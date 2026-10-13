@@ -63,6 +63,8 @@ def oracle(logits, output):
 @pytest.mark.parametrize("m", [1, 5, 20])
 @pytest.mark.parametrize("quantize", [False, True])
 def test_native_router_changed_graph_inputs(m, quantize):
+    if quantize and not hasattr(torch.ops._C, "gguf_quantize_q8_1_sm70_out"):
+        pytest.skip("Q8_1 reference op is not on this branch")
     logits = torch.zeros(m, 512, device="cuda", dtype=torch.float16)
     x = torch.zeros(m, 2560, device="cuda", dtype=torch.float16)
     out, ref, dispatched = buffers(m), buffers(m), buffers(m)
@@ -140,3 +142,33 @@ def test_native_router_rejects_unsupported_storage(failure):
         out[1] = out[1].long()
     with pytest.raises(RuntimeError):
         torch.ops.vllm_sm70_router.top10(*out, logits)
+
+
+@pytest.mark.parametrize("m", [17, 18, 19, 20])
+def test_fused_topk_native_route_for_verifier_rows(m, monkeypatch):
+    """VLLM_SM70_QWEN38_NATIVE_ROUTER_TOPK routes M17..20 through #1147."""
+    from vllm.model_executor.layers.fused_moe.router.fused_topk_router import (
+        fused_topk,
+    )
+
+    torch.manual_seed(m)
+    logits = torch.randn(m, 512, device="cuda", dtype=torch.float16)
+    hidden = torch.empty(m, 2560, device="cuda", dtype=torch.float16)
+    monkeypatch.setenv("VLLM_SM70_QWEN38_NATIVE_ROUTER_TOPK", "0")
+    generic = fused_topk(hidden, logits, 10, True)
+    monkeypatch.setenv("VLLM_SM70_QWEN38_NATIVE_ROUTER_TOPK", "1")
+    native = fused_topk(hidden, logits, 10, True)
+    ref = buffers(m)
+    oracle(logits, ref)
+    assert torch.equal(native[1], ref[1])
+    assert torch.equal(native[2], ref[2])
+    torch.testing.assert_close(native[0], ref[0], atol=3e-7, rtol=0)
+    # The generic op ranks rounded softmax scores; with random FP16 logits the
+    # selected sets agree, and weights agree to FP32 rounding.
+    assert torch.equal(native[1].sort(1).values, generic[1].sort(1).values)
+    torch.testing.assert_close(
+        native[0].gather(1, native[1].argsort(1)),
+        generic[0].gather(1, generic[1].argsort(1)),
+        atol=1e-6,
+        rtol=0,
+    )

@@ -367,6 +367,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE: bool = True
     VLLM_SM70_NVFP4_QPN_M1_LIBRARY: str | None = None
     VLLM_SM70_QWEN38_ROUTER_TOPK: bool = True
+    VLLM_SM70_QWEN38_NATIVE_ROUTER_TOPK: bool = False
     VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE: bool = False
     VLLM_SM70_AWQ_WARMUP: bool = True
     VLLM_SM70_AWQ_WARMUP_MAX_M: int = 16
@@ -5107,6 +5108,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="configuration",
         declared_default="True",
         effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
+    ),
+    # 1CatAI #1147 native E512/K10 router (vllm._sm70_router_C) for the
+    # M=17..20 verifier rows that the Triton router above does not admit.
+    "VLLM_SM70_QWEN38_NATIVE_ROUTER_TOPK": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_QWEN38_NATIVE_ROUTER_TOPK", "0"))),
+        description=(
+            "Route Qwen3.8 E=512, K=10 renormalized softmax top-k for 17..20 "
+            "FP16 router rows through the native SM70 router extension "
+            "(#1147) instead of the generic topk_softmax op. Selection follows "
+            "stable raw-logit order; weights are the FP32 softmax of the "
+            "selected logits. M<=16 keeps the Triton router."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
         user_visible=False,

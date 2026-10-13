@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import functools
 from collections.abc import Callable
 
 import torch
@@ -142,6 +143,52 @@ def _sm70_qwen38_router_topk(
     )
 
 
+@functools.cache
+def _sm70_native_router_available() -> bool:
+    """Load the #1147 extension once; register a no-op fake for tracing."""
+    try:
+        import vllm._sm70_router_C  # noqa: F401
+    except ImportError as exc:
+        logger.warning_once("SM70 native router extension unavailable: %s", exc)
+        return False
+    if not hasattr(torch.ops, "vllm_sm70_router") or not hasattr(
+        torch.ops.vllm_sm70_router, "top10"
+    ):
+        return False
+    try:
+
+        @torch.library.register_fake("vllm_sm70_router::top10")
+        def _top10_fake(weights, ids, source, logits) -> None:
+            return None
+
+    except RuntimeError:
+        # Already registered (e.g. by another import path).
+        pass
+    return True
+
+
+def _use_sm70_native_router_top10(
+    gating_output: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+) -> bool:
+    num_tokens = gating_output.shape[0]
+    return bool(
+        envs.VLLM_SM70_QWEN38_NATIVE_ROUTER_TOPK
+        and 17 <= num_tokens <= 20
+        and gating_output.shape == (num_tokens, 512)
+        and gating_output.dtype == torch.float16
+        and gating_output.is_cuda
+        and gating_output.is_contiguous()
+        and topk == 10
+        and renormalize
+        and topk_ids.dtype == torch.int32
+        and current_platform.is_device_capability(70)
+        and _sm70_native_router_available()
+    )
+
+
 def vllm_topk_softmax(
     topk_weights: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -239,6 +286,15 @@ def fused_topk(
                 topk_ids,
                 token_expert_indices,
                 gating_output,
+            )
+            return topk_weights, topk_ids, token_expert_indices
+
+        if _use_sm70_native_router_top10(gating_output, topk_ids, topk, renormalize):
+            logger.info_once(
+                "SM70 Qwen3.8 E512/K10 native router (#1147) enabled for M=%d.", M
+            )
+            torch.ops.vllm_sm70_router.top10(
+                topk_weights, topk_ids, token_expert_indices, gating_output
             )
             return topk_weights, topk_ids, token_expert_indices
 

@@ -949,7 +949,7 @@ class precompiled_wheel_utils:
                     r"flash_qla/ops/gated_delta_rule/chunk/sm70/[^/]+\.so"
                 )
                 sm70_ext_regex = re.compile(
-                    r"vllm/_sm70_(?:sampler|exact_reduce|sparse_attention)_C"
+                    r"vllm/_sm70_(?:sampler|exact_reduce|sparse_attention|router)_C"
                     r"(?:\.[^/]+)?\.so$"
                 )
                 h3_ext_regex = re.compile(

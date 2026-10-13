@@ -1333,6 +1333,9 @@ if _is_cuda():
         # These extensions use pybind11/libtorch_python and therefore require
         # the interpreter-specific CPython ABI suffix emitted by CMake.
         ext_modules.append(
+            CMakeExtension(name="vllm._sm70_router_C", py_limited_api=False)
+        )
+        ext_modules.append(
             CMakeExtension(name="vllm._sm70_exact_reduce_C", py_limited_api=False)
         )
         ext_modules.append(

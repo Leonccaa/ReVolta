@@ -307,6 +307,7 @@ def awq_layer():
     saved = dict(os.environ)
     os.environ.update(
         VLLM_SM70_AWQ_QWEN38_GROUPED_QPN="1",
+        VLLM_SM70_AWQ_QWEN38_MOE_GROUPED_DECODE20="1",
         VLLM_SM70_AWQ_QWEN38_MOE_COMPACT_GROUPED_DECODE="1",
         VLLM_SM70_AWQ_MOE_COMPACT_METADATA="1",
         VLLM_SM70_AWQ_TUNE_SMALL_SHAPES="0",
@@ -317,12 +318,14 @@ def awq_layer():
         os.environ.clear()
         os.environ.update(saved)
     assert layer.sm70_awq_qwen38_grouped_qpn
+    assert layer.sm70_awq_qwen38_grouped_decode20
     assert layer.sm70_awq_moe_compact_metadata
     return layer
 
 
-def _apply(layer, x, ids, topk, grouped):
+def _apply(layer, x, ids, topk, grouped, grouped_decode20=False):
     layer.sm70_awq_qwen38_grouped_qpn = grouped
+    layer.sm70_awq_qwen38_grouped_decode20 = grouped_decode20
     out = layer._r2_method.apply(layer, x, topk, ids, None, None)
     torch.cuda.synchronize()
     return out.clone()
@@ -375,3 +378,30 @@ def test_method_route_against_turbomind(awq_layer, m):
         assert torch.equal(grouped, turbomind)
     assert tm_diff <= 1e-2 * scale + 2**-24
     assert ref_diff <= 1e-2 * scale + 2**-24
+
+
+@pytest.mark.parametrize("m", list(range(9, 21)))
+def test_grouped_decode20_against_per_expert_dispatch(awq_layer, m):
+    """VLLM_SM70_AWQ_QWEN38_MOE_GROUPED_DECODE20: grouped TurboMind launch-spec
+    selection for 9..20 rows vs the default per-expert-dispatch selection."""
+    pool = tuple(range(512))
+    torch.manual_seed(7000 + m)
+    x = (torch.randn(m, 2560, device="cuda") * 0.5).half()
+    ids, topk = _routing(m, seed=1900 + m, pool=pool)
+    per_expert = _apply(awq_layer, x, ids, topk, grouped=False)
+    grouped20 = _apply(awq_layer, x, ids, topk, grouped=False, grouped_decode20=True)
+    # Eager replay determinism of the grouped selection.
+    again = _apply(awq_layer, x, ids, topk, grouped=False, grouped_decode20=True)
+    awq_layer.sm70_awq_qwen38_grouped_qpn = True
+    awq_layer.sm70_awq_qwen38_grouped_decode20 = True
+    diff, scale = _diff(grouped20, per_expert)
+    _report(
+        test="grouped_decode20",
+        m=m,
+        grouped20_vs_per_expert_max_abs=diff,
+        ref_max=scale,
+        bitwise_equal=bool(torch.equal(grouped20, per_expert)),
+    )
+    assert torch.isfinite(grouped20.float()).all()
+    assert torch.equal(grouped20, again)
+    assert diff <= 1e-2 * scale + 2**-24

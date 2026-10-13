@@ -771,6 +771,45 @@ def _warmup_moe_dense_stage_layers(
                 device=device,
             )
 
+            if (
+                getattr(layer, "sm70_awq_qwen38_grouped_decode20", False)
+                and 9 <= num_tokens <= 20
+                and top_k == 10
+            ):
+                # VLLM_SM70_AWQ_QWEN38_MOE_GROUPED_DECODE20: measure/select the
+                # grouped (512-group) launch specs before graph capture.
+                for out, src, ptr_w, ptr_s, k, n in (
+                    (
+                        gate_up,
+                        permuted_input,
+                        layer.w13_strided_ptrs_w,
+                        layer.w13_strided_ptrs_s,
+                        int(layer.sm70_w13_k_dim),
+                        int(layer.sm70_w13_n_dim),
+                    ),
+                    (
+                        sorted_output,
+                        intermediate,
+                        layer.w2_strided_ptrs_w,
+                        layer.w2_strided_ptrs_s,
+                        int(layer.sm70_w2_k_dim),
+                        int(layer.sm70_w2_n_dim),
+                    ),
+                ):
+                    sm70_ops.awq_moe_gemm_sm70_out(
+                        out,
+                        src,
+                        expert_offsets,
+                        ptr_w,
+                        ptr_s,
+                        num_experts,
+                        k,
+                        n,
+                        group_size,
+                        False,
+                    )
+                calls += 2
+                continue
             stage_op(
                 gate_up,
                 permuted_input,

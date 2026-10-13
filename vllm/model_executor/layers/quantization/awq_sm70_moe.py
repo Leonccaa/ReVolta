@@ -114,6 +114,32 @@ def _use_qwen38_active_grouped_decode(
     )
 
 
+_QWEN38_GROUPED_DECODE20_MIN_TOKENS: Final = 9
+_QWEN38_GROUPED_DECODE20_MAX_TOKENS: Final = 20
+
+
+def _use_qwen38_grouped_decode20(
+    layer: RoutedExperts, num_tokens: int, top_k: int
+) -> bool:
+    """Opt-in grouped TurboMind dispatch for 9..20 decode/verify rows.
+
+    The default AWQ batched route selects each GEMM's launch spec as if the
+    whole batch belonged to one expert (dispatch_num_override=1, introduced
+    for exactness against the per-expert dense order). The NVFP4 route at
+    the same Qwen3.8 shapes dispatches over all 512 groups instead. This
+    admission reuses the existing grouped op (awq_moe_gemm_sm70_out) for W13
+    and W2 with that grouped selection; it changes the split-K/tile choice and
+    therefore the FP32 accumulation order.
+    """
+    return bool(
+        getattr(layer, "sm70_awq_qwen38_grouped_decode20", False)
+        and _QWEN38_GROUPED_DECODE20_MIN_TOKENS
+        <= num_tokens
+        <= _QWEN38_GROUPED_DECODE20_MAX_TOKENS
+        and top_k == 10
+    )
+
+
 _QWEN38_GROUPED_QPN_MIN_TOKENS: Final = 2
 _QWEN38_GROUPED_QPN_MAX_TOKENS: Final = 20
 
@@ -975,6 +1001,20 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         layer.sm70_awq_qwen38_qpn_m1 = initialize_qpn_m1(
             layer, _qwen38_active_grouped_layer_contract(layer, self.group_size)
         )
+        layer.sm70_awq_qwen38_grouped_decode20 = bool(
+            envs.VLLM_SM70_AWQ_QWEN38_MOE_GROUPED_DECODE20
+            and batched_gemm
+            and _qwen38_active_grouped_layer_contract(layer, self.group_size)
+            and hasattr(torch.ops._C, "awq_moe_gemm_sm70_out")
+        )
+        if (
+            envs.VLLM_SM70_AWQ_QWEN38_MOE_GROUPED_DECODE20
+            and not layer.sm70_awq_qwen38_grouped_decode20
+        ):
+            logger.warning_once(
+                "VLLM_SM70_AWQ_QWEN38_MOE_GROUPED_DECODE20=1 ignored: requires the "
+                "batched Qwen3.8 TP4 E512 g32 layer contract."
+            )
         layer.sm70_awq_qwen38_grouped_qpn = _initialize_qwen38_grouped_qpn(
             layer,
             _qwen38_active_grouped_layer_contract(layer, self.group_size),
@@ -1738,6 +1778,9 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         buffers["sorted_expert_ids"] = _dump_awq_moe_buffer(
             layer, buffers["sorted_expert_ids"], "sorted_expert_ids"
         )
+        use_grouped_decode20 = not indexed_w13 and _use_qwen38_grouped_decode20(
+            layer, num_tokens, top_k
+        )
         route_plan = select_sm70_quantized_moe_route(
             batched_enabled=layer.sm70_awq_moe_batched_gemm,
             num_tokens=num_tokens,
@@ -1748,8 +1791,8 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             strict_dense_w13=(envs.VLLM_SM70_AWQ_MOE_BATCHED_SINGLE_TOKEN_DENSE_W13),
             exact_w2=envs.VLLM_SM70_AWQ_MOE_BATCHED_EXACT_W2,
             active_exact_w2=envs.VLLM_SM70_AWQ_MOE_BATCHED_ACTIVE_EXACT_W2,
-            w13_per_expert_dispatch=True,
-            w2_per_expert_dispatch=True,
+            w13_per_expert_dispatch=not use_grouped_decode20,
+            w2_per_expert_dispatch=not use_grouped_decode20,
         )
         use_batched_strict_moe = route_plan.use_batched_strict_w13
         use_batched_moe_gemm = route_plan.use_batched_moe_gemm
@@ -1824,6 +1867,24 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                     self.group_size,
                 )
                 compare_dense_w13_stats = _diff_stats(buffers["gate_up"], dense_gate_up)
+        elif route_plan.w13 == Sm70MoeStageRoute.BATCHED:
+            _log_runtime_route_once(
+                "SM70 Qwen3.8 AWQ grouped-dispatch W13 (tokens=%d, experts=%d).",
+                num_tokens,
+                layer.sm70_num_experts,
+            )
+            sm70_ops.awq_moe_gemm_sm70_out(
+                buffers["gate_up"],
+                buffers["permuted_input"],
+                buffers["expert_offsets"],
+                layer.w13_strided_ptrs_w,
+                layer.w13_strided_ptrs_s,
+                layer.sm70_num_experts,
+                layer.sm70_w13_k_dim,
+                layer.sm70_w13_n_dim,
+                self.group_size,
+                False,
+            )
         elif route_plan.w13 == Sm70MoeStageRoute.PER_EXPERT_DISPATCH:
             _log_runtime_route_once(
                 "SM70 AWQ MoE batched W13 using per-expert dispatch "
@@ -2008,6 +2069,24 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                     .cpu()
                     .tolist(),
                 }
+        elif route_plan.w2 == Sm70MoeStageRoute.BATCHED:
+            _log_runtime_route_once(
+                "SM70 Qwen3.8 AWQ grouped-dispatch W2 (tokens=%d, experts=%d).",
+                num_tokens,
+                layer.sm70_num_experts,
+            )
+            sm70_ops.awq_moe_gemm_sm70_out(
+                buffers["sorted_output"],
+                buffers["intermediate"],
+                buffers["expert_offsets"],
+                layer.w2_strided_ptrs_w,
+                layer.w2_strided_ptrs_s,
+                layer.sm70_num_experts,
+                layer.sm70_w2_k_dim,
+                layer.sm70_w2_n_dim,
+                self.group_size,
+                False,
+            )
         elif route_plan.w2 == Sm70MoeStageRoute.PER_EXPERT_DISPATCH:
             _log_runtime_route_once(
                 "SM70 AWQ MoE batched W2 using per-expert dispatch "

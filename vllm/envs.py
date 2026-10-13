@@ -263,6 +263,7 @@ if TYPE_CHECKING:
     VLLM_SM70_AWQ_QWEN38_MOE_COMPACT_GROUPED_DECODE: bool = True
     VLLM_SM70_AWQ_QWEN38_QPN_M1: bool = True
     VLLM_SM70_AWQ_QWEN38_GROUPED_QPN: bool = False
+    VLLM_SM70_AWQ_QWEN38_MOE_GROUPED_DECODE20: bool = False
     VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT: int = 16
     VLLM_SM70_AWQ_QWEN38_MOE_W2_CHUNK_TOKENS: int = 0
     VLLM_SM70_AWQ_MOE_BATCHED_SINGLE_TOKEN_DENSE_W13: bool = False
@@ -3333,6 +3334,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "env_with_choices('VLLM_SM70_AWQ_QWEN38_QPN_M1', '1', ['0', "
             "'1'])() == '1'"
         ),
+        automatic_conditions=(),
+        acceleration_paths=("TurboMindAwqLinearKernel",),
+        user_visible=False,
+    ),
+    # Opt-in grouped TurboMind launch-spec selection for AWQ 9..20 decode rows.
+    "VLLM_SM70_AWQ_QWEN38_MOE_GROUPED_DECODE20": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_AWQ_QWEN38_MOE_GROUPED_DECODE20", "0"))),
+        description=(
+            "Experimental: for 9..20 Qwen3.8 TP4 AWQ MoE rows, run W13 and W2 "
+            "through the grouped TurboMind GEMM with launch specs selected over "
+            "all 512 expert groups (as the NVFP4 route does at these shapes) "
+            "instead of the per-expert-dispatch selection. Changes split-K and "
+            "tile choice, hence FP32 accumulation order. The SM70 AWQ warmup "
+            "pre-selects the grouped specs before graph capture."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("TurboMindAwqLinearKernel",),
         user_visible=False,

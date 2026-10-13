@@ -11,7 +11,11 @@ the production AWQSM70MoEMethod (awq_sm70_prepare_compact):
   W13 split 16 and 8;
 * turbomind: AWQSM70MoEMethod.apply() with the grouped route disabled, i.e.
   the production route (permute + active-grouped TurboMind GEMMs for M<=8,
-  per-expert dispatch for M>8, SwiGLU, W2, unpermute).
+  per-expert dispatch for M>8, SwiGLU, W2, unpermute);
+* grouped20 (M 9..20): the same apply() with
+  VLLM_SM70_AWQ_QWEN38_MOE_GROUPED_DECODE20 (grouped TurboMind launch specs).
+  Run with VLLM_SM70_AWQ_TUNE_SMALL_SHAPES=1 and
+  VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS=200 to include tactic tuning at M=20.
 
 Each variant is captured in a CUDA graph of --inner calls and replayed; the
 median per-call time over --rounds is reported, with the effective weight
@@ -154,6 +158,7 @@ def main():
     if not hasattr(torch.ops._C, "awq_moe_grouped_decode_sm70_out"):
         raise SystemExit("build lacks awq_moe_grouped_decode_sm70_out")
     os.environ.setdefault("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN", "1")
+    os.environ.setdefault("VLLM_SM70_AWQ_QWEN38_MOE_GROUPED_DECODE20", "1")
     os.environ.setdefault("VLLM_SM70_AWQ_QWEN38_MOE_COMPACT_GROUPED_DECODE", "1")
     os.environ.setdefault("VLLM_SM70_AWQ_MOE_COMPACT_METADATA", "1")
     os.environ.setdefault("VLLM_SM70_AWQ_TUNE_SMALL_SHAPES", "0")
@@ -196,6 +201,7 @@ def main():
 
             def turbomind(x=x, topk=topk, ids=ids):
                 layer.sm70_awq_qwen38_grouped_qpn = False
+                layer.sm70_awq_qwen38_grouped_decode20 = False
                 method.apply(layer, x, topk, ids, None, None)
 
             median, best, graph = time_graph(turbomind, args.inner, args.rounds)
@@ -205,6 +211,27 @@ def main():
             if args.profile:
                 entry["turbomind_kernels"] = profile_kernels(graph)
             del graph
+            if 9 <= m <= 20:
+                # VLLM_SM70_AWQ_QWEN38_MOE_GROUPED_DECODE20 route.
+                def grouped20(x=x, topk=topk, ids=ids):
+                    layer.sm70_awq_qwen38_grouped_qpn = False
+                    layer.sm70_awq_qwen38_grouped_decode20 = True
+                    method.apply(layer, x, topk, ids, None, None)
+
+                grouped20()
+                torch.cuda.synchronize()
+                out20 = method.apply(layer, x, topk, ids, None, None).clone()
+                entry["grouped20_max_abs_vs_turbomind"] = (
+                    (out20.double() - reference.double()).abs().max().item()
+                )
+                median, best, graph = time_graph(grouped20, args.inner, args.rounds)
+                entry["grouped20_us"] = median
+                entry["grouped20_best_us"] = best
+                entry["grouped20_gbps"] = weight_mb * 1e6 / (median * 1e-6) / 1e9
+                if args.profile:
+                    entry["grouped20_kernels"] = profile_kernels(graph)
+                del graph
+                layer.sm70_awq_qwen38_grouped_decode20 = False
         for split in args.splits:
 
             def grouped(

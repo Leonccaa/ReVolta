@@ -216,3 +216,31 @@ def test_runtime_admission_rejects_layout_and_dtype():
     assert not moe._use_qwen38_grouped_qpn(
         _layer(sm70_awq_qwen38_grouped_qpn=False), x, weights, ids
     )
+
+
+@pytest.mark.parametrize("m", [1, 5, 8, 9, 10, 15, 20, 21, 32])
+@pytest.mark.parametrize("flag", [False, True])
+def test_grouped_decode20_runtime_band(m, flag):
+    layer = SimpleNamespace(sm70_awq_qwen38_grouped_decode20=flag)
+    assert moe._use_qwen38_grouped_decode20(layer, m, 10) == (flag and 9 <= m <= 20)
+    assert not moe._use_qwen38_grouped_decode20(layer, m, 8)
+
+
+@pytest.mark.parametrize("grouped", [False, True])
+def test_grouped_decode20_route_plan(grouped):
+    from vllm.model_executor.layers.quantization.sm70_moe_router import (
+        Sm70MoeStageRoute,
+        select_sm70_quantized_moe_route,
+    )
+
+    plan = select_sm70_quantized_moe_route(
+        batched_enabled=True,
+        num_tokens=20,
+        total_slots=200,
+        w13_per_expert_dispatch=not grouped,
+        w2_per_expert_dispatch=not grouped,
+    )
+    expected = (
+        Sm70MoeStageRoute.BATCHED if grouped else Sm70MoeStageRoute.PER_EXPERT_DISPATCH
+    )
+    assert plan.w13 == expected and plan.w2 == expected

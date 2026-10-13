@@ -456,6 +456,8 @@ if TYPE_CHECKING:
     VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH: bool = True
     VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1: bool = True
     VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES: bool = True
+    VLLM_SM70_CAR_VMM_SAFE: bool = False
+    VLLM_SM70_CAR_VMM_SAFE_PREALLOC: bool = True
     VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES: bool = False
     VLLM_SM70_CUSTOM_AR_LIBRARY: str | None = None
     VLLM_SM70_TOP1_CUSTOM_AR: bool = False
@@ -6929,6 +6931,48 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "size. SM70, fully connected TP4 and captured FP16 only; default "
             "off until the mixed-size graph replay, numerical and full-model "
             "quality gates pass."
+        ),
+        category="experimental",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 collectives",),
+        user_visible=False,
+    ),
+    # Keep custom all-reduce CUDA graph registration exportable under
+    # expandable_segments:True. While capturing, an input whose memory cannot
+    # be exported with cudaIpcGetMemHandle (CUDA VMM, e.g. a resident buffer
+    # allocated before capture) is copied into a cudaMalloc-backed graph
+    # allocation first; the native kernels and their selection are unchanged.
+    "VLLM_SM70_CAR_VMM_SAFE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_CAR_VMM_SAFE", "0"))),
+        description=(
+            "Keep custom all-reduce CUDA graph registration exportable under "
+            "expandable_segments:True. While capturing, an input whose memory "
+            "cannot be exported with cudaIpcGetMemHandle (CUDA VMM, e.g. a "
+            "resident buffer allocated before capture) is copied into a "
+            "cudaMalloc-backed graph allocation first; the native kernels and "
+            "their selection are unchanged."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 collectives",),
+        user_visible=False,
+    ),
+    # With VLLM_SM70_CAR_VMM_SAFE=1, allocate the resident SM70 MoE output
+    # buffers that feed captured all_reduce_sum2 outside expandable segments,
+    # so capture does not need a per-call copy. 0 keeps them in the default
+    # allocator and leaves the per-call copy as the only mechanism.
+    "VLLM_SM70_CAR_VMM_SAFE_PREALLOC": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_CAR_VMM_SAFE_PREALLOC", "1"))),
+        description=(
+            "With VLLM_SM70_CAR_VMM_SAFE=1, allocate the resident SM70 MoE "
+            "output buffers that feed captured all_reduce_sum2 outside "
+            "expandable segments, so capture does not need a per-call copy. "
+            "0 keeps them in the default allocator and leaves the per-call "
+            "copy as the only mechanism."
         ),
         category="experimental",
         declared_default="True",

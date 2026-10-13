@@ -1168,12 +1168,19 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             persistent_tokens,
             _DEFAULT_PERSISTENT_MAX_TOKENS,
         )
-        layer._awq_moe_buf_output = torch.empty(
-            persistent_tokens,
-            layer.sm70_hidden_logical_size,
-            dtype=torch.float16,
-            device=device,
+        from vllm.distributed.device_communicators.custom_all_reduce import (
+            sm70_custom_ar_ipc_safe_allocation,
         )
+
+        # MRV2 capture reuses this resident buffer as the routed input of the
+        # captured all_reduce_sum2; keep it CUDA-IPC exportable when opted in.
+        with sm70_custom_ar_ipc_safe_allocation():
+            layer._awq_moe_buf_output = torch.empty(
+                persistent_tokens,
+                layer.sm70_hidden_logical_size,
+                dtype=torch.float16,
+                device=device,
+            )
         layer._awq_moe_buf_permuted_input = torch.empty(
             max_slots,
             layer.sm70_hidden_logical_size,

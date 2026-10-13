@@ -386,9 +386,16 @@ class Fp8SM70MoEMethod(FusedMoEMethodBase):
         layer._fp8_buf_max_tokens = persistent_tokens
         layer._fp8_buf_max_slots = max_slots
         layer._fp8_buf_top_k = top_k
-        layer._fp8_buf_output = torch.empty(
-            persistent_tokens, hidden_size, dtype=torch.float16, device=device
+        from vllm.distributed.device_communicators.custom_all_reduce import (
+            sm70_custom_ar_ipc_safe_allocation,
         )
+
+        # Captured graphs reuse this resident buffer as the routed input of
+        # all_reduce_sum2; keep it CUDA-IPC exportable when opted in.
+        with sm70_custom_ar_ipc_safe_allocation():
+            layer._fp8_buf_output = torch.empty(
+                persistent_tokens, hidden_size, dtype=torch.float16, device=device
+            )
         layer._fp8_buf_permuted_input = torch.empty(
             max_slots, hidden_size, dtype=torch.float16, device=device
         )

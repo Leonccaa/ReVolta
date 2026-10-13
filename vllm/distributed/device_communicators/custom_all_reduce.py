@@ -49,7 +49,7 @@ def _get_effective_allocator_conf() -> str:
 
 
 @contextmanager
-def _disable_expandable_segments_for_cuda_ipc(active: bool):
+def _disable_expandable_segments_for_cuda_ipc(active: bool, purpose: str | None = None):
     """Keep CUDA-IPC graph buffers on cudaMalloc-backed allocations.
 
     ``cudaIpcGetMemHandle`` cannot export CUDA VMM allocations created when
@@ -57,6 +57,10 @@ def _disable_expandable_segments_for_cuda_ipc(active: bool):
     environment variable. Custom all-reduce exports graph buffers through that
     legacy IPC API, so disable expandable segments for the complete capture
     and registration window while preserving every other allocator option.
+
+    While disabled, PyTorch's caching allocator also skips free blocks of
+    existing expandable segments, so every allocation made inside this window
+    is cudaMalloc-backed. Allocations made *before* the window are not.
     """
     allocator_conf = _get_effective_allocator_conf()
     disabled_conf, replacements = _EXPANDABLE_SEGMENTS_TRUE_PATTERN.subn(
@@ -64,16 +68,129 @@ def _disable_expandable_segments_for_cuda_ipc(active: bool):
     )
     should_disable = active and current_platform.is_cuda() and replacements > 0
     if should_disable:
-        logger.info_once(
-            "Temporarily disabling expandable_segments during custom allreduce "
-            "CUDA graph capture for CUDA IPC compatibility."
-        )
+        if purpose is None:
+            logger.info_once(
+                "Temporarily disabling expandable_segments during custom "
+                "allreduce CUDA graph capture for CUDA IPC compatibility."
+            )
+        else:
+            logger.info_once(
+                "Temporarily disabling expandable_segments during %s for CUDA "
+                "IPC compatibility.",
+                purpose,
+            )
         torch.cuda.memory._set_allocator_settings(disabled_conf)
     try:
         yield
     finally:
         if should_disable:
             torch.cuda.memory._set_allocator_settings(allocator_conf)
+
+
+# CUDA driver enums (cuda.h): CU_POINTER_ATTRIBUTE_IS_LEGACY_CUDA_IPC_CAPABLE
+# and CU_STREAM_CAPTURE_MODE_RELAXED.
+_CU_POINTER_ATTRIBUTE_IS_LEGACY_CUDA_IPC_CAPABLE = 10
+_CU_STREAM_CAPTURE_MODE_RELAXED = 2
+
+
+class _LegacyCudaIpcProbe:
+    """ctypes binding of ``cuPointerGetAttribute`` for the IPC capability bit.
+
+    Answers whether ``cudaIpcGetMemHandle`` can export the allocation behind a
+    device pointer (False for CUDA VMM / expandable-segment memory). The query
+    is a host-side metadata lookup; it is still bracketed by a relaxed
+    thread capture mode, as PyTorch does for its own calls during capture.
+    """
+
+    def __init__(self, library: str = "libcuda.so.1") -> None:
+        import ctypes
+
+        self._ctypes = ctypes
+        lib = ctypes.CDLL(library)
+        self._get_attribute = lib.cuPointerGetAttribute
+        self._get_attribute.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_ulonglong,
+        ]
+        self._get_attribute.restype = ctypes.c_int
+        self._exchange_mode = lib.cuThreadExchangeStreamCaptureMode
+        self._exchange_mode.argtypes = [ctypes.POINTER(ctypes.c_int)]
+        self._exchange_mode.restype = ctypes.c_int
+
+    def is_capable(self, ptr: int) -> bool | None:
+        """True/False from the driver, None when the query itself failed."""
+        ctypes = self._ctypes
+        # Zero-filled 8 bytes: correct whether the driver writes a 1-byte
+        # bool or a 4-byte int for this boolean attribute.
+        value = ctypes.c_ulonglong(0)
+        mode = ctypes.c_int(_CU_STREAM_CAPTURE_MODE_RELAXED)
+        if self._exchange_mode(ctypes.byref(mode)) != 0:
+            return None
+        try:
+            status = self._get_attribute(
+                ctypes.byref(value),
+                _CU_POINTER_ATTRIBUTE_IS_LEGACY_CUDA_IPC_CAPABLE,
+                ptr,
+            )
+        finally:
+            self._exchange_mode(ctypes.byref(mode))
+        if status != 0:
+            return None
+        return value.value != 0
+
+
+_LEGACY_CUDA_IPC_PROBE: _LegacyCudaIpcProbe | None = None
+_LEGACY_CUDA_IPC_PROBE_FAILED = False
+
+
+def _is_legacy_cuda_ipc_capable(ptr: int) -> bool | None:
+    """Whether ``cudaIpcGetMemHandle`` can export ``ptr``; None if unknown."""
+    global _LEGACY_CUDA_IPC_PROBE, _LEGACY_CUDA_IPC_PROBE_FAILED
+    if _LEGACY_CUDA_IPC_PROBE is None and not _LEGACY_CUDA_IPC_PROBE_FAILED:
+        try:
+            _LEGACY_CUDA_IPC_PROBE = _LegacyCudaIpcProbe()
+        except (OSError, AttributeError) as exc:
+            _LEGACY_CUDA_IPC_PROBE_FAILED = True
+            logger.warning(
+                "SM70 VMM-safe custom all-reduce cannot query CUDA IPC "
+                "capability (%s); every captured custom all-reduce input "
+                "will be copied or staged.",
+                exc,
+            )
+    if _LEGACY_CUDA_IPC_PROBE is None:
+        return None
+    return _LEGACY_CUDA_IPC_PROBE.is_capable(ptr)
+
+
+def _sm70_car_vmm_safe_enabled() -> bool:
+    return bool(envs.VLLM_SM70_CAR_VMM_SAFE) and current_platform.is_cuda()
+
+
+@contextmanager
+def sm70_custom_ar_ipc_safe_allocation():
+    """Opt-in: allocate persistent custom all-reduce inputs outside VMM memory.
+
+    Some layers keep resident output buffers, allocated at load time, that are
+    later passed unchanged to a captured custom all-reduce (for example the
+    SM70 MoE ``all_reduce_sum2`` routed output). Under
+    ``expandable_segments:True`` those buffers live in CUDA VMM memory, which
+    the graph-buffer registration cannot export. With
+    ``VLLM_SM70_CAR_VMM_SAFE=1`` (and ``VLLM_SM70_CAR_VMM_SAFE_PREALLOC``
+    left at 1) allocations made in this context use cudaMalloc segments, so
+    capture needs no per-call copy. Otherwise this is a no-op.
+    """
+    active = (
+        _sm70_car_vmm_safe_enabled()
+        and bool(envs.VLLM_SM70_CAR_VMM_SAFE_PREALLOC)
+        # A capture window already holds the allocator toggle; nesting would
+        # restore expandable segments before that window ends.
+        and not torch.cuda.is_current_stream_capturing()
+    )
+    with _disable_expandable_segments_for_cuda_ipc(
+        active, purpose="persistent custom all-reduce input allocation"
+    ):
+        yield
 
 
 def _sm70_tp8_hierarchical_peer_ranks(rank: int) -> tuple[int, ...]:
@@ -106,6 +223,11 @@ def is_weak_contiguous(inp: torch.Tensor):
 
 class CustomAllreduce:
     _SUPPORTED_WORLD_SIZES = [2, 4, 6, 8]
+    # Opt-in VLLM_SM70_CAR_VMM_SAFE state; class defaults keep instances made
+    # without __init__ (tests) on the unchanged path.
+    _vmm_safe = False
+    _vmm_safe_copies = 0
+    _vmm_safe_fallbacks = 0
 
     # max_size: max supported allreduce size
     def __init__(
@@ -128,6 +250,7 @@ class CustomAllreduce:
         """
         self._IS_CAPTURING = False
         self.disabled = True
+        self._vmm_safe = _sm70_car_vmm_safe_enabled()
         self.long_prefill_output_ptrs: list[int] | None = None
         self.sm70_tp4_push_buffer_ptrs: list[int] | None = None
         self.sm70_tp8_hierarchical_push_buffer_ptrs: list[int] | None = None
@@ -399,6 +522,17 @@ class CustomAllreduce:
                     self.register_graph_buffers()
 
     def register_graph_buffers(self):
+        if self._vmm_safe:
+            # Logged before the IPC export so the counts survive its failure.
+            logger.info(
+                "SM70 VMM-safe custom all-reduce: %d captured input(s) were "
+                "not legacy-CUDA-IPC exportable and were copied; %d used the "
+                "staging/NCCL fallback.",
+                self._vmm_safe_copies,
+                self._vmm_safe_fallbacks,
+            )
+            self._vmm_safe_copies = 0
+            self._vmm_safe_fallbacks = 0
         handle, offset = ops.get_graph_buffer_ipc_meta(self._ptr)
         logger.info("Registering %d cuda graph addresses", len(offset))
         # We cannot directly use `dist.all_gather_object` here
@@ -416,6 +550,31 @@ class CustomAllreduce:
         handles = cast(list[list[int]], [d[0] for d in all_data])
         offsets = cast(list[list[int]], [d[1] for d in all_data])
         ops.register_graph_buffers(self._ptr, handles, offsets)
+
+    def _vmm_safe_graph_input(self, inp: torch.Tensor) -> torch.Tensor | None:
+        """Return a tensor with ``inp``'s values that the graph-buffer
+        registration can export through ``cudaIpcGetMemHandle``.
+
+        Used only for ``VLLM_SM70_CAR_VMM_SAFE`` while a CUDA graph is being
+        captured. The native op records every captured input pointer for
+        ``get_graph_buffer_ipc_meta`` (even when the push kernel never reads a
+        peer's copy), so a VMM-backed input such as a resident buffer
+        allocated before capture would fail there. Inside ``capture()`` the
+        allocator toggle is active, so a fresh copy is cudaMalloc-backed; it
+        keeps the original strides, hence the native op's flat element order.
+        ``None`` means no exportable copy was produced and the caller must use
+        its exportable fallback.
+        """
+        if _is_legacy_cuda_ipc_capable(inp.data_ptr()):
+            return inp
+        copy = torch.empty_like(inp)
+        copy.copy_(inp)
+        self._vmm_safe_copies += 1
+        if _is_legacy_cuda_ipc_capable(copy.data_ptr()):
+            return copy
+        self._vmm_safe_copies -= 1
+        self._vmm_safe_fallbacks += 1
+        return None
 
     def should_custom_ar(self, inp: torch.Tensor):
         if self.disabled:
@@ -574,6 +733,11 @@ class CustomAllreduce:
         normalized_out = torch.empty_like(inp)
         residual_out = torch.empty_like(residual, dtype=torch.float32)
         registered = self._IS_CAPTURING and torch.cuda.is_current_stream_capturing()
+        if registered and self._vmm_safe:
+            safe_inp = self._vmm_safe_graph_input(inp)
+            registered = safe_inp is not None
+            if safe_inp is not None:
+                inp = safe_inp
         reg_buffer = 0 if registered else self.buffer_ptrs[self.rank]
         reg_buffer_size = 0 if registered else self.max_size
         ops.sm70_tp2_all_reduce_gemma_rms_norm(
@@ -628,6 +792,11 @@ class CustomAllreduce:
         normalized_out = torch.empty_like(inp)
         residual_out = torch.empty_like(residual, dtype=torch.float32)
         registered = self._IS_CAPTURING and torch.cuda.is_current_stream_capturing()
+        if registered and self._vmm_safe:
+            safe_inp = self._vmm_safe_graph_input(inp)
+            registered = safe_inp is not None
+            if safe_inp is not None:
+                inp = safe_inp
         reg_buffer = 0 if registered else self.buffer_ptrs[self.rank]
         reg_buffer_size = 0 if registered else self.max_size
         ops.sm70_tp4_all_reduce_gemma_rms_norm(
@@ -693,6 +862,18 @@ class CustomAllreduce:
         graph_registered = (
             self._IS_CAPTURING and torch.cuda.is_current_stream_capturing()
         )
+        if graph_registered and self._vmm_safe:
+            # Peers also write the shared output in place, so a copy of it
+            # would not work; stage both buffers instead when either one is
+            # not exportable.
+            safe_inp = self._vmm_safe_graph_input(inp)
+            if safe_inp is None:
+                graph_registered = False
+            elif not _is_legacy_cuda_ipc_capable(normalized_out.data_ptr()):
+                graph_registered = False
+                self._vmm_safe_fallbacks += 1
+            else:
+                inp = safe_inp
         ops.sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
             self._ptr,
             inp,
@@ -951,6 +1132,11 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
+                if self._vmm_safe:
+                    safe_pair = self._vmm_safe_graph_input(input_pair)
+                    if safe_pair is None:
+                        return self.top1_argmax(input_pair, registered=False)
+                    return self.top1_argmax(safe_pair, registered=True)
                 return self.top1_argmax(input_pair, registered=True)
             # Graph warmup still consumes the sampled token. Returning an
             # uninitialized placeholder here can change the dummy decode
@@ -966,6 +1152,13 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
+                if self._vmm_safe:
+                    safe_input = self._vmm_safe_graph_input(input)
+                    if safe_input is None:
+                        # The pre-registered staging buffer is cudaMalloc-
+                        # backed, so its graph registration is exportable.
+                        return self.all_reduce(input, registered=False)
+                    return self.all_reduce(safe_input, registered=True)
                 return self.all_reduce(input, registered=True)
             # Graph warmup can still feed persistent model state (KV, SSM, or
             # CUDA graph metadata buffers). Returning an uninitialized tensor
@@ -990,6 +1183,15 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
+                if self._vmm_safe:
+                    safe_a = self._vmm_safe_graph_input(input_a)
+                    safe_b = (
+                        None if safe_a is None else self._vmm_safe_graph_input(input_b)
+                    )
+                    if safe_a is None or safe_b is None:
+                        # Caller falls back to all_reduce(input_a + input_b).
+                        return None
+                    return self.all_reduce_sum2(safe_a, safe_b)
                 return self.all_reduce_sum2(input_a, input_b)
             return self.all_reduce(input_a + input_b, registered=False)
         return None

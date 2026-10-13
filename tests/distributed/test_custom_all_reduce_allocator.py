@@ -222,3 +222,228 @@ def test_cuda_ipc_capture_allocator_guard_is_otherwise_a_noop(
         pass
 
     assert settings == []
+
+
+def _vmm_safe_env(monkeypatch: pytest.MonkeyPatch, **values: str) -> None:
+    monkeypatch.setenv("VLLM_SM70_CAR_VMM_SAFE", values.get("safe", "1"))
+    monkeypatch.setenv("VLLM_SM70_CAR_VMM_SAFE_PREALLOC", values.get("prealloc", "1"))
+
+
+def test_vmm_safe_is_off_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("VLLM_SM70_CAR_VMM_SAFE", raising=False)
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    settings = _patch_allocator_settings(monkeypatch)
+
+    assert not custom_all_reduce._sm70_car_vmm_safe_enabled()
+    with custom_all_reduce.sm70_custom_ar_ipc_safe_allocation():
+        pass
+
+    assert settings == []
+
+
+def test_vmm_safe_prealloc_allocates_outside_expandable_segments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _vmm_safe_env(monkeypatch)
+    allocator_conf = "max_split_size_mb:512,expandable_segments:True"
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", allocator_conf)
+    settings = _patch_allocator_settings(monkeypatch)
+    monkeypatch.setattr(
+        custom_all_reduce.torch.cuda, "is_current_stream_capturing", lambda: False
+    )
+
+    with custom_all_reduce.sm70_custom_ar_ipc_safe_allocation():
+        assert settings == [allocator_conf.replace("True", "False")]
+
+    assert settings == [allocator_conf.replace("True", "False"), allocator_conf]
+
+
+@pytest.mark.parametrize(("prealloc", "capturing"), [("0", False), ("1", True)])
+def test_vmm_safe_prealloc_is_otherwise_a_noop(
+    monkeypatch: pytest.MonkeyPatch,
+    prealloc: str,
+    capturing: bool,
+) -> None:
+    _vmm_safe_env(monkeypatch, prealloc=prealloc)
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    settings = _patch_allocator_settings(monkeypatch)
+    monkeypatch.setattr(
+        custom_all_reduce.torch.cuda,
+        "is_current_stream_capturing",
+        lambda: capturing,
+    )
+
+    with custom_all_reduce.sm70_custom_ar_ipc_safe_allocation():
+        pass
+
+    assert settings == []
+
+
+def _capturing_communicator(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    vmm_safe: bool,
+    exportable,
+) -> tuple[custom_all_reduce.CustomAllreduce, list[tuple]]:
+    communicator = object.__new__(custom_all_reduce.CustomAllreduce)
+    communicator.disabled = False
+    communicator._ptr = 0
+    communicator.world_size = 4
+    communicator.fully_connected = True
+    communicator._IS_CAPTURING = True
+    communicator._vmm_safe = vmm_safe
+    communicator._vmm_safe_copies = 0
+    communicator._vmm_safe_fallbacks = 0
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        custom_all_reduce.torch.cuda, "is_current_stream_capturing", lambda: True
+    )
+    monkeypatch.setattr(custom_all_reduce, "_is_legacy_cuda_ipc_capable", exportable)
+    monkeypatch.setattr(communicator, "should_custom_ar", lambda inp: True)
+
+    def all_reduce(inp, *, out=None, registered=False):
+        calls.append(("all_reduce", inp, registered))
+        return inp
+
+    def all_reduce_sum2(inp_a, inp_b, *, out=None):
+        calls.append(("all_reduce_sum2", inp_a, inp_b))
+        return inp_a
+
+    def top1_argmax(inp, *, out=None, registered=False):
+        calls.append(("top1_argmax", inp, registered))
+        return inp
+
+    monkeypatch.setattr(communicator, "all_reduce", all_reduce)
+    monkeypatch.setattr(communicator, "all_reduce_sum2", all_reduce_sum2)
+    monkeypatch.setattr(communicator, "top1_argmax", top1_argmax)
+    return communicator, calls
+
+
+def test_vmm_safe_default_path_registers_inputs_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def no_probe(ptr: int) -> bool:
+        raise AssertionError("the default path must not query IPC capability")
+
+    communicator, calls = _capturing_communicator(
+        monkeypatch, vmm_safe=False, exportable=no_probe
+    )
+    inp = custom_all_reduce.torch.arange(16, dtype=custom_all_reduce.torch.float16)
+
+    communicator.custom_all_reduce(inp)
+    communicator.custom_all_reduce_sum2(inp, inp.clone())
+
+    assert calls[0] == ("all_reduce", inp, True)
+    assert calls[1][0] == "all_reduce_sum2" and calls[1][1] is inp
+
+
+def test_vmm_safe_keeps_exportable_inputs_without_a_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    communicator, calls = _capturing_communicator(
+        monkeypatch, vmm_safe=True, exportable=lambda ptr: True
+    )
+    torch = custom_all_reduce.torch
+    inp = torch.arange(16, dtype=torch.float16)
+    other = inp.clone()
+
+    communicator.custom_all_reduce(inp)
+    communicator.custom_all_reduce_sum2(inp, other)
+
+    assert calls[0] == ("all_reduce", inp, True)
+    assert calls[1][1] is inp and calls[1][2] is other
+    assert communicator._vmm_safe_copies == 0
+
+
+def test_vmm_safe_copies_unexportable_inputs_before_registration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch = custom_all_reduce.torch
+    inp = torch.arange(16, dtype=torch.float16)
+    resident = torch.arange(16, 32, dtype=torch.float16)
+    vmm_ptrs = {inp.data_ptr(), resident.data_ptr()}
+    communicator, calls = _capturing_communicator(
+        monkeypatch, vmm_safe=True, exportable=lambda ptr: ptr not in vmm_ptrs
+    )
+    shared = torch.ones(16, dtype=torch.float16)
+
+    communicator.custom_all_reduce(inp)
+    communicator.custom_all_reduce_sum2(shared, resident)
+    communicator.custom_top1_argmax(torch.zeros(2, dtype=torch.float32))
+
+    name, staged, registered = calls[0]
+    assert name == "all_reduce" and registered
+    assert staged.data_ptr() not in vmm_ptrs and torch.equal(staged, inp)
+    assert staged.stride() == inp.stride()
+    name, sum_a, sum_b = calls[1]
+    assert name == "all_reduce_sum2" and sum_a is shared
+    assert sum_b.data_ptr() not in vmm_ptrs and torch.equal(sum_b, resident)
+    assert calls[2][0] == "top1_argmax" and calls[2][2]
+    assert communicator._vmm_safe_copies == 2
+    assert communicator._vmm_safe_fallbacks == 0
+
+
+def test_vmm_safe_falls_back_when_no_exportable_copy_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    communicator, calls = _capturing_communicator(
+        monkeypatch, vmm_safe=True, exportable=lambda ptr: None
+    )
+    torch = custom_all_reduce.torch
+    inp = torch.arange(16, dtype=torch.float16)
+    pair = torch.zeros(2, dtype=torch.float32)
+
+    communicator.custom_all_reduce(inp)
+    assert communicator.custom_all_reduce_sum2(inp, inp.clone()) is None
+    communicator.custom_top1_argmax(pair)
+
+    # Staging buffer registration (all_reduce/top1) or the NCCL add path (sum2).
+    assert calls == [("all_reduce", inp, False), ("top1_argmax", pair, False)]
+    assert communicator._vmm_safe_copies == 0
+    assert communicator._vmm_safe_fallbacks == 3
+
+
+def test_vmm_safe_counts_are_logged_and_reset_before_ipc_export(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    communicator = object.__new__(custom_all_reduce.CustomAllreduce)
+    communicator.disabled = False
+    communicator._vmm_safe = True
+    communicator._vmm_safe_copies = 3
+    communicator._vmm_safe_fallbacks = 1
+    communicator._ptr = 0
+    messages: list[tuple] = []
+    monkeypatch.setattr(
+        custom_all_reduce.logger,
+        "info",
+        lambda msg, *args: messages.append((msg, args)),
+    )
+
+    def failed_export(_ptr):
+        raise RuntimeError("cudaIpcGetMemHandle failed")
+
+    monkeypatch.setattr(
+        custom_all_reduce.ops, "get_graph_buffer_ipc_meta", failed_export
+    )
+
+    with pytest.raises(RuntimeError, match="cudaIpcGetMemHandle"):
+        communicator.register_graph_buffers()
+
+    assert messages and messages[0][1] == (3, 1)
+    assert communicator._vmm_safe_copies == 0
+    assert communicator._vmm_safe_fallbacks == 0
+
+
+def test_ipc_probe_failure_is_reported_as_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def missing_driver(*args, **kwargs):
+        raise OSError("libcuda.so.1: cannot open shared object file")
+
+    monkeypatch.setattr(custom_all_reduce, "_LEGACY_CUDA_IPC_PROBE", None)
+    monkeypatch.setattr(custom_all_reduce, "_LEGACY_CUDA_IPC_PROBE_FAILED", False)
+    monkeypatch.setattr(custom_all_reduce, "_LegacyCudaIpcProbe", missing_driver)
+
+    assert custom_all_reduce._is_legacy_cuda_ipc_capable(0x1000) is None
+    assert custom_all_reduce._LEGACY_CUDA_IPC_PROBE_FAILED
+    assert custom_all_reduce._is_legacy_cuda_ipc_capable(0x2000) is None

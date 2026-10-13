@@ -511,6 +511,10 @@ class KernelConfig:
     ple_disk_cascade_reason: str | None = Field(default=None, init=False)
     """Startup reason when the disk cascade cannot serve this configuration."""
 
+    sm70_greedy_verify: bool = False
+    """Verify greedy MTP drafts from TP-local target argmax pairs instead of
+    gathering full-vocabulary logits for the rejection sampler."""
+
     ple_result_transport: Literal["auto", "cuda", "mapped"] = "auto"
     """Select CPU PLE result transport by local operator/resource capability."""
     ple_result_transports: dict[str, Any] = Field(
@@ -548,6 +552,8 @@ class KernelConfig:
             "ple_disk_cascade_reason",
             "ple_result_transports",
             "qsa_auto_e4m3_reason",
+            # Sampler-only switch; it does not change any compiled graph.
+            "sm70_greedy_verify",
         }
         if not self.sm70_skinny_moe_applicable:
             ignored_factors.add("sm70_skinny_moe")

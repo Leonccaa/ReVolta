@@ -436,6 +436,7 @@ if TYPE_CHECKING:
     VLLM_SM70_CUSTOM_AR_LIBRARY: str | None = None
     VLLM_SM70_TOP1_CUSTOM_AR: bool = False
     VLLM_SM70_GREEDY_TOKEN_FASTPATH: bool = True
+    VLLM_SM70_GREEDY_VERIFY: bool = False
     VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE: bool = False
     VLLM_SM70_COMPACT_TOPK20_SAMPLER: bool = False
     VLLM_SM70_CHUNKED_TOPK20_CHUNKS: int = 0
@@ -6551,6 +6552,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="experimental",
         declared_default="True",
         effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
+    ),
+    # Greedy MTP verification from TP-local argmax pairs (ported from 1CatAI
+    # b3f1229d8f, kernel_config.sm70_greedy_verify). Either switch enables it.
+    "VLLM_SM70_GREEDY_VERIFY": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_GREEDY_VERIFY", "0"))),
+        description=(
+            "Verify greedy MTP drafts from TP-local (value, id) argmax pairs "
+            "gathered over the normal TP group instead of full-vocabulary "
+            "logits. Same switch as kernel_config.sm70_greedy_verify; only "
+            "used when every request is greedy without logprobs, penalties, "
+            "logit bias, bad words, grammar or LoRA."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
         user_visible=False,

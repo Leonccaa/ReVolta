@@ -47,11 +47,17 @@ __global__ void rmsnorm_gated_exact_kernel(const half* x, const half* z,
   }
 }
 
+// One warp per row and no shared memory, so the row count is only an
+// admission bound: 192 = 16 tokens x 12 local heads by default, 576 = 48
+// tokens with VLLM_SM70_QWEN38_WIDE_M_GATED_NORM (checked in Python).
+constexpr int64_t kMaxRows = 576;
+
 void rmsnorm_gated_exact(torch::Tensor out, torch::Tensor x, torch::Tensor z,
                          torch::Tensor weight, double eps, bool silu) {
   TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.size(1) == 128 &&
-                  x.size(0) >= 1 && x.size(0) <= 192,
-              "SM70 exact gated RMSNorm requires CUDA [1..192, 128]");
+                  x.size(0) >= 1 && x.size(0) <= kMaxRows,
+              "SM70 exact gated RMSNorm requires CUDA [1..", kMaxRows,
+              ", 128]");
   const c10::cuda::CUDAGuard guard(x.device());
   const auto* properties = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(properties->major == 7 && properties->minor == 0,

@@ -20,6 +20,15 @@ from vllm.v1.worker.gpu.states import RequestState
 logger = init_logger(__name__)
 
 
+def _ple_input_prepare_max_padded_requests() -> int:
+    """Padded requests of the fused PLE n-gram input preparation.
+
+    4 by default; VLLM_SM70_QWEN38_WIDE_M_PLE admits 8 (the Triton kernel
+    launches one program per padded request and has no request bound).
+    """
+    return 8 if envs.VLLM_SM70_QWEN38_WIDE_M_PLE else 4
+
+
 class Qwen4ExpModelState(MambaHybridModelState):
     """Add rollback-safe PLE n-gram context to the model inputs."""
 
@@ -114,7 +123,10 @@ class Qwen4ExpModelState(MambaHybridModelState):
             reason = "disabled_by_kernel_config"
         elif not self._ple_input_hardware:
             reason = "requires_sm70"
-        elif num_reqs_padded > 4 or self.ngram_context_len > 8:
+        elif (
+            num_reqs_padded > _ple_input_prepare_max_padded_requests()
+            or self.ngram_context_len > 8
+        ):
             reason = "input_shape_has_no_calibration"
         elif any(
             t.dtype != torch.int32 or not t.is_cuda or not t.is_contiguous()

@@ -401,6 +401,36 @@ def _sm70_flashqla_original_prefill_enabled() -> bool:
     return raw.strip().lower() not in ("0", "false", "no", "off", "")
 
 
+# VLLM_SM70_QWEN38_WIDE_M_GDN: token bound of the widened verify admissions
+# (max_num_seqs 8 x MTP4 = 40 tokens; the Triton/copy kernels are M-generic).
+_SM70_GDN_WIDE_M_MAX_TOKENS = 48
+
+
+def _sm70_gdn_wide_tokens_ok(num_tokens: int) -> bool:
+    return bool(
+        envs.VLLM_SM70_QWEN38_WIDE_M_GDN
+        and 2 <= num_tokens <= _SM70_GDN_WIDE_M_MAX_TOKENS
+    )
+
+
+def _sm70_gdn_tail_copy_tokens_ok(num_tokens: int) -> bool:
+    """Token counts of the opt-in tail-copy / direct-output routes.
+
+    1CatAI #927/#928/#929/#936 admit the MTP4 verify widths 5 and 20 (1 and 4
+    requests); VLLM_SM70_QWEN38_WIDE_M_GDN admits 2..48 tokens.
+    """
+    return num_tokens in (5, 20) or _sm70_gdn_wide_tokens_ok(num_tokens)
+
+
+def _sm70_mixed_qkv_verify_tokens_ok(num_tokens: int) -> bool:
+    """Token band of the fused mixed-QKV GDN verifier (default 2..16)."""
+    return (
+        1 < num_tokens <= 16
+        or (envs.VLLM_SM70_GDN_TAIL_COPY and num_tokens == 20)
+        or _sm70_gdn_wide_tokens_ok(num_tokens)
+    )
+
+
 def _sm70_flashqla_indexed_prefill_enabled() -> bool:
     raw = os.getenv("VLLM_SM70_FLASHQLA_INDEXED_PREFILL")
     if raw is None:
@@ -4267,7 +4297,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 envs.VLLM_SM70_GDN_TAIL_COPY  # 1CatAI #936, opt-in here
                 and not self.gqa_interleaved_layout
                 and not self.disable_tp_for_ba_proj
-                and mixed_qkvz.shape[0] in (5, 20)
+                and _sm70_gdn_tail_copy_tokens_ok(mixed_qkvz.shape[0])
                 and (self.key_dim * 2 + self.value_dim) // self.tp_size == 2560
                 and self.value_dim // self.tp_size == 1536
                 and _can_fuse_gdn_projection_split(mixed_qkvz, ba)
@@ -5390,7 +5420,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 or (
                     envs.VLLM_SM70_GDN_TAIL_COPY  # 1CatAI #928
                     and attn_metadata.spec_sequence_masks is not None
-                    and mixed_qkv.shape[0] in (5, 20)
+                    and _sm70_gdn_tail_copy_tokens_ok(mixed_qkv.shape[0])
                     and mixed_qkv.stride(1) == 1
                     and mixed_qkv.stride(0) >= mixed_qkv.shape[1]
                 )
@@ -5751,15 +5781,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 mixed_qkv_spec.is_contiguous()
                 or (
                     envs.VLLM_SM70_GDN_TAIL_COPY  # 1CatAI #928
-                    and mixed_qkv_spec.shape[0] in (5, 20)
+                    and _sm70_gdn_tail_copy_tokens_ok(mixed_qkv_spec.shape[0])
                     and mixed_qkv_spec.stride(1) == 1
                     and mixed_qkv_spec.stride(0) >= mixed_qkv_spec.shape[1]
                 )
             )
-            and (
-                1 < mixed_qkv_spec.shape[0] <= 16
-                or (envs.VLLM_SM70_GDN_TAIL_COPY and mixed_qkv_spec.shape[0] == 20)
-            )
+            and _sm70_mixed_qkv_verify_tokens_ok(mixed_qkv_spec.shape[0])
         )
         if use_dflash2_packed_gdn_verify or use_sm70_mixed_qkv_verify:
             query_spec, key_spec, value_spec = None, None, None
@@ -5947,7 +5974,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     envs.VLLM_SM70_MTP_GDN_DIRECT_OUTPUT  # 1CatAI #929, opt-in
                     and spec_rows_are_batch
                     and num_actual_tokens == mixed_qkv_spec.shape[0]
-                    and num_actual_tokens in (5, 20)
+                    and _sm70_gdn_tail_copy_tokens_ok(num_actual_tokens)
                     and core_attn_out.is_contiguous()
                     and core_attn_out.dtype == mixed_qkv_spec.dtype
                 )
@@ -7555,7 +7582,7 @@ def qwen_gdn_input_projection_core(
             envs.VLLM_SM70_GDN_TAIL_COPY  # 1CatAI #927, opt-in here
             and not self.gqa_interleaved_layout
             and not self.disable_tp_for_ba_proj
-            and mixed_qkvz.shape[0] in (5, 20)
+            and _sm70_gdn_tail_copy_tokens_ok(mixed_qkvz.shape[0])
             and (self.key_dim * 2 + self.value_dim) // self.tp_size == 2560
             and self.value_dim // self.tp_size == 1536
             and z_out.shape == (mixed_qkvz.shape[0], 12, 128)

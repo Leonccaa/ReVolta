@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm import envs
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
@@ -16,12 +17,17 @@ class Sm70PLENgramCapability:
     graph_safe: bool = True
     min_m: int = 2
     max_m: int = 32
+    # VLLM_SM70_QWEN38_WIDE_M_PLE (one program per token, M-generic kernel).
+    wide_max_m: int = 48
+
+    def max_tokens(self) -> int:
+        return self.wide_max_m if envs.VLLM_SM70_QWEN38_WIDE_M_PLE else self.max_m
 
     def reason(self, ids, starts, context, multipliers, sizes, offsets):
         if not ids.is_cuda or not current_platform.is_device_capability(70):
             return "requires_sm70"
         m, requests = ids.numel(), starts.numel() - 1
-        if not self.min_m <= m <= self.max_m or not 1 <= requests <= 32:
+        if not self.min_m <= m <= self.max_tokens() or not 1 <= requests <= 32:
             return "outside_small_batch_band"
         if context.ndim != 2 or context.shape[0] < requests or context.shape[1] != 2:
             return "requires_two_history_tokens_per_request"

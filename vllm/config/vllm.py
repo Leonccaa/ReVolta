@@ -84,6 +84,8 @@ DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
 _SM70_NOMTP_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 16, 32)
 _SM70_DFLASH2_VERIFIER_DEFAULTS = SM70_DFLASH2_VERIFIER_DEFAULTS
 _SM70_MTP_CUDAGRAPH_REQUEST_SIZES = (1, 2, 3, 4, 6, 8, 12, 16)
+# VLLM_SM70_QWEN38_WIDE_M_CAPTURE: 5 and 7 requests no longer pad to 6 and 8.
+_SM70_MTP_CUDAGRAPH_WIDE_REQUEST_SIZES = (5, 7)
 _SM70_SPECULATIVE_AUX_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 9, 18)
 
 _SM70_BATCH_GEMM_DEFAULTS = {
@@ -418,6 +420,17 @@ def _sm70_max_cudagraph_capture_size(
     return max(size for size in capture_sizes if size <= max_num_batched_tokens)
 
 
+def _sm70_mtp_cudagraph_request_sizes() -> tuple[int, ...]:
+    if envs.VLLM_SM70_QWEN38_WIDE_M_CAPTURE:
+        return tuple(
+            sorted(
+                set(_SM70_MTP_CUDAGRAPH_REQUEST_SIZES)
+                | set(_SM70_MTP_CUDAGRAPH_WIDE_REQUEST_SIZES)
+            )
+        )
+    return _SM70_MTP_CUDAGRAPH_REQUEST_SIZES
+
+
 def _sm70_mtp_cudagraph_capture_sizes(
     max_num_seqs: int,
     decode_query_len: int,
@@ -425,7 +438,7 @@ def _sm70_mtp_cudagraph_capture_sizes(
     """Return exact SM70 MTP verifier token shapes for production requests."""
     max_graph_reqs = min(max(int(max_num_seqs), 1), 16)
     request_sizes = {
-        size for size in _SM70_MTP_CUDAGRAPH_REQUEST_SIZES if size <= max_graph_reqs
+        size for size in _sm70_mtp_cudagraph_request_sizes() if size <= max_graph_reqs
     }
     request_sizes.add(max_graph_reqs)
     return [decode_query_len * size for size in sorted(request_sizes)]
@@ -589,7 +602,7 @@ def _sm70_speculative_cudagraph_capture_sizes(
     # ordinary decode. A 16-request cap leaves C32 outside CUDA Graph replay.
     max_graph_reqs = min(max(int(max_num_seqs), 1), 32)
     request_sizes = {
-        size for size in _SM70_MTP_CUDAGRAPH_REQUEST_SIZES if size <= max_graph_reqs
+        size for size in _sm70_mtp_cudagraph_request_sizes() if size <= max_graph_reqs
     }
     request_sizes.add(max_graph_reqs)
     verifier_sizes = [decode_query_len * size for size in request_sizes]

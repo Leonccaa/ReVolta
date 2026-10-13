@@ -31,6 +31,21 @@ from vllm.model_executor.utils import set_weight_attrs
 logger = init_logger(__name__)
 
 _DEFAULT_PERSISTENT_MAX_TOKENS = 32
+# VLLM_SM70_QWEN38_WIDE_M_FP8_MOE_BUFFERS: resident scratch for 48 tokens.
+_WIDE_M_PERSISTENT_MAX_TOKENS = 48
+
+
+def _persistent_max_tokens() -> int:
+    """Resident decode scratch rows: 32 tokens by default.
+
+    VLLM_SM70_QWEN38_WIDE_M_FP8_MOE_BUFFERS sizes them for 48 tokens (480
+    routed slots at top-10), which covers max_num_seqs=8 x MTP4 verify (40)
+    so 33..48-token steps do not allocate per call (about 1.8 MiB more per
+    FP8 MoE layer at hidden 2560).
+    """
+    if envs.VLLM_SM70_QWEN38_WIDE_M_FP8_MOE_BUFFERS:
+        return _WIDE_M_PERSISTENT_MAX_TOKENS
+    return _DEFAULT_PERSISTENT_MAX_TOKENS
 
 
 def _log_runtime_route_once(message: str, *args) -> None:
@@ -364,7 +379,7 @@ class Fp8SM70MoEMethod(FusedMoEMethodBase):
     def _allocate_buffers(self, layer: RoutedExperts) -> None:
         device = layer.w13_tm_weight.device
         top_k = self.moe.experts_per_token
-        persistent_tokens = _DEFAULT_PERSISTENT_MAX_TOKENS
+        persistent_tokens = _persistent_max_tokens()
         max_slots = persistent_tokens * top_k
         hidden_size = layer.sm70_hidden_logical_size
         num_experts = layer.sm70_num_experts

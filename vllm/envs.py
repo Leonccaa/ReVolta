@@ -268,6 +268,12 @@ if TYPE_CHECKING:
     VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS: int = 20
     VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_PACK_ROWS: int = 0
     VLLM_SM70_AWQ_QWEN38_MOE_GROUPED_DECODE_MAX_TOKENS: int = 20
+    VLLM_SM70_QWEN38_WIDE_M: bool = False
+    VLLM_SM70_QWEN38_WIDE_M_GDN: bool = False
+    VLLM_SM70_QWEN38_WIDE_M_GATED_NORM: bool = False
+    VLLM_SM70_QWEN38_WIDE_M_FP8_MOE_BUFFERS: bool = False
+    VLLM_SM70_QWEN38_WIDE_M_PLE: bool = False
+    VLLM_SM70_QWEN38_WIDE_M_CAPTURE: bool = False
     VLLM_SM70_AWQ_QWEN38_MOE_W2_CHUNK_TOKENS: int = 0
     VLLM_SM70_AWQ_MOE_BATCHED_SINGLE_TOKEN_DENSE_W13: bool = False
     VLLM_SM70_AWQ_MOE_BATCHED_EXACT_W2: bool = False
@@ -3454,6 +3460,127 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="20",
         automatic_conditions=(),
         acceleration_paths=("TurboMindAwqLinearKernel",),
+        user_visible=False,
+    ),
+    # Opt-in admission widenings for max_num_seqs=8 MTP4 verify (M up to 40).
+    "VLLM_SM70_QWEN38_WIDE_M": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_QWEN38_WIDE_M", "0"))),
+        description=(
+            "Umbrella default for the VLLM_SM70_QWEN38_WIDE_M_* switches: widen "
+            "admission-only SM70 Qwen3.8 decode/verify routes from the 4-request "
+            "(<=20 token) envelope to 8 requests (M up to 40, kernels accept 48). "
+            "Each item switch overrides it individually."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 Qwen3.8 wide-M decode",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_QWEN38_WIDE_M_GDN": env_var(
+        lambda: bool(
+            int(
+                os.getenv(
+                    "VLLM_SM70_QWEN38_WIDE_M_GDN",
+                    os.getenv("VLLM_SM70_QWEN38_WIDE_M", "0"),
+                )
+            )
+        ),
+        description=(
+            "Admit 2..48-token MTP verify batches to the fused mixed-QKV GDN "
+            "verifier (default 2..16, or 20 with VLLM_SM70_GDN_TAIL_COPY), and "
+            "widen the opt-in VLLM_SM70_GDN_TAIL_COPY / "
+            "VLLM_SM70_MTP_GDN_DIRECT_OUTPUT token sets {5, 20} to 2..48."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False (follows VLLM_SM70_QWEN38_WIDE_M when unset)",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 Qwen3.8 wide-M decode",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_QWEN38_WIDE_M_GATED_NORM": env_var(
+        lambda: bool(
+            int(
+                os.getenv(
+                    "VLLM_SM70_QWEN38_WIDE_M_GATED_NORM",
+                    os.getenv("VLLM_SM70_QWEN38_WIDE_M", "0"),
+                )
+            )
+        ),
+        description=(
+            "Admit up to 576 rows (48 tokens x 12 local value heads; default "
+            "192) to the native exact gated RMSNorm (sm70_rmsnorm_gated_exact)."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False (follows VLLM_SM70_QWEN38_WIDE_M when unset)",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 Qwen3.8 wide-M decode",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_QWEN38_WIDE_M_FP8_MOE_BUFFERS": env_var(
+        lambda: bool(
+            int(
+                os.getenv(
+                    "VLLM_SM70_QWEN38_WIDE_M_FP8_MOE_BUFFERS",
+                    os.getenv("VLLM_SM70_QWEN38_WIDE_M", "0"),
+                )
+            )
+        ),
+        description=(
+            "Size the SM70 FP8 MoE persistent decode buffers for "
+            "max_num_seqs x verify width tokens, between the default 32 and 48, "
+            "so 33..48-token draft/verify steps do not allocate per call."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False (follows VLLM_SM70_QWEN38_WIDE_M when unset)",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 Qwen3.8 wide-M decode",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_QWEN38_WIDE_M_PLE": env_var(
+        lambda: bool(
+            int(
+                os.getenv(
+                    "VLLM_SM70_QWEN38_WIDE_M_PLE",
+                    os.getenv("VLLM_SM70_QWEN38_WIDE_M", "0"),
+                )
+            )
+        ),
+        description=(
+            "Widen the opt-in PLE routes: VLLM_SM70_PLE_NGRAM_BATCH to 48 tokens "
+            "(default 32) and VLLM_SM70_PLE_INPUT_PREPARE to 8 padded requests "
+            "(default 4)."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False (follows VLLM_SM70_QWEN38_WIDE_M when unset)",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 Qwen3.8 wide-M decode",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_QWEN38_WIDE_M_CAPTURE": env_var(
+        lambda: bool(
+            int(
+                os.getenv(
+                    "VLLM_SM70_QWEN38_WIDE_M_CAPTURE",
+                    os.getenv("VLLM_SM70_QWEN38_WIDE_M", "0"),
+                )
+            )
+        ),
+        description=(
+            "Add 5 and 7 requests to the SM70 MTP CUDA-graph request sizes "
+            "(default 1, 2, 3, 4, 6, 8, 12, 16) so 5 or 7 verify requests do "
+            "not pad to 6 or 8."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False (follows VLLM_SM70_QWEN38_WIDE_M when unset)",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 Qwen3.8 wide-M decode",),
         user_visible=False,
     ),
     # Zero disables chunking; 4096 and 6144 cap the indexed W2 scratch rows.

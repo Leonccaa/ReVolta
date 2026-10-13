@@ -33,13 +33,25 @@ def _sm70_gated_norm_device_supported(device_id: int | None) -> bool:
     return current_platform.is_device_capability(70, device_id=device_id)
 
 
+# Rows admitted to the native exact gated RMSNorm: 16 tokens x 12 local value
+# heads by default; 48 x 12 with VLLM_SM70_QWEN38_WIDE_M_GATED_NORM (the
+# kernel is one warp per row and accepts up to 576 rows).
+_SM70_GATED_NORM_MAX_ROWS = 192
+_SM70_GATED_NORM_WIDE_MAX_ROWS = 576
+
+
 def _sm70_gated_norm_shape_supported(
     x: torch.Tensor, z: torch.Tensor | None, weight: torch.Tensor
 ) -> bool:
+    max_rows = (
+        _SM70_GATED_NORM_WIDE_MAX_ROWS
+        if envs.VLLM_SM70_QWEN38_WIDE_M_GATED_NORM
+        else _SM70_GATED_NORM_MAX_ROWS
+    )
     return bool(
         z is not None
         and x.ndim == 2
-        and 1 <= x.shape[0] <= 192
+        and 1 <= x.shape[0] <= max_rows
         and x.shape[1] == 128
         and z.shape == x.shape
         and weight.shape == (128,)

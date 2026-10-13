@@ -3390,8 +3390,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         lambda: int(os.getenv("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT", "16")),
         description=(
             "W13 split-K warps per CTA for VLLM_SM70_AWQ_QWEN38_GROUPED_QPN: "
-            "16 reproduces the per-row arithmetic of the QPN M1 route; 8 uses "
-            "fewer threads per CTA and a different FP32 split association."
+            "16 reproduces the per-row arithmetic of the QPN M1 route; 8 or 4 "
+            "use fewer threads per CTA (longer K per warp, as the NVFP4 grouped "
+            "W13 kernel) and a different FP32 split association."
         ),
         category="tuning",
         declared_default="16",

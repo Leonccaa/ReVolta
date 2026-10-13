@@ -29,8 +29,10 @@
 // With split=16 the per-route arithmetic (K assignment per warp, MMA chain,
 // partial-sum order, FP16 boundaries, router-order fmaf) is the same as
 // awq_moe_qpn_m1_sm70_out, so every row is expected to match a separate M=1
-// QPN call bitwise (batch invariance). split=8 changes only the FP32 split-K
-// association. Neither is bitwise equal to the TurboMind serial split-K route.
+// QPN call bitwise (batch invariance). split=8 or 4 (fewer warps per CTA,
+// longer K per warp, as the NVFP4 grouped w13_kernel<4>) changes only the
+// FP32 split-K association. Neither is bitwise equal to the TurboMind serial
+// split-K route.
 
 #include <torch/all.h>
 #include <ATen/MemoryOverlap.h>
@@ -479,7 +481,10 @@ void launch_all(const at::Tensor& input, const at::Tensor& w13,
                 const at::Tensor& plan, at::Tensor& intermediate,
                 at::Tensor& out, int tokens, int split, cudaStream_t stream) {
   const int routes = tokens * kTopK;
-  if (split == 8) {
+  if (split == 4) {
+    launch_w13<W13Format, 4, RB>(input, w13, s13, plan, intermediate, routes,
+                                 stream);
+  } else if (split == 8) {
     launch_w13<W13Format, 8, RB>(input, w13, s13, plan, intermediate, routes,
                                  stream);
   } else {
@@ -542,8 +547,8 @@ void awq_moe_grouped_decode_sm70_out(at::Tensor out, at::Tensor intermediate,
       "awq_grouped_decode: input must be [1..20, 2560]");
   const int tokens = static_cast<int>(input.size(0));
   const int routes = tokens * kTopK;
-  TORCH_CHECK(split == 0 || split == 8 || split == 16,
-              "awq_grouped_decode: split must be 0 (default 16), 8 or 16");
+  TORCH_CHECK(split == 0 || split == 4 || split == 8 || split == 16,
+              "awq_grouped_decode: split must be 0 (default 16), 4, 8 or 16");
   check_tensor(input, at::kHalf, {tokens, kK}, device, "input");
   check_tensor(out, at::kHalf, {tokens, kN2}, device, "output");
   check_tensor(intermediate, at::kHalf, {routes, kK2}, device, "intermediate");
@@ -589,7 +594,7 @@ void awq_moe_grouped_decode_sm70_out(at::Tensor out, at::Tensor intermediate,
       ids.const_data_ptr<int32_t>(), routes, rb * 8,
       plan.mutable_data_ptr<int32_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  const int w13_split = split == 8 ? 8 : 16;
+  const int w13_split = split == 0 ? 16 : static_cast<int>(split);
   if (compact) {
     dispatch_rb<1, 0>(rb, input, w13, s13, w2, s2, topk, plan, intermediate,
                       out, tokens, w13_split, stream);

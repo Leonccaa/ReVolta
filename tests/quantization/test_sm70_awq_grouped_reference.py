@@ -153,7 +153,7 @@ def test_initialize_default_off_never_inspects_layer(monkeypatch):
 
 def test_initialize_rejects_bad_split(monkeypatch):
     monkeypatch.setenv("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN", "1")
-    monkeypatch.setenv("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT", "4")
+    monkeypatch.setenv("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT", "2")
     with pytest.raises(ValueError):
         moe._initialize_qwen38_grouped_qpn(_layer(), True, 10)
 

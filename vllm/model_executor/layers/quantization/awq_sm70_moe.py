@@ -151,8 +151,8 @@ def _initialize_qwen38_grouped_qpn(
     if not envs.VLLM_SM70_AWQ_QWEN38_GROUPED_QPN:
         return False
     split = int(envs.VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT)
-    if split not in (8, 16):
-        raise ValueError("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT must be 8 or 16.")
+    if split not in (4, 8, 16):
+        raise ValueError("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT must be 4, 8 or 16.")
     reasons = []
     if not shape_contract:
         reasons.append("not the Qwen3.8 TP4 E512 g32 2560/320/160 shape")

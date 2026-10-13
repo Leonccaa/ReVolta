@@ -8,7 +8,7 @@ intermediate 160 per rank, AWQ g32 with compact metadata) for M rows, on full
 the production AWQSM70MoEMethod (awq_sm70_prepare_compact):
 
 * grouped: awq_moe_grouped_decode_sm70_out (plan + W13/SwiGLU + W2/reduce),
-  W13 split 16 and 8;
+  W13 split 16, 8 and 4;
 * turbomind: AWQSM70MoEMethod.apply() with the grouped route disabled, i.e.
   the production route (permute + active-grouped TurboMind GEMMs for M<=8,
   per-expert dispatch for M>8, SwiGLU, W2, unpermute);
@@ -146,7 +146,7 @@ def main():
         default=None,
         help="torch.save'd [N, 10] int topk_ids; first M rows used",
     )
-    parser.add_argument("--splits", type=int, nargs="+", default=[16, 8])
+    parser.add_argument("--splits", type=int, nargs="+", default=[16, 8, 4])
     parser.add_argument("--no-turbomind", action="store_true")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--json", default=None)

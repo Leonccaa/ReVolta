@@ -7,7 +7,7 @@ Checks, for M = 1..20 rows with random routings:
 * W13 intermediate and final output against the FP64 decoded-bank reference
   (relative 1e-2 of the reference max, FP16 boundaries);
 * every row against a separate M=1 QPN call (bitwise with split=16, the
-  QPN M1 arithmetic; tolerance with split=8) and batch invariance;
+  QPN M1 arithmetic; tolerance with split=8 or 4) and batch invariance;
 * changed-input CUDA graph replay, invalid ids, input validation, fake op;
 * the full AWQSM70MoEMethod.apply() route against the existing TurboMind
   active-grouped (M<=8) / per-expert-dispatch (M>8) route on the same
@@ -109,7 +109,7 @@ def _diff(actual, expected):
     return diff.max().item(), scale
 
 
-@pytest.mark.parametrize("split", [16, 8])
+@pytest.mark.parametrize("split", [16, 8, 4])
 @pytest.mark.parametrize("m", ALL_M)
 def test_grouped_against_reference_and_qpn_m1(banks, m, split):
     ops = _ops()
@@ -173,7 +173,7 @@ def test_grouped_against_reference_and_qpn_m1(banks, m, split):
         assert qpn_out_diff <= 1e-2 * out_scale + 2**-24
 
 
-@pytest.mark.parametrize("split", [16, 8])
+@pytest.mark.parametrize("split", [16, 8, 4])
 def test_batch_invariance(banks, split):
     """A row's output does not depend on M or on its co-routed rows."""
     ops = _ops()
@@ -286,7 +286,7 @@ def test_rejects_unsupported_inputs_and_traces(banks):
         (8, ids.long()),
         (9, topk.half()),
         (1, inter[:-1]),
-        (10, 4),
+        (10, 2),
     ):
         args = list(valid)
         args[index] = replacement

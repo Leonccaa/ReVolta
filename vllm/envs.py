@@ -338,6 +338,7 @@ if TYPE_CHECKING:
     VLLM_SM70_QWEN38_HC_REPLICATED: bool = False
     VLLM_SM70_SKIP_REJECTED_BATCH_PACKS: bool = False
     VLLM_SM70_GDN_TAIL_COPY: bool = False
+    VLLM_SM70_PLE_PREFILL_CONV_CHUNK: bool = False
     VLLM_SM70_MTP_GDN_DIRECT_OUTPUT: bool = False
     VLLM_SM70_QSA_SHARED_KEY: bool = False
     VLLM_SM70_QSA_COMPACT_TOPK: bool = False
@@ -4233,6 +4234,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_PLE_PREFILL_CONV_CHUNK": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_PLE_PREFILL_CONV_CHUNK", "0"))),
+        description=(
+            "Bound the PLE dilated short-conv prefill buffers when several "
+            "prefills share a step: the per-request padded "
+            "[prefills, hidden, state+max_len] history is processed in "
+            "channel chunks so each chunk is at most half of one unpadded "
+            "step. Depthwise convolution, so every channel's arithmetic is "
+            "unchanged. Needed at max_num_seqs=8, where the padded buffer "
+            "can exceed the profiled activation peak."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
         user_visible=False,
     ),
     "VLLM_SM70_GDN_TAIL_COPY": env_var(

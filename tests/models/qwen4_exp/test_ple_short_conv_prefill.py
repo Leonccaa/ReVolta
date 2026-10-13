@@ -253,3 +253,105 @@ def test_prefill_short_conv_holds_two_batch_sized_buffers() -> None:
     # two of them alive at once, plus index scratch.
     assert optimized <= 2.25 * batch_bytes, (optimized, batch_bytes)
     assert reference - optimized >= 2 * batch_bytes, (reference, optimized)
+
+
+# VLLM_SM70_PLE_PREFILL_CONV_CHUNK: one long prefill next to short ones pads
+# every request to the long one; the channel-chunked path must give the same
+# bits and keep its buffers bounded by the unpadded step.
+SKEWED_CASES = {
+    "skewed_with_state": dict(
+        lengths=[200, 3, 2, 1],
+        decode_tokens=2,
+        state_indices=[3, 0, 5, 1],
+        has_initial=[True, False, True, True],
+        hidden_size=256,
+    ),
+    "skewed_null_and_empty": dict(
+        lengths=[1, 150, 0, 4],
+        decode_tokens=0,
+        state_indices=[2, 4, 1, NULL_BLOCK_ID],
+        has_initial=[True, True, False, True],
+        hidden_size=192,
+    ),
+    "skewed_no_cache_rows": dict(
+        lengths=[90, 2],
+        decode_tokens=1,
+        state_indices=[0, 1],
+        has_initial=[False, False],
+        hidden_size=320,
+        empty_cache=True,
+    ),
+}
+
+
+@pytest.mark.parametrize("device,dtype", _devices())
+@pytest.mark.parametrize("name", sorted(SKEWED_CASES))
+def test_prefill_short_conv_channel_chunks_bitwise(
+    name, device, dtype, monkeypatch
+) -> None:
+    module, x_p, args = _case(device, dtype, **SKEWED_CASES[name])
+    metadata, conv_state, *rest = args
+    reference_state = conv_state.clone()
+    unchunked_state = conv_state.clone()
+
+    expected = _reference_prefill_batched(module, x_p, metadata, reference_state, *rest)
+    monkeypatch.setenv("VLLM_SM70_PLE_PREFILL_CONV_CHUNK", "0")
+    unchunked = module._short_conv_dilated_prefill_batched(
+        x_p, metadata, unchunked_state, *rest
+    )
+    calls = []
+    original = Qwen4ExpPLELayer._short_conv_dilated_prefill_channel_chunks
+
+    def spy(self, **kwargs):
+        calls.append(kwargs["chunk"])
+        return original(self, **kwargs)
+
+    monkeypatch.setattr(
+        Qwen4ExpPLELayer, "_short_conv_dilated_prefill_channel_chunks", spy
+    )
+    monkeypatch.setenv("VLLM_SM70_PLE_PREFILL_CONV_CHUNK", "1")
+    actual = module._short_conv_dilated_prefill_batched(
+        x_p, metadata, conv_state, *rest
+    )
+
+    assert calls and calls[0] < x_p.shape[1], calls
+    assert actual.is_contiguous()
+    assert torch.equal(actual, expected)
+    assert torch.equal(actual, unchunked)
+    assert torch.equal(conv_state, reference_state)
+    assert torch.equal(conv_state, unchunked_state)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_prefill_short_conv_channel_chunks_bound_memory(monkeypatch) -> None:
+    lengths = [1024] + [16] * 7
+    module, x_p, args = _case(
+        "cuda",
+        torch.float16,
+        lengths=lengths,
+        decode_tokens=0,
+        state_indices=list(range(8)),
+        has_initial=[True] * 8,
+        hidden_size=1024,
+        state_slots=8,
+    )
+    metadata, conv_state, *rest = args
+    batch_bytes = x_p.numel() * x_p.element_size()
+
+    def peak(state):
+        torch.accelerator.synchronize()
+        torch.accelerator.reset_peak_memory_stats()
+        base = torch.accelerator.memory_allocated()
+        result = module._short_conv_dilated_prefill_batched(x_p, metadata, state, *rest)
+        torch.accelerator.synchronize()
+        grown = torch.accelerator.max_memory_allocated() - base
+        return grown, result
+
+    monkeypatch.setenv("VLLM_SM70_PLE_PREFILL_CONV_CHUNK", "0")
+    padded, expected = peak(conv_state.clone())
+    monkeypatch.setenv("VLLM_SM70_PLE_PREFILL_CONV_CHUNK", "1")
+    chunked, actual = peak(conv_state.clone())
+    assert torch.equal(actual, expected)
+    # Output plus at most half a step per chunk buffer, plus index scratch.
+    assert chunked <= 2.5 * batch_bytes, (chunked, batch_bytes)
+    assert padded >= 4 * batch_bytes, (padded, batch_bytes)

@@ -4006,7 +4006,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=("MTP verifier", "Flash-Next qualified batch"),
+        acceleration_paths=("MTP verifier",),
         user_visible=False,
     ),
     # Join the admitted HC phases with cooperative grid barriers, keeping

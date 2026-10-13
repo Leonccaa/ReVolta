@@ -502,6 +502,9 @@ class KernelConfig:
     qsa_auto_e4m3_reason: str | None = Field(default=None, init=False)
     """Startup reason when calibrated automatic storage cannot be selected."""
 
+    sm70_qsa_shared_key: bool = True
+    """Share FP16 indexer keys across M2..8 queries of one request on SM70."""
+
     ple_disk_cascade: bool = True
     """Allow resident FP8 PLE tiers to spill to mapped checkpoint storage."""
     ple_disk_release_pages: bool = False

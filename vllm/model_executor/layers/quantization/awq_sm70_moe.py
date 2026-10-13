@@ -114,6 +114,78 @@ def _use_qwen38_active_grouped_decode(
     )
 
 
+_QWEN38_GROUPED_QPN_MIN_TOKENS: Final = 2
+_QWEN38_GROUPED_QPN_MAX_TOKENS: Final = 20
+
+
+def _initialize_qwen38_grouped_qpn(
+    layer: RoutedExperts, shape_contract: bool, top_k: int
+) -> bool:
+    """Opt-in admission of the grouped small-M AWQ route at load time."""
+    if not envs.VLLM_SM70_AWQ_QWEN38_GROUPED_QPN:
+        return False
+    split = int(envs.VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT)
+    if split not in (8, 16):
+        raise ValueError("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT must be 8 or 16.")
+    reasons = []
+    if not shape_contract:
+        reasons.append("not the Qwen3.8 TP4 E512 g32 2560/320/160 shape")
+    if top_k != 10:
+        reasons.append(f"top_k={top_k}")
+    if not getattr(layer, "sm70_awq_moe_batched_gemm", False):
+        reasons.append("batched TurboMind banks disabled")
+    if not getattr(layer, "sm70_awq_moe_w13_interleaved", False):
+        reasons.append("W13 bank is not gate/up interleaved")
+    if int(getattr(layer, "sm70_awq_checkpoint_group_size", 0)) != 32:
+        reasons.append("checkpoint group size is not 32")
+    if tuple(layer.w13_tm_weight.shape) != (512, 2560, 40) or tuple(
+        layer.w2_tm_weight.shape
+    ) != (512, 160, 320):
+        reasons.append("unexpected prepared bank shape")
+    if not hasattr(torch.ops._C, "awq_moe_grouped_decode_sm70_out"):
+        reasons.append("native op missing from this build")
+    if reasons:
+        logger.warning_once(
+            "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN=1 ignored for this layer: %s.",
+            "; ".join(reasons),
+        )
+        return False
+    logger.info_once(
+        "SM70 Qwen3.8 AWQ grouped QPN decode admitted for %d..%d rows (split=%d).",
+        _QWEN38_GROUPED_QPN_MIN_TOKENS,
+        _QWEN38_GROUPED_QPN_MAX_TOKENS,
+        split,
+    )
+    return True
+
+
+def _use_qwen38_grouped_qpn(
+    layer: RoutedExperts,
+    x: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> bool:
+    """Runtime admission: exact geometry, dtypes and storage of this call."""
+    num_tokens = x.shape[0]
+    return bool(
+        getattr(layer, "sm70_awq_qwen38_grouped_qpn", False)
+        and _QWEN38_GROUPED_QPN_MIN_TOKENS
+        <= num_tokens
+        <= _QWEN38_GROUPED_QPN_MAX_TOKENS
+        and x.ndim == 2
+        and x.shape[1] == 2560
+        and x.dtype == torch.float16
+        and x.is_contiguous()
+        and x.data_ptr() % 16 == 0
+        and topk_ids.shape == (num_tokens, 10)
+        and topk_ids.dtype == torch.int32
+        and topk_ids.is_contiguous()
+        and topk_weights.shape == (num_tokens, 10)
+        and topk_weights.dtype == torch.float32
+        and topk_weights.is_contiguous()
+    )
+
+
 def _use_temporary_buffers_for_dummy_or_capture() -> bool:
     # Dummy/profile and CUDA graph capture allocate temporary tensors. Captured
     # addresses subsequently remain fixed in the graph pool; normal eager
@@ -903,6 +975,11 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         layer.sm70_awq_qwen38_qpn_m1 = initialize_qpn_m1(
             layer, _qwen38_active_grouped_layer_contract(layer, self.group_size)
         )
+        layer.sm70_awq_qwen38_grouped_qpn = _initialize_qwen38_grouped_qpn(
+            layer,
+            _qwen38_active_grouped_layer_contract(layer, self.group_size),
+            int(self.moe.experts_per_token),
+        )
         w2_chunk_tokens = int(envs.VLLM_SM70_AWQ_QWEN38_MOE_W2_CHUNK_TOKENS)
         if w2_chunk_tokens not in (0, *_QWEN38_CHUNKED_W2_SUPPORTED_TOKENS):
             raise ValueError(
@@ -1047,6 +1124,14 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         layer._awq_moe_buf_active_expert_offsets = torch.arange(
             max_slots + 1, dtype=torch.int32, device=device
         )
+        # Fixed-size routing plan of the grouped small-M route (int32).
+        layer._awq_moe_buf_grouped_plan = torch.empty(
+            sm70_ops.AWQ_GROUPED_DECODE_PLAN_INTS
+            if getattr(layer, "sm70_awq_qwen38_grouped_qpn", False)
+            else 0,
+            dtype=torch.int32,
+            device=device,
+        )
         ptr_row_bytes = int(layer.sm70_ptr_row_bytes)
         layer._awq_moe_buf_compact_w13_ptrs_w = torch.empty(
             top_k * ptr_row_bytes, dtype=torch.uint8, device=device
@@ -1127,6 +1212,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 "legacy_w13_ptrs_s": layer._awq_moe_buf_legacy_w13_ptrs_s,
                 "legacy_w2_ptrs_w": layer._awq_moe_buf_legacy_w2_ptrs_w,
                 "legacy_w2_ptrs_s": layer._awq_moe_buf_legacy_w2_ptrs_s,
+                "grouped_plan": layer._awq_moe_buf_grouped_plan,
             }
 
         device = layer._awq_moe_buf_output.device
@@ -1281,6 +1367,11 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             "legacy_w13_ptrs_s": legacy_w13_ptrs_s,
             "legacy_w2_ptrs_w": legacy_w2_ptrs_w,
             "legacy_w2_ptrs_s": legacy_w2_ptrs_s,
+            "grouped_plan": (
+                torch.empty_like(layer._awq_moe_buf_grouped_plan)
+                if use_temporary_buffers
+                else layer._awq_moe_buf_grouped_plan
+            ),
         }
 
     def _apply_legacy_single_token_compact(
@@ -1573,6 +1664,28 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 )
             output = _dump_awq_moe_buffer(layer, output, "st_output")
             return output
+        if not indexed_w13 and _use_qwen38_grouped_qpn(
+            layer, x, topk_weights, topk_ids_i32
+        ):
+            _log_runtime_route_once(
+                "SM70 Qwen3.8 AWQ grouped QPN decode (tokens=%d, routes=%d).",
+                num_tokens,
+                total_slots,
+            )
+            sm70_ops.awq_moe_grouped_decode_sm70_out(
+                output,
+                buffers["intermediate"],
+                buffers["grouped_plan"],
+                x,
+                layer.w13_tm_weight,
+                layer.w13_tm_scales,
+                layer.w2_tm_weight,
+                layer.w2_tm_scales,
+                topk_ids_i32,
+                topk_weights,
+                int(envs.VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT),
+            )
+            return _dump_awq_moe_buffer(layer, output, "grouped_qpn_output")
         if indexed_w13:
             torch.ops._moe_C.moe_permute_metadata_with_scratch(
                 x,

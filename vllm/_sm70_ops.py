@@ -4119,6 +4119,49 @@ if hasattr(torch.ops._C, "awq_moe_qpn_m1_sm70_out"):
         return None
 
 
+# int32 elements of the fixed-size routing plan used by the grouped AWQ op
+# (kPlanInts in csrc/sm70_turbomind/ops/awq_grouped_decode_sm70.cu).
+AWQ_GROUPED_DECODE_PLAN_INTS = 5208
+
+
+def awq_moe_grouped_decode_sm70_out(
+    out: torch.Tensor,
+    intermediate: torch.Tensor,
+    plan: torch.Tensor,
+    input: torch.Tensor,
+    w13: torch.Tensor,
+    s13: torch.Tensor,
+    w2: torch.Tensor,
+    s2: torch.Tensor,
+    ids: torch.Tensor,
+    topk: torch.Tensor,
+    split: int = 16,
+) -> None:
+    """Qwen3.8 TP4 g32 AWQ grouped small-M MoE decode (M=1..20 rows)."""
+    _op("awq_moe_grouped_decode_sm70_out")(
+        out, intermediate, plan, input, w13, s13, w2, s2, ids, topk, split
+    )
+
+
+if hasattr(torch.ops._C, "awq_moe_grouped_decode_sm70_out"):
+
+    @register_fake("_C::awq_moe_grouped_decode_sm70_out")
+    def _awq_moe_grouped_decode_sm70_out_fake(
+        out: torch.Tensor,
+        intermediate: torch.Tensor,
+        plan: torch.Tensor,
+        input: torch.Tensor,
+        w13: torch.Tensor,
+        s13: torch.Tensor,
+        w2: torch.Tensor,
+        s2: torch.Tensor,
+        ids: torch.Tensor,
+        topk: torch.Tensor,
+        split: int,
+    ) -> None:
+        return None
+
+
 def awq_moe_single_token_sm70_out(
     out: torch.Tensor,
     x: torch.Tensor,

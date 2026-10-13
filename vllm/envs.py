@@ -262,6 +262,8 @@ if TYPE_CHECKING:
     VLLM_SM70_AWQ_QWEN38_MOE_INDEXED_PREFILL: bool = True
     VLLM_SM70_AWQ_QWEN38_MOE_COMPACT_GROUPED_DECODE: bool = True
     VLLM_SM70_AWQ_QWEN38_QPN_M1: bool = True
+    VLLM_SM70_AWQ_QWEN38_GROUPED_QPN: bool = False
+    VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT: int = 16
     VLLM_SM70_AWQ_QWEN38_MOE_W2_CHUNK_TOKENS: int = 0
     VLLM_SM70_AWQ_MOE_BATCHED_SINGLE_TOKEN_DENSE_W13: bool = False
     VLLM_SM70_AWQ_MOE_BATCHED_EXACT_W2: bool = False
@@ -3331,6 +3333,40 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "env_with_choices('VLLM_SM70_AWQ_QWEN38_QPN_M1', '1', ['0', "
             "'1'])() == '1'"
         ),
+        automatic_conditions=(),
+        acceleration_paths=("TurboMindAwqLinearKernel",),
+        user_visible=False,
+    ),
+    # Opt-in grouped small-M (2..20 rows) W13/W2 route on the prepared banks.
+    "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN", "0"))),
+        description=(
+            "Experimental Qwen3.8 TP4 native-g32 AWQ MoE decode route for "
+            "2..20 rows: a deterministic plan groups routes by expert, W13 "
+            "(+SwiGLU) and W2 read each active expert once for all of its "
+            "rows, and W2 reduces router slots in order without atomics. "
+            "Uses the existing prepared TurboMind banks (no repack) and the "
+            "QPN M1 FP16 boundaries. Unsupported layers fall back with a "
+            "warning."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMindAwqLinearKernel",),
+        user_visible=False,
+    ),
+    # W13 split-K warps of the grouped route: 16 keeps the QPN M1 order.
+    "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT": env_var(
+        lambda: int(os.getenv("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT", "16")),
+        description=(
+            "W13 split-K warps per CTA for VLLM_SM70_AWQ_QWEN38_GROUPED_QPN: "
+            "16 reproduces the per-row arithmetic of the QPN M1 route; 8 uses "
+            "fewer threads per CTA and a different FP32 split association."
+        ),
+        category="tuning",
+        declared_default="16",
+        effective_default="16",
         automatic_conditions=(),
         acceleration_paths=("TurboMindAwqLinearKernel",),
         user_visible=False,

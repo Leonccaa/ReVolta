@@ -795,6 +795,54 @@ def _warmup_moe_dense_stage_layers(
                 group_size,
             )
             calls += 2
+    calls += _warmup_moe_grouped_qpn(moe_layers, token_counts)
+    return calls
+
+
+def _warmup_moe_grouped_qpn(
+    moe_layers: list[torch.nn.Module],
+    token_counts: list[int],
+) -> int:
+    """Load the opt-in grouped small-M AWQ kernels before graph capture.
+
+    The native op has no tactic selection; one eager call per row-block count
+    on the first admitted layer is enough to load every launched kernel.
+    """
+    layer = next(
+        (m for m in moe_layers if getattr(m, "sm70_awq_qwen38_grouped_qpn", False)),
+        None,
+    )
+    if layer is None:
+        return 0
+    device = layer.w13_tm_scales.device
+    calls = 0
+    for num_tokens in token_counts:
+        if not 2 <= num_tokens <= 20:
+            continue
+        routes = num_tokens * 10
+        x = torch.zeros((num_tokens, 2560), dtype=torch.float16, device=device)
+        ids = (torch.arange(routes, dtype=torch.int32, device=device) % 512).view(
+            num_tokens, 10
+        )
+        topk = torch.full((num_tokens, 10), 0.1, dtype=torch.float32, device=device)
+        sm70_ops.awq_moe_grouped_decode_sm70_out(
+            torch.empty_like(x),
+            torch.empty((routes, 160), dtype=torch.float16, device=device),
+            torch.empty(
+                sm70_ops.AWQ_GROUPED_DECODE_PLAN_INTS,
+                dtype=torch.int32,
+                device=device,
+            ),
+            x,
+            layer.w13_tm_weight,
+            layer.w13_tm_scales,
+            layer.w2_tm_weight,
+            layer.w2_tm_scales,
+            ids,
+            topk,
+            int(envs.VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT),
+        )
+        calls += 1
     return calls
 
 

@@ -4264,7 +4264,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
 
             if (
-                not self.gqa_interleaved_layout
+                envs.VLLM_SM70_GDN_TAIL_COPY  # 1CatAI #936, opt-in here
+                and not self.gqa_interleaved_layout
                 and not self.disable_tp_for_ba_proj
                 and mixed_qkvz.shape[0] in (5, 20)
                 and (self.key_dim * 2 + self.value_dim) // self.tp_size == 2560
@@ -5387,7 +5388,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and (
                 mixed_qkv.is_contiguous()
                 or (
-                    attn_metadata.spec_sequence_masks is not None
+                    envs.VLLM_SM70_GDN_TAIL_COPY  # 1CatAI #928
+                    and attn_metadata.spec_sequence_masks is not None
                     and mixed_qkv.shape[0] in (5, 20)
                     and mixed_qkv.stride(1) == 1
                     and mixed_qkv.stride(0) >= mixed_qkv.shape[1]
@@ -5748,12 +5750,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and (
                 mixed_qkv_spec.is_contiguous()
                 or (
-                    mixed_qkv_spec.shape[0] in (5, 20)
+                    envs.VLLM_SM70_GDN_TAIL_COPY  # 1CatAI #928
+                    and mixed_qkv_spec.shape[0] in (5, 20)
                     and mixed_qkv_spec.stride(1) == 1
                     and mixed_qkv_spec.stride(0) >= mixed_qkv_spec.shape[1]
                 )
             )
-            and (1 < mixed_qkv_spec.shape[0] <= 16 or mixed_qkv_spec.shape[0] == 20)
+            and (
+                1 < mixed_qkv_spec.shape[0] <= 16
+                or (envs.VLLM_SM70_GDN_TAIL_COPY and mixed_qkv_spec.shape[0] == 20)
+            )
         )
         if use_dflash2_packed_gdn_verify or use_sm70_mixed_qkv_verify:
             query_spec, key_spec, value_spec = None, None, None
@@ -5938,7 +5944,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 # gating, BV32 reduction and FP32 state. Avoid materializing
                 # three contiguous splits and concatenating them again.
                 direct_verify_out = bool(
-                    spec_rows_are_batch
+                    envs.VLLM_SM70_MTP_GDN_DIRECT_OUTPUT  # 1CatAI #929, opt-in
+                    and spec_rows_are_batch
                     and num_actual_tokens == mixed_qkv_spec.shape[0]
                     and num_actual_tokens in (5, 20)
                     and core_attn_out.is_contiguous()
@@ -7545,7 +7552,8 @@ def qwen_gdn_input_projection_core(
         )
 
         copied_tails = (
-            not self.gqa_interleaved_layout
+            envs.VLLM_SM70_GDN_TAIL_COPY  # 1CatAI #927, opt-in here
+            and not self.gqa_interleaved_layout
             and not self.disable_tp_for_ba_proj
             and mixed_qkvz.shape[0] in (5, 20)
             and (self.key_dim * 2 + self.value_dim) // self.tp_size == 2560

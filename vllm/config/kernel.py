@@ -502,8 +502,9 @@ class KernelConfig:
     qsa_auto_e4m3_reason: str | None = Field(default=None, init=False)
     """Startup reason when calibrated automatic storage cannot be selected."""
 
-    sm70_qsa_shared_key: bool = True
-    """Share FP16 indexer keys across M2..8 queries of one request on SM70."""
+    sm70_qsa_shared_key: bool = False
+    """Share FP16 indexer keys across M2..8 queries of one request on SM70
+    (1CatAI #1127; opt-in here, also VLLM_SM70_QSA_SHARED_KEY=1)."""
 
     ple_disk_cascade: bool = True
     """Allow resident FP8 PLE tiers to spill to mapped checkpoint storage."""
@@ -525,7 +526,7 @@ class KernelConfig:
     )
     """Observed per-layer result transport and small pinned-buffer sizes."""
 
-    ple_input_prepare: bool = True
+    ple_input_prepare: bool = False
     """Fuse qualified SM70 PLE context gathering and query-boundary staging."""
     ple_input_preparations: dict[str, Any] = Field(
         default_factory=dict, init=False, repr=False

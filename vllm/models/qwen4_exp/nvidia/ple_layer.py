@@ -1474,7 +1474,8 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             return output
 
         if (
-            not is_offload_process()
+            envs.VLLM_SM70_PLE_NGRAM_BATCH  # 1CatAI #914, opt-in here
+            and not is_offload_process()
             and self.ngram_size == 3
             and self.heads_per_ngram == 8
         ):

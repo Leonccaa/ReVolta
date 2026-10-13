@@ -11,6 +11,14 @@ from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as mod
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
 
+@pytest.fixture(autouse=True)
+def _r2_opt_in(monkeypatch):
+    # The release configuration keeps 1CatAI #928/#929 opt-in;
+    # exercise the new path here.
+    monkeypatch.setenv("VLLM_SM70_GDN_TAIL_COPY", "1")
+    monkeypatch.setenv("VLLM_SM70_MTP_GDN_DIRECT_OUTPUT", "1")
+
+
 @pytest.mark.parametrize("batch,width", [(1, 2), (1, 5), (2, 5), (4, 4), (4, 5)])
 @pytest.mark.parametrize("dim_first", [False, True])
 @pytest.mark.parametrize("row_stride", [2560, 4096])

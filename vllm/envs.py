@@ -326,6 +326,16 @@ if TYPE_CHECKING:
     VLLM_SM70_QWEN38_GDN_INPUT_BATCH: bool = True
     VLLM_SM70_MTP_HC_BATCH: bool = True
     VLLM_SM70_QWEN38_HC_PREFER_REPLICATED: bool = False
+    VLLM_SM70_QWEN38_HC_REPLICATED: bool = False
+    VLLM_SM70_SKIP_REJECTED_BATCH_PACKS: bool = False
+    VLLM_SM70_GDN_TAIL_COPY: bool = False
+    VLLM_SM70_MTP_GDN_DIRECT_OUTPUT: bool = False
+    VLLM_SM70_QSA_SHARED_KEY: bool = False
+    VLLM_SM70_QSA_COMPACT_TOPK: bool = False
+    VLLM_SM70_PLE_NGRAM_BATCH: bool = False
+    VLLM_SM70_PLE_INPUT_PREPARE: bool = False
+    VLLM_PLE_ASYNC_REQUEST_INDICES: bool = False
+    VLLM_EARLY_MODEL_INPUTS: bool = False
     VLLM_SM70_MTP_HC_COOPERATIVE: bool = True
     VLLM_SM70_MTP_HC_FULL_UNROLL: bool = True
     VLLM_SM70_MTP_ROUTER_TOP16: bool = True
@@ -4008,11 +4018,159 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=("MTP verifier", "Flash-Next qualified batch"),
         user_visible=True,
     ),
+    "VLLM_SM70_QWEN38_HC_REPLICATED": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_QWEN38_HC_REPLICATED", "0"))),
+        description=(
+            "1CatAI #900 (opt-in here): when custom all-reduce is not "
+            "fully connected, prepare replicated FP32 batched-HC packs (M "
+            "2..16 and 20, no TP collective inside HC) and allow the M5 "
+            "local-MMA + TP collective fallback. About 1 GiB more per TP4 "
+            "rank when the Qwen3.8 batch lane is active."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_SKIP_REJECTED_BATCH_PACKS": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_SKIP_REJECTED_BATCH_PACKS", "0"))),
+        description=(
+            "1CatAI #919 (opt-in here): skip preparing "
+            "router/shared-expert MTP batch packs that the worker "
+            "precision policy (FP32 partials) would never admit; saves "
+            "about 199 MiB per rank when the Qwen3.8 batch lane is "
+            "active."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_GDN_TAIL_COPY": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_GDN_TAIL_COPY", "0"))),
+        description=(
+            "1CatAI #927/#936/#928 (opt-in here): for 5 and 20 GDN rows, "
+            "copy only the z/b/a projection tails and read the "
+            "row-strided QKV view in the fused MTP recurrence instead of "
+            "materializing QKV."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_MTP_GDN_DIRECT_OUTPUT": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_GDN_DIRECT_OUTPUT", "0"))),
+        description=(
+            "1CatAI #929 (opt-in here): write pure 5/20-row MTP GDN "
+            "verification directly into the layer output buffer instead "
+            "of a temporary plus copy."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_QSA_SHARED_KEY": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_QSA_SHARED_KEY", "0"))),
+        description=(
+            "1CatAI #1127 (opt-in here, same as "
+            "kernel_config.sm70_qsa_shared_key): score M2..8 QSA "
+            "verification queries of one request with the shared-key FP16 "
+            "indexer (vllm._sm70_qsa_indexer_C)."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_QSA_COMPACT_TOPK": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_QSA_COMPACT_TOPK", "0"))),
+        description=(
+            "1CatAI #1171 (opt-in here; read by the native QSA top-k "
+            "launcher): for <=32 rows and >=32768 compressed scores, "
+            "pre-select candidates by a coarse FP16 key before the exact "
+            "lexicographic top-k (same indices by construction)."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_PLE_NGRAM_BATCH": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_PLE_NGRAM_BATCH", "0"))),
+        description=(
+            "1CatAI #914 (opt-in here): fused small-batch PLE n-gram id "
+            "preprocessing for 2..32 rows."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_PLE_INPUT_PREPARE": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_PLE_INPUT_PREPARE", "0"))),
+        description=(
+            "1CatAI #988 (opt-in here, same as "
+            "kernel_config.ple_input_prepare): fuse PLE n-gram context "
+            "gathering and query-boundary staging into one launch (<=4 "
+            "requests, context <=8)."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
+    ),
+    "VLLM_PLE_ASYNC_REQUEST_INDICES": env_var(
+        lambda: bool(int(os.getenv("VLLM_PLE_ASYNC_REQUEST_INDICES", "0"))),
+        description=(
+            "1CatAI #964 (opt-in here): non-blocking PLE short-conv "
+            "request-index transfers, reused for the "
+            "accepted/computed-token gathers."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
+    ),
+    "VLLM_EARLY_MODEL_INPUTS": env_var(
+        lambda: bool(int(os.getenv("VLLM_EARLY_MODEL_INPUTS", "0"))),
+        description=(
+            "1CatAI #955 (opt-in here): in FULL CUDA-graph steps, prepare "
+            "model-state inputs before attention metadata for model "
+            "states that declare independent inputs."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
+    ),
     # Prefer the replicated FP32 batched-HC packs (#900) even when the TP
     # group's custom all-reduce reports fully_connected (e.g. forced on PCIe).
     "VLLM_SM70_QWEN38_HC_PREFER_REPLICATED": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_QWEN38_HC_PREFER_REPLICATED", "0"))),
         description=(
+            "Implies VLLM_SM70_QWEN38_HC_REPLICATED. "
             "Pack batched-HC weights for the replicated FP32 route (complete "
             "down/up packs on every rank, no TP collective inside HC) even "
             "when custom all-reduce is fully connected. The sharded IPC packs "

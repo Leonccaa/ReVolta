@@ -15,6 +15,12 @@ from vllm.models.qwen4_exp.nvidia.ops.qsa_shared_key import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _r2_opt_in(monkeypatch):
+    # The release configuration keeps 1CatAI #1127 opt-in; exercise the new path here.
+    monkeypatch.setenv("VLLM_SM70_QSA_SHARED_KEY", "1")
+
+
 @pytest.mark.parametrize("rows", [2, 5, 8])
 @pytest.mark.parametrize("strided", [False, True])
 @pytest.mark.parametrize("position_dtype", [torch.int32, torch.int64])

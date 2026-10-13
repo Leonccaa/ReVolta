@@ -577,6 +577,9 @@ def _mtp_batch_packing_allowed(layer: nn.Module, role: str) -> bool:
     # Match the router/shared runtime precision guards without changing their
     # forward hooks or fallbacks. The worker sets this policy before loading;
     # configure it before preparing weights, not during graph replay.
+    if not envs.VLLM_SM70_SKIP_REJECTED_BATCH_PACKS:
+        # 1CatAI #919 is opt-in on this branch: keep preparing the packs.
+        return True
     matmul = torch.backends.cuda.matmul
     reason = None
     if not matmul.allow_fp16_reduced_precision_reduction:

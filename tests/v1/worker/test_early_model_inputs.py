@@ -11,6 +11,12 @@ from vllm.v1.worker.gpu.mm.rope import RopeState
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 
+@pytest.fixture(autouse=True)
+def _r2_opt_in(monkeypatch):
+    # The release configuration keeps 1CatAI #955 opt-in; exercise the new path here.
+    monkeypatch.setenv("VLLM_EARLY_MODEL_INPUTS", "1")
+
+
 @pytest.mark.parametrize(
     "mode,capability,ple,expected",
     [

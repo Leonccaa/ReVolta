@@ -12,6 +12,12 @@ from vllm.v1.worker.gpu.buffer_utils import UvaBuffer
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
+@pytest.fixture(autouse=True)
+def _r2_opt_in(monkeypatch):
+    # The release configuration keeps 1CatAI #988 opt-in; exercise the new path here.
+    monkeypatch.setenv("VLLM_SM70_PLE_INPUT_PREPARE", "1")
+
+
 @pytest.mark.parametrize("requests,padded", [(0, 4), (1, 1), (1, 4), (4, 4)])
 @pytest.mark.parametrize("length", [2, 7])
 @pytest.mark.parametrize("uva", [False, True])

@@ -481,7 +481,7 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         "scope": "calibrated_cache_storage",
     }
     shared_key_reason = None
-    if not cfg.kernel_config.sm70_qsa_shared_key:
+    if not (cfg.kernel_config.sm70_qsa_shared_key or envs.VLLM_SM70_QSA_SHARED_KEY):
         shared_key_reason = "user_override"
     elif not sm70:
         shared_key_reason = "requires_SM70"

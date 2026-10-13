@@ -14,6 +14,12 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse=True)
+def _r2_opt_in(monkeypatch):
+    # The release configuration keeps 1CatAI #900 opt-in; exercise the new path here.
+    monkeypatch.setenv("VLLM_SM70_QWEN38_HC_REPLICATED", "1")
+
+
 @pytest.mark.parametrize("m", [2, 5, 10, 16])
 def test_local_hc_fp32_arithmetic_and_disjoint_tp_packets(m):
     assert ops.supports_sm70_qwen38_hc_local(), "packaged HC local operators missing"

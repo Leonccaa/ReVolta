@@ -10,6 +10,12 @@ from vllm.model_executor.layers.fla.ops.fused_sigmoid_gating import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _r2_opt_in(monkeypatch):
+    # The release configuration keeps 1CatAI #928 opt-in; exercise the new path here.
+    monkeypatch.setenv("VLLM_SM70_GDN_TAIL_COPY", "1")
+
+
 @pytest.mark.parametrize("requests", [1, 4])
 @pytest.mark.parametrize("feature_stride", [1, 2])
 def test_strided_qkv_output_and_fp32_state_graph(requests, feature_stride):

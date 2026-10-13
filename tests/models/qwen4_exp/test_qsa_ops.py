@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 import sys
 from types import ModuleType, SimpleNamespace
 from typing import Any, cast
@@ -583,3 +584,9 @@ def test_chunked_selection_allocates_scratch_only_for_generic_topk(monkeypatch, 
     assert torch.all(output == -1)
     assert len(scratch) == (0 if exact else 1)
     assert events == ["score", "select", "expand"] * 3
+
+
+# The release configuration keeps 1CatAI #1171 opt-in; the native launcher reads
+# VLLM_SM70_QSA_COMPACT_TOPK once per process, so set it at collection
+# time (before any test runs).
+os.environ.setdefault("VLLM_SM70_QSA_COMPACT_TOPK", "1")

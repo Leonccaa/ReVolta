@@ -9,6 +9,7 @@ from typing import cast
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
@@ -129,7 +130,10 @@ class QSAIndexer(nn.Module):
         # MTP step 0 selects the target-aligned rows; later steps reuse them
         # while continuing to update the QSA side cache.
         self.skip_topk = False
-        self.shared_key_scoring = vllm_config.kernel_config.sm70_qsa_shared_key
+        self.shared_key_scoring = (
+            vllm_config.kernel_config.sm70_qsa_shared_key
+            or envs.VLLM_SM70_QSA_SHARED_KEY
+        )
 
         self.index_qk_proj = ReplicatedLinear(
             int(config.hidden_size),

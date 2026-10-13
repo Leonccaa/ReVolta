@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Exact decode Top-K: row isolation, strides, ties and dynamic graph lengths."""
 
+import os
+
 import pytest
 import torch
 
@@ -154,3 +156,9 @@ def test_independent_selection_graphs_keep_their_own_addresses():
                 dtype=torch.int32,
             )
             assert torch.equal(output, expected.expand_as(output))
+
+
+# The release configuration keeps 1CatAI #1171 opt-in; the native launcher reads
+# VLLM_SM70_QSA_COMPACT_TOPK once per process, so set it at collection
+# time (before any test runs).
+os.environ.setdefault("VLLM_SM70_QSA_COMPACT_TOPK", "1")

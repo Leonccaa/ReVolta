@@ -7,6 +7,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.models.qwen4_exp.common.ple import check_ple_layers_on_first_pp_rank
@@ -106,7 +107,10 @@ class Qwen4ExpModelState(MambaHybridModelState):
         num_reqs_padded = input_batch.num_reqs_after_padding
         query_start_loc = self.ple_query_start_loc[: num_reqs_padded + 1]
         reason = None
-        if not self._ple_kernel_config.ple_input_prepare:
+        if not (
+            self._ple_kernel_config.ple_input_prepare
+            or envs.VLLM_SM70_PLE_INPUT_PREPARE
+        ):
             reason = "disabled_by_kernel_config"
         elif not self._ple_input_hardware:
             reason = "requires_sm70"

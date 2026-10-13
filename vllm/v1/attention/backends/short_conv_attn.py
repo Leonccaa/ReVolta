@@ -5,6 +5,7 @@ from typing import Any
 
 import torch
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
@@ -332,9 +333,14 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
         decode_req_idx_cpu = decode_mask_cpu.nonzero(as_tuple=True)[0]
         prefill_req_idx_cpu = prefill_mask_cpu.nonzero(as_tuple=True)[0]
         non_spec_req_idx_cpu = torch.cat((decode_req_idx_cpu, prefill_req_idx_cpu))
-        spec_req_idx = spec_req_idx_cpu.to(query_start_loc.device, non_blocking=True)
+        # 1CatAI #964 (opt-in, VLLM_PLE_ASYNC_REQUEST_INDICES=1): non-blocking
+        # request-index copies, reused for the accepted/computed-token gathers.
+        async_idx = envs.VLLM_PLE_ASYNC_REQUEST_INDICES
+        spec_req_idx = spec_req_idx_cpu.to(
+            query_start_loc.device, non_blocking=async_idx
+        )
         non_spec_req_idx = non_spec_req_idx_cpu.to(
-            query_start_loc.device, non_blocking=True
+            query_start_loc.device, non_blocking=async_idx
         )
 
         if num_decodes == 0 and num_prefills == 0:
@@ -366,7 +372,7 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
             )
             req_group[spec_req_idx] = 0
             req_group[
-                decode_req_idx_cpu.to(query_start_loc.device, non_blocking=True)
+                decode_req_idx_cpu.to(query_start_loc.device, non_blocking=async_idx)
             ] = 1
             token_group = torch.repeat_interleave(req_group, query_lens)
             token_perm = torch.argsort(token_group, stable=True)
@@ -407,6 +413,8 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
         # device copy instead of synchronizing the current stream again.
         num_accepted_tokens = num_accepted_tokens[
             spec_req_idx.to(num_accepted_tokens.device, non_blocking=True)
+            if async_idx
+            else spec_req_idx_cpu.to(num_accepted_tokens.device)
         ]
 
         # Compute the conv-state slots for the non-spec decode/prefill split,
@@ -425,8 +433,10 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
         if num_decodes > 0 or num_prefills > 0:
             num_computed_tokens = m.compute_num_computed_tokens()
             if non_spec_req_idx_cpu is not None:
-                non_spec_req_idx = non_spec_req_idx.to(
-                    num_computed_tokens.device, non_blocking=True
+                non_spec_req_idx = (
+                    non_spec_req_idx.to(num_computed_tokens.device, non_blocking=True)
+                    if async_idx
+                    else non_spec_req_idx_cpu.to(num_computed_tokens.device)
                 )
                 num_computed_tokens = num_computed_tokens[non_spec_req_idx]
 

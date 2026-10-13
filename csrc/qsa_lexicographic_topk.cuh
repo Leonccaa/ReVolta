@@ -10,6 +10,7 @@
 #include <cub/block/block_radix_sort.cuh>
 #include <cub/block/block_scan.cuh>
 #include <cstdint>
+#include <cstdlib>
 
 namespace vllm::qsa {
 
@@ -613,13 +614,24 @@ __launch_bounds__(kLexicographicTopKThreads) void qsa_lexicographic_mtp_topk_ker
   }
 }
 
+// 1CatAI #1171 long-context compact pre-selection is opt-in on this branch:
+// VLLM_SM70_QSA_COMPACT_TOPK=1 (read once per process).
+inline bool qsa_compact_topk_enabled() {
+  static const bool enabled = [] {
+    const char* raw = std::getenv("VLLM_SM70_QSA_COMPACT_TOPK");
+    return raw != nullptr && std::atoi(raw) != 0;
+  }();
+  return enabled;
+}
+
 template <int TopK>
 void launch_qsa_lexicographic_topk(const float* logits, const int32_t* lengths,
                                    int32_t* output, uint32_t num_rows,
                                    uint32_t columns, uint32_t stride,
                                    cudaStream_t stream,
                                    bool decode_batch = false) {
-  if (num_rows <= 32 && columns >= kLexicographicTopKCompactMinLength) {
+  if (qsa_compact_topk_enabled() && num_rows <= 32 &&
+      columns >= kLexicographicTopKCompactMinLength) {
     qsa_lexicographic_compact_topk_kernel<TopK>
         <<<num_rows, kLexicographicTopKThreads, 0, stream>>>(
             logits, lengths, output, num_rows, columns, stride, decode_batch);

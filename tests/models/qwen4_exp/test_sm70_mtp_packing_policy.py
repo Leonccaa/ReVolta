@@ -16,6 +16,12 @@ from vllm.sm70_profiles.acceleration import loaded_sm70_preparations
 
 
 @pytest.fixture(autouse=True)
+def _r2_opt_in(monkeypatch):
+    # The release configuration keeps 1CatAI #919 opt-in; exercise the new path here.
+    monkeypatch.setenv("VLLM_SM70_SKIP_REJECTED_BATCH_PACKS", "1")
+
+
+@pytest.fixture(autouse=True)
 def restore_precision():
     backend = torch.backends.cuda.matmul
     names = (

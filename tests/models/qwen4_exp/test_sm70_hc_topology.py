@@ -11,6 +11,12 @@ from vllm.distributed import parallel_state
 from vllm.models.qwen4_exp.nvidia import sm70_fp16_hc as hc
 
 
+@pytest.fixture(autouse=True)
+def _r2_opt_in(monkeypatch):
+    # The release configuration keeps 1CatAI #900 opt-in; exercise the new path here.
+    monkeypatch.setenv("VLLM_SM70_QWEN38_HC_REPLICATED", "1")
+
+
 def test_local_batch_hc_uses_tp_collective_without_full_mesh(monkeypatch):
     calls = []
     group = SimpleNamespace(

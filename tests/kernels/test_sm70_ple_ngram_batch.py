@@ -10,6 +10,12 @@ from vllm.model_executor.kernels.ple.ngram import SM70_PLE_NGRAM
 from vllm.models.qwen4_exp.nvidia import ple_layer
 
 
+@pytest.fixture(autouse=True)
+def _r2_opt_in(monkeypatch):
+    # The release configuration keeps 1CatAI #914 opt-in; exercise the new path here.
+    monkeypatch.setenv("VLLM_SM70_PLE_NGRAM_BATCH", "1")
+
+
 def make_layer(m):
     layer = object.__new__(ple_layer.Qwen4ExpNGramEmbedding)
     torch.nn.Module.__init__(layer)

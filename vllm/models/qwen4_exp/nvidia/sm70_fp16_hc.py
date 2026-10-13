@@ -85,10 +85,14 @@ def _prepare_hc_batch_weight(layer: nn.Module) -> None:
     ca = getattr(get_tp_group().device_communicator, "ca_comm", None)
     # VLLM_SM70_QWEN38_HC_PREFER_REPLICATED selects the replicated packs even
     # when custom all-reduce is (force-)enabled as fully connected.
+    # 1CatAI #900 is opt-in on this branch (VLLM_SM70_QWEN38_HC_REPLICATED=1).
     if (
         (
             envs.VLLM_SM70_QWEN38_HC_PREFER_REPLICATED
-            or not (ca is not None and not ca.disabled and ca.fully_connected)
+            or (
+                envs.VLLM_SM70_QWEN38_HC_REPLICATED
+                and not (ca is not None and not ca.disabled and ca.fully_connected)
+            )
         )
         and not torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
         and ops.supports_sm70_qwen38_hc_replicated()
@@ -478,7 +482,12 @@ def _qwen38_sm70_fp16_fused_hc(
         group = get_tp_group()
         # The local+collective screen regressed M10. Keep it as a reference;
         # automatic non-mesh preparation uses the replicated FP32 route.
-        if concurrent_batch and group.world_size == 4 and x.shape[0] == 5:
+        if (
+            envs.VLLM_SM70_QWEN38_HC_REPLICATED
+            and concurrent_batch
+            and group.world_size == 4
+            and x.shape[0] == 5
+        ):
             if ops.supports_sm70_qwen38_hc_local():
                 m = x.shape[0]
                 partials = x.new_empty((20, m, 96), dtype=torch.float32)

@@ -9,6 +9,13 @@ from vllm.models.qwen4_exp.nvidia.sm70_fp16_gemv import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _r2_opt_in(monkeypatch):
+    # The release configuration keeps 1CatAI #927/#936 opt-in;
+    # exercise the new path here.
+    monkeypatch.setenv("VLLM_SM70_GDN_TAIL_COPY", "1")
+
+
 @pytest.mark.parametrize("m", [5, 20])
 def test_tail_split_preserves_half_payloads_and_qkv_alias(m):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):

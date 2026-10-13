@@ -9,6 +9,12 @@ import torch
 from vllm.v1.attention.backends import short_conv_attn
 
 
+@pytest.fixture(autouse=True)
+def _r2_opt_in(monkeypatch):
+    # The release configuration keeps 1CatAI #964 opt-in; exercise the new path here.
+    monkeypatch.setenv("VLLM_PLE_ASYNC_REQUEST_INDICES", "1")
+
+
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 @pytest.mark.parametrize(
     "query_lengths,drafts,spec_rows,non_spec_rows",

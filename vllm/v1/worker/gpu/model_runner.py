@@ -1278,6 +1278,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if (
             mode == CUDAGraphMode.FULL
             and self.model_state.supports_early_input_preparation
+            # 1CatAI #955 is opt-in on this branch.
+            and envs.VLLM_EARLY_MODEL_INPUTS
         ):
             # Ready request/token buffers and the current stream preserve
             # ordering with the previous iteration. Hide host launch work

@@ -322,6 +322,7 @@ if TYPE_CHECKING:
     VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16: bool = False
     VLLM_SM70_QWEN38_GDN_INPUT_BATCH: bool = True
     VLLM_SM70_MTP_HC_BATCH: bool = True
+    VLLM_SM70_QWEN38_HC_PREFER_REPLICATED: bool = False
     VLLM_SM70_MTP_HC_COOPERATIVE: bool = True
     VLLM_SM70_MTP_HC_FULL_UNROLL: bool = True
     VLLM_SM70_MTP_ROUTER_TOP16: bool = True
@@ -3950,6 +3951,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=("MTP verifier", "Flash-Next qualified batch"),
         user_visible=True,
+    ),
+    # Prefer the replicated FP32 batched-HC packs (#900) even when the TP
+    # group's custom all-reduce reports fully_connected (e.g. forced on PCIe).
+    "VLLM_SM70_QWEN38_HC_PREFER_REPLICATED": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_QWEN38_HC_PREFER_REPLICATED", "0"))),
+        description=(
+            "Pack batched-HC weights for the replicated FP32 route (complete "
+            "down/up packs on every rank, no TP collective inside HC) even "
+            "when custom all-reduce is fully connected. The sharded IPC packs "
+            "are skipped, so M outside 2..16 and 20 uses the dense HC "
+            "projections. Needs FP32 partial reductions and the packaged "
+            "replicated operator; about 1 GiB more per TP4 rank than the "
+            "sharded packs."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier", "Flash-Next qualified batch"),
+        user_visible=False,
     ),
     # Join the admitted HC phases with cooperative grid barriers, keeping
     # the same per-projection arithmetic and communicator-owned packets.

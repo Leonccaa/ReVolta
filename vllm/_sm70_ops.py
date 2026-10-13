@@ -4120,8 +4120,10 @@ if hasattr(torch.ops._C, "awq_moe_qpn_m1_sm70_out"):
 
 
 # int32 elements of the fixed-size routing plan used by the grouped AWQ op
-# (kPlanInts in csrc/sm70_turbomind/ops/awq_grouped_decode_sm70.cu).
-AWQ_GROUPED_DECODE_PLAN_INTS = 5208
+# (kPlanInts in csrc/sm70_turbomind/ops/awq_grouped_decode_sm70.cu) and the
+# largest row count the op accepts (kMaxTokens).
+AWQ_GROUPED_DECODE_PLAN_INTS = 1928
+AWQ_GROUPED_DECODE_MAX_TOKENS = 48
 
 
 def awq_moe_grouped_decode_sm70_out(
@@ -4136,10 +4138,15 @@ def awq_moe_grouped_decode_sm70_out(
     ids: torch.Tensor,
     topk: torch.Tensor,
     split: int = 16,
+    pack_rows: int = 0,
 ) -> None:
-    """Qwen3.8 TP4 g32 AWQ grouped small-M MoE decode (M=1..20 rows)."""
+    """Qwen3.8 TP4 g32 AWQ grouped small-M MoE decode (M=1..48 rows).
+
+    pack_rows=0 reads each active expert once (ceil(M/8) row blocks);
+    8..48 caps the rows per pack, splitting hotter experts into more packs.
+    """
     _op("awq_moe_grouped_decode_sm70_out")(
-        out, intermediate, plan, input, w13, s13, w2, s2, ids, topk, split
+        out, intermediate, plan, input, w13, s13, w2, s2, ids, topk, split, pack_rows
     )
 
 
@@ -4158,6 +4165,7 @@ if hasattr(torch.ops._C, "awq_moe_grouped_decode_sm70_out"):
         ids: torch.Tensor,
         topk: torch.Tensor,
         split: int,
+        pack_rows: int = 0,
     ) -> None:
         return None
 

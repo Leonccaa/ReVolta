@@ -2,16 +2,20 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """SM70 grouped small-M AWQ MoE decode (awq_moe_grouped_decode_sm70_out).
 
-Checks, for M = 1..20 rows with random routings:
+Checks, for M = 1..20 and 21, 24, 25, 32, 39, 40, 48 rows with random
+routings:
 * the routing plan against the pure-torch plan reference (bitwise);
 * W13 intermediate and final output against the FP64 decoded-bank reference
   (relative 1e-2 of the reference max, FP16 boundaries);
 * every row against a separate M=1 QPN call (bitwise with split=16, the
   QPN M1 arithmetic; tolerance with split=8 or 4) and batch invariance;
+* pack-row invariance: capping the rows per pack (pack_rows 8..48, which
+  splits hot experts into several packs) gives bitwise the same output;
 * changed-input CUDA graph replay, invalid ids, input validation, fake op;
 * the full AWQSM70MoEMethod.apply() route against the existing TurboMind
   active-grouped (M<=8) / per-expert-dispatch (M>8) route on the same
-  prepared banks.
+  prepared banks, and the grouped-dispatch TurboMind route
+  (VLLM_SM70_AWQ_QWEN38_MOE_GROUPED_DECODE20) for M=9..40.
 
 Run on a V100: pytest -s -v tests/kernels/test_sm70_awq_grouped_decode.py
 (-s prints the GROUPED_DIFF lines with max abs differences).
@@ -39,7 +43,8 @@ ACTIVE = tuple(
         | set(range(11, 31))
     )
 )
-ALL_M = list(range(1, 21))
+WIDE_M = [21, 24, 25, 32, 39, 40, 48]
+ALL_M = list(range(1, 21)) + WIDE_M
 REPORT = os.environ.get("SM70_AWQ_GROUPED_REPORT")
 
 
@@ -67,8 +72,12 @@ def banks(request):
     return SimpleNamespace(w13=w13, s13=s13, d13=d13, w2=w2, s2=s2, d2=d2)
 
 
-def _routing(m, seed, invalid=0, pool=ACTIVE):
-    """Distinct experts per token; correlated like MTP verify rows (5/request)."""
+def _routing(m, seed, invalid=0, pool=ACTIVE, hot=None):
+    """Distinct experts per token; correlated like MTP verify rows (5/request).
+
+    hot: an expert every token routes to (in a random slot), so one expert
+    has M rows and needs every row block (or several packs).
+    """
     rng = random.Random(seed)
     rows = []
     previous = None
@@ -80,17 +89,21 @@ def _routing(m, seed, invalid=0, pool=ACTIVE):
             rest = [e for e in pool if e not in keep]
             chosen = keep + rng.sample(rest, 10 - len(keep))
             rng.shuffle(chosen)
+        if hot is not None and hot not in chosen:
+            chosen[rng.randrange(10)] = hot
         previous = chosen
         rows.append(list(chosen))
     for _ in range(invalid):
         t, s = rng.randrange(m), rng.randrange(10)
+        while hot is not None and rows[t][s] == hot:
+            t, s = rng.randrange(m), rng.randrange(10)
         rows[t][s] = rng.choice((-1, 512, 4096))
     ids = torch.tensor(rows, dtype=torch.int32, device="cuda")
     weights = torch.softmax(torch.randn(m, 10, device="cuda"), dim=-1)
     return ids, weights.float().contiguous()
 
 
-def _run(ops, b, x, ids, topk, split):
+def _run(ops, b, x, ids, topk, split, pack_rows=0):
     m = x.shape[0]
     out = torch.full((m, 2560), float("nan"), dtype=torch.float16, device="cuda")
     inter = torch.full((m * 10, 160), float("nan"), dtype=torch.float16, device="cuda")
@@ -98,7 +111,7 @@ def _run(ops, b, x, ids, topk, split):
         (ops.AWQ_GROUPED_DECODE_PLAN_INTS,), -7, dtype=torch.int32, device="cuda"
     )
     ops.awq_moe_grouped_decode_sm70_out(
-        out, inter, plan, x, b.w13, b.s13, b.w2, b.s2, ids, topk, split
+        out, inter, plan, x, b.w13, b.s13, b.w2, b.s2, ids, topk, split, pack_rows
     )
     return out, inter, plan
 
@@ -119,7 +132,7 @@ def test_grouped_against_reference_and_qpn_m1(banks, m, split):
     out, inter, plan = _run(ops, banks, x, ids, topk, split)
     torch.cuda.synchronize()
 
-    cap = 8 * ((m + 7) // 8)
+    cap = ref.pack_cap(m)
     expected_plan = ref.grouped_plan_reference(ids.cpu(), cap)
     mask = ref.plan_prefix_mask(expected_plan)
     assert torch.equal(plan.cpu()[mask], expected_plan[mask])
@@ -174,14 +187,19 @@ def test_grouped_against_reference_and_qpn_m1(banks, m, split):
 
 
 @pytest.mark.parametrize("split", [16, 8, 4])
-def test_batch_invariance(banks, split):
+@pytest.mark.parametrize("full_m", [20, 40, 48])
+def test_batch_invariance(banks, split, full_m):
     """A row's output does not depend on M or on its co-routed rows."""
     ops = _ops()
     torch.manual_seed(77)
-    x = (torch.randn(20, 2560, device="cuda") * 0.5).half()
-    ids, topk = _routing(20, seed=78)
+    x = (torch.randn(full_m, 2560, device="cuda") * 0.5).half()
+    ids, topk = _routing(full_m, seed=78)
     full, full_mid, _ = _run(ops, banks, x, ids, topk, split)
-    for start, stop in ((0, 1), (0, 5), (5, 10), (3, 16), (10, 20), (0, 9)):
+    slices = [(0, 1), (0, 5), (5, 10), (3, 16), (10, 20), (0, 9)]
+    if full_m > 20:
+        slices += [(0, 21), (15, 40), (7, 32), (20, 40), (1, 26), (0, full_m)]
+        slices += [(full_m - 8, full_m)]
+    for start, stop in slices:
         part, part_mid, _ = _run(
             ops,
             banks,
@@ -194,7 +212,70 @@ def test_batch_invariance(banks, split):
         assert torch.equal(part_mid, full_mid[start * 10 : stop * 10]), (start, stop)
 
 
-@pytest.mark.parametrize("m", [2, 5, 8, 9, 16, 17, 20])
+@pytest.mark.parametrize("split", [16, 8, 4])
+@pytest.mark.parametrize("m", [24, 40, 48])
+def test_pack_rows_invariance(banks, m, split):
+    """Capping rows per pack (hot experts split over several packs and their
+    weights read again) does not change any bit of the result."""
+    ops = _ops()
+    torch.manual_seed(300 + m)
+    x = (torch.randn(m, 2560, device="cuda") * 0.5).half()
+    ids, topk = _routing(m, seed=400 + m + split, invalid=2, hot=ACTIVE[3])
+    full, full_mid, full_plan = _run(ops, banks, x, ids, topk, split)
+    valid = ((ids >= 0) & (ids < 512)).view(-1)
+    hot_rows = int((ids == ACTIVE[3]).sum())
+    assert hot_rows == m
+    for pack_rows in (8, 16, 24, 32, 40, 48):
+        out, mid, plan = _run(ops, banks, x, ids, topk, split, pack_rows)
+        torch.cuda.synchronize()
+        cap = ref.pack_cap(m, pack_rows)
+        expected_plan = ref.grouped_plan_reference(ids.cpu(), cap)
+        mask = ref.plan_prefix_mask(expected_plan)
+        assert torch.equal(plan.cpu()[mask], expected_plan[mask]), pack_rows
+        assert int(plan[0]) >= int(full_plan[0])
+        _report(
+            test="pack_rows",
+            m=m,
+            split=split,
+            pack_rows=pack_rows,
+            packs=int(plan[0]),
+            packs_one_per_expert=int(full_plan[0]),
+            bitwise_equal=bool(torch.equal(out, full)),
+        )
+        assert torch.equal(out, full), pack_rows
+        assert torch.equal(mid[valid], full_mid[valid]), pack_rows
+
+
+@pytest.mark.parametrize("split", [16, 4])
+@pytest.mark.parametrize("m", [21, 33, 40, 48])
+def test_hot_expert_against_reference(banks, m, split):
+    """One expert routed by every token: all ceil(M/8) row blocks of one pack
+    (RB 3..6) and the multi-round W13 partial reduction are exercised."""
+    ops = _ops()
+    torch.manual_seed(500 + m)
+    x = (torch.randn(m, 2560, device="cuda") * 0.5).half()
+    ids, topk = _routing(m, seed=600 + m, hot=ACTIVE[5])
+    out, inter, _ = _run(ops, banks, x, ids, topk, split)
+    torch.cuda.synchronize()
+    ref_out, ref_inter = ref.awq_grouped_decode_reference(
+        x, ids, topk, banks.d13.__getitem__, banks.d2.__getitem__
+    )
+    mid_diff, mid_scale = _diff(inter, ref_inter)
+    out_diff, out_scale = _diff(out, ref_out)
+    _report(
+        test="hot_expert",
+        m=m,
+        split=split,
+        mid_max_abs=mid_diff,
+        mid_ref_max=mid_scale,
+        out_max_abs=out_diff,
+        out_ref_max=out_scale,
+    )
+    assert mid_diff <= 1e-2 * mid_scale + 2**-24
+    assert out_diff <= 1e-2 * out_scale + 2**-24
+
+
+@pytest.mark.parametrize("m", [2, 5, 8, 9, 16, 17, 20, 21, 25, 33, 40, 48])
 def test_graph_replay_with_changed_routing(banks, m):
     ops = _ops()
     x = torch.zeros(m, 2560, dtype=torch.float16, device="cuda")
@@ -276,17 +357,28 @@ def test_rejects_unsupported_inputs_and_traces(banks):
         ops.awq_moe_grouped_decode_sm70_out(*valid)
 
     torch.compile(run, backend="eager", fullgraph=True)()
+    torch.compile(
+        lambda: ops.awq_moe_grouped_decode_sm70_out(*valid, 24),
+        backend="eager",
+        fullgraph=True,
+    )()
     unaligned = torch.empty(m * 2560 + 1, dtype=x.dtype, device="cuda")[1:].view_as(x)
-    big = torch.zeros(21, 2560, dtype=torch.float16, device="cuda")
+    big = torch.zeros(ops.AWQ_GROUPED_DECODE_MAX_TOKENS + 1, 2560, device="cuda").half()
+    valid.append(0)  # pack_rows
     for index, replacement in (
         (3, x.float()),
         (3, unaligned),
         (3, big),
         (2, plan[:100]),
+        (2, plan[: ops.AWQ_GROUPED_DECODE_PLAN_INTS - 1]),
         (8, ids.long()),
         (9, topk.half()),
         (1, inter[:-1]),
         (10, 2),
+        (11, 4),
+        (11, 12),
+        (11, 56),
+        (11, -8),
     ):
         args = list(valid)
         args[index] = replacement
@@ -307,7 +399,9 @@ def awq_layer():
     saved = dict(os.environ)
     os.environ.update(
         VLLM_SM70_AWQ_QWEN38_GROUPED_QPN="1",
+        VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS="48",
         VLLM_SM70_AWQ_QWEN38_MOE_GROUPED_DECODE20="1",
+        VLLM_SM70_AWQ_QWEN38_MOE_GROUPED_DECODE_MAX_TOKENS="48",
         VLLM_SM70_AWQ_QWEN38_MOE_COMPACT_GROUPED_DECODE="1",
         VLLM_SM70_AWQ_MOE_COMPACT_METADATA="1",
         VLLM_SM70_AWQ_TUNE_SMALL_SHAPES="0",
@@ -318,7 +412,9 @@ def awq_layer():
         os.environ.clear()
         os.environ.update(saved)
     assert layer.sm70_awq_qwen38_grouped_qpn
+    assert layer.sm70_awq_qwen38_grouped_qpn_max_tokens == 48
     assert layer.sm70_awq_qwen38_grouped_decode20
+    assert layer.sm70_awq_qwen38_grouped_decode20_max_tokens == 48
     assert layer.sm70_awq_moe_compact_metadata
     return layer
 
@@ -339,7 +435,10 @@ def test_method_route_against_turbomind(awq_layer, m):
     ids, topk = _routing(m, seed=900 + m, pool=pool)
     turbomind = _apply(awq_layer, x, ids, topk, grouped=False)
     grouped = _apply(awq_layer, x, ids, topk, grouped=True)
-    awq_layer.sm70_awq_qwen38_grouped_qpn = True
+    from vllm.model_executor.layers.quantization import awq_sm70_moe as moe
+
+    # The grouped route really ran for 2..48 rows (not a silent fallback).
+    assert moe._use_qwen38_grouped_qpn(awq_layer, x, topk, ids) == (m >= 2)
 
     cache13, cache2 = {}, {}
 
@@ -380,14 +479,18 @@ def test_method_route_against_turbomind(awq_layer, m):
     assert ref_diff <= 1e-2 * scale + 2**-24
 
 
-@pytest.mark.parametrize("m", list(range(9, 21)))
+@pytest.mark.parametrize("m", list(range(9, 21)) + WIDE_M[:-1])
 def test_grouped_decode20_against_per_expert_dispatch(awq_layer, m):
     """VLLM_SM70_AWQ_QWEN38_MOE_GROUPED_DECODE20: grouped TurboMind launch-spec
-    selection for 9..20 rows vs the default per-expert-dispatch selection."""
+    selection for 9..40 rows (VLLM_SM70_AWQ_QWEN38_MOE_GROUPED_DECODE_MAX_TOKENS)
+    vs the default per-expert-dispatch selection."""
+    from vllm.model_executor.layers.quantization import awq_sm70_moe as moe
+
     pool = tuple(range(512))
     torch.manual_seed(7000 + m)
     x = (torch.randn(m, 2560, device="cuda") * 0.5).half()
     ids, topk = _routing(m, seed=1900 + m, pool=pool)
+    assert moe._use_qwen38_grouped_decode20(awq_layer, m, 10)
     per_expert = _apply(awq_layer, x, ids, topk, grouped=False)
     grouped20 = _apply(awq_layer, x, ids, topk, grouped=False, grouped_decode20=True)
     # Eager replay determinism of the grouped selection.

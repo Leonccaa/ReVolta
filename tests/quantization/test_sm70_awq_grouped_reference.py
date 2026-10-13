@@ -60,14 +60,10 @@ def test_plan_reference_groups_by_expert_and_drops_invalid():
     experts = plan[ref.PLAN_EXPERTS : ref.PLAN_EXPERTS + packs].tolist()
     assert experts == sorted(set(experts))
     assert -1 not in experts and 512 not in experts
-    routes = []
+    routes: list[int] = []
     for pack in range(packs):
-        count = int(plan[ref.PLAN_COUNTS + pack])
-        rows = plan[
-            ref.PLAN_ROWS + pack * ref.ROW_CAP : ref.PLAN_ROWS
-            + pack * ref.ROW_CAP
-            + count
-        ].tolist()
+        rows = ref.plan_pack_routes(plan, pack)
+        assert int(plan[ref.PLAN_STARTS + pack]) == len(routes)
         assert rows == sorted(rows)
         assert all(int(ids.view(-1)[r]) == experts[pack] for r in rows)
         routes += rows
@@ -75,6 +71,7 @@ def test_plan_reference_groups_by_expert_and_drops_invalid():
     assert sorted(routes) == valid
     mask = ref.plan_prefix_mask(plan)
     assert torch.all(plan[mask] >= 0)
+    assert int(mask.sum()) == 1 + 3 * packs + len(valid)
 
 
 def test_plan_reference_splits_packs_at_capacity():
@@ -85,6 +82,43 @@ def test_plan_reference_splits_packs_at_capacity():
     assert int(plan[0]) == 4
     counts = plan[ref.PLAN_COUNTS : ref.PLAN_COUNTS + 4].tolist()
     assert counts == [8, 8, 8, 6]
+    starts = plan[ref.PLAN_STARTS : ref.PLAN_STARTS + 4].tolist()
+    assert starts == [0, 8, 16, 24]
+    assert plan[ref.PLAN_ROWS : ref.PLAN_ROWS + 30].tolist() == list(range(30))
+
+
+def test_plan_layout_matches_native_constants():
+    from vllm import _sm70_ops as ops
+
+    assert ref.PLAN_INTS == ops.AWQ_GROUPED_DECODE_PLAN_INTS == 1928
+    assert ref.MAX_TOKENS == ops.AWQ_GROUPED_DECODE_MAX_TOKENS == 48
+    assert ref.ROW_CAP == 8 * ((ref.MAX_TOKENS + 7) // 8)
+
+
+@pytest.mark.parametrize(
+    "m,pack_rows,cap",
+    [(1, 0, 8), (8, 0, 8), (9, 0, 16), (20, 0, 24), (21, 0, 24), (25, 0, 32)]
+    + [(40, 0, 40), (41, 0, 48), (48, 0, 48), (40, 24, 24), (20, 32, 24)]
+    + [(48, 8, 8), (17, 16, 16)],
+)
+def test_pack_cap(m, pack_rows, cap):
+    assert ref.pack_cap(m, pack_rows) == cap
+
+
+@pytest.mark.parametrize("m", [20, 40, 48])
+def test_plan_reference_full_width_hot_expert(m):
+    """Every token routes to one hot expert: one pack per cap-sized chunk."""
+    ids = torch.stack(
+        [torch.tensor([7] + [8 + 9 * t + s for s in range(9)]) for t in range(m)]
+    ).to(torch.int32)
+    for pack_rows in (0, 8, 24):
+        cap = ref.pack_cap(m, pack_rows)
+        plan = ref.grouped_plan_reference(ids, cap)
+        hot = [p for p in range(int(plan[0])) if int(plan[ref.PLAN_EXPERTS + p]) == 7]
+        assert len(hot) == -(-m // cap)
+        hot_routes = [r for p in hot for r in ref.plan_pack_routes(plan, p)]
+        assert hot_routes == [10 * t for t in range(m)]
+        assert int(plan[0]) == len(hot) + 9 * m
 
 
 def test_reference_one_hot_matches_decoded_weights():
@@ -187,8 +221,66 @@ def test_initialize_falls_back_on_unsupported_layers(
 
 def test_initialize_requires_native_op(monkeypatch):
     monkeypatch.setenv("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN", "1")
-    expected = hasattr(torch.ops._C, "awq_moe_grouped_decode_sm70_out")
-    assert moe._initialize_qwen38_grouped_qpn(_layer(), True, 10) == expected
+    for name in (
+        "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT",
+        "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS",
+        "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_PACK_ROWS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    # Only the 48-row native op (schema with pack_rows) is admitted.
+    expected = moe._grouped_qpn_native_supports_pack_rows()
+    assert expected <= hasattr(torch.ops._C, "awq_moe_grouped_decode_sm70_out")
+    layer = _layer()
+    assert moe._initialize_qwen38_grouped_qpn(layer, True, 10) == expected
+    if expected:
+        assert layer.sm70_awq_qwen38_grouped_qpn_max_tokens == 20
+        assert layer.sm70_awq_qwen38_grouped_qpn_pack_rows == 0
+
+
+@pytest.mark.parametrize("value", ["1", "49", "64"])
+def test_initialize_rejects_bad_max_tokens(monkeypatch, value):
+    monkeypatch.setenv("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN", "1")
+    monkeypatch.delenv("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT", raising=False)
+    monkeypatch.setenv("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS", value)
+    with pytest.raises(ValueError):
+        moe._initialize_qwen38_grouped_qpn(_layer(), True, 10)
+
+
+@pytest.mark.parametrize("value", ["4", "12", "56", "-8"])
+def test_initialize_rejects_bad_pack_rows(monkeypatch, value):
+    monkeypatch.setenv("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN", "1")
+    monkeypatch.delenv("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT", raising=False)
+    monkeypatch.delenv("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS", raising=False)
+    monkeypatch.setenv("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_PACK_ROWS", value)
+    with pytest.raises(ValueError):
+        moe._initialize_qwen38_grouped_qpn(_layer(), True, 10)
+
+
+@pytest.mark.parametrize("max_tokens", ["2", "20", "40", "48"])
+@pytest.mark.parametrize("pack_rows", ["0", "24", "48"])
+def test_initialize_records_row_band(monkeypatch, max_tokens, pack_rows):
+    monkeypatch.setenv("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN", "1")
+    monkeypatch.delenv("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT", raising=False)
+    monkeypatch.setenv("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS", max_tokens)
+    monkeypatch.setenv("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_PACK_ROWS", pack_rows)
+    monkeypatch.setattr(moe, "_grouped_qpn_native_supports_pack_rows", lambda: True)
+    monkeypatch.setattr(
+        torch.ops._C, "awq_moe_grouped_decode_sm70_out", object(), raising=False
+    )
+    layer = _layer()
+    assert moe._initialize_qwen38_grouped_qpn(layer, True, 10)
+    assert layer.sm70_awq_qwen38_grouped_qpn_max_tokens == int(max_tokens)
+    assert layer.sm70_awq_qwen38_grouped_qpn_pack_rows == int(pack_rows)
+
+
+def test_initialize_rejects_20_row_native_op(monkeypatch):
+    monkeypatch.setenv("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN", "1")
+    monkeypatch.delenv("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS", raising=False)
+    monkeypatch.setattr(moe, "_grouped_qpn_native_supports_pack_rows", lambda: False)
+    monkeypatch.setattr(
+        torch.ops._C, "awq_moe_grouped_decode_sm70_out", object(), raising=False
+    )
+    assert not moe._initialize_qwen38_grouped_qpn(_layer(), True, 10)
 
 
 def _runtime_inputs(m, dtype=torch.float16):
@@ -198,10 +290,14 @@ def _runtime_inputs(m, dtype=torch.float16):
     return x, weights, ids
 
 
-@pytest.mark.parametrize("m", [1, 2, 5, 16, 17, 20, 21, 32])
-def test_runtime_admission_row_band(m):
-    admitted = moe._use_qwen38_grouped_qpn(_layer(), *_runtime_inputs(m))
-    assert admitted == (2 <= m <= 20)
+@pytest.mark.parametrize("m", [1, 2, 5, 16, 17, 20, 21, 32, 40, 41, 48, 49])
+@pytest.mark.parametrize("max_tokens", [None, 20, 40, 48])
+def test_runtime_admission_row_band(m, max_tokens):
+    layer = _layer()
+    if max_tokens is not None:
+        layer.sm70_awq_qwen38_grouped_qpn_max_tokens = max_tokens
+    admitted = moe._use_qwen38_grouped_qpn(layer, *_runtime_inputs(m))
+    assert admitted == (2 <= m <= (max_tokens or 20))
 
 
 def test_runtime_admission_rejects_layout_and_dtype():
@@ -218,16 +314,36 @@ def test_runtime_admission_rejects_layout_and_dtype():
     )
 
 
-@pytest.mark.parametrize("m", [1, 5, 8, 9, 10, 15, 20, 21, 32])
+@pytest.mark.parametrize("m", [1, 5, 8, 9, 10, 15, 20, 21, 32, 40, 41, 48])
 @pytest.mark.parametrize("flag", [False, True])
-def test_grouped_decode20_runtime_band(m, flag):
+@pytest.mark.parametrize("max_tokens", [None, 20, 40])
+def test_grouped_decode20_runtime_band(m, flag, max_tokens):
     layer = SimpleNamespace(sm70_awq_qwen38_grouped_decode20=flag)
-    assert moe._use_qwen38_grouped_decode20(layer, m, 10) == (flag and 9 <= m <= 20)
+    if max_tokens is not None:
+        layer.sm70_awq_qwen38_grouped_decode20_max_tokens = max_tokens
+    assert moe._use_qwen38_grouped_decode20(layer, m, 10) == (
+        flag and 9 <= m <= (max_tokens or 20)
+    )
     assert not moe._use_qwen38_grouped_decode20(layer, m, 8)
 
 
+@pytest.mark.parametrize("value,ok", [("8", False), ("9", True), ("20", True)])
+@pytest.mark.parametrize("value2,ok2", [("40", True), ("48", True), ("49", False)])
+def test_grouped_decode20_max_tokens_env(monkeypatch, value, ok, value2, ok2):
+    for raw, valid in ((value, ok), (value2, ok2)):
+        monkeypatch.setenv("VLLM_SM70_AWQ_QWEN38_MOE_GROUPED_DECODE_MAX_TOKENS", raw)
+        if valid:
+            assert moe._resolve_qwen38_grouped_decode20_max_tokens() == int(raw)
+        else:
+            with pytest.raises(ValueError):
+                moe._resolve_qwen38_grouped_decode20_max_tokens()
+    monkeypatch.delenv("VLLM_SM70_AWQ_QWEN38_MOE_GROUPED_DECODE_MAX_TOKENS")
+    assert moe._resolve_qwen38_grouped_decode20_max_tokens() == 20
+
+
 @pytest.mark.parametrize("grouped", [False, True])
-def test_grouped_decode20_route_plan(grouped):
+@pytest.mark.parametrize("m", [20, 40])
+def test_grouped_decode20_route_plan(grouped, m):
     from vllm.model_executor.layers.quantization.sm70_moe_router import (
         Sm70MoeStageRoute,
         select_sm70_quantized_moe_route,
@@ -235,8 +351,8 @@ def test_grouped_decode20_route_plan(grouped):
 
     plan = select_sm70_quantized_moe_route(
         batched_enabled=True,
-        num_tokens=20,
-        total_slots=200,
+        num_tokens=m,
+        total_slots=10 * m,
         w13_per_expert_dispatch=not grouped,
         w2_per_expert_dispatch=not grouped,
     )

@@ -8,14 +8,17 @@ intermediate 160 per rank, AWQ g32 with compact metadata) for M rows, on full
 the production AWQSM70MoEMethod (awq_sm70_prepare_compact):
 
 * grouped: awq_moe_grouped_decode_sm70_out (plan + W13/SwiGLU + W2/reduce),
-  W13 split 16, 8 and 4;
+  W13 split 16, 8 and 4 (M = 1..48), optionally with --pack-rows caps
+  (e.g. 24: at most three row blocks per CTA, hot experts split into packs);
 * turbomind: AWQSM70MoEMethod.apply() with the grouped route disabled, i.e.
   the production route (permute + active-grouped TurboMind GEMMs for M<=8,
   per-expert dispatch for M>8, SwiGLU, W2, unpermute);
-* grouped20 (M 9..20): the same apply() with
-  VLLM_SM70_AWQ_QWEN38_MOE_GROUPED_DECODE20 (grouped TurboMind launch specs).
-  Run with VLLM_SM70_AWQ_TUNE_SMALL_SHAPES=1 and
-  VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS=200 to include tactic tuning at M=20.
+* grouped20 (M 9..48): the same apply() with
+  VLLM_SM70_AWQ_QWEN38_MOE_GROUPED_DECODE20 (grouped TurboMind launch specs;
+  the benchmark raises VLLM_SM70_AWQ_QWEN38_MOE_GROUPED_DECODE_MAX_TOKENS to
+  48 unless set). Run with VLLM_SM70_AWQ_TUNE_SMALL_SHAPES=1 and
+  VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS=400 to include tactic tuning up to M=40
+  (the limit counts routed slots, M x 10).
 
 Each variant is captured in a CUDA graph of --inner calls and replayed; the
 median per-call time over --rounds is reported, with the effective weight
@@ -26,7 +29,8 @@ topk_ids tensor (rows are taken in order).
 
 Example (V100, one GPU):
   python benchmarks/kernels/benchmark_sm70_awq_grouped_decode.py \\
-      --m 5 10 15 20 --json /tmp/grouped.json --profile
+      --m 5 10 15 20 25 30 35 40 --pack-rows 0 24 --json /tmp/grouped.json \\
+      --profile
 """
 
 import argparse
@@ -126,7 +130,9 @@ def profile_kernels(graph, replays=20):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--m", type=int, nargs="+", default=[5, 10, 15, 20])
+    parser.add_argument(
+        "--m", type=int, nargs="+", default=[5, 10, 15, 20, 25, 30, 35, 40]
+    )
     parser.add_argument(
         "--inner", type=int, default=48, help="calls per graph (layers)"
     )
@@ -147,6 +153,13 @@ def main():
         help="torch.save'd [N, 10] int topk_ids; first M rows used",
     )
     parser.add_argument("--splits", type=int, nargs="+", default=[16, 8, 4])
+    parser.add_argument(
+        "--pack-rows",
+        type=int,
+        nargs="+",
+        default=[0],
+        help="grouped pack-row caps to time (0 = one pack per expert)",
+    )
     parser.add_argument("--no-turbomind", action="store_true")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--json", default=None)
@@ -158,7 +171,9 @@ def main():
     if not hasattr(torch.ops._C, "awq_moe_grouped_decode_sm70_out"):
         raise SystemExit("build lacks awq_moe_grouped_decode_sm70_out")
     os.environ.setdefault("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN", "1")
+    os.environ.setdefault("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS", "48")
     os.environ.setdefault("VLLM_SM70_AWQ_QWEN38_MOE_GROUPED_DECODE20", "1")
+    os.environ.setdefault("VLLM_SM70_AWQ_QWEN38_MOE_GROUPED_DECODE_MAX_TOKENS", "48")
     os.environ.setdefault("VLLM_SM70_AWQ_QWEN38_MOE_COMPACT_GROUPED_DECODE", "1")
     os.environ.setdefault("VLLM_SM70_AWQ_MOE_COMPACT_METADATA", "1")
     os.environ.setdefault("VLLM_SM70_AWQ_TUNE_SMALL_SHAPES", "0")
@@ -170,6 +185,10 @@ def main():
         flush=True,
     )
     method = layer._r2_method
+    from vllm.model_executor.layers.quantization import awq_sm70_moe as moe
+
+    if max(args.m) > ops.AWQ_GROUPED_DECODE_MAX_TOKENS:
+        raise SystemExit(f"--m above {ops.AWQ_GROUPED_DECODE_MAX_TOKENS}")
     saved = None
     if args.routing_file:
         saved = torch.load(args.routing_file).to(torch.int32).reshape(-1, 10)
@@ -211,7 +230,10 @@ def main():
             if args.profile:
                 entry["turbomind_kernels"] = profile_kernels(graph)
             del graph
-            if 9 <= m <= 20:
+            layer.sm70_awq_qwen38_grouped_decode20 = True
+            use_grouped20 = moe._use_qwen38_grouped_decode20(layer, m, 10)
+            layer.sm70_awq_qwen38_grouped_decode20 = False
+            if use_grouped20:
                 # VLLM_SM70_AWQ_QWEN38_MOE_GROUPED_DECODE20 route.
                 def grouped20(x=x, topk=topk, ids=ids):
                     layer.sm70_awq_qwen38_grouped_qpn = False
@@ -232,10 +254,25 @@ def main():
                     entry["grouped20_kernels"] = profile_kernels(graph)
                 del graph
                 layer.sm70_awq_qwen38_grouped_decode20 = False
-        for split in args.splits:
+        variants = [
+            (split, pack_rows)
+            for split in args.splits
+            for pack_rows in args.pack_rows
+            if not pack_rows or pack_rows < 8 * ((m + 7) // 8)
+        ]
+        split_out = {}
+        for split, pack_rows in variants:
+            name = f"split{split}" + (f"_pr{pack_rows}" if pack_rows else "")
 
             def grouped(
-                split=split, out=out, inter=inter, plan=plan, x=x, ids=ids, topk=topk
+                split=split,
+                pack_rows=pack_rows,
+                out=out,
+                inter=inter,
+                plan=plan,
+                x=x,
+                ids=ids,
+                topk=topk,
             ):
                 ops.awq_moe_grouped_decode_sm70_out(
                     out,
@@ -249,20 +286,29 @@ def main():
                     ids,
                     topk,
                     split,
+                    pack_rows,
                 )
 
             grouped()
             torch.cuda.synchronize()
+            entry[f"{name}_packs"] = int(plan[0].item())
+            if split in split_out:
+                # Pack-row caps must not change any bit (same split).
+                entry[f"{name}_bitwise_vs_first"] = bool(
+                    torch.equal(out, split_out[split])
+                )
+            else:
+                split_out[split] = out.clone()
             if reference is not None:
                 diff = (out.double() - reference.double()).abs()
-                entry[f"split{split}_max_abs_vs_turbomind"] = diff.max().item()
+                entry[f"{name}_max_abs_vs_turbomind"] = diff.max().item()
                 entry["ref_max_abs"] = reference.double().abs().max().item()
             median, best, graph = time_graph(grouped, args.inner, args.rounds)
-            entry[f"split{split}_us"] = median
-            entry[f"split{split}_best_us"] = best
-            entry[f"split{split}_gbps"] = weight_mb * 1e6 / (median * 1e-6) / 1e9
+            entry[f"{name}_us"] = median
+            entry[f"{name}_best_us"] = best
+            entry[f"{name}_gbps"] = weight_mb * 1e6 / (median * 1e-6) / 1e9
             if args.profile:
-                entry[f"split{split}_kernels"] = profile_kernels(graph)
+                entry[f"{name}_kernels"] = profile_kernels(graph)
             del graph
         layer.sm70_awq_qwen38_grouped_qpn = True
         results.append(entry)

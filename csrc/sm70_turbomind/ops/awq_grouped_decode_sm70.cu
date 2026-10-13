@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 //
-// Qwen3.8 TP4 native-g32 AWQ grouped small-M MoE decode (M = 1..20 rows).
+// Qwen3.8 TP4 native-g32 AWQ grouped small-M MoE decode (M = 1..48 rows).
 //
 // The multi-row grouped dataflow follows nvfp4_grouped_decode_sm70.cu; the
 // AWQ U4 decoder and 3-byte/4-byte metadata readers follow
@@ -16,10 +16,12 @@
 //      so the plan is deterministic and contains no atomics.
 //   2. W13 + SwiGLU: grid (10 N32 tiles, M*10 pack slots). A CTA reads one
 //      tile of one active expert once and multiplies every row routed to it:
-//      RB m8n8k4 row blocks share each decoded B fragment. K is split across
-//      warps; FP32 partials are reduced in a fixed order in shared memory,
-//      gate/up are rounded to FP16, SiLU is evaluated in FP32 from the FP16
-//      gate and rounded, then multiplied by up in FP16 (the QPN M1 boundary).
+//      RB (1..6) m8n8k4 row blocks share each decoded B fragment. K is split
+//      across warps; FP32 partials are reduced in a fixed order in shared
+//      memory (in rounds of at most three row blocks, so every variant stays
+//      within the default 48 KB), gate/up are rounded to FP16, SiLU is
+//      evaluated in FP32 from the FP16 gate and rounded, then multiplied by up
+//      in FP16 (the QPN M1 boundary).
 //   3. W2 + weighted unroute: 80 CTAs, each owning 32 output columns for all
 //      tokens. Warps walk the packs and read each expert's W2 slice once; FP16
 //      route outputs stay in shared memory and, after one barrier, each token
@@ -32,7 +34,10 @@
 // QPN call bitwise (batch invariance). split=8 or 4 (fewer warps per CTA,
 // longer K per warp, as the NVFP4 grouped w13_kernel<4>) changes only the
 // FP32 split-K association. Neither is bitwise equal to the TurboMind serial
-// split-K route.
+// split-K route. A row's arithmetic does not depend on which pack or MMA row
+// it occupies (m8n8k4 rows are independent; inactive rows are zero), so the
+// optional pack-row cap (pack_rows) changes only how often a hot expert's
+// weights are read, not the result.
 
 #include <torch/all.h>
 #include <ATen/MemoryOverlap.h>
@@ -42,6 +47,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <torch/library.h>
+#include <algorithm>
 #include <cstdint>
 
 namespace {
@@ -52,22 +58,31 @@ constexpr int kK2 = 160;   // intermediate size per TP4 rank (W2 K)
 constexpr int kN2 = 2560;  // W2 output columns
 constexpr int kExperts = 512;
 constexpr int kTopK = 10;
-constexpr int kMaxTokens = 20;
-constexpr int kMaxRoutes = kMaxTokens * kTopK;  // 200
-constexpr int kRowCap = 24;                     // 3 m8n8k4 row blocks
-constexpr int kTiles13 = kN13 / 32;             // 10
-constexpr int kTiles2 = kN2 / 32;               // 80
+constexpr int kMaxTokens = 48;
+constexpr int kMaxRoutes = kMaxTokens * kTopK;       // 480
+constexpr int kMaxRowBlocks = (kMaxTokens + 7) / 8;  // 6 m8n8k4 row blocks
+constexpr int kRowCap = kMaxRowBlocks * 8;           // 48 rows per pack
+// W13 partial sums are reduced in rounds of at most this many row blocks:
+// Split * kRoundRB * 8 rows * 32 columns * 4 B = 48 KB at Split 16.
+constexpr int kRoundRB = 3;
+constexpr int kTiles13 = kN13 / 32;  // 10
+constexpr int kTiles2 = kN2 / 32;    // 80
+static_assert(kMaxRoutes <= kExperts, "the plan kernel loads one route/thread");
 
 // int32 plan layout (fixed size, graph capturable):
-//   [0]                         number of packs
-//   [kPlanExperts + p]          expert id of pack p
-//   [kPlanCounts + p]           rows in pack p (1..cap)
-//   [kPlanRows + p*kRowCap + i] route index (token*10 + slot) of row i
+//   [0]                    number of packs
+//   [kPlanExperts + p]     expert id of pack p
+//   [kPlanCounts + p]      rows in pack p (1..cap)
+//   [kPlanStarts + p]      first row of pack p in the row list
+//   [kPlanRows + i]        route index (token*10 + slot) of row i. Rows are
+//                          sorted by (expert, route), so pack p owns rows
+//                          [start, start + count) and every route has one row.
 constexpr int kPlanExperts = 8;
 constexpr int kPlanCounts = kPlanExperts + kMaxRoutes;
-constexpr int kPlanRows = kPlanCounts + kMaxRoutes;
-constexpr int kPlanInts = kPlanRows + kMaxRoutes * kRowCap;  // 5208
-static_assert(kPlanInts == 5208, "keep vllm/_sm70_ops.py in sync");
+constexpr int kPlanStarts = kPlanCounts + kMaxRoutes;
+constexpr int kPlanRows = kPlanStarts + kMaxRoutes;
+constexpr int kPlanInts = kPlanRows + kMaxRoutes;  // 1928
+static_assert(kPlanInts == 1928, "keep vllm/_sm70_ops.py in sync");
 
 // Metadata formats, as in awq_qpn_m1_sm70.cu: 0 = compact 3-byte scalar
 // reader, 1 = compact 3-byte warp-cooperative reader, 2 = 4-byte scale+bias.
@@ -192,8 +207,9 @@ __global__ void __launch_bounds__(kExperts)
   __shared__ int s_id[kMaxRoutes];
   __shared__ int s_ordinal[kMaxRoutes];
   __shared__ int s_count[kExperts];
-  __shared__ int s_first[kExperts];
-  __shared__ int s_warp_sum[kExperts / 32];
+  __shared__ int s_first_row[kExperts];
+  __shared__ int s_warp_packs[kExperts / 32];
+  __shared__ int s_warp_rows[kExperts / 32];
   const int t = threadIdx.x;
   const int lane = t & 31;
   const int warp = t >> 5;
@@ -220,33 +236,44 @@ __global__ void __launch_bounds__(kExperts)
     }
   }
   __syncthreads();
+  // Block-wide exclusive scans (in expert order) of the pack and row counts.
   const int count = s_count[t];
   const int npacks = (count + cap - 1) / cap;
-  int inclusive = npacks;
+  int packs_incl = npacks;
+  int rows_incl = count;
 #pragma unroll
   for (int offset = 1; offset < 32; offset <<= 1) {
-    const int value = __shfl_up_sync(0xffffffffu, inclusive, offset);
-    if (lane >= offset) inclusive += value;
+    const int packs = __shfl_up_sync(0xffffffffu, packs_incl, offset);
+    const int rows = __shfl_up_sync(0xffffffffu, rows_incl, offset);
+    if (lane >= offset) {
+      packs_incl += packs;
+      rows_incl += rows;
+    }
   }
-  if (lane == 31) s_warp_sum[warp] = inclusive;
+  if (lane == 31) {
+    s_warp_packs[warp] = packs_incl;
+    s_warp_rows[warp] = rows_incl;
+  }
   __syncthreads();
-  int warp_base = 0;
-  for (int w = 0; w < warp; ++w) warp_base += s_warp_sum[w];
-  const int first = warp_base + inclusive - npacks;
-  s_first[t] = first;
-  for (int p = 0; p < npacks; ++p) {
-    plan[kPlanExperts + first + p] = t;
-    plan[kPlanCounts + first + p] = min(cap, count - p * cap);
+  int packs_base = 0;
+  int rows_base = 0;
+  for (int w = 0; w < warp; ++w) {
+    packs_base += s_warp_packs[w];
+    rows_base += s_warp_rows[w];
   }
-  if (t == kExperts - 1) plan[0] = warp_base + inclusive;
+  const int first_pack = packs_base + packs_incl - npacks;
+  const int first_row = rows_base + rows_incl - count;
+  s_first_row[t] = first_row;
+  for (int p = 0; p < npacks; ++p) {
+    plan[kPlanExperts + first_pack + p] = t;
+    plan[kPlanCounts + first_pack + p] = min(cap, count - p * cap);
+    plan[kPlanStarts + first_pack + p] = first_row + p * cap;
+  }
+  if (t == kExperts - 1) plan[0] = packs_base + packs_incl;
   __syncthreads();
   if (t < routes) {
     const int id = s_id[t];
-    if (id >= 0) {
-      const int ordinal = s_ordinal[t];
-      const int pack = s_first[id] + ordinal / cap;
-      plan[kPlanRows + pack * kRowCap + ordinal % cap] = t;
-    }
+    if (id >= 0) plan[kPlanRows + s_first_row[id] + s_ordinal[t]] = t;
   }
 }
 
@@ -257,15 +284,19 @@ __global__ void __launch_bounds__(Split * 32)
                        const uint8_t* __restrict__ metadata,
                        const int32_t* __restrict__ plan,
                        half* __restrict__ out) {
-  extern __shared__ float partial[];  // [Split][RB * 8][32]
-  constexpr int kRows = RB * 8;
+  // Partials of up to kRoundRB row blocks: [Split][kChunkRows][32]. RB <= 3
+  // reduces in one round (the single-pass layout of the 20-row kernel).
+  extern __shared__ float partial[];
+  constexpr int kChunkRB = RB < kRoundRB ? RB : kRoundRB;
+  constexpr int kChunkRows = kChunkRB * 8;
   constexpr int kSteps = (kK / 16) / Split;
   static_assert(kSteps % 2 == 0, "warps must start on an even K16 step");
+  static_assert(RB >= 1 && RB <= kMaxRowBlocks, "unsupported row blocks");
   const int pack = blockIdx.y;
   if (pack >= __ldg(plan)) return;
   const int expert = __ldg(plan + kPlanExperts + pack);
   const int count = __ldg(plan + kPlanCounts + pack);
-  const int32_t* rows = plan + kPlanRows + pack * kRowCap;
+  const int32_t* rows = plan + kPlanRows + __ldg(plan + kPlanStarts + pack);
   const int nrb = (count + 7) >> 3;
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
@@ -315,35 +346,46 @@ __global__ void __launch_bounds__(Split * 32)
     mma_row_blocks<RB>(accum, a, on, nrb, group + 1, d1);
   }
 #pragma unroll
-  for (int rb = 0; rb < RB; ++rb) {
-    if (rb < nrb) {
+  for (int c = 0; c < RB; c += kChunkRB) {
+    // `c < nrb` is CTA-uniform, so the barriers below are uniform too.
+    if (c < nrb) {
+      if (c > 0) __syncthreads();  // the previous round has been reduced
 #pragma unroll
-      for (int i = 0; i < 8; ++i) {
-        partial[(warp * kRows + rb * 8 + acc_row(i, lane)) * 32 + quadpair * 8 +
-                acc_col(i, lane)] = accum[rb][i];
+      for (int q = 0; q < kChunkRB; ++q) {
+        const int rb = c + q;
+        if (rb < RB && rb < nrb) {
+#pragma unroll
+          for (int i = 0; i < 8; ++i) {
+            partial[(warp * kChunkRows + q * 8 + acc_row(i, lane)) * 32 +
+                    quadpair * 8 + acc_col(i, lane)] =
+                accum[rb < RB ? rb : RB - 1][i];
+          }
+        }
+      }
+      __syncthreads();
+      // Fixed split order from 0.f, as the QPN M1 reduction. Columns 2j/2j+1
+      // of the interleaved bank are gate/up of intermediate index tile*16+j.
+      const int row0 = c * 8;
+      const int round_rows = min(count - row0, kChunkRows);
+      for (int idx = threadIdx.x; idx < round_rows * 16; idx += blockDim.x) {
+        const int r = idx >> 4;
+        const int j = idx & 15;
+        float gate_sum = 0.f;
+        float up_sum = 0.f;
+#pragma unroll
+        for (int s = 0; s < Split; ++s) {
+          const float* p = partial + (s * kChunkRows + r) * 32;
+          gate_sum += p[2 * j];
+          up_sum += p[2 * j + 1];
+        }
+        const half gate = __float2half(gate_sum);
+        const half up = __float2half(up_sum);
+        const float gate_f = __half2float(gate);
+        const half silu = __float2half(gate_f / (1.f + expf(-gate_f)));
+        out[static_cast<size_t>(__ldg(rows + row0 + r)) * kK2 + tile * 16 + j] =
+            __hmul(silu, up);
       }
     }
-  }
-  __syncthreads();
-  // Fixed split order from 0.f, as the QPN M1 reduction. Columns 2j/2j+1 of
-  // the interleaved bank are gate/up of intermediate index tile*16 + j.
-  for (int idx = threadIdx.x; idx < count * 16; idx += blockDim.x) {
-    const int r = idx >> 4;
-    const int j = idx & 15;
-    float gate_sum = 0.f;
-    float up_sum = 0.f;
-#pragma unroll
-    for (int s = 0; s < Split; ++s) {
-      const float* p = partial + (s * kRows + r) * 32;
-      gate_sum += p[2 * j];
-      up_sum += p[2 * j + 1];
-    }
-    const half gate = __float2half(gate_sum);
-    const half up = __float2half(up_sum);
-    const float gate_f = __half2float(gate);
-    const half silu = __float2half(gate_f / (1.f + expf(-gate_f)));
-    out[static_cast<size_t>(__ldg(rows + r)) * kK2 + tile * 16 + j] =
-        __hmul(silu, up);
   }
 }
 
@@ -355,6 +397,7 @@ __global__ void __launch_bounds__(Warps * 32)
                              const int32_t* __restrict__ plan,
                              const float* __restrict__ topk,
                              half* __restrict__ out, int tokens) {
+  // FP16 route outputs of this column tile: kMaxRoutes * 64 B (30 KB).
   __shared__ half values[kMaxRoutes][32];
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
@@ -372,7 +415,7 @@ __global__ void __launch_bounds__(Warps * 32)
   for (int pack = warp; pack < packs; pack += Warps) {
     const int expert = __ldg(plan + kPlanExperts + pack);
     const int count = __ldg(plan + kPlanCounts + pack);
-    const int32_t* rows = plan + kPlanRows + pack * kRowCap;
+    const int32_t* rows = plan + kPlanRows + __ldg(plan + kPlanStarts + pack);
     const int nrb = (count + 7) >> 3;
     const half* a[RB];
     bool on[RB];
@@ -445,7 +488,8 @@ template <int Format, int Split, int RB>
 void launch_w13(const at::Tensor& input, const at::Tensor& w13,
                 const at::Tensor& s13, const at::Tensor& plan,
                 at::Tensor& intermediate, int routes, cudaStream_t stream) {
-  constexpr size_t smem = static_cast<size_t>(Split) * RB * 8 * 32 * 4;
+  constexpr int kChunkRB = RB < kRoundRB ? RB : kRoundRB;
+  constexpr size_t smem = static_cast<size_t>(Split) * kChunkRB * 8 * 32 * 4;
   static_assert(smem <= 48 * 1024, "W13 partials exceed default smem");
   grouped_w13_kernel<Format, Split, RB>
       <<<dim3(kTiles13, routes), Split * 32, smem, stream>>>(
@@ -501,6 +545,7 @@ void dispatch_rb(int rb, const at::Tensor& input, const at::Tensor& w13,
                  const at::Tensor& s2, const at::Tensor& topk,
                  const at::Tensor& plan, at::Tensor& intermediate,
                  at::Tensor& out, int tokens, int split, cudaStream_t stream) {
+  static_assert(kMaxRowBlocks == 6, "add the new row-block variants");
   switch (rb) {
     case 1:
       launch_all<W13Format, W2Format, 1>(input, w13, s13, w2, s2, topk, plan,
@@ -512,8 +557,23 @@ void dispatch_rb(int rb, const at::Tensor& input, const at::Tensor& w13,
                                          intermediate, out, tokens, split,
                                          stream);
       break;
-    default:
+    case 3:
       launch_all<W13Format, W2Format, 3>(input, w13, s13, w2, s2, topk, plan,
+                                         intermediate, out, tokens, split,
+                                         stream);
+      break;
+    case 4:
+      launch_all<W13Format, W2Format, 4>(input, w13, s13, w2, s2, topk, plan,
+                                         intermediate, out, tokens, split,
+                                         stream);
+      break;
+    case 5:
+      launch_all<W13Format, W2Format, 5>(input, w13, s13, w2, s2, topk, plan,
+                                         intermediate, out, tokens, split,
+                                         stream);
+      break;
+    default:
+      launch_all<W13Format, W2Format, 6>(input, w13, s13, w2, s2, topk, plan,
                                          intermediate, out, tokens, split,
                                          stream);
       break;
@@ -534,21 +594,24 @@ void check_tensor(const at::Tensor& tensor, at::ScalarType dtype,
       "awq_grouped_decode: ", name, " alignment mismatch");
 }
 
-void awq_moe_grouped_decode_sm70_out(at::Tensor out, at::Tensor intermediate,
-                                     at::Tensor plan, const at::Tensor& input,
-                                     const at::Tensor& w13,
-                                     const at::Tensor& s13,
-                                     const at::Tensor& w2, const at::Tensor& s2,
-                                     const at::Tensor& ids,
-                                     const at::Tensor& topk, int64_t split) {
+void awq_moe_grouped_decode_sm70_out(
+    at::Tensor out, at::Tensor intermediate, at::Tensor plan,
+    const at::Tensor& input, const at::Tensor& w13, const at::Tensor& s13,
+    const at::Tensor& w2, const at::Tensor& s2, const at::Tensor& ids,
+    const at::Tensor& topk, int64_t split, int64_t pack_rows) {
   const auto device = input.device();
   TORCH_CHECK(
       input.dim() == 2 && input.size(0) >= 1 && input.size(0) <= kMaxTokens,
-      "awq_grouped_decode: input must be [1..20, 2560]");
+      "awq_grouped_decode: input must be [1..", kMaxTokens, ", 2560]");
   const int tokens = static_cast<int>(input.size(0));
   const int routes = tokens * kTopK;
   TORCH_CHECK(split == 0 || split == 4 || split == 8 || split == 16,
               "awq_grouped_decode: split must be 0 (default 16), 4, 8 or 16");
+  TORCH_CHECK(pack_rows == 0 || (pack_rows >= 8 && pack_rows <= kRowCap &&
+                                 pack_rows % 8 == 0),
+              "awq_grouped_decode: pack_rows must be 0 (one pack per expert) "
+              "or a multiple of 8 in [8, ",
+              kRowCap, "]");
   check_tensor(input, at::kHalf, {tokens, kK}, device, "input");
   check_tensor(out, at::kHalf, {tokens, kN2}, device, "output");
   check_tensor(intermediate, at::kHalf, {routes, kK2}, device, "intermediate");
@@ -589,7 +652,10 @@ void awq_moe_grouped_decode_sm70_out(at::Tensor out, at::Tensor intermediate,
   const auto stream = at::cuda::getCurrentCUDAStream();
   // Each token routes to an expert at most once, so an expert has at most
   // `tokens` rows: ceil(tokens / 8) row blocks read its weights exactly once.
-  const int rb = (tokens + 7) / 8;
+  // pack_rows > 0 caps the rows per pack (fewer accumulator registers); an
+  // expert with more rows is then split into several packs and read again.
+  int rb = (tokens + 7) / 8;
+  if (pack_rows > 0) rb = std::min(rb, static_cast<int>(pack_rows / 8));
   grouped_plan_kernel<<<1, kExperts, 0, stream>>>(
       ids.const_data_ptr<int32_t>(), routes, rb * 8,
       plan.mutable_data_ptr<int32_t>());
@@ -610,7 +676,8 @@ TORCH_LIBRARY_FRAGMENT(_C, m) {
   m.def(
       "awq_moe_grouped_decode_sm70_out(Tensor(a!) out, Tensor(b!) "
       "intermediate, Tensor(c!) plan, Tensor input, Tensor w13, Tensor s13, "
-      "Tensor w2, Tensor s2, Tensor ids, Tensor topk, int split) -> ()");
+      "Tensor w2, Tensor s2, Tensor ids, Tensor topk, int split, "
+      "int pack_rows=0) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(_C, CUDA, m) {

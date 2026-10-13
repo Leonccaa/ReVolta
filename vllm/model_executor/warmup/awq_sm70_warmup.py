@@ -16,7 +16,12 @@ from vllm import _sm70_ops as sm70_ops
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 from vllm.model_executor.layers.quantization.awq_sm70_moe import (
+    _QWEN38_GROUPED_DECODE20_MAX_TOKENS,
+    _QWEN38_GROUPED_DECODE20_MIN_TOKENS,
+    _QWEN38_GROUPED_QPN_MAX_TOKENS,
+    _QWEN38_GROUPED_QPN_MIN_TOKENS,
     _use_qwen38_active_grouped_decode,
+    _use_qwen38_grouped_decode20,
 )
 from vllm.model_executor.layers.quantization.nvfp4_sm70_moe import (
     _prepare_compact_slot_groups,
@@ -730,7 +735,21 @@ def _warmup_moe_dense_stage_layers(
             int(layer.sm70_w13_k_dim), layer.w13_tm_scales[0]
         )
         dense_expert_ids = torch.arange(num_experts, dtype=torch.int32, device=device)
-        for num_tokens in token_counts:
+        layer_token_counts = set(token_counts)
+        if getattr(layer, "sm70_awq_qwen38_grouped_decode20", False):
+            # Every admitted grouped-dispatch row count, not only the default
+            # warmup sizes, so capture never meets an unselected launch spec.
+            max_tokens = int(
+                getattr(
+                    layer,
+                    "sm70_awq_qwen38_grouped_decode20_max_tokens",
+                    _QWEN38_GROUPED_DECODE20_MAX_TOKENS,
+                )
+            )
+            layer_token_counts.update(
+                range(_QWEN38_GROUPED_DECODE20_MIN_TOKENS, max_tokens + 1)
+            )
+        for num_tokens in sorted(layer_token_counts):
             total_slots = num_tokens * top_k
             expert_offsets = _build_balanced_offsets(total_slots, num_experts, device)
             active_grouped = _use_qwen38_active_grouped_decode(layer, num_tokens, top_k)
@@ -771,11 +790,7 @@ def _warmup_moe_dense_stage_layers(
                 device=device,
             )
 
-            if (
-                getattr(layer, "sm70_awq_qwen38_grouped_decode20", False)
-                and 9 <= num_tokens <= 20
-                and top_k == 10
-            ):
+            if _use_qwen38_grouped_decode20(layer, num_tokens, top_k):
                 # VLLM_SM70_AWQ_QWEN38_MOE_GROUPED_DECODE20: measure/select the
                 # grouped (512-group) launch specs before graph capture.
                 for out, src, ptr_w, ptr_s, k, n in (
@@ -834,18 +849,16 @@ def _warmup_moe_dense_stage_layers(
                 group_size,
             )
             calls += 2
-    calls += _warmup_moe_grouped_qpn(moe_layers, token_counts)
+    calls += _warmup_moe_grouped_qpn(moe_layers)
     return calls
 
 
-def _warmup_moe_grouped_qpn(
-    moe_layers: list[torch.nn.Module],
-    token_counts: list[int],
-) -> int:
+def _warmup_moe_grouped_qpn(moe_layers: list[torch.nn.Module]) -> int:
     """Load the opt-in grouped small-M AWQ kernels before graph capture.
 
-    The native op has no tactic selection; one eager call per row-block count
-    on the first admitted layer is enough to load every launched kernel.
+    The native op has no tactic selection; one eager call on the first
+    admitted layer for every admitted row count (2..max) loads every kernel
+    variant (row blocks x split) that capture or replay can launch.
     """
     layer = next(
         (m for m in moe_layers if getattr(m, "sm70_awq_qwen38_grouped_qpn", False)),
@@ -854,10 +867,16 @@ def _warmup_moe_grouped_qpn(
     if layer is None:
         return 0
     device = layer.w13_tm_scales.device
+    max_tokens = int(
+        getattr(
+            layer,
+            "sm70_awq_qwen38_grouped_qpn_max_tokens",
+            _QWEN38_GROUPED_QPN_MAX_TOKENS,
+        )
+    )
+    pack_rows = int(getattr(layer, "sm70_awq_qwen38_grouped_qpn_pack_rows", 0))
     calls = 0
-    for num_tokens in token_counts:
-        if not 2 <= num_tokens <= 20:
-            continue
+    for num_tokens in range(_QWEN38_GROUPED_QPN_MIN_TOKENS, max_tokens + 1):
         routes = num_tokens * 10
         x = torch.zeros((num_tokens, 2560), dtype=torch.float16, device=device)
         ids = (torch.arange(routes, dtype=torch.int32, device=device) % 512).view(
@@ -880,6 +899,7 @@ def _warmup_moe_grouped_qpn(
             ids,
             topk,
             int(envs.VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT),
+            pack_rows,
         )
         calls += 1
     return calls

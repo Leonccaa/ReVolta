@@ -265,6 +265,9 @@ if TYPE_CHECKING:
     VLLM_SM70_AWQ_QWEN38_GROUPED_QPN: bool = False
     VLLM_SM70_AWQ_QWEN38_MOE_GROUPED_DECODE20: bool = False
     VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT: int = 16
+    VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS: int = 20
+    VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_PACK_ROWS: int = 0
+    VLLM_SM70_AWQ_QWEN38_MOE_GROUPED_DECODE_MAX_TOKENS: int = 20
     VLLM_SM70_AWQ_QWEN38_MOE_W2_CHUNK_TOKENS: int = 0
     VLLM_SM70_AWQ_MOE_BATCHED_SINGLE_TOKEN_DENSE_W13: bool = False
     VLLM_SM70_AWQ_MOE_BATCHED_EXACT_W2: bool = False
@@ -3397,6 +3400,58 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="tuning",
         declared_default="16",
         effective_default="16",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMindAwqLinearKernel",),
+        user_visible=False,
+    ),
+    # Upper row bound of the grouped small-M route (kernel maximum: 48).
+    "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS": env_var(
+        lambda: int(os.getenv("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS", "20")),
+        description=(
+            "Largest decode/verify row count admitted to "
+            "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN (2..48; default 20). Rows above "
+            "it keep the TurboMind route. The SM70 AWQ warmup calls the op for "
+            "every admitted row count before graph capture."
+        ),
+        category="tuning",
+        declared_default="20",
+        effective_default="20",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMindAwqLinearKernel",),
+        user_visible=False,
+    ),
+    # Rows per expert pack of the grouped route; 0 reads each expert once.
+    "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_PACK_ROWS": env_var(
+        lambda: int(os.getenv("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_PACK_ROWS", "0")),
+        description=(
+            "Rows per expert pack for VLLM_SM70_AWQ_QWEN38_GROUPED_QPN: 0 (default) "
+            "uses ceil(M/8) m8n8k4 row blocks so every active expert is read "
+            "once; 8, 16, ..., 48 cap the row blocks per CTA (fewer accumulator "
+            "registers) and split hotter experts into several packs that read "
+            "the expert again. The result does not depend on this setting."
+        ),
+        category="tuning",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMindAwqLinearKernel",),
+        user_visible=False,
+    ),
+    # Upper row bound of VLLM_SM70_AWQ_QWEN38_MOE_GROUPED_DECODE20.
+    "VLLM_SM70_AWQ_QWEN38_MOE_GROUPED_DECODE_MAX_TOKENS": env_var(
+        lambda: int(
+            os.getenv("VLLM_SM70_AWQ_QWEN38_MOE_GROUPED_DECODE_MAX_TOKENS", "20")
+        ),
+        description=(
+            "Largest row count (9..48; default 20) that "
+            "VLLM_SM70_AWQ_QWEN38_MOE_GROUPED_DECODE20 sends through the grouped "
+            "TurboMind launch specs. Tactic tuning additionally needs "
+            "VLLM_SM70_AWQ_TUNE_SMALL_SHAPES=1 and "
+            "VLLM_SM70_AWQ_MOE_TUNE_MAX_TOKENS >= rows x 10."
+        ),
+        category="tuning",
+        declared_default="20",
+        effective_default="20",
         automatic_conditions=(),
         acceleration_paths=("TurboMindAwqLinearKernel",),
         user_visible=False,

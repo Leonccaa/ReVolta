@@ -10,7 +10,8 @@ Device-agnostic (CPU or CUDA) and independent of the native extension:
   4-byte (FP16 scale, FP16 bias) group-32 metadata;
 * dequantization with the native FP16 boundary: fp16(q * s + fp16(-z * s)),
   one rounding (the hfma2 result), not (q - z) * s;
-* the routing plan written by the op (ascending expert, ascending route);
+* the routing plan written by the op (ascending expert, ascending route;
+  packs of at most `cap` rows over one row list sorted by expert);
 * the MoE decode itself: FP64 dots, FP16 gate/up, SiLU in FP32 from the FP16
   gate, FP16 product, FP16 per-route W2 output, then a router-order FP32 fma
   reduction rounded once to FP16 (the QPN M1 boundaries).
@@ -28,13 +29,24 @@ TOP_K = 10
 HIDDEN = 2560
 INTERMEDIATE = 160
 EXPERTS = 512
-MAX_TOKENS = 20
+MAX_TOKENS = 48
 MAX_ROUTES = MAX_TOKENS * TOP_K
-ROW_CAP = 24
+ROW_CAP = 48  # rows per pack at most (6 m8n8k4 row blocks)
+# Plan layout (kPlan* in awq_grouped_decode_sm70.cu): [0] pack count, then
+# per pack its expert, row count and first row, then one route per row.
 PLAN_EXPERTS = 8
 PLAN_COUNTS = PLAN_EXPERTS + MAX_ROUTES
-PLAN_ROWS = PLAN_COUNTS + MAX_ROUTES
-PLAN_INTS = PLAN_ROWS + MAX_ROUTES * ROW_CAP
+PLAN_STARTS = PLAN_COUNTS + MAX_ROUTES
+PLAN_ROWS = PLAN_STARTS + MAX_ROUTES
+PLAN_INTS = PLAN_ROWS + MAX_ROUTES
+
+
+def pack_cap(num_tokens: int, pack_rows: int = 0) -> int:
+    """Rows per pack the op uses: 8 * ceil(M / 8), capped by pack_rows."""
+    row_blocks = (num_tokens + 7) // 8
+    if pack_rows:
+        row_blocks = min(row_blocks, pack_rows // 8)
+    return 8 * row_blocks
 
 
 def pack_tm_bank(
@@ -110,7 +122,8 @@ def grouped_plan_reference(ids: torch.Tensor, cap: int) -> torch.Tensor:
     """The int32 plan the native op writes for `ids` ([M, 10]) and `cap`.
 
     Only the meaningful prefix is defined: entries past the pack count and
-    unused row slots are left as -1 here (the native buffer is not cleared).
+    past the routed rows are left as -1 here (the native buffer is not
+    cleared).
     """
     flat = ids.reshape(-1).tolist()
     plan = torch.full((PLAN_INTS,), -1, dtype=torch.int32)
@@ -119,17 +132,27 @@ def grouped_plan_reference(ids: torch.Tensor, cap: int) -> torch.Tensor:
         if 0 <= expert < EXPERTS:
             by_expert.setdefault(int(expert), []).append(route)
     pack = 0
+    row = 0
     for expert in sorted(by_expert):
         rows = by_expert[expert]
         for start in range(0, len(rows), cap):
             chunk = rows[start : start + cap]
             plan[PLAN_EXPERTS + pack] = expert
             plan[PLAN_COUNTS + pack] = len(chunk)
+            plan[PLAN_STARTS + pack] = row
             for i, route in enumerate(chunk):
-                plan[PLAN_ROWS + pack * ROW_CAP + i] = route
+                plan[PLAN_ROWS + row + i] = route
+            row += len(chunk)
             pack += 1
     plan[0] = pack
     return plan
+
+
+def plan_pack_routes(plan: torch.Tensor, pack: int) -> list[int]:
+    """Route indices of one pack of a (native or reference) plan."""
+    count = int(plan[PLAN_COUNTS + pack])
+    start = int(plan[PLAN_STARTS + pack])
+    return plan[PLAN_ROWS + start : PLAN_ROWS + start + count].tolist()
 
 
 def plan_prefix_mask(plan: torch.Tensor) -> torch.Tensor:
@@ -139,10 +162,9 @@ def plan_prefix_mask(plan: torch.Tensor) -> torch.Tensor:
     mask[0] = True
     mask[PLAN_EXPERTS : PLAN_EXPERTS + packs] = True
     mask[PLAN_COUNTS : PLAN_COUNTS + packs] = True
-    for pack in range(packs):
-        count = int(plan[PLAN_COUNTS + pack])
-        start = PLAN_ROWS + pack * ROW_CAP
-        mask[start : start + count] = True
+    mask[PLAN_STARTS : PLAN_STARTS + packs] = True
+    rows = int(plan[PLAN_COUNTS : PLAN_COUNTS + packs].sum()) if packs else 0
+    mask[PLAN_ROWS : PLAN_ROWS + rows] = True
     return mask
 
 

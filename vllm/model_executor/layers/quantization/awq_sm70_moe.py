@@ -115,13 +115,31 @@ def _use_qwen38_active_grouped_decode(
 
 
 _QWEN38_GROUPED_DECODE20_MIN_TOKENS: Final = 9
+# Default upper bound; VLLM_SM70_AWQ_QWEN38_MOE_GROUPED_DECODE_MAX_TOKENS
+# raises it up to _QWEN38_GROUPED_DECODE20_MAX_TOKENS_LIMIT.
 _QWEN38_GROUPED_DECODE20_MAX_TOKENS: Final = 20
+_QWEN38_GROUPED_DECODE20_MAX_TOKENS_LIMIT: Final = 48
+
+
+def _resolve_qwen38_grouped_decode20_max_tokens() -> int:
+    max_tokens = int(envs.VLLM_SM70_AWQ_QWEN38_MOE_GROUPED_DECODE_MAX_TOKENS)
+    if not (
+        _QWEN38_GROUPED_DECODE20_MIN_TOKENS
+        <= max_tokens
+        <= _QWEN38_GROUPED_DECODE20_MAX_TOKENS_LIMIT
+    ):
+        raise ValueError(
+            "VLLM_SM70_AWQ_QWEN38_MOE_GROUPED_DECODE_MAX_TOKENS must be in "
+            f"{_QWEN38_GROUPED_DECODE20_MIN_TOKENS}.."
+            f"{_QWEN38_GROUPED_DECODE20_MAX_TOKENS_LIMIT}, got {max_tokens}."
+        )
+    return max_tokens
 
 
 def _use_qwen38_grouped_decode20(
     layer: RoutedExperts, num_tokens: int, top_k: int
 ) -> bool:
-    """Opt-in grouped TurboMind dispatch for 9..20 decode/verify rows.
+    """Opt-in grouped TurboMind dispatch for 9..max decode/verify rows.
 
     The default AWQ batched route selects each GEMM's launch spec as if the
     whole batch belonged to one expert (dispatch_num_override=1, introduced
@@ -129,30 +147,78 @@ def _use_qwen38_grouped_decode20(
     the same Qwen3.8 shapes dispatches over all 512 groups instead. This
     admission reuses the existing grouped op (awq_moe_gemm_sm70_out) for W13
     and W2 with that grouped selection; it changes the split-K/tile choice and
-    therefore the FP32 accumulation order.
+    therefore the FP32 accumulation order. The upper bound is
+    VLLM_SM70_AWQ_QWEN38_MOE_GROUPED_DECODE_MAX_TOKENS (default 20), resolved
+    at load time into the layer.
     """
+    max_tokens = int(
+        getattr(
+            layer,
+            "sm70_awq_qwen38_grouped_decode20_max_tokens",
+            _QWEN38_GROUPED_DECODE20_MAX_TOKENS,
+        )
+    )
     return bool(
         getattr(layer, "sm70_awq_qwen38_grouped_decode20", False)
-        and _QWEN38_GROUPED_DECODE20_MIN_TOKENS
-        <= num_tokens
-        <= _QWEN38_GROUPED_DECODE20_MAX_TOKENS
+        and _QWEN38_GROUPED_DECODE20_MIN_TOKENS <= num_tokens <= max_tokens
         and top_k == 10
     )
 
 
 _QWEN38_GROUPED_QPN_MIN_TOKENS: Final = 2
+# Default upper bound; VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS raises it up
+# to the native kernel maximum (sm70_ops.AWQ_GROUPED_DECODE_MAX_TOKENS).
 _QWEN38_GROUPED_QPN_MAX_TOKENS: Final = 20
+_QWEN38_GROUPED_QPN_PACK_ROWS: Final = (0, 8, 16, 24, 32, 40, 48)
+
+
+def _grouped_qpn_native_supports_pack_rows() -> bool:
+    """True for the 48-row native op (schema with pack_rows, 1928-int plan).
+
+    The 20-row build (5208-int plan, no pack_rows) is not compatible with this
+    Python side, so it is not admitted.
+    """
+    op = getattr(torch.ops._C, "awq_moe_grouped_decode_sm70_out", None)
+    if op is None:
+        return False
+    try:
+        arguments = op.default._schema.arguments
+    except (AttributeError, RuntimeError):
+        return False
+    return any(argument.name == "pack_rows" for argument in arguments)
 
 
 def _initialize_qwen38_grouped_qpn(
     layer: RoutedExperts, shape_contract: bool, top_k: int
 ) -> bool:
-    """Opt-in admission of the grouped small-M AWQ route at load time."""
+    """Opt-in admission of the grouped small-M AWQ route at load time.
+
+    On success the resolved row band and pack-row cap are stored on the layer
+    (sm70_awq_qwen38_grouped_qpn_max_tokens / _pack_rows) for the runtime
+    admission and the pre-capture warmup.
+    """
     if not envs.VLLM_SM70_AWQ_QWEN38_GROUPED_QPN:
         return False
     split = int(envs.VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT)
     if split not in (4, 8, 16):
         raise ValueError("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT must be 4, 8 or 16.")
+    max_tokens = int(envs.VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS)
+    if not (
+        _QWEN38_GROUPED_QPN_MIN_TOKENS
+        <= max_tokens
+        <= sm70_ops.AWQ_GROUPED_DECODE_MAX_TOKENS
+    ):
+        raise ValueError(
+            "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS must be in "
+            f"{_QWEN38_GROUPED_QPN_MIN_TOKENS}.."
+            f"{sm70_ops.AWQ_GROUPED_DECODE_MAX_TOKENS}, got {max_tokens}."
+        )
+    pack_rows = int(envs.VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_PACK_ROWS)
+    if pack_rows not in _QWEN38_GROUPED_QPN_PACK_ROWS:
+        raise ValueError(
+            "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_PACK_ROWS must be one of "
+            f"{_QWEN38_GROUPED_QPN_PACK_ROWS}, got {pack_rows}."
+        )
     reasons = []
     if not shape_contract:
         reasons.append("not the Qwen3.8 TP4 E512 g32 2560/320/160 shape")
@@ -170,17 +236,23 @@ def _initialize_qwen38_grouped_qpn(
         reasons.append("unexpected prepared bank shape")
     if not hasattr(torch.ops._C, "awq_moe_grouped_decode_sm70_out"):
         reasons.append("native op missing from this build")
+    elif not _grouped_qpn_native_supports_pack_rows():
+        reasons.append("native op is the 20-row build (no pack_rows); rebuild")
     if reasons:
         logger.warning_once(
             "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN=1 ignored for this layer: %s.",
             "; ".join(reasons),
         )
         return False
+    layer.sm70_awq_qwen38_grouped_qpn_max_tokens = max_tokens
+    layer.sm70_awq_qwen38_grouped_qpn_pack_rows = pack_rows
     logger.info_once(
-        "SM70 Qwen3.8 AWQ grouped QPN decode admitted for %d..%d rows (split=%d).",
+        "SM70 Qwen3.8 AWQ grouped QPN decode admitted for %d..%d rows "
+        "(split=%d, pack_rows=%d).",
         _QWEN38_GROUPED_QPN_MIN_TOKENS,
-        _QWEN38_GROUPED_QPN_MAX_TOKENS,
+        max_tokens,
         split,
+        pack_rows,
     )
     return True
 
@@ -193,11 +265,16 @@ def _use_qwen38_grouped_qpn(
 ) -> bool:
     """Runtime admission: exact geometry, dtypes and storage of this call."""
     num_tokens = x.shape[0]
+    max_tokens = int(
+        getattr(
+            layer,
+            "sm70_awq_qwen38_grouped_qpn_max_tokens",
+            _QWEN38_GROUPED_QPN_MAX_TOKENS,
+        )
+    )
     return bool(
         getattr(layer, "sm70_awq_qwen38_grouped_qpn", False)
-        and _QWEN38_GROUPED_QPN_MIN_TOKENS
-        <= num_tokens
-        <= _QWEN38_GROUPED_QPN_MAX_TOKENS
+        and _QWEN38_GROUPED_QPN_MIN_TOKENS <= num_tokens <= max_tokens
         and x.ndim == 2
         and x.shape[1] == 2560
         and x.dtype == torch.float16
@@ -1007,6 +1084,17 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             and _qwen38_active_grouped_layer_contract(layer, self.group_size)
             and hasattr(torch.ops._C, "awq_moe_gemm_sm70_out")
         )
+        layer.sm70_awq_qwen38_grouped_decode20_max_tokens = (
+            _resolve_qwen38_grouped_decode20_max_tokens()
+            if layer.sm70_awq_qwen38_grouped_decode20
+            else _QWEN38_GROUPED_DECODE20_MAX_TOKENS
+        )
+        if layer.sm70_awq_qwen38_grouped_decode20:
+            logger.info_once(
+                "SM70 Qwen3.8 AWQ grouped-dispatch decode admitted for %d..%d rows.",
+                _QWEN38_GROUPED_DECODE20_MIN_TOKENS,
+                layer.sm70_awq_qwen38_grouped_decode20_max_tokens,
+            )
         if (
             envs.VLLM_SM70_AWQ_QWEN38_MOE_GROUPED_DECODE20
             and not layer.sm70_awq_qwen38_grouped_decode20
@@ -1724,6 +1812,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 topk_ids_i32,
                 topk_weights,
                 int(envs.VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT),
+                int(getattr(layer, "sm70_awq_qwen38_grouped_qpn_pack_rows", 0)),
             )
             return _dump_awq_moe_buffer(layer, output, "grouped_qpn_output")
         if indexed_w13:

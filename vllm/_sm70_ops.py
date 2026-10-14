@@ -4170,6 +4170,91 @@ if hasattr(torch.ops._C, "awq_moe_grouped_decode_sm70_out"):
         return None
 
 
+# Largest row count of the SM70 FP16 skinny GEMM (kMaxRows in
+# csrc/sm70_turbomind/ops/fp16_skinny_gemm_sm70.cu).
+FP16_SKINNY_GEMM_MAX_ROWS = 48
+
+
+def has_fp16_skinny_gemm() -> bool:
+    return hasattr(torch.ops._C, "fp16_skinny_gemm_sm70_out") and hasattr(
+        torch.ops._C, "fp16_skinny_gemm2_sm70_out"
+    )
+
+
+def fp16_skinny_gemm_sm70_out(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    workspace: torch.Tensor,
+    ng: int,
+    warps_n: int,
+    warps_k: int,
+    splits: int,
+) -> None:
+    """out[M, N] = x[M, K] @ weight[N, K].T (+ bias), M = 1..48, SM70.
+
+    workspace: FP32 with at least splits * M * N elements when splits > 1.
+    """
+    _op("fp16_skinny_gemm_sm70_out")(
+        out, x, weight, bias, workspace, ng, warps_n, warps_k, splits
+    )
+
+
+def fp16_skinny_gemm2_sm70_out(
+    out0a: torch.Tensor,
+    out0b: torch.Tensor,
+    out1a: torch.Tensor,
+    out1b: torch.Tensor,
+    x: torch.Tensor,
+    w0: torch.Tensor,
+    w1: torch.Tensor,
+    workspace: torch.Tensor,
+    ng: int,
+    warps_n: int,
+    warps_k: int,
+    splits: int,
+) -> None:
+    """Two weights sharing x; weight i's columns split into outia | outib."""
+    _op("fp16_skinny_gemm2_sm70_out")(
+        out0a, out0b, out1a, out1b, x, w0, w1, workspace, ng, warps_n, warps_k, splits
+    )
+
+
+if has_fp16_skinny_gemm():
+
+    @register_fake("_C::fp16_skinny_gemm_sm70_out")
+    def _fp16_skinny_gemm_sm70_out_fake(
+        out: torch.Tensor,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        workspace: torch.Tensor,
+        ng: int,
+        warps_n: int,
+        warps_k: int,
+        splits: int,
+    ) -> None:
+        return None
+
+    @register_fake("_C::fp16_skinny_gemm2_sm70_out")
+    def _fp16_skinny_gemm2_sm70_out_fake(
+        out0a: torch.Tensor,
+        out0b: torch.Tensor,
+        out1a: torch.Tensor,
+        out1b: torch.Tensor,
+        x: torch.Tensor,
+        w0: torch.Tensor,
+        w1: torch.Tensor,
+        workspace: torch.Tensor,
+        ng: int,
+        warps_n: int,
+        warps_k: int,
+        splits: int,
+    ) -> None:
+        return None
+
+
 def awq_moe_single_token_sm70_out(
     out: torch.Tensor,
     x: torch.Tensor,

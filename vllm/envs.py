@@ -339,6 +339,7 @@ if TYPE_CHECKING:
     VLLM_SM70_SKIP_REJECTED_BATCH_PACKS: bool = False
     VLLM_SM70_GDN_TAIL_COPY: bool = False
     VLLM_SM70_PLE_PREFILL_CONV_CHUNK: bool = False
+    VLLM_SM70_QWEN38_GDN_NO_PACK: bool = False
     VLLM_SM70_MTP_GDN_DIRECT_OUTPUT: bool = False
     VLLM_SM70_QSA_SHARED_KEY: bool = False
     VLLM_SM70_QSA_COMPACT_TOPK: bool = False
@@ -4234,6 +4235,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_QWEN38_GDN_NO_PACK": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_QWEN38_GDN_NO_PACK", "0"))),
+        description=(
+            "Do not build the packed copy of the Qwen3.8 GDN in_proj_qkvz/ba "
+            "weights (725.6 MiB per TP4 rank) for the 2..16-row lane; serve "
+            "2..48 decode/verify rows with the SM70 FP16 skinny dual GEMM on "
+            "the original row-major weights instead. Frees the memory for the "
+            "KV cache."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 runtime/kernel policy",),
         user_visible=False,
     ),
     "VLLM_SM70_PLE_PREFILL_CONV_CHUNK": env_var(

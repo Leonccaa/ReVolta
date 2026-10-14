@@ -27,6 +27,8 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
+from .sm70_gdn_input_rowmajor import gdn_input_rowmajor
+
 logger = init_logger(__name__)
 
 
@@ -517,6 +519,12 @@ def _qwen38_sm70_fp16_gdn_input(
         and _runtime_ok(x, qkvz_weight)
         and _runtime_ok(x, ba_weight)
     ):
+        if envs.VLLM_SM70_QWEN38_GDN_NO_PACK:
+            # Opt-in: no packed copy; 2..48 rows read the original row-major
+            # weights in one skinny dual GEMM launch (contiguous qkv/z/b/a).
+            fused = gdn_input_rowmajor(x, qkvz_weight, ba_weight)
+            if fused is not None:
+                return fused
         qkvz = torch.nn.functional.linear(x, qkvz_weight)
         ba = torch.nn.functional.linear(x, ba_weight)
         if _can_fuse_gdn_projection_split(qkvz, ba):
@@ -647,6 +655,10 @@ class Qwen38SM70FP16LinearMethod(UnquantizedLinearMethod):
         weight = layer.weight
         if not weight.is_cuda or weight.dtype != torch.float16:
             return  # The PLE-only/meta loader never executes this GPU route.
+        if envs.VLLM_SM70_QWEN38_GDN_NO_PACK:
+            # 2..48 rows read the original weights (skinny dual GEMM).
+            logger.info_once("SM70 Qwen3.8 GDN input: packed copy disabled.")
+            return
         if not hasattr(torch.ops._C, "qwen38_gdn_input_batch_sm70_out"):
             raise RuntimeError("Rebuild the SM70 extension for batched GDN input")
         layer.register_buffer(

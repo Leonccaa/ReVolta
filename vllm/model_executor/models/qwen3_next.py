@@ -22,6 +22,7 @@ from vllm.config import (
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
@@ -191,6 +192,10 @@ def _sm70_qwen_layer_dump_impl(
 
     enable_file = os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_ENABLE_FILE")
     can_save = bool(dump_dir) and (not enable_file or os.path.exists(enable_file))
+    save_rank = os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_TP_RANK")
+    if can_save and save_rank:
+        # Tensor-parallel ranks hold replicated activations; one rank suffices.
+        can_save = get_tensor_model_parallel_rank() == int(save_rank)
     direct_save = os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_DIRECT_SAVE", "1") != "0"
     if direct_save and can_save and not torch.cuda.is_current_stream_capturing():
         target_counts = _sm70_parse_int_ranges(

@@ -107,6 +107,7 @@ if TYPE_CHECKING:
     VLLM_SM70_DUMP_QWEN_LAYER_LABELS: str | None = None
     VLLM_SM70_DUMP_QWEN_LAYER_MAX_DUMPS: str | None = None
     VLLM_SM70_DUMP_QWEN_LAYER_MAX_TOKENS: str | None = None
+    VLLM_SM70_DUMP_QWEN_LAYER_TP_RANK: str | None = None
     VLLM_SM70_DUMP_QWEN_MLP_INTERNALS: str | None = None
     VLLM_SM70_DUMP_SAMPLER_LOGITS_ENABLE_FILE: str | None = None
     VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_PROBE_TOKENS: str | None = None
@@ -17417,6 +17418,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
             (
                 "None at vllm/model_executor/layers/fused_moe/runner/moe_runner.py"
                 ":_sm70_moe_runner_dump_token_count_allowed"
+            ),
+        ),
+        acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_DUMP_QWEN_LAYER_TP_RANK": env_var(
+        lambda: os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_TP_RANK"),
+        description=(
+            "SM70 diagnostic capture: save qwen layer dumps only on this tensor "
+            "parallel rank (activations are replicated across TP ranks). Unset "
+            "saves on every rank."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default=("None"),
+        automatic_conditions=(
+            (
+                "None at vllm/model_executor/models/qwen3_next.py:_sm70_qwen_layer"
+                "_dump_impl"
             ),
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),

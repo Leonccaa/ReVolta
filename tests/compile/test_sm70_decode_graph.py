@@ -89,7 +89,11 @@ def test_qwen38_nomtp_dual_compile_contract() -> None:
     assert _is_sm70_qwen38_decode_compile_contract(model_config, None, parallel_config)
 
 
-def test_qwen38_nomtp_dual_compile_contract_accepts_awq_lm_only_wrapper() -> None:
+def test_qwen38_nomtp_dual_compile_contract_accepts_awq_lm_only_wrapper(
+    monkeypatch,
+) -> None:
+    # Upstream contract: only the language_model_only wrapper is admitted.
+    monkeypatch.setenv("VLLM_SM70_QWEN38_CONTRACT_MULTIMODAL", "0")
     model_config = _qwen38_model_config(
         "Qwen4ExpForConditionalGeneration",
         language_model_only=True,
@@ -108,6 +112,24 @@ def test_qwen38_nomtp_dual_compile_contract_accepts_awq_lm_only_wrapper() -> Non
     )
 
     model_config.multimodal_config = None
+    assert not _is_sm70_qwen38_decode_compile_contract(
+        model_config, None, parallel_config
+    )
+
+
+def test_qwen38_contract_admits_multimodal_class_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("VLLM_SM70_QWEN38_CONTRACT_MULTIMODAL", raising=False)
+    model_config = _qwen38_model_config(
+        "Qwen4ExpForConditionalGeneration",
+        language_model_only=False,
+        quantization="awq",
+    )
+    parallel_config = SimpleNamespace(tensor_parallel_size=4, pipeline_parallel_size=1)
+
+    assert _is_sm70_qwen38_decode_compile_contract(model_config, None, parallel_config)
+    model_config.multimodal_config = None
+    assert _is_sm70_qwen38_decode_compile_contract(model_config, None, parallel_config)
+    model_config.dtype = torch.bfloat16
     assert not _is_sm70_qwen38_decode_compile_contract(
         model_config, None, parallel_config
     )
@@ -175,9 +197,11 @@ def test_qwen38_nomtp_defaults_reject_unqualified_contract(monkeypatch, mismatch
     elif mismatch == "dtype":
         cfg.model_config.dtype = torch.bfloat16
     elif mismatch == "multimodal":
+        # Only the upstream contract rejects the multimodal class.
         cfg.model_config.multimodal_config.language_model_only = False
+        os.environ["VLLM_SM70_QWEN38_CONTRACT_MULTIMODAL"] = "0"
     assert _apply_sm70_qwen38_decode_defaults(cfg, is_sm70=mismatch != "device") == ()
-    assert not os.environ
+    assert set(os.environ) <= {"VLLM_SM70_QWEN38_CONTRACT_MULTIMODAL"}
 
 
 @pytest.mark.parametrize(

@@ -460,6 +460,10 @@ if TYPE_CHECKING:
     VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES: bool = True
     VLLM_SM70_CAR_VMM_SAFE: bool = False
     VLLM_SM70_CAR_VMM_SAFE_PREALLOC: bool = True
+    VLLM_SM70_PCIE_SWITCH_CUSTOM_AR: str = "auto"
+    VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES: int = 81920
+    VLLM_SM70_PCIE_SWITCH_CAR_GRAPH_ONLY: bool = True
+    VLLM_SM70_QWEN38_CONTRACT_MULTIMODAL: bool = True
     VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES: bool = False
     VLLM_SM70_CUSTOM_AR_LIBRARY: str | None = None
     VLLM_SM70_TOP1_CUSTOM_AR: bool = False
@@ -7015,6 +7019,75 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("SM70 collectives",),
+        user_visible=False,
+    ),
+    # Four SM70 GPUs whose every pair meets below a PCIe switch (nvidia-smi
+    # PIX/PXB) have working P2P but no NVLink. Upstream disables custom
+    # all-reduce for more than two non-NVLink GPUs; on this topology the SM70
+    # TP4 push kernels are faster than NCCL for small graph-captured payloads.
+    # auto: enable when SM70, TP4 and the PCIe-switch topology all hold.
+    # 1: skip the topology query (the P2P test still runs). 0: never.
+    "VLLM_SM70_PCIE_SWITCH_CUSTOM_AR": env_var(
+        lambda: os.getenv("VLLM_SM70_PCIE_SWITCH_CUSTOM_AR", "auto").strip().lower(),
+        description=(
+            "Custom all-reduce for four SM70 GPUs under one PCIe switch "
+            "(nvidia-smi PIX/PXB, no NVLink): auto enables it when SM70, "
+            "TP4 and the topology hold; 1 skips the topology query (the P2P "
+            "test still runs); 0 disables it. Other topologies keep the "
+            "upstream rule."
+        ),
+        category="experimental",
+        declared_default="auto",
+        effective_default="auto",
+        automatic_conditions=("SM70", "tensor parallel size 4", "PCIe switch"),
+        acceleration_paths=("SM70 collectives",),
+        user_visible=False,
+    ),
+    # Largest payload, in bytes, that the PCIe-switch mode sends through
+    # custom all-reduce. The TP4 push kernel covers up to 80 KiB; above that
+    # NCCL is as fast on PCIe.
+    "VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES": env_var(
+        lambda: int(os.getenv("VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES", "81920")),
+        description=(
+            "Largest payload in bytes that the SM70 PCIe-switch custom "
+            "all-reduce mode handles; larger payloads use NCCL."
+        ),
+        category="tuning",
+        declared_default="81920",
+        effective_default="81920",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 collectives",),
+        user_visible=False,
+    ),
+    # In PCIe-switch mode, use custom all-reduce only inside CUDA graph
+    # capture; eager calls stay on NCCL.
+    "VLLM_SM70_PCIE_SWITCH_CAR_GRAPH_ONLY": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_PCIE_SWITCH_CAR_GRAPH_ONLY", "1"))),
+        description=(
+            "In the SM70 PCIe-switch custom all-reduce mode, use custom "
+            "all-reduce only inside CUDA graph capture; eager calls use NCCL."
+        ),
+        category="tuning",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 collectives",),
+        user_visible=False,
+    ),
+    # The FP16 Qwen3.8 decode lane serves the language model. Admit the
+    # multimodal class as well: its vision tower runs outside the lane.
+    "VLLM_SM70_QWEN38_CONTRACT_MULTIMODAL": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_QWEN38_CONTRACT_MULTIMODAL", "1"))),
+        description=(
+            "Admit the multimodal Qwen4ExpForConditionalGeneration class to "
+            "the SM70 FP16 Qwen3.8 decode lane, not only the text-only and "
+            "language_model_only variants."
+        ),
+        category="experimental",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 Qwen3.8 decode",),
         user_visible=False,
     ),
     # Refuse to start when a checkpoint carries no calibrated QSA E4M3 K/V

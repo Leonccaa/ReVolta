@@ -182,6 +182,14 @@ def _is_sm70_qwen38_decode_compile_contract(
         and multimodal_config is not None
         and getattr(multimodal_config, "language_model_only", False)
     )
+    # The lane serves the language model only; the vision tower of the
+    # multimodal class runs outside it (ReVolta's validated multimodal deployment).
+    if (
+        not supported_architecture
+        and envs.VLLM_SM70_QWEN38_CONTRACT_MULTIMODAL
+        and "Qwen4ExpForConditionalGeneration" in architectures
+    ):
+        supported_architecture = True
     return bool(
         supported_architecture and getattr(model_config, "dtype", None) == torch.float16
     )

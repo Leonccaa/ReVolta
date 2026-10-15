@@ -265,6 +265,11 @@ class CudaPlatformBase(Platform):
         raise NotImplementedError
 
     @classmethod
+    def is_pcie_switch_connected(cls, physical_device_ids: list[int]) -> bool:
+        """Whether every GPU pair meets below a PCIe switch (nvidia-smi PIX/PXB)."""
+        return False
+
+    @classmethod
     def log_warnings(cls):
         pass
 
@@ -775,6 +780,28 @@ class NvmlCudaPlatform(CudaPlatformBase):
                             " your machine has no NVLink equipped."
                         )
                         return False
+        return True
+
+    @classmethod
+    @with_nvml_context
+    def is_pcie_switch_connected(cls, physical_device_ids: list[int]) -> bool:
+        """
+        query if every pair of gpus meets below a PCIe switch, i.e. their
+        common ancestor is a switch rather than a host bridge or the CPU
+        interconnect (nvidia-smi topo PIX/PXB)
+        """
+        handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in physical_device_ids]
+        for i, handle in enumerate(handles):
+            for peer_handle in handles[i + 1 :]:
+                try:
+                    level = pynvml.nvmlDeviceGetTopologyCommonAncestor(
+                        handle, peer_handle
+                    )
+                except pynvml.NVMLError:
+                    logger.exception("PCIe topology detection failed.")
+                    return False
+                if level > pynvml.NVML_TOPOLOGY_MULTIPLE:
+                    return False
         return True
 
     @classmethod

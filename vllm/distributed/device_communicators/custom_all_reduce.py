@@ -19,6 +19,7 @@ from vllm.distributed.device_communicators.all_reduce_utils import (
 from vllm.distributed.parallel_state import in_the_same_node_as
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.platforms.interface import DeviceCapability
 
 try:
     ops.meta_size()
@@ -202,6 +203,38 @@ def _sm70_tp8_hierarchical_peer_ranks(rank: int) -> tuple[int, ...]:
     return (*range(clique_base, clique_base + 4), pair_rank)
 
 
+def _sm70_pcie_switch_tp4_mode(
+    world_size: int,
+    device_capability: DeviceCapability | None,
+    physical_device_ids: list[int],
+) -> bool:
+    """Whether to treat four SM70 GPUs under one PCIe switch as fully connected.
+
+    Upstream enables custom all-reduce for more than two GPUs only over an
+    NVLink mesh. Four V100s whose every pair meets below a PCIe switch
+    (nvidia-smi PIX/PXB) have working P2P, and there the SM70 TP4 push kernels
+    beat NCCL for small graph-captured payloads. Other topologies, world sizes
+    and architectures keep the upstream rule.
+    """
+    mode = envs.VLLM_SM70_PCIE_SWITCH_CUSTOM_AR
+    if mode not in ("auto", "0", "1"):
+        raise ValueError(
+            f"VLLM_SM70_PCIE_SWITCH_CUSTOM_AR must be auto, 0 or 1, got {mode!r}"
+        )
+    if mode == "0":
+        return False
+    if (
+        not current_platform.is_cuda()
+        or world_size != 4
+        or device_capability is None
+        or (device_capability.major, device_capability.minor) != (7, 0)
+    ):
+        return False
+    if mode == "1":
+        return True
+    return current_platform.is_pcie_switch_connected(physical_device_ids)
+
+
 def _can_p2p(rank: int, world_size: int) -> bool:
     for i in range(world_size):
         if i == rank:
@@ -228,6 +261,11 @@ class CustomAllreduce:
     _vmm_safe = False
     _vmm_safe_copies = 0
     _vmm_safe_fallbacks = 0
+    # SM70 PCIe-switch TP4 mode; class defaults keep instances made without
+    # __init__ (tests) on the upstream path.
+    sm70_pcie_switch = False
+    sm70_pcie_switch_max_bytes = 0
+    sm70_pcie_switch_graph_only = False
 
     # max_size: max supported allreduce size
     def __init__(
@@ -337,6 +375,25 @@ class CustomAllreduce:
         # this checks hardware and driver support for NVLink
         assert current_platform.is_cuda_alike()
         fully_connected = current_platform.is_fully_connected(physical_device_ids)
+        if (
+            world_size > 2
+            and not fully_connected
+            and _sm70_pcie_switch_tp4_mode(
+                world_size, device_capability, physical_device_ids
+            )
+        ):
+            # Every fully_connected consumer below behaves as on an NVLink
+            # mesh; should_custom_ar() adds the PCIe payload limits.
+            fully_connected = True
+            self.sm70_pcie_switch = True
+            self.sm70_pcie_switch_max_bytes = envs.VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES
+            self.sm70_pcie_switch_graph_only = envs.VLLM_SM70_PCIE_SWITCH_CAR_GRAPH_ONLY
+            logger.info(
+                "SM70 PCIe-switch custom allreduce enabled for TP4 "
+                "(payload <= %d bytes, graph capture only: %s).",
+                self.sm70_pcie_switch_max_bytes,
+                self.sm70_pcie_switch_graph_only,
+            )
         tp8_hierarchical = False
         hierarchical_peer_ranks: tuple[int, ...] | None = None
         if world_size > 2 and not fully_connected:
@@ -582,6 +639,17 @@ class CustomAllreduce:
     def should_custom_ar(self, inp: torch.Tensor):
         if self.disabled:
             return False
+        if self.sm70_pcie_switch:
+            if (
+                self.sm70_pcie_switch_max_bytes
+                and inp.numel() * inp.element_size() > self.sm70_pcie_switch_max_bytes
+            ):
+                return False
+            if (
+                self.sm70_pcie_switch_graph_only
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                return False
         if inp.dtype not in (torch.float32, torch.float16, torch.bfloat16):
             return False
         inp_size = inp.numel() * inp.element_size()

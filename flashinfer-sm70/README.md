@@ -26,13 +26,8 @@ The implementation uses `nvcuda::wmma` when compiled for `sm_70`, which emits
 Volta `HMMA.884` rather than recreating an `m8n8k4` raw-HMMA decomposition.
 It is intentionally a primitive probe only.
 
-Run the harness from the repository root:
-
-```bash
-.venv/bin/python benchmarks/benchmark_sm70_flashinfer_volta_mma_micro.py
-```
-
-It requires an idle physical GPU 0 at exactly 1200 MHz before compilation and
+The standalone microbenchmark was removed during repository trimming. Its
+historical validation harness requires an idle physical GPU 0 at exactly 1200 MHz before compilation and
 execution.  The harness fixes code generation to `sm_70`, runs random and
 alternating-sign inputs for both layouts at `M=N=16, K=256`, and performs 16
 ordered K16 updates between one accumulator load and one final store.  It

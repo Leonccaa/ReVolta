@@ -165,12 +165,6 @@ venv.bak/
 # Rope project settings
 .ropeproject
 
-# mkdocs documentation
-/site
-docs/argparse
-docs/examples/*
-!docs/examples/README.md
-
 # mypy
 .mypy_cache/
 .dmypy.json
@@ -225,9 +219,6 @@ _build/
 *_hip*
 hip_compat.h
 
-# Benchmark dataset
-benchmarks/**/*.json
-
 # Linting
 actionlint
 shellcheck*/
@@ -238,9 +229,8 @@ csrc/moe/marlin_moe_wna16/kernel_*
 # Ignore ep_kernels_workspace folder
 ep_kernels_workspace/
 
-# Allow tracked library source folders under submodules (e.g., benchmarks/lib)
+# Allow tracked runtime benchmark library source folders
 !vllm/benchmarks/lib/
-!.buildkite/scripts/lib/
 
 # Generated gRPC protobuf files (compiled at build time from vllm_engine.proto)
 vllm/grpc/vllm_engine_pb2.py

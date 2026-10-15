@@ -49,3 +49,6 @@ share/python-wheels/
 *.egg
 MANIFEST
 rust/target/
+
+# Local verification environments and hook caches.
+/.cache

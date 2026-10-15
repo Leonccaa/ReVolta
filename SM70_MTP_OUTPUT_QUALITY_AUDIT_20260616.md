@@ -18,7 +18,7 @@ VLLM_SM70_QWEN_GDN_SPEC_CORE_OP=0
 
 Primary artifact:
 `bench_results/verifier20_quality_20260701/noinputcore_003_fixed_quality4_seed20260620/summary.md`.
-See `docs/design/sm70_v100_migration_control.md` for the full route table and
+See [the archived migration control document](https://github.com/Leonccaa/ReVolta/blob/43ddbf426afe9dfa6ac0de980f991d02b77c738d/docs/design/sm70_v100_migration_control.md) for the full route table and
 the rejected input-core/output-op evidence.
 
 ## Scope

@@ -4,7 +4,7 @@
 
 import pytest
 
-from tools.generate_env_reference import OUTPUT, render
+from tools.generate_env_reference import render
 from tools.pre_commit.check_env_metadata import ENVS_FILE, read_metadata
 from vllm.envs_metadata import env_var
 
@@ -98,10 +98,12 @@ def test_metadata_wrapper_only_delegates_when_read():
     assert variable() is sentinel and calls == ["read"]
 
 
-def test_all_current_registrations_and_generated_reference_are_complete():
+def test_all_current_registrations_and_reference_render_are_complete():
     metadata, errors = read_metadata(ENVS_FILE.read_text())
     assert not errors
-    assert OUTPUT.read_text() == render(metadata)
+    reference = render(metadata)
+    public_names = {name for name, row in metadata.items() if row["user_visible"]}
+    assert all(f"`{name}`" in reference for name in public_names)
     assert metadata["VLLM_SM70_NVFP4_QPN2"]["category"] == "deprecated"
     assert "qualified DFlash" in metadata["VLLM_SM70_NVFP4_QPN2"]["effective_default"]
     assert metadata["VLLM_SM70_DUMP_GDN_CORE_DIR"]["category"] == "debug"

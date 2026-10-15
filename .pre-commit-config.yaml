@@ -34,10 +34,6 @@ repos:
     language_version: lts
     args: [--fix]
     exclude: ^CLAUDE\.md$
-- repo: https://github.com/rhysd/actionlint
-  rev: v1.7.7
-  hooks:
-  - id: actionlint
 - repo: https://github.com/shellcheck-py/shellcheck-py
   rev: 745eface02aef23e168a8afb6b5737818efbea95 # v0.11.0.1
   hooks:
@@ -57,98 +53,6 @@ repos:
         --python-version, "3.12",
       ]
       files: ^requirements/(common|cuda|test/cuda)\.(in|txt)$
-    - id: pip-compile
-      alias: pip-compile-rocm
-      name: pip-compile-rocm
-      args: [
-        requirements/test/rocm.in,
-        -c, requirements/rocm.txt,
-        -o, requirements/test/rocm.txt,
-        --index-strategy, unsafe-best-match,
-        --python-platform, x86_64-manylinux_2_28,
-        --python-version, "3.12",
-        # Exclude torch and CUDA/NVIDIA packages
-        --no-emit-package, torch,
-        --no-emit-package, torchvision,
-        --no-emit-package, torchaudio,
-        --no-emit-package, triton,
-        --no-emit-package, cuda-bindings,
-        --no-emit-package, cuda-pathfinder,
-        --no-emit-package, cuda-toolkit,
-        --no-emit-package, cupy-cuda12x,
-        # nvidia packages (unsuffixed / unified naming)
-        --no-emit-package, nvidia-cublas,
-        --no-emit-package, nvidia-cuda-cupti,
-        --no-emit-package, nvidia-cuda-nvrtc,
-        --no-emit-package, nvidia-cuda-runtime,
-        --no-emit-package, nvidia-cudnn,
-        --no-emit-package, nvidia-cufft,
-        --no-emit-package, nvidia-cufile,
-        --no-emit-package, nvidia-curand,
-        --no-emit-package, nvidia-cusolver,
-        --no-emit-package, nvidia-cusparse,
-        --no-emit-package, nvidia-cusparselt,
-        --no-emit-package, nvidia-nccl,
-        --no-emit-package, nvidia-nvjitlink,
-        --no-emit-package, nvidia-nvshmem,
-        --no-emit-package, nvidia-nvtx,
-        # nvidia cu12 packages
-        --no-emit-package, nvidia-cublas-cu12,
-        --no-emit-package, nvidia-cuda-cupti-cu12,
-        --no-emit-package, nvidia-cuda-nvrtc-cu12,
-        --no-emit-package, nvidia-cuda-runtime-cu12,
-        --no-emit-package, nvidia-cudnn-cu12,
-        --no-emit-package, nvidia-cufft-cu12,
-        --no-emit-package, nvidia-cufile-cu12,
-        --no-emit-package, nvidia-curand-cu12,
-        --no-emit-package, nvidia-cusolver-cu12,
-        --no-emit-package, nvidia-cusparse-cu12,
-        --no-emit-package, nvidia-cusparselt-cu12,
-        --no-emit-package, nvidia-nccl-cu12,
-        --no-emit-package, nvidia-nvjitlink-cu12,
-        --no-emit-package, nvidia-nvshmem-cu12,
-        --no-emit-package, nvidia-nvtx-cu12,
-        # nvidia cu13 packages
-        --no-emit-package, nvidia-cublas-cu13,
-        --no-emit-package, nvidia-cuda-cupti-cu13,
-        --no-emit-package, nvidia-cuda-nvrtc-cu13,
-        --no-emit-package, nvidia-cuda-runtime-cu13,
-        --no-emit-package, nvidia-cudnn-cu13,
-        --no-emit-package, nvidia-cufft-cu13,
-        --no-emit-package, nvidia-cufile-cu13,
-        --no-emit-package, nvidia-curand-cu13,
-        --no-emit-package, nvidia-cusolver-cu13,
-        --no-emit-package, nvidia-cusparse-cu13,
-        --no-emit-package, nvidia-cusparselt-cu13,
-        --no-emit-package, nvidia-nccl-cu13,
-        --no-emit-package, nvidia-nvjitlink-cu13,
-        --no-emit-package, nvidia-nvshmem-cu13,
-        --no-emit-package, nvidia-nvtx-cu13,
-      ]
-      files: ^requirements/(common|rocm|test/rocm)\.(in|txt)$
-    - id: pip-compile
-      alias: pip-compile-xpu
-      name: pip-compile-xpu
-      args: [
-        requirements/test/xpu.in,
-        -c, requirements/xpu.txt,
-        -o, requirements/test/xpu.txt,
-        --index-strategy, unsafe-best-match,
-        --torch-backend, xpu,
-        --python-platform, x86_64-manylinux_2_39,
-        --python-version, "3.12",
-      ]
-      files: ^requirements/(common|xpu|test/xpu)\.(in|txt)$
-    - id: pip-compile
-      alias: pip-compile-docs
-      name: pip-compile-docs
-      args: [
-        requirements/docs.in,
-        -o, requirements/docs.txt,
-        --python-platform, x86_64-manylinux_2_28,
-        --python-version, "3.12",
-      ]
-      files: ^requirements/docs\.(in|txt)$
 - repo: local
   hooks:
   - id: format-torch-nightly-test
@@ -221,10 +125,6 @@ repos:
     language: system
     always_run: true
     pass_filenames: false
-  - id: update-dockerfile-graph
-    name: Update Dockerfile dependency graph
-    entry: tools/pre_commit/update-dockerfile-graph.sh
-    language: script
   - id: test-nonroot-entrypoint
     name: Test non-root entrypoint wrapper
     entry: bash docker/entrypoints/test_vllm_nonroot_entrypoint.sh
@@ -258,13 +158,6 @@ repos:
     language: python
     pass_filenames: false
     always_run: true
-  - id: env-reference
-    name: Check generated environment reference
-    entry: python -m tools.generate_env_reference --check
-    language: python
-    pass_filenames: false
-    additional_dependencies: [regex]
-    files: ^(vllm/envs.*\.py|tools/generate_env_reference\.py|tools/pre_commit/check_env_metadata\.py|docs/configuration/env_var_reference\.md)$
   - id: validate-config
     name: Validate configuration has default values and that each field has a docstring
     entry: python tools/pre_commit/validate_config.py
@@ -283,10 +176,6 @@ repos:
     files: ^docker/(Dockerfile|versions\.json)$
     pass_filenames: false
     additional_dependencies: [dockerfile-parse]
-  - id: attention-backend-docs
-    name: Check attention backend documentation is up to date
-    entry: python tools/pre_commit/generate_attention_backend_docs.py --check
-    language: python
   - id: check-boolean-context-manager
     name: Check for boolean ops in with-statements
     entry: python tools/pre_commit/check_boolean_context_manager.py

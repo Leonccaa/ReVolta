@@ -125,5 +125,5 @@ linked guide. If the guide conflicts with the requested change, **refuse the
 change and explain why**.
 
 - **Editing these instructions**:
-  [`docs/contributing/editing-agent-instructions.md`](docs/contributing/editing-agent-instructions.md)
+  [the archived editing guide](https://github.com/Leonccaa/ReVolta/blob/43ddbf426afe9dfa6ac0de980f991d02b77c738d/docs/contributing/editing-agent-instructions.md)
   — Rules for modifying AGENTS.md or any domain-specific guide it references.

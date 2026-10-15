@@ -15,7 +15,6 @@ omit =
     */third_party/*
     */examples/*
     */benchmarks/*
-    */docs/*
 
 [paths]
 # Map all possible vllm locations to a canonical "vllm" path

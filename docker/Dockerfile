@@ -1,9 +1,7 @@
 # The vLLM Dockerfile is used to construct vLLM image that can be directly used
 # to run the OpenAI compatible server.
 
-# Please update any changes made here to
-# docs/contributing/dockerfile/dockerfile.md and
-# docs/assets/contributing/dockerfile-stages-dependency.png
+# See the repository README for the ReVolta SM70 build recipe.
 
 # =============================================================================
 # VERSION MANAGEMENT
@@ -22,7 +20,7 @@
 #   docker buildx bake -f docker/docker-bake.hcl -f docker/versions.json
 # =============================================================================
 
-ARG CUDA_VERSION=13.0.2
+ARG CUDA_VERSION=12.8.1
 ARG PYTHON_VERSION=3.12
 ARG UBUNTU_VERSION=22.04
 
@@ -248,7 +246,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 # Explicitly set the list to avoid issues with torch 2.2
 # See https://github.com/pytorch/pytorch/pull/123243
 # From versions.json: .torch.cuda_arch_list
-ARG torch_cuda_arch_list='7.5 8.0 8.6 8.9 9.0 10.0 11.0 12.0+PTX'
+ARG torch_cuda_arch_list='7.0'
 ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
 #################### BUILD BASE IMAGE ####################
 
@@ -459,13 +457,17 @@ ARG DEEPEP_COMMIT_HASH=73b6ea4
 ARG NVSHMEM_VER
 RUN --mount=type=cache,target=/opt/uv/cache \
     mkdir -p /tmp/ep_kernels_workspace/dist && \
-    export TORCH_CUDA_ARCH_LIST='9.0a 10.0a' && \
-    /tmp/install_python_libraries.sh \
-        --workspace /tmp/ep_kernels_workspace \
-        --mode wheel \
-        ${DEEPEP_COMMIT_HASH:+--deepep-ref "$DEEPEP_COMMIT_HASH"} \
-        ${NVSHMEM_VER:+--nvshmem-ver "$NVSHMEM_VER"} && \
-    find /tmp/ep_kernels_workspace/nvshmem -name '*.a' -delete
+    if echo "${TORCH_CUDA_ARCH_LIST}" | grep -Eq '(^|[ ;])7\.[02](\+PTX)?([ ;]|$)'; then \
+        echo "Skipping DeepEP extensions for the SM70 build"; \
+    else \
+        export TORCH_CUDA_ARCH_LIST='9.0a 10.0a' && \
+        /tmp/install_python_libraries.sh \
+            --workspace /tmp/ep_kernels_workspace \
+            --mode wheel \
+            ${DEEPEP_COMMIT_HASH:+--deepep-ref "$DEEPEP_COMMIT_HASH"} \
+            ${NVSHMEM_VER:+--nvshmem-ver "$NVSHMEM_VER"} && \
+        find /tmp/ep_kernels_workspace/nvshmem -name '*.a' -delete; \
+    fi
 #################### EXTENSIONS BUILD IMAGE ####################
 
 #################### WHEEL BUILD IMAGE ####################
@@ -731,7 +733,7 @@ RUN mkdir -p "${UV_PYTHON_INSTALL_DIR}" "${UV_CACHE_DIR}" \
 #     + `RUN uv pip install --system ...` flow is unchanged.
 #   * The entrypoint wrapper below is only used by `vllm-openai-nonroot`; it
 #     handles the OpenShift arbitrary-UID case (UID not in /etc/passwd).
-# See #31959 and docs/deployment/docker.md.
+# See upstream vLLM issue #31959 for the runtime dependency rationale.
 RUN useradd --uid 2000 --gid 0 --create-home --home-dir /home/vllm \
         --shell /bin/bash vllm \
     && mkdir -p /home/vllm/.cache /home/vllm/.config \
@@ -889,9 +891,6 @@ ENV CUDA_DEVICE_ORDER=PCI_BUS_ID \
     TILELANG_CLEANUP_TEMP_FILES=1 \
     TOKENIZERS_PARALLELISM=false
 
-# Copy examples and benchmarks at the end to minimize cache invalidation
-COPY examples examples
-COPY benchmarks benchmarks
 COPY ./vllm/collect_env.py .
 #################### vLLM installation IMAGE ####################
 #################### TEST IMAGE ####################
@@ -991,7 +990,7 @@ ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL
 ENV UV_HTTP_TIMEOUT=500
 
 # install kv_connectors if requested
-ARG torch_cuda_arch_list='7.5 8.0 8.6 8.9 9.0 10.0 11.0 12.0+PTX'
+ARG torch_cuda_arch_list='7.0'
 ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
 RUN --mount=type=cache,target=/opt/uv/cache \
     --mount=type=bind,source=requirements/kv_connectors.txt,target=/tmp/kv_connectors.txt,ro \
@@ -1052,20 +1051,12 @@ LABEL org.opencontainers.image.source="https://github.com/vllm-project/vllm" \
       ai.vllm.build.url="${VLLM_BUILD_URL}" \
       ai.vllm.image.tag="${VLLM_IMAGE_TAG}"
 
-# define sagemaker first, so it is not default from `docker build`
-FROM vllm-openai-base AS vllm-sagemaker
-
-COPY examples/deployment/sagemaker-entrypoint.sh .
-RUN chmod +x sagemaker-entrypoint.sh
-ENTRYPOINT ["./sagemaker-entrypoint.sh"]
-
 FROM vllm-openai-base AS vllm-openai
 
 # To run the image as non-root, either build the `vllm-openai-nonroot` target
 # below, or in a derived Dockerfile uncomment the following line and ensure
 # any additional layers chgrp-0 / chmod-g+rwX paths they write to. The `vllm`
 # user (UID 2000, GID 0) is already created in the `vllm-base` stage.
-# See docs/deployment/docker.md.
 # USER vllm
 ENTRYPOINT ["vllm", "serve"]
 #################### OPENAI API SERVER ####################

@@ -46,12 +46,6 @@ CHECK_IMPORTS = {
             "tests/utils_/test_hashing.py",
             "tests/compile/test_aot_compile.py",
             "tests/compile/test_aot_triton_side_table.py",
-            "benchmarks/kernels/graph_machete_bench.py",
-            "benchmarks/kernels/benchmark_lora.py",
-            "benchmarks/kernels/benchmark_machete.py",
-            "benchmarks/fused_kernels/layernorm_rms_benchmarks.py",
-            "benchmarks/cutlass_benchmarks/w8a8_benchmarks.py",
-            "benchmarks/cutlass_benchmarks/sparse_benchmarks.py",
             # cloudpickle
             "vllm/v1/executor/multiproc_executor.py",
             "vllm/v1/executor/ray_executor.py",
@@ -83,9 +77,6 @@ CHECK_IMPORTS = {
         ),
         allowed_files={
             "vllm/triton_utils/importing.py",
-            # AOT inspection needs compiler/backend modules that the vLLM
-            # runtime shim deliberately does not export.
-            "benchmarks/kernels/deepseek_v4_sm70_aot_check.py",
             # Standalone source-built kernel screen: run before installing a
             # vLLM runtime, including CPU-only layout tests and compilation.
             "benchmarks/kernels/benchmark_sm70_hc_batch_reuse.py",

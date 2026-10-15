@@ -1,34 +1,16 @@
-<!-- markdownlint-disable -->
-PLEASE FILL IN THE PR DESCRIPTION HERE ENSURING ALL CHECKLIST ITEMS (AT THE BOTTOM) HAVE BEEN CONSIDERED.
+# ReVolta pull request
 
-## Purpose
+## Change
 
-## Test Plan
+Describe the problem, resulting behavior and affected ReVolta configuration.
+For an upstream fix, include its source commit and any adaptations.
 
-## Acceleration and benchmark contract (required for performance changes)
+## Validation
 
-- Default enabled or opt-in:
-- Required CLI options and environment switches:
-- KV cache dtype used for the benchmark:
-- Wheel SHA or source commit:
-- PYTHONPATH, source overlays, or external native libraries used (write "none" if absent):
-- User-entry route-hit, speed, and output-quality evidence:
-- Existing kernel/backend registry and capability-rejection reasons:
-- Per-engine configuration and deprecated-variable compatibility:
-- New/changed environment metadata and generated reference check:
-- Route snapshot command and intentional changed rows (write "none" for refactors):
-- SM70 registered variables / unregistered reads / model-parameter restrictions, before -> after:
+List the checks run and their results. State hardware and configuration for
+runtime checks, and identify unverified configurations.
 
-## Test Result
+## Attribution
 
----
-<details>
-<summary> Essential Elements of an Effective PR Description Checklist </summary>
-
-- [ ] The purpose of the PR, such as "Fix some issue (link existing issues this PR will resolve)".
-- [ ] The test plan, such as providing test command.
-- [ ] The test results, such as pasting the results comparison before and after, or e2e results
-- [ ] (Optional) The necessary documentation update, such as updating `supported_models.md` and `examples` for a new model.
-</details>
-
-**BEFORE SUBMITTING, PLEASE READ <https://docs.vllm.ai/en/latest/contributing>** (anything written below this line will be removed by GitHub Actions)
+Retain upstream authorship and license notices. Describe any AI assistance;
+the human reviewer remains responsible for the change.

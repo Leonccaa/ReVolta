@@ -3,13 +3,12 @@
 """Generate the reference from metadata; never read the process environment."""
 
 import argparse
+import sys
 from pathlib import Path
 
 import regex as re
 
 from tools.pre_commit.check_env_metadata import ENVS_FILE, read_metadata
-
-OUTPUT = Path("docs/configuration/env_var_reference.md")
 
 
 def render(metadata: dict[str, dict], *, include_internal: bool = False) -> str:
@@ -47,8 +46,6 @@ def render(metadata: dict[str, dict], *, include_internal: bool = False) -> str:
             "compatibility aliases remain in the metadata inventory; they are not "
             "daily configuration options. Developers can render that inventory with "
             "`--include-internal --output /tmp/environment-internals.md`. "
-            "See [SM70 environment surface](../design/sm70_environment_surface.md) "
-            "for compatibility and removal plans."
         ),
         "",
         (
@@ -82,19 +79,25 @@ def main() -> int:
         action="store_true",
         help="Include compatibility, tuning and diagnostic implementation controls",
     )
-    parser.add_argument("--output", type=Path, default=OUTPUT)
+    parser.add_argument(
+        "--output", type=Path, help="Write to this file; default: stdout"
+    )
     args = parser.parse_args()
+    if args.check and args.output is None:
+        parser.error("--check requires --output")
     metadata, errors = read_metadata(ENVS_FILE.read_text())
     if errors:
         raise SystemExit("\n".join(errors))
     expected = render(metadata, include_internal=args.include_internal)
     if args.check:
         if not args.output.exists() or args.output.read_text() != expected:
-            print(f"{args.output} is stale; run python -m tools.generate_env_reference")
+            print(f"{args.output} is stale; regenerate with --output {args.output}")
             return 1
-    else:
+    elif args.output is not None:
         args.output.write_text(expected)
-    print(f"{len(metadata)} environment registrations documented")
+    else:
+        sys.stdout.write(expected)
+    print(f"{len(metadata)} environment registrations documented", file=sys.stderr)
     return 0
 
 

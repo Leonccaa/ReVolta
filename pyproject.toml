@@ -16,11 +16,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "1cat-vllm"
-authors = [{name = "1Cat AI"}, {name = "vLLM Team"}]
+authors = [{name = "Leon"}, {name = "1Cat AI"}, {name = "vLLM Team"}]
 license = "Apache-2.0"
-license-files = ["LICENSE"]
+license-files = [
+    "LICENSE", "NOTICE", "flash-attention-v100/LICENSE", "flash_qla/LICENSE",
+    "csrc/**/LICENSE*", "vllm/third_party/**/LICENSE*",
+]
 readme = "README.md"
-description = "A high-throughput and memory-efficient inference and serving engine for LLMs"
+description = "ReVolta: an NVIDIA Volta / V100 (SM70) inference engine based on 1Cat-vLLM and vLLM"
 classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -37,8 +40,8 @@ requires-python = ">=3.10,<3.15"
 dynamic = [ "version", "dependencies", "optional-dependencies"]
 
 [project.urls]
-Homepage="https://github.com/1CatAI/1Cat-vLLM"
-Documentation="https://github.com/1CatAI/1Cat-vLLM"
+Homepage="https://github.com/Leonccaa/ReVolta"
+Documentation="https://github.com/Leonccaa/ReVolta#readme"
 
 [project.scripts]
 vllm = "vllm.entrypoints.cli.main:main"
@@ -123,11 +126,10 @@ python = "./.venv"
 [tool.typos.files]
 # these files may be written in non english words
 extend-exclude = ["flash_qla/*", "tests/models/fixtures/*", "tests/prompts/*", "tests/tokenizers_/*",
-    "benchmarks/sonnet.txt", "tests/lora/data/*", "build/*",
-    "examples/pooling/token_embed/*", "tests/models/language/pooling/*",
+    "tests/lora/data/*", "build/*",
+    "tests/models/language/pooling/*",
     "vllm/third_party/*", "vllm/entrypoints/serve/instrumentator/static/*",
     "tests/entrypoints/speech_to_text/transcription/test_transcription_validation.py",
-    "docs/governance/process.md", "docs/assets/contributing/vllm_bench_serve_timeline.html", 
     "tests/v1/engine/test_fast_incdec_prefix_err.py", ".git/*", "csrc/cpu/sgl-kernels/*",
     "rust/src/chat/src/renderer/deepseek_v32/fixtures/*",
     "rust/src/tool-parser/src/gemma4.rs", "rust/src/text/src/output/decoded.rs",

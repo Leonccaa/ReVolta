@@ -720,8 +720,10 @@ class CircularBufferManager(FullAttentionManager):
         num_local_computed_tokens: int,
         num_external_computed_tokens: int,
     ) -> None:
-        del new_computed_blocks, num_local_computed_tokens, num_external_computed_tokens
-        self._claim_ring_block(request_id)
+        # All groups must touch their cache hits before we take a free block.
+        # allocate_new_blocks claims the ring after that coordinator pass.
+        del request_id, new_computed_blocks
+        del num_local_computed_tokens, num_external_computed_tokens
 
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int, num_tokens_main_model: int
@@ -1089,8 +1091,9 @@ class KpoolTailManager(FullAttentionManager):
     ) -> None:
         if new_computed_blocks:
             raise ValueError("KPool tail blocks cannot be prefix-cache hits.")
-        if num_local_computed_tokens or num_external_computed_tokens:
-            self._allocate_tail_block(request_id)
+        # Defer allocation until every group has protected its local hits.
+        # allocate_new_blocks still owns exactly one tail block per request.
+        del request_id, num_local_computed_tokens, num_external_computed_tokens
 
 
 class ChunkedLocalAttentionManager(SingleTypeKVCacheManager):

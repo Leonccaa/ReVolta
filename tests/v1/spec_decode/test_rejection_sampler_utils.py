@@ -535,3 +535,56 @@ def test_synthetic_rejection_sample(
             f"Step {i}: observed rate {observed_rate:.4f} deviates from "
             f"expected rate {expected_rate:.4f} by more than {deviation_tol}."
         )
+
+
+@pytest.mark.parametrize("draft_logits_none", [False, True])
+@pytest.mark.parametrize("num_speculative_steps", [1, 4])
+@pytest.mark.parametrize("vocab_size", [20000, 248320])
+@pytest.mark.parametrize("temperature", [0.0, 1.0])
+def test_all_nan_target_logits_in_range(
+    temperature: float,
+    vocab_size: int,
+    num_speculative_steps: int,
+    draft_logits_none: bool,
+):
+    """Ported from upstream #50183, plus the Qwen3.8 vocabulary, MTP K=4 and
+    the greedy-draft (draft_logits=None) path.
+
+    An all-NaN target row makes every per-block local max NaN, and
+    tl.argmax over a padded block count can then return an index past the
+    real blocks. NaN must be mapped to -inf so that the kernels emit in-range
+    token ids. A finite row in the same batch must keep its greedy argmax.
+    """
+    torch.manual_seed(0)
+    device = "cuda"
+    num_trials = 4
+    K = num_speculative_steps
+
+    target_logits_1d = torch.full(
+        (vocab_size,), float("nan"), device=device, dtype=torch.float32
+    )
+    draft_logits_1d = torch.randn(vocab_size, device=device, dtype=torch.float32)
+    inputs = _build_rejection_sample_inputs(
+        target_logits_1d,
+        draft_logits_1d,
+        K,
+        temperature=temperature,
+        num_trials=num_trials,
+    )
+    # The last trial gets finite target logits.
+    finite = torch.randn(vocab_size, device=device, dtype=torch.float32)
+    inputs["target_logits"][(num_trials - 1) * (K + 1) :] = finite
+    if draft_logits_none:
+        inputs["draft_logits"] = None
+
+    sampled, num_sampled = rejection_sample(**inputs, num_speculative_steps=K)
+    torch.accelerator.synchronize()
+
+    assert ((num_sampled >= 1) & (num_sampled <= K + 1)).all()
+    steps = torch.arange(K + 1, device=device).unsqueeze(0)
+    valid = steps < num_sampled.unsqueeze(1)
+    assert (sampled[valid] >= 0).all()
+    assert (sampled[valid] < vocab_size).all()
+    if temperature == 0.0:
+        last = sampled[-1][valid[-1]]
+        assert (last == finite.argmax()).all()

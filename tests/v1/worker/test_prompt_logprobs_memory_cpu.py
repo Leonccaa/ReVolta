@@ -324,6 +324,9 @@ def test_input_processor_rejects_before_engine_request(
         def update_from_generation_config(self, *args):
             pass
 
+        def validate_stop_token_ids_limit(self):
+            pass
+
     ns = dict(
         limits,
         time=time,

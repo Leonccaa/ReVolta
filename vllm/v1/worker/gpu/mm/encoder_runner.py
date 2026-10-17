@@ -3,11 +3,15 @@
 import numpy as np
 import torch
 
+from vllm import envs
+from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.multimodal.inputs import MultiModalKwargsItem
 from vllm.multimodal.utils import group_and_batch_mm_kwargs
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
+
+logger = init_logger(__name__)
 
 
 class EncoderRunner:
@@ -52,6 +56,11 @@ class EncoderRunner:
         self,
         mm_kwargs: list[tuple[str, MultiModalKwargsItem]],
     ) -> list[torch.Tensor]:
+        log_peak = envs.VLLM_SM70_LOG_MEMORY_PEAKS
+        if log_peak:
+            torch.accelerator.synchronize()
+            base = torch.accelerator.memory_allocated(self.device)
+            torch.accelerator.reset_peak_memory_stats(self.device)
         encoder_outputs: list[torch.Tensor] = []
         for modality, num_items, mm_kwargs_batch in group_and_batch_mm_kwargs(
             mm_kwargs, device=self.device, pin_memory=False
@@ -59,6 +68,18 @@ class EncoderRunner:
             batch_outputs = self.model.embed_multimodal(**mm_kwargs_batch)
             sanity_check_mm_encoder_outputs(batch_outputs, expected_num_items=num_items)
             encoder_outputs.extend(batch_outputs)
+        if log_peak:
+            torch.accelerator.synchronize()
+            peak = torch.accelerator.max_memory_allocated(self.device)
+            held = torch.accelerator.memory_allocated(self.device)
+            logger.info(
+                "Encoder memory: %d items, peak +%.1f MiB, outputs held "
+                "+%.1f MiB over %.1f MiB allocated",
+                len(mm_kwargs),
+                (peak - base) / 2**20,
+                (held - base) / 2**20,
+                base / 2**20,
+            )
         return encoder_outputs
 
     def gather_mm_embeddings(

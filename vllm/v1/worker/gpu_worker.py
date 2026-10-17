@@ -666,6 +666,19 @@ class Worker(WorkerBase):
             "Available KV cache memory: %s GiB",
             format_gib(self.available_kv_cache_memory_bytes),
         )
+        if envs.VLLM_SM70_LOG_MEMORY_PEAKS:
+            logger.info(
+                "Memory budget: requested %s GiB = weights %s + torch peak "
+                "increase %s + non-torch %s + warmup residual %s + graph "
+                "reserve %s + KV %s (GiB)",
+                format_gib(self.requested_memory),
+                format_gib(profile_result.weights_memory),
+                format_gib(profile_result.torch_peak_increase),
+                format_gib(profile_result.non_torch_increase),
+                format_gib(warmup_torch_residual),
+                format_gib(cudagraph_memory_estimate_applied),
+                format_gib(self.available_kv_cache_memory_bytes),
+            )
 
         if cudagraph_memory_estimate > 0:
             total_mem = self.init_snapshot.total_memory

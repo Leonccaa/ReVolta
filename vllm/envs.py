@@ -401,6 +401,7 @@ if TYPE_CHECKING:
     VLLM_SM70_AWQ_WARMUP_MAX_M: int = 16
     VLLM_SM70_AWQ_WARMUP_MAX_MOE_TOKENS: int = 8
     VLLM_SM70_AUX_KERNEL_WARMUP: bool = True
+    VLLM_SM70_LOG_MEMORY_PEAKS: bool = False
     VLLM_SM70_GEMM_LUT_PATH: str | None = None
     VLLM_SM70_AWQ_DENSE_TUNE_MAX_M: int = 16
     VLLM_SM70_FP8_DENSE_TUNE_MAX_M: int = 16
@@ -5686,6 +5687,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_LOG_MEMORY_PEAKS": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_LOG_MEMORY_PEAKS", "0"))),
+        description=(
+            "SM70 diagnostics: log the startup memory budget terms and the "
+            "per-call vision encoder allocation peak at INFO. Resets the "
+            "allocator peak counter around encoder calls; measurement only."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
         user_visible=False,
     ),
     "VLLM_SM70_GEMM_LUT_PATH": env_var(

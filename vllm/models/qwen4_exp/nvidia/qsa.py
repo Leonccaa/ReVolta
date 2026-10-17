@@ -544,15 +544,21 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
+        mm_config = model_config.multimodal_config
+        # Qwen4Exp M-RoPE positions never exceed the token count unless video
+        # pruning re-spaces them, so a 1x cos/sin cache suffices otherwise.
+        video_pruning = mm_config is not None and (
+            mm_config.is_multimodal_pruning_enabled()
+        )
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
             max_position=config.max_position_embeddings,
             rope_parameters=config.rope_parameters,
+            mrope_positions_factor=4 if video_pruning else 1,
         )
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        mm_config = model_config.multimodal_config
         text_only = mm_config is None or mm_config.language_model_only
         mrope_section = getattr(self.rotary_emb, "mrope_section", None)
         supports_mrope = bool(

@@ -53,12 +53,14 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
         inv_freq_extrapolation = 1.0 / pos_freqs
         inv_freq_interpolation = 1.0 / (scaling_factor * pos_freqs)
 
+        # M-RoPE may size its cache apart from the length that defines the
+        # correction range; every other user keeps max_position_embeddings.
         low, high = yarn_find_correction_range(
             self.beta_fast,
             self.beta_slow,
             self.rotary_dim,
             self.base,
-            self.max_position_embeddings,
+            getattr(self, "yarn_correction_max_position", self.max_position_embeddings),
             self.truncate,
         )
         # Get n-d rotational scaling corrected for extrapolation

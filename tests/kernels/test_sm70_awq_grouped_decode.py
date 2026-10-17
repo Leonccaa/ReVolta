@@ -420,10 +420,22 @@ def awq_layer():
 
 
 def _apply(layer, x, ids, topk, grouped, grouped_decode20=False):
+    # Select the route for this call only. The module-scoped layer keeps its
+    # load-time admission, so admission checks do not depend on test order.
+    saved = (
+        layer.sm70_awq_qwen38_grouped_qpn,
+        layer.sm70_awq_qwen38_grouped_decode20,
+    )
     layer.sm70_awq_qwen38_grouped_qpn = grouped
     layer.sm70_awq_qwen38_grouped_decode20 = grouped_decode20
-    out = layer._r2_method.apply(layer, x, topk, ids, None, None)
-    torch.cuda.synchronize()
+    try:
+        out = layer._r2_method.apply(layer, x, topk, ids, None, None)
+        torch.cuda.synchronize()
+    finally:
+        (
+            layer.sm70_awq_qwen38_grouped_qpn,
+            layer.sm70_awq_qwen38_grouped_decode20,
+        ) = saved
     return out.clone()
 
 
@@ -495,8 +507,6 @@ def test_grouped_decode20_against_per_expert_dispatch(awq_layer, m):
     grouped20 = _apply(awq_layer, x, ids, topk, grouped=False, grouped_decode20=True)
     # Eager replay determinism of the grouped selection.
     again = _apply(awq_layer, x, ids, topk, grouped=False, grouped_decode20=True)
-    awq_layer.sm70_awq_qwen38_grouped_qpn = True
-    awq_layer.sm70_awq_qwen38_grouped_decode20 = True
     diff, scale = _diff(grouped20, per_expert)
     _report(
         test="grouped_decode20",

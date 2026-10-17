@@ -3,28 +3,13 @@
 
 from __future__ import annotations
 
-import importlib.util
 import math
-import sys
-from pathlib import Path
 
 import pytest
 import torch
 
+from tests.kernels import sm70_attention_reference
 from vllm import _custom_ops as ops
-
-
-def _load_exactness_benchmark():
-    repo_root = Path(__file__).resolve().parents[3]
-    module_path = repo_root / "benchmarks" / "benchmark_sm70_attention_exactness.py"
-    spec = importlib.util.spec_from_file_location(
-        "benchmark_sm70_attention_exactness", module_path
-    )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -33,8 +18,9 @@ def test_sm70_flash_v100_varlen_type_a_layout_exact():
         pytest.skip("FlashAttention-V100 regression is SM70/V100 only")
 
     flash_attn_v100 = pytest.importorskip("flash_attn_v100")
-    bench = _load_exactness_benchmark()
-    diagnostics = bench.run_varlen_layout_diagnostic_cases(flash_attn_v100)
+    diagnostics = sm70_attention_reference.run_varlen_layout_diagnostic_cases(
+        flash_attn_v100
+    )
 
     failures: list[str] = []
     for case in diagnostics:

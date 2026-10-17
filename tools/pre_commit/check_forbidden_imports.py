@@ -77,9 +77,6 @@ CHECK_IMPORTS = {
         ),
         allowed_files={
             "vllm/triton_utils/importing.py",
-            # Standalone source-built kernel screen: run before installing a
-            # vLLM runtime, including CPU-only layout tests and compilation.
-            "benchmarks/kernels/benchmark_sm70_hc_batch_reuse.py",
         },
     ),
 }

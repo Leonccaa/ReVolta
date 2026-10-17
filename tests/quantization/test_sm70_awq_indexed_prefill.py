@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from benchmarks.benchmark_sm70_turbomind_exactness import (
+from tests.kernels.sm70_awq_reference import (
     _prepare_awq_moe_checkpoint_for_tp,
 )
 from vllm import envs

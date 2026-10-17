@@ -15,7 +15,7 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(scope="module", params=[False, True], ids=["standard", "compact"])
 def w2_bank(request):
-    from benchmarks.benchmark_sm70_turbomind_exactness import _awq_reference_weight
+    from tests.kernels.sm70_awq_reference import _awq_reference_weight
     from vllm import _sm70_ops as sm70
 
     compact = request.param

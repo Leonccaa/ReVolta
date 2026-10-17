@@ -2,27 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU layout checks only; these do NOT prove CUDA arithmetic or performance."""
 
-import importlib.util
-from pathlib import Path
-
 import pytest
 import torch
 
-ROOT = Path(__file__).resolve().parents[2]
-SPEC = importlib.util.spec_from_file_location(
-    "hc_batch_reuse_benchmark",
-    ROOT / "benchmarks/kernels/benchmark_sm70_hc_batch_reuse.py",
-)
-assert SPEC is not None and SPEC.loader is not None
-BENCH = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(BENCH)
+from tests.kernels.sm70_hc_reference import pack_down_weight, pack_weight
 
 
 @pytest.mark.parametrize("hidden", [640, 2560])
 def test_weight_packing_preserves_every_element(hidden):
     # Use int32 so each source position is distinct, unlike a half arange.
     weight = torch.arange(4 * hidden * 320, dtype=torch.int32).reshape(4, hidden, 320)
-    packed = BENCH.pack_weight(weight)
+    packed = pack_weight(weight)
     assert packed.is_contiguous()
     assert packed.dtype == weight.dtype
     restored = packed.permute(3, 0, 4, 1, 2, 5).reshape_as(weight)
@@ -70,9 +60,9 @@ def test_fragment_mapping_has_one_writer_per_output(rows, paired):
 
 def test_invalid_packing_rejected():
     with pytest.raises(ValueError, match="shape"):
-        BENCH.pack_weight(torch.empty(2560, 320))
+        pack_weight(torch.empty(2560, 320))
     with pytest.raises(ValueError, match="hidden"):
-        BENCH.pack_weight(torch.empty(4, 1280, 320))
+        pack_weight(torch.empty(4, 1280, 320))
 
 
 @pytest.mark.parametrize("tile_n", [16, 32])
@@ -80,7 +70,7 @@ def test_invalid_packing_rejected():
 def test_down_weight_packing_preserves_every_element(tile_n, columns):
     weight = torch.arange(columns * 10240, dtype=torch.int32).reshape(columns, 10240)
     padded_n = 96 if columns == 88 else 352
-    packed = BENCH.pack_down_weight(weight, tile_n)
+    packed = pack_down_weight(weight, tile_n)
     assert packed.is_contiguous()
     assert packed.dtype == weight.dtype
     restored = packed.permute(0, 3, 1, 2, 4).reshape(padded_n, 10240)
@@ -102,9 +92,9 @@ def test_down_weight_packing_preserves_every_element(tile_n, columns):
 
 def test_down_weight_packing_rejects_wrong_shape():
     with pytest.raises(ValueError, match="shape"):
-        BENCH.pack_down_weight(torch.empty(320, 10240))
+        pack_down_weight(torch.empty(320, 10240))
     with pytest.raises(ValueError, match="columns"):
-        BENCH.pack_down_weight(torch.empty(336, 10240), 8)
+        pack_down_weight(torch.empty(336, 10240), 8)
 
 
 @pytest.mark.parametrize("rows", [2, 4, 8, 16])
@@ -127,7 +117,7 @@ def test_tp4_down_shards_preserve_lora_and_rank3_injection_ownership():
     weight = torch.arange(336 * 10240, dtype=torch.int32).reshape(336, 10240)
     shards = []
     for rank in range(4):
-        packed = BENCH.pack_down_weight(weight[rank * 80 : rank * 80 + 88])
+        packed = pack_down_weight(weight[rank * 80 : rank * 80 + 88])
         shards.append(packed.permute(0, 3, 1, 2, 4).reshape(96, 10240))
     assert torch.equal(torch.cat([s[:80] for s in shards]), weight[:320])
     assert torch.equal(shards[3][80:84], weight[320:324])

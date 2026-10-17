@@ -293,6 +293,23 @@ def _apply_sm70_batch_gemm_defaults(*, is_sm70: bool) -> tuple[str, ...]:
     return tuple(applied)
 
 
+def _should_disable_legacy_sm70_graph_profiler(
+    use_v2_model_runner: bool, is_speculative_draft: bool
+) -> bool:
+    """Should this config switch off the process-wide graph memory estimator?
+
+    Only a target that runs on the legacy runner may do so. A speculative draft
+    config is derived inside a worker whose target may run on V2; its runner
+    choice must not disable the target's graph reserve, because the env value
+    is cached for the whole process after model loading.
+    """
+    return (
+        not use_v2_model_runner
+        and not is_speculative_draft
+        and "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS" not in os.environ
+    )
+
+
 def checkpoint_kv_quant_allowed(cfg: "VllmConfig") -> bool:
     """May the checkpoint's own metadata select a quantized KV cache here?
 
@@ -2324,9 +2341,8 @@ class VllmConfig:
                         "Auto-setting VLLM_MQ_BROADCASTER_MAX_CHUNKS=64 for "
                         "SM70 Flash-V100 0.0.3 compile graph startup."
                     )
-                if (
-                    not self.use_v2_model_runner
-                    and "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS" not in os.environ
+                if _should_disable_legacy_sm70_graph_profiler(
+                    self.use_v2_model_runner, self.is_speculative_draft
                 ):
                     os.environ["VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS"] = "0"
                     logger.info_once(

@@ -21,7 +21,9 @@ if TYPE_CHECKING:
 @dataclasses.dataclass
 class StructuredOutputRequest:
     params: StructuredOutputsParams
-    _grammar: Future[StructuredOutputGrammar] | StructuredOutputGrammar | None = None
+    _grammar: (
+        Future[StructuredOutputGrammar] | StructuredOutputGrammar | Exception | None
+    ) = None
     reasoning_ended: bool | None = None
     # Absolute index in all_token_ids of the last reasoning-marker token.
     # Only the suffix after this boundary may advance the structured grammar.
@@ -53,6 +55,8 @@ class StructuredOutputRequest:
                 self.status = RequestStatus.WAITING
             except TimeoutError:
                 return False
+            except Exception as e:
+                self._grammar = e
         return True
 
     @property
@@ -60,11 +64,10 @@ class StructuredOutputRequest:
         return self._check_grammar_completion()
 
     @property
-    def grammar(self) -> StructuredOutputGrammar | None:
-        completed = self._check_grammar_completion()
-        return (
-            cast(StructuredOutputGrammar | None, self._grammar) if completed else None
-        )
+    def grammar(self) -> StructuredOutputGrammar | Exception | None:
+        if not self._check_grammar_completion():
+            return None
+        return cast(StructuredOutputGrammar | Exception | None, self._grammar)
 
     @grammar.setter
     def grammar(

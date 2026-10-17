@@ -238,6 +238,12 @@ def _rejection_kernel(
                     mask=target_blocks_mask,
                     other=float("-inf"),
                 )
+                # NaNs can send the block argmax into the padded region.
+                target_local_max = tl.where(
+                    target_local_max != target_local_max,
+                    float("-inf"),
+                    target_local_max,
+                )
                 max_target_block_idx = tl.argmax(target_local_max, axis=0)
                 target_argmax = tl.load(
                     target_local_argmax_ptr
@@ -483,6 +489,12 @@ def _insert_resampled_kernel(
         resampled_local_max_ptr + req_idx * resampled_local_max_stride + block,
         mask=mask,
         other=float("-inf"),
+    )
+    # Keep NaN block maxima from selecting padding before the index load.
+    resampled_local_max = tl.where(
+        resampled_local_max != resampled_local_max,
+        float("-inf"),
+        resampled_local_max,
     )
     resampled_max_block_idx = tl.argmax(resampled_local_max, axis=0)
     resampled = tl.load(

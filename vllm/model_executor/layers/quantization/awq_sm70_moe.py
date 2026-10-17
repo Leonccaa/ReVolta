@@ -21,6 +21,7 @@ from vllm.model_executor.layers.fused_moe import (
     SharedExperts,
 )
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+from vllm.model_executor.layers.quantization.awq_int4_zero import pack_int4_zero
 from vllm.model_executor.layers.quantization.awq_qpn_sm70 import (
     initialize_qpn_m1,
     use_qpn_m1,
@@ -917,6 +918,15 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             native_available=hasattr(torch.ops._C, "awq_sm70_prepare_compact"),
             shape_ok=_is_qwen38_tp4_compact_metadata_shape(layer, self.group_size),
         )
+        int4_zero = envs.VLLM_SM70_AWQ_MOE_INT4_ZERO
+        if int4_zero and (
+            not compact_metadata
+            or not hasattr(torch.ops._C, "awq_sm70_int4_zero_supported")
+        ):
+            raise RuntimeError(
+                "VLLM_SM70_AWQ_MOE_INT4_ZERO=1 requires the exact compact "
+                "Qwen3.8 TP4 lane and a rebuilt int4-zero SM70 extension."
+            )
         prepare_awq = (
             sm70_ops.awq_sm70_prepare_compact
             if compact_metadata
@@ -942,7 +952,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 w13_interleaved,
             )
             w13_tm_weights.append(r13[0])
-            w13_tm_scales.append(r13[1])
+            w13_tm_scales.append(pack_int4_zero(r13[1]) if int4_zero else r13[1])
             w13_meta.append(r13[2])
 
             r2 = prepare_awq(
@@ -953,7 +963,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 False,
             )
             w2_tm_weights.append(r2[0])
-            w2_tm_scales.append(r2[1])
+            w2_tm_scales.append(pack_int4_zero(r2[1]) if int4_zero else r2[1])
             w2_meta.append(r2[2])
 
         layer.w13_tm_weight = Parameter(
@@ -1021,6 +1031,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         layer.sm70_awq_moe_w13_interleaved = w13_interleaved
         layer.sm70_awq_moe_legacy_single_token_compact = build_legacy_w13
         layer.sm70_awq_moe_compact_metadata = compact_metadata
+        layer.sm70_awq_moe_int4_zero = int4_zero
 
         indexed_prefill_contract = bool(
             batched_gemm
@@ -1150,6 +1161,10 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             "batched" if batched_gemm else "per-expert dense",
             num_experts,
         )
+        if int4_zero:
+            logger.info_once(
+                "SM70 AWQ int4 zero enabled (5 bytes per two metadata records)."
+            )
         if compact_metadata:
             logger.info_once(
                 "SM70 Qwen3.8 TP4 AWQ compact scale/zero metadata enabled."

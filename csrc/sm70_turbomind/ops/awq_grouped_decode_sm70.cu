@@ -86,6 +86,7 @@ static_assert(kPlanInts == 1928, "keep vllm/_sm70_ops.py in sync");
 
 // Metadata formats, as in awq_qpn_m1_sm70.cu: 0 = compact 3-byte scalar
 // reader, 1 = compact 3-byte warp-cooperative reader, 2 = 4-byte scale+bias.
+// Format 3 = five bytes per pair (FP16 scales and packed uint4 zeros).
 template <int Format>
 __device__ __forceinline__ uint32_t read_awq_stats(const uint8_t* stats,
                                                    int group, int tile, int col,
@@ -94,6 +95,14 @@ __device__ __forceinline__ uint32_t read_awq_stats(const uint8_t* stats,
   if constexpr (Format == 2) {
     return __ldg(reinterpret_cast<const uint32_t*>(stats) + group * n +
                  tile * 32 + col);
+  } else if constexpr (Format == 3) {
+    const size_t index = static_cast<size_t>(group) * n + tile * 32 + col;
+    const auto* pair = stats + (index >> 1) * 5;
+    const int offset = (index & 1) * 2;
+    bits = static_cast<uint32_t>(__ldg(pair + offset)) |
+           (static_cast<uint32_t>(__ldg(pair + offset + 1)) << 8) |
+           (static_cast<uint32_t>((__ldg(pair + 4) >> ((index & 1) * 4)) & 15)
+            << 16);
   } else if constexpr (Format == 1) {
     const int lane = threadIdx.x & 31;
     const auto* words = reinterpret_cast<const uint32_t*>(
@@ -315,7 +324,8 @@ __global__ void __launch_bounds__(Split * 32)
     a[rb] = x + static_cast<size_t>(route / kTopK) * kK;
   }
   const uint32_t* w = weights + static_cast<size_t>(expert) * (kK * kN13 / 8);
-  constexpr int stats_bytes = (kK / 32) * kN13 * (Format == 2 ? 4 : 3);
+  constexpr int stats_bytes =
+      (kK / 32) * kN13 * (Format == 3 ? 5 : (Format == 2 ? 8 : 6)) / 2;
   const uint8_t* st = metadata + static_cast<size_t>(expert) * stats_bytes;
 
   float accum[RB][8];
@@ -411,7 +421,8 @@ __global__ void __launch_bounds__(Warps * 32)
   const int quadpair = (lane >> 2) & 3;
   const int a_row = (lane & 3) + ((lane & 16) ? 4 : 0);
   const int packed_col = quadpair * 8 + a_row;
-  constexpr int stats_bytes = (kK2 / 32) * kN2 * (Format == 2 ? 4 : 3);
+  constexpr int stats_bytes =
+      (kK2 / 32) * kN2 * (Format == 3 ? 5 : (Format == 2 ? 8 : 6)) / 2;
   for (int pack = warp; pack < packs; pack += Warps) {
     const int expert = __ldg(plan + kPlanExperts + pack);
     const int count = __ldg(plan + kPlanCounts + pack);
@@ -624,7 +635,12 @@ void awq_moe_grouped_decode_sm70_out(
   check_tensor(w13, at::kInt, {kExperts, kK, kN13 / 8}, device, "W13");
   check_tensor(w2, at::kInt, {kExperts, kK2, kN2 / 8}, device, "W2");
   const bool compact = s13.scalar_type() == at::kByte;
-  if (compact) {
+  const bool int4_zero = compact && s13.dim() == 4 && s13.size(3) == 5;
+  if (int4_zero) {
+    check_tensor(s13, at::kByte, {512, 80, 160, 5}, device,
+                 "W13 int4 metadata");
+    check_tensor(s2, at::kByte, {512, 5, 1280, 5}, device, "W2 int4 metadata");
+  } else if (compact) {
     check_tensor(s13, at::kByte, {kExperts, kK / 32, kN13, 3}, device,
                  "W13 metadata");
     check_tensor(s2, at::kByte, {kExperts, kK2 / 32, kN2, 3}, device,
@@ -661,7 +677,10 @@ void awq_moe_grouped_decode_sm70_out(
       plan.mutable_data_ptr<int32_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   const int w13_split = split == 0 ? 16 : static_cast<int>(split);
-  if (compact) {
+  if (int4_zero) {
+    dispatch_rb<3, 3>(rb, input, w13, s13, w2, s2, topk, plan, intermediate,
+                      out, tokens, w13_split, stream);
+  } else if (compact) {
     dispatch_rb<1, 0>(rb, input, w13, s13, w2, s2, topk, plan, intermediate,
                       out, tokens, w13_split, stream);
   } else {

@@ -7432,17 +7432,51 @@ namespace {
 
 __global__ void awq_moe_fill_strided_ptrs_kernel(
     turbomind::gemm::StridedPtr* ptrs, char* base, int64_t expert_stride,
-    int stride, int64_t num_experts, bool compact_metadata) {
+    int stride, int64_t num_experts, uintptr_t metadata_tag) {
   const int64_t expert_id =
       static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (expert_id < num_experts) {
     const uintptr_t data_ptr =
         reinterpret_cast<uintptr_t>(base + expert_id * expert_stride);
     ptrs[expert_id] = {
-        reinterpret_cast<void*>(
-            data_ptr | (compact_metadata ? uintptr_t{1} : uintptr_t{0})),
+        reinterpret_cast<void*>(data_ptr | metadata_tag),
         stride,
     };
+  }
+}
+
+// Decode only selected source experts, preserving the B group-index mapping.
+// Tag 3 is private to AWQ int4 zero. It never reaches the TurboMind iterator.
+// Existing tags 0 (FP16 scale/bias) and 1 (3-byte scale/zero) pass through.
+__global__ void awq_moe_expand_int4_zero_kernel(
+    const turbomind::gemm::StridedPtr* source,
+    turbomind::gemm::StridedPtr* destination, uint8_t* expanded,
+    const int* group_indices, int records) {
+  const int expert = blockIdx.y;
+  const int source_expert =
+      group_indices ? __ldg(group_indices + expert) : expert;
+  const auto src = source[source_expert];
+  const auto tagged = reinterpret_cast<uintptr_t>(src.ptr);
+  if ((tagged & uintptr_t{3}) != uintptr_t{3}) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) destination[expert] = src;
+    return;
+  }
+  const auto* bytes = reinterpret_cast<const uint8_t*>(tagged & ~uintptr_t{3});
+  auto* dst = expanded + static_cast<size_t>(expert) * records * 3;
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    destination[expert] = {
+        reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(dst) |
+                                uintptr_t{1}),
+        src.stride,
+    };
+  }
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index < records) {
+    const auto* pair = bytes + (index >> 1) * 5;
+    const int offset = (index & 1) * 2;
+    dst[index * 3] = __ldg(pair + offset);
+    dst[index * 3 + 1] = __ldg(pair + offset + 1);
+    dst[index * 3 + 2] = (__ldg(pair + 4) >> ((index & 1) * 4)) & 15;
   }
 }
 
@@ -7464,10 +7498,23 @@ std::vector<torch::Tensor> awq_moe_build_strided_ptrs(
               "awq_moe_build_strided_ptrs: scales dim0 != num_experts.");
   if (q_ld < 0) {
     TORCH_CHECK(tm_scales.scalar_type() == torch::kUInt8 &&
-                    tm_scales.dim() == 4 && tm_scales.size(3) == 3 &&
+                    tm_scales.dim() == 4 &&
+                    (tm_scales.size(3) == 3 || tm_scales.size(3) == 5) &&
                     tm_scales.is_contiguous(),
                 "awq_moe_build_strided_ptrs: compact scales must be "
-                "contiguous uint8 [E,G,N,3].");
+                "contiguous uint8 [E,G,N,3] or [E,G,N/2,5].");
+  }
+
+  const bool int4_zero = q_ld < 0 && tm_scales.size(3) == 5;
+  if (int4_zero) {
+    const char* enabled = std::getenv("VLLM_SM70_AWQ_MOE_INT4_ZERO");
+    TORCH_CHECK(
+        enabled && std::atoi(enabled) != 0,
+        "int4 zero pointer banks require VLLM_SM70_AWQ_MOE_INT4_ZERO=1");
+    TORCH_CHECK(tm_scales.size(2) * 2 == tm_weights.size(2) * 8 &&
+                    tm_scales.stride(0) % 4 == 0 &&
+                    reinterpret_cast<uintptr_t>(tm_scales.data_ptr()) % 4 == 0,
+                "int4 zero requires even N and aligned expert banks");
   }
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(tm_weights));
@@ -7491,12 +7538,14 @@ std::vector<torch::Tensor> awq_moe_build_strided_ptrs(
   const int blocks = static_cast<int>((num_experts + kThreads - 1) / kThreads);
   awq_moe_fill_strided_ptrs_kernel<<<blocks, kThreads, 0, stream>>>(
       reinterpret_cast<turbomind::gemm::StridedPtr*>(w_tensor.data_ptr()),
-      w_base, w_expert_stride, static_cast<int>(k_ld), num_experts, false);
+      w_base, w_expert_stride, static_cast<int>(k_ld), num_experts,
+      uintptr_t{0});
   awq_moe_fill_strided_ptrs_kernel<<<blocks, kThreads, 0, stream>>>(
       reinterpret_cast<turbomind::gemm::StridedPtr*>(s_tensor.data_ptr()),
       s_base, s_expert_stride,
       static_cast<int>(compact_metadata ? -q_ld : q_ld), num_experts,
-      compact_metadata);
+      int4_zero ? uintptr_t{3}
+                : (compact_metadata ? uintptr_t{1} : uintptr_t{0}));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   return {w_tensor, s_tensor};
@@ -8810,6 +8859,32 @@ void awq_moe_gemm_sm70_out_impl(
   desc_V.num = static_cast<int>(num_experts);
   desc_V.group_idxs =
       use_b_group_indices ? b_group_indices_flat.data_ptr<int>() : nullptr;
+
+  torch::Tensor expanded_stats;
+  torch::Tensor expanded_ptrs;
+  const char* int4_zero = std::getenv("VLLM_SM70_AWQ_MOE_INT4_ZERO");
+  if (int4_zero && std::atoi(int4_zero) != 0) {
+    TORCH_CHECK(n % 2 == 0 && (n * num_groups_raw * 3) % 4 == 0,
+                "int4 zero expansion requires aligned even-N AWQ banks");
+    expanded_stats = torch::empty({num_experts, num_groups_raw, n, 3},
+                                  strided_ptrs_s.options());
+    expanded_ptrs = torch::empty({num_experts * 16}, strided_ptrs_s.options());
+    const int records = static_cast<int>(num_groups_raw * n);
+    const dim3 grid((records + 255) / 256, num_experts);
+    awq_moe_expand_int4_zero_kernel<<<grid, 256, 0, stream>>>(
+        reinterpret_cast<const turbomind::gemm::StridedPtr*>(
+            strided_ptrs_s.data_ptr()),
+        reinterpret_cast<turbomind::gemm::StridedPtr*>(
+            expanded_ptrs.data_ptr()),
+        expanded_stats.data_ptr<uint8_t>(),
+        use_b_group_indices ? b_group_indices_flat.data_ptr<int>() : nullptr,
+        records);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    strided_ptrs_s = expanded_ptrs;
+    // Expanded rows are already in logical group order. B still uses its
+    // original source indices; applying them twice to V would be incorrect.
+    desc_V.group_idxs = nullptr;
+  }
 
   // desc_D: output with offsets (same as A)
   turbomind::gemm::MatrixLayout desc_D{

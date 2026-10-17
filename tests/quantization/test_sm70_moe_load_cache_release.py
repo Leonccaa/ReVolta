@@ -46,6 +46,7 @@ def _awq_case(monkeypatch):
         "envs",
         SimpleNamespace(
             VLLM_SM70_AWQ_MOE_COMPACT_METADATA=False,
+            VLLM_SM70_AWQ_MOE_INT4_ZERO=False,
             VLLM_SM70_AWQ_MOE_LEGACY_SINGLE_TOKEN_COMPACT=False,
             VLLM_SM70_AWQ_QWEN38_MOE_INDEXED_PREFILL=False,
             VLLM_SM70_AWQ_QWEN38_MOE_COMPACT_GROUPED_DECODE=False,

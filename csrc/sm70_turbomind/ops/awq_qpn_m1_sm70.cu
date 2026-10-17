@@ -26,6 +26,7 @@ constexpr int kRoutes = 10;
 constexpr int kSplit = 16;
 
 // Modes: existing 3B scalar / 3B cooperative / 4B scale+bias metadata.
+// Format 3 = five bytes per pair (FP16 scales and packed uint4 zeros).
 template <int Format>
 __device__ __forceinline__ uint32_t read_awq_stats(const uint8_t* stats,
                                                    int group, int tile, int col,
@@ -34,6 +35,14 @@ __device__ __forceinline__ uint32_t read_awq_stats(const uint8_t* stats,
   if constexpr (Format == 2) {
     return __ldg(reinterpret_cast<const uint32_t*>(stats) + group * n +
                  tile * 32 + col);
+  } else if constexpr (Format == 3) {
+    const size_t index = static_cast<size_t>(group) * n + tile * 32 + col;
+    const auto* pair = stats + (index >> 1) * 5;
+    const int offset = (index & 1) * 2;
+    bits = static_cast<uint32_t>(__ldg(pair + offset)) |
+           (static_cast<uint32_t>(__ldg(pair + offset + 1)) << 8) |
+           (static_cast<uint32_t>((__ldg(pair + 4) >> ((index & 1) * 4)) & 15)
+            << 16);
   } else if constexpr (Format == 1) {
     const int lane = threadIdx.x & 31;
     const auto* words = reinterpret_cast<const uint32_t*>(
@@ -129,7 +138,8 @@ __global__ void shared_qpn_w13_kernel(const half* input,
   const int packed_col = quadpair * 8 + a_row;
   const uint32_t* expert_weights =
       weights + static_cast<size_t>(expert) * kK * kN / 8;
-  constexpr int stats_bytes = (kK / 32) * kN * (Format == 2 ? 4 : 3);
+  constexpr int stats_bytes =
+      (kK / 32) * kN * (Format == 3 ? 5 : (Format == 2 ? 8 : 6)) / 2;
   const uint8_t* expert_stats =
       metadata + static_cast<size_t>(expert) * stats_bytes;
   float accum[8] = {};
@@ -215,7 +225,8 @@ __global__ void shared_qpn_w2_reduce_kernel(
     const int packed_col = quadpair * 8 + a_row;
     const uint32_t* expert_weights =
         weights + static_cast<size_t>(expert) * k * n / 8;
-    constexpr int bytes = (k / 32) * n * (Format == 2 ? 4 : 3);
+    constexpr int bytes =
+        (k / 32) * n * (Format == 3 ? 5 : (Format == 2 ? 8 : 6)) / 2;
     const uint8_t* expert_stats =
         metadata + static_cast<size_t>(expert) * bytes;
     const half* input_row = input + route * k;
@@ -326,7 +337,12 @@ void awq_moe_qpn_m1_sm70_out(at::Tensor out, at::Tensor intermediate,
   check_tensor(w13, at::kInt, {512, 2560, 40}, device, "W13");
   check_tensor(w2, at::kInt, {512, 160, 320}, device, "W2");
   const bool compact = s13.scalar_type() == at::kByte;
-  if (compact) {
+  const bool int4_zero = compact && s13.dim() == 4 && s13.size(3) == 5;
+  if (int4_zero) {
+    check_tensor(s13, at::kByte, {512, 80, 160, 5}, device,
+                 "W13 int4 metadata");
+    check_tensor(s2, at::kByte, {512, 5, 1280, 5}, device, "W2 int4 metadata");
+  } else if (compact) {
     check_tensor(s13, at::kByte, {512, 80, 320, 3}, device, "W13 metadata");
     check_tensor(s2, at::kByte, {512, 5, 2560, 3}, device, "W2 metadata");
   } else {
@@ -346,9 +362,20 @@ void awq_moe_qpn_m1_sm70_out(at::Tensor out, at::Tensor intermediate,
               "awq_qpn_m1 requires SM70");
   const auto stream = at::cuda::getCurrentCUDAStream();
   // Reuse the prepared bank; no load-time repack or additional weight copy.
-  if (compact) {
+  if (int4_zero) {
+    launch<3, 3>(input, w13, s13, w2, s2, ids, topk, intermediate, out, stream);
+  } else if (compact) {
     launch<1, 0>(input, w13, s13, w2, s2, ids, topk, intermediate, out, stream);
   } else {
     launch<2, 2>(input, w13, s13, w2, s2, ids, topk, intermediate, out, stream);
   }
+}
+
+// Capability handshake: old wheels must reject the new Python loading flag.
+TORCH_LIBRARY_FRAGMENT(_C, m) {
+  m.def("awq_sm70_int4_zero_supported() -> bool");
+}
+
+TORCH_LIBRARY_IMPL(_C, CatchAll, m) {
+  m.impl("awq_sm70_int4_zero_supported", []() { return true; });
 }

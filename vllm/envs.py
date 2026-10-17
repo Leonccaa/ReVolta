@@ -284,6 +284,7 @@ if TYPE_CHECKING:
     VLLM_SM70_AWQ_MOE_BATCHED_DECODE_MAX_TOKENS: int = 0
     VLLM_SM70_AWQ_MOE_PERSISTENT_MAX_TOKENS: int = 0
     VLLM_SM70_AWQ_MOE_COMPACT_METADATA: bool = True
+    VLLM_SM70_AWQ_MOE_INT4_ZERO: bool = False
     VLLM_SM70_AWQ_MOE_BATCHED_LAYER_ALLOWLIST: str | None = None
     VLLM_SM70_AWQ_MOE_BATCHED_LAYER_DENYLIST: str | None = None
     VLLM_SM70_AWQ_MOE_COMPARE_DENSE_DIR: str | None = None
@@ -3699,6 +3700,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="tuning",
         declared_default="0",
         effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=("MoE AWQ",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_AWQ_MOE_INT4_ZERO": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_AWQ_MOE_INT4_ZERO", "0"))),
+        description=(
+            "Losslessly pack prepared Qwen3.8 TP4 AWQ zeros into nibbles. "
+            "Requires compact metadata and a rebuilt SM70 extension. "
+            "QPN reads the packed bank; TurboMind uses temporary 3-byte stats."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("MoE AWQ",),
         user_visible=False,

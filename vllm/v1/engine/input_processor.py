@@ -336,6 +336,7 @@ class InputProcessor:
             )
             if self.tokenizer is not None:
                 sampling_params.update_from_tokenizer(self.tokenizer)
+            sampling_params.validate_stop_token_ids_limit()
         else:
             pooling_params = params.clone()
 

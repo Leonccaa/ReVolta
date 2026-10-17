@@ -30,6 +30,15 @@ MAX_LOGPROB_TOKEN_IDS = 128
 """Upper bound on `SamplingParams.logprob_token_ids` list length. Must match
 the per-request row width allocated by the sampler's `LogprobTokenIdsState`."""
 
+# Per-request row widths of the MRv2 sampler buffers (LogitBiasState,
+# BadWordsState). Requests above them must be rejected here (HTTP 400): the
+# worker-side check runs inside EngineCore.step() and kills the engine.
+MAX_NUM_ALLOWED_TOKEN_IDS = 1024
+MAX_NUM_LOGIT_BIAS_TOKENS = 1024
+MAX_NUM_STOP_TOKEN_IDS = 128  # only enforced when min_tokens > 0
+MAX_NUM_BAD_WORDS = 128  # token sequences after tokenization (~64 strings)
+MAX_BAD_WORDS_TOTAL_TOKENS = 1024
+
 
 def validate_thinking_token_budget(value: int | float | bool | None) -> int | None:
     """Validate ``thinking_token_budget``; return ``None`` if unset."""
@@ -617,6 +626,16 @@ class SamplingParams(
                     eos_ids.update(self.stop_token_ids)
                     self.stop_token_ids = list(eos_ids)
 
+    def validate_stop_token_ids_limit(self) -> None:
+        """Call after update_from_generation_config (EOS ids merged)."""
+        num = len(self._all_stop_token_ids)
+        if self.min_tokens > 0 and num > MAX_NUM_STOP_TOKEN_IDS:
+            raise VLLMValidationError(
+                f"With min_tokens > 0, at most {MAX_NUM_STOP_TOKEN_IDS} stop "
+                f"token ids (including EOS) are supported; got {num}.",
+                parameter="stop_token_ids",
+            )
+
     def update_from_tokenizer(self, tokenizer: TokenizerLike) -> None:
         if not self.bad_words:
             return
@@ -649,6 +668,16 @@ class SamplingParams(
                     and len(prompt_token_ids) == len(self._bad_words_token_ids[-1])
                 ):
                     self._bad_words_token_ids.append(prompt_token_ids)
+
+        num_seqs = len(self._bad_words_token_ids)
+        num_tokens = sum(len(t) for t in self._bad_words_token_ids)
+        if num_seqs > MAX_NUM_BAD_WORDS or num_tokens > MAX_BAD_WORDS_TOTAL_TOKENS:
+            raise VLLMValidationError(
+                f"bad_words tokenizes to {num_seqs} sequences / {num_tokens} "
+                f"tokens; the limits are {MAX_NUM_BAD_WORDS} sequences and "
+                f"{MAX_BAD_WORDS_TOTAL_TOKENS} tokens.",
+                parameter="bad_words",
+            )
 
         invalid_token_ids = [
             token_id
@@ -835,6 +864,12 @@ class SamplingParams(
         if allowed_token_ids is None:
             return
 
+        if len(allowed_token_ids) > MAX_NUM_ALLOWED_TOKEN_IDS:
+            raise VLLMValidationError(
+                f"allowed_token_ids has {len(allowed_token_ids)} entries; "
+                f"the limit is {MAX_NUM_ALLOWED_TOKEN_IDS}.",
+                parameter="allowed_token_ids",
+            )
         if len(allowed_token_ids) == 0:
             raise VLLMValidationError(
                 "allowed_token_ids is not None and empty!",

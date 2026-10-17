@@ -4530,3 +4530,22 @@ def test_eagle3_mm_encoder_cache_with_shift():
         f"shifted_end={scheduled_end_with_shift}) overlapping MM at "
         f"{start_pos}. The fix must schedule encoder inputs."
     )
+
+
+def test_kv_connector_honors_skip_reading_prefix_cache():
+    """A request that must score every prompt row takes no external hit."""
+    BLOCK_SIZE = 16
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        use_kv_connector=mock_kv(matched_tokens=BLOCK_SIZE * 2, is_async=False),
+        block_size=BLOCK_SIZE,
+    )
+    plain, scoring = create_requests(num_requests=2, num_tokens=BLOCK_SIZE * 4)
+    scoring.sampling_params.prompt_logprobs = 1
+    scoring.skip_reading_prefix_cache = True
+    scheduler.add_request(plain)
+    scheduler.add_request(scoring)
+
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens[plain.request_id] == BLOCK_SIZE * 2
+    assert output.num_scheduled_tokens[scoring.request_id] == BLOCK_SIZE * 4

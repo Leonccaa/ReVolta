@@ -53,6 +53,7 @@ from vllm.model_executor.layers.linear import (
     LinearBase,
     LinearMethodBase,
     UnquantizedLinearMethod,
+    register_weight_loader_v2_supported_method,
 )
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
@@ -2121,6 +2122,30 @@ class ModelOptMxFp8LinearMethod(LinearMethodBase):
         return self.kernel.apply_weights(layer, x, bias)
 
 
+@register_weight_loader_v2_supported_method
+class ModelOptMxFp8SM70LinearMethod(ModelOptMxFp8LinearMethod):
+    """Load MXFP8 through the standard TP loaders, then retain only FP16."""
+
+    def __init__(self) -> None:
+        self.quant_config = ModelOptMxFp8Config(True, None, [])
+        self.unquantized = UnquantizedLinearMethod()
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from vllm.model_executor.layers.quantization.utils.fp4_local import (
+            dequantize_mxfp8_cpu,
+        )
+
+        weight = dequantize_mxfp8_cpu(layer.weight, layer.weight_scale)
+        replace_parameter(layer, "weight", weight.to(layer.weight.device))
+        del layer.weight_scale
+        logger.info_once("SM70 MXFP8 weights expanded to FP16 (E4M3 x E8M0 block32).")
+        self.unquantized.process_weights_after_loading(layer)
+        layer.quant_method = self.unquantized
+
+    def apply(self, layer, x, bias=None):
+        return self.unquantized.apply(layer, x, bias)
+
+
 class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
     """FlashInfer TRTLLM MXFP8 block-scale MoE for ModelOpt checkpoints."""
 
@@ -2690,6 +2715,10 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
         quant_algo = self._resolve_quant_algo(prefix)
 
         if isinstance(layer, (LinearBase, ParallelLMHead)):
+            if quant_algo == "MXFP8":
+                if sm70_tm.is_exact_sm70_cuda_platform():
+                    return ModelOptMxFp8SM70LinearMethod()
+                return ModelOptMxFp8LinearMethod(ModelOptMxFp8Config(True, None, []))
             if quant_algo == "FP8":
                 return ModelOptFp8LinearMethod(self.fp8_config)
             if quant_algo == "NVFP4":

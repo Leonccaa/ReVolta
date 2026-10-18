@@ -75,8 +75,15 @@ def strip_wheel(wheel: Path, output_dir: Path) -> dict:
         unpacked, symbols = root / "wheel", root / "symbols"
         with WheelFile(wheel) as source:
             source.extractall(unpacked)
+            # zipfile extraction does not restore executable bits (vllm-rs).
+            for member in source.infolist():
+                mode = (member.external_attr >> 16) & 0o777
+                if mode:
+                    (unpacked / member.filename).chmod(mode)
         for library in sorted(unpacked.rglob("*.so")):
-            if library.read_bytes()[:4] != b"\x7fELF":
+            with library.open("rb") as stream:
+                header = stream.read(4)
+            if header != b"\x7fELF":
                 raise ValueError(f"Not an ELF library: {library}")
             relative = library.relative_to(unpacked)
             debug = symbols / (str(relative) + ".debug")

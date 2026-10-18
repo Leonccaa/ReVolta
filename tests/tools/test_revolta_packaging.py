@@ -138,6 +138,9 @@ def test_split_debug_preserves_sections_and_record(tmp_path):
     )
     unpacked = tmp_path / "unpacked"
     (unpacked / "vllm").mkdir(parents=True)
+    executable = unpacked / "vllm/vllm-rs"
+    executable.write_bytes(b"executable fixture")
+    executable.chmod(0o755)
     import shutil
 
     shutil.copy2(library, unpacked / "vllm/example.so")
@@ -156,6 +159,7 @@ def test_split_debug_preserves_sections_and_record(tmp_path):
     assert all(report["libraries"]["vllm/example.so"].values())
     # WheelFile validates every member against the regenerated RECORD.
     with WheelFile(wheel) as result:
+        assert (result.getinfo("vllm/vllm-rs").external_attr >> 16) & 0o111
         result.extractall(tmp_path / "stripped")
     stripped = tmp_path / "stripped/vllm/example.so"
     module.verify(library, stripped)

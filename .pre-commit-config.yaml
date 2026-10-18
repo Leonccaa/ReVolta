@@ -158,6 +158,12 @@ repos:
     language: python
     pass_filenames: false
     always_run: true
+  - id: config-inventory
+    name: Check ReVolta profile environment inventory
+    entry: python -m tools.config_inventory --check
+    language: python
+    pass_filenames: false
+    always_run: true
   - id: validate-config
     name: Validate configuration has default values and that each field has a docstring
     entry: python tools/pre_commit/validate_config.py

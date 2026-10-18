@@ -1617,6 +1617,19 @@ class VllmConfig:
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
 
+        from vllm.revolta_profile import (
+            all_visible_devices_sm70,
+            apply_revolta_profile,
+        )
+
+        # Also cover direct VllmConfig users. This is intentionally before
+        # upstream overlap, hybrid-PLE and compilation automatic defaults.
+        revolta_profile_enabled = apply_revolta_profile(
+            self.model_config,
+            self.parallel_config.tensor_parallel_size,
+            is_sm70=all_visible_devices_sm70(),
+        )
+
         # To give each torch profile run a unique instance name.
         self.instance_id = f"{time.time_ns()}"
 
@@ -2940,6 +2953,17 @@ class VllmConfig:
         self._verify_kv_transfer_compat()
         # Log the custom passes that are enabled
         self.compilation_config.pass_config.log_enabled_passes()
+
+        if not self.is_speculative_draft:
+            from vllm.revolta_profile import profile_audit
+
+            logger.info_once(
+                "ReVolta profile %s",
+                profile_audit(
+                    enabled=revolta_profile_enabled,
+                    quantization=getattr(self.model_config, "quantization", None),
+                ),
+            )
 
     def update_sizes_for_sequence_parallelism(self, possible_sizes: list) -> list:
         # remove the sizes that not multiple of tp_size when

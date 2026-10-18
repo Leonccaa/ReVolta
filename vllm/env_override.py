@@ -6,6 +6,9 @@ import os
 
 import regex as re
 
+# Snapshot audit provenance before torch and automatic environment defaults.
+import vllm.revolta_profile  # noqa: F401
+
 
 def _get_torch_cuda_version():
     """Peripheral function to _maybe_set_cuda_compatibility_path().

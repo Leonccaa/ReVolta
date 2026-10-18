@@ -94,6 +94,7 @@ def policy_module():
         "_sm70_nomtp_cudagraph_capture_sizes",
         "_sm70_max_cudagraph_capture_size",
         "_configure_sm70_dflash2_graph_cache",
+        "_should_disable_legacy_sm70_graph_profiler",
     }
     helpers = [
         node
@@ -178,6 +179,7 @@ def _config(**overrides: object) -> SimpleNamespace:
         kernel_config=SimpleNamespace(ir_op_priority=SimpleNamespace()),
         compilation_config=SimpleNamespace(**compilation),
         use_v2_model_runner=False,
+        is_speculative_draft=False,
     )
 
 

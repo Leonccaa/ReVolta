@@ -61,7 +61,7 @@ def _spec():
     )
 
 
-def _build(root):
+def _build(root, **fs_options):
     from vllm.v1.kv_offload.tiering.spec import TieringOffloadingSpec
 
     spec = object.__new__(TieringOffloadingSpec)
@@ -80,7 +80,13 @@ def _build(root):
     spec.extra_config = {}
     spec.persistent_layout = {"version": "test-grouped-row-v1"}
     spec.secondary_tier_configs = [
-        {"type": "fs", "root_dir": str(root), "n_read_threads": 1, "n_write_threads": 1}
+        {
+            "type": "fs",
+            "root_dir": str(root),
+            "n_read_threads": 1,
+            "n_write_threads": 1,
+            **fs_options,
+        }
     ]
     spec._manager = None
     return spec.get_manager()
@@ -414,3 +420,95 @@ def test_scheduler_unlinks_region_created_by_worker():
     finally:
         worker.cleanup()
         scheduler.cleanup()
+
+
+def test_tp4_dcp2_demoted_state_survives_cpu_eviction(tmp_path, monkeypatch):
+    """All four owner slices, including replicated state bytes, reload exactly."""
+    import sys
+
+    module = sys.modules[__name__]
+    original_spec = _spec
+    monkeypatch.setattr(module, "WORLD_SIZE", 4)
+
+    def dcp_spec():
+        spec = original_spec()
+        spec.vllm_config.parallel_config.decode_context_parallel_size = 2
+        return spec
+
+    monkeypatch.setattr(module, "_spec", dcp_spec)
+    manager = _build(tmp_path)
+    try:
+        keys = [_key(g) for g in GROUP_PAGES]
+        output = manager.prepare_store(keys, CTX)
+        _write_rows(manager, output, {g: _payload(g) for g in GROUP_PAGES})
+        filler = manager.prepare_store([_key(g, 2) for g in GROUP_PAGES], CTX)
+        _write_rows(manager, filler, {g: _payload(g) for g in GROUP_PAGES})
+        # demote_superseded_states routes here: it changes CPU priority only.
+        manager.demote(keys, CTX)
+        pressure = manager.prepare_store([_key(g, 3) for g in GROUP_PAGES], CTX)
+        assert set(pressure.evicted_keys) == set(keys)
+        _write_rows(manager, pressure, {g: _payload(g) for g in GROUP_PAGES})
+        assert all(manager.lookup(k, CTX) is None for k in keys)
+        _settle(manager)
+        assert all(manager.lookup(k, CTX) is True for k in keys)
+        loaded = manager.prepare_load(keys, CTX)
+        for k, bid in zip(keys, loaded.block_ids):
+            group = int.from_bytes(k[-4:], "big")
+            primary = manager.managers[group].primary_tier
+            with primary.get_kv_memoryview().cast("B") as view:
+                size = len(_payload(group))
+                assert bytes(view[int(bid) * size : (int(bid) + 1) * size]) == _payload(
+                    group
+                )
+            fields = manager.managers[group].secondary_tiers[0].file_mapper.fields
+            assert fields["tp_size"] == 4 and fields["dcp_size"] == 2
+        manager.complete_load(keys, CTX)
+    finally:
+        manager.shutdown()
+
+
+def test_secondary_enospc_keeps_cpu_copy_and_releases_pins(tmp_path, monkeypatch):
+    import errno
+
+    import vllm.v1.kv_offload.tiering.fs.io as fs_io
+
+    def full(*args):
+        raise OSError(errno.ENOSPC, "injected disk full")
+
+    monkeypatch.setattr(fs_io.os, "write", full)
+    manager = _build(tmp_path)
+    try:
+        keys = [_key(g) for g in GROUP_PAGES]
+        output = manager.prepare_store(keys, CTX)
+        _write_rows(manager, output, {g: _payload(g) for g in GROUP_PAGES})
+        assert all(manager.lookup(k, CTX) is True for k in keys)
+        # Two rounds must remain evictable despite every secondary write failing.
+        for number in (2, 3, 4):
+            output = manager.prepare_store([_key(g, number) for g in GROUP_PAGES], CTX)
+            assert output is not None
+            _write_rows(manager, output, {g: _payload(g) for g in GROUP_PAGES})
+        assert all(manager.lookup(k, CTX) is False for k in keys)
+    finally:
+        manager.shutdown()
+
+
+def test_fs_budget_applies_across_group_managers(tmp_path):
+    pytest.importorskip("vllm.v1.kv_offload.tiering.fs.cache")
+    budget = sum(GROUP_PAGES.values()) * WORLD_SIZE
+    manager = _build(tmp_path, max_size_bytes=budget)
+    try:
+        for number in (1, 2, 3):
+            keys = [_key(g, number) for g in GROUP_PAGES]
+            output = manager.prepare_store(keys, CTX)
+            _write_rows(manager, output, {g: _payload(g) for g in GROUP_PAGES})
+            assert all(manager.lookup(k, CTX) is True for k in keys)
+            files = list(tmp_path.rglob("*.bin"))
+            assert 0 < sum(p.stat().st_size for p in files) <= budget
+        # Group count must not multiply the configured disk capacity.
+        children = list(manager.managers.values())
+        assert (
+            children[0].secondary_tiers[0]._cache
+            is children[1].secondary_tiers[0]._cache
+        )
+    finally:
+        manager.shutdown()

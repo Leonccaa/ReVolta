@@ -8,8 +8,11 @@ The tier manager writes KV cache blocks to disk and reads them back, verifying
 data integrity throughout the process.
 """
 
+import errno
+import mmap
 import os
 import time
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -98,7 +101,10 @@ def drain(tier: FileSystemTierManager, max_rounds: int = 40) -> list:
 
 @pytest.fixture
 def fs_tier(tmp_path):
-    tensor = torch.zeros((4, _BLOCK_ELEMENTS), dtype=_DTYPE)
+    # O_DIRECT requires aligned addresses. Match the production mmap CPU pool;
+    # torch's ordinary CPU allocator only promises 64-byte alignment.
+    backing = mmap.mmap(-1, 4 * _BLOCK_ELEMENTS * 4)
+    tensor = torch.frombuffer(backing, dtype=_DTYPE).reshape(4, _BLOCK_ELEMENTS)
     mock_view = memoryview(tensor.numpy())
     tier = FileSystemTierManager(
         offloading_spec=_MOCK_OFFLOADING_SPEC,
@@ -255,3 +261,56 @@ def test_store_load_data_integrity(fs_tier):
         assert torch.allclose(tensor[bid], expected[i]), (
             f"Block {bid} data mismatch after store+load"
         )
+
+
+@pytest.mark.parametrize("size_delta", (-2 * 1024 * 1024, -4096, 4096))
+def test_wrong_sized_page_rejected_before_copy_and_replaced(fs_tier, size_delta):
+    """Backport the page-extent regression from 01d241fd90 (#1170)."""
+    tier, tensor = fs_tier
+    tensor[0].fill_(13)
+    tier.submit_store(make_job(1, [key(1)], [0]))
+    results = drain(tier)
+    assert len(results) == 1 and results[0].success
+    path = tier.file_mapper.get_file_name(key(1))
+    with open(path, "r+b") as page:
+        page.truncate(_BLOCK_ELEMENTS * tensor.element_size() + size_delta)
+    tensor[1].fill_(-17)
+    tier.submit_load(make_job(2, [key(1)], [1], is_promotion=True))
+    results = drain(tier)
+    assert len(results) == 1 and not results[0].success
+    assert torch.all(tensor[1] == -17)
+    assert tier.lookup(key(1), _CTX) is False
+    tier.submit_store(make_job(3, [key(1)], [0]))
+    results = drain(tier)
+    assert len(results) == 1 and results[0].success
+    tier.submit_load(make_job(4, [key(1)], [1], is_promotion=True))
+    results = drain(tier)
+    assert len(results) == 1 and results[0].success
+    assert torch.equal(tensor[0], tensor[1])
+
+
+def test_disk_full_cleans_temporary_and_allows_retry(fs_tier, monkeypatch):
+    import vllm.v1.kv_offload.tiering.fs.io as fs_io
+
+    tier, tensor = fs_tier
+    tensor[0].fill_(23)
+    real_write = fs_io.os.write
+
+    def full_disk(*args):
+        raise OSError(errno.ENOSPC, "injected disk full")
+
+    monkeypatch.setattr(fs_io.os, "write", full_disk)
+    tier.submit_store(make_job(1, [key(1)], [0]))
+    results = drain(tier)
+    assert len(results) == 1 and not results[0].success
+    assert not list(Path(tier.file_mapper.base_path).parent.rglob("*.tmp"))
+    assert tier.lookup(key(1), _CTX) is False
+    monkeypatch.setattr(fs_io.os, "write", real_write)
+    tier.submit_store(make_job(2, [key(1)], [0]))
+    results = drain(tier)
+    assert len(results) == 1 and results[0].success
+    tensor[1].zero_()
+    tier.submit_load(make_job(3, [key(1)], [1], is_promotion=True))
+    results = drain(tier)
+    assert len(results) == 1 and results[0].success
+    assert torch.equal(tensor[0], tensor[1])

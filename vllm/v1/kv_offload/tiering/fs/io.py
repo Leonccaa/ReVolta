@@ -85,6 +85,13 @@ def load_block(
     view_slice = view.cast("B")[offset : offset + block_size]
     try:
         fd = os.open(source_path, os.O_RDONLY | O_DIRECT)
+        # One file is one complete page. Reject stale layouts before touching
+        # the destination, including files larger than the expected page.
+        file_size = os.fstat(fd).st_size
+        if file_size != block_size:
+            raise OSError(
+                f"Invalid block size: expected {block_size} bytes, found {file_size}"
+            )
         bytes_read = os.readv(fd, [view_slice])
         if bytes_read < block_size:
             raise OSError(f"Short read: expected {block_size} bytes, read {bytes_read}")

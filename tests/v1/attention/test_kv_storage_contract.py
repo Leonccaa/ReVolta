@@ -595,3 +595,11 @@ def test_int8_v1_kernel_geometry_is_part_of_persistent_identity():
         "region_bytes": 8320,
         "member_stride": 8320,
     }
+
+
+def test_legacy_inline_int8_keeps_its_original_transfer_span():
+    # Inline scale bytes are not physical padding. Preserve the old canonical
+    # ref policy for int8_per_token_head instead of redefining that format.
+    carrier = torch.empty(153, 2, 16, 1, 260, dtype=torch.int8)
+    owner = KVPhysicalPage(424320)
+    assert owner.transfer_size(carrier, 3, 417792, planar=False) == 417792

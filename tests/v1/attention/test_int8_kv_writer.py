@@ -37,9 +37,17 @@ def make_cache(device, heads=1, member=1):
 
 
 def write(k, v, view, slots):
-    ignored = torch.tensor(float("nan"), device=k.device)
+    assert view.key_scale is not None and view.value_scale is not None
     ops.reshape_and_cache_flash(
-        k, v, view.key, view.value, slots, "int8", ignored, ignored, **view.scale_kwargs
+        k,
+        v,
+        view.key,
+        view.value,
+        slots,
+        "int8",
+        view.key_scale,
+        view.value_scale,
+        **view.scale_kwargs,
     )
 
 

@@ -116,13 +116,20 @@ class KVPhysicalPage:
         )
 
     def transfer_size(
-        self, tensor: torch.Tensor, num_blocks: int, real_bytes: int, *, planar: bool
+        self,
+        tensor: torch.Tensor,
+        num_blocks: int,
+        real_bytes: int,
+        *,
+        planar: bool,
+        padded: bool = False,
     ) -> int:
         # Uniformly subdivided padding is inside a scheduler page. A contiguous
         # real_bytes prefix would truncate the last payload/scale, including a
         # dense member in a mixed INT8 plan. Legacy tail padding stays unchanged.
         interior_padding = (
-            self.member_page_bytes > real_bytes
+            padded
+            and self.member_page_bytes > real_bytes
             and tensor.ndim == 5
             and tensor.shape[1] == 2
             and tensor.shape[0] > num_blocks

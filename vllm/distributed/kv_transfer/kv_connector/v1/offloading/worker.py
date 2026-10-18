@@ -107,6 +107,7 @@ class OffloadingConnectorWorker:
                         planar=(
                             layer_kv_cache_spec.kv_quant_mode == KVQuantMode.INT8_PLANAR
                         ),
+                        padded=layer_kv_cache_spec.page_size_padded is not None,
                     )
 
                 elif isinstance(layer_kv_cache_spec, MambaSpec):

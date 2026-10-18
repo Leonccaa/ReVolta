@@ -120,7 +120,6 @@ from vllm.utils.network_utils import get_ip
 from vllm.utils.torch_utils import resolve_kv_cache_dtype_string
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.sample.logits_processor import LogitsProcessor
-from vllm.version import __version__ as VLLM_VERSION
 
 if TYPE_CHECKING:
     from vllm.config.quantization import QuantizationConfigArgs
@@ -288,8 +287,7 @@ def _maybe_add_docs_url(cls: Any) -> str:
     """Generate API docs URL for a vllm config class."""
     if not cls.__module__.startswith("vllm.config"):
         return ""
-    version = f"v{VLLM_VERSION}" if "dev" not in VLLM_VERSION else "latest"
-    return f"\n\nAPI docs: https://docs.vllm.ai/en/{version}/api/vllm/config/#vllm.config.{cls.__name__}"
+    return "\n\nAPI docs: https://github.com/Leonccaa/ReVolta#readme"
 
 
 def _expand_json_human_readable_numbers(val: str) -> str:

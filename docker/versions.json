@@ -62,7 +62,7 @@
       "default": "0"
     },
     "VLLM_MAX_SIZE_MB": {
-      "default": "500"
+      "default": "95"
     },
     "RUN_WHEEL_CHECK": {
       "default": "true"

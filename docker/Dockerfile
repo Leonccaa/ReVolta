@@ -536,12 +536,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
         python3 use_existing_torch.py --prefix; \
     fi
 
-# Build the bundled SM70 FlashAttention wheel alongside vLLM. FLASH_ATTN_V100
-# is an external Python/CUDA package, so the runtime image must install it
-# explicitly instead of relying on the vLLM wheel to carry the extension.
-RUN --mount=type=cache,target=/opt/uv/cache \
-    cd flash-attention-v100 && \
-    python3 setup.py bdist_wheel --dist-dir=/workspace/flash-attn-v100-dist
+# Flash-V100 and FlashQLA are already bundled in the native wheel by setup.py.
 
 # Build the vLLM wheel
 RUN --mount=type=cache,target=/opt/uv/cache \
@@ -555,13 +550,20 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     fi && \
     python3 setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38
 
+# Keep an exact unstripped copy for same-build section verification. Runtime
+# images install only dist/; separate debug symbols are exportable from build.
+RUN mkdir -p /workspace/unstripped /workspace/debug && \
+    cp dist/revolta-*.whl /workspace/unstripped/ && \
+    python3 tools/wheel_debug.py strip dist/revolta-*.whl \
+        --output-dir /workspace/debug
+
 # Copy extension wheels from extensions-build stage for later use
 COPY --from=extensions-build /tmp/ep_kernels_workspace/dist /tmp/ep_kernels_workspace/dist
 
 # Check the size of the wheel if RUN_WHEEL_CHECK is true
 COPY .buildkite/check-wheel-size.py check-wheel-size.py
 # sync the default value with .buildkite/check-wheel-size.py
-ARG VLLM_MAX_SIZE_MB=500
+ARG VLLM_MAX_SIZE_MB=95
 ENV VLLM_MAX_SIZE_MB=$VLLM_MAX_SIZE_MB
 ARG RUN_WHEEL_CHECK=true
 RUN if [ "$RUN_WHEEL_CHECK" = "true" ]; then \
@@ -835,18 +837,17 @@ ARG PYTORCH_NIGHTLY
 # Check whether to install torch nightly instead of release for this build.
 COPY --from=base /workspace/torch_lib_versions.txt torch_lib_versions.txt
 RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist \
-    --mount=type=bind,from=build,src=/workspace/flash-attn-v100-dist,target=/vllm-workspace/flash-attn-v100-dist \
     --mount=type=cache,target=/opt/uv/cache \
     if [ "${PYTORCH_NIGHTLY}" = "1" ]; then \
         echo "Installing torch nightly..." \
         && uv pip install --system $(cat torch_lib_versions.txt | xargs) --pre \
         --index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
         && echo "Installing vLLM..." \
-        && uv pip install --system flash-attn-v100-dist/*.whl dist/*.whl --verbose \
+        && uv pip install --system dist/revolta-*.whl --verbose \
         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/nightly/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
     else \
         echo "Installing vLLM..." \
-        && uv pip install --system flash-attn-v100-dist/*.whl dist/*.whl --verbose \
+        && uv pip install --system dist/revolta-*.whl --verbose \
         --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
     fi
 
@@ -860,8 +861,10 @@ ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 # Install EP kernels wheels (DeepEP) that have been built in the `build` stage
 RUN --mount=type=bind,from=build,src=/tmp/ep_kernels_workspace/dist,target=/vllm-workspace/ep_kernels/dist \
     --mount=type=cache,target=/opt/uv/cache \
-    uv pip install --system ep_kernels/dist/*.whl --verbose \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
+    if ls ep_kernels/dist/*.whl >/dev/null 2>&1; then \
+        uv pip install --system ep_kernels/dist/*.whl --verbose \
+            --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+    fi
 
 # Download FlashInfer precompiled cubins AFTER all pip installs are done.
 # This must run after the vLLM wheel and EP kernels installs above, because

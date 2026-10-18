@@ -12,6 +12,7 @@ cmake_minimum_required(VERSION 3.26)
 # cmake --build . --target _C
 # cmake --install . --component _C
 project(vllm_extensions LANGUAGES CXX)
+option(VLLM_BUILD_GGUF "Build the unsupported GGUF extension" OFF)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -827,7 +828,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" AND SM70_TURBOMIND_ARCHS)
 endif()
 
 if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
-  if(VLLM_GPU_LANG STREQUAL "CUDA")
+  if(VLLM_GPU_LANG STREQUAL "CUDA" AND VLLM_BUILD_GGUF)
     include(csrc/quantization/gguf_upstream/CMakeLists.txt)
   endif()
   #

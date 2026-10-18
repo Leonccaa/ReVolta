@@ -14,6 +14,8 @@ import torch
 
 from vllm.v1.attention.kv_codecs import KVCodec
 
+INT8_KERNEL_TOKENS = 16
+
 
 def align_up(size: int, alignment: int = 16) -> int:
     if size < 0 or alignment <= 0:
@@ -213,8 +215,11 @@ def bind_planar_kv_cache(
     member_index: int = 0,
     member_count: int = 1,
 ) -> torch.Tensor:
-    if scheduler_block_size % kernel_block_size or kernel_block_size % 16:
-        raise ValueError("Planar kernel pages must divide scheduler blocks in 16s")
+    if (
+        kernel_block_size != INT8_KERNEL_TOKENS
+        or scheduler_block_size % kernel_block_size
+    ):
+        raise ValueError("INT8 v1 uses 16-token kernel pages dividing scheduler blocks")
     layout = KVPageLayout(kernel_block_size, num_heads, head_size, head_size)
     owner = KVPhysicalPage(page_size_bytes, member_count, member_index)
     subdivisions = scheduler_block_size // kernel_block_size
@@ -311,6 +316,8 @@ class KVCacheView:
             )
 
         if codec.layout == "planar_scales":
+            if b != INT8_KERNEL_TOKENS:
+                raise ValueError("INT8 v1 requires a 16-token kernel-page carrier")
             layout = KVPageLayout(b, h, head_size, head_size, item)
             if (
                 base % 16
@@ -390,6 +397,26 @@ def kv_storage_metadata(kv_cache_config, configured_dtype: str) -> dict:
                 entry["heads"] = spec.num_kv_heads
                 entry["head_size"] = spec.head_size
                 entry["head_size_v"] = getattr(spec, "head_size_v", spec.head_size)
+                if codec is not None and codec.layout == "planar_scales":
+                    layout = KVPageLayout(
+                        INT8_KERNEL_TOKENS,
+                        spec.num_kv_heads,
+                        spec.head_size,
+                        entry["head_size_v"],
+                    )
+                    entry["kernel_page"] = {
+                        "tokens": INT8_KERNEL_TOKENS,
+                        "alignment": 16,
+                        "region_offsets": [
+                            0,
+                            layout.value_offset,
+                            layout.key_scale_offset,
+                            layout.value_scale_offset,
+                        ],
+                        "region_bytes": layout.page_size_bytes,
+                        "member_stride": spec.page_size_bytes
+                        // (spec.storage_block_size // INT8_KERNEL_TOKENS),
+                    }
             else:
                 entry["shapes"] = list(spec.shapes)
                 entry["dtypes"] = [str(dtype) for dtype in spec.dtypes]
@@ -406,6 +433,20 @@ def kv_storage_metadata(kv_cache_config, configured_dtype: str) -> dict:
             for t in kv_cache_config.kv_cache_tensors
         ],
     }
+
+
+def has_planar_kv_cache(kv_cache_config) -> bool:
+    """Target and draft may choose their storage encoding independently."""
+    from vllm.v1.kv_cache_interface import AttentionSpec, KVQuantMode
+
+    return any(
+        isinstance(spec, AttentionSpec)
+        and spec.kv_quant_mode == KVQuantMode.INT8_PLANAR
+        for group in kv_cache_config.kv_cache_groups
+        for spec in getattr(
+            group.kv_cache_spec, "kv_cache_specs", {"owner": group.kv_cache_spec}
+        ).values()
+    )
 
 
 def split_dense_kv_cache(

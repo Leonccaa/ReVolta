@@ -519,3 +519,79 @@ def test_legacy_triton_writer_does_not_reinterpret_planar_int8_as_fp8():
     assert not _is_supported_kv_cache_dtype("int8")
     assert _is_supported_kv_cache_dtype("auto")
     assert _is_supported_kv_cache_dtype("fp8_e4m3")
+
+
+@pytest.mark.parametrize("configured_dtype", ["fp8_e4m3", "int8"])
+def test_int8_draft_requires_ssd_framing_even_with_a_legacy_target(
+    monkeypatch, configured_dtype
+):
+    from vllm.v1.attention.kv_cache_view import has_planar_kv_cache
+    from vllm.v1.kv_cache_interface import (
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        KVCacheTensor,
+    )
+    from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
+    from vllm.v1.kv_offload.tiering.spec import TieringOffloadingSpec
+
+    # Test the tiering policy without constructing a shared-memory/IO backend.
+    def parent_init(self, *args):
+        self.extra_config = {"secondary_tiers": [{"type": "fs"}]}
+        self.partition_by_group = False
+
+    monkeypatch.setattr(CPUOffloadingSpec, "__init__", parent_init)
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(cache_dtype=configured_dtype),
+        compute_hash=lambda: "frozen-config",
+    )
+    cache = KVCacheConfig(
+        num_blocks=3,
+        kv_cache_groups=[
+            KVCacheGroupSpec(["draft"], replace(spec(), dcp_sharded=False))
+        ],
+        kv_cache_tensors=[KVCacheTensor(size=3 * 424320, shared_by=["draft"])],
+    )
+    assert has_planar_kv_cache(cache)
+    with pytest.raises(ValueError, match="aligned FS framing"):
+        TieringOffloadingSpec(config, cache)
+    # Ordinary FP8-only tiering keeps its old namespace policy.
+    cache.kv_cache_groups = [
+        KVCacheGroupSpec(["target"], spec(torch.uint8, KVQuantMode.FP8_PER_TENSOR))
+    ]
+    assert not has_planar_kv_cache(cache)
+    assert TieringOffloadingSpec(config, cache).persistent_layout is None
+
+
+def test_int8_v1_kernel_geometry_is_part_of_persistent_identity():
+    from vllm.v1.attention.kv_cache_view import kv_storage_metadata
+    from vllm.v1.kv_cache_interface import (
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        KVCacheTensor,
+    )
+
+    raw = torch.empty(3 * 424320, dtype=torch.int8)
+    # 48 divides 816, but differs from v1's frozen 16-token file layout.
+    with pytest.raises(ValueError, match="16-token"):
+        bind_planar_kv_cache(
+            raw,
+            num_blocks=3,
+            scheduler_block_size=816,
+            kernel_block_size=48,
+            num_heads=1,
+            head_size=256,
+            page_size_bytes=424320,
+        )
+    config = KVCacheConfig(
+        num_blocks=3,
+        kv_cache_groups=[KVCacheGroupSpec(["a"], spec())],
+        kv_cache_tensors=[KVCacheTensor(size=raw.numel(), shared_by=["a"])],
+    )
+    kernel = kv_storage_metadata(config, "int8")["owners"]["a"]["kernel_page"]
+    assert kernel == {
+        "tokens": 16,
+        "alignment": 16,
+        "region_offsets": [0, 4096, 8192, 8256],
+        "region_bytes": 8320,
+        "member_stride": 8320,
+    }

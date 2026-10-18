@@ -9,6 +9,10 @@
 namespace py = pybind11;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("int8_page4_abi_version", &flash_attention_int8_page4_abi_version);
+  m.def("decode_int8_page4_fwd", &flash_attention_decode_int8_page4);
+  m.def("grouped_sparse_int8_page4_fwd",
+        &flash_attention_grouped_sparse_int8_page4);
   m.doc() = "FlashAttention-2 implementation optimized for Volta";
   m.attr("paged_prefill_bm32_page_alignment") = 16;
   m.def("fwd", &flash_attention_forward,

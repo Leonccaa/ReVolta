@@ -187,6 +187,7 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
         "bfloat16",
         "fp8",
         "fp8_e4m3",
+        "int8",
     ]
 
     @staticmethod
@@ -234,10 +235,15 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             "bfloat16",
             "fp8",
             "fp8_e4m3",
+            "int8",
         ):
             raise NotImplementedError(
                 "Qwen4Exp QSA requires FP16/BF16 or E4M3 main KV cache"
             )
+        if self.kv_cache_dtype == "int8":
+            from .ops.qsa_int8 import require_int8_abi
+
+            require_int8_abi()
         self.supports_quant_query_input = False
 
     def forward_qsa(
@@ -292,6 +298,9 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         if self.kv_cache_dtype in ("fp8", "fp8_e4m3"):
             if key_cache.dtype != torch.uint8 or value_cache.dtype != torch.uint8:
                 raise RuntimeError("Qwen4Exp QSA E4M3 cache must use uint8 storage")
+        elif self.kv_cache_dtype == "int8":
+            if key_cache.dtype != torch.int8 or value_cache.dtype != torch.int8:
+                raise RuntimeError("Qwen4Exp QSA INT8 cache requires signed payloads")
         elif key_cache.dtype != query.dtype or value_cache.dtype != query.dtype:
             raise RuntimeError("Qwen4Exp QSA FP16/BF16 cache must match query dtype")
 
@@ -310,6 +319,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 token_to_req,
                 output[:num_tokens],
                 output_gate[:num_tokens],
+                **view.scale_kwargs,
             )
             return output
 
@@ -332,6 +342,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             k_scale=layer._k_scale_float,
             v_scale=layer._v_scale_float,
             **qsa_metadata,
+            **view.scale_kwargs,
         )
         return output
 
@@ -346,6 +357,8 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         token_to_req: torch.Tensor,
         output: torch.Tensor,
         output_gate: torch.Tensor,
+        k_scale_cache: torch.Tensor | None = None,
+        v_scale_cache: torch.Tensor | None = None,
     ) -> None:
         from vllm.distributed import get_dcp_group
 
@@ -393,6 +406,12 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             layer.cp_kv_cache_interleave_size,
             local_indices.shape[1],
         )
+        scale_kwargs = {}
+        if self.kv_cache_dtype == "int8":
+            scale_kwargs = {
+                "k_scale_cache": k_scale_cache,
+                "v_scale_cache": v_scale_cache,
+            }
         # Prefill-sized batches use the grouped page4 route for their leading
         # multiple of eight rows; decode batches and the rest stay on Triton.
         grouped_rows = qsa_dcp_sparse_paged_attention_sm70_grouped_page4(
@@ -407,6 +426,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             self.kv_cache_dtype,
             layer._k_scale_float,
             layer._v_scale_float,
+            **scale_kwargs,
         )
         if grouped_rows < query.shape[0]:
             qsa_sparse_paged_attention(
@@ -421,6 +441,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 k_scale=layer._k_scale_float,
                 v_scale=layer._v_scale_float,
                 lse=partial_lse[grouped_rows:],
+                **scale_kwargs,
             )
         merged = cast(
             torch.Tensor,
@@ -444,6 +465,13 @@ def _verify_e4m3_kv_requirements(
     cache_config: CacheConfig,
 ) -> None:
     """Admit calibrated E4M3 from kernel capabilities, independent of TP/MTP."""
+    if cache_config.cache_dtype == "int8":
+        from .ops.qsa_int8 import require_int8_abi
+
+        if model_config.dtype != torch.float16:
+            raise NotImplementedError("QSA INT8 requires FP16 activations on SM70")
+        require_int8_abi()
+        return
     if cache_config.cache_dtype not in ("fp8", "fp8_e4m3"):
         return
     from .ops.qsa import qsa_e4m3_capability_reason
@@ -488,6 +516,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             "bfloat16",
             "fp8",
             "fp8_e4m3",
+            "int8",
         ):
             raise NotImplementedError(
                 "Qwen4Exp QSA requires FP16/BF16 or E4M3 main KV cache"
@@ -609,7 +638,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, model_config
         )
-        if self.kv_cache_dtype not in ("fp8", "fp8_e4m3") and (
+        if self.kv_cache_dtype not in ("fp8", "fp8_e4m3", "int8") and (
             self.kv_cache_torch_dtype != model_config.dtype
         ):
             raise NotImplementedError(

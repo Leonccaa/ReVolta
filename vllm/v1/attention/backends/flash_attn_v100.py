@@ -5008,6 +5008,10 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         )
         super().__init__(*args, **kwargs)
         self.kv_cache_dtype = _normalize_flash_v100_kv_cache_dtype(self.kv_cache_dtype)
+        if self.kv_cache_dtype == "int8":
+            from vllm.models.qwen4_exp.nvidia.ops.qsa_int8 import require_int8_abi
+
+            require_int8_abi()
         _log_kv_dtype_contract(self.kv_cache_dtype)
         (
             self.flash_attn_func,
@@ -6376,6 +6380,13 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         )
         return max_query_len <= self.smallq_decode_max_query_len and model_len_supported
 
+    def do_kv_cache_update(self, layer, key, value, kv_cache, slot_mapping):
+        if self.kv_cache_dtype == "int8":
+            from vllm.v1.attention.ops.int8_dense import write_int8_dense
+
+            return write_int8_dense(self, layer, key, value, kv_cache, slot_mapping)
+        return super().do_kv_cache_update(layer, key, value, kv_cache, slot_mapping)
+
     def forward(
         self,
         layer: torch.nn.Module,
@@ -6402,6 +6413,19 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         global _logged_prefill_triton_safe
         global _warned_decode_fallback
         global _warned_decode_strict_fallback, _warned_feature_fallback
+
+        if self.kv_cache_dtype == "int8":
+            from vllm.v1.attention.ops.int8_dense import forward_int8_dense
+
+            return forward_int8_dense(
+                self,
+                query,
+                kv_cache,
+                attn_metadata,
+                output,
+                output_scale,
+                output_block_scale,
+            )
 
         if attn_metadata is None:
             assert output is not None
@@ -9727,6 +9751,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
 class FlashAttnV100Backend(TritonAttentionBackend):
     """Flash Attention V100 Backend."""
+
+    supported_kv_cache_dtypes = [
+        *TritonAttentionBackend.supported_kv_cache_dtypes,
+        "int8",
+    ]
 
     # Keep vLLM unified KV cache update path.
     forward_includes_kv_cache_update: bool = False

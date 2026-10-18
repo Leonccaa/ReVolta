@@ -140,6 +140,18 @@ def _qsa_grouped_page4_supported(
     flash_attn_v100_cuda,
     kv_cache_dtype: str,
 ) -> bool:
+    if kv_cache_dtype == "int8":
+        capability = getattr(flash_attn_v100_cuda, "int8_page4_abi_version", None)
+        return (
+            callable(capability)
+            and capability() == 1
+            and callable(
+                getattr(flash_attn_v100_cuda, "grouped_sparse_int8_page4_fwd", None)
+            )
+            and callable(
+                getattr(flash_attn_v100_cuda, "grouped_sparse_page4_plan_fwd", None)
+            )
+        )
     forward = getattr(flash_attn_v100_cuda, "grouped_sparse_page4_fwd", None)
     planner = getattr(flash_attn_v100_cuda, "grouped_sparse_page4_plan_fwd", None)
     if not callable(forward) or not callable(planner):
@@ -2124,6 +2136,8 @@ def qsa_dcp_sparse_paged_attention_sm70_grouped_page4(
     kv_cache_dtype: str,
     k_scale: float,
     v_scale: float,
+    k_scale_cache: torch.Tensor | None = None,
+    v_scale_cache: torch.Tensor | None = None,
 ) -> int:
     """Run the leading rows of a QSA DCP batch through the grouped page4 route.
 
@@ -2139,6 +2153,22 @@ def qsa_dcp_sparse_paged_attention_sm70_grouped_page4(
     multiple of eight, or 0 when the route does not apply. The caller runs the
     remaining rows through ``qsa_sparse_paged_attention``.
     """
+    if kv_cache_dtype == "int8":
+        from .qsa_int8 import dcp_grouped
+
+        return dcp_grouped(
+            q,
+            k_cache,
+            v_cache,
+            local_indices,
+            block_table,
+            token_to_req,
+            out,
+            lse,
+            k_scale_cache,
+            v_scale_cache,
+        )
+
     heads = 6
     group = _SM70_QSA_GROUPED_PAGE4_QUERIES
     rows = q.shape[0] // group * group
@@ -2465,12 +2495,33 @@ def qsa_sparse_paged_attention(
     k_scale: float = 1.0,
     v_scale: float = 1.0,
     lse: torch.Tensor | None = None,
+    k_scale_cache: torch.Tensor | None = None,
+    v_scale_cache: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run sparse GQA, optionally returning base-2 LSE for a cross-rank merge.
 
     LSE callers may supply FP32 output to avoid rounding each rank's partial
     result. Apply output gating after the cross-rank merge, not per rank.
     """
+
+    if kv_cache_dtype == "int8":
+        from .qsa_int8 import sparse_attention
+
+        return sparse_attention(
+            q,
+            k_cache,
+            v_cache,
+            logical_indices,
+            block_table,
+            token_to_req,
+            out,
+            output_gate,
+            query_positions,
+            sequence_lengths,
+            k_scale_cache,
+            v_scale_cache,
+            lse,
+        )
 
     if not q.is_cuda or not HAS_TRITON:
         raise RuntimeError("paged QSA sparse attention requires CUDA and Triton")

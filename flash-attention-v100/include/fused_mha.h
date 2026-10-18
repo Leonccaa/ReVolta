@@ -173,4 +173,15 @@ std::vector<at::Tensor> flash_attention_backward(
     const bool deterministic, std::optional<at::Generator> gen_,
     std::optional<at::Tensor>& rng_state);
 
+// INT8 v1 entry points have explicit scale planes and owner-page mapping.
+int64_t flash_attention_int8_page4_abi_version();
+at::Tensor flash_attention_decode_int8_page4(
+    const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&,
+    const at::Tensor&, const at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&,
+    const at::Tensor&, const at::Tensor&, const at::Tensor&, int64_t, double);
+at::Tensor flash_attention_grouped_sparse_int8_page4(
+    const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&,
+    const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&,
+    const at::Tensor&, const at::Tensor&, int64_t, double);
+
 #endif

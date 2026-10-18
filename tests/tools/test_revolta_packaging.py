@@ -127,6 +127,36 @@ assert not native_available()
     subprocess.run([sys.executable, "-c", code], check=True)
 
 
+def test_serve_help_without_gpu():
+    subprocess.run(
+        [sys.executable, "-m", "vllm.entrypoints.cli.main", "serve", "--help"],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        timeout=90,
+    )
+
+
+def test_cli_does_not_construct_excluded_runtime_config():
+    from dataclasses import dataclass, field
+
+    from vllm.engine.arg_utils import get_kwargs
+
+    def requires_hardware():
+        raise RuntimeError("runtime factory must not run while building CLI arguments")
+
+    @dataclass
+    class Example:
+        selected: int = 42
+        runtime: str = field(default_factory=requires_hardware)
+
+    kwargs = get_kwargs(Example, exclude_fields=("runtime",))
+    assert set(kwargs) == {"selected"}
+    assert kwargs["selected"]["default"] == 42
+    # Exclusions must be part of the cache key.
+    with pytest.raises(RuntimeError, match="runtime factory"):
+        get_kwargs(Example)
+
+
 def test_split_debug_preserves_sections_and_record(tmp_path):
     from wheel.wheelfile import WheelFile
 
@@ -172,7 +202,9 @@ def test_split_debug_preserves_sections_and_record(tmp_path):
         assert (result.getinfo("vllm/vllm-rs").external_attr >> 16) & 0o111
         result.extractall(tmp_path / "stripped")
     stripped = tmp_path / "stripped/vllm/example.so"
+    original_times = (library.stat().st_mtime_ns, stripped.stat().st_mtime_ns)
     module.verify(library, stripped)
+    assert (library.stat().st_mtime_ns, stripped.stat().st_mtime_ns) == original_times
     subprocess.run(["objcopy", "--remove-section", ".nv_fatbin", stripped], check=True)
     with pytest.raises(ValueError, match="Runtime sections changed"):
         module.verify(library, stripped)

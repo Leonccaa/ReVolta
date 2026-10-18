@@ -313,11 +313,15 @@ def _expand_json_human_readable_numbers(val: str) -> str:
 
 
 @functools.lru_cache(maxsize=30)
-def _compute_kwargs(cls: ConfigType) -> dict[str, dict[str, Any]]:
+def _compute_kwargs(
+    cls: ConfigType, exclude_fields: tuple[str, ...] = ()
+) -> dict[str, dict[str, Any]]:
     # Save time only getting attr docs if we're generating help text
     cls_docs = get_attr_docs(cls) if NEEDS_HELP else {}
     kwargs = {}
     for field in fields(cls):
+        if field.name in exclude_fields:
+            continue
         # Get the set of possible types for the field
         type_hints: set[TypeHint] = get_type_hints(field.type)
 
@@ -425,7 +429,9 @@ def _compute_kwargs(cls: ConfigType) -> dict[str, dict[str, Any]]:
     return kwargs
 
 
-def get_kwargs(cls: ConfigType) -> dict[str, dict[str, Any]]:
+def get_kwargs(
+    cls: ConfigType, exclude_fields: tuple[str, ...] = ()
+) -> dict[str, dict[str, Any]]:
     """Return argparse kwargs for the given Config dataclass.
 
     If `--help` or `mkdocs` are not present in the command line command, the
@@ -435,7 +441,7 @@ def get_kwargs(cls: ConfigType) -> dict[str, dict[str, Any]]:
     is returned so callers can mutate the dictionary without affecting the
     cached version.
     """
-    return copy.deepcopy(_compute_kwargs(cls))
+    return copy.deepcopy(_compute_kwargs(cls, exclude_fields))
 
 
 @dataclass
@@ -1513,7 +1519,10 @@ class EngineArgs:
         kernel_group.add_argument("--linear-backend", **linear_backend_kwargs)
 
         # vLLM arguments
-        vllm_kwargs = get_kwargs(VllmConfig)
+        # DeviceConfig is not exposed as a CLI argument. Its factory requires
+        # hardware detection, which must not run while constructing --help.
+        # create_engine_config still constructs the real device configuration.
+        vllm_kwargs = get_kwargs(VllmConfig, exclude_fields=("device_config",))
         vllm_group = parser.add_argument_group(
             title="VllmConfig",
             description=VllmConfig.__doc__,

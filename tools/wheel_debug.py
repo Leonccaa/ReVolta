@@ -31,7 +31,13 @@ def section_hashes(path: Path) -> dict[str, str | None]:
                 continue
             target = Path(temp) / section
             subprocess.run(
-                ["objcopy", "--dump-section", f"{section}={target}", str(path)],
+                [
+                    "objcopy",
+                    "--dump-section",
+                    f"{section}={target}",
+                    str(path),
+                    os.devnull,
+                ],
                 check=True,
                 capture_output=True,
             )

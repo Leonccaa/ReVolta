@@ -543,6 +543,7 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     --mount=type=bind,source=.git,target=.git \
     if [ -n "${SETUPTOOLS_SCM_PRETEND_VERSION}" ]; then \
         export SETUPTOOLS_SCM_PRETEND_VERSION; \
+        export VLLM_VERSION_OVERRIDE="${SETUPTOOLS_SCM_PRETEND_VERSION}"; \
     fi; \
     if [ "${vllm_target_device}" = "cuda" ]; then \
         export VLLM_USE_PRECOMPILED=1; \

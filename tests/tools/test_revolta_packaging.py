@@ -66,6 +66,11 @@ def test_distribution_name_and_command():
     assert project["scripts"]["vllm"] == "vllm.entrypoints.cli.main:main"
 
 
+def test_docker_explicit_release_version_is_exact():
+    source = (ROOT / "docker/Dockerfile").read_text()
+    assert 'export VLLM_VERSION_OVERRIDE="${SETUPTOOLS_SCM_PRETEND_VERSION}"' in source
+
+
 def test_metadata_prefers_revolta():
     from vllm import version
 

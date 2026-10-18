@@ -190,6 +190,7 @@ class NVFP4PinnedPLEEmbedding(VocabParallelEmbedding):
         self._host_view: torch.Tensor | None = None
         self._host_ptr = 0
         self._loaded_parts = set()
+        self._split_parts: int | None = None
 
     def materialize(self):
         if self.storage is None:
@@ -215,6 +216,12 @@ class NVFP4PinnedPLEEmbedding(VocabParallelEmbedding):
         from ..common.ple import copy_ple_embedding_shard_
 
         prefix = "ngram_embedding.shard_"
+        if self._split_parts is None:
+            self._split_parts = split_parts
+        elif split_parts != self._split_parts:
+            raise ValueError(
+                f"NVFP4 PLE shard count changed: {self._split_parts} -> {split_parts}"
+            )
         if name == "ngram_embedding.weight_scale_2":
             if tensor.numel() != 1 or not bool(
                 torch.isfinite(tensor).all() and (tensor > 0).all()
@@ -272,6 +279,12 @@ class NVFP4PinnedPLEEmbedding(VocabParallelEmbedding):
             )
 
     def prepare(self):
+        # A module's tensors can reach load_weights in several calls (one per
+        # contiguous run in the shard-file stream), so completeness is only
+        # known here, after every file has been read.
+        if self._split_parts is None:
+            raise ValueError("No NVFP4 PLE tensors were loaded")
+        self.check_loaded(self._split_parts)
         self.materialize()
         assert self.storage is not None
         if self._host_view is None:

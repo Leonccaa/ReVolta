@@ -66,6 +66,12 @@ def test_sharded_packed_rows_and_scale_loading(rank):
         layer._loaded_parts.remove("global")
         with pytest.raises(ValueError, match="Incomplete"):
             layer.check_loaded(3)
+        with pytest.raises(ValueError, match="Incomplete"):
+            layer.prepare()
+        with pytest.raises(ValueError, match="shard count changed"):
+            layer.load_checkpoint_tensor(
+                "ngram_embedding.weight_scale_2", torch.tensor(0.125), 4
+            )
 
 
 def test_gpu_gather_and_dequant_with_triton_interpreter(monkeypatch):
@@ -110,3 +116,65 @@ def test_process_offload_rejected_before_placeholder_can_skip_constructor():
         ple_layer.Qwen4ExpPLELayer(
             SimpleNamespace(ple_embedding_dtype="nvfp4"), SimpleNamespace()
         )
+
+
+def test_module_load_weights_accepts_tensors_split_across_calls():
+    # The model loader groups a streamed shard-file iterator by module prefix,
+    # so one PLE module sees several load_weights calls when its tensors sit in
+    # different files. Completeness is checked once, in prepare().
+    import vllm.model_executor.layers.vocab_parallel_embedding as embeddings
+    import vllm.model_executor.parameter as parameters
+    from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+    from vllm.models.qwen4_exp.nvidia import ple_layer
+
+    with (
+        patch.object(embeddings, "get_tensor_model_parallel_rank", return_value=1),
+        patch.object(
+            embeddings, "get_tensor_model_parallel_world_size", return_value=4
+        ),
+        patch.object(parameters, "get_tensor_model_parallel_rank", return_value=1),
+        patch.object(
+            parameters, "get_tensor_model_parallel_world_size", return_value=4
+        ),
+        patch.object(ple_layer, "_pin_host_tensor_exact"),
+        patch.object(ple, "get_accelerator_view_from_cpu_tensor", lambda t: t),
+        set_current_vllm_config(VllmConfig(device_config=DeviceConfig("cpu"))),
+    ):
+        module = ple_layer.Qwen4ExpNGramEmbedding.__new__(
+            ple_layer.Qwen4ExpNGramEmbedding
+        )
+        torch.nn.Module.__init__(module)
+        module.split_ngram_parts = 3
+        for name in (
+            "layer_multipliers",
+            "ngram_heads_offsets",
+            "ngram_heads_vocab_sizes",
+        ):
+            module.register_buffer(name, torch.zeros(1, dtype=torch.long))
+        module.ngram_embedding = ple.NVFP4PinnedPLEEmbedding(
+            32, 32, torch.float16, 4, "ple.split_calls"
+        )
+        weight = torch.arange(32 * 16, dtype=torch.int64).byte().reshape(32, 16)
+        scale = torch.full((32, 2), 56, dtype=torch.uint8).view(torch.float8_e4m3fn)
+
+        def shard(index):
+            lo, hi = index * 11, min((index + 1) * 11, 32)
+            return [
+                (f"ngram_embedding.shard_{index}.weight", weight[lo:hi]),
+                (f"ngram_embedding.shard_{index}.weight_scale", scale[lo:hi]),
+            ]
+
+        first = module.load_weights(shard(2))
+        assert first == {"ngram_embedding.weight"}
+        with pytest.raises(ValueError, match="Incomplete"):
+            module.ngram_embedding.prepare()
+        second = module.load_weights(
+            shard(0)
+            + shard(1)
+            + [("ngram_embedding.weight_scale_2", torch.tensor(0.25))]
+        )
+        assert second == {"ngram_embedding.weight", "ngram_embedding.weight_scale_2"}
+        module.ngram_embedding.prepare()
+        storage = module.ngram_embedding.storage
+        assert torch.equal(storage[:, :16], weight[8:16])
+        assert torch.equal(storage[:, 16:], scale[8:16].view(torch.uint8))

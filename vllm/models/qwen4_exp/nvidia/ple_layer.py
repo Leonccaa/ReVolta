@@ -1970,8 +1970,6 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 mapped_gib,
                 len(self._disk_mapped_paths),
             )
-        if nvfp4_embedding is not None:
-            nvfp4_embedding.check_loaded(self.split_ngram_parts)
         if regular_weights:
             loaded.update(AutoWeightsLoader(self).load_weights(regular_weights))
         return loaded

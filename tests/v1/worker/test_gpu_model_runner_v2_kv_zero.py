@@ -61,6 +61,9 @@ def test_v2_clears_new_cache_blocks_before_zero_token_return() -> None:
         return empty_output
 
     runner = mrv2.GPUModelRunner.__new__(mrv2.GPUModelRunner)
+    # execute_model only starts the mixed-prefill timer on CUDA.
+    runner.device = torch.device("cpu")
+    runner.update_pp_decode_requests = lambda: None
     runner.finish_requests = lambda _: events.append("finish")
     runner.free_states = lambda _: events.append("free")
     runner.add_requests = lambda _: events.append("add")
@@ -105,9 +108,16 @@ def test_v2_warms_qwen38_mtp_moe_prefill_and_decode_shapes(monkeypatch) -> None:
     speculator.device = torch.device("cuda")
     speculator.draft_model_config = draft_model_config
     speculator.vllm_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(tensor_parallel_size=4)
+        parallel_config=SimpleNamespace(tensor_parallel_size=4),
+        # MTP4 verifier graphs hold 5 rows per request; 7 and 16 are not
+        # decode shapes and must be skipped.
+        compilation_config=SimpleNamespace(
+            cudagraph_capture_sizes=[1, 5, 7, 10, 16, 20, 40]
+        ),
     )
     speculator.max_num_tokens = 8192
+    speculator.max_num_reqs = 8
+    speculator.num_speculative_steps = 4
 
     runner = mrv2.GPUModelRunner.__new__(mrv2.GPUModelRunner)
     runner._kv_block_zeroer = zeroer
@@ -131,7 +141,12 @@ def test_v2_warms_qwen38_mtp_moe_prefill_and_decode_shapes(monkeypatch) -> None:
         runner._warmup_sm70_aux_kernels()
 
     zeroer.warmup_kernel.assert_called_once_with()
+    # One M16 prefill, then one uniform decode per verifier request count
+    # (1, 2, 4 and 8 requests of 1 + 4 tokens).
     assert runner._dummy_run.call_args_list == [
         mock.call(16),
-        mock.call(1, uniform_decode=True),
+        mock.call(5, uniform_decode=True),
+        mock.call(10, uniform_decode=True),
+        mock.call(20, uniform_decode=True),
+        mock.call(40, uniform_decode=True),
     ]

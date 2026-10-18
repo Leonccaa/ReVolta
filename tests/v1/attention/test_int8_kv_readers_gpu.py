@@ -160,3 +160,41 @@ def test_masked_poison_and_empty_rows():
     )
     assert torch.isfinite(out).all()
     assert not out[-1].count_nonzero()
+
+
+def test_grouped_keeps_tiny_value_residual_in_fp32():
+    _, view, q, ids, table, req, pos, lens = fixture(8)
+    q.zero_()
+    view.key.zero_()
+    view.value.zero_()
+    view.value[0, 0].fill_(1)
+    view.value[0, 1].fill_(-1)
+    view.key_scale.fill_(1e-6)
+    view.value_scale.fill_(2.0**-19)
+    view.value_scale[0, 0] += 2.0**-32
+    table.copy_(
+        torch.arange(153, device="cuda", dtype=torch.int32)[None].expand_as(table)
+    )
+    req.zero_()
+    pos.fill_(1)
+    lens.fill_(2)
+    ids.fill_(-1)
+    ids[:, 0] = 0
+    ids[:, 1] = 1
+    out = torch.empty(q.shape, dtype=torch.float32, device="cuda")
+    lse = torch.empty(q.shape[:2], dtype=torch.float32, device="cuda")
+    reader.native_grouped(
+        q,
+        view.key,
+        view.value,
+        ids,
+        table,
+        req,
+        pos,
+        lens,
+        out,
+        view.key_scale,
+        view.value_scale,
+        lse,
+    )
+    torch.testing.assert_close(out, torch.full_like(out, 2.0**-33), atol=0, rtol=1e-5)

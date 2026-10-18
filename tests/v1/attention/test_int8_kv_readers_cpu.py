@@ -243,3 +243,33 @@ def test_nonfinite_scale_is_masked_or_propagated(visible):
         assert out.isnan().all() and lse.isnan().all()
     else:
         assert not out.count_nonzero() and lse.isneginf().all()
+
+
+def test_late_scale_preserves_tiny_fp32_value_residual():
+    _, _, view = cache()
+    view.key.zero_()
+    view.value.zero_()
+    view.value[0, 0].fill_(1)
+    view.value[0, 1].fill_(-1)
+    view.key_scale.fill_(1e-6)
+    view.value_scale.fill_(2.0**-19)
+    view.value_scale[0, 0] += 2.0**-32
+    query = torch.zeros(1, 6, 256, dtype=torch.float16)
+    ids = torch.full((1, 40), -1, dtype=torch.int32)
+    ids[0, :2] = torch.tensor([0, 1], dtype=torch.int32)
+    out = torch.empty(query.shape, dtype=torch.float32)
+    reader.triton_attention(
+        query,
+        view.key,
+        view.value,
+        ids,
+        torch.arange(153, dtype=torch.int32)[None],
+        torch.zeros(1, dtype=torch.int32),
+        out,
+        view.key_scale,
+        view.value_scale,
+        torch.empty(1, 6),
+    )
+    # Early Half KV or one Half P*sV both cancel this exact residual to zero.
+    expected = torch.full_like(out, 2.0**-33)
+    torch.testing.assert_close(out, expected, atol=0, rtol=1e-5)

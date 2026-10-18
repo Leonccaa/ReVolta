@@ -1,0 +1,69 @@
+name: Bug report
+description: Report a ReVolta problem with a reproducible configuration.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Issue support follows the roadmap W10 support table, reproduced in
+        [the support scope](../blob/HEAD/.github/SUPPORT.md).
+        Four V100s and Qwen3.8 Flash-Next are the release focus. NVLink is
+        unverified. Remove credentials and private information from logs.
+        Report vulnerabilities through GitHub private vulnerability reporting.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and reproduction
+      description: Include expected behavior, actual behavior and minimal steps.
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU model, count and memory per GPU
+      placeholder: 4 x NVIDIA V100 PCIe, 32 GB each
+    validations:
+      required: true
+  - type: dropdown
+    id: interconnect
+    attributes:
+      label: GPU interconnect
+      options:
+        - PCIe + PEX switch + P2P
+        - PCIe without P2P
+        - NVLink (unverified)
+        - Other (describe in reproduction)
+    validations:
+      required: true
+  - type: input
+    id: host-memory
+    attributes:
+      label: Host memory and any container memory limit
+      placeholder: 128 GiB host, 128 GiB container limit
+    validations:
+      required: true
+  - type: input
+    id: checkpoint
+    attributes:
+      label: Checkpoint, revision and quantization format
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Complete launch command and relevant environment variables
+      description: Include KV offload settings. Remove tokens and private paths.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: versions
+    attributes:
+      label: ReVolta version or commit and environment
+      description: Include OS, installation method, Python, torch, CUDA and driver versions.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      render: text

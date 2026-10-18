@@ -1,0 +1,245 @@
+[
+  {
+    "name": "lmdeploy-dated",
+    "repo": "InternLM/lmdeploy",
+    "sha": "9b3b1933ee2ad1731a6e49b99867b52925b2a54b",
+    "license_path": "LICENSE",
+    "url": "https://raw.githubusercontent.com/InternLM/lmdeploy/9b3b1933ee2ad1731a6e49b99867b52925b2a54b/LICENSE",
+    "sha256": "811e05b43b0d985814c7ffd0a1d0b93e9166e6f0271245d540302505734528ba",
+    "bytes": 11379,
+    "file": "LICENSES/lmdeploy-dated.txt"
+  },
+  {
+    "name": "flash-attention-v100",
+    "repo": "ai-bond/flash-attention-v100",
+    "ref": "main",
+    "license_path": "LICENSE",
+    "sha": "0ababf82e3836c1786d7937c6002670ca4ecda62",
+    "url": "https://raw.githubusercontent.com/ai-bond/flash-attention-v100/0ababf82e3836c1786d7937c6002670ca4ecda62/LICENSE",
+    "sha256": "4eec967a15191488e23d9955fa472ba8074f89cfc3e4afacbf8e378180c28449",
+    "bytes": 1511,
+    "file": "LICENSES/flash-attention-v100.txt"
+  },
+  {
+    "name": "flash-attention-sm70",
+    "repo": "zhinianqin/flash-attention-v100",
+    "ref": "c2eda5e6115b98c3ba4bfd181570668742eece22",
+    "license_path": "LICENSE",
+    "sha": "c2eda5e6115b98c3ba4bfd181570668742eece22",
+    "url": "https://raw.githubusercontent.com/zhinianqin/flash-attention-v100/c2eda5e6115b98c3ba4bfd181570668742eece22/LICENSE",
+    "sha256": "8c9ccb96c065e706135b6cbad279b721da6156e51f3a5f27c6b3329af9416d73",
+    "bytes": 1558,
+    "file": "LICENSES/flash-attention-sm70.txt"
+  },
+  {
+    "name": "flash-attention-sm70-authors",
+    "repo": "zhinianqin/flash-attention-v100",
+    "sha": "c2eda5e6115b98c3ba4bfd181570668742eece22",
+    "license_path": "AUTHORS",
+    "url": "https://raw.githubusercontent.com/zhinianqin/flash-attention-v100/c2eda5e6115b98c3ba4bfd181570668742eece22/AUTHORS",
+    "sha256": "f3bf4144826a62841b7f9aebc5057f75da2d32a652a573edc67250ec94a377a7",
+    "bytes": 29,
+    "file": "LICENSES/flash-attention-sm70-authors.txt"
+  },
+  {
+    "name": "cutlass",
+    "repo": "NVIDIA/cutlass",
+    "ref": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
+    "license_path": "LICENSE.txt",
+    "sha": "da5e086dab31d63815acafdac9a9c5893b1c69e2",
+    "url": "https://raw.githubusercontent.com/NVIDIA/cutlass/da5e086dab31d63815acafdac9a9c5893b1c69e2/LICENSE.txt",
+    "sha256": "7bc733829f16663593865344541c6dcc433beb6b6b555c8f86a43e9b399993cf",
+    "bytes": 1854,
+    "file": "LICENSES/cutlass.txt"
+  },
+  {
+    "name": "cutlass-machete",
+    "repo": "NVIDIA/cutlass",
+    "ref": "06b21349bcf6ddf6a1686a47a137ad1446579db9",
+    "license_path": "LICENSE.txt",
+    "sha": "06b21349bcf6ddf6a1686a47a137ad1446579db9",
+    "url": "https://raw.githubusercontent.com/NVIDIA/cutlass/06b21349bcf6ddf6a1686a47a137ad1446579db9/LICENSE.txt",
+    "sha256": "6fc6ad419e4d26571a14c7c4d26b65345865c20dd8686ddcf5e8673f54d3d233",
+    "bytes": 1547,
+    "file": "LICENSES/cutlass-machete.txt"
+  },
+  {
+    "name": "cutlass-fa2",
+    "repo": "NVIDIA/cutlass",
+    "sha": "62750a2b75c802660e4894434dc55e839f322277",
+    "license_path": "LICENSE.txt",
+    "url": "https://raw.githubusercontent.com/NVIDIA/cutlass/62750a2b75c802660e4894434dc55e839f322277/LICENSE.txt",
+    "sha256": "42fec630f410aa308f70a51a89fadcd19586fa620f9831a32bee528a9a10000e",
+    "bytes": 1547,
+    "file": "LICENSES/cutlass-fa2.txt"
+  },
+  {
+    "name": "marlin",
+    "repo": "IST-DASLab/marlin",
+    "ref": "master",
+    "license_path": "LICENSE",
+    "sha": "1f25790bdd49fba53106164a24666dade68d7c90",
+    "url": "https://raw.githubusercontent.com/IST-DASLab/marlin/1f25790bdd49fba53106164a24666dade68d7c90/LICENSE",
+    "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+    "bytes": 11357,
+    "file": "LICENSES/marlin.txt"
+  },
+  {
+    "name": "flashqla-dated",
+    "repo": "QwenLM/FlashQLA",
+    "sha": "5be4204363d1f751ba586b0972eab58b818c852c",
+    "license_path": "LICENSE",
+    "url": "https://raw.githubusercontent.com/QwenLM/FlashQLA/5be4204363d1f751ba586b0972eab58b818c852c/LICENSE",
+    "sha256": "d0b7a111f48dc0207c7e057c810ae0e2fdbc807ba654eb669ade998b2cdc3438",
+    "bytes": 1070,
+    "file": "LICENSES/flashqla-dated.txt"
+  },
+  {
+    "name": "sglang-kernel",
+    "repo": "sgl-project/sglang",
+    "sha": "a9a8b20a90df3c8b64f7308abde7d3d1fa1a5d12",
+    "license_path": "sgl-kernel/LICENSE",
+    "url": "https://raw.githubusercontent.com/sgl-project/sglang/a9a8b20a90df3c8b64f7308abde7d3d1fa1a5d12/sgl-kernel/LICENSE",
+    "sha256": "1495e1e757ef4d0925a2350563cf5754bb23c51701a8ec4fb3c5cdcbedae6747",
+    "bytes": 11346,
+    "file": "LICENSES/sglang-kernel.txt"
+  },
+  {
+    "name": "sglang-notices",
+    "repo": "sgl-project/sglang",
+    "sha": "a9a8b20a90df3c8b64f7308abde7d3d1fa1a5d12",
+    "license_path": "sgl-kernel/THIRDPARTYNOTICES.txt",
+    "url": "https://raw.githubusercontent.com/sgl-project/sglang/a9a8b20a90df3c8b64f7308abde7d3d1fa1a5d12/sgl-kernel/THIRDPARTYNOTICES.txt",
+    "sha256": "2e44e480eb9e4e9e1b98ea2c442a5fa5186ffaec9f9d8b178ec8e6617a05cfa8",
+    "bytes": 26483,
+    "file": "LICENSES/sglang-notices.txt"
+  },
+  {
+    "name": "fla-dated",
+    "repo": "fla-org/flash-linear-attention",
+    "sha": "8a91ac503764fed5bb65ad6d9b157880eeff2820",
+    "license_path": "LICENSE",
+    "url": "https://raw.githubusercontent.com/fla-org/flash-linear-attention/8a91ac503764fed5bb65ad6d9b157880eeff2820/LICENSE",
+    "sha256": "98d913740dd16462d79ca94c88269a166673058d95c941f8fc98cb3fb39a7b45",
+    "bytes": 1074,
+    "file": "LICENSES/fla-dated.txt"
+  },
+  {
+    "name": "mamba",
+    "repo": "state-spaces/mamba",
+    "ref": "v2.2.4",
+    "license_path": "LICENSE",
+    "sha": "95d8aba8a8c75aedcaa6143713b11e745e7cd0d9",
+    "url": "https://raw.githubusercontent.com/state-spaces/mamba/95d8aba8a8c75aedcaa6143713b11e745e7cd0d9/LICENSE",
+    "sha256": "760939b000194d04548ede6a857bbe735d1695d8422ec85955c8e2bd7f4b95c5",
+    "bytes": 11348,
+    "file": "LICENSES/mamba.txt"
+  },
+  {
+    "name": "causal-conv1d",
+    "repo": "Dao-AILab/causal-conv1d",
+    "ref": "v1.5.0",
+    "license_path": "LICENSE",
+    "sha": "fe772c75e29da8123d4478b670342111ce23cc6b",
+    "url": "https://raw.githubusercontent.com/Dao-AILab/causal-conv1d/fe772c75e29da8123d4478b670342111ce23cc6b/LICENSE",
+    "sha256": "8c9ccb96c065e706135b6cbad279b721da6156e51f3a5f27c6b3329af9416d73",
+    "bytes": 1558,
+    "file": "LICENSES/causal-conv1d.txt"
+  },
+  {
+    "name": "causal-conv1d-authors",
+    "repo": "Dao-AILab/causal-conv1d",
+    "sha": "fe772c75e29da8123d4478b670342111ce23cc6b",
+    "license_path": "AUTHORS",
+    "url": "https://raw.githubusercontent.com/Dao-AILab/causal-conv1d/fe772c75e29da8123d4478b670342111ce23cc6b/AUTHORS",
+    "sha256": "0dd3fdb00754168d9789b946e325655491bc209faf8cb68c7f9dded33f82a775",
+    "bytes": 23,
+    "file": "LICENSES/causal-conv1d-authors.txt"
+  },
+  {
+    "name": "vllm-flash-attention",
+    "repo": "vllm-project/flash-attention",
+    "ref": "bce29425653ec0fbc579d329883030e832d15ada",
+    "license_path": "LICENSE",
+    "sha": "bce29425653ec0fbc579d329883030e832d15ada",
+    "url": "https://raw.githubusercontent.com/vllm-project/flash-attention/bce29425653ec0fbc579d329883030e832d15ada/LICENSE",
+    "sha256": "8c9ccb96c065e706135b6cbad279b721da6156e51f3a5f27c6b3329af9416d73",
+    "bytes": 1558,
+    "file": "LICENSES/vllm-flash-attention.txt"
+  },
+  {
+    "name": "vllm-flash-attention-authors",
+    "repo": "vllm-project/flash-attention",
+    "sha": "bce29425653ec0fbc579d329883030e832d15ada",
+    "license_path": "AUTHORS",
+    "url": "https://raw.githubusercontent.com/vllm-project/flash-attention/bce29425653ec0fbc579d329883030e832d15ada/AUTHORS",
+    "sha256": "f3bf4144826a62841b7f9aebc5057f75da2d32a652a573edc67250ec94a377a7",
+    "bytes": 29,
+    "file": "LICENSES/vllm-flash-attention-authors.txt"
+  },
+  {
+    "name": "flash-attention-sm75",
+    "repo": "Peuqui/flash-attention",
+    "ref": "43b9d29c9aa8e18d9351e7c643dc78ef7e7979fc",
+    "license_path": "LICENSE",
+    "sha": "43b9d29c9aa8e18d9351e7c643dc78ef7e7979fc",
+    "url": "https://raw.githubusercontent.com/Peuqui/flash-attention/43b9d29c9aa8e18d9351e7c643dc78ef7e7979fc/LICENSE",
+    "sha256": "8c9ccb96c065e706135b6cbad279b721da6156e51f3a5f27c6b3329af9416d73",
+    "bytes": 1558,
+    "file": "LICENSES/flash-attention-sm75.txt"
+  },
+  {
+    "name": "flash-attention-sm75-authors",
+    "repo": "Peuqui/flash-attention",
+    "sha": "43b9d29c9aa8e18d9351e7c643dc78ef7e7979fc",
+    "license_path": "AUTHORS",
+    "url": "https://raw.githubusercontent.com/Peuqui/flash-attention/43b9d29c9aa8e18d9351e7c643dc78ef7e7979fc/AUTHORS",
+    "sha256": "f3bf4144826a62841b7f9aebc5057f75da2d32a652a573edc67250ec94a377a7",
+    "bytes": 29,
+    "file": "LICENSES/flash-attention-sm75-authors.txt"
+  },
+  {
+    "name": "flashmla",
+    "repo": "vllm-project/FlashMLA",
+    "ref": "a6ec2ba7bd0a7dff98b3f4d3e6b52b159c48d78b",
+    "license_path": "LICENSE",
+    "sha": "a6ec2ba7bd0a7dff98b3f4d3e6b52b159c48d78b",
+    "url": "https://raw.githubusercontent.com/vllm-project/FlashMLA/a6ec2ba7bd0a7dff98b3f4d3e6b52b159c48d78b/LICENSE",
+    "sha256": "6c73a30c14a2938abaa6afe98ebb19e6d81dac5bd4ace0cb05c61c20afa37b85",
+    "bytes": 1065,
+    "file": "LICENSES/flashmla.txt"
+  },
+  {
+    "name": "deepgemm",
+    "repo": "deepseek-ai/DeepGEMM",
+    "ref": "891d57b4db1071624b5c8fa0d1e51cb317fa709f",
+    "license_path": "LICENSE",
+    "sha": "891d57b4db1071624b5c8fa0d1e51cb317fa709f",
+    "url": "https://raw.githubusercontent.com/deepseek-ai/DeepGEMM/891d57b4db1071624b5c8fa0d1e51cb317fa709f/LICENSE",
+    "sha256": "6c73a30c14a2938abaa6afe98ebb19e6d81dac5bd4ace0cb05c61c20afa37b85",
+    "bytes": 1065,
+    "file": "LICENSES/deepgemm.txt"
+  },
+  {
+    "name": "triton",
+    "repo": "triton-lang/triton",
+    "ref": "v3.5.1",
+    "license_path": "LICENSE",
+    "sha": "0add68262ab0a2e33b84524346cb27cbb2787356",
+    "url": "https://raw.githubusercontent.com/triton-lang/triton/0add68262ab0a2e33b84524346cb27cbb2787356/LICENSE",
+    "sha256": "92640fb97222fd0a698ff28ce0c3782c172623f8d6c609b557636a80f28fb946",
+    "bytes": 1132,
+    "file": "LICENSES/triton.txt"
+  },
+  {
+    "name": "qutlass",
+    "repo": "IST-DASLab/qutlass",
+    "ref": "830d2c4537c7396e14a02a46fbddd18b5d107c65",
+    "license_path": "LICENSE",
+    "sha": "830d2c4537c7396e14a02a46fbddd18b5d107c65",
+    "url": "https://raw.githubusercontent.com/IST-DASLab/qutlass/830d2c4537c7396e14a02a46fbddd18b5d107c65/LICENSE",
+    "sha256": "43070e2d4e532684de521b885f385d0841030efa2b1a20bafb76133a5e1379c1",
+    "bytes": 11356,
+    "file": "LICENSES/qutlass.txt"
+  }
+]

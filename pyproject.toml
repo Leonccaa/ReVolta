@@ -21,6 +21,7 @@ license = "Apache-2.0"
 license-files = [
     "LICENSE", "NOTICE", "flash-attention-v100/LICENSE", "flash_qla/LICENSE",
     "csrc/**/LICENSE*", "vllm/third_party/**/LICENSE*",
+    "LICENSES/*.txt", "LICENSES/*.md", "LICENSES/*.json",
 ]
 readme = "README.md"
 description = "ReVolta: an NVIDIA Volta / V100 (SM70) inference engine based on 1Cat-vLLM and vLLM"

@@ -2697,7 +2697,27 @@ def reshape_and_cache_flash(
     kv_cache_dtype: str,
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
+    *,
+    k_scale_cache: torch.Tensor | None = None,
+    v_scale_cache: torch.Tensor | None = None,
 ) -> None:
+    if kv_cache_dtype == "int8":
+        if k_scale_cache is None or v_scale_cache is None:
+            raise ValueError("INT8 v1 writer requires both FP32 scale planes")
+        if not hasattr(torch.ops._C_cache_ops, "reshape_and_cache_flash_int8"):
+            raise RuntimeError("Installed native wheel lacks the INT8 v1 writer ABI")
+        torch.ops._C_cache_ops.reshape_and_cache_flash_int8(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            k_scale_cache,
+            v_scale_cache,
+        )
+        return
+    if k_scale_cache is not None or v_scale_cache is not None:
+        raise ValueError("Legacy writers do not accept planar scale planes")
     torch.ops._C_cache_ops.reshape_and_cache_flash(
         key,
         value,

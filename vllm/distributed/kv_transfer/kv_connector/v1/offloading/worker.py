@@ -61,11 +61,9 @@ class OffloadingConnectorWorker:
         # Packed attention layers split each physical block of one tensor,
         # interleaved kernel block by kernel block, so they transfer as one
         # whole physical page registered once, by the first member.
-        packed: dict[str, tuple[int, int]] = {}
-        for kv_cache_tensor in self.spec.kv_cache_config.kv_cache_tensors:
-            members = getattr(kv_cache_tensor, "packed_members", None) or []
-            for index, layer_name in enumerate(members):
-                packed[layer_name] = (index, len(members))
+        from vllm.v1.attention.kv_cache_view import packed_kv_members
+
+        packed = packed_kv_members(self.spec.kv_cache_config)
 
         # layer_name -> (num_blocks, page_size_bytes) tensor
         tensors_per_block: dict[str, tuple[torch.Tensor, ...]] = {}
@@ -91,16 +89,14 @@ class OffloadingConnectorWorker:
                     # Only the first packed member's view starts the storage.
                     assert (layer_kv_cache.storage_offset() == 0) == (member_index == 0)
 
-                    storage = layer_kv_cache.untyped_storage()
-                    page = layer_kv_cache_spec.page_size_bytes * member_count
+                    from vllm.v1.attention.kv_cache_view import KVPhysicalPage
+
+                    owner = KVPhysicalPage(
+                        layer_kv_cache_spec.page_size_bytes, member_count, member_index
+                    )
+                    page = owner.page_size_bytes
                     tensors_per_block[layer_name] = (
-                        torch.tensor(
-                            [],
-                            dtype=torch.int8,
-                            device=layer_kv_cache.device,
-                        )
-                        .set_(storage)
-                        .view(num_blocks, page),
+                        owner.raw_pages(layer_kv_cache, num_blocks),
                     )
                     page_size_bytes[layer_name] = page
                     unpadded_page_size_bytes[layer_name] = (

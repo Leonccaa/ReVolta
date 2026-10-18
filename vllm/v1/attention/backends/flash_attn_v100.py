@@ -622,30 +622,9 @@ def _normalize_flash_v100_kv_cache_dtype(kv_cache_dtype: str) -> str:
 def _split_paged_kv_cache(
     kv_cache: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | list[torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if isinstance(kv_cache, (list, tuple)):
-        if len(kv_cache) != 2:
-            raise ValueError(
-                f"Unexpected KV cache tuple/list length {len(kv_cache)}; expected 2"
-            )
-        return kv_cache[0], kv_cache[1]
+    from vllm.v1.attention.kv_cache_view import split_dense_kv_cache
 
-    if kv_cache.ndim < 2:
-        raise ValueError(
-            f"Unexpected KV cache shape {tuple(kv_cache.shape)}; "
-            "expected dimension 2 at axis 0 or 1"
-        )
-
-    # Standard vLLM paged KV layout is [num_blocks, 2, block_size, heads, dim].
-    # Prefer axis 1 so num_blocks == 2 does not get mistaken for K/V.
-    if kv_cache.shape[1] == 2:
-        return kv_cache.unbind(1)
-    if kv_cache.shape[0] == 2:
-        return kv_cache.unbind(0)
-
-    raise ValueError(
-        f"Unexpected KV cache shape {tuple(kv_cache.shape)}; "
-        "expected dimension 2 at axis 0 or 1"
-    )
+    return split_dense_kv_cache(kv_cache)
 
 
 def _draft_graph_debug_enabled() -> bool:

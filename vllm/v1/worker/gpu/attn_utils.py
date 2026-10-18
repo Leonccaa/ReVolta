@@ -171,12 +171,9 @@ def _packed_attention_members(
     kv_cache_config: KVCacheConfig,
 ) -> dict[str, tuple[int, int]]:
     """Map each packed attention layer to (member index, member count)."""
-    packed: dict[str, tuple[int, int]] = {}
-    for tensor in kv_cache_config.kv_cache_tensors:
-        members = getattr(tensor, "packed_members", None) or []
-        for index, layer_name in enumerate(members):
-            packed[layer_name] = (index, len(members))
-    return packed
+    from vllm.v1.attention.kv_cache_view import packed_kv_members
+
+    return packed_kv_members(kv_cache_config)
 
 
 def _reshape_kv_cache(
@@ -237,7 +234,7 @@ def _reshape_kv_cache(
                     kernel_block_size,
                     kv_cache_spec.num_kv_heads,
                     kv_cache_spec.head_size,
-                    cache_dtype_str=cache_dtype,
+                    cache_dtype_str=kv_cache_spec.layout_cache_dtype(cache_dtype),
                 )
 
                 # FIXME(woosuk): Add kv_cache_stride_order to all attention backends.
@@ -254,55 +251,38 @@ def _reshape_kv_cache(
                 ]
 
                 dtype = kv_cache_spec.dtype
-                kv_tensor = kv_raw_tensor.view(dtype)
-                if packed is not None:
-                    if kv_cache_spec.page_size_padded is not None:
-                        raise ValueError("Packed attention pages cannot be padded")
-                    if inv_order[0] != 0:
-                        raise ValueError(
-                            "Packed attention pages need the block dimension "
-                            "outermost in physical memory"
-                        )
-                    # Members interleave one kernel block at a time, so member
-                    # j's kernel block k starts (k * count + j) kernel blocks
-                    # into the tensor: a uniform stride of `count` kernel
-                    # blocks with an offset of j. That holds across physical
-                    # block boundaries because each block holds `count` pages.
-                    # A meta tensor gives the strides without allocating.
-                    strides = list(torch.empty(kv_cache_shape, device="meta").stride())
-                    kernel_block_numel = strides[0]
-                    strides[0] = kernel_block_numel * member_count
-                    kv_cache = torch.as_strided(
-                        kv_tensor,
-                        size=kv_cache_shape,
-                        stride=tuple(strides),
-                        storage_offset=kernel_block_numel * member_index,
-                    )
-                elif kv_cache_spec.page_size_padded is not None:
-                    if kernel_num_blocks != num_blocks:
-                        raise ValueError(
-                            "Virtually split compressed KV caches cannot use "
-                            "padded physical pages"
-                        )
-                    # Use strided view to handle page_size_bytes that
-                    # include padding. This follows the same pattern as
-                    # MambaSpec handling in gpu_model_runner.py.
-                    # NOTE: This assumes kv_cache_shape[0] == num_blocks
-                    # (i.e. the first physical dimension is the block
-                    # index), which holds for all current backends
-                    # (MLA, FlashAttention, TritonAttention, etc.).
-                    dtype_size = get_dtype_size(dtype)
-                    page_stride = kv_cache_spec.page_size_bytes // dtype_size
-                    strides = list(torch.empty(kv_cache_shape).stride())
-                    strides[inv_order[0]] = page_stride
-                    kv_cache = torch.as_strided(
-                        kv_tensor,
-                        size=kv_cache_shape,
-                        stride=tuple(strides),
+                from vllm.v1.attention.kv_cache_view import (
+                    bind_attention_cache,
+                    bind_planar_kv_cache,
+                )
+                from vllm.v1.kv_cache_interface import KVQuantMode
+
+                if kv_cache_spec.kv_quant_mode == KVQuantMode.INT8_PLANAR:
+                    if inv_order != list(range(5)):
+                        raise ValueError("Planar KV requires block-major NHD layout")
+                    kv_cache = bind_planar_kv_cache(
+                        kv_raw_tensor,
+                        num_blocks=num_blocks,
+                        scheduler_block_size=kv_cache_spec.storage_block_size,
+                        kernel_block_size=kernel_block_size,
+                        num_heads=kv_cache_spec.num_kv_heads,
+                        head_size=kv_cache_spec.head_size,
+                        page_size_bytes=kv_cache_spec.page_size_bytes,
+                        member_index=member_index,
+                        member_count=member_count,
                     )
                 else:
-                    # No padding — safe to use a contiguous view.
-                    kv_cache = kv_tensor.view(kv_cache_shape)
+                    kv_cache = bind_attention_cache(
+                        kv_raw_tensor,
+                        shape=kv_cache_shape,
+                        dtype=dtype,
+                        page_size_bytes=kv_cache_spec.page_size_bytes,
+                        scheduler_block_size=kv_cache_spec.storage_block_size,
+                        kernel_block_size=kernel_block_size,
+                        block_dim=inv_order[0],
+                        member_index=member_index,
+                        member_count=member_count,
+                    )
                 kv_caches[layer_name] = kv_cache.permute(*inv_order)
 
             elif isinstance(kv_cache_spec, MambaSpec):
@@ -364,7 +344,7 @@ def _update_hybrid_attention_layout(
             kernel_block_sizes[group.kv_cache_group_id],
             kv_cache_spec.num_kv_heads,
             kv_cache_spec.head_size,
-            cache_dtype_str=cache_dtype,
+            cache_dtype_str=kv_cache_spec.layout_cache_dtype(cache_dtype),
         )
         # if the first dim of the kvcache's layout is already num_blocks, continue
         if block_dim == 0:

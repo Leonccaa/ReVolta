@@ -226,22 +226,14 @@ class KVBlockZeroer:
                         kernel_bs,
                         spec.num_kv_heads,
                         spec.head_size,
-                        cache_dtype_str=cache_dtype,
+                        cache_dtype_str=spec.layout_cache_dtype(cache_dtype),
                     )
-                    el = kv.element_size()
-                    # Packed DCP pages (attn_utils) expose each member as a
-                    # view offset by whole kernel blocks inside one physical
-                    # page, with a block stride that spans every member. Zero
-                    # from the page base: starting at member j's own offset
-                    # runs j kernel blocks past the page into the next block.
-                    # The members then share one segment that covers the page.
-                    page_offset_el = kv.storage_offset() % kv.stride(block_dim)
-                    dp = kv.data_ptr() - page_offset_el * el
+                    from vllm.v1.attention.kv_cache_view import KVPhysicalPage
 
+                    el = kv.element_size()
+                    dp, page_bytes = KVPhysicalPage.zeroer_segment(kv, block_dim, ratio)
                     cur_bytes = kv.stride(block_dim) * el
-                    assert cur_bytes % 4 == 0
-                    kernel_block_el = cur_bytes // 4
-                    cur_page_el = kernel_block_el * ratio
+                    cur_page_el = page_bytes // 4
 
                     block_stride_bytes = cur_bytes
                     outer_dims = [

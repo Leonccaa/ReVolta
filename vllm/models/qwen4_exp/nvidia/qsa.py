@@ -276,7 +276,15 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         token_to_req = token_to_req[:num_tokens]
         # This tree's FlashAttention cache ABI keeps K/V on dimension 1:
         # [num_blocks, 2, block_size, num_kv_heads, head_size].
-        key_cache, value_cache = kv_cache.unbind(1)
+        from vllm.v1.attention.kv_cache_view import KVCacheView
+        from vllm.v1.attention.kv_codecs import resolve_kv_codec
+
+        codec = resolve_kv_codec(self.kv_cache_dtype)
+        if self.kv_cache_dtype == "auto" and kv_cache.dtype == torch.bfloat16:
+            codec = resolve_kv_codec("bfloat16")
+        assert codec is not None
+        view = KVCacheView.bind(kv_cache, codec, self.head_size)
+        key_cache, value_cache = view.key, view.value
         key_cache = canonicalize_singleton_dim_strides(key_cache)
         value_cache = canonicalize_singleton_dim_strides(value_cache)
         if query.dtype not in (torch.float16, torch.bfloat16):

@@ -679,6 +679,11 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "                        str kv_cache_dtype,"
       "                        Tensor k_scale, Tensor v_scale) -> ()");
 
+  ops.def(
+      "reshape_and_cache_flash_int8(Tensor key, Tensor value,"
+      " Tensor! key_cache, Tensor! value_cache, Tensor slot_mapping,"
+      " Tensor! k_scale_cache, Tensor! v_scale_cache) -> ()");
+
   // Concat kv_c and k_pe and cache them.
   ops.def(
       "concat_and_cache_mla(Tensor kv_c, Tensor k_pe,"
@@ -745,6 +750,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C_cache_ops, CUDA, ops) {
   ops.impl("swap_blocks", TORCH_BOX(&swap_blocks));
   ops.impl("reshape_and_cache", TORCH_BOX(&reshape_and_cache));
   ops.impl("reshape_and_cache_flash", TORCH_BOX(&reshape_and_cache_flash));
+  ops.impl("reshape_and_cache_flash_int8",
+           TORCH_BOX(&reshape_and_cache_flash_int8));
   ops.impl("concat_and_cache_mla", TORCH_BOX(&concat_and_cache_mla));
   ops.impl("concat_and_cache_mla_rope_fused",
            TORCH_BOX(&concat_and_cache_mla_rope_fused));

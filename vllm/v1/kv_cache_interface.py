@@ -17,6 +17,7 @@ from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.torch_utils import get_dtype_size, nvfp4_kv_cache_full_dim
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.attention.kv_cache_view import KVPageLayout
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -41,6 +42,7 @@ class KVQuantMode(IntEnum):
     INT8_PER_TOKEN_HEAD = 2  # per-token-head dynamic scales for int8
     FP8_PER_TOKEN_HEAD = 3  # per-token-head dynamic scales for fp8
     NVFP4 = 4  # packed fp4 data + fp8 block scales
+    INT8_PLANAR = 5  # v1 RNE int8, FP32 token/head planes in each kernel page
 
     @property
     def is_per_token_head(self) -> bool:
@@ -48,6 +50,7 @@ class KVQuantMode(IntEnum):
         return self in (
             KVQuantMode.INT8_PER_TOKEN_HEAD,
             KVQuantMode.FP8_PER_TOKEN_HEAD,
+            KVQuantMode.INT8_PLANAR,
         )
 
     @property
@@ -58,6 +61,8 @@ class KVQuantMode(IntEnum):
 
 def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
     """Map a ``kv_cache_dtype`` string to a :class:`KVQuantMode`."""
+    if kv_cache_dtype == "int8":
+        return KVQuantMode.INT8_PLANAR
     if kv_cache_dtype == "int8_per_token_head":
         return KVQuantMode.INT8_PER_TOKEN_HEAD
     if kv_cache_dtype == "fp8_per_token_head":
@@ -168,13 +173,29 @@ class AttentionSpec(KVCacheSpec):
     kv_quant_mode: KVQuantMode = KVQuantMode.NONE
     page_size_padded: int | None = None
 
+    def layout_cache_dtype(self, configured_dtype: str) -> str:
+        """Shape APIs follow this owner, including an independently typed draft."""
+        if get_kv_quant_mode(configured_dtype) == self.kv_quant_mode:
+            return configured_dtype
+        return {
+            KVQuantMode.NONE: "auto",
+            KVQuantMode.FP8_PER_TENSOR: "fp8",
+            KVQuantMode.INT8_PER_TOKEN_HEAD: "int8_per_token_head",
+            KVQuantMode.FP8_PER_TOKEN_HEAD: "fp8_per_token_head",
+            KVQuantMode.NVFP4: "nvfp4",
+            KVQuantMode.INT8_PLANAR: "int8",
+        }[self.kv_quant_mode]
+
     @property
     def page_size_bytes(self) -> int:
         real_page_size = self.real_page_size_bytes
         # Per-token-head scales are stored in separate tensors managed
         # by the attention backend, but the memory is carved from the
         # raw KV cache allocation so it must be budgeted here.
-        if self.kv_quant_mode.is_per_token_head:
+        if (
+            self.kv_quant_mode.is_per_token_head
+            and self.kv_quant_mode != KVQuantMode.INT8_PLANAR
+        ):
             real_page_size += (
                 2 * self.block_size * self.num_kv_heads * get_dtype_size(torch.float32)
             )
@@ -185,6 +206,8 @@ class AttentionSpec(KVCacheSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
+        if self.kv_quant_mode == KVQuantMode.INT8_PLANAR:
+            return self.kv_page_layout.page_size_bytes
         if self.kv_quant_mode.is_nvfp4:
             # Packed layout: fp4 data + fp8 block scales per head.
             full_dim = nvfp4_kv_cache_full_dim(self.head_size)
@@ -201,6 +224,17 @@ class AttentionSpec(KVCacheSpec):
             * self.num_kv_heads
             * self.head_size
             * get_dtype_size(self.dtype)
+        )
+
+    @property
+    def kv_page_layout(self) -> KVPageLayout:
+        return KVPageLayout(
+            self.storage_block_size,
+            self.num_kv_heads,
+            self.head_size,
+            getattr(self, "head_size_v", self.head_size),
+            get_dtype_size(self.dtype),
+            planar_scales=self.kv_quant_mode == KVQuantMode.INT8_PLANAR,
         )
 
 
@@ -226,6 +260,14 @@ class FullAttentionSpec(AttentionSpec):
     def __post_init__(self):
         if self.head_size_v is None:
             object.__setattr__(self, "head_size_v", self.head_size)
+        if self.kv_quant_mode == KVQuantMode.INT8_PLANAR and (
+            self.dtype != torch.int8
+            or self.head_size_v != self.head_size
+            or self.block_size % 16
+        ):
+            raise ValueError(
+                "INT8 v1 requires int8, equal K/V heads and 16-token blocks"
+            )
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_model_len = vllm_config.model_config.max_model_len
@@ -298,6 +340,8 @@ class FullAttentionSpec(AttentionSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
+        if self.kv_quant_mode == KVQuantMode.INT8_PLANAR:
+            return self.kv_page_layout.page_size_bytes
         if self.kv_quant_mode.is_nvfp4:
             # Packed layout per head: fp4 data + fp8 block scales.
             # fp4 data: head_size//2 bytes (2 fp4 values per byte)
@@ -311,12 +355,7 @@ class FullAttentionSpec(AttentionSpec):
                 * last_dim
                 * get_dtype_size(self.dtype)
             )
-        return (
-            self.block_size
-            * self.num_kv_heads
-            * (self.head_size + self.head_size_v)
-            * get_dtype_size(self.dtype)
-        )
+        return self.kv_page_layout.page_size_bytes
 
 
 def _apply_alignment_padding(spec: MLAAttentionSpec | SlidingWindowMLASpec):

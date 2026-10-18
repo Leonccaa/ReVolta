@@ -7,7 +7,7 @@ and per-file notices; they do not replace those notices.
 
 | Component | License text | Source reference |
 | --- | --- | --- |
-| LMDeploy / TurboMind | `lmdeploy-dated.txt` (Apache-2.0) | `InternLM/lmdeploy@9b3b1933ee2ad1731a6e49b99867b52925b2a54b` |
+| LMDeploy / TurboMind | `lmdeploy-dated.txt` (Apache-2.0 for LMDeploy code); the locally added llama.cpp tables have a separate MIT notice, see NOTICE | `InternLM/lmdeploy@9b3b1933ee2ad1731a6e49b99867b52925b2a54b` |
 | FlashAttention-V100 | `flash-attention-v100.txt` (BSD-3-Clause) | `ai-bond/flash-attention-v100@0ababf82e3836c1786d7937c6002670ca4ecda62` |
 | SM70 FA2 | `flash-attention-sm70.txt`, `flash-attention-sm70-authors.txt` (BSD-3-Clause) | Build pin `zhinianqin/flash-attention-v100@c2eda5e6115b98c3ba4bfd181570668742eece22` |
 | CUTLASS | `cutlass.txt` (BSD-3-Clause and embedded third-party notices) | v4.4.2, `da5e086dab31d63815acafdac9a9c5893b1c69e2` |

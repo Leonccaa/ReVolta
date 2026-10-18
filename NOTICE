@@ -26,7 +26,10 @@ Included components
 1. TurboMind / LMDeploy (OpenMMLab)
    Source: https://github.com/InternLM/lmdeploy
    Location: csrc/sm70_turbomind/lmdeploy/src/turbomind/
-   License: Apache-2.0; LICENSES/lmdeploy-dated.txt.
+   License: Apache-2.0 for LMDeploy-origin code; LICENSES/lmdeploy-dated.txt.
+   Exception: the locally added kernels/gemm/lattice_codebooks.h identifies
+   MIT-licensed tables from gguf-py 0.19.0 / llama.cpp. Keep its SPDX notice
+   and the original MIT text recorded in item 7; it is not Apache-2.0 code.
    Copyright OpenMMLab; Shanghai AI Laboratory; NVIDIA for derived utilities,
    as recorded in individual source headers.
    Evidence snapshot: 9b3b1933ee2ad1731a6e49b99867b52925b2a54b, the latest

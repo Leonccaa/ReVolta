@@ -420,3 +420,102 @@ def test_ssd_frame_budget_and_persistent_namespace():
     old = replace(spec(torch.uint8, KVQuantMode.FP8_PER_TENSOR))
     config.kv_cache_groups = [KVCacheGroupSpec(["a", "b"], old)]
     assert kv_storage_metadata(config, "fp8_e4m3") != meta
+
+
+def test_offload_copies_interior_padding_for_single_int8_member():
+    from unittest.mock import Mock
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
+        OffloadingConnectorWorker,
+    )
+    from vllm.v1.kv_cache_interface import (
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        KVCacheTensor,
+    )
+
+    # Padding is spread over 51 kernel pages, so the last scale plane lies
+    # beyond real_page_size_bytes. A prefix slice would lose valid scale bytes.
+    padded = replace(spec(), page_size_padded=425136)
+    raw = torch.full((3 * padded.page_size_bytes,), 61, dtype=torch.int8)
+    carrier = bind_planar_kv_cache(
+        raw,
+        num_blocks=3,
+        scheduler_block_size=816,
+        kernel_block_size=16,
+        num_heads=1,
+        head_size=256,
+        page_size_bytes=padded.page_size_bytes,
+    )
+    view = KVCacheView.bind(carrier, INT8, 256)
+    view.value_scale[50].fill_(123.5)
+    config = KVCacheConfig(
+        num_blocks=3,
+        kv_cache_groups=[KVCacheGroupSpec(["a"], padded)],
+        kv_cache_tensors=[KVCacheTensor(size=raw.numel(), shared_by=["a"])],
+    )
+    offload_spec = Mock()
+    offload_spec.kv_cache_config = config
+    offload_spec.get_handlers.return_value = []
+    OffloadingConnectorWorker(offload_spec).register_kv_caches({"a": carrier})
+    canonical = offload_spec.get_handlers.call_args[0][0]
+    ref = canonical.group_data_refs[0][0]
+    assert ref.page_size_bytes == padded.page_size_bytes
+    pages = canonical.tensors[0].tensor
+    saved = pages[0, : ref.page_size_bytes].clone()
+    pages[0].zero_()
+    pages[0, : ref.page_size_bytes].copy_(saved)
+    assert torch.all(view.value_scale[50] == 123.5)
+
+
+def test_mixed_fp16_virtual_padding_is_part_of_offload_span():
+    from unittest.mock import Mock
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
+        OffloadingConnectorWorker,
+    )
+    from vllm.v1.kv_cache_interface import (
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        KVCacheTensor,
+    )
+
+    padded = replace(spec(torch.float16, KVQuantMode.NONE), page_size_padded=848640)
+    raw = torch.zeros(3 * padded.page_size_bytes, dtype=torch.int8)
+    carrier = bind_attention_cache(
+        raw,
+        shape=(153, 2, 16, 1, 256),
+        dtype=torch.float16,
+        page_size_bytes=padded.page_size_bytes,
+        scheduler_block_size=816,
+        kernel_block_size=16,
+    )
+    view = KVCacheView.bind(carrier, FP16, 256)
+    view.value[50].fill_(123.5)
+    config = KVCacheConfig(
+        num_blocks=3,
+        kv_cache_groups=[KVCacheGroupSpec(["a"], padded)],
+        kv_cache_tensors=[KVCacheTensor(size=raw.numel(), shared_by=["a"])],
+    )
+    offload_spec = Mock()
+    offload_spec.kv_cache_config = config
+    offload_spec.get_handlers.return_value = []
+    OffloadingConnectorWorker(offload_spec).register_kv_caches({"a": carrier})
+    canonical = offload_spec.get_handlers.call_args[0][0]
+    ref = canonical.group_data_refs[0][0]
+    assert ref.page_size_bytes == padded.page_size_bytes
+    pages = canonical.tensors[0].tensor
+    saved = pages[0, : ref.page_size_bytes].clone()
+    pages[0].zero_()
+    pages[0, : ref.page_size_bytes].copy_(saved)
+    assert torch.all(view.value[50] == 123.5)
+
+
+def test_legacy_triton_writer_does_not_reinterpret_planar_int8_as_fp8():
+    from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+        _is_supported_kv_cache_dtype,
+    )
+
+    assert not _is_supported_kv_cache_dtype("int8")
+    assert _is_supported_kv_cache_dtype("auto")
+    assert _is_supported_kv_cache_dtype("fp8_e4m3")

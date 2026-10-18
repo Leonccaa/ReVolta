@@ -90,6 +90,7 @@ class OffloadingConnectorWorker:
                     assert (layer_kv_cache.storage_offset() == 0) == (member_index == 0)
 
                     from vllm.v1.attention.kv_cache_view import KVPhysicalPage
+                    from vllm.v1.kv_cache_interface import KVQuantMode
 
                     owner = KVPhysicalPage(
                         layer_kv_cache_spec.page_size_bytes, member_count, member_index
@@ -99,10 +100,13 @@ class OffloadingConnectorWorker:
                         owner.raw_pages(layer_kv_cache, num_blocks),
                     )
                     page_size_bytes[layer_name] = page
-                    unpadded_page_size_bytes[layer_name] = (
-                        page
-                        if member_count > 1
-                        else layer_kv_cache_spec.real_page_size_bytes
+                    unpadded_page_size_bytes[layer_name] = owner.transfer_size(
+                        layer_kv_cache,
+                        num_blocks,
+                        layer_kv_cache_spec.real_page_size_bytes,
+                        planar=(
+                            layer_kv_cache_spec.kv_quant_mode == KVQuantMode.INT8_PLANAR
+                        ),
                     )
 
                 elif isinstance(layer_kv_cache_spec, MambaSpec):

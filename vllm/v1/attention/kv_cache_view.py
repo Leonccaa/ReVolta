@@ -113,6 +113,22 @@ class KVPhysicalPage:
             storage, 0, (num_blocks, self.page_size_bytes), (self.page_size_bytes, 1)
         )
 
+    def transfer_size(
+        self, tensor: torch.Tensor, num_blocks: int, real_bytes: int, *, planar: bool
+    ) -> int:
+        # Uniformly subdivided padding is inside a scheduler page. A contiguous
+        # real_bytes prefix would truncate the last payload/scale, including a
+        # dense member in a mixed INT8 plan. Legacy tail padding stays unchanged.
+        interior_padding = (
+            self.member_page_bytes > real_bytes
+            and tensor.ndim == 5
+            and tensor.shape[1] == 2
+            and tensor.shape[0] > num_blocks
+        )
+        if self.member_count > 1 or planar or interior_padding:
+            return self.page_size_bytes
+        return real_bytes
+
     def kernel_stride(self, subdivisions: int, minimum: int) -> int:
         if subdivisions <= 0 or self.member_page_bytes % subdivisions:
             raise ValueError("Physical padding must divide uniformly over kernel pages")

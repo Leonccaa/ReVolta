@@ -17,6 +17,10 @@ _NATIVE_KV_CACHE_DTYPES = {"auto", "float16", "bfloat16", "float32", "half", "fl
 
 
 def _is_supported_kv_cache_dtype(kv_cache_dtype: str) -> bool:
+    if kv_cache_dtype == "int8":
+        # Planar RNE INT8 must use the plane-aware writer, never this legacy
+        # tensor-scale FP8 conversion or the truncating per-token INT8 helper.
+        return False
     return kv_cache_dtype in _NATIVE_KV_CACHE_DTYPES or is_quantized_kv_cache(
         kv_cache_dtype
     )

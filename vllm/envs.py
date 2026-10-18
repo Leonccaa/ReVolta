@@ -388,6 +388,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W13: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W2: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE: bool = False
+    VLLM_SM70_NVFP4_QWEN38_MOE_RAW_GROUPED_DECODE: bool = False
     VLLM_SM70_NVFP4_QWEN38_MOE_W2_DIRECT_REDUCE: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_INDEXED_PREFILL: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_FUSED_SWIGLU_PREFILL: bool = True
@@ -5462,6 +5463,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "reduces persistent scale memory instead of retaining a second "
             "representation. Experimental until full-model prefill/decode "
             "quality admission is complete."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind NVFP4",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_NVFP4_QWEN38_MOE_RAW_GROUPED_DECODE": env_var(
+        lambda: bool(
+            int(os.getenv("VLLM_SM70_NVFP4_QWEN38_MOE_RAW_GROUPED_DECODE", "0"))
+        ),
+        description=(
+            "Opt in to graph-safe native raw-E4M3 grouped NVFP4 MoE for "
+            "M=2..40 on exact SM70, TP4 Qwen3.8 expert shapes. Requires "
+            "RAW_SCALE storage and a matching native extension. Uses fixed "
+            "split4 FP32 W13 accumulation and router-order FP32 W2 reduction."
         ),
         category="experimental",
         declared_default="False",

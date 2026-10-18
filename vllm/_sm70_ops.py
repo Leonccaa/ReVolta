@@ -204,6 +204,69 @@ def has_nvfp4_qpn_w13_swiglu_batch_dispatch() -> bool:
     ) or hasattr(torch.ops._C, "nvfp4_moe_qpn_w13_swiglu_batch_sm70_out")
 
 
+NVFP4_RAW_GROUPED_PLAN_INTS = 1608
+
+
+def has_nvfp4_raw_grouped_decode_dispatch() -> bool:
+    return hasattr(torch.ops._C, "nvfp4_raw_grouped_decode_sm70_out")
+
+
+def nvfp4_raw_grouped_decode_sm70_out(
+    out: torch.Tensor,
+    intermediate: torch.Tensor,
+    plan: torch.Tensor,
+    x: torch.Tensor,
+    w13: torch.Tensor,
+    s13: torch.Tensor,
+    g13: torch.Tensor,
+    w2: torch.Tensor,
+    s2: torch.Tensor,
+    g2: torch.Tensor,
+    ids: torch.Tensor,
+    topk: torch.Tensor,
+    split: int = 4,
+    interleaved: bool = False,
+) -> None:
+    torch.ops._C.nvfp4_raw_grouped_decode_sm70_out(
+        out,
+        intermediate,
+        plan,
+        x,
+        w13,
+        s13,
+        g13,
+        w2,
+        s2,
+        g2,
+        ids,
+        topk,
+        split,
+        interleaved,
+    )
+
+
+if has_nvfp4_raw_grouped_decode_dispatch():
+
+    @register_fake("_C::nvfp4_raw_grouped_decode_sm70_out")
+    def _nvfp4_raw_grouped_fake(
+        out,
+        intermediate,
+        plan,
+        x,
+        w13,
+        s13,
+        g13,
+        w2,
+        s2,
+        g2,
+        ids,
+        topk,
+        split,
+        interleaved,
+    ):
+        return None
+
+
 def has_nvfp4_grouped_decode_dispatch() -> bool:
     return all(
         hasattr(torch.ops._C, name)

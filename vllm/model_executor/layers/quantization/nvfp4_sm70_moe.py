@@ -147,6 +147,37 @@ def _get_qwen38_raw_scale_workspace(device: torch.device) -> torch.Tensor:
     return workspace
 
 
+def _use_qwen38_raw_grouped_decode(
+    layer: RoutedExperts, x: torch.Tensor, topk_ids: torch.Tensor
+) -> bool:
+    """Row-independent math also admits MTP verify; no GPU metadata readback.
+
+    Layer flag is established after exact-SM70 preparation, RAW_SCALE
+    validation and native-op availability checks. apply checks SM70 again.
+    """
+    return bool(
+        getattr(layer, "sm70_nvfp4_raw_grouped_decode", False)
+        and getattr(layer, "sm70_nvfp4_qwen38_raw_scale", False)
+        and int(layer.moe_config.tp_size) == 4
+        and (
+            layer.sm70_nvfp4_num_experts,
+            layer.sm70_nvfp4_hidden_size,
+            layer.sm70_nvfp4_intermediate_size,
+            layer.sm70_nvfp4_top_k,
+        )
+        == (512, 2560, 160, 10)
+        and layer.swiglu_limit is None
+        and x.ndim == 2
+        and 2 <= x.shape[0] <= 40
+        and x.shape[1] == 2560
+        and x.dtype == torch.float16
+        and x.is_contiguous()
+        and topk_ids.shape == (x.shape[0], 10)
+        and topk_ids.dtype == torch.int32
+        and topk_ids.is_contiguous()
+    )
+
+
 def _use_qwen38_qpn_m1_decode(
     layer: RoutedExperts,
     x: torch.Tensor,
@@ -1228,6 +1259,36 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             layer._nvfp4_grouped_total = torch.empty(
                 1, dtype=torch.int32, device=device
             )
+        raw_grouped = bool(
+            envs.VLLM_SM70_NVFP4_QWEN38_MOE_RAW_GROUPED_DECODE
+            and raw_scale
+            and int(layer.moe_config.tp_size) == 4
+            and (num_experts, hidden, intermediate, layer.sm70_nvfp4_top_k)
+            == (512, 2560, 160, 10)
+            and layer.swiglu_limit is None
+        )
+        if raw_grouped and not sm70_ops.has_nvfp4_raw_grouped_decode_dispatch():
+            raise RuntimeError(
+                "SM70 raw grouped NVFP4 decode requires a matching native build."
+            )
+        layer.sm70_nvfp4_raw_grouped_decode = raw_grouped
+        if raw_grouped:
+            # Only this opt-in route owns M<=40 storage. Existing buffers and
+            # all prepared-scale/default paths retain their B1-B18 contract.
+            device = layer.w13_tm_weight.device
+            layer._nvfp4_raw_grouped_output = torch.empty(
+                40, hidden, dtype=torch.float16, device=device
+            )
+            layer._nvfp4_raw_grouped_intermediate = torch.empty(
+                400, intermediate, dtype=torch.float16, device=device
+            )
+            layer._nvfp4_raw_grouped_plan = torch.empty(
+                sm70_ops.NVFP4_RAW_GROUPED_PLAN_INTS, dtype=torch.int32, device=device
+            )
+            logger.info_once(
+                "Experimental SM70 raw-E4M3 grouped NVFP4 enabled "
+                "(TP4/E512/H2560/I160/K10, M2-M40, split4, graph-safe)."
+            )
         self._allocate_graph_safe_decode_buffers(layer)
 
         del layer.w13_weight
@@ -1511,6 +1572,28 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         num_tokens = x.shape[0]
         if num_tokens == 0:
             return x.new_empty((0, hidden))
+        if (
+            _use_qwen38_raw_grouped_decode(layer, x, topk_ids)
+            and topk_weights.is_contiguous()
+        ):
+            output = layer._nvfp4_raw_grouped_output[:num_tokens]
+            sm70_ops.nvfp4_raw_grouped_decode_sm70_out(
+                output,
+                layer._nvfp4_raw_grouped_intermediate[: num_tokens * top_k],
+                layer._nvfp4_raw_grouped_plan,
+                x,
+                layer.w13_tm_weight,
+                layer.w13_raw_scale_codes,
+                layer.w13_raw_global_scales,
+                layer.w2_tm_weight,
+                layer.w2_raw_scale_codes,
+                layer.w2_raw_global_scales,
+                topk_ids,
+                topk_weights,
+                4,
+                bool(getattr(layer, "sm70_nvfp4_qwen38_fused_swiglu_prefill", False)),
+            )
+            return output
         indexed_w13 = _use_qwen38_indexed_prefill(layer, x, topk_ids)
         interleaved_w13 = bool(
             getattr(layer, "sm70_nvfp4_qwen38_fused_swiglu_prefill", False)

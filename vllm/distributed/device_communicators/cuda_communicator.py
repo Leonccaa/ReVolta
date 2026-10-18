@@ -174,6 +174,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                     else 8192 * 1024
                 ),
                 long_prefill_fusion_enabled=use_sm70_tp4_long_prefill_fused_norm,
+                disable_custom_all_reduce=not use_custom_allreduce,
             )
 
             if current_platform.is_rocm():
@@ -197,6 +198,19 @@ class CudaCommunicator(DeviceCommunicatorBase):
                     self.unique_name or "<unnamed>",
                     scope="global",
                 )
+
+        if (
+            "tp" in unique_name
+            and self.ca_comm is None
+            and not use_custom_allreduce
+            and self.world_size == 4
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability(70)
+        ):
+            logger.info(
+                "SM70 interconnect=no_p2p source=disable-custom-all-reduce; "
+                "NVML: not queried; P2P: not checked; custom AR disabled by policy"
+            )
 
         if self.world_size > 1:
             self._log_all_reduce_backend_selection()

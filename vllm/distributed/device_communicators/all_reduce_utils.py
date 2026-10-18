@@ -5,6 +5,7 @@ import ctypes
 import json
 import os
 import pickle
+import signal
 import subprocess
 import sys
 import tempfile
@@ -307,6 +308,43 @@ def can_actually_p2p(
 #  **local** device id, i.e. from 0 to num_dev-1, where num_dev is the number
 #  of visible devices in the vllm engine.
 _gpu_p2p_access_cache: dict[str, bool] | None = None
+
+
+def gpu_p2p_access_check_fresh(device_indices: Sequence[int]) -> bool:
+    """Test every directed peer edge without either P2P cache or a world barrier.
+
+    The old cache key only identifies CUDA_VISIBLE_DEVICES, not driver or ACS
+    state. A PEX group must call this once per communicator startup, on one
+    rank, and share the result over its CPU group before allocating IPC buffers.
+    """
+    pairs = [
+        (src, tgt) for src in device_indices for tgt in device_indices if src != tgt
+    ]
+    if not pairs:
+        return True
+    batch_src, batch_tgt = zip(*pairs)
+    with tempfile.NamedTemporaryFile() as output_file:
+        input_bytes = pickle.dumps((batch_src, batch_tgt, output_file.name))
+        # Isolate the process group so a stalled IPC probe and its spawned CUDA
+        # workers can all be terminated, allowing the caller to fall back.
+        with subprocess.Popen(
+            [sys.executable, __file__],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        ) as process:
+            try:
+                _, stderr = process.communicate(input_bytes, timeout=60)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.communicate()
+                raise RuntimeError("Fresh GPU P2P probe timed out") from None
+            if process.returncode:
+                raise RuntimeError(f"Fresh GPU P2P probe failed: {stderr.decode()}")
+        with open(output_file.name, "rb") as result_file:
+            result = pickle.load(result_file)
+    return len(result) == len(pairs) and all(value is True for value in result)
 
 
 def gpu_p2p_access_check(src: int, tgt: int) -> bool:

@@ -27,13 +27,16 @@ PCIE_SWITCH_TOPOLOGY = [
 
 class _FakeNvml:
     NVML_TOPOLOGY_MULTIPLE = PXB
+    NVML_P2P_CAPS_INDEX_NVLINK = 4
+    NVML_P2P_STATUS_OK = 0
 
     class NVMLError(Exception):
         pass
 
-    def __init__(self, matrix, fail=False):
+    def __init__(self, matrix, fail=False, nvlink=False):
         self.matrix = matrix
         self.fail = fail
+        self.nvlink = nvlink
         self.queries = 0
 
     def nvmlInit(self):
@@ -50,6 +53,12 @@ class _FakeNvml:
         if self.fail:
             raise self.NVMLError()
         return self.matrix[a][b]
+
+    def nvmlDeviceGetP2PStatus(self, a, b, capability):
+        assert capability == self.NVML_P2P_CAPS_INDEX_NVLINK
+        if self.fail:
+            raise self.NVMLError()
+        return self.NVML_P2P_STATUS_OK if self.nvlink else 1
 
 
 def _with_level(level):

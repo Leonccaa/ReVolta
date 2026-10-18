@@ -465,6 +465,7 @@ if TYPE_CHECKING:
     VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES: bool = True
     VLLM_SM70_CAR_VMM_SAFE: bool = False
     VLLM_SM70_CAR_VMM_SAFE_PREALLOC: bool = True
+    VLLM_SM70_INTERCONNECT: str = "auto"
     VLLM_SM70_PCIE_SWITCH_CUSTOM_AR: str = "auto"
     VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES: int = 81920
     VLLM_SM70_PCIE_SWITCH_CAR_GRAPH_ONLY: bool = True
@@ -7254,20 +7255,44 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=("SM70 collectives",),
         user_visible=False,
     ),
-    # Four SM70 GPUs whose every pair meets below a PCIe switch (nvidia-smi
-    # PIX/PXB) have working P2P but no NVLink. Upstream disables custom
-    # all-reduce for more than two non-NVLink GPUs; on this topology the SM70
-    # TP4 push kernels are faster than NCCL for small graph-captured payloads.
-    # auto: enable when SM70, TP4 and the PCIe-switch topology all hold.
-    # 1: skip the topology query (the P2P test still runs). 0: never.
+    # One scoped policy selector; explicit modes override the legacy PEX knob.
+    "VLLM_SM70_INTERCONNECT": env_var(
+        lambda: os.getenv("VLLM_SM70_INTERCONNECT", "auto").strip().lower(),
+        description=(
+            "Select the SM70 TP4 custom all-reduce interconnect policy: auto "
+            "detects NVLink, then the narrow PIX/PXB PEX topology with fresh "
+            "all-peer IPC validation; pex bypasses topology but still requires "
+            "fresh P2P and retains the PCIe payload/graph limits; nccl disables "
+            "custom AR; nvlink forces the upstream fully-connected path but "
+            "still checks P2P. Auto preserves the legacy PCIe-switch switch; "
+            "explicit modes override it. disable-custom-all-reduce wins. "
+            "Use an explicit mode for diagnostics or unavailable NVML; auto "
+            "is the safe default. Other architectures and TP sizes retain "
+            "the upstream policy."
+        ),
+        category="configuration",
+        declared_default="auto",
+        effective_default="auto",
+        automatic_conditions=(
+            "CUDA SM70",
+            "tensor parallel size 4",
+            "CPU group agrees on topology and P2P",
+        ),
+        acceleration_paths=("SM70 collectives",),
+        user_visible=True,
+    ),
+    # Legacy PEX admission: auto requires PIX/PXB; 1 bypasses NVML topology;
+    # 0 excludes only PEX. All PEX paths now require fresh all-peer IPC access.
     "VLLM_SM70_PCIE_SWITCH_CUSTOM_AR": env_var(
         lambda: os.getenv("VLLM_SM70_PCIE_SWITCH_CUSTOM_AR", "auto").strip().lower(),
         description=(
             "Custom all-reduce for four SM70 GPUs under one PCIe switch "
             "(nvidia-smi PIX/PXB, no NVLink): auto enables it when SM70, "
             "TP4 and the topology hold; 1 skips the topology query (the P2P "
-            "test still runs); 0 disables it. Other topologies keep the "
-            "upstream rule."
+            "test still runs); 0 disables it. Explicit pex/nccl/nvlink values "
+            "of VLLM_SM70_INTERCONNECT take precedence. PEX always performs "
+            "fresh all-peer IPC validation, ignoring VLLM_SKIP_P2P_CHECK and "
+            "the persistent P2P cache. Other topologies keep the upstream rule."
         ),
         category="experimental",
         declared_default="auto",

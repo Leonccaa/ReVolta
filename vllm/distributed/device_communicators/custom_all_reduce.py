@@ -3,7 +3,8 @@
 
 import os
 from contextlib import contextmanager
-from typing import cast
+from dataclasses import dataclass, replace
+from typing import Literal, cast
 
 import regex as re
 import torch
@@ -15,6 +16,7 @@ from vllm import _custom_ops as ops
 from vllm.distributed.device_communicators.all_reduce_utils import (
     CUSTOM_ALL_REDUCE_MAX_SIZES,
     gpu_p2p_access_check,
+    gpu_p2p_access_check_fresh,
 )
 from vllm.distributed.parallel_state import in_the_same_node_as
 from vllm.logger import init_logger
@@ -235,16 +237,240 @@ def _sm70_pcie_switch_tp4_mode(
     return current_platform.is_pcie_switch_connected(physical_device_ids)
 
 
-def _can_p2p(rank: int, world_size: int) -> bool:
-    for i in range(world_size):
-        if i == rank:
+def _can_p2p(
+    rank: int,
+    world_size: int,
+    device_indices: list[int] | None = None,
+    *,
+    driver_only: bool = False,
+) -> bool:
+    # TP rank is not necessarily the CUDA ordinal (subgroups/reordered devices).
+    indices = list(range(world_size)) if device_indices is None else device_indices
+    results = []
+    for peer in range(world_size):
+        if peer == rank:
             continue
-        if envs.VLLM_SKIP_P2P_CHECK:
-            logger.debug("Skipping P2P check and trusting the driver's P2P report.")
-            return torch.cuda.can_device_access_peer(rank, i)
-        if not gpu_p2p_access_check(rank, i):
-            return False
-    return True
+        if driver_only or envs.VLLM_SKIP_P2P_CHECK:
+            results.append(
+                torch.cuda.can_device_access_peer(indices[rank], indices[peer])
+            )
+        else:
+            results.append(gpu_p2p_access_check(indices[rank], indices[peer]))
+    return all(results)
+
+
+@dataclass(frozen=True)
+class _InterconnectDecision:
+    mode: str
+    fully_connected: bool = False
+    source: str = "upstream"
+    nvml: str = "not queried"
+    p2p: str = "not checked"
+    reason: str = ""
+    max_bytes: int = 0
+    graph_only: bool = False
+
+
+def _select_interconnect(
+    world_size: int,
+    capability: DeviceCapability | None,
+    physical_device_ids: list[int],
+    disable_custom_all_reduce: bool,
+) -> _InterconnectDecision:
+    """Select a candidate policy; only _resolve_interconnect confirms P2P."""
+    requested = envs.VLLM_SM70_INTERCONNECT
+    if requested not in ("auto", "pex", "nccl", "nvlink"):
+        raise ValueError(
+            "VLLM_SM70_INTERCONNECT must be auto, pex, nccl or nvlink, "
+            f"got {requested!r}"
+        )
+    scoped = (
+        current_platform.is_cuda()
+        and world_size == 4
+        and capability == DeviceCapability(7, 0)
+    )
+    if scoped and (disable_custom_all_reduce or requested == "nccl"):
+        return _InterconnectDecision(
+            "no_p2p",
+            source="disable-custom-all-reduce"
+            if disable_custom_all_reduce
+            else "env:nccl",
+            reason="custom AR disabled by policy",
+        )
+    try:
+        fully_connected = current_platform.is_fully_connected(physical_device_ids)
+        nvml = f"NVLink={fully_connected}"
+    except Exception:
+        if not (scoped and requested in ("pex", "nvlink")):
+            raise
+        fully_connected = False
+        nvml = "NVLink=query failed (explicit override)"
+    source = f"env:{requested}" if scoped and requested != "auto" else "auto"
+    if scoped and requested == "nvlink":
+        # Explicit escape hatch for unavailable NVML. P2P is still mandatory.
+        return _InterconnectDecision("nvlink", True, source, nvml)
+    if fully_connected and not (scoped and requested == "pex"):
+        return _InterconnectDecision("nvlink", True, source, nvml)
+    if scoped:
+        pex = requested == "pex" or _sm70_pcie_switch_tp4_mode(
+            world_size, capability, physical_device_ids
+        )
+        if requested == "pex" or envs.VLLM_SM70_PCIE_SWITCH_CUSTOM_AR == "1":
+            nvml += "; PIX/PXB=bypassed"
+        elif envs.VLLM_SM70_PCIE_SWITCH_CUSTOM_AR == "0":
+            nvml += "; PIX/PXB=disabled"
+        else:
+            nvml += f"; PIX/PXB={pex}"
+        if pex:
+            return _InterconnectDecision(
+                "pex_p2p",
+                True,
+                source,
+                nvml,
+                max_bytes=envs.VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES,
+                graph_only=envs.VLLM_SM70_PCIE_SWITCH_CAR_GRAPH_ONLY,
+            )
+    if (
+        world_size == 8
+        and capability == DeviceCapability(7, 0)
+        and envs.VLLM_SM70_TP8_HIERARCHICAL_CUSTOM_AR
+    ):
+        return _InterconnectDecision("tp8_hierarchical", False, "upstream", nvml)
+    if world_size <= 2:
+        return _InterconnectDecision("upstream", False, "upstream", nvml)
+    return _InterconnectDecision(
+        "no_p2p",
+        source=source,
+        nvml=nvml,
+        reason="upstream excludes more than two PCIe-only GPUs",
+    )
+
+
+def _resolve_interconnect(
+    group: ProcessGroup,
+    rank: int,
+    world_size: int,
+    capability: DeviceCapability | None,
+    physical_device_ids: list[int],
+    device_ids: list[int],
+    disable_custom_all_reduce: bool = False,
+) -> _InterconnectDecision:
+    """Confirm topology and P2P on the CPU group, before any native/IPC init.
+
+    All ranks enter the same collectives even when their local NVML/driver
+    checks disagree or fail. No PEX probe reads or writes the persistent cache.
+    """
+    try:
+        candidate = _select_interconnect(
+            world_size, capability, physical_device_ids, disable_custom_all_reduce
+        )
+    except ValueError as error:
+        # Join the policy collective before reporting a typo. One rank with
+        # bad configuration must not leave its peers waiting in a collective.
+        candidate = _InterconnectDecision("invalid", source="env", reason=str(error))
+    except Exception as error:
+        candidate = _InterconnectDecision(
+            "no_p2p", reason=f"topology query failed: {type(error).__name__}"
+        )
+    if candidate.mode not in ("no_p2p", "pex_p2p", "tp8_hierarchical"):
+        candidate = replace(
+            candidate,
+            p2p="driver" if envs.VLLM_SKIP_P2P_CHECK else "cached IPC",
+        )
+    candidates = [candidate] * world_size
+    dist.all_gather_object(candidates, candidate, group=group)
+    # Compare dispatch limits as well as mode: different graph/size admission
+    # can hang a collective just as a different enabled/disabled decision can.
+    signatures = {
+        (
+            value.mode,
+            value.fully_connected,
+            value.max_bytes,
+            value.graph_only,
+            value.p2p,
+        )
+        for value in candidates
+    }
+    if len(signatures) != 1:
+        return _InterconnectDecision(
+            "no_p2p",
+            source="group consensus",
+            nvml="per-rank disagreement",
+            reason="rank policy mismatch; entire group uses NCCL",
+        )
+    if candidate.mode == "invalid":
+        raise ValueError(candidates[0].reason)
+    if candidate.mode == "no_p2p":
+        return candidate
+    try:
+        indices = [device_ids.index(physical_id) for physical_id in physical_device_ids]
+        if candidate.mode == "tp8_hierarchical":
+            peers = _sm70_tp8_hierarchical_peer_ranks(rank)
+            local_ok = all(
+                torch.cuda.can_device_access_peer(indices[rank], indices[peer])
+                for peer in peers
+                if peer != rank
+            )
+        else:
+            local_ok = current_platform.is_rocm() or _can_p2p(
+                rank,
+                world_size,
+                indices,
+                driver_only=candidate.mode == "pex_p2p",
+            )
+    except Exception as error:
+        local_ok = False
+        logger.warning("GPU P2P check failed: %s", type(error).__name__)
+    statuses = [None] * world_size
+    dist.all_gather_object(statuses, local_ok, group=group)
+    p2p = "driver all peers" if envs.VLLM_SKIP_P2P_CHECK else "cached IPC all peers"
+    if candidate.mode in ("pex_p2p", "tp8_hierarchical"):
+        p2p = "driver all required peers"
+    if not all(value is True for value in statuses):
+        return replace(
+            candidate,
+            mode="no_p2p",
+            fully_connected=False,
+            p2p=p2p + "=failed",
+            reason="P2P unavailable on at least one rank; entire group uses NCCL",
+        )
+    if candidate.mode == "pex_p2p":
+        fresh_ok = None
+        if rank == 0:
+            try:
+                fresh_ok = gpu_p2p_access_check_fresh(indices)
+            except Exception as error:
+                fresh_ok = False
+                logger.warning("Fresh PEX P2P check failed: %s", type(error).__name__)
+        fresh_results = [None] * world_size
+        dist.all_gather_object(fresh_results, fresh_ok, group=group)
+        p2p = "driver all peers=passed; fresh IPC all directed peers"
+        if fresh_results[0] is not True:
+            return replace(
+                candidate,
+                mode="no_p2p",
+                fully_connected=False,
+                p2p=p2p + "=failed",
+                reason="fresh IPC failed; entire group uses NCCL",
+            )
+    return replace(candidate, p2p=p2p + "=passed")
+
+
+def get_sm70_interconnect_mode(
+    communicator: "CustomAllreduce | None",
+) -> Literal["pex_p2p", "nvlink", "no_p2p"]:
+    """W9 profile hook: query only after the TP communicator was initialized.
+
+    Before init (None), after a group fallback, or when custom AR is disabled,
+    return no_p2p. Only pex_p2p/nvlink permit custom-AR-dependent defaults.
+    This function never probes CUDA or consults an unconfirmed topology guess.
+    """
+    if communicator is not None and not communicator.disabled:
+        if communicator.interconnect_mode == "pex_p2p":
+            return "pex_p2p"
+        if communicator.interconnect_mode == "nvlink":
+            return "nvlink"
+    return "no_p2p"
 
 
 def is_weak_contiguous(inp: torch.Tensor):
@@ -263,6 +489,7 @@ class CustomAllreduce:
     _vmm_safe_fallbacks = 0
     # SM70 PCIe-switch TP4 mode; class defaults keep instances made without
     # __init__ (tests) on the upstream path.
+    interconnect_mode = "no_p2p"
     sm70_pcie_switch = False
     sm70_pcie_switch_max_bytes = 0
     sm70_pcie_switch_graph_only = False
@@ -275,6 +502,7 @@ class CustomAllreduce:
         max_size=8192 * 1024,
         symm_mem_enabled=False,
         long_prefill_fusion_enabled=False,
+        disable_custom_all_reduce=False,
     ) -> None:
         """
         Args:
@@ -370,90 +598,42 @@ class CustomAllreduce:
         dist.all_gather(gather_list, tensor, group=self.group)
         physical_device_ids = [t.item() for t in gather_list]
 
-        # test nvlink first, this will filter out most of the cases
-        # where custom allreduce is not supported
-        # this checks hardware and driver support for NVLink
         assert current_platform.is_cuda_alike()
-        fully_connected = current_platform.is_fully_connected(physical_device_ids)
-        if (
-            world_size > 2
-            and not fully_connected
-            and _sm70_pcie_switch_tp4_mode(
-                world_size, device_capability, physical_device_ids
-            )
-        ):
-            # Every fully_connected consumer below behaves as on an NVLink
-            # mesh; should_custom_ar() adds the PCIe payload limits.
-            fully_connected = True
-            self.sm70_pcie_switch = True
-            self.sm70_pcie_switch_max_bytes = envs.VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES
-            self.sm70_pcie_switch_graph_only = envs.VLLM_SM70_PCIE_SWITCH_CAR_GRAPH_ONLY
+        decision = _resolve_interconnect(
+            self.group,
+            rank,
+            world_size,
+            device_capability,
+            physical_device_ids,
+            device_ids,
+            disable_custom_all_reduce,
+        )
+        self.interconnect_mode = decision.mode
+        logger.info(
+            "SM70 interconnect=%s source=%s; NVML: %s; P2P: %s; %s",
+            decision.mode,
+            decision.source,
+            decision.nvml,
+            decision.p2p,
+            decision.reason or "group consensus passed",
+        )
+        if decision.mode == "no_p2p":
+            return
+        fully_connected = decision.fully_connected
+        self.sm70_pcie_switch = decision.mode == "pex_p2p"
+        if self.sm70_pcie_switch:
+            self.sm70_pcie_switch_max_bytes = decision.max_bytes
+            self.sm70_pcie_switch_graph_only = decision.graph_only
             logger.info(
                 "SM70 PCIe-switch custom allreduce enabled for TP4 "
                 "(payload <= %d bytes, graph capture only: %s).",
                 self.sm70_pcie_switch_max_bytes,
                 self.sm70_pcie_switch_graph_only,
             )
-        tp8_hierarchical = False
-        hierarchical_peer_ranks: tuple[int, ...] | None = None
-        if world_size > 2 and not fully_connected:
-            sm70_tp8_candidate = (
-                envs.VLLM_SM70_TP8_HIERARCHICAL_CUSTOM_AR
-                and world_size == 8
-                and device_capability is not None
-                and device_capability.major == 7
-                and device_capability.minor == 0
-            )
-            if not sm70_tp8_candidate:
-                logger.warning(
-                    "Custom allreduce is disabled because it's not supported on"
-                    " more than two PCIe-only GPUs. To silence this warning, "
-                    "specify disable_custom_all_reduce=True explicitly."
-                )
-                return
-
-            hierarchical_peer_ranks = _sm70_tp8_hierarchical_peer_ranks(rank)
-            try:
-                rank_device_indices = [
-                    device_ids.index(physical_id) for physical_id in physical_device_ids
-                ]
-            except ValueError:
-                logger.warning(
-                    "SM70 TP8 hierarchical custom allreduce cannot map all rank "
-                    "devices into CUDA_VISIBLE_DEVICES."
-                )
-                return
-            local_topology_ok = all(
-                peer == rank
-                or torch.cuda.can_device_access_peer(
-                    device.index, rank_device_indices[peer]
-                )
-                for peer in hierarchical_peer_ranks
-            )
-            topology_status: list[bool | None] = [None] * world_size
-            dist.all_gather_object(topology_status, local_topology_ok, group=self.group)
-            if not all(status is True for status in topology_status):
-                logger.warning(
-                    "SM70 TP8 hierarchical custom allreduce is disabled because "
-                    "a required clique or paired NVLink P2P edge is unavailable."
-                )
-                return
-            tp8_hierarchical = True
-        # test P2P capability, this checks software/cudaruntime support
-        # this is expensive to compute at the first time
-        # then we cache the result
-        # On AMD GPU, p2p is always enabled between XGMI connected GPUs
-        if (
-            not tp8_hierarchical
-            and not current_platform.is_rocm()
-            and not _can_p2p(rank, world_size)
-        ):
-            logger.warning(
-                "Custom allreduce is disabled because your platform lacks "
-                "GPU P2P capability or P2P test failed. To silence this "
-                "warning, specify disable_custom_all_reduce=True explicitly."
-            )
-            return
+        tp8_hierarchical = decision.mode == "tp8_hierarchical"
+        hierarchical_peer_ranks = (
+            _sm70_tp8_hierarchical_peer_ranks(rank) if tp8_hierarchical else None
+        )
 
         self.disabled = False
         # Buffers memory are owned by this Python class and passed to C++.

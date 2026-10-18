@@ -367,3 +367,78 @@ def test_block_ids_are_not_overwritten_while_copy_is_in_flight() -> None:
     torch.testing.assert_close(storage[1], torch.zeros_like(storage[1]))
     torch.testing.assert_close(storage[2], torch.zeros_like(storage[2]))
     torch.testing.assert_close(storage[3], torch.ones_like(storage[3]))
+
+
+def _packed_members(device: torch.device, num_blocks: int = 4):
+    """Two attention layers packed into one physical page, as attn_utils builds
+    them for DCP-sharded pages: member j is a view offset by j kernel blocks
+    with a block stride that spans both members."""
+    spec = FullAttentionSpec(
+        block_size=4, num_kv_heads=1, head_size=4, dtype=torch.float16
+    )
+    kernel_bs, member_count = 2, 2
+    ratio = spec.block_size // kernel_bs
+    block_bytes = spec.page_size_bytes * member_count
+    raw = torch.ones(num_blocks * block_bytes, dtype=torch.int8, device=device)
+    shape = (num_blocks * ratio, 2, kernel_bs, spec.num_kv_heads, spec.head_size)
+    strides = list(torch.empty(shape, device="meta").stride())
+    kernel_block_numel = strides[0]
+    strides[0] = kernel_block_numel * member_count
+    views = {
+        f"layer{j}": torch.as_strided(
+            raw.view(spec.dtype),
+            size=shape,
+            stride=tuple(strides),
+            storage_offset=kernel_block_numel * j,
+        )
+        for j in range(member_count)
+    }
+    group = SimpleNamespace(
+        kv_cache_spec=spec,
+        kv_cache_group_id=0,
+        layer_names=list(views),
+        backend=_BlockFirstAttentionBackend,
+    )
+    context = {name: SimpleNamespace(kv_cache=kv) for name, kv in views.items()}
+    zeroer = KVBlockZeroer(device, pin_memory=False)
+    zeroer.init_meta(
+        [group],
+        kernel_block_sizes=[kernel_bs],
+        cache_dtype="auto",
+        runner_only_attn_layers=set(),
+        static_forward_context=context,
+    )
+    return raw, block_bytes, zeroer
+
+
+@pytest.mark.skip_global_cleanup
+def test_packed_member_segments_stay_inside_their_page() -> None:
+    """Every (block, segment) zero range must lie inside that block's physical
+    page and the segments must cover it. Zeroing member 1 from its own start
+    used to run one kernel block into the next page (DCP2 packed main KV)."""
+    num_blocks = 4
+    raw, block_bytes, zeroer = _packed_members(torch.device("cpu"), num_blocks)
+    assert zeroer._meta is not None
+    seg_addrs, seg_strides, seg_pages = (t.tolist() for t in zeroer._meta[:3])
+    base = raw.data_ptr()
+    for block in range(num_blocks):
+        page = (base + block * block_bytes, base + (block + 1) * block_bytes)
+        covered: set[int] = set()
+        for addr, stride, size in zip(seg_addrs, seg_strides, seg_pages):
+            start = addr + block * stride * 4
+            end = start + size * 4
+            assert page[0] <= start and end <= page[1], (block, start, end, page)
+            covered.update(range(start, end))
+        assert covered == set(range(*page))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_zero_block_ids_packed_members_leave_next_block_alone() -> None:
+    num_blocks = 4
+    raw, block_bytes, zeroer = _packed_members(torch.device("cuda"), num_blocks)
+    zeroer.zero_block_ids([1])
+    torch.accelerator.synchronize()
+    pages = raw.view(num_blocks, block_bytes)
+    assert bool((pages[1] == 0).all())
+    for block in (0, 2, 3):
+        assert bool((pages[block] == 1).all()), block

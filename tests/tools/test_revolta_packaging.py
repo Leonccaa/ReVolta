@@ -71,6 +71,11 @@ def test_docker_explicit_release_version_is_exact():
     assert 'export VLLM_VERSION_OVERRIDE="${SETUPTOOLS_SCM_PRETEND_VERSION}"' in source
 
 
+def test_sm70_image_skips_unsupported_cubin_prefetch():
+    source = (ROOT / "docker/Dockerfile").read_text()
+    assert "Skipping unsupported FlashInfer cubin prefetch for SM70" in source
+
+
 def test_metadata_prefers_revolta():
     from vllm import version
 

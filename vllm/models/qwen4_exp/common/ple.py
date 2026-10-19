@@ -4,7 +4,7 @@
 
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import pairwise
 from typing import TYPE_CHECKING, Any
 
@@ -92,6 +92,33 @@ def compute_ple_shard_overlap(
         destination_start=overlap_start - tp_start,
         row_count=overlap_end - overlap_start,
     )
+
+
+@dataclass
+class PLECheckpointCoverage:
+    """Checkpoint row intervals, not a sum that duplicate shards can inflate."""
+
+    intervals: list[tuple[int, int]] = field(default_factory=list)
+    scale_loaded: bool = False
+
+    def record(self, start: int, end: int) -> None:
+        self.intervals.append((start, end))
+
+    def validate(self, start: int, end: int) -> None:
+        cursor = start
+        for lo, hi in sorted(self.intervals):
+            if lo > cursor:
+                break
+            cursor = max(cursor, hi)
+            if cursor >= end:
+                break
+        if cursor < end:
+            raise RuntimeError(
+                "FP8 PLE checkpoint has incomplete row coverage: "
+                f"missing rows starting at {cursor} in [{start}, {end})."
+            )
+        if not self.scale_loaded:
+            raise RuntimeError("FP8 PLE weight_scale was not loaded from checkpoint.")
 
 
 def copy_ple_embedding_shard_(

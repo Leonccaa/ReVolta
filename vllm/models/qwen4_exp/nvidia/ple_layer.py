@@ -86,6 +86,7 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 from ..common.ple import (
     PLE_SHARD_PREFIX,
+    PLECheckpointCoverage,
     PLEDiskSegment,
     PLEPlacement,
     PLERemotePlacement,
@@ -448,6 +449,29 @@ class Qwen4ExpPLEGroupedNorm(nn.Module):
         return (normalized * (1.0 + self.weight.float())).to(input_dtype)
 
 
+def _fp8_checkpoint_coverage(layer: nn.Module) -> PLECheckpointCoverage:
+    coverage = getattr(layer, "_ple_checkpoint_coverage", None)
+    if coverage is None:
+        coverage = PLECheckpointCoverage()
+        layer._ple_checkpoint_coverage = coverage
+    return coverage
+
+
+def _validate_fp8_checkpoint(layer: nn.Module) -> None:
+    from vllm.config import get_current_vllm_config_or_none
+
+    config = get_current_vllm_config_or_none()
+    if getattr(getattr(config, "load_config", None), "load_format", None) == "dummy":
+        return
+    indices = layer.shard_indices
+    start = indices.org_vocab_start_index
+    end = min(indices.org_vocab_end_index, layer.org_vocab_size)
+    if isinstance(layer, Qwen4ExpPinnedHostEmbedding):
+        # The worker owns disk rows; padding has no checkpoint source.
+        end = min(end, start + layer.local_rows)
+    _fp8_checkpoint_coverage(layer).validate(start, end)
+
+
 class Qwen4ExpPLEFp8EmbeddingMethod(QuantizeMethodBase):
     """FP8 PLE embedding with one global checkpoint scale."""
 
@@ -480,6 +504,7 @@ class Qwen4ExpPLEFp8EmbeddingMethod(QuantizeMethodBase):
             scale_dtype=params_dtype,
         )
         layer.register_parameter("weight_scale", weight_scale)
+        _fp8_checkpoint_coverage(layer)
 
     def apply(
         self,
@@ -502,6 +527,7 @@ class Qwen4ExpPLEFp8EmbeddingMethod(QuantizeMethodBase):
         return F.embedding(input_, weight)
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
+        _validate_fp8_checkpoint(layer)
         prepare_accelerator_weight = getattr(layer, "prepare_accelerator_weight", None)
         if prepare_accelerator_weight is not None:
             prepare_accelerator_weight()
@@ -887,6 +913,11 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         tp_end: int,
     ) -> int:
         """Copy one checkpoint shard into whichever resident tier owns its rows."""
+        if loaded_weight.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                "PLE resident shard dtype mismatch: expected "
+                f"torch.float8_e4m3fn, got {loaded_weight.dtype}"
+            )
         self.materialize_tables()
         assert self.ple_device_table is not None
         assert self.ple_host_storage is not None
@@ -904,6 +935,9 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             tp_end=tp_end,
         )
         self._checkpoint_shard_loaded = True
+        _fp8_checkpoint_coverage(self).record(
+            checkpoint_start, checkpoint_start + loaded_weight.shape[0]
+        )
         return copied
 
     def get_accelerator_weight(self, device: torch.device) -> torch.Tensor:
@@ -935,6 +969,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
 
     def prepare_accelerator_weight(self) -> None:
         self.materialize_tables()
+        _validate_fp8_checkpoint(self)
         if not self._checkpoint_shard_loaded and not self._accelerator_weight_views:
             # Dummy loading initializes only the zero-row parameter, not these
             # private tables. Ensure finite profiling data before graph capture.
@@ -1915,6 +1950,14 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                     self._disk_mapped_paths.add(mapped_path)
                     loaded.add("ngram_embedding.weight")
                     continue
+                if (
+                    embedding.weight.dtype == torch.float8_e4m3fn
+                    and loaded_weight.dtype != torch.float8_e4m3fn
+                ):
+                    raise ValueError(
+                        "PLE resident shard dtype mismatch: expected "
+                        f"torch.float8_e4m3fn, got {loaded_weight.dtype}"
+                    )
                 if isinstance(embedding, Qwen4ExpPinnedHostEmbedding):
                     # Split placement: the embedding routes each shard into
                     # its device or host part (tables built on first shard).
@@ -1932,6 +1975,10 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                         tp_start=embedding.shard_indices.org_vocab_start_index,
                         tp_end=embedding.shard_indices.org_vocab_end_index,
                     )
+                    if embedding.weight.dtype == torch.float8_e4m3fn:
+                        _fp8_checkpoint_coverage(embedding).record(
+                            checkpoint_start, checkpoint_start + loaded_weight.shape[0]
+                        )
                 loaded.add("ngram_embedding.weight")
                 continue
             if file_backed and name == "ngram_embedding.weight_scale":
@@ -1972,6 +2019,13 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             )
         if regular_weights:
             loaded.update(AutoWeightsLoader(self).load_weights(regular_weights))
+        if (
+            not file_backed
+            and nvfp4_embedding is None
+            and self.ngram_embedding.weight.dtype == torch.float8_e4m3fn
+            and "ngram_embedding.weight_scale" in loaded
+        ):
+            _fp8_checkpoint_coverage(self.ngram_embedding).scale_loaded = True
         return loaded
 
 

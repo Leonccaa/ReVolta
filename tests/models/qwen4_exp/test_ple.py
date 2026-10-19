@@ -80,6 +80,15 @@ def _pinned_layer(
         )
 
 
+def _prepare_fixture_weight(layer):
+    # Kernel fixtures populate tensors by hand. Only the dedicated loader
+    # tests claim checkpoint provenance and exercise integrity validation.
+    config = VllmConfig()
+    config.load_config.load_format = "dummy"
+    with set_current_vllm_config(config):
+        layer.prepare_accelerator_weight()
+
+
 def _expose_to_gather_op(monkeypatch: pytest.MonkeyPatch, *layers) -> None:
     # qwen4_exp_ple_pinned_gather resolves the table through the forward
     # context, like qwen4_exp_compute_ple_ngram_ids does for its layer.
@@ -155,7 +164,7 @@ def test_pinned_host_ple_without_budget_keeps_everything_on_device(
     layer = _pinned_layer(num_embeddings=8)
     # Preparing the accelerator view (process_weights_after_loading) must not
     # depend on a shard having been loaded, e.g. with dummy weights.
-    layer.prepare_accelerator_weight()
+    _prepare_fixture_weight(layer)
 
     assert layer.ple_device_table is not None
     assert layer.ple_device_table.shape == (8, 8)
@@ -194,7 +203,7 @@ def test_pinned_host_ple_fp8_rows_are_gatherable_across_the_split_on_sm70(
         torch.tensor([0.25], dtype=torch.float16, device="cuda"),
         requires_grad=False,
     )
-    layer.prepare_accelerator_weight()
+    _prepare_fixture_weight(layer)
 
     ids = torch.tensor([0, 3, 4, 7, 2], dtype=torch.int64, device="cuda")
     output = layer(ids)
@@ -218,7 +227,7 @@ def test_pinned_host_ple_fp8_rows_are_gatherable_across_the_split_on_sm70(
         # Reload both halves in-place; captured pointers must stay live.
         reloaded = raw.roll(offset, dims=0).view(torch.float8_e4m3fn)
         layer.load_shard(reloaded, checkpoint_start=0, tp_start=0, tp_end=8)
-        layer.prepare_accelerator_weight()
+        _prepare_fixture_weight(layer)
         ids.copy_((ids + 1) % 8)
         graph.replay()
         expected = reloaded.float() * 0.25
@@ -241,7 +250,7 @@ def test_dummy_ple_tables_do_not_retain_uninitialized_bytes(monkeypatch, host_ro
         return result
 
     monkeypatch.setattr(ple_module.torch, "empty", poisoned_empty)
-    layer.prepare_accelerator_weight()
+    _prepare_fixture_weight(layer)
     for table in (layer.ple_device_table, layer.ple_host_storage):
         assert torch.all(table.view(torch.uint8) == 0)
 
@@ -1654,7 +1663,7 @@ def test_pinned_host_ple_merges_the_workers_rows_bit_identically(
         torch.tensor([0.25], dtype=torch.float16, device="cuda"),
         requires_grad=False,
     )
-    layer.prepare_accelerator_weight()
+    _prepare_fixture_weight(layer)
     assert layer.local_rows == 8
 
     ids = torch.tensor([0, 9, 3, 11, 8, 7], dtype=torch.int64, device="cuda")
@@ -1823,7 +1832,7 @@ def test_one_worker_buffer_merges_into_every_rank_bit_identically(
                 tp_end=layer.shard_indices.org_vocab_end_index,
             )
         layer.weight_scale = nn.Parameter(scale.clone(), requires_grad=False)
-        layer.prepare_accelerator_weight()
+        _prepare_fixture_weight(layer)
         assert layer._device_rows == rows // 4 and layer._disk_rows > 0
         ranks.append(layer)
     _expose_to_gather_op(monkeypatch, *ranks)
@@ -1918,7 +1927,7 @@ def test_pinned_host_ple_merge_stays_bit_identical_under_inductor(
         torch.tensor([0.0371], dtype=torch.float16, device="cuda"),
         requires_grad=False,
     )
-    layer.prepare_accelerator_weight()
+    _prepare_fixture_weight(layer)
     assert layer._host_rows == host_rows
 
     def merged(ids: torch.Tensor, remote: torch.Tensor) -> torch.Tensor:

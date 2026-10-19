@@ -31,6 +31,7 @@ from vllm.v1.kv_offload.tiering.base import (
     SecondaryTierManager,
 )
 from vllm.v1.kv_offload.tiering.fs.cache import FileSystemCache
+from vllm.v1.kv_offload.tiering.fs.config import validate_fs_budget
 from vllm.v1.kv_offload.tiering.fs.io import load_block, store_block
 from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
 
@@ -62,7 +63,7 @@ class FileSystemTierManager(SecondaryTierManager):
         n_read_threads: int = 16,
         n_write_threads: int = 16,
         max_size_bytes: int | None = None,
-        min_free_bytes: int = 0,
+        min_free_bytes: int | None = None,
         max_files: int = 1_000_000,
     ):
         """
@@ -75,10 +76,12 @@ class FileSystemTierManager(SecondaryTierManager):
             n_read_threads: Number of read-priority I/O threads.
             n_write_threads: Number of write-priority I/O threads.
             max_size_bytes: Total page budget across all groups/layouts in root_dir.
-                None preserves the legacy unbounded cache.
+                Required positive byte count; unbounded disk caches are rejected.
             min_free_bytes: Filesystem space to leave available before writes.
+                Defaults to 5% of filesystem capacity. An explicit 0 disables it.
             max_files: Page count limit shared across groups, bounding the index.
         """
+        validate_fs_budget(max_size_bytes, min_free_bytes)
         super().__init__(offloading_spec, primary_kv_view, tier_type)
 
         # Extract block size from primary view

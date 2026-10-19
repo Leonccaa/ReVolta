@@ -106,6 +106,12 @@ class KVTransferConfig:
                 f"is set, supported roles are {get_args(KVRole)}"
             )
 
+        # Reject unbounded SSD caches before worker/model initialization.
+        if self.kv_connector == "OffloadingConnector":
+            from vllm.v1.kv_offload.tiering.fs.config import fs_tier_configs
+
+            fs_tier_configs(self)
+
     @property
     def is_kv_transfer_instance(self) -> bool:
         return self.kv_connector is not None and self.kv_role in get_args(KVRole)

@@ -83,6 +83,7 @@ def _build(root, **fs_options):
         {
             "type": "fs",
             "root_dir": str(root),
+            "max_size_bytes": 1 << 24,
             "n_read_threads": 1,
             "n_write_threads": 1,
             **fs_options,

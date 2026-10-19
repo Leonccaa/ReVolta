@@ -29,16 +29,19 @@ class FileSystemCache:
         cls,
         root: str,
         max_size_bytes: int | None,
-        min_free_bytes: int,
+        min_free_bytes: int | None = None,
         max_files: int = 1_000_000,
     ) -> "FileSystemCache":
         root = os.path.realpath(root)
-        if max_size_bytes is not None and max_size_bytes <= 0:
-            raise ValueError("max_size_bytes must be positive")
-        if min_free_bytes < 0:
-            raise ValueError("min_free_bytes must be non-negative")
+        from vllm.v1.kv_offload.tiering.fs.config import validate_fs_budget
+
+        validate_fs_budget(max_size_bytes, min_free_bytes)
         if max_files <= 0:
             raise ValueError("max_files must be positive")
+        if min_free_bytes is None:
+            os.makedirs(root, exist_ok=True)
+            stat = os.statvfs(root)
+            min_free_bytes = max(1, stat.f_blocks * stat.f_frsize // 20)
         with cls._registry_lock:
             cache = cls._registry.get(root)
             if cache is None:

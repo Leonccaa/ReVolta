@@ -31,6 +31,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.platforms import current_platform
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -52,7 +53,13 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
-from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
+    CrossAttentionSpec,
+    KpoolTailSpec,
+    KVCacheConfig,
+    MambaSpec,
+)
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
@@ -290,6 +297,24 @@ class Scheduler(SchedulerInterface):
             metrics_collector=self.kv_metrics_collector,
             prefix_cache_retention_interval=self.cache_config.prefix_cache_retention_interval,
         )
+        # Adapted from vLLM #44560, #57104 and #59880. Mamba managers already
+        # include their speculative states. Fixed ring/tail and cross-attention
+        # allocations do not grow during decode. Other attention groups need
+        # a margin while async loads are allocated without lookahead slots.
+        spec_step_tokens = (
+            1 + self.num_spec_tokens + self.num_lookahead_tokens
+            if self.num_spec_tokens
+            else 0
+        )
+        self._spec_decode_step_blocks = sum(
+            cdiv(spec_step_tokens, manager.block_size)
+            for manager in self.kv_cache_manager.coordinator.single_type_managers
+            if not isinstance(
+                manager.kv_cache_spec,
+                (MambaSpec, CircularBufferSpec, KpoolTailSpec, CrossAttentionSpec),
+            )
+        )
+        self._inflight_prefills: set[Request] = set()
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
         if self.connector is not None:
@@ -1021,6 +1046,21 @@ class Scheduler(SchedulerInterface):
                     step_skipped_waiting.prepend_request(request)
                     continue
 
+                # A parked KV load already holds blocks and a future runner
+                # slot, including after transfer completion. Let it promote,
+                # but do not admit additional work into its reserved slot.
+                if request not in self._inflight_prefills and (
+                    len(self.running)
+                    + sum(
+                        req.status != RequestStatus.RUNNING
+                        for req in self._inflight_prefills
+                    )
+                    >= self.max_num_running_reqs
+                ):
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
+
                 # Check that adding the request still respects the max_loras
                 # constraint.
                 if (
@@ -1189,6 +1229,15 @@ class Scheduler(SchedulerInterface):
                         for i in encoder_inputs_to_schedule
                     )
 
+                reserved_blocks = 0
+                if load_kv_async:
+                    # Parked transfers cannot be preempted to recover memory.
+                    # Protect earlier prefills and this load's first spec step.
+                    reserved_blocks = (
+                        self._inflight_prefill_reserved_blocks()
+                        + self._spec_decode_step_blocks
+                    )
+
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens,
@@ -1199,6 +1248,7 @@ class Scheduler(SchedulerInterface):
                     delay_cache_blocks=load_kv_async,
                     num_encoder_tokens=num_encoder_tokens,
                     full_sequence_must_fit=self.scheduler_reserve_full_isl,
+                    reserved_blocks=reserved_blocks,
                 )
 
                 if new_blocks is None:
@@ -1250,6 +1300,7 @@ class Scheduler(SchedulerInterface):
                     # _update_waiting_for_remote_kv will then cache
                     # only the successfully loaded tokens.
                     request.num_computed_tokens = num_computed_tokens
+                    self._inflight_prefills.add(request)
                     continue
 
                 self.running.append(request)
@@ -1279,6 +1330,8 @@ class Scheduler(SchedulerInterface):
                     prefill_token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+                if num_computed_tokens + num_new_tokens < request.num_tokens:
+                    self._inflight_prefills.add(request)
                 # Encoder-related.
                 if encoder_inputs_to_schedule:
                     scheduled_encoder_inputs[request_id] = encoder_inputs_to_schedule
@@ -1444,6 +1497,7 @@ class Scheduler(SchedulerInterface):
         )
         self.kv_cache_manager.free(request)
         self.encoder_cache_manager.free(request)
+        self._inflight_prefills.discard(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
         if request.spec_token_ids:
@@ -1476,6 +1530,8 @@ class Scheduler(SchedulerInterface):
             scheduler_output.has_structured_output_requests |= (
                 request.use_structured_output and not request.is_prefill_chunk
             )
+            if not request.is_prefill_chunk:
+                self._inflight_prefills.discard(request)
 
         # Snapshot block IDs for routed experts before forward starts.
         # A concurrent schedule() may preempt requests and free blocks
@@ -2465,6 +2521,7 @@ class Scheduler(SchedulerInterface):
     ) -> dict[str, Any] | None:
         assert request.is_finished()
 
+        self._inflight_prefills.discard(request)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
@@ -2704,6 +2761,31 @@ class Scheduler(SchedulerInterface):
 
         return self.connector.request_finished_all_groups(request, block_ids)
 
+    def _request_remaining_blocks(self, request: Request) -> int:
+        """Remaining allocator demand through prefill and speculative promotion."""
+        full_num_tokens = min(request.num_tokens, self.max_model_len)
+        num_tokens = full_num_tokens
+        if self.num_spec_tokens:
+            num_tokens = min(
+                num_tokens + 1 + self.num_spec_tokens + self.num_lookahead_tokens,
+                self.max_model_len,
+            )
+        return self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
+            request_id=request.request_id,
+            num_tokens=num_tokens,
+            new_computed_blocks=self.kv_cache_manager.empty_kv_cache_blocks.blocks,
+            num_encoder_tokens=0,
+            total_computed_tokens=request.num_computed_tokens,
+            num_tokens_main_model=full_num_tokens,
+            apply_admission_cap=True,
+        )
+
+    def _inflight_prefill_reserved_blocks(self) -> int:
+        """Protect the remaining demand of admitted prefills and async loads."""
+        return sum(
+            self._request_remaining_blocks(req) for req in self._inflight_prefills
+        )
+
     def _update_waiting_for_remote_kv(self, request: Request) -> None:
         """
         KV Connector: update request state after async recv is finished.
@@ -2724,6 +2806,7 @@ class Scheduler(SchedulerInterface):
                 # No valid computed tokens, release allocated blocks.
                 # There may be a local cache hit on retry.
                 self.kv_cache_manager.free(request)
+                self._inflight_prefills.discard(request)
 
             self.failed_recving_kv_req_ids.remove(request.request_id)
         else:
@@ -2845,13 +2928,36 @@ class Scheduler(SchedulerInterface):
             is_affected = False
             marked_invalid_block = False
             req_id = request.request_id
-            # TODO (davidb): add support for hybrid memory allocator
-            (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
+            block_groups = self.kv_cache_manager.get_block_ids(req_id)
             # We iterate only over blocks that may contain externally computed
             # tokens
             req_num_computed_tokens = (
                 request.num_computed_tokens - num_scheduled_tokens.get(req_id, 0)
             )
+
+            if len(block_groups) > 1:
+                # An async hybrid transfer has not published its cache entries.
+                # A token offset in one attention group is not a valid restore
+                # point for recurrent state or fixed ring/tail groups. Recompute
+                # the whole prefix on any group failure, and release all groups
+                # only when the transfer completes in _update_waiting_for_remote_kv.
+                null_id = self.kv_cache_manager.block_pool.null_block.block_id
+                if not any(
+                    block_id != null_id and block_id in invalid_block_ids
+                    for group in block_groups
+                    for block_id in group
+                ):
+                    # The failure scan also visits RUNNING peers. Unrelated
+                    # hybrid requests must not enter single-group recovery.
+                    continue
+                if not evict_blocks:
+                    affected_req_ids.add(req_id)
+                    total_affected_tokens += req_num_computed_tokens
+                    request.num_computed_tokens = 0
+                    continue
+
+            # Synchronous hybrid connector recovery remains unsupported here.
+            (req_block_ids,) = block_groups
 
             req_num_computed_blocks = (
                 req_num_computed_tokens + self.block_size - 1

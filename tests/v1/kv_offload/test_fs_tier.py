@@ -111,6 +111,7 @@ def fs_tier(tmp_path):
         primary_kv_view=mock_view,
         tier_type="fs",
         root_dir=str(tmp_path),
+        max_size_bytes=16 << 20,
         n_read_threads=4,
         n_write_threads=4,
     )
@@ -171,6 +172,7 @@ def test_invalid_path_raises_at_construction():
             primary_kv_view=mock_view,
             tier_type="fs",
             root_dir="/dev/null/invalid_path",
+            max_size_bytes=1 << 20,
         )
 
 

@@ -9,6 +9,7 @@ import pybase64
 import pytest
 from PIL import Image
 
+from vllm import envs
 from vllm.assets.base import get_vllm_public_assets
 from vllm.assets.video import video_to_ndarrays, video_to_pil_images_list
 from vllm.multimodal.media import ImageMediaIO, VideoMediaIO
@@ -36,7 +37,7 @@ class Assert10Frames1FPSVideoLoader(VideoLoader):
 def test_video_media_io_kwargs(monkeypatch: pytest.MonkeyPatch):
     with monkeypatch.context() as m:
         # These synthetic loaders test dispatch only and cannot precheck decoding.
-        m.setenv("VLLM_MAX_MEDIA_REQUEST_DECODE_BYTES", "0")
+        m.setattr(envs, "VLLM_MAX_MEDIA_REQUEST_DECODE_BYTES", 0, raising=False)
         m.setenv("VLLM_VIDEO_LOADER_BACKEND", "assert_10_frames_1_fps")
         imageio = ImageMediaIO()
 
@@ -153,7 +154,7 @@ def test_video_media_io_backend_kwarg_override(monkeypatch: pytest.MonkeyPatch):
     """
     with monkeypatch.context() as m:
         # Set the env var to one backend
-        m.setenv("VLLM_MAX_MEDIA_REQUEST_DECODE_BYTES", "0")
+        m.setattr(envs, "VLLM_MAX_MEDIA_REQUEST_DECODE_BYTES", 0, raising=False)
         m.setenv("VLLM_VIDEO_LOADER_BACKEND", "test_video_backend_override_1")
 
         imageio = ImageMediaIO()
@@ -201,7 +202,7 @@ def test_video_media_io_backend_kwarg_not_passed_to_loader(
 
     with monkeypatch.context() as m:
         # These synthetic loaders test dispatch only and cannot precheck decoding.
-        m.setenv("VLLM_MAX_MEDIA_REQUEST_DECODE_BYTES", "0")
+        m.setattr(envs, "VLLM_MAX_MEDIA_REQUEST_DECODE_BYTES", 0, raising=False)
         m.setenv("VLLM_VIDEO_LOADER_BACKEND", "test_reject_video_backend_kwarg")
 
         imageio = ImageMediaIO()
@@ -228,7 +229,7 @@ def test_video_media_io_backend_env_var_fallback(monkeypatch: pytest.MonkeyPatch
     """
     with monkeypatch.context() as m:
         # These synthetic loaders test dispatch only and cannot precheck decoding.
-        m.setenv("VLLM_MAX_MEDIA_REQUEST_DECODE_BYTES", "0")
+        m.setattr(envs, "VLLM_MAX_MEDIA_REQUEST_DECODE_BYTES", 0, raising=False)
         m.setenv("VLLM_VIDEO_LOADER_BACKEND", "test_video_backend_override_2")
 
         imageio = ImageMediaIO()

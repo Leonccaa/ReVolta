@@ -38,7 +38,7 @@ from vllm.forward_context import ForwardContext
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVQuantMode, get_kv_quant_mode
 from vllm.v1.kv_offload.factory import OffloadingSpecFactory
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
@@ -185,6 +185,18 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA, SupportsVmmSafeTransf
 
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: VllmConfig) -> str | None:
+        # Transfers copy whole raw physical pages (KVPhysicalPage.raw_pages), so
+        # the in-page layout does not matter to this connector. Existing formats
+        # keep HND. INT8 planar pages are defined block-major NHD by their writer
+        # and readers, and the planar binding rejects any other order, so leave
+        # the layout to the default (NHD) for them. Speculative-KV admission only
+        # allows an INT8 draft together with an INT8 target, so the target cache
+        # dtype decides for both.
+        if (
+            get_kv_quant_mode(vllm_config.cache_config.cache_dtype)
+            == KVQuantMode.INT8_PLANAR
+        ):
+            return None
         return "HND"
 
     def reset_cache(self) -> bool | None:

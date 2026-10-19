@@ -200,8 +200,13 @@ def test_async_load_does_not_displace_chunked_prefill():
 
 
 @pytest.mark.parametrize("action", ["cancel", "fail", "recompute", "preempt"])
-def test_reservation_released_on_lifecycle_changes(action):
-    scheduler = make_scheduler(blocks=10, long_prefill_token_threshold=32)
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_reservation_released_on_lifecycle_changes(action, hybrid):
+    scheduler = make_scheduler(
+        blocks=16 if hybrid else 10,
+        mamba=("align", 32) if hybrid else None,
+        long_prefill_token_threshold=32,
+    )
     a = request(scheduler, "a", 128)
     output = scheduler.schedule()
     if action == "cancel":

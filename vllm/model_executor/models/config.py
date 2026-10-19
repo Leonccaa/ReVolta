@@ -700,6 +700,13 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
     """Apply the Qwen3.5 hybrid-cache contract to Qwen4Exp."""
 
     @staticmethod
+    def get_mm_encoder_tp_linear_shapes(model_config: "ModelConfig"):
+        from vllm.config.mm_encoder_tp import qwen3_vision_tp_linears
+
+        vision = getattr(model_config.hf_config, "vision_config", None)
+        return () if vision is None else qwen3_vision_tp_linears(vision)
+
+    @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
         Qwen3_5ForConditionalGenerationConfig.verify_and_update_config(vllm_config)
         text_config = vllm_config.model_config.hf_text_config

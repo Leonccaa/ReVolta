@@ -1721,6 +1721,10 @@ class VllmConfig:
                 self.model_config, self.load_config
             )
 
+        from vllm.config.mm_encoder_tp import resolve_mm_encoder_tp_mode
+
+        resolve_mm_encoder_tp_mode(self)
+
         if (
             self.quant_config is not None
             and self.model_config is not None
@@ -2938,6 +2942,10 @@ class VllmConfig:
             self.compilation_config.debug_dump_path = env_path
 
         self._verify_kv_transfer_compat()
+
+        from vllm.config.speculative_kv import validate_speculative_kv_cache_dtype
+
+        validate_speculative_kv_cache_dtype(self)
         # Log the custom passes that are enabled
         self.compilation_config.pass_config.log_enabled_passes()
 

@@ -3,9 +3,12 @@
 import torch
 import torch.nn as nn
 
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, replace
 from vllm.distributed.parallel_state import get_pp_group
+from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
+
+logger = init_logger(__name__)
 
 
 def _should_share(eagle: nn.Module, flag: str, draft, target) -> bool:
@@ -37,9 +40,30 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
     draft_model_config = speculative_config.draft_model_config
+    draft_cache_dtype = getattr(speculative_config, "kv_cache_dtype", None)
+    draft_vllm_config = vllm_config
+    if (
+        draft_cache_dtype is not None
+        and draft_cache_dtype != vllm_config.cache_config.cache_dtype
+    ):
+        # Keep the inherited/same-dtype path identical, including its config
+        # identity. Scope the override before rerunning target-only admission.
+        draft_vllm_config = replace(
+            vllm_config,
+            is_speculative_draft=True,
+            cache_config=replace(
+                vllm_config.cache_config,
+                cache_dtype=draft_cache_dtype,
+            ),
+        )
+        logger.info_once(
+            "Using %s draft KV cache while the target uses %s.",
+            draft_cache_dtype,
+            vllm_config.cache_config.cache_dtype,
+        )
     with set_model_tag("eagle_head"):
         eagle_model = get_model(
-            vllm_config=vllm_config, model_config=draft_model_config
+            vllm_config=draft_vllm_config, model_config=draft_model_config
         )
 
     target_language_model = (

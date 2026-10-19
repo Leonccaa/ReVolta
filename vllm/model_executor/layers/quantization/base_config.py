@@ -165,6 +165,14 @@ class QuantizationConfig(ABC):
     def get_cache_scale(self, name: str) -> str | None:
         return None
 
+    def get_linear_input_alignment(self, prefix: str) -> int:
+        """Input-column alignment for an encoder TP preflight, without weights.
+
+        Quantizers with grouped/packed linear weights can override this. One
+        preserves existing admission for methods without a declared constraint.
+        """
+        return 1
+
     def apply_vllm_mapper(  # noqa: B027
         self, hf_to_vllm_mapper: "WeightsMapper"
     ):

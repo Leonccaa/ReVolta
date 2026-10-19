@@ -19518,6 +19518,9 @@ def compile_factors() -> dict[str, object]:
         "VLLM_DEBUG_LOG_API_SERVER_RESPONSE",
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",
+        # Where the SM70 GEMM dispatch cache is saved; dispatch happens inside
+        # custom ops at run time, so the traced graph does not depend on it.
+        "VLLM_SM70_GEMM_LUT_PATH",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
         "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS",

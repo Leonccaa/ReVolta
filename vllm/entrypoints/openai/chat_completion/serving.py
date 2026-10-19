@@ -592,6 +592,7 @@ class OpenAIServingChat(OpenAIServing):
 
                 for output in res.outputs:
                     i = output.index
+                    self._raise_if_error(output.finish_reason, request_id)
                     parser = parsers[i]
                     tool_parser = parser.tool_parser if parser is not None else None
 

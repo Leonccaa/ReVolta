@@ -96,7 +96,9 @@ def test_defaults_by_format_and_interconnect(profile, quantization, mode):
     if quantization == "awq":
         expected.update(AWQ)
     assert {
-        k: v for k, v in os.environ.items() if k != "PYTEST_CURRENT_TEST"
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("PYTEST_CURRENT_TEST", "VLLM_REVOLTA_PROFILE_PROVENANCE")
     } == expected
     assert not set(FP16) & set(os.environ)
     assert not any(name.startswith("PYTORCH_") for name in os.environ)
@@ -189,6 +191,87 @@ def test_sources_after_upstream_auto_defaults(profile, monkeypatch):
     }
     assert audit["values"]["VLLM_SM70_QSA_INDEXER_CUBLAS"]["value"] == "1"
     assert "\n" not in module.profile_audit(enabled=True)
+
+
+def inherited_profile():
+    """Fresh module state, as in a spawned child inheriting only environ."""
+    spec = importlib.util.find_spec("vllm.revolta_profile")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_audit_provenance_survives_child_and_grandchild(profile, monkeypatch, enabled):
+    # An explicit value identical to the profile must remain environment.
+    explicit = "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT"
+    monkeypatch.setenv(explicit, "8")
+    parent = inherited_profile()
+    parent.apply_revolta_profile(model(), 4 if enabled else 2, is_sm70=True)
+    monkeypatch.setenv(FP16[0], "1")
+    monkeypatch.setenv("NCCL_GRAPH_REGISTER", "0")
+    expected = parent.profile_audit(enabled=enabled)
+    for _ in range(2):
+        child = inherited_profile()
+        child.apply_revolta_profile(model(), 4 if enabled else 2, is_sm70=True)
+        assert child.profile_audit(enabled=enabled) == expected
+    rows = json.loads(expected)["values"]
+    assert rows[explicit] == {"value": "8", "source": "environment"}
+    assert rows[FP16[0]] == {"value": "1", "source": "upstream_default"}
+    assert rows["NCCL_GRAPH_REGISTER"]["source"] == "upstream_default"
+    if enabled:
+        assert rows["VLLM_SM70_GREEDY_VERIFY"]["source"] == "profile"
+
+
+def test_child_can_start_after_apply_before_audit(profile, monkeypatch):
+    monkeypatch.setenv("VLLM_SM70_QSA_SHARED_KEY", "1")
+    profile.apply_revolta_profile(model(), 4, is_sm70=True)
+    child = inherited_profile()
+    child.apply_revolta_profile(model(), 4, is_sm70=True)
+    assert child.profile_audit(enabled=True) == profile.profile_audit(enabled=True)
+
+
+@pytest.mark.parametrize("name", ["VLLM_SM70_GREEDY_VERIFY", FP16[0]])
+def test_changed_inherited_value_is_environment(profile, monkeypatch, name):
+    profile.apply_revolta_profile(model(), 4, is_sm70=True)
+    monkeypatch.setenv(FP16[0], "1")
+    profile.profile_audit(enabled=True)
+    monkeypatch.setenv(name, "0")
+    child = inherited_profile()
+    child.apply_revolta_profile(model(), 4, is_sm70=True)
+    assert json.loads(child.profile_audit(enabled=True))["values"][name] == {
+        "value": "0",
+        "source": "environment",
+    }
+
+
+@pytest.mark.parametrize(
+    "value", ["broken", "[]", '{"version": 999}', '{"version": 1}']
+)
+def test_invalid_provenance_does_not_change_defaults(profile, monkeypatch, value):
+    monkeypatch.setenv("VLLM_REVOLTA_PROFILE_PROVENANCE", value)
+    child = inherited_profile()
+    child.apply_revolta_profile(model(), 4, is_sm70=True)
+    assert os.environ["VLLM_SM70_GREEDY_VERIFY"] == "1"
+    assert (
+        json.loads(child.profile_audit(enabled=True))["values"][
+            "VLLM_SM70_GREEDY_VERIFY"
+        ]["source"]
+        == "profile"
+    )
+
+
+def test_provenance_never_changes_compile_factors(profile, monkeypatch):
+    # Keep actual serving variables constant; only the diagnostic changes.
+    from vllm.config import utils  # noqa: F401
+
+    monkeypatch.setattr(envs, "environment_variables", {"VLLM_PORT": lambda: 8000})
+    monkeypatch.setenv("VLLM_REVOLTA_PROFILE_PROVENANCE", "parent audit")
+    before = envs.compile_factors()
+    monkeypatch.setenv("VLLM_REVOLTA_PROFILE_PROVENANCE", "child audit")
+    assert envs.compile_factors() == before
+    assert "VLLM_REVOLTA_PROFILE_PROVENANCE" not in before
 
 
 def test_invalid_interconnect_fails_before_writing(profile):

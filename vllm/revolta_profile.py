@@ -77,8 +77,66 @@ AUDITED_NAMES = tuple(
         | set(UPSTREAM_AND_DEPLOYMENT)
     )
 )
+# Diagnostic transport only: never use it to resolve an operator setting.
+# The VLLM_ prefix also carries it through worker environment propagation.
+_PROVENANCE_ENV = "VLLM_REVOLTA_PROFILE_PROVENANCE"
+
+
+def _inherited_provenance() -> dict[str, dict[str, Any]]:
+    try:
+        payload = json.loads(os.environ.get(_PROVENANCE_ENV, "{}"))
+        if payload.get("version") != 1:
+            return {}
+        rows = payload["values"]
+        return {
+            name: row
+            for name, row in rows.items()
+            if name in AUDITED_NAMES
+            and row["source"] in ("profile", "environment", "upstream_default")
+            and isinstance(row["value"], str)
+        }
+    except (ValueError, TypeError, KeyError, AttributeError):
+        # A stale or malformed diagnostic must not affect serving defaults.
+        return {}
+
+
+_INHERITED_PROVENANCE = _inherited_provenance()
 _INITIAL_ENV = {name: os.environ[name] for name in AUDITED_NAMES if name in os.environ}
 _PROFILE_VALUES: dict[str, str] = {}
+
+
+def _source(name: str) -> str:
+    current = os.environ.get(name)
+    if name in _PROFILE_VALUES and current == _PROFILE_VALUES[name]:
+        return "profile"
+    inherited = _INHERITED_PROVENANCE.get(name)
+    if inherited is not None and current == inherited["value"]:
+        return inherited["source"]
+    if name in _INITIAL_ENV or (
+        current is not None
+        and (
+            inherited is not None
+            or name in _PROFILE_VALUES
+            or (not name.startswith("VLLM_") and name != "NCCL_GRAPH_REGISTER")
+        )
+    ):
+        return "environment"
+    return "upstream_default"
+
+
+def _export_provenance() -> None:
+    # Refresh at the final audit too, after upstream materializes its defaults.
+    os.environ[_PROVENANCE_ENV] = json.dumps(
+        {
+            "version": 1,
+            "values": {
+                name: {"value": os.environ.get(name), "source": _source(name)}
+                for name in AUDITED_NAMES
+                if name in os.environ
+            },
+        },
+        sort_keys=True,
+    )
 
 
 def has_qsa_capability(model_config: Any) -> bool:
@@ -149,10 +207,11 @@ def apply_revolta_profile(
         if name not in os.environ:
             os.environ.setdefault(name, value)
             _PROFILE_VALUES[name] = value
-        elif name not in _PROFILE_VALUES:
+        elif name not in _PROFILE_VALUES and name not in _INHERITED_PROVENANCE:
             # Also recognize programmatic overrides supplied after import vllm
             # but before EngineArgs/VllmConfig construction.
             _INITIAL_ENV.setdefault(name, os.environ[name])
+    _export_provenance()
     return True
 
 
@@ -181,17 +240,8 @@ def profile_audit(
                 value = str(raw) if raw is not None else None
         else:
             value = None
-        if name in _PROFILE_VALUES and os.environ.get(name) == _PROFILE_VALUES[name]:
-            source = "profile"
-        elif name in _INITIAL_ENV or (
-            name in os.environ
-            and name not in envs.environment_variables
-            and name != "NCCL_GRAPH_REGISTER"
-        ):
-            source = "environment"
-        else:
-            source = "upstream_default"
-        values[name] = {"value": value, "source": source}
+        values[name] = {"value": value, "source": _source(name)}
+    _export_provenance()
     return json.dumps(
         {
             "enabled": enabled,

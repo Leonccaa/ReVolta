@@ -44,5 +44,9 @@ def test_missing_metadata_is_rejected(inventory, tmp_path, broken):
     (tmp_path / "vllm/revolta_profile.py").write_text(
         (inventory.ROOT / "vllm/revolta_profile.py").read_text()
     )
+    (tmp_path / "vllm/config").mkdir()
+    (tmp_path / "vllm/config/kernel.py").write_text(
+        (inventory.ROOT / "vllm/config/kernel.py").read_text()
+    )
     _, errors = inventory.collect(tmp_path)
     assert errors

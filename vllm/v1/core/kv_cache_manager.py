@@ -257,6 +257,7 @@ class KVCacheManager:
         delay_cache_blocks: bool = False,
         num_encoder_tokens: int = 0,
         full_sequence_must_fit: bool = False,
+        reserved_blocks: int = 0,
     ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append.
 
@@ -282,6 +283,8 @@ class KVCacheManager:
                 free blocks to hold the full sequence, accounting for prefix cache hits
                 and sliding window. Used as an admission gate to prevent over-admitting
                 requests when chunked prefill would otherwise only check the first chunk
+            reserved_blocks: Free blocks to leave for other in-flight prefills
+                and the candidate async load's speculative promotion margin.
 
         Blocks layout:
         ```
@@ -369,7 +372,9 @@ class KVCacheManager:
                 num_tokens_main_model=full_num_tokens,
                 apply_admission_cap=True,
             )
-            if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
+            if num_blocks_to_allocate > (
+                self.block_pool.get_num_free_blocks() - reserved_blocks
+            ):
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
@@ -402,7 +407,9 @@ class KVCacheManager:
             num_tokens_main_model=num_tokens_main_model,
         )
 
-        if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
+        if num_blocks_to_allocate > (
+            self.block_pool.get_num_free_blocks() - reserved_blocks
+        ):
             # Cannot allocate new blocks
             return None
 

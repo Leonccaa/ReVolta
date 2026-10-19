@@ -534,7 +534,9 @@ class VideoBackend(VideoLoader, OpenCVVideoBackendMixin, PyAVVideoBackendMixin):
                     frame_recovery=frame_recovery,
                 )
             finally:
-                cap.release()
+                # Keep the capture destructor ownership used by this backend.
+                # Explicit release() can invalidate Python IStream callbacks.
+                del cap
         elif backend == "pyav":
             assert not frame_recovery, (
                 "frame_recovery is only available for `opencv` backend"

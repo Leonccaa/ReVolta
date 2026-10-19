@@ -80,7 +80,7 @@ class VideoMediaIO(MediaIO[tuple[npt.NDArray, dict[str, Any]]]):
             self.image_io.budget.charge_video(count, width, height)
             precharged = count * width * height * 4
 
-        if issubclass(self.video_loader, VideoBackend):
+        if isinstance(self.video_loader, VideoBackend):
             # Set internally after request kwargs, so clients cannot replace it.
             kwargs["frame_budget"] = charge_frames
         elif envs.VLLM_MAX_MEDIA_REQUEST_DECODE_BYTES:

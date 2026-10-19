@@ -35,7 +35,6 @@ def test_video_budget_precedes_frame_allocation(monkeypatch):
     with pytest.raises(ValueError, match="VLLM_MAX_MEDIA_REQUEST_DECODE_BYTES"):
         VideoMediaIO(ImageMediaIO(), num_frames=16).load_bytes(b"encoded")
     read.assert_not_called()
-    cap.release.assert_called_once()
 
 
 def test_default_budget_covers_sixteen_4k_frames():

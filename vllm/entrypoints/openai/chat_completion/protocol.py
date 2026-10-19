@@ -64,6 +64,13 @@ class ChatMessage(OpenAIBaseModel):
     # vLLM-specific fields that are not in OpenAI spec
     reasoning: str | None = None
 
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if not data.get("tool_calls"):
+            data.pop("tool_calls", None)
+        return data
+
 
 class ChatCompletionLogProb(OpenAIBaseModel):
     token: str

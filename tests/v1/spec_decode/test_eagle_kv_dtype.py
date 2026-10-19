@@ -247,6 +247,7 @@ def test_mixed_dtype_admission(connector, method):
         ("speculative_config", "kv_cache_dtype", "bfloat16", "activation dtype"),
         ("cache_config", "cache_dtype", "nvfp4", "target KV layout"),
         ("cache_config", "cache_dtype", "fp8_e5m2", "target KV layout"),
+        ("cache_config", "cache_dtype", "int8", "target KV layout"),
         ("speculative_config", "method", "eagle", "native QSA MTP"),
         ("speculative_config", "method", "eagle3", "native QSA MTP"),
     ],
@@ -302,14 +303,33 @@ def test_mixed_dtype_allows_a_disabled_transfer_config():
     validate(config)
 
 
-def test_same_dtype_keeps_existing_unsupported_options_outside_the_new_gate():
+@pytest.mark.parametrize("dtype", ["fp8_e4m3", "int8"])
+def test_same_dtype_keeps_existing_unsupported_options_outside_the_new_gate(dtype):
     validate = pytest.importorskip(
         "vllm.config.speculative_kv"
     ).validate_speculative_kv_cache_dtype
-    config = _config("fp8_e4m3")
+    config = _config(dtype)
+    config.cache_config.cache_dtype = dtype
     config.use_v2_model_runner = False
     config.scheduler_config.disable_hybrid_kv_cache_manager = True
     validate(config)
+
+
+def test_int8_cli_selection_and_inherited_draft_remain_unchanged():
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+    validate = pytest.importorskip(
+        "vllm.config.speculative_kv"
+    ).validate_speculative_kv_cache_dtype
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    parsed = parser.parse_args(["--kv-cache-dtype", "int8"])
+    cache = CacheConfig(cache_dtype=parsed.kv_cache_dtype)
+    config = _config(None)
+    config.cache_config = cache
+    validate(config)
+    assert config.cache_config is cache
+    assert cache.cache_dtype == "int8"
 
 
 def _mixed_specs(dtype):

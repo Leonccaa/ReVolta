@@ -43,6 +43,10 @@ AWQ_DEFAULTS = {
 }
 CUSTOM_AR_DEFAULTS = {"VLLM_SM70_CAR_VMM_SAFE": "1"}
 
+# Config defaults have their own audit namespace; never add them to the W9
+# environment inventory or use environment provenance to resolve them.
+KERNEL_DEFAULTS = {"ple_disk_cascade": False}
+
 # Include the entire deployment inventory in the audit, even entries whose
 # defaults remain upstream. In particular, never write the three FP16 flags.
 UPSTREAM_AND_DEPLOYMENT = (
@@ -235,11 +239,29 @@ def apply_revolta_profile(
     return True
 
 
+def apply_revolta_kernel_profile(kernel_config: Any, *, enabled: bool) -> None:
+    """Apply only to unset fields; the config carries provenance to workers."""
+    value = kernel_config.ple_disk_cascade
+    source = kernel_config.ple_disk_cascade_source
+    default = KERNEL_DEFAULTS["ple_disk_cascade"]
+    if (source == "profile" and value != default) or (
+        source == "upstream_default" and value is not True
+    ):
+        # Also recognize a programmatic override of a resolved config.
+        kernel_config.ple_disk_cascade_source = "explicit"
+    elif value is None or (enabled and source == "upstream_default"):
+        kernel_config.ple_disk_cascade = default if enabled else True
+        kernel_config.ple_disk_cascade_source = (
+            "profile" if enabled else "upstream_default"
+        )
+
+
 def profile_audit(
     *,
     enabled: bool,
     interconnect_mode: InterconnectMode = "pex_p2p",
     quantization: str | None = None,
+    kernel_config: Any = None,
 ) -> str:
     """One JSON line, after upstream config policy has resolved its defaults."""
     from vllm import envs
@@ -270,6 +292,16 @@ def profile_audit(
             "interconnect_policy": os.environ.get("VLLM_SM70_INTERCONNECT", "auto"),
             "quantization": quantization,
             "values": values,
+            "kernel_config": (
+                {
+                    "ple_disk_cascade": {
+                        "value": kernel_config.ple_disk_cascade,
+                        "source": kernel_config.ple_disk_cascade_source,
+                    }
+                }
+                if kernel_config is not None
+                else {}
+            ),
         },
         sort_keys=True,
     )

@@ -21,6 +21,7 @@ def collect(root: Path) -> tuple[dict, list[str]]:
     metadata, errors = read_metadata((root / "vllm/envs.py").read_text())
     profile = root / "vllm/revolta_profile.py"
     tables = {}
+    kernel_defaults = {}
     for node in ast.parse(profile.read_text()).body:
         if (
             isinstance(node, ast.Assign)
@@ -29,6 +30,12 @@ def collect(root: Path) -> tuple[dict, list[str]]:
             in ("COMMON_DEFAULTS", "AWQ_DEFAULTS", "CUSTOM_AR_DEFAULTS")
         ):
             tables[node.targets[0].id] = ast.literal_eval(node.value)
+        elif (
+            isinstance(node, ast.Assign)
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "KERNEL_DEFAULTS"
+        ):
+            kernel_defaults = ast.literal_eval(node.value)
     for group, defaults in tables.items():
         for name, value in defaults.items():
             row = metadata.get(name)
@@ -44,7 +51,24 @@ def collect(root: Path) -> tuple[dict, list[str]]:
                 errors.append(f"{name}: missing interconnect condition")
     if len(tables) != 3:
         errors.append("Missing ReVolta default tables")
-    return {"registrations": len(metadata), "profile_defaults": tables}, errors
+    kernel_tree = ast.parse((root / "vllm/config/kernel.py").read_text())
+    kernel_fields = {
+        node.target.id
+        for cls in kernel_tree.body
+        if isinstance(cls, ast.ClassDef) and cls.name == "KernelConfig"
+        for node in cls.body
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+    }
+    if kernel_defaults != {"ple_disk_cascade": False}:
+        errors.append("Missing ReVolta cascade default")
+    for name in kernel_defaults:
+        if name not in kernel_fields or f"{name}_source" not in kernel_fields:
+            errors.append(f"{name}: missing KernelConfig field or provenance")
+    return {
+        "registrations": len(metadata),
+        "profile_defaults": tables,
+        "kernel_profile_defaults": kernel_defaults,
+    }, errors
 
 
 def main() -> int:

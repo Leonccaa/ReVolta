@@ -234,6 +234,8 @@ class PleOffloadLayer(nn.Module, ABC):
     """
 
     _is_cpu_offloaded = False
+    # Constructor policy must survive execution outside the current config.
+    _keeps_local_tables = False
     _gpu_output_buffer: torch.Tensor
     _sem: CpuGpuSemaphore
 
@@ -249,15 +251,17 @@ class PleOffloadLayer(nn.Module, ABC):
         def guarded_init(
             self: "PleOffloadLayer", *args: object, **kwargs: object
         ) -> None:
+            keeps_local_tables = self.offload_keeps_local_tables()
             if (
                 ple_offload_enabled()
                 and not envs.VLLM_SM70_QWEN38_HYBRID_PLE
-                and not self.offload_keeps_local_tables()
+                and not keeps_local_tables
                 and not is_offload_process()
             ):
                 nn.Module.__init__(self)
                 return
             original_init(self, *args, **kwargs)
+            self._keeps_local_tables = keeps_local_tables
 
         cls.__init__ = guarded_init  # type: ignore[method-assign, assignment]
 
@@ -354,7 +358,7 @@ class PleOffloadLayer(nn.Module, ABC):
         if self._is_cpu_offloaded:
             if envs.VLLM_SM70_QWEN38_HYBRID_PLE and use_sm70_decode_graph_semantics():
                 return self.forward_impl(hidden_states, input_ids, *args, **kwargs)
-            if self.offload_keeps_local_tables():
+            if self._keeps_local_tables:
                 # The layer gathers its resident rows itself and merges the
                 # worker's rows through wait_offloaded_output.
                 return self.forward_impl(hidden_states, input_ids, *args, **kwargs)

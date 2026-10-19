@@ -506,8 +506,14 @@ class KernelConfig:
     """Share FP16 indexer keys across M2..8 queries of one request on SM70
     (1CatAI #1127; opt-in here, also VLLM_SM70_QSA_SHARED_KEY=1)."""
 
-    ple_disk_cascade: bool = True
-    """Allow resident FP8 PLE tiers to spill to mapped checkpoint storage."""
+    ple_disk_cascade: bool | None = None
+    """Allow resident FP8 PLE tiers to spill to mapped checkpoint storage.
+
+    Unset resolves to True upstream, or False in the ReVolta SM70 QSA TP4
+    profile. Explicit True/False always wins over the profile.
+    """
+    ple_disk_cascade_source: str = Field(default="explicit", init=False)
+    """Diagnostic origin of the resolved cascade choice; excluded from hashes."""
     ple_disk_release_pages: bool = False
     """Release file-backed PLE mappings after gathers to reduce resident RAM."""
     ple_disk_cascade_active: bool = Field(default=False, init=False)
@@ -561,6 +567,7 @@ class KernelConfig:
             "sm70_skinny_moe_applicable",
             "fused_fp16_aux_gemv_applicable",
             "ple_disk_cascade_reason",
+            "ple_disk_cascade_source",
             "ple_result_transports",
             "ple_input_prepare",  # Input staging is outside the compiled model.
             "ple_input_preparations",

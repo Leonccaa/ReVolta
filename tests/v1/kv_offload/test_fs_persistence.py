@@ -192,3 +192,12 @@ def test_corrupt_seed_is_not_replaced(tmp_path, contents):
     with pytest.raises(ValueError):
         initialize_fs_roots([tmp_path])
     assert path.read_text() == contents
+
+
+def test_empty_environment_seed_is_persistable(tmp_path, monkeypatch):
+    monkeypatch.setenv("PYTHONHASHSEED", "")
+    initialize_fs_roots([tmp_path])
+    first = kv_cache_utils.NONE_HASH
+    assert (tmp_path / ".hash_seed.json").is_file()
+    initialize_fs_roots([tmp_path])
+    assert first == kv_cache_utils.NONE_HASH

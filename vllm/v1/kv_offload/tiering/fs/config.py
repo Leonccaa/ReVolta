@@ -79,7 +79,7 @@ def get_fs_hash_seed(config: "KVTransferConfig | None") -> str | None:
             raise ValueError(
                 "FS tier roots have different hash seeds; use matching roots"
             )
-        seed = next(iter(seeds)) if seeds else os.getenv("PYTHONHASHSEED")
+        seed = next(iter(seeds)) if seeds else os.getenv("PYTHONHASHSEED") or None
         if seed is None:
             seed = os.urandom(32).hex()
         for path in missing:

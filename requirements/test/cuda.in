@@ -43,7 +43,6 @@ tokenizers==0.22.2
 schemathesis>=3.39.15 # Required for openai schema test.
 # quantization
 bitsandbytes==0.50.1
-buildkite-test-collector==0.1.9
 
 
 genai_perf>=0.0.8

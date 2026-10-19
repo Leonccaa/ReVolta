@@ -77,8 +77,6 @@ botocore==1.35.57
     #   s3transfer
 bounded-pool-executor==0.0.3
     # via pqdm
-buildkite-test-collector==0.1.9
-    # via -r requirements/test/cuda.in
 cachetools==5.5.2
     # via google-auth
 certifi==2024.8.30
@@ -725,7 +723,6 @@ pytablewriter==1.2.0
 pytest==8.3.5
     # via
     #   -r requirements/test/cuda.in
-    #   buildkite-test-collector
     #   genai-perf
     #   pytest-asyncio
     #   pytest-cov
@@ -808,7 +805,6 @@ requests==2.34.2
     # via
     #   -c requirements/common.txt
     #   azure-core
-    #   buildkite-test-collector
     #   datasets
     #   docker
     #   evaluate

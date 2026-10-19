@@ -36,6 +36,10 @@ Included components
    upstream commit before the local import on 2026-06-14. Of 141 retained
    files, 89 match that snapshot byte-for-byte; 46 differ and 6 are absent
    upstream at that revision.
+   A second file-by-file Git blob comparison against upstream commit
+   3bf75ff9fc745798f518e22c5e9e92a2bbf39d23 finds 112 of the 141 retained
+   files byte-identical, 25 different and 4 absent. This closer snapshot is
+   additional provenance evidence, not an exact base for modified files.
    Revision gap: local import ee0bc6a875f891ff4785bfbdb1cd9ed35b21f647
    records no upstream pin. Repository history, source headers and the
    dated upstream tree establish provenance but not one exact base for all

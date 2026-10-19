@@ -341,13 +341,15 @@ def test_hardware_detection_without_cuda_context(profile, monkeypatch, caps):
     assert not profile.all_visible_devices_sm70()
 
 
-def test_engineargs_profile_precedes_actual_mtp_defaults(profile, monkeypatch):
+def run_engineargs_early_policy(profile, monkeypatch, apply, **engine_kwargs):
+    """Execute EngineArgs' real sequence from the profile import to MTP defaults."""
     import vllm.revolta_profile as installed
     from vllm.config.compilation import CompilationConfig
     from vllm.engine.arg_utils import EngineArgs
 
+    monkeypatch.setattr(installed, "apply_revolta_profile", apply)
     monkeypatch.setattr(
-        installed, "apply_revolta_profile", profile.apply_revolta_profile
+        installed, "frontend_interconnect_mode", profile.frontend_interconnect_mode
     )
     monkeypatch.setattr(installed, "all_visible_devices_sm70", lambda: True)
     # Execute the real early sequence, including the real MTP default method.
@@ -390,6 +392,7 @@ def test_engineargs_profile_precedes_actual_mtp_defaults(profile, monkeypatch):
         max_num_seqs=8,
         compilation_config=CompilationConfig(),
         speculative_config={"method": "mtp", "num_speculative_tokens": 4},
+        **engine_kwargs,
     )
     target = model()
     target.hf_text_config.mtp_num_hidden_layers = 1
@@ -406,8 +409,101 @@ def test_engineargs_profile_precedes_actual_mtp_defaults(profile, monkeypatch):
             "usage_context": SimpleNamespace(name="OPENAI_API_SERVER"),
         },
     )
+    return args
+
+
+def test_engineargs_profile_precedes_actual_mtp_defaults(profile, monkeypatch):
+    args = run_engineargs_early_policy(
+        profile, monkeypatch, profile.apply_revolta_profile
+    )
     assert args.compilation_config.fast_moe_cold_start is None
     assert args.compilation_config.cudagraph_capture_sizes is None
+
+
+@pytest.mark.parametrize(
+    ("requested", "disabled", "expected"),
+    [
+        (None, False, "pex_p2p"),
+        ("nccl", False, "no_p2p"),
+        ("nvlink", False, "nvlink"),
+        ("auto", True, "no_p2p"),
+    ],
+)
+def test_engineargs_profile_receives_frontend_interconnect(
+    profile, monkeypatch, requested, disabled, expected
+):
+    if requested is not None:
+        monkeypatch.setenv("VLLM_SM70_INTERCONNECT", requested)
+    seen = []
+
+    def apply(*args, **kwargs):
+        seen.append(kwargs["interconnect_mode"])
+        return profile.apply_revolta_profile(*args, **kwargs)
+
+    run_engineargs_early_policy(
+        profile, monkeypatch, apply, disable_custom_all_reduce=disabled
+    )
+    assert seen == [expected]
+    assert ("VLLM_SM70_CAR_VMM_SAFE" in os.environ) == (expected != "no_p2p")
+
+
+@pytest.mark.parametrize(
+    ("requested", "disabled", "expected"),
+    [
+        (None, False, "pex_p2p"),
+        ("auto", False, "pex_p2p"),
+        ("pex", False, "pex_p2p"),
+        (" NCCL ", False, "no_p2p"),
+        ("nvlink", False, "nvlink"),
+        ("nvlink", True, "no_p2p"),
+        ("auto", True, "no_p2p"),
+    ],
+)
+def test_frontend_interconnect_mode_and_audit(
+    profile, monkeypatch, requested, disabled, expected
+):
+    # The frontend knows only explicit choices; workers resolve auto/pex.
+    if requested is not None:
+        monkeypatch.setenv("VLLM_SM70_INTERCONNECT", requested)
+    mode = profile.frontend_interconnect_mode(disable_custom_all_reduce=disabled)
+    assert mode == expected
+    assert profile.apply_revolta_profile(
+        model(), 4, is_sm70=True, interconnect_mode=mode
+    )
+    assert ("VLLM_SM70_CAR_VMM_SAFE" in os.environ) == (expected != "no_p2p")
+    audit = json.loads(profile.profile_audit(enabled=True, interconnect_mode=mode))
+    assert audit["interconnect_mode"] == expected
+    assert audit["interconnect_policy"] == ("auto" if requested is None else requested)
+    assert len(audit["values"]) == 45
+
+
+def test_vllmconfig_profile_and_audit_receive_frontend_interconnect():
+    # Both VllmConfig call sites must pass the same frontend assumption.
+    import vllm.config.vllm as config_module
+
+    assert config_module.__file__ is not None
+    tree = ast.parse(Path(config_module.__file__).read_text())
+    calls = [
+        (node.func.id, node)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in ("apply_revolta_profile", "profile_audit")
+    ]
+    assert sorted(name for name, _ in calls) == [
+        "apply_revolta_profile",
+        "profile_audit",
+    ]
+    for _, call in calls:
+        value = next(k.value for k in call.keywords if k.arg == "interconnect_mode")
+        assert isinstance(value, ast.Call)
+        assert isinstance(value.func, ast.Name)
+        assert value.func.id == "frontend_interconnect_mode"
+        (keyword,) = value.keywords
+        assert keyword.arg == "disable_custom_all_reduce"
+        assert ast.unparse(keyword.value) == (
+            "self.parallel_config.disable_custom_all_reduce"
+        )
 
 
 def test_audit_logs_disabled_profile(profile):

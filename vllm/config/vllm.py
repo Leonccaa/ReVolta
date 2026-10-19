@@ -1620,6 +1620,7 @@ class VllmConfig:
         from vllm.revolta_profile import (
             all_visible_devices_sm70,
             apply_revolta_profile,
+            frontend_interconnect_mode,
         )
 
         # Also cover direct VllmConfig users. This is intentionally before
@@ -1628,6 +1629,9 @@ class VllmConfig:
             self.model_config,
             self.parallel_config.tensor_parallel_size,
             is_sm70=all_visible_devices_sm70(),
+            interconnect_mode=frontend_interconnect_mode(
+                disable_custom_all_reduce=self.parallel_config.disable_custom_all_reduce
+            ),
         )
 
         # To give each torch profile run a unique instance name.
@@ -2969,6 +2973,11 @@ class VllmConfig:
                 "ReVolta profile %s",
                 profile_audit(
                     enabled=revolta_profile_enabled,
+                    interconnect_mode=frontend_interconnect_mode(
+                        disable_custom_all_reduce=(
+                            self.parallel_config.disable_custom_all_reduce
+                        )
+                    ),
                     quantization=getattr(self.model_config, "quantization", None),
                 ),
             )

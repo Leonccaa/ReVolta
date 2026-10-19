@@ -173,6 +173,27 @@ def all_visible_devices_sm70() -> bool:
     )
 
 
+def frontend_interconnect_mode(
+    *, disable_custom_all_reduce: bool = False
+) -> InterconnectMode:
+    """The interconnect the profile assumes before workers resolve topology.
+
+    Only explicit operator choices are known this early: nccl or a disabled
+    custom AR mean no_p2p, and nvlink forces that path. auto and pex assume
+    pex_p2p; workers log the resolved mode ("SM70 interconnect=...") and fall
+    back to NCCL when P2P fails, which leaves the custom-AR default inert.
+    Unknown values also assume pex_p2p and fail in the worker resolver.
+    """
+    if disable_custom_all_reduce:
+        return "no_p2p"
+    requested = os.environ.get("VLLM_SM70_INTERCONNECT", "auto").strip().lower()
+    if requested == "nccl":
+        return "no_p2p"
+    if requested == "nvlink":
+        return "nvlink"
+    return "pex_p2p"
+
+
 def apply_revolta_profile(
     model_config: Any,
     tensor_parallel_size: int,
@@ -182,9 +203,8 @@ def apply_revolta_profile(
 ) -> bool:
     """Apply before config defaults and before model/native module imports.
 
-    W10.3 can supply its resolved interconnect mode here. Until integrated,
-    pex_p2p preserves the existing deployment; this does not select an AR
-    backend. Explicit environment overrides always win, including in no_p2p.
+    Pass frontend_interconnect_mode(); this does not select an AR backend.
+    Explicit environment overrides always win, including in no_p2p.
     """
     import torch
 
@@ -245,7 +265,9 @@ def profile_audit(
     return json.dumps(
         {
             "enabled": enabled,
+            # Frontend assumption; workers log the resolved mode.
             "interconnect_mode": interconnect_mode,
+            "interconnect_policy": os.environ.get("VLLM_SM70_INTERCONNECT", "auto"),
             "quantization": quantization,
             "values": values,
         },

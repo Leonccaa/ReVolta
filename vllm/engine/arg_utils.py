@@ -2002,6 +2002,7 @@ class EngineArgs:
         from vllm.revolta_profile import (
             all_visible_devices_sm70,
             apply_revolta_profile,
+            frontend_interconnect_mode,
         )
 
         # Must precede the MTP defaults: those pre-fill capture sizes and change
@@ -2010,6 +2011,9 @@ class EngineArgs:
             model_config,
             self.tensor_parallel_size,
             is_sm70=all_visible_devices_sm70(),
+            interconnect_mode=frontend_interconnect_mode(
+                disable_custom_all_reduce=self.disable_custom_all_reduce
+            ),
         )
         self._maybe_apply_sm70_mtp_defaults(usage_context, model_config)
         self._set_default_chunked_prefill_and_prefix_caching_args(model_config)

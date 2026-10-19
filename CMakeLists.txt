@@ -403,6 +403,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/awq_grouped_decode_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/fp16_skinny_gemm_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/nvfp4_grouped_decode_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/nvfp4_raw_grouped_decode_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/qwen38_gdn_input_batch_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/qwen38_ple_spec_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/rmsnorm_gated_exact_sm70.cu"

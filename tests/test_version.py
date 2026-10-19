@@ -33,5 +33,8 @@ def test_version_tuple():
     ],
 )
 def test_prev_minor_version_was(version_tuple, version_str, expected):
-    with patch("vllm.version.__version_tuple__", version_tuple):
+    with (
+        patch("vllm.version.__version_tuple__", version_tuple),
+        patch("vllm.version.__compat_version_tuple__", version_tuple, create=True),
+    ):
         assert version._prev_minor_version_was(version_str) == expected

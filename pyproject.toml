@@ -15,7 +15,7 @@ requires = [
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "1cat-vllm"
+name = "revolta"
 authors = [{name = "Leon"}, {name = "1Cat AI"}, {name = "vLLM Team"}]
 license = "Apache-2.0"
 license-files = [

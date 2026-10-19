@@ -36,6 +36,20 @@ def load_module_from_path(module_name, path):
 
 ROOT_DIR = Path(__file__).parent
 logger = logging.getLogger(__name__)
+RELEASE_VERSION = "0.1.0"
+
+
+def build_gguf() -> bool:
+    # Forward the same option to CMake and setuptools' target/package lists.
+    value = os.getenv("VLLM_BUILD_GGUF", "OFF")
+    options = re.findall(
+        r"(?:^|\s)-DVLLM_BUILD_GGUF(?::BOOL)?=([^\s]+)",
+        os.getenv("CMAKE_ARGS", ""),
+    )
+    if options:
+        value = options[-1]
+    return value.upper() in {"1", "ON", "YES", "TRUE"}
+
 
 PRECOMPILED_RUST_FRONTEND_PATH = ROOT_DIR / "vllm" / "vllm-rs"
 FLASH_ATTN_V100_ROOT = ROOT_DIR / "flash-attention-v100"
@@ -437,6 +451,7 @@ class cmake_build_ext(build_ext):
             cmake_args += [f"-DROCM_PATH={ROCM_HOME}"]
 
         other_cmake_args = os.environ.get("CMAKE_ARGS")
+        cmake_args += [f"-DVLLM_BUILD_GGUF={'ON' if build_gguf() else 'OFF'}"]
         if other_cmake_args:
             cmake_args += other_cmake_args.split()
 
@@ -711,7 +726,12 @@ class precompiled_wheel_utils:
         """Search for a local vllm wheel in common locations."""
         import glob
 
-        for pattern in ["/vllm-workspace/dist/vllm-*.whl", "./dist/vllm-*.whl"]:
+        for pattern in [
+            "/vllm-workspace/dist/revolta-*.whl",
+            "./dist/revolta-*.whl",
+            "/vllm-workspace/dist/vllm-*.whl",
+            "./dist/vllm-*.whl",
+        ]:
             wheels = glob.glob(pattern)
             if wheels:
                 return sorted(wheels)[-1]
@@ -906,7 +926,6 @@ class precompiled_wheel_utils:
                         {
                             "vllm/_C.abi3.so",
                             "vllm/_C_stable_libtorch.abi3.so",
-                            "vllm/_C_gguf.abi3.so",
                             "vllm/_moe_C.abi3.so",
                             "vllm/_flashmla_C.abi3.so",
                             "vllm/_flashmla_extension_C.abi3.so",
@@ -920,6 +939,8 @@ class precompiled_wheel_utils:
                             "vllm/_rocm_C.abi3.so",
                         }
                     )
+                    if build_gguf():
+                        exact_members.add("vllm/_C_gguf.abi3.so")
                 if extract_rust_frontend:
                     exact_members.add("vllm/vllm-rs")
 
@@ -1214,7 +1235,13 @@ def get_vllm_version() -> str:
         os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = env_version
         return get_version(write_to="vllm/_version.py")
 
-    version = get_version(write_to="vllm/_version.py")
+    # Inherited upstream tags must not determine ReVolta's release version.
+    # Explicit SCM overrides still support source archives and deployment builds.
+    version = (
+        os.getenv("SETUPTOOLS_SCM_PRETEND_VERSION_FOR_REVOLTA")
+        or os.getenv("SETUPTOOLS_SCM_PRETEND_VERSION")
+        or RELEASE_VERSION
+    )
     sep = "+" if "+" not in version else "."  # dev versions might contain +
 
     if _no_device():
@@ -1247,7 +1274,23 @@ def get_vllm_version() -> str:
     else:
         raise RuntimeError("Unknown runtime environment")
 
-    return version
+    # Stamp the final version, including device suffixes, into the importable
+    # module so wheel metadata and vllm.__version__ cannot disagree.
+    keys = (
+        "SETUPTOOLS_SCM_PRETEND_VERSION",
+        "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_REVOLTA",
+    )
+    previous = {key: os.environ.get(key) for key in keys}
+    try:
+        for key in keys:
+            os.environ[key] = version
+        return get_version(write_to="vllm/_version.py")
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def get_requirements() -> list[str]:
@@ -1419,7 +1462,7 @@ if _build_custom_ops():
     ext_modules.append(CMakeExtension(name="vllm._C"))
     if _is_cuda() or _is_hip():
         ext_modules.append(CMakeExtension(name="vllm._C_stable_libtorch"))
-    if _is_cuda():
+    if _is_cuda() and build_gguf():
         ext_modules.append(CMakeExtension(name="vllm._C_gguf"))
 
 package_data = {
@@ -1471,7 +1514,11 @@ if PRECOMPILED_RUST_FRONTEND_PATH.exists():
 # A focused CMake source build may prepare the new GGUF extension while the
 # unchanged base operators come from a precompiled wheel. Ship that normally
 # installed module in the final wheel, rather than a task-cache sidecar.
-if USE_PRECOMPILED_EXTENSIONS and (ROOT_DIR / "vllm/_C_gguf.abi3.so").is_file():
+if (
+    build_gguf()
+    and USE_PRECOMPILED_EXTENSIONS
+    and (ROOT_DIR / "vllm/_C_gguf.abi3.so").is_file()
+):
     package_data.setdefault("vllm", []).append("_C_gguf.abi3.so")
 package_data.setdefault("vllm", []).append("third_party/gguf_native/*")
 

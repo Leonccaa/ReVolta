@@ -732,6 +732,92 @@ def test_request_block_hasher(hash_fn):
 
 
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
+def test_request_block_hasher_incremental_append_with_multiple_mm_features(hash_fn):
+    # Upstream vLLM #51694 regression: a block completed by an output token
+    # that overlaps two mm items must key both of them.
+    mm_positions = [
+        PlaceholderRange(offset=4, length=2),
+        PlaceholderRange(offset=6, length=1),
+    ]
+    incremental = make_request(
+        request_id="incremental",
+        prompt_token_ids=list(range(7)),
+        block_size=4,
+        hash_fn=hash_fn,
+        mm_positions=mm_positions,
+        mm_hashes=["A", "B"],
+    )
+    incremental.append_output_token_ids(7)
+    fresh = make_request(
+        request_id="fresh",
+        prompt_token_ids=list(range(8)),
+        block_size=4,
+        hash_fn=hash_fn,
+        mm_positions=mm_positions,
+        mm_hashes=["A", "B"],
+    )
+
+    expected_second_hash = hash_fn(
+        (incremental.block_hashes[0], (4, 5, 6, 7), (("A", 0), ("B", 2)))
+    )
+    assert incremental.block_hashes[1] == expected_second_hash
+    assert incremental.block_hashes == fresh.block_hashes
+
+
+@pytest.mark.parametrize(
+    "mm_layout",
+    [
+        # Two one-token images in the last partial 8-token block, as rendered
+        # for our Qwen3-VL processor with a minimal image size.
+        [(9, 1), (12, 1)],
+        # Three items, the first starting in the previous (full) block.
+        [(6, 3), (10, 1), (12, 1)],
+        # Only the last item reaches the partial block (old fast path).
+        [(1, 2), (12, 1)],
+        # Every item ends before the partial block.
+        [(1, 2), (4, 3)],
+    ],
+)
+def test_incremental_block_hashes_match_full_prompt_hashes(mm_layout):
+    """Hashing a block when output tokens complete it must give the hash the
+    same tokens get when they are all in the prompt, and two requests that
+    differ only in an earlier image of that block must not collide."""
+    block_size = 8
+    prompt = list(range(14))
+    output = [100, 101]
+    positions = [PlaceholderRange(offset=o, length=n) for o, n in mm_layout]
+    names = [f"img{i}" for i in range(len(mm_layout))]
+
+    def build(prompt_ids, hashes, request_id):
+        return make_request(
+            request_id=request_id,
+            prompt_token_ids=prompt_ids,
+            block_size=block_size,
+            hash_fn=sha256,
+            mm_positions=positions,
+            mm_hashes=hashes,
+        )
+
+    incremental = build(prompt, names, "incremental")
+    incremental.append_output_token_ids(output[:1])
+    incremental.append_output_token_ids(output[1:])
+    fresh = build(prompt + output, names, "fresh")
+    assert len(incremental.block_hashes) == 2
+    assert incremental.block_hashes == fresh.block_hashes
+
+    other = build(prompt, ["other", *names[1:]], "other")
+    other.append_output_token_ids(output)
+    first_end = mm_layout[0][0] + mm_layout[0][1]
+    if first_end > block_size:
+        # The first image is in the completed block: its identity must key
+        # that block even though a later image is present.
+        assert other.block_hashes[-1] != incremental.block_hashes[-1]
+    else:
+        # The first image only lives in the first (prompt) block.
+        assert other.block_hashes[0] != incremental.block_hashes[0]
+
+
+@pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
 def test_hash_tokens_different_mm_input(hash_fn):
     request1 = make_request(
         request_id="0",

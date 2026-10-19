@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """KV-Cache Utilities."""
 
+import bisect
 import copy
 import hashlib
 import math
@@ -700,12 +701,21 @@ def get_request_block_hasher(
             return []
 
         curr_mm_idx = 0
-        if start_token_idx > 0:
-            # Set curr_mm_idx = -1 to indicate the last mm input.
-            # Note that since we reach to this branch only when the block is
-            # completed with generated tokens, we only need to consider the
-            # last mm input.
-            curr_mm_idx = -1
+        mm_features = request.mm_features
+        if start_token_idx > 0 and mm_features:
+            # A block completed by appended tokens (generated output, or a
+            # streaming-input update) can still overlap several mm items,
+            # e.g. two small images at the end of the prompt. Start from the
+            # first item that ends after the block start rather than only the
+            # last item, so every overlapping item keys the block hash and
+            # the incremental hash equals the one computed from scratch.
+            # Items are sorted by offset and do not overlap, so their end
+            # positions are sorted as well.
+            curr_mm_idx = bisect.bisect_right(
+                mm_features,
+                start_token_idx,
+                key=lambda f: f.mm_position.offset + f.mm_position.length,
+            )
 
         prev_block_hash_value = (
             request.block_hashes[-1] if request.block_hashes else None

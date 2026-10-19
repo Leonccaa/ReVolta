@@ -306,6 +306,7 @@ class MediaConnector:
                 url_spec.url,
                 timeout=fetch_timeout,
                 allow_redirects=envs.VLLM_MEDIA_URL_ALLOW_REDIRECTS,
+                max_bytes=envs.VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB * 1024 * 1024 or None,
             )
 
             self._put_cached_bytes(url, data)
@@ -351,6 +352,7 @@ class MediaConnector:
                 url_spec.url,
                 timeout=fetch_timeout,
                 allow_redirects=envs.VLLM_MEDIA_URL_ALLOW_REDIRECTS,
+                max_bytes=envs.VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB * 1024 * 1024 or None,
             )
 
             await loop.run_in_executor(

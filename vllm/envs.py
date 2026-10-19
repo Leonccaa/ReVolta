@@ -214,6 +214,7 @@ if TYPE_CHECKING:
     VLLM_WORKER_MULTIPROC_METHOD: Literal["fork", "spawn"] = "fork"
     VLLM_ASSETS_CACHE: str = os.path.join(VLLM_CACHE_ROOT, "assets")
     VLLM_ASSETS_CACHE_MODEL_CLEAN: bool = False
+    VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB: int = 256
     VLLM_IMAGE_FETCH_TIMEOUT: int = 5
     VLLM_VIDEO_FETCH_TIMEOUT: int = 30
     VLLM_AUDIO_FETCH_TIMEOUT: int = 10
@@ -2716,6 +2717,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Timeout for fetching images when serving multimodal models
     # Default is 5 seconds
+    "VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB": env_var(
+        lambda: int(os.getenv("VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB", "256")),
+        description=(
+            "Maximum bytes per remote media response in MiB; "
+            "0 disables this limit. Applied while streaming."
+        ),
+        category="configuration",
+        declared_default="256",
+        effective_default="256",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
     "VLLM_IMAGE_FETCH_TIMEOUT": env_var(
         lambda: int(os.getenv("VLLM_IMAGE_FETCH_TIMEOUT", "5")),
         description=(
@@ -19525,6 +19539,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
         "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS",
         "VLLM_KEEP_ALIVE_ON_ENGINE_DEATH",
+        "VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB",
         "VLLM_IMAGE_FETCH_TIMEOUT",
         "VLLM_VIDEO_FETCH_TIMEOUT",
         "VLLM_AUDIO_FETCH_TIMEOUT",

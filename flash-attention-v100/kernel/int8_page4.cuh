@@ -2,7 +2,7 @@
 // Copyright (c) 2025, D.Skryabin
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 // INT8-only specialization adapted from 1CatAI/1Cat-vLLM #1193/#1194.
-// Keep legacy templates and their instantiations in the parent TU unchanged.
+// Compile separately so legacy templates and PTX remain unchanged.
 #pragma once
 #include "int8_kv_traits.cuh"
 namespace int8_page4 {

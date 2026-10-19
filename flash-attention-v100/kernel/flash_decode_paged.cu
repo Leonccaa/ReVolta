@@ -6363,5 +6363,3 @@ at::Tensor flash_attention_decode_qk_scores(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return scores;
 }
-
-#include "int8_page4.cuh"

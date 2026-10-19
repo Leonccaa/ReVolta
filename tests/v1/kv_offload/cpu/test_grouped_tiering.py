@@ -380,6 +380,7 @@ def test_spec_declares_layout_and_rejects_unsupported_topology(monkeypatch, topo
     )
     cache = SimpleNamespace(
         num_blocks=2,
+        kv_cache_groups=[],
         kv_cache_tensors=[SimpleNamespace(size=8192, shared_by=["a", "b"])],
     )
     if topology not in (None, "decode_cp"):

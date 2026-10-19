@@ -13,7 +13,7 @@ from functools import partial
 from typing import Any, NamedTuple, NewType, TypeAlias, cast, overload
 
 from vllm import envs
-from vllm.config import VllmConfig
+from vllm.config import KVTransferConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.hashing import sha256_cbor, xxhash_cbor
 from vllm.utils.math_utils import cdiv, round_up
@@ -98,10 +98,20 @@ NONE_HASH: BlockHash
 _CBOR_HASH_FUNCTIONS = frozenset({sha256_cbor, xxhash_cbor})
 
 
-def init_none_hash(hash_fn: Callable[[Any], bytes]):
+def init_none_hash(
+    hash_fn: Callable[[Any], bytes],
+    *,
+    kv_transfer_config: KVTransferConfig | None = None,
+):
     global NONE_HASH
 
     hash_seed = os.getenv("PYTHONHASHSEED")
+    if kv_transfer_config is not None:
+        from vllm.v1.kv_offload.tiering.fs.config import get_fs_hash_seed
+
+        fs_seed = get_fs_hash_seed(kv_transfer_config)
+        if fs_seed is not None:
+            hash_seed = fs_seed
     if hash_seed is None and hash_fn in _CBOR_HASH_FUNCTIONS:
         logger.warning(
             "PYTHONHASHSEED is not set. This will lead to non-reproducible "

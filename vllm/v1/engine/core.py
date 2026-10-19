@@ -31,6 +31,7 @@ from vllm.logger import init_logger
 from vllm.logging_utils.dump_input import dump_engine_exception
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.cache import MultiModalCacheMissError
 from vllm.tasks import POOLING_TASKS, SupportedTask
 from vllm.tracing import instrument, maybe_init_worker_tracer
 from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
@@ -1660,6 +1661,9 @@ class EngineCoreProc(EngineCore):
                         req: EngineCoreRequest = add_request_decoder.decode(data_frames)
                         try:
                             request = self.preprocess_add_request(req)
+                        except MultiModalCacheMissError as e:
+                            self._handle_mm_cache_miss(req, e)
+                            continue
                         except Exception:
                             self._handle_request_preproc_error(req)
                             continue
@@ -1742,6 +1746,26 @@ class EngineCoreProc(EngineCore):
                 elif len(reuse_buffers) < max_reuse_bufs:
                     # Limit the number of buffers to reuse.
                     reuse_buffers.append(buffer)
+
+    def _handle_mm_cache_miss(
+        self, request: EngineCoreRequest, err: MultiModalCacheMissError
+    ) -> None:
+        """Fail a request whose multi-modal items are missing from the engine
+        cache although the frontend sent them without data (P0/P1 drift).
+
+        The frontend drops the items it sent without data for a request that
+        fails, so a retry sends them again. Expected after a request that was
+        rendered but rejected before it reached the engine, so this logs a
+        warning rather than a traceback.
+        """
+        logger.warning(
+            "Multi-modal items %s of request %s are not in the engine cache "
+            "(frontend/engine cache drift); failing the request so that a "
+            "retry sends their data again.",
+            err.mm_hashes,
+            request.request_id,
+        )
+        self._send_error_outputs_to_client([request.request_id], request.client_index)
 
     def _handle_request_preproc_error(self, request: EngineCoreRequest) -> None:
         """Log and return a request-scoped error response for exceptions raised

@@ -11,7 +11,7 @@ from PIL import Image
 
 from vllm import envs
 
-from ..video import VIDEO_LOADER_REGISTRY
+from ..video import VIDEO_LOADER_REGISTRY, VideoBackend
 from .base import MediaIO
 from .image import ImageMediaIO
 
@@ -49,6 +49,11 @@ class VideoMediaIO(MediaIO[tuple[npt.NDArray, dict[str, Any]]]):
 
         self.image_io = image_io
         self.num_frames = num_frames
+        limit = envs.VLLM_MAX_VIDEO_FRAMES
+        if limit and num_frames > limit:
+            raise ValueError(
+                f"Video exceeds VLLM_MAX_VIDEO_FRAMES={limit}: {num_frames}"
+            )
         # `kwargs` contains custom arguments from
         # --media-io-kwargs for this modality, merged with
         # per-request runtime media_io_kwargs via merge_kwargs().
@@ -67,9 +72,33 @@ class VideoMediaIO(MediaIO[tuple[npt.NDArray, dict[str, Any]]]):
         self.video_loader = VIDEO_LOADER_REGISTRY.load(video_loader_backend)
 
     def load_bytes(self, data: bytes) -> tuple[npt.NDArray, dict[str, Any]]:
-        return self.video_loader.load_bytes(
-            data, num_frames=self.num_frames, **self.kwargs
+        kwargs = dict(self.kwargs)
+        precharged = 0
+
+        def charge_frames(count: int, width: int, height: int) -> None:
+            nonlocal precharged
+            self.image_io.budget.charge_video(count, width, height)
+            precharged = count * width * height * 4
+
+        if issubclass(self.video_loader, VideoBackend):
+            # Set internally after request kwargs, so clients cannot replace it.
+            kwargs["frame_budget"] = charge_frames
+        elif envs.VLLM_MAX_MEDIA_REQUEST_DECODE_BYTES:
+            raise ValueError(
+                "Video backend cannot enforce a pre-decode budget; choose opencv "
+                "or explicitly disable VLLM_MAX_MEDIA_REQUEST_DECODE_BYTES"
+            )
+        result = self.video_loader.load_bytes(
+            data, num_frames=self.num_frames, **kwargs
         )
+        frames = result[0] if isinstance(result, tuple) else result
+        if frames.ndim == 4:
+            count, height, width, _ = frames.shape
+            if not precharged:
+                charge_frames(count, width, height)
+            if frames.nbytes > precharged:
+                self.image_io.budget.charge("decoded", frames.nbytes - precharged)
+        return result
 
     def load_base64(
         self, media_type: str, data: str
@@ -85,8 +114,14 @@ class VideoMediaIO(MediaIO[tuple[npt.NDArray, dict[str, Any]]]):
             elif self.num_frames == 0:
                 raise ValueError("num_frames must be greater than 0 or -1")
             else:
+                limit = envs.VLLM_MAX_VIDEO_FRAMES
+                if limit and data.count(",") + 1 > limit:
+                    raise ValueError(f"Video exceeds VLLM_MAX_VIDEO_FRAMES={limit}")
                 frame_parts = data.split(",")
 
+            limit = envs.VLLM_MAX_VIDEO_FRAMES
+            if limit and len(frame_parts) > limit:
+                raise ValueError(f"Video exceeds VLLM_MAX_VIDEO_FRAMES={limit}")
             frames = np.stack(
                 [np.asarray(load_frame(frame_data)) for frame_data in frame_parts]
             )

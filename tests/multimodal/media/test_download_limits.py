@@ -156,6 +156,22 @@ def test_size_error_maps_to_bad_request():
     assert "VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB" in response.error.message
 
 
+def test_request_budget_streams_across_real_http(monkeypatch, media_server):
+    monkeypatch.setattr(envs, "VLLM_MAX_MEDIA_REQUEST_BYTES", 2, raising=False)
+    url, _, verify = media_server
+    connection = HTTPConnection()
+    connection.get_sync_client().verify = verify
+    connector = MediaConnector(connection=connection)
+    media_io = MagicMock()
+    media_io.load_bytes.side_effect = lambda data: data
+    try:
+        assert connector.load_from_url(f"{url}/small", media_io) == b"ok"
+        with pytest.raises(ValueError, match="VLLM_MAX_MEDIA_REQUEST_BYTES"):
+            connector.load_from_url(f"{url}/small", media_io)
+    finally:
+        connection.get_sync_client().close()
+
+
 def test_size_failure_is_not_retried(monkeypatch):
     monkeypatch.setattr(envs, "VLLM_MEDIA_FETCH_MAX_RETRIES", 3, raising=False)
     connection = HTTPConnection()
@@ -167,6 +183,34 @@ def test_size_failure_is_not_retried(monkeypatch):
         connection.get_bytes("http://127.0.0.1/media", max_bytes=4)
     connection.get_response.assert_called_once()
     response.__exit__.assert_called_once()
+
+
+def test_partial_retry_retains_request_charge(monkeypatch):
+    import requests
+
+    from vllm.multimodal.media.budget import MediaBudget
+
+    monkeypatch.setattr(envs, "VLLM_MAX_MEDIA_REQUEST_BYTES", 3, raising=False)
+    monkeypatch.setattr(envs, "VLLM_MEDIA_FETCH_MAX_RETRIES", 2)
+    monkeypatch.setattr("vllm.connections.time.sleep", lambda _: None)
+    response = MagicMock()
+    response.__enter__.return_value = response
+    response.headers = {}
+
+    def interrupted():
+        yield b"ab"
+        raise requests.exceptions.Timeout("interrupted")
+
+    response.raw.stream.side_effect = [interrupted(), iter([b"cd"])]
+    connection = HTTPConnection()
+    connection.get_response = MagicMock(return_value=response)
+    with pytest.raises(ValueError, match="VLLM_MAX_MEDIA_REQUEST_BYTES"):
+        connection.get_bytes(
+            "http://127.0.0.1/media",
+            max_bytes=10,
+            on_chunk=MediaBudget().charge_encoded,
+        )
+    assert connection.get_response.call_count == 2
 
 
 def test_cancelled_stream_closes_response():

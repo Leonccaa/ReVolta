@@ -12,6 +12,8 @@ from vllm.config.utils import config
 from vllm.utils.hashing import safe_hash
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
+_DEFAULT_LIMITS = {"image": 16, "video": 1, "audio": 16}
+
 
 @dataclass
 class BaseDummyOptions:
@@ -81,7 +83,9 @@ class MultiModalConfig:
     """The maximum number of input items and options allowed per
     prompt for each modality.
 
-    Defaults to 999 for each modality.
+    Defaults to 16 images, 1 video, 16 audio items, and 999 for other
+    modalities. Explicit counts override these defaults. Request media byte
+    and aggregate item budgets apply independently.
 
     Legacy format (count only):
         {"image": 16, "video": 2}
@@ -210,6 +214,8 @@ class MultiModalConfig:
             # Handle legacy format where only count is specified
             if isinstance(v, int):
                 v = {"count": v}
+            else:
+                v = {"count": _DEFAULT_LIMITS.get(k, 999), **v}
 
             # Convert to the appropriate DummyOptions subclass
             if k == "video":
@@ -318,8 +324,8 @@ class MultiModalConfig:
         limit_data = self.limit_per_prompt.get(modality)
 
         if limit_data is None:
-            # Unspecified modality is set to 999 by default
-            return 999
+            # Keep image and video defaults bounded before media is loaded.
+            return _DEFAULT_LIMITS.get(modality, 999)
 
         return limit_data.count
 

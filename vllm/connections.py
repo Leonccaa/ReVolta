@@ -120,6 +120,7 @@ def _append_chunk(
 def _read_response_bytes(
     response: requests.Response,
     max_bytes: int | None,
+    on_chunk: Callable[[int], None] | None = None,
 ) -> bytes:
     max_bytes, media_download_limit = _get_response_size_limit(max_bytes)
 
@@ -135,6 +136,8 @@ def _read_response_bytes(
         _RESPONSE_READ_CHUNK_SIZE, decode_content=False
     ):
         for chunk in decoder.decode(raw_chunk):
+            if on_chunk is not None:
+                on_chunk(len(chunk))
             received_bytes = _append_chunk(
                 chunks, chunk, received_bytes, max_bytes, media_download_limit
             )
@@ -175,6 +178,7 @@ class _MediaResponseDecoder:
 async def _async_read_response_bytes(
     response: aiohttp.ClientResponse,
     max_bytes: int | None,
+    on_chunk: Callable[[int], None] | None = None,
 ) -> bytes:
     max_bytes, media_download_limit = _get_response_size_limit(max_bytes)
 
@@ -184,6 +188,8 @@ async def _async_read_response_bytes(
     decoder = _MediaResponseDecoder(response.headers.get("Content-Encoding", ""))
     async for raw_chunk in response.content.iter_chunked(_RESPONSE_READ_CHUNK_SIZE):
         for chunk in decoder.decode(raw_chunk):
+            if on_chunk is not None:
+                on_chunk(len(chunk))
             received_bytes = _append_chunk(
                 chunks, chunk, received_bytes, max_bytes, media_download_limit
             )
@@ -450,6 +456,7 @@ class HTTPConnection:
         timeout: float | None = None,
         allow_redirects: bool = True,
         max_bytes: int | None = None,
+        on_chunk: Callable[[int], None] | None = None,
     ) -> bytes:
         with self.get_response(
             url,
@@ -460,7 +467,7 @@ class HTTPConnection:
         ) as r:
             r.raise_for_status()
 
-            return _read_response_bytes(r, max_bytes)
+            return _read_response_bytes(r, max_bytes, on_chunk)
 
     @_async_retry
     async def async_get_bytes(
@@ -470,6 +477,7 @@ class HTTPConnection:
         timeout: float | None = None,
         allow_redirects: bool = True,
         max_bytes: int | None = None,
+        on_chunk: Callable[[int], None] | None = None,
     ) -> bytes:
         async with await self.get_async_response(
             url,
@@ -480,7 +488,7 @@ class HTTPConnection:
         ) as r:
             r.raise_for_status()
 
-            return await _async_read_response_bytes(r, max_bytes)
+            return await _async_read_response_bytes(r, max_bytes, on_chunk)
 
     def get_text(self, url: str, *, timeout: float | None = None) -> str:
         with self.get_response(url, timeout=timeout) as r:

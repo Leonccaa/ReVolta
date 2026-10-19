@@ -94,7 +94,9 @@ deployment.
 For local checks, create a Python 3.12 environment with `uv`, install
 `requirements/lint.txt`, and run `pre-commit run --all-files` or run it on staged
 files. Environment registration and metadata checks remain active without a
-local documentation tree. An environment reference can be generated on demand:
+local documentation tree. See [multimodal input limits](.github/MULTIMODAL_INPUTS.md)
+for media defaults, request budgets and override rules.
+An environment reference can be generated on demand:
 
 ```bash
 .venv/bin/python -m tools.generate_env_reference --output environment-reference.md

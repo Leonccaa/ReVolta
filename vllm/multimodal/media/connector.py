@@ -20,12 +20,17 @@ from PIL import Image, UnidentifiedImageError
 from urllib3.util import Url, parse_url
 
 import vllm.envs as envs
-from vllm.connections import HTTPConnection, global_http_connection
+from vllm.connections import (
+    HTTPConnection,
+    MediaDownloadSizeExceededError,
+    global_http_connection,
+)
 from vllm.logger import init_logger
 from vllm.utils.registry import ExtensionManager
 
 from .audio import AudioEmbeddingMediaIO, AudioMediaIO
 from .base import MediaIO
+from .budget import MediaBudget
 from .image import ImageEmbeddingMediaIO, ImageMediaIO
 from .video import VideoMediaIO
 
@@ -84,6 +89,7 @@ class MediaConnector:
         *,
         allowed_local_media_path: str = "",
         allowed_media_domains: list[str] | None = None,
+        budget: MediaBudget | None = None,
     ) -> None:
         """
         Args:
@@ -102,6 +108,7 @@ class MediaConnector:
             media_io_kwargs if media_io_kwargs else {}
         )
         self.connection = connection
+        self.budget = budget or MediaBudget()
 
         if allowed_local_media_path:
             allowed_local_media_path_ = Path(allowed_local_media_path)
@@ -168,7 +175,9 @@ class MediaConnector:
         # Touch mtime for LRU ordering
         try:
             cache_path.touch()
-            return cache_path.read_bytes()
+            return self._read_file_bytes(
+                cache_path, max_bytes=envs.VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB * 1024 * 1024
+            )
         except OSError:
             return None
 
@@ -247,6 +256,13 @@ class MediaConnector:
             msg = "Only base64 data URLs are supported for now."
             raise NotImplementedError(msg)
 
+        # Check before base64 decoding allocates another copy. JPEG sequences
+        # contain comma-separated base64 frames; charge all supplied frames.
+        base64_length = len(data)
+        if media_type.lower() == "video/jpeg":
+            base64_length -= data.count(",")
+        encoded_size = (base64_length + 3) // 4 * 3 - data.count("=")
+        self.budget.charge_encoded(encoded_size)
         return media_io.load_base64(media_type, data)
 
     def _load_file_url(
@@ -269,7 +285,19 @@ class MediaConnector:
                 f"of `--allowed-local-media-path {allowed_local_media_path}`."
             )
 
-        return media_io.load_file(filepath)
+        return media_io.load_bytes(self._read_file_bytes(filepath))
+
+    def _read_file_bytes(self, path: Path, *, max_bytes: int = 0) -> bytes:
+        chunks = []
+        total = 0
+        with path.open("rb") as stream:
+            while chunk := stream.read(64 * 1024):
+                total += len(chunk)
+                if max_bytes and total > max_bytes:
+                    raise MediaDownloadSizeExceededError(max_bytes, total)
+                self.budget.charge_encoded(len(chunk))
+                chunks.append(chunk)
+        return b"".join(chunks)
 
     def _assert_url_in_allowed_media_domains(self, url_spec: Url) -> None:
         if (
@@ -289,6 +317,7 @@ class MediaConnector:
         *,
         fetch_timeout: int | None = None,
     ) -> _M:  # type: ignore[type-var]
+        self.budget.charge("items", 1)
         if url[:5].lower() == "data:":
             return self._load_data_url(url, media_io)
 
@@ -307,6 +336,7 @@ class MediaConnector:
                 timeout=fetch_timeout,
                 allow_redirects=envs.VLLM_MEDIA_URL_ALLOW_REDIRECTS,
                 max_bytes=envs.VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB * 1024 * 1024 or None,
+                on_chunk=self.budget.charge_encoded,
             )
 
             self._put_cached_bytes(url, data)
@@ -326,6 +356,7 @@ class MediaConnector:
         fetch_timeout: int | None = None,
     ) -> _M:
         loop = asyncio.get_running_loop()
+        self.budget.charge("items", 1)
 
         if url[:5].lower() == "data:":
             future = loop.run_in_executor(
@@ -353,6 +384,7 @@ class MediaConnector:
                 timeout=fetch_timeout,
                 allow_redirects=envs.VLLM_MEDIA_URL_ALLOW_REDIRECTS,
                 max_bytes=envs.VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB * 1024 * 1024 or None,
+                on_chunk=self.budget.charge_encoded,
             )
 
             await loop.run_in_executor(
@@ -411,7 +443,9 @@ class MediaConnector:
         By default, the image is converted into RGB format.
         """
         image_io = ImageMediaIO(
-            image_mode=image_mode, **self.media_io_kwargs.get("image", {})
+            image_mode=image_mode,
+            budget=self.budget,
+            **self.media_io_kwargs.get("image", {}),
         )
 
         try:
@@ -436,7 +470,9 @@ class MediaConnector:
         By default, the image is converted into RGB format.
         """
         image_io = ImageMediaIO(
-            image_mode=image_mode, **self.media_io_kwargs.get("image", {})
+            image_mode=image_mode,
+            budget=self.budget,
+            **self.media_io_kwargs.get("image", {}),
         )
 
         try:
@@ -459,7 +495,9 @@ class MediaConnector:
         Load video from an HTTP or base64 data URL.
         """
         image_io = ImageMediaIO(
-            image_mode=image_mode, **self.media_io_kwargs.get("image", {})
+            image_mode=image_mode,
+            budget=self.budget,
+            **self.media_io_kwargs.get("image", {}),
         )
         video_io = VideoMediaIO(image_io, **self.media_io_kwargs.get("video", {}))
 
@@ -481,7 +519,9 @@ class MediaConnector:
         By default, the image is converted into RGB format.
         """
         image_io = ImageMediaIO(
-            image_mode=image_mode, **self.media_io_kwargs.get("image", {})
+            image_mode=image_mode,
+            budget=self.budget,
+            **self.media_io_kwargs.get("image", {}),
         )
         video_io = VideoMediaIO(image_io, **self.media_io_kwargs.get("video", {}))
 

@@ -631,7 +631,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             seed=self.seed,
             stop=self.stop,
             stop_token_ids=self.stop_token_ids,
-            logprobs=self.top_logprobs if self.logprobs else None,
+            logprobs=(self.top_logprobs or 0) if self.logprobs else None,
             prompt_logprobs=prompt_logprobs,
             ignore_eos=self.ignore_eos,
             max_tokens=max_tokens,

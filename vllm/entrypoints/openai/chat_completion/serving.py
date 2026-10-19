@@ -609,13 +609,13 @@ class OpenAIServingChat(OpenAIServing):
                     if finish_reason_sent[i]:
                         continue
 
-                    if request.logprobs and request.top_logprobs is not None:
+                    if request.logprobs:
                         assert output.logprobs is not None, "Did not output logprobs"
                         logprobs = self._create_chat_logprobs(
                             token_ids=output.token_ids,
                             top_logprobs=output.logprobs,
                             tokenizer=tokenizer,
-                            num_output_top_logprobs=request.top_logprobs,
+                            num_output_top_logprobs=request.top_logprobs or 0,
                             return_as_token_id=request.return_tokens_as_token_ids,
                         )
                     else:
@@ -1047,12 +1047,12 @@ class OpenAIServingChat(OpenAIServing):
             out_logprobs = output.logprobs
             tool_call_info = None
 
-            if request.logprobs and request.top_logprobs is not None:
+            if request.logprobs:
                 assert out_logprobs is not None, "Did not output logprobs"
                 logprobs = self._create_chat_logprobs(
                     token_ids=token_ids,
                     top_logprobs=out_logprobs,
-                    num_output_top_logprobs=request.top_logprobs,
+                    num_output_top_logprobs=request.top_logprobs or 0,
                     tokenizer=tokenizer,
                     return_as_token_id=request.return_tokens_as_token_ids,
                 )

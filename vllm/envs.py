@@ -214,6 +214,12 @@ if TYPE_CHECKING:
     VLLM_WORKER_MULTIPROC_METHOD: Literal["fork", "spawn"] = "fork"
     VLLM_ASSETS_CACHE: str = os.path.join(VLLM_CACHE_ROOT, "assets")
     VLLM_ASSETS_CACHE_MODEL_CLEAN: bool = False
+    VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB: int = 256
+    VLLM_MAX_MEDIA_REQUEST_BYTES: int = 268435456
+    VLLM_MAX_MEDIA_REQUEST_DECODE_BYTES: int = 536870912
+    VLLM_MAX_MEDIA_REQUEST_ITEMS: int = 32
+    VLLM_MAX_IMAGE_PIXELS: int = 16777216
+    VLLM_MAX_VIDEO_FRAMES: int = 64
     VLLM_IMAGE_FETCH_TIMEOUT: int = 5
     VLLM_VIDEO_FETCH_TIMEOUT: int = 30
     VLLM_AUDIO_FETCH_TIMEOUT: int = 10
@@ -2716,6 +2722,84 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Timeout for fetching images when serving multimodal models
     # Default is 5 seconds
+    "VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB": env_var(
+        lambda: int(os.getenv("VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB", "256")),
+        description=(
+            "Maximum bytes per remote media response in MiB; "
+            "0 disables this limit. Applied while streaming."
+        ),
+        category="configuration",
+        declared_default="256",
+        effective_default="256",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_MAX_MEDIA_REQUEST_BYTES": env_var(
+        lambda: int(os.getenv("VLLM_MAX_MEDIA_REQUEST_BYTES", "268435456")),
+        description=(
+            "Maximum total encoded media bytes per request across HTTP, data URLs"
+            " and files. Zero disables the limit."
+        ),
+        category="configuration",
+        declared_default="268435456",
+        effective_default="268435456",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_MAX_MEDIA_REQUEST_DECODE_BYTES": env_var(
+        lambda: int(os.getenv("VLLM_MAX_MEDIA_REQUEST_DECODE_BYTES", "536870912")),
+        description=(
+            "Maximum aggregate decoded media bytes per request, charged before "
+            "image and default video raster allocation. Zero disables the limit."
+        ),
+        category="configuration",
+        declared_default="536870912",
+        effective_default="536870912",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_MAX_MEDIA_REQUEST_ITEMS": env_var(
+        lambda: int(os.getenv("VLLM_MAX_MEDIA_REQUEST_ITEMS", "32")),
+        description=(
+            "Maximum total raw media items per request, shared across modalities."
+            " Zero disables the limit."
+        ),
+        category="configuration",
+        declared_default="32",
+        effective_default="32",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_MAX_IMAGE_PIXELS": env_var(
+        lambda: int(os.getenv("VLLM_MAX_IMAGE_PIXELS", "16777216")),
+        description=(
+            "Maximum pixels per image or video frame, checked before default "
+            "raster allocation. Zero disables the limit."
+        ),
+        category="configuration",
+        declared_default="16777216",
+        effective_default="16777216",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_MAX_VIDEO_FRAMES": env_var(
+        lambda: int(os.getenv("VLLM_MAX_VIDEO_FRAMES", "64")),
+        description=(
+            "Maximum sampled frames per video, independent of request media IO "
+            "overrides. Zero disables the limit."
+        ),
+        category="configuration",
+        declared_default="64",
+        effective_default="64",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
     "VLLM_IMAGE_FETCH_TIMEOUT": env_var(
         lambda: int(os.getenv("VLLM_IMAGE_FETCH_TIMEOUT", "5")),
         description=(
@@ -19525,6 +19609,12 @@ def compile_factors() -> dict[str, object]:
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
         "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS",
         "VLLM_KEEP_ALIVE_ON_ENGINE_DEATH",
+        "VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB",
+        "VLLM_MAX_MEDIA_REQUEST_BYTES",
+        "VLLM_MAX_MEDIA_REQUEST_DECODE_BYTES",
+        "VLLM_MAX_MEDIA_REQUEST_ITEMS",
+        "VLLM_MAX_IMAGE_PIXELS",
+        "VLLM_MAX_VIDEO_FRAMES",
         "VLLM_IMAGE_FETCH_TIMEOUT",
         "VLLM_VIDEO_FETCH_TIMEOUT",
         "VLLM_AUDIO_FETCH_TIMEOUT",

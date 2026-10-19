@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
 from abc import abstractmethod
+from collections.abc import Callable
 from io import BytesIO
 from typing import Any, ClassVar, Literal, NamedTuple, cast
 
@@ -484,6 +485,7 @@ class VideoBackend(VideoLoader, OpenCVVideoBackendMixin, PyAVVideoBackendMixin):
         frame_recovery: bool = False,
         *,
         backend: Literal["opencv", "pyav"] = "opencv",
+        frame_budget: Callable[[int, int, int], None] | None = None,
         **kwargs,
     ) -> tuple[npt.NDArray, dict[str, Any]]:
         """Load sampled frames from raw video bytes.
@@ -507,25 +509,50 @@ class VideoBackend(VideoLoader, OpenCVVideoBackendMixin, PyAVVideoBackendMixin):
 
         if backend == "opencv":
             cap = cls.open_video_capture(data)
-            source = cls._prepare_source(cls.get_video_metadata(cap))
-            frame_idx = cls.compute_frames_index_to_sample(
-                source=source, target=target, **kwargs
-            )
-            frames, valid = cls.read_frames(
-                cap,
-                frame_idx,
-                total_frames_num=source.total_frames_num,
-                frame_recovery=frame_recovery,
-            )
+            try:
+                source = cls._prepare_source(cls.get_video_metadata(cap))
+                charged = frame_budget is not None and num_frames < 0 and fps < 0
+                if charged and frame_budget is not None:
+                    frame_budget(
+                        source.total_frames_num,
+                        int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                        int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+                    )
+                frame_idx = cls.compute_frames_index_to_sample(
+                    source=source, target=target, **kwargs
+                )
+                if frame_budget is not None and not charged:
+                    frame_budget(
+                        len(frame_idx),
+                        int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                        int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+                    )
+                frames, valid = cls.read_frames(
+                    cap,
+                    frame_idx,
+                    total_frames_num=source.total_frames_num,
+                    frame_recovery=frame_recovery,
+                )
+            finally:
+                # Keep the capture destructor ownership used by this backend.
+                # Explicit release() can invalidate Python IStream callbacks.
+                del cap
         elif backend == "pyav":
             assert not frame_recovery, (
                 "frame_recovery is only available for `opencv` backend"
             )
             with av.open(BytesIO(data)) as container:
                 source = cls._prepare_source(cls.get_metadata(container))
+                charged = frame_budget is not None and num_frames < 0 and fps < 0
+                if charged and frame_budget is not None:
+                    stream = container.streams.video[0]
+                    frame_budget(source.total_frames_num, stream.width, stream.height)
                 frame_idx = cls.compute_frames_index_to_sample(
                     source=source, target=target, **kwargs
                 )
+                if frame_budget is not None and not charged:
+                    stream = container.streams.video[0]
+                    frame_budget(len(frame_idx), stream.width, stream.height)
                 frames, valid = cls.decode_frames(
                     container, frame_idx, source.original_fps, source.duration
                 )

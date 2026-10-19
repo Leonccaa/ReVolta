@@ -2550,10 +2550,17 @@ class EngineArgs:
         # Checked here, once before any worker starts, and not in
         # VllmConfig.__post_init__: model construction rebuilds the config in
         # every worker while the first stage may already pin its tables.
-        from vllm.models.qwen4_exp.common.ple import check_ple_host_share
+        from vllm.models.qwen4_exp.common.ple import (
+            check_ple_host_share,
+            cpu_kv_offload_bytes,
+        )
 
         check_ple_host_share(
-            model_config.hf_text_config, parallel_config.tensor_parallel_size
+            model_config.hf_text_config,
+            min(parallel_config.tensor_parallel_size, parallel_config.local_world_size)
+            * parallel_config.data_parallel_size_local,
+            cpu_kv_bytes=cpu_kv_offload_bytes(config)
+            * parallel_config.data_parallel_size_local,
         )
 
         return config

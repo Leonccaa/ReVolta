@@ -320,12 +320,21 @@ def test_configured_host_share_is_checked_once_before_the_ranks_start(
     set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_GIB", "6")
     set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", None)
     monkeypatch.setattr(ple_common, "total_host_bytes", lambda: 30 * gib)
+    monkeypatch.setattr(
+        ple_common, "cgroup_host_memory", lambda: (None, None), raising=False
+    )
     # 30 GiB host, 7.5 GiB reserve: two ranks of 6 GiB need 19.5 GiB available.
     monkeypatch.setattr(ple_common, "available_host_bytes", lambda: int(19.5 * gib))
     check_ple_host_share(ple_config, ranks_sharing_host=2)
     monkeypatch.setattr(ple_common, "available_host_bytes", lambda: 19 * gib)
-    with pytest.raises(ValueError, match="asks for 6.0 GiB .* at most 5.75 GiB"):
-        check_ple_host_share(ple_config, ranks_sharing_host=2)
+    warnings = []
+    monkeypatch.setattr(
+        ple_common.logger, "warning", lambda msg, *args: warnings.append(msg % args)
+    )
+    # HOST_GIB is a cap; preflight cannot reject a smaller actual table.
+    check_ple_host_share(ple_config, ranks_sharing_host=2)
+    assert len(warnings) == 1
+    assert "PLE configured upper bound 12.0 GiB" in warnings[0]
     # A smaller reserve makes room again.
     set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", "4")
     check_ple_host_share(ple_config, ranks_sharing_host=2)

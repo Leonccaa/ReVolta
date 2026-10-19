@@ -855,6 +855,15 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             vram_budget_bytes=vram_budget,
             disk_allowed=cascade,
         )
+        if explicit_host is not None and not cascade and placement.vram_rows:
+            logger.warning(
+                "Qwen4Exp PLE explicit VLLM_QWEN4EXP_PLE_HOST_GIB cap "
+                "leaves %d rows (%s GiB) in device memory, with %d rows "
+                "on host. This device allocation reduces room for KV cache.",
+                placement.vram_rows,
+                format_gib(placement.vram_rows * row_bytes),
+                placement.host_rows,
+            )
         if placement.disk_rows and not placement.local_rows:
             # The gathers of both resident tiers always run and read row 0.
             raise RuntimeError(

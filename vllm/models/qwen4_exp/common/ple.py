@@ -6,6 +6,7 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from itertools import pairwise
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -500,43 +501,111 @@ def ple_cascade_configured() -> bool:
     return bool(getattr(kernel, "ple_disk_cascade_active", False))
 
 
-def check_ple_host_share(text_config: Any, ranks_sharing_host: int) -> None:
-    """Refuse a configured pinned-host share the host cannot hold.
+def cgroup_host_memory(
+    root: Path = Path("/sys/fs/cgroup"),
+    membership: Path = Path("/proc/self/cgroup"),
+) -> tuple[int | None, int | None]:
+    """Visible cgroup-v2 hard limit and headroom, including tighter parents.
+
+    A container may mount only its own cgroup at root. Always inspect that
+    root too; membership paths need not exist in the container's namespace.
+    """
+    root = root.resolve()
+    node = root
+    try:
+        entry = next(
+            line[3:]
+            for line in membership.read_text().splitlines()
+            if line.startswith("0::")
+        )
+        candidate = (root / entry.lstrip("/")).resolve()
+        if candidate.is_relative_to(root):
+            node = candidate
+    except (OSError, StopIteration):
+        pass
+    limits, remaining = [], []
+    while True:
+        try:
+            limit = int((node / "memory.max").read_text())
+            if limit >= 0:
+                try:
+                    used = int((node / "memory.current").read_text())
+                except (OSError, ValueError):
+                    used = 0
+                limits.append(limit)
+                remaining.append(max(0, limit - used))
+        except (OSError, ValueError):
+            pass
+        if node == root:
+            break
+        node = node.parent
+    return (min(limits), min(remaining)) if limits else (None, None)
+
+
+def preflight_host_memory() -> tuple[int | None, int | None, str]:
+    total, available = cgroup_host_memory()
+    host_available = available_host_bytes()
+    if total is not None:
+        if host_available is not None and available is not None:
+            available = min(available, host_available)
+        return total, available, "cgroup v2 memory.max/memory.current"
+    return total_host_bytes(), host_available, "/proc/meminfo"
+
+
+def cpu_kv_offload_bytes(config: Any) -> int:
+    """Resolved CPU pool size, summed across TP ranks (not multiplied by TP)."""
+    transfer = getattr(config, "kv_transfer_config", None)
+    extra = getattr(transfer, "kv_connector_extra_config", {})
+    if getattr(transfer, "kv_connector", None) in (
+        "OffloadingConnector",
+        "SimpleCPUOffloadConnector",
+    ):
+        return max(0, int(extra.get("cpu_bytes_to_use", 0)))
+    size = getattr(getattr(config, "cache_config", None), "kv_offloading_size", None)
+    return max(0, int(size * 2**30)) if size is not None else 0
+
+
+def check_ple_host_share(
+    text_config: Any, ranks_sharing_host: int, *, cpu_kv_bytes: int = 0
+) -> None:
+    """Warn when configured PLE caps plus the CPU KV pool exceed headroom.
 
     Runs once before any rank starts. The ranks place their tables at the same
     time, so a rank that reads the host memory while a sibling already pins its
     share would count that share twice and refuse a configuration that fits.
-    The reserve covers what the loading claims afterwards.
+    This is an upper-bound estimate: HOST_GIB is a cap, not an allocation,
+    and placement may retain fewer rows. A warning preserves the placement
+    contract and avoids rejecting tables that fit below their configured caps.
+    The reserve covers engines and checkpoint loading, separately from KV.
     """
 
     if not getattr(text_config, "ple_layer_ids", None):
         return
     budget = ple_host_budget_bytes()
-    available = available_host_bytes()
-    total = total_host_bytes()
-    if not budget or available is None or total is None:
+    total, available, source = preflight_host_memory()
+    if available is None or total is None:
+        return
+    if budget is None and not cpu_kv_bytes:
         return
     reserve = ple_host_reserve_bytes(total)
-    share = cap_host_budget_bytes(
-        budget_bytes=budget,
-        available_bytes=available,
-        reserve_bytes=reserve,
-        ranks_sharing_host=ranks_sharing_host,
+    ple_bytes = (budget or 0) * ranks_sharing_host * len(text_config.ple_layer_ids)
+    log = (
+        logger.warning
+        if ple_bytes + cpu_kv_bytes + reserve > available
+        else logger.info
     )
-    if share < budget:
-        raise ValueError(
-            f"VLLM_QWEN4EXP_PLE_HOST_GIB asks for {format_gib(budget)} GiB of "
-            f"pinned host memory per rank, but each of the {ranks_sharing_host} "
-            f"tensor-parallel ranks may pin at most {format_gib(share)} GiB: "
-            f"{format_gib(available)} GiB available, {format_gib(reserve)} GiB "
-            "kept in reserve. Lower VLLM_QWEN4EXP_PLE_HOST_GIB or "
-            "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB."
-        )
-    logger.info(
-        "Qwen4Exp PLE host share %s GiB per rank fits: %d ranks, %s GiB "
-        "available, %s GiB kept in reserve.",
-        format_gib(budget),
-        ranks_sharing_host,
+    log(
+        "Qwen4Exp PLE host preflight (%s): limit %s GiB, %s GiB available; "
+        "PLE configured upper bound %s GiB across %d ranks, CPU KV pool %s GiB "
+        "total, reserve %s GiB. HOST_GIB caps each table; a larger cap does "
+        "not allocate extra rows. Automatic PLE placement is not estimated. "
+        "If these allocations exceed headroom, reduce the CPU KV pool or "
+        "PLE host share to avoid host OOM; placement is unchanged.",
+        source,
+        format_gib(total),
         format_gib(available),
+        format_gib(ple_bytes),
+        ranks_sharing_host,
+        format_gib(cpu_kv_bytes),
         format_gib(reserve),
     )

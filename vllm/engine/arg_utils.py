@@ -1991,6 +1991,18 @@ class EngineArgs:
         self.tokenizer = model_config.tokenizer
 
         self._check_feature_supported()
+        from vllm.revolta_profile import (
+            all_visible_devices_sm70,
+            apply_revolta_profile,
+        )
+
+        # Must precede the MTP defaults: those pre-fill capture sizes and change
+        # fast_moe_cold_start before VllmConfig gets a chance to choose policy.
+        apply_revolta_profile(
+            model_config,
+            self.tensor_parallel_size,
+            is_sm70=all_visible_devices_sm70(),
+        )
         self._maybe_apply_sm70_mtp_defaults(usage_context, model_config)
         self._set_default_chunked_prefill_and_prefix_caching_args(model_config)
         self._set_default_reasoning_config_args()

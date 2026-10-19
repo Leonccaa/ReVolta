@@ -465,6 +465,7 @@ if TYPE_CHECKING:
     VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES: bool = True
     VLLM_SM70_CAR_VMM_SAFE: bool = False
     VLLM_SM70_CAR_VMM_SAFE_PREALLOC: bool = True
+    VLLM_SM70_INTERCONNECT: str = "auto"
     VLLM_SM70_PCIE_SWITCH_CUSTOM_AR: str = "auto"
     VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES: int = 81920
     VLLM_SM70_PCIE_SWITCH_CAR_GRAPH_ONLY: bool = True
@@ -2053,22 +2054,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default=(
             "Computed by use_aot_compile; configuration may replace the unset "
-            "default under the automatic conditions below."
+            "default under the automatic conditions below.; ReVolta FP16 QSA SM70 "
+            "TP4 profile sets '0' under automatic_conditions."
         ),
         automatic_conditions=(
             (
-                "vllm/config/vllm.py:_configure_sm70_glm5_dflash_tp8_pp1_verifier_"
-                "path sets '0' when name not in os.environ; automatic defaults "
-                "apply only when the environment override is absent."
+                "vllm/config/vllm.py:_configure_sm70_glm5_dflash_tp8_pp1_verifier_path "
+                "sets '0' when name not in os.environ; automatic defaults apply only "
+                "when the environment override is absent."
             ),
             (
                 "vllm/config/vllm.py:__post_init__ sets '1' when "
-                "sm70_flash_0dot3_compile_graph and sm70_compile_disabled_by_user "
-                "and current_platform.is_cuda() and "
+                "sm70_flash_0dot3_compile_graph and sm70_compile_disabled_by_user and "
+                "current_platform.is_cuda() and "
                 "_any_participating_device_is_capability(self, (7, 0)) and "
                 "envs.VLLM_SM70_FLASH_ATTN_V100 and 'VLLM_USE_AOT_COMPILE' not in "
                 "os.environ; automatic defaults apply only when the environment "
                 "override is absent."
+            ),
+            (
+                "vllm/revolta_profile.py:apply_revolta_profile sets '0' when all "
+                "visible CUDA devices are SM70, selector metadata describes QSA, "
+                "activation dtype is FP16 and TP=4; explicit environment values win."
             ),
         ),
         acceleration_paths=(),
@@ -3215,8 +3222,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         category="configuration",
         declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
+        effective_default=(
+            "False; ReVolta FP16 QSA SM70 TP4 profile sets '1' under "
+            "automatic_conditions."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/revolta_profile.py:apply_revolta_profile sets '1' when all "
+                "visible CUDA devices are SM70, selector metadata describes QSA, "
+                "activation dtype is FP16 and TP=4; explicit environment values win."
+            ),
+        ),
         acceleration_paths=("MTP verifier",),
         user_visible=False,
     ),
@@ -3386,11 +3402,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="configuration",
         declared_default="True",
         effective_default=(
-            "Computed when unset: "
-            "env_with_choices('VLLM_SM70_AWQ_QWEN38_QPN_M1', '1', ['0', "
-            "'1'])() == '1'"
+            "Computed when unset: env_with_choices('VLLM_SM70_AWQ_QWEN38_QPN_M1', "
+            "'1', ['0', '1'])() == '1'; ReVolta FP16 QSA SM70 TP4 profile sets "
+            "'1' under automatic_conditions."
         ),
-        automatic_conditions=(),
+        automatic_conditions=(
+            (
+                "vllm/revolta_profile.py:apply_revolta_profile sets '1' when all "
+                "visible CUDA devices are SM70, selector metadata describes QSA, "
+                "activation dtype is FP16 and TP=4; explicit environment values win. "
+                "Only AWQ checkpoints; NVFP4 retains the upstream default for this "
+                "item."
+            ),
+        ),
         acceleration_paths=("TurboMindAwqLinearKernel",),
         user_visible=False,
     ),
@@ -3426,8 +3450,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         category="experimental",
         declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
+        effective_default=(
+            "False; ReVolta FP16 QSA SM70 TP4 profile sets '1' under "
+            "automatic_conditions."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/revolta_profile.py:apply_revolta_profile sets '1' when all "
+                "visible CUDA devices are SM70, selector metadata describes QSA, "
+                "activation dtype is FP16 and TP=4; explicit environment values win. "
+                "Only AWQ checkpoints; NVFP4 retains the upstream default for this "
+                "item."
+            ),
+        ),
         acceleration_paths=("TurboMindAwqLinearKernel",),
         user_visible=False,
     ),
@@ -3442,8 +3477,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         category="tuning",
         declared_default="16",
-        effective_default="16",
-        automatic_conditions=(),
+        effective_default=(
+            "16; ReVolta FP16 QSA SM70 TP4 profile sets '8' under automatic_conditions."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/revolta_profile.py:apply_revolta_profile sets '8' when all "
+                "visible CUDA devices are SM70, selector metadata describes QSA, "
+                "activation dtype is FP16 and TP=4; explicit environment values win. "
+                "Only AWQ checkpoints; NVFP4 retains the upstream default for this "
+                "item."
+            ),
+        ),
         acceleration_paths=("TurboMindAwqLinearKernel",),
         user_visible=False,
     ),
@@ -3458,8 +3503,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         category="tuning",
         declared_default="20",
-        effective_default="20",
-        automatic_conditions=(),
+        effective_default=(
+            "20; ReVolta FP16 QSA SM70 TP4 profile sets '40' under "
+            "automatic_conditions."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/revolta_profile.py:apply_revolta_profile sets '40' when all "
+                "visible CUDA devices are SM70, selector metadata describes QSA, "
+                "activation dtype is FP16 and TP=4; explicit environment values win. "
+                "Only AWQ checkpoints; NVFP4 retains the upstream default for this "
+                "item."
+            ),
+        ),
         acceleration_paths=("TurboMindAwqLinearKernel",),
         user_visible=False,
     ),
@@ -3475,8 +3531,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         category="tuning",
         declared_default="0",
-        effective_default="0",
-        automatic_conditions=(),
+        effective_default=(
+            "0; ReVolta FP16 QSA SM70 TP4 profile sets '24' under automatic_conditions."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/revolta_profile.py:apply_revolta_profile sets '24' when all "
+                "visible CUDA devices are SM70, selector metadata describes QSA, "
+                "activation dtype is FP16 and TP=4; explicit environment values win. "
+                "Only AWQ checkpoints; NVFP4 retains the upstream default for this "
+                "item."
+            ),
+        ),
         acceleration_paths=("TurboMindAwqLinearKernel",),
         user_visible=False,
     ),
@@ -3510,8 +3576,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         category="experimental",
         declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
+        effective_default=(
+            "False; ReVolta FP16 QSA SM70 TP4 profile sets '1' under "
+            "automatic_conditions."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/revolta_profile.py:apply_revolta_profile sets '1' when all "
+                "visible CUDA devices are SM70, selector metadata describes QSA, "
+                "activation dtype is FP16 and TP=4; explicit environment values win."
+            ),
+        ),
         acceleration_paths=("SM70 Qwen3.8 wide-M decode",),
         user_visible=False,
     ),
@@ -3862,8 +3937,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         category="configuration",
         declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
+        effective_default=(
+            "False; ReVolta FP16 QSA SM70 TP4 profile sets '1' under "
+            "automatic_conditions."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/revolta_profile.py:apply_revolta_profile sets '1' when all "
+                "visible CUDA devices are SM70, selector metadata describes QSA, "
+                "activation dtype is FP16 and TP=4; explicit environment values win. "
+                "Only AWQ checkpoints; NVFP4 retains the upstream default for this "
+                "item."
+            ),
+        ),
         acceleration_paths=("TurboMindAwqLinearKernel",),
         user_visible=False,
     ),
@@ -4279,8 +4365,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         category="experimental",
         declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
+        effective_default=(
+            "False; ReVolta FP16 QSA SM70 TP4 profile sets '1' under "
+            "automatic_conditions."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/revolta_profile.py:apply_revolta_profile sets '1' when all "
+                "visible CUDA devices are SM70, selector metadata describes QSA, "
+                "activation dtype is FP16 and TP=4; explicit environment values win."
+            ),
+        ),
         acceleration_paths=("MTP verifier",),
         user_visible=False,
     ),
@@ -4295,8 +4390,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         category="experimental",
         declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
+        effective_default=(
+            "False; ReVolta FP16 QSA SM70 TP4 profile sets '1' under "
+            "automatic_conditions."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/revolta_profile.py:apply_revolta_profile sets '1' when all "
+                "visible CUDA devices are SM70, selector metadata describes QSA, "
+                "activation dtype is FP16 and TP=4; explicit environment values win."
+            ),
+        ),
         acceleration_paths=("SM70 runtime/kernel policy",),
         user_visible=False,
     ),
@@ -4313,8 +4417,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         category="experimental",
         declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
+        effective_default=(
+            "False; ReVolta FP16 QSA SM70 TP4 profile sets '1' under "
+            "automatic_conditions."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/revolta_profile.py:apply_revolta_profile sets '1' when all "
+                "visible CUDA devices are SM70, selector metadata describes QSA, "
+                "activation dtype is FP16 and TP=4; explicit environment values win."
+            ),
+        ),
         acceleration_paths=("SM70 runtime/kernel policy",),
         user_visible=False,
     ),
@@ -4357,8 +4470,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         category="experimental",
         declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
+        effective_default=(
+            "False; ReVolta FP16 QSA SM70 TP4 profile sets '1' under "
+            "automatic_conditions."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/revolta_profile.py:apply_revolta_profile sets '1' when all "
+                "visible CUDA devices are SM70, selector metadata describes QSA, "
+                "activation dtype is FP16 and TP=4; explicit environment values win."
+            ),
+        ),
         acceleration_paths=("SM70 runtime/kernel policy",),
         user_visible=False,
     ),
@@ -4372,8 +4494,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         category="experimental",
         declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
+        effective_default=(
+            "False; ReVolta FP16 QSA SM70 TP4 profile sets '1' under "
+            "automatic_conditions."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/revolta_profile.py:apply_revolta_profile sets '1' when all "
+                "visible CUDA devices are SM70, selector metadata describes QSA, "
+                "activation dtype is FP16 and TP=4; explicit environment values win."
+            ),
+        ),
         acceleration_paths=("SM70 runtime/kernel policy",),
         user_visible=False,
     ),
@@ -4385,8 +4516,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         category="experimental",
         declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
+        effective_default=(
+            "False; ReVolta FP16 QSA SM70 TP4 profile sets '1' under "
+            "automatic_conditions."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/revolta_profile.py:apply_revolta_profile sets '1' when all "
+                "visible CUDA devices are SM70, selector metadata describes QSA, "
+                "activation dtype is FP16 and TP=4; explicit environment values win."
+            ),
+        ),
         acceleration_paths=("SM70 runtime/kernel policy",),
         user_visible=False,
     ),
@@ -4400,8 +4540,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         category="experimental",
         declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
+        effective_default=(
+            "False; ReVolta FP16 QSA SM70 TP4 profile sets '1' under "
+            "automatic_conditions."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/revolta_profile.py:apply_revolta_profile sets '1' when all "
+                "visible CUDA devices are SM70, selector metadata describes QSA, "
+                "activation dtype is FP16 and TP=4; explicit environment values win."
+            ),
+        ),
         acceleration_paths=("SM70 runtime/kernel policy",),
         user_visible=False,
     ),
@@ -4414,8 +4563,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         category="experimental",
         declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
+        effective_default=(
+            "False; ReVolta FP16 QSA SM70 TP4 profile sets '1' under "
+            "automatic_conditions."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/revolta_profile.py:apply_revolta_profile sets '1' when all "
+                "visible CUDA devices are SM70, selector metadata describes QSA, "
+                "activation dtype is FP16 and TP=4; explicit environment values win."
+            ),
+        ),
         acceleration_paths=("SM70 runtime/kernel policy",),
         user_visible=False,
     ),
@@ -4428,8 +4586,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         category="experimental",
         declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
+        effective_default=(
+            "False; ReVolta FP16 QSA SM70 TP4 profile sets '1' under "
+            "automatic_conditions."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/revolta_profile.py:apply_revolta_profile sets '1' when all "
+                "visible CUDA devices are SM70, selector metadata describes QSA, "
+                "activation dtype is FP16 and TP=4; explicit environment values win."
+            ),
+        ),
         acceleration_paths=("SM70 runtime/kernel policy",),
         user_visible=False,
     ),
@@ -7053,8 +7220,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         category="experimental",
         declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
+        effective_default=(
+            "False; ReVolta FP16 QSA SM70 TP4 profile sets '1' under "
+            "automatic_conditions."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/revolta_profile.py:apply_revolta_profile sets '1' when all "
+                "visible CUDA devices are SM70, selector metadata describes QSA, "
+                "activation dtype is FP16 and TP=4; explicit environment values win. "
+                "Only interconnect_mode=pex_p2p or nvlink; no_p2p retains upstream."
+            ),
+        ),
         acceleration_paths=("SM70 collectives",),
         user_visible=False,
     ),
@@ -7078,20 +7255,44 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=("SM70 collectives",),
         user_visible=False,
     ),
-    # Four SM70 GPUs whose every pair meets below a PCIe switch (nvidia-smi
-    # PIX/PXB) have working P2P but no NVLink. Upstream disables custom
-    # all-reduce for more than two non-NVLink GPUs; on this topology the SM70
-    # TP4 push kernels are faster than NCCL for small graph-captured payloads.
-    # auto: enable when SM70, TP4 and the PCIe-switch topology all hold.
-    # 1: skip the topology query (the P2P test still runs). 0: never.
+    # One scoped policy selector; explicit modes override the legacy PEX knob.
+    "VLLM_SM70_INTERCONNECT": env_var(
+        lambda: os.getenv("VLLM_SM70_INTERCONNECT", "auto").strip().lower(),
+        description=(
+            "Select the SM70 TP4 custom all-reduce interconnect policy: auto "
+            "detects NVLink, then the narrow PIX/PXB PEX topology with fresh "
+            "all-peer IPC validation; pex bypasses topology but still requires "
+            "fresh P2P and retains the PCIe payload/graph limits; nccl disables "
+            "custom AR; nvlink forces the upstream fully-connected path but "
+            "still checks P2P. Auto preserves the legacy PCIe-switch switch; "
+            "explicit modes override it. disable-custom-all-reduce wins. "
+            "Use an explicit mode for diagnostics or unavailable NVML; auto "
+            "is the safe default. Other architectures and TP sizes retain "
+            "the upstream policy."
+        ),
+        category="configuration",
+        declared_default="auto",
+        effective_default="auto",
+        automatic_conditions=(
+            "CUDA SM70",
+            "tensor parallel size 4",
+            "CPU group agrees on topology and P2P",
+        ),
+        acceleration_paths=("SM70 collectives",),
+        user_visible=True,
+    ),
+    # Legacy PEX admission: auto requires PIX/PXB; 1 bypasses NVML topology;
+    # 0 excludes only PEX. All PEX paths now require fresh all-peer IPC access.
     "VLLM_SM70_PCIE_SWITCH_CUSTOM_AR": env_var(
         lambda: os.getenv("VLLM_SM70_PCIE_SWITCH_CUSTOM_AR", "auto").strip().lower(),
         description=(
             "Custom all-reduce for four SM70 GPUs under one PCIe switch "
             "(nvidia-smi PIX/PXB, no NVLink): auto enables it when SM70, "
             "TP4 and the topology hold; 1 skips the topology query (the P2P "
-            "test still runs); 0 disables it. Other topologies keep the "
-            "upstream rule."
+            "test still runs); 0 disables it. Explicit pex/nccl/nvlink values "
+            "of VLLM_SM70_INTERCONNECT take precedence. PEX always performs "
+            "fresh all-peer IPC validation, ignoring VLLM_SKIP_P2P_CHECK and "
+            "the persistent P2P cache. Other topologies keep the upstream rule."
         ),
         category="experimental",
         declared_default="auto",
@@ -7215,8 +7416,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         category="experimental",
         declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
+        effective_default=(
+            "False; ReVolta FP16 QSA SM70 TP4 profile sets '1' under "
+            "automatic_conditions."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/revolta_profile.py:apply_revolta_profile sets '1' when all "
+                "visible CUDA devices are SM70, selector metadata describes QSA, "
+                "activation dtype is FP16 and TP=4; explicit environment values win."
+            ),
+        ),
         acceleration_paths=("SM70 runtime/kernel policy",),
         user_visible=False,
     ),
@@ -12277,13 +12487,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default=(
             "False; configuration may replace the unset default under the "
-            "automatic conditions below."
+            "automatic conditions below.; ReVolta FP16 QSA SM70 TP4 profile sets "
+            "'0' under automatic_conditions."
         ),
         automatic_conditions=(
             (
-                "vllm/config/vllm.py:_apply_sm70_qwen38_decode_defaults sets '1' "
-                "when name not in os.environ; automatic defaults apply only when "
-                "the environment override is absent."
+                "vllm/config/vllm.py:_apply_sm70_qwen38_decode_defaults sets '1' when "
+                "name not in os.environ; automatic defaults apply only when the "
+                "environment override is absent."
+            ),
+            (
+                "vllm/revolta_profile.py:apply_revolta_profile sets '0' when all "
+                "visible CUDA devices are SM70, selector metadata describes QSA, "
+                "activation dtype is FP16 and TP=4; explicit environment values win."
             ),
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
@@ -12472,13 +12688,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="False",
         effective_default=(
             "False; configuration may replace the unset default under the "
-            "automatic conditions below."
+            "automatic conditions below.; ReVolta FP16 QSA SM70 TP4 profile sets "
+            "'0' under automatic_conditions."
         ),
         automatic_conditions=(
             (
-                "vllm/config/vllm.py:_apply_sm70_qwen38_hybrid_ple_defaults sets "
-                "'1' when owner policy; automatic defaults apply only when the "
+                "vllm/config/vllm.py:_apply_sm70_qwen38_hybrid_ple_defaults sets '1' "
+                "when owner policy; automatic defaults apply only when the "
                 "environment override is absent."
+            ),
+            (
+                "vllm/revolta_profile.py:apply_revolta_profile sets '0' when all "
+                "visible CUDA devices are SM70, selector metadata describes QSA, "
+                "activation dtype is FP16 and TP=4; explicit environment values win."
             ),
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
@@ -15616,8 +15838,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         category="configuration",
         declared_default="0.0",
-        effective_default="0.0",
-        automatic_conditions=(),
+        effective_default=(
+            "0.0; ReVolta FP16 QSA SM70 TP4 profile sets '700' under "
+            "automatic_conditions."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/revolta_profile.py:apply_revolta_profile sets '700' when all "
+                "visible CUDA devices are SM70, selector metadata describes QSA, "
+                "activation dtype is FP16 and TP=4; explicit environment values win. "
+                "Only AWQ checkpoints; NVFP4 retains the upstream default for this "
+                "item."
+            ),
+        ),
         acceleration_paths=(),
         user_visible=True,
     ),

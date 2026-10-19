@@ -1036,6 +1036,21 @@ class Scheduler(SchedulerInterface):
                     step_skipped_waiting.prepend_request(request)
                     continue
 
+                # A parked KV load already holds blocks and a future runner
+                # slot, including after transfer completion. Let it promote,
+                # but do not admit additional work into its reserved slot.
+                if request not in self._inflight_prefills and (
+                    len(self.running)
+                    + sum(
+                        req.status != RequestStatus.RUNNING
+                        for req in self._inflight_prefills
+                    )
+                    >= self.max_num_running_reqs
+                ):
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
+
                 # Check that adding the request still respects the max_loras
                 # constraint.
                 if (

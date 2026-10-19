@@ -1238,19 +1238,46 @@ class VllmConfig:
         if not self._is_default_v2_model_runner_model():
             return False
 
-        if not HAS_TRITON:
-            logger.warning_once(
-                "Model Runner V2 requires Triton; using the V1 model runner instead."
-            )
-            return False
-
-        unsupported = self._get_v2_model_runner_unsupported_features()
+        unsupported = (
+            self._get_v2_model_runner_unsupported_features()
+            if HAS_TRITON
+            else ["Triton (unavailable)"]
+        )
         if unsupported:
-            logger.warning_once(
-                "Model Runner V2 does not yet support %s; using the V1 model "
-                "runner instead.",
-                ", ".join(unsupported),
-            )
+            if is_qwen4_exp:
+                from vllm.revolta_profile import (
+                    all_visible_devices_sm70,
+                    has_qsa_capability,
+                )
+
+                if (
+                    all_visible_devices_sm70()
+                    and self.parallel_config.tensor_parallel_size == 4
+                    and has_qsa_capability(self.model_config)
+                    and self.model_config.dtype == torch.float16
+                ):
+                    logger.warning_once(
+                        "ReVolta SM70 QSA TP4 profile: Model Runner V2 does not "
+                        "yet support %s; automatically selecting Model Runner V1. "
+                        "Qwen4Exp requires V2 for its QSA ring cache and "
+                        "rollback-safe PLE n-gram context; V1 may fail to start "
+                        "or produce incorrect results. Set "
+                        "VLLM_USE_V2_MODEL_RUNNER=1 to require V2 and reject "
+                        "unsupported features at startup.",
+                        ", ".join(unsupported),
+                    )
+                    return False
+            if not HAS_TRITON:
+                logger.warning_once(
+                    "Model Runner V2 requires Triton; using the V1 model "
+                    "runner instead."
+                )
+            else:
+                logger.warning_once(
+                    "Model Runner V2 does not yet support %s; using the V1 model "
+                    "runner instead.",
+                    ", ".join(unsupported),
+                )
             return False
 
         return True

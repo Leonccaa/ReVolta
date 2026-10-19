@@ -4,6 +4,7 @@
 from fnmatch import fnmatch
 from typing import TYPE_CHECKING, Any
 
+import regex as re
 import torch
 from torch.nn.parameter import Parameter
 
@@ -52,6 +53,7 @@ from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
 from vllm.model_executor.layers.linear import (
     LinearBase,
     LinearMethodBase,
+    RowParallelLinear,
     UnquantizedLinearMethod,
     register_weight_loader_v2_supported_method,
 )
@@ -2537,6 +2539,26 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
             for info in self.quantized_layers.values()
         )
 
+    def can_dequantize_vision_fc2(
+        self, prefix: str, input_size: int, tp: int, dtype: torch.dtype
+    ) -> bool:
+        """Narrow escape from group-alignment fallback; never affects the LM."""
+        return (
+            tp == 4
+            and input_size % 16 == 0
+            and input_size % tp == 0
+            and (input_size // tp) % 16 != 0
+            and re.fullmatch(
+                r"(?:model\.)?visual\.blocks\.\d+\.mlp\.linear_fc2", prefix
+            )
+            is not None
+            and not self.is_layer_excluded(prefix)
+            and self._resolve_quant_algo(prefix) == "W4A16_NVFP4"
+            and self.w4a16_nvfp4_config.group_size == 16
+            and sm70_tm.is_exact_sm70_cuda_platform()
+            and dtype == torch.float16
+        )
+
     def get_linear_input_alignment(self, prefix: str) -> int:
         from math import lcm
 
@@ -2745,6 +2767,14 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
             if quant_algo == "NVFP4":
                 return ModelOptNvFp4LinearMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":
+                if isinstance(
+                    layer, RowParallelLinear
+                ) and self.can_dequantize_vision_fc2(
+                    prefix, layer.input_size, layer.tp_size, layer.params_dtype
+                ):
+                    from vllm.model_executor.layers.quantization import modelopt_vision
+
+                    return modelopt_vision.ModelOptNvFp4VisionFC2Method()
                 return ModelOptNvFp4W4A16LinearMethod(self.w4a16_nvfp4_config)
             # Layer not in quantized_layers — leave unquantized
             return UnquantizedLinearMethod()

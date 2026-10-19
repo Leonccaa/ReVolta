@@ -92,6 +92,18 @@ def resolve_mm_encoder_tp_mode(config: "VllmConfig") -> None:
         replicated_reason = layer.invalid_reason(1, alignment)
         if replicated_reason is not None:
             raise ValueError(f"Invalid quantized vision layer: {replicated_reason}")
+        can_dequantize = getattr(config.quant_config, "can_dequantize_vision_fc2", None)
+        if (
+            layer.split == "row"
+            and can_dequantize is not None
+            and can_dequantize(layer.prefix, layer.input_size, tp, model.dtype)
+        ):
+            logger.info_once(
+                "Using mm_encoder_tp_mode=weights: %s; expanding only "
+                "unaligned vision fc2 weights to FP16 at load time.",
+                reason,
+            )
+            continue
         suggestion = "Use --mm-encoder-tp-mode data to replicate the vision encoder."
         if model._mm_encoder_tp_mode_explicit:
             raise ValueError(

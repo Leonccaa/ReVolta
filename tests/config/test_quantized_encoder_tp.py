@@ -6,6 +6,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from vllm.config import ModelConfig, MultiModalConfig
 from vllm.engine.arg_utils import EngineArgs
@@ -80,6 +81,7 @@ def _config(mode=None, intermediate=4304, tp=4, **quant_kwargs):
         quant_config=_quant(**quant_kwargs),
         parallel_config=SimpleNamespace(tensor_parallel_size=tp),
         model_config=SimpleNamespace(
+            dtype=torch.float16,
             architecture="Qwen4ExpForConditionalGeneration",
             hf_config=SimpleNamespace(vision_config=vision),
             multimodal_config=MultiModalConfig(mm_encoder_tp_mode=mode or "weights"),
@@ -95,7 +97,10 @@ def _resolve(config):
     return config.model_config.multimodal_config.mm_encoder_tp_mode
 
 
-def test_fp4_local_defaults_to_replicated_encoder():
+def test_unhandled_platform_defaults_to_replicated_encoder(monkeypatch):
+    from vllm.model_executor.layers.quantization import sm70_turbomind
+
+    monkeypatch.setattr(sm70_turbomind, "is_exact_sm70_cuda_platform", lambda: False)
     config = _config()
     assert _resolve(config) == "data"
     assert config.model_config._mm_encoder_tp_mode_explicit is False

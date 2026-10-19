@@ -53,7 +53,13 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
-from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
+    CrossAttentionSpec,
+    KpoolTailSpec,
+    KVCacheConfig,
+    MambaSpec,
+)
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
@@ -292,8 +298,9 @@ class Scheduler(SchedulerInterface):
             prefix_cache_retention_interval=self.cache_config.prefix_cache_retention_interval,
         )
         # Adapted from vLLM #44560, #57104 and #59880. Mamba managers already
-        # include their speculative states; attention groups need a separate
-        # margin while async loads are allocated without lookahead slots.
+        # include their speculative states. Fixed ring/tail and cross-attention
+        # allocations do not grow during decode. Other attention groups need
+        # a margin while async loads are allocated without lookahead slots.
         spec_step_tokens = (
             1 + self.num_spec_tokens + self.num_lookahead_tokens
             if self.num_spec_tokens
@@ -302,7 +309,10 @@ class Scheduler(SchedulerInterface):
         self._spec_decode_step_blocks = sum(
             cdiv(spec_step_tokens, manager.block_size)
             for manager in self.kv_cache_manager.coordinator.single_type_managers
-            if not isinstance(manager.kv_cache_spec, MambaSpec)
+            if not isinstance(
+                manager.kv_cache_spec,
+                (MambaSpec, CircularBufferSpec, KpoolTailSpec, CrossAttentionSpec),
+            )
         )
         self._inflight_prefills: set[Request] = set()
         # Bind GPU block pool to the KV connector. This must happen after
@@ -2918,13 +2928,32 @@ class Scheduler(SchedulerInterface):
             is_affected = False
             marked_invalid_block = False
             req_id = request.request_id
-            # TODO (davidb): add support for hybrid memory allocator
-            (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
+            block_groups = self.kv_cache_manager.get_block_ids(req_id)
             # We iterate only over blocks that may contain externally computed
             # tokens
             req_num_computed_tokens = (
                 request.num_computed_tokens - num_scheduled_tokens.get(req_id, 0)
             )
+
+            if not evict_blocks and len(block_groups) > 1:
+                # An async hybrid transfer has not published its cache entries.
+                # A token offset in one attention group is not a valid restore
+                # point for recurrent state or fixed ring/tail groups. Recompute
+                # the whole prefix on any group failure, and release all groups
+                # only when the transfer completes in _update_waiting_for_remote_kv.
+                null_id = self.kv_cache_manager.block_pool.null_block.block_id
+                if any(
+                    block_id != null_id and block_id in invalid_block_ids
+                    for group in block_groups
+                    for block_id in group
+                ):
+                    affected_req_ids.add(req_id)
+                    total_affected_tokens += req_num_computed_tokens
+                    request.num_computed_tokens = 0
+                continue
+
+            # Synchronous hybrid connector recovery remains unsupported here.
+            (req_block_ids,) = block_groups
 
             req_num_computed_blocks = (
                 req_num_computed_tokens + self.block_size - 1

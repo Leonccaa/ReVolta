@@ -14,7 +14,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
     FullAttentionSpec,
+    KpoolTailSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     MambaSpec,
@@ -33,11 +35,21 @@ class HybridMockConnector(MockKVConnector, SupportsHMA):
         return False, None
 
 
-def make_scheduler(*, blocks, spans=(16,), spec=0, mamba=None, **kwargs):
+def make_scheduler(
+    *,
+    blocks,
+    spans=(16,),
+    spec=0,
+    mamba=None,
+    fixed_states=False,
+    token_budget=256,
+    **kwargs,
+):
+    kwargs.setdefault("max_model_len", 256)
     original = create_scheduler(
         block_size=16,
         num_blocks=blocks,
-        max_num_batched_tokens=256,
+        max_num_batched_tokens=token_budget,
         max_num_seqs=4,
         use_kv_connector=mock_kv(64, True),
         num_speculative_tokens=spec or None,
@@ -55,6 +67,30 @@ def make_scheduler(*, blocks, spans=(16,), spec=0, mamba=None, **kwargs):
         )
         for i, span in enumerate(spans)
     ]
+    if fixed_states:
+        groups.extend(
+            [
+                KVCacheGroupSpec(
+                    ["ring"],
+                    CircularBufferSpec(
+                        block_size=4,
+                        num_kv_heads=1,
+                        head_size=1,
+                        dtype=torch.float32,
+                    ),
+                ),
+                KVCacheGroupSpec(
+                    ["tail"],
+                    KpoolTailSpec(
+                        block_size=16,
+                        sliding_window=4,
+                        num_kv_heads=1,
+                        head_size=1,
+                        dtype=torch.float32,
+                    ),
+                ),
+            ]
+        )
     if mamba:
         mode, span = mamba
         config.cache_config.mamba_cache_mode = mode
@@ -183,6 +219,22 @@ def test_mamba_speculative_states_are_reserved_once(mode, span, blocks):
     complete(scheduler, output)
 
 
+def test_fixed_ring_and_tail_do_not_reserve_decode_growth():
+    scheduler = make_scheduler(blocks=14, spec=4, fixed_states=True)
+    scheduler.connector.get_num_new_matched_tokens = lambda req, _: (
+        req.num_tokens,
+        True,
+    )
+    a = request(scheduler, "a", 64)
+    b = request(scheduler, "b", 48)
+    output = scheduler.schedule()
+    assert a.status == b.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    complete(scheduler, output, received={"a", "b"})
+    output = scheduler.schedule()
+    assert set(output.num_scheduled_tokens) == {"a", "b"}
+    complete(scheduler, output)
+
+
 def test_async_load_does_not_displace_chunked_prefill():
     scheduler = make_scheduler(blocks=10, long_prefill_token_threshold=32)
     scheduler.connector.get_num_new_matched_tokens = lambda req, _: (
@@ -205,6 +257,7 @@ def test_reservation_released_on_lifecycle_changes(action, hybrid):
     scheduler = make_scheduler(
         blocks=16 if hybrid else 10,
         mamba=("align", 32) if hybrid else None,
+        token_budget=32,
         long_prefill_token_threshold=32,
     )
     a = request(scheduler, "a", 128)
@@ -239,6 +292,27 @@ def test_reservation_released_on_lifecycle_changes(action, hybrid):
     b = request(scheduler, "b", 80)
     scheduler.schedule()
     assert b.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+
+
+@pytest.mark.parametrize("failed_group", [0, 1])
+def test_hybrid_failed_load_recomputes_all_state_groups(failed_group):
+    scheduler = make_scheduler(blocks=30, mamba=("align", 32), token_budget=32)
+    scheduler.recompute_kv_load_failures = True
+    a = request(scheduler, "a", 128)
+    output = scheduler.schedule()
+    null = scheduler.kv_cache_manager.block_pool.null_block.block_id
+    block_ids = scheduler.kv_cache_manager.get_block_ids("a")[failed_group]
+    invalid = {next(bid for bid in block_ids if bid != null)}
+    complete(scheduler, output, received={"a"}, invalid=invalid)
+    assert a.num_computed_tokens == 0
+    scheduler.connector.get_num_new_matched_tokens = lambda req, _: (0, False)
+    for _ in range(5):
+        output = scheduler.schedule()
+        complete(scheduler, output)
+        if a.is_finished():
+            break
+    assert a.is_finished()
+    assert not scheduler._inflight_prefills
 
 
 def test_remaining_mtp_requirement_includes_lookahead():

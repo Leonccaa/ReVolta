@@ -10,11 +10,13 @@ import pytest
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
 from vllm.entrypoints.openai.engine.protocol import (
+    DeltaMessage,
     RequestResponseMetadata,
 )
 from vllm.logprobs import Logprob
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.parser.abstract_parser import _WrappedParser
+from vllm.reasoning.qwen3_reasoning_parser import Qwen3ReasoningParser
 from vllm.tool_parsers.qwen3coder_tool_parser import Qwen3CoderToolParser
 
 
@@ -180,3 +182,90 @@ def test_tool_finish_reason_preserves_truncation(stream, choice, finish, monkeyp
         actual = response.choices[0].finish_reason
     expected = "tool_calls" if finish == "stop" and choice != "named" else finish
     assert actual == expected
+
+
+@pytest.mark.parametrize("return_token_ids", [False, True])
+@pytest.mark.parametrize("include_reasoning", [False, True])
+def test_parser_suppressed_logprobs_are_preserved(return_token_ids, include_reasoning):
+    parser = MagicMock()
+    parser.tool_parser = None
+    parser.parse_delta.side_effect = [None, None, DeltaMessage(content="answer")]
+    serving = _serving(MagicMock(return_value=parser))
+    chunks = _stream(
+        serving,
+        _request(
+            stream=True,
+            logprobs=True,
+            return_token_ids=return_token_ids,
+            include_reasoning=include_reasoning,
+        ),
+        [
+            _output("<think>", [10], logprobs=True),
+            _output("</think>", [11], logprobs=True),
+            _output("answer", [20], "stop", logprobs=True),
+        ],
+    )
+    tokens = [
+        lp["token"]
+        for chunk in chunks
+        for c in chunk["choices"]
+        if c.get("logprobs")
+        for lp in c["logprobs"]["content"]
+    ]
+    assert tokens == ["<think>", "</think>", "answer"]
+
+
+@pytest.mark.parametrize("parser_kind", ["reasoning", "tool", "both"])
+def test_real_qwen_parser_control_token_logprobs(parser_kind, monkeypatch):
+    monkeypatch.setattr(
+        _WrappedParser,
+        "tool_parser_cls",
+        Qwen3CoderToolParser if parser_kind in ("tool", "both") else None,
+    )
+    monkeypatch.setattr(
+        _WrappedParser,
+        "reasoning_parser_cls",
+        Qwen3ReasoningParser if parser_kind in ("reasoning", "both") else None,
+    )
+    marker, token_id = ("<tool_call>", 12) if parser_kind == "tool" else ("<think>", 10)
+    parser = _WrappedParser(_tokenizer())
+    request = _request(stream=True, logprobs=True, tool_choice="auto")
+    assert parser.parse_delta(marker, [token_id], request, prompt_token_ids=[1]) is None
+    serving = _serving(_WrappedParser)
+    chunks = _stream(
+        serving,
+        request,
+        [
+            _output(marker, [token_id], logprobs=True),
+            _output("", [], "length", logprobs=True),
+        ],
+    )
+    tokens = [
+        lp["token"]
+        for chunk in chunks
+        for c in chunk["choices"]
+        if c.get("logprobs")
+        for lp in c["logprobs"]["content"]
+    ]
+    assert tokens == [marker]
+
+
+def test_suppressed_logprobs_are_isolated_per_choice():
+    parsers = [MagicMock(), MagicMock()]
+    for index, parser in enumerate(parsers):
+        parser.tool_parser = None
+        parser.parse_delta.side_effect = [None, DeltaMessage(content=f"answer{index}")]
+    serving = _serving(MagicMock(side_effect=parsers))
+    first = _output("marker0", [10], logprobs=True)
+    first.outputs += _output("marker1", [11], logprobs=True, index=1).outputs
+    last = _output("answer0", [20], "stop", logprobs=True)
+    last.outputs += _output("answer1", [21], "stop", logprobs=True, index=1).outputs
+    chunks = _stream(serving, _request(stream=True, n=2, logprobs=True), [first, last])
+    tokens: dict[int, list[str]] = {0: [], 1: []}
+    for chunk in chunks:
+        for choice in chunk["choices"]:
+            if choice.get("logprobs"):
+                tokens[choice["index"]].extend(
+                    lp["token"] for lp in choice["logprobs"]["content"]
+                )
+    assert tokens == {0: ["marker0", "answer0"], 1: ["marker1", "answer1"]}

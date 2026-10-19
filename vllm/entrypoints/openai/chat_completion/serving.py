@@ -761,6 +761,7 @@ class OpenAIServingChat(OpenAIServing):
                         if (
                             output.finish_reason is None
                             and not request.return_token_ids
+                            and logprobs is None
                         ):
                             continue
                         delta_message = DeltaMessage()

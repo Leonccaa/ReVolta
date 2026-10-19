@@ -36,6 +36,18 @@ def test_nixl_side_channel_host_is_not_compile_factor(
     assert "VLLM_NIXL_SIDE_CHANNEL_HOST" not in envs.compile_factors()
 
 
+def test_sm70_gemm_lut_path_is_not_compile_factor(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # Setting only the dispatch-cache location must not force a recompile.
+    monkeypatch.delenv("VLLM_SM70_GEMM_LUT_PATH", raising=False)
+    baseline = envs.compile_factors()
+    monkeypatch.setenv("VLLM_SM70_GEMM_LUT_PATH", "/tmp/tune/rank-{rank}.bin")
+
+    assert "VLLM_SM70_GEMM_LUT_PATH" not in envs.compile_factors()
+    assert envs.compile_factors() == baseline
+
+
 def test_unregistered_vllm_env_vars_are_compile_factors(
     monkeypatch: pytest.MonkeyPatch,
 ):

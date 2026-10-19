@@ -605,7 +605,7 @@ class EngineArgs:
         MultiModalConfig.mm_shm_cache_max_object_size_mb
     )
     mm_encoder_only: bool = MultiModalConfig.mm_encoder_only
-    mm_encoder_tp_mode: MMEncoderTPMode = MultiModalConfig.mm_encoder_tp_mode
+    mm_encoder_tp_mode: MMEncoderTPMode | None = None
     mm_encoder_attn_backend: AttentionBackendEnum | str | None = (
         MultiModalConfig.mm_encoder_attn_backend
     )
@@ -1285,7 +1285,8 @@ class EngineArgs:
             "--mm-encoder-only", **multimodal_kwargs["mm_encoder_only"]
         )
         multimodal_group.add_argument(
-            "--mm-encoder-tp-mode", **multimodal_kwargs["mm_encoder_tp_mode"]
+            "--mm-encoder-tp-mode",
+            **{**multimodal_kwargs["mm_encoder_tp_mode"], "default": None},
         )
         multimodal_group.add_argument(
             "--mm-encoder-attn-backend",

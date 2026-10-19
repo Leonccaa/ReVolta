@@ -359,6 +359,8 @@ class ModelConfig:
     mm_shm_cache_max_object_size_mb: InitVar[int | None] = None
     mm_encoder_only: InitVar[bool | None] = None
     mm_encoder_tp_mode: InitVar[MMEncoderTPMode | None] = None
+    _mm_encoder_tp_mode_explicit: bool = field(default=False, init=False, repr=False)
+    """Whether encoder TP mode was supplied by the caller, before resolution."""
     mm_encoder_attn_backend: InitVar[AttentionBackendEnum | str | None] = None
     mm_encoder_attn_dtype: InitVar[str | None] = None
     mm_encoder_fp8_scale_path: InitVar[str | None] = None
@@ -412,6 +414,7 @@ class ModelConfig:
             "mm_processor_cache_type",
             "mm_shm_cache_max_object_size_mb",
             "mm_encoder_tp_mode",
+            "_mm_encoder_tp_mode_explicit",
             "interleave_mm_strings",
             "skip_mm_profiling",
         }
@@ -682,6 +685,7 @@ class ModelConfig:
             logger.info("Encoder-decoder model detected, disabling mm processor cache.")
 
         # Init multimodal config if needed
+        self._mm_encoder_tp_mode_explicit = mm_encoder_tp_mode is not None
         if self._model_info.supports_multimodal:
             if (
                 mm_encoder_tp_mode == "data"

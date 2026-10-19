@@ -1176,6 +1176,16 @@ def _try_prepare_sm70_modelopt_nvfp4(layer: torch.nn.Module) -> bool:
 class ModelOptNvFp4Config(ModelOptQuantConfigBase):
     """Config class for ModelOpt FP4."""
 
+    def get_linear_input_alignment(self, prefix: str) -> int:
+        from math import lcm
+
+        if self.is_layer_excluded(prefix) or any(
+            name in prefix
+            for name in ("vision_tower", "vision_model", "vit_large_projector")
+        ):
+            return 1
+        return lcm(16, self.group_size)
+
     def __init__(
         self,
         quant_method: str = "NVFP4",
@@ -2526,6 +2536,17 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
             info.get("quant_algo", "").upper() in _BLOCK_FP8_MOE_ALGOS
             for info in self.quantized_layers.values()
         )
+
+    def get_linear_input_alignment(self, prefix: str) -> int:
+        from math import lcm
+
+        if self.is_layer_excluded(prefix):
+            return 1
+        algo = self._resolve_quant_algo(prefix)
+        if algo in ("NVFP4", "W4A16_NVFP4"):
+            config = self.nvfp4_config if algo == "NVFP4" else self.w4a16_nvfp4_config
+            return lcm(16, config.group_size)
+        return 1
 
     def get_name(self) -> QuantizationMethods:
         return "modelopt_mixed"

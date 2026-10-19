@@ -1,164 +1,211 @@
 ReVolta attribution notice
 --------------------------
 
-ReVolta is derived from 1CatAI/1Cat-vLLM, which is derived from
-vllm-project/vllm. Both upstream projects use Apache License 2.0 for their
-engine code, subject to the third-party exceptions retained in the source.
+ReVolta is derived from 1CatAI/1Cat-vLLM (1Cat-vLLM), which is derived from
+vllm-project/vllm. The Python import name remains "vllm". The upstream engine
+code uses Apache License 2.0, subject to the component exceptions below.
 
 Sources:
   https://github.com/1CatAI/1Cat-vLLM
   https://github.com/vllm-project/vllm
-Evidence: LICENSE; pyproject.toml (upstream authors and Apache-2.0 project
-metadata); SPDX copyright and license headers throughout vllm/ and csrc/.
 Copyright contributors to the vLLM project; 1Cat AI and contributors.
 ReVolta modifications are maintained by Leon under Apache License 2.0,
-except where an existing component license applies.
+except where an existing component license applies. See LICENSE.
 
-This is a repository-evidence inventory, not a license grant for dependencies
-or model weights. Per-file notices and license texts remain authoritative.
-"Pending verification" means that the checked-in evidence does not establish
-a complete source revision, license or redistribution notice for that item.
-The list includes retained, unused platform code as well as the SM70 path.
+This inventory covers retained source and configured build dependencies.
+It does not grant rights to model weights or other installed dependencies.
+Per-file copyright, license and modification notices remain authoritative.
+LICENSES/ contains verbatim upstream texts and SOURCES.json records their
+immutable URLs and SHA-256 digests. "Evidence snapshot" identifies a checked
+upstream revision, not a claim that all local adaptations are an exact copy.
+Remaining source-history gaps are stated explicitly below.
 
 Included components
 -------------------
 
-1. TurboMind / lmdeploy (OpenMMLab)
+1. TurboMind / LMDeploy (OpenMMLab)
+   Source: https://github.com/InternLM/lmdeploy
    Location: csrc/sm70_turbomind/lmdeploy/src/turbomind/
-   Evidence: OpenMMLab copyright headers, e.g. kernels/gemm/gemm.h;
-   utils/cuda_utils.h and utils/memory_utils.h contain Apache-2.0 notices
-   for NVIDIA-derived utilities (Copyright 2019-2023 NVIDIA Corporation).
-   License: Apache-2.0 is evidenced for those utility files. Pending
-   verification: the license and exact upstream revision of the complete
-   vendored TurboMind snapshot; no standalone lmdeploy LICENSE is present.
-   Do not infer a complete subtree license from those utility headers.
+   License: Apache-2.0 for LMDeploy-origin code; LICENSES/lmdeploy-dated.txt.
+   Exception: the locally added kernels/gemm/lattice_codebooks.h identifies
+   MIT-licensed tables from gguf-py 0.19.0 / llama.cpp. Keep its SPDX notice
+   and the original MIT text recorded in item 7; it is not Apache-2.0 code.
+   Copyright OpenMMLab; Shanghai AI Laboratory; NVIDIA for derived utilities,
+   as recorded in individual source headers.
+   Evidence snapshot: 9b3b1933ee2ad1731a6e49b99867b52925b2a54b, the latest
+   upstream commit before the local import on 2026-06-14. Of 141 retained
+   files, 89 match that snapshot byte-for-byte; 46 differ and 6 are absent
+   upstream at that revision.
+   Revision gap: local import ee0bc6a875f891ff4785bfbdb1cd9ed35b21f647
+   records no upstream pin. Repository history, source headers and the
+   dated upstream tree establish provenance but not one exact base for all
+   modified files. Preserve the later local adaptations and their notices.
 
 2. v100-skinny / dnv2003
    Location: csrc/sm70_turbomind/ops/
    License: MIT; Copyright (c) 2026 v100-skinny contributors.
-   Evidence: LICENSE.v100-skinny and derivation notices in
-   skinny_moe_qpn_sm70.cu and awq_qpn_m1_sm70.cu.
-   The Apache-2.0 notices on integration code do not replace this MIT notice.
+   Evidence: csrc/sm70_turbomind/ops/LICENSE.v100-skinny and derivation
+   notices in skinny_moe_qpn_sm70.cu and awq_qpn_m1_sm70.cu.
+   Apache-2.0 integration headers do not replace this MIT notice.
 
-3. FlashAttention-V100 / D. Skryabin
+3. FlashAttention-V100 / D. Skryabin and the separate SM70 FA2 port
    Source: https://github.com/ai-bond/flash-attention-v100
-   Location: flash-attention-v100/; csrc/attention/sm70_grouped_long/
+   Locations: flash-attention-v100/; csrc/attention/sm70_grouped_long/;
+   csrc/attention/sm70_v37/; csrc/attention/sm70_79t/.
    License: BSD-3-Clause; Copyright (c) 2025, D.Skryabin.
-   Evidence: flash-attention-v100/setup.py and LICENSE;
-   csrc/attention/sm70_grouped_long/LICENSE. Other retained SM70 prefill
-   adaptations in csrc/attention/sm70_v37/ and sm70_79t/ carry BSD-3-Clause
-   source headers alongside separately marked Apache integration files.
-   Exact source revisions for all adaptations: pending verification.
-   The separate CMake-fetched SM70 FA2 port uses
-   https://github.com/zhinianqin/flash-attention-v100.git as recorded in
-   cmake/external_projects/vllm_flash_attn.cmake. Its fetched license text
-   is not checked in here; pending verification before redistribution.
+   Existing component LICENSE files and source notices are retained.
+   Upstream evidence snapshot: 0ababf82e3836c1786d7937c6002670ca4ecda62;
+   full upstream text: LICENSES/flash-attention-v100.txt.
+   Revision gap: import ee0bc6a875f891ff4785bfbdb1cd9ed35b21f647 and later
+   adaptation commits do not identify a single original upstream base.
+   The dated upstream tree and local file history were checked; the modified
+   v37, 79T and grouped kernels are not asserted to equal that snapshot.
+   Separately, CMake fetches https://github.com/zhinianqin/flash-attention-v100
+   at c2eda5e6115b98c3ba4bfd181570668742eece22. Its BSD-3-Clause license and
+   AUTHORS are LICENSES/flash-attention-sm70{,-authors}.txt. Its CUTLASS
+   submodule is 62750a2b75c802660e4894434dc55e839f322277; see item 4.
+   Preserve the distinct Apache-2.0 integration notices and local patches.
 
 4. NVIDIA CUTLASS
-   Source: https://github.com/nvidia/cutlass.git
-   License: BSD-3-Clause for the retained adapted headers.
-   Evidence: CMakeLists.txt; BSD notices in
-   csrc/attention/sm70_79t/include/cutlass/gemm/threadblock/mma_pipelined.h
-   and csrc/attention/sm70_v37/gemm_with_softmax.h.
-   flash-attention-v100/kernel/h3/UPSTREAM.md records CUTLASS v4.4.2,
-   revision da5e086dab31d63815acafdac9a9c5893b1c69e2, for its adapted headers.
-   Preserve the NVIDIA copyright, conditions and disclaimer in each header.
-   Completeness of notices across all CUTLASS adaptations, including
-   csrc/quantization/machete/: pending verification.
+   Source: https://github.com/NVIDIA/cutlass
+   License: BSD-3-Clause for the identified adapted headers.
+   Main build reference: v4.4.2, da5e086dab31d63815acafdac9a9c5893b1c69e2;
+   LICENSES/cutlass.txt also retains that upstream file's additional notices.
+   flash-attention-v100/kernel/h3/UPSTREAM.md records this same revision.
+   csrc/quantization/machete/machete_mainloop.cuh explicitly identifies
+   06b21349bcf6ddf6a1686a47a137ad1446579db9; its original license, including
+   NVIDIA's copyright, is LICENSES/cutlass-machete.txt.
+   The fetched SM70 and SM75 FA2 ports use CUTLASS submodule
+   62750a2b75c802660e4894434dc55e839f322277; LICENSES/cutlass-fa2.txt.
+   Notice-audit gap: headers in sm70_v37, sm70_79t, H3 and Machete were
+   inspected. A complete per-file lineage for every older adaptation is
+   not recorded. Do not treat the current build revision as their import
+   revision. Keep embedded conditions and disclaimers with each header.
+   Removal candidate: Machete's Hopper-only native sources are outside the
+   SM70 build. They remain present; deletion would require adapting shared
+   CMake, dispatch and tests when picking upstream fixes. CUTLASS itself is
+   used by SM70 and is not a removal candidate.
 
 5. Marlin / Elias Frantar; Neural Magic modifications
    Source: https://github.com/IST-DASLab/marlin
-   Location: csrc/quantization/marlin/ and csrc/moe/marlin_moe_wna16/
-   License: Apache-2.0.
-   Evidence: marlin_template.h and marlin_moe_wna16/ops.cu headers:
+   Locations: csrc/quantization/marlin/; csrc/moe/marlin_moe_wna16/.
+   License: Apache-2.0; LICENSES/marlin.txt, checked at upstream
+   1f25790bdd49fba53106164a24666dade68d7c90.
    Copyright (C) Marlin.2024 Elias Frantar; Modified by Neural Magic.
-   Exact imported revisions: pending verification.
+   Revision gap: the locally retained headers name Marlin but no original
+   upstream commit. Local rename history and vLLM PR #14447 (merge
+   d06ba4ed3f9a5929eabb404842a5c02da42e960b) identify the modified vLLM
+   integration, not a single original Marlin revision.
 
 6. NVIDIA FasterTransformer and TensorRT-LLM adaptations
    Sources: https://github.com/NVIDIA/FasterTransformer
             https://github.com/NVIDIA/TensorRT-LLM
-   License: Apache-2.0 for the identified files.
-   Evidence: csrc/attention/attention_generic.cuh and dtype_*.cuh retain
-   FasterTransformer source URLs and NVIDIA/vLLM copyright notices;
-   csrc/moe/topk_softmax_kernels.cu retains a TensorRT-LLM v0.7.1 URL,
-   NVIDIA copyright and Apache-2.0 notice. Other MoE files identify further
-   TensorRT-LLM adaptations; per-file notices must be retained.
+   License: Apache-2.0 for the identified files; see LICENSE and their headers.
+   csrc/attention/attention_generic.cuh and dtype_*.cuh retain source URLs
+   and NVIDIA/vLLM copyright notices. csrc/moe/topk_softmax_kernels.cu
+   identifies TensorRT-LLM v0.7.1. Other MoE files retain their own source
+   references and notices.
 
 7. llama.cpp / ggml authors and vLLM GGUF plugin
    Sources: https://github.com/ggml-org/llama.cpp
             https://github.com/vllm-project/vllm-gguf-plugin/pull/141
    Licenses: llama.cpp MIT; plugin bridge Apache-2.0.
-   Evidence: vllm/third_party/gguf_native/PROVENANCE.txt, LICENSE.llama.cpp
-   and LICENSE.vllm-gguf-plugin; csrc/quantization/gguf_upstream/llama.cpp/LICENSE
-   and source_manifest.json; csrc/libtorch_stable/quantization/gguf_upstream/
-   LICENSE.plugin. Recorded revisions: llama.cpp
-   002a12ad25503a93501b2e188c360029830a241a; bridge
-   aa09d6522f29325d64d999d7d7c794f79836de07.
+   Existing texts and provenance: vllm/third_party/gguf_native/ and
+   csrc/quantization/gguf_upstream/llama.cpp/LICENSE, source_manifest.json;
+   csrc/libtorch_stable/quantization/gguf_upstream/LICENSE.plugin.
+   Recorded revisions: llama.cpp 002a12ad25503a93501b2e188c360029830a241a;
+   bridge aa09d6522f29325d64d999d7d7c794f79836de07.
    Older csrc/quantization/gguf/ headers identify llama.cpp b2899.
 
 8. FlashQLA / Qwen, Alibaba
+   Source: https://github.com/QwenLM/FlashQLA
    Location: flash_qla/
    License: MIT; Copyright (c) 2026 Qwen, Alibaba.
-   Evidence: flash_qla/LICENSE and __init__.py.
-   Exact imported source URL and revision: pending verification.
+   Texts: flash_qla/LICENSE; LICENSES/flashqla-dated.txt.
+   Evidence snapshot: 5be4204363d1f751ba586b0972eab58b818c852c, preceding the
+   local import 25733d9cf98d47108ff4b8da2138aa121ad1d1b1 on 2026-07-19.
+   Four retained files match; 15 differ and 4 are not in that snapshot.
+   Revision gap: the import message and headers contain no exact source pin;
+   this is a locally adapted subtree, not an exact upstream checkout.
 
 9. NVIDIA Management Library Python bindings (nvidia-ml-py)
    Source: https://pypi.org/project/nvidia-ml-py
    Location: vllm/third_party/pynvml.py
-   License: BSD-3-Clause notice embedded in the file, alongside a vLLM
-   Apache-2.0 integration header. Copyright (c) 2011-2023 NVIDIA Corporation.
-   Evidence: file header records version 12.570.86 and the original terms.
-   Retain those terms when distributing the copied bindings.
+   License: BSD-3-Clause notice embedded in the file alongside Apache-2.0
+   integration headers. Copyright (c) 2011-2023 NVIDIA Corporation.
+   The file records version 12.570.86. Retain its original full notice.
 
 10. SGLang CPU kernels
     Source: https://github.com/sgl-project/sglang/tree/main/sgl-kernel/csrc/cpu
     Location: csrc/cpu/sgl-kernels/
-    Evidence: source URLs in conv.cpp, gemm.cpp and related headers.
-    Exact revision and component-specific license: pending verification;
-    no standalone license text for this copy is checked in. CPU builds
-    are outside ReVolta's supported build target; the sources are retained.
+    License: Apache-2.0 from the component's own sgl-kernel/LICENSE;
+    Copyright 2023-2024 SGLang Team.
+    Evidence snapshot: a9a8b20a90df3c8b64f7308abde7d3d1fa1a5d12.
+    Texts: LICENSES/sglang-kernel.txt and sglang-notices.txt (the component's
+    complete upstream THIRDPARTYNOTICES, retained conservatively).
+    Revision gap: local update b3945cc3160119111927816841950715c5410708
+    (vLLM PR #41924) and its linked source URLs do not specify the original
+    SGLang commit. All 13 comparable files differ; 2 have no same-path
+    upstream file. The dated tree, import PR and local history were checked.
+    Removal candidate: CPU-only sources are outside the SM70 build target.
+    They remain present. Deletion would require adapting CPU CMake lists,
+    CPU op registration and tests, and would increase conflicts when picking
+    upstream CPU or shared build fixes.
 
 11. Flash Linear Attention (FLA) adaptations
+    Source: https://github.com/fla-org/flash-linear-attention
     Location: vllm/model_executor/layers/fla/ops/
-    Evidence: chunk.py explicitly records copied MIT-licensed FLA code and
-    Copyright (c) 2023-2025 Songlin Yang, Yu Zhang; layernorm_guard.py records
-    MIT-licensed FLA code and Copyright (c) 2024 Tri Dao. The vLLM integration
-    has Apache-2.0 headers; these do not erase the copied MIT attribution.
-    A complete original MIT notice and exact imported revisions: pending
-    verification; no standalone FLA license is checked in for this copy.
+    License: MIT for copied FLA code; LICENSES/fla-dated.txt, checked at
+    8a91ac503764fed5bb65ad6d9b157880eeff2820 before the vLLM import.
+    Preserve the additional per-file copyrights: (c) 2023-2025 Songlin Yang,
+    Yu Zhang; (c) 2024 Tri Dao for layernorm_guard.py. Apache-2.0 integration
+    headers do not replace the copied MIT attribution.
+    Revision gap: vLLM PR #24518 and merge
+    1aa427fdc1d4ddb7a0c966f7c46badd1c3952c14 name FLA but give no exact
+    original revision. The PR, source headers and local import were checked.
+    These runtime kernels are not a CPU-only removal candidate.
 
 12. Mamba and causal-conv1d adaptations
     Sources: https://github.com/state-spaces/mamba
              https://github.com/Dao-AILab/causal-conv1d
     Location: vllm/model_executor/layers/mamba/ops/
-    Evidence: mamba_ssm.py and ssd_*.py record Mamba v2.2.4 and Copyright
-    (c) 2024 Tri Dao, Albert Gu; layernorm_gated.py identifies revision
-    60dadf2e0ee730ac337035d5533de10bc26e4847; causal_conv1d.py records its
-    source and Copyright (c) 2024 Tri Dao. These files have Apache-2.0
-    integration headers. Original component licenses and full original
-    notices: pending verification; no standalone licenses accompany them.
-
+    Mamba license: Apache-2.0; LICENSES/mamba.txt. Copyright (c) 2023-2024
+    Tri Dao, Albert Gu. Source headers cite v2.2.4, resolved to
+    95d8aba8a8c75aedcaa6143713b11e745e7cd0d9. layernorm_gated.py cites
+    60dadf2e0ee730ac337035d5533de10bc26e4847; its license text is identical.
+    causal-conv1d license: BSD-3-Clause; Copyright (c) 2022, the respective
+    contributors in AUTHORS; copied adaptation credits (c) 2024 Tri Dao.
+    Full texts: LICENSES/causal-conv1d{,-authors}.txt, from v1.5.0,
+    fe772c75e29da8123d4478b670342111ce23cc6b.
+    Revision gap: causal_conv1d.py links upstream "main"; local history and
+    that URL do not establish its exact import revision. v1.5.0 is license
+    evidence, not a claimed exact copy. Preserve per-file integration notices.
 
 Build-fetched components
 ------------------------
 
-The following are references to external sources, not checked-in license
-texts or proof that a component is built by the SM70 recipe:
+Configured default revisions are listed below. A source-directory override
+or a changed pin requires a fresh license and transitive-notice check.
+License texts do not establish which optional components a wheel contains.
 
-- vLLM FlashAttention: https://github.com/vllm-project/flash-attention.git
-  Evidence: cmake/external_projects/vllm_flash_attn.cmake.
-- SM75 FlashAttention port: https://github.com/Peuqui/flash-attention.git
-  Evidence: cmake/external_projects/vllm_flash_attn_sm75.cmake.
+- vLLM FlashAttention: https://github.com/vllm-project/flash-attention
+  bce29425653ec0fbc579d329883030e832d15ada; BSD-3-Clause;
+  LICENSES/vllm-flash-attention{,-authors}.txt.
+- SM75 FlashAttention: https://github.com/Peuqui/flash-attention
+  43b9d29c9aa8e18d9351e7c643dc78ef7e7979fc; BSD-3-Clause;
+  LICENSES/flash-attention-sm75{,-authors}.txt.
 - FlashMLA: https://github.com/vllm-project/FlashMLA
-  Evidence: cmake/external_projects/flashmla.cmake.
-- DeepGEMM: https://github.com/deepseek-ai/DeepGEMM.git
-  Evidence: cmake/external_projects/deepgemm.cmake.
-- Triton kernels: https://github.com/triton-lang/triton.git
-  Evidence: cmake/external_projects/triton_kernels.cmake.
-- qutlass: https://github.com/IST-DASLab/qutlass.git
-  Evidence: cmake/external_projects/qutlass.cmake.
+  a6ec2ba7bd0a7dff98b3f4d3e6b52b159c48d78b; MIT; LICENSES/flashmla.txt.
+- DeepGEMM: https://github.com/deepseek-ai/DeepGEMM
+  891d57b4db1071624b5c8fa0d1e51cb317fa709f; MIT; LICENSES/deepgemm.txt.
+- Triton kernels: https://github.com/triton-lang/triton
+  v3.5.1, 0add68262ab0a2e33b84524346cb27cbb2787356; MIT; LICENSES/triton.txt.
+- QuTLASS: https://github.com/IST-DASLab/qutlass
+  830d2c4537c7396e14a02a46fbddd18b5d107c65; Apache-2.0;
+  LICENSES/qutlass.txt.
 
-Licenses and distribution notices for fetched artifacts: pending verification
-against the exact revisions selected by each build. This inventory does not
-relicense them as Apache-2.0. Full third-party redistribution clearance remains
-pending, particularly for entries without a checked-in component license.
+The referenced CMake files and upstream LICENSE/AUTHORS at these pins were
+checked. Their top-level license texts are now included. Distribution gap:
+this source inventory is not an audit of an assembled wheel or container's
+complete transitive dependency contents and notices. Recheck the exact
+release artifacts, optional components and submodules before redistribution.

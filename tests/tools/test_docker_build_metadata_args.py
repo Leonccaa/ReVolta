@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-HELPER = REPO_ROOT / ".buildkite" / "scripts" / "docker-build-metadata-args.sh"
+HELPER = REPO_ROOT / "tools" / "build_utils" / "docker-build-metadata-args.sh"
 
 
 def run_helper(

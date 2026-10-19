@@ -39,9 +39,9 @@ NUM_QUESTIONS = 256  # Fast eval for CI
 NUM_SHOTS = 5  # Few-shot examples
 # tp accuracy with 2% buffer
 MIN_ACCURACY = {
-    # .buildkite/lm-eval-harness/configs/DeepSeek-V2-Lite-Chat.yaml
+    # The upstream DeepSeek-V2-Lite-Chat evaluation configuration.
     "deepseek-ai/DeepSeek-V2-Lite-Chat": 0.64,
-    # .buildkite/lm-eval-harness/configs/Qwen2.5-1.5B-Instruct.yaml
+    # The upstream Qwen2.5-1.5B-Instruct evaluation configuration.
     "Qwen/Qwen2.5-1.5B-Instruct": 0.52,
 }
 

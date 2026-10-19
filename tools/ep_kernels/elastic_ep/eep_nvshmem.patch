@@ -1,5 +1,5 @@
 From 18c0599c2f07ec965132efa25961dc8179c2dda3 Mon Sep 17 00:00:00 2001
-From: Yongji Wu <wuyongji317@gmail.com>
+From: Yongji Wu
 Date: Tue, 20 May 2025 13:41:12 -0700
 Subject: [PATCH] fix reinit issues due to states not cleaned up
 

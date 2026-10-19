@@ -837,7 +837,6 @@ class precompiled_wheel_utils:
                 "Failed to fetch precompiled wheel metadata"
             )
             # The metadata.json has the following format:
-            # see .buildkite/scripts/generate-nightly-index.py for details
             """[{
     "package_name": "vllm",
     "version": "0.11.2.dev278+gdbc3d9991",
@@ -1551,9 +1550,6 @@ setup(
         ],
         "flashinfer": [],  # Kept for backwards compatibility
         # Optional deps for Helion kernel development
-        # NOTE: When updating helion version, also update CI files:
-        #   - .buildkite/test_areas/kernels.yaml
-        #   - .buildkite/test-amd.yaml
         "helion": ["helion==1.4.0"],
         # Optional deps for gRPC server (vllm serve --grpc)
         "grpc": ["smg-grpc-servicer[vllm] >= 0.5.2"],

@@ -1619,6 +1619,7 @@ class VllmConfig:
 
         from vllm.revolta_profile import (
             all_visible_devices_sm70,
+            apply_revolta_kernel_profile,
             apply_revolta_profile,
             frontend_interconnect_mode,
         )
@@ -1632,6 +1633,9 @@ class VllmConfig:
             interconnect_mode=frontend_interconnect_mode(
                 disable_custom_all_reduce=self.parallel_config.disable_custom_all_reduce
             ),
+        )
+        apply_revolta_kernel_profile(
+            self.kernel_config, enabled=revolta_profile_enabled
         )
 
         # To give each torch profile run a unique instance name.
@@ -2979,6 +2983,7 @@ class VllmConfig:
                         )
                     ),
                     quantization=getattr(self.model_config, "quantization", None),
+                    kernel_config=self.kernel_config,
                 ),
             )
 

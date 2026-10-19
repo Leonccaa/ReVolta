@@ -1169,7 +1169,22 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             )
         )
         self._disk_executor: ThreadPoolExecutor | None = None
-        if self._file_backed_shards:
+        if ple_storage_dtype == "nvfp4":
+            if self._cascade or self._file_backed_shards or ple_offload_enabled():
+                raise NotImplementedError(
+                    "NVFP4 PLE requires resident pinned-host rows; disable PLE "
+                    "process/disk offload and cascade for this checkpoint"
+                )
+            from .ple_nvfp4 import NVFP4PinnedPLEEmbedding
+
+            self.ngram_embedding = NVFP4PinnedPLEEmbedding(
+                padded_vocab_size,
+                self.head_dim,
+                params_dtype,
+                divisor,
+                embedding_prefix,
+            )
+        elif self._file_backed_shards:
             if quant_method is None:
                 raise NotImplementedError(
                     "Qwen4Exp PLE file-backed shards require FP8 checkpoint storage"
@@ -1832,7 +1847,23 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         regular_weights: list[tuple[str, torch.Tensor]] = []
         shard_prefix = PLE_SHARD_PREFIX
 
+        from .ple_nvfp4 import NVFP4PinnedPLEEmbedding
+
+        nvfp4_embedding = (
+            self.ngram_embedding
+            if isinstance(self.ngram_embedding, NVFP4PinnedPLEEmbedding)
+            else None
+        )
         for name, loaded_weight in weights:
+            if nvfp4_embedding is not None:
+                handled = nvfp4_embedding.load_checkpoint_tensor(
+                    name,
+                    loaded_weight,
+                    self.split_ngram_parts,
+                )
+                if handled is not None:
+                    loaded.update(handled)
+                    continue
             leaf_name = name.rsplit(".", 1)[-1]
             if leaf_name.startswith("hashstats_") or leaf_name == "token_lookup":
                 continue
@@ -1954,6 +1985,15 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        # Check before PleOffloadLayer can replace NGramEmbedding with a
+        # cross-process placeholder and bypass its subclass constructor.
+        if str(getattr(config, "ple_embedding_dtype", "")) == "nvfp4" and (
+            ple_offload_enabled() or ple_cascade_configured()
+        ):
+            raise NotImplementedError(
+                "NVFP4 PLE requires resident pinned-host rows; disable PLE "
+                "process/disk offload and cascade for this checkpoint"
+            )
         model_config = vllm_config.model_config
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config

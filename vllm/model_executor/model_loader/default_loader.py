@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
 import glob
+import json
 import os
 import time
 from collections.abc import Callable, Generator, Iterable
@@ -16,6 +17,7 @@ from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.torchao import torchao_version_at_least
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
+from vllm.model_executor.model_loader.csf_scales import decode_csf_scale_streams
 from vllm.model_executor.model_loader.direct_io import decoder_layer_filter
 from vllm.model_executor.model_loader.ep_weight_filter import (
     compute_local_expert_ids,
@@ -80,6 +82,19 @@ def _pipeline_stage_layer_range(model: nn.Module) -> tuple[int, int] | None:
             "one the checkpoint's decoder layers belong to"
         )
     return ranges.pop() if ranges else None
+
+
+def _indexed_safetensors_files(hf_folder: str, index_file: str) -> list[str]:
+    index_path = os.path.join(hf_folder, index_file)
+    if not os.path.isfile(index_path):
+        return []
+    with open(index_path) as f:
+        paths = sorted(set(json.load(f)["weight_map"].values()))
+    files = [os.path.join(hf_folder, path) for path in paths]
+    missing = [path for path in files if not os.path.isfile(path)]
+    if missing:
+        raise FileNotFoundError(f"Indexed checkpoint shards missing: {missing[:4]}")
+    return files
 
 
 class DefaultModelLoader(BaseModelLoader):
@@ -227,6 +242,16 @@ class DefaultModelLoader(BaseModelLoader):
         hf_weights_files: list[str] = []
         for pattern in allow_patterns:
             hf_weights_files += glob.glob(os.path.join(hf_folder, pattern))
+            if not hf_weights_files and pattern.endswith(".safetensors"):
+                if not is_local:
+                    download_safetensors_index_file_from_hf(
+                        model_name_or_path,
+                        index_file,
+                        cache_dir=self.load_config.download_dir,
+                        subfolder=subfolder,
+                        revision=revision,
+                    )
+                hf_weights_files = _indexed_safetensors_files(hf_folder, index_file)
             if len(hf_weights_files) > 0:
                 if pattern.endswith(".safetensors"):
                     use_safetensors = True
@@ -373,7 +398,10 @@ class DefaultModelLoader(BaseModelLoader):
         if self.counter_before_loading_weights == 0.0:
             self.counter_before_loading_weights = time.perf_counter()
         # Apply the prefix.
-        return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
+        return (
+            (source.prefix + name, tensor)
+            for name, tensor in decode_csf_scale_streams(weights_iterator)
+        )
 
     def _skip_weight_for(self, model: nn.Module) -> Callable[[str], bool] | None:
         """The model's own skip predicate, plus, for direct I/O under pipeline

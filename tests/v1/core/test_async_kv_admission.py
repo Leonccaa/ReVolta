@@ -295,9 +295,21 @@ def test_reservation_released_on_lifecycle_changes(action, hybrid):
 
 
 @pytest.mark.parametrize("failed_group", [0, 1])
-def test_hybrid_failed_load_recomputes_all_state_groups(failed_group):
-    scheduler = make_scheduler(blocks=30, mamba=("align", 32), token_budget=32)
+@pytest.mark.parametrize("with_running_peer", [False, True])
+def test_hybrid_failed_load_recomputes_all_state_groups(
+    failed_group, with_running_peer
+):
+    scheduler = make_scheduler(
+        blocks=30, mamba=("align", 32), token_budget=64 if with_running_peer else 32
+    )
     scheduler.recompute_kv_load_failures = True
+    scheduler.connector.get_num_new_matched_tokens = lambda req, _: (
+        (64, True) if req.request_id == "a" else (0, False)
+    )
+    if with_running_peer:
+        request(scheduler, "peer", 16, max_tokens=16)
+        complete(scheduler, scheduler.schedule())
+        assert scheduler.running
     a = request(scheduler, "a", 128)
     output = scheduler.schedule()
     null = scheduler.kv_cache_manager.block_pool.null_block.block_id

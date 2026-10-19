@@ -2935,22 +2935,26 @@ class Scheduler(SchedulerInterface):
                 request.num_computed_tokens - num_scheduled_tokens.get(req_id, 0)
             )
 
-            if not evict_blocks and len(block_groups) > 1:
+            if len(block_groups) > 1:
                 # An async hybrid transfer has not published its cache entries.
                 # A token offset in one attention group is not a valid restore
                 # point for recurrent state or fixed ring/tail groups. Recompute
                 # the whole prefix on any group failure, and release all groups
                 # only when the transfer completes in _update_waiting_for_remote_kv.
                 null_id = self.kv_cache_manager.block_pool.null_block.block_id
-                if any(
+                if not any(
                     block_id != null_id and block_id in invalid_block_ids
                     for group in block_groups
                     for block_id in group
                 ):
+                    # The failure scan also visits RUNNING peers. Unrelated
+                    # hybrid requests must not enter single-group recovery.
+                    continue
+                if not evict_blocks:
                     affected_req_ids.add(req_id)
                     total_affected_tokens += req_num_computed_tokens
                     request.num_computed_tokens = 0
-                continue
+                    continue
 
             # Synchronous hybrid connector recovery remains unsupported here.
             (req_block_ids,) = block_groups

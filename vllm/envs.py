@@ -186,6 +186,7 @@ if TYPE_CHECKING:
     VLLM_USAGE_SOURCE: str = "production"
     VLLM_CONFIGURE_LOGGING: bool = True
     VLLM_LOGGING_LEVEL: str = "INFO"
+    VLLM_REVOLTA_PROFILE_PROVENANCE: str | None = None
     VLLM_LOGGING_PREFIX: str = ""
     VLLM_LOGGING_STREAM: str = "ext://sys.stdout"
     VLLM_LOGGING_CONFIG_PATH: str | None = None
@@ -1661,6 +1662,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=True,
+    ),
+    "VLLM_REVOLTA_PROFILE_PROVENANCE": env_var(
+        lambda: os.getenv("VLLM_REVOLTA_PROFILE_PROVENANCE"),
+        description=(
+            "Internal JSON transport of startup audit values and sources to "
+            "child processes; diagnostic only, never resolves serving settings."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(
+            "Written by apply_revolta_profile and profile_audit for inheritance.",
+        ),
+        acceleration_paths=(),
+        user_visible=False,
     ),
     # Root directory for vLLM configuration files
     # Defaults to `~/.config/vllm` unless `XDG_CONFIG_HOME` is set
@@ -19475,6 +19491,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_NO_USAGE_STATS",
         "VLLM_DO_NOT_TRACK",
         "VLLM_LOGGING_LEVEL",
+        "VLLM_REVOLTA_PROFILE_PROVENANCE",
         "VLLM_LOGGING_PREFIX",
         "VLLM_LOGGING_STREAM",
         "VLLM_LOGGING_CONFIG_PATH",

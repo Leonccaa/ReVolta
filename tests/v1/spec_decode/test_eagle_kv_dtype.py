@@ -246,6 +246,7 @@ def test_mixed_dtype_admission(connector, method):
         ("speculative_config", "kv_cache_dtype", "fp8_e5m2", "quantized draft"),
         ("speculative_config", "kv_cache_dtype", "bfloat16", "activation dtype"),
         ("cache_config", "cache_dtype", "nvfp4", "target KV layout"),
+        ("cache_config", "cache_dtype", "fp8_e5m2", "target KV layout"),
         ("speculative_config", "method", "eagle", "native QSA MTP"),
         ("speculative_config", "method", "eagle3", "native QSA MTP"),
     ],

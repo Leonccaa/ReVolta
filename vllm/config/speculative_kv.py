@@ -51,7 +51,6 @@ def validate_speculative_kv_cache_dtype(config: "VllmConfig") -> None:
         "bfloat16",
         "fp8",
         "fp8_e4m3",
-        "fp8_e5m2",
     ):
         reason = "the target KV layout does not support an independent draft dtype"
     elif spec.kv_cache_dtype not in ("auto", "float16", "bfloat16"):

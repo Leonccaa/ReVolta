@@ -1123,6 +1123,28 @@ def unify_kv_cache_spec_page_size(
         return kv_cache_spec
 
     max_page_size = max(page_sizes)
+    # The v1 planar format never changes the logical token/checkpoint grid to
+    # solve a physical byte ratio (e.g. 65:64). Keep legacy-only plans unchanged.
+    from math import lcm
+
+    from vllm.v1.kv_cache_interface import KVQuantMode
+
+    if any(
+        isinstance(s, AttentionSpec) and s.kv_quant_mode == KVQuantMode.INT8_PLANAR
+        for s in kv_cache_spec.values()
+    ):
+        quantum = 16
+        for s in kv_cache_spec.values():
+            if isinstance(s, AttentionSpec):
+                quantum = lcm(quantum, max(1, s.storage_block_size // 16) * 16)
+        physical_page = round_up(max_page_size, quantum)
+        result: dict[str, KVCacheSpec] = {}
+        for name, s in kv_cache_spec.items():
+            if not isinstance(s, (AttentionSpec, MambaSpec)):
+                raise NotImplementedError("Owner cannot express physical KV padding")
+            result[name] = replace(s, page_size_padded=physical_page)
+        return result
+
     new_kv_cache_spec = {}
     for layer_name, layer_spec in kv_cache_spec.items():
         if layer_spec.page_size_bytes == max_page_size:
@@ -2067,7 +2089,11 @@ class _CSALinearTensorLayout:
         return sum(self.main_kv_page_sizes) + sum(self.compressed_page_sizes)
 
     def owner_page_size(self, owner: int) -> int:
-        return sum(self.main_kv_page_sizes[i] for i in self.main_kv_owners[owner])
+        from vllm.v1.attention.kv_cache_view import physical_owner_page_size
+
+        return physical_owner_page_size(
+            [self.main_kv_page_sizes[i] for i in self.main_kv_owners[owner]]
+        )
 
 
 def _csa_linear_state_page(mamba_specs: Iterable[KVCacheSpec]) -> int:
@@ -2301,7 +2327,11 @@ def _get_kv_cache_groups_csa_linear(
     owners = _pack_csa_linear_main_kv(
         main_kv_pages, _csa_linear_state_page(roles.mamba.values())
     )
-    owner_pages = [sum(main_kv_pages[i] for i in owner) for owner in owners]
+    from vllm.v1.attention.kv_cache_view import physical_owner_page_size
+
+    owner_pages = [
+        physical_owner_page_size([main_kv_pages[i] for i in owner]) for owner in owners
+    ]
     # One representative name per physical owner; recurrent states are placed
     # per physical owner, whatever it packs.
     owner_names = [main_kv_names[owner[0]] for owner in owners]

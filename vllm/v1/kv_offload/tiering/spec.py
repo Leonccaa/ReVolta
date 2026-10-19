@@ -111,6 +111,23 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 ],
             }
 
+        from vllm.v1.attention.kv_cache_view import (
+            has_planar_kv_cache,
+            kv_storage_metadata,
+        )
+
+        if has_planar_kv_cache(kv_cache_config):
+            if self.persistent_layout is None:
+                self.persistent_layout = {"config_hash": vllm_config.compute_hash()}
+            self.persistent_layout["kv_storage"] = kv_storage_metadata(
+                kv_cache_config, vllm_config.cache_config.cache_dtype
+            )
+            if any(tier.get("type") == "fs" for tier in self.secondary_tier_configs):
+                raise ValueError(
+                    "INT8 v1 SSD requires aligned FS framing; raw O_DIRECT pages "
+                    "are unsupported. Use CPU offload until FS framing is integrated."
+                )
+
         # Scheduler-side mmap (rank=None); kept for cleanup
         self._scheduler_mmap: SharedOffloadRegion | None = None
 

@@ -12680,7 +12680,9 @@ class GPUModelRunner(
                         shape_block_size,
                         kv_cache_spec.num_kv_heads,
                         kv_cache_spec.head_size,
-                        cache_dtype_str=self.cache_config.cache_dtype,
+                        cache_dtype_str=kv_cache_spec.layout_cache_dtype(
+                            self.cache_config.cache_dtype
+                        ),
                     )
                     dtype = kv_cache_spec.dtype
                     try:
@@ -12702,28 +12704,36 @@ class GPUModelRunner(
                         for i in range(len(kv_cache_stride_order))
                     ]
 
-                    raw_tensor = kv_cache_raw_tensors[layer_name].view(dtype)
-                    if kv_cache_spec.page_size_padded is not None:
-                        # Use strided view to handle page_size_bytes that
-                        # include padding. This follows
-                        # the same pattern as MambaSpec handling below.
-                        # NOTE: This assumes kv_cache_shape[0] == num_blocks
-                        # (i.e. the first physical dimension is the block
-                        # index), which holds for MLA backends but NOT for
-                        # standard attention backends whose shape starts with
-                        # a K/V dimension of size 2.
-                        dtype_size = get_dtype_size(dtype)
-                        page_stride = kv_cache_spec.page_size_bytes // dtype_size
-                        strides = list(torch.empty(kv_cache_shape).stride())
-                        strides[inv_order[0]] = page_stride
-                        kv_cache = torch.as_strided(
+                    from vllm.v1.attention.kv_cache_view import (
+                        bind_attention_cache,
+                        bind_planar_kv_cache,
+                    )
+                    from vllm.v1.kv_cache_interface import KVQuantMode
+
+                    if kv_cache_spec.kv_quant_mode == KVQuantMode.INT8_PLANAR:
+                        if inv_order != list(range(5)):
+                            raise ValueError(
+                                "Planar KV requires block-major NHD layout"
+                            )
+                        kv_cache = bind_planar_kv_cache(
                             raw_tensor,
-                            size=kv_cache_shape,
-                            stride=tuple(strides),
+                            num_blocks=num_blocks,
+                            scheduler_block_size=kv_cache_spec.storage_block_size,
+                            kernel_block_size=shape_block_size,
+                            num_heads=kv_cache_spec.num_kv_heads,
+                            head_size=kv_cache_spec.head_size,
+                            page_size_bytes=kv_cache_spec.page_size_bytes,
                         )
                     else:
-                        # No padding — safe to use a contiguous view.
-                        kv_cache = raw_tensor.view(kv_cache_shape)
+                        kv_cache = bind_attention_cache(
+                            raw_tensor,
+                            shape=kv_cache_shape,
+                            dtype=dtype,
+                            page_size_bytes=kv_cache_spec.page_size_bytes,
+                            scheduler_block_size=kv_cache_spec.storage_block_size,
+                            kernel_block_size=shape_block_size,
+                            block_dim=inv_order[0],
+                        )
                     kv_caches[layer_name] = kv_cache.permute(*inv_order)
 
                 elif isinstance(kv_cache_spec, MambaSpec):
@@ -12778,7 +12788,9 @@ class GPUModelRunner(
                 kernel_block_sizes[group.kv_cache_group_id],
                 kv_cache_spec.num_kv_heads,
                 kv_cache_spec.head_size,
-                cache_dtype_str=self.cache_config.cache_dtype,
+                cache_dtype_str=kv_cache_spec.layout_cache_dtype(
+                    self.cache_config.cache_dtype
+                ),
             )
             # block_dim: 0 means (num_blocks, 2, ...); 1 means (2, num_blocks, ...).
             if block_dim == 0:

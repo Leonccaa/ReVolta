@@ -869,7 +869,19 @@ class FlashAttentionImpl(AttentionImpl):
 
         # Scatter write into the KV cache using slot_mapping indices.
         # No TMA kernel is invoked here, so stride canonicalization is not needed.
-        key_cache, value_cache = kv_cache.unbind(1)
+        from vllm.v1.attention.kv_cache_view import KVCacheView
+        from vllm.v1.attention.kv_codecs import resolve_kv_codec
+
+        codec = resolve_kv_codec(self.kv_cache_dtype)
+        if self.kv_cache_dtype == "auto" and kv_cache.dtype == torch.bfloat16:
+            codec = resolve_kv_codec("bfloat16")
+        scale_kwargs = {}
+        if codec is None:
+            key_cache, value_cache = kv_cache.unbind(1)
+        else:
+            view = KVCacheView.bind(kv_cache, codec, self.head_size)
+            key_cache, value_cache = view.key, view.value
+            scale_kwargs = view.scale_kwargs
 
         # Reshape the input keys and values and store them in the cache.
         # Skip this if sharing KV cache with an earlier attention layer.
@@ -887,6 +899,7 @@ class FlashAttentionImpl(AttentionImpl):
             self.kv_cache_dtype,
             layer._k_scale,
             layer._v_scale,
+            **scale_kwargs,
         )
 
     def _forward_with_dcp(

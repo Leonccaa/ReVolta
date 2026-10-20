@@ -11,7 +11,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from vllm.config import MultiModalConfig
+from vllm.config import MultiModalConfig, mm_encoder_tp
 from vllm.config.mm_encoder_tp import (
     qwen3_vision_tp_linears,
     resolve_mm_encoder_tp_mode,
@@ -91,6 +91,64 @@ def test_sm70_tp4_automatically_keeps_weights(explicit):
     cfg = config(explicit=explicit)
     resolve_mm_encoder_tp_mode(cfg)
     assert cfg.model_config.multimodal_config.mm_encoder_tp_mode == "weights"
+
+
+@pytest.mark.parametrize("depth,excluded_first", [(1, False), (27, False), (27, True)])
+def test_encoder_expansion_logs_one_summary(depth, excluded_first):
+    cfg = config(exclude=[PREFIX] if excluded_first else [])
+    cfg.model_config.hf_config.vision_config.depth = depth
+    with patch.object(mm_encoder_tp.logger, "info_once") as log:
+        resolve_mm_encoder_tp_mode(cfg)
+    assert cfg.model_config.multimodal_config.mm_encoder_tp_mode == "weights"
+    log.assert_called_once()
+    message, count, reason = log.call_args.args
+    assert count == depth - int(excluded_first)
+    first_prefix = (
+        PREFIX.replace("blocks.0.", "blocks.1.") if excluded_first else PREFIX
+    )
+    assert reason == (
+        f"{first_prefix}: row input 4304, TP4, local input 1076 is not a multiple "
+        "of quantization alignment 16"
+    )
+    rendered = message % (count, reason)
+    assert f"{count} vision fc2 layers" in rendered
+    assert "mm_encoder_tp_mode=weights" in rendered
+    assert "expanded to FP16 at load time" in rendered
+
+
+@pytest.mark.parametrize("case", ["data", "excluded", "aligned"])
+def test_no_expansion_needs_no_summary(case):
+    cfg = config(
+        mode="data" if case == "data" else "weights",
+        exclude=["model.visual.*"] if case == "excluded" else [],
+    )
+    if case == "aligned":
+        cfg.model_config.hf_config.vision_config.intermediate_size = 4352
+    with patch.object(mm_encoder_tp.logger, "info_once") as log:
+        resolve_mm_encoder_tp_mode(cfg)
+    assert cfg.model_config.multimodal_config.mm_encoder_tp_mode == (
+        "data" if case == "data" else "weights"
+    )
+    log.assert_not_called()
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_later_unsupported_layer_does_not_log_weights_summary(explicit):
+    cfg = config(explicit=explicit)
+    second = PREFIX.replace("blocks.0.", "blocks.1.")
+    cfg.quant_config.quantized_layers[second]["quant_algo"] = "NVFP4"
+    with patch.object(mm_encoder_tp.logger, "info_once") as log:
+        if explicit:
+            with pytest.raises(ValueError, match=r"weights is invalid: .*blocks\.1\."):
+                resolve_mm_encoder_tp_mode(cfg)
+            log.assert_not_called()
+        else:
+            resolve_mm_encoder_tp_mode(cfg)
+            assert cfg.model_config.multimodal_config.mm_encoder_tp_mode == "data"
+            log.assert_called_once()
+            message, reason = log.call_args.args
+            assert message == "Using mm_encoder_tp_mode=data: %s."
+            assert reason.startswith(second)
 
 
 def test_data_is_explicitly_available():

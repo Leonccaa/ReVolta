@@ -81,6 +81,8 @@ def resolve_mm_encoder_tp_mode(config: "VllmConfig") -> None:
     get_shapes = getattr(architecture_config, "get_mm_encoder_tp_linear_shapes", None)
     if get_shapes is None:
         return
+    expanded_fc2_count = 0
+    first_expanded_reason = None
     for layer in get_shapes(model):
         alignment = config.quant_config.get_linear_input_alignment(layer.prefix)
         if alignment == 1:
@@ -98,11 +100,9 @@ def resolve_mm_encoder_tp_mode(config: "VllmConfig") -> None:
             and can_dequantize is not None
             and can_dequantize(layer.prefix, layer.input_size, tp, model.dtype)
         ):
-            logger.info_once(
-                "Using mm_encoder_tp_mode=weights: %s; expanding only "
-                "unaligned vision fc2 weights to FP16 at load time.",
-                reason,
-            )
+            expanded_fc2_count += 1
+            if first_expanded_reason is None:
+                first_expanded_reason = reason
             continue
         suggestion = "Use --mm-encoder-tp-mode data to replicate the vision encoder."
         if model._mm_encoder_tp_mode_explicit:
@@ -114,3 +114,10 @@ def resolve_mm_encoder_tp_mode(config: "VllmConfig") -> None:
         mm.mm_encoder_tp_mode = "data"
         logger.info_once("Using mm_encoder_tp_mode=data: %s.", reason)
         return
+    if expanded_fc2_count:
+        logger.info_once(
+            "Using mm_encoder_tp_mode=weights: %d vision fc2 layers are expanded "
+            "to FP16 at load time (first layer: %s).",
+            expanded_fc2_count,
+            first_expanded_reason,
+        )

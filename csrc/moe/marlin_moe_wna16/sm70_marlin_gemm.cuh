@@ -2765,6 +2765,12 @@ struct Sm70MarlinMoeGemmTraits {
   };
 };
 
+// The constructor's warp offset and the accumulator staging and partition-K
+// reduction in operator() follow NVIDIA CUTLASS
+// include/cutlass/epilogue/threadblock/epilogue_base.h and epilogue.h.
+// Copyright (c) 2017 - 2026 NVIDIA CORPORATION & AFFILIATES.
+// All rights reserved.
+// SPDX-License-Identifier: BSD-3-Clause (text: LICENSES/cutlass.txt)
 template <typename Traits>
 class Sm70MoeScatterEpilogue {
  public:

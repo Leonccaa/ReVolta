@@ -96,6 +96,12 @@ sm70_splitk_partition(int k, int requested_split_k, int partition_idx) {
   return {start_tiles * CtaK, partition_tiles * CtaK};
 }
 
+// The constructor's warp offset and the accumulator staging and partition-K
+// reduction in operator() follow NVIDIA CUTLASS
+// include/cutlass/epilogue/threadblock/epilogue_base.h and epilogue.h.
+// Copyright (c) 2017 - 2026 NVIDIA CORPORATION & AFFILIATES.
+// All rights reserved.
+// SPDX-License-Identifier: BSD-3-Clause (text: LICENSES/cutlass.txt)
 template <typename Traits>
 class Sm70AtomicFp16Epilogue {
  public:
@@ -222,6 +228,12 @@ class Sm70AtomicFp16Epilogue {
   }
 };
 
+// The constructor's warp offset and the accumulator staging and partition-K
+// reduction in operator() follow NVIDIA CUTLASS
+// include/cutlass/epilogue/threadblock/epilogue_base.h and epilogue.h.
+// Copyright (c) 2017 - 2026 NVIDIA CORPORATION & AFFILIATES.
+// All rights reserved.
+// SPDX-License-Identifier: BSD-3-Clause (text: LICENSES/cutlass.txt)
 template <typename Traits>
 class Sm70AtomicFp32Epilogue {
  public:

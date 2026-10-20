@@ -26,6 +26,10 @@ Included components
 1. TurboMind / LMDeploy (OpenMMLab)
    Source: https://github.com/InternLM/lmdeploy
    Location: csrc/sm70_turbomind/lmdeploy/src/turbomind/
+   Also adapted from TurboMind, as stated in their headers:
+   csrc/sm70_turbomind/ops/awq_sm70_gemm.cu (s884h kernel integration) and
+   the alternative e2m1 decoder in csrc/sm70_turbomind/ops/
+   skinny_moe_qpn_sm70.cu.
    License: Apache-2.0 for LMDeploy-origin code; LICENSES/lmdeploy-dated.txt.
    Exception: the locally added kernels/gemm/lattice_codebooks.h identifies
    MIT-licensed tables from gguf-py 0.19.0 / llama.cpp. Keep its SPDX notice
@@ -54,8 +58,14 @@ Included components
 
 3. FlashAttention-V100 / D. Skryabin and the separate SM70 FA2 port
    Source: https://github.com/ai-bond/flash-attention-v100
-   Locations: flash-attention-v100/; csrc/attention/sm70_grouped_long/;
-   csrc/attention/sm70_v37/; csrc/attention/sm70_79t/.
+   Locations: flash-attention-v100/ (kernel/h3/ is CUTLASS-derived, see
+   item 4); csrc/attention/sm70_grouped_long/.
+   csrc/attention/sm70_v37/ and csrc/attention/sm70_79t/ are 1Cat SM70
+   extensions compiled into the fetched SM70 FA2 target. Their files carry
+   1CatAI or vLLM-contributor notices (Apache-2.0 or BSD-3-Clause) and
+   include headers from that FA2 port; their CUTLASS-derived files are
+   listed in item 4. No file in these two directories carries a
+   D.Skryabin notice.
    License: BSD-3-Clause; Copyright (c) 2025, D.Skryabin.
    Existing component LICENSE files and source notices are retained.
    Upstream evidence snapshot: 0ababf82e3836c1786d7937c6002670ca4ecda62;
@@ -81,10 +91,33 @@ Included components
    NVIDIA's copyright, is LICENSES/cutlass-machete.txt.
    The fetched SM70 and SM75 FA2 ports use CUTLASS submodule
    62750a2b75c802660e4894434dc55e839f322277; LICENSES/cutlass-fa2.txt.
-   Notice-audit gap: headers in sm70_v37, sm70_79t, H3 and Machete were
-   inspected. A complete per-file lineage for every older adaptation is
-   not recorded. Do not treat the current build revision as their import
-   revision. Keep embedded conditions and disclaimers with each header.
+   Per-file lineage (checked 2026-10-19 against CUTLASS 62750a2b75,
+   v3.8.0, v3.9.2, v4.0.0, v4.1.0, v4.2.1, v4.3.0 and v4.4.2):
+   - csrc/attention/sm70_v37/{gemm_with_softmax.h,
+     epilogue_visitor_with_softmax.h,reduce_softmax_final.h} and
+     csrc/attention/sm70_79t/include/cutlass/gemm/threadblock/mma_pipelined.h
+     are modified copies of examples/35_gemm_softmax/gemm_with_softmax.h,
+     include/cutlass/epilogue/threadblock/epilogue_visitor_with_softmax.h,
+     include/cutlass/reduction/kernel/reduce_softmax_final.h and
+     include/cutlass/gemm/threadblock/mma_pipelined.h. They keep the
+     2017-2025 NVIDIA notice. The upstream text is identical in every
+     checked 2025 revision, including the FA2 submodule, so the exact
+     import revision is not recorded. Text: LICENSES/cutlass-fa2.txt.
+   - csrc/quantization/marlin/sm70_marlin_mma.cuh adapts CUTLASS
+     MmaPipelined (include/cutlass/gemm/threadblock/mma_pipelined.h).
+     The epilogue classes in csrc/quantization/marlin/sm70_marlin_splitk.cuh
+     and csrc/moe/marlin_moe_wna16/sm70_marlin_gemm.cuh adapt the warp
+     offset and partition-K reduction of
+     include/cutlass/epilogue/threadblock/{epilogue_base.h,epilogue.h}.
+     Import revision not recorded; these files build against v4.4.2.
+     Text: LICENSES/cutlass.txt.
+   - flash-attention-v100/kernel/h3/{default_fmha.h,fmha.h,prefetch_mma.h}
+     derive from v4.4.2 examples/41_fused_multi_head_attention; see
+     kernel/h3/UPSTREAM.md.
+   - The SM70 FA2 build patches the submodule's
+     examples/35_gemm_softmax/gemm_with_softmax.h
+     (cmake/patches/sm70_flash_attn_d256_gqa_arch.patch).
+   Keep embedded conditions and disclaimers with each header.
    Removal candidate: Machete's Hopper-only native sources are outside the
    SM70 build. They remain present; deletion would require adapting shared
    CMake, dispatch and tests when picking upstream fixes. CUTLASS itself is
@@ -100,6 +133,11 @@ Included components
    upstream commit. Local rename history and vLLM PR #14447 (merge
    d06ba4ed3f9a5929eabb404842a5c02da42e960b) identify the modified vLLM
    integration, not a single original Marlin revision.
+   The sm70_* files in these directories are 1Cat SM70 implementations on
+   CUTLASS 2.x APIs. Only sm70_marlin_dispatch.cu and
+   sm70_marlin_moe_dispatch.cu carry the Marlin notice;
+   sm70_{gptq,awq}_marlin_repack.cu are copies of vLLM's repack kernels.
+   Their CUTLASS-derived parts are listed in item 4.
 
 6. NVIDIA FasterTransformer and TensorRT-LLM adaptations
    Sources: https://github.com/NVIDIA/FasterTransformer
@@ -185,8 +223,36 @@ Included components
     that URL do not establish its exact import revision. v1.5.0 is license
     evidence, not a claimed exact copy. Preserve per-file integration notices.
 
+13. SGLang-V100 SM70 one-shot push all-reduce
+    Source: https://github.com/haohervchb/sglang-V100 (a fork of
+    https://github.com/sgl-project/sglang), revision 845b9fdf7a7e.
+    Location: the SM70 TP4 one-shot push collective in
+    csrc/custom_all_reduce.cuh, as stated in its comment.
+    License: Apache-2.0 (the fork's repository license, checked
+    2026-10-19); text: LICENSE.
+
+Retained but not built for the SM70 (7.0) release
+-------------------------------------------------
+
+Machete (csrc/quantization/machete/, 9.0a only); CUTLASS scaled_mm c2x/c3x
+and grouped MoE (csrc/libtorch_stable/quantization/w8a8/cutlass/, except the
+scaled_mm_entry.cu dispatcher); W4A8
+(csrc/libtorch_stable/quantization/cutlass_w4a8/); SM100 CUTLASS MLA
+(csrc/libtorch_stable/attention/mla/); NVFP4/MXFP4 kernels
+(csrc/libtorch_stable/quantization/fp4/, except nvfp4_quant_entry.cu and
+nvfp4_scaled_mm_entry.cu); MXFP8 MoE (csrc/moe/mxfp8_moe/); DSV3 router and
+fused-A GEMM; CUTLASS epilogue extensions (csrc/cutlass_extensions/epilogue/,
+csrc/libtorch_stable/cutlass_extensions/); TurboMind SM80/SM90 GEMM headers
+(csrc/sm70_turbomind/lmdeploy/src/turbomind/kernels/gemm/ *sm90*,
+mainloop_sm80_v2.h, scheduler.cuh); non-SM70 Marlin kernels. Their per-file
+notices still apply to source distributions.
+
 Build-fetched components
 ------------------------
+
+For the 7.0 release build, DeepGEMM, FlashMLA, QuTLASS, vLLM FlashAttention
+and SM75 FlashAttention are not fetched; CUDA builds fetch CUTLASS v4.4.2,
+the SM70 FA2 port (with its CUTLASS submodule) and Triton kernels.
 
 Configured default revisions are listed below. A source-directory override
 or a changed pin requires a fresh license and transitive-notice check.

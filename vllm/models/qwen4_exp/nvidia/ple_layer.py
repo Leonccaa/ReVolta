@@ -1957,6 +1957,12 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                     mapped_path = _advise_random_file_access(loaded_weight)
                     self._disk_shards[shard_index] = loaded_weight
                     self._disk_mapped_paths.add(mapped_path)
+                    # The mapped shard is this table's storage: count its rows
+                    # for the post-load coverage check like a resident copy.
+                    if embedding.weight.dtype == torch.float8_e4m3fn:
+                        _fp8_checkpoint_coverage(embedding).record(
+                            checkpoint_start, checkpoint_start + loaded_weight.shape[0]
+                        )
                     loaded.add("ngram_embedding.weight")
                     continue
                 if (
@@ -2029,8 +2035,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         if regular_weights:
             loaded.update(AutoWeightsLoader(self).load_weights(regular_weights))
         if (
-            not file_backed
-            and nvfp4_embedding is None
+            nvfp4_embedding is None
             and self.ngram_embedding.weight.dtype == torch.float8_e4m3fn
             and "ngram_embedding.weight_scale" in loaded
         ):

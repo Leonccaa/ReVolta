@@ -23,7 +23,8 @@ Reference system: 4 × V100 32 GB PCIe, one PCIe switch, P2P enabled, no NVLink.
 | Total output throughput, tok/s | 152.5 | 167.2 | 262.2 | 383.6 |
 
 These are totals across all requests, including the wait for the first token:
-512-token responses, thinking off, MTP4 on. See [Performance](#performance).
+512-token responses, thinking off, MTP4 on. C2 varies between runs; see
+[Performance](#performance).
 
 | Cold prompt | 8K tokens | 131K tokens |
 | --- | ---: | ---: |
@@ -535,6 +536,12 @@ Release configuration: Uncensored AWQ g32, E4M3 KV, TP4 + DCP2, MTP4, on the ref
 `temperature=0`, streaming, and MTP4 enabled. English code, Chinese explanation,
 and English arithmetic prompts rotate across clients. Each concurrency level
 has one warm-up and eight measured runs; the table reports the mean.
+
+At C2, the two requests share the first prefill step only if the second one reaches
+the engine within a sub-millisecond window. With the same code, this happened in
+0 to 8 of the 8 measured repetitions, varying from run to run, and C2 ranged
+from 159.7 to 173.7 tok/s; the table's 167.2 came from a run with 4 of 8.
+Repetitions where both requests started together reached about 174 tok/s.
 
 Total output throughput is all generated tokens divided by wall time, including
 time to first token. It is an end-to-end rate, not a decode-only measurement.

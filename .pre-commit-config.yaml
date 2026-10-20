@@ -111,6 +111,8 @@ repos:
     entry: python tools/pre_commit/check_spdx_header.py
     language: python
     types: [python]
+    # Byte-identical mirror of a published artifact; SHA256SUMS covers it.
+    exclude: ^tools/kv-scales/
   - id: check-root-lazy-imports
     name: Check root lazy imports
     entry: python tools/pre_commit/check_init_lazy_imports.py

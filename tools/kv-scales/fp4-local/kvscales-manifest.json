@@ -1,0 +1,150 @@
+{
+  "artifact_id": "leoncca/Qwen3.8-Flash-Next-FP4-Local-QSA-FP8-E4M3-KV-Scales",
+  "artifact_type": "qsa_e4m3_kv_scale_pack",
+  "base_checkpoint": {
+    "config_sha256": "b50dbc52a0c83b0cd2a44a372c1fb6b5e0e6827d22f2611c97d4d030f92f6b28",
+    "index_sha256": "5fa166bbb1cf25adda455117563efa72a2072272001f459eedece131ffc913e1",
+    "qsa_layer_ids": [
+      3,
+      7,
+      11,
+      15,
+      19,
+      23,
+      27,
+      31,
+      35,
+      39,
+      43,
+      47
+    ],
+    "repo_id": "nvidia/Qwen3.8-Flash-Next-FP4-Local",
+    "revision": "b9ce18a6887e18c089fdea8509a33e63429a3300"
+  },
+  "calibration": {
+    "clipping": "none; observed maxima map to at most 448",
+    "collection_runtime": {
+      "activation_dtype": "float16",
+      "kv_cache_dtype": "float16",
+      "language_model_only": true,
+      "mtp": 0,
+      "prefix_caching": false,
+      "tensor_parallel_size": 4
+    },
+    "corpus": {
+      "coverage": [
+        "English structured records",
+        "Chinese inventory records",
+        "Python code",
+        "JSON records"
+      ],
+      "disjoint_from_quality_set": "no identical prompt and no shared 64-token span",
+      "distributed": false,
+      "kind": "deterministic template-generated synthetic text",
+      "max_prompt_tokens": 9809,
+      "prompt_tokens": 236320,
+      "records": 48
+    },
+    "method": "per-layer per-tensor observed max_abs/448",
+    "observer_path": "K and V tensors immediately before the main QSA cache write, normal prefill forwards after engine initialization",
+    "safety_margin": "none beyond FP32 upward rounding",
+    "saturation_definition": "abs(x) > 448*scale",
+    "scale_storage": "float32 rounded upward",
+    "source_report_sha256": "bdf37f5a2f9ddc3ed09062fab5e85f63baf6a19e3286900b93615108a63d595a",
+    "statistics_note": "p99 bounds are upper bin edges of a 4096-bin log2 histogram; one collection shard, so no shard-stability ratio is reported"
+  },
+  "derived_view": {
+    "index_sha256": "870379a3c8b3d661b5ea3fd592db49092e720e7a3e874927e991aa1ed26f1f32",
+    "index_total_size_delta": 96,
+    "indexed_file_count": 22,
+    "scale_path": "calibration/model-kvscales.safetensors",
+    "unchanged_base_files": "all other base files are symlinked unchanged"
+  },
+  "loader_contract": "24 scale entries merged into model.safetensors.index.json, scale file at calibration/model-kvscales.safetensors",
+  "release_tag": "v1.0-base-b9ce18a6",
+  "runtime": {
+    "activation_dtype": "float16",
+    "decode_context_parallel_size": 2,
+    "description": "V100 (SM70) vLLM build with QSA E4M3 KV support",
+    "hardware": "4 x NVIDIA Tesla V100 (SM70)",
+    "main_qsa_kv_cache_dtype": "fp8_e4m3",
+    "speculative_draft": "checkpoint MTP layer with float16 draft KV cache; this pack has no MTP-layer scales",
+    "strict_scale_env": "VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES=1",
+    "tensor_parallel_size": 4
+  },
+  "scale_contract": "e4m3fn(x/scale), max_abs/448",
+  "scale_file": {
+    "filename": "model-kvscales.safetensors",
+    "metadata": {
+      "format": "pt",
+      "negative_control": "false",
+      "qsa_kv_scale_contract": "e4m3fn(x/scale), max_abs/448"
+    },
+    "payload_bytes": 96,
+    "payload_sha256": "0881a0ed8619c5ce4c0b6458b2cffcf7b4d64b9ecbfcb7a297db9c74eced432b",
+    "sha256": "71f2cbba9334459b48e5f9f5c97159f68b497985b6c7533db03fb1556fadd125",
+    "size_bytes": 2640,
+    "tensor_count": 24,
+    "tensor_names": [
+      "model.language_model.layers.3.self_attn.k_scale",
+      "model.language_model.layers.3.self_attn.v_scale",
+      "model.language_model.layers.7.self_attn.k_scale",
+      "model.language_model.layers.7.self_attn.v_scale",
+      "model.language_model.layers.11.self_attn.k_scale",
+      "model.language_model.layers.11.self_attn.v_scale",
+      "model.language_model.layers.15.self_attn.k_scale",
+      "model.language_model.layers.15.self_attn.v_scale",
+      "model.language_model.layers.19.self_attn.k_scale",
+      "model.language_model.layers.19.self_attn.v_scale",
+      "model.language_model.layers.23.self_attn.k_scale",
+      "model.language_model.layers.23.self_attn.v_scale",
+      "model.language_model.layers.27.self_attn.k_scale",
+      "model.language_model.layers.27.self_attn.v_scale",
+      "model.language_model.layers.31.self_attn.k_scale",
+      "model.language_model.layers.31.self_attn.v_scale",
+      "model.language_model.layers.35.self_attn.k_scale",
+      "model.language_model.layers.35.self_attn.v_scale",
+      "model.language_model.layers.39.self_attn.k_scale",
+      "model.language_model.layers.39.self_attn.v_scale",
+      "model.language_model.layers.43.self_attn.k_scale",
+      "model.language_model.layers.43.self_attn.v_scale",
+      "model.language_model.layers.47.self_attn.k_scale",
+      "model.language_model.layers.47.self_attn.v_scale"
+    ]
+  },
+  "schema_version": 1,
+  "validation": {
+    "forward_kl_top20_tail": 0.038028,
+    "functional_check": "passed: concurrent requests, image and video input, long context",
+    "kl_note": "token-weighted; top-20 plus tail-bucket approximation; measures the complete FP4-Local + E4M3-KV stack, not the KV scales alone",
+    "quality_set": "66 English/Chinese/code records, 39101 scored tokens",
+    "reference": "original BF16 Qwen/Qwen3.8-Flash-Next",
+    "top1_agreement": 0.95908
+  },
+  "tensors": [
+    {"dtype":"F32","f32_hex":"3c7f4925","kind":"k","layer":3,"max_abs":6.98046875,"name":"model.language_model.layers.3.self_attn.k_scale","p99_99_abs_upper_bound":5.300946572638965,"p99_9_abs_upper_bound":4.661205519970817,"saturation_ratio":0.0,"scale":0.015581403858959675,"shape":[]},
+    {"dtype":"F32","f32_hex":"3c4f2493","kind":"v","layer":3,"max_abs":5.6640625,"name":"model.language_model.layers.3.self_attn.v_scale","p99_99_abs_upper_bound":4.1827539235731015,"p99_9_abs_upper_bound":2.5005849635406174,"saturation_ratio":0.0,"scale":0.012642997317016125,"shape":[]},
+    {"dtype":"F32","f32_hex":"3c898000","kind":"k","layer":7,"max_abs":7.51953125,"name":"model.language_model.layers.7.self_attn.k_scale","p99_99_abs_upper_bound":5.336950479838349,"p99_9_abs_upper_bound":4.692864320654549,"saturation_ratio":0.0,"scale":0.01678466796875,"shape":[]},
+    {"dtype":"F32","f32_hex":"3cc0924a","kind":"v","layer":7,"max_abs":10.53125,"name":"model.language_model.layers.7.self_attn.v_scale","p99_99_abs_upper_bound":3.7789063087818784,"p99_9_abs_upper_bound":2.767819763927664,"saturation_ratio":0.0,"scale":0.0235072560608387,"shape":[]},
+    {"dtype":"F32","f32_hex":"3ca46db7","kind":"k","layer":11,"max_abs":8.9921875,"name":"model.language_model.layers.11.self_attn.k_scale","p99_99_abs_upper_bound":6.363947239451456,"p99_9_abs_upper_bound":4.821664436020495,"saturation_ratio":0.0,"scale":0.02007184736430645,"shape":[]},
+    {"dtype":"F32","f32_hex":"3d0fc925","kind":"v","layer":11,"max_abs":15.7265625,"name":"model.language_model.layers.11.self_attn.v_scale","p99_99_abs_upper_bound":2.824600582150291,"p99_9_abs_upper_bound":2.0688486767477623,"saturation_ratio":0.0,"scale":0.0351039357483387,"shape":[]},
+    {"dtype":"F32","f32_hex":"3cb8924a","kind":"k","layer":15,"max_abs":10.09375,"name":"model.language_model.layers.15.self_attn.k_scale","p99_99_abs_upper_bound":6.363947239451456,"p99_9_abs_upper_bound":5.124537751085858,"saturation_ratio":0.0,"scale":0.0225306935608387,"shape":[]},
+    {"dtype":"F32","f32_hex":"3ca74925","kind":"v","layer":15,"max_abs":9.1484375,"name":"model.language_model.layers.15.self_attn.v_scale","p99_99_abs_upper_bound":2.154602712360215,"p99_9_abs_upper_bound":1.6104903319492543,"saturation_ratio":0.0,"scale":0.02042062021791935,"shape":[]},
+    {"dtype":"F32","f32_hex":"3ccb4925","kind":"k","layer":19,"max_abs":11.1171875,"name":"model.language_model.layers.19.self_attn.k_scale","p99_99_abs_upper_bound":8.342887983110959,"p99_9_abs_upper_bound":5.987821647068942,"saturation_ratio":0.0,"scale":0.02481515146791935,"shape":[]},
+    {"dtype":"F32","f32_hex":"3d6c4925","kind":"v","layer":19,"max_abs":25.84375,"name":"model.language_model.layers.19.self_attn.v_scale","p99_99_abs_upper_bound":2.9616604556449437,"p99_9_abs_upper_bound":2.183970130366394,"saturation_ratio":0.0,"scale":0.0576869435608387,"shape":[]},
+    {"dtype":"F32","f32_hex":"3cb12493","kind":"k","layer":23,"max_abs":9.6875,"name":"model.language_model.layers.23.self_attn.k_scale","p99_99_abs_upper_bound":7.188561612350244,"p99_9_abs_upper_bound":5.672191537281661,"saturation_ratio":0.0,"scale":0.02162388525903225,"shape":[]},
+    {"dtype":"F32","f32_hex":"3cb34925","kind":"v","layer":23,"max_abs":9.8046875,"name":"model.language_model.layers.23.self_attn.v_scale","p99_99_abs_upper_bound":2.9416806284751105,"p99_9_abs_upper_bound":2.154602712360215,"saturation_ratio":0.0,"scale":0.02188546396791935,"shape":[]},
+    {"dtype":"F32","f32_hex":"3cc0924a","kind":"k","layer":27,"max_abs":10.53125,"name":"model.language_model.layers.27.self_attn.k_scale","p99_99_abs_upper_bound":7.744247173969177,"p99_9_abs_upper_bound":5.7495039897959295,"saturation_ratio":0.0,"scale":0.0235072560608387,"shape":[]},
+    {"dtype":"F32","f32_hex":"3d91db6e","kind":"v","layer":27,"max_abs":31.90625,"name":"model.language_model.layers.27.self_attn.v_scale","p99_99_abs_upper_bound":2.712180367730652,"p99_9_abs_upper_bound":2.0135839539999214,"saturation_ratio":0.0,"scale":0.0712193101644516,"shape":[]},
+    {"dtype":"F32","f32_hex":"3cbe6db7","kind":"k","layer":31,"max_abs":10.4140625,"name":"model.language_model.layers.31.self_attn.k_scale","p99_99_abs_upper_bound":7.436023089715282,"p99_9_abs_upper_bound":6.028490793975701,"saturation_ratio":0.0,"scale":0.02324567548930645,"shape":[]},
+    {"dtype":"F32","f32_hex":"3d14db6e","kind":"v","layer":31,"max_abs":16.28125,"name":"model.language_model.layers.31.self_attn.v_scale","p99_99_abs_upper_bound":5.373198924747341,"p99_9_abs_upper_bound":1.588834384317164,"saturation_ratio":0.0,"scale":0.0363420769572258,"shape":[]},
+    {"dtype":"F32","f32_hex":"3ce1b6dc","kind":"k","layer":35,"max_abs":12.34375,"name":"model.language_model.layers.35.self_attn.k_scale","p99_99_abs_upper_bound":8.571866462198969,"p99_9_abs_upper_bound":6.407171022730774,"saturation_ratio":0.0,"scale":0.0275530144572258,"shape":[]},
+    {"dtype":"F32","f32_hex":"3d976db7","kind":"v","layer":35,"max_abs":33.125,"name":"model.language_model.layers.35.self_attn.v_scale","p99_99_abs_upper_bound":6.236017600951348,"p99_9_abs_upper_bound":1.9465744175792332,"saturation_ratio":0.0,"scale":0.0739397332072258,"shape":[]},
+    {"dtype":"F32","f32_hex":"3cdc2493","kind":"k","layer":39,"max_abs":12.0390625,"name":"model.language_model.layers.39.self_attn.k_scale","p99_99_abs_upper_bound":9.110309078053533,"p99_9_abs_upper_bound":7.09189843422443,"saturation_ratio":0.0,"scale":0.02687290869653225,"shape":[]},
+    {"dtype":"F32","f32_hex":"3d10db6e","kind":"v","layer":39,"max_abs":15.84375,"name":"model.language_model.layers.39.self_attn.v_scale","p99_99_abs_upper_bound":4.098671171588543,"p99_9_abs_upper_bound":2.863100128039026,"saturation_ratio":0.0,"scale":0.0353655144572258,"shape":[]},
+    {"dtype":"F32","f32_hex":"3ca92493","kind":"k","layer":43,"max_abs":9.25,"name":"model.language_model.layers.43.self_attn.k_scale","p99_99_abs_upper_bound":6.321015050611298,"p99_9_abs_upper_bound":5.124537751085858,"saturation_ratio":0.0,"scale":0.02064732275903225,"shape":[]},
+    {"dtype":"F32","f32_hex":"3c5cdb6e","kind":"v","layer":43,"max_abs":6.0390625,"name":"model.language_model.layers.43.self_attn.v_scale","p99_99_abs_upper_bound":3.022417845327891,"p99_9_abs_upper_bound":1.6659303960841396,"saturation_ratio":0.0,"scale":0.01348005048930645,"shape":[]},
+    {"dtype":"F32","f32_hex":"3d0d36dc","kind":"k","layer":47,"max_abs":15.4453125,"name":"model.language_model.layers.47.self_attn.k_scale","p99_99_abs_upper_bound":10.937202537954542,"p99_9_abs_upper_bound":7.385858508599907,"saturation_ratio":0.0,"scale":0.0344761461019516,"shape":[]},
+    {"dtype":"F32","f32_hex":"3cab924a","kind":"v","layer":47,"max_abs":9.3828125,"name":"model.language_model.layers.47.self_attn.v_scale","p99_99_abs_upper_bound":4.44549401337927,"p99_9_abs_upper_bound":3.002028139252851,"saturation_ratio":0.0,"scale":0.0209437794983387,"shape":[]}
+  ]
+}

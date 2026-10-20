@@ -5,7 +5,7 @@
 Describe the problem, resulting behavior and affected ReVolta configuration.
 For an upstream fix, include its source commit and any adaptations.
 Link related issues and explain whether an existing pull request overlaps.
-State any effect on the support scope in roadmap W10 and `.github/SUPPORT.md`.
+State any effect on the support matrix in the README and `.github/SUPPORT.md`.
 
 ## Validation
 

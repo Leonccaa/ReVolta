@@ -1,26 +1,48 @@
 name: Bug report
 description: Report a ReVolta problem with a reproducible configuration.
+labels: ["bug"]
 body:
   - type: markdown
     attributes:
       value: |
-        Issue support follows the roadmap W10 support table, reproduced in
-        [the support scope](../blob/HEAD/.github/SUPPORT.md).
-        Four V100s and Qwen3.8 Flash-Next are the release focus. NVLink is
-        unverified. Remove credentials and private information from logs.
-        Report vulnerabilities through GitHub private vulnerability reporting.
+        **Support scope for 0.1.0** (see the support matrix in the README):
+
+        - **Validated:** 4 × V100 32 GB PCIe, TP4 + DCP2, Qwen3.8 Flash-Next
+          (multimodal) with the AWQ g32, standard NVFP4 or NVIDIA FP4-Local
+          checkpoints; E4M3 or INT8 KV cache; KV offload off, CPU, or CPU + SSD;
+          PCIe switch with P2P. PCIe without P2P was validated by disabling P2P on
+          P2P-capable hardware.
+        - **Unverified, best effort:** NVLink, TP2/TP8, V100 16 GB, other GPU counts,
+          other models and other topologies.
+        - **Out of scope:** GPUs other than SM70, ROCm/CPU/XPU/TPU, GGUF.
+          INT8 KV with the SSD tier is not supported in 0.1.0.
+
+        Remove credentials, tokens and private paths from logs.
+        Report security vulnerabilities through GitHub private vulnerability
+        reporting, not in a public issue.
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Support scope
+      description: Which part of the support matrix does your configuration match?
+      options:
+        - Validated configuration
+        - Unverified configuration (best effort)
+        - Not sure
+    validations:
+      required: true
   - type: textarea
     id: problem
     attributes:
       label: Problem and reproduction
-      description: Include expected behavior, actual behavior and minimal steps.
+      description: Expected behavior, actual behavior and minimal steps, including the failing request if possible.
     validations:
       required: true
   - type: input
     id: gpu
     attributes:
       label: GPU model, count and memory per GPU
-      placeholder: 4 x NVIDIA V100 PCIe, 32 GB each
+      placeholder: 4 x Tesla V100 PCIe, 32 GB each
     validations:
       required: true
   - type: dropdown
@@ -28,38 +50,74 @@ body:
     attributes:
       label: GPU interconnect
       options:
-        - PCIe + PEX switch + P2P
+        - PCIe switch with P2P
         - PCIe without P2P
         - NVLink (unverified)
-        - Other (describe in reproduction)
+        - Other (describe in the reproduction)
+    validations:
+      required: true
+  - type: textarea
+    id: topology
+    attributes:
+      label: Output of `nvidia-smi topo -m`
+      render: text
     validations:
       required: true
   - type: input
     id: host-memory
     attributes:
-      label: Host memory and any container memory limit
-      placeholder: 128 GiB host, 128 GiB container limit
+      label: Host memory, container memory limit and /dev/shm size
+      placeholder: 128 GiB host, 128 GiB container limit, 128 GiB shm
     validations:
       required: true
   - type: input
     id: checkpoint
     attributes:
-      label: Checkpoint, revision and quantization format
+      label: Checkpoint repository and revision
+      placeholder: <owner>/<repository> @ <revision>
+    validations:
+      required: true
+  - type: dropdown
+    id: kv-dtype
+    attributes:
+      label: KV cache dtype
+      options:
+        - fp8_e4m3
+        - int8
+        - auto / float16
+    validations:
+      required: true
+  - type: dropdown
+    id: offload
+    attributes:
+      label: KV offload mode
+      options:
+        - "Off"
+        - CPU
+        - CPU + SSD tier
     validations:
       required: true
   - type: textarea
     id: command
     attributes:
-      label: Complete launch command and relevant environment variables
-      description: Include KV offload settings. Remove tokens and private paths.
+      label: Complete launch command and environment variables
+      description: Include --speculative-config and --kv-transfer-config, and every VLLM_*, NCCL_* and PYTORCH_* variable you set.
       render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: startup
+    attributes:
+      label: Startup log lines
+      description: The `ReVolta profile {...}` line and the `SM70 interconnect=` lines from each worker.
+      render: text
     validations:
       required: true
   - type: textarea
     id: versions
     attributes:
-      label: ReVolta version or commit and environment
-      description: Include OS, installation method, Python, torch, CUDA and driver versions.
+      label: ReVolta version and environment
+      description: Output of `vllm --version`, installation method (wheel or Docker image tag), OS, Python, torch, CUDA and NVIDIA driver versions.
     validations:
       required: true
   - type: textarea

@@ -1,21 +1,24 @@
 # ReVolta 0.1.0 support scope
 
-Issue support follows the support table in roadmap W10. This public copy states
-the release scope; validation status and release instructions belong in the
-[README](../README.md). A support target does not imply that release acceptance
-has already completed.
+The [support matrix in the README](../README.md#support-matrix) is the reference.
+In short:
 
 | Area | Scope |
 | --- | --- |
-| GPUs | Four NVIDIA V100 GPUs |
-| PCIe with a PEX switch and P2P | Supported |
-| PCIe without P2P | Supported; validation uses P2P-disabled simulation |
-| NVLink | Upstream topology path and an explicit override are intended; hardware validation is unavailable, so this configuration is unverified |
-| Host memory | 128 GB recommended, not required; the minimum with KV offload disabled still needs measurement |
-| KV offload | Disabled, CPU, or CPU plus SSD |
-| Models | QSA models; acceptance currently covers only Qwen3.8 Flash-Next |
-| Checkpoints | AWQ g32; `nvidia/Qwen3.8-Flash-Next-FP4-Local`; standard NVFP4 `RadixArk/Qwen3.8-Flash-Next-NVFP4` |
+| GPUs | 4 × NVIDIA V100 32 GB PCIe |
+| PCIe switch with P2P | Validated |
+| PCIe without P2P | Validated by disabling P2P on P2P-capable hardware; about 30–55% of P2P speed |
+| NVLink | Unverified (no hardware available); the upstream topology path and `VLLM_SM70_INTERCONNECT` override exist |
+| Host memory | 128 GiB recommended; 80 GiB measured minimum with KV offload off |
+| KV offload | Off, CPU, or CPU + SSD tier |
+| KV cache | E4M3 (default) or INT8; INT8 with the SSD tier is not supported |
+| Models | Qwen3.8 Flash-Next (QSA, multimodal) |
+| Checkpoints | AWQ g32, standard NVFP4 `RadixArk/Qwen3.8-Flash-Next-NVFP4`, `nvidia/Qwen3.8-Flash-Next-FP4-Local` |
 
-Other hardware, models and inherited vLLM features are outside the 0.1.0 support
-commitment. Include the complete environment even when reporting an issue
-outside this scope. Never include credentials or private deployment details.
+Unverified configurations (NVLink, TP2/TP8, V100 16 GB, other models or
+topologies) are handled on a best-effort basis. Other GPU architectures,
+ROCm/CPU/XPU/TPU serving and GGUF are not built.
+
+Include the complete launch command and environment in every report. Never
+include credentials or private deployment details. Report security
+vulnerabilities through GitHub private vulnerability reporting.

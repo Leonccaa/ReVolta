@@ -3,9 +3,13 @@
 
 import asyncio
 import json
+from copy import copy
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
+from tokenizers import AddedToken, Tokenizer, decoders, models, pre_tokenizers
+from transformers import PreTrainedTokenizerFast
 
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
@@ -18,6 +22,10 @@ from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.parser.abstract_parser import _WrappedParser
 from vllm.reasoning.qwen3_reasoning_parser import Qwen3ReasoningParser
 from vllm.tool_parsers.qwen3coder_tool_parser import Qwen3CoderToolParser
+from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
+from vllm.v1.engine.output_processor import OutputProcessor, RequestOutputCollector
+from vllm.v1.engine.parallel_sampling import ParentRequest
+from vllm.v1.outputs import LogprobsLists
 
 
 def _serving(parser_factory=None):
@@ -94,7 +102,7 @@ def _tokenizer():
     return tokenizer
 
 
-def _stream(serving, request, outputs, tokenizer=None):
+def _stream(serving, request, outputs, tokenizer=None, chat_template_kwargs=None):
     async def collect():
         lines = [
             line
@@ -106,6 +114,7 @@ def _stream(serving, request, outputs, tokenizer=None):
                 [],
                 tokenizer or _tokenizer(),
                 RequestResponseMetadata(request_id="test"),
+                chat_template_kwargs=chat_template_kwargs,
             )
         ]
         assert lines[-1] == "data: [DONE]\n\n"
@@ -269,3 +278,317 @@ def test_suppressed_logprobs_are_isolated_per_choice():
                     lp["token"] for lp in choice["logprobs"]["content"]
                 )
     assert tokens == {0: ["marker0", "answer0"], 1: ["marker1", "answer1"]}
+
+
+# Steps with empty delta text. The tests below do not hand-write the step
+# texts: the sampled token ids go through the real OutputProcessor (incremental
+# detokenizer, stop-string check and logprobs), one token per engine step, and
+# its RequestOutputs feed the streaming generator. A character split across
+# byte tokens and the stop-string look-back then leave some steps without text,
+# which the Qwen3 parsers answer with no delta.
+
+_STOP = "STOP-HERE"
+
+
+def _byte_tokenizer():
+    # Byte-level BPE without merges: every UTF-8 byte is its own token, so a
+    # CJK character or an emoji spans three or four tokens, as rare characters
+    # do in the Qwen vocabularies.
+    alphabet = sorted(pre_tokenizers.ByteLevel.alphabet())
+    backend = Tokenizer(models.BPE({c: i for i, c in enumerate(alphabet)}, []))
+    backend.pre_tokenizer = pre_tokenizers.ByteLevel(
+        add_prefix_space=False, use_regex=False
+    )
+    backend.decoder = decoders.ByteLevel()
+    backend.add_tokens(
+        [
+            AddedToken(token, special=False, normalized=False)
+            for token in ("<think>", "</think>", "<tool_call>", "</tool_call>")
+        ]
+    )
+    return PreTrainedTokenizerFast(tokenizer_object=backend)
+
+
+def _encode(tokenizer, text):
+    return tokenizer.encode(text, add_special_tokens=False)
+
+
+def _engine_outputs(request, tokenizer, prompt, completions):
+    params = request.to_sampling_params(64, {})
+    engine_request = EngineCoreRequest(
+        request_id="test",
+        external_req_id="test",
+        prompt_token_ids=_encode(tokenizer, prompt),
+        mm_features=None,
+        sampling_params=params,
+        pooling_params=None,
+        arrival_time=0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+    )
+    processor = OutputProcessor(tokenizer, log_stats=False)
+    queue = RequestOutputCollector(params.output_kind, "test")
+    parent = ParentRequest(engine_request) if params.n > 1 else None
+    sampled = {}
+    for index, completion in enumerate(completions):
+        child = copy(engine_request)
+        if parent is not None:
+            child.request_id, child.sampling_params = parent.get_child_info(index)
+        processor.add_request(child, "x", parent, index, queue)
+        sampled[child.request_id] = _encode(tokenizer, completion)
+    outputs = []
+    step = 0
+    while processor.has_unfinished_requests():
+        processor.process_outputs(
+            [
+                EngineCoreOutput(
+                    request_id=request_id,
+                    new_token_ids=[ids[step]],
+                    new_logprobs=None
+                    if params.logprobs is None
+                    else LogprobsLists(
+                        np.array([[ids[step]]]), np.array([[-0.5]]), np.array([1])
+                    ),
+                    # The last token hits max_tokens unless a stop string matched.
+                    finish_reason=FinishReason.LENGTH if step == len(ids) - 1 else None,
+                )
+                for request_id, ids in sampled.items()
+                if request_id in processor.request_states
+            ]
+        )
+        outputs.append(queue.get_nowait())
+        step += 1
+    return outputs
+
+
+def _qwen_stream(parser_kind, thinking, completions, monkeypatch, **kwargs):
+    monkeypatch.setattr(
+        _WrappedParser,
+        "tool_parser_cls",
+        Qwen3CoderToolParser if parser_kind in ("tool", "both") else None,
+    )
+    monkeypatch.setattr(
+        _WrappedParser,
+        "reasoning_parser_cls",
+        Qwen3ReasoningParser if parser_kind in ("reasoning", "both") else None,
+    )
+    tokenizer = _byte_tokenizer()
+    kwargs.setdefault("logprobs", True)
+    request = _request(
+        stream=True, tool_choice="auto", return_tokens_as_token_ids=True, **kwargs
+    )
+    # Qwen3.5 templates open <think> in the prompt; with thinking disabled
+    # they close it there as well.
+    prompt = "q<think>\n" if thinking else "q<think>\n\n</think>\n\n"
+    outputs = _engine_outputs(request, tokenizer, prompt, completions)
+    chunks = _stream(
+        _serving(_WrappedParser),
+        request,
+        outputs,
+        tokenizer,
+        chat_template_kwargs=None if thinking else {"enable_thinking": False},
+    )
+    return chunks, outputs, [_encode(tokenizer, c) for c in completions]
+
+
+def _choices(chunks):
+    choices: dict[int, list[dict]] = {}
+    for chunk in chunks:
+        for choice in chunk["choices"]:
+            if "role" not in choice["delta"]:
+                choices.setdefault(choice["index"], []).append(choice)
+    return choices
+
+
+def _logprob_ids(choice):
+    return [
+        int(lp["token"].removeprefix("token_id:"))
+        for lp in choice["logprobs"]["content"]
+    ]
+
+
+def _text(choices, field):
+    return "".join(choice["delta"].get(field) or "" for choice in choices)
+
+
+def _tool_calls(choices):
+    calls = [tc for choice in choices for tc in choice["delta"].get("tool_calls", [])]
+    names = [tc["function"]["name"] for tc in calls if tc["function"].get("name")]
+    arguments = "".join(tc["function"].get("arguments") or "" for tc in calls)
+    return names, json.loads(arguments) if arguments else None
+
+
+def _assert_empty_steps_keep_logprobs(
+    chunks, outputs, sampled, finish_reasons, return_token_ids=False
+):
+    steps: dict[int, list[CompletionOutput]] = {}
+    for output in outputs:
+        for completion in output.outputs:
+            steps.setdefault(completion.index, []).append(completion)
+    choices = _choices(chunks)
+    assert choices.keys() == steps.keys() == set(range(len(sampled)))
+    for index, ids in enumerate(sampled):
+        assert any(not step.text for step in steps[index])
+        # One chunk per engine step, carrying exactly that step's tokens, so
+        # every sampled token is streamed once and in order.
+        assert [_logprob_ids(c) for c in choices[index]] == [
+            list(step.token_ids) for step in steps[index]
+        ]
+        assert [i for c in choices[index] for i in _logprob_ids(c)] == ids
+        for choice, step in zip(choices[index], steps[index]):
+            if not step.text:
+                assert not choice["delta"].get("content")
+                assert not choice["delta"].get("reasoning")
+                assert not choice["delta"].get("tool_calls")
+            if return_token_ids:
+                assert choice["token_ids"] == list(step.token_ids)
+            else:
+                assert choice.get("token_ids") is None
+        assert [c.get("finish_reason") for c in choices[index]] == [None] * (
+            len(steps[index]) - 1
+        ) + [finish_reasons[index]]
+    return choices
+
+
+@pytest.mark.parametrize("include_reasoning", [False, True])
+@pytest.mark.parametrize("return_token_ids", [False, True])
+@pytest.mark.parametrize("thinking", [True, False])
+@pytest.mark.parametrize("parser_kind", ["reasoning", "both"])
+def test_split_character_logprobs_are_preserved(
+    parser_kind, thinking, return_token_ids, include_reasoning, monkeypatch
+):
+    # The detokenizer returns no text until the last byte of a character.
+    completion = "想🙂</think>\n\n好😀" if thinking else "好😀"
+    chunks, outputs, sampled = _qwen_stream(
+        parser_kind,
+        thinking,
+        [completion],
+        monkeypatch,
+        return_token_ids=return_token_ids,
+        include_reasoning=include_reasoning,
+    )
+    choices = _assert_empty_steps_keep_logprobs(
+        chunks, outputs, sampled, ["length"], return_token_ids
+    )
+    assert _text(choices[0], "reasoning") == ("想🙂" if thinking else "")
+    assert _text(choices[0], "content") == ("\n\n好😀" if thinking else "好😀")
+
+
+@pytest.mark.parametrize(
+    ("parser_kind", "thinking", "stop"),
+    [
+        ("tool", False, None),
+        ("tool", False, [_STOP]),
+        ("both", False, None),
+        ("both", False, [_STOP]),
+        ("both", True, None),
+    ],
+)
+def test_split_character_tool_call_logprobs_are_preserved(
+    parser_kind, thinking, stop, monkeypatch
+):
+    call = (
+        "<tool_call>\n<function=f>\n<parameter=x>\n值🙂\n"
+        "</parameter>\n</function>\n</tool_call>"
+    )
+    completion = ("想</think>\n\n" if thinking else "") + call + (_STOP if stop else "")
+    chunks, outputs, sampled = _qwen_stream(
+        parser_kind, thinking, [completion], monkeypatch, stop=stop
+    )
+    choices = _assert_empty_steps_keep_logprobs(
+        chunks, outputs, sampled, ["tool_calls" if stop else "length"]
+    )
+    assert _tool_calls(choices[0]) == (["f"], {"x": "值🙂"})
+    assert _text(choices[0], "reasoning") == ("想" if thinking else "")
+    assert _text(choices[0], "content") == ("\n\n" if thinking else "")
+
+
+@pytest.mark.parametrize("include_reasoning", [False, True])
+@pytest.mark.parametrize("return_token_ids", [False, True])
+@pytest.mark.parametrize("thinking", [True, False])
+@pytest.mark.parametrize("parser_kind", ["reasoning", "both"])
+def test_stop_string_lookback_logprobs_are_preserved(
+    parser_kind, thinking, return_token_ids, include_reasoning, monkeypatch
+):
+    # The detokenizer holds back len(stop) - 1 characters, so the first eight
+    # steps stream no text.
+    completion = ("planning</think>\n\n" if thinking else "") + f"answer {_STOP}"
+    chunks, outputs, sampled = _qwen_stream(
+        parser_kind,
+        thinking,
+        [completion],
+        monkeypatch,
+        stop=[_STOP],
+        return_token_ids=return_token_ids,
+        include_reasoning=include_reasoning,
+    )
+    choices = _assert_empty_steps_keep_logprobs(
+        chunks, outputs, sampled, ["stop"], return_token_ids
+    )
+    held_back = len(_STOP) - 1
+    assert [step.outputs[0].text for step in outputs[:held_back]] == [""] * held_back
+    # With thinking on, the text held back when </think> is sampled arrives in
+    # later steps, which the reasoning parser does not split correctly; only
+    # the logprobs are checked then.
+    if not thinking:
+        assert _text(choices[0], "content") == "answer "
+
+
+@pytest.mark.parametrize("stop", [None, [_STOP]])
+def test_empty_step_logprobs_are_isolated_per_choice(stop, monkeypatch):
+    if stop:
+        thinking, completions = False, [f"好😀 {_STOP}", "🙂ok"]
+        finish_reasons = ["stop", "length"]
+        reasoning, content = ["", ""], ["好😀 ", "🙂ok"]
+    else:
+        thinking, completions = True, ["想🙂</think>\n\n好😀", "🙂</think>\n\nok"]
+        finish_reasons = ["length", "length"]
+        reasoning, content = ["想🙂", "🙂"], ["\n\n好😀", "\n\nok"]
+    chunks, outputs, sampled = _qwen_stream(
+        "both", thinking, completions, monkeypatch, n=2, stop=stop
+    )
+    choices = _assert_empty_steps_keep_logprobs(
+        chunks, outputs, sampled, finish_reasons
+    )
+    for index in (0, 1):
+        assert _text(choices[index], "reasoning") == reasoning[index]
+        assert _text(choices[index], "content") == content[index]
+
+
+@pytest.mark.parametrize(
+    ("parser_kind", "thinking", "stop"),
+    [
+        ("reasoning", True, None),
+        ("both", True, None),
+        ("both", False, None),
+        ("both", False, [_STOP]),
+    ],
+)
+def test_empty_steps_without_logprobs_are_skipped(
+    parser_kind, thinking, stop, monkeypatch
+):
+    completion = "想🙂</think>\n\n好😀" if thinking else "好😀"
+    if stop:
+        completion += f" {_STOP}"
+    streams = {}
+    for logprobs in (False, True):
+        chunks, _, _ = _qwen_stream(
+            parser_kind,
+            thinking,
+            [completion],
+            monkeypatch,
+            logprobs=logprobs,
+            stop=stop,
+        )
+        streams[logprobs] = [
+            {k: v for k, v in choice.items() if k != "logprobs"}
+            for chunk in chunks
+            for choice in chunk["choices"]
+        ]
+    # Without logprobs, a step the parser suppresses sends no chunk. With
+    # logprobs, it sends an empty delta and nothing else changes.
+    assert all(c["delta"] or c.get("finish_reason") for c in streams[False])
+    kept = [c for c in streams[True] if c["delta"] or c.get("finish_reason")]
+    assert streams[False] == kept
+    assert len(kept) < len(streams[True])

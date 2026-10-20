@@ -28,8 +28,6 @@ logger = init_logger(__name__)
 
 _config_home = envs.VLLM_CONFIG_ROOT
 _USAGE_STATS_JSON_PATH = os.path.join(_config_home, "usage_stats.json")
-_USAGE_STATS_DO_NOT_TRACK_PATH = os.path.join(_config_home, "do_not_track")
-_USAGE_STATS_ENABLED = None
 _USAGE_STATS_SERVER = envs.VLLM_USAGE_STATS_SERVER
 
 _GLOBAL_RUNTIME_DATA = dict[str, str | int | bool]()
@@ -49,24 +47,15 @@ def set_runtime_usage_data(key: str, value: str | int | bool) -> None:
 
 
 def is_usage_stats_enabled():
-    """Determine whether or not we can send usage stats to the server.
-    The logic is as follows:
-    - By default, it should be enabled.
-    - Three environment variables can disable it:
-        - VLLM_DO_NOT_TRACK=1
-        - DO_NOT_TRACK=1
-        - VLLM_NO_USAGE_STATS=1
-    - A file in the home directory can disable it if it exists:
-        - $HOME/.config/vllm/do_not_track
-    """
-    global _USAGE_STATS_ENABLED
-    if _USAGE_STATS_ENABLED is None:
-        do_not_track = envs.VLLM_DO_NOT_TRACK
-        no_usage_stats = envs.VLLM_NO_USAGE_STATS
-        do_not_track_file = os.path.exists(_USAGE_STATS_DO_NOT_TRACK_PATH)
+    """ReVolta never sends usage stats.
 
-        _USAGE_STATS_ENABLED = not (do_not_track or no_usage_stats or do_not_track_file)
-    return _USAGE_STATS_ENABLED
+    Upstream vLLM reports anonymous usage to the vLLM project's server unless
+    VLLM_NO_USAGE_STATS=1, VLLM_DO_NOT_TRACK=1, DO_NOT_TRACK=1 or a
+    do_not_track file in VLLM_CONFIG_ROOT turns it off. That server belongs to
+    the vLLM project, not to this fork, so ReVolta keeps the report off
+    unconditionally; the switches above are still accepted and change nothing.
+    """
+    return False
 
 
 def _get_current_timestamp_ns() -> int:

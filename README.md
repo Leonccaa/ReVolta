@@ -156,6 +156,8 @@ The wheel metadata pins `torch==2.10.0`, `torchaudio==2.10.0` and
 `torchvision==0.25.0` to the CUDA 12.8 builds on `download.pytorch.org`, so pip
 installs them from there. Install the NVIDIA driver for CUDA 12.8 on the host.
 
+ReVolta does not send the anonymous usage statistics that upstream vLLM reports.
+
 Or use the Docker image:
 
 ```bash

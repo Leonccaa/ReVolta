@@ -218,7 +218,30 @@ class EncoderCacheManager:
             if request.mm_features[input_id].identifier in self.cached
         }
 
-    def free_encoder_input(self, request: Request, input_id: int) -> None:
+    @staticmethod
+    def _has_duplicate_in_progress(
+        request: Request, input_id: int, mm_hash: str
+    ) -> bool:
+        """Whether another occurrence of `mm_hash` in *request* is being
+        computed: it starts at or before the computed position and is not
+        finished. Such an occurrence was in range of the step that just ran,
+        so the request is about to read the entry again."""
+        for other_id, feature in enumerate(request.mm_features):
+            if other_id == input_id or feature.identifier != mm_hash:
+                continue
+            position = feature.mm_position
+            num_computed_tokens = request.num_computed_tokens
+            if (
+                position.offset
+                <= num_computed_tokens
+                < position.offset + position.length
+            ):
+                return True
+        return False
+
+    def free_encoder_input(
+        self, request: Request, input_id: int, *, force: bool = False
+    ) -> None:
         """Free the request's reference to the encoder input (`mm_data`)
 
         When the reference set for the corresponding `mm_hash` becomes empty,
@@ -227,11 +250,22 @@ class EncoderCacheManager:
 
         The entry is NOT physically freed until capacity is needed (e.g., by
         `can_allocate`).
+
+        `cached` holds one reference per request, not per occurrence. If the
+        request repeats the item (e.g. the same image in two turns) and
+        another occurrence is being computed, the reference is kept so the
+        entry cannot be evicted and re-encoded before the rest of that
+        occurrence is spliced in. The hold ends with that occurrence; it never
+        spans a different item, so a request cannot pin an entry that it must
+        evict to make room for its own next item. `force=True` (used by
+        `free`) drops the reference unconditionally.
         """
         req_id = request.request_id
         mm_hash = request.mm_features[input_id].identifier
         # The mm_hash not in cache or the req_id set is empty
         if not self.cached.get(mm_hash, None):
+            return
+        if not force and self._has_duplicate_in_progress(request, input_id, mm_hash):
             return
         self.cached[mm_hash].discard(req_id)
         if not self.cached[mm_hash]:
@@ -250,7 +284,7 @@ class EncoderCacheManager:
         """
         input_ids = self.get_cached_input_ids(request)
         for input_id in input_ids:
-            self.free_encoder_input(request, input_id)
+            self.free_encoder_input(request, input_id, force=True)
 
     def get_freed_mm_hashes(self) -> list[str]:
         """Get and clear the list of recently freed encoder cache entries.
@@ -376,6 +410,10 @@ class EncoderDecoderCacheManager(EncoderCacheManager):
         self.allocated = []
         return to_free
 
-    def free_encoder_input(self, request: Request, input_id: int) -> None:
+    def free_encoder_input(
+        self, request: Request, input_id: int, *, force: bool = False
+    ) -> None:
+        # Encoder-decoder inputs hold no shared references; `force` is moot.
+        del force
         num_encoder_embeds = request.get_num_encoder_embeds(input_id)
         self.num_free_slots += num_encoder_embeds

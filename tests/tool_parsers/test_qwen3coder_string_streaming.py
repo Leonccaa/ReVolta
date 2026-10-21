@@ -217,6 +217,11 @@ CASES = {
     "literal_close_then_newline_text": "a</parameter>\nnot a tag\nb",
     "inline_param_open": 'tag = "<parameter=path>inline"',
     "lt_heavy": "if a < b and b <= c: return a<b<c </ /p </param",
+    # A literal "<parameter=" that is not a real tag must not make the scan
+    # jump to the next ">", which belongs to the real closing tag.
+    "literal_param_prefix_no_gt": "Use the prefix <parameter= to start.",
+    "literal_param_prefix_code": 'PREFIX = "<parameter="\nEND = "</parameter"',
+    "literal_param_prefix_then_func_prefix": "see <parameter=foo </func",
 }
 
 
@@ -237,6 +242,46 @@ def test_streamed_args_match_non_streaming(tokenizer, case, burst):
         assert final.startswith(streamed), (streamed, final)
     assert streamed == final
     assert json.loads(final)["content"] == content
+
+
+@pytest.mark.parametrize("burst", [1, 5])
+@pytest.mark.parametrize(
+    "model_output,expected",
+    [
+        pytest.param(
+            # Last parameter without </parameter>: the literal prefix must not
+            # swallow </function> into the streamed value.
+            "<tool_call>\n<function=write>\n"
+            "<parameter=path>\n/tmp/out.txt\n</parameter>\n"
+            "<parameter=content>\nx <parameter=y\n</function>\n</tool_call>",
+            {"path": "/tmp/out.txt", "content": "x <parameter=y"},
+            id="missing_close_before_function_end",
+        ),
+        pytest.param(
+            "<tool_call>\n<function=configure>\n"
+            "<parameter=name>\nx <parameter=y\n</parameter>\n"
+            "<parameter=count>\n3\n</parameter>\n"
+            "</function>\n</tool_call>",
+            {"name": "x <parameter=y", "count": 3},
+            id="literal_prefix_then_typed_param",
+        ),
+    ],
+)
+def test_literal_parameter_prefix_keeps_structure(
+    tokenizer, model_output, expected, burst
+):
+    tools = [WRITE_TOOL, TYPED_TOOL]
+    request = ChatCompletionRequest(model=MODEL, messages=[], tools=tools)
+    parser = Qwen3CoderToolParser(tokenizer, tools=tools)
+    events = _stream(parser, tokenizer, model_output, request, burst)
+
+    final = _non_streaming_args(tokenizer, tools, model_output)
+    streamed = ""
+    for _, args, _ in events:
+        streamed += args
+        assert final.startswith(streamed), (streamed, final)
+    assert streamed == final
+    assert json.loads(final) == expected
 
 
 @pytest.mark.parametrize("burst", [1, 5])

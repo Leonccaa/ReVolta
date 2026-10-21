@@ -634,7 +634,9 @@ class Qwen3CoderToolParser(ToolParser):
                 )
                 if position in self._parameter_start_positions(text, config):
                     return position, True
-                search = end + 1
+                # A literal prefix is ordinary value text. Keep scanning right
+                # after it: the next ">" may belong to the real close tag.
+                search = position + len(self.parameter_prefix)
                 continue
             if suffix.startswith(self.parameter_end_token):
                 after = position + len(self.parameter_end_token)

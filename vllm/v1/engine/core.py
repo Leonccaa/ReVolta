@@ -7,7 +7,7 @@ import signal
 import threading
 import time
 from collections import defaultdict, deque
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager
 from enum import IntEnum
@@ -1733,12 +1733,14 @@ class EngineCoreProc(EngineCore):
 
                 # Reclaim buffers that zmq is finished with.
                 while pending and pending[-1][0].done:
-                    reuse_buffers.append(pending.pop()[2])
+                    reclaimed = pending.pop()[2]
+                    if len(reuse_buffers) < max_reuse_bufs:
+                        reuse_buffers.append(reclaimed)
 
                 buffer = reuse_buffers.pop() if reuse_buffers else bytearray()
                 buffers = encoder.encode_into(outputs, buffer)
-                tracker = sockets[client_index].send_multipart(
-                    buffers, copy=False, track=True
+                tracker = self._send_msg_tracking_payload(
+                    sockets[client_index], buffers
                 )
                 if not tracker.done:
                     ref = outputs if len(buffers) > 1 else None
@@ -1746,6 +1748,18 @@ class EngineCoreProc(EngineCore):
                 elif len(reuse_buffers) < max_reuse_bufs:
                     # Limit the number of buffers to reuse.
                     reuse_buffers.append(buffer)
+
+    @staticmethod
+    def _send_msg_tracking_payload(
+        socket: zmq.Socket, buffers: Sequence[bytes | bytearray | memoryview]
+    ) -> zmq.MessageTracker:
+        # send_multipart only tracks its last frame, which can be copied
+        # while the reusable msgpack payload is still being sent zero-copy.
+        flags = zmq.SNDMORE if len(buffers) > 1 else 0
+        tracker = socket.send(buffers[0], flags, copy=False, track=True)
+        if flags:
+            socket.send_multipart(buffers[1:], copy=False)
+        return tracker
 
     def _handle_mm_cache_miss(
         self, request: EngineCoreRequest, err: MultiModalCacheMissError

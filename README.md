@@ -196,8 +196,10 @@ def make_view(src: Path, dst: Path) -> None:
     config = json.loads((src / "config.json").read_text())
     text = config["text_config"]
     rope = dict(text["rope_parameters"])
+    # YaRN goes only into text_config. Write the outer default explicitly;
+    # otherwise the outer config inherits the YaRN values and fails to load.
+    config["rope_parameters"] = dict(rope)
     rope.update(YARN)
-    # YaRN goes only into text_config; the outer rope_type stays "default".
     text["rope_parameters"] = dict(rope)
     text["rope_scaling"] = dict(rope)
     (dst / "config.json").write_text(json.dumps(config, indent=2) + "\n")

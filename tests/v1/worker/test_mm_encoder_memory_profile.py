@@ -38,7 +38,7 @@ CACHE_BYTES = IMAGE_TOKENS * HIDDEN_SIZE * 2 * TP
 def test_qwen_maximum_dummy_image_and_video_shapes(monkeypatch):
     # The pinned checkpoint uses p16, merge 2 and a 4096**2 pixel limit.
     # Run its real resize/token arithmetic without downloading a checkpoint.
-    ctx = SimpleNamespace(get_merged_mm_kwargs=lambda kwargs: kwargs)
+    ctx = SimpleNamespace(get_merged_mm_kwargs=lambda kwargs: kwargs, tokenizer=None)
     info = Qwen3VLProcessingInfo(ctx)
     vision = SimpleNamespace(patch_size=16, spatial_merge_size=2, temporal_patch_size=2)
     processor = SimpleNamespace(size={"shortest_edge": 65536, "longest_edge": 16777216})

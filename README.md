@@ -165,18 +165,26 @@ The distribution name is `revolta` (version `0.1.1`). The Python import name and
 CLI are still **`vllm`** (`import vllm`, `vllm serve`); this is intentional. Only
 compute capability 7.0 is built, with CUDA 12.8, Python 3.12 and PyTorch 2.10.
 
-From the wheel attached to the GitHub release (Linux x86-64, Python 3.12):
+From PyPI (Linux x86-64 with glibc 2.34 or newer, Python 3.12):
 
 ```bash
 python3.12 -m venv /data/revolta/venv
 . /data/revolta/venv/bin/activate
-pip install "https://github.com/Leonccaa/ReVolta/releases/download/v0.1.1/revolta-0.1.1-cp312-cp312-linux_x86_64.whl"
+pip install revolta==0.1.1
 vllm --version          # 0.1.1
 ```
 
-The wheel metadata pins `torch==2.10.0`, `torchaudio==2.10.0` and
-`torchvision==0.25.0` to the CUDA 12.8 builds on `download.pytorch.org`, so pip
-installs them from there. Install the NVIDIA driver for CUDA 12.8 on the host.
+The wheel pins `torch==2.10.0`, `torchaudio==2.10.0` and `torchvision==0.25.0`,
+and pip installs them from PyPI. PyPI's `torch==2.10.0` is the CUDA 12.8 build.
+Install the NVIDIA driver for CUDA 12.8 on the host.
+
+The wheel attached to the GitHub release contains the same files. Only its metadata
+differs: it pins the same versions to the CUDA 12.8 builds on `download.pytorch.org`
+and has the generic `linux_x86_64` tag.
+
+```bash
+pip install "https://github.com/Leonccaa/ReVolta/releases/download/v0.1.1/revolta-0.1.1-cp312-cp312-linux_x86_64.whl"
+```
 
 ReVolta does not send the anonymous usage statistics that upstream vLLM reports.
 

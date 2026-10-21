@@ -259,6 +259,11 @@ def build_app(
     app.exception_handler(EngineGenerateError)(engine_error_handler)
     app.exception_handler(EngineDeadError)(engine_error_handler)
     app.exception_handler(GenerationError)(generation_error_handler)
+    # These already map to 400 in create_error_response. Register them with
+    # ExceptionMiddleware so ServerErrorMiddleware does not re-raise a handled
+    # parameter error to the ASGI server after sending the response.
+    for error_type in (ValueError, TypeError, OverflowError):
+        app.exception_handler(error_type)(exception_handler)
     app.exception_handler(Exception)(exception_handler)
 
     # Ensure --api-key option from CLI takes precedence over VLLM_API_KEY

@@ -360,7 +360,14 @@ class DelegatingParser(Parser):
         logprobs: list[Logprob] | None = None,
     ) -> list[ResponseOutputItem]:
         # First extract reasoning
-        reasoning, content = self.extract_reasoning(model_output, request)
+        if self._reasoning_parser is not None:
+            reasoning, content = (
+                self._reasoning_parser.extract_reasoning_with_token_ids(
+                    model_output, model_output_token_ids, request
+                )
+            )
+        else:
+            reasoning, content = self.extract_reasoning(model_output, request)
 
         # Then parse tool calls from the content
         tool_calls, content = self._parse_tool_calls(
@@ -686,9 +693,12 @@ class DelegatingParser(Parser):
                 current_token_ids=current_token_ids,
                 delta_token_ids=delta_token_ids,
             )
-            if self.is_reasoning_end_streaming(current_token_ids, delta_token_ids):
+            assert self._reasoning_parser is not None
+            if self._reasoning_parser.is_reasoning_output_end(
+                current_token_ids, delta_token_ids, current_text
+            ):
                 state.reasoning_ended = True
-                current_token_ids = self.extract_content_ids(delta_token_ids)
+                current_token_ids = self.extract_content_ids(current_token_ids)
                 current_text = (
                     delta_message.content
                     if delta_message and delta_message.content

@@ -150,6 +150,21 @@ class ReasoningParser:
             A tuple containing the reasoning content and the content.
         """
 
+    def extract_reasoning_with_token_ids(
+        self,
+        model_output: str,
+        token_ids: Sequence[int],
+        request: "ChatCompletionRequest | ResponsesRequest",
+    ) -> tuple[str | None, str | None]:
+        """Token-aware entry point; legacy parsers keep their existing split."""
+        return self.extract_reasoning(model_output, request)
+
+    def is_reasoning_output_end(
+        self, input_ids: Sequence[int], delta_ids: Sequence[int], text: str
+    ) -> bool:
+        """Whether the boundary text has reached the streaming parser."""
+        return self.is_reasoning_end_streaming(input_ids, delta_ids)
+
     @abstractmethod
     def extract_reasoning_streaming(
         self,

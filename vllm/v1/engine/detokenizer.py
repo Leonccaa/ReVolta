@@ -11,6 +11,7 @@ from tokenizers import Tokenizer
 from transformers import PreTrainedTokenizerFast
 
 from vllm.logger import init_logger
+from vllm.reasoning.qwen3_boundary import Qwen3ReasoningBoundary
 from vllm.tokenizers import TokenizerLike
 from vllm.tokenizers.detokenizer_utils import (
     convert_prompt_ids_to_tokens,
@@ -52,6 +53,7 @@ class IncrementalDetokenizer:
         cls,
         tokenizer: TokenizerLike | None,
         request: EngineCoreRequest,
+        reasoning_parser_name: str = "",
     ) -> "IncrementalDetokenizer":
         assert request.sampling_params is not None
 
@@ -61,10 +63,37 @@ class IncrementalDetokenizer:
 
         if USE_FAST_DETOKENIZER and isinstance(tokenizer, PreTrainedTokenizerFast):
             # Fast tokenizer => use tokenizers library DecodeStream.
-            return FastIncrementalDetokenizer(tokenizer, request)
+            detokenizer: BaseIncrementalDetokenizer = FastIncrementalDetokenizer(
+                tokenizer, request
+            )
+        else:
+            detokenizer = SlowIncrementalDetokenizer(tokenizer, request)
 
-        # Fall back to slow python-based incremental detokenization.
-        return SlowIncrementalDetokenizer(tokenizer, request)
+        # Opt in only on the Qwen chat path. reasoning_ended also controls
+        # grammar activation and may be True merely because reasoning is hidden;
+        # use the actual template switch and prompt state for stop matching.
+        if (
+            reasoning_parser_name == "qwen3"
+            and request.sampling_params.stop
+            and (
+                request.reasoning_ended is False
+                or request.reasoning_parser_kwargs is not None
+            )
+        ):
+            from vllm.reasoning.qwen3_reasoning_parser import Qwen3ReasoningParser
+
+            parser = Qwen3ReasoningParser(
+                tokenizer, **(request.reasoning_parser_kwargs or {})
+            )
+            if parser.thinking_enabled and not parser.is_reasoning_end(
+                request.prompt_token_ids or []
+            ):
+                detokenizer.reasoning_boundary = Qwen3ReasoningBoundary(
+                    parser.start_token_id,
+                    parser.end_token_id,
+                    parser.vocab.get("<tool_call>"),
+                )
+        return detokenizer
 
 
 class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
@@ -93,6 +122,7 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
 
         # Generation data
         self.output_text = ""
+        self.reasoning_boundary: Qwen3ReasoningBoundary | None = None
 
     def update(self, new_token_ids: list[int], stop_terminated: bool) -> str | None:
         """
@@ -121,7 +151,12 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
         token_offsets = [len(self.output_text)] if self.stop else None
         for new_token_id in new_token_ids:
             self.token_ids.append(new_token_id)
+            before = len(self.output_text)
             self.output_text += self.decode_next(new_token_id)
+            if self.reasoning_boundary is not None:
+                self.reasoning_boundary.observe(
+                    new_token_id, before, len(self.output_text)
+                )
             if token_offsets is not None:
                 token_offsets.append(len(self.output_text))
 
@@ -133,14 +168,22 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
 
         # 2) Evaluate stop strings.
         stop_string = None
-        if token_offsets is not None and self.num_output_tokens() > self.min_tokens:
+        boundary = self.reasoning_boundary
+        if (
+            token_offsets is not None
+            and self.num_output_tokens() > self.min_tokens
+            and (boundary is None or boundary.ended)
+        ):
             # Support min_tokens, see https://github.com/vllm-project/vllm/pull/22014
             stop_check_offset = token_offsets[max(self.min_tokens - num_prev_tokens, 0)]
+            content_start = boundary.content_start if boundary is not None else 0
+            assert content_start is not None
             stop = check_stop_strings(
                 output_text=self.output_text,
                 new_char_count=len(self.output_text) - stop_check_offset,
                 stop=self.stop,
                 include_in_output=self.include_stop_str_in_output,
+                start_offset=content_start,
             )
             if stop is not None:
                 stop_string, truncate_to = stop
@@ -166,6 +209,15 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
 
         # We return the full output text if the sequence is finished.
         buffer_length = 0 if finished else self.stop_buffer_length
+        if not finished and self.reasoning_boundary is not None:
+            # Never delay reasoning or its boundary marker. Otherwise token ids
+            # can reach the parser before their text and end its phase early.
+            content_start = self.reasoning_boundary.content_start
+            buffer_length = (
+                min(buffer_length, len(self.output_text) - content_start)
+                if content_start is not None
+                else 0
+            )
         if not delta:
             if not buffer_length:
                 return self.output_text
@@ -326,6 +378,7 @@ def check_stop_strings(
     new_char_count: int,
     stop: list[str],
     include_in_output: bool,
+    start_offset: int = 0,
 ) -> tuple[str, int] | None:
     """Check if any stop strings are matched and truncate sequence
     output text accordingly.
@@ -351,7 +404,10 @@ def check_stop_strings(
     for stop_str in stop:
         stop_string_len = len(stop_str)
         # Avoid searching already-searched text.
-        stop_index = output_text.find(stop_str, 1 - new_char_count - stop_string_len)
+        search_start = max(
+            start_offset, len(output_text) + 1 - new_char_count - stop_string_len
+        )
+        stop_index = output_text.find(stop_str, search_start)
         if stop_index == -1:
             continue
 

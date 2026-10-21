@@ -140,6 +140,11 @@ class AsyncLLM(EngineClient):
             log_stats=self.log_stats,
             stream_interval=self.vllm_config.scheduler_config.stream_interval,
             tracing_enabled=tracing_endpoint is not None,
+            reasoning_parser_name=(
+                vllm_config.reasoning_config.reasoning_parser
+                if vllm_config.reasoning_config is not None
+                else ""
+            ),
         )
 
         # EngineCore (starts the engine in background process).

@@ -875,11 +875,20 @@ class OpenAIServingChat(OpenAIServing):
                                 actual_call = actual_call[:-latest_delta_len]
 
                             # check to see if there's anything left to stream
-                            remaining_call = expected_call.replace(actual_call, "", 1)
-                            # set that as a delta message
-                            delta_message = self._create_remaining_args_delta(
-                                delta_message, remaining_call, index
-                            )
+                            # Only a suffix can extend bytes already sent.
+                            # See vllm-project/vllm#44017. On mismatch keep the
+                            # parser's delta; appending an object corrupts JSON.
+                            if expected_call.startswith(actual_call):
+                                remaining_call = expected_call[len(actual_call) :]
+                                delta_message = self._create_remaining_args_delta(
+                                    delta_message, remaining_call, index
+                                )
+                            else:
+                                logger.warning(
+                                    "Skipping tool argument flush: streamed "
+                                    "arguments are not a prefix (tool index %d)",
+                                    index,
+                                )
 
                         # Send the finish response for each request.n only once
                         # In OpenAI's API, when a tool is called, the
@@ -1130,8 +1139,8 @@ class OpenAIServingChat(OpenAIServing):
             if reasoning_parser:
                 # If the reasoning parser is enabled,
                 # tool calls are extracted exclusively from the content.
-                reasoning, content = reasoning_parser.extract_reasoning(
-                    output.text, request=request
+                reasoning, content = reasoning_parser.extract_reasoning_with_token_ids(
+                    output.text, output.token_ids, request=request
                 )
                 if not request.include_reasoning:
                     reasoning = None

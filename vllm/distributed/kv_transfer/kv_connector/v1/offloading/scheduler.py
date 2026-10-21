@@ -677,6 +677,11 @@ class OffloadingConnectorScheduler:
         for group_state in req_status.group_states:
             group_state.block_ids.clear()
 
+        # A preempted request can return before its stores have completed.
+        # Its preemption metadata will flush them before the next forward.
+        if req_status.transfer_jobs:
+            return None, False
+
         req_status.update_offload_keys()
         req_status.num_locally_computed_tokens = num_computed_tokens
 
@@ -1342,9 +1347,15 @@ class OffloadingConnectorScheduler:
         self.manager.reset_cache()
 
         # Reset store progress so active requests re-offload from block 0
-        for status in self._req_status.values():
+        finished_req_ids = []
+        for req_id, status in self._req_status.items():
+            status.transfer_jobs.clear()
+            if status.req.is_finished():
+                finished_req_ids.append(req_id)
             for group_state in status.group_states:
                 group_state.next_stored_block_idx = 0
+        for req_id in finished_req_ids:
+            del self._req_status[req_id]
 
         # Discard jobs and save job_counter to be able to discard worker responses
         self._stale_job_threshold = self._job_counter

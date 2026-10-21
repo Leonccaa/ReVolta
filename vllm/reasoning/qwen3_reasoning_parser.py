@@ -201,6 +201,24 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
                 )
             boundary.observe(token_id, len(before), len(after))
 
+    def _boundary_matches_text(
+        self, boundary: Qwen3ReasoningBoundary, text: str
+    ) -> bool:
+        """Check that token-derived offsets bracket the markers in text."""
+        start = boundary.reasoning_start
+        if start > len(text) or (start and not text[:start].endswith(self.start_token)):
+            return False
+        if boundary.content_start is None:
+            return True
+        end, content_start = boundary.reasoning_end, boundary.content_start
+        if end is None or not start <= end <= content_start <= len(text):
+            return False
+        if boundary.implicit_end:
+            return end == content_start and text.startswith(
+                self._tool_call_tag, content_start
+            )
+        return text[end:content_start] == self.end_token
+
     def extract_reasoning_with_token_ids(
         self,
         model_output: str,
@@ -211,6 +229,11 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
             return self.extract_reasoning(model_output, request)
         boundary = self._new_boundary()
         self._observe_boundary(boundary, token_ids, 0, model_output)
+        if not self._boundary_matches_text(boundary, model_output):
+            # Offsets come from decoding token prefixes. If that decode does
+            # not reproduce model_output around the markers, they would move
+            # the split silently; use the text-based split instead.
+            return self.extract_reasoning(model_output, request)
         reasoning = model_output[boundary.reasoning_start : boundary.reasoning_end]
         content = (
             model_output[boundary.content_start :]

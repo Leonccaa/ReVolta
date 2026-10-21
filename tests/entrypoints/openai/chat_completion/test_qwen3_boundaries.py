@@ -487,6 +487,27 @@ def test_empty_reasoning_non_streaming_unchanged(tok, text):
     )
 
 
+@pytest.mark.parametrize(
+    "generated,mutate",
+    [
+        pytest.param("思考</think>答案", lambda text: "✅" + text, id="extra_prefix"),
+        pytest.param("ab思考</think>答案", lambda text: text[1:], id="dropped_char"),
+        pytest.param("想<tool_call>x", lambda text: "✅" + text, id="implicit_tool"),
+        pytest.param("<think>A</think>B", lambda text: "x" + text, id="start_token"),
+    ],
+)
+def test_token_split_falls_back_on_decode_mismatch(tok, generated, mutate):
+    # The token-id split decodes token prefixes and applies their lengths to
+    # the detokenized text. When the two disagree, the offsets no longer
+    # bracket the markers and the text-based split must be used instead.
+    ids = encode(tok, generated)
+    text = mutate(tok.decode(ids))
+    parser = Qwen3ReasoningParser(tok)
+    expected = parser.extract_reasoning(text, _request())
+    assert expected[1] is not None
+    assert split(parser, text, ids) == expected
+
+
 def test_reasoning_delta_preserves_unset_content(tok):
     ids = encode(tok, "ordinary reasoning")
     parser = Qwen3ReasoningParser(tok)

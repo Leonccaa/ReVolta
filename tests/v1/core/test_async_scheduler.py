@@ -326,6 +326,7 @@ def test_prefix_caching_for_multi_turn():
 
 def test_abort_request_when_structured_output_fsm_cannot_advance():
     scheduler = object.__new__(AsyncScheduler)
+    scheduler.mixed_prefill_budget = Mock()
     request = create_requests(num_requests=1, num_tokens=1)[0]
     request.structured_output_request = Mock()
     request.structured_output_request.grammar = Mock(spec=StructuredOutputGrammar)

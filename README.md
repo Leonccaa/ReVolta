@@ -367,6 +367,8 @@ Replace `...` with the remaining arguments from step 4. Container notes:
 
 - The CPU KV pool is a file in `/dev/shm`. Make `--shm-size` larger than
   `cpu_bytes_to_use` (the validated container used 128g).
+  After an abnormal service exit, recreate the container to release leftover
+  CPU offload files in its private `/dev/shm`.
 - `--cap-add SYS_PTRACE` was required in the validated container: the workers share
   memory with each other through `pidfd_getfd`.
   Whether `seccomp=unconfined` is needed remains to be checked.

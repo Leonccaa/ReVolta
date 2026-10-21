@@ -8,8 +8,8 @@ Run Qwen3.8 Flash-Next for text, images, and video, with an OpenAI-compatible AP
   two 512K or four 256K contexts.
 - **Weight formats:** standard AWQ, NVFP4, and NVIDIA FP4-Local.
 - **KV formats:** FP8 E4M3, FP16, and INT8.
-- **Speed:** about **380 tokens/s total output at 8 concurrent requests** (512-token
-  responses, MTP4 on).
+- **Speed:** about **465 tokens/s total output at 8 concurrent requests** on NVLink
+  ([community result](https://github.com/Leonccaa/ReVolta/issues/2)), about 380 on our PCIe reference (512-token responses, MTP4 on).
 - **Cache reuse:** CPU memory and disk offload; a cached 32K document answered in **1.28 s vs 10.06 s** when recomputed.
 
 ## Measurements

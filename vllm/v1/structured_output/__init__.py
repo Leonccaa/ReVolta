@@ -204,10 +204,40 @@ class StructuredOutputManager:
                 # requests here.
                 self._grammar_bitmask[index].fill_(self._full_mask)
 
+    @staticmethod
+    def handle_runtime_error(request: "Request", exc: Exception) -> None:
+        structured_req = request.structured_output_request
+        assert structured_req is not None
+        # A failed matcher may already have advanced. Discard it permanently;
+        # attempting rollback or using it again can repeat the same failure.
+        structured_req.grammar = exc
+        request.resumable = False
+        logger.error(
+            "Structured output runtime failure for request %s; terminating request",
+            request.request_id,
+            exc_info=exc,
+        )
+
+    def _fill_request_bitmasks(self, batch: list[tuple["Request", int, bool]]) -> None:
+        assert self._grammar_bitmask is not None
+        for request, index, apply_bitmask in batch:
+            structured_req = request.structured_output_request
+            assert structured_req is not None
+            grammar = structured_req.grammar
+            if isinstance(grammar, Exception):
+                self._grammar_bitmask[index].fill_(self._full_mask)
+                continue
+            try:
+                assert isinstance(grammar, StructuredOutputGrammar)
+                self._fill_bitmasks(((grammar, index, apply_bitmask),))
+            except Exception as exc:
+                self.handle_runtime_error(request, exc)
+                self._grammar_bitmask[index].fill_(self._full_mask)
+
     def _async_submit_fill_bitmask(
-        self, batch: list[tuple[StructuredOutputGrammar, int, bool]]
+        self, batch: list[tuple["Request", int, bool]]
     ) -> Future:
-        return self.executor_for_fillmask.submit(self._fill_bitmasks, batch)
+        return self.executor_for_fillmask.submit(self._fill_request_bitmasks, batch)
 
     def grammar_bitmask(
         self,
@@ -252,15 +282,12 @@ class StructuredOutputManager:
             batch = []
             for req_id in structured_output_request_ids:
                 request = requests[req_id]
-                structured_output_request = request.structured_output_request
-                if TYPE_CHECKING:
-                    assert structured_output_request is not None
-                grammar = structured_output_request.grammar
-                if TYPE_CHECKING:
-                    assert isinstance(grammar, StructuredOutputGrammar)
-
-                apply_bitmask = self.should_fill_bitmask(request)
-                batch.append((grammar, cumulative_index, apply_bitmask))
+                try:
+                    apply_bitmask = self.should_fill_bitmask(request)
+                except Exception as exc:
+                    self.handle_runtime_error(request, exc)
+                    apply_bitmask = False
+                batch.append((request, cumulative_index, apply_bitmask))
                 if len(batch) == self.fill_bitmask_parallel_batch_size:
                     promises.append(self._async_submit_fill_bitmask(batch))
                     batch = []
@@ -276,75 +303,97 @@ class StructuredOutputManager:
             # Fallback to serial filling of bitmasks for small-batch-size cases
             for req_id in structured_output_request_ids:
                 request = requests[req_id]
-                structured_output_request = request.structured_output_request
-
-                if TYPE_CHECKING:
-                    assert structured_output_request is not None
-                grammar = structured_output_request.grammar
-                if TYPE_CHECKING:
-                    assert isinstance(grammar, StructuredOutputGrammar)
-                apply_bitmask = self.should_fill_bitmask(request)
-
-                reasoner = None if apply_bitmask else self._get_reasoner(request)
-                detect_reasoning_end = reasoner is not None
-                simulated_buf: list[int] | None = None
-                history_len = 0
-
-                state_advancements = 0
-                post_reasoning_end_in_window = False
                 req_tokens = scheduled_spec_decode_tokens.get(req_id, ())
-                for i, token in enumerate(req_tokens):
-                    self._fill_bitmasks(((grammar, cumulative_index, apply_bitmask),))
-                    advance_grammar = apply_bitmask
-                    if token == -1:
-                        apply_bitmask = False
-                        advance_grammar = False
-                    elif (
-                        detect_reasoning_end
-                        and reasoner is not None
-                        and not apply_bitmask
-                    ):
-                        if simulated_buf is None:
-                            history = list(request.all_token_ids)
-                            history_len = len(history)
-                            simulated_buf = history + list(req_tokens)
-                        simulated = simulated_buf[: history_len + i + 1]
-                        if reasoner.is_reasoning_end_streaming(simulated, [token]):
-                            # The marker belongs to reasoning. Constrain the
-                            # following draft rows, but do not advance the
-                            # grammar through this token.
-                            apply_bitmask = True
-                            advance_grammar = False
-                            post_reasoning_end_in_window = True
-                    if advance_grammar and not grammar.is_terminated():
-                        if post_reasoning_end_in_window:
-                            # These drafts were produced before their grammar
-                            # masks existed. Validate them without logging an
-                            # expected FSM error, then advance only valid rows.
-                            accepted = bool(grammar.validate_tokens([token]))
-                            if accepted:
-                                accepted = grammar.accept_tokens(req_id, [token])
-                        else:
-                            accepted = grammar.accept_tokens(req_id, [token])
-                        if accepted:
-                            state_advancements += 1
-                        elif not post_reasoning_end_in_window:
-                            raise AssertionError(
-                                (token, req_id, scheduled_spec_decode_tokens)
-                            )
-                    cumulative_index += 1
-
-                # Diffusion models do not sample a bonus position after their
-                # scheduled block. Autoregressive speculative decoding does.
+                start_index = cumulative_index
                 is_diffusion = bool(
                     getattr(self.vllm_config.model_config, "is_diffusion", False)
                 )
-                if not (is_diffusion and req_tokens):
-                    bonus_apply = self.should_fill_bitmask(request) or apply_bitmask
-                    self._fill_bitmasks(((grammar, cumulative_index, bonus_apply),))
-                    cumulative_index += 1
-                if state_advancements > 0:
-                    grammar.rollback(state_advancements)
+                num_rows = len(req_tokens) + int(not (is_diffusion and req_tokens))
+                structured_req = request.structured_output_request
+                assert structured_req is not None
+                if isinstance(structured_req.grammar, Exception):
+                    self._grammar_bitmask[start_index : start_index + num_rows].fill_(
+                        self._full_mask
+                    )
+                    cumulative_index += num_rows
+                    continue
+                try:
+                    structured_output_request = request.structured_output_request
+
+                    if TYPE_CHECKING:
+                        assert structured_output_request is not None
+                    grammar = structured_output_request.grammar
+                    if TYPE_CHECKING:
+                        assert isinstance(grammar, StructuredOutputGrammar)
+                    apply_bitmask = self.should_fill_bitmask(request)
+
+                    reasoner = None if apply_bitmask else self._get_reasoner(request)
+                    detect_reasoning_end = reasoner is not None
+                    simulated_buf: list[int] | None = None
+                    history_len = 0
+
+                    state_advancements = 0
+                    post_reasoning_end_in_window = False
+                    for i, token in enumerate(req_tokens):
+                        self._fill_bitmasks(
+                            ((grammar, cumulative_index, apply_bitmask),)
+                        )
+                        advance_grammar = apply_bitmask
+                        if token == -1:
+                            apply_bitmask = False
+                            advance_grammar = False
+                        elif (
+                            detect_reasoning_end
+                            and reasoner is not None
+                            and not apply_bitmask
+                        ):
+                            if simulated_buf is None:
+                                history = list(request.all_token_ids)
+                                history_len = len(history)
+                                simulated_buf = history + list(req_tokens)
+                            simulated = simulated_buf[: history_len + i + 1]
+                            if reasoner.is_reasoning_end_streaming(simulated, [token]):
+                                # The marker belongs to reasoning. Constrain the
+                                # following draft rows, but do not advance the
+                                # grammar through this token.
+                                apply_bitmask = True
+                                advance_grammar = False
+                                post_reasoning_end_in_window = True
+                        if advance_grammar and not grammar.is_terminated():
+                            if post_reasoning_end_in_window:
+                                # These drafts were produced before their grammar
+                                # masks existed. Validate them without logging an
+                                # expected FSM error, then advance only valid rows.
+                                accepted = bool(grammar.validate_tokens([token]))
+                                if accepted:
+                                    accepted = grammar.accept_tokens(req_id, [token])
+                            else:
+                                accepted = grammar.accept_tokens(req_id, [token])
+                            if accepted:
+                                state_advancements += 1
+                            elif not post_reasoning_end_in_window:
+                                raise AssertionError(
+                                    (token, req_id, scheduled_spec_decode_tokens)
+                                )
+                        cumulative_index += 1
+
+                    # Diffusion models do not sample a bonus position after their
+                    # scheduled block. Autoregressive speculative decoding does.
+                    if not (is_diffusion and req_tokens):
+                        bonus_apply = self.should_fill_bitmask(request) or apply_bitmask
+                        self._fill_bitmasks(((grammar, cumulative_index, bonus_apply),))
+                        cumulative_index += 1
+                    if state_advancements > 0:
+                        grammar.rollback(state_advancements)
+                except Exception as exc:
+                    self.handle_runtime_error(request, exc)
+                    # Execution was already scheduled. Keep valid sampler rows
+                    # and their offsets; the scheduler discards this request's
+                    # results and frees it after the in-flight step completes.
+                    cumulative_index = start_index + num_rows
+                    self._grammar_bitmask[start_index:cumulative_index].fill_(
+                        self._full_mask
+                    )
 
         bitmask_tensor = self._grammar_bitmask
         if cumulative_index < bitmask_tensor.shape[0]:

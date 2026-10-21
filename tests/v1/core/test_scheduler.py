@@ -2711,6 +2711,7 @@ def test_grammar_compile_error_finishes_only_request(async_grammar: bool):
 
 def test_abort_request_when_structured_output_fsm_cannot_advance():
     scheduler = object.__new__(Scheduler)
+    scheduler.mixed_prefill_budget = Mock()
     sampling_params = SamplingParams(ignore_eos=True, max_tokens=4)
     sampling_params.update_from_generation_config({}, EOS_TOKEN_ID)
 

@@ -71,7 +71,8 @@ class StructuredOutputRequest:
 
     @grammar.setter
     def grammar(
-        self, grammar: StructuredOutputGrammar | Future[StructuredOutputGrammar]
+        self,
+        grammar: StructuredOutputGrammar | Future[StructuredOutputGrammar] | Exception,
     ) -> None:
         self._grammar = grammar
 

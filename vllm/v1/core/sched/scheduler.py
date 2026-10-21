@@ -242,8 +242,8 @@ class Scheduler(SchedulerInterface):
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
 
-        # Grammar compilation failures to finish as per-request errors in
-        # update_from_output.
+        # Grammar compilation and runtime failures to finish as per-request
+        # errors in update_from_output, after consuming in-flight model output.
         self.grammar_compile_error_reqs: set[str] = set()
 
         # Encoder-related.
@@ -1927,6 +1927,15 @@ class Scheduler(SchedulerInterface):
                 # In this case, we use is_finished() to check.
                 continue
 
+            structured_req = request.structured_output_request
+            if structured_req is not None and isinstance(
+                structured_req.grammar, Exception
+            ):
+                # Matcher failure during mask fill/draft validation. The model
+                # step is complete, so blocks can now be safely released below.
+                self.grammar_compile_error_reqs.add(req_id)
+                continue
+
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
@@ -1980,33 +1989,44 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
 
-            if new_token_ids and self.structured_output_manager.should_advance(
-                request, new_token_ids=new_token_ids
-            ):
-                struct_output_request = request.structured_output_request
-                assert struct_output_request is not None
-                grammar = struct_output_request.grammar
-                assert isinstance(grammar, StructuredOutputGrammar)
-                # new_token_ids can be a mixed block of reasoning content, then
-                # the reasoning end marker, then the start of the grammar content.
-                # Trim the reasoning content so the grammar only sees grammar content.
-                advance_token_ids = (
-                    self.structured_output_manager.trim_reasoning_for_advance(
-                        request, new_token_ids
-                    )
-                )
-                if advance_token_ids and not grammar.accept_tokens(
-                    req_id, advance_token_ids
+            try:
+                if new_token_ids and self.structured_output_manager.should_advance(
+                    request, new_token_ids=new_token_ids
                 ):
-                    logger.error(
-                        "Unexpected: grammar rejected tokens %s for request %s. "
-                        "Terminating request.",
-                        advance_token_ids,
-                        req_id,
+                    struct_output_request = request.structured_output_request
+                    assert struct_output_request is not None
+                    grammar = struct_output_request.grammar
+                    assert isinstance(grammar, StructuredOutputGrammar)
+                    # new_token_ids can be a mixed block of reasoning content, then
+                    # the reasoning end marker, then the start of the grammar content.
+                    # Trim reasoning so the grammar only sees grammar content.
+                    advance_token_ids = (
+                        self.structured_output_manager.trim_reasoning_for_advance(
+                            request, new_token_ids
+                        )
                     )
-                    request.status = RequestStatus.FINISHED_ERROR
-                    request.resumable = False
-                    stopped = True
+                    if advance_token_ids and not grammar.accept_tokens(
+                        req_id, advance_token_ids
+                    ):
+                        logger.error(
+                            "Unexpected: grammar rejected tokens %s for request %s. "
+                            "Terminating request.",
+                            advance_token_ids,
+                            req_id,
+                        )
+                        request.status = RequestStatus.FINISHED_ERROR
+                        request.resumable = False
+                        stopped = True
+            except Exception as exc:
+                # Only structured-output processing is guarded here. Other
+                # scheduler/model errors retain their fatal error semantics.
+                if request.structured_output_request is None:
+                    raise
+                StructuredOutputManager.handle_runtime_error(request, exc)
+                request.status = RequestStatus.FINISHED_ERROR
+                request.resumable = False
+                new_token_ids = []
+                stopped = True
 
             routed_experts = None
             if (
@@ -2272,6 +2292,27 @@ class Scheduler(SchedulerInterface):
                 # in the decoder's KV cache.
                 self.encoder_cache_manager.free_encoder_input(request, input_id)
 
+    def _validate_grammar_draft_tokens(
+        self, request: Request, spec_token_ids: list[int]
+    ) -> list[int]:
+        try:
+            metadata = request.structured_output_request
+            if metadata is not None and isinstance(metadata.grammar, Exception):
+                self.grammar_compile_error_reqs.add(request.request_id)
+                return []
+            if self.structured_output_manager.should_advance(request):
+                assert metadata is not None
+                grammar = metadata.grammar
+                assert isinstance(grammar, StructuredOutputGrammar)
+                return grammar.validate_tokens(spec_token_ids)
+        except Exception as exc:
+            if request.structured_output_request is None:
+                raise
+            StructuredOutputManager.handle_runtime_error(request, exc)
+            self.grammar_compile_error_reqs.add(request.request_id)
+            return []
+        return spec_token_ids
+
     def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
         for req_id, spec_token_ids in zip(
             draft_token_ids.req_ids,
@@ -2290,9 +2331,9 @@ class Scheduler(SchedulerInterface):
                 continue
 
             # Add newly generated spec token ids to the request.
-            if self.structured_output_manager.should_advance(request):
-                metadata = request.structured_output_request
-                spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
+            spec_token_ids = self._validate_grammar_draft_tokens(
+                request, spec_token_ids
+            )
             request.spec_token_ids = list(spec_token_ids)
 
         if draft_token_ids.ddtree_payloads is None:
@@ -2388,9 +2429,9 @@ class Scheduler(SchedulerInterface):
             # row can still be used for diagnostics or async state repair.
             spec_token_ids = list(spec_token_ids[:orig_num_spec_tokens])
             # Filter out spec tokens which do not adhere to the grammar.
-            if self.structured_output_manager.should_advance(request):
-                metadata = request.structured_output_request
-                spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
+            spec_token_ids = self._validate_grammar_draft_tokens(
+                request, spec_token_ids
+            )
             # Pad to original number of spec tokens.
             num_invalid_tokens = orig_num_spec_tokens - len(spec_token_ids)
             if num_invalid_tokens:

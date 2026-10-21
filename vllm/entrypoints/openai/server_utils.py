@@ -376,7 +376,10 @@ async def generation_error_handler(req: Request, exc: GenerationError):
 
 
 async def exception_handler(req: Request, exc: Exception):
-    if req.app.state.args.log_error_stack:
+    err = create_error_response(exc)
+    if err.error.code == HTTPStatus.BAD_REQUEST:
+        logger.warning("Invalid request: %r", err.error.message)
+    elif req.app.state.args.log_error_stack:
         logger.error(
             "Exception caught. Request id: %s",
             req.state.request_metadata.request_id
@@ -384,12 +387,13 @@ async def exception_handler(req: Request, exc: Exception):
             else None,
         )
 
-    err = create_error_response(exc)
     return JSONResponse(err.model_dump(), status_code=err.error.code)
 
 
 async def http_exception_handler(req: Request, exc: HTTPException):
-    if req.app.state.args.log_error_stack:
+    if exc.status_code == HTTPStatus.BAD_REQUEST:
+        logger.warning("Invalid request: %r", sanitize_message(str(exc.detail)))
+    elif req.app.state.args.log_error_stack:
         logger.exception(
             "HTTPException caught. Request id: %s",
             req.state.request_metadata.request_id
@@ -407,14 +411,6 @@ async def http_exception_handler(req: Request, exc: HTTPException):
 
 
 async def validation_exception_handler(req: Request, exc: RequestValidationError):
-    if req.app.state.args.log_error_stack:
-        logger.exception(
-            "RequestValidationError caught. Request id: %s",
-            req.state.request_metadata.request_id
-            if hasattr(req.state, "request_metadata")
-            else None,
-        )
-
     param = None
     errors = exc.errors()
     for error in errors:
@@ -431,6 +427,8 @@ async def validation_exception_handler(req: Request, exc: RequestValidationError
         message = f"{exc_str} {errors_str}"
     else:
         message = exc_str
+
+    logger.warning("Invalid request: %r", sanitize_message(message))
 
     err = ErrorResponse(
         error=ErrorInfo(

@@ -1401,6 +1401,10 @@ class Worker(WorkerBase):
         """
         self._check_weight_transfer_engine()
 
+        from vllm.model_executor.model_loader.reload import validate_weight_reload
+
+        validate_weight_reload(self.model_runner.model)
+
         if self._weight_update_active:
             raise RuntimeError(
                 "start_weight_update called while a weight update is "
@@ -1437,6 +1441,10 @@ class Worker(WorkerBase):
             raise RuntimeError(
                 "start_weight_update must be called before update_weights."
             )
+
+        from vllm.model_executor.model_loader.reload import validate_weight_reload
+
+        validate_weight_reload(self.model_runner.model)
 
         # Parse dict into backend-specific typed dataclass
         typed_update_info = self.weight_transfer_engine.parse_update_info(update_info)

@@ -5,6 +5,8 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Mapping, Sequence
 from concurrent.futures import Executor, ThreadPoolExecutor
+from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, Generic, overload
 
@@ -24,6 +26,7 @@ from vllm.inputs import (
     TokensPrompt,
     build_enc_dec_input,
     embeds_input,
+    split_enc_dec_input,
     tokens_input,
 )
 from vllm.logger import init_logger
@@ -80,6 +83,9 @@ class BaseRenderer(ABC, Generic[_T]):
         self.api_process_rank = config.parallel_config._api_process_rank
 
         self.tokenizer = tokenizer
+        self._rendered_mm_hashes: ContextVar[list[str] | None] = ContextVar(
+            "rendered_mm_hashes", default=None
+        )
 
         # Thread pool executor for blocking tokenizer operations. The
         # multimodal processor
@@ -296,6 +302,27 @@ class BaseRenderer(ABC, Generic[_T]):
         clear_mm_cache_async. The work is submitted when this is called, so it
         runs before any rendering submitted later; awaiting is optional."""
         return self._invalidate_mm_cache_items_async(mm_hashes)
+
+    @contextmanager
+    def track_mm_cache_items(self):
+        """Track rendered items until the serving layer accepts the request."""
+        hashes: list[str] = []
+        token = self._rendered_mm_hashes.set(hashes)
+        try:
+            yield hashes
+        finally:
+            self._rendered_mm_hashes.reset(token)
+
+    @staticmethod
+    def get_mm_hashes(engine_input: EngineInput) -> list[str]:
+        encoder, decoder = split_enc_dec_input(engine_input)
+        return [
+            mm_hash
+            for inputs in (encoder, decoder)
+            if inputs is not None and inputs["type"] == "multimodal"
+            for hashes in inputs["mm_hashes"].values()
+            for mm_hash in hashes
+        ]
 
     def shutdown(self) -> None:
         mm_processor_cache = self.mm_processor_cache
@@ -928,6 +955,9 @@ class BaseRenderer(ABC, Generic[_T]):
             )
 
         engine_input["arrival_time"] = arrival_time
+
+        if (hashes := self._rendered_mm_hashes.get()) is not None:
+            hashes.extend(self.get_mm_hashes(engine_input))
 
         return engine_input
 

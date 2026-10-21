@@ -7,7 +7,7 @@ import time
 import warnings
 from collections.abc import AsyncGenerator, Iterable, Mapping
 from copy import copy
-from typing import Any
+from typing import Any, cast
 
 import torch
 
@@ -351,18 +351,25 @@ class AsyncLLM(EngineClient):
                     "latter will be used, and the former will be ignored."
                 )
         else:
-            request = self.input_processor.process_inputs(
-                request_id,
-                prompt,
-                params,
-                supported_tasks=await self.get_supported_tasks(),
-                arrival_time=arrival_time,
-                lora_request=lora_request,
-                tokenization_kwargs=tokenization_kwargs,
-                trace_headers=trace_headers,
-                priority=priority,
-                data_parallel_rank=data_parallel_rank,
-            )
+            try:
+                request = self.input_processor.process_inputs(
+                    request_id,
+                    prompt,
+                    params,
+                    supported_tasks=await self.get_supported_tasks(),
+                    arrival_time=arrival_time,
+                    lora_request=lora_request,
+                    tokenization_kwargs=tokenization_kwargs,
+                    trace_headers=trace_headers,
+                    priority=priority,
+                    data_parallel_rank=data_parallel_rank,
+                )
+            except Exception:
+                if isinstance(prompt, dict) and "type" in prompt:
+                    mm_hashes = self.renderer.get_mm_hashes(cast(EngineInput, prompt))
+                    if mm_hashes:
+                        await self.renderer.invalidate_mm_cache_items_async(mm_hashes)
+                raise
             prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
 
         if reasoning_ended is not None:

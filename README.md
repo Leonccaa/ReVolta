@@ -367,6 +367,8 @@ Replace `...` with the remaining arguments from step 4. Container notes:
 
 - The CPU KV pool is a file in `/dev/shm`. Make `--shm-size` larger than
   `cpu_bytes_to_use` (the validated container used 128g).
+  After an abnormal service exit, recreate the container to release leftover
+  CPU offload files in its private `/dev/shm`.
 - `--cap-add SYS_PTRACE` was required in the validated container: the workers share
   memory with each other through `pidfd_getfd`.
   Whether `seccomp=unconfined` is needed remains to be checked.
@@ -618,6 +620,9 @@ GGUF are outside the build.
 - **Memory.** The default GPU utilization of 0.95 passed multimodal stress. Retest
   memory use when changing concurrency or media limits. The AWQ PLE table always
   needs about 48 GiB of host memory.
+- **PLE cascade.** Profiling with `ple_disk_cascade=true` used about 4 GiB more
+  GPU memory per 32 GB card. This left room for about 345K context tokens.
+  Cascade is unsupported in 0.1.0 and 0.1.1. Keep it disabled.
 - **FP4-Local vision.** Keep the default vision-tower TP4. Forcing data parallelism
   removes the tested memory arrangement; request-level image settings can raise limits.
 - **NVFP4 scales.** Different gate/up global scales are not supported by the

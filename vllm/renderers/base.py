@@ -5,6 +5,8 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Mapping, Sequence
 from concurrent.futures import Executor, ThreadPoolExecutor
+from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, Generic, overload
 
@@ -24,6 +26,7 @@ from vllm.inputs import (
     TokensPrompt,
     build_enc_dec_input,
     embeds_input,
+    split_enc_dec_input,
     tokens_input,
 )
 from vllm.logger import init_logger
@@ -80,17 +83,20 @@ class BaseRenderer(ABC, Generic[_T]):
         self.api_process_rank = config.parallel_config._api_process_rank
 
         self.tokenizer = tokenizer
+        self._rendered_mm_hashes: ContextVar[list[str] | None] = ContextVar(
+            "rendered_mm_hashes", default=None
+        )
 
-        # Shared thread pool executor for blocking tokenizer and
-        # multimodal preprocessing operations.  The multimodal processor
+        # Thread pool executor for blocking tokenizer operations. The
+        # multimodal processor
         # receives a deep-copied tokenizer (see #36557) so it is safe to
         # run tokenization and MM preprocessing concurrently.
         pool_workers = config.model_config.renderer_num_workers
         self._executor = ThreadPoolExecutor(max_workers=pool_workers)
 
-        # Multimodal preprocessing is always offloaded to the thread pool
-        # to keep the asyncio event loop responsive under concurrent load.
-        self._mm_executor: Executor = self._executor
+        # Separate single-worker executor so tokenization never queues behind
+        # MM preprocessing; must stay single-worker per #38418 (P0/P1 order).
+        self._mm_executor: Executor = ThreadPoolExecutor(max_workers=1)
 
         # Lazy initialization since offline LLM doesn't use async
         self._async_tokenizer: AsyncMicrobatchTokenizer | None = None
@@ -99,10 +105,10 @@ class BaseRenderer(ABC, Generic[_T]):
         self._readonly_mm_processor: BaseMultiModalProcessor | None = None
         self._mm_cache_stats: MultiModalCacheStats | None = None
         self._clear_mm_cache_async = make_async(
-            self.clear_mm_cache, executor=self._executor
+            self.clear_mm_cache, executor=self._mm_executor
         )
         self._invalidate_mm_cache_items_async = make_async(
-            self.invalidate_mm_cache_items, executor=self._executor
+            self.invalidate_mm_cache_items, executor=self._mm_executor
         )
         self._process_multimodal_async = make_async(
             self._process_multimodal, executor=self._mm_executor
@@ -285,17 +291,38 @@ class BaseRenderer(ABC, Generic[_T]):
                 self._clear_processor_cache(self._readonly_mm_processor)
 
     async def clear_mm_cache_async(self) -> None:
-        """Serialize clear_mm_cache through the shared executor to avoid
+        """Serialize clear_mm_cache through the multimodal executor to avoid
         races with concurrent process_inputs on the mm_processor_cache."""
         await self._clear_mm_cache_async()
 
     def invalidate_mm_cache_items_async(
         self, mm_hashes: Sequence[str]
     ) -> Awaitable[None]:
-        """Run invalidate_mm_cache_items on the shared executor, like
+        """Run invalidate_mm_cache_items on the multimodal executor, like
         clear_mm_cache_async. The work is submitted when this is called, so it
         runs before any rendering submitted later; awaiting is optional."""
         return self._invalidate_mm_cache_items_async(mm_hashes)
+
+    @contextmanager
+    def track_mm_cache_items(self):
+        """Track rendered items until the serving layer accepts the request."""
+        hashes: list[str] = []
+        token = self._rendered_mm_hashes.set(hashes)
+        try:
+            yield hashes
+        finally:
+            self._rendered_mm_hashes.reset(token)
+
+    @staticmethod
+    def get_mm_hashes(engine_input: EngineInput) -> list[str]:
+        encoder, decoder = split_enc_dec_input(engine_input)
+        return [
+            mm_hash
+            for inputs in (encoder, decoder)
+            if inputs is not None and inputs["type"] == "multimodal"
+            for hashes in inputs["mm_hashes"].values()
+            for mm_hash in hashes
+        ]
 
     def shutdown(self) -> None:
         mm_processor_cache = self.mm_processor_cache
@@ -733,7 +760,7 @@ class BaseRenderer(ABC, Generic[_T]):
         skip_mm_cache: bool = False,
     ) -> TokensInput | MultiModalInput:
         """Process token inputs, with multimodal preprocessing offloaded
-        to the shared thread pool in the async variant.
+        to the multimodal executor in the async variant.
         """
         prompt_token_ids = prompt["prompt_token_ids"]
 
@@ -928,6 +955,9 @@ class BaseRenderer(ABC, Generic[_T]):
             )
 
         engine_input["arrival_time"] = arrival_time
+
+        if (hashes := self._rendered_mm_hashes.get()) is not None:
+            hashes.extend(self.get_mm_hashes(engine_input))
 
         return engine_input
 

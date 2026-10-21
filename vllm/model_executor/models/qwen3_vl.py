@@ -95,6 +95,7 @@ from vllm.multimodal.parse import ImageSize, MultiModalDataItems
 from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
     BaseMultiModalProcessor,
+    InputProcessingContext,
     PromptReplacement,
     PromptUpdate,
     PromptUpdateDetails,
@@ -868,6 +869,26 @@ class Qwen3_VisionTransformer(nn.Module):
 
 
 class Qwen3VLProcessingInfo(Qwen2VLProcessingInfo):
+    def __init__(self, ctx: InputProcessingContext) -> None:
+        super().__init__(ctx)
+        if ctx.tokenizer is None:
+            return
+        config = self.get_hf_config()
+        vocab = ctx.tokenizer.get_vocab()
+        for name, token in (
+            ("image_token_id", "<|image_pad|>"),
+            ("video_token_id", "<|video_pad|>"),
+            ("vision_start_token_id", "<|vision_start|>"),
+            ("vision_end_token_id", "<|vision_end|>"),
+        ):
+            config_id = getattr(config, name)
+            tokenizer_id = vocab.get(token)
+            if tokenizer_id is None or config_id != tokenizer_id:
+                raise ValueError(
+                    f"Visual token mismatch for {name}: config={config_id}, "
+                    f"tokenizer={tokenizer_id} ({token})."
+                )
+
     def get_hf_config(self):
         return self.ctx.get_hf_config(Qwen3VLConfig)
 

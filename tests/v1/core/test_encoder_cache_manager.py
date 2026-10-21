@@ -335,3 +335,89 @@ def test_encoder_decoder_cache_manager_reset_allows_fresh_allocations():
 
     assert manager.num_free_slots == 2
     assert "img2" in manager.allocated
+
+
+# ------------- Repeated items within one request (upstream #54284) ------------- #
+class PositionedMockRequest(MockRequest):
+    """MockRequest with placeholder offsets and a computed-token cursor."""
+
+    def __init__(self, request_id, mm_hashes, offsets, token_counts):
+        super().__init__(request_id, mm_hashes, token_counts)
+        for feature, offset, length in zip(self.mm_features, offsets, token_counts):
+            feature.mm_position = PlaceholderRange(offset=offset, length=length)
+        self.num_computed_tokens = 0
+
+
+def test_duplicate_mm_hash_stays_referenced_while_next_occurrence_runs():
+    """`cached` holds one reference per request, not per occurrence, so
+    freeing the first of two occurrences must not release the entry while
+    the second one is still being computed."""
+    manager = EncoderCacheManager(cache_size=20)
+    req = PositionedMockRequest("r1", ["imgA", "imgA"], [0, 10], [4, 4])
+
+    manager.allocate(req, 0)
+    req.num_computed_tokens = 12  # first consumed, second half computed
+    manager.free_encoder_input(req, 0)
+    assert manager.cached["imgA"] == {"r1"}
+    assert "imgA" not in manager.freeable
+    assert manager.num_freeable_slots == 16
+
+    assert manager.check_and_update_cache(req, 1)
+    req.num_computed_tokens = 14  # both occurrences consumed
+    manager.free_encoder_input(req, 0)
+    manager.free_encoder_input(req, 1)
+    assert not manager.cached["imgA"]
+    assert manager.freeable["imgA"] == 4
+    assert manager.num_freeable_slots == 20
+
+
+def test_duplicate_mm_hash_is_not_evicted_before_last_use():
+    """An item repeated within one request must not become reclaimable
+    capacity while an occurrence is still being spliced in, or the encoder
+    recomputes it."""
+    manager = EncoderCacheManager(cache_size=8)
+    req = PositionedMockRequest("r1", ["imgA", "imgA"], [0, 10], [4, 4])
+    other = MockRequest("r2", ["imgB"], [8])
+
+    manager.allocate(req, 0)
+    req.num_computed_tokens = 10  # the second occurrence starts next
+    manager.free_encoder_input(req, 0)
+
+    assert not manager.can_allocate(other, 0, int(1e9), 0)
+    assert manager.check_and_update_cache(req, 1)
+    assert manager.get_freed_mm_hashes() == []
+
+
+def test_duplicate_mm_hash_not_started_does_not_pin_the_entry():
+    """The reference is not held across a gap: the request may need the space
+    for a different item first (e.g. images A, C, A that do not all fit)."""
+    manager = EncoderCacheManager(cache_size=8)
+    req = PositionedMockRequest("r1", ["imgA", "imgC", "imgA"], [0, 6, 14], [4, 6, 4])
+
+    manager.allocate(req, 0)
+    req.num_computed_tokens = 4
+    manager.free_encoder_input(req, 0)
+    assert not manager.cached["imgA"]
+    assert manager.can_allocate(req, 1, int(1e9), 0)
+    assert manager.get_freed_mm_hashes() == ["imgA"]
+
+
+def test_free_request_releases_duplicate_in_progress():
+    """Finishing, aborting or preempting a request (`free`) releases its
+    reference even while a repeated item is being computed."""
+    manager = EncoderCacheManager(cache_size=20)
+    req = PositionedMockRequest("r1", ["imgA", "imgB", "imgA"], [0, 6, 12], [4, 2, 4])
+
+    manager.allocate(req, 0)
+    manager.allocate(req, 1)
+    req.num_computed_tokens = 13
+    manager.free_encoder_input(req, 0)
+    manager.free_encoder_input(req, 1)
+    assert manager.cached["imgA"] == {"r1"}
+
+    manager.free(req)
+    assert not manager.cached["imgA"]
+    assert not manager.cached["imgB"]
+    assert manager.num_freeable_slots == 20
+    manager.free(req)  # idempotent
+    assert manager.num_freeable_slots == 20

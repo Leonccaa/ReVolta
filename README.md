@@ -507,20 +507,13 @@ about 126 GiB. Add the 24 calibrated scales from
 [the QSA E4M3 scale pack](https://huggingface.co/leoncca/Qwen3.8-Flash-Next-NVFP4-QSA-FP8-E4M3-KV-Scales)
 to the model index.
 
-Use `--quantization modelopt_mixed` and:
-
-```bash
-export VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE=1
-export VLLM_SM70_NVFP4_QWEN38_MOE_RAW_GROUPED_DECODE=1
-export VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE=1
-export VLLM_SM70_NVFP4_MOE_GROUPED_DECODE=0
-export VLLM_SM70_NVFP4_TURBOMIND=1 VLLM_SM70_FP8_TURBOMIND=1 VLLM_SM70_FP4_TURBOMIND=1
-export VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL=1 VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES=1
-export VLLM_V2_CUDAGRAPH_MEM_MIB=700
-```
-
-These switches are not yet in the automatic profile. Validation used the FP8 MTP
-draft from the Uncensored AWQ repository, with 62.5% acceptance.
+Use `--quantization modelopt_mixed`. On the FP16 QSA SM70 TP4 profile,
+ReVolta detects NVFP4 weights from checkpoint quantization metadata and sets
+the validated kernel switches and a 700 MiB CUDA graph reserve automatically.
+Explicit environment settings take precedence. The startup profile audit logs
+each value and its source (`profile`, `environment`, or `upstream_default`).
+Validation used the FP8 MTP draft from the Uncensored AWQ repository, with
+62.5% acceptance.
 
 ### NVIDIA FP4-Local
 
@@ -536,7 +529,7 @@ The PLE table uses about 26.8 GiB of pinned host memory across four ranks.
 Use the checkpoint's own MTP layer with `"kv_cache_dtype": "float16"` and no draft
 `model` field. Measured acceptance was 65.1%.
 
-Use `--quantization modelopt_mixed` and the NVFP4 environment above. The checkpoint has
+Use `--quantization modelopt_mixed`; the same automatic NVFP4 profile applies. The checkpoint has
 no QSA E4M3 KV scales; download the calibrated 24-scale pack
 [`leoncca/Qwen3.8-Flash-Next-FP4-Local-QSA-FP8-E4M3-KV-Scales`](https://huggingface.co/leoncca/Qwen3.8-Flash-Next-FP4-Local-QSA-FP8-E4M3-KV-Scales)
 (tag `v1.0-base-b9ce18a6`) and build a checkpoint view with its `materialize_overlay.py`.

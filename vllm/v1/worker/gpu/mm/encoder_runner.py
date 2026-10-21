@@ -4,9 +4,12 @@ import numpy as np
 import torch
 
 from vllm import envs
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsMultiModal
+from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.inputs import MultiModalKwargsItem
+from vllm.multimodal.registry import MultiModalRegistry
 from vllm.multimodal.utils import group_and_batch_mm_kwargs
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
@@ -34,6 +37,70 @@ class EncoderRunner:
         self.inputs_embeds = torch.zeros(
             max_num_tokens, hidden_size, dtype=dtype, device=device
         )
+
+    def profile(
+        self, vllm_config: VllmConfig, mm_registry: MultiModalRegistry
+    ) -> torch.Tensor | None:
+        """Profile replicated encoders and retain cache space for the decoder.
+
+        An item is indivisible in data TP mode: a single maximum-size image
+        runs entirely on one rank. Use the real item assignment, without
+        dividing the encoder budget by TP. KV allocation takes the minimum
+        block count across ranks, so the busiest encoder rank limits every
+        rank's KV pool. Weight TP profiling intentionally stays unchanged.
+        """
+        mm_config = vllm_config.model_config.get_multimodal_config()
+        if mm_config.mm_encoder_tp_mode != "data" or mm_config.skip_mm_profiling:
+            return None
+
+        budget = MultiModalBudget(vllm_config, mm_registry)
+        if budget.encoder_cache_size == 0:
+            return None
+
+        # Data TP may return views into a padded all-gather: one item's
+        # backing storage can be TP times its logical size. Reserve that
+        # full-cache upper bound on every rank, also during encoder execution,
+        # and keep it alive through the max_num_batched_tokens decoder profile.
+        encoder_cache = torch.empty(
+            budget.encoder_cache_size
+            * vllm_config.parallel_config.tensor_parallel_size,
+            self.hidden_size,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        for modality, num_items in budget.mm_max_items_per_batch.items():
+            if num_items == 0:
+                continue
+            # Profile each enabled tower modality: the one with the most
+            # output tokens need not have the largest activation peak.
+            dummy_inputs = mm_registry.get_dummy_mm_inputs(
+                vllm_config.model_config,
+                mm_counts={modality: 1},
+                processor=budget.processor,
+            )
+            dummy_item = dummy_inputs["mm_kwargs"][modality][0]
+            assert dummy_item is not None
+            logger.info(
+                "Profiling data-parallel encoder with %d maximum-size %s "
+                "items and %d encoder cache tokens (%d reserved bytes) per rank",
+                num_items,
+                modality,
+                budget.encoder_cache_size,
+                encoder_cache.nbytes,
+            )
+            for _, batch_size, kwargs in group_and_batch_mm_kwargs(
+                [(modality, dummy_item)] * num_items,
+                device=self.device,
+                pin_memory=False,
+            ):
+                # Do not use execute_mm_encoder: its optional diagnostic
+                # logging resets peak stats and would discard earlier peaks.
+                outputs = self.model.embed_multimodal(**kwargs)
+                sanity_check_mm_encoder_outputs(outputs, expected_num_items=batch_size)
+                del outputs
+            del kwargs, dummy_inputs, dummy_item
+        budget.reset_cache()
+        return encoder_cache
 
     def prepare_mm_inputs(
         self, scheduled_encoder_inputs: dict[str, list[int]]

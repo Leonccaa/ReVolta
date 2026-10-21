@@ -38,7 +38,18 @@ AWQ_DEFAULTS = {
     "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT": "8",
     "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_PACK_ROWS": "24",
     "VLLM_SM70_AWQ_TUNE_SMALL_SHAPES": "1",
-    # Measured for the AWQ TP4 graph pool. NVFP4 retains automatic measurement.
+    # Measured for the AWQ TP4 graph pool.
+    "VLLM_V2_CUDAGRAPH_MEM_MIB": "700",
+}
+NVFP4_DEFAULTS = {
+    "VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE": "1",
+    "VLLM_SM70_NVFP4_QWEN38_MOE_RAW_GROUPED_DECODE": "1",
+    "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE": "1",
+    "VLLM_SM70_NVFP4_MOE_GROUPED_DECODE": "0",
+    "VLLM_SM70_NVFP4_TURBOMIND": "1",
+    "VLLM_SM70_FP8_TURBOMIND": "1",
+    "VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL": "1",
+    "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES": "1",
     "VLLM_V2_CUDAGRAPH_MEM_MIB": "700",
 }
 CUSTOM_AR_DEFAULTS = {"VLLM_SM70_CAR_VMM_SAFE": "1"}
@@ -81,6 +92,9 @@ AUDITED_NAMES = tuple(
         | set(UPSTREAM_AND_DEPLOYMENT)
     )
 )
+# Keep the AWQ audit inventory byte-compatible. Format-specific entries are
+# included in NVFP4 audits and provenance transport only.
+_ALL_AUDITED_NAMES = tuple(sorted(set(AUDITED_NAMES) | set(NVFP4_DEFAULTS)))
 # Diagnostic transport only: never use it to resolve an operator setting.
 # The VLLM_ prefix also carries it through worker environment propagation.
 _PROVENANCE_ENV = "VLLM_REVOLTA_PROFILE_PROVENANCE"
@@ -95,7 +109,7 @@ def _inherited_provenance() -> dict[str, dict[str, Any]]:
         return {
             name: row
             for name, row in rows.items()
-            if name in AUDITED_NAMES
+            if name in _ALL_AUDITED_NAMES
             and row["source"] in ("profile", "environment", "upstream_default")
             and isinstance(row["value"], str)
         }
@@ -105,7 +119,9 @@ def _inherited_provenance() -> dict[str, dict[str, Any]]:
 
 
 _INHERITED_PROVENANCE = _inherited_provenance()
-_INITIAL_ENV = {name: os.environ[name] for name in AUDITED_NAMES if name in os.environ}
+_INITIAL_ENV = {
+    name: os.environ[name] for name in _ALL_AUDITED_NAMES if name in os.environ
+}
 _PROFILE_VALUES: dict[str, str] = {}
 
 
@@ -135,7 +151,7 @@ def _export_provenance() -> None:
             "version": 1,
             "values": {
                 name: {"value": os.environ.get(name), "source": _source(name)}
-                for name in AUDITED_NAMES
+                for name in _ALL_AUDITED_NAMES
                 if name in os.environ
             },
         },
@@ -198,6 +214,34 @@ def frontend_interconnect_mode(
     return "pex_p2p"
 
 
+def has_nvfp4_weights(model_config: Any) -> bool:
+    """Resolve ModelOpt formats from metadata, independent of checkpoint names."""
+    method = getattr(model_config, "quantization", None)
+    if method == "modelopt_fp4":
+        return True
+    if method != "modelopt_mixed":
+        return False
+    for owner in ("hf_config", "hf_text_config", "model_arch_config"):
+        config = getattr(
+            getattr(model_config, owner, None), "quantization_config", None
+        )
+        if not isinstance(config, dict):
+            continue
+        quant = config.get("quantization", config)
+        if not isinstance(quant, dict):
+            continue
+        if str(quant.get("quant_algo", "")).upper() in ("NVFP4", "W4A16_NVFP4"):
+            return True
+        layers = quant.get("quantized_layers", {})
+        if isinstance(layers, dict) and any(
+            isinstance(info, dict)
+            and str(info.get("quant_algo", "")).upper() in ("NVFP4", "W4A16_NVFP4")
+            for info in layers.values()
+        ):
+            return True
+    return False
+
+
 def apply_revolta_profile(
     model_config: Any,
     tensor_parallel_size: int,
@@ -225,6 +269,8 @@ def apply_revolta_profile(
     defaults = dict(COMMON_DEFAULTS)
     if getattr(model_config, "quantization", None) == "awq":
         defaults.update(AWQ_DEFAULTS)
+    elif has_nvfp4_weights(model_config):
+        defaults.update(NVFP4_DEFAULTS)
     if interconnect_mode != "no_p2p":
         defaults.update(CUSTOM_AR_DEFAULTS)
     for name, value in defaults.items():
@@ -267,7 +313,12 @@ def profile_audit(
     from vllm import envs
 
     values = {}
-    for name in AUDITED_NAMES:
+    names = (
+        _ALL_AUDITED_NAMES
+        if quantization in ("modelopt_fp4", "modelopt_mixed")
+        else AUDITED_NAMES
+    )
+    for name in names:
         value: str | None
         if name in os.environ:
             value = os.environ[name]

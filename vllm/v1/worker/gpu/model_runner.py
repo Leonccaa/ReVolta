@@ -128,6 +128,7 @@ from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+from vllm.v1.worker.mamba_utils import pad_mamba_block_table_widths
 from vllm.v1.worker.utils import KVBlockZeroer, clear_layer_kv_caches
 
 logger = init_logger(__name__)
@@ -626,6 +627,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_cache_config, self.vllm_config, self.device
         )
         self._kernel_block_sizes = kernel_block_sizes
+        max_num_blocks_per_group = pad_mamba_block_table_widths(
+            self.kv_cache_config, max_num_blocks_per_group
+        )
         self.block_tables = BlockTables(
             block_sizes=block_sizes,
             max_num_reqs=self.max_num_reqs,
@@ -877,6 +881,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     @torch.inference_mode()
     def profile_run(self) -> None:
+        encoder_cache = None
+        mm_config = self.model_config.multimodal_config
+        if (
+            self.supports_mm_inputs
+            and self.is_first_pp_rank
+            and mm_config is not None
+            and mm_config.mm_encoder_tp_mode == "data"
+        ):
+            encoder_cache = self.model_state.encoder_runner.profile(
+                self.vllm_config, MULTIMODAL_REGISTRY
+            )
         hidden_states, sample_hidden_states = self._dummy_run(
             self.max_num_tokens, skip_attn=True, is_profile=True
         )
@@ -890,7 +905,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self._dummy_pooler_run(hidden_states)
 
         torch.accelerator.synchronize()
-        del hidden_states, sample_hidden_states
+        del hidden_states, sample_hidden_states, encoder_cache
         gc.collect()
 
     def post_kv_cache_wake_up(self) -> None:

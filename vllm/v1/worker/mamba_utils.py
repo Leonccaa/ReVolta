@@ -323,10 +323,46 @@ def get_mamba_groups(kv_cache_config: KVCacheConfig) -> tuple[list[int], MambaSp
     # State shapes, dtypes, backend types, and TP replication may differ across
     # groups (for example Qwen4Exp GDN versus its PLE short-conv state). The
     # align scheduler and copy kernels only require shared block semantics.
-    for field in ("block_size", "mamba_cache_mode", "num_speculative_blocks"):
+    for field in ("block_size", "mamba_cache_mode"):
         values = {getattr(spec, field) for spec in mamba_specs}
         assert len(values) == 1, f"all mamba groups must share {field}, got {values}"
-    return mamba_group_ids, mamba_specs[0]
+    # Replicated PLE short-conv keeps speculative history within one block.
+    # Retain the shared speculative-block contract for all other owners.
+    state_specs = [
+        spec
+        for spec in mamba_specs
+        if not (
+            spec.mamba_type == MambaAttentionBackendEnum.SHORT_CONV
+            and spec.tp_replicated
+            and spec.num_speculative_blocks == 0
+        )
+    ]
+    values = {spec.num_speculative_blocks for spec in state_specs}
+    assert len(values) <= 1, (
+        f"all other mamba groups must share num_speculative_blocks, got {values}"
+    )
+    return mamba_group_ids, (state_specs or mamba_specs)[0]
+
+
+def pad_mamba_block_table_widths(
+    kv_cache_config: KVCacheConfig, widths: list[int]
+) -> list[int]:
+    """Pad physical Mamba tables for the shared-stride state-copy kernels.
+
+    This only allocates index storage. Each group's cache spec and logical
+    block count still determine how many state blocks the pool hands out.
+    """
+    widths = widths.copy()
+    groups = [
+        i
+        for i, group in enumerate(kv_cache_config.kv_cache_groups)
+        if isinstance(group.kv_cache_spec, MambaSpec)
+    ]
+    if groups:
+        width = max(widths[i] for i in groups)
+        for i in groups:
+            widths[i] = width
+    return widths
 
 
 def get_mamba_types(

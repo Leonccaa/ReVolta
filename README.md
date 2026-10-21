@@ -30,6 +30,20 @@ These are totals across all requests, including the wait for the first token:
 | --- | ---: | ---: |
 | Prefill throughput, tok/s | 3,510 | 3,020 |
 
+**NVLink (community result).** [@jttdev](https://github.com/jttdev) measured 0.1.0 on
+4 × V100-SXM2 32 GB with an NV2 NVLink mesh ([#2](https://github.com/Leonccaa/ReVolta/issues/2)):
+
+| Concurrent requests | 1 | 2 | 4 | 8 |
+| --- | ---: | ---: | ---: | ---: |
+| Total output throughput, tok/s | 153.5 | 223.4 | 326.3 | 467.8 |
+
+Same three prompts and 512-token responses, thinking off, MTP4, 512K views, base AWQ
+checkpoint, `--gpu-memory-utilization 0.925`. The method differs slightly from ours: each
+level runs 3 requests per stream, and the single-request value is the mean of the three
+prompts, including the wait for the first token. On this system
+`--gpu-memory-utilization 0.95` also started (1,100,286 KV tokens), and two concurrent
+retrieval requests of about 490K tokens each found all three needles.
+
 ### Coming back to a document
 
 A cached 32K-token document answered a follow-up in **1.28 seconds from memory**,
@@ -84,7 +98,8 @@ The reference system uses four V100 32 GB PCIe cards behind one PCIe switch
 | --- | --- |
 | 4 × V100 32 GB PCIe, TP4 + DCP2, P2P | Full acceptance passed on the reference configuration |
 | P2P disabled on the same machine | Correct output; about 30–55% of P2P throughput |
-| NVLink, V100 16 GB, other GPU counts | Not yet tested |
+| 4 × V100-SXM2 32 GB, NVLink (NV2 mesh) | Community test by [@jttdev](https://github.com/jttdev) ([#2](https://github.com/Leonccaa/ReVolta/issues/2)): speed, retrieval to about 490K tokens, vision. Not part of our release gate |
+| V100 16 GB, other GPU counts | Not yet tested |
 
 The engine selects the interconnect automatically and logs `SM70 interconnect=<mode>`.
 P2P uses custom all-reduce for messages up to 80 KiB inside CUDA graphs; other
@@ -586,7 +601,8 @@ and FP4-Local with their documented settings. Base AWQ has quality measurements.
 80 GiB RAM has memory-stress results. Disk caching has readback results; its full
 release gate passed with an 8 GiB CPU pool and a 40 GiB disk budget.
 
-NVLink, V100 16 GB, TP2/TP8, and other models have not been tested.
+V100 16 GB, TP2/TP8, and other models have not been tested. NVLink has a community
+test ([#2](https://github.com/Leonccaa/ReVolta/issues/2)) but is not part of our release gate.
 This release builds SM70 only; other GPU architectures, ROCm, CPU, XPU, TPU, and
 GGUF are outside the build.
 
@@ -632,7 +648,8 @@ command, relevant environment, model revision, host/container memory limits,
 offload settings, `nvidia-smi topo -m`, and the `ReVolta profile` /
 `SM70 interconnect=` log lines. Remove credentials.
 
-Reports from NVLink V100 owners are especially welcome. Report security issues
+Reports from NVLink V100 owners are especially welcome; thanks to
+[@jttdev](https://github.com/jttdev) for the first one ([#2](https://github.com/Leonccaa/ReVolta/issues/2)). Report security issues
 through GitHub private vulnerability reporting.
 
 ## Building from source

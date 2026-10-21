@@ -55,6 +55,7 @@ class StreamState:
     reasoning_ended: bool = False
     tool_call_text_started: bool = False
     prompt_reasoning_checked: bool = False
+    request_prepared: bool = False
     previous_text: str = ""
     previous_token_ids: list[int] = field(default_factory=list)
     history_tool_call_cnt: int = 0
@@ -671,6 +672,11 @@ class DelegatingParser(Parser):
         prompt_token_ids: list[int] | None = None,
     ) -> DeltaMessage | None:
         state = self._stream_state
+
+        if not state.request_prepared:
+            state.request_prepared = True
+            if self._reasoning_parser is not None:
+                self._reasoning_parser.prepare_streaming(request)
 
         if not state.prompt_reasoning_checked and prompt_token_ids is not None:
             state.prompt_reasoning_checked = True

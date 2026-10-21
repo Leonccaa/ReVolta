@@ -189,6 +189,16 @@ class ReasoningParser:
         """Adjust request parameters; override in subclasses as needed."""
         return request
 
+    def prepare_streaming(
+        self, request: "ChatCompletionRequest | ResponsesRequest"
+    ) -> None:
+        """Receive the streamed request before its first delta.
+
+        The non-streaming methods take the request as an argument; override
+        this when the streaming split depends on it as well.
+        """
+        return None
+
     def prepare_structured_tag(
         self,
         original_tag: str | None,

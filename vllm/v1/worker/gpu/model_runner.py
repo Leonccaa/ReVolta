@@ -128,6 +128,7 @@ from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+from vllm.v1.worker.mamba_utils import pad_mamba_block_table_widths
 from vllm.v1.worker.utils import KVBlockZeroer, clear_layer_kv_caches
 
 logger = init_logger(__name__)
@@ -626,6 +627,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_cache_config, self.vllm_config, self.device
         )
         self._kernel_block_sizes = kernel_block_sizes
+        max_num_blocks_per_group = pad_mamba_block_table_widths(
+            self.kv_cache_config, max_num_blocks_per_group
+        )
         self.block_tables = BlockTables(
             block_sizes=block_sizes,
             max_num_reqs=self.max_num_reqs,

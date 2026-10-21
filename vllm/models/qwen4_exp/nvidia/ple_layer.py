@@ -11,6 +11,7 @@ import weakref
 from collections.abc import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from dataclasses import replace
 
 import numpy as np
 import torch
@@ -83,6 +84,7 @@ from vllm.v1.attention.backends.short_conv_attn import (
     PleShortConvAttentionMetadata,
 )
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+from vllm.v1.kv_cache_interface import MambaSpec
 
 from ..common.ple import (
     PLE_SHARD_PREFIX,
@@ -2200,6 +2202,14 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         return MambaStateDtypeCalculator.short_conv_state_dtype(
             self.model_config.dtype, self.cache_config.mamba_cache_dtype
         )
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> MambaSpec:
+        spec = super().get_kv_cache_spec(vllm_config)
+        assert isinstance(spec, MambaSpec)
+        # PLE keeps the speculative history inside its running short-conv
+        # block. Every path selects column zero of the state-block window;
+        # separate speculative pool blocks are never read or written.
+        return replace(spec, num_speculative_blocks=0)
 
     def get_state_shape(self) -> Sequence[tuple[int, ...]]:
         return MambaStateShapeCalculator.short_conv_state_shape(

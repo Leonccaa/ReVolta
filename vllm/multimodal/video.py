@@ -29,6 +29,13 @@ except ImportError:
 logger = init_logger(__name__)
 
 
+def _resolve_video_fps(fps: float) -> float:
+    if not math.isfinite(fps) or fps <= 0:
+        logger.warning_once("Unknown video frame rate; assuming 24 FPS.")
+        return 24.0
+    return fps
+
+
 def resize_video(frames: npt.NDArray, size: tuple[int, int]) -> npt.NDArray:
     num_frames, _, _, channels = frames.shape
     new_height, new_width = size
@@ -143,8 +150,8 @@ class OpenCVVideoBackendMixin:
     @staticmethod
     def get_video_metadata(cap: "cv2.VideoCapture") -> VideoSourceMetadata:
         total_frames_num = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        original_fps = cap.get(cv2.CAP_PROP_FPS)
-        duration = total_frames_num / original_fps if original_fps > 0 else 0
+        original_fps = _resolve_video_fps(cap.get(cv2.CAP_PROP_FPS))
+        duration = total_frames_num / original_fps
         return VideoSourceMetadata(
             total_frames_num=total_frames_num,
             original_fps=original_fps,
@@ -380,6 +387,10 @@ class PyAVVideoBackendMixin:
         total_frames = stream.frames or 0
         fps = float(stream.average_rate) if stream.average_rate else 0.0
         duration = float(stream.duration * stream.time_base) if stream.duration else 0.0
+        resolved_fps = _resolve_video_fps(fps)
+        if resolved_fps != fps and (not math.isfinite(duration) or duration <= 0):
+            duration = total_frames / resolved_fps
+        fps = resolved_fps
         if total_frames == 0 and duration > 0 and fps > 0:
             total_frames = int(duration * fps)
         return VideoSourceMetadata(total_frames, fps, duration)

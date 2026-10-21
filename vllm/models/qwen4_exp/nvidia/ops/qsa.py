@@ -7,6 +7,7 @@ from __future__ import annotations
 import math
 import os
 from itertools import pairwise
+from typing import Any
 
 import regex as re
 import torch
@@ -1500,6 +1501,8 @@ def _qsa_select_by_request(
     compress_ratio: int,
     out: torch.Tensor,
     query_start_loc_cpu: torch.Tensor,
+    max_seq_len: int | None = None,
+    seq_lens_cpu_upper_bound: torch.Tensor | None = None,
 ) -> bool:
     """Select a multi-request batch one long request at a time.
 
@@ -1531,6 +1534,12 @@ def _qsa_select_by_request(
     if all(request is None for _, _, request in segments):
         return False
     for start, end, request in segments:
+        host_bound = max_seq_len
+        if request is not None and seq_lens_cpu_upper_bound is not None:
+            host_bound = int(seq_lens_cpu_upper_bound[request])
+        bound_args: dict[str, Any] = (
+            {"max_seq_len": host_bound} if host_bound is not None else {}
+        )
         if request is None:
             qsa_select_paged_tokens(
                 q[start:end],
@@ -1542,6 +1551,7 @@ def _qsa_select_by_request(
                 token_topk,
                 compress_ratio,
                 out[start:end],
+                **bound_args,
             )
         else:
             qsa_select_paged_tokens(
@@ -1554,6 +1564,7 @@ def _qsa_select_by_request(
                 token_topk,
                 compress_ratio,
                 out[start:end],
+                **bound_args,
             )
     return True
 
@@ -1570,8 +1581,14 @@ def qsa_select_paged_tokens(
     out: torch.Tensor | None = None,
     query_start_loc_cpu: torch.Tensor | None = None,
     shared_key_scoring: bool = False,
+    max_seq_len: int | None = None,
+    seq_lens_cpu_upper_bound: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Score, select, and expand QSA indices without host synchronization."""
+    """Score and select QSA indices, using a host bound when available.
+
+    Host lengths only bound scoring storage. Device visibility still masks
+    every row; callers without a host bound retain the existing fallback.
+    """
 
     rows = q.shape[0]
     output_width = token_topk + compress_ratio - 1
@@ -1592,6 +1609,8 @@ def qsa_select_paged_tokens(
         compress_ratio,
         out,
         query_start_loc_cpu,
+        max_seq_len,
+        seq_lens_cpu_upper_bound,
     ):
         return out
 
@@ -1611,11 +1630,14 @@ def qsa_select_paged_tokens(
         # cuBLAS has a rectangular host-side launch shape, unlike the paged
         # Triton kernel's device-side early exit. Bound it to this chunk's live
         # prefix so early-context prefill does not multiply the unused 140K
-        # model-capacity tail. This is one scalar sync per QSA layer.
-        score_columns = min(
-            capacity_columns,
-            max(block_topk, int(all_visible.max().item())),
+        # model-capacity tail. The host upper bound removes the scalar sync;
+        # device visibility masks any extra columns before top-k selection.
+        live_blocks = (
+            max_seq_len // compress_ratio
+            if max_seq_len is not None
+            else int(all_visible.max().item())
         )
+        score_columns = min(capacity_columns, max(block_topk, live_blocks))
         if _qsa_indexer_cublas_work_supported(rows, score_columns):
             logger.info_once(
                 "Using SM70 QSA indexer prefill cuBLAS path "

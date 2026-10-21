@@ -356,6 +356,8 @@ class QSAIndexer(nn.Module):
             out,
             query_start_loc_cpu=compressed_metadata.query_start_loc_cpu,
             shared_key_scoring=self.shared_key_scoring,
+            max_seq_len=compressed_metadata.max_seq_len,
+            seq_lens_cpu_upper_bound=compressed_metadata.seq_lens_cpu_upper_bound,
         )
 
 

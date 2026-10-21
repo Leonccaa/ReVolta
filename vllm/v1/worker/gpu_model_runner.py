@@ -6344,9 +6344,19 @@ class GPUModelRunner(
                             **micro_batch_mm_inputs
                         )
 
-                        batch_outputs_lst.extend(micro_batch_outputs)
+                        # A single video's outputs may still be views into a
+                        # padded all-gather. Release that source before encoding
+                        # the next video, just as for ordinary batches below.
+                        batch_outputs_lst.extend(
+                            out.clone()
+                            if out.untyped_storage().nbytes() > out.nbytes
+                            else out
+                            for out in micro_batch_outputs
+                        )
+                        del micro_batch_outputs
 
                 batch_outputs = batch_outputs_lst
+                del batch_outputs_lst
             else:
                 # Run the encoder.
                 # `batch_outputs` is either of the following:
@@ -6372,9 +6382,16 @@ class GPUModelRunner(
                         batch_outputs = cudagraph_output
                     else:
                         batch_outputs = model.embed_multimodal(**mm_kwargs_batch)
+                    del cudagraph_output
 
             sanity_check_mm_encoder_outputs(batch_outputs, expected_num_items=num_items)
-            encoder_outputs.extend(batch_outputs)
+            # Cache entries are evicted independently. A split/all-gather view
+            # must not keep the rest of its batch (or TP padding) alive.
+            encoder_outputs.extend(
+                out.clone() if out.untyped_storage().nbytes() > out.nbytes else out
+                for out in batch_outputs
+            )
+            del batch_outputs
 
             current_item_idx += num_items
 

@@ -242,6 +242,50 @@ def test_sparse_keeps_both_replay_boundaries(eagle, length):
     assert len(ends) <= length // 8000 + 3
 
 
+@pytest.mark.parametrize("eagle", [False, True])
+@pytest.mark.parametrize(
+    "length", [50, MAMBA_BLOCK_SIZE - 1, 2 * MAMBA_BLOCK_SIZE + 30]
+)
+def test_sparse_does_not_split_at_unaligned_last_token(eagle, length):
+    # A state ending at the unaligned position length - 1 is never cacheable;
+    # stopping there only adds a step and changes the prefill chunking.
+    ends = _chunk_ends(length, eagle=eagle)
+    assert length - 1 not in ends
+    assert all(end == length or end % MAMBA_BLOCK_SIZE == 0 for end in ends), ends
+
+
+@pytest.mark.parametrize("eagle", [False, True])
+def test_replay_boundaries_preserve_retained_blocks(eagle):
+    from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+
+    alignment = MAMBA_BLOCK_SIZE
+    coordinator = SimpleNamespace(eagle_group_ids={0} if eagle else set())
+    spec = MambaSpec(
+        block_size=alignment,
+        shapes=((1,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+    for length in range(1, 6 * alignment + 1):
+        request = SimpleNamespace(num_tokens=length)
+        resend = (length - 1) // alignment * alignment
+        extension = length // alignment * alignment
+        old = (
+            tuple(sorted({max(resend - alignment, 0), max(extension - alignment, 0)}))
+            if eagle
+            else (length - 1, length)
+        )
+        current = KVCacheCoordinator.get_replay_boundaries(
+            coordinator, request, alignment
+        )
+        if eagle:
+            assert current == old
+        for interval in (0, 2 * alignment):
+            assert MambaManager.reachable_block_mask(
+                0, 6, alignment, spec, interval, current
+            ) == MambaManager.reachable_block_mask(0, 6, alignment, spec, interval, old)
+
+
 def test_sparse_keeps_detected_shared_prefix_boundary():
     assert 4896 in _chunk_ends(32768, eagle=True, shared=4896)
 

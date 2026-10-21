@@ -6,6 +6,7 @@ import json
 import os
 import time
 from collections.abc import Callable, Generator, Iterable
+from contextlib import nullcontext
 from typing import cast
 
 import torch
@@ -15,7 +16,9 @@ from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 from vllm.config import ModelConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
+from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.torchao import torchao_version_at_least
+from vllm.model_executor.model_loader.awq_coverage import awq_checkpoint_coverage
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.csf_scales import decode_csf_scale_streams
 from vllm.model_executor.model_loader.direct_io import decoder_layer_filter
@@ -561,17 +564,25 @@ class DefaultModelLoader(BaseModelLoader):
 
         self._init_ep_weight_filter(model_config)
 
-        loaded_weights = model.load_weights(self.get_all_weights(model_config, model))
+        with (
+            awq_checkpoint_coverage(model)
+            if model_config.quantization in ("awq", "awq_marlin")
+            else nullcontext()
+        ):
+            loaded_weights = model.load_weights(
+                self.get_all_weights(model_config, model)
+            )
 
         self.counter_after_loading_weights = time.perf_counter()
         logger.info_once(
             "Loading weights took %.2f seconds",
             self.counter_after_loading_weights - self.counter_before_loading_weights,
         )
-        # We only enable strict check for non-quantized models
-        # that have loaded weights tracking by default.
+        # AWQ also needs the generic check for its unquantized parameters.
+        # Its fused quantized components are checked individually above.
         default_enable_weights_track = (
-            model_config.quantization is None and loaded_weights is not None
+            model_config.quantization in (None, "awq", "awq_marlin")
+            and loaded_weights is not None
         )
         enable_weights_track = (
             self.enable_weights_track
@@ -579,10 +590,18 @@ class DefaultModelLoader(BaseModelLoader):
             else default_enable_weights_track
         )
         if enable_weights_track:
-            self.track_weights_loading(model, loaded_weights)
+            self.track_weights_loading(
+                model,
+                loaded_weights,
+                strict_awq=model_config.quantization in ("awq", "awq_marlin"),
+            )
 
     def track_weights_loading(
-        self, model: nn.Module, loaded_weights: set[str] | None
+        self,
+        model: nn.Module,
+        loaded_weights: set[str] | None,
+        *,
+        strict_awq: bool = False,
     ) -> None:
         weights_to_load = {name for name, _ in model.named_parameters()}
         if loaded_weights is not None:
@@ -593,6 +612,14 @@ class DefaultModelLoader(BaseModelLoader):
                 has_postprocess_quant = getattr(
                     quant_method, "process_weights_after_loading", None
                 )
+                if strict_awq and (
+                    isinstance(quant_method, UnquantizedLinearMethod)
+                    or "qweight" in module._parameters
+                    or "w13_qweight" in module._parameters
+                ):
+                    # Repacking an AWQ matrix or an unquantized linear does
+                    # not make its serialized parameters optional.
+                    has_postprocess_quant = None
                 # ignore kv_cache scale and online quant scale,
                 # which can be missing in checkpoints
                 if has_online_quant or has_postprocess_quant:

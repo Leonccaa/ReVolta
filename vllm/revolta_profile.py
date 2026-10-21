@@ -144,6 +144,12 @@ def _source(name: str) -> str:
     return "upstream_default"
 
 
+def value_source(name: str) -> str:
+    """Audit provenance of an audited variable: profile, environment or
+    upstream_default. Diagnostics only; never resolve a setting from it."""
+    return _source(name)
+
+
 def _export_provenance() -> None:
     # Refresh at the final audit too, after upstream materializes its defaults.
     os.environ[_PROVENANCE_ENV] = json.dumps(

@@ -469,6 +469,28 @@ def _sm70_mtp_cudagraph_capture_sizes(
     return [decode_query_len * size for size in sorted(request_sizes)]
 
 
+def _log_sm70_compile_graph_without_aot() -> None:
+    """Log VLLM_USE_AOT_COMPILE=0 on the SM70 Flash-V100 0.0.3 compile graph.
+
+    Only an operator's explicit choice gets the diagnostic warning; the
+    ReVolta profile records that it set the value itself.
+    """
+    from vllm.revolta_profile import value_source
+
+    if value_source("VLLM_USE_AOT_COMPILE") == "profile":
+        logger.info_once(
+            "Using regular torch.compile for the SM70 Flash-V100 0.0.3 compile "
+            "graph: the ReVolta profile sets VLLM_USE_AOT_COMPILE=0."
+        )
+        return
+    logger.warning_once(
+        "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH=1 with "
+        "explicit VLLM_USE_AOT_COMPILE=0 is a diagnostic-only "
+        "configuration: regular torch.compile reproduced "
+        "deterministic greedy token drift."
+    )
+
+
 def _configure_sm70_glm5_dflash_tp4_push_allreduce(
     model_config: ModelConfig | None,
     speculative_config: SpeculativeConfig | None,
@@ -2432,12 +2454,7 @@ class VllmConfig:
                             "path for SM70 GLM-5.3 DFlash2 TP8/PP1."
                         )
                     else:
-                        logger.warning_once(
-                            "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH=1 with "
-                            "explicit VLLM_USE_AOT_COMPILE=0 is a diagnostic-only "
-                            "configuration: regular torch.compile reproduced "
-                            "deterministic greedy token drift."
-                        )
+                        _log_sm70_compile_graph_without_aot()
                 elif sm70_dflash2_graph_cache and envs.VLLM_USE_AOT_COMPILE:
                     logger.warning_once(
                         "Explicit VLLM_USE_AOT_COMPILE=1 selects AOT cache reload, "

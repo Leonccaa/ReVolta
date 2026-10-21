@@ -257,7 +257,9 @@ def test_dev_reset_running_requests_with_pending_stores(
     assert pending <= so.kv_connector_metadata.jobs_to_flush
     if not reset_connector:
         assert not so.kv_connector_metadata.load_jobs
-    assert not h.cs._req_status[rid].transfer_jobs
+    # A connector reset restarts store progress, so a resumed request may
+    # already have fresh stores. Only the old transfer IDs must be gone.
+    assert pending.isdisjoint(h.cs._req_status[rid].transfer_jobs)
     for _ in range(3):
         h.step(token=0)
     h.step(token=EOS_TOKEN_ID)

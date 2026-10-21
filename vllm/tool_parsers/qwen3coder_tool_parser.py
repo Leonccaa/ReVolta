@@ -626,6 +626,14 @@ class Qwen3CoderToolParser(ToolParser):
             if suffix.startswith(self.parameter_prefix):
                 end = text.find(">", position)
                 if end == -1:
+                    line_start = text.rfind("\n", 0, position) + 1
+                    if text[line_start:position].strip() and not text[
+                        :position
+                    ].rstrip().endswith(self.parameter_end_token):
+                        # Mid-line and not after a close tag, so it can never
+                        # be a real tag (see _parameter_start_positions).
+                        search = position + len(self.parameter_prefix)
+                        continue
                     self._string_waiting_header = True
                     return position, False
                 # Preserve the existing inline-code and unknown-name rules.

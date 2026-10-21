@@ -285,6 +285,30 @@ def test_literal_parameter_prefix_keeps_structure(
 
 
 @pytest.mark.parametrize("burst", [1, 5])
+def test_mid_line_parameter_prefix_is_not_held(tokenizer, burst):
+    # "<parameter=" in the middle of a line, not after a close tag, can never
+    # be a real tag, so the text after it must not wait for a ">".
+    content = (
+        "Use the prefix <parameter= to start.\n"
+        + "and then some more ordinary words follow on this line " * 3
+    )
+    model_output = _write_call("/tmp/out.txt", content)
+    tools = [WRITE_TOOL]
+    request = ChatCompletionRequest(model=MODEL, messages=[], tools=tools)
+    parser = Qwen3CoderToolParser(tokenizer, tools=tools)
+    events = _stream(parser, tokenizer, model_output, request, burst)
+
+    close_at = model_output.index("\n</parameter>", model_output.index(content))
+    streamed, before_close = "", ""
+    for cur_text, args, _ in events:
+        streamed += args
+        if len(cur_text) <= close_at:
+            before_close = streamed
+    assert "<parameter= to start.\\nand then some" in before_close
+    assert streamed == _non_streaming_args(tokenizer, tools, model_output)
+
+
+@pytest.mark.parametrize("burst", [1, 5])
 def test_non_string_values_are_atomic(tokenizer, burst):
     model_output = (
         "<tool_call>\n<function=configure>\n"

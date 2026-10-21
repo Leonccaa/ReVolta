@@ -68,9 +68,18 @@ Repeated URLs and cache hits are charged again. Failed attempts conservatively
 retain their charges for the current request; a new request has a fresh budget.
 HTTP size errors are non-retryable validation failures and map to HTTP 400.
 
+Non-empty per-request `mm_processor_kwargs` and `media_io_kwargs` are rejected
+with HTTP 400 by default. Only deployments with trusted API clients should enable
+`--trust-request-mm-kwargs` to allow these overrides. Omitted values, `null` and
+empty dictionaries retain their previous behavior. Server-level
+`--mm-processor-kwargs` and `--media-io-kwargs` remain operator settings.
+The same policy applies to render, tokenize, pooling and `run-batch` frontends;
+the local Python `LLM` API keeps accepting caller-controlled overrides.
+
 `--media-io-kwargs '{"video": {"num_frames": 16}}'` remains a default sampling
-setting. Requests can override `num_frames` or `fps` using the existing merge
-rules: overriding either clears the other inherited field. The loader's fallback
+setting. With `--trust-request-mm-kwargs`, requests can override `num_frames` or
+`fps` using the existing merge rules: overriding either clears the other
+inherited field. The loader's fallback
 is 16 frames when `num_frames` is omitted. The operator's 64-frame ceiling
 and raster budget apply after these merges. `num_frames=-1` can load all frames only when the actual selected count fits
 the frame ceiling and raster budget; this is checked before frame allocation.

@@ -621,7 +621,10 @@ GGUF are outside the build.
   GPU memory per 32 GB card. This left room for about 345K context tokens.
   Cascade is unsupported in 0.1.x. Keep it disabled.
 - **FP4-Local vision.** Keep the default vision-tower TP4. Forcing data parallelism
-  removes the tested memory arrangement; request-level image settings can raise limits.
+  removes the tested memory arrangement. Non-empty request-level
+  `mm_processor_kwargs` and `media_io_kwargs` are rejected with HTTP 400 by
+  default. Only enable `--trust-request-mm-kwargs` for trusted API clients;
+  their image settings can then raise preprocessing resource usage.
 - **NVFP4 scales.** Different gate/up global scales are not supported by the
   raw-scale path. Both documented checkpoints use equal scales.
 - **Structured output with MTP.** GPU tests produced 16/16 valid JSON/tool outputs;

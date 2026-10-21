@@ -249,10 +249,57 @@ class Qwen4ExpConfig(PretrainedConfig):
         self.video_token_id = video_token_id
         self.vision_start_token_id = vision_start_token_id
         self.vision_end_token_id = vision_end_token_id
-        self.rope_parameters = rope_parameters or getattr(
-            self.text_config, "rope_parameters", {}
+        self.rope_parameters = rope_parameters or _outer_rope_parameters(
+            getattr(self.text_config, "rope_parameters", {})
         )
         super().__init__(**kwargs, tie_word_embeddings=tie_word_embeddings)
+
+
+# Keys that only describe RoPE context scaling (YaRN, linear/dynamic NTK,
+# llama3, longrope). The legacy "type" alias names the scaled rope type.
+_ROPE_SCALING_KEYS = (
+    "type",
+    "factor",
+    "original_max_position_embeddings",
+    "attention_factor",
+    "beta_fast",
+    "beta_slow",
+    "mscale",
+    "mscale_all_dim",
+    "truncate",
+    "low_freq_factor",
+    "high_freq_factor",
+    "short_factor",
+    "long_factor",
+)
+
+
+def _outer_rope_parameters(text_rope_parameters: Any) -> Any:
+    """Rope parameters the multimodal wrapper inherits from its text config.
+
+    The wrapper keeps the default rope: context scaling such as YaRN belongs to
+    the text config only. A config.json that writes YaRN into ``text_config``
+    without an outer ``rope_parameters`` would otherwise hand the scaled dict
+    to the wrapper, whose rope standardization then needs a
+    ``max_position_embeddings`` the wrapper does not have (issue #2).
+    Unscaled parameters are inherited as before.
+    """
+    if not isinstance(text_rope_parameters, dict):
+        return text_rope_parameters
+    rope_type = text_rope_parameters.get(
+        "rope_type", text_rope_parameters.get("type", "default")
+    )
+    if rope_type == "default" and not any(
+        key in text_rope_parameters for key in _ROPE_SCALING_KEYS
+    ):
+        return text_rope_parameters
+    outer = {
+        key: value
+        for key, value in text_rope_parameters.items()
+        if key not in _ROPE_SCALING_KEYS
+    }
+    outer["rope_type"] = "default"
+    return outer
 
 
 __all__ = [

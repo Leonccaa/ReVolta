@@ -214,6 +214,24 @@ def frontend_interconnect_mode(
     return "pex_p2p"
 
 
+def _logged_interconnect_mode(mode: InterconnectMode, policy: str) -> str:
+    """The audit names a mode only when the operator chose it explicitly.
+
+    frontend_interconnect_mode() assumes pex_p2p for auto, which applies the
+    same defaults as nvlink; only the workers know the topology and log the
+    resolved mode ("SM70 interconnect=..."). Logging the assumption as a mode
+    would contradict them on an NVLink machine.
+    """
+    if mode != "pex_p2p":
+        return mode  # nccl, nvlink or a disabled custom AR
+    requested = policy.strip().lower()
+    if requested == "pex":
+        return mode
+    if requested == "auto":
+        return "auto (resolved by workers)"
+    return "pending (resolved by workers)"
+
+
 def has_nvfp4_weights(model_config: Any) -> bool:
     """Resolve ModelOpt formats from metadata, independent of checkpoint names."""
     method = getattr(model_config, "quantization", None)
@@ -335,12 +353,12 @@ def profile_audit(
             value = None
         values[name] = {"value": value, "source": _source(name)}
     _export_provenance()
+    policy = os.environ.get("VLLM_SM70_INTERCONNECT", "auto")
     return json.dumps(
         {
             "enabled": enabled,
-            # Frontend assumption; workers log the resolved mode.
-            "interconnect_mode": interconnect_mode,
-            "interconnect_policy": os.environ.get("VLLM_SM70_INTERCONNECT", "auto"),
+            "interconnect_mode": _logged_interconnect_mode(interconnect_mode, policy),
+            "interconnect_policy": policy,
             "quantization": quantization,
             "values": values,
             "kernel_config": (

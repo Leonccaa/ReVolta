@@ -461,20 +461,24 @@ def test_engineargs_profile_receives_frontend_interconnect(
     assert ("VLLM_SM70_CAR_VMM_SAFE" in os.environ) == (expected != "no_p2p")
 
 
+AUTO_LOGGED = "auto (resolved by workers)"
+INTERCONNECT_CASES = [
+    (None, False, "pex_p2p", AUTO_LOGGED),
+    ("auto", False, "pex_p2p", AUTO_LOGGED),
+    ("pex", False, "pex_p2p", "pex_p2p"),
+    (" NCCL ", False, "no_p2p", "no_p2p"),
+    ("nvlink", False, "nvlink", "nvlink"),
+    ("nvlink", True, "no_p2p", "no_p2p"),
+    ("auto", True, "no_p2p", "no_p2p"),
+    ("bogus", False, "pex_p2p", "pending (resolved by workers)"),
+]
+
+
 @pytest.mark.parametrize(
-    ("requested", "disabled", "expected"),
-    [
-        (None, False, "pex_p2p"),
-        ("auto", False, "pex_p2p"),
-        ("pex", False, "pex_p2p"),
-        (" NCCL ", False, "no_p2p"),
-        ("nvlink", False, "nvlink"),
-        ("nvlink", True, "no_p2p"),
-        ("auto", True, "no_p2p"),
-    ],
+    ("requested", "disabled", "expected", "logged"), INTERCONNECT_CASES
 )
 def test_frontend_interconnect_mode_and_audit(
-    profile, monkeypatch, requested, disabled, expected
+    profile, monkeypatch, requested, disabled, expected, logged
 ):
     # The frontend knows only explicit choices; workers resolve auto/pex.
     if requested is not None:
@@ -486,9 +490,48 @@ def test_frontend_interconnect_mode_and_audit(
     )
     assert ("VLLM_SM70_CAR_VMM_SAFE" in os.environ) == (expected != "no_p2p")
     audit = json.loads(profile.profile_audit(enabled=True, interconnect_mode=mode))
-    assert audit["interconnect_mode"] == expected
+    # Name a mode only for an explicit choice: on an NVLink machine an auto
+    # policy must not read "pex_p2p" while the workers log nvlink.
+    assert audit["interconnect_mode"] == logged
     assert audit["interconnect_policy"] == ("auto" if requested is None else requested)
     assert len(audit["values"]) == 45
+
+
+def _applied_profile(profile, monkeypatch, requested, disabled):
+    with monkeypatch.context() as m:
+        m.setattr(os, "environ", {})
+        envs.disable_envs_cache()
+        profile._PROFILE_VALUES.clear()
+        profile._INITIAL_ENV.clear()
+        if requested is not None:
+            os.environ["VLLM_SM70_INTERCONNECT"] = requested
+        mode = profile.frontend_interconnect_mode(disable_custom_all_reduce=disabled)
+        assert profile.apply_revolta_profile(
+            model(), 4, is_sm70=True, interconnect_mode=mode
+        )
+        audit = json.loads(profile.profile_audit(enabled=True, interconnect_mode=mode))
+        environ = dict(os.environ)
+    envs.disable_envs_cache()
+    return mode, audit, environ
+
+
+def test_audit_log_text_does_not_change_applied_values(profile, monkeypatch):
+    # The logged mode is the only field that depends on whether the frontend
+    # knows the interconnect: auto, pex and nvlink apply the same values and
+    # sources, and so do the two ways of reaching no_p2p.
+    by_mode: dict[str, list] = {}
+    for requested, disabled, expected, logged in INTERCONNECT_CASES:
+        mode, audit, environ = _applied_profile(
+            profile, monkeypatch, requested, disabled
+        )
+        assert (mode, audit.pop("interconnect_mode")) == (expected, logged)
+        audit.pop("interconnect_policy")
+        environ.pop("VLLM_SM70_INTERCONNECT", None)
+        applied = "no_p2p" if expected == "no_p2p" else "p2p"
+        by_mode.setdefault(applied, []).append((audit, environ))
+    for rows in by_mode.values():
+        assert all(row == rows[0] for row in rows)
+    assert by_mode["p2p"][0][0] != by_mode["no_p2p"][0][0]
 
 
 def test_vllmconfig_profile_and_audit_receive_frontend_interconnect():

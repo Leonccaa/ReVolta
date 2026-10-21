@@ -12,11 +12,14 @@ import pytest
 
 from tests.entrypoints.openai.chat_completion.test_output_correctness import (
     _byte_tokenizer,
+    _choices,
     _generate,
     _output,
+    _qwen_stream,
     _request,
     _serving,
     _stream,
+    _text,
 )
 from vllm.parser.abstract_parser import _WrappedParser
 from vllm.reasoning.qwen3_reasoning_parser import Qwen3ReasoningParser
@@ -672,3 +675,52 @@ def test_json_alternate_duplicate_parameters_first_value(tok, encoded_arguments)
     assert json.loads(args) == {"x": "first", "meta": {"nested": 2}}
     _, events = replay_tools(tok, text, 5)
     assert events[-1][2] == args
+
+
+@pytest.mark.parametrize("marker", ["token", "literal"])
+@pytest.mark.parametrize(
+    "completion",
+    ["答案引用 </think> 这个标记", "<think>A</think>B"],
+    ids=["end_in_content", "start_and_end_in_content"],
+)
+def test_thinking_disabled_end_marker_is_content(tok, monkeypatch, marker, completion):
+    # With thinking disabled the template closes reasoning in the prompt and
+    # streaming routes every delta to content; non-streaming must not split
+    # at a </think> inside the answer either.
+    from vllm.entrypoints.openai.engine.protocol import RequestResponseMetadata
+
+    ids = encode(tok, completion) if marker == "token" else literal(tok, completion)
+    text = tok.decode(ids)
+    assert text == completion
+    disabled = {"chat_template_kwargs": {"enable_thinking": False}}
+
+    assert split(Qwen3ReasoningParser(tok, **disabled), text, ids) == (None, text)
+
+    chunks, _, _ = _qwen_stream("reasoning", False, [completion], monkeypatch)
+    streamed = _choices(chunks)[0]
+    assert (_text(streamed, "reasoning"), _text(streamed, "content")) == ("", text)
+
+    response = asyncio.run(
+        _serving().chat_completion_full_generator(
+            _request(stream=False, tool_choice="none"),
+            _generate([_output(text, ids, "stop")]),
+            "test",
+            "test",
+            [],
+            tok,
+            RequestResponseMetadata(request_id="test"),
+            reasoning_parser=Qwen3ReasoningParser(tok, **disabled),
+        )
+    )
+    message = response.choices[0].message
+    assert (message.reasoning, message.content) == (None, text)
+
+
+@pytest.mark.parametrize("marker", ["token", "literal"])
+def test_thinking_enabled_split_unchanged(tok, marker):
+    completion = "想一想</think>答案"
+    ids = encode(tok, completion) if marker == "token" else literal(tok, completion)
+    text = tok.decode(ids)
+    parser = Qwen3ReasoningParser(tok)
+    expected = ("想一想", "答案") if marker == "token" else (text, None)
+    assert split(parser, text, ids) == expected

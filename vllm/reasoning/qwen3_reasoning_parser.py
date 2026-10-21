@@ -226,7 +226,10 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         request: "ChatCompletionRequest | ResponsesRequest",
     ) -> tuple[str | None, str | None]:
         if not self.thinking_enabled:
-            return self.extract_reasoning(model_output, request)
+            # The chat template already closed reasoning in the prompt, and
+            # streaming routes every delta to content. A literal </think> in
+            # the answer must not split it here either.
+            return None, model_output
         boundary = self._new_boundary()
         self._observe_boundary(boundary, token_ids, 0, model_output)
         if not self._boundary_matches_text(boundary, model_output):

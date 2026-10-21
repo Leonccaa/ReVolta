@@ -20,6 +20,7 @@ class Qwen3ReasoningBoundary:
     reasoning_end: int | None = None
     content_start: int | None = None
     implicit_end: bool = False
+    start_seen: bool = False
 
     @property
     def ended(self) -> bool:
@@ -29,7 +30,11 @@ class Qwen3ReasoningBoundary:
         if self.ended:
             return
         if token_id == self.start_token_id:
-            self.reasoning_start = after
+            # Only the first opener starts reasoning; a later one is reasoning
+            # text, as in the text split (and already streamed as such).
+            if not self.start_seen:
+                self.start_seen = True
+                self.reasoning_start = after
         elif token_id == self.end_token_id:
             self.reasoning_end = before
             self.content_start = after

@@ -508,6 +508,35 @@ def test_token_split_falls_back_on_decode_mismatch(tok, generated, mutate):
     assert split(parser, text, ids) == expected
 
 
+@pytest.mark.parametrize("burst", [1, 5, 1000])
+def test_repeated_start_token_same_split(tok, burst):
+    # Only the first <think> opens reasoning; a second one is reasoning text.
+    # This matches the text-based split, which strips the first opener only.
+    ids = encode(tok, "<think>A<think>B</think>C")
+    text = tok.decode(ids)
+    expected = ("A<think>B", "C")
+    assert Qwen3ReasoningParser(tok).extract_reasoning(text, _request()) == expected
+    assert split(Qwen3ReasoningParser(tok), text, ids) == expected
+    parser = Qwen3ReasoningParser(tok)
+    previous, reasoning, content = "", "", ""
+    for offset in range(0, len(ids), burst):
+        cur_ids = ids[: offset + burst]
+        current = tok.decode(cur_ids)
+        out = parser.extract_reasoning_streaming(
+            previous,
+            current,
+            current[len(previous) :],
+            ids[:offset],
+            cur_ids,
+            cur_ids[offset:],
+        )
+        if out:
+            reasoning += out.reasoning or ""
+            content += out.content or ""
+        previous = current
+    assert (reasoning, content) == expected
+
+
 def test_reasoning_delta_preserves_unset_content(tok):
     ids = encode(tok, "ordinary reasoning")
     parser = Qwen3ReasoningParser(tok)

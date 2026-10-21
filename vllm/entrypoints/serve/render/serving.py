@@ -34,6 +34,7 @@ from vllm.entrypoints.serve.disagg.protocol import (
 from vllm.entrypoints.utils import (
     create_error_response,
     get_max_tokens,
+    validate_request_mm_kwargs,
 )
 from vllm.inputs import (
     EngineInput,
@@ -73,6 +74,7 @@ class OpenAIServingRender:
         chat_template: str | None,
         chat_template_content_format: ChatTemplateContentFormatOption,
         trust_request_chat_template: bool = False,
+        trust_request_mm_kwargs: bool = False,
         enable_auto_tools: bool = False,
         exclude_tools_when_tool_choice_none: bool = False,
         tool_parser: str | None = None,
@@ -89,6 +91,7 @@ class OpenAIServingRender:
             chat_template_content_format
         )
         self.trust_request_chat_template = trust_request_chat_template
+        self.trust_request_mm_kwargs = trust_request_mm_kwargs
         self.enable_auto_tools = enable_auto_tools
         self.exclude_tools_when_tool_choice_none = exclude_tools_when_tool_choice_none
         self.tool_parser: type[ToolParser] | None = ParserManager.get_tool_parser(
@@ -400,6 +403,11 @@ class OpenAIServingRender:
         should_include_tools: bool = True,
     ):
         """Build Harmony (GPT-OSS) messages and engine prompt from a chat request."""
+        validate_request_mm_kwargs(
+            mm_processor_kwargs=request.mm_processor_kwargs,
+            media_io_kwargs=request.media_io_kwargs,
+            trust_request_mm_kwargs=self.trust_request_mm_kwargs,
+        )
         messages: list[OpenAIMessage] = []
 
         # because of issues with pydantic we need to potentially
@@ -498,6 +506,11 @@ class OpenAIServingRender:
         skip_mm_cache: bool = False,
     ) -> list[EngineInput]:
         """Copied from OpenAIServing._preprocess_cmpl."""
+        validate_request_mm_kwargs(
+            mm_processor_kwargs=getattr(request, "mm_processor_kwargs", None),
+            media_io_kwargs=getattr(request, "media_io_kwargs", None),
+            trust_request_mm_kwargs=self.trust_request_mm_kwargs,
+        )
         renderer = self.renderer
         model_config = self.model_config
 
@@ -536,6 +549,11 @@ class OpenAIServingRender:
         skip_mm_cache: bool = False,
     ) -> tuple[list[ConversationMessage], list[EngineInput]]:
         """Copied from OpenAIServing._preprocess_chat."""
+        validate_request_mm_kwargs(
+            mm_processor_kwargs=getattr(request, "mm_processor_kwargs", None),
+            media_io_kwargs=getattr(request, "media_io_kwargs", None),
+            trust_request_mm_kwargs=self.trust_request_mm_kwargs,
+        )
         renderer = self.renderer
         mm_config = self.model_config.multimodal_config
 

@@ -25,11 +25,44 @@ from vllm.entrypoints.openai.engine.protocol import (
     StreamOptions,
 )
 from vllm.entrypoints.openai.models.protocol import LoRAModulePath
+from vllm.exceptions import VLLMValidationError
 from vllm.logger import current_formatter_type, init_logger
 from vllm.platforms import current_platform
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 logger = init_logger(__name__)
+
+
+def validate_request_mm_kwargs(
+    *,
+    mm_processor_kwargs: dict[str, Any] | None,
+    media_io_kwargs: dict[str, dict[str, Any]] | None,
+    trust_request_mm_kwargs: bool,
+) -> None:
+    """Reject untrusted per-request multimodal kwarg overrides.
+
+    Ported from vllm-project/vllm#58830 (31f2e70cd3e).
+    """
+    if trust_request_mm_kwargs:
+        return
+
+    if mm_processor_kwargs:
+        raise VLLMValidationError(
+            "Per-request mm_processor_kwargs are disabled by default because "
+            "they can change multimodal preprocessing resource usage. Start "
+            "the server with --trust-request-mm-kwargs only when clients "
+            "are trusted.",
+            parameter="mm_processor_kwargs",
+        )
+    if media_io_kwargs:
+        raise VLLMValidationError(
+            "Per-request media_io_kwargs are disabled by default because "
+            "they can change multimodal media loading resource usage. Start "
+            "the server with --trust-request-mm-kwargs only when clients "
+            "are trusted.",
+            parameter="media_io_kwargs",
+        )
+
 
 VLLM_SUBCMD_PARSER_EPILOG = (
     "For full list:            vllm {subcmd} --help=all\n"

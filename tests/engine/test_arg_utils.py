@@ -28,6 +28,17 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 
+def test_trust_request_mm_kwargs_cli():
+    from vllm.entrypoints.openai.cli_args import FrontendArgs
+
+    parser = FrontendArgs.add_cli_args(FlexibleArgumentParser())
+    assert not parser.parse_args([]).trust_request_mm_kwargs
+    assert parser.parse_args(["--trust-request-mm-kwargs"]).trust_request_mm_kwargs
+    assert not parser.parse_args(
+        ["--no-trust-request-mm-kwargs"]
+    ).trust_request_mm_kwargs
+
+
 @pytest.mark.parametrize(
     ("type", "value", "expected"),
     [

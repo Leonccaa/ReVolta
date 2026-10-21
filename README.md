@@ -643,8 +643,16 @@ GGUF are outside the build.
   `prompt_logprobs=20` measured about 2.3× ordinary prefill time.
 - **Standard NVFP4 draft.** Use the FP8 `mtp-fp8/` draft from the Uncensored AWQ
   repository, as in validation.
-- **Media.** Default per-prompt limits are 16 images, 1 video, and 16 audio items,
-  with download/decode budgets. See [multimodal input limits](.github/MULTIMODAL_INPUTS.md).
+- **Media.** Defaults are 8 images, 1 video, and 1 audio item per whole request;
+  images in historical chat messages count toward the 8-image limit. Qwen4Exp
+  resizes large images to at most 1,048,576 pixels using HF's existing resize
+  logic. Small text can become blurry; alignment near the area boundary can also
+  change images whose source area is slightly below the limit.
+  An empty `--mm-processor-kwargs '{}'`
+  selects this default; restore the checkpoint image budget with
+  `--mm-processor-kwargs '{"images_kwargs": {"size": {"longest_edge": 16777216, "shortest_edge": 65536}}}'`.
+  Video sampling defaults to 16 frames. Download/decode ceilings remain separate.
+  See [multimodal input limits](.github/MULTIMODAL_INPUTS.md).
 
 There is no GPU CI. Releases are checked on the reference machine.
 

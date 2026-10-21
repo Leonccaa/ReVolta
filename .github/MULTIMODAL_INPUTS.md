@@ -1,7 +1,8 @@
 # Multimodal input limits
 
-Media limits apply in the frontend. They do not change model computation for
-accepted inputs. EXIF orientation is applied when loading encoded images.
+Media admission limits apply in the frontend. Qwen4Exp also defaults to a smaller
+image processing budget, as described below. EXIF orientation is applied when
+loading encoded images.
 Transparent images (RGBA, LA, palette transparency and PNG tRNS) are composited
 onto white before RGB conversion. White preserves the existing RGBA behavior
 and matches the Qwen HF example workflow's
@@ -11,13 +12,44 @@ The generic Transformers RGB converter does not itself composite alpha.
 
 ## Defaults and overrides
 
-Unspecified modality counts default to **16 images, 1 video and 16 audio items**;
+Unspecified modality counts default to **8 images, 1 video and 1 audio item**;
 other inherited modalities retain 999. `--limit-mm-per-prompt` overrides each
 specified modality; a zero count disables that modality. For example,
-`--limit-mm-per-prompt '{"video": 1}'` now also limits images to 16.
+`--limit-mm-per-prompt '{"video": 1}'` also limits images to 8 and audio to 1.
+The 8-image limit counts the **whole request**, including images in historical
+chat messages, rather than only the latest message.
 These limits remain independent of the aggregate raw-media item ceiling below.
 Embedding-only and UUID-only cache references do not fetch raw media and are
 outside the raw-media byte accounting; their existing frontend limits still apply.
+
+Qwen4Exp defaults to **1,048,576 pixels (1024 × 1024 in area) per image** at the
+HF image processor. Larger decoded images are resized, rather than rejected by
+this processing budget. HF's existing `smart_resize` preserves the aspect ratio
+subject to alignment to 32-pixel multiples. The checkpoint's existing
+preprocessing still applies, including alignment and minimum-size rules;
+for example, 800 × 600 still becomes 800 × 608. Small text can become blurry
+when a large image is reduced. Crop the relevant region or raise the processing
+budget when fine detail matters. Near the area boundary, even a source image
+below 1,048,576 pixels can change if HF's 32-pixel rounding would otherwise put
+it over the budget. For example, 977 × 1073 changes from 992 × 1088 under the
+checkpoint budget to 960 × 1056 under the new budget.
+
+An omitted or empty `--mm-processor-kwargs '{}'` selects this default. Explicit
+image size settings (`size`, `max_pixels`, `min_pixels`, or `do_resize`, including
+settings inside `images_kwargs`) retain operator precedence. To restore the
+checkpoint's 16,777,216-pixel image budget, use:
+
+```bash
+--mm-processor-kwargs '{"images_kwargs": {"size": {"longest_edge": 16777216, "shortest_edge": 65536}}}'
+```
+
+The image default leaves the video processor's size unchanged. Generic top-level
+size overrides can also affect video processing through HF's existing routing;
+use `images_kwargs` for an image-only override. Startup logs report the effective
+image pixel budget and its source. The image dummy profile uses this same budget
+(1024 maximum image tokens by default instead of 16384 for the checkpoint).
+Encoder and KV memory capacity still depend on enabled video inputs and measured
+GPU allocations; a smaller image budget does not imply a fixed KV increase.
 
 | Server environment variable | Default | Scope |
 | --- | ---: | --- |
@@ -39,7 +71,7 @@ HTTP size errors are non-retryable validation failures and map to HTTP 400.
 `--media-io-kwargs '{"video": {"num_frames": 16}}'` remains a default sampling
 setting. Requests can override `num_frames` or `fps` using the existing merge
 rules: overriding either clears the other inherited field. The loader's fallback
-is still 32 frames when `num_frames` is omitted. The operator's 64-frame ceiling
+is 16 frames when `num_frames` is omitted. The operator's 64-frame ceiling
 and raster budget apply after these merges. `num_frames=-1` can load all frames only when the actual selected count fits
 the frame ceiling and raster budget; this is checked before frame allocation.
 Backends without pre-decode accounting are rejected while the decoded budget is

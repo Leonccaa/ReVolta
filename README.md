@@ -105,6 +105,12 @@ embedding table uses about 47.7 GiB of pinned host memory even with KV offload d
 80 GiB is the smallest tested passing memory configuration. With less than 128 GiB,
 reduce or disable the CPU KV pool.
 
+Image and video preprocessing also uses host memory, in the API server process. In one
+test, 8 concurrent requests with 8 different 2048-pixel images each used about 33 GB at
+peak. With a 32 GiB CPU KV pool on a 125 GiB host, the kernel then killed a worker. The
+same burst passed with a 16 GiB pool. If you expect bursts of large images or videos,
+use a smaller CPU KV pool or limit the image size and the number of concurrent requests.
+
 The AWQ checkpoint is 137 GB at the pinned revision:
 
 | Part | Format | Size | Where it runs |

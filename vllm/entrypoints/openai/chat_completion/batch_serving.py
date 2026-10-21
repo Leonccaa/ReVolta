@@ -5,6 +5,7 @@ import asyncio
 import time
 from collections.abc import AsyncGenerator
 from http import HTTPStatus
+from typing import Any
 
 from fastapi import Request
 
@@ -120,6 +121,7 @@ class OpenAIServingChatBatch(OpenAIServingChat):
         ]
 
         reasoning_parser: ReasoningParser | None = None
+        reasoning_parser_kwargs: dict[str, Any] | None = None
         if self.reasoning_parser_cls:
             chat_template_kwargs = self._effective_chat_template_kwargs(
                 single_requests[0]
@@ -128,6 +130,9 @@ class OpenAIServingChatBatch(OpenAIServingChat):
                 tokenizer,
                 chat_template_kwargs=chat_template_kwargs,  # type: ignore[call-arg]
             )
+            # Same as the chat path: the engine builds its own parser from
+            # these kwargs (e.g. to match stop strings only after reasoning).
+            reasoning_parser_kwargs = {"chat_template_kwargs": chat_template_kwargs}
 
         render_result = await self.render_batch_chat_request(request)
         if isinstance(render_result, ErrorResponse):
@@ -183,6 +188,7 @@ class OpenAIServingChatBatch(OpenAIServingChat):
                     priority=request.priority if hasattr(request, "priority") else 0,
                     data_parallel_rank=data_parallel_rank,
                     reasoning_ended=None,
+                    reasoning_parser_kwargs=reasoning_parser_kwargs,
                 )
             )
 

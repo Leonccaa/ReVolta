@@ -537,6 +537,78 @@ def test_repeated_start_token_same_split(tok, burst):
     assert (reasoning, content) == expected
 
 
+def test_batch_chat_guards_stop_like_chat(tok, monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm.entrypoints.openai.chat_completion.batch_serving import (
+        OpenAIServingChatBatch,
+    )
+    from vllm.entrypoints.openai.chat_completion.protocol import (
+        BatchChatCompletionRequest,
+    )
+
+    serving = OpenAIServingChatBatch.__new__(OpenAIServingChatBatch)
+    serving.renderer = SimpleNamespace(tokenizer=tok)
+    serving.reasoning_parser_cls = Qwen3ReasoningParser
+    serving.chat_template = None
+    serving.chat_template_content_format = "auto"
+    serving.default_chat_template_kwargs = {}
+    serving.models = SimpleNamespace(model_name=lambda lora_request=None: "test")
+    serving.model_config = SimpleNamespace(max_model_len=128)
+    serving.default_sampling_params = {}
+    serving.override_max_tokens = None
+    serving.request_logger = None
+    calls = []
+
+    def generate(*args, **kwargs):
+        calls.append(kwargs)
+        return _generate([])
+
+    async def render(request):
+        prompt = {"prompt_token_ids": encode(tok, "q<think>\n")}
+        return [[], []], [prompt, prompt]
+
+    async def full(*args, **kwargs):
+        return "done"
+
+    serving.engine_client = SimpleNamespace(generate=generate)
+    monkeypatch.setattr(serving, "_maybe_get_adapters", lambda *a, **k: None)
+    monkeypatch.setattr(serving, "_extract_prompt_len", lambda prompt: 3)
+    monkeypatch.setattr(serving, "render_batch_chat_request", render)
+    monkeypatch.setattr(serving, "chat_completion_full_generator_batch", full)
+    message = [{"role": "user", "content": "q"}]
+    request = BatchChatCompletionRequest(
+        model="test", messages=[message, message], stop=["STOP"], max_tokens=16
+    )
+    assert asyncio.run(serving.create_batch_chat_completion(request)) == "done"
+    assert len(calls) == 2
+    kwargs = calls[0].get("reasoning_parser_kwargs")
+    assert kwargs is not None and "chat_template_kwargs" in kwargs
+    assert calls[1].get("reasoning_parser_kwargs") == kwargs
+
+    # The engine request built from these kwargs gets the chat stop guard.
+    engine_request = EngineCoreRequest(
+        request_id="test",
+        external_req_id="test",
+        prompt_token_ids=encode(tok, "q<think>\n"),
+        mm_features=None,
+        sampling_params=SamplingParams(stop=["STOP"]),
+        pooling_params=None,
+        arrival_time=0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+        reasoning_ended=calls[0]["reasoning_ended"],
+        reasoning_parser_kwargs=kwargs,
+    )
+    decoder = IncrementalDetokenizer.from_new_request(
+        tok, engine_request, reasoning_parser_name="qwen3"
+    )
+    hit = decoder.update(encode(tok, "STOP inside</think>answer STOP tail"), False)
+    assert hit == "STOP"
+    assert decoder.output_text == "STOP inside</think>answer "
+
+
 def test_reasoning_delta_preserves_unset_content(tok):
     ids = encode(tok, "ordinary reasoning")
     parser = Qwen3ReasoningParser(tok)

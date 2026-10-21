@@ -13,6 +13,31 @@ from vllm.model_executor.layers.quantization.utils.fp4_local import (
 )
 
 
+def test_materialize_retries_failed_host_registration():
+    from vllm.models.qwen4_exp.nvidia import ple_layer
+
+    # Bypass distributed construction: only allocation/registration is under test.
+    layer = object.__new__(ple.NVFP4PinnedPLEEmbedding)
+    torch.nn.Module.__init__(layer)
+    layer.storage = None
+    layer.num_embeddings_per_partition = 4
+    layer.row_bytes = 18
+    layer.weight = torch.nn.Parameter(torch.empty(0), requires_grad=False)
+    layer.weight.tp_rank = 0
+    with patch.object(
+        ple_layer, "_pin_host_tensor_exact", side_effect=[RuntimeError("pin"), None]
+    ) as register:
+        with pytest.raises(RuntimeError, match="pin"):
+            layer.materialize()
+        layer.materialize()
+        assert register.call_count == 2
+        assert layer.storage is register.call_args.args[0]
+        storage = layer.storage
+        layer.materialize()
+        assert register.call_count == 2
+        assert layer.storage is storage
+
+
 @pytest.mark.parametrize("rank", range(4))
 def test_sharded_packed_rows_and_scale_loading(rank):
     import vllm.model_executor.layers.vocab_parallel_embedding as embeddings

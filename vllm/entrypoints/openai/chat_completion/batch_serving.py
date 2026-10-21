@@ -263,9 +263,12 @@ class OpenAIServingChatBatch(OpenAIServingChat):
                     logprobs = None
 
                 if reasoning_parser:
-                    reasoning, content = reasoning_parser.extract_reasoning(
-                        output.text,
-                        request=request,  # type: ignore[arg-type]
+                    reasoning, content = (
+                        reasoning_parser.extract_reasoning_with_token_ids(
+                            output.text,
+                            output.token_ids,
+                            request=request,  # type: ignore[arg-type]
+                        )
                     )
                     if not getattr(request, "include_reasoning", True):
                         reasoning = None

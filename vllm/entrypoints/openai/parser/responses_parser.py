@@ -71,8 +71,10 @@ class ResponsesParser:
         # Store the finish_reason from the output
         self.finish_reason = output.finish_reason
 
-        reasoning, content = self.reasoning_parser_instance.extract_reasoning(
-            output.text, request=self.request
+        reasoning, content = (
+            self.reasoning_parser_instance.extract_reasoning_with_token_ids(
+                output.text, output.token_ids, request=self.request
+            )
         )
         if reasoning:
             self.response_messages.append(

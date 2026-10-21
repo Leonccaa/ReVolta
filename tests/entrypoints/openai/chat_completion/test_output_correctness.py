@@ -99,6 +99,10 @@ def _tokenizer():
         "<tool_call>": 12,
         "</tool_call>": 13,
     }
+    spellings = {10: "<think>", 11: "</think>", 12: "<tool_call>", 13: "</tool_call>"}
+    tokenizer.decode.side_effect = lambda ids, **kwargs: "".join(
+        spellings.get(i, "") for i in ids
+    )
     return tokenizer
 
 
@@ -528,11 +532,8 @@ def test_stop_string_lookback_logprobs_are_preserved(
     )
     held_back = len(_STOP) - 1
     assert [step.outputs[0].text for step in outputs[:held_back]] == [""] * held_back
-    # With thinking on, the text held back when </think> is sampled arrives in
-    # later steps, which the reasoning parser does not split correctly; only
-    # the logprobs are checked then.
-    if not thinking:
-        assert _text(choices[0], "content") == "answer "
+    assert _text(choices[0], "content") == ("\n\n" if thinking else "") + "answer "
+    assert _text(choices[0], "reasoning") == ("planning" if thinking else "")
 
 
 @pytest.mark.parametrize("stop", [None, [_STOP]])

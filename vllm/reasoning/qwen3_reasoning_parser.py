@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 from vllm.entrypoints.openai.engine.protocol import DeltaMessage
 from vllm.reasoning.basic_parsers import BaseThinkingReasoningParser
+from vllm.reasoning.qwen3_boundary import Qwen3ReasoningBoundary
 
 if TYPE_CHECKING:
     from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
@@ -49,6 +50,8 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         self._tool_call_token_id = self.vocab.get(self._tool_call_tag)
         self._tool_call_end_tag = "</tool_call>"
         self._tool_call_end_token_id = self.vocab.get(self._tool_call_end_tag)
+        self._stream_boundary = self._new_boundary()
+        self._boundary_tokens_seen = 0
 
     @property
     def start_token(self) -> str:
@@ -157,6 +160,77 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         # Everything generated so far is reasoning.
         return model_output, None
 
+    def _new_boundary(self) -> Qwen3ReasoningBoundary:
+        return Qwen3ReasoningBoundary(
+            self.start_token_id, self.end_token_id, self._tool_call_token_id
+        )
+
+    def _observe_boundary(
+        self,
+        boundary: Qwen3ReasoningBoundary,
+        ids: Sequence[int],
+        start: int,
+        text: str,
+    ) -> None:
+        # Decode only marker prefixes, once per boundary, rather than searching
+        # for their spelling. Ordinary BPE tokens can spell the same literal.
+        for i in range(start, len(ids)):
+            if boundary.ended:
+                break
+            token_id = ids[i]
+            if token_id not in (
+                self.start_token_id,
+                self.end_token_id,
+                self._tool_call_token_id,
+            ):
+                continue
+            before = self.model_tokenizer.decode(
+                list(ids[:i]), skip_special_tokens=False
+            )
+            after = self.model_tokenizer.decode(
+                list(ids[: i + 1]), skip_special_tokens=False
+            )
+            # Some tokenizers classify the markers as special and remove them.
+            # Choose the decode mode matching the actual detokenized prefix.
+            if not after.startswith(text) and not text.startswith(after):
+                before = self.model_tokenizer.decode(
+                    list(ids[:i]), skip_special_tokens=True
+                )
+                after = self.model_tokenizer.decode(
+                    list(ids[: i + 1]), skip_special_tokens=True
+                )
+            boundary.observe(token_id, len(before), len(after))
+
+    def extract_reasoning_with_token_ids(
+        self,
+        model_output: str,
+        token_ids: Sequence[int],
+        request: "ChatCompletionRequest | ResponsesRequest",
+    ) -> tuple[str | None, str | None]:
+        if not self.thinking_enabled:
+            return self.extract_reasoning(model_output, request)
+        boundary = self._new_boundary()
+        self._observe_boundary(boundary, token_ids, 0, model_output)
+        reasoning = model_output[boundary.reasoning_start : boundary.reasoning_end]
+        content = (
+            model_output[boundary.content_start :]
+            if boundary.content_start is not None
+            else None
+        )
+        # Preserve the legacy empty-string result for an explicit end (or
+        # truncated empty output); only implicit tool entry uses None.
+        return (
+            reasoning or None
+        ) if boundary.implicit_end else reasoning, content or None
+
+    def is_reasoning_output_end(
+        self, input_ids: Sequence[int], delta_ids: Sequence[int], text: str
+    ) -> bool:
+        boundary = self._stream_boundary
+        return (
+            boundary.content_start is not None and len(text) >= boundary.content_start
+        )
+
     def extract_reasoning_streaming(
         self,
         previous_text: str,
@@ -166,66 +240,37 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         current_token_ids: Sequence[int],
         delta_token_ids: Sequence[int],
     ) -> DeltaMessage | None:
-        """
-        Extract reasoning content from a streaming delta.
-
-        Since <think> is placed in the prompt by the chat template, all
-        generated tokens before </think> are reasoning and tokens after
-        are content.
-
-        NOTE: When thinking is disabled, no think tokens appear in the
-        generated output. The serving layer detects this via
-        prompt_is_reasoning_end and routes deltas as content without
-        calling this method.
-        """
-        # Strip <think> from delta if present (old template / edge case
-        # where the model generates <think> itself).
-        if self.start_token_id in delta_token_ids:
-            start_idx = delta_text.find(self.start_token)
-            if start_idx >= 0:
-                delta_text = delta_text[start_idx + len(self.start_token) :]
-
-        if self.end_token_id in delta_token_ids:
-            # End token in this delta: split reasoning from content.
-            end_index = delta_text.find(self.end_token)
-            if end_index >= 0:
-                reasoning = delta_text[:end_index]
-                content = delta_text[end_index + len(self.end_token) :]
-                if not reasoning and not content:
-                    return None
-                return DeltaMessage(
-                    reasoning=reasoning if reasoning else None,
-                    content=content if content else None,
-                )
-            # end_token_id in IDs but not in text (already stripped)
+        if not previous_token_ids:
+            self._stream_boundary = self._new_boundary()
+            self._boundary_tokens_seen = 0
+        boundary = self._stream_boundary
+        self._observe_boundary(
+            boundary, current_token_ids, self._boundary_tokens_seen, current_text
+        )
+        self._boundary_tokens_seen = len(current_token_ids)
+        # Token ids may be ahead of text because stop lookback holds a suffix.
+        # Keep assigning delayed text to reasoning until its true offset, and
+        # suppress only the actual marker span (possibly across many deltas).
+        lo, hi = len(previous_text), len(current_text)
+        reasoning_end = boundary.reasoning_end
+        reasoning = current_text[
+            max(lo, boundary.reasoning_start) : min(hi, reasoning_end)
+            if reasoning_end is not None
+            else hi
+        ]
+        content = (
+            current_text[max(lo, boundary.content_start) : hi]
+            if boundary.content_start is not None
+            else ""
+        )
+        if not reasoning and not content:
             return None
-
-        # Implicit reasoning end via <tool_call>.
-        if (
-            self._tool_call_token_id is not None
-            and self._tool_call_token_id in delta_token_ids
+        # Preserve unset fields on ordinary deltas. Serving serializes unset
+        # and explicitly-null fields differently, even if their values agree.
+        if boundary.content_start is None or (
+            boundary.reasoning_end is not None and hi <= boundary.reasoning_end
         ):
-            tool_index = delta_text.find(self._tool_call_tag)
-            if tool_index >= 0:
-                reasoning = delta_text[:tool_index]
-                content = delta_text[tool_index:]
-                return DeltaMessage(
-                    reasoning=reasoning if reasoning else None,
-                    content=content if content else None,
-                )
-
-        # No end token in this delta.
-        if not delta_text:
-            # Nothing left after stripping start token.
-            return None
-        elif self.end_token_id in previous_token_ids:
-            # End token already passed: everything is content now.
-            return DeltaMessage(content=delta_text)
-        elif (
-            self._tool_call_token_id is not None
-            and self._tool_call_token_id in previous_token_ids
-        ):
-            return DeltaMessage(content=delta_text)
-        else:
-            # No end token yet: still in reasoning phase.
-            return DeltaMessage(reasoning=delta_text)
+            return DeltaMessage(reasoning=reasoning)
+        if lo >= boundary.content_start:
+            return DeltaMessage(content=content)
+        return DeltaMessage(reasoning=reasoning or None, content=content or None)

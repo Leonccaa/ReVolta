@@ -30,12 +30,21 @@ from vllm.tool_parsers.structural_tag_registry import (
     get_model_structural_tag,
 )
 from vllm.tool_parsers.utils import (
+    _TYPE_ALIASES,
     coerce_to_schema_type,
     extract_types_from_schema,
     find_tool_properties,
 )
 
 logger = init_logger(__name__)
+
+
+class _JSONObject(dict):
+    """Keep pairs for top-level argument deduplication; nested dicts stay last-wins."""
+
+    def __init__(self, pairs):
+        super().__init__(pairs)
+        self.pairs = pairs
 
 
 class Qwen3CoderToolParser(ToolParser):
@@ -120,6 +129,13 @@ class Qwen3CoderToolParser(ToolParser):
         self.accumulated_params = {}
         self.streaming_request = None
         self.json_tool_calls_streamed = 0
+        self._duplicate_params_warned: set[int] = set()
+        self._string_param_start: int | None = None
+        self._string_sent_to = 0
+        self._string_tool_start = 0
+        self._string_waiting_space = False
+        self._has_streamed_string = False
+        self._string_waiting_header = False
 
     def _convert_param_value(
         self, param_value: str, param_name: str, param_config: dict, func_name: str
@@ -228,7 +244,9 @@ class Qwen3CoderToolParser(ToolParser):
                 return position
             search_idx = position + len(self.parameter_end_token)
 
-    def _parse_xml_function_call(self, function_call_str: str) -> ToolCall | None:
+    def _parse_xml_function_call(
+        self, function_call_str: str, *, warn_duplicates: bool = True
+    ) -> ToolCall | None:
         # Extract function name
         end_index = function_call_str.find(">")
         # If there's no ">" character, this is not a valid xml function call
@@ -245,6 +263,13 @@ class Qwen3CoderToolParser(ToolParser):
             if name_end == -1:
                 continue
             param_name = parameters[name_start:name_end]
+            if param_name in param_dict:
+                if warn_duplicates:
+                    logger.warning(
+                        "Ignoring duplicate tool parameter %r (first value wins)",
+                        param_name,
+                    )
+                continue
             value_start = name_end + 1
             next_start = (
                 param_starts[param_index + 1]
@@ -288,7 +313,7 @@ class Qwen3CoderToolParser(ToolParser):
         tool call.
         """
         try:
-            raw_call = json.loads(payload.strip())
+            raw_call = json.loads(payload.strip(), object_pairs_hook=_JSONObject)
         except (TypeError, json.JSONDecodeError):
             return None
         if not isinstance(raw_call, dict):
@@ -300,11 +325,22 @@ class Qwen3CoderToolParser(ToolParser):
             return None
         if isinstance(arguments, str):
             try:
-                arguments = json.loads(arguments)
+                arguments = json.loads(arguments, object_pairs_hook=_JSONObject)
             except json.JSONDecodeError:
                 return None
         if not isinstance(arguments, dict):
             return None
+        if isinstance(arguments, _JSONObject):
+            first_arguments = {}
+            for param_name, value in arguments.pairs:
+                if param_name in first_arguments:
+                    logger.warning(
+                        "Ignoring duplicate tool parameter %r (first value wins)",
+                        param_name,
+                    )
+                    continue
+                first_arguments[param_name] = value
+            arguments = first_arguments
 
         return ToolCall(
             type="function",
@@ -401,7 +437,9 @@ class Qwen3CoderToolParser(ToolParser):
         if func_content_end != -1:
             func_content = tool_text[func_start:func_content_end]
             try:
-                parsed_tool = self._parse_xml_function_call(func_content)
+                parsed_tool = self._parse_xml_function_call(
+                    func_content, warn_duplicates=False
+                )
                 if parsed_tool and self.current_tool_index < len(
                     self.prev_tool_call_arr
                 ):
@@ -559,6 +597,129 @@ class Qwen3CoderToolParser(ToolParser):
                 tools_called=False, tool_calls=[], content=model_output
             )
 
+    def _is_string_param(self, name: str, config: dict) -> bool:
+        types = extract_types_from_schema(config.get(name, {}))
+        return {
+            _TYPE_ALIASES.get(t.strip().lower(), t.strip().lower()) for t in types
+        } == {"string"}
+
+    def _safe_string_end(self, text: str, start: int) -> tuple[int, bool]:
+        """Hold the earliest unresolved structural suffix, not just the last <.
+
+        A literal </parameter> is released only when lookahead disproves a
+        structural close. Retain all whitespace after a possible close. This
+        intentionally cannot promise bounded silence for ambiguous input.
+        """
+        markers = (
+            self.parameter_end_token,
+            self.function_end_token,
+            self.tool_call_end_token,
+            self.parameter_prefix,
+        )
+        search = start
+        while (position := text.find("<", search)) != -1:
+            suffix = text[position:]
+            if any(marker.startswith(suffix) for marker in markers):
+                return position, False
+            if suffix.startswith((self.function_end_token, self.tool_call_end_token)):
+                return position, True
+            if suffix.startswith(self.parameter_prefix):
+                end = text.find(">", position)
+                if end == -1:
+                    self._string_waiting_header = True
+                    return position, False
+                # Preserve the existing inline-code and unknown-name rules.
+                config = find_tool_properties(
+                    self.tools, self.current_function_name or ""
+                )
+                if position in self._parameter_start_positions(text, config):
+                    return position, True
+                search = end + 1
+                continue
+            if suffix.startswith(self.parameter_end_token):
+                after = position + len(self.parameter_end_token)
+                while after < len(text) and text[after].isspace():
+                    after += 1
+                rest = text[after:]
+                if not rest or any(marker.startswith(rest) for marker in markers):
+                    self._string_waiting_space = not rest
+                    return position, False
+                if rest.startswith(self.parameter_prefix):
+                    if ">" not in rest:
+                        self._string_waiting_header = True
+                        return position, False
+                    return position, True
+                if rest.startswith((self.function_end_token, self.tool_call_end_token)):
+                    return position, True
+            search = position + 1
+        # The final parser removes exactly one trailing LF. Keep it until we
+        # know whether it is the end of the value.
+        return len(text) - int(text.endswith("\n")), False
+
+    def _string_fragment(
+        self,
+        tool_text: str,
+        value_start: int,
+        value_end: int | None,
+        name: str,
+    ) -> str:
+        fragments = []
+        if self._string_param_start is None:
+            self._has_streamed_string = True
+            self._string_param_start = value_start
+            self._string_sent_to = value_start
+            if (
+                self._string_sent_to < len(tool_text)
+                and tool_text[self._string_sent_to] == "\n"
+            ):
+                self._string_sent_to += 1
+            separator = ", " if self.accumulated_params else ""
+            fragments.append(separator + json.dumps(name, ensure_ascii=False) + ': "')
+        # A value can start in a later delta, so defer its leading LF decision.
+        if (
+            self._string_sent_to == value_start
+            and value_start < len(tool_text)
+            and tool_text[value_start] == "\n"
+        ):
+            self._string_sent_to += 1
+        if value_end is None:
+            safe_end, _ = self._safe_string_end(tool_text, self._string_sent_to)
+            if (
+                safe_end < len(tool_text)
+                and safe_end > 0
+                and tool_text[safe_end - 1] == "\n"
+            ):
+                safe_end -= 1
+        else:
+            safe_end = value_end - int(tool_text[value_start:value_end].endswith("\n"))
+        safe_end = max(self._string_sent_to, safe_end)
+        piece = tool_text[self._string_sent_to : safe_end]
+        fragments.append(json.dumps(piece, ensure_ascii=False)[1:-1])
+        self._string_sent_to = safe_end
+        if value_end is not None:
+            fragments.append('"')
+            self._string_param_start = None
+            self._string_waiting_space = False
+            self._string_waiting_header = False
+        return "".join(fragments)
+
+    def _record_string_delta(self, fragment: str) -> DeltaMessage | None:
+        if not fragment:
+            return None
+        index = self.current_tool_index
+        self.streamed_args_for_tool[index] += fragment
+        # During length truncation expected state is the real JSON prefix,
+        # never stale {} and never an invented closed/successful call.
+        self.prev_tool_call_arr[index]["arguments"] = self.streamed_args_for_tool[index]
+        return DeltaMessage(
+            tool_calls=[
+                DeltaToolCall(
+                    index=index,
+                    function=DeltaFunctionCall(arguments=fragment),
+                )
+            ]
+        )
+
     def extract_tool_calls_streaming(
         self,
         previous_text: str,
@@ -600,6 +761,30 @@ class Qwen3CoderToolParser(ToolParser):
                     return DeltaMessage(content="")
             return None
 
+        if self._string_param_start is not None:
+            # For a long ordinary value, scan/escape only its new suffix.
+            # Re-enter the existing structural parser only at a possible tag.
+            if (
+                self._string_waiting_space
+                and delta_text.isspace()
+                or self._string_waiting_header
+                and ">" not in delta_text
+            ):
+                return None
+            self._string_waiting_space = False
+            self._string_waiting_header = False
+            tool_text = current_text[self._string_tool_start :]
+            _, structural = self._safe_string_end(tool_text, self._string_sent_to)
+            if not structural:
+                return self._record_string_delta(
+                    self._string_fragment(
+                        tool_text,
+                        self._string_param_start,
+                        None,
+                        self.current_param_name or "",
+                    )
+                )
+
         # Update accumulated text
         self.accumulated_text = current_text
 
@@ -626,6 +811,8 @@ class Qwen3CoderToolParser(ToolParser):
                 self.json_started = False
                 self.json_closed = False
                 self.accumulated_params = {}
+                self._duplicate_params_warned.clear()
+                self._has_streamed_string = False
 
                 # Check if there are more tool calls
                 tool_starts = current_text.count(self.tool_call_start_token)
@@ -808,6 +995,13 @@ class Qwen3CoderToolParser(ToolParser):
 
                 name_end = remaining.find(">")
                 current_param_name = remaining[:name_end]
+                duplicate = current_param_name in self.accumulated_params
+                if duplicate and param_idx not in self._duplicate_params_warned:
+                    logger.warning(
+                        "Ignoring duplicate tool parameter %r (first value wins)",
+                        current_param_name,
+                    )
+                    self._duplicate_params_warned.add(param_idx)
 
                 value_start = param_start + name_end + 1
                 next_param_idx = (
@@ -838,9 +1032,24 @@ class Qwen3CoderToolParser(ToolParser):
                         # Recover a missing final close before function/tool end.
                         value_end = container_end
                     else:
-                        # Wait for structural lookahead. The current suffix may
-                        # be literal </parameter> text inside a long value.
+                        if not duplicate and self._is_string_param(
+                            current_param_name, param_config
+                        ):
+                            self.current_param_name = current_param_name
+                            self._string_tool_start = tool_start_idx
+                            json_fragments.append(
+                                self._string_fragment(
+                                    tool_text,
+                                    value_start,
+                                    None,
+                                    current_param_name,
+                                )
+                            )
                         break
+
+                if duplicate:
+                    self.param_count += 1
+                    continue
 
                 param_value = tool_text[value_start:value_end]
                 if param_value.startswith("\n"):
@@ -860,7 +1069,14 @@ class Qwen3CoderToolParser(ToolParser):
 
                 serialized_value = json.dumps(converted_value, ensure_ascii=False)
 
-                if self.param_count == 0:
+                if self._string_param_start == value_start:
+                    json_fragment = self._string_fragment(
+                        tool_text,
+                        value_start,
+                        value_end,
+                        current_param_name,
+                    )
+                elif len(self.accumulated_params) == 1:
                     json_fragment = f'"{current_param_name}": {serialized_value}'
                 else:
                     json_fragment = f', "{current_param_name}": {serialized_value}'
@@ -873,6 +1089,10 @@ class Qwen3CoderToolParser(ToolParser):
 
                 if self.current_tool_index < len(self.streamed_args_for_tool):
                     self.streamed_args_for_tool[self.current_tool_index] += combined
+                    if self._has_streamed_string:
+                        self.prev_tool_call_arr[self.current_tool_index][
+                            "arguments"
+                        ] = self.streamed_args_for_tool[self.current_tool_index]
                 else:
                     logger.warning(
                         "streamed_args_for_tool out of sync: index=%d len=%d",

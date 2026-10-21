@@ -77,6 +77,7 @@ from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.model_loader.reload import (
     finalize_layerwise_reload,
     initialize_layerwise_reload,
+    validate_weight_reload,
 )
 from vllm.model_executor.models.interfaces import (
     MixtureOfExperts,
@@ -10665,6 +10666,9 @@ class GPUModelRunner(
         :param is_checkpoint_format: set to False if weights have already been processed
             into kernel format (repacking, renaming, etc.)
         """
+        model = self.get_model()
+        validate_weight_reload(model)
+
         # TODO(@kylesayrs): generalize to all runners and loaders
         # argument validation
         if weights_iterator is None and not is_checkpoint_format:
@@ -10674,7 +10678,6 @@ class GPUModelRunner(
                 "to avoid weight reloading errors"
             )
 
-        model = self.get_model()
         weights_to_load = {name for name, _ in model.named_parameters()}
         counter_before_reloading = time.perf_counter()
 

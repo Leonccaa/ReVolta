@@ -19,6 +19,7 @@ Limitations:
 
 __all__ = [
     "record_metadata_for_reloading",
+    "validate_weight_reload",
     "initialize_layerwise_reload",
     "finalize_layerwise_processing",
     "finalize_layerwise_reload",
@@ -31,6 +32,7 @@ from .layerwise import (
     finalize_layerwise_reload,
     initialize_layerwise_reload,
     record_metadata_for_reloading,
+    validate_weight_reload,
 )
 from .torchao_decorator import (
     set_torchao_reload_attrs,

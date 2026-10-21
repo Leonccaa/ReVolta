@@ -881,6 +881,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     @torch.inference_mode()
     def profile_run(self) -> None:
+        encoder_cache = None
+        mm_config = self.model_config.multimodal_config
+        if (
+            self.supports_mm_inputs
+            and self.is_first_pp_rank
+            and mm_config is not None
+            and mm_config.mm_encoder_tp_mode == "data"
+        ):
+            encoder_cache = self.model_state.encoder_runner.profile(
+                self.vllm_config, MULTIMODAL_REGISTRY
+            )
         hidden_states, sample_hidden_states = self._dummy_run(
             self.max_num_tokens, skip_attn=True, is_profile=True
         )
@@ -894,7 +905,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self._dummy_pooler_run(hidden_states)
 
         torch.accelerator.synchronize()
-        del hidden_states, sample_hidden_states
+        del hidden_states, sample_hidden_states, encoder_cache
         gc.collect()
 
     def post_kv_cache_wake_up(self) -> None:

@@ -693,12 +693,22 @@ class DelegatingParser(Parser):
                 current_token_ids=current_token_ids,
                 delta_token_ids=delta_token_ids,
             )
-            assert self._reasoning_parser is not None
-            if self._reasoning_parser.is_reasoning_output_end(
+            reasoning_parser = self._reasoning_parser
+            assert reasoning_parser is not None
+            if reasoning_parser.is_reasoning_output_end(
                 current_token_ids, delta_token_ids, current_text
             ):
                 state.reasoning_ended = True
-                current_token_ids = self.extract_content_ids(current_token_ids)
+                # A text-aware boundary can be reached in a later delta than
+                # the one carrying the end token; search all ids for it then.
+                # Other parsers keep the delta-only form.
+                text_aware = (
+                    type(reasoning_parser).is_reasoning_output_end
+                    is not ReasoningParser.is_reasoning_output_end
+                )
+                current_token_ids = self.extract_content_ids(
+                    current_token_ids if text_aware else delta_token_ids
+                )
                 current_text = (
                     delta_message.content
                     if delta_message and delta_message.content

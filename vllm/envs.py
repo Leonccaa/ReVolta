@@ -5544,7 +5544,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="configuration",
         declared_default="True",
         effective_default="True",
-        automatic_conditions=(),
+        automatic_conditions=(
+            (
+                "Only ModelOpt NVFP4 checkpoints (including mixed NVFP4 layers); "
+                "vllm/revolta_profile.py:apply_revolta_profile sets '1' "
+                "for unset values on FP16 QSA SM70 TP4."
+            ),
+        ),
         acceleration_paths=("TurboMind NVFP4",),
         user_visible=False,
     ),
@@ -5622,7 +5628,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="experimental",
         declared_default="False",
         effective_default="False",
-        automatic_conditions=(),
+        automatic_conditions=(
+            (
+                "Only ModelOpt NVFP4 checkpoints (including mixed NVFP4 layers); "
+                "vllm/revolta_profile.py:apply_revolta_profile sets '1' "
+                "for unset values on FP16 QSA SM70 TP4."
+            ),
+        ),
         acceleration_paths=("TurboMind NVFP4",),
         user_visible=False,
     ),
@@ -5640,7 +5652,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="experimental",
         declared_default="False",
         effective_default="False",
-        automatic_conditions=(),
+        automatic_conditions=(
+            (
+                "Only ModelOpt NVFP4 checkpoints (including mixed NVFP4 layers); "
+                "vllm/revolta_profile.py:apply_revolta_profile sets '0' "
+                "for unset values on FP16 QSA SM70 TP4."
+            ),
+        ),
         acceleration_paths=("TurboMind NVFP4",),
         user_visible=False,
     ),
@@ -5734,7 +5752,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="experimental",
         declared_default="False",
         effective_default="False",
-        automatic_conditions=(),
+        automatic_conditions=(
+            (
+                "Only ModelOpt NVFP4 checkpoints (including mixed NVFP4 layers); "
+                "vllm/revolta_profile.py:apply_revolta_profile sets '1' "
+                "for unset values on FP16 QSA SM70 TP4."
+            ),
+        ),
         acceleration_paths=("TurboMind NVFP4",),
         user_visible=False,
     ),
@@ -5751,7 +5775,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="experimental",
         declared_default="False",
         effective_default="False",
-        automatic_conditions=(),
+        automatic_conditions=(
+            (
+                "Only ModelOpt NVFP4 checkpoints (including mixed NVFP4 layers); "
+                "vllm/revolta_profile.py:apply_revolta_profile sets '1' "
+                "for unset values on FP16 QSA SM70 TP4."
+            ),
+        ),
         acceleration_paths=("TurboMind NVFP4",),
         user_visible=False,
     ),
@@ -7913,7 +7943,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="deprecated",
         declared_default="True",
         effective_default="True",
-        automatic_conditions=(),
+        automatic_conditions=(
+            (
+                "Only ModelOpt NVFP4 checkpoints (including mixed NVFP4 layers); "
+                "vllm/revolta_profile.py:apply_revolta_profile sets '1' "
+                "for unset values on FP16 QSA SM70 TP4."
+            ),
+        ),
         acceleration_paths=("TurboMind FP8",),
         user_visible=False,
     ),
@@ -7953,7 +7989,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="configuration",
         declared_default="True",
         effective_default="True",
-        automatic_conditions=(),
+        automatic_conditions=(
+            (
+                "Only ModelOpt NVFP4 checkpoints (including mixed NVFP4 layers); "
+                "vllm/revolta_profile.py:apply_revolta_profile sets '1' "
+                "for unset values on FP16 QSA SM70 TP4."
+            ),
+        ),
         acceleration_paths=("TurboMind NVFP4",),
         user_visible=False,
     ),
@@ -7971,7 +8013,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="configuration",
         declared_default="True",
         effective_default="True",
-        automatic_conditions=(),
+        automatic_conditions=(
+            (
+                "Only ModelOpt NVFP4 checkpoints (including mixed NVFP4 layers); "
+                "vllm/revolta_profile.py:apply_revolta_profile sets '1' "
+                "for unset values on FP16 QSA SM70 TP4."
+            ),
+        ),
         acceleration_paths=("TurboMind NVFP4",),
         user_visible=False,
     ),
@@ -15962,11 +16010,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         automatic_conditions=(
             (
+                "Only ModelOpt NVFP4 checkpoints (including mixed NVFP4 layers); "
+                "vllm/revolta_profile.py:apply_revolta_profile sets '700' "
+                "for unset values on FP16 QSA SM70 TP4."
+            ),
+            (
                 "vllm/revolta_profile.py:apply_revolta_profile sets '700' when all "
                 "visible CUDA devices are SM70, selector metadata describes QSA, "
                 "activation dtype is FP16 and TP=4; explicit environment values win. "
-                "Only AWQ checkpoints; NVFP4 retains the upstream default for this "
-                "item."
+                "Only AWQ checkpoints in this condition."
             ),
         ),
         acceleration_paths=(),

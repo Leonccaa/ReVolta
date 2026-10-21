@@ -95,6 +95,20 @@ def test_defaults_by_format_and_interconnect(profile, quantization, mode):
         expected.pop("VLLM_SM70_CAR_VMM_SAFE")
     if quantization == "awq":
         expected.update(AWQ)
+    elif quantization == "modelopt_fp4":
+        expected.update(
+            {
+                "VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE": "1",
+                "VLLM_SM70_NVFP4_QWEN38_MOE_RAW_GROUPED_DECODE": "1",
+                "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE": "1",
+                "VLLM_SM70_NVFP4_MOE_GROUPED_DECODE": "0",
+                "VLLM_SM70_NVFP4_TURBOMIND": "1",
+                "VLLM_SM70_FP8_TURBOMIND": "1",
+                "VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL": "1",
+                "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES": "1",
+                "VLLM_V2_CUDAGRAPH_MEM_MIB": "700",
+            }
+        )
     assert {
         k: v
         for k, v in os.environ.items()

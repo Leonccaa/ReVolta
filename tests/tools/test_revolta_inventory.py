@@ -19,11 +19,11 @@ def inventory():
 def test_profile_inventory_is_complete(inventory):
     data, errors = inventory.collect(inventory.ROOT)
     assert not errors
-    assert len(data["profile_defaults"]) == 3
+    assert len(data["profile_defaults"]) == 4
 
 
 @pytest.mark.parametrize(
-    "broken", ["registration", "condition", "format", "interconnect"]
+    "broken", ["registration", "condition", "format", "nvfp4_format", "interconnect"]
 )
 def test_missing_metadata_is_rejected(inventory, tmp_path, broken):
     source = Path(inventory.ROOT / "vllm/envs.py").read_text()
@@ -37,6 +37,8 @@ def test_missing_metadata_is_rejected(inventory, tmp_path, broken):
         )
     elif broken == "format":
         source = source.replace("Only AWQ checkpoints", "missing_format")
+    elif broken == "nvfp4_format":
+        source = source.replace("Only ModelOpt NVFP4 checkpoints", "missing_nvfp4")
     else:
         source = source.replace("no_p2p", "missing_interconnect")
     (tmp_path / "vllm").mkdir()

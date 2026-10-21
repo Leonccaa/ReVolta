@@ -27,7 +27,12 @@ def collect(root: Path) -> tuple[dict, list[str]]:
             isinstance(node, ast.Assign)
             and isinstance(node.targets[0], ast.Name)
             and node.targets[0].id
-            in ("COMMON_DEFAULTS", "AWQ_DEFAULTS", "CUSTOM_AR_DEFAULTS")
+            in (
+                "COMMON_DEFAULTS",
+                "AWQ_DEFAULTS",
+                "NVFP4_DEFAULTS",
+                "CUSTOM_AR_DEFAULTS",
+            )
         ):
             tables[node.targets[0].id] = ast.literal_eval(node.value)
         elif (
@@ -47,9 +52,14 @@ def collect(root: Path) -> tuple[dict, list[str]]:
                 errors.append(f"{name}: missing profile automatic_conditions")
             if group == "AWQ_DEFAULTS" and "Only AWQ checkpoints" not in conditions:
                 errors.append(f"{name}: missing AWQ condition")
+            if (
+                group == "NVFP4_DEFAULTS"
+                and "Only ModelOpt NVFP4 checkpoints" not in conditions
+            ):
+                errors.append(f"{name}: missing NVFP4 condition")
             if group == "CUSTOM_AR_DEFAULTS" and "no_p2p" not in conditions:
                 errors.append(f"{name}: missing interconnect condition")
-    if len(tables) != 3:
+    if len(tables) != 4:
         errors.append("Missing ReVolta default tables")
     kernel_tree = ast.parse((root / "vllm/config/kernel.py").read_text())
     kernel_fields = {

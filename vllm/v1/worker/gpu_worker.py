@@ -37,6 +37,7 @@ from vllm.distributed.kv_transfer import (
 )
 from vllm.distributed.parallel_state import (
     Handle,
+    get_dcp_group,
     get_pp_group,
     get_tp_group,
 )
@@ -512,6 +513,34 @@ class Worker(WorkerBase):
             )
         self.model_runner.reload_weights(*args, **kwargs)
 
+    def _warmup_profile_communicators(self) -> None:
+        """Create c10d TP/DCP NCCL communicators before profiling peaks.
+
+        Bypass custom AR and PyNCCL: warming those does not initialize the
+        separate c10d communicators used by attention collectives.
+        """
+        if not current_platform.is_cuda():
+            return
+        seen = set()
+        probe = None
+        for name, group in (("TP", get_tp_group()), ("DCP", get_dcp_group())):
+            device_group = group.device_group
+            if (
+                group.world_size <= 1
+                or id(device_group) in seen
+                or torch.distributed.get_backend(device_group) != "nccl"
+            ):
+                continue
+            if probe is None:
+                probe = torch.zeros(1, dtype=torch.float32, device=self.device)
+            torch.distributed.all_reduce(probe, group=device_group)
+            seen.add(id(device_group))
+            logger.info(
+                "Warmed c10d NCCL %s communicator before memory profiling", name
+            )
+        if probe is not None:
+            torch.accelerator.synchronize(self.device)
+
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much
@@ -525,6 +554,7 @@ class Worker(WorkerBase):
             You may limit the usage of GPU memory
             by adjusting the `gpu_memory_utilization` parameter.
         """
+        self._warmup_profile_communicators()
         # Compilation and lazy workspaces have very different lifetimes. Avoid
         # pinning large split segments behind small persistent allocations on
         # SM70, then restore the serving allocator before measuring its peak.

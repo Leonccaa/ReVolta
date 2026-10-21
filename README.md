@@ -161,7 +161,7 @@ concurrent requests in testing, and a 48 GiB CPU KV pool.
 
 ### 1. Install
 
-The distribution name is `revolta` (version `0.1.0`). The Python import name and the
+The distribution name is `revolta` (version `0.1.1`). The Python import name and the
 CLI are still **`vllm`** (`import vllm`, `vllm serve`); this is intentional. Only
 compute capability 7.0 is built, with CUDA 12.8, Python 3.12 and PyTorch 2.10.
 
@@ -170,8 +170,8 @@ From the wheel attached to the GitHub release (Linux x86-64, Python 3.12):
 ```bash
 python3.12 -m venv /data/revolta/venv
 . /data/revolta/venv/bin/activate
-pip install "https://github.com/Leonccaa/ReVolta/releases/download/v0.1.0/revolta-0.1.0-cp312-cp312-linux_x86_64.whl"
-vllm --version          # 0.1.0
+pip install "https://github.com/Leonccaa/ReVolta/releases/download/v0.1.1/revolta-0.1.1-cp312-cp312-linux_x86_64.whl"
+vllm --version          # 0.1.1
 ```
 
 The wheel metadata pins `torch==2.10.0`, `torchaudio==2.10.0` and
@@ -183,7 +183,7 @@ ReVolta does not send the anonymous usage statistics that upstream vLLM reports.
 Or use the Docker image:
 
 ```bash
-docker pull ghcr.io/leonccaa/revolta:0.1.0
+docker pull ghcr.io/leonccaa/revolta:0.1.1
 ```
 
 ### 2. Download the checkpoint and make 512K views
@@ -359,7 +359,7 @@ docker run --rm --gpus all \
   -e VLLM_QWEN4EXP_PLE_HOST_GIB=12 \
   -e VLLM_PLE_OFFLOAD_READY_TIMEOUT=1200 \
   -e VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES=1 \
-  ghcr.io/leonccaa/revolta:0.1.0 \
+  ghcr.io/leonccaa/revolta:0.1.1 \
   /data/revolta/views/target-512k --served-model-name Qwen3.8-Flash-Next ...
 ```
 
@@ -452,7 +452,7 @@ use a larger CPU pool and set `max_size_bytes` to your disk budget.
   be larger than the largest prefix you expect to restore from disk (about 21 KB per
   token; a 100K-token prefix needs more than 2 GiB). Otherwise the request is computed
   again. The quick-start 48 GiB pool holds about 2.4M tokens.
-- The SSD tier is **not supported with INT8 KV** in 0.1.0. That combination is
+- The SSD tier is **not supported with INT8 KV** in 0.1.1. That combination is
   rejected at configuration time.
 
 Validation scope: the SSD tier was tested with its root on a network file system. The
@@ -495,7 +495,7 @@ On the measured sets, INT8 has slightly lower KL and similar top-1 agreement to
 E4M3. This has not established a difference in task-level answer quality.
 
 Capacity is 1.1–1.3% lower than E4M3. Prefill speed is within ±1.3%; decoding is
-about 5–8% slower. CPU offload works; the disk tier is not supported with INT8 in 0.1.0.
+about 5–8% slower. CPU offload works; the disk tier is not supported with INT8 in 0.1.1.
 
 ### Standard NVFP4
 
@@ -607,11 +607,15 @@ This release builds SM70 only; other GPU architectures, ROCm, CPU, XPU, TPU, and
 GGUF are outside the build.
 
 - **Output reproducibility.** A single request is reproducible bit for bit. When several
-  requests are prefilled together, the result can differ noticeably from the same request
-  run alone (first-token log-probability differences of up to about one nat were
-  measured), so greedy outputs at C2–C8 can change between runs. This is under
-  investigation. Fresh compiler autotuning can also change outputs; restarts that reuse
-  the compile cache do not.
+  requests are prefilled together, the result can differ from the same request run alone,
+  so greedy outputs at C2–C8 can change between runs. The cause is the tensor-parallel
+  all-reduce: the order in which it sums each value depends on where the request's
+  tokens sit in the batch. The rounding-level difference can then be amplified where
+  expert routing or sparse-attention block selection is close to a tie. On most text
+  the prompt NLL changes by less than 0.015 nat/token; highly repetitive or table-like
+  text changed by up to about 0.3. Against a BF16 reference, a request run alone and the
+  same request in a batch were equally close. Fresh compiler autotuning can also change
+  outputs; restarts that reuse the compile cache do not.
 - **Long context.** Release retrieval is tested at 211K. The previous production
   build retrieved 20/20 needles at 489K. At 512K, the test covers capacity and the
   input/output boundary.
@@ -624,12 +628,17 @@ GGUF are outside the build.
   raw-scale path. Both documented checkpoints use equal scales.
 - **Structured output with MTP.** GPU tests produced 16/16 valid JSON/tool outputs;
   the zero-draft step was covered on CPU but was not triggered on GPU.
-- **Stop strings and thinking.** As in upstream vLLM, a `stop` string also matches inside
-  the reasoning. With thinking on, a request can end before the answer with empty
-  `content`. Streaming responses with a `stop` string can also lose the last characters of
-  the reasoning and show `</think>` in `content`. With thinking on, leave `stop` unset or
-  turn thinking off. Non-streaming responses also split the reasoning at a literal
-  `</think>` written as plain text. A fix is planned for 0.1.1.
+- **Stop strings and thinking.** Since 0.1.1, with thinking on, a `stop` string matches
+  only after the reasoning ends, and the reasoning/content split uses the `</think>`
+  token, not its spelling. A `stop` of `</think>` therefore no longer ends a request at
+  the end of the reasoning. With thinking off, everything is content, also in
+  non-streaming responses.
+- **Tool calls.** In `qwen3_coder` tool calls, a string argument that contains the
+  literal text `</function>` is cut at that point. String arguments are streamed as
+  they are generated.
+- **Chat template.** The model's own chat template rejects a system message that is not
+  the first message (`System message must be at the beginning.`). Agent stacks that send
+  several system messages need to merge them.
 - **Allocator.** Keep `NCCL_GRAPH_REGISTER=0` with expandable allocator segments.
 - **Small KV pools.** Startup rejects a pool that cannot hold one maximum-length request.
 - **Prompt log-probabilities.** Long prompts are processed in chunks;

@@ -499,10 +499,12 @@ class PleOffloadWorker:
                 raise EOFError
             message = reader.recv()
         except EOFError as error:
-            handle.proc.join(timeout=1)
+            exitcode = None
+            if handle.proc is not None:
+                handle.proc.join(timeout=1)
+                exitcode = handle.proc.exitcode
             raise RuntimeError(
-                "PLE offload worker exited during startup "
-                f"with exit code {handle.proc.exitcode}"
+                f"PLE offload worker exited during startup with exit code {exitcode}"
             ) from error
         finally:
             reader.close()

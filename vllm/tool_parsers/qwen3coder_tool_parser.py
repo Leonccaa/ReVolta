@@ -39,6 +39,14 @@ from vllm.tool_parsers.utils import (
 logger = init_logger(__name__)
 
 
+class _JSONObject(dict):
+    """Keep pairs for top-level argument deduplication; nested dicts stay last-wins."""
+
+    def __init__(self, pairs):
+        super().__init__(pairs)
+        self.pairs = pairs
+
+
 class Qwen3CoderToolParser(ToolParser):
     supports_required_and_named: bool = not VLLM_ENFORCE_STRICT_TOOL_CALLING
 
@@ -305,7 +313,7 @@ class Qwen3CoderToolParser(ToolParser):
         tool call.
         """
         try:
-            raw_call = json.loads(payload.strip())
+            raw_call = json.loads(payload.strip(), object_pairs_hook=_JSONObject)
         except (TypeError, json.JSONDecodeError):
             return None
         if not isinstance(raw_call, dict):
@@ -317,11 +325,22 @@ class Qwen3CoderToolParser(ToolParser):
             return None
         if isinstance(arguments, str):
             try:
-                arguments = json.loads(arguments)
+                arguments = json.loads(arguments, object_pairs_hook=_JSONObject)
             except json.JSONDecodeError:
                 return None
         if not isinstance(arguments, dict):
             return None
+        if isinstance(arguments, _JSONObject):
+            first_arguments = {}
+            for param_name, value in arguments.pairs:
+                if param_name in first_arguments:
+                    logger.warning(
+                        "Ignoring duplicate tool parameter %r (first value wins)",
+                        param_name,
+                    )
+                    continue
+                first_arguments[param_name] = value
+            arguments = first_arguments
 
         return ToolCall(
             type="function",

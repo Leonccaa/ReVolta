@@ -534,3 +534,19 @@ def test_non_streaming_service_uses_token_origins(tok):
         "quote </think> still reasoning",
         "answer",
     )
+
+
+@pytest.mark.parametrize("encoded_arguments", [False, True])
+def test_json_alternate_duplicate_parameters_first_value(tok, encoded_arguments):
+    arguments = '{"x":"first","x":"second","meta":{"nested":1,"nested":2}}'
+    body = json.dumps(arguments) if encoded_arguments else arguments
+    text = '<tool_call>{"name":"f","arguments":' + body + "}</tool_call>"
+    request = _request()
+    full = Qwen3CoderToolParser(tok, tools=request.tools).extract_tool_calls(
+        text, request
+    )
+    args = full.tool_calls[0].function.arguments
+    assert full.tool_calls[0].function.name == "f"
+    assert json.loads(args) == {"x": "first", "meta": {"nested": 2}}
+    _, events = replay_tools(tok, text, 5)
+    assert events[-1][2] == args

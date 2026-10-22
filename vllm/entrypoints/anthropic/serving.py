@@ -53,6 +53,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _tool_input(arguments: str) -> dict[str, Any] | None:
+    """Decode tool call arguments for a tool_use block, or None if invalid."""
+    try:
+        tool_input = json.loads(arguments)
+    except json.JSONDecodeError:
+        return None
+    return tool_input if isinstance(tool_input, dict) else None
+
+
 def wrap_data_with_event(data: str, event: str):
     return f"event: {event}\ndata: {data}\n\n"
 
@@ -435,6 +444,9 @@ class AnthropicServingMessages(OpenAIServingChat):
             req.tool_choice = None
             return
 
+        req.parallel_tool_calls = (
+            not anthropic_request.tool_choice.disable_parallel_tool_use
+        )
         tool_choice_type = anthropic_request.tool_choice.type
         if tool_choice_type == "auto":
             req.tool_choice = "auto"
@@ -522,8 +534,24 @@ class AnthropicServingMessages(OpenAIServingChat):
             kv_transfer_params=generator.kv_transfer_params,
         )
         choice = generator.choices[0]
+        tool_inputs = []
+        for tool_call in choice.message.tool_calls:
+            tool_input = _tool_input(tool_call.function.arguments)
+            if tool_input is None:
+                # Only a named call cut short (e.g. by max_tokens) has
+                # arguments that are not a JSON object. A tool_use block
+                # needs a complete input; drop the call instead of failing
+                # the whole response.
+                logger.warning(
+                    "Dropping tool call %r: its arguments are not a JSON object",
+                    tool_call.function.name,
+                )
+                continue
+            tool_inputs.append((tool_call, tool_input))
         if choice.finish_reason == "stop":
-            result.stop_reason = "end_turn"
+            # A named tool_choice finishes with "stop"; Anthropic reports any
+            # tool call as tool_use.
+            result.stop_reason = "tool_use" if tool_inputs else "end_turn"
         elif choice.finish_reason == "length":
             result.stop_reason = "max_tokens"
         elif choice.finish_reason == "tool_calls":
@@ -546,12 +574,12 @@ class AnthropicServingMessages(OpenAIServingChat):
                 )
             )
 
-        for tool_call in choice.message.tool_calls:
+        for tool_call, tool_input in tool_inputs:
             anthropic_tool_call = AnthropicContentBlock(
                 type="tool_use",
                 id=tool_call.id,
                 name=tool_call.function.name,
-                input=json.loads(tool_call.function.arguments),
+                input=tool_input,
             )
             content += [anthropic_tool_call]
 
@@ -599,6 +627,7 @@ class AnthropicServingMessages(OpenAIServingChat):
 
             first_item = True
             finish_reason = None
+            tool_used = False
             state = _ActiveBlockState()
             # Map from tool call index to tool_use_id
             tool_index_to_id: dict[int, str] = {}
@@ -690,6 +719,9 @@ class AnthropicServingMessages(OpenAIServingChat):
                             stop_reason = self.stop_reason_map.get(
                                 finish_reason or "stop"
                             )
+                            if tool_used and stop_reason == "end_turn":
+                                # A named tool_choice finishes with "stop".
+                                stop_reason = "tool_use"
                             chunk = AnthropicStreamEvent(
                                 type="message_delta",
                                 delta=AnthropicDelta(stop_reason=stop_reason),
@@ -786,6 +818,7 @@ class AnthropicServingMessages(OpenAIServingChat):
                                     ):
                                         for event in stop_active_block():
                                             yield event
+                                        tool_used = True
                                         start_event = start_block(
                                             AnthropicContentBlock(
                                                 type="tool_use",

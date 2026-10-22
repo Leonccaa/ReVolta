@@ -166,7 +166,9 @@ def test_initial_sm70_v2_route_rejects_unvalidated_speculator(
         ),
         cache_config=SimpleNamespace(enable_prefix_caching=False),
         parallel_config=SimpleNamespace(enable_dbo=False, ubatch_size=1),
-        speculative_config=SimpleNamespace(method="dflash"),
+        # DFlash is admitted only with a declared feature contract
+        # (test_dflash_capture.py); other learned proposers stay rejected.
+        speculative_config=SimpleNamespace(method="dspark"),
     )
 
     with pytest.raises(NotImplementedError, match="supports only its native MTP"):

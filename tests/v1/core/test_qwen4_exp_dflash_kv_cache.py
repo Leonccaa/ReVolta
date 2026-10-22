@@ -131,6 +131,9 @@ def test_drafter_layers_share_main_kv_owner_slots() -> None:
     group = _drafter_group(groups)
     spec = group.kv_cache_spec
     assert group.layer_names == [DRAFT.format(8), DRAFT.format(9)]
+    # Only the drafter group takes the EAGLE last-block drop.
+    assert group.is_eagle_group
+    assert not any(g.is_eagle_group for g in groups if g is not group)
     assert spec.block_size == 16
     # One extra block in the manager's window (vllm-project/vllm#60560).
     assert spec.sliding_window == 32 + 16
@@ -252,3 +255,5 @@ def test_scheduler_builds_a_sliding_window_manager_for_the_drafter() -> None:
     ]
     assert len(managers) == 1
     assert managers[0].sliding_window == 48
+    drafter_index = coordinator.single_type_managers.index(managers[0])
+    assert coordinator.eagle_group_ids == {drafter_index}

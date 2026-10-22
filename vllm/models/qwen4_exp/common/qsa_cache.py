@@ -975,7 +975,14 @@ class QSAKeyStateCache(_QSAStateCache):
         # overwrite a committed key the next step needs to close the group.
         span = self.compress_ratio + vllm_config.num_speculative_tokens
         capacity = self.compress_ratio * cdiv(span, self.compress_ratio)
-        assert self.cache_config.block_size % capacity == 0, (
+        # The attention block size is aligned for kernels and Mamba pages, not
+        # for this ring. Widen the ring by whole groups until it divides the
+        # block; the minimal ring is kept whenever it already does (e.g. 8 for
+        # four draft tokens), and consumers read the size from this spec.
+        block_size = self.cache_config.block_size
+        while block_size % capacity != 0 and capacity < block_size:
+            capacity += self.compress_ratio
+        assert block_size % capacity == 0, (
             f"QSA ring capacity {capacity} must divide the attention block "
             f"size {self.cache_config.block_size}"
         )

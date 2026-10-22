@@ -2449,7 +2449,14 @@ def _get_kv_cache_groups_csa_linear(
             target_span=next(iter(shapes))[1],
             slot_page=min(owner_pages),
         )
-        groups.extend(_get_kv_cache_groups_uniform_spec(fitted))
+        drafter_groups = _get_kv_cache_groups_uniform_spec(fitted)
+        # Flag the drafter group explicitly. Unflagged, the coordinator applies
+        # the EAGLE last-block drop to every group, which also throws away the
+        # target's aligned Mamba prefix hits (upstream fixed the same issue with
+        # explicit draft-layer labels, vllm-project/vllm#61455).
+        for group in drafter_groups:
+            group.is_eagle_group = True
+        groups.extend(drafter_groups)
     return groups
 
 

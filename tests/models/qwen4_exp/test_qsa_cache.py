@@ -234,3 +234,34 @@ def test_qsa_e4m3_forward_cannot_bypass_scale_finalization() -> None:
             tensor,
             tensor,
         )
+
+
+@pytest.mark.parametrize(
+    ("block_size", "num_speculative_tokens", "capacity"),
+    [
+        (1632, 4, 8),  # native MTP4: the minimal ring, unchanged
+        (1632, 3, 8),
+        (1632, 7, 12),  # 1632 = 12 * 136
+        (1600, 7, 16),  # 12 does not divide 1600; widen by whole groups
+        (1600, 0, 4),
+    ],
+)
+def test_qsa_ring_capacity_divides_the_attention_block(
+    block_size: int, num_speculative_tokens: int, capacity: int
+) -> None:
+    layer = QSAKeyStateCache(
+        head_size=128,
+        dtype=torch.float16,
+        prefix="model.layers.0.self_attn.raw_key_cache",
+        cache_config=SimpleNamespace(block_size=block_size),
+        compress_ratio=4,
+        vllm_config=SimpleNamespace(
+            compilation_config=SimpleNamespace(static_forward_context={})
+        ),
+    )
+    spec = layer.get_kv_cache_spec(
+        SimpleNamespace(num_speculative_tokens=num_speculative_tokens)
+    )
+    assert spec.block_size == capacity
+    assert block_size % spec.block_size == 0
+    assert spec.block_size >= 4 + num_speculative_tokens

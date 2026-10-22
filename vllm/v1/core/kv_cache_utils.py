@@ -9,7 +9,7 @@ import math
 import os
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import Any, NamedTuple, NewType, TypeAlias, cast, overload
 
@@ -1783,6 +1783,7 @@ def _get_kv_cache_config_csa_linear(
     if layout is None:
         return None
 
+    shared_auxiliary, standalone_auxiliary = layout.auxiliary_tensor_plan()
     num_blocks = available_memory // layout.bytes_per_block
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
     kv_cache_tensors = []
@@ -1796,7 +1797,8 @@ def _get_kv_cache_config_csa_linear(
                     group.layer_names[index]
                     for group in layout.mamba_groups
                     if index < len(group.layer_names)
-                ],
+                ]
+                + shared_auxiliary[index],
                 packed_members=members if len(members) > 1 else None,
             )
         )
@@ -1806,6 +1808,10 @@ def _get_kv_cache_config_csa_linear(
             shared_by=[compressed_name, layout.compressor_state_names[index]],
         )
         for index, compressed_name in enumerate(layout.compressed_names)
+    )
+    kv_cache_tensors.extend(
+        KVCacheTensor(size=page_size * num_blocks, shared_by=[layer_name])
+        for layer_name, page_size in standalone_auxiliary
     )
     return num_blocks, kv_cache_tensors
 
@@ -2103,10 +2109,18 @@ class _CSALinearTensorLayout:
     compressed_page_sizes: list[int]
     # Physical main-KV owners, as indices into ``main_kv_names``.
     main_kv_owners: list[list[int]]
+    # Sliding-window attention of a DFlash drafter (see
+    # `_fit_csa_linear_auxiliary_specs`).
+    auxiliary_groups: list[KVCacheGroupSpec] = field(default_factory=list)
 
     @property
     def bytes_per_block(self) -> int:
-        return sum(self.main_kv_page_sizes) + sum(self.compressed_page_sizes)
+        _, standalone = self.auxiliary_tensor_plan()
+        return (
+            sum(self.main_kv_page_sizes)
+            + sum(self.compressed_page_sizes)
+            + sum(page_size for _, page_size in standalone)
+        )
 
     def owner_page_size(self, owner: int) -> int:
         from vllm.v1.attention.kv_cache_view import physical_owner_page_size
@@ -2114,6 +2128,24 @@ class _CSALinearTensorLayout:
         return physical_owner_page_size(
             [self.main_kv_page_sizes[i] for i in self.main_kv_owners[owner]]
         )
+
+    def auxiliary_tensor_plan(self) -> tuple[list[list[str]], list[tuple[str, int]]]:
+        """Place drafter layers in main-KV owner slots, else standalone.
+
+        Block ids are unique across the shared pool, so a drafter page padded
+        to an owner's page can share that owner's tensor without aliasing the
+        target or Mamba pages stored there.
+        """
+        shared: list[list[str]] = [[] for _ in self.main_kv_owners]
+        standalone: list[tuple[str, int]] = []
+        for group in self.auxiliary_groups:
+            page_size = group.kv_cache_spec.page_size_bytes
+            for index, layer_name in enumerate(group.layer_names):
+                if index < len(shared) and page_size == self.owner_page_size(index):
+                    shared[index].append(layer_name)
+                else:
+                    standalone.append((layer_name, page_size))
+        return shared, standalone
 
 
 def _csa_linear_state_page(mamba_specs: Iterable[KVCacheSpec]) -> int:
@@ -2161,6 +2193,8 @@ class _CSALinearRoles(NamedTuple):
     compressed: dict[str, MLAAttentionSpec]
     compressor_state: dict[str, CircularBufferSpec]
     mamba: dict[str, MambaSpec]
+    # Sliding-window attention of a DFlash drafter attached to the target.
+    auxiliary: dict[str, SlidingWindowSpec]
 
 
 def _classify_csa_linear_specs(
@@ -2169,7 +2203,9 @@ def _classify_csa_linear_specs(
     if not any(type(spec) is CircularBufferSpec for spec in kv_cache_spec.values()):
         return None
 
-    roles = _CSALinearRoles(main_kv={}, compressed={}, compressor_state={}, mamba={})
+    roles = _CSALinearRoles(
+        main_kv={}, compressed={}, compressor_state={}, mamba={}, auxiliary={}
+    )
     unsupported: list[str] = []
     for name, spec in kv_cache_spec.items():
         if type(spec) is FullAttentionSpec:
@@ -2180,6 +2216,8 @@ def _classify_csa_linear_specs(
             roles.compressor_state[name] = spec
         elif type(spec) is MambaSpec:
             roles.mamba[name] = spec
+        elif type(spec) is SlidingWindowSpec:
+            roles.auxiliary[name] = spec
         else:
             unsupported.append(name)
     if unsupported:
@@ -2404,7 +2442,81 @@ def _get_kv_cache_groups_csa_linear(
                 assert uniform is not None
                 padded = uniform
             groups.append(KVCacheGroupSpec(group_names, padded))
+    if roles.auxiliary:
+        fitted = _fit_csa_linear_auxiliary_specs(
+            vllm_config,
+            roles.auxiliary,
+            target_span=next(iter(shapes))[1],
+            slot_page=min(owner_pages),
+        )
+        groups.extend(_get_kv_cache_groups_uniform_spec(fitted))
     return groups
+
+
+def _fit_csa_linear_auxiliary_specs(
+    vllm_config: VllmConfig,
+    auxiliary: dict[str, SlidingWindowSpec],
+    target_span: int,
+    slot_page: int,
+) -> dict[str, KVCacheSpec]:
+    """Reblock a DFlash drafter's sliding-window cache for the CSA+linear pool.
+
+    Same approach as GLM-5.3-Flash (`_get_kv_cache_groups_glm5_next`): use the
+    largest 16-token-aligned divisor of the target's block span whose page fits
+    one main-KV owner slot, and pad the page to that slot so the drafter can
+    share the owner's tensor. A divisor keeps the scheduler block size (the LCM
+    of group spans) unchanged. The manager's window keeps one extra block:
+    kernels that read whole key tiles must never touch a block that was freed
+    below the window (vllm-project/vllm#60560). The attention layer keeps its
+    own window.
+    """
+    spec_config = vllm_config.speculative_config
+    if spec_config is None or not spec_config.use_dflash():
+        raise ValueError(
+            "CSA+linear sliding-window cache owners are only supported for a "
+            f"DFlash drafter: {sorted(auxiliary)}."
+        )
+    if not is_kv_cache_spec_uniform(cast(dict[str, KVCacheSpec], auxiliary)):
+        raise ValueError("CSA+linear DFlash drafter layers must share one cache spec.")
+    if any(spec.dcp_sharded for spec in auxiliary.values()):
+        raise ValueError(
+            "CSA+linear DFlash drafter caches must be replicated across DCP ranks."
+        )
+    for candidate in range(target_span, 15, -1):
+        if target_span % candidate != 0 or candidate % 16 != 0:
+            continue
+        candidate_specs = {
+            name: replace(spec, block_size=candidate, page_size_padded=None)
+            for name, spec in auxiliary.items()
+        }
+        if all(
+            spec.real_page_size_bytes <= slot_page for spec in candidate_specs.values()
+        ):
+            fitted: dict[str, KVCacheSpec] = {
+                name: replace(
+                    spec,
+                    sliding_window=spec.sliding_window + candidate,
+                    page_size_padded=slot_page,
+                )
+                for name, spec in candidate_specs.items()
+            }
+            logger.info_once(
+                "CSA+linear DFlash drafter cache uses block_size=%d and shares "
+                "padded %d-byte main-KV slots.",
+                candidate,
+                slot_page,
+            )
+            return fitted
+    # No divisor fits a slot: keep the target span and own tensors.
+    return {
+        name: replace(
+            spec,
+            block_size=target_span,
+            sliding_window=spec.sliding_window + target_span,
+            page_size_padded=None,
+        )
+        for name, spec in auxiliary.items()
+    }
 
 
 def _get_csa_linear_tensor_layout(
@@ -2413,12 +2525,16 @@ def _get_csa_linear_tensor_layout(
     compressed_sparse: Mapping[str, KVCacheSpec] | None = None
     compressor_state: Mapping[str, KVCacheSpec] | None = None
     mamba_groups: list[KVCacheGroupSpec] = []
+    auxiliary_groups: list[KVCacheGroupSpec] = []
     for group in kv_cache_groups:
         if not group.layer_names:
             continue
         spec = group.kv_cache_spec
         if isinstance(spec, MambaSpec):
             mamba_groups.append(group)
+            continue
+        if type(spec) is SlidingWindowSpec:
+            auxiliary_groups.append(group)
             continue
         if not isinstance(spec, UniformTypeKVCacheSpecs):
             return None
@@ -2471,6 +2587,7 @@ def _get_csa_linear_tensor_layout(
                 )
             ),
         ),
+        auxiliary_groups=auxiliary_groups,
     )
 
 

@@ -322,3 +322,101 @@ def test_sharded_flag_is_harmless_without_dcp() -> None:
         _vllm_config(), _target_specs() | _draft_specs((8,), dcp_sharded=True)
     )
     assert _drafter_group(groups).kv_cache_spec.block_size == 16
+
+
+def test_dcp2_prefix_hit_reaches_through_the_drafter_window() -> None:
+    from tests.v1.core.test_prefix_caching import make_request
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    from vllm.v1.core.kv_cache_utils import init_none_hash
+    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
+
+    init_none_hash(sha256)
+    # Sharded 16-slot target (32 global tokens), replicated 32-token drafter
+    # window, replicated recurrent state: the window-2 DCP2 geometry in small.
+    target = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    drafter = SlidingWindowSpec(
+        block_size=32,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=64 + 32,
+        dcp_sharded=False,
+    )
+    state = MambaSpec(
+        block_size=32, shapes=((1,),), dtypes=(torch.float32,), mamba_cache_mode="all"
+    )
+    config = KVCacheConfig(
+        num_blocks=64,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["target"], target),
+            KVCacheGroupSpec(["drafter"], drafter, is_eagle_group=True),
+            KVCacheGroupSpec(["state"], state),
+        ],
+    )
+    manager = KVCacheManager(
+        config,
+        max_model_len=512,
+        hash_block_size=32,
+        use_eagle=True,
+        dcp_world_size=2,
+        enable_caching=True,
+    )
+    owners = manager.coordinator.single_type_managers
+    assert [m.block_size for m in owners] == [32, 32, 32]
+    assert [m.dcp_world_size for m in owners] == [2, 1, 1]
+    assert manager.coordinator.eagle_group_ids == {1}
+
+    common = list(range(256))
+    first = make_request("first", common + [91] * 5, 32, sha256)
+    assert manager.allocate_slots(first, 261) is not None
+    second = make_request("second", common + [92] * 5, 32, sha256)
+    blocks, tokens = manager.get_computed_blocks(second)
+    # Only the drafter group gives up its last block (EAGLE drop); the hit is
+    # still most of the shared prefix and stays block aligned.
+    assert tokens % 32 == 0
+    assert 256 - 64 <= tokens < 256
+    manager.free(first)
+
+
+def test_offload_spec_budgets_the_drafter_group() -> None:
+    from tests.v1.core.test_qwen4_exp_kv_cache import _mixed_dcp_specs
+    from tests.v1.core.test_qwen4_exp_kv_cache import _vllm_config as _base_config
+    from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
+
+    config = _base_config()
+    config.parallel_config.decode_context_parallel_size = 2
+    config.parallel_config.world_size = 4
+    config.cache_config.block_size = 16
+    config.cache_config.hash_block_size = 4
+    config.cache_config.enable_prefix_caching = True
+    config.cache_config.prefix_cache_retention_interval = 0
+    config.cache_config.mamba_cache_mode = "align"
+    config.speculative_config = SimpleNamespace(use_dflash=lambda: True)
+    config.kv_transfer_config = SimpleNamespace(
+        kv_connector_extra_config={"cpu_bytes_to_use": 16 * 1024**2}
+    )
+    specs = _mixed_dcp_specs()
+    for name, spec in list(specs.items()):
+        if isinstance(spec, MambaSpec):
+            specs[name] = replace(
+                spec, block_size=32, mamba_cache_mode="align", num_speculative_blocks=4
+            )
+    specs |= _draft_specs((8, 9), dcp_sharded=True)
+    groups = get_kv_cache_groups(config, specs)
+    drafter = _drafter_group(groups)
+    assert not drafter.kv_cache_spec.dcp_sharded
+    worker_cache = get_kv_cache_config_from_groups(
+        config, groups, available_memory=1 << 20
+    )
+    scheduler_cache = generate_scheduler_kv_cache_config([worker_cache])
+    worker = CPUOffloadingSpec(config, worker_cache)
+    scheduler = CPUOffloadingSpec(config, scheduler_cache)
+    drafter_index = groups.index(drafter)
+    assert worker.gpu_block_size == scheduler.gpu_block_size
+    assert worker.gpu_block_size[drafter_index] == drafter.kv_cache_spec.block_size
+    assert worker.cpu_group_num_blocks == scheduler.cpu_group_num_blocks
+    assert worker.cpu_group_page_sizes == scheduler.cpu_group_page_sizes

@@ -23,7 +23,16 @@ def _json_constrained(request: object) -> bool:
     so under a JSON grammar the opener delimits reasoning and is not content.
     """
     params = getattr(request, "structured_outputs", None)
-    return params is not None and (params.json is not None or bool(params.json_object))
+    if params is not None and (params.json is not None or bool(params.json_object)):
+        return True
+    # The Responses API keeps the grammar on ``text.format`` (that is where
+    # tool_choice="required" and named tools put theirs) and builds the
+    # structured-output params from it only when sampling.
+    text_format = getattr(getattr(request, "text", None), "format", None)
+    return (
+        getattr(text_format, "type", None) == "json_schema"
+        and getattr(text_format, "schema_", None) is not None
+    )
 
 
 class Qwen3ReasoningParser(BaseThinkingReasoningParser):

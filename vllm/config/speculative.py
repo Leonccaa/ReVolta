@@ -142,6 +142,11 @@ def check_dflash_concurrency_drafts(
             "dflash_concurrency_drafts needs method='dflash' without ngram_assist."
         )
     for min_reqs, drafts in policy.items():
+        if isinstance(min_reqs, bool) or isinstance(drafts, bool):
+            raise ValueError(
+                "dflash_concurrency_drafts takes integer request counts and drafts; "
+                f"got {min_reqs!r}: {drafts!r}."
+            )
         if int(min_reqs) < 2 or not 0 < int(drafts) < num_speculative_tokens:
             raise ValueError(
                 "dflash_concurrency_drafts maps a running-request count >= 2 to "
@@ -461,6 +466,9 @@ class SpeculativeConfig:
         factors: list[Any] = [
             ("use_local_argmax_reduction", self.use_local_argmax_reduction)
         ]
+        # dflash_concurrency_drafts is left out: it only picks how many drafts
+        # are verified and which uniform decode sizes get CUDA graphs; compile
+        # ranges come from compilation_config, and graphs are not persisted.
         if self.sm70_dflash2.resolved and (
             self.use_dflash_family() or self.sm70_dflash2.explicit_fields
         ):

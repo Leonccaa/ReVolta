@@ -538,7 +538,6 @@ class DFlash2Speculator(DFlashSpeculator):
         self._req_states = None
         self._lookup_current_req_key: tuple[int, ...] = ()
         self._lookup_current_eligible = False
-        self._running_reqs = 0
         self._lookup_last_emitted: torch.Tensor | None = None
         if self._lookup_enabled:
             if device.type != "cuda":
@@ -651,8 +650,8 @@ class DFlash2Speculator(DFlashSpeculator):
         num_rejected: torch.Tensor,
     ) -> None:
         """Refresh lookup eligibility and controller inputs before replay."""
+        super()._prepare_proposal_runtime(input_batch, num_sampled, num_rejected)
         del num_rejected
-        self._running_reqs = input_batch.num_reqs
         if not self._lookup_enabled:
             return
 

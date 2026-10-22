@@ -1829,6 +1829,27 @@ class VllmConfig:
             and uses_adaptive_dflash_lookup(self.speculative_config)
             and envs.VLLM_DFLASH2_LOOKUP_ADAPTIVE
         )
+        dflash_width_policy = (
+            getattr(self.speculative_config, "dflash_concurrency_drafts", None)
+            if self.speculative_config is not None
+            else None
+        )
+        dflash_concurrency_width = bool(dflash_width_policy)
+        if dflash_width_policy:
+            unreachable = tuple(
+                sorted(
+                    int(min_reqs)
+                    for min_reqs in dflash_width_policy
+                    if int(min_reqs) > self.scheduler_config.max_num_seqs
+                )
+            )
+            if unreachable:
+                logger.warning_once(
+                    "dflash_concurrency_drafts thresholds %s exceed max_num_seqs=%d "
+                    "and never apply.",
+                    unreachable,
+                    self.scheduler_config.max_num_seqs,
+                )
 
         if self.scheduler_config.async_scheduling:
             # Async scheduling explicitly enabled, hard fail any incompatibilities.
@@ -1840,6 +1861,12 @@ class VllmConfig:
                     "configured maximum and is incompatible with adaptive q8/q16 "
                     "lookup verification. Disable async scheduling or set "
                     "VLLM_DFLASH2_LOOKUP_ADAPTIVE=0 to use fixed q16 verification."
+                )
+            if dflash_concurrency_width:
+                raise ValueError(
+                    "Async scheduling reserves num_speculative_tokens draft slots "
+                    "every step and ignores dflash_concurrency_drafts. Disable "
+                    "async scheduling or remove dflash_concurrency_drafts."
                 )
             if dflash_ddtree_tree_verify:
                 raise ValueError(
@@ -1884,6 +1911,13 @@ class VllmConfig:
                     "Disabling asynchronous scheduling because adaptive DFlash2 "
                     "lookup verification must return a per-step q8/q16 width to "
                     "the scheduler."
+                )
+                self.scheduler_config.async_scheduling = False
+            elif dflash_concurrency_width:
+                logger.warning_once(
+                    "Disabling asynchronous scheduling because "
+                    "dflash_concurrency_drafts must return a per-step "
+                    "verification width to the scheduler."
                 )
                 self.scheduler_config.async_scheduling = False
             elif dflash_ddtree_tree_verify:

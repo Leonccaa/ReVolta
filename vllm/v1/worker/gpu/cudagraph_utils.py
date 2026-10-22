@@ -320,10 +320,15 @@ class CudaGraphManager:
                     if query_len not in self._capture_sizes:
                         self._capture_sizes.append(query_len)
                 self._capture_sizes.sort()
+            # Stay inside the compiled decode range (the largest capture size).
+            max_size = self.compilation_config.max_cudagraph_capture_size or max(
+                self._capture_sizes, default=0
+            )
             for query_len, min_reqs in self._dflash_width_min_reqs.items():
                 for num_reqs in range(min_reqs, self.max_num_reqs + 1):
-                    if num_reqs * query_len not in self._capture_sizes:
-                        self._capture_sizes.append(num_reqs * query_len)
+                    size = num_reqs * query_len
+                    if size <= max_size and size not in self._capture_sizes:
+                        self._capture_sizes.append(size)
             self._capture_sizes.sort()
         self._init_candidates()
 

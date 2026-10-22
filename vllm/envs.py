@@ -3620,6 +3620,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=("TurboMindAwqLinearKernel",),
         user_visible=False,
     ),
+    # Upper row bound of the grouped small-M route with a DFlash drafter.
+    "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_DFLASH_MAX_TOKENS": env_var(
+        lambda: int(
+            os.getenv("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_DFLASH_MAX_TOKENS", "48")
+        ),
+        description=(
+            "Largest row count admitted to VLLM_SM70_AWQ_QWEN38_GROUPED_QPN when "
+            "a DFlash drafter is configured (2..48; default 48, the kernel "
+            "maximum). It replaces VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS "
+            "there: DFlash verify batches reach requests x (drafts + 1) rows, and "
+            "wider batches are split into at most two grouped calls. MTP and "
+            "non-speculative deployments keep "
+            "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS."
+        ),
+        category="tuning",
+        declared_default="48",
+        effective_default="48",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMindAwqLinearKernel",),
+        user_visible=False,
+    ),
     # Rows per expert pack of the grouped route; 0 reads each expert once.
     "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_PACK_ROWS": env_var(
         lambda: int(os.getenv("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_PACK_ROWS", "0")),

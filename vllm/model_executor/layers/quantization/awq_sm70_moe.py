@@ -208,14 +208,24 @@ def _initialize_qwen38_grouped_qpn(
     split = int(envs.VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT)
     if split not in (4, 8, 16):
         raise ValueError("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT must be 4, 8 or 16.")
-    max_tokens = int(envs.VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS)
+    # Row chunking and the DFlash row band only serve the wide DFlash verify
+    # batches; other deployments keep their band and the TurboMind route above it.
+    vllm_config = get_current_vllm_config_or_none()
+    speculative_config = None if vllm_config is None else vllm_config.speculative_config
+    chunked = getattr(speculative_config, "method", None) == "dflash"
+    band_name = (
+        "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_DFLASH_MAX_TOKENS"
+        if chunked
+        else "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS"
+    )
+    max_tokens = int(getattr(envs, band_name))
     if not (
         _QWEN38_GROUPED_QPN_MIN_TOKENS
         <= max_tokens
         <= sm70_ops.AWQ_GROUPED_DECODE_MAX_TOKENS
     ):
         raise ValueError(
-            "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS must be in "
+            f"{band_name} must be in "
             f"{_QWEN38_GROUPED_QPN_MIN_TOKENS}.."
             f"{sm70_ops.AWQ_GROUPED_DECODE_MAX_TOKENS}, got {max_tokens}."
         )
@@ -252,11 +262,6 @@ def _initialize_qwen38_grouped_qpn(
         return False
     layer.sm70_awq_qwen38_grouped_qpn_max_tokens = max_tokens
     layer.sm70_awq_qwen38_grouped_qpn_pack_rows = pack_rows
-    # Row chunking only serves the wide DFlash verify batches; other
-    # deployments keep the TurboMind route above the band.
-    vllm_config = get_current_vllm_config_or_none()
-    speculative_config = None if vllm_config is None else vllm_config.speculative_config
-    chunked = getattr(speculative_config, "method", None) == "dflash"
     layer.sm70_awq_qwen38_grouped_qpn_chunked = chunked
     logger.info_once(
         "SM70 Qwen3.8 AWQ grouped QPN decode admitted for %d..%d rows "

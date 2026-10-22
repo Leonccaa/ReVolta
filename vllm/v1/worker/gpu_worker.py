@@ -292,6 +292,17 @@ class Worker(WorkerBase):
 
         PleOffloadWorker.wait_for_ready(self._ple_offload_worker_handle)
 
+    def check_sleep(self) -> str | None:
+        try:
+            from vllm.device_allocator.cumem import CuMemAllocator
+
+            CuMemAllocator.get_instance()
+        except Exception as exc:
+            # Do not raise through collective_rpc: all ranks must return
+            # before the engine can safely handle another RPC.
+            return f"{type(exc).__name__}: {exc}"
+        return None
+
     def sleep(self, level: int = 1) -> None:
         from vllm.device_allocator.cumem import CuMemAllocator
 

@@ -360,3 +360,63 @@ def test_grouped_decode20_route_plan(grouped, m):
         Sm70MoeStageRoute.BATCHED if grouped else Sm70MoeStageRoute.PER_EXPERT_DISPATCH
     )
     assert plan.w13 == expected and plan.w2 == expected
+
+
+@pytest.mark.parametrize(
+    ("method", "chunked"), [(None, False), ("mtp", False), ("dflash", True)]
+)
+def test_initialize_admits_row_chunks_only_for_dflash(monkeypatch, method, chunked):
+    monkeypatch.setenv("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN", "1")
+    monkeypatch.delenv("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT", raising=False)
+    monkeypatch.setenv("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS", "40")
+    monkeypatch.setattr(moe, "_grouped_qpn_native_supports_pack_rows", lambda: True)
+    monkeypatch.setattr(
+        torch.ops._C, "awq_moe_grouped_decode_sm70_out", object(), raising=False
+    )
+    spec = None if method is None else SimpleNamespace(method=method)
+    monkeypatch.setattr(
+        moe,
+        "get_current_vllm_config_or_none",
+        lambda: SimpleNamespace(speculative_config=spec),
+    )
+    layer = _layer()
+    assert moe._initialize_qwen38_grouped_qpn(layer, True, 10)
+    assert layer.sm70_awq_qwen38_grouped_qpn_chunked is chunked
+
+
+@pytest.mark.parametrize(
+    ("m", "chunked", "expected"),
+    [
+        (40, False, [(0, 40)]),
+        (64, False, None),  # TurboMind route above the band
+        (2, True, [(0, 2)]),
+        (40, True, [(0, 40)]),
+        (41, True, [(0, 21), (21, 41)]),
+        (64, True, [(0, 32), (32, 64)]),  # seven drafts at eight requests
+        (80, True, [(0, 40), (40, 80)]),
+        (81, True, None),  # more than two calls
+        (1, True, None),
+    ],
+)
+def test_row_chunks_for_wide_verify_batches(m, chunked, expected):
+    layer = _layer(
+        sm70_awq_qwen38_grouped_qpn_max_tokens=40,
+        sm70_awq_qwen38_grouped_qpn_chunked=chunked,
+    )
+    assert moe._qwen38_grouped_qpn_chunks(layer, *_runtime_inputs(m)) == expected
+
+
+def test_row_chunks_keep_the_layout_checks():
+    layer = _layer(
+        sm70_awq_qwen38_grouped_qpn_max_tokens=40,
+        sm70_awq_qwen38_grouped_qpn_chunked=True,
+    )
+    x, weights, ids = _runtime_inputs(64)
+    assert moe._qwen38_grouped_qpn_chunks(layer, x.float(), weights, ids) is None
+    assert moe._qwen38_grouped_qpn_chunks(layer, x, weights, ids.long()) is None
+    assert (
+        moe._qwen38_grouped_qpn_chunks(
+            _layer(sm70_awq_qwen38_grouped_qpn=False), x, weights, ids
+        )
+        is None
+    )

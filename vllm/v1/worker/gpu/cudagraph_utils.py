@@ -245,6 +245,39 @@ class CudaGraphManager:
                 "Capturing SM70 DFlash2 target tail query lengths %s.",
                 self.decode_query_lens,
             )
+        # DFlash concurrency widths (dflash_concurrency_drafts): the target
+        # verifies a narrower uniform batch from each threshold up, so capture
+        # those multi-request decode shapes. The drafter keeps its block.
+        self._dflash_width_min_reqs: dict[int, int] = {}
+        policy = (
+            getattr(speculative_config, "dflash_concurrency_drafts", None)
+            if speculative_config is not None
+            and speculative_config.method == "dflash"
+            and isinstance(self, ModelCudaGraphManager)
+            else None
+        )
+        for min_reqs, drafts in (policy or {}).items():
+            query_len = int(drafts) + 1
+            if 1 < query_len < decode_query_len:
+                self._dflash_width_min_reqs[query_len] = min(
+                    self._dflash_width_min_reqs.get(query_len, int(min_reqs)),
+                    int(min_reqs),
+                )
+        if self._dflash_width_min_reqs:
+            self.decode_query_lens = tuple(
+                dict.fromkeys(
+                    (
+                        *self.decode_query_lens,
+                        *sorted(self._dflash_width_min_reqs, reverse=True),
+                    )
+                )
+            )
+            logger.info_once(
+                "Capturing DFlash concurrency-width target query lengths %s "
+                "(from request counts %s).",
+                self.decode_query_lens,
+                tuple(sorted(self._dflash_width_min_reqs.items())),
+            )
 
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
@@ -287,6 +320,11 @@ class CudaGraphManager:
                     if query_len not in self._capture_sizes:
                         self._capture_sizes.append(query_len)
                 self._capture_sizes.sort()
+            for query_len, min_reqs in self._dflash_width_min_reqs.items():
+                for num_reqs in range(min_reqs, self.max_num_reqs + 1):
+                    if num_reqs * query_len not in self._capture_sizes:
+                        self._capture_sizes.append(num_reqs * query_len)
+            self._capture_sizes.sort()
         self._init_candidates()
 
     def _init_candidates(self) -> None:
@@ -312,7 +350,15 @@ class CudaGraphManager:
                         query_len <= num_tokens <= self.max_num_reqs * query_len
                         and num_tokens % query_len == 0
                     ):
-                        if (
+                        width_min_reqs = self._dflash_width_min_reqs.get(query_len)
+                        if width_min_reqs is not None:
+                            # Concurrency widths serve only their request counts.
+                            if num_tokens // query_len < width_min_reqs and not (
+                                self._sm70_dflash2_tail_graphs
+                                and num_tokens == query_len
+                            ):
+                                continue
+                        elif (
                             self._sm70_dflash2_tail_graphs
                             and query_len < self.decode_query_len
                             and num_tokens != query_len

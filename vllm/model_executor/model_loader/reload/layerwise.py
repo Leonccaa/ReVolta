@@ -33,6 +33,7 @@ logger = init_logger(__name__)
 
 __all__ = [
     "get_layerwise_info",
+    "validate_weight_reload",
     "record_metadata_for_reloading",
     "initialize_layerwise_reload",
     "finalize_layerwise_processing",
@@ -67,6 +68,21 @@ def get_layerwise_info(layer: torch.nn.Module) -> LayerReloadingInfo:
     return LAYERWISE_INFO[layer]
 
 
+def validate_weight_reload(model: torch.nn.Module) -> None:
+    """Reject SM70 AWQ updates before restoring or replacing any tensors."""
+    from vllm.model_executor.layers.quantization.awq_sm70_moe import AWQSM70MoEMethod
+
+    for name, layer in model.named_modules():
+        if getattr(layer, "_awq_sm70_prepared", False) or any(
+            isinstance(getattr(layer, attr, None), AWQSM70MoEMethod)
+            for attr in ("quant_method", "base_quant_method")
+        ):
+            raise NotImplementedError(
+                f"Weight reload and updates are not supported for SM70 AWQ "
+                f"(layer {name!r}). Use a cold model load with the new weights."
+            )
+
+
 def record_metadata_for_reloading(model: torch.nn.Module):
     """
     Record layer metadata needed for later reloading.
@@ -96,6 +112,9 @@ def initialize_layerwise_reload(model: torch.nn.Module):
     3. Run quantization processing if applicable
     4. Copy processed values back to original tensor storage
     """
+    # Check the whole model before restoring even the first layer.
+    validate_weight_reload(model)
+
     # disable torchao reloading to avoid infinite recursion
     model._original_do_torchao_reload = getattr(model, "_do_torchao_reload", False)
     model._do_torchao_reload = False

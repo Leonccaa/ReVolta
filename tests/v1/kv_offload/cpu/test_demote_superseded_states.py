@@ -9,6 +9,7 @@ import pytest
 
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
+    RequestGroupState,
 )
 from vllm.v1.kv_offload.base import OffloadingSpec, ReqContext, make_offload_key
 from vllm.v1.kv_offload.cpu.manager import (
@@ -98,7 +99,8 @@ def test_request_completion_respects_demotion_policy(enabled):
     )
     keys = [key(0, i) for i in range(6)]
     state = SimpleNamespace(
-        group_states=(SimpleNamespace(offload_keys=keys),),
+        group_states=(SimpleNamespace(offload_keys=keys, num_hit_blocks=0),),
+        req=SimpleNamespace(shared_prefix_boundary=0),
         req_context=CTX,
         transfer_jobs=[],
     )
@@ -136,9 +138,10 @@ def test_request_finished_demotes_all_but_the_tail_states():
     state = [key(1, i) for i in range(10)]
     req_status = SimpleNamespace(
         group_states=(
-            SimpleNamespace(offload_keys=attn),
-            SimpleNamespace(offload_keys=state),
+            SimpleNamespace(offload_keys=attn, num_hit_blocks=0),
+            SimpleNamespace(offload_keys=state, num_hit_blocks=0),
         ),
+        req=SimpleNamespace(shared_prefix_boundary=0),
         req_context=CTX,
     )
     _scheduler(True, configs, manager)._demote_superseded_states(req_status)
@@ -158,8 +161,85 @@ def test_short_requests_demote_nothing():
         ),
     )
     req_status = SimpleNamespace(
-        group_states=(SimpleNamespace(offload_keys=[key(0, 0), key(0, 1)]),),
+        group_states=(
+            SimpleNamespace(offload_keys=[key(0, 0), key(0, 1)], num_hit_blocks=0),
+        ),
+        req=SimpleNamespace(shared_prefix_boundary=0),
         req_context=CTX,
     )
     _scheduler(True, configs, manager)._demote_superseded_states(req_status)
     assert calls == []
+
+
+@pytest.mark.parametrize(
+    "hits,junction,block_size,expected",
+    [
+        (0, 0, 32, [0, 1, 2, 3, 4, 5, 6]),
+        (3, 0, 32, [3, 4, 5, 6]),
+        (7, 0, 32, []),
+        (10, 0, 32, []),
+        (12, 0, 32, []),
+        (0, 32, 32, [1, 2, 3, 4, 5, 6]),
+        (0, 160, 32, [0, 1, 2, 3, 5, 6]),
+        (0, 161, 32, [0, 1, 2, 3, 4, 5, 6]),
+        (0, 256, 32, [0, 1, 2, 3, 4, 5, 6]),
+        (0, 1024, 32, [0, 1, 2, 3, 4, 5, 6]),
+        (3, 160, 32, [3, 5, 6]),
+        (0, 80, 16, [0, 1, 2, 3, 5, 6]),
+    ],
+)
+def test_demotion_excludes_hits_and_exact_junction(
+    hits, junction, block_size, expected
+):
+    manager = MagicMock()
+    config = SimpleNamespace(
+        group_idx=0,
+        sliding_window_size_in_blocks=1,
+        requires_exact_boundary_source=True,
+        offloaded_block_size=block_size,
+    )
+    keys = [key(0, i) for i in range(10)]
+    state = SimpleNamespace(
+        group_states=(RequestGroupState(offload_keys=keys, num_hit_blocks=hits),),
+        req=SimpleNamespace(shared_prefix_boundary=junction),
+        req_context=CTX,
+    )
+    _scheduler(True, (config,), manager)._demote_superseded_states(state)
+    if expected:
+        manager.demote.assert_called_once_with([keys[i] for i in expected], CTX)
+    else:
+        manager.demote.assert_not_called()
+    # Candidate selection must not change block identity or lookup metadata.
+    assert state.group_states[0].offload_keys == keys
+    assert state.group_states[0].num_hit_blocks == hits
+    assert state.req.shared_prefix_boundary == junction
+
+
+@pytest.mark.parametrize("policy", ["lru", "arc"])
+def test_junctions_remain_evictable_and_pool_capacity_stays_bounded(policy):
+    manager = CPUOffloadingManager(4, cache_policy=policy)
+    keys = [key(0, i) for i in range(10)]
+    # Several historical checkpoints: two in the inherited hit range, one
+    # at the current junction, and one unknown to this request.
+    historical = [keys[i] for i in (0, 2, 4, 6)]
+    store(manager, historical)
+    config = SimpleNamespace(
+        group_idx=0,
+        sliding_window_size_in_blocks=1,
+        requires_exact_boundary_source=True,
+        offloaded_block_size=32,
+    )
+    state = SimpleNamespace(
+        group_states=(RequestGroupState(offload_keys=keys, num_hit_blocks=3),),
+        req=SimpleNamespace(shared_prefix_boundary=160),
+        req_context=CTX,
+    )
+    _scheduler(True, (config,), manager)._demote_superseded_states(state)
+    evicted = []
+    for i in range(4):
+        evicted.extend(store(manager, [key(0, 100 + i)]).evicted_keys)
+    if policy == "lru":
+        assert evicted[0] == keys[6]  # unrecorded historical junction
+    assert set(evicted) == set(historical)
+    assert not any(manager.lookup(k, CTX) for k in historical)
+    assert all(manager.lookup(key(0, 100 + i), CTX) for i in range(4))

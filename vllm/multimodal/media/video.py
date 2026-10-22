@@ -42,7 +42,7 @@ class VideoMediaIO(MediaIO[tuple[npt.NDArray, dict[str, Any]]]):
     def __init__(
         self,
         image_io: ImageMediaIO,
-        num_frames: int = 32,
+        num_frames: int = 16,
         **kwargs,
     ) -> None:
         super().__init__()

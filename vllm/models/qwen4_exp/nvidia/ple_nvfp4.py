@@ -194,7 +194,7 @@ class NVFP4PinnedPLEEmbedding(VocabParallelEmbedding):
 
     def materialize(self):
         if self.storage is None:
-            self.storage = torch.zeros(
+            storage = torch.zeros(
                 (self.num_embeddings_per_partition, self.row_bytes),
                 dtype=torch.uint8,
                 device="cpu",
@@ -202,7 +202,8 @@ class NVFP4PinnedPLEEmbedding(VocabParallelEmbedding):
             # Share the established registration/lifetime handling of FP8 PLE.
             from .ple_layer import _pin_host_tensor_exact
 
-            _pin_host_tensor_exact(self.storage)
+            _pin_host_tensor_exact(storage)
+            self.storage = storage
             logger.info(
                 "NVFP4 PLE pinned table: TP rank %d, %d rows, %d bytes/row, "
                 "%.3f GiB; gather packed rows then dequantize on GPU",

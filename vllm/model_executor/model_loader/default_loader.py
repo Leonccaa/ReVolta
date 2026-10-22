@@ -25,6 +25,7 @@ from vllm.model_executor.model_loader.direct_io import decoder_layer_filter
 from vllm.model_executor.model_loader.ep_weight_filter import (
     compute_local_expert_ids,
 )
+from vllm.model_executor.model_loader.nvfp4_coverage import nvfp4_checkpoint_coverage
 from vllm.model_executor.model_loader.weight_utils import (
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
@@ -42,6 +43,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     safetensors_weights_iterator,
 )
 from vllm.model_executor.models.interfaces import SupportsMultiModal
+from vllm.revolta_profile import has_nvfp4_weights
 from vllm.tracing import instrument
 from vllm.transformers_utils.repo_utils import list_filtered_repo_files
 
@@ -567,6 +569,8 @@ class DefaultModelLoader(BaseModelLoader):
         with (
             awq_checkpoint_coverage(model)
             if model_config.quantization in ("awq", "awq_marlin")
+            else nvfp4_checkpoint_coverage(model)
+            if has_nvfp4_weights(model_config)
             else nullcontext()
         ):
             loaded_weights = model.load_weights(

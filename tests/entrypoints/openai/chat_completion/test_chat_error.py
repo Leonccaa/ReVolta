@@ -14,6 +14,7 @@ from vllm.entrypoints.openai.engine.protocol import GenerationError
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.serve.render.serving import OpenAIServingRender
+from vllm.exceptions import VLLMValidationError
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.renderers.hf import HfRenderer
 from vllm.tokenizers.registry import cached_tokenizer_from_config
@@ -25,6 +26,46 @@ BASE_MODEL_PATHS = [
     BaseModelPath(name=MODEL_NAME, model_path=MODEL_NAME),
     BaseModelPath(name=MODEL_NAME_SHORT, model_path=MODEL_NAME_SHORT),
 ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        (
+            "mm_processor_kwargs",
+            {"patch_size": 1, "vision_min_num_patches": 3_000_000_000},
+        ),
+        ("media_io_kwargs", {"video": {"num_frames": 1_000_000}}),
+    ],
+)
+async def test_online_renderer_rejects_mm_kwargs_by_default(field, value):
+    # Adapted from vllm-project/vllm#58830: this tree uses OpenAIServingRender.
+    render = OpenAIServingRender(
+        model_config=MockModelConfig(),
+        renderer=MagicMock(),
+        model_registry=MagicMock(),
+        request_logger=None,
+        chat_template=None,
+        chat_template_content_format="auto",
+    )
+    request = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "hello"}],
+        **{field: value},
+    )
+    with pytest.raises(VLLMValidationError, match=f"Per-request {field} are disabled"):
+        await render.preprocess_chat(request, request.messages, None, "auto", None)
+
+
+def test_trust_request_mm_kwargs_opt_in_allows_overrides():
+    from vllm.entrypoints.utils import validate_request_mm_kwargs
+
+    validate_request_mm_kwargs(
+        mm_processor_kwargs={"use_audio_in_video": True},
+        media_io_kwargs={"video": {"num_frames": 4}},
+        trust_request_mm_kwargs=True,
+    )
 
 
 @dataclass
@@ -55,6 +96,7 @@ class MockModelConfig:
     skip_tokenizer_init = False
     is_encoder_decoder: bool = False
     is_multimodal_model: bool = False
+    enable_prompt_embeds: bool = False
     renderer_num_workers: int = 1
 
     def get_diff_sampling_param(self):

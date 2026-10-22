@@ -319,6 +319,14 @@ class Executor(ABC):
         """Reset the encoder cache in each worker to clear cached encoder outputs."""
         self.collective_rpc("reset_encoder_cache")
 
+    def check_sleep(self) -> None:
+        errors: list[str | None] = self.collective_rpc("check_sleep")
+        failures = [
+            f"worker {rank}: {error}" for rank, error in enumerate(errors) if error
+        ]
+        if failures:
+            raise RuntimeError("Sleep preflight failed: " + "; ".join(failures))
+
     def sleep(self, level: int = 1):
         if self.is_sleeping:
             logger.warning("Executor is already sleeping.")

@@ -438,6 +438,10 @@ class OpenAIServingChat(OpenAIServing):
             not tool_choice_function_name
             and self._should_stream_with_auto_tool_parsing(request)
         )
+        # Content that is whitespace-only so far (e.g. the line breaks after
+        # </think>), held until text, a tool call or the end of the stream
+        # decides it. None once the content has started.
+        held_whitespace: list[str | None] = [""] * num_choices
 
         all_previous_token_ids: list[list[int]] | None
         if self.tool_call_id_type == "kimi_k2":
@@ -727,6 +731,16 @@ class OpenAIServingChat(OpenAIServing):
                         )
                         if delta_message and delta_message.tool_calls:
                             tools_streamed[i] = True
+                        held = held_whitespace[i]
+                        if tool_choice_auto and held is not None:
+                            delta_message, held_whitespace[i] = (
+                                self._hold_leading_whitespace(
+                                    delta_message,
+                                    held,
+                                    tools_called=tools_streamed[i],
+                                    finished=output.finish_reason is not None,
+                                )
+                            )
                     # handle streaming just a content delta (no parsers)
                     else:
                         delta_message = DeltaMessage(content=delta_text)
@@ -1556,6 +1570,51 @@ class OpenAIServingChat(OpenAIServing):
             and self.enable_auto_tools
             and request.tool_choice in ["auto", None]
         )
+
+    @staticmethod
+    def _hold_leading_whitespace(
+        delta_message: DeltaMessage | None,
+        held: str,
+        tools_called: bool,
+        finished: bool,
+    ) -> tuple[DeltaMessage | None, str | None]:
+        """Keep whitespace-only content out of a tool-call response.
+
+        The non-streaming response drops content that is only whitespace when
+        tool calls are returned. A stream cannot know yet whether a call
+        follows, so it holds such content: text after it receives it as a
+        prefix, a tool call discards it, and the end of the stream releases
+        it. Returns the delta to send and the held text, or None once the
+        content has started and nothing more needs holding.
+        """
+        content = delta_message.content if delta_message is not None else None
+        if content:
+            if (held + content).strip():
+                assert delta_message is not None
+                delta_message.content = held + content
+                return delta_message, None
+            held += content
+            assert delta_message is not None
+            fields = {
+                name: getattr(delta_message, name)
+                for name in delta_message.model_fields_set
+                if name != "content"
+            }
+            delta_message = (
+                DeltaMessage(**fields)
+                if fields.get("role")
+                or fields.get("reasoning")
+                or fields.get("tool_calls")
+                else None
+            )
+        if tools_called:
+            held = ""
+        elif finished and held:
+            if delta_message is None:
+                delta_message = DeltaMessage()
+            delta_message.content = held
+            held = ""
+        return delta_message, held
 
     def _should_check_for_unstreamed_tool_arg_tokens(
         self,

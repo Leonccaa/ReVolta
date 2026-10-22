@@ -30,13 +30,14 @@ def data_url(data):
 
 def test_safe_modality_defaults_and_explicit_override():
     config = MultiModalConfig(limit_per_prompt={"video": 1})
-    assert config.get_limit_per_prompt("image") == 16
+    assert config.get_limit_per_prompt("image") == 8
     assert config.get_limit_per_prompt("video") == 1
+    assert config.get_limit_per_prompt("audio") == 1
     assert (
         MultiModalConfig(
             limit_per_prompt={"image": {"width": 512}}
         ).get_limit_per_prompt("image")
-        == 16
+        == 8
     )
     assert (
         MultiModalConfig(

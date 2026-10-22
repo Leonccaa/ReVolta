@@ -77,6 +77,7 @@ from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.model_loader.reload import (
     finalize_layerwise_reload,
     initialize_layerwise_reload,
+    validate_weight_reload,
 )
 from vllm.model_executor.models.interfaces import (
     MixtureOfExperts,
@@ -6344,9 +6345,19 @@ class GPUModelRunner(
                             **micro_batch_mm_inputs
                         )
 
-                        batch_outputs_lst.extend(micro_batch_outputs)
+                        # A single video's outputs may still be views into a
+                        # padded all-gather. Release that source before encoding
+                        # the next video, just as for ordinary batches below.
+                        batch_outputs_lst.extend(
+                            out.clone()
+                            if out.untyped_storage().nbytes() > out.nbytes
+                            else out
+                            for out in micro_batch_outputs
+                        )
+                        del micro_batch_outputs
 
                 batch_outputs = batch_outputs_lst
+                del batch_outputs_lst
             else:
                 # Run the encoder.
                 # `batch_outputs` is either of the following:
@@ -6372,9 +6383,16 @@ class GPUModelRunner(
                         batch_outputs = cudagraph_output
                     else:
                         batch_outputs = model.embed_multimodal(**mm_kwargs_batch)
+                    del cudagraph_output
 
             sanity_check_mm_encoder_outputs(batch_outputs, expected_num_items=num_items)
-            encoder_outputs.extend(batch_outputs)
+            # Cache entries are evicted independently. A split/all-gather view
+            # must not keep the rest of its batch (or TP padding) alive.
+            encoder_outputs.extend(
+                out.clone() if out.untyped_storage().nbytes() > out.nbytes else out
+                for out in batch_outputs
+            )
+            del batch_outputs
 
             current_item_idx += num_items
 
@@ -10648,6 +10666,9 @@ class GPUModelRunner(
         :param is_checkpoint_format: set to False if weights have already been processed
             into kernel format (repacking, renaming, etc.)
         """
+        model = self.get_model()
+        validate_weight_reload(model)
+
         # TODO(@kylesayrs): generalize to all runners and loaders
         # argument validation
         if weights_iterator is None and not is_checkpoint_format:
@@ -10657,7 +10678,6 @@ class GPUModelRunner(
                 "to avoid weight reloading errors"
             )
 
-        model = self.get_model()
         weights_to_load = {name for name, _ in model.named_parameters()}
         counter_before_reloading = time.perf_counter()
 

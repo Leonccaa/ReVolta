@@ -26,9 +26,14 @@ class VerifyAndUpdateConfig:
 
 
 def sm70_flash_next_batch_qualified(vllm_config: "VllmConfig") -> bool:
-    """Batch quality covers ordinary decode and MTP; other proposers await gates."""
+    """Batch quality covers ordinary decode, MTP and DFlash; other proposers
+    await gates. DFlash verifies the same multi-token target batches as MTP
+    under the same numerical policy."""
     speculative = vllm_config.speculative_config
-    return speculative is None or getattr(speculative, "method", None) == "mtp"
+    return speculative is None or getattr(speculative, "method", None) in (
+        "mtp",
+        "dflash",
+    )
 
 
 def sm70_fp8_serialized_pipeline_qualified(vllm_config: "VllmConfig") -> bool:

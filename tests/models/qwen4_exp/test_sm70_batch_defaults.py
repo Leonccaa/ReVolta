@@ -74,8 +74,24 @@ def test_unqualified_proposer_requires_explicit_gdn_opt_in(monkeypatch, legacy_o
         monkeypatch.setenv(name, legacy_opt_in)
     envs.disable_envs_cache()
     routes = collect()
-    assert routes["flash_next/fp16/tp4/dflash/c4/p4096"]["gdn_packed"] is (
+    assert routes["flash_next/fp16/tp4/ngram/c4/p4096"]["gdn_packed"] is (
         legacy_opt_in is not None
     )
-    for method in ("none", "mtp"):
+    for method in ("none", "mtp", "dflash"):
         assert routes[f"flash_next/fp16/tp4/{method}/c4/p4096"]["gdn_packed"]
+
+
+def test_dflash_verifier_takes_the_qualified_batch_routes():
+    from tools.sm70_flash_next_route_snapshot import collect
+
+    envs.disable_envs_cache()
+    routes = collect()
+    for key, route in routes.items():
+        if not key.startswith("flash_next/fp16/tp4/dflash/"):
+            continue
+        assert route["batch_qualified"], key
+        assert route["dense_batch_prepared"], key
+        assert route["gdn_packed"], key
+        # The worker's default FP32-partial policy runs HC as one concurrent
+        # batch pack (the tool models MTP's legacy FP16 partials instead).
+        assert route["hc_packed"] and route["hc_fp32_partials"], key

@@ -102,7 +102,7 @@ def collect(ref=None):
         ("27b_dflash2", "flash_next", "35b_awq"),
         ("fp16", "e4m3", "e5m2"),
         (2, 4),
-        ("none", "mtp", "dflash"),
+        ("none", "mtp", "dflash", "ngram"),
         (1, 4, 8),
         (4096, 8192),
     ):
@@ -120,7 +120,7 @@ def collect(ref=None):
             parallel_config=NS(tensor_parallel_size=tp, use_ubatching=False),
         )
         cfg.kernel_config.resolve_sm70_rmsnorm_gated(
-            qualified=model == "flash_next" and spec in ("none", "mtp")
+            qualified=model == "flash_next" and spec in ("none", "mtp", "dflash")
         )
         key = f"{model}/{kv}/tp{tp}/{spec}/c{concurrency}/p{budget}"
         with (

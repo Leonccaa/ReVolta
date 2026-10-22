@@ -19678,6 +19678,10 @@ def compile_factors() -> dict[str, object]:
         # Where the SM70 GEMM dispatch cache is saved; dispatch happens inside
         # custom ops at run time, so the traced graph does not depend on it.
         "VLLM_SM70_GEMM_LUT_PATH",
+        # Row band of the DFlash grouped MoE route. Routing happens inside the
+        # moe_forward_shared custom op at run time, so the traced graph does not
+        # depend on it, and registering it must not recompile any deployment.
+        "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_DFLASH_MAX_TOKENS",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
         "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS",

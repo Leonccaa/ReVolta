@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from vllm.config.scheduler import SchedulerConfig
+from vllm.config.sm70_dflash2 import Sm70DFlash2Config
 from vllm.config.speculative import (
     SpeculativeConfig,
     get_dflash_model_draft_tokens,
@@ -211,6 +212,7 @@ def _adaptive_lookup_config() -> SpeculativeConfig:
     config.method = "dflash"
     config.ngram_assist = True
     config.num_speculative_tokens = 15
+    config.sm70_dflash2 = Sm70DFlash2Config()
     config.ddtree_disable_tree_verify = False
     config.disable_padded_drafter_batch = False
     config.draft_model_config = SimpleNamespace(

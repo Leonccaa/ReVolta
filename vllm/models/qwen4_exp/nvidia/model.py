@@ -308,6 +308,16 @@ def kv_bytes_per_token(model_config, num_kv_heads: int, cache_dtype: str) -> int
     ).page_size_bytes
 
 
+def compact_aux_hidden_state(
+    value: torch.Tensor, dtype: torch.dtype | None
+) -> torch.Tensor:
+    """Apply a drafter's projection dtype to a captured state as
+    ``EagleModelMixin._maybe_add_hidden_state`` does: only to shrink storage."""
+    if dtype is not None and torch.finfo(dtype).bits < 8 * value.element_size():
+        return value.to(dtype)
+    return value
+
+
 def hc_stream_mean(hidden_states: torch.Tensor, hc_count: int) -> torch.Tensor:
     """Reduce a multi-stream ``[T, hc_count * H]`` state to ``[T, H]``.
 
@@ -868,6 +878,11 @@ class Qwen4ExpModel(nn.Module, EagleModelMixin):
                     f"Qwen4Exp captured {len(aux_hidden_states)} aux hidden states "
                     f"for boundaries {self.aux_hidden_state_layers}"
                 )
+            if self.aux_hidden_state_dtype is not None:
+                aux_hidden_states = [
+                    compact_aux_hidden_state(state, self.aux_hidden_state_dtype)
+                    for state in aux_hidden_states
+                ]
             return sample_hidden_states, aux_hidden_states
         return sample_hidden_states
 

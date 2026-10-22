@@ -2523,8 +2523,26 @@ def _fit_csa_linear_auxiliary_specs(
                 candidate,
                 slot_page,
             )
+            if candidate * 4 < target_span:
+                logger.warning_once(
+                    "CSA+linear DFlash drafter blocks hold %d tokens of a "
+                    "%d-token target block, and each takes a whole main-KV "
+                    "slot, so the drafter cache needs about %dx the blocks "
+                    "of a shared layout. Leave --block-size unset so the "
+                    "block is chosen for the drafter.",
+                    candidate,
+                    target_span,
+                    target_span // candidate,
+                )
             return fitted
     # No divisor fits a slot: keep the target span and own tensors.
+    logger.warning_once(
+        "CSA+linear DFlash drafter cache cannot share main-KV slots at a "
+        "%d-token target block: each drafter layer gets its own full-span "
+        "pages. Leave --block-size unset so the block is chosen for the "
+        "drafter.",
+        target_span,
+    )
     return {
         name: replace(
             spec,

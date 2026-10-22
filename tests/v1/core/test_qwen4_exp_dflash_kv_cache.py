@@ -469,6 +469,17 @@ def test_dcp_lse_check_skips_replicated_drafter_layers(monkeypatch) -> None:
         ],
     )
     cp_utils.check_attention_cp_compatibility(config, caches)
+    # Other replicated owners (recurrent state, QSA rings) keep the check.
+    layers["state"] = SimpleNamespace(impl=no_lse)
+    caches.kv_cache_groups.append(
+        KVCacheGroupSpec(
+            ["state"],
+            MambaSpec(block_size=16, shapes=((1,),), dtypes=(torch.float32,)),
+        )
+    )
+    with pytest.raises(AssertionError, match="softmax LSE"):
+        cp_utils.check_attention_cp_compatibility(config, caches)
+    del layers["state"], caches.kv_cache_groups[-1]
     # Without the cache layout (or with a sharded drafter) the check still holds.
     with pytest.raises(AssertionError, match="softmax LSE"):
         cp_utils.check_attention_cp_compatibility(config)
@@ -477,3 +488,23 @@ def test_dcp_lse_check_skips_replicated_drafter_layers(monkeypatch) -> None:
     )
     with pytest.raises(AssertionError, match="softmax LSE"):
         cp_utils.check_attention_cp_compatibility(config, caches)
+
+
+def test_drafter_layouts_that_cost_memory_are_reported(monkeypatch) -> None:
+    from unittest.mock import MagicMock
+
+    import vllm.v1.core.kv_cache_utils as kv_cache_utils
+
+    logger = MagicMock()
+    monkeypatch.setattr(kv_cache_utils, "logger", logger)
+    config = _vllm_config()
+    # A wide drafter (8 KiB/token) in 128-token target blocks (1 KiB/token):
+    # only a 16-token drafter block fits a slot, an eighth of the target block.
+    get_kv_cache_groups(config, _target_specs(128) | _draft_specs((8,), head_size=2048))
+    # No divisor fits a slot at all.
+    get_kv_cache_groups(
+        config, _target_specs() | _draft_specs((8,), num_kv_heads=8, head_size=256)
+    )
+    messages = [call.args[0] for call in logger.warning_once.call_args_list]
+    assert any("Leave --block-size unset" in m and "blocks hold" in m for m in messages)
+    assert any("cannot share main-KV slots" in m for m in messages)

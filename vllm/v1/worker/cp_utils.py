@@ -19,13 +19,20 @@ def check_attention_cp_compatibility(
     dcp_size = vllm_config.parallel_config.decode_context_parallel_size
     interleave_size = vllm_config.parallel_config.cp_kv_cache_interleave_size
     if pcp_size * dcp_size > 1:
-        # A layer whose cache group is replicated across DCP ranks (e.g. a
-        # DFlash drafter) attends over its whole cache on every rank and never
-        # combines partial results, so it needs no softmax LSE.
+        # A drafter's sliding-window cache replicated across DCP ranks (DFlash)
+        # is attended whole on every rank and never combined, so its layers need
+        # no softmax LSE. Every other layer keeps the check.
         replicated: set[str] = set()
         if kv_cache_config is not None:
+            from vllm.v1.kv_cache_interface import SlidingWindowSpec
+
             for group in kv_cache_config.kv_cache_groups:
-                if not group.kv_cache_spec.dcp_sharded:
+                spec = group.kv_cache_spec
+                if (
+                    group.is_eagle_group
+                    and isinstance(spec, SlidingWindowSpec)
+                    and not spec.dcp_sharded
+                ):
                     replicated.update(group.layer_names)
         layer_type = cast(type[Any], AttentionLayerBase)
         layers = get_layers_from_vllm_config(vllm_config, layer_type)

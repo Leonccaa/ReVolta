@@ -332,9 +332,10 @@ def test_nvfp4_warmup_uses_converter_padded_output_size(monkeypatch, compact):
         global_scale=0.125,
     )
     calls = []
-    monkeypatch.setattr(
-        torch.ops._C, "nvfp4_gemm_sm70_out_meta", object(), raising=False
-    )
+    # The warmup guards both NVFP4 routes on the registered native operator.
+    # Stub it so the test does not depend on the native library being loaded,
+    # which only CUDA platforms do at import time.
+    monkeypatch.setattr(torch.ops._C, "nvfp4_gemm_sm70_out", object(), raising=False)
     monkeypatch.setattr(
         warmup.sm70_ops,
         "nvfp4_gemm_sm70_out",

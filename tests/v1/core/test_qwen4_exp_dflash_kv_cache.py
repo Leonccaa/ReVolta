@@ -14,6 +14,7 @@ from vllm.v1.core.kv_cache_utils import (
     generate_scheduler_kv_cache_config,
     get_kv_cache_config_from_groups,
     get_kv_cache_groups,
+    resolve_kv_cache_block_sizes,
 )
 from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
 from vllm.v1.kv_cache_interface import (
@@ -23,6 +24,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowSpec,
 )
+from vllm.v1.worker.gpu.block_table import BlockTables
 
 pytestmark = pytest.mark.skip_global_cleanup
 
@@ -209,10 +211,65 @@ def test_drafter_cache_requires_dflash() -> None:
         )
 
 
-def test_drafter_cache_must_be_replicated_across_dcp() -> None:
-    specs = _target_specs(dcp_sharded=True) | _draft_specs((8,), dcp_sharded=True)
-    with pytest.raises(ValueError, match="replicated across DCP"):
-        get_kv_cache_groups(_vllm_config(dcp=2), specs)
+def _dcp2_target_specs():
+    # Production layout: QSA main K/V sharded, recurrent and ring state replicated.
+    return {
+        name: (
+            replace(spec, dcp_sharded=False)
+            if type(spec) in (MambaSpec, CircularBufferSpec)
+            else spec
+        )
+        for name, spec in _target_specs(dcp_sharded=True).items()
+    }
+
+
+def test_drafter_cache_is_replicated_across_dcp() -> None:
+    # Drafter layers report AttentionSpec's default dcp_sharded=True; the group
+    # is replicated anyway, so hybrid DCP accepts it and every rank keeps the
+    # whole window (the drafter's attention backend has no DCP combine).
+    config = _vllm_config(dcp=2)
+    config.cache_config.block_size = 16
+    config.cache_config.enable_prefix_caching = True
+    config.cache_config.hash_block_size = None
+    config.kv_transfer_config = None
+    groups = get_kv_cache_groups(
+        config, _dcp2_target_specs() | _draft_specs((8,), dcp_sharded=True)
+    )
+    drafter = _drafter_group(groups).kv_cache_spec
+    assert not drafter.dcp_sharded
+    # The sharded 16-slot target block spans 32 global tokens; a 32-token
+    # drafter page (8 KiB) still fits one 16 KiB owner slot.
+    assert drafter.block_size == 32
+
+    caches = get_kv_cache_config_from_groups(config, groups, available_memory=1 << 30)
+    assert resolve_kv_cache_block_sizes(caches, config) == (32, 32)
+    scheduler_config = generate_scheduler_kv_cache_config([caches])
+    scheduler_config.num_blocks = 64
+    coordinator = get_kv_cache_coordinator(
+        scheduler_config,
+        max_model_len=8192,
+        max_in_flight_tokens=128,
+        use_eagle=True,
+        enable_caching=True,
+        enable_kv_cache_events=False,
+        dcp_world_size=2,
+        pcp_world_size=1,
+        hash_block_size=16,
+    )
+    manager = next(
+        m
+        for m in coordinator.single_type_managers
+        if isinstance(m, SlidingWindowManager)
+    )
+    assert manager.dcp_world_size == 1
+    assert manager.block_size == 32
+
+
+def test_block_table_lays_out_a_replicated_group_on_every_rank() -> None:
+    tables = BlockTables.__new__(BlockTables)
+    tables.cp_size, tables.cp_rank, tables._dcp_sharded = 2, 1, [True, False]
+    assert tables.group_cp(0) == (2, 1)
+    assert tables.group_cp(1) == (1, 0)
 
 
 def test_drafter_under_dcp_uses_the_global_target_span() -> None:

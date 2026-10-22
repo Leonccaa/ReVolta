@@ -654,6 +654,8 @@ class DFlashSpeculator(DraftModelSpeculator):
         # Support multiple draft KV cache groups by preparing inputs once for each
         with record_function_or_nullcontext("dflash: prepare inputs"):
             for i, gid in enumerate(self.draft_kv_cache_group_ids):
+                # A drafter cache replicated across DCP ranks takes every slot.
+                cp_size, cp_rank = self.block_tables.group_cp(gid)
                 prepare_dflash_inputs(
                     self.input_buffers,
                     query_slot_mappings[gid],
@@ -673,8 +675,8 @@ class DFlashSpeculator(DraftModelSpeculator):
                     seeds,
                     self.block_tables.input_block_tables[gid],
                     self.block_tables.kernel_block_sizes[gid],
-                    self.block_tables.cp_rank,
-                    self.block_tables.cp_size,
+                    cp_rank,
+                    cp_size,
                     self.block_tables.cp_interleave,
                     self.parallel_drafting_token_id,
                     self.num_query_per_req,

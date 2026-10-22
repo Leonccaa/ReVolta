@@ -1976,6 +1976,7 @@ def test_dflash_intermediate_prefill_materializes_context_without_query(monkeypa
         cp_rank=0,
         cp_size=1,
         cp_interleave=1,
+        group_cp=lambda group_id: (1, 0),
     )
     speculator._context_slot_mappings = torch.zeros(1, 8, dtype=torch.int64)
     speculator._query_slot_mappings = torch.zeros(1, 8, dtype=torch.int64)

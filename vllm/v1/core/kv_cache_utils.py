@@ -2476,6 +2476,11 @@ def _fit_csa_linear_auxiliary_specs(
     kernels that read whole key tiles must never touch a block that was freed
     below the window (vllm-project/vllm#60560). The attention layer keeps its
     own window.
+
+    The drafter cache is replicated across DCP ranks, like the MTP drafter's
+    QSA cache: hybrid DCP admits only full-attention shards or replicated owners
+    (resolve_kv_cache_block_sizes), and the drafter's attention backend has no
+    DCP combine. Each rank holds the whole window for its own heads.
     """
     spec_config = vllm_config.speculative_config
     if spec_config is None or not spec_config.use_dflash():
@@ -2485,15 +2490,9 @@ def _fit_csa_linear_auxiliary_specs(
         )
     if not is_kv_cache_spec_uniform(cast(dict[str, KVCacheSpec], auxiliary)):
         raise ValueError("CSA+linear DFlash drafter layers must share one cache spec.")
-    dcp = getattr(vllm_config.parallel_config, "decode_context_parallel_size", 1)
-    if dcp > 1 and any(spec.dcp_sharded for spec in auxiliary.values()):
-        # Hybrid DCP admits full-attention shards or replicated owners only
-        # (resolve_kv_cache_block_sizes); a sharded sliding-window drafter
-        # would need a DCP-aware sliding-window manager.
-        raise ValueError(
-            "CSA+linear DFlash drafter caches must be replicated across DCP "
-            "ranks; serve the drafter with decode_context_parallel_size=1."
-        )
+    auxiliary = {
+        name: replace(spec, dcp_sharded=False) for name, spec in auxiliary.items()
+    }
     for candidate in range(target_span, 15, -1):
         if target_span % candidate != 0 or candidate % 16 != 0:
             continue

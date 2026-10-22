@@ -362,6 +362,57 @@ def test_grouped_decode20_route_plan(grouped, m):
     assert plan.w13 == expected and plan.w2 == expected
 
 
+def _admit_for(monkeypatch, method):
+    monkeypatch.setenv("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN", "1")
+    monkeypatch.delenv("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT", raising=False)
+    monkeypatch.setattr(moe, "_grouped_qpn_native_supports_pack_rows", lambda: True)
+    monkeypatch.setattr(
+        torch.ops._C, "awq_moe_grouped_decode_sm70_out", object(), raising=False
+    )
+    spec = None if method is None else SimpleNamespace(method=method)
+    monkeypatch.setattr(
+        moe,
+        "get_current_vllm_config_or_none",
+        lambda: SimpleNamespace(speculative_config=spec),
+    )
+    return _layer()
+
+
+@pytest.mark.parametrize(
+    ("method", "dflash_band", "expected"),
+    [
+        (None, None, 40),
+        ("mtp", None, 40),
+        ("mtp", "24", 40),  # the DFlash band never applies to MTP
+        ("dflash", None, 48),  # kernel maximum by default
+        ("dflash", "40", 40),
+    ],
+)
+def test_dflash_layers_take_their_own_row_band(
+    monkeypatch, method, dflash_band, expected
+):
+    layer = _admit_for(monkeypatch, method)
+    monkeypatch.setenv("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS", "40")
+    if dflash_band is None:
+        monkeypatch.delenv(
+            "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_DFLASH_MAX_TOKENS", raising=False
+        )
+    else:
+        monkeypatch.setenv(
+            "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_DFLASH_MAX_TOKENS", dflash_band
+        )
+    assert moe._initialize_qwen38_grouped_qpn(layer, True, 10)
+    assert layer.sm70_awq_qwen38_grouped_qpn_max_tokens == expected
+
+
+@pytest.mark.parametrize("value", ["1", "49"])
+def test_dflash_row_band_is_checked(monkeypatch, value):
+    layer = _admit_for(monkeypatch, "dflash")
+    monkeypatch.setenv("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_DFLASH_MAX_TOKENS", value)
+    with pytest.raises(ValueError, match="DFLASH_MAX_TOKENS"):
+        moe._initialize_qwen38_grouped_qpn(layer, True, 10)
+
+
 @pytest.mark.parametrize(
     ("method", "chunked"), [(None, False), ("mtp", False), ("dflash", True)]
 )
@@ -402,6 +453,25 @@ def test_row_chunks_for_wide_verify_batches(m, chunked, expected):
     layer = _layer(
         sm70_awq_qwen38_grouped_qpn_max_tokens=40,
         sm70_awq_qwen38_grouped_qpn_chunked=chunked,
+    )
+    assert moe._qwen38_grouped_qpn_chunks(layer, *_runtime_inputs(m)) == expected
+
+
+@pytest.mark.parametrize(
+    ("m", "expected"),
+    [
+        (40, [(0, 40)]),
+        (48, [(0, 48)]),  # five verified drafts at eight requests: one call
+        (49, [(0, 25), (25, 49)]),
+        (64, [(0, 32), (32, 64)]),
+        (96, [(0, 48), (48, 96)]),
+        (97, None),
+    ],
+)
+def test_row_chunks_with_the_dflash_band(m, expected):
+    layer = _layer(
+        sm70_awq_qwen38_grouped_qpn_max_tokens=48,
+        sm70_awq_qwen38_grouped_qpn_chunked=True,
     )
     assert moe._qwen38_grouped_qpn_chunks(layer, *_runtime_inputs(m)) == expected
 

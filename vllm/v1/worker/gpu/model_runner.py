@@ -660,7 +660,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cudagraph_mode,
             decode_query_len=self.decode_query_len,
         )
-        check_attention_cp_compatibility(self.vllm_config)
+        check_attention_cp_compatibility(self.vllm_config, self.kv_cache_config)
         if isinstance(self.speculator, DraftModelSpeculator):
             self.speculator.set_attn(
                 self.model_state,

@@ -431,3 +431,49 @@ def test_offload_spec_budgets_the_drafter_group() -> None:
     assert worker.gpu_block_size[drafter_index] == drafter.kv_cache_spec.block_size
     assert worker.cpu_group_num_blocks == scheduler.cpu_group_num_blocks
     assert worker.cpu_group_page_sizes == scheduler.cpu_group_page_sizes
+
+
+def test_dcp_lse_check_skips_replicated_drafter_layers(monkeypatch) -> None:
+    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
+    from vllm.v1.worker import cp_utils
+
+    no_lse = SimpleNamespace(
+        need_to_return_lse_for_decode=False,
+        supports_mtp_with_cp_non_trivial_interleave_size=True,
+    )
+    layers = {
+        "target": SimpleNamespace(
+            impl=SimpleNamespace(need_to_return_lse_for_decode=True)
+        ),
+        DRAFT.format(8): SimpleNamespace(impl=no_lse),
+    }
+    monkeypatch.setattr(cp_utils, "get_layers_from_vllm_config", lambda *_: layers)
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=2,
+            cp_kv_cache_interleave_size=1,
+        ),
+        speculative_config=SimpleNamespace(method="dflash"),
+    )
+    target = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    drafter = _draft_specs((8,))[DRAFT.format(8)]
+    caches = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["target"], target),
+            KVCacheGroupSpec([DRAFT.format(8)], drafter, is_eagle_group=True),
+        ],
+    )
+    cp_utils.check_attention_cp_compatibility(config, caches)
+    # Without the cache layout (or with a sharded drafter) the check still holds.
+    with pytest.raises(AssertionError, match="softmax LSE"):
+        cp_utils.check_attention_cp_compatibility(config)
+    caches.kv_cache_groups[1] = KVCacheGroupSpec(
+        [DRAFT.format(8)], replace(drafter, dcp_sharded=True), is_eagle_group=True
+    )
+    with pytest.raises(AssertionError, match="softmax LSE"):
+        cp_utils.check_attention_cp_compatibility(config, caches)

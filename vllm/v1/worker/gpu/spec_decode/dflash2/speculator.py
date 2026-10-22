@@ -844,7 +844,13 @@ class DFlash2Speculator(DFlashSpeculator):
             if isinstance(self._group_causal, dict)
             else self._group_causal
         )
-        if self.block_tables.cp_size != 1 or has_causal:
+        # The refresh copies global seq_lens, which a DCP-replicated drafter
+        # cache uses as is; only a sharded drafter group needs local lengths.
+        sharded = any(
+            self.block_tables.group_cp(gid)[0] != 1
+            for gid in self.draft_kv_cache_group_ids
+        )
+        if sharded or has_causal:
             return
         if any(
             not isinstance(a.impl, FlashAttnV100Impl)

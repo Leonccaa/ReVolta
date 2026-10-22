@@ -713,6 +713,14 @@ class Platform:
             indexer_align = cls._get_indexer_block_alignment(vllm_config)
             if indexer_align:
                 attn_block_size = indexer_align * cdiv(attn_block_size, indexer_align)
+            # A model may need the block to divide further, e.g. a drafter
+            # cache reblocked into the main-KV slots. Round up to a size that
+            # keeps the backend alignment as well.
+            model_align = getattr(model_cls, "get_kv_block_size_alignment", None)
+            extra_align = model_align(vllm_config) if model_align else None
+            if extra_align:
+                unit = lcm(kernel_block_alignment_size, extra_align)
+                attn_block_size = unit * cdiv(attn_block_size, unit)
 
         if cache_config.block_size < attn_block_size:
             cache_config.block_size = attn_block_size

@@ -84,6 +84,15 @@ class BlockTables:
             [t.data_ptr() for t in x], dtype=torch.uint64, device=self.device
         )
 
+    def group_cp(self, group_id: int) -> tuple[int, int]:
+        """(cp_size, cp_rank) that lay out a group's slots.
+
+        A replicated group holds every token on every rank.
+        """
+        if self._dcp_sharded[group_id]:
+            return self.cp_size, self.cp_rank
+        return 1, 0
+
     def init_block_table_layout_tensors(self) -> None:
         # Called at init and after a CuMem kv_cache wake-up. The ptr tensors
         # cache raw data_ptr() values that go stale once the underlying tensors

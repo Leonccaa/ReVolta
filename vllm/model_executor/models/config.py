@@ -26,9 +26,14 @@ class VerifyAndUpdateConfig:
 
 
 def sm70_flash_next_batch_qualified(vllm_config: "VllmConfig") -> bool:
-    """Batch quality covers ordinary decode and MTP; other proposers await gates."""
+    """Batch quality covers ordinary decode, MTP and DFlash; other proposers
+    await gates. DFlash verifies the same multi-token target batches as MTP
+    under the same numerical policy."""
     speculative = vllm_config.speculative_config
-    return speculative is None or getattr(speculative, "method", None) == "mtp"
+    return speculative is None or getattr(speculative, "method", None) in (
+        "mtp",
+        "dflash",
+    )
 
 
 def sm70_fp8_serialized_pipeline_qualified(vllm_config: "VllmConfig") -> bool:
@@ -696,6 +701,22 @@ def _strip_qwen4_exp_mrope(model_config: "ModelConfig") -> None:
             rope_parameters.pop("mrope_interleaved", None)
 
 
+# How a DFlash drafter's target features were reduced from Qwen4Exp's
+# hyper-connection streams during training. Only the plain stream mean of a
+# completed layer is implemented (Qwen4ExpModel aux capture).
+QWEN4_EXP_DFLASH_FEATURE_CONTRACTS = frozenset({"hc_mean"})
+
+
+def qwen4_exp_dflash_feature_contract(spec_config: Any) -> str | None:
+    draft_model_config = getattr(spec_config, "draft_model_config", None)
+    hf_config = getattr(draft_model_config, "hf_config", None)
+    dflash_config = getattr(hf_config, "dflash_config", None)
+    if not isinstance(dflash_config, Mapping):
+        return None
+    contract = dflash_config.get("target_feature_reduction")
+    return contract if isinstance(contract, str) else None
+
+
 class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConfig):
     """Apply the Qwen3.5 hybrid-cache contract to Qwen4Exp."""
 
@@ -737,14 +758,25 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
             _strip_qwen4_exp_mrope(model_config)
 
         spec_config = vllm_config.speculative_config
-        if spec_config is not None and spec_config.method not in {
+        if spec_config is not None and spec_config.method == "dflash":
+            contract = qwen4_exp_dflash_feature_contract(spec_config)
+            if contract not in QWEN4_EXP_DFLASH_FEATURE_CONTRACTS:
+                raise NotImplementedError(
+                    "Qwen4Exp DFlash needs the drafter to declare how it reads "
+                    "the target's hyper-connection streams: set "
+                    "dflash_config.target_feature_reduction in the draft config "
+                    f"to one of {sorted(QWEN4_EXP_DFLASH_FEATURE_CONTRACTS)} "
+                    f"(got {contract!r}). 'hc_mean' is the stream mean of a "
+                    "completed layer; learned HC contractions are not supported"
+                )
+        elif spec_config is not None and spec_config.method not in {
             "mtp",
             "ngram",
             "ngram_gpu",
         }:
             raise NotImplementedError(
                 "Qwen4Exp speculative decoding supports only its native MTP "
-                "checkpoint and linear n-gram proposers"
+                "checkpoint, DFlash drafters and linear n-gram proposers"
             )
 
 

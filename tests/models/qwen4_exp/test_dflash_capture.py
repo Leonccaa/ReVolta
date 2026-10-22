@@ -58,6 +58,7 @@ def _vllm_config(method: str, dflash_config: dict | None = None):
             enable_dbo=False,
             ubatch_size=1,
             decode_context_parallel_size=1,
+            pipeline_parallel_size=1,
         ),
         speculative_config=SimpleNamespace(method=method, draft_model_config=draft),
     )
@@ -95,6 +96,16 @@ def test_dflash_without_a_supported_contract_is_rejected(dflash_config) -> None:
         Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(
             _vllm_config("dflash", dflash_config)
         )
+
+
+@pytest.mark.usefixtures("_no_base_verify")
+def test_dflash_with_pipeline_parallelism_fails_early() -> None:
+    config = _vllm_config(
+        "dflash", dict(INCOAI_DFLASH_CONFIG, target_feature_reduction="hc_mean")
+    )
+    config.parallel_config.pipeline_parallel_size = 2
+    with pytest.raises(NotImplementedError, match="pipeline parallelism"):
+        Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(config)
 
 
 @pytest.mark.usefixtures("_no_base_verify")
@@ -402,3 +413,20 @@ def test_vl_shell_routes_aux_layers_to_the_text_backbone(monkeypatch) -> None:
     shell = SimpleNamespace(get_language_model=lambda: SimpleNamespace(model=backbone))
     SupportsEagle3.set_aux_hidden_state_layers(shell, (6, 16, 26, 36, 46))
     assert backbone.aux_hidden_state_layers == (6, 16, 26, 36, 46)
+
+
+@pytest.mark.parametrize(
+    ("source", "target", "expected"),
+    [
+        (torch.float32, torch.float16, torch.float16),  # shrink: applied
+        (torch.float16, torch.float16, torch.float16),  # same width: kept
+        (torch.bfloat16, torch.float16, torch.bfloat16),  # same width: kept
+        (torch.float16, torch.float32, torch.float16),  # never widened
+        (torch.float16, None, torch.float16),
+    ],
+)
+def test_aux_state_compaction_only_shrinks(source, target, expected) -> None:
+    from vllm.models.qwen4_exp.nvidia.model import compact_aux_hidden_state
+
+    value = torch.ones(2, 8, dtype=source)
+    assert compact_aux_hidden_state(value, target).dtype == expected

@@ -769,6 +769,13 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
                     f"(got {contract!r}). 'hc_mean' is the stream mean of a "
                     "completed layer; learned HC contractions are not supported"
                 )
+            if vllm_config.parallel_config.pipeline_parallel_size > 1:
+                # The CSA+linear drafter cache and the aux-state handoff are
+                # built and tested for a single pipeline stage only.
+                raise NotImplementedError(
+                    "Qwen4Exp DFlash drafting does not support pipeline "
+                    "parallelism; use pipeline_parallel_size=1"
+                )
         elif spec_config is not None and spec_config.method not in {
             "mtp",
             "ngram",

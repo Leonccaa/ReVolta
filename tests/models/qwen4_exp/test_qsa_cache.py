@@ -265,3 +265,20 @@ def test_qsa_ring_capacity_divides_the_attention_block(
     assert spec.block_size == capacity
     assert block_size % spec.block_size == 0
     assert spec.block_size >= 4 + num_speculative_tokens
+
+
+def test_qsa_ring_widening_is_capped() -> None:
+    # 16-row groups in a 1616 = 16 * 101 block: only the whole block divides it,
+    # far beyond four times the 32-row minimal ring.
+    layer = QSAKeyStateCache(
+        head_size=128,
+        dtype=torch.float16,
+        prefix="model.layers.0.self_attn.raw_key_cache",
+        cache_config=SimpleNamespace(block_size=1616),
+        compress_ratio=16,
+        vllm_config=SimpleNamespace(
+            compilation_config=SimpleNamespace(static_forward_context={})
+        ),
+    )
+    with pytest.raises(ValueError, match="multiple of 32"):
+        layer.get_kv_cache_spec(SimpleNamespace(num_speculative_tokens=4))

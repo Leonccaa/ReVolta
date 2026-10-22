@@ -2035,6 +2035,7 @@ def test_noncausal_dflash_capture_binds_paged_prefix_attention(monkeypatch):
         use_flash_v100_prefill_paged=True,
         _small_query_decode_enabled=lambda _metadata: False,
         _flash_v100_prefill_with_prefix=paged_prefix,
+        kv_cache_dtype="auto",
     )
     metadata = SimpleNamespace(
         max_query_len=8,

@@ -8,6 +8,29 @@ from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.config.cache import CacheDType
+
+
+def dflash_draft_cache_dtype(config: "VllmConfig") -> "CacheDType":
+    """The cache dtype a DFlash drafter is loaded with (``load_dflash_model``).
+
+    An explicit draft ``kv_cache_dtype`` wins; on SM70 an FP8 target keeps an
+    FP16 drafter cache; otherwise the drafter inherits the target dtype.
+    """
+    from vllm.platforms import current_platform
+
+    spec = config.speculative_config
+    assert spec is not None
+    if spec.kv_cache_dtype is not None:
+        return spec.kv_cache_dtype
+    target = config.cache_config.cache_dtype
+    if (
+        str(target).startswith("fp8")
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability(70)
+    ):
+        return "auto"
+    return target
 
 
 def validate_speculative_kv_cache_dtype(config: "VllmConfig") -> None:

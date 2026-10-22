@@ -14,6 +14,7 @@ from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.compilation.sm70_decode_graph import is_sm70_decode_graph_compiling
 from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config.speculative_kv import dflash_draft_cache_dtype
 from vllm.distributed import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
@@ -80,8 +81,10 @@ from vllm.tokenizers.registry import cached_tokenizer_from_config
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
+from vllm.utils.math_utils import cdiv
+from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
-from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, get_kv_quant_mode
 
 from ..config import Qwen4ExpConfig
 from .hyperconnection import GatedResidual, HyperConnectionConfig
@@ -283,6 +286,26 @@ _QWEN3_5_WEIGHTS_MAPPER = WeightsMapper(
         ".in_proj_a": (".in_proj_ba", 1),
     }
 )
+
+
+def kv_bytes_per_token(model_config, num_kv_heads: int, cache_dtype: str) -> int:
+    """K and V bytes per token, sized as ``Platform._align_hybrid_block_size``
+    sizes an attention page."""
+    dtype = (
+        model_config.dtype
+        if cache_dtype == "auto"
+        else STR_DTYPE_TO_TORCH_DTYPE[cache_dtype]
+    )
+    return FullAttentionSpec(
+        block_size=1,
+        num_kv_heads=num_kv_heads,
+        head_size=model_config.get_head_size(),
+        dtype=dtype,
+        # The first INT8 format keeps the E4M3 token grid.
+        kv_quant_mode=get_kv_quant_mode(
+            "auto" if cache_dtype == "int8" else cache_dtype
+        ),
+    ).page_size_bytes
 
 
 def hc_stream_mean(hidden_states: torch.Tensor, hc_count: int) -> torch.Tensor:
@@ -1171,6 +1194,36 @@ class Qwen4ExpForCausalLM(
         return vllm_config.parallel_config.decode_context_parallel_size
 
     @classmethod
+    def get_kv_block_size_alignment(cls, vllm_config: VllmConfig) -> int | None:
+        """Block multiple a DFlash drafter cache needs, else ``None``.
+
+        The drafter's sliding-window cache shares main-KV owner slots: its block
+        is a 16-token-aligned divisor of the target block whose page fits one
+        slot (``_fit_csa_linear_auxiliary_specs``). A drafter token takes
+        ``ratio`` main-KV tokens of bytes, so the target block must split into
+        ``ratio`` such divisors; otherwise only tiny drafter blocks fit (DCP1
+        picks 1616 = 16 * 101 for a four-token draft).
+        """
+        from vllm.v1.core.kv_cache_utils import CSA_LINEAR_DRAFTER_BLOCK_ALIGNMENT
+
+        spec = vllm_config.speculative_config
+        if spec is None or not spec.use_dflash():
+            return None
+        draft = spec.draft_model_config
+        target = vllm_config.model_config
+        draft_bytes = kv_bytes_per_token(
+            draft,
+            draft.get_num_kv_heads(spec.draft_parallel_config),
+            dflash_draft_cache_dtype(vllm_config),
+        )
+        main_bytes = kv_bytes_per_token(
+            target,
+            target.get_num_kv_heads(vllm_config.parallel_config),
+            vllm_config.cache_config.cache_dtype,
+        )
+        return CSA_LINEAR_DRAFTER_BLOCK_ALIGNMENT * cdiv(draft_bytes, main_bytes)
+
+    @classmethod
     def get_mamba_specs_from_config(
         cls, vllm_config: VllmConfig
     ) -> tuple[MambaSpec, ...]:
@@ -1535,6 +1588,10 @@ class Qwen4ExpForConditionalGeneration(
     @classmethod
     def get_kv_block_size_multiple(cls, vllm_config: VllmConfig) -> int:
         return Qwen4ExpForCausalLM.get_kv_block_size_multiple(vllm_config)
+
+    @classmethod
+    def get_kv_block_size_alignment(cls, vllm_config: VllmConfig) -> int | None:
+        return Qwen4ExpForCausalLM.get_kv_block_size_alignment(vllm_config)
 
 
 __all__ = [

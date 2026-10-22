@@ -2460,6 +2460,11 @@ def _get_kv_cache_groups_csa_linear(
     return groups
 
 
+# A DFlash drafter block inside the CSA+linear pool is a multiple of this many
+# tokens (see _fit_csa_linear_auxiliary_specs).
+CSA_LINEAR_DRAFTER_BLOCK_ALIGNMENT = 16
+
+
 def _fit_csa_linear_auxiliary_specs(
     vllm_config: VllmConfig,
     auxiliary: dict[str, SlidingWindowSpec],
@@ -2493,8 +2498,9 @@ def _fit_csa_linear_auxiliary_specs(
     auxiliary = {
         name: replace(spec, dcp_sharded=False) for name, spec in auxiliary.items()
     }
-    for candidate in range(target_span, 15, -1):
-        if target_span % candidate != 0 or candidate % 16 != 0:
+    align = CSA_LINEAR_DRAFTER_BLOCK_ALIGNMENT
+    for candidate in range(target_span, align - 1, -1):
+        if target_span % candidate != 0 or candidate % align != 0:
             continue
         candidate_specs = {
             name: replace(spec, block_size=candidate, page_size_padded=None)

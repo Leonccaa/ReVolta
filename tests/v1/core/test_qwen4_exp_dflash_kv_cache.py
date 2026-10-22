@@ -257,3 +257,11 @@ def test_scheduler_builds_a_sliding_window_manager_for_the_drafter() -> None:
     assert managers[0].sliding_window == 48
     drafter_index = coordinator.single_type_managers.index(managers[0])
     assert coordinator.eagle_group_ids == {drafter_index}
+
+
+def test_sharded_flag_is_harmless_without_dcp() -> None:
+    # AttentionSpec defaults to dcp_sharded=True; with DCP=1 that is a no-op.
+    groups = get_kv_cache_groups(
+        _vllm_config(), _target_specs() | _draft_specs((8,), dcp_sharded=True)
+    )
+    assert _drafter_group(groups).kv_cache_spec.block_size == 16

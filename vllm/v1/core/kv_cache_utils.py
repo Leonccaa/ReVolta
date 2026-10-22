@@ -2485,9 +2485,14 @@ def _fit_csa_linear_auxiliary_specs(
         )
     if not is_kv_cache_spec_uniform(cast(dict[str, KVCacheSpec], auxiliary)):
         raise ValueError("CSA+linear DFlash drafter layers must share one cache spec.")
-    if any(spec.dcp_sharded for spec in auxiliary.values()):
+    dcp = getattr(vllm_config.parallel_config, "decode_context_parallel_size", 1)
+    if dcp > 1 and any(spec.dcp_sharded for spec in auxiliary.values()):
+        # Hybrid DCP admits full-attention shards or replicated owners only
+        # (resolve_kv_cache_block_sizes); a sharded sliding-window drafter
+        # would need a DCP-aware sliding-window manager.
         raise ValueError(
-            "CSA+linear DFlash drafter caches must be replicated across DCP ranks."
+            "CSA+linear DFlash drafter caches must be replicated across DCP "
+            "ranks; serve the drafter with decode_context_parallel_size=1."
         )
     for candidate in range(target_span, 15, -1):
         if target_span % candidate != 0 or candidate % 16 != 0:

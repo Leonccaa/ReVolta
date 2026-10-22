@@ -264,6 +264,17 @@ def test_drafter_cache_is_replicated_across_dcp() -> None:
     assert manager.dcp_world_size == 1
     assert manager.block_size == 32
 
+    # The engine sizes memory per request from the group spec before it
+    # builds the pool; a replicated window is sized as at DCP1.
+    config.model_config.max_model_len = 8192
+    config.max_in_flight_tokens = 128
+    blocks = drafter.max_admission_blocks_per_request(
+        max_in_flight_tokens=128, max_model_len=8192
+    )
+    assert drafter.max_memory_usage_bytes(config) == blocks * drafter.page_size_bytes
+    with pytest.raises(AssertionError, match="DCP not support sliding window"):
+        replace(drafter, dcp_sharded=True).max_memory_usage_bytes(config)
+
 
 def test_block_table_lays_out_a_replicated_group_on_every_rank() -> None:
     tables = BlockTables.__new__(BlockTables)

@@ -596,9 +596,12 @@ class SlidingWindowSpec(AttentionSpec):
         return cdiv(num_tokens, self.block_size) + 1
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
-        assert vllm_config.parallel_config.decode_context_parallel_size == 1, (
-            "DCP not support sliding window."
-        )
+        # A replicated window (e.g. a DFlash drafter under DCP) keeps every
+        # token on every rank, so DCP does not change its footprint.
+        assert (
+            not self.dcp_sharded
+            or vllm_config.parallel_config.decode_context_parallel_size == 1
+        ), "DCP not support sliding window."
         max_model_len = vllm_config.model_config.max_model_len
         max_in_flight_tokens = vllm_config.max_in_flight_tokens
         max_blocks = self.max_admission_blocks_per_request(

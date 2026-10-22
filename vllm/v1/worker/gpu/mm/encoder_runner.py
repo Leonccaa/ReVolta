@@ -134,7 +134,14 @@ class EncoderRunner:
         ):
             batch_outputs = self.model.embed_multimodal(**mm_kwargs_batch)
             sanity_check_mm_encoder_outputs(batch_outputs, expected_num_items=num_items)
-            encoder_outputs.extend(batch_outputs)
+            # Cache entries are evicted independently. A split/all-gather view
+            # must not keep the rest of its batch (or TP padding) alive.
+            encoder_outputs.extend(
+                out.clone() if out.untyped_storage().nbytes() > out.nbytes else out
+                for out in batch_outputs
+            )
+            # Release source storage before the next encoder's activations.
+            del batch_outputs
         if log_peak:
             torch.accelerator.synchronize()
             peak = torch.accelerator.max_memory_allocated(self.device)

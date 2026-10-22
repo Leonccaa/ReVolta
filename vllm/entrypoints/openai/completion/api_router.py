@@ -14,6 +14,10 @@ from vllm.entrypoints.openai.completion.protocol import (
 from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.entrypoints.openai.orca_metrics import metrics_header
+from vllm.entrypoints.openai.sse_keep_alive import (
+    sse_keep_alive_interval,
+    with_sse_keep_alive,
+)
 from vllm.entrypoints.openai.utils import validate_json_request
 from vllm.entrypoints.utils import (
     load_aware_call,
@@ -63,7 +67,10 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             headers=metrics_header(metrics_header_format),
         )
 
-    return StreamingResponse(content=generator, media_type="text/event-stream")
+    return StreamingResponse(
+        content=with_sse_keep_alive(generator, sse_keep_alive_interval(raw_request)),
+        media_type="text/event-stream",
+    )
 
 
 def attach_router(app: FastAPI):

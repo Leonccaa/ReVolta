@@ -111,6 +111,14 @@ class WorkerBase:
         """Basic health check (override for device-specific checks)."""
         return
 
+    def check_sleep(self) -> str | None:
+        """Return a prerequisite error without changing device memory.
+
+        Errors must be returned as data so the executor consumes every
+        worker's RPC response before rejecting the sleep request.
+        """
+        return None
+
     def init_device(self) -> None:
         """Initialize device state, such as loading the model or other on-device
         memory allocations.

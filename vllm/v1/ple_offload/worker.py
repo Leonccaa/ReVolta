@@ -29,7 +29,7 @@ import threading
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
-from multiprocessing.connection import Connection
+from multiprocessing.connection import Connection, wait
 from multiprocessing.reduction import ForkingPickler
 from typing import Any, cast
 
@@ -315,9 +315,55 @@ class PleOffloadWorkerHandle:
     proc: Any
     death_writer: Connection | None
     ready_pipe_reader: Connection | None
+    _monitor_stop_writer: Connection | None = None
+    _monitor_thread: threading.Thread | None = None
+
+    def start_monitor(self) -> None:
+        """Fail the owning GPU process even if its main thread is in CUDA.
+
+        A Python exception/signal on the main thread cannot interrupt a CUDA
+        graph's stream-memory wait. Watch the child sentinel in a sleeping
+        thread, then exit the GPU process so the executor's existing worker
+        monitor shuts down the engine. There is no per-forward polling.
+        """
+        if self._monitor_thread is not None:
+            return
+        stop_reader, self._monitor_stop_writer = get_mp_context().Pipe(duplex=False)
+
+        def monitor() -> None:
+            try:
+                if stop_reader in wait([stop_reader, self.proc.sentinel]):
+                    return
+                self.proc.join()
+                raise RuntimeError(
+                    "PLE offload worker exited "
+                    f"with exit code {self.proc.exitcode}; "
+                    "terminating the GPU worker because PLE results cannot arrive."
+                )
+            except Exception:
+                logger.exception("PLE offload worker failure.")
+                # Do not run CUDA destructors: they may wait on the same
+                # unsatisfied semaphore. Process death is observed by the
+                # executor independently of GPU progress, including in graphs.
+                os._exit(1)
+            finally:
+                stop_reader.close()
+
+        self._monitor_thread = threading.Thread(
+            target=monitor, daemon=True, name="PleOffloadWorkerMonitor"
+        )
+        self._monitor_thread.start()
 
     def close(self) -> None:
         """Release all process resources. Safe to call more than once."""
+        # Disarm before asking the child to exit during normal shutdown.
+        if self._monitor_stop_writer is not None:
+            self._monitor_stop_writer.send(None)
+            self._monitor_stop_writer.close()
+            self._monitor_stop_writer = None
+        if self._monitor_thread is not None:
+            self._monitor_thread.join()
+            self._monitor_thread = None
         if self.ready_pipe_reader is not None:
             self.ready_pipe_reader.close()
             self.ready_pipe_reader = None
@@ -439,15 +485,27 @@ class PleOffloadWorker:
         reader = handle.ready_pipe_reader
         if reader is None:
             return
-        if not reader.poll(envs.VLLM_PLE_OFFLOAD_READY_TIMEOUT):
-            raise TimeoutError(
-                "PLE offload worker did not become ready within "
-                f"{envs.VLLM_PLE_OFFLOAD_READY_TIMEOUT}s."
-            )
         try:
+            sources: list[Connection | int] = [reader]
+            if handle.proc is not None:
+                sources.append(handle.proc.sentinel)
+            readable = wait(sources, timeout=envs.VLLM_PLE_OFFLOAD_READY_TIMEOUT)
+            if not readable:
+                raise TimeoutError(
+                    "PLE offload worker did not become ready within "
+                    f"{envs.VLLM_PLE_OFFLOAD_READY_TIMEOUT}s."
+                )
+            if reader not in readable:
+                raise EOFError
             message = reader.recv()
         except EOFError as error:
-            raise RuntimeError("PLE offload worker exited during startup") from error
+            exitcode = None
+            if handle.proc is not None:
+                handle.proc.join(timeout=1)
+                exitcode = handle.proc.exitcode
+            raise RuntimeError(
+                f"PLE offload worker exited during startup with exit code {exitcode}"
+            ) from error
         finally:
             reader.close()
             handle.ready_pipe_reader = None
@@ -462,6 +520,8 @@ class PleOffloadWorker:
             len(layer_names),
             layer_names,
         )
+        if handle.proc is not None:
+            handle.start_monitor()
 
     @staticmethod
     def proc_main(
@@ -1031,15 +1091,25 @@ class PleOffloadRunner:
                         # The pinned source and IPC destination need no Torch
                         # dtype/stride handling. Enqueue directly on the same
                         # stream used by the per-rank completion semaphore.
-                        status = cuda_driver.cuMemcpyHtoDAsync(
-                            cuda_driver.CUdeviceptr(destination.data_ptr()),
-                            result.data_ptr(),
-                            result_bytes,
-                            cuda_driver.CUstream(target.copy_stream.cuda_stream),
-                        )
-                        if status[0].value != 0:
-                            raise RuntimeError(f"PLE H2D copy failed: {status[0]}")
-                        target.sem.signal(target.copy_stream)
+                        # Raw driver calls do not install Torch's device guard.
+                        # IPC targets and streams can belong to different GPUs;
+                        # select the destination's context for both operations.
+                        with torch.accelerator.device_index(destination.device.index):
+                            status = cuda_driver.cuMemcpyHtoDAsync(
+                                cuda_driver.CUdeviceptr(destination.data_ptr()),
+                                result.data_ptr(),
+                                result_bytes,
+                                cuda_driver.CUstream(target.copy_stream.cuda_stream),
+                            )
+                            if status[0].value != 0:
+                                raise RuntimeError(
+                                    f"PLE H2D copy failed: {status[0]} "
+                                    f"(tp_rank={target.tp_rank}, "
+                                    f"device={destination.device}, "
+                                    f"shape={tuple(destination.shape)}, "
+                                    f"bytes={result_bytes})"
+                                )
+                            target.sem.signal(target.copy_stream)
                     else:
                         with torch.cuda.stream(target.copy_stream):
                             destination.copy_(result, non_blocking=True)

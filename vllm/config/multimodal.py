@@ -12,7 +12,7 @@ from vllm.config.utils import config
 from vllm.utils.hashing import safe_hash
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-_DEFAULT_LIMITS = {"image": 16, "video": 1, "audio": 16}
+_DEFAULT_LIMITS = {"image": 8, "video": 1, "audio": 1}
 
 
 @dataclass
@@ -83,7 +83,7 @@ class MultiModalConfig:
     """The maximum number of input items and options allowed per
     prompt for each modality.
 
-    Defaults to 16 images, 1 video, 16 audio items, and 999 for other
+    Defaults to 8 images, 1 video, 1 audio item, and 999 for other
     modalities. Explicit counts override these defaults. Request media byte
     and aggregate item budgets apply independently.
 

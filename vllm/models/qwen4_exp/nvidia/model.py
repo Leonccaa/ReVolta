@@ -8,6 +8,7 @@ from itertools import islice
 
 import torch
 from torch import nn
+from transformers.models.qwen3_vl import Qwen3VLProcessor
 
 from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
@@ -1146,6 +1147,54 @@ class Qwen4ExpForCausalLM(
 class Qwen4ExpProcessingInfo(Qwen3VLProcessingInfo):
     def get_hf_config(self) -> Qwen4ExpConfig:
         return self.ctx.get_hf_config(Qwen4ExpConfig)
+
+    def get_hf_processor(self, **kwargs: object) -> Qwen3VLProcessor:
+        processor = super().get_hf_processor(**kwargs)
+        merged_kwargs = self.ctx.get_merged_mm_kwargs(kwargs)
+        image_kwargs = merged_kwargs | merged_kwargs.get("images_kwargs", {})
+        size_keys = ("size", "min_pixels", "max_pixels", "do_resize")
+        explicit_size = any(image_kwargs.get(key) is not None for key in size_keys)
+        operator_kwargs = self.ctx.get_merged_mm_kwargs({})
+        operator_image_kwargs = operator_kwargs | operator_kwargs.get(
+            "images_kwargs", {}
+        )
+        operator_size = any(
+            operator_image_kwargs.get(key) is not None for key in size_keys
+        )
+
+        # HF caches this processor across callers. Copy only the image component
+        # so the video processor and the cached checkpoint defaults stay intact.
+        processor = copy.copy(processor)
+        image_processor = copy.copy(processor.image_processor)
+        size = dict(image_processor.size)
+        if explicit_size:
+            size.update(image_kwargs.get("size") or {})
+            if (min_pixels := image_kwargs.get("min_pixels")) is not None:
+                size["shortest_edge"] = min_pixels
+            if (max_pixels := image_kwargs.get("max_pixels")) is not None:
+                size["longest_edge"] = max_pixels
+        else:
+            size["longest_edge"] = 1024 * 1024
+        image_processor.size = size
+        # Older HF processors also store these aliases; newer ones only use
+        # size and warn if the deprecated aliases are added back.
+        if hasattr(image_processor, "min_pixels"):
+            image_processor.min_pixels = size["shortest_edge"]
+        if hasattr(image_processor, "max_pixels"):
+            image_processor.max_pixels = size["longest_edge"]
+        if (do_resize := image_kwargs.get("do_resize")) is not None:
+            image_processor.do_resize = do_resize
+        processor.image_processor = image_processor
+
+        logger.info_once(
+            "Qwen4Exp image max_pixels=%s source=%s do_resize=%s",
+            size["longest_edge"] if image_processor.do_resize else "unbounded",
+            ("operator" if operator_size else "request")
+            if explicit_size
+            else "default",
+            image_processor.do_resize,
+        )
+        return processor
 
 
 @MULTIMODAL_REGISTRY.register_processor(

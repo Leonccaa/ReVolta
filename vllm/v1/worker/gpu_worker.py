@@ -292,6 +292,17 @@ class Worker(WorkerBase):
 
         PleOffloadWorker.wait_for_ready(self._ple_offload_worker_handle)
 
+    def check_sleep(self) -> str | None:
+        try:
+            from vllm.device_allocator.cumem import CuMemAllocator
+
+            CuMemAllocator.get_instance()
+        except Exception as exc:
+            # Do not raise through collective_rpc: all ranks must return
+            # before the engine can safely handle another RPC.
+            return f"{type(exc).__name__}: {exc}"
+        return None
+
     def sleep(self, level: int = 1) -> None:
         from vllm.device_allocator.cumem import CuMemAllocator
 
@@ -1401,6 +1412,10 @@ class Worker(WorkerBase):
         """
         self._check_weight_transfer_engine()
 
+        from vllm.model_executor.model_loader.reload import validate_weight_reload
+
+        validate_weight_reload(self.model_runner.model)
+
         if self._weight_update_active:
             raise RuntimeError(
                 "start_weight_update called while a weight update is "
@@ -1437,6 +1452,10 @@ class Worker(WorkerBase):
             raise RuntimeError(
                 "start_weight_update must be called before update_weights."
             )
+
+        from vllm.model_executor.model_loader.reload import validate_weight_reload
+
+        validate_weight_reload(self.model_runner.model)
 
         # Parse dict into backend-specific typed dataclass
         typed_update_info = self.weight_transfer_engine.parse_update_info(update_info)

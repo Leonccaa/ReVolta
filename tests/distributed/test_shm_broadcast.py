@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 import torch.distributed as dist
 
+from vllm.distributed.device_communicators import shm_broadcast
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.distributed.utils import StatelessProcessGroup
 from vllm.utils.network_utils import get_open_port
@@ -390,5 +391,32 @@ def test_warning_logs(caplog_vllm):
         )
 
         # Clean up when done
+        writer.shutdown()
+        reader.shutdown()
+
+
+def test_busy_reader_consumes_write_notifications():
+    """A reader that never goes idle must still service its notify socket,
+    otherwise libzmq queues a command per notification and memory grows with
+    every message read (upstream vLLM #63165).
+    """
+    writer = MessageQueue(
+        n_reader=1,
+        n_local_reader=1,
+        max_chunk_bytes=1024,
+        max_chunks=1,
+    )
+    reader = MessageQueue.create_from_handle(writer.export_handle(), rank=0)
+    notify_socket = reader._spin_condition.local_notify_socket
+    try:
+        writer.wait_until_ready()
+        reader.wait_until_ready()
+
+        writer.enqueue("payload")
+        assert notify_socket.poll(timeout=5000)
+        with mock.patch.object(shm_broadcast, "SHM_NOTIFY_POLL_INTERVAL_S", 0):
+            assert reader.dequeue(timeout=5) == "payload"
+        assert not notify_socket.poll(timeout=0)
+    finally:
         writer.shutdown()
         reader.shutdown()

@@ -1663,6 +1663,26 @@ class Scheduler(SchedulerInterface):
             num_output_tokens=num_output_tokens,
         )
 
+    @staticmethod
+    def _tokens_before_encoder_input(
+        num_computed_tokens: int, start_pos: int, shift_computed_tokens: int
+    ) -> int:
+        """Decoder tokens to schedule when the encoder input at `start_pos`
+        cannot be scheduled in this step.
+
+        Normally stop `shift_computed_tokens` early, so the EAGLE/MTP drafter
+        lookahead does not reach the encoder input either. If the request
+        already stands within the shift before `start_pos`, that would be zero
+        tokens, and the same state would repeat on every step (e.g. an
+        adjacent previous item still holds the encoder cache until its last
+        token is computed). Then compute the remaining tokens before the item;
+        the drafter embeds the lookahead position as a plain placeholder token.
+        """
+        num_new_tokens = start_pos - (num_computed_tokens + shift_computed_tokens)
+        if num_new_tokens <= 0 and num_computed_tokens < start_pos:
+            return start_pos - num_computed_tokens
+        return max(0, num_new_tokens)
+
     def _try_schedule_encoder_inputs(
         self,
         request: Request,
@@ -1765,8 +1785,8 @@ class Scheduler(SchedulerInterface):
                 # Account for EAGLE shift when rolling back to avoid
                 # encoder cache miss. This ensures the scheduled range
                 # stops before start_pos even with the shift.
-                num_new_tokens = max(
-                    0, start_pos - (num_computed_tokens + shift_computed_tokens)
+                num_new_tokens = self._tokens_before_encoder_input(
+                    num_computed_tokens, start_pos, shift_computed_tokens
                 )
                 break
             if not self.encoder_cache_manager.can_allocate(
@@ -1776,11 +1796,11 @@ class Scheduler(SchedulerInterface):
                 # NOTE(woosuk): We assume that the encoder input tokens should
                 # be processed altogether, as the encoder usually uses
                 # bidirectional attention.
-                if num_computed_tokens + shift_computed_tokens < start_pos:
+                if num_computed_tokens < start_pos:
                     # We only schedule the decoder tokens just before the
                     # encoder input.
-                    num_new_tokens = start_pos - (
-                        num_computed_tokens + shift_computed_tokens
+                    num_new_tokens = self._tokens_before_encoder_input(
+                        num_computed_tokens, start_pos, shift_computed_tokens
                     )
                 else:
                     # Because of prefix caching, num_computed_tokens is greater

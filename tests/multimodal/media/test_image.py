@@ -168,6 +168,33 @@ def test_image_media_io_load_bytes(tmp_path):
         image_io.load_bytes(b"")
 
 
+def test_image_media_io_broken_png_rejected():
+    """A PNG with a corrupted chunk structure is a client error: Pillow raises
+    SyntaxError, which is not an OSError (upstream vLLM #62704)."""
+    # Stray bytes between the IDAT CRC and IEND make Pillow read a bogus
+    # chunk header (sample from upstream vLLM #62704).
+    data = bytes.fromhex(
+        "89504e470d0a1a0a0000000d4948445200000004000000040806000000a9f19e"
+        "7e000000144944415478da63fccfc0c0c0c0c0c0c0c0c0c000000e0001ff02ab"
+        "ce36890000000049454e44ae426082"
+    )
+    with pytest.raises(ValueError, match="Failed to load image") as exc_info:
+        ImageMediaIO().load_bytes(data)
+    assert isinstance(exc_info.value.__cause__, SyntaxError)
+
+
+def test_image_media_io_decompression_bomb_rejected(tmp_path, monkeypatch):
+    """Images over Pillow's own pixel cap are rejected in Image.open, before
+    our pixel budget runs; they must surface as ValueError, not a 500."""
+    path = tmp_path / "big.png"
+    Image.new("RGB", (8, 8)).save(path)
+    # Pillow raises DecompressionBombError above 2 * MAX_IMAGE_PIXELS.
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 10)
+    with pytest.raises(ValueError, match="Failed to load image") as exc_info:
+        ImageMediaIO().load_bytes(path.read_bytes())
+    assert isinstance(exc_info.value.__cause__, Image.DecompressionBombError)
+
+
 def test_image_media_io_load_file(tmp_path):
     """Test load_file with valid and invalid image files."""
     # Save a valid RGB image to disk

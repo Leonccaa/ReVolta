@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DFlash verifies fewer drafts per request at high concurrency."""
 
+import itertools
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -35,11 +36,53 @@ pytestmark = pytest.mark.skip_global_cleanup
         ({5: 4}, 8, 4),
         ({3: 5, 5: 3}, 3, 5),
         ({3: 5, 5: 3}, 6, 3),
+        # A ladder: each entry holds up to the next one, and may widen again.
+        ({4: 3, 5: 4}, 3, 7),
+        ({4: 3, 5: 4}, 4, 3),
+        ({4: 3, 5: 4}, 5, 4),
+        ({4: 3, 5: 4}, 8, 4),
+        ({2: 4, 4: 7}, 3, 4),
+        ({2: 4, 4: 7}, 5, 7),
     ],
 )
 def test_drafts_follow_the_running_request_count(policy, num_reqs, drafts) -> None:
     spec = SimpleNamespace(num_speculative_tokens=7, dflash_concurrency_drafts=policy)
     assert dflash_drafts_for_requests(spec, num_reqs) == drafts
+
+
+def _min_semantics(policy, num_reqs, nst=7):
+    """The first release: every threshold reached may only lower the width."""
+    drafts = nst
+    for min_reqs, width in (policy or {}).items():
+        if num_reqs >= min_reqs:
+            drafts = min(drafts, width)
+    return drafts
+
+
+def _monotone_policies(nst=7, max_reqs=8):
+    thresholds = range(2, max_reqs + 1)
+    for size in (1, 2, 3):
+        for keys in itertools.combinations(thresholds, size):
+            for widths in itertools.combinations_with_replacement(
+                range(nst - 1, 0, -1), size
+            ):
+                yield dict(zip(keys, widths))  # widths never increase with the count
+
+
+def test_ladder_matches_the_first_release_for_narrowing_policies() -> None:
+    # Every policy the first release could express (widths that only shrink as
+    # requests grow) resolves to the same width at every request count.
+    checked = 0
+    for policy in _monotone_policies():
+        spec = SimpleNamespace(
+            num_speculative_tokens=7, dflash_concurrency_drafts=policy
+        )
+        for num_reqs in range(0, 13):
+            assert dflash_drafts_for_requests(spec, num_reqs) == _min_semantics(
+                policy, num_reqs
+            ), (policy, num_reqs)
+            checked += 1
+    assert checked > 10_000
 
 
 @pytest.mark.parametrize(
@@ -50,7 +93,8 @@ def test_drafts_follow_the_running_request_count(policy, num_reqs, drafts) -> No
         ({5: 4}, False, False, False),  # not DFlash
         ({5: 4}, True, True, False),  # lookup owns the width
         ({1: 4}, True, False, False),  # a single request keeps the full width
-        ({5: 7}, True, False, False),  # not narrower
+        ({5: 7}, True, False, True),  # the full width, e.g. after a narrower step
+        ({5: 8}, True, False, False),  # wider than the proposal
         ({5: 0}, True, False, False),
         ({5: True}, True, False, False),  # a bool is not a draft count
     ],
@@ -128,7 +172,32 @@ def test_narrow_target_graphs_from_the_threshold_up(monkeypatch, tails) -> None:
 def test_no_policy_keeps_the_capture_plan(monkeypatch) -> None:
     manager = _manager(monkeypatch, None, tails=False)
     assert manager.decode_query_lens == (8,)
-    assert not manager._dflash_width_min_reqs
+    assert not manager._dflash_width_reqs
+
+
+def test_ladder_widths_capture_only_their_request_counts(monkeypatch) -> None:
+    # {4: 3, 5: 4}: three drafts (q4) for four requests, four (q5) from five up,
+    # all seven (q8) for one to three.
+    manager = _manager(monkeypatch, {4: 3, 5: 4}, tails=False)
+    assert manager._dflash_width_reqs == {4: frozenset({4}), 5: frozenset(range(5, 9))}
+    desc = manager.dispatch(4, 16, 4)
+    assert desc.cg_mode == CUDAGraphMode.FULL and desc.uniform_token_count == 4
+    for num_reqs in range(5, 9):
+        desc = manager.dispatch(num_reqs, num_reqs * 5, 5)
+        assert desc.cg_mode == CUDAGraphMode.FULL and desc.uniform_token_count == 5
+    # q4 is not a graph shape for the counts that verify four drafts, nor q5 for four.
+    assert manager.dispatch(6, 24, 4).uniform_token_count != 4
+    assert manager.dispatch(4, 20, 5).uniform_token_count != 5
+    assert manager.dispatch(3, 24, 8).cg_mode == CUDAGraphMode.FULL
+
+
+def test_narrowing_policy_drops_unused_wide_shapes(monkeypatch) -> None:
+    # {3: 5, 5: 3}: six-token rows only serve three and four requests now.
+    manager = _manager(monkeypatch, {3: 5, 5: 3}, tails=False)
+    assert manager._dflash_width_reqs == {
+        6: frozenset({3, 4}),
+        4: frozenset(range(5, 9)),
+    }
 
 
 def test_added_sizes_stay_within_the_largest_capture_size(monkeypatch) -> None:

@@ -116,14 +116,15 @@ def get_dflash_model_draft_tokens(speculative_config: Any) -> int:
 def dflash_drafts_for_requests(speculative_config: Any, num_reqs: int) -> int:
     """Draft tokens the target verifies per request with ``num_reqs`` running.
 
-    Applies ``dflash_concurrency_drafts``: every threshold reached may lower the
-    width; without a policy this is ``num_speculative_tokens``.
+    Applies ``dflash_concurrency_drafts`` as a ladder: the entry with the largest
+    threshold not above ``num_reqs`` sets the width. Below every threshold, and
+    without a policy, this is ``num_speculative_tokens``.
     """
     drafts = int(getattr(speculative_config, "num_speculative_tokens", 0) or 0)
     policy = getattr(speculative_config, "dflash_concurrency_drafts", None) or {}
-    for min_reqs, width in policy.items():
-        if num_reqs >= int(min_reqs):
-            drafts = min(drafts, int(width))
+    reached = {int(t): int(w) for t, w in policy.items() if num_reqs >= int(t)}
+    if reached:
+        drafts = reached[max(reached)]
     return drafts
 
 
@@ -147,10 +148,10 @@ def check_dflash_concurrency_drafts(
                 "dflash_concurrency_drafts takes integer request counts and drafts; "
                 f"got {min_reqs!r}: {drafts!r}."
             )
-        if int(min_reqs) < 2 or not 0 < int(drafts) < num_speculative_tokens:
+        if int(min_reqs) < 2 or not 0 < int(drafts) <= num_speculative_tokens:
             raise ValueError(
                 "dflash_concurrency_drafts maps a running-request count >= 2 to "
-                f"1..num_speculative_tokens-1 drafts; got {min_reqs}: {drafts}."
+                f"1..num_speculative_tokens drafts; got {min_reqs}: {drafts}."
             )
 
 
@@ -291,13 +292,15 @@ class SpeculativeConfig:
     capability."""
 
     dflash_concurrency_drafts: dict[int, int] | None = None
-    """DFlash: verify fewer drafts per request at high concurrency, as
-    ``{min_running_requests: draft_tokens}`` (for example ``{5: 4}``). The
-    drafter still proposes its trained block and the target verifies only the
-    first drafts, so a wide draft keeps its single-request acceptance without
-    paying for rejected verifier rows in large batches. Narrower target decode
-    graphs are captured from each threshold up. None verifies
-    ``num_speculative_tokens`` drafts at every concurrency."""
+    """DFlash: verify fewer drafts per request at high concurrency, as a
+    ladder ``{min_running_requests: draft_tokens}``. Each entry holds from its
+    request count up to the next entry: ``{4: 3, 5: 4}`` verifies all drafts
+    for one to three running requests, three at four, and four from five up.
+    The drafter still proposes its trained block and the target verifies only
+    the first drafts, so a wide draft keeps its single-request acceptance
+    without paying for rejected verifier rows in large batches. Narrower target
+    decode graphs are captured for the request counts that use them. None
+    verifies ``num_speculative_tokens`` drafts at every concurrency."""
 
     # Alternative drafting strategies
     parallel_drafting: bool = False

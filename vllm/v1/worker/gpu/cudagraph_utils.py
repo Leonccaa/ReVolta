@@ -16,6 +16,7 @@ from vllm.compilation.sm70_decode_graph import sm70_decode_graph_compilation
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.config.speculative import (
+    dflash_drafts_for_requests,
     get_dflash_model_draft_tokens,
     uses_adaptive_dflash_lookup,
 )
@@ -246,9 +247,11 @@ class CudaGraphManager:
                 self.decode_query_lens,
             )
         # DFlash concurrency widths (dflash_concurrency_drafts): the target
-        # verifies a narrower uniform batch from each threshold up, so capture
-        # those multi-request decode shapes. The drafter keeps its block.
-        self._dflash_width_min_reqs: dict[int, int] = {}
+        # verifies a narrower uniform batch for some request counts, so capture
+        # those multi-request decode shapes, and only for the counts that use
+        # them (the same resolver the speculator applies at run time). The
+        # drafter keeps its block.
+        self._dflash_width_reqs: dict[int, frozenset[int]] = {}
         policy = (
             getattr(speculative_config, "dflash_concurrency_drafts", None)
             if speculative_config is not None
@@ -256,27 +259,30 @@ class CudaGraphManager:
             and isinstance(self, ModelCudaGraphManager)
             else None
         )
-        for min_reqs, drafts in (policy or {}).items():
-            query_len = int(drafts) + 1
-            if 1 < query_len < decode_query_len:
-                self._dflash_width_min_reqs[query_len] = min(
-                    self._dflash_width_min_reqs.get(query_len, int(min_reqs)),
-                    int(min_reqs),
-                )
-        if self._dflash_width_min_reqs:
+        if policy:
+            width_reqs: dict[int, set[int]] = defaultdict(set)
+            for num_reqs in range(2, self.max_num_reqs + 1):
+                query_len = dflash_drafts_for_requests(speculative_config, num_reqs) + 1
+                if 1 < query_len < decode_query_len:
+                    width_reqs[query_len].add(num_reqs)
+            self._dflash_width_reqs = {q: frozenset(r) for q, r in width_reqs.items()}
+        if self._dflash_width_reqs:
             self.decode_query_lens = tuple(
                 dict.fromkeys(
                     (
                         *self.decode_query_lens,
-                        *sorted(self._dflash_width_min_reqs, reverse=True),
+                        *sorted(self._dflash_width_reqs, reverse=True),
                     )
                 )
             )
             logger.info_once(
                 "Capturing DFlash concurrency-width target query lengths %s "
-                "(from request counts %s).",
+                "(request counts per length %s).",
                 self.decode_query_lens,
-                tuple(sorted(self._dflash_width_min_reqs.items())),
+                tuple(
+                    (q, tuple(sorted(r)))
+                    for q, r in sorted(self._dflash_width_reqs.items())
+                ),
             )
 
         self.dp_size = vllm_config.parallel_config.data_parallel_size
@@ -324,8 +330,8 @@ class CudaGraphManager:
             max_size = self.compilation_config.max_cudagraph_capture_size or max(
                 self._capture_sizes, default=0
             )
-            for query_len, min_reqs in self._dflash_width_min_reqs.items():
-                for num_reqs in range(min_reqs, self.max_num_reqs + 1):
+            for query_len, counts in self._dflash_width_reqs.items():
+                for num_reqs in sorted(counts):
                     size = num_reqs * query_len
                     if size <= max_size and size not in self._capture_sizes:
                         self._capture_sizes.append(size)
@@ -355,10 +361,10 @@ class CudaGraphManager:
                         query_len <= num_tokens <= self.max_num_reqs * query_len
                         and num_tokens % query_len == 0
                     ):
-                        width_min_reqs = self._dflash_width_min_reqs.get(query_len)
-                        if width_min_reqs is not None:
+                        width_reqs = self._dflash_width_reqs.get(query_len)
+                        if width_reqs is not None:
                             # Concurrency widths serve only their request counts.
-                            if num_tokens // query_len < width_min_reqs and not (
+                            if num_tokens // query_len not in width_reqs and not (
                                 self._sm70_dflash2_tail_graphs
                                 and num_tokens == query_len
                             ):

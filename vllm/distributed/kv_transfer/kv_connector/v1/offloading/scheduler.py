@@ -1179,6 +1179,13 @@ class OffloadingConnectorScheduler:
             self._drop_pending_boundary_offloads(req_status, "preempted")
             if not req_status.transfer_jobs:
                 continue
+            # A request preempted outside schedule() (reset_prefix_cache with
+            # reset_running_requests) is reported one call later. With no
+            # transfer left, that call may already have re-admitted it with a
+            # new load into freshly allocated blocks. The load reads no freed
+            # block, and workers start it only after this step's flushes.
+            if req_status.transfer_jobs.issubset(self._current_batch_load_jobs):
+                continue
             any_jid = next(iter(req_status.transfer_jobs))
             assert self._jobs[any_jid].is_store
             self._current_batch_jobs_to_flush.update(req_status.transfer_jobs)

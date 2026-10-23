@@ -161,7 +161,7 @@ concurrent requests in testing, and a 48 GiB CPU KV pool.
 
 ### 1. Install
 
-The distribution name is `revolta` (version `0.1.1`). The Python import name and the
+The distribution name is `revolta` (version `0.1.2`). The Python import name and the
 CLI are still **`vllm`** (`import vllm`, `vllm serve`); this is intentional. Only
 compute capability 7.0 is built, with CUDA 12.8, Python 3.12 and PyTorch 2.10.
 
@@ -170,8 +170,8 @@ From PyPI (Linux x86-64 with glibc 2.34 or newer, Python 3.12):
 ```bash
 python3.12 -m venv /data/revolta/venv
 . /data/revolta/venv/bin/activate
-pip install revolta==0.1.1
-vllm --version          # 0.1.1
+pip install revolta==0.1.2
+vllm --version          # 0.1.2
 ```
 
 The wheel pins `torch==2.10.0`, `torchaudio==2.10.0` and `torchvision==0.25.0`,
@@ -183,7 +183,7 @@ differs: it pins the same versions to the CUDA 12.8 builds on `download.pytorch.
 and has the generic `linux_x86_64` tag.
 
 ```bash
-pip install "https://github.com/Leonccaa/ReVolta/releases/download/v0.1.1/revolta-0.1.1-cp312-cp312-linux_x86_64.whl"
+pip install "https://github.com/Leonccaa/ReVolta/releases/download/v0.1.2/revolta-0.1.2-cp312-cp312-linux_x86_64.whl"
 ```
 
 ReVolta does not send the anonymous usage statistics that upstream vLLM reports.
@@ -191,7 +191,7 @@ ReVolta does not send the anonymous usage statistics that upstream vLLM reports.
 Or use the Docker image:
 
 ```bash
-docker pull ghcr.io/leonccaa/revolta:0.1.1
+docker pull ghcr.io/leonccaa/revolta:0.1.2
 ```
 
 ### 2. Download the checkpoint and make 512K views
@@ -252,6 +252,7 @@ export VLLM_SM70_AWQ_MOE_INT4_ZERO=1             # pack AWQ zero points to 4 bit
 export VLLM_QWEN4EXP_PLE_HOST_GIB=12             # pinned host memory for the PLE table, GiB per TP rank
 export VLLM_PLE_OFFLOAD_READY_TIMEOUT=1200       # seconds; PLE loading takes a while
 export VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES=1    # refuse to start without calibrated E4M3 KV scales
+export TILELANG_CACHE_DIR=/data/revolta/cache/tilelang  # persistent TileLang kernel cache (needed in containers)
 ```
 
 Do not set other `VLLM_SM70_*` variables unless you are troubleshooting. Explicit
@@ -276,9 +277,10 @@ vllm serve /data/revolta/views/target-512k \
   --no-async-scheduling \
   --kv-cache-dtype fp8_e4m3 \
   --no-language-model-only \
-  --limit-mm-per-prompt '{"video": 1}' \
+  --limit-mm-per-prompt '{"image": 16, "video": 1, "audio": 16}' \
   --media-io-kwargs '{"video": {"num_frames": 16}}' \
   --compilation-config '{"mode": 3, "cudagraph_mode": "FULL_AND_PIECEWISE"}' \
+  --structured-outputs-config '{"backend": "xgrammar"}' \
   --seed 0 \
   --speculative-config '{"method": "mtp",
       "model": "/data/revolta/views/draft-512k",
@@ -306,6 +308,7 @@ vllm serve /data/revolta/views/target-512k \
   --tool-call-parser qwen3_coder \
   --reasoning-parser qwen3 \
   --enable-prompt-tokens-details \
+  --sse-keep-alive-interval 15 \
   --host 0.0.0.0 --port 8000
 ```
 
@@ -326,6 +329,20 @@ Notes:
   `--mixed-prefill-step-latency-ms`) and `ple_disk_cascade: false` are the tested
   values for this machine. They are deployment settings, not universal defaults.
 - `cpu_bytes_to_use` is the total for all four workers (48 GiB = 12 GiB per worker).
+- **Keep `--limit-mm-per-prompt` on V100.** With FlashAttention-V100, the engine allows
+  1 image and no video per request without it, and a value that leaves out `"video"`
+  disables video. `{"image": 16, "video": 1, "audio": 16}` keeps the reference
+  deployment's limits; a lower image count leaves more host memory for bursts of large
+  images. Large images are resized either way (see
+  [Support and known limits](#support-and-known-limits)).
+- `--structured-outputs-config '{"backend": "xgrammar"}'` pins the structured-output
+  backend. With `auto`, the engine keeps the backend chosen for its first
+  structured-output request.
+- `--sse-keep-alive-interval 15` sends an SSE comment line (`: keep-alive`) after 15 idle
+  seconds on streaming responses, so proxies with read timeouts keep the connection open
+  during queueing and prefill. The default, 0, sends none.
+- `TILELANG_CACHE_DIR` (step 3) keeps TileLang's compiled kernels on persistent storage.
+  Without it, a new container compiles them again.
 - Media limits and request budgets: see
   [multimodal input limits](.github/MULTIMODAL_INPUTS.md).
 
@@ -367,7 +384,8 @@ docker run --rm --gpus all \
   -e VLLM_QWEN4EXP_PLE_HOST_GIB=12 \
   -e VLLM_PLE_OFFLOAD_READY_TIMEOUT=1200 \
   -e VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES=1 \
-  ghcr.io/leonccaa/revolta:0.1.1 \
+  -e TILELANG_CACHE_DIR=/data/revolta/cache/tilelang \
+  ghcr.io/leonccaa/revolta:0.1.2 \
   /data/revolta/views/target-512k --served-model-name Qwen3.8-Flash-Next ...
 ```
 
@@ -382,6 +400,117 @@ Replace `...` with the remaining arguments from step 4. Container notes:
   Whether `seccomp=unconfined` is needed remains to be checked.
 - Do not bake `VLLM_SM70_*` switches into derived images. Values from the environment
   override the profile.
+
+## DFlash2 speculative decoding (optional)
+
+MTP4 is the default and the tested release configuration. Since 0.1.2, ReVolta can use
+the [incoai DFlash2 drafter](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2)
+instead (tested revision `a22a1744`): 5 sliding-window layers, an 8-token block and a
+2048-token window. It is off by default. Without a `dflash` speculative config, the KV
+cache layout, block size and MoE routes are the same as in 0.1.1.
+
+**1. Make a draft view.** The drafter must declare how it reads the target's
+hyper-connection streams, and its position limit must cover the 512K target. The view
+links the weights and adds both settings to `config.json`. Startup refuses a drafter
+without `"target_feature_reduction": "hc_mean"`.
+
+```bash
+python - <<'EOF'
+import json
+from pathlib import Path
+from huggingface_hub import snapshot_download
+
+src = Path("/data/revolta/models/Qwen3.8-Flash-Next-DFlash2")
+dst = Path("<path to the DFlash2 draft model>")
+snapshot_download("incoai/Qwen3.8-Flash-Next-DFlash2", local_dir=src,
+                  revision="a22a1744e85c17364dcc54a6a420af7135d4c7f6")
+
+dst.mkdir(parents=True, exist_ok=True)
+for item in src.iterdir():
+    if item.is_file() and item.name != "config.json":
+        link = dst / item.name
+        if not link.exists():
+            link.symlink_to(item.resolve())
+config = json.loads((src / "config.json").read_text())
+config["dflash_config"]["target_feature_reduction"] = "hc_mean"
+config["max_position_embeddings"] = 524288   # the drafter's layers keep a 2048-token window
+(dst / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+EOF
+```
+
+**2. Set one more environment variable and replace the MTP speculative config** in step 4.
+Keep every other argument, including `--no-async-scheduling`. With Docker, pass the
+variable with `-e`.
+
+```bash
+export VLLM_SM70_DFLASH2_FUSED_QKV_PACK=1
+
+  --speculative-config '{"method": "dflash",
+      "model": "<path to the DFlash2 draft model>",
+      "num_speculative_tokens": 7,
+      "attention_backend": "FLASH_ATTN_V100",
+      "draft_sample_method": "greedy",
+      "dflash_concurrency_drafts": {"4": 3, "5": 4},
+      "sm70_dflash2": {"context_kv_graph": true, "context_pipeline": true,
+        "verify_fastpath": true, "fused_gdn_metadata": true,
+        "fused_smallq_metadata": true, "grouped_smallq_metadata": true}}' \
+```
+
+In the startup log, the AWQ MoE line should read `grouped QPN decode admitted for 2..48
+rows (split=8, pack_rows=24, up to 2 row chunks)`.
+
+Settings:
+
+- **Enable the six `sm70_dflash2` options above.** They are off unless set.
+- **Do not enable** `fused_gdn_verify`, `fused_gdn_norm`, `fused_gdn_split` or
+  `fused_gdn_combined_split`. They change the numerics and lowered sampled acceptance
+  in our tests.
+- **Leave `--block-size` unset.** The automatic block size fits the drafter cache into the
+  main KV slots (1664 tokens with 7 drafts at DCP2). An explicit block can leave the
+  drafter only small blocks; startup logs a warning then.
+- **Do not set `VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS`.** With DFlash, the AWQ MoE
+  layers use `VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_DFLASH_MAX_TOKENS` (default 48; no need to
+  set it). The older variable changes only MTP and non-speculative routes.
+- **`VLLM_SM70_DFLASH2_FUSED_QKV_PACK=1`** packs the verifier's Q/K/V rows with one copy
+  kernel. It acts only on SM70 with DFlash2. In tests, greedy output was bit-identical and
+  throughput about 1.5% higher. Like every `VLLM_*` variable, it is part of the
+  torch.compile key, so a deployment that sets it builds its own compile cache.
+- **`dflash_concurrency_drafts`** maps a number of running requests (the threshold) to the
+  number of drafts the target verifies per request (the width). The drafter still drafts
+  7 tokens. With `{"4": 3, "5": 4}`, one to three running requests verify all 7 drafts,
+  four verify 3, and five or more verify 4.
+- The thresholds form a ladder: the entry with the largest threshold that is not above the
+  number of running requests sets the width. Below the lowest threshold, all drafts are
+  verified, and a higher entry can widen the width again. CUDA graphs are captured only
+  for the request counts that use each width. Thresholds must be 2 or more, and widths 1
+  to 7.
+- Against `{"5": 4}`, this ladder gave identical output at 1 request and 9.7% more
+  throughput at 4 requests (English, Chinese and code weighted equally); at 5–8 requests
+  both use the same width.
+- For mostly Chinese loads, `{"3": 3}` verifies 3 drafts from three requests on; at three
+  requests that was about 15% faster in an earlier width sweep. For mostly code, `{"8": 4}`
+  measured best at 8 requests.
+- Setting `dflash_concurrency_drafts` turns off async scheduling; `--async-scheduling`
+  together with it is an error. Pipeline parallelism is not supported with DFlash2.
+
+What to expect:
+
+- Greedy output is not bitwise identical to MTP4. It differs at near-ties, because a
+  different number of tokens is verified and DFlash uses a different MoE route for some
+  batch sizes.
+- English code and reasoning gain the most. Chinese is slower than MTP4 in almost every
+  measured case: the drafter was trained on English. Very long prompts also favour MTP4.
+- The GPU KV pool is about a quarter larger than with MTP4 (1,445,845 vs 1,153,143 tokens on
+  the reference setup).
+- On a replay of real agent sessions (one request at a time, sampling, long reasoning),
+  DFlash2 and MTP4 were on par: 0.97× the MTP4 speed (95% interval 0.90–1.01). DFlash2
+  was ahead on tool calls, answers and contexts up to 64K, and behind in reasoning, above
+  128K and on Chinese. MTP4 stays the default.
+- The first request after an empty compile cache compiles the DFlash verify kernels.
+- Measured on the reference setup with the recommended config (greedy, tokens/s, DFlash2 vs
+  MTP4): one request, agent code 181 / 158, English code 201 / 163, English reasoning
+  195 / 163, Chinese explanation 101 / 105, Chinese chat 85 / 100; four mixed requests
+  238 / 236; eight mixed requests 331 / 357 (0.93×).
 
 ## KV offload modes
 
@@ -462,7 +591,7 @@ use a larger CPU pool and set `max_size_bytes` to your disk budget.
   be larger than the largest prefix you expect to restore from disk (about 21 KB per
   token; a 100K-token prefix needs more than 2 GiB). Otherwise the request is computed
   again. The quick-start 48 GiB pool holds about 2.4M tokens.
-- The SSD tier is **not supported with INT8 KV** in 0.1.1. That combination is
+- The SSD tier is **not supported with INT8 KV** in 0.1.2. That combination is
   rejected at configuration time.
 
 Validation scope: the SSD tier was tested with its root on a network file system. The
@@ -505,7 +634,7 @@ On the measured sets, INT8 has slightly lower KL and similar top-1 agreement to
 E4M3. This has not established a difference in task-level answer quality.
 
 Capacity is 1.1–1.3% lower than E4M3. Prefill speed is within ±1.3%; decoding is
-about 5–8% slower. CPU offload works; the disk tier is not supported with INT8 in 0.1.1.
+about 5–8% slower. CPU offload works; the disk tier is not supported with INT8 in 0.1.2.
 
 ### Standard NVFP4
 
@@ -635,8 +764,9 @@ GGUF are outside the build.
   their image settings can then raise preprocessing resource usage.
 - **NVFP4 scales.** Different gate/up global scales are not supported by the
   raw-scale path. Both documented checkpoints use equal scales.
-- **Structured output with MTP.** GPU tests produced 16/16 valid JSON/tool outputs;
-  the zero-draft step was covered on CPU but was not triggered on GPU.
+- **Structured output with MTP.** GPU tests produced 16/16 valid JSON/tool outputs. A
+  later GPU test also reached the zero-draft step, where the grammar leaves no draft
+  tokens (64 such steps): all outputs were valid, and repeated runs gave identical output.
 - **Stop strings and thinking.** Since 0.1.1, with thinking on, a `stop` string matches
   only after the reasoning ends, and the reasoning/content split uses the `</think>`
   token, not its spelling. A `stop` of `</think>` therefore no longer ends a request at
@@ -645,6 +775,13 @@ GGUF are outside the build.
 - **Tool calls.** In `qwen3_coder` tool calls, a string argument that contains the
   literal text `</function>` is cut at that point. String arguments are streamed as
   they are generated.
+- **Image placeholder text.** Text that contains the literal image placeholder
+  `<|image_pad|>` can take the place of a real image in the same request. Upstream vLLM
+  and HF behave the same (vLLM #57740), and ReVolta follows them. Remove such tokens from
+  untrusted text.
+- **DFlash2.** Optional and off by default; see
+  [DFlash2 speculative decoding](#dflash2-speculative-decoding-optional) for its settings
+  and limits.
 - **Chat template.** The model's own chat template rejects a system message that is not
   the first message (`System message must be at the beginning.`). Agent stacks that send
   several system messages need to merge them.
@@ -654,8 +791,12 @@ GGUF are outside the build.
   `prompt_logprobs=20` measured about 2.3× ordinary prefill time.
 - **Standard NVFP4 draft.** Use the FP8 `mtp-fp8/` draft from the Uncensored AWQ
   repository, as in validation.
-- **Media.** Defaults are 8 images, 1 video, and 1 audio item per whole request;
-  images in historical chat messages count toward the 8-image limit. Qwen4Exp
+- **Media.** On V100 with FlashAttention-V100, the default without `--limit-mm-per-prompt`
+  is 1 image and no video, and a value that leaves out `"video"` disables video. Set the
+  option explicitly, as in the launch command. Aligning this default with the generic one
+  is planned after validation. On other hardware and backends, the defaults are 8 images,
+  1 video, and 1 audio item per whole request. Images in historical chat messages count
+  toward the image limit. Qwen4Exp
   resizes large images to at most 1,048,576 pixels using HF's existing resize
   logic. Small text can become blurry; alignment near the area boundary can also
   change images whose source area is slightly below the limit.

@@ -35,7 +35,10 @@ GENERIC = {
     "'.lan' host name": re.compile(
         r"\b[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)*\.lan\b", re.I
     ),
-    "home directory path": re.compile(r"(?<![\w.])(?:/home/[a-z_][a-z0-9_-]*/|~/ops/)"),
+    # "[/]" keeps the pattern line below from matching itself.
+    "home directory path": re.compile(
+        r"(?<![\w.])(?:/home/[a-z_][a-z0-9_-]*/|~[/]ops/)"
+    ),
     "mount path": re.compile(r"(?<![\w.])/mnt/[A-Za-z0-9_]"),
 }
 

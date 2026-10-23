@@ -16,6 +16,7 @@ from vllm.compilation.sm70_decode_graph import sm70_decode_graph_compilation
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.config.speculative import (
+    dflash_drafts_for_requests,
     get_dflash_model_draft_tokens,
     uses_adaptive_dflash_lookup,
 )
@@ -245,6 +246,44 @@ class CudaGraphManager:
                 "Capturing SM70 DFlash2 target tail query lengths %s.",
                 self.decode_query_lens,
             )
+        # DFlash concurrency widths (dflash_concurrency_drafts): the target
+        # verifies a narrower uniform batch for some request counts, so capture
+        # those multi-request decode shapes, and only for the counts that use
+        # them (the same resolver the speculator applies at run time). The
+        # drafter keeps its block.
+        self._dflash_width_reqs: dict[int, frozenset[int]] = {}
+        policy = (
+            getattr(speculative_config, "dflash_concurrency_drafts", None)
+            if speculative_config is not None
+            and speculative_config.method == "dflash"
+            and isinstance(self, ModelCudaGraphManager)
+            else None
+        )
+        if policy:
+            width_reqs: dict[int, set[int]] = defaultdict(set)
+            for num_reqs in range(2, self.max_num_reqs + 1):
+                query_len = dflash_drafts_for_requests(speculative_config, num_reqs) + 1
+                if 1 < query_len < decode_query_len:
+                    width_reqs[query_len].add(num_reqs)
+            self._dflash_width_reqs = {q: frozenset(r) for q, r in width_reqs.items()}
+        if self._dflash_width_reqs:
+            self.decode_query_lens = tuple(
+                dict.fromkeys(
+                    (
+                        *self.decode_query_lens,
+                        *sorted(self._dflash_width_reqs, reverse=True),
+                    )
+                )
+            )
+            logger.info_once(
+                "Capturing DFlash concurrency-width target query lengths %s "
+                "(request counts per length %s).",
+                self.decode_query_lens,
+                tuple(
+                    (q, tuple(sorted(r)))
+                    for q, r in sorted(self._dflash_width_reqs.items())
+                ),
+            )
 
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
@@ -287,6 +326,16 @@ class CudaGraphManager:
                     if query_len not in self._capture_sizes:
                         self._capture_sizes.append(query_len)
                 self._capture_sizes.sort()
+            # Stay inside the compiled decode range (the largest capture size).
+            max_size = self.compilation_config.max_cudagraph_capture_size or max(
+                self._capture_sizes, default=0
+            )
+            for query_len, counts in self._dflash_width_reqs.items():
+                for num_reqs in sorted(counts):
+                    size = num_reqs * query_len
+                    if size <= max_size and size not in self._capture_sizes:
+                        self._capture_sizes.append(size)
+            self._capture_sizes.sort()
         self._init_candidates()
 
     def _init_candidates(self) -> None:
@@ -312,7 +361,15 @@ class CudaGraphManager:
                         query_len <= num_tokens <= self.max_num_reqs * query_len
                         and num_tokens % query_len == 0
                     ):
-                        if (
+                        width_reqs = self._dflash_width_reqs.get(query_len)
+                        if width_reqs is not None:
+                            # Concurrency widths serve only their request counts.
+                            if num_tokens // query_len not in width_reqs and not (
+                                self._sm70_dflash2_tail_graphs
+                                and num_tokens == query_len
+                            ):
+                                continue
+                        elif (
                             self._sm70_dflash2_tail_graphs
                             and query_len < self.decode_query_len
                             and num_tokens != query_len

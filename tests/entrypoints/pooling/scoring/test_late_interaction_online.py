@@ -26,6 +26,32 @@ TEXTS_2 = [
 ]
 
 
+@pytest.mark.asyncio
+async def test_flash_late_interaction_rejects_mm_processor_kwargs_by_default():
+    # Adapted from vllm-project/vllm#58830 for PoolingServingBase._init_ctx.
+    from unittest.mock import MagicMock
+
+    from vllm.entrypoints.pooling.base.serving import PoolingServingBase
+    from vllm.entrypoints.pooling.scoring.protocol import ScoreQueriesDocumentsRequest
+    from vllm.entrypoints.pooling.scoring.serving import ServingScores
+    from vllm.exceptions import VLLMValidationError
+
+    serving = MagicMock()
+    serving.trust_request_mm_kwargs = False
+    serving._init_ctx = PoolingServingBase._init_ctx.__get__(serving)
+    request = ScoreQueriesDocumentsRequest(
+        model=MODEL_NAME,
+        queries=TEXTS_1[0],
+        documents=TEXTS_2[0],
+        mm_processor_kwargs={"vision_min_num_patches": 3_000_000_000},
+    )
+    with pytest.raises(
+        VLLMValidationError, match="Per-request mm_processor_kwargs are disabled"
+    ):
+        await ServingScores.flash_late_interaction(serving, request)
+    serving._preprocessing_async.assert_not_called()
+
+
 @pytest.fixture(scope="module", params=[True, False])
 def server(request):
     args = [

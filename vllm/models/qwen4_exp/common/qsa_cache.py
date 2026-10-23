@@ -23,6 +23,7 @@ from torch import nn
 
 from vllm.config import CacheConfig, VllmConfig
 from vllm.config.cache import CacheDType
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
@@ -41,6 +42,12 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
 )
+
+logger = init_logger(__name__)
+
+# A key ring may widen to this many times its minimal size to divide the
+# attention block; beyond that the block size is the thing to change.
+QSA_RING_MAX_WIDENING = 4
 
 
 def canonical_qsa_rope_positions(positions: torch.Tensor) -> torch.Tensor:
@@ -975,10 +982,30 @@ class QSAKeyStateCache(_QSAStateCache):
         # overwrite a committed key the next step needs to close the group.
         span = self.compress_ratio + vllm_config.num_speculative_tokens
         capacity = self.compress_ratio * cdiv(span, self.compress_ratio)
-        assert self.cache_config.block_size % capacity == 0, (
-            f"QSA ring capacity {capacity} must divide the attention block "
-            f"size {self.cache_config.block_size}"
-        )
+        # The attention block size is aligned for kernels and Mamba pages, not
+        # for this ring. Widen the ring by whole groups until it divides the
+        # block; the minimal ring is kept whenever it already does (e.g. 8 for
+        # four draft tokens), and consumers read the size from this spec.
+        block_size = self.cache_config.block_size
+        minimal = capacity
+        limit = QSA_RING_MAX_WIDENING * minimal
+        while block_size % capacity != 0 and capacity < limit:
+            capacity += self.compress_ratio
+        if block_size % capacity != 0:
+            raise ValueError(
+                f"No QSA ring of {minimal}..{limit} rows (compress ratio "
+                f"{self.compress_ratio}, {vllm_config.num_speculative_tokens} "
+                f"draft tokens) divides the attention block size {block_size}; "
+                f"choose a block size that is a multiple of {minimal}."
+            )
+        if capacity != minimal:
+            logger.info_once(
+                "QSA ring widened from %d to %d rows to divide the %d-token "
+                "attention block.",
+                minimal,
+                capacity,
+                block_size,
+            )
         return CircularBufferSpec(
             block_size=capacity,
             num_kv_heads=1,

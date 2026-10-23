@@ -3620,6 +3620,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=("TurboMindAwqLinearKernel",),
         user_visible=False,
     ),
+    # Upper row bound of the grouped small-M route with a DFlash drafter.
+    "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_DFLASH_MAX_TOKENS": env_var(
+        lambda: int(
+            os.getenv("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_DFLASH_MAX_TOKENS", "48")
+        ),
+        description=(
+            "Largest row count admitted to VLLM_SM70_AWQ_QWEN38_GROUPED_QPN when "
+            "a DFlash drafter is configured (2..48; default 48, the kernel "
+            "maximum). It replaces VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS "
+            "there: DFlash verify batches reach requests x (drafts + 1) rows, and "
+            "wider batches are split into at most two grouped calls. MTP and "
+            "non-speculative deployments keep "
+            "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS."
+        ),
+        category="tuning",
+        declared_default="48",
+        effective_default="48",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMindAwqLinearKernel",),
+        user_visible=False,
+    ),
     # Rows per expert pack of the grouped route; 0 reads each expert once.
     "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_PACK_ROWS": env_var(
         lambda: int(os.getenv("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_PACK_ROWS", "0")),
@@ -4401,7 +4422,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_QWEN38_GDN_INPUT_BATCH": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_QWEN38_GDN_INPUT_BATCH", "1"))),
         description=(
-            "Automatic packing is qualified for ordinary decode and MTP; "
+            "Automatic packing is qualified for ordinary decode, MTP and DFlash; "
             "other proposers retain explicit opt-in. "
             "Enables lossless packed GDN input projections for M2..16. Default "
             "on after #703/#704 qualification. Set 0 together with "
@@ -19657,6 +19678,10 @@ def compile_factors() -> dict[str, object]:
         # Where the SM70 GEMM dispatch cache is saved; dispatch happens inside
         # custom ops at run time, so the traced graph does not depend on it.
         "VLLM_SM70_GEMM_LUT_PATH",
+        # Row band of the DFlash grouped MoE route. Routing happens inside the
+        # moe_forward_shared custom op at run time, so the traced graph does not
+        # depend on it, and registering it must not recompile any deployment.
+        "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_DFLASH_MAX_TOKENS",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
         "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS",

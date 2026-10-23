@@ -8,11 +8,13 @@ from itertools import islice
 
 import torch
 from torch import nn
+from transformers.models.qwen3_vl import Qwen3VLProcessor
 
 from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.compilation.sm70_decode_graph import is_sm70_decode_graph_compiling
 from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config.speculative_kv import dflash_draft_cache_dtype
 from vllm.distributed import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
@@ -36,10 +38,12 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.models.interfaces import (
+    EagleModelMixin,
     HasInnerState,
     IsHybrid,
     MixtureOfExperts,
     MultiModalEmbeddings,
+    SupportsEagle3,
     SupportsLoRA,
     SupportsMRoPE,
     SupportsPP,
@@ -77,8 +81,10 @@ from vllm.tokenizers.registry import cached_tokenizer_from_config
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
+from vllm.utils.math_utils import cdiv
+from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
-from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, get_kv_quant_mode
 
 from ..config import Qwen4ExpConfig
 from .hyperconnection import GatedResidual, HyperConnectionConfig
@@ -282,6 +288,51 @@ _QWEN3_5_WEIGHTS_MAPPER = WeightsMapper(
 )
 
 
+def kv_bytes_per_token(model_config, num_kv_heads: int, cache_dtype: str) -> int:
+    """K and V bytes per token, sized as ``Platform._align_hybrid_block_size``
+    sizes an attention page."""
+    dtype = (
+        model_config.dtype
+        if cache_dtype == "auto"
+        else STR_DTYPE_TO_TORCH_DTYPE[cache_dtype]
+    )
+    return FullAttentionSpec(
+        block_size=1,
+        num_kv_heads=num_kv_heads,
+        head_size=model_config.get_head_size(),
+        dtype=dtype,
+        # The first INT8 format keeps the E4M3 token grid.
+        kv_quant_mode=get_kv_quant_mode(
+            "auto" if cache_dtype == "int8" else cache_dtype
+        ),
+    ).page_size_bytes
+
+
+def compact_aux_hidden_state(
+    value: torch.Tensor, dtype: torch.dtype | None
+) -> torch.Tensor:
+    """Apply a drafter's projection dtype to a captured state as
+    ``EagleModelMixin._maybe_add_hidden_state`` does: only to shrink storage."""
+    if dtype is not None and torch.finfo(dtype).bits < 8 * value.element_size():
+        return value.to(dtype)
+    return value
+
+
+def hc_stream_mean(hidden_states: torch.Tensor, hc_count: int) -> torch.Tensor:
+    """Reduce a multi-stream ``[T, hc_count * H]`` state to ``[T, H]``.
+
+    DFlash-family drafters trained on Qwen3.8-Flash-Next take the plain mean of
+    the hyper-connection streams of a completed layer (the incoai DFlash2
+    capture contract), not the learned contraction of the next HC module.
+    The reduction accumulates in FP32 and returns the input dtype.
+    """
+    return (
+        hidden_states.unflatten(-1, (hc_count, -1))
+        .mean(dim=-2, dtype=torch.float32)
+        .to(hidden_states.dtype)
+    )
+
+
 class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
     """Qwen3Next MoE with Qwen4Exp HC validation."""
 
@@ -415,6 +466,10 @@ class Qwen4ExpDecoderLayer(nn.Module):
             hc_config,
             prefix=maybe_prefix(prefix, "mlp_hyper_connection"),
         )
+        self.hc_count = config.hc_count
+        # Set by Qwen4ExpModel when a drafter conditions on the state entering
+        # this layer, i.e. the completed output of the previous layer.
+        self.aux_hidden_state_tap = False
 
     def forward(
         self,
@@ -426,8 +481,10 @@ class Qwen4ExpDecoderLayer(nn.Module):
         input_ids: torch.Tensor | None,
         query_start_loc: torch.Tensor | None,
         ngram_context: torch.Tensor | None,
+        aux_hidden_states: list[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         attn_hc = self.attn_hyper_connection
+        tap = aux_hidden_states is not None and self.aux_hidden_state_tap
         if self.ple is not None:
             # PLE adds directly to the multi-stream state, so pending HC state
             # must be materialized before the addition.
@@ -436,6 +493,11 @@ class Qwen4ExpDecoderLayer(nn.Module):
                     hidden_states, prev_block_output, prev_injection
                 )
                 prev_block_output = prev_injection = None
+            if tap:
+                # The previous layer's output, before this layer's PLE term.
+                assert aux_hidden_states is not None
+                aux_hidden_states.append(hc_stream_mean(hidden_states, self.hc_count))
+                tap = False
 
             if input_ids is None or query_start_loc is None or ngram_context is None:
                 raise RuntimeError("PLE inputs were not prepared")
@@ -453,6 +515,11 @@ class Qwen4ExpDecoderLayer(nn.Module):
             )
         else:
             hidden_states, block_input, injection = attn_hc.mix(hidden_states)
+        if tap:
+            # combine_and_mix returns the materialized multi-stream state of the
+            # previous layer; reading it adds no work to the target path.
+            assert aux_hidden_states is not None
+            aux_hidden_states.append(hc_stream_mean(hidden_states, self.hc_count))
 
         if self.layer_type == "linear_attention":
             use_direct_attention_output = (
@@ -553,7 +620,7 @@ class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
         "deepstack_input_embeds": 0,
     }
 )
-class Qwen4ExpModel(nn.Module):
+class Qwen4ExpModel(nn.Module, EagleModelMixin):
     hf_to_vllm_mapper = _QWEN3_5_WEIGHTS_MAPPER | _HC_WEIGHTS_MAPPER
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -666,6 +733,44 @@ class Qwen4ExpModel(nn.Module):
             )
         else:
             self._mtp_hidden_buffer = None
+        self._aux_hidden_state_final = False
+
+    def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        """Select layer boundaries whose HC-mean state is returned as aux.
+
+        Boundary ``b`` is the completed output of layer ``b - 1`` (the vLLM
+        EAGLE-3 / DFlash convention after the ``+1`` applied to a drafter's
+        ``target_layer_ids``). The state is read where the pending combine of
+        layer ``b - 1`` is materialized, inside layer ``b``; boundary
+        ``num_hidden_layers`` is read at the final mixer.
+        """
+        layers = tuple(int(layer) for layer in layers)
+        num_layers = int(self.config.num_hidden_layers)
+        if list(layers) != sorted(set(layers)):
+            raise ValueError(
+                "Qwen4Exp aux hidden-state layers must be strictly increasing, "
+                f"got {layers}"
+            )
+        for boundary in layers:
+            if not 1 <= boundary <= num_layers:
+                raise ValueError(
+                    f"Qwen4Exp aux hidden-state boundary {boundary} is outside "
+                    f"[1, {num_layers}]"
+                )
+            owner = min(boundary, num_layers - 1)
+            if not self.start_layer <= owner < self.end_layer:
+                raise ValueError(
+                    f"Qwen4Exp aux hidden-state boundary {boundary} is not on "
+                    "this pipeline stage"
+                )
+            if boundary == num_layers and not get_pp_group().is_last_rank:
+                raise ValueError(
+                    "the final Qwen4Exp aux boundary requires the last PP rank"
+                )
+        self.aux_hidden_state_layers = layers
+        for layer_idx in range(self.start_layer, self.end_layer):
+            self.layers[layer_idx].aux_hidden_state_tap = layer_idx in layers
+        self._aux_hidden_state_final = num_layers in layers
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -696,6 +801,13 @@ class Qwen4ExpModel(nn.Module):
         block_output = None
         injection = None
         last_layer = None
+        aux_hidden_states: list[torch.Tensor] | None = None
+        aux_kwargs: dict[str, list[torch.Tensor]] = {}
+        if self.aux_hidden_state_layers:
+            # Only a DFlash-family target passes the list; the MTP and
+            # no-speculation call is unchanged.
+            aux_hidden_states = []
+            aux_kwargs["aux_hidden_states"] = aux_hidden_states
         for layer_idx, layer in islice(
             enumerate(self.layers), self.start_layer, self.end_layer
         ):
@@ -708,6 +820,7 @@ class Qwen4ExpModel(nn.Module):
                 input_ids=input_ids,
                 query_start_loc=query_start_loc,
                 ngram_context=ngram_context,
+                **aux_kwargs,
             )
             if deepstack_input_embeds is not None and layer_idx < len(
                 deepstack_input_embeds
@@ -755,6 +868,22 @@ class Qwen4ExpModel(nn.Module):
             # this tensor is needed by the final mixer regardless).
             num_tokens = multi_hidden.shape[0]
             self._mtp_hidden_buffer[:num_tokens].copy_(multi_hidden)
+        if aux_hidden_states is not None:
+            if self._aux_hidden_state_final:
+                aux_hidden_states.append(
+                    hc_stream_mean(multi_hidden, self.config.hc_count)
+                )
+            if len(aux_hidden_states) != len(self.aux_hidden_state_layers):
+                raise RuntimeError(
+                    f"Qwen4Exp captured {len(aux_hidden_states)} aux hidden states "
+                    f"for boundaries {self.aux_hidden_state_layers}"
+                )
+            if self.aux_hidden_state_dtype is not None:
+                aux_hidden_states = [
+                    compact_aux_hidden_state(state, self.aux_hidden_state_dtype)
+                    for state in aux_hidden_states
+                ]
+            return sample_hidden_states, aux_hidden_states
         return sample_hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -865,6 +994,7 @@ class Qwen4ExpForCausalLM(
     SupportsLoRA,
     SupportsMRoPE,
     SupportsPP,
+    SupportsEagle3,
     Qwen4ExpMixtureOfExperts,
     IsHybrid,
 ):
@@ -1079,6 +1209,36 @@ class Qwen4ExpForCausalLM(
         return vllm_config.parallel_config.decode_context_parallel_size
 
     @classmethod
+    def get_kv_block_size_alignment(cls, vllm_config: VllmConfig) -> int | None:
+        """Block multiple a DFlash drafter cache needs, else ``None``.
+
+        The drafter's sliding-window cache shares main-KV owner slots: its block
+        is a 16-token-aligned divisor of the target block whose page fits one
+        slot (``_fit_csa_linear_auxiliary_specs``). A drafter token takes
+        ``ratio`` main-KV tokens of bytes, so the target block must split into
+        ``ratio`` such divisors; otherwise only tiny drafter blocks fit (DCP1
+        picks 1616 = 16 * 101 for a four-token draft).
+        """
+        from vllm.v1.core.kv_cache_utils import CSA_LINEAR_DRAFTER_BLOCK_ALIGNMENT
+
+        spec = vllm_config.speculative_config
+        if spec is None or not spec.use_dflash():
+            return None
+        draft = spec.draft_model_config
+        target = vllm_config.model_config
+        draft_bytes = kv_bytes_per_token(
+            draft,
+            draft.get_num_kv_heads(spec.draft_parallel_config),
+            dflash_draft_cache_dtype(vllm_config),
+        )
+        main_bytes = kv_bytes_per_token(
+            target,
+            target.get_num_kv_heads(vllm_config.parallel_config),
+            vllm_config.cache_config.cache_dtype,
+        )
+        return CSA_LINEAR_DRAFTER_BLOCK_ALIGNMENT * cdiv(draft_bytes, main_bytes)
+
+    @classmethod
     def get_mamba_specs_from_config(
         cls, vllm_config: VllmConfig
     ) -> tuple[MambaSpec, ...]:
@@ -1146,6 +1306,54 @@ class Qwen4ExpForCausalLM(
 class Qwen4ExpProcessingInfo(Qwen3VLProcessingInfo):
     def get_hf_config(self) -> Qwen4ExpConfig:
         return self.ctx.get_hf_config(Qwen4ExpConfig)
+
+    def get_hf_processor(self, **kwargs: object) -> Qwen3VLProcessor:
+        processor = super().get_hf_processor(**kwargs)
+        merged_kwargs = self.ctx.get_merged_mm_kwargs(kwargs)
+        image_kwargs = merged_kwargs | merged_kwargs.get("images_kwargs", {})
+        size_keys = ("size", "min_pixels", "max_pixels", "do_resize")
+        explicit_size = any(image_kwargs.get(key) is not None for key in size_keys)
+        operator_kwargs = self.ctx.get_merged_mm_kwargs({})
+        operator_image_kwargs = operator_kwargs | operator_kwargs.get(
+            "images_kwargs", {}
+        )
+        operator_size = any(
+            operator_image_kwargs.get(key) is not None for key in size_keys
+        )
+
+        # HF caches this processor across callers. Copy only the image component
+        # so the video processor and the cached checkpoint defaults stay intact.
+        processor = copy.copy(processor)
+        image_processor = copy.copy(processor.image_processor)
+        size = dict(image_processor.size)
+        if explicit_size:
+            size.update(image_kwargs.get("size") or {})
+            if (min_pixels := image_kwargs.get("min_pixels")) is not None:
+                size["shortest_edge"] = min_pixels
+            if (max_pixels := image_kwargs.get("max_pixels")) is not None:
+                size["longest_edge"] = max_pixels
+        else:
+            size["longest_edge"] = 1024 * 1024
+        image_processor.size = size
+        # Older HF processors also store these aliases; newer ones only use
+        # size and warn if the deprecated aliases are added back.
+        if hasattr(image_processor, "min_pixels"):
+            image_processor.min_pixels = size["shortest_edge"]
+        if hasattr(image_processor, "max_pixels"):
+            image_processor.max_pixels = size["longest_edge"]
+        if (do_resize := image_kwargs.get("do_resize")) is not None:
+            image_processor.do_resize = do_resize
+        processor.image_processor = image_processor
+
+        logger.info_once(
+            "Qwen4Exp image max_pixels=%s source=%s do_resize=%s",
+            size["longest_edge"] if image_processor.do_resize else "unbounded",
+            ("operator" if operator_size else "request")
+            if explicit_size
+            else "default",
+            image_processor.do_resize,
+        )
+        return processor
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -1395,6 +1603,10 @@ class Qwen4ExpForConditionalGeneration(
     @classmethod
     def get_kv_block_size_multiple(cls, vllm_config: VllmConfig) -> int:
         return Qwen4ExpForCausalLM.get_kv_block_size_multiple(vllm_config)
+
+    @classmethod
+    def get_kv_block_size_alignment(cls, vllm_config: VllmConfig) -> int | None:
+        return Qwen4ExpForCausalLM.get_kv_block_size_alignment(vllm_config)
 
 
 __all__ = [

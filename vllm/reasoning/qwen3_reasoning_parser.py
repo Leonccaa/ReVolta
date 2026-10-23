@@ -14,6 +14,27 @@ if TYPE_CHECKING:
     from vllm.tokenizers import TokenizerLike
 
 
+def _json_constrained(request: object) -> bool:
+    """Whether a JSON grammar constrains the output after reasoning.
+
+    tool_choice="required" and named tool choice install one, as do JSON
+    response formats. The structured-output manager ends reasoning at an
+    implicit <tool_call> and applies the grammar only to the tokens after it,
+    so under a JSON grammar the opener delimits reasoning and is not content.
+    """
+    params = getattr(request, "structured_outputs", None)
+    if params is not None and (params.json is not None or bool(params.json_object)):
+        return True
+    # The Responses API keeps the grammar on ``text.format`` (that is where
+    # tool_choice="required" and named tools put theirs) and builds the
+    # structured-output params from it only when sampling.
+    text_format = getattr(getattr(request, "text", None), "format", None)
+    return (
+        getattr(text_format, "type", None) == "json_schema"
+        and getattr(text_format, "schema_", None) is not None
+    )
+
+
 class Qwen3ReasoningParser(BaseThinkingReasoningParser):
     """
     Reasoning parser for the Qwen3/Qwen3.5 model family.
@@ -35,7 +56,9 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
 
     NOTE: Qwen3.5 models may emit <tool_call> inside the thinking block
     without closing </think> first. <tool_call> is treated as an implicit
-    end of reasoning, matching the approach in KimiK2ReasoningParser.
+    end of reasoning, matching the approach in KimiK2ReasoningParser. It
+    starts the content, except under a JSON grammar (tool_choice="required",
+    a named tool, JSON response formats), whose output begins after it.
     """
 
     def __init__(self, tokenizer: "TokenizerLike", *args, **kwargs):
@@ -50,6 +73,7 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         self._tool_call_token_id = self.vocab.get(self._tool_call_tag)
         self._tool_call_end_tag = "</tool_call>"
         self._tool_call_end_token_id = self.vocab.get(self._tool_call_end_tag)
+        self._tool_opener_in_content = True
         self._stream_boundary = self._new_boundary()
         self._boundary_tokens_seen = 0
 
@@ -112,6 +136,8 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
             tool_call_index = (
                 len(input_ids) - 1 - input_ids[::-1].index(self._tool_call_token_id)
             )
+            if not self._tool_opener_in_content:
+                tool_call_index += 1
             return input_ids[tool_call_index:]
         return []
 
@@ -154,16 +180,31 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         tool_call_index = model_output.find(self._tool_call_tag)
         if tool_call_index != -1:
             reasoning = model_output[:tool_call_index]
+            if _json_constrained(request):
+                tool_call_index += len(self._tool_call_tag)
             content = model_output[tool_call_index:]
             return reasoning or None, content or None
         # Thinking enabled but no </think>: output was truncated.
         # Everything generated so far is reasoning.
         return model_output, None
 
-    def _new_boundary(self) -> Qwen3ReasoningBoundary:
+    def _new_boundary(
+        self, tool_opener_in_content: bool | None = None
+    ) -> Qwen3ReasoningBoundary:
+        if tool_opener_in_content is None:
+            tool_opener_in_content = self._tool_opener_in_content
         return Qwen3ReasoningBoundary(
-            self.start_token_id, self.end_token_id, self._tool_call_token_id
+            self.start_token_id,
+            self.end_token_id,
+            self._tool_call_token_id,
+            tool_opener_in_content=tool_opener_in_content,
         )
+
+    def prepare_streaming(
+        self, request: "ChatCompletionRequest | ResponsesRequest"
+    ) -> None:
+        self._tool_opener_in_content = not _json_constrained(request)
+        self._stream_boundary = self._new_boundary()
 
     def _observe_boundary(
         self,
@@ -213,11 +254,12 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         end, content_start = boundary.reasoning_end, boundary.content_start
         if end is None or not start <= end <= content_start <= len(text):
             return False
-        if boundary.implicit_end:
+        if boundary.implicit_end and boundary.tool_opener_in_content:
             return end == content_start and text.startswith(
                 self._tool_call_tag, content_start
             )
-        return text[end:content_start] == self.end_token
+        marker = self._tool_call_tag if boundary.implicit_end else self.end_token
+        return text[end:content_start] == marker
 
     def extract_reasoning_with_token_ids(
         self,
@@ -230,7 +272,7 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
             # streaming routes every delta to content. A literal </think> in
             # the answer must not split it here either.
             return None, model_output
-        boundary = self._new_boundary()
+        boundary = self._new_boundary(not _json_constrained(request))
         self._observe_boundary(boundary, token_ids, 0, model_output)
         if not self._boundary_matches_text(boundary, model_output):
             # Offsets come from decoding token prefixes. If that decode does

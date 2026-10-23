@@ -34,6 +34,59 @@ def get_target_lm_head(target_model: nn.Module, target_language_model: nn.Module
     )
 
 
+def _share_mtp_topk_buffer(
+    target_inner: nn.Module, draft_inner: nn.Module, vllm_config: VllmConfig
+) -> None:
+    """Reuse the target workspace for one sequential MTP QSA layer.
+
+    This loader is used by Model Runner V2's EagleSpeculator. Its MTP
+    propose runs after the target forward, on the same stream, without
+    calling the target between draft selection, compaction and decode.
+    Overlapping/async paths must keep independent workspaces.
+    """
+    iter_qsa = getattr(draft_inner, "_iter_qsa_attentions", None)
+    if iter_qsa is None:
+        return
+
+    speculative_config = vllm_config.speculative_config
+    scheduler_config = getattr(vllm_config, "scheduler_config", None)
+    reason = None
+    attentions = list(iter_qsa())
+    if getattr(speculative_config, "method", None) != "mtp":
+        reason = "only the sequential MTP propose path is eligible"
+    elif getattr(scheduler_config, "async_scheduling", None) is not False:
+        reason = "synchronous scheduling must be explicitly resolved"
+    elif len(attentions) != 1:
+        # Each layer's step-0 indices survive until the last draft step.
+        # Sharing across multiple draft layers would overwrite those indices.
+        reason = "exactly one draft QSA layer is required"
+    else:
+        shared = getattr(target_inner, "topk_indices_buffer", None)
+        own = attentions[0].topk_indices_buffer
+        if (
+            not isinstance(shared, torch.Tensor)
+            or not isinstance(own, torch.Tensor)
+            or shared.dtype != torch.int32
+            or own.dtype != torch.int32
+            or shared.ndim != 2
+            or own.ndim != 2
+            or shared.shape[0] < own.shape[0]
+            or shared.shape[1] != own.shape[1]
+            or shared.device != own.device
+        ):
+            reason = "target and draft workspace shape, dtype or device differ"
+        else:
+            # get_model has finished device/dtype transforms; bind before
+            # warmup and graph capture. Assignment preserves the draft's
+            # nonpersistent buffer registration (and named_buffers alias).
+            # Any later allocating Module._apply needs rebinding before capture.
+            attentions[0].topk_indices_buffer = shared
+            logger.info("Sharing target top-k workspace with the MTP QSA layer.")
+            return
+
+    logger.info("Keeping private draft QSA top-k workspace: %s.", reason)
+
+
 def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
     from vllm.compilation.backends import set_model_tag
 
@@ -107,10 +160,12 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
                     del sh.head
                     sh.head = target_lm_head
 
-    # MTP also shares a topk_indices_buffer between target and draft.
+    # Preserve the predictor-level alias; QSA reads its layer-local attribute.
     if hasattr(target_inner, "topk_indices_buffer"):
         if hasattr(draft_inner, "topk_indices_buffer"):
             del draft_inner.topk_indices_buffer
         draft_inner.topk_indices_buffer = target_inner.topk_indices_buffer
+
+    _share_mtp_topk_buffer(target_inner, draft_inner, vllm_config)
 
     return eagle_model

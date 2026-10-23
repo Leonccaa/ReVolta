@@ -10,7 +10,10 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
-from vllm.config.speculative import get_dflash_model_draft_tokens
+from vllm.config.speculative import (
+    dflash_drafts_for_requests,
+    get_dflash_model_draft_tokens,
+)
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_rank
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
@@ -51,6 +54,9 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         # Multimodal inputs not currently supported.
         self.supports_mm_inputs = False
+        # Running requests of the current proposal, for the verification width
+        # policy (dflash_concurrency_drafts).
+        self._running_reqs = 0
 
         # A lookup-augmented DFlash2 proposal may be wider than the checkpoint
         # block. The model still emits only its trained block; lookup fills the
@@ -516,6 +522,14 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_rejected: torch.Tensor,
     ) -> None:
         """Refresh optional proposal-controller state before graph replay."""
+        self._running_reqs = input_batch.num_reqs
+
+    def next_num_draft_tokens(self) -> int | None:
+        """Drafts the target verifies next step under
+        ``dflash_concurrency_drafts``; None keeps the full proposal."""
+        if not getattr(self.speculative_config, "dflash_concurrency_drafts", None):
+            return None
+        return dflash_drafts_for_requests(self.speculative_config, self._running_reqs)
 
     def _apply_ngram_assist(self, num_reqs: int) -> None:
         """Override model proposals for ngram-hit rows, if configured."""
@@ -654,6 +668,8 @@ class DFlashSpeculator(DraftModelSpeculator):
         # Support multiple draft KV cache groups by preparing inputs once for each
         with record_function_or_nullcontext("dflash: prepare inputs"):
             for i, gid in enumerate(self.draft_kv_cache_group_ids):
+                # A drafter cache replicated across DCP ranks takes every slot.
+                cp_size, cp_rank = self.block_tables.group_cp(gid)
                 prepare_dflash_inputs(
                     self.input_buffers,
                     query_slot_mappings[gid],
@@ -673,8 +689,8 @@ class DFlashSpeculator(DraftModelSpeculator):
                     seeds,
                     self.block_tables.input_block_tables[gid],
                     self.block_tables.kernel_block_sizes[gid],
-                    self.block_tables.cp_rank,
-                    self.block_tables.cp_size,
+                    cp_rank,
+                    cp_size,
                     self.block_tables.cp_interleave,
                     self.parallel_drafting_token_id,
                     self.num_query_per_req,

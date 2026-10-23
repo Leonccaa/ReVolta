@@ -135,17 +135,18 @@ class MockOffloadingSpec(OffloadingSpec):
     def complete_transfers(self):
         self.handler.complete_jobs(self.handler.waiting_jobs.copy())
 
-    def get_completed_transfers(self) -> list[TransferSpec]:
+    def get_completed_transfers(self) -> list[tuple[int, TransferSpec]]:
         specs = [
-            self.handler.transfer_specs[job_id]
+            (job_id, self.handler.transfer_specs[job_id])
             for job_id in self.handler.completed_jobs
         ]
         self.handler.completed_jobs.clear()
         return specs
 
-    def get_flushed_transfers(self):
+    def get_flushed_transfers(self) -> list[tuple[int, TransferSpec]]:
         specs = [
-            self.handler.transfer_specs[job_id] for job_id in self.handler.flushed_jobs
+            (job_id, self.handler.transfer_specs[job_id])
+            for job_id in self.handler.flushed_jobs
         ]
         self.handler.flushed_jobs.clear()
         return specs
@@ -304,6 +305,8 @@ class RequestRunner:
 
         # block_id -> GPUBlock
         self.gpu_blocks: dict[int, GPUBlock] = {}
+        # job_id -> GPUBlocks of the job, resolved when the scheduler creates it
+        self.job_gpu_blocks: dict[int, list[GPUBlock]] = {}
 
         init_none_hash(sha256)
         self._block_hasher = get_request_block_hasher(block_size, sha256)
@@ -336,21 +339,45 @@ class RequestRunner:
 
         self.scheduler.add_request(req)
 
+    @staticmethod
+    def _gpu_spec(transfer_spec: TransferSpec) -> GPULoadStoreSpec:
+        src_spec, dst_spec = transfer_spec
+        gpu_spec = src_spec if isinstance(src_spec, GPULoadStoreSpec) else dst_spec
+        assert isinstance(gpu_spec, GPULoadStoreSpec)
+        return gpu_spec
+
+    def _record_job_gpu_blocks(self, metadata: OffloadingConnectorMetadata):
+        # Resolve block IDs when the scheduler creates each job. A sliding
+        # window can free the blocks it has moved past for immediate reuse, so
+        # by the time a transfer completes its block ID may belong to another
+        # GPU block.
+        for job_id, job in (*metadata.load_jobs.items(), *metadata.store_jobs.items()):
+            self.job_gpu_blocks[job_id] = [
+                self.gpu_blocks[block_id.item()]
+                for block_id in self._gpu_spec(job.transfer_spec).block_ids
+            ]
+
+    def _gpu_blocks_of_job(
+        self, job_id: int, transfer_spec: TransferSpec
+    ) -> list[GPUBlock]:
+        recorded = self.job_gpu_blocks.get(job_id)
+        if recorded is not None:
+            return recorded
+        return [
+            self.gpu_blocks[block_id.item()]
+            for block_id in self._gpu_spec(transfer_spec).block_ids
+        ]
+
     def _parse_transfers(self):
-        for transfer_spec in self.offloading_spec.get_flushed_transfers():
-            src_spec, dst_spec = transfer_spec
-            if isinstance(src_spec, GPULoadStoreSpec):
-                # store flush
-                for block_id in src_spec.block_ids:
-                    self.flushed_gpu_blocks.add(self.gpu_blocks[block_id.item()])
-            else:
-                # load flush
-                for block_id in dst_spec.block_ids:
-                    self.flushed_gpu_blocks.add(self.gpu_blocks[block_id.item()])
+        for job_id, transfer_spec in self.offloading_spec.get_flushed_transfers():
+            # store or load flush
+            self.flushed_gpu_blocks.update(
+                self._gpu_blocks_of_job(job_id, transfer_spec)
+            )
 
         block_size_factor = self.block_size_factor
 
-        for transfer_spec in self.offloading_spec.get_completed_transfers():
+        for job_id, transfer_spec in self.offloading_spec.get_completed_transfers():
             src_spec, dst_spec = transfer_spec
 
             if isinstance(src_spec, GPULoadStoreSpec):
@@ -366,9 +393,8 @@ class RequestRunner:
             assert isinstance(gpu_spec, GPULoadStoreSpec)
             assert len(gpu_spec.group_sizes) == self.num_kv_groups
 
-            gpu_blocks: list[GPUBlock] = []
-            for block_id in gpu_spec.block_ids:
-                gpu_blocks.append(self.gpu_blocks[block_id.item()])
+            gpu_blocks = self._gpu_blocks_of_job(job_id, transfer_spec)
+            self.job_gpu_blocks.pop(job_id, None)
 
             # list of (offload_key, sub_block_offset)
             offload_addresses: list[Any] = []
@@ -448,6 +474,7 @@ class RequestRunner:
             kv_connector_metadata = scheduler_output.kv_connector_metadata
             assert kv_connector_metadata is not None
             assert isinstance(kv_connector_metadata, OffloadingConnectorMetadata)
+            self._record_job_gpu_blocks(kv_connector_metadata)
 
             self.worker_connector.handle_preemptions(kv_connector_metadata)
 

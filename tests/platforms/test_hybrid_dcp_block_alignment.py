@@ -84,3 +84,50 @@ def test_dcp_share_keeps_the_block_alignment(monkeypatch, mamba_tokens, dcp) -> 
     # No larger than the next aligned size: existing geometries do not move.
     assert block_size - KERNEL_BLOCK * dcp < mamba_tokens
     assert config.cache_config.mamba_block_size == block_size
+
+
+def _with_alignment(model_cls, align):
+    return type(
+        "_Aligned",
+        (model_cls,),
+        {"get_kv_block_size_alignment": classmethod(lambda cls, vllm_config: align)},
+    )
+
+
+# A DFlash drafter that needs a 32-token block multiple (two main-KV tokens of
+# bytes per drafter token): MTP4-like and seven-token-draft-like mamba pages.
+@pytest.mark.parametrize(
+    ("mamba_tokens", "dcp", "expected"),
+    [(1610, 1, 1632), (1636, 1, 1664), (1610, 2, 1632), (1636, 2, 1664)],
+)
+def test_model_alignment_rounds_the_automatic_block(
+    monkeypatch, mamba_tokens, dcp, expected
+) -> None:
+    config, model_cls = _vllm_config(mamba_tokens, dcp)
+    aligned = _with_alignment(model_cls, 32)
+    monkeypatch.setattr(
+        ModelRegistry,
+        "resolve_model_cls",
+        lambda *args, **kwargs: (aligned, "FakeHybridForCausalLM"),
+    )
+
+    Platform._align_hybrid_block_size(config, _LooseBackend)
+
+    assert config.cache_config.block_size == expected
+    assert config.cache_config.mamba_block_size == expected
+
+
+@pytest.mark.parametrize("align", [None, 32])
+def test_model_alignment_keeps_an_explicit_block(monkeypatch, align) -> None:
+    config, model_cls = _vllm_config(1610, 1)
+    config.cache_config.block_size = 1632
+    aligned = _with_alignment(model_cls, align)
+    monkeypatch.setattr(
+        ModelRegistry,
+        "resolve_model_cls",
+        lambda *args, **kwargs: (aligned, "FakeHybridForCausalLM"),
+    )
+
+    Platform._align_hybrid_block_size(config, _LooseBackend)
+
+    assert config.cache_config.block_size == 1632

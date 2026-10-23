@@ -94,7 +94,7 @@ from vllm.entrypoints.openai.responses.utils import (
     extract_tool_types,
 )
 from vllm.entrypoints.serve.render.serving import OpenAIServingRender
-from vllm.entrypoints.utils import get_max_tokens
+from vllm.entrypoints.utils import get_max_tokens, validate_request_mm_kwargs
 from vllm.exceptions import VLLMValidationError
 from vllm.inputs import EngineInput, tokens_input
 from vllm.logger import init_logger
@@ -343,6 +343,13 @@ class OpenAIServingResponses(OpenAIServing):
         | ResponsesResponse
         | ErrorResponse
     ):
+        validate_request_mm_kwargs(
+            mm_processor_kwargs=request.mm_processor_kwargs,
+            media_io_kwargs=request.media_io_kwargs,
+            trust_request_mm_kwargs=(
+                self.openai_serving_render.trust_request_mm_kwargs
+            ),
+        )
         error_check_ret = await self._check_model(request)
         if error_check_ret is not None:
             logger.error("Error with model %s", error_check_ret)

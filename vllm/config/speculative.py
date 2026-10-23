@@ -113,6 +113,48 @@ def get_dflash_model_draft_tokens(speculative_config: Any) -> int:
     return verify_tokens
 
 
+def dflash_drafts_for_requests(speculative_config: Any, num_reqs: int) -> int:
+    """Draft tokens the target verifies per request with ``num_reqs`` running.
+
+    Applies ``dflash_concurrency_drafts`` as a ladder: the entry with the largest
+    threshold not above ``num_reqs`` sets the width. Below every threshold, and
+    without a policy, this is ``num_speculative_tokens``.
+    """
+    drafts = int(getattr(speculative_config, "num_speculative_tokens", 0) or 0)
+    policy = getattr(speculative_config, "dflash_concurrency_drafts", None) or {}
+    reached = {int(t): int(w) for t, w in policy.items() if num_reqs >= int(t)}
+    if reached:
+        drafts = reached[max(reached)]
+    return drafts
+
+
+def check_dflash_concurrency_drafts(
+    policy: dict[int, int] | None,
+    *,
+    dflash: bool,
+    ngram_assist: bool,
+    num_speculative_tokens: int,
+) -> None:
+    """Reject a ``dflash_concurrency_drafts`` policy that cannot apply."""
+    if not policy:
+        return
+    if not dflash or ngram_assist:
+        raise ValueError(
+            "dflash_concurrency_drafts needs method='dflash' without ngram_assist."
+        )
+    for min_reqs, drafts in policy.items():
+        if isinstance(min_reqs, bool) or isinstance(drafts, bool):
+            raise ValueError(
+                "dflash_concurrency_drafts takes integer request counts and drafts; "
+                f"got {min_reqs!r}: {drafts!r}."
+            )
+        if int(min_reqs) < 2 or not 0 < int(drafts) <= num_speculative_tokens:
+            raise ValueError(
+                "dflash_concurrency_drafts maps a running-request count >= 2 to "
+                f"1..num_speculative_tokens drafts; got {min_reqs}: {drafts}."
+            )
+
+
 def uses_adaptive_dflash_lookup(speculative_config: Any) -> bool:
     """Whether DFlash2 can switch between model and augmented widths."""
     verify_tokens = int(getattr(speculative_config, "num_speculative_tokens", 0) or 0)
@@ -121,6 +163,35 @@ def uses_adaptive_dflash_lookup(speculative_config: Any) -> bool:
         and bool(getattr(speculative_config, "ngram_assist", False))
         and 0 < get_dflash_model_draft_tokens(speculative_config) < verify_tokens
     )
+
+
+def match_target_rope_scaling(target, draft) -> bool:
+    """Rotate MTP draft positions exactly like a window-extended target.
+
+    The stock MTP checkpoint ships its target's native RoPE. When the target
+    serves a longer window with scaled RoPE (YaRN), the draft attends over the
+    same positions and must use the same scaling and position range. Returns
+    whether the draft config was changed.
+    """
+    if target is None or draft is None:
+        return False
+    target_text, draft_text = target.hf_text_config, draft.hf_text_config
+    target_rope = dict(getattr(target_text, "rope_parameters", None) or {})
+    draft_rope = dict(getattr(draft_text, "rope_parameters", None) or {})
+    if target_rope.get("rope_type", "default") == "default":
+        return False
+    if draft_rope.get("rope_type", "default") != "default":
+        return False
+    if target_rope.get("rope_theta") != draft_rope.get("rope_theta"):
+        return False
+    draft_text.rope_parameters = target_rope
+    draft_text.max_position_embeddings = target_text.max_position_embeddings
+    logger.info(
+        "MTP draft RoPE follows the target's %s scaling over %d positions.",
+        target_rope.get("rope_type"),
+        target_text.max_position_embeddings,
+    )
+    return True
 
 
 @config
@@ -219,6 +290,17 @@ class SpeculativeConfig:
     keeps its trained width and lookup may fill the extra target-verification
     positions. Only valid with ``method='dflash'`` and a DFlash2 selector
     capability."""
+
+    dflash_concurrency_drafts: dict[int, int] | None = None
+    """DFlash: verify fewer drafts per request at high concurrency, as a
+    ladder ``{min_running_requests: draft_tokens}``. Each entry holds from its
+    request count up to the next entry: ``{4: 3, 5: 4}`` verifies all drafts
+    for one to three running requests, three at four, and four from five up.
+    The drafter still proposes its trained block and the target verifies only
+    the first drafts, so a wide draft keeps its single-request acceptance
+    without paying for rejected verifier rows in large batches. Narrower target
+    decode graphs are captured for the request counts that use them. None
+    verifies ``num_speculative_tokens`` drafts at every concurrency."""
 
     # Alternative drafting strategies
     parallel_drafting: bool = False
@@ -387,6 +469,9 @@ class SpeculativeConfig:
         factors: list[Any] = [
             ("use_local_argmax_reduction", self.use_local_argmax_reduction)
         ]
+        # dflash_concurrency_drafts is left out: it only picks how many drafts
+        # are verified and which uniform decode sizes get CUDA graphs; compile
+        # ranges come from compilation_config, and graphs are not persisted.
         if self.sm70_dflash2.resolved and (
             self.use_dflash_family() or self.sm70_dflash2.explicit_fields
         ):
@@ -1061,6 +1146,14 @@ class SpeculativeConfig:
                     )
                 )
 
+                if self.method == "mtp" and match_target_rope_scaling(
+                    self.target_model_config, self.draft_model_config
+                ):
+                    # The draft now covers the target's extended positions.
+                    self.draft_model_config.max_model_len = max(
+                        self.draft_model_config.max_model_len,
+                        self.target_model_config.max_model_len,
+                    )
                 self.draft_model_config.max_model_len = (
                     SpeculativeConfig._maybe_override_draft_max_model_len(
                         self.max_model_len,
@@ -1418,6 +1511,12 @@ class SpeculativeConfig:
                 "Expected num_speculative_tokens to be greater "
                 f"than zero ({self.num_speculative_tokens})."
             )
+        check_dflash_concurrency_drafts(
+            self.dflash_concurrency_drafts,
+            dflash=self.use_dflash(),
+            ngram_assist=self.ngram_assist,
+            num_speculative_tokens=self.num_speculative_tokens,
+        )
         if self.ngram_assist:
             if not self.use_dflash():
                 raise ValueError("ngram_assist is only supported with method='dflash'.")

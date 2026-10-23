@@ -7,18 +7,36 @@ from vllm.distributed import get_dcp_group, get_pcp_group
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+    from vllm.v1.kv_cache_interface import KVCacheConfig
 else:
     AttentionLayerBase = object
 
 
-def check_attention_cp_compatibility(vllm_config: VllmConfig) -> None:
+def check_attention_cp_compatibility(
+    vllm_config: VllmConfig, kv_cache_config: "KVCacheConfig | None" = None
+) -> None:
     pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
     dcp_size = vllm_config.parallel_config.decode_context_parallel_size
     interleave_size = vllm_config.parallel_config.cp_kv_cache_interleave_size
     if pcp_size * dcp_size > 1:
+        # A drafter's sliding-window cache replicated across DCP ranks (DFlash)
+        # is attended whole on every rank and never combined, so its layers need
+        # no softmax LSE. Every other layer keeps the check.
+        replicated: set[str] = set()
+        if kv_cache_config is not None:
+            from vllm.v1.kv_cache_interface import SlidingWindowSpec
+
+            for group in kv_cache_config.kv_cache_groups:
+                spec = group.kv_cache_spec
+                if (
+                    group.is_eagle_group
+                    and isinstance(spec, SlidingWindowSpec)
+                    and not spec.dcp_sharded
+                ):
+                    replicated.update(group.layer_names)
         layer_type = cast(type[Any], AttentionLayerBase)
         layers = get_layers_from_vllm_config(vllm_config, layer_type)
-        for layer in layers.values():
+        for name, layer in layers.items():
             layer_impl = getattr(layer, "impl", None)
             if layer_impl is None:
                 continue
@@ -27,7 +45,7 @@ def check_attention_cp_compatibility(vllm_config: VllmConfig) -> None:
                     "MTP with cp_kv_cache_interleave_size > 1 is not "
                     f"supported in {layer_impl.__class__.__name__}."
                 )
-            if dcp_size > 1:
+            if dcp_size > 1 and name not in replicated:
                 assert layer_impl.need_to_return_lse_for_decode, (
                     "Decode Context Parallelism (DCP) requires attention "
                     "implementations to return the softmax LSE during decode, "

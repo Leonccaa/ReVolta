@@ -43,7 +43,9 @@ def test_sm70_v2_route_accepts_prefix_caching(
             multimodal_config=SimpleNamespace(language_model_only=True),
         ),
         cache_config=SimpleNamespace(enable_prefix_caching=True),
-        parallel_config=SimpleNamespace(enable_dbo=False, ubatch_size=1),
+        parallel_config=SimpleNamespace(
+            enable_dbo=False, ubatch_size=1, decode_context_parallel_size=1
+        ),
         speculative_config=None,
         use_v2_model_runner=True,
     )
@@ -76,7 +78,9 @@ def test_sm70_route_accepts_multimodal_tower_and_preserves_mrope(
             multimodal_config=multimodal_config,
         ),
         cache_config=SimpleNamespace(enable_prefix_caching=False),
-        parallel_config=SimpleNamespace(enable_dbo=False, ubatch_size=1),
+        parallel_config=SimpleNamespace(
+            enable_dbo=False, ubatch_size=1, decode_context_parallel_size=1
+        ),
         speculative_config=None,
     )
 
@@ -140,7 +144,9 @@ def test_initial_sm70_v2_route_accepts_native_mtp(
             multimodal_config=None,
         ),
         cache_config=SimpleNamespace(enable_prefix_caching=False),
-        parallel_config=SimpleNamespace(enable_dbo=False, ubatch_size=1),
+        parallel_config=SimpleNamespace(
+            enable_dbo=False, ubatch_size=1, decode_context_parallel_size=1
+        ),
         speculative_config=SimpleNamespace(method="mtp"),
     )
 
@@ -165,8 +171,12 @@ def test_initial_sm70_v2_route_rejects_unvalidated_speculator(
             multimodal_config=None,
         ),
         cache_config=SimpleNamespace(enable_prefix_caching=False),
-        parallel_config=SimpleNamespace(enable_dbo=False, ubatch_size=1),
-        speculative_config=SimpleNamespace(method="dflash"),
+        parallel_config=SimpleNamespace(
+            enable_dbo=False, ubatch_size=1, decode_context_parallel_size=1
+        ),
+        # DFlash is admitted only with a declared feature contract
+        # (test_dflash_capture.py); other learned proposers stay rejected.
+        speculative_config=SimpleNamespace(method="dspark"),
     )
 
     with pytest.raises(NotImplementedError, match="supports only its native MTP"):

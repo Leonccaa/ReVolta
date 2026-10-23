@@ -48,6 +48,20 @@ def test_sm70_gemm_lut_path_is_not_compile_factor(
     assert envs.compile_factors() == baseline
 
 
+def test_sm70_dflash_row_band_is_not_compile_factor(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # The DFlash MoE row band routes inside a custom op; neither registering it
+    # nor setting it may change the compile key.
+    name = "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_DFLASH_MAX_TOKENS"
+    monkeypatch.delenv(name, raising=False)
+    baseline = envs.compile_factors()
+    monkeypatch.setenv(name, "40")
+
+    assert name not in envs.compile_factors()
+    assert envs.compile_factors() == baseline
+
+
 def test_unregistered_vllm_env_vars_are_compile_factors(
     monkeypatch: pytest.MonkeyPatch,
 ):

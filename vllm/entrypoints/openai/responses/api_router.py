@@ -15,6 +15,10 @@ from vllm.entrypoints.openai.responses.protocol import (
     StreamingResponsesResponse,
 )
 from vllm.entrypoints.openai.responses.serving import OpenAIServingResponses
+from vllm.entrypoints.openai.sse_keep_alive import (
+    sse_keep_alive_interval,
+    with_sse_keep_alive,
+)
 from vllm.entrypoints.openai.utils import validate_json_request
 from vllm.entrypoints.utils import (
     load_aware_call,
@@ -73,7 +77,13 @@ async def create_responses(request: ResponsesRequest, raw_request: Request):
         return JSONResponse(content=generator.model_dump(mode="json", by_alias=True))
 
     return StreamingResponse(
-        content=_convert_stream_to_sse_events(generator), media_type="text/event-stream"
+        content=with_sse_keep_alive(
+            _convert_stream_to_sse_events(generator),
+            # Harmony tool sessions can hold task-local cancel scopes across
+            # yields; separate anext tasks cannot safely advance them.
+            0 if handler.use_harmony else sse_keep_alive_interval(raw_request),
+        ),
+        media_type="text/event-stream",
     )
 
 
@@ -103,7 +113,11 @@ async def retrieve_responses(
     elif isinstance(response, ResponsesResponse):
         return JSONResponse(content=response.model_dump(mode="json", by_alias=True))
     return StreamingResponse(
-        content=_convert_stream_to_sse_events(response), media_type="text/event-stream"
+        content=with_sse_keep_alive(
+            _convert_stream_to_sse_events(response),
+            0 if handler.use_harmony else sse_keep_alive_interval(raw_request),
+        ),
+        media_type="text/event-stream",
     )
 
 

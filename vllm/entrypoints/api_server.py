@@ -11,7 +11,7 @@ change `vllm/entrypoints/openai/api_server.py` instead.
 import asyncio
 import json
 import ssl
-from argparse import Namespace
+from argparse import BooleanOptionalAction, Namespace
 from collections.abc import AsyncGenerator
 from typing import Any
 
@@ -22,7 +22,9 @@ import vllm.envs as envs
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.entrypoints.launcher import serve_http
-from vllm.entrypoints.utils import with_cancellation
+from vllm.entrypoints.openai.server_utils import exception_handler
+from vllm.entrypoints.utils import validate_request_mm_kwargs, with_cancellation
+from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.usage.usage_lib import UsageContext
@@ -58,6 +60,26 @@ async def generate(request: Request) -> Response:
 
 @with_cancellation
 async def _generate(request_dict: dict, raw_request: Request) -> Response:
+    # The demo accepts raw PromptType dictionaries, unlike the OpenAI protocols.
+    # Guard their overrides before forwarding them to the engine/processor.
+    prompt_input = request_dict.get("prompt")
+    prompts = [prompt_input]
+    if isinstance(prompt_input, dict):
+        prompts.extend(
+            prompt_input.get(key) for key in ("encoder_prompt", "decoder_prompt")
+        )
+    try:
+        for prompt_item in prompts:
+            if isinstance(prompt_item, dict):
+                validate_request_mm_kwargs(
+                    mm_processor_kwargs=prompt_item.get("mm_processor_kwargs"),
+                    media_io_kwargs=prompt_item.get("media_io_kwargs"),
+                    trust_request_mm_kwargs=getattr(
+                        raw_request.app.state, "trust_request_mm_kwargs", False
+                    ),
+                )
+    except VLLMValidationError as exc:
+        return await exception_handler(raw_request, exc)
     prompt = request_dict.pop("prompt")
     stream = request_dict.pop("stream", False)
     # Since SamplingParams is created fresh per request, safe to skip clone
@@ -99,6 +121,7 @@ def build_app(args: Namespace) -> FastAPI:
     global app
 
     app.root_path = args.root_path
+    app.state.trust_request_mm_kwargs = getattr(args, "trust_request_mm_kwargs", False)
     return app
 
 
@@ -180,6 +203,12 @@ if __name__ == "__main__":
         help="FastAPI root_path when app is behind a path based routing proxy",
     )
     parser.add_argument("--log-level", type=str, default="debug")
+    parser.add_argument(
+        "--trust-request-mm-kwargs",
+        action=BooleanOptionalAction,
+        default=False,
+        help="Allow multimodal kwarg overrides in prompts from trusted clients.",
+    )
     parser = AsyncEngineArgs.add_cli_args(parser)
     args = parser.parse_args()
 

@@ -171,6 +171,11 @@ _QWEN38_GROUPED_QPN_MIN_TOKENS: Final = 2
 # to the native kernel maximum (sm70_ops.AWQ_GROUPED_DECODE_MAX_TOKENS).
 _QWEN38_GROUPED_QPN_MAX_TOKENS: Final = 20
 _QWEN38_GROUPED_QPN_PACK_ROWS: Final = (0, 8, 16, 24, 32, 40, 48)
+# With a DFlash drafter, a verify batch above the admitted row band runs as at
+# most this many grouped calls over balanced row chunks: a seven-token draft at
+# eight requests (64 rows) otherwise falls to the TurboMind route, which costs
+# about 66 ms per step there against about 23 ms for two 32-row grouped calls.
+_QWEN38_GROUPED_QPN_MAX_CALLS: Final = 2
 
 
 def _grouped_qpn_native_supports_pack_rows() -> bool:
@@ -203,14 +208,24 @@ def _initialize_qwen38_grouped_qpn(
     split = int(envs.VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT)
     if split not in (4, 8, 16):
         raise ValueError("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT must be 4, 8 or 16.")
-    max_tokens = int(envs.VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS)
+    # Row chunking and the DFlash row band only serve the wide DFlash verify
+    # batches; other deployments keep their band and the TurboMind route above it.
+    vllm_config = get_current_vllm_config_or_none()
+    speculative_config = None if vllm_config is None else vllm_config.speculative_config
+    chunked = getattr(speculative_config, "method", None) == "dflash"
+    band_name = (
+        "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_DFLASH_MAX_TOKENS"
+        if chunked
+        else "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS"
+    )
+    max_tokens = int(getattr(envs, band_name))
     if not (
         _QWEN38_GROUPED_QPN_MIN_TOKENS
         <= max_tokens
         <= sm70_ops.AWQ_GROUPED_DECODE_MAX_TOKENS
     ):
         raise ValueError(
-            "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS must be in "
+            f"{band_name} must be in "
             f"{_QWEN38_GROUPED_QPN_MIN_TOKENS}.."
             f"{sm70_ops.AWQ_GROUPED_DECODE_MAX_TOKENS}, got {max_tokens}."
         )
@@ -247,13 +262,15 @@ def _initialize_qwen38_grouped_qpn(
         return False
     layer.sm70_awq_qwen38_grouped_qpn_max_tokens = max_tokens
     layer.sm70_awq_qwen38_grouped_qpn_pack_rows = pack_rows
+    layer.sm70_awq_qwen38_grouped_qpn_chunked = chunked
     logger.info_once(
         "SM70 Qwen3.8 AWQ grouped QPN decode admitted for %d..%d rows "
-        "(split=%d, pack_rows=%d).",
+        "(split=%d, pack_rows=%d, up to %d row chunks).",
         _QWEN38_GROUPED_QPN_MIN_TOKENS,
         max_tokens,
         split,
         pack_rows,
+        _QWEN38_GROUPED_QPN_MAX_CALLS if chunked else 1,
     )
     return True
 
@@ -288,6 +305,49 @@ def _use_qwen38_grouped_qpn(
         and topk_weights.dtype == torch.float32
         and topk_weights.is_contiguous()
     )
+
+
+def _qwen38_grouped_qpn_chunks(
+    layer: RoutedExperts,
+    x: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> list[tuple[int, int]] | None:
+    """Row ranges for the grouped route, or ``None`` for the TurboMind route.
+
+    Within the admitted band this is one call. Above it, a layer admitted for
+    chunking (DFlash) splits the rows into balanced chunks for at most
+    ``_QWEN38_GROUPED_QPN_MAX_CALLS`` calls. Each row's experts are computed
+    and reduced for that row alone, so chunks do not change a row's result.
+    """
+    num_tokens = x.shape[0]
+    max_tokens = int(
+        getattr(
+            layer,
+            "sm70_awq_qwen38_grouped_qpn_max_tokens",
+            _QWEN38_GROUPED_QPN_MAX_TOKENS,
+        )
+    )
+    calls = 1
+    if num_tokens > max_tokens and getattr(
+        layer, "sm70_awq_qwen38_grouped_qpn_chunked", False
+    ):
+        calls = -(-num_tokens // max_tokens)
+        if calls > _QWEN38_GROUPED_QPN_MAX_CALLS:
+            return None
+    rows = -(-num_tokens // calls)
+    # Every chunk is a contiguous row slice of these tensors; the first one
+    # stands for all of them in the geometry, dtype and storage checks.
+    if not _use_qwen38_grouped_qpn(
+        layer, x[:rows], topk_weights[:rows], topk_ids[:rows]
+    ):
+        return None
+    chunks = [
+        (start, min(start + rows, num_tokens)) for start in range(0, num_tokens, rows)
+    ]
+    if chunks[-1][1] - chunks[-1][0] < _QWEN38_GROUPED_QPN_MIN_TOKENS:
+        return None
+    return chunks
 
 
 def _use_temporary_buffers_for_dummy_or_capture() -> bool:
@@ -1814,28 +1874,35 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 )
             output = _dump_awq_moe_buffer(layer, output, "st_output")
             return output
-        if not indexed_w13 and _use_qwen38_grouped_qpn(
-            layer, x, topk_weights, topk_ids_i32
-        ):
+        grouped_chunks = (
+            None
+            if indexed_w13
+            else _qwen38_grouped_qpn_chunks(layer, x, topk_weights, topk_ids_i32)
+        )
+        if grouped_chunks is not None:
             _log_runtime_route_once(
-                "SM70 Qwen3.8 AWQ grouped QPN decode (tokens=%d, routes=%d).",
+                "SM70 Qwen3.8 AWQ grouped QPN decode (tokens=%d, routes=%d, calls=%d).",
                 num_tokens,
                 total_slots,
+                len(grouped_chunks),
             )
-            sm70_ops.awq_moe_grouped_decode_sm70_out(
-                output,
-                buffers["intermediate"],
-                buffers["grouped_plan"],
-                x,
-                layer.w13_tm_weight,
-                layer.w13_tm_scales,
-                layer.w2_tm_weight,
-                layer.w2_tm_scales,
-                topk_ids_i32,
-                topk_weights,
-                int(envs.VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT),
-                int(getattr(layer, "sm70_awq_qwen38_grouped_qpn_pack_rows", 0)),
-            )
+            for start, end in grouped_chunks:
+                # One plan and intermediate buffer serve the chunks in stream
+                # order; each call rebuilds its plan.
+                sm70_ops.awq_moe_grouped_decode_sm70_out(
+                    output[start:end],
+                    buffers["intermediate"][: (end - start) * top_k],
+                    buffers["grouped_plan"],
+                    x[start:end],
+                    layer.w13_tm_weight,
+                    layer.w13_tm_scales,
+                    layer.w2_tm_weight,
+                    layer.w2_tm_scales,
+                    topk_ids_i32[start:end],
+                    topk_weights[start:end],
+                    int(envs.VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT),
+                    int(getattr(layer, "sm70_awq_qwen38_grouped_qpn_pack_rows", 0)),
+                )
             return _dump_awq_moe_buffer(layer, output, "grouped_qpn_output")
         if indexed_w13:
             torch.ops._moe_C.moe_permute_metadata_with_scratch(

@@ -505,7 +505,8 @@ def test_split_character_tool_call_logprobs_are_preserved(
     )
     assert _tool_calls(choices[0]) == (["f"], {"x": "值🙂"})
     assert _text(choices[0], "reasoning") == ("想" if thinking else "")
-    assert _text(choices[0], "content") == ("\n\n" if thinking else "")
+    # Like the non-streaming response, no whitespace-only content with calls.
+    assert _text(choices[0], "content") == ""
 
 
 @pytest.mark.parametrize("include_reasoning", [False, True])

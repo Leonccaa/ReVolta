@@ -13,6 +13,7 @@ from vllm.config.sm70_dflash2 import (
     capture_sm70_dflash2_config,
     sm70_dflash2_enabled,
 )
+from vllm.config.speculative import dflash_drafts_for_requests
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
@@ -649,6 +650,7 @@ class DFlash2Speculator(DFlashSpeculator):
         num_rejected: torch.Tensor,
     ) -> None:
         """Refresh lookup eligibility and controller inputs before replay."""
+        super()._prepare_proposal_runtime(input_batch, num_sampled, num_rejected)
         del num_rejected
         if not self._lookup_enabled:
             return
@@ -710,9 +712,12 @@ class DFlash2Speculator(DFlashSpeculator):
         self._lookup_copy_pending = True
 
     def next_num_draft_tokens(self) -> int:
-        """Choose q8 or q16 for the next target verification step."""
+        """Choose the next target verification width: q8 or q16 with lookup,
+        otherwise the concurrency policy (``dflash_concurrency_drafts``)."""
         if not self._lookup_enabled:
-            return self.num_speculative_steps
+            return dflash_drafts_for_requests(
+                self.speculative_config, self._running_reqs
+            )
 
         num_reqs = len(self._lookup_current_req_key)
         if num_reqs == 0 or not self._lookup_current_eligible:
@@ -844,7 +849,13 @@ class DFlash2Speculator(DFlashSpeculator):
             if isinstance(self._group_causal, dict)
             else self._group_causal
         )
-        if self.block_tables.cp_size != 1 or has_causal:
+        # The refresh copies global seq_lens, which a DCP-replicated drafter
+        # cache uses as is; only a sharded drafter group needs local lengths.
+        sharded = any(
+            self.block_tables.group_cp(gid)[0] != 1
+            for gid in self.draft_kv_cache_group_ids
+        )
+        if sharded or has_causal:
             return
         if any(
             not isinstance(a.impl, FlashAttnV100Impl)

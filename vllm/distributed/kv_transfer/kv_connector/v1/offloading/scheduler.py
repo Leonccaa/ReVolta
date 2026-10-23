@@ -1179,6 +1179,13 @@ class OffloadingConnectorScheduler:
             self._drop_pending_boundary_offloads(req_status, "preempted")
             if not req_status.transfer_jobs:
                 continue
+            # A request preempted outside schedule() (reset_prefix_cache with
+            # reset_running_requests) is reported one call later. With no
+            # transfer left, that call may already have re-admitted it with a
+            # new load into freshly allocated blocks. The load reads no freed
+            # block, and workers start it only after this step's flushes.
+            if req_status.transfer_jobs.issubset(self._current_batch_load_jobs):
+                continue
             any_jid = next(iter(req_status.transfer_jobs))
             assert self._jobs[any_jid].is_store
             self._current_batch_jobs_to_flush.update(req_status.transfer_jobs)
@@ -1294,8 +1301,8 @@ class OffloadingConnectorScheduler:
         return False, None
 
     # Replay boundaries (resend and extension) sit within this many blocks of
-    # the request's last full block; older positions only held checkpoints of
-    # earlier turns that the newest boundary supersedes.
+    # the request's last full block. Older request-owned checkpoints can be
+    # superseded, but prefix hits and shared junctions still serve siblings.
     _KEEP_TAIL_STATE_BLOCKS = 3
 
     def _demote_superseded_states(self, req_status: RequestOffloadState) -> None:
@@ -1305,10 +1312,19 @@ class OffloadingConnectorScheduler:
                 continue
             if not group_config.requires_exact_boundary_source:
                 continue
-            group_keys = req_status.group_states[group_config.group_idx].offload_keys
+            group_state = req_status.group_states[group_config.group_idx]
+            group_keys = group_state.offload_keys
             keep = self._KEEP_TAIL_STATE_BLOCKS
-            if len(group_keys) > keep:
-                keys.extend(group_keys[: len(group_keys) - keep])
+            # Hits include GPU and external prefixes. The junction is already
+            # on the usable state boundary, including the EAGLE/MTP shift.
+            junction = req_status.req.shared_prefix_boundary
+            for block_idx in range(group_state.num_hit_blocks, len(group_keys) - keep):
+                if (
+                    junction
+                    and (block_idx + 1) * group_config.offloaded_block_size == junction
+                ):
+                    continue
+                keys.append(group_keys[block_idx])
         if keys:
             self.manager.demote(keys, req_status.req_context)
 

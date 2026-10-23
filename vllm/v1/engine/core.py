@@ -896,6 +896,11 @@ class EngineCore:
                 documentation of pause_scheduler method.
         """
 
+        # Check every worker before aborting requests or clearing caches.
+        # An allocator import/binding failure must leave serving untouched.
+        if level >= 1:
+            self.model_executor.check_sleep()
+
         # Pause scheduler before sleeping.
         clear_prefix_cache = level >= 1
         pause_future = self.pause_scheduler(mode=mode, clear_cache=clear_prefix_cache)

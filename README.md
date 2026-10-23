@@ -438,12 +438,13 @@ config["max_position_embeddings"] = 524288   # the drafter's layers keep a 2048-
 EOF
 ```
 
-**2. Set one more environment variable and replace the MTP speculative config** in step 4.
-Keep every other argument, including `--no-async-scheduling`. With Docker, pass the
-variable with `-e`.
+**2. Set two more environment variables and replace the MTP speculative config** in step 4.
+Keep every other argument, including `--no-async-scheduling`. With Docker, pass both with
+`-e VLLM_SM70_DFLASH2_FUSED_QKV_PACK=1 -e VLLM_V2_CUDAGRAPH_MEM_MIB=1500`.
 
 ```bash
 export VLLM_SM70_DFLASH2_FUSED_QKV_PACK=1
+export VLLM_V2_CUDAGRAPH_MEM_MIB=1500    # CUDA graph reserve for DFlash2 (the profile's 700 fits MTP4 only)
 
   --speculative-config '{"method": "dflash",
       "model": "<path to the DFlash2 draft model>",
@@ -475,6 +476,12 @@ Settings:
   kernel. It acts only on SM70 with DFlash2. In tests, greedy output was bit-identical and
   throughput about 1.5% higher. Like every `VLLM_*` variable, it is part of the
   torch.compile key, so a deployment that sets it builds its own compile cache.
+- **`VLLM_V2_CUDAGRAPH_MEM_MIB=1500` is required with DFlash2.** It reserves GPU memory
+  for the CUDA graphs before the KV pool is sized. The ReVolta profile sets 700 MiB, which
+  fits MTP4's graphs (0.68 GiB per GPU); DFlash2's graphs take about 1.37–1.39 GiB. Without
+  the setting, the KV pool takes about 0.7 GiB per GPU too much. Concurrent long prompts
+  that fill a mixed prefill step (up to the 8192-token batch budget), with or without
+  decoding, can then run out of GPU memory. An explicit value overrides the profile. Alternative: `--gpu-memory-utilization 0.93`.
 - **`dflash_concurrency_drafts`** maps a number of running requests (the threshold) to the
   number of drafts the target verifies per request (the width). The drafter still drafts
   7 tokens. With `{"4": 3, "5": 4}`, one to three running requests verify all 7 drafts,
@@ -500,8 +507,9 @@ What to expect:
   batch sizes.
 - English code and reasoning gain the most. Chinese is slower than MTP4 in almost every
   measured case: the drafter was trained on English. Very long prompts also favour MTP4.
-- The GPU KV pool is about a quarter larger than with MTP4 (1,445,845 vs 1,153,143 tokens on
-  the reference setup).
+- The GPU KV pool is about 10% larger than with MTP4: about 1.27 million tokens with the
+  graph reserve (1,268,831 measured), against 1,153,143. Without the
+  reserve it reached 1,445,845 tokens, but that setting can run out of memory.
 - On a replay of real agent sessions (one request at a time, sampling, long reasoning),
   DFlash2 and MTP4 were on par: 0.97× the MTP4 speed (95% interval 0.90–1.01). DFlash2
   was ahead on tool calls, answers and contexts up to 64K, and behind in reasoning, above
@@ -781,7 +789,11 @@ GGUF are outside the build.
   untrusted text.
 - **DFlash2.** Optional and off by default; see
   [DFlash2 speculative decoding](#dflash2-speculative-decoding-optional) for its settings
-  and limits.
+  and limits. Set `VLLM_V2_CUDAGRAPH_MEM_MIB=1500` with it. The profile's CUDA graph reserve
+  is sized for MTP4. Without the larger reserve, concurrent long prompts that fill a mixed
+  prefill step (up to the 8192-token batch budget), with or without decoding, ran out of
+  GPU memory on the reference setup. Sizing the reserve per
+  speculative method is planned for the next release.
 - **Chat template.** The model's own chat template rejects a system message that is not
   the first message (`System message must be at the beginning.`). Agent stacks that send
   several system messages need to merge them.

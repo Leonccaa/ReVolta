@@ -41,6 +41,10 @@ AWQ_DEFAULTS = {
     # Measured for the AWQ TP4 graph pool.
     "VLLM_V2_CUDAGRAPH_MEM_MIB": "700",
 }
+# DFlash2 also captures the eight-row verify graphs with their tail and width
+# shapes and the drafter's graphs: 1.37-1.39 GiB on the AWQ TP4 pool. With the
+# MTP figure the excess goes to the KV cache and a large mixed step can OOM.
+AWQ_DFLASH_DEFAULTS = {"VLLM_V2_CUDAGRAPH_MEM_MIB": "1500"}
 NVFP4_DEFAULTS = {
     "VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE": "1",
     "VLLM_SM70_NVFP4_QWEN38_MOE_RAW_GROUPED_DECODE": "1",
@@ -272,11 +276,14 @@ def apply_revolta_profile(
     *,
     is_sm70: bool,
     interconnect_mode: InterconnectMode = "pex_p2p",
+    speculative_method: str | None = None,
 ) -> bool:
     """Apply before config defaults and before model/native module imports.
 
     Pass frontend_interconnect_mode(); this does not select an AR backend.
-    Explicit environment overrides always win, including in no_p2p.
+    Explicit environment overrides always win, including in no_p2p. A later
+    call may refine a value this profile wrote (EngineArgs may not know the
+    speculative method that VllmConfig resolves).
     """
     import torch
 
@@ -293,13 +300,15 @@ def apply_revolta_profile(
     defaults = dict(COMMON_DEFAULTS)
     if getattr(model_config, "quantization", None) == "awq":
         defaults.update(AWQ_DEFAULTS)
+        if speculative_method == "dflash":
+            defaults.update(AWQ_DFLASH_DEFAULTS)
     elif has_nvfp4_weights(model_config):
         defaults.update(NVFP4_DEFAULTS)
     if interconnect_mode != "no_p2p":
         defaults.update(CUSTOM_AR_DEFAULTS)
     for name, value in defaults.items():
-        if name not in os.environ:
-            os.environ.setdefault(name, value)
+        if name not in os.environ or _PROFILE_VALUES.get(name) == os.environ[name]:
+            os.environ[name] = value
             _PROFILE_VALUES[name] = value
         elif name not in _PROFILE_VALUES and name not in _INHERITED_PROVENANCE:
             # Also recognize programmatic overrides supplied after import vllm

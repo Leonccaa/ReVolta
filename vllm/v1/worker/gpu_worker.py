@@ -879,6 +879,17 @@ class Worker(WorkerBase):
                 GiB(diff),
                 100 * diff / max(cuda_graph_memory_bytes, 1),
             )
+            if (
+                self.use_v2_model_runner
+                and envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
+            ):
+                from vllm.v1.worker.gpu.cudagraph_utils import (
+                    warn_if_graphs_outgrew_reserve,
+                )
+
+                warn_if_graphs_outgrew_reserve(
+                    cuda_graph_memory_bytes, self.cudagraph_memory_estimate
+                )
 
         if self.cache_config.kv_cache_memory_bytes is None and hasattr(
             self, "peak_activation_memory"

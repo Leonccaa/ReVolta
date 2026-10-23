@@ -5,9 +5,9 @@
 Run Qwen3.8 Flash-Next for text, images, and video, with an OpenAI-compatible API.
 
 > [!TIP]
-> **New in 0.1.2: DFlash2 speculative decoding on V100.** As far as we know, ReVolta is the
-> first engine to run [DFlash2](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2) on
-> Volta (SM70) GPUs: V100 attention kernels and CUDA graphs for the drafter and the
+> **New in 0.1.2: DFlash2 speculative decoding on V100.** ReVolta runs the
+> [incoai DFlash2 drafter](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2) on
+> Volta (SM70) GPUs, with V100 attention kernels and CUDA graphs for the drafter and the
 > verifier, in the 512K-context setup with prefix caching and CPU KV offload. On one
 > request it writes English code at **201 tokens/s instead of 163** with MTP4 (1.23×), and
 > the GPU KV pool grows by about 10% to 1.27 million tokens. Our own server runs it. MTP4

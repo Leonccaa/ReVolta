@@ -12,8 +12,9 @@ The generic Transformers RGB converter does not itself composite alpha.
 
 ## Defaults and overrides
 
-Unspecified modality counts default to **8 images, 1 video and 1 audio item**;
-other inherited modalities retain 999. `--limit-mm-per-prompt` overrides each
+Unspecified modality counts default to **8 images, 1 video and 1 audio item**
+(except on V100 with FlashAttention-V100, see below); other inherited modalities
+retain 999. `--limit-mm-per-prompt` overrides each
 specified modality; a zero count disables that modality. For example,
 `--limit-mm-per-prompt '{"video": 1}'` also limits images to 8 and audio to 1.
 The 8-image limit counts the **whole request**, including images in historical
@@ -21,6 +22,22 @@ chat messages, rather than only the latest message.
 These limits remain independent of the aggregate raw-media item ceiling below.
 Embedding-only and UUID-only cache references do not fetch raw media and are
 outside the raw-media byte accounting; their existing frontend limits still apply.
+
+**V100 with FlashAttention-V100 (the ReVolta target).** On pre-Ampere GPUs with the
+V100 attention path (`VLLM_SM70_FLASH_ATTN_V100=1`, the default, and the attention
+backend unset, `FLASH_ATTN_V100` or `FLASHINFER_SM70`), the engine replaces the
+defaults above:
+
+- Without `--limit-mm-per-prompt`, it allows **1 image and no video** per request and
+  logs `Using SM70 Flash-V100 multimodal default: image=1, video=0`. A second image is
+  rejected with `At most 1 image(s) may be provided in one prompt`.
+- With `--limit-mm-per-prompt` that leaves out `"video"`, video is set to 0 (disabled).
+  Other modalities the value leaves out keep the defaults above.
+
+Set `--limit-mm-per-prompt` explicitly and include `"video"`. The README launch command
+uses `--limit-mm-per-prompt '{"image": 16, "video": 1, "audio": 16}'`. This behaviour is
+the same as in 0.1.0 and 0.1.1. Aligning the V100 default with 8 images, 1 video and
+1 audio item is planned after validation. The image resizing below applies on V100 too.
 
 Qwen4Exp defaults to **1,048,576 pixels (1024 × 1024 in area) per image** at the
 HF image processor. Larger decoded images are resized, rather than rejected by

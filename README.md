@@ -331,10 +331,11 @@ Notes:
 - `cpu_bytes_to_use` is the total for all four workers (48 GiB = 12 GiB per worker).
 - **Keep `--limit-mm-per-prompt` on V100.** With FlashAttention-V100, the engine allows
   1 image and no video per request without it, and a value that leaves out `"video"`
-  disables video. `{"image": 16, "video": 1, "audio": 16}` keeps the reference
-  deployment's limits; a lower image count leaves more host memory for bursts of large
-  images. Large images are resized either way (see
-  [Support and known limits](#support-and-known-limits)).
+  disables video. This V100 default is kept in 0.1.2. `{"image": 16, "video": 1,
+  "audio": 16}` keeps the reference deployment's limits. To use the generic 0.1.2 default
+  instead, set `--limit-mm-per-prompt '{"image": 8, "video": 1, "audio": 1}'`; a lower
+  image count leaves more host memory for bursts of large images. Large images are resized
+  either way (see [Support and known limits](#support-and-known-limits)).
 - `--structured-outputs-config '{"backend": "xgrammar"}'` pins the structured-output
   backend. With `auto`, the engine keeps the backend chosen for its first
   structured-output request.
@@ -798,16 +799,20 @@ GGUF are outside the build.
   the first message (`System message must be at the beginning.`). Agent stacks that send
   several system messages need to merge them.
 - **Allocator.** Keep `NCCL_GRAPH_REGISTER=0` with expandable allocator segments.
+- **Sleep level 2.** Not supported on the reference setup (128 GiB host, PLE tables in host
+  memory): it needs about 87 GiB of free host memory for the model buffers while about
+  63 GiB is available. Sleep level 1 works.
 - **Small KV pools.** Startup rejects a pool that cannot hold one maximum-length request.
 - **Prompt log-probabilities.** Long prompts are processed in chunks;
   `prompt_logprobs=20` measured about 2.3× ordinary prefill time.
 - **Standard NVFP4 draft.** Use the FP8 `mtp-fp8/` draft from the Uncensored AWQ
   repository, as in validation.
 - **Media.** On V100 with FlashAttention-V100, the default without `--limit-mm-per-prompt`
-  is 1 image and no video, and a value that leaves out `"video"` disables video. Set the
-  option explicitly, as in the launch command. Aligning this default with the generic one
-  is planned after validation. On other hardware and backends, the defaults are 8 images,
-  1 video, and 1 audio item per whole request. Images in historical chat messages count
+  is 1 image and no video, and a value that leaves out `"video"` disables video. This
+  behaviour is kept. Set the option explicitly and include `"video"`: for example
+  `'{"image": 8, "video": 1, "audio": 1}'` (the generic 0.1.2 default) or
+  `'{"image": 16, "video": 1, "audio": 16}'` (the launch command above). On other hardware
+  and backends, the defaults are 8 images, 1 video, and 1 audio item per whole request. Images in historical chat messages count
   toward the image limit. Qwen4Exp
   resizes large images to at most 1,048,576 pixels using HF's existing resize
   logic. Small text can become blurry; alignment near the area boundary can also

@@ -34,10 +34,14 @@ defaults above:
 - With `--limit-mm-per-prompt` that leaves out `"video"`, video is set to 0 (disabled).
   Other modalities the value leaves out keep the defaults above.
 
-Set `--limit-mm-per-prompt` explicitly and include `"video"`. The README launch command
-uses `--limit-mm-per-prompt '{"image": 16, "video": 1, "audio": 16}'`. This behaviour is
-the same as in 0.1.0 and 0.1.1. Aligning the V100 default with 8 images, 1 video and
-1 audio item is planned after validation. The image resizing below applies on V100 too.
+This V100 behaviour is the same as in 0.1.0 and 0.1.1, and 0.1.2 keeps it. Set
+`--limit-mm-per-prompt` explicitly and include `"video"`. To copy:
+
+- the generic 0.1.2 default: `--limit-mm-per-prompt '{"image": 8, "video": 1, "audio": 1}'`;
+- the reference deployment, as in the README launch command:
+  `--limit-mm-per-prompt '{"image": 16, "video": 1, "audio": 16}'`.
+
+The image resizing below applies on V100 too.
 
 Qwen4Exp defaults to **1,048,576 pixels (1024 × 1024 in area) per image** at the
 HF image processor. Larger decoded images are resized, rather than rejected by

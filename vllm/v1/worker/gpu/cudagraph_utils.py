@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import math
 import os
 from collections import defaultdict
 from collections.abc import Callable
@@ -72,6 +73,30 @@ def get_explicit_cudagraph_memory_reserve(cudagraph_mode: CUDAGraphMode) -> int:
         reserve_bytes / 2**30,
     )
     return reserve_bytes
+
+
+def warn_if_graphs_outgrew_reserve(actual_bytes: int, reserve_bytes: int) -> int:
+    """Warn when captured graphs exceed the reserve the KV cache was sized with.
+
+    V2 reserves graph memory before capture. Whatever the graphs take beyond it
+    comes out of the runtime headroom, so a large mixed batch can then run out
+    of memory. Returns the suggested VLLM_V2_CUDAGRAPH_MEM_MIB, or 0 when the
+    reserve covered the graphs within max(64 MiB, 5%).
+    """
+    excess = actual_bytes - reserve_bytes
+    if excess <= max(64 << 20, reserve_bytes // 20):
+        return 0
+    suggested_mib = math.ceil(actual_bytes * 1.05 / (100 << 20)) * 100
+    logger.warning(
+        "CUDA graphs took %.2f GiB, %.2f GiB more than the reserve the KV cache "
+        "was sized with; a large mixed batch may run out of memory. Set "
+        "VLLM_V2_CUDAGRAPH_MEM_MIB to at least %d or lower "
+        "--gpu-memory-utilization.",
+        actual_bytes / 2**30,
+        excess / 2**30,
+        suggested_mib,
+    )
+    return suggested_mib
 
 
 def _worker_device_is_pre_ampere() -> bool:

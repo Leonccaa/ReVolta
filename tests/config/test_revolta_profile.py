@@ -568,3 +568,94 @@ def test_audit_logs_disabled_profile(profile):
     audit = json.loads(profile.profile_audit(enabled=False))
     assert not audit["enabled"]
     assert all(row["source"] == "upstream_default" for row in audit["values"].values())
+
+
+GRAPH_RESERVE = "VLLM_V2_CUDAGRAPH_MEM_MIB"
+
+
+@pytest.mark.parametrize(
+    ("quantization", "method", "expected"),
+    [
+        ("awq", None, "700"),
+        ("awq", "mtp", "700"),
+        ("awq", "dflash", "1500"),
+        ("modelopt_fp4", "dflash", "700"),
+    ],
+)
+def test_graph_reserve_follows_the_speculative_method(
+    profile, quantization, method, expected
+):
+    assert profile.apply_revolta_profile(
+        model(quantization), 4, is_sm70=True, speculative_method=method
+    )
+    assert os.environ[GRAPH_RESERVE] == expected
+    row = json.loads(profile.profile_audit(enabled=True))["values"][GRAPH_RESERVE]
+    assert row == {"value": expected, "source": "profile"}
+
+
+def test_dflash_leaves_every_other_default_alone(profile):
+    assert profile.apply_revolta_profile(
+        model(), 4, is_sm70=True, speculative_method="dflash"
+    )
+    dflash = dict(os.environ)
+    os.environ.clear()
+    assert profile.apply_revolta_profile(
+        model(), 4, is_sm70=True, speculative_method="mtp"
+    )
+    changed = {
+        k
+        for k in set(dflash) | set(os.environ)
+        if k not in ("PYTEST_CURRENT_TEST", "VLLM_REVOLTA_PROFILE_PROVENANCE")
+        and dflash.get(k) != os.environ.get(k)
+    }
+    assert changed == {GRAPH_RESERVE}
+
+
+def test_later_call_refines_only_the_profile_value(profile, monkeypatch):
+    # EngineArgs without the method, then VllmConfig with the resolved one.
+    assert profile.apply_revolta_profile(model(), 4, is_sm70=True)
+    assert os.environ[GRAPH_RESERVE] == "700"
+    assert profile.apply_revolta_profile(
+        model(), 4, is_sm70=True, speculative_method="dflash"
+    )
+    assert os.environ[GRAPH_RESERVE] == "1500"
+    row = json.loads(profile.profile_audit(enabled=True))["values"][GRAPH_RESERVE]
+    assert row == {"value": "1500", "source": "profile"}
+
+
+def test_explicit_graph_reserve_wins_over_dflash(profile, monkeypatch):
+    monkeypatch.setenv(GRAPH_RESERVE, "900")
+    assert profile.apply_revolta_profile(
+        model(), 4, is_sm70=True, speculative_method="dflash"
+    )
+    assert os.environ[GRAPH_RESERVE] == "900"
+    row = json.loads(profile.profile_audit(enabled=True))["values"][GRAPH_RESERVE]
+    assert row == {"value": "900", "source": "environment"}
+
+
+def test_engineargs_profile_receives_the_speculative_method(profile, monkeypatch):
+    seen = []
+
+    def apply(*args, **kwargs):
+        seen.append(kwargs["speculative_method"])
+        return profile.apply_revolta_profile(*args, **kwargs)
+
+    run_engineargs_early_policy(profile, monkeypatch, apply)
+    assert seen == ["mtp"]
+    assert os.environ[GRAPH_RESERVE] == "700"
+
+
+def test_vllmconfig_profile_receives_the_speculative_method():
+    import vllm.config.vllm as config_module
+
+    assert config_module.__file__ is not None
+    tree = ast.parse(Path(config_module.__file__).read_text())
+    (call,) = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "apply_revolta_profile"
+    ]
+    value = next(k.value for k in call.keywords if k.arg == "speculative_method")
+    assert ast.unparse(value) == "getattr(self.speculative_config, 'method', None)"

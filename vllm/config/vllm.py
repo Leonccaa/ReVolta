@@ -1682,6 +1682,7 @@ class VllmConfig:
             interconnect_mode=frontend_interconnect_mode(
                 disable_custom_all_reduce=self.parallel_config.disable_custom_all_reduce
             ),
+            speculative_method=getattr(self.speculative_config, "method", None),
         )
         apply_revolta_kernel_profile(
             self.kernel_config, enabled=revolta_profile_enabled

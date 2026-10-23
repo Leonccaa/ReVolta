@@ -6460,6 +6460,17 @@ class GPUModelRunner(
 
                 mm_hash = mm_feature.identifier
                 encoder_output = self.encoder_cache.get(mm_hash, None)
+                if (
+                    encoder_output is None
+                    and shift_computed_tokens > 0
+                    and start_pos
+                    >= req_state.num_computed_tokens + num_scheduled_tokens
+                ):
+                    # Only the drafter lookahead reaches this item, and the
+                    # scheduler did not encode it yet (it could not fit in
+                    # the encoder cache). Keep the placeholder token embedding
+                    # for that position; this only affects the draft.
+                    continue
                 assert encoder_output is not None, f"Encoder cache miss for {mm_hash}."
 
                 if (is_embed := pos_info.is_embed) is not None:

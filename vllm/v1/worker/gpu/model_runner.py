@@ -1959,6 +1959,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_batch.query_start_loc_np,
                 prefill_lens,
                 computed_prefill_lens + 1,  # +1 to consider the skew in eagle
+                num_lookahead_tokens=1,
             )
 
         # Postprocess results and update request states.

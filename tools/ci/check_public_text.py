@@ -14,6 +14,10 @@ PR adds.
   so they skip that part. Its matches are reported by location only, so the
   log does not reveal the pattern.
 
+- Credential formats (GitHub, Hugging Face and PyPI tokens, "sk-" API
+  keys, AWS access keys, private key blocks) are reported by location only,
+  so the log does not repeat a leaked value.
+
 It also warns about hard-wrapped paragraphs in the PR body: GitHub shows a
 single newline there as a line break.
 
@@ -41,6 +45,16 @@ GENERIC = {
     ),
     "mount path": re.compile(r"(?<![\w.])/mnt/[A-Za-z0-9_]"),
 }
+CREDENTIALS = {
+    "GitHub token": re.compile(
+        r"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})"
+    ),
+    "Hugging Face token": re.compile(r"\bhf_[A-Za-z0-9]{30,}"),
+    "PyPI token": re.compile(r"\bpypi-AgE[A-Za-z0-9_-]{20,}"),
+    "API key": re.compile(r"\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,}"),
+    "AWS access key": re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    "private key": re.compile(r"-----BEGIN (?:[A-Z]+ )*PRIVATE KEY-----"),
+}
 
 errors = 0
 
@@ -67,6 +81,10 @@ def scan(
             if m:
                 errors += 1
                 print(f"::error title=Public text::{where}: {what} {m.group(0)!r}")
+        for what, pattern in CREDENTIALS.items():
+            if pattern.search(line):
+                errors += 1
+                print(f"::error title=Public text::{where}: looks like a {what}")
         if denylist is not None and denylist.search(line):
             errors += 1
             print(f"::error title=Public text::{where}: matches the private denylist")

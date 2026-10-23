@@ -23,6 +23,13 @@ virtual environment managed with `uv`. Give exact commands and results, plus
 hardware and configuration for runtime checks. State what remains untested;
 GPU validation may require maintainer hardware.
 
+Every pull request runs these checks, and all must pass before it can merge:
+public text (no private addresses, local paths or credentials in the PR, its
+commit messages or added lines), sign-off and added files (every commit signed
+off; no added file over 1 MiB unless listed in
+`.github/large-files-allowed.txt`), pre-commit on the changed files, and mypy
+for Python 3.12.
+
 Disclose AI assistance. The submitting human must review every changed line,
 understand the change, run relevant checks, and be able to explain the result.
 Contributions are subject to the [Code of Conduct](CODE_OF_CONDUCT.md).

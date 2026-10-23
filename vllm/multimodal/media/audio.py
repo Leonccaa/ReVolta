@@ -145,9 +145,9 @@ def load_audio(
         logger.error("Failed to load audio via soundfile: %r", exc)
     except soundfile.LibsndfileError as exc:
         # Only fall back for known format-detection failures.
-        # Re-raise anything else (e.g. corrupt but recognised format).
+        # Anything else (e.g. corrupt but recognised format) is a client error.
         if exc.code not in _BAD_SF_CODES:
-            raise
+            raise ValueError("Invalid or unsupported audio file.") from exc
     # soundfile may have advanced the BytesIO seek position before failing;
     # reset it so PyAV can read from the beginning.
     if isinstance(path, BytesIO):

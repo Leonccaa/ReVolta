@@ -118,6 +118,14 @@ class Sm70DFlash2Config:
     sharded_context_fc: bool | None = None
     """Policy for sharded context fc; None retains automatic qualification."""
 
+    sharded_selector_codebook: bool = False
+    """Shard the candidate selector's two vocabulary codebooks across TP ranks.
+
+    Each rank keeps 1/TP of the rows; a lookup reads the owner's rows and an
+    all-reduce of exact zeros returns them bitwise on every rank. Saves
+    (TP-1)/TP of the codebooks' memory per GPU for one small all-reduce per
+    codebook and draft step. Configuration only, no environment alias."""
+
     qualified: bool = Field(default=False, init=False, repr=False)
     """Whether the retained complete-model validation boundary matches."""
 
@@ -162,9 +170,13 @@ class Sm70DFlash2Config:
         self.resolved = True
 
     def graph_options(self) -> dict[str, bool | None]:
-        return {
+        options = {
             field: getattr(self, field) for field in SM70_DFLASH2_LEGACY_FIELDS.values()
         }
+        # Listed only when on, so the default keeps existing compile keys.
+        if self.sharded_selector_codebook:
+            options["sharded_selector_codebook"] = True
+        return options
 
 
 def capture_sm70_dflash2_config(vllm_config=None) -> Sm70DFlash2Config | None:

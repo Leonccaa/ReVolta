@@ -57,9 +57,11 @@ from vllm.model_executor.models.qwen3_dflash import (
     _dflash_layer_causal,
 )
 from vllm.model_executor.models.qwen3_dflash2 import (
+    CandidateSelector,
     DFlash2Qwen3ForCausalLM,
     DFlash2Qwen3Model,
     _grouped_conv,
+    _lookup_sharded_rows,
     _score_edges,
 )
 from vllm.v1.attention.backend import AttentionType
@@ -1046,6 +1048,102 @@ def test_selector_edges_match_sequential_reference():
         )
 
     torch.testing.assert_close(actual, expected)
+
+
+def _shards(table: torch.Tensor, tp: int) -> tuple[list[torch.Tensor], int]:
+    rows = -(-table.shape[0] // tp)
+    shards = []
+    for rank in range(tp):
+        shard = torch.zeros(rows, table.shape[1], dtype=table.dtype)
+        part = table[rank * rows : (rank + 1) * rows]
+        shard[: part.shape[0]] = part
+        shards.append(shard)
+    return shards, rows
+
+
+@pytest.mark.parametrize("vocab", [17, 20, 248320])
+def test_sharded_codebook_lookup_is_bitwise(vocab):
+    # Four ranks, each with a contiguous slice; the last slice is padded.
+    torch.manual_seed(2)
+    table = torch.randn(vocab, 8).to(torch.float16)
+    ids = torch.cat(
+        (torch.tensor([0, vocab - 1]), torch.randint(vocab, (2, 7, 16)).flatten())
+    ).view(-1, 2)
+    shards, rows = _shards(table, 4)
+    partial = [
+        _lookup_sharded_rows(shard, ids, rank * rows, reduce=lambda x: x)
+        for rank, shard in enumerate(shards)
+    ]
+    total = partial[0]
+    for rows_from_rank in partial[1:]:
+        total = total + rows_from_rank
+    assert torch.equal(total, table[ids])
+    # Every row has exactly one owner.
+    owners = sum((p != 0).any(-1).to(torch.int64) for p in partial)
+    assert int(owners.max()) <= 1
+
+
+def test_sharded_codebook_scores_match_replicated_bitwise():
+    torch.manual_seed(3)
+    batch, steps, top_k, rank, vocab = 8, 7, 16, 32, 101
+    predecessors = torch.randn(vocab, rank).to(torch.float16)
+    successors = torch.randn(vocab, rank).to(torch.float16)
+    candidate_ids = torch.randint(vocab, (batch, steps, top_k))
+    unary = torch.randn(batch, steps, top_k)
+    hidden = torch.randn(batch, steps, rank).to(torch.float16)
+    anchors = torch.randint(vocab, (batch,))
+    expected = _score_edges(
+        predecessors, successors, candidate_ids, unary, hidden, anchors, top_k
+    )
+    shard_tables = {
+        id(predecessors): _shards(predecessors, 4)[0],
+        id(successors): _shards(successors, 4)[0],
+    }
+    rows = -(-vocab // 4)
+
+    def lookup(table, ids):
+        total = None
+        for rank_index, shard in enumerate(shard_tables[id(table)]):
+            part = _lookup_sharded_rows(
+                shard, ids, rank_index * rows, reduce=lambda x: x
+            )
+            total = part if total is None else total + part
+        return total
+
+    actual = _score_edges(
+        predecessors,
+        successors,
+        candidate_ids,
+        unary,
+        hidden,
+        anchors,
+        top_k,
+        vocab,
+        lookup,
+    )
+    assert torch.equal(actual, expected)
+
+
+def test_sharded_codebook_loader_takes_its_rows():
+    loaded = torch.arange(17 * 3, dtype=torch.float32).view(17, 3)
+    for rank, start in enumerate((0, 5, 10, 15)):
+        owner = SimpleNamespace(vocab_start=start, rows_per_rank=5)
+        param = torch.nn.Parameter(torch.full((5, 3), -1.0), requires_grad=False)
+        CandidateSelector._load_rows(owner, param, loaded)
+        expected = torch.zeros(5, 3)
+        part = loaded[start : start + 5]
+        expected[: part.shape[0]] = part
+        assert torch.equal(param.data, expected), rank
+
+
+def test_sharded_selector_codebook_is_off_and_out_of_the_compile_key_by_default():
+    from vllm.config.sm70_dflash2 import Sm70DFlash2Config
+
+    policy = Sm70DFlash2Config()
+    assert policy.sharded_selector_codebook is False
+    assert "sharded_selector_codebook" not in policy.graph_options()
+    policy = Sm70DFlash2Config(sharded_selector_codebook=True)
+    assert policy.graph_options()["sharded_selector_codebook"] is True
 
 
 def _stub_base(monkeypatch: pytest.MonkeyPatch, draft_logits):

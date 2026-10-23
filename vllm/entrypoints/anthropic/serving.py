@@ -13,6 +13,7 @@ from collections.abc import AsyncGenerator
 from typing import TYPE_CHECKING, Any
 
 from fastapi import Request
+from pydantic import ValidationError
 
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.anthropic.protocol import (
@@ -27,6 +28,7 @@ from vllm.entrypoints.anthropic.protocol import (
     AnthropicOutputConfig,
     AnthropicStreamEvent,
     AnthropicUsage,
+    translate_error_type,
 )
 from vllm.entrypoints.chat_utils import ChatTemplateContentFormatOption
 from vllm.entrypoints.logger import RequestLogger
@@ -39,6 +41,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
 )
 from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
 from vllm.entrypoints.openai.engine.protocol import (
+    ErrorInfo,
     ErrorResponse,
     JsonSchemaResponseFormat,
     ResponseFormat,
@@ -60,6 +63,16 @@ def _tool_input(arguments: str) -> dict[str, Any] | None:
     except json.JSONDecodeError:
         return None
     return tool_input if isinstance(tool_input, dict) else None
+
+
+class _StreamError(Exception):
+    """Carries the ErrorInfo from an upstream ErrorResponse through the stream
+    converter so the SSE ``error`` event can reuse its status code to pick the
+    Anthropic error type."""
+
+    def __init__(self, error_info: ErrorInfo) -> None:
+        super().__init__(error_info.message)
+        self.error_info = error_info
 
 
 def wrap_data_with_event(data: str, event: str):
@@ -685,9 +698,23 @@ class AnthropicServingMessages(OpenAIServingChat):
                         )
                         yield wrap_data_with_event(data, "message_stop")
                     else:
-                        origin_chunk = ChatCompletionStreamResponse.model_validate_json(
-                            data_str
-                        )
+                        try:
+                            origin_chunk = (
+                                ChatCompletionStreamResponse.model_validate_json(
+                                    data_str
+                                )
+                            )
+                        except ValidationError as parse_error:
+                            # The chat stream reports failures in-band as an
+                            # ErrorResponse payload; surface it with its own
+                            # status code instead of a parse error.
+                            try:
+                                error_chunk = ErrorResponse.model_validate_json(
+                                    data_str
+                                )
+                            except ValidationError:
+                                raise parse_error from None
+                            raise _StreamError(error_chunk.error) from None
 
                         if first_item:
                             chunk = AnthropicStreamEvent(
@@ -880,7 +907,7 @@ class AnthropicServingMessages(OpenAIServingChat):
                     error_response = AnthropicStreamEvent(
                         type="error",
                         error=AnthropicError(
-                            type="internal_error",
+                            type="api_error",
                             message="Invalid data format received",
                         ),
                     )
@@ -889,9 +916,18 @@ class AnthropicServingMessages(OpenAIServingChat):
 
         except Exception as e:
             logger.exception("Error in message stream converter.")
+            if isinstance(e, _StreamError):
+                # Reuse the ErrorResponse status code so the SSE error event
+                # uses the same Anthropic vocabulary as the non-streaming
+                # path (e.g. overloaded_error, not_found_error).
+                error_type = translate_error_type(e.error_info.code)
+                message = e.error_info.message
+            else:
+                error_type = "api_error"
+                message = str(e)
             error_response = AnthropicStreamEvent(
                 type="error",
-                error=AnthropicError(type="internal_error", message=str(e)),
+                error=AnthropicError(type=error_type, message=message),
             )
             data = error_response.model_dump_json(exclude_unset=True)
             yield wrap_data_with_event(data, "error")

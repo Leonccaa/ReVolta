@@ -1,0 +1,59 @@
+name: checks
+
+on:
+  pull_request:
+    branches: [main, prod, "release/**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  public-text:
+    name: public text
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - run: python -m pip install regex==2026.9.29
+      - name: Scan the PR text, commit messages and added lines
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          DENYLIST: ${{ secrets.PUBLIC_TEXT_DENYLIST }}
+        run: python tools/ci/check_public_text.py
+
+  pre-commit:
+    name: pre-commit (changed files)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - run: python -m pip install pre-commit==4.6.2
+      - name: Run pre-commit on the files the PR changes
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          # mypy-local needs the full development environment; the hooks below
+          # are the ones contributors run before committing.
+          SKIP: mypy-local
+        run: |
+          mb=$(git merge-base "$BASE" "$HEAD")
+          pre-commit run --show-diff-on-failure --color=always --from-ref "$mb" --to-ref "$HEAD"

@@ -398,3 +398,70 @@ def test_release_default_is_one_switch(sm70, monkeypatch):
     assert sm70(_replay_config()) is False
     explicit = SimpleNamespace(spec_state_replay=True, fused_gdn_verify=False)
     assert sm70(_replay_config(**{"speculative_config.sm70_dflash2": explicit})) is True
+
+
+_FUSED_TABLE_CODE = r"""
+import torch
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.worker.gpu.gdn_spec_replay import (
+    build_replay_state_indices,
+    build_replay_state_table,
+)
+
+gen = torch.Generator().manual_seed(0)
+cases = 0
+for block_size in (4, 7, 16, 1664):
+    for num_columns in (5, 9):
+        for _ in range(60):
+            batch = int(torch.randint(1, 9, (1,), generator=gen))
+            # Graph padding rows past the batch.
+            num_reqs = batch + int(torch.randint(0, 3, (1,), generator=gen))
+            spec_mask = torch.rand(batch, generator=gen) < 0.8
+            spec_rows = torch.nonzero(spec_mask).reshape(-1)
+            num_spec = spec_rows.numel()
+            num_states = 16
+            idx_mapping = torch.randperm(num_states, generator=gen)[:batch]
+            idx_mapping = idx_mapping.to(torch.int32)
+            num_sampled = torch.randint(0, num_columns, (batch,), generator=gen)
+            num_sampled = num_sampled.to(torch.int32)
+            computed = torch.randint(1, 6 * block_size, (num_states,), generator=gen)
+            computed = computed.to(torch.int32)
+            width = 6 * block_size // block_size + 2
+            block_table = torch.randint(0, 10_000, (batch, width), generator=gen)
+            block_table = block_table.to(torch.int32)
+            # Strided base ids (the verifier table's column 0); padding is PAD.
+            state_table = torch.randint(0, 10_000, (num_reqs, 3), generator=gen)
+            state_table = state_table.to(torch.int32)
+            state_table[num_spec:, 0] = PAD_SLOT_ID
+            base = state_table[:, 0]
+            req = idx_mapping[spec_rows].long()
+            want = build_replay_state_indices(
+                base_state_ids=base, num_reqs=num_reqs, num_columns=num_columns,
+                spec_rows=spec_rows, num_accepted=num_sampled[spec_rows],
+                num_computed_tokens=computed[req], block_table=block_table,
+                block_size=block_size)
+            got = build_replay_state_table(
+                base_state_ids=base, num_reqs=num_reqs, num_columns=num_columns,
+                spec_rows=spec_rows, idx_mapping=idx_mapping, num_sampled=num_sampled,
+                num_computed_tokens=computed, block_table=block_table,
+                block_size=block_size)
+            assert torch.equal(got, want), (got, want, block_size, num_columns)
+            cases += 1
+print("FUSED_TABLE_EQUAL", cases)
+"""
+
+
+def test_fused_replay_table_equals_the_torch_reference():
+    import os
+    import subprocess
+    import sys
+
+    env = dict(os.environ, TRITON_INTERPRET="1")
+    result = subprocess.run(
+        [sys.executable, "-c", _FUSED_TABLE_CODE],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    print(result.stdout[-2000:], result.stderr[-4000:])
+    assert result.returncode == 0 and "FUSED_TABLE_EQUAL 480" in result.stdout

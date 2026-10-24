@@ -14,8 +14,9 @@ Run Qwen3.8 Flash-Next for text, images, and video, with an OpenAI-compatible AP
 > stays the default: Chinese text and eight concurrent requests are still faster with MTP4.
 > [How to enable it](#dflash2-speculative-decoding-optional).
 
-- **GPU-resident context:** a KV pool of about 1.14 million tokens with 8-bit KV, room for
-  two 512K or four 256K contexts.
+- **GPU-resident context:** a KV pool of up to about **1.3 million tokens** with 8-bit KV
+  (1.27 million with the default AWQ checkpoint and DFlash2), room for two 512K or four
+  256K contexts; see [Weight and KV formats](#weight-and-kv-formats).
 - **Weight formats:** standard AWQ, NVFP4, and NVIDIA FP4-Local.
 - **KV formats:** FP8 E4M3, FP16, and INT8.
 - **Speculative decoding:** native MTP4 by default, or DFlash2 with the incoai drafter
@@ -609,16 +610,19 @@ throughput was not measured.
 V100 stores compressed weights and KV, then converts them to FP16 for computation.
 The default is AWQ g32 with E4M3 KV.
 
-| Format | GPU KV capacity, tokens | KL vs base BF16 | Top-1 agreement |
-| --- | ---: | ---: | ---: |
-| Uncensored AWQ g32 + E4M3 KV | 1,140,505 | 0.0273 | 96.63% |
-| Standard NVFP4 + E4M3 KV | 1,232,435 | 0.0303 | 96.36% |
-| NVIDIA FP4-Local + E4M3 KV | 1,295,637 | 0.0380 | 95.91% |
-| Uncensored AWQ g32 + INT8 KV | 1,127,578 | 0.0267 | Within 0.1 percentage point of E4M3 |
+| Format | GPU KV capacity with MTP4, tokens | GPU KV capacity with DFlash2, tokens | KL vs base BF16 | Top-1 agreement |
+| --- | ---: | ---: | ---: | ---: |
+| Uncensored AWQ g32 + E4M3 KV | 1,140,505 | 1,268,831 | 0.0273 | 96.63% |
+| Standard NVFP4 + E4M3 KV | 1,232,435 | | 0.0303 | 96.36% |
+| NVIDIA FP4-Local + E4M3 KV | 1,295,637 | | 0.0380 | 95.91% |
+| Uncensored AWQ g32 + INT8 KV | 1,127,578 | | 0.0267 | Within 0.1 percentage point of E4M3 |
 
-These are candidate-build measurements on the reference machine, with 8 sequences
-and a 512K maximum request length. All rows use the same base BF16 reference.
-The Uncensored rows include the effect of fine-tuning as well as quantization.
+Measured on the reference machine, with 8 sequences and a 512K maximum request length.
+MTP4: 0.1.0 candidate builds (0.1.2 with MTP4 has 1,153,143 tokens in the first row).
+DFlash2: the 0.1.2 release build with the recommended DFlash2 config, including
+`VLLM_V2_CUDAGRAPH_MEM_MIB=1500`. Empty cells are not measured yet. All KL and top-1
+values use the same base BF16 reference. The Uncensored rows include the effect of
+fine-tuning as well as quantization.
 
 ### E4M3 KV
 

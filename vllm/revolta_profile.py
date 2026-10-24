@@ -41,10 +41,16 @@ AWQ_DEFAULTS = {
     # Measured for the AWQ TP4 graph pool.
     "VLLM_V2_CUDAGRAPH_MEM_MIB": "700",
 }
-# DFlash2 also captures the eight-row verify graphs with their tail and width
-# shapes and the drafter's graphs: 1.37-1.39 GiB on the AWQ TP4 pool. With the
-# MTP figure the excess goes to the KV cache and a large mixed step can OOM.
-AWQ_DFLASH_DEFAULTS = {"VLLM_V2_CUDAGRAPH_MEM_MIB": "1500"}
+# DFlash2 also captures the eight-row verify graphs with their width shapes and
+# the drafter's graphs. The single-request verifier tail graphs add about
+# 0.3 GiB without a measured speed gain on the AWQ TP4 profile (greedy tokens
+# identical, 256K decode unchanged), so DFlash2 leaves them off; the remaining
+# pool is about 1.1 GiB. With the MTP figure the excess goes to the KV cache
+# and a large mixed step can OOM.
+AWQ_DFLASH_DEFAULTS = {
+    "VLLM_V2_CUDAGRAPH_MEM_MIB": "1200",
+    "VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS": "0",
+}
 NVFP4_DEFAULTS = {
     "VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE": "1",
     "VLLM_SM70_NVFP4_QWEN38_MOE_RAW_GROUPED_DECODE": "1",

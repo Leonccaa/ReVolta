@@ -383,3 +383,18 @@ def test_replay_verifier_rejects_layouts_the_kernel_cannot_read():
     assert not reads(layer, qkv.float())  # type: ignore[arg-type]
     assert not reads(layer, qkv.t())  # type: ignore[arg-type]
     assert not reads(layer, None)  # type: ignore[arg-type]
+
+
+def test_release_default_is_one_switch(sm70, monkeypatch):
+    import vllm.config.vllm as config_module
+    from vllm.config import sm70_dflash2
+
+    # The release default lives in one constant, read through vllm.config.vllm.
+    assert sm70_dflash2.SM70_DFLASH2_SPEC_STATE_REPLAY_DEFAULT is True
+    assert config_module.SM70_DFLASH2_SPEC_STATE_REPLAY_DEFAULT is True
+    assert sm70(_replay_config()) is True
+    monkeypatch.setattr(config_module, "SM70_DFLASH2_SPEC_STATE_REPLAY_DEFAULT", False)
+    # Default off: None resolves off, explicit True still turns replay on.
+    assert sm70(_replay_config()) is False
+    explicit = SimpleNamespace(spec_state_replay=True, fused_gdn_verify=False)
+    assert sm70(_replay_config(**{"speculative_config.sm70_dflash2": explicit})) is True

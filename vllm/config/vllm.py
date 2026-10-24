@@ -47,7 +47,10 @@ from .parallel import ParallelConfig
 from .profiler import ProfilerConfig
 from .reasoning import ReasoningConfig
 from .scheduler import SchedulerConfig
-from .sm70_dflash2 import SM70_DFLASH2_VERIFIER_DEFAULTS
+from .sm70_dflash2 import (
+    SM70_DFLASH2_SPEC_STATE_REPLAY_DEFAULT,
+    SM70_DFLASH2_VERIFIER_DEFAULTS,
+)
 from .speculative import (
     EagleModelTypes,
     NgramGPUTypes,
@@ -272,6 +275,8 @@ def _resolve_gdn_spec_state_replay(vllm_config: "VllmConfig") -> bool:
         return False
     policy = spec.sm70_dflash2
     if policy.spec_state_replay is False:
+        return False
+    if policy.spec_state_replay is None and not SM70_DFLASH2_SPEC_STATE_REPLAY_DEFAULT:
         return False
     if policy.fused_gdn_verify:
         if policy.spec_state_replay is True:

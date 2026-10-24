@@ -28,62 +28,17 @@ Run Qwen3.8 Flash-Next for text, images, and video, with an OpenAI-compatible AP
 
 ### Speed
 
-Best measured output speed in tokens/s for each number of concurrent requests (512-token
-responses, thinking off). The speculative method, the prompts and the metric differ between
-cells; the notes below give each one.
+Best measured output speed in tokens/s, 512-token responses. The breakdown by speculative
+method (MTP4 and DFlash2) and prompt type is in [Performance](#performance).
 
 | System | 1 request | 2 | 4 | 8 |
 | --- | ---: | ---: | ---: | ---: |
 | 4 × V100 32 GB PCIe, one PCIe switch, P2P, no NVLink (our reference) | **201** | **275** | **262** | **505** |
 | 4 × V100-SXM2 32 GB, NV2 NVLink mesh ([community result](https://github.com/Leonccaa/ReVolta/issues/2), 0.1.1) | **191** | **231** | **338** | **525** |
 
-- **Reference system, 1, 2 and 8 requests:** DFlash2 with the recommended config, greedy.
-  1 request: English code, decode speed after the first token (MTP4: 163). 2 and 8
-  requests: code prompts (8 per category), aggregate output (MTP4: 232 and 492); measured
-  with the 0.1.2 code before the final width ladder, with the same verify widths at 2 and
-  8 requests. Chinese text is slower with DFlash2; see the DFlash2 table below.
-- **Reference system, 4 requests, and the everyday mix:** MTP4 with three mixed prompts,
-  total output across all requests including the wait for the first token: 152.5, 167.2,
-  262.2 and 383.6 tokens/s at 1, 2, 4 and 8 requests. C2 varies between runs; see
-  [Performance](#performance).
-- **NVLink:** measured by [@jttdev](https://github.com/jttdev) with MTP4, the same three
-  prompts, base AWQ checkpoint, 512K views, `--gpu-memory-utilization 0.95` and a 16 GiB
-  CPU KV pool (`cpu_bytes_to_use`); each level runs 3 requests per stream. 1 request:
-  decode speed on the reasoning prompt (code 178, Chinese 123). 2 and 8 requests: total
-  output. 4 requests: 338 at 262K context, `--gpu-memory-utilization 0.925` and a 32 GiB
-  pool without the prefill-pressure flags (330 with the settings above). 0.1.0 measured the same in the same session, with
-  byte-identical greedy outputs.
-- **CPU KV pool size on NVLink:** at 262K context and `--gpu-memory-utilization 0.925`, eight
-  requests gave 513 tokens/s with a 16 GiB pool and 497 with 32 GiB, about 3% less; one to
-  four requests did not change. An earlier 8-request gap against a hand-built 1Cat-vLLM
-  setup did not reproduce in later runs.
-- **NVLink memory and retrieval:** the GPU KV pool at 0.95 and 512K is 1,095,050 tokens with
-  0.1.1 (1,100,286 with 0.1.0); 0.1.1 creates the NCCL communicators before memory
-  profiling, which probably explains the 0.5% difference. Two concurrent retrieval
-  requests of about 490K tokens each found all three needles (0.1.0); 0.1.1 found 3 of 3
-  at 91K and 244K tokens.
-
-**Prefill (reference system).**
-
 | Cold prompt | 8K tokens | 131K tokens |
 | --- | ---: | ---: |
 | Prefill throughput, tok/s | 3,510 | 3,020 |
-
-**DFlash2 vs MTP4 (new in 0.1.2).** Reference system, recommended DFlash2 config, greedy,
-512-token responses. One request: decode speed; four and eight requests: total output.
-
-| Requests and prompt | DFlash2, tok/s | MTP4, tok/s |
-| --- | ---: | ---: |
-| 1, English code | 201 | 163 |
-| 1, English reasoning | 195 | 163 |
-| 1, agent code | 181 | 158 |
-| 1, Chinese explanation | 101 | 105 |
-| 1, Chinese chat | 85 | 100 |
-| 4, mixed | 238 | 236 |
-| 8, mixed | 331 | 357 |
-
-On a replay of real agent sessions (one request at a time, sampling), the two were on par
-(0.97× the MTP4 speed). See [DFlash2 speculative decoding](#dflash2-speculative-decoding-optional).
 
 ### Coming back to a document
 
@@ -723,6 +678,8 @@ no QSA E4M3 KV scales; download the calibrated 24-scale pack
 
 ## Performance
 
+### Reference system, MTP4
+
 Release configuration: Uncensored AWQ g32, E4M3 KV, TP4 + DCP2, MTP4, on the reference system.
 
 | Metric | 0.1.0 |
@@ -756,6 +713,60 @@ first token.
 Version-to-version speed comparisons use the same machine, configuration, and test
 window. Other context lengths, media workloads, and thinking-mode outputs can give
 different results.
+
+### DFlash2 against MTP4
+
+Reference system, recommended DFlash2 config (new in 0.1.2), greedy, thinking off,
+512-token responses. One request: decode speed after the first token. Four and eight
+mixed requests: total output. With one prompt per category, the per-category values are
+indicative.
+
+| Requests and prompt | DFlash2, tok/s | MTP4, tok/s |
+| --- | ---: | ---: |
+| 1, English code | 201 | 163 |
+| 1, English reasoning | 195 | 163 |
+| 1, agent code | 181 | 158 |
+| 1, Chinese explanation | 101 | 105 |
+| 1, Chinese chat | 85 | 100 |
+| 4, mixed | 238 | 236 |
+| 8, mixed | 331 | 357 |
+
+By prompt category, 8 prompts per category, aggregate output; measured with the 0.1.2
+code before the final width ladder, with the same verify widths at 2 and 8 requests:
+
+| Requests | DFlash2: code / English / Chinese | MTP4: code / English / Chinese |
+| --- | ---: | ---: |
+| 2 | 275 / 203 / 129 | 232 / 193 / 141 |
+| 8 | 505 / 336 / 285 | 492 / 332 / 327 |
+
+English code and reasoning gain the most; Chinese text is slower with DFlash2. On a
+replay of real agent sessions (one request at a time, sampling), the two were on par
+(0.97× the MTP4 speed). See [DFlash2 speculative decoding](#dflash2-speculative-decoding-optional).
+
+### NVLink (community result)
+
+[@jttdev](https://github.com/jttdev) measured 0.1.1 on 4 × V100-SXM2 32 GB with an NV2
+NVLink mesh ([#2](https://github.com/Leonccaa/ReVolta/issues/2)): MTP4, the same three
+prompts, base AWQ checkpoint, 512K views, `--gpu-memory-utilization 0.95` and a 16 GiB CPU
+KV pool (`cpu_bytes_to_use`). Each level runs 3 requests per stream.
+
+| | 1 request: code / Chinese / reasoning (decode) | 2 | 4 | 8 |
+| --- | ---: | ---: | ---: | ---: |
+| 0.1.1 | 178 / 123 / 191 | 231.3 | 329.5 | 524.6 |
+| 0.1.0, same session | 179 / 123 / 191 | 231.0 | 329.0 | 519.2 |
+
+- The greedy outputs of both releases were byte-identical.
+- At 262K context, `--gpu-memory-utilization 0.925` and a 32 GiB CPU pool, four requests
+  reached 338 without the prefill-pressure flags (333 with them).
+- The CPU KV pool size affects eight requests: in that 262K setup, eight requests gave
+  513 tokens/s with a 16 GiB pool and 497 with 32 GiB, about 3% less; one to four
+  requests did not change. An earlier 8-request gap against a hand-built 1Cat-vLLM setup
+  did not reproduce in later runs.
+- The GPU KV pool at 0.95 and 512K is 1,095,050 tokens with 0.1.1 (1,100,286 with 0.1.0);
+  0.1.1 creates the NCCL communicators before memory profiling, which probably explains
+  the 0.5% difference.
+- Two concurrent retrieval requests of about 490K tokens each found all three needles
+  (0.1.0); 0.1.1 found 3 of 3 at 91K and 244K tokens.
 
 ## Quality measurements
 

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Admission for independent EAGLE/MTP KV storage, before loading weights."""
+"""Admission for speculative KV storage, before loading weights."""
 
 from typing import TYPE_CHECKING
 
@@ -35,12 +35,35 @@ def dflash_draft_cache_dtype(config: "VllmConfig") -> "CacheDType":
 
 def validate_speculative_kv_cache_dtype(config: "VllmConfig") -> None:
     spec = config.speculative_config
-    if (
-        config.is_speculative_draft
-        or spec is None
-        or spec.method not in ("eagle", "eagle3", "mtp")
-        or spec.kv_cache_dtype is None
-    ):
+    if config.is_speculative_draft or spec is None:
+        return
+    if spec.method == "dflash" and dflash_draft_cache_dtype(config) == "int8":
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        # Auto selection can use Flash-V100, the in-tree backend admitting
+        # planar INT8. Its dense reader cannot handle sliding windows or sinks;
+        # non-causal full attention alone is supported by that reader.
+        if spec.attention_backend in (None, AttentionBackendEnum.FLASH_ATTN_V100):
+            draft = spec.draft_model_config
+            hf_config = getattr(draft, "hf_config", None)
+            dflash_config = getattr(hf_config, "dflash_config", None) or {}
+            sliding = dflash_config.get("use_swa", False) or (
+                "sliding_attention" in (getattr(hf_config, "layer_types", None) or [])
+            )
+            sinks = dflash_config.get(
+                "attention_sink_bias",
+                getattr(hf_config, "add_swa_attention_sink_bias", False),
+            )
+            if sliding or sinks:
+                raise ValueError(
+                    "DFlash/DFlash2 draft attention with sliding windows or "
+                    "attention sinks does not support INT8 KV with "
+                    "FLASH_ATTN_V100. Use --kv-cache-dtype fp8_e4m3, float16, "
+                    "or auto, or set speculative_config.kv_cache_dtype to "
+                    "'float16'/'auto' for a separate FP16 draft cache. "
+                    "Use method='mtp' for MTP speculative decoding with INT8 KV."
+                )
+    if spec.method not in ("eagle", "eagle3", "mtp") or spec.kv_cache_dtype is None:
         return
     target = config.model_config
     draft = spec.draft_model_config

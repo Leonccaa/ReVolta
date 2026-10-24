@@ -8,7 +8,9 @@ import pytest
 import torch
 
 from vllm.config.speculative import SpeculativeConfig
+from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.v1.attention.backends.gdn_attn import select_gdn_state_block_ids
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID, mamba_get_block_table_tensor
 from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.worker.gpu.gdn_spec_replay import build_replay_state_indices
@@ -242,3 +244,79 @@ def test_replay_never_applies_to_other_methods(sm70):
     assert sm70(config) is False
     config.speculative_config = None
     assert sm70(config) is False
+
+
+class _GDNLayer:
+    # The MambaBase attributes get_kv_cache_spec reads, with the TP4 GDN shapes.
+    mamba_type = MambaAttentionBackendEnum.GDN_ATTN
+    is_kv_cache_tp_replicated = False
+
+    def get_state_shape(self):
+        return ((3, 2560), (12, 128, 128))
+
+    def get_state_dtype(self):
+        return (torch.float16, torch.float32)
+
+
+def _gdn_spec(sm70, method, num_tokens):
+    """The GDN layer's KV cache spec after VllmConfig resolution, for one method."""
+    config = _replay_config()
+    if method is None:
+        config.speculative_config = None
+    else:
+        spec = config.speculative_config
+        spec.method = method
+        spec.num_speculative_tokens = num_tokens
+        spec.use_dflash = lambda: method == "dflash"
+        spec.num_speculative_state_tokens = (
+            lambda: SpeculativeConfig.num_speculative_state_tokens(spec)  # type: ignore[arg-type]
+        )
+        spec.num_speculative_state_blocks = (
+            lambda: SpeculativeConfig.num_speculative_state_blocks(spec)  # type: ignore[arg-type]
+        )
+        spec.gdn_spec_state_replay = sm70(config)
+    config.cache_config.mamba_block_size = BS
+    config.cache_config.mamba_page_size_padded = None
+    return MambaBase.get_kv_cache_spec(_GDNLayer(), config)  # type: ignore[arg-type]
+
+
+def _legacy_gdn_spec(num_speculative_blocks):
+    # What get_kv_cache_spec built before replay existed.
+    layer = _GDNLayer()
+    return MambaSpec(
+        shapes=layer.get_state_shape(),
+        dtypes=layer.get_state_dtype(),
+        block_size=BS,
+        page_size_padded=None,
+        mamba_type=layer.mamba_type,
+        tp_replicated=False,
+        mamba_cache_mode="align",
+        num_speculative_blocks=num_speculative_blocks,
+    )
+
+
+@pytest.mark.parametrize(("method", "num_tokens"), [("mtp", 4), ("mtp", 1), (None, 0)])
+def test_mtp_and_no_speculation_keep_their_gdn_allocation(sm70, method, num_tokens):
+    # Every other condition for replay holds; only the method differs from DFlash.
+    spec = _gdn_spec(sm70, method, num_tokens)
+    assert spec == _legacy_gdn_spec(num_tokens)
+    assert spec.num_replayed_speculative_blocks == 0
+    config = SimpleNamespace(cache_config=SimpleNamespace(mamba_cache_mode="align"))
+    page = spec.page_size_bytes
+    assert spec.max_memory_usage_bytes(config) == (2 + num_tokens) * page
+    # The state table keeps one real block per speculative position.
+    block_table = torch.arange(2 * 12, dtype=torch.int32).view(2, 12) + 100
+    seq_lens = torch.tensor([BS + 1, 3 * BS])
+    out = mamba_get_block_table_tensor(block_table, seq_lens, spec, "align")
+    legacy = mamba_get_block_table_tensor(
+        block_table, seq_lens, _legacy_gdn_spec(num_tokens), "align"
+    )
+    assert torch.equal(out, legacy)
+    assert (out != PAD_SLOT_ID).all()
+
+
+def test_dflash_replay_is_the_only_change_to_gdn_allocation(sm70):
+    spec = _gdn_spec(sm70, "dflash", 7)
+    assert spec.num_speculative_blocks == 0
+    assert spec.num_replayed_speculative_blocks == 7
+    assert spec.page_size_bytes == _legacy_gdn_spec(7).page_size_bytes

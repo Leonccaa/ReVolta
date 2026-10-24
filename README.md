@@ -28,21 +28,37 @@ Run Qwen3.8 Flash-Next for text, images, and video, with an OpenAI-compatible AP
 
 ### Speed
 
-Reference system: 4 × V100 32 GB PCIe, one PCIe switch, P2P enabled, no NVLink.
+Total output throughput in tokens/s, across all requests and including the wait for the
+first token: 512-token responses, thinking off, MTP4 on.
 
-| Concurrent requests | 1 | 2 | 4 | 8 |
+| System | 1 request | 2 | 4 | 8 |
 | --- | ---: | ---: | ---: | ---: |
-| Total output throughput, tok/s | 152.5 | 167.2 | 262.2 | 383.6 |
+| 4 × V100 32 GB PCIe, one PCIe switch, P2P, no NVLink (our reference) | 152.5 | 167.2 | 262.2 | 383.6 |
+| 4 × V100-SXM2 32 GB, NV2 NVLink mesh ([community result](https://github.com/Leonccaa/ReVolta/issues/2), 0.1.1) | – | 231.3 | 329.5 | 524.6 |
 
-These are totals across all requests, including the wait for the first token:
-512-token responses, thinking off, MTP4 on. C2 varies between runs; see
-[Performance](#performance).
+- **Reference system:** C2 varies between runs; see [Performance](#performance).
+- **NVLink:** measured by [@jttdev](https://github.com/jttdev) with the same three prompts,
+  base AWQ checkpoint, 512K views, `--gpu-memory-utilization 0.95` and a 16 GiB CPU KV pool
+  (`cpu_bytes_to_use`); each level runs 3 requests per stream. For one request only the
+  decode speed was reported: 178 tokens/s (code), 123 (Chinese) and 191 (reasoning). 0.1.0 measured the same in the same
+  session, with byte-identical greedy outputs.
+- **CPU KV pool size on NVLink:** at 262K context and `--gpu-memory-utilization 0.925`, eight
+  requests gave 513 tokens/s with a 16 GiB pool and 497 with 32 GiB, about 3% less; one to
+  four requests did not change. An earlier 8-request gap against a hand-built 1Cat-vLLM
+  setup did not reproduce in later runs.
+- **NVLink memory and retrieval:** the GPU KV pool at 0.95 and 512K is 1,095,050 tokens with
+  0.1.1 (1,100,286 with 0.1.0); 0.1.1 creates the NCCL communicators before memory
+  profiling, which probably explains the 0.5% difference. Two concurrent retrieval
+  requests of about 490K tokens each found all three needles (0.1.0); 0.1.1 found 3 of 3
+  at 91K and 244K tokens.
+
+**Prefill (reference system).**
 
 | Cold prompt | 8K tokens | 131K tokens |
 | --- | ---: | ---: |
 | Prefill throughput, tok/s | 3,510 | 3,020 |
 
-**DFlash2 vs MTP4 (new in 0.1.2).** Same system, recommended DFlash2 config, greedy,
+**DFlash2 vs MTP4 (new in 0.1.2).** Reference system, recommended DFlash2 config, greedy,
 512-token responses. One request: decode speed; four and eight requests: total output.
 
 | Requests and prompt | DFlash2, tok/s | MTP4, tok/s |
@@ -57,31 +73,6 @@ These are totals across all requests, including the wait for the first token:
 
 On a replay of real agent sessions (one request at a time, sampling), the two were on par
 (0.97× the MTP4 speed). See [DFlash2 speculative decoding](#dflash2-speculative-decoding-optional).
-
-**NVLink (community result).** [@jttdev](https://github.com/jttdev) measured 0.1.1 on
-4 × V100-SXM2 32 GB with an NV2 NVLink mesh ([#2](https://github.com/Leonccaa/ReVolta/issues/2)):
-the same three prompts, 512-token responses, thinking off, MTP4, 512K views, base AWQ
-checkpoint, `--gpu-memory-utilization 0.95` and a 16 GiB CPU KV pool
-(`cpu_bytes_to_use`). The method differs slightly from ours: each level runs 3 requests
-per stream.
-
-| Concurrent requests | 2 | 4 | 8 |
-| --- | ---: | ---: | ---: |
-| Total output throughput, tok/s | 231.3 | 329.5 | 524.6 |
-
-One request decodes at 178 tokens/s (code), 123 (Chinese) and 191 (reasoning).
-
-- 0.1.0 measured the same in the same session (ratio 1.00 / 1.00 / 1.00 / 1.01 for one to
-  eight requests), and the greedy outputs of both releases were byte-identical.
-- The size of the CPU KV pool affects eight requests on this system: at 262K context and
-  `--gpu-memory-utilization 0.925`, eight requests gave 513 tokens/s with a 16 GiB pool and
-  497 with 32 GiB, about 3% less; one to four requests did not change. An earlier
-  8-request gap against a hand-built 1Cat-vLLM setup did not reproduce in later runs.
-- The GPU KV pool at 0.95 and 512K is 1,095,050 tokens with 0.1.1 (1,100,286 with 0.1.0).
-  0.1.1 creates the NCCL communicators before memory profiling, so their memory is now
-  counted; that probably explains the 0.5% difference.
-- Two concurrent retrieval requests of about 490K tokens each found all three needles
-  (0.1.0); 0.1.1 found 3 of 3 at 91K and 244K tokens.
 
 ### Coming back to a document
 

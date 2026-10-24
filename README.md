@@ -20,28 +20,39 @@ Run Qwen3.8 Flash-Next for text, images, and video, with an OpenAI-compatible AP
 - **KV formats:** FP8 E4M3, FP16, and INT8.
 - **Speculative decoding:** native MTP4 by default, or DFlash2 with the incoai drafter
   (new in 0.1.2, up to 1.23× on one request).
-- **Speed:** about **525 tokens/s total output at 8 concurrent requests** on NVLink
-  ([community result](https://github.com/Leonccaa/ReVolta/issues/2), 0.1.1), about 380 on our PCIe reference (512-token responses, MTP4 on).
+- **Speed:** up to **525 tokens/s total output at 8 concurrent requests** on NVLink
+  ([community result](https://github.com/Leonccaa/ReVolta/issues/2), 0.1.1), and up to 505 on our PCIe reference (code prompts, DFlash2); see [Speed](#speed).
 - **Cache reuse:** CPU memory and disk offload; a cached 32K document answered in **1.28 s vs 10.06 s** when recomputed.
 
 ## Measurements
 
 ### Speed
 
-Total output throughput in tokens/s, across all requests and including the wait for the
-first token: 512-token responses, thinking off, MTP4 on.
+Best measured output speed in tokens/s for each number of concurrent requests (512-token
+responses, thinking off). The speculative method, the prompts and the metric differ between
+cells; the notes below give each one.
 
 | System | 1 request | 2 | 4 | 8 |
 | --- | ---: | ---: | ---: | ---: |
-| 4 × V100 32 GB PCIe, one PCIe switch, P2P, no NVLink (our reference) | 152.5 | 167.2 | 262.2 | 383.6 |
-| 4 × V100-SXM2 32 GB, NV2 NVLink mesh ([community result](https://github.com/Leonccaa/ReVolta/issues/2), 0.1.1) | – | 231.3 | 329.5 | 524.6 |
+| 4 × V100 32 GB PCIe, one PCIe switch, P2P, no NVLink (our reference) | **201** | **275** | **262** | **505** |
+| 4 × V100-SXM2 32 GB, NV2 NVLink mesh ([community result](https://github.com/Leonccaa/ReVolta/issues/2), 0.1.1) | **191** | **231** | **338** | **525** |
 
-- **Reference system:** C2 varies between runs; see [Performance](#performance).
-- **NVLink:** measured by [@jttdev](https://github.com/jttdev) with the same three prompts,
-  base AWQ checkpoint, 512K views, `--gpu-memory-utilization 0.95` and a 16 GiB CPU KV pool
-  (`cpu_bytes_to_use`); each level runs 3 requests per stream. For one request only the
-  decode speed was reported: 178 tokens/s (code), 123 (Chinese) and 191 (reasoning). 0.1.0 measured the same in the same
-  session, with byte-identical greedy outputs.
+- **Reference system, 1, 2 and 8 requests:** DFlash2 with the recommended config, greedy.
+  1 request: English code, decode speed after the first token (MTP4: 163). 2 and 8
+  requests: code prompts (8 per category), aggregate output (MTP4: 232 and 492); measured
+  with the 0.1.2 code before the final width ladder, with the same verify widths at 2 and
+  8 requests. Chinese text is slower with DFlash2; see the DFlash2 table below.
+- **Reference system, 4 requests, and the everyday mix:** MTP4 with three mixed prompts,
+  total output across all requests including the wait for the first token: 152.5, 167.2,
+  262.2 and 383.6 tokens/s at 1, 2, 4 and 8 requests. C2 varies between runs; see
+  [Performance](#performance).
+- **NVLink:** measured by [@jttdev](https://github.com/jttdev) with MTP4, the same three
+  prompts, base AWQ checkpoint, 512K views, `--gpu-memory-utilization 0.95` and a 16 GiB
+  CPU KV pool (`cpu_bytes_to_use`); each level runs 3 requests per stream. 1 request:
+  decode speed on the reasoning prompt (code 178, Chinese 123). 2 and 8 requests: total
+  output. 4 requests: 338 at 262K context, `--gpu-memory-utilization 0.925` and a 32 GiB
+  pool without the prefill-pressure flags (330 with the settings above). 0.1.0 measured the same in the same session, with
+  byte-identical greedy outputs.
 - **CPU KV pool size on NVLink:** at 262K context and `--gpu-memory-utilization 0.925`, eight
   requests gave 513 tokens/s with a 16 GiB pool and 497 with 32 GiB, about 3% less; one to
   four requests did not change. An earlier 8-request gap against a hand-built 1Cat-vLLM

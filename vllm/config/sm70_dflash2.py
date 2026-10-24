@@ -122,7 +122,8 @@ class Sm70DFlash2Config:
     """Shard the candidate selector's two vocabulary codebooks across TP ranks.
 
     Each rank keeps 1/TP of the rows; a lookup reads the owner's rows and an
-    all-reduce of exact zeros returns them bitwise on every rank. Saves
+    all-reduce preserves finite nonzero values bitwise on every rank. Zero
+    values are equal, but their sign may change when adding +0. Saves
     (TP-1)/TP of the codebooks' memory per GPU for one small all-reduce per
     codebook and draft step. On by default; set False to keep full codebooks
     on every rank. Configuration only, no environment alias."""

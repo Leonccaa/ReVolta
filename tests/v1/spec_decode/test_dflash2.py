@@ -1061,8 +1061,20 @@ def _shards(table: torch.Tensor, tp: int) -> tuple[list[torch.Tensor], int]:
     return shards, rows
 
 
-@pytest.mark.parametrize("vocab", [17, 20, 248320])
-def test_sharded_codebook_lookup_is_bitwise(vocab):
+def _assert_nonzero_bits_and_zero_values(actual, expected):
+    # Adding +0 from non-owners can clear the sign of an owner's -0.
+    integer_dtype = {torch.float16: torch.int16, torch.float32: torch.int32}[
+        expected.dtype
+    ]
+    nonzero = expected != 0
+    assert torch.equal(
+        actual[nonzero].view(integer_dtype), expected[nonzero].view(integer_dtype)
+    )
+    assert torch.equal(actual[~nonzero], expected[~nonzero])
+
+
+@pytest.mark.parametrize("vocab", [3, 17, 20, 248320])
+def test_sharded_codebook_lookup_preserves_nonzero_bits(vocab):
     # Four ranks, each with a contiguous slice; the last slice is padded.
     torch.manual_seed(2)
     table = torch.randn(vocab, 8).to(torch.float16)
@@ -1077,13 +1089,13 @@ def test_sharded_codebook_lookup_is_bitwise(vocab):
     total = partial[0]
     for rows_from_rank in partial[1:]:
         total = total + rows_from_rank
-    assert torch.equal(total, table[ids])
+    _assert_nonzero_bits_and_zero_values(total, table[ids])
     # Every row has exactly one owner.
     owners = sum((p != 0).any(-1).to(torch.int64) for p in partial)
     assert int(owners.max()) <= 1
 
 
-def test_sharded_codebook_scores_match_replicated_bitwise():
+def test_sharded_codebook_scores_preserve_nonzero_bits():
     torch.manual_seed(3)
     batch, steps, top_k, rank, vocab = 8, 7, 16, 32, 101
     predecessors = torch.randn(vocab, rank).to(torch.float16)
@@ -1121,19 +1133,50 @@ def test_sharded_codebook_scores_match_replicated_bitwise():
         vocab,
         lookup,
     )
-    assert torch.equal(actual, expected)
+    _assert_nonzero_bits_and_zero_values(actual, expected)
 
 
-def test_sharded_codebook_loader_takes_its_rows():
-    loaded = torch.arange(17 * 3, dtype=torch.float32).view(17, 3)
-    for rank, start in enumerate((0, 5, 10, 15)):
-        owner = SimpleNamespace(vocab_start=start, rows_per_rank=5)
-        param = torch.nn.Parameter(torch.full((5, 3), -1.0), requires_grad=False)
+@pytest.mark.parametrize("vocab,tp", [(3, 4), (17, 4), (20, 4)])
+def test_sharded_codebook_loader_takes_its_rows(vocab, tp):
+    loaded = torch.arange(vocab * 3, dtype=torch.float32).view(vocab, 3)
+    rows = -(-vocab // tp)
+    for rank in range(tp):
+        start = rank * rows
+        owner = SimpleNamespace(vocab_size=vocab, vocab_start=start, rows_per_rank=rows)
+        param = torch.nn.Parameter(torch.full((rows, 3), -1.0), requires_grad=False)
         CandidateSelector._load_rows(owner, param, loaded)
-        expected = torch.zeros(5, 3)
-        part = loaded[start : start + 5]
+        expected = torch.zeros(rows, 3)
+        part = loaded[start : start + rows]
         expected[: part.shape[0]] = part
-        assert torch.equal(param.data, expected), rank
+        assert torch.equal(param.data.view(torch.int32), expected.view(torch.int32)), (
+            rank
+        )
+
+
+@pytest.mark.parametrize("shape", [(16, 3), (18, 3), (17, 1), (17,), (17, 3, 1)])
+def test_sharded_codebook_loader_rejects_invalid_full_shape_before_writing(shape):
+    owner = SimpleNamespace(vocab_size=17, vocab_start=15, rows_per_rank=5)
+    param = torch.nn.Parameter(torch.full((5, 3), -1.0), requires_grad=False)
+    before = param.detach().clone()
+    with pytest.raises(ValueError, match=r"Expected full codebook shape.*17, 3.*got"):
+        CandidateSelector._load_rows(owner, param, torch.ones(shape))
+    assert torch.equal(param, before)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_sharded_lookup_preserves_nonzero_bits_but_can_clear_negative_zero(dtype):
+    table = torch.tensor([[1.0, -0.0], [-0.0, -2.0], [3.0, -0.0]], dtype=dtype)
+    ids = torch.arange(3)
+    shards, rows = _shards(table, 4)
+    partial = [
+        _lookup_sharded_rows(shard, ids, rank * rows, reduce=lambda x: x)
+        for rank, shard in enumerate(shards)
+    ]
+    actual = sum(partial[1:], partial[0])
+    _assert_nonzero_bits_and_zero_values(actual, table)
+    negative_zero = (table == 0) & torch.signbit(table)
+    assert negative_zero.any()
+    assert not torch.signbit(actual[negative_zero]).any()
 
 
 def test_sharded_selector_codebook_is_on_by_default_and_can_be_turned_off():

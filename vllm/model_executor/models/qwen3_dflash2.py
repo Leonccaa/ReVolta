@@ -286,7 +286,8 @@ def _lookup_sharded_rows(
     """Rows of a vocabulary-sharded table, replicated on every rank.
 
     Each id has exactly one owner; the other ranks contribute exact zeros, so
-    the sum returns the owner's row bitwise.
+    the sum preserves finite nonzero values bitwise. Zero values are equal,
+    but adding +0 from non-owners may clear an owner's negative-zero sign.
     """
     local = ids - start
     owned = (local >= 0) & (local < table.shape[0])
@@ -393,6 +394,12 @@ class CandidateSelector(nn.Module):
         return _lookup_rows(table, ids)
 
     def _load_rows(self, param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
+        expected_shape = (self.vocab_size, param.shape[1])
+        if tuple(loaded_weight.shape) != expected_shape:
+            raise ValueError(
+                f"Expected full codebook shape {expected_shape}, "
+                f"got {tuple(loaded_weight.shape)}"
+            )
         rows = loaded_weight[self.vocab_start : self.vocab_start + self.rows_per_rank]
         param.data.zero_()
         param.data[: rows.shape[0]].copy_(rows)

@@ -47,8 +47,13 @@ def validate_speculative_kv_cache_dtype(config: "VllmConfig") -> None:
             draft = spec.draft_model_config
             hf_config = getattr(draft, "hf_config", None)
             dflash_config = getattr(hf_config, "dflash_config", None) or {}
-            sliding = dflash_config.get("use_swa", False) or (
-                "sliding_attention" in (getattr(hf_config, "layer_types", None) or [])
+            sliding = (
+                dflash_config.get("use_swa", False)
+                or "sliding_attention"
+                in (getattr(hf_config, "layer_types", None) or [])
+                # Attention inherits the target cache's window when a draft
+                # layer does not declare a per-layer window.
+                or config.cache_config.sliding_window is not None
             )
             sinks = dflash_config.get(
                 "attention_sink_bias",

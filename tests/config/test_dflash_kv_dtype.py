@@ -54,7 +54,7 @@ def sm70(monkeypatch):
     "target_dtype,draft_dtype",
     [("int8", None), ("int8", "int8"), ("fp8_e4m3", "int8")],
 )
-@pytest.mark.parametrize("feature", ["swa", "layer_types", "sink"])
+@pytest.mark.parametrize("feature", ["swa", "layer_types", "sink", "cache_window"])
 def test_dflash_int8_rejected_before_loading_weights(
     backend, target_dtype, draft_dtype, feature
 ):
@@ -66,6 +66,8 @@ def test_dflash_int8_rejected_before_loading_weights(
         hf_config.dflash_config["use_swa"] = False
         if feature == "layer_types":
             hf_config.layer_types = ["full_attention", "sliding_attention"]
+        elif feature == "cache_window":
+            config.cache_config.sliding_window = 256
         else:
             hf_config.dflash_config["attention_sink_bias"] = True
 

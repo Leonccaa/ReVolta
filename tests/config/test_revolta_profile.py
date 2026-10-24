@@ -571,6 +571,7 @@ def test_audit_logs_disabled_profile(profile):
 
 
 GRAPH_RESERVE = "VLLM_V2_CUDAGRAPH_MEM_MIB"
+TAIL_GRAPHS = "VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS"
 
 
 @pytest.mark.parametrize(
@@ -578,7 +579,7 @@ GRAPH_RESERVE = "VLLM_V2_CUDAGRAPH_MEM_MIB"
     [
         ("awq", None, "700"),
         ("awq", "mtp", "700"),
-        ("awq", "dflash", "1500"),
+        ("awq", "dflash", "1200"),
         ("modelopt_fp4", "dflash", "700"),
     ],
 )
@@ -608,7 +609,7 @@ def test_dflash_leaves_every_other_default_alone(profile):
         if k not in ("PYTEST_CURRENT_TEST", "VLLM_REVOLTA_PROFILE_PROVENANCE")
         and dflash.get(k) != os.environ.get(k)
     }
-    assert changed == {GRAPH_RESERVE}
+    assert changed == {GRAPH_RESERVE, TAIL_GRAPHS}
 
 
 def test_later_call_refines_only_the_profile_value(profile, monkeypatch):
@@ -618,9 +619,9 @@ def test_later_call_refines_only_the_profile_value(profile, monkeypatch):
     assert profile.apply_revolta_profile(
         model(), 4, is_sm70=True, speculative_method="dflash"
     )
-    assert os.environ[GRAPH_RESERVE] == "1500"
+    assert os.environ[GRAPH_RESERVE] == "1200"
     row = json.loads(profile.profile_audit(enabled=True))["values"][GRAPH_RESERVE]
-    assert row == {"value": "1500", "source": "profile"}
+    assert row == {"value": "1200", "source": "profile"}
 
 
 def test_explicit_graph_reserve_wins_over_dflash(profile, monkeypatch):
@@ -631,6 +632,32 @@ def test_explicit_graph_reserve_wins_over_dflash(profile, monkeypatch):
     assert os.environ[GRAPH_RESERVE] == "900"
     row = json.loads(profile.profile_audit(enabled=True))["values"][GRAPH_RESERVE]
     assert row == {"value": "900", "source": "environment"}
+
+
+@pytest.mark.parametrize(
+    ("quantization", "method", "expected"),
+    [
+        ("awq", None, None),
+        ("awq", "mtp", None),
+        ("awq", "dflash", "0"),
+        ("modelopt_fp4", "dflash", None),
+    ],
+)
+def test_tail_graphs_are_off_only_for_awq_dflash(
+    profile, quantization, method, expected
+):
+    assert profile.apply_revolta_profile(
+        model(quantization), 4, is_sm70=True, speculative_method=method
+    )
+    assert os.environ.get(TAIL_GRAPHS) == expected
+
+
+def test_explicit_tail_graphs_win_over_dflash(profile, monkeypatch):
+    monkeypatch.setenv(TAIL_GRAPHS, "1")
+    assert profile.apply_revolta_profile(
+        model(), 4, is_sm70=True, speculative_method="dflash"
+    )
+    assert os.environ[TAIL_GRAPHS] == "1"
 
 
 def test_engineargs_profile_receives_the_speculative_method(profile, monkeypatch):

@@ -89,10 +89,12 @@ def build_replay_state_indices(
     aligned = (computed // block_size) * block_size
     boundary_pos = aligned - running
     has_boundary = (aligned >= running) & (boundary_pos < accepted - 1)
-    if bool(has_boundary.any()):
-        dst_cols = (aligned // block_size - 1).clamp(min=0)
-        dst_blocks = block_table[spec_rows.to(torch.long), dst_cols].to(torch.int32)
-        table[rows[has_boundary], boundary_pos[has_boundary]] = dst_blocks[has_boundary]
+    # Fixed-size writes, no host sync: a row without a boundary writes the
+    # running block to its last accepted column again.
+    dst_cols = (aligned // block_size - 1).clamp(min=0)
+    dst_blocks = block_table[spec_rows.to(torch.long), dst_cols].to(torch.int32)
+    cols = torch.where(has_boundary, boundary_pos, accepted - 1)
+    table[rows, cols] = torch.where(has_boundary, dst_blocks, base[:num_spec])
     return table
 
 

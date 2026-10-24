@@ -5340,6 +5340,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             (max_reqs,), self._replay_slots + 1, dtype=torch.int32, device=device
         )
 
+    def _mixed_qkv_verify_admits(self, num_tokens: int) -> bool:
+        """Token counts the mixed-QKV verifier takes for this layer.
+
+        Replay records this verifier's inputs, so with replay it takes every
+        verify batch (up to max_num_seqs x (1 + drafts) tokens): the kernel
+        loops per request and head, and the token band is admission only.
+        """
+        return self.spec_state_replay or _sm70_mixed_qkv_verify_tokens_ok(num_tokens)
+
     def _spec_state_replay_verify(
         self,
         mixed_qkv: torch.Tensor,
@@ -5891,7 +5900,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     and mixed_qkv_spec.stride(0) >= mixed_qkv_spec.shape[1]
                 )
             )
-            and _sm70_mixed_qkv_verify_tokens_ok(mixed_qkv_spec.shape[0])
+            and self._mixed_qkv_verify_admits(mixed_qkv_spec.shape[0])
         )
         if use_dflash2_packed_gdn_verify or use_sm70_mixed_qkv_verify:
             query_spec, key_spec, value_spec = None, None, None

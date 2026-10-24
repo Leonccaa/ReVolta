@@ -320,3 +320,23 @@ def test_dflash_replay_is_the_only_change_to_gdn_allocation(sm70):
     assert spec.num_speculative_blocks == 0
     assert spec.num_replayed_speculative_blocks == 7
     assert spec.page_size_bytes == _legacy_gdn_spec(7).page_size_bytes
+
+
+@pytest.mark.parametrize("wide", [False, True])
+@pytest.mark.parametrize("num_tokens", [1, 8, 16, 20, 24, 40, 48, 64])
+def test_replay_alone_widens_the_mixed_qkv_verifier_admission(
+    monkeypatch, wide, num_tokens
+):
+    from vllm import envs
+    from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as gdn
+
+    monkeypatch.setattr(envs, "VLLM_SM70_QWEN38_WIDE_M_GDN", wide, raising=False)
+    monkeypatch.setattr(envs, "VLLM_SM70_GDN_TAIL_COPY", False, raising=False)
+    admits = gdn.QwenGatedDeltaNetAttention._mixed_qkv_verify_admits
+    # Replay off (MTP, no speculation, DFlash with replay off): the band as before.
+    off = SimpleNamespace(spec_state_replay=False)
+    assert admits(off, num_tokens) == gdn._sm70_mixed_qkv_verify_tokens_ok(num_tokens)  # type: ignore[arg-type]
+    expected_band = 1 < num_tokens <= 16 or (wide and 2 <= num_tokens <= 48)
+    assert gdn._sm70_mixed_qkv_verify_tokens_ok(num_tokens) == expected_band
+    # Replay on: every verify batch, up to 8 requests x 8 tokens.
+    assert admits(SimpleNamespace(spec_state_replay=True), num_tokens)  # type: ignore[arg-type]

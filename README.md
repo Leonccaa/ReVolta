@@ -616,12 +616,15 @@ The default is AWQ g32 with E4M3 KV.
 | Standard NVFP4 + E4M3 KV | 1,232,435 | | 0.0303 | 96.36% |
 | NVIDIA FP4-Local + E4M3 KV | 1,295,637 | | 0.0380 | 95.91% |
 | Uncensored AWQ g32 + INT8 KV | 1,127,578 | | 0.0267 | Within 0.1 percentage point of E4M3 |
+| Uncensored AWQ g32 + FP16 KV | | | Within 0.001 of E4M3 | Same as E4M3 |
 
 Measured on the reference machine, with 8 sequences and a 512K maximum request length.
 MTP4: 0.1.0 candidate builds (0.1.2 with MTP4 has 1,153,143 tokens in the first row).
 DFlash2: the 0.1.2 release build with the recommended DFlash2 config, including
 `VLLM_V2_CUDAGRAPH_MEM_MIB=1500`. Empty cells are not measured yet. All KL and top-1
-values use the same base BF16 reference. The Uncensored rows include the effect of
+values use the same base BF16 reference; the FP16 KV row compares FP16 with E4M3 KV
+directly (on short prompts: KL 0.0220 against 0.0214, top-1 97.08% for both; on the
+long-context set: 0.0239 against 0.0238). The Uncensored rows include the effect of
 fine-tuning as well as quantization.
 
 ### E4M3 KV

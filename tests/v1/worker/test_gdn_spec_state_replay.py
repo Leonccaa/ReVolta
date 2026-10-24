@@ -340,3 +340,46 @@ def test_replay_alone_widens_the_mixed_qkv_verifier_admission(
     assert gdn._sm70_mixed_qkv_verify_tokens_ok(num_tokens) == expected_band
     # Replay on: every verify batch, up to 8 requests x 8 tokens.
     assert admits(SimpleNamespace(spec_state_replay=True), num_tokens)  # type: ignore[arg-type]
+
+
+def _qkvz_rows(num_tokens):
+    # The q/k/v/z projection output; q/k/v is its row-strided leading slice.
+    qkvz = torch.zeros(num_tokens, 2560 + 1536, dtype=torch.float16)
+    return qkvz[:, :2560]
+
+
+def _strided_layer(replay):
+    return SimpleNamespace(
+        spec_state_replay=replay,
+        enable_sm70_fused_sigmoid_mixed_qkv=True,
+        num_k_heads=16,
+        num_v_heads=48,
+        tp_size=4,
+    )
+
+
+@pytest.mark.parametrize("num_tokens", [8, 24, 40, 64])
+def test_replay_verifier_reads_row_strided_qkv(num_tokens):
+    # Batches outside the fused input projection hand the verifier a strided
+    # view; without this the replay layer reached the split verifier and raised.
+    from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as gdn
+
+    reads = gdn.QwenGatedDeltaNetAttention._replay_reads_strided_qkv
+    qkv = _qkvz_rows(num_tokens)
+    assert not qkv.is_contiguous()
+    assert reads(_strided_layer(True), qkv)  # type: ignore[arg-type]
+    # Replay off: no input is admitted by this path, so the original
+    # contiguity and tail-copy conditions alone decide, as before.
+    assert not reads(_strided_layer(False), qkv)  # type: ignore[arg-type]
+    assert not reads(_strided_layer(False), qkv.contiguous())  # type: ignore[arg-type]
+
+
+def test_replay_verifier_rejects_layouts_the_kernel_cannot_read():
+    from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as gdn
+
+    reads = gdn.QwenGatedDeltaNetAttention._replay_reads_strided_qkv
+    layer = _strided_layer(True)
+    qkv = _qkvz_rows(8)
+    assert not reads(layer, qkv.float())  # type: ignore[arg-type]
+    assert not reads(layer, qkv.t())  # type: ignore[arg-type]
+    assert not reads(layer, None)  # type: ignore[arg-type]

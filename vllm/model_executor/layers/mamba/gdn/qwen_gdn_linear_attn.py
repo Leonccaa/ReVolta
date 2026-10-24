@@ -5349,6 +5349,26 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         """
         return self.spec_state_replay or _sm70_mixed_qkv_verify_tokens_ok(num_tokens)
 
+    def _replay_reads_strided_qkv(self, mixed_qkv: torch.Tensor | None) -> bool:
+        """Whether replay lets the mixed-QKV verifier read row-strided input.
+
+        Batches outside the fused input projection keep q/k/v as a row-strided
+        view of the q/k/v/z projection. The verifier reads such rows as the
+        tail-copy route does (unit inner stride); replay records every verify
+        batch, so it takes them instead of the split q/k/v verifier.
+        """
+        return bool(
+            self.spec_state_replay
+            and mixed_qkv is not None
+            and mixed_qkv.dim() == 2
+            and mixed_qkv.dtype == torch.float16
+            and mixed_qkv.stride(1) == 1
+            and mixed_qkv.stride(0) >= mixed_qkv.shape[1]
+            and self.enable_sm70_fused_sigmoid_mixed_qkv
+            and self.num_k_heads % self.tp_size == 0
+            and self.num_v_heads % self.tp_size == 0
+        )
+
     def _spec_state_replay_verify(
         self,
         mixed_qkv: torch.Tensor,
@@ -5880,7 +5900,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             attn_metadata=attn_metadata,
         )
         use_sm70_mixed_qkv_verify = (
-            mixed_qkv_decode_requested
+            (mixed_qkv_decode_requested or self._replay_reads_strided_qkv(mixed_qkv))
             and not use_dflash2_packed_gdn_verify
             and spec_sequence_masks is not None
             and ddtree_parent_ids is None
@@ -5893,6 +5913,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and mixed_qkv_spec is not None
             and (
                 mixed_qkv_spec.is_contiguous()
+                or self._replay_reads_strided_qkv(mixed_qkv_spec)
                 or (
                     envs.VLLM_SM70_GDN_TAIL_COPY  # 1CatAI #928
                     and _sm70_gdn_tail_copy_tokens_ok(mixed_qkv_spec.shape[0])

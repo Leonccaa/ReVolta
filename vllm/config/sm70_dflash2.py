@@ -125,8 +125,12 @@ class Sm70DFlash2Config:
     state; once the accepted count is known, the same kernel launch is replayed
     into the request's state block. Each running request then holds 2 instead
     of 2 + num_speculative_tokens state blocks per GDN cache group. None (the
-    default) enables it wherever it is supported; False keeps one state block
-    per speculative position. Configuration only, no environment alias."""
+    default) enables it wherever it is supported, but yields to a packed
+    verifier (fused_gdn_verify) enabled by the qualified policy or explicitly.
+    True overrides an automatic packed default; explicitly enabling both
+    options raises a ValueError.
+    False keeps one state block per speculative position. Configuration only,
+    no environment alias."""
 
     qualified: bool = Field(default=False, init=False, repr=False)
     """Whether the retained complete-model validation boundary matches."""

@@ -273,6 +273,27 @@ def _resolve_gdn_spec_state_replay(vllm_config: "VllmConfig") -> bool:
     policy = spec.sm70_dflash2
     if policy.spec_state_replay is False:
         return False
+    if policy.fused_gdn_verify:
+        if policy.spec_state_replay is True:
+            if "fused_gdn_verify" in policy.explicit_fields:
+                raise ValueError(
+                    "sm70_dflash2.spec_state_replay=True and "
+                    "sm70_dflash2.fused_gdn_verify=True cannot be enabled "
+                    "together. Disable one of these explicit settings."
+                )
+            policy.fused_gdn_verify = False
+            logger.info_once(
+                "Disabling the automatic sm70_dflash2.fused_gdn_verify "
+                "default because sm70_dflash2.spec_state_replay=True was "
+                "explicitly requested."
+            )
+        else:
+            logger.info_once(
+                "GDN speculative state replay is disabled: "
+                "sm70_dflash2.spec_state_replay=None gives precedence to "
+                "the enabled sm70_dflash2.fused_gdn_verify packed verifier."
+            )
+            return False
     reasons = []
     model = vllm_config.model_config
     if model is None or not model.is_hybrid:
@@ -290,8 +311,6 @@ def _resolve_gdn_spec_state_replay(vllm_config: "VllmConfig") -> bool:
         reasons.append("async scheduling")
     if vllm_config.parallel_config.pipeline_parallel_size != 1:
         reasons.append("pipeline parallelism")
-    if policy.fused_gdn_verify:
-        reasons.append("sm70_dflash2.fused_gdn_verify")
     if envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP:
         reasons.append("VLLM_SM70_QWEN_GDN_SPEC_CORE_OP")
     if not envs.VLLM_SM70_FUSED_SIGMOID_MIXED_QKV:

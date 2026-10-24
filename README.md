@@ -274,7 +274,7 @@ vllm serve /data/revolta/views/target-512k \
   --no-async-scheduling \
   --kv-cache-dtype fp8_e4m3 \
   --no-language-model-only \
-  --limit-mm-per-prompt '{"image": 16, "video": 1, "audio": 16}' \
+  --limit-mm-per-prompt '{"image": 16, "video": 1}' \
   --media-io-kwargs '{"video": {"num_frames": 16}}' \
   --compilation-config '{"mode": 3, "cudagraph_mode": "FULL_AND_PIECEWISE"}' \
   --structured-outputs-config '{"backend": "xgrammar"}' \
@@ -328,10 +328,11 @@ Notes:
 - `cpu_bytes_to_use` is the total for all four workers (48 GiB = 12 GiB per worker).
 - **Keep `--limit-mm-per-prompt` on V100.** With FlashAttention-V100, the engine allows
   1 image and no video per request without it, and a value that leaves out `"video"`
-  disables video. This V100 default is kept in 0.1.2. `{"image": 16, "video": 1,
-  "audio": 16}` keeps the reference deployment's limits. To use the generic 0.1.2 default
-  instead, set `--limit-mm-per-prompt '{"image": 8, "video": 1, "audio": 1}'`; a lower
-  image count leaves more host memory for bursts of large images. Large images are resized
+  disables video. This V100 default is kept in 0.1.2. `{"image": 16, "video": 1}`
+  keeps the reference deployment's limits; Qwen3.8 Flash-Next takes images and video,
+  not audio, so no audio limit is set. To use the generic image count instead, set
+  `--limit-mm-per-prompt '{"image": 8, "video": 1}'`; a lower image count leaves more
+  host memory for bursts of large images. Large images are resized
   either way (see [Support and known limits](#support-and-known-limits)).
 - `--structured-outputs-config '{"backend": "xgrammar"}'` pins the structured-output
   backend. With `auto`, the engine keeps the backend chosen for its first
@@ -869,8 +870,8 @@ GGUF are outside the build.
 - **Media.** On V100 with FlashAttention-V100, the default without `--limit-mm-per-prompt`
   is 1 image and no video, and a value that leaves out `"video"` disables video. This
   behaviour is kept. Set the option explicitly and include `"video"`: for example
-  `'{"image": 8, "video": 1, "audio": 1}'` (the generic 0.1.2 default) or
-  `'{"image": 16, "video": 1, "audio": 16}'` (the launch command above). On other hardware
+  `'{"image": 8, "video": 1}'` (the generic image count) or
+  `'{"image": 16, "video": 1}'` (the launch command above). The model has no audio input. On other hardware
   and backends, the defaults are 8 images, 1 video, and 1 audio item per whole request. Images in historical chat messages count
   toward the image limit. Qwen4Exp
   resizes large images to at most 1,048,576 pixels using HF's existing resize

@@ -180,7 +180,10 @@ def test_ple_spec_retains_in_block_history(mode):
         cache_config=NS(
             mamba_block_size=16, mamba_page_size_padded=None, mamba_cache_mode=mode
         ),
-        speculative_config=NS(num_speculative_state_tokens=lambda: 4),
+        speculative_config=NS(
+            num_speculative_state_tokens=lambda: 4,
+            num_speculative_state_blocks=lambda: 4,
+        ),
     )
     old = MambaBase.get_kv_cache_spec(layer, cfg)
     new = layer.get_kv_cache_spec(cfg)

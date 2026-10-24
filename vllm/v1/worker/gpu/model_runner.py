@@ -984,10 +984,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     torch.accelerator.memory_allocated(),
                     torch.accelerator.memory_reserved(),
                 )
+                draft_start_free = torch.cuda.mem_get_info()[0]
                 if isinstance(self.speculator, DraftModelSpeculator):
                     self.speculator.capture()
                 else:
                     self.speculator.capture(captured_attn_states)
+                draft_graph_size = draft_start_free - torch.cuda.mem_get_info()[0]
+                logger.info(
+                    "CUDA graph memory by owner: target %.2f GiB, drafter %.2f GiB",
+                    (start_free_gpu_memory - draft_start_free) / (1 << 30),
+                    draft_graph_size / (1 << 30),
+                )
         if self._ple_offload_connector is not None:
             self._ple_offload_connector.release_outputs()
 

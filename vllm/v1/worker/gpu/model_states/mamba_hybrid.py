@@ -46,6 +46,11 @@ from vllm.v1.worker.gpu.attn_utils import (
     build_attn_metadata,
     compute_common_gdn_attn_metadata,
 )
+from vllm.v1.worker.gpu.gdn_spec_replay import (
+    GDNSpecReplayLayer,
+    GDNSpecReplayStep,
+    replay_gdn_spec_states,
+)
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mamba_align import (
     preprocess_mamba_align_fused_kernel,
@@ -127,6 +132,10 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
 
 class MambaHybridModelState(DefaultModelState):
     """Model state for hybrid attention + Mamba / linear-attention models."""
+
+    # GDN speculative state replay (set in __init__ from the speculative config).
+    _spec_state_replay = False
+    _spec_replay_step: GDNSpecReplayStep | None = None
 
     def __init__(
         self,
@@ -215,6 +224,12 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_ctx: MambaSpecDecodeGPUContext | None = None
             self._mamba_group_ids: list[int] = []
             self._mamba_spec: MambaSpec | None = None
+        speculative_config = self.vllm_config.speculative_config
+        self._spec_state_replay = bool(
+            speculative_config is not None and speculative_config.gdn_spec_state_replay
+        )
+        assert self._align_mode or not self._spec_state_replay
+        self._spec_replay_step: GDNSpecReplayStep | None = None
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
@@ -319,6 +334,7 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_token_bias_gpu,
             input_batch.idx_mapping,
             input_batch.query_start_loc,
+            spec_state_replay=self._spec_state_replay,
         )
 
     def _get_dflash2_gdn_builders(
@@ -532,7 +548,81 @@ class MambaHybridModelState(DefaultModelState):
                     common_gdn_metadata.spec_query_start_loc[-1].item()
                     == common_gdn_metadata.num_spec_decode_tokens
                 )
+        self._spec_replay_step = None
+        if self._spec_state_replay and not for_capture:
+            assert num_decode_draft_tokens_cpu is not None
+            self._spec_replay_step = self._make_spec_replay_step(
+                attn_metadata,
+                kv_cache_config,
+                block_tables,
+                num_decode_draft_tokens_cpu[: input_batch.num_reqs],
+                full_graph=cudagraph_mode == CUDAGraphMode.FULL,
+                num_reqs=num_reqs,
+                num_tokens=num_tokens,
+            )
         return attn_metadata
+
+    def _make_spec_replay_step(
+        self,
+        attn_metadata: dict[str, Any],
+        kv_cache_config: KVCacheConfig,
+        block_tables: tuple[torch.Tensor, ...],
+        num_decode_draft_tokens_cpu: torch.Tensor,
+        *,
+        full_graph: bool,
+        num_reqs: int,
+        num_tokens: int,
+    ) -> GDNSpecReplayStep | None:
+        """What the post-sampling replay needs from this step's GDN verifier."""
+        spec_rows_cpu = torch.nonzero(num_decode_draft_tokens_cpu >= 0).reshape(-1)
+        if spec_rows_cpu.numel() == 0:
+            return None
+        forward_context = self.vllm_config.compilation_config.static_forward_context
+        layers: list[GDNSpecReplayLayer] = []
+        launch: tuple[int, int] | None = None
+        for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
+            for layer_name in group.layer_names:
+                layer = forward_context.get(layer_name)
+                metadata = attn_metadata.get(layer_name)
+                if not getattr(layer, "spec_state_replay", False) or not isinstance(
+                    metadata, GDNAttentionMetadata
+                ):
+                    continue
+                if metadata.num_spec_decodes <= 0:
+                    continue
+                if full_graph:
+                    # A FULL graph replays the launch it captured: every row is a
+                    # speculative request, padded to the captured batch.
+                    assert metadata.num_prefills == 0 and metadata.num_decodes == 0
+                    layer_launch = (num_reqs, num_tokens)
+                else:
+                    layer_launch = (
+                        metadata.num_spec_decodes,
+                        metadata.num_spec_decode_tokens,
+                    )
+                assert launch is None or launch == layer_launch
+                launch = layer_launch
+                assert metadata.spec_state_indices_tensor is not None
+                assert metadata.spec_query_start_loc is not None
+                layers.append(
+                    GDNSpecReplayLayer(
+                        layer=layer,
+                        group_id=group_id,
+                        base_state_ids=metadata.spec_state_indices_tensor[
+                            : layer_launch[0], 0
+                        ],
+                        cu_seqlens=metadata.spec_query_start_loc[: layer_launch[0] + 1],
+                    )
+                )
+        if launch is None:
+            return None
+        return GDNSpecReplayStep(
+            num_reqs=launch[0],
+            num_tokens=launch[1],
+            spec_rows=spec_rows_cpu.to(self.device, non_blocking=True),
+            layers=layers,
+            block_tables=block_tables,
+        )
 
     def postprocess_state(
         self,
@@ -556,6 +646,16 @@ class MambaHybridModelState(DefaultModelState):
                 _scatter_num_accepted_kernel[(num_reqs,)](
                     idx_mapping, num_sampled, self.num_accepted_tokens_gpu
                 )
+        step, self._spec_replay_step = self._spec_replay_step, None
+        if step is not None and isinstance(num_sampled, torch.Tensor):
+            assert num_computed_tokens is not None and self._mamba_spec is not None
+            replay_gdn_spec_states(
+                step,
+                idx_mapping=idx_mapping,
+                num_sampled=num_sampled,
+                num_computed_tokens=num_computed_tokens,
+                block_size=self._mamba_spec.block_size,
+            )
         if (
             self._align_mode
             and num_computed_tokens is not None
@@ -569,6 +669,7 @@ class MambaHybridModelState(DefaultModelState):
                 self._mamba_state_idx_gpu,
                 num_computed_tokens,
                 idx_mapping,
+                spec_state_replay=self._spec_state_replay,
             )
 
 

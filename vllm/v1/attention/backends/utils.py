@@ -937,4 +937,12 @@ def mamba_get_block_table_tensor(
             dtype=torch.int32,
         )
         indices_to_gather = (start_indices.unsqueeze(1) + offsets).to(torch.int64)
-        return torch.gather(block_table, 1, indices_to_gather)
+        state_block_ids = torch.gather(block_table, 1, indices_to_gather)
+        replayed = getattr(kv_cache_spec, "num_replayed_speculative_blocks", 0)
+        if replayed:
+            # Replayed speculative columns have no blocks; stores to them are
+            # skipped and nothing reads them.
+            state_block_ids = torch.nn.functional.pad(
+                state_block_ids, (0, replayed), value=PAD_SLOT_ID
+            )
+        return state_block_ids

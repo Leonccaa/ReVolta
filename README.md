@@ -20,8 +20,8 @@ Run Qwen3.8 Flash-Next for text, images, and video, with an OpenAI-compatible AP
 - **KV formats:** FP8 E4M3, FP16, and INT8.
 - **Speculative decoding:** native MTP4 by default, or DFlash2 with the incoai drafter
   (new in 0.1.2, up to 1.23× on one request).
-- **Speed:** about **465 tokens/s total output at 8 concurrent requests** on NVLink
-  ([community result](https://github.com/Leonccaa/ReVolta/issues/2)), about 380 on our PCIe reference (512-token responses, MTP4 on).
+- **Speed:** about **525 tokens/s total output at 8 concurrent requests** on NVLink
+  ([community result](https://github.com/Leonccaa/ReVolta/issues/2), 0.1.1), about 380 on our PCIe reference (512-token responses, MTP4 on).
 - **Cache reuse:** CPU memory and disk offload; a cached 32K document answered in **1.28 s vs 10.06 s** when recomputed.
 
 ## Measurements
@@ -58,19 +58,30 @@ These are totals across all requests, including the wait for the first token:
 On a replay of real agent sessions (one request at a time, sampling), the two were on par
 (0.97× the MTP4 speed). See [DFlash2 speculative decoding](#dflash2-speculative-decoding-optional).
 
-**NVLink (community result).** [@jttdev](https://github.com/jttdev) measured 0.1.0 on
+**NVLink (community result).** [@jttdev](https://github.com/jttdev) measured 0.1.1 on
 4 × V100-SXM2 32 GB with an NV2 NVLink mesh ([#2](https://github.com/Leonccaa/ReVolta/issues/2)):
+the same three prompts, 512-token responses, thinking off, MTP4, 512K views, base AWQ
+checkpoint, `--gpu-memory-utilization 0.95` and a 16 GiB CPU KV pool
+(`cpu_bytes_to_use`). The method differs slightly from ours: each level runs 3 requests
+per stream.
 
-| Concurrent requests | 1 | 2 | 4 | 8 |
-| --- | ---: | ---: | ---: | ---: |
-| Total output throughput, tok/s | 153.5 | 223.4 | 326.3 | 467.8 |
+| Concurrent requests | 2 | 4 | 8 |
+| --- | ---: | ---: | ---: |
+| Total output throughput, tok/s | 231.3 | 329.5 | 524.6 |
 
-Same three prompts and 512-token responses, thinking off, MTP4, 512K views, base AWQ
-checkpoint, `--gpu-memory-utilization 0.925`. The method differs slightly from ours: each
-level runs 3 requests per stream, and the single-request value is the mean of the three
-prompts, including the wait for the first token. On this system
-`--gpu-memory-utilization 0.95` also started (1,100,286 KV tokens), and two concurrent
-retrieval requests of about 490K tokens each found all three needles.
+One request decodes at 178 tokens/s (code), 123 (Chinese) and 191 (reasoning).
+
+- 0.1.0 measured the same in the same session (ratio 1.00 / 1.00 / 1.00 / 1.01 for one to
+  eight requests), and the greedy outputs of both releases were byte-identical.
+- The size of the CPU KV pool affects eight requests on this system: at 262K context and
+  `--gpu-memory-utilization 0.925`, eight requests gave 513 tokens/s with a 16 GiB pool and
+  497 with 32 GiB, about 3% less; one to four requests did not change. An earlier
+  8-request gap against a hand-built 1Cat-vLLM setup did not reproduce in later runs.
+- The GPU KV pool at 0.95 and 512K is 1,095,050 tokens with 0.1.1 (1,100,286 with 0.1.0).
+  0.1.1 creates the NCCL communicators before memory profiling, so their memory is now
+  counted; that probably explains the 0.5% difference.
+- Two concurrent retrieval requests of about 490K tokens each found all three needles
+  (0.1.0); 0.1.1 found 3 of 3 at 91K and 244K tokens.
 
 ### Coming back to a document
 

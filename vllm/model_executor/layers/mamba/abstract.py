@@ -49,6 +49,7 @@ class MambaBase(AttentionLayerBase):
         mamba_block_size = vllm_config.cache_config.mamba_block_size
         assert mamba_block_size is not None
         page_size_padded = vllm_config.cache_config.mamba_page_size_padded
+        spec_config = vllm_config.speculative_config
         return MambaSpec(
             shapes=tuple(self.get_state_shape()),
             dtypes=self.get_state_dtype(),
@@ -58,8 +59,12 @@ class MambaBase(AttentionLayerBase):
             tp_replicated=self.is_kv_cache_tp_replicated,
             mamba_cache_mode=vllm_config.cache_config.mamba_cache_mode,
             num_speculative_blocks=(
-                vllm_config.speculative_config.num_speculative_state_tokens()
-                if vllm_config.speculative_config
+                spec_config.num_speculative_state_blocks() if spec_config else 0
+            ),
+            num_replayed_speculative_blocks=(
+                spec_config.num_speculative_state_tokens()
+                - spec_config.num_speculative_state_blocks()
+                if spec_config
                 else 0
             ),
         )

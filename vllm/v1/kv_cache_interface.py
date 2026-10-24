@@ -734,6 +734,10 @@ class MambaSpec(KVCacheSpec):
     num_speculative_blocks: int = 0
     # PLE short-conv state is replicated; GDN state is TP-sharded.
     tp_replicated: bool = False
+    # Speculative state-table columns without blocks behind them: accepted GDN
+    # tokens are replayed into the running block, so the kernels see padded
+    # columns (`mamba_get_block_table_tensor`) and nothing is allocated.
+    num_replayed_speculative_blocks: int = 0
 
     @property
     def real_page_size_bytes(self) -> int:
@@ -914,6 +918,8 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
             return all(
                 isinstance(spec, MambaSpec)
                 and spec.num_speculative_blocks == one_spec.num_speculative_blocks
+                and spec.num_replayed_speculative_blocks
+                == one_spec.num_replayed_speculative_blocks
                 for spec in kv_cache_specs.values()
             )
         else:

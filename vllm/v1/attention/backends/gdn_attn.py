@@ -199,8 +199,13 @@ def _dflash2_gdn_group_metadata_kernel(
     USE_STATE_START: tl.constexpr,
     USE_SEQ_LEN_START: tl.constexpr,
     MAMBA_BLOCK_SIZE: tl.constexpr,
+    STATE_COLUMNS: tl.constexpr,
 ):
-    """Write every GDN group's state IDs and the shared graph metadata."""
+    """Write every GDN group's state IDs and the shared graph metadata.
+
+    Only the first STATE_COLUMNS columns of each row have state blocks behind
+    them; the rest (replayed speculative columns) are padded.
+    """
     group_id = tl.program_id(0)
     block_table = _load_gdn_i32_ptr(block_table_ptrs + group_id)
     state_output = _load_gdn_i32_ptr(state_output_ptrs + group_id)
@@ -210,7 +215,9 @@ def _dflash2_gdn_group_metadata_kernel(
     rows = offsets // WIDTH
     columns = offsets % WIDTH
     output_mask = offsets < batch_size * WIDTH
-    live_state_mask = output_mask & (rows < num_spec_decodes)
+    live_state_mask = (
+        output_mask & (rows < num_spec_decodes) & (columns < STATE_COLUMNS)
+    )
     state_columns = columns
     if USE_STATE_START:
         req_indices = tl.load(
@@ -579,10 +586,16 @@ def select_gdn_state_block_ids(
     block_table: torch.Tensor,
     accepted_tokens: torch.Tensor | None,
     num_spec: int,
+    state_columns: int | None = None,
 ) -> torch.Tensor:
+    """Each row's current state block: the accepted speculative column.
+
+    ``state_columns`` counts the columns with blocks behind them; with replayed
+    speculative states only column zero has one, and it holds the state.
+    """
     if envs.VLLM_SM70_MTP_LEGACY_GDN_NON_SPEC_SLOT0:
         return block_table[:, 0]
-    if accepted_tokens is None:
+    if accepted_tokens is None or state_columns == 1:
         return block_table[:, 0]
     state_offsets = torch.clamp(
         accepted_tokens.to(device=block_table.device, dtype=torch.long) - 1,
@@ -606,6 +619,7 @@ def build_gdn_spec_decode_state_contract(
     current_state_block_ids: torch.Tensor | None,
     is_mamba_cache_all: bool,
     spec_state_slot_selectors: torch.Tensor | None = None,
+    state_columns: int | None = None,
 ) -> GDNSpecDecodeStateContract:
     """Build the state-index/count contract consumed by active-MTP GDN.
 
@@ -638,6 +652,7 @@ def build_gdn_spec_decode_state_contract(
             non_spec_source,
             num_accepted_tokens[~accepted_mask],
             num_spec,
+            state_columns,
         )
     elif is_mamba_cache_all:
         block_mask = _mask_for(block_table_tensor)
@@ -686,6 +701,7 @@ def build_gdn_spec_decode_state_contract(
                 _select_rows(block_table_tensor, False),
                 _select_rows(num_accepted_tokens, False),
                 num_spec,
+                state_columns,
             )
 
     if current_state_block_ids is None and not is_mamba_cache_all:
@@ -802,6 +818,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         else:
             self.num_spec = 0
             self.num_spec_state_tokens = 0
+        # State-table columns with blocks behind them (the rest are replayed).
+        self._state_columns: int | None = (
+            1 + kv_cache_spec.num_speculative_blocks
+            if isinstance(kv_cache_spec, MambaSpec)
+            else None
+        )
         self.use_spec_decode: bool = self.num_spec > 0
         self._init_reorder_batch_threshold(1, self.use_spec_decode)
 
@@ -1535,6 +1557,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     block_table_tensor,
                     num_accepted_tokens,
                     self.num_spec_state_tokens,
+                    self._state_columns,
                 )
             if num_prefills == 0:
                 query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
@@ -1706,6 +1729,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     current_state_block_ids=current_state_block_ids,
                     is_mamba_cache_all=is_mamba_cache_all,
                     spec_state_slot_selectors=spec_state_slot_selectors,
+                    state_columns=self._state_columns,
                 )
                 if metadata_profile:
                     profile_state_contract_ms = (
@@ -2495,6 +2519,7 @@ def prepare_dflash2_gdn_group_metadata(
         USE_STATE_START=use_state_start,
         USE_SEQ_LEN_START=use_seq_len_start,
         MAMBA_BLOCK_SIZE=first_builder.kv_cache_spec.block_size,
+        STATE_COLUMNS=first_builder._state_columns or width,
         num_warps=1,
     )
     common_buffers.initialized_key = (

@@ -257,6 +257,60 @@ def _apply_sm70_qwen38_decode_defaults(
     return tuple(applied)
 
 
+def _resolve_gdn_spec_state_replay(vllm_config: "VllmConfig") -> bool:
+    """Whether GDN layers replay accepted tokens instead of keeping per-draft states.
+
+    Supported for linear DFlash verification on SM70 with Model Runner V2, align
+    prefix caching and synchronous scheduling: the verifier route that records
+    its inputs and the replay after sampling are wired there. Elsewhere the
+    per-position state blocks remain.
+    """
+    from vllm.platforms import current_platform
+
+    spec = vllm_config.speculative_config
+    if spec is None or not spec.use_dflash() or spec.use_dflash_ddtree():
+        return False
+    policy = spec.sm70_dflash2
+    if policy.spec_state_replay is False:
+        return False
+    reasons = []
+    model = vllm_config.model_config
+    if model is None or not model.is_hybrid:
+        reasons.append("the target has no recurrent layers")
+    if not (
+        current_platform.is_cuda()
+        and _any_participating_device_is_capability(vllm_config, (7, 0))
+    ):
+        reasons.append("not SM70")
+    if not vllm_config.use_v2_model_runner:
+        reasons.append("Model Runner V1")
+    if vllm_config.cache_config.mamba_cache_mode != "align":
+        reasons.append("mamba_cache_mode is not align")
+    if vllm_config.scheduler_config.async_scheduling:
+        reasons.append("async scheduling")
+    if vllm_config.parallel_config.pipeline_parallel_size != 1:
+        reasons.append("pipeline parallelism")
+    if policy.fused_gdn_verify:
+        reasons.append("sm70_dflash2.fused_gdn_verify")
+    if envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP:
+        reasons.append("VLLM_SM70_QWEN_GDN_SPEC_CORE_OP")
+    if not envs.VLLM_SM70_FUSED_SIGMOID_MIXED_QKV:
+        reasons.append("VLLM_SM70_FUSED_SIGMOID_MIXED_QKV is off")
+    if reasons:
+        if policy.spec_state_replay:
+            logger.warning_once(
+                "sm70_dflash2.spec_state_replay is not supported here (%s); "
+                "GDN layers keep one state block per speculative position.",
+                ", ".join(reasons),
+            )
+        return False
+    logger.info_once(
+        "GDN speculative state replay: recurrent layers keep 2 state blocks per "
+        "running request and replay accepted tokens after sampling."
+    )
+    return True
+
+
 def _any_participating_device_is_capability(
     cfg: "VllmConfig", capability: tuple[int, int]
 ) -> bool:
@@ -2327,6 +2381,9 @@ class VllmConfig:
                 and (policy.qualified or "target_fp8_qpn8" in policy.explicit_fields)
             ):
                 self.kernel_config.sm70_fp8.qpn8 = policy.target_fp8_qpn8
+            self.speculative_config.gdn_spec_state_replay = (
+                _resolve_gdn_spec_state_replay(self)
+            )
         if self.model_config is not None and self.model_config.quantization == "fp8":
             # Resolve after the per-engine verifier defaults.
             self.kernel_config.sm70_fp8.resolve()

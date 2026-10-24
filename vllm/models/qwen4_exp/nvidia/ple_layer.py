@@ -2209,7 +2209,9 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         # PLE keeps the speculative history inside its running short-conv
         # block. Every path selects column zero of the state-block window;
         # separate speculative pool blocks are never read or written.
-        return replace(spec, num_speculative_blocks=0)
+        return replace(
+            spec, num_speculative_blocks=0, num_replayed_speculative_blocks=0
+        )
 
     def get_state_shape(self) -> Sequence[tuple[int, ...]]:
         return MambaStateShapeCalculator.short_conv_state_shape(

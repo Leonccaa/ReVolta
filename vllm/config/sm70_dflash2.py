@@ -118,6 +118,16 @@ class Sm70DFlash2Config:
     sharded_context_fc: bool | None = None
     """Policy for sharded context fc; None retains automatic qualification."""
 
+    spec_state_replay: bool | None = None
+    """Replay accepted GDN tokens instead of keeping a state block per draft.
+
+    The verifier keeps each recurrent layer's inputs and stores no per-position
+    state; once the accepted count is known, the same kernel launch is replayed
+    into the request's state block. Each running request then holds 2 instead
+    of 2 + num_speculative_tokens state blocks per GDN cache group. None (the
+    default) enables it wherever it is supported; False keeps one state block
+    per speculative position. Configuration only, no environment alias."""
+
     qualified: bool = Field(default=False, init=False, repr=False)
     """Whether the retained complete-model validation boundary matches."""
 

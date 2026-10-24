@@ -454,6 +454,11 @@ class SpeculativeConfig:
     sm70_dflash2: Sm70DFlash2Config = Field(default_factory=Sm70DFlash2Config)
     """Per-engine SM70 DFlash2 verifier policy; automatic when not specified."""
 
+    gdn_spec_state_replay: bool = Field(default=False, init=False)
+    """Resolved by VllmConfig: GDN layers replay accepted tokens rather than
+    keeping one state block per speculative position
+    (sm70_dflash2.spec_state_replay)."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -476,6 +481,9 @@ class SpeculativeConfig:
             self.use_dflash_family() or self.sm70_dflash2.explicit_fields
         ):
             factors.append(("sm70_dflash2", self.sm70_dflash2.graph_options()))
+        # Listed only when on, so speculative methods without it keep their keys.
+        if self.gdn_spec_state_replay:
+            factors.append(("gdn_spec_state_replay", True))
         # Eagle3 and extract_hidden_states affect the computation graph because
         # they return intermediate hidden states in addition to the final hidden state.
         uses_aux_hidden_states = (
@@ -1689,6 +1697,16 @@ class SpeculativeConfig:
         if self.use_dflash_ddtree() and not self.ddtree_disable_tree_verify:
             return max(num_spec_tokens, self.ddtree_budget or num_spec_tokens)
         return num_spec_tokens
+
+    def num_speculative_state_blocks(self) -> int:
+        """State blocks a recurrent cache group allocates per speculative position.
+
+        Zero when accepted GDN tokens are replayed: the state table keeps its
+        num_speculative_state_tokens() columns, padded, without blocks behind them.
+        """
+        if self.gdn_spec_state_replay:
+            return 0
+        return self.num_speculative_state_tokens()
 
     def uses_draft_model(self) -> bool:
         return self.method == "draft_model"

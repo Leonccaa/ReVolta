@@ -80,7 +80,10 @@ from vllm.v1.attention.backends.gdn_attn import (
     gdn_spec_metadata_tensors,
     get_registered_gdn_spec_metadata_tensors,
 )
-from vllm.v1.attention.backends.utils import compute_causal_conv1d_metadata
+from vllm.v1.attention.backends.utils import (
+    PAD_SLOT_ID,
+    compute_causal_conv1d_metadata,
+)
 from vllm.v1.worker.gpu.spec_decode import uses_dflash_selector_engine
 
 # Optional ROCm AITER Triton kernels for the GDN decode fast-path.
@@ -2488,6 +2491,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.enable_sm70_fused_sigmoid_mixed_qkv = (
             envs.VLLM_SM70_FUSED_SIGMOID_MIXED_QKV
         )
+        self.spec_state_replay = bool(
+            vllm_config.speculative_config is not None
+            and vllm_config.speculative_config.gdn_spec_state_replay
+        )
+        if self.spec_state_replay:
+            self._init_spec_state_replay(vllm_config)
         self.enable_sm70_dflash2_fused_gdn_verify = bool(
             sm70_dflash2_enabled(
                 "fused_gdn_verify", capture_sm70_dflash2_config(vllm_config)
@@ -5295,6 +5304,102 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             kv_cache=kv_cache,
         )
 
+    def _init_spec_state_replay(self, vllm_config: VllmConfig) -> None:
+        """Buffers that let the verifier skip per-position states (see below)."""
+        spec_config = vllm_config.speculative_config
+        assert spec_config is not None
+        # Today's state table width; the verifier's tokens per request fit in it.
+        self._replay_slots = spec_config.num_speculative_state_tokens() + 1
+        max_reqs = vllm_config.scheduler_config.max_num_seqs
+        max_tokens = max_reqs * self._replay_slots
+        num_v_heads = self.num_v_heads // self.tp_size
+        qkv_width = (2 * self.key_dim + self.value_dim) // self.tp_size
+        dtype = vllm_config.model_config.dtype
+        device = torch.device(
+            current_platform.device_type, torch.accelerator.current_device_index()
+        )
+        self._replay_qkv = torch.empty(
+            max_tokens, qkv_width, dtype=dtype, device=device
+        )
+        self._replay_a = torch.empty(
+            max_tokens, num_v_heads, dtype=dtype, device=device
+        )
+        self._replay_b = torch.empty_like(self._replay_a)
+        self._replay_out = torch.empty(
+            1, max_tokens, num_v_heads, self.head_v_dim, dtype=dtype, device=device
+        )
+        # Columns 0..slots-1 stay padded, so the verifier stores no state; the
+        # last column names the running state block it starts from.
+        self._replay_table = torch.full(
+            (max_reqs, self._replay_slots + 1),
+            PAD_SLOT_ID,
+            dtype=torch.int32,
+            device=device,
+        )
+        self._replay_selectors = torch.full(
+            (max_reqs,), self._replay_slots + 1, dtype=torch.int32, device=device
+        )
+
+    def _spec_state_replay_verify(
+        self,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        spec_state_indices_tensor: torch.Tensor,
+        num_spec_decodes: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """State indices and selectors for a verifier that stores no state.
+
+        Records the verifier's inputs; `replay_spec_states` repeats the same
+        launch after sampling with the accepted position mapped to the running
+        state block, so the committed state is the one the verifier computed.
+        """
+        num_tokens = mixed_qkv.shape[0]
+        table = self._replay_table[:num_spec_decodes]
+        table[:, self._replay_slots].copy_(
+            spec_state_indices_tensor[:num_spec_decodes, 0]
+        )
+        self._replay_qkv[:num_tokens].copy_(mixed_qkv)
+        self._replay_a[:num_tokens].copy_(a)
+        self._replay_b[:num_tokens].copy_(b)
+        return table, self._replay_selectors[:num_spec_decodes]
+
+    def replay_spec_states(
+        self,
+        state_indices: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        num_tokens: int,
+    ) -> None:
+        """Commit accepted recurrent states by repeating the verifier's launch.
+
+        ``state_indices`` has the verifier's shape ([requests, slots + 1]): the
+        last column is the running block the verifier started from, the column
+        of the last accepted token maps to the running block again, and a
+        block-boundary position may map to its prefix-cache block. Every other
+        column is padded, so nothing else is stored. Same inputs, request count,
+        token count and schedule as the verifier: the stored states are the
+        verifier's own, bitwise.
+        """
+        num_reqs = state_indices.shape[0]
+        fused_sigmoid_gating_delta_rule_update_mixed_qkv(
+            A_log=self.A_log,
+            a=self._replay_a[:num_tokens],
+            b=self._replay_b[:num_tokens],
+            dt_bias=self.dt_bias,
+            mixed_qkv=self._replay_qkv[:num_tokens],
+            num_q_heads=self.num_k_heads // self.tp_size,
+            num_v_heads=self.num_v_heads // self.tp_size,
+            head_k_dim=self.head_k_dim,
+            head_v_dim=self.head_v_dim,
+            initial_state=self.kv_cache[1],
+            inplace_final_state=True,
+            cu_seqlens=cu_seqlens,
+            ssm_state_indices=state_indices,
+            num_accepted_tokens=self._replay_selectors[:num_reqs],
+            use_qk_l2norm_in_kernel=True,
+            out=self._replay_out[:, :num_tokens],
+        )
+
     def _can_use_dflash2_packed_gdn_verify(
         self,
         *,
@@ -5978,6 +6083,19 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     and core_attn_out.is_contiguous()
                     and core_attn_out.dtype == mixed_qkv_spec.dtype
                 )
+                verify_state_indices = spec_state_indices_tensor
+                verify_selectors = spec_state_slot_selectors
+                if self.spec_state_replay:
+                    assert spec_state_indices_tensor is not None
+                    verify_state_indices, verify_selectors = (
+                        self._spec_state_replay_verify(
+                            mixed_qkv_spec,
+                            a_spec,
+                            b_spec,
+                            spec_state_indices_tensor,
+                            attn_metadata.num_spec_decodes,
+                        )
+                    )
                 core_attn_out_spec, last_recurrent_state = (
                     fused_sigmoid_gating_delta_rule_update_mixed_qkv(
                         A_log=self.A_log,
@@ -5994,8 +6112,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                         cu_seqlens=spec_query_start_loc[
                             : attn_metadata.num_spec_decodes + 1
                         ],
-                        ssm_state_indices=spec_state_indices_tensor,
-                        num_accepted_tokens=spec_state_slot_selectors,
+                        ssm_state_indices=verify_state_indices,
+                        num_accepted_tokens=verify_selectors,
                         use_qk_l2norm_in_kernel=True,
                         out=(
                             core_attn_out[:num_actual_tokens].unsqueeze(0)
@@ -6008,6 +6126,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     "SM70 mixed-QKV fused GDN target-verification route hit."
                 )
             else:
+                if self.spec_state_replay:
+                    raise RuntimeError(
+                        "GDN speculative state replay records the mixed-QKV "
+                        "verifier's inputs; this batch took the split q/k/v "
+                        "verifier. Set sm70_dflash2.spec_state_replay=false."
+                    )
                 assert query_spec is not None
                 assert key_spec is not None
                 assert value_spec is not None

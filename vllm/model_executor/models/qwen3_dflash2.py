@@ -503,7 +503,7 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
                     getattr(
                         capture_sm70_dflash2_config(vllm_config),
                         "sharded_selector_codebook",
-                        False,
+                        True,
                     )
                 ),
             )

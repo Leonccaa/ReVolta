@@ -1136,14 +1136,15 @@ def test_sharded_codebook_loader_takes_its_rows():
         assert torch.equal(param.data, expected), rank
 
 
-def test_sharded_selector_codebook_is_off_and_out_of_the_compile_key_by_default():
+def test_sharded_selector_codebook_is_on_by_default_and_can_be_turned_off():
     from vllm.config.sm70_dflash2 import Sm70DFlash2Config
 
     policy = Sm70DFlash2Config()
-    assert policy.sharded_selector_codebook is False
-    assert "sharded_selector_codebook" not in policy.graph_options()
-    policy = Sm70DFlash2Config(sharded_selector_codebook=True)
+    assert policy.sharded_selector_codebook is True
     assert policy.graph_options()["sharded_selector_codebook"] is True
+    # Off restores the earlier compile key: the field is not listed.
+    policy = Sm70DFlash2Config(sharded_selector_codebook=False)
+    assert "sharded_selector_codebook" not in policy.graph_options()
 
 
 def _stub_base(monkeypatch: pytest.MonkeyPatch, draft_logits):

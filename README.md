@@ -10,11 +10,11 @@ Run Qwen3.8 Flash-Next for text, images, and video, with an OpenAI-compatible AP
 > Volta (SM70) GPUs, with V100 attention kernels and CUDA graphs for the drafter and the
 > verifier, in the 512K-context setup with prefix caching and CPU KV offload. On one
 > request it writes English code at up to **234 tokens/s instead of 180** with MTP4 (1.30×)
-> on community NVLink hardware. In 0.1.3 (in testing), the GPU KV pool reaches **1.54 million tokens (2.94× at 512K)**. MTP4
+> on community NVLink hardware. In 0.1.3 (in testing), the GPU KV pool reaches **1.38 million tokens (2.63× at 512K)** with the recommended DFlash2 settings, and 1.54 million (2.94×) with state replay on. MTP4
 > stays the default: Chinese text and eight concurrent requests are still faster with MTP4.
 > [How to enable it](#dflash2-speculative-decoding-optional).
 
-- **GPU-resident context:** up to **1.54 million tokens**, with a reported maximum concurrency of **2.94× at 512K** (AWQ, E4M3 KV, DFlash2, 0.1.3); see [Weight and KV formats](#weight-and-kv-formats).
+- **GPU-resident context:** **1.38 million tokens** with a reported maximum concurrency of **2.63× at 512K** (AWQ, E4M3 KV, DFlash2 recommended settings, 0.1.3), up to 1.54 million (2.94×) with state replay on; see [Weight and KV formats](#weight-and-kv-formats).
 - **Weight formats:** standard AWQ, NVFP4, and NVIDIA FP4-Local.
 - **KV formats:** FP8 E4M3, FP16, and INT8.
 - **Speculative decoding:** native MTP4 by default, or DFlash2 with the incoai drafter
@@ -149,6 +149,225 @@ same repository as the target.
 
 Use `--dtype half`: V100 has no BF16 support.
 
+## Checkpoints, KV scales and MTP drafts
+
+E4M3 KV scales belong to a specific checkpoint revision. Keep
+`VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES=1` enabled: missing target scales then
+reject startup. Without it, missing target scales fall back to unit scale
+with a warning. That fallback is unvalidated and can saturate E4M3 values.
+An uncalibrated MTP draft with E4M3 draft KV is rejected even without strict
+target-scale checking. Use the draft's own scales or set its
+`"kv_cache_dtype": "float16"`.
+
+| Target checkpoint | E4M3 target scales | MTP draft | Draft KV dtype |
+| --- | --- | --- | --- |
+| Uncensored AWQ g32 | Included in the same checkpoint | Its own `mtp-fp8/`, including draft scales | `fp8_e4m3` (or `float16`) |
+| Base AWQ g32 | Included in the same checkpoint | Its own `mtp-fp8/`, converted and calibrated separately | `fp8_e4m3` (or `float16`) |
+| Standard NVFP4 `7b719225` | [NVFP4 pack](https://huggingface.co/leoncca/Qwen3.8-Flash-Next-NVFP4-QSA-FP8-E4M3-KV-Scales), `v1.2-base-7b719225`; materialize first | Uncensored FP8 MTP and its scales, included in that pack | `fp8_e4m3` (or `float16`) |
+| NVIDIA FP4-Local `b9ce18a6` | [FP4-Local pack](https://huggingface.co/leoncca/Qwen3.8-Flash-Next-FP4-Local-QSA-FP8-E4M3-KV-Scales), `v1.0-base-b9ce18a6`; materialize first | The checkpoint's built-in MTP layer | `float16`; draft scales are not yet published |
+
+DFlash2 drafts do not need these K/V scales. Their own configuration is in
+[DFlash2 speculative decoding](#dflash2-speculative-decoding-optional).
+When target E4M3 scales are unavailable, FP16 KV needs no calibration but
+holds roughly half as many KV tokens at the same memory budget. INT8 KV
+computes per-token, per-head scales at runtime; in the supported speculative
+configuration use MTP with both target and draft set to `int8`. INT8 KV
+cannot be combined with DFlash2 ([#25](https://github.com/Leonccaa/ReVolta/issues/25)).
+
+The following steps pin every download. Retain the downloaded base and pack:
+the materialized checkpoints and 512K YaRN views link to their files. Use a
+fresh output directory for each run. **Materialize before making YaRN views**:
+the materializer verifies the unmodified base index (and FP4-Local config).
+Both target and draft need YaRN; `--hf-overrides` only reaches the target.
+Views must also link directories such as `tensors/` and `calibration/`.
+Run these commands in the installed ReVolta environment and apply the
+[environment settings](#3-environment) before launching. These are checkpoint
+setup and minimal launch examples; use the rest of the quick-start launch
+options for the reference multimodal and CPU KV offload configuration.
+
+### Uncensored or Base AWQ
+
+Use the target and `mtp-fp8/` from the same repository. The default below is
+Uncensored. To use Base AWQ, change `variant` to `"base"`; its revision is
+pinned separately. No materialization is needed because both target and
+draft scales are already included.
+
+```bash
+python - <<'EOF'
+import json
+from pathlib import Path
+from huggingface_hub import snapshot_download
+
+variant = "uncensored"  # or "base"
+choices = {
+    "uncensored": ("leoncca/Qwen3.8-Flash-Next-Uncensored-AWQ-g32",
+                   "1fd7ab705731c9dacc3bcd5b5d15783c60706d64"),
+    "base": ("leoncca/Qwen3.8-Flash-Next-AWQ-g32",
+             "c6d84ec547717f71710f82ec3783027b61bbfc49"),
+}
+repo, revision = choices[variant]
+ckpt = Path("/data/revolta/models") / repo.split("/")[-1]
+views = Path("/data/revolta/views/awq")
+snapshot_download(repo, revision=revision, local_dir=ckpt)
+
+YARN = {"rope_type": "yarn", "factor": 2, "original_max_position_embeddings": 262144}
+
+def make_view(src: Path, dst: Path) -> None:
+    dst.mkdir(parents=True, exist_ok=False)
+    for item in src.iterdir():
+        if item.name not in ("config.json", ".cache", ".git"):
+            (dst / item.name).symlink_to(item.resolve(), target_is_directory=item.is_dir())
+    config = json.loads((src / "config.json").read_text())
+    text = config["text_config"]
+    rope = dict(text["rope_parameters"])
+    # Keep the outer default; YaRN applies only to text_config.
+    config["rope_parameters"] = dict(rope)
+    rope.update(YARN)
+    text["rope_parameters"] = dict(rope)
+    text["rope_scaling"] = dict(rope)
+    (dst / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+
+make_view(ckpt, views / "target-512k")
+make_view(ckpt / "mtp-fp8", views / "draft-512k")
+EOF
+
+VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES=1 \
+vllm serve /data/revolta/views/awq/target-512k \
+  --dtype half --tensor-parallel-size 4 --decode-context-parallel-size 2 \
+  --gpu-memory-utilization 0.95 --max-model-len 524288 \
+  --max-num-seqs 8 --max-num-batched-tokens 8192 \
+  --enable-chunked-prefill --enable-prefix-caching --mamba-cache-mode align \
+  --no-async-scheduling --kv-cache-dtype fp8_e4m3 \
+  --attention-backend FLASH_ATTN_V100 --kernel-config '{"ple_disk_cascade":false}' \
+  --speculative-config '{"method":"mtp","model":"/data/revolta/views/awq/draft-512k","quantization":"modelopt_mixed","num_speculative_tokens":4,"draft_sample_method":"greedy","attention_backend":"FLASH_ATTN_V100","kv_cache_dtype":"fp8_e4m3"}'
+```
+
+### Standard NVFP4 checkpoint setup
+
+The pack includes the 24 target scales and the optional Uncensored FP8 MTP
+draft with its own two K/V scales. Download only the base model separately.
+The draft is copied from Uncensored AWQ revision
+`1fd7ab705731c9dacc3bcd5b5d15783c60706d64`, including its license and provenance.
+ReVolta validated this pairing with **62.5% acceptance**; that number is a
+serving-test result, not an answer-quality measurement.
+
+```bash
+python - <<'EOF'
+import json
+import subprocess
+import sys
+from pathlib import Path
+from huggingface_hub import snapshot_download
+
+base = Path("/data/revolta/models/nvfp4-base")
+pack = Path("/data/revolta/models/nvfp4-pack-v1.2")
+merged = Path("/data/revolta/models/nvfp4-e4m3")
+views = Path("/data/revolta/views/nvfp4")
+snapshot_download("RadixArk/Qwen3.8-Flash-Next-NVFP4",
+                  revision="7b719225242aacd3dbd3f9407468c2ee9a9d2594", local_dir=base)
+snapshot_download("leoncca/Qwen3.8-Flash-Next-NVFP4-QSA-FP8-E4M3-KV-Scales",
+                  revision="v1.2-base-7b719225", local_dir=pack)
+subprocess.run([sys.executable, str(pack / "materialize_overlay.py"),
+                "--pack-dir", str(pack), "--base-checkpoint", str(base),
+                "--output-dir", str(merged)], check=True)
+
+YARN = {"rope_type": "yarn", "factor": 2, "original_max_position_embeddings": 262144}
+
+def make_view(src: Path, dst: Path) -> None:
+    dst.mkdir(parents=True, exist_ok=False)
+    for item in src.iterdir():
+        if item.name not in ("config.json", ".cache", ".git"):
+            (dst / item.name).symlink_to(item.resolve(), target_is_directory=item.is_dir())
+    config = json.loads((src / "config.json").read_text())
+    text = config["text_config"]
+    rope = dict(text["rope_parameters"])
+    # Keep the outer default; YaRN applies only to text_config.
+    config["rope_parameters"] = dict(rope)
+    rope.update(YARN)
+    text["rope_parameters"] = dict(rope)
+    text["rope_scaling"] = dict(rope)
+    (dst / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+
+make_view(merged, views / "target-512k")
+make_view(pack / "mtp-fp8", views / "draft-512k")
+EOF
+
+VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES=1 \
+vllm serve /data/revolta/views/nvfp4/target-512k \
+  --dtype half \
+  --tensor-parallel-size 4 --decode-context-parallel-size 2 \
+  --gpu-memory-utilization 0.95 --max-model-len 524288 \
+  --max-num-seqs 8 --max-num-batched-tokens 8192 \
+  --enable-chunked-prefill --enable-prefix-caching --mamba-cache-mode align \
+  --no-async-scheduling --kv-cache-dtype fp8_e4m3 \
+  --attention-backend FLASH_ATTN_V100 --kernel-config '{"ple_disk_cascade":false}' \
+  --speculative-config '{"method":"mtp","model":"/data/revolta/views/nvfp4/draft-512k","quantization":"modelopt_mixed","num_speculative_tokens":4,"draft_sample_method":"greedy","attention_backend":"FLASH_ATTN_V100","kv_cache_dtype":"fp8_e4m3"}'
+```
+
+### NVIDIA FP4-Local checkpoint setup
+
+The currently published pack contains only the 24 target scales. Draft scales
+are not yet published, so use the checkpoint's own MTP layer with FP16 draft
+KV (measured acceptance: **65.1%**). Omit the draft `model` field: the drafter
+uses the same materialized 512K view and its YaRN settings.
+
+Calibrated E4M3 scales for this MTP layer are being prepared. Until they are
+published in the pack, keep `"kv_cache_dtype": "float16"` for the draft: an E4M3
+draft cache without calibrated draft scales is rejected at startup.
+
+```bash
+python - <<'EOF'
+import json
+import subprocess
+import sys
+from pathlib import Path
+from huggingface_hub import snapshot_download
+
+base = Path("/data/revolta/models/fp4-local-base")
+pack = Path("/data/revolta/models/fp4-local-pack-v1.0")
+merged = Path("/data/revolta/models/fp4-local-e4m3")
+views = Path("/data/revolta/views/fp4-local")
+snapshot_download("nvidia/Qwen3.8-Flash-Next-FP4-Local",
+                  revision="b9ce18a6887e18c089fdea8509a33e63429a3300", local_dir=base)
+snapshot_download("leoncca/Qwen3.8-Flash-Next-FP4-Local-QSA-FP8-E4M3-KV-Scales",
+                  revision="v1.0-base-b9ce18a6", local_dir=pack)
+subprocess.run([sys.executable, str(pack / "materialize_overlay.py"),
+                "--pack-dir", str(pack), "--base-checkpoint", str(base),
+                "--output-dir", str(merged)], check=True)
+
+YARN = {"rope_type": "yarn", "factor": 2, "original_max_position_embeddings": 262144}
+
+def make_view(src: Path, dst: Path) -> None:
+    dst.mkdir(parents=True, exist_ok=False)
+    for item in src.iterdir():
+        if item.name not in ("config.json", ".cache", ".git"):
+            (dst / item.name).symlink_to(item.resolve(), target_is_directory=item.is_dir())
+    config = json.loads((src / "config.json").read_text())
+    text = config["text_config"]
+    rope = dict(text["rope_parameters"])
+    # Keep the outer default; YaRN applies only to text_config.
+    config["rope_parameters"] = dict(rope)
+    rope.update(YARN)
+    text["rope_parameters"] = dict(rope)
+    text["rope_scaling"] = dict(rope)
+    (dst / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+
+# The built-in MTP uses this same view; no separate draft directory is needed.
+make_view(merged, views / "target-512k")
+EOF
+
+VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES=1 \
+vllm serve /data/revolta/views/fp4-local/target-512k \
+  --quantization modelopt_mixed --dtype half \
+  --tensor-parallel-size 4 --decode-context-parallel-size 2 \
+  --gpu-memory-utilization 0.95 --max-model-len 524288 \
+  --max-num-seqs 8 --max-num-batched-tokens 8192 \
+  --enable-chunked-prefill --enable-prefix-caching --mamba-cache-mode align \
+  --no-async-scheduling --kv-cache-dtype fp8_e4m3 \
+  --attention-backend FLASH_ATTN_V100 --kernel-config '{"ple_disk_cascade":false}' \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":4,"draft_sample_method":"greedy","attention_backend":"FLASH_ATTN_V100","kv_cache_dtype":"float16"}'
+```
+
 ## Quick start
 
 Reference configuration: Uncensored AWQ g32, TP4 + DCP2,
@@ -198,6 +417,14 @@ settings. `--hf-overrides` reaches only the target model, so make two "view"
 directories instead. Each view links to every checkpoint file and contains an edited
 `config.json`. The validated setup used views of this kind.
 
+YaRN in vLLM is static: it applies the same scaling to every request, short or long.
+Qwen's model card notes that this can lower quality on shorter texts and advises
+enabling YaRN only when long contexts are needed. ReVolta's quality measurements
+compare against a BF16 reference that also uses YaRN, so they do not show this
+effect. If your requests stay within 262,144 tokens, you can skip the views: serve the
+checkpoint directory itself with `--max-model-len 262144`, and use its `mtp-fp8/`
+directory as the MTP draft. The full acceptance ran with the 512K views.
+
 ```bash
 python - <<'EOF'
 import json
@@ -214,10 +441,10 @@ YARN = {"rope_type": "yarn", "factor": 2, "original_max_position_embeddings": 26
 def make_view(src: Path, dst: Path) -> None:
     dst.mkdir(parents=True, exist_ok=True)
     for item in src.iterdir():
-        if item.is_file() and item.name != "config.json":
+        if item.name not in ("config.json", ".cache", ".git"):
             link = dst / item.name
             if not link.exists():
-                link.symlink_to(item.resolve())
+                link.symlink_to(item.resolve(), target_is_directory=item.is_dir())
     config = json.loads((src / "config.json").read_text())
     text = config["text_config"]
     rope = dict(text["rope_parameters"])
@@ -363,6 +590,29 @@ In the startup log, look for:
   default).
 - `SM70 interconnect=pex_p2p` (or `no_p2p` / `nvlink`) from each worker.
 
+### 6. Sampling parameters
+
+The server takes default sampling values from the checkpoint's `generation_config.json`
+(`temperature` 1.0, `top_p` 0.95, `top_k` 20), but only for fields that a request
+leaves out. Many chat clients send their own `temperature` and `top_p`, so check the
+client settings. Qwen recommends:
+
+| Mode | `temperature` | `top_p` | `top_k` | `min_p` | `presence_penalty` | `repetition_penalty` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Thinking (default) | 1.0 | 0.95 | 20 | 0.0 | 0.0 | 1.0 |
+| Non-thinking | 0.7 | 0.80 | 20 | 0.0 | 1.5 | 1.0 |
+
+- **Endless repetition:** Qwen suggests a `presence_penalty` between 0 and 2. Higher values
+  can mix languages and slightly lower quality.
+- `presence_penalty` can only be set per request. `--override-generation-config` sets
+  server defaults for `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty` and
+  `max_new_tokens` only.
+- `top_k` and `min_p` are not standard OpenAI fields. With the OpenAI Python SDK, pass them
+  in `extra_body`.
+- These are the model vendor's values. The speed tests in this README use
+  `temperature=0`. The greedy `draft_sample_method` in the launch command applies only to
+  draft verification, not to these request settings.
+
 ### Docker
 
 The image entry point is `vllm serve`. Mount the model and view directories at the
@@ -427,10 +677,10 @@ snapshot_download("incoai/Qwen3.8-Flash-Next-DFlash2", local_dir=src,
 
 dst.mkdir(parents=True, exist_ok=True)
 for item in src.iterdir():
-    if item.is_file() and item.name != "config.json":
+    if item.name not in ("config.json", ".cache", ".git"):
         link = dst / item.name
         if not link.exists():
-            link.symlink_to(item.resolve())
+            link.symlink_to(item.resolve(), target_is_directory=item.is_dir())
 config = json.loads((src / "config.json").read_text())
 config["dflash_config"]["target_feature_reduction"] = "hc_mean"
 config["max_position_embeddings"] = 524288   # the drafter's layers keep a 2048-token window
@@ -453,7 +703,8 @@ export VLLM_SM70_DFLASH2_FUSED_QKV_PACK=1
       "dflash_concurrency_drafts": {"4": 3, "5": 4},
       "sm70_dflash2": {"context_kv_graph": true, "context_pipeline": true,
         "verify_fastpath": true, "fused_gdn_metadata": true,
-        "fused_smallq_metadata": true, "grouped_smallq_metadata": true}}' \
+        "fused_smallq_metadata": true, "grouped_smallq_metadata": true,
+        "spec_state_replay": false}}' \
 ```
 
 In the startup log, the AWQ MoE line should read `grouped QPN decode admitted for 2..48
@@ -476,7 +727,7 @@ Settings:
   throughput about 1.5% higher. Like every `VLLM_*` variable, it is part of the
   torch.compile key, so a deployment that sets it builds its own compile cache.
 - **CUDA graph memory is set by the profile from 0.1.3.** With DFlash2 on AWQ TP4, the ReVolta profile reserves 1200 MiB per GPU (`VLLM_V2_CUDAGRAPH_MEM_MIB`) and leaves the single-request verifier tail graphs off (`VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS=0`). The graphs take about 1.1 GiB per GPU instead of 1.4 GiB. Greedy output was identical in the single-request comparison, including a 256K-token prompt; repeated comparisons found no consistent speed penalty at one or three requests. MTP4 keeps 700 MiB. Remove a previous explicit 1500 MiB setting to use the new default: environment values override the profile. If you turn the tail graphs back on, also set `VLLM_V2_CUDAGRAPH_MEM_MIB=1500`. A reserve smaller than the graphs lets the KV pool take that memory, and concurrent long prompts can then run out of GPU memory.
-- **Speculative state replay is on by default with DFlash2 from 0.1.3.** It recomputes the accepted GDN recurrent state after verification instead of keeping a state for every draft position. To turn it off, add `"spec_state_replay": false` inside `sm70_dflash2` in `--speculative-config` (`sm70_dflash2.spec_state_replay=false`). See [State replay in 0.1.3](#state-replay-in-013) for the measured memory and speed tradeoff.
+- **Keep state replay off (`"spec_state_replay": false`).** Replay is on by default with DFlash2 from 0.1.3 and saves KV memory, but it adds about 7 ms per decoding step when the target samples. The recommended configuration above turns it off; see [State replay in 0.1.3](#state-replay-in-013).
 - **`dflash_concurrency_drafts`** maps a number of running requests (the threshold) to the
   number of drafts the target verifies per request (the width). The drafter still drafts
   7 tokens. With `{"4": 3, "5": 4}`, one to three running requests verify all 7 drafts,
@@ -502,7 +753,7 @@ What to expect:
   batch sizes.
 - English code and reasoning gain the most. Chinese is slower than MTP4 in almost every
   measured case: the drafter was trained on English. Very long prompts also favour MTP4.
-- With the 0.1.3 DFlash2 defaults (state replay, sharded selector codebooks and the new graph settings), the measured GPU KV pool is 1,542,558 tokens, with a reported maximum concurrency of 2.94× at 512K. The 0.1.2 DFlash2 configuration measured 1,268,831 tokens (2.42×); see [Weight and KV formats](#weight-and-kv-formats).
+- With the recommended 0.1.3 settings (sharded selector codebooks, the new graph settings, state replay off), the measured GPU KV pool is 1,379,634 tokens, with a reported maximum concurrency of 2.63× at 512K; with state replay on it is 1,542,558 tokens (2.94×). The 0.1.2 DFlash2 configuration measured 1,268,831 tokens (2.42×); see [Weight and KV formats](#weight-and-kv-formats).
 - On a replay of real agent sessions (one request at a time, sampling, long reasoning),
   DFlash2 and MTP4 were on par: 0.97× the MTP4 speed (95% interval 0.90–1.01). DFlash2
   was ahead on tool calls, answers and contexts up to 64K, and behind in reasoning, above
@@ -611,7 +862,8 @@ Measured on our 4x V100 PCIe deployment with TP4 + DCP2, `--gpu-memory-utilizati
 
 | Format | Measured version | Method | GPU KV capacity, tokens | Maximum concurrency at 512K |
 | --- | --- | --- | ---: | ---: |
-| Uncensored AWQ g32 + E4M3 KV | 0.1.3, in testing | DFlash2 defaults | **1,542,558** | **2.94×** |
+| Uncensored AWQ g32 + E4M3 KV | 0.1.3, in testing | DFlash2 recommended (state replay off) | **1,379,634** | **2.63×** |
+| Uncensored AWQ g32 + E4M3 KV | 0.1.3, in testing | DFlash2 with state replay | 1,542,558 | 2.94× |
 | Uncensored AWQ g32 + E4M3 KV | 0.1.2 | DFlash2 | 1,268,831 | 2.42× |
 | Uncensored AWQ g32 + E4M3 KV | 0.1.2 | MTP4 | 1,153,143 | 2.20× |
 | Uncensored AWQ g32 + INT8 KV | 0.1.2 | MTP4 | 1,140,072 | 2.17× |
@@ -660,19 +912,17 @@ about 5–8% slower. CPU offload works; the disk tier is not supported with INT8
 
 ### Standard NVFP4
 
-Tested revision: `7b719225` of
-[RadixArk/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4),
-about 126 GiB. Add the 24 calibrated scales from
-[the QSA E4M3 scale pack](https://huggingface.co/leoncca/Qwen3.8-Flash-Next-NVFP4-QSA-FP8-E4M3-KV-Scales)
-to the model index.
+The checkpoint is about 126 GiB. Follow the
+[checkpoint setup](#standard-nvfp4-checkpoint-setup) for the pinned base,
+combined scale/draft pack and 512K views.
 
-Use `--quantization modelopt_mixed`. On the FP16 QSA SM70 TP4 profile,
+`--quantization` is not needed. The engine reads `quant_algo: NVFP4` from the
+checkpoint and selects `modelopt_fp4`; this replaces a `--quantization` value given on
+the command line. On the FP16 QSA SM70 TP4 profile,
 ReVolta detects NVFP4 weights from checkpoint quantization metadata and sets
 the validated kernel switches and a 700 MiB CUDA graph reserve automatically.
 Explicit environment settings take precedence. The startup profile audit logs
 each value and its source (`profile`, `environment`, or `upstream_default`).
-Validation used the FP8 MTP draft from the Uncensored AWQ repository, with
-62.5% acceptance.
 
 ### NVIDIA FP4-Local
 
@@ -685,13 +935,9 @@ weights to FP16 so that their dimensions can be sharded correctly. This configur
 passed the large-image and video stress tests.
 
 The PLE table uses about 26.8 GiB of pinned host memory across four ranks.
-Use the checkpoint's own MTP layer with `"kv_cache_dtype": "float16"` and no draft
-`model` field. Measured acceptance was 65.1%.
-
-Use `--quantization modelopt_mixed`; the same automatic NVFP4 profile applies. The checkpoint has
-no QSA E4M3 KV scales; download the calibrated 24-scale pack
-[`leoncca/Qwen3.8-Flash-Next-FP4-Local-QSA-FP8-E4M3-KV-Scales`](https://huggingface.co/leoncca/Qwen3.8-Flash-Next-FP4-Local-QSA-FP8-E4M3-KV-Scales)
-(tag `v1.0-base-b9ce18a6`) and build a checkpoint view with its `materialize_overlay.py`.
+Use `--quantization modelopt_mixed`; the same automatic NVFP4 profile applies.
+Follow the [checkpoint setup](#nvidia-fp4-local-checkpoint-setup) for pinned
+downloads, the target-scale overlay, 512K views and the current FP16 MTP draft KV.
 
 ## Performance
 
@@ -772,9 +1018,9 @@ replay of real agent sessions (one request at a time, sampling), the two were on
 
 ### State replay in 0.1.3
 
-State replay is enabled by default when using DFlash2. With replay, sharded selector codebooks and the new graph defaults, the reference setup measured **1,542,558 KV tokens (2.94× maximum concurrency at 512K)**, up 21.6% from 0.1.2 DFlash2's 1,268,831 (2.42×). At eight concurrent 96K-token requests, peak KV use fell to **26% from 60%**, with no preemption. These are 250 W measurements of the 0.1.3 candidate configuration; release acceptance is still in progress.
+GDN speculative state replay (`sm70_dflash2.spec_state_replay`, on by default with DFlash2) adds about 7 ms per decoding step when the target samples (30.6 to 37.9 ms per step at one request on our 4x V100 PCIe deployment) and costs 2 to 3% of throughput with greedy decoding at one request (5 to 7% at eight). The reference deployment therefore turns it off with `"sm70_dflash2": {"spec_state_replay": false}`; outputs are unchanged either way.
 
-The measured speed cost against 0.1.2 DFlash2 was about **2–3% at one request** and **5–7% at eight requests**. Replay's recurrent-state update runs outside CUDA graphs. To disable it, set `"spec_state_replay": false` inside `sm70_dflash2` in `--speculative-config` (`sm70_dflash2.spec_state_replay=false`); this uses more KV memory. MTP4 remains the default speculative method.
+With replay off, DFlash2 keeps the other 0.1.3 memory changes (sharded selector codebooks, verifier tail graphs off, 1200 MiB graph reserve): 1,379,634 KV tokens at 512K against 1,268,831 in 0.1.2. Replay adds about 11% more (1,542,558); at eight concurrent 96K-token requests it lowered peak KV use from 60% to 26%. MTP4 remains the default speculative method.
 
 ### NVLink (community result)
 

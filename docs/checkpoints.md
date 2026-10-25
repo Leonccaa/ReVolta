@@ -283,7 +283,7 @@ On the measured sets, INT8 has slightly lower KL and similar top-1 agreement to
 E4M3. This has not established a difference in task-level answer quality.
 
 Capacity is 1.1–1.3% lower than E4M3. Prefill speed is within ±1.3%; decoding is
-about 5–8% slower. CPU offload works; the disk tier is not supported with INT8 in 0.1.2.
+about 5–8% slower. CPU offload works; the disk tier is not supported with INT8 yet.
 
 ## Standard NVFP4
 

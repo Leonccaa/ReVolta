@@ -36,7 +36,7 @@ or disable custom all-reduce with `--disable-custom-all-reduce`.
 - `cpu_bytes_to_use` is the total for all four workers (48 GiB = 12 GiB per worker).
 - **Keep `--limit-mm-per-prompt` on V100.** With FlashAttention-V100, the engine allows
   1 image and no video per request without it, and a value that leaves out `"video"`
-  disables video. This V100 default is kept in 0.1.2. `{"image": 16, "video": 1}`
+  disables video. 0.1.3 keeps this V100 default. `{"image": 16, "video": 1}`
   keeps the reference deployment's limits; Qwen3.8 Flash-Next takes images and video,
   not audio, so no audio limit is set. To use the generic image count instead, set
   `--limit-mm-per-prompt '{"image": 8, "video": 1}'`; a lower image count leaves more

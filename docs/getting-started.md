@@ -31,7 +31,7 @@ differs: it pins the same versions to the CUDA 12.8 builds on `download.pytorch.
 and has the generic `linux_x86_64` tag.
 
 ```bash
-pip install "https://github.com/Leonccaa/ReVolta/releases/download/v0.1.2/revolta-0.1.2-cp312-cp312-linux_x86_64.whl"
+pip install "https://github.com/Leonccaa/ReVolta/releases/download/v0.1.3/revolta-0.1.3-cp312-cp312-linux_x86_64.whl"
 ```
 
 ReVolta does not send the anonymous usage statistics that upstream vLLM reports.

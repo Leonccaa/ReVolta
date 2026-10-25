@@ -80,7 +80,7 @@ use a larger CPU pool and set `max_size_bytes` to your disk budget.
   be larger than the largest prefix you expect to restore from disk (about 21 KB per
   token; a 100K-token prefix needs more than 2 GiB). Otherwise the request is computed
   again. The quick-start 48 GiB pool holds about 2.4M tokens.
-- The SSD tier is **not supported with INT8 KV** in 0.1.2. That combination is
+- The SSD tier is **not supported with INT8 KV** yet. That combination is
   rejected at configuration time.
 
 Validation scope: the SSD tier was tested with its root on a network file system. The

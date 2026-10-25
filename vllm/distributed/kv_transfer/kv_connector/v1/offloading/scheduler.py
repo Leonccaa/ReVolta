@@ -676,6 +676,9 @@ class OffloadingConnectorScheduler:
         req_status = self._req_status[request.request_id]
         for group_state in req_status.group_states:
             group_state.block_ids.clear()
+            # Restarting at token 0: offer every block again; resident keys
+            # are filtered by prepare_store (vllm-project/vllm#63010).
+            group_state.next_stored_block_idx = 0
 
         # A preempted request can return before its stores have completed.
         # Its preemption metadata will flush them before the next forward.

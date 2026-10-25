@@ -10,12 +10,15 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pydantic import BaseModel, Field, ValidationError
 
 from vllm.entrypoints.anthropic.api_router import (
     attach_router,
     translate_error_response,
 )
 from vllm.entrypoints.openai.engine.protocol import ErrorInfo, ErrorResponse
+from vllm.exceptions import VLLMNotFoundError, VLLMValidationError
+from vllm.renderers.params import TokenizeParams
 
 pytestmark = pytest.mark.skip_global_cleanup
 
@@ -139,14 +142,20 @@ def test_stream_invalid_data_format_maps_to_api_error():
     }
 
 
-def _client_with_failing_handler() -> TestClient:
+def _client_with_handler(handler: MagicMock) -> TestClient:
     app = FastAPI()
     attach_router(app)
-    handler = MagicMock()
-    handler.create_messages = AsyncMock(side_effect=RuntimeError("exploded"))
-    handler.count_tokens = AsyncMock(side_effect=RuntimeError("exploded"))
     app.state.anthropic_serving_messages = handler
     return TestClient(app)
+
+
+def _client_with_failing_handler(error: Exception | None = None) -> TestClient:
+    if error is None:
+        error = RuntimeError("exploded")
+    handler = MagicMock()
+    handler.create_messages = AsyncMock(side_effect=error)
+    handler.count_tokens = AsyncMock(side_effect=error)
+    return _client_with_handler(handler)
 
 
 _REQUEST_BODY = {
@@ -168,3 +177,124 @@ def test_unhandled_handler_exception_maps_to_api_error(path: str):
         "type": "error",
         "error": {"type": "api_error", "message": "exploded"},
     }
+
+
+@pytest.mark.parametrize(
+    ("path", "stream"),
+    [
+        ("/v1/messages", False),
+        ("/v1/messages", True),
+        ("/v1/messages/count_tokens", False),
+    ],
+)
+def test_overlong_prompt_returns_bad_request(path: str, stream: bool):
+    """Exercise the real token-length validator without a tokenizer or engine.
+
+    The serving layer raises this exception before returning a stream, too.
+    """
+    params = TokenizeParams(
+        max_total_tokens=8,
+        max_output_tokens=0 if path.endswith("count_tokens") else 1,
+    )
+    with pytest.raises(VLLMValidationError) as exc:
+        params.apply_post_tokenization(None, {"prompt_token_ids": list(range(9))})
+
+    body = dict(_REQUEST_BODY)
+    body["max_tokens"] = 1
+    if path.endswith("count_tokens"):
+        body.pop("max_tokens")
+    else:
+        body["stream"] = stream
+    with _client_with_failing_handler(exc.value) as client:
+        response = client.post(path, json=body)
+    assert response.status_code == HTTPStatus.BAD_REQUEST
+    assert response.json() == {
+        "type": "error",
+        "error": {"type": "invalid_request_error", "message": str(exc.value)},
+    }
+    assert "maximum context length is 8 tokens" in str(exc.value)
+
+
+@pytest.mark.parametrize("path", ["/v1/messages", "/v1/messages/count_tokens"])
+def test_conversion_validation_error_returns_bad_request(path: str):
+    """Adapted from vllm-project/vllm#52246; retain Anthropic error types."""
+
+    class StubRequest(BaseModel):
+        stop: list[str] = Field(max_length=4)
+
+    with pytest.raises(ValidationError) as exc:
+        StubRequest(stop=["a"] * 6)
+    body = dict(_REQUEST_BODY)
+    if path.endswith("count_tokens"):
+        body.pop("max_tokens")
+    with _client_with_failing_handler(exc.value) as client:
+        response = client.post(path, json=body)
+    assert response.status_code == HTTPStatus.BAD_REQUEST
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    assert "at most 4 items" in response.json()["error"]["message"]
+
+
+@pytest.mark.parametrize("path", ["/v1/messages", "/v1/messages/count_tokens"])
+@pytest.mark.parametrize("raised", [True, False])
+def test_unknown_model_returns_not_found(path: str, raised: bool):
+    message = "The model `missing-model` does not exist."
+    if raised:
+        client = _client_with_failing_handler(VLLMNotFoundError(message))
+    else:
+        error = ErrorResponse(
+            error=ErrorInfo(
+                message=message, type="NotFoundError", code=HTTPStatus.NOT_FOUND
+            )
+        )
+        handler = MagicMock()
+        handler.create_messages = AsyncMock(return_value=error)
+        handler.count_tokens = AsyncMock(return_value=error)
+        client = _client_with_handler(handler)
+    body = dict(_REQUEST_BODY, model="missing-model")
+    if path.endswith("count_tokens"):
+        body.pop("max_tokens")
+    with client:
+        response = client.post(path, json=body)
+    assert response.status_code == HTTPStatus.NOT_FOUND
+    assert response.json() == {
+        "type": "error",
+        "error": {"type": "not_found_error", "message": message},
+    }
+
+
+@pytest.mark.parametrize("error", [ValueError("late validation"), RuntimeError("boom")])
+def test_mid_stream_exception_keeps_http_ok_and_api_error(error: Exception):
+    """Once SSE starts, the router's pre-stream exception mapping cannot run."""
+    from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
+
+    async def upstream():
+        chunk = {
+            "id": "chatcmpl-test",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "test-model",
+            "choices": [{"index": 0, "delta": {"role": "assistant"}}],
+        }
+        yield f"data: {json.dumps(chunk)}\n\n"
+        chunk["choices"] = [{"index": 0, "delta": {"content": "hello"}}]
+        yield f"data: {json.dumps(chunk)}\n\n"
+        raise error
+
+    converter = AnthropicServingMessages.__new__(AnthropicServingMessages)
+    handler = MagicMock()
+    handler.create_messages = AsyncMock(
+        return_value=converter.message_stream_converter(upstream())
+    )
+    with _client_with_handler(handler) as client:
+        response = client.post("/v1/messages", json=dict(_REQUEST_BODY, stream=True))
+    assert response.status_code == HTTPStatus.OK
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert "event: message_start" in response.text
+    assert "hello" in response.text
+    assert _sse_error_payloads(response.text.split("\n\n")) == [
+        {
+            "type": "error",
+            "error": {"type": "api_error", "message": str(error)},
+        }
+    ]
+    assert "event: message_stop" not in response.text

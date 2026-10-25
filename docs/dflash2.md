@@ -91,7 +91,7 @@ rows (split=8, pack_rows=24, up to 2 row chunks)`.
   throughput about 1.5% higher. Like every `VLLM_*` variable, it is part of the
   torch.compile key, so a deployment that sets it builds its own compile cache.
 - **CUDA graph memory is set by the profile from 0.1.3.** With DFlash2 on AWQ TP4, the ReVolta profile reserves 1200 MiB per GPU (`VLLM_V2_CUDAGRAPH_MEM_MIB`) and leaves the single-request verifier tail graphs off (`VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS=0`). The graphs take about 1.1 GiB per GPU instead of 1.4 GiB. Greedy output was identical in the single-request comparison, including a 256K-token prompt; repeated comparisons found no consistent speed penalty at one or three requests. MTP4 keeps 700 MiB. Remove a previous explicit 1500 MiB setting to use the new default: environment values override the profile. If you turn the tail graphs back on, also set `VLLM_V2_CUDAGRAPH_MEM_MIB=1500`. A reserve smaller than the graphs lets the KV pool take that memory, and concurrent long prompts can then run out of GPU memory.
-- **Keep state replay off (`"spec_state_replay": false`).** Replay is on by default with DFlash2 from 0.1.3 and saves KV memory, but it adds about 7 ms per decoding step when the target samples. The recommended configuration above turns it off; see [State replay in 0.1.3](performance.md#state-replay-in-013).
+- **State replay is optional and off by default from 0.1.4.** It adds GPU KV capacity at a small per-step cost; see [State replay (optional)](#state-replay-optional). The explicit `"spec_state_replay": false` above matches the default.
 - **`dflash_concurrency_drafts`** maps a number of running requests (the threshold) to the
   number of drafts the target verifies per request (the width). The drafter still drafts
   7 tokens. With `{"4": 3, "5": 4}`, one to three running requests verify all 7 drafts,
@@ -109,6 +109,23 @@ rows (split=8, pack_rows=24, up to 2 row chunks)`.
   measured best at 8 requests.
 - Setting `dflash_concurrency_drafts` turns off async scheduling; `--async-scheduling`
   together with it is an error. Pipeline parallelism is not supported with DFlash2.
+
+## State replay (optional)
+
+GDN speculative state replay keeps two recurrent-state blocks per running request instead of nine: the verifier stores no per-draft state, and after sampling the accepted tokens are replayed into the request's block. It is off by default from 0.1.4. Turn it on for long contexts or more concurrent requests:
+
+```bash
+      "sm70_dflash2": {"context_kv_graph": true, "context_pipeline": true,
+        "verify_fastpath": true, "fused_gdn_metadata": true,
+        "fused_smallq_metadata": true, "grouped_smallq_metadata": true,
+        "spec_state_replay": true}}' \
+```
+
+- **Gain:** the GPU KV pool grew from 1,379,634 to 1,542,558 tokens (+11.8%; 2.63× to 2.94× maximum concurrency at 512K) on our 4 × V100 PCIe deployment. At eight concurrent 96K-token requests, peak KV use fell from 55% to 26%.
+- **Cost (0.1.4, measured in the same session):** about +0.44 ms per decoding step when the target samples (30.05 to 30.49 ms per step at one request, 30 replayed agent turns); with greedy decoding about 1–4% lower throughput at one to four requests and level at eight. Outputs were identical with replay on and off (24 of 24 greedy streams, 30 of 30 sampled turns).
+- **Who should use it:** deployments that run long contexts or several long requests at once and are limited by KV capacity. For single short requests, leave it off.
+- **CUDA graph:** with replay on, the replay after sampling runs as a CUDA graph (`"spec_state_replay_graph": true`, the default). Without it, the replay's launches cost about 5 ms per step with sampling, because sampling has already drained the GPU queue. One graph is captured per verify shape, the second time the shape runs; with the `{"4": 3, "5": 4}` width policy that is eight graphs (one to eight requests). Each capture takes 35–90 ms once, at the step that first meets the shape. The graphs added no measurable GPU memory (peak 31,564 MiB per GPU with them, 31,580 MiB without, in the same benchmark). With all eight captured, eight concurrent 96K-token requests completed without preemption at 27% peak KV use, and GPU memory peaked at 31,884 of 32,768 MiB per GPU.
+- Replay needs Model Runner V2, `--mamba-cache-mode align`, synchronous scheduling and no pipeline parallelism; elsewhere it stays off with a log line.
 
 ## What to expect
 

@@ -1,0 +1,159 @@
+{
+  "schema_version": 1,
+  "release_tag": "v1.1-base-b9ce18a6",
+  "status": "VALIDATED",
+  "base_checkpoint": {
+    "config_sha256": "b50dbc52a0c83b0cd2a44a372c1fb6b5e0e6827d22f2611c97d4d030f92f6b28",
+    "index_sha256": "5fa166bbb1cf25adda455117563efa72a2072272001f459eedece131ffc913e1",
+    "qsa_layer_ids": [
+      3,
+      7,
+      11,
+      15,
+      19,
+      23,
+      27,
+      31,
+      35,
+      39,
+      43,
+      47
+    ],
+    "repo_id": "nvidia/Qwen3.8-Flash-Next-FP4-Local",
+    "revision": "b9ce18a6887e18c089fdea8509a33e63429a3300"
+  },
+  "scale_contract": "e4m3fn(x/scale), max_abs/448",
+  "scale_file": {
+    "filename": "model-kvscales-mtp.safetensors",
+    "size_bytes": 296,
+    "sha256": "21e015d1285e56cfd81796d0563b6ae7f25df76753e3572006ddee681cd762c7",
+    "tensor_names": [
+      "mtp.layers.0.self_attn.k_scale",
+      "mtp.layers.0.self_attn.v_scale"
+    ],
+    "tensor_count": 2
+  },
+  "tensors": [
+    {
+      "name": "mtp.layers.0.self_attn.k_scale",
+      "f32_hex": "3e570000",
+      "count": 5022244864,
+      "kind": "k",
+      "layer_id": 48,
+      "max_abs": 94.0625,
+      "p99_99_abs_upper_bound": 92.24147962423204,
+      "p99_9_abs_upper_bound": 91.0011265388266,
+      "saturation_ratio": 0.0,
+      "scale": 0.2099609375,
+      "shard_scale_max_over_global": 1.0,
+      "shard_scale_min_over_global": 0.9887043797692587,
+      "shard_scales": {
+        "chinese-128k": 0.2080078125,
+        "chinese-16k": 0.2078683078289032,
+        "chinese-64k": 0.2075892984867096,
+        "code-128k": 0.2084263414144516,
+        "code-16k": 0.2075892984867096,
+        "code-64k": 0.208147332072258,
+        "tool-sessions-250k": 0.208984375,
+        "tool-sessions-500k": 0.208984375,
+        "tool-sessions-800k": 0.208984375,
+        "english-128k": 0.2099609375,
+        "english-16k": 0.2080078125,
+        "english-64k": 0.2087053656578064,
+        "short-prompts": 0.2084263414144516,
+        "tool-calls-short": 0.2082868367433548
+      }
+    },
+    {
+      "name": "mtp.layers.0.self_attn.v_scale",
+      "f32_hex": "3d40db6e",
+      "count": 5022244864,
+      "kind": "v",
+      "layer_id": 48,
+      "max_abs": 21.09375,
+      "p99_99_abs_upper_bound": 7.640111801081559,
+      "p99_9_abs_upper_bound": 4.724738147184371,
+      "saturation_ratio": 0.0,
+      "scale": 0.0470842644572258,
+      "shard_scale_max_over_global": 1.0,
+      "shard_scale_min_over_global": 0.65259260044595,
+      "shard_scales": {
+        "chinese-128k": 0.0313197560608387,
+        "chinese-16k": 0.0307268425822258,
+        "chinese-64k": 0.0350516214966774,
+        "code-128k": 0.03759765625,
+        "code-16k": 0.0337611623108387,
+        "code-64k": 0.03662109375,
+        "tool-sessions-250k": 0.0470842644572258,
+        "tool-sessions-500k": 0.0470842644572258,
+        "tool-sessions-800k": 0.0470842644572258,
+        "english-128k": 0.0316859669983387,
+        "english-16k": 0.03955078125,
+        "english-64k": 0.0319475457072258,
+        "short-prompts": 0.0385393425822258,
+        "tool-calls-short": 0.044189453125
+      }
+    }
+  ],
+  "derived_view": {
+    "scale_path": "calibration/model-kvscales-mtp.safetensors",
+    "index_sha256": "4d62e0bd87132707e45c4399cc2fa0dfd837d6d044b924d2d65fa9bb39d79cad",
+    "indexed_file_count": 23
+  },
+  "calibration": {
+    "helper_sha256": "bc0fe6aaf2607f045391a98da6e22b229fb1bc5ac9f52f644182eeb89bc1f44b",
+    "corpus_manifest_sha256": "d0c137ad2c61cbe14ad99bfcfb2f1039800b35f414a1b9eac665f26f53f0783c",
+    "summary_sha256": "e619b62a77dc62359d38585c51b451e2f7384e7cec6367bff60e0b9c384ba944",
+    "prompt_count": 4904,
+    "corpus_shards": 14,
+    "method": "max_abs/448 rounded up to FP32",
+    "target_kv": "float16",
+    "draft_kv": "float16",
+    "native_mtp": 4,
+    "enforce_eager": true,
+    "prefix_cache": false,
+    "max_tokens": 1,
+    "shard_label_note": "Shard labels are descriptive; the corpus is not distributed."
+  },
+  "validation": {
+    "date": "2026-10-25",
+    "hardware": "4 x Tesla V100 32 GB (SM70)",
+    "runtime": "ReVolta 0.1.3",
+    "runtime_contract": {
+      "tensor_parallel_size": 4,
+      "decode_context_parallel_size": 2,
+      "dtype": "float16",
+      "target_kv_cache_dtype": "fp8_e4m3",
+      "draft": "built-in MTP layer, 4 speculative tokens, greedy drafting",
+      "draft_kv_cache_dtype": "fp8_e4m3",
+      "strict_scales": true
+    },
+    "scale_gates": "strict loading passed for 24/24 target and 2/2 draft K/V scales",
+    "paired_draft_kv_test": {
+      "description": "same E4M3 target view and settings; only the draft KV cache dtype changed; 16 prompts per run",
+      "greedy": {
+        "float16": {
+          "completed": "16/16",
+          "acceptance": 0.644
+        },
+        "fp8_e4m3": {
+          "completed": "16/16",
+          "acceptance": 0.6308
+        }
+      },
+      "sampled_temperature_0_7": {
+        "float16": {
+          "completed": "16/16",
+          "acceptance": 0.6188
+        },
+        "fp8_e4m3": {
+          "completed": "16/16",
+          "acceptance": 0.6203
+        }
+      },
+      "acceptance_definition": "accepted draft tokens / proposed draft tokens; not an answer-quality benchmark"
+    },
+    "functional_check": "passed a 512K-context serving smoke with E4M3 target and draft KV: greedy self-repeat at 1K to 32K prompts, image and table questions, and startup checks",
+    "not_tested": "answer quality against BF16 with the E4M3 draft cache; other GPUs and parallel layouts"
+  }
+}

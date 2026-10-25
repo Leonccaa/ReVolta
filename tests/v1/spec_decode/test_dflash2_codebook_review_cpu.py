@@ -40,12 +40,17 @@ def test_all_valid_ids_have_exactly_one_owner_and_match_replicated(vocab, tp):
     )
 
 
-def test_all_reduce_of_zeros_preserves_codebook_bits_including_negative_zero():
+def test_all_reduce_of_zeros_keeps_nonzero_bits_and_zero_values():
+    # Accepted behaviour (#9, 0.1.3 release notes): the owner's finite nonzero
+    # values come back bitwise; a zero keeps its value, but adding +0.0 from the
+    # other ranks may clear the sign of an owner's -0.0.
     table = torch.tensor([[1.0, -0.0], [-0.0, -2.0], [3.0, -0.0]]).half()
     actual = _lookup(table, torch.arange(3), 4)
-    assert torch.equal(actual.view(torch.int16), table.view(torch.int16)), (
-        "Floating-point addition of positive zeros changes negative-zero bits"
+    nonzero = table != 0
+    assert torch.equal(
+        actual[nonzero].view(torch.int16), table[nonzero].view(torch.int16)
     )
+    assert torch.equal(actual[~nonzero], table[~nonzero])  # -0.0 == +0.0
 
 
 @pytest.mark.parametrize("shape", [(16, 3), (18, 3), (17, 1)])

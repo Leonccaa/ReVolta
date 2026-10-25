@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Independent replay review: CPU contracts, including unresolved regressions.
+"""Independent replay review (#20): CPU contracts.
 
-These assertions state the intended contracts. Failing tests are deliberately
-left visible for the implementation owner; this file does not patch runtime code.
+Written for the review of #21; the replay policy and the verifier admission
+assertions follow what 0.1.3 settled (#21: replay=None yields to the packed
+verifier under the qualified contract; with replay on the mixed-QKV verifier
+admits every verify batch).
 """
 
 import hashlib
@@ -62,16 +64,25 @@ def resolve(monkeypatch):
     return resolver
 
 
-def test_default_qualified_policy_really_enables_replay(resolve, monkeypatch):
+def test_qualified_default_yields_replay_to_the_packed_verifier(resolve, monkeypatch):
+    # 0.1.3 policy (#21): under the qualified contract the packed verifier is the
+    # default, and replay=None yields to it; an explicit replay=True turns the
+    # automatic packed default off. Explicitly enabling both is rejected
+    # (tests/config/test_gdn_replay_policy.py).
     for name in envs.environment_variables:
         if name.startswith("VLLM_SM70_DFLASH2_"):
             monkeypatch.delenv(name, raising=False)
     policy = Sm70DFlash2Config()
     # VllmConfig resolves this policy before resolving replay.
     policy.resolve(qualified=True)
-    assert resolve(_config(policy)), (
-        "The qualified default enables packed verification, which disables replay"
-    )
+    assert policy.fused_gdn_verify
+    assert not resolve(_config(policy))
+    assert policy.fused_gdn_verify
+
+    explicit = Sm70DFlash2Config(spec_state_replay=True)
+    explicit.resolve(qualified=True)
+    assert resolve(_config(explicit))
+    assert not explicit.fused_gdn_verify
 
 
 @pytest.mark.parametrize("requests", [1, 2, 4, 8])
@@ -83,11 +94,26 @@ def test_enabled_replay_admits_the_whole_verify_batch(
     monkeypatch.setattr(envs, "VLLM_SM70_QWEN38_WIDE_M_GDN", wide)
     monkeypatch.setattr(envs, "VLLM_SM70_GDN_TAIL_COPY", False)
     enabled = resolve(_config(policy))
-    # This is the actual live-shape predicate in _forward_core. With replay
-    # enabled, failing it reaches the new split-verifier RuntimeError.
-    assert not enabled or gdn._sm70_mixed_qkv_verify_tokens_ok(requests * 8), (
-        f"Replay is enabled but the mixed-QKV verifier rejects {requests * 8} tokens"
+    num_tokens = requests * 8
+    layer = SimpleNamespace(
+        spec_state_replay=enabled,
+        enable_sm70_fused_sigmoid_mixed_qkv=True,
+        num_k_heads=16,
+        num_v_heads=48,
+        tp_size=4,
     )
+    cls = gdn.QwenGatedDeltaNetAttention
+    # The layer-level admission _forward_core uses (#21): with replay on the
+    # mixed-QKV verifier takes every verify batch, so the split verifier (which
+    # raises under replay) is never reached; with replay off the token band is
+    # the module predicate, unchanged.
+    admitted = cls._mixed_qkv_verify_admits(layer, num_tokens)
+    assert admitted == (enabled or gdn._sm70_mixed_qkv_verify_tokens_ok(num_tokens))
+    if enabled:
+        assert admitted, f"Replay is on but the verifier rejects {num_tokens} tokens"
+        # Batches outside the fused input projection pass a row-strided view.
+        qkvz = torch.zeros(num_tokens, 2560 + 1536, dtype=torch.float16)
+        assert cls._replay_reads_strided_qkv(layer, qkvz[:, :2560])
 
 
 def _spec(spec_tokens, replay=False):

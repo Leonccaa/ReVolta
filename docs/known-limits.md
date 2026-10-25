@@ -62,7 +62,7 @@ GGUF are outside the build.
   they are generated.
 - **Image placeholder text.** Text that contains the literal image placeholder
   `<|image_pad|>` can take the place of a real image in the same request. Upstream vLLM
-  and HF behave the same (vLLM #57740), and ReVolta follows them. Remove such tokens from
+  and HF behave the same (vllm-project/vllm#57740), and ReVolta follows them. Remove such tokens from
   untrusted text.
 - **DFlash2.** Optional and off by default; see
   [DFlash2 speculative decoding](dflash2.md) for its settings

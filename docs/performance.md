@@ -159,9 +159,9 @@ replay of real agent sessions (one request at a time, sampling), the two were on
 
 ### State replay in 0.1.3
 
-GDN speculative state replay (`sm70_dflash2.spec_state_replay`, on by default with DFlash2) adds about 7 ms per decoding step when the target samples (30.6 to 37.9 ms per step at one request on our 4x V100 PCIe deployment) and costs 2 to 3% of throughput with greedy decoding at one request (5 to 7% at eight). The reference deployment therefore turns it off with `"sm70_dflash2": {"spec_state_replay": false}`; outputs are unchanged either way.
+GDN speculative state replay (`sm70_dflash2.spec_state_replay`, on by default with DFlash2) adds about 7 ms per decoding step when the target samples (30.6 to 37.9 ms per step at one request on our 4 × V100 PCIe deployment). With greedy decoding, development runs measured 2 to 3% lower throughput at one request and 5 to 7% at eight; a single release-image check at eight greedy requests measured 312.6 tokens/s with replay and 302.1 without, so the high-concurrency difference is small. The reference deployment therefore turns it off with `"sm70_dflash2": {"spec_state_replay": false}`; outputs are unchanged either way.
 
-With replay off, DFlash2 keeps the other 0.1.3 memory changes (sharded selector codebooks, verifier tail graphs off, 1200 MiB graph reserve): 1,379,634 KV tokens at 512K against 1,268,831 in 0.1.2. Replay adds about 11% more (1,542,558); at eight concurrent 96K-token requests it lowered peak KV use from 60% to 26%. MTP4 remains the default speculative method.
+With replay off, DFlash2 keeps the other 0.1.3 memory changes (sharded selector codebooks, verifier tail graphs off, 1200 MiB graph reserve): 1,379,634 KV tokens at 512K against 1,268,831 in 0.1.2. Replay adds about 12% more (1,542,558). At eight concurrent 96K-token requests, peak KV use was 26% with replay, sharding and the graph defaults together, against 55% without replay and 60% on 0.1.2. MTP4 remains the default speculative method.
 
 ### NVLink (community result)
 

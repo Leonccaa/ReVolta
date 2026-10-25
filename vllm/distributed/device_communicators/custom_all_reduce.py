@@ -39,6 +39,26 @@ _EXPANDABLE_SEGMENTS_TRUE_PATTERN = re.compile(
 )
 
 
+def _sm70_tp4_push_sum2_size(nbytes: int) -> bool:
+    """Mirror the FP16 sum2 push size gates in custom_all_reduce.cuh.
+
+    Native reads raw strings: unset M1/batch/MTP5 switches mean enabled, but
+    M2 requires an explicit FASTPATH=1. The Python FASTPATH default is not the
+    native default. SMALL_MESSAGES applies only to ordinary all-reduce.
+    """
+    batch = os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH")
+    if batch in (None, "1"):
+        if nbytes in (20480, 40960, 81920):
+            return True
+        if nbytes == 10240 and os.getenv("VLLM_SM70_QWEN38_BATCH_FASTPATH") == "1":
+            return True
+    if nbytes == 25600:
+        return os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5") in (None, "1")
+    if nbytes == 5120:
+        return os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1") in (None, "1")
+    return False
+
+
 def _get_effective_allocator_conf() -> str:
     """Return the allocator config selected by PyTorch on CUDA.
 
@@ -1423,10 +1443,30 @@ class CustomAllreduce:
             # latency) compared to the performance gain of using custom kernels
             return self.all_reduce(input, registered=False)
 
+    def can_sm70_tp4_push_sum2(self, inp: torch.Tensor) -> bool:
+        return (
+            not self.disabled
+            and self.sm70_pcie_switch
+            and self.world_size == 4
+            and self.fully_connected
+            and self.sm70_tp4_push_buffer_ptrs is not None
+            and inp.dtype == torch.float16
+            and self.should_custom_ar(inp)
+            and self._IS_CAPTURING
+            and torch.cuda.is_current_stream_capturing()
+            and _sm70_tp4_push_sum2_size(inp.numel() * inp.element_size())
+        )
+
     def custom_all_reduce_sum2(
         self, input_a: torch.Tensor, input_b: torch.Tensor
     ) -> torch.Tensor | None:
         if self.disabled or not self.should_custom_ar(input_a):
+            return None
+        if (
+            self.sm70_pcie_switch
+            and input_a.dtype == torch.float16
+            and not self.can_sm70_tp4_push_sum2(input_a)
+        ):
             return None
         if input_a.shape != input_b.shape or input_a.dtype != input_b.dtype:
             return None

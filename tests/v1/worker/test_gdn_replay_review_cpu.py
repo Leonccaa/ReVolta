@@ -90,10 +90,12 @@ def test_qualified_default_yields_replay_to_the_packed_verifier(resolve, monkeyp
 def test_enabled_replay_admits_the_whole_verify_batch(
     resolve, monkeypatch, requests, wide
 ):
-    policy = Sm70DFlash2Config(fused_gdn_verify=False)
+    # Replay is off by default from 0.1.4; request it so the enabled branch runs.
+    policy = Sm70DFlash2Config(fused_gdn_verify=False, spec_state_replay=True)
     monkeypatch.setattr(envs, "VLLM_SM70_QWEN38_WIDE_M_GDN", wide)
     monkeypatch.setattr(envs, "VLLM_SM70_GDN_TAIL_COPY", False)
     enabled = resolve(_config(policy))
+    assert enabled
     num_tokens = requests * 8
     layer = SimpleNamespace(
         spec_state_replay=enabled,

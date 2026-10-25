@@ -210,8 +210,10 @@ def sm70(monkeypatch):
     return config_module._resolve_gdn_spec_state_replay
 
 
-def test_replay_is_on_by_default_where_supported(sm70):
-    assert sm70(_replay_config()) is True
+def test_replay_is_off_by_default_and_on_when_requested(sm70):
+    assert sm70(_replay_config()) is False
+    requested = SimpleNamespace(spec_state_replay=True, fused_gdn_verify=False)
+    assert sm70(_replay_config(**{"speculative_config.sm70_dflash2": requested}))
 
 
 @pytest.mark.parametrize(
@@ -265,6 +267,8 @@ def _gdn_spec(sm70, method, num_tokens):
         config.speculative_config = None
     else:
         spec = config.speculative_config
+        # Replay requested (off by default): only the method decides.
+        spec.sm70_dflash2.spec_state_replay = True
         spec.method = method
         spec.num_speculative_tokens = num_tokens
         spec.use_dflash = lambda: method == "dflash"
@@ -390,14 +394,16 @@ def test_release_default_is_one_switch(sm70, monkeypatch):
     from vllm.config import sm70_dflash2
 
     # The release default lives in one constant, read through vllm.config.vllm.
-    assert sm70_dflash2.SM70_DFLASH2_SPEC_STATE_REPLAY_DEFAULT is True
-    assert config_module.SM70_DFLASH2_SPEC_STATE_REPLAY_DEFAULT is True
-    assert sm70(_replay_config()) is True
-    monkeypatch.setattr(config_module, "SM70_DFLASH2_SPEC_STATE_REPLAY_DEFAULT", False)
-    # Default off: None resolves off, explicit True still turns replay on.
+    assert sm70_dflash2.SM70_DFLASH2_SPEC_STATE_REPLAY_DEFAULT is False
+    assert config_module.SM70_DFLASH2_SPEC_STATE_REPLAY_DEFAULT is False
     assert sm70(_replay_config()) is False
-    explicit = SimpleNamespace(spec_state_replay=True, fused_gdn_verify=False)
-    assert sm70(_replay_config(**{"speculative_config.sm70_dflash2": explicit})) is True
+    monkeypatch.setattr(config_module, "SM70_DFLASH2_SPEC_STATE_REPLAY_DEFAULT", True)
+    # Default on: None resolves on, explicit False still turns replay off.
+    assert sm70(_replay_config()) is True
+    explicit = SimpleNamespace(spec_state_replay=False, fused_gdn_verify=False)
+    assert (
+        sm70(_replay_config(**{"speculative_config.sm70_dflash2": explicit})) is False
+    )
 
 
 _FUSED_TABLE_CODE = r"""

@@ -164,8 +164,12 @@ def test_explicit_replay_overrides_qualified_packed_default(engine_config):
     ],
 )
 def test_default_replay_yields_only_to_enabled_packed_verifier(
-    engine_config, caplog, hidden_size, qualified, replay, packed
+    engine_config, caplog, monkeypatch, hidden_size, qualified, replay, packed
 ):
+    import vllm.config.vllm as config_module
+
+    # The precedence applies when the release default turns replay on.
+    monkeypatch.setattr(config_module, "SM70_DFLASH2_SPEC_STATE_REPLAY_DEFAULT", True)
     spec = engine_config(hidden_size).speculative_config
     assert spec is not None
     assert spec.sm70_dflash2.resolved
@@ -203,7 +207,7 @@ def test_explicit_replay_and_explicit_packed_are_a_configuration_error(
         (False, False, False),
         (False, True, False),
         (True, False, True),
-        (None, False, True),
+        (None, False, False),  # replay is off by default from 0.1.4
         (None, True, False),
     ],
 )

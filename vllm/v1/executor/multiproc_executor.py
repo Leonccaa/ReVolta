@@ -59,6 +59,7 @@ from vllm.utils.system_utils import (
     get_mp_context,
     set_process_title,
 )
+from vllm.utils.watch_dog import get_watch_dog, start_watch_dog
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.executor.abstract import Executor, FailureCallback
 from vllm.v1.executor.vllm_net_devices import set_worker_net_device
@@ -788,6 +789,7 @@ class WorkerProc:
                 death_pipe.recv()
             except EOFError:
                 logger.info_once("Parent process exited, terminating worker queues")
+                get_watch_dog().handle_failure("parent process exited")
                 shutdown_requested.set()
                 for mq in queues_to_shutdown:
                     if mq is not None:
@@ -817,6 +819,8 @@ class WorkerProc:
             nonlocal shutdown_requested
             if not shutdown_requested.is_set():
                 shutdown_requested.set()
+                if signum == signal.SIGTERM:
+                    get_watch_dog().handle_failure("SIGTERM")
                 logger.debug(
                     "WorkerProc handling signal %d, raising SystemExit", signum
                 )
@@ -876,6 +880,9 @@ class WorkerProc:
             ready_writer.close()
             ready_writer = None
 
+            start_watch_dog(
+                f"worker_{rank}", kwargs["vllm_config"].watchdog_config, logger
+            )
             worker.worker_busy_loop()
 
         except Exception:
@@ -904,6 +911,7 @@ class WorkerProc:
             raise e
 
         finally:
+            get_watch_dog().stop()
             if ready_writer is not None:
                 ready_writer.close()
             if death_pipe is not None:
@@ -963,16 +971,22 @@ class WorkerProc:
         """Main busy loop for Multiprocessing Workers"""
         assert self.rpc_broadcast_mq is not None
         while True:
-            method, args, kwargs, output_rank = self.rpc_broadcast_mq.dequeue(
-                indefinite=True
-            )
+            watchdog = get_watch_dog()
+            with watchdog.disable():
+                method, args, kwargs, output_rank = self.rpc_broadcast_mq.dequeue(
+                    indefinite=True
+                )
             try:
                 if isinstance(method, str):
                     func = getattr(self.worker, method)
                 elif isinstance(method, bytes):
                     func = partial(cloudpickle.loads(method), self.worker)
 
-                output = func(*args, **kwargs)
+                watchdog.feed()
+                try:
+                    output = func(*args, **kwargs)
+                finally:
+                    watchdog.feed()
             except Exception as e:
                 # Notes have been introduced in python 3.11
                 if hasattr(e, "add_note"):

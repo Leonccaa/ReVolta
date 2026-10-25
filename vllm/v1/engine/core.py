@@ -43,6 +43,7 @@ from vllm.utils.gc_utils import (
 from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.utils.network_utils import make_zmq_socket
 from vllm.utils.system_utils import decorate_logs, set_process_title
+from vllm.utils.watch_dog import get_watch_dog, start_watch_dog
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     generate_scheduler_kv_cache_config,
@@ -1340,10 +1341,13 @@ class EngineCoreProc(EngineCore):
             def signal_handler(signum, frame):
                 engine_core.shutdown_state = EngineShutdownState.REQUESTED
                 signal_callback.trigger()
+                if signum == signal.SIGTERM:
+                    get_watch_dog().handle_failure("SIGTERM")
 
             signal.signal(signal.SIGTERM, signal_handler)
             signal.signal(signal.SIGINT, signal_handler)
 
+            start_watch_dog(f"engine_{dp_rank}", vllm_config.watchdog_config, logger)
             engine_core.run_busy_loop()
 
         except SystemExit:
@@ -1357,6 +1361,7 @@ class EngineCoreProc(EngineCore):
                 engine_core._send_engine_dead()
             raise e
         finally:
+            get_watch_dog().stop()
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
             signal.signal(signal.SIGINT, signal.SIG_DFL)
             if signal_callback is not None:
@@ -1405,8 +1410,10 @@ class EngineCoreProc(EngineCore):
                     waited = True
             block = self.process_input_queue_block
             try:
-                req = self.input_queue.get(block=block)
+                with get_watch_dog().disable():
+                    req = self.input_queue.get(block=block)
                 self._handle_client_request(*req)
+                get_watch_dog().feed()
             except queue.Empty:
                 break
             if not block:
@@ -1419,12 +1426,15 @@ class EngineCoreProc(EngineCore):
         while not self.input_queue.empty():
             req = self.input_queue.get_nowait()
             self._handle_client_request(*req)
+            get_watch_dog().feed()
 
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""
 
         # Step the engine core.
+        get_watch_dog().feed()
         outputs, model_executed = self.step_fn()
+        get_watch_dog().feed()
         # Put EngineCoreOutputs into the output queue.
         for output in outputs.items() if outputs else ():
             self.output_queue.put_nowait(output)

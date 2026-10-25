@@ -39,7 +39,7 @@ This V100 behaviour is the same as in 0.1.0 and 0.1.1, and 0.1.2 keeps it. Set
 
 - the generic 0.1.2 default: `--limit-mm-per-prompt '{"image": 8, "video": 1, "audio": 1}'`;
 - the reference deployment, as in the README launch command:
-  `--limit-mm-per-prompt '{"image": 16, "video": 1, "audio": 16}'`.
+  `--limit-mm-per-prompt '{"image": 16, "video": 1}'` (Qwen3.8 Flash-Next has no audio input).
 
 The image resizing below applies on V100 too.
 

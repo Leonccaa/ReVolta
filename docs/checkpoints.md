@@ -37,7 +37,7 @@ target-scale checking. Use the draft's own scales or set its
 | Uncensored AWQ g32 | Included in the same checkpoint | Its own `mtp-fp8/`, including draft scales | `fp8_e4m3` (or `float16`) |
 | Base AWQ g32 | Included in the same checkpoint | Its own `mtp-fp8/`, converted and calibrated separately | `fp8_e4m3` (or `float16`) |
 | Standard NVFP4 `7b719225` | [NVFP4 pack](https://huggingface.co/leoncca/Qwen3.8-Flash-Next-NVFP4-QSA-FP8-E4M3-KV-Scales), `v1.2-base-7b719225`; materialize first | Uncensored FP8 MTP and its scales, included in that pack | `fp8_e4m3` (or `float16`) |
-| NVIDIA FP4-Local `b9ce18a6` | [FP4-Local pack](https://huggingface.co/leoncca/Qwen3.8-Flash-Next-FP4-Local-QSA-FP8-E4M3-KV-Scales), `v1.0-base-b9ce18a6`; materialize first | The checkpoint's built-in MTP layer | `float16`; draft scales are not yet published |
+| NVIDIA FP4-Local `b9ce18a6` | [FP4-Local pack](https://huggingface.co/leoncca/Qwen3.8-Flash-Next-FP4-Local-QSA-FP8-E4M3-KV-Scales), `v1.1-base-b9ce18a6`; materialize first | The checkpoint's built-in MTP layer; its two draft scales are in the same pack | `fp8_e4m3` (or `float16`) |
 
 DFlash2 drafts do not need these K/V scales. Their own configuration is in
 [DFlash2 speculative decoding](dflash2.md).
@@ -179,14 +179,17 @@ vllm serve /data/revolta/views/nvfp4/target-512k \
 
 ## NVIDIA FP4-Local checkpoint setup
 
-The currently published pack contains only the 24 target scales. Draft scales
-are not yet published, so use the checkpoint's own MTP layer with FP16 draft
-KV (measured acceptance: **65.1%**). Omit the draft `model` field: the drafter
-uses the same materialized 512K view and its YaRN settings.
+The pack (`v1.1-base-b9ce18a6`) contains the 24 target scales and the two K/V
+scales of the checkpoint's built-in MTP layer, so both target and draft can use
+E4M3 KV. Omit the draft `model` field: the drafter uses the same materialized
+512K view, its YaRN settings and its draft scales. In a paired test that changed
+only the draft KV type, MTP acceptance was 63.1% (greedy) and 62.0% (sampled)
+with E4M3 draft KV, against 64.4% and 61.9% with FP16 draft KV.
 
-Calibrated E4M3 scales for this MTP layer are being prepared. Until they are
-published in the pack, keep `"kv_cache_dtype": "float16"` for the draft: an E4M3
-draft cache without calibrated draft scales is rejected at startup.
+`"kv_cache_dtype": "float16"` for the draft still works. The older
+`v1.0-base-b9ce18a6` tag has no draft scales; with it, keep the draft in
+`float16`, because an E4M3 draft cache without calibrated draft scales is
+rejected at startup.
 
 ```bash
 python - <<'EOF'
@@ -197,13 +200,13 @@ from pathlib import Path
 from huggingface_hub import snapshot_download
 
 base = Path("/data/revolta/models/fp4-local-base")
-pack = Path("/data/revolta/models/fp4-local-pack-v1.0")
+pack = Path("/data/revolta/models/fp4-local-pack-v1.1")
 merged = Path("/data/revolta/models/fp4-local-e4m3")
 views = Path("/data/revolta/views/fp4-local")
 snapshot_download("nvidia/Qwen3.8-Flash-Next-FP4-Local",
                   revision="b9ce18a6887e18c089fdea8509a33e63429a3300", local_dir=base)
 snapshot_download("leoncca/Qwen3.8-Flash-Next-FP4-Local-QSA-FP8-E4M3-KV-Scales",
-                  revision="v1.0-base-b9ce18a6", local_dir=pack)
+                  revision="v1.1-base-b9ce18a6", local_dir=pack)
 subprocess.run([sys.executable, str(pack / "materialize_overlay.py"),
                 "--pack-dir", str(pack), "--base-checkpoint", str(base),
                 "--output-dir", str(merged)], check=True)
@@ -238,7 +241,7 @@ vllm serve /data/revolta/views/fp4-local/target-512k \
   --enable-chunked-prefill --enable-prefix-caching --mamba-cache-mode align \
   --no-async-scheduling --kv-cache-dtype fp8_e4m3 \
   --attention-backend FLASH_ATTN_V100 --kernel-config '{"ple_disk_cascade":false}' \
-  --speculative-config '{"method":"mtp","num_speculative_tokens":4,"draft_sample_method":"greedy","attention_backend":"FLASH_ATTN_V100","kv_cache_dtype":"float16"}'
+  --speculative-config '{"method":"mtp","num_speculative_tokens":4,"draft_sample_method":"greedy","attention_backend":"FLASH_ATTN_V100","kv_cache_dtype":"fp8_e4m3"}'
 ```
 
 ## Weight and KV formats
@@ -309,7 +312,7 @@ passed the large-image and video stress tests.
 The PLE table uses about 26.8 GiB of pinned host memory across four ranks.
 Use `--quantization modelopt_mixed` (matches the automatic detection); the same automatic NVFP4 profile applies.
 Follow the [checkpoint setup](#nvidia-fp4-local-checkpoint-setup) for pinned
-downloads, the target-scale overlay, 512K views and the current FP16 MTP draft KV.
+downloads, the scale overlay, 512K views and the MTP draft KV options.
 
 ## See also
 

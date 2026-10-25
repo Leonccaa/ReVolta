@@ -78,7 +78,7 @@ Measured on our 4x V100 PCIe deployment with TP4 + DCP2, `--gpu-memory-utilizati
 | Standard NVFP4 + E4M3 KV | 0.1.2 | MTP4 | 1,250,448 | 2.39× |
 | Standard NVFP4 + E4M3 KV | 0.1.2 | DFlash2 | 1,337,745 | 2.55× |
 
-The 0.1.3 AWQ DFlash2 measurement includes state replay (#21), sharded selector codebooks (#9), and the 1200 MiB graph reserve with tail graphs off (#23). The FP16 KV, FP4-Local and NVFP4 DFlash2 values were measured on 0.1.2; they have not been remeasured with 0.1.3's state replay. The 0.1.2 AWQ DFlash2 measurements use a 1500 MiB graph reserve. INT8 KV is not supported by the DFlash2 drafter; 0.1.3 rejects this combination at startup.
+The 0.1.3 AWQ DFlash2 measurements include sharded selector codebooks (#9) and the 1200 MiB graph reserve with tail graphs off (#23), with state replay (#21) off (recommended) or on. The FP16 KV, FP4-Local and NVFP4 DFlash2 values were measured on 0.1.2; they have not been remeasured with the 0.1.3 DFlash2 changes. The 0.1.2 AWQ DFlash2 measurements use a 1500 MiB graph reserve. INT8 KV is not supported by the DFlash2 drafter; 0.1.3 rejects this combination at startup.
 
 ## Performance
 

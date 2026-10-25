@@ -157,7 +157,18 @@ English code and reasoning gain the most; Chinese text is slower with DFlash2. O
 replay of real agent sessions (one request at a time, sampling), the two were on par
 (0.97× the MTP4 speed). See [DFlash2 speculative decoding](dflash2.md).
 
-### State replay in 0.1.3
+### State replay in 0.1.4
+
+From 0.1.4, state replay is optional and off by default, and when turned on its post-sampling replay runs as a CUDA graph. Measured on our 4 × V100 PCIe deployment in one session (30 replayed agent turns at one request with sampling, 200 W; greedy benchmark phases at 250 W, two rounds):
+
+| Configuration | Sampled, ms per step | vs replay off |
+| --- | ---: | ---: |
+| Replay off (recommended) | 30.05 | — |
+| Replay on, 0.1.3 (no graph) | 37.15 | +7.10 ms |
+| Replay on, 0.1.4 without the graph | 35.44 | +5.39 ms |
+| Replay on, 0.1.4 (graph, default when on) | 30.49 | +0.44 ms |
+
+Outputs were identical in all four (30 of 30 sampled turns, 24 of 24 greedy streams). With greedy decoding, replay on with the graph ran 1–4% below replay off at one to four requests and level at eight, and faster than 0.1.3's replay at every concurrency. The remaining cost is the replay's own GPU work.
 
 GDN speculative state replay (`sm70_dflash2.spec_state_replay`, on by default with DFlash2) adds about 7 ms per decoding step when the target samples (30.6 to 37.9 ms per step at one request on our 4 × V100 PCIe deployment). With greedy decoding, development runs measured 2 to 3% lower throughput at one request and 5 to 7% at eight; on the release image, eight greedy requests measured 312.6 tokens/s with replay (one run) and 302.1 and 335.8 without it (two runs), so the high-concurrency difference is within run-to-run variation. The reference deployment therefore turns it off with `"sm70_dflash2": {"spec_state_replay": false}`; outputs are unchanged either way.
 

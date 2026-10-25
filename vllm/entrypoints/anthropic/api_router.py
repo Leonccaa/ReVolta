@@ -24,6 +24,7 @@ from vllm.entrypoints.openai.sse_keep_alive import (
 )
 from vllm.entrypoints.openai.utils import validate_json_request
 from vllm.entrypoints.utils import (
+    create_error_response,
     load_aware_call,
     with_cancellation,
 )
@@ -75,15 +76,7 @@ async def create_messages(request: AnthropicMessagesRequest, raw_request: Reques
         generator = await handler.create_messages(request, raw_request)
     except Exception as e:
         logger.exception("Error in create_messages: %s", e)
-        return JSONResponse(
-            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
-            content=AnthropicErrorResponse(
-                error=AnthropicError(
-                    type=translate_error_type(HTTPStatus.INTERNAL_SERVER_ERROR.value),
-                    message=str(e),
-                )
-            ).model_dump(),
-        )
+        return translate_error_response(create_error_response(e))
 
     if isinstance(generator, ErrorResponse):
         return translate_error_response(generator)
@@ -124,15 +117,7 @@ async def count_tokens(request: AnthropicCountTokensRequest, raw_request: Reques
         response = await handler.count_tokens(request, raw_request)
     except Exception as e:
         logger.exception("Error in count_tokens: %s", e)
-        return JSONResponse(
-            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
-            content=AnthropicErrorResponse(
-                error=AnthropicError(
-                    type=translate_error_type(HTTPStatus.INTERNAL_SERVER_ERROR.value),
-                    message=str(e),
-                )
-            ).model_dump(),
-        )
+        return translate_error_response(create_error_response(e))
 
     if isinstance(response, ErrorResponse):
         return translate_error_response(response)

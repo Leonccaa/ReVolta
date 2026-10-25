@@ -17,12 +17,16 @@ before; recurrent states need only the boundary copy when the boundary is the la
 accepted position (``SPEC_STATE_REPLAY`` in ``mamba_align``).
 """
 
+import time
 from dataclasses import dataclass
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -353,6 +357,9 @@ class GDNSpecReplayGraphs:
         num_sampled = torch.ones(n, dtype=torch.int32, device=device)
         if self._pool is None:
             self._pool = torch.cuda.graph_pool_handle()
+        start = time.perf_counter()
+        torch.accelerator.synchronize(device)
+        reserved_before = torch.accelerator.memory_reserved(device)
         graph = torch.cuda.CUDAGraph()
         # Nothing runs during capture; the caller replays the graph for this step.
         with torch.cuda.graph(graph, self._pool, capture_error_mode="thread_local"):
@@ -364,6 +371,17 @@ class GDNSpecReplayGraphs:
                 num_computed_tokens=num_computed_tokens,
                 block_size=block_size,
             )
+        torch.accelerator.synchronize(device)
+        logger.info(
+            "GDN replay graph captured: requests=%d tokens=%d layers=%d in %.1f ms, "
+            "allocator reserve %+.2f MiB (%d replay graphs).",
+            step.num_reqs,
+            step.num_tokens,
+            len(step.layers),
+            1000 * (time.perf_counter() - start),
+            (torch.accelerator.memory_reserved(device) - reserved_before) / (1 << 20),
+            len(self.graphs) + 1,
+        )
         return _ReplayGraph(graph, spec_rows, idx_mapping, num_sampled)
 
 

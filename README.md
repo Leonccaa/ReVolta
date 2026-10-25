@@ -1,43 +1,49 @@
 # ReVolta
 
-**A daily AI server on 4 × V100 32 GB.**
+**Stable, fast inference on multi-GPU NVIDIA V100 servers.**
 
-Run Qwen3.8 Flash-Next for text, images, and video, with an OpenAI-compatible API.
-ReVolta is a Volta-focused fork of [vLLM](https://github.com/vllm-project/vllm),
-through [1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM).
+ReVolta turns a server with V100 32 GB GPUs and plenty of system memory into a dependable daily AI service. It runs Qwen3.8 Flash-Next for text, images and video behind an OpenAI-compatible API. ReVolta is built on [1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM), a V100-focused fork of vLLM, so the `vllm` command, its options and its OpenAI-compatible API work as usual.
+
+It is built for four or more V100 32 GB GPUs and validated on four. Every release passes the same gate on our own server before it ships: greedy output identical to the previous release token for token, 4 and 8 concurrent requests, images and video, CPU cache readback, and 512K-token prompts. That server runs ReVolta every day.
+
+**You need:** 4 × V100 32 GB (PCIe with P2P, or NVLink), at least 64 GB of system memory (128 GB recommended), Linux x86-64 with glibc 2.34 or newer, and an NVIDIA driver for CUDA 12.8. Tested hardware and limits: [Support and known limits](docs/known-limits.md).
 
 Current release: [0.1.3](https://github.com/Leonccaa/ReVolta/releases/tag/v0.1.3).
 
-## Highlights
+## At a glance
 
-- **GPU-resident context:** **1.38 million tokens** with a reported maximum concurrency of **2.63× at 512K** (AWQ, E4M3 KV, DFlash2 recommended settings, 0.1.3), up to 1.54 million (2.94×) with state replay on; see [GPU KV capacity](docs/performance.md#gpu-kv-capacity-by-method).
-- **Speculative decoding:** native MTP4 by default, or [DFlash2](docs/dflash2.md) with the incoai drafter
-  (new in 0.1.2, up to 1.30× on one request).
-- **Speed:** up to **525 tokens/s total output at 8 concurrent requests** on NVLink
-  ([community result](https://github.com/Leonccaa/ReVolta/issues/2)), and up to 509 on our PCIe reference; see [Speed](docs/performance.md#speed).
-- **Cache reuse:** [CPU memory and disk offload](docs/kv-offload.md); a cached 32K document answered in **1.28 s vs 10.06 s** when recomputed.
+**Context and capacity** (Uncensored AWQ, E4M3 KV cache, 0.1.3)
 
-## Hardware and models
+| | MTP4 (default) | DFlash2 (recommended settings) |
+| --- | ---: | ---: |
+| Context per request | 512K tokens | 512K tokens |
+| GPU KV pool | 1.15 million tokens | **1.38 million tokens** |
+| Full 512K requests held on the GPU at once | 2.20 | **2.63** |
+| Concurrent requests | 8 | 8 |
 
-### Hardware
+Prefixes evicted from the GPU stay in CPU memory or on disk: a cached 32K-token document is answered in **1.28 s instead of 10.06 s**. See [KV offload](docs/kv-offload.md).
 
-The reference system uses four V100 32 GB PCIe cards behind one PCIe switch
-(PIX/PXB in `nvidia-smi topo -m`), with P2P enabled and a 128 GiB container memory limit.
+**Speed** (total output tokens/s, 512-token responses; best of MTP4 and DFlash2)
 
-**128 GiB RAM is recommended** for the default 48 GiB CPU KV pool.
-See [memory and storage](docs/configuration.md#system-memory-and-storage) and the
-[full hardware test matrix](docs/known-limits.md).
+| System | 1 request | 2 | 4 | 8 | Prefill, 8K / 131K prompt |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 4 × V100 32 GB PCIe, one PCIe switch (our server) | 201 | 275 | 370 | **509** | 3,382 / 3,016 |
+| 4 × V100-SXM2 32 GB, NVLink ([community result](https://github.com/Leonccaa/ReVolta/issues/2)) | 234 | 260 | 368 | **525** | 4,680 / 4,037 |
 
-### Models
+Versions, power caps and the per-method breakdown are in [Performance](docs/performance.md).
 
-| Checkpoint | Test status | Preparation |
-| --- | --- | --- |
-| [Uncensored AWQ g32](https://huggingface.co/leoncca/Qwen3.8-Flash-Next-Uncensored-AWQ-g32) | Default; full serving acceptance passed | [Setup](docs/checkpoints.md#uncensored-or-base-awq) |
-| [Base AWQ g32](https://huggingface.co/leoncca/Qwen3.8-Flash-Next-AWQ-g32) | Quantization quality measured; full serving acceptance not run | [Setup](docs/checkpoints.md#uncensored-or-base-awq) |
-| [Standard NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4) | Full serving acceptance passed with format-specific settings | [Setup](docs/checkpoints.md#standard-nvfp4-checkpoint-setup) |
-| [NVIDIA FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local) | Full serving acceptance passed with vision-tower TP4 | [Setup](docs/checkpoints.md#nvidia-fp4-local-checkpoint-setup) |
+## Models
 
-Use `--dtype half`: V100 has no BF16 support.
+| Model | Weights (bits per weight: routed experts / whole model) | Download | PLE table in host memory | GPU KV pool (MTP4) | Quality vs its BF16 parent: KL ↓ / top-1 ↑ | Notes |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| [Uncensored AWQ g32](https://huggingface.co/leoncca/Qwen3.8-Flash-Next-Uncensored-AWQ-g32) **(recommended)** | 4-bit AWQ g32 experts, FP8 PLE, BF16 rest (**4.63 / 5.95**) | 142 GB, MTP draft included | 48 GiB | 1.15 M (1.38 M with DFlash2) | 0.0214 / 97.1% | Uncensored fine-tune; the reference setup |
+| [Base AWQ g32](https://huggingface.co/leoncca/Qwen3.8-Flash-Next-AWQ-g32) | 4-bit AWQ g32 experts, FP8 PLE, BF16 rest (**4.63 / 5.95**) | 142 GB | 48 GiB | Same layout as Uncensored | 0.0207 / 97.1% | The original model |
+| [Standard NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4) | NVFP4 experts, FP8 PLE, BF16 rest (**4.50 / 5.86**) | 135 GB + 5 GB draft pack | 48 GiB | 1.25 M | 0.0303 / 96.4% | Widely used community format |
+| [NVIDIA FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local) | NVFP4 experts and PLE, MXFP8 attention and shared experts (**4.26 / 4.53**) | 102 GB, MTP layer built in | **27 GiB** | **1.47 M** | 0.0380 / 95.9% | NVIDIA's official checkpoint; least host memory |
+
+In the AWQ and standard NVFP4 checkpoints only the routed experts are 4-bit: the PLE tables are FP8, and all other weights (attention, shared experts, embeddings, `lm_head` and the vision tower) stay BF16. NVIDIA FP4-Local is quantized further: its PLE table and parts of the vision tower and MTP layer are NVFP4, and its attention projections and shared experts are MXFP8; its `lm_head` stays BF16. V100 has no BF16 units, so ReVolta runs BF16 weights in FP16 (`--dtype half`). Bits per weight include quantization scales and zero points and exclude the MTP draft; the whole-model figure covers all 177 billion stored parameters, 51 billion of them in the PLE tables.
+
+GPU KV pools use the recommended setup for each checkpoint (E4M3 target and draft KV, 512K, 8 sequences). Quality is measured with an E4M3 KV cache on 66 English, Chinese and code records against each checkpoint's own BF16 parent; method and other datasets are in [Quality measurements](docs/performance.md#quality-measurements). Test status, pinned revisions and preparation steps for each checkpoint are in [Checkpoints](docs/checkpoints.md).
 
 ## Quick start
 

@@ -137,6 +137,15 @@ class Sm70DFlash2Config:
     False keeps one state block per speculative position. Configuration only,
     no environment alias."""
 
+    spec_state_replay_graph: bool = True
+    """Capture the post-sampling GDN state replay in CUDA graphs.
+
+    One graph per FULL verify shape, captured the second time the shape runs;
+    mixed steps replay eagerly. Without it the replay's per-layer launches run
+    from the host, which costs several milliseconds per step once sampling has
+    drained the GPU queue. Only used with spec_state_replay. Configuration only,
+    no environment alias."""
+
     sharded_selector_codebook: bool = True
     """Shard the candidate selector's two vocabulary codebooks across TP ranks.
 

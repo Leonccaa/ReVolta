@@ -465,3 +465,159 @@ def test_fused_replay_table_equals_the_torch_reference():
     )
     print(result.stdout[-2000:], result.stderr[-4000:])
     assert result.returncode == 0 and "FUSED_TABLE_EQUAL 480" in result.stdout
+
+
+_PADDED_TABLE_CODE = r"""
+import torch
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.worker.gpu.gdn_spec_replay import (
+    build_replay_state_indices,
+    build_replay_state_table,
+    fill_replay_graph_inputs,
+)
+
+gen = torch.Generator().manual_seed(1)
+cases = 0
+block_size = 16
+for _ in range(200):
+    num_reqs = int(torch.randint(1, 9, (1,), generator=gen))
+    batch = int(torch.randint(1, num_reqs + 1, (1,), generator=gen))
+    spec_rows = torch.arange(batch)  # a FULL step: every real row speculates
+    idx_mapping = torch.randperm(16, generator=gen)[:batch].to(torch.int32)
+    num_sampled = torch.randint(1, 9, (batch,), generator=gen).to(torch.int32)
+    computed = torch.randint(1, 6 * block_size, (16,), generator=gen)
+    computed = computed.to(torch.int32)
+    block_table = torch.randint(0, 10_000, (num_reqs, 8), generator=gen)
+    block_table = block_table.to(torch.int32)
+    base = torch.randint(0, 10_000, (num_reqs,), generator=gen).to(torch.int32)
+    base[batch:] = PAD_SLOT_ID
+    want = build_replay_state_indices(
+        base_state_ids=base, num_reqs=num_reqs, num_columns=9,
+        spec_rows=spec_rows, num_accepted=num_sampled,
+        num_computed_tokens=computed[idx_mapping.long()],
+        block_table=block_table, block_size=block_size)
+    # The graph's fixed-size buffers: spec rows padded with -1.
+    rows_buf = torch.full((num_reqs,), 7, dtype=torch.int64)
+    idx_buf = torch.zeros(num_reqs, dtype=torch.int32)
+    sampled_buf = torch.ones(num_reqs, dtype=torch.int32)
+    fill_replay_graph_inputs(rows_buf, idx_buf, sampled_buf, spec_rows=spec_rows,
+                             idx_mapping=idx_mapping, num_sampled=num_sampled)
+    assert rows_buf[batch:].eq(-1).all() and torch.equal(rows_buf[:batch], spec_rows)
+    got = build_replay_state_table(
+        base_state_ids=base, num_reqs=num_reqs, num_columns=9,
+        spec_rows=rows_buf, idx_mapping=idx_buf, num_sampled=sampled_buf,
+        num_computed_tokens=computed, block_table=block_table,
+        block_size=block_size)
+    assert torch.equal(got, want), (got, want)
+    cases += 1
+print("PADDED_TABLE_EQUAL", cases)
+"""
+
+
+def test_graph_padded_spec_rows_build_the_same_table():
+    import os
+    import subprocess
+    import sys
+
+    env = dict(os.environ, TRITON_INTERPRET="1")
+    result = subprocess.run(
+        [sys.executable, "-c", _PADDED_TABLE_CODE],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    print(result.stdout[-2000:], result.stderr[-4000:])
+    assert result.returncode == 0 and "PADDED_TABLE_EQUAL 200" in result.stdout
+
+
+def _graph_step(full_graph):
+    from vllm.v1.worker.gpu.gdn_spec_replay import (
+        GDNSpecReplayLayer,
+        GDNSpecReplayStep,
+    )
+
+    layer = SimpleNamespace(_replay_slots=8)
+    base = torch.zeros(4, 9, dtype=torch.int32)[:, 0]
+    return GDNSpecReplayStep(
+        num_reqs=4,
+        num_tokens=32,
+        spec_rows=torch.arange(3),
+        layers=[GDNSpecReplayLayer(layer, 0, base, torch.zeros(5, dtype=torch.int32))],
+        block_tables=(torch.zeros(4, 8, dtype=torch.int32),),
+        full_graph=full_graph,
+    )
+
+
+def test_replay_graphs_use_eager_replay_for_mixed_steps(monkeypatch):
+    from vllm.v1.worker.gpu import gdn_spec_replay as m
+
+    calls = []
+    monkeypatch.setattr(m, "replay_gdn_spec_states", lambda step, **kw: calls.append(1))
+    monkeypatch.setattr(
+        m.GDNSpecReplayGraphs, "_capture", lambda *a: pytest.fail("captured")
+    )
+    graphs = m.GDNSpecReplayGraphs(enabled=True)
+    kw = dict(
+        idx_mapping=torch.zeros(3, dtype=torch.int32),
+        num_sampled=torch.ones(3, dtype=torch.int32),
+        num_computed_tokens=torch.zeros(8, dtype=torch.int32),
+        block_size=16,
+    )
+    for _ in range(3):
+        graphs.run(_graph_step(full_graph=False), **kw)
+    assert calls == [1, 1, 1] and not graphs.graphs
+    # Disabled: FULL steps stay eager too.
+    off = m.GDNSpecReplayGraphs(enabled=False)
+    for _ in range(3):
+        off.run(_graph_step(full_graph=True), **kw)
+    assert calls == [1] * 6 and not off.graphs
+
+
+def test_replay_graphs_capture_on_the_second_full_step(monkeypatch):
+    from vllm.v1.worker.gpu import gdn_spec_replay as m
+
+    eager, replays = [], []
+    monkeypatch.setattr(m, "replay_gdn_spec_states", lambda step, **kw: eager.append(1))
+    fake_graph = SimpleNamespace(replay=lambda: replays.append(1))
+
+    def capture(self, step, num_computed_tokens, block_size):
+        n = step.num_reqs
+        return m._ReplayGraph(
+            fake_graph,
+            torch.full((n,), -1, dtype=torch.int64),
+            torch.zeros(n, dtype=torch.int32),
+            torch.ones(n, dtype=torch.int32),
+        )
+
+    monkeypatch.setattr(m.GDNSpecReplayGraphs, "_capture", capture)
+    graphs = m.GDNSpecReplayGraphs(enabled=True)
+    step = _graph_step(full_graph=True)
+    computed = torch.zeros(8, dtype=torch.int32)
+    kw = dict(num_computed_tokens=computed, block_size=16)
+    graphs.run(
+        step,
+        idx_mapping=torch.tensor([5, 6, 7], dtype=torch.int32),
+        num_sampled=torch.tensor([1, 2, 3], dtype=torch.int32),
+        **kw,
+    )
+    assert eager == [1] and replays == [] and not graphs.graphs
+    graphs.run(
+        step,
+        idx_mapping=torch.tensor([5, 6, 7], dtype=torch.int32),
+        num_sampled=torch.tensor([4, 2, 1], dtype=torch.int32),
+        **kw,
+    )
+    assert eager == [1] and replays == [1] and len(graphs.graphs) == 1
+    entry = next(iter(graphs.graphs.values()))
+    assert entry.spec_rows.tolist() == [0, 1, 2, -1]
+    assert entry.num_sampled.tolist()[:3] == [4, 2, 1]
+    assert entry.idx_mapping.tolist()[:3] == [5, 6, 7]
+    # A different tensor behind the step (another shape) is a new key.
+    other = _graph_step(full_graph=True)
+    graphs.run(
+        other,
+        idx_mapping=torch.zeros(3, dtype=torch.int32),
+        num_sampled=torch.ones(3, dtype=torch.int32),
+        **kw,
+    )
+    assert eager == [1, 1] and replays == [1]

@@ -59,6 +59,7 @@ from .speculative import (
 )
 from .structured_outputs import StructuredOutputsConfig
 from .utils import SupportsHash, config, replace
+from .watchdog_config import WatchdogConfig
 from .weight_transfer import WeightTransferConfig
 
 if TYPE_CHECKING:
@@ -1148,6 +1149,13 @@ class VllmConfig:
     """Shutdown grace period for in-flight requests. Shutdown will be delayed for
     up to this amount of time to allow already-running requests to complete. Any
     remaining requests are aborted once the timeout is reached.
+    """
+
+    watchdog_config: WatchdogConfig = Field(default_factory=WatchdogConfig)
+    """Optional stack-dump diagnostics; excluded from the computation graph hash.
+
+    It changes no tensor, kernel, graph, or scheduling configuration. Keep it
+    outside compute_hash() so enabling diagnostics reuses the same graphs.
     """
 
     def compute_hash(self) -> str:

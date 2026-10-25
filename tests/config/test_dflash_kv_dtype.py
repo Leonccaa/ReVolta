@@ -52,7 +52,7 @@ def sm70(monkeypatch):
 @pytest.mark.parametrize("backend", [None, AttentionBackendEnum.FLASH_ATTN_V100])
 @pytest.mark.parametrize(
     "target_dtype,draft_dtype",
-    [("int8", None), ("int8", "int8"), ("fp8_e4m3", "int8")],
+    [("fp8_e4m3", "int8")],
 )
 @pytest.mark.parametrize("feature", ["swa", "layer_types", "sink", "cache_window"])
 def test_dflash_int8_rejected_before_loading_weights(
@@ -85,6 +85,35 @@ def test_dflash_int8_rejected_before_loading_weights(
         "mtp",
     ):
         assert keyword in message
+    assert "separate FP16 draft cache" not in message
+
+
+@pytest.mark.parametrize("draft_dtype", [None, "float16", "auto", "int8"])
+@pytest.mark.parametrize("backend", [None, AttentionBackendEnum.FLASH_ATTN_V100])
+@pytest.mark.parametrize("sliding", [False, True])
+def test_int8_target_dflash_rejected_for_every_draft_dtype(
+    draft_dtype, backend, sliding
+):
+    config = _config(draft_dtype=draft_dtype)
+    config.speculative_config.attention_backend = backend
+    config.speculative_config.draft_model_config.hf_config.dflash_config["use_swa"] = (
+        sliding
+    )
+    with pytest.raises(ValueError) as exc:
+        validate_speculative_kv_cache_dtype(config)
+    message = str(exc.value)
+    for text in (
+        "DFlash2",
+        "INT8 target",
+        "16-token kernel pages",
+        "block size",
+        "fp8_e4m3 (recommended)",
+        "float16",
+        "auto",
+        "mtp",
+    ):
+        assert text in message
+    assert "separate FP16 draft cache" not in message
 
 
 @pytest.mark.parametrize(
@@ -93,8 +122,6 @@ def test_dflash_int8_rejected_before_loading_weights(
         ("fp8_e4m3", None, "dflash"),
         ("float16", None, "dflash"),
         ("auto", None, "dflash"),
-        ("int8", "float16", "dflash"),
-        ("int8", "auto", "dflash"),
         ("int8", None, "mtp"),
         ("int8", "int8", "mtp"),
         ("fp8_e4m3", None, "mtp"),
@@ -117,7 +144,7 @@ def test_int8_without_speculation_is_unchanged():
 
 
 def test_full_attention_int8_dflash_keeps_the_existing_dense_route():
-    config = _config()
+    config = _config("fp8_e4m3", "int8")
     config.speculative_config.draft_model_config.hf_config.dflash_config = {
         "selector_top_k": 16,
     }
@@ -134,7 +161,7 @@ def test_top_level_sink_bias_is_also_rejected():
 
 
 def test_explicit_sink_setting_overrides_top_level_default():
-    config = _config()
+    config = _config("fp8_e4m3", "int8")
     hf_config = config.speculative_config.draft_model_config.hf_config
     hf_config.dflash_config = {"attention_sink_bias": False}
     hf_config.add_swa_attention_sink_bias = True
@@ -155,7 +182,8 @@ def test_dflash_resolves_the_same_dtype_as_its_loader(sm70, target_dtype, expect
         ("dflash", "fp8_e4m3", None, False),
         ("dflash", "float16", None, False),
         ("dflash", "auto", None, False),
-        ("dflash", "int8", "float16", False),
+        ("dflash", "int8", "float16", True),
+        ("dflash", "int8", "auto", True),
         (None, "int8", None, False),
     ],
 )

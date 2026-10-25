@@ -10,7 +10,7 @@ Current release: [0.1.2](https://github.com/Leonccaa/ReVolta/releases/tag/v0.1.2
 
 ## Highlights
 
-- **GPU-resident context:** **1.38 million tokens** with a reported maximum concurrency of **2.63× at 512K** (AWQ, E4M3 KV, DFlash2 recommended settings, 0.1.3), up to 1.54 million (2.94×) with state replay on; see [Weight and KV formats](docs/performance.md#gpu-kv-capacity-by-method).
+- **GPU-resident context:** **1.38 million tokens** with a reported maximum concurrency of **2.63× at 512K** (AWQ, E4M3 KV, DFlash2 recommended settings, 0.1.3), up to 1.54 million (2.94×) with state replay on; see [GPU KV capacity](docs/performance.md#gpu-kv-capacity-by-method).
 - **Speculative decoding:** native MTP4 by default, or [DFlash2](docs/dflash2.md) with the incoai drafter
   (new in 0.1.2, up to 1.30× on one request).
 - **Speed:** up to **525 tokens/s total output at 8 concurrent requests** on NVLink

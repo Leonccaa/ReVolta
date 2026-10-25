@@ -35,8 +35,15 @@ def _copy_mamba_state_block(
     tile_idx,
     COPY_BLOCK_SIZE: tl.constexpr,
     TEMPORAL_TILES: tl.constexpr,
+    SPEC_STATE_REPLAY: tl.constexpr,
 ):
-    """Copy one SD-layout conv or temporal state using V1 align semantics."""
+    """Copy one SD-layout conv or temporal state using V1 align semantics.
+
+    Conv windows shift by ``token_bias`` within the block. A temporal state comes
+    from speculative column ``src_col + token_bias``; with SPEC_STATE_REPLAY the
+    replay already put the accepted state in ``src_col``, and a copy onto
+    itself is skipped.
+    """
     state_base_addr = tl.load(state_base_addrs_ptr + state_idx)
     state_block_stride = tl.load(state_block_strides_ptr + state_idx)
     state_elem_size = tl.load(state_elem_sizes_ptr + state_idx).to(tl.int64)
@@ -71,7 +78,12 @@ def _copy_mamba_state_block(
         is_left_overlap = (dst_addr < src_addr) & (dst_addr + copy_size > src_addr)
     else:
         # Temporal state chooses the accepted speculative column.
-        src_block_id = tl.load(block_table + src_col + token_bias).to(tl.int64)
+        if SPEC_STATE_REPLAY:
+            if src_col == dst_col:
+                return
+            src_block_id = tl.load(block_table + src_col).to(tl.int64)
+        else:
+            src_block_id = tl.load(block_table + src_col + token_bias).to(tl.int64)
         src_addr = state_base_addr + src_block_id * state_block_stride
         copy_size = state_inner_size * state_elem_size
         bytes_per_tile = (copy_size + TEMPORAL_TILES - 1) // TEMPORAL_TILES
@@ -157,6 +169,7 @@ def _precopy_mamba_align_kernel(
     num_reqs,
     COPY_BLOCK_SIZE: tl.constexpr,
     TEMPORAL_TILES: tl.constexpr,
+    SPEC_STATE_REPLAY: tl.constexpr,
 ):
     batch_idx = tl.program_id(0)
     state_idx = tl.program_id(1)
@@ -192,6 +205,7 @@ def _precopy_mamba_align_kernel(
         tile_idx,
         COPY_BLOCK_SIZE,
         TEMPORAL_TILES,
+        SPEC_STATE_REPLAY,
     )
 
 
@@ -214,6 +228,7 @@ def _postprocess_mamba_align_kernel(
     MAMBA_BLOCK_SIZE: tl.constexpr,
     COPY_BLOCK_SIZE: tl.constexpr,
     TEMPORAL_TILES: tl.constexpr,
+    SPEC_STATE_REPLAY: tl.constexpr,
 ):
     batch_idx = tl.program_id(0)
     state_meta_idx = tl.program_id(1)
@@ -238,6 +253,12 @@ def _postprocess_mamba_align_kernel(
         tl.store(num_accepted_out_ptr + req_idx, 1)
     if src_col == dst_col and token_bias == 0:
         return
+    if SPEC_STATE_REPLAY:
+        # The replay stored a boundary passed before the last accepted token;
+        # only a boundary at that token is copied, from the running block.
+        is_temporal = tl.load(state_conv_widths_ptr + state_meta_idx) <= 0
+        if is_temporal and token_bias != num_accepted - 1:
+            return
 
     _copy_mamba_state_block(
         state_meta_idx,
@@ -256,6 +277,7 @@ def _postprocess_mamba_align_kernel(
         tile_idx,
         COPY_BLOCK_SIZE,
         TEMPORAL_TILES,
+        SPEC_STATE_REPLAY,
     )
 
 
@@ -267,6 +289,7 @@ def run_mamba_align_precopy(
     token_bias: torch.Tensor,
     idx_mapping: torch.Tensor,
     query_start_loc: torch.Tensor,
+    spec_state_replay: bool = False,
 ) -> None:
     if num_reqs == 0 or not ctx.is_initialized:
         return
@@ -288,6 +311,7 @@ def run_mamba_align_precopy(
         num_reqs,
         COPY_BLOCK_SIZE=1024,
         TEMPORAL_TILES=_TEMPORAL_TILES,
+        SPEC_STATE_REPLAY=spec_state_replay,
     )
 
 
@@ -298,6 +322,7 @@ def run_mamba_align_postprocess(
     state_idx: torch.Tensor,
     new_num_computed_tokens: torch.Tensor,
     idx_mapping: torch.Tensor,
+    spec_state_replay: bool = False,
 ) -> None:
     if num_reqs == 0 or not ctx.is_initialized:
         return
@@ -324,4 +349,5 @@ def run_mamba_align_postprocess(
         MAMBA_BLOCK_SIZE=ctx.block_size,
         COPY_BLOCK_SIZE=1024,
         TEMPORAL_TILES=_TEMPORAL_TILES,
+        SPEC_STATE_REPLAY=spec_state_replay,
     )

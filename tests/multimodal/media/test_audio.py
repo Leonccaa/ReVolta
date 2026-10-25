@@ -76,3 +76,18 @@ def test_audio_media_io_from_video(video_assets):
     audio_ref, sr_ref = load_audio(video_path, sr=None)
     assert sr == sr_ref
     np.testing.assert_allclose(audio_ref, audio, atol=1e-4)
+
+
+def test_load_audio_corrupt_recognised_format_is_value_error():
+    """A recognised but corrupt file (libsndfile error outside the
+    format-detection codes) is a client error, not a server error."""
+    soundfile = pytest.importorskip("soundfile")
+    err = soundfile.LibsndfileError(2, prefix="Error opening: ")
+    with (
+        patch(
+            "vllm.multimodal.media.audio.load_audio_soundfile",
+            side_effect=err,
+        ),
+        pytest.raises(ValueError, match="Invalid or unsupported audio file"),
+    ):
+        load_audio(Path("corrupt.wav"), sr=None)

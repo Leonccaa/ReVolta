@@ -4,10 +4,22 @@
 
 Run Qwen3.8 Flash-Next for text, images, and video, with an OpenAI-compatible API.
 
+> [!TIP]
+> **New in 0.1.2: DFlash2 speculative decoding on V100.** ReVolta runs the
+> [incoai DFlash2 drafter](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2) on
+> Volta (SM70) GPUs, with V100 attention kernels and CUDA graphs for the drafter and the
+> verifier, in the 512K-context setup with prefix caching and CPU KV offload. On one
+> request it writes English code at **201 tokens/s instead of 163** with MTP4 (1.23×), and
+> the GPU KV pool grows by about 10% to 1.27 million tokens. Our own server runs it. MTP4
+> stays the default: Chinese text and eight concurrent requests are still faster with MTP4.
+> [How to enable it](#dflash2-speculative-decoding-optional).
+
 - **GPU-resident context:** a KV pool of about 1.14 million tokens with 8-bit KV, room for
   two 512K or four 256K contexts.
 - **Weight formats:** standard AWQ, NVFP4, and NVIDIA FP4-Local.
 - **KV formats:** FP8 E4M3, FP16, and INT8.
+- **Speculative decoding:** native MTP4 by default, or DFlash2 with the incoai drafter
+  (new in 0.1.2, up to 1.23× on one request).
 - **Speed:** about **465 tokens/s total output at 8 concurrent requests** on NVLink
   ([community result](https://github.com/Leonccaa/ReVolta/issues/2)), about 380 on our PCIe reference (512-token responses, MTP4 on).
 - **Cache reuse:** CPU memory and disk offload; a cached 32K document answered in **1.28 s vs 10.06 s** when recomputed.
@@ -29,6 +41,22 @@ These are totals across all requests, including the wait for the first token:
 | Cold prompt | 8K tokens | 131K tokens |
 | --- | ---: | ---: |
 | Prefill throughput, tok/s | 3,510 | 3,020 |
+
+**DFlash2 vs MTP4 (new in 0.1.2).** Same system, recommended DFlash2 config, greedy,
+512-token responses. One request: decode speed; four and eight requests: total output.
+
+| Requests and prompt | DFlash2, tok/s | MTP4, tok/s |
+| --- | ---: | ---: |
+| 1, English code | 201 | 163 |
+| 1, English reasoning | 195 | 163 |
+| 1, agent code | 181 | 158 |
+| 1, Chinese explanation | 101 | 105 |
+| 1, Chinese chat | 85 | 100 |
+| 4, mixed | 238 | 236 |
+| 8, mixed | 331 | 357 |
+
+On a replay of real agent sessions (one request at a time, sampling), the two were on par
+(0.97× the MTP4 speed). See [DFlash2 speculative decoding](#dflash2-speculative-decoding-optional).
 
 **NVLink (community result).** [@jttdev](https://github.com/jttdev) measured 0.1.0 on
 4 × V100-SXM2 32 GB with an NV2 NVLink mesh ([#2](https://github.com/Leonccaa/ReVolta/issues/2)):
@@ -422,7 +450,7 @@ from pathlib import Path
 from huggingface_hub import snapshot_download
 
 src = Path("/data/revolta/models/Qwen3.8-Flash-Next-DFlash2")
-dst = Path("<path to the DFlash2 draft model>")
+dst = Path("/data/revolta/views/dflash2-512k")
 snapshot_download("incoai/Qwen3.8-Flash-Next-DFlash2", local_dir=src,
                   revision="a22a1744e85c17364dcc54a6a420af7135d4c7f6")
 
@@ -448,7 +476,7 @@ export VLLM_SM70_DFLASH2_FUSED_QKV_PACK=1
 export VLLM_V2_CUDAGRAPH_MEM_MIB=1500    # CUDA graph reserve for DFlash2 (the profile's 700 fits MTP4 only)
 
   --speculative-config '{"method": "dflash",
-      "model": "<path to the DFlash2 draft model>",
+      "model": "/data/revolta/views/dflash2-512k",
       "num_speculative_tokens": 7,
       "attention_backend": "FLASH_ATTN_V100",
       "draft_sample_method": "greedy",

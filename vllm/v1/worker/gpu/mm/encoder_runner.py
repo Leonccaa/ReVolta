@@ -164,7 +164,10 @@ class EncoderRunner:
         query_start_loc: np.ndarray,
         prefill_lens: np.ndarray,
         computed_prefill_lens: np.ndarray,
+        num_lookahead_tokens: int = 0,
     ) -> tuple[list[torch.Tensor], torch.Tensor]:
+        # `computed_prefill_lens` already includes `num_lookahead_tokens` when
+        # gathering for the EAGLE/MTP drafter.
         is_prefilling = (computed_prefill_lens < prefill_lens).tolist()
         all_decode = not any(is_prefilling)
         if all_decode:
@@ -212,6 +215,16 @@ class EncoderRunner:
 
                 mm_hash = mm_feature.identifier
                 encoder_output = self.encoder_cache.encoder_outputs.get(mm_hash, None)
+                if (
+                    encoder_output is None
+                    and num_lookahead_tokens > 0
+                    and start_pos >= query_end[i] - num_lookahead_tokens
+                ):
+                    # Only the drafter lookahead reaches this item, and the
+                    # scheduler did not encode it yet (it could not fit in
+                    # the encoder cache). Keep the placeholder token embedding
+                    # for that position; this only affects the draft.
+                    continue
                 assert encoder_output is not None, f"Encoder cache miss for {mm_hash}."
 
                 if (is_embed := pos_info.is_embed) is not None:

@@ -34,6 +34,10 @@ SM70_DFLASH2_VERIFIER_DEFAULTS = {
     "VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC": "1",
 }
 
+# What spec_state_replay=None means. One line to flip the release default;
+# explicit True or False always wins.
+SM70_DFLASH2_SPEC_STATE_REPLAY_DEFAULT = True
+
 SM70_DFLASH2_LEGACY_FIELDS = {
     "VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY": "fused_gdn_verify",
     "VLLM_SM70_DFLASH2_FUSED_GDN_COMBINED_SPLIT": "fused_gdn_combined_split",
@@ -118,6 +122,31 @@ class Sm70DFlash2Config:
     sharded_context_fc: bool | None = None
     """Policy for sharded context fc; None retains automatic qualification."""
 
+    spec_state_replay: bool | None = None
+    """Replay accepted GDN tokens instead of keeping a state block per draft.
+
+    The verifier keeps each recurrent layer's inputs and stores no per-position
+    state; once the accepted count is known, the same kernel launch is replayed
+    into the request's state block. Each running request then holds 2 instead
+    of 2 + num_speculative_tokens state blocks per GDN cache group. None (the
+    default) follows SM70_DFLASH2_SPEC_STATE_REPLAY_DEFAULT; when that is on,
+    it enables replay wherever it is supported, but yields to a packed
+    verifier (fused_gdn_verify) enabled by the qualified policy or explicitly.
+    True overrides an automatic packed default; explicitly enabling both
+    options raises a ValueError.
+    False keeps one state block per speculative position. Configuration only,
+    no environment alias."""
+
+    sharded_selector_codebook: bool = True
+    """Shard the candidate selector's two vocabulary codebooks across TP ranks.
+
+    Each rank keeps 1/TP of the rows; a lookup reads the owner's rows and an
+    all-reduce preserves finite nonzero values bitwise on every rank. Zero
+    values are equal, but their sign may change when adding +0. Saves
+    (TP-1)/TP of the codebooks' memory per GPU for one small all-reduce per
+    codebook and draft step. On by default; set False to keep full codebooks
+    on every rank. Configuration only, no environment alias."""
+
     qualified: bool = Field(default=False, init=False, repr=False)
     """Whether the retained complete-model validation boundary matches."""
 
@@ -162,9 +191,13 @@ class Sm70DFlash2Config:
         self.resolved = True
 
     def graph_options(self) -> dict[str, bool | None]:
-        return {
+        options = {
             field: getattr(self, field) for field in SM70_DFLASH2_LEGACY_FIELDS.values()
         }
+        # Listed only when on, so turning it off keeps the earlier compile keys.
+        if self.sharded_selector_codebook:
+            options["sharded_selector_codebook"] = True
+        return options
 
 
 def capture_sm70_dflash2_config(vllm_config=None) -> Sm70DFlash2Config | None:

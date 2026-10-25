@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location(
     "awq_int4_zero", ROOT / "vllm/model_executor/layers/quantization/awq_int4_zero.py"
 )
+assert SPEC is not None and SPEC.loader is not None
 PACK = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PACK)
 ORDER = (0, 4, 1, 5, 2, 6, 3, 7)
@@ -206,6 +207,7 @@ def test_real_checkpoint_tp4_all_ranks(layer, expert):
     checkpoint = os.getenv("W3_CHECKPOINT")
     if not checkpoint:
         pytest.skip("set W3_CHECKPOINT for read-only real expert validation")
+    assert checkpoint is not None
     from safetensors import safe_open
 
     path = Path(checkpoint) / f"f1-layer-{layer:02d}.safetensors"
@@ -280,6 +282,7 @@ def test_flag_defaults_off_and_explicit_on(monkeypatch):
                 if (
                     isinstance(key, ast.Constant)
                     and key.value == "VLLM_SM70_AWQ_MOE_INT4_ZERO"
+                    and isinstance(value, ast.Call)
                 ):
                     entry = value.args[0]
     assert isinstance(entry, ast.Lambda)

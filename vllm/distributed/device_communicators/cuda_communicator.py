@@ -431,9 +431,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 if out is not None:
                     _trace_all_reduce_path(self, "custom_sum2", input_a)
                     return out
-            # The generic sum2 pull kernel is slower on this topology. Bypass
-            # ordinary custom AR too, using the same fallback as large sum2.
-            return self._all_reduce_pynccl(input_a + input_b)
+            # Avoid generic sum2 pull while retaining ordinary AR's push,
+            # size/capture policy and backend fallbacks for the local sum.
+            return self.all_reduce(input_a + input_b)
         if (
             self.use_custom_allreduce
             and ca_comm is not None

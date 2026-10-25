@@ -6,7 +6,7 @@ Run Qwen3.8 Flash-Next for text, images, and video, with an OpenAI-compatible AP
 ReVolta is a Volta-focused fork of [vLLM](https://github.com/vllm-project/vllm),
 through [1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM).
 
-Current release: [0.1.2](https://github.com/Leonccaa/ReVolta/releases/tag/v0.1.2). 0.1.3 is in testing.
+Current release: [0.1.3](https://github.com/Leonccaa/ReVolta/releases/tag/v0.1.3).
 
 ## Highlights
 
@@ -47,14 +47,14 @@ The package is `revolta`; the Python import and CLI remain `vllm`.
 ```bash
 python3.12 -m venv /data/revolta/venv
 . /data/revolta/venv/bin/activate
-pip install revolta==0.1.2
-vllm --version          # 0.1.2
+pip install revolta==0.1.3
+vllm --version          # 0.1.3
 ```
 
 Or pull the Docker image:
 
 ```bash
-docker pull ghcr.io/leonccaa/revolta:0.1.2
+docker pull ghcr.io/leonccaa/revolta:0.1.3
 ```
 
 Follow [Getting started](docs/getting-started.md) to download the pinned checkpoint,
@@ -82,7 +82,7 @@ For another checkpoint, use its [preparation guide](docs/checkpoints.md) before 
 - Greedy outputs at C2–C8 can change between runs; fresh compiler autotuning can also change outputs.
 - The AWQ PLE table always needs about 48 GiB of host memory; retest memory use when changing concurrency or media limits.
 - PLE cascade is unsupported in 0.1.x; keep it disabled.
-- INT8 KV cannot be combined with DFlash2; the disk tier does not support INT8 in 0.1.2.
+- INT8 KV cannot be combined with DFlash2; the disk tier does not support INT8 yet.
 
 See [Support and known limits](docs/known-limits.md) for the complete list and test boundaries.
 

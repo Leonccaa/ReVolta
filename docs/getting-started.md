@@ -18,8 +18,8 @@ From PyPI (Linux x86-64 with glibc 2.34 or newer, Python 3.12):
 ```bash
 python3.12 -m venv /data/revolta/venv
 . /data/revolta/venv/bin/activate
-pip install revolta==0.1.2
-vllm --version          # 0.1.2
+pip install revolta==0.1.3
+vllm --version          # 0.1.3
 ```
 
 The wheel pins `torch==2.10.0`, `torchaudio==2.10.0` and `torchvision==0.25.0`,
@@ -39,7 +39,7 @@ ReVolta does not send the anonymous usage statistics that upstream vLLM reports.
 Or use the Docker image:
 
 ```bash
-docker pull ghcr.io/leonccaa/revolta:0.1.2
+docker pull ghcr.io/leonccaa/revolta:0.1.3
 ```
 
 ## 2. Download the checkpoint and make 512K views
@@ -212,7 +212,7 @@ docker run --rm --gpus all \
   -e VLLM_PLE_OFFLOAD_READY_TIMEOUT=1200 \
   -e VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES=1 \
   -e TILELANG_CACHE_DIR=/data/revolta/cache/tilelang \
-  ghcr.io/leonccaa/revolta:0.1.2 \
+  ghcr.io/leonccaa/revolta:0.1.3 \
   /data/revolta/views/target-512k --served-model-name Qwen3.8-Flash-Next ...
 ```
 

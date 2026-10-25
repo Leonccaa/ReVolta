@@ -37,11 +37,34 @@ GGUF are outside the build.
   build retrieved 20/20 needles at 489K. At 512K, the test covers capacity and the
   input/output boundary.
 - **Memory.** The default GPU utilization of 0.95 passed multimodal stress. Retest
-  memory use when changing concurrency or media limits. The AWQ PLE table always
-  needs about 48 GiB of host memory.
-- **PLE cascade.** Profiling with `ple_disk_cascade=true` used about 4 GiB more
-  GPU memory per 32 GB card. This left room for about 345K context tokens.
-  Cascade is unsupported in 0.1.x. Keep it disabled.
+  memory use when changing concurrency or media limits. By default the AWQ PLE
+  table needs about 48 GiB of host memory; see the experimental disk option below.
+- **PLE cascade.** Cascade (`ple_disk_cascade=true`) spills the part of the PLE table
+  that does not fit in host memory to the checkpoint files. It is not supported yet
+  and is off by default in the ReVolta profile; full support is planned for 0.2.
+  Profiling with it enabled used about 4 GiB more GPU memory per 32 GB card, which
+  left room for about 345K context tokens.
+- **Whole PLE table on disk (experimental, 0.1.3).** Instead of pinned host memory, the
+  whole table can stay as file-backed mappings of the checkpoint's safetensors files,
+  read by a separate PLE process. This is a different path from cascade and is off by
+  default. To try it, set `VLLM_PLE_CPU_OFFLOAD=1`, `VLLM_PLE_DISK_OFFLOAD=1` and
+  `VLLM_SM70_QWEN38_HYBRID_PLE=0`, add `--safetensors-load-strategy lazy`, keep
+  `"ple_disk_cascade": false` in `--kernel-config` (the check also set
+  `"ple_disk_release_pages": true`), and run without CPU KV offload
+  (`--kv-transfer-config`); that combination was not tested.
+    - Checked on the 0.1.3 candidate with Uncensored AWQ and E4M3 KV: MTP4 served
+      131K-token prompts, 4 concurrent requests and images under both a 64 GiB and a
+      32 GiB container memory limit, and a 491K-token prompt under 64 GiB; DFlash2
+      also served under 64 GiB. Peak container memory was about 54 GiB under the 64 GiB
+      limit; under 32 GiB, startup peaked at 16.5 GiB. The GPU KV pool was about 7%
+      smaller (1,073,265 tokens with MTP4).
+    - Greedy outputs matched the pinned-memory path; one of eight sampled
+      single-request outputs diverged at a near-tie, so the two paths are not bitwise
+      identical. If the PLE process dies, the client gets an error after about 9 s and
+      the engine exits after 11–13 s instead of hanging.
+    - Not measured: decode speed and time to first token, a machine with little
+      physical RAM, a local SSD (the check read the checkpoint from network storage),
+      and the net memory saving against the default path.
 - **FP4-Local vision.** Keep the default vision-tower TP4. Forcing data parallelism
   removes the tested memory arrangement. Non-empty request-level
   `mm_processor_kwargs` and `media_io_kwargs` are rejected with HTTP 400 by

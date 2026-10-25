@@ -86,8 +86,8 @@ For another checkpoint, use its [preparation guide](docs/checkpoints.md) before 
 - V100 16 GB, TP2/TP8, and other models have not been tested; NVLink has community results and is outside the release gate.
 - This release builds SM70 only; other GPU architectures, ROCm, CPU, XPU, TPU, and GGUF are outside the build.
 - Greedy outputs at C2–C8 can change between runs; fresh compiler autotuning can also change outputs.
-- The AWQ PLE table always needs about 48 GiB of host memory; retest memory use when changing concurrency or media limits.
-- PLE cascade is unsupported in 0.1.x; keep it disabled.
+- The AWQ PLE table needs about 48 GiB of host memory by default. 0.1.3 adds an experimental option that keeps the whole table on disk instead; it ran under 64 GiB and 32 GiB container limits, but speed was not measured. See [Support and known limits](docs/known-limits.md).
+- PLE cascade (spilling part of the table to disk, `ple_disk_cascade=true`) is not supported yet and is off by default; full support is planned for 0.2.
 - INT8 KV cannot be combined with DFlash2; the disk tier does not support INT8 yet.
 
 See [Support and known limits](docs/known-limits.md) for the complete list and test boundaries.

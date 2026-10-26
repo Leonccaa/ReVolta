@@ -65,7 +65,8 @@ Measured on our 4x V100 PCIe deployment with TP4 + DCP2, `--gpu-memory-utilizati
 
 | Format | Measured version | Method | GPU KV capacity, tokens | Maximum concurrency at 512K |
 | --- | --- | --- | ---: | ---: |
-| Uncensored AWQ g32 + E4M3 KV | 0.1.3 | DFlash2 recommended (state replay off) | **1,379,634** | **2.63×** |
+| Uncensored AWQ g32 + E4M3 KV | 0.1.4 | DFlash2 recommended (probabilistic drafting, state replay off) | **1,366,121** | **2.61×** |
+| Uncensored AWQ g32 + E4M3 KV | 0.1.3 / 0.1.4 | DFlash2, greedy drafting, state replay off | 1,379,634 | 2.63× |
 | Uncensored AWQ g32 + E4M3 KV | 0.1.3 | DFlash2 with state replay | 1,542,558 | 2.94× |
 | Uncensored AWQ g32 + E4M3 KV | 0.1.2 | DFlash2 | 1,268,831 | 2.42× |
 | Uncensored AWQ g32 + E4M3 KV | 0.1.2 / 0.1.3 | MTP4 | 1,153,143 | 2.20× |

@@ -23,10 +23,13 @@ or disable custom all-reduce with `--disable-custom-all-reduce`.
 
 ## Launch options
 
-- **`draft_sample_method` must be `greedy`.** A probabilistic draft corrupts output
-  above `max_num_seqs=2` at temperature > 0 (upstream 1Cat-vLLM issue #656). This
-  setting is about draft verification only; clients can still use any sampling
-  parameters.
+- **`draft_sample_method`: `greedy` for MTP, `probabilistic` for DFlash2.** With MTP, a
+  probabilistic draft corrupts output above `max_num_seqs=2` at temperature > 0
+  (upstream 1Cat-vLLM issue #656), so MTP must stay `greedy`. For DFlash2, `probabilistic`
+  is the recommended setting from 0.1.4; it was validated in the 0.1.4 release gate at one
+  to eight concurrent requests, at temperature 1 with thinking, including tool calls and
+  structured output. `greedy` still works with DFlash2. This setting is about drafting and
+  draft verification only; clients can still use any sampling parameters.
 - **`--gpu-memory-utilization 0.95`** passed the full gate, including the multimodal
   stress test with 8 concurrent requests. Higher values ran out of memory in earlier
   multimodal stress tests. If you change concurrency or media limits, measure again.
@@ -73,8 +76,8 @@ client settings. Qwen recommends:
 - `top_k` and `min_p` are not standard OpenAI fields. With the OpenAI Python SDK, pass them
   in `extra_body`.
 - These are the model vendor's values. The [speed tests](performance.md) use
-  `temperature=0`. The greedy `draft_sample_method` in the launch command applies only to
-  draft verification, not to these request settings.
+  `temperature=0`. The `draft_sample_method` in the launch command applies only to
+  drafting and draft verification, not to these request settings.
 
 ## YaRN and native context
 

@@ -10,7 +10,7 @@ evicted prefixes, so a later request with the same prefix reads them back instea
 running prefill again. All three modes were tested for correct readback: tokens
 generated after readback matched the off-mode reference exactly.
 
-**1. Off.** Remove `--kv-transfer-config`. This uses the least host memory (80 GiB was the smallest tested passing configuration). Evicted prefixes are
+**1. Off.** Remove `--kv-transfer-config`. This uses the least host memory with the default pinned PLE table (80 GiB passed memory stress; full acceptance was not run). Evicted prefixes are
 computed again.
 
 **2. CPU.** The quick start configuration:

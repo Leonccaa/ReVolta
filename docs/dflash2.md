@@ -134,7 +134,7 @@ GDN speculative state replay keeps two recurrent-state blocks per running reques
   batch sizes.
 - English code and reasoning gain the most. Chinese is slower than MTP4 in almost every
   measured case: the drafter was trained on English. Very long prompts also favour MTP4.
-- With the recommended 0.1.3 settings (sharded selector codebooks, the new graph settings, state replay off), the measured GPU KV pool is 1,379,634 tokens, with a reported maximum concurrency of 2.63× at 512K; with state replay on it is 1,542,558 tokens (2.94×). The 0.1.2 DFlash2 configuration measured 1,268,831 tokens (2.42×); see [Weight and KV formats](checkpoints.md#weight-and-kv-formats).
+- With the recommended 0.1.3 settings (sharded selector codebooks, the new graph settings, state replay off), the measured GPU KV pool is 1,379,634 tokens, with a reported maximum concurrency of 2.63× at 512K; with state replay on it is 1,542,558 tokens (2.94×). The 0.1.2 DFlash2 configuration measured 1,268,831 tokens (2.42×); see [GPU KV capacity by method](performance.md#gpu-kv-capacity-by-method).
 - On a replay of real agent sessions (one request at a time, sampling, long reasoning),
   DFlash2 and MTP4 were on par: 0.97× the MTP4 speed (95% interval 0.90–1.01). DFlash2
   was ahead on tool calls, answers and contexts up to 64K, and behind in reasoning, above

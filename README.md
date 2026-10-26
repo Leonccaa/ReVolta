@@ -4,7 +4,7 @@
 
 ReVolta turns a server with V100 32 GB GPUs and plenty of system memory into a dependable daily AI service. It runs Qwen3.8 Flash-Next for text, images and video behind an OpenAI-compatible API. ReVolta is built on [1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM), a V100-focused fork of vLLM, so the `vllm` command, its options and its OpenAI-compatible API work as usual.
 
-It is built for four or more V100 32 GB GPUs and validated on four. Every release passes the same gate on our own server before it ships: greedy output identical to the previous release token for token, 4 and 8 concurrent requests, images and video, CPU cache readback, and 512K-token prompts. That server runs ReVolta every day.
+It is built for four or more V100 32 GB GPUs and validated on four. Every release passes the same gate on our own server before it ships: single-request greedy output identical to the previous release token for token, 4 and 8 concurrent requests, images and video, CPU cache readback, and 512K-token prompts. That server runs ReVolta every day.
 
 **You need:** 4 × V100 32 GB (PCIe with P2P, or NVLink), at least 64 GB of system memory (128 GB recommended), Linux x86-64 with glibc 2.34 or newer, and an NVIDIA driver for CUDA 12.8. Tested hardware and limits: [Support and known limits](docs/known-limits.md).
 
@@ -18,7 +18,7 @@ Current release: [0.1.3](https://github.com/Leonccaa/ReVolta/releases/tag/v0.1.3
 | --- | ---: | ---: |
 | Context per request | 512K tokens | 512K tokens |
 | GPU KV pool | 1.15 million tokens | **1.38 million tokens** |
-| Full 512K requests held on the GPU at once | 2.20 | **2.63** |
+| GPU KV pool / 512K tokens (capacity ratio) | 2.20× | **2.63×** |
 | Concurrent requests | 8 | 8 |
 
 Prefixes evicted from the GPU stay in CPU memory or on disk: a cached 32K-token document is answered in **1.28 s instead of 10.06 s**. See [KV offload](docs/kv-offload.md).
@@ -86,8 +86,8 @@ For another checkpoint, use its [preparation guide](docs/checkpoints.md) before 
 - V100 16 GB, TP2/TP8, and other models have not been tested; NVLink has community results and is outside the release gate.
 - This release builds SM70 only; other GPU architectures, ROCm, CPU, XPU, TPU, and GGUF are outside the build.
 - Greedy outputs at C2–C8 can change between runs; fresh compiler autotuning can also change outputs.
-- The AWQ PLE table needs about 48 GiB of host memory by default. 0.1.3 adds an experimental option that keeps the whole table on disk instead; it ran under 64 GiB and 32 GiB container limits, but speed was not measured. See [Support and known limits](docs/known-limits.md).
-- PLE cascade (spilling part of the table to disk, `ple_disk_cascade=true`) is not supported yet and is off by default; full support is planned for 0.2.
+- The AWQ PLE table needs about 48 GiB of host memory by default. An existing experimental option keeps the whole table on disk instead; functional checks in 0.1.3 ran under 64 GiB and 32 GiB container limits without CPU KV offload, but speed was not measured. See [Support and known limits](docs/known-limits.md).
+- PLE cascade (spilling part of the table to disk, `ple_disk_cascade=true`) is not supported yet and is off by default in the ReVolta profile; full support is planned for 0.2.
 - INT8 KV cannot be combined with DFlash2; the disk tier does not support INT8 yet.
 
 See [Support and known limits](docs/known-limits.md) for the complete list and test boundaries.

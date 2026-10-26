@@ -109,7 +109,8 @@ command, relevant environment, model revision, host/container memory limits,
 offload settings, `nvidia-smi topo -m`, and the `ReVolta profile` /
 `SM70 interconnect=` log lines. Remove credentials.
 
-Reports from NVLink V100 owners are especially welcome; thanks to
+Reports from NVLink V100 owners are especially welcome; share measured results with the
+[Test results](https://github.com/Leonccaa/ReVolta/issues/new?template=test_results.yml) form. Thanks to
 [@jttdev](https://github.com/jttdev) for sharing their results ([#2](https://github.com/Leonccaa/ReVolta/issues/2)). Report security issues
 through GitHub private vulnerability reporting.
 

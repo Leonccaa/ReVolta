@@ -28,7 +28,7 @@ def test_native_push_size_contract_all_tokens(monkeypatch, values):
         else:
             monkeypatch.setenv(key, value)
     batch, fast, mtp5, m1 = values
-    admitted = set()
+    admitted: set[int] = set()
     if batch in (None, "1"):
         admitted.update((4, 8, 16))
         if fast == "1":

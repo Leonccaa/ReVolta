@@ -68,23 +68,25 @@ Measured on our 4x V100 PCIe deployment with TP4 + DCP2, `--gpu-memory-utilizati
 | Uncensored AWQ g32 + E4M3 KV | 0.1.3 | DFlash2 recommended (state replay off) | **1,379,634** | **2.63×** |
 | Uncensored AWQ g32 + E4M3 KV | 0.1.3 | DFlash2 with state replay | 1,542,558 | 2.94× |
 | Uncensored AWQ g32 + E4M3 KV | 0.1.2 | DFlash2 | 1,268,831 | 2.42× |
-| Uncensored AWQ g32 + E4M3 KV | 0.1.2 | MTP4 | 1,153,143 | 2.20× |
-| Uncensored AWQ g32 + INT8 KV | 0.1.2 | MTP4 | 1,140,072 | 2.17× |
+| Uncensored AWQ g32 + E4M3 KV | 0.1.2 / 0.1.3 | MTP4 | 1,153,143 | 2.20× |
+| Uncensored AWQ g32 + INT8 KV | 0.1.2 / 0.1.3 | MTP4 | 1,140,072 | 2.17× |
 | Uncensored AWQ g32 + INT8 KV | — | DFlash2 | Unsupported | — |
 | Uncensored AWQ g32 + FP16 KV | 0.1.2 | MTP4 | 673,749 | 1.29× |
 | Uncensored AWQ g32 + FP16 KV | 0.1.2 | DFlash2 | 781,584 | 1.49× |
-| NVIDIA FP4-Local + E4M3 KV | 0.1.2 | MTP4 | 1,321,612 | 2.52× |
+| NVIDIA FP4-Local + E4M3 KV | 0.1.3 | MTP4, E4M3 draft KV | 1,474,106 | 2.81× |
+| NVIDIA FP4-Local + E4M3 KV | 0.1.2 / 0.1.3 | MTP4, FP16 draft KV | 1,321,612 | 2.52× |
 | NVIDIA FP4-Local + E4M3 KV | 0.1.2 | DFlash2 | 1,335,042 | 2.55× |
-| Standard NVFP4 + E4M3 KV | 0.1.2 | MTP4 | 1,250,448 | 2.39× |
+| Standard NVFP4 + E4M3 KV | 0.1.2 / 0.1.3 | MTP4 | 1,250,448 | 2.39× |
 | Standard NVFP4 + E4M3 KV | 0.1.2 | DFlash2 | 1,337,745 | 2.55× |
 
-The 0.1.3 AWQ DFlash2 measurements include sharded selector codebooks (#9) and the 1200 MiB graph reserve with tail graphs off (#23), with state replay (#21) off (recommended) or on. The FP16 KV, FP4-Local and NVFP4 DFlash2 values were measured on 0.1.2; they have not been remeasured with the 0.1.3 DFlash2 changes. The 0.1.2 AWQ DFlash2 measurements use a 1500 MiB graph reserve. INT8 KV is not supported by the DFlash2 drafter; 0.1.3 rejects this combination at startup.
+The 0.1.3 AWQ DFlash2 measurements include sharded selector codebooks (#9) and the 1200 MiB graph reserve with tail graphs off (#23), with state replay (#21) off (recommended) or on. The MTP4 rows marked 0.1.2 / 0.1.3 were remeasured unchanged on the 0.1.3 release image; the FP4-Local E4M3-draft row is a separate smoke with the `v1.1-base-b9ce18a6` scale pack. The FP16 KV, FP4-Local and NVFP4 DFlash2 values were measured on 0.1.2; they have not been remeasured with the 0.1.3 DFlash2 changes. The 0.1.2 AWQ DFlash2 measurements use a 1500 MiB graph reserve. INT8 target KV is not supported with DFlash2; current main rejects it during configuration even with a separate FP16 draft cache (#25).
 
 ## Performance
 
 ### Reference system, MTP4
 
 Release configuration: Uncensored AWQ g32, E4M3 KV, TP4 + DCP2, MTP4, on the reference system.
+The first table records 0.1.0; the later release comparison follows below.
 
 | Metric | 0.1.0 |
 | --- | ---: |
@@ -101,7 +103,7 @@ Release configuration: Uncensored AWQ g32, E4M3 KV, TP4 + DCP2, MTP4, on the ref
 and English arithmetic prompts rotate across clients. Each concurrency level
 has one warm-up and eight measured runs; the table reports the mean.
 
-At C2, the two requests share the first prefill step only if the second one reaches
+In the 0.1.0 C2 measurement, the two requests share the first prefill step only if the second one reaches
 the engine within a sub-millisecond window. With the same code, this happened in
 0 to 8 of the 8 measured repetitions, varying from run to run, and C2 ranged
 from 159.7 to 173.7 tok/s; the table's 167.2 came from a run with 4 of 8.
@@ -115,6 +117,17 @@ first token.
 Version-to-version speed comparisons use the same machine, configuration, and test
 window. Other context lengths, media workloads, and thinking-mode outputs can give
 different results.
+
+The 0.1.3 release gate repeated the output-speed comparison against 0.1.2 in the same
+window and configuration, at 250 W per GPU, with 512-token responses and eight repeats
+per concurrency level:
+
+| Total output throughput, tokens/s | 0.1.2 | 0.1.3 |
+| --- | ---: | ---: |
+| C1 | 153.1 | 153.2 |
+| C2 | 170.7 | 169.4 |
+| C4 | 263.4 | 268.3 |
+| C8 | 389.3 | 390.4 |
 
 ### Cold prefill
 
@@ -170,7 +183,9 @@ From 0.1.4, state replay is optional and off by default, and when turned on its 
 
 Outputs were identical in all four (30 of 30 sampled turns, 24 of 24 greedy streams). With greedy decoding, replay on with the graph ran 1–4% below replay off at one to four requests and level at eight, and faster than 0.1.3's replay at every concurrency. The remaining cost is the replay's own GPU work.
 
-GDN speculative state replay (`sm70_dflash2.spec_state_replay`, on by default with DFlash2) adds about 7 ms per decoding step when the target samples (30.6 to 37.9 ms per step at one request on our 4 × V100 PCIe deployment). With greedy decoding, development runs measured 2 to 3% lower throughput at one request and 5 to 7% at eight; on the release image, eight greedy requests measured 312.6 tokens/s with replay (one run) and 302.1 and 335.8 without it (two runs), so the high-concurrency difference is within run-to-run variation. The reference deployment therefore turns it off with `"sm70_dflash2": {"spec_state_replay": false}`; outputs are unchanged either way.
+### State replay in 0.1.3
+
+In 0.1.3, GDN speculative state replay (`sm70_dflash2.spec_state_replay`, on by default where supported) added about 7 ms per decoding step when the target sampled (30.6 to 37.9 ms per step at one request on our 4 × V100 PCIe deployment). With greedy decoding, development runs measured 2 to 3% lower throughput at one request and up to about 5% at eight; on the release image, eight greedy requests measured 312.6 tokens/s with replay (one run) and 302.1 and 335.8 without it (two runs), so the high-concurrency difference was within run-to-run variation. The 0.1.3 reference deployment therefore turned it off with `"sm70_dflash2": {"spec_state_replay": false}`; outputs were unchanged either way. See [State replay (optional)](dflash2.md#state-replay-optional) for the configuration requirements and current default.
 
 With replay off, DFlash2 keeps the other 0.1.3 memory changes (sharded selector codebooks, verifier tail graphs off, 1200 MiB graph reserve): 1,379,634 KV tokens at 512K against 1,268,831 in 0.1.2. Replay adds about 12% more (1,542,558). At eight concurrent 96K-token requests, peak KV use was 26% with replay, sharding and the graph defaults together, against 55% without replay and 60% on 0.1.2. MTP4 remains the default speculative method.
 

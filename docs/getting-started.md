@@ -9,7 +9,7 @@ concurrent requests in testing, and a 48 GiB CPU KV pool.
 
 ## 1. Install
 
-The distribution name is `revolta` (version `0.1.2`). The Python import name and the
+The distribution name is `revolta` (version `0.1.3`). The Python import name and the
 CLI are still **`vllm`** (`import vllm`, `vllm serve`); this is intentional. Only
 compute capability 7.0 is built, with CUDA 12.8, Python 3.12 and PyTorch 2.10.
 
@@ -102,7 +102,7 @@ export VLLM_SM70_AWQ_MOE_INT4_ZERO=1             # pack AWQ zero points to 4 bit
 export VLLM_QWEN4EXP_PLE_HOST_GIB=12             # pinned host memory for the PLE table, GiB per TP rank
 export VLLM_PLE_OFFLOAD_READY_TIMEOUT=1200       # seconds; PLE loading takes a while
 export VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES=1    # refuse to start without calibrated E4M3 KV scales
-export TILELANG_CACHE_DIR=/data/revolta/cache/tilelang  # persistent TileLang kernel cache (needed in containers)
+export TILELANG_CACHE_DIR=/data/revolta/cache/tilelang  # persistent TileLang kernel cache
 ```
 
 Continue with the launch command below.
@@ -164,7 +164,9 @@ vllm serve /data/revolta/views/target-512k \
 Notes:
 
 - **Startup** takes roughly 10–15 minutes: weight and PLE loading, `torch.compile`
-  and CUDA graph capture. Later starts reuse the compile cache. On a first start with
+  and CUDA graph capture. Later starts reuse the compile cache. Upgrading from 0.1.2
+  to 0.1.3 invalidates that cache, even with MTP or no speculation, because the traced
+  GDN source changed; allow a cold compile after upgrading. On a first start with
   an empty compile cache, the reported GPU KV capacity can be one allocation unit
   (7,182 tokens) lower.
 
@@ -191,6 +193,11 @@ In the startup log, look for:
 
 For request defaults and the model vendor's recommendations, see
 [Sampling parameters](configuration.md#sampling-parameters).
+
+The server also provides Anthropic-compatible `/v1/messages` (including streaming)
+and `/v1/messages/count_tokens`. On current main, an overlong prompt returns HTTP 400
+with `invalid_request_error`; an unknown model returns HTTP 404 with `not_found_error`.
+In 0.1.3, the overlong-prompt case returns HTTP 500 with `api_error` (#26).
 
 ## Docker
 

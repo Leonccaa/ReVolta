@@ -44,7 +44,7 @@ GGUF are outside the build.
   and is off by default in the ReVolta profile; full support is planned for 0.2.
   Profiling with it enabled used about 4 GiB more GPU memory per 32 GB card, which
   left room for about 345K context tokens.
-- **Whole PLE table on disk (experimental, 0.1.3).** Instead of pinned host memory, the
+- **Whole PLE table on disk (experimental; first checked in 0.1.3).** Instead of pinned host memory, the
   whole table can stay as file-backed mappings of the checkpoint's safetensors files,
   read by a separate PLE process. This is a different path from cascade and is off by
   default. To try it, set `VLLM_PLE_CPU_OFFLOAD=1`, `VLLM_PLE_DISK_OFFLOAD=1` and
@@ -82,7 +82,10 @@ GGUF are outside the build.
   non-streaming responses.
 - **Tool calls.** In `qwen3_coder` tool calls, a string argument that contains the
   literal text `</function>` is cut at that point. String arguments are streamed as
-  they are generated.
+  they are generated. `$ref` parameters can be treated as strings, and a failed
+  `required` parse can still report `finish_reason="tool_calls"`. Stop tokens inside
+  JSON strings and very large parallel-call deltas remain problematic; strict native
+  XML structural tags remain deferred.
 - **Image placeholder text.** Text that contains the literal image placeholder
   `<|image_pad|>` can take the place of a real image in the same request. Upstream vLLM
   and HF behave the same (vllm-project/vllm#57740), and ReVolta follows them. Remove such tokens from

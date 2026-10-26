@@ -11,7 +11,7 @@ settings remain:
 
 The complete reference exports are in [step 3 of the tutorial](getting-started.md#3-environment).
 
-Do not set other `VLLM_SM70_*` variables unless you are troubleshooting. Explicit
+Use only the documented `VLLM_SM70_*` settings unless you are troubleshooting. Explicit
 values override the profile.
 
 ## Interconnect
@@ -49,7 +49,7 @@ or disable custom all-reduce with `--disable-custom-all-reduce`.
   seconds on streaming responses, so proxies with read timeouts keep the connection open
   during queueing and prefill. The default, 0, sends none.
 - `TILELANG_CACHE_DIR` ([step 3](getting-started.md#3-environment)) keeps TileLang's compiled kernels on persistent storage.
-  Without it, a new container compiles them again.
+  Without persistent cache storage, a recreated container compiles them again.
 - Media limits and request budgets: see
   [multimodal input limits](../.github/MULTIMODAL_INPUTS.md).
 
@@ -100,7 +100,7 @@ embedding table uses about 47.7 GiB of pinned host memory even with KV offload d
 | 80 GiB | Off | Memory stress passed; full acceptance not run |
 | 64 GiB | Off | Out of memory during startup |
 
-80 GiB is the smallest tested passing memory configuration. With less than 128 GiB,
+80 GiB is the smallest tested limit that passed memory stress, without full acceptance. With less than 128 GiB,
 reduce or disable the CPU KV pool.
 
 Image and video preprocessing also uses host memory, in the API server process. In one

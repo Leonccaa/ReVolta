@@ -184,7 +184,9 @@ scales of the checkpoint's built-in MTP layer, so both target and draft can use
 E4M3 KV. Omit the draft `model` field: the drafter uses the same materialized
 512K view, its YaRN settings and its draft scales. In a paired test that changed
 only the draft KV type, MTP acceptance was 63.1% (greedy) and 62.0% (sampled)
-with E4M3 draft KV, against 64.4% and 61.9% with FP16 draft KV.
+with E4M3 draft KV, against 64.4% and 61.9% with FP16 draft KV. The 0.1.3 release-image
+smoke measured 1,474,106 GPU KV tokens (2.81× at 512K) with E4M3 target and draft KV,
+against 1,321,612 (2.52×) with an FP16 draft cache.
 
 `"kv_cache_dtype": "float16"` for the draft still works. The older
 `v1.0-base-b9ce18a6` tag has no draft scales; with it, keep the draft in
@@ -254,7 +256,7 @@ The default is AWQ g32 with E4M3 KV.
 No ReVolta version is specified for these measurements. See
 [Quality measurements](performance.md#quality-measurements) for the datasets, reference and estimator.
 
-| Format | KL vs base BF16 | Top-1 agreement |
+| Format | KL vs BF16 (reference below) | Top-1 agreement |
 | --- | ---: | ---: |
 | Uncensored AWQ g32 + E4M3 KV | 0.0273 | 96.63% |
 | Standard NVFP4 + E4M3 KV | 0.0303 | 96.36% |
@@ -262,7 +264,7 @@ No ReVolta version is specified for these measurements. See
 | Uncensored AWQ g32 + INT8 KV | 0.0267 | Within 0.1 percentage point of E4M3 |
 | Uncensored AWQ g32 + FP16 KV | Within 0.001 of E4M3 | Same as E4M3 |
 
-All KL and top-1 values use the same base BF16 reference; the FP16 KV row compares FP16 with E4M3 KV directly (on short prompts: KL 0.0220 against 0.0214, top-1 97.08% for both; on the long-context set: 0.0239 against 0.0238). The Uncensored rows include the effect of fine-tuning as well as quantization.
+The first four rows use the same base BF16 reference; the Uncensored rows there include the effect of fine-tuning as well as quantization. The FP16 KV row is a separate comparison of FP16 and E4M3 KV against the Uncensored checkpoint's own BF16 parent (on short prompts: KL 0.0220 against 0.0214, top-1 97.08% for both; on the long-context set: 0.0239 against 0.0238).
 
 ## E4M3 KV
 
@@ -271,7 +273,7 @@ Use the calibrated per-layer K/V scales included in the checkpoint. Keep
 Without it, the loader warns and falls back to 1.0.
 
 On the long-context quality set, E4M3 and FP16 KV measured KL 0.0238 and 0.0239
-against BF16.
+against the Uncensored checkpoint's own BF16 parent.
 
 ## INT8 KV
 

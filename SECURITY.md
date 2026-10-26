@@ -3,7 +3,7 @@
 Report suspected vulnerabilities through this repository's GitHub
 **Security → Advisories → Report a vulnerability** form (private vulnerability
 reporting). Do not put exploit details, credentials or private data in a public
-issue. Private reporting must be enabled before the public release.
+issue.
 
 Include the affected version or commit, configuration, impact, reproduction
 steps and any suggested mitigation. Maintainers will coordinate investigation,

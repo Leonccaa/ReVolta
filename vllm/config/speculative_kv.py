@@ -37,6 +37,14 @@ def validate_speculative_kv_cache_dtype(config: "VllmConfig") -> None:
     spec = config.speculative_config
     if config.is_speculative_draft or spec is None:
         return
+    if spec.method == "dflash" and config.cache_config.cache_dtype == "int8":
+        raise ValueError(
+            "DFlash/DFlash2 does not support INT8 target KV: its attention "
+            "block size is incompatible with the 16-token kernel pages "
+            "required by the INT8 v1 planar layout, regardless of the draft "
+            "KV dtype. With DFlash2 use --kv-cache-dtype fp8_e4m3 (recommended), "
+            "float16, or auto. For INT8 KV use method='mtp'."
+        )
     if spec.method == "dflash" and dflash_draft_cache_dtype(config) == "int8":
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
@@ -64,8 +72,8 @@ def validate_speculative_kv_cache_dtype(config: "VllmConfig") -> None:
                     "DFlash/DFlash2 draft attention with sliding windows or "
                     "attention sinks does not support INT8 KV with "
                     "FLASH_ATTN_V100. Use --kv-cache-dtype fp8_e4m3, float16, "
-                    "or auto, or set speculative_config.kv_cache_dtype to "
-                    "'float16'/'auto' for a separate FP16 draft cache. "
+                    "or auto for the target and omit an INT8 draft "
+                    "speculative_config.kv_cache_dtype. "
                     "Use method='mtp' for MTP speculative decoding with INT8 KV."
                 )
     if spec.method not in ("eagle", "eagle3", "mtp") or spec.kv_cache_dtype is None:

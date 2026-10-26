@@ -676,6 +676,9 @@ class OffloadingConnectorScheduler:
         req_status = self._req_status[request.request_id]
         for group_state in req_status.group_states:
             group_state.block_ids.clear()
+            # Restarting at token 0: offer every block again; resident keys
+            # are filtered by prepare_store (vllm-project/vllm#63010).
+            group_state.next_stored_block_idx = 0
 
         # A preempted request can return before its stores have completed.
         # Its preemption metadata will flush them before the next forward.
@@ -743,18 +746,21 @@ class OffloadingConnectorScheduler:
             num_gpu_blocks = cdiv(num_cached_tokens, gpu_block_size)
 
             assert len(group_blocks) >= num_gpu_blocks
-            num_locally_computed_gpu_blocks = num_gpu_blocks
-            # Skip null placeholder blocks (used for sliding window or mamba padding).
-            for i, block in enumerate(group_blocks[:num_gpu_blocks]):
+            # The load boundary is a slice index, not a count of computed blocks.
+            # Sparse groups (Mamba, SWA) can hold non-null unhashed blocks below
+            # the local hit. Scan only beyond it, still skipping null padding.
+            first_fresh_gpu_block_idx = cdiv(
+                num_locally_computed_tokens, gpu_block_size
+            )
+            load_start_gpu_block_idx = num_gpu_blocks
+            for i in range(first_fresh_gpu_block_idx, num_gpu_blocks):
+                block = group_blocks[i]
                 if not block.is_null and block.block_hash is None:
-                    num_locally_computed_gpu_blocks = i
+                    load_start_gpu_block_idx = i
                     break
 
-            assert (
-                num_locally_computed_tokens
-                <= num_locally_computed_gpu_blocks * gpu_block_size
-            )
-            num_pending_gpu_blocks = num_gpu_blocks - num_locally_computed_gpu_blocks
+            assert num_locally_computed_tokens % gpu_block_size == 0
+            num_pending_gpu_blocks = num_gpu_blocks - load_start_gpu_block_idx
 
             if group_config.sliding_window_size_in_blocks is not None:
                 assert (
@@ -767,18 +773,16 @@ class OffloadingConnectorScheduler:
             assert len(offload_keys) >= num_blocks
             if num_pending_gpu_blocks:
                 start_block_idx = (
-                    num_locally_computed_gpu_blocks // self.config.block_size_factor
+                    load_start_gpu_block_idx // self.config.block_size_factor
                 )
                 keys_to_load.extend(offload_keys[start_block_idx:num_blocks])
 
             dst_block_ids.extend(
                 block.block_id
-                for block in group_blocks[
-                    num_locally_computed_gpu_blocks:num_gpu_blocks
-                ]
+                for block in group_blocks[load_start_gpu_block_idx:num_gpu_blocks]
             )
             group_sizes[group_config.group_idx] = num_pending_gpu_blocks
-            block_indices[group_config.group_idx] = num_locally_computed_gpu_blocks
+            block_indices[group_config.group_idx] = load_start_gpu_block_idx
 
             # Skip prefix-hit blocks for block-level policy; for
             # request-level, next_stored_block_idx stays at 0 so all

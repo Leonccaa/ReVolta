@@ -1,7 +1,7 @@
 # Contributing to ReVolta
 
 ReVolta focuses on the configurations in the
-[0.1.0 support scope](.github/SUPPORT.md), derived from roadmap W10. Inherited
+[support scope](.github/SUPPORT.md). Inherited
 vLLM functionality outside that scope is not a support commitment.
 
 ## Issues

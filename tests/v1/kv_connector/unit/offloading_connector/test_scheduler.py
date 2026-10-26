@@ -20,7 +20,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     SchedulerOffloadConfig,
 )
 from vllm.v1.core.kv_cache_coordinator import KVCacheCoordinator
-from vllm.v1.core.kv_cache_utils import BlockHash
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+from vllm.v1.core.kv_cache_utils import (
+    BlockHash,
+    KVCacheBlock,
+    make_block_hash_with_group_id,
+)
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -178,7 +183,12 @@ def test_offloading_connector(request_runner, async_scheduling: bool):
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])
-def test_request_preemption(request_runner, async_scheduling: bool):
+@pytest.mark.parametrize("cpu_hit", [True, False])
+def test_request_preemption(request_runner, async_scheduling: bool, cpu_hit: bool):
+    """Reload a resident prefix, or re-store it after CPU eviction.
+
+    Adapted from vllm-project/vllm#63010.
+    """
     block_size = 4
     block_size_factor = 3
     offloaded_block_size = block_size * block_size_factor
@@ -229,16 +239,22 @@ def test_request_preemption(request_runner, async_scheduling: bool):
     free_block_queue.num_free_blocks = num_free_blocks_empty
     runner.scheduler.reset_prefix_cache()
 
-    # request should now return from preemption
-    # re-load [0, ..., 8] from the CPU and store [9, 10, 11]
-    runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context: 3
     runner.manager.prepare_store.side_effect = lambda keys, req_context: (
         generate_store_output(keys)
     )
-    runner.run(
-        decoded_tokens=[0] * block_size,
-        expected_loaded=(0, 1, 2, 3, 4, 5, 6, 7, 8),
-    )
+    if cpu_hit:
+        # Resume by loading [0, ..., 8]; the hit advances the store cursor.
+        runner.connector_scheduler._maximal_prefix_lookup = lambda key, req_context: 3
+        runner.run(
+            decoded_tokens=[0] * block_size,
+            expected_loaded=(0, 1, 2, 3, 4, 5, 6, 7, 8),
+        )
+    else:
+        # The CPU tier evicted the prefix: recompute and offer it again.
+        runner.run(
+            decoded_tokens=[0] * block_size,
+            expected_stored=(0, 1, 2, 3, 4, 5, 6, 7, 8),
+        )
 
     runner.run(
         decoded_tokens=[EOS_TOKEN_ID],
@@ -875,6 +891,109 @@ def _make_exact_boundary_scheduler() -> OffloadingConnectorScheduler:
     scheduler._jobs = {}
     scheduler._block_id_to_pending_jobs = {}
     return scheduler
+
+
+@pytest.mark.parametrize("block_size,hash_size", [(1632, 8), (1664, 16)])
+@pytest.mark.parametrize("unhashed_idx", [0, 1])
+def test_recurrent_unhashed_prefix_does_not_truncate_load_boundary(
+    block_size: int, hash_size: int, unhashed_idx: int
+):
+    """Adapt vllm-project/vllm#52807 to the MTP/DFlash state-page geometry.
+
+    This pins the connector's input contract directly: a non-null block
+    without a hash below the local prefix hit must not become the start of
+    the load region. The local prefix covers three pages, followed by two
+    external pages. The recurrent group needs only the final external state;
+    neither its unhashed local state nor the null padding is a load
+    destination.
+    """
+    scheduler = _make_exact_boundary_scheduler()
+    scheduler.config = scheduler.config._replace(
+        kv_group_configs=tuple(
+            group._replace(
+                gpu_block_size=block_size,
+                offloaded_block_size=block_size,
+                hash_block_size_factor=block_size // hash_size,
+            )
+            for group in scheduler.config.kv_group_configs
+        )
+    )
+    state = scheduler._req_status["req"]
+    state.config = scheduler.config
+    state.req.block_hashes = [
+        BlockHash(f"h{i}".encode()) for i in range(5 * block_size // hash_size)
+    ]
+    state.num_locally_computed_tokens = 3 * block_size
+    state.update_offload_keys()
+    full = [KVCacheBlock(10 + i) for i in range(5)]
+    for i in range(3):
+        full[i].block_hash = make_block_hash_with_group_id(
+            BlockHash(f"f{i}".encode()), 0
+        )
+    null = KVCacheBlock(0, is_null=True)
+    recurrent = [null] * 5
+    recurrent[unhashed_idx] = KVCacheBlock(41)
+    recurrent[-1] = KVCacheBlock(42)
+
+    scheduler.update_state_after_alloc(
+        state.req, KVCacheBlocks((full, recurrent)), 2 * block_size
+    )
+
+    [job] = scheduler._current_batch_load_jobs.values()
+    dst_spec = job.transfer_spec[1]
+    assert isinstance(dst_spec, GPULoadStoreSpec)
+    assert list(dst_spec.block_ids) == [13, 14, 42]
+    assert list(dst_spec.group_sizes) == [2, 1]
+    assert list(dst_spec.block_indices) == [3, 4]
+    expected_keys = [
+        *state.group_states[0].offload_keys[3:5],
+        state.group_states[1].offload_keys[4],
+    ]
+    assert scheduler.manager.prepare_load.call_args.args[0] == expected_keys
+
+
+@pytest.mark.parametrize("local_blocks", [0, 3])
+@pytest.mark.parametrize("recurrent", [False, True])
+def test_load_boundary_preserves_cold_and_hashed_prefix_paths(
+    local_blocks: int, recurrent: bool
+):
+    scheduler = _make_exact_boundary_scheduler()
+    if not recurrent:
+        scheduler.config = scheduler.config._replace(
+            kv_group_configs=tuple(
+                group._replace(sliding_window_size_in_blocks=None)
+                for group in scheduler.config.kv_group_configs
+            )
+        )
+    state = scheduler._req_status["req"]
+    state.config = scheduler.config
+    state.req.block_hashes = [BlockHash(f"h{i}".encode()) for i in range(20)]
+    state.num_locally_computed_tokens = local_blocks * 16
+    state.update_offload_keys()
+    end = local_blocks + 2
+    groups = [[KVCacheBlock(10 * (g + 1) + i) for i in range(end)] for g in range(2)]
+    for g, blocks in enumerate(groups):
+        for i in range(local_blocks):
+            blocks[i].block_hash = make_block_hash_with_group_id(
+                BlockHash(f"g{g}b{i}".encode()), g
+            )
+    if recurrent:
+        groups[1][:-1] = [KVCacheBlock(0, is_null=True)] * (end - 1)
+    scheduler.update_state_after_alloc(state.req, KVCacheBlocks(tuple(groups)), 32)
+    [job] = scheduler._current_batch_load_jobs.values()
+    starts = [local_blocks, end - 1 if recurrent else local_blocks]
+    expected_ids = [b.block_id for g, start in zip(groups, starts) for b in g[start:]]
+    dst_spec = job.transfer_spec[1]
+    assert isinstance(dst_spec, GPULoadStoreSpec)
+    assert list(dst_spec.block_ids) == expected_ids
+    assert list(dst_spec.group_sizes) == [2, 1 if recurrent else 2]
+    assert list(dst_spec.block_indices) == starts
+    expected_keys = [
+        key
+        for group, start in zip(state.group_states, starts)
+        for key in group.offload_keys[start:end]
+    ]
+    assert scheduler.manager.prepare_load.call_args.args[0] == expected_keys
 
 
 def _hybrid_align_spec(

@@ -47,9 +47,9 @@ from vllm.v1.worker.gpu.attn_utils import (
     compute_common_gdn_attn_metadata,
 )
 from vllm.v1.worker.gpu.gdn_spec_replay import (
+    GDNSpecReplayGraphs,
     GDNSpecReplayLayer,
     GDNSpecReplayStep,
-    replay_gdn_spec_states,
 )
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mamba_align import (
@@ -136,6 +136,8 @@ class MambaHybridModelState(DefaultModelState):
     # GDN speculative state replay (set in __init__ from the speculative config).
     _spec_state_replay = False
     _spec_replay_step: GDNSpecReplayStep | None = None
+    # Disabled default for states built without __init__ (tests); never captures.
+    _spec_replay_graphs = GDNSpecReplayGraphs(enabled=False)
 
     def __init__(
         self,
@@ -230,6 +232,11 @@ class MambaHybridModelState(DefaultModelState):
         )
         assert self._align_mode or not self._spec_state_replay
         self._spec_replay_step: GDNSpecReplayStep | None = None
+        policy = getattr(speculative_config, "sm70_dflash2", None)
+        self._spec_replay_graphs = GDNSpecReplayGraphs(
+            enabled=self._spec_state_replay
+            and bool(getattr(policy, "spec_state_replay_graph", True))
+        )
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
@@ -622,6 +629,7 @@ class MambaHybridModelState(DefaultModelState):
             spec_rows=spec_rows_cpu.to(self.device, non_blocking=True),
             layers=layers,
             block_tables=block_tables,
+            full_graph=full_graph,
         )
 
     def postprocess_state(
@@ -649,7 +657,7 @@ class MambaHybridModelState(DefaultModelState):
         step, self._spec_replay_step = self._spec_replay_step, None
         if step is not None and isinstance(num_sampled, torch.Tensor):
             assert num_computed_tokens is not None and self._mamba_spec is not None
-            replay_gdn_spec_states(
+            self._spec_replay_graphs.run(
                 step,
                 idx_mapping=idx_mapping,
                 num_sampled=num_sampled,

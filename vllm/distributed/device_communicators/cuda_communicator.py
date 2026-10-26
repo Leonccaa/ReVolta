@@ -393,6 +393,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             assert out is not None
             _trace_all_reduce_path(self, "torch_symm_mem", input_)
             return out
+        return self._all_reduce_pynccl(input_)
+
+    def _all_reduce_pynccl(self, input_):
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is None or pynccl_comm.disabled:
             out = input_.clone()
@@ -415,6 +418,22 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
     def all_reduce_sum2(self, input_a, input_b):
         ca_comm = self.ca_comm
+        if (
+            self.use_custom_allreduce
+            and ca_comm is not None
+            and not ca_comm.disabled
+            and ca_comm.sm70_pcie_switch
+            and input_a.dtype == input_b.dtype == torch.float16
+            and input_a.shape == input_b.shape
+        ):
+            if ca_comm.can_sm70_tp4_push_sum2(input_a):
+                out = ca_comm.custom_all_reduce_sum2(input_a, input_b)
+                if out is not None:
+                    _trace_all_reduce_path(self, "custom_sum2", input_a)
+                    return out
+            # Avoid generic sum2 pull while retaining ordinary AR's push,
+            # size/capture policy and backend fallbacks for the local sum.
+            return self.all_reduce(input_a + input_b)
         if (
             self.use_custom_allreduce
             and ca_comm is not None

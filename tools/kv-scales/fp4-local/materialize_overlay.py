@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Materialize a revision-checked QSA E4M3 KV-scale checkpoint view.
 
 Target: nvidia/Qwen3.8-Flash-Next-FP4-Local. Its weight shards live under
@@ -63,6 +64,7 @@ def inspect_scale_file(path: Path) -> tuple[dict[str, int], dict[str, str], int]
         data_start = 8 + header_size
         values: dict[str, int] = {}
         payload_bytes = 0
+        intervals = []
 
         for name, details in header.items():
             if name == "__metadata__":
@@ -79,6 +81,9 @@ def inspect_scale_file(path: Path) -> tuple[dict[str, int], dict[str, str], int]
                 or offsets[1] - offsets[0] != 4
             ):
                 raise ValueError(f"Invalid scalar data offsets for {name}")
+            if offsets[0] < 0 or offsets[1] > file_size - data_start:
+                raise ValueError(f"Out-of-bounds tensor data for {name}")
+            intervals.append(tuple(offsets))
             handle.seek(data_start + offsets[0])
             raw_value = handle.read(4)
             if len(raw_value) != 4:
@@ -89,7 +94,63 @@ def inspect_scale_file(path: Path) -> tuple[dict[str, int], dict[str, str], int]
             values[name] = struct.unpack("<I", raw_value)[0]
             payload_bytes += offsets[1] - offsets[0]
 
+        cursor = 0
+        for start, end in sorted(intervals):
+            if start != cursor:
+                raise ValueError("Scale payload has overlapping or unused bytes")
+            cursor = end
+        if cursor != file_size - data_start:
+            raise ValueError("Scale payload has trailing bytes")
+
     return values, {str(k): str(v) for k, v in metadata.items()}, payload_bytes
+
+
+DRAFT_SCALE_FILENAME = "model-kvscales-mtp.safetensors"
+DRAFT_MANIFEST_FILENAME = "draft-kvscales-manifest.json"
+DRAFT_NAMES = {f"mtp.layers.0.self_attn.{kind}_scale" for kind in ("k", "v")}
+
+
+def validate_draft(pack_dir: Path, manifest: dict[str, Any]):
+    """An absent optional file preserves the original 24-scale view exactly."""
+    path = pack_dir / DRAFT_SCALE_FILENAME
+    if not path.exists():
+        return None
+    draft = load_json(pack_dir / DRAFT_MANIFEST_FILENAME)
+    if draft.get("schema_version") != 1:
+        raise ValueError("Unsupported draft manifest version")
+    if draft.get("base_checkpoint") != manifest["base_checkpoint"]:
+        raise ValueError("Draft scale base revision/index/config binding mismatch")
+    if draft.get("scale_contract") != manifest["scale_contract"]:
+        raise ValueError("Draft scale converter contract mismatch")
+    details = draft["scale_file"]
+    if details["filename"] != DRAFT_SCALE_FILENAME:
+        raise ValueError("Unexpected draft scale filename")
+    if path.stat().st_size != details["size_bytes"]:
+        raise ValueError("Draft scale file size mismatch")
+    if sha256(path) != details["sha256"]:
+        raise ValueError("Draft scale file SHA-256 mismatch")
+    values, metadata, payload = inspect_scale_file(path)
+    if (
+        set(values) != DRAFT_NAMES
+        or set(details["tensor_names"]) != DRAFT_NAMES
+        or len(details["tensor_names"]) != 2
+        or details["tensor_count"] != 2
+    ):
+        raise ValueError("Draft scale tensor coverage mismatch")
+    entries = {entry["name"]: entry for entry in draft["tensors"]}
+    if set(entries) != DRAFT_NAMES or len(draft["tensors"]) != 2:
+        raise ValueError("Draft manifest tensor coverage mismatch")
+    for name, entry in entries.items():
+        if values[name] != int(entry["f32_hex"], 16):
+            raise ValueError(f"Draft scale value does not match manifest: {name}")
+    if metadata.get("negative_control") != "false":
+        raise ValueError("Refusing a draft negative-control file")
+    if metadata.get("qsa_kv_scale_contract") != manifest["scale_contract"]:
+        raise ValueError("Draft scale metadata converter contract mismatch")
+    view = draft["derived_view"]
+    if view["scale_path"] != "calibration/" + DRAFT_SCALE_FILENAME:
+        raise ValueError("Invalid draft scale view path")
+    return draft, path, payload
 
 
 def materialize(args: argparse.Namespace) -> None:
@@ -161,12 +222,16 @@ def materialize(args: argparse.Namespace) -> None:
     if scale_metadata.get("qsa_kv_scale_contract") != manifest["scale_contract"]:
         raise ValueError("Scale converter contract does not match the manifest")
 
+    draft_info = validate_draft(pack_dir, manifest)
+    all_names = expected_names | (DRAFT_NAMES if draft_info else set())
+    selected_view = draft_info[0]["derived_view"] if draft_info else view_details
+
     # 3. The scales must be new entries in the base index.
     base_index = load_json(base_index_path)
     weight_map = base_index.get("weight_map")
     if not isinstance(weight_map, dict):
         raise TypeError("Base checkpoint index lacks a weight_map object")
-    collisions = sorted(expected_names & set(weight_map))
+    collisions = sorted(all_names & set(weight_map))
     if collisions:
         raise ValueError(
             f"Base checkpoint already contains scale tensors: {collisions}"
@@ -209,11 +274,22 @@ def materialize(args: argparse.Namespace) -> None:
         if sha256(copied_scale) != actual_scale_hash:
             raise ValueError("Copied scale file failed its integrity check")
 
+        if draft_info:
+            draft, draft_path, draft_payload = draft_info
+            copied_draft = staging / draft["derived_view"]["scale_path"]
+            shutil.copy2(draft_path, copied_draft)
+            if sha256(copied_draft) != draft["scale_file"]["sha256"]:
+                raise ValueError("Copied draft scale file failed integrity check")
+            payload_bytes += draft_payload
+
         # Keep the base order and append the scale entries in sorted order.
         merged_index = dict(base_index)
         merged_weight_map = dict(weight_map)
         for name in sorted(expected_names):
             merged_weight_map[name] = view_scale_path.as_posix()
+        if draft_info:
+            for name in sorted(DRAFT_NAMES):
+                merged_weight_map[name] = draft_info[0]["derived_view"]["scale_path"]
         merged_index["weight_map"] = merged_weight_map
         metadata = dict(base_index.get("metadata", {}))
         if isinstance(metadata.get("total_size"), int):
@@ -226,17 +302,17 @@ def materialize(args: argparse.Namespace) -> None:
 
         # The derived index is deterministic; it must equal the validated one.
         actual_view_hash = sha256(index_path)
-        if actual_view_hash != view_details["index_sha256"]:
+        if actual_view_hash != selected_view["index_sha256"]:
             raise ValueError(
                 "Derived index SHA-256 is "
-                f"{actual_view_hash}, expected {view_details['index_sha256']}"
+                f"{actual_view_hash}, expected {selected_view['index_sha256']}"
             )
         if list(staging.glob("*.safetensors")):
             raise ValueError("A top-level safetensors file would hide the shards")
         indexed_files = sorted(set(merged_weight_map.values()))
-        if len(indexed_files) != view_details["indexed_file_count"]:
+        if len(indexed_files) != selected_view["indexed_file_count"]:
             raise ValueError(
-                f"Expected {view_details['indexed_file_count']} indexed files, "
+                f"Expected {selected_view['indexed_file_count']} indexed files, "
                 f"found {len(indexed_files)}"
             )
         broken = [name for name in indexed_files if not (staging / name).is_file()]
@@ -257,6 +333,14 @@ def materialize(args: argparse.Namespace) -> None:
             "tensor_count": len(expected_names),
             "loader_contract": manifest["loader_contract"],
         }
+        if draft_info:
+            provenance.update(
+                release_tag=draft_info[0]["release_tag"],
+                tensor_count=len(all_names),
+                draft_scale_file=draft_info[0]["derived_view"]["scale_path"],
+                draft_scale_file_sha256=draft_info[0]["scale_file"]["sha256"],
+                draft_manifest_sha256=sha256(pack_dir / DRAFT_MANIFEST_FILENAME),
+            )
         (staging / PROVENANCE_FILENAME).write_text(
             json.dumps(provenance, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
@@ -272,7 +356,7 @@ def materialize(args: argparse.Namespace) -> None:
     print(f"Derived index SHA-256: {actual_view_hash}")
     print(f"Scale SHA-256: {actual_scale_hash}")
     print(f"Indexed files: {len(indexed_files)} (scale file: {view_scale_path})")
-    print(f"Loaded scale entries: {len(expected_names)}/{len(expected_names)}")
+    print(f"Loaded scale entries: {len(all_names)}/{len(all_names)}")
 
 
 def parse_args() -> argparse.Namespace:

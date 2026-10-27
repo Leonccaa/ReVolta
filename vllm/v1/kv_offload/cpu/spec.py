@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterator
+from collections.abc import Callable, Collection, Iterator, Mapping
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -63,6 +63,38 @@ def mamba_state_slots(
     return min(num_token_blocks, requests_in_pool * states_per_request)
 
 
+def group_slot_counts(
+    spans: Mapping[int, int],
+    recurrent_groups: Collection[int],
+    token_slots: int,
+    reference_span: int,
+    state_slots: Callable[[int, int], int] | None = None,
+) -> dict[int, int]:
+    """Per-group CPU slot counts that keep one token coverage across groups.
+
+    ``token_slots`` counts blocks of ``reference_span`` tokens, i.e. the
+    offloaded block of the widest token group. A group whose own offloaded
+    block covers ``span`` tokens gets ``token_slots * reference_span // span``
+    slots, so every token group holds the same number of tokens. When all
+    spans equal ``reference_span`` the count is exactly ``token_slots``, which
+    is the single-``num_blocks`` sizing the grouped layout used before group
+    spans could differ. Recurrent groups replace their count with
+    ``state_slots(group, own_slots)``, the boundary states the prefix-cache
+    retention mask needs at that same coverage.
+    """
+    if reference_span <= 0:
+        raise ValueError(f"reference_span must be positive, got {reference_span}")
+    counts: dict[int, int] = {}
+    for group, span in spans.items():
+        if span <= 0:
+            raise ValueError(f"group {group} has a non-positive token span {span}")
+        slots = max(1, token_slots * reference_span // span)
+        if state_slots is not None and group in recurrent_groups:
+            slots = state_slots(group, slots)
+        counts[group] = slots
+    return counts
+
+
 class CPUOffloadingSpec(OffloadingSpec):
     def __init__(self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig):
         super().__init__(vllm_config, kv_cache_config)
@@ -85,13 +117,25 @@ class CPUOffloadingSpec(OffloadingSpec):
                 spec = next(iter(spec.kv_cache_specs.values()))
             if isinstance(spec, MambaSpec):
                 mamba_specs[i] = spec
-        # Equal-sized Mamba/attention blocks need matching checkpoint coverage.
-        # Keep the existing layout for single groups and mixed block geometry.
+        # Rollback knob and the phase-3 widening: "auto" partitions whenever a
+        # recurrent group exists (the historical trigger), "off" always keeps
+        # the row-per-key layout, "force" also partitions multi-group models
+        # without a recurrent group.
+        partition_mode = str(self.extra_config.get("cpu_group_partition", "auto"))
+        if partition_mode not in ("auto", "force", "off"):
+            raise ValueError(
+                "cpu_group_partition must be 'auto', 'force' or 'off', got "
+                f"{partition_mode!r}"
+            )
+        # Private per-group pools charge each group its own page instead of one
+        # shared row per key. Group token spans may differ (a DFlash drafter
+        # block is a divisor of the target block), so slot counts are solved per
+        # span. Keep the existing layout for single groups and no-recurrent models.
         self.partition_by_group = (
-            kv_cache_config.num_blocks > 0
+            partition_mode != "off"
+            and kv_cache_config.num_blocks > 0
             and len(cacheable_groups) > 1
-            and bool(mamba_specs)
-            and len({self.gpu_block_size[i] for i in cacheable_groups}) == 1
+            and bool(mamba_specs or partition_mode == "force")
         )
         # Mamba state slots follow the prefix-cache retention policy (see
         # CacheConfig.prefix_cache_retention_interval): sparse retention keeps
@@ -113,10 +157,36 @@ class CPUOffloadingSpec(OffloadingSpec):
 
         self.cpu_group_page_sizes: dict[int, int] = {}
         self.cpu_group_num_blocks: dict[int, int] = {}
+        self.cpu_group_offloaded_tokens: dict[int, int] = {}
         world_size = vllm_config.parallel_config.world_size
         if self.partition_by_group:
-            mamba_groups: set[int] = set()
-            mamba_spec: MambaSpec | None = None
+            mamba_groups: set[int] = set(mamba_specs)
+            # Tokens covered by one offloaded block of each group, the same
+            # quantity the connector calls ``offloaded_block_size``.
+            spans = {
+                i: self.gpu_block_size[i] * self.block_size_factor
+                for i in cacheable_groups
+            }
+            # Every recurrent group is sized from its own MambaSpec, but they
+            # must agree on one geometry: the connector hands states over at a
+            # single mamba align size and the retention mask counts blocks of
+            # that spec, so mixed geometry has to fail loudly instead of
+            # silently sizing every state pool from the last spec seen.
+            geometries = {
+                (
+                    spans[i],
+                    spec.block_size * self.block_size_factor,
+                    spec.mamba_cache_mode,
+                )
+                for i, spec in mamba_specs.items()
+            }
+            if len(geometries) > 1:
+                raise ValueError(
+                    "Grouped CPU offload needs one state slot geometry across "
+                    "all recurrent groups (offloaded token span, mamba "
+                    "block_size x block_size_factor and mamba_cache_mode); got "
+                    f"{sorted(geometries)}."
+                )
             for i, group in cacheable_groups.items():
                 layer_names = set(group.layer_names)
                 # Scheduler specs can replace a heterogeneous UniformType spec
@@ -128,45 +198,57 @@ class CPUOffloadingSpec(OffloadingSpec):
                     if not layer_names.isdisjoint(tensor.shared_by)
                 )
                 self.cpu_group_page_sizes[i] = page_size * self.block_size_factor
-                if i in mamba_specs:
-                    mamba_groups.add(i)
-                    mamba_spec = mamba_specs[i]
             # Physical storage contains only that group's tensors, rather than
             # every shared GPU tensor for each independently allocated group key.
             self.cpu_page_size_per_worker = sum(self.cpu_group_page_sizes.values())
-            token_page = sum(
-                page
-                for i, page in self.cpu_group_page_sizes.items()
-                if i not in mamba_groups
-            )
+            token_groups = [
+                i for i in self.cpu_group_page_sizes if i not in mamba_groups
+            ]
+            token_page = sum(self.cpu_group_page_sizes[i] for i in token_groups)
             state_page = sum(self.cpu_group_page_sizes[i] for i in mamba_groups)
             budget_per_worker = int(cpu_bytes_to_use) // world_size
+            # The pool covers ``num_blocks`` blocks of the widest token group;
+            # every other group gets the slot count for the same token count.
+            reference_span = max((spans[i] for i in token_groups), default=0) or max(
+                spans.values()
+            )
 
-            assert mamba_spec is not None
-            block_size = mamba_spec.block_size * self.block_size_factor
-            alignment_tokens = block_size
-
-            def state_slots(num_token_blocks: int) -> int:
+            def state_slots(group: int, num_token_blocks: int) -> int:
+                spec = mamba_specs[group]
+                block_size = spec.block_size * self.block_size_factor
                 return mamba_state_slots(
                     num_token_blocks,
                     block_size,
-                    alignment_tokens,
-                    mamba_spec,
+                    block_size,
+                    spec,
                     self.retention_interval,
                     self.state_slots_reference_tokens,
                 )
 
+            def slot_counts(num_token_blocks: int) -> dict[int, int]:
+                return group_slot_counts(
+                    spans, mamba_groups, num_token_blocks, reference_span, state_slots
+                )
+
             def bytes_per_worker(num_token_blocks: int) -> int:
-                return (
-                    num_token_blocks * token_page
-                    + state_slots(num_token_blocks) * state_page
+                return sum(
+                    self.cpu_group_page_sizes[group] * slots
+                    for group, slots in slot_counts(num_token_blocks).items()
                 )
 
             # Largest token-block count whose token pages plus the state slots
-            # the retention mask demands fit the per-worker budget.
+            # the retention mask demands fit the per-worker budget. The search
+            # starts from the bytes a reference-span block costs when no group
+            # needs extra slots, which is the legacy estimate for equal spans.
             num_blocks = 0
             if token_page + state_page > 0:
-                num_blocks = budget_per_worker // (token_page + state_page)
+                per_reference_block = sum(
+                    page * (reference_span // spans[group])
+                    for group, page in self.cpu_group_page_sizes.items()
+                )
+                if per_reference_block <= 0:
+                    per_reference_block = max(bytes_per_worker(1), 1)
+                num_blocks = budget_per_worker // per_reference_block
                 while bytes_per_worker(num_blocks + 1) <= budget_per_worker:
                     num_blocks += 1
                 while (
@@ -174,24 +256,57 @@ class CPUOffloadingSpec(OffloadingSpec):
                 ):
                     num_blocks -= 1
             self.num_blocks = num_blocks
-            for i in self.cpu_group_page_sizes:
-                self.cpu_group_num_blocks[i] = (
-                    state_slots(num_blocks) if i in mamba_groups else num_blocks
+            self.cpu_group_offloaded_tokens = dict(spans)
+            self.cpu_group_num_blocks = slot_counts(num_blocks)
+            bytes_per_token = (
+                world_size
+                * sum(
+                    self.cpu_group_page_sizes[group] / spans[group]
+                    for group in token_groups
                 )
+                if token_groups
+                else 0.0
+            )
             logger.info(
-                "Grouped CPU offload pool: %d token slots, %d state slots per "
-                "Mamba group; per-worker token page %d B, state page %d B "
-                "(%d Mamba groups), budget %d B per worker, retention=%s, "
-                "state reference tokens=%d.",
+                "Grouped CPU offload pool: %d slots x %d tokens of the widest "
+                "token group (%d tokens covered); %d recurrent group(s), %d "
+                "state slots each. Token pages %d B, state pages %d B per slot "
+                "set per worker, budget %d B per worker x %d workers, "
+                "retention=%s, state reference tokens=%d, token-proportional "
+                "cost %.0f B/token.",
                 num_blocks,
-                state_slots(num_blocks),
+                reference_span,
+                num_blocks * reference_span,
+                len(mamba_groups),
+                min(
+                    (self.cpu_group_num_blocks[g] for g in mamba_groups),
+                    default=0,
+                ),
                 token_page,
                 state_page,
-                len(mamba_groups),
                 budget_per_worker,
+                world_size,
                 self.retention_interval,
                 self.state_slots_reference_tokens,
+                bytes_per_token,
             )
+            for group in sorted(self.cpu_group_page_sizes):
+                logger.info(
+                    "Grouped CPU offload group %d: page %d B per worker, %d "
+                    "slots x %d tokens per slot = %.2f GiB across %d workers "
+                    "(%s group, %.0f B per covered token).",
+                    group,
+                    self.cpu_group_page_sizes[group],
+                    self.cpu_group_num_blocks[group],
+                    spans[group],
+                    self.cpu_group_page_sizes[group]
+                    * world_size
+                    * self.cpu_group_num_blocks[group]
+                    / 2**30,
+                    world_size,
+                    "recurrent" if group in mamba_groups else "token",
+                    world_size * self.cpu_group_page_sizes[group] / spans[group],
+                )
         else:
             total_gpu_kv_bytes = sum(t.size for t in kv_cache_config.kv_cache_tensors)
             self.cpu_page_size_per_worker = (

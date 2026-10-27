@@ -9,7 +9,10 @@ Use this guide to replace MTP4 with DFlash2 and choose its settings. First prepa
 > Volta (SM70) GPUs, with V100 attention kernels and CUDA graphs for the drafter and the
 > verifier, in the 512K-context setup with prefix caching and CPU KV offload. On one
 > request it writes English code at up to **234 tokens/s instead of 180** with MTP4 (1.30×)
-> on community NVLink hardware. In 0.1.3, the GPU KV pool reaches **1.38 million tokens (2.63× at 512K)** with the recommended DFlash2 settings, and 1.54 million (2.94×) with state replay on. MTP4
+> on community NVLink hardware. With 0.1.4 and the recommended DFlash2 settings (probabilistic
+> drafting, state replay off) the GPU KV pool reaches **1.37 million tokens (2.61× at 512K)**;
+> with greedy drafting it is 1.38 million (2.63×), and the 0.1.3 measurement with state replay
+> on (greedy drafting) reached 1.54 million (2.94×). MTP4
 > stays the default: Chinese text and eight concurrent requests are still faster with MTP4.
 > [How to enable it](#enable-dflash2).
 
@@ -19,7 +22,9 @@ instead (tested revision `a22a1744`): 5 sliding-window layers, an 8-token block 
 2048-token window. It is off by default. Without a `dflash` speculative config, the KV
 cache layout, block size and MoE routes are the same as in 0.1.1.
 
-The configuration below describes 0.1.3. With 0.1.2, also set `VLLM_V2_CUDAGRAPH_MEM_MIB=1500`; its profile does not reserve enough memory for DFlash2's graphs.
+The configuration below is the recommended 0.1.4 configuration. With 0.1.2, also set
+`VLLM_V2_CUDAGRAPH_MEM_MIB=1500`; its profile does not reserve enough memory for DFlash2's
+graphs.
 
 ## Enable DFlash2
 

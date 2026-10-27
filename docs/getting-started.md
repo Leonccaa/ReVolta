@@ -9,7 +9,7 @@ concurrent requests in testing, and a 48 GiB CPU KV pool.
 
 ## 1. Install
 
-The distribution name is `revolta` (version `0.1.3`). The Python import name and the
+The distribution name is `revolta` (version `0.1.4`). The Python import name and the
 CLI are still **`vllm`** (`import vllm`, `vllm serve`); this is intentional. Only
 compute capability 7.0 is built, with CUDA 12.8, Python 3.12 and PyTorch 2.10.
 
@@ -18,8 +18,8 @@ From PyPI (Linux x86-64 with glibc 2.34 or newer, Python 3.12):
 ```bash
 python3.12 -m venv /data/revolta/venv
 . /data/revolta/venv/bin/activate
-pip install revolta==0.1.3
-vllm --version          # 0.1.3
+pip install revolta==0.1.4
+vllm --version          # 0.1.4
 ```
 
 The wheel pins `torch==2.10.0`, `torchaudio==2.10.0` and `torchvision==0.25.0`,
@@ -31,7 +31,7 @@ differs: it pins the same versions to the CUDA 12.8 builds on `download.pytorch.
 and has the generic `linux_x86_64` tag.
 
 ```bash
-pip install "https://github.com/Leonccaa/ReVolta/releases/download/v0.1.3/revolta-0.1.3-cp312-cp312-linux_x86_64.whl"
+pip install "https://github.com/Leonccaa/ReVolta/releases/download/v0.1.4/revolta-0.1.4-cp312-cp312-linux_x86_64.whl"
 ```
 
 ReVolta does not send the anonymous usage statistics that upstream vLLM reports.
@@ -39,7 +39,7 @@ ReVolta does not send the anonymous usage statistics that upstream vLLM reports.
 Or use the Docker image:
 
 ```bash
-docker pull ghcr.io/leonccaa/revolta:0.1.3
+docker pull ghcr.io/leonccaa/revolta:0.1.4
 ```
 
 ## 2. Download the checkpoint and make 512K views
@@ -164,11 +164,13 @@ vllm serve /data/revolta/views/target-512k \
 Notes:
 
 - **Startup** takes roughly 10–15 minutes: weight and PLE loading, `torch.compile`
-  and CUDA graph capture. Later starts reuse the compile cache. Upgrading from 0.1.2
-  to 0.1.3 invalidates that cache, even with MTP or no speculation, because the traced
-  GDN source changed; allow a cold compile after upgrading. On a first start with
-  an empty compile cache, the reported GPU KV capacity can be one allocation unit
-  (7,182 tokens) lower.
+  and CUDA graph capture. Later starts reuse the compile cache. After an upgrade that
+  cache can still be incomplete: keeping the 0.1.3 cache, MTP4 and DFlash2 each compiled
+  four graphs again on the first 0.1.4 start (about 5 s on the reference machine), and
+  later starts loaded them from the cache. The 0.1.2 to 0.1.3 upgrade invalidated the
+  whole cache, even with MTP or no speculation, because the traced GDN source changed;
+  allow a cold compile after upgrading. On a first start with an empty compile cache,
+  the reported GPU KV capacity can be one allocation unit (7,182 tokens) lower.
 
 See [Launch options](configuration.md#launch-options) before changing these settings.
 
@@ -195,9 +197,10 @@ For request defaults and the model vendor's recommendations, see
 [Sampling parameters](configuration.md#sampling-parameters).
 
 The server also provides Anthropic-compatible `/v1/messages` (including streaming)
-and `/v1/messages/count_tokens`. On current main, an overlong prompt returns HTTP 400
-with `invalid_request_error`; an unknown model returns HTTP 404 with `not_found_error`.
-In 0.1.3, the overlong-prompt case returns HTTP 500 with `api_error` (#26).
+and `/v1/messages/count_tokens`. From 0.1.4, an overlong prompt returns HTTP 400 with
+`invalid_request_error` and an unknown model returns HTTP 404 with `not_found_error`;
+internal errors stay HTTP 500 (#32). In 0.1.3 the overlong-prompt case returned HTTP 500
+with `api_error` (#26).
 
 ## Docker
 
@@ -219,7 +222,7 @@ docker run --rm --gpus all \
   -e VLLM_PLE_OFFLOAD_READY_TIMEOUT=1200 \
   -e VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES=1 \
   -e TILELANG_CACHE_DIR=/data/revolta/cache/tilelang \
-  ghcr.io/leonccaa/revolta:0.1.3 \
+  ghcr.io/leonccaa/revolta:0.1.4 \
   /data/revolta/views/target-512k --served-model-name Qwen3.8-Flash-Next ...
 ```
 

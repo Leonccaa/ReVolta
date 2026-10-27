@@ -34,7 +34,7 @@ computed again.
 holds about 2.4M tokens. With DFlash2, the drafter uses a different cache block size, so
 every cache group takes pages of the full block size and a prefix needs about 50 KB per
 token in the CPU pool and on disk (measured in 0.1.4: 1.84 GB for a 32K-token prefix,
-6.36 GB for 131K), about 2.5 times as much as with MTP4. `mamba_state_slots_reference_tokens` sets how many
+6.36 GB for 131K), about 2.4 times MTP4's about 21 KB per token. `mamba_state_slots_reference_tokens` sets how many
 recurrent-state slots each layer group gets. A smaller reference gives more slots,
 which helps when many short sessions share the pool.
 
@@ -83,7 +83,8 @@ use a larger CPU pool and set `max_size_bytes` to your disk budget.
   be larger than the largest prefix you expect to restore from disk (about 21 KB per
   token with MTP4 and about 50 KB with DFlash2; a 100K-token prefix needs more than
   2 GiB with MTP4 and about 5 GB with DFlash2). Otherwise the request is computed
-  again. The quick-start 48 GiB pool holds about 2.4M tokens.
+  again. The quick-start 48 GiB pool holds about 2.4M tokens with MTP4; with DFlash2 the
+  same pool holds about 1M tokens, an estimate from the same about 50 KB per token.
 - The SSD tier is **not supported with INT8 KV** yet. That combination is
   rejected at configuration time.
 
@@ -92,8 +93,10 @@ system (8 GiB CPU pool, 40 GiB disk budget), including a 99K-token prefix restor
 disk (96,288 cached tokens, output identical). In 0.1.4 the tier was also measured on a
 local NVMe SSD with DFlash2 (7 GiB CPU pool, 64 GiB disk budget, one read and one write
 thread). After an engine restart, 11 of 11 documents were read back from disk with the
-same 64-token greedy output as a cold run, at about 2.2–2.4 GB/s per request; a
-32K / 99K / 131K-token prefix came back in 1.47 / 2.93 / 3.77 s instead of
+same 64-token greedy output as a cold run, reading the pages from disk at about
+2.2–2.4 GB/s inside the restore. That rate covers the disk read on its own: it is not the
+stored bytes divided by the time to the first token, and that quotient is the lower of
+the two. A 32K / 99K / 131K-token prefix came back in 1.47 / 2.93 / 3.77 s instead of
 10.12 / 31.88 / 42.43 s when recomputed. A root holding 27.8 GB in 1,088 files did not
 slow the restart. See [Coming back to a document](performance.md#coming-back-to-a-document).
 

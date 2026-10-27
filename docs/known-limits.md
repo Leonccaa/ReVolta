@@ -9,6 +9,8 @@ all GPUs under one PCIe switch with P2P, are the recommended and tested intercon
 The reference system uses four V100 32 GB PCIe cards behind one PCIe switch
 (PIX/PXB in `nvidia-smi topo -m`), with P2P enabled and a 128 GiB container memory limit.
 
+## Support matrix
+
 | Configuration | Test status |
 | --- | --- |
 | 4 × V100 32 GB PCIe, TP4 + DCP2, P2P | Full acceptance passed on the reference configuration |
@@ -18,8 +20,10 @@ The reference system uses four V100 32 GB PCIe cards behind one PCIe switch
 
 **Full acceptance on the reference setup:** default Uncensored AWQ, Standard NVFP4,
 and FP4-Local with their documented settings. Base AWQ has quality measurements.
-80 GiB RAM has memory-stress results. Disk caching has readback results; its full
-release gate passed with an 8 GiB CPU pool and a 40 GiB disk budget.
+80 GiB RAM has memory-stress results for the default pinned PLE table with KV offload
+off; the experimental whole-table disk option below ran under lower limits. Disk caching
+has readback results; its full release gate passed with an 8 GiB CPU pool and a 40 GiB
+disk budget.
 
 V100 16 GB, TP2/TP8, and other models have not been tested.
 This release builds SM70 only; other GPU architectures, ROCm, CPU, XPU, TPU, and
@@ -39,8 +43,10 @@ GGUF are outside the build.
   build retrieved 20/20 needles at 489K. At 512K, the test covers capacity and the
   input/output boundary.
 - **Memory.** The default GPU utilization of 0.95 passed multimodal stress. Retest
-  memory use when changing concurrency or media limits. By default the AWQ PLE
-  table needs about 48 GiB of host memory; see the experimental disk option below.
+  memory use when changing concurrency or media limits. By default the AWQ PLE table
+  needs about 48 GiB of pinned host memory, and 80 GiB is the smallest tested limit that
+  passed memory stress on that path with KV offload off; see the experimental disk option
+  below.
 - **PLE cascade.** Cascade (`ple_disk_cascade=true`) spills the part of the PLE table
   that does not fit in host memory to the checkpoint files. It is not supported yet
   and is off by default in the ReVolta profile; full support is planned for 0.2.
@@ -72,7 +78,7 @@ GGUF are outside the build.
       Single-request decoding was 101.5–104.9 tokens/s against 135.5 with the pinned
       table, about 23–25% slower. A cold first token took 5.4–5.9 / 16.8–17.9 /
       65.6–69.8 s at 8K / 32K / 131K prompt tokens, against 2.61 / 9.66 / 40.40 s, so
-      1.7–2.2 times as long; once the table pages for a prompt had been read, the first
+      1.6–2.3 times as long; once the table pages for a prompt had been read, the first
       token was within 2–3% of the pinned path (5–8% with the 32 GiB CPU KV pool). NVMe
       and SATA, and the 32 and 64 GiB limits, differed little. Peak memory of the
       serving container was about 57 GiB under the 64 GiB limit (62 GiB with the CPU KV
@@ -100,6 +106,11 @@ GGUF are outside the build.
   `required` parse can still report `finish_reason="tool_calls"`. Stop tokens inside
   JSON strings and very large parallel-call deltas remain problematic; strict native
   XML structural tags remain deferred.
+- **Anthropic endpoint.** On `/v1/messages`, a response that `max_tokens` cuts inside a
+  tool call streams the partial `tool_use` input, but a non-streaming response returns no
+  `tool_use` block (0.1.4 known issue). `/v1/messages` and `/v1/messages/count_tokens`
+  return HTTP 400 for a prompt longer than `--max-model-len` and HTTP 404 for a missing
+  model from 0.1.4 (#32); internal errors stay HTTP 500.
 - **Image placeholder text.** Text that contains the literal image placeholder
   `<|image_pad|>` can take the place of a real image in the same request. Upstream vLLM
   and HF behave the same (vllm-project/vllm#57740), and ReVolta follows them. Remove such tokens from

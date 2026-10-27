@@ -6,7 +6,7 @@ ReVolta turns a server with V100 32 GB GPUs and plenty of system memory into a d
 
 It is built for four or more V100 32 GB GPUs and validated on four. We recommend, and test, the two interconnects that give the best speed: NVLink, or all GPUs under one PCIe switch with P2P. Every release passes the same gate on our own server before it ships: single-request greedy output identical to the previous release token for token, 4 and 8 concurrent requests, images and video, CPU cache readback, and 512K-token prompts. That server runs ReVolta every day.
 
-**You need:** 4 × V100 32 GB (NVLink or PCIe; NVLink or one PCIe switch with P2P recommended), at least 64 GB of system memory (128 GB recommended), Linux x86-64 with glibc 2.34 or newer, and an NVIDIA driver for CUDA 12.8. Tested hardware and limits: [Support and known limits](docs/known-limits.md).
+**You need:** four or more V100 32 GB GPUs (validated on four), on NVLink or with all GPUs under one PCIe switch with P2P; at least 32 GiB of system memory with the experimental whole-table PLE disk option (about 23–25% slower single-request decoding), 80 GiB with the default pinned PLE table, 128 GiB recommended; Linux x86-64 with glibc 2.34 or newer; and an NVIDIA driver for CUDA 12.8. Tested hardware and limits: [Support and known limits](docs/known-limits.md).
 
 Current release: [0.1.4](https://github.com/Leonccaa/ReVolta/releases/tag/v0.1.4).
 
@@ -23,7 +23,7 @@ Current release: [0.1.4](https://github.com/Leonccaa/ReVolta/releases/tag/v0.1.4
 
 Prefixes evicted from the GPU stay in CPU memory or on disk: a cached 32K-token document comes back from CPU memory in **0.6 s**, and after an engine restart from a local NVMe disk tier in **1.5 s**, instead of **10.1 s** when recomputed (0.1.4, DFlash2). See [KV offload](docs/kv-offload.md).
 
-**Speed** (total output tokens/s, 512-token responses; best of MTP4 and DFlash2)
+**Speed** (total output tokens/s, 512-token responses; best of MTP4 and DFlash2; the PCIe row was measured on 0.1.2 and the NVLink row combines 0.1.2 and 0.1.1)
 
 | System | 1 request | 2 | 4 | 8 | Prefill, 8K / 131K prompt |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -37,7 +37,7 @@ Versions, power caps and the per-method breakdown are in [Performance](docs/perf
 | Model | Weights (bits per weight: routed experts / whole model) | Download | PLE table in host memory | GPU KV pool (MTP4) | Quality vs its BF16 parent: KL ↓ / top-1 ↑ | Notes |
 | --- | --- | ---: | ---: | ---: | ---: | --- |
 | [Uncensored AWQ g32](https://huggingface.co/leoncca/Qwen3.8-Flash-Next-Uncensored-AWQ-g32) **(recommended)** | 4-bit AWQ g32 experts, FP8 PLE, BF16 rest (**4.63 / 5.95**) | 142 GB, MTP draft included | 48 GiB | 1.15 M (1.37 M with DFlash2) | 0.0214 / 97.1% | Uncensored fine-tune; the reference setup |
-| [Base AWQ g32](https://huggingface.co/leoncca/Qwen3.8-Flash-Next-AWQ-g32) | 4-bit AWQ g32 experts, FP8 PLE, BF16 rest (**4.63 / 5.95**) | 142 GB | 48 GiB | Same layout as Uncensored | 0.0207 / 97.1% | The original model |
+| [Base AWQ g32](https://huggingface.co/leoncca/Qwen3.8-Flash-Next-AWQ-g32) | 4-bit AWQ g32 experts, FP8 PLE, BF16 rest (**4.63 / 5.95**) | 142 GB, MTP draft included | 48 GiB | Same layout as Uncensored | 0.0207 / 97.1% | The original model |
 | [Standard NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4) | NVFP4 experts, FP8 PLE, BF16 rest (**4.50 / 5.86**) | 135 GB + 5 GB draft pack | 48 GiB | 1.25 M | 0.0303 / 96.4% | Widely used community format |
 | [NVIDIA FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local) | NVFP4 experts and PLE, MXFP8 attention and shared experts (**4.26 / 4.53**) | 102 GB, MTP layer built in | **27 GiB** | **1.47 M** | 0.0380 / 95.9% | NVIDIA's official checkpoint; least host memory |
 
@@ -86,7 +86,7 @@ For another checkpoint, use its [preparation guide](docs/checkpoints.md) before 
 - V100 16 GB, TP2/TP8, and other models have not been tested.
 - This release builds SM70 only; other GPU architectures, ROCm, CPU, XPU, TPU, and GGUF are outside the build.
 - Greedy outputs at C2–C8 can change between runs; fresh compiler autotuning can also change outputs.
-- The AWQ PLE table needs about 48 GiB of host memory by default. An experimental option keeps the whole table on a local SSD instead: in 0.1.4 it served under 64 GiB and 32 GiB memory limits, also with a 32 GiB CPU KV pool under 64 GiB, and greedy output matched the default path. Single-request decoding is about 23–25% slower, and a cold first token takes 1.7–2.2 times as long. See [Support and known limits](docs/known-limits.md).
+- The AWQ PLE table needs about 48 GiB of host memory by default. An experimental option keeps the whole table on a local SSD instead: in 0.1.4 it served under 64 GiB and 32 GiB memory limits, also with a 32 GiB CPU KV pool under 64 GiB, and greedy output matched the default path. Single-request decoding is about 23–25% slower, and a cold first token takes 1.6–2.3 times as long. See [Support and known limits](docs/known-limits.md).
 - PLE cascade (spilling part of the table to disk, `ple_disk_cascade=true`) is not supported yet and is off by default in the ReVolta profile; full support is planned for 0.2.
 - INT8 KV cannot be combined with DFlash2; the disk tier does not support INT8 yet.
 
@@ -188,7 +188,7 @@ See [Support and known limits](docs/known-limits.md).
 
 ### Support matrix
 
-See [Support matrix](docs/known-limits.md).
+See [Support matrix](docs/known-limits.md#support-matrix).
 
 ### Reporting issues
 

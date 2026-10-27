@@ -15,7 +15,7 @@ body:
         - **Unverified, best effort:** TP2/TP8, V100 16 GB, other GPU counts,
           other models and other topologies.
         - **Out of scope:** GPUs other than SM70, ROCm/CPU/XPU/TPU, GGUF.
-          INT8 KV with the SSD tier is not supported in 0.1.0.
+          INT8 KV with the SSD tier is not supported in 0.1.4 either.
 
         Remove credentials, tokens and private paths from logs.
         Report security vulnerabilities through GitHub private vulnerability

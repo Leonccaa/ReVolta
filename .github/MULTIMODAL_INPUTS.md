@@ -34,10 +34,15 @@ defaults above:
 - With `--limit-mm-per-prompt` that leaves out `"video"`, video is set to 0 (disabled).
   Other modalities the value leaves out keep the defaults above.
 
-This V100 behaviour is the same as in 0.1.0 and 0.1.1, and 0.1.2 keeps it. Set
-`--limit-mm-per-prompt` explicitly and include `"video"`. To copy:
+This V100 behaviour is the same as in 0.1.0 and 0.1.1, and 0.1.2 through 0.1.4 keep it.
+Set `--limit-mm-per-prompt` explicitly and include `"video"`. To copy:
 
-- the generic 0.1.2 default: `--limit-mm-per-prompt '{"image": 8, "video": 1, "audio": 1}'`;
+- the generic default counts (8 images, 1 video, 1 audio item):
+  `--limit-mm-per-prompt '{"image": 8, "video": 1, "audio": 1}'`. Qwen3.8 Flash-Next has
+  no audio input, so the shorter `--limit-mm-per-prompt '{"image": 8, "video": 1}'` — the
+  form used in [Configuration](../docs/configuration.md#launch-options) and
+  [Support and known limits](../docs/known-limits.md) — gives the same image and video
+  counts;
 - the reference deployment, as in the README launch command:
   `--limit-mm-per-prompt '{"image": 16, "video": 1}'` (Qwen3.8 Flash-Next has no audio input).
 

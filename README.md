@@ -4,7 +4,7 @@
 
 ReVolta turns a server with V100 32 GB GPUs and plenty of system memory into a dependable daily AI service. It runs Qwen3.8 Flash-Next for text, images and video behind an OpenAI-compatible API. ReVolta is built on [1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM), a V100-focused fork of vLLM, so the `vllm` command, its options and its OpenAI-compatible API work as usual.
 
-It is built for servers with 4 × V100 32 GB. We recommend, and test, the two interconnects that give the best speed: NVLink, or all four GPUs under one PCIe switch with P2P. Every release passes the same gate on our own server before it ships: single-request greedy output identical to the previous release token for token, 4 and 8 concurrent requests, images and video, CPU cache readback, and 512K-token prompts. That server runs ReVolta every day.
+It is built for four or more V100 32 GB GPUs and validated on four. We recommend, and test, the two interconnects that give the best speed: NVLink, or all GPUs under one PCIe switch with P2P. Every release passes the same gate on our own server before it ships: single-request greedy output identical to the previous release token for token, 4 and 8 concurrent requests, images and video, CPU cache readback, and 512K-token prompts. That server runs ReVolta every day.
 
 **You need:** 4 × V100 32 GB (NVLink or PCIe; NVLink or one PCIe switch with P2P recommended), at least 64 GB of system memory (128 GB recommended), Linux x86-64 with glibc 2.34 or newer, and an NVIDIA driver for CUDA 12.8. Tested hardware and limits: [Support and known limits](docs/known-limits.md).
 

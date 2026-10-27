@@ -3,8 +3,8 @@
 This reference lists the tested support scope and known limitations. Check it before
 using the [launch tutorial](getting-started.md) or changing hardware, formats or request limits.
 
-ReVolta is designed for 4 × V100 32 GB. NVLink, or all four GPUs under one PCIe switch
-with P2P, are the recommended and tested interconnects.
+ReVolta is designed for four or more V100 32 GB GPUs and validated on four. NVLink, or
+all GPUs under one PCIe switch with P2P, are the recommended and tested interconnects.
 
 The reference system uses four V100 32 GB PCIe cards behind one PCIe switch
 (PIX/PXB in `nvidia-smi topo -m`), with P2P enabled and a 128 GiB container memory limit.

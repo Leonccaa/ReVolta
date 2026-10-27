@@ -370,11 +370,26 @@ def _dflash_reason(cfg: VllmConfig) -> str | None:
         cfg.model_config, cfg.speculative_config, cfg.parallel_config
     ):
         return None
+    # The fused verifier lane is qualified for one target shape with DFlash drafting.
+    # Another drafting method or another target model does not use the lane at all,
+    # which is "not_applicable" (#38: Flash-Next printed a contract_mismatch that read
+    # like a fault). A matching model whose configuration differs keeps
+    # "contract_mismatch": changing the configuration would enable the lane.
     spec = cfg.speculative_config
     if spec is None:
-        return "contract_mismatch:method=None≠dflash"
+        return "not_applicable:method=None≠dflash"
     if spec.method != "dflash":
-        return f"contract_mismatch:method={spec.method}≠dflash"
+        return f"not_applicable:method={spec.method}≠dflash"
+    text = getattr(cfg.model_config, "hf_text_config", None)
+    target = (
+        ("hidden_size", getattr(text, "hidden_size", None), 5120),
+        ("num_attention_heads", getattr(text, "num_attention_heads", None), 24),
+        ("num_key_value_heads", getattr(text, "num_key_value_heads", None), 4),
+        ("head_dim", getattr(text, "head_dim", None), 256),
+    )
+    for name, actual, expected in target:
+        if str(actual) != str(expected):
+            return f"not_applicable:{name}={actual}≠{expected}"
     if spec.num_speculative_tokens != 7:
         return (
             f"contract_mismatch:num_speculative_tokens={spec.num_speculative_tokens}≠7"
@@ -385,13 +400,8 @@ def _dflash_reason(cfg: VllmConfig) -> str | None:
     selector = None
     if isinstance(draft_config, Mapping):
         selector = draft_config.get("selector_top_k")
-    text = getattr(cfg.model_config, "hf_text_config", None)
     requirements = (
         ("dtype", cfg.model_config.dtype, "torch.float16"),
-        ("hidden_size", getattr(text, "hidden_size", None), 5120),
-        ("num_attention_heads", getattr(text, "num_attention_heads", None), 24),
-        ("num_key_value_heads", getattr(text, "num_key_value_heads", None), 4),
-        ("head_dim", getattr(text, "head_dim", None), 256),
         ("selector_top_k", selector, 16),
         ("pipeline_parallel_size", cfg.parallel_config.pipeline_parallel_size, 1),
     )

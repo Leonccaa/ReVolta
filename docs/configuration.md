@@ -118,13 +118,15 @@ embedding table uses about 47.7 GiB of pinned host memory even with KV offload d
 | 128 GiB | Off, or 48 GiB CPU pool | Full acceptance passed |
 | 80 GiB | Off | Memory stress passed; full acceptance not run |
 | 64 GiB | Off | Out of memory during startup |
+| 64 GiB, whole PLE table on disk (experimental) | Off, or 32 GiB CPU pool | Served; greedy output matched the pinned path (0.1.4) |
+| 32 GiB, whole PLE table on disk (experimental) | Off | Served; greedy output matched the pinned path (0.1.4) |
 
-80 GiB is the smallest tested limit that passed memory stress for the default pinned PLE
-table, with KV offload off and without full acceptance. With less than 128 GiB,
+With the default pinned PLE table, 80 GiB is the smallest tested limit that passed memory
+stress, with KV offload off and without full acceptance. With less than 128 GiB,
 reduce or disable the CPU KV pool. The experimental whole-table PLE disk option
-([Support and known limits](known-limits.md)) is a different path: on 0.1.4 it started and
-served under a 64 GiB and a 32 GiB container memory limit, and under 64 GiB with a 32 GiB
-CPU KV pool.
+([Support and known limits](known-limits.md)) keeps the table on a local SSD instead and
+brings the tested minimum down to 32 GiB; single-request decoding is about 23–25% slower
+and a cold first token takes 1.6–2.3 times as long.
 
 Image and video preprocessing also uses host memory, in the API server process. In one
 test, 8 concurrent requests with 8 different 2048-pixel images each used about 33 GB at

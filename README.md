@@ -6,7 +6,7 @@ ReVolta turns a server with V100 32 GB GPUs and plenty of system memory into a d
 
 It is built for four or more V100 32 GB GPUs and validated on four. We recommend, and test, the two interconnects that give the best speed: NVLink, or all GPUs under one PCIe switch with P2P. Every release passes the same gate on our own server before it ships: single-request greedy output identical to the previous release token for token, 4 and 8 concurrent requests, images and video, CPU cache readback, and 512K-token prompts. That server runs ReVolta every day.
 
-**You need:** four or more V100 32 GB GPUs (validated on four), on NVLink or with all GPUs under one PCIe switch with P2P; at least 80 GiB of system memory for the default pinned PLE table (128 GiB recommended; the experimental whole-table PLE disk option ran under 64 GiB and 32 GiB limits); Linux x86-64 with glibc 2.34 or newer; and an NVIDIA driver for CUDA 12.8. Tested hardware and limits: [Support and known limits](docs/known-limits.md).
+**You need:** four or more V100 32 GB GPUs (validated on four), on NVLink or with all GPUs under one PCIe switch with P2P; at least 32 GiB of system memory with the experimental whole-table PLE disk option (about 23–25% slower single-request decoding), 80 GiB with the default pinned PLE table, 128 GiB recommended; Linux x86-64 with glibc 2.34 or newer; and an NVIDIA driver for CUDA 12.8. Tested hardware and limits: [Support and known limits](docs/known-limits.md).
 
 Current release: [0.1.4](https://github.com/Leonccaa/ReVolta/releases/tag/v0.1.4).
 

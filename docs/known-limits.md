@@ -20,8 +20,8 @@ The reference system uses four V100 32 GB PCIe cards behind one PCIe switch
 
 **Full acceptance on the reference setup:** default Uncensored AWQ, Standard NVFP4,
 and FP4-Local with their documented settings. Base AWQ has quality measurements.
-80 GiB RAM has memory-stress results for the default pinned PLE table with KV offload
-off; the experimental whole-table disk option below ran under lower limits. Disk caching
+32 GiB RAM served with the experimental whole-table PLE disk option below; 80 GiB RAM
+has memory-stress results for the default pinned PLE table with KV offload off. Disk caching
 has readback results; its full release gate passed with an 8 GiB CPU pool and a 40 GiB
 disk budget.
 
@@ -45,8 +45,8 @@ GGUF are outside the build.
 - **Memory.** The default GPU utilization of 0.95 passed multimodal stress. Retest
   memory use when changing concurrency or media limits. By default the AWQ PLE table
   needs about 48 GiB of pinned host memory, and 80 GiB is the smallest tested limit that
-  passed memory stress on that path with KV offload off; see the experimental disk option
-  below.
+  passed memory stress on that path with KV offload off. The experimental disk option
+  below served under a 32 GiB limit.
 - **PLE cascade.** Cascade (`ple_disk_cascade=true`) spills the part of the PLE table
   that does not fit in host memory to the checkpoint files. It is not supported yet
   and is off by default in the ReVolta profile; full support is planned for 0.2.

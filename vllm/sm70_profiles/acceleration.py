@@ -381,7 +381,7 @@ def _dflash_reason(cfg: VllmConfig) -> str | None:
     if spec.method != "dflash":
         return f"not_applicable:method={spec.method}≠dflash"
     text = getattr(cfg.model_config, "hf_text_config", None)
-    target = (
+    target: tuple[tuple[str, Any, Any], ...] = (
         ("hidden_size", getattr(text, "hidden_size", None), 5120),
         ("num_attention_heads", getattr(text, "num_attention_heads", None), 24),
         ("num_key_value_heads", getattr(text, "num_key_value_heads", None), 4),
@@ -400,7 +400,7 @@ def _dflash_reason(cfg: VllmConfig) -> str | None:
     selector = None
     if isinstance(draft_config, Mapping):
         selector = draft_config.get("selector_top_k")
-    requirements = (
+    requirements: tuple[tuple[str, Any, Any], ...] = (
         ("dtype", cfg.model_config.dtype, "torch.float16"),
         ("selector_top_k", selector, 16),
         ("pipeline_parallel_size", cfg.parallel_config.pipeline_parallel_size, 1),

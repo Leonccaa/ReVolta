@@ -30,8 +30,11 @@ computed again.
 }
 ```
 
-`cpu_bytes_to_use` sets the pool size (total for all workers). With 48 GiB, the pool
-holds about 2.4M tokens. `mamba_state_slots_reference_tokens` sets how many
+`cpu_bytes_to_use` sets the pool size (total for all workers). With MTP4, a 48 GiB pool
+holds about 2.4M tokens. With DFlash2, the drafter uses a different cache block size, so
+every cache group takes pages of the full block size and a prefix needs about 50 KB per
+token in the CPU pool and on disk (measured in 0.1.4: 1.84 GB for a 32K-token prefix,
+6.36 GB for 131K), about 2.5 times as much as with MTP4. `mamba_state_slots_reference_tokens` sets how many
 recurrent-state slots each layer group gets. A smaller reference gives more slots,
 which helps when many short sessions share the pool.
 
@@ -78,15 +81,21 @@ use a larger CPU pool and set `max_size_bytes` to your disk budget.
 - The SSD tier is a disposable cache, not model storage.
 - A prefix restored from disk is staged in the CPU pool first, so `cpu_bytes_to_use` must
   be larger than the largest prefix you expect to restore from disk (about 21 KB per
-  token; a 100K-token prefix needs more than 2 GiB). Otherwise the request is computed
+  token with MTP4 and about 50 KB with DFlash2; a 100K-token prefix needs more than
+  2 GiB with MTP4 and about 5 GB with DFlash2). Otherwise the request is computed
   again. The quick-start 48 GiB pool holds about 2.4M tokens.
 - The SSD tier is **not supported with INT8 KV** yet. That combination is
   rejected at configuration time.
 
-Validation scope: the SSD tier was tested with its root on a network file system. The
-full release gate passed with an 8 GiB CPU pool and a 40 GiB disk budget, including a
-99K-token prefix restored from disk (96,288 cached tokens, output identical). SSD
-throughput was not measured.
+Validation scope: the full release gate passed with the SSD tier on a network file
+system (8 GiB CPU pool, 40 GiB disk budget), including a 99K-token prefix restored from
+disk (96,288 cached tokens, output identical). In 0.1.4 the tier was also measured on a
+local NVMe SSD with DFlash2 (7 GiB CPU pool, 64 GiB disk budget, one read and one write
+thread). After an engine restart, 11 of 11 documents were read back from disk with the
+same 64-token greedy output as a cold run, at about 2.2–2.4 GB/s per request; a
+32K / 99K / 131K-token prefix came back in 1.47 / 2.93 / 3.77 s instead of
+10.12 / 31.88 / 42.43 s when recomputed. A root holding 27.8 GB in 1,088 files did not
+slow the restart. See [Coming back to a document](performance.md#coming-back-to-a-document).
 
 ## See also
 

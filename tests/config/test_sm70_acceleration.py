@@ -144,6 +144,34 @@ def test_five_speculative_tokens_reason(config):
     )
 
 
+def test_other_target_model_is_not_applicable(config):
+    # #38: Flash-Next (hidden size 2560) with DFlash2 does not use the fused lane.
+    config.model_config.hf_text_config.hidden_size = 2560
+    assert acc.build_report(config)["paths"]["dflash2_verifier"]["reason"] == (
+        "not_applicable:hidden_size=2560≠5120"
+    )
+
+
+def test_other_drafting_method_is_not_applicable(config):
+    config.speculative_config.method = "mtp"
+    assert acc.build_report(config)["paths"]["dflash2_verifier"]["reason"] == (
+        "not_applicable:method=mtp≠dflash"
+    )
+    config.speculative_config = None
+    assert acc.build_report(config)["paths"]["dflash2_verifier"]["reason"] == (
+        "not_applicable:method=None≠dflash"
+    )
+
+
+def test_other_target_model_wins_over_configuration(config):
+    # A different model is reported as such even when its draft settings differ too.
+    config.model_config.hf_text_config.hidden_size = 2560
+    config.speculative_config.num_speculative_tokens = 5
+    assert acc.build_report(config)["paths"]["dflash2_verifier"]["reason"] == (
+        "not_applicable:hidden_size=2560≠5120"
+    )
+
+
 def test_budget_reason(config):
     config.scheduler_config.max_num_batched_tokens = 4096
     assert acc.build_report(config)["paths"]["q8000_prefill"]["reason"] == "budget<8000"

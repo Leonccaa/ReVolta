@@ -290,22 +290,22 @@ class CPUOffloadingSpec(OffloadingSpec):
                 self.state_slots_reference_tokens,
                 bytes_per_token,
             )
-            for group in sorted(self.cpu_group_page_sizes):
+            for gid in sorted(self.cpu_group_page_sizes):
                 logger.info(
                     "Grouped CPU offload group %d: page %d B per worker, %d "
                     "slots x %d tokens per slot = %.2f GiB across %d workers "
                     "(%s group, %.0f B per covered token).",
-                    group,
-                    self.cpu_group_page_sizes[group],
-                    self.cpu_group_num_blocks[group],
-                    spans[group],
-                    self.cpu_group_page_sizes[group]
+                    gid,
+                    self.cpu_group_page_sizes[gid],
+                    self.cpu_group_num_blocks[gid],
+                    spans[gid],
+                    self.cpu_group_page_sizes[gid]
                     * world_size
-                    * self.cpu_group_num_blocks[group]
+                    * self.cpu_group_num_blocks[gid]
                     / 2**30,
                     world_size,
-                    "recurrent" if group in mamba_groups else "token",
-                    world_size * self.cpu_group_page_sizes[group] / spans[group],
+                    "recurrent" if gid in mamba_groups else "token",
+                    world_size * self.cpu_group_page_sizes[gid] / spans[gid],
                 )
         else:
             total_gpu_kv_bytes = sum(t.size for t in kv_cache_config.kv_cache_tensors)

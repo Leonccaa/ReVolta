@@ -5,14 +5,14 @@ body:
   - type: markdown
     attributes:
       value: |
-        **Support scope for 0.1.0** (see the support matrix in the README):
+        **Support scope** (see the support matrix in the README):
 
-        - **Validated:** 4 × V100 32 GB PCIe, TP4 + DCP2, Qwen3.8 Flash-Next
+        - **Validated:** 4 × V100 32 GB, TP4 + DCP2, Qwen3.8 Flash-Next
           (multimodal) with the AWQ g32, standard NVFP4 or NVIDIA FP4-Local
           checkpoints; E4M3 or INT8 KV cache; KV offload off, CPU, or CPU + SSD;
-          PCIe switch with P2P. PCIe without P2P was validated by disabling P2P on
-          P2P-capable hardware.
-        - **Unverified, best effort:** NVLink, TP2/TP8, V100 16 GB, other GPU counts,
+          NVLink, or a PCIe switch with P2P (the recommended interconnects). PCIe
+          without P2P was validated by disabling P2P on P2P-capable hardware.
+        - **Unverified, best effort:** TP2/TP8, V100 16 GB, other GPU counts,
           other models and other topologies.
         - **Out of scope:** GPUs other than SM70, ROCm/CPU/XPU/TPU, GGUF.
           INT8 KV with the SSD tier is not supported in 0.1.0.
@@ -52,7 +52,7 @@ body:
       options:
         - PCIe switch with P2P
         - PCIe without P2P
-        - NVLink (unverified)
+        - NVLink
         - Other (describe in the reproduction)
     validations:
       required: true

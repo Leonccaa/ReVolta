@@ -4,24 +4,24 @@
 
 ReVolta turns a server with V100 32 GB GPUs and plenty of system memory into a dependable daily AI service. It runs Qwen3.8 Flash-Next for text, images and video behind an OpenAI-compatible API. ReVolta is built on [1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM), a V100-focused fork of vLLM, so the `vllm` command, its options and its OpenAI-compatible API work as usual.
 
-It is built for four or more V100 32 GB GPUs and validated on four. Every release passes the same gate on our own server before it ships: single-request greedy output identical to the previous release token for token, 4 and 8 concurrent requests, images and video, CPU cache readback, and 512K-token prompts. That server runs ReVolta every day.
+It is built for four or more V100 32 GB GPUs and validated on four. We recommend, and test, the two interconnects that give the best speed: NVLink, or all GPUs under one PCIe switch with P2P. Every release passes the same gate on our own server before it ships: single-request greedy output identical to the previous release token for token, 4 and 8 concurrent requests, images and video, CPU cache readback, and 512K-token prompts. That server runs ReVolta every day.
 
-**You need:** 4 × V100 32 GB (PCIe with P2P, or NVLink), at least 64 GB of system memory (128 GB recommended), Linux x86-64 with glibc 2.34 or newer, and an NVIDIA driver for CUDA 12.8. Tested hardware and limits: [Support and known limits](docs/known-limits.md).
+**You need:** 4 × V100 32 GB (NVLink or PCIe; NVLink or one PCIe switch with P2P recommended), at least 64 GB of system memory (128 GB recommended), Linux x86-64 with glibc 2.34 or newer, and an NVIDIA driver for CUDA 12.8. Tested hardware and limits: [Support and known limits](docs/known-limits.md).
 
-Current release: [0.1.3](https://github.com/Leonccaa/ReVolta/releases/tag/v0.1.3).
+Current release: [0.1.4](https://github.com/Leonccaa/ReVolta/releases/tag/v0.1.4).
 
 ## At a glance
 
-**Context and capacity** (Uncensored AWQ, E4M3 KV cache, 0.1.3)
+**Context and capacity** (Uncensored AWQ, E4M3 KV cache, 0.1.4)
 
 | | MTP4 (default) | DFlash2 (recommended settings) |
 | --- | ---: | ---: |
 | Context per request | 512K tokens | 512K tokens |
-| GPU KV pool | 1.15 million tokens | **1.38 million tokens** |
-| GPU KV pool / 512K tokens (capacity ratio) | 2.20× | **2.63×** |
+| GPU KV pool | 1.15 million tokens | **1.37 million tokens** |
+| GPU KV pool / 512K tokens (capacity ratio) | 2.20× | **2.61×** |
 | Concurrent requests | 8 | 8 |
 
-Prefixes evicted from the GPU stay in CPU memory or on disk: a cached 32K-token document is answered in **1.28 s instead of 10.06 s**. See [KV offload](docs/kv-offload.md).
+Prefixes evicted from the GPU stay in CPU memory or on disk: a cached 32K-token document comes back from CPU memory in **0.6 s**, and after an engine restart from a local NVMe disk tier in **1.5 s**, instead of **10.1 s** when recomputed (0.1.4, DFlash2). See [KV offload](docs/kv-offload.md).
 
 **Speed** (total output tokens/s, 512-token responses; best of MTP4 and DFlash2)
 
@@ -36,7 +36,7 @@ Versions, power caps and the per-method breakdown are in [Performance](docs/perf
 
 | Model | Weights (bits per weight: routed experts / whole model) | Download | PLE table in host memory | GPU KV pool (MTP4) | Quality vs its BF16 parent: KL ↓ / top-1 ↑ | Notes |
 | --- | --- | ---: | ---: | ---: | ---: | --- |
-| [Uncensored AWQ g32](https://huggingface.co/leoncca/Qwen3.8-Flash-Next-Uncensored-AWQ-g32) **(recommended)** | 4-bit AWQ g32 experts, FP8 PLE, BF16 rest (**4.63 / 5.95**) | 142 GB, MTP draft included | 48 GiB | 1.15 M (1.38 M with DFlash2) | 0.0214 / 97.1% | Uncensored fine-tune; the reference setup |
+| [Uncensored AWQ g32](https://huggingface.co/leoncca/Qwen3.8-Flash-Next-Uncensored-AWQ-g32) **(recommended)** | 4-bit AWQ g32 experts, FP8 PLE, BF16 rest (**4.63 / 5.95**) | 142 GB, MTP draft included | 48 GiB | 1.15 M (1.37 M with DFlash2) | 0.0214 / 97.1% | Uncensored fine-tune; the reference setup |
 | [Base AWQ g32](https://huggingface.co/leoncca/Qwen3.8-Flash-Next-AWQ-g32) | 4-bit AWQ g32 experts, FP8 PLE, BF16 rest (**4.63 / 5.95**) | 142 GB | 48 GiB | Same layout as Uncensored | 0.0207 / 97.1% | The original model |
 | [Standard NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4) | NVFP4 experts, FP8 PLE, BF16 rest (**4.50 / 5.86**) | 135 GB + 5 GB draft pack | 48 GiB | 1.25 M | 0.0303 / 96.4% | Widely used community format |
 | [NVIDIA FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local) | NVFP4 experts and PLE, MXFP8 attention and shared experts (**4.26 / 4.53**) | 102 GB, MTP layer built in | **27 GiB** | **1.47 M** | 0.0380 / 95.9% | NVIDIA's official checkpoint; least host memory |
@@ -53,14 +53,14 @@ The package is `revolta`; the Python import and CLI remain `vllm`.
 ```bash
 python3.12 -m venv /data/revolta/venv
 . /data/revolta/venv/bin/activate
-pip install revolta==0.1.3
-vllm --version          # 0.1.3
+pip install revolta==0.1.4
+vllm --version          # 0.1.4
 ```
 
 Or pull the Docker image:
 
 ```bash
-docker pull ghcr.io/leonccaa/revolta:0.1.3
+docker pull ghcr.io/leonccaa/revolta:0.1.4
 ```
 
 Follow [Getting started](docs/getting-started.md) to download the pinned checkpoint,
@@ -83,10 +83,10 @@ For another checkpoint, use its [preparation guide](docs/checkpoints.md) before 
 
 ## Known limits
 
-- V100 16 GB, TP2/TP8, and other models have not been tested; NVLink has community results and is outside the release gate.
+- V100 16 GB, TP2/TP8, and other models have not been tested.
 - This release builds SM70 only; other GPU architectures, ROCm, CPU, XPU, TPU, and GGUF are outside the build.
 - Greedy outputs at C2–C8 can change between runs; fresh compiler autotuning can also change outputs.
-- The AWQ PLE table needs about 48 GiB of host memory by default. An existing experimental option keeps the whole table on disk instead; functional checks in 0.1.3 ran under 64 GiB and 32 GiB container limits without CPU KV offload, but speed was not measured. See [Support and known limits](docs/known-limits.md).
+- The AWQ PLE table needs about 48 GiB of host memory by default. An experimental option keeps the whole table on a local SSD instead: in 0.1.4 it served under 64 GiB and 32 GiB memory limits, also with a 32 GiB CPU KV pool under 64 GiB, and greedy output matched the default path. Single-request decoding is about 23–25% slower, and a cold first token takes 1.7–2.2 times as long. See [Support and known limits](docs/known-limits.md).
 - PLE cascade (spilling part of the table to disk, `ple_disk_cascade=true`) is not supported yet and is off by default in the ReVolta profile; full support is planned for 0.2.
 - INT8 KV cannot be combined with DFlash2; the disk tier does not support INT8 yet.
 
@@ -98,8 +98,10 @@ ReVolta focuses on dependable daily service on V100. Releases check output corre
 long-context retrieval, concurrent use, multimodal input, cache recovery, and speed
 on the reference machine.
 
-Next: faster INT8 KV decoding, simpler NVFP4 setup, INT8 disk caching, and community
-testing on NVLink systems. Longer-term work includes reducing host-memory use and
+Next (0.1.5): faster all-reduce on NVLink above 16 tokens per step, a cheaper DFlash2
+state replay, smaller DFlash2 CPU and disk cache pages, and a 512K long-context
+retrieval self-test. Also planned: faster INT8 KV decoding, simpler NVFP4 setup and
+INT8 disk caching. Longer-term work includes reducing host-memory use and
 runtime dependencies.
 
 ## Getting help
@@ -113,7 +115,10 @@ Reports from NVLink V100 owners are especially welcome; share measured results w
 [Test results](https://github.com/Leonccaa/ReVolta/issues/new?template=test_results.md) template
 ([`.github/ISSUE_TEMPLATE/test_results.md`](.github/ISSUE_TEMPLATE/test_results.md); agents can fill it in and
 open the issue through the API). Thanks to
-[@jttdev](https://github.com/jttdev) for sharing their results ([#2](https://github.com/Leonccaa/ReVolta/issues/2)). Report security issues
+[@jttdev](https://github.com/jttdev), [@That80-20](https://github.com/That80-20) and
+[@vincentyan2023](https://github.com/vincentyan2023) for sharing their results
+([#2](https://github.com/Leonccaa/ReVolta/issues/2), [#38](https://github.com/Leonccaa/ReVolta/issues/38),
+[#37](https://github.com/Leonccaa/ReVolta/issues/37)). Report security issues
 through GitHub private vulnerability reporting.
 
 For project status and development background, read the [pinned overview (#1)](https://github.com/Leonccaa/ReVolta/issues/1).

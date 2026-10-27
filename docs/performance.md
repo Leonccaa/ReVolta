@@ -26,7 +26,26 @@ method (MTP4 and DFlash2) and prompt type is in [Performance](#performance).
 
 ### Coming back to a document
 
-No ReVolta version is specified for this readback measurement; its request and cache conditions follow below.
+Measured on 0.1.4 with DFlash2 (recommended settings), Uncensored AWQ, E4M3 KV, 250 W,
+the pinned PLE table, a 7 GiB CPU pool and a disk tier on a local NVMe SSD. Each
+document was first computed cold. The CPU readback followed after the GPU prefix cache
+was cleared; the disk readback followed an engine restart with the page cache dropped.
+Both readbacks hit the whole cacheable prefix, and the disk readbacks gave the same
+64-token greedy output as the cold run.
+
+| Prompt tokens | Recomputed | From CPU memory | From NVMe after a restart |
+| ---: | ---: | ---: | ---: |
+| 32,768 | 10.12 s | 0.61 s | 1.47 s |
+| 99,000 | 31.88 s | 0.77 s | 2.93 s |
+| 131,072 | 42.43 s | 0.99 s | 3.77 s |
+
+Times are to the first token, one request at a time. Eight more 32K-token documents
+gave 0.62–0.66 s from CPU memory and 1.41–1.46 s from NVMe for the first four of them.
+Four 32K-token documents read from NVMe at the same time after the restart took
+1.48–3.84 s each (median 2.67 s).
+
+An earlier measurement, with no ReVolta version recorded, under the request and cache
+conditions below:
 
 A cached 32K-token document answered a follow-up in **1.28 seconds from memory**,
 compared with **10.06 seconds when recomputed**. Both produced identical output.
@@ -39,8 +58,8 @@ compared with **10.06 seconds when recomputed**. Both produced identical output.
 | CPU memory + filesystem cache | 1.60 s |
 
 The request generated 64 tokens and reused 31,008 cached prompt tokens. A small GPU
-pool forced eviction. The filesystem tier was tested on a network filesystem;
-local SSD performance has not yet been measured.
+pool forced eviction. The filesystem tier in this earlier measurement was on a network
+filesystem.
 
 ### Quantization quality
 

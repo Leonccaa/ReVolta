@@ -91,6 +91,8 @@ _SM70_MTP_CUDAGRAPH_REQUEST_SIZES = (1, 2, 3, 4, 6, 8, 12, 16)
 # VLLM_SM70_QWEN38_WIDE_M_CAPTURE: 5 and 7 requests no longer pad to 6 and 8.
 _SM70_MTP_CUDAGRAPH_WIDE_REQUEST_SIZES = (5, 7)
 _SM70_SPECULATIVE_AUX_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 9, 18)
+# Piecewise graphs for short prompts joining resident speculative verifiers.
+_SPECULATIVE_MIXED_CUDAGRAPH_CAPTURE_SIZES = (64, 96, 128, 160, 192, 256)
 
 _SM70_BATCH_GEMM_DEFAULTS = {
     # Common dense-operator policy, independent of model name, checkpoint
@@ -753,6 +755,8 @@ def _configure_sm70_glm5_dflash_tp4_pp2_acceptance_path(
 def _sm70_speculative_cudagraph_capture_sizes(
     max_num_seqs: int,
     decode_query_len: int,
+    *,
+    include_mixed_prefill: bool = False,
 ) -> list[int]:
     """Return bounded auxiliary and verifier shapes without a TP contract."""
     # DFlash verification has the same B32 attention/layout coverage as
@@ -762,10 +766,11 @@ def _sm70_speculative_cudagraph_capture_sizes(
         size for size in _sm70_mtp_cudagraph_request_sizes() if size <= max_graph_reqs
     }
     request_sizes.add(max_graph_reqs)
-    verifier_sizes = [decode_query_len * size for size in request_sizes]
-    return sorted(
-        set(_SM70_SPECULATIVE_AUX_CUDAGRAPH_CAPTURE_SIZES) | set(verifier_sizes)
-    )
+    capture_sizes = set(_SM70_SPECULATIVE_AUX_CUDAGRAPH_CAPTURE_SIZES)
+    capture_sizes.update(decode_query_len * size for size in request_sizes)
+    if include_mixed_prefill:
+        capture_sizes.update(_SPECULATIVE_MIXED_CUDAGRAPH_CAPTURE_SIZES)
+    return sorted(capture_sizes)
 
 
 class OptimizationLevel(IntEnum):
@@ -2530,10 +2535,18 @@ class VllmConfig:
                                 tuple(cudagraph_capture_sizes),
                             )
                         else:
+                            graph_mode = self.compilation_config.cudagraph_mode
+                            target_ms = (
+                                self.scheduler_config.mixed_prefill_step_latency_ms
+                            )
                             cudagraph_capture_sizes = (
                                 _sm70_speculative_cudagraph_capture_sizes(
                                     self.scheduler_config.max_num_seqs,
                                     decode_query_len,
+                                    include_mixed_prefill=(
+                                        target_ms > 0
+                                        and graph_mode.has_piecewise_cudagraphs()
+                                    ),
                                 )
                             )
                             logger.info_once(

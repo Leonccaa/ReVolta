@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm import envs
 from vllm.config.speculative import SpeculativeConfig
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.v1.attention.backends.gdn_attn import select_gdn_state_block_ids
@@ -19,6 +20,23 @@ pytestmark = pytest.mark.cpu_test
 
 SLOTS = 8  # 1 + 7 speculative tokens: the verifier table has SLOTS + 1 columns
 BS = 1664
+
+
+def _patch_env_flag(monkeypatch, name, value):
+    """Override one vllm.envs boolean switch for this test only.
+
+    Every declared vllm.envs name resolves lazily through the module
+    ``__getattr__`` (vllm/envs.py:19565), so ``monkeypatch.setattr(envs, name,
+    value)`` records the *resolved* value as the old value and puts it back as a
+    concrete module attribute on undo. That shadow then hides the getter from
+    every later test in the same pytest process, which makes unrelated tests that
+    only change the environment order-dependent. Deleting any pre-existing
+    shadow and writing the flag into ``os.environ`` (what the getter reads) is
+    restored exactly by monkeypatch, so nothing leaks.
+    """
+
+    monkeypatch.delitem(vars(envs), name, raising=False)
+    monkeypatch.setenv(name, "1" if value else "0")
 
 
 def _table(**kwargs):
@@ -151,12 +169,8 @@ def test_replay_halves_the_blocks_a_request_holds():
 
 
 def test_non_speculative_rows_read_the_running_block_with_replay(monkeypatch):
-    from vllm import envs
-
     # Exercise the accepted-column selection, not the legacy slot-zero override.
-    monkeypatch.setattr(
-        envs, "VLLM_SM70_MTP_LEGACY_GDN_NON_SPEC_SLOT0", False, raising=False
-    )
+    _patch_env_flag(monkeypatch, "VLLM_SM70_MTP_LEGACY_GDN_NON_SPEC_SLOT0", False)
     table = torch.tensor([[3, PAD_SLOT_ID, PAD_SLOT_ID], [4, PAD_SLOT_ID, PAD_SLOT_ID]])
     accepted = torch.tensor([1, 3])
     assert select_gdn_state_block_ids(table, accepted, 2, state_columns=1).tolist() == [
@@ -198,15 +212,14 @@ def _replay_config(**overrides):
 @pytest.fixture
 def sm70(monkeypatch):
     import vllm.config.vllm as config_module
-    from vllm import envs
     from vllm.platforms import current_platform
 
     monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
     monkeypatch.setattr(
         config_module, "_any_participating_device_is_capability", lambda *a: True
     )
-    monkeypatch.setattr(envs, "VLLM_SM70_QWEN_GDN_SPEC_CORE_OP", False, raising=False)
-    monkeypatch.setattr(envs, "VLLM_SM70_FUSED_SIGMOID_MIXED_QKV", True, raising=False)
+    _patch_env_flag(monkeypatch, "VLLM_SM70_QWEN_GDN_SPEC_CORE_OP", False)
+    _patch_env_flag(monkeypatch, "VLLM_SM70_FUSED_SIGMOID_MIXED_QKV", True)
     return config_module._resolve_gdn_spec_state_replay
 
 
@@ -331,11 +344,10 @@ def test_dflash_replay_is_the_only_change_to_gdn_allocation(sm70):
 def test_replay_alone_widens_the_mixed_qkv_verifier_admission(
     monkeypatch, wide, num_tokens
 ):
-    from vllm import envs
     from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as gdn
 
-    monkeypatch.setattr(envs, "VLLM_SM70_QWEN38_WIDE_M_GDN", wide, raising=False)
-    monkeypatch.setattr(envs, "VLLM_SM70_GDN_TAIL_COPY", False, raising=False)
+    _patch_env_flag(monkeypatch, "VLLM_SM70_QWEN38_WIDE_M_GDN", wide)
+    _patch_env_flag(monkeypatch, "VLLM_SM70_GDN_TAIL_COPY", False)
     admits = gdn.QwenGatedDeltaNetAttention._mixed_qkv_verify_admits
     # Replay off (MTP, no speculation, DFlash with replay off): the band as before.
     off = SimpleNamespace(spec_state_replay=False)

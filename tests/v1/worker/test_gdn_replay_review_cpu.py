@@ -31,6 +31,23 @@ from vllm.v1.kv_offload.cpu.spec import mamba_state_slots
 pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
 
 
+def _patch_env_flag(monkeypatch, name, value):
+    """Override one vllm.envs boolean switch for this test only.
+
+    Every declared vllm.envs name resolves lazily through the module
+    ``__getattr__`` (vllm/envs.py:19565), so ``monkeypatch.setattr(envs, name,
+    value)`` records the *resolved* value as the old value and puts it back as a
+    concrete module attribute on undo. That shadow then hides the getter from
+    every later test in the same pytest process, which makes unrelated tests that
+    only change the environment order-dependent. Deleting any pre-existing
+    shadow and writing the flag into ``os.environ`` (what the getter reads) is
+    restored exactly by monkeypatch, so nothing leaks.
+    """
+
+    monkeypatch.delitem(vars(envs), name, raising=False)
+    monkeypatch.setenv(name, "1" if value else "0")
+
+
 def _config(policy):
     return SimpleNamespace(
         speculative_config=SimpleNamespace(
@@ -59,8 +76,8 @@ def resolve(monkeypatch):
     monkeypatch.setattr(
         config_module, "_any_participating_device_is_capability", lambda *a: True
     )
-    monkeypatch.setattr(envs, "VLLM_SM70_QWEN_GDN_SPEC_CORE_OP", False)
-    monkeypatch.setattr(envs, "VLLM_SM70_FUSED_SIGMOID_MIXED_QKV", True)
+    _patch_env_flag(monkeypatch, "VLLM_SM70_QWEN_GDN_SPEC_CORE_OP", False)
+    _patch_env_flag(monkeypatch, "VLLM_SM70_FUSED_SIGMOID_MIXED_QKV", True)
     return resolver
 
 
@@ -92,8 +109,8 @@ def test_enabled_replay_admits_the_whole_verify_batch(
 ):
     # Replay is off by default from 0.1.4; request it so the enabled branch runs.
     policy = Sm70DFlash2Config(fused_gdn_verify=False, spec_state_replay=True)
-    monkeypatch.setattr(envs, "VLLM_SM70_QWEN38_WIDE_M_GDN", wide)
-    monkeypatch.setattr(envs, "VLLM_SM70_GDN_TAIL_COPY", False)
+    _patch_env_flag(monkeypatch, "VLLM_SM70_QWEN38_WIDE_M_GDN", wide)
+    _patch_env_flag(monkeypatch, "VLLM_SM70_GDN_TAIL_COPY", False)
     enabled = resolve(_config(policy))
     assert enabled
     num_tokens = requests * 8

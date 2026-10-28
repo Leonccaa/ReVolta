@@ -17,7 +17,12 @@ def config(monkeypatch):
     envs.disable_envs_cache()
     # Other operator tests may monkeypatch a dynamic env attribute. Remove
     # their restored concrete values so this fixture exercises actual getters.
-    for name in _SM70_DFLASH2_VERIFIER_DEFAULTS:
+    # monkeypatch.setattr reads the old value with getattr, so undoing a patch of
+    # a name that vllm/envs.py resolves lazily through module __getattr__ leaves a
+    # concrete attribute behind, and that shadow hides the getter from every later
+    # test in the process. Drop every shadowed declared name, not only the
+    # verifier defaults, so these reports never depend on another file's leftovers.
+    for name in [k for k in dict(vars(envs)) if k in envs.environment_variables]:
         monkeypatch.delitem(vars(envs), name, raising=False)
     for name, value in {
         **_SM70_BATCH_GEMM_DEFAULTS,
@@ -415,7 +420,14 @@ def test_flash_next_batch_memory_and_explicit_off(config, monkeypatch):
         monkeypatch.setenv(name, "0")
     report = acc.build_report(config)["flash_next_batch"]
     assert report["packed_weight_memory"]["total_bytes"] == 0
-    assert all(row["reason"] == "user_override" for row in report["controls"].values())
+    # Same requirement as all(row["reason"] == "user_override" ...), named by row
+    # so that a control which is still on shows up as {'NAME': None} on failure.
+    offenders = {
+        name: row["reason"]
+        for name, row in report["controls"].items()
+        if row["reason"] != "user_override"
+    }
+    assert offenders == {}
 
 
 def test_flash_next_memory_does_not_guess_other_tp_layout(config):

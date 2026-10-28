@@ -34,6 +34,22 @@ logger = init_logger(__name__)
 
 _SM70_TP8_HIERARCHICAL_ELEMENTS = frozenset((4096, 8 * 4096))
 _SM70_TP8_HIERARCHICAL_SCRATCH_BYTES = 4 * 8 * 4096 * torch.float16.itemsize
+# csrc/custom_all_reduce.cuh:75,89-96 reserves the SM70 TP4 push payloads:
+# 8, 16 and 32 FP16 rows of the 5120-element reference hidden size.
+_SM70_TP4_PUSH_HIDDEN_ELEMENTS = 5120
+_SM70_TP4_PUSH_ALLREDUCE_M8_BYTES = (
+    8 * _SM70_TP4_PUSH_HIDDEN_ELEMENTS * torch.float16.itemsize
+)
+# The 16- and 32-row payloads are the only larger messages with a dedicated
+# push kernel; anything else in between uses the generic one-stage pull kernel.
+_SM70_TP4_PUSH_ALLREDUCE_LARGE_BYTES = frozenset(
+    (2 * _SM70_TP4_PUSH_ALLREDUCE_M8_BYTES, 4 * _SM70_TP4_PUSH_ALLREDUCE_M8_BYTES)
+)
+# SM70 TP4 NVLink: custom all-reduce up to 27 tokens of the FP16 [tokens, 2560]
+# decode payload. Inside CUDA graphs the custom kernels measured 17.0 / 18.0 /
+# 18.3 us at 20 / 24 / 25 tokens and 19.7 us at 30 against about 19.0 us for
+# NCCL, so they cross over near 27.7 tokens.
+_SM70_TP4_NVLINK_CAR_MAX_BYTES = 27 * 2560 * torch.float16.itemsize
 _EXPANDABLE_SEGMENTS_TRUE_PATTERN = re.compile(
     r"((?:^|,)\s*expandable_segments\s*:\s*)True(?=\s*(?:,|$))"
 )
@@ -57,6 +73,31 @@ def _sm70_tp4_push_sum2_size(nbytes: int) -> bool:
     if nbytes == 5120:
         return os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1") in (None, "1")
     return False
+
+
+def _sm70_tp4_nvlink_car_admits(nbytes: int, push_registered: bool) -> bool:
+    """Mirror the SM70 TP4 NVLink payload admission measured against NCCL.
+
+    Operator microbenchmark on four V100-SXM2 with NVLink, FP16 [tokens, 2560],
+    inside CUDA graphs: up to 16 tokens the push kernels take 3.4-7.3 us against
+    15-19 us for NCCL; from 17 to 27 tokens the generic one-stage kernel is still
+    slightly faster than NCCL; the two larger push payloads keep their dedicated
+    push kernels (11.2 and 18.9 us at 32 and 64 tokens against 19.1 and 24.4 us).
+    Every other size goes to NCCL, which is faster there. Those microbenchmarks
+    are not stored in this tree (see docs/performance.md for end-to-end figures).
+
+    Native admission lives in ``sm70_tp4_push_allreduce_blocks``, which reads
+    the raw ``VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY`` string; ``vllm.envs``
+    publishes the resolved default into ``os.environ`` before any launch, so
+    reading the same raw string here cannot disagree with the kernel.
+    """
+    if nbytes <= _SM70_TP4_NVLINK_CAR_MAX_BYTES:
+        return True
+    return (
+        push_registered
+        and nbytes in _SM70_TP4_PUSH_ALLREDUCE_LARGE_BYTES
+        and os.getenv("VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY") == "1"
+    )
 
 
 def _get_effective_allocator_conf() -> str:
@@ -513,6 +554,9 @@ class CustomAllreduce:
     sm70_pcie_switch = False
     sm70_pcie_switch_max_bytes = 0
     sm70_pcie_switch_graph_only = False
+    # SM70 TP4 NVLink payload admission; the class default keeps every other
+    # mode, and instances made without __init__ (tests), on the unchanged path.
+    sm70_nvlink_tp4_car_sizes = False
 
     # max_size: max supported allreduce size
     def __init__(
@@ -649,6 +693,27 @@ class CustomAllreduce:
                 "(payload <= %d bytes, graph capture only: %s).",
                 self.sm70_pcie_switch_max_bytes,
                 self.sm70_pcie_switch_graph_only,
+            )
+        # The same condition that allocates and registers the SM70 TP4 push
+        # buffers below, so the two larger payloads this table admits really do
+        # have a push kernel whenever the table admits them.
+        self.sm70_nvlink_tp4_car_sizes = (
+            decision.mode == "nvlink"
+            and world_size == 4
+            and device_capability is not None
+            and device_capability.major == 7
+            and device_capability.minor == 0
+        )
+        if self.sm70_nvlink_tp4_car_sizes:
+            logger.info(
+                "SM70 NVLink custom allreduce enabled for TP4 payloads <= %d "
+                "bytes plus the %s push payloads while they are registered; "
+                "every other payload uses NCCL. sum2 uses its push kernel at the "
+                "push sizes and otherwise the local sum plus this all-reduce.",
+                _SM70_TP4_NVLINK_CAR_MAX_BYTES,
+                " and ".join(
+                    str(size) for size in sorted(_SM70_TP4_PUSH_ALLREDUCE_LARGE_BYTES)
+                ),
             )
         tp8_hierarchical = decision.mode == "tp8_hierarchical"
         hierarchical_peer_ranks = (
@@ -863,6 +928,10 @@ class CustomAllreduce:
                 inp.dtype == torch.float16
                 and inp.numel() in _SM70_TP8_HIERARCHICAL_ELEMENTS
             )
+        if self.sm70_nvlink_tp4_car_sizes and not _sm70_tp4_nvlink_car_admits(
+            inp_size, self.sm70_tp4_push_buffer_ptrs is not None
+        ):
+            return False
         # for 4 or more non NVLink-capable GPUs, custom allreduce provides
         # little performance improvement over NCCL.
         if self.world_size == 2 or self.fully_connected:
@@ -1446,7 +1515,7 @@ class CustomAllreduce:
     def can_sm70_tp4_push_sum2(self, inp: torch.Tensor) -> bool:
         return (
             not self.disabled
-            and self.sm70_pcie_switch
+            and (self.sm70_pcie_switch or self.sm70_nvlink_tp4_car_sizes)
             and self.world_size == 4
             and self.fully_connected
             and self.sm70_tp4_push_buffer_ptrs is not None
@@ -1463,7 +1532,7 @@ class CustomAllreduce:
         if self.disabled or not self.should_custom_ar(input_a):
             return None
         if (
-            self.sm70_pcie_switch
+            (self.sm70_pcie_switch or self.sm70_nvlink_tp4_car_sizes)
             and input_a.dtype == torch.float16
             and not self.can_sm70_tp4_push_sum2(input_a)
         ):

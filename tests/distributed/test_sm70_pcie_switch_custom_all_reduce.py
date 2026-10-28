@@ -153,9 +153,7 @@ def test_mode_rejects_unknown_value(monkeypatch):
         _mode(monkeypatch, mode="yes")
 
 
-def _communicator(
-    pcie_switch, max_bytes=81920, graph_only=True, nvlink=False, push_registered=True
-):
+def _communicator(pcie_switch, max_bytes=81920, graph_only=True):
     communicator = object.__new__(CustomAllreduce)
     communicator.disabled = False
     communicator._ptr = 0
@@ -163,17 +161,10 @@ def _communicator(
     communicator.fully_connected = True
     communicator.tp8_hierarchical = False
     communicator.dispatch_max_size = 8 * 1024 * 1024
-    # The SM70 TP4 NVLink payload table is a separate, mode-scoped gate; set it
-    # explicitly so these fakes cannot inherit it by accident.
-    communicator.sm70_nvlink_tp4_car_sizes = nvlink
-    communicator.sm70_tp4_push_buffer_ptrs = [1, 2, 3, 4] if push_registered else None
     if pcie_switch:
-        communicator.interconnect_mode = "pex_p2p"
         communicator.sm70_pcie_switch = True
         communicator.sm70_pcie_switch_max_bytes = max_bytes
         communicator.sm70_pcie_switch_graph_only = graph_only
-    else:
-        communicator.interconnect_mode = "nvlink" if nvlink else "no_p2p"
     return communicator
 
 
@@ -199,26 +190,12 @@ def test_pcie_switch_zero_limit_means_no_byte_cap(monkeypatch):
     assert _communicator(True, max_bytes=0).should_custom_ar(_fp16(1024 * 1024))
 
 
-def test_instances_outside_the_two_switches_keep_the_upstream_rule(monkeypatch):
-    # An instance with neither switch on (TP2/TP8/no_p2p, or any other resolved
-    # mode) has no payload and no capture limit, exactly as before. The SM70 TP4
-    # NVLink table is a third, separate gate and must be machine-checked off here.
+def test_upstream_instances_unchanged(monkeypatch):
+    # NVLink (or any non-PCIe-switch) instance: no payload or capture limit.
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    upstream = _communicator(False)
-    assert not upstream.sm70_pcie_switch
-    assert upstream.sm70_nvlink_tp4_car_sizes is False
-    assert upstream.should_custom_ar(_fp16(1024 * 1024))
-
-
-def test_nvlink_tp4_payload_table_replaces_the_upstream_byte_rule(monkeypatch):
-    # The intent statement that changed: an SM70 TP4 NVLink instance is no
-    # longer "no payload limit"; only the table's payloads stay on custom.
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    nvlink = _communicator(False, nvlink=True)
-    assert not nvlink.sm70_pcie_switch
-    assert nvlink.sm70_nvlink_tp4_car_sizes is True
-    assert nvlink.should_custom_ar(_fp16(81920))
-    assert not nvlink.should_custom_ar(_fp16(1024 * 1024))
+    communicator = _communicator(False)
+    assert not communicator.sm70_pcie_switch
+    assert communicator.should_custom_ar(_fp16(1024 * 1024))
 
 
 def test_env_defaults_match_validated_pcie_switch_settings(monkeypatch):

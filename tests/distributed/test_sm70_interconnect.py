@@ -427,9 +427,9 @@ def test_constructor_uses_confirmed_policy_before_native_init(
     comm = car.CustomAllreduce("cpu-group", device=0)
     assert comm.disabled is not enabled
     assert comm.sm70_pcie_switch is pex
-    # The NVLink payload table is resolved for the NVLink mode only; PCIe-switch
-    # and no_p2p groups keep the byte rule they already had.
-    assert comm.sm70_nvlink_tp4_car_sizes is (requested == "nvlink")
+    # The SM70 TP4 NVLink sum2 route is resolved for the NVLink mode only;
+    # PCIe-switch and no_p2p groups keep the routes they already had.
+    assert comm.sm70_nvlink_tp4 is (requested == "nvlink")
     assert (
         car.get_sm70_interconnect_mode(comm)
         == {

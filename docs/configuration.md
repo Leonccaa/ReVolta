@@ -17,14 +17,10 @@ values override the profile.
 ## Interconnect
 
 The engine selects the interconnect automatically and logs `SM70 interconnect=<mode>`.
-Custom all-reduce then admits payloads by size, per mode. On an SM70 TP4 group under one
-PCIe switch (`pex_p2p`) it carries messages up to 80 KiB inside CUDA graphs. On an SM70
-TP4 NVLink group (`nvlink`) it carries messages up to 135 KiB (27 tokens of the
-2560-wide FP16 hidden state), plus the 160 KiB and 320 KiB push payloads while the
-SM70 TP4 push buffers are registered and `VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY=1`
-(both are the defaults); the MoE output sum (sum2) uses its own push kernel at the sizes
-that have one and otherwise adds locally before this all-reduce. Every other collective,
-on both modes, uses NCCL. Override with `VLLM_SM70_INTERCONNECT=auto|pex|nccl|nvlink`
+P2P uses custom all-reduce for messages up to 80 KiB inside CUDA graphs; other
+collectives use NCCL. On an SM70 TP4 group (under one PCIe switch, or on NVLink) the MoE
+output sum (sum2) uses its own push kernel at the sizes that have one and otherwise adds
+locally before the ordinary all-reduce. Override with `VLLM_SM70_INTERCONNECT=auto|pex|nccl|nvlink`
 or disable custom all-reduce with `--disable-custom-all-reduce`.
 
 ## Launch options

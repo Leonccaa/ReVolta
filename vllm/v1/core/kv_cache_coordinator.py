@@ -51,6 +51,11 @@ class KVCacheCoordinator(ABC):
         self.max_model_len = max_model_len
         self.enable_caching = enable_caching
         self.retention_interval: int | None = None
+        # Engine-level EAGLE/MTP rewind. ``Scheduler.use_eagle`` carries the same
+        # flag (``SpeculativeConfig.use_eagle_kv_cache``): when it is on, the
+        # scheduler ends the last prefill chunk one page below the deepest
+        # aligned boundary, so that state is never produced at all.
+        self.engine_use_eagle = use_eagle
         self.shared_prefix_boundary = 0
 
         self.block_pool = BlockPool(
@@ -68,6 +73,13 @@ class KVCacheCoordinator(ABC):
         # Conservatively fall back to flag all groups when no group is flagged.
         if use_eagle and not self.eagle_group_ids:
             self.eagle_group_ids = set(range(len(kv_cache_config.kv_cache_groups)))
+        # Whether a replay of a prompt lands one checkpoint page below the
+        # deepest aligned boundary its lookup can key. Default to the engine
+        # rule so a coordinator that never configures sparse retention answers
+        # exactly as before; ``configure_prefix_cache_retention`` replaces it
+        # with the drop a page-granular cacheable group really takes, which a
+        # drafter owning a sub-page cache (DFlash2) does not take.
+        self.mamba_state_lookbehind = bool(self.eagle_group_ids)
 
         self.single_type_managers = tuple(
             get_manager_for_kv_cache_spec(
@@ -97,16 +109,32 @@ class KVCacheCoordinator(ABC):
                 "in this backport"
             )
         alignment = getattr(self, "lcm_block_size", mamba[0].block_size)
-        # SWA must preserve the window at the checkpoint Mamba actually admits,
-        # rather than the prompt's final (unrestorable) alignment boundary.
-        sparse_mamba = bool(self.eagle_group_ids) and any(
+        sparse_mamba = any(
             isinstance(m.kv_cache_spec, MambaSpec)
             and m.kv_cache_spec.mamba_cache_mode == "align"
             and m.block_size == alignment
             for m in mamba
         )
+        # The lookbehind is only owed to a drop that costs a whole checkpoint
+        # page, i.e. a drop taken by a cacheable group whose block size equals
+        # the hit alignment. A drafter that owns a sub-page cache (DFlash2 flags
+        # only its own group, and ``MambaManager.find_longest_cache_hit`` then
+        # takes no drop at all) pops one of its own blocks and re-aligns inside
+        # the page, so the deepest boundary a resend reaches stays
+        # floor((num_tokens - 1) / alignment) * alignment. An engine that
+        # rewinds ``last_cache_position`` keeps the rewind: it never produces
+        # that state.
+        page_granular_drop = self.engine_use_eagle or any(
+            manager.kv_cache_group_id in self.eagle_group_ids
+            and manager.block_size == alignment
+            for manager in self.single_type_managers
+            if manager.kv_cache_spec.prefix_cacheable
+        )
+        self.mamba_state_lookbehind = sparse_mamba and page_granular_drop
+        # SWA must preserve the window at the checkpoint Mamba actually admits,
+        # rather than the prompt's final (unrestorable) alignment boundary.
         for manager in self.single_type_managers:
-            manager.mamba_replay_lookbehind = sparse_mamba
+            manager.mamba_replay_lookbehind = self.mamba_state_lookbehind
         if interval < 0 or interval % alignment:
             raise ValueError(
                 f"prefix_cache_retention_interval ({interval}) must be a non-negative "
@@ -130,9 +158,16 @@ class KVCacheCoordinator(ABC):
             # Once the cache horizon advances, the next decode token cannot
             # retroactively admit it. The preceding boundary serves a resend.
             return tuple(sorted({resend, extension}))
-        return tuple(
-            sorted({max(resend - alignment, 0), max(extension - alignment, 0)})
-        )
+        rewound = {max(resend - alignment, 0), max(extension - alignment, 0)}
+        lookbehind = getattr(self, "mamba_state_lookbehind", bool(self.eagle_group_ids))
+        if not lookbehind:
+            # Nothing rewinds this group's own lookup, so the unrewound
+            # boundary is what a resend lands on and must be published. Keep
+            # the rewound entry too: the scheduler already ends a chunk there,
+            # so dropping it would move the last prefill stop and change the
+            # recurrent chunk geometry (and its low bits) for no gain.
+            return tuple(sorted(rewound | {resend, extension}))
+        return tuple(sorted(rewound))
 
     def _cache_manager_blocks(
         self,

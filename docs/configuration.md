@@ -18,7 +18,9 @@ values override the profile.
 
 The engine selects the interconnect automatically and logs `SM70 interconnect=<mode>`.
 P2P uses custom all-reduce for messages up to 80 KiB inside CUDA graphs; other
-collectives use NCCL. Override with `VLLM_SM70_INTERCONNECT=auto|pex|nccl|nvlink`
+collectives use NCCL. On an SM70 TP4 group (under one PCIe switch, or on NVLink) the MoE
+output sum (sum2) uses its own push kernel at the sizes that have one and otherwise adds
+locally before the ordinary all-reduce. Override with `VLLM_SM70_INTERCONNECT=auto|pex|nccl|nvlink`
 or disable custom all-reduce with `--disable-custom-all-reduce`.
 
 ## Launch options

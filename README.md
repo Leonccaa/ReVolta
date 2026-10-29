@@ -112,7 +112,7 @@ offload settings, `nvidia-smi topo -m`, and the `ReVolta profile` /
 `SM70 interconnect=` log lines. Remove credentials.
 
 Reports from NVLink V100 owners are especially welcome; share measured results with the
-[Test results](https://github.com/Leonccaa/ReVolta/issues/new?template=test_results.md) template
+[Report](https://github.com/Leonccaa/ReVolta/issues/new?template=test_results.md) template
 ([`.github/ISSUE_TEMPLATE/test_results.md`](.github/ISSUE_TEMPLATE/test_results.md); agents can fill it in and
 open the issue through the API). Thanks to
 [@jttdev](https://github.com/jttdev), [@That80-20](https://github.com/That80-20) and

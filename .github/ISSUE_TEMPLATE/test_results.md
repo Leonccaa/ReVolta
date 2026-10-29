@@ -1,13 +1,16 @@
 ---
-name: Test results
-about: Share speed, capacity or stability results measured on your hardware. People and coding agents can both fill this in.
-title: "Test results: "
-labels: ["test results"]
+name: Report
+about: Share test results or experience from running ReVolta on your hardware. People and coding agents can both fill this in.
+title: "[Report] "
+labels: ["report"]
 ---
 
 <!--
 Instructions (for people and for coding agents):
 - Fill in every section. Write "not measured" instead of deleting a section.
+- Measured results and experience from daily use are both welcome. For daily use,
+  describe the workload under "How you measured" and what happened under
+  "Stability and notes".
 - Keep the keys in the Summary block; put units in the values.
 - Remove credentials, tokens and private paths from commands and logs.
 - For a problem or a crash, use the bug report form instead.

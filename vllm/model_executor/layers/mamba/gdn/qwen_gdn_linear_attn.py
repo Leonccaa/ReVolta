@@ -5336,8 +5336,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             dtype=torch.int32,
             device=device,
         )
+        # Start every row at the last column. The replay splits each request
+        # into its accepted prefix and the rest, so it reads 2 x requests.
         self._replay_selectors = torch.full(
-            (max_reqs,), self._replay_slots + 1, dtype=torch.int32, device=device
+            (2 * max_reqs,), self._replay_slots + 1, dtype=torch.int32, device=device
         )
 
     def _mixed_qkv_verify_admits(self, num_tokens: int) -> bool:
@@ -5401,15 +5403,19 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     ) -> None:
         """Commit accepted recurrent states by repeating the verifier's launch.
 
-        ``state_indices`` has the verifier's shape ([requests, slots + 1]): the
+        ``state_indices`` has the verifier's width (slots + 1 columns): the
         last column is the running block the verifier started from, the column
         of the last accepted token maps to the running block again, and a
         block-boundary position may map to its prefix-cache block. Every other
-        column is padded, so nothing else is stored. Same inputs, request count,
-        token count and schedule as the verifier: the stored states are the
-        verifier's own, bitwise.
+        column is padded, so nothing else is stored. Same inputs, token count
+        and schedule as the verifier: the stored states are the verifier's own,
+        bitwise. With the accepted-prefix launch (``gdn_spec_replay``) each
+        verifier row is two sequences, its accepted prefix and an all-padding
+        rest, so ``state_indices`` has 2 x requests rows; the kernel computes a
+        token from the start state and the tokens before it only.
         """
         num_reqs = state_indices.shape[0]
+        assert num_reqs <= self._replay_selectors.numel()
         fused_sigmoid_gating_delta_rule_update_mixed_qkv(
             A_log=self.A_log,
             a=self._replay_a[:num_tokens],

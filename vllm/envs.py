@@ -353,6 +353,7 @@ if TYPE_CHECKING:
     VLLM_SM70_QWEN38_GDN_NO_PACK: bool = False
     VLLM_SM70_MTP_GDN_DIRECT_OUTPUT: bool = False
     VLLM_SM70_QSA_SHARED_KEY: bool = False
+    VLLM_SM70_QSA_REQUEST_SEGMENTS: bool = False
     VLLM_SM70_QSA_COMPACT_TOPK: bool = False
     VLLM_SM70_PLE_NGRAM_BATCH: bool = False
     VLLM_SM70_PLE_INPUT_PREPARE: bool = False
@@ -4603,6 +4604,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "activation dtype is FP16 and TP=4; explicit environment values win."
             ),
         ),
+        acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_QSA_REQUEST_SEGMENTS": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_QSA_REQUEST_SEGMENTS", "0"))),
+        description=(
+            "Score multi-request FP16 QSA batches (decode, at most 256 rows) "
+            "with the request-segmented paged scorer: each 64-key tile is "
+            "read once per segment of up to four rows of one request instead "
+            "of once per row. Scores and visible lengths are bitwise equal to "
+            "the paged scorer on SM70; single-request batches and batches "
+            "with fewer than two rows per request are unchanged."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
         user_visible=False,
     ),

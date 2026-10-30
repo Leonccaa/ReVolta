@@ -4619,8 +4619,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         category="experimental",
         declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
+        effective_default=(
+            "False; ReVolta FP16 QSA SM70 TP4 profile sets '1' under "
+            "automatic_conditions."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/revolta_profile.py:apply_revolta_profile sets '1' when all "
+                "visible CUDA devices are SM70, selector metadata describes QSA, "
+                "activation dtype is FP16 and TP=4; explicit environment values win."
+            ),
+        ),
         acceleration_paths=("SM70 runtime/kernel policy",),
         user_visible=False,
     ),

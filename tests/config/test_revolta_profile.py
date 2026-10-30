@@ -23,6 +23,7 @@ COMMON = {
     "VLLM_SM70_GREEDY_VERIFY": "1",
     "VLLM_SM70_SKIP_REJECTED_BATCH_PACKS": "1",
     "VLLM_SM70_QSA_SHARED_KEY": "1",
+    "VLLM_SM70_QSA_REQUEST_SEGMENTS": "1",
     "VLLM_SM70_QSA_COMPACT_TOPK": "1",
     "VLLM_SM70_PLE_NGRAM_BATCH": "1",
     "VLLM_SM70_PLE_INPUT_PREPARE": "1",
@@ -196,7 +197,7 @@ def test_sources_after_upstream_auto_defaults(profile, monkeypatch):
     monkeypatch.setenv("NCCL_GRAPH_REGISTER", "0")  # env_override
     audit = json.loads(module.profile_audit(enabled=True))
     assert audit["enabled"]
-    assert len(audit["values"]) == 45
+    assert len(audit["values"]) == 46
     assert audit["values"][FP16[0]]["source"] == "upstream_default"
     assert audit["values"]["NCCL_GRAPH_REGISTER"]["source"] == "upstream_default"
     assert audit["values"]["VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT"] == {
@@ -494,7 +495,7 @@ def test_frontend_interconnect_mode_and_audit(
     # policy must not read "pex_p2p" while the workers log nvlink.
     assert audit["interconnect_mode"] == logged
     assert audit["interconnect_policy"] == ("auto" if requested is None else requested)
-    assert len(audit["values"]) == 45
+    assert len(audit["values"]) == 46
 
 
 def _applied_profile(profile, monkeypatch, requested, disabled):

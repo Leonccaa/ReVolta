@@ -19700,6 +19700,11 @@ def compile_factors() -> dict[str, object]:
         # moe_forward_shared custom op at run time, so the traced graph does not
         # depend on it, and registering it must not recompile any deployment.
         "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_DFLASH_MAX_TOKENS",
+        # QSA scorer route for multi-request batches. It is chosen inside the
+        # qwen4_exp_qsa_with_output custom op at run time, so the traced graph
+        # does not depend on it, and registering it must not recompile any
+        # deployment.
+        "VLLM_SM70_QSA_REQUEST_SEGMENTS",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
         "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS",

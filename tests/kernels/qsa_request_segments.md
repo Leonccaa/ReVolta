@@ -1,90 +1,78 @@
-# Request-segmented QSA candidate
+# Request-segmented QSA scorer
 
-This is a research implementation. Serving dispatch does not import or call it.
-GPU bit patterns, graph replay, memory safety, performance and engine behavior
-still need qualification. Do not enable it based on CPU interpreter results.
+`vllm/models/qwen4_exp/nvidia/ops/qsa_request_segments.py` scores multi-request
+SM70 QSA batches. The paged scorer (`qsa.qsa_mqa_paged`) loads every 64-key
+tile once per query row. Rows of one request share a page table, so this scorer
+splits each contiguous request run into segments of up to four rows and loads
+each tile once per segment. Four rows by four heads form one 128x16 query block.
+The kernel keeps the paged kernel's 64x128 by 128x16 dot, 2 warps, pipelined
+tile loop and per-row 16-lane reduction (the other rows' lanes are zeroed). On
+SM70 the scores and visible lengths are bitwise equal to the paged scorer.
 
-`qsa_mqa_request_segments` splits each contiguous request run into segments of
-at most 1, 2, 4 or 8 query rows. Repeated runs stay separate. A device builder
-overwrites a fixed `[M,3]` int32 descriptor buffer on every call; unused slots
-contain -1. A second kernel loads each segment's 64-key tile once and reuses
-it across the original per-row dots. Each row keeps its own visibility mask.
-The entry supports at most 256 rows and finite FP16 Q/K with H4/D128.
+## Runtime use
 
-The candidate retains the paged scorer's 64x128 by 128x16 dot, 16 padded head
-lanes, FP32 accumulation, ReLU, `tl.sum` over heads and score divisor. It uses
-a device loop over rows to avoid duplicating the dot body eight times. This
-preserves the arithmetic form, not a proof about the compiler's GPU output.
-Combining queries into a wider dot changed random FP16 CPU interpreter results
-in an exploratory control and is deferred. The existing native shared-key
-operator is not used as the numerical reference.
+`qsa.qsa_select_paged_tokens` uses this scorer in place of `qsa_mqa_paged` when
+`VLLM_SM70_QSA_REQUEST_SEGMENTS=1` (the ReVolta profile sets it; an explicit
+value wins) and `request_segments_unsupported` returns `None`:
 
-Generic-stride offline compilation with Triton 3.6.0 to SM70 succeeds, but
-also exposes a register-spill risk: the eight-row candidate has a 6856-byte
-thread stack frame versus 8 bytes for the paged control in that compilation.
-Both need 40 KiB dynamic shared memory. Real JIT alignment specializations
-may change these resources. Treat this as a known performance limitation to
-investigate in the GPU window, not as evidence of the native operator's speed.
+- two or more requests (`single_request` keeps the shared-key and cuBLAS paths);
+- at most 256 rows in the logits chunk;
+- at least two rows per request on average (`one_row_per_request`: MTP drafting
+  steps, including CUDA-graph padding, gain nothing from one-row segments);
+- FP16 Q and indexer K with H4/D128, int32 page table, request map and lengths,
+  int32 or int64 positions, positive strides.
 
-Allocate `SegmentWorkspace` before capture, then pass the same buffers on each
-call. The entry rebuilds descriptors, has no dynamic count readback and performs
-no tensor allocation. Inputs and workspace must not overlap. The wrapper checks
-shape, dtype, device and positive input strides; input values remain the caller's
-responsibility. It does not extend the published serving support scope.
+The variable is not a torch.compile factor: the route is chosen inside the QSA
+custom op at run time. A device builder writes a fixed `[M,3]` descriptor buffer
+on every call (unused slots hold -1 and exit), so there is no host readback and
+the call can be captured in a CUDA graph. Buffers are allocated per call, as in
+the paged scorer.
+
+The segment limit is four rows. Eight-row segments (two query blocks), query
+blocks loaded inside the tile loop, a data-dependent branch in the loop body, or
+more warps either spill the key tile at 2 warps or change the reduction order.
 
 ## CPU checks
 
-Use an installed ReVolta environment with PyTorch and Triton, managed with `uv`.
-From the checkout root:
+From the checkout root, in an environment with PyTorch and Triton:
 
 ```bash
 CUDA_VISIBLE_DEVICES='' TRITON_INTERPRET=1 \
   .venv/bin/python tests/kernels/test_qsa_request_segments_cpu.py
-.venv/bin/python tests/kernels/qsa_request_segments_gpu.py \
-  --matrix qsa-segment-gpu-matrix.json
+.venv/bin/python -m pytest tests/kernels/test_qsa_request_segments_dispatch.py
 ```
 
-The first command runs the actual builder and scorer in Triton's CPU interpreter
-and compares them with the paged kernel extracted from this checkout. The
-independent NumPy oracle uses small dyadic FP16 values so addressing checks do
-not depend on a particular BLAS reduction. Random FP16 uses the paged interpreter
-control. Scores, visible lengths, stable top-512 IDs, untouched padding and
-descriptor ownership are checked. Tests include request remapping between calls,
-inactive rows, invalid pages, negative positions, ragged and repeated runs,
-long-run splitting, strides, page sizes 16/204/416 and maximum builder capacity.
+The first runs the builder and scorer in Triton's CPU interpreter against the
+paged kernel of this checkout and a NumPy oracle (scores, visible lengths,
+stable top-512 IDs, untouched padding, descriptors; remapped requests, inactive
+rows, invalid pages, negative positions, ragged and repeated runs, strides, page
+sizes 16/204/416). The interpreter does not establish SM70 rounding, launch
+safety or CUDA-graph behavior. The second checks when the runtime uses the
+scorer.
 
-The [Triton interpreter](https://triton-lang.org/main/programming-guide/chapter-3/debugging.html)
-executes on the CPU. Passing these checks does not establish SM70 rounding,
-launch safety, physical key traffic or CUDA graph correctness. Zero-width scores
-get deterministic visibility from the builder; the paged GPU zero-width metadata
-is unspecified, so that case is not a GPU comparison gate.
+## SM70 checks
 
-## Deferred GPU checks
-
-During a separately approved SM70 window, with the paged runtime matching this
-checkout and the native exact top-k extension installed:
+On one SM70 GPU, with the native exact top-k extension installed:
 
 ```bash
-.venv/bin/python tests/kernels/qsa_request_segments_gpu.py \
-  --out qsa-segment-gpu-results.json
+.venv/bin/python tests/kernels/qsa_request_segments_gpu.py --out kernel.json
+.venv/bin/python tests/kernels/qsa_request_segments_select_gpu.py --out select.json --time
 ```
 
-The prepared matrix has 36 cases: C1/M8, C4/M16, C4/M20, C8/M40 at
-32768/131072/262144 tokens, with segment limits 1/4/8. It captures the actual
-paged call and candidate including the builder. Replay changes queries, keys,
-page tables, positions, lengths, request runs and active descriptor counts.
-Scores must match FP32 words, visibility and exact top-512 IDs. Guard storage
-surrounds all three candidate buffers. The runner fails on any difference and
-records no performance claim. Synthetic C8 long-context scorer inputs do not
-establish engine admission. Use Compute Sanitizer and allocation/host-readback
-instrumentation separately; guard values alone do not prove memory safety.
+`qsa_request_segments_gpu.py` runs 36 kernel cases (C1/M8, C4/M16, C4/M20,
+C8/M40 at 32768/131072/262144 tokens, segment limits 1/2/4) against the paged
+scorer, eagerly and through CUDA graphs replayed after the queries, keys, page
+tables, positions, lengths and request runs change. FP32 score words, visible
+lengths and exact top-512 IDs must match; guard storage surrounds the buffers.
 
-After correctness, alternate full scorer-plus-selection timings at identical
-contexts, power, clocks and cache conditions. Include the builder, fixed empty
-slots and every launch. Metadata storage is 16*M bytes (descriptors 12*M plus
-visibility 4*M), in addition to `4*M*columns` score bytes; do not double-count
-visibility already needed by the baseline. The fixed score grid launches
-`M*ceil(columns/64)` programs, even for unused descriptor slots. At M40 the
-shipped paged baseline already groups eight tiles and has a smaller grid.
-Neither source-level load reuse nor interpreter time proves a speedup. Engine
-C4/C8, offload and long-context acceptance comes after scorer qualification.
+`qsa_request_segments_select_gpu.py` runs `qsa_select_paged_tokens` with the
+variable off and on and compares the selected token indices: decode batches,
+one row per request, ragged rows, a prefill chunk next to decode rows (with and
+without the host request split), two logits chunks and CUDA-graph padding rows.
+It also checks which batches use the scorer. `--time` adds the graph replay
+time of the whole selection (scoring, top-512, expansion).
+
+Measured on a V100-PCIE-32GB at 250 W, whole selection per layer, new / paged:
+4 requests x 4 rows 0.39-0.40, 4 x 5 rows 0.47-0.50, 8 x 4 rows 0.32-0.36,
+8 x 5 rows 0.49-0.55 (32K-256K tokens); one row per request 0.97-1.15, which is
+why those batches keep the paged scorer.

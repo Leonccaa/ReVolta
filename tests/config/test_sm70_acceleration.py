@@ -17,7 +17,12 @@ def config(monkeypatch):
     envs.disable_envs_cache()
     # Other operator tests may monkeypatch a dynamic env attribute. Remove
     # their restored concrete values so this fixture exercises actual getters.
-    for name in _SM70_DFLASH2_VERIFIER_DEFAULTS:
+    # monkeypatch.setattr reads the old value with getattr, so undoing a patch of
+    # a name that vllm/envs.py resolves lazily through module __getattr__ leaves a
+    # concrete attribute behind, and that shadow hides the getter from every later
+    # test in the process. Drop every shadowed declared name, not only the
+    # verifier defaults, so these reports never depend on another file's leftovers.
+    for name in [k for k in dict(vars(envs)) if k in envs.environment_variables]:
         monkeypatch.delitem(vars(envs), name, raising=False)
     for name, value in {
         **_SM70_BATCH_GEMM_DEFAULTS,
@@ -141,6 +146,34 @@ def test_five_speculative_tokens_reason(config):
     config.speculative_config.num_speculative_tokens = 5
     assert acc.build_report(config)["paths"]["dflash2_verifier"]["reason"] == (
         "contract_mismatch:num_speculative_tokens=5≠7"
+    )
+
+
+def test_other_target_model_is_not_applicable(config):
+    # #38: Flash-Next (hidden size 2560) with DFlash2 does not use the fused lane.
+    config.model_config.hf_text_config.hidden_size = 2560
+    assert acc.build_report(config)["paths"]["dflash2_verifier"]["reason"] == (
+        "not_applicable:hidden_size=2560≠5120"
+    )
+
+
+def test_other_drafting_method_is_not_applicable(config):
+    config.speculative_config.method = "mtp"
+    assert acc.build_report(config)["paths"]["dflash2_verifier"]["reason"] == (
+        "not_applicable:method=mtp≠dflash"
+    )
+    config.speculative_config = None
+    assert acc.build_report(config)["paths"]["dflash2_verifier"]["reason"] == (
+        "not_applicable:method=None≠dflash"
+    )
+
+
+def test_other_target_model_wins_over_configuration(config):
+    # A different model is reported as such even when its draft settings differ too.
+    config.model_config.hf_text_config.hidden_size = 2560
+    config.speculative_config.num_speculative_tokens = 5
+    assert acc.build_report(config)["paths"]["dflash2_verifier"]["reason"] == (
+        "not_applicable:hidden_size=2560≠5120"
     )
 
 
@@ -387,7 +420,14 @@ def test_flash_next_batch_memory_and_explicit_off(config, monkeypatch):
         monkeypatch.setenv(name, "0")
     report = acc.build_report(config)["flash_next_batch"]
     assert report["packed_weight_memory"]["total_bytes"] == 0
-    assert all(row["reason"] == "user_override" for row in report["controls"].values())
+    # Same requirement as all(row["reason"] == "user_override" ...), named by row
+    # so that a control which is still on shows up as {'NAME': None} on failure.
+    offenders = {
+        name: row["reason"]
+        for name, row in report["controls"].items()
+        if row["reason"] != "user_override"
+    }
+    assert offenders == {}
 
 
 def test_flash_next_memory_does_not_guess_other_tp_layout(config):

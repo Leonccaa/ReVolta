@@ -5,7 +5,7 @@ The release version is `RELEASE_VERSION` in `setup.py` (initially `0.1.0`).
 Set `VLLM_VERSION_OVERRIDE` for an exact wheel and runtime version, or pass
 `SETUPTOOLS_SCM_PRETEND_VERSION` to the Docker build. Inherited Git tags do not
 select the ReVolta version. Use a PEP 440 local version for private deployments,
-for example `0.1.3+deployment.20261025.g0123456789`.
+for example `0.1.4+deployment.20261025.g0123456789`.
 
 ## SM70 source build
 
@@ -15,7 +15,7 @@ Use CUDA 12.8; CUDA 13 cannot compile SM70. Limit parallelism to available memor
 NVCC thread per job are a conservative starting point on a 32 GB host.
 
 ```bash
-version=0.1.3
+version=0.1.4
 docker build --target build -f docker/Dockerfile \
   --build-arg torch_cuda_arch_list=7.0 \
   --build-arg max_jobs=4 --build-arg nvcc_threads=1 \

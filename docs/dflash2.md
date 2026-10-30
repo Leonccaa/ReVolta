@@ -9,7 +9,10 @@ Use this guide to replace MTP4 with DFlash2 and choose its settings. First prepa
 > Volta (SM70) GPUs, with V100 attention kernels and CUDA graphs for the drafter and the
 > verifier, in the 512K-context setup with prefix caching and CPU KV offload. On one
 > request it writes English code at up to **234 tokens/s instead of 180** with MTP4 (1.30×)
-> on community NVLink hardware. In 0.1.3, the GPU KV pool reaches **1.38 million tokens (2.63× at 512K)** with the recommended DFlash2 settings, and 1.54 million (2.94×) with state replay on. MTP4
+> on community NVLink hardware. With 0.1.4 and the recommended DFlash2 settings (probabilistic
+> drafting, state replay off) the GPU KV pool reaches **1.37 million tokens (2.61× at 512K)**;
+> with greedy drafting it is 1.38 million (2.63×), and the 0.1.3 measurement with state replay
+> on (greedy drafting) reached 1.54 million (2.94×). MTP4
 > stays the default: Chinese text and eight concurrent requests are still faster with MTP4.
 > [How to enable it](#enable-dflash2).
 
@@ -19,7 +22,9 @@ instead (tested revision `a22a1744`): 5 sliding-window layers, an 8-token block 
 2048-token window. It is off by default. Without a `dflash` speculative config, the KV
 cache layout, block size and MoE routes are the same as in 0.1.1.
 
-The configuration below describes 0.1.3. With 0.1.2, also set `VLLM_V2_CUDAGRAPH_MEM_MIB=1500`; its profile does not reserve enough memory for DFlash2's graphs.
+The configuration below is the recommended 0.1.4 configuration. With 0.1.2, also set
+`VLLM_V2_CUDAGRAPH_MEM_MIB=1500`; its profile does not reserve enough memory for DFlash2's
+graphs.
 
 ## Enable DFlash2
 
@@ -63,7 +68,7 @@ export VLLM_SM70_DFLASH2_FUSED_QKV_PACK=1
       "model": "/data/revolta/views/dflash2-512k",
       "num_speculative_tokens": 7,
       "attention_backend": "FLASH_ATTN_V100",
-      "draft_sample_method": "greedy",
+      "draft_sample_method": "probabilistic",
       "dflash_concurrency_drafts": {"4": 3, "5": 4},
       "sm70_dflash2": {"context_kv_graph": true, "context_pipeline": true,
         "verify_fastpath": true, "fused_gdn_metadata": true,
@@ -73,6 +78,11 @@ export VLLM_SM70_DFLASH2_FUSED_QKV_PACK=1
 
 In the startup log, the AWQ MoE line should read `grouped QPN decode admitted for 2..48
 rows (split=8, pack_rows=24, up to 2 row chunks)`.
+
+From 0.1.4, `"draft_sample_method": "probabilistic"` is the recommended setting for DFlash2:
+the drafter samples its proposals and the target accepts them with the standard rejection
+rule. `"greedy"` still works. MTP must stay `"greedy"`; see
+[Launch options](configuration.md#launch-options).
 
 ## Settings
 
@@ -122,7 +132,7 @@ GDN speculative state replay keeps two recurrent-state blocks per running reques
 ```
 
 - **Gain:** the GPU KV pool grew from 1,379,634 to 1,542,558 tokens (+11.8%; 2.63× to 2.94× maximum concurrency at 512K) on our 4 × V100 PCIe deployment. At eight concurrent 96K-token requests, peak KV use fell from 55% to 26%.
-- **Cost (0.1.4, measured in the same session):** about +0.44 ms per decoding step when the target samples (30.05 to 30.49 ms per step at one request, 30 replayed agent turns); with greedy decoding about 1–4% lower throughput at one to four requests and level at eight. Outputs were identical with replay on and off (24 of 24 greedy streams, 30 of 30 sampled turns).
+- **Cost (0.1.4, measured in the same session):** about +0.44 ms per decoding step with greedy drafting when the target samples (30.05 to 30.49 ms per step at one request, 30 replayed agent turns); with greedy decoding about 1–4% lower throughput at one to four requests and level at eight. Outputs were identical with replay on and off (24 of 24 greedy streams, 30 of 30 sampled turns). With probabilistic drafting, recommended from 0.1.4, the replay costs about 0.8 ms per step (six real agent sessions at one request, 250 W), with outputs identical to replay off.
 - **Who should use it:** deployments that run long contexts or several long requests at once and are limited by KV capacity. For single short requests, leave it off.
 - **CUDA graph:** with replay on, the replay after sampling runs as a CUDA graph (`"spec_state_replay_graph": true`, the default). Without it, the replay's launches cost about 5 ms per step with sampling, because sampling has already drained the GPU queue. One graph is captured per verify shape, the second time the shape runs; with the `{"4": 3, "5": 4}` width policy that is eight graphs (one to eight requests). Each capture takes 35–90 ms once, at the step that first meets the shape. The graphs added no measurable GPU memory (peak 31,564 MiB per GPU with them, 31,580 MiB without, in the same benchmark). With all eight captured, eight concurrent 96K-token requests completed without preemption at 27% peak KV use, and GPU memory peaked at 31,884 of 32,768 MiB per GPU.
 - Replay needs Model Runner V2, `--mamba-cache-mode align`, synchronous scheduling and no pipeline parallelism; elsewhere it stays off with a log line.
@@ -134,7 +144,7 @@ GDN speculative state replay keeps two recurrent-state blocks per running reques
   batch sizes.
 - English code and reasoning gain the most. Chinese is slower than MTP4 in almost every
   measured case: the drafter was trained on English. Very long prompts also favour MTP4.
-- With the recommended 0.1.3 settings (sharded selector codebooks, the new graph settings, state replay off), the measured GPU KV pool is 1,379,634 tokens, with a reported maximum concurrency of 2.63× at 512K; with state replay on it is 1,542,558 tokens (2.94×). The 0.1.2 DFlash2 configuration measured 1,268,831 tokens (2.42×); see [GPU KV capacity by method](performance.md#gpu-kv-capacity-by-method).
+- With the recommended 0.1.3 settings (sharded selector codebooks, the new graph settings, state replay off), the measured GPU KV pool is 1,379,634 tokens, with a reported maximum concurrency of 2.63× at 512K; with state replay on it is 1,542,558 tokens (2.94×). The 0.1.2 DFlash2 configuration measured 1,268,831 tokens (2.42×). In 0.1.4 with probabilistic drafting, the recommended setting, the pool is 1,366,121 tokens (2.61×); with greedy drafting it is unchanged at 1,379,634. See [GPU KV capacity by method](performance.md#gpu-kv-capacity-by-method).
 - On a replay of real agent sessions (one request at a time, sampling, long reasoning),
   DFlash2 and MTP4 were on par: 0.97× the MTP4 speed (95% interval 0.90–1.01). DFlash2
   was ahead on tool calls, answers and contexts up to 64K, and behind in reasoning, above

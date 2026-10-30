@@ -422,7 +422,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.use_custom_allreduce
             and ca_comm is not None
             and not ca_comm.disabled
-            and ca_comm.sm70_pcie_switch
+            # SM70 TP4 under a PCIe switch or on NVLink: the generic fused sum2
+            # pull is slower than the local sum plus ordinary all-reduce at every
+            # size without a sum2 push kernel (four V100-SXM2, all pairs NVLink,
+            # inside graphs: 13.1 against 5.9 us at 10 tokens, 32.7 against
+            # 19.8 us at 64 tokens).
+            and (ca_comm.sm70_pcie_switch or ca_comm.sm70_nvlink_tp4)
             and input_a.dtype == input_b.dtype == torch.float16
             and input_a.shape == input_b.shape
         ):

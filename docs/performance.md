@@ -9,7 +9,8 @@ Read the [hardware scope](known-limits.md) first; each group keeps its own versi
 
 Version and test conditions: the PCIe values use 0.1.2; the NVLink overview combines 0.1.2 and 0.1.1.
 See [DFlash2 against MTP4](#dflash2-against-mtp4), [Cold prefill](#cold-prefill) and
-[NVLink](#nvlink-community-result) for the per-group conditions.
+[NVLink](#nvlink-community-result) for the per-group conditions. The 0.1.4 release-gate
+speed comparison against 0.1.3 is in [Reference system, MTP4](#reference-system-mtp4).
 
 Best measured output speed in tokens/s, 512-token responses. The breakdown by speculative
 method (MTP4 and DFlash2) and prompt type is in [Performance](#performance).
@@ -26,7 +27,28 @@ method (MTP4 and DFlash2) and prompt type is in [Performance](#performance).
 
 ### Coming back to a document
 
-No ReVolta version is specified for this readback measurement; its request and cache conditions follow below.
+Measured on 0.1.4 with DFlash2 (recommended settings), Uncensored AWQ, E4M3 KV, 250 W,
+the pinned PLE table, a 7 GiB CPU pool and a disk tier on a local NVMe SSD. Each
+document was first computed cold. The CPU readback followed after the GPU prefix cache
+was cleared; the disk readback followed an engine restart with the page cache dropped.
+Both readbacks hit the whole cacheable prefix, and the disk readbacks gave the same
+64-token greedy output as the cold run.
+
+| Prompt tokens | Recomputed | From CPU memory | From NVMe after a restart |
+| ---: | ---: | ---: | ---: |
+| 32,768 | 10.12 s | 0.61 s | 1.47 s |
+| 99,000 | 31.88 s | 0.77 s | 2.93 s |
+| 131,072 | 42.43 s | 0.99 s | 3.77 s |
+
+Times are to the first token, one request at a time. The about 2.2–2.4 GB/s quoted in
+[KV offload modes](kv-offload.md) is the disk read rate inside the restore, not these
+stored bytes divided by these times. Eight more 32K-token documents
+gave 0.62–0.66 s from CPU memory and 1.41–1.46 s from NVMe for the first four of them.
+Four 32K-token documents read from NVMe at the same time after the restart took
+1.48–3.84 s each (median 2.67 s).
+
+An earlier measurement, with no ReVolta version recorded, under the request and cache
+conditions below:
 
 A cached 32K-token document answered a follow-up in **1.28 seconds from memory**,
 compared with **10.06 seconds when recomputed**. Both produced identical output.
@@ -39,8 +61,8 @@ compared with **10.06 seconds when recomputed**. Both produced identical output.
 | CPU memory + filesystem cache | 1.60 s |
 
 The request generated 64 tokens and reused 31,008 cached prompt tokens. A small GPU
-pool forced eviction. The filesystem tier was tested on a network filesystem;
-local SSD performance has not yet been measured.
+pool forced eviction. The filesystem tier in this earlier measurement was on a network
+filesystem.
 
 ### Quantization quality
 
@@ -65,7 +87,8 @@ Measured on our 4x V100 PCIe deployment with TP4 + DCP2, `--gpu-memory-utilizati
 
 | Format | Measured version | Method | GPU KV capacity, tokens | Maximum concurrency at 512K |
 | --- | --- | --- | ---: | ---: |
-| Uncensored AWQ g32 + E4M3 KV | 0.1.3 | DFlash2 recommended (state replay off) | **1,379,634** | **2.63×** |
+| Uncensored AWQ g32 + E4M3 KV | 0.1.4 | DFlash2 recommended (probabilistic drafting, state replay off) | **1,366,121** | **2.61×** |
+| Uncensored AWQ g32 + E4M3 KV | 0.1.3 / 0.1.4 | DFlash2, greedy drafting, state replay off | 1,379,634 | 2.63× |
 | Uncensored AWQ g32 + E4M3 KV | 0.1.3 | DFlash2 with state replay | 1,542,558 | 2.94× |
 | Uncensored AWQ g32 + E4M3 KV | 0.1.2 | DFlash2 | 1,268,831 | 2.42× |
 | Uncensored AWQ g32 + E4M3 KV | 0.1.2 / 0.1.3 | MTP4 | 1,153,143 | 2.20× |
@@ -79,14 +102,14 @@ Measured on our 4x V100 PCIe deployment with TP4 + DCP2, `--gpu-memory-utilizati
 | Standard NVFP4 + E4M3 KV | 0.1.2 / 0.1.3 | MTP4 | 1,250,448 | 2.39× |
 | Standard NVFP4 + E4M3 KV | 0.1.2 | DFlash2 | 1,337,745 | 2.55× |
 
-The 0.1.3 AWQ DFlash2 measurements include sharded selector codebooks (#9) and the 1200 MiB graph reserve with tail graphs off (#23), with state replay (#21) off (recommended) or on. The MTP4 rows marked 0.1.2 / 0.1.3 were remeasured unchanged on the 0.1.3 release image; the FP4-Local E4M3-draft row is a separate smoke with the `v1.1-base-b9ce18a6` scale pack. The FP16 KV, FP4-Local and NVFP4 DFlash2 values were measured on 0.1.2; they have not been remeasured with the 0.1.3 DFlash2 changes. The 0.1.2 AWQ DFlash2 measurements use a 1500 MiB graph reserve. INT8 target KV is not supported with DFlash2; current main rejects it during configuration even with a separate FP16 draft cache (#25).
+The 0.1.3 AWQ DFlash2 measurements include sharded selector codebooks (#9) and the 1200 MiB graph reserve with tail graphs off (#23), with state replay (#21) off (recommended) or on. The MTP4 rows marked 0.1.2 / 0.1.3 were remeasured unchanged on the 0.1.3 release image; the FP4-Local E4M3-draft row is a separate smoke with the `v1.1-base-b9ce18a6` scale pack. The FP16 KV, FP4-Local and NVFP4 DFlash2 values were measured on 0.1.2; they have not been remeasured with the 0.1.3 DFlash2 changes. The 0.1.2 AWQ DFlash2 measurements use a 1500 MiB graph reserve. INT8 target KV is not supported with DFlash2; 0.1.4 rejects it during configuration even with a separate FP16 draft cache (#33, fixes #25).
 
 ## Performance
 
 ### Reference system, MTP4
 
 Release configuration: Uncensored AWQ g32, E4M3 KV, TP4 + DCP2, MTP4, on the reference system.
-The first table records 0.1.0; the later release comparison follows below.
+The first table records 0.1.0; the release-to-release comparisons follow below.
 
 | Metric | 0.1.0 |
 | --- | ---: |
@@ -128,6 +151,17 @@ per concurrency level:
 | C2 | 170.7 | 169.4 |
 | C4 | 263.4 | 268.3 |
 | C8 | 389.3 | 390.4 |
+
+The 0.1.4 release gate measured MTP4 output against 0.1.3 on the reference system: two
+concurrent requests produced about 3% more output tokens per second, and the other MTP4
+levels were unchanged within 1% (#34). The gain comes from the MoE all-reduce no longer
+using the slow generic sum2 kernel at two and three requests behind a PCIe switch. MTP4
+output at two and three concurrent requests is therefore not bitwise identical to 0.1.3,
+because the summation order changed, while single-request output and DFlash2 output are
+unchanged. A repeated A/B measurement at three to five requests found DFlash2 within about
+2% per step of 0.1.3, with the same acceptance length. The best-of entries in
+[Speed](#speed) come from DFlash2 on the reference system and do not change: the MTP4
+values in these windows stay below them at every concurrency level shown.
 
 ### Cold prefill
 

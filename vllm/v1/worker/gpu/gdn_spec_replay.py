@@ -15,6 +15,16 @@ repeated per layer with an index table that maps
 so both states are the verifier's own. The align copies then move conv windows as
 before; recurrent states need only the boundary copy when the boundary is the last
 accepted position (``SPEC_STATE_REPLAY`` in ``mamba_align``).
+
+The replay processes only each request's accepted prefix. Both stored columns lie
+inside it (a boundary counts only strictly before the last accepted position), and
+the recurrent kernel computes token t from the start state and tokens 0..t alone,
+so the tokens after the last accepted one change nothing that is stored. Each
+verifier row becomes two sequences over the same recorded rows: the accepted
+prefix with the row's table, then the rejected tail with an all-padding table row,
+which the kernel leaves before reading any token. The launch keeps the verifier's
+inputs, token count and kernel constants; only the request count doubles, so a
+captured replay keeps static shapes.
 """
 
 import time
@@ -52,6 +62,9 @@ class GDNSpecReplayStep:
     # request (padded to the captured batch) and the GDN metadata tensors are
     # the builder's persistent buffers, so the replay can be graph-captured.
     full_graph: bool = False
+    # Replay each request's accepted prefix only (see the module docstring);
+    # False repeats every verifier token, as before 0.1.5.
+    accepted_prefix: bool = True
 
 
 def build_replay_state_indices(
@@ -107,6 +120,49 @@ def build_replay_state_indices(
     return table
 
 
+def split_replay_launch(
+    table: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    num_accepted: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The accepted-prefix launch for a verifier table (torch reference).
+
+    Verifier row r becomes sequences 2r (its first ``min(accepted, length)``
+    tokens, with row r of ``table``) and 2r + 1 (the rest of its tokens, with an
+    all-padding row). Rows without an accepted count (padding) keep no prefix.
+
+    Args:
+        table: ``build_replay_state_indices`` output ([num_reqs, columns]).
+        cu_seqlens: the verifier's cu_seqlens ([>= num_reqs + 1]).
+        num_accepted: tokens committed per speculative request, for verifier
+            rows 0..len(num_accepted) - 1.
+    Returns:
+        The state table ([2 * num_reqs, columns]) and cu_seqlens
+        ([2 * num_reqs + 1]) of the replay launch.
+    """
+    num_reqs = table.shape[0]
+    cu = cu_seqlens[: num_reqs + 1].to(torch.long)
+    lengths = cu[1:] - cu[:-1]
+    num_spec = num_accepted.numel()
+    keep = torch.zeros(num_reqs, dtype=torch.long, device=table.device)
+    keep[:num_spec] = torch.minimum(
+        num_accepted.to(torch.long).clamp(min=1), lengths[:num_spec]
+    )
+    split_cu = torch.empty(
+        2 * num_reqs + 1, dtype=cu_seqlens.dtype, device=cu_seqlens.device
+    )
+    split_cu[0::2] = cu.to(cu_seqlens.dtype)
+    split_cu[1::2] = (cu[:-1] + keep).to(cu_seqlens.dtype)
+    split_table = torch.full(
+        (2 * num_reqs, table.shape[1]),
+        PAD_SLOT_ID,
+        dtype=table.dtype,
+        device=table.device,
+    )
+    split_table[0::2] = table
+    return split_table, split_cu
+
+
 @triton.jit
 def _replay_state_table_kernel(
     table_ptr,
@@ -121,11 +177,15 @@ def _replay_state_table_kernel(
     block_table_stride,
     num_spec,
     block_size,
+    cu_seqlens_ptr,
+    split_cu_seqlens_ptr,
     NUM_COLUMNS: tl.constexpr,
     BLOCK_COLUMNS: tl.constexpr,
     PAD: tl.constexpr,
+    SPLIT: tl.constexpr,
 ):
-    # One program per verifier row: the same table as build_replay_state_indices.
+    # One program per verifier row: the same table as build_replay_state_indices,
+    # and with SPLIT the accepted-prefix launch of split_replay_launch.
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK_COLUMNS)
     base = tl.load(base_ptr + row * base_stride)
@@ -151,7 +211,53 @@ def _replay_state_table_kernel(
         # passed before it gets its prefix-cache block.
         vals = tl.where(cols == accepted - 1, base, vals)
         vals = tl.where(has_boundary & (cols == boundary_pos), dst.to(vals.dtype), vals)
-    tl.store(table_ptr + row * table_stride + cols, vals, mask=cols < NUM_COLUMNS)
+    if SPLIT:
+        # Sequence 2 * row: the accepted prefix with this row's columns;
+        # sequence 2 * row + 1: the rejected tail, all padding.
+        tl.store(
+            table_ptr + 2 * row * table_stride + cols, vals, mask=cols < NUM_COLUMNS
+        )
+        tl.store(
+            table_ptr + (2 * row + 1) * table_stride + cols,
+            tl.full([BLOCK_COLUMNS], PAD, tl.int32),
+            mask=cols < NUM_COLUMNS,
+        )
+        is_spec = batch_row >= 0
+        taken = tl.load(num_sampled_ptr + batch_row, mask=is_spec, other=0)
+        bos = tl.load(cu_seqlens_ptr + row).to(tl.int64)
+        eos = tl.load(cu_seqlens_ptr + row + 1).to(tl.int64)
+        keep = tl.minimum(tl.maximum(taken.to(tl.int64), 1), eos - bos)
+        keep = tl.where(is_spec, keep, 0)
+        if row == 0:
+            tl.store(split_cu_seqlens_ptr, bos)
+        tl.store(split_cu_seqlens_ptr + 2 * row + 1, bos + keep)
+        tl.store(split_cu_seqlens_ptr + 2 * row + 2, eos)
+    else:
+        tl.store(table_ptr + row * table_stride + cols, vals, mask=cols < NUM_COLUMNS)
+
+
+def _table_kernel_args(
+    *,
+    base_state_ids: torch.Tensor,
+    spec_rows: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    num_sampled: torch.Tensor,
+    num_computed_tokens: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+) -> tuple:
+    return (
+        base_state_ids,
+        base_state_ids.stride(0),
+        spec_rows,
+        idx_mapping,
+        num_sampled,
+        num_computed_tokens,
+        block_table,
+        block_table.stride(0),
+        spec_rows.numel(),
+        block_size,
+    )
 
 
 def build_replay_state_table(
@@ -179,21 +285,72 @@ def build_replay_state_table(
     _replay_state_table_kernel[(num_reqs,)](
         table,
         table.stride(0),
-        base_state_ids,
-        base_state_ids.stride(0),
-        spec_rows,
-        idx_mapping,
-        num_sampled,
-        num_computed_tokens,
-        block_table,
-        block_table.stride(0),
-        spec_rows.numel(),
-        block_size,
+        *_table_kernel_args(
+            base_state_ids=base_state_ids,
+            spec_rows=spec_rows,
+            idx_mapping=idx_mapping,
+            num_sampled=num_sampled,
+            num_computed_tokens=num_computed_tokens,
+            block_table=block_table,
+            block_size=block_size,
+        ),
+        # Unused without SPLIT.
+        table,
+        table,
         NUM_COLUMNS=num_columns,
         BLOCK_COLUMNS=triton.next_power_of_2(num_columns),
         PAD=PAD_SLOT_ID,
+        SPLIT=False,
     )
     return table
+
+
+def build_replay_prefix_launch(
+    *,
+    base_state_ids: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    num_reqs: int,
+    num_columns: int,
+    spec_rows: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    num_sampled: torch.Tensor,
+    num_computed_tokens: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``split_replay_launch(build_replay_state_table(...))`` in one launch.
+
+    Returns the state table ([2 * num_reqs, num_columns]) and cu_seqlens
+    ([2 * num_reqs + 1]) of the accepted-prefix replay; ``cu_seqlens`` is the
+    verifier's ([>= num_reqs + 1]), read on the device.
+    """
+    assert cu_seqlens.numel() > num_reqs and cu_seqlens.stride(0) == 1
+    device = base_state_ids.device
+    table = torch.empty((2 * num_reqs, num_columns), dtype=torch.int32, device=device)
+    split_cu = torch.empty(2 * num_reqs + 1, dtype=cu_seqlens.dtype, device=device)
+    if num_reqs == 0:
+        split_cu.copy_(cu_seqlens[:1])
+        return table, split_cu
+    _replay_state_table_kernel[(num_reqs,)](
+        table,
+        table.stride(0),
+        *_table_kernel_args(
+            base_state_ids=base_state_ids,
+            spec_rows=spec_rows,
+            idx_mapping=idx_mapping,
+            num_sampled=num_sampled,
+            num_computed_tokens=num_computed_tokens,
+            block_table=block_table,
+            block_size=block_size,
+        ),
+        cu_seqlens,
+        split_cu,
+        NUM_COLUMNS=num_columns,
+        BLOCK_COLUMNS=triton.next_power_of_2(num_columns),
+        PAD=PAD_SLOT_ID,
+        SPLIT=True,
+    )
+    return table, split_cu
 
 
 def _replay_launches(
@@ -205,26 +362,45 @@ def _replay_launches(
     num_computed_tokens: torch.Tensor,
     block_size: int,
 ) -> None:
-    tables: dict[tuple[int, int], torch.Tensor] = {}
+    launches: dict[tuple[int, int, int], tuple[torch.Tensor, torch.Tensor]] = {}
     for entry in step.layers:
         layer = entry.layer
-        key = (entry.group_id, entry.base_state_ids.data_ptr())
-        table = tables.get(key)
-        if table is None:
+        key = (
+            entry.group_id,
+            entry.base_state_ids.data_ptr(),
+            entry.cu_seqlens.data_ptr() if step.accepted_prefix else 0,
+        )
+        launch = launches.get(key)
+        if launch is None:
             # One launch per cache group (the torch reference took about 25).
-            table = build_replay_state_table(
-                base_state_ids=entry.base_state_ids,
-                num_reqs=step.num_reqs,
-                num_columns=layer._replay_slots + 1,
-                spec_rows=spec_rows,
-                idx_mapping=idx_mapping,
-                num_sampled=num_sampled,
-                num_computed_tokens=num_computed_tokens,
-                block_table=step.block_tables[entry.group_id],
-                block_size=block_size,
-            )
-            tables[key] = table
-        layer.replay_spec_states(table, entry.cu_seqlens, step.num_tokens)
+            if step.accepted_prefix:
+                launch = build_replay_prefix_launch(
+                    base_state_ids=entry.base_state_ids,
+                    cu_seqlens=entry.cu_seqlens,
+                    num_reqs=step.num_reqs,
+                    num_columns=layer._replay_slots + 1,
+                    spec_rows=spec_rows,
+                    idx_mapping=idx_mapping,
+                    num_sampled=num_sampled,
+                    num_computed_tokens=num_computed_tokens,
+                    block_table=step.block_tables[entry.group_id],
+                    block_size=block_size,
+                )
+            else:
+                table = build_replay_state_table(
+                    base_state_ids=entry.base_state_ids,
+                    num_reqs=step.num_reqs,
+                    num_columns=layer._replay_slots + 1,
+                    spec_rows=spec_rows,
+                    idx_mapping=idx_mapping,
+                    num_sampled=num_sampled,
+                    num_computed_tokens=num_computed_tokens,
+                    block_table=step.block_tables[entry.group_id],
+                    block_size=block_size,
+                )
+                launch = (table, entry.cu_seqlens)
+            launches[key] = launch
+        layer.replay_spec_states(launch[0], launch[1], step.num_tokens)
 
 
 def replay_gdn_spec_states(
@@ -253,11 +429,14 @@ def replay_graph_key(
 
     The per-layer recorded inputs and the GDN metadata tensors (running blocks,
     cu_seqlens) are persistent buffers in a FULL step; a graph replays only when
-    they are the same tensors it captured.
+    they are the same tensors it captured. The accepted-prefix launch reads the
+    verifier's cu_seqlens and the per-step accepted counts on the device, so its
+    shapes follow from num_reqs alone.
     """
     return (
         step.num_reqs,
         step.num_tokens,
+        step.accepted_prefix,
         block_size,
         num_computed_tokens.data_ptr(),
         tuple(t.data_ptr() for t in step.block_tables),
@@ -373,11 +552,13 @@ class GDNSpecReplayGraphs:
             )
         torch.accelerator.synchronize(device)
         logger.info(
-            "GDN replay graph captured: requests=%d tokens=%d layers=%d in %.1f ms, "
-            "allocator reserve %+.2f MiB (%d replay graphs).",
+            "GDN replay graph captured: requests=%d tokens=%d layers=%d "
+            "accepted_prefix=%s in %.1f ms, allocator reserve %+.2f MiB "
+            "(%d replay graphs).",
             step.num_reqs,
             step.num_tokens,
             len(step.layers),
+            step.accepted_prefix,
             1000 * (time.perf_counter() - start),
             (torch.accelerator.memory_reserved(device) - reserved_before) / (1 << 20),
             len(self.graphs) + 1,

@@ -513,6 +513,10 @@ class CustomAllreduce:
     sm70_pcie_switch = False
     sm70_pcie_switch_max_bytes = 0
     sm70_pcie_switch_graph_only = False
+    # SM70 TP4 NVLink group: all-reduce admission is unchanged, only sum2 takes
+    # the push-or-local-sum route. The class default keeps every other mode, and
+    # instances made without __init__ (tests), on the unchanged path.
+    sm70_nvlink_tp4 = False
 
     # max_size: max supported allreduce size
     def __init__(
@@ -649,6 +653,20 @@ class CustomAllreduce:
                 "(payload <= %d bytes, graph capture only: %s).",
                 self.sm70_pcie_switch_max_bytes,
                 self.sm70_pcie_switch_graph_only,
+            )
+        # The same condition that allocates and registers the SM70 TP4 push
+        # buffers below, so the sum2 push sizes really have a push kernel.
+        self.sm70_nvlink_tp4 = (
+            decision.mode == "nvlink"
+            and world_size == 4
+            and device_capability is not None
+            and device_capability.major == 7
+            and device_capability.minor == 0
+        )
+        if self.sm70_nvlink_tp4:
+            logger.info(
+                "SM70 NVLink TP4: sum2 uses its push kernel at the push sizes and "
+                "otherwise the local sum plus the ordinary all-reduce."
             )
         tp8_hierarchical = decision.mode == "tp8_hierarchical"
         hierarchical_peer_ranks = (
@@ -1446,7 +1464,7 @@ class CustomAllreduce:
     def can_sm70_tp4_push_sum2(self, inp: torch.Tensor) -> bool:
         return (
             not self.disabled
-            and self.sm70_pcie_switch
+            and (self.sm70_pcie_switch or self.sm70_nvlink_tp4)
             and self.world_size == 4
             and self.fully_connected
             and self.sm70_tp4_push_buffer_ptrs is not None
@@ -1463,7 +1481,7 @@ class CustomAllreduce:
         if self.disabled or not self.should_custom_ar(input_a):
             return None
         if (
-            self.sm70_pcie_switch
+            (self.sm70_pcie_switch or self.sm70_nvlink_tp4)
             and input_a.dtype == torch.float16
             and not self.can_sm70_tp4_push_sum2(input_a)
         ):

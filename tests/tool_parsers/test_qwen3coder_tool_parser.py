@@ -691,6 +691,69 @@ hello world
     assert args["obj_param"] == {"key": "value"}
 
 
+def test_large_integer_number_arguments_preserved(qwen3_tokenizer):
+    """Integers beyond 2**53 in `number` parameters keep their exact value.
+
+    Converting through float changed e.g. 9007199254740993 to 9007199254740992
+    without an error (vllm-project/vllm#55743), so a 64-bit ID declared as
+    `number` reached the tool with a different value.
+    """
+    tools = [
+        ChatCompletionToolsParam(
+            type="function",
+            function={
+                "name": "get_order",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "order_id": {"type": "number"},
+                        "account_id": {"type": ["number", "string"]},
+                        "offset": {"type": "number"},
+                        "ratio": {"type": "number"},
+                    },
+                },
+            },
+        )
+    ]
+    model_output = """<tool_call>
+<function=get_order>
+<parameter=order_id>
+9007199254740993
+</parameter>
+<parameter=account_id>
+-9223372036854775807
+</parameter>
+<parameter=offset>
+5.0
+</parameter>
+<parameter=ratio>
+0.25
+</parameter>
+</function>
+</tool_call>"""
+    expected = {
+        "order_id": 2**53 + 1,
+        "account_id": -(2**63 - 1),
+        "offset": 5,
+        "ratio": 0.25,
+    }
+    request = ChatCompletionRequest(model=MODEL, messages=[], tools=tools)
+
+    parser = Qwen3CoderToolParser(qwen3_tokenizer, tools=tools)
+    extracted = parser.extract_tool_calls(model_output, request=request)
+    assert json.loads(extracted.tool_calls[0].function.arguments) == expected
+
+    parser = Qwen3CoderToolParser(qwen3_tokenizer, tools=tools)
+    arguments = ""
+    for delta_message in stream_delta_message_generator(
+        parser, qwen3_tokenizer, model_output, request
+    ):
+        for tool_call in delta_message.tool_calls or []:
+            if tool_call.function and tool_call.function.arguments is not None:
+                arguments += tool_call.function.arguments
+    assert json.loads(arguments) == expected
+
+
 def test_extract_tool_calls_anyof_type_conversion(qwen3_tokenizer):
     """Test type conversion for anyOf/oneOf nullable schemas (Pydantic v2).
 

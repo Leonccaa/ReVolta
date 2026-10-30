@@ -6,13 +6,17 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm.v1.core.kv_cache_coordinator import KVCacheCoordinator
+from vllm.v1.core.kv_cache_coordinator import (
+    KVCacheCoordinator,
+    get_kv_cache_coordinator,
+)
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     MambaSpec,
+    SlidingWindowSpec,
 )
 from vllm.v1.structured_output import StructuredOutputManager
 
@@ -300,3 +304,146 @@ def test_periodic_retention_stops_at_all_retained_checkpoints():
 def test_dense_retention_still_materializes_every_checkpoint():
     length = 3 * MAMBA_BLOCK_SIZE + 30
     assert _chunk_ends(length, interval=None) == [816, 1632, 2448, length]
+
+
+# ---------------------------------------------------------------------------
+# DFlash2 keeps its own sub-page cache, so its EAGLE flag does not rewind the
+# recurrent state (r015). Retaining the unrewound replay boundary must not move
+# a single prefill stop of a cold DFlash2 prompt.
+# ---------------------------------------------------------------------------
+
+DFLASH_STATE_BLOCK = 1664
+DFLASH_DRAFT_BLOCK = 128
+# prompt length -> deepest cacheable boundary floor((n - 1) / 1664) * 1664
+DFLASH_PROMPTS = {32_768: 31_616, 99_000: 98_176, 131_072: 129_792}
+
+
+def _dflash2_coordinator(
+    *, drafter_block: int = DFLASH_DRAFT_BLOCK, use_eagle: bool = False
+):
+    """Target KV + align-mode state on one grid, EAGLE-flagged drafter window."""
+    groups = [
+        KVCacheGroupSpec(
+            ["target"],
+            FullAttentionSpec(
+                block_size=DFLASH_STATE_BLOCK,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["state"],
+            MambaSpec(
+                block_size=DFLASH_STATE_BLOCK,
+                shapes=((1,),),
+                dtypes=(torch.float32,),
+                mamba_cache_mode="align",
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["drafter"],
+            SlidingWindowSpec(
+                block_size=drafter_block,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                sliding_window=3 * drafter_block,
+            ),
+            is_eagle_group=True,
+        ),
+    ]
+    coordinator = get_kv_cache_coordinator(
+        KVCacheConfig(8, [], groups),
+        max_model_len=max(DFLASH_PROMPTS) + 1,
+        max_in_flight_tokens=8192,
+        use_eagle=use_eagle,
+        enable_caching=True,
+        enable_kv_cache_events=False,
+        dcp_world_size=1,
+        pcp_world_size=1,
+        hash_block_size=DFLASH_DRAFT_BLOCK,
+    )
+    coordinator.configure_prefix_cache_retention(0)
+    return coordinator
+
+
+def _prefill_stops(boundary_source, length: int, *, use_eagle: bool) -> list[int]:
+    """Chunk ends of a cold prompt, driven by the split under test."""
+    request = SimpleNamespace(
+        num_computed_tokens=0,
+        num_prompt_tokens=length,
+        num_tokens=length,
+        shared_prefix_boundary=0,
+    )
+    scheduler = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=DFLASH_DRAFT_BLOCK),
+        mamba_state_block_size=DFLASH_STATE_BLOCK,
+        mamba_state_retention_interval=0,
+        use_eagle=use_eagle,
+        kv_cache_manager=SimpleNamespace(coordinator=boundary_source),
+    )
+    ends = []
+    while request.num_computed_tokens < length:
+        remaining = length - request.num_computed_tokens
+        chunk = Scheduler._mamba_block_aligned_split(
+            scheduler, request, min(8192, remaining)
+        )
+        assert 0 < chunk <= min(8192, remaining)
+        request.num_computed_tokens += chunk
+        ends.append(request.num_computed_tokens)
+    return ends
+
+
+def _rewind_only_coordinator():
+    """The pre-fix rule: rewind because *some* group carries the EAGLE flag."""
+    coordinator = SimpleNamespace(eagle_group_ids={1})
+    coordinator.get_replay_boundaries = lambda request, block: (
+        KVCacheCoordinator.get_replay_boundaries(coordinator, request, block)
+    )
+    return coordinator
+
+
+def _state_lookbehind(coordinator) -> bool:
+    """The look-behind in force, also for a coordinator without the new flag."""
+    return getattr(
+        coordinator, "mamba_state_lookbehind", bool(coordinator.eagle_group_ids)
+    )
+
+
+@pytest.mark.parametrize("length,deepest", sorted(DFLASH_PROMPTS.items()))
+def test_dflash2_deeper_boundary_keeps_the_cold_prefill_stops(length, deepest):
+    coordinator = _dflash2_coordinator()
+    assert deepest in coordinator.get_replay_boundaries(
+        SimpleNamespace(num_tokens=length), DFLASH_STATE_BLOCK
+    )
+    assert _state_lookbehind(coordinator) is False
+    # DFlash2 does not rewind `last_cache_position` (use_eagle_kv_cache() is
+    # False for method="dflash"), so that boundary was already a chunk stop.
+    assert _prefill_stops(coordinator, length, use_eagle=False) == _prefill_stops(
+        _rewind_only_coordinator(), length, use_eagle=False
+    )
+    assert {deepest - DFLASH_STATE_BLOCK, deepest} <= set(
+        _prefill_stops(coordinator, length, use_eagle=False)
+    )
+
+
+def test_dflash2_cold_prefill_stops_are_pinned():
+    ends = _prefill_stops(_dflash2_coordinator(), 32_768, use_eagle=False)
+    assert ends == [6656, 13312, 19968, 26624, 29952, 31616, 32768]
+
+
+@pytest.mark.parametrize("length,deepest", sorted(DFLASH_PROMPTS.items()))
+def test_page_granular_eagle_drop_keeps_the_cold_prefill_stops(length, deepest):
+    # MTP4-like: the flagged group's block is the whole checkpoint page, and
+    # the engine rewinds `last_cache_position`, so the last chunk crosses the
+    # deepest boundary. Both the boundary set and the stops stay as they were.
+    coordinator = _dflash2_coordinator(drafter_block=DFLASH_STATE_BLOCK, use_eagle=True)
+    assert _state_lookbehind(coordinator) is True
+    assert _prefill_stops(coordinator, length, use_eagle=True) == _prefill_stops(
+        _rewind_only_coordinator(), length, use_eagle=True
+    )
+    assert deepest - DFLASH_STATE_BLOCK in _prefill_stops(
+        coordinator, length, use_eagle=True
+    )
+    assert deepest not in _prefill_stops(coordinator, length, use_eagle=True)

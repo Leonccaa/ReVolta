@@ -18,15 +18,34 @@ values override the profile.
 
 The engine selects the interconnect automatically and logs `SM70 interconnect=<mode>`.
 P2P uses custom all-reduce for messages up to 80 KiB inside CUDA graphs; other
-collectives use NCCL. Override with `VLLM_SM70_INTERCONNECT=auto|pex|nccl|nvlink`
+collectives use NCCL. On an SM70 TP4 group (under one PCIe switch, or on NVLink) the MoE
+output sum (sum2) uses its own push kernel at the sizes that have one and otherwise adds
+locally before the ordinary all-reduce. Override with `VLLM_SM70_INTERCONNECT=auto|pex|nccl|nvlink`
 or disable custom all-reduce with `--disable-custom-all-reduce`.
 
 ## Launch options
 
-- **`draft_sample_method` must be `greedy`.** A probabilistic draft corrupts output
-  above `max_num_seqs=2` at temperature > 0 (upstream 1Cat-vLLM issue #656). This
-  setting is about draft verification only; clients can still use any sampling
-  parameters.
+- **`draft_sample_method`: `greedy` for MTP, `probabilistic` for DFlash2.** With MTP, a
+  probabilistic draft corrupts output above `max_num_seqs=2` at temperature > 0
+  (upstream 1Cat-vLLM issue #656), so MTP must stay `greedy`. For DFlash2, `probabilistic`
+  is the recommended setting from 0.1.4; it was validated in the 0.1.4 release gate at one
+  to eight concurrent requests, at temperature 1 with thinking, including tool calls and
+  structured output. `greedy` still works with DFlash2. This setting is about drafting and
+  draft verification only; clients can still use any sampling parameters.
+- **`--watchdog-config` (opt-in stack-dump watchdog, from 0.1.4, #33).** JSON with three
+  fields: `dump_dir` (directory for the dump files; the empty default disables the
+  watchdog), `timeout` (seconds without progress after which the process counts as stuck,
+  default 300, must be greater than 0) and `check_interval` (seconds between checks,
+  default 10). Example:
+  `--watchdog-config '{"timeout": 300, "check_interval": 10, "dump_dir": "/data/revolta/dumps"}'`.
+  When enabled it runs a background thread in the engine core process (`engine_<dp_rank>`)
+  and in each worker (`worker_<rank>`); if that process makes no progress for `timeout`
+  seconds it appends a numbered dump of all its Python thread stacks to
+  `<dump_dir>/VLLM_STACK_DUMP_for_<name>_<pid>.log`, at most once per stall, and logs
+  `[Watchdog]Dumped stack to ...`. The engine core also dumps its stacks on SIGTERM.
+  Waiting for incoming work does not count as a stall: the timeout window restarts when
+  the process resumes. This is a diagnostic aid, not a recovery mechanism: the process is
+  not restarted or killed.
 - **`--gpu-memory-utilization 0.95`** passed the full gate, including the multimodal
   stress test with 8 concurrent requests. Higher values ran out of memory in earlier
   multimodal stress tests. If you change concurrency or media limits, measure again.
@@ -36,10 +55,12 @@ or disable custom all-reduce with `--disable-custom-all-reduce`.
 - `cpu_bytes_to_use` is the total for all four workers (48 GiB = 12 GiB per worker).
 - **Keep `--limit-mm-per-prompt` on V100.** With FlashAttention-V100, the engine allows
   1 image and no video per request without it, and a value that leaves out `"video"`
-  disables video. 0.1.3 keeps this V100 default. `{"image": 16, "video": 1}`
+  disables video. 0.1.4 keeps this V100 default. `{"image": 16, "video": 1}`
   keeps the reference deployment's limits; Qwen3.8 Flash-Next takes images and video,
   not audio, so no audio limit is set. To use the generic image count instead, set
-  `--limit-mm-per-prompt '{"image": 8, "video": 1}'`; a lower image count leaves more
+  `--limit-mm-per-prompt '{"image": 8, "video": 1}'` (the inherited generic default is
+  8 images, 1 video and 1 audio item, and the audio field is left out here because this
+  model has no audio input); a lower image count leaves more
   host memory for bursts of large images. Large images are resized
   either way (see [Support and known limits](known-limits.md)).
 - `--structured-outputs-config '{"backend": "xgrammar"}'` pins the structured-output
@@ -73,8 +94,8 @@ client settings. Qwen recommends:
 - `top_k` and `min_p` are not standard OpenAI fields. With the OpenAI Python SDK, pass them
   in `extra_body`.
 - These are the model vendor's values. The [speed tests](performance.md) use
-  `temperature=0`. The greedy `draft_sample_method` in the launch command applies only to
-  draft verification, not to these request settings.
+  `temperature=0`. The `draft_sample_method` in the launch command applies only to
+  drafting and draft verification, not to these request settings.
 
 ## YaRN and native context
 
@@ -99,9 +120,15 @@ embedding table uses about 47.7 GiB of pinned host memory even with KV offload d
 | 128 GiB | Off, or 48 GiB CPU pool | Full acceptance passed |
 | 80 GiB | Off | Memory stress passed; full acceptance not run |
 | 64 GiB | Off | Out of memory during startup |
+| 64 GiB, whole PLE table on disk (experimental) | Off, or 32 GiB CPU pool | Served; greedy output matched the pinned path (0.1.4) |
+| 32 GiB, whole PLE table on disk (experimental) | Off | Served; greedy output matched the pinned path (0.1.4) |
 
-80 GiB is the smallest tested limit that passed memory stress, without full acceptance. With less than 128 GiB,
-reduce or disable the CPU KV pool.
+With the default pinned PLE table, 80 GiB is the smallest tested limit that passed memory
+stress, with KV offload off and without full acceptance. With less than 128 GiB,
+reduce or disable the CPU KV pool. The experimental whole-table PLE disk option
+([Support and known limits](known-limits.md)) keeps the table on a local SSD instead and
+brings the tested minimum down to 32 GiB; single-request decoding is about 23–25% slower
+and a cold first token takes 1.6–2.3 times as long.
 
 Image and video preprocessing also uses host memory, in the API server process. In one
 test, 8 concurrent requests with 8 different 2048-pixel images each used about 33 GB at

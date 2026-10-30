@@ -3,23 +3,29 @@
 This reference lists the tested support scope and known limitations. Check it before
 using the [launch tutorial](getting-started.md) or changing hardware, formats or request limits.
 
+ReVolta is designed for four or more V100 32 GB GPUs and validated on four. NVLink, or
+all GPUs under one PCIe switch with P2P, are the recommended and tested interconnects.
+
 The reference system uses four V100 32 GB PCIe cards behind one PCIe switch
 (PIX/PXB in `nvidia-smi topo -m`), with P2P enabled and a 128 GiB container memory limit.
+
+## Support matrix
 
 | Configuration | Test status |
 | --- | --- |
 | 4 × V100 32 GB PCIe, TP4 + DCP2, P2P | Full acceptance passed on the reference configuration |
 | P2P disabled on the same machine | Correct output; about 30–55% of P2P throughput |
-| 4 × V100-SXM2 32 GB, NVLink (NV2 mesh) | Community test by [@jttdev](https://github.com/jttdev) ([#2](https://github.com/Leonccaa/ReVolta/issues/2)): speed, retrieval to about 490K tokens, vision. Not part of our release gate |
+| 4 × V100-SXM2 32 GB, NVLink | Tested by the community: [@jttdev](https://github.com/jttdev) ([#2](https://github.com/Leonccaa/ReVolta/issues/2)): speed, retrieval to about 490K tokens, vision; also [#38](https://github.com/Leonccaa/ReVolta/issues/38) and [#37](https://github.com/Leonccaa/ReVolta/issues/37) |
 | V100 16 GB, other GPU counts | Not yet tested |
 
 **Full acceptance on the reference setup:** default Uncensored AWQ, Standard NVFP4,
 and FP4-Local with their documented settings. Base AWQ has quality measurements.
-80 GiB RAM has memory-stress results. Disk caching has readback results; its full
-release gate passed with an 8 GiB CPU pool and a 40 GiB disk budget.
+32 GiB RAM served with the experimental whole-table PLE disk option below; 80 GiB RAM
+has memory-stress results for the default pinned PLE table with KV offload off. Disk caching
+has readback results; its full release gate passed with an 8 GiB CPU pool and a 40 GiB
+disk budget.
 
-V100 16 GB, TP2/TP8, and other models have not been tested. NVLink has a community
-test ([#2](https://github.com/Leonccaa/ReVolta/issues/2)) but is not part of our release gate.
+V100 16 GB, TP2/TP8, and other models have not been tested.
 This release builds SM70 only; other GPU architectures, ROCm, CPU, XPU, TPU, and
 GGUF are outside the build.
 
@@ -37,21 +43,23 @@ GGUF are outside the build.
   build retrieved 20/20 needles at 489K. At 512K, the test covers capacity and the
   input/output boundary.
 - **Memory.** The default GPU utilization of 0.95 passed multimodal stress. Retest
-  memory use when changing concurrency or media limits. By default the AWQ PLE
-  table needs about 48 GiB of host memory; see the experimental disk option below.
+  memory use when changing concurrency or media limits. By default the AWQ PLE table
+  needs about 48 GiB of pinned host memory, and 80 GiB is the smallest tested limit that
+  passed memory stress on that path with KV offload off. The experimental disk option
+  below served under a 32 GiB limit.
 - **PLE cascade.** Cascade (`ple_disk_cascade=true`) spills the part of the PLE table
   that does not fit in host memory to the checkpoint files. It is not supported yet
   and is off by default in the ReVolta profile; full support is planned for 0.2.
   Profiling with it enabled used about 4 GiB more GPU memory per 32 GB card, which
   left room for about 345K context tokens.
-- **Whole PLE table on disk (experimental; first checked in 0.1.3).** Instead of pinned host memory, the
+- **Whole PLE table on disk (experimental; first checked in 0.1.3, measured in 0.1.4).** Instead of pinned host memory, the
   whole table can stay as file-backed mappings of the checkpoint's safetensors files,
   read by a separate PLE process. This is a different path from cascade and is off by
   default. To try it, set `VLLM_PLE_CPU_OFFLOAD=1`, `VLLM_PLE_DISK_OFFLOAD=1` and
   `VLLM_SM70_QWEN38_HYBRID_PLE=0`, add `--safetensors-load-strategy lazy`, keep
-  `"ple_disk_cascade": false` in `--kernel-config` (the check also set
-  `"ple_disk_release_pages": true`), and run without CPU KV offload
-  (`--kv-transfer-config`); that combination was not tested.
+  `"ple_disk_cascade": false` in `--kernel-config` (the checks also set
+  `"ple_disk_release_pages": true`). CPU KV offload (`--kv-transfer-config`) can stay
+  on; 0.1.4 measured it with a 32 GiB CPU pool.
     - Checked on the 0.1.3 candidate with Uncensored AWQ and E4M3 KV: MTP4 served
       131K-token prompts, 4 concurrent requests and images under both a 64 GiB and a
       32 GiB container memory limit, and a 491K-token prompt under 64 GiB; DFlash2
@@ -62,9 +70,21 @@ GGUF are outside the build.
       single-request outputs diverged at a near-tie, so the two paths are not bitwise
       identical. If the PLE process dies, the client gets an error after about 9 s and
       the engine exits after 11–13 s instead of hanging.
-    - Not measured: decode speed and time to first token, a machine with little
-      physical RAM, a local SSD (the check read the checkpoint from network storage),
-      and the net memory saving against the default path.
+    - Measured on 0.1.4 with DFlash2 (recommended settings), Uncensored AWQ, E4M3 KV and
+      250 W, with the table read from a local NVMe or SATA SSD. Under a 64 GiB limit
+      (NVMe and SATA), a 32 GiB limit (NVMe), and a 64 GiB limit with a 32 GiB CPU KV
+      pool (NVMe and SATA), the engine started and served without running out of memory,
+      and three 64-token greedy outputs matched the pinned-memory path exactly.
+      Single-request decoding was 101.5–104.9 tokens/s against 135.5 with the pinned
+      table, about 23–25% slower. A cold first token took 5.4–5.9 / 16.8–17.9 /
+      65.6–69.8 s at 8K / 32K / 131K prompt tokens, against 2.61 / 9.66 / 40.40 s, so
+      1.6–2.3 times as long; once the table pages for a prompt had been read, the first
+      token was within 2–3% of the pinned path (5–8% with the 32 GiB CPU KV pool). NVMe
+      and SATA, and the 32 and 64 GiB limits, differed little. Peak memory of the
+      serving container was about 57 GiB under the 64 GiB limit (62 GiB with the CPU KV
+      pool) and 30 GiB under 32 GiB.
+    - Not measured: a machine with little physical RAM (the limits above were set on the
+      container that runs the engine), and long-running stability on this path.
 - **FP4-Local vision.** Keep the default vision-tower TP4. Forcing data parallelism
   removes the tested memory arrangement. Non-empty request-level
   `mm_processor_kwargs` and `media_io_kwargs` are rejected with HTTP 400 by
@@ -86,6 +106,11 @@ GGUF are outside the build.
   `required` parse can still report `finish_reason="tool_calls"`. Stop tokens inside
   JSON strings and very large parallel-call deltas remain problematic; strict native
   XML structural tags remain deferred.
+- **Anthropic endpoint.** On `/v1/messages`, a response that `max_tokens` cuts inside a
+  tool call streams the partial `tool_use` input, but a non-streaming response returns no
+  `tool_use` block (0.1.4 known issue). `/v1/messages` and `/v1/messages/count_tokens`
+  return HTTP 400 for a prompt longer than `--max-model-len` and HTTP 404 for a missing
+  model from 0.1.4 (#32); internal errors stay HTTP 500.
 - **Image placeholder text.** Text that contains the literal image placeholder
   `<|image_pad|>` can take the place of a real image in the same request. Upstream vLLM
   and HF behave the same (vllm-project/vllm#57740), and ReVolta follows them. Remove such tokens from

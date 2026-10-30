@@ -505,6 +505,22 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         "arithmetic": "FP16 MMA inputs; FP32 accumulation and scores",
         "fallback": "paged Triton indexer; multiple requests and other shapes",
     }
+    segments_reason = None
+    if not envs.VLLM_SM70_QSA_REQUEST_SEGMENTS:
+        segments_reason = "user_override"
+    elif not sm70:
+        segments_reason = "requires_SM70"
+    report["qsa_request_segments"] = {
+        "enabled": segments_reason is None,
+        "reason": segments_reason,
+        "scope": "configured_runtime_route",
+        "runtime_guards": (
+            "two or more requests, at least two rows per request on average, at "
+            "most 256 rows per logits chunk; FP16 Q and indexer K, H4, D128"
+        ),
+        "arithmetic": "bitwise equal to the paged Triton scorer",
+        "fallback": "paged Triton scorer; one request keeps shared-key and cuBLAS",
+    }
     sparse_policy = cfg.kernel_config.sm70_sparse
     report["sparse_kernel_policy"] = {
         "scope": "indexed_sparse_attention",

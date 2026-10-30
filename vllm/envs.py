@@ -353,6 +353,7 @@ if TYPE_CHECKING:
     VLLM_SM70_QWEN38_GDN_NO_PACK: bool = False
     VLLM_SM70_MTP_GDN_DIRECT_OUTPUT: bool = False
     VLLM_SM70_QSA_SHARED_KEY: bool = False
+    VLLM_SM70_QSA_REQUEST_SEGMENTS: bool = False
     VLLM_SM70_QSA_COMPACT_TOPK: bool = False
     VLLM_SM70_PLE_NGRAM_BATCH: bool = False
     VLLM_SM70_PLE_INPUT_PREPARE: bool = False
@@ -4589,6 +4590,32 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "kernel_config.sm70_qsa_shared_key): score M2..8 QSA "
             "verification queries of one request with the shared-key FP16 "
             "indexer (vllm._sm70_qsa_indexer_C)."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default=(
+            "False; ReVolta FP16 QSA SM70 TP4 profile sets '1' under "
+            "automatic_conditions."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/revolta_profile.py:apply_revolta_profile sets '1' when all "
+                "visible CUDA devices are SM70, selector metadata describes QSA, "
+                "activation dtype is FP16 and TP=4; explicit environment values win."
+            ),
+        ),
+        acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_QSA_REQUEST_SEGMENTS": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_QSA_REQUEST_SEGMENTS", "0"))),
+        description=(
+            "Score multi-request FP16 QSA batches (decode, at most 256 rows) "
+            "with the request-segmented paged scorer: each 64-key tile is "
+            "read once per segment of up to four rows of one request instead "
+            "of once per row. Scores and visible lengths are bitwise equal to "
+            "the paged scorer on SM70; single-request batches and batches "
+            "with fewer than two rows per request are unchanged."
         ),
         category="experimental",
         declared_default="False",
@@ -19682,6 +19709,11 @@ def compile_factors() -> dict[str, object]:
         # moe_forward_shared custom op at run time, so the traced graph does not
         # depend on it, and registering it must not recompile any deployment.
         "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_DFLASH_MAX_TOKENS",
+        # QSA scorer route for multi-request batches. It is chosen inside the
+        # qwen4_exp_qsa_with_output custom op at run time, so the traced graph
+        # does not depend on it, and registering it must not recompile any
+        # deployment.
+        "VLLM_SM70_QSA_REQUEST_SEGMENTS",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
         "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS",

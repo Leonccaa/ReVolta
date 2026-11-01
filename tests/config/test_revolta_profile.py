@@ -178,10 +178,13 @@ def test_incomplete_qsa_does_not_match_model_name(profile, field, bad):
     assert set(os.environ) <= {"PYTEST_CURRENT_TEST"}
 
 
-def test_qsa_sparse_layer_spelling_and_unrelated_name(profile):
+@pytest.mark.parametrize(
+    "layer_type", ["full_attention", "qwen_sparse_attention", "indexed_attention"]
+)
+def test_qsa_sparse_layer_spelling_and_unrelated_name(profile, layer_type):
     config = model()
     config.architectures = ["AnotherQSAModel"]
-    config.hf_text_config.layer_types = ["qwen_sparse_attention"]
+    config.hf_text_config.layer_types = [layer_type]
     assert profile.apply_revolta_profile(config, 4, is_sm70=True)
 
 
@@ -370,6 +373,7 @@ def run_engineargs_early_policy(profile, monkeypatch, apply, **engine_kwargs):
     # Execute the real early sequence, including the real MTP default method.
     import vllm.engine.arg_utils as arg_utils
 
+    monkeypatch.setattr(arg_utils, "get_model_path", lambda path, _revision: path)
     monkeypatch.setattr(
         arg_utils,
         "current_platform",

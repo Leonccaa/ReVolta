@@ -188,7 +188,7 @@ def has_qsa_capability(model_config: Any) -> bool:
     )
     values = [getattr(text, field, None) for field in fields]
     return all(isinstance(v, int) and v > 0 for v in values) and any(
-        kind in ("full_attention", "qwen_sparse_attention")
+        kind in ("full_attention", "qwen_sparse_attention", "indexed_attention")
         for kind in (getattr(text, "layer_types", None) or ())
     )
 

@@ -371,3 +371,74 @@ def test_rule_config_default_and_rejects_unknown():
     assert make({}).superseded_state_rule == "request"
     with pytest.raises(ValueError, match="superseded_state_rule"):
         make({"superseded_state_rule": "extend_all"})
+
+
+def test_extend_keeps_the_checkpoint_an_identical_resend_uses():
+    # 33,280-token prompt (exactly 20 blocks): hit at 31,616 (19 blocks), new
+    # state stored at 33,280 (block 19). An identical resend is capped at
+    # prompt_length - 1 = 33,279 and resumes from 31,616 (block 18), inside the
+    # protected tail, so extend must not demote it.
+    keys = [key(0, i) for i in range(21)]
+    req = SimpleNamespace(
+        group_states=(SimpleNamespace(offload_keys=keys, num_hit_blocks=19),),
+        req=SimpleNamespace(shared_prefix_boundary=0, num_prompt_tokens=20 * _BS),
+        req_context=CTX,
+        stored_state_blocks={0: {19}},
+    )
+    demoted, _ = _demoted("extend", req)
+    assert keys[18] not in demoted
+    assert demoted == []
+
+
+def _with_other(rule, finishing, other_hit_blocks, other_keys):
+    calls = []
+    manager = SimpleNamespace(demote=lambda keys, ctx: calls.append(list(keys)))
+    s = _rule_scheduler(rule, manager)
+    other = SimpleNamespace(
+        group_states=(
+            SimpleNamespace(offload_keys=other_keys, num_hit_blocks=other_hit_blocks),
+        )
+    )
+    s._req_status = {"finishing": finishing, "other": other}
+    s._demote_superseded_states(finishing)
+    return calls[0] if calls else []
+
+
+def test_extend_keeps_a_checkpoint_another_active_request_resumed_from():
+    # A and B both hit checkpoint E (block 18); no junction is recorded. A
+    # extends past it and finishes while B is still running.
+    a, keys = _req(23, 1, hit=19, stored=(21, 22))
+    assert keys[18] in _with_other("extend", a, 0, [])
+    a, keys = _req(23, 1, hit=19, stored=(21, 22))
+    demoted = _with_other("extend", a, 19, keys[:20])
+    assert keys[18] not in demoted
+    assert demoted == [keys[19]]
+
+
+def test_request_fixed_also_respects_other_requests_hit_states():
+    # B resumed from A's block 10 (e.g. a sibling branch): A's own range must
+    # not demote it under the new rules.
+    a, keys = _req(20, 5, hit=0, stored=(18, 19))
+    demoted = _with_other("request_fixed", a, 11, keys[:12])
+    assert keys[10] not in demoted and keys[9] in demoted
+
+
+def test_request_rule_unchanged_by_other_requests():
+    a, keys = _req(20, 5, hit=0, stored=(18, 19))
+    assert _with_other("request", a, 11, keys[:12]) == _demoted("request", a)[0]
+
+
+def test_extend_protects_the_shifted_resend_checkpoint_with_eagle():
+    # 23-block prompt (+100 tokens): resend checkpoint is block 22. Hit at 22
+    # blocks (state at block 21), new state stored at block 22. Without a
+    # shift block 21 may be demoted; with an EAGLE/MTP shift it is the usable
+    # resend state and must be kept.
+    req, keys = _req(23, 1, hit=22, stored=(22,))
+    assert keys[21] in _demoted("extend", req)[0]
+    calls = []
+    manager = SimpleNamespace(demote=lambda k, ctx: calls.append(list(k)))
+    s = _rule_scheduler("extend", manager)
+    s._eagle_state_shift = 1664
+    req, keys = _req(23, 1, hit=22, stored=(22,))
+    s._demote_superseded_states(req)
+    assert not calls or keys[21] not in calls[0]

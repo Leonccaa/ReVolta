@@ -1356,6 +1356,24 @@ class OffloadingConnectorScheduler:
     # superseded, but prefix hits and shared junctions still serve siblings.
     _KEEP_TAIL_STATE_BLOCKS = 3
 
+    def _hit_states_of_others(self, req_status: RequestOffloadState) -> set[OffloadKey]:
+        """Prefix-hit state keys of every other tracked request (exact-boundary
+        recurrent groups): checkpoints those requests resume from."""
+        keys: set[OffloadKey] = set()
+        for other in getattr(self, "_req_status", {}).values():
+            if other is req_status:
+                continue
+            for group_config in self.config.kv_group_configs:
+                if group_config.sliding_window_size_in_blocks != 1:
+                    continue
+                if not group_config.requires_exact_boundary_source:
+                    continue
+                group_state = other.group_states[group_config.group_idx]
+                hit = group_state.num_hit_blocks
+                if 0 < hit <= len(group_state.offload_keys):
+                    keys.add(group_state.offload_keys[hit - 1])
+        return keys
+
     def _demote_superseded_states(self, req_status: RequestOffloadState) -> None:
         """Demote the recurrent states this request made obsolete (soft: the
         CPU tier evicts them first; nothing is deleted).
@@ -1370,10 +1388,16 @@ class OffloadingConnectorScheduler:
           extend         request_fixed + the state at the hit point, once this
                          request stored a newer state past it: a continued
                          conversation no longer needs its previous end state
-        The junction (shared prefix) is never demoted.
+        The junction (shared prefix) is never demoted. Under request_fixed and
+        extend, neither is the prefix-hit state of another active request
+        (it may still need it, e.g. after preemption), and extend never
+        demotes this prompt's resend checkpoint: an identical resend is capped
+        at prompt_length - 1 and resumes from it (one block earlier with an
+        EAGLE/MTP shift).
         """
         rule = getattr(self.config, "superseded_state_rule", "request")
         keys: list[OffloadKey] = []
+        in_use = set() if rule == "request" else self._hit_states_of_others(req_status)
         for group_config in self.config.kv_group_configs:
             if group_config.sliding_window_size_in_blocks != 1:
                 continue
@@ -1401,14 +1425,24 @@ class OffloadingConnectorScheduler:
             demote = [b for b in range(hit, last - keep) if not is_junction(b)]
             if rule == "extend" and hit > 0:
                 stored = req_status.stored_state_blocks.get(group_config.group_idx)
+                # An identical resend is capped at prompt_length - 1 and
+                # resumes from this prompt's resend boundary; with an
+                # EAGLE/MTP shift the usable state is one block earlier.
+                resend = (req_status.req.num_prompt_tokens - 1) // (
+                    group_config.offloaded_block_size
+                ) - 1
+                resend_blocks = {resend}
+                if getattr(self, "_eagle_state_shift", None) is not None:
+                    resend_blocks.add(resend - 1)
                 if (
                     stored
                     and max(stored) >= hit
                     and hit - 1 < len(group_keys)
+                    and hit - 1 not in resend_blocks
                     and not is_junction(hit - 1)
                 ):
                     demote.append(hit - 1)
-            keys.extend(group_keys[b] for b in demote)
+            keys.extend(group_keys[b] for b in demote if group_keys[b] not in in_use)
         if keys:
             self.num_demoted_states = getattr(self, "num_demoted_states", 0) + len(keys)
             self.manager.demote(keys, req_status.req_context)

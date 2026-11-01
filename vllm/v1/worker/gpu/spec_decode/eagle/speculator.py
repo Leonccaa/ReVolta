@@ -10,6 +10,7 @@ import torch.nn as nn
 from vllm import envs
 from vllm.config import SpeculativeConfig, VllmConfig, get_layers_from_vllm_config
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed.parallel_state import GraphCaptureContext
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -149,7 +150,12 @@ class EagleSpeculator:
         self.prefill_cudagraph_manager: PrefillEagleCudaGraphManager | None = None
         self.decode_cudagraph_manager: DecodeEagleCudaGraphManager | None = None
 
-    def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
+    def init_cudagraph_manager(
+        self,
+        cudagraph_mode: CUDAGraphMode,
+        *,
+        capture_context: GraphCaptureContext | None = None,
+    ) -> None:
         cudagraph_mode = self.vllm_config.compilation_config.cudagraph_mode
         # Initialize cudagraph manager for draft prefill (draft position 0).
         self.prefill_cudagraph_manager = PrefillEagleCudaGraphManager(
@@ -178,6 +184,19 @@ class EagleSpeculator:
         # Share a single pool between prefill and decode since they never
         # execute concurrently.
         self.decode_cudagraph_manager.pool = self.prefill_cudagraph_manager.pool
+
+        # These routines execute serially in the runner. Share the capture
+        # stream's library workspaces while keeping target/draft graph pools
+        # separate so their live outputs cannot alias.
+        if self.prefill_cudagraph_manager.cudagraph_mode:
+            capture_context = (
+                capture_context or self.prefill_cudagraph_manager.get_capture_context()
+            )
+            for manager in (
+                self.prefill_cudagraph_manager,
+                self.decode_cudagraph_manager,
+            ):
+                manager.capture_context = capture_context
 
     def load_model(self, target_model: nn.Module) -> None:
         target_attn_layer_names = get_layers_from_vllm_config(

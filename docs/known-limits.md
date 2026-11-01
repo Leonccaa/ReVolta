@@ -29,6 +29,12 @@ V100 16 GB, TP2/TP8, and other models have not been tested.
 This release builds SM70 only; other GPU architectures, ROCm, CPU, XPU, TPU, and
 GGUF are outside the build.
 
+- **Qwen4Exp output gate metadata.** Transformers 5.20 resolves
+  `output_gate_type: null` to `hidden_act` (normally `silu`), not `sigmoid`.
+  ReVolta currently rejects an explicit `null` at model initialization; it must
+  not be rewritten to `sigmoid`. Use the checkpoint's actual gate activation.
+  ReVolta's legacy default for an omitted field remains `sigmoid`. Flash-Next
+  explicitly declares `sigmoid` and is unaffected.
 - **Output reproducibility.** A single request is reproducible bit for bit. When several
   requests are prefilled together, the result can differ from the same request run alone,
   so greedy outputs at C2–C8 can change between runs. The cause is the tensor-parallel

@@ -8,7 +8,7 @@ It is built for four or more V100 32 GB GPUs and validated on four. We recommend
 
 **You need:** four or more V100 32 GB GPUs (validated on four), on NVLink or with all GPUs under one PCIe switch with P2P; at least 32 GiB of system memory with the experimental whole-table PLE disk option (about 23–25% slower single-request decoding), 80 GiB with the default pinned PLE table, 128 GiB recommended; Linux x86-64 with glibc 2.34 or newer; and an NVIDIA driver for CUDA 12.8. Tested hardware and limits: [Support and known limits](docs/known-limits.md).
 
-Current release: [0.1.4](https://github.com/Leonccaa/ReVolta/releases/tag/v0.1.4).
+Current release: [0.1.5](https://github.com/Leonccaa/ReVolta/releases/tag/v0.1.5).
 
 ## At a glance
 
@@ -53,14 +53,14 @@ The package is `revolta`; the Python import and CLI remain `vllm`.
 ```bash
 python3.12 -m venv /data/revolta/venv
 . /data/revolta/venv/bin/activate
-pip install revolta==0.1.4
-vllm --version          # 0.1.4
+pip install revolta==0.1.5
+vllm --version          # 0.1.5
 ```
 
 Or pull the Docker image:
 
 ```bash
-docker pull ghcr.io/leonccaa/revolta:0.1.4
+docker pull ghcr.io/leonccaa/revolta:0.1.5
 ```
 
 Follow [Getting started](docs/getting-started.md) to download the pinned checkpoint,
@@ -98,10 +98,10 @@ ReVolta focuses on dependable daily service on V100. Releases check output corre
 long-context retrieval, concurrent use, multimodal input, cache recovery, and speed
 on the reference machine.
 
-Next (0.1.5): faster all-reduce on NVLink above 16 tokens per step, a cheaper DFlash2
-state replay, smaller DFlash2 CPU and disk cache pages, and a 512K long-context
-retrieval self-test. Also planned: faster INT8 KV decoding, simpler NVFP4 setup and
-INT8 disk caching. Longer-term work includes reducing host-memory use and
+Next (0.2): faster long-context decoding with several requests (request-segment QSA
+scoring, #59), a clean CPU KV offload shutdown (#51), and smaller DFlash2 CPU and disk
+cache pages. Also planned: faster INT8 KV decoding, simpler NVFP4 setup and INT8 disk
+caching. Longer-term work includes reducing host-memory use and
 runtime dependencies.
 
 ## Getting help

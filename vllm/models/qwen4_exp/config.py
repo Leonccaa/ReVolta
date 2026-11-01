@@ -24,6 +24,20 @@ class Qwen4ExpVisionConfig(Qwen3VLVisionConfig):
     model_type = "qwen4_exp"
     base_config_key = "vision_config"
 
+    def __init__(
+        self,
+        deepstack_visual_indexes: list[int] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        # Transformers 5.20 Qwen4ExpVisionModel has only the final merger.
+        # Retain explicit deepstack indexes from older checkpoint exports.
+        super().__init__(
+            deepstack_visual_indexes=(
+                [] if deepstack_visual_indexes is None else deepstack_visual_indexes
+            ),
+            **kwargs,
+        )
+
 
 class Qwen4ExpTextConfig(Qwen3NextConfig):
     model_type = "qwen4_exp_text"

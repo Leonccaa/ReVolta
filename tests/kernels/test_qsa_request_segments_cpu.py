@@ -15,6 +15,7 @@ import unittest
 from pathlib import Path
 from types import ModuleType
 from typing import Any, ClassVar
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -120,7 +121,8 @@ def launch_baseline(kernel, x, columns):
     out = torch.full((len(q), columns), float("nan"), device=q.device)
     visible = torch.empty(len(q), dtype=torch.int32, device=q.device)
     if columns and len(q):
-        kernel[(len(q), triton.cdiv(columns, 64))](
+        tiles_per_prog = 8 if len(q) > 32 else 1
+        kernel[(len(q), triton.cdiv(columns, 64 * tiles_per_prog))](
             q,
             k,
             table,
@@ -146,7 +148,7 @@ def launch_baseline(kernel, x, columns):
             HEAD_DIM=128,
             BLOCK_N=64,
             BLOCK_D=128,
-            TILES_PER_PROG=1,
+            TILES_PER_PROG=tiles_per_prog,
             STAGES=2,
             MAX_N=16,
             COMPRESS_RATIO=4,
@@ -258,6 +260,86 @@ class RequestSegmentTests(unittest.TestCase):
             x = inputs(columns=529, normal=True)
             x[4] = x[4].to(dtype)
             self.check_case(x, 529, check_oracle=False)
+
+    def test_tiles_per_program_and_grid(self):
+        # Pin both sides of the threshold and ceil division of a partial tile.
+        for m, tiles in ((16, 4), (32, 4), (33, 8), (40, 8), (64, 8)):
+            with self.subTest(m=m):
+                x = inputs((m,), columns=1025)
+                ws = self.mod.SegmentWorkspace.allocate(x[0], 1025)
+                with (
+                    patch.object(self.mod, "_build_segments"),
+                    patch.object(self.mod, "_segment_scores") as scorer,
+                ):
+                    self.mod.qsa_mqa_request_segments(*x, 4, ws)
+                scorer.__getitem__.assert_called_once_with(
+                    (m, triton.cdiv(1025, 64 * tiles))
+                )
+                self.assertEqual(
+                    scorer.__getitem__.return_value.call_args.kwargs["TILES_PER_PROG"],
+                    tiles,
+                )
+
+    def test_adaptive_tiles_bitwise_against_four_tiles_and_paged(self):
+        # Cross 256/512-key program boundaries, page tails and the top-512 cutoff.
+        # Contexts are uncompressed tokens, as in the runtime (compression = 4).
+        for widths, long_context in (
+            ((4,) * 4, 32768),
+            ((5,) * 8, 131072),
+            ((8,) * 8, 262144),
+        ):
+            for context in (128, 640, long_context):
+                with self.subTest(m=sum(widths), context=context):
+                    columns = context // 4 + 3
+                    x = inputs(widths, page=416, columns=columns, normal=True)
+                    x[5].fill_(context)
+                    x[4].copy_(
+                        torch.cat([torch.arange(context - w, context) for w in widths])
+                    )
+                    # A whole request with zero visible keys, plus inactive rows.
+                    # Most descriptor slots are empty even for the live requests.
+                    x[5][1] = 0
+                    if context == long_context:
+                        # Keep long tile loops on one request; inactive requests
+                        # still exercise the M-dependent launch and empty segments.
+                        x[5][1:] = 0
+                    x[4][-2:] = -1
+                    x[2][0, 0] = -1  # Invalid visible page must stay -inf.
+                    ws = self.check_case(x, columns, check_oracle=False)
+                    self.assertTrue((ws.descriptors[:, 1] == -1).any())
+                    self.assertTrue((ws.visible == 0).any())
+                    control = self.mod.SegmentWorkspace.allocate(x[0], columns)
+                    control.scores.fill_(float("nan"))
+                    kernel = self.mod._segment_scores
+
+                    def four_tile_grid(grid, kernel=kernel, columns=columns):
+                        def launch(*args, **kwargs):
+                            kwargs["TILES_PER_PROG"] = 4
+                            return kernel[(grid[0], triton.cdiv(columns, 64 * 4))](
+                                *args, **kwargs
+                            )
+
+                        return launch
+
+                    # Reproduce the pre-change scorer: change only its partition.
+                    with patch.object(self.mod, "_segment_scores") as scorer:
+                        scorer.__getitem__.side_effect = four_tile_grid
+                        self.mod.qsa_mqa_request_segments(*x, 4, control)
+                    self.assertTrue(torch.equal(ws.visible, control.visible))
+                    self.assertTrue(torch.equal(ws.descriptors, control.descriptors))
+                    # Also compare untouched NaN padding as raw words.
+                    self.assertTrue(
+                        torch.equal(
+                            ws.scores.view(torch.int32),
+                            control.scores.view(torch.int32),
+                        )
+                    )
+                    self.assertTrue(
+                        torch.equal(
+                            top512(ws.scores, ws.visible),
+                            top512(control.scores, control.visible),
+                        )
+                    )
 
     def test_zero_columns_and_empty_queries(self):
         self.check_case(inputs(columns=1), 0)

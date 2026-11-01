@@ -29,10 +29,6 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
-# 64-key tiles per program. More than one keeps the pipelined loop (one constant
-# iteration spills); 4 also cuts the programs that start past a request's visible
-# length.
-_TILES_PER_PROG = 4
 # Rows per segment: four rows fill the 16 dot lanes; eight (two query blocks) spill on
 # SM70.
 SEGMENT_ROWS = (1, 2, 4)
@@ -301,7 +297,11 @@ def qsa_mqa_request_segments(
             num_warps=4,
         )
         if columns:
-            _segment_scores[(m, triton.cdiv(columns, 64 * _TILES_PER_PROG))](
+            # Match the paged scorer's 8 tiles for M > 32 to avoid twice as many
+            # CTAs, including empty slots. Keep 4 for smaller batches: a single
+            # constant iteration spills on SM70. Each tile's arithmetic is unchanged.
+            tiles_per_prog = 8 if m > 32 else 4
+            _segment_scores[(m, triton.cdiv(columns, 64 * tiles_per_prog))](
                 q,
                 cache,
                 table,
@@ -320,7 +320,7 @@ def qsa_mqa_request_segments(
                 PAGE_SIZE=cache.shape[1],
                 TABLE_WIDTH=table.shape[1],
                 MAX_ROWS=max_rows,
-                TILES_PER_PROG=_TILES_PER_PROG,
+                TILES_PER_PROG=tiles_per_prog,
                 STAGES=2,
                 num_warps=2,
             )

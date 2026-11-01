@@ -299,6 +299,10 @@ class Scheduler(SchedulerInterface):
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
             prefix_cache_retention_interval=self.cache_config.prefix_cache_retention_interval,
+            partial_prefix_cache=self.cache_config.partial_prefix_cache,
+            partial_prefix_cache_max_fraction=(
+                self.cache_config.partial_prefix_cache_max_fraction
+            ),
         )
         # Adapted from vLLM #44560, #57104 and #59880. Mamba managers already
         # include their speculative states. Fixed ring/tail and cross-attention
@@ -492,6 +496,29 @@ class Scheduler(SchedulerInterface):
             - request.num_output_placeholders,
         )
 
+    @staticmethod
+    def _resolve_partial_prefix_hit(
+        request: Request,
+        partial_blocks: KVCacheBlocks,
+        partial_tokens: int,
+        ext_tokens: int,
+        load_kv_async: bool,
+    ) -> tuple[KVCacheBlocks, int, int, bool]:
+        """Choose between a local partial prefix hit and an external load.
+
+        The connector was asked from the block-aligned hit ``A`` the partial
+        entry extends. Its loads are whole blocks, so they cannot follow a hit
+        that ends inside a block: keep the partial hit and drop the external
+        tokens unless ``A + external`` reaches further, in which case fall back
+        to the block-aligned hit and load.
+        """
+        aligned_blocks, aligned_tokens = request.partial_prefix_fallback
+        request.partial_prefix_fallback = None
+        if ext_tokens and aligned_tokens + ext_tokens > partial_tokens:
+            request.partial_prefix_entry = None
+            return aligned_blocks, aligned_tokens, ext_tokens, load_kv_async
+        return partial_blocks, partial_tokens, 0, False
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -567,6 +594,11 @@ class Scheduler(SchedulerInterface):
                     getattr(request, "shared_prefix_boundary", 0)
                     // block_size
                     * block_size,
+                    *(
+                        self.kv_cache_manager.partial_prefix_stops(request, start, end)
+                        if getattr(self.kv_cache_manager, "partial_cache", None)
+                        else ()
+                    ),
                 )
                 if start < stop < end
             ),
@@ -1092,9 +1124,15 @@ class Scheduler(SchedulerInterface):
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
+                        # A partial prefix hit ends inside a block; connectors
+                        # load whole blocks, so ask from the block-aligned hit.
+                        partial_fallback = request.partial_prefix_fallback
                         ext_tokens, load_kv_async = (
                             self.connector.get_num_new_matched_tokens(
-                                request, num_new_local_computed_tokens
+                                request,
+                                num_new_local_computed_tokens
+                                if partial_fallback is None
+                                else partial_fallback[1],
                             )
                         )
                         if request.skip_reading_prefix_cache:
@@ -1107,6 +1145,19 @@ class Scheduler(SchedulerInterface):
                             request_queue.pop_request()
                             step_skipped_waiting.prepend_request(request)
                             continue
+                        if partial_fallback is not None:
+                            (
+                                new_computed_blocks,
+                                num_new_local_computed_tokens,
+                                ext_tokens,
+                                load_kv_async,
+                            ) = self._resolve_partial_prefix_hit(
+                                request,
+                                new_computed_blocks,
+                                num_new_local_computed_tokens,
+                                ext_tokens,
+                                load_kv_async,
+                            )
 
                         num_external_computed_tokens = ext_tokens
 
@@ -1457,6 +1508,7 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
+            kv_block_copies=self.kv_cache_manager.take_block_copies() or None,
             boundary_state_offloads=(
                 boundary_state_offloads if self.connector is not None else None
             ),

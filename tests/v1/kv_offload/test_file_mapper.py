@@ -168,3 +168,55 @@ def test_persistent_layout_isolates_physical_bytes():
     layout["pages"][0] = 1
     assert grouped.get_run_config()["persistent_layout"]["pages"][0] == 4096
     assert "persistent_layout" not in legacy.get_run_config()
+
+
+def test_group_tokens_field_changes_base_path():
+    """Per-group token spans must move the namespace, not the key names."""
+    from copy import deepcopy
+
+    args = dict(
+        root_dir="/tmp/cache",
+        model_name="grouped/model",
+        hash_block_size=16,
+        gpu_blocks_per_file=1,
+        tp_size=4,
+        pp_size=1,
+        pcp_size=1,
+        dcp_size=2,
+        rank=2,
+        dtype="float16",
+    )
+    layout: dict = {
+        "version": "grouped-worker-interleaved-v2",
+        "group_pages": {0: 6389760, 9: 2129920},
+        "group_tokens": {0: 1664, 9: 832},
+    }
+    mapper = FileMapper(**args, persistent_layout=deepcopy(layout))
+    equal = deepcopy(layout)
+    equal["group_tokens"] = {0: 1664, 9: 1664}
+    equal_mapper = FileMapper(**args, persistent_layout=equal)
+    legacy = deepcopy(layout)
+    del legacy["group_tokens"]
+    legacy["version"] = "grouped-worker-interleaved-v1"
+    legacy_mapper = FileMapper(**args, persistent_layout=legacy)
+
+    # Same keys, different physical page size per group: different directory.
+    assert mapper.base_path != equal_mapper.base_path
+    assert mapper.base_path != legacy_mapper.base_path
+    assert (
+        FileMapper(**args, persistent_layout=deepcopy(layout)).base_path
+        == mapper.base_path
+    )
+    # Rank and per-group subfolders keep their shape inside the new namespace.
+    key = make_offload_key(bytes(range(8)), 9)
+    name = mapper.get_file_name(key)
+    assert name.startswith(f"{mapper.base_path}_r2/")
+    assert name.endswith("/000/10_g9/0001020304050607.bin")
+    assert (
+        name[len(mapper.base_path) :]
+        == (equal_mapper.get_file_name(key)[len(equal_mapper.base_path) :])
+    )
+    assert mapper.get_run_config()["persistent_layout"]["group_tokens"] == {
+        "0": 1664,
+        "9": 832,
+    }

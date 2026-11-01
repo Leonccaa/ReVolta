@@ -9,6 +9,11 @@ and configurable secondary tiers (e.g., Storage, Network).
 Configuration via kv_connector_extra_config:
   - cpu_bytes_to_use: (required) Bytes to allocate for CPU primary tier
   - block_size: (optional) Block size for offloaded blocks (default: GPU block size)
+  - cpu_group_partition: (optional) "auto" (default) gives every cache group its
+    own pool and tier pages when the model has a recurrent group and more than
+    one prefix-cacheable group; groups with a narrower cache block then get more
+    slots so all groups cover the same tokens. "off" keeps one shared row per
+    key, "force" also partitions multi-group models without a recurrent group.
   - eviction_policy: (optional) Primary tier eviction policy: "lru" or
     "arc" (default: "lru")
   - secondary_tiers: (optional) List of secondary tier configurations
@@ -96,6 +101,9 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 raise ValueError(
                     "Grouped tiering requires an explicit attention backend"
                 )
+            group_tokens = dict(
+                sorted(getattr(self, "cpu_group_offloaded_tokens", {}).items())
+            )
             self.persistent_layout = {
                 "version": "grouped-worker-interleaved-v1",
                 "config_hash": vllm_config.compute_hash(),
@@ -110,6 +118,12 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                     for tensor in kv_cache_config.kv_cache_tensors
                 ],
             }
+            if len(set(group_tokens.values())) > 1:
+                # Groups now write pages of different sizes, so their files must
+                # not share the v1 namespace where every key paid one row. The
+                # equal-span (e.g. MTP4) dict stays byte-for-byte identical.
+                self.persistent_layout["version"] = "grouped-worker-interleaved-v2"
+                self.persistent_layout["group_tokens"] = group_tokens
 
         from vllm.v1.attention.kv_cache_view import (
             has_planar_kv_cache,
@@ -152,11 +166,27 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             raise
         return regions
 
+    def _tier_thread_summary(self) -> str:
+        """Configured per-tier I/O threads, for the startup log only."""
+        parts = []
+        for config in self.secondary_tier_configs:
+            if not isinstance(config, dict):
+                continue
+            read = config.get("n_read_threads")
+            write = config.get("n_write_threads")
+            if read is None and write is None:
+                parts.append(f"{config.get('type', '?')}=default threads")
+                continue
+            parts.append(f"{config.get('type', '?')}={read or 0}r+{write or 0}w")
+        return "; ".join(parts) if parts else "no secondary tier"
+
     def _get_grouped_manager(self, enable_events: bool) -> OffloadingManager:
         if int(self.extra_config.get("store_threshold", 0)) >= 2:
             raise ValueError(
                 "store_threshold is not supported for TieringOffloadingSpec"
             )
+        world_size = self.vllm_config.parallel_config.world_size
+        thread_summary = self._tier_thread_summary()
         # ExitStack unwinds tiers before primary views, including partial setup.
         with ExitStack() as cleanup:
             regions = self._create_group_regions(None)
@@ -182,6 +212,22 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                     primary_tier=primary,
                     secondary_tiers=tiers,
                     enable_events=enable_events,
+                )
+                logger.info(
+                    "Grouped tier group %d: page %d B per worker x %d slots x %d "
+                    "workers = %.2f GiB primary tier, %d tokens per slot, %d "
+                    "secondary tier(s) (%s).",
+                    group,
+                    self.cpu_group_page_sizes[group],
+                    self.cpu_group_num_blocks[group],
+                    world_size,
+                    self.cpu_group_page_sizes[group]
+                    * world_size
+                    * self.cpu_group_num_blocks[group]
+                    / 2**30,
+                    getattr(self, "cpu_group_offloaded_tokens", {}).get(group, 0),
+                    len(tiers),
+                    thread_summary,
                 )
             manager = GroupedCPUOffloadingManager(managers)
             cleanup.pop_all()

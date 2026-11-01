@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU composition proof: existing tier managers and FS I/O behind group routing.
 
-This deliberately does not enable grouped TieringOffloadingSpec in serving.
-It validates the scheduler/storage seam, not CUDA registration or GPU transfers.
+These tests drive grouped managers directly and never register memory with CUDA
+or run GPU transfers. Grouped TieringOffloadingSpec itself is production code
+whenever the CPU pool is partitioned: `get_manager` routes to
+`_get_grouped_manager`, one primary tier plus one filesystem tier per group.
 """
 
 import json
@@ -61,9 +63,10 @@ def _spec():
     )
 
 
-def _build(root, **fs_options):
+def _build(root, pages=None, **fs_options):
     from vllm.v1.kv_offload.tiering.spec import TieringOffloadingSpec
 
+    pages = GROUP_PAGES if pages is None else pages
     spec = object.__new__(TieringOffloadingSpec)
     config = _spec()
     spec.vllm_config = config.vllm_config
@@ -72,9 +75,10 @@ def _build(root, **fs_options):
     spec.vllm_config.kv_events_config = SimpleNamespace(enable_kv_cache_events=True)
     spec.kv_cache_config = config.kv_cache_config
     spec.block_size_factor = 1
-    spec.cpu_group_page_sizes = GROUP_PAGES
+    spec.cpu_group_page_sizes = pages
     spec.num_blocks = 2
-    spec.cpu_group_num_blocks = {group: 2 for group in GROUP_PAGES}
+    spec.cpu_group_num_blocks = {group: 2 for group in pages}
+    spec.cpu_group_offloaded_tokens = {group: 16 for group in pages}
     spec.partition_by_group = True
     spec.eviction_policy = "lru"
     spec.extra_config = {}
@@ -106,11 +110,11 @@ def _settle(manager):
     raise AssertionError("FS jobs did not finish")
 
 
-def _payload(group):
+def _payload(group, pages=None):
     # Distinguish both groups and both TP rank slices within each stored row.
+    pages = GROUP_PAGES if pages is None else pages
     return b"".join(
-        bytes([31 + group + rank * 70]) * GROUP_PAGES[group]
-        for rank in range(WORLD_SIZE)
+        bytes([31 + group + rank * 70]) * pages[group] for rank in range(WORLD_SIZE)
     )
 
 
@@ -514,3 +518,227 @@ def test_fs_budget_applies_across_group_managers(tmp_path):
         )
     finally:
         manager.shutdown()
+
+
+def test_grouped_fs_pages_use_group_page_size(tmp_path):
+    """Each group's disk page is that group's own row, not the widest one."""
+    pages = {0: 8192, 2: 4096, 9: 2048}
+    manager = _build(tmp_path, pages)
+    try:
+        children = list(manager.managers.values())
+        assert children[0].secondary_tiers[0]._block_size == pages[0] * WORLD_SIZE
+        assert children[-1].secondary_tiers[0]._block_size == pages[9] * WORLD_SIZE
+        keys = [_key(g) for g in pages]
+        output = manager.prepare_store(keys, CTX)
+        assert output is not None
+        payloads = {g: _payload(g, pages) for g in pages}
+        _write_rows(manager, output, payloads)
+        paths = []
+        for group in pages:
+            path = Path(
+                manager.managers[group]
+                .secondary_tiers[0]
+                .file_mapper.get_file_name(_key(group))
+            )
+            # <base>_r<rank>/<hhh>/<hh>_g<group>/<hash>.bin keeps its shape.
+            assert path.parent.name.endswith(f"_g{group}")
+            assert path.parts[-4].endswith("_r0")
+            assert path.stat().st_size == pages[group] * WORLD_SIZE
+            assert path.read_bytes() == payloads[group]
+            paths.append(path)
+        assert len({p.parent for p in paths}) == len(pages)
+        assert (
+            sum(p.stat().st_size for p in tmp_path.rglob("*.bin"))
+            == sum(pages.values()) * WORLD_SIZE
+        )
+    finally:
+        manager.shutdown()
+
+
+def test_heterogeneous_group_regions_have_distinct_geometries():
+    """Per-group slot counts size the shared mappings, not one global count."""
+    import vllm.v1.kv_offload.tiering.spec as spec_module
+
+    pages = {0: 8192, 2: 4096, 9: 2048}
+    # A 832-token drafter group needs twice the slots of the 1,664-token groups
+    # to cover the same tokens, at a quarter of the target page.
+    slots = {0: 4, 2: 4, 9: 8}
+    spans = {0: 1664, 2: 1664, 9: 832}
+    spec = object.__new__(spec_module.TieringOffloadingSpec)
+    spec.vllm_config = SimpleNamespace(
+        instance_id=f"grouped-geometry-test-{uuid.uuid4().hex}",
+        parallel_config=SimpleNamespace(world_size=WORLD_SIZE),
+    )
+    spec.cpu_group_page_sizes = pages
+    spec.cpu_group_num_blocks = slots
+    spec.cpu_group_offloaded_tokens = spans
+    spec.num_blocks = 4
+    regions = spec._create_group_regions(None)
+    try:
+        for group, page in pages.items():
+            assert regions[group].num_blocks == slots[group]
+            assert regions[group].total_size_bytes == page * WORLD_SIZE * slots[group]
+        assert {g: r.total_size_bytes for g, r in regions.items()} == {
+            0: 65536,
+            2: 32768,
+            9: 32768,
+        }
+        assert regions[9].total_size_bytes < regions[0].total_size_bytes
+    finally:
+        for region in regions.values():
+            region.cleanup()
+
+
+def _tiering_spec(monkeypatch, group_tokens, pages):
+    """A TieringOffloadingSpec whose parent resolved `group_tokens` per group."""
+    import vllm.v1.kv_offload.tiering.spec as spec_module
+
+    def parent_init(self, config, cache):
+        self.extra_config = {}
+        self.partition_by_group = True
+        self.cpu_group_page_sizes = pages
+        self.cpu_group_offloaded_tokens = group_tokens
+
+    monkeypatch.setattr(spec_module.CPUOffloadingSpec, "__init__", parent_init)
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+            nnodes=1,
+        ),
+        attention_config=SimpleNamespace(backend="FLASH_ATTN_V100"),
+        model_config=SimpleNamespace(revision="fixed-model-revision"),
+        compute_hash=lambda: "configuration-hash",
+    )
+    cache = SimpleNamespace(
+        num_blocks=2,
+        kv_cache_groups=[],
+        kv_cache_tensors=[SimpleNamespace(size=8192, shared_by=["a", "b"])],
+    )
+    return spec_module.TieringOffloadingSpec(config, cache)
+
+
+MAPPER_ARGS = dict(
+    root_dir="/tmp/cache",
+    model_name="test/model",
+    hash_block_size=16,
+    gpu_blocks_per_file=1,
+    tp_size=2,
+    pp_size=1,
+    pcp_size=1,
+    dcp_size=1,
+    rank=1,
+    dtype="float16",
+)
+
+# The dict TieringOffloadingSpec wrote for equal-span grouped pools so far.
+LEGACY_V1_LAYOUT = {
+    "version": "grouped-worker-interleaved-v1",
+    "config_hash": "configuration-hash",
+    "attention_backend": "FLASH_ATTN_V100",
+    "model_revision": "fixed-model-revision",
+    "group_pages": {0: 8192, 2: 4096, 5: 512},
+    "tensors": [{"page_size": 4096, "shared_by": ["a", "b"]}],
+}
+
+
+def test_mtp4_persistent_layout_unchanged(monkeypatch):
+    from vllm.v1.kv_offload.file_mapper import FileMapper
+
+    pages = LEGACY_V1_LAYOUT["group_pages"]
+    spec = _tiering_spec(monkeypatch, {0: 784, 2: 784, 5: 784}, pages)
+    layout = spec.persistent_layout
+    assert layout == LEGACY_V1_LAYOUT
+    assert set(layout) == {
+        "version",
+        "config_hash",
+        "attention_backend",
+        "model_revision",
+        "group_pages",
+        "tensors",
+    }
+    assert layout["version"] == "grouped-worker-interleaved-v1"
+    # Same base_path and the same group suffixes, so existing MTP4 disk roots
+    # keep being reused after the upgrade.
+    key = make_offload_key(bytes(range(8)), 2)
+    assert FileMapper(**MAPPER_ARGS, persistent_layout=layout).get_file_name(
+        key
+    ) == FileMapper(
+        **MAPPER_ARGS, persistent_layout=dict(LEGACY_V1_LAYOUT)
+    ).get_file_name(key)
+
+
+def test_heterogeneous_persistent_layout_isolates_namespace(monkeypatch):
+    from copy import deepcopy
+
+    from vllm.v1.kv_offload.file_mapper import FileMapper
+
+    pages = {0: 8192, 2: 4096, 9: 2048}
+    tokens = {0: 1664, 2: 1664, 9: 832}
+    layout = _tiering_spec(monkeypatch, tokens, pages).persistent_layout
+    assert layout["version"] == "grouped-worker-interleaved-v2"
+    assert layout["group_tokens"] == tokens
+    equal = _tiering_spec(monkeypatch, dict.fromkeys(tokens, 1664), pages)
+    assert "group_tokens" not in equal.persistent_layout
+    legacy = deepcopy(LEGACY_V1_LAYOUT)
+    legacy["group_pages"] = pages
+    mapper = FileMapper(**MAPPER_ARGS, persistent_layout=layout)
+    assert mapper.base_path != (
+        FileMapper(**MAPPER_ARGS, persistent_layout=equal.persistent_layout).base_path
+    )
+    assert mapper.base_path != (
+        FileMapper(**MAPPER_ARGS, persistent_layout=legacy).base_path
+    )
+    # Path shape is unchanged: only the namespace directory and page bytes move.
+    path = mapper.get_file_name(make_offload_key(bytes(range(8)), 9))
+    assert path.startswith(mapper.base_path + "_r1/")
+    assert path.endswith("/000/10_g9/0001020304050607.bin")
+
+
+def test_non_grouped_tier_keeps_row_and_legacy_namespace(monkeypatch):
+    """Without a partition: one row per key, no persistent_layout, one manager."""
+    import vllm.v1.kv_offload.tiering.spec as spec_module
+
+    def parent_init(self, config, cache):
+        self.vllm_config = config
+        self.kv_cache_config = cache
+        self.extra_config = {}
+        self.partition_by_group = False
+        self.cpu_group_page_sizes = {}
+        self.cpu_group_num_blocks = {}
+        self.cpu_group_offloaded_tokens = {}
+        self.cpu_page_size_per_worker = 64
+        self.num_blocks = 4
+        self.eviction_policy = "lru"
+
+    monkeypatch.setattr(spec_module.CPUOffloadingSpec, "__init__", parent_init)
+    config = SimpleNamespace(
+        instance_id=f"legacy-tier-test-{uuid.uuid4().hex}",
+        parallel_config=SimpleNamespace(
+            world_size=WORLD_SIZE,
+            pipeline_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+            nnodes=1,
+        ),
+        attention_config=SimpleNamespace(backend="FLASH_ATTN_V100"),
+        model_config=SimpleNamespace(revision="fixed-model-revision"),
+        compute_hash=lambda: "configuration-hash",
+        kv_events_config=None,
+    )
+    cache = SimpleNamespace(num_blocks=2, kv_cache_groups=[], kv_cache_tensors=[])
+    spec = spec_module.TieringOffloadingSpec(config, cache)
+    assert spec.persistent_layout is None
+    manager = spec.get_manager()
+    try:
+        assert isinstance(manager, spec_module.TieringOffloadingManager)
+        view = manager.primary_tier.get_kv_memoryview()
+        # Every group, however wide its own block, addresses the same row.
+        assert view.strides[0] == 64 * WORLD_SIZE
+        assert view.shape[0] == 4
+    finally:
+        manager.shutdown()
+        spec._manager = None
+        assert spec._scheduler_mmap is not None
+        spec._scheduler_mmap.cleanup()

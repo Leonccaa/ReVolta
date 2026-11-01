@@ -38,6 +38,18 @@ token in the CPU pool and on disk (measured in 0.1.4: 1.84 GB for a 32K-token pr
 recurrent-state slots each layer group gets. A smaller reference gives more slots,
 which helps when many short sessions share the pool.
 
+When the model has a recurrent (state) group and more than one prefix-cacheable group, each
+group gets a CPU pool of its own that holds only that group's pages, and the disk tier stores
+those pages instead of a full row per block. Groups whose cache block is narrower than the
+widest group's (the DFlash2 drafter, 832 tokens against the target's 1,664) get proportionally
+more slots, so every group still covers the same number of tokens. The 0.1.4 DFlash2 figures
+above were measured with one shared row per block; with the per-group pools they are expected
+to fall by roughly 1.8–2.3× (an estimate) and are being re-measured. MTP4 is unchanged. Startup logs one
+line per group with its page size, slot count and token span. Set `"cpu_group_partition":
+"off"` in `kv_connector_extra_config` to go back to the shared-row layout; because that also
+changes the page layout, each mode reuses only its own disk files (see the restart note
+below), so flipping it alternates between two namespaces and never mixes page sizes in one.
+
 **3. CPU + disk.** Add a filesystem tier, typically on a local SSD:
 
 ```json

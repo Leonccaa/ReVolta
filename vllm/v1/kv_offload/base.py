@@ -50,6 +50,9 @@ class ReqContext:
     kv_transfer_params: dict[str, Any] | None = None
 
 
+SUPERSEDED_STATE_RULES = ("request", "request_fixed", "extend")
+
+
 class OffloadPolicy(Enum):
     # Offload only newly-computed blocks as they arrive; prefix-hit
     # blocks (already offloaded by a prior request) are skipped.
@@ -405,6 +408,23 @@ class OffloadingSpec(ABC):
         self.demote_superseded_states: bool = bool(
             self.extra_config.get("demote_superseded_states", True)
         )
+        # Which states a finished request demotes (see
+        # OffloadingConnectorScheduler._demote_superseded_states):
+        #   request        its own states in [hit, last block - 3), the last
+        #                  block counted with decode output (historical)
+        #   request_fixed  the same, the last block counted from the prompt,
+        #                  since decode-time states are never offloaded
+        #   extend         request_fixed + the state at the hit point once this
+        #                  request stored a newer state past it
+        # Junctions (shared prefixes) are never demoted.
+        self.superseded_state_rule: str = str(
+            self.extra_config.get("superseded_state_rule", "request")
+        )
+        if self.superseded_state_rule not in SUPERSEDED_STATE_RULES:
+            raise ValueError(
+                f"superseded_state_rule must be one of {SUPERSEDED_STATE_RULES}, "
+                f"got {self.superseded_state_rule!r}"
+            )
 
         parallel_config = vllm_config.parallel_config
         # gpu block size per group

@@ -59,6 +59,10 @@ class CPUOffloadingManager(OffloadingManager):
         self.store_threshold: int = store_threshold
         self.max_tracker_size: int = max_tracker_size
 
+        # Cumulative counters for observability (blocks).
+        self.num_stored_blocks: int = 0
+        self.num_evicted_blocks: int = 0
+
         # Number of block references. It is ordered so can evict the LRU entry in O(1).
         self.counts: OrderedDict[OffloadKey, int] | None = (
             OrderedDict() if store_threshold >= 2 else None
@@ -175,6 +179,7 @@ class CPUOffloadingManager(OffloadingManager):
             for key, block in evicted:
                 self._free_block(block)
                 to_evict.append(key)
+            self.num_evicted_blocks += len(evicted)
 
         if to_evict and self.events is not None:
             self.events.append(
@@ -192,6 +197,7 @@ class CPUOffloadingManager(OffloadingManager):
 
         for key, block in zip(keys_to_store, blocks):
             self._policy.insert(key, block)
+        self.num_stored_blocks += len(keys_to_store)
 
         # build store specs for allocated blocks
         store_spec = self._get_load_store_spec(keys_to_store, blocks)

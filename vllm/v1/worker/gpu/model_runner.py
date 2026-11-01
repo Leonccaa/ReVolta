@@ -134,6 +134,27 @@ from vllm.v1.worker.utils import KVBlockZeroer, clear_layer_kv_caches
 logger = init_logger(__name__)
 
 
+def _reclaim_before_draft_load() -> tuple[int, int]:
+    """Free target-loading temporaries before the draft model allocates.
+
+    Checkpoint conversion can leave reference cycles that still hold replaced
+    tensors. Collect them and return cached blocks so the draft does not stack
+    on top of them. Returns the allocated bytes before and after.
+    """
+    allocated_before = torch.accelerator.memory_allocated()
+    gc.collect()
+    torch.accelerator.empty_cache()
+    allocated_after = torch.accelerator.memory_allocated()
+    logger.info(
+        "Target loading cleanup before draft load: allocated %d -> %d bytes, "
+        "reserved %d bytes",
+        allocated_before,
+        allocated_after,
+        torch.accelerator.memory_reserved(),
+    )
+    return allocated_before, allocated_after
+
+
 def _detach_model_runtime_state(model: nn.Module) -> None:
     """Drop layer KV views and compilation hooks that can pin a model."""
     clear_layer_kv_caches(model.modules())
@@ -495,6 +516,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 assert self.speculative_config is not None
                 set_eagle3_aux_hidden_state_layers(self.model, self.speculative_config)
             if self.speculator is not None:
+                _reclaim_before_draft_load()
                 self.speculator.load_model(self.model)
                 eplb_models_added = self.eplb.maybe_register_speculator(
                     self.speculator, self.speculative_config, load_dummy_weights

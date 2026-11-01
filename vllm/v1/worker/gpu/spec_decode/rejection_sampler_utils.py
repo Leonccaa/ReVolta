@@ -1036,5 +1036,11 @@ def rejection_sample(
         expanded_idx_mapping,
         temperature,
         PADDED_RESAMPLE_NUM_BLOCKS=padded_resample_num_blocks,
+        # The kernel reads num_sampled and then increments it in place, with
+        # no barrier in between. With several warps, a later warp can load the
+        # incremented count, take a different early-return branch, and leave
+        # the cross-warp argmax with unwritten partials. One warp makes the
+        # read-before-write order hold for the whole program.
+        num_warps=1,
     )
     return sampled, num_sampled

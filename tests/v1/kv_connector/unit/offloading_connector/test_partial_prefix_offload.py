@@ -212,3 +212,33 @@ def test_boundary_handoffs_only_accept_block_boundaries():
     [job] = jobs.values()
     src, _ = job.transfer_spec
     assert src.block_ids.tolist() == [98]
+
+
+def _step_output(**overrides):
+    output = SimpleNamespace(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=[], new_block_ids=[], resumed_req_ids=set()
+        ),
+        num_scheduled_tokens={},
+        finished_req_ids=set(),
+        preempted_req_ids=set(),
+        boundary_state_offloads=None,
+    )
+    for name, value in overrides.items():
+        setattr(output, name, value)
+    return output
+
+
+def test_copy_destinations_are_fenced_against_pending_stores():
+    # Codex repro: page 89 is still the source of store 123 of a finished
+    # request; a snapshot copy into it must wait for that store.
+    scheduler = _scheduler()
+    scheduler._block_id_to_pending_jobs = {89: {123}, 50: {7}}
+    meta = scheduler.build_connector_meta(_step_output(kv_block_copies=[(8, 89)]))
+    assert meta.jobs_to_flush == {123}
+    # Copy sources are only read and need no fence; outputs without the field
+    # (older producers, test doubles) are unaffected.
+    meta = scheduler.build_connector_meta(_step_output(kv_block_copies=[(50, 9)]))
+    assert meta.jobs_to_flush == set()
+    assert scheduler.build_connector_meta(_step_output()).jobs_to_flush == set()

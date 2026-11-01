@@ -106,8 +106,20 @@ def qwen4exp_kv_cache_config(
     )
 
 
+_NONE_HASH_READY = False
+
+
+def ensure_none_hash() -> None:
+    """Initialize the hash seed once: it is random unless PYTHONHASHSEED is
+    set, so re-initializing between requests would change their hashes."""
+    global _NONE_HASH_READY
+    if not _NONE_HASH_READY:
+        init_none_hash(sha256)
+        _NONE_HASH_READY = True
+
+
 def make_manager(**kwargs) -> KVCacheManager:
-    init_none_hash(sha256)
+    ensure_none_hash()
     config_kwargs = {
         k: kwargs.pop(k)
         for k in (
@@ -134,6 +146,7 @@ def make_request(
     boundaries: Any = None,
     reasoning_ended: bool | None = None,
 ) -> Request:
+    ensure_none_hash()
     extra = {"prefix_cache_boundaries": boundaries} if boundaries else None
     params = SamplingParams(max_tokens=64, extra_args=extra)
     params.update_from_generation_config({}, eos_token_id=100_000)

@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import contextlib
 import enum
+import math
 import time
 from collections import deque
 from collections.abc import Callable, Mapping
@@ -59,6 +59,44 @@ class StreamingUpdate:
 
 # Chunk size of the chunked recurrent (GDN/Mamba) prefill kernels.
 PREFIX_CACHE_BOUNDARY_ALIGNMENT = 64
+
+
+# Upper bound on boundaries read from one request.
+MAX_PREFIX_CACHE_BOUNDARIES = 64
+
+
+def parse_prefix_cache_boundaries(raw: Any, limit: int) -> list[int]:
+    """Valid positions in ``(0, limit)`` from client-supplied boundaries.
+
+    Accepts None, one value or a list; each value may be an int, an
+    integer-valued finite float or a decimal string. Anything else (bools,
+    negative, non-finite, out-of-range or malformed values) is ignored, never
+    an error: a boundary only adds a cache entry.
+    """
+    if raw is None:
+        return []
+    items = raw if isinstance(raw, (list, tuple)) else [raw]
+    out: set[int] = set()
+    for item in items[:MAX_PREFIX_CACHE_BOUNDARIES]:
+        value: int
+        if isinstance(item, bool):
+            continue
+        if isinstance(item, int):
+            value = item
+        elif isinstance(item, float):
+            if not math.isfinite(item) or not item.is_integer():
+                continue
+            value = int(item)
+        elif isinstance(item, str):
+            text = item.strip()
+            if not (text.isascii() and text.isdigit()) or len(text) > 18:
+                continue
+            value = int(text)
+        else:
+            continue
+        if 0 < value < limit:
+            out.add(value)
+    return sorted(out)
 
 
 class Request:
@@ -159,24 +197,15 @@ class Request:
         self.num_computed_tokens = 0
         self.cache_salt: str | None = cache_salt
         # Prompt positions inside a block where a partial prefix-cache entry
-        # should be kept (e.g. the end of the last chat message).
-        extra_args = getattr(sampling_params, "extra_args", None) or {}
-        # Boundaries are rounded down to whole recurrent-kernel chunks, so a
-        # request resumed there chunks its prefill exactly like a cold one.
-        align = PREFIX_CACHE_BOUNDARY_ALIGNMENT
-        self.prefix_cache_boundaries: tuple[int, ...] = ()
-        requested = extra_args.get("prefix_cache_boundaries", ())
-        # Malformed client-supplied boundaries only forgo partial entries.
-        with contextlib.suppress(TypeError, ValueError):
-            self.prefix_cache_boundaries = tuple(
-                sorted(
-                    {
-                        int(b) // align * align
-                        for b in requested
-                        if align <= int(b) < len(prompt_token_ids or ())
-                    }
-                )
-            )
+        # should be kept (e.g. the end of the last chat message). Parsed on
+        # first use, which only happens with the partial prefix cache on.
+        extra_args = getattr(sampling_params, "extra_args", None)
+        self._prefix_cache_boundaries_raw: Any = (
+            extra_args.get("prefix_cache_boundaries")
+            if isinstance(extra_args, dict)
+            else None
+        )
+        self._prefix_cache_boundaries: tuple[int, ...] | None = None
         # Partial prefix-cache entry selected by the last cache lookup.
         self.partial_prefix_entry: Any = None
         # (blocks, tokens) of the block-aligned hit the partial entry extends,
@@ -270,6 +299,26 @@ class Request:
         """Compute block hashes for any new full blocks and append them."""
         if self._block_hasher is not None:
             self.block_hashes.extend(self._block_hasher(self))
+
+    @property
+    def prefix_cache_boundaries(self) -> tuple[int, ...]:
+        """Partial prefix-cache boundaries, rounded down to whole recurrent
+        kernel chunks so a request resumed there chunks its prefill exactly
+        like a cold one. Only the partial prefix cache reads this."""
+        if self._prefix_cache_boundaries is None:
+            align = PREFIX_CACHE_BOUNDARY_ALIGNMENT
+            self._prefix_cache_boundaries = tuple(
+                sorted(
+                    {
+                        b // align * align
+                        for b in parse_prefix_cache_boundaries(
+                            self._prefix_cache_boundaries_raw, self.num_prompt_tokens
+                        )
+                        if b >= align
+                    }
+                )
+            )
+        return self._prefix_cache_boundaries
 
     @property
     def use_structured_output(self) -> bool:

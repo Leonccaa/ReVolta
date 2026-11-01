@@ -8,6 +8,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -302,6 +303,12 @@ class Scheduler(SchedulerInterface):
             partial_prefix_cache=self.cache_config.partial_prefix_cache,
             partial_prefix_cache_max_fraction=(
                 self.cache_config.partial_prefix_cache_max_fraction
+            ),
+            # Upper bound of the executors' max_concurrent_batches.
+            max_concurrent_batches=max(
+                2,
+                envs.VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH,
+                self.parallel_config.pipeline_parallel_size,
             ),
         )
         # Adapted from vLLM #44560, #57104 and #59880. Mamba managers already

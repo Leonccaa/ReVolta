@@ -29,7 +29,7 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_sliding_window,
 )
 from vllm.v1.metrics.stats import PrefixCacheStats
-from vllm.v1.request import Request
+from vllm.v1.request import PREFIX_CACHE_BOUNDARY_ALIGNMENT, Request
 
 logger = init_logger(__name__)
 
@@ -136,8 +136,14 @@ class KVCacheManager:
         prefix_cache_retention_interval: int | None = None,
         partial_prefix_cache: bool = False,
         partial_prefix_cache_max_fraction: float = 0.125,
+        max_concurrent_batches: int = 2,
     ) -> None:
         self.max_model_len = max_model_len
+        # Steps a partial-cache copy's blocks stay referenced: the engine
+        # schedules up to ``max_concurrent_batches`` steps ahead of the
+        # worker, so a copy emitted now has executed once that many more
+        # steps have been scheduled after it.
+        self._copy_hold_steps = max(2, max_concurrent_batches) + 1
         # When unset, fall back to `max_model_len` so the recycling-aware cap
         # collapses to the prior (uncapped) admission behavior. The scheduler
         # always supplies the real value at runtime.
@@ -253,6 +259,15 @@ class KVCacheManager:
                 [type(m).__name__ for m in managers],
             )
             return
+        if PREFIX_CACHE_BOUNDARY_ALIGNMENT % hash_block_size:
+            # Keys need the chained block hash ending at the boundary.
+            logger.warning(
+                "Partial prefix cache needs hash blocks that divide %d tokens "
+                "(hash block %d); keeping block-aligned hits.",
+                PREFIX_CACHE_BOUNDARY_ALIGNMENT,
+                hash_block_size,
+            )
+            return
         scratch = tuple(type(m) is CircularBufferManager for m in managers)
         cached = [m for m, s in zip(managers, scratch) if not s]
         # Entries are keyed under the last block boundary shared by all groups.
@@ -286,6 +301,17 @@ class KVCacheManager:
         index = block_start // self.hash_block_size - 1
         return (request.block_hashes[index] if index >= 0 else None), block_start
 
+    def _tail_hash(self, request: Request, boundary: int):
+        """Chained request block hash ending at ``boundary``.
+
+        It covers every token, multimodal input, LoRA and cache salt up to the
+        boundary, which the raw tail tokens alone do not (image placeholders
+        are identical tokens).
+        """
+        index = boundary // self.hash_block_size - 1
+        hashes = request.block_hashes
+        return hashes[index] if 0 <= index < len(hashes) else None
+
     def _partial_key(self, request: Request, boundary: int):
         parent, block_start = self._partial_parent(request, boundary)
         lora_id = request.lora_request.lora_int_id if request.lora_request else 0
@@ -294,6 +320,7 @@ class KVCacheManager:
             tuple(request.all_token_ids[block_start:boundary]),
             request.cache_salt,
             lora_id,
+            self._tail_hash(request, boundary),
         )
 
     def _partial_block_range(self, manager, boundary: int) -> tuple[int, int]:
@@ -317,7 +344,7 @@ class KVCacheManager:
             for b in request.prefix_cache_boundaries
             if start < b < end
             and b % self.partial_block_size
-            and b // self.partial_block_size * self.partial_block_size <= hashed
+            and b <= hashed
             and not self.partial_cache.contains(self._partial_key(request, b))
         )
 
@@ -348,6 +375,7 @@ class KVCacheManager:
                 request.cache_salt,
                 lora_id,
                 self._step,
+                tail_hash_at=lambda length: self._tail_hash(request, length),
             )
             if entry is not None and entry.length > hit_length:
                 break
@@ -390,13 +418,12 @@ class KVCacheManager:
         return tuple(blocks), boundary
 
     def _defer_release(self, blocks: list[KVCacheBlock]) -> None:
-        # Async scheduling runs up to two steps ahead of the worker; the copy
-        # emitted in this step has executed once three more steps started.
-        self._deferred_release.append((self._step + 3, blocks))
+        self._deferred_release.append((self._step + self._copy_hold_steps, blocks))
 
     def _redirect_partial_hit(self, request: Request, entry: PartialEntry) -> None:
         """Copy-on-write: continue the request on private copies."""
-        sources = []
+        sources: list[KVCacheBlock] = []
+        targets: list[KVCacheBlock] = []
         for group_id, manager in enumerate(self.coordinator.single_type_managers):
             if not entry.blocks[group_id]:
                 continue
@@ -414,9 +441,13 @@ class KVCacheManager:
             req_blocks[last] = target
             self._block_copies.append((source.block_id, target.block_id))
             sources.append(source)
-        # Keep the reference taken by the cache hit until the copy has run.
+            targets.append(target)
         if sources:
-            self._defer_release(sources)
+            # Keep the source reference taken by the cache hit, and one on the
+            # private target (the request may be aborted and its blocks freed
+            # before the copy has run).
+            self.block_pool.touch(targets)
+            self._defer_release(sources + targets)
 
     def _materialize_snapshots(self) -> None:
         cache = self.partial_cache
@@ -461,9 +492,13 @@ class KVCacheManager:
                     self._block_copies.append((source.block_id, target.block_id))
                 targets.append(group_targets)
             flat = [block for blocks in sources for block in blocks]
-            # The request may release these blocks this step.
-            self.block_pool.touch(flat)
-            self._defer_release(flat)
+            flat_targets = [block for blocks in targets for block in blocks]
+            # Both ends stay referenced until the copy has run: the request may
+            # release the sources this step, and the entry (the only other
+            # holder of the targets) may be evicted before the copy runs, even
+            # by the insert below.
+            self.block_pool.touch(flat + flat_targets)
+            self._defer_release(flat + flat_targets)
             cache.insert(
                 PartialEntry(
                     key=key,
@@ -845,9 +880,20 @@ class KVCacheManager:
         """
         if self.partial_cache is not None:
             self.partial_cache.clear()
-            for _, blocks in self._deferred_release:
-                self.block_pool.free_blocks(blocks)
-            self._deferred_release = []
+            self._pending_snapshots = []
+            # Copy endpoints are released early only when no request holds
+            # blocks: the pool reset below requires that anyway, and the steps
+            # that emitted those copies have then finished. Copies not yet
+            # handed to a worker are dropped with them.
+            if not any(
+                blocks
+                for manager in self.coordinator.single_type_managers
+                for blocks in manager.req_to_blocks.values()
+            ):
+                for _, blocks in self._deferred_release:
+                    self.block_pool.free_blocks(blocks)
+                self._deferred_release = []
+                self._block_copies = []
         if not self.block_pool.reset_prefix_cache():
             return False
         if self.log_stats:

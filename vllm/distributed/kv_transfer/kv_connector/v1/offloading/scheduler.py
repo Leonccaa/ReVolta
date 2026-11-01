@@ -1249,6 +1249,16 @@ class OffloadingConnectorScheduler:
         ):
             self._current_batch_jobs_to_flush.update(self._jobs.keys())
 
+        # Partial prefix-cache copies write into pages no request block table
+        # announces (snapshot targets) or announces only once; fence each copy
+        # destination against in-flight stores still reading that page.
+        kv_block_copies = getattr(scheduler_output, "kv_block_copies", None)
+        if kv_block_copies and self._block_id_to_pending_jobs:
+            for _, dst_block_id in kv_block_copies:
+                self._current_batch_jobs_to_flush.update(
+                    self._block_id_to_pending_jobs.get(dst_block_id, ())
+                )
+
         boundary_store_jobs = self._build_boundary_state_store_jobs(scheduler_output)
         normal_store_jobs = self._build_store_jobs(scheduler_output)
         meta = OffloadingConnectorMetadata(

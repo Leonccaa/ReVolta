@@ -182,14 +182,20 @@ def test_snapshot_copies_each_group_and_skips_the_ring(nsb):
     assert copies == expected
     assert entry.blocks[RING] == []
     assert entry.copy_last == [True, True, False, True, True, True]
-    # Entry blocks are cache-owned and outside the hash table.
+    # Entry blocks are cache-owned and outside the hash table. Until the copy
+    # has run they also carry a guard reference.
     for blocks in entry.blocks:
         for block in blocks:
-            assert block.ref_cnt == 1 and block.block_hash is None
+            assert block.ref_cnt == 2 and block.block_hash is None
     # Materialized at the start of this step; its copies run in this step's
     # worker pass, so lookups in this step must not use it.
     assert entry.ready_step == manager._step
     manager.free(first)
+    for _ in range(3):
+        manager.new_step_starts()
+    for blocks in entry.blocks:
+        for block in blocks:
+            assert block.ref_cnt == 1
 
 
 @pytest.mark.parametrize("nsb", [0, 2])

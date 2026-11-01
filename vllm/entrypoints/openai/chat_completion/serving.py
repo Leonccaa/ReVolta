@@ -76,6 +76,10 @@ from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.utils.collection_utils import as_list
 from vllm.utils.mistral import is_mistral_tokenizer, is_mistral_tool_parser
+from vllm.v1.request import (
+    MAX_PREFIX_CACHE_BOUNDARIES,
+    parse_prefix_cache_boundaries,
+)
 
 if TYPE_CHECKING:
     from vllm.entrypoints.serve.render.serving import OpenAIServingRender
@@ -215,6 +219,28 @@ class _PrefixCacheBoundaries:
             ):
                 boundaries.append(len(system))
         return sorted(set(boundaries))
+
+
+def _with_prefix_cache_boundaries(
+    extra_args: dict[str, Any] | None, derived: list[int], prompt_len: int
+) -> dict[str, Any]:
+    """``extra_args`` with the derived boundaries added to any valid ones the
+    client passed in ``vllm_xargs``. Invalid client values are dropped.
+
+    The engine reads at most ``MAX_PREFIX_CACHE_BOUNDARIES`` values, so the
+    result holds no more than that, derived boundaries first."""
+    extra_args = dict(extra_args or {})
+    kept = sorted(set(derived))[:MAX_PREFIX_CACHE_BOUNDARIES]
+    requested = [
+        b
+        for b in parse_prefix_cache_boundaries(
+            extra_args.get("prefix_cache_boundaries"), prompt_len
+        )
+        if b not in kept
+    ]
+    kept += requested[: MAX_PREFIX_CACHE_BOUNDARIES - len(kept)]
+    extra_args["prefix_cache_boundaries"] = sorted(kept)
+    return extra_args
 
 
 class OpenAIServingChat(OpenAIServing):
@@ -469,17 +495,11 @@ class OpenAIServingChat(OpenAIServing):
                     else None
                 )
                 if boundaries:
-                    extra_args = sampling_params.extra_args or {}
-                    # Keep boundaries a client passed in ``vllm_xargs``.
-                    requested = extra_args.get("prefix_cache_boundaries") or ()
-                    if not isinstance(requested, list):
-                        requested = [requested]
-                    sampling_params.extra_args = {
-                        **extra_args,
-                        "prefix_cache_boundaries": sorted(
-                            {*boundaries, *(int(b) for b in requested)}
-                        ),
-                    }
+                    sampling_params.extra_args = _with_prefix_cache_boundaries(
+                        sampling_params.extra_args,
+                        boundaries,
+                        len(prompt_token_ids or ()),
+                    )
 
             self._log_inputs(
                 sub_request_id,

@@ -30,14 +30,18 @@ order, or when the block pool runs short.
 """
 
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from typing import Any
 
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import BlockHash, KVCacheBlock
 
-# (parent full-block hash or None, tail tokens, cache salt, LoRA id)
-PartialKey = tuple[BlockHash | None, tuple[int, ...], str | None, int]
+# (parent full-block hash or None, tail tokens, cache salt, LoRA id[, hash of
+# the last hash block ending at the boundary]). The last element is the chained
+# request block hash, which also covers multimodal inputs, so placeholder
+# tokens of different images never match.
+PartialKey = tuple[Any, ...]
 
 
 @dataclass
@@ -111,11 +115,13 @@ class PartialPrefixCache:
         cache_salt: str | None,
         lora_id: int,
         current_step: int,
+        tail_hash_at: Callable[[int], Any] | None = None,
     ) -> PartialEntry | None:
         """Longest ready entry under ``parent`` whose tail matches ``tokens``.
 
         The tail starts at ``block_start``, the start of the block after
-        ``parent``.
+        ``parent``. ``tail_hash_at(length)`` gives the request's chained block
+        hash ending at ``length``; keys that carry one must match it.
         """
         best: PartialEntry | None = None
         for key in self.by_parent.get(parent, ()):
@@ -126,6 +132,12 @@ class PartialPrefixCache:
                 or key[2] != cache_salt
                 or key[3] != lora_id
                 or (best is not None and entry.length <= best.length)
+            ):
+                continue
+            if (
+                len(key) > 4
+                and tail_hash_at is not None
+                and tail_hash_at(entry.length) != key[4]
             ):
                 continue
             tail = key[1]

@@ -162,3 +162,13 @@ def test_switched_off_scheduler_ignores_boundaries():
     assert (second.num_computed_tokens - output.num_scheduled_tokens["second"]) % (
         BLOCK
     ) == 0
+
+
+@pytest.mark.parametrize("override,hold", [(0, 3), (4, 5)])
+def test_copy_hold_follows_async_queue_depth(monkeypatch, override, hold):
+    import vllm.envs as envs
+
+    monkeypatch.setattr(envs, "VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH", override)
+    # The manager built by Scheduler.__init__ (not the test replacement).
+    scheduler = create_scheduler(enable_prefix_caching=True)
+    assert scheduler.kv_cache_manager._copy_hold_steps == hold

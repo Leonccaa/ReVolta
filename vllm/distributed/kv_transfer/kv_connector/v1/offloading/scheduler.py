@@ -1210,10 +1210,12 @@ class OffloadingConnectorScheduler:
         stored, evicted = self._cpu_tier_counters()
         logger.info(
             "Offload counters: demoted_states=%d cpu_stored_blocks=%d "
-            "cpu_evicted_blocks=%d rule=%s",
+            "cpu_evicted_blocks=%d rejected_boundary_offers=%d rule=%s",
             getattr(self, "num_demoted_states", 0),
             stored,
             evicted,
+            # Mamba boundary-state hand-offs the host tier could not accept.
+            getattr(self, "num_rejected_boundary_offers", 0),
             self.config.superseded_state_rule,
         )
 

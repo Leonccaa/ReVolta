@@ -1261,6 +1261,19 @@ class OffloadingConnectorScheduler:
                     self._block_id_to_pending_jobs.get(dst_block_id, ())
                 )
 
+        # The worker zeroes newly allocated pages before this step's stores
+        # run. A page can be allocated while an earlier store still reads it
+        # without passing through the new-block fence in _build_store_jobs: a
+        # request parked for an async load is not scheduled, and groups that
+        # are not offloaded (e.g. the QSA compressor ring) are not fenced by
+        # update_state_after_alloc. Fence every page announced for zeroing.
+        new_block_ids_to_zero = getattr(scheduler_output, "new_block_ids_to_zero", None)
+        if new_block_ids_to_zero and self._block_id_to_pending_jobs:
+            for block_id in new_block_ids_to_zero:
+                self._current_batch_jobs_to_flush.update(
+                    self._block_id_to_pending_jobs.get(block_id, ())
+                )
+
         boundary_store_jobs = self._build_boundary_state_store_jobs(scheduler_output)
         normal_store_jobs = self._build_store_jobs(scheduler_output)
         meta = OffloadingConnectorMetadata(

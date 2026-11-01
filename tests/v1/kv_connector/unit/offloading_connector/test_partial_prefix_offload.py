@@ -242,3 +242,128 @@ def test_copy_destinations_are_fenced_against_pending_stores():
     meta = scheduler.build_connector_meta(_step_output(kv_block_copies=[(50, 9)]))
     assert meta.jobs_to_flush == set()
     assert scheduler.build_connector_meta(_step_output()).jobs_to_flush == set()
+
+
+def test_zeroed_pages_are_fenced_against_pending_stores():
+    # The worker zeroes pages announced in new_block_ids_to_zero before this
+    # step's stores run; a pending store still reading such a page must be
+    # flushed first.
+    scheduler = _scheduler()
+    scheduler._block_id_to_pending_jobs = {89: {123}, 50: {7}}
+    meta = scheduler.build_connector_meta(_step_output(new_block_ids_to_zero=[3, 89]))
+    assert meta.jobs_to_flush == {123}
+    meta = scheduler.build_connector_meta(_step_output(new_block_ids_to_zero=None))
+    assert meta.jobs_to_flush == set()
+
+
+def test_parked_request_ring_page_is_fenced_before_zeroing():
+    """Review repro: a request parked for an async CPU load claims, as its
+    QSA compressor-ring page, the source page of another request's pending
+    boundary store. The ring group is not offloaded and the parked request is
+    not scheduled, so only the zeroing fence covers the page."""
+    from dataclasses import replace
+
+    from tests.v1.core.partial_prefix_trace import (
+        make_request,
+        qwen4exp_kv_cache_config,
+    )
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+
+    block, prompt_len = 1664, 4500
+    boundary = 2 * block
+    cfg = qwen4exp_kv_cache_config()
+    groups = []
+    for i, g in enumerate(cfg.kv_cache_groups):
+        kw: dict = {"block_size": (832, 1664, 16, 1664, 1664, 832)[i]}
+        if i == 5:
+            kw["sliding_window"] = 2048
+        groups.append(
+            replace(
+                g,
+                kv_cache_spec=replace(g.kv_cache_spec, **kw),
+                is_eagle_group=(i == 5),
+            )
+        )
+    cfg = replace(cfg, kv_cache_groups=groups)
+    m = KVCacheManager(
+        cfg,
+        max_model_len=8192,
+        hash_block_size=16,
+        dcp_world_size=2,
+        prefix_cache_retention_interval=0,
+        partial_prefix_cache=True,
+    )
+    s = _scheduler()
+    s.config = s.config._replace(
+        kv_group_configs=(
+            GroupOffloadConfig(0, block, block, block // 16, None),
+            GroupOffloadConfig(
+                3, block, block, block // 16, 1, requires_exact_boundary_source=True
+            ),
+        ),
+        num_kv_cache_groups=6,
+    )
+    s._group_config_by_idx = {g.group_idx: g for g in s.config.kv_group_configs}
+    s._sliding_window_groups = (3,)
+    s._lookup_groups = (0, 3)
+    s._mamba_align_size = block
+    s._req_status = {}
+    s.manager.prepare_store.side_effect = lambda keys, ctx: generate_store_output(keys)
+
+    # A's boundary store is accepted in its offer step.
+    a = make_request("A", list(range(prompt_len)))
+    s.on_new_request(a)
+    assert m.allocate_slots(a, boundary)
+    offers = m.take_boundary_state_offloads()
+    source = next(bid for g, bid, _ in offers["A"] if g == 3)
+    meta_a = s.build_connector_meta(
+        _step_output(
+            boundary_state_offloads=offers, num_scheduled_tokens={"A": boundary}
+        )
+    )
+    a.num_computed_tokens = boundary
+    [job] = [
+        j
+        for j, t in meta_a.store_jobs.items()
+        if t.transfer_spec[0].block_ids.tolist() == [source]
+    ]
+    m.new_step_starts()
+    assert m.allocate_slots(a, prompt_len - boundary)
+    a.num_computed_tokens = prompt_len
+    m.new_step_starts()
+    a.append_output_token_ids(42)
+    assert m.allocate_slots(a, 1)
+    a.num_computed_tokens = prompt_len + 1
+    # A's draft window moved past the page; the store is still pending.
+    assert m.block_pool.blocks[source].ref_cnt == 0
+    assert job in s._block_id_to_pending_jobs[source]
+
+    # Order the free queue so that C's ring page (group 2) is the released one.
+    m.new_step_starts()
+    taken = m.block_pool.get_new_blocks(m.block_pool.get_num_free_blocks())
+    page = next(b for b in taken if b.block_id == source)
+    rest = [b for b in taken if b.block_id != source]
+    m.block_pool.free_blocks(rest[6:])
+    m.block_pool.free_blocks([page])
+    m.block_pool.free_blocks(rest[:6])
+
+    c = make_request("C", [50000 + i for i in range(prompt_len)])
+    assert (
+        m.allocate_slots(
+            c, 0, num_external_computed_tokens=block, delay_cache_blocks=True
+        )
+        is not None
+    )
+    ring = m.coordinator.single_type_managers[2]
+    assert m.block_pool.blocks[source] in ring.req_to_blocks["C"]
+    zero_ids = m.take_new_block_ids()
+    assert source in zero_ids
+
+    s.on_new_request(c)
+    status = s._req_status["C"]
+    status.update_offload_keys()
+    status.num_locally_computed_tokens = 0
+    s.update_state_after_alloc(c, m.get_blocks("C"), block)
+    # C is parked for its load and not scheduled this step.
+    meta = s.build_connector_meta(_step_output(new_block_ids_to_zero=zero_ids))
+    assert job in meta.jobs_to_flush

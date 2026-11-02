@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from itertools import islice
@@ -119,8 +120,9 @@ class SchedulerOffloadConfig(NamedTuple):
     offload_prompt_only: bool
     # Worker/state arrays retain original group indices, including scratch.
     num_kv_cache_groups: int
-    # See OffloadingSpec.demote_superseded_states.
+    # See OffloadingSpec.demote_superseded_states / superseded_state_rule.
     demote_superseded_states: bool = True
+    superseded_state_rule: str = "request"
 
     @classmethod
     def from_spec(cls, spec: OffloadingSpec) -> "SchedulerOffloadConfig":
@@ -226,6 +228,7 @@ class SchedulerOffloadConfig(NamedTuple):
             offload_prompt_only=spec.offload_prompt_only,
             num_kv_cache_groups=len(spec.kv_cache_config.kv_cache_groups),
             demote_superseded_states=getattr(spec, "demote_superseded_states", True),
+            superseded_state_rule=getattr(spec, "superseded_state_rule", "request"),
         )
 
 
@@ -262,6 +265,9 @@ class RequestOffloadState:
     # store is retried every step until it is accepted, the request finishes
     # or it is preempted.
     pending_boundary_offloads: list[tuple[int, int, int]] = field(default_factory=list)
+    # group_idx -> offload block indices of boundary states this request has
+    # issued stores for (superseded_state_rule "extend").
+    stored_state_blocks: dict[int, set[int]] = field(default_factory=dict)
     # In-flight job IDs. Per the connector's invariant, at any given time
     # this contains either a single load job, or one or more store jobs.
     transfer_jobs: set[int] = field(default_factory=set)
@@ -373,6 +379,9 @@ class OffloadingConnectorScheduler:
         )
 
         self._req_status: dict[ReqId, RequestOffloadState] = {}
+        # Recurrent states demoted by _demote_superseded_states (all requests).
+        self.num_demoted_states: int = 0
+        self._counters_logged_at: float = time.monotonic()
         self._current_batch_load_jobs: dict[int, TransferJob] = {}
         self._current_batch_jobs_to_flush: set[int] = set()
         # if GPU prefix caching is enabled,
@@ -1141,6 +1150,9 @@ class OffloadingConnectorScheduler:
                     continue
                 assert keys_to_store == {offload_key}
 
+                req_status.stored_state_blocks.setdefault(group_idx, set()).add(
+                    offload_block_idx
+                )
                 job_id = self._generate_job_id()
                 req_status.transfer_jobs.add(job_id)
                 self._block_id_to_pending_jobs.setdefault(block_id, set()).add(job_id)
@@ -1171,9 +1183,46 @@ class OffloadingConnectorScheduler:
 
         return store_jobs
 
+    def _cpu_tier_counters(self) -> tuple[int, int]:
+        """(stored, evicted) CPU-tier block counts, summed over group pools."""
+        stack = [self.manager]
+        stored = evicted = 0
+        while stack:
+            m = stack.pop()
+            if hasattr(m, "managers"):  # GroupedCPUOffloadingManager
+                stack.extend(m.managers.values())
+                continue
+            m = getattr(m, "primary_tier", m)  # TieringOffloadingManager
+            stored += getattr(m, "num_stored_blocks", 0)
+            evicted += getattr(m, "num_evicted_blocks", 0)
+        return stored, evicted
+
+    def _maybe_log_counters(self) -> None:
+        now = time.monotonic()
+        last = getattr(self, "_counters_logged_at", None)
+        if last is None:
+            # Objects built without __init__ (tests) start counting now.
+            self._counters_logged_at = now
+            return
+        if now - last < 60.0:
+            return
+        self._counters_logged_at = now
+        stored, evicted = self._cpu_tier_counters()
+        logger.info(
+            "Offload counters: demoted_states=%d cpu_stored_blocks=%d "
+            "cpu_evicted_blocks=%d rejected_boundary_offers=%d rule=%s",
+            getattr(self, "num_demoted_states", 0),
+            stored,
+            evicted,
+            # Mamba boundary-state hand-offs the host tier could not accept.
+            getattr(self, "num_rejected_boundary_offers", 0),
+            self.config.superseded_state_rule,
+        )
+
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
+        self._maybe_log_counters()
         for req_id in scheduler_output.preempted_req_ids or ():
             req_status = self._req_status.get(req_id)
             if req_status is None:
@@ -1309,8 +1358,48 @@ class OffloadingConnectorScheduler:
     # superseded, but prefix hits and shared junctions still serve siblings.
     _KEEP_TAIL_STATE_BLOCKS = 3
 
+    def _hit_states_of_others(self, req_status: RequestOffloadState) -> set[OffloadKey]:
+        """Prefix-hit state keys of every other tracked request (exact-boundary
+        recurrent groups): checkpoints those requests resume from."""
+        keys: set[OffloadKey] = set()
+        for other in getattr(self, "_req_status", {}).values():
+            if other is req_status:
+                continue
+            for group_config in self.config.kv_group_configs:
+                if group_config.sliding_window_size_in_blocks != 1:
+                    continue
+                if not group_config.requires_exact_boundary_source:
+                    continue
+                group_state = other.group_states[group_config.group_idx]
+                hit = group_state.num_hit_blocks
+                if 0 < hit <= len(group_state.offload_keys):
+                    keys.add(group_state.offload_keys[hit - 1])
+        return keys
+
     def _demote_superseded_states(self, req_status: RequestOffloadState) -> None:
+        """Demote the recurrent states this request made obsolete (soft: the
+        CPU tier evicts them first; nothing is deleted).
+
+        ``superseded_state_rule`` (OffloadingSpec) selects the states:
+          request        own states in [hit, last block - 3); the last block
+                         counts decode output (historical behaviour)
+          request_fixed  the same, with the last block taken from the prompt:
+                         decode-time states are never offloaded
+                         (offload_prompt_only), so counting output demoted the
+                         prompt-end replay states the next turn resumes from
+          extend         request_fixed + the state at the hit point, once this
+                         request stored a newer state past it: a continued
+                         conversation no longer needs its previous end state
+        The junction (shared prefix) is never demoted. Under request_fixed and
+        extend, neither is the prefix-hit state of another active request
+        (it may still need it, e.g. after preemption), and extend never
+        demotes this prompt's resend checkpoint: an identical resend is capped
+        at prompt_length - 1 and resumes from it (one block earlier with an
+        EAGLE/MTP shift).
+        """
+        rule = getattr(self.config, "superseded_state_rule", "request")
         keys: list[OffloadKey] = []
+        in_use = set() if rule == "request" else self._hit_states_of_others(req_status)
         for group_config in self.config.kv_group_configs:
             if group_config.sliding_window_size_in_blocks != 1:
                 continue
@@ -1319,17 +1408,45 @@ class OffloadingConnectorScheduler:
             group_state = req_status.group_states[group_config.group_idx]
             group_keys = group_state.offload_keys
             keep = self._KEEP_TAIL_STATE_BLOCKS
+            if rule == "request":
+                last = len(group_keys)
+            else:
+                last = min(
+                    len(group_keys),
+                    req_status.req.num_prompt_tokens
+                    // group_config.offloaded_block_size,
+                )
             # Hits include GPU and external prefixes. The junction is already
             # on the usable state boundary, including the EAGLE/MTP shift.
             junction = req_status.req.shared_prefix_boundary
-            for block_idx in range(group_state.num_hit_blocks, len(group_keys) - keep):
+            hit = group_state.num_hit_blocks
+
+            def is_junction(block_idx: int, gc=group_config, jn=junction) -> bool:
+                return bool(jn) and (block_idx + 1) * gc.offloaded_block_size == jn
+
+            demote = [b for b in range(hit, last - keep) if not is_junction(b)]
+            if rule == "extend" and hit > 0:
+                stored = req_status.stored_state_blocks.get(group_config.group_idx)
+                # An identical resend is capped at prompt_length - 1 and
+                # resumes from this prompt's resend boundary; with an
+                # EAGLE/MTP shift the usable state is one block earlier.
+                resend = (req_status.req.num_prompt_tokens - 1) // (
+                    group_config.offloaded_block_size
+                ) - 1
+                resend_blocks = {resend}
+                if getattr(self, "_eagle_state_shift", None) is not None:
+                    resend_blocks.add(resend - 1)
                 if (
-                    junction
-                    and (block_idx + 1) * group_config.offloaded_block_size == junction
+                    stored
+                    and max(stored) >= hit
+                    and hit - 1 < len(group_keys)
+                    and hit - 1 not in resend_blocks
+                    and not is_junction(hit - 1)
                 ):
-                    continue
-                keys.append(group_keys[block_idx])
+                    demote.append(hit - 1)
+            keys.extend(group_keys[b] for b in demote if group_keys[b] not in in_use)
         if keys:
+            self.num_demoted_states = getattr(self, "num_demoted_states", 0) + len(keys)
             self.manager.demote(keys, req_status.req_context)
 
     def take_events(self) -> Iterable[KVCacheEvent]:

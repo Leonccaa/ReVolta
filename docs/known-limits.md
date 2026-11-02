@@ -29,6 +29,12 @@ V100 16 GB, TP2/TP8, and other models have not been tested.
 This release builds SM70 only; other GPU architectures, ROCm, CPU, XPU, TPU, and
 GGUF are outside the build.
 
+- **Qwen4Exp output gate metadata.** Transformers 5.20 resolves
+  `output_gate_type: null` to `hidden_act` (normally `silu`), not `sigmoid`.
+  ReVolta currently rejects an explicit `null` at model initialization; it must
+  not be rewritten to `sigmoid`. Use the checkpoint's actual gate activation.
+  ReVolta's legacy default for an omitted field remains `sigmoid`. Flash-Next
+  explicitly declares `sigmoid` and is unaffected.
 - **AWQ MoE tensor parallelism.** Each routed expert's `down_proj` input size
   per TP shard must be a multiple of the AWQ group size. Loading rejects
   configurations that split a quantization group across shards: padding cannot

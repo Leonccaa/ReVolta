@@ -24,6 +24,20 @@ class Qwen4ExpVisionConfig(Qwen3VLVisionConfig):
     model_type = "qwen4_exp"
     base_config_key = "vision_config"
 
+    def __init__(
+        self,
+        deepstack_visual_indexes: list[int] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        # Transformers 5.20 Qwen4ExpVisionModel has only the final merger.
+        # Retain explicit deepstack indexes from older checkpoint exports.
+        super().__init__(
+            deepstack_visual_indexes=(
+                [] if deepstack_visual_indexes is None else deepstack_visual_indexes
+            ),
+            **kwargs,
+        )
+
 
 class Qwen4ExpTextConfig(Qwen3NextConfig):
     model_type = "qwen4_exp_text"
@@ -64,14 +78,16 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
 
         rope_scaling = kwargs.get("rope_scaling")
         rope_theta = kwargs.get("rope_theta", 10_000.0)
-        # Newer Qwen4Exp exports spell the QSA attention layers
+        # Qwen4Exp exports spell QSA layers "indexed_attention" or
         # "qwen_sparse_attention"; older ones say "full_attention". They select
         # the same path (Qwen4ExpQSAAttention is used whenever indexer_n_heads
         # is set), so normalize here -- one place covers the decoder layers, the
         # MTP head and the KV-cache spec.
         if layer_types is not None:
             layer_types = [
-                "full_attention" if lt == "qwen_sparse_attention" else lt
+                "full_attention"
+                if lt in ("qwen_sparse_attention", "indexed_attention")
+                else lt
                 for lt in layer_types
             ]
         super().__init__(layer_types=layer_types, **kwargs)

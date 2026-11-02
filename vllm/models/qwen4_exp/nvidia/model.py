@@ -1424,7 +1424,7 @@ class Qwen4ExpForConditionalGeneration(
 
         self.use_deepstack = (
             not self.language_model_only
-            and bool(config.vision_config.deepstack_visual_indexes)
+            and bool(getattr(config.vision_config, "deepstack_visual_indexes", []))
             and not isinstance(self.visual, StageMissingLayer)
         )
         self.deepstack_num_level = (

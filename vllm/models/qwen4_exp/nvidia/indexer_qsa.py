@@ -274,14 +274,13 @@ class QSAIndexer(nn.Module):
                 ),
             )
         else:
-            # Unfused reference path
-            from flashinfer.norm import gemma_rmsnorm
-
+            # The torch reference also works where FlashInfer's CuTe RMSNorm
+            # is unsupported (including SM70). Keep the Gemma (1 + weight)
+            # multiplier and normalization in FP32 until the final cast.
             q = projected_q.reshape(-1, self.index_n_heads, self.index_head_dim)
-            q = gemma_rmsnorm(
-                q.reshape(-1, self.index_head_dim),
-                self.q_layernorm.weight,
-                self.q_layernorm.variance_epsilon,
+            q = cast(
+                torch.Tensor,
+                self.q_layernorm.forward_native(q.reshape(-1, self.index_head_dim)),
             ).reshape_as(q)
             q = apply_qsa_rope(self.rotary_emb, positions, q)
 
@@ -307,10 +306,11 @@ class QSAIndexer(nn.Module):
                 self.compress_ratio,
                 rope_position_cache,
             )
-            compressed_keys = gemma_rmsnorm(
-                pooled.reshape(-1, self.index_head_dim),
-                self.k_layernorm.weight,
-                self.k_layernorm.variance_epsilon,
+            compressed_keys = cast(
+                torch.Tensor,
+                self.k_layernorm.forward_native(
+                    pooled.reshape(-1, self.index_head_dim)
+                ),
             ).reshape(-1, 1, self.index_head_dim)
             if getattr(self.rotary_emb, "mrope_section", None):
                 first_positions = first_positions.transpose(0, 1)

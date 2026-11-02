@@ -341,6 +341,10 @@ def _create_req_context(req: Request) -> ReqContext:
 class OffloadingConnectorScheduler:
     """Implementation of Scheduler side methods"""
 
+    # Mamba boundary-state hand-offs the host tier could not accept in the
+    # step they were offered (see _build_boundary_state_store_jobs).
+    num_rejected_boundary_offers: int = 0
+
     def __init__(self, spec: OffloadingSpec):
         self.config = SchedulerOffloadConfig.from_spec(spec)
         self._group_config_by_idx = {
@@ -403,6 +407,7 @@ class OffloadingConnectorScheduler:
         # protected by their ref_cnt) and for sliding window blocks (which can
         # be freed before a request finishes).
         self._block_id_to_pending_jobs: dict[int, set[int]] = {}
+        self.num_rejected_boundary_offers = 0
 
     def _generate_job_id(self) -> int:
         job_id = self._job_counter
@@ -1084,11 +1089,16 @@ class OffloadingConnectorScheduler:
     ) -> dict[int, TransferJob]:
         """Build stores from exact committed Mamba boundary-state blocks.
 
-        Hand-offs that the host tier cannot accept this step (its state slots
-        are pinned by in-flight loads, stores or a filesystem cascade) stay
-        pending on the request and are retried on later steps: the normal
-        store path retries by not advancing ``next_stored_block_idx``, while a
-        hand-off is offered by the core only once.
+        A hand-off is tried only in the step the core offers it. The core
+        does not pin the source block for the connector: once the step ends,
+        the request may free it (e.g. a draft group's sliding window moves on)
+        and the block pool may give it to another request. A store job created
+        now is covered by ``_block_id_to_pending_jobs``, which flushes it
+        before the block is reused; a later retry would not be, and would
+        store another request's data under this request's key. So a hand-off
+        that the host tier cannot accept this step (its state slots are pinned
+        by in-flight loads, stores or a filesystem cascade) is dropped and
+        counted. That boundary is then recomputed on a later prefix hit.
         """
         self._queue_boundary_state_offloads(scheduler_output)
 
@@ -1114,7 +1124,7 @@ class OffloadingConnectorScheduler:
                     num_offloadable_tokens, req.num_prompt_tokens
                 )
 
-            still_pending: list[tuple[int, int, int]] = []
+            rejected: list[int] = []
             for entry in pending:
                 group_idx, block_id, boundary_tokens = entry
                 group_config = self._group_config_by_idx[group_idx]
@@ -1137,13 +1147,7 @@ class OffloadingConnectorScheduler:
                     [offload_key], req_status.req_context
                 )
                 if store_output is None:
-                    logger.debug(
-                        "Request %s: host tier busy, retrying Mamba boundary "
-                        "state at %d tokens next step",
-                        req_id,
-                        boundary_tokens,
-                    )
-                    still_pending.append(entry)
+                    rejected.append(boundary_tokens)
                     continue
                 keys_to_store = set(store_output.keys_to_store)
                 if not keys_to_store:
@@ -1179,7 +1183,16 @@ class OffloadingConnectorScheduler:
                     req_id=req_id,
                     transfer_spec=(src_spec, store_output.store_spec),
                 )
-            req_status.pending_boundary_offloads = still_pending
+            pending.clear()
+            if rejected:
+                self.num_rejected_boundary_offers += len(rejected)
+                logger.info(
+                    "Request %s: host tier busy, dropped Mamba boundary "
+                    "state(s) at %s tokens (%d dropped since start)",
+                    req_id,
+                    rejected,
+                    self.num_rejected_boundary_offers,
+                )
 
         return store_jobs
 
@@ -1259,6 +1272,19 @@ class OffloadingConnectorScheduler:
             for _, dst_block_id in kv_block_copies:
                 self._current_batch_jobs_to_flush.update(
                     self._block_id_to_pending_jobs.get(dst_block_id, ())
+                )
+
+        # The worker zeroes newly allocated pages before this step's stores
+        # run. A page can be allocated while an earlier store still reads it
+        # without passing through the new-block fence in _build_store_jobs: a
+        # request parked for an async load is not scheduled, and groups that
+        # are not offloaded (e.g. the QSA compressor ring) are not fenced by
+        # update_state_after_alloc. Fence every page announced for zeroing.
+        new_block_ids_to_zero = getattr(scheduler_output, "new_block_ids_to_zero", None)
+        if new_block_ids_to_zero and self._block_id_to_pending_jobs:
+            for block_id in new_block_ids_to_zero:
+                self._current_batch_jobs_to_flush.update(
+                    self._block_id_to_pending_jobs.get(block_id, ())
                 )
 
         boundary_store_jobs = self._build_boundary_state_store_jobs(scheduler_output)

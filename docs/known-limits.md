@@ -29,6 +29,19 @@ V100 16 GB, TP2/TP8, and other models have not been tested.
 This release builds SM70 only; other GPU architectures, ROCm, CPU, XPU, TPU, and
 GGUF are outside the build.
 
+- **Qwen4Exp output gate metadata.** Transformers 5.20 resolves
+  `output_gate_type: null` to `hidden_act` (normally `silu`), not `sigmoid`.
+  ReVolta currently rejects an explicit `null` at model initialization; it must
+  not be rewritten to `sigmoid`. Use the checkpoint's actual gate activation.
+  ReVolta's legacy default for an omitted field remains `sigmoid`. Flash-Next
+  explicitly declares `sigmoid` and is unaffected.
+- **AWQ MoE tensor parallelism.** Each routed expert's `down_proj` input size
+  per TP shard must be a multiple of the AWQ group size. Loading rejects
+  configurations that split a quantization group across shards: padding cannot
+  preserve the checkpoint's scale and zero-point assignments. For g32, an MoE
+  intermediate size of 704 is group-aligned at TP1/TP2 (704/352 rows per shard), but
+  TP4 (176 rows per shard) is rejected. Choose a TP size that keeps groups intact.
+  This constraint does not extend the supported model or hardware scope.
 - **Output reproducibility.** A single request is reproducible bit for bit. When several
   requests are prefilled together, the result can differ from the same request run alone,
   so greedy outputs at C2–C8 can change between runs. The cause is the tensor-parallel
@@ -124,6 +137,15 @@ GGUF are outside the build.
   the first message (`System message must be at the beginning.`). Agent stacks that send
   several system messages need to merge them.
 - **Allocator.** Keep `NCCL_GRAPH_REGISTER=0` with expandable allocator segments.
+- **CPU KV offload and restarts.** With CPU KV offload on, a normal stop can leave the
+  shared offload file `/dev/shm/vllm_offload_<id>.mmap` behind
+  ([#51](https://github.com/Leonccaa/ReVolta/issues/51)). Each file is the size of the CPU
+  pool and every start creates a new one, so repeated restarts in the same `/dev/shm`
+  fill it until a start fails. The default `--shutdown-timeout 0` stops the engine before
+  its cleanup runs. Start with `--shutdown-timeout 30` (in-flight requests then get up to
+  30 s to finish), or remove stale `vllm_offload_*.mmap` files that no process has open
+  before starting. A container with its own IPC namespace drops its `/dev/shm` when it
+  is removed. A fix is planned after 0.1.5.
 - **Sleep level 2.** Not supported on the reference setup (128 GiB host, PLE tables in host
   memory): it needs about 87 GiB of free host memory for the model buffers while about
   63 GiB is available. Sleep level 1 works.

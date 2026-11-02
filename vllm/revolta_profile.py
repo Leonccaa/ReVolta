@@ -20,6 +20,7 @@ COMMON_DEFAULTS = {
     "VLLM_SM70_GREEDY_VERIFY": "1",
     "VLLM_SM70_SKIP_REJECTED_BATCH_PACKS": "1",
     "VLLM_SM70_QSA_SHARED_KEY": "1",
+    "VLLM_SM70_QSA_REQUEST_SEGMENTS": "1",
     "VLLM_SM70_QSA_COMPACT_TOPK": "1",
     "VLLM_SM70_PLE_NGRAM_BATCH": "1",
     "VLLM_SM70_PLE_INPUT_PREPARE": "1",
@@ -187,9 +188,37 @@ def has_qsa_capability(model_config: Any) -> bool:
     )
     values = [getattr(text, field, None) for field in fields]
     return all(isinstance(v, int) and v > 0 for v in values) and any(
-        kind in ("full_attention", "qwen_sparse_attention")
+        kind in ("full_attention", "qwen_sparse_attention", "indexed_attention")
         for kind in (getattr(text, "layer_types", None) or ())
     )
+
+
+def _has_awq_qpn_shape(model_config: Any, tensor_parallel_size: int) -> bool:
+    """The measured native-g32 QPN banks are E512, K=2560, TP shard N=160.
+
+    Missing metadata keeps AWQ's generic admission. Do not turn its implicit
+    fallback into an explicit fail-closed QPN request for an unknown shape.
+    """
+    text = getattr(model_config, "hf_text_config", None)
+    if tensor_parallel_size != 4 or any(
+        getattr(text, name, None) != value
+        for name, value in (
+            ("hidden_size", 2560),
+            ("moe_intermediate_size", 640),
+            ("num_experts", 512),
+            ("num_experts_per_tok", 10),
+        )
+    ):
+        return False
+    for owner in ("hf_config", "hf_text_config", "model_arch_config"):
+        quant = getattr(getattr(model_config, owner, None), "quantization_config", None)
+        if quant is not None:
+            return (
+                isinstance(quant, dict)
+                and quant.get("q_group_size", quant.get("group_size")) == 32
+                and quant.get("w_bit", quant.get("bits")) == 4
+            )
+    return False
 
 
 def all_visible_devices_sm70() -> bool:
@@ -305,9 +334,10 @@ def apply_revolta_profile(
         return False
     defaults = dict(COMMON_DEFAULTS)
     if getattr(model_config, "quantization", None) == "awq":
-        defaults.update(AWQ_DEFAULTS)
-        if speculative_method == "dflash":
-            defaults.update(AWQ_DFLASH_DEFAULTS)
+        if _has_awq_qpn_shape(model_config, tensor_parallel_size):
+            defaults.update(AWQ_DEFAULTS)
+            if speculative_method == "dflash":
+                defaults.update(AWQ_DFLASH_DEFAULTS)
     elif has_nvfp4_weights(model_config):
         defaults.update(NVFP4_DEFAULTS)
     if interconnect_mode != "no_p2p":

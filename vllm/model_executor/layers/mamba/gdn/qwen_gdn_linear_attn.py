@@ -2347,6 +2347,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         self.num_k_heads = config.linear_num_key_heads
         self.num_v_heads = config.linear_num_value_heads
+        for name, heads in (
+            ("linear_num_key_heads", self.num_k_heads),
+            ("linear_num_value_heads", self.num_v_heads),
+        ):
+            if heads % self.tp_size:
+                raise ValueError(
+                    f"GDN {name}={heads} must be divisible by "
+                    f"tensor_parallel_size={self.tp_size}"
+                )
         self.head_k_dim = config.linear_key_head_dim
         self.head_v_dim = config.linear_value_head_dim
         self.conv_kernel_size = config.linear_conv_kernel_dim

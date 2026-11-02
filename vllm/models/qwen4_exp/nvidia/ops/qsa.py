@@ -24,6 +24,11 @@ from vllm.models.qwen4_exp.nvidia.ops.sm70_qsa_tuning import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
+from .qsa_request_segments import (
+    qsa_mqa_request_segments_paged,
+    request_segments_unsupported,
+)
+
 logger = init_logger(__name__)
 
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
@@ -1291,6 +1296,37 @@ def _qsa_indexer_cublas_work_supported(rows: int, columns: int) -> bool:
     return rows * columns >= _SM70_INDEXER_CUBLAS_MIN_SCORE_ELEMENTS
 
 
+def _on_sm70_cuda(q: torch.Tensor) -> bool:
+    return q.is_cuda and current_platform.is_device_capability(70)
+
+
+def _use_sm70_qsa_request_segments(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    query_positions: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+) -> bool:
+    """Multi-request batches score with the request-segmented scorer (bitwise
+    equal to the paged scorer, keys read once per segment of up to four rows).
+    Single-request batches keep the shared-key or cuBLAS paths above."""
+
+    if not envs.VLLM_SM70_QSA_REQUEST_SEGMENTS or not _on_sm70_cuda(q):
+        return False
+    reason = request_segments_unsupported(
+        q, k_cache, page_table, token_to_req, query_positions, sequence_lengths
+    )
+    if reason is not None:
+        if reason != "single_request":
+            logger.info_once("SM70 QSA request-segmented scorer fallback: %s.", reason)
+        return False
+    logger.info_once(
+        "Using the SM70 QSA request-segmented scorer for multi-request batches."
+    )
+    return True
+
+
 def _use_sm70_qsa_lexicographic_topk(topk: int) -> bool:
     """Use the exact, deterministic selector for Volta QSA."""
 
@@ -1675,6 +1711,23 @@ def qsa_select_paged_tokens(
                 contiguous_keys,
                 key_valid,
                 all_visible[row_slice],
+            )
+        elif _use_sm70_qsa_request_segments(
+            q[row_slice],
+            k_cache,
+            page_table,
+            token_to_req[row_slice],
+            query_positions[row_slice],
+            sequence_lengths,
+        ):
+            logits, visible_blocks = qsa_mqa_request_segments_paged(
+                q[row_slice],
+                k_cache,
+                page_table,
+                token_to_req[row_slice],
+                query_positions[row_slice],
+                sequence_lengths,
+                compress_ratio,
             )
         else:
             logits, visible_blocks = qsa_mqa_paged(

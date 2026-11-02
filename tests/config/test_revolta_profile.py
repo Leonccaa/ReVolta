@@ -23,6 +23,7 @@ COMMON = {
     "VLLM_SM70_GREEDY_VERIFY": "1",
     "VLLM_SM70_SKIP_REJECTED_BATCH_PACKS": "1",
     "VLLM_SM70_QSA_SHARED_KEY": "1",
+    "VLLM_SM70_QSA_REQUEST_SEGMENTS": "1",
     "VLLM_SM70_QSA_COMPACT_TOPK": "1",
     "VLLM_SM70_PLE_NGRAM_BATCH": "1",
     "VLLM_SM70_PLE_INPUT_PREPARE": "1",
@@ -54,7 +55,14 @@ def model(quantization="awq", dtype=torch.float16):
     return SimpleNamespace(
         quantization=quantization,
         dtype=dtype,
+        hf_config=SimpleNamespace(
+            quantization_config={"quant_method": "awq", "bits": 4, "group_size": 32},
+        ),
         hf_text_config=SimpleNamespace(
+            hidden_size=2560,
+            moe_intermediate_size=640,
+            num_experts=512,
+            num_experts_per_tok=10,
             indexer_n_heads=4,
             indexer_kv_heads=1,
             indexer_head_dim=128,
@@ -177,10 +185,13 @@ def test_incomplete_qsa_does_not_match_model_name(profile, field, bad):
     assert set(os.environ) <= {"PYTEST_CURRENT_TEST"}
 
 
-def test_qsa_sparse_layer_spelling_and_unrelated_name(profile):
+@pytest.mark.parametrize(
+    "layer_type", ["full_attention", "qwen_sparse_attention", "indexed_attention"]
+)
+def test_qsa_sparse_layer_spelling_and_unrelated_name(profile, layer_type):
     config = model()
     config.architectures = ["AnotherQSAModel"]
-    config.hf_text_config.layer_types = ["qwen_sparse_attention"]
+    config.hf_text_config.layer_types = [layer_type]
     assert profile.apply_revolta_profile(config, 4, is_sm70=True)
 
 
@@ -196,7 +207,7 @@ def test_sources_after_upstream_auto_defaults(profile, monkeypatch):
     monkeypatch.setenv("NCCL_GRAPH_REGISTER", "0")  # env_override
     audit = json.loads(module.profile_audit(enabled=True))
     assert audit["enabled"]
-    assert len(audit["values"]) == 45
+    assert len(audit["values"]) == 46
     assert audit["values"][FP16[0]]["source"] == "upstream_default"
     assert audit["values"]["NCCL_GRAPH_REGISTER"]["source"] == "upstream_default"
     assert audit["values"]["VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT"] == {
@@ -309,6 +320,70 @@ def test_qpn_explicit_profile_keeps_fail_closed(profile):
 
 
 @pytest.mark.parametrize(
+    "field,value",
+    [
+        ("hidden_size", 3072),
+        ("moe_intermediate_size", 704),
+        ("moe_intermediate_size", 512),
+        ("num_experts", 256),
+        ("num_experts_per_tok", 8),
+        ("hidden_size", None),
+    ],
+)
+@pytest.mark.parametrize("method", [None, "dflash"])
+def test_other_awq_shapes_leave_tuned_defaults_unset(profile, field, value, method):
+    from vllm.model_executor.layers.quantization.awq_qpn_sm70 import initialize_qpn_m1
+
+    target = model()
+    setattr(target.hf_text_config, field, value)
+    assert profile.apply_revolta_profile(
+        target, 4, is_sm70=True, speculative_method=method
+    )
+    assert not (set(AWQ) | {TAIL_GRAPHS}) & set(os.environ)
+    assert os.environ["VLLM_SM70_QSA_SHARED_KEY"] == "1"
+    assert not initialize_qpn_m1(SimpleNamespace(), shape_contract=False)
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [None, {}, {"bits": 4, "group_size": 128}, {"bits": 8, "group_size": 32}],
+)
+def test_non_native_g32_or_unknown_quantization_uses_generic_awq(profile, metadata):
+    target = model()
+    target.hf_config.quantization_config = metadata
+    assert profile.apply_revolta_profile(target, 4, is_sm70=True)
+    assert not set(AWQ) & set(os.environ)
+
+
+@pytest.mark.parametrize("owner", ["hf_config", "hf_text_config", "model_arch_config"])
+@pytest.mark.parametrize("legacy_keys", [False, True])
+def test_production_awq_metadata_locations_and_aliases(profile, owner, legacy_keys):
+    target = model()
+    del target.hf_config.quantization_config
+    metadata = (
+        {"w_bit": 4, "q_group_size": 32}
+        if legacy_keys
+        else {"bits": 4, "group_size": 32}
+    )
+    if not hasattr(target, owner):
+        setattr(target, owner, SimpleNamespace())
+    getattr(target, owner).quantization_config = metadata
+    assert profile.apply_revolta_profile(target, 4, is_sm70=True)
+    assert all(os.environ.get(name) == value for name, value in AWQ.items())
+
+
+def test_unsupported_awq_shape_keeps_explicit_fail_closed_request(profile, monkeypatch):
+    from vllm.model_executor.layers.quantization.awq_qpn_sm70 import initialize_qpn_m1
+
+    target = model()
+    target.hf_text_config.num_experts = 256
+    monkeypatch.setenv("VLLM_SM70_AWQ_QWEN38_QPN_M1", "1")
+    assert profile.apply_revolta_profile(target, 4, is_sm70=True)
+    with pytest.raises(RuntimeError, match="native-g32 TP4"):
+        initialize_qpn_m1(SimpleNamespace(), shape_contract=False)
+
+
+@pytest.mark.parametrize(
     "is_sm70,dtype",
     [(True, torch.float16), (False, torch.float16), (True, torch.bfloat16)],
 )
@@ -369,6 +444,7 @@ def run_engineargs_early_policy(profile, monkeypatch, apply, **engine_kwargs):
     # Execute the real early sequence, including the real MTP default method.
     import vllm.engine.arg_utils as arg_utils
 
+    monkeypatch.setattr(arg_utils, "get_model_path", lambda path, _revision: path)
     monkeypatch.setattr(
         arg_utils,
         "current_platform",
@@ -494,7 +570,7 @@ def test_frontend_interconnect_mode_and_audit(
     # policy must not read "pex_p2p" while the workers log nvlink.
     assert audit["interconnect_mode"] == logged
     assert audit["interconnect_policy"] == ("auto" if requested is None else requested)
-    assert len(audit["values"]) == 45
+    assert len(audit["values"]) == 46
 
 
 def _applied_profile(profile, monkeypatch, requested, disabled):

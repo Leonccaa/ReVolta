@@ -35,6 +35,13 @@ GGUF are outside the build.
   not be rewritten to `sigmoid`. Use the checkpoint's actual gate activation.
   ReVolta's legacy default for an omitted field remains `sigmoid`. Flash-Next
   explicitly declares `sigmoid` and is unaffected.
+- **AWQ MoE tensor parallelism.** Each routed expert's `down_proj` input size
+  per TP shard must be a multiple of the AWQ group size. Loading rejects
+  configurations that split a quantization group across shards: padding cannot
+  preserve the checkpoint's scale and zero-point assignments. For g32, an MoE
+  intermediate size of 704 is group-aligned at TP1/TP2 (704/352 rows per shard), but
+  TP4 (176 rows per shard) is rejected. Choose a TP size that keeps groups intact.
+  This constraint does not extend the supported model or hardware scope.
 - **Output reproducibility.** A single request is reproducible bit for bit. When several
   requests are prefilled together, the result can differ from the same request run alone,
   so greedy outputs at C2–C8 can change between runs. The cause is the tensor-parallel

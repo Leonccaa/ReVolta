@@ -1896,13 +1896,7 @@ class Scheduler(SchedulerInterface):
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: SpecDecodingStats | None = None
-        kv_connector_stats: KVConnectorStats | None = (
-            kv_connector_output.kv_connector_stats if kv_connector_output else None
-        )
-        if kv_connector_stats and self.connector:
-            kv_stats = self.connector.get_kv_connector_stats()
-            if kv_stats:
-                kv_connector_stats = kv_connector_stats.aggregate(kv_stats)
+        kv_connector_stats = self._collect_kv_connector_stats(kv_connector_output)
 
         failed_kv_load_req_ids = None
         if kv_connector_output and kv_connector_output.invalid_block_ids:
@@ -2726,6 +2720,29 @@ class Scheduler(SchedulerInterface):
         stale vision embeddings are not reused.
         """
         self.encoder_cache_manager.reset()
+
+    def _collect_kv_connector_stats(
+        self, kv_connector_output: KVConnectorOutput | None
+    ) -> KVConnectorStats | None:
+        """Worker-reported connector stats of this step, aggregated with the
+        scheduler-side connector stats (e.g. CPU-tier evictions).
+
+        The scheduler side is collected every step, also when no worker
+        transfer reported stats: otherwise its counters wait for the next
+        transfer, or never show when there is none.
+        """
+        kv_connector_stats: KVConnectorStats | None = (
+            kv_connector_output.kv_connector_stats if kv_connector_output else None
+        )
+        if self.connector:
+            kv_stats = self.connector.get_kv_connector_stats()
+            if kv_stats:
+                kv_connector_stats = (
+                    kv_stats
+                    if kv_connector_stats is None
+                    else kv_connector_stats.aggregate(kv_stats)
+                )
+        return kv_connector_stats
 
     def make_stats(
         self,

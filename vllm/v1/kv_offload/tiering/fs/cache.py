@@ -14,7 +14,7 @@ import heapq
 import os
 import threading
 from collections import OrderedDict
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import ClassVar
@@ -142,6 +142,14 @@ class FileSystemCache:
             if path in self._pages:
                 self._pages.move_to_end(path)
             return True
+
+    def touch(self, paths: Iterable[str]) -> None:
+        """Mark resident pages as recently used, in the given order (the last
+        one becomes the most recent). In memory only: no filesystem calls."""
+        with self._lock:
+            for path in paths:
+                if path in self._pages:
+                    self._pages.move_to_end(path)
 
     @contextmanager
     def read(self, path: str) -> Iterator[None]:

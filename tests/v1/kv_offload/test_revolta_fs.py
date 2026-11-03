@@ -5,6 +5,7 @@
 import mmap
 import os
 import shutil
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -360,3 +361,101 @@ def test_manifest_tool_writes_verifiable_manifest(tmp_path):
     }
     with pytest.raises(SystemExit):
         module.main(["--role", f"target={model}", "--out", str(model / "m.json")])
+
+
+# ---------------------------------------------------------------------------
+# Recency and chain integrity
+# ---------------------------------------------------------------------------
+
+_PAGE = _BLOCK_ELEMENTS * 4
+
+
+def test_touch_keeps_chain_head_most_recent(tmp_path):
+    """D1: a hot head used only through the CPU tier must not be evicted
+    before the chain tail."""
+    tensor, view = _view()
+    tier = make_tier(
+        tmp_path, view, max_size_bytes=3 * _PAGE, mtime_update_interval_s=0
+    )
+    try:
+        chain = [key(1), key(2), key(3)]
+        tensor[:3].fill_(1.0)
+        tier.submit_store(make_job(1, chain, [0, 1, 2]))
+        assert all(r.success for r in drain(tier))
+        tier.touch(chain)
+        tier.flush_mtime_updates()
+        mtimes = [os.stat(tier.file_mapper.get_file_name(k)).st_mtime_ns for k in chain]
+        assert mtimes[0] >= mtimes[1] >= mtimes[2]
+        tier.submit_store(make_job(2, [key(4)], [3]))
+        assert all(r.success for r in drain(tier))
+        assert tier.lookup(key(1)) is True  # head kept
+        assert tier.lookup(key(3)) is False  # tail evicted
+    finally:
+        tier.shutdown()
+
+
+def test_restart_order_follows_touch(tmp_path):
+    tensor, view = _view()
+    tier = make_tier(
+        tmp_path, view, max_size_bytes=3 * _PAGE, mtime_update_interval_s=0
+    )
+    chain = [key(1), key(2), key(3)]
+    tensor[:3].fill_(1.0)
+    tier.submit_store(make_job(1, chain, [0, 1, 2]))
+    assert all(r.success for r in drain(tier))
+    time.sleep(0.02)
+    tier.touch(chain)
+    tier.flush_mtime_updates()
+    tier.shutdown()
+    tier = make_tier(tmp_path, view, max_size_bytes=3 * _PAGE)
+    try:
+        tier.submit_store(make_job(2, [key(4)], [3]))
+        assert all(r.success for r in drain(tier))
+        assert tier.lookup(key(1)) is True
+        assert tier.lookup(key(3)) is False
+    finally:
+        tier.shutdown()
+
+
+def test_mtime_updates_are_throttled(tmp_path):
+    tensor, view = _view()
+    tier = make_tier(tmp_path, view, mtime_update_interval_s=3600)
+    try:
+        path = _store(tier, tensor, key(1))
+        tier.touch([key(1)])
+        tier.flush_mtime_updates()
+        first = os.stat(path).st_mtime_ns
+        time.sleep(0.02)
+        tier.touch([key(1)])
+        tier.flush_mtime_updates()
+        assert os.stat(path).st_mtime_ns == first
+        assert tier.get_revolta_stats()["mtime_updates"] == 1
+    finally:
+        tier.shutdown()
+
+
+def test_chain_stops_at_first_failed_page_per_group(tmp_path, monkeypatch):
+    from vllm.v1.kv_offload.base import make_offload_key
+    from vllm.v1.kv_offload.tiering.fs import revolta
+
+    tensor, view = _view()
+    tier = make_tier(tmp_path, view, n_write_threads=1, n_read_threads=0)
+    real = revolta.store_verified_block
+    bad = tier.file_mapper.get_file_name(make_offload_key(b"\x00" * 7 + b"\x02", 0))
+
+    def flaky(path, *args, **kwargs):
+        if path == bad:
+            raise OSError(5, "injected EIO")
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(revolta, "store_verified_block", flaky)
+    try:
+        g0 = [make_offload_key(i.to_bytes(8, "big"), 0) for i in (1, 2, 3)]
+        g1 = [make_offload_key(i.to_bytes(8, "big"), 1) for i in (1, 2, 3)]
+        tier.submit_store(make_job(1, g0 + g1, [0, 1, 2, 0, 1, 2]))
+        assert [r.success for r in drain(tier)] == [False]
+        assert [tier.lookup(k) for k in g0] == [True, False, False]
+        assert [tier.lookup(k) for k in g1] == [True, True, True]
+        assert tier.get_revolta_stats()["skipped_after_chain_failure"] == 1
+    finally:
+        tier.shutdown()

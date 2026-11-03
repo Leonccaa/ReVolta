@@ -26,14 +26,17 @@ import functools
 import glob
 import hashlib
 import json
+import math
 import os
+import queue
 import struct
 import threading
+import time
 from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
-from vllm.v1.kv_offload.base import OffloadKey
+from vllm.v1.kv_offload.base import OffloadKey, get_offload_group_idx
 from vllm.v1.kv_offload.tiering.base import (
     JobMetadata,
     JobResult,
@@ -280,6 +283,18 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
         require_content_manifest: disable the tier without one (default True).
         verify_content: "stat" (default) checks size/mtime/inode of every
             file; "full" also recomputes every content hash at startup.
+        mtime_update_interval_s: minimum seconds between mtime updates of a
+            page (default 60; 0 = every use).
+
+    Recency: CPU/GPU-tier hits never read the disk tier, so without help its
+    LRU would only see writes, and a hot shared chain head (written first)
+    would be evicted first, orphaning every chain behind it. ``touch`` moves
+    the pages of a used prefix to the recent end in reverse order, so the
+    head is the most recent, and refreshes their mtimes on a background
+    thread (throttled per page), which the cache uses to rebuild its order
+    after a restart. Within one store job, once a page of a group fails, the
+    later pages of that group are skipped, so the persisted chain stays
+    contiguous.
     """
 
     def __init__(
@@ -291,6 +306,7 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
         content_manifest: str | None = None,
         require_content_manifest: bool = True,
         verify_content: str = "stat",
+        mtime_update_interval_s: float = 60.0,
         **kwargs,
     ):
         self._stats_lock = threading.Lock()
@@ -299,8 +315,16 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
             "pages_existing": 0,
             "pages_verified": 0,
             "checksum_failures": 0,
+            "skipped_after_chain_failure": 0,
+            "mtime_updates": 0,
         }
         self.disabled_reason: str | None = None
+        if mtime_update_interval_s < 0:
+            raise ValueError("mtime_update_interval_s must be >= 0")
+        self._mtime_interval = mtime_update_interval_s
+        self._mtime_at: dict[str, float] = {}
+        self._mtime_queue: queue.SimpleQueue[str | None] = queue.SimpleQueue()
+        self._mtime_thread: threading.Thread | None = None
         self._disabled_finished: list[int] = []
         if verify_content not in ("stat", "full"):
             raise ValueError("verify_content must be 'stat' or 'full'")
@@ -339,6 +363,10 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
             offloading_spec, primary_kv_view, tier_type, root_dir, **kwargs
         )
         self._check_xattr_support()
+        self._mtime_thread = threading.Thread(
+            target=self._mtime_worker, name="revolta_fs_mtime", daemon=True
+        )
+        self._mtime_thread.start()
         identity = json.dumps(
             self.file_mapper.get_run_config(), sort_keys=True, separators=(",", ":")
         )
@@ -476,7 +504,25 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
         with self._stats_lock:
             return dict(self._stats)
 
-    def _store_key(self, key: OffloadKey, path: str, block_id: int) -> None:
+    def _store_key(
+        self,
+        key: OffloadKey,
+        path: str,
+        block_id: int,
+        failed_groups: set[int] | None = None,
+    ) -> None:
+        group = get_offload_group_idx(key)
+        if failed_groups is not None and group in failed_groups:
+            self._count("skipped_after_chain_failure")
+            return
+        try:
+            self._write_page(key, path, block_id)
+        except Exception:
+            if failed_groups is not None:
+                failed_groups.add(group)
+            raise
+
+    def _write_page(self, key: OffloadKey, path: str, block_id: int) -> None:
         with self._cache.write(path, self._block_size):
             written = store_verified_block(
                 path,
@@ -502,6 +548,51 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
                 logger.warning("revolta_fs: %s (%s)", exc.reason, path)
                 raise
         self._count("pages_verified")
+        self._schedule_mtime([path])
+
+    # --- recency ------------------------------------------------------------
+
+    def touch(self, keys, req_context=None) -> None:
+        if self.disabled:
+            return
+        paths = [self.file_mapper.get_file_name(k) for k in reversed(list(keys))]
+        self._cache.touch(paths)
+        self._schedule_mtime(paths)
+
+    def _schedule_mtime(self, paths: list[str]) -> None:
+        now = time.monotonic()
+        for path in paths:
+            if now - self._mtime_at.get(path, -math.inf) >= self._mtime_interval:
+                self._mtime_at[path] = now
+                self._mtime_queue.put(path)
+        if len(self._mtime_at) > 4 * max(self._cache.max_files, 1):
+            cutoff = now - self._mtime_interval
+            self._mtime_at = {p: t for p, t in self._mtime_at.items() if t >= cutoff}
+
+    def _mtime_worker(self) -> None:
+        # File timestamps come from a coarse clock, so pages touched together
+        # would tie and restart order would fall back to path order. Stamp
+        # explicit, strictly increasing times in queue order instead.
+        last_ns = 0
+        while True:
+            path = self._mtime_queue.get()
+            if path is None:
+                return
+            last_ns = max(time.time_ns(), last_ns + 1)
+            try:
+                os.utime(path, ns=(last_ns, last_ns))
+                self._count("mtime_updates")
+            except FileNotFoundError:
+                pass
+            except OSError as exc:  # never fails a load or store
+                logger.debug("revolta_fs: mtime update of %s failed: %s", path, exc)
+
+    def flush_mtime_updates(self, timeout: float = 5.0) -> None:
+        """Wait until queued mtime updates are applied (tests, shutdown)."""
+        deadline = time.monotonic() + timeout
+        while not self._mtime_queue.empty() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        time.sleep(0.005)
 
     def lookup(self, key: OffloadKey, req_context=None) -> bool | None:
         if self.disabled:
@@ -519,9 +610,15 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
             # Nothing is written; completing the job releases the CPU pins.
             self._disabled_finished.append(job_metadata.job_id)
             return
+        # Shared by the job's tasks: groups whose chain broke in this job.
+        failed_groups: set[int] = set()
         tasks = (
             functools.partial(
-                self._store_key, key, self.file_mapper.get_file_name(key), int(bid)
+                self._store_key,
+                key,
+                self.file_mapper.get_file_name(key),
+                int(bid),
+                failed_groups,
             )
             for key, bid in zip(job_metadata.keys, job_metadata.block_ids)
         )
@@ -544,3 +641,7 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
         if not getattr(self, "_closed", True):
             logger.info("revolta_fs stats: %s", self.get_revolta_stats())
         super().shutdown()
+        if self._mtime_thread is not None:
+            self._mtime_queue.put(None)
+            self._mtime_thread.join(timeout=5.0)
+            self._mtime_thread = None

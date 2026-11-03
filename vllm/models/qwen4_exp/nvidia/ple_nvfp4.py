@@ -21,9 +21,9 @@ logger = init_logger(__name__)
 
 @triton.jit
 def _gather_rows(table, ids, output, ROW_BYTES: tl.constexpr, B: tl.constexpr):
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     offsets = tl.arange(0, B)
-    idx = tl.load(ids + row)
+    idx = tl.load(ids + row).to(tl.int64)
     ptr = table.to(tl.int64).to(tl.pointer_type(tl.uint8))
     data = tl.load(ptr + idx * ROW_BYTES + offsets, offsets < ROW_BYTES, 0)
     tl.store(output + row * ROW_BYTES + offsets, data, offsets < ROW_BYTES)
@@ -33,7 +33,7 @@ def _gather_rows(table, ids, output, ROW_BYTES: tl.constexpr, B: tl.constexpr):
 def _dequant_rows(rows, global_scale, output, D: tl.constexpr, B: tl.constexpr):
     # Both values and scales are already on the GPU. Explicit integer decode
     # works on SM70 too; no FP8 instructions or activation quantization.
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     col = tl.arange(0, B)
     stride: tl.constexpr = D // 2 + D // 16
     packed = tl.load(rows + row * stride + col // 2, col < D, 0)

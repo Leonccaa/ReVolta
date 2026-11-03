@@ -203,8 +203,9 @@ def _gather_ple_fp8_from_pinned_kernel(
 ):
     """Gather and dequantize one PLE row per program from pinned host memory."""
 
-    row_idx = tl.program_id(0)
-    local_idx = tl.load(ids_ptr + row_idx)
+    # int64 row offsets: row * embedding_dim overflows int32 past 2**31.
+    row_idx = tl.program_id(0).to(tl.int64)
+    local_idx = tl.load(ids_ptr + row_idx).to(tl.int64)
     offsets = tl.arange(0, BLOCK_D)
     mask = offsets < embedding_dim
     byte_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8))
@@ -228,7 +229,7 @@ def _dequantize_ple_fp8_bytes_kernel(
 ):
     """Dequantize raw E4M3FN bytes without exposing FP8 to SM70 Inductor."""
 
-    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < numel
     raw = tl.load(input_ptr + offsets, mask=mask, other=0)
     scale = tl.load(scale_ptr).to(tl.float32)

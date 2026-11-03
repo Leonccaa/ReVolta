@@ -45,6 +45,7 @@ from vllm.v1.kv_offload.cpu.manager import GroupedCPUOffloadingManager
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
+from vllm.v1.kv_offload.tiering.fs.config import FS_TIER_TYPES
 from vllm.v1.kv_offload.tiering.manager import (
     CPUPrimaryTierOffloadingManager,
     TieringOffloadingManager,
@@ -122,7 +123,10 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             self.persistent_layout["kv_storage"] = kv_storage_metadata(
                 kv_cache_config, vllm_config.cache_config.cache_dtype
             )
-            if any(tier.get("type") == "fs" for tier in self.secondary_tier_configs):
+            if any(
+                tier.get("type") in FS_TIER_TYPES
+                for tier in self.secondary_tier_configs
+            ):
                 raise ValueError(
                     "INT8 v1 SSD requires aligned FS framing; raw O_DIRECT pages "
                     "are unsupported. Use CPU offload until FS framing is integrated."

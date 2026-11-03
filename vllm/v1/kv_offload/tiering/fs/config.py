@@ -25,13 +25,18 @@ def validate_fs_budget(max_size_bytes: Any, min_free_bytes: Any = None) -> None:
         raise ValueError("FS tier min_free_bytes must be a non-negative integer")
 
 
+# Secondary tier types backed by FileSystemTierManager (same root_dir layout,
+# hash seed and budget rules).
+FS_TIER_TYPES = ("fs", "revolta_fs")
+
+
 def fs_tier_configs(config: "KVTransferConfig | None") -> list[dict]:
     if config is None or config.kv_connector != "OffloadingConnector":
         return []
     tiers = config.kv_connector_extra_config.get("secondary_tiers", [])
     if not isinstance(tiers, list) or any(not isinstance(t, dict) for t in tiers):
         raise ValueError("secondary_tiers must be a list of tier configurations")
-    result = [tier for tier in tiers if tier.get("type") == "fs"]
+    result = [tier for tier in tiers if tier.get("type") in FS_TIER_TYPES]
     for tier in result:
         validate_fs_budget(tier.get("max_size_bytes"), tier.get("min_free_bytes"))
         if not isinstance(tier.get("root_dir"), str) or not tier["root_dir"]:

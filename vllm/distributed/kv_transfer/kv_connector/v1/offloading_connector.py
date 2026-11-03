@@ -205,9 +205,17 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA, SupportsVmmSafeTransf
         return True
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
-        if self.connector_worker is None:
-            return None  # We only emit stats from the worker-side
-        return self.connector_worker.get_kv_connector_stats()
+        if self.connector_worker is not None:
+            return self.connector_worker.get_kv_connector_stats()
+        if self.connector_scheduler is None:
+            return None
+        # Scheduler side: CPU-tier evictions by reason since the last call.
+        deltas = self.connector_scheduler.cpu_tier_eviction_deltas()
+        if not deltas:
+            return None
+        stats = OffloadingConnectorStats()
+        stats.record_evictions(deltas)
+        return stats
 
     @classmethod
     def build_kv_connector_stats(

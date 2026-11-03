@@ -29,12 +29,22 @@ import json
 import os
 import struct
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import OffloadKey
-from vllm.v1.kv_offload.tiering.base import JobMetadata
+from vllm.v1.kv_offload.tiering.base import (
+    JobMetadata,
+    JobResult,
+    SecondaryTierManager,
+)
+from vllm.v1.kv_offload.tiering.fs.content_manifest import (
+    ManifestError,
+    load_manifest,
+    rehash_and_verify,
+    verify_manifest,
+)
 from vllm.v1.kv_offload.tiering.fs.io import O_DIRECT, _ensure_dirs, _get_tmp_suffix
 from vllm.v1.kv_offload.tiering.fs.manager import FileSystemTierManager
 
@@ -239,8 +249,38 @@ def load_verified_block(
 # ---------------------------------------------------------------------------
 
 
+def expected_content_roots(vllm_config) -> dict[str, str]:
+    """Role -> path of the checkpoint files the engine loads."""
+    roots = {"target": str(vllm_config.model_config.model)}
+    spec = getattr(vllm_config, "speculative_config", None)
+    draft = getattr(spec, "model", None) if spec is not None else None
+    if (
+        isinstance(draft, str)
+        and draft
+        and os.path.exists(draft)
+        and os.path.realpath(draft) != os.path.realpath(roots["target"])
+    ):
+        roots["draft"] = draft
+    return roots
+
+
 class RevoltaFileSystemTierManager(FileSystemTierManager):
-    """File-system secondary tier for persistent, verified KV reuse."""
+    """File-system secondary tier for persistent, verified KV reuse.
+
+    Identity: the directory hash binds the page format, the engine's config
+    hash and the digest of a content manifest of the loaded checkpoint files
+    (see content_manifest.py). The tier fails closed: without a manifest
+    (``require_content_manifest``), with a manifest that does not match the
+    loaded files, or when the namespace's recorded run config differs, it
+    disables itself: lookups miss, stores complete without writing, nothing
+    on disk is read or changed. Inference and the CPU tier are unaffected.
+
+    Extra tier options:
+        content_manifest: path of the manifest file.
+        require_content_manifest: disable the tier without one (default True).
+        verify_content: "stat" (default) checks size/mtime/inode of every
+            file; "full" also recomputes every content hash at startup.
+    """
 
     def __init__(
         self,
@@ -248,6 +288,9 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
         primary_kv_view: memoryview,
         tier_type: str,
         root_dir: str,
+        content_manifest: str | None = None,
+        require_content_manifest: bool = True,
+        verify_content: str = "stat",
         **kwargs,
     ):
         self._stats_lock = threading.Lock()
@@ -257,6 +300,41 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
             "pages_verified": 0,
             "checksum_failures": 0,
         }
+        self.disabled_reason: str | None = None
+        self._disabled_finished: list[int] = []
+        if verify_content not in ("stat", "full"):
+            raise ValueError("verify_content must be 'stat' or 'full'")
+        content_digest = self._content_identity(
+            offloading_spec,
+            content_manifest,
+            require_content_manifest,
+            verify_content,
+        )
+        if content_digest is None:
+            self._init_disabled(offloading_spec, primary_kv_view, tier_type)
+            return
+        try:
+            config_hash = str(offloading_spec.vllm_config.compute_hash())
+        except Exception as exc:  # noqa: BLE001 - identity must not guess
+            self._init_disabled(
+                offloading_spec,
+                primary_kv_view,
+                tier_type,
+                reason=f"cannot hash the engine config: {exc}",
+            )
+            return
+        self._extra_layout = {
+            "revolta_fs_format": PAGE_FORMAT,
+            "content_digest": content_digest,
+            "vllm_config_hash": config_hash,
+        }
+        mapper = self._make_file_mapper(os.path.realpath(root_dir), offloading_spec)
+        conflict = self._run_config_conflict(mapper)
+        if conflict is not None:
+            self._init_disabled(
+                offloading_spec, primary_kv_view, tier_type, reason=conflict
+            )
+            return
         super().__init__(
             offloading_spec, primary_kv_view, tier_type, root_dir, **kwargs
         )
@@ -265,6 +343,61 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
             self.file_mapper.get_run_config(), sort_keys=True, separators=(",", ":")
         )
         self._identity_digest = hashlib.sha256(identity.encode()).digest()
+        logger.info(
+            "revolta_fs enabled at %s (content %s)",
+            os.path.dirname(self.file_mapper.get_config_file_path()),
+            content_digest[:16],
+        )
+
+    # --- identity ---------------------------------------------------------
+
+    @staticmethod
+    def _content_identity(
+        offloading_spec: "OffloadingSpec",
+        manifest_path: str | None,
+        required: bool,
+        verify_content: str,
+    ) -> str | None:
+        """Digest of the verified content manifest; None disables the tier."""
+        if manifest_path is None:
+            if required:
+                logger.error(
+                    "revolta_fs disabled: no content_manifest configured "
+                    "(require_content_manifest=true)"
+                )
+                return None
+            logger.warning(
+                "revolta_fs: no content manifest; persisted KV is bound to "
+                "paths and config only, not to the checkpoint contents"
+            )
+            return "unverified"
+        try:
+            manifest = load_manifest(manifest_path)
+            roots = expected_content_roots(offloading_spec.vllm_config)
+            digest = verify_manifest(manifest, roots)
+            if verify_content == "full":
+                digest = rehash_and_verify(manifest)
+        except ManifestError as exc:
+            logger.error("revolta_fs disabled: %s", exc)
+            return None
+        return digest
+
+    def _init_disabled(
+        self,
+        offloading_spec: "OffloadingSpec",
+        primary_kv_view: memoryview,
+        tier_type: str,
+        reason: str | None = None,
+    ) -> None:
+        SecondaryTierManager.__init__(self, offloading_spec, primary_kv_view, tier_type)
+        self.disabled_reason = reason or "content identity not verified"
+        self._closed = True
+        if reason is not None:
+            logger.error("revolta_fs disabled: %s", reason)
+
+    @property
+    def disabled(self) -> bool:
+        return self.disabled_reason is not None
 
     def _make_file_mapper(self, root_dir: str, offloading_spec: "OffloadingSpec"):
         from vllm.v1.kv_offload.file_mapper import FileMapper
@@ -273,8 +406,44 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
             root_dir=root_dir,
             offloading_spec=offloading_spec,
             gpu_blocks_per_file=offloading_spec.block_size_factor,
-            extra_layout={"revolta_fs_format": PAGE_FORMAT},
+            extra_layout=self._extra_layout,
         )
+
+    @staticmethod
+    def _run_config_conflict(mapper) -> str | None:
+        """Reason the namespace directory belongs to another identity, if so.
+
+        The directory name holds only a hash prefix; the recorded run config
+        must match the full identity."""
+        config_path = mapper.get_config_file_path()
+        if not os.path.exists(config_path):
+            return None
+        try:
+            with open(config_path) as f:
+                recorded = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            return f"unreadable {config_path}: {exc}"
+        if recorded != json.loads(json.dumps(mapper.get_run_config())):
+            return (
+                f"{config_path} records another identity under the same "
+                "directory hash prefix"
+            )
+        return None
+
+    def _write_run_config(self) -> None:
+        """Write the namespace's run config atomically if it is missing."""
+        config_path = self.file_mapper.get_config_file_path()
+        expected = self.file_mapper.get_run_config()
+        if os.path.exists(config_path):
+            return
+        os.makedirs(os.path.dirname(config_path), exist_ok=True)
+        tmp = config_path + _get_tmp_suffix()
+        with open(tmp, "w") as f:
+            json.dump(expected, f, indent=2, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, config_path)
+        _fsync_dir(os.path.dirname(config_path))
 
     def _check_xattr_support(self) -> None:
         """Fail at startup if the root cannot hold checksum attributes: a
@@ -334,7 +503,22 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
                 raise
         self._count("pages_verified")
 
+    def lookup(self, key: OffloadKey, req_context=None) -> bool | None:
+        if self.disabled:
+            return False
+        return super().lookup(key, req_context)
+
+    def get_finished_jobs(self) -> Iterable[JobResult]:
+        if self.disabled:
+            finished, self._disabled_finished = self._disabled_finished, []
+            return (JobResult(job_id=j, success=True) for j in finished)
+        return super().get_finished_jobs()
+
     def submit_store(self, job_metadata: JobMetadata) -> None:
+        if self.disabled:
+            # Nothing is written; completing the job releases the CPU pins.
+            self._disabled_finished.append(job_metadata.job_id)
+            return
         tasks = (
             functools.partial(
                 self._store_key, key, self.file_mapper.get_file_name(key), int(bid)
@@ -344,6 +528,8 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
         self._pool.enqueue_store(job_metadata.job_id, len(job_metadata.keys), tasks)
 
     def submit_load(self, job_metadata: JobMetadata) -> None:
+        if self.disabled:
+            raise RuntimeError("revolta_fs is disabled; lookups never hit it")
         tasks = (
             functools.partial(
                 self._load_key, key, self.file_mapper.get_file_name(key), int(bid)
@@ -353,6 +539,8 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
         self._pool.enqueue_load(job_metadata.job_id, len(job_metadata.keys), tasks)
 
     def shutdown(self) -> None:
+        if self.disabled:
+            return
         if not getattr(self, "_closed", True):
             logger.info("revolta_fs stats: %s", self.get_revolta_stats())
         super().shutdown()

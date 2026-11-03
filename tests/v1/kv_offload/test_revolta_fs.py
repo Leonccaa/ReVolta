@@ -6,6 +6,7 @@ import mmap
 import os
 import shutil
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -20,6 +21,7 @@ from tests.v1.kv_offload.test_fs_tier import (
 )
 from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
 from vllm.v1.kv_offload.tiering.fs.config import fs_tier_configs
+from vllm.v1.kv_offload.tiering.fs.content_manifest import build_manifest
 from vllm.v1.kv_offload.tiering.fs.revolta import (
     CHECKSUM_XATTR,
     RevoltaFileSystemTierManager,
@@ -35,7 +37,29 @@ def _view(num_blocks: int = 4):
     return tensor, memoryview(tensor.numpy())
 
 
-def make_tier(root, view, spec=_MOCK_OFFLOADING_SPEC, **kwargs):
+def make_spec(model_dir="test-model", config_hash="cfg-1"):
+    spec = MagicMock()
+    spec.vllm_config.model_config.model = str(model_dir)
+    spec.vllm_config.speculative_config = None
+    spec.vllm_config.compute_hash.return_value = config_hash
+    for name in (
+        "cache_config",
+        "parallel_config",
+    ):
+        setattr(
+            spec.vllm_config, name, getattr(_MOCK_OFFLOADING_SPEC.vllm_config, name)
+        )
+    spec.kv_cache_config = _MOCK_OFFLOADING_SPEC.kv_cache_config
+    spec.block_size_factor = 1
+    spec.persistent_layout = None
+    return spec
+
+
+_SPEC = make_spec()
+
+
+def make_tier(root, view, spec=_SPEC, **kwargs):
+    kwargs.setdefault("require_content_manifest", False)
     kwargs.setdefault("max_size_bytes", 64 << 20)
     kwargs.setdefault("n_read_threads", 2)
     kwargs.setdefault("n_write_threads", 2)
@@ -65,9 +89,10 @@ def test_registered_and_shares_fs_seed_rules(tmp_path):
             "max_size_bytes": 64 << 20,
             "n_read_threads": 1,
             "n_write_threads": 1,
+            "require_content_manifest": False,
         },
         view,
-        _MOCK_OFFLOADING_SPEC,
+        _SPEC,
     )
     try:
         assert isinstance(tier, RevoltaFileSystemTierManager)
@@ -190,3 +215,148 @@ def test_missing_xattr_support_fails_at_startup(tmp_path, monkeypatch):
     monkeypatch.setattr(os, "setxattr", no_xattr)
     with pytest.raises(RuntimeError, match="extended attributes"):
         make_tier(tmp_path, view)
+
+
+# ---------------------------------------------------------------------------
+# Identity (content manifest, fail closed)
+# ---------------------------------------------------------------------------
+
+
+def _checkpoint(tmp_path):
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text('{"a": 1}')
+    (model / "model-00001.safetensors").write_bytes(b"w" * 4096)
+    return model
+
+
+def _write_manifest(tmp_path, roles):
+    path = tmp_path / "manifest.json"
+    path.write_text(__import__("json").dumps(build_manifest(roles)))
+    return str(path)
+
+
+def _identity_tier(tmp_path, model, manifest, **kwargs):
+    tensor, view = _view()
+    tier = make_tier(
+        tmp_path / "kv",
+        view,
+        spec=make_spec(model),
+        content_manifest=manifest,
+        require_content_manifest=True,
+        **kwargs,
+    )
+    return tier, tensor
+
+
+def test_manifest_enables_and_binds_namespace(tmp_path):
+    model = _checkpoint(tmp_path)
+    manifest = _write_manifest(tmp_path, {"target": str(model)})
+    tier, tensor = _identity_tier(tmp_path, model, manifest)
+    try:
+        assert not tier.disabled
+        layout = tier.file_mapper.get_run_config()["persistent_layout"]
+        assert len(layout["content_digest"]) == 64
+        _store(tier, tensor, key(1))
+        assert _load(tier, key(1)) == [True]
+    finally:
+        tier.shutdown()
+
+
+def test_same_path_weight_swap_disables_tier(tmp_path):
+    """Counterexample 1: same path, same index and config, new shard bytes."""
+    model = _checkpoint(tmp_path)
+    manifest = _write_manifest(tmp_path, {"target": str(model)})
+    tier, tensor = _identity_tier(tmp_path, model, manifest)
+    _store(tier, tensor, key(1))
+    tier.shutdown()
+    shard = model / "model-00001.safetensors"
+    st = shard.stat()
+    shard.write_bytes(b"x" * 4096)  # same name and size, new contents
+    os.utime(shard, ns=(st.st_atime_ns, st.st_mtime_ns + 1))
+    tier, _ = _identity_tier(tmp_path, model, manifest)
+    assert tier.disabled
+    assert tier.lookup(key(1)) is False
+    tier.submit_store(make_job(5, [key(2)], [0]))
+    assert [(r.job_id, r.success) for r in tier.get_finished_jobs()] == [(5, True)]
+    tier.shutdown()
+
+
+def test_full_verification_catches_restored_mtime(tmp_path):
+    """stat checks miss a rewrite that restores size, mtime and inode;
+    verify_content=full recomputes the hashes."""
+    model = _checkpoint(tmp_path)
+    manifest = _write_manifest(tmp_path, {"target": str(model)})
+    shard = model / "model-00001.safetensors"
+    st = shard.stat()
+    with open(shard, "r+b") as f:
+        f.write(b"y")
+    os.utime(shard, ns=(st.st_atime_ns, st.st_mtime_ns))
+    tier, _ = _identity_tier(tmp_path, model, manifest)
+    assert not tier.disabled
+    tier.shutdown()
+    tier, _ = _identity_tier(tmp_path, model, manifest, verify_content="full")
+    assert tier.disabled
+    tier.shutdown()
+
+
+def test_unlisted_file_or_missing_manifest_disables(tmp_path):
+    model = _checkpoint(tmp_path)
+    manifest = _write_manifest(tmp_path, {"target": str(model)})
+    (model / "model-00002.safetensors").write_bytes(b"z")
+    tier, _ = _identity_tier(tmp_path, model, manifest)
+    assert tier.disabled
+    tier.shutdown()
+    tier, _ = _identity_tier(tmp_path, model, None)
+    assert tier.disabled
+    tier.shutdown()
+    assert not (tmp_path / "kv").exists()
+
+
+def test_namespace_config_conflict_disables(tmp_path):
+    model = _checkpoint(tmp_path)
+    manifest = _write_manifest(tmp_path, {"target": str(model)})
+    tier, _ = _identity_tier(tmp_path, model, manifest)
+    config_path = tier.file_mapper.get_config_file_path()
+    tier.shutdown()
+    with open(config_path, "w") as f:
+        f.write('{"someone": "else"}')
+    tier, _ = _identity_tier(tmp_path, model, manifest)
+    assert tier.disabled
+    tier.shutdown()
+
+
+def test_manifest_tool_writes_verifiable_manifest(tmp_path):
+    import importlib.util
+    import json
+
+    from vllm.v1.kv_offload.tiering.fs.content_manifest import (
+        load_manifest,
+        verify_manifest,
+    )
+
+    tool = os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "..",
+        "..",
+        "tools",
+        "kv_offload",
+        "make_content_manifest.py",
+    )
+    spec = importlib.util.spec_from_file_location("make_content_manifest", tool)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    model = _checkpoint(tmp_path)
+    out = tmp_path / "out" / "m.json"
+    out.parent.mkdir()
+    assert module.main(["--role", f"target={model}", "--out", str(out)]) == 0
+    manifest = load_manifest(str(out))
+    assert verify_manifest(manifest, {"target": str(model)}) == manifest["digest"]
+    assert json.loads(out.read_text())["roles"]["target"]["files"].keys() == {
+        "config.json",
+        "model-00001.safetensors",
+    }
+    with pytest.raises(SystemExit):
+        module.main(["--role", f"target={model}", "--out", str(model / "m.json")])

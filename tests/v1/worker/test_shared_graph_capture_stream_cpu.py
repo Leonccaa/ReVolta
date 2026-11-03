@@ -4,7 +4,7 @@
 
 The target runner and the Eagle/MTP draft managers capture one after another,
 so they can share one capture stream (and its library workspaces) while keeping
-separate graph pools. These tests check the wiring only; the workspace saving
+one graph pool. These tests check the wiring only; the workspace saving
 and bitwise replay need a GPU.
 """
 
@@ -21,6 +21,8 @@ from vllm.distributed import parallel_state as ps
 from vllm.v1.worker.gpu import cudagraph_utils as cg
 from vllm.v1.worker.gpu import model_runner as mr
 from vllm.v1.worker.gpu.spec_decode.eagle import speculator as eagle
+
+_GLOBAL_POOL = object()  # stands in for the platform's global graph pool
 
 
 class _FakeStream:
@@ -73,7 +75,7 @@ def test_manager_capture_context_is_created_once(fake_streams):
 def _make_speculator(monkeypatch, mode):
     class _Manager:
         def __init__(self, config, device, cudagraph_mode, *args, **kwargs):
-            self.pool = object()
+            self.pool = _GLOBAL_POOL
             self.cudagraph_mode = cudagraph_mode
             self.capture_context = None
             self.device = device
@@ -108,9 +110,8 @@ def test_eagle_managers_share_one_context(fake_streams, monkeypatch, external):
         assert fake_streams.created == created
     else:
         assert fake_streams.created == created + 1
-    # Pools stay shared between draft prefill and decode only (unchanged);
-    # the target pool is separate, so live outputs cannot alias.
-    assert decode.pool is prefill.pool
+    # Draft prefill, draft decode and the target all use the global pool.
+    assert decode.pool is prefill.pool is _GLOBAL_POOL
 
 
 def test_eagle_without_graphs_leaves_context_unset(fake_streams, monkeypatch):
@@ -151,3 +152,28 @@ def test_runner_passes_target_context_to_eagle():
     source = inspect.getsource(mr)
     assert "capture_context=(" in source
     assert "self.cudagraph_manager.get_capture_context()" in source
+
+
+def test_eagle_graph_managers_use_the_global_pool():
+    """The Eagle/MTP managers no longer create or assign a dedicated pool; they
+    inherit CudaGraphManager's global graph pool, shared with the target."""
+    from vllm.v1.worker.gpu.spec_decode.eagle import cudagraph as eagle_cg
+
+    for cls in (
+        eagle_cg.PrefillEagleCudaGraphManager,
+        eagle_cg.DecodeEagleCudaGraphManager,
+    ):
+        assert cls.__mro__[1] is cg.CudaGraphManager
+        assert "__init__" not in vars(cls)
+    for module in (eagle_cg, eagle):
+        tree = _source_tree(module)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute):
+                assert node.attr != "graph_pool_handle", module.__name__
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    assert not (
+                        isinstance(target, ast.Attribute) and target.attr == "pool"
+                    ), module.__name__
+    init = _source_tree(cg.CudaGraphManager.__init__)
+    assert "get_global_graph_pool" in ast.dump(init)

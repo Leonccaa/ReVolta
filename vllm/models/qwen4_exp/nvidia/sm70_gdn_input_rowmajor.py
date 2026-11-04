@@ -18,6 +18,7 @@ for every M, so each row's result is independent of the batch width.
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from typing import NamedTuple
 
@@ -48,6 +49,22 @@ class SkinnyConfig(NamedTuple):
 
 # Plan for the fused N = 4096 + 24, K = 2560 launch; one plan for every M.
 PLAN = SkinnyConfig(1, 1, 2, 1)
+
+# Research (default off): REVOLTA_SKINNY_MPLAN=1 picks the column tiling by M.
+# Only ng changes; warps_k and splits (the K partition, hence every row's
+# summation order) stay those of PLAN, so outputs are bit-identical to PLAN
+# and still independent of the batch width. Measured on one V100 (one TP4
+# rank's shapes, M = 2..48, all nine (ng, warps_n) choices byte-equal to
+# PLAN): ng=2 is 8-26% faster for M = 9..24 and 33..48, within 1-2% for
+# M <= 8 (kept at PLAN) and slower for M = 25..32 (kept at PLAN).
+_SKINNY_MPLAN = os.getenv("REVOLTA_SKINNY_MPLAN", "0") == "1"
+_PLAN_NG2 = SkinnyConfig(2, 1, 2, 1)
+
+
+def plan_for(m: int) -> SkinnyConfig:
+    if _SKINNY_MPLAN and (9 <= m <= 24 or 33 <= m <= MAX_ROWS):
+        return _PLAN_NG2
+    return PLAN
 
 
 @lru_cache(maxsize=1)
@@ -140,10 +157,13 @@ def gdn_input_rowmajor(
         x2d.new_empty((m, cols))
         for cols in (QKV_COLS, n0 - QKV_COLS, B_COLS, n1 - B_COLS)
     )
-    _launch2(outs, x2d, qkvz_weight, ba_weight, _workspace(x2d, PLAN, n0 + n1), PLAN)
+    plan = plan_for(m)
+    _launch2(outs, x2d, qkvz_weight, ba_weight, _workspace(x2d, plan, n0 + n1), plan)
     logger.info_once(
-        "SM70 Qwen3.8 GDN input: row-major skinny dual GEMM for 2..48 rows (plan=%s).",
+        "SM70 Qwen3.8 GDN input: row-major skinny dual GEMM for 2..48 rows "
+        "(plan=%s, per-M ng=2 plan=%s).",
         tuple(PLAN),
+        _SKINNY_MPLAN,
     )
     return outs  # type: ignore[return-value]
 
@@ -154,6 +174,7 @@ __all__ = [
     "PLAN",
     "SkinnyConfig",
     "admitted",
+    "plan_for",
     "gdn_input_rowmajor",
     "native_available",
     "rows_admitted",

@@ -161,6 +161,12 @@ repos:
     pass_filenames: false
     files: ^(vllm/envs\.py|docs/(configuration|kv-offload)\.md|tools/pre_commit/(check_env_docs\.py|env_docs_baseline\.txt))$
     additional_dependencies: [regex]
+  - id: gen-env-docs
+    name: Keep the generated environment reference in docs/configuration.md current
+    entry: python tools/gen_env_docs.py --check
+    language: python
+    pass_filenames: false
+    files: ^(vllm/envs\.py|vllm/revolta_profile\.py|vllm/config/sm70_dflash2\.py|docs/configuration\.md|tools/(gen_env_docs|env_docs_notes)\.py)$
   - id: check-env-metadata
     name: Require complete environment registration metadata
     entry: python tools/pre_commit/check_env_metadata.py

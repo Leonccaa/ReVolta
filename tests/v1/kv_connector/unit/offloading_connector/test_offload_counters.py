@@ -710,6 +710,72 @@ TRACE_CASES = [
 ]
 
 
+# Jobs, lookups, flushes and every manager call from the actual rc5 parent
+# scheduler (92cbca4d00), across stores, loads, demotion and reset.
+RC5_TRACE_DIGESTS = {
+    (
+        "all",
+        False,
+        False,
+    ): "7a7c53ddd615ca35317ccded23e43e1fcf359cf2692c7bb0840673c02a8f61cc",
+    (
+        "all",
+        False,
+        True,
+    ): "809a4cafb8ae64ef166d72ee720d37f0d56c1ac7a865418c3bd159d5ec37b27a",
+    (
+        "all",
+        True,
+        False,
+    ): "13ae77d6aba539d4e446d58502d099a90da4496510c38ef11331b6974c4f54bb",
+    (
+        "all",
+        True,
+        True,
+    ): "b506326c823cfe19f10cc29ab8e058caa0e690f0e515111bc59860ba3554d041",
+    (
+        "window",
+        False,
+        False,
+    ): "0bddc5ce8570b21df842aa6c9fb453e78487c63db76abee8a9585ab387a0d9e8",
+    (
+        "window",
+        False,
+        True,
+    ): "7369a016583386c1f172fbe1080ec14e13516bb40bb22f21fa2d04081a578488",
+    (
+        "window",
+        True,
+        False,
+    ): "b59ad0b6fed88a81f8d5d4b1f1a1c3ad5480031d16ee6855d0496747541f8b26",
+    (
+        "window",
+        True,
+        True,
+    ): "3709d76ed8fd3bff7bd26db174fc3721a86b4ce62413651db5915cfd1cb13115",
+    (
+        "none",
+        False,
+        False,
+    ): "b84177749a95b3d5158ceb0f9f0fe7107b718d4bd6d840d4bce2a6d5f6f8f006",
+    (
+        "none",
+        False,
+        True,
+    ): "1d8254cfbfaec2b068aff0ceb9d54074b7519c5eba386a366b46dd73efc86f6f",
+    (
+        "none",
+        True,
+        False,
+    ): "6a86f927104afa3783da345aa51bba411b44158475b8d8ff1853ea46dc7c3b91",
+    (
+        "none",
+        True,
+        True,
+    ): "f1d3180a19e98c21fbf2c1bb277564ef404dfc232aa5b5c06103849318fd5d13",
+}
+
+
 @pytest.mark.parametrize(("mode", "grouped", "eagle"), TRACE_CASES)
 def test_counters_do_not_change_behaviour(mode, grouped, eagle):
     """Jobs, lookups and every CPU-tier call are identical with the counters
@@ -718,4 +784,5 @@ def test_counters_do_not_change_behaviour(mode, grouped, eagle):
     without = _trace(mode, grouped, eagle, counters=False)
     assert with_counters == without
     digest = hashlib.sha256(repr(with_counters).encode()).hexdigest()
+    assert digest == RC5_TRACE_DIGESTS[(mode, grouped, eagle)]
     print(f"TRACE {mode} grouped={grouped} eagle={eagle} {digest}")

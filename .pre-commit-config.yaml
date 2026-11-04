@@ -148,11 +148,18 @@ repos:
     additional_dependencies: [regex]
   # Keep Python and native environment reads in the compile cache key.
   - id: check-env-registration
-    name: "Prevent unregistered 'VLLM_*' environment reads"
+    name: "Prevent unregistered 'VLLM_*' and 'REVOLTA_*' environment reads"
     entry: python tools/pre_commit/check_env_registration.py
     language: python
     types: [file]
     files: ^(vllm/.*\.py|(?:csrc|flash-attention-v100|flash_qla|lmdeploy)/.*\.(?:c|cc|cpp|cu|cuh|h|hpp))$
+    additional_dependencies: [regex]
+  - id: check-env-docs
+    name: Require documented, well-named ReVolta environment variables
+    entry: python tools/pre_commit/check_env_docs.py
+    language: python
+    pass_filenames: false
+    files: ^(vllm/envs\.py|docs/(configuration|kv-offload)\.md|tools/pre_commit/(check_env_docs\.py|env_docs_baseline\.txt))$
     additional_dependencies: [regex]
   - id: check-env-metadata
     name: Require complete environment registration metadata

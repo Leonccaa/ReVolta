@@ -5,6 +5,7 @@ import subprocess
 
 from tools.pre_commit.check_env_registration import (
     BASELINE,
+    native_reads,
     registered_variables,
     scan_file,
 )
@@ -152,3 +153,14 @@ def test_module_alias_does_not_override_function_local_binding(tmp_path):
         'import os\nKEY = "VLLM_NOT_A_SWITCH"\n'
         'def read():\n    KEY = "VLLM_PORT"\n    return os.getenv(KEY)\n',
     )
+
+
+def test_revolta_reads_must_be_registered(tmp_path):
+    assert _scan(tmp_path, 'import os\nx = os.getenv("REVOLTA_RESEARCH_NEW_SWITCH")\n')
+    # The rc4 research switches are grandfathered until they are renamed.
+    assert not _scan(tmp_path, 'import os\nx = os.getenv("REVOLTA_SKINNY_MPLAN")\n')
+
+
+def test_native_revolta_reads_must_be_registered():
+    source = 'bool on = env_flag_enabled("REVOLTA_RESEARCH_NEW_SWITCH");\n'
+    assert native_reads(source) == [("REVOLTA_RESEARCH_NEW_SWITCH", 1)]

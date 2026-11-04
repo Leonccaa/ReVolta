@@ -46,6 +46,12 @@ or disable custom all-reduce with `--disable-custom-all-reduce`.
   Waiting for incoming work does not count as a stall: the timeout window restarts when
   the process resumes. This is a diagnostic aid, not a recovery mechanism: the process is
   not restarted or killed.
+- **`--shutdown-timeout 30` (ReVolta default since 0.2.0; upstream vLLM: 0).** On SIGTERM
+  the engine lets in-flight requests run for up to this many seconds, then aborts the rest
+  and answers them. With `0` the engine process is stopped at once: requests still in
+  flight can stay unanswered until the container runtime kills the server, and CPU
+  offload cleanup does not run (see [Support and known limits](known-limits.md)). Keep the
+  container stop grace period (for example `docker stop --time 120`) above this value.
 - **`--gpu-memory-utilization 0.95`** passed the full gate, including the multimodal
   stress test with 8 concurrent requests. Higher values ran out of memory in earlier
   multimodal stress tests. If you change concurrency or media limits, measure again.

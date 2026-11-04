@@ -603,8 +603,14 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
             return dict(self._stats)
 
     def _store_key(self, key: OffloadKey, path: str, block_id: int) -> None:
+        def write():
+            state = current_job()
+            if self._pool.stopping or (state is not None and state.expired):
+                raise StoreCancelled(path)
+            self._write_page(key, path, block_id)
+
         try:
-            self._with_retries(lambda: self._write_page(key, path, block_id))
+            self._with_retries(write)
         except StoreCancelled:
             self._count("store_tasks_cancelled")
             raise

@@ -151,6 +151,7 @@ class DualQueueThreadPool:
         self._store_q: deque = deque()
         self._condition = threading.Condition(threading.Lock())
         self._stop = False
+        self._active_stores = 0
         self._threads: list[threading.Thread] = []
         self._finished_q: deque[tuple[JobId, bool]] = deque()
 
@@ -222,15 +223,20 @@ class DualQueueThreadPool:
             overdue = [
                 (job_id, state)
                 for job_id, state in self._timed.items()
-                if state.deadline is not None and now >= state.deadline
+                if state.expire(now)
             ]
             for job_id, _ in overdue:
                 del self._timed[job_id]
-        for job_id, state in overdue:
-            if state.expire(now):
-                logger.warning("Store job %s exceeded its I/O deadline", job_id)
-                self.num_timed_out += 1
-                self._finished_q.append((job_id, False))
+        for job_id, _ in overdue:
+            logger.warning("Store job %s exceeded its I/O deadline", job_id)
+            self.num_timed_out += 1
+            self._finished_q.append((job_id, False))
+
+    @property
+    def stopping(self) -> bool:
+        """Grouped tasks must stop between pages after the drain deadline."""
+        with self._condition:
+            return self._stop
 
     def shutdown(self, wait: bool = True) -> None:
         if self._drain_timeout_s > 0:
@@ -241,7 +247,7 @@ class DualQueueThreadPool:
                 self._load_q.clear()
             while time.monotonic() < deadline:
                 with self._condition:
-                    if not self._store_q:
+                    if not self._store_q and not self._active_stores:
                         break
                 time.sleep(0.01)
         with self._condition:
@@ -267,10 +273,17 @@ class DualQueueThreadPool:
                     return
                 primary = self._load_q if load_priority else self._store_q
                 secondary = self._store_q if load_priority else self._load_q
-                task, state = primary.popleft() if primary else secondary.popleft()
+                selected = primary if primary else secondary
+                is_store = selected is self._store_q
+                task, state = selected.popleft()
+                if is_store:
+                    self._active_stores += 1
             if state.deadline is not None and state.expired:
                 # Reported failed at its deadline: its buffers may be reused.
                 state.task_done(False)
+                if is_store:
+                    with self._condition:
+                        self._active_stores -= 1
                 continue
             _current.state = state
             try:
@@ -285,6 +298,10 @@ class DualQueueThreadPool:
                 job_finished, success = state.task_done(False)
             finally:
                 _current.state = None
+                if is_store:
+                    with self._condition:
+                        self._active_stores -= 1
+                        self._condition.notify_all()
 
             if job_finished:
                 if state.deadline is not None:

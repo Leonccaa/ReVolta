@@ -75,6 +75,8 @@ def get_fs_hash_seed(
     try:
         return _locked_fs_hash_seed(roots)
     except (OSError, ValueError) as exc:
+        if not any(tier["type"] == "revolta_fs" for tier in enabled):
+            raise
         from vllm.v1.kv_offload.tiering.fs.identity import disable_revolta_root
 
         for tier in enabled:

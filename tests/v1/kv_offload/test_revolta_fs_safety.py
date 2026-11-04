@@ -991,3 +991,38 @@ def test_manifest_bound_quantization_file_changes_identity(tmp_path, role):
     manifest = _write_manifest(tmp_path, {"target": model.model})
     after = get_revolta_identity(cfg, str(root), manifest)
     assert after is not None and before != after
+
+
+@pytest.mark.parametrize("role", ["target", "draft"])
+@pytest.mark.parametrize("source", ["vision_tower", "quantization_config_dict_json"])
+def test_unresolved_nested_sources_disable_identity(tmp_path, role, source):
+    root = tmp_path / "kv"
+    spec, manifest = checkpoint_spec(root)
+    cfg = spec.vllm_config
+    cfg.speculative_config = _draft(cfg.model_config.model)
+    model = (
+        cfg.model_config
+        if role == "target"
+        else cfg.speculative_config.draft_model_config
+    )
+    value = "example/external-encoder"
+    if source.endswith("_json"):
+        value = json.dumps({"nested": {"scale_path": "missing-scales.json"}})
+    model.hf_overrides = {source: value}
+    assert get_revolta_identity(cfg, str(root), manifest) is None
+
+
+def test_auxiliary_config_directory_requires_exact_manifest_files(tmp_path):
+    root = tmp_path / "kv"
+    spec, _ = checkpoint_spec(root)
+    auxiliary = tmp_path / "auxiliary"
+    auxiliary.mkdir()
+    (auxiliary / "config.json").write_text("{}")
+    model = spec.vllm_config.model_config
+    model.hf_config_path = str(auxiliary)
+    manifest = _write_manifest(
+        tmp_path, {"target": model.model, "config": str(auxiliary)}
+    )
+    assert get_revolta_identity(spec.vllm_config, str(root), manifest) is not None
+    (auxiliary / "extra.json").write_text("{}")
+    assert get_revolta_identity(spec.vllm_config, str(root), manifest) is None

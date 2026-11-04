@@ -194,11 +194,14 @@ def _verify_config_sources(config, manifest: dict) -> None:
                 visit(item, name)
         elif isinstance(value, (str, os.PathLike)) and value:
             path = os.fspath(value)
+            if name.endswith("_json"):
+                visit(json.loads(path))
+                return
             path_field = name.endswith(
                 ("_file", "_files", "_path", "_paths", "_dir", "_name_or_path")
             )
             if (
-                path_field or os.path.isabs(path) or os.path.exists(path)
+                path_field or "/" in path or "\\" in path or os.path.exists(path)
             ) and os.path.realpath(path) not in files | roots:
                 raise ManifestError(f"{name}: source is outside the content manifest")
 
@@ -228,8 +231,10 @@ def _verify_config_sources(config, manifest: dict) -> None:
         index = os.path.join(config.model, filename)
         if os.path.isfile(index):
             with open(index) as source:
-                shards = json.load(source)["weight_map"].values()
-            for shard in shards:
+                weights = json.load(source)["weight_map"]
+            if not isinstance(weights, dict):
+                raise ManifestError("invalid checkpoint weight map")
+            for shard in weights.values():
                 if os.path.realpath(os.path.join(config.model, shard)) not in files:
                     raise ManifestError("indexed shard is outside the content manifest")
 
@@ -291,7 +296,13 @@ def get_revolta_identity(
                 ),
             }
         manifest = load_manifest(manifest_path)
-        content = verify_manifest(manifest, roots)
+        # Auxiliary directory inputs also require an exact file set. A newly
+        # added file can change loader selection even if older files match.
+        required_roots = {
+            role: entry["root"] for role, entry in manifest["roles"].items()
+        }
+        required_roots.update(roots)
+        content = verify_manifest(manifest, required_roots)
         _verify_config_sources(target, manifest)
         if speculative is not None:
             _verify_config_sources(draft, manifest)

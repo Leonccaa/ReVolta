@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""REVOLTA_SKINNY_MPLAN: per-M column tiling for the GDN input skinny GEMM must
+"""VLLM_SM70_GDN_SKINNY_MPLAN: per-M column tiling for the GDN input skinny GEMM must
 keep the K partition of PLAN (so every row's summation order) and, on SM70,
 produce byte-identical outputs."""
 

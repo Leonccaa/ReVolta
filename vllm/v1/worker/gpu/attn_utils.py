@@ -7,6 +7,7 @@ from typing import Any, cast
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -438,15 +439,15 @@ class CommonGDNSpecMetadata:
     non_spec_token_indx: torch.Tensor
 
 
-# Research (default off): build the GDN spec/non-spec query offsets on the
-# host instead of indexing GPU tensors with boolean masks (two host syncs per
-# step in mixed prefill + spec-decode batches). Integer offsets only; the
-# values are identical either way.
-_GDN_CPU_SPEC_QUERY_START_LOC = os.getenv("REVOLTA_GDN_CPU_SPEC_QSL", "0") == "1"
-# Research validation: while this file exists, also compute the offsets the
-# original way on the GPU and compare (adds the host syncs back; never enable
-# it for timing runs). Mismatches are logged as errors.
-_GDN_CPU_SPEC_QSL_CHECK_FILE = os.getenv("REVOLTA_GDN_CPU_SPEC_QSL_CHECK_FILE", "")
+# VLLM_SM70_GDN_CPU_SPEC_QSL (default off): build the GDN spec/non-spec query
+# offsets on the host instead of indexing GPU tensors with boolean masks (two
+# host syncs per step in mixed prefill + spec-decode batches). Integer offsets
+# only; the values are identical either way.
+_GDN_CPU_SPEC_QUERY_START_LOC = envs.VLLM_SM70_GDN_CPU_SPEC_QSL
+# Validation: while this file exists, also compute the offsets the original way
+# on the GPU and compare (adds the host syncs back; never enable it for timing
+# runs). Mismatches are logged as errors.
+_GDN_CPU_SPEC_QSL_CHECK_FILE = envs.VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE
 _GDN_CPU_SPEC_QSL_CHECK_STATE = {"checked": 0, "mismatched": 0}
 
 

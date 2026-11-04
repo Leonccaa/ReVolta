@@ -26,6 +26,70 @@ PROFILE_NOTE = (
 _BITWISE = "Outputs are bitwise identical either way."
 
 NOTES: dict[str, dict[str, str]] = {
+    # ---- promoted research switches -------------------------------------
+    "VLLM_SM70_GDN_CPU_SPEC_QSL": dict(
+        section="promoted",
+        since="0.2.0",
+        range="0, 1",
+        tradeoff="Removes two host synchronizations per step in mixed prefill + "
+        "speculative batches; costs a host-side offset computation. " + _BITWISE,
+        metrics="",
+    ),
+    "VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE": dict(
+        section="promoted",
+        since="0.2.0",
+        range="path",
+        tradeoff="Validation only: adds the synchronizations back while the file "
+        "exists. Never set for timing runs.",
+        metrics="",
+    ),
+    "VLLM_SM70_QSA_GROUPED_LPT": dict(
+        section="promoted",
+        since="0.2.0",
+        range="0, 1",
+        tradeoff="Longest grouped page4 CTAs start first, which shortens the "
+        "tail of uneven decode batches. " + _BITWISE,
+        metrics="",
+    ),
+    "VLLM_SM70_GDN_SKINNY_MPLAN": dict(
+        section="promoted",
+        since="0.2.0",
+        range="0, 1",
+        tradeoff="ng=2 tiling is 8-26% faster at M = 9..24 and 33..48 on V100; "
+        "other M keep the fixed plan. Only with VLLM_SM70_QWEN38_GDN_NO_PACK. "
+        + _BITWISE,
+        metrics="",
+    ),
+    "REVOLTA_GDN_CPU_SPEC_QSL": dict(
+        section="promoted",
+        since="0.2.0",
+        range="0, 1",
+        tradeoff="Deprecated alias of VLLM_SM70_GDN_CPU_SPEC_QSL; removed in "
+        "0.2.0rc6. The new name wins when both are set.",
+        metrics="",
+    ),
+    "REVOLTA_GDN_CPU_SPEC_QSL_CHECK_FILE": dict(
+        section="promoted",
+        since="0.2.0",
+        range="path",
+        tradeoff="Deprecated alias of VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE; "
+        "removed in 0.2.0rc6.",
+        metrics="",
+    ),
+    "REVOLTA_QSA_GROUPED_LPT": dict(
+        section="promoted",
+        since="0.2.0",
+        range="0, 1",
+        tradeoff="Deprecated alias of VLLM_SM70_QSA_GROUPED_LPT; removed in 0.2.0rc6.",
+        metrics="",
+    ),
+    "REVOLTA_SKINNY_MPLAN": dict(
+        section="promoted",
+        since="0.2.0",
+        range="0, 1",
+        tradeoff="Deprecated alias of VLLM_SM70_GDN_SKINNY_MPLAN; removed in 0.2.0rc6.",
+        metrics="",
+    ),
     # ---- reference deployment ---------------------------------------------
     "VLLM_QWEN4EXP_PLE_HOST_GIB": dict(
         section="deployment",

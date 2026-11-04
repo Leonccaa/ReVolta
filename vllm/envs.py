@@ -353,6 +353,14 @@ if TYPE_CHECKING:
     VLLM_SM70_QWEN38_GDN_NO_PACK: bool = False
     VLLM_SM70_MTP_GDN_DIRECT_OUTPUT: bool = False
     VLLM_SM70_QSA_SHARED_KEY: bool = False
+    VLLM_SM70_QSA_GROUPED_LPT: bool = False
+    VLLM_SM70_GDN_CPU_SPEC_QSL: bool = False
+    VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE: str = ""
+    VLLM_SM70_GDN_SKINNY_MPLAN: bool = False
+    REVOLTA_QSA_GROUPED_LPT: bool = False
+    REVOLTA_GDN_CPU_SPEC_QSL: bool = False
+    REVOLTA_GDN_CPU_SPEC_QSL_CHECK_FILE: str = ""
+    REVOLTA_SKINNY_MPLAN: bool = False
     VLLM_SM70_QSA_REQUEST_SEGMENTS: bool = False
     VLLM_SM70_QSA_COMPACT_TOPK: bool = False
     VLLM_SM70_PLE_NGRAM_BATCH: bool = False
@@ -1146,6 +1154,44 @@ def deprecated_env(
         return getter()
 
     return _read
+
+
+# Research switches promoted in 0.2.0rc5: old name -> registered name. The old
+# names are honoured for one release with a FutureWarning; the new name wins
+# when both are set.
+PROMOTED_RESEARCH_ENVS = {
+    "REVOLTA_GDN_CPU_SPEC_QSL": "VLLM_SM70_GDN_CPU_SPEC_QSL",
+    "REVOLTA_GDN_CPU_SPEC_QSL_CHECK_FILE": "VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE",
+    "REVOLTA_QSA_GROUPED_LPT": "VLLM_SM70_QSA_GROUPED_LPT",
+    "REVOLTA_SKINNY_MPLAN": "VLLM_SM70_GDN_SKINNY_MPLAN",
+}
+_PROMOTED_REMOVAL = "0.2.0rc6"
+
+
+def _promoted_raw(new_name: str, default: str) -> str:
+    """Raw value of a promoted switch: new name first, then its old alias."""
+    if new_name in os.environ:
+        return os.environ[new_name]
+    old_name = next(
+        old for old, new in PROMOTED_RESEARCH_ENVS.items() if new == new_name
+    )
+    if old_name in os.environ:
+        warnings.warn(
+            f"{old_name} is deprecated and will be removed in "
+            f"{_PROMOTED_REMOVAL}. Use {new_name}.",
+            FutureWarning,
+            stacklevel=3,
+        )
+        return os.environ[old_name]
+    return default
+
+
+def _promoted_flag(new_name: str) -> Callable[[], bool]:
+    return lambda: _promoted_raw(new_name, "0") == "1"
+
+
+def _promoted_str(new_name: str) -> Callable[[], str]:
+    return lambda: _promoted_raw(new_name, "")
 
 
 def sm70_debug_enabled(channel: str, legacy_name: str) -> bool:
@@ -4605,6 +4651,138 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ),
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_QSA_GROUPED_LPT": env_var(
+        _promoted_flag("VLLM_SM70_QSA_GROUPED_LPT"),
+        description=(
+            "Launch the grouped page4 QSA CTAs in descending planned work "
+            "(longest processing time first) instead of request order, so the "
+            "longest groups start first. Each CTA reads and writes only its own "
+            "group, so outputs are bitwise identical either way. Promoted from "
+            "REVOLTA_QSA_GROUPED_LPT in 0.2.0rc5."
+        ),
+        category="tuning",
+        declared_default="False",
+        effective_default=(
+            "False; REVOLTA_QSA_GROUPED_LPT=1 also enables it until 0.2.0rc6."
+        ),
+        automatic_conditions=(),
+        acceleration_paths=("SM70 QSA grouped page4 decode",),
+        user_visible=True,
+    ),
+    "VLLM_SM70_GDN_CPU_SPEC_QSL": env_var(
+        _promoted_flag("VLLM_SM70_GDN_CPU_SPEC_QSL"),
+        description=(
+            "Build the GDN speculative/non-speculative query start offsets on "
+            "the host from the CPU copies of the query lengths and spec masks "
+            "instead of indexing GPU tensors with boolean masks, removing two "
+            "host synchronizations per step in mixed prefill and speculative "
+            "decode batches. Integer offsets only; the values are identical. "
+            "Promoted from REVOLTA_GDN_CPU_SPEC_QSL in 0.2.0rc5."
+        ),
+        category="tuning",
+        declared_default="False",
+        effective_default=(
+            "False; REVOLTA_GDN_CPU_SPEC_QSL=1 also enables it until 0.2.0rc6."
+        ),
+        automatic_conditions=(),
+        acceleration_paths=("GDN attention metadata (host)",),
+        user_visible=True,
+    ),
+    "VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE": env_var(
+        _promoted_str("VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE"),
+        description=(
+            "Validation for VLLM_SM70_GDN_CPU_SPEC_QSL: while the named file "
+            "exists, also compute the offsets on the GPU the original way and "
+            "log mismatches as errors. Adds the host synchronizations back; "
+            "never set it for timing runs. Promoted from "
+            "REVOLTA_GDN_CPU_SPEC_QSL_CHECK_FILE in 0.2.0rc5."
+        ),
+        category="debug",
+        declared_default="''",
+        effective_default="'' (disabled)",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_SM70_GDN_SKINNY_MPLAN": env_var(
+        _promoted_flag("VLLM_SM70_GDN_SKINNY_MPLAN"),
+        description=(
+            "Pick the column tiling of the row-major GDN input skinny dual GEMM "
+            "(VLLM_SM70_QWEN38_GDN_NO_PACK path) by batch rows: ng=2 for "
+            "M = 9..24 and 33..48, the fixed plan otherwise. The K partition "
+            "and therefore every row's summation order are unchanged, so "
+            "outputs are bitwise identical to the fixed plan. Promoted from "
+            "REVOLTA_SKINNY_MPLAN in 0.2.0rc5."
+        ),
+        category="tuning",
+        declared_default="False",
+        effective_default=(
+            "False; REVOLTA_SKINNY_MPLAN=1 also enables it until 0.2.0rc6."
+        ),
+        automatic_conditions=(),
+        acceleration_paths=("SM70 Qwen3.8 GDN input projection",),
+        user_visible=True,
+    ),
+    "REVOLTA_QSA_GROUPED_LPT": env_var(
+        deprecated_env(
+            "REVOLTA_QSA_GROUPED_LPT",
+            "0.2.0rc6",
+            "Use VLLM_SM70_QSA_GROUPED_LPT.",
+            _promoted_flag("VLLM_SM70_QSA_GROUPED_LPT"),
+        ),
+        description="Deprecated alias of VLLM_SM70_QSA_GROUPED_LPT.",
+        category="deprecated",
+        declared_default="False",
+        effective_default="Same as VLLM_SM70_QSA_GROUPED_LPT.",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "REVOLTA_GDN_CPU_SPEC_QSL": env_var(
+        deprecated_env(
+            "REVOLTA_GDN_CPU_SPEC_QSL",
+            "0.2.0rc6",
+            "Use VLLM_SM70_GDN_CPU_SPEC_QSL.",
+            _promoted_flag("VLLM_SM70_GDN_CPU_SPEC_QSL"),
+        ),
+        description="Deprecated alias of VLLM_SM70_GDN_CPU_SPEC_QSL.",
+        category="deprecated",
+        declared_default="False",
+        effective_default="Same as VLLM_SM70_GDN_CPU_SPEC_QSL.",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "REVOLTA_GDN_CPU_SPEC_QSL_CHECK_FILE": env_var(
+        deprecated_env(
+            "REVOLTA_GDN_CPU_SPEC_QSL_CHECK_FILE",
+            "0.2.0rc6",
+            "Use VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE.",
+            _promoted_str("VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE"),
+        ),
+        description="Deprecated alias of VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE.",
+        category="deprecated",
+        declared_default="''",
+        effective_default="Same as VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE.",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "REVOLTA_SKINNY_MPLAN": env_var(
+        deprecated_env(
+            "REVOLTA_SKINNY_MPLAN",
+            "0.2.0rc6",
+            "Use VLLM_SM70_GDN_SKINNY_MPLAN.",
+            _promoted_flag("VLLM_SM70_GDN_SKINNY_MPLAN"),
+        ),
+        description="Deprecated alias of VLLM_SM70_GDN_SKINNY_MPLAN.",
+        category="deprecated",
+        declared_default="False",
+        effective_default="Same as VLLM_SM70_GDN_SKINNY_MPLAN.",
+        automatic_conditions=(),
+        acceleration_paths=(),
         user_visible=False,
     ),
     "VLLM_SM70_QSA_REQUEST_SEGMENTS": env_var(
@@ -19694,6 +19872,16 @@ def compile_factors() -> dict[str, object]:
         "VLLM_DO_NOT_TRACK",
         "VLLM_LOGGING_LEVEL",
         "VLLM_REVOLTA_PROFILE_PROVENANCE",
+        # Host metadata and opaque custom-op launch order/tiling only; outputs
+        # are bitwise identical and the compiled graph does not change.
+        "VLLM_SM70_QSA_GROUPED_LPT",
+        "VLLM_SM70_GDN_CPU_SPEC_QSL",
+        "VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE",
+        "VLLM_SM70_GDN_SKINNY_MPLAN",
+        "REVOLTA_QSA_GROUPED_LPT",
+        "REVOLTA_GDN_CPU_SPEC_QSL",
+        "REVOLTA_GDN_CPU_SPEC_QSL_CHECK_FILE",
+        "REVOLTA_SKINNY_MPLAN",
         "VLLM_LOGGING_PREFIX",
         "VLLM_LOGGING_STREAM",
         "VLLM_LOGGING_CONFIG_PATH",

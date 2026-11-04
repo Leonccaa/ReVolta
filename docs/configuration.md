@@ -157,6 +157,19 @@ type and default as registered in `vllm/envs.py`; *Since* is the first
 release with the variable (1Cat = inherited from 1Cat-vLLM); *Category*
 is configuration, tuning, experimental, debug or deprecated.
 
+### Promoted research switches (0.2.0rc5)
+
+| Name | Type | Default | Range | Category | Since | Effect and trade-off |
+|---|---|---|---|---|---|---|
+| `REVOLTA_GDN_CPU_SPEC_QSL` | bool | `False` | 0, 1 | deprecated | 0.2.0 | Deprecated alias of VLLM_SM70_GDN_CPU_SPEC_QSL; removed in 0.2.0rc6. The new name wins when both are set. |
+| `REVOLTA_GDN_CPU_SPEC_QSL_CHECK_FILE` | str | `''` | path | deprecated | 0.2.0 | Deprecated alias of VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE; removed in 0.2.0rc6. |
+| `REVOLTA_QSA_GROUPED_LPT` | bool | `False` | 0, 1 | deprecated | 0.2.0 | Deprecated alias of VLLM_SM70_QSA_GROUPED_LPT; removed in 0.2.0rc6. |
+| `REVOLTA_SKINNY_MPLAN` | bool | `False` | 0, 1 | deprecated | 0.2.0 | Deprecated alias of VLLM_SM70_GDN_SKINNY_MPLAN; removed in 0.2.0rc6. |
+| `VLLM_SM70_GDN_CPU_SPEC_QSL` | bool | `False` | 0, 1 | tuning | 0.2.0 | Removes two host synchronizations per step in mixed prefill + speculative batches; costs a host-side offset computation. Outputs are bitwise identical either way. |
+| `VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE` | str | `''` | path | debug | 0.2.0 | Validation only: adds the synchronizations back while the file exists. Never set for timing runs. |
+| `VLLM_SM70_GDN_SKINNY_MPLAN` | bool | `False` | 0, 1 | tuning | 0.2.0 | ng=2 tiling is 8-26% faster at M = 9..24 and 33..48 on V100; other M keep the fixed plan. Only with VLLM_SM70_QWEN38_GDN_NO_PACK. Outputs are bitwise identical either way. |
+| `VLLM_SM70_QSA_GROUPED_LPT` | bool | `False` | 0, 1 | tuning | 0.2.0 | Longest grouped page4 CTAs start first, which shortens the tail of uneven decode batches. Outputs are bitwise identical either way. |
+
 ### Settings used by the reference deployment
 
 | Name | Type | Default | Range | Category | Since | Effect and trade-off |

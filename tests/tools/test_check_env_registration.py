@@ -157,7 +157,7 @@ def test_module_alias_does_not_override_function_local_binding(tmp_path):
 
 def test_revolta_reads_must_be_registered(tmp_path):
     assert _scan(tmp_path, 'import os\nx = os.getenv("REVOLTA_RESEARCH_NEW_SWITCH")\n')
-    # The rc4 research switches are grandfathered until they are renamed.
+    # Registered deprecated aliases are accepted.
     assert not _scan(tmp_path, 'import os\nx = os.getenv("REVOLTA_SKINNY_MPLAN")\n')
 
 

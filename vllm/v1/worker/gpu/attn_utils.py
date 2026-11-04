@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, cast
@@ -437,6 +438,13 @@ class CommonGDNSpecMetadata:
     non_spec_token_indx: torch.Tensor
 
 
+# Research (default off): build the GDN spec/non-spec query offsets on the
+# host instead of indexing GPU tensors with boolean masks (two host syncs per
+# step in mixed prefill + spec-decode batches). Integer offsets only; the
+# values are identical either way.
+_GDN_CPU_SPEC_QUERY_START_LOC = os.getenv("REVOLTA_GDN_CPU_SPEC_QSL", "0") == "1"
+
+
 def compute_common_gdn_attn_metadata(
     *,
     num_decode_draft_tokens_cpu: torch.Tensor | None,
@@ -523,36 +531,61 @@ def compute_common_gdn_attn_metadata(
         non_spec_token_indx = index[:num_non_spec_tokens]
         spec_token_indx = index[num_non_spec_tokens:]
 
-        spec_query_start_loc = torch.zeros(
-            num_spec_decodes + 1,
-            dtype=torch.int32,
-            device=query_start_loc.device,
-        )
-        torch.cumsum(
-            query_lens[spec_sequence_masks],
-            dim=0,
-            out=spec_query_start_loc[1:],
-        )
-        non_spec_query_start_loc = torch.zeros(
-            query_lens.numel() - num_spec_decodes + 1,
-            dtype=torch.int32,
-            device=query_start_loc.device,
-        )
-        torch.cumsum(
-            query_lens[~spec_sequence_masks],
-            dim=0,
-            out=non_spec_query_start_loc[1:],
-        )
-        non_spec_query_start_loc_cpu = torch.zeros(
-            query_lens_cpu.numel() - num_spec_decodes + 1,
-            dtype=torch.int32,
-            device="cpu",
-        )
-        torch.cumsum(
-            query_lens_cpu[~spec_sequence_masks_cpu],
-            dim=0,
-            out=non_spec_query_start_loc_cpu[1:],
-        )
+        if _GDN_CPU_SPEC_QUERY_START_LOC:
+            # Same integer offsets as the GPU branch below, built on the host
+            # from CPU masks and sent in one pinned copy: boolean-mask
+            # indexing of a GPU tensor needs nonzero() and blocks the host.
+            num_non_spec = query_lens_cpu.numel() - num_spec_decodes
+            offsets_cpu = torch.zeros(
+                num_spec_decodes + 1 + num_non_spec + 1,
+                dtype=torch.int32,
+                pin_memory=query_start_loc.is_cuda,
+            )
+            torch.cumsum(
+                query_lens_cpu[spec_sequence_masks_cpu],
+                dim=0,
+                out=offsets_cpu[1 : num_spec_decodes + 1],
+            )
+            torch.cumsum(
+                query_lens_cpu[~spec_sequence_masks_cpu],
+                dim=0,
+                out=offsets_cpu[num_spec_decodes + 2 :],
+            )
+            offsets = offsets_cpu.to(query_start_loc.device, non_blocking=True)
+            spec_query_start_loc = offsets[: num_spec_decodes + 1]
+            non_spec_query_start_loc = offsets[num_spec_decodes + 1 :]
+            non_spec_query_start_loc_cpu = offsets_cpu[num_spec_decodes + 1 :].clone()
+        else:
+            spec_query_start_loc = torch.zeros(
+                num_spec_decodes + 1,
+                dtype=torch.int32,
+                device=query_start_loc.device,
+            )
+            torch.cumsum(
+                query_lens[spec_sequence_masks],
+                dim=0,
+                out=spec_query_start_loc[1:],
+            )
+            non_spec_query_start_loc = torch.zeros(
+                query_lens.numel() - num_spec_decodes + 1,
+                dtype=torch.int32,
+                device=query_start_loc.device,
+            )
+            torch.cumsum(
+                query_lens[~spec_sequence_masks],
+                dim=0,
+                out=non_spec_query_start_loc[1:],
+            )
+            non_spec_query_start_loc_cpu = torch.zeros(
+                query_lens_cpu.numel() - num_spec_decodes + 1,
+                dtype=torch.int32,
+                device="cpu",
+            )
+            torch.cumsum(
+                query_lens_cpu[~spec_sequence_masks_cpu],
+                dim=0,
+                out=non_spec_query_start_loc_cpu[1:],
+            )
 
     return CommonGDNSpecMetadata(
         num_prefills=num_prefills,

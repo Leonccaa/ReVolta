@@ -10,9 +10,9 @@ seed, budget and thread pool, and only takes effect when configured: plain
 Integrity: every page carries a CRC32C of its payload in the extended
 attribute ``user.revolta.kv_crc32c`` (the approach of the upstream FS-tier
 checksum proposal, which keeps the payload byte-exact and O_DIRECT aligned).
-The stored value is XORed with a tag of the page's offload key and the tier's
-full layout identity, so an intact page stored for another prefix, group or
-layout fails the check like a corrupted one. A page is published by writing a
+The attribute separately records the full offload key and SHA-256 namespace
+identity, compared exactly on load. CRC32C covers only the payload. A page is
+published by writing a
 temporary file, setting the attribute, fsync, rename and a directory fsync.
 On load the payload is verified before the load is reported successful; a
 page that is short, has no or a malformed attribute, or fails the check is
@@ -26,7 +26,6 @@ import functools
 import glob
 import hashlib
 import json
-import math
 import os
 import queue
 import struct
@@ -42,11 +41,11 @@ from vllm.v1.kv_offload.tiering.base import (
     JobResult,
     SecondaryTierManager,
 )
-from vllm.v1.kv_offload.tiering.fs.content_manifest import (
-    ManifestError,
-    load_manifest,
-    rehash_and_verify,
-    verify_manifest,
+from vllm.v1.kv_offload.tiering.fs.identity import (
+    PAGE_FORMAT,
+    canonical_digest,
+    disable_revolta_root,
+    get_revolta_identity,
 )
 from vllm.v1.kv_offload.tiering.fs.io import O_DIRECT, _ensure_dirs, _get_tmp_suffix
 from vllm.v1.kv_offload.tiering.fs.manager import FileSystemTierManager
@@ -57,11 +56,9 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 CHECKSUM_XATTR = "user.revolta.kv_crc32c"
-# Attribute value: little-endian (format version, tagged CRC32C).
-_XATTR_FORMAT = struct.Struct("<II")
-_XATTR_VERSION = 1
-# On-disk format of this tier, bound into the directory hash.
-PAGE_FORMAT = "revolta_fs/page-v1+crc32c-xattr"
+# Version, payload CRC32C, full SHA-256 namespace digest, key length; then key.
+_XATTR_FORMAT = struct.Struct("<II32sI")
+_XATTR_VERSION = 2
 
 
 # ---------------------------------------------------------------------------
@@ -145,36 +142,42 @@ def _fsync_dir(path: str) -> None:
         os.close(fd)
 
 
-def read_tagged_crc(path_or_fd: str | int) -> int | None:
-    """Return the tagged CRC stored for a page, or None if it has no valid
-    attribute."""
+def read_page_identity(path_or_fd: str | int) -> tuple[int, bytes, bytes] | None:
+    """Return (payload CRC32C, full namespace digest, full OffloadKey)."""
     try:
         raw = os.getxattr(path_or_fd, CHECKSUM_XATTR)
     except OSError as exc:
         if exc.errno in (errno.ENODATA, errno.ENOTSUP, errno.ENOENT):
             return None
         raise
-    if len(raw) != _XATTR_FORMAT.size:
+    if len(raw) < _XATTR_FORMAT.size:
         return None
-    version, value = _XATTR_FORMAT.unpack(raw)
-    if version != _XATTR_VERSION:
+    version, crc, identity, key_len = _XATTR_FORMAT.unpack_from(raw)
+    key = raw[_XATTR_FORMAT.size :]
+    if version != _XATTR_VERSION or key_len != len(key) or key_len <= 4:
         return None
-    return value
+    return crc, identity, key
 
 
 def store_verified_block(
-    dest_path: str, view: memoryview, offset: int, block_size: int, tag: int
+    dest_path: str,
+    view: memoryview,
+    offset: int,
+    block_size: int,
+    key: OffloadKey,
+    identity: bytes,
 ) -> bool:
-    """Durably publish one page with its tagged checksum.
+    """Publish one page with its payload checksum and full identity.
 
     Returns False if a page with a valid attribute already exists (it is not
     rewritten; its payload is verified on load). A file without one is a
     partial or foreign page and is replaced.
     """
-    if os.path.exists(dest_path) and read_tagged_crc(dest_path) is not None:
+    existing = read_page_identity(dest_path)
+    if existing is not None and existing[1:] == (identity, bytes(key)):
         return False
     payload = view.cast("B")[offset : offset + block_size]
-    value = crc32c(payload) ^ tag
+    value = crc32c(payload)
     tmp_path = dest_path + _get_tmp_suffix()
     _ensure_dirs(dest_path)
     try:
@@ -190,7 +193,12 @@ def store_verified_block(
                     errno.EIO,
                     f"Short write: expected {len(payload)} bytes, wrote {written}",
                 )
-            os.setxattr(fd, CHECKSUM_XATTR, _XATTR_FORMAT.pack(_XATTR_VERSION, value))
+            os.setxattr(
+                fd,
+                CHECKSUM_XATTR,
+                _XATTR_FORMAT.pack(_XATTR_VERSION, value, identity, len(key))
+                + bytes(key),
+            )
             os.fsync(fd)
         finally:
             os.close(fd)
@@ -208,7 +216,12 @@ def store_verified_block(
 
 
 def load_verified_block(
-    source_path: str, view: memoryview, offset: int, block_size: int, tag: int
+    source_path: str,
+    view: memoryview,
+    offset: int,
+    block_size: int,
+    key: OffloadKey,
+    identity: bytes,
 ) -> None:
     """Read one page into ``view`` and verify it; delete it on any failure.
 
@@ -222,13 +235,15 @@ def load_verified_block(
         file_size = os.fstat(fd).st_size
         if file_size != block_size:
             raise ChecksumError(source_path, f"size {file_size}, expected {block_size}")
-        stored = read_tagged_crc(fd)
+        stored = read_page_identity(fd)
         if stored is None:
             raise ChecksumError(source_path, "missing or malformed checksum")
+        if stored[1:] != (identity, bytes(key)):
+            raise ChecksumError(source_path, "page identity mismatch")
         bytes_read = os.readv(fd, [payload])
         if bytes_read < block_size:
             raise ChecksumError(source_path, f"short read {bytes_read}")
-        if crc32c(payload) ^ tag != stored:
+        if crc32c(payload) != stored[0]:
             raise ChecksumError(source_path, "checksum mismatch")
     except FileNotFoundError:
         raise
@@ -252,36 +267,19 @@ def load_verified_block(
 # ---------------------------------------------------------------------------
 
 
-def expected_content_roots(vllm_config) -> dict[str, str]:
-    """Role -> path of the checkpoint files the engine loads."""
-    roots = {"target": str(vllm_config.model_config.model)}
-    spec = getattr(vllm_config, "speculative_config", None)
-    draft = getattr(spec, "model", None) if spec is not None else None
-    if (
-        isinstance(draft, str)
-        and draft
-        and os.path.exists(draft)
-        and os.path.realpath(draft) != os.path.realpath(roots["target"])
-    ):
-        roots["draft"] = draft
-    return roots
-
-
 class RevoltaFileSystemTierManager(FileSystemTierManager):
     """File-system secondary tier for persistent, verified KV reuse.
 
     Identity: the directory hash binds the page format, the engine's config
-    hash and the digest of a content manifest of the loaded checkpoint files
-    (see content_manifest.py). The tier fails closed: without a manifest
-    (unless ``enable_unverified_content``), with a manifest that does not match the
-    loaded files, or when the namespace's recorded run config differs, it
+    identity and the digest of a content manifest of the loaded checkpoint files
+    (see content_manifest.py). The tier fails closed: without a manifest,
+    with a manifest that does not match the loaded files, or when the namespace's
+    recorded run config differs, it
     disables itself: lookups miss, stores complete without writing, nothing
     on disk is read or changed. Inference and the CPU tier are unaffected.
 
     Extra tier options (documented as ``ssd.*`` in docs/kv-offload.md):
         content_manifest_path: path of the manifest file.
-        enable_unverified_content: run without a manifest, binding pages to
-            paths and config only (default False: the tier is disabled).
         content_verify: "stat" (default) checks size/mtime/inode of every
             file; "full" also recomputes every content hash at startup.
         mtime_update_interval_s: minimum seconds between mtime updates of a
@@ -292,7 +290,7 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
     would be evicted first, orphaning every chain behind it. ``touch`` moves
     the pages of a used prefix to the recent end in reverse order, so the
     head is the most recent, and refreshes their mtimes on a background
-    thread (throttled per page), which the cache uses to rebuild its order
+    thread (a due page refreshes the whole touched chain). The cache rebuilds its order
     after a restart. Within one store job, once a page of a group fails, the
     later pages of that group are skipped, so the persisted chain stays
     contiguous.
@@ -305,7 +303,6 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
         tier_type: str,
         root_dir: str,
         content_manifest_path: str | None = None,
-        enable_unverified_content: bool = False,
         content_verify: str = "stat",
         mtime_update_interval_s: float = 60.0,
         **kwargs,
@@ -320,39 +317,56 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
             "mtime_updates": 0,
         }
         self.disabled_reason: str | None = None
+        self._root_dir = os.path.realpath(root_dir)
         if mtime_update_interval_s < 0:
             raise ValueError("mtime_update_interval_s must be >= 0")
         self._mtime_interval = mtime_update_interval_s
+        self._mtime_lock = threading.Lock()
         self._mtime_at: dict[str, float] = {}
-        self._mtime_queue: queue.SimpleQueue[str | None] = queue.SimpleQueue()
+        self._mtime_queue: queue.SimpleQueue[str | threading.Event | None] = (
+            queue.SimpleQueue()
+        )
         self._mtime_thread: threading.Thread | None = None
         self._disabled_finished: list[int] = []
         if content_verify not in ("stat", "full"):
             raise ValueError("content_verify must be 'stat' or 'full'")
-        content_digest = self._content_identity(
-            offloading_spec,
-            content_manifest_path,
-            not enable_unverified_content,
-            content_verify,
+        identity = get_revolta_identity(
+            offloading_spec.vllm_config, root_dir, content_manifest_path, content_verify
         )
-        if content_digest is None:
+        if identity is None:
             self._init_disabled(offloading_spec, primary_kv_view, tier_type)
             return
+        # Include the actual physical page description, not just compile hashes.
+        assert primary_kv_view.shape is not None
         try:
-            config_hash = str(offloading_spec.vllm_config.compute_hash())
-        except Exception as exc:  # noqa: BLE001 - identity must not guess
-            self._init_disabled(
-                offloading_spec,
-                primary_kv_view,
-                tier_type,
-                reason=f"cannot hash the engine config: {exc}",
+            self._extra_layout = {
+                "revolta_fs_format": PAGE_FORMAT,
+                "content_digest": identity.content_digest,
+                "persistent_identity_digest": identity.persistent_digest,
+                "page_layout": canonical_digest(
+                    {
+                        "groups": [
+                            {
+                                "layers": list(group.layer_names),
+                                "spec": group.kv_cache_spec,
+                            }
+                            for group in offloading_spec.kv_cache_config.kv_cache_groups
+                        ],
+                        "tensors": offloading_spec.kv_cache_config.kv_cache_tensors,
+                        "primary_shape": primary_kv_view.shape[1:],
+                        "primary_strides": primary_kv_view.strides,
+                        "primary_format": primary_kv_view.format,
+                        "block_size_factor": offloading_spec.block_size_factor,
+                        "layout": getattr(offloading_spec, "persistent_layout", None),
+                    }
+                ),
+            }
+            self._extra_layout["persistent_identity_digest"] = canonical_digest(
+                self._extra_layout
             )
+        except (ValueError, TypeError) as exc:
+            self._init_disabled(offloading_spec, primary_kv_view, tier_type, str(exc))
             return
-        self._extra_layout = {
-            "revolta_fs_format": PAGE_FORMAT,
-            "content_digest": content_digest,
-            "vllm_config_hash": config_hash,
-        }
         mapper = self._make_file_mapper(os.path.realpath(root_dir), offloading_spec)
         conflict = self._run_config_conflict(mapper)
         if conflict is not None:
@@ -360,56 +374,30 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
                 offloading_spec, primary_kv_view, tier_type, reason=conflict
             )
             return
-        super().__init__(
-            offloading_spec, primary_kv_view, tier_type, root_dir, **kwargs
-        )
-        self._check_xattr_support()
+        try:
+            super().__init__(
+                offloading_spec, primary_kv_view, tier_type, root_dir, **kwargs
+            )
+            self._check_xattr_support()
+        except OSError as exc:
+            self.shutdown()
+            self._init_disabled(offloading_spec, primary_kv_view, tier_type, str(exc))
+            return
         self._mtime_thread = threading.Thread(
             target=self._mtime_worker, name="revolta_fs_mtime", daemon=True
         )
         self._mtime_thread.start()
-        identity = json.dumps(
+        namespace = json.dumps(
             self.file_mapper.get_run_config(), sort_keys=True, separators=(",", ":")
         )
-        self._identity_digest = hashlib.sha256(identity.encode()).digest()
+        self._identity_digest = hashlib.sha256(namespace.encode()).digest()
         logger.info(
             "revolta_fs enabled at %s (content %s)",
             os.path.dirname(self.file_mapper.get_config_file_path()),
-            content_digest[:16],
+            identity.content_digest[:16],
         )
 
     # --- identity ---------------------------------------------------------
-
-    @staticmethod
-    def _content_identity(
-        offloading_spec: "OffloadingSpec",
-        manifest_path: str | None,
-        required: bool,
-        content_verify: str,
-    ) -> str | None:
-        """Digest of the verified content manifest; None disables the tier."""
-        if manifest_path is None:
-            if required:
-                logger.error(
-                    "revolta_fs disabled: no content_manifest_path configured "
-                    "(set enable_unverified_content to run without one)"
-                )
-                return None
-            logger.warning(
-                "revolta_fs: no content manifest; persisted KV is bound to "
-                "paths and config only, not to the checkpoint contents"
-            )
-            return "unverified"
-        try:
-            manifest = load_manifest(manifest_path)
-            roots = expected_content_roots(offloading_spec.vllm_config)
-            digest = verify_manifest(manifest, roots)
-            if content_verify == "full":
-                digest = rehash_and_verify(manifest)
-        except ManifestError as exc:
-            logger.error("revolta_fs disabled: %s", exc)
-            return None
-        return digest
 
     def _init_disabled(
         self,
@@ -420,6 +408,9 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
     ) -> None:
         SecondaryTierManager.__init__(self, offloading_spec, primary_kv_view, tier_type)
         self.disabled_reason = reason or "content identity not verified"
+        disable_revolta_root(
+            offloading_spec.vllm_config, self._root_dir, self.disabled_reason
+        )
         self._closed = True
         if reason is not None:
             logger.error("revolta_fs disabled: %s", reason)
@@ -431,12 +422,18 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
     def _make_file_mapper(self, root_dir: str, offloading_spec: "OffloadingSpec"):
         from vllm.v1.kv_offload.file_mapper import FileMapper
 
-        return FileMapper.from_offloading_spec(
+        mapper = FileMapper.from_offloading_spec(
             root_dir=root_dir,
             offloading_spec=offloading_spec,
             gpu_blocks_per_file=offloading_spec.block_size_factor,
             extra_layout=self._extra_layout,
         )
+
+        # Use a 128-bit directory prefix; the xattr still binds the full digest.
+        digest = canonical_digest(mapper.get_run_config())
+        model = os.path.basename(offloading_spec.vllm_config.model_config.model)
+        mapper.base_path = f"{root_dir}/{model}_{digest[:32]}"
+        return mapper
 
     @staticmethod
     def _run_config_conflict(mapper) -> str | None:
@@ -486,16 +483,12 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
             finally:
                 os.close(fd)
         except OSError as exc:
-            self.shutdown()
-            raise RuntimeError(
-                f"revolta_fs needs user extended attributes on {base}: {exc}"
+            raise OSError(
+                exc.errno, f"revolta_fs needs user extended attributes on {base}: {exc}"
             ) from exc
         finally:
             with contextlib.suppress(FileNotFoundError):
                 os.remove(probe)
-
-    def _tag(self, key: OffloadKey) -> int:
-        return crc32c(self._identity_digest + bytes(key))
 
     def _count(self, name: str, n: int = 1) -> None:
         with self._stats_lock:
@@ -505,23 +498,17 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
         with self._stats_lock:
             return dict(self._stats)
 
-    def _store_key(
-        self,
-        key: OffloadKey,
-        path: str,
-        block_id: int,
-        failed_groups: set[int] | None = None,
-    ) -> None:
-        group = get_offload_group_idx(key)
-        if failed_groups is not None and group in failed_groups:
-            self._count("skipped_after_chain_failure")
-            return
-        try:
-            self._write_page(key, path, block_id)
-        except Exception:
-            if failed_groups is not None:
-                failed_groups.add(group)
-            raise
+    def _store_key(self, key: OffloadKey, path: str, block_id: int) -> None:
+        self._write_page(key, path, block_id)
+
+    def _store_group(self, pages: list[tuple[OffloadKey, int]]) -> None:
+        # Input order is prefix-chain order, not lexicographic hash order.
+        for index, (key, block_id) in enumerate(pages):
+            try:
+                self._store_key(key, self.file_mapper.get_file_name(key), block_id)
+            except Exception:
+                self._count("skipped_after_chain_failure", len(pages) - index - 1)
+                raise
 
     def _write_page(self, key: OffloadKey, path: str, block_id: int) -> None:
         with self._cache.write(path, self._block_size):
@@ -530,7 +517,8 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
                 self._primary_kv_view,
                 block_id * self._block_size,
                 self._block_size,
-                self._tag(key),
+                key,
+                self._identity_digest,
             )
         self._count("pages_written" if written else "pages_existing")
 
@@ -542,7 +530,8 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
                     self._primary_kv_view,
                     block_id * self._block_size,
                     self._block_size,
-                    self._tag(key),
+                    key,
+                    self._identity_digest,
                 )
             except ChecksumError as exc:
                 self._count("checksum_failures")
@@ -562,13 +551,21 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
 
     def _schedule_mtime(self, paths: list[str]) -> None:
         now = time.monotonic()
-        for path in paths:
-            if now - self._mtime_at.get(path, -math.inf) >= self._mtime_interval:
-                self._mtime_at[path] = now
-                self._mtime_queue.put(path)
-        if len(self._mtime_at) > 4 * max(self._cache.max_files, 1):
-            cutoff = now - self._mtime_interval
-            self._mtime_at = {p: t for p, t in self._mtime_at.items() if t >= cutoff}
+        # One lock covers all producers: scheduler touches and pool loads.
+        # A due page refreshes the entire batch, already ordered tail to head.
+        with self._mtime_lock:
+            if any(
+                now - self._mtime_at.get(p, -float("inf")) >= self._mtime_interval
+                for p in paths
+            ):
+                for path in paths:
+                    self._mtime_at[path] = now
+                    self._mtime_queue.put(path)
+            if len(self._mtime_at) > 4 * max(self._cache.max_files, 1):
+                cutoff = now - self._mtime_interval
+                self._mtime_at = {
+                    p: t for p, t in self._mtime_at.items() if t >= cutoff
+                }
 
     def _mtime_worker(self) -> None:
         # File timestamps come from a coarse clock, so pages touched together
@@ -579,6 +576,9 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
             path = self._mtime_queue.get()
             if path is None:
                 return
+            if isinstance(path, threading.Event):
+                path.set()
+                continue
             last_ns = max(time.time_ns(), last_ns + 1)
             try:
                 os.utime(path, ns=(last_ns, last_ns))
@@ -590,10 +590,13 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
 
     def flush_mtime_updates(self, timeout: float = 5.0) -> None:
         """Wait until queued mtime updates are applied (tests, shutdown)."""
-        deadline = time.monotonic() + timeout
-        while not self._mtime_queue.empty() and time.monotonic() < deadline:
-            time.sleep(0.005)
-        time.sleep(0.005)
+        if self._mtime_thread is None:
+            return
+        barrier = threading.Event()
+        with self._mtime_lock:
+            self._mtime_queue.put(barrier)
+        if not barrier.wait(timeout):
+            raise TimeoutError("mtime worker did not reach the flush barrier")
 
     def lookup(self, key: OffloadKey, req_context=None) -> bool | None:
         if self.disabled:
@@ -611,19 +614,13 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
             # Nothing is written; completing the job releases the CPU pins.
             self._disabled_finished.append(job_metadata.job_id)
             return
-        # Shared by the job's tasks: groups whose chain broke in this job.
-        failed_groups: set[int] = set()
-        tasks = (
-            functools.partial(
-                self._store_key,
-                key,
-                self.file_mapper.get_file_name(key),
-                int(bid),
-                failed_groups,
-            )
-            for key, bid in zip(job_metadata.keys, job_metadata.block_ids)
-        )
-        self._pool.enqueue_store(job_metadata.job_id, len(job_metadata.keys), tasks)
+        groups: dict[int, list[tuple[OffloadKey, int]]] = {}
+        for key, bid in zip(job_metadata.keys, job_metadata.block_ids):
+            groups.setdefault(get_offload_group_idx(key), []).append((key, int(bid)))
+        tasks = [
+            functools.partial(self._store_group, pages) for pages in groups.values()
+        ]
+        self._pool.enqueue_store(job_metadata.job_id, len(tasks), tasks)
 
     def submit_load(self, job_metadata: JobMetadata) -> None:
         if self.disabled:
@@ -641,8 +638,11 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
             return
         if not getattr(self, "_closed", True):
             logger.info("revolta_fs stats: %s", self.get_revolta_stats())
-        super().shutdown()
-        if self._mtime_thread is not None:
-            self._mtime_queue.put(None)
-            self._mtime_thread.join(timeout=5.0)
-            self._mtime_thread = None
+        if not getattr(self, "_closed", True):
+            self._pool.shutdown(wait=True)
+            if self._mtime_thread is not None:
+                self._mtime_queue.put(None)
+                self._mtime_thread.join()
+                self._mtime_thread = None
+            self._cache.release()
+            self._closed = True

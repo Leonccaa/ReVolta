@@ -1,0 +1,645 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""CPU regressions for persistent identity, startup and concurrent chain I/O."""
+
+import copy
+import errno
+import json
+import os
+import shutil
+import subprocess
+import sys
+import threading
+from types import SimpleNamespace
+
+import pytest
+
+from tests.v1.kv_offload.test_fs_tier import drain, key, make_job
+from tests.v1.kv_offload.test_revolta_fs import (
+    _PAGE,
+    _checkpoint,
+    _load,
+    _store,
+    _view,
+    _write_manifest,
+    checkpoint_spec,
+    make_spec,
+    make_tier,
+)
+from vllm.utils.hashing import sha256
+from vllm.v1.core import kv_cache_utils
+from vllm.v1.kv_offload.base import OffloadKey, make_offload_key
+from vllm.v1.kv_offload.tiering.fs import content_manifest, revolta
+from vllm.v1.kv_offload.tiering.fs.content_manifest import (
+    ManifestError,
+    build_manifest,
+    load_manifest,
+    manifest_digest,
+)
+from vllm.v1.kv_offload.tiering.fs.identity import get_revolta_identity
+
+
+@pytest.fixture
+def revolta_tier(tmp_path):
+    tensor, view = _view()
+    tier = make_tier(tmp_path, view)
+    try:
+        yield tier, tensor
+    finally:
+        tier.shutdown()
+
+
+def _seed_config(root, manifest):
+    return SimpleNamespace(
+        kv_connector="OffloadingConnector",
+        kv_connector_extra_config={
+            "secondary_tiers": [
+                {
+                    "type": "revolta_fs",
+                    "root_dir": str(root),
+                    "max_size_bytes": 64 << 20,
+                    "content_manifest_path": manifest,
+                }
+            ]
+        },
+    )
+
+
+def _draft(model):
+    return SimpleNamespace(
+        method="dflash",
+        model=str(model),
+        num_speculative_tokens=4,
+        quantization=None,
+        hf_overrides={},
+        draft_model_config=make_spec(model).vllm_config.model_config,
+        draft_load_config=None,
+    )
+
+
+def test_crc_collision_still_rejects_full_key(revolta_tier):
+    """These full keys collide under the former identity+key CRC32C tag."""
+    tier, tensor = revolta_tier
+    first = OffloadKey(
+        bytes.fromhex(
+            "8aaca1de2926b7646606f8b42f4c12d0ceb57fc81992dd7a80f16dcafb20cf8d00000000"
+        )
+    )
+    second = OffloadKey(
+        bytes.fromhex(
+            "ed6d9182a2d8b4de405f359a00c59928d6e55903495d730576790eef8982283d00000000"
+        )
+    )
+    assert first != second
+    assert revolta.crc32c(tier._identity_digest + first) == revolta.crc32c(
+        tier._identity_digest + second
+    )
+    src = _store(tier, tensor, first, value=7)
+    dst = tier.file_mapper.get_file_name(second)
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    shutil.copy2(src, dst)
+    assert _load(tier, second) == [False]
+    assert _load(tier, first, job_id=3) == [True]
+
+
+@pytest.mark.parametrize("changed", ["version", "namespace", "key", "key_length"])
+def test_full_xattr_fields_are_checked(revolta_tier, changed):
+    tier, tensor = revolta_tier
+    path = _store(tier, tensor, key(1))
+    raw = bytearray(os.getxattr(path, revolta.CHECKSUM_XATTR))
+    offsets = {
+        "version": 0,
+        "namespace": 8,
+        "key_length": 40,
+        "key": revolta._XATTR_FORMAT.size,
+    }
+    raw[offsets[changed]] ^= 1
+    os.setxattr(path, revolta.CHECKSUM_XATTR, raw)
+    assert _load(tier, key(1)) == [False]
+
+
+def test_another_namespace_page_is_rejected(tmp_path):
+    tensor, view = _view()
+    spec, manifest = checkpoint_spec(tmp_path / "kv")
+    first = make_tier(tmp_path / "kv", view, spec=spec, content_manifest_path=manifest)
+    src = _store(first, tensor, key(1))
+    first.shutdown()
+    spec.vllm_config.model_config.quantization = "awq"
+    second = make_tier(tmp_path / "kv", view, spec=spec, content_manifest_path=manifest)
+    try:
+        dst = second.file_mapper.get_file_name(key(1))
+        assert src != dst
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(src, dst)
+        assert _load(second, key(1)) == [False]
+    finally:
+        second.shutdown()
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "target_quantization",
+        "target_dtype",
+        "target_overrides",
+        "target_rope",
+        "draft_method",
+        "draft_model",
+        "draft_tokens",
+        "draft_quantization",
+        "effective_draft_quantization",
+        "effective_draft_dtype",
+        "draft_overrides",
+        "draft_rope",
+        "load_format",
+        "draft_load_format",
+        "kv_dtype",
+        "hash_algo",
+    ],
+)
+def test_dedicated_identity_covers_effective_configuration(tmp_path, change):
+    model = _checkpoint(tmp_path)
+    draft_dir = tmp_path / "draft"
+    shutil.copytree(model, draft_dir)
+    manifest = _write_manifest(
+        tmp_path, {"target": str(model), "draft": str(draft_dir)}
+    )
+    config = make_spec(model).vllm_config
+    config.speculative_config = _draft(draft_dir)
+    spec = config.speculative_config
+    before = get_revolta_identity(config, str(tmp_path / "kv"), manifest)
+    assert before is not None and len(before.persistent_digest) == 64
+    if change == "target_quantization":
+        config.model_config.quantization = "awq"
+    elif change == "target_dtype":
+        config.model_config.dtype = "float32"
+    elif change == "target_overrides":
+        config.model_config.hf_overrides = {"rope_theta": 20000}
+    elif change == "target_rope":
+        config.model_config.hf_config = {"rope_scaling": {"factor": 2}}
+    elif change == "draft_method":
+        spec.method = "eagle3"
+    elif change == "draft_model":
+        spec.model = str(model)
+    elif change == "draft_tokens":
+        spec.num_speculative_tokens = 8
+    elif change == "draft_quantization":
+        spec.quantization = "fp8"
+    elif change == "effective_draft_quantization":
+        spec.draft_model_config.quantization = "fp8"
+    elif change == "effective_draft_dtype":
+        spec.draft_model_config.dtype = "float32"
+    elif change == "draft_overrides":
+        spec.draft_model_config.hf_overrides = {"rope_theta": 30000}
+    elif change == "draft_rope":
+        spec.draft_model_config.hf_text_config = {
+            "rope_parameters": {"rope_theta": 12345}
+        }
+    elif change == "load_format":
+        config.load_config.load_format = "safetensors"
+    elif change == "draft_load_format":
+        spec.draft_load_config = copy.copy(config.load_config)
+        spec.draft_load_config.load_format = "safetensors"
+    elif change == "kv_dtype":
+        config.cache_config.cache_dtype = "float16"
+    elif change == "hash_algo":
+        config.cache_config.prefix_caching_hash_algo = "sha256_cbor"
+    after = get_revolta_identity(config, str(tmp_path / "kv"), manifest)
+    assert after is not None
+    assert before.persistent_digest != after.persistent_digest
+    assert config.compute_hash() == "cfg-1"  # compile identity deliberately unchanged
+
+
+def test_physical_layout_changes_namespace(tmp_path):
+    tensor, view = _view()
+    spec, manifest = checkpoint_spec(tmp_path / "kv")
+    first = make_tier(tmp_path / "kv", view, spec=spec, content_manifest_path=manifest)
+    first_digest = first._identity_digest
+    first.shutdown()
+    spec.persistent_layout = {"storage": {"strides": [64, 1], "role": "recurrent"}}
+    second = make_tier(tmp_path / "kv", view, spec=spec, content_manifest_path=manifest)
+    try:
+        assert second._identity_digest != first_digest
+    finally:
+        second.shutdown()
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "no_manifest",
+        "remote_target",
+        "remote_draft",
+        "unlisted_draft",
+        "model_weights",
+        "secondary_weights",
+        "loader_extras",
+        "dummy",
+        "pt",
+        "sharded_state",
+        "draft_loader",
+        "lora",
+        "kv_calibration",
+    ],
+)
+def test_disabled_seed_path_never_touches_root(tmp_path, reason, monkeypatch):
+    root = tmp_path / "kv"
+    spec, manifest = checkpoint_spec(root)
+    config = spec.vllm_config
+    if reason == "no_manifest":
+        manifest = None
+    elif reason == "remote_target":
+        config.model_config.model = "example/remote-target"
+    elif reason == "remote_draft":
+        config.speculative_config = _draft("example/remote-draft")
+    elif reason == "unlisted_draft":
+        draft = tmp_path / "unlisted-draft"
+        shutil.copytree(config.model_config.model, draft)
+        config.speculative_config = _draft(draft)
+    elif reason in ("model_weights", "secondary_weights"):
+        setattr(config.model_config, reason, "another/source")
+    elif reason == "loader_extras":
+        config.load_config.model_loader_extra_config = {
+            "secondary_weights": ["another/source"]
+        }
+    elif reason in ("dummy", "pt", "sharded_state"):
+        config.load_config.load_format = reason
+    elif reason == "draft_loader":
+        config.speculative_config = _draft(config.model_config.model)
+        config.speculative_config.draft_load_config = SimpleNamespace(
+            load_format="dummy"
+        )
+    elif reason == "lora":
+        config.lora_config = {}
+    elif reason == "kv_calibration":
+        config.cache_config.calculate_kv_scales = True
+    tensor, view = _view()
+    seed_config = _seed_config(root, manifest)
+    # Exercise EngineCore's entry before AND after tier construction.
+    real_makedirs = os.makedirs
+
+    def forbid_root(path, *args, **kwargs):
+        assert not str(path).startswith(str(root)), "disabled seed attempted root I/O"
+        return real_makedirs(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "makedirs", forbid_root)
+    kv_cache_utils.init_none_hash(
+        sha256, kv_transfer_config=seed_config, vllm_config=config
+    )
+    tier = make_tier(root, view, spec=spec, content_manifest_path=manifest)
+    try:
+        assert tier.disabled
+        kv_cache_utils.init_none_hash(
+            sha256, kv_transfer_config=seed_config, vllm_config=config
+        )
+        assert not root.exists()
+        tier.submit_store(make_job(1, [key(1)], [0]))
+        assert [(r.job_id, r.success) for r in tier.get_finished_jobs()] == [(1, True)]
+        assert list(tier.get_finished_jobs()) == []
+        assert tier.lookup(key(1)) is False
+    finally:
+        tier.shutdown()
+
+
+def test_constructor_disabled_root_stays_excluded_from_seed(tmp_path, monkeypatch):
+    root = tmp_path / "kv"
+    spec, manifest = checkpoint_spec(root)
+    tensor, view = _view()
+
+    def unsupported(*args, **kwargs):
+        raise OSError(errno.ENOTSUP, "no user xattrs")
+
+    monkeypatch.setattr(os, "setxattr", unsupported)
+    tier = make_tier(root, view, spec=spec, content_manifest_path=manifest)
+    assert tier.disabled
+    kv_cache_utils.init_none_hash(
+        sha256,
+        kv_transfer_config=_seed_config(root, manifest),
+        vllm_config=spec.vllm_config,
+    )
+    assert not (root / ".hash_seed.lock").exists()
+    assert not (root / ".hash_seed.json").exists()
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "role",
+        "root",
+        "files",
+        "record",
+        "size",
+        "ino",
+        "mtime_ns",
+        "hash",
+        "algorithm",
+        "version",
+        "digest",
+        "relative_path",
+        "bool_size",
+        "bool_version",
+    ],
+)
+def test_manifest_schema_damage_disables_without_root_io(tmp_path, damage):
+    model = _checkpoint(tmp_path)
+    manifest = build_manifest({"target": str(model)})
+    entry = manifest["roles"]["target"]
+    record = entry["files"]["config.json"]
+    if damage == "role":
+        manifest["roles"]["target"] = []
+    elif damage == "root":
+        del entry["root"]
+    elif damage == "files":
+        entry["files"] = []
+    elif damage == "record":
+        entry["files"]["config.json"] = "bad"
+    elif damage in ("size", "ino", "mtime_ns", "hash"):
+        del record[damage]
+    elif damage == "relative_path":
+        entry["files"]["../escape"] = entry["files"].pop("config.json")
+        manifest["digest"] = manifest_digest(manifest["roles"])
+    elif damage == "bool_size":
+        record["size"] = True
+        manifest["digest"] = manifest_digest(manifest["roles"])
+    elif damage == "bool_version":
+        manifest["version"] = True
+    else:
+        manifest[damage] = ["bad"]
+    path = tmp_path / "bad-manifest.json"
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(ManifestError):
+        load_manifest(str(path))
+    tensor, view = _view()
+    tier = make_tier(
+        tmp_path / "kv", view, spec=make_spec(model), content_manifest_path=str(path)
+    )
+    assert tier.disabled
+    assert not (tmp_path / "kv").exists()
+
+
+def test_full_rehash_io_failure_disables_tier_and_seed(tmp_path, monkeypatch):
+    root = tmp_path / "kv"
+    spec, manifest = checkpoint_spec(root)
+    tensor, view = _view()
+
+    def io_failure(*args, **kwargs):
+        raise OSError(errno.EIO, "rehash read failure")
+
+    monkeypatch.setattr(content_manifest, "_hash_file", io_failure)
+    seed = _seed_config(root, manifest)
+    seed.kv_connector_extra_config["secondary_tiers"][0]["content_verify"] = "full"
+    kv_cache_utils.init_none_hash(
+        sha256, kv_transfer_config=seed, vllm_config=spec.vllm_config
+    )
+    tier = make_tier(
+        root, view, spec=spec, content_manifest_path=manifest, content_verify="full"
+    )
+    assert tier.disabled
+    assert not root.exists()
+
+
+@pytest.mark.parametrize("threads", [None, (0, 2)])
+@pytest.mark.parametrize("failure_errno", [errno.EIO, errno.ENOSPC])
+def test_group_failure_cannot_publish_later_page(
+    tmp_path, monkeypatch, threads, failure_errno
+):
+    tensor, view = _view()
+    options = (
+        {}
+        if threads is None
+        else dict(zip(("n_read_threads", "n_write_threads"), threads))
+    )
+    tier = make_tier(tmp_path, view, **options)
+    entered = threading.Event()
+    release = threading.Event()
+    tail_started = threading.Event()
+    other_group_started = threading.Event()
+    other_group_release = threading.Event()
+    original = tier._write_page
+    other = make_offload_key(b"other-group", 1)
+
+    def controlled(k, path, bid):
+        if k == key(1):
+            entered.set()
+            assert release.wait(5)
+            raise OSError(failure_errno, "head rejected")
+        if k == key(2):
+            tail_started.set()
+        if k == other:
+            other_group_started.set()
+            assert other_group_release.wait(5)
+        original(k, path, bid)
+
+    monkeypatch.setattr(tier, "_write_page", controlled)
+    try:
+        tensor.fill_(1)
+        tier.submit_store(make_job(1, [key(1), key(2), other], [0, 1, 2]))
+        assert entered.wait(5) and other_group_started.wait(5)
+        assert not tail_started.is_set()
+        release.set()
+        # A failed group's task must not complete the job while another is active.
+        assert list(tier.get_finished_jobs()) == []
+        other_group_release.set()
+        assert [r.success for r in drain(tier)] == [False]
+        assert not tail_started.is_set()
+        assert [tier.lookup(k) for k in (key(1), key(2), other)] == [False, False, True]
+    finally:
+        release.set()
+        other_group_release.set()
+        tier.shutdown()
+
+
+def test_scheduler_touch_and_pool_load_serialize_mtime_pruning(tmp_path, monkeypatch):
+    tensor, view = _view()
+    tier = make_tier(tmp_path, view)
+    pruning = threading.Event()
+    release = threading.Event()
+    load_scheduling = threading.Event()
+    errors = []
+    real_schedule = tier._schedule_mtime
+
+    class GatedDict(dict):
+        def items(self):
+            iterator = iter(super().items())
+            yield next(iterator)
+            pruning.set()
+            assert release.wait(5)
+            yield from iterator
+
+    def schedule(paths):
+        if threading.current_thread().name.startswith("vllm_kv_py_fs"):
+            load_scheduling.set()
+        real_schedule(paths)
+
+    def touch():
+        try:
+            tier.touch([key(1)])
+        except Exception as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=touch, name="scheduler-touch")
+    try:
+        _store(tier, tensor, key(1))
+        _store(tier, tensor, key(2), job_id=3)
+        # Force pruning without allocating millions of disk pages.
+        tier._mtime_at = GatedDict({f"old-{i}": 0.0 for i in range(5)})
+        tier._cache.max_files = 1
+        monkeypatch.setattr(tier, "_schedule_mtime", schedule)
+        thread.start()
+        assert pruning.wait(5)
+        tier.submit_load(make_job(4, [key(2)], [1], is_promotion=True))
+        assert load_scheduling.wait(5)
+        assert thread.is_alive()
+        release.set()
+        thread.join(5)
+        assert not thread.is_alive()
+        assert errors == []
+        assert [r.success for r in drain(tier)] == [True]
+    finally:
+        release.set()
+        if thread.ident is not None:
+            thread.join(5)
+        tier.shutdown()
+
+
+def test_just_read_head_then_extended_chain_preserves_restart_order(tmp_path):
+    tensor, view = _view()
+    options = dict(max_size_bytes=2 * _PAGE, mtime_update_interval_s=3600)
+    tier = make_tier(tmp_path, view, **options)
+    try:
+        tensor.fill_(1)
+        tier.submit_store(make_job(1, [key(1), key(2)], [0, 1]))
+        assert [r.success for r in drain(tier)] == [True]
+        assert _load(tier, key(1)) == [True]
+        tier.flush_mtime_updates()
+        tier.touch([key(1), key(2)])
+        tier.flush_mtime_updates()
+        assert (
+            os.stat(tier.file_mapper.get_file_name(key(1))).st_mtime_ns
+            > os.stat(tier.file_mapper.get_file_name(key(2))).st_mtime_ns
+        )
+    finally:
+        tier.shutdown()
+    tier = make_tier(tmp_path, view, **options)
+    try:
+        tier.submit_store(make_job(3, [key(3)], [2]))
+        assert [r.success for r in drain(tier)] == [True]
+        assert [tier.lookup(k) for k in (key(1), key(2))] == [True, False]
+    finally:
+        tier.shutdown()
+
+
+def test_flush_waits_for_inflight_mtime(tmp_path, monkeypatch):
+    tensor, view = _view()
+    tier = make_tier(tmp_path, view)
+    entered, release, flushed = (threading.Event() for _ in range(3))
+    real_utime = os.utime
+
+    def blocked(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        real_utime(*args, **kwargs)
+
+    def flush():
+        tier.flush_mtime_updates()
+        flushed.set()
+
+    thread = threading.Thread(target=flush)
+    try:
+        _store(tier, tensor, key(1))
+        monkeypatch.setattr(os, "utime", blocked)
+        tier.touch([key(1)])
+        assert entered.wait(5)
+        thread.start()
+        assert not flushed.wait(0.05)
+        release.set()
+        assert flushed.wait(5)
+    finally:
+        release.set()
+        if thread.ident is not None:
+            thread.join(5)
+        tier.shutdown()
+
+
+def test_disabled_completion_releases_cpu_pins_once(tmp_path):
+    from tests.v1.kv_offload.test_tiering_offloading import _mock_mmap_region
+    from vllm.v1.kv_offload.base import ReqContext
+    from vllm.v1.kv_offload.tiering.manager import (
+        CPUPrimaryTierOffloadingManager,
+        TieringOffloadingManager,
+    )
+
+    tensor, view = _view()
+    spec, _ = checkpoint_spec(tmp_path / "kv")
+    tier = make_tier(tmp_path / "kv", view, spec=spec)
+    primary = CPUPrimaryTierOffloadingManager(2, _mock_mmap_region(2))
+    manager = TieringOffloadingManager(primary, [tier])
+    ctx = ReqContext(req_id="disabled-test")
+    try:
+        manager.prepare_store([key(1)], ctx)
+        manager.complete_store([key(1)], ctx, success=True)
+        assert primary._policy.get(key(1)).ref_cnt == 1
+        manager._process_finished_jobs()
+        manager._process_finished_jobs()
+        assert primary._policy.get(key(1)).ref_cnt == 0
+        assert primary.lookup(key(1), ctx) is True
+        assert not manager._transfer_jobs
+    finally:
+        manager.shutdown()
+
+
+def test_revolta_seed_and_page_survive_fresh_processes(tmp_path):
+    root = tmp_path / "kv"
+    spec, manifest = checkpoint_spec(root)
+    snippet = """
+import json, sys
+from pathlib import Path
+from tests.v1.kv_offload.test_revolta_fs import (
+    make_spec, make_tier, _view, _store, _load,
+)
+from tests.v1.kv_offload.test_revolta_fs_safety import _seed_config
+from vllm.utils.hashing import sha256
+from vllm.v1.core import kv_cache_utils as u
+from vllm.v1.kv_offload.base import make_offload_key
+root, model, manifest, action = sys.argv[1:]
+spec = make_spec(model)
+tensor, view = _view()
+tier = make_tier(Path(root), view, spec=spec, content_manifest_path=manifest)
+assert not tier.disabled
+u.init_none_hash(
+    sha256, kv_transfer_config=_seed_config(root, manifest),
+    vllm_config=spec.vllm_config,
+)
+block = u.hash_block_tokens(sha256, None, list(range(16)), None)
+k = make_offload_key(block, 0)
+try:
+    if action == 'store':
+        _store(tier, tensor, k, value=7)
+    else:
+        assert tier.lookup(k)
+        assert _load(tier, k) == [True]
+        assert tensor[1, 0].item() == 7
+finally:
+    tier.shutdown()
+print(json.dumps([u.NONE_HASH.hex(), k.hex()]))
+"""
+    results = []
+    for seed, action in (("17", "store"), ("93", "load")):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                snippet,
+                str(root),
+                spec.vllm_config.model_config.model,
+                manifest,
+                action,
+            ],
+            env=dict(os.environ, PYTHONHASHSEED=seed),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        results.append(json.loads(result.stdout.splitlines()[-1]))
+    assert results[0] == results[1]

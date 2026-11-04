@@ -216,7 +216,9 @@ class EngineCore:
                 vllm_config.cache_config.prefix_caching_hash_algo
             )
             init_none_hash(
-                caching_hash_fn, kv_transfer_config=vllm_config.kv_transfer_config
+                caching_hash_fn,
+                kv_transfer_config=vllm_config.kv_transfer_config,
+                vllm_config=vllm_config,
             )
 
             self.request_block_hasher = get_request_block_hasher(

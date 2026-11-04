@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from vllm.config import KVTransferConfig
+    from vllm.config import KVTransferConfig, VllmConfig
 
 
 def validate_fs_budget(max_size_bytes: Any, min_free_bytes: Any = None) -> None:
@@ -44,7 +44,9 @@ def fs_tier_configs(config: "KVTransferConfig | None") -> list[dict]:
     return result
 
 
-def get_fs_hash_seed(config: "KVTransferConfig | None") -> str | None:
+def get_fs_hash_seed(
+    config: "KVTransferConfig | None", *, vllm_config: "VllmConfig | None" = None
+) -> str | None:
     """Lock configured roots and persist one seed before hashing requests.
 
     This short identity lock is separate from FileSystemCache's lifetime
@@ -52,7 +54,24 @@ def get_fs_hash_seed(config: "KVTransferConfig | None") -> str | None:
     weakening single-engine ownership. Existing roots must agree because a
     process has one NONE_HASH; changing an identity would lose cache hits.
     """
-    roots = sorted({os.path.realpath(t["root_dir"]) for t in fs_tier_configs(config)})
+    tiers = fs_tier_configs(config)
+    enabled = []
+    for tier in tiers:
+        if tier["type"] == "revolta_fs":
+            from vllm.v1.kv_offload.tiering.fs.identity import get_revolta_identity
+
+            if (
+                get_revolta_identity(
+                    vllm_config,
+                    tier["root_dir"],
+                    tier.get("content_manifest_path"),
+                    tier.get("content_verify", "stat"),
+                )
+                is None
+            ):
+                continue
+        enabled.append(tier)
+    roots = sorted({os.path.realpath(t["root_dir"]) for t in enabled})
     if not roots:
         return None
     with ExitStack() as locks:

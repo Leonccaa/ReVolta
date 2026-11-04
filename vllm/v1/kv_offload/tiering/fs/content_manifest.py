@@ -22,6 +22,8 @@ import os
 from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 
+import regex as re
+
 MANIFEST_VERSION = 1
 
 
@@ -36,7 +38,13 @@ def _iter_files(root: str) -> Iterator[str]:
         yield os.path.basename(root)
         return
     found = []
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
+
+    def walk_error(exc: OSError) -> None:
+        raise ManifestError(f"cannot enumerate {root}: {exc}") from exc
+
+    for dirpath, dirnames, filenames in os.walk(
+        root, followlinks=True, onerror=walk_error
+    ):
         dirnames.sort()
         for name in filenames:
             path = os.path.join(dirpath, name)
@@ -94,11 +102,17 @@ def build_manifest(roles: Mapping[str, str], workers: int = 4) -> dict:
             raise ManifestError(f"{role}: {root} does not exist")
         rels = list(_iter_files(root))
         paths = [_file_path(root, rel) for rel in rels]
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            hashes = list(pool.map(lambda p: _hash_file(p, factory), paths))
-        files = {}
-        for rel, path, digest in zip(rels, paths, hashes):
-            files[rel] = {**_stat_fields(path), "hash": digest}
+        try:
+            before = [_stat_fields(path) for path in paths]
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                hashes = list(pool.map(lambda p: _hash_file(p, factory), paths))
+            files = {}
+            for rel, path, stat, digest in zip(rels, paths, before, hashes):
+                if stat != _stat_fields(path):
+                    raise ManifestError(f"{role}/{rel}: changed while hashing")
+                files[rel] = {**stat, "hash": digest}
+        except OSError as exc:
+            raise ManifestError(f"cannot hash {role}: {exc}") from exc
         out[role] = {"root": os.path.abspath(root), "files": files}
     return {
         "version": MANIFEST_VERSION,
@@ -108,23 +122,66 @@ def build_manifest(roles: Mapping[str, str], workers: int = 4) -> dict:
     }
 
 
+def _validate_manifest(manifest: dict) -> None:
+    """Validate every field before any consumer indexes the manifest."""
+    if (
+        not isinstance(manifest, dict)
+        or type(manifest.get("version")) is not int
+        or manifest["version"] != MANIFEST_VERSION
+    ):
+        raise ManifestError("unsupported manifest version")
+    if manifest.get("algorithm") not in ("sha256", "blake3"):
+        raise ManifestError("unsupported manifest hash algorithm")
+
+    def digest_valid(value) -> bool:
+        return (
+            isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+        )
+
+    if not digest_valid(manifest.get("digest")):
+        raise ManifestError("invalid manifest digest")
+    roles = manifest.get("roles")
+    if not isinstance(roles, dict) or not roles:
+        raise ManifestError("manifest has no roles")
+    for role, entry in roles.items():
+        if not isinstance(role, str) or not role or not isinstance(entry, dict):
+            raise ManifestError("invalid manifest role")
+        root = entry.get("root")
+        if not isinstance(root, str) or "\0" in root or not os.path.isabs(root):
+            raise ManifestError(f"{role}: invalid root")
+        files = entry.get("files")
+        if not isinstance(files, dict) or not files:
+            raise ManifestError(f"{role}: invalid or empty files")
+        for rel, record in files.items():
+            if (
+                not isinstance(rel, str)
+                or not rel
+                or "\0" in rel
+                or os.path.isabs(rel)
+                or any(part in ("", ".", "..") for part in rel.split("/"))
+                or not isinstance(record, dict)
+            ):
+                raise ManifestError(f"{role}: invalid file entry")
+            for field in ("size", "mtime_ns", "ino"):
+                if type(record.get(field)) is not int:
+                    raise ManifestError(f"{role}/{rel}: invalid {field}")
+            if (
+                record["size"] < 0
+                or record["ino"] < 0
+                or not digest_valid(record.get("hash"))
+            ):
+                raise ManifestError(f"{role}/{rel}: invalid size, inode or hash")
+    if manifest_digest(roles) != manifest["digest"]:
+        raise ManifestError("manifest digest does not match its entries")
+
+
 def load_manifest(path: str) -> dict:
     try:
         with open(path) as f:
             manifest = json.load(f)
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError, UnicodeError) as exc:
         raise ManifestError(f"cannot read manifest {path}: {exc}") from exc
-    if not isinstance(manifest, dict) or manifest.get("version") != MANIFEST_VERSION:
-        raise ManifestError(f"unsupported manifest version in {path}")
-    roles = manifest.get("roles")
-    if not isinstance(roles, dict) or not roles:
-        raise ManifestError(f"manifest {path} has no roles")
-    try:
-        digest = manifest_digest(roles)
-    except (KeyError, TypeError) as exc:
-        raise ManifestError(f"malformed manifest {path}: {exc}") from exc
-    if digest != manifest.get("digest"):
-        raise ManifestError(f"manifest {path} digest does not match its entries")
+    _validate_manifest(manifest)
     return manifest
 
 
@@ -136,6 +193,7 @@ def verify_manifest(manifest: dict, expected_roots: Mapping[str, str]) -> str:
     each with unchanged size, mtime and inode. Other roles in the manifest are
     checked file by file. Raises ManifestError on any difference.
     """
+    _validate_manifest(manifest)
     roles = manifest["roles"]
     for role, path in expected_roots.items():
         entry = roles.get(role)
@@ -145,7 +203,10 @@ def verify_manifest(manifest: dict, expected_roots: Mapping[str, str]) -> str:
             raise ManifestError(
                 f"{role}: manifest root {entry['root']} is not the loaded {path}"
             )
-        actual = set(_iter_files(path))
+        try:
+            actual = set(_iter_files(path))
+        except (OSError, ValueError) as exc:
+            raise ManifestError(f"{role}: cannot enumerate files: {exc}") from exc
         listed = set(entry["files"])
         if actual != listed:
             extra = sorted(actual - listed)[:5]
@@ -160,7 +221,7 @@ def verify_manifest(manifest: dict, expected_roots: Mapping[str, str]) -> str:
             path = _file_path(root, rel)
             try:
                 stat = _stat_fields(path)
-            except OSError as exc:
+            except (OSError, ValueError) as exc:
                 raise ManifestError(f"{role}/{rel}: {exc}") from exc
             for field in ("size", "mtime_ns", "ino"):
                 if stat[field] != record[field]:
@@ -173,14 +234,20 @@ def verify_manifest(manifest: dict, expected_roots: Mapping[str, str]) -> str:
 
 def rehash_and_verify(manifest: dict) -> str:
     """Recompute every content hash (slow, optional full verification)."""
-    algorithm, factory = _hasher()
-    if algorithm != manifest["algorithm"]:
-        raise ManifestError(
-            f"manifest uses {manifest['algorithm']}, only {algorithm} available"
-        )
+    _validate_manifest(manifest)
+    factory = hashlib.sha256
+    if manifest["algorithm"] == "blake3":
+        try:
+            import blake3
+        except ImportError as exc:
+            raise ManifestError("manifest needs blake3, which is unavailable") from exc
+        factory = blake3.blake3
     for role, entry in manifest["roles"].items():
         for rel, listed in entry["files"].items():
-            digest = _hash_file(_file_path(entry["root"], rel), factory)
+            try:
+                digest = _hash_file(_file_path(entry["root"], rel), factory)
+            except (OSError, ValueError) as exc:
+                raise ManifestError(f"{role}/{rel}: cannot rehash: {exc}") from exc
             if digest != listed["hash"]:
                 raise ManifestError(f"{role}/{rel}: content hash differs")
     return manifest["digest"]

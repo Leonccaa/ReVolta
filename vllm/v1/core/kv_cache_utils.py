@@ -103,6 +103,7 @@ def init_none_hash(
     hash_fn: Callable[[Any], bytes],
     *,
     kv_transfer_config: KVTransferConfig | None = None,
+    vllm_config: VllmConfig | None = None,
 ):
     global NONE_HASH
 
@@ -110,7 +111,7 @@ def init_none_hash(
     if kv_transfer_config is not None:
         from vllm.v1.kv_offload.tiering.fs.config import get_fs_hash_seed
 
-        fs_seed = get_fs_hash_seed(kv_transfer_config)
+        fs_seed = get_fs_hash_seed(kv_transfer_config, vllm_config=vllm_config)
         if fs_seed is not None:
             hash_seed = fs_seed
     if hash_seed is None and hash_fn in _CBOR_HASH_FUNCTIONS:

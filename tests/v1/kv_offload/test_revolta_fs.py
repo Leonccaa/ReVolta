@@ -2,12 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for the ReVolta file-system secondary tier (``revolta_fs``)."""
 
+import json
 import mmap
 import os
 import shutil
 import time
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -15,7 +15,6 @@ import torch
 from tests.v1.kv_offload.test_fs_tier import (
     _BLOCK_ELEMENTS,
     _DTYPE,
-    _MOCK_OFFLOADING_SPEC,
     drain,
     key,
     make_job,
@@ -26,7 +25,7 @@ from vllm.v1.kv_offload.tiering.fs.content_manifest import build_manifest
 from vllm.v1.kv_offload.tiering.fs.revolta import (
     CHECKSUM_XATTR,
     RevoltaFileSystemTierManager,
-    read_tagged_crc,
+    read_page_identity,
 )
 
 
@@ -38,32 +37,61 @@ def _view(num_blocks: int = 4):
     return tensor, memoryview(tensor.numpy())
 
 
-def make_spec(model_dir="test-model", config_hash="cfg-1"):
-    spec = MagicMock()
-    spec.vllm_config.model_config.model = str(model_dir)
-    spec.vllm_config.speculative_config = None
-    spec.vllm_config.compute_hash.return_value = config_hash
-    for name in (
-        "cache_config",
-        "parallel_config",
-    ):
-        setattr(
-            spec.vllm_config, name, getattr(_MOCK_OFFLOADING_SPEC.vllm_config, name)
-        )
-    spec.kv_cache_config = _MOCK_OFFLOADING_SPEC.kv_cache_config
-    spec.block_size_factor = 1
-    spec.persistent_layout = None
-    return spec
+def make_spec(model_dir, config_hash="cfg-1"):
+    model = SimpleNamespace(
+        model=str(model_dir),
+        dtype=torch.float16,
+        quantization=None,
+        hf_overrides={},
+        hf_config={},
+        hf_text_config={},
+        model_weights=None,
+    )
+    config = SimpleNamespace(
+        model_config=model,
+        speculative_config=None,
+        lora_config=None,
+        load_config=SimpleNamespace(
+            load_format="auto",
+            model_loader_extra_config={},
+            ignore_patterns=["original/**/*"],
+        ),
+        cache_config=SimpleNamespace(block_size=16, cache_dtype="torch.float32"),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+            rank=0,
+        ),
+        compute_hash=lambda: config_hash,
+    )
+    return SimpleNamespace(
+        vllm_config=config,
+        kv_cache_config=SimpleNamespace(kv_cache_groups=[], kv_cache_tensors=[]),
+        block_size_factor=1,
+        persistent_layout=None,
+    )
 
 
-_SPEC = make_spec()
+def checkpoint_spec(root):
+    # Keep immutable fixtures outside the disk budget/namespace being tested.
+    model = root.parent / (root.name + "-checkpoint")
+    if not model.exists():
+        model.mkdir()
+        (model / "config.json").write_text('{"a": 1}')
+        (model / "model.safetensors").write_bytes(b"w" * 4096)
+    manifest = root.parent / (root.name + "-manifest.json")
+    if not manifest.exists():
+        manifest.write_text(json.dumps(build_manifest({"target": str(model)})))
+    return make_spec(model), str(manifest)
 
 
-def make_tier(root, view, spec=_SPEC, **kwargs):
-    kwargs.setdefault("enable_unverified_content", True)
+def make_tier(root, view, spec=None, **kwargs):
+    if spec is None:
+        spec, manifest = checkpoint_spec(root)
+        kwargs.setdefault("content_manifest_path", manifest)
     kwargs.setdefault("max_size_bytes", 64 << 20)
-    kwargs.setdefault("n_read_threads", 2)
-    kwargs.setdefault("n_write_threads", 2)
     return RevoltaFileSystemTierManager(
         offloading_spec=spec,
         primary_kv_view=view,
@@ -83,6 +111,7 @@ def revolta_tier(tmp_path):
 
 def test_registered_and_shares_fs_seed_rules(tmp_path):
     tensor, view = _view()
+    spec, manifest = checkpoint_spec(tmp_path)
     tier = SecondaryTierFactory.create_secondary_tier(
         {
             "type": "revolta_fs",
@@ -90,10 +119,10 @@ def test_registered_and_shares_fs_seed_rules(tmp_path):
             "max_size_bytes": 64 << 20,
             "n_read_threads": 1,
             "n_write_threads": 1,
-            "enable_unverified_content": True,
+            "content_manifest_path": manifest,
         },
         view,
-        _SPEC,
+        spec,
     )
     try:
         assert isinstance(tier, RevoltaFileSystemTierManager)
@@ -143,7 +172,7 @@ def _load(tier, k, slot=1, job_id=2):
 def test_page_has_checksum_and_no_temp_files(revolta_tier):
     tier, tensor = revolta_tier
     path = _store(tier, tensor, key(1))
-    assert read_tagged_crc(path) is not None
+    assert read_page_identity(path) is not None
     leftovers = [
         f
         for _, _, files in os.walk(os.path.dirname(path))
@@ -180,7 +209,7 @@ def test_page_without_checksum_is_rejected_and_replaced(revolta_tier):
     with open(path, "wb") as f:
         f.write(b"\0" * (_BLOCK_ELEMENTS * 4))
     _store(tier, tensor, key(1), value=3.0, job_id=3)
-    assert read_tagged_crc(path) is not None
+    assert read_page_identity(path) is not None
     assert _load(tier, key(1), job_id=4) == [True]
     assert torch.equal(tensor[1], tensor[0])
 
@@ -207,15 +236,17 @@ def test_wrong_size_page_is_rejected(revolta_tier):
     assert not os.path.exists(path)
 
 
-def test_missing_xattr_support_fails_at_startup(tmp_path, monkeypatch):
+def test_missing_xattr_support_disables_tier(tmp_path, monkeypatch):
     tensor, view = _view()
 
     def no_xattr(*args, **kwargs):
         raise OSError(95, "Operation not supported")
 
     monkeypatch.setattr(os, "setxattr", no_xattr)
-    with pytest.raises(RuntimeError, match="extended attributes"):
-        make_tier(tmp_path, view)
+    tier = make_tier(tmp_path, view)
+    assert tier.disabled
+    assert "extended attributes" in tier.disabled_reason
+    tier.shutdown()
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +275,6 @@ def _identity_tier(tmp_path, model, manifest, **kwargs):
         view,
         spec=make_spec(model),
         content_manifest_path=manifest,
-        enable_unverified_content=False,
         **kwargs,
     )
     return tier, tensor
@@ -439,7 +469,7 @@ def test_chain_stops_at_first_failed_page_per_group(tmp_path, monkeypatch):
     from vllm.v1.kv_offload.tiering.fs import revolta
 
     tensor, view = _view()
-    tier = make_tier(tmp_path, view, n_write_threads=1, n_read_threads=0)
+    tier = make_tier(tmp_path, view)
     real = revolta.store_verified_block
     bad = tier.file_mapper.get_file_name(make_offload_key(b"\x00" * 7 + b"\x02", 0))
 

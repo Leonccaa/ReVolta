@@ -415,7 +415,9 @@ def test_group_failure_cannot_publish_later_page(
     tail_started = threading.Event()
     other_group_started = threading.Event()
     other_group_release = threading.Event()
+    failed_group_done = threading.Event()
     original = tier._write_page
+    original_group = tier._store_group
     other = make_offload_key(b"other-group", 1)
 
     def controlled(k, path, bid):
@@ -430,7 +432,15 @@ def test_group_failure_cannot_publish_later_page(
             assert other_group_release.wait(5)
         original(k, path, bid)
 
+    def group(pages):
+        try:
+            original_group(pages)
+        finally:
+            if pages[0][0] == key(1):
+                failed_group_done.set()
+
     monkeypatch.setattr(tier, "_write_page", controlled)
+    monkeypatch.setattr(tier, "_store_group", group)
     try:
         tensor.fill_(1)
         tier.submit_store(make_job(1, [key(1), key(2), other], [0, 1, 2]))
@@ -440,6 +450,9 @@ def test_group_failure_cannot_publish_later_page(
         # A failed group's task must not complete the job while another is active.
         assert list(tier.get_finished_jobs()) == []
         other_group_release.set()
+        # M2 retries transient EIO before ending this group. Do not interpret
+        # drain's short idle interval as a completion while retries are active.
+        assert failed_group_done.wait(5)
         assert [r.success for r in drain(tier)] == [False]
         assert not tail_started.is_set()
         assert [tier.lookup(k) for k in (key(1), key(2), other)] == [False, False, True]

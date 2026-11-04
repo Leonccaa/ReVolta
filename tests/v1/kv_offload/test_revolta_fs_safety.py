@@ -656,3 +656,38 @@ print(json.dumps([u.NONE_HASH.hex(), k.hex()]))
         assert result.returncode == 0, result.stdout + result.stderr
         results.append(json.loads(result.stdout.splitlines()[-1]))
     assert results[0] == results[1]
+
+
+def test_multimodal_model_is_supported_and_identified(tmp_path):
+    """A multimodal checkpoint (vision encoder in the same checkpoint) keeps
+    the tier enabled; its effective processing config is part of the ID."""
+    import dataclasses as dc
+
+    @dc.dataclass
+    class MM:
+        limit_per_prompt: dict
+        mm_processor_kwargs: dict | None = None
+        mm_encoder_tp_mode: str = "weights"
+
+    model = _checkpoint(tmp_path)
+    manifest = _write_manifest(tmp_path, {"target": str(model)})
+    config = make_spec(model).vllm_config
+    config.model_config.is_multimodal_model = True
+    config.model_config.multimodal_config = MM(limit_per_prompt={"image": 4})
+    first = get_revolta_identity(config, str(tmp_path / "kv"), manifest)
+    assert first is not None
+    config.model_config.multimodal_config = MM(
+        limit_per_prompt={"image": 4}, mm_encoder_tp_mode="data"
+    )
+    second = get_revolta_identity(config, str(tmp_path / "kv"), manifest)
+    assert second is not None
+    assert second.persistent_digest != first.persistent_digest
+    config.model_config.multimodal_config = MM(
+        limit_per_prompt={"image": 4}, mm_processor_kwargs={"max_pixels": 1024}
+    )
+    third = get_revolta_identity(config, str(tmp_path / "kv"), manifest)
+    assert third is not None
+    assert third.persistent_digest not in (
+        first.persistent_digest,
+        second.persistent_digest,
+    )

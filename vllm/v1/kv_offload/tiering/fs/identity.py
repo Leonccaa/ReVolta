@@ -7,6 +7,7 @@ loading and serving. Stat verification is a fast check of that contract; full
 verification also detects rewrites that preserve stat fields.
 """
 
+import dataclasses
 import hashlib
 import json
 import os
@@ -44,8 +45,6 @@ def _local_model(config, role: str) -> str:
     for name in ("model_weights", "secondary_weights"):
         if getattr(config, name, None):
             raise ManifestError(f"{role}: {name} is not supported")
-    if getattr(config, "is_multimodal_model", False):
-        raise ManifestError(f"{role}: multimodal weight sources are not supported")
     if getattr(config, "runner_type", "generate") != "generate":
         raise ManifestError(f"{role}: only generation models are supported")
     hf = getattr(config, "hf_config", None)
@@ -102,7 +101,38 @@ def _model_identity(config) -> dict:
         if overrides is not SpeculativeConfig.hf_config_override:
             raise ManifestError("custom callable hf_overrides cannot be identified")
         result["hf_overrides"] = "SpeculativeConfig.hf_config_override"
+    # Multimodal models: the encoder weights are part of the checkpoint (and
+    # of its content manifest), and request block hashes already carry the
+    # multimodal input hashes; what remains is the effective processing
+    # configuration, which changes the tokens and embeddings of a prefix.
+    mm = getattr(config, "multimodal_config", None)
+    result["multimodal_config"] = None if mm is None else _plain(mm)
     return result
+
+
+def _plain(value, depth: int = 0):
+    """A JSON-safe, deterministic rendering of a config object for the
+    identity digest. Unknown leaf objects are rendered by type and str(), so
+    an unexpected field still changes the digest when its value changes."""
+    if depth > 8:
+        return f"<{type(value).__qualname__}>"
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return {
+            f.name: _plain(getattr(value, f.name, None), depth + 1)
+            for f in dataclasses.fields(value)
+        }
+    if isinstance(value, dict):
+        return {
+            str(k): _plain(v, depth + 1)
+            for k, v in sorted(value.items(), key=lambda kv: str(kv[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_plain(v, depth + 1) for v in value]
+    if isinstance(value, (set, frozenset)):
+        return sorted(str(_plain(v, depth + 1)) for v in value)
+    return f"{type(value).__module__}.{type(value).__qualname__}:{value}"
 
 
 @dataclass(frozen=True)

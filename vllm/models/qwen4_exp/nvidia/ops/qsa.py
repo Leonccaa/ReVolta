@@ -2199,6 +2199,54 @@ def _qsa_sparse_paged_attention_sm70_grouped_page4(
     return out
 
 
+# Research (default off): launch grouped page4 CTAs in descending planned
+# work (REVOLTA_QSA_GROUPED_LPT=1). Bit-identical by construction: the
+# kernel reads and writes only per-group data.
+_SM70_QSA_GROUPED_LPT = os.getenv("REVOLTA_QSA_GROUPED_LPT", "0") == "1"
+
+
+def _qsa_grouped_lpt_permute(
+    grouped_pages: torch.Tensor,
+    token_masks: torch.Tensor,
+    grouped_sequence_lengths: torch.Tensor,
+    q_rows: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reorder groups by planned length, longest first (no host sync)."""
+    groups = grouped_sequence_lengths.shape[0]
+    order = torch.argsort(grouped_sequence_lengths, descending=True, stable=True)
+    q_perm = (
+        q_rows.reshape(groups, _SM70_QSA_GROUPED_PAGE4_QUERIES, *q_rows.shape[1:])
+        .index_select(0, order)
+        .reshape(q_rows.shape)
+    )
+    return (
+        order,
+        grouped_pages.index_select(0, order),
+        # uint32 index kernels are not available on every backend; move the
+        # bits through an int32 view instead.
+        token_masks.view(torch.int32).index_select(0, order).view(token_masks.dtype),
+        grouped_sequence_lengths.index_select(0, order),
+        q_perm,
+    )
+
+
+def _qsa_grouped_lpt_restore(
+    order: torch.Tensor, out: torch.Tensor, lse: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Put per-group outputs written in launch order back in row order."""
+    groups = order.shape[0]
+    q = _SM70_QSA_GROUPED_PAGE4_QUERIES
+    restored_out = torch.empty_like(out)
+    restored_out.view(groups, q, *out.shape[1:]).index_copy_(
+        0, order, out.view(groups, q, *out.shape[1:])
+    )
+    restored_lse = torch.empty_like(lse)
+    restored_lse.view(groups, q, *lse.shape[1:]).index_copy_(
+        0, order, lse.view(groups, q, *lse.shape[1:])
+    )
+    return restored_out, restored_lse
+
+
 def qsa_dcp_sparse_paged_attention_sm70_grouped_page4(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -2305,11 +2353,22 @@ def qsa_dcp_sparse_paged_attention_sm70_grouped_page4(
     physical_k_cache, physical_v_cache = _qsa_xqa_page4_physical_kv(
         q_slice, k_cache, v_cache
     )
+    q_rows = q[:rows]
+    order = None
+    if _SM70_QSA_GROUPED_LPT:
+        # Launch the heaviest groups first (longest-processing-time order) to
+        # shorten the last wave. Each group's inputs move together and its
+        # outputs move back, so every group computes exactly what it did.
+        order, grouped_pages, token_masks, grouped_sequence_lengths, q_rows = (
+            _qsa_grouped_lpt_permute(
+                grouped_pages, token_masks, grouped_sequence_lengths, q_rows
+            )
+        )
     slice_out = torch.empty(q_slice.shape, dtype=torch.float16, device=q.device)
     for head in range(0, q.shape[1], heads):
         _qsa_grouped_page4_forward(
             flash_attn_v100_cuda,
-            q[:rows, head : head + heads].contiguous(),
+            q_rows[:, head : head + heads].contiguous(),
             physical_k_cache,
             physical_v_cache,
             slice_out,
@@ -2322,12 +2381,13 @@ def qsa_dcp_sparse_paged_attention_sm70_grouped_page4(
             k_scale,
             v_scale,
         )
-        out[:rows, head : head + heads].copy_(slice_out)
+        head_out, head_lse = slice_out, slice_lse[:rows]
+        if order is not None:
+            head_out, head_lse = _qsa_grouped_lpt_restore(order, slice_out, head_lse)
+        out[:rows, head : head + heads].copy_(head_out)
         # The kernel writes natural-log LSE and -1e30 for rows without keys.
         lse[:rows, head : head + heads].copy_(
-            (slice_lse * math.log2(math.e)).masked_fill_(
-                slice_lse <= -1.0e29, -math.inf
-            )
+            (head_lse * math.log2(math.e)).masked_fill_(head_lse <= -1.0e29, -math.inf)
         )
     logger.info_once(
         "Using SM70 grouped QSA Flash-V100 page4 route for DCP-local attention "

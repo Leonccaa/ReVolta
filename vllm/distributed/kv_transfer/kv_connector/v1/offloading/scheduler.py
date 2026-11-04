@@ -1320,7 +1320,7 @@ class OffloadingConnectorScheduler:
             deferred.clear()
         # Accepted blocks have no unsettled obligation. Once ownership ends,
         # a later CPU reset must not requeue their old physical sources.
-        req_status.draft_reofferable.clear()
+        getattr(req_status, "draft_reofferable", {}).clear()
 
     def skipped_draft_blocks_delta(self) -> int:
         """Draft blocks skipped by cpu.draft_offload since the previous call."""

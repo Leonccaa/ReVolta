@@ -31,6 +31,7 @@ import queue
 import struct
 import threading
 import time
+import weakref
 from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING
 
@@ -223,7 +224,7 @@ def load_verified_block(
     key: OffloadKey,
     identity: bytes,
 ) -> None:
-    """Read one page into ``view`` and verify it; delete it on any failure.
+    """Read one page into ``view`` and delete confirmed verification failures.
 
     The destination slice may hold partial data after a failure; the caller
     reports the load as failed so the slot is never marked ready.
@@ -245,9 +246,7 @@ def load_verified_block(
             raise ChecksumError(source_path, f"short read {bytes_read}")
         if crc32c(payload) != stored[0]:
             raise ChecksumError(source_path, "checksum mismatch")
-    except FileNotFoundError:
-        raise
-    except Exception:
+    except ChecksumError:
         try:
             os.remove(source_path)
         except FileNotFoundError:
@@ -391,6 +390,12 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
             self.file_mapper.get_run_config(), sort_keys=True, separators=(",", ":")
         )
         self._identity_digest = hashlib.sha256(namespace.encode()).digest()
+        config = offloading_spec.vllm_config
+        managers = getattr(config, "_revolta_fs_managers", None)
+        if managers is None:
+            managers = weakref.WeakSet()
+            config.__dict__["_revolta_fs_managers"] = managers
+        managers.add(self)
         logger.info(
             "revolta_fs enabled at %s (content %s)",
             os.path.dirname(self.file_mapper.get_config_file_path()),
@@ -447,7 +452,7 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
         try:
             with open(config_path) as f:
                 recorded = json.load(f)
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, ValueError) as exc:
             return f"unreadable {config_path}: {exc}"
         if recorded != json.loads(json.dumps(mapper.get_run_config())):
             return (

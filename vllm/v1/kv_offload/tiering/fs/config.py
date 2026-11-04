@@ -72,6 +72,24 @@ def get_fs_hash_seed(
                 continue
         enabled.append(tier)
     roots = sorted({os.path.realpath(t["root_dir"]) for t in enabled})
+    try:
+        return _locked_fs_hash_seed(roots)
+    except (OSError, ValueError) as exc:
+        from vllm.v1.kv_offload.tiering.fs.identity import disable_revolta_root
+
+        for tier in enabled:
+            if tier["type"] == "revolta_fs":
+                disable_revolta_root(vllm_config, tier["root_dir"], str(exc))
+        # Preserve plain fs startup failures and seed selection. Never repair
+        # or overwrite an unreadable identity belonging to a disabled tier.
+        return _locked_fs_hash_seed(
+            sorted(
+                {os.path.realpath(t["root_dir"]) for t in enabled if t["type"] == "fs"}
+            )
+        )
+
+
+def _locked_fs_hash_seed(roots: list[str]) -> str | None:
     if not roots:
         return None
     with ExitStack() as locks:

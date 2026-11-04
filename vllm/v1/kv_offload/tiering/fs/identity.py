@@ -45,8 +45,9 @@ def _local_model(config, role: str) -> str:
     for name in ("model_weights", "secondary_weights"):
         if getattr(config, name, None):
             raise ManifestError(f"{role}: {name} is not supported")
-    if getattr(config, "runner_type", "generate") != "generate":
-        raise ManifestError(f"{role}: only generation models are supported")
+    runner = "generate" if role == "target" else "draft"
+    if getattr(config, "runner_type", runner) != runner:
+        raise ManifestError(f"{role}: expected the {runner} runner")
     hf = getattr(config, "hf_config", None)
     if getattr(hf, "secondary_weights", None):
         raise ManifestError(f"{role}: secondary weights are not supported")
@@ -86,6 +87,7 @@ def _model_identity(config) -> dict:
             "code_revision",
             "dtype",
             "quantization",
+            "quantization_config",
             "hf_overrides",
             "hf_config",
             "hf_text_config",
@@ -154,6 +156,82 @@ def disable_revolta_root(vllm_config, root: str, reason: str) -> None:
         disabled = {}
         vllm_config._revolta_fs_disabled_roots = disabled
     disabled[os.path.realpath(root)] = reason
+    for tier in getattr(vllm_config, "_revolta_fs_managers", ()):
+        if tier._root_dir == os.path.realpath(root) and not tier.disabled:
+            tier.shutdown()
+            tier.disabled_reason = reason
+
+
+def _verify_config_sources(config, manifest: dict) -> None:
+    """Reject file references without manifest coverage, including nested HF
+    overrides, online quantization or multimodal encoder scale inputs.
+
+    Paths are resolved as the loader resolves them, relative to the process
+    working directory. A directory reference must itself be a manifest root.
+    """
+    files = set()
+    roots = set()
+    for entry in manifest["roles"].values():
+        root = entry["root"]
+        roots.add(os.path.realpath(root))
+        for rel in entry["files"]:
+            files.add(
+                os.path.realpath(
+                    root if os.path.isfile(root) else os.path.join(root, rel)
+                )
+            )
+
+    def visit(value, name=""):
+        if hasattr(value, "to_dict"):
+            value = value.to_dict()
+        elif dataclasses.is_dataclass(value) and not isinstance(value, type):
+            value = {f.name: getattr(value, f.name) for f in dataclasses.fields(value)}
+        if isinstance(value, dict):
+            for key, item in value.items():
+                visit(item, str(key))
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                visit(item, name)
+        elif isinstance(value, (str, os.PathLike)) and value:
+            path = os.fspath(value)
+            path_field = name.endswith(
+                ("_file", "_files", "_path", "_paths", "_dir", "_name_or_path")
+            )
+            if (
+                path_field or os.path.isabs(path) or os.path.exists(path)
+            ) and os.path.realpath(path) not in files | roots:
+                raise ManifestError(f"{name}: source is outside the content manifest")
+
+    for name in ("tokenizer", "generation_config"):
+        source = getattr(config, name, None)
+        if source and source not in ("auto", "vllm"):
+            visit(source, name + "_path")
+    visit(
+        _fields(
+            config,
+            (
+                "hf_config_path",
+                "quantization_config",
+                "hf_overrides",
+                "hf_config",
+                "hf_text_config",
+                "multimodal_config",
+            ),
+        )
+    )
+    # DefaultModelLoader can follow shard names outside the checkpoint through
+    # a safetensors index. The index's own hash does not bind those shards.
+    for filename in (
+        "model.safetensors.index.json",
+        "consolidated.safetensors.index.json",
+    ):
+        index = os.path.join(config.model, filename)
+        if os.path.isfile(index):
+            with open(index) as source:
+                shards = json.load(source)["weight_map"].values()
+            for shard in shards:
+                if os.path.realpath(os.path.join(config.model, shard)) not in files:
+                    raise ManifestError("indexed shard is outside the content manifest")
 
 
 def get_revolta_identity(
@@ -214,6 +292,9 @@ def get_revolta_identity(
             }
         manifest = load_manifest(manifest_path)
         content = verify_manifest(manifest, roots)
+        _verify_config_sources(target, manifest)
+        if speculative is not None:
+            _verify_config_sources(draft, manifest)
         if content_verify == "full":
             rehash_and_verify(manifest)
         # Check the optional checksum dependency before creating the root.
@@ -254,6 +335,13 @@ def get_revolta_identity(
             "compile_hash": vllm_config.compute_hash(),
         }
         return RevoltaIdentity(content, canonical_digest(identity))
-    except (ManifestError, OSError, ValueError, TypeError, ImportError) as exc:
+    except (
+        ManifestError,
+        OSError,
+        ValueError,
+        TypeError,
+        KeyError,
+        ImportError,
+    ) as exc:
         logger.error("revolta_fs disabled: %s", exc)
         return None

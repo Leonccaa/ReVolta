@@ -154,6 +154,11 @@ tier entry is the part after `ssd.`):
 | `ssd.content_verify` | enum | `stat` | `stat`, `full` | deployment | `stat` checks size, modification time and inode of every listed file at startup (milliseconds). `full` also recomputes every content hash (about a minute per 100 GB) and catches a rewrite that restored the modification time. | 0.2 | experimental |
 | `ssd.mtime_update_interval_s` | float | `60` | `>= 0` | deployment | Minimum time between refreshes unless another page in the touched chain is due; then the whole chain is stamped tail to head. The times order eviction after a restart; shorter is more precise and writes more metadata. | 0.2 | experimental |
 
+When store timeouts are configured, the deadline covers the entire store job,
+including time in the queue. Completion polling reports overdue jobs as failed
+after any protected source snapshot finishes. Each page shares the job deadline.
+An active kernel I/O call still has to return before its worker can shut down.
+
 Counters of a `revolta_fs` tier (pages written, existing, verified, checksum
 failures, pages skipped after a failure in the same chain, modification-time updates)
 are logged when the engine shuts down.

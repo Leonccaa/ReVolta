@@ -40,6 +40,7 @@ def _view(num_blocks: int = 4):
 def make_spec(model_dir, config_hash="cfg-1"):
     model = SimpleNamespace(
         model=str(model_dir),
+        runner_type="generate",
         dtype=torch.float16,
         quantization=None,
         hf_overrides={},

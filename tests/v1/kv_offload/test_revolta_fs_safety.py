@@ -3,6 +3,7 @@
 """CPU regressions for persistent identity, startup and concurrent chain I/O."""
 
 import copy
+import dataclasses
 import errno
 import json
 import os
@@ -10,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -66,13 +68,15 @@ def _seed_config(root, manifest):
 
 
 def _draft(model):
+    config = make_spec(model).vllm_config.model_config
+    config.runner_type = "draft"
     return SimpleNamespace(
         method="dflash",
         model=str(model),
         num_speculative_tokens=4,
         quantization=None,
         hf_overrides={},
-        draft_model_config=make_spec(model).vllm_config.model_config,
+        draft_model_config=config,
         draft_load_config=None,
     )
 
@@ -691,3 +695,299 @@ def test_multimodal_model_is_supported_and_identified(tmp_path):
         first.persistent_digest,
         second.persistent_digest,
     )
+
+
+@pytest.mark.parametrize("raw", [b"{", b"\xff", b"", b'{"version":1,"seed":""}'])
+def test_bad_seed_disables_existing_manager_at_init_none_hash(tmp_path, raw):
+    root = tmp_path / "kv"
+    spec, manifest = checkpoint_spec(root)
+    tensor, view = _view()
+    tier = make_tier(root, view, spec=spec, content_manifest_path=manifest)
+    path = root / ".hash_seed.json"
+    path.write_bytes(raw)
+    try:
+        kv_cache_utils.init_none_hash(
+            sha256,
+            kv_transfer_config=_seed_config(root, manifest),
+            vllm_config=spec.vllm_config,
+        )
+        assert tier.disabled and tier._closed
+        assert path.read_bytes() == raw
+        assert not tier.lookup(key(1))
+        assert all(not thread.is_alive() for thread in tier._pool._threads)
+        from vllm.v1.kv_offload.tiering.fs.config import get_fs_hash_seed
+
+        assert (
+            get_fs_hash_seed(_seed_config(root, manifest), vllm_config=spec.vllm_config)
+            is None
+        )
+        tier.submit_store(make_job(1, [key(1)], [0]))
+        assert [r.success for r in tier.get_finished_jobs()] == [True]
+    finally:
+        tier.shutdown()
+
+
+def test_non_utf8_namespace_config_disables_startup(tmp_path):
+    tensor, view = _view()
+    tier = make_tier(tmp_path, view)
+    path = Path(tier.file_mapper.get_config_file_path())
+    tier.shutdown()
+    path.write_bytes(b"\xff\xfe")
+    tier = make_tier(tmp_path, view)
+    assert tier.disabled
+    assert path.read_bytes() == b"\xff\xfe"
+
+
+@pytest.mark.parametrize("error_at", ["read", "lock", "write", "conflict"])
+def test_seed_failures_disable_all_revolta_roots(tmp_path, monkeypatch, error_at):
+    from vllm.v1.kv_offload.tiering.fs.config import get_fs_hash_seed
+
+    root = tmp_path / "kv"
+    spec, manifest = checkpoint_spec(root)
+    tensor, view = _view()
+    tier = make_tier(root, view, spec=spec, content_manifest_path=manifest)
+    second_root = tmp_path / "second"
+    second = make_tier(second_root, view, spec=spec, content_manifest_path=manifest)
+    config = _seed_config(root, manifest)
+    config.kv_connector_extra_config["secondary_tiers"] += _seed_config(
+        second_root, manifest
+    ).kv_connector_extra_config["secondary_tiers"]
+    path = root / ".hash_seed.json"
+    raw = b'{"version":1,"seed":"first"}'
+    if error_at in ("read", "conflict"):
+        path.write_bytes(raw)
+    if error_at == "conflict":
+        (second_root / ".hash_seed.json").write_text('{"version":1,"seed":"second"}')
+    elif error_at == "read":
+        real_open = Path.open
+
+        def denied(path, *args, **kwargs):
+            if path.name == ".hash_seed.json":
+                raise PermissionError(errno.EACCES, "seed read denied")
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", denied)
+    elif error_at == "lock":
+        import builtins
+
+        builtin_open = builtins.open
+
+        def denied(path, *args, **kwargs):
+            if str(path).endswith(".hash_seed.lock"):
+                raise PermissionError(errno.EACCES, "seed lock denied")
+            return builtin_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", denied)
+    else:
+        os_open = os.open
+
+        def denied(path, *args, **kwargs):
+            if str(path).endswith(".hash_seed.json.new"):
+                raise PermissionError(errno.EACCES, "seed write denied")
+            return os_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", denied)
+    try:
+        assert get_fs_hash_seed(config, vllm_config=spec.vllm_config) is None
+        assert tier.disabled and second.disabled
+        assert tier._closed and second._closed
+        if error_at in ("read", "conflict"):
+            with open(path, "rb") as saved:
+                assert saved.read() == raw
+    finally:
+        tier.shutdown()
+        second.shutdown()
+
+
+@pytest.mark.parametrize("raw", [b"{", b"\xff", b'{"version":1,"seed":""}'])
+def test_plain_fs_bad_seed_still_raises(tmp_path, raw):
+    from vllm.v1.kv_offload.tiering.fs.config import get_fs_hash_seed
+
+    config = _seed_config(tmp_path, "unused")
+    config.kv_connector_extra_config["secondary_tiers"][0]["type"] = "fs"
+    (tmp_path / ".hash_seed.json").write_bytes(raw)
+    with pytest.raises(ValueError):
+        get_fs_hash_seed(config)
+    assert (tmp_path / ".hash_seed.json").read_bytes() == raw
+
+
+def test_real_runner_resolution_is_role_specific(tmp_path):
+    from vllm.config import ModelConfig
+
+    root = tmp_path / "kv"
+    spec, manifest = checkpoint_spec(root)
+    cfg = spec.vllm_config
+    cfg.model_config.runner_type = ModelConfig._get_runner_type(
+        None, [], "generate", "none"
+    )
+    cfg.speculative_config = _draft(cfg.model_config.model)
+    draft = cfg.speculative_config.draft_model_config
+    draft.runner_type = ModelConfig._get_runner_type(None, [], "draft", "none")
+    assert draft.runner_type == "draft"
+    assert get_revolta_identity(cfg, str(root), manifest) is not None
+    draft.runner_type = "generate"
+    assert get_revolta_identity(cfg, str(root), manifest) is None
+    draft.runner_type = "draft"
+    cfg.model_config.runner_type = "pooling"
+    assert get_revolta_identity(cfg, str(root), manifest) is None
+
+
+@pytest.mark.parametrize("role", ["target", "draft"])
+@pytest.mark.parametrize(
+    "source",
+    [
+        "hf_overrides",
+        "hf_config",
+        "hf_text_config",
+        "quantization_config",
+        "hf_config_path",
+        "multimodal_config",
+        "index",
+    ],
+)
+def test_external_config_sources_disable_tier(tmp_path, role, source):
+    root = tmp_path / "kv"
+    spec, manifest = checkpoint_spec(root)
+    cfg = spec.vllm_config
+    cfg.speculative_config = _draft(cfg.model_config.model)
+    model = (
+        cfg.model_config
+        if role == "target"
+        else cfg.speculative_config.draft_model_config
+    )
+    external = tmp_path / "external.json"
+    external.write_text('{"config":"A"}')
+    if source == "index":
+        (Path(model.model) / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {"w": str(external)}})
+        )
+        manifest = _write_manifest(tmp_path, {"target": model.model})
+    elif source == "hf_config_path":
+        model.hf_config_path = str(external)
+    else:
+        setattr(model, source, {"nested": {"quantization_config_file": str(external)}})
+    assert get_revolta_identity(cfg, str(root), manifest) is None
+    tensor, view = _view()
+    tier = make_tier(root, view, spec=spec, content_manifest_path=manifest)
+    assert tier.disabled and not root.exists()
+    external.write_text('{"config":"B"}')
+    assert get_revolta_identity(cfg, str(root), manifest) is None
+
+
+def test_transient_read_error_preserves_page(tmp_path, monkeypatch):
+    tensor, view = _view()
+    tier = make_tier(tmp_path, view)
+    path = _store(tier, tensor, key(1), value=7)
+    real_readv = os.readv
+    calls = []
+
+    def transient(fd, buffers):
+        calls.append(True)
+        if len(calls) == 1:
+            raise OSError(errno.EAGAIN, "transient read")
+        return real_readv(fd, buffers)
+
+    monkeypatch.setattr(os, "readv", transient)
+    try:
+        # Direct verification keeps the valid file available for the next read.
+        with pytest.raises(OSError):
+            revolta.load_verified_block(
+                path,
+                view,
+                tier._block_size,
+                tier._block_size,
+                key(1),
+                tier._identity_digest,
+            )
+        assert os.path.exists(path)
+        assert _load(tier, key(1)) == [True]
+        assert len(calls) == 2
+        assert tensor[1].eq(7).all()
+    finally:
+        tier.shutdown()
+
+
+def raw_config(cls, **overrides):
+    # Real hash code, without model or device initialization.
+    from pydantic.fields import FieldInfo
+    from pydantic_core import PydanticUndefined
+
+    obj = object.__new__(cls)
+    for field in dataclasses.fields(cls):
+        if field.name in overrides:
+            value = overrides[field.name]
+        elif isinstance(field.default, FieldInfo):
+            value = field.default.get_default(call_default_factory=True)
+            if value is PydanticUndefined:
+                value = None
+        elif field.default is not dataclasses.MISSING:
+            value = field.default
+        elif field.default_factory is not dataclasses.MISSING:
+            value = field.default_factory()
+        else:
+            value = None
+        setattr(obj, field.name, value)
+    for name, value in overrides.items():
+        setattr(obj, name, value)
+    return obj
+
+
+def test_external_quant_file_real_config_hash_and_loader_path(tmp_path, monkeypatch):
+    from transformers import LlamaConfig
+
+    from vllm.config import ModelConfig, VllmConfig
+    from vllm.model_executor.layers.quantization.torchao import TorchAOConfig
+    from vllm.model_executor.model_loader import weight_utils
+
+    root = tmp_path / "kv"
+    spec, manifest = checkpoint_spec(root)
+    cfgfile = tmp_path / "quant.json"
+    cfgfile.write_text('{"_type": "Float8WeightOnlyConfig", "_data": {"version": 1}}')
+    hf = LlamaConfig(hidden_size=64, num_attention_heads=4, num_hidden_layers=2)
+    model = raw_config(
+        ModelConfig,
+        model=spec.vllm_config.model_config.model,
+        hf_config=hf,
+        hf_text_config=hf,
+        runner_type="generate",
+        quantization="torchao",
+        hf_overrides={"quantization_config_file": str(cfgfile)},
+    )
+    cfg = raw_config(VllmConfig, model_config=model, device_config=None)
+    # Real file resolution/JSON parsing; avoid initializing optional TorchAO kernels.
+    monkeypatch.setattr(
+        TorchAOConfig, "from_config", classmethod(lambda cls, config: config)
+    )
+    selected_a = weight_utils.get_quant_config(model, cfg.load_config)
+    before_hash = cfg.compute_hash()
+    before = get_revolta_identity(cfg, str(root), manifest)
+    assert before is None
+    cfgfile.write_text('{"_type": "Float8WeightOnlyConfig", "_data": {"version": 2}}')
+    selected_b = weight_utils.get_quant_config(model, cfg.load_config)
+    assert selected_a != selected_b
+    assert cfg.compute_hash() == before_hash
+    assert get_revolta_identity(cfg, str(root), manifest) == before
+
+
+@pytest.mark.parametrize("role", ["target", "draft"])
+def test_manifest_bound_quantization_file_changes_identity(tmp_path, role):
+    root = tmp_path / "kv"
+    spec, _ = checkpoint_spec(root)
+    cfg = spec.vllm_config
+    cfg.speculative_config = _draft(cfg.model_config.model)
+    model = (
+        cfg.model_config
+        if role == "target"
+        else cfg.speculative_config.draft_model_config
+    )
+    path = Path(model.model) / "quant.json"
+    path.write_text('{"version":1}')
+    model.hf_overrides = {"quantization_config_file": str(path)}
+    manifest = _write_manifest(tmp_path, {"target": model.model})
+    before = get_revolta_identity(cfg, str(root), manifest)
+    assert before is not None
+    path.write_text('{"version":2}')
+    assert get_revolta_identity(cfg, str(root), manifest) is None
+    manifest = _write_manifest(tmp_path, {"target": model.model})
+    after = get_revolta_identity(cfg, str(root), manifest)
+    assert after is not None and before != after

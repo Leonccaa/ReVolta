@@ -238,6 +238,7 @@ The ReVolta profile (`vllm/revolta_profile.py`) sets these on SM70 + TP4 + FP16 
 | `VLLM_DFLASH2_LOOKUP_STICKY` | str | `Computed when unset: max(0, int('3'))` | integer >= 0 | experimental | 1Cat | Experimental, ngram_assist only (speculative_config ngram_assist, default off). Steps lookup mode stays on after a hit. |
 | `VLLM_DFLASH_COMPACT_AUX_HIDDEN` | bool | `True` | 0, 1 | configuration | 1Cat | Concatenates the target auxiliary hidden states directly in the draft projection dtype (DFlash and DFlash2 drafts); avoids an extra full-precision copy. |
 | `VLLM_DFLASH_DEBUG_CONTEXT_KV` | bool | `False` | 0, 1 | debug | 1Cat | Debug: log the draft context KV. |
+| `VLLM_DFLASH_DEBUG_CORRUPTION` | bool | `False` | 0, 1 | debug | 1Cat | Debug, MRv1 only: draft corruption diagnostics. |
 | `VLLM_DFLASH_DEBUG_PROPOSAL_STAGES` | str \| None | `None` | 0, 1 | debug | 1Cat | Debug: log DFlash (v1 speculator) proposal stages. |
 | `VLLM_DFLASH_DEBUG_STATE_TABLE` | bool | `False` | 0, 1 | debug | 1Cat | Debug: log the GDN speculative state table. |
 | `VLLM_DFLASH_DEBUG_TARGET_LAYER_TRACE` | str \| None | `None` | 0, 1 | debug | 1Cat | Debug: target layer trace (NVFP4 MoE). |
@@ -245,6 +246,9 @@ The ReVolta profile (`vllm/revolta_profile.py`) sets these on SM70 + TP4 + FP16 
 | `VLLM_DFLASH_DEBUG_TARGET_TRACE_MIN_POSITION` | str \| None | `None` | position | debug | 1Cat | Debug: first position of the target layer trace. |
 | `VLLM_DFLASH_DEBUG_TENSOR_DUMP_DIR` | str \| None | `None` | path | debug | 1Cat | Debug: DFlash (v1 speculator) tensor dump directory. |
 | `VLLM_DFLASH_DEBUG_TENSOR_DUMP_LIMIT` | str \| None | `None` | count | debug | 1Cat | Debug: maximum tensor dumps. |
+| `VLLM_DFLASH_DISABLE_AUX_OUTPUTS` | bool | `False` | 0, 1 | debug | 1Cat | Debug, MRv1 only: disable the auxiliary outputs for the draft. |
+| `VLLM_DFLASH_DUMP_DRAFT_LOGITS` | bool | `False` | 0, 1 | debug | 1Cat | Debug, MRv1 only: dump draft logits. |
+| `VLLM_DFLASH_DUMP_FIRST_PASS` | bool | `False` | 0, 1 | debug | 1Cat | Debug, MRv1 DFlash (v1) only: dump the first draft pass. |
 | `VLLM_DFLASH_PROFILE` | bool | `False` | 0, 1 | debug | 1Cat | Debug: DFlash/DFlash2 proposal timing log. |
 | `VLLM_DFLASH_PROFILE_LOG_INTERVAL` | int | `32` | steps | debug | 1Cat | Debug: interval of the timing log. |
 

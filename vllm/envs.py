@@ -11695,8 +11695,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DFLASH_DUMP_FIRST_PASS": env_var(
         lambda: bool(int(os.getenv("VLLM_DFLASH_DUMP_FIRST_PASS", "0"))),
         description=(
-            "vLLM: dflash dump first pass. The consumer locations and unset "
-            "defaults are listed below."
+            "Debug, MRv1 DFlash (v1) only: dump the first draft pass. No effect "
+            "on the MRv2 runner."
         ),
         category="debug",
         declared_default="False",
@@ -11708,10 +11708,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DFLASH_DISABLE_AUX_OUTPUTS": env_var(
         lambda: bool(int(os.getenv("VLLM_DFLASH_DISABLE_AUX_OUTPUTS", "0"))),
         description=(
-            "vLLM: dflash disable aux outputs. The consumer locations and "
-            "unset defaults are listed below."
+            "Debug, MRv1 only: disable the target auxiliary hidden-state "
+            "outputs that feed the DFlash draft. No effect on the MRv2 runner."
         ),
-        category="configuration",
+        category="debug",
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
@@ -11919,8 +11919,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DFLASH_DEBUG_CORRUPTION": env_var(
         lambda: bool(int(os.getenv("VLLM_DFLASH_DEBUG_CORRUPTION", "0"))),
         description=(
-            "DFlash diagnostic: corruption. The consumer locations and unset "
-            "defaults are listed below."
+            "Debug, MRv1 only: draft corruption diagnostics in the MRv1 "
+            "speculative proposer. No effect on the MRv2 runner."
         ),
         category="debug",
         declared_default="False",
@@ -11932,8 +11932,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DFLASH_DUMP_DRAFT_LOGITS": env_var(
         lambda: bool(int(os.getenv("VLLM_DFLASH_DUMP_DRAFT_LOGITS", "0"))),
         description=(
-            "vLLM: dflash dump draft logits. The consumer locations and unset "
-            "defaults are listed below."
+            "Debug, MRv1 only: dump draft logits from the MRv1 speculative "
+            "proposer. No effect on the MRv2 runner."
         ),
         category="debug",
         declared_default="False",

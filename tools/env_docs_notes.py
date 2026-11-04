@@ -569,6 +569,34 @@ NOTES: dict[str, dict[str, str]] = {
         tradeoff="Debug: target layer trace (NVFP4 MoE).",
         metrics="",
     ),
+    "VLLM_DFLASH_DISABLE_AUX_OUTPUTS": dict(
+        section="dflash",
+        since="1Cat",
+        range="0, 1",
+        tradeoff="Debug, MRv1 only: disable the auxiliary outputs for the draft.",
+        metrics="",
+    ),
+    "VLLM_DFLASH_DEBUG_CORRUPTION": dict(
+        section="dflash",
+        since="1Cat",
+        range="0, 1",
+        tradeoff="Debug, MRv1 only: draft corruption diagnostics.",
+        metrics="",
+    ),
+    "VLLM_DFLASH_DUMP_DRAFT_LOGITS": dict(
+        section="dflash",
+        since="1Cat",
+        range="0, 1",
+        tradeoff="Debug, MRv1 only: dump draft logits.",
+        metrics="",
+    ),
+    "VLLM_DFLASH_DUMP_FIRST_PASS": dict(
+        section="dflash",
+        since="1Cat",
+        range="0, 1",
+        tradeoff="Debug, MRv1 DFlash (v1) only: dump the first draft pass.",
+        metrics="",
+    ),
     # ---- retiring in 0.2.0rc6 ---------------------------------------------
     "VLLM_DFLASH_DDTREE_ATTN_COMPACT_BATCH": dict(
         section="retiring",

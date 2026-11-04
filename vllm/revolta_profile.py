@@ -58,7 +58,6 @@ NVFP4_DEFAULTS = {
     "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE": "1",
     "VLLM_SM70_NVFP4_MOE_GROUPED_DECODE": "0",
     "VLLM_SM70_NVFP4_TURBOMIND": "1",
-    "VLLM_SM70_FP8_TURBOMIND": "1",
     "VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL": "1",
     "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES": "1",
     "VLLM_V2_CUDAGRAPH_MEM_MIB": "700",
@@ -105,7 +104,12 @@ AUDITED_NAMES = tuple(
 )
 # Keep the AWQ audit inventory byte-compatible. Format-specific entries are
 # included in NVFP4 audits and provenance transport only.
-_ALL_AUDITED_NAMES = tuple(sorted(set(AUDITED_NAMES) | set(NVFP4_DEFAULTS)))
+# VLLM_SM70_FP8_TURBOMIND is no longer written (its unset default is already 1;
+# kernel_config.sm70_fp8.enabled replaces it for FP8 linear layers) but stays
+# audited for NVFP4 mixed checkpoints, whose MoE consumers still read it.
+_ALL_AUDITED_NAMES = tuple(
+    sorted(set(AUDITED_NAMES) | set(NVFP4_DEFAULTS) | {"VLLM_SM70_FP8_TURBOMIND"})
+)
 # Diagnostic transport only: never use it to resolve an operator setting.
 # The VLLM_ prefix also carries it through worker environment propagation.
 _PROVENANCE_ENV = "VLLM_REVOLTA_PROFILE_PROVENANCE"

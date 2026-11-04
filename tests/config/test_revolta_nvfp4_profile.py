@@ -18,7 +18,6 @@ NVFP4 = {
     "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE": "1",
     "VLLM_SM70_NVFP4_MOE_GROUPED_DECODE": "0",
     "VLLM_SM70_NVFP4_TURBOMIND": "1",
-    "VLLM_SM70_FP8_TURBOMIND": "1",
     "VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL": "1",
     "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES": "1",
     "VLLM_V2_CUDAGRAPH_MEM_MIB": "700",
@@ -90,6 +89,20 @@ def test_nvfp4_explicit_settings_win(profile, monkeypatch, algo, name, value):
             module.profile_audit(enabled=True, quantization="modelopt_mixed")
         )
         assert audit["values"][name] == {"value": override, "source": "environment"}
+
+
+@pytest.mark.parametrize("algo", ["NVFP4", "W4A16_NVFP4"])
+def test_nvfp4_profile_leaves_deprecated_fp8_alias_unset(profile, algo):
+    # kernel_config.sm70_fp8.enabled replaces the alias; its unset default is
+    # already enabled, so the profile must not write the deprecated name.
+    assert profile.apply_revolta_profile(model(algo), 4, is_sm70=True)
+    assert "VLLM_SM70_FP8_TURBOMIND" not in os.environ
+    assert envs.VLLM_SM70_FP8_TURBOMIND is True
+    audit = json.loads(
+        profile.profile_audit(enabled=True, quantization="modelopt_mixed")
+    )
+    assert audit["values"]["VLLM_SM70_FP8_TURBOMIND"]["value"] == "1"
+    assert audit["values"]["VLLM_SM70_FP8_TURBOMIND"]["source"] != "profile"
 
 
 def test_mixed_fp8_does_not_enable_nvfp4(profile):

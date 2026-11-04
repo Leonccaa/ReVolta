@@ -8169,13 +8169,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="deprecated",
         declared_default="True",
         effective_default="True",
-        automatic_conditions=(
-            (
-                "Only ModelOpt NVFP4 checkpoints (including mixed NVFP4 layers); "
-                "vllm/revolta_profile.py:apply_revolta_profile sets '1' "
-                "for unset values on FP16 QSA SM70 TP4."
-            ),
-        ),
+        automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
         user_visible=False,
     ),

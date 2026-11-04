@@ -333,9 +333,12 @@ class RequestOffloadState:
     # cpu.draft_offload != "all" (draft groups only, keyed by group_idx):
     # next offloaded block index the draft store frontier examines,
     draft_frontier: dict[int, int] = field(default_factory=dict)
-    # ("window") blocks passed by the frontier that were neither offered for
-    # store nor counted as skipped yet,
+    # ("window") blocks awaiting a needed window / accepted store: one unsettled
+    # accounting obligation each, including live blocks requeued by a CPU reset,
     draft_deferred: dict[int, set[int]] = field(default_factory=dict)
+    # ("window") blocks offered successfully (or loaded) in this cache
+    # generation. A CPU reset returns the still-held ones to draft_deferred.
+    draft_reofferable: dict[int, set[int]] = field(default_factory=dict)
     # ("window") and the token boundaries whose recurrent state this request
     # handed to the host tier: the draft window before each is offloaded.
     draft_window_boundaries: set[int] = field(default_factory=set)
@@ -922,6 +925,28 @@ class OffloadingConnectorScheduler:
             if req_status.offloading_context.policy == OffloadPolicy.BLOCK_LEVEL:
                 group_state.next_stored_block_idx = num_blocks
 
+            if (
+                self.config.cpu_draft_offload == "window"
+                and group_config.draft_window_tokens is not None
+            ):
+                # A reset can also evict the prefix just loaded from the tier.
+                # Remember its GPU window even though the store frontier skips
+                # prefix-hit blocks. Include locally cached non-null blocks.
+                window = group_config.sliding_window_size_in_blocks
+                assert window is not None
+                req_status.draft_reofferable.setdefault(
+                    group_config.group_idx, set()
+                ).update(
+                    b
+                    for b in range(
+                        max(0, num_blocks - window),
+                        num_cached_tokens // offloaded_block_size,
+                    )
+                    if not group_blocks[
+                        (b + 1) * self.config.block_size_factor - 1
+                    ].is_null
+                )
+
         # Fence dst blocks against finished-request pending stores.
         if (
             self._block_id_to_pending_jobs
@@ -1084,6 +1109,10 @@ class OffloadingConnectorScheduler:
                 deferred = req_status.draft_deferred.get(group_idx)
                 if deferred:
                     deferred.difference_update(selected)
+                if selected:
+                    req_status.draft_reofferable.setdefault(group_idx, set()).update(
+                        selected
+                    )
 
             if not store_output.keys_to_store:
                 req_status.advance_stored_idx(num_offloadable_tokens)
@@ -1226,9 +1255,11 @@ class OffloadingConnectorScheduler:
         processed tokens and the pool may reuse them at once, so a later store
         could read another request's data.
 
-        Every non-null block the frontier passes is eventually either offered
-        or counted in num_skipped_draft_blocks (when it leaves the window,
-        the request is preempted or it finishes).
+        Every non-null block the frontier passes is offered, remains deferred,
+        or is counted in num_skipped_draft_blocks (when it leaves the window,
+        the request is preempted or it finishes). After a CPU cache reset,
+        still-held offered / loaded blocks may be reconsidered and offered
+        again; a block already deferred keeps its accounting obligation.
         """
         group_idx = group_config.group_idx
         group_state = req_status.group_states[group_idx]
@@ -1254,23 +1285,32 @@ class OffloadingConnectorScheduler:
         deferred.update(passed)
         if not deferred:
             return []
-        window_tokens = group_config.draft_window_tokens
-        assert window_tokens is not None
-        # Blocks freed by SlidingWindowManager.remove_skipped_blocks: it frees
-        # on processed tokens, which never exceed num_computed_tokens here.
-        num_skipped_tokens = max(
-            0, req_status.req.num_computed_tokens - window_tokens + 1
-        )
-        first_held = cdiv(num_skipped_tokens // group_config.gpu_block_size, factor)
+        first_held = self._first_held_draft_block(req_status, group_config)
         wanted = self._draft_window_blocks(req_status, group_config)
         selected: list[int] = []
         for block_idx in sorted(deferred):
             if block_idx < first_held:
                 deferred.discard(block_idx)
                 self.num_skipped_draft_blocks += 1
-            elif block_idx in wanted:
+            elif block_idx < num_blocks and block_idx in wanted:
                 selected.append(block_idx)
         return selected
+
+    def _first_held_draft_block(
+        self, req_status: RequestOffloadState, group_config: GroupOffloadConfig
+    ) -> int:
+        # SlidingWindowManager.remove_skipped_blocks frees on processed tokens,
+        # which never exceed num_computed_tokens here. The connector mirror can
+        # still contain non-null IDs for those freed (and possibly reused) pages.
+        window_tokens = group_config.draft_window_tokens
+        assert window_tokens is not None
+        num_skipped_tokens = max(
+            0, req_status.req.num_computed_tokens - window_tokens + 1
+        )
+        return cdiv(
+            num_skipped_tokens // group_config.gpu_block_size,
+            self.config.block_size_factor,
+        )
 
     def _drop_draft_deferred(self, req_status: RequestOffloadState) -> None:
         """Count deferred draft blocks as skipped once the request releases
@@ -1278,6 +1318,9 @@ class OffloadingConnectorScheduler:
         for deferred in getattr(req_status, "draft_deferred", {}).values():
             self.num_skipped_draft_blocks += len(deferred)
             deferred.clear()
+        # Accepted blocks have no unsettled obligation. Once ownership ends,
+        # a later CPU reset must not requeue their old physical sources.
+        req_status.draft_reofferable.clear()
 
     def skipped_draft_blocks_delta(self) -> int:
         """Draft blocks skipped by cpu.draft_offload since the previous call."""
@@ -1800,12 +1843,30 @@ class OffloadingConnectorScheduler:
         # Reset offloading manager cache
         self.manager.reset_cache()
 
-        # Reset store progress so active requests re-offload from block 0
+        # Reset store progress for active requests. Keep draft scan frontiers:
+        # rewinding them can recount settled skips, especially when optimistic
+        # computed tokens roll back after speculative-token rejection.
         finished_req_ids = []
         for req_id, status in self._req_status.items():
             status.transfer_jobs.clear()
             if status.req.is_finished():
                 finished_req_ids.append(req_id)
+            elif self.config.cpu_draft_offload == "window":
+                for group_config in self.config.kv_group_configs:
+                    group_idx = group_config.group_idx
+                    if group_config.draft_window_tokens is None:
+                        continue
+                    offered = status.draft_reofferable.get(group_idx)
+                    if not offered:
+                        continue
+                    first_held = self._first_held_draft_block(status, group_config)
+                    status.draft_deferred.setdefault(group_idx, set()).update(
+                        b for b in offered if b >= first_held
+                    )
+                    offered.clear()
+                # Existing deferred blocks keep their accounting obligation;
+                # previously accepted held blocks start a new one. The selector
+                # checks the held boundary again before issuing any source read.
             for group_state in status.group_states:
                 group_state.next_stored_block_idx = 0
         for req_id in finished_req_ids:

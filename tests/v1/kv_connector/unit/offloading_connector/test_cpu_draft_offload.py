@@ -43,7 +43,11 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     SlidingWindowSpec,
 )
-from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+from vllm.v1.kv_offload.base import OffloadKey, make_offload_key
+from vllm.v1.kv_offload.cpu.manager import (
+    CPUOffloadingManager,
+    GroupedCPUOffloadingManager,
+)
 
 pytestmark = pytest.mark.cpu_test
 
@@ -449,6 +453,318 @@ def test_window_preemption_drops_deferred_blocks():
             continue  # the exact state hand-off source
         assert all(bid >= 1000 for bid in src.block_ids.tolist())
     assert run.stored_blocks(DRAFT) == [7, 8, 9]
+
+
+def _cpu_manager(grouped: bool, num_blocks: int = 256):
+    if grouped:
+        return GroupedCPUOffloadingManager(
+            {i: CPUOffloadingManager(num_blocks) for i in (FULL, MAMBA, DRAFT)}
+        )
+    return CPUOffloadingManager(num_blocks)
+
+
+def _stats_connector(scheduler):
+    connector = object.__new__(OffloadingConnector)
+    connector.connector_worker = None
+    connector.connector_scheduler = scheduler
+    # Isolate the draft counter from the CPU reset eviction counters.
+    scheduler.cpu_tier_eviction_deltas = lambda: {}
+    return connector
+
+
+@pytest.mark.parametrize("grouped", [False, True], ids=["unified", "grouped"])
+@pytest.mark.parametrize("complete", [False, True], ids=["inflight", "completed"])
+def test_reset_reoffers_held_draft_window(grouped, complete):
+    """Reset the CPU tier while the request keeps its GPU window. Previously
+    offered blocks must be offered again; existing deferred blocks keep one
+    accounting obligation and already settled skips are never revisited."""
+    manager = _cpu_manager(grouped)
+    scheduler = _make("window", manager=manager)
+    run = Run(scheduler, _request("r1", PROMPT, junction=160), complete=complete)
+    state = scheduler._req_status["r1"]
+    draft_keys = set(state.group_states[DRAFT].offload_keys)
+    offered: list[OffloadKey] = []
+    prepare_store = manager.prepare_store
+
+    def record_offers(keys, ctx):
+        result = prepare_store(keys, ctx)
+        if result is not None:
+            offered.extend(k for k in keys if k in draft_keys)
+        return result
+
+    manager.prepare_store = record_offers
+    run.step(128)
+    run.step(16)
+    key = state.group_states[DRAFT].offload_keys[7]
+    assert manager.lookup(key, state.req_context) is (True if complete else None)
+    deferred = state.draft_deferred[DRAFT]
+    assert deferred == {5, 6}
+    assert len(offered) == 2  # junction blocks 7 and 8
+    assert scheduler.num_skipped_draft_blocks == 5
+    assert len(offered) + scheduler.num_skipped_draft_blocks + len(deferred) == 9
+    connector = _stats_connector(scheduler)
+    assert connector.get_kv_connector_stats().reduce() == {CPU_DRAFT_SKIPPED_KEY: 5}
+    assert connector.get_kv_connector_stats() is None
+    old_jobs = set(scheduler._jobs)
+    assert bool(old_jobs) is not complete
+
+    scheduler.reset_cache()
+    assert not manager.lookup(key, state.req_context)
+    assert state.draft_deferred[DRAFT] is deferred
+    assert connector.get_kv_connector_stats() is None
+    run.complete = False
+    meta = run.step(16, boundaries=(160,))
+    assert meta.jobs_to_flush == old_jobs
+    # Delayed reports from before reset cannot complete the new reservations.
+    scheduler.update_connector_output(
+        SimpleNamespace(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={jid: 1 for jid in old_jobs}
+            )
+        )
+    )
+    assert manager.lookup(key, state.req_context) is None
+    scheduler.update_connector_output(
+        SimpleNamespace(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={jid: 1 for jid in meta.store_jobs}
+            )
+        )
+    )
+    sources = [
+        job.transfer_spec[0]
+        for job in meta.store_jobs.values()
+        if job.transfer_spec[0].group_sizes[DRAFT]
+    ]
+    assert len(sources) == 1
+    src = sources[0]
+    # The stale connector mirror still has non-null IDs for freed blocks 0..5.
+    # Only the held, needed window may become a draft source after reset.
+    assert src.block_ids.tolist()[-src.group_sizes[DRAFT] :] == [307, 308, 309]
+    resident = [
+        i
+        for i, k in enumerate(state.group_states[DRAFT].offload_keys)
+        if manager.lookup(k, state.req_context)
+    ]
+    assert resident == [7, 8, 9]
+    assert scheduler.get_num_new_matched_tokens(_sibling(scheduler), 0)[0] == 160
+    assert deferred == {6}
+    assert len(offered) == 5  # 7,8 before reset; 7,8,9 afterwards
+    assert scheduler.num_skipped_draft_blocks == 6
+    # Nine first scans, two reoffers after reset, one new block. Carrying the
+    # old deferred set must not count blocks 5 and 6 as new scan obligations.
+    scanned = 9 + 2 + 1
+    assert len(offered) + scheduler.num_skipped_draft_blocks + len(deferred) == scanned
+    assert connector.get_kv_connector_stats().reduce() == {CPU_DRAFT_SKIPPED_KEY: 1}
+    assert connector.get_kv_connector_stats() is None
+    run.finish()
+    assert scheduler.num_skipped_draft_blocks == 7
+    assert len(offered) + scheduler.num_skipped_draft_blocks == scanned
+    assert connector.get_kv_connector_stats().reduce() == {CPU_DRAFT_SKIPPED_KEY: 1}
+    assert connector.get_kv_connector_stats() is None
+    scheduler.request_finished(run.req)
+    assert scheduler.num_skipped_draft_blocks == 7
+
+
+@pytest.mark.parametrize("mode", ["window", "none"])
+def test_reset_does_not_recount_skipped_or_read_freed_draft(mode):
+    scheduler = _make(mode, manager=_cpu_manager(False))
+    run = Run(scheduler, _request("r1", PROMPT, junction=64), complete=True)
+    run.step(96)
+    run.step(32)
+    run.step(0)
+    count = scheduler.num_skipped_draft_blocks
+    # The window before 64 is gone. Reset twice, with a step between resets,
+    # while no new token becomes offloadable. Old non-null IDs stay mirrored.
+    for _ in range(2):
+        scheduler.reset_cache()
+        meta = run.step(0)
+        assert not any(
+            job.transfer_spec[0].group_sizes[DRAFT] for job in meta.store_jobs.values()
+        )
+        assert scheduler.num_skipped_draft_blocks == count
+    assert scheduler.get_num_new_matched_tokens(_sibling(scheduler), 0)[0] == 0
+    run.finish()
+    # In window mode, held but unwanted blocks 5..7 settle exactly once.
+    assert scheduler.num_skipped_draft_blocks == count + (3 if mode == "window" else 0)
+
+
+@pytest.mark.parametrize("grouped", [False, True], ids=["unified", "grouped"])
+def test_window_retries_rejected_reset_store(grouped):
+    manager = _cpu_manager(grouped, num_blocks=16)
+    scheduler = _make("window", manager=manager)
+    run = Run(scheduler, _request("r1", PROMPT, junction=160), complete=True)
+    run.step(128)
+    scheduler.reset_cache()
+    state = scheduler._req_status["r1"]
+    # Pin the entire draft pool with another request's in-flight store.
+    pressure_pool = manager.managers[DRAFT] if grouped else manager
+    pressure = [make_offload_key(f"pressure{i}".encode(), DRAFT) for i in range(16)]
+    assert pressure_pool.prepare_store(pressure, state.req_context) is not None
+    for tokens, boundaries in ((32, (160,)), (0, ())):
+        meta = run.step(tokens, boundaries=boundaries)
+        assert not any(
+            job.transfer_spec[0].group_sizes[DRAFT] for job in meta.store_jobs.values()
+        )
+        if grouped:
+            # The full-attention reservations precede the rejected draft
+            # group. Rollback must free them so this request can retry.
+            assert manager.managers[FULL]._get_num_free_blocks() == 16
+        assert pressure_pool.lookup(pressure[0], state.req_context) is None
+    assert state.draft_deferred[DRAFT] == {7, 8, 9}
+    assert scheduler.num_skipped_draft_blocks == 7
+    pressure_pool.complete_store(pressure, state.req_context, success=False)
+    # Re-deliver the state as well: a unified pool rejected its hand-off.
+    meta = run.step(0, boundaries=(160,))
+    sources = [
+        job.transfer_spec[0]
+        for job in meta.store_jobs.values()
+        if job.transfer_spec[0].group_sizes[DRAFT]
+    ]
+    assert len(sources) == 1
+    src = sources[0]
+    assert src.block_ids.tolist()[-src.group_sizes[DRAFT] :] == [307, 308, 309]
+    assert not state.draft_deferred[DRAFT]
+    assert scheduler.num_skipped_draft_blocks == 7
+    assert scheduler.get_num_new_matched_tokens(_sibling(scheduler), 0)[0] == 160
+
+
+def test_reset_with_optimistic_tokens_excludes_old_draft_sources():
+    scheduler = _make("window", manager=_cpu_manager(False))
+    req = _request("r1", PROMPT, junction=160)
+    run = Run(scheduler, req, complete=True)
+    run.step(128)
+    # Async scheduling can optimistically advance past the core's processed
+    # tokens. Its conservative held boundary must still apply after reset.
+    req.num_computed_tokens = 192
+    scheduler.reset_cache()
+    meta = run.step(0, boundaries=(160,))
+    src = next(
+        job.transfer_spec[0]
+        for job in meta.store_jobs.values()
+        if job.transfer_spec[0].group_sizes[DRAFT]
+    )
+    assert src.block_ids.tolist()[-src.group_sizes[DRAFT] :] == [309]
+    assert scheduler.get_num_new_matched_tokens(_sibling(scheduler), 0)[0] == 0
+
+
+def test_reset_after_optimistic_token_rollback_keeps_settled_skips():
+    scheduler = _make("window", manager=_cpu_manager(False))
+    req = _request("r1", PROMPT, junction=160)
+    run = Run(scheduler, req, complete=True)
+    run.step(128)
+    run.step(16)
+    req.num_computed_tokens = 160
+    run.step(0)
+    assert scheduler.num_skipped_draft_blocks == 7
+    state = scheduler._req_status["r1"]
+    frontier = state.draft_frontier[DRAFT]
+    assert not state.draft_deferred[DRAFT]
+    # A worker rejects speculative tokens. Even though the conservative held
+    # boundary moves backwards, skipped block 6 must not get a new obligation.
+    req.num_computed_tokens = 144
+    scheduler.reset_cache()
+    assert state.draft_frontier[DRAFT] == frontier
+    assert state.draft_deferred[DRAFT] == {7, 8, 9}
+    # Block 9 contains rejected tokens until the next batch recomputes them.
+    # A zero-token step may reoffer 7 and 8, but must leave 9 deferred.
+    meta = run.step(0)
+    src = next(
+        job.transfer_spec[0]
+        for job in meta.store_jobs.values()
+        if job.transfer_spec[0].group_sizes[DRAFT]
+    )
+    assert src.block_ids.tolist()[-src.group_sizes[DRAFT] :] == [307, 308]
+    assert state.draft_deferred[DRAFT] == {9}
+    run.step(16, boundaries=(160,))
+    run.finish()
+    assert scheduler.num_skipped_draft_blocks == 7
+    assert scheduler.get_num_new_matched_tokens(_sibling(scheduler), 0)[0] == 160
+
+
+def test_reset_reoffers_loaded_draft_window():
+    scheduler, _, _ = _tier("window")
+    req = _sibling(scheduler)
+    assert scheduler.get_num_new_matched_tokens(req, 0)[0] == 192
+    ids = _block_ids(req.num_tokens)
+    ids[DRAFT][:9] = [0] * 9
+    ids[MAMBA][5] = 605
+    null = KVCacheBlock(block_id=0, is_null=True)
+    blocks = KVCacheBlocks(
+        tuple(
+            [null if bid == 0 else KVCacheBlock(block_id=bid) for bid in group]
+            for group in ids
+        )
+    )
+    scheduler.update_state_after_alloc(req, blocks, 192)
+    req.num_computed_tokens = 192
+    meta = scheduler.build_connector_meta(_output(req, 0, new=ids))
+    scheduler.update_connector_output(
+        SimpleNamespace(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={jid: 1 for jid in meta.load_jobs}
+            )
+        )
+    )
+    state = scheduler._req_status[req.request_id]
+    assert state.draft_reofferable[DRAFT] == {9, 10, 11}
+    scheduler.reset_cache()
+    assert state.draft_deferred[DRAFT] == {9, 10, 11}
+    # The next boundary needs loaded block 11 as well as new blocks 12 and 13.
+    meta = scheduler.build_connector_meta(
+        _output(req, 32, cached=True, boundaries=(224,))
+    )
+    src = next(
+        job.transfer_spec[0]
+        for job in meta.store_jobs.values()
+        if job.transfer_spec[0].group_sizes[DRAFT]
+    )
+    assert src.block_ids.tolist()[-src.group_sizes[DRAFT] :] == [311, 312, 313]
+    scheduler.update_connector_output(
+        SimpleNamespace(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={jid: 1 for jid in meta.store_jobs}
+            )
+        )
+    )
+    assert (
+        scheduler.get_num_new_matched_tokens(_sibling(scheduler, req_id="r3"), 0)[0]
+        == 224
+    )
+
+
+def test_reset_reoffered_draft_fences_same_batch_reuse():
+    scheduler = _make("window", manager=_cpu_manager(False))
+    req = _request("r1", PROMPT, junction=160)
+    run = Run(scheduler, req, complete=True)
+    run.step(128)
+    scheduler.reset_cache()
+    run.complete = False
+    meta = run.step(32, boundaries=(160,))
+    draft_job = next(
+        jid
+        for jid, job in meta.store_jobs.items()
+        if job.transfer_spec[0].group_sizes[DRAFT]
+    )
+    # Once the original request finishes, its reoffered window can be reused
+    # by multiple requests in the same batch, before the old store completes.
+    run.finish()
+    requests = [
+        _request(f"reuse{i}", PROMPT, hashes=_hashes(12, salt=f"reuse{i}"))
+        for i in range(2)
+    ]
+    new_reqs = []
+    for i, other in enumerate(requests):
+        scheduler.on_new_request(other)
+        scheduler.get_num_new_matched_tokens(other, 0)
+        blocks = _block_ids(PROMPT, base=1000 * (i + 1))
+        blocks[DRAFT][0] = 307 + i
+        new_reqs.append(SimpleNamespace(req_id=other.request_id, block_ids=blocks))
+    output = _output(requests[0], 16)
+    output.scheduled_new_reqs = new_reqs
+    output.num_scheduled_tokens = {r.request_id: 16 for r in requests}
+    reused = scheduler.build_connector_meta(output)
+    assert draft_job in reused.jobs_to_flush
 
 
 # ------------------------------------------------------------------ lookup

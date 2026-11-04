@@ -181,13 +181,12 @@ class EagleSpeculator:
             cudagraph_mode,
             decode_query_len=1,
         )
-        # Share a single pool between prefill and decode since they never
-        # execute concurrently.
-        self.decode_cudagraph_manager.pool = self.prefill_cudagraph_manager.pool
 
         # These routines execute serially in the runner. Share the capture
-        # stream's library workspaces while keeping target/draft graph pools
-        # separate so their live outputs cannot alias.
+        # stream's library workspaces; the draft graphs also use the target's
+        # global graph pool (CudaGraphManager default). Graph outputs that are
+        # read after replay (target hidden states, draft tokens) live in
+        # persistent buffers, so a later replay cannot reuse their memory.
         if self.prefill_cudagraph_manager.cudagraph_mode:
             capture_context = (
                 capture_context or self.prefill_cudagraph_manager.get_capture_context()

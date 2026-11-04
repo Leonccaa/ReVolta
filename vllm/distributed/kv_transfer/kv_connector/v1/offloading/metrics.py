@@ -24,6 +24,33 @@ CPU_EVICTIONS_KEY = "cpu_evicted_blocks"
 CPU_DRAFT_SKIPPED_KEY = "cpu_draft_blocks_skipped"
 CPU_RESIDENT_KEY = "cpu_resident_blocks"
 
+# Labelled scheduler-side counters (see offloading/counters.py): key in
+# ``OffloadingConnectorStats.data`` -> (Prometheus name, label, documentation).
+# Each entry is a list of {"label": str, "count": int}.
+LABELLED_COUNTERS: dict[str, tuple[str, str, str]] = {
+    "cpu_stored_blocks": (
+        "vllm:kv_offload_cpu_stored_blocks",
+        "kind",
+        "Blocks whose store to the CPU offload tier completed, by KV cache "
+        "group kind: target, draft (a speculative drafter's sliding window, "
+        "as recognised by cpu.draft_offload) or state (recurrent state).",
+    ),
+    "lookup_shrink_tokens": (
+        "vllm:kv_offload_lookup_shrink_tokens",
+        "cause",
+        "Tokens by which sliding-window and recurrent-state groups lowered an "
+        "admitted request's offload lookup below the full-attention reach, by "
+        "cause: draft_window, recurrent_state, sliding_window, page_align.",
+    ),
+    "hit_draft_window_needed": (
+        "vllm:kv_offload_hit_draft_window_needed",
+        "needed",
+        "External prefix hits on a model with a draft sliding-window group: "
+        "needed=true when fewer tokens than the draft window remain to be "
+        "prefilled after the hit, so the drafter reads the loaded window.",
+    ),
+}
+
 
 @dataclass
 class OffloadingOperationMetrics:
@@ -78,6 +105,11 @@ class OffloadingConnectorStats(KVConnectorStats):
                         key = f"{CPU_RESIDENT_KEY}_{row['kind']}_{row['status']}"
                         return_dict[key] = row["blocks"]
                 continue
+            if transfer_type in LABELLED_COUNTERS:
+                for entry in ops_list:
+                    key = f"{transfer_type}_{entry['label']}"
+                    return_dict[key] = return_dict.get(key, 0) + entry["count"]
+                continue
             total_bytes = 0
             total_time = 0.0
             for op in ops_list:
@@ -106,6 +138,12 @@ class OffloadingConnectorStats(KVConnectorStats):
                 for (kind, status), blocks in totals.items()
             ]
         ]
+
+    def record_labelled_counts(self, key: str, counts: dict[str, int]) -> None:
+        assert key in LABELLED_COUNTERS, key
+        entries = self.data.setdefault(key, [])
+        for label, count in counts.items():
+            entries.append({"label": label, "count": count})
 
     def record_transfer(self, num_bytes: int, time: float, transfer_type: TransferType):
         src, dst = transfer_type
@@ -178,6 +216,15 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
             labelnames=labelnames,
         )
 
+        # key -> labelled counter; (engine_idx, key, label) -> bound counter
+        self._labelled_counters: dict[str, PromMetricT] = {
+            key: self._counter_cls(
+                name=name, documentation=doc, labelnames=labelnames + [label]
+            )
+            for key, (name, label, doc) in LABELLED_COUNTERS.items()
+        }
+        self.labelled_counters: dict[tuple[int, str, str], PromMetricT] = {}
+
         self._histogram_transfer_size = self._histogram_cls(
             name="vllm:kv_offload_size",
             documentation="Histogram of KV offload transfer size, in bytes.",
@@ -217,6 +264,9 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
                                 + [row["kind"], row["status"]]
                             )
                         ).set(row["blocks"])
+                continue
+            if transfer_type in LABELLED_COUNTERS:
+                self._observe_labelled(transfer_type, ops, engine_idx)
                 continue
             # Cache:
             if (engine_idx, transfer_type) not in self.histogram_transfer_size:
@@ -272,3 +322,14 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
             )
         for count in counts:
             self.counter_cpu_draft_blocks_skipped[engine_idx].inc(count)
+
+    def _observe_labelled(self, key: str, entries: list[Any], engine_idx: int) -> None:
+        for entry in entries:
+            cache_key = (engine_idx, key, entry["label"])
+            counter = self.labelled_counters.get(cache_key)
+            if counter is None:
+                counter = self._labelled_counters[key].labels(
+                    *(self.per_engine_labelvalues[engine_idx] + [entry["label"]])
+                )
+                self.labelled_counters[cache_key] = counter
+            counter.inc(entry["count"])

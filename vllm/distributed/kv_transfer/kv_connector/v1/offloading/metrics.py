@@ -15,6 +15,10 @@ from vllm.v1.kv_offload.worker.worker import TransferType
 
 logger = init_logger(__name__)
 
+# Key in ``OffloadingConnectorStats.data`` for CPU-tier evictions reported by
+# the scheduler side: a list of {"reason": str, "blocks": int} entries.
+CPU_EVICTIONS_KEY = "cpu_evicted_blocks"
+
 
 @dataclass
 class OffloadingOperationMetrics:
@@ -30,7 +34,9 @@ class OffloadingConnectorStats(KVConnectorStats):
             self.reset()
 
     def reset(self):
-        self.data: dict[str, list[OffloadingOperationMetrics]] = {}
+        # Transfer ops per transfer type; CPU_EVICTIONS_KEY holds eviction
+        # entries ({"reason", "blocks"}) from the scheduler side.
+        self.data: dict[str, list[Any]] = {}
 
     def aggregate(self, other: KVConnectorStats) -> KVConnectorStats:
         if not other.is_empty():
@@ -53,6 +59,11 @@ class OffloadingConnectorStats(KVConnectorStats):
         return_dict: dict[str, int | float] = {}
         for transfer_type, ops_list in self.data.items():
             assert isinstance(ops_list, list)
+            if transfer_type == CPU_EVICTIONS_KEY:
+                for entry in ops_list:
+                    key = f"{CPU_EVICTIONS_KEY}_{entry['reason']}"
+                    return_dict[key] = return_dict.get(key, 0) + entry["blocks"]
+                continue
             total_bytes = 0
             total_time = 0.0
             for op in ops_list:
@@ -65,6 +76,11 @@ class OffloadingConnectorStats(KVConnectorStats):
 
     def is_empty(self) -> bool:
         return not self.data
+
+    def record_evictions(self, blocks_by_reason: dict[str, int]) -> None:
+        entries = self.data.setdefault(CPU_EVICTIONS_KEY, [])
+        for reason, blocks in blocks_by_reason.items():
+            entries.append({"reason": reason, "blocks": blocks})
 
     def record_transfer(self, num_bytes: int, time: float, transfer_type: TransferType):
         src, dst = transfer_type
@@ -114,6 +130,17 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
             labelnames=labelnames + ["transfer_type"],
         )
 
+        self.counter_cpu_evicted_blocks: dict[tuple[int, str], PromMetricT] = {}
+        self._counter_cpu_evicted_blocks = self._counter_cls(
+            name="vllm:kv_offload_cpu_evicted_blocks",
+            documentation=(
+                "Blocks evicted from the CPU offload tier, by reason: capacity "
+                "(policy eviction), superseded (evicted after being demoted as "
+                "a superseded state), reset (dropped by a cache reset)."
+            ),
+            labelnames=labelnames + ["reason"],
+        )
+
         self._histogram_transfer_size = self._histogram_cls(
             name="vllm:kv_offload_size",
             documentation="Histogram of KV offload transfer size, in bytes.",
@@ -130,6 +157,9 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
         """
 
         for transfer_type, ops in transfer_stats_data.items():
+            if transfer_type == CPU_EVICTIONS_KEY:
+                self._observe_evictions(ops, engine_idx)
+                continue
             # Cache:
             if (engine_idx, transfer_type) not in self.histogram_transfer_size:
                 self.histogram_transfer_size[(engine_idx, transfer_type)] = (
@@ -163,3 +193,14 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
                 self.counter_kv_transfer_time[(engine_idx, transfer_type)].inc(
                     op["op_time"]
                 )
+
+    def _observe_evictions(self, entries: list[Any], engine_idx: int) -> None:
+        for entry in entries:
+            key = (engine_idx, entry["reason"])
+            if key not in self.counter_cpu_evicted_blocks:
+                self.counter_cpu_evicted_blocks[key] = (
+                    self._counter_cpu_evicted_blocks.labels(
+                        *(self.per_engine_labelvalues[engine_idx] + [entry["reason"]])
+                    )
+                )
+            self.counter_cpu_evicted_blocks[key].inc(entry["blocks"])

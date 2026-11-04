@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from collections.abc import Collection, Iterable, Mapping
 from typing import Literal
 
@@ -24,6 +24,13 @@ _CACHE_POLICIES: dict[str, type[CachePolicy]] = {
     "lru": LRUCachePolicy,
     "arc": ARCCachePolicy,
 }
+
+# Why a stored CPU-tier block left the cache (observability only).
+# "capacity" and "superseded" are policy evictions under space pressure and
+# together equal ``num_evicted_blocks`` and the keys of the removal events;
+# "superseded" marks blocks the scheduler had demoted as superseded states.
+# "reset" counts blocks dropped by ``reset_cache`` (no removal event).
+EVICTION_REASONS: tuple[str, ...] = ("capacity", "superseded", "reset")
 
 
 class CPUOffloadingManager(OffloadingManager):
@@ -62,6 +69,14 @@ class CPUOffloadingManager(OffloadingManager):
         # Cumulative counters for observability (blocks).
         self.num_stored_blocks: int = 0
         self.num_evicted_blocks: int = 0
+        # Read-only bookkeeping: evicted blocks by reason, and the cached keys
+        # currently demoted (only for policies that implement demote). Never
+        # consulted by any admission or eviction decision.
+        self.evicted_blocks_by_reason: Counter[str] = Counter()
+        self._tracks_demotion: bool = (
+            type(self._policy).demote is not CachePolicy.demote
+        )
+        self._demoted: set[OffloadKey] = set()
 
         # Number of block references. It is ordered so can evict the LRU entry in O(1).
         self.counts: OrderedDict[OffloadKey, int] | None = (
@@ -136,9 +151,13 @@ class CPUOffloadingManager(OffloadingManager):
 
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
         self._policy.touch(keys)
+        if self._demoted:
+            self._demoted.difference_update(keys)
 
     def demote(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
         self._policy.demote(keys)
+        if self._tracks_demotion:
+            self._demoted.update(k for k in keys if self._policy.get(k) is not None)
 
     def complete_load(
         self, keys: Collection[OffloadKey], req_context: ReqContext
@@ -180,6 +199,7 @@ class CPUOffloadingManager(OffloadingManager):
                 self._free_block(block)
                 to_evict.append(key)
             self.num_evicted_blocks += len(evicted)
+            self._record_evictions(to_evict)
 
         if to_evict and self.events is not None:
             self.events.append(
@@ -228,6 +248,7 @@ class CPUOffloadingManager(OffloadingManager):
                 if block is not None and not block.is_ready:
                     self._policy.remove(key)
                     self._free_block(block)
+                    self._demoted.discard(key)
 
         if stored_keys and self.events is not None:
             self.events.append(
@@ -244,6 +265,10 @@ class CPUOffloadingManager(OffloadingManager):
         # pre-reset jobs, so no lazy cleanup is needed. The scheduler also
         # flushes in-flight load job IDs to the workers before any new stores
         # can begin, preventing a cross-direction data race on reused offload block IDs.
+        num_cached = self._num_allocated_blocks - len(self._free_list)
+        if num_cached:
+            self.evicted_blocks_by_reason["reset"] += num_cached
+        self._demoted.clear()
         self._policy.clear()
 
         self._free_list.clear()
@@ -253,6 +278,18 @@ class CPUOffloadingManager(OffloadingManager):
         if self.events is not None:
             yield from self.events
             self.events.clear()
+
+    def _record_evictions(self, keys: list[OffloadKey]) -> None:
+        superseded = 0
+        if self._demoted:
+            for key in keys:
+                if key in self._demoted:
+                    self._demoted.discard(key)
+                    superseded += 1
+        if superseded:
+            self.evicted_blocks_by_reason["superseded"] += superseded
+        if len(keys) > superseded:
+            self.evicted_blocks_by_reason["capacity"] += len(keys) - superseded
 
 
 class GroupedCPUOffloadingManager(OffloadingManager):

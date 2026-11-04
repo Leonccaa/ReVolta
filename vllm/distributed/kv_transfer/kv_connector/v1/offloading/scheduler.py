@@ -1214,6 +1214,36 @@ class OffloadingConnectorScheduler:
 
         return store_jobs
 
+    def _cpu_tier_managers(self) -> list[Any]:
+        """Leaf CPU-tier managers, unwrapping group pools and tiering."""
+        stack, leaves = [self.manager], []
+        while stack:
+            m = stack.pop()
+            if hasattr(m, "managers"):  # GroupedCPUOffloadingManager
+                stack.extend(m.managers.values())
+                continue
+            leaves.append(getattr(m, "primary_tier", m))  # TieringOffloadingManager
+        return leaves
+
+    def cpu_tier_eviction_deltas(self) -> dict[str, int]:
+        """CPU-tier evicted blocks by reason since the previous call.
+
+        Read-only: sums the managers' cumulative per-reason counters and
+        returns the increase, so a counter fed with the deltas matches the
+        cumulative totals.
+        """
+        totals: dict[str, int] = {}
+        for m in self._cpu_tier_managers():
+            for reason, n in getattr(m, "evicted_blocks_by_reason", {}).items():
+                totals[reason] = totals.get(reason, 0) + n
+        reported: dict[str, int] | None = getattr(self, "_reported_evictions", None)
+        if reported is None:
+            reported = {}
+            self._reported_evictions = reported
+        deltas = {r: n - reported.get(r, 0) for r, n in totals.items()}
+        reported.update(totals)
+        return {r: d for r, d in deltas.items() if d > 0}
+
     def _cpu_tier_counters(self) -> tuple[int, int]:
         """(stored, evicted) CPU-tier block counts, summed over group pools."""
         stack = [self.manager]

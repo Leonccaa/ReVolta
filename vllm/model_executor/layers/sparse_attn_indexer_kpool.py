@@ -851,7 +851,7 @@ def sparse_attn_indexer_kpool(
                 dec_seq = dec_seq.to(torch.int32)
             out = expand_pools_and_append_tail(pool_ids, dec_seq, index_kpool)
             if (
-                (envs.VLLM_DFLASH_DEBUG_COORD_TRACE or "0") == "1"
+                envs.VLLM_DFLASH_DEBUG_COORD_TRACE == "1"
                 and not _DFLASH_KPOOL_COORD_TRACE_SEEN
                 and 1 < out.shape[0] <= 8
                 and positions is not None

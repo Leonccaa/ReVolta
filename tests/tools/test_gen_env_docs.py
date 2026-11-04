@@ -26,3 +26,25 @@ def test_updated_replaces_only_the_block():
     assert once.startswith("# Title\n\nintro\n\n" + gen_env_docs.BEGIN)
     assert once.endswith("\n## See also\n\n- x\n")
     assert gen_env_docs.updated(once, block) == once
+
+
+def test_missing_type_annotation_is_an_error(monkeypatch):
+    import pytest
+
+    probe = "VLLM_SM70_UNTYPED_PROBE"
+    notes = dict(gen_env_docs.NOTES)
+    notes[probe] = dict(
+        section="profile", since="0.2.0", range="0, 1", tradeoff="x", metrics=""
+    )
+    original = gen_env_docs.read_metadata
+
+    def with_probe(source):
+        metadata, errors = original(source)
+        metadata = dict(metadata)
+        metadata[probe] = {"declared_default": "False", "category": "debug"}
+        return metadata, errors
+
+    monkeypatch.setattr(gen_env_docs, "NOTES", notes)
+    monkeypatch.setattr(gen_env_docs, "read_metadata", with_probe)
+    with pytest.raises(SystemExit, match="TYPE_CHECKING"):
+        gen_env_docs.render()

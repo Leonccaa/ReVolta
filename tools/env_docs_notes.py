@@ -545,14 +545,14 @@ NOTES: dict[str, dict[str, str]] = {
         section="dflash",
         since="1Cat",
         range="0, 1",
-        tradeoff="Debug: log DFlash (v1 speculator) proposal stages.",
+        tradeoff="Debug: DFlash v1 speculator (MRv2) proposal stages.",
         metrics="",
     ),
     "VLLM_DFLASH_DEBUG_TENSOR_DUMP_DIR": dict(
         section="dflash",
         since="1Cat",
         range="path",
-        tradeoff="Debug: DFlash (v1 speculator) tensor dump directory.",
+        tradeoff="Debug: DFlash v1 speculator (MRv2) tensor dump directory.",
         metrics="",
     ),
     "VLLM_DFLASH_DEBUG_TENSOR_DUMP_LIMIT": dict(

@@ -917,8 +917,10 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             "VLLM_DFLASH_DEBUG_TENSOR_DUMP_DIR", ""
         ).strip()
         self._debug_pp_aux_dump_count = 0
+        # Same parsing as os.getenv(name, "2"): only unset takes the default.
+        dump_limit = envs.VLLM_DFLASH_DEBUG_PP_AUX_DUMP_LIMIT
         self._debug_pp_aux_dump_limit = max(
-            0, int(envs.VLLM_DFLASH_DEBUG_PP_AUX_DUMP_LIMIT or "2")
+            0, int("2" if dump_limit is None else dump_limit)
         )
 
     def _debug_dump_pp_aux_hidden_states(

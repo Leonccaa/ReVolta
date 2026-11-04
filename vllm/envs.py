@@ -353,6 +353,16 @@ if TYPE_CHECKING:
     VLLM_SM70_QWEN38_GDN_NO_PACK: bool = False
     VLLM_SM70_MTP_GDN_DIRECT_OUTPUT: bool = False
     VLLM_SM70_QSA_SHARED_KEY: bool = False
+    VLLM_DFLASH2_LOOKUP_ADAPTIVE: bool = True
+    VLLM_DFLASH2_LOOKUP_NSTRONG: int = 6
+    VLLM_DFLASH2_LOOKUP_AGREE: int = 0
+    VLLM_DFLASH2_LOOKUP_NMIN_TAIL: int = 4
+    VLLM_DFLASH2_LOOKUP_LONG_MIN: int = 6
+    VLLM_DFLASH2_LOOKUP_SEARCH: int = 1 << 30
+    VLLM_DFLASH2_LOOKUP_ENTRY_STREAK: int = 2
+    VLLM_DFLASH2_LOOKUP_STICKY: int = 3
+    VLLM_DFLASH2_LOOKUP_CHEAP_CONTEXT: int = 0
+    VLLM_V2_CUDAGRAPH_MEM_MIB: float = 0.0
     VLLM_SM70_QSA_GROUPED_LPT: bool = False
     VLLM_SM70_GDN_CPU_SPEC_QSL: bool = False
     VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE: str = ""
@@ -20076,8 +20086,10 @@ def is_set(name: str):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-# Deprecated switches that call sites read straight from os.environ;
-# validate_environ() warns once at engine startup when one is set.
+# Deprecated switches that call sites read straight from os.environ.
+# validate_environ() logs one warning per set name each time it runs (once per
+# engine-config build; several API server processes each log their own). The
+# getters also raise a FutureWarning when read, so users may see both.
 _DDTREE_RETIRED = "DDTree (speculative method dflash_ddtree) is retired"
 _GLM5NEXT_RETIRED = "glm5next is outside the supported models"
 RETIRING_ENVS: dict[str, str] = {

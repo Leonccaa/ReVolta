@@ -38,7 +38,9 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-_DEBUG_DFLASH_SPARSE_INDICES = bool(int(envs.VLLM_DFLASH_DEBUG_COORD_TRACE or "0"))
+# Same parsing as os.getenv(name, "0"): only an unset variable takes the default.
+_COORD_TRACE = envs.VLLM_DFLASH_DEBUG_COORD_TRACE
+_DEBUG_DFLASH_SPARSE_INDICES = bool(int("0" if _COORD_TRACE is None else _COORD_TRACE))
 _DFLASH_SPARSE_INDICES_SEEN = False
 _FP8_GEMM_MAX_TOKENS = 8
 

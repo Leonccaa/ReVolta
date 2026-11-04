@@ -91,3 +91,73 @@ def test_glm5next_sites_read_through_envs():
             "VLLM_DFLASH_DEBUG_PP_AUX_DUMP_LIMIT",
         ):
             assert f'os.getenv("{name}"' not in text, (path, name)
+
+
+def _old_coord_flag(raw):
+    # Original glm5next sparse.py: bool(int(os.getenv(name, "0")))
+    return bool(int("0" if raw is None else raw))
+
+
+def _old_dump_limit(raw):
+    # Original glm5next model.py: max(0, int(os.getenv(name, "2")))
+    return max(0, int("2" if raw is None else raw))
+
+
+def _run(expr_source: str, raw):
+    from types import SimpleNamespace
+
+    ns = {
+        "envs": SimpleNamespace(
+            VLLM_DFLASH_DEBUG_COORD_TRACE=raw, VLLM_DFLASH_DEBUG_PP_AUX_DUMP_LIMIT=raw
+        )
+    }
+    exec(expr_source, ns)  # noqa: S102 - test-only, source from this repo
+    return ns
+
+
+def _outcome(fn):
+    try:
+        return ("value", fn())
+    except ValueError as exc:
+        return ("ValueError", type(exc).__name__)
+
+
+RAWS = [None, "", "0", "1", "3", "-3"]
+
+
+@pytest.mark.parametrize("raw", RAWS)
+def test_glm5next_sparse_flag_parses_like_before(raw):
+    src = (ROOT / "vllm/models/glm5next/sm70/sparse.py").read_text()
+    start = src.index("_COORD_TRACE = envs.")
+    end = src.index("\n", src.index("_DEBUG_DFLASH_SPARSE_INDICES = ", start))
+    code = src[start:end]
+    new = _outcome(lambda: _run(code, raw)["_DEBUG_DFLASH_SPARSE_INDICES"])
+    assert new == _outcome(lambda: _old_coord_flag(raw))
+
+
+@pytest.mark.parametrize("raw", RAWS)
+def test_glm5next_dump_limit_parses_like_before(raw):
+    import ast
+
+    tree = ast.parse((ROOT / "vllm/models/glm5next/nvidia/model.py").read_text())
+    stmts = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = ast.unparse(node.targets[0])
+            if target in ("dump_limit", "self._debug_pp_aux_dump_limit"):
+                stmts[target] = ast.unparse(node.value)
+    code = (
+        f"dump_limit = {stmts['dump_limit']}\n"
+        f"result = {stmts['self._debug_pp_aux_dump_limit']}"
+    )
+    new = _outcome(lambda: _run(code, raw)["result"])
+    assert new == _outcome(lambda: _old_dump_limit(raw))
+
+
+@pytest.mark.parametrize("raw", RAWS)
+def test_kpool_coord_trace_compares_like_before(raw):
+    src = (ROOT / "vllm/model_executor/layers/sparse_attn_indexer_kpool.py").read_text()
+    assert 'envs.VLLM_DFLASH_DEBUG_COORD_TRACE == "1"' in src
+    # Original: os.getenv(name, "0") == "1"
+    old = ("0" if raw is None else raw) == "1"
+    assert (raw == "1") == old

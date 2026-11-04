@@ -8,6 +8,7 @@ from typing import ClassVar, Literal
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import (
     get_ep_group,
@@ -917,7 +918,7 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         ).strip()
         self._debug_pp_aux_dump_count = 0
         self._debug_pp_aux_dump_limit = max(
-            0, int(os.getenv("VLLM_DFLASH_DEBUG_PP_AUX_DUMP_LIMIT", "2"))
+            0, int(envs.VLLM_DFLASH_DEBUG_PP_AUX_DUMP_LIMIT or "2")
         )
 
     def _debug_dump_pp_aux_hidden_states(

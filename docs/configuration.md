@@ -223,6 +223,77 @@ The ReVolta profile (`vllm/revolta_profile.py`) sets these on SM70 + TP4 + FP16 
 | `VLLM_USE_AOT_COMPILE` | bool | `False` | `0` | 0, 1 | configuration | 1Cat | AOT compile reuse. The profile sets 0 on the reference deployment. |
 | `VLLM_V2_CUDAGRAPH_MEM_MIB` | str | `0.0` | `700` (AWQ), `1200` (AWQ+DFlash2), `700` (NVFP4) | MiB | configuration | 1Cat | CUDA graph memory reserved before sizing the KV cache (MRv2 does not profile it). Too low risks OOM at capture; too high wastes KV. Profile: 700 (AWQ, NVFP4), 1200 (AWQ + DFlash2). |
 
+### DFlash2 and DFlash draft settings
+
+| Name | Type | Default | Range | Category | Since | Effect and trade-off |
+|---|---|---|---|---|---|---|
+| `VLLM_DFLASH2_LOOKUP_ADAPTIVE` | str | `True` | 0, 1 | experimental | 1Cat | Experimental, ngram_assist only (speculative_config ngram_assist, default off). Adaptive q8/q16 lookup width. |
+| `VLLM_DFLASH2_LOOKUP_AGREE` | str | `Computed when unset: max(0, int('0'))` | integer >= 0 | experimental | 1Cat | Experimental, ngram_assist only (speculative_config ngram_assist, default off). Leading tokens the lookup and the draft must agree on (0 = none). |
+| `VLLM_DFLASH2_LOOKUP_CHEAP_CONTEXT` | str | `Computed when unset: max(0, int('0'))` | integer >= 0 | experimental | 1Cat | Experimental, ngram_assist only (speculative_config ngram_assist, default off). Context length below which lookup is always tried (0 = off). |
+| `VLLM_DFLASH2_LOOKUP_ENTRY_STREAK` | str | `Computed when unset: max(1, int('2'))` | integer >= 1 | experimental | 1Cat | Experimental, ngram_assist only (speculative_config ngram_assist, default off). Consecutive hits before lookup mode starts. |
+| `VLLM_DFLASH2_LOOKUP_LONG_MIN` | str | `Computed when unset: max(1, int('6'))` | integer >= 1 | experimental | 1Cat | Experimental, ngram_assist only (speculative_config ngram_assist, default off). Minimum length of a long match. |
+| `VLLM_DFLASH2_LOOKUP_NMIN_TAIL` | str | `Computed when unset: max(1, int('4'))` | integer >= 1 | experimental | 1Cat | Experimental, ngram_assist only (speculative_config ngram_assist, default off). Smallest n-gram accepted for the lookup tail. |
+| `VLLM_DFLASH2_LOOKUP_NSTRONG` | str | `Computed when unset: max(1, int('6'))` | integer >= 1 | experimental | 1Cat | Experimental, ngram_assist only (speculative_config ngram_assist, default off). n-gram length that counts as a strong prompt match. |
+| `VLLM_DFLASH2_LOOKUP_SEARCH` | str | `Computed when unset: max(1, int(str(1 << 30)))` | integer >= 1 | experimental | 1Cat | Experimental, ngram_assist only (speculative_config ngram_assist, default off). Context searched for matches (default unbounded). |
+| `VLLM_DFLASH2_LOOKUP_STICKY` | str | `Computed when unset: max(0, int('3'))` | integer >= 0 | experimental | 1Cat | Experimental, ngram_assist only (speculative_config ngram_assist, default off). Steps lookup mode stays on after a hit. |
+| `VLLM_DFLASH_COMPACT_AUX_HIDDEN` | bool | `True` | 0, 1 | configuration | 1Cat | Concatenates the target auxiliary hidden states directly in the draft projection dtype (DFlash and DFlash2 drafts); avoids an extra full-precision copy. |
+| `VLLM_DFLASH_DEBUG_CONTEXT_KV` | bool | `False` | 0, 1 | debug | 1Cat | Debug: log the draft context KV. |
+| `VLLM_DFLASH_DEBUG_PROPOSAL_STAGES` | str \| None | `None` | 0, 1 | debug | 1Cat | Debug: log DFlash (v1 speculator) proposal stages. |
+| `VLLM_DFLASH_DEBUG_STATE_TABLE` | bool | `False` | 0, 1 | debug | 1Cat | Debug: log the GDN speculative state table. |
+| `VLLM_DFLASH_DEBUG_TARGET_LAYER_TRACE` | str \| None | `None` | 0, 1 | debug | 1Cat | Debug: target layer trace (NVFP4 MoE). |
+| `VLLM_DFLASH_DEBUG_TARGET_LOGITS` | str \| None | `None` | 0, 1 | debug | 1Cat | Debug: log target logits (MRv2). |
+| `VLLM_DFLASH_DEBUG_TARGET_TRACE_MIN_POSITION` | str \| None | `None` | position | debug | 1Cat | Debug: first position of the target layer trace. |
+| `VLLM_DFLASH_DEBUG_TENSOR_DUMP_DIR` | str \| None | `None` | path | debug | 1Cat | Debug: DFlash (v1 speculator) tensor dump directory. |
+| `VLLM_DFLASH_DEBUG_TENSOR_DUMP_LIMIT` | str \| None | `None` | count | debug | 1Cat | Debug: maximum tensor dumps. |
+| `VLLM_DFLASH_PROFILE` | bool | `False` | 0, 1 | debug | 1Cat | Debug: DFlash/DFlash2 proposal timing log. |
+| `VLLM_DFLASH_PROFILE_LOG_INTERVAL` | int | `32` | steps | debug | 1Cat | Debug: interval of the timing log. |
+
+### Deprecated, removed in 0.2.0rc6
+
+| Name | Type | Default | Range | Category | Since | Effect and trade-off |
+|---|---|---|---|---|---|---|
+| `VLLM_DFLASH_DDTREE_ATTN_COMPACT_BATCH` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree is retired. |
+| `VLLM_DFLASH_DDTREE_COMPACT_DRAFTER_CONTEXT` | bool | `True` | - | deprecated | 1Cat | Deprecated: DDTree is retired. |
+| `VLLM_DFLASH_DDTREE_CONV_KERNEL` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree is retired. |
+| `VLLM_DFLASH_DDTREE_DEBUG` | bool | `False` | - | deprecated | 1Cat | Deprecated: DDTree is retired. |
+| `VLLM_DFLASH_DDTREE_DISABLE_GDN_FAST_BUILD` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree is retired. |
+| `VLLM_DFLASH_DDTREE_DISABLE_GDN_FAST_BUILD_CACHE` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree is retired. |
+| `VLLM_DFLASH_DDTREE_ENABLE_GDN_FAST_BUILD` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree is retired. |
+| `VLLM_DFLASH_DDTREE_ENABLE_GDN_FAST_BUILD_CACHE` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree is retired. |
+| `VLLM_DFLASH_DDTREE_ENABLE_HYBRID_TREE_STATE` | bool | `False` | - | deprecated | 1Cat | Deprecated: DDTree is retired. |
+| `VLLM_DFLASH_DDTREE_ENGINE_PROFILE` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree is retired. |
+| `VLLM_DFLASH_DDTREE_FAST_BUILD_DEBUG` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree is retired. |
+| `VLLM_DFLASH_DDTREE_FORCE_MAMBA_COMPACT` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree is retired. |
+| `VLLM_DFLASH_DDTREE_FUSED_GDN` | bool | `True` | - | deprecated | 1Cat | Deprecated: DDTree is retired. |
+| `VLLM_DFLASH_DDTREE_GDN_FAST_BUILD_TRITON` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree is retired. |
+| `VLLM_DFLASH_DDTREE_GDN_SHARED_COMMON` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree is retired. |
+| `VLLM_DFLASH_DDTREE_GPU_SAMPLER` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree is retired. |
+| `VLLM_DFLASH_DDTREE_LINEAR_GDN` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree is retired. |
+| `VLLM_DFLASH_DDTREE_MAMBA_COMPACT_BATCH` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree is retired. |
+| `VLLM_DFLASH_DDTREE_METADATA_PROFILE` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree is retired. |
+| `VLLM_DFLASH_DDTREE_PATH_PROBE` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree is retired. |
+| `VLLM_DFLASH_DDTREE_PATH_PROBE_LAYER` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree is retired. |
+| `VLLM_DFLASH_DDTREE_PATH_PROBE_MAX_REPORTS` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree is retired. |
+| `VLLM_DFLASH_DDTREE_PATH_PROBE_NODE_LIMIT` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree is retired. |
+| `VLLM_DFLASH_DDTREE_PROFILE` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree is retired. |
+| `VLLM_DFLASH_DDTREE_QLA_GDN` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree is retired. |
+| `VLLM_DFLASH_DDTREE_SERIAL_GDN` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree is retired. |
+| `VLLM_DFLASH_DDTREE_SKIP_MAMBA_COMPACT` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree is retired. |
+| `VLLM_DFLASH_DDTREE_STOCHASTIC_TOPK_LOGITS` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree is retired. |
+| `VLLM_DFLASH_DDTREE_TARGET_FORWARD_NVTX` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree is retired. |
+| `VLLM_DFLASH_DDTREE_TARGET_FORWARD_PROFILER_STEP` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree is retired. |
+| `VLLM_DFLASH_DDTREE_TRACE_JSONL` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree is retired. |
+| `VLLM_DFLASH_DDTREE_TRACE_KV_CACHE_DIFF` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree is retired. |
+| `VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN` | bool | `True` | - | deprecated | 1Cat | Deprecated: DDTree is retired. |
+| `VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN_STRICT` | bool | `False` | - | deprecated | 1Cat | Deprecated: DDTree is retired. |
+| `VLLM_DFLASH_DDTREE_TRITON_SAMPLER` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree is retired. |
+| `VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree is retired. |
+| `VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE_CONTEXT` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree is retired. |
+| `VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE_TOPK` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree is retired. |
+| `VLLM_DFLASH_DDTREE_WORKER_PROFILE` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree is retired. |
+| `VLLM_DFLASH_DEBUG_COORD_TRACE` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: glm5next is unsupported. |
+| `VLLM_DFLASH_DEBUG_PP_AUX_DUMP_LIMIT` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: glm5next is unsupported. |
+
 ### speculative_config.sm70_dflash2 keys
 
 Pass these inside `--speculative-config '{..., "sm70_dflash2": {...}}'`

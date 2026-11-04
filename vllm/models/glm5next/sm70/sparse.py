@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, ClassVar
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import get_current_vllm_config_or_none
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
@@ -37,9 +38,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-_DEBUG_DFLASH_SPARSE_INDICES = bool(
-    int(os.getenv("VLLM_DFLASH_DEBUG_COORD_TRACE", "0"))
-)
+_DEBUG_DFLASH_SPARSE_INDICES = bool(int(envs.VLLM_DFLASH_DEBUG_COORD_TRACE or "0"))
 _DFLASH_SPARSE_INDICES_SEEN = False
 _FP8_GEMM_MAX_TOKENS = 8
 

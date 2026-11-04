@@ -65,3 +65,32 @@ def test_cpu_offsets_match_gpu_path(monkeypatch, legacy):
                 assert a == b, field
         checked += 1
     assert checked > 100
+
+
+def test_check_mode_counts_and_matches(monkeypatch, tmp_path):
+    flag = tmp_path / "check.on"
+    flag.touch()
+    monkeypatch.setattr(attn_utils, "_GDN_CPU_SPEC_QSL_CHECK_FILE", str(flag))
+    monkeypatch.setattr(
+        attn_utils, "_GDN_CPU_SPEC_QSL_CHECK_STATE", {"checked": 0, "mismatched": 0}
+    )
+    rng = random.Random(7)
+    for _ in range(200):
+        k = 7
+        qsl, drafts = _batch(rng, rng.randint(2, 8), k)
+        _run(monkeypatch, True, qsl, drafts, k, False)
+    state = attn_utils._GDN_CPU_SPEC_QSL_CHECK_STATE
+    assert state["checked"] > 50
+    assert state["mismatched"] == 0
+
+
+def test_check_mode_reports_a_mismatch(monkeypatch):
+    monkeypatch.setattr(
+        attn_utils, "_GDN_CPU_SPEC_QSL_CHECK_STATE", {"checked": 0, "mismatched": 0}
+    )
+    lens = torch.tensor([8, 100, 8], dtype=torch.int32)
+    masks = torch.tensor([True, False, True])
+    good_spec = torch.tensor([0, 8, 16], dtype=torch.int32)
+    bad_non_spec = torch.tensor([0, 99], dtype=torch.int32)
+    attn_utils._check_cpu_spec_qsl(lens, masks, good_spec, bad_non_spec)
+    assert attn_utils._GDN_CPU_SPEC_QSL_CHECK_STATE == {"checked": 1, "mismatched": 1}

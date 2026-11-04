@@ -443,6 +443,46 @@ class CommonGDNSpecMetadata:
 # step in mixed prefill + spec-decode batches). Integer offsets only; the
 # values are identical either way.
 _GDN_CPU_SPEC_QUERY_START_LOC = os.getenv("REVOLTA_GDN_CPU_SPEC_QSL", "0") == "1"
+# Research validation: while this file exists, also compute the offsets the
+# original way on the GPU and compare (adds the host syncs back; never enable
+# it for timing runs). Mismatches are logged as errors.
+_GDN_CPU_SPEC_QSL_CHECK_FILE = os.getenv("REVOLTA_GDN_CPU_SPEC_QSL_CHECK_FILE", "")
+_GDN_CPU_SPEC_QSL_CHECK_STATE = {"checked": 0, "mismatched": 0}
+
+
+def _check_cpu_spec_qsl(
+    query_lens: torch.Tensor,
+    spec_sequence_masks: torch.Tensor,
+    spec_query_start_loc: torch.Tensor,
+    non_spec_query_start_loc: torch.Tensor,
+) -> None:
+    import logging
+
+    ref_spec = torch.zeros_like(spec_query_start_loc)
+    torch.cumsum(query_lens[spec_sequence_masks], dim=0, out=ref_spec[1:])
+    ref_non_spec = torch.zeros_like(non_spec_query_start_loc)
+    torch.cumsum(query_lens[~spec_sequence_masks], dim=0, out=ref_non_spec[1:])
+    state = _GDN_CPU_SPEC_QSL_CHECK_STATE
+    state["checked"] += 1
+    same = torch.equal(ref_spec, spec_query_start_loc) and torch.equal(
+        ref_non_spec, non_spec_query_start_loc
+    )
+    log = logging.getLogger("vllm.revolta.gdn_qsl_check")
+    if not same:
+        state["mismatched"] += 1
+        log.error(
+            "GDN QSL check MISMATCH spec=%s/%s non_spec=%s/%s",
+            spec_query_start_loc.tolist(),
+            ref_spec.tolist(),
+            non_spec_query_start_loc.tolist(),
+            ref_non_spec.tolist(),
+        )
+    if state["checked"] in (1, 10, 100) or state["checked"] % 500 == 0:
+        log.warning(
+            "GDN QSL check: %d mixed steps checked, %d mismatched",
+            state["checked"],
+            state["mismatched"],
+        )
 
 
 def compute_common_gdn_attn_metadata(
@@ -555,6 +595,15 @@ def compute_common_gdn_attn_metadata(
             spec_query_start_loc = offsets[: num_spec_decodes + 1]
             non_spec_query_start_loc = offsets[num_spec_decodes + 1 :]
             non_spec_query_start_loc_cpu = offsets_cpu[num_spec_decodes + 1 :].clone()
+            if _GDN_CPU_SPEC_QSL_CHECK_FILE and os.path.exists(
+                _GDN_CPU_SPEC_QSL_CHECK_FILE
+            ):
+                _check_cpu_spec_qsl(
+                    query_lens,
+                    spec_sequence_masks,
+                    spec_query_start_loc,
+                    non_spec_query_start_loc,
+                )
         else:
             spec_query_start_loc = torch.zeros(
                 num_spec_decodes + 1,

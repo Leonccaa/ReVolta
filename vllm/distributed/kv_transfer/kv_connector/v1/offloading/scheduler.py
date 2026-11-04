@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from itertools import islice
 from typing import Any, NamedTuple
 
+import regex as re
+
 from vllm.distributed.kv_events import BlockRemoved, BlockStored, KVCacheEvent
 from vllm.distributed.kv_transfer.kv_connector.utils import yield_req_data
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
@@ -23,6 +25,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
     MambaSpec,
+    SlidingWindowMLASpec,
     SlidingWindowSpec,
 )
 from vllm.v1.kv_offload.base import (
@@ -78,6 +81,10 @@ class GroupOffloadConfig(NamedTuple):
     # must be stored from exact core-provided boundary block IDs instead of the
     # connector's append-only positional mirror.
     requires_exact_boundary_source: bool = False
+    # Sliding window (tokens) of a speculative draft model's sliding-window
+    # group spanning more than one offloaded block; None for every other group.
+    # Such groups follow SchedulerOffloadConfig.cpu_draft_offload.
+    draft_window_tokens: int | None = None
 
 
 def get_sliding_window_size_in_blocks(
@@ -93,6 +100,44 @@ def get_sliding_window_size_in_blocks(
 
     assert isinstance(kv_cache_spec, FullAttentionSpec)
     return None
+
+
+# ``layers.<index>`` in an attention layer name, e.g. "model.layers.48.self_attn".
+_LAYER_INDEX_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?=\.|$)")
+
+
+def is_draft_sliding_window_group(spec: "OffloadingSpec", group_idx: int) -> bool:
+    """Whether a KV cache group holds a speculative draft model's
+    sliding-window attention (e.g. the DFlash drafter).
+
+    The scheduler has no model, so the group is recognised from its spec and
+    layer names: speculative decoding is configured, the spec is a plain
+    sliding window (managed by SlidingWindowManager, which frees a head prefix
+    of the request's blocks), and the group is either flagged as a draft group
+    or all its layers are numbered past the target model's layers (drafters
+    such as DFlash and EAGLE number their layers after the target's).
+    Recurrent (Mamba) and full-attention groups are never draft groups here.
+    """
+    vllm_config = spec.vllm_config
+    if getattr(vllm_config, "speculative_config", None) is None:
+        return False
+    group = spec.kv_cache_config.kv_cache_groups[group_idx]
+    if type(group.kv_cache_spec) not in (SlidingWindowSpec, SlidingWindowMLASpec):
+        return False
+    if getattr(group, "is_eagle_group", False):
+        return True
+    model_config = getattr(vllm_config, "model_config", None)
+    try:
+        num_target_layers = model_config.get_total_num_hidden_layers()  # type: ignore[union-attr]
+    except Exception:
+        return False
+    if not isinstance(num_target_layers, int) or not group.layer_names:
+        return False
+    for layer_name in group.layer_names:
+        indices = _LAYER_INDEX_RE.findall(layer_name)
+        if len(indices) != 1 or int(indices[0]) < num_target_layers:
+            return False
+    return True
 
 
 def resolve_mamba_align_size(spec: "OffloadingSpec") -> int | None:
@@ -123,6 +168,8 @@ class SchedulerOffloadConfig(NamedTuple):
     # See OffloadingSpec.demote_superseded_states / superseded_state_rule.
     demote_superseded_states: bool = True
     superseded_state_rule: str = "request"
+    # See OffloadingSpec.cpu_draft_offload.
+    cpu_draft_offload: str = "all"
 
     @classmethod
     def from_spec(cls, spec: OffloadingSpec) -> "SchedulerOffloadConfig":
@@ -168,6 +215,19 @@ class SchedulerOffloadConfig(NamedTuple):
             return (
                 isinstance(kv_spec, MambaSpec) and kv_spec.mamba_cache_mode == "align"
             )
+
+        def _draft_window_tokens(
+            group_idx: int, sliding_window_size_in_blocks: int | None
+        ) -> int | None:
+            if (
+                sliding_window_size_in_blocks is None
+                or sliding_window_size_in_blocks <= 1
+                or not is_draft_sliding_window_group(spec, group_idx)
+            ):
+                return None
+            kv_spec = spec.kv_cache_config.kv_cache_groups[group_idx].kv_cache_spec
+            assert isinstance(kv_spec, SlidingWindowSpec)
+            return kv_spec.sliding_window
 
         # Sparse retention (see CacheConfig.prefix_cache_retention_interval)
         # keeps Mamba ``align`` states on the GPU block grid: the replay and
@@ -218,6 +278,7 @@ class SchedulerOffloadConfig(NamedTuple):
                     requires_exact_boundary_source=(
                         _requires_exact_boundary_source(idx)
                     ),
+                    draft_window_tokens=_draft_window_tokens(idx, sw),
                 )
                 for idx, gpu_block_size in enumerate(spec.gpu_block_size)
                 if spec.kv_cache_config.kv_cache_groups[
@@ -229,6 +290,7 @@ class SchedulerOffloadConfig(NamedTuple):
             num_kv_cache_groups=len(spec.kv_cache_config.kv_cache_groups),
             demote_superseded_states=getattr(spec, "demote_superseded_states", True),
             superseded_state_rule=getattr(spec, "superseded_state_rule", "request"),
+            cpu_draft_offload=getattr(spec, "cpu_draft_offload", "all"),
         )
 
 
@@ -268,6 +330,15 @@ class RequestOffloadState:
     # group_idx -> offload block indices of boundary states this request has
     # issued stores for (superseded_state_rule "extend").
     stored_state_blocks: dict[int, set[int]] = field(default_factory=dict)
+    # cpu.draft_offload != "all" (draft groups only, keyed by group_idx):
+    # next offloaded block index the draft store frontier examines,
+    draft_frontier: dict[int, int] = field(default_factory=dict)
+    # ("window") blocks passed by the frontier that were neither offered for
+    # store nor counted as skipped yet,
+    draft_deferred: dict[int, set[int]] = field(default_factory=dict)
+    # ("window") and the token boundaries whose recurrent state this request
+    # handed to the host tier: the draft window before each is offloaded.
+    draft_window_boundaries: set[int] = field(default_factory=set)
     # In-flight job IDs. Per the connector's invariant, at any given time
     # this contains either a single load job, or one or more store jobs.
     transfer_jobs: set[int] = field(default_factory=set)
@@ -344,6 +415,9 @@ class OffloadingConnectorScheduler:
     # Mamba boundary-state hand-offs the host tier could not accept in the
     # step they were offered (see _build_boundary_state_store_jobs).
     num_rejected_boundary_offers: int = 0
+    # Draft-model sliding-window blocks not offloaded because of
+    # cpu.draft_offload ("window" / "none"); see _select_draft_blocks.
+    num_skipped_draft_blocks: int = 0
 
     def __init__(self, spec: OffloadingSpec):
         self.config = SchedulerOffloadConfig.from_spec(spec)
@@ -408,6 +482,28 @@ class OffloadingConnectorScheduler:
         # be freed before a request finishes).
         self._block_id_to_pending_jobs: dict[int, set[int]] = {}
         self.num_rejected_boundary_offers = 0
+        self.num_skipped_draft_blocks = 0
+        self._reported_skipped_draft_blocks = 0
+
+        draft_groups = [
+            group.group_idx
+            for group in self.config.kv_group_configs
+            if group.draft_window_tokens is not None
+        ]
+        if self.config.cpu_draft_offload != "all":
+            if draft_groups:
+                logger.info(
+                    "cpu.draft_offload=%s for draft sliding-window KV cache "
+                    "group(s) %s",
+                    self.config.cpu_draft_offload,
+                    draft_groups,
+                )
+            else:
+                logger.warning(
+                    "cpu.draft_offload=%s has no effect: no KV cache group was "
+                    "recognised as a speculative draft sliding-window group",
+                    self.config.cpu_draft_offload,
+                )
 
     def _generate_job_id(self) -> int:
         job_id = self._job_counter
@@ -711,6 +807,10 @@ class OffloadingConnectorScheduler:
             # Restarting at token 0: offer every block again; resident keys
             # are filtered by prepare_store (vllm-project/vllm#63010).
             group_state.next_stored_block_idx = 0
+        # The block table is rebuilt as well: draft blocks deferred from an
+        # earlier run are no longer held (cpu.draft_offload "window").
+        self._drop_draft_deferred(req_status)
+        req_status.draft_frontier.clear()
 
         # A preempted request can return before its stores have completed.
         # Its preemption metadata will flush them before the next forward.
@@ -908,12 +1008,27 @@ class OffloadingConnectorScheduler:
             # Filter out blocks skipped due to sliding window attention / SSM
             # or unreachable by the load path's alignment constraints.
             new_offload_keys: list[OffloadKey] = []
+            # group_idx -> offloaded block indices selected for draft groups
+            # under cpu.draft_offload "window" / "none" (ascending).
+            draft_selected: dict[int, list[int]] = {}
             for group_config in self.config.kv_group_configs:
                 group_state = req_status.group_states[group_config.group_idx]
                 if group_config.requires_exact_boundary_source:
                     continue
                 num_blocks = num_offloadable_tokens // group_config.offloaded_block_size
                 start_block_idx = group_state.next_stored_block_idx
+                if (
+                    group_config.draft_window_tokens is not None
+                    and self.config.cpu_draft_offload != "all"
+                ):
+                    selected = self._select_draft_blocks(
+                        req_status, group_config, start_block_idx, num_blocks
+                    )
+                    draft_selected[group_config.group_idx] = selected
+                    new_offload_keys.extend(
+                        group_state.offload_keys[b] for b in selected
+                    )
+                    continue
                 if num_blocks <= start_block_idx:
                     continue
                 offload_keys = group_state.offload_keys[start_block_idx:num_blocks]
@@ -964,6 +1079,12 @@ class OffloadingConnectorScheduler:
                 logger.warning("Request %s: cannot store blocks", req_id)
                 continue
 
+            # Offered (stored now or already resident): no longer deferred.
+            for group_idx, selected in draft_selected.items():
+                deferred = req_status.draft_deferred.get(group_idx)
+                if deferred:
+                    deferred.difference_update(selected)
+
             if not store_output.keys_to_store:
                 req_status.advance_stored_idx(num_offloadable_tokens)
                 continue
@@ -989,13 +1110,19 @@ class OffloadingConnectorScheduler:
                 block_ids = group_state.block_ids
                 num_group_blocks = 0
                 start_gpu_block_idx: int | None = None
-                for idx, offload_key in enumerate(
-                    group_state.offload_keys[start_block_idx:num_blocks]
+                selected_block_idxs = draft_selected.get(group_config.group_idx)
+                for offloaded_block_idx in (
+                    range(
+                        start_block_idx,
+                        min(num_blocks, len(group_state.offload_keys)),
+                    )
+                    if selected_block_idxs is None
+                    else selected_block_idxs
                 ):
+                    offload_key = group_state.offload_keys[offloaded_block_idx]
                     if offload_key not in keys_to_store:
                         continue
 
-                    offloaded_block_idx = start_block_idx + idx
                     gpu_block_idx = offloaded_block_idx * block_size_factor
                     for i in range(block_size_factor):
                         block_id = block_ids[gpu_block_idx + i]
@@ -1057,6 +1184,107 @@ class OffloadingConnectorScheduler:
             )
 
         return store_jobs
+
+    def _draft_window_blocks(
+        self, req_status: RequestOffloadState, group_config: GroupOffloadConfig
+    ) -> set[int]:
+        """Offloaded block indices of a draft group that a prefix hit at one of
+        this request's state boundaries (or its junction) needs: the
+        ``sliding_window_size_in_blocks`` blocks before each boundary, as
+        _sliding_window_lookup requires them."""
+        boundaries = set(req_status.draft_window_boundaries)
+        junction = getattr(req_status.req, "shared_prefix_boundary", 0)
+        if isinstance(junction, int) and junction > 0:
+            boundaries.add(junction)
+        window = group_config.sliding_window_size_in_blocks
+        assert window is not None
+        blocks: set[int] = set()
+        for boundary in boundaries:
+            end = boundary // group_config.offloaded_block_size
+            blocks.update(range(max(0, end - window), end))
+        return blocks
+
+    def _select_draft_blocks(
+        self,
+        req_status: RequestOffloadState,
+        group_config: GroupOffloadConfig,
+        start_block_idx: int,
+        num_blocks: int,
+    ) -> list[int]:
+        """Select the blocks of a draft sliding-window group to offer for
+        store under cpu.draft_offload "window" or "none".
+
+        The draft KV cannot be recomputed by the drafter (it is projected from
+        target hidden states), so a prefix hit needs the draft window before
+        the hit point in the tier. "none" offers nothing. "window" offers the
+        window before each boundary whose recurrent state the request handed
+        to the host tier, and before its junction. A boundary is offered when
+        its chunk is scheduled, after earlier chunks already passed part of
+        its window, so blocks passed by the store frontier are deferred and
+        offered once a boundary needs them, as long as the request still
+        holds them: SlidingWindowManager frees blocks behind the window of the
+        processed tokens and the pool may reuse them at once, so a later store
+        could read another request's data.
+
+        Every non-null block the frontier passes is eventually either offered
+        or counted in num_skipped_draft_blocks (when it leaves the window,
+        the request is preempted or it finishes).
+        """
+        group_idx = group_config.group_idx
+        group_state = req_status.group_states[group_idx]
+        factor = self.config.block_size_factor
+        first = max(req_status.draft_frontier.get(group_idx, 0), start_block_idx)
+        passed: list[int] = []
+        if num_blocks > first:
+            req_status.draft_frontier[group_idx] = num_blocks
+            # As in _build_store_jobs: the last GPU block of each offloaded
+            # block is zero (null) when the request does not hold the block.
+            last_block_ids = group_state.block_ids[
+                first * factor + factor - 1 : num_blocks * factor : factor
+            ]
+            assert len(last_block_ids) == num_blocks - first
+            passed = [
+                first + i for i, block_id in enumerate(last_block_ids) if block_id != 0
+            ]
+        if self.config.cpu_draft_offload == "none":
+            self.num_skipped_draft_blocks += len(passed)
+            return []
+
+        deferred = req_status.draft_deferred.setdefault(group_idx, set())
+        deferred.update(passed)
+        if not deferred:
+            return []
+        window_tokens = group_config.draft_window_tokens
+        assert window_tokens is not None
+        # Blocks freed by SlidingWindowManager.remove_skipped_blocks: it frees
+        # on processed tokens, which never exceed num_computed_tokens here.
+        num_skipped_tokens = max(
+            0, req_status.req.num_computed_tokens - window_tokens + 1
+        )
+        first_held = cdiv(num_skipped_tokens // group_config.gpu_block_size, factor)
+        wanted = self._draft_window_blocks(req_status, group_config)
+        selected: list[int] = []
+        for block_idx in sorted(deferred):
+            if block_idx < first_held:
+                deferred.discard(block_idx)
+                self.num_skipped_draft_blocks += 1
+            elif block_idx in wanted:
+                selected.append(block_idx)
+        return selected
+
+    def _drop_draft_deferred(self, req_status: RequestOffloadState) -> None:
+        """Count deferred draft blocks as skipped once the request releases
+        them (finished or preempted)."""
+        for deferred in getattr(req_status, "draft_deferred", {}).values():
+            self.num_skipped_draft_blocks += len(deferred)
+            deferred.clear()
+
+    def skipped_draft_blocks_delta(self) -> int:
+        """Draft blocks skipped by cpu.draft_offload since the previous call."""
+        total = getattr(self, "num_skipped_draft_blocks", 0)
+        reported = getattr(self, "_reported_skipped_draft_blocks", 0)
+        self._reported_skipped_draft_blocks = total
+        return total - reported
 
     def _queue_boundary_state_offloads(self, scheduler_output: SchedulerOutput) -> None:
         """Move this step's exact Mamba boundary-state hand-offs onto requests."""
@@ -1122,6 +1350,12 @@ class OffloadingConnectorScheduler:
 
         store_jobs: dict[int, TransferJob] = {}
         num_groups = self.config.num_kv_cache_groups
+        record_draft_windows = getattr(
+            self.config, "cpu_draft_offload", "all"
+        ) == "window" and any(
+            group.draft_window_tokens is not None
+            for group in self.config.kv_group_configs
+        )
         for req_id, req_status in self._req_status.items():
             pending = req_status.pending_boundary_offloads
             if not pending:
@@ -1167,6 +1401,9 @@ class OffloadingConnectorScheduler:
                 if store_output is None:
                     rejected.append(boundary_tokens)
                     continue
+                if record_draft_windows:
+                    # Stored now or already resident: keep its draft window.
+                    req_status.draft_window_boundaries.add(boundary_tokens)
                 keys_to_store = set(store_output.keys_to_store)
                 if not keys_to_store:
                     continue
@@ -1271,13 +1508,17 @@ class OffloadingConnectorScheduler:
         stored, evicted = self._cpu_tier_counters()
         logger.info(
             "Offload counters: demoted_states=%d cpu_stored_blocks=%d "
-            "cpu_evicted_blocks=%d rejected_boundary_offers=%d rule=%s",
+            "cpu_evicted_blocks=%d rejected_boundary_offers=%d rule=%s "
+            "cpu_draft_blocks_skipped=%d cpu.draft_offload=%s",
             getattr(self, "num_demoted_states", 0),
             stored,
             evicted,
             # Mamba boundary-state hand-offs the host tier could not accept.
             getattr(self, "num_rejected_boundary_offers", 0),
             self.config.superseded_state_rule,
+            # Draft-model blocks not offloaded (cpu.draft_offload).
+            getattr(self, "num_skipped_draft_blocks", 0),
+            getattr(self.config, "cpu_draft_offload", "all"),
         )
 
     def build_connector_meta(
@@ -1291,6 +1532,7 @@ class OffloadingConnectorScheduler:
             # Preemption returns the request's blocks to the pool, so
             # boundary states not yet handed to a store job are gone.
             self._drop_pending_boundary_offloads(req_status, "preempted")
+            self._drop_draft_deferred(req_status)
             if not req_status.transfer_jobs:
                 continue
             # A request preempted outside schedule() (reset_prefix_cache with
@@ -1416,6 +1658,7 @@ class OffloadingConnectorScheduler:
         # Blocks are freed right after this call; a store for a still
         # pending boundary offer could not be issued before block reuse.
         self._drop_pending_boundary_offloads(req_status, "request finished")
+        self._drop_draft_deferred(req_status)
         if not req_status.transfer_jobs:
             del self._req_status[request.request_id]
             return False, None

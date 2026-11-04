@@ -209,12 +209,17 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA, SupportsVmmSafeTransf
             return self.connector_worker.get_kv_connector_stats()
         if self.connector_scheduler is None:
             return None
-        # Scheduler side: CPU-tier evictions by reason since the last call.
+        # Scheduler side: CPU-tier evictions by reason and skipped draft
+        # blocks (cpu.draft_offload) since the last call.
         deltas = self.connector_scheduler.cpu_tier_eviction_deltas()
-        if not deltas:
+        skipped_draft = self.connector_scheduler.skipped_draft_blocks_delta()
+        if not deltas and not skipped_draft:
             return None
         stats = OffloadingConnectorStats()
-        stats.record_evictions(deltas)
+        if deltas:
+            stats.record_evictions(deltas)
+        if skipped_draft:
+            stats.record_skipped_draft_blocks(skipped_draft)
         return stats
 
     @classmethod

@@ -18,6 +18,10 @@ logger = init_logger(__name__)
 # Key in ``OffloadingConnectorStats.data`` for CPU-tier evictions reported by
 # the scheduler side: a list of {"reason": str, "blocks": int} entries.
 CPU_EVICTIONS_KEY = "cpu_evicted_blocks"
+# Key in ``OffloadingConnectorStats.data`` for speculative draft-model blocks
+# the scheduler did not offload (kv_connector_extra_config "cpu.draft_offload"):
+# a list of block counts.
+CPU_DRAFT_SKIPPED_KEY = "cpu_draft_blocks_skipped"
 
 
 @dataclass
@@ -64,6 +68,9 @@ class OffloadingConnectorStats(KVConnectorStats):
                     key = f"{CPU_EVICTIONS_KEY}_{entry['reason']}"
                     return_dict[key] = return_dict.get(key, 0) + entry["blocks"]
                 continue
+            if transfer_type == CPU_DRAFT_SKIPPED_KEY:
+                return_dict[CPU_DRAFT_SKIPPED_KEY] = sum(ops_list)
+                continue
             total_bytes = 0
             total_time = 0.0
             for op in ops_list:
@@ -81,6 +88,9 @@ class OffloadingConnectorStats(KVConnectorStats):
         entries = self.data.setdefault(CPU_EVICTIONS_KEY, [])
         for reason, blocks in blocks_by_reason.items():
             entries.append({"reason": reason, "blocks": blocks})
+
+    def record_skipped_draft_blocks(self, blocks: int) -> None:
+        self.data.setdefault(CPU_DRAFT_SKIPPED_KEY, []).append(blocks)
 
     def record_transfer(self, num_bytes: int, time: float, transfer_type: TransferType):
         src, dst = transfer_type
@@ -141,6 +151,16 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
             labelnames=labelnames + ["reason"],
         )
 
+        self.counter_cpu_draft_blocks_skipped: dict[int, PromMetricT] = {}
+        self._counter_cpu_draft_blocks_skipped = self._counter_cls(
+            name="vllm:kv_offload_cpu_draft_blocks_skipped",
+            documentation=(
+                "Speculative draft-model KV blocks not offloaded to the CPU "
+                "tier because of kv_connector_extra_config cpu.draft_offload."
+            ),
+            labelnames=labelnames,
+        )
+
         self._histogram_transfer_size = self._histogram_cls(
             name="vllm:kv_offload_size",
             documentation="Histogram of KV offload transfer size, in bytes.",
@@ -159,6 +179,9 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
         for transfer_type, ops in transfer_stats_data.items():
             if transfer_type == CPU_EVICTIONS_KEY:
                 self._observe_evictions(ops, engine_idx)
+                continue
+            if transfer_type == CPU_DRAFT_SKIPPED_KEY:
+                self._observe_draft_skipped(ops, engine_idx)
                 continue
             # Cache:
             if (engine_idx, transfer_type) not in self.histogram_transfer_size:
@@ -204,3 +227,13 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
                     )
                 )
             self.counter_cpu_evicted_blocks[key].inc(entry["blocks"])
+
+    def _observe_draft_skipped(self, counts: list[Any], engine_idx: int) -> None:
+        if engine_idx not in self.counter_cpu_draft_blocks_skipped:
+            self.counter_cpu_draft_blocks_skipped[engine_idx] = (
+                self._counter_cpu_draft_blocks_skipped.labels(
+                    *self.per_engine_labelvalues[engine_idx]
+                )
+            )
+        for count in counts:
+            self.counter_cpu_draft_blocks_skipped[engine_idx].inc(count)

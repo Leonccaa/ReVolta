@@ -51,6 +51,9 @@ class ReqContext:
 
 
 SUPERSEDED_STATE_RULES = ("request", "request_fixed", "extend")
+# Values of kv_connector_extra_config "cpu.draft_offload" (see
+# OffloadingSpec.cpu_draft_offload).
+CPU_DRAFT_OFFLOAD_MODES = ("all", "window", "none")
 
 
 class OffloadPolicy(Enum):
@@ -424,6 +427,25 @@ class OffloadingSpec(ABC):
             raise ValueError(
                 f"superseded_state_rule must be one of {SUPERSEDED_STATE_RULES}, "
                 f"got {self.superseded_state_rule!r}"
+            )
+        # "cpu.draft_offload": which blocks of a speculative draft model's
+        # sliding-window KV cache group are offloaded (see
+        # OffloadingConnectorScheduler). The draft KV is projected from target
+        # hidden states, so a missing draft window limits a prefix hit to
+        # where the window is complete:
+        #   all     every block (historical behaviour)
+        #   window  only the window before each boundary at which this request
+        #           stores a recurrent state, and before its shared-prefix
+        #           junction; other draft blocks are skipped
+        #   none    no draft block; the tier then cannot serve a prefix hit
+        #           that needs a draft window
+        self.cpu_draft_offload: str = str(
+            self.extra_config.get("cpu.draft_offload", "all")
+        )
+        if self.cpu_draft_offload not in CPU_DRAFT_OFFLOAD_MODES:
+            raise ValueError(
+                f"cpu.draft_offload must be one of {CPU_DRAFT_OFFLOAD_MODES}, "
+                f"got {self.cpu_draft_offload!r}"
             )
 
         parallel_config = vllm_config.parallel_config

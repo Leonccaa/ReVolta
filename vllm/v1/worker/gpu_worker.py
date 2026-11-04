@@ -54,6 +54,7 @@ from vllm.profiler.wrapper import CudaProfilerWrapper, TorchProfilerWrapper
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.tracing import instrument
+from vllm.utils.gc_utils import freeze_gc_heap, maybe_attach_gc_debug_callback
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
 from vllm.utils.torch_utils import (
@@ -987,11 +988,22 @@ class Worker(WorkerBase):
         )
 
         activate_triton_jit_monitor()
+        self._freeze_gc_after_warmup()
 
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,
             encoder=self.compilation_config.encoder_compilation_time,
         )
+
+    @staticmethod
+    def _freeze_gc_after_warmup() -> None:
+        # Move the startup heap (model, compiled graphs, CUDA graphs, Triton
+        # kernels, PLE/offload state) out of the collector's view, so that
+        # oldest-generation collections during serving do not scan it. With
+        # tensor parallelism a pause on any rank stalls every rank at the next
+        # collective. Same as the EngineCore process; undone in shutdown().
+        freeze_gc_heap()
+        maybe_attach_gc_debug_callback()
 
     def reset_mm_cache(self) -> None:
         self.model_runner.reset_mm_cache()
@@ -1527,6 +1539,10 @@ class Worker(WorkerBase):
         self._is_checkpoint_format = True
 
     def shutdown(self) -> None:
+        # Undo the freeze from compile_or_warm_up_model so that objects
+        # allocated at startup can be collected when the worker is torn down
+        # in-process.
+        gc.unfreeze()
         from vllm.v1.worker.gpu.shutdown import log_loaded_attention_route_summaries
 
         log_loaded_attention_route_summaries()

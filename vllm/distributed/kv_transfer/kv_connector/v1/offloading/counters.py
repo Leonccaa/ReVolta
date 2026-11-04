@@ -14,7 +14,7 @@ from collections.abc import Iterable, Mapping
 from operator import itemgetter
 from typing import TYPE_CHECKING
 
-from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec, MambaSpec
 from vllm.v1.kv_offload.base import OffloadKey, make_offload_key
 
 if TYPE_CHECKING:
@@ -144,6 +144,17 @@ class OffloadCounters:
         return out
 
 
+def offload_group_kind(group: "GroupOffloadConfig", kv_spec: KVCacheSpec) -> str:
+    """Semantic kind shared by completed-store and residency statistics.
+
+    A recurrent group's cache mode affects dependency deletion support, not
+    its statistics kind. Draft recognition remains the scheduler's decision.
+    """
+    if group.draft_window_tokens is not None:
+        return "draft"
+    return "state" if isinstance(kv_spec, MambaSpec) else "target"
+
+
 def build_offload_counters(
     kv_group_configs: Iterable["GroupOffloadConfig"], kv_cache_config: KVCacheConfig
 ) -> OffloadCounters:
@@ -164,21 +175,19 @@ def build_offload_counters(
     draft_windows: list[int] = []
     for group in kv_group_configs:
         idx = group.group_idx
-        is_state = isinstance(
-            kv_cache_config.kv_cache_groups[idx].kv_cache_spec, MambaSpec
+        kind = offload_group_kind(
+            group, kv_cache_config.kv_cache_groups[idx].kv_cache_spec
         )
+        kind_by_group[idx] = kind
         if group.draft_window_tokens is not None:
-            kind_by_group[idx] = "draft"
             draft_windows.append(group.draft_window_tokens)
-        else:
-            kind_by_group[idx] = "state" if is_state else "target"
         if group.sliding_window_size_in_blocks is None:
             has_full_attention = True
         elif group.draft_window_tokens is not None:
             shrink_cause_by_group[idx] = "draft_window"
         else:
             shrink_cause_by_group[idx] = (
-                "recurrent_state" if is_state else "sliding_window"
+                "recurrent_state" if kind == "state" else "sliding_window"
             )
     return OffloadCounters(
         kind_by_group,

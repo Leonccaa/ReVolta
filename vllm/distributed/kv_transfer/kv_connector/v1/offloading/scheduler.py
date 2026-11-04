@@ -21,6 +21,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.counters import (
     LookupShrink,
     OffloadCounters,
     build_offload_counters,
+    offload_group_kind,
 )
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
@@ -28,6 +29,7 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    KVCacheConfig,
     KVCacheSpec,
     MambaSpec,
     SlidingWindowMLASpec,
@@ -511,7 +513,7 @@ class OffloadingConnectorScheduler:
             self.config.cpu_enable_dependency_eviction
             or self.config.cpu_residency_stats
         ):
-            self._init_dependency_index()
+            self._init_dependency_index(spec.kv_cache_config)
         # Read-only counters (stored blocks by kind, lookup shrink, draft
         # window use); never consulted by any decision.
         self._offload_counters = build_offload_counters(
@@ -543,7 +545,7 @@ class OffloadingConnectorScheduler:
                     self.config.cpu_draft_offload,
                 )
 
-    def _init_dependency_index(self) -> None:
+    def _init_dependency_index(self, kv_cache_config: KVCacheConfig) -> None:
         from vllm.v1.kv_offload.cpu.dependency import (
             CPUBlockDependencyIndex,
             DependencyGroup,
@@ -573,12 +575,8 @@ class OffloadingConnectorScheduler:
         groups = []
         sizes = set()
         for g in self.config.kv_group_configs:
-            kind = (
-                "draft"
-                if g.draft_window_tokens is not None
-                else "state"
-                if g.requires_exact_boundary_source
-                else "target"
+            kind = offload_group_kind(
+                g, kv_cache_config.kv_cache_groups[g.group_idx].kv_cache_spec
             )
             groups.append(
                 DependencyGroup(
@@ -590,8 +588,13 @@ class OffloadingConnectorScheduler:
             )
             if kind != "draft":
                 sizes.add(g.offloaded_block_size)
-                supported &= g.sliding_window_size_in_blocks is None or (
-                    kind == "state" and g.sliding_window_size_in_blocks == 1
+                # Statistics recognise all recurrent modes, but deletion is
+                # modelled only for align states on this checkpoint grid.
+                supported &= (
+                    g.requires_exact_boundary_source
+                    and g.sliding_window_size_in_blocks == 1
+                    if kind == "state"
+                    else g.sliding_window_size_in_blocks is None
                 )
         supported &= len(sizes) == 1
         if sizes:

@@ -90,7 +90,10 @@ Both are experimental deployment settings in `kv_connector_extra_config`.
   dependency collection, a particular capacity gain, or GPU performance.
 - Metric: `vllm:kv_offload_cpu_resident_blocks{kind,status}` is a gauge, enabled
   by either setting, sampled by the scheduler at most once every 60 seconds.
-  `kind` is `target`, `draft` or `state`. Statuses are `potentially_servable`
+  `kind` uses the same KV spec classifier as completed stores: recognised draft
+  windows are `draft`, all `MambaSpec` modes are `state`, and other groups are
+  `target`. Non-align recurrent modes remain unsupported for deletion and
+  report `unknown`. Statuses are `potentially_servable`
   (a conservative upper bound, including GPU-assisted hits), `chain_broken`
   (a state's mandatory final target page is missing), `missing_dependency`
   (a required recurrent peer or mandatory draft suffix is missing), `no_state`

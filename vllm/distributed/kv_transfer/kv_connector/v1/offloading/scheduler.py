@@ -183,6 +183,7 @@ class SchedulerOffloadConfig(NamedTuple):
     cpu_draft_offload: str = "all"
     cpu_enable_dependency_eviction: bool = False
     cpu_residency_stats: bool = False
+    cpu_offload_counters: bool = False
 
     @classmethod
     def from_spec(cls, spec: OffloadingSpec) -> "SchedulerOffloadConfig":
@@ -308,6 +309,7 @@ class SchedulerOffloadConfig(NamedTuple):
                 spec, "cpu_enable_dependency_eviction", False
             ),
             cpu_residency_stats=getattr(spec, "cpu_residency_stats", False),
+            cpu_offload_counters=getattr(spec, "cpu_offload_counters", False),
         )
 
 
@@ -516,14 +518,16 @@ class OffloadingConnectorScheduler:
             self._init_dependency_index(spec.kv_cache_config)
         # Read-only counters (stored blocks by kind, lookup shrink, draft
         # window use); never consulted by any decision.
-        self._offload_counters = build_offload_counters(
-            self.config.kv_group_configs, spec.kv_cache_config
-        )
-        logger.info(
-            "Offload counter kinds by KV cache group: %s (draft window: %s tokens)",
-            self._offload_counters.kind_by_group,
-            self._offload_counters.draft_window_tokens,
-        )
+        self._offload_counters: OffloadCounters | None = None
+        if self.config.cpu_offload_counters:
+            self._offload_counters = build_offload_counters(
+                self.config.kv_group_configs, spec.kv_cache_config
+            )
+            logger.info(
+                "Offload counter kinds by KV cache group: %s (draft window: %s tokens)",
+                self._offload_counters.kind_by_group,
+                self._offload_counters.draft_window_tokens,
+            )
 
         draft_groups = [
             group.group_idx
@@ -1016,11 +1020,12 @@ class OffloadingConnectorScheduler:
         req_status.num_locally_computed_tokens = num_computed_tokens
 
         num_hit_tokens: int | None
-        req_status.lookup_shrink = None
+        counters = getattr(self, "_offload_counters", None)
+        if counters is not None:
+            req_status.lookup_shrink = None
         if request.skip_reading_prefix_cache:
             num_hit_tokens = 0
         else:
-            counters = getattr(self, "_offload_counters", None)
             shrink = counters.new_lookup() if counters is not None else None
             num_hit_tokens = self._lookup(req_status, shrink)
             if shrink is not None and num_hit_tokens is not None:
@@ -1814,17 +1819,24 @@ class OffloadingConnectorScheduler:
             residency_suffix = " cpu_resident_blocks=" + str(sum(totals.values()))
             residency_suffix += " cpu_residency=" + str(totals)
         counters = getattr(self, "_offload_counters", None)
-        by_kind = counters.stored_blocks if counters is not None else {}
-        shrink = counters.lookup_shrink_tokens if counters is not None else {}
-        needed = counters.hit_draft_window_needed if counters is not None else {}
+        counter_suffix = ""
+        if counters is not None:
+            by_kind = counters.stored_blocks
+            shrink = counters.lookup_shrink_tokens
+            needed = counters.hit_draft_window_needed
+            counter_suffix = (
+                f" stored_blocks_by_kind=target:{by_kind['target']},"
+                f"draft:{by_kind['draft']},state:{by_kind['state']} "
+                f"lookup_shrink_tokens=draft_window:{shrink['draft_window']},"
+                f"recurrent_state:{shrink['recurrent_state']},"
+                f"sliding_window:{shrink['sliding_window']},"
+                f"page_align:{shrink['page_align']} "
+                f"hit_draft_window_needed=true:{needed['true']},false:{needed['false']}"
+            )
         logger.info(
             "Offload counters: demoted_states=%d cpu_stored_blocks=%d "
             "cpu_evicted_blocks=%d rejected_boundary_offers=%d rule=%s "
-            "cpu_draft_blocks_skipped=%d cpu.draft_offload=%s "
-            "stored_blocks_by_kind=target:%d,draft:%d,state:%d "
-            "lookup_shrink_tokens=draft_window:%d,recurrent_state:%d,"
-            "sliding_window:%d,page_align:%d "
-            "hit_draft_window_needed=true:%d,false:%d%s",
+            "cpu_draft_blocks_skipped=%d cpu.draft_offload=%s%s%s",
             getattr(self, "num_demoted_states", 0),
             stored,
             evicted,
@@ -1834,16 +1846,7 @@ class OffloadingConnectorScheduler:
             # Draft-model blocks not offloaded (cpu.draft_offload).
             getattr(self, "num_skipped_draft_blocks", 0),
             getattr(self.config, "cpu_draft_offload", "all"),
-            # Completed stores, lookup shrink and draft window use of hits.
-            by_kind.get("target", 0),
-            by_kind.get("draft", 0),
-            by_kind.get("state", 0),
-            shrink.get("draft_window", 0),
-            shrink.get("recurrent_state", 0),
-            shrink.get("sliding_window", 0),
-            shrink.get("page_align", 0),
-            needed.get("true", 0),
-            needed.get("false", 0),
+            counter_suffix,
             residency_suffix,
         )
 

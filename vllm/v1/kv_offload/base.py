@@ -448,7 +448,11 @@ class OffloadingSpec(ABC):
                 f"got {self.cpu_draft_offload!r}"
             )
 
-        for key in ("cpu.enable_dependency_eviction", "cpu.residency_stats"):
+        for key in (
+            "cpu.enable_dependency_eviction",
+            "cpu.residency_stats",
+            "cpu.offload_counters",
+        ):
             if type(self.extra_config.get(key, False)) is not bool:
                 raise ValueError(f"{key} must be a bool")
         self.cpu_enable_dependency_eviction: bool = self.extra_config.get(
@@ -456,6 +460,9 @@ class OffloadingSpec(ABC):
         )
         self.cpu_residency_stats: bool = self.extra_config.get(
             "cpu.residency_stats", False
+        )
+        self.cpu_offload_counters: bool = self.extra_config.get(
+            "cpu.offload_counters", False
         )
 
         parallel_config = vllm_config.parallel_config

@@ -75,6 +75,12 @@ from vllm.v1.kv_cache_interface import (
 pytestmark = pytest.mark.cpu_test
 
 
+def _vllm_config_with_counters():
+    config = _vllm_config("all")
+    config.kv_transfer_config.kv_connector_extra_config["cpu.offload_counters"] = True
+    return config
+
+
 def _scheduler(
     mode="all",
     manager=None,
@@ -82,8 +88,13 @@ def _scheduler(
     eagle=False,
     speculative=True,
     kv_config=None,
+    counters=True,
 ):
     config = _vllm_config(mode, speculative=speculative)
+    if counters is not None:
+        config.kv_transfer_config.kv_connector_extra_config["cpu.offload_counters"] = (
+            counters
+        )
     if eagle:
         config.speculative_config = SimpleNamespace(use_eagle_kv_cache=lambda: True)
     spec = MockOffloadingSpec(config, kv_config or _kv_config())
@@ -400,8 +411,7 @@ def test_lookup_shrink_reconciles_random(seed, eagle):
         assert sum(shrink.values()) == reach - (num_computed + hit)
         assert set(shrink) <= {"draft_window", "recurrent_state", "page_align"}
     # The same lookup with the counters disabled.
-    off_scheduler = _scheduler(eagle=eagle)
-    off_scheduler._offload_counters = None
+    off_scheduler = _scheduler(eagle=eagle, counters=False)
     off_req = _request("r", PROMPT)
     off_scheduler.on_new_request(off_req)
     off_state = off_scheduler._req_status["r"]
@@ -509,7 +519,7 @@ def test_prometheus_labelled_counters():
         return lambda *a, **k: cls(*a, registry=registry, **k)
 
     prom = OffloadPromMetrics(
-        SimpleNamespace(kv_transfer_config=None),
+        _vllm_config_with_counters(),
         {Gauge: bind(Gauge), Counter: bind(Counter), Histogram: bind(Histogram)},
         ["model_name", "engine"],
         {0: ["m", "0"]},
@@ -638,9 +648,7 @@ def _trace(mode: str, grouped: bool, eagle: bool, counters: bool):
     manager call and the final pool contents."""
     log: list = []
     manager = _Recorder(_cpu_manager(grouped), log)
-    scheduler = _scheduler(mode, manager, eagle=eagle)
-    if not counters:
-        scheduler._offload_counters = None
+    scheduler = _scheduler(mode, manager, eagle=eagle, counters=counters)
     out: list = []
 
     # r1: chunked prefill; r2 looks up while r1's first stores are in flight.
@@ -705,8 +713,7 @@ TRACE_CASES = [
 @pytest.mark.parametrize(("mode", "grouped", "eagle"), TRACE_CASES)
 def test_counters_do_not_change_behaviour(mode, grouped, eagle):
     """Jobs, lookups and every CPU-tier call are identical with the counters
-    disabled (``_offload_counters = None`` runs exactly the code paths
-    without them)."""
+    disabled through the deployment setting."""
     with_counters = _trace(mode, grouped, eagle, counters=True)
     without = _trace(mode, grouped, eagle, counters=False)
     assert with_counters == without

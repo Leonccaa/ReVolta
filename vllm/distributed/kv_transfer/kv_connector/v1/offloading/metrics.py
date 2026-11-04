@@ -217,11 +217,17 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
         )
 
         # key -> labelled counter; (engine_idx, key, label) -> bound counter
+        transfer_config = vllm_config.kv_transfer_config
+        counters_enabled = transfer_config is not None and (
+            transfer_config.kv_connector_extra_config.get("cpu.offload_counters", False)
+            is True
+        )
         self._labelled_counters: dict[str, PromMetricT] = {
             key: self._counter_cls(
                 name=name, documentation=doc, labelnames=labelnames + [label]
             )
             for key, (name, label, doc) in LABELLED_COUNTERS.items()
+            if counters_enabled
         }
         self.labelled_counters: dict[tuple[int, str, str], PromMetricT] = {}
 
@@ -266,7 +272,8 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
                         ).set(row["blocks"])
                 continue
             if transfer_type in LABELLED_COUNTERS:
-                self._observe_labelled(transfer_type, ops, engine_idx)
+                if transfer_type in self._labelled_counters:
+                    self._observe_labelled(transfer_type, ops, engine_idx)
                 continue
             # Cache:
             if (engine_idx, transfer_type) not in self.histogram_transfer_size:

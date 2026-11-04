@@ -323,7 +323,7 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
         mtime_update_interval_s: minimum seconds between mtime updates of a
             page (default 60; 0 = every use).
         store_timeout_s: report a store job failed after this many seconds
-            (default 30; None = never). Safe because a page's checksum is
+            (default 30; 0 = never). Safe because a page's checksum is
             taken from its source before writing and a job cannot expire
             while a task is taking it: a write whose buffer is reused after
             expiry produces a page that fails verification.
@@ -334,7 +334,7 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
         max_inflight_store_blocks: pages queued or being written above which
             new store jobs are skipped (completed without writing, so the CPU
             tier is not held by a slow disk). Default: a quarter of the CPU
-            tier's blocks, at least 64. A job is always accepted when
+            tier's blocks, at least 64 (0 = this default). A job is always accepted when
             nothing else is in flight.
 
     Recency: CPU/GPU-tier hits never read the disk tier, so without help its
@@ -357,10 +357,10 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
         content_manifest_path: str | None = None,
         content_verify: str = "stat",
         mtime_update_interval_s: float = 60.0,
-        store_timeout_s: float | None = 30.0,
+        store_timeout_s: float = 30.0,
         drain_timeout_s: float = 30.0,
         max_io_retries: int = 2,
-        max_inflight_store_blocks: int | None = None,
+        max_inflight_store_blocks: int = 0,
         **kwargs,
     ):
         self._stats_lock = threading.Lock()
@@ -390,16 +390,18 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
         if max_io_retries < 0:
             raise ValueError("max_io_retries must be >= 0")
         self._max_io_retries = max_io_retries
-        self._store_timeout_s = store_timeout_s
+        if store_timeout_s < 0 or drain_timeout_s < 0:
+            raise ValueError("store_timeout_s and drain_timeout_s must be >= 0")
+        self._store_timeout_s = store_timeout_s or None
         self._drain_timeout_s = drain_timeout_s
         num_cpu_blocks = len(primary_kv_view) if primary_kv_view.ndim else 1
         self._max_inflight = (
             max(64, num_cpu_blocks // 4)
-            if max_inflight_store_blocks is None
+            if max_inflight_store_blocks == 0
             else max_inflight_store_blocks
         )
         if self._max_inflight < 1:
-            raise ValueError("max_inflight_store_blocks must be >= 1")
+            raise ValueError("max_inflight_store_blocks must be >= 0")
         self._inflight_stores = 0
         self._inflight_jobs: dict[int, int] = {}
         self._disabled_finished: list[int] = []

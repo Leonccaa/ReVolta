@@ -153,6 +153,10 @@ tier entry is the part after `ssd.`):
 | `ssd.content_manifest_path` | string | none | path | deployment | Content manifest of the loaded checkpoint. Without it the tier is disabled. | 0.2 | experimental |
 | `ssd.content_verify` | enum | `stat` | `stat`, `full` | deployment | `stat` checks size, modification time and inode of every listed file at startup (milliseconds). `full` also recomputes every content hash (about a minute per 100 GB) and catches a rewrite that restored the modification time. | 0.2 | experimental |
 | `ssd.mtime_update_interval_s` | float | `60` | `>= 0` | deployment | Minimum time between refreshes unless another page in the touched chain is due; then the whole chain is stamped tail to head. The times order eviction after a restart; shorter is more precise and writes more metadata. | 0.2 | experimental |
+| `ssd.store_timeout_s` | float | `30` | `>= 0`, `0` = never | deployment | A page write still running after this time is reported failed, so the CPU pool is not held by a stuck disk. Safe because each page's checksum is taken from memory before the write starts. | 0.2 | experimental |
+| `ssd.drain_timeout_s` | float | `30` | `>= 0` | deployment | At shutdown, queued page writes keep running for up to this time; the rest are dropped. Must fit in the engine's shutdown time. | 0.2 | experimental |
+| `ssd.max_io_retries` | int | `2` | `>= 0` | deployment | Retries of a page read or write after a transient error (`EAGAIN`, `EINTR`, `EBUSY`, `ESTALE`, `ETIMEDOUT`, `EIO`), with backoff. Checksum failures are not retried. | 0.2 | experimental |
+| `ssd.max_inflight_store_blocks` | int | `0` (auto) | `>= 0` | deployment | While more pages than this are queued or being written, new pages are not written to disk, so a slow disk does not hold the CPU pool. Auto is a quarter of the CPU pool's blocks, at least 64. | 0.2 | experimental |
 
 When store timeouts are configured, the deadline covers the entire store job,
 including time in the queue. Completion polling reports overdue jobs as failed
@@ -160,7 +164,8 @@ after any protected source snapshot finishes. Each page shares the job deadline.
 An active kernel I/O call still has to return before its worker can shut down.
 
 Counters of a `revolta_fs` tier (pages written, existing, verified, checksum
-failures, pages skipped after a failure in the same chain, modification-time updates)
+failures, pages skipped after a failure in the same chain, modification-time updates,
+retries, write jobs skipped because the disk was behind, timed-out writes)
 are logged when the engine shuts down.
 
 ## See also

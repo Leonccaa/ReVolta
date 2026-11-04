@@ -610,7 +610,7 @@ def test_backpressure_skips_store_jobs(tmp_path, monkeypatch):
 
     monkeypatch.setattr(revolta_mod, "_fsync_dir", hang)
     tensor, view = _view()
-    tier = make_tier(tmp_path, view, max_inflight_store_blocks=1, store_timeout_s=None)
+    tier = make_tier(tmp_path, view, max_inflight_store_blocks=1, store_timeout_s=0)
     try:
         tensor[:2].fill_(1.0)
         tier.submit_store(make_job(1, [key(1)], [0]))

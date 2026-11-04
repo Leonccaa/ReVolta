@@ -511,6 +511,8 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
     def _with_retries(self, op: Callable[[], None]) -> None:
         delay = 0.01
         for attempt in range(self._max_io_retries + 1):
+            if not self._pool.retry_allowed():
+                raise StoreCancelled("I/O job stopped or reached its deadline")
             try:
                 op()
                 return
@@ -520,8 +522,11 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
                 if exc.errno not in _RETRYABLE or attempt == self._max_io_retries:
                     raise
                 self._count("io_retries")
-                time.sleep(delay)
-                delay *= 4
+                if not self._pool.wait_for_retry(delay):
+                    raise StoreCancelled(
+                        "I/O retry stopped or reached its deadline"
+                    ) from exc
+                delay = min(delay * 4, 1.0)
 
     def _make_file_mapper(self, root_dir: str, offloading_spec: "OffloadingSpec"):
         from vllm.v1.kv_offload.file_mapper import FileMapper
@@ -740,30 +745,25 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
             self._disabled_finished.append(job_metadata.job_id)
             return
         n = len(job_metadata.keys)
-        with self._stats_lock:
-            # A job always goes through when nothing else is in flight.
-            over = (
-                self._inflight_stores > 0
-                and self._inflight_stores + n > self._max_inflight
-            )
-            if over:
-                self._stats["store_jobs_skipped_backpressure"] += 1
-                self._stats["store_blocks_skipped_backpressure"] += n
-            else:
-                self._inflight_stores += n
-                self._inflight_jobs[job_metadata.job_id] = n
-        if over:
-            # The disk is behind: do not hold CPU blocks for it. The job
-            # completes without writing; these pages simply miss later.
-            self._disabled_finished.append(job_metadata.job_id)
-            return
         groups: dict[int, list[tuple[OffloadKey, int]]] = {}
         for key, bid in zip(job_metadata.keys, job_metadata.block_ids):
             groups.setdefault(get_offload_group_idx(key), []).append((key, int(bid)))
         tasks = [
             functools.partial(self._store_group, pages) for pages in groups.values()
         ]
-        self._pool.enqueue_store(job_metadata.job_id, len(tasks), tasks)
+        with self._stats_lock:
+            # Expired jobs release CPU pins, but their queued/active tasks
+            # retain physical capacity until every task has returned.
+            pending = max(self._inflight_stores, self._pool.pending_store_blocks)
+            if pending > 0 and pending + n > self._max_inflight:
+                self._stats["store_jobs_skipped_backpressure"] += 1
+                self._stats["store_blocks_skipped_backpressure"] += n
+                # Completing a skipped job releases its CPU pins.
+                self._disabled_finished.append(job_metadata.job_id)
+                return
+            self._inflight_stores += n
+            self._inflight_jobs[job_metadata.job_id] = n
+            self._pool.enqueue_store(job_metadata.job_id, len(tasks), tasks, n_blocks=n)
 
     def submit_load(self, job_metadata: JobMetadata) -> None:
         if self.disabled:

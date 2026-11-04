@@ -91,6 +91,12 @@ class JobState:
         with self._lock:
             return self._published
 
+    @property
+    def finished(self) -> bool:
+        """All physical tasks have returned, including late expired tasks."""
+        with self._lock:
+            return self._completed == self._n_tasks
+
     def begin_unsafe(self) -> bool:
         """Enter a section during which the job must not expire (e.g. while a
         task snapshots its source buffer). Returns False if the job already
@@ -152,6 +158,7 @@ class DualQueueThreadPool:
         self._condition = threading.Condition(threading.Lock())
         self._stop = False
         self._active_stores = 0
+        self._store_blocks: dict[JobId, int] = {}
         self._threads: list[threading.Thread] = []
         self._finished_q: deque[tuple[JobId, bool]] = deque()
 
@@ -193,6 +200,7 @@ class DualQueueThreadPool:
         job_id: JobId,
         n_tasks: int,
         tasks: Iterable[Callable],
+        n_blocks: int = 0,
     ) -> None:
         """Enqueue store tasks for a job (high-priority for store-priority threads)."""
         deadline = (
@@ -205,6 +213,8 @@ class DualQueueThreadPool:
             with self._timed_lock:
                 self._timed[job_id] = state
         with self._condition:
+            if n_blocks:
+                self._store_blocks[job_id] = n_blocks
             for fn in tasks:
                 self._store_q.append((fn, state))
             self._condition.notify(n_tasks)
@@ -231,6 +241,35 @@ class DualQueueThreadPool:
             logger.warning("Store job %s exceeded its I/O deadline", job_id)
             self.num_timed_out += 1
             self._finished_q.append((job_id, False))
+        if overdue:
+            with self._condition:
+                self._condition.notify_all()
+
+    @property
+    def pending_store_blocks(self) -> int:
+        """Physical queued/active pages, independent of published completion."""
+        with self._condition:
+            return sum(self._store_blocks.values())
+
+    def retry_allowed(self) -> bool:
+        state = current_job()
+        return not self._stop and (
+            state is None
+            or (
+                not state.expired
+                and (state.deadline is None or time.monotonic() < state.deadline)
+            )
+        )
+
+    def wait_for_retry(self, delay: float) -> bool:
+        """Wait until retry time, expiry or stop, within the job's budget."""
+        state = current_job()
+        delay = min(delay, 1.0)
+        if state is not None and state.deadline is not None:
+            delay = min(delay, max(0.0, state.deadline - time.monotonic()))
+        with self._condition:
+            self._condition.wait_for(lambda: not self.retry_allowed(), timeout=delay)
+            return self.retry_allowed()
 
     @property
     def stopping(self) -> bool:
@@ -254,6 +293,11 @@ class DualQueueThreadPool:
             self._stop = True
             dropped = len(self._store_q)
             self._load_q.clear()
+            for _, state in self._store_q:
+                if state.job_id in self._store_blocks:
+                    state.task_done(False)
+                    if state.finished:
+                        self._store_blocks.pop(state.job_id, None)
             self._store_q.clear()
             self._condition.notify_all()
         if dropped and self._drain_timeout_s > 0:
@@ -284,6 +328,8 @@ class DualQueueThreadPool:
                 if is_store:
                     with self._condition:
                         self._active_stores -= 1
+                        if state.finished:
+                            self._store_blocks.pop(state.job_id, None)
                 continue
             _current.state = state
             try:
@@ -301,6 +347,8 @@ class DualQueueThreadPool:
                 if is_store:
                     with self._condition:
                         self._active_stores -= 1
+                        if state.finished:
+                            self._store_blocks.pop(state.job_id, None)
                         self._condition.notify_all()
 
             if job_finished:

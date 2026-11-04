@@ -1026,3 +1026,44 @@ def test_auxiliary_config_directory_requires_exact_manifest_files(tmp_path):
     assert get_revolta_identity(spec.vllm_config, str(root), manifest) is not None
     (auxiliary / "extra.json").write_text("{}")
     assert get_revolta_identity(spec.vllm_config, str(root), manifest) is None
+
+
+@pytest.mark.parametrize("method", ["draft_model", "ngram"])
+def test_real_speculative_config_runner_identity(tmp_path, method):
+    from transformers import LlamaConfig
+
+    from vllm.config import ModelConfig, ParallelConfig, SpeculativeConfig
+
+    target_path = tmp_path / "target"
+    draft_path = tmp_path / "draft"
+    hf = LlamaConfig(
+        hidden_size=64,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_hidden_layers=2,
+        intermediate_size=128,
+        max_position_embeddings=128,
+    )
+    hf.architectures = ["LlamaForCausalLM"]
+    hf.save_pretrained(target_path)
+    hf.save_pretrained(draft_path)
+    target = ModelConfig(model=str(target_path), dtype="half", max_model_len=128)
+    speculative = SpeculativeConfig(
+        target_model_config=target,
+        target_parallel_config=ParallelConfig(),
+        model=str(draft_path) if method == "draft_model" else None,
+        method=method,
+        num_speculative_tokens=2,
+    )
+    cfg = make_spec(target_path).vllm_config
+    cfg.model_config = target
+    cfg.speculative_config = speculative
+    manifest = _write_manifest(
+        tmp_path, {"target": str(target_path), "draft": str(draft_path)}
+    )
+    assert target.runner_type == "generate"
+    if method == "draft_model":
+        assert speculative.draft_model_config.runner_type == "draft"
+    else:
+        assert speculative.draft_model_config is target
+    assert get_revolta_identity(cfg, str(tmp_path / "kv"), manifest) is not None

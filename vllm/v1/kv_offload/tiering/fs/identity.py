@@ -270,7 +270,9 @@ def get_revolta_identity(
             draft = getattr(speculative, "draft_model_config", None)
             if draft is None:
                 raise ManifestError("effective draft model configuration is missing")
-            draft_root = _local_model(draft, "draft")
+            draft_root = (
+                roots["target"] if draft is target else _local_model(draft, "draft")
+            )
             if roots["target"] != draft_root:
                 roots["draft"] = draft_root
             draft_identity = {

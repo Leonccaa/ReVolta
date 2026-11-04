@@ -108,6 +108,19 @@ _SIGNATURE = {
     "resampled_local_max_ptr": "*fp32",
     "resampled_local_max_stride": "i64",
     "resample_num_blocks": "i32",
+    "target_logits_ptr": "*fp32",
+    "target_logits_stride": "i64",
+    "seed_ptr": "*i64",
+    "pos_ptr": "*i64",
+    "draft_logits_ptr": "*fp32",
+    "draft_logits_stride_0": "i64",
+    "draft_logits_stride_1": "i64",
+    "block_stats_ptr": "*fp32",
+    "block_stats_plane_stride": "i64",
+    "block_stats_row_stride": "i64",
+    "vocab_num_blocks": "i32",
+    "fallback_count_ptr": "*i64",
+    "vocab_size": "i32",
     "cu_num_logits_ptr": "*i32",
     "expanded_idx_mapping_ptr": "*i32",
     "temp_ptr": "*fp32",
@@ -122,7 +135,7 @@ _FLOAT_ARITH = re.compile(
 )
 
 
-def _sm70_ptx(num_warps: int) -> str:
+def _sm70_ptx(num_warps: int, has_fallback: bool = False) -> str:
     triton = pytest.importorskip("triton")
     from triton.backends.compiler import GPUTarget
     from triton.compiler import ASTSource
@@ -137,7 +150,14 @@ def _sm70_ptx(num_warps: int) -> str:
                 _insert_resampled_kernel,
                 signature=_SIGNATURE,
                 # cdiv(248320, 1024) = 243 blocks, padded to 256.
-                constexprs={"PADDED_RESAMPLE_NUM_BLOCKS": 256},
+                constexprs={
+                    "PADDED_RESAMPLE_NUM_BLOCKS": 256,
+                    "HAS_FALLBACK": has_fallback,
+                    "FALLBACK_BLOCK_SIZE": 1024,
+                    "USE_FP64": False,
+                    "HAS_COUNT": False,
+                    "PADDED_VOCAB_NUM_BLOCKS": 32,
+                },
             ),
             target=GPUTarget("cuda", 70, 32),
             options={"num_warps": num_warps},
@@ -173,6 +193,7 @@ def test_sm70_ptx_one_warp_has_no_cross_warp_step():
     ptx = _sm70_ptx(1)
     assert ".reqntid 32" in ptx
     assert "bar.sync" not in ptx
+    assert _sm70_ptx(1, has_fallback=True).count("bar.sync") == 0
     assert "ld.shared" not in ptx and "st.shared" not in ptx
     _count_store_line(ptx.splitlines())
 
@@ -180,7 +201,8 @@ def test_sm70_ptx_one_warp_has_no_cross_warp_step():
 @pytest.mark.parametrize("num_warps", [1, 4])
 def test_sm70_ptx_has_no_rounding_float_ops(num_warps):
     """Floats are only compared and selected, so the warp count cannot change
-    any value the kernel writes."""
+    any value the kernel writes. (The empty-residual fallback runs Gumbel
+    math, but only in one warp and only for rows with no residual.)"""
     ptx = _sm70_ptx(num_warps)
     assert _FLOAT_ARITH.findall(ptx) == []
     assert "setp" in ptx and "selp.f32" in ptx

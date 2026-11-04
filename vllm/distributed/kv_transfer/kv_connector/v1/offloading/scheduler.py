@@ -337,7 +337,8 @@ class RequestOffloadState:
     # accounting obligation each, including live blocks requeued by a CPU reset,
     draft_deferred: dict[int, set[int]] = field(default_factory=dict)
     # ("window") blocks offered successfully (or loaded) in this cache
-    # generation. A CPU reset returns the still-held ones to draft_deferred.
+    # generation, retired behind the processed-token window. A CPU reset
+    # returns the still-held ones to draft_deferred.
     draft_reofferable: dict[int, set[int]] = field(default_factory=dict)
     # ("window") and the token boundaries whose recurrent state this request
     # handed to the host tier: the draft window before each is offloaded.
@@ -992,6 +993,8 @@ class OffloadingConnectorScheduler:
             req_status = self._req_status[req_id]
             req_status.update_offload_keys()
             req = req_status.req
+            if self.config.cpu_draft_offload == "window":
+                self._prune_draft_history(req_status)
 
             if preempted:
                 for group_state in req_status.group_states:
@@ -1296,17 +1299,50 @@ class OffloadingConnectorScheduler:
                 selected.append(block_idx)
         return selected
 
+    def _prune_draft_history(self, req_status: RequestOffloadState) -> None:
+        # Pending steps can roll back the optimistic computed-token count.
+        # Retire accepted records only behind the processed-token boundary
+        # used by the core to release sliding-window blocks. The source-read
+        # check remains stricter and uses the optimistic boundary below.
+        processed_tokens = max(
+            0, req_status.req.num_computed_tokens - req_status.req.num_in_flight_tokens
+        )
+        live_boundaries: set[int] = set()
+        for group_config in self.config.kv_group_configs:
+            if group_config.draft_window_tokens is None:
+                continue
+            first_held = self._first_held_draft_block(
+                req_status, group_config, num_computed_tokens=processed_tokens
+            )
+            offered = req_status.draft_reofferable.get(group_config.group_idx)
+            if offered:
+                # These offers are already settled: retiring their records
+                # must not count them as skipped.
+                offered.intersection_update({b for b in offered if b >= first_held})
+            live_boundaries.update(
+                boundary
+                for boundary in req_status.draft_window_boundaries
+                if boundary // group_config.offloaded_block_size > first_held
+            )
+        # A past boundary whose whole draft window is gone cannot need a
+        # late store. Keep boundaries overlapping any draft group's window.
+        req_status.draft_window_boundaries.intersection_update(live_boundaries)
+
     def _first_held_draft_block(
-        self, req_status: RequestOffloadState, group_config: GroupOffloadConfig
+        self,
+        req_status: RequestOffloadState,
+        group_config: GroupOffloadConfig,
+        *,
+        num_computed_tokens: int | None = None,
     ) -> int:
         # SlidingWindowManager.remove_skipped_blocks frees on processed tokens,
         # which never exceed num_computed_tokens here. The connector mirror can
         # still contain non-null IDs for those freed (and possibly reused) pages.
         window_tokens = group_config.draft_window_tokens
         assert window_tokens is not None
-        num_skipped_tokens = max(
-            0, req_status.req.num_computed_tokens - window_tokens + 1
-        )
+        if num_computed_tokens is None:
+            num_computed_tokens = req_status.req.num_computed_tokens
+        num_skipped_tokens = max(0, num_computed_tokens - window_tokens + 1)
         return cdiv(
             num_skipped_tokens // group_config.gpu_block_size,
             self.config.block_size_factor,
@@ -1321,6 +1357,7 @@ class OffloadingConnectorScheduler:
         # Accepted blocks have no unsettled obligation. Once ownership ends,
         # a later CPU reset must not requeue their old physical sources.
         getattr(req_status, "draft_reofferable", {}).clear()
+        getattr(req_status, "draft_window_boundaries", set()).clear()
 
     def skipped_draft_blocks_delta(self) -> int:
         """Draft blocks skipped by cpu.draft_offload since the previous call."""
@@ -1575,15 +1612,19 @@ class OffloadingConnectorScheduler:
             # Preemption returns the request's blocks to the pool, so
             # boundary states not yet handed to a store job are gone.
             self._drop_pending_boundary_offloads(req_status, "preempted")
-            self._drop_draft_deferred(req_status)
-            if not req_status.transfer_jobs:
-                continue
             # A request preempted outside schedule() (reset_prefix_cache with
             # reset_running_requests) is reported one call later. With no
             # transfer left, that call may already have re-admitted it with a
             # new load into freshly allocated blocks. The load reads no freed
             # block, and workers start it only after this step's flushes.
-            if req_status.transfer_jobs.issubset(self._current_batch_load_jobs):
+            if req_status.transfer_jobs and req_status.transfer_jobs.issubset(
+                self._current_batch_load_jobs
+            ):
+                # Lookup already cleared the old admission's draft records;
+                # preserve the window registered by this fresh load.
+                continue
+            self._drop_draft_deferred(req_status)
+            if not req_status.transfer_jobs:
                 continue
             any_jid = next(iter(req_status.transfer_jobs))
             assert self._jobs[any_jid].is_store

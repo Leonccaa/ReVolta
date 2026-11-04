@@ -133,6 +133,7 @@ def _request(req_id: str, num_tokens: int, hashes=None, junction: int = 0):
         hashes if hashes is not None else _hashes(num_tokens // DRAFT_BLOCK)
     )
     req.num_computed_tokens = 0
+    req.num_in_flight_tokens = 0
     req.num_prompt_tokens = req.num_tokens = num_tokens
     req.shared_prefix_boundary = junction
     req.is_finished.return_value = False

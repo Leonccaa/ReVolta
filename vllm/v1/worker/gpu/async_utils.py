@@ -17,6 +17,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
         num_sampled_tokens: torch.Tensor,
         main_stream: torch.cuda.Stream,
         copy_stream: torch.cuda.Stream,
+        rejection_fallback_count: torch.Tensor | None = None,
     ):
         # NOTE(woosuk): We must retain references to the GPU tensors,
         # as the copy operations are performed on a different CUDA stream than
@@ -40,6 +41,12 @@ class AsyncOutput(AsyncModelRunnerOutput):
             if sampler_output.num_nans is not None:
                 self.num_nans = async_copy_to_np(sampler_output.num_nans)
             self.num_sampled_tokens_np = async_copy_to_np(num_sampled_tokens)
+            self.rejection_fallback_count = rejection_fallback_count
+            self.rejection_fallback_count_np: np.ndarray | None = None
+            if rejection_fallback_count is not None:
+                self.rejection_fallback_count_np = async_copy_to_np(
+                    rejection_fallback_count
+                )
             self.prompt_logprobs_dict = {
                 k: v.to_cpu_nonblocking() if v is not None else None
                 for k, v in self.model_runner_output.prompt_logprobs_dict.items()
@@ -62,6 +69,12 @@ class AsyncOutput(AsyncModelRunnerOutput):
         if self.num_nans is not None:
             self.model_runner_output.num_nans_in_logits = dict(
                 zip(self.model_runner_output.req_ids, self.num_nans.tolist())
+            )
+
+        if self.rejection_fallback_count_np is not None:
+            # Both fallback tiers: the stable residual was empty.
+            self.model_runner_output.rejection_fallbacks_total = int(
+                self.rejection_fallback_count_np.sum()
             )
 
         if self.logprobs_tensors is not None:

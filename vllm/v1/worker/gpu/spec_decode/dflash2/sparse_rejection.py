@@ -231,6 +231,7 @@ def _sample_reference_requests(
         sampler.sampling_states.seeds.gpu,
         rejection_sampler.num_speculative_steps,
         use_fp64=sampler.use_fp64_gumbel,
+        fallback_count=rejection_sampler.fallback_count,
     )
     return reqs, sampled, num_sampled
 

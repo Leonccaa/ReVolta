@@ -278,6 +278,10 @@ class ModelRunnerOutput:
     # req_id -> num_nans_in_logits
     num_nans_in_logits: dict[str, int] | None = None
 
+    # Running total of rejected positions whose stable FP32 residual was
+    # empty (redrawn from a fallback tier).
+    rejection_fallbacks_total: int | None = None
+
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 

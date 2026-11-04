@@ -1977,6 +1977,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_sampled_tokens=num_sampled,
             main_stream=self.main_stream,
             copy_stream=self.output_copy_stream,
+            rejection_fallback_count=(
+                self.rejection_sampler.fallback_count
+                if self.rejection_sampler is not None
+                else None
+            ),
         )
 
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None

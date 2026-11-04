@@ -28,7 +28,7 @@ from tests.v1.kv_offload.test_revolta_fs import (
     make_spec,
     make_tier,
 )
-from vllm.utils.hashing import sha256
+from vllm.utils.hashing import sha256, sha256_cbor
 from vllm.v1.core import kv_cache_utils
 from vllm.v1.kv_offload.base import OffloadKey, make_offload_key
 from vllm.v1.kv_offload.tiering.fs import content_manifest, revolta
@@ -697,17 +697,29 @@ def test_multimodal_model_is_supported_and_identified(tmp_path):
     )
 
 
-@pytest.mark.parametrize("raw", [b"{", b"\xff", b"", b'{"version":1,"seed":""}'])
-def test_bad_seed_disables_existing_manager_at_init_none_hash(tmp_path, raw):
+@pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"{",
+        b"\xff",
+        b"",
+        b'{"version":1,"seed":""}',
+        b'{"version":1,"seed":"\\ud800"}',
+        b'{"version":1,"seed":"valid-prefix\\udfff"}',
+    ],
+)
+def test_bad_seed_disables_existing_manager_at_init_none_hash(tmp_path, raw, hash_fn):
     root = tmp_path / "kv"
     spec, manifest = checkpoint_spec(root)
+    spec.vllm_config.cache_config.prefix_caching_hash_algo = hash_fn.__name__
     tensor, view = _view()
     tier = make_tier(root, view, spec=spec, content_manifest_path=manifest)
     path = root / ".hash_seed.json"
     path.write_bytes(raw)
     try:
         kv_cache_utils.init_none_hash(
-            sha256,
+            hash_fn,
             kv_transfer_config=_seed_config(root, manifest),
             vllm_config=spec.vllm_config,
         )
@@ -723,6 +735,57 @@ def test_bad_seed_disables_existing_manager_at_init_none_hash(tmp_path, raw):
         )
         tier.submit_store(make_job(1, [key(1)], [0]))
         assert [r.success for r in tier.get_finished_jobs()] == [True]
+    finally:
+        tier.shutdown()
+
+
+def test_cbor_seed_validation_precedes_propagation_to_missing_roots(tmp_path):
+    from vllm.v1.kv_offload.tiering.fs.config import get_fs_hash_seed
+
+    root = tmp_path / "kv"
+    spec, manifest = checkpoint_spec(root)
+    spec.vllm_config.cache_config.prefix_caching_hash_algo = "sha256_cbor"
+    tensor, view = _view()
+    tier = make_tier(root, view, spec=spec, content_manifest_path=manifest)
+    missing = tmp_path / "other"
+    other = make_tier(missing, view, spec=spec, content_manifest_path=manifest)
+    config = _seed_config(root, manifest)
+    config.kv_connector_extra_config["secondary_tiers"] += _seed_config(
+        missing, manifest
+    ).kv_connector_extra_config["secondary_tiers"]
+    path = root / ".hash_seed.json"
+    raw = b'{"version":1,"seed":"\\ud800"}'
+    path.write_bytes(raw)
+    try:
+        assert get_fs_hash_seed(config, vllm_config=spec.vllm_config) is None
+        assert tier.disabled and other.disabled
+        assert tier._closed and other._closed
+        assert path.read_bytes() == raw
+        assert not (missing / ".hash_seed.json").exists()
+    finally:
+        tier.shutdown()
+        other.shutdown()
+
+
+def test_cbor_unicode_seed_survives_real_init_none_hash(tmp_path):
+    root = tmp_path / "kv"
+    spec, manifest = checkpoint_spec(root)
+    spec.vllm_config.cache_config.prefix_caching_hash_algo = "sha256_cbor"
+    tensor, view = _view()
+    tier = make_tier(root, view, spec=spec, content_manifest_path=manifest)
+    seed = "valid-\u00e9-\U0001f600"
+    raw = json.dumps({"version": 1, "seed": seed}).encode()
+    path = root / ".hash_seed.json"
+    path.write_bytes(raw)
+    try:
+        kv_cache_utils.init_none_hash(
+            sha256_cbor,
+            kv_transfer_config=_seed_config(root, manifest),
+            vllm_config=spec.vllm_config,
+        )
+        assert not tier.disabled
+        assert sha256_cbor(seed) == kv_cache_utils.NONE_HASH
+        assert path.read_bytes() == raw
     finally:
         tier.shutdown()
 
@@ -809,6 +872,22 @@ def test_plain_fs_bad_seed_still_raises(tmp_path, raw):
     with pytest.raises(ValueError):
         get_fs_hash_seed(config)
     assert (tmp_path / ".hash_seed.json").read_bytes() == raw
+
+
+@pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
+def test_plain_fs_surrogate_seed_keeps_hash_algorithm_behavior(tmp_path, hash_fn):
+    config = _seed_config(tmp_path, "unused")
+    config.kv_connector_extra_config["secondary_tiers"][0]["type"] = "fs"
+    path = tmp_path / ".hash_seed.json"
+    raw = b'{"version":1,"seed":"\\ud800"}'
+    path.write_bytes(raw)
+    if hash_fn is sha256_cbor:
+        with pytest.raises(UnicodeEncodeError):
+            kv_cache_utils.init_none_hash(hash_fn, kv_transfer_config=config)
+    else:
+        kv_cache_utils.init_none_hash(hash_fn, kv_transfer_config=config)
+        assert hash_fn("\ud800") == kv_cache_utils.NONE_HASH
+    assert path.read_bytes() == raw
 
 
 def test_real_runner_resolution_is_role_specific(tmp_path):
@@ -1026,6 +1105,163 @@ def test_auxiliary_config_directory_requires_exact_manifest_files(tmp_path):
     assert get_revolta_identity(spec.vllm_config, str(root), manifest) is not None
     (auxiliary / "extra.json").write_text("{}")
     assert get_revolta_identity(spec.vllm_config, str(root), manifest) is None
+
+
+def test_awq_multimodal_metadata_through_real_model_config(tmp_path):
+    from vllm.config import ModelConfig, MultiModalConfig
+    from vllm.models.qwen4_exp.config import Qwen4ExpConfig
+
+    model = tmp_path / "checkpoint"
+    # Synthetic dimensions and metadata exercise the composite config loader
+    # without loading weights or depending on a deployed checkpoint.
+    hf = Qwen4ExpConfig(
+        architectures=["Qwen4ExpForConditionalGeneration"],
+        text_config={
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "max_position_embeddings": 524288,
+        },
+        vision_config={
+            "depth": 1,
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_heads": 4,
+            "out_hidden_size": 64,
+        },
+        quantization_config={
+            "quant_method": "awq",
+            "bits": 4,
+            "group_size": 32,
+            "zero_point": True,
+            "meta": {
+                "selection": "s1/s2 re-searched synthetic candidates",
+                "code_rule": "round(w/FP16(scale)+integer_zero), synthetic rule",
+                "old_template_provenance": "template-provenance/",
+            },
+        },
+    )
+    hf.save_pretrained(model)
+    cfg = ModelConfig(
+        model=str(model),
+        dtype="half",
+        max_model_len=524288,
+        language_model_only=False,
+        limit_mm_per_prompt={"image": 16, "video": 1},
+        mm_processor_kwargs={},
+    )
+    assert cfg.is_multimodal_model and cfg.runner_type == "generate"
+    assert cfg.quantization == "awq"
+    assert isinstance(cfg.multimodal_config, MultiModalConfig)
+    assert cfg.multimodal_config.language_model_only is False
+    assert cfg.multimodal_config.get_limit_per_prompt("image") == 16
+    assert cfg.multimodal_config.get_limit_per_prompt("video") == 1
+    assert cfg.multimodal_config.mm_processor_kwargs == {}
+    spec = make_spec(model)
+    spec.vllm_config.model_config = cfg
+    manifest = _write_manifest(tmp_path, {"target": str(model)})
+    root = tmp_path / "kv"
+    before = get_revolta_identity(spec.vllm_config, str(root), manifest)
+    assert before is not None
+    tensor, view = _view()
+    tier = make_tier(root, view, spec=spec, content_manifest_path=manifest)
+    try:
+        assert not tier.disabled
+    finally:
+        tier.shutdown()
+    cfg.hf_config.quantization_config["meta"]["selection"] += " updated"
+    after = get_revolta_identity(spec.vllm_config, str(root), manifest)
+    assert after is not None and before != after
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "quantization_config_file",
+        "vocab_file",
+        "merges_file",
+        "tokenizer_file",
+        "scale_path",
+        "processor_dir",
+        "vision_tower",
+        "source",
+        "encoder_source",
+    ],
+)
+def test_unresolved_loader_processor_sources_still_disable(tmp_path, field):
+    root = tmp_path / "kv"
+    spec, manifest = checkpoint_spec(root)
+    spec.vllm_config.model_config.hf_overrides = {field: "unresolved-source"}
+    assert get_revolta_identity(spec.vllm_config, str(root), manifest) is None
+    assert not root.exists()
+
+
+@pytest.mark.parametrize("exists", [False, True])
+def test_absolute_or_existing_paths_in_unknown_fields_still_disable(
+    tmp_path, monkeypatch, exists
+):
+    root = tmp_path / "kv"
+    spec, manifest = checkpoint_spec(root)
+    external = tmp_path / "external.json"
+    value = str(external)
+    if exists:
+        external.write_text("{}")
+        monkeypatch.chdir(tmp_path)
+        value = external.name
+    spec.vllm_config.model_config.hf_config = {"unknown": value}
+    assert get_revolta_identity(spec.vllm_config, str(root), manifest) is None
+
+
+@pytest.mark.parametrize("role", ["target", "draft"])
+@pytest.mark.parametrize("scales", ["dynamic", "external", "manifest"])
+def test_multimodal_encoder_fp8_requires_manifest_bound_fixed_scales(
+    tmp_path, role, scales
+):
+    from vllm.config import MultiModalConfig
+
+    root = tmp_path / "kv"
+    spec, manifest = checkpoint_spec(root)
+    cfg = spec.vllm_config
+    cfg.speculative_config = _draft(cfg.model_config.model)
+    model = (
+        cfg.model_config
+        if role == "target"
+        else cfg.speculative_config.draft_model_config
+    )
+    scale_path = None
+    if scales != "dynamic":
+        scale_path = (
+            Path(model.model) if scales == "manifest" else tmp_path
+        ) / "encoder-scales.json"
+        scale_path.write_text('{"layer": {"q": 1, "k": 1, "v": 1}}')
+        manifest = _write_manifest(tmp_path, {"target": cfg.model_config.model})
+    model.multimodal_config = MultiModalConfig(
+        mm_encoder_attn_dtype="fp8",
+        mm_encoder_fp8_scale_path=None if scale_path is None else str(scale_path),
+    )
+    identity = get_revolta_identity(cfg, str(root), manifest)
+    tensor, view = _view()
+    tier = make_tier(root, view, spec=spec, content_manifest_path=manifest)
+    try:
+        assert tier.disabled == (scales != "manifest")
+        if scales != "manifest":
+            assert identity is None and not root.exists()
+            kv_cache_utils.init_none_hash(
+                sha256, kv_transfer_config=_seed_config(root, manifest), vllm_config=cfg
+            )
+            assert not root.exists()
+        else:
+            assert identity is not None
+            assert scale_path is not None
+            scale_path.write_text('{"layer": {"q": 2, "k": 1, "v": 1}}')
+            assert get_revolta_identity(cfg, str(root), manifest) is None
+            manifest = _write_manifest(tmp_path, {"target": cfg.model_config.model})
+            updated = get_revolta_identity(cfg, str(root), manifest)
+            assert updated is not None and updated != identity
+    finally:
+        tier.shutdown()
 
 
 @pytest.mark.parametrize("method", ["draft_model", "ngram"])

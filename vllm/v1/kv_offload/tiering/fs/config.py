@@ -5,6 +5,7 @@
 import fcntl
 import json
 import os
+from collections.abc import Callable
 from contextlib import ExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -45,7 +46,10 @@ def fs_tier_configs(config: "KVTransferConfig | None") -> list[dict]:
 
 
 def get_fs_hash_seed(
-    config: "KVTransferConfig | None", *, vllm_config: "VllmConfig | None" = None
+    config: "KVTransferConfig | None",
+    *,
+    vllm_config: "VllmConfig | None" = None,
+    hash_fn: Callable[[Any], bytes] | None = None,
 ) -> str | None:
     """Lock configured roots and persist one seed before hashing requests.
 
@@ -73,8 +77,19 @@ def get_fs_hash_seed(
         enabled.append(tier)
     roots = sorted({os.path.realpath(t["root_dir"]) for t in enabled})
     try:
-        return _locked_fs_hash_seed(roots)
-    except (OSError, ValueError) as exc:
+        seed_hash_fn = None
+        if any(tier["type"] == "revolta_fs" for tier in enabled):
+            from vllm.utils.hashing import get_hash_fn_by_name
+
+            seed_hash_fn = hash_fn or get_hash_fn_by_name(
+                getattr(
+                    getattr(vllm_config, "cache_config", None),
+                    "prefix_caching_hash_algo",
+                    "sha256",
+                )
+            )
+        return _locked_fs_hash_seed(roots, seed_hash_fn)
+    except (OSError, ValueError, TypeError) as exc:
         if not any(tier["type"] == "revolta_fs" for tier in enabled):
             raise
         from vllm.v1.kv_offload.tiering.fs.identity import disable_revolta_root
@@ -91,7 +106,9 @@ def get_fs_hash_seed(
         )
 
 
-def _locked_fs_hash_seed(roots: list[str]) -> str | None:
+def _locked_fs_hash_seed(
+    roots: list[str], hash_fn: Callable[[Any], bytes] | None = None
+) -> str | None:
     if not roots:
         return None
     with ExitStack() as locks:
@@ -126,6 +143,11 @@ def _locked_fs_hash_seed(roots: list[str]) -> str | None:
         seed = next(iter(seeds)) if seeds else os.getenv("PYTHONHASHSEED") or None
         if seed is None:
             seed = os.urandom(32).hex()
+        if hash_fn is not None:
+            # Validate before propagating a seed to other roots, and while
+            # failures can still disable every already-created manager.
+            seed.encode("utf-8")
+            hash_fn(seed)
         for path in missing:
             temporary = path.with_suffix(".json.new")
             fd = os.open(temporary, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)

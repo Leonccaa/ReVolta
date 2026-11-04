@@ -94,6 +94,12 @@ def _model_identity(config) -> dict:
             "max_model_len",
         ),
     )
+    # HF configs can also be dataclasses. Their extra attributes (including
+    # quantization metadata) must survive generic dataclass normalization.
+    for name in ("hf_config", "hf_text_config"):
+        value = result[name]
+        if hasattr(value, "to_dict"):
+            result[name] = value.to_dict()
     overrides = result["hf_overrides"]
     if callable(overrides):
         # SpeculativeConfig installs this built-in transformation itself. Its
@@ -108,6 +114,13 @@ def _model_identity(config) -> dict:
     # multimodal input hashes; what remains is the effective processing
     # configuration, which changes the tokens and embeddings of a prefix.
     mm = getattr(config, "multimodal_config", None)
+    if (
+        getattr(mm, "mm_encoder_attn_dtype", None) == "fp8"
+        and getattr(mm, "mm_encoder_fp8_scale_path", None) is None
+    ):
+        raise ManifestError(
+            "runtime multimodal encoder scale calibration is not supported"
+        )
     result["multimodal_config"] = None if mm is None else _plain(mm)
     return result
 
@@ -194,14 +207,43 @@ def _verify_config_sources(config, manifest: dict) -> None:
                 visit(item, name)
         elif isinstance(value, (str, os.PathLike)) and value:
             path = os.fspath(value)
-            if name.endswith("_json"):
+            # get_quant_config passes this serialized configuration to
+            # TorchAOConfig. Inspect its nested sources as well.
+            if name == "quantization_config_dict_json":
                 visit(json.loads(path))
                 return
             path_field = name.endswith(
-                ("_file", "_files", "_path", "_paths", "_dir", "_name_or_path")
-            )
+                (
+                    "_file",
+                    "_files",
+                    "_path",
+                    "_paths",
+                    "_dir",
+                    "_dirs",
+                    "_name_or_path",
+                    "_source",
+                    "_sources",
+                )
+            ) or name in {
+                "file",
+                "files",
+                "path",
+                "paths",
+                "dir",
+                "source",
+                "sources",
+                "vision_tower",
+                "mm_vision_tower",
+                "audio_tower",
+                "model_id",
+                "processor_name",
+                "tokenizer_name",
+            }
+            # Loader/processor source fields can be relative or remote even
+            # before they exist. A slash alone also occurs in AWQ metadata
+            # (formulae and provenance notes), which remains in the digest.
             if (
-                path_field or "/" in path or "\\" in path or os.path.exists(path)
+                path_field or os.path.isabs(path) or os.path.exists(path)
             ) and os.path.realpath(path) not in files | roots:
                 raise ManifestError(f"{name}: source is outside the content manifest")
 

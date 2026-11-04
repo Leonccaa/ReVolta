@@ -48,6 +48,11 @@ class RejectionSampler:
         self.num_speculative_steps = spec_config.num_speculative_tokens
         self.rejection_sample_method = spec_config.rejection_sample_method
         self.synthetic_conditional_rates: torch.Tensor | None = None
+        # Running counts of rejected positions whose stable FP32 residual was
+        # empty, redrawn from [0] the single-logsumexp residual or [1] the
+        # target distribution. The kernels add to them only when that happens;
+        # they are read with the step output.
+        self.fallback_count = torch.zeros(2, dtype=torch.int64, device=device)
         if self.rejection_sample_method == "synthetic":
             assert spec_config.synthetic_acceptance_rates is not None
             self.synthetic_conditional_rates = torch.tensor(
@@ -133,6 +138,7 @@ class RejectionSampler:
             self.num_speculative_steps,
             self.synthetic_conditional_rates,
             use_fp64=self.sampler.use_fp64_gumbel,
+            fallback_count=self.fallback_count,
         )
         logprobs_tensors = self._get_logprobs_tensors(
             input_batch,

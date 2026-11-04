@@ -279,6 +279,8 @@ class Scheduler(SchedulerInterface):
 
         self.use_eagle = False
         self.num_spec_tokens = vllm_config.num_speculative_tokens
+        # Last running total of rejection fallbacks seen from the workers.
+        self._rejection_fallbacks_total = 0
         self.num_lookahead_tokens = vllm_config.num_lookahead_tokens
         if speculative_config and speculative_config.use_eagle_kv_cache():
             self.use_eagle = True
@@ -2218,6 +2220,9 @@ class Scheduler(SchedulerInterface):
                     )
             finished_req_ids.clear()
 
+        spec_decoding_stats = self._observe_rejection_fallbacks(
+            spec_decoding_stats, model_runner_output.rejection_fallbacks_total
+        )
         if (
             stats := self.make_stats(
                 spec_decoding_stats, kv_connector_stats, cudagraph_stats, perf_stats
@@ -2756,6 +2761,23 @@ class Scheduler(SchedulerInterface):
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
         )
+
+    def _observe_rejection_fallbacks(
+        self,
+        spec_decoding_stats: SpecDecodingStats | None,
+        total: int | None,
+    ) -> SpecDecodingStats | None:
+        # The worker reports a running total; count only the increase.
+        if total is None or total <= self._rejection_fallbacks_total:
+            return spec_decoding_stats
+        delta = total - self._rejection_fallbacks_total
+        self._rejection_fallbacks_total = total
+        if not self.log_stats:
+            return spec_decoding_stats
+        if spec_decoding_stats is None:
+            spec_decoding_stats = SpecDecodingStats.new(self.num_spec_tokens)
+        spec_decoding_stats.num_rejection_fallbacks += delta
+        return spec_decoding_stats
 
     def make_spec_decoding_stats(
         self,

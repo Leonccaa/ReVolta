@@ -28,6 +28,9 @@ class SpecDecodingStats:
     num_draft_tokens: int = 0
     num_accepted_tokens: int = 0
     num_accepted_tokens_per_pos: list[int] = field(default_factory=list)
+    # Rejected positions whose stable FP32 residual max(p - q, 0) was empty
+    # and were redrawn from a fallback tier.
+    num_rejection_fallbacks: int = 0
 
     @classmethod
     def new(cls, num_spec_tokens: int) -> "SpecDecodingStats":
@@ -178,6 +181,18 @@ class SpecDecodingProm:
             counter_accepted_tokens, per_engine_labelvalues
         )
 
+        counter_rejection_fallbacks = self._counter_cls(
+            name="vllm:spec_decode_num_rejection_fallbacks",
+            documentation=(
+                "Rejected draft positions redrawn from a fallback tier "
+                "because the stable FP32 residual was empty."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_spec_decode_num_rejection_fallbacks = create_metric_per_engine(
+            counter_rejection_fallbacks, per_engine_labelvalues
+        )
+
         assert speculative_config is not None
         num_spec_tokens = (
             speculative_config.num_speculative_tokens
@@ -209,6 +224,10 @@ class SpecDecodingProm:
         self.counter_spec_decode_num_accepted_tokens[engine_idx].inc(
             spec_decoding_stats.num_accepted_tokens
         )
+        if spec_decoding_stats.num_rejection_fallbacks:
+            self.counter_spec_decode_num_rejection_fallbacks[engine_idx].inc(
+                spec_decoding_stats.num_rejection_fallbacks
+            )
         for pos, counter in enumerate(
             self.counter_spec_decode_num_accepted_tokens_per_pos[engine_idx]
         ):

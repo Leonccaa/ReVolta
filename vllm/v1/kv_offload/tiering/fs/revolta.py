@@ -273,15 +273,16 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
     Identity: the directory hash binds the page format, the engine's config
     hash and the digest of a content manifest of the loaded checkpoint files
     (see content_manifest.py). The tier fails closed: without a manifest
-    (``require_content_manifest``), with a manifest that does not match the
+    (unless ``enable_unverified_content``), with a manifest that does not match the
     loaded files, or when the namespace's recorded run config differs, it
     disables itself: lookups miss, stores complete without writing, nothing
     on disk is read or changed. Inference and the CPU tier are unaffected.
 
-    Extra tier options:
-        content_manifest: path of the manifest file.
-        require_content_manifest: disable the tier without one (default True).
-        verify_content: "stat" (default) checks size/mtime/inode of every
+    Extra tier options (documented as ``ssd.*`` in docs/kv-offload.md):
+        content_manifest_path: path of the manifest file.
+        enable_unverified_content: run without a manifest, binding pages to
+            paths and config only (default False: the tier is disabled).
+        content_verify: "stat" (default) checks size/mtime/inode of every
             file; "full" also recomputes every content hash at startup.
         mtime_update_interval_s: minimum seconds between mtime updates of a
             page (default 60; 0 = every use).
@@ -303,9 +304,9 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
         primary_kv_view: memoryview,
         tier_type: str,
         root_dir: str,
-        content_manifest: str | None = None,
-        require_content_manifest: bool = True,
-        verify_content: str = "stat",
+        content_manifest_path: str | None = None,
+        enable_unverified_content: bool = False,
+        content_verify: str = "stat",
         mtime_update_interval_s: float = 60.0,
         **kwargs,
     ):
@@ -326,13 +327,13 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
         self._mtime_queue: queue.SimpleQueue[str | None] = queue.SimpleQueue()
         self._mtime_thread: threading.Thread | None = None
         self._disabled_finished: list[int] = []
-        if verify_content not in ("stat", "full"):
-            raise ValueError("verify_content must be 'stat' or 'full'")
+        if content_verify not in ("stat", "full"):
+            raise ValueError("content_verify must be 'stat' or 'full'")
         content_digest = self._content_identity(
             offloading_spec,
-            content_manifest,
-            require_content_manifest,
-            verify_content,
+            content_manifest_path,
+            not enable_unverified_content,
+            content_verify,
         )
         if content_digest is None:
             self._init_disabled(offloading_spec, primary_kv_view, tier_type)
@@ -384,14 +385,14 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
         offloading_spec: "OffloadingSpec",
         manifest_path: str | None,
         required: bool,
-        verify_content: str,
+        content_verify: str,
     ) -> str | None:
         """Digest of the verified content manifest; None disables the tier."""
         if manifest_path is None:
             if required:
                 logger.error(
-                    "revolta_fs disabled: no content_manifest configured "
-                    "(require_content_manifest=true)"
+                    "revolta_fs disabled: no content_manifest_path configured "
+                    "(set enable_unverified_content to run without one)"
                 )
                 return None
             logger.warning(
@@ -403,7 +404,7 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
             manifest = load_manifest(manifest_path)
             roots = expected_content_roots(offloading_spec.vllm_config)
             digest = verify_manifest(manifest, roots)
-            if verify_content == "full":
+            if content_verify == "full":
                 digest = rehash_and_verify(manifest)
         except ManifestError as exc:
             logger.error("revolta_fs disabled: %s", exc)

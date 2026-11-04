@@ -12,7 +12,7 @@ engine will load, for example inside the serving container:
 
 Roles: ``target`` is the --model path and ``draft`` the speculative model
 path; any other role (e.g. KV scale overlays) is verified file by file. Then
-set ``"content_manifest": "<out>"`` in the revolta_fs tier config. If a listed
+set ``"content_manifest_path": "<out>"`` in the revolta_fs tier config. If a listed
 file is rewritten later, the tier disables itself until a new manifest is
 made. Keep the manifest outside the model directories: files inside a role
 root are part of that role.

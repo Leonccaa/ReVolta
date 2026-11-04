@@ -60,7 +60,7 @@ _SPEC = make_spec()
 
 
 def make_tier(root, view, spec=_SPEC, **kwargs):
-    kwargs.setdefault("require_content_manifest", False)
+    kwargs.setdefault("enable_unverified_content", True)
     kwargs.setdefault("max_size_bytes", 64 << 20)
     kwargs.setdefault("n_read_threads", 2)
     kwargs.setdefault("n_write_threads", 2)
@@ -90,7 +90,7 @@ def test_registered_and_shares_fs_seed_rules(tmp_path):
             "max_size_bytes": 64 << 20,
             "n_read_threads": 1,
             "n_write_threads": 1,
-            "require_content_manifest": False,
+            "enable_unverified_content": True,
         },
         view,
         _SPEC,
@@ -243,8 +243,8 @@ def _identity_tier(tmp_path, model, manifest, **kwargs):
         tmp_path / "kv",
         view,
         spec=make_spec(model),
-        content_manifest=manifest,
-        require_content_manifest=True,
+        content_manifest_path=manifest,
+        enable_unverified_content=False,
         **kwargs,
     )
     return tier, tensor
@@ -285,7 +285,7 @@ def test_same_path_weight_swap_disables_tier(tmp_path):
 
 def test_full_verification_catches_restored_mtime(tmp_path):
     """stat checks miss a rewrite that restores size, mtime and inode;
-    verify_content=full recomputes the hashes."""
+    content_verify=full recomputes the hashes."""
     model = _checkpoint(tmp_path)
     manifest = _write_manifest(tmp_path, {"target": str(model)})
     shard = model / "model-00001.safetensors"
@@ -296,7 +296,7 @@ def test_full_verification_catches_restored_mtime(tmp_path):
     tier, _ = _identity_tier(tmp_path, model, manifest)
     assert not tier.disabled
     tier.shutdown()
-    tier, _ = _identity_tier(tmp_path, model, manifest, verify_content="full")
+    tier, _ = _identity_tier(tmp_path, model, manifest, content_verify="full")
     assert tier.disabled
     tier.shutdown()
 

@@ -2734,7 +2734,7 @@ class Scheduler(SchedulerInterface):
         kv_connector_stats: KVConnectorStats | None = (
             kv_connector_output.kv_connector_stats if kv_connector_output else None
         )
-        if self.connector:
+        if self.log_stats and self.connector:
             kv_stats = self.connector.get_kv_connector_stats()
             if kv_stats:
                 kv_connector_stats = (

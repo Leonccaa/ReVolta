@@ -33,8 +33,8 @@ class _Connector:
         return self.stats
 
 
-def _collect(connector, output):
-    fake = SimpleNamespace(connector=connector)
+def _collect(connector, output, log_stats=True):
+    fake = SimpleNamespace(connector=connector, log_stats=log_stats)
     return Scheduler._collect_kv_connector_stats(fake, output)
 
 
@@ -58,3 +58,12 @@ def test_no_scheduler_stats_keeps_worker_stats():
     assert _collect(_Connector(_Stats({})), output) is worker
     assert _collect(None, output) is worker
     assert _collect(_Connector(None), None) is None
+
+
+def test_logging_disabled_does_not_poll_scheduler_connector():
+    connector = _Connector(_Stats({"evictions": 3}))
+    worker = _Stats({"bytes": 7})
+    assert _collect(connector, None, log_stats=False) is None
+    output = KVConnectorOutput(kv_connector_stats=worker)
+    assert _collect(connector, output, log_stats=False) is worker
+    assert connector.calls == 0

@@ -476,7 +476,7 @@ def test_chain_stops_at_first_failed_page_per_group(tmp_path, monkeypatch):
 
     def flaky(path, *args, **kwargs):
         if path == bad:
-            raise OSError(5, "injected EIO")
+            raise OSError(28, "injected ENOSPC")
         return real(path, *args, **kwargs)
 
     monkeypatch.setattr(revolta, "store_verified_block", flaky)
@@ -490,3 +490,158 @@ def test_chain_stops_at_first_failed_page_per_group(tmp_path, monkeypatch):
         assert tier.get_revolta_stats()["skipped_after_chain_failure"] == 1
     finally:
         tier.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# I/O robustness: deadlines, retries, backpressure, shutdown drain
+# ---------------------------------------------------------------------------
+
+import errno  # noqa: E402
+import threading  # noqa: E402
+
+from vllm.v1.kv_offload.tiering.fs import revolta as revolta_mod  # noqa: E402
+
+
+def test_hung_write_after_snapshot_expires_once(tmp_path, monkeypatch):
+    release = threading.Event()
+    real_fsync_dir = revolta_mod._fsync_dir
+
+    def hang(path):
+        release.wait(5)
+        real_fsync_dir(path)
+
+    monkeypatch.setattr(revolta_mod, "_fsync_dir", hang)
+    tensor, view = _view()
+    tier = make_tier(tmp_path, view, store_timeout_s=0.1, n_write_threads=1)
+    try:
+        tensor[0].fill_(1.0)
+        tier.submit_store(make_job(1, [key(1)], [0]))
+        time.sleep(0.3)
+        assert [(r.job_id, r.success) for r in drain(tier)] == [(1, False)]
+        release.set()
+        assert drain(tier) == []  # the late completion is not reported again
+        assert tier._pool.num_timed_out == 1
+        # The late write completed a page whose checksum was taken before
+        # the deadline: it is still a valid page of key 1.
+        assert _load(tier, key(1), job_id=2) == [True]
+    finally:
+        release.set()
+        tier.shutdown()
+
+
+def test_job_does_not_expire_while_taking_its_snapshot(tmp_path, monkeypatch):
+    real_crc = revolta_mod.crc32c
+
+    def slow_crc(view, crc=0):
+        if len(view) > 4096:  # the page payload, not the key tag
+            time.sleep(0.3)
+        return real_crc(view, crc)
+
+    tensor, view = _view()
+    tier = make_tier(tmp_path, view, store_timeout_s=0.05, n_write_threads=1)
+    monkeypatch.setattr(revolta_mod, "crc32c", slow_crc)
+    try:
+        tensor[0].fill_(1.0)
+        tier.submit_store(make_job(1, [key(1)], [0]))
+        time.sleep(0.5)
+        assert [r.success for r in drain(tier, max_rounds=100)] == [True]
+    finally:
+        tier.shutdown()
+
+
+def test_queued_tasks_of_expired_job_never_run(tmp_path, monkeypatch):
+    release = threading.Event()
+    real_fsync_dir = revolta_mod._fsync_dir
+
+    def hang(path):
+        release.wait(5)
+        real_fsync_dir(path)
+
+    monkeypatch.setattr(revolta_mod, "_fsync_dir", hang)
+    tensor, view = _view()
+    tier = make_tier(
+        tmp_path, view, store_timeout_s=0.1, n_write_threads=1, n_read_threads=0
+    )
+    try:
+        tensor[:2].fill_(1.0)
+        tier.submit_store(make_job(1, [key(1)], [0]))
+        tier.submit_store(make_job(2, [key(2)], [1]))  # queued behind job 1
+        time.sleep(0.3)
+        results = drain(tier)
+        assert sorted((r.job_id, r.success) for r in results) == [
+            (1, False),
+            (2, False),
+        ]
+        release.set()
+        time.sleep(0.2)
+        assert not os.path.exists(tier.file_mapper.get_file_name(key(2)))
+    finally:
+        release.set()
+        tier.shutdown()
+
+
+def test_transient_errors_are_retried(tmp_path, monkeypatch):
+    real = revolta_mod.store_verified_block
+    calls = {"n": 0}
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError(errno.EAGAIN, "try again")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(revolta_mod, "store_verified_block", flaky)
+    tensor, view = _view()
+    tier = make_tier(tmp_path, view)
+    try:
+        _store(tier, tensor, key(1))
+        assert tier.get_revolta_stats()["io_retries"] == 1
+    finally:
+        tier.shutdown()
+
+
+def test_backpressure_skips_store_jobs(tmp_path, monkeypatch):
+    release = threading.Event()
+    real_fsync_dir = revolta_mod._fsync_dir
+
+    def hang(path):
+        release.wait(5)
+        real_fsync_dir(path)
+
+    monkeypatch.setattr(revolta_mod, "_fsync_dir", hang)
+    tensor, view = _view()
+    tier = make_tier(tmp_path, view, max_inflight_store_blocks=1, store_timeout_s=None)
+    try:
+        tensor[:2].fill_(1.0)
+        tier.submit_store(make_job(1, [key(1)], [0]))
+        tier.submit_store(make_job(2, [key(2)], [1]))
+        first = list(tier.get_finished_jobs())
+        assert [(r.job_id, r.success) for r in first] == [(2, True)]
+        stats = tier.get_revolta_stats()
+        assert stats["store_jobs_skipped_backpressure"] == 1
+        release.set()
+        assert [(r.job_id, r.success) for r in drain(tier)] == [(1, True)]
+        assert tier._inflight_stores == 0
+        assert tier.lookup(key(2)) is False
+    finally:
+        release.set()
+        tier.shutdown()
+
+
+def test_shutdown_drains_queued_stores(tmp_path, monkeypatch):
+    real = revolta_mod.store_verified_block
+
+    def slow(*args, **kwargs):
+        time.sleep(0.05)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(revolta_mod, "store_verified_block", slow)
+    tensor, view = _view()
+    tier = make_tier(
+        tmp_path, view, n_write_threads=1, n_read_threads=0, drain_timeout_s=5
+    )
+    keys = [key(i) for i in range(1, 5)]
+    tensor[:4].fill_(1.0)
+    tier.submit_store(make_job(1, keys, [0, 1, 2, 3]))
+    tier.shutdown()
+    assert all(os.path.exists(tier.file_mapper.get_file_name(k)) for k in keys)

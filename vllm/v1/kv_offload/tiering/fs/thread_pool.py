@@ -9,6 +9,7 @@ Thread pool:
 """
 
 import threading
+import time
 from collections import deque
 from collections.abc import Callable, Iterable
 
@@ -25,26 +26,92 @@ class JobState:
     Each task calls task_done(success) when it finishes.
     """
 
-    __slots__ = ("_job_id", "_n_tasks", "_completed", "_success", "_lock")
+    __slots__ = (
+        "_job_id",
+        "_n_tasks",
+        "_completed",
+        "_success",
+        "_lock",
+        "deadline",
+        "_published",
+        "_unsafe",
+    )
 
-    def __init__(self, job_id: JobId, n_tasks: int) -> None:
+    def __init__(
+        self, job_id: JobId, n_tasks: int, deadline: float | None = None
+    ) -> None:
         self._job_id: JobId = job_id
         self._n_tasks = n_tasks
         self._completed = 0
         self._success = True
         self._lock = threading.Lock()
+        # Monotonic time after which the job is reported failed (None: never).
+        self.deadline = deadline
+        # The job's result was published (by its last task or by the deadline).
+        self._published = False
+        # Tasks inside a section that must finish before the job may expire
+        # (see begin_unsafe).
+        self._unsafe = 0
 
     @property
     def job_id(self) -> JobId:
         return self._job_id
 
     def task_done(self, success: bool) -> tuple[bool, bool]:
-        """Returns if job completed and success flag"""
+        """Returns (publish now, success). The first publisher wins: a job
+        already reported failed at its deadline is not reported again when
+        its last, late task finishes."""
         with self._lock:
             self._completed += 1
             if not success:
                 self._success = False
-            return self._completed == self._n_tasks, self._success
+            if self._completed == self._n_tasks and not self._published:
+                self._published = True
+                return True, self._success
+            return False, self._success
+
+    def expire(self, now: float) -> bool:
+        """Mark the job failed if its deadline passed, it is unpublished and no
+        task is inside an unsafe section; return whether the caller must
+        publish the failure. Publishing releases the job's source buffers."""
+        with self._lock:
+            if (
+                self._published
+                or self.deadline is None
+                or now < self.deadline
+                or self._unsafe
+            ):
+                return False
+            self._published = True
+            self._success = False
+            return True
+
+    @property
+    def expired(self) -> bool:
+        with self._lock:
+            return self._published
+
+    def begin_unsafe(self) -> bool:
+        """Enter a section during which the job must not expire (e.g. while a
+        task snapshots its source buffer). Returns False if the job already
+        expired: its buffers may be reused, so the task must not touch them."""
+        with self._lock:
+            if self._published:
+                return False
+            self._unsafe += 1
+            return True
+
+    def end_unsafe(self) -> None:
+        with self._lock:
+            self._unsafe -= 1
+
+
+_current = threading.local()
+
+
+def current_job() -> "JobState | None":
+    """The JobState of the task running on this pool thread, if any."""
+    return getattr(_current, "state", None)
 
 
 class DualQueueThreadPool:
@@ -61,7 +128,25 @@ class DualQueueThreadPool:
         n_read_threads: int,
         n_write_threads: int,
         thread_name_prefix: str = "fs_secondary_tier",
+        store_timeout_s: float | None = None,
+        drain_timeout_s: float = 0.0,
     ) -> None:
+        """
+        Args:
+            store_timeout_s: report a store job failed this many seconds after
+                it was enqueued if it has not finished (None: never). Its
+                threads may still be writing; only use it when a late write
+                cannot be mistaken for a complete page (e.g. pages carry a
+                checksum computed before the write).
+            drain_timeout_s: at shutdown, keep running queued store tasks for
+                up to this many seconds before dropping the rest (0: drop
+                queued tasks immediately, the historical behaviour).
+        """
+        self._store_timeout_s = store_timeout_s
+        self._drain_timeout_s = drain_timeout_s
+        self._timed: dict[JobId, JobState] = {}
+        self.num_timed_out = 0
+        self._timed_lock = threading.Lock()
         self._load_q: deque = deque()
         self._store_q: deque = deque()
         self._condition = threading.Condition(threading.Lock())
@@ -109,24 +194,64 @@ class DualQueueThreadPool:
         tasks: Iterable[Callable],
     ) -> None:
         """Enqueue store tasks for a job (high-priority for store-priority threads)."""
-        state = JobState(job_id, n_tasks)
+        deadline = (
+            None
+            if self._store_timeout_s is None
+            else time.monotonic() + self._store_timeout_s
+        )
+        state = JobState(job_id, n_tasks, deadline)
+        if deadline is not None:
+            with self._timed_lock:
+                self._timed[job_id] = state
         with self._condition:
             for fn in tasks:
                 self._store_q.append((fn, state))
             self._condition.notify(n_tasks)
 
     def get_finished(self) -> list[tuple[JobId, bool]]:
+        if self._timed:
+            self._expire_overdue()
         jobs = []
         while self._finished_q:
             jobs.append(self._finished_q.popleft())
         return jobs
 
+    def _expire_overdue(self) -> None:
+        now = time.monotonic()
+        with self._timed_lock:
+            overdue = [
+                (job_id, state)
+                for job_id, state in self._timed.items()
+                if state.deadline is not None and now >= state.deadline
+            ]
+            for job_id, _ in overdue:
+                del self._timed[job_id]
+        for job_id, state in overdue:
+            if state.expire(now):
+                logger.warning("Store job %s exceeded its I/O deadline", job_id)
+                self.num_timed_out += 1
+                self._finished_q.append((job_id, False))
+
     def shutdown(self, wait: bool = True) -> None:
+        if self._drain_timeout_s > 0:
+            # Let queued stores run for a bounded time; loads are dropped
+            # (nothing will consume their results).
+            deadline = time.monotonic() + self._drain_timeout_s
+            with self._condition:
+                self._load_q.clear()
+            while time.monotonic() < deadline:
+                with self._condition:
+                    if not self._store_q:
+                        break
+                time.sleep(0.01)
         with self._condition:
             self._stop = True
+            dropped = len(self._store_q)
             self._load_q.clear()
             self._store_q.clear()
             self._condition.notify_all()
+        if dropped and self._drain_timeout_s > 0:
+            logger.warning("Dropped %d queued store tasks at shutdown", dropped)
         if wait:
             for t in self._threads:
                 t.join()
@@ -143,6 +268,11 @@ class DualQueueThreadPool:
                 primary = self._load_q if load_priority else self._store_q
                 secondary = self._store_q if load_priority else self._load_q
                 task, state = primary.popleft() if primary else secondary.popleft()
+            if state.deadline is not None and state.expired:
+                # Reported failed at its deadline: its buffers may be reused.
+                state.task_done(False)
+                continue
+            _current.state = state
             try:
                 task()
                 job_finished, success = state.task_done(True)
@@ -153,6 +283,11 @@ class DualQueueThreadPool:
                     exc,
                 )
                 job_finished, success = state.task_done(False)
+            finally:
+                _current.state = None
 
             if job_finished:
+                if state.deadline is not None:
+                    with self._timed_lock:
+                        self._timed.pop(state.job_id, None)
                 self._finished_q.append((state.job_id, success))

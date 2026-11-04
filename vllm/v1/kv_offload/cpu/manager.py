@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import Counter, OrderedDict
-from collections.abc import Collection, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
 from typing import Literal
 
 from vllm.v1.kv_offload.base import (
@@ -26,11 +26,11 @@ _CACHE_POLICIES: dict[str, type[CachePolicy]] = {
 }
 
 # Why a stored CPU-tier block left the cache (observability only).
-# "capacity" and "superseded" are policy evictions under space pressure and
-# together equal ``num_evicted_blocks`` and the keys of the removal events;
+# "capacity" and "superseded" are policy evictions under space pressure;
+# together with "dependency" they equal ``num_evicted_blocks`` and removal events.
 # "superseded" marks blocks the scheduler had demoted as superseded states.
 # "reset" counts blocks dropped by ``reset_cache`` (no removal event).
-EVICTION_REASONS: tuple[str, ...] = ("capacity", "superseded", "reset")
+EVICTION_REASONS: tuple[str, ...] = ("capacity", "superseded", "reset", "dependency")
 
 
 class CPUOffloadingManager(OffloadingManager):
@@ -77,6 +77,8 @@ class CPUOffloadingManager(OffloadingManager):
             type(self._policy).demote is not CachePolicy.demote
         )
         self._demoted: set[OffloadKey] = set()
+        # Optional resident-only dependency bookkeeping, installed by scheduler.
+        self.cache_observer: Callable[[OffloadKey, bool], None] | None = None
 
         # Number of block references. It is ordered so can evict the LRU entry in O(1).
         self.counts: OrderedDict[OffloadKey, int] | None = (
@@ -200,6 +202,9 @@ class CPUOffloadingManager(OffloadingManager):
                 to_evict.append(key)
             self.num_evicted_blocks += len(evicted)
             self._record_evictions(to_evict)
+            if self.cache_observer is not None:
+                for key in to_evict:
+                    self.cache_observer(key, False)
 
         if to_evict and self.events is not None:
             self.events.append(
@@ -217,6 +222,8 @@ class CPUOffloadingManager(OffloadingManager):
 
         for key, block in zip(keys_to_store, blocks):
             self._policy.insert(key, block)
+            if self.cache_observer is not None:
+                self.cache_observer(key, True)
         self.num_stored_blocks += len(keys_to_store)
 
         # build store specs for allocated blocks
@@ -249,6 +256,8 @@ class CPUOffloadingManager(OffloadingManager):
                     self._policy.remove(key)
                     self._free_block(block)
                     self._demoted.discard(key)
+                    if self.cache_observer is not None:
+                        self.cache_observer(key, False)
 
         if stored_keys and self.events is not None:
             self.events.append(
@@ -269,10 +278,45 @@ class CPUOffloadingManager(OffloadingManager):
         if num_cached:
             self.evicted_blocks_by_reason["reset"] += num_cached
         self._demoted.clear()
+        if self.cache_observer is not None:
+            # The observer owns no nonresident entries; notify before clear.
+            for key in self.resident_keys():
+                self.cache_observer(key, False)
         self._policy.clear()
 
         self._free_list.clear()
         self._num_allocated_blocks = 0
+
+    def resident_keys(self) -> list[OffloadKey]:
+        """Snapshot without touching recency or lookup/admission counters."""
+        if isinstance(self._policy, LRUCachePolicy):
+            return list(self._policy.blocks)
+        assert isinstance(self._policy, ARCCachePolicy)
+        return list(self._policy.t1) + list(self._policy.t2)
+
+    def remove_dependency_blocks(
+        self, keys: Collection[OffloadKey]
+    ) -> list[OffloadKey]:
+        """Remove proven dead blocks, retaining all pinned or unfinished slots."""
+        removed = []
+        for key in keys:
+            block = self._policy.get(key)
+            if block is None or block.ref_cnt != 0:
+                continue
+            self._policy.remove(key)
+            self._free_block(block)
+            self._demoted.discard(key)
+            if self.cache_observer is not None:
+                self.cache_observer(key, False)
+            removed.append(key)
+        if removed:
+            self.num_evicted_blocks += len(removed)
+            self.evicted_blocks_by_reason["dependency"] += len(removed)
+            if self.events is not None:
+                self.events.append(
+                    OffloadingEvent(keys=removed, medium=self.medium, removed=True)
+                )
+        return removed
 
     def take_events(self) -> Iterable[OffloadingEvent]:
         if self.events is not None:

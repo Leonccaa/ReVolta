@@ -22,6 +22,7 @@ CPU_EVICTIONS_KEY = "cpu_evicted_blocks"
 # the scheduler did not offload (kv_connector_extra_config "cpu.draft_offload"):
 # a list of block counts.
 CPU_DRAFT_SKIPPED_KEY = "cpu_draft_blocks_skipped"
+CPU_RESIDENT_KEY = "cpu_resident_blocks"
 
 
 @dataclass
@@ -45,7 +46,7 @@ class OffloadingConnectorStats(KVConnectorStats):
     def aggregate(self, other: KVConnectorStats) -> KVConnectorStats:
         if not other.is_empty():
             for k, v in other.data.items():
-                if k not in self.data:
+                if k == CPU_RESIDENT_KEY or k not in self.data:
                     self.data[k] = v
                 else:
                     accumulator = self.data[k]
@@ -71,6 +72,12 @@ class OffloadingConnectorStats(KVConnectorStats):
             if transfer_type == CPU_DRAFT_SKIPPED_KEY:
                 return_dict[CPU_DRAFT_SKIPPED_KEY] = sum(ops_list)
                 continue
+            if transfer_type == CPU_RESIDENT_KEY:
+                for entry in ops_list[-1:]:
+                    for row in entry:
+                        key = f"{CPU_RESIDENT_KEY}_{row['kind']}_{row['status']}"
+                        return_dict[key] = row["blocks"]
+                continue
             total_bytes = 0
             total_time = 0.0
             for op in ops_list:
@@ -91,6 +98,14 @@ class OffloadingConnectorStats(KVConnectorStats):
 
     def record_skipped_draft_blocks(self, blocks: int) -> None:
         self.data.setdefault(CPU_DRAFT_SKIPPED_KEY, []).append(blocks)
+
+    def record_residency(self, totals: dict[tuple[str, str], int]) -> None:
+        self.data[CPU_RESIDENT_KEY] = [
+            [
+                {"kind": kind, "status": status, "blocks": blocks}
+                for (kind, status), blocks in totals.items()
+            ]
+        ]
 
     def record_transfer(self, num_bytes: int, time: float, transfer_type: TransferType):
         src, dst = transfer_type
@@ -152,6 +167,8 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
         )
 
         self.counter_cpu_draft_blocks_skipped: dict[int, PromMetricT] = {}
+        # Register lazily: disabled configurations expose exactly the old metrics.
+        self._gauge_cpu_resident_blocks: PromMetricT | None = None
         self._counter_cpu_draft_blocks_skipped = self._counter_cls(
             name="vllm:kv_offload_cpu_draft_blocks_skipped",
             documentation=(
@@ -182,6 +199,24 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
                 continue
             if transfer_type == CPU_DRAFT_SKIPPED_KEY:
                 self._observe_draft_skipped(ops, engine_idx)
+                continue
+            if transfer_type == CPU_RESIDENT_KEY:
+                if self._gauge_cpu_resident_blocks is None:
+                    self._gauge_cpu_resident_blocks = self._gauge_cls(
+                        name="vllm:kv_offload_cpu_resident_blocks",
+                        documentation=(
+                            "Resident CPU blocks by kind and conservative usability."
+                        ),
+                        labelnames=self._labelnames + ["kind", "status"],
+                    )
+                for snapshot in ops[-1:]:
+                    for row in snapshot:
+                        self._gauge_cpu_resident_blocks.labels(
+                            *(
+                                self.per_engine_labelvalues[engine_idx]
+                                + [row["kind"], row["status"]]
+                            )
+                        ).set(row["blocks"])
                 continue
             # Cache:
             if (engine_idx, transfer_type) not in self.histogram_transfer_size:

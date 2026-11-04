@@ -55,6 +55,64 @@ States at a shared-prefix junction are never demoted. Under `request_fixed` and 
 - `none`: store no draft blocks. The drafter cannot compute its cache again (it is projected from target hidden states), and a hit needs the draft window before the hit point, so a fresh CPU tier with a draft group cannot serve prefix hits. This setting controls writes; old draft keys already present in a backend can still serve hits. Use it only to measure the cost of the draft blocks.
 - Counters: `vllm:kv_offload_cpu_draft_blocks_skipped_total` counts settled draft block skips because of this setting, and the `Offload counters` log line reports the same total as `cpu_draft_blocks_skipped`. For non-null scanned blocks, reconcile **accepted offers + settled skipped + still deferred = scanned**. Blocks not yet needed stay deferred until offered, freed, preempted or finished. A rejected store or retry keeps the same deferred obligation. After a CPU cache reset, previously offered or loaded blocks still held by the request can start new scan obligations and be offered again; existing deferred blocks retain their obligation, and previously settled skips are not counted again. A new admission after preemption starts a new scan. Offers include keys already resident or filtered by the store threshold, so they are not counts of new writes. The skipped counter measures neither saved resident slots nor bytes, and cannot generally be added to the all-group `cpu_stored_blocks` counter. With `all` its internal value stays at 0; the Prometheus series may be absent until a positive increment creates its labels.
 
+`cpu.enable_dependency_eviction` removes provably unusable CPU blocks after a
+capacity eviction. `cpu.residency_stats` enables residency statistics independently.
+Both are experimental deployment settings in `kv_connector_extra_config`.
+
+- Type: boolean for both keys. Default: `false`. Non-boolean values are rejected
+  at startup. With both keys absent or false, no dependency index or residency
+  scan runs, and store selection, lookups and eviction order are unchanged.
+- Scope: dependency removal supports CPU-only LRU tiers, including unified
+  shared-row pools and independent grouped pools. It requires full-attention and
+  Mamba `align` groups on the same offloaded page size, with any recognised draft
+  sliding-window block size dividing that size. All recurrent groups participate
+  in a checkpoint. EAGLE/MTP is treated conservatively; target sliding-window
+  groups and other geometries retain their existing behaviour. With **any
+  secondary tier**, including a filesystem tier, dependency removal is disabled:
+  a missing CPU page may still be reachable through that tier. Residency is then
+  reported as `unknown`. ARC and unsupported geometries also report `unknown`.
+- Removal is a closure over resident dependencies: a state needs every recurrent
+  group, the final target page in every full-attention group, and a mandatory
+  suffix of each draft window. Target pages with no reachable resident state and
+  draft pages outside every potentially usable state's window can then be freed.
+  Admission is unchanged; the remaining pages keep their relative LRU order.
+  Freed slots return to their original pool, so grouped pools cannot exchange
+  capacity. `cpu.draft_offload=all|window|none` still controls writes only.
+- Safety limits: CPU absence alone cannot prove an earlier prefix is broken,
+  because lookup can start after a GPU prefix hit, including a partial prefix
+  entry. Missing window heads may similarly be supplied by a GPU prefix. These
+  cases are retained. Transfer pins, active requests' known hashes (including
+  prefix hits and possible later state stores), and known junction dependencies
+  are retained. Demotion under `superseded_state_rule=extend` is never evidence
+  of unusability. Unknown annotations retain all rows. The index owns one record
+  per resident CPU block, with bounded parent/group/window references, and drops
+  it on every removal, failed store and reset. This does not promise idealised
+  dependency collection, a particular capacity gain, or GPU performance.
+- Metric: `vllm:kv_offload_cpu_resident_blocks{kind,status}` is a gauge, enabled
+  by either setting, sampled by the scheduler at most once every 60 seconds.
+  `kind` is `target`, `draft` or `state`. Statuses are `potentially_servable`
+  (a conservative upper bound, including GPU-assisted hits), `chain_broken`
+  (a state's mandatory final target page is missing), `missing_dependency`
+  (a required recurrent peer or mandatory draft suffix is missing), `no_state`
+  (target page participates in no possible resident state hit), `outside_window`
+  (draft page lies in no potentially usable state's window), and `unknown`
+  (protected, incomplete metadata, secondary tiers or unsupported geometry).
+  There is no `demoted_unservable` classification: a demoted state can still hit.
+  The full state of the GPU prefix cache is not available to this index, so
+  `potentially_servable` is not an exact count of cold CPU hits. Protected rows
+  are counted as `unknown` even when their current dependencies are incomplete.
+- Reconciliation: the gauge's sum over all labels equals occupied CPU slots
+  **at sampling time**, including in-flight stores and loads. It counts blocks,
+  not bytes, and must not be summed over time. All zero-valued labels are sent
+  on later samples, including after reset. The existing `Offload counters` line
+  adds `cpu_resident_blocks` and `cpu_residency` only when enabled. Additional
+  removals use `vllm:kv_offload_cpu_evicted_blocks_total{reason="dependency"}`;
+  `capacity + superseded + dependency = cpu_evicted_blocks` in the log, excluding
+  `reset`. Dependency removal events carry exactly the freed keys. Resets and
+  failed reservations are separate from successful writes, so stored minus
+  evicted alone need not equal residency. Draft skips count write selection,
+  not dependency removals or saved resident bytes.
+
 **3. CPU + disk.** Add a filesystem tier, typically on a local SSD:
 
 ```json

@@ -4,7 +4,7 @@ import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from itertools import islice
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import regex as re
 
@@ -34,6 +34,7 @@ from vllm.v1.kv_offload.base import (
     OffloadingSpec,
     OffloadKey,
     OffloadPolicy,
+    PrepareStoreOutput,
     ReqContext,
     RequestOffloadingContext,
     get_offload_block_hash,
@@ -43,6 +44,9 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from vllm.v1.kv_offload.cpu.dependency import CPUBlockDependencyIndex
 
 
 @dataclass(slots=True)
@@ -170,6 +174,8 @@ class SchedulerOffloadConfig(NamedTuple):
     superseded_state_rule: str = "request"
     # See OffloadingSpec.cpu_draft_offload.
     cpu_draft_offload: str = "all"
+    cpu_enable_dependency_eviction: bool = False
+    cpu_residency_stats: bool = False
 
     @classmethod
     def from_spec(cls, spec: OffloadingSpec) -> "SchedulerOffloadConfig":
@@ -291,6 +297,10 @@ class SchedulerOffloadConfig(NamedTuple):
             demote_superseded_states=getattr(spec, "demote_superseded_states", True),
             superseded_state_rule=getattr(spec, "superseded_state_rule", "request"),
             cpu_draft_offload=getattr(spec, "cpu_draft_offload", "all"),
+            cpu_enable_dependency_eviction=getattr(
+                spec, "cpu_enable_dependency_eviction", False
+            ),
+            cpu_residency_stats=getattr(spec, "cpu_residency_stats", False),
         )
 
 
@@ -488,6 +498,12 @@ class OffloadingConnectorScheduler:
         self.num_rejected_boundary_offers = 0
         self.num_skipped_draft_blocks = 0
         self._reported_skipped_draft_blocks = 0
+        self._dependency_index: CPUBlockDependencyIndex | None = None
+        if (
+            self.config.cpu_enable_dependency_eviction
+            or self.config.cpu_residency_stats
+        ):
+            self._init_dependency_index()
 
         draft_groups = [
             group.group_idx
@@ -508,6 +524,141 @@ class OffloadingConnectorScheduler:
                     "recognised as a speculative draft sliding-window group",
                     self.config.cpu_draft_offload,
                 )
+
+    def _init_dependency_index(self) -> None:
+        from vllm.v1.kv_offload.cpu.dependency import (
+            CPUBlockDependencyIndex,
+            DependencyGroup,
+        )
+        from vllm.v1.kv_offload.cpu.manager import (
+            CPUOffloadingManager,
+            GroupedCPUOffloadingManager,
+        )
+        from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
+        from vllm.v1.kv_offload.tiering.manager import TieringOffloadingManager
+
+        pools = []
+        supported = True
+        stack = [self.manager]
+        while stack:
+            manager = stack.pop()
+            if isinstance(manager, GroupedCPUOffloadingManager):
+                stack.extend(manager.managers.values())
+            elif isinstance(manager, TieringOffloadingManager):
+                supported &= not bool(manager.secondary_tiers)
+                stack.append(manager.primary_tier)
+            elif isinstance(manager, CPUOffloadingManager):
+                pools.append(manager)
+                supported &= isinstance(manager._policy, LRUCachePolicy)
+            else:
+                supported = False
+        groups = []
+        sizes = set()
+        for g in self.config.kv_group_configs:
+            kind = (
+                "draft"
+                if g.draft_window_tokens is not None
+                else "state"
+                if g.requires_exact_boundary_source
+                else "target"
+            )
+            groups.append(
+                DependencyGroup(
+                    g.group_idx,
+                    g.offloaded_block_size,
+                    kind,
+                    g.sliding_window_size_in_blocks,
+                )
+            )
+            if kind != "draft":
+                sizes.add(g.offloaded_block_size)
+                supported &= g.sliding_window_size_in_blocks is None or (
+                    kind == "state" and g.sliding_window_size_in_blocks == 1
+                )
+        supported &= len(sizes) == 1
+        if sizes:
+            size = next(iter(sizes))
+            supported &= all(
+                size % g.block_size == 0 for g in groups if g.kind == "draft"
+            )
+        self._dependency_index = CPUBlockDependencyIndex(
+            groups,
+            pools,
+            supported,
+            eagle_lookahead=self._eagle_state_shift is not None,
+        )
+        if not self._dependency_index.supported:
+            logger.warning(
+                "CPU dependency removal disabled for this tier/group geometry; "
+                "residency is classified as unknown"
+            )
+        self._residency_sampled_at: float | None = None
+        self._residency_totals: dict[tuple[str, str], int] = {}
+        self._residency_pending = False
+
+    def _dependency_protected_keys(self) -> set[OffloadKey]:
+        # Include waiting/preempted requests and finished requests with jobs.
+        # A running request can still hand off a later checkpoint or window.
+        keys: set[OffloadKey] = set()
+        for status in self._req_status.values():
+            status.update_offload_keys()
+            if any(
+                len(status.group_states[g.group_idx].offload_keys)
+                < status.req.num_tokens // g.offloaded_block_size
+                for g in self.config.kv_group_configs
+            ):
+                index = self._dependency_index
+                assert index is not None
+                return set(index.records)  # An active prefix has unknown hashes.
+            for group in status.group_states:
+                keys.update(group.offload_keys)
+        return keys
+
+    def _prepare_store(
+        self, keys: list[OffloadKey], status: RequestOffloadState
+    ) -> PrepareStoreOutput | None:
+        index = getattr(self, "_dependency_index", None)
+        before = (
+            sum(m.num_evicted_blocks for m in index.managers)
+            if index is not None and self.config.cpu_enable_dependency_eviction
+            else 0
+        )
+        output = self.manager.prepare_store(keys, status.req_context)
+        if index is not None:
+            # Even a rejected grouped reservation can already have evicted
+            # earlier groups. The observer has cleaned those records.
+            index.annotate(
+                keys,
+                [g.offload_keys for g in status.group_states],
+                status.req.shared_prefix_boundary,
+            )
+            if (
+                self.config.cpu_enable_dependency_eviction
+                and sum(m.num_evicted_blocks for m in index.managers) > before
+            ):
+                removed = index.evict(self._dependency_protected_keys())
+                if output is not None:
+                    # The manager's capacity event may own the original list.
+                    output.evicted_keys = output.evicted_keys + removed
+        return output
+
+    def cpu_residency_snapshot(
+        self, consume: bool = True
+    ) -> dict[tuple[str, str], int] | None:
+        """New C7 snapshot at most once per minute; no work when disabled."""
+        index = getattr(self, "_dependency_index", None)
+        if index is None:
+            return None
+        now = time.monotonic()
+        if self._residency_sampled_at is None or now - self._residency_sampled_at >= 60:
+            self._residency_sampled_at = now
+            self._residency_totals = index.totals(self._dependency_protected_keys())
+            self._residency_pending = True
+        if consume:
+            if not self._residency_pending:
+                return None
+            self._residency_pending = False
+        return self._residency_totals.copy()
 
     def _generate_job_id(self) -> int:
         job_id = self._job_counter
@@ -1100,9 +1251,7 @@ class OffloadingConnectorScheduler:
                 req_status.advance_stored_idx(num_offloadable_tokens)
                 continue
 
-            store_output = self.manager.prepare_store(
-                new_offload_keys, req_status.req_context
-            )
+            store_output = self._prepare_store(new_offload_keys, req_status)
             if store_output is None:
                 logger.warning("Request %s: cannot store blocks", req_id)
                 continue
@@ -1475,9 +1624,7 @@ class OffloadingConnectorScheduler:
                 if offload_block_idx >= len(group_state.offload_keys):
                     continue
                 offload_key = group_state.offload_keys[offload_block_idx]
-                store_output = self.manager.prepare_store(
-                    [offload_key], req_status.req_context
-                )
+                store_output = self._prepare_store([offload_key], req_status)
                 if store_output is None:
                     rejected.append(boundary_tokens)
                     continue
@@ -1586,10 +1733,16 @@ class OffloadingConnectorScheduler:
             return
         self._counters_logged_at = now
         stored, evicted = self._cpu_tier_counters()
+        residency_suffix = ""
+        if getattr(self, "_dependency_index", None) is not None:
+            self.cpu_residency_snapshot(consume=False)
+            totals = self._residency_totals
+            residency_suffix = " cpu_resident_blocks=" + str(sum(totals.values()))
+            residency_suffix += " cpu_residency=" + str(totals)
         logger.info(
             "Offload counters: demoted_states=%d cpu_stored_blocks=%d "
             "cpu_evicted_blocks=%d rejected_boundary_offers=%d rule=%s "
-            "cpu_draft_blocks_skipped=%d cpu.draft_offload=%s",
+            "cpu_draft_blocks_skipped=%d cpu.draft_offload=%s%s",
             getattr(self, "num_demoted_states", 0),
             stored,
             evicted,
@@ -1599,6 +1752,7 @@ class OffloadingConnectorScheduler:
             # Draft-model blocks not offloaded (cpu.draft_offload).
             getattr(self, "num_skipped_draft_blocks", 0),
             getattr(self.config, "cpu_draft_offload", "all"),
+            residency_suffix,
         )
 
     def build_connector_meta(

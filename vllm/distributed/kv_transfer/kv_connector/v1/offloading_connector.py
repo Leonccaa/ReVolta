@@ -213,13 +213,16 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA, SupportsVmmSafeTransf
         # blocks (cpu.draft_offload) since the last call.
         deltas = self.connector_scheduler.cpu_tier_eviction_deltas()
         skipped_draft = self.connector_scheduler.skipped_draft_blocks_delta()
-        if not deltas and not skipped_draft:
+        residency = self.connector_scheduler.cpu_residency_snapshot()
+        if not deltas and not skipped_draft and residency is None:
             return None
         stats = OffloadingConnectorStats()
         if deltas:
             stats.record_evictions(deltas)
         if skipped_draft:
             stats.record_skipped_draft_blocks(skipped_draft)
+        if residency is not None:
+            stats.record_residency(residency)
         return stats
 
     @classmethod

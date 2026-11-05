@@ -468,8 +468,10 @@ def _stats_connector(scheduler):
     connector = object.__new__(OffloadingConnector)
     connector.connector_worker = None
     connector.connector_scheduler = scheduler
-    # Isolate the draft counter from the CPU reset eviction counters.
+    # Isolate the draft counter from the CPU reset eviction counters and the
+    # stored / lookup counters.
     scheduler.cpu_tier_eviction_deltas = lambda: {}
+    scheduler.offload_counter_deltas = lambda: {}
     return connector
 
 

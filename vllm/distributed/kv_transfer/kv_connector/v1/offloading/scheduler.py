@@ -4,7 +4,7 @@ import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from itertools import islice
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import regex as re
 
@@ -17,12 +17,19 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     ReqId,
     TransferJob,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.counters import (
+    LookupShrink,
+    OffloadCounters,
+    build_offload_counters,
+    offload_group_kind,
+)
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    KVCacheConfig,
     KVCacheSpec,
     MambaSpec,
     SlidingWindowMLASpec,
@@ -34,6 +41,7 @@ from vllm.v1.kv_offload.base import (
     OffloadingSpec,
     OffloadKey,
     OffloadPolicy,
+    PrepareStoreOutput,
     ReqContext,
     RequestOffloadingContext,
     get_offload_block_hash,
@@ -43,6 +51,9 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from vllm.v1.kv_offload.cpu.dependency import CPUBlockDependencyIndex
 
 
 @dataclass(slots=True)
@@ -170,6 +181,9 @@ class SchedulerOffloadConfig(NamedTuple):
     superseded_state_rule: str = "request"
     # See OffloadingSpec.cpu_draft_offload.
     cpu_draft_offload: str = "all"
+    cpu_enable_dependency_eviction: bool = False
+    cpu_residency_stats: bool = False
+    cpu_offload_counters: bool = False
 
     @classmethod
     def from_spec(cls, spec: OffloadingSpec) -> "SchedulerOffloadConfig":
@@ -291,6 +305,11 @@ class SchedulerOffloadConfig(NamedTuple):
             demote_superseded_states=getattr(spec, "demote_superseded_states", True),
             superseded_state_rule=getattr(spec, "superseded_state_rule", "request"),
             cpu_draft_offload=getattr(spec, "cpu_draft_offload", "all"),
+            cpu_enable_dependency_eviction=getattr(
+                spec, "cpu_enable_dependency_eviction", False
+            ),
+            cpu_residency_stats=getattr(spec, "cpu_residency_stats", False),
+            cpu_offload_counters=getattr(spec, "cpu_offload_counters", False),
         )
 
 
@@ -321,6 +340,9 @@ class RequestOffloadState:
     # served to the scheduler, a sparse group (Mamba / sliding window) lacks
     # its checkpoint there: an externally discovered shared-prefix junction.
     external_full_attention_hit_tokens: int = 0
+    # Lookup shrink tokens by cause from the last lookup, counted (observability
+    # only) when the request is admitted; see LookupShrink.
+    lookup_shrink: dict[str, int] | None = None
     # Mamba ``align`` boundary-state hand-offs ``(group_idx, block_id,
     # boundary_tokens)`` the host tier could not accept yet. The core offers
     # each hand-off once; the source block stays owned by the request, so the
@@ -488,6 +510,24 @@ class OffloadingConnectorScheduler:
         self.num_rejected_boundary_offers = 0
         self.num_skipped_draft_blocks = 0
         self._reported_skipped_draft_blocks = 0
+        self._dependency_index: CPUBlockDependencyIndex | None = None
+        if (
+            self.config.cpu_enable_dependency_eviction
+            or self.config.cpu_residency_stats
+        ):
+            self._init_dependency_index(spec.kv_cache_config)
+        # Read-only counters (stored blocks by kind, lookup shrink, draft
+        # window use); never consulted by any decision.
+        self._offload_counters: OffloadCounters | None = None
+        if self.config.cpu_offload_counters:
+            self._offload_counters = build_offload_counters(
+                self.config.kv_group_configs, spec.kv_cache_config
+            )
+            logger.info(
+                "Offload counter kinds by KV cache group: %s (draft window: %s tokens)",
+                self._offload_counters.kind_by_group,
+                self._offload_counters.draft_window_tokens,
+            )
 
         draft_groups = [
             group.group_idx
@@ -508,6 +548,142 @@ class OffloadingConnectorScheduler:
                     "recognised as a speculative draft sliding-window group",
                     self.config.cpu_draft_offload,
                 )
+
+    def _init_dependency_index(self, kv_cache_config: KVCacheConfig) -> None:
+        from vllm.v1.kv_offload.cpu.dependency import (
+            CPUBlockDependencyIndex,
+            DependencyGroup,
+        )
+        from vllm.v1.kv_offload.cpu.manager import (
+            CPUOffloadingManager,
+            GroupedCPUOffloadingManager,
+        )
+        from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
+        from vllm.v1.kv_offload.tiering.manager import TieringOffloadingManager
+
+        pools = []
+        supported = True
+        stack = [self.manager]
+        while stack:
+            manager = stack.pop()
+            if isinstance(manager, GroupedCPUOffloadingManager):
+                stack.extend(manager.managers.values())
+            elif isinstance(manager, TieringOffloadingManager):
+                supported &= not bool(manager.secondary_tiers)
+                stack.append(manager.primary_tier)
+            elif isinstance(manager, CPUOffloadingManager):
+                pools.append(manager)
+                supported &= isinstance(manager._policy, LRUCachePolicy)
+            else:
+                supported = False
+        groups = []
+        sizes = set()
+        for g in self.config.kv_group_configs:
+            kind = offload_group_kind(
+                g, kv_cache_config.kv_cache_groups[g.group_idx].kv_cache_spec
+            )
+            groups.append(
+                DependencyGroup(
+                    g.group_idx,
+                    g.offloaded_block_size,
+                    kind,
+                    g.sliding_window_size_in_blocks,
+                )
+            )
+            if kind != "draft":
+                sizes.add(g.offloaded_block_size)
+                # Statistics recognise all recurrent modes, but deletion is
+                # modelled only for align states on this checkpoint grid.
+                supported &= (
+                    g.requires_exact_boundary_source
+                    and g.sliding_window_size_in_blocks == 1
+                    if kind == "state"
+                    else g.sliding_window_size_in_blocks is None
+                )
+        supported &= len(sizes) == 1
+        if sizes:
+            size = next(iter(sizes))
+            supported &= all(
+                size % g.block_size == 0 for g in groups if g.kind == "draft"
+            )
+        self._dependency_index = CPUBlockDependencyIndex(
+            groups,
+            pools,
+            supported,
+            eagle_lookahead=self._eagle_state_shift is not None,
+        )
+        if not self._dependency_index.supported:
+            logger.warning(
+                "CPU dependency removal disabled for this tier/group geometry; "
+                "residency is classified as unknown"
+            )
+        self._residency_sampled_at: float | None = None
+        self._residency_totals: dict[tuple[str, str], int] = {}
+        self._residency_pending = False
+
+    def _dependency_protected_keys(self) -> set[OffloadKey]:
+        # Include waiting/preempted requests and finished requests with jobs.
+        # A running request can still hand off a later checkpoint or window.
+        keys: set[OffloadKey] = set()
+        for status in self._req_status.values():
+            status.update_offload_keys()
+            if any(
+                len(status.group_states[g.group_idx].offload_keys)
+                < status.req.num_tokens // g.offloaded_block_size
+                for g in self.config.kv_group_configs
+            ):
+                index = self._dependency_index
+                assert index is not None
+                return set(index.records)  # An active prefix has unknown hashes.
+            for group in status.group_states:
+                keys.update(group.offload_keys)
+        return keys
+
+    def _prepare_store(
+        self, keys: list[OffloadKey], status: RequestOffloadState
+    ) -> PrepareStoreOutput | None:
+        index = getattr(self, "_dependency_index", None)
+        before = (
+            sum(m.num_evicted_blocks for m in index.managers)
+            if index is not None and self.config.cpu_enable_dependency_eviction
+            else 0
+        )
+        output = self.manager.prepare_store(keys, status.req_context)
+        if index is not None:
+            # Even a rejected grouped reservation can already have evicted
+            # earlier groups. The observer has cleaned those records.
+            index.annotate(
+                keys,
+                [g.offload_keys for g in status.group_states],
+                status.req.shared_prefix_boundary,
+            )
+            if (
+                self.config.cpu_enable_dependency_eviction
+                and sum(m.num_evicted_blocks for m in index.managers) > before
+            ):
+                removed = index.evict(self._dependency_protected_keys())
+                if output is not None:
+                    # The manager's capacity event may own the original list.
+                    output.evicted_keys = output.evicted_keys + removed
+        return output
+
+    def cpu_residency_snapshot(
+        self, consume: bool = True
+    ) -> dict[tuple[str, str], int] | None:
+        """New C7 snapshot at most once per minute; no work when disabled."""
+        index = getattr(self, "_dependency_index", None)
+        if index is None:
+            return None
+        now = time.monotonic()
+        if self._residency_sampled_at is None or now - self._residency_sampled_at >= 60:
+            self._residency_sampled_at = now
+            self._residency_totals = index.totals(self._dependency_protected_keys())
+            self._residency_pending = True
+        if consume:
+            if not self._residency_pending:
+                return None
+            self._residency_pending = False
+        return self._residency_totals.copy()
 
     def _generate_job_id(self) -> int:
         job_id = self._job_counter
@@ -587,7 +763,9 @@ class OffloadingConnectorScheduler:
                     req_status.req_context,
                 )
 
-    def _lookup(self, req_status: RequestOffloadState) -> int | None:
+    def _lookup(
+        self, req_status: RequestOffloadState, shrink: LookupShrink | None = None
+    ) -> int | None:
         """
         Find how many tokens beyond num_locally_computed_tokens can be loaded.
 
@@ -595,6 +773,9 @@ class OffloadingConnectorScheduler:
         groups (suffix lookup). Each group may tighten max_hit_size_tokens, which
         can invalidate an earlier group's result, so the loop re-runs when that
         happens until num_hit_tokens converges.
+
+        ``shrink`` (optional, observability only) records how far the
+        sliding-window groups lower the hit below the full-attention reach.
         """
         num_computed_tokens = req_status.num_locally_computed_tokens
         req_status.external_full_attention_hit_tokens = 0
@@ -620,6 +801,11 @@ class OffloadingConnectorScheduler:
             for group_idx in groups_iter:
                 group_config: GroupOffloadConfig = self._group_config_by_idx[group_idx]
                 if (
+                    shrink is not None
+                    and group_config.sliding_window_size_in_blocks is not None
+                ):
+                    shrink.enter(group_idx, max_hit_size_tokens)
+                if (
                     eagle_state_shift is not None
                     and group_config.sliding_window_size_in_blocks is not None
                 ):
@@ -638,6 +824,8 @@ class OffloadingConnectorScheduler:
                         0,
                     )
                     eagle_state_shift = None
+                    if shrink is not None:
+                        shrink.lower(max_hit_size_tokens, "page_align")
                 group_state: RequestGroupState = req_status.group_states[group_idx]
                 offloaded_block_size = group_config.offloaded_block_size
                 offload_keys = group_state.offload_keys
@@ -692,6 +880,8 @@ class OffloadingConnectorScheduler:
                             group_hit_tokens,
                         )
                     max_hit_size_tokens = min(max_hit_size_tokens, group_hit_tokens)
+                    if shrink is not None and sliding_window_size_in_blocks is not None:
+                        shrink.lower(max_hit_size_tokens)
                     if self._mamba_align_size is not None:
                         # A group with smaller blocks (e.g. a drafter's sliding
                         # window) can end its hit inside a Mamba page. The
@@ -710,6 +900,11 @@ class OffloadingConnectorScheduler:
                         ):
                             lookup_groups = self._sliding_window_groups
                         max_hit_size_tokens = aligned
+                        if (
+                            shrink is not None
+                            and sliding_window_size_in_blocks is not None
+                        ):
+                            shrink.lower(aligned, "page_align")
 
                 new_num_hit_tokens = max_hit_size_tokens - num_computed_tokens
                 if new_num_hit_tokens < offloaded_block_size:
@@ -825,10 +1020,18 @@ class OffloadingConnectorScheduler:
         req_status.num_locally_computed_tokens = num_computed_tokens
 
         num_hit_tokens: int | None
+        counters = getattr(self, "_offload_counters", None)
+        if counters is not None:
+            req_status.lookup_shrink = None
         if request.skip_reading_prefix_cache:
             num_hit_tokens = 0
         else:
-            num_hit_tokens = self._lookup(req_status)
+            shrink = counters.new_lookup() if counters is not None else None
+            num_hit_tokens = self._lookup(req_status, shrink)
+            if shrink is not None and num_hit_tokens is not None:
+                # Served at the local hit when there is no external hit.
+                shrink.lower(num_computed_tokens + num_hit_tokens)
+                req_status.lookup_shrink = shrink.tokens
         served_tokens = num_computed_tokens + (num_hit_tokens or 0)
         req_status.update_num_hit_blocks(served_tokens)
 
@@ -860,6 +1063,10 @@ class OffloadingConnectorScheduler:
     def update_state_after_alloc(
         self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
     ):
+        counters = getattr(self, "_offload_counters", None)
+        if counters is not None:
+            self._count_admitted_lookup(counters, request, num_external_tokens)
+
         if num_external_tokens == 0:
             return
 
@@ -982,6 +1189,23 @@ class OffloadingConnectorScheduler:
         if self._blocks_being_loaded is not None:
             self._blocks_being_loaded.update(keys_to_load)
 
+    def _count_admitted_lookup(
+        self, counters: OffloadCounters, request: Request, num_external_tokens: int
+    ) -> None:
+        """Count the admitted request's last lookup once (observability)."""
+        req_status = self._req_status.get(request.request_id)
+        if req_status is None:
+            return
+        shrink_tokens = req_status.lookup_shrink
+        req_status.lookup_shrink = None
+        counters.count_admitted_lookup(
+            shrink_tokens,
+            num_external_tokens,
+            request.num_tokens
+            - req_status.num_locally_computed_tokens
+            - num_external_tokens,
+        )
+
     def _build_store_jobs(
         self,
         scheduler_output: SchedulerOutput,
@@ -1100,9 +1324,7 @@ class OffloadingConnectorScheduler:
                 req_status.advance_stored_idx(num_offloadable_tokens)
                 continue
 
-            store_output = self.manager.prepare_store(
-                new_offload_keys, req_status.req_context
-            )
+            store_output = self._prepare_store(new_offload_keys, req_status)
             if store_output is None:
                 logger.warning("Request %s: cannot store blocks", req_id)
                 continue
@@ -1359,6 +1581,12 @@ class OffloadingConnectorScheduler:
         getattr(req_status, "draft_reofferable", {}).clear()
         getattr(req_status, "draft_window_boundaries", set()).clear()
 
+    def offload_counter_deltas(self) -> dict[str, dict[str, int]]:
+        """Stored blocks by kind, lookup shrink tokens by cause and draft
+        window use of hits since the previous call (see OffloadCounters)."""
+        counters = getattr(self, "_offload_counters", None)
+        return counters.deltas() if counters is not None else {}
+
     def skipped_draft_blocks_delta(self) -> int:
         """Draft blocks skipped by cpu.draft_offload since the previous call."""
         total = getattr(self, "num_skipped_draft_blocks", 0)
@@ -1475,9 +1703,7 @@ class OffloadingConnectorScheduler:
                 if offload_block_idx >= len(group_state.offload_keys):
                     continue
                 offload_key = group_state.offload_keys[offload_block_idx]
-                store_output = self.manager.prepare_store(
-                    [offload_key], req_status.req_context
-                )
+                store_output = self._prepare_store([offload_key], req_status)
                 if store_output is None:
                     rejected.append(boundary_tokens)
                     continue
@@ -1586,10 +1812,31 @@ class OffloadingConnectorScheduler:
             return
         self._counters_logged_at = now
         stored, evicted = self._cpu_tier_counters()
+        residency_suffix = ""
+        if getattr(self, "_dependency_index", None) is not None:
+            self.cpu_residency_snapshot(consume=False)
+            totals = self._residency_totals
+            residency_suffix = " cpu_resident_blocks=" + str(sum(totals.values()))
+            residency_suffix += " cpu_residency=" + str(totals)
+        counters = getattr(self, "_offload_counters", None)
+        counter_suffix = ""
+        if counters is not None:
+            by_kind = counters.stored_blocks
+            shrink = counters.lookup_shrink_tokens
+            needed = counters.hit_draft_window_needed
+            counter_suffix = (
+                f" stored_blocks_by_kind=target:{by_kind['target']},"
+                f"draft:{by_kind['draft']},state:{by_kind['state']} "
+                f"lookup_shrink_tokens=draft_window:{shrink['draft_window']},"
+                f"recurrent_state:{shrink['recurrent_state']},"
+                f"sliding_window:{shrink['sliding_window']},"
+                f"page_align:{shrink['page_align']} "
+                f"hit_draft_window_needed=true:{needed['true']},false:{needed['false']}"
+            )
         logger.info(
             "Offload counters: demoted_states=%d cpu_stored_blocks=%d "
             "cpu_evicted_blocks=%d rejected_boundary_offers=%d rule=%s "
-            "cpu_draft_blocks_skipped=%d cpu.draft_offload=%s",
+            "cpu_draft_blocks_skipped=%d cpu.draft_offload=%s%s%s",
             getattr(self, "num_demoted_states", 0),
             stored,
             evicted,
@@ -1599,6 +1846,8 @@ class OffloadingConnectorScheduler:
             # Draft-model blocks not offloaded (cpu.draft_offload).
             getattr(self, "num_skipped_draft_blocks", 0),
             getattr(self.config, "cpu_draft_offload", "all"),
+            counter_suffix,
+            residency_suffix,
         )
 
     def build_connector_meta(
@@ -1692,6 +1941,9 @@ class OffloadingConnectorScheduler:
             req_status = self._req_status[job_status.req_id]
             if job_status.is_store:
                 self.manager.complete_store(job_status.keys, req_status.req_context)
+                counters = getattr(self, "_offload_counters", None)
+                if counters is not None:
+                    counters.count_stored(job_status.keys)
             else:
                 self.manager.complete_load(job_status.keys, req_status.req_context)
                 if self._blocks_being_loaded:

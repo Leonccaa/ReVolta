@@ -456,3 +456,90 @@ def test_grouped_manager_forwards_latest_only_drop_and_stats():
     stats = grouped.delayed_write_stats()
     assert stats["fake[group 1]"]["dropped_latest"] == 1
     assert stats["fake[group 0]"]["written"] == 1
+
+
+# ------------------------------------------- idle engine (no steps) persistence
+
+
+def test_idle_step_writes_due_rows_and_releases_pins_without_engine_steps():
+    manager, primary, tier, clock = setup(delay_s=60)
+    assert manager.has_pending_delayed_writes() is False
+    store(manager, [k(1)])
+    assert manager.has_pending_delayed_writes() is True  # queued
+    manager.delayed_write_step()  # not due yet
+    assert written(tier) == []
+    clock[0] += 60
+    manager.delayed_write_step()  # due: written, CPU row pinned until polled
+    assert written(tier) == [[k(1)]]
+    assert primary._policy.get(k(1)).ref_cnt == 1
+    assert manager.has_pending_delayed_writes() is True  # job in flight
+    manager.delayed_write_step()  # completion polled
+    assert primary._policy.get(k(1)).ref_cnt == 0
+    assert manager.has_pending_delayed_writes() is False
+
+
+def test_no_delayed_tier_never_reports_pending():
+    manager, primary, tier, clock = setup(delay_s=None)
+    store(manager, [k(1)])  # immediate cascade in flight
+    assert manager.has_pending_delayed_writes() is False
+
+
+def test_scheduler_forwards_persistence_hooks():
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+        OffloadingConnectorScheduler,
+    )
+
+    sched = OffloadingConnectorScheduler.__new__(OffloadingConnectorScheduler)
+    calls = []
+    sched.manager = SimpleNamespace(
+        has_pending_delayed_writes=lambda: True,
+        delayed_write_step=lambda: calls.append("step"),
+    )
+    assert sched.has_pending_persistence() is True
+    sched.persistence_step()
+    assert calls == ["step"]
+    sched.manager = SimpleNamespace()  # plain CPU manager: no delayed writes
+    assert sched.has_pending_persistence() is False
+    sched.persistence_step()
+
+
+@pytest.mark.parametrize("pending", [True, False])
+def test_idle_engine_bounds_wait_only_with_pending_writes(pending, monkeypatch):
+    import queue
+    from contextlib import nullcontext
+
+    from vllm.v1.engine import core
+
+    observed, steps = [], []
+
+    class Input:
+        def empty(self):
+            return True
+
+        def get(self, **kwargs):
+            observed.append(kwargs)
+            raise queue.Empty
+
+    connector = SimpleNamespace(
+        has_pending_persistence=lambda: pending,
+        persistence_step=lambda: steps.append(1),
+    )
+    monkeypatch.setattr(
+        core,
+        "get_watch_dog",
+        lambda: SimpleNamespace(disable=nullcontext, feed=lambda: None),
+    )
+    instance = SimpleNamespace(
+        has_work=lambda: False,
+        is_running=lambda: True,
+        _notify_idle_state_callbacks=lambda: None,
+        input_queue=Input(),
+        aborts_queue=queue.Queue(),
+        process_input_queue_block=True,
+        scheduler=SimpleNamespace(get_kv_connector=lambda: connector),
+    )
+    core.EngineCoreProc._process_input_queue(instance)
+    if pending:
+        assert observed == [{"timeout": 1.0}] and steps == [1]
+    else:
+        assert observed == [{"block": True}] and steps == []

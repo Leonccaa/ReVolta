@@ -388,6 +388,18 @@ class GroupedCPUOffloadingManager(OffloadingManager):
                 dropped += drop(group_keys)
         return dropped
 
+    def has_pending_delayed_writes(self) -> bool:
+        return any(
+            bool(getattr(m, "has_pending_delayed_writes", lambda: False)())
+            for m in self.managers.values()
+        )
+
+    def delayed_write_step(self) -> None:
+        for manager in self.managers.values():
+            step = getattr(manager, "delayed_write_step", None)
+            if step is not None:
+                step()
+
     def delayed_write_stats(self) -> dict[str, dict[str, int]]:
         out: dict[str, dict[str, int]] = {}
         for group_idx, manager in self.managers.items():

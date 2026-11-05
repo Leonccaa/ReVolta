@@ -2104,6 +2104,18 @@ class OffloadingConnectorScheduler:
             self.num_demoted_states = getattr(self, "num_demoted_states", 0) + len(keys)
             self.manager.demote(keys, req_status.req_context)
 
+    def has_pending_persistence(self) -> bool:
+        """Delayed secondary-tier writes are queued or in flight: the idle
+        engine wakes about once a second to service them (EngineCoreProc)."""
+        pending = getattr(self.manager, "has_pending_delayed_writes", None)
+        return bool(pending()) if pending is not None else False
+
+    def persistence_step(self) -> None:
+        """Idle engine, scheduler thread: write due rows, poll completions."""
+        step = getattr(self.manager, "delayed_write_step", None)
+        if step is not None:
+            step()
+
     def _drop_superseded_state_writes(self, req_status: RequestOffloadState) -> None:
         """state_latest_only (secondary tiers with delayed writes): of the
         recurrent states this request stored, only the newest is written to

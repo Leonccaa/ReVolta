@@ -610,6 +610,20 @@ class TieringOffloadingManager(OffloadingManager):
             for tier, queue in self._delayed.items():
                 logger.info("Delayed writes (%s): %s", tier.tier_type, queue.summary())
 
+    def has_pending_delayed_writes(self) -> bool:
+        """Delayed rows queued, or cascades to secondary tiers still in flight
+        (their CPU pins are released when the completion is polled)."""
+        if not self._delayed:
+            return False
+        return any(q.depth for q in self._delayed.values()) or any(
+            not job.is_promotion for job in self._transfer_jobs.values()
+        )
+
+    def delayed_write_step(self) -> None:
+        """Idle-engine service on the scheduler thread (no engine step runs)."""
+        self._process_finished_jobs()
+        self.flush_delayed_writes()
+
     def drop_pending_secondary_writes(self, keys: Collection[OffloadKey]) -> int:
         """Do not write these pending keys to tiers with state_latest_only."""
         return sum(

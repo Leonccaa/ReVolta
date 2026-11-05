@@ -183,6 +183,15 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA, SupportsVmmSafeTransf
         assert self.connector_scheduler is not None
         return self.connector_scheduler.take_events()
 
+    def has_pending_persistence(self) -> bool:
+        return self.connector_scheduler is not None and (
+            self.connector_scheduler.has_pending_persistence()
+        )
+
+    def persistence_step(self) -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.persistence_step()
+
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: VllmConfig) -> str | None:
         # Transfers copy whole raw physical pages (KVPhysicalPage.raw_pages), so

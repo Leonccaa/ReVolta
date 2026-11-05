@@ -2730,6 +2730,7 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
 
     scheduler.perf_metrics = None
     scheduler.connector = None
+    scheduler.log_stats = False
     scheduler.structured_output_manager = Mock()
     scheduler.structured_output_manager.should_advance.return_value = True
     # The scheduler strips reasoning tokens before handing them to the grammar;

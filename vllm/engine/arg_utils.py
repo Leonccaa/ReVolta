@@ -750,7 +750,7 @@ class EngineArgs:
     kv_offloading_backend: KVOffloadingBackend = CacheConfig.kv_offloading_backend
     tokens_only: bool = False
 
-    shutdown_timeout: int = 0
+    shutdown_timeout: int = 30
 
     watchdog_config: WatchdogConfig = get_field(VllmConfig, "watchdog_config")
 
@@ -1602,8 +1602,9 @@ class EngineArgs:
         parser.add_argument(
             "--shutdown-timeout",
             type=int,
-            default=0,
-            help="Shutdown timeout in seconds. 0 = abort, >0 = wait.",
+            default=30,
+            help="Shutdown timeout in seconds. 0 = abort, >0 = wait. "
+            "ReVolta default: 30 (upstream vLLM: 0).",
         )
 
         parser.add_argument(

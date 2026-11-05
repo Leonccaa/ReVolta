@@ -1145,10 +1145,14 @@ class VllmConfig:
     weight_transfer_config: WeightTransferConfig | None = None
     """The configurations for weight transfer during RL training."""
 
-    shutdown_timeout: int = Field(default=0, ge=0)
+    shutdown_timeout: int = Field(default=30, ge=0)
     """Shutdown grace period for in-flight requests. Shutdown will be delayed for
     up to this amount of time to allow already-running requests to complete. Any
     remaining requests are aborted once the timeout is reached.
+
+    ReVolta defaults to 30 (upstream vLLM: 0). With 0 the engine process is stopped
+    at once, so requests still in flight may never be answered and offload cleanup
+    may not run.
     """
 
     watchdog_config: WatchdogConfig = Field(default_factory=WatchdogConfig)

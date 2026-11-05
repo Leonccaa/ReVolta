@@ -117,6 +117,61 @@ the two. A 32K / 99K / 131K-token prefix came back in 1.47 / 2.93 / 3.77 s inste
 10.12 / 31.88 / 42.43 s when recomputed. A root holding 27.8 GB in 1,088 files did not
 slow the restart. See [Coming back to a document](performance.md#coming-back-to-a-document).
 
+**4. CPU + verified disk (`revolta_fs`, experimental).** A stricter variant of the
+filesystem tier meant to keep conversations reusable across engine restarts. Use
+`"type": "revolta_fs"` instead of `"fs"`; every `fs` key above still applies. It adds:
+
+- **Integrity:** each page carries a CRC32C of its contents in a user extended
+  attribute, bound to the page's prefix and the tier's identity. A corrupted page, or
+  an intact page that belongs to another prefix or layout, is deleted and computed
+  again; it is never loaded. Pages are written to a temporary file, synced and then
+  renamed. The file system under `root_dir` must support user extended attributes
+  (ext4 and XFS do); otherwise this tier disables itself and CPU serving continues.
+- **Identity:** pages are bound to the contents of the loaded checkpoint, not its
+  path. Create a content manifest once per checkpoint, with the same paths the engine
+  loads, and keep it outside the model directories:
+
+  ```bash
+  python tools/kv_offload/make_content_manifest.py \
+      --role target=/path/to/model --role draft=/path/to/draft \
+      --out /path/to/manifests/model.json
+  ```
+
+  If a listed file changes, a file is added to a model directory, or the manifest is
+  missing, the tier disables itself: nothing is read from or written to disk, and the
+  CPU tier works as before. Create a new manifest after changing the checkpoint.
+  The target and effective draft must resolve to local checkpoints covered by the
+  manifest. Only the default `auto` and `safetensors` loaders are accepted; extra
+  loader options, secondary weights, `model_weights`, LoRA, multimodal sources and
+  runtime KV scale calibration disable this tier. Keep checkpoint generations
+  immutable from manifest creation through model loading and serving. `stat`
+  verification depends on that contract; `full` also rehashes the files.
+  A dedicated full SHA-256 identity covers loader selection, target and effective
+  draft settings (including quantization, dtype and RoPE), KV dtype/layout and page
+  format. Each page records its complete key and namespace digest separately from
+  its payload CRC32C and compares both exactly before accepting a load.
+- **Recency:** prefixes used from the GPU or CPU pool also refresh their disk pages,
+  with the start of a prefix kept most recent, so a shared system prompt is not the
+  first page evicted.
+
+Options of a `revolta_fs` tier entry, listed under the `ssd.` namespace (the key in the
+tier entry is the part after `ssd.`):
+
+| Option | Type | Default | Values | Scope | Effect and trade-off | Since | Status |
+|---|---|---|---|---|---|---|---|
+| `ssd.content_manifest_path` | string | none | path | deployment | Content manifest of the loaded checkpoint. Without it the tier is disabled. | 0.2 | experimental |
+| `ssd.content_verify` | enum | `stat` | `stat`, `full` | deployment | `stat` checks size, modification time and inode of every listed file at startup (milliseconds). `full` also recomputes every content hash (about a minute per 100 GB) and catches a rewrite that restored the modification time. | 0.2 | experimental |
+| `ssd.mtime_update_interval_s` | float | `60` | `>= 0` | deployment | Minimum time between refreshes unless another page in the touched chain is due; then the whole chain is stamped tail to head. The times order eviction after a restart; shorter is more precise and writes more metadata. | 0.2 | experimental |
+
+When store timeouts are configured, the deadline covers the entire store job,
+including time in the queue. Completion polling reports overdue jobs as failed
+after any protected source snapshot finishes. Each page shares the job deadline.
+An active kernel I/O call still has to return before its worker can shut down.
+
+Counters of a `revolta_fs` tier (pages written, existing, verified, checksum
+failures, pages skipped after a failure in the same chain, modification-time updates)
+are logged when the engine shuts down.
+
 ## See also
 
 - [Reference launch tutorial](getting-started.md)

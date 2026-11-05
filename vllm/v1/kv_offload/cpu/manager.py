@@ -370,6 +370,32 @@ class GroupedCPUOffloadingManager(OffloadingManager):
         for manager in self.managers.values():
             manager.on_request_finished(req_context)
 
+    @property
+    def state_latest_only(self) -> bool:
+        """Any group's tiering manager has a state_latest_only tier."""
+        return any(
+            getattr(m, "state_latest_only", False) is True
+            for m in self.managers.values()
+        )
+
+    def drop_pending_secondary_writes(self, keys: Collection[OffloadKey]) -> int:
+        dropped = 0
+        for group_idx, group_keys in self._partition(keys).items():
+            drop = getattr(
+                self.managers[group_idx], "drop_pending_secondary_writes", None
+            )
+            if drop is not None:
+                dropped += drop(group_keys)
+        return dropped
+
+    def delayed_write_stats(self) -> dict[str, dict[str, int]]:
+        out: dict[str, dict[str, int]] = {}
+        for group_idx, manager in self.managers.items():
+            stats = getattr(manager, "delayed_write_stats", None)
+            for tier, values in (stats() if stats is not None else {}).items():
+                out[f"{tier}[group {group_idx}]"] = values
+        return out
+
     def shutdown(self) -> None:
         for manager in self.managers.values():
             manager.shutdown()

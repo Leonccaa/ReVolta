@@ -184,7 +184,9 @@ class TieringOffloadingManager(OffloadingManager):
                 continue
             volume = None
             if config.get("volume_path"):
-                volume = WriteVolume(config["volume_path"], config["warn_bytes_24h"])
+                volume = WriteVolume.shared(
+                    config["volume_path"], config["warn_bytes_24h"]
+                )
             self._delayed[tier] = DelayedWriteQueue(
                 delay_s=float(config["delay_s"]),
                 page_bytes=int(config["page_bytes"]),

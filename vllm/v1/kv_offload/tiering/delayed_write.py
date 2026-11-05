@@ -40,8 +40,24 @@ class WriteVolume:
 
     The file survives restarts so a restart does not reset the count. A
     missing or unreadable file starts empty (logged); a write failure only
-    logs, it never blocks the write path.
+    logs, it never blocks the write path. With grouped CPU pools every group
+    has its own tier instance on the same root: use ``shared()`` so they
+    count into one object (one file, one warning).
     """
+
+    _shared: dict[str, "WriteVolume"] = {}
+
+    @classmethod
+    def shared(cls, path: str, warn_bytes: int) -> "WriteVolume":
+        key = os.path.realpath(path)
+        volume = cls._shared.get(key)
+        if volume is None:
+            volume = cls._shared[key] = cls(key, warn_bytes)
+        elif volume.warn_bytes != int(warn_bytes):
+            raise ValueError(
+                f"{path}: tiers sharing a root must use the same write_warn_bytes_24h"
+            )
+        return volume
 
     def __init__(
         self,
@@ -65,6 +81,7 @@ class WriteVolume:
         self._buckets: dict[int, int] = {}
         self._dirty = False
         self._persisted_at: float | None = None
+        self.warned_at: float | None = None
         self._load()
 
     def _bucket(self, now: float) -> int:
@@ -98,6 +115,24 @@ class WriteVolume:
 
     def over(self, now: float | None = None) -> bool:
         return self.warn_bytes > 0 and self.used(now) > self.warn_bytes
+
+    def record(self, nbytes: int, now: float | None = None) -> tuple[bool, bool]:
+        """Charge a write; returns (over threshold, warned now). Warns at most
+        hourly per volume (all groups of a root share it). Never refuses."""
+        now = self.clock() if now is None else now
+        self.charge(nbytes, now)
+        if not self.over(now):
+            return False, False
+        if self.warned_at is not None and now - self.warned_at < 3600:
+            return True, False
+        self.warned_at = now
+        logger.warning(
+            "Secondary tier wrote %d bytes in the last 24 h, above the %d byte "
+            "warning threshold (writes continue)",
+            self.used(now),
+            self.warn_bytes,
+        )
+        return True, True
 
     def charge(self, nbytes: int, now: float | None = None) -> None:
         now = self.clock() if now is None else now
@@ -157,7 +192,6 @@ class DelayedWriteQueue:
     _pending: Counter = field(default_factory=Counter)
     _drops: dict = field(default_factory=dict)
     _seq: int = 0
-    _warned_at: float | None = None
 
     def __post_init__(self) -> None:
         if self.delay_s < 0:
@@ -242,24 +276,16 @@ class DelayedWriteQueue:
         return live
 
     def account(self, keys: list[OffloadKey], now_wall: float | None = None) -> None:
-        """Count one submitted write job; warn (hourly at most) above the
-        rolling 24 h threshold. Never refuses the write."""
+        """Count one submitted write job; the shared volume warns (hourly at
+        most) above the rolling 24 h threshold. Never refuses the write."""
         self.stats["written"] += len(keys)
         if self.volume is None:
             return
-        now_wall = self.volume.clock() if now_wall is None else now_wall
-        self.volume.charge(len(keys) * self.page_bytes, now_wall)
-        if self.volume.over(now_wall):
+        over, warned = self.volume.record(len(keys) * self.page_bytes, now_wall)
+        if over:
             self.stats["over_threshold_jobs"] += 1
-            if self._warned_at is None or now_wall - self._warned_at >= 3600:
-                self._warned_at = now_wall
-                self.stats["over_threshold_warnings"] += 1
-                logger.warning(
-                    "Secondary tier wrote %d bytes in the last 24 h, above the "
-                    "%d byte warning threshold (writes continue)",
-                    self.volume.used(now_wall),
-                    self.volume.warn_bytes,
-                )
+        if warned:
+            self.stats["over_threshold_warnings"] += 1
 
     def summary(self) -> dict[str, int]:
         out = {k: int(v) for k, v in self.stats.items()}

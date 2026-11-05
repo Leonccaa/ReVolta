@@ -402,3 +402,57 @@ def test_scheduler_drops_older_own_states_and_extended_hit_state():
 def test_delayed_batch_dataclass_is_plain():
     b = DelayedBatch(1.0, [k(1)], CTX, 3)
     assert b.seq == 3 and b.keys == [k(1)]
+
+
+# --------------------------------------------- grouped pools (one root, N groups)
+
+
+def test_shared_volume_counts_all_groups_and_warns_once(tmp_path, monkeypatch):
+    from vllm.v1.kv_offload.tiering import delayed_write
+
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        delayed_write.logger, "warning", lambda msg, *a: warnings.append(msg % a)
+    )
+    path = str(tmp_path / VOLUME_FILE)
+    a = WriteVolume.shared(path, 150)
+    b = WriteVolume.shared(path, 150)
+    assert a is b
+    with pytest.raises(ValueError):
+        WriteVolume.shared(path, 999)
+    qa = DelayedWriteQueue(delay_s=1, page_bytes=100, volume=a)
+    qb = DelayedWriteQueue(delay_s=1, page_bytes=100, volume=b)
+    qa.account([k(1)])
+    qb.account([k(2)])  # 200 > 150 across both groups
+    qa.account([k(3)])
+    assert a.used() == 300
+    assert len(warnings) == 1
+    assert qb.stats["over_threshold_warnings"] == 1
+    assert (
+        qa.stats["over_threshold_jobs"] == 1
+        and qa.stats["over_threshold_warnings"] == 0
+    )
+
+
+def test_grouped_manager_forwards_latest_only_drop_and_stats():
+    from vllm.v1.kv_offload.cpu.manager import GroupedCPUOffloadingManager
+
+    groups = {}
+    clocks = {}
+    for g in (0, 1):
+        manager, primary, tier, clock = setup(delay_s=60, latest_only=(g == 1))
+        groups[g], clocks[g] = (manager, tier), clock
+    grouped = GroupedCPUOffloadingManager({g: m for g, (m, _) in groups.items()})
+    assert grouped.state_latest_only is True
+    store(groups[0][0], [k(1, 0)])
+    store(groups[1][0], [k(2, 1), k(3, 1)])
+    # only group 1 is latest-only
+    assert grouped.drop_pending_secondary_writes([k(1, 0), k(2, 1)]) == 1
+    for g in (0, 1):
+        clocks[g][0] += 60
+    list(grouped.take_events())
+    assert written(groups[0][1]) == [[k(1, 0)]]
+    assert written(groups[1][1]) == [[k(3, 1)]]
+    stats = grouped.delayed_write_stats()
+    assert stats["fake[group 1]"]["dropped_latest"] == 1
+    assert stats["fake[group 0]"]["written"] == 1

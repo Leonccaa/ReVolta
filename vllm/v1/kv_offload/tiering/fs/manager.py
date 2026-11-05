@@ -112,10 +112,15 @@ class FileSystemTierManager(SecondaryTierManager):
                 n_read_threads,
                 n_write_threads,
                 thread_name_prefix="vllm_kv_py_fs",
+                **self._pool_options(),
             )
         except BaseException:
             self._cache.release()
             raise
+
+    def _pool_options(self) -> dict:
+        """Extra DualQueueThreadPool options (none for the plain fs tier)."""
+        return {}
 
     def _make_file_mapper(
         self, root_dir: str, offloading_spec: "OffloadingSpec"

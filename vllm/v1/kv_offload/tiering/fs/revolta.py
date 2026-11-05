@@ -25,6 +25,7 @@ import errno
 import functools
 import glob
 import hashlib
+import itertools
 import json
 import os
 import queue
@@ -50,6 +51,7 @@ from vllm.v1.kv_offload.tiering.fs.identity import (
 )
 from vllm.v1.kv_offload.tiering.fs.io import O_DIRECT, _ensure_dirs, _get_tmp_suffix
 from vllm.v1.kv_offload.tiering.fs.manager import FileSystemTierManager
+from vllm.v1.kv_offload.tiering.fs.thread_pool import current_job
 
 if TYPE_CHECKING:
     from vllm.v1.kv_offload.base import OffloadingSpec
@@ -61,6 +63,11 @@ CHECKSUM_XATTR = "user.revolta.kv_crc32c"
 _XATTR_FORMAT = struct.Struct("<II32sI")
 _XATTR_VERSION = 2
 
+
+# Errors worth retrying for one page operation.
+_RETRYABLE = frozenset(
+    {errno.EAGAIN, errno.EINTR, errno.EBUSY, errno.ESTALE, errno.ETIMEDOUT, errno.EIO}
+)
 
 # ---------------------------------------------------------------------------
 # CRC32C
@@ -126,6 +133,11 @@ def crc32c(view: memoryview | bytes, crc: int = 0) -> int:
 # ---------------------------------------------------------------------------
 
 
+class StoreCancelled(Exception):
+    """A store task found its job already expired; its source buffer may be
+    reused, so nothing was written."""
+
+
 class ChecksumError(OSError):
     """A page failed integrity verification (missing, malformed or wrong
     checksum). Reported as EBADMSG."""
@@ -167,18 +179,29 @@ def store_verified_block(
     block_size: int,
     key: OffloadKey,
     identity: bytes,
+    snapshot_guard: Callable[[], contextlib.AbstractContextManager[bool]] | None = None,
 ) -> bool:
     """Publish one page with its payload checksum and full identity.
 
     Returns False if a page with a valid attribute already exists (it is not
     rewritten; its payload is verified on load). A file without one is a
     partial or foreign page and is replaced.
+
+    The checksum is computed from the source buffer before writing, so a write
+    whose buffer is reused midway produces a page that fails verification.
+    ``snapshot_guard`` brackets that computation: while inside it, the buffer
+    must not be released; if it yields False the buffer may already have been
+    released and nothing is written (``StoreCancelled``).
     """
     existing = read_page_identity(dest_path)
     if existing is not None and existing[1:] == (identity, bytes(key)):
         return False
     payload = view.cast("B")[offset : offset + block_size]
-    value = crc32c(payload)
+    guard = snapshot_guard() if snapshot_guard else contextlib.nullcontext(True)
+    with guard as safe:
+        if not safe:
+            raise StoreCancelled(dest_path)
+        value = crc32c(payload)
     tmp_path = dest_path + _get_tmp_suffix()
     _ensure_dirs(dest_path)
     try:
@@ -261,6 +284,22 @@ def load_verified_block(
             os.close(fd)
 
 
+@contextlib.contextmanager
+def _job_snapshot_guard():
+    """Keep the running pool job from expiring while its source is read."""
+    state = current_job()
+    if state is None:
+        yield True
+        return
+    if not state.begin_unsafe():
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        state.end_unsafe()
+
+
 # ---------------------------------------------------------------------------
 # Tier
 # ---------------------------------------------------------------------------
@@ -283,6 +322,20 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
             file; "full" also recomputes every content hash at startup.
         mtime_update_interval_s: minimum seconds between mtime updates of a
             page (default 60; 0 = every use).
+        store_timeout_s: report a store job failed after this many seconds
+            (default 30; 0 = never). Safe because a page's checksum is
+            taken from its source before writing and a job cannot expire
+            while a task is taking it: a write whose buffer is reused after
+            expiry produces a page that fails verification.
+        drain_timeout_s: at shutdown, keep writing queued pages for up to this
+            many seconds (default 30) before dropping the rest.
+        max_io_retries: retries of a page operation after a transient error
+            (EAGAIN, EINTR, EBUSY, ESTALE, ETIMEDOUT, EIO), with backoff.
+        max_inflight_store_blocks: pages queued or being written above which
+            new store jobs are skipped (completed without writing, so the CPU
+            tier is not held by a slow disk). Default: a quarter of the CPU
+            tier's blocks, at least 64 (0 = this default). A job is always accepted when
+            nothing else is in flight.
 
     Recency: CPU/GPU-tier hits never read the disk tier, so without help its
     LRU would only see writes, and a hot shared chain head (written first)
@@ -304,6 +357,10 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
         content_manifest_path: str | None = None,
         content_verify: str = "stat",
         mtime_update_interval_s: float = 60.0,
+        store_timeout_s: float = 30.0,
+        drain_timeout_s: float = 30.0,
+        max_io_retries: int = 2,
+        max_inflight_store_blocks: int = 0,
         **kwargs,
     ):
         self._stats_lock = threading.Lock()
@@ -314,6 +371,10 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
             "checksum_failures": 0,
             "skipped_after_chain_failure": 0,
             "mtime_updates": 0,
+            "io_retries": 0,
+            "store_jobs_skipped_backpressure": 0,
+            "store_blocks_skipped_backpressure": 0,
+            "store_tasks_cancelled": 0,
         }
         self.disabled_reason: str | None = None
         self._root_dir = os.path.realpath(root_dir)
@@ -326,6 +387,23 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
             queue.SimpleQueue()
         )
         self._mtime_thread: threading.Thread | None = None
+        if max_io_retries < 0:
+            raise ValueError("max_io_retries must be >= 0")
+        self._max_io_retries = max_io_retries
+        if store_timeout_s < 0 or drain_timeout_s < 0:
+            raise ValueError("store_timeout_s and drain_timeout_s must be >= 0")
+        self._store_timeout_s = store_timeout_s or None
+        self._drain_timeout_s = drain_timeout_s
+        num_cpu_blocks = len(primary_kv_view) if primary_kv_view.ndim else 1
+        self._max_inflight = (
+            max(64, num_cpu_blocks // 4)
+            if max_inflight_store_blocks == 0
+            else max_inflight_store_blocks
+        )
+        if self._max_inflight < 1:
+            raise ValueError("max_inflight_store_blocks must be >= 0")
+        self._inflight_stores = 0
+        self._inflight_jobs: dict[int, int] = {}
         self._disabled_finished: list[int] = []
         if content_verify not in ("stat", "full"):
             raise ValueError("content_verify must be 'stat' or 'full'")
@@ -424,6 +502,32 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
     def disabled(self) -> bool:
         return self.disabled_reason is not None
 
+    def _pool_options(self) -> dict:
+        return {
+            "store_timeout_s": self._store_timeout_s,
+            "drain_timeout_s": self._drain_timeout_s,
+        }
+
+    def _with_retries(self, op: Callable[[], None]) -> None:
+        delay = 0.01
+        for attempt in range(self._max_io_retries + 1):
+            if not self._pool.retry_allowed():
+                raise StoreCancelled("I/O job stopped or reached its deadline")
+            try:
+                op()
+                return
+            except (ChecksumError, StoreCancelled, FileNotFoundError):
+                raise
+            except OSError as exc:
+                if exc.errno not in _RETRYABLE or attempt == self._max_io_retries:
+                    raise
+                self._count("io_retries")
+                if not self._pool.wait_for_retry(delay):
+                    raise StoreCancelled(
+                        "I/O retry stopped or reached its deadline"
+                    ) from exc
+                delay = min(delay * 4, 1.0)
+
     def _make_file_mapper(self, root_dir: str, offloading_spec: "OffloadingSpec"):
         from vllm.v1.kv_offload.file_mapper import FileMapper
 
@@ -504,7 +608,17 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
             return dict(self._stats)
 
     def _store_key(self, key: OffloadKey, path: str, block_id: int) -> None:
-        self._write_page(key, path, block_id)
+        def write():
+            state = current_job()
+            if self._pool.stopping or (state is not None and state.expired):
+                raise StoreCancelled(path)
+            self._write_page(key, path, block_id)
+
+        try:
+            self._with_retries(write)
+        except StoreCancelled:
+            self._count("store_tasks_cancelled")
+            raise
 
     def _store_group(self, pages: list[tuple[OffloadKey, int]]) -> None:
         # Input order is prefix-chain order, not lexicographic hash order.
@@ -524,10 +638,16 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
                 self._block_size,
                 key,
                 self._identity_digest,
+                _job_snapshot_guard,
             )
         self._count("pages_written" if written else "pages_existing")
 
     def _load_key(self, key: OffloadKey, path: str, block_id: int) -> None:
+        self._with_retries(lambda: self._read_page(key, path, block_id))
+        self._count("pages_verified")
+        self._schedule_mtime([path])
+
+    def _read_page(self, key: OffloadKey, path: str, block_id: int) -> None:
         with self._cache.read(path):
             try:
                 load_verified_block(
@@ -542,8 +662,6 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
                 self._count("checksum_failures")
                 logger.warning("revolta_fs: %s (%s)", exc.reason, path)
                 raise
-        self._count("pages_verified")
-        self._schedule_mtime([path])
 
     # --- recency ------------------------------------------------------------
 
@@ -609,23 +727,43 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
         return super().lookup(key, req_context)
 
     def get_finished_jobs(self) -> Iterable[JobResult]:
+        finished, self._disabled_finished = self._disabled_finished, []
+        skipped = [JobResult(job_id=j, success=True) for j in finished]
         if self.disabled:
-            finished, self._disabled_finished = self._disabled_finished, []
-            return (JobResult(job_id=j, success=True) for j in finished)
-        return super().get_finished_jobs()
+            return iter(skipped)
+        done = list(super().get_finished_jobs())
+        with self._stats_lock:
+            for result in done:
+                # Counted per job: tasks of an expired job may still run, but
+                # the job no longer holds CPU blocks.
+                self._inflight_stores -= self._inflight_jobs.pop(result.job_id, 0)
+        return itertools.chain(skipped, done)
 
     def submit_store(self, job_metadata: JobMetadata) -> None:
         if self.disabled:
             # Nothing is written; completing the job releases the CPU pins.
             self._disabled_finished.append(job_metadata.job_id)
             return
+        n = len(job_metadata.keys)
         groups: dict[int, list[tuple[OffloadKey, int]]] = {}
         for key, bid in zip(job_metadata.keys, job_metadata.block_ids):
             groups.setdefault(get_offload_group_idx(key), []).append((key, int(bid)))
         tasks = [
             functools.partial(self._store_group, pages) for pages in groups.values()
         ]
-        self._pool.enqueue_store(job_metadata.job_id, len(tasks), tasks)
+        with self._stats_lock:
+            # Expired jobs release CPU pins, but their queued/active tasks
+            # retain physical capacity until every task has returned.
+            pending = max(self._inflight_stores, self._pool.pending_store_blocks)
+            if pending > 0 and pending + n > self._max_inflight:
+                self._stats["store_jobs_skipped_backpressure"] += 1
+                self._stats["store_blocks_skipped_backpressure"] += n
+                # Completing a skipped job releases its CPU pins.
+                self._disabled_finished.append(job_metadata.job_id)
+                return
+            self._inflight_stores += n
+            self._inflight_jobs[job_metadata.job_id] = n
+            self._pool.enqueue_store(job_metadata.job_id, len(tasks), tasks, n_blocks=n)
 
     def submit_load(self, job_metadata: JobMetadata) -> None:
         if self.disabled:

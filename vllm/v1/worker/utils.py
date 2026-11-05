@@ -26,6 +26,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    CircularBufferSpec,
     EncoderOnlyAttentionSpec,
     FullAttentionSpec,
     KVCacheConfig,
@@ -155,6 +156,34 @@ def _zero_kv_blocks_kernel(
     )
 
 
+@triton.jit
+def _copy_kv_blocks_kernel(
+    seg_addrs_ptr,
+    seg_block_strides_ptr,
+    seg_page_sizes_ptr,
+    src_ids_ptr,
+    dst_ids_ptr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Copy whole KV cache blocks across all segments (see the zero kernel)."""
+    pair_index = tl.program_id(0)
+    seg_index = tl.program_id(1)
+    chunk_index = tl.program_id(2)
+    page_size_el = tl.load(seg_page_sizes_ptr + seg_index)
+    chunk_offset = chunk_index.to(tl.int64) * BLOCK_SIZE
+    if chunk_offset >= page_size_el:
+        return
+    src_id = tl.load(src_ids_ptr + pair_index)
+    dst_id = tl.load(dst_ids_ptr + pair_index)
+    seg_addr = tl.load(seg_addrs_ptr + seg_index)
+    block_stride_el = tl.load(seg_block_strides_ptr + seg_index).to(tl.int64)
+    ptr = tl.cast(seg_addr, tl.pointer_type(tl.int32))
+    cols = chunk_offset + tl.arange(0, BLOCK_SIZE).to(tl.int64)
+    mask = cols < page_size_el
+    values = tl.load(ptr + src_id.to(tl.int64) * block_stride_el + cols, mask=mask)
+    tl.store(ptr + dst_id.to(tl.int64) * block_stride_el + cols, values, mask=mask)
+
+
 class KVBlockZeroer:
     """Manages efficient zeroing of KV cache blocks via a Triton kernel.
 
@@ -169,6 +198,14 @@ class KVBlockZeroer:
         self._meta: (
             tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int] | None
         ) = None
+        # Scheduler block count, set by the runner; copy_block_ids rejects
+        # block IDs outside it (the 6-field segment table has no per-segment
+        # bound, unlike upstream's).
+        self.num_blocks: int | None = None
+        # Cache layers whose storage no segment covers. Copies skip them, so a
+        # partial prefix-cache entry would leave their page stale (scratch
+        # rings are excluded: they are never copied by design).
+        self.uncovered_layers: list[str] = []
 
     def init_meta(
         self,
@@ -197,6 +234,8 @@ class KVBlockZeroer:
         seen_ptrs: dict[int, int] = {}
         seg_addrs: list[int] = []
         seg_page_sizes: list[int] = []
+        covered_storages: set[int] = set()
+        other_layers: list[tuple[str, int]] = []
 
         def add_segment(address: int, page_size_el: int) -> None:
             if (index := seen_ptrs.get(address)) is not None:
@@ -218,6 +257,7 @@ class KVBlockZeroer:
                 if isinstance(spec, FullAttentionSpec):
                     if not isinstance(kv, torch.Tensor):
                         continue
+                    covered_storages.add(kv.untyped_storage().data_ptr())
                     kernel_bs, ratio = _resolve_zeroer_kernel_layout(
                         spec,
                         kernel_block_sizes[group.kv_cache_group_id],
@@ -252,11 +292,22 @@ class KVBlockZeroer:
                     if not isinstance(first_state, torch.Tensor):
                         continue
                     dp = first_state.data_ptr()
+                    covered_storages.add(first_state.untyped_storage().data_ptr())
 
                     page_bytes = spec.page_size_bytes
                     assert page_bytes % 4 == 0
                     cur_page_el = page_bytes // 4
                     add_segment(dp, cur_page_el)
+                elif not isinstance(spec, CircularBufferSpec) and isinstance(
+                    kv, torch.Tensor
+                ):
+                    other_layers.append((layer_name, kv.untyped_storage().data_ptr()))
+
+        # A layer sharing a covered tensor (e.g. a DFlash drafter placed in a
+        # main-KV owner page) is copied with that tensor's segment.
+        self.uncovered_layers = [
+            name for name, storage in other_layers if storage not in covered_storages
+        ]
 
         if not seg_addrs:
             self._meta = None
@@ -295,6 +346,55 @@ class KVBlockZeroer:
             (max_page_size_el + blk_size - 1) // blk_size,
             blk_size,
             n_segs,
+        )
+
+    def copy_block_ids(self, pairs: list[tuple[int, int]]) -> None:
+        """Copy whole KV cache blocks (source, destination) in one launch."""
+        if not pairs:
+            return
+        if self._meta is None:
+            raise RuntimeError("KV block copies need initialized block metadata")
+        limit = self.num_blocks
+        for src_id, dst_id in pairs:
+            if (
+                src_id < 0
+                or dst_id < 0
+                or (limit is not None and (src_id >= limit or dst_id >= limit))
+            ):
+                raise ValueError(f"KV block copy {src_id}->{dst_id} out of range")
+        if self.uncovered_layers:
+            logger.warning_once(
+                "KV block copies do not cover layers %s; partial prefix-cache "
+                "hits resume them from stale pages.",
+                ", ".join(self.uncovered_layers),
+            )
+        (
+            seg_addrs,
+            seg_block_strides,
+            seg_page_sizes,
+            max_chunks,
+            blk_size,
+            n_segs,
+        ) = self._meta
+        src = async_tensor_h2d(
+            [p[0] for p in pairs],
+            dtype=torch.int64,
+            device=self.device,
+            pin_memory=self.pin_memory,
+        )
+        dst = async_tensor_h2d(
+            [p[1] for p in pairs],
+            dtype=torch.int64,
+            device=self.device,
+            pin_memory=self.pin_memory,
+        )
+        _copy_kv_blocks_kernel[(len(pairs), n_segs, max_chunks)](
+            seg_addrs,
+            seg_block_strides,
+            seg_page_sizes,
+            src,
+            dst,
+            BLOCK_SIZE=blk_size,
         )
 
     def zero_block_ids(self, block_ids: list[int]) -> None:

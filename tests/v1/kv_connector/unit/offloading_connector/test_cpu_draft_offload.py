@@ -926,6 +926,10 @@ def test_prometheus_counter_for_skipped_draft_blocks():
 # --------------------------------------------------- partial prefix cache
 
 
+@pytest.mark.skipif(
+    not hasattr(Scheduler, "_resolve_partial_prefix_hit"),
+    reason="needs the partial prefix cache",
+)
 @pytest.mark.parametrize("mode", MODES)
 def test_partial_prefix_hit_resolution(mode):
     """A partial prefix-cache hit (aligned local hit 128, partial 170) is

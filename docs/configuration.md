@@ -147,6 +147,87 @@ The AWQ checkpoint is 137 GB at the pinned revision:
 
 Allow extra disk space for compilation caches and the optional disk KV tier.
 
+<!-- BEGIN GENERATED: tools/gen_env_docs.py -->
+<!-- Edit tools/env_docs_notes.py, then run python tools/gen_env_docs.py -->
+
+## Environment variable reference
+
+Every variable below is read once per process (deployment scope). Columns:
+type and default as registered in `vllm/envs.py`; *Since* is the first
+release with the variable (1Cat = inherited from 1Cat-vLLM); *Category*
+is configuration, tuning, experimental, debug or deprecated.
+
+### Settings used by the reference deployment
+
+| Name | Type | Default | Range | Category | Since | Effect and trade-off |
+|---|---|---|---|---|---|---|
+| `VLLM_PLE_OFFLOAD_READY_TIMEOUT` | float | `600.0` | seconds | configuration | 1Cat | How long startup waits for the PLE offload worker. Raise it on slow storage; the reference deployment uses 1200. |
+| `VLLM_QWEN4EXP_PLE_HOST_GIB` | float \| None | `None` | GiB per TP rank; unset = automatic | configuration | 1Cat | Caps pinned host memory for the PLE table. Lower values leave host RAM for CPU KV offload but move more PLE rows to disk; the reference deployment uses 12. |
+| `VLLM_SM70_AWQ_MOE_INT4_ZERO` | bool | `False` | 0, 1 | experimental | 0.2.0 | Packs AWQ zero points into nibbles: less resident metadata, lossless. Needs compact metadata and a native build with the packed kernels. |
+| `VLLM_SM70_DFLASH2_FUSED_QKV_PACK` | bool | `False` | 0, 1 | configuration | 1Cat | One Triton launch instead of three copies and a concat in the DFlash2 verifier. Outputs are bitwise identical either way. |
+| `VLLM_SM70_FLASH_ATTN_V100` | bool | `True` | 0, 1 | configuration | 1Cat | Default on (set in the image). 0 only to diagnose backend selection; prefer --attention-backend to choose a backend. |
+| `VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH` | bool | `False` | 0, 1 | configuration | 1Cat | Set in the image: VLLM_COMPILE + FULL_AND_PIECEWISE with small decode captures (the 0.0.3 graph policy). |
+| `VLLM_SM70_QWEN_GDN_DISABLE_FULL_FORWARD` | bool | `False` | 0, 1 | configuration | 1Cat | Diagnostic: compare the split GDN compile boundary with the full-forward guard. The image sets 0. |
+| `VLLM_SM70_QWEN_GDN_FULL_FORWARD` | bool | `False` | 0, 1 | configuration | 1Cat | Diagnostic force-on of the opaque GDN full-forward boundary. The image sets 0; the automatic default arms it only for active MTP batches. |
+| `VLLM_SM70_QWEN_GDN_SPEC_CORE_OP` | bool | `False` | 0, 1 | experimental | 1Cat | Experimental narrower MTP boundary (only the recurrent core is opaque). The image sets 0 until it passes long-output quality. |
+
+### Values applied by the ReVolta profile
+
+The ReVolta profile (`vllm/revolta_profile.py`) sets these on SM70 + TP4 + FP16 + QSA models when they are unset; explicit values win. The profile column shows the value it applies (AWQ-only and NVFP4-only entries apply to that checkpoint family only).
+
+| Name | Type | Default | Profile | Range | Category | Since | Effect and trade-off |
+|---|---|---|---|---|---|---|---|
+| `VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS` | bool | `False` | `1` | 0, 1 | configuration | 1Cat | Opts out of the 1Cat SM70 MTP launch defaults; the ReVolta profile supplies its own. |
+| `VLLM_EARLY_MODEL_INPUTS` | bool | `False` | `1` | 0, 1 | experimental | 0.2.0 | Prepares model-state inputs before attention metadata in FULL graph steps, overlapping host work. |
+| `VLLM_PLE_ASYNC_REQUEST_INDICES` | bool | `False` | `1` | 0, 1 | experimental | 0.2.0 | Non-blocking PLE request-index transfers; removes a host wait per step. |
+| `VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP` | bool | `False` | `0` | 0, 1 | configuration | 1Cat | Shared-expert stream overlap. The profile sets 0 on TP4 SM70, where the second stream does not pay off. |
+| `VLLM_SM70_AWQ_QWEN38_GROUPED_QPN` | bool | `False` | `1` (AWQ) | 0, 1 | experimental | 0.2.0 | Grouped AWQ MoE decode reads each active expert once for all its rows (2..48). Faster at 2..8 requests; reduction order differs from the TurboMind route. |
+| `VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS` | int | `20` | `40` (AWQ) | 2..48 | tuning | 0.2.0 | Largest row count sent to the grouped route; above it rows use TurboMind. The profile uses 40 (8 requests x 5 tokens). |
+| `VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_PACK_ROWS` | int | `0` | `24` (AWQ) | 0 or 8..48 step 8 | tuning | 0.2.0 | Caps rows per expert pack: fewer registers per CTA but hot experts are read more than once. Result unchanged. |
+| `VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT` | int | `16` | `8` (AWQ) | 4, 8, 16 | tuning | 0.2.0 | W13 split-K warps per CTA. 16 matches the M1 arithmetic; 8 (profile) uses fewer threads and a different FP32 split association. |
+| `VLLM_SM70_AWQ_QWEN38_QPN_M1` | bool | `True` | `1` (AWQ) | 0, 1 | configuration | 1Cat | Single-token W13/W2 QPN route; 0 restores the legacy route. Changes reduction order. |
+| `VLLM_SM70_AWQ_TUNE_SMALL_SHAPES` | bool | `False` | `1` (AWQ) | 0, 1 | configuration | 1Cat | Tunes TurboMind small-M AWQ shapes at startup: longer warmup, faster small batches. |
+| `VLLM_SM70_CAR_VMM_SAFE` | bool | `False` | `1` (P2P/NVLink) | 0, 1 | experimental | 0.2.0 | Copies non-exportable (VMM) inputs into graph allocations while capturing custom all-reduce graphs, so expandable segments can stay on. Only with P2P or NVLink. |
+| `VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS` | bool | `True` | `0` (AWQ+DFlash2) | 0, 1 | configuration | 1Cat | Single-request DFlash2 verifier tail graphs. The AWQ DFlash profile sets 0 to keep the graph memory for the KV cache. |
+| `VLLM_SM70_GREEDY_VERIFY` | bool | `False` | `1` | 0, 1 | experimental | 0.2.0 | Greedy MTP verification from TP-local argmax pairs instead of full-vocabulary logits; only when every request is plain greedy. |
+| `VLLM_SM70_NVFP4_MOE_GROUPED_DECODE` | bool | `False` | `0` (NVFP4) | 0, 1 | experimental | 1Cat | Grouped native-NVFP4 decode; the profile keeps it off pending quality admission. |
+| `VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL` | bool | `True` | `1` (NVFP4) | 0, 1 | configuration | 1Cat | One grouped TurboMind call for all routed experts in prefill. |
+| `VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE` | bool | `False` | `1` (NVFP4) | 0, 1 | experimental | 1Cat | QPN for every live width 2..16 (NVFP4). |
+| `VLLM_SM70_NVFP4_QWEN38_MOE_RAW_GROUPED_DECODE` | bool | `False` | `1` (NVFP4) | 0, 1 | experimental | 0.2.0 | Graph-safe raw-E4M3 grouped NVFP4 MoE for M = 2..40; needs RAW_SCALE storage. |
+| `VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE` | bool | `False` | `1` (NVFP4) | 0, 1 | experimental | 1Cat | Keeps E4M3 block-scale codes resident instead of a second FP16 copy: less memory, decode reconstructs exact values. |
+| `VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES` | bool | `True` | `1` (NVFP4) | 0, 1 | configuration | 1Cat | Tunes small NVFP4 shapes at startup. |
+| `VLLM_SM70_NVFP4_TURBOMIND` | bool | `True` | `1` (NVFP4) | 0, 1 | configuration | 1Cat | TurboMind route for NVFP4/MXFP4 dense layers; 0 only for diagnosis. |
+| `VLLM_SM70_PLE_INPUT_PREPARE` | bool | `False` | `1` | 0, 1 | experimental | 0.2.0 | One fused launch for PLE n-gram context gathering (<=4 requests). |
+| `VLLM_SM70_PLE_NGRAM_BATCH` | bool | `False` | `1` | 0, 1 | experimental | 0.2.0 | Fused PLE n-gram id preprocessing for 2..32 rows. |
+| `VLLM_SM70_PLE_PREFILL_CONV_CHUNK` | bool | `False` | `1` | 0, 1 | experimental | 0.2.0 | Bounds PLE short-conv prefill buffers when several prefills share a step; needed at max_num_seqs=8. Outputs are bitwise identical either way. |
+| `VLLM_SM70_QSA_COMPACT_TOPK` | bool | `False` | `1` | 0, 1 | experimental | 0.2.0 | Coarse FP16 pre-selection before the exact QSA top-k for <=32 rows and long contexts; same indices. |
+| `VLLM_SM70_QSA_REQUEST_SEGMENTS` | bool | `False` | `1` | 0, 1 | experimental | 0.2.0 | Reads each 64-key tile once per request segment in multi-request decode. Outputs are bitwise identical either way. |
+| `VLLM_SM70_QSA_SHARED_KEY` | bool | `False` | `1` | 0, 1 | experimental | 0.2.0 | Shared-key FP16 indexer for M2..8 verification queries of one request. |
+| `VLLM_SM70_QWEN38_GDN_NO_PACK` | bool | `False` | `1` | 0, 1 | experimental | 0.2.0 | Skips the packed GDN weight copy (725.6 MiB per TP4 rank) and serves 2..48 rows with the skinny dual GEMM; frees memory for KV. |
+| `VLLM_SM70_QWEN38_HYBRID_PLE` | bool | `False` | `0` | 0, 1 | configuration | 1Cat | Local pinned PLE shards for decode. The profile sets 0 (single PLE placement) on the reference deployment. |
+| `VLLM_SM70_QWEN38_WIDE_M` | bool | `False` | `1` | 0, 1 | experimental | 0.2.0 | Widens Qwen3.8 decode/verify routes from 4 to 8 requests (M up to 40); each VLLM_SM70_QWEN38_WIDE_M_* item can override it. |
+| `VLLM_SM70_SKIP_REJECTED_BATCH_PACKS` | bool | `False` | `1` | 0, 1 | experimental | 0.2.0 | Skips batch packs the precision policy never admits; saves about 199 MiB per rank. |
+| `VLLM_USE_AOT_COMPILE` | bool | `False` | `0` | 0, 1 | configuration | 1Cat | AOT compile reuse. The profile sets 0 on the reference deployment. |
+| `VLLM_V2_CUDAGRAPH_MEM_MIB` | str | `0.0` | `700` (AWQ), `1200` (AWQ+DFlash2), `700` (NVFP4) | MiB | configuration | 1Cat | CUDA graph memory reserved before sizing the KV cache (MRv2 does not profile it). Too low risks OOM at capture; too high wastes KV. Profile: 700 (AWQ, NVFP4), 1200 (AWQ + DFlash2). |
+
+### speculative_config.sm70_dflash2 keys
+
+Pass these inside `--speculative-config '{..., "sm70_dflash2": {...}}'`
+(see [DFlash2](dflash2.md)). `None` selects the model-qualified policy;
+operator shape, dtype and native checks still decide each dispatch.
+
+| Key | Type | Default | Effect and trade-off |
+|---|---|---|---|
+| `context_kv_graph` | bool \| None | `None` | Capture the drafter's context-KV writes in CUDA graphs per token count instead of running them eagerly. |
+| `context_pipeline` | bool \| None | `None` | Pipeline the drafter context-KV refresh with the verifier; accepted slots are refreshed before each replay. |
+| `fused_gdn_metadata` | bool \| None | `None` | Build the GDN verify metadata with one fused launch. |
+| `fused_smallq_metadata` | bool \| None | `None` | Fused Flash-V100 metadata for small-query verify batches. |
+| `grouped_smallq_metadata` | bool \| None | `None` | Grouped small-query Flash-V100 metadata across requests. |
+| `spec_state_replay` | bool \| None | `None` | Replay the accepted prefix to rebuild recurrent state instead of storing every speculative state: more GPU KV capacity at a small per-step cost. Off by default since 0.1.4; see [State replay](dflash2.md#state-replay-optional). |
+| `verify_fastpath` | bool \| None | `None` | Fast metadata path for verify steps in the hybrid (GDN + attention) model state. |
+
+<!-- END GENERATED: tools/gen_env_docs.py -->
+
 ## See also
 
 - [Reference launch tutorial](getting-started.md)

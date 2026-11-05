@@ -24,17 +24,8 @@ PREFIXES = ("VLLM_", "REVOLTA_")
 
 # Direct reads that existed when this check was added. Register them in
 # vllm/envs.py (or delete them) and drop them from this list over time; do not
-# add new entries. The REVOLTA_* entries are the 0.2.0rc4 research switches;
-# 0.2.0rc5 renames them to registered VLLM_SM70_* names and keeps the old
-# names for one release as deprecated aliases.
-BASELINE: frozenset[str] = frozenset(
-    {
-        "REVOLTA_GDN_CPU_SPEC_QSL",
-        "REVOLTA_GDN_CPU_SPEC_QSL_CHECK_FILE",
-        "REVOLTA_QSA_GROUPED_LPT",
-        "REVOLTA_SKINNY_MPLAN",
-    }
-)
+# add new entries.
+BASELINE: frozenset[str] = frozenset()
 
 NATIVE_SUFFIXES = {".c", ".cc", ".cpp", ".cu", ".cuh", ".h", ".hpp"}
 

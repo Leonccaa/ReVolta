@@ -97,6 +97,11 @@ def render() -> str:
     missing = sorted(set(NOTES) - set(metadata))
     if missing:
         raise SystemExit(f"notes for unregistered variables: {missing}")
+    untyped = sorted(set(NOTES) - set(types))
+    if untyped:
+        raise SystemExit(
+            f"add TYPE_CHECKING annotations in vllm/envs.py for: {untyped}"
+        )
     lines = [
         BEGIN,
         "<!-- Edit tools/env_docs_notes.py, then run python tools/gen_env_docs.py -->",
@@ -129,7 +134,7 @@ def render() -> str:
                 effect += f" Metrics: {note['metrics']}."
             row = [
                 f"`{name}`",
-                cell(types.get(name, "str")),
+                cell(types[name]),
                 f"`{cell(meta['declared_default'])}`",
             ]
             if key == "profile":

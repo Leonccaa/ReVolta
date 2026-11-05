@@ -18,7 +18,6 @@ for every M, so each row's result is independent of the batch width.
 
 from __future__ import annotations
 
-import os
 from functools import lru_cache
 from typing import NamedTuple
 
@@ -50,14 +49,14 @@ class SkinnyConfig(NamedTuple):
 # Plan for the fused N = 4096 + 24, K = 2560 launch; one plan for every M.
 PLAN = SkinnyConfig(1, 1, 2, 1)
 
-# Research (default off): REVOLTA_SKINNY_MPLAN=1 picks the column tiling by M.
+# VLLM_SM70_GDN_SKINNY_MPLAN (default off) picks the column tiling by M.
 # Only ng changes; warps_k and splits (the K partition, hence every row's
 # summation order) stay those of PLAN, so outputs are bit-identical to PLAN
 # and still independent of the batch width. Measured on one V100 (one TP4
 # rank's shapes, M = 2..48, all nine (ng, warps_n) choices byte-equal to
 # PLAN): ng=2 is 8-26% faster for M = 9..24 and 33..48, within 1-2% for
 # M <= 8 (kept at PLAN) and slower for M = 25..32 (kept at PLAN).
-_SKINNY_MPLAN = os.getenv("REVOLTA_SKINNY_MPLAN", "0") == "1"
+_SKINNY_MPLAN = envs.VLLM_SM70_GDN_SKINNY_MPLAN
 _PLAN_NG2 = SkinnyConfig(2, 1, 2, 1)
 
 

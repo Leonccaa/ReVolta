@@ -2199,10 +2199,10 @@ def _qsa_sparse_paged_attention_sm70_grouped_page4(
     return out
 
 
-# Research (default off): launch grouped page4 CTAs in descending planned
-# work (REVOLTA_QSA_GROUPED_LPT=1). Bit-identical by construction: the
-# kernel reads and writes only per-group data.
-_SM70_QSA_GROUPED_LPT = os.getenv("REVOLTA_QSA_GROUPED_LPT", "0") == "1"
+# VLLM_SM70_QSA_GROUPED_LPT (default off): launch grouped page4 CTAs in
+# descending planned work. Bit-identical by construction: the kernel reads and
+# writes only per-group data.
+_SM70_QSA_GROUPED_LPT = envs.VLLM_SM70_QSA_GROUPED_LPT
 
 
 def _qsa_grouped_lpt_permute(

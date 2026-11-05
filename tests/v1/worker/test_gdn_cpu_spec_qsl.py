@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""REVOLTA_GDN_CPU_SPEC_QSL must not change any GDN spec metadata value."""
+"""VLLM_SM70_GDN_CPU_SPEC_QSL must not change any GDN spec metadata value."""
 
 import random
 

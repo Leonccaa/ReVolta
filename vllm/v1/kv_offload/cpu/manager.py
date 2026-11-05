@@ -287,6 +287,15 @@ class CPUOffloadingManager(OffloadingManager):
         self._free_list.clear()
         self._num_allocated_blocks = 0
 
+    def is_ready_resident(self, key: OffloadKey) -> bool:
+        """Resident and readable; no recency, admission-counter or ref change."""
+        block = self._policy.get(key)
+        return block is not None and block.is_ready
+
+    def is_demoted(self, key: OffloadKey) -> bool:
+        """Demoted (superseded) and not touched since; read-only."""
+        return key in self._demoted
+
     def resident_keys(self) -> list[OffloadKey]:
         """Snapshot without touching recency or lookup/admission counters."""
         if isinstance(self._policy, LRUCachePolicy):

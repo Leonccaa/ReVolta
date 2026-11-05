@@ -1991,6 +1991,8 @@ class OffloadingConnectorScheduler:
             return False, None
         if self.config.demote_superseded_states:
             self._demote_superseded_states(req_status)
+        if getattr(self.manager, "state_latest_only", False) is True:
+            self._drop_superseded_state_writes(req_status)
         # Blocks are freed right after this call; a store for a still
         # pending boundary offer could not be issued before block reuse.
         self._drop_pending_boundary_offloads(req_status, "request finished")
@@ -2101,6 +2103,43 @@ class OffloadingConnectorScheduler:
         if keys:
             self.num_demoted_states = getattr(self, "num_demoted_states", 0) + len(keys)
             self.manager.demote(keys, req_status.req_context)
+
+    def _drop_superseded_state_writes(self, req_status: RequestOffloadState) -> None:
+        """state_latest_only (secondary tiers with delayed writes): of the
+        recurrent states this request stored, only the newest is written to
+        the secondary tier; the older ones (tail / resend checkpoints the CPU
+        tier keeps on purpose) and the state at the hit point it extended are
+        dropped from the pending write queues. CPU residency is unchanged.
+        The junction and the prefix-hit states of other active requests are
+        never dropped."""
+        in_use = self._hit_states_of_others(req_status)
+        junction = req_status.req.shared_prefix_boundary
+        keys: list[OffloadKey] = []
+        for group_config in self.config.kv_group_configs:
+            if group_config.sliding_window_size_in_blocks != 1:
+                continue
+            if not group_config.requires_exact_boundary_source:
+                continue
+            stored = req_status.stored_state_blocks.get(group_config.group_idx)
+            if not stored:
+                continue
+            group_keys = req_status.group_states[group_config.group_idx].offload_keys
+            hit = req_status.group_states[group_config.group_idx].num_hit_blocks
+            latest = max(stored)
+            older = {b for b in stored if b != latest}
+            if 0 < hit <= latest:
+                older.add(hit - 1)
+            for b in sorted(older):
+                if (
+                    bool(junction)
+                    and (b + 1) * group_config.offloaded_block_size == junction
+                ):
+                    continue
+                if b < len(group_keys) and group_keys[b] not in in_use:
+                    keys.append(group_keys[b])
+        drop = getattr(self.manager, "drop_pending_secondary_writes", None)
+        if keys and drop is not None:
+            drop(keys)
 
     def take_events(self) -> Iterable[KVCacheEvent]:
         """Take the KV cache events from the connector.

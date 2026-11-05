@@ -43,6 +43,7 @@ from vllm.v1.kv_offload.tiering.base import (
     JobResult,
     SecondaryTierManager,
 )
+from vllm.v1.kv_offload.tiering.delayed_write import VOLUME_FILE
 from vllm.v1.kv_offload.tiering.fs.identity import (
     PAGE_FORMAT,
     canonical_digest,
@@ -361,8 +362,19 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
         drain_timeout_s: float = 30.0,
         max_io_retries: int = 2,
         max_inflight_store_blocks: int = 0,
+        write_delay_s: float = 300.0,
+        write_warn_bytes_24h: int = 10**12,
+        state_latest_only: bool = False,
         **kwargs,
     ):
+        # Delayed write-through (tiering/delayed_write.py; Leon 2026-11-05:
+        # 5 minutes by default, 24 h written-bytes warning at 1.0 TB, log only,
+        # "state latest only" off). write_delay_s=0 keeps the immediate cascade.
+        if write_delay_s < 0 or write_warn_bytes_24h < 0:
+            raise ValueError("write_delay_s and write_warn_bytes_24h must be >= 0")
+        self.write_delay_s = float(write_delay_s)
+        self.write_warn_bytes_24h = int(write_warn_bytes_24h)
+        self.state_latest_only = bool(state_latest_only)
         self._stats_lock = threading.Lock()
         self._stats: dict[str, int] = {
             "pages_written": 0,
@@ -602,6 +614,19 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
     def _count(self, name: str, n: int = 1) -> None:
         with self._stats_lock:
             self._stats[name] += n
+
+    def delayed_write_config(self) -> dict | None:
+        """Read by TieringOffloadingManager; None keeps the immediate cascade
+        (also for a disabled tier: it never writes)."""
+        if self.disabled or self.write_delay_s <= 0:
+            return None
+        return {
+            "delay_s": self.write_delay_s,
+            "page_bytes": self._block_size,
+            "volume_path": os.path.join(self._root_dir, VOLUME_FILE),
+            "warn_bytes_24h": self.write_warn_bytes_24h,
+            "state_latest_only": self.state_latest_only,
+        }
 
     def get_revolta_stats(self) -> dict[str, int]:
         with self._stats_lock:

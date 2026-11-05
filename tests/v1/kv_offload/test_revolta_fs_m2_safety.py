@@ -447,6 +447,7 @@ def test_expired_physical_job_does_not_retain_cpu_pins(tmp_path, monkeypatch):
         max_inflight_store_blocks=1,
         store_timeout_s=1,
         drain_timeout_s=0,
+        write_delay_s=0,  # immediate write-through: this test pins on complete_store
     )
     primary = CPUPrimaryTierOffloadingManager(2, _mock_mmap_region(2))
     manager = TieringOffloadingManager(primary, [tier])

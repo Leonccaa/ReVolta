@@ -241,6 +241,17 @@ tier entry is the part after `ssd.`):
 | `ssd.drain_timeout_s` | float | `30` | `>= 0` | deployment | At shutdown, queued page writes keep running for up to this time; the rest are dropped. Must fit in the engine's shutdown time. | 0.2 | experimental |
 | `ssd.max_io_retries` | int | `2` | `>= 0` | deployment | Retries of a page read or write after a transient error (`EAGAIN`, `EINTR`, `EBUSY`, `ESTALE`, `ETIMEDOUT`, `EIO`), with interruptible backoff capped at one second and the remaining job budget. Checksum failures are not retried. | 0.2 | experimental |
 | `ssd.max_inflight_store_blocks` | int | `0` (auto) | `>= 0` | deployment | Admission counts physical queued and active pages even after timed-out jobs release CPU pins. New jobs are skipped when they would exceed this limit. A single job may exceed the limit when the tier is empty. Auto is a quarter of the CPU pool's blocks, at least 64. | 0.2 | experimental |
+| `ssd.write_delay_s` | float | `300` | `>= 0` | deployment | Wait before cascading CPU rows to disk. Only keys are queued; CPU rows remain evictable. At the deadline, write only rows still resident, ready and not demoted, resolving CPU slots again by key. `0` keeps immediate cascading. A longer delay can avoid superseded writes but leaves fewer rows durable before a crash. | 0.2 | experimental |
+| `ssd.write_warn_bytes_24h` | int | `1000000000000` (1 TB) | `>= 0`, `0` disables warnings | deployment | Warn at most hourly when the rolling 24-hour submitted page-byte estimate exceeds this threshold. Grouped pools sharing a root share the persisted count. This is a log-only warning: writes continue. It is not a physical SSD write or endurance counter. Applies to delayed writes. | 0.2 | experimental |
+| `ssd.state_latest_only` | bool | `false` | `true`, `false` | deployment | With delayed writes, discard a finished request's older recurrent-state keys from pending writes, keeping its newest state, shared junction and states other active requests resume from. CPU residency is unchanged. Leave disabled to retain the normal pending-state selection. | 0.2 | experimental |
+
+Delayed queues are serviced on engine steps and while the engine is idle, with an
+idle polling interval of up to one second. At shutdown, still-live pending rows are
+submitted newest first within the tier's existing bounded drain. Rows evicted or
+demoted before their deadline are skipped; no CPU slot is pinned during the delay.
+These options belong in the `revolta_fs` tier entry without the `ssd.` prefix, for
+example `"write_delay_s": 300`, `"write_warn_bytes_24h": 1000000000000` and
+`"state_latest_only": false`.
 
 When store timeouts are configured, the deadline covers the entire store job,
 including time in the queue. Completion polling reports overdue jobs as failed
@@ -257,7 +268,17 @@ deployment, with or without a disk tier.
 Counters of a `revolta_fs` tier (pages written, existing, verified, checksum
 failures, pages skipped after a failure in the same chain, modification-time updates,
 retries, write jobs skipped because the disk was behind, timed-out writes)
-are logged when the engine shuts down.
+are logged when the engine shuts down. With delayed writes enabled, the manager
+also logs `Delayed writes (...)` and `SSD tier stats (...)` at most once every
+60 seconds when it services persistence. The latter reports cumulative
+`verified_load_pages` and `verified_load_bytes`: pages successfully read back from
+the SSD tier after CRC32C and identity verification, and their full page bytes.
+Grouped pools report their own tier counters; these are not unique prompt tokens.
+The external prefix-hit counters combine CPU and SSD hits, so they cannot provide
+an exact SSD share of prompt tokens. These SSD counters are log output, not a
+Prometheus endpoint or a prompt-token hit rate. The delayed queue's `written` and
+`written_bytes_24h` count submitted rows and page bytes, which may still fail or be
+skipped by the disk tier; they do not prove successful physical writes.
 
 ## See also
 

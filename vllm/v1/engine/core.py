@@ -1411,12 +1411,26 @@ class EngineCoreProc(EngineCore):
                     logger.debug("EngineCore waiting for work.")
                     waited = True
             block = self.process_input_queue_block
+            connector = self.scheduler.get_kv_connector()
+            persistence_pending = (
+                connector is not None
+                and getattr(connector, "has_pending_persistence", lambda: False)()
+            )
             try:
                 with get_watch_dog().disable():
-                    req = self.input_queue.get(block=block)
+                    if block and persistence_pending:
+                        req = self.input_queue.get(timeout=1.0)
+                    else:
+                        req = self.input_queue.get(block=block)
                 self._handle_client_request(*req)
                 get_watch_dog().feed()
             except queue.Empty:
+                if persistence_pending:
+                    # All policy mutation and completion polling stays on the
+                    # scheduler thread, including when there are zero requests.
+                    persistence_step = getattr(connector, "persistence_step", None)
+                    if persistence_step is not None:
+                        persistence_step()
                 break
             if not block:
                 break

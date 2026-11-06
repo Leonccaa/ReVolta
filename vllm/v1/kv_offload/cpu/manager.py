@@ -287,6 +287,15 @@ class CPUOffloadingManager(OffloadingManager):
         self._free_list.clear()
         self._num_allocated_blocks = 0
 
+    def is_ready_resident(self, key: OffloadKey) -> bool:
+        """Resident and readable; no recency, admission-counter or ref change."""
+        block = self._policy.get(key)
+        return block is not None and block.is_ready
+
+    def is_demoted(self, key: OffloadKey) -> bool:
+        """Demoted (superseded) and not touched since; read-only."""
+        return key in self._demoted
+
     def resident_keys(self) -> list[OffloadKey]:
         """Snapshot without touching recency or lookup/admission counters."""
         if isinstance(self._policy, LRUCachePolicy):
@@ -360,6 +369,44 @@ class GroupedCPUOffloadingManager(OffloadingManager):
     def on_request_finished(self, req_context: ReqContext) -> None:
         for manager in self.managers.values():
             manager.on_request_finished(req_context)
+
+    @property
+    def state_latest_only(self) -> bool:
+        """Any group's tiering manager has a state_latest_only tier."""
+        return any(
+            getattr(m, "state_latest_only", False) is True
+            for m in self.managers.values()
+        )
+
+    def drop_pending_secondary_writes(self, keys: Collection[OffloadKey]) -> int:
+        dropped = 0
+        for group_idx, group_keys in self._partition(keys).items():
+            drop = getattr(
+                self.managers[group_idx], "drop_pending_secondary_writes", None
+            )
+            if drop is not None:
+                dropped += drop(group_keys)
+        return dropped
+
+    def has_pending_delayed_writes(self) -> bool:
+        return any(
+            bool(getattr(m, "has_pending_delayed_writes", lambda: False)())
+            for m in self.managers.values()
+        )
+
+    def delayed_write_step(self) -> None:
+        for manager in self.managers.values():
+            step = getattr(manager, "delayed_write_step", None)
+            if step is not None:
+                step()
+
+    def delayed_write_stats(self) -> dict[str, dict[str, int]]:
+        out: dict[str, dict[str, int]] = {}
+        for group_idx, manager in self.managers.items():
+            stats = getattr(manager, "delayed_write_stats", None)
+            for tier, values in (stats() if stats is not None else {}).items():
+                out[f"{tier}[group {group_idx}]"] = values
+        return out
 
     def shutdown(self) -> None:
         for manager in self.managers.values():

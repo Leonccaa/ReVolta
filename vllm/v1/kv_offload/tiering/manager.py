@@ -20,6 +20,7 @@ Key Design Principles:
    protecting blocks from eviction until complete_read() is called
 """
 
+import time
 from collections import defaultdict
 from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass, field
@@ -45,6 +46,7 @@ from vllm.v1.kv_offload.tiering.base import (
     JobMetadata,
     SecondaryTierManager,
 )
+from vllm.v1.kv_offload.tiering.delayed_write import DelayedWriteQueue, WriteVolume
 
 logger = init_logger(__name__)
 
@@ -167,6 +169,40 @@ class TieringOffloadingManager(OffloadingManager):
         self._request_level_tiers: defaultdict[str, set[SecondaryTierManager]] = (
             defaultdict(set)
         )
+
+        # Delayed write-through (see tiering/delayed_write.py): tiers that
+        # return a delayed_write_config() get a queue; others keep the
+        # immediate cascade unchanged.
+        self._delayed: dict[SecondaryTierManager, DelayedWriteQueue] = {}
+        # Drop superseded-but-protected request states from the queues (the
+        # scheduler calls drop_pending_secondary_writes on request finish).
+        self.state_latest_only: bool = False
+        for tier in self.secondary_tiers:
+            config_fn = getattr(tier, "delayed_write_config", None)
+            config = config_fn() if callable(config_fn) else None
+            if config is None:
+                continue
+            volume = None
+            if config.get("volume_path"):
+                volume = WriteVolume.shared(
+                    config["volume_path"], config["warn_bytes_24h"]
+                )
+            self._delayed[tier] = DelayedWriteQueue(
+                delay_s=float(config["delay_s"]),
+                page_bytes=int(config["page_bytes"]),
+                volume=volume,
+            )
+            logger.info(
+                "%s: delayed write-through %.0f s (CPU rows are not pinned while "
+                "waiting), 24 h write warning at %d bytes, state latest only: %s",
+                tier.tier_type,
+                float(config["delay_s"]),
+                config.get("warn_bytes_24h", 0),
+                bool(config.get("state_latest_only")),
+            )
+            self._delayed[tier].latest_only = bool(config.get("state_latest_only"))
+            self.state_latest_only |= self._delayed[tier].latest_only
+        self._delayed_logged_at: float = time.monotonic()
 
     def _next_job_id(self) -> JobId:
         """Generate a unique job ID for async transfer tracking."""
@@ -511,26 +547,105 @@ class TieringOffloadingManager(OffloadingManager):
         # eviction during the async transfer). One prepare_read() call per
         # secondary tier.
         for tier in self.secondary_tiers:
-            primary_blocks_spec = self.primary_tier.prepare_read(keys, req_context)
-
-            # Submit async store job: primary→secondary
-            job_id = self._next_job_id()
-
-            # Track this store job
-            assert isinstance(primary_blocks_spec, CPULoadStoreSpec)
-            job_metadata = JobMetadata(
-                job_id=job_id,
-                keys=keys,
-                block_ids=primary_blocks_spec.block_ids,
-                is_promotion=False,
-                req_context=req_context,
-            )
-            self._transfer_jobs[job_id] = job_metadata
-
-            tier.submit_store(job_metadata)
+            queue = self._delayed.get(tier)
+            if queue is not None:
+                # Delayed: remember the keys only. The CPU blocks are not
+                # pinned, so the CPU policy may evict them meanwhile.
+                queue.enqueue(keys, req_context)
+                continue
+            self._submit_cascade(tier, keys, req_context)
 
         # Note: The async transfers are now in flight. Their completion is
         # tracked via get_finished_jobs() / _maybe_process_finished_jobs().
+
+    def _submit_cascade(
+        self,
+        tier: SecondaryTierManager,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> None:
+        """primary.prepare_read() (pins the CPU blocks) + tier.submit_store()."""
+        primary_blocks_spec = self.primary_tier.prepare_read(keys, req_context)
+
+        # Submit async store job: primary→secondary
+        job_id = self._next_job_id()
+
+        # Track this store job
+        assert isinstance(primary_blocks_spec, CPULoadStoreSpec)
+        job_metadata = JobMetadata(
+            job_id=job_id,
+            keys=keys,
+            block_ids=primary_blocks_spec.block_ids,
+            is_promotion=False,
+            req_context=req_context,
+        )
+        self._transfer_jobs[job_id] = job_metadata
+
+        tier.submit_store(job_metadata)
+
+    def _write_delayed(self, tier: SecondaryTierManager, batches) -> None:
+        """Write the still-live keys of due batches (one job per batch, the
+        original prefix-chain order kept). Block IDs are resolved again by key
+        in prepare_read(): a CPU slot reused meanwhile is never written under
+        the old key."""
+        queue = self._delayed[tier]
+        for batch in batches:
+            live = queue.select(
+                batch, self.primary_tier.is_ready_resident, self.primary_tier.is_demoted
+            )
+            if not live:
+                continue
+            queue.account(live)
+            self._submit_cascade(tier, live, batch.req_context)
+
+    def flush_delayed_writes(self) -> None:
+        """Write every due batch (called once per engine step)."""
+        for tier, queue in self._delayed.items():
+            due = queue.take_due()
+            if due:
+                self._write_delayed(tier, due)
+        now = time.monotonic()
+        if self._delayed and now - self._delayed_logged_at >= 60:
+            self._delayed_logged_at = now
+            for tier, queue in self._delayed.items():
+                logger.info("Delayed writes (%s): %s", tier.tier_type, queue.summary())
+                read_stats = getattr(tier, "get_revolta_stats", None)
+                if read_stats is not None:
+                    stats = read_stats()
+                    loaded = stats["pages_verified"]
+                    logger.info(
+                        "SSD tier stats (%s): verified_load_pages=%d "
+                        "verified_load_bytes=%d stats=%s",
+                        tier.tier_type,
+                        loaded,
+                        loaded * int(getattr(tier, "_block_size", 0)),
+                        stats,
+                    )
+
+    def has_pending_delayed_writes(self) -> bool:
+        """Delayed rows queued, or cascades to secondary tiers still in flight
+        (their CPU pins are released when the completion is polled)."""
+        if not self._delayed:
+            return False
+        return any(q.depth for q in self._delayed.values()) or any(
+            not job.is_promotion for job in self._transfer_jobs.values()
+        )
+
+    def delayed_write_step(self) -> None:
+        """Idle-engine service on the scheduler thread (no engine step runs)."""
+        self._process_finished_jobs()
+        self.flush_delayed_writes()
+
+    def drop_pending_secondary_writes(self, keys: Collection[OffloadKey]) -> int:
+        """Do not write these pending keys to tiers with state_latest_only."""
+        return sum(
+            queue.drop(keys, "latest")
+            for queue in self._delayed.values()
+            if queue.latest_only
+        )
+
+    def delayed_write_stats(self) -> dict[str, dict[str, int]]:
+        return {tier.tier_type: q.summary() for tier, q in self._delayed.items()}
 
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         """
@@ -580,6 +695,8 @@ class TieringOffloadingManager(OffloadingManager):
 
         self._flush_pending_promotions()
 
+        self.flush_delayed_writes()
+
         # Reset the per-step gate so next step's first call does real work.
         self._processed_jobs_this_step = False
 
@@ -591,6 +708,24 @@ class TieringOffloadingManager(OffloadingManager):
 
     def shutdown(self) -> None:
         """Shutdown all tiers and release resources."""
+        # Pending delayed writes that are still live are submitted now, the
+        # newest first; the tier's own bounded drain (drain_timeout_s) writes
+        # what it can and drops the rest, so this never prolongs shutdown
+        # beyond that bound.
+        for tier, queue in self._delayed.items():
+            pending = queue.take_all_newest_first()
+            if pending:
+                before = queue.stats["written"]
+                self._write_delayed(tier, pending)
+                logger.info(
+                    "%s: submitted %d delayed rows at shutdown (bounded by the "
+                    "tier's drain timeout)",
+                    tier.tier_type,
+                    queue.stats["written"] - before,
+                )
+            if queue.volume is not None:
+                queue.volume.persist()
+            logger.info("Delayed writes (%s): %s", tier.tier_type, queue.summary())
         for tier in self.secondary_tiers:
             tier.shutdown()
         self.primary_tier.shutdown()

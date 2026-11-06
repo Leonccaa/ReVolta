@@ -35,9 +35,9 @@ SM70_DFLASH2_VERIFIER_DEFAULTS = {
 }
 
 # What spec_state_replay=None means. One line to flip the release default;
-# explicit True or False always wins. Off from 0.1.4: replay is an opt-in for
-# more KV capacity (long contexts), at a small per-step cost.
-SM70_DFLASH2_SPEC_STATE_REPLAY_DEFAULT = False
+# supported ordinary routes replay by default for more KV capacity, at a small
+# per-step cost. Explicit choices and packed-verifier precedence remain intact.
+SM70_DFLASH2_SPEC_STATE_REPLAY_DEFAULT = True
 
 SM70_DFLASH2_LEGACY_FIELDS = {
     "VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY": "fused_gdn_verify",
@@ -130,7 +130,7 @@ class Sm70DFlash2Config:
     state; once the accepted count is known, the same kernel launch is replayed
     into the request's state block. Each running request then holds 2 instead
     of 2 + num_speculative_tokens state blocks per GDN cache group. None (the
-    default) follows SM70_DFLASH2_SPEC_STATE_REPLAY_DEFAULT (off); when that is
+    default) follows SM70_DFLASH2_SPEC_STATE_REPLAY_DEFAULT (on); when that is
     on, it enables replay wherever it is supported, but yields to a packed
     verifier (fused_gdn_verify) enabled by the qualified policy or explicitly.
     True overrides an automatic packed default; explicitly enabling both

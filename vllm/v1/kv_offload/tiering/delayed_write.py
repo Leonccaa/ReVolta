@@ -15,7 +15,7 @@ reused CPU slot is never written under an old key.
 Also:
   * a rolling 24 h written-bytes count persisted under the tier root; above a
     threshold a WARNING is logged (at most hourly) and a counter is raised.
-    Writes are never refused (Leon 2026-11-05: log only);
+    Writes are never refused;
   * explicit drops (``drop``), used for "state latest only".
 """
 

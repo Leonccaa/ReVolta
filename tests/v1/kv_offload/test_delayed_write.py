@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Delayed write-through from the CPU tier to a secondary tier (rc6 design,
-2026-11-05): queue semantics, manager integration, revolta_fs options,
+"""Delayed write-through from the CPU tier to a secondary tier:
+queue semantics, manager integration, revolta_fs options,
 shutdown flush, 24 h written-bytes warning and the state_latest_only hook."""
 
 import json

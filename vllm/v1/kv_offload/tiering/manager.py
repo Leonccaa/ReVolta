@@ -609,6 +609,18 @@ class TieringOffloadingManager(OffloadingManager):
             self._delayed_logged_at = now
             for tier, queue in self._delayed.items():
                 logger.info("Delayed writes (%s): %s", tier.tier_type, queue.summary())
+                read_stats = getattr(tier, "get_revolta_stats", None)
+                if read_stats is not None:
+                    stats = read_stats()
+                    loaded = stats["pages_verified"]
+                    logger.info(
+                        "SSD tier stats (%s): verified_load_pages=%d "
+                        "verified_load_bytes=%d stats=%s",
+                        tier.tier_type,
+                        loaded,
+                        loaded * int(getattr(tier, "_block_size", 0)),
+                        stats,
+                    )
 
     def has_pending_delayed_writes(self) -> bool:
         """Delayed rows queued, or cascades to secondary tiers still in flight

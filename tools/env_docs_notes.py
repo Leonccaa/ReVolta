@@ -902,6 +902,8 @@ DFLASH2_NOTES: dict[str, str] = {
     "requests.",
     "spec_state_replay": "Replay the accepted prefix to rebuild recurrent state "
     "instead of storing every speculative state: more GPU KV capacity at a "
-    "small per-step cost. Off by default since 0.1.4; see "
+    "small per-step cost. On by default in current development for supported "
+    "ordinary DFlash2 routes; released 0.1.4–0.1.5 require explicit true. "
+    "None retains an enabled packed verifier, and explicit false disables replay. See "
     "[State replay](dflash2.md#state-replay-optional).",
 }

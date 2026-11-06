@@ -317,7 +317,7 @@ operator shape, dtype and native checks still decide each dispatch.
 | `fused_gdn_metadata` | bool \| None | `None` | Build the GDN verify metadata with one fused launch. |
 | `fused_smallq_metadata` | bool \| None | `None` | Fused Flash-V100 metadata for small-query verify batches. |
 | `grouped_smallq_metadata` | bool \| None | `None` | Grouped small-query Flash-V100 metadata across requests. |
-| `spec_state_replay` | bool \| None | `None` | Replay the accepted prefix to rebuild recurrent state instead of storing every speculative state: more GPU KV capacity at a small per-step cost. Off by default since 0.1.4; see [State replay](dflash2.md#state-replay-optional). |
+| `spec_state_replay` | bool \| None | `None` | Replay the accepted prefix to rebuild recurrent state instead of storing every speculative state: more GPU KV capacity at a small per-step cost. On by default in current development for supported ordinary DFlash2 routes; released 0.1.4–0.1.5 require explicit true. None retains an enabled packed verifier, and explicit false disables replay. See [State replay](dflash2.md#state-replay-optional). |
 | `verify_fastpath` | bool \| None | `None` | Fast metadata path for verify steps in the hybrid (GDN + attention) model state. |
 
 <!-- END GENERATED: tools/gen_env_docs.py -->

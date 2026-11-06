@@ -9,7 +9,7 @@ Use this guide to replace MTP4 with DFlash2 and choose its settings. First prepa
 > Volta (SM70) GPUs, with V100 attention kernels and CUDA graphs for the drafter and the
 > verifier, in the 512K-context setup with prefix caching and CPU KV offload. On one
 > request it writes English code at up to **234 tokens/s instead of 180** with MTP4 (1.30×)
-> on community NVLink hardware. With 0.1.4 and the recommended DFlash2 settings (probabilistic
+> on community NVLink hardware. With 0.1.4 and its then-recommended DFlash2 settings (probabilistic
 > drafting, state replay off) the GPU KV pool reaches **1.37 million tokens (2.61× at 512K)**;
 > with greedy drafting it is 1.38 million (2.63×), and the 0.1.3 measurement with state replay
 > on (greedy drafting) reached 1.54 million (2.94×). MTP4
@@ -22,7 +22,10 @@ instead (tested revision `a22a1744`): 5 sliding-window layers, an 8-token block 
 2048-token window. It is off by default. Without a `dflash` speculative config, the KV
 cache layout, block size and MoE routes are the same as in 0.1.1.
 
-The configuration below is the recommended 0.1.4 configuration. With 0.1.2, also set
+The configuration below is the current development recommendation, with state replay
+explicitly enabled. Released versions 0.1.4–0.1.5 keep their replay-off default and
+need this explicit `true`; the example therefore enables replay on those supported
+releases too. Historical measurements retain their stated replay setting. With 0.1.2, also set
 `VLLM_V2_CUDAGRAPH_MEM_MIB=1500`; its profile does not reserve enough memory for DFlash2's
 graphs.
 
@@ -73,7 +76,7 @@ export VLLM_SM70_DFLASH2_FUSED_QKV_PACK=1
       "sm70_dflash2": {"context_kv_graph": true, "context_pipeline": true,
         "verify_fastpath": true, "fused_gdn_metadata": true,
         "fused_smallq_metadata": true, "grouped_smallq_metadata": true,
-        "spec_state_replay": false}}' \
+        "spec_state_replay": true}}' \
 ```
 
 In the startup log, the AWQ MoE line should read `grouped QPN decode admitted for 2..48
@@ -101,7 +104,7 @@ rule. `"greedy"` still works. MTP must stay `"greedy"`; see
   throughput about 1.5% higher. Like every `VLLM_*` variable, it is part of the
   torch.compile key, so a deployment that sets it builds its own compile cache.
 - **CUDA graph memory is set by the profile from 0.1.3.** With DFlash2 on AWQ TP4, the ReVolta profile reserves 1200 MiB per GPU (`VLLM_V2_CUDAGRAPH_MEM_MIB`) and leaves the single-request verifier tail graphs off (`VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS=0`). The graphs take about 1.1 GiB per GPU instead of 1.4 GiB. Greedy output was identical in the single-request comparison, including a 256K-token prompt; repeated comparisons found no consistent speed penalty at one or three requests. MTP4 keeps 700 MiB. Remove a previous explicit 1500 MiB setting to use the new default: environment values override the profile. If you turn the tail graphs back on, also set `VLLM_V2_CUDAGRAPH_MEM_MIB=1500`. A reserve smaller than the graphs lets the KV pool take that memory, and concurrent long prompts can then run out of GPU memory.
-- **State replay is optional and off by default from 0.1.4.** It adds GPU KV capacity at a small per-step cost; see [State replay (optional)](#state-replay-optional). The explicit `"spec_state_replay": false` above matches the default.
+- **State replay is on by default in current development for the supported ordinary DFlash2 route.** The recommendation above sets `"spec_state_replay": true` explicitly, including for released 0.1.4–0.1.5, with `spec_state_replay_graph=true` retained as the graph default. Set `"spec_state_replay": false` to keep per-draft state blocks instead. It adds GPU KV capacity at a small per-step cost; see [State replay (optional)](#state-replay-optional).
 - **`dflash_concurrency_drafts`** maps a number of running requests (the threshold) to the
   number of drafts the target verifies per request (the width). The drafter still drafts
   7 tokens. With `{"4": 3, "5": 4}`, one to three running requests verify all 7 drafts,
@@ -122,7 +125,7 @@ rule. `"greedy"` still works. MTP must stay `"greedy"`; see
 
 ## State replay (optional)
 
-GDN speculative state replay keeps two recurrent-state blocks per running request instead of nine: the verifier stores no per-draft state, and after sampling the accepted tokens are replayed into the request's block. It is off by default from 0.1.4. Turn it on for long contexts or more concurrent requests:
+GDN speculative state replay keeps two recurrent-state blocks per running request instead of nine: the verifier stores no per-draft state, and after sampling the accepted tokens are replayed into the request's block. It is enabled by default in current development for the supported ordinary DFlash2 route and set explicitly in the recommended configuration. Released 0.1.4–0.1.5 require that explicit `true`:
 
 ```bash
       "sm70_dflash2": {"context_kv_graph": true, "context_pipeline": true,
@@ -131,9 +134,11 @@ GDN speculative state replay keeps two recurrent-state blocks per running reques
         "spec_state_replay": true}}' \
 ```
 
+- An omitted `spec_state_replay` remains `None`: it selects replay on the supported ordinary route, but yields to an enabled `fused_gdn_verify` packed verifier on its separately qualified model contract. Explicit `true` overrides an automatic packed default; explicitly enabling both options is a configuration error. This recommendation does not change packed-verifier qualification.
+- Explicit `"spec_state_replay": false` disables replay. MTP, non-speculative decoding and routes outside the existing replay requirements retain their current behavior.
 - **Gain:** the GPU KV pool grew from 1,379,634 to 1,542,558 tokens (+11.8%; 2.63× to 2.94× maximum concurrency at 512K) on our 4 × V100 PCIe deployment. At eight concurrent 96K-token requests, peak KV use fell from 55% to 26%.
 - **Cost (0.1.4, measured in the same session):** about +0.44 ms per decoding step with greedy drafting when the target samples (30.05 to 30.49 ms per step at one request, 30 replayed agent turns); with greedy decoding about 1–4% lower throughput at one to four requests and level at eight. Outputs were identical with replay on and off (24 of 24 greedy streams, 30 of 30 sampled turns). With probabilistic drafting, recommended from 0.1.4, the replay costs about 0.8 ms per step (six real agent sessions at one request, 250 W), with outputs identical to replay off.
-- **Who should use it:** deployments that run long contexts or several long requests at once and are limited by KV capacity. For single short requests, leave it off.
+- **Trade-off:** the capacity gain helps long contexts or several long requests at once. Explicitly disabling replay trades away that capacity and avoids the replay's per-step work.
 - **CUDA graph:** with replay on, the replay after sampling runs as a CUDA graph (`"spec_state_replay_graph": true`, the default). Without it, the replay's launches cost about 5 ms per step with sampling, because sampling has already drained the GPU queue. One graph is captured per verify shape, the second time the shape runs; with the `{"4": 3, "5": 4}` width policy that is eight graphs (one to eight requests). Each capture takes 35–90 ms once, at the step that first meets the shape. The graphs added no measurable GPU memory (peak 31,564 MiB per GPU with them, 31,580 MiB without, in the same benchmark). With all eight captured, eight concurrent 96K-token requests completed without preemption at 27% peak KV use, and GPU memory peaked at 31,884 of 32,768 MiB per GPU.
 - Replay needs Model Runner V2, `--mamba-cache-mode align`, synchronous scheduling and no pipeline parallelism; elsewhere it stays off with a log line.
 

@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import replace
 from math import lcm
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
@@ -28,11 +28,18 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.request import Request
 
+if TYPE_CHECKING:
+    from vllm.v1.core.long_context_kv import LongContextAdmissionLedger
+
 
 class KVCacheCoordinator(ABC):
     """
     Coordinate the KV cache of different KV cache groups.
     """
+
+    # Long-context mode only (see KVCacheManager): attributes allocations to
+    # their KV cache group's domains. None leaves allocation unchanged.
+    admission_ledger: "LongContextAdmissionLedger | None" = None
 
     def __init__(
         self,
@@ -57,6 +64,7 @@ class KVCacheCoordinator(ABC):
         # aligned boundary, so that state is never produced at all.
         self.engine_use_eagle = use_eagle
         self.shared_prefix_boundary = 0
+        self.admission_ledger = None
 
         self.block_pool = BlockPool(
             num_gpu_blocks=kv_cache_config.num_blocks,
@@ -221,27 +229,54 @@ class KVCacheCoordinator(ABC):
         Returns:
             The number of blocks to allocate.
         """
-        num_blocks_to_allocate = 0
+        return sum(
+            self.get_num_blocks_to_allocate_per_group(
+                request_id,
+                num_tokens,
+                new_computed_blocks,
+                num_encoder_tokens,
+                total_computed_tokens,
+                num_tokens_main_model,
+                apply_admission_cap=apply_admission_cap,
+            )
+        )
+
+    def get_num_blocks_to_allocate_per_group(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: tuple[Sequence[KVCacheBlock], ...],
+        num_encoder_tokens: int,
+        total_computed_tokens: int,
+        num_tokens_main_model: int,
+        apply_admission_cap: bool = False,
+    ) -> list[int]:
+        """`get_num_blocks_to_allocate`, one count per KV cache group."""
+        num_blocks_to_allocate: list[int] = []
         for i, manager in enumerate(self.single_type_managers):
             if isinstance(manager, CrossAttentionManager):
                 # For cross-attention, we issue a single static allocation
                 # of blocks based on the number of encoder input tokens.
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
-                    request_id,
-                    num_encoder_tokens,
-                    [],
-                    0,
-                    num_encoder_tokens,
-                    apply_admission_cap=apply_admission_cap,
+                num_blocks_to_allocate.append(
+                    manager.get_num_blocks_to_allocate(
+                        request_id,
+                        num_encoder_tokens,
+                        [],
+                        0,
+                        num_encoder_tokens,
+                        apply_admission_cap=apply_admission_cap,
+                    )
                 )
             else:
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
-                    request_id,
-                    num_tokens,
-                    new_computed_blocks[i],
-                    total_computed_tokens,
-                    num_tokens_main_model,
-                    apply_admission_cap=apply_admission_cap,
+                num_blocks_to_allocate.append(
+                    manager.get_num_blocks_to_allocate(
+                        request_id,
+                        num_tokens,
+                        new_computed_blocks[i],
+                        total_computed_tokens,
+                        num_tokens_main_model,
+                        apply_admission_cap=apply_admission_cap,
+                    )
                 )
         return num_blocks_to_allocate
 
@@ -277,7 +312,10 @@ class KVCacheCoordinator(ABC):
         # every group. This ensures an earlier group's external
         # `get_new_blocks` cannot evict a later group's not-yet-touched
         # cache-hit blocks.
+        ledger = self.admission_ledger
         for i, manager in enumerate(self.single_type_managers):
+            if ledger is not None:
+                ledger.enter_group(manager.kv_cache_group_id)
             manager.add_local_computed_blocks(
                 request_id,
                 new_computed_blocks[i],
@@ -286,11 +324,15 @@ class KVCacheCoordinator(ABC):
             )
         if num_external_computed_tokens > 0:
             for manager in self.single_type_managers:
+                if ledger is not None:
+                    ledger.enter_group(manager.kv_cache_group_id)
                 manager.allocate_external_computed_blocks(
                     request_id,
                     num_local_computed_tokens,
                     num_external_computed_tokens,
                 )
+        if ledger is not None:
+            ledger.enter_group(None)
 
     def allocate_new_blocks(
         self,
@@ -316,6 +358,15 @@ class KVCacheCoordinator(ABC):
         Returns:
             The new allocated blocks.
         """
+        ledger = self.admission_ledger
+        if ledger is not None:
+            return self._allocate_new_blocks_in_scope(
+                ledger,
+                request_id,
+                num_tokens,
+                num_tokens_main_model,
+                num_encoder_tokens,
+            )
         return tuple(
             manager.allocate_new_blocks(
                 request_id,
@@ -326,6 +377,30 @@ class KVCacheCoordinator(ABC):
             )
             for manager in self.single_type_managers
         )
+
+    def _allocate_new_blocks_in_scope(
+        self,
+        ledger: "LongContextAdmissionLedger",
+        request_id: str,
+        num_tokens: int,
+        num_tokens_main_model: int,
+        num_encoder_tokens: int,
+    ) -> tuple[list[KVCacheBlock], ...]:
+        """`allocate_new_blocks`, attributing each group's blocks to it."""
+        new_blocks: list[list[KVCacheBlock]] = []
+        for manager in self.single_type_managers:
+            ledger.enter_group(manager.kv_cache_group_id)
+            new_blocks.append(
+                manager.allocate_new_blocks(
+                    request_id,
+                    num_encoder_tokens
+                    if isinstance(manager, CrossAttentionManager)
+                    else num_tokens,
+                    num_tokens_main_model,
+                )
+            )
+        ledger.enter_group(None)
+        return tuple(new_blocks)
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """

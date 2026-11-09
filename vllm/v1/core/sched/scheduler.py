@@ -1565,7 +1565,10 @@ class Scheduler(SchedulerInterface):
         self.finished_req_ids = set()
 
     def _update_request_as_session(
-        self, session: Request, update: StreamingUpdate
+        self,
+        session: Request,
+        update: StreamingUpdate,
+        kept_tokens: int | None = None,
     ) -> None:
         """
         Updates the waiting session with the next streaming update.
@@ -1576,6 +1579,20 @@ class Scheduler(SchedulerInterface):
         # Current streaming input behaviour: Keep only computed output tokens
         # (discard final sampled output token).
         num_computed_tokens = session.num_computed_tokens
+        if kept_tokens is not None:
+            # The turn's final frame stopped a session preempted while that
+            # frame was in flight: its history ends before the final sampled
+            # token, though all of its KV is recomputed.
+            num_computed_tokens = kept_tokens
+        elif (
+            session.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+            and num_computed_tokens == 0
+        ):
+            # An idle session released its KV (for a peer's growth, or it was
+            # preempted while its final frame was in flight). Its accepted
+            # input/output history still ends just before the final sampled
+            # token, even though all KV must now be recomputed.
+            num_computed_tokens = session.num_tokens - 1
         kept_output_tokens = session._all_token_ids[
             session.num_prompt_tokens : num_computed_tokens
         ]
@@ -1933,12 +1950,16 @@ class Scheduler(SchedulerInterface):
         # the below loop can be a performance bottleneck. We should do our best
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
-        stopped_preempted_reqs: set[Request] = set()
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
             if request is not None:
                 request.num_in_flight_tokens -= num_tokens_scheduled
+                if request.num_stale_in_flight_tokens > 0:
+                    # Scheduled before its streaming-input turn stopped.
+                    request.num_stale_in_flight_tokens -= num_tokens_scheduled
+                    assert request.num_stale_in_flight_tokens >= 0
+                    continue
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
                 # skip failed or rescheduled requests from KV load failure
                 continue
@@ -2009,6 +2030,8 @@ class Scheduler(SchedulerInterface):
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids
                 )
+                if stopped and request.resumable:
+                    self._end_streaming_turn(request, status_before_stop)
             elif request.pooling_params and pooler_output is not None:
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED
@@ -2098,14 +2121,20 @@ class Scheduler(SchedulerInterface):
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
                 # reset the status to WAITING for streaming requests that continue.
                 finish_reason = request.get_finished_reason()
-                finished = self._handle_stopped_request(request)
+                kept_tokens = None
+                if status_before_stop != RequestStatus.RUNNING:
+                    # A preempted request is already queued. Dequeue it before
+                    # a continuing streaming session is enqueued again (it was
+                    # dropped from every queue), and keep its turn's history.
+                    self.waiting.remove_requests((request,))
+                    self.skipped_waiting.remove_requests((request,))
+                    kept_tokens = request.num_tokens - 1
+                finished = self._handle_stopped_request(request, kept_tokens)
                 if finished:
                     kv_transfer_params = self._free_request(request)
 
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
-                else:
-                    stopped_preempted_reqs.add(request)
 
             # Extract sample logprobs if needed.
             if (
@@ -2151,9 +2180,7 @@ class Scheduler(SchedulerInterface):
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:
             self.running = remove_all(self.running, stopped_running_reqs)
-        if stopped_preempted_reqs:
-            # This is a rare case and unlikely to impact performance.
-            self.waiting.remove_requests(stopped_preempted_reqs)
+        # Stopped preempted requests were dequeued above (rare case).
 
         error_req_ids = set(self.grammar_compile_error_reqs)
         self.grammar_compile_error_reqs.clear()
@@ -2260,7 +2287,28 @@ class Scheduler(SchedulerInterface):
 
         return self.waiting or self.skipped_waiting or None
 
-    def _handle_stopped_request(self, request: Request) -> bool:
+    def _end_streaming_turn(
+        self, request: Request, status_before_stop: RequestStatus
+    ) -> None:
+        """Drop the work of a stopped streaming-input turn beyond its tokens.
+
+        A stop can trim accepted draft tokens, and with async scheduling
+        later steps of the turn may already be in flight. Neither belongs to
+        the session: the KV that remains valid ends just before the final
+        sampled token (which the next input chunk discards), and the outputs
+        of the in-flight steps are dropped when they return.
+        """
+        request.num_stale_in_flight_tokens = request.num_in_flight_tokens
+        request.num_output_placeholders = 0
+        request.spec_token_ids = []
+        if status_before_stop == RequestStatus.RUNNING:
+            request.num_computed_tokens = min(
+                request.num_computed_tokens, request.num_tokens - 1
+            )
+
+    def _handle_stopped_request(
+        self, request: Request, kept_tokens: int | None = None
+    ) -> bool:
         """Return True if finished (can be False for resumable requests)."""
         if not request.resumable:
             return True
@@ -2270,7 +2318,7 @@ class Scheduler(SchedulerInterface):
             if update is None:
                 # Streaming request finished.
                 return True
-            self._update_request_as_session(request, update)
+            self._update_request_as_session(request, update, kept_tokens)
         else:
             request.status = RequestStatus.WAITING_FOR_STREAMING_REQ
             self.num_waiting_for_streaming_input += 1

@@ -432,8 +432,7 @@ class HostKVHitManager:
             identity = (entry.hid, entry.hgen)
             pool.last_use[identity] = max(pool.last_use.get(identity, 0), txn.step)
         for handle in {e.handle for e in txn.new_loads}:
-            page = pool.host_pages.get(handle)
-            page.last_use = max(page.last_use, txn.step)
+            pool.host_pages.touch(handle, txn.step)
             pool.host_pages.start_io(handle, txn.attempt_id)
 
     def retire_receive(self, txn: ReceiveTxn) -> None:

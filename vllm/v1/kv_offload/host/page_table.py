@@ -10,9 +10,10 @@ from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
+from heapq import heapify, heappop, heappush
 from typing import Protocol
 
-from vllm.v1.kv_offload.base import OffloadKey
+from vllm.v1.kv_offload.base import OffloadKey, get_offload_group_idx
 
 
 class PageState(str, Enum):
@@ -21,6 +22,12 @@ class PageState(str, Enum):
     READY = "ready"
     SHADOW = "shadow"
     LOADING = "loading"
+
+
+class PageKind(str, Enum):
+    MAIN = "main"
+    STATE = "state"
+    DRAFT = "draft"
 
 
 class Result(str, Enum):
@@ -90,6 +97,9 @@ class HostPage:
     valid: bool = True
     completed_ranks: int = 0
     failed_ranks: int = 0
+    kind: PageKind = PageKind.MAIN
+    group: int = 0
+    revision: int = 0
 
 
 class PersistenceHooks(Protocol):
@@ -137,6 +147,21 @@ class HostPageTable:
         self._steps: dict[int, int] = {}
         self.watermark = 0
         self.ssd_epoch = 0
+        # Two views: all allocatable pages, and only pages collect may free.
+        # READY stays in the LRU until reserve explicitly selects it.
+        self._candidates: set[int] = set()
+        self._auto: set[int] = set()
+        # (threshold, page_id, epoch, revision). The second heap prunes
+        # individual retirements even while a newer access still protects a page.
+        self._pending: list[tuple[int, int, int, int]] = []
+        self._retiring: list[tuple[int, int, int, int]] = []
+        self._pending_live: set[int] = set()
+        self._retiring_live: set[int] = set()
+        self.heap_compactions = 0
+        self.collect_work_max = 0
+        self.state_counts = dict.fromkeys(PageState, 0)
+        self.state_counts[PageState.FREE] = len(self._free)
+        self.persisted_pages = 0
         # host SSD persistence: SSD persistence hooks (None keeps the page ownership
         # behaviour exactly).
         self.persistence: PersistenceHooks | None = None
@@ -190,10 +215,88 @@ class HostPageTable:
         return len(self._free)
 
     def available(self) -> int:
-        return len(self._free) + sum(
-            self.reclaimable(p) and p.state != PageState.FREE
-            for p in self.pages[self._first :]
+        return len(self._free) + len(self._candidates)
+
+    def _set_state(self, page: HostPage, state: PageState) -> None:
+        self.state_counts[page.state] -= 1
+        self.state_counts[state] += 1
+        page.state = state
+
+    def _current(self, entry: tuple[int, int, int, int]) -> bool:
+        _, pid, epoch, revision = entry
+        page = self.pages[pid]
+        return page.handle.epoch == epoch and page.revision == revision
+
+    def _refresh(self, page: HostPage) -> None:
+        """Invalidate same-incarnation pending work after every eligibility event.
+
+        All retirement thresholds originate from last_use, which is monotone
+        within an incarnation. Keep the explicit max for the retirement contract.
+        No table scan; lazy heap garbage is bounded by the physical pool size.
+        """
+        pid = page.handle.page_id
+        page.revision += 1
+        self._candidates.discard(pid)
+        self._auto.discard(pid)
+        self._pending_live.discard(pid)
+        self._retiring_live.discard(pid)
+        if pid < self._first or page.state == PageState.FREE:
+            return
+        if page.retirements:
+            page.retirements[:] = [
+                r for r in page.retirements if r.retire_after > self.watermark
+            ]
+        threshold = max(
+            page.last_use,
+            max((r.retire_after for r in page.retirements), default=0),
         )
+        identity = (pid, page.handle.epoch, page.revision)
+        if threshold > self.watermark:
+            heappush(self._pending, (threshold, *identity))
+            self._pending_live.add(pid)
+        if page.retirements:
+            heappush(
+                self._retiring,
+                (min(r.retire_after for r in page.retirements), *identity),
+            )
+            self._retiring_live.add(pid)
+        if self.reclaimable(page):
+            self._candidates.add(pid)
+            if page.state != PageState.READY:
+                self._auto.add(pid)
+        limit = 4 * len(self.pages) + 64
+        for heap in (self._pending, self._retiring):
+            if len(heap) > limit:
+                heap[:] = [entry for entry in heap if self._current(entry)]
+                heapify(heap)
+                self.heap_compactions += 1
+
+    def touch(self, handle: PageHandle, step: int) -> None:
+        """Record an access without changing the canonical LRU order."""
+        page = self.get(handle)
+        page.last_use = max(page.last_use, step)
+        self._refresh(page)
+
+    def set_bind_role(self, handle: PageHandle, hid: int, hgen: int, role: str) -> None:
+        page = self.get(handle)
+        if (hid, hgen) not in page.binds:
+            raise ValueError("Unknown host binding")
+        page.binds[hid, hgen] = role
+        self._refresh(page)
+
+    def producer_result(
+        self, handle: PageHandle, *, compute: Result, seal: Result
+    ) -> None:
+        page = self.get(handle)
+        page.compute_result, page.seal_result = compute, seal
+        self._refresh(page)
+
+    def invalidate(self, handle: PageHandle) -> None:
+        page = self.get(handle)
+        if page.key is not None and self.index.get(page.key) == handle:
+            del self.index[page.key]
+        page.valid = False
+        self._refresh(page)
 
     def _recycle(self, page: HostPage) -> None:
         assert self.reclaimable(page)
@@ -201,19 +304,34 @@ class HostPageTable:
         if page.key is not None and self.index.get(page.key) == handle:
             del self.index[page.key]
         self._lru.pop(handle.page_id, None)
+        self._candidates.discard(handle.page_id)
+        self._auto.discard(handle.page_id)
+        self._pending_live.discard(handle.page_id)
+        self._retiring_live.discard(handle.page_id)
+        self.state_counts[page.state] -= 1
+        self.state_counts[PageState.FREE] += 1
+        self.persisted_pages -= int(self.is_persisted(page))
         self.pages[handle.page_id] = HostPage(
             PageHandle(handle.page_id, handle.epoch + 1)
         )
         self._free.append(handle.page_id)
 
     def collect(self) -> None:
-        for page in self.pages[self._first :]:
-            if page.state in (
-                PageState.PRIVATE,
-                PageState.SHADOW,
-                PageState.LOADING,
-            ) and self.reclaimable(page):
+        work = 0
+        for heap in (self._retiring, self._pending):
+            while heap and heap[0][0] <= self.watermark:
+                entry = heappop(heap)
+                work += 1
+                if self._current(entry):
+                    self._refresh(self.pages[entry[1]])
+        # The old full scan appended free IDs in ascending physical order.
+        # Preserve that order, including simultaneous rank-prefix retirement.
+        for pid in sorted(self._auto):
+            page = self.pages[pid]
+            work += 1
+            if self.reclaimable(page) and page.state != PageState.READY:
                 self._recycle(page)
+        self.collect_work_max = max(self.collect_work_max, work)
 
     def is_persisted(self, page: HostPage) -> bool:
         return page.persisted_epoch == page.handle.epoch
@@ -257,11 +375,15 @@ class HostPageTable:
         if not self._free:
             return None
         page = self.pages[self._free.pop()]
-        page.state = PageState.PRIVATE if loading_key is None else PageState.LOADING
+        self._set_state(
+            page, PageState.PRIVATE if loading_key is None else PageState.LOADING
+        )
         page.key = loading_key
         if loading_key is not None:
+            page.group = get_offload_group_idx(loading_key)
             self.index[loading_key] = page.handle
             self._lru[page.handle.page_id] = None
+        self._refresh(page)
         return page.handle
 
     def bind(self, handle: PageHandle, hid: int, hgen: int, step: int = 0) -> None:
@@ -269,6 +391,7 @@ class HostPageTable:
         page.binds[hid, hgen] = "inuse"
         if page.state == PageState.PRIVATE and page.writer is None:
             page.writer = (hid, hgen, step)
+        self._refresh(page)
 
     def unbind(self, handle: PageHandle, hid: int, hgen: int, last_use: int) -> None:
         page = self.get(handle)
@@ -277,22 +400,31 @@ class HostPageTable:
         del page.binds[hid, hgen]
         page.last_use = max(page.last_use, last_use)
         page.retirements.append(Retirement(hid, hgen, handle, page.last_use))
+        self._refresh(page)
         self.collect()
 
     def pin(self, handle: PageHandle, lease_id: int) -> None:
-        self.get(handle).leases.add(lease_id)
+        page = self.get(handle)
+        page.leases.add(lease_id)
+        self._refresh(page)
         if handle.page_id in self._lru:
             self._lru.move_to_end(handle.page_id)
 
     def release(self, handle: PageHandle, lease_id: int) -> None:
-        self.get(handle).leases.remove(lease_id)
+        page = self.get(handle)
+        page.leases.remove(lease_id)
+        self._refresh(page)
         self.collect()
 
     def start_io(self, handle: PageHandle, job_id: int) -> None:
-        self.get(handle).io.add(job_id)
+        page = self.get(handle)
+        page.io.add(job_id)
+        self._refresh(page)
 
     def finish_io(self, handle: PageHandle, job_id: int) -> None:
-        self.get(handle).io.remove(job_id)
+        page = self.get(handle)
+        page.io.remove(job_id)
+        self._refresh(page)
         self.collect()
 
     def publish(self, handle: PageHandle, key: OffloadKey) -> bool:
@@ -305,9 +437,11 @@ class HostPageTable:
             raise ValueError("Host publication requires successful compute and seal")
         canonical = self.index.get(key)
         page.key = key
-        page.state = (
-            PageState.READY if canonical in (None, handle) else PageState.SHADOW
+        page.group = get_offload_group_idx(key)
+        self._set_state(
+            page, PageState.READY if canonical in (None, handle) else PageState.SHADOW
         )
+        self._refresh(page)
         if page.state == PageState.READY:
             self.index[key] = handle
             self._lru[handle.page_id] = None
@@ -328,14 +462,17 @@ class HostPageTable:
         if page.state != PageState.LOADING:
             return False
         if ok and page.valid:
-            page.state = PageState.READY
+            self._set_state(page, PageState.READY)
             page.compute_result = page.seal_result = Result.OK
             page.persisted_epoch = handle.epoch
+            self.persisted_pages += 1
+            self._refresh(page)
             return True
         if page.key is not None and self.index.get(page.key) == handle:
             del self.index[page.key]
         self._lru.pop(handle.page_id, None)
         page.valid = False
+        self._refresh(page)
         return False
 
     def mark_persisted(self, handle: PageHandle) -> bool:
@@ -346,7 +483,10 @@ class HostPageTable:
             return False
         if not page.valid or page.state != PageState.READY:
             return False
-        page.persisted_epoch = handle.epoch
+        if not self.is_persisted(page):
+            page.persisted_epoch = handle.epoch
+            self.persisted_pages += 1
+            self._refresh(page)
         return True
 
     def open_seal(
@@ -369,6 +509,7 @@ class HostPageTable:
         page.compute_result = page.seal_result = Result.PENDING
         page.writer = (hid, hgen, step)
         page.last_use = max(page.last_use, step)
+        self._refresh(page)
         return ticket
 
     def seal_result(
@@ -394,6 +535,7 @@ class HostPageTable:
         if page.compute_result != Result.FAILED:
             page.compute_result = Result.OK
         page.seal_result = Result.FAILED if page.failed_ranks else Result.OK
+        self._refresh(page)
         if page.compute_result == Result.OK and page.seal_result == Result.OK:
             self.publish(ticket.handle, ticket.key)
         self.collect()
@@ -417,10 +559,14 @@ class HostPageTable:
         if self.persistence is not None:
             self.persistence.on_reset()
         for page in self.pages[self._first :]:
+            # unbind may collect another private page from this snapshot.
+            if self.pages[page.handle.page_id] is not page:
+                continue
             if page.state != PageState.FREE:
                 page.valid = False
                 page.key = None
-                page.state = PageState.PRIVATE
+                self._set_state(page, PageState.PRIVATE)
+                self._refresh(page)
                 for hid, hgen in list(page.binds):
                     self.unbind(page.handle, hid, hgen, page.last_use)
         self.collect()

@@ -561,7 +561,10 @@ class HistoryBlockPool(BlockPool):
                 self.evict_blocks({hid})
                 handle = self.bindings.get(hid)
                 if handle is not None:
-                    self.host_pages.get(handle).compute_result = Result.FAILED
+                    page = self.host_pages.get(handle)
+                    self.host_pages.producer_result(
+                        handle, compute=Result.FAILED, seal=page.seal_result
+                    )
 
     def finish_schedule(self, executed: Iterable[str]) -> list[SealTicket]:
         executed = set(executed)
@@ -600,8 +603,7 @@ class HistoryBlockPool(BlockPool):
             if hid in self.bindings:
                 key = (hid, self.hgen[hid])
                 self.last_use[key] = max(self.last_use.get(key, 0), last_use)
-                page = self.host_pages.get(self.bindings[hid])
-                page.last_use = max(page.last_use, last_use)
+                self.host_pages.touch(self.bindings[hid], last_use)
 
     def touch(self, blocks) -> None:
         if not self.elastic:
@@ -670,9 +672,9 @@ class HistoryBlockPool(BlockPool):
                 if block.block_hash is None:
                     self.unbind(hid)
                 else:
-                    self.host_pages.get(self.bindings[hid]).binds[
-                        hid, self.hgen[hid]
-                    ] = "cached"
+                    self.host_pages.set_bind_role(
+                        self.bindings[hid], hid, self.hgen[hid], "cached"
+                    )
 
     def num_physically_free_blocks(self) -> int:
         """Unreferenced IDs, independent of host and hot-floor caps."""

@@ -42,7 +42,7 @@ class ArbiterProbe(Extension):
         self.mode, self.enabled = mode, enabled
         self.first_seen: dict[str, int] = {}
         self.max_wait = 0
-        self.checked_decisions = 0
+        self.last_checked_window = -1
         self.max_cached = 0
 
     def attach(self, driver: Driver) -> None:
@@ -97,12 +97,15 @@ class ArbiterProbe(Extension):
             driver.fail(f"T_idx {arb.t_idx} outside [0, {snap.upper}]")
         if self.pool.index_cache_target != arb.t_idx:
             driver.fail("pool T_idx differs from the arbiter's")
-        for decision in arb.decisions[self.checked_decisions :]:
+        for decision in arb.decisions:
+            if decision.window <= self.last_checked_window:
+                continue
             if decision.value_donated > arb.q:
                 driver.fail(f"window {decision.window} donated more than Q")
             if decision.reason == "counters_missing" and decision.action != "hold":
                 driver.fail("moved without complete counters")
-        self.checked_decisions = len(arb.decisions)
+        if arb.decisions:
+            self.last_checked_window = arb.decisions[-1].window
 
 
 def run(seed: int, policy: str, mode: str, enabled: bool, steps: int) -> dict:
@@ -114,7 +117,7 @@ def run(seed: int, policy: str, mode: str, enabled: bool, steps: int) -> dict:
     )
     probe = ArbiterProbe(mode, enabled)
     result = Driver(profile, steps, extensions=[probe]).run()
-    decisions = probe.arb.decisions if probe.arb is not None else []
+    arb = probe.arb
     return {
         "seed": seed,
         "policy": policy,
@@ -123,12 +126,12 @@ def run(seed: int, policy: str, mode: str, enabled: bool, steps: int) -> dict:
         "finished": result.finished,
         "max_idle_wait": result.max_idle_wait,
         "max_wait_first_progress": probe.max_wait,
-        "moves": sum(d.action != "hold" for d in decisions),
-        "windows": len(decisions),
+        "moves": arb.value_moves if arb else 0,
+        "windows": sum(arb.decision_counts.values()) if arb else 0,
         "value_donated": probe.arb.value_donated if probe.arb else 0,
         "forced_clamps": probe.arb.forced_clamps if probe.arb else 0,
         "max_cached": probe.max_cached,
-        "reasons": sorted({d.reason for d in decisions}),
+        "reasons": sorted(arb.decision_counts) if arb else [],
     }
 
 

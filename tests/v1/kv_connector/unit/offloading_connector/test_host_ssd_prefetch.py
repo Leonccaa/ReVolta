@@ -55,8 +55,7 @@ for i, key in enumerate(keys):
     handle = env.table.reserve()
     start = handle.page_id * t.ROW
     env.backing[start : start + t.ROW] = t.payload(i)
-    page = env.table.get(handle)
-    page.compute_result = page.seal_result = Result.OK
+    env.table.producer_result(handle, compute=Result.OK, seal=Result.OK)
     env.table.publish(handle, key)
 report = env.ssd.final_flush(budget_s=10.0, io_grace_s=5.0)
 assert (report.candidates, report.completed) == (len(keys), len(keys)), report

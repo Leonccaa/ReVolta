@@ -57,6 +57,12 @@ class StreamingUpdate:
 
 
 class Request:
+    # Immutable defaults keep disabled telemetry out of each request's field
+    # dictionary. Lifecycle accounting materializes only fields it changes.
+    prefix_cache_attempt: int = 0
+    prefix_cache_recorded_attempt: int = -1
+    store_attempt: Any = None
+
     def __init__(
         self,
         request_id: str,

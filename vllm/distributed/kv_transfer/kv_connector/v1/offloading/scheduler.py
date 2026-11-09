@@ -72,6 +72,7 @@ BlockIdentity = int | tuple[int, int]
 if TYPE_CHECKING:
     from vllm.v1.kv_offload.cpu.dependency import CPUBlockDependencyIndex
     from vllm.v1.kv_offload.host.hit import HostKVHitManager
+    from vllm.v1.metrics.store import PrefixAttempt
 
 
 @dataclass(slots=True)
@@ -94,6 +95,7 @@ class TransferJobStatus:
     # A worker reported this load as failed (load_failure_recompute_enabled).
     failed: bool = False
     receive_txn: ReceiveTxn | None = None
+    metric_attempt: "PrefixAttempt | None" = None
 
 
 class GroupOffloadConfig(NamedTuple):
@@ -583,6 +585,7 @@ class OffloadingConnectorScheduler:
         self._req_status: dict[ReqId, RequestOffloadState] = {}
         # Recurrent states demoted by _demote_superseded_states (all requests).
         self.num_demoted_states: int = 0
+        # Demotion events, including repeated demotion of the same key.
         self._counters_logged_at: float = time.monotonic()
         self._current_batch_load_jobs: dict[int, TransferJob] = {}
         self._current_batch_jobs_to_flush: set[int] = set()
@@ -1324,6 +1327,10 @@ class OffloadingConnectorScheduler:
     def update_state_after_alloc(
         self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
     ):
+        metrics = getattr(self, "store_metrics", None)
+        ssd = getattr(self, "host_page_ssd", None)
+        if metrics is not None and ssd is not None:
+            metrics.state(request).ssd_handles.update(ssd.holds(request.request_id))
         self._forget_host_ssd_request(request.request_id)
         if not getattr(self, "_recompute_failed_loads", False):
             return self._update_state_after_alloc(request, blocks, num_external_tokens)
@@ -1533,12 +1540,14 @@ class OffloadingConnectorScheduler:
         )
         # a load can only be issued when no other jobs are pending.
         req_status.transfer_jobs.add(load_job_id)
+        metrics = getattr(self, "store_metrics", None)
         self._jobs[load_job_id] = TransferJobStatus(
             req_id=request.request_id,
             pending_count=self.config.num_workers,
             keys=set(keys_to_load),
             is_store=False,
             receive_txn=txn,
+            metric_attempt=metrics.state(request) if metrics is not None else None,
         )
 
         if self._blocks_being_loaded is not None:
@@ -2548,6 +2557,18 @@ class OffloadingConnectorScheduler:
                     counters.count_stored(job_status.keys)
             else:
                 self.manager.complete_load(job_status.keys, req_status.req_context)
+                metrics = getattr(self, "store_metrics", None)
+                if metrics is not None:
+                    metrics.complete_receive(
+                        req_status.req,
+                        job_status.metric_attempt,
+                        txn=job_status.receive_txn,
+                        block_tokens=self.host_kv_hits.rule.block_size
+                        if self.host_kv_hits is not None
+                        else 0,
+                        ok=not job_status.failed,
+                        now=time.monotonic(),
+                    )
                 if self._blocks_being_loaded:
                     self._blocks_being_loaded.difference_update(job_status.keys)
                 if job_status.failed:

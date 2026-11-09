@@ -530,8 +530,7 @@ def test_background_io_keeps_committed_host_reserve(monkeypatch, static):
     )
     while table.num_free():
         handle = table.reserve(writeback=False)
-        page = table.get(handle)
-        page.compute_result = page.seal_result = Result.OK
+        table.producer_result(handle, compute=Result.OK, seal=Result.OK)
         table.publish(handle, bytes([handle.page_id]))
     headroom = table.net_headroom(pending=1)
     assert headroom > 0

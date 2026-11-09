@@ -100,8 +100,7 @@ def test_shadow_is_never_promoted(canonical_loading):
     assert table.get(shadow).state == PageState.SHADOW
     assert table.lookup(key(1)) == canonical
     if canonical_loading:
-        table.get(canonical).valid = False
-        del table.index[key(1)]
+        table.invalidate(canonical)
         table.finish_io(canonical, 99)
     else:
         table.unbind(canonical, 1, 1, 1)
@@ -166,7 +165,7 @@ def test_cancelled_loading_waits_for_io_and_step():
     table = HostPageTable(2)
     handle = table.reserve(loading_key=key(1))
     table.start_io(handle, 99)
-    table.get(handle).last_use = 3
+    table.touch(handle, 3)
     table.reset()
     table.finish_io(handle, 99)
     assert table.reserve(loading_key=key(2)) is None
@@ -236,7 +235,7 @@ def test_publication_requires_both_producer_results():
     handle = private(table)
     with pytest.raises(ValueError, match="successful compute and seal"):
         table.publish(handle, key(1))
-    table.get(handle).compute_result = Result.OK
+    table.producer_result(handle, compute=Result.OK, seal=Result.PENDING)
     with pytest.raises(ValueError, match="successful compute and seal"):
         table.publish(handle, key(1))
     assert table.lookup(key(1)) is None

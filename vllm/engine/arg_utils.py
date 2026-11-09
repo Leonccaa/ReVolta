@@ -677,6 +677,7 @@ class EngineArgs:
         ObservabilityConfig.enable_layerwise_nvtx_tracing
     )
     enable_mfu_metrics: bool = ObservabilityConfig.enable_mfu_metrics
+    enable_store_metrics: bool = ObservabilityConfig.enable_store_metrics
     enable_logging_iteration_details: bool = (
         ObservabilityConfig.enable_logging_iteration_details
     )
@@ -1406,6 +1407,10 @@ class EngineArgs:
         observability_group.add_argument(
             "--enable-mfu-metrics",
             **observability_kwargs["enable_mfu_metrics"],
+        )
+        observability_group.add_argument(
+            "--enable-store-metrics",
+            **observability_kwargs["enable_store_metrics"],
         )
         observability_group.add_argument(
             "--enable-logging-iteration-details",
@@ -2487,6 +2492,7 @@ class EngineArgs:
             cudagraph_metrics=self.cudagraph_metrics,
             enable_layerwise_nvtx_tracing=self.enable_layerwise_nvtx_tracing,
             enable_mfu_metrics=self.enable_mfu_metrics,
+            enable_store_metrics=self.enable_store_metrics,
             enable_mm_processor_stats=self.enable_mm_processor_stats,
             enable_logging_iteration_details=self.enable_logging_iteration_details,
         )

@@ -208,6 +208,7 @@ class KVCacheManager:
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
 
+        self._pending_reset_events: list[KVCacheEvent] = []
         self.admission_ledger = None
         plan = kv_cache_config.long_context_plan
         if plan is not None:
@@ -391,6 +392,7 @@ class KVCacheManager:
         full_sequence_must_fit: bool = False,
         reserved_blocks: int = 0,
         reserved_blocks_per_group: Sequence[int] | None = None,
+        num_tokens_to_reserve: int = 0,
     ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append.
 
@@ -416,10 +418,12 @@ class KVCacheManager:
                 free blocks to hold the full sequence, accounting for prefix cache hits
                 and sliding window. Used as an admission gate to prevent over-admitting
                 requests when chunked prefill would otherwise only check the first chunk
-            reserved_blocks: Free blocks to leave for other in-flight prefills
-                and the candidate async load's speculative promotion margin.
+            reserved_blocks: Free blocks to leave for other in-flight prefills.
             reserved_blocks_per_group: The same future demand in group units
                 for split pools and domain admission.
+            num_tokens_to_reserve: Minimum slot coverage for an async load's
+                executable successor. This is an admission check only. Existing
+                blocks, prefix hits and this allocation count toward it.
 
         Blocks layout:
         ```
@@ -499,14 +503,17 @@ class KVCacheManager:
         # against its own groups' demand.
         split = self._segment_pools() is not None
         per_group_needed = ledger is not None or split
-        if full_sequence_must_fit:
+        if full_sequence_must_fit or num_tokens_to_reserve:
             # First check and fail if the full request sequence won't fit.
             full_num_tokens = min(request.num_tokens, self.max_model_len)
+            reserve_num_tokens = min(
+                max(full_num_tokens, num_tokens_to_reserve), self.max_model_len
+            )
 
             if not per_group_needed:
                 num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
                     request_id=request.request_id,
-                    num_tokens=full_num_tokens,
+                    num_tokens=reserve_num_tokens,
                     new_computed_blocks=new_computed_block_list,
                     num_encoder_tokens=num_encoder_tokens,
                     total_computed_tokens=total_computed_tokens,
@@ -516,7 +523,7 @@ class KVCacheManager:
             else:
                 per_group = self.coordinator.get_num_blocks_to_allocate_per_group(
                     request_id=request.request_id,
-                    num_tokens=full_num_tokens,
+                    num_tokens=reserve_num_tokens,
                     new_computed_blocks=new_computed_block_list,
                     num_encoder_tokens=num_encoder_tokens,
                     total_computed_tokens=total_computed_tokens,
@@ -722,8 +729,18 @@ class KVCacheManager:
                     "Failed to reset prefix cache because some blocks are not freed yet"
                 )
                 return False
+            # Keep the pre-reset batch before one global clear. Per-pool
+            # concatenation after reset would put another clear after new
+            # stores from an earlier pool and erase the consumer's new state.
+            self._pending_reset_events.extend(
+                event for pool in pools for event in pool.take_events()
+            )
+            reset_events = []
             for pool in pools:
                 pool.reset_prefix_cache()
+                reset_events.extend(pool.take_events())
+            if reset_events:
+                self._pending_reset_events.append(reset_events[0])
         elif not self.block_pool.reset_prefix_cache():
             return False
         if self.log_stats:
@@ -775,7 +792,9 @@ class KVCacheManager:
         if pools is None:
             events = self.block_pool.take_events()
         else:
-            events = [event for pool in pools for event in pool.take_events()]
+            events = self._pending_reset_events
+            self._pending_reset_events = []
+            events.extend(event for pool in pools for event in pool.take_events())
         for event in events:
             if not isinstance(event, BlockStored):
                 continue

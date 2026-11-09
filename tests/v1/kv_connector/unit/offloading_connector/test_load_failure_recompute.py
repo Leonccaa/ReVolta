@@ -355,13 +355,20 @@ def test_preparation_errors_recompute_before_creating_job(
 
 
 @pytest.mark.parametrize("is_load", [False, True])
+@pytest.mark.parametrize("failure", ["false", "exception"])
 def test_rejected_worker_submission_reports_failure_after_drain(
-    request_runner, monkeypatch, is_load
+    request_runner, monkeypatch, is_load, failure
 ):
     runner = _runner(request_runner, monkeypatch, "contract", async_scheduling=False)
     worker = runner.worker_connector.connector_worker
     calls = []
-    worker.worker.transfer_async = lambda job_id, spec: False
+
+    def reject(job_id, spec):
+        if failure == "exception":
+            raise OSError("injected submission failure")
+        return False
+
+    worker.worker.transfer_async = reject
     worker.worker.wait = lambda job_ids: calls.append(set(job_ids))
     worker.worker.get_finished = lambda: []
     if is_load:
@@ -372,6 +379,54 @@ def test_rejected_worker_submission_reports_failure_after_drain(
     meta = worker.build_connector_worker_meta()
     assert meta.failed_jobs == {42: 1}
     assert meta.completed_jobs == {42: 1}
+    assert worker.get_finished(set()) == (set(), set())
+    assert worker.build_connector_worker_meta() is None
+
+
+@pytest.mark.parametrize("preempted", [False, True])
+@pytest.mark.parametrize("failure", ["false", "exception"])
+def test_deferred_store_submission_reports_failure(
+    request_runner, monkeypatch, preempted, failure
+):
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+        OffloadingConnectorMetadata,
+        TransferJob,
+    )
+
+    runner = _runner(request_runner, monkeypatch, "contract", False)
+    worker = runner.worker_connector.connector_worker
+    calls = []
+
+    def reject(job_id, spec):
+        calls.append("submitted")
+        if failure == "exception":
+            raise OSError("injected deferred store submission error")
+        return False
+
+    worker.worker.transfer_async = reject
+    worker.worker.wait = lambda job_ids: calls.append("drained")
+    worker.worker.get_finished = lambda: []
+    metadata = OffloadingConnectorMetadata(
+        load_jobs={},
+        store_jobs={
+            42: TransferJob(req_id="store", transfer_spec=(None, None)),
+        },
+    )
+    worker.prepare_store_kv(metadata)
+    assert not calls
+    if preempted:
+        worker.handle_preemptions(
+            OffloadingConnectorMetadata(load_jobs={}, store_jobs={}, jobs_to_flush={42})
+        )
+    else:
+        worker.start_kv_transfers(
+            OffloadingConnectorMetadata(load_jobs={}, store_jobs={})
+        )
+    assert calls[:2] == ["submitted", "drained"]
+    assert not worker._unsubmitted_store_jobs
+    assert worker.get_finished(set()) == (set(), set())
+    result = worker.build_connector_worker_meta()
+    assert result.failed_jobs == result.completed_jobs == {42: 1}
     assert worker.get_finished(set()) == (set(), set())
     assert worker.build_connector_worker_meta() is None
 
@@ -426,8 +481,9 @@ def test_partial_submission_drains_before_failure_is_returned(monkeypatch, failu
 
 
 @pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("failure", ["false", "exception"])
 def test_rejected_load_submission_recomputes_through_scheduler(
-    request_runner, monkeypatch, async_scheduling
+    request_runner, monkeypatch, async_scheduling, failure
 ):
     runner = _runner(request_runner, monkeypatch, "contract", async_scheduling)
     prompt = _store_prefix(runner, 3)
@@ -440,6 +496,8 @@ def test_rejected_load_submission_recomputes_through_scheduler(
             # The fixture's fence recorder requires the rejected descriptor
             # even though this handler never queues or completes its I/O.
             handler.transfer_specs[job_id] = spec
+            if failure == "exception":
+                raise OSError("injected submission error")
             return False
         return transfer(job_id, spec)
 
@@ -465,3 +523,44 @@ def test_lookup_error_is_a_miss_before_admission(request_runner, monkeypatch):
     _finish(runner, _Recorder(runner))
     assert request.status == RequestStatus.FINISHED_STOPPED
     assert runner.connector_scheduler.num_abandoned_loads == 0
+
+
+@pytest.mark.parametrize("failed_rank", [0, 3])
+def test_cancelled_load_late_rank_failure_cleans_markers(
+    request_runner, monkeypatch, failed_rank
+):
+    from dataclasses import replace
+
+    from tests.v1.kv_connector.unit.offloading_connector.test_reset_lifecycle import (
+        NONE,
+        TP4,
+    )
+
+    h = TP4(request_runner, "two_group")
+    h.cs._recompute_failed_loads = True
+    for worker in h.workers:
+        worker.connector_worker._report_failures = True
+    h.hit(1)
+    rid = h.add(h.obs * 2, 0)
+    h.step(complete=NONE)
+    request = h.sched.requests[rid]
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    handler = h.workers[failed_rank].connector_worker.spec.handler
+    complete = handler.complete_jobs
+
+    def fail(job_ids):
+        complete(job_ids)
+        handler.completed_transfers = [
+            replace(result, success=False) for result in handler.completed_transfers
+        ]
+
+    handler.complete_jobs = fail
+    h.sched.finish_requests((rid,), RequestStatus.FINISHED_ABORTED)
+    assert rid in h.sched.requests  # active destinations survive until rank acks
+    h.step(complete=NONE)  # terminal flush reports the late failed receive
+    h.drain()
+    h.assert_clean()
+    assert h.recv_count(rid) == 1
+    assert not h.cs._skip_external_once
+    assert not h.cs.take_failed_loads()
+    _check_pool_drained(h.r)

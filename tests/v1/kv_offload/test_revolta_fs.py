@@ -7,6 +7,7 @@ import mmap
 import os
 import shutil
 import time
+from dataclasses import make_dataclass
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +20,7 @@ from tests.v1.kv_offload.test_fs_tier import (
     key,
     make_job,
 )
+from vllm.v1.kv_cache_interface import KVBlockSegments, KVCacheTensor
 from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
 from vllm.v1.kv_offload.tiering.fs.config import fs_tier_configs
 from vllm.v1.kv_offload.tiering.fs.content_manifest import build_manifest
@@ -168,6 +170,76 @@ def _store(tier, tensor, k, slot=0, value=1.0, job_id=1):
 def _load(tier, k, slot=1, job_id=2):
     tier.submit_load(make_job(job_id, [k], [slot], is_promotion=True))
     return [r.success for r in drain(tier)]
+
+
+def test_unified_tensor_schema_reuses_pre_split_ssd_page(tmp_path):
+    # The old dataclass had precisely these three fields and this FQN. Use it
+    # to write an actual checksummed page, then reopen with today's dataclass.
+    legacy = make_dataclass(
+        "KVCacheTensor",
+        [("size", int), ("shared_by", list), ("packed_members", object)],
+    )
+    legacy.__module__ = KVCacheTensor.__module__
+    tensor, view = _view()
+    spec, manifest = checkpoint_spec(tmp_path)
+    spec.kv_cache_config.block_segments = None
+    spec.kv_cache_config.kv_cache_tensors = [legacy(4096, ["layer"], None)]
+    writer = make_tier(tmp_path, view, spec=spec, content_manifest_path=manifest)
+    try:
+        assert not writer.disabled
+        old_layout = writer._extra_layout.copy()
+        old_path = _store(writer, tensor, key(1), value=7.0)
+    finally:
+        writer.shutdown()
+    spec.kv_cache_config.kv_cache_tensors = [KVCacheTensor(4096, ["layer"])]
+    reader = make_tier(tmp_path, view, spec=spec, content_manifest_path=manifest)
+    try:
+        assert not reader.disabled
+        assert reader._extra_layout == old_layout
+        assert reader.file_mapper.get_file_name(key(1)) == old_path
+        tensor[1].zero_()
+        assert reader.lookup(key(1))
+        assert _load(reader, key(1)) == [True]
+        assert torch.equal(tensor[1], torch.full_like(tensor[1], 7.0))
+    finally:
+        reader.shutdown()
+
+
+def test_split_persistence_binds_tensor_counts_and_segments(tmp_path):
+    tensor, view = _view()
+    spec, manifest = checkpoint_spec(tmp_path)
+    layouts = []
+    for blocks, primary in ((2, 1), (3, 1), (2, 0)):
+        spec.kv_cache_config.block_segments = KVBlockSegments(
+            ("state", "history"), (4, 4), (), primary
+        )
+        spec.kv_cache_config.kv_cache_tensors = [
+            KVCacheTensor(4096, ["layer"], num_blocks=blocks)
+        ]
+        tier = make_tier(tmp_path, view, spec=spec, content_manifest_path=manifest)
+        try:
+            assert not tier.disabled
+            layouts.append(tier._extra_layout["page_layout"])
+        finally:
+            tier.shutdown()
+    assert len(set(layouts)) == 3
+
+
+def test_unified_explicit_tensor_count_changes_identity(tmp_path):
+    tensor, view = _view()
+    spec, manifest = checkpoint_spec(tmp_path)
+    layouts = []
+    for blocks in (None, 2, 3):
+        spec.kv_cache_config.kv_cache_tensors = [
+            KVCacheTensor(4096, ["layer"], num_blocks=blocks)
+        ]
+        tier = make_tier(tmp_path, view, spec=spec, content_manifest_path=manifest)
+        try:
+            assert not tier.disabled
+            layouts.append(tier._extra_layout["page_layout"])
+        finally:
+            tier.shutdown()
+    assert len(set(layouts)) == 3
 
 
 def test_page_has_checksum_and_no_temp_files(revolta_tier):

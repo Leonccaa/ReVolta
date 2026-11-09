@@ -51,6 +51,17 @@ class KVConnectorFactory:
             raise ValueError("kv_transfer_config must be set to create a connector")
         connector_cls = cls.get_connector_class(kv_transfer_config)
 
+        if kv_cache_config.block_segments is not None:
+            from vllm.distributed.kv_transfer.kv_connector.v1 import (
+                offloading_connector,
+            )
+
+            if connector_cls is not offloading_connector.OffloadingConnector:
+                raise ValueError(
+                    "Split KV block spaces require the built-in OffloadingConnector "
+                    "with request-scoped load failures."
+                )
+
         # check if the connector supports HMA
         hma_enabled = not config.scheduler_config.disable_hybrid_kv_cache_manager
         if hma_enabled and not cls.supports_hma_config(kv_transfer_config):

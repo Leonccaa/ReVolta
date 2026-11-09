@@ -1248,6 +1248,7 @@ class Scheduler(SchedulerInterface):
 
                 reserved_blocks = 0
                 reserved_per_group = None
+                num_tokens_to_reserve = 0
                 if load_kv_async:
                     # Parked transfers cannot be preempted to recover memory.
                     # Protect earlier prefills and this load's first spec step.
@@ -1267,22 +1268,16 @@ class Scheduler(SchedulerInterface):
                             for group_id, count in enumerate(remaining):
                                 reserved_per_group[group_id] += count
                         if self.num_spec_tokens:
-                            for group_id, manager in enumerate(managers):
-                                if not isinstance(
-                                    manager.kv_cache_spec,
-                                    (
-                                        MambaSpec,
-                                        CircularBufferSpec,
-                                        KpoolTailSpec,
-                                        CrossAttentionSpec,
-                                    ),
-                                ):
-                                    reserved_per_group[group_id] += cdiv(
-                                        1
-                                        + self.num_spec_tokens
-                                        + self.num_lookahead_tokens,
-                                        manager.block_size,
-                                    )
+                            # Ask the allocator for the successor's net demand.
+                            # A full-ISL reservation, block slack or allocated
+                            # lookahead may already cover the entire margin.
+                            num_tokens_to_reserve = min(
+                                request.num_tokens
+                                + 1
+                                + self.num_spec_tokens
+                                + self.num_lookahead_tokens,
+                                self.max_model_len,
+                            )
 
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
@@ -1296,6 +1291,7 @@ class Scheduler(SchedulerInterface):
                     full_sequence_must_fit=self.scheduler_reserve_full_isl,
                     reserved_blocks=reserved_blocks,
                     reserved_blocks_per_group=reserved_per_group,
+                    num_tokens_to_reserve=num_tokens_to_reserve,
                 )
 
                 if new_blocks is None:
@@ -1305,6 +1301,10 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
+                    if self._reclaim_waiting_hot_reservations(
+                        request, scheduled_timestamp
+                    ):
+                        continue
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -1571,20 +1571,63 @@ class Scheduler(SchedulerInterface):
     ) -> KVConnectorMetadata:
         return connector.build_connector_meta(scheduler_output)
 
-    def _preempt_request(self, request: Request, timestamp: float) -> None:
-        """Preempt a request and put it back to the waiting queue.
+    def _reclaim_waiting_hot_reservations(
+        self, request: Request, timestamp: float
+    ) -> bool:
+        """Let the queue head grow by recomputing idle sessions when needed."""
+        ledger = self.kv_cache_manager.admission_ledger
+        if ledger is None:
+            return False
+        from vllm.v1.core.long_context_kv import HOT
 
-        NOTE: The request should be popped from the running queue outside of this
-        method.
+        empty_demand = [0] * len(ledger.group_domains)
+        if ledger.blocking_domain(request, empty_demand) != HOT:
+            return False
+        reclaimed = False
+        for peer in reversed(list(self.requests.values())):
+            if (
+                peer is request
+                or peer.status
+                not in (
+                    RequestStatus.WAITING,
+                    RequestStatus.PREEMPTED,
+                    RequestStatus.WAITING_FOR_STREAMING_REQ,
+                )
+                or peer.num_computed_tokens == 0
+                or peer.num_in_flight_tokens != 0
+            ):
+                continue
+            self._preempt_request(peer, timestamp, enqueue=False)
+            reclaimed = True
+            if ledger.blocking_domain(request, empty_demand) != HOT:
+                break
+        return reclaimed
+
+    def _preempt_request(
+        self, request: Request, timestamp: float, *, enqueue: bool = True
+    ) -> None:
+        """Release KV for recomputation, optionally enqueueing a running request.
+
+        Running callers remove the request from the running queue first.
+        Idle-session reclamation keeps its existing waiting queue membership.
         """
-        assert request.status == RequestStatus.RUNNING, (
-            "Only running requests can be preempted"
-        )
+        waiting_for_input = request.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+        if enqueue:
+            assert request.status == RequestStatus.RUNNING
+        else:
+            # Queue membership and the streaming-input wait count stay intact.
+            assert request.status in (
+                RequestStatus.WAITING,
+                RequestStatus.PREEMPTED,
+                RequestStatus.WAITING_FOR_STREAMING_REQ,
+            )
+            assert request.num_in_flight_tokens == 0
         self._pending_preempted_req_ids.add(request.request_id)
         self.kv_cache_manager.free(request)
         self.encoder_cache_manager.free(request)
         self._inflight_prefills.discard(request)
-        request.status = RequestStatus.PREEMPTED
+        if not waiting_for_input:
+            request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
         if request.spec_token_ids:
             request.spec_token_ids = []
@@ -1593,7 +1636,8 @@ class Scheduler(SchedulerInterface):
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
 
         # Put the request back to the waiting queue.
-        self.waiting.prepend_request(request)
+        if enqueue:
+            self.waiting.prepend_request(request)
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER
@@ -3180,6 +3224,11 @@ class Scheduler(SchedulerInterface):
                 - blocks_to_evict (set[int]): Block IDs to evict from cache,
                 including invalid blocks and downstream dependent blocks.
         """
+        if self.kv_cache_config.block_segments is not None and invalid_block_ids:
+            raise ValueError(
+                "Bare invalid_block_ids are unsupported with split KV block spaces; "
+                "use request-scoped failed loads."
+            )
         affected_req_ids: set[str] = set()
         total_affected_tokens = 0
         blocks_to_evict: set[int] = set()

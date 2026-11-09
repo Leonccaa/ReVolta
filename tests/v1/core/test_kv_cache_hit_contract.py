@@ -20,6 +20,7 @@ from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_hit_contract import (
     GroupHitRule,
     HitNeed,
+    KVHitContract,
     cross_group_hit_check_enabled,
 )
 from vllm.v1.core.kv_cache_manager import KVCacheManager
@@ -234,6 +235,51 @@ def test_probe_only_group_requires_hash_grid():
     with pytest.raises(ValueError, match="multiple of hash_block_size"):
         manager.hit_contract.register_probe(7, lambda *args: True, block_size=BS + 1)
     assert 7 not in manager.hit_contract.rules
+
+
+@pytest.mark.parametrize("eagle", [False, True])
+def test_probe_partial_last_page_keeps_earlier_state(eagle):
+    """regression coverage. A 96-token cap also depends on the second 64-token host
+    page."""
+    manager = _manager([_full(), _mamba()], check=True)
+    manager = KVCacheManager(
+        manager.kv_cache_config,
+        max_model_len=4096,
+        hash_block_size=BS,
+        enable_caching=True,
+        use_eagle=eagle,
+        cross_group_hit_check=True,
+    )
+    request = _request(6)
+    _cache(manager, request, {0: set(range(6)), 1: {3, 4}})
+    assert manager.get_computed_blocks(request)[1] == 80
+    manager.hit_contract.register_probe(7, lambda g, i, h, b: i == 0, block_size=64)
+    for _ in range(1024):
+        assert manager.get_computed_blocks(request)[1] == 64
+    manager.hit_contract.register_probe(7, lambda *args: False)
+    assert manager.get_computed_blocks(request)[1] == 0
+
+
+@pytest.mark.parametrize("block_size", [16, 32, 64, 96])
+@pytest.mark.parametrize("start", [0, 16, 64])
+def test_prefix_cap_checks_partial_page_against_token_oracle(block_size, start):
+    contract = KVHitContract([GroupHitRule(7, HitNeed.PREFIX, block_size)], path="test")
+    for end in range(start + 1, 193):
+        for missing in range(193 // block_size):
+            checked: list[int] = []
+
+            def probe(
+                group, index, block_hash, block_id, checked=checked, missing=missing
+            ):
+                checked.append(index)
+                return index != missing
+
+            contract.register_probe(7, probe)
+            actual = contract.probe_cap(lambda rule, index: b"hash", start, end)
+            required = {token // block_size for token in range(start, end)}
+            expected = missing * block_size if missing in required else end
+            assert actual == expected
+            assert set(checked) <= required
 
 
 def test_flag_reads_only_a_real_true():

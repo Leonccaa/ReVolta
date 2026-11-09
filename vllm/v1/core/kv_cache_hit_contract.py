@@ -210,7 +210,7 @@ class KVHitContract:
             rule = self.rules[group_id]
             if rule.need is not HitNeed.PREFIX:
                 continue
-            for index in range(start_tokens // rule.block_size, cap // rule.block_size):
+            for index in rule.required_blocks(cap, start_tokens):
                 block_hash = chain_hash(rule, index)
                 if block_hash is None or not self._probe_ready(
                     probe, group_id, index, block_hash, None

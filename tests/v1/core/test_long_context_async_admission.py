@@ -21,10 +21,23 @@ from vllm.v1.request import RequestStatus
 pytestmark = pytest.mark.cpu_test
 
 
-def scheduler(*, enabled, full_isl, async_scheduling=False, matched=5 * SPAN):
+def scheduler(
+    *,
+    enabled,
+    full_isl,
+    async_scheduling=False,
+    matched=5 * SPAN,
+    speculative_tokens=0,
+):
     s = build(
-        settings(host_pool_tokens=MAX_MODEL_LEN) if enabled else None,
+        settings(
+            host_pool_tokens=MAX_MODEL_LEN,
+            hot_pool_gib=0.8 if speculative_tokens else 0.2,
+        )
+        if enabled
+        else None,
         reserve_full_isl=full_isl,
+        speculative_tokens=speculative_tokens,
     )
     if async_scheduling:
         s.vllm_config.scheduler_config.async_scheduling = True
@@ -39,10 +52,79 @@ def scheduler(*, enabled, full_isl, async_scheduling=False, matched=5 * SPAN):
     cfg.kv_transfer_config = KVTransferConfig(
         kv_connector="MockKVConnector",
         kv_role="kv_both",
-        kv_connector_extra_config={"matched_tokens": matched, "is_async": True},
+        kv_connector_extra_config={"matched_tokens": matched, "is_async": matched > 0},
     )
     s.connector = HybridMockConnector(cfg, KVConnectorRole.SCHEDULER, s.kv_cache_config)
     return s
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("full_isl", [False, True])
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("matched", [0, 5 * SPAN, 9 * SPAN])
+@pytest.mark.parametrize("slack", [1, 8])
+def test_dflash_single_request_fits_without_double_reservation(
+    enabled, full_isl, async_scheduling, matched, slack
+):
+    """prefix regression. One legal request must fit, even with allocated draft
+    lookahead.
+
+    The host domain holds exactly ten pages. Both the full-ISL gate and the
+    load's allocation can already cover the speculative successor. Clear the
+    cache each wave so that later successes still exercise external loads.
+    """
+    s = scheduler(
+        enabled=enabled,
+        full_isl=full_isl,
+        async_scheduling=async_scheduling,
+        matched=matched,
+        speculative_tokens=7,
+    )
+    ledger = s.kv_cache_manager.admission_ledger
+    if ledger is not None:
+        assert not ledger.plan.startup_problems()
+    for wave in range(256):
+        assert s.kv_cache_manager.reset_prefix_cache()
+        request = make_requests(1, MAX_MODEL_LEN - slack, 1, tag=f"spec{wave}-")[0]
+        s.add_request(request)
+        for tick in range(128):
+            output = s.schedule()
+            received = {request.request_id} if tick % 4 == 3 else set()
+            complete(s, output, received=received)
+            if ledger is not None:
+                assert ledger.in_use == recount(s)
+                assert ledger.hot_used <= ledger.plan.hot_pool_groups
+            if request.is_finished():
+                break
+        assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+        check_drained(s)
+
+
+@pytest.mark.parametrize("full_isl", [False, True])
+def test_dflash_load_fits_minimal_state_pool(full_isl):
+    s = build(
+        settings(host_pool_tokens=40 * SPAN, hot_pool_gib=0.8),
+        max_num_seqs=1,
+        reserve_full_isl=full_isl,
+        speculative_tokens=7,
+    )
+    cfg = s.vllm_config
+    cfg.kv_transfer_config = KVTransferConfig(
+        kv_connector="MockKVConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={"matched_tokens": 5 * SPAN, "is_async": True},
+    )
+    s.connector = HybridMockConnector(cfg, KVConnectorRole.SCHEDULER, s.kv_cache_config)
+    assert not s.kv_cache_manager.admission_ledger.plan.startup_problems()
+    request = make_requests(1, 8 * SPAN, 1)[0]
+    s.add_request(request)
+    for _ in range(128):
+        output = s.schedule()
+        complete(s, output, received={request.request_id})
+        if request.is_finished():
+            break
+    assert request.is_finished()
+    check_drained(s)
 
 
 def check_drained(s):
@@ -84,7 +166,10 @@ def test_async_load_preserves_inflight_chunked_prefill(enabled, full_isl):
 @pytest.mark.parametrize("full_isl", [False, True])
 @pytest.mark.parametrize("async_scheduling", [False, True])
 @pytest.mark.parametrize("matched", [5 * SPAN, 8 * SPAN])
-def test_two_loads_keep_progress(enabled, full_isl, async_scheduling, matched):
+@pytest.mark.parametrize("speculative_tokens", [0, 7])
+def test_two_loads_keep_progress(
+    enabled, full_isl, async_scheduling, matched, speculative_tokens
+):
     """The review's two-load counterexample over 512 waves with caches cleared.
 
     Unlike a fixed number of idle schedule calls, every wave must finish.
@@ -95,6 +180,7 @@ def test_two_loads_keep_progress(enabled, full_isl, async_scheduling, matched):
         full_isl=full_isl,
         async_scheduling=async_scheduling,
         matched=matched,
+        speculative_tokens=speculative_tokens,
     )
     for wave in range(512):
         assert s.kv_cache_manager.reset_prefix_cache()

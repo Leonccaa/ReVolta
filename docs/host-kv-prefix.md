@@ -130,7 +130,7 @@ hits = HostKVHitManager.attach(
 The attachment returns `None` if either contract is missing, a controller is
 already attached, or an existing main-KV rule has an incompatible kind/span.
 Validation precedes registration on either path. host-history integration must gate host-mode hit
-reuse on successful attachment. The current unified-pool startup does not
+reuse on successful attachment. The current split-pool startup does not
 construct an authoritative host backing or call this attachment automatically.
 
 The same probe is registered with
@@ -170,10 +170,14 @@ newly allocated GPU history block and generation to the pinned host page
 before publishing the complete restore. `hits.pinned_pages(request_id)` lends
 the chain-order leases and their key/slot identities for this transaction.
 The controller owns their release. This adapter leaves that physical
-binding transaction to the split-pool allocator. It also leaves the existing
-post-admission load-failure channel to that integration. That channel must
-invalidate the entire prefix and recompute it if validation or loading fails.
-The inherited complete-prefix contract load-plan exception still requires replacement there.
+binding transaction to the split-pool allocator. The current OffloadingConnector
+invalidates failed external loads by request ID and recomputes the whole prefix.
+Planning errors and failed transfer submissions use this channel too; a partially
+submitted transfer drains before pins or GPU blocks can be released. Split mode
+requires the built-in OffloadingConnector and rejects bare invalid-block IDs.
+These CPU-tested paths do not supply the missing host binding and all-rank fence
+transaction. Request skip markers survive lookup deferral until a recompute is
+admitted and are discarded at request termination.
 
 ## Group-local availability and shutdown
 

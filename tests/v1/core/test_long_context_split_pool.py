@@ -640,10 +640,8 @@ def test_worker_allocates_separate_tensors_per_segment():
 
 
 @pytest.mark.parametrize("drafter", [True, False])
-def test_cpu_offload_pages_are_the_same_on_two_block_spaces(drafter: bool):
-    """The CPU offload tier sizes its pages from the GPU tensors. With block
-    segments each tensor holds its own space's blocks; a page must still fit
-    one block of either space, which here equals the unified pool block."""
+def test_cpu_offload_pages_cover_all_canonical_tensors(drafter: bool):
+    """Unpartitioned backing holds every tensor; grouped pools keep private pages."""
     from types import SimpleNamespace
 
     from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
@@ -670,12 +668,11 @@ def test_cpu_offload_pages_are_the_same_on_two_block_spaces(drafter: bool):
     split = offload_spec(settings())
     assert split.kv_cache_config.block_segments is not None
     if drafter:
-        # The drafter's 832-token blocks keep the shared-page CPU layout: a
-        # page holds one block of one space, the largest being a history block.
+        # The two independent GPU spaces have distinct CPU backing tensors.
         assert not split.partition_by_group and not unified.partition_by_group
-        assert split.cpu_page_size_per_worker == unified.cpu_page_size_per_worker
+        assert split.cpu_page_size_per_worker > unified.cpu_page_size_per_worker
         assert split.cpu_page_size_per_worker == (
-            POOL_BLOCK_BYTES * split.block_size_factor
+            (HISTORY_BLOCK_BYTES + STATE_BLOCK_BYTES) * split.block_size_factor
         )
     else:
         # Per-group pages: state groups keep their owner-shaped pages, the
@@ -684,3 +681,59 @@ def test_cpu_offload_pages_are_the_same_on_two_block_spaces(drafter: bool):
         assert split.cpu_group_page_sizes == unified.cpu_group_page_sizes
         assert split.cpu_group_page_sizes[0] == POOL_BLOCK_BYTES
         assert split.cpu_group_num_blocks == unified.cpu_group_num_blocks
+
+
+def test_reset_events_preserve_new_state_before_next_poll():
+    from vllm.distributed.kv_events import AllBlocksCleared, BlockStored
+
+    from .test_long_context_admission import build, make_requests
+
+    scheduler = build(settings(state_blocks=28))
+    manager = scheduler.kv_cache_manager
+    for pool in manager.coordinator.block_pools:
+        pool.enable_kv_cache_events = True
+    (before,) = make_requests(1, 4 * SPAN, 1, tag="before-reset")
+    assert manager.allocate_slots(before, 4 * SPAN)
+    manager.free(before)
+    # Leave pre-reset events queued too, then reset/store twice without a poll.
+    for tag in ("after-first-reset", "after-second-reset"):
+        assert manager.reset_prefix_cache()
+        (after,) = make_requests(1, 4 * SPAN, 1, tag=tag)
+        assert manager.allocate_slots(after, 4 * SPAN)
+        manager.free(after)
+    events = manager.take_events()
+    assert sum(isinstance(e, AllBlocksCleared) for e in events) == 2
+    present: set[int | None] = set()
+    for event in events:
+        if isinstance(event, AllBlocksCleared):
+            present.clear()
+        elif isinstance(event, BlockStored):
+            present.add(event.group_idx)
+    # Compressor ring (group 1) has no prefix-cache entries.
+    assert present == set(range(len(manager.kv_cache_config.kv_cache_groups))) - {1}
+    assert not manager.take_events()
+
+
+@pytest.mark.parametrize("evict", [False, True])
+def test_bare_failure_ids_rejected_before_touching_running_peer(evict):
+    from .test_long_context_admission import build, make_requests
+
+    scheduler = build(settings(state_blocks=28))
+    manager = scheduler.kv_cache_manager
+    a, b = make_requests(2, 4 * SPAN, 1)
+    assert manager.allocate_slots(a, 2 * SPAN)
+    assert manager.allocate_slots(b, 2 * SPAN, delay_cache_blocks=True)
+    a.num_computed_tokens = b.num_computed_tokens = 2 * SPAN
+    a.status = RequestStatus.RUNNING
+    b.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+    bad = manager.get_block_ids(b.request_id)[0][0]
+    assert bad not in manager.get_block_ids(a.request_id)[0]
+    assert any(bad in group for group in manager.get_block_ids(a.request_id)[2:])
+    with pytest.raises(ValueError, match="Bare invalid_block_ids"):
+        scheduler._update_requests_with_invalid_blocks(
+            [a, b], {bad}, {}, evict_blocks=evict
+        )
+    assert a.status == RequestStatus.RUNNING
+    assert a.num_computed_tokens == b.num_computed_tokens == 2 * SPAN
+    manager.free(a)
+    manager.free(b)

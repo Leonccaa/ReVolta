@@ -101,7 +101,8 @@ def test_real_quota_loss_revokes_evidence_and_refreshes_cpu_value(tmp_path):
         settle(env, lambda: m.table.is_persisted(m.table.get(h)))
         b = m.units.begin(sha256(1), [key(1, 1)])
         m.units.finish(b.uid, b.gen)
-        assert m.units.value(key(1, 1), PageKind.STATE) == ValueClass.SSD_REDUNDANT
+        # A B inventory alone has no committed cold-recovery manifest.
+        assert m.units.value(key(1, 1), PageKind.STATE) == ValueClass.LEAF
         h2 = publish(m.table, key(2, 1), PageKind.STATE)
         settle(env, lambda: m.table.is_persisted(m.table.get(h2)))
         env.ssd.poll()
@@ -127,7 +128,7 @@ def test_shutdown_completes_unexpired_component_write(tmp_path):
         env.ssd.close(io_grace_s=5)
 
 
-def test_quota_deletion_before_store_receipt_cannot_create_false_evidence(tmp_path):
+def test_quota_cannot_delete_file_before_store_receipt(tmp_path):
     env = Env(tmp_path, pages=8, max_files=1, write_threads=2, write_delay_s=300)
     try:
         m = attach(env)
@@ -142,12 +143,16 @@ def test_quota_deletion_before_store_receipt_cannot_create_false_evidence(tmp_pa
         assert tier._pool._finished_q
         env.ssd._new_job(m.table.get(h2), False)
         env.ssd._pump()
-        while len(tier._pool._finished_q) < 2 and time.monotonic() < deadline:
-            time.sleep(0.001)
-        assert len(tier._pool._finished_q) == 2
-        # Both writes succeeded, but the second file replaced the first in
-        # the one-file root before either scheduler receipt was consumed.
+        # The first write's reservation protects its file through receipt.
+        # The one-file budget refuses the second write until it retires.
         env.ssd.poll()
+        assert m.table.is_persisted(m.table.get(h1))
+        assert not m.table.is_persisted(m.table.get(h2))
+        # End the orphan grace period before explicitly retrying quota use.
+        env.ssd.options["write_delay_s"] = 0
+        env.ssd._new_job(m.table.get(h2), False)
+        env.ssd._pump()
+        settle(env, lambda: m.table.is_persisted(m.table.get(h2)))
         assert not m.table.is_persisted(m.table.get(h1))
         assert m.table.is_persisted(m.table.get(h2))
         assert m.units.components[key(1, 1)].persisted is None
@@ -271,7 +276,10 @@ def test_full_leaf_writeback_cannot_refuse_reserved_foreground_frame(tmp_path, f
         assert held[0].page_id == old_main[0].page_id
         assert v.uid not in m.units.units
         assert m.units.events["revoke_value"] >= 1
-        assert env.ssd._jobs
+        # Whole-unit source protection cannot spend the caller's reserved
+        # foreground capacity. Pressure releases the variant guarantee.
+        assert env.ssd.unit_store.credit.events["guarantee_revoked_pressure"] == 1
+        assert not env.ssd.unit_store.writes
         for job in env.ssd._jobs.values():
             assert job.handle not in held
             assert job.job_id in m.table.get(job.handle).io

@@ -79,6 +79,9 @@ class UnitValuePolicy:
         return int(value), page.lru_clock
 
     def select(self, pending: int, writeback: bool) -> HostPage | None:
+        store = getattr(self.table.persistence, "unit_store", None)
+        if store is not None:
+            return self._select_units(store, pending, writeback)
         seen: set[UnitId] = set()
         deferred: deque[tuple[int, int, int, int, int]] = deque()
         work = 0
@@ -151,6 +154,104 @@ class UnitValuePolicy:
                 # Revocation refreshes all affected pages through _refresh.
                 # A remaining shared leaf may still require another pass.
             return None
+        finally:
+            for entry in deferred:
+                if self._valid(entry):
+                    heappush(self.heap, entry)
+            self.work_max = max(self.work_max, work)
+
+    def _select_units(self, store, pending: int, writeback: bool) -> HostPage | None:
+        seen: set[UnitId] = set()
+        deferred = []
+        work = 0
+        try:
+            while True:
+                while self.heap:
+                    entry = heappop(self.heap)
+                    work += 1
+                    if not self._valid(entry):
+                        continue
+                    page = self.table.pages[entry[2]]
+                    assert page.key is not None
+                    if (
+                        self.units.value(page.key, page.kind)
+                        <= ValueClass.SSD_REDUNDANT
+                    ):
+                        return page
+                    refs = [
+                        self.units.units[uid]
+                        for uid in self.units.components[page.key].refs
+                        if uid not in seen
+                    ]
+                    if not refs:
+                        deferred.append(entry)
+                        continue
+                    unit = min(
+                        refs,
+                        key=lambda u: (
+                            not self.units.interior(u),
+                            u.parent is None and bool(u.variants),
+                            u.last_use,
+                        ),
+                    )
+                    seen.add(unit.uid)
+                    if self.units.interior(unit):
+                        self.units.revoke(unit.uid, unit.gen, "value")
+                        continue
+                    if unit.parent is None and unit.variants:
+                        deferred.append(entry)
+                        continue
+                    if (
+                        writeback
+                        and unit.parent is not None
+                        and store.start_write(unit, self.table.net_headroom(pending))
+                    ):
+                        deferred.append(entry)
+                        continue
+                    if unit.uid in store.credit.guaranteed:
+                        deferred.append(entry)
+                        continue
+                    if (
+                        unit.parent is None
+                        and writeback
+                        and self.table.persistence is not None
+                        and self.table.persistence.try_writeback(
+                            page, self.table.net_headroom(pending)
+                        )
+                    ):
+                        deferred.append(entry)
+                        continue
+                    self.units.events["unit_evict_unwritten"] += 1
+                    self.units.revoke(unit.uid, unit.gen, "value")
+                ordinary = {}
+                for entry in deferred:
+                    if not self._valid(entry):
+                        continue
+                    page = self.table.pages[entry[2]]
+                    assert page.key is not None
+                    for uid in self.units.components[page.key].refs:
+                        unit = self.units.units[uid]
+                        if (
+                            uid not in store.credit.guaranteed
+                            and not unit.variants & store.credit.guaranteed
+                        ):
+                            ordinary[uid] = unit
+                if ordinary:
+                    unit = min(ordinary.values(), key=lambda u: u.last_use)
+                    self.units.revoke(unit.uid, unit.gen, "value")
+                    writeback = False
+                    continue
+                # Every ordinary candidate was considered. Revoke the oldest
+                # remaining guarantee, retaining all physical IO owners.
+                candidates = [
+                    self.units.units[uid] for uid in seen & store.credit.guaranteed
+                ]
+                if not candidates:
+                    return None
+                unit = min(candidates, key=lambda u: u.last_use)
+                store.credit.pressure(unit.uid)
+                self.units.revoke(unit.uid, unit.gen, "value")
+                writeback = False
         finally:
             for entry in deferred:
                 if self._valid(entry):

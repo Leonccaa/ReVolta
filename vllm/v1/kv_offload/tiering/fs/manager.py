@@ -65,6 +65,7 @@ class FileSystemTierManager(SecondaryTierManager):
         max_size_bytes: int | None = None,
         min_free_bytes: int | None = None,
         max_files: int = 1_000_000,
+        external_eviction: bool = False,
     ):
         """
         Args:
@@ -104,7 +105,7 @@ class FileSystemTierManager(SecondaryTierManager):
         ):
             raise ValueError("FS tier requires at least one I/O thread")
         self._cache = FileSystemCache.acquire(
-            root_dir, max_size_bytes, min_free_bytes, max_files
+            root_dir, max_size_bytes, min_free_bytes, max_files, external_eviction
         )
         self._closed = False
         try:

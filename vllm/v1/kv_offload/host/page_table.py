@@ -512,6 +512,18 @@ class HostPageTable:
                 self.persistence.on_published(handle)
         return page.state == PageState.READY
 
+    def install_loading(self, handle: PageHandle, key: OffloadKey) -> None:
+        """Assign an identity to a transaction's already-reserved target."""
+        page = self.get(handle)
+        if page.state != PageState.PRIVATE or page.key is not None or key in self.index:
+            raise ValueError("Loading target must be private and uniquely reserved")
+        page.key = key
+        page.group = get_offload_group_idx(key)
+        page.kind = self.kind_for_key(key)
+        self._set_state(page, PageState.LOADING)
+        self.index[key] = handle
+        self._refresh(page)
+
     def complete_load(self, handle: PageHandle, ok: bool) -> bool:
         """Finish an SSD read into a LOADING page; the caller retires its IO.
 

@@ -978,10 +978,14 @@ def _host_store_checks(
     checks.append(
         check(
             "history segment bytes equal the plan (tensors + store metadata)",
-            history_tensor_bytes + store["metadata_bytes"] == plan["gpu_history_bytes"],
+            history_tensor_bytes
+            + store["metadata_bytes"]
+            + store.get("per_slot_gpu_bytes", 0)
+            == plan["gpu_history_bytes"],
             {
                 "tensors": history_tensor_bytes,
                 "store_metadata": store["metadata_bytes"],
+                "per_slot": store.get("per_slot_gpu_bytes", 0),
                 "plan": plan["gpu_history_bytes"],
             },
         )
@@ -1009,9 +1013,11 @@ def _host_store_checks(
     workers = int(geometry.get("num_workers") or 1)
     physical_pages = store.get("physical_host_pages", store["num_blocks"])
     shared_host_bytes = store.get("shared_host_bytes", store["host_bytes"] * workers)
+    # The shared hot region shared region decouples history IDs from host pages.
+    aliased = bool(store.get("hot_aliases_index"))
     pages_ok = (
         store["num_blocks"] == history_n
-        and store["num_blocks"] <= plan["host_history_blocks"]
+        and (aliased or store["num_blocks"] <= plan["host_history_blocks"])
         and store["page_bytes"] == int(geometry["main_kv_bytes_per_block"])
         and physical_pages <= plan["host_history_blocks"]
         and store["host_bytes"] == physical_pages * store["page_bytes"]
@@ -1036,10 +1042,13 @@ def _host_store_checks(
         geometry, int(plan["hot_pool_groups"]), int(plan["max_num_seqs"])
     )
     hot_plan = plan.get("gpu_hot_pool_bytes", plan["hot_pool_bytes"])
+    # Shared region: the null ID page aliases k reserved slots the plan's
+    # U = (A - 1) k leaves out.
+    null_slots = int(store.get("slots_per_block", 0)) if aliased else 0
     checks.append(
         check(
             "hot pool matches the plan",
-            store["hot_slots"] == plan["hot_pool_groups"]
+            store["hot_slots"] == plan["hot_pool_groups"] + null_slots
             and store["hot_bytes"] + store.get("scratch_gpu_bytes", 0) == hot_plan
             and store["rows_per_pass"] == expected_rows,
             {
@@ -1147,6 +1156,7 @@ def segment_tensor_checks(structure: dict[str, Any], arm: str) -> list[dict[str,
         store = structure.get("host_store") or {}
         used += (
             store.get("metadata_bytes", 0)
+            + store.get("per_slot_gpu_bytes", 0)
             + store.get("hot_bytes", 0)
             + store.get("scratch_gpu_bytes", 0)
             + int(plan.get("staging_bytes", 0))
@@ -1325,6 +1335,10 @@ def _host_store_dict(
         return tensor.numel() * tensor.element_size()
 
     shape = store.shape
+    # shared hot region shared region: one hot view per layer aliases that layer's index
+    # storage, which the history segment already counts; no separate bytes.
+    aliased = isinstance(store.hot, (list, tuple))
+    hot_bytes = 0 if aliased else nbytes(store.hot)
     planned = sum(
         nbytes(getattr(store, name))
         for name in _HOST_STORE_PLANNED
@@ -1338,6 +1352,12 @@ def _host_store_dict(
         and name not in skip
         and value.device.type != "cpu"
     }
+    per_slot: dict[str, int] = {}
+    if aliased:
+        from vllm.models.qwen4_exp.nvidia.host_kv.budget import SHARED_PER_SLOT
+
+        # Billed per history ID in the history segment, not as hot scratch.
+        per_slot = {n: other.pop(n) for n in sorted(SHARED_PER_SLOT) if n in other}
     bound = [
         name
         for name in host_layers
@@ -1367,13 +1387,17 @@ def _host_store_dict(
         "host_pinned": pinned,
         "metadata_bytes": planned,
         "hot_slots": shape.hot_slots,
-        "hot_bytes": nbytes(store.hot),
+        "hot_bytes": hot_bytes,
+        "hot_aliases_index": aliased,
+        "slots_per_block": getattr(shape, "slots_per_block", 0),
         "rows_per_pass": shape.rows_per_pass,
         "max_requests": shape.max_requests,
         "selection_width": shape.selection_width,
         "max_write_rows": shape.max_write_rows,
         "scratch_gpu_bytes": sum(other.values()),
         "scratch_gpu_tensors": other,
+        "per_slot_gpu_bytes": sum(per_slot.values()),
+        "per_slot_gpu_tensors": per_slot,
         "layers": list(store.layer_index),
         "bound_layers": bound,
     }
@@ -1514,7 +1538,11 @@ def _pool_state(sched: Any) -> list[dict[str, int]]:
         {
             "blocks": p.num_gpu_blocks,
             "usable": p.num_gpu_blocks - 1,
-            "free": p.get_num_free_blocks(),
+            # The elastic pool's free count reserves the hot floor (GPU
+            # admission); an idle pool is fully free physically.
+            "free": p.num_physically_free_blocks()
+            if getattr(p, "elastic", False)
+            else p.get_num_free_blocks(),
         }
         for p in _pools(sched)
     ]

@@ -204,6 +204,30 @@ def test_delay_is_respected_and_due_pages_are_written(tmp_path, envs):
     assert len(page_files(tmp_path / "ssd")) == 1
 
 
+def test_write_volume_counts_completed_writes_only(tmp_path, envs, monkeypatch):
+    """delayed_written and the 24 h volume are charged when a store completes;
+    a failed store is not charged (it wrote nothing durable)."""
+    env = envs(tmp_path / "ssd")
+    write = ssd_module.store_verified_block
+
+    def broken(*args, **kwargs):
+        raise OSError(28, "injected: no space left")
+
+    monkeypatch.setattr(ssd_module, "store_verified_block", broken)
+    failed = env.publish(1)
+    assert env.settle(lambda: env.ssd.stats().get("store_failures") == 1)
+    stats = env.ssd.stats()
+    assert stats.get("delayed_written", 0) == 0
+    assert stats["delayed_written_bytes_24h"] == 0
+    assert not env.table.is_persisted(env.table.get(failed))
+    monkeypatch.setattr(ssd_module, "store_verified_block", write)
+    done = env.publish(2)
+    assert env.settle(lambda: env.table.is_persisted(env.table.get(done)))
+    stats = env.ssd.stats()
+    assert stats["delayed_written"] == 1 and stats["pages_written"] == 1
+    assert stats["delayed_written_bytes_24h"] == ROW
+
+
 # ---------------------------------------------------------------- item 2
 
 

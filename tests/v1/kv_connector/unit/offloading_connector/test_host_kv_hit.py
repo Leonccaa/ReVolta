@@ -336,7 +336,9 @@ def test_cold_promotion_reports_only_verified_common_prefix(tmp_path, caches, da
     request = _request(10)
     keys = host_keys(first, request, 7)
     stored(first, keys)
-    paths_on_disk = [Path(first._tier.file_mapper.get_file_name(k)) for k in keys]
+    paths_on_disk = [
+        Path(first._tier.file_mapper.get_file_name(first.tier_key(k))) for k in keys
+    ]
     first.close()
     if damage == "hash":
         shutil.copy2(paths_on_disk[0], paths_on_disk[1])

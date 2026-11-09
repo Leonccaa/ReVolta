@@ -238,6 +238,28 @@ def test_real_files_restart_read_directly_into_new_host_pool(tmp_path, caches):
     prefix.release()
 
 
+def test_full_length_page_key_is_written_and_hits_after_restart(tmp_path, caches):
+    """A concatenated page key (98 x 32-byte hashes + group) would need a
+    6272-character file name. The SSD file is keyed by a fixed-length digest,
+    stable across restarts, and the stored identity still binds the key."""
+    root = tmp_path / "ssd"
+    long_key = make_offload_key(b"".join(sha256(i) for i in range(98)), 3)
+    assert len(long_key) == 98 * 32 + 4
+    first = caches(root)
+    stored(first, [long_key])
+    path = Path(first._tier.file_mapper.get_file_name(first.tier_key(long_key)))
+    assert path.is_file() and len(path.name) < 255
+    first.close()
+    second = caches(root)
+    assert second.prefetch(long_key)
+    assert second.flush(5)
+    assert second.stats().get("load_failures", 0) == 0
+    prefix = second.acquire_prefix([long_key])
+    assert prefix.available_tokens == BLOCK_TOKENS
+    assert bytes(prefix.pages[0].view) == payload(0)
+    prefix.release()
+
+
 def test_aggregate_worker_rows_share_authoritative_mmap_and_restore(tmp_path, caches):
     root = tmp_path / "ssd"
     backing = mmap.mmap(-1, 2 * 2 * PAGE_BYTES)
@@ -283,8 +305,8 @@ def test_corruption_is_a_miss_and_never_publishes_partial_bytes(
     first = caches(root)
     keys = [key(1), key(2)]
     stored(first, keys)
-    path = Path(first._tier.file_mapper.get_file_name(keys[1]))
-    head_path = Path(first._tier.file_mapper.get_file_name(keys[0]))
+    path = Path(first._tier.file_mapper.get_file_name(first.tier_key(keys[1])))
+    head_path = Path(first._tier.file_mapper.get_file_name(first.tier_key(keys[0])))
     first.close()
     if damage == "hash":
         shutil.copy2(head_path, path)  # Includes the wrong full key in its xattr.
@@ -318,7 +340,7 @@ def test_incompatible_identity_cannot_reuse_host_pages(tmp_path, caches, changed
     root = tmp_path / "ssd"
     first = caches(root)
     stored(first, [key(1)])
-    original = first._tier.file_mapper.get_file_name(key(1))
+    original = first._tier.file_mapper.get_file_name(first.tier_key(key(1)))
     first.close()
     layout = LAYOUT
     if changed == "scales":
@@ -346,7 +368,9 @@ def test_incompatible_identity_cannot_reuse_host_pages(tmp_path, caches, changed
         second = caches(root, layout=layout)
     try:
         assert second.enabled
-        assert second._tier.file_mapper.get_file_name(key(1)) != original
+        assert (
+            second._tier.file_mapper.get_file_name(second.tier_key(key(1))) != original
+        )
         assert not second.prefetch(key(1))
         assert second.acquire_prefix([key(1)]).available_tokens == 0
     finally:
@@ -362,7 +386,7 @@ def test_store_failure_keeps_ram_and_leaves_no_persisted_hit(
 ):
     c = caches(tmp_path / "ssd")
     commit(c.pool, key(1))
-    path = Path(c._tier.file_mapper.get_file_name(key(1)))
+    path = Path(c._tier.file_mapper.get_file_name(c.tier_key(key(1))))
 
     def fail(*args, **kwargs):
         raise OSError(failure, "injected write failure")

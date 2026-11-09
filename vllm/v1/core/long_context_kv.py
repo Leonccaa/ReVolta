@@ -910,8 +910,15 @@ class LongContextAdmissionLedger:
             if pool is not None and domain == HOST:
                 # The candidate's evictable hit IDs are in the block demand,
                 # but they keep their own pages: only fresh pages need room.
-                if demand[domain] - pool.host_kept_free() > (
-                    pool.host_reclaimable_after()
+                # Free-list pages are a lower bound of Reclaimable_after, so
+                # the O(pages + cached IDs) scan runs only when they do not
+                # cover the need (admit runs for every allocating request on
+                # every step; most decode steps need no fresh page).
+                fresh = demand[domain] - pool.host_kept_free()
+                if (
+                    fresh > 0
+                    and fresh > pool.host_pages.num_free()
+                    and fresh > pool.host_reclaimable_after()
                 ):
                     return domain
                 continue

@@ -9,6 +9,7 @@ can publish a verified read, and that publication is local to this KV group.
 """
 
 import copy
+import hashlib
 import math
 import threading
 import time
@@ -18,7 +19,13 @@ from dataclasses import asdict, dataclass
 
 import numpy as np
 
-from vllm.v1.kv_offload.base import OffloadingSpec, OffloadKey, ReqContext
+from vllm.v1.kv_offload.base import (
+    OffloadingSpec,
+    OffloadKey,
+    ReqContext,
+    get_offload_group_idx,
+    make_offload_key,
+)
 from vllm.v1.kv_offload.host.pool import HostKVPage, HostKVPool, HostKVPrefix
 from vllm.v1.kv_offload.tiering.base import JobMetadata
 from vllm.v1.kv_offload.tiering.fs.config import host_kv_ssd_config
@@ -29,6 +36,19 @@ from vllm.v1.kv_offload.tiering.fs.revolta import (
     load_verified_block,
     store_verified_block,
 )
+
+
+def host_page_tier_key(key: OffloadKey, salt: bytes = b"") -> OffloadKey:
+    """Fixed-length SSD key for a host page key.
+
+    A host page's block hash may concatenate the hashes of every hash block
+    it covers (98 x 32 bytes for a 1568-token page), and the file name is the
+    key's hex, far over the 255-byte limit. Files are keyed by a SHA-256 of
+    the full key instead; the file's xattr binds that digest, so the identity
+    check still holds. An empty salt is stable across restarts.
+    """
+    digest = hashlib.sha256(salt + bytes(key)).digest()
+    return make_offload_key(digest, get_offload_group_idx(key))
 
 
 @dataclass(frozen=True)
@@ -177,6 +197,7 @@ class HostKVPrefixCache:
                 "block_tokens": pool.block_tokens,
                 "page_bytes": pool.page_bytes,
                 "io": "buffered-host-direct-v1",
+                "key": "sha256",
             },
         }
         self._tier = _HostTier(
@@ -203,6 +224,11 @@ class HostKVPrefixCache:
     @property
     def enabled(self) -> bool:
         return not self._closed and self._tier is not None and not self._tier.disabled
+
+    @staticmethod
+    def tier_key(key: OffloadKey) -> OffloadKey:
+        """SSD file key of a host page key (fixed length, restart stable)."""
+        return host_page_tier_key(key)
 
     @property
     def pending_blocks(self) -> int:
@@ -237,7 +263,7 @@ class HostKVPrefixCache:
         self._pending[job_id] = (page, loading)
         job = JobMetadata(
             job_id=job_id,
-            keys=[page.key],
+            keys=[self.tier_key(page.key)],
             block_ids=np.array([page.block_id], dtype=np.int64),
             is_promotion=loading,
             req_context=ReqContext(req_id="host-kv-prefix"),
@@ -277,7 +303,7 @@ class HostKVPrefixCache:
         if tier is None:
             return False
         try:
-            if tier.lookup(key) is not True:
+            if tier.lookup(self.tier_key(key)) is not True:
                 return False
         except OSError:
             self._stats["lookup_failures"] += 1
@@ -313,7 +339,7 @@ class HostKVPrefixCache:
         self._stats["group_prefix_queries"] += 1
         self._stats["group_prefix_tokens"] += prefix.available_tokens
         if self.enabled and self._tier is not None and prefix.pages:
-            self._tier.touch([page.key for page in prefix.pages])
+            self._tier.touch([self.tier_key(page.key) for page in prefix.pages])
         return prefix
 
     def flush(self, timeout: float) -> bool:

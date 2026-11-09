@@ -367,6 +367,9 @@ class Scheduler(SchedulerInterface):
             if hits is not None:
                 assert self.connector.connector_scheduler is not None
                 hits.attach_connector(self.connector.connector_scheduler)
+        self.value_arbiter: Any = None
+        self._value_step_clock: float | None = None
+        self._init_value_arbiter()
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
         )
@@ -1649,6 +1652,7 @@ class Scheduler(SchedulerInterface):
                     start = sum(gpu.group_sizes[:group_id])
                     end = start + gpu.group_sizes[group_id]
                     host_pool.track_job(job_id, gpu.block_ids[start:end].tolist())
+            arbiter_epoch = self._value_arbiter_step()
             # Roles after job tracking: an ID with an in-flight transfer is
             # held, never donated to the hot region this step.
             roles = host_pool.finish_roles()
@@ -1663,6 +1667,7 @@ class Scheduler(SchedulerInterface):
                 requests=self._host_kv_batch(num_scheduled_tokens)
                 if host_pool.elastic
                 else {},
+                arbiter_epoch=arbiter_epoch,
             )
             host_pool.binding_updates.clear()
             scheduler_output.new_block_ids_to_zero = host_pool.filter_zero_ids(
@@ -1689,6 +1694,80 @@ class Scheduler(SchedulerInterface):
         if host_hits is not None:
             host_hits.release_uncommitted()
         return scheduler_output
+
+    def _init_value_arbiter(self) -> None:
+        """value arbitration: bounded value feedback on T_idx, only for the shared
+        region
+        with ``long_context_kv.value_arbitration`` (otherwise T_idx keeps the
+        shared hot region default split and nothing here runs)."""
+        pool = self.host_history_pool
+        ledger = self.kv_cache_manager.admission_ledger
+        if (
+            pool is None
+            or not pool.elastic
+            or ledger is None
+            or not ledger.plan.value_shadow
+        ):
+            return
+        from vllm.v1.core.value_arbiter import ArbiterConfig, ValueArbiter
+
+        settings = self.vllm_config.kernel_config.long_context_kv
+        config = ArbiterConfig.from_settings(
+            settings.value_arbitration, settings.value_arbiter_settings
+        )
+        if not config.enabled:
+            return
+        geo = ledger.plan.geometry
+        layers = max(geo.hot_layers, 1)
+        arbiter = ValueArbiter(
+            config,
+            pool,
+            default_target=pool.index_cache_target,
+            slot_bytes=geo.hot_slot_bytes // layers,
+            index_block_bytes=geo.index_bytes_per_block,
+            num_ranks=pool.host_pages.num_workers,
+            hot_layers=layers,
+            forced_counts=lambda: pool.stats,
+        )
+        self.value_arbiter = arbiter
+        pool.value_observer = arbiter.on_index_evicted
+        scheduler = getattr(self.connector, "connector_scheduler", None)
+        if scheduler is not None:
+            scheduler.value_restore_hook = self._value_restore
+
+    def _value_restore(self, txn) -> None:
+        """A receive every rank completed without a failure: its NEW_LOAD
+        entries copied index pages host -> GPU (keyed like evictions: the
+        canonical page's offload key)."""
+        pool = self.host_history_pool
+        arbiter = getattr(self, "value_arbiter", None)
+        if txn.cancelled or pool is None or arbiter is None:
+            return
+        hashes = []
+        for entry in txn.new_loads:
+            try:
+                page = pool.host_pages.get(entry.handle)
+            except ValueError:
+                continue
+            if page.key is not None:
+                hashes.append(page.key)
+        if hashes:
+            arbiter.on_index_restored(hashes)
+
+    def _value_arbiter_step(self) -> int | None:
+        """Per host-KV step, before the roles are finished: register the
+        step, evaluate closed windows (value donations join this step's
+        roles) and return the worker's shadow epoch."""
+        arbiter = getattr(self, "value_arbiter", None)
+        if arbiter is None:
+            return None
+        now = time.monotonic()
+        last, self._value_step_clock = self._value_step_clock, now
+        epoch = arbiter.begin_step(
+            self.current_step, None if last is None else now - last
+        )
+        arbiter.end_step(self.current_step)
+        return epoch
 
     def _host_kv_batch(
         self, num_scheduled_tokens: dict[str, int]
@@ -3233,6 +3312,11 @@ class Scheduler(SchedulerInterface):
         pool.complete_jobs(meta.completed_jobs)
         for step, ranks in meta.completed_steps.items():
             pool.host_pages.complete_step(step, ranks)
+        arbiter = getattr(self, "value_arbiter", None)
+        if arbiter is not None:
+            all_ranks = pool.host_pages.all_ranks
+            for step, (ranks, values) in meta.value_counters.items():
+                arbiter.add_rank_counters(step, ranks, values, all_ranks)
 
     def shutdown(self, deadline: float | None = None) -> None:
         ssd = getattr(self, "host_kv_ssd", None)

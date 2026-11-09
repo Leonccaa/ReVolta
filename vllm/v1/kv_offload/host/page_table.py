@@ -68,6 +68,8 @@ class HostKVStep:
     requests: dict[str, tuple[int, int, int]] = field(default_factory=dict)
     """CPU batch metadata: req_id -> (query rows, G_q, class), class 0 for
     decode/verify rows and 1 for prefill. Planner input on every rank."""
+    arbiter_epoch: int | None = None
+    """value arbitration value-arbitration window; None when arbitration is off."""
 
 
 @dataclass

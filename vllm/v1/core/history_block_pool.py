@@ -22,7 +22,7 @@ the per-step role changes (donate, then claim) on the forward stream before
 zeroing and beginning new IDs, so every rank sees the same hot capacity.
 """
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
 from vllm.v1.core.block_pool import BlockPool
@@ -60,6 +60,10 @@ class SharedRegionStep:
 class HistoryBlockPool(BlockPool):
     slots_per_block = 0
     """k: hot slots per history ID page; 0 keeps the static page ownership hot pool."""
+    value_observer: Callable[[bytes], None] | None = None
+    """value arbitration: told every unreferenced cached ID that gives up its prefix
+    (value, allocation, floor or host reclaim), as the offload key of its
+    bound host page (the key a later NEW_LOAD restores), else its GPU hash."""
 
     def configure_host(self, num_pages: int, num_workers: int, group_id: int) -> None:
         self.host_pages = HostPageTable(num_pages, num_workers)
@@ -127,6 +131,7 @@ class HistoryBlockPool(BlockPool):
         self._dirty: set[int] = set()
         self.keep_hids: frozenset[int] = frozenset()
         self.stats = {
+            "cached_evicted_for_value": 0,
             "cached_evicted_for_floor": 0,
             "cached_evicted_for_host": 0,
             "cached_evicted_for_allocation": 0,
@@ -145,6 +150,49 @@ class HistoryBlockPool(BlockPool):
 
     def num_cached_free(self) -> int:
         return self.free_block_queue.num_free_blocks
+
+    # ----- value arbitration value arbitration
+    # ----------------------------------------------
+
+    def arbiter_snapshot(self):
+        from vllm.v1.core.value_arbiter import PoolSnapshot
+
+        usable = self.num_gpu_blocks - 1
+        cached, donated = self.num_cached_free(), self.num_donated()
+        # In use: referenced (ring, parked, idle sessions) plus held/draining.
+        return PoolSnapshot(
+            usable, usable - cached - donated, self.floor_blocks(), cached
+        )
+
+    def set_index_cache_target(self, target: int) -> None:
+        self.index_cache_target = target
+
+    def donate_cached_for_value(self, num_blocks: int) -> int:
+        """Give the LRU cached IDs to the hot region (a value adjustment)."""
+        given = 0
+        while given < num_blocks and self.free_block_queue.num_free_blocks:
+            block = self.free_block_queue.popleft()
+            self._maybe_evict_cached_block(block)
+            self.stats["cached_evicted_for_value"] += 1
+            self._to_donated(block)
+            given += 1
+        return given
+
+    def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
+        block_hash = block.block_hash
+        evicted = super()._maybe_evict_cached_block(block)
+        observer = self.value_observer
+        if evicted and observer is not None and block.ref_cnt == 0:
+            assert block_hash is not None
+            key: bytes | None = None
+            handle = getattr(self, "bindings", {}).get(block.block_id)
+            if handle is not None:
+                try:
+                    key = self.host_pages.get(handle).key
+                except ValueError:
+                    key = None
+            observer(get_block_hash(block_hash) if key is None else key)
+        return evicted
 
     def raw_free_blocks(self) -> int:
         """Unreferenced IDs that allocation may take (cached plus donated)."""

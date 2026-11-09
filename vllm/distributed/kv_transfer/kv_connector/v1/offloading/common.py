@@ -43,10 +43,18 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
     """
 
     completed_jobs: dict[int, int] = field(default_factory=dict)
+    # Completed jobs that failed on a worker (counted like completed_jobs).
+    # Reported only when load_failure_recompute_enabled; a failed job is also
+    # in completed_jobs so the scheduler releases its bookkeeping as usual.
+    failed_jobs: dict[int, int] = field(default_factory=dict)
 
     def mark_completed(self, job_id: int) -> None:
         """Record a transfer job completion from this worker."""
         self.completed_jobs[job_id] = 1
+
+    def mark_failed(self, job_id: int) -> None:
+        """Record that this worker's part of a completed job failed."""
+        self.failed_jobs[job_id] = 1
 
     def aggregate(
         self, other: "KVConnectorWorkerMetadata"
@@ -56,5 +64,8 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
         merged = dict(self.completed_jobs)
         for job_id, v in other.completed_jobs.items():
             merged[job_id] = merged.get(job_id, 0) + v
+        failed = dict(self.failed_jobs)
+        for job_id, v in other.failed_jobs.items():
+            failed[job_id] = failed.get(job_id, 0) + v
 
-        return OffloadingWorkerMetadata(completed_jobs=merged)
+        return OffloadingWorkerMetadata(completed_jobs=merged, failed_jobs=failed)

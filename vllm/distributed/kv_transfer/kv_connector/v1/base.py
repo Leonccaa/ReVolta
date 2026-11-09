@@ -455,6 +455,20 @@ class KVConnectorBase_V1(ABC):
     # Scheduler-side methods
     # ==============================
 
+    def take_failed_loads(self) -> set[str]:
+        """Requests whose external KV load was abandoned since the last call.
+
+        Scheduler-side. A connector that finds, after
+        ``update_state_after_alloc`` committed a load, that it cannot restore
+        a complete prefix (or learns from its workers that the transfer
+        failed) reports the request here instead of raising. The scheduler
+        then voids the request's external hit, releases its blocks and
+        schedules it again; the connector must not offer an external hit for
+        that request's next lookup. Called only when
+        ``load_failure_recompute_enabled``; the default reports nothing.
+        """
+        return set()
+
     def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
         """
         Bind the GPU block pool to the connector for per-GPU block status tracking.

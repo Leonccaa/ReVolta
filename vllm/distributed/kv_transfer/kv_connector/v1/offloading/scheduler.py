@@ -65,6 +65,7 @@ logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm.v1.kv_offload.cpu.dependency import CPUBlockDependencyIndex
+    from vllm.v1.kv_offload.host.hit import HostKVHitManager
 
 
 @dataclass(slots=True)
@@ -204,7 +205,7 @@ def _connector_hit_needs(
             needs[group.group_idx] = (
                 HitNeed.WINDOW,
                 block,
-                cdiv(spec.sliding_window - 1, block),
+                spec.sliding_window - 1,
             )
         else:
             needs[group.group_idx] = (HitNeed.UNCHECKED, block, 0)
@@ -480,6 +481,8 @@ def _create_req_context(req: Request) -> ReqContext:
 class OffloadingConnectorScheduler:
     """Implementation of Scheduler side methods"""
 
+    host_kv_hits: "HostKVHitManager | None" = None
+
     # Mamba boundary-state hand-offs the host tier could not accept in the
     # step they were offered (see _build_boundary_state_store_jobs).
     num_rejected_boundary_offers: int = 0
@@ -533,6 +536,7 @@ class OffloadingConnectorScheduler:
                     _connector_hit_needs(self.config, spec.kv_cache_config)
                 ),
                 path="offloading-connector",
+                hash_block_size=self._hash_block_size,
             )
 
         # Broken loads void the external hit and recompute instead of raising
@@ -865,7 +869,11 @@ class OffloadingConnectorScheduler:
                     max_hit_size_tokens, self._mamba_align_size
                 )
         if hit_cap is not None and hit_cap < max_hit_size_tokens:
-            max_hit_size_tokens = hit_cap
+            # PREFIX probes cap the final usable prefix. Mamba's EAGLE
+            # lookbehind still needs the original extra-page search horizon.
+            max_hit_size_tokens = min(
+                max_hit_size_tokens, hit_cap + (self._eagle_state_shift or 0)
+            )
             if self._mamba_align_size is not None:
                 max_hit_size_tokens = round_down(
                     max_hit_size_tokens, self._mamba_align_size
@@ -904,6 +912,8 @@ class OffloadingConnectorScheduler:
                         0,
                     )
                     eagle_state_shift = None
+                    if hit_cap is not None:
+                        max_hit_size_tokens = min(max_hit_size_tokens, hit_cap)
                     if shrink is not None:
                         shrink.lower(max_hit_size_tokens, "page_align")
                 group_state: RequestGroupState = req_status.group_states[group_idx]
@@ -1061,6 +1071,19 @@ class OffloadingConnectorScheduler:
     def get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int
     ) -> tuple[int | None, bool]:
+        if not getattr(self, "_recompute_failed_loads", False):
+            return self._get_num_new_matched_tokens(request, num_computed_tokens)
+        try:
+            return self._get_num_new_matched_tokens(request, num_computed_tokens)
+        except (AssertionError, IndexError, KeyError, ValueError, RuntimeError):
+            # Nothing has been admitted or transferred yet. A lookup failure
+            # is a miss, preserving any independently verified local prefix.
+            logger.debug("KV lookup failed for %s", request.request_id, exc_info=True)
+            return 0, False
+
+    def _get_num_new_matched_tokens(
+        self, request: Request, num_computed_tokens: int
+    ) -> tuple[int | None, bool]:
         """
         Get number of new tokens that can be loaded beyond the
         num_computed_tokens.
@@ -1157,6 +1180,25 @@ class OffloadingConnectorScheduler:
     def update_state_after_alloc(
         self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
     ):
+        if not getattr(self, "_recompute_failed_loads", False):
+            return self._update_state_after_alloc(request, blocks, num_external_tokens)
+        try:
+            return self._update_state_after_alloc(request, blocks, num_external_tokens)
+        except (
+            AssertionError,
+            IndexError,
+            KeyError,
+            ValueError,
+            RuntimeError,
+        ) as error:
+            # No worker I/O is submitted until metadata is built. Known tier
+            # managers make prepare_load transactional, so a planning failure
+            # can safely void the complete request before it becomes runnable.
+            self._abandon_load(request.request_id, f"load preparation failed: {error}")
+
+    def _update_state_after_alloc(
+        self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
+    ):
         counters = getattr(self, "_offload_counters", None)
         if counters is not None:
             self._count_admitted_lookup(counters, request, num_external_tokens)
@@ -1165,6 +1207,8 @@ class OffloadingConnectorScheduler:
             return
 
         req_status = self._req_status[request.request_id]
+        # Check before prepare_load pins or a job is inserted.
+        assert not req_status.transfer_jobs
 
         num_locally_computed_tokens = req_status.num_locally_computed_tokens
         num_cached_tokens = num_locally_computed_tokens + num_external_tokens
@@ -1175,7 +1219,10 @@ class OffloadingConnectorScheduler:
         group_sizes: list[int] = [0] * self.config.num_kv_cache_groups
         block_indices: list[int] = [0] * self.config.num_kv_cache_groups
         # group_idx -> (first loaded GPU block, end GPU block); contract only
-        load_plan: dict[int, tuple[int, int]] = {}
+        contract = getattr(self, "hit_contract", None)
+        load_plan: dict[int, tuple[int, int]] | None = (
+            {} if contract is not None else None
+        )
         for group_config in self.config.kv_group_configs:
             group_state = req_status.group_states[group_config.group_idx]
             group_blocks = blocks.blocks[group_config.group_idx]
@@ -1222,10 +1269,11 @@ class OffloadingConnectorScheduler:
             )
             group_sizes[group_config.group_idx] = num_pending_gpu_blocks
             block_indices[group_config.group_idx] = load_start_gpu_block_idx
-            load_plan[group_config.group_idx] = (
-                load_start_gpu_block_idx,
-                num_gpu_blocks,
-            )
+            if load_plan is not None:
+                load_plan[group_config.group_idx] = (
+                    load_start_gpu_block_idx,
+                    num_gpu_blocks,
+                )
 
             # Skip prefix-hit blocks for block-level policy; for
             # request-level, next_stored_block_idx stays at 0 so all
@@ -1255,8 +1303,8 @@ class OffloadingConnectorScheduler:
                     ].is_null
                 )
 
-        contract = getattr(self, "hit_contract", None)
         if contract is not None:
+            assert load_plan is not None
             reason = self._check_load_plan(
                 contract,
                 req_status,
@@ -1306,10 +1354,10 @@ class OffloadingConnectorScheduler:
                 )
                 return
 
-        src_spec = self.manager.prepare_load(keys_to_load, req_status.req_context)
         dst_spec = GPULoadStoreSpec(
             dst_block_ids, group_sizes=group_sizes, block_indices=block_indices
         )
+        src_spec = self.manager.prepare_load(keys_to_load, req_status.req_context)
 
         load_job_id = self._generate_job_id()
         self._current_batch_load_jobs[load_job_id] = TransferJob(
@@ -1317,7 +1365,6 @@ class OffloadingConnectorScheduler:
             transfer_spec=(src_spec, dst_spec),
         )
         # a load can only be issued when no other jobs are pending.
-        assert not req_status.transfer_jobs
         req_status.transfer_jobs.add(load_job_id)
         self._jobs[load_job_id] = TransferJobStatus(
             req_id=request.request_id,
@@ -1338,6 +1385,9 @@ class OffloadingConnectorScheduler:
         self.num_abandoned_loads += 1
         self._failed_loads.add(req_id)
         self._skip_external_once.add(req_id)
+        status = self._req_status.get(req_id)
+        if status is not None:
+            status.draft_reofferable.clear()
         logger.warning_once(
             "Offloading connector abandoned an external KV load and recomputes "
             "the request instead (further cases are logged at debug level)."
@@ -1384,6 +1434,9 @@ class OffloadingConnectorScheduler:
         """``_lookup`` under the cross-group hit contract: bounded by the
         probed stores, and an incomplete answer is reported as a miss."""
         req = req_status.req
+        host_hits = self.host_kv_hits
+        if host_hits is not None:
+            host_hits.cache.poll()
         chain_hash = chain_hash_from_request(req.block_hashes, self._hash_block_size)
         hit_cap = None
         if contract.has_probes:
@@ -1410,6 +1463,11 @@ class OffloadingConnectorScheduler:
         )
         if reason is not None:
             contract.reject(reason, req.request_id)
+            return 0
+        if host_hits is not None and not host_hits.pin_hit(
+            req.request_id, chain_hash, num_computed_tokens + num_hit_tokens
+        ):
+            contract.reject("host prefix could not be pinned", req.request_id)
             return 0
         return num_hit_tokens
 

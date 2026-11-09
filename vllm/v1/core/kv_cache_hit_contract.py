@@ -69,7 +69,7 @@ class HitNeed(enum.Enum):
 
     PREFIX = "prefix"  # every block before L
     STATE = "state"  # the block that ends exactly at L
-    WINDOW = "window"  # the window_blocks blocks before L
+    WINDOW = "window"  # the last window_tokens tokens before L
     NONE = "none"  # never part of a hit (scratch ring / tail)
     UNCHECKED = "unchecked"  # hit semantics this contract does not model
 
@@ -82,7 +82,7 @@ class GroupHitRule:
     # (global scheduler tokens for the GPU cache, offloaded block for the
     # connector).
     block_size: int
-    window_blocks: int = 0
+    window_tokens: int = 0
 
     def required_blocks(self, end_tokens: int, start_tokens: int = 0) -> range:
         """Block indices that must hold valid data for a hit ending at
@@ -91,8 +91,9 @@ class GroupHitRule:
 
         A hit may end inside a full-attention or sliding-window block (the
         connector serves groups of different block sizes without a recurrent
-        page grid); that block is then required too, and a window counts one
-        extra block. A recurrent state must end exactly at the hit, which
+        page grid); that block is then required too. Window retention is
+        measured in tokens before converting to blocks. A recurrent state must
+        end exactly at the hit, which
         ``KVHitContract.check`` enforces before calling this.
         """
         if end_tokens <= 0 or self.need in (HitNeed.NONE, HitNeed.UNCHECKED):
@@ -104,7 +105,7 @@ class GroupHitRule:
         elif self.need is HitNeed.STATE:
             low = full - 1
         else:
-            low = max(0, full - self.window_blocks)
+            low = max(0, end_tokens - self.window_tokens) // self.block_size
         return range(max(low, start_tokens // self.block_size), end)
 
 
@@ -135,8 +136,11 @@ class HitContractStats:
 class KVHitContract:
     """Rules for one lookup path plus optional residency probes."""
 
-    def __init__(self, rules: Sequence[GroupHitRule], path: str):
+    def __init__(
+        self, rules: Sequence[GroupHitRule], path: str, hash_block_size: int = 1
+    ):
         self.path = path
+        self.hash_block_size = hash_block_size
         self.rules: dict[int, GroupHitRule] = {r.group_id: r for r in rules}
         self._probes: dict[int, ResidencyProbe] = {}
         self.stats = HitContractStats()
@@ -156,6 +160,9 @@ class KVHitContract:
         host pool, which the connector neither stores nor loads) is added as a
         PREFIX group of ``block_size`` tokens.
         """
+        span = self.rules[group_id].block_size if group_id in self.rules else block_size
+        if span is not None and span % self.hash_block_size:
+            raise ValueError("Probe block_size must be a multiple of hash_block_size")
         if group_id not in self.rules:
             if block_size is None or block_size <= 0:
                 raise ValueError(
@@ -168,6 +175,25 @@ class KVHitContract:
                 f"group {group_id} is not checked by the {self.path} contract"
             )
         self._probes[group_id] = probe
+
+    @staticmethod
+    def _probe_ready(
+        probe: ResidencyProbe,
+        group_id: int,
+        index: int,
+        block_hash: BlockHash,
+        block_id: int | None,
+    ) -> bool:
+        try:
+            return probe(group_id, index, block_hash, block_id)
+        except Exception:
+            logger.debug(
+                "KV residency probe failed for group %d block %d",
+                group_id,
+                index,
+                exc_info=True,
+            )
+            return False
 
     @property
     def has_probes(self) -> bool:
@@ -186,7 +212,9 @@ class KVHitContract:
                 continue
             for index in range(start_tokens // rule.block_size, cap // rule.block_size):
                 block_hash = chain_hash(rule, index)
-                if block_hash is None or not probe(group_id, index, block_hash, None):
+                if block_hash is None or not self._probe_ready(
+                    probe, group_id, index, block_hash, None
+                ):
                     cap = min(cap, index * rule.block_size)
                     break
         if cap < max_tokens:
@@ -234,8 +262,8 @@ class KVHitContract:
                     block_id = (
                         None if gpu_block_id is None else gpu_block_id(rule, index)
                     )
-                    if block_hash is None or not probe(
-                        rule.group_id, index, block_hash, block_id
+                    if block_hash is None or not self._probe_ready(
+                        probe, rule.group_id, index, block_hash, block_id
                     ):
                         return (
                             f"group {rule.group_id}: block {index} not resident "
@@ -280,14 +308,10 @@ def local_hit_rules(
             need = HitNeed.WINDOW
         else:
             need = HitNeed.UNCHECKED
-        window_blocks = 0
+        window_tokens = 0
         if need is HitNeed.WINDOW:
-            window_blocks = SlidingWindowManager._contiguous_blocks_for_hit(
-                spec.sliding_window,  # type: ignore[attr-defined]
-                manager.block_size,
-                use_eagle=False,
-            )
-        rules.append(GroupHitRule(group_id, need, manager.block_size, window_blocks))
+            window_tokens = spec.sliding_window - 1  # type: ignore[attr-defined]
+        rules.append(GroupHitRule(group_id, need, manager.block_size, window_tokens))
     unchecked = [r.group_id for r in rules if r.need is HitNeed.UNCHECKED]
     if unchecked:
         logger.info(

@@ -49,6 +49,7 @@ class OffloadingConnectorWorker:
         self._load_jobs: dict[int, ReqId] = {}
         self._unsubmitted_store_jobs: list[tuple[int, TransferSpec]] = []
         self._connector_worker_meta = OffloadingWorkerMetadata()
+        self._failed_submissions: set[int] = set()
         # Report failed transfers to the scheduler (which recomputes a failed
         # load and drops a failed store) instead of asserting.
         from vllm.v1.core.kv_cache_hit_contract import (
@@ -65,6 +66,16 @@ class OffloadingConnectorWorker:
         self, kv_caches: dict[str, torch.Tensor | list[torch.Tensor]]
     ):
         num_blocks = self.spec.kv_cache_config.num_blocks
+        # Separate block spaces (long-context mode): a layer's tensor holds its
+        # own space's blocks; the transfer handlers index it by that space's
+        # block IDs, which the scheduler records per group.
+        from vllm.v1.kv_cache_interface import kv_tensor_num_blocks
+
+        layer_num_blocks = {
+            name: kv_tensor_num_blocks(self.spec.kv_cache_config, tensor)
+            for tensor in self.spec.kv_cache_config.kv_cache_tensors
+            for name in tensor.shared_by
+        }
         # Packed attention layers split each physical block of one tensor,
         # interleaved kernel block by kernel block, so they transfer as one
         # whole physical page registered once, by the first member.
@@ -104,12 +115,14 @@ class OffloadingConnectorWorker:
                     )
                     page = owner.page_size_bytes
                     tensors_per_block[layer_name] = (
-                        owner.raw_pages(layer_kv_cache, num_blocks),
+                        owner.raw_pages(
+                            layer_kv_cache, layer_num_blocks.get(layer_name, num_blocks)
+                        ),
                     )
                     page_size_bytes[layer_name] = page
                     unpadded_page_size_bytes[layer_name] = owner.transfer_size(
                         layer_kv_cache,
-                        num_blocks,
+                        layer_num_blocks.get(layer_name, num_blocks),
                         layer_kv_cache_spec.real_page_size_bytes,
                         planar=(
                             layer_kv_cache_spec.kv_quant_mode == KVQuantMode.INT8_PLANAR
@@ -133,7 +146,12 @@ class OffloadingConnectorWorker:
                             device=first_state_tensor.device,
                         )
                         .set_(first_state_tensor.untyped_storage())
-                        .view((num_blocks, layer_kv_cache_spec.page_size_bytes))
+                        .view(
+                            (
+                                layer_num_blocks.get(layer_name, num_blocks),
+                                layer_kv_cache_spec.page_size_bytes,
+                            )
+                        )
                     )
                     tensors_per_block[layer_name] = (tensor,)
 
@@ -254,8 +272,7 @@ class OffloadingConnectorWorker:
 
     def handle_preemptions(self, kv_connector_metadata: OffloadingConnectorMetadata):
         for job_id, transfer_spec in self._unsubmitted_store_jobs:
-            success = self.worker.transfer_async(job_id, transfer_spec)
-            assert success
+            self._submit_transfer(job_id, transfer_spec)
         self._unsubmitted_store_jobs.clear()
 
         if kv_connector_metadata.jobs_to_flush:
@@ -263,14 +280,28 @@ class OffloadingConnectorWorker:
 
     def start_kv_transfers(self, metadata: OffloadingConnectorMetadata):
         for job_id, transfer_spec in self._unsubmitted_store_jobs:
-            success = self.worker.transfer_async(job_id, transfer_spec)
-            assert success
+            self._submit_transfer(job_id, transfer_spec)
         self._unsubmitted_store_jobs.clear()
 
         for job_id, entry in metadata.load_jobs.items():
             self._load_jobs[job_id] = entry.req_id
-            success = self.worker.transfer_async(job_id, entry.transfer_spec)
+            self._submit_transfer(job_id, entry.transfer_spec)
+
+    def _submit_transfer(self, job_id: int, transfer_spec: TransferSpec) -> None:
+        try:
+            success = self.worker.transfer_async(job_id, transfer_spec)
+        except Exception:
+            if not getattr(self, "_report_failures", False):
+                raise
+            success = False
+        if success:
+            return
+        if not getattr(self, "_report_failures", False):
             assert success
+        # Drain any submitted part before the scheduler can reuse destinations
+        # or release source pins. wait must also accept an unsubmitted job ID.
+        self.worker.wait({job_id})
+        self._failed_submissions.add(job_id)
 
     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
         for job_id, entry in metadata.store_jobs.items():
@@ -290,8 +321,12 @@ class OffloadingConnectorWorker:
             blocked on remote KV (and free aborted-during-load reqs).
         """
         finished_recving: set[str] = set()
+        failed_submissions: set[int] = getattr(self, "_failed_submissions", set())
         for transfer_result in self.worker.get_finished():
             job_id = transfer_result.job_id
+            if job_id in failed_submissions:
+                # Report this drained, partially submitted job once below.
+                continue
             # getattr: tests may build this object without __init__.
             if not transfer_result.success and getattr(self, "_report_failures", False):
                 logger.warning("KV offloading transfer job %d failed", job_id)
@@ -314,6 +349,14 @@ class OffloadingConnectorWorker:
             req_id = self._load_jobs.pop(job_id, None)
             if req_id is not None:
                 finished_recving.add(req_id)
+
+        for job_id in failed_submissions:
+            self._connector_worker_meta.mark_failed(job_id)
+            self._connector_worker_meta.mark_completed(job_id)
+            req_id = self._load_jobs.pop(job_id, None)
+            if req_id is not None:
+                finished_recving.add(req_id)
+        failed_submissions.clear()
 
         return set(), finished_recving
 

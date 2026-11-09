@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import math
 import os
-from typing import ClassVar, cast
+from typing import TYPE_CHECKING, ClassVar, cast
 
 import torch
 from torch import nn
@@ -66,6 +66,9 @@ from ..common.qsa_cache import (
     qsa_dcp_block_geometry,
 )
 from .indexer_qsa import QSAIndexer
+
+if TYPE_CHECKING:
+    from .host_kv.history import HostHistoryLayer
 
 
 class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
@@ -344,6 +347,167 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             **qsa_metadata,
             **view.scale_kwargs,
         )
+        return output
+
+    def forward_qsa_host(
+        self,
+        layer: torch.nn.Module,
+        host: HostHistoryLayer,
+        query: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+        output: torch.Tensor,
+        token_to_req: torch.Tensor,
+        sequence_lengths: torch.Tensor,
+        output_gate: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Sparse attention over the main K/V in the host history store.
+
+        Same selection, DCP localization, routes, merge and gate as the GPU
+        path; the K/V operands are the layer's hot pool and the selection is
+        remapped to hot token IDs (identity page table). Query rows run in
+        passes that fit the hot pool. Positions and sequence lengths are not
+        passed to the sparse kernel: the remapped IDs are not positions, and
+        the selection is already causal (the remap also drops columns at or
+        past each request's length)."""
+        if self.sliding_window != (-1, -1) or self.alibi_slopes is not None:
+            raise NotImplementedError("QSA host history needs plain attention")
+        if self.sinks is not None:
+            raise NotImplementedError("QSA host history needs plain attention")
+        num_tokens = attn_metadata.num_actual_tokens
+        output.zero_()
+        if num_tokens == 0:
+            return output
+        if query.dtype != torch.float16:
+            raise NotImplementedError("QSA host history requires FP16 queries")
+        topk_buffer = getattr(layer, "topk_indices_buffer", None)
+        if topk_buffer is None:
+            raise RuntimeError("QSA owner did not provide its top-k buffer")
+        from .host_kv.history import for_each_pass
+        from .ops.qsa import qsa_sparse_paged_attention
+
+        selection = topk_buffer[:num_tokens]
+        token_to_req = token_to_req[:num_tokens]
+        block_table = attn_metadata.block_table
+        hot_table = host.store.hot_block_table
+        key_cache, value_cache = host.key_cache, host.value_cache
+        k_scale, v_scale = layer._k_scale_float, layer._v_scale_float
+        if not getattr(layer, "qsa_dcp_sharded", False):
+            query = query[:num_tokens]
+            out = output[:num_tokens]
+            gate = None if output_gate is None else output_gate[:num_tokens]
+
+            def attend(start: int, end: int, hot_ids: torch.Tensor) -> None:
+                qsa_sparse_paged_attention(
+                    query[start:end],
+                    key_cache,
+                    value_cache,
+                    hot_ids,
+                    hot_table,
+                    token_to_req[start:end],
+                    out[start:end],
+                    output_gate=None if gate is None else gate[start:end],
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                )
+
+            for_each_pass(
+                host, selection, token_to_req, block_table, sequence_lengths, attend
+            )
+            return output
+
+        if output_gate is None:
+            raise RuntimeError("QSA DCP requires its output gate")
+        from vllm.distributed import get_dcp_group
+
+        from .ops.qsa import (
+            _qsa_output_gate,
+            qsa_dcp_sparse_paged_attention_sm70_grouped_page4,
+        )
+        from .ops.qsa_dcp import (
+            qsa_dcp_local_selection_width,
+            qsa_localize_dcp_indices,
+        )
+
+        buffers = (
+            layer.dcp_local_indices_buffer,
+            layer.dcp_partial_output_buffer,
+            layer.dcp_partial_lse_buffer,
+        )
+        if any(buffer is None for buffer in buffers):
+            raise RuntimeError("QSA DCP target workspaces are not initialized")
+        local_indices = qsa_localize_dcp_indices(
+            selection,
+            layer.dcp_local_indices_buffer[:num_tokens],
+            dcp_world_size=self.dcp_world_size,
+            dcp_rank=self.dcp_rank,
+            interleave_size=layer.cp_kv_cache_interleave_size,
+            local_block_size=host.kernel_block_tokens,
+        )
+        group = get_dcp_group()
+        gathered_query = group.all_gather(query[:num_tokens].contiguous(), dim=1)
+        partial_output = layer.dcp_partial_output_buffer[:num_tokens]
+        partial_lse = layer.dcp_partial_lse_buffer[:num_tokens]
+        if partial_output.shape != gathered_query.shape:
+            raise RuntimeError("QSA DCP partial output has wrong head geometry")
+        local_width = qsa_dcp_local_selection_width(
+            layer.indexer.token_topk,
+            layer.indexer.compress_ratio,
+            self.dcp_world_size,
+            layer.cp_kv_cache_interleave_size,
+            local_indices.shape[1],
+        )
+
+        def attend_dcp(start: int, end: int, hot_ids: torch.Tensor) -> None:
+            rows_q = gathered_query[start:end]
+            rows_req = token_to_req[start:end]
+            rows_out = partial_output[start:end]
+            rows_lse = partial_lse[start:end]
+            grouped = qsa_dcp_sparse_paged_attention_sm70_grouped_page4(
+                rows_q,
+                key_cache,
+                value_cache,
+                hot_ids,
+                hot_table,
+                rows_req,
+                rows_out,
+                rows_lse,
+                self.kv_cache_dtype,
+                k_scale,
+                v_scale,
+            )
+            if grouped < end - start:
+                qsa_sparse_paged_attention(
+                    rows_q[grouped:],
+                    key_cache,
+                    value_cache,
+                    hot_ids[grouped:, :local_width],
+                    hot_table,
+                    rows_req[grouped:],
+                    rows_out[grouped:],
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                    lse=rows_lse[grouped:],
+                )
+
+        for_each_pass(
+            host,
+            local_indices,
+            token_to_req,
+            block_table,
+            sequence_lengths,
+            attend_dcp,
+        )
+        merged = cast(
+            torch.Tensor,
+            self.dcp_combine(
+                partial_output, partial_lse, group, is_lse_base_on_e=False
+            ),
+        )
+        out = output[:num_tokens]
+        out.copy_(merged)
+        _qsa_output_gate(out, output_gate[:num_tokens].view_as(out))
         return output
 
     def _forward_qsa_dcp(
@@ -646,6 +810,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             )
         self.kv_sharing_target_layer_name = None
         self.kv_cache = torch.tensor([])
+        # Bound by the model runner in long-context mode when the main K/V
+        # lives in the host history store (no GPU tensor then).
+        self.host_history: HostHistoryLayer | None = None
         set_default_quant_scales(self, register_buffer=True)
         self._qsa_kv_scales_finalized = self.kv_cache_dtype not in (
             "fp8",
@@ -829,7 +996,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             output.zero_()
             return
         main_metadata = cast(FlashAttentionMetadata, metadata[self.layer_name])
-        if self.kv_cache.numel() == 0:
+        # Long-context mode: main K/V in the host history store, by history
+        # block ID (no GPU tensor is bound then).
+        host = getattr(self, "host_history", None)
+        if host is None and self.kv_cache.numel() == 0:
             raise RuntimeError("QSA main K/V cache is not bound")
 
         num_tokens = main_metadata.num_actual_tokens
@@ -864,26 +1034,47 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             selected,
         )
         impl = cast(Qwen4ExpQSAFlashAttentionImpl, self.impl)
-        impl.do_kv_cache_update(
-            self,
-            key,
-            value,
-            self.kv_cache,
-            main_metadata.slot_mapping,
-        )
-        impl.forward_qsa(
-            self,
-            query,
-            key,
-            value,
-            self.kv_cache,
-            main_metadata,
-            output,
-            token_to_req=side_metadata.token_to_req,
-            output_gate=output_gate,
-            query_positions=side_metadata.logical_positions,
-            sequence_lengths=side_metadata.seq_lens,
-        )
+        if host is not None:
+            # Write before reading: a prefill row attends to its own chunk.
+            host.write(
+                key,
+                value,
+                main_metadata.slot_mapping,
+                self.kv_cache_dtype,
+                self._k_scale,
+                self._v_scale,
+            )
+            impl.forward_qsa_host(
+                self,
+                host,
+                query,
+                main_metadata,
+                output,
+                token_to_req=side_metadata.token_to_req,
+                sequence_lengths=side_metadata.seq_lens,
+                output_gate=output_gate,
+            )
+        else:
+            impl.do_kv_cache_update(
+                self,
+                key,
+                value,
+                self.kv_cache,
+                main_metadata.slot_mapping,
+            )
+            impl.forward_qsa(
+                self,
+                query,
+                key,
+                value,
+                self.kv_cache,
+                main_metadata,
+                output,
+                token_to_req=side_metadata.token_to_req,
+                output_gate=output_gate,
+                query_positions=side_metadata.logical_positions,
+                sequence_lengths=side_metadata.seq_lens,
+            )
         _sm70_dump_qwen_layer_tensor(
             "qsa_core_out",
             self.indexer.layer_id,

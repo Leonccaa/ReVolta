@@ -1101,6 +1101,18 @@ class KVCacheConfig:
     GPU history segment). None: one pool of ``num_blocks`` shared by every
     group, as before. With segments, ``num_blocks`` is the primary segment's
     count; use ``group_num_blocks`` / ``tensor_num_blocks``."""
+    host_kv_layers: list[str] = field(default_factory=list)
+    """Attention layers without a GPU tensor: their main K/V lives in each
+    worker's host history store, addressed by the primary (history)
+    segment's block IDs (long-context mode, ``main_kv_placement="host"``)."""
+
+    @property
+    def host_kv_page_size_bytes(self) -> int:
+        """One history ID's host payload, transferred with its index group."""
+        if not self.host_kv_layers:
+            return 0
+        assert self.long_context_plan is not None
+        return self.long_context_plan.geometry.main_kv_bytes_per_block
 
     def group_num_blocks(self, group_id: int) -> int:
         """Blocks addressable by the given KV cache group's block IDs."""

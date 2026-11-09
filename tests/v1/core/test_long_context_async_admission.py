@@ -15,6 +15,7 @@ from tests.v1.core.test_long_context_admission import (
 )
 from vllm.config import KVTransferConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+from vllm.v1.core.long_context_kv import HOST
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.request import RequestStatus
 
@@ -137,6 +138,81 @@ def check_drained(s):
         assert not ledger._hot
     assert not s._inflight_prefills
     assert not s.finished_recving_kv_req_ids
+
+
+@pytest.mark.parametrize("full_isl", [False, True])
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("max_tokens", [1, 2])
+def test_dflash_idle_peer_reserves_only_executable_successor(
+    full_isl, async_scheduling, max_tokens
+):
+    """A. Pair cold/async paths with the same real ten-page host plan.
+
+    A 3,320-token idle peer holds two pages. The target's 13,304-token
+    prefill plus seven lookahead slots fits the remaining eight pages.
+    With one output token it ends at prefill; with two, a speculative
+    successor can execute and its ninth page must still be protected.
+    """
+    for matched in (0, 5 * SPAN) if max_tokens == 1 else (5 * SPAN,):
+        s = scheduler(
+            enabled=True,
+            full_isl=full_isl,
+            async_scheduling=async_scheduling,
+            matched=matched,
+            speculative_tokens=7,
+        )
+        ledger = s.kv_cache_manager.admission_ledger
+        assert ledger.capacity[HOST] == 10
+        assert not ledger.plan.startup_problems()
+        peer = make_requests(1, 2 * SPAN - 8, 1, tag="idle")[0]
+        peer.resumable = True
+        # Use a different prefix so local caching cannot hide the async hit.
+        target = make_requests(2, 8 * SPAN - 8, max_tokens, tag="target")[1]
+
+        def get_matched(req, _, target=target, matched=matched):
+            return (matched, matched > 0) if req is target else (0, False)
+
+        s.connector.get_num_new_matched_tokens = get_matched
+        s.add_request(peer)
+        for _ in range(128):
+            output = s.schedule()
+            complete(s, output)
+            if peer.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+                break
+        assert peer.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+        assert ledger.in_use[HOST] == 2
+        peer_blocks = s.kv_cache_manager.get_block_ids(peer.request_id)
+        s.add_request(target)
+        saw_load = False
+        for _ in range(128):
+            output = s.schedule()
+            saw_load |= target.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+            complete(s, output, received={target.request_id})
+            assert ledger.in_use == recount(s)
+            assert ledger.hot_used <= ledger.plan.hot_pool_groups
+            assert peer.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+            assert peer.num_preemptions == 0
+            assert s.kv_cache_manager.get_block_ids(peer.request_id) == peer_blocks
+            if target.is_finished():
+                break
+        if matched and max_tokens > 1:
+            # A real possible spec step still needs nine pages. No running
+            # work can release the idle peer's two pages in this interval.
+            assert target.status == RequestStatus.WAITING
+            assert not s.running and not s._inflight_prefills
+            assert ledger.blocked[HOST] > 0
+        else:
+            assert target.status == RequestStatus.FINISHED_LENGTH_CAPPED
+            assert saw_load == bool(matched)
+            assert ledger.in_use[HOST] == 2
+        s.finish_requests(peer.request_id, RequestStatus.FINISHED_ABORTED)
+        for _ in range(128):
+            if target.is_finished():
+                break
+            output = s.schedule()
+            complete(s, output, received={target.request_id})
+        assert target.status == RequestStatus.FINISHED_LENGTH_CAPPED
+        check_drained(s)
 
 
 @pytest.mark.parametrize("enabled", [False, True])

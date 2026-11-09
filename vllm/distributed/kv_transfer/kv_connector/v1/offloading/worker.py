@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import defaultdict
 from dataclasses import replace
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -27,6 +28,7 @@ from vllm.v1.kv_offload.base import (
     CanonicalKVCacheRef,
     CanonicalKVCaches,
     CanonicalKVCacheTensor,
+    GPULoadStoreSpec,
     OffloadingSpec,
 )
 from vllm.v1.kv_offload.worker.worker import (
@@ -35,6 +37,9 @@ from vllm.v1.kv_offload.worker.worker import (
 )
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from vllm.models.qwen4_exp.nvidia.host_kv.history import HostHistoryStore
 
 
 class OffloadingConnectorWorker:
@@ -51,6 +56,9 @@ class OffloadingConnectorWorker:
         self._connector_worker_meta = OffloadingWorkerMetadata()
         self._failed_submissions: set[int] = set()
         self._pending_failed_submissions: set[int] = set()
+        self._host_history: HostHistoryStore | None = None
+        self._host_group_id: int | None = None
+        self._host_load_blocks: dict[int, list[int]] = {}
         # Report failed transfers to the scheduler (which recomputes a failed
         # load and drops a failed store) instead of asserting.
         from vllm.v1.core.kv_cache_hit_contract import (
@@ -83,6 +91,7 @@ class OffloadingConnectorWorker:
         from vllm.v1.attention.kv_cache_view import packed_kv_members
 
         packed = packed_kv_members(self.spec.kv_cache_config)
+        host_names = set(getattr(self.spec.kv_cache_config, "host_kv_layers", ()))
 
         # layer_name -> (num_blocks, page_size_bytes) tensor
         tensors_per_block: dict[str, tuple[torch.Tensor, ...]] = {}
@@ -98,6 +107,8 @@ class OffloadingConnectorWorker:
             else:
                 per_layer_specs = {}
             for layer_name in group_layer_names:
+                if layer_name in host_names:
+                    continue
                 layer_kv_cache_spec = per_layer_specs.get(
                     layer_name, group_kv_cache_spec
                 )
@@ -217,6 +228,37 @@ class OffloadingConnectorWorker:
                 group_refs += block_data_refs[layer_name]
             group_data_refs.append(group_refs)
 
+        if host_names:
+            context = self.spec.vllm_config.compilation_config.static_forward_context
+            stores = {context[name].host_history.store for name in host_names}
+            if len(stores) != 1:
+                raise ValueError("Host main K/V must use one history store per worker")
+            (store,) = stores
+            group_ids = [
+                index
+                for index, group in enumerate(self.spec.kv_cache_config.kv_cache_groups)
+                if not host_names.isdisjoint(group.layer_names)
+            ]
+            if len(group_ids) != 1:
+                raise ValueError("Host main K/V must belong to one transfer group")
+            (self._host_group_id,) = group_ids
+            self._host_history = store
+            page_bytes = self.spec.kv_cache_config.host_kv_page_size_bytes
+            if store.shape.page_bytes != page_bytes:
+                raise ValueError("Host main K/V transfer page differs from the plan")
+            index = len(block_tensors)
+            block_tensors.append(
+                CanonicalKVCacheTensor(
+                    tensor=store.host.view(torch.int8).view(
+                        store.shape.num_blocks, page_bytes
+                    ),
+                    page_size_bytes=page_bytes,
+                )
+            )
+            group_data_refs[self._host_group_id].append(
+                CanonicalKVCacheRef(index, page_bytes)
+            )
+
         canonical_kv_caches = CanonicalKVCaches(
             tensors=block_tensors,
             group_data_refs=group_data_refs,
@@ -292,6 +334,14 @@ class OffloadingConnectorWorker:
 
         for job_id, entry in metadata.load_jobs.items():
             self._load_jobs[job_id] = entry.req_id
+            if getattr(self, "_host_history", None) is not None:
+                target = entry.transfer_spec[1]
+                assert isinstance(target, GPULoadStoreSpec)
+                group_id = self._host_group_id
+                assert group_id is not None
+                start = sum(target.group_sizes[:group_id])
+                end = start + target.group_sizes[group_id]
+                self._host_load_blocks[job_id] = target.block_ids[start:end].tolist()
             self._submit_transfer(job_id, entry.transfer_spec)
 
     def _submit_transfer(self, job_id: int, transfer_spec: TransferSpec) -> None:
@@ -358,6 +408,14 @@ class OffloadingConnectorWorker:
             else:
                 # job failures are not supported without the recompute path
                 assert transfer_result.success
+            host_history = getattr(self, "_host_history", None)
+            if host_history is not None:
+                blocks = self._host_load_blocks.pop(job_id, [])
+                if transfer_result.success:
+                    # All group copies on this worker retired. Publish the
+                    # host bytes before reporting receive completion. The
+                    # scheduler still waits for every rank before execution.
+                    host_history.mark_ready(blocks)
             if (
                 transfer_result.transfer_time
                 and transfer_result.transfer_size is not None
@@ -375,6 +433,8 @@ class OffloadingConnectorWorker:
                 finished_recving.add(req_id)
 
         for job_id in failed_submissions:
+            if getattr(self, "_host_history", None) is not None:
+                self._host_load_blocks.pop(job_id, None)
             self._connector_worker_meta.mark_failed(job_id)
             self._connector_worker_meta.mark_completed(job_id)
             req_id = self._load_jobs.pop(job_id, None)
@@ -410,4 +470,6 @@ class OffloadingConnectorWorker:
         self._load_jobs.clear()
         self._failed_submissions.clear()
         self._pending_failed_submissions.clear()
+        getattr(self, "_host_load_blocks", {}).clear()
+        self._host_history = None
         self._connector_worker_meta = OffloadingWorkerMetadata()

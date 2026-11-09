@@ -3,7 +3,7 @@
 import contextlib
 from collections.abc import Callable
 from dataclasses import asdict, fields
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from pydantic import Field, field_validator
 
@@ -385,10 +385,6 @@ class Sm70SparseConfig:
     """Startup capability rejection; individual calls also check tensor layouts."""
 
 
-LONG_CONTEXT_DEFAULT_HOT_POOL_RATIO = 0.10
-"""Hot-page share of the host history pool when neither hot size is given."""
-
-
 @config
 class LongContextKVConfig:
     """Active Host KV long-context mode for compressed-sparse (QSA) models.
@@ -413,10 +409,15 @@ class LongContextKVConfig:
     host_pool_tokens: int | None = Field(default=None, gt=0)
     """Host history pool sized in history tokens (rounded down to whole KV
     blocks) instead of GiB."""
-    hot_pool_gib: float | None = Field(default=None, gt=0)
-    """GPU hot-page pool per GPU, in GiB. At most one of this and
-    ``hot_pool_ratio``; with neither, the ratio defaults to
-    ``LONG_CONTEXT_DEFAULT_HOT_POOL_RATIO``."""
+    hot_pool_gib: (
+        Annotated[float, Field(gt=0, allow_inf_nan=False)] | Literal["auto"] | None
+    ) = None
+    """Total fixed hot-pool budget per GPU in GiB, covering payload, slot metadata,
+    shared workspace and write staging. Per-history-block metadata is charged
+    separately to the history segment. At most one of this and
+    ``hot_pool_ratio`` may be set. ``auto`` uses the remaining KV memory after
+    state, demand-sized history and prefill staging. With neither set, use
+    ``auto``. The host pool must still be sized explicitly."""
     hot_pool_ratio: float | None = Field(default=None, gt=0, le=1)
     """GPU hot-page pool as a fraction of the host history pool's tokens."""
     prewarm_hot_pool: bool = True
@@ -427,6 +428,12 @@ class LongContextKVConfig:
     """GPU state-segment block IDs (recurrent states, PLE states, drafter
     windows, checkpoints). None reserves ``max_num_seqs`` worst-case requests
     plus the pool's null block."""
+    main_kv_placement: Literal["host", "gpu"] = "host"
+    """Where the main QSA K/V history lives. ``host``: one page per history
+    block ID in a pinned host store on every worker, read through the GPU
+    hot-page pool. ``gpu``: in the GPU history segment next to the
+    compressed index (the same-plan reference arm); the host and hot pools
+    then only budget admission."""
 
     def validate_settings(self) -> None:
         """Reject contradictory sizes; called only when the mode is enabled."""

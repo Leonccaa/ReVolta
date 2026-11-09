@@ -22,7 +22,7 @@ import gc
 import os
 import time
 from copy import deepcopy
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
 import torch
@@ -130,6 +130,9 @@ from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.mamba_utils import pad_mamba_block_table_widths
 from vllm.v1.worker.utils import KVBlockZeroer, clear_layer_kv_caches
+
+if TYPE_CHECKING:
+    from vllm.models.qwen4_exp.nvidia.host_kv.history import HostHistoryStore
 
 logger = init_logger(__name__)
 
@@ -720,6 +723,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             kernel_block_sizes,
             self.vllm_config,
         )
+        self.host_history: HostHistoryStore | None = None
+        if getattr(self.kv_cache_config, "host_kv_layers", None):
+            # Long-context mode with the main QSA K/V in host memory: one page
+            # per history block ID, bound to the QSA layers before any capture.
+            from vllm.models.qwen4_exp.nvidia.host_kv.engine import (
+                build_host_history_store,
+            )
+
+            self.host_history = build_host_history_store(
+                self.kv_cache_config,
+                self.vllm_config,
+                self.compilation_config.static_forward_context,
+                kernel_block_sizes,
+                self.device,
+            )
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
 
     def _init_kv_zero_meta(self) -> None:
@@ -748,6 +766,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         """Clear cache blocks before their first use after allocation."""
         if hasattr(self, "_kv_block_zeroer"):
             self._kv_block_zeroer.zero_block_ids(block_ids)
+        # The same new history IDs start a new life of their host pages.
+        host_history = getattr(self, "host_history", None)
+        if host_history is not None:
+            host_history.begin_blocks(block_ids)
 
     def _warmup_sm70_aux_kernels(self) -> None:
         """Warm SM70 kernels whose production cache exists only in MRV2."""
@@ -2203,6 +2225,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if hasattr(self, "kv_caches"):
             self.kv_caches.clear()
+        self.host_history = None
         if hasattr(self, "attn_groups"):
             self.attn_groups.clear()
         if hasattr(self, "kv_cache_config"):

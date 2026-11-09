@@ -2900,6 +2900,21 @@ def generate_scheduler_kv_cache_config(
     # All workers have the same kv_cache_config except layer names, so use
     # an arbitrary one to initialize the scheduler.
     cfg = copy.deepcopy(kv_cache_configs[0])
+    if (
+        cfg.long_context_plan is not None
+        and cfg.long_context_plan.hot_pool_source == "auto"
+        and not cfg.long_context_plan.main_kv_on_gpu
+    ):
+        # Workers share history/state IDs, but each auto hot pool consumes
+        # its own remaining memory. Admission must fit the smallest pool.
+        cfg.long_context_plan = min(
+            (
+                worker.long_context_plan
+                for worker in kv_cache_configs
+                if worker.long_context_plan is not None
+            ),
+            key=lambda plan: plan.hot_pool_groups,
+        )
     for group in cfg.kv_cache_groups:
         if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
             # All layers in the UniformTypeKVCacheSpecs have the same type,
@@ -3217,14 +3232,6 @@ def _project_kv_cache_groups_to_worker(
     return projected_groups
 
 
-# Long-context mode keeps the main QSA K/V on the GPU, in the history segment
-# next to the compressed index, until the host history pool (host KV pool) is bound to
-# history block IDs and serves the attention reads. Flipping this only changes
-# the history segment's bytes per block and drops the main-K/V tensors from
-# ``get_long_context_kv_cache_config``; see LongContextCapacityPlan.
-LONG_CONTEXT_MAIN_KV_ON_GPU = True
-
-
 def _long_context_settings(vllm_config: VllmConfig) -> "LongContextKVConfig | None":
     kernel_config = getattr(vllm_config, "kernel_config", None)
     settings = getattr(kernel_config, "long_context_kv", None)
@@ -3274,6 +3281,7 @@ def get_long_context_geometry(
 
     group_domains: list[tuple[int, ...]] = []
     block_tokens = 0
+    main_kv_dcp = 1
     state_blocks = 0
     ring_blocks = 0
     compress_ratio = 0
@@ -3298,6 +3306,7 @@ def get_long_context_geometry(
                 member for member in members if type(member) is FullAttentionSpec
             )
             block_tokens = full_spec.global_block_size(dcp)
+            main_kv_dcp = dcp if full_spec.dcp_sharded else 1
             hot_head_dim = full_spec.head_size
             hot_kv_heads = full_spec.num_kv_heads
             compress_ratio = max(
@@ -3354,7 +3363,7 @@ def get_long_context_geometry(
         hot_row_groups=budget // compress_ratio + 1,
         decode_rows_per_request=1 + num_spec,
         group_domains=tuple(group_domains),
-        dcp_world_size=dcp,
+        dcp_world_size=main_kv_dcp,
         hot_layers=len(layout.main_kv_names),
         hot_max_write_rows=vllm_config.scheduler_config.max_num_batched_tokens,
         hot_query_heads=vllm_config.model_config.get_num_attention_heads(parallel),
@@ -3385,15 +3394,44 @@ def _plan_long_context_kv(
             "kernel_config.long_context_kv needs the same cache geometry on "
             "every worker."
         )
+    if settings.main_kv_placement == "host":
+        _check_host_main_kv(vllm_config, workers[0][0])
     plan = plan_long_context_capacity(
         settings,
         geometries.pop(),
         min(memory for _, memory in workers),
         vllm_config.scheduler_config.max_num_seqs,
-        main_kv_on_gpu=LONG_CONTEXT_MAIN_KV_ON_GPU,
     )
     validate_long_context_plan(plan)
     return plan
+
+
+def _check_host_main_kv(
+    vllm_config: VllmConfig, kv_cache_groups: list[KVCacheGroupSpec]
+) -> None:
+    """Refuse what the host history store does not serve yet."""
+    import torch
+
+    from vllm.v1.kv_cache_interface import KVQuantMode
+
+    for group in kv_cache_groups:
+        spec = group.kv_cache_spec
+        members = (
+            spec.kv_cache_specs.values()
+            if isinstance(spec, UniformTypeKVCacheSpecs)
+            else [spec]
+        )
+        for member in members:
+            if type(member) is FullAttentionSpec and (
+                member.dtype not in (torch.uint8, torch.float16)
+                or member.kv_quant_mode
+                not in (KVQuantMode.NONE, KVQuantMode.FP8_PER_TENSOR)
+            ):
+                raise ValueError(
+                    "kernel_config.long_context_kv with main_kv_placement='host' "
+                    "supports E4M3 or FP16 main K/V, not "
+                    f"{member.dtype} ({member.kv_quant_mode.name})."
+                )
 
 
 def get_long_context_kv_cache_config(
@@ -3416,11 +3454,6 @@ def get_long_context_kv_cache_config(
             "kernel_config.long_context_kv requires the compressed-sparse "
             "(QSA) + linear-attention KV cache layout."
         )
-    if not plan.main_kv_on_gpu:
-        raise NotImplementedError(
-            "Long-context mode cannot place the main QSA K/V in the host pool "
-            "yet: the host pool is not addressed by history block IDs."
-        )
     group_segments = plan.group_segments()
     if len(group_segments) != len(kv_cache_groups):
         raise ValueError(
@@ -3433,14 +3466,15 @@ def get_long_context_kv_cache_config(
     for index, owner in enumerate(layout.main_kv_owners):
         page = layout.owner_page_size(index)
         members = [layout.main_kv_names[i] for i in owner]
-        tensors.append(
-            KVCacheTensor(
-                size=page * num_history,
-                shared_by=list(members),
-                packed_members=members if len(members) > 1 else None,
-                num_blocks=num_history,
+        if plan.main_kv_on_gpu:
+            tensors.append(
+                KVCacheTensor(
+                    size=page * num_history,
+                    shared_by=list(members),
+                    packed_members=members if len(members) > 1 else None,
+                    num_blocks=num_history,
+                )
             )
-        )
         if state_members[index]:
             tensors.append(
                 KVCacheTensor(
@@ -3466,6 +3500,9 @@ def get_long_context_kv_cache_config(
         kv_cache_tensors=tensors,
         kv_cache_groups=kv_cache_groups,
         long_context_plan=plan,
+        # Host placement: these layers' main K/V lives in each worker's host
+        # history store, addressed by the history segment's block IDs.
+        host_kv_layers=[] if plan.main_kv_on_gpu else list(layout.main_kv_names),
         block_segments=KVBlockSegments(
             names=LC_SEGMENT_NAMES,
             num_blocks=(num_state, num_history),
@@ -3572,10 +3609,26 @@ def get_kv_cache_configs(
         vllm_config, projected_groups_per_worker, available_memory
     )
     if long_context_plan is not None:
-        return [
-            get_long_context_kv_cache_config(long_context_plan, groups)
-            for groups in projected_groups_per_worker
-        ]
+        configs = []
+        for worker_index, (groups, memory) in enumerate(
+            zip(projected_groups_per_worker, available_memory)
+        ):
+            worker_plan = long_context_plan
+            if (
+                long_context_plan.hot_pool_source == "auto"
+                and not long_context_plan.main_kv_on_gpu
+            ):
+                worker_plan = plan_long_context_capacity(
+                    vllm_config.kernel_config.long_context_kv,
+                    long_context_plan.geometry,
+                    memory,
+                    long_context_plan.max_num_seqs,
+                )
+            logger.info(
+                "long-context KV worker=%d %s", worker_index, worker_plan.describe()
+            )
+            configs.append(get_long_context_kv_cache_config(worker_plan, groups))
+        return configs
 
     # Check if the available memory is enough per worker.
     for worker_index, (groups, avail_mem) in enumerate(

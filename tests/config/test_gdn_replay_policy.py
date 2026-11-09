@@ -12,6 +12,7 @@ from vllm import envs
 from vllm.config import (
     CacheConfig,
     DeviceConfig,
+    KernelConfig,
     ModelConfig,
     ParallelConfig,
     SchedulerConfig,
@@ -55,7 +56,14 @@ def engine_config(monkeypatch, tmp_path):
         lambda capability, device_id=0: capability in (70, (7, 0)),
     )
 
-    def build(hidden_size=5120, *, method="dflash", replay=None, packed=None):
+    def build(
+        hidden_size=5120,
+        *,
+        method="dflash",
+        replay=None,
+        packed=None,
+        long_context=False,
+    ):
         target = tmp_path / "target"
         target.mkdir(exist_ok=True)
         (target / "config.json").write_text(
@@ -127,6 +135,9 @@ def engine_config(monkeypatch, tmp_path):
             )
         )
         return VllmConfig(
+            kernel_config=KernelConfig(
+                long_context_kv={"enabled": long_context, "host_pool_gib": 128}
+            ),
             model_config=model,
             speculative_config=spec,
             parallel_config=parallel,
@@ -254,3 +265,48 @@ def test_explicit_packed_false_wins_over_legacy_packed_true(engine_config, monke
     assert spec is not None
     assert spec.gdn_spec_state_replay
     assert spec.sm70_dflash2.fused_gdn_verify is False
+
+
+@pytest.mark.parametrize(
+    "replay,expected,states", [(None, True, 29), (True, True, 29), (False, False, 71)]
+)
+def test_long_context_replay_default_and_capacity(
+    engine_config, caplog, replay, expected, states, monkeypatch
+):
+    import vllm.config.vllm as config_module
+    from tests.v1.core.long_context_kv_utils import production_config, production_specs
+    from vllm.v1.core.kv_cache_utils import (
+        get_kv_cache_groups,
+        get_long_context_geometry,
+    )
+
+    monkeypatch.setattr(
+        config_module.logger, "warning_once", config_module.logger.warning
+    )
+    config = engine_config(2560, replay=replay, long_context=True)
+    assert config.speculative_config.gdn_spec_state_replay is expected
+    assert config.speculative_config.sm70_dflash2.spec_state_replay is expected
+    geometry_config = production_config()
+    groups = get_kv_cache_groups(
+        geometry_config,
+        production_specs(
+            speculative_blocks=config.speculative_config.num_speculative_state_blocks()
+        ),
+    )
+    assert (
+        get_long_context_geometry(geometry_config, groups).state_blocks_per_request
+        == states
+    )
+    assert ("explicitly configured" in caplog.text) is (replay is False)
+
+
+def test_long_context_replay_overrides_automatic_packed_default(engine_config):
+    spec = engine_config(long_context=True).speculative_config
+    assert spec.sm70_dflash2.qualified
+    assert spec.gdn_spec_state_replay
+    assert spec.sm70_dflash2.fused_gdn_verify is False
+
+
+def test_long_context_replay_rejects_explicit_packed_conflict(engine_config):
+    with pytest.raises(ValueError, match="cannot be enabled together"):
+        engine_config(long_context=True, packed=True)

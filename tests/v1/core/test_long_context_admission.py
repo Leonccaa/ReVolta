@@ -81,6 +81,10 @@ def build(
 def settings(**kw) -> LongContextKVConfig:
     kw.setdefault("host_pool_tokens", 40 * SPAN)
     kw.setdefault("hot_pool_gib", 0.2)
+    # These cases budget the host pool by history blocks alone (the ledger's
+    # domain); host placement additionally backs ring and null IDs with
+    # pages, covered in test_long_context_host_main_kv.py.
+    kw.setdefault("main_kv_placement", "gpu")
     return LongContextKVConfig(enabled=True, **kw)
 
 

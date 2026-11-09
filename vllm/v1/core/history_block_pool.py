@@ -43,6 +43,48 @@ from vllm.v1.kv_offload.host.page_table import (
 from vllm.v1.request import Request
 
 
+class _DonatedQueue(FreeKVCacheBlockQueue):
+    """The donated free list with an O(1) membership flag per history ID.
+
+    ``finish_roles`` runs every host-KV step and only needs the membership of
+    the IDs touched this step; walking the whole list (tens of thousands of
+    IDs) dominated the scheduler step.
+    """
+
+    def __init__(self, num_blocks: int) -> None:
+        self.member = bytearray(num_blocks)
+        super().__init__([])
+
+    def popleft(self) -> KVCacheBlock:
+        block = super().popleft()
+        self.member[block.block_id] = 0
+        return block
+
+    def popleft_n(self, n: int) -> list[KVCacheBlock]:
+        blocks = super().popleft_n(n)
+        for block in blocks:
+            self.member[block.block_id] = 0
+        return blocks
+
+    def remove(self, block: KVCacheBlock) -> None:
+        super().remove(block)
+        self.member[block.block_id] = 0
+
+    def append(self, block: KVCacheBlock) -> None:
+        super().append(block)
+        self.member[block.block_id] = 1
+
+    def prepend_n(self, blocks: list[KVCacheBlock]) -> None:
+        super().prepend_n(blocks)
+        for block in blocks:
+            self.member[block.block_id] = 1
+
+    def append_n(self, blocks: list[KVCacheBlock]) -> None:
+        super().append_n(blocks)
+        for block in blocks:
+            self.member[block.block_id] = 1
+
+
 @dataclass
 class SharedRegionStep:
     """Per-step role changes of the shared region, identical on every rank."""
@@ -112,7 +154,7 @@ class HistoryBlockPool(BlockPool):
             if index_cache_target is None
             else index_cache_target
         )
-        self.donated_queue = FreeKVCacheBlockQueue([])
+        self.donated_queue = _DonatedQueue(self.num_gpu_blocks)
         for block in self.free_block_queue.get_all_free_blocks():
             if block.block_hash is None:
                 self.free_block_queue.remove(block)
@@ -122,6 +164,7 @@ class HistoryBlockPool(BlockPool):
         self.device_free = bytearray(self.num_gpu_blocks)
         for block in self.donated_queue.get_all_free_blocks():
             self.device_free[block.block_id] = 1
+        self.num_device_free = self.donated_queue.num_free_blocks
         self.held: dict[int, int] = {}
         """Free unhashed IDs not yet donated: hid -> retire_after step (or -1
         while transfers are in flight)."""
@@ -351,15 +394,20 @@ class HistoryBlockPool(BlockPool):
         self._release_held()
         self._ensure_floor()
         step = SharedRegionStep(floor_slots=self.floor_slots)
-        donated = {b.block_id for b in self.donated_queue.get_all_free_blocks()}
+        # Every membership change marks the ID dirty, so only dirty IDs can
+        # differ from the worker view.
+        donated = self.donated_queue.member
         for hid in sorted(self._dirty):
-            free = hid in donated
+            free = bool(donated[hid])
             if free != bool(self.device_free[hid]):
                 (step.donate if free else step.claim).append(hid)
                 self.device_free[hid] = int(free)
+                self.num_device_free += 1 if free else -1
         self._dirty.clear()
         step.hot_slots = self.hot_slots()
-        assert sum(self.device_free) == len(donated), "shared-region roles diverged"
+        assert self.num_device_free == self.donated_queue.num_free_blocks, (
+            "shared-region roles diverged"
+        )
         return step
 
     def filter_zero_ids(self, block_ids: list[int] | None) -> list[int] | None:

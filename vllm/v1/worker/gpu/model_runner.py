@@ -1712,6 +1712,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        if (
+            dummy_run
+            and getattr(self, "host_history", None) is not None
+            and getattr(self, "_host_history_live", False)
+        ):
+            # Dummy batches have no scheduler hot-capacity reservation. Only
+            # initialization may use them, followed by the first-step reset.
+            raise RuntimeError(
+                "Host KV dummy batches are only supported before serving"
+            )
         if not dummy_run:
             if self.device.type == "cuda":
                 self.mixed_prefill_timer.begin(scheduler_output)
@@ -1728,13 +1738,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             host_step = getattr(scheduler_output, "host_kv", None)
             if host_step is not None:
                 assert self.host_history is not None
-                if self.host_history.shape.slots_per_block and not getattr(
-                    self, "_host_history_live", False
-                ):
+                if not getattr(self, "_host_history_live", False):
                     # Profiling, warmup and capture ran dummy batches over the
                     # shared index pages: start serving from the scheduler's
                     # initial roles (every non-null ID DONATED, no binding).
-                    self.host_history.reset_hot_state()
+                    if self.host_history.shape.slots_per_block:
+                        self.host_history.reset_hot_state()
                     self._host_history_live = True
                 self.host_history.bind_pages(host_step.bindings)
                 # shared hot region step head: donate, claim, then zero/begin new IDs

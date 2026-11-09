@@ -38,7 +38,7 @@ def test_completed_receive_reports_new_load_hashes(local_blocks, failed):
     scheduler.value_arbiter = SimpleNamespace(
         on_index_restored=restored.append,
         begin_step=lambda step, seconds: 0,
-        end_step=lambda step: None,
+        end_step=lambda step, **kwargs: None,
         add_rank_counters=lambda *args: None,
     )
     connector.value_restore_hook = scheduler._value_restore

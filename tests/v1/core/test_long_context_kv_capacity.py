@@ -513,11 +513,10 @@ def kv_cache_configs(
     return get_kv_cache_configs(config, [specs] * WORKERS, [memory] * WORKERS)
 
 
-def test_auto_uses_each_workers_effective_budget_and_admits_against_smallest(
+def test_static_auto_uses_common_minimum_budget_for_every_worker(
     monkeypatch,
 ):
-    # Static hot-pool arm; the shared region keeps one common plan instead
-    # (test_history_shared_region.py).
+    # Static and shared hot pools both need the same cross-rank pass plan.
     monkeypatch.setattr("vllm.v1.core.long_context_kv.SHARED_HOT_REGION", False)
     settings = LongContextKVConfig(enabled=True, host_pool_gib=112)
     config = production_config(max_model_len=32, long_context=settings)
@@ -527,7 +526,8 @@ def test_auto_uses_each_workers_effective_budget_and_admits_against_smallest(
     workers = get_kv_cache_configs(config, [specs] * 4, budgets)
     for worker, budget in zip(workers, budgets):
         plan = worker.long_context_plan
-        assert plan.gpu_budget_bytes == budget
+        assert plan.gpu_budget_bytes == min(budgets)
+        assert plan.gpu_budget_bytes <= budget
         assert (
             0
             <= plan.gpu_remaining_bytes
@@ -539,10 +539,7 @@ def test_auto_uses_each_workers_effective_budget_and_admits_against_smallest(
         assert worker.block_segments == workers[0].block_segments
     scheduler = generate_scheduler_kv_cache_config(workers)
     assert scheduler.long_context_plan == workers[1].long_context_plan
-    assert (
-        workers[0].long_context_plan.hot_pool_groups
-        > scheduler.long_context_plan.hot_pool_groups
-    )
+    assert len({w.long_context_plan for w in workers}) == 1
     config.cache_config.num_gpu_blocks_override = 700
     overridden = get_kv_cache_configs(config, [specs] * 4, budgets)
     assert all(

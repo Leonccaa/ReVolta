@@ -6,6 +6,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorWorkerMetadata,
 )
+from vllm.v1.core.value_arbiter import NUM_HOT_COUNTERS
 from vllm.v1.kv_offload.host.page_table import SealTicket
 from vllm.v1.kv_offload.worker.worker import TransferSpec
 
@@ -87,9 +88,17 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
         counters = dict(self.value_counters)
         for step, (ranks, values) in other.value_counters.items():
             old_ranks, old_values = counters.get(step, (0, (0,) * len(values)))
+            invalid = (
+                bool(old_ranks & ranks)
+                or len(values) != NUM_HOT_COUNTERS
+                or len(old_values) != NUM_HOT_COUNTERS
+                or any(v < 0 for v in (*old_values, *values))
+            )
+            # An empty tuple is an invalid report for this entire step. It
+            # remains invalid through later aggregation and the arbiter holds.
             counters[step] = (
                 old_ranks | ranks,
-                tuple(a + b for a, b in zip(old_values, values)),
+                () if invalid else tuple(a + b for a, b in zip(old_values, values)),
             )
         receives = dict(self.receive_results)
         for attempt, (completed, failed_ranks) in other.receive_results.items():

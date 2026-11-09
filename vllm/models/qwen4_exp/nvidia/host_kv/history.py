@@ -1023,7 +1023,7 @@ class HostHistoryLayer:
             store.wanted, self.slot_owner, self.age, self.clock, store.miss_count,
             store.victim_counts, store.victim_slots, self.eviction_hand,
             s.hot_slots, store.victim_tiles, 512,
-            triton.next_power_of_2(store.victim_tiles), debug=store.debug,
+            triton.next_power_of_2(store.victim_tiles), debug=True,
         )  # fmt: skip
         if shadow is not None:
             # Before allocation overwrites the victims' owners.

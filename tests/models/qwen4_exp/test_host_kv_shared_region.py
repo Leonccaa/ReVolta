@@ -271,3 +271,166 @@ def test_alias_must_cover_whole_storage():
 
 def test_widths_constant_is_the_selection_width():
     assert _shared_shape().selection_width == WIDTH
+
+
+def _production_layer_store():
+    """FP8 per-layer production page geometry, k=26, DCP2, eight requests."""
+    from vllm.models.qwen4_exp.nvidia.host_kv.history import HostHistoryShape
+
+    shape = HostHistoryShape(
+        num_blocks=25,
+        kernel_blocks_per_block=1,
+        kernel_block_tokens=832,
+        num_layers=1,
+        kv_heads=1,
+        head_dim=256,
+        dtype=torch.uint8,
+        hot_slots=25 * 26,
+        slots_per_block=26,
+        max_requests=8,
+        selection_width=2051,
+        max_write_rows=8192,
+        dcp_world_size=2,
+        max_context_tokens=262144,
+        decode_rows=8,
+    )
+    index = torch.full((25, 26 * 2048), 99, dtype=torch.uint8)
+    store = HostHistoryStore(
+        shape,
+        ["l0"],
+        device="cpu",
+        debug=False,
+        hot_views=[hot_alias_view(index, shape)],
+    )
+    store.bind_pages([(hid, hid) for hid in range(1, 25)])
+    store.host.fill_(77)
+    store.ready.fill_(1)
+    store.apply_roles([], list(range(1, 24)))
+    store.set_step_plan(26, None)
+    store.victim_slots.fill_(26)  # a formerly valid slot in a now claimed page
+    return store, index
+
+
+def test_insufficient_victims_keep_reserved_index_pages():
+    store, index = _production_layer_store()
+    before = index.clone()
+    owners = store.slot_owner.clone()
+    # Eight 32-local-token tails need 64 slots, but only 26 remain DONATED.
+    # The interpreter suppresses device assertions. Exercise the data guard
+    # itself, which also protects builds with assertions disabled.
+    store.layer("l0").gather(
+        torch.full((8, 1), -1, dtype=torch.int32),
+        torch.arange(8, dtype=torch.int32),
+        torch.arange(1, 9, dtype=torch.int32).view(8, 1),
+        torch.full((8,), 64, dtype=torch.int32),
+    )
+    assert store.miss_count.item() == 0
+    assert torch.equal(index, before)
+    assert torch.equal(store.slot_owner, owners)
+    assert (store.group_to_slot == -1).all()
+
+
+def test_insufficient_victims_clear_count_even_without_device_asserts():
+    from vllm.models.qwen4_exp.nvidia.host_kv import kernels
+    from vllm.triton_utils import triton
+
+    store, _ = _production_layer_store()
+    layer = store.layer("l0")
+    store.miss_count.fill_(64)
+    kernels.count_victim_buckets[(store.victim_tiles,)](
+        store.wanted,
+        layer.slot_owner,
+        layer.age,
+        layer.clock,
+        store.miss_count,
+        store.victim_counts,
+        layer.eviction_hand,
+        store.shape.hot_slots,
+        store.victim_tiles,
+        512,
+    )
+    before = store.victim_slots.clone()
+    kernels.select_bucket_victims[(store.victim_tiles,)](
+        store.wanted,
+        layer.slot_owner,
+        layer.age,
+        layer.clock,
+        store.miss_count,
+        store.victim_counts,
+        store.victim_slots,
+        layer.eviction_hand,
+        store.shape.hot_slots,
+        store.victim_tiles,
+        512,
+        triton.next_power_of_2(store.victim_tiles),
+        debug=False,
+    )
+    assert store.miss_count.item() == 0
+    assert torch.equal(store.victim_slots, before)
+
+
+@pytest.mark.parametrize("full_graph", [False, True])
+def test_live_dummy_rejected_before_model_or_fullgraph_dispatch(full_graph):
+    from types import SimpleNamespace
+
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    store, index = _production_layer_store()
+    before = index.clone()
+
+    def unexpected_dispatch(*args):
+        raise AssertionError("live dummy reached model dispatch")
+
+    runner = SimpleNamespace(
+        host_history=store,
+        _host_history_live=True,
+        _get_uniform_decode_token_count=unexpected_dispatch,
+        cudagraph_manager=SimpleNamespace(run_fullgraph=unexpected_dispatch),
+    )
+    output = SimpleNamespace(
+        num_scheduled_tokens={"dummy": 1}, total_num_scheduled_tokens=1
+    )
+    with pytest.raises(RuntimeError, match="dummy.*before serving"):
+        GPUModelRunner.execute_model(
+            runner, output, dummy_run=True, skip_attn_for_dummy_run=not full_graph
+        )
+    assert torch.equal(index, before)
+
+
+def test_production_layer_gather_fits_current_hot_capacity():
+    store, index = _production_layer_store()
+    before = index[:24].clone()
+    indices = store.layer("l0").gather(
+        torch.zeros((1, 1), dtype=torch.int32),
+        torch.zeros(1, dtype=torch.int32),
+        torch.ones((1, 1), dtype=torch.int32),
+        torch.full((1,), 64, dtype=torch.int32),
+    )
+    assert store.miss_count.item() == 8
+    assert indices.min().item() >= 24 * 26 * 4
+    assert torch.equal(index[:24], before)
+    slots = store.group_to_slot[0]
+    resident = slots[slots >= 0].long()
+    assert resident.numel() == 8
+    assert (store.hot[0][resident] == 77).all()
+
+
+def test_dummy_wrapper_restores_connector_after_rejection():
+    from types import SimpleNamespace
+
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    disabled: list[bool] = []
+
+    def reject_dummy(*args, **kwargs):
+        raise RuntimeError("Host KV dummy batches are only supported before serving")
+
+    runner = SimpleNamespace(
+        max_num_reqs=8,
+        is_first_pp_rank=True,
+        execute_model=reject_dummy,
+        kv_connector=SimpleNamespace(set_disabled=disabled.append),
+    )
+    with pytest.raises(RuntimeError, match="dummy.*before serving"):
+        GPUModelRunner._dummy_run(runner, 8)
+    assert disabled == [True, False]

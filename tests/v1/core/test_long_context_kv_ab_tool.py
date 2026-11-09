@@ -407,6 +407,16 @@ def test_host_store_check_failures(field, delta, name):
     assert name in _failed(ab.segment_tensor_checks(structure, "on-host"))
 
 
+def test_value_shadow_bytes_count_toward_the_history_segment():
+    # value arbitration bills one shadow byte per history group in the history segment.
+    structure = _structure("host")
+    structure["plan"]["gpu_history_bytes"] += 7 * 4
+    name = "history segment bytes equal the plan (tensors + store metadata)"
+    assert name in _failed(ab.segment_tensor_checks(structure, "on-host"))
+    structure["host_store"]["shadow_gpu_bytes"] = 7 * 4
+    assert not _failed(ab.segment_tensor_checks(structure, "on-host"))
+
+
 def test_host_history_segment_and_binding_failures():
     structure = _structure("host")
     structure["kv_cache_tensors"][2]["size"] += 11

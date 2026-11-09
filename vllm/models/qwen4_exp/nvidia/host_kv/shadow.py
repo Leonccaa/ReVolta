@@ -143,6 +143,14 @@ class HotShadowTable:
         self._events: list[torch.cuda.Event | None] = [None, None]
         self._steps: list[int | None] = [None, None]
         self._turn = 0
+        if pin:
+            # Compile both expiry variants now (no-ops on the empty table):
+            # the first window advance otherwise JIT-compiles inside a decode
+            # step (about 250 ms on a cold Triton cache).
+            for expire_all in (False, True):
+                shadow_expire[(triton.cdiv(num_groups, 1024),)](
+                    self.epoch, self.window, expire_all, num_groups, EPOCH_MOD, 1024
+                )
 
     def device_bytes(self) -> dict[str, int]:
         return {

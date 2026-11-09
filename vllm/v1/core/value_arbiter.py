@@ -76,7 +76,12 @@ class ArbiterConfig:
     """One side observed, the other not: move toward the observed side when
     its density is positive (``follow``), or hold (``hold``)."""
     lag_steps: int = 2
-    """Steps after a window's end to wait for its lagged worker counters."""
+    """Completed worker steps after a window's end to await lagged counters
+    when they are still incomplete; a closed window is evaluated as soon as
+    every step reported. The scheduler passes the output watermark, which
+    excludes queued executions: the output completing step ``s`` carries the
+    counters of step ``s - 1`` (the worker reads them back one step late), so
+    two completed steps cover the last step of the window with one spare."""
     # PLACEHOLDER weights, to be frozen by the value arbitration GPU measurement.
     bw_uva: float = 12.3 * GIB
     """Bytes/s of the UVA hot-slot gather, summed over ranks (placeholder:
@@ -276,6 +281,8 @@ class Decision:
     hot_density: float | None
     idx_density: float | None
     value_donated: int = 0
+    value_delta: int = 0
+    forced_delta: int = 0
 
 
 class ValueArbiter:
@@ -314,6 +321,7 @@ class ValueArbiter:
         self.value_moves = 0
         self.value_donated = 0
         self.forced_clamps = 0
+        self.forced_delta = 0
         self.decisions: list[Decision] = []
         self.late_reports = 0
         self._step_window: dict[int, int] = {}
@@ -359,9 +367,18 @@ class ValueArbiter:
         self, step: int, ranks: int, values: Iterable[int], all_ranks: int
     ) -> None:
         """Accumulate per-output partial reports until every rank reported."""
+        if step not in self._step_window:
+            self.late_reports += 1
+            return
         old_ranks, old_values = self._partial.get(step, (0, [0] * NUM_HOT_COUNTERS))
         values = list(values)
-        if ranks & old_ranks or len(values) != NUM_HOT_COUNTERS:
+        if (
+            ranks <= 0
+            or ranks & ~all_ranks
+            or ranks & old_ranks
+            or len(values) != NUM_HOT_COUNTERS
+            or any(value < 0 for value in values)
+        ):
             # A duplicate or malformed report cannot stand in for another rank.
             self._partial.pop(step, None)
             self.add_hot_counters(step, None)
@@ -391,23 +408,31 @@ class ValueArbiter:
 
     # ----- control -----------------------------------------------------------
 
-    def end_step(self, step: int) -> Decision | None:
-        """Apply the forced clamp, then evaluate windows whose lagged
-        counters had their chance to arrive."""
+    def end_step(
+        self, step: int, *, completed_step: int | None = None
+    ) -> Decision | None:
+        """Apply the forced clamp, then evaluate closed windows whose lagged
+        counters all arrived or had their chance to arrive."""
         snap = self.pool.arbiter_snapshot()
+        forced_delta = self._apply(snap, forced=True)
+        feedback_step = step if completed_step is None else completed_step
         decision = None
         for window in sorted(self.windows):
             stats = self.windows[window]
             if window >= self.window or (
-                stats.steps and step < max(stats.steps) + self.config.lag_steps
+                not stats.complete
+                and stats.steps
+                and feedback_step < max(stats.steps) + self.config.lag_steps
             ):
                 continue
-            decision = self._evaluate(window, stats, snap)
+            decision = self._evaluate(window, stats, snap, forced_delta)
+            self._apply(snap, forced=False)
+            snap = self.pool.arbiter_snapshot()
+            forced_delta = 0
             del self.windows[window]
             for s in stats.steps - stats.reported:
                 self._step_window.pop(s, None)
                 self._partial.pop(s, None)
-        self._apply(snap)
         return decision
 
     def _density(self, stats: WindowStats) -> tuple[float | None, float | None]:
@@ -427,7 +452,7 @@ class ValueArbiter:
         return hot, idx
 
     def _evaluate(
-        self, window: int, stats: WindowStats, snap: PoolSnapshot
+        self, window: int, stats: WindowStats, snap: PoolSnapshot, forced_delta: int = 0
     ) -> Decision:
         c = self.config
         hot, idx = self._density(stats)
@@ -457,16 +482,38 @@ class ValueArbiter:
             and window - self.last_move_window <= c.reverse_gap_windows
         ):
             direction, reason = 0, "reverse_gap"
+        old_target = self.target
         if direction:
-            self.target = min(max(self.target + direction * self.q, 0), snap.upper)
+            self.target = min(max(self.target + direction * self.q, 0), snap.num_ids)
             self.last_dir, self.last_move_window = direction, window
             self.value_moves += 1
+        value_delta = self.target - old_target
+        applied = min(self.target, snap.upper)
+        # Only the applied value change may donate cached IDs. A capacity
+        # clamp that masks this window's value change is accounted separately.
+        excess = max(0, snap.cached - applied)
+        given = 0
+        donation = min(self.q, max(0, self.t_idx - applied), excess)
+        if direction < 0 and donation > 0:
+            given = self.pool.donate_cached_for_value(donation)
+            self.value_donated += given
         action = _ACTIONS[direction]
-        decision = Decision(window, action, reason, self.target, hot, idx)
+        decision = Decision(
+            window,
+            action,
+            reason,
+            applied,
+            hot,
+            idx,
+            value_donated=given,
+            value_delta=value_delta,
+            forced_delta=forced_delta,
+        )
         self.decisions.append(decision)
         logger.info(
             "host KV arbitration window %d: hot density %s, index density %s "
-            "-> %s (%s), T_idx %d, Q %d, forced clamps %d, hot refetch %d/%d, "
+            "-> %s (%s), T_idx %d, value target %d, value delta %d, "
+            "forced delta %d (total %d), Q %d, forced clamps %d, hot refetch %d/%d, "
             "claim evicted %d, index refetch %d (%d txns)/%d, value donated %d, "
             "pool %s",
             window,
@@ -474,7 +521,11 @@ class ValueArbiter:
             _fmt(idx),
             action,
             reason,
-            min(self.target, snap.upper),
+            applied,
+            self.target,
+            value_delta,
+            forced_delta,
+            self.forced_delta,
             self.q,
             self.forced_clamps,
             stats.hot[HOT_REFETCH],
@@ -483,30 +534,25 @@ class ValueArbiter:
             stats.idx_refetch_blocks,
             stats.idx_refetch_txns,
             stats.idx_evicted,
-            self.value_donated,
+            given,
             dict(self.forced_counts()) if self.forced_counts else {},
         )
-        # Value adjustment gives up at most Q cached IDs per evaluated window,
-        # and only when this window moved T_idx toward the hot side.
-        excess = snap.cached - min(self.target, snap.upper)
-        if direction < 0 and excess > 0:
-            given = self.pool.donate_cached_for_value(min(self.q, excess))
-            self.value_donated += given
-            self.decisions[-1] = Decision(
-                window, action, reason, self.target, hot, idx, given
-            )
-        return self.decisions[-1]
+        return decision
 
-    def _apply(self, snap: PoolSnapshot) -> None:
+    def _apply(self, snap: PoolSnapshot, *, forced: bool) -> int:
         target = self.target if self.config.enabled else self.default_target
         t_idx = min(target, snap.upper)
-        if t_idx < target and t_idx < self.t_idx:
+        delta = t_idx - self.t_idx
+        if forced and t_idx < target and delta < 0:
             # Growth (U or F) pushed the bound below the value target: forced,
             # never limited by Q.
             self.forced_clamps += 1
+        if forced:
+            self.forced_delta += delta
         if t_idx != self.t_idx:
             self.t_idx = t_idx
             self.pool.set_index_cache_target(t_idx)
+        return delta
 
 
 _ACTIONS: dict[int, Literal["raise", "lower", "hold"]] = {

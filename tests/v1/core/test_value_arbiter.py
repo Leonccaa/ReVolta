@@ -64,8 +64,15 @@ def make(config=None, pool=None, default=200, **kwargs):
 class Feeder:
     """Drives one arbiter with lagged hot counters and index events."""
 
-    def __init__(self, arb, pool, lag=1):
+    def __init__(self, arb, pool, lag=1, after_end=False):
+        # after_end: deliver counters after end_step, as the engine does (the
+        # output carrying them is processed after the next schedule). The
+        # scheduler then passes its output watermark: the output completing
+        # step s carries the counters of step s - 1, so with counters of
+        # step k delivered after end_step(k + lag), end_step(s) sees the
+        # watermark s - lag.
         self.arb, self.pool, self.lag = arb, pool, lag
+        self.after_end = after_end
         self.step = 0
         self.pending: list[tuple[int, list[int] | None]] = []
         self.decisions = []
@@ -94,14 +101,24 @@ class Feeder:
                 if idx_refetch:
                     self.arb.on_index_restored(hashes[:idx_refetch])
             self.pending.append((self.step, None if i == drop_step else counters))
-            while self.pending and self.pending[0][0] <= self.step - self.lag:
-                step, values = self.pending.pop(0)
-                if values is not None:
-                    self.arb.add_hot_counters(step, values)
-            d = self.arb.end_step(self.step)
+            if self.after_end:
+                d = self.arb.end_step(
+                    self.step, completed_step=max(self.step - self.lag, 0)
+                )
+            else:
+                self.deliver()
+                d = self.arb.end_step(self.step)
             if d is not None:
                 self.decisions.append(d)
+            if self.after_end:
+                self.deliver()
         return self.decisions[-1] if self.decisions else None
+
+    def deliver(self):
+        while self.pending and self.pending[0][0] <= self.step - self.lag:
+            step, values = self.pending.pop(0)
+            if values is not None:
+                self.arb.add_hot_counters(step, values)
 
     def flush(self):
         # Opening the next window closes this one; lag steps then evaluate.
@@ -367,6 +384,34 @@ def test_late_counters_are_dropped():
     assert arb.late_reports > 0
 
 
+@pytest.mark.parametrize("lag", [1, 2, 3])
+def test_engine_ordered_counters_are_not_late(lag):
+    # GPU finding: with async scheduling the counters of step s arrive after
+    # schedule(s + 2) ran end_step. A wait of exactly two steps evaluated
+    # every window before its last step reported ("counters_missing" forever).
+    arb, pool = make()
+    f = Feeder(arb, pool, lag=lag, after_end=True)
+    f.window(hot_forced=100, hot_refetch=50, idx_evicted=100, idx_refetch=10)
+    f.window()
+    f.window()
+    assert arb.late_reports == 0
+    assert f.decisions[0].reason == "hot_denser"
+    assert f.decisions[0].action == "lower" and arb.value_moves == 1
+
+
+def test_complete_window_is_evaluated_without_waiting():
+    arb, pool = make()
+    f = Feeder(arb, pool, lag=1)
+    f.window(hot_forced=100, hot_refetch=50, idx_evicted=100, idx_refetch=10)
+    # The first step of the next window delivers the last counters of window
+    # 0, which completes it: evaluated in that same step.
+    f.step += 1
+    arb.begin_step(f.step, 0.01)
+    f.pending.append((f.step, [0] * NUM_HOT_COUNTERS))
+    f.deliver()
+    assert arb.end_step(f.step) is not None
+
+
 def test_config_from_settings():
     config = ArbiterConfig.from_settings(False, {"w_ttft": "2.5", "window_steps": 8})
     assert not config.enabled and config.w_ttft == 2.5 and config.window_steps == 8
@@ -411,7 +456,157 @@ def test_worker_metadata_aggregates_counters():
         OffloadingWorkerMetadata,
     )
 
-    a = OffloadingWorkerMetadata(value_counters={7: (1, (1, 2))})
-    b = OffloadingWorkerMetadata(value_counters={7: (2, (10, 20)), 8: (2, (3, 4))})
+    a = OffloadingWorkerMetadata(value_counters={7: (1, (1,) * NUM_HOT_COUNTERS)})
+    b = OffloadingWorkerMetadata(
+        value_counters={
+            7: (2, (10,) * NUM_HOT_COUNTERS),
+            8: (2, (3,) * NUM_HOT_COUNTERS),
+        }
+    )
     merged = a.aggregate(b)
-    assert merged.value_counters == {7: (3, (11, 22)), 8: (2, (3, 4))}
+    assert merged.value_counters == {
+        7: (3, (11,) * NUM_HOT_COUNTERS),
+        8: (2, (3,) * NUM_HOT_COUNTERS),
+    }
+
+
+@pytest.mark.parametrize("depth", [1, 2, 4])
+@pytest.mark.parametrize("drop_last", [False, True])
+def test_real_engine_queue_feedback_deadline(depth, drop_last):
+    """Use the real engine queue, scheduler hooks and one-step harvest."""
+    from collections import deque
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+        OffloadingWorkerMetadata,
+    )
+    from vllm.models.qwen4_exp.nvidia.host_kv.shadow import HotShadowTable
+    from vllm.v1.core.sched.scheduler import Scheduler
+    from vllm.v1.engine.core import EngineCore
+    from vllm.v1.kv_offload.host.page_table import HostPageTable
+    from vllm.v1.outputs import KVConnectorOutput
+
+    arb, _ = make(ArbiterConfig())
+    shadow = HotShadowTable(16, 4, torch.device("cpu"))
+    pages = HostPageTable(2, num_workers=2)
+    scheduler = SimpleNamespace(
+        current_step=0,
+        value_arbiter=arb,
+        _value_step_clock=None,
+        host_history_pool=SimpleNamespace(
+            host_pages=pages,
+            complete_jobs=lambda _: None,
+        ),
+    )
+    state = SimpleNamespace(current=None)
+
+    def schedule():
+        scheduler.current_step += 1
+        Scheduler._value_arbiter_step(scheduler)
+        return SimpleNamespace(
+            step=scheduler.current_step,
+            total_num_scheduled_tokens=1,
+            pending_structured_output_tokens=False,
+        )
+
+    def execute(output, non_block):
+        shadow.counters[HOT_FORCED_RECENT] = 10
+        shadow.counters[HOT_REFETCH] = 10
+        counters = shadow.harvest(output.step)
+        state.current = SimpleNamespace(
+            done=lambda: False,
+            result=lambda: SimpleNamespace(counters=counters),
+        )
+        return state.current
+
+    def update(output, result):
+        counters = {}
+        if result.counters is not None:
+            step, values = result.counters
+            ranks = 1 if drop_last and step == W else pages.all_ranks
+            counters[step] = (ranks, tuple(values))
+        Scheduler.update_host_kv_output(
+            scheduler,
+            KVConnectorOutput(
+                kv_connector_worker_meta=OffloadingWorkerMetadata(
+                    completed_steps={output.step: pages.all_ranks},
+                    value_counters=counters,
+                ),
+            ),
+        )
+        return {}
+
+    engine = SimpleNamespace(
+        batch_queue=deque(maxlen=depth),
+        batch_queue_size=depth,
+        _sm70_async_cpu_trace_step=0,
+        is_ec_consumer=True,
+        is_pooling_model=False,
+        scheduler=SimpleNamespace(
+            has_requests=lambda: True,
+            schedule=schedule,
+            get_grammar_bitmask=lambda _: None,
+            update_from_output=update,
+        ),
+        model_executor=SimpleNamespace(
+            execute_model=execute,
+            sample_tokens=lambda *a, **kw: state.current,
+        ),
+        log_error_detail=lambda _: nullcontext(),
+        log_iteration_details=lambda _: nullcontext(),
+        _process_aborts_queue=lambda: None,
+    )
+    for _ in range(110):
+        EngineCore.step_with_batch_queue(engine)
+    assert len(arb.decisions) == 3
+    assert arb.decisions[0].reason == ("counters_missing" if drop_last else "one_sided")
+    assert all(d.reason != "counters_missing" for d in arb.decisions[1:])
+    assert arb.value_moves == (2 if drop_last else 3)
+    assert arb.late_reports == 0
+    assert len(arb.windows) <= 2 and len(arb._partial) <= 1
+
+
+@pytest.mark.parametrize("clamp_step", [33, 34])
+def test_evaluation_clamp_preserves_value_target_and_recovers(clamp_step):
+    arb, pool = make(default=500)
+    values = [0] * NUM_HOT_COUNTERS
+    values[HOT_FORCED_RECENT] = values[HOT_REFETCH] = 1
+    decisions = []
+    # Counters arrive two steps late, so window 0 (steps 1-32) completes and
+    # is evaluated at step 34: the clamp lands before or at that step.
+    for step in range(1, 35):
+        if step == clamp_step:
+            pool.inuse, pool.floor, pool.cached = 850, 50, 100
+        arb.begin_step(step)
+        if step > 2:
+            arb.add_hot_counters(step - 2, values)
+        if (d := arb.end_step(step)) is not None:
+            decisions.append((step, d))
+    assert [(step, d.window) for step, d in decisions] == [(34, 0)]
+    decision = decisions[0][1]
+    assert arb.forced_clamps == 1
+    assert arb.target == 500 - arb.q
+    assert arb.t_idx == pool.target == 100
+    assert decision.value_delta == -arb.q
+    assert decision.value_donated <= arb.q
+    assert arb.forced_delta == -400
+    pool.inuse = 100
+    arb.begin_step(35)
+    arb.end_step(35)
+    assert arb.target == arb.t_idx == pool.target == 490
+    assert arb.forced_delta == -10  # release of 390 after the clamp of 400
+
+
+def test_late_partial_ranks_do_not_reopen_expired_feedback():
+    arb, pool = make()
+    feeder = Feeder(arb, pool, lag=5)
+    feeder.window(hot_forced=100, hot_refetch=100)
+    feeder.window()
+    assert feeder.decisions[0].reason == "counters_missing"
+    for step in range(1, W + 1):
+        arb.add_rank_counters(step, 1, [0] * NUM_HOT_COUNTERS, 3)
+    assert not set(range(1, W + 1)) & arb._partial.keys()
+    assert arb.target == arb.default_target

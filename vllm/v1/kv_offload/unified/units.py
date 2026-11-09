@@ -4,9 +4,7 @@
 
 Content references never pin physical frames. CPU handles and SSD evidence
 are separate from the graph, and all events carry their incarnation.
-unified host budgeting uses files_complete as a cold-recovery approximation; unit SSD
-transactions supplies the
-manifest predicate through the same interface.
+SSD cold recovery additionally requires a committed variant manifest.
 """
 
 from collections import Counter
@@ -55,6 +53,9 @@ class Unit:
     variants: set[UnitId] = field(default_factory=set)
     last_use: int = 0
     missing: dict[str, int] = field(default_factory=dict)
+    boundary_position: int = 0
+    ahead_position: int = 0
+    draft_range: tuple[int, int] = (0, 0)
 
 
 @dataclass(frozen=True)
@@ -63,6 +64,9 @@ class VariantOffer:
     gen: int
     ahead: bytes
     main: tuple[OffloadKey, ...]
+    boundary_position: int = 0
+    ahead_position: int = 0
+    draft_range: tuple[int, int] = (0, 0)
 
 
 class UnitIndex:
@@ -79,6 +83,8 @@ class UnitIndex:
         # claim
         # that a manifest has been committed.
         self.manifest_ok: Callable[[Unit], bool] | None = None
+        self.on_event: Callable[[str, Unit], None] = lambda event, unit: None
+        self.on_reset: Callable[[], None] = lambda: None
 
     def _changed(self, keys: Iterable[OffloadKey]) -> None:
         unique = set(keys)
@@ -254,7 +260,11 @@ class UnitIndex:
             self.components[key].refs.add(uid)
         self.touch(uid)
         self.events["variant_registered"] += 1
+        u.boundary_position = offer.boundary_position
+        u.ahead_position = offer.ahead_position
+        u.draft_range = offer.draft_range
         self._changed(keys)
+        self.on_event("register", u)
         return u
 
     def _resident(self, key: OffloadKey, tier: str) -> bool:
@@ -284,7 +294,9 @@ class UnitIndex:
         """
         u = self.units[uid]
         return (
-            frozenset(k for k in u.keys if not self._resident(k, "ssd")),
+            frozenset()
+            if u.missing["ssd"] == 0
+            else frozenset(k for k in u.keys if not self._resident(k, "ssd")),
             self.manifest_ok is not None and not self.manifest_ok(u),
         )
 
@@ -372,6 +384,7 @@ class UnitIndex:
             self.components[key].refs.discard(uid)
         self.events[f"revoke_{reason}"] += 1
         self._changed(u.keys)
+        self.on_event("revoke", u)
         return True
 
     def reset(self) -> None:
@@ -380,6 +393,7 @@ class UnitIndex:
                 self.revoke(uid, self.units[uid].gen, "reset")
         self.components.clear()
         self.reset_epoch += 1
+        self.on_reset()
 
     def cpu_status(self, key: OffloadKey) -> str:
         c = self.components.get(key)

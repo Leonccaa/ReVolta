@@ -94,6 +94,7 @@ class UnifiedStoreManager(OffloadingManager):
         self.waiting_on: dict[OffloadKey, set[str]] = {}
         self._wait_keys: dict[str, set[OffloadKey]] = {}
         self.waiting: dict[str, dict[tuple[UnitId, bytes], VariantOffer]] = {}
+        self._latest_variant_offers: dict[str, VariantOffer] = {}
         self._missing_main: dict[str, dict[tuple[UnitId, bytes], set[OffloadKey]]] = {}
         self._waiting_boundaries: dict[UnitId, set[str]] = {}
         self.num_stored_blocks = 0
@@ -160,6 +161,10 @@ class UnifiedStoreManager(OffloadingManager):
                 "transport_bytes": self.spec.cpu_page_size_per_worker,
             }
         )
+        if ssd.enabled and not ssd._component_tier.disabled:
+            from vllm.v1.kv_offload.unified.ssd import UnitSsdStore
+
+            ssd.unit_store = UnitSsdStore(self, ssd)
 
     def admit_build(self, req_id: str, frames: int) -> bool:
         return self.ledger.admit(req_id, frames)
@@ -359,6 +364,12 @@ class UnifiedStoreManager(OffloadingManager):
         }
 
     def offer_variant(self, req_id: str, offer: VariantOffer) -> None:
+        prior = self._latest_variant_offers.get(req_id)
+        if prior is None or (offer.boundary_position, offer.ahead_position) >= (
+            prior.boundary_position,
+            prior.ahead_position,
+        ):
+            self._latest_variant_offers[req_id] = offer
         identity = offer.boundary, offer.ahead
         if self.waiting.get(req_id, {}).get(identity) == offer:
             return
@@ -414,6 +425,7 @@ class UnifiedStoreManager(OffloadingManager):
         # Normal end: accepted stores are allowed to publish after completion.
         # Only unused credit is returned now; accepted DMA moves to DRAINING.
         self.clear_waiter(req_context.req_id)
+        self._latest_variant_offers.pop(req_context.req_id, None)
         self.release_lookup(req_context.req_id)
         self.end_step()
         self.ledger.finish(req_context.req_id)
@@ -422,6 +434,7 @@ class UnifiedStoreManager(OffloadingManager):
 
     def cancel_request(self, req_id: str) -> None:
         self.clear_waiter(req_id)
+        self._latest_variant_offers.pop(req_id, None)
         self.release_lookup(req_id)
         for b in tuple(self.builds.values()):
             if b.req_id == req_id:
@@ -437,6 +450,14 @@ class UnifiedStoreManager(OffloadingManager):
         return handle is not None and self.table.is_ready(handle)
 
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> bool | None:
+        if (
+            self.ssd is not None
+            and self.ssd.unit_store is not None
+            and req_context.req_id in self.ssd.unit_store.requests
+        ):
+            self.ssd.poll()
+            if self.ssd.unit_store.waiting(req_context.req_id):
+                return None
         if self.is_ready_resident(key):
             return True
         if key in self.pending:
@@ -652,12 +673,39 @@ class UnifiedStoreManager(OffloadingManager):
     def demote(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
         self.units.demote(keys, True)
 
-    def drop_pending_secondary_writes(self, keys: Collection[OffloadKey]) -> None:
+    def drop_pending_secondary_writes(
+        self, keys: Collection[OffloadKey], req_id: str | None = None
+    ) -> None:
         if self.ssd is not None:
             handles = [self.table.lookup(k) for k in keys]
             self.ssd._queue.drop([h for h in handles if h is not None], "superseded")
+            store = self.ssd.unit_store
+            if store is not None:
+                variants = {
+                    uid
+                    for key in keys
+                    if key in self.units.components
+                    for uid in self.units.components[key].refs
+                    if uid.ahead is not None
+                }
+                offer = (
+                    self._latest_variant_offers.get(req_id)
+                    if req_id is not None
+                    else None
+                )
+                target = (
+                    None
+                    if offer is None
+                    else UnitId(
+                        offer.boundary.boundary, offer.boundary.reset, offer.ahead
+                    )
+                )
+                store.credit.supersede(variants, target)
+                for uid in variants:
+                    store.due.pop(uid, None)
 
     def _on_table_reset(self) -> None:
+        self._latest_variant_offers.clear()
         for req_id in tuple(self._lookup_holds):
             self.release_lookup(req_id)
         self.waiting.clear()
@@ -669,6 +717,7 @@ class UnifiedStoreManager(OffloadingManager):
             build.failed = True
 
     def reset_cache(self) -> None:
+        self._latest_variant_offers.clear()
         for req_id in tuple(self._lookup_holds):
             self.release_lookup(req_id)
         for b in tuple(self.builds.values()):
@@ -760,6 +809,11 @@ class UnifiedStoreManager(OffloadingManager):
             "physical_charges": len(self.ledger.charges),
             "value_work_max": self.value.work_max,
             **(self.bytes + self.table.dma_bytes),
+            **(
+                self.ssd.unit_store.snapshot()
+                if self.ssd is not None and self.ssd.unit_store is not None
+                else {}
+            ),
         }
 
     def shutdown(self) -> None:

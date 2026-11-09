@@ -31,6 +31,7 @@ class FileSystemCache:
         max_size_bytes: int | None,
         min_free_bytes: int | None = None,
         max_files: int = 1_000_000,
+        external_eviction: bool = False,
     ) -> "FileSystemCache":
         root = os.path.realpath(root)
         from vllm.v1.kv_offload.tiering.fs.config import validate_fs_budget
@@ -45,7 +46,13 @@ class FileSystemCache:
         with cls._registry_lock:
             cache = cls._registry.get(root)
             if cache is None:
-                cache = cls(root, max_size_bytes, min_free_bytes, max_files)
+                cache = cls(
+                    root,
+                    max_size_bytes,
+                    min_free_bytes,
+                    max_files,
+                    external_eviction=external_eviction,
+                )
                 cls._registry[root] = cache
             elif (cache.max_size_bytes, cache.min_free_bytes, cache.max_files) != (
                 max_size_bytes,
@@ -54,15 +61,24 @@ class FileSystemCache:
             ):
                 raise ValueError("FS tiers sharing a root must use the same budget")
             cache._users += 1
+            cache.external_eviction |= external_eviction
             return cache
 
     def __init__(
-        self, root: str, max_size_bytes: int | None, min_free_bytes: int, max_files: int
+        self,
+        root: str,
+        max_size_bytes: int | None,
+        min_free_bytes: int,
+        max_files: int,
+        *,
+        external_eviction: bool = False,
     ):
         self.root = root
         self.max_size_bytes = max_size_bytes
         self.min_free_bytes = min_free_bytes
         self.max_files = max_files
+        self.external_eviction = external_eviction
+        self._claims: dict[str, tuple[int, int]] = {}
         self._users = 0
         self._lock = threading.Lock()
         self._pins: dict[str, int] = {}
@@ -78,20 +94,28 @@ class FileSystemCache:
         try:
             fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             # The lock makes abandoned atomic-write temporaries safe to remove.
-            for path in Path(root).rglob("*.tmp"):
-                path.unlink()
+            if not external_eviction:
+                for path in Path(root).rglob("*.tmp"):
+                    path.unlink()
             pages: list[tuple[int, str, int]] = []
-            for path in Path(root).rglob("*.bin"):
+            for path in Path(root).rglob("*"):
+                if not path.is_file() or not (
+                    path.suffix == ".bin"
+                    or external_eviction
+                    and (path.name.endswith(".unit.json") or path.suffix == ".tmp")
+                ):
+                    continue
                 stat = path.stat()
                 heapq.heappush(pages, (stat.st_mtime_ns, str(path), stat.st_size))
-                if len(pages) > max_files:
+                if not external_eviction and len(pages) > max_files:
                     _, victim, _ = heapq.heappop(pages)
                     os.unlink(victim)
             for _, name, size in sorted(pages):
                 self._pages[name] = size
                 self._bytes += size
             try:
-                self._make_room(0)
+                if not external_eviction:
+                    self._make_room(0)
             except OSError as exc:
                 # Other filesystem users may consume the reserve. Keep reads
                 # and CPU serving available; subsequent stores fail as jobs.
@@ -130,6 +154,8 @@ class FileSystemCache:
 
         # Never evict a page being read or written, even across group pools.
         while not fits():
+            if self.external_eviction:
+                raise OSError(errno.ENOSPC, "Unified SSD reservation required")
             victim = next((p for p in self._pages if p not in self._pins), None)
             if victim is None:
                 raise OSError(
@@ -138,6 +164,51 @@ class FileSystemCache:
             with suppress(FileNotFoundError):
                 os.unlink(victim)
             self._forget(victim)
+
+    def reserve_paths(self, paths: dict[str, int]) -> bool:
+        """Atomically reserve a complete transaction, sharing pending paths."""
+        with self._lock:
+            fresh = {
+                p: n
+                for p, n in paths.items()
+                if p not in self._pages and p not in self._claims
+            }
+            size = sum(fresh.values())
+            stat = os.statvfs(self.root)
+            pending_files = sum(path not in self._pages for path in self._claims)
+            if (
+                len(self._pages) + pending_files + len(fresh) > self.max_files
+                or self.max_size_bytes is not None
+                and self._bytes + self._reserved + size > self.max_size_bytes
+                or stat.f_bavail * stat.f_frsize
+                < self.min_free_bytes + self._reserved + size
+            ):
+                return False
+            for path in paths:
+                amount, refs = self._claims.get(path, (fresh.get(path, 0), 0))
+                self._claims[path] = amount, refs + 1
+            self._reserved += size
+            return True
+
+    def release_paths(self, paths: Iterable[str]) -> None:
+        with self._lock:
+            for path in paths:
+                amount, refs = self._claims[path]
+                if refs == 1:
+                    self._reserved -= amount
+                    del self._claims[path]
+                else:
+                    self._claims[path] = amount, refs - 1
+
+    def discard(self, path: str) -> bool:
+        """Explicit authority deletion. Pins include every transaction source."""
+        with self._lock:
+            if path in self._pins or path in self._claims or path in self._writing:
+                return False
+            with suppress(FileNotFoundError):
+                os.unlink(path)
+            self._forget(path)
+            return True
 
     def lookup(self, path: str, on_found: Callable[[], None] | None = None) -> bool:
         """Optionally install a proof under the deletion lock.
@@ -188,9 +259,12 @@ class FileSystemCache:
             if not os.path.exists(path):
                 if self.max_size_bytes is not None and size > self.max_size_bytes:
                     raise OSError(errno.ENOSPC, "FS cache page exceeds budget")
-                self._make_room(size)
-                reserved = size
-                self._reserved += size
+                if path not in self._claims:
+                    if self.external_eviction:
+                        raise OSError(errno.ENOSPC, "Unified SSD reservation required")
+                    self._make_room(size)
+                    reserved = size
+                    self._reserved += size
             self._writing.add(path)
             self._pins[path] = self._pins.get(path, 0) + 1
         try:
@@ -198,6 +272,11 @@ class FileSystemCache:
         finally:
             with self._lock:
                 self._reserved -= reserved
+                if path in self._claims:
+                    amount, refs = self._claims[path]
+                    if os.path.exists(path):
+                        self._reserved -= amount
+                        self._claims[path] = 0, refs
                 self._writing.remove(path)
                 self._pins[path] -= 1
                 if self._pins[path] == 0:

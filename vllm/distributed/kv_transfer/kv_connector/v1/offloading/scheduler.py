@@ -3,7 +3,6 @@
 import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
-from itertools import islice
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import regex as re
@@ -451,16 +450,17 @@ class RequestOffloadState:
     def update_offload_keys(self) -> None:
         for group_config in self.config.kv_group_configs:
             group_state = self.group_states[group_config.group_idx]
-            for req_block_hash in islice(
-                self.req.block_hashes,
+            for block_idx in range(
                 group_config.hash_block_size_factor * len(group_state.offload_keys)
                 + group_config.hash_block_size_factor
                 - 1,
-                None,
+                len(self.req.block_hashes),
                 group_config.hash_block_size_factor,
             ):
                 group_state.offload_keys.append(
-                    make_offload_key(req_block_hash, group_config.group_idx)
+                    make_offload_key(
+                        self.req.block_hashes[block_idx], group_config.group_idx
+                    )
                 )
 
     def update_block_id_groups(
@@ -2442,6 +2442,7 @@ class OffloadingConnectorScheduler:
                 if h_b is None:
                     continue
                 components = []
+                draft_start = boundary
                 for group in self.config.kv_group_configs:
                     keys = status.group_states[group.group_idx].offload_keys
                     end = boundary // group.offloaded_block_size
@@ -2451,6 +2452,10 @@ class OffloadingConnectorScheduler:
                     elif group.draft_window_tokens is not None:
                         window = group.sliding_window_size_in_blocks
                         assert window is not None
+                        draft_start = min(
+                            draft_start,
+                            max(0, end - window) * group.offloaded_block_size,
+                        )
                         components.extend(keys[max(0, end - window) : end])
                 uid = UnitId(h_b, unified.units.reset_epoch)
                 existing = unified.units.units.get(uid)
@@ -2474,7 +2479,15 @@ class OffloadingConnectorScheduler:
                 if len(main) >= ahead // span:
                     unified.offer_variant(
                         req_id,
-                        VariantOffer(uid, gen, h_a, tuple(main[: ahead // span])),
+                        VariantOffer(
+                            uid,
+                            gen,
+                            h_a,
+                            tuple(main[: ahead // span]),
+                            boundary,
+                            ahead,
+                            (draft_start, boundary),
+                        ),
                     )
 
     def _cpu_tier_managers(self) -> list[Any]:
@@ -3081,7 +3094,13 @@ class OffloadingConnectorScheduler:
                     keys.append(group_keys[b])
         drop = getattr(self.manager, "drop_pending_secondary_writes", None)
         if keys and drop is not None:
-            drop(keys)
+            unified = getattr(self, "unified", None)
+            if unified is not None:
+                unified.drop_pending_secondary_writes(
+                    keys, req_id=req_status.req.request_id
+                )
+            else:
+                drop(keys)
 
     def take_events(self) -> Iterable[KVCacheEvent]:
         """Take the KV cache events from the connector.

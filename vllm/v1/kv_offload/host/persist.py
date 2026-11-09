@@ -78,6 +78,9 @@ class FlushReport:
     deadline_hit: bool = False
     skipped: str | None = None
     quarantined: bool = False
+    guaranteed_completed_bytes: int = 0
+    best_effort_completed_bytes: int = 0
+    unfinished_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -194,6 +197,7 @@ class HostPageSsd:
         self._phase = "run"
         self._closed = False
         self.quarantined = False
+        self.unit_store: Any = None
         self.stats_counter: Counter[str] = Counter()
         self._ctx = ReqContext(req_id="host-kv-v2")
         layout_dict = asdict(layout) if is_dataclass(layout) else dict(layout)
@@ -237,6 +241,7 @@ class HostPageSsd:
             drain_timeout_s=0,
             max_inflight_store_blocks=self._max_pending + self._window,
             write_delay_s=0,
+            external_eviction=table.value_policy is not None,
         )
         volume = None
         try:
@@ -269,6 +274,8 @@ class HostPageSsd:
         if self._component_tier is not None:
             return
         options = self.options
+        if self.enabled:
+            self._tier._cache.external_eviction = True
         spec = _HostSpec(
             self._spec.vllm_config,
             self._spec.kv_cache_config,
@@ -294,6 +301,7 @@ class HostPageSsd:
             drain_timeout_s=0,
             max_inflight_store_blocks=self._max_pending + self._window,
             write_delay_s=0,
+            external_eviction=True,
         )
         if self.enabled:
             self._tier._cache.loss_listeners.append(self._file_lost)
@@ -322,9 +330,13 @@ class HostPageSsd:
                 continue
             del self._file_evidence[path]
             key, incarnation = evidence
+            if self.unit_store is not None:
+                self.unit_store.invalidate_key(key)
             policy = self.table.value_policy
             if policy is not None:
                 policy.ssd_lost(key, incarnation)
+            if self.unit_store is not None:
+                self.unit_store.file_lost(key)
             page = self._page(incarnation)
             if page is not None and page.key == key:
                 self.table.unpersist(incarnation)
@@ -341,10 +353,23 @@ class HostPageSsd:
         out.update(self.stats_counter)
         out["jobs"] = len(self._jobs)
         out["deferred"] = len(self._deferred)
+        if self.unit_store is not None:
+            out.update(self.unit_store.snapshot())
         return out
 
     def has_pending(self) -> bool:
-        return bool(self._jobs or self._queue.depth or self._deferred or self._rounds)
+        return bool(
+            self._jobs
+            or self._queue.depth
+            or self._deferred
+            or self._rounds
+            or self.unit_store is not None
+            and (
+                self.unit_store.writes
+                or self.unit_store.prefetches
+                or self.unit_store.due
+            )
+        )
 
     def owns_io(self, owner_id: int) -> bool:
         return owner_id in self._jobs
@@ -376,6 +401,10 @@ class HostPageSsd:
         the file's xattr binds that digest. Epoch 0 is stable across
         restarts. A reset gets a process-unique salt, so pre- and post-reset
         files can never hit each other."""
+        if self.unit_store is not None:
+            restored = self.unit_store.tier_key(key)
+            if restored is not None:
+                return restored
         epoch = self.table.ssd_epoch
         salt = b"" if epoch == 0 else self._salts.setdefault(epoch, os.urandom(16))
         if (
@@ -386,7 +415,11 @@ class HostPageSsd:
         return host_page_tier_key(key, salt)
 
     def _store_jobs(self) -> int:
-        return len(self._jobs) - self._inflight_loads
+        return (
+            len(self._jobs)
+            - self._inflight_loads
+            + (len(self.unit_store.manifest_jobs) if self.unit_store is not None else 0)
+        )
 
     # --- jobs ------------------------------------------------------------
 
@@ -394,6 +427,9 @@ class HostPageSsd:
         assert page.key is not None
         self._next_job -= 1
         job = _Job(self._next_job, page.handle, self._tier_key(page.key), loading)
+        if self._report is not None and not loading:
+            job.flush = True
+            self._report.candidates += 1
         self.table.start_io(page.handle, job.job_id)
         self._jobs[job.job_id] = job
         self._page_jobs[page.handle.page_id] = job.job_id
@@ -406,6 +442,9 @@ class HostPageSsd:
         return job
 
     def _submit_to_tier(self, job: _Job) -> None:
+        if self.unit_store is not None and not self.unit_store.prepare_job(job):
+            self._finish(job, False)
+            return
         meta = JobMetadata(
             job_id=job.job_id,
             keys=[job.tier_key],
@@ -430,7 +469,14 @@ class HostPageSsd:
         job.submitted = True
 
     def _pump(self) -> None:
-        while self._submit and self._inflight_stores < self._window:
+        limit = self._window
+        if self.unit_store is not None:
+            limit = min(limit, self.unit_store.credit.q_eff // self.page_bytes)
+            if limit == 0:
+                while self._submit:
+                    self._finish(self._jobs[self._submit.popleft()], False)
+                return
+        while self._submit and self._inflight_stores < limit:
             job = self._jobs[self._submit.popleft()]
             self._submit_to_tier(job)
 
@@ -465,6 +511,10 @@ class HostPageSsd:
                 file_present = not tier.disabled and tier._cache.lookup(
                     path, remember_file
                 )
+        if self.unit_store is not None:
+            page = self._page(job.handle)
+            if page is not None and page.key is not None:
+                self.unit_store.invalidate_key(page.key)
         if job.loading:
             ok = self.table.complete_load(job.handle, success)
             if ok and not file_present:
@@ -511,6 +561,8 @@ class HostPageSsd:
                 else:
                     report.late_failed += 1
         self.table.finish_io(job.handle, job.job_id)
+        if self.unit_store is not None:
+            self.unit_store.job_done(job, success)
 
     def _poll(self) -> None:
         self._poll_losses()
@@ -522,17 +574,37 @@ class HostPageSsd:
                 job = self._jobs.get(result.job_id)
                 if job is not None:
                     self._finish(job, result.success)
+                elif self.unit_store is not None:
+                    self.unit_store.manifest_done(result.job_id, result.success)
         self._poll_losses()
 
     # --- PersistenceHooks ------------------------------------------------
 
     def on_published(self, handle: PageHandle) -> None:
+        if self.unit_store is not None:
+            self.unit_store.dirty_since.setdefault(handle, self.clock())
         if self.enabled and not self._flushing:
             self._queue.enqueue([handle], self._ctx)
 
     def try_writeback(self, page: HostPage, headroom_before: int) -> bool:
         """Before eviction: one immediate write (still rate limited) when the
         queue has room and net headroom pays for the page. Never blocks."""
+        if self.unit_store is not None and page.key is not None:
+            component = self.unit_store.units.components.get(page.key)
+            variants = (
+                []
+                if component is None
+                else [
+                    self.unit_store.units.units[uid]
+                    for uid in component.refs
+                    if uid.ahead is not None
+                ]
+            )
+            if variants:
+                return any(
+                    self.unit_store.start_write(u, headroom_before)
+                    for u in sorted(variants, key=lambda u: u.last_use)
+                )
         if not self.enabled or self._flushing or not self._writable(page):
             return False
         if self._store_jobs() >= self._max_pending:
@@ -600,6 +672,8 @@ class HostPageSsd:
             return
         self._poll()
         self._expire_prefetch(self.clock())
+        if self.unit_store is not None:
+            self.unit_store.step()
         for batch in self._queue.take_due():
             for handle in self._queue.select(batch, self._resident, lambda h: False):
                 self._deferred[handle] = None
@@ -612,6 +686,20 @@ class HostPageSsd:
                 if page is not None and self.table.is_persisted(page):
                     self.stats_counter["already_persisted"] += 1
                 continue
+            if (
+                self.unit_store is not None
+                and page.key in self.unit_store.units.components
+            ):
+                component = self.unit_store.units.components[page.key]
+                variants = [
+                    self.unit_store.units.units[uid]
+                    for uid in component.refs
+                    if uid.ahead is not None
+                ]
+                if variants:
+                    for unit in variants:
+                        self.unit_store.start_write(unit)
+                    continue
             cost = int(self.table.reclaimable(page))
             if headroom is None:
                 headroom = self.table.net_headroom()
@@ -642,6 +730,15 @@ class HostPageSsd:
         """
         if not self.enabled or self._flushing:
             return []
+        keys = tuple(keys)
+        now = self.clock()
+        self._expire_prefetch(now)
+        if req_id in self._expired_rounds:
+            return []
+        if self.unit_store is not None:
+            result = self.unit_store.prefetch(req_id, keys)
+            if result is not None:
+                return result
         now = self.clock()
         self._expire_prefetch(now)
         if req_id in self._expired_rounds:
@@ -654,6 +751,12 @@ class HostPageSsd:
         headroom: int | None = None
         per_req = self.options["prefetch_max_per_request"]
         for key in keys:
+            if (
+                self.unit_store is not None
+                and self.table.kind_for_key(key) != PageKind.MAIN
+                and key not in self.unit_store.files
+            ):
+                break
             if key in round_.keys:
                 continue
             handle = self.table.lookup(key)
@@ -717,16 +820,31 @@ class HostPageSsd:
             return
         self._poll()
         self._expire_prefetch(self.clock())
+        if self.unit_store is not None:
+            self.unit_store.advance_prefetches()
+            self.unit_store.advance_writes()
 
     def waiting(self, req_id: str) -> bool:
         """The request's prefetch round still has reads in flight. False
         once every read has finished, failed, or the round expired."""
         round_ = self._rounds.get(req_id)
-        return round_ is not None and bool(round_.loading)
+        return (round_ is not None and bool(round_.loading)) or (
+            self.unit_store is not None and self.unit_store.waiting(req_id)
+        )
 
     def holds(self, req_id: str) -> list[PageHandle]:
         round_ = self._rounds.get(req_id)
-        return [] if round_ is None else [h for h, _ in round_.holds]
+        handles = [] if round_ is None else [h for h, _ in round_.holds]
+        if self.unit_store is not None:
+            for uid in self.unit_store.requests.get(req_id, ()):
+                txn = self.unit_store.prefetches.get(uid)
+                if txn is not None:
+                    handles.extend(
+                        txn.handles[k]
+                        for k in txn.sources
+                        if self.table.is_ready(txn.handles[k])
+                    )
+        return handles
 
     def release_holds(self, req_id: str) -> None:
         round_ = self._rounds.get(req_id)
@@ -739,6 +857,8 @@ class HostPageSsd:
     def cancel(self, req_id: str) -> None:
         """Withdraw a request's waiting; physical reads finish on their own."""
         self._expired_rounds.discard(req_id)
+        if self.unit_store is not None:
+            self.unit_store.cancel(req_id)
         round_ = self._rounds.pop(req_id, None)
         if round_ is None:
             return
@@ -776,6 +896,8 @@ class HostPageSsd:
         IO grace period. A write that still does not finish quarantines the
         region (no unmap, no unlink) instead of hanging shutdown.
         """
+        if self.unit_store is not None:
+            return self.unit_store.final_flush(budget_s, deadline, io_grace_s)
         budget = (
             self.options["shutdown_flush_timeout_s"] if budget_s is None else budget_s
         )
@@ -868,6 +990,8 @@ class HostPageSsd:
         if self._closed:
             return
         self._flushing = True
+        if self.unit_store is not None:
+            self.unit_store.begin_close()
         for job_id in list(self._submit):
             self._finish(self._jobs[job_id], False)
         self._submit.clear()
@@ -879,10 +1003,14 @@ class HostPageSsd:
         end = self.clock() + grace
         if deadline is not None:
             end = min(end, deadline)
-        while self._jobs and self.clock() < end:
+        while (
+            self._jobs or self.unit_store is not None and self.unit_store.manifest_jobs
+        ) and self.clock() < end:
             self._poll()
             time.sleep(0.002)
         self._poll()
+        if self.unit_store is not None:
+            self.unit_store.retire()
         self._closed = True
         if self._queue.volume is not None:
             if deadline is None:
@@ -893,7 +1021,7 @@ class HostPageSsd:
                 wait_until(self._queue.volume.persist, deadline, "host-ssd-volume")
         if self.table.persistence is self:
             self.table.persistence = None
-        if self._jobs:
+        if self._jobs or self.unit_store is not None and self.unit_store.manifest_jobs:
             self.quarantined = True
             # Stop the pool without joining: a hung writer keeps its row and
             # the region stays mapped (transfer regression). Queued tasks are dropped.
@@ -1016,4 +1144,12 @@ def run_final_flush(
         report.skipped,
         report.quarantined,
     )
+    if ssd.unit_store is not None:
+        logger.info(
+            "Unified SSD flush guaranteed_completed_bytes=%d "
+            "best_effort_written_bytes=%d unfinished_bytes=%d",
+            report.guaranteed_completed_bytes,
+            report.best_effort_completed_bytes,
+            report.unfinished_bytes,
+        )
     return report

@@ -25,6 +25,16 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.counters import (
 )
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
+from vllm.v1.core.kv_cache_hit_contract import (
+    GroupHitRule,
+    HitNeed,
+    KVHitContract,
+    KVHitContractError,
+    chain_hash_from_request,
+    connector_hit_rules,
+    cross_group_hit_check_enabled,
+    load_failure_recompute_enabled,
+)
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
@@ -45,6 +55,7 @@ from vllm.v1.kv_offload.base import (
     ReqContext,
     RequestOffloadingContext,
     get_offload_block_hash,
+    get_offload_group_idx,
     make_offload_key,
 )
 from vllm.v1.outputs import KVConnectorOutput
@@ -73,6 +84,8 @@ class TransferJobStatus:
     # Store src block IDs that may be freed before the request finishes.
     # Registered in _block_id_to_pending_jobs at store creation time.
     sliding_window_block_ids: list[int] | None = None
+    # A worker reported this load as failed (load_failure_recompute_enabled).
+    failed: bool = False
 
 
 class GroupOffloadConfig(NamedTuple):
@@ -167,6 +180,35 @@ def resolve_mamba_align_size(spec: "OffloadingSpec") -> int | None:
             assert mamba_align_size is None or mamba_align_size == offload_block_size
             mamba_align_size = offload_block_size
     return mamba_align_size
+
+
+def _connector_hit_needs(
+    config: "SchedulerOffloadConfig", kv_cache_config: KVCacheConfig
+) -> dict[int, tuple[HitNeed, int, int]]:
+    """Per offloaded group: what a prefix hit needs, in offloaded blocks.
+
+    A sliding-window group needs the blocks its GPU manager keeps for the
+    next token, i.e. those covering the last ``sliding_window - 1`` tokens
+    (``SlidingWindowManager.get_num_skipped_tokens``). The lookup itself asks
+    for ``cdiv(sliding_window, block)`` blocks, which is never fewer.
+    """
+    needs: dict[int, tuple[HitNeed, int, int]] = {}
+    for group in config.kv_group_configs:
+        spec = kv_cache_config.kv_cache_groups[group.group_idx].kv_cache_spec
+        block = group.offloaded_block_size
+        if group.sliding_window_size_in_blocks is None:
+            needs[group.group_idx] = (HitNeed.PREFIX, block, 0)
+        elif isinstance(spec, MambaSpec):
+            needs[group.group_idx] = (HitNeed.STATE, block, 0)
+        elif isinstance(spec, SlidingWindowSpec):
+            needs[group.group_idx] = (
+                HitNeed.WINDOW,
+                block,
+                cdiv(spec.sliding_window - 1, block),
+            )
+        else:
+            needs[group.group_idx] = (HitNeed.UNCHECKED, block, 0)
+    return needs
 
 
 class SchedulerOffloadConfig(NamedTuple):
@@ -482,6 +524,28 @@ class OffloadingConnectorScheduler:
             else None
         )
 
+        # Opt-in cross-group hit contract (kernel_config.qsa_cross_group_hit_check).
+        self._hash_block_size: int = spec.hash_block_size
+        self.hit_contract: KVHitContract | None = None
+        if cross_group_hit_check_enabled(spec.vllm_config):
+            self.hit_contract = KVHitContract(
+                connector_hit_rules(
+                    _connector_hit_needs(self.config, spec.kv_cache_config)
+                ),
+                path="offloading-connector",
+            )
+
+        # Broken loads void the external hit and recompute instead of raising
+        # (load_failure_recompute_enabled). Requests whose load was abandoned
+        # since the scheduler last asked, and requests whose next lookup must
+        # not offer an external hit again.
+        self._recompute_failed_loads: bool = load_failure_recompute_enabled(
+            spec.vllm_config
+        )
+        self._failed_loads: set[ReqId] = set()
+        self._skip_external_once: set[ReqId] = set()
+        self.num_abandoned_loads: int = 0
+
         self._req_status: dict[ReqId, RequestOffloadState] = {}
         # Recurrent states demoted by _demote_superseded_states (all requests).
         self.num_demoted_states: int = 0
@@ -500,6 +564,11 @@ class OffloadingConnectorScheduler:
         # active jobs.
         self._stale_job_threshold: int = 0
         self._jobs: dict[int, TransferJobStatus] = {}
+        # Load jobs still in flight when reset_cache discarded the job table
+        # (load_failure_recompute_enabled only). Their completion is otherwise
+        # skipped as stale, but a load that fails after the reset must still
+        # void the request's external hit before finished_recving promotes it.
+        self._stale_load_jobs: dict[int, TransferJobStatus] = {}
 
         # block_id -> pending store job_ids. Used to track jobs that needs
         # flushing in case a block is re-allocated by the KV cache manager.
@@ -764,7 +833,10 @@ class OffloadingConnectorScheduler:
                 )
 
     def _lookup(
-        self, req_status: RequestOffloadState, shrink: LookupShrink | None = None
+        self,
+        req_status: RequestOffloadState,
+        shrink: LookupShrink | None = None,
+        hit_cap: int | None = None,
     ) -> int | None:
         """
         Find how many tokens beyond num_locally_computed_tokens can be loaded.
@@ -776,6 +848,8 @@ class OffloadingConnectorScheduler:
 
         ``shrink`` (optional, observability only) records how far the
         sliding-window groups lower the hit below the full-attention reach.
+        ``hit_cap`` (cross-group hit contract only) bounds the hit in absolute
+        tokens, e.g. where a probed store stops holding the prefix.
         """
         num_computed_tokens = req_status.num_locally_computed_tokens
         req_status.external_full_attention_hit_tokens = 0
@@ -787,6 +861,12 @@ class OffloadingConnectorScheduler:
             max_hit_size_tokens -= 1
             if self._mamba_align_size is not None:
                 # Constrain hit-window to the mamba block size.
+                max_hit_size_tokens = round_down(
+                    max_hit_size_tokens, self._mamba_align_size
+                )
+        if hit_cap is not None and hit_cap < max_hit_size_tokens:
+            max_hit_size_tokens = hit_cap
+            if self._mamba_align_size is not None:
                 max_hit_size_tokens = round_down(
                     max_hit_size_tokens, self._mamba_align_size
                 )
@@ -1023,11 +1103,25 @@ class OffloadingConnectorScheduler:
         counters = getattr(self, "_offload_counters", None)
         if counters is not None:
             req_status.lookup_shrink = None
-        if request.skip_reading_prefix_cache:
+        # getattr: tests may build this object without __init__.
+        skip_once = getattr(self, "_skip_external_once", None)
+        if skip_once and request.request_id in skip_once:
+            # The previous external load of this request was abandoned
+            # (take_failed_loads): recompute from the local hit this time.
+            skip_once.discard(request.request_id)
+            num_hit_tokens = 0
+        elif request.skip_reading_prefix_cache:
             num_hit_tokens = 0
         else:
             shrink = counters.new_lookup() if counters is not None else None
-            num_hit_tokens = self._lookup(req_status, shrink)
+            # getattr: tests may build this object without __init__.
+            contract = getattr(self, "hit_contract", None)
+            if contract is None:
+                num_hit_tokens = self._lookup(req_status, shrink)
+            else:
+                num_hit_tokens = self._contract_lookup(
+                    contract, req_status, shrink, num_computed_tokens
+                )
             if shrink is not None and num_hit_tokens is not None:
                 # Served at the local hit when there is no external hit.
                 shrink.lower(num_computed_tokens + num_hit_tokens)
@@ -1080,6 +1174,8 @@ class OffloadingConnectorScheduler:
         # per group
         group_sizes: list[int] = [0] * self.config.num_kv_cache_groups
         block_indices: list[int] = [0] * self.config.num_kv_cache_groups
+        # group_idx -> (first loaded GPU block, end GPU block); contract only
+        load_plan: dict[int, tuple[int, int]] = {}
         for group_config in self.config.kv_group_configs:
             group_state = req_status.group_states[group_config.group_idx]
             group_blocks = blocks.blocks[group_config.group_idx]
@@ -1126,6 +1222,10 @@ class OffloadingConnectorScheduler:
             )
             group_sizes[group_config.group_idx] = num_pending_gpu_blocks
             block_indices[group_config.group_idx] = load_start_gpu_block_idx
+            load_plan[group_config.group_idx] = (
+                load_start_gpu_block_idx,
+                num_gpu_blocks,
+            )
 
             # Skip prefix-hit blocks for block-level policy; for
             # request-level, next_stored_block_idx stays at 0 so all
@@ -1155,6 +1255,29 @@ class OffloadingConnectorScheduler:
                     ].is_null
                 )
 
+        contract = getattr(self, "hit_contract", None)
+        if contract is not None:
+            reason = self._check_load_plan(
+                contract,
+                req_status,
+                blocks,
+                load_plan,
+                keys_to_load,
+                num_locally_computed_tokens,
+                num_cached_tokens,
+            )
+            if reason is not None:
+                contract.stats.load_plan_errors += 1
+                if getattr(self, "_recompute_failed_loads", False):
+                    self._abandon_load(request.request_id, reason)
+                    return
+                raise KVHitContractError(
+                    f"request {request.request_id}: load plan for "
+                    f"{num_external_tokens} external tokens after "
+                    f"{num_locally_computed_tokens} local tokens would restore "
+                    f"an incomplete prefix: {reason}"
+                )
+
         # Fence dst blocks against finished-request pending stores.
         if (
             self._block_id_to_pending_jobs
@@ -1165,6 +1288,23 @@ class OffloadingConnectorScheduler:
                 for bid in dst_block_ids
                 for jid in self._block_id_to_pending_jobs.get(bid, ())
             )
+
+        if getattr(self, "_recompute_failed_loads", False) and contract is None:
+            # Without the contract nothing re-checked the keys since lookup;
+            # prepare_load asserts on a key that is gone.
+            missing = next(
+                (
+                    key
+                    for key in keys_to_load
+                    if not self._key_ready(key, req_status.req_context)
+                ),
+                None,
+            )
+            if missing is not None:
+                self._abandon_load(
+                    request.request_id, f"offload key {missing!r} is not readable"
+                )
+                return
 
         src_spec = self.manager.prepare_load(keys_to_load, req_status.req_context)
         dst_spec = GPULoadStoreSpec(
@@ -1188,6 +1328,134 @@ class OffloadingConnectorScheduler:
 
         if self._blocks_being_loaded is not None:
             self._blocks_being_loaded.update(keys_to_load)
+
+    # --- abandoned loads (load_failure_recompute_enabled) -----------------------
+
+    def _abandon_load(self, req_id: ReqId, reason: str) -> None:
+        """Void a committed external hit: no transfer is issued, the scheduler
+        releases the request's blocks and recomputes, and the next lookup of
+        this request offers no external hit."""
+        self.num_abandoned_loads += 1
+        self._failed_loads.add(req_id)
+        self._skip_external_once.add(req_id)
+        logger.warning_once(
+            "Offloading connector abandoned an external KV load and recomputes "
+            "the request instead (further cases are logged at debug level)."
+        )
+        logger.debug("Abandoned external KV load of %s: %s", req_id, reason)
+
+    def take_failed_loads(self) -> set[ReqId]:
+        failed = self._failed_loads
+        self._failed_loads = set()
+        return failed
+
+    # --- cross-group hit contract (kernel_config.qsa_cross_group_hit_check) --
+
+    def _key_ready(self, key: OffloadKey, req_context: ReqContext) -> bool:
+        """Whether ``key`` is resident and readable in the tier loads read
+        from, without touching recency, admission counters or promotions.
+        Managers this method does not know answer through their own lookup."""
+        from vllm.v1.kv_offload.cpu.manager import (
+            CPUOffloadingManager,
+            GroupedCPUOffloadingManager,
+        )
+        from vllm.v1.kv_offload.tiering.manager import TieringOffloadingManager
+
+        manager: OffloadingManager | None = self.manager
+        while True:
+            if isinstance(manager, GroupedCPUOffloadingManager):
+                manager = manager.managers.get(get_offload_group_idx(key))
+            elif isinstance(manager, TieringOffloadingManager):
+                manager = manager.primary_tier
+            elif isinstance(manager, CPUOffloadingManager):
+                return manager.is_ready_resident(key)
+            elif manager is None:
+                return False
+            else:
+                return manager.lookup(key, req_context) is True
+
+    def _contract_lookup(
+        self,
+        contract: KVHitContract,
+        req_status: RequestOffloadState,
+        shrink: LookupShrink | None,
+        num_computed_tokens: int,
+    ) -> int | None:
+        """``_lookup`` under the cross-group hit contract: bounded by the
+        probed stores, and an incomplete answer is reported as a miss."""
+        req = req_status.req
+        chain_hash = chain_hash_from_request(req.block_hashes, self._hash_block_size)
+        hit_cap = None
+        if contract.has_probes:
+            hit_cap = contract.probe_cap(
+                chain_hash, num_computed_tokens, req.num_tokens
+            )
+        num_hit_tokens = self._lookup(req_status, shrink, hit_cap)
+        if not num_hit_tokens:
+            return num_hit_tokens
+
+        def _block_ok(rule: GroupHitRule, index: int) -> bool | None:
+            if rule.group_id not in self._group_config_by_idx:
+                return None
+            keys = req_status.group_states[rule.group_id].offload_keys
+            return index < len(keys) and self._key_ready(
+                keys[index], req_status.req_context
+            )
+
+        reason = contract.check(
+            num_computed_tokens + num_hit_tokens,
+            num_computed_tokens,
+            _block_ok,
+            chain_hash,
+        )
+        if reason is not None:
+            contract.reject(reason, req.request_id)
+            return 0
+        return num_hit_tokens
+
+    def _check_load_plan(
+        self,
+        contract: KVHitContract,
+        req_status: RequestOffloadState,
+        blocks: KVCacheBlocks,
+        load_plan: dict[int, tuple[int, int]],
+        keys_to_load: list[OffloadKey],
+        num_local_tokens: int,
+        num_cached_tokens: int,
+    ) -> str | None:
+        """Check that the loads plus the local hit restore every group at
+        exactly ``num_cached_tokens`` and nothing beyond it."""
+        factor = self.config.block_size_factor
+        loading = set(keys_to_load)
+        for group_idx, (load_start, load_end) in load_plan.items():
+            group_blocks = blocks.blocks[group_idx]
+            if any(b.is_null for b in group_blocks[load_start:load_end]):
+                return f"group {group_idx}: a load targets the null block"
+
+        def _block_ok(rule: GroupHitRule, index: int) -> bool | None:
+            plan = load_plan.get(rule.group_id)
+            if plan is None:
+                return None
+            keys = req_status.group_states[rule.group_id].offload_keys
+            if index < len(keys) and keys[index] in loading:
+                # Restored by this load: the key must be readable.
+                return self._key_ready(keys[index], req_status.req_context)
+            if index * factor >= plan[0]:
+                return False  # fresh GPU block that nothing restores
+            # Below the first loaded block: held by the local GPU hit.
+            gpu_idx = (index + 1) * factor - 1
+            group_blocks = blocks.blocks[rule.group_id]
+            if gpu_idx >= len(group_blocks):
+                return False
+            block = group_blocks[gpu_idx]
+            return not block.is_null and block.block_hash is not None
+
+        return contract.check(
+            num_cached_tokens,
+            num_local_tokens,
+            _block_ok,
+            chain_hash_from_request(req_status.req.block_hashes, self._hash_block_size),
+        )
 
     def _count_admitted_lookup(
         self, counters: OffloadCounters, request: Request, num_external_tokens: int
@@ -1926,6 +2194,7 @@ class OffloadingConnectorScheduler:
         for job_id, count in meta.completed_jobs.items():
             assert count > 0
             if job_id < self._stale_job_threshold:
+                self._complete_stale_load(job_id, count, job_id in meta.failed_jobs)
                 logger.debug(
                     "Skipping stale completed job %d (pre-reset counter: %d)",
                     job_id,
@@ -1933,13 +2202,21 @@ class OffloadingConnectorScheduler:
                 )
                 continue
             job_status = self._jobs[job_id]
+            if job_id in meta.failed_jobs:
+                job_status.failed = True
             job_status.pending_count -= count
             if job_status.pending_count > 0:
                 continue
             assert job_status.pending_count == 0
 
             req_status = self._req_status[job_status.req_id]
-            if job_status.is_store:
+            if job_status.is_store and job_status.failed:
+                # The tier never received valid data: drop the keys rather
+                # than publishing them as loadable.
+                self.manager.complete_store(
+                    job_status.keys, req_status.req_context, success=False
+                )
+            elif job_status.is_store:
                 self.manager.complete_store(job_status.keys, req_status.req_context)
                 counters = getattr(self, "_offload_counters", None)
                 if counters is not None:
@@ -1948,6 +2225,10 @@ class OffloadingConnectorScheduler:
                 self.manager.complete_load(job_status.keys, req_status.req_context)
                 if self._blocks_being_loaded:
                     self._blocks_being_loaded.difference_update(job_status.keys)
+                if job_status.failed:
+                    # A worker could not read the keys back: the GPU blocks
+                    # hold no valid prefix. The scheduler recomputes.
+                    self._abandon_load(job_status.req_id, "transfer failed")
             if self._block_id_to_pending_jobs:
                 # Sliding window blocks are tracked from store creation
                 # and must be cleaned up unconditionally.
@@ -1963,6 +2244,28 @@ class OffloadingConnectorScheduler:
             req_status.transfer_jobs.remove(job_id)
             if not req_status.transfer_jobs and req_status.req.is_finished():
                 del self._req_status[job_status.req_id]
+
+    def _complete_stale_load(self, job_id: int, count: int, failed: bool) -> None:
+        """Account a worker report of a load job discarded by reset_cache.
+
+        The reset dropped the job's bookkeeping, not its outcome: the request
+        is still promoted by finished_recving once every rank is done, so a
+        failure on any rank must void the external hit exactly as it would
+        without the reset.
+        """
+        stale_loads = getattr(self, "_stale_load_jobs", None)
+        if not stale_loads:
+            return
+        job_status = stale_loads.get(job_id)
+        if job_status is None:
+            return
+        job_status.failed |= failed
+        job_status.pending_count -= count
+        if job_status.pending_count > 0:
+            return
+        del stale_loads[job_id]
+        if job_status.failed:
+            self._abandon_load(job_status.req_id, "transfer failed after a reset")
 
     def request_finished(
         self,
@@ -2215,6 +2518,14 @@ class OffloadingConnectorScheduler:
                 group_state.next_stored_block_idx = 0
         for req_id in finished_req_ids:
             del self._req_status[req_id]
+
+        # A load still in flight keeps its failure path: remember its request
+        # so a failed completion after the reset is abandoned, not promoted.
+        if getattr(self, "_recompute_failed_loads", False):
+            stale_loads = self.__dict__.setdefault("_stale_load_jobs", {})
+            for job_id, job_status in self._jobs.items():
+                if not job_status.is_store:
+                    stale_loads[job_id] = job_status
 
         # Discard jobs and save job_counter to be able to discard worker responses
         self._stale_job_threshold = self._job_counter

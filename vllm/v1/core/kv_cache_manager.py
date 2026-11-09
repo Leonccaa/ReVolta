@@ -10,6 +10,12 @@ from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
+from vllm.v1.core.kv_cache_hit_contract import (
+    KVHitContract,
+    chain_hash_from_request,
+    local_hit_rules,
+    settle_local_hit,
+)
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.kv_cache_interface import (
@@ -126,6 +132,7 @@ class KVCacheManager:
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
         prefix_cache_retention_interval: int | None = None,
+        cross_group_hit_check: bool = False,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -158,6 +165,15 @@ class KVCacheManager:
         self.coordinator.configure_prefix_cache_retention(
             prefix_cache_retention_interval
         )
+        # Opt-in cross-group hit contract (kernel_config.qsa_cross_group_hit_check).
+        # None keeps the coordinator's answer unchanged.
+        self.hash_block_size = hash_block_size
+        self.hit_contract: KVHitContract | None = None
+        if cross_group_hit_check and enable_caching:
+            self.hit_contract = KVHitContract(
+                local_hit_rules(self.coordinator.single_type_managers),
+                path="gpu-prefix-cache",
+            )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
@@ -226,11 +242,31 @@ class KVCacheManager:
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
         max_cache_hit_length = request.num_tokens - 1
+        # getattr: tests may build this object without __init__.
+        contract = getattr(self, "hit_contract", None)
+        if contract is not None:
+            chain_hash = chain_hash_from_request(
+                request.block_hashes, self.hash_block_size
+            )
+            if contract.has_probes:
+                # Stop before the first block a probed store no longer holds,
+                # so the fixed point lands on the common complete prefix.
+                max_cache_hit_length = contract.probe_cap(
+                    chain_hash, 0, max_cache_hit_length
+                )
         computed_blocks, num_new_computed_tokens = (
             self.coordinator.find_longest_cache_hit(
                 request.block_hashes, max_cache_hit_length
             )
         )
+        if contract is not None:
+            computed_blocks, num_new_computed_tokens = settle_local_hit(
+                contract,
+                request.request_id,
+                computed_blocks,
+                num_new_computed_tokens,
+                chain_hash,
+            )
 
         # Keep the existing two-value lookup API used by 1Cat connectors. The
         # synchronous coordinator exposes the junction from this lookup only.

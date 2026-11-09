@@ -36,6 +36,10 @@ from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
 )
+from vllm.v1.core.kv_cache_hit_contract import (
+    cross_group_hit_check_enabled,
+    load_failure_recompute_enabled,
+)
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
@@ -157,6 +161,9 @@ class Scheduler(SchedulerInterface):
         self.connector = None
         self.connector_prefix_cache_stats: PrefixCacheStats | None = None
         self.recompute_kv_load_failures = True
+        # Abandoned external loads (KVConnectorBase_V1.take_failed_loads) void
+        # the request's external hit; it is recomputed, never failed.
+        self.recompute_failed_loads = False
         if self.vllm_config.kv_transfer_config is not None:
             assert not self.is_encoder_decoder, (
                 "Encoder-decoder models are not currently supported with KV connectors"
@@ -172,6 +179,9 @@ class Scheduler(SchedulerInterface):
                 self.vllm_config.kv_transfer_config.kv_load_failure_policy
             )
             self.recompute_kv_load_failures = kv_load_failure_policy == "recompute"
+            self.recompute_failed_loads = load_failure_recompute_enabled(
+                self.vllm_config
+            )
 
         self.kv_event_publisher = EventPublisherFactory.create(
             self.kv_events_config,
@@ -302,6 +312,7 @@ class Scheduler(SchedulerInterface):
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
             prefix_cache_retention_interval=self.cache_config.prefix_cache_retention_interval,
+            cross_group_hit_check=cross_group_hit_check_enabled(vllm_config),
         )
         # Adapted from vLLM #44560, #57104 and #59880. Mamba managers already
         # include their speculative states. Fixed ring/tail and cross-attention
@@ -1270,12 +1281,18 @@ class Scheduler(SchedulerInterface):
                 # if a load is needed. Note that
                 # This information is used to determine if a load is
                 # needed for this request.
+                load_abandoned = False
                 if self.connector is not None:
                     self.connector.update_state_after_alloc(
                         request,
                         self.kv_cache_manager.get_blocks(request_id),
                         num_external_computed_tokens,
                     )
+                    if self.recompute_failed_loads:
+                        abandoned = self.connector.take_failed_loads()
+                        load_abandoned = request_id in abandoned
+                        abandoned.discard(request_id)
+                        self._void_failed_loads(abandoned)
                     if (
                         self.connector_prefix_cache_stats is not None
                         and connector_prefix_cache_queries != 0
@@ -1287,6 +1304,30 @@ class Scheduler(SchedulerInterface):
                         )
 
                 request = request_queue.pop_request()
+                if load_abandoned:
+                    # The connector could not restore a complete prefix after
+                    # all and issued no transfer. Park the request as a failed
+                    # remote load that already finished: the next step releases
+                    # its blocks and schedules it again from its local hit.
+                    if not load_kv_async:
+                        # Synchronous loads cached their blocks already.
+                        self.kv_cache_manager.evict_blocks(
+                            {
+                                block_id
+                                for ids in self.kv_cache_manager.get_block_ids(
+                                    request_id
+                                )
+                                for block_id in ids
+                                if block_id
+                            }
+                        )
+                    request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+                    step_skipped_waiting.prepend_request(request)
+                    request.num_computed_tokens = 0
+                    self.failed_recving_kv_req_ids.add(request_id)
+                    self.finished_recving_kv_req_ids.add(request_id)
+                    self._inflight_prefills.add(request)
+                    continue
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
@@ -2979,6 +3020,8 @@ class Scheduler(SchedulerInterface):
 
         if self.connector is not None:
             self.connector.update_connector_output(kv_connector_output)
+            if self.recompute_failed_loads:
+                self._void_failed_loads(self.connector.take_failed_loads())
 
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():
@@ -2994,6 +3037,31 @@ class Scheduler(SchedulerInterface):
             logger.debug("Finished sending KV transfer for request %s", req_id)
             assert req_id in self.requests
             self._free_blocks(self.requests[req_id])
+
+    def _void_failed_loads(self, req_ids: Iterable[str]) -> None:
+        """Void the external hit of requests whose async load failed.
+
+        The load's GPU blocks hold no valid prefix, and they were allocated
+        with caching delayed, so nothing was published. Mark the request as a
+        failed receive with no computed tokens: when its transfer completes,
+        ``_update_waiting_for_remote_kv`` releases all its blocks and the
+        request is scheduled again from its local prefix hit. Other requests
+        are untouched (no block-ID matching, which separate block spaces
+        would make ambiguous).
+        """
+        for req_id in req_ids:
+            request = self.requests.get(req_id)
+            if (
+                request is None
+                or request.status != RequestStatus.WAITING_FOR_REMOTE_KVS
+            ):
+                # Finished or aborted meanwhile: its blocks are freed with it.
+                continue
+            logger.warning(
+                "External KV load of request %s failed; recomputing it.", req_id
+            )
+            request.num_computed_tokens = 0
+            self.failed_recving_kv_req_ids.add(req_id)
 
     def _update_requests_with_invalid_blocks(
         self,

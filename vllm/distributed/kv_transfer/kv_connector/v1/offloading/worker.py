@@ -49,6 +49,13 @@ class OffloadingConnectorWorker:
         self._load_jobs: dict[int, ReqId] = {}
         self._unsubmitted_store_jobs: list[tuple[int, TransferSpec]] = []
         self._connector_worker_meta = OffloadingWorkerMetadata()
+        # Report failed transfers to the scheduler (which recomputes a failed
+        # load and drops a failed store) instead of asserting.
+        from vllm.v1.core.kv_cache_hit_contract import (
+            load_failure_recompute_enabled,
+        )
+
+        self._report_failures: bool = load_failure_recompute_enabled(spec.vllm_config)
 
     def _register_handlers(self, kv_caches: CanonicalKVCaches):
         for src_cls, dst_cls, handler in self.spec.get_handlers(kv_caches):
@@ -284,9 +291,14 @@ class OffloadingConnectorWorker:
         """
         finished_recving: set[str] = set()
         for transfer_result in self.worker.get_finished():
-            # we currently do not support job failures
             job_id = transfer_result.job_id
-            assert transfer_result.success
+            # getattr: tests may build this object without __init__.
+            if not transfer_result.success and getattr(self, "_report_failures", False):
+                logger.warning("KV offloading transfer job %d failed", job_id)
+                self._connector_worker_meta.mark_failed(job_id)
+            else:
+                # job failures are not supported without the recompute path
+                assert transfer_result.success
             if (
                 transfer_result.transfer_time
                 and transfer_result.transfer_size is not None

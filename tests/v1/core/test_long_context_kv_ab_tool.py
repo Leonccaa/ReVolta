@@ -111,6 +111,7 @@ def _geometry_object(geometry):
     from vllm.v1.core.long_context_kv import LongContextGeometry
 
     fields = dict(geometry)
+    fields.setdefault("hot_read_rows", None)
     fields["group_domains"] = tuple(tuple(d) for d in fields["group_domains"])
     return LongContextGeometry(**fields)
 
@@ -118,7 +119,11 @@ def _geometry_object(geometry):
 def test_tool_arithmetic_matches_the_engine_plan():
     geo = _geometry_object(GEOMETRY)
     assert ab.host_metadata_bytes_per_block(GEOMETRY) == (
-        geo.host_metadata_bytes_per_block
+        geo.host_metadata_bytes_per_block - 4  # Legacy receipt predates page_of.
+    )
+    current = {**GEOMETRY, "logical_index_bytes_per_block": 100_352}
+    assert (
+        ab.host_metadata_bytes_per_block(current) == geo.host_metadata_bytes_per_block
     )
     for num_bytes in (ab.GIB, 3 * ab.GIB + 12345):
         groups = ab.hot_groups_for_bytes(GEOMETRY, num_bytes)
@@ -872,3 +877,36 @@ def test_route_checks():
         "plan": {"geometry": GEOMETRY, "hot_pool_groups": 131072, "max_num_seqs": 4}
     }
     assert _failed(ab.route_checks(ok, "gpu", single, config, plan))
+
+
+def test_v2_receipts_enforce_read_cap_and_short_context_bounds():
+    geo = dict(GEOMETRY, hot_read_rows=256)
+    with pytest.raises(ValueError, match="R_cap=256"):
+        ab.hot_pool_gib_for_rows(geo, 512, 4)
+    assert ab.rows_per_pass(geo, 10_000_000, 8) == 256
+    short = dict(geo, max_model_len=128, dcp_world_size=2, dcp_interleave=1)
+    assert ab.rows_per_pass(short, 26, 1) == 256
+    assert ab.rows_per_pass(short, 79, 8) == 1
+
+
+def test_route_probe_counts_actual_planner_callbacks():
+    probe = ab.QSARouteProbe()
+    layer = type("Layer", (), {"rows_per_pass": 16})()
+    selection = type("Selection", (), {"shape": (32, 1)})()
+    consumed = []
+
+    def original(layer, selection, token_to_req, table, lengths, attend, **kwargs):
+        attend(0, 32, None)  # Fixed single-pass decode, despite a 16-row bound.
+
+    probe.passes(original)(
+        layer,
+        selection,
+        None,
+        None,
+        None,
+        lambda start, end, ids: consumed.append((start, end)),
+    )
+    assert consumed == [(0, 32)]
+    assert probe.stats["host_max_passes"] == 1
+    assert probe.stats["host_rows_per_pass"] == 32
+    assert probe.stats["host_multi_pass_steps"] == 0

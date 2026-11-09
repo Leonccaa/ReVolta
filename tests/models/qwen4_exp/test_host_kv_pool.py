@@ -677,6 +677,21 @@ def test_truncate_and_request_release_do_not_expose_retired_data():
     assert int(pool.miss_count) == 8
 
 
+def test_truncate_on_a_group_boundary_keeps_the_last_whole_group():
+    pool = _pool()
+    _fill(pool)
+    _step(pool, [56])
+    slot = int(pool.group_to_slot[0, 14])
+    assert slot >= 0
+    pool.truncate(torch.tensor([60], dtype=torch.int32))
+    # Group 14 (tokens 56..59) lies wholly below the new length: it stays hot.
+    assert int(pool.group_to_slot[0, 14]) == slot
+    assert int(pool.slot_owner[slot]) >= 0
+    assert (pool.group_to_slot[0, 15:] == -1).all()
+    assert pool.ready[0, :60].all()
+    assert not pool.ready[0, 60:].any()
+
+
 def test_metadata_rejection_precedes_payload_mutation():
     pool = _pool()
     _fill(pool)

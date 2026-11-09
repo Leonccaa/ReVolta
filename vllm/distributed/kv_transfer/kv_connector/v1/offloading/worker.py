@@ -85,6 +85,11 @@ class OffloadingConnectorWorker:
             for tensor in self.spec.kv_cache_config.kv_cache_tensors
             for name in tensor.shared_by
         }
+        physical_strides: dict[str, int] = {}
+        for tensor in self.spec.kv_cache_config.kv_cache_tensors:
+            stride = getattr(tensor, "page_stride_bytes", None)
+            if stride is not None:
+                physical_strides.update({name: stride for name in tensor.shared_by})
         # Packed attention layers split each physical block of one tensor,
         # interleaved kernel block by kernel block, so they transfer as one
         # whole physical page registered once, by the first member.
@@ -112,6 +117,9 @@ class OffloadingConnectorWorker:
                 layer_kv_cache_spec = per_layer_specs.get(
                     layer_name, group_kv_cache_spec
                 )
+                member_stride = physical_strides.get(
+                    layer_name, layer_kv_cache_spec.page_size_bytes
+                )
                 if isinstance(layer_kv_cache_spec, AttentionSpec):
                     layer_kv_cache = kv_caches[layer_name]
                     assert isinstance(layer_kv_cache, torch.Tensor)
@@ -122,9 +130,7 @@ class OffloadingConnectorWorker:
                     from vllm.v1.attention.kv_cache_view import KVPhysicalPage
                     from vllm.v1.kv_cache_interface import KVQuantMode
 
-                    owner = KVPhysicalPage(
-                        layer_kv_cache_spec.page_size_bytes, member_count, member_index
-                    )
+                    owner = KVPhysicalPage(member_stride, member_count, member_index)
                     page = owner.page_size_bytes
                     tensors_per_block[layer_name] = (
                         owner.raw_pages(
@@ -141,6 +147,13 @@ class OffloadingConnectorWorker:
                         ),
                         padded=layer_kv_cache_spec.page_size_padded is not None,
                     )
+                    if layer_name in physical_strides:
+                        # Transitional static host allocation bridge preserves the whole
+                        # physical
+                        # index page. receive transactions seal/restore uses logical
+                        # pack/scatter
+                        # and removes G0 from these canonical transfer views.
+                        unpadded_page_size_bytes[layer_name] = page
 
                 elif isinstance(layer_kv_cache_spec, MambaSpec):
                     state_tensors = kv_caches[layer_name]
@@ -161,13 +174,13 @@ class OffloadingConnectorWorker:
                         .view(
                             (
                                 layer_num_blocks.get(layer_name, num_blocks),
-                                layer_kv_cache_spec.page_size_bytes,
+                                member_stride,
                             )
                         )
                     )
                     tensors_per_block[layer_name] = (tensor,)
 
-                    page_size_bytes[layer_name] = layer_kv_cache_spec.page_size_bytes
+                    page_size_bytes[layer_name] = member_stride
                     unpadded_page_size_bytes[layer_name] = replace(
                         layer_kv_cache_spec, page_size_padded=None
                     ).page_size_bytes
@@ -247,11 +260,11 @@ class OffloadingConnectorWorker:
             if store.shape.page_bytes != page_bytes:
                 raise ValueError("Host main K/V transfer page differs from the plan")
             index = len(block_tensors)
+            main_view = store.host.view(torch.int8).flatten(1)
+            main_view._host_page_of = store.page_of_cpu
             block_tensors.append(
                 CanonicalKVCacheTensor(
-                    tensor=store.host.view(torch.int8).view(
-                        store.shape.num_blocks, page_bytes
-                    ),
+                    tensor=main_view,
                     page_size_bytes=page_bytes,
                 )
             )
@@ -451,6 +464,16 @@ class OffloadingConnectorWorker:
         meta = self._connector_worker_meta
         self._connector_worker_meta = OffloadingWorkerMetadata()
         return meta
+
+    def drain(self) -> tuple[set[str], set[str], OffloadingWorkerMetadata | None]:
+        """Finish deferred submissions and all handlers without releasing backing."""
+        self.start_kv_transfers(OffloadingConnectorMetadata({}, {}))
+        for handler in self.worker.handlers:
+            handler.drain()
+        sending, receiving = self.get_finished(set())
+        if self._load_jobs or self._pending_failed_submissions:
+            raise RuntimeError("Connector drain left unfinished transfer jobs")
+        return sending, receiving, self.build_connector_worker_meta()
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
         """

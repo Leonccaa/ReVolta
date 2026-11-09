@@ -47,7 +47,7 @@ LOCAL = SPAN // 2  # rank-local main K/V tokens of a history block under DCP2
 # Host placement: the host store's GPU metadata per history block, i.e. the
 # hot-group map of 12 layers + the wanted map (int32 per 4 local tokens), the
 # readiness bytes and the generation.
-HOST_META_BYTES = 12 * LOCAL + LOCAL + LOCAL + 4
+HOST_META_BYTES = 12 * LOCAL + LOCAL + LOCAL + 8
 HOT_GROUP_BYTES = 12 * 4 * 2 * 256  # four local tokens of K and V, 12 layers
 
 
@@ -88,7 +88,7 @@ def test_production_geometry_reproduces_the_m0_ledger():
     assert geometry(num_spec=0).hot_reserve_groups(MI) == 513 + 9
     assert (geo.dcp_world_size, geo.local_block_tokens) == (2, LOCAL)
     assert geo.hot_layers == 12
-    assert geo.host_metadata_bytes_per_block == HOST_META_BYTES == 11_652
+    assert geo.host_metadata_bytes_per_block == HOST_META_BYTES == 11_656
     assert geo.hot_slot_bytes == HOT_GROUP_BYTES
 
 
@@ -315,7 +315,10 @@ def test_auto_verify_minimum_and_budget_suggestion_round_trip(placement):
         prefill_staging_gib=0.125,
     )
     plan = plan_long_context_capacity(settings, geo, GPU_BUDGET, seqs)
-    groups = seqs * (8 * 513 + 9)
+    geo = plan.geometry
+    groups = seqs * (
+        (8 * 513 + 9) if placement == "gpu" else geo.hot_reserve_groups(32)
+    )
     minimum = (
         plan.gpu_state_bytes
         + (plan.history_demand_blocks + 1) * plan.history_bytes_per_block
@@ -327,7 +330,9 @@ def test_auto_verify_minimum_and_budget_suggestion_round_trip(placement):
     assert enough.hot_pool_groups == groups
     for budget in (minimum - 1, plan.gpu_state_bytes - 1, 0):
         small = plan_long_context_capacity(settings, geo, budget, seqs)
-        with pytest.raises(ValueError, match="verify working sets need 32904") as info:
+        with pytest.raises(
+            ValueError, match=f"verify working sets need {groups}"
+        ) as info:
             validate_long_context_plan(small)
         assert f"GPU KV budget >= {minimum} bytes" in str(info.value)
         assert "hot_pool_gib >= " in str(info.value)
@@ -369,10 +374,10 @@ def test_auto_still_requires_a_manually_sized_host_pool():
             dict(host_pool_gib=None, host_pool_tokens=633 * SPAN),
         ),
         (
-            dict(host_pool_gib=96.13, hot_pool_gib=0.01),
+            dict(host_pool_gib=96.13, hot_pool_gib=0.01, prefill_staging_gib=6.0),
             None,
-            "GPU hot-page pool",
-            dict(hot_pool_gib=0.3),
+            "GPU history segment",
+            dict(prefill_staging_gib=0),
         ),
         (
             dict(host_pool_gib=96.13, hot_pool_gib=0.5, state_blocks=10),
@@ -416,10 +421,13 @@ def test_startup_suggestion_values_round_trip():
     )
     problems = plan.startup_problems()
     host = next(p for p in problems if "host history pool" in p)
-    hot = next(p for p in problems if "hot-page pool" in p)
+    # A manual value is a lower bound: static host allocation can allocate more to fit
+    # the
+    # minimum active verify set. The host error remains actionable.
+    assert plan.hot_pool_groups > plan.hot_pool_min_groups
     host_gib = float(host.split("host_pool_gib >= ")[1].split(" ")[0])
-    hot_gib = float(hot.split("hot_pool_gib >= ")[1].rstrip("."))
-    assert (host_gib, hot_gib) == (12.06, 0.10)
+    hot_gib = 0.01
+    assert host_gib == 12.06
     fixed = plan_long_context_capacity(
         LongContextKVConfig(enabled=True, host_pool_gib=host_gib, hot_pool_gib=hot_gib),
         geo,

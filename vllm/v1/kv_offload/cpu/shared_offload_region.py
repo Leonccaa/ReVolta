@@ -43,6 +43,8 @@ class SharedOffloadRegion:
         rank: int | None,
         num_workers: int,
         cpu_page_size: int,
+        *,
+        scheduler_only_unlink: bool = False,
     ) -> None:
         self.page_size = mmap.PAGESIZE
 
@@ -52,6 +54,7 @@ class SharedOffloadRegion:
         self.num_blocks = num_blocks
         self.rank = rank
         self._scheduler_unlink = rank is None
+        self._scheduler_only_unlink = scheduler_only_unlink
         # interleaved-layout stride: one row = all workers' data for one block
         self._row_stride = cpu_page_size * num_workers
         if rank is not None:
@@ -210,9 +213,10 @@ class SharedOffloadRegion:
             self.fd = None
         # Engine shutdown stops workers before the scheduler. The scheduler
         # therefore owns final unlink even if a worker won the creation race.
-        if (self._creator or self._scheduler_unlink) and getattr(
-            self, "mmap_path", None
-        ):
+        if (
+            self._scheduler_unlink
+            or (self._creator and not self._scheduler_only_unlink)
+        ) and getattr(self, "mmap_path", None):
             try:
                 os.unlink(self.mmap_path)
                 logger.info("Removed mmap file %s", self.mmap_path)

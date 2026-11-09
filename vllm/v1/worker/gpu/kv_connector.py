@@ -16,6 +16,7 @@ from vllm.forward_context import (
     is_forward_context_available,
     set_forward_context,
 )
+from vllm.v1.kv_offload.host.page_table import HostKVStep
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     KVConnectorOutput,
@@ -51,6 +52,12 @@ class KVConnector:
     def set_disabled(self, disabled: bool) -> None:
         pass
 
+    def seal_host_step(self) -> None:
+        pass
+
+    def close_host_kv(self) -> None:
+        pass
+
 
 class ActiveKVConnector(KVConnector):
     def __init__(
@@ -67,6 +74,26 @@ class ActiveKVConnector(KVConnector):
         self._disabled = False
         # Metadata whose preemptions were already handled this step.
         self._handled_metadata: object | None = None
+        self._host_step: HostKVStep | None = None
+        self._host_store = None
+        self._host_indices: list[torch.Tensor] = []
+        self._host_event = None
+        self._host_sealed = False
+        self._host_seal_failed = False
+        self._host_drain_output: KVConnectorOutput | None = None
+        self._host_drain_complete = False
+        # Connector worker owns the registered store, including test doubles.
+        worker = getattr(self.kv_connector, "connector_worker", None)
+        if worker is not None and getattr(worker, "_host_history", None) is not None:
+            self._host_store = worker._host_history
+            config = worker.spec.kv_cache_config
+            names = set(config.host_kv_layers)
+            group_id = worker._host_group_id
+            self._host_indices = [
+                kv_caches_dict[name]
+                for name in config.kv_cache_groups[group_id].layer_names
+                if name not in names
+            ]
 
     def handle_preemptions(self, scheduler_output: "SchedulerOutput") -> None:
         # Deferred stores read blocks written by the previous step. A block
@@ -90,6 +117,10 @@ class ActiveKVConnector(KVConnector):
         if self._handled_metadata is not kv_connector_metadata:
             self.kv_connector.handle_preemptions(kv_connector_metadata)
         self._handled_metadata = None
+        self._host_step = getattr(scheduler_output, "host_kv", None)
+        self._host_sealed = False
+        self._host_seal_failed = False
+        self._host_event = None
         self.kv_connector.bind_connector_metadata(kv_connector_metadata)
 
         # TODO: sort out KV Connectors' use of forward_context
@@ -98,6 +129,54 @@ class ActiveKVConnector(KVConnector):
         else:
             with set_forward_context(None, self.vllm_config):
                 self.kv_connector.start_load_kv(get_forward_context())
+
+    def seal_host_step(self) -> None:
+        step = self._host_step
+        if step is None or self._host_sealed:
+            return
+        assert self._host_store is not None
+        # Submission or context errors propagate. Only a successfully retired
+        # stream may report a seal-only failure and preserve local GPU hashes.
+        try:
+            self._host_store.seal(step.seals, self._host_indices)
+        except Exception:
+            event = self._host_store.fence()
+            if event is not None:
+                event.synchronize()
+            self._host_seal_failed = True
+        self._host_event = self._host_store.fence()
+        self._host_sealed = True
+
+    def _host_receipt(self, output: KVConnectorOutput) -> None:
+        step = getattr(self, "_host_step", None)
+        if step is None:
+            return
+        from vllm.distributed import get_world_group
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+            OffloadingWorkerMetadata,
+        )
+
+        if self._host_event is not None:
+            self._host_event.synchronize()
+        elif self._host_store is not None:
+            # No-forward and aborted producer steps still need a physical
+            # retirement fence before a rank can advance the watermark.
+            event = self._host_store.fence()
+            if event is not None:
+                event.synchronize()
+        meta = output.kv_connector_worker_meta
+        if meta is None:
+            meta = OffloadingWorkerMetadata()
+        assert isinstance(meta, OffloadingWorkerMetadata)
+        rank = 1 << get_world_group().rank_in_group
+        for ticket in step.seals:
+            compute_failed = 0 if self._host_sealed else rank
+            seal_failed = rank if self._host_seal_failed else compute_failed
+            meta.seal_results[ticket] = (rank, seal_failed, compute_failed)
+        meta.completed_steps[step.step] = rank
+        output.kv_connector_worker_meta = meta
+        self._host_step = None
+        self._host_event = None
 
     def post_forward(
         self, finished_req_ids: set[str], wait_for_save: bool = True
@@ -117,8 +196,35 @@ class ActiveKVConnector(KVConnector):
         output.kv_connector_worker_meta = (
             self.kv_connector.build_connector_worker_meta()
         )
+        self._host_receipt(output)
         self.kv_connector.clear_connector_metadata()
         return output
+
+    def drain_host_kv(self) -> KVConnectorOutput:
+        output = getattr(self, "_host_drain_output", None)
+        if output is None:
+            output = KVConnectorOutput()
+            self._host_drain_output = output
+        if getattr(self, "_host_drain_complete", False):
+            return output
+        # Keep receipts across a failed drain on this or another rank. Parent
+        # shutdown consumes them only after every rank has acknowledged.
+        self._host_receipt(output)
+        worker = getattr(self.kv_connector, "connector_worker", None)
+        assert worker is not None
+        sending, receiving, meta = worker.drain()
+        output.finished_sending, output.finished_recving = sending, receiving
+        if meta is not None:
+            previous = output.kv_connector_worker_meta
+            output.kv_connector_worker_meta = (
+                meta if previous is None else previous.aggregate(meta)
+            )
+        self._host_drain_complete = True
+        return output
+
+    def close_host_kv(self) -> None:
+        self._host_store = None
+        self._host_indices.clear()
 
     def no_forward(self, scheduler_output: "SchedulerOutput") -> ModelRunnerOutput:
         if self._disabled:

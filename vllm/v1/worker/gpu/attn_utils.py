@@ -20,6 +20,7 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    KVCacheTensor,
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -190,6 +191,7 @@ def _reshape_kv_cache(
     shared_kv_cache_layers: dict[str, str],
     packed_members: dict[str, tuple[int, int]] | None = None,
     host_kv_layers: Iterable[str] = (),
+    tensor_descriptions: dict[str, KVCacheTensor] | None = None,
 ) -> dict[str, Any]:
     kv_caches: dict[str, Any] = {}
     host_kv_layers = set(host_kv_layers)
@@ -230,9 +232,23 @@ def _reshape_kv_cache(
             packed = (packed_members or {}).get(layer_name)
             member_index, member_count = packed if packed is not None else (0, 1)
             # A packed physical block holds one page of every member.
-            block_bytes = kv_cache_spec.page_size_bytes * member_count
-            assert kv_raw_tensor.numel() % block_bytes == 0
-            num_blocks = kv_raw_tensor.numel() // block_bytes
+            page_bytes = kv_cache_spec.page_size_bytes
+            description = (tensor_descriptions or {}).get(layer_name)
+            if description is not None and description.page_stride_bytes is not None:
+                page_bytes = description.page_stride_bytes
+                num_blocks = description.num_blocks
+                if (
+                    num_blocks is None
+                    or num_blocks < 1
+                    or page_bytes < kv_cache_spec.page_size_bytes
+                    or description.size != kv_raw_tensor.numel()
+                    or kv_raw_tensor.numel() != num_blocks * page_bytes * member_count
+                ):
+                    raise ValueError("Invalid explicit KV tensor page description")
+            else:
+                block_bytes = page_bytes * member_count
+                assert kv_raw_tensor.numel() % block_bytes == 0
+                num_blocks = kv_raw_tensor.numel() // block_bytes
 
             if isinstance(kv_cache_spec, AttentionSpec):
                 has_attn = True
@@ -278,7 +294,7 @@ def _reshape_kv_cache(
                         kernel_block_size=kernel_block_size,
                         num_heads=kv_cache_spec.num_kv_heads,
                         head_size=kv_cache_spec.head_size,
-                        page_size_bytes=kv_cache_spec.page_size_bytes,
+                        page_size_bytes=page_bytes,
                         member_index=member_index,
                         member_count=member_count,
                     )
@@ -287,7 +303,7 @@ def _reshape_kv_cache(
                         kv_raw_tensor,
                         shape=kv_cache_shape,
                         dtype=dtype,
-                        page_size_bytes=kv_cache_spec.page_size_bytes,
+                        page_size_bytes=page_bytes,
                         scheduler_block_size=kv_cache_spec.storage_block_size,
                         kernel_block_size=kernel_block_size,
                         block_dim=inv_order[0],
@@ -302,7 +318,9 @@ def _reshape_kv_cache(
                 storage_offset_bytes = 0
                 for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
                     dtype_size = get_dtype_size(dtype)
-                    num_element_per_page = kv_cache_spec.page_size_bytes // dtype_size
+                    if page_bytes % dtype_size:
+                        raise ValueError("KV state page stride is not element aligned")
+                    num_element_per_page = page_bytes // dtype_size
                     target_shape = (num_blocks, *shape)
                     stride = torch.empty(target_shape).stride()
                     target_stride = (num_element_per_page, *stride[1:])
@@ -414,6 +432,11 @@ def init_kv_cache(
         shared_kv_cache_layers=shared_kv_cache_layers,
         packed_members=_packed_attention_members(kv_cache_config),
         host_kv_layers=getattr(kv_cache_config, "host_kv_layers", None) or (),
+        tensor_descriptions={
+            name: tensor
+            for tensor in kv_cache_config.kv_cache_tensors
+            for name in tensor.shared_by
+        },
     )
     bind_kv_cache(kv_caches, forward_context, runner_kv_caches)
     return kv_caches

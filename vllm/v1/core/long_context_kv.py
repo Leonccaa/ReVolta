@@ -136,6 +136,10 @@ class LongContextGeometry:
     hot_query_heads: int = 1
     hot_head_dim: int = 256
     hot_kv_heads: int = 1
+    dcp_interleave: int = 1
+    hot_read_rows: int | None = 256
+    logical_index_bytes_per_block: int = 0
+    """Host ABI index bytes, excluding GPU page padding (host placement only)."""
 
     @property
     def local_block_tokens(self) -> int:
@@ -154,7 +158,9 @@ class LongContextGeometry:
     @property
     def host_bytes_per_block(self) -> int:
         """Host bytes of one history block summed over all workers."""
-        return self.main_kv_bytes_per_block * self.num_workers
+        return (
+            self.main_kv_bytes_per_block + self.logical_index_bytes_per_block
+        ) * self.num_workers
 
     @property
     def hot_tail_groups(self) -> int:
@@ -172,8 +178,11 @@ class LongContextGeometry:
         reads it, and the newest tokens stay pinned. A request can never need
         more groups than its own local history has.
         """
+        from vllm.models.qwen4_exp.nvidia.host_kv.planning import max_local_tokens
+
         groups = cdiv(
-            cdiv(max(num_tokens, 1), self.dcp_world_size), self.hot_group_tokens
+            max_local_tokens(num_tokens, self.dcp_world_size, self.dcp_interleave),
+            self.hot_group_tokens,
         )
         bound = self.decode_rows_per_request * min(self.hot_row_groups, groups) + min(
             self.hot_tail_groups, groups
@@ -208,6 +217,7 @@ class LongContextGeometry:
             max_write_rows=self.hot_max_write_rows,
             row_groups=self.hot_row_groups,
             tail_groups=self.hot_tail_groups,
+            read_rows=self.hot_read_rows,
         )
         payload = parts.pop("hot")
         workspace = sum(
@@ -260,6 +270,15 @@ class LongContextCapacityPlan:
     only budgets admission."""
     hot_pool_source: Literal["manual", "auto"] = "manual"
     """Whether the hot pool was explicitly sized or took the remaining budget."""
+    hot_pool_min_groups: int = 0
+    """Guaranteed slot floor. The static static host allocation pool may exceed this
+    floor; shared hot region
+    can grow/shrink the shared hot region without changing this contract."""
+
+    def hot_floor_groups(self, reserved_groups: int) -> int:
+        """shared hot region's shared-region floor; static host allocation still uses
+        static physical allocation."""
+        return max(self.hot_pool_min_groups, reserved_groups)
 
     @property
     def gpu_state_bytes(self) -> int:
@@ -400,9 +419,7 @@ class LongContextCapacityPlan:
         if self.hot_pool_source == "auto":
             # Reserve a full verify step even when history is short or the
             # host pool caps the number of simultaneous full-length requests.
-            step_need = self.max_num_seqs * (
-                geo.decode_rows_per_request * geo.hot_row_groups + geo.hot_tail_groups
-            )
+            step_need = self.hot_pool_min_groups
             auto_hot_shortfall = self.hot_pool_groups < step_need
             if auto_hot_shortfall:
                 hot_bytes = geo.hot_bytes_for_groups(step_need, self.max_num_seqs)
@@ -431,7 +448,12 @@ class LongContextCapacityPlan:
                 f"{hot_gib:.2f}."
             )
         if not self.main_kv_on_gpu:
-            pass_need = geo.hot_row_groups + self.max_num_seqs * geo.hot_tail_groups
+            from vllm.models.qwen4_exp.nvidia.host_kv.planning import history_groups
+
+            groups = history_groups(max_len, geo.dcp_world_size, geo.dcp_interleave)
+            pass_need = min(groups, geo.hot_row_groups + geo.hot_tail_groups) + (
+                self.max_num_seqs - 1
+            ) * min(groups, geo.hot_tail_groups)
             if self.hot_pool_groups < pass_need:
                 pass_gib = _ceil_gib(
                     geo.hot_bytes_for_groups(pass_need, self.max_num_seqs)
@@ -495,6 +517,7 @@ class LongContextCapacityPlan:
             f"hot={self.gpu_hot_pool_bytes}, staging={self.staging_bytes}, "
             f"remaining={self.gpu_remaining_bytes}, "
             f"hot_pool_source={self.hot_pool_source}, "
+            f"hot_pool_min_groups={self.hot_pool_min_groups}, "
             f"hot_admission_bytes={self.hot_pool_bytes}"
         )
 
@@ -515,6 +538,10 @@ def plan_long_context_capacity(
     settings.validate_settings()
     if main_kv_on_gpu is None:
         main_kv_on_gpu = settings.main_kv_placement == "gpu"
+    if main_kv_on_gpu:
+        # The reference arm retains its original admission sizing and never
+        # allocates the host reader scratch.
+        geometry = replace(geometry, hot_read_rows=None)
     if settings.host_pool_tokens is not None:
         host_blocks = settings.host_pool_tokens // geometry.block_tokens
     else:
@@ -572,11 +599,38 @@ def plan_long_context_capacity(
             / geometry.dcp_world_size
         )
         hot_groups = hot_tokens // geometry.hot_group_tokens
+    floor = (
+        max_num_seqs
+        * (
+            geometry.decode_rows_per_request * geometry.hot_row_groups
+            + geometry.hot_tail_groups
+            if main_kv_on_gpu
+            else geometry.hot_reserve_groups(geometry.max_model_len)
+        )
+        if auto
+        else hot_groups
+    )
+    # Manual settings guarantee a minimum, rather than imposing an upper
+    # limit. Static static host allocation reserves at least the verification working
+    # set too.
+    if not auto and not main_kv_on_gpu:
+        from vllm.models.qwen4_exp.nvidia.host_kv.planning import history_groups
+
+        groups = history_groups(
+            geometry.max_model_len, geometry.dcp_world_size, geometry.dcp_interleave
+        )
+        pass_need = min(groups, geometry.hot_row_groups + geometry.hot_tail_groups) + (
+            max_num_seqs - 1
+        ) * min(groups, geometry.hot_tail_groups)
+        hot_groups = max(
+            floor, geometry.hot_reserve_groups(geometry.max_model_len), pass_need
+        )
     plan = replace(
         plan,
         hot_pool_groups=hot_groups,
         hot_pool_bytes=geometry.hot_bytes_for_groups(hot_groups, max_num_seqs),
         hot_pool_source="auto" if auto else "manual",
+        hot_pool_min_groups=floor,
     )
     if auto and not main_kv_on_gpu:
         return replace(plan, gpu_history_blocks=history_blocks)

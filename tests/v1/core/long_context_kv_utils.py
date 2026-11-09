@@ -30,6 +30,21 @@ INDEX_BLOCK_BYTES = 1_277_952
 MI = 1 << 20
 
 
+def host_step_receipts(scheduler, output):
+    """Retire a scheduler-only fixture's simulated host worker execution."""
+    if output.host_kv is None:
+        return None
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+        OffloadingWorkerMetadata,
+    )
+
+    mask = scheduler.host_history_pool.host_pages.all_ranks
+    return OffloadingWorkerMetadata(
+        seal_results={t: (mask, 0, 0) for t in output.host_kv.seals},
+        completed_steps={output.host_kv.step: mask},
+    )
+
+
 class ProductionModelConfig:
     hf_text_config = SimpleNamespace(indexer_budget=2048)
 
@@ -79,6 +94,13 @@ def production_config(
         max_in_flight_tokens=8192,
         kernel_config=SimpleNamespace(
             long_context_kv=long_context or LongContextKVConfig()
+        ),
+        kv_transfer_config=(
+            SimpleNamespace(kv_connector="OffloadingConnector")
+            if long_context is not None
+            and long_context.enabled
+            and long_context.main_kv_placement == "host"
+            else None
         ),
     )
 

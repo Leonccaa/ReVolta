@@ -151,21 +151,21 @@ def test_pool_is_authority_without_a_second_payload_and_lru_respects_leases():
     pages = pool(slots=2)
     bid = commit(pages, key(1), payload(7))
     assert pages.view.obj[bid * PAGE_BYTES : (bid + 1) * PAGE_BYTES] == payload(7)
-    active = pages.pin(key(1))
+    active = pages.pin(pages.lookup(key(1)))
     assert active is not None and active.view.readonly
     commit(pages, key(2))
     # Touch the other page, making the active page oldest. It still cannot go.
-    other = pages.pin(key(2))
+    other = pages.pin(pages.lookup(key(2)))
     assert other is not None
     pages.release(other)
     commit(pages, key(3))
-    assert pages.lookup(key(1)) is True and pages.lookup(key(2)) is False
+    assert pages.is_ready(pages.lookup(key(1))) and pages.lookup(key(2)) is None
     pages.release(active)
     with pytest.raises(ValueError, match="released"):
         _ = active.view
     pages.release(active)  # Idempotent release cannot drop a later lease.
     commit(pages, key(4))
-    assert pages.lookup(key(1)) is False
+    assert pages.lookup(key(1)) is None
 
 
 def test_unpublished_aborted_and_mixed_group_pages_cannot_hit():
@@ -173,14 +173,35 @@ def test_unpublished_aborted_and_mixed_group_pages_cannot_hit():
     page = pages.reserve(key(1))
     assert page is not None
     page.view[:] = payload()
-    assert pages.lookup(key(1)) is None and pages.pin(key(1)) is None
+    assert pages.lookup(key(1)) is not None
+    assert not pages.is_ready(pages.lookup(key(1)))
+    assert pages.pin(pages.lookup(key(1))) is None
     assert pages.reserve(key(2)) is None
     pages.release(page)
-    assert pages.lookup(key(1)) is False
+    assert pages.lookup(key(1)) is None
     commit(pages, key(2))
     with pytest.raises(ValueError, match="group"):
         pages.acquire_prefix([key(2), key(3, group=4)])
     commit(pages, key(3))  # The mixed-group failure leaked no read pin.
+
+
+def test_an_in_flight_row_cannot_be_reserved_twice():
+    pages = pool(slots=2)
+    first = pages.reserve(key(1))
+    assert first is not None
+    # An unpublished row may be located, but it is never ready to hit.
+    handle = pages.lookup(key(1))
+    assert handle is None or not pages.is_ready(handle)
+    # One writer per key: a duplicate hash must not get a second destination.
+    assert pages.reserve(key(1)) is None
+    first.view[:] = payload(1)
+    pages.publish(first)
+    assert pages.reserve(key(1)) is None
+    pages.release(first)
+    prefix = pages.acquire_prefix([key(1)])
+    assert [bytes(p.view) for p in prefix.pages] == [payload(1)]
+    prefix.release()
+    commit(pages, key(2))  # The second slot was never taken by a duplicate.
 
 
 def test_only_a_contiguous_prefix_contributes_group_availability():
@@ -206,7 +227,8 @@ def test_real_files_restart_read_directly_into_new_host_pool(tmp_path, caches):
     for k in keys:
         assert second.prefetch(k)
     # A reserved destination is not yet readable, regardless of worker timing.
-    assert second.pool.lookup(keys[0]) is None
+    assert second.pool.lookup(keys[0]) is not None
+    assert not second.pool.is_ready(second.pool.lookup(keys[0]))
     assert second.flush(5)
     prefix = second.acquire_prefix(keys)
     assert prefix.available_tokens == 3 * BLOCK_TOKENS
@@ -279,7 +301,7 @@ def test_corruption_is_a_miss_and_never_publishes_partial_bytes(
     head = second.acquire_prefix(keys)
     assert head.available_tokens == BLOCK_TOKENS
     assert second.prefetch(keys[1]) and second.flush(5)
-    assert second.pool.lookup(keys[1]) is False
+    assert second.pool.lookup(keys[1]) is None
     assert not path.exists()
     after = second.acquire_prefix(keys)
     assert after.available_tokens == BLOCK_TOKENS
@@ -383,8 +405,9 @@ def test_queue_cap_counts_active_queued_and_completed_until_polled(
         # Source pages remain pinned even though the caller ended its request.
         commit(c.pool, key(6))
         commit(c.pool, key(7))
-        assert c.pool.lookup(key(1)) is True and c.pool.lookup(key(2)) is True
-        assert c.pool.lookup(key(3)) is True
+        assert c.pool.is_ready(c.pool.lookup(key(1)))
+        assert c.pool.is_ready(c.pool.lookup(key(2)))
+        assert c.pool.is_ready(c.pool.lookup(key(3)))
     finally:
         proceed.set()
     deadline = time.monotonic() + 5
@@ -415,7 +438,8 @@ def test_pending_load_holds_destination_and_queue_capacity(
     monkeypatch.setattr(second._tier, "_read_page", blocked)
     try:
         assert second.prefetch(key(1)) and entered.wait(5)
-        assert second.pool.lookup(key(1)) is None
+        assert second.pool.lookup(key(1)) is not None
+        assert not second.pool.is_ready(second.pool.lookup(key(1)))
         assert not second.prefetch(key(2))
         assert second.pool.reserve(key(3)) is None
         assert second.acquire_prefix([key(1)]).available_tokens == 0
@@ -462,7 +486,7 @@ def test_close_waits_for_physical_read_before_aborting_destination(
         timer.join()
     assert read_done.is_set()
     # Discarded reads never publish a hit, even if bytes arrived before join.
-    assert second.pool.lookup(key(1)) is False
+    assert second.pool.lookup(key(1)) is None
     assert second.stats()["cancelled_loads"] == 1
     assert second.stats().get("ssd_verified_pages", 0) == 0
     commit(second.pool, key(2))

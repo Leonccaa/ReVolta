@@ -121,6 +121,7 @@ class Arms:
             dcp_rank=self.rank,
         )
         self.store = HostHistoryStore(shape, ["attn"], device="cpu")
+        self.store.bind_pages([(hid, 17 - hid) for hid in range(1, 17)])
         self.host = self.store.layer("attn")
         self.paged = torch.zeros((17, 2, KBS, 1, DIM), dtype=dtype)
         self.kv_dtype = "fp8_e4m3" if e4m3 else "auto"
@@ -195,7 +196,11 @@ class Arms:
         )
         query = (torch.randn((n, QHEADS, DIM), generator=self.gen) * 0.5).half()
         gate = torch.randn((n, QHEADS * DIM), generator=self.gen).half()
-        meta = SimpleNamespace(num_actual_tokens=n, block_table=table)
+        meta = SimpleNamespace(
+            num_actual_tokens=n,
+            block_table=table,
+            max_query_len=max(reqs.count(r) for r in range(REQS)),
+        )
         out_gpu = torch.empty((n, QHEADS, DIM), dtype=torch.float16)
         self.impl.forward_qsa(
             self.layer, query, None, None, self.paged, meta, out_gpu,

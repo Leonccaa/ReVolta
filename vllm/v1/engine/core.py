@@ -157,6 +157,12 @@ class EngineCore:
             hash_block_size=hash_block_size,
         )
         self.use_spec_decode = vllm_config.speculative_config is not None
+        if getattr(self.scheduler, "host_history_pool", None) is not None:
+            from vllm.v1.kv_offload.host.region import host_region_layout
+
+            cast(Any, self.scheduler).host_region = host_region_layout(
+                kv_cache_config, vllm_config.instance_id
+            ).open(None)
         if self.scheduler.connector is not None:  # type: ignore
             self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore
 
@@ -772,6 +778,43 @@ class EngineCore:
             self.abort_requests(request_ids)
 
     def shutdown(self):
+        host_scheduler = cast(Any, self.scheduler)
+        host_pool = getattr(host_scheduler, "host_history_pool", None)
+        if (
+            host_pool is not None
+            and self.model_executor
+            and not getattr(self, "_host_kv_drained", False)
+        ):
+            # Consume every submitted batch through the normal scheduler
+            # output path before asking workers for their final IO receipts.
+            queue = getattr(self, "batch_queue", None)
+            while queue:
+                future, scheduled, execute_future = queue[-1]
+                output = future.result()
+                if output is None:
+                    execute_future.result()
+                    raise RuntimeError("Host KV shutdown has a failed batch")
+                self.scheduler.update_from_output(scheduled, output)
+                queue.pop()
+            receipts = self.model_executor.collective_rpc("drain_host_kv")
+            ranks = [rank for rank, _, _ in receipts]
+            expected = set(range(host_pool.host_pages.num_workers))
+            failures = [error for _, _, error in receipts if error is not None]
+            if set(ranks) != expected or len(ranks) != len(expected) or failures:
+                raise RuntimeError(
+                    f"Host KV drain failed, retaining resources {receipts!r}"
+                )
+            for _, output, _ in receipts:
+                if output is not None and output.kv_connector_worker_meta is not None:
+                    host_scheduler.update_host_kv_output(output)
+                    host_scheduler.connector.update_connector_output(output)
+            if host_pool._jobs or any(
+                p.ticket or p.io for p in host_pool.host_pages.pages
+            ):
+                raise RuntimeError("Host KV drain left owners, retaining resources")
+            if host_pool.host_pages.watermark != host_scheduler.current_step:
+                raise RuntimeError("Host KV drain left a step gap, retaining resources")
+            self._host_kv_drained = True
         self.structured_output_manager.clear_backend()
         if self.model_executor:
             self.model_executor.shutdown()
@@ -2297,12 +2340,14 @@ class EngineCoreActorMixin:
         # To bypass 2, we need to also set
         # RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES, but vLLM workers created
         # thereafter would have CUDA_VISIBLE_DEVICES set, which is sticky:
-        # https://github.com/ray-project/ray/blob/e752fc319ddedd9779a0989b6d3613909bad75c9/python/ray/_private/worker.py#L456 # noqa: E501
+        # https://github.com/ray-project/ray/blob/e752fc319ddedd9779a0989b6d3613909bad75c9/python/ray/_private/worker.py#L456
+        # # noqa: E501
         # This is problematic because when the vLLM worker (a Ray actor)
         # executes a task, it indexes into the sticky CUDA_VISIBLE_DEVICES
         # rather than directly using the GPU ID, potentially resulting in
         # index out of bounds error. See:
-        # https://github.com/ray-project/ray/pull/40461/files#diff-31e8159767361e4bc259b6d9883d9c0d5e5db780fcea4a52ead4ee3ee4a59a78R1860 # noqa: E501
+        # https://github.com/ray-project/ray/pull/40461/files#diff-31e8159767361e4bc259b6d9883d9c0d5e5db780fcea4a52ead4ee3ee4a59a78R1860
+        # # noqa: E501
         # and get_accelerator_ids_for_accelerator_resource() in worker.py
         # of ray.
         self._set_visible_devices(vllm_config, local_dp_rank)

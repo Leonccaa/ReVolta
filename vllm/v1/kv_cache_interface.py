@@ -1024,6 +1024,10 @@ class KVCacheTensor:
     """Blocks this tensor holds when the KV cache has separate block spaces
     (``KVCacheConfig.block_segments``); ``None`` means
     ``KVCacheConfig.num_blocks``."""
+    page_stride_bytes: int | None = None
+    """Physical scheduler-page stride for this tensor's members. None uses
+    the spec page size. Explicit strides require num_blocks; padding belongs
+    to the allocation, not to the logical payload or ordinary-mode spec."""
 
 
 @dataclass

@@ -1,22 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Engine host history store: main QSA K/V addressed by history block ID.
+"""Main QSA K/V in physical host pages, addressed through ``page_of[hid]``.
 
-In long-context mode with the main K/V in the host pool, every history block
-ID of the scheduler's GPU history segment owns exactly one host page per QSA
-layer; the same ID addresses the block's compressed-index page on the GPU.
-The host allocation is made once, for every history ID (null block 0
-included), so a host page lives exactly as long as its history block: it is
-written while the block's request computes, kept while the block sits in the
-prefix cache, and reset when the scheduler hands the ID to a new allocation
-(``begin_blocks``, driven by the same new-block list that drives KV zeroing).
-Nothing here allocates or evicts host pages on its own.
+The scheduler's HostPageTable owns allocation and retirement. A worker maps
+one shared region whose rows contain every rank's main KV and logical index
+payload. A history ID is a binding, and a page can outlive an ID incarnation.
+The worker applies binding updates on the forward stream before using an ID.
 
-Layout. One pinned allocation ``[num_blocks, ratio, layers, 2, kbs, H, D]``:
-a history block's pages for all layers are one contiguous byte range
-(``host_page``), and each layer sees a kernel-block view
-``[num_blocks * ratio, 2, kbs, H, D]`` that matches the GPU paged layout, so
-the engine's slot mapping and block tables address it unchanged.
+A layer's host view is ``[page, subpage, 2, kbs, H, D]``. Its strides retain
+other ranks and index payload between rows. Layer views alias the registered
+backing, including when subpages cannot be flattened into a uniform stride.
 
 Reads go through a per-layer GPU hot pool of four-token groups, keyed by
 ``(kernel block, group)``: select -> mark wanted groups -> evict (clock
@@ -41,6 +34,7 @@ from __future__ import annotations
 import math
 import os
 import weakref
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 import torch
@@ -50,16 +44,48 @@ from vllm.utils.torch_utils import (
     async_tensor_h2d,
     get_accelerator_view_from_cpu_tensor,
 )
+from vllm.v1.kv_offload.host.page_table import SealTicket
+from vllm.v1.kv_offload.host.region import HostRegionLayout
 
 from . import history_kernels as hk
 from . import kernels
 from .budget import (
     HISTORY_METADATA,
     QSA_ROW_GROUPS,
+    READ_ROWS,
     TAIL_GROUPS,
     history_fixed_memory_bytes,
 )
 from .pool import HostKVResourceError, UnsupportedHostKVConfig, _check_product
+
+
+def tensor_storage_bytes(values: Mapping[str, object]) -> dict[str, int]:
+    """Bill owned storage once, including per-layer lists and aliased views.
+
+    A slice owns the underlying allocation's bytes, not just its numel. Walk
+    explicit tensor containers only; layer objects can reference this store.
+    """
+    seen: set[tuple[torch.device, int]] = set()
+
+    def size(value: object) -> int:
+        if isinstance(value, torch.Tensor):
+            storage = value.untyped_storage()
+            key = (value.device, storage._cdata)
+            if key in seen:
+                return 0
+            seen.add(key)
+            return storage.nbytes()
+        if isinstance(value, (list, tuple)):
+            return sum(size(item) for item in value)
+        if isinstance(value, dict):
+            return sum(size(item) for item in value.values())
+        return 0
+
+    return {
+        name: size(value)
+        for name, value in values.items()
+        if isinstance(value, (torch.Tensor, list, tuple, dict))
+    }
 
 
 @dataclass(frozen=True)
@@ -93,6 +119,36 @@ class HostHistoryShape:
     qsa_group_columns: int = 0
     """Columns per selected group in the selection (4, 2 after DCP2
     localization), or 0 to claim every column separately."""
+    read_rows: int = READ_ROWS
+    """R_cap: fixed indices scratch capacity, independent of hot slot count."""
+    max_context_tokens: int | None = None
+    """Startup context bound, allowing short histories below the 513-row bound."""
+    decode_rows: int = 1
+    """Maximum verify rows of one request; uniform decode stays one pass."""
+
+    def conservative_pass_geometry(self) -> tuple[int, int, list[int]]:
+        """Planner inputs safe for any request assignment, without device reads.
+
+        For short histories one row can cover an entire request. At most N
+        different requests can contribute, so the bound saturates at N*G.
+        Long histories retain the original numerical pass boundaries.
+        """
+        from .planning import history_groups
+
+        if self.max_context_tokens is not None:
+            groups = history_groups(
+                self.max_context_tokens, self.dcp_world_size, self.interleave
+            )
+            if groups <= self.row_groups + self.tail_groups:
+                tail = min(groups, self.tail_groups)
+                delta = groups - tail
+                return (
+                    max(delta, 1),
+                    tail,
+                    [tail + self.max_requests * delta]
+                    + [tail] * (self.max_requests - 1),
+                )
+        return self.row_groups, self.tail_groups, [2**63 - 1] * self.max_requests
 
     @property
     def num_kernel_blocks(self) -> int:
@@ -114,8 +170,11 @@ class HostHistoryShape:
     def rows_per_pass(self) -> int:
         """Query rows whose union bound fits the hot pool with every
         request's tail resident."""
-        return (self.hot_slots - self.max_requests * self.tail_groups) // (
-            self.row_groups
+        row_groups, tail, groups = self.conservative_pass_geometry()
+        if sum(groups) <= self.hot_slots:
+            return self.read_rows
+        return min(
+            self.read_rows, (self.hot_slots - self.max_requests * tail) // row_groups
         )
 
     @property
@@ -146,6 +205,7 @@ class HostHistoryShape:
             max_write_rows=self.max_write_rows,
             row_groups=self.row_groups,
             tail_groups=self.tail_groups,
+            read_rows=self.read_rows,
         )
 
     def validate(self) -> None:
@@ -163,9 +223,13 @@ class HostHistoryShape:
             self.row_groups,
             self.dcp_world_size,
             self.interleave,
+            self.read_rows,
+            self.decode_rows,
         )
         if any(type(n) is not int or n <= 0 for n in sizes) or self.tail_groups < 0:
             raise ValueError("Host history dimensions must be positive integers")
+        if self.max_context_tokens is not None and self.max_context_tokens < 1:
+            raise ValueError("Host history context bound must be positive")
         if self.kernel_block_tokens % 4:
             raise UnsupportedHostKVConfig(
                 "Host history kernel blocks must hold a multiple of four tokens"
@@ -191,7 +255,7 @@ class HostHistoryShape:
             ("ready tokens", (self.num_kernel_blocks, self.kernel_block_tokens)),
             ("hot token coordinates", (self.hot_slots, 4)),
             ("hot page table", (self.max_requests, self.hot_slots)),
-            ("selection", (self.rows_per_pass, self.selection_width)),
+            ("selection", (self.read_rows, self.selection_width)),
             ("group transfer elements", (8, self.kv_heads, self.head_dim)),
             ("selection grid Y", (triton.cdiv(self.selection_width, 128),)),
         ):
@@ -236,6 +300,8 @@ class HostHistoryStore:
         *,
         device: torch.device | str,
         debug: bool = False,
+        region_layout: HostRegionLayout | None = None,
+        rank: int = 0,
     ) -> None:
         shape.validate()
         if len(layer_names) != shape.num_layers or len(set(layer_names)) != len(
@@ -252,13 +318,32 @@ class HostHistoryStore:
         kb, kbs, layers = s.num_kernel_blocks, s.kernel_block_tokens, s.num_layers
         h, d = s.kv_heads, s.head_dim
         dims = (s.num_blocks, s.kernel_blocks_per_block, layers, 2, kbs, h, d)
-        flat = _allocate_host(math.prod(dims), s.dtype)
-        if device.type == "cuda":
+        self.region = None
+        self.index_payloads: list[torch.Tensor] = []
+        if region_layout is None:
+            flat = _allocate_host(math.prod(dims), s.dtype)
+            self.host = flat.view(dims)
+        else:
+            self.region = region_layout.open(rank)
+            raw = self.region.create_next_view(region_layout.main_bytes)
+            # Unflatten preserves the row stride across other workers and
+            # this rank's logical index payload. No reshape may copy here.
+            self.host = raw.view(s.dtype).unflatten(1, dims[1:])
+            self.index_payloads = [
+                self.region.create_next_view(n).view(torch.uint8)
+                for n in region_layout.index_bytes
+            ]
+            flat = self.region._base
+        if device.type == "cuda" and self.region is None:
             _register_host(flat)
             # Unregister only when the store goes away; views must not
             # outlive it.
             weakref.finalize(self, _unregister_host, flat)
-        self.host = flat.view(dims)
+        elif device.type == "cuda":
+            from vllm.v1.kv_offload.cpu.gpu_worker import pin_mmap_region
+
+            assert self.region is not None
+            pin_mmap_region(self.region, flags=3)
         try:
             if device.type == "cuda":
                 with torch.accelerator.device_index(device.index):
@@ -266,6 +351,16 @@ class HostHistoryStore:
             else:
                 self.host_device = self.host
             i32 = dict(dtype=torch.int32, device=device)
+            self.page_of = (
+                torch.arange(s.num_blocks, **i32)
+                if region_layout is None
+                else torch.full((s.num_blocks,), -1, **i32)
+            )
+            self.page_of[0] = 0
+            # CPU mirror is used only by the temporary static host allocation transfer
+            # bridge.
+            self.page_of_cpu = self.page_of.cpu().numpy().copy()
+            self._seal_sources: list[torch.Tensor] = []
             self.ready = torch.zeros(kb * kbs, dtype=torch.uint8, device=device)
             # The null block is never written; reading it yields zeros.
             self.ready[: s.kernel_blocks_per_block * kbs] = 1
@@ -292,7 +387,7 @@ class HostHistoryStore:
             self.victim_tiles = min(triton.cdiv(slots, 512), 256)
             self.victim_counts = torch.empty((3, self.victim_tiles), **i32)
             self.gather_workers = min(slots, 256)
-            self.indices = torch.empty((s.rows_per_pass, s.selection_width), **i32)
+            self.indices = torch.empty((s.read_rows, s.selection_width), **i32)
             # Hot token IDs are global slot coordinates; every request row of
             # the identity table maps page p to hot slot p.
             self.hot_block_table = (
@@ -316,12 +411,23 @@ class HostHistoryStore:
 
     def fixed_device_memory_bytes(self) -> dict[str, int]:
         """Actual fixed tensor bytes, excluding host pages and history metadata."""
-        return {
-            name: value.numel() * value.element_size()
-            for name, value in vars(self).items()
-            if isinstance(value, torch.Tensor)
-            and name not in HISTORY_METADATA | {"host", "host_device"}
-        }
+        return tensor_storage_bytes(
+            {
+                name: value
+                for name, value in vars(self).items()
+                if name
+                not in HISTORY_METADATA
+                | {
+                    "host",
+                    "host_device",
+                    "layers",
+                    "layer_index",
+                    "page_of",
+                    "index_payloads",
+                    "_seal_sources",
+                }
+            }
+        )
 
     # ----- interface for the scheduler-facing tiers (host prefix adapter)
     # -----------------
@@ -331,7 +437,64 @@ class HostHistoryStore:
         ``[ratio, layers, 2, kernel_block_tokens, H, D]``, contiguous."""
         if not 0 <= block_id < self.shape.num_blocks:
             raise IndexError(f"history block {block_id} is out of range")
-        return self.host[block_id]
+        page = int(self.page_of_cpu[block_id])
+        if page < 0:
+            raise ValueError("History block has no host page binding")
+        return self.host[page]
+
+    def bind_pages(self, bindings: list[tuple[int, int]]) -> None:
+        """Apply ordered hid/page updates on the forward stream, outside graphs."""
+        if not bindings:
+            return
+        ids = self._block_ids([hid for hid, _ in bindings])
+        values = async_tensor_h2d(
+            [page for _, page in bindings],
+            dtype=torch.int32,
+            device=self.device,
+            pin_memory=self.device.type == "cuda",
+        )
+        self.page_of[ids] = values
+        for hid, page in bindings:
+            self.page_of_cpu[hid] = page
+
+    def seal(self, tickets: list[SealTicket], index_views: list[torch.Tensor]) -> None:
+        """Queue logical index D2H before the output stream's dependency.
+
+        Keep packed device sources alive until that step's output has retired.
+        The temporary sources belong to this stream, and their allocator reuse
+        is stream ordered. Host destinations remain owned by the tickets.
+        """
+        from vllm.v1.attention.kv_cache_view import pack_page_payload
+
+        self._seal_sources.clear()
+        for ticket in tickets:
+            if int(self.page_of_cpu[ticket.hid]) != ticket.handle.page_id:
+                raise ValueError("Seal refers to a stale history binding")
+            if len(index_views) != len(self.index_payloads):
+                raise ValueError("Seal index members differ from host ABI")
+            for view, target in zip(index_views, self.index_payloads):
+                if view.shape[0] % self.shape.num_blocks:
+                    raise ValueError("Index kernel pages do not divide history IDs")
+                packed = pack_page_payload(
+                    view,
+                    ticket.hid,
+                    subdivisions=view.shape[0] // self.shape.num_blocks,
+                )
+                if packed.numel() != target.shape[1]:
+                    raise ValueError("Seal payload size differs from logical ABI")
+                self._seal_sources.append(packed)
+                target[ticket.handle.page_id].copy_(packed, non_blocking=True)
+
+    def close(self) -> None:
+        """Called only after all workers' drain acknowledgements were collected."""
+        if self.region is not None:
+            self.layers.clear()
+            self.layer_index.clear()
+            self.index_payloads.clear()
+            self._seal_sources.clear()
+            self.host = self.host_device = None
+            self.region.cleanup()
+            self.region = None
 
     def layer(self, name: str) -> HostHistoryLayer:
         return self.layers[self.layer_index[name]]
@@ -412,8 +575,8 @@ class HostHistoryLayer:
     def __init__(self, store: HostHistoryStore, index: int, name: str) -> None:
         self.store, self.index, self.name = store, index, name
         s = store.shape
-        self.host_device = store.host_device[:, :, index].flatten(0, 1)
-        self.host_view = store.host[:, :, index].flatten(0, 1)
+        self.host_device = store.host_device[:, :, index]
+        self.host_view = store.host[:, :, index]
         self.hot = store.hot[index]
         self.key_cache, self.value_cache = self.hot.unbind(1)
         self.group_to_slot = store.group_to_slot[index]
@@ -508,12 +671,21 @@ class HostHistoryLayer:
                 raise ValueError("duplicate host history write slot")
         hk.write_slots[(n,)](
             key, value, slot_mapping, self.host_device, self.hot,
-            self.group_to_slot, key.stride(0), key.stride(1), value.stride(0),
-            value.stride(1), *self.host_view.stride()[:4], s.kernel_block_tokens,
+            self.group_to_slot, self.store.page_of,
+            key.stride(0), key.stride(1), value.stride(0),
+            value.stride(1), *self.host_view.stride()[:5],
+            s.kernel_blocks_per_block, s.kernel_block_tokens,
             s.kv_heads, s.head_dim, triton.next_power_of_2(s.kv_heads * s.head_dim),
         )  # fmt: skip
         # A separate kernel boundary publishes rows only after both copies.
-        hk.commit_slots[(triton.cdiv(n, 256),)](slot_mapping, self.store.ready, n, 256)
+        hk.commit_slots[(triton.cdiv(n, 256),)](
+            slot_mapping,
+            self.store.ready,
+            self.store.page_of,
+            s.kernel_blocks_per_block * s.kernel_block_tokens,
+            n,
+            256,
+        )
 
     # ----- reads ----------------------------------------------------------
 
@@ -536,7 +708,7 @@ class HostHistoryLayer:
         requests = seq_lens.shape[0]
         if (
             selection.ndim != 2
-            or not 0 < rows <= s.rows_per_pass
+            or not 0 < rows <= s.read_rows
             or width > s.selection_width
             or selection.dtype != torch.int32
             or selection.stride(1) != 1
@@ -597,7 +769,8 @@ class HostHistoryLayer:
         )  # fmt: skip
         hk.gather_groups[(store.gather_workers,)](
             self.host_device, self.hot, store.ready, store.miss_groups,
-            store.miss_slots, store.miss_count, *self.host_view.stride()[:4],
+            store.miss_slots, store.miss_count, store.page_of,
+            *self.host_view.stride()[:5], s.kernel_blocks_per_block,
             s.kernel_block_tokens, s.kv_heads, s.head_dim,
             triton.next_power_of_2(8 * s.kv_heads * s.head_dim),
         )  # fmt: skip
@@ -662,6 +835,9 @@ def for_each_pass(
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
     attend,
+    *,
+    passes: Sequence[tuple[int, int]] | None = None,
+    single_pass: bool = False,
 ) -> None:
     """Gather and attend query rows in passes that fit the hot pool.
 
@@ -670,10 +846,39 @@ def for_each_pass(
     evict the groups it read. A step that fits one pass keeps the original
     row count and therefore the original split/merge plan."""
     rows = selection.shape[0]
-    step = layer.rows_per_pass
-    for start in range(0, rows, step):
-        end = min(rows, start + step)
+    if single_pass:
+        if rows > layer.store.shape.read_rows:
+            raise ValueError("Decode rows exceed host-history R_cap")
+        passes = [(0, rows)] if rows else []
+    if passes is None:
+        # Keep the conservative numerical plan until the runner supplies real
+        # CPU batch metadata (shared hot region). Use the same planner with an uncapped
+        # G,
+        # charging every request's tail, without reading GPU tensors.
+        from .planning import plan_passes
+
+        s = layer.store.shape
+        row_groups, tail_groups, groups = s.conservative_pass_geometry()
+        passes = plan_passes(
+            [rows] + [0] * (s.max_requests - 1),
+            groups,
+            s.hot_slots,
+            s.read_rows,
+            row_groups=row_groups,
+            tail_groups=tail_groups,
+        )
+    cursor = 0
+    for start, end in passes:
+        if (
+            start != cursor
+            or not start < end <= rows
+            or end - start > layer.store.shape.read_rows
+        ):
+            raise ValueError("Invalid host-history pass intervals")
         hot_ids = layer.gather(
             selection[start:end], token_to_req[start:end], block_table, seq_lens
         )
         attend(start, end, hot_ids)
+        cursor = end
+    if cursor != rows:
+        raise ValueError("Host-history pass intervals do not cover the query rows")

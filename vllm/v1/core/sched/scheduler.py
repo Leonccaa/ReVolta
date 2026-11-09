@@ -340,6 +340,14 @@ class Scheduler(SchedulerInterface):
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
         self.current_step = 0
+        from vllm.v1.core.history_block_pool import HistoryBlockPool
+
+        self.host_history_pool = (
+            self.kv_cache_manager.block_pool
+            if isinstance(self.kv_cache_manager.block_pool, HistoryBlockPool)
+            else None
+        )
+        self.host_region = None
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
         )
@@ -623,6 +631,9 @@ class Scheduler(SchedulerInterface):
 
     def schedule(self) -> SchedulerOutput:
         self.current_step += 1
+        host_pool = getattr(self, "host_history_pool", None)
+        if host_pool is not None:
+            host_pool.start_step(self.current_step)
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -1562,6 +1573,29 @@ class Scheduler(SchedulerInterface):
             meta = self._build_kv_connector_meta(self.connector, scheduler_output)
             scheduler_output.kv_connector_metadata = meta
 
+        if host_pool is not None:
+            from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+                OffloadingConnectorMetadata,
+            )
+            from vllm.v1.kv_offload.base import GPULoadStoreSpec
+            from vllm.v1.kv_offload.host.page_table import HostKVStep
+
+            tickets = host_pool.finish_schedule(num_scheduled_tokens)
+            scheduler_output.host_kv = HostKVStep(
+                self.current_step, list(host_pool.binding_updates.items()), tickets
+            )
+            host_pool.binding_updates.clear()
+            metadata = scheduler_output.kv_connector_metadata
+            if isinstance(metadata, OffloadingConnectorMetadata):
+                for job_id, job in (metadata.load_jobs | metadata.store_jobs).items():
+                    source, target = job.transfer_spec
+                    gpu = source if isinstance(source, GPULoadStoreSpec) else target
+                    assert isinstance(gpu, GPULoadStoreSpec)
+                    group_id = host_pool.host_group_id
+                    start = sum(gpu.group_sizes[:group_id])
+                    end = start + gpu.group_sizes[group_id]
+                    host_pool.track_job(job_id, gpu.block_ids[start:end].tolist())
+
         self._pending_preempted_req_ids = set()
 
         # Exact source IDs are scheduler-side connector inputs only.
@@ -1649,6 +1683,9 @@ class Scheduler(SchedulerInterface):
             )
             assert request.num_in_flight_tokens == 0
         self._pending_preempted_req_ids.add(request.request_id)
+        host_pool = getattr(self, "host_history_pool", None)
+        if host_pool is not None:
+            host_pool.cancel_scheduled(request.request_id)
         self.kv_cache_manager.free(request)
         self.encoder_cache_manager.free(request)
         self._inflight_prefills.discard(request)
@@ -2043,6 +2080,8 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        if getattr(self, "host_history_pool", None) is not None:
+            self.update_host_kv_output(model_runner_output.kv_connector_output)
         self.mixed_prefill_budget.update(model_runner_output.mixed_prefill_timing)
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
@@ -3012,6 +3051,32 @@ class Scheduler(SchedulerInterface):
         )
         return spec_decoding_stats
 
+    def update_host_kv_output(self, output: KVConnectorOutput | None) -> None:
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+            OffloadingWorkerMetadata,
+        )
+
+        pool = self.host_history_pool
+        assert pool is not None
+        meta = output.kv_connector_worker_meta if output is not None else None
+        if not isinstance(meta, OffloadingWorkerMetadata):
+            raise RuntimeError("Host KV step is missing its worker receipts")
+        for ticket, (completed, failed, compute_failed) in meta.seal_results.items():
+            try:
+                page = pool.host_pages.get(ticket.handle)
+            except ValueError:
+                continue
+            if page.ticket != ticket:
+                continue
+            pool.host_pages.seal_result(ticket, completed, failed, compute_failed)
+            if compute_failed and pool.hgen[ticket.hid] == ticket.hgen:
+                pool.evict_blocks({ticket.hid})
+                if pool.blocks[ticket.hid].ref_cnt == 0:
+                    pool.unbind(ticket.hid)
+        pool.complete_jobs(meta.completed_jobs)
+        for step, ranks in meta.completed_steps.items():
+            pool.host_pages.complete_step(step, ranks)
+
     def shutdown(self) -> None:
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
@@ -3019,6 +3084,9 @@ class Scheduler(SchedulerInterface):
             self.connector.shutdown()
         if self.ec_connector is not None:
             self.ec_connector.shutdown()
+        if self.host_region is not None:
+            self.host_region.cleanup()
+            self.host_region = None
 
     ########################################################################
     # KV Connector Related Methods

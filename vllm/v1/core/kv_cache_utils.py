@@ -2915,6 +2915,10 @@ def generate_scheduler_kv_cache_config(
             ),
             key=lambda plan: plan.hot_pool_groups,
         )
+    if cfg.host_kv_layers:
+        from vllm.v1.kv_offload.host.region import host_region_layout
+
+        cfg.__dict__["_host_region_layout"] = host_region_layout(cfg, "")
     for group in cfg.kv_cache_groups:
         if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
             # All layers in the UniformTypeKVCacheSpecs have the same type,
@@ -3348,7 +3352,7 @@ def get_long_context_geometry(
     workers = getattr(parallel, "tensor_parallel_size", 1) * (
         parallel.pipeline_parallel_size
     )
-    return LongContextGeometry(
+    geometry = LongContextGeometry(
         block_tokens=block_tokens,
         num_workers=workers,
         main_kv_bytes_per_block=owner_bytes,
@@ -3369,7 +3373,34 @@ def get_long_context_geometry(
         hot_query_heads=vllm_config.model_config.get_num_attention_heads(parallel),
         hot_head_dim=hot_head_dim,
         hot_kv_heads=hot_kv_heads,
+        dcp_interleave=getattr(parallel, "cp_kv_cache_interleave_size", 1),
     )
+    settings = _long_context_settings(vllm_config)
+    if settings is not None and settings.main_kv_placement == "host":
+        geometry = replace(
+            geometry,
+            index_bytes_per_block=sum(_long_context_index_strides(layout, geometry)),
+            logical_index_bytes_per_block=sum(layout.compressed_page_sizes),
+        )
+    return geometry
+
+
+def _long_context_index_strides(
+    layout: _CSALinearTensorLayout, geometry: LongContextGeometry
+) -> list[int]:
+    from vllm.v1.attention.kv_cache_view import padded_page_stride
+
+    # QSA's side-cache builder uses physical block tables: one kernel page
+    # per stored index page. The binder validates any requested subdivision
+    # again before binding views. FP16 index and ring require two-byte strides.
+    return [
+        padded_page_stride(
+            page,
+            geometry.hot_slot_bytes // geometry.hot_layers,
+            element_bytes=2,
+        )
+        for page in layout.compressed_page_sizes
+    ]
 
 
 def _plan_long_context_kv(
@@ -3413,6 +3444,17 @@ def _check_host_main_kv(
     import torch
 
     from vllm.v1.kv_cache_interface import KVQuantMode
+
+    transfer = getattr(vllm_config, "kv_transfer_config", None)
+    if (
+        transfer is None
+        or transfer.kv_connector != "OffloadingConnector"
+        or getattr(transfer, "kv_connector_module_path", None) is not None
+    ):
+        raise ValueError(
+            "Host main K/V requires the built-in OffloadingConnector for "
+            "state/draft prefix transfers."
+        )
 
     for group in kv_cache_groups:
         spec = group.kv_cache_spec
@@ -3483,11 +3525,17 @@ def get_long_context_kv_cache_config(
                     num_blocks=num_state,
                 )
             )
+    index_strides = (
+        layout.compressed_page_sizes
+        if plan.main_kv_on_gpu
+        else _long_context_index_strides(layout, plan.geometry)
+    )
     tensors.extend(
         KVCacheTensor(
-            size=layout.compressed_page_sizes[index] * num_history,
+            size=index_strides[index] * num_history,
             shared_by=[compressed_name, layout.compressor_state_names[index]],
             num_blocks=num_history,
+            page_stride_bytes=None if plan.main_kv_on_gpu else index_strides[index],
         )
         for index, compressed_name in enumerate(layout.compressed_names)
     )

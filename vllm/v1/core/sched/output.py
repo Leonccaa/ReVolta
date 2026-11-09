@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from vllm.multimodal.inputs import MultiModalFeatureSpec
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
+    from vllm.v1.kv_offload.host.page_table import HostKVStep
     from vllm.v1.request import Request
     from vllm.v1.spec_decode.ddtree_payload import DDTreeDraftPayload
 else:
@@ -27,6 +28,7 @@ else:
     SamplingParams = object
     DDTreeDraftPayload = object
     Request = object
+    HostKVStep = object
 
 
 @dataclass
@@ -256,6 +258,8 @@ class SchedulerOutput:
     # {request_id: [(group_id, block_id, boundary_tokens), ...]}.
     # Scheduler-local; cleared after connector metadata is built.
     boundary_state_offloads: dict[str, list[tuple[int, int, int]]] | None = None
+
+    host_kv: "HostKVStep | None" = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

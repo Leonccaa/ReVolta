@@ -311,6 +311,7 @@ def _capacity_geometry(geometry: dict[str, Any]):
     fields = dict(geometry)
     legacy_layers = fields.pop("main_kv_layers", None)
     fields.setdefault("hot_layers", legacy_layers or 1)
+    fields.setdefault("hot_read_rows", None)  # Older receipts used slot-sized scratch.
     constructor_fields = {
         field.name for field in dataclasses.fields(LongContextGeometry)
     }
@@ -335,15 +336,34 @@ def hot_bytes_for_groups(
 
 def rows_per_pass(geometry: dict[str, Any], hot_groups: int, max_num_seqs: int) -> int:
     """Query rows of one host gather pass (``HostHistoryShape.rows_per_pass``)."""
-    return (hot_groups - max_num_seqs * HOT_TAIL_GROUPS) // int(
+    bound = (hot_groups - max_num_seqs * HOT_TAIL_GROUPS) // int(
         geometry["hot_row_groups"]
     )
+    cap = geometry.get("hot_read_rows")
+    if cap is not None:
+        length = int(geometry["max_model_len"])
+        dcp = int(geometry.get("dcp_world_size", 1))
+        il = int(geometry.get("dcp_interleave", 1))
+        local = length // (dcp * il) * il + min(length % (dcp * il), il)
+        groups = (local + 3) // 4
+        if groups <= int(geometry["hot_row_groups"]) + HOT_TAIL_GROUPS:
+            tail = min(groups, HOT_TAIL_GROUPS)
+            if hot_groups >= groups * max_num_seqs:
+                return int(cap)
+            bound = (hot_groups - max_num_seqs * tail) // max(groups - tail, 1)
+    return bound if cap is None else min(int(cap), bound)
 
 
 def host_metadata_bytes_per_block(geometry: dict[str, Any]) -> int:
     """GPU bytes the host store keeps per history block ID (hot-group map of
     every layer, shared wanted map, readiness bytes, generation)."""
-    return _capacity_geometry(geometry).host_metadata_bytes_per_block
+    reported = geometry.get("host_metadata_bytes_per_block")
+    if reported is not None:
+        return int(reported)
+    current = _capacity_geometry(geometry).host_metadata_bytes_per_block
+    # page ownership receipts carry the logical host index field. Earlier raw geometries
+    # predate the device page_of table and retain their original byte bill.
+    return current if "logical_index_bytes_per_block" in geometry else current - 4
 
 
 def hot_pool_gib_for_rows(
@@ -352,6 +372,9 @@ def hot_pool_gib_for_rows(
     """Smallest ``hot_pool_gib`` (1/1024 GiB steps) whose gather pass holds
     ``rows`` query rows: with ``rows >= max_num_batched_tokens`` every step
     runs in one pass, i.e. with the GPU placement's split-K plan."""
+    cap = geometry.get("hot_read_rows")
+    if cap is not None and rows > cap:
+        raise ValueError(f"Requested {rows} rows exceed host-history R_cap={cap}")
     need = rows * int(geometry["hot_row_groups"]) + max_num_seqs * HOT_TAIL_GROUPS
     gib = (
         math.ceil(hot_bytes_for_groups(geometry, need, max_num_seqs) * 1024 / GIB)
@@ -749,7 +772,7 @@ LOG_PATTERNS = {
     "graph_capture": re.compile(r"Graph capturing finished"),
     "kv_cache_size": re.compile(r"GPU KV cache size: ([0-9,]+) tokens"),
     "block_size": re.compile(r"Setting attention block size to (\d+) tokens"),
-    "host_store": re.compile(r"Long-context main K/V in host memory"),
+    "host_store": re.compile(r"Long-context (?:main K/V in host memory|host memory)"),
 }
 
 
@@ -910,12 +933,15 @@ def _host_store_checks(
         )
     )
     workers = int(geometry.get("num_workers") or 1)
+    physical_pages = store.get("physical_host_pages", store["num_blocks"])
+    shared_host_bytes = store.get("shared_host_bytes", store["host_bytes"] * workers)
     pages_ok = (
         store["num_blocks"] == history_n
         and store["num_blocks"] <= plan["host_history_blocks"]
         and store["page_bytes"] == int(geometry["main_kv_bytes_per_block"])
-        and store["host_bytes"] == store["num_blocks"] * store["page_bytes"]
-        and store["host_bytes"] * workers <= plan["host_pool_bytes"]
+        and physical_pages <= plan["host_history_blocks"]
+        and store["host_bytes"] == physical_pages * store["page_bytes"]
+        and shared_host_bytes <= plan["host_pool_bytes"]
     )
     checks.append(
         check(
@@ -1210,7 +1236,7 @@ def _plan_dict(plan: Any) -> dict[str, Any] | None:
 
 
 # Host store tensors the capacity plan charges per history block.
-_HOST_STORE_PLANNED = ("group_to_slot", "wanted", "ready", "generation")
+_HOST_STORE_PLANNED = ("group_to_slot", "wanted", "ready", "generation", "page_of")
 
 
 def _host_store_dict(
@@ -1225,7 +1251,11 @@ def _host_store_dict(
         return tensor.numel() * tensor.element_size()
 
     shape = store.shape
-    planned = sum(nbytes(getattr(store, name)) for name in _HOST_STORE_PLANNED)
+    planned = sum(
+        nbytes(getattr(store, name))
+        for name in _HOST_STORE_PLANNED
+        if hasattr(store, name)
+    )
     skip = {"host", "host_device", "hot", *_HOST_STORE_PLANNED}
     other = {
         name: nbytes(value)
@@ -1254,6 +1284,12 @@ def _host_store_dict(
         "dtype": str(shape.dtype),
         "page_bytes": shape.page_bytes,
         "host_bytes": nbytes(store.host),
+        "physical_host_pages": store.host.shape[0],
+        **(
+            {"shared_host_bytes": store.region.total_size_bytes}
+            if getattr(store, "region", None) is not None
+            else {}
+        ),
         "host_pinned": pinned,
         "metadata_bytes": planned,
         "hot_slots": shape.hot_slots,
@@ -1676,12 +1712,29 @@ class QSARouteProbe:
             rows = int(selection.shape[0])
             step = int(layer.rows_per_pass)
             passes = -(-rows // step) if rows else 0
+            # New planners and fixed single-pass decode can differ from the
+            # conservative diagnostic rows_per_pass. Count actual callbacks.
+            attend = args[3] if len(args) >= 4 else kwargs.get("attend")
+            if callable(attend):
+                passes, step = 0, 0
+
+                def counted(start: int, end: int, hot_ids: Any) -> Any:
+                    nonlocal passes, step
+                    passes += 1
+                    step = max(step, end - start)
+                    return attend(start, end, hot_ids)
+
+                if len(args) >= 4:
+                    args = (*args[:3], counted, *args[4:])
+                else:
+                    kwargs["attend"] = counted
+            result = original(layer, selection, *args, **kwargs)
             stats["host_steps"] += 1
             stats["host_multi_pass_steps"] += int(passes > 1)
             stats["host_max_passes"] = max(stats["host_max_passes"], passes)
             stats["host_max_rows"] = max(stats["host_max_rows"], rows)
             stats["host_rows_per_pass"] = step
-            return original(layer, selection, *args, **kwargs)
+            return result
 
         return for_each_pass
 

@@ -70,15 +70,18 @@ def _persistent_kv_tensors(kv_cache_config):
     a unified cache. Only the new field's absent/default value is omitted.
     """
     tensors = kv_cache_config.kv_cache_tensors
-    if getattr(kv_cache_config, "block_segments", None) is not None:
-        return tensors
+    absent_fields = {"page_stride_bytes"}
+    if getattr(kv_cache_config, "block_segments", None) is None:
+        absent_fields.add("num_blocks")
     normalized = []
     for tensor in tensors:
         type_name, items = normalize_value(tensor)
         normalized.append(
             (
                 type_name,
-                tuple((k, v) for k, v in items if k != "num_blocks" or v is not None),
+                tuple(
+                    (k, v) for k, v in items if k not in absent_fields or v is not None
+                ),
             )
         )
     return normalized

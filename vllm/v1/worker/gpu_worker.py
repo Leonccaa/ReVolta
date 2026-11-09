@@ -9,7 +9,7 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import deepcopy
 from datetime import timedelta
 from types import NoneType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import regex as re
@@ -1537,6 +1537,15 @@ class Worker(WorkerBase):
         # Reset state
         self._weight_update_active = False
         self._is_checkpoint_format = True
+
+    def drain_host_kv(self):
+        """Control RPC. All ranks acknowledge before any executor teardown."""
+        try:
+            output = cast(Any, self.model_runner).kv_connector.drain_host_kv()
+            torch.accelerator.synchronize()
+            return self.rank, output, None
+        except Exception as error:
+            return self.rank, None, repr(error)
 
     def shutdown(self) -> None:
         # Undo the freeze from compile_or_warm_up_model so that objects

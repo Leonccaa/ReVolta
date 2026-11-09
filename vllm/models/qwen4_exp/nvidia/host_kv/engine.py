@@ -83,6 +83,25 @@ def build_host_history_store(
     widths = {layer.indexer.output_width for layer in layers}
     if len(widths) != 1:
         raise RuntimeError("Host main K/V layers need one selection width")
+    from vllm.config.compilation import CUDAGraphMode
+
+    from .planning import validate_graph_capacity
+
+    # MRv2 resolves/rounds the actual graph sizes before binding this store.
+    # Check that collection, not just max_num_seqs * verify width.
+    compilation = getattr(vllm_config, "compilation_config", None)
+    mode = getattr(compilation, "cudagraph_mode", None) or CUDAGraphMode.NONE
+    read_rows = plan.geometry.hot_read_rows
+    assert read_rows is not None
+    validate_graph_capacity(
+        read_rows,
+        (getattr(compilation, "cudagraph_capture_sizes", None) or ())
+        if mode.decode_mode() == CUDAGraphMode.FULL
+        else (),
+        vllm_config.scheduler_config.max_num_seqs,
+        plan.geometry.decode_rows_per_request,
+        mixed_full=mode.mixed_mode() == CUDAGraphMode.FULL,
+    )
     shape = HostHistoryShape(
         num_blocks=kv_cache_config.num_blocks,
         kernel_blocks_per_block=storage_block // kernel_block,
@@ -103,6 +122,9 @@ def build_host_history_store(
         # One claim per selected column: robust to any selection layout; the
         # per-group claim (host KV pool perf) is an optimization left for GPU tuning.
         qsa_group_columns=0,
+        read_rows=read_rows,
+        max_context_tokens=plan.geometry.max_model_len,
+        decode_rows=plan.geometry.decode_rows_per_request,
     )
     # Check before allocating (and again before publishing layer bindings).
     fixed_bytes = sum(shape.fixed_device_memory_bytes().values())
@@ -111,7 +133,17 @@ def build_host_history_store(
             f"Host history fixed allocations need {fixed_bytes} device bytes, "
             f"exceeding the hot-pool reservation {plan.gpu_hot_pool_bytes}"
         )
-    store = HostHistoryStore(shape, names, device=device)
+    from vllm.distributed import get_world_group
+    from vllm.v1.kv_offload.host.region import host_region_layout
+
+    layout = host_region_layout(kv_cache_config, vllm_config.instance_id)
+    store = HostHistoryStore(
+        shape,
+        names,
+        device=device,
+        region_layout=layout,
+        rank=get_world_group().rank_in_group,
+    )
     if store.fixed_device_memory_bytes() != shape.fixed_device_memory_bytes():
         raise ValueError(
             "Host history fixed allocation accounting differs from its shape"
@@ -119,12 +151,15 @@ def build_host_history_store(
     for name, layer in zip(names, layers):
         layer.host_history = store.layer(name)
     logger.info(
-        "Long-context main K/V in host memory: %d history blocks x %d layers "
-        "(%.2f GiB pinned on this worker), hot pool %d groups per layer, %d "
+        "Long-context host memory: %d physical pages, %d history IDs, %d layers "
+        "(%.2f GiB logical shard, %.2f GiB registered region), "
+        "hot pool %d groups per layer, %d "
         "query rows per gather pass.",
+        layout.num_pages,
         shape.num_blocks,
         shape.num_layers,
-        shape.num_blocks * shape.page_bytes / (1 << 30),
+        layout.num_pages * layout.worker_bytes / (1 << 30),
+        layout.num_pages * layout.worker_bytes * layout.num_workers / (1 << 30),
         shape.hot_slots,
         shape.rows_per_pass,
     )

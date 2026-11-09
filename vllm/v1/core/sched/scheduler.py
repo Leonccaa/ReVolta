@@ -2589,13 +2589,13 @@ class Scheduler(SchedulerInterface):
 
             # Check for stop and update request status.
             if new_token_ids:
-                if self.store_metrics is not None:
-                    state = request.store_attempt
-                    if state is None or not state.first_token:
-                        self.store_metrics.first_token(request, time.monotonic())
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids
                 )
+                if new_token_ids and self.store_metrics is not None:
+                    state = request.store_attempt
+                    if state is None or not state.first_token:
+                        self.store_metrics.first_token(request, time.monotonic())
                 if stopped and request.resumable:
                     self._end_streaming_turn(request, status_before_stop)
             elif request.pooling_params and pooler_output is not None:

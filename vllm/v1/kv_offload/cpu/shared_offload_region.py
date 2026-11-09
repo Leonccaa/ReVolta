@@ -56,6 +56,7 @@ class SharedOffloadRegion:
         self._scheduler_unlink = rank is None
         self._scheduler_only_unlink = scheduler_only_unlink
         # interleaved-layout stride: one row = all workers' data for one block
+        self.worker_bytes = cpu_page_size
         self._row_stride = cpu_page_size * num_workers
         if rank is not None:
             # byte offset to this worker's first slot within each block row
@@ -167,6 +168,28 @@ class SharedOffloadRegion:
         self._worker_offset = new_offset
         self._views.append(worker_layer_view)
         return worker_layer_view
+
+    def create_view_at(self, offset: int, length: int) -> torch.Tensor:
+        """Overlapping kind view at an explicit offset in this rank's frame.
+
+        Does not advance the MAIN/index view cursor and owns no registration.
+        Every component ID indexes the same physical row on every rank.
+        """
+        if self.rank is None or self._base is None:
+            raise ValueError("Kind views require a worker mapping")
+        # _worker_area_end is fixed even after create_next_view advanced the
+        # cursor. Derive the frame width from rank, not that cursor.
+        worker_bytes = self.worker_bytes
+        if offset < 0 or length <= 0 or offset + length > worker_bytes:
+            raise ValueError("Kind view exceeds its unified frame")
+        view = torch.as_strided(
+            self._base,
+            size=(self.num_blocks, length),
+            stride=(self._row_stride, 1),
+            storage_offset=self.rank * worker_bytes + offset,
+        )
+        self._views.append(view)
+        return view
 
     def create_kv_memoryview(self) -> memoryview:
         """Return a zero-copy memoryview over the entire KV buffer.

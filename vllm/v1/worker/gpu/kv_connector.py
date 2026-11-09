@@ -178,6 +178,13 @@ class ActiveKVConnector(KVConnector):
             compute_failed = 0 if self._host_sealed else rank
             seal_failed = rank if self._host_seal_failed else compute_failed
             meta.seal_results[ticket] = (rank, seal_failed, compute_failed)
+            payloads = getattr(self._host_store, "index_payloads", None)
+            if not seal_failed and isinstance(payloads, list):
+                meta.seal_bytes[ticket] = {
+                    get_world_group().rank_in_group: sum(
+                        p.shape[1] * p.element_size() for p in payloads
+                    )
+                }
         meta.completed_steps[step.step] = rank
         shadow = getattr(getattr(self, "_host_store", None), "shadow", None)
         if shadow is not None:

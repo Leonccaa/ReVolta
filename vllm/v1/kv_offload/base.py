@@ -365,6 +365,14 @@ class CanonicalKVCacheRef:
     # The un-padded page size per block in bytes
     page_size_bytes: int
 
+    # Optional worker ABI details used by long-context unified views.
+    subdivision: int = 1
+    dtypes: tuple[str, ...] = ()
+    scale: str = "none"
+    # Logical Mamba state tensors inside the transferred physical prefix.
+    member_offsets: tuple[int, ...] = ()
+    member_lengths: tuple[int, ...] = ()
+
 
 @dataclass
 class CanonicalKVCaches:

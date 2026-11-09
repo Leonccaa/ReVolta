@@ -53,6 +53,7 @@ def build(
     reserve_full_isl: bool = False,
     speculative_tokens: int = 0,
     async_scheduling: bool = False,
+    with_connector: bool = False,
 ):
     config = make_config(
         max_model_len=MAX_MODEL_LEN, speculative_tokens=speculative_tokens
@@ -72,7 +73,9 @@ def build(
             config.kv_transfer_config = KVTransferConfig(
                 kv_connector="OffloadingConnector",
                 kv_role="kv_both",
-                kv_connector_extra_config={"cpu_bytes_to_use": 4 * GiB},
+                # This fixture disables the connector below. There is no
+                # second physical CPU backing to merge into its HOST budget.
+                kv_connector_extra_config={},
             )
     specs = production_specs(
         speculative_blocks=speculative_tokens, drafter=bool(speculative_tokens)
@@ -91,11 +94,17 @@ def build(
         settings is not None
         and settings.enabled
         and settings.main_kv_placement == "host"
+        and not with_connector
     ):
         # Exercise D-A at startup, then keep this scheduler-only fixture's
         # original scope. Its fake step has no worker to complete real I/O;
         # connector transfer/retirement is covered by connector unit tests.
         scheduler.connector = None
+        table = scheduler.host_history_pool.host_pages
+        if table.reservation_ledger is not None:
+            table.committed_reserve = table.reservation_ledger._external
+            table.reservation_ledger = None
+            table.value_policy = None
     return scheduler
 
 

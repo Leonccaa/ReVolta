@@ -402,6 +402,10 @@ class LongContextKVConfig:
 
     enabled: bool = False
     """Turn on long-context mode; every other field is inert while False."""
+    host_store_gib: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    """Unified host budget across MAIN, STATE and DRAFT, summed over workers.
+    Includes ZERO_PAGE and build reservations. Mutually exclusive with the
+    legacy host_pool_gib/host_pool_tokens and connector cpu_bytes_to_use."""
     host_pool_gib: float | None = Field(default=None, gt=0)
     """Host history pool for the main QSA K/V, in GiB summed over all workers
     (like ``kv_offloading_size``). Exactly one of this and
@@ -471,10 +475,20 @@ class LongContextKVConfig:
         """Reject contradictory sizes; called only when the mode is enabled."""
         if not self.enabled:
             return
-        if (self.host_pool_gib is None) == (self.host_pool_tokens is None):
+        if (
+            sum(
+                x is not None
+                for x in (
+                    self.host_store_gib,
+                    self.host_pool_gib,
+                    self.host_pool_tokens,
+                )
+            )
+            != 1
+        ):
             raise ValueError(
-                "kernel_config.long_context_kv needs exactly one of host_pool_gib "
-                "and host_pool_tokens when enabled."
+                "kernel_config.long_context_kv needs exactly one of host_store_gib, "
+                "host_pool_gib and host_pool_tokens when enabled."
             )
         if self.hot_pool_gib is not None and self.hot_pool_ratio is not None:
             raise ValueError(
@@ -735,6 +749,10 @@ class KernelConfig:
                     item
                     for item in items
                     if item[0] not in ("value_arbitration", "value_arbiter_settings")
+                    and not (
+                        item[0] == "host_store_gib"
+                        and self.long_context_kv.host_store_gib is None
+                    )
                 ),
             )
         factors["ir_op_priority"] = self.ir_op_priority.compute_hash()

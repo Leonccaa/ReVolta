@@ -355,7 +355,9 @@ def test_gpu_auto_keeps_physical_history_and_only_budgets_hot_admission():
 
 
 def test_auto_still_requires_a_manually_sized_host_pool():
-    with pytest.raises(ValueError, match="exactly one of host_pool_gib"):
+    with pytest.raises(
+        ValueError, match="exactly one of (?:host_store_gib, )?host_pool_gib"
+    ):
         LongContextKVConfig(enabled=True, hot_pool_gib="auto").validate_settings()
     with pytest.raises(ValueError, match="at most one of"):
         LongContextKVConfig(
@@ -455,9 +457,13 @@ def test_startup_suggestion_values_round_trip():
 def test_settings_validation():
     LongContextKVConfig().validate_settings()  # disabled: nothing required
     LongContextKVConfig(hot_pool_gib=1, hot_pool_ratio=0.1).validate_settings()
-    with pytest.raises(ValueError, match="exactly one of host_pool_gib"):
+    with pytest.raises(
+        ValueError, match="exactly one of (?:host_store_gib, )?host_pool_gib"
+    ):
         LongContextKVConfig(enabled=True).validate_settings()
-    with pytest.raises(ValueError, match="exactly one of host_pool_gib"):
+    with pytest.raises(
+        ValueError, match="exactly one of (?:host_store_gib, )?host_pool_gib"
+    ):
         LongContextKVConfig(
             enabled=True, host_pool_gib=1, host_pool_tokens=SPAN
         ).validate_settings()

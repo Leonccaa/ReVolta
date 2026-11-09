@@ -48,7 +48,7 @@ pytestmark = pytest.mark.cpu_test
 @pytest.mark.parametrize("grouped", [False, True])
 @pytest.mark.parametrize("padded", [False, True])
 def test_host_transfer_registration_and_real_cpu_budget(
-    monkeypatch, tiering, grouped, padded
+    monkeypatch, request, tiering, grouped, padded
 ):
     config = production_config(
         max_model_len=4 * SPAN,
@@ -67,8 +67,8 @@ def test_host_transfer_registration_and_real_cpu_budget(
         kv_connector="OffloadingConnector",
         kv_connector_extra_config={"cpu_bytes_to_use": 4 << 30},
     )
-    # Without the drafter every cacheable group's span is SPAN, enabling
-    # grouped backing. With it the unpartitioned S1 path is exercised.
+    # Preserve both legacy input geometries (with/without drafter). Long
+    # context now uses the same unified backing instead of grouped pools.
     (cfg,) = get_kv_cache_configs(
         config, [production_specs(drafter=not grouped)], [int(6.05 * (1 << 30))]
     )
@@ -90,6 +90,11 @@ def test_host_transfer_registration_and_real_cpu_budget(
             for t in cfg.kv_cache_tensors
         ]
     cfg.num_blocks = 2
+    from vllm.v1.kv_offload.host.region import HostRegionOwner, host_region_layout
+
+    layout = replace(host_region_layout(cfg, config.instance_id), num_pages=2)
+    cfg._host_region_layout = layout
+    request.addfinalizer(HostRegionOwner(layout).cleanup)
     store = HostHistoryStore(
         HostHistoryShape(
             num_blocks=2,
@@ -106,13 +111,17 @@ def test_host_transfer_registration_and_real_cpu_budget(
         ),
         cfg.host_kv_layers,
         device="cpu",
+        region_layout=layout,
+        rank=3,
     )
+    request.addfinalizer(store.close)
     config.compilation_config = SimpleNamespace(
         static_forward_context={
             name: SimpleNamespace(host_history=store.layer(name))
             for name in cfg.host_kv_layers
         }
     )
+    request.addfinalizer(config.compilation_config.static_forward_context.clear)
     if tiering and grouped:
         config.parallel_config.prefill_context_parallel_size = 1
         config.parallel_config.nnodes = 1
@@ -121,7 +130,8 @@ def test_host_transfer_registration_and_real_cpu_budget(
         config.compute_hash = lambda: "cpu-host-fixture"
     cls = TieringOffloadingSpec if tiering else CPUOffloadingSpec
     spec = cls(config, cfg)
-    assert spec.partition_by_group is grouped
+    assert not spec.partition_by_group
+    assert spec.unified_host and spec.num_blocks == 2
     specs = _layer_specs(cfg)
     caches = {name: torch.empty(0) for name in cfg.host_kv_layers}
     for tensor in cfg.kv_cache_tensors:
@@ -148,7 +158,7 @@ def test_host_transfer_registration_and_real_cpu_budget(
     assert cfg.host_kv_group_id not in spec.cpu_group_page_sizes
     required = (
         sum(t.page_size_bytes for t in canonical.tensors) * spec.block_size_factor
-        if not grouped
+        if not spec.partition_by_group
         else sum(spec.cpu_group_page_sizes.values())
     )
     config.kv_transfer_config.kv_connector_extra_config["cpu_bytes_to_use"] = (
@@ -162,24 +172,29 @@ def test_host_transfer_registration_and_real_cpu_budget(
         "SingleDirectionOffloadingHandler",
         lambda **kw: SimpleNamespace(**kw),
     )
+    # Worker registration supplies the owner mapping, never an independent
+    # allocation from cpu_bytes_to_use. The second spec tests the same ABI.
+    spec.unified_region = store.region
     handlers = spec.create_handlers(canonical)
+    request.addfinalizer(handlers.gpu_to_cpu_handler.cpu_tensors.clear)
+    request.addfinalizer(handlers.cpu_to_gpu_handler.cpu_tensors.clear)
     cpu = handlers.gpu_to_cpu_handler.cpu_tensors
     assert spec.cpu_page_size_per_worker == required
-    assert sum(t.numel() for t in cpu) * 4 <= required * 4 + 123
+    assert handlers._mmap_region is None
+    assert spec.unified_region is store.region
+    assert sum(t.numel() for t in cpu) * 4 <= store.region.total_size_bytes
+    assert spec.unified_frame_bytes * spec.num_blocks == store.region.total_size_bytes
+    cursor = 0
+    for tensor in cpu:
+        assert tensor.data_ptr() == store.host.data_ptr() + cursor
+        assert tensor.stride(0) == spec.unified_frame_bytes
+        cursor += tensor.shape[1]
     if tiering:
         assert (
             spec.persistent_layout["host_main_kv"]["page_bytes"]
             == store.shape.page_bytes
         )
-        regions = (
-            list(handlers.gpu_to_cpu_handler.group_mmap_regions.values())
-            if grouped
-            else [handlers._mmap_region]
-        )
-        handlers.gpu_to_cpu_handler.cpu_tensors.clear()
-        handlers.cpu_to_gpu_handler.cpu_tensors.clear()
-        for region in regions:
-            region.cleanup()
+        assert not handlers.gpu_to_cpu_handler.group_mmap_regions
 
 
 def _streams(monkeypatch):

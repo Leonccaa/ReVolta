@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """page ownership physical ownership, late receipts and retirement without CUDA."""
 
+from collections import Counter
 from dataclasses import replace
 
 import pytest
@@ -50,12 +51,18 @@ def test_rank_dedup_and_gap_free_watermark():
     "state", [PageState.PRIVATE, PageState.READY, PageState.SHADOW]
 )
 def test_s1_write_s3_read_cancel_waits_for_reader_retirement(state):
-    table = HostPageTable(2)
+    table = HostPageTable(3 if state == PageState.SHADOW else 2)
+    if state == PageState.SHADOW:
+        # Keep the canonical page bound so only the duplicate can be recycled.
+        canonical = private(table, hid=2)
+        ready(table, canonical, hid=2)
     handle = private(table)
-    if state == PageState.READY:
+    if state in (PageState.READY, PageState.SHADOW):
         ready(table, handle)
-    else:
-        table.get(handle).state = state
+    assert table.get(handle).state == state
+    assert Counter(table.state_counts) == Counter(
+        page.state for page in table.pages[1:]
+    )
     table.complete_step(1, 1)
     table.complete_step(2, 1)
     table.unbind(handle, 1, 1, last_use=3)
@@ -64,9 +71,15 @@ def test_s1_write_s3_read_cancel_waits_for_reader_retirement(state):
     assert table.reserve(loading_key=key(2)) is None
     assert table.get(handle).retirements[0].retire_after == 3
     table.complete_step(3, 1)
+    assert Counter(table.state_counts) == Counter(
+        page.state for page in table.pages[1:]
+    )
     replacement = table.reserve(loading_key=key(2))
     assert replacement.page_id == handle.page_id
     assert replacement.epoch == handle.epoch + 1
+    assert Counter(table.state_counts) == Counter(
+        page.state for page in table.pages[1:]
+    )
 
 
 def test_hid_reuse_preserves_old_page_retirement_and_epoch_rejects_late_seal():

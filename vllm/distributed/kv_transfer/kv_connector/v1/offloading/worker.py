@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import defaultdict
 from dataclasses import replace
+from math import prod
 from typing import TYPE_CHECKING
 
 import torch
@@ -53,6 +54,8 @@ class OffloadingConnectorWorker:
         self.kv_connector_stats = OffloadingConnectorStats()
         # job_id -> req_id for in-flight loads.
         self._load_jobs: dict[int, ReqId] = {}
+        self._unified_generations: dict[int, int] = {}
+        self._unified_payload_bytes: dict[int, dict[str, int]] = {}
         self._unsubmitted_store_jobs: list[tuple[int, TransferSpec]] = []
         self._connector_worker_meta = OffloadingWorkerMetadata()
         self._failed_submissions: set[int] = set()
@@ -114,6 +117,9 @@ class OffloadingConnectorWorker:
         unpadded_page_size_bytes: dict[str, int] = {}
         # layer_name -> size of page in bytes
         page_size_bytes: dict[str, int] = {}
+        abi: dict[
+            str, tuple[int, tuple[str, ...], str, tuple[int, ...], tuple[int, ...]]
+        ] = {}
         for kv_cache_group in self.spec.kv_cache_config.kv_cache_groups:
             group_layer_names = kv_cache_group.layer_names
             group_kv_cache_spec = kv_cache_group.kv_cache_spec
@@ -194,6 +200,51 @@ class OffloadingConnectorWorker:
                 else:
                     raise NotImplementedError
 
+        if getattr(self.spec, "unified_host", False):
+            for group in self.spec.kv_cache_config.kv_cache_groups:
+                sizes = group.kv_cache_spec
+                for name in group.layer_names:
+                    if name not in tensors_per_block:
+                        continue
+                    size = (
+                        sizes.kv_cache_specs[name]
+                        if isinstance(sizes, UniformTypeKVCacheSpecs)
+                        else sizes
+                    )
+                    raw = kv_caches[name]
+                    if isinstance(raw, list):
+                        abi[name] = (
+                            1,
+                            tuple(str(t.dtype) for t in raw),
+                            "none",
+                            tuple(t.storage_offset() * t.element_size() for t in raw),
+                            tuple(prod(t.shape[1:]) * t.element_size() for t in raw),
+                        )
+                    else:
+                        blocks = layer_num_blocks.get(name, num_blocks)
+                        # Registered physical owners cover all interleaved
+                        # kernel subdivisions, including packed members.
+                        rows = (
+                            raw.shape[1]
+                            if raw.ndim == 5 and raw.shape[0] == 2
+                            else raw.shape[0]
+                            if raw.ndim >= 3
+                            else blocks
+                        )
+                        subdivision = (
+                            rows // blocks
+                            if rows >= blocks and rows % blocks == 0
+                            else 1
+                        )
+                        mode = getattr(size, "kv_quant_mode", None)
+                        abi[name] = (
+                            subdivision,
+                            (str(raw.dtype),),
+                            getattr(mode, "name", "none"),
+                            (0,),
+                            (unpadded_page_size_bytes[name],),
+                        )
+
         block_tensors: list[CanonicalKVCacheTensor] = []
         block_data_refs: dict[str, list[CanonicalKVCacheRef]] = defaultdict(list)
         for kv_cache_tensor in self.spec.kv_cache_config.kv_cache_tensors:
@@ -237,6 +288,15 @@ class OffloadingConnectorWorker:
                         CanonicalKVCacheRef(
                             tensor_idx=curr_tensor_idx,
                             page_size_bytes=(unpadded_page_size_bytes[layer_name]),
+                            subdivision=abi.get(layer_name, (1, (), "none", (), ()))[0],
+                            dtypes=abi.get(layer_name, (1, (), "none", (), ()))[1],
+                            scale=abi.get(layer_name, (1, (), "none", (), ()))[2],
+                            member_offsets=abi.get(layer_name, (1, (), "none", (), ()))[
+                                3
+                            ],
+                            member_lengths=abi.get(layer_name, (1, (), "none", (), ()))[
+                                4
+                            ],
                         )
                     )
 
@@ -262,6 +322,11 @@ class OffloadingConnectorWorker:
                 raise ValueError("Host main K/V must belong to one transfer group")
             (self._host_group_id,) = group_ids
             self._host_history = store
+            if getattr(self.spec, "unified_host", False):
+                from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
+
+                assert isinstance(self.spec, CPUOffloadingSpec)
+                self.spec.unified_region = store.region
             self._host_index_views = [
                 kv_caches[name]
                 for name in self.spec.kv_cache_config.kv_cache_groups[
@@ -348,12 +413,35 @@ class OffloadingConnectorWorker:
         self._unsubmitted_store_jobs.clear()
 
         for job_id, entry in metadata.load_jobs.items():
+            if entry.generation is not None:
+                self._remember_unified_job(job_id, entry)
             self._load_jobs[job_id] = entry.req_id
             source = entry.transfer_spec[0]
             if isinstance(source, HostReceiveSpec):
                 self._receive_attempts[job_id] = source.txn.attempt_id
                 self._host_load_blocks[job_id] = [e.hid for e in source.txn.new_loads]
             self._submit_transfer(job_id, entry.transfer_spec)
+
+    def _remember_unified_job(self, job_id, entry) -> None:
+        from vllm.v1.kv_cache_interface import MambaSpec, UniformTypeKVCacheSpecs
+        from vllm.v1.kv_offload.base import GPULoadStoreSpec
+        from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
+
+        assert isinstance(self.spec, CPUOffloadingSpec)
+        assert self.spec._handlers is not None
+        self._unified_generations[job_id] = entry.generation
+        gpu = next(s for s in entry.transfer_spec if isinstance(s, GPULoadStoreSpec))
+        amounts: dict[str, int] = {}
+        for desc in self.spec._handlers.transfer_layout:
+            group = self.spec.kv_cache_config.kv_cache_groups[desc.group]
+            spec = group.kv_cache_spec
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                spec = next(iter(spec.kv_cache_specs.values()))
+            kind = "state" if isinstance(spec, MambaSpec) else "draft"
+            amounts[kind] = (
+                amounts.get(kind, 0) + desc.length * gpu.group_sizes[desc.group]
+            )
+        self._unified_payload_bytes[job_id] = amounts
 
     def _submit_transfer(self, job_id: int, transfer_spec: TransferSpec) -> None:
         try:
@@ -382,6 +470,8 @@ class OffloadingConnectorWorker:
 
     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
         for job_id, entry in metadata.store_jobs.items():
+            if entry.generation is not None:
+                self._remember_unified_job(job_id, entry)
             # NOTE(orozery): defer the store to the beginning of the next
             # engine step, so that offloading starts AFTER transfers related
             # to token sampling, thereby avoiding delays to token generation.
@@ -445,7 +535,9 @@ class OffloadingConnectorWorker:
                 )
 
             self._connector_worker_meta.mark_completed(job_id)
-            self._receive_receipt(job_id, transfer_result.success)
+            self._receive_receipt(
+                job_id, transfer_result.success, transfer_result.transfer_size
+            )
             req_id = self._load_jobs.pop(job_id, None)
             if req_id is not None:
                 finished_recving.add(req_id)
@@ -463,7 +555,33 @@ class OffloadingConnectorWorker:
 
         return set(), finished_recving
 
-    def _receive_receipt(self, job_id: int, success: bool) -> None:
+    def _receive_receipt(
+        self, job_id: int, success: bool, nbytes: int | None = None
+    ) -> None:
+        generation = getattr(self, "_unified_generations", {}).pop(job_id, None)
+        if generation is not None:
+            from vllm.distributed import get_world_group
+
+            rank = get_world_group().rank_in_group
+            mask = 1 << rank
+            amounts = self._unified_payload_bytes.pop(job_id, {})
+            if nbytes is not None and success:
+                # The completed copy count proves these bytes. G0 index H2D
+                # is the remainder added by HostReceiveHandler; host UVA
+                # traffic is not included. Failed partial DMA stays unknown.
+                expected = sum(amounts.values())
+                if amounts and expected <= nbytes:
+                    amounts["main"] = nbytes - expected
+                else:
+                    amounts = {"unknown": nbytes}
+                for kind, amount in amounts.items():
+                    self._connector_worker_meta.job_bytes[
+                        job_id, generation, rank, kind
+                    ] = amount
+            self._connector_worker_meta.job_results[job_id, generation] = (
+                mask,
+                0 if success else mask,
+            )
         attempt = getattr(self, "_receive_attempts", {}).pop(job_id, None)
         if attempt is None:
             return

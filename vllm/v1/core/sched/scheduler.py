@@ -1715,7 +1715,8 @@ class Scheduler(SchedulerInterface):
                     group_id = host_pool.host_group_id
                     start = sum(gpu.group_sizes[:group_id])
                     end = start + gpu.group_sizes[group_id]
-                    host_pool.track_job(job_id, gpu.block_ids[start:end].tolist())
+                    if end > start:
+                        host_pool.track_job(job_id, gpu.block_ids[start:end].tolist())
             arbiter_epoch = self._value_arbiter_step()
             # Roles after job tracking: an ID with an in-flight transfer is
             # held, never donated to the hot region this step.
@@ -2046,6 +2047,10 @@ class Scheduler(SchedulerInterface):
             )
             assert request.num_in_flight_tokens == 0
         self._pending_preempted_req_ids.add(request.request_id)
+        offload = getattr(self.connector, "connector_scheduler", None)
+        preempt_unified = getattr(offload, "preempt_unified_request", None)
+        if preempt_unified is not None:
+            preempt_unified(request.request_id)
         host_pool = getattr(self, "host_history_pool", None)
         if host_pool is not None:
             host_pool.cancel_scheduled(request.request_id)
@@ -3475,7 +3480,16 @@ class Scheduler(SchedulerInterface):
                 continue
             if page.ticket != ticket:
                 continue
-            pool.host_pages.seal_result(ticket, completed, failed, compute_failed)
+            if ticket in meta.seal_bytes:
+                pool.host_pages.seal_result(
+                    ticket,
+                    completed,
+                    failed,
+                    compute_failed,
+                    dma_bytes=meta.seal_bytes[ticket],
+                )
+            else:
+                pool.host_pages.seal_result(ticket, completed, failed, compute_failed)
             if compute_failed and pool.hgen[ticket.hid] == ticket.hgen:
                 pool.evict_blocks({ticket.hid})
                 if pool.blocks[ticket.hid].ref_cnt == 0:

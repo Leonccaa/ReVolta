@@ -512,6 +512,7 @@ class CpuGpuOffloadingHandlers:
         group_page_sizes: dict[int, int] | None = None,
         group_mmap_regions: dict[int, SharedOffloadRegion] | None = None,
         group_num_blocks: dict[int, int] | None = None,
+        unified_region: SharedOffloadRegion | None = None,
     ):
         gpu_tensors: list[torch.Tensor] = []
         cpu_tensors: list[torch.Tensor] = []
@@ -558,6 +559,14 @@ class CpuGpuOffloadingHandlers:
                 for region in group_mmap_regions.values():
                     pin_mmap_region(region)
 
+            if unified_region is not None:
+                from vllm.v1.kv_offload.unified.layout import transfer_layout
+
+                worker_bytes = unified_region.worker_bytes
+                self.transfer_layout = transfer_layout(
+                    kv_caches, unified_region._row_stride, worker_bytes
+                )
+            kind_offset = 0
             for tensor_idx, kv_cache_tensor in enumerate(kv_caches.tensors):
                 gpu_page_size_bytes = kv_cache_tensor.page_size_bytes
                 gpu_tensor = kv_cache_tensor.tensor.view(torch.int8).view(
@@ -566,7 +575,16 @@ class CpuGpuOffloadingHandlers:
                 cpu_page_size_bytes = gpu_page_size_bytes * block_size_factor
 
                 tensor_region = tensor_regions.get(tensor_idx, mmap_region)
-                if tensor_region is not None:
+                if unified_region is not None:
+                    if not unified_region.is_pinned and pin_memory:
+                        raise ValueError(
+                            "Unified region must be registered by its owner"
+                        )
+                    cpu_tensor = unified_region.create_view_at(
+                        kind_offset, cpu_page_size_bytes
+                    )
+                    kind_offset += cpu_page_size_bytes
+                elif tensor_region is not None:
                     cpu_tensor = tensor_region.create_next_view(cpu_page_size_bytes)
                 else:
                     t0 = time.monotonic()

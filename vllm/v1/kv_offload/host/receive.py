@@ -27,6 +27,15 @@ class ReceiveEntry:
     acquired_ref: bool = True
 
 
+@dataclass(frozen=True)
+class ReceiveComponent:
+    key: bytes
+    handle: PageHandle
+    lease_id: int
+    load_generation: int
+    group: int
+
+
 @dataclass
 class ReceiveTxn:
     attempt_id: int
@@ -36,6 +45,7 @@ class ReceiveTxn:
     completed_ranks: int = 0
     failed_ranks: int = 0
     cancelled: bool = False
+    components: tuple[ReceiveComponent, ...] = ()
 
     def complete(self, completed: int, failed: int, all_ranks: int) -> bool:
         if (completed | failed) & ~all_ranks or failed & ~completed:

@@ -360,6 +360,25 @@ class StoreMetrics:
                     gpu_t_idx=pool.index_cache_target,
                     gpu_hot_capacity_slots=pool.hot_slots(),
                 )
+        from vllm.v1.kv_offload.unified.manager import UnifiedStoreManager
+
+        if isinstance(manager, UnifiedStoreManager):
+            snapshot = manager.snapshot()
+            gauges.update(
+                {
+                    f"unified_{k}": v
+                    for k, v in snapshot.items()
+                    if not k.startswith("dma_")
+                }
+            )
+            totals.update(
+                {f"unified_{k}": v for k, v in snapshot.items() if k.startswith("dma_")}
+            )
+            totals.update({f"unified_{k}": v for k, v in manager.events.items()})
+            totals.update({f"unit_{k}": v for k, v in manager.units.events.items()})
+            totals.update(
+                {f"reservation_{k}": v for k, v in manager.ledger.events.items()}
+            )
         if ledger is not None:
             gauges["gpu_hot_committed_groups"] = ledger.hot_used
         if ssd is not None:

@@ -14,7 +14,7 @@ import heapq
 import os
 import threading
 from collections import OrderedDict
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import ClassVar
@@ -67,6 +67,7 @@ class FileSystemCache:
         self._lock = threading.Lock()
         self._pins: dict[str, int] = {}
         self._writing: set[str] = set()
+        self.loss_listeners: list[Callable[[str], None]] = []
         self._reserved = 0
         self._bytes = 0
         self._pages: OrderedDict[str, int] = OrderedDict()
@@ -108,7 +109,11 @@ class FileSystemCache:
                 os.close(self._lock_fd)
 
     def _forget(self, path: str) -> None:
+        known = path in self._pages
         self._bytes -= self._pages.pop(path, 0)
+        if known and self.loss_listeners and not os.path.exists(path):
+            for listener in self.loss_listeners:
+                listener(path)
 
     def _make_room(self, size: int) -> None:
         def fits() -> bool:
@@ -134,13 +139,20 @@ class FileSystemCache:
                 os.unlink(victim)
             self._forget(victim)
 
-    def lookup(self, path: str) -> bool:
+    def lookup(self, path: str, on_found: Callable[[], None] | None = None) -> bool:
+        """Optionally install a proof under the deletion lock.
+
+        The callback must not re-enter the cache. This makes publication and
+        loss notifications ordered even when a path is deleted and rewritten.
+        """
         with self._lock:
             if not os.path.isfile(path):
                 self._forget(path)
                 return False
             if path in self._pages:
                 self._pages.move_to_end(path)
+            if on_found is not None:
+                on_found()
             return True
 
     def touch(self, paths: Iterable[str]) -> None:

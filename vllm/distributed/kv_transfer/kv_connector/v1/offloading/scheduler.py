@@ -96,6 +96,10 @@ class TransferJobStatus:
     failed: bool = False
     receive_txn: ReceiveTxn | None = None
     metric_attempt: "PrefixAttempt | None" = None
+    generation: int | None = None
+    completed_ranks: int = 0
+    failed_ranks: int = 0
+    byte_receipts: set[tuple[int, str]] = field(default_factory=set)
 
 
 class GroupOffloadConfig(NamedTuple):
@@ -421,6 +425,8 @@ class RequestOffloadState:
     # In-flight job IDs. Per the connector's invariant, at any given time
     # this contains either a single load job, or one or more store jobs.
     transfer_jobs: set[int] = field(default_factory=set)
+    unified_junction_offered: bool = False
+    unified_preemptions: int = 0
 
     def __post_init__(self) -> None:
         self.group_states = tuple(
@@ -528,6 +534,28 @@ class OffloadingConnectorScheduler:
             group.group_idx: group for group in self.config.kv_group_configs
         }
         self.manager: OffloadingManager = spec.get_manager()
+        from vllm.v1.kv_offload.unified.manager import UnifiedStoreManager
+
+        self._residency_sampled_at: float | None = None
+        self._residency_pending = False
+        self._residency_totals: dict[tuple[str, str], int] = {}
+        self.unified = (
+            self.manager if isinstance(self.manager, UnifiedStoreManager) else None
+        )
+        if self.unified is not None:
+            batch = spec.vllm_config.scheduler_config.max_num_batched_tokens
+            plan = spec.kv_cache_config.long_context_plan
+            assert plan is not None
+            span = plan.geometry.block_tokens
+            groups = self.config.kv_group_configs
+            components = sum(g.requires_exact_boundary_source for g in groups)
+            components += sum(
+                g.sliding_window_size_in_blocks or 0
+                for g in groups
+                if g.draft_window_tokens is not None
+            )
+            self.unified.build_frames_per_request = (cdiv(batch, span) + 1) * components
+            self.unified.max_pending_variants = cdiv(batch, span) + 1
 
         full_attention_groups: list[int] = []
         sliding_window_groups: list[int] = []
@@ -601,6 +629,7 @@ class OffloadingConnectorScheduler:
         # active jobs.
         self._stale_job_threshold: int = 0
         self._jobs: dict[int, TransferJobStatus] = {}
+        self._receive_waiting: set[int] = set()
         # Load jobs still in flight when reset_cache discarded the job table
         # (load_failure_recompute_enabled only). Their completion is otherwise
         # skipped as stale, but a load that fails after the reset must still
@@ -618,7 +647,7 @@ class OffloadingConnectorScheduler:
         self.num_skipped_draft_blocks = 0
         self._reported_skipped_draft_blocks = 0
         self._dependency_index: CPUBlockDependencyIndex | None = None
-        if (
+        if getattr(self, "unified", None) is None and (
             self.config.cpu_enable_dependency_eviction
             or self.config.cpu_residency_stats
         ):
@@ -724,9 +753,6 @@ class OffloadingConnectorScheduler:
                 "CPU dependency removal disabled for this tier/group geometry; "
                 "residency is classified as unknown"
             )
-        self._residency_sampled_at: float | None = None
-        self._residency_totals: dict[tuple[str, str], int] = {}
-        self._residency_pending = False
 
     def _dependency_protected_keys(self) -> set[OffloadKey]:
         # Include waiting/preempted requests and finished requests with jobs.
@@ -779,12 +805,18 @@ class OffloadingConnectorScheduler:
     ) -> dict[tuple[str, str], int] | None:
         """New C7 snapshot at most once per minute; no work when disabled."""
         index = getattr(self, "_dependency_index", None)
-        if index is None:
+        unified = getattr(self, "unified", None)
+        if index is None and unified is None:
             return None
         now = time.monotonic()
         if self._residency_sampled_at is None or now - self._residency_sampled_at >= 60:
             self._residency_sampled_at = now
-            self._residency_totals = index.totals(self._dependency_protected_keys())
+            assert unified is not None or index is not None
+            if unified is not None:
+                self._residency_totals = unified.residency_totals()
+            else:
+                assert index is not None
+                self._residency_totals = index.totals(self._dependency_protected_keys())
             self._residency_pending = True
         if consume:
             if not self._residency_pending:
@@ -1143,6 +1175,26 @@ class OffloadingConnectorScheduler:
                     "KV lookup failed for %s", request.request_id, exc_info=True
                 )
                 result = 0, False
+        unified = getattr(self, "unified", None)
+        if unified is not None:
+            if result[0] is not None and result[0] > 0:
+                end = num_computed_tokens + result[0]
+                status = self._req_status[request.request_id]
+                keys = []
+                for group in self.config.kv_group_configs:
+                    high = end // group.offloaded_block_size
+                    low = num_computed_tokens // group.offloaded_block_size
+                    if group.requires_exact_boundary_source:
+                        low = max(low, high - 1)
+                    elif group.sliding_window_size_in_blocks is not None:
+                        low = max(low, high - group.sliding_window_size_in_blocks)
+                    keys.extend(
+                        status.group_states[group.group_idx].offload_keys[low:high]
+                    )
+                if not unified.hold_lookup(request.request_id, keys):
+                    result = None, False
+            elif result[0] == 0:
+                unified.release_lookup(request.request_id)
         if result[0] is not None:
             # A final answer: its lookup leases (if any) now protect the
             # prefetched pages. Drop the round and its holds.
@@ -1518,6 +1570,12 @@ class OffloadingConnectorScheduler:
         src_spec = self.manager.prepare_load(keys_to_load, req_status.req_context)
 
         load_job_id = self._generate_job_id()
+        from vllm.v1.kv_offload.unified.manager import ComponentTransferSpec
+
+        component_spec = src_spec
+        if getattr(self, "unified", None) is not None:
+            assert isinstance(component_spec, ComponentTransferSpec)
+        unified = getattr(self, "unified", None)
         txn = None
         host_hits = self.host_kv_hits
         if host_hits is not None and host_hits.history_pool is not None:
@@ -1529,14 +1587,21 @@ class OffloadingConnectorScheduler:
                     num_cached_tokens,
                     load_job_id,
                 )
+                if unified is not None:
+                    txn.components = unified.receive_components(component_spec)
                 host_hits.start_receive(txn)
             except Exception:
                 self.manager.complete_load(keys_to_load, req_status.req_context)
                 raise
             src_spec = HostReceiveSpec(src_spec, txn)
+        if unified is not None:
+            unified.bind_job(load_job_id, request.request_id, component_spec, False)
         self._current_batch_load_jobs[load_job_id] = TransferJob(
             req_id=request.request_id,
             transfer_spec=(src_spec, dst_spec),
+            generation=component_spec.gen
+            if isinstance(component_spec, ComponentTransferSpec)
+            else None,
         )
         # a load can only be issued when no other jobs are pending.
         req_status.transfer_jobs.add(load_job_id)
@@ -1547,6 +1612,9 @@ class OffloadingConnectorScheduler:
             keys=set(keys_to_load),
             is_store=False,
             receive_txn=txn,
+            generation=component_spec.gen
+            if isinstance(component_spec, ComponentTransferSpec)
+            else None,
             metric_attempt=metrics.state(request) if metrics is not None else None,
         )
 
@@ -1587,6 +1655,9 @@ class OffloadingConnectorScheduler:
         """Whether ``key`` is resident and readable in the tier loads read
         from, without touching recency, admission counters or promotions.
         Managers this method does not know answer through their own lookup."""
+        unified = getattr(self, "unified", None)
+        if unified is not None:
+            return unified.is_ready_resident(key)
         from vllm.v1.kv_offload.cpu.manager import (
             CPUOffloadingManager,
             GroupedCPUOffloadingManager,
@@ -1774,7 +1845,7 @@ class OffloadingConnectorScheduler:
         block_size_factor = self.config.block_size_factor
         store_jobs: dict[int, TransferJob] = {}
         # iterate over both new and cached requests
-        for req_id, new_block_id_groups, preempted in yield_req_data(scheduler_output):
+        for req_id, new_block_id_groups, resumed in yield_req_data(scheduler_output):
             skip_once = getattr(self, "_skip_external_once", None)
             if skip_once:
                 skip_once.discard(req_id)
@@ -1784,7 +1855,7 @@ class OffloadingConnectorScheduler:
             if self.config.cpu_draft_offload == "window":
                 self._prune_draft_history(req_status)
 
-            if preempted:
+            if resumed:
                 for group_state in req_status.group_states:
                     group_state.block_ids.clear()
 
@@ -2224,6 +2295,9 @@ class OffloadingConnectorScheduler:
         counted. That boundary is then recomputed on a later prefix hit.
         """
         self._queue_boundary_state_offloads(scheduler_output)
+        unified = getattr(self, "unified", None)
+        if unified is not None:
+            self._prepare_unified_boundaries(scheduler_output)
 
         store_jobs: dict[int, TransferJob] = {}
         num_groups = self.config.num_kv_cache_groups
@@ -2272,6 +2346,9 @@ class OffloadingConnectorScheduler:
                 if offload_block_idx >= len(group_state.offload_keys):
                     continue
                 offload_key = group_state.offload_keys[offload_block_idx]
+                if unified is not None and offload_key in unified.rejected_step:
+                    rejected.append(boundary_tokens)
+                    continue
                 store_output = self._prepare_store([offload_key], req_status)
                 if store_output is None:
                     rejected.append(boundary_tokens)
@@ -2326,6 +2403,79 @@ class OffloadingConnectorScheduler:
                 )
 
         return store_jobs
+
+    def _prepare_unified_boundaries(self, scheduler_output: SchedulerOutput) -> None:
+        """Compile complete inventories before any component acquires an owner."""
+        from vllm.v1.core.kv_cache_hit_contract import chain_hash_from_request
+        from vllm.v1.kv_offload.unified.units import UnitId, VariantOffer
+
+        unified = self.unified
+        assert unified is not None
+        unified.rejected_step.clear()
+        plan = self.kv_cache_config.long_context_plan
+        assert plan is not None and self.host_kv_hits is not None
+        span = plan.geometry.block_tokens
+        main_group = self.kv_cache_config.host_kv_group_id
+        assert main_group is not None
+        for req_id, status in self._req_status.items():
+            boundaries = {entry[2] for entry in status.pending_boundary_offloads}
+            # A request can reuse B from an earlier request and publish a new
+            # branch A without offering the states again.
+            junction = getattr(status.req, "shared_prefix_boundary", 0)
+            if (
+                isinstance(junction, int)
+                and junction > 0
+                and not status.unified_junction_offered
+                and req_id in scheduler_output.num_scheduled_tokens
+            ):
+                boundaries.add(junction)
+                status.unified_junction_offered = True
+            if not boundaries:
+                continue
+            status.update_offload_keys()
+            chain = chain_hash_from_request(
+                status.req.block_hashes, self._hash_block_size
+            )
+            main: list[OffloadKey] = []
+            for boundary in boundaries:
+                h_b = chain(self.host_kv_hits.rule, boundary // span - 1)
+                if h_b is None:
+                    continue
+                components = []
+                for group in self.config.kv_group_configs:
+                    keys = status.group_states[group.group_idx].offload_keys
+                    end = boundary // group.offloaded_block_size
+                    if group.requires_exact_boundary_source:
+                        if 0 < end <= len(keys):
+                            components.append(keys[end - 1])
+                    elif group.draft_window_tokens is not None:
+                        window = group.sliding_window_size_in_blocks
+                        assert window is not None
+                        components.extend(keys[max(0, end - window) : end])
+                uid = UnitId(h_b, unified.units.reset_epoch)
+                existing = unified.units.units.get(uid)
+                if existing is None:
+                    build = unified.begin_boundary(req_id, h_b, components)
+                    if build is None:
+                        unified.rejected_step.update(components)
+                        continue
+                    gen = build.gen
+                else:
+                    gen = existing.gen
+                ahead = boundary + (self._eagle_state_shift or 0)
+                h_a = chain(self.host_kv_hits.rule, ahead // span - 1)
+                if h_a is None:
+                    continue
+                for i in range(len(main), ahead // span):
+                    h = chain(self.host_kv_hits.rule, i)
+                    if h is None:
+                        break
+                    main.append(make_offload_key(h, main_group))
+                if len(main) >= ahead // span:
+                    unified.offer_variant(
+                        req_id,
+                        VariantOffer(uid, gen, h_a, tuple(main[: ahead // span])),
+                    )
 
     def _cpu_tier_managers(self) -> list[Any]:
         """Leaf CPU-tier managers, unwrapping group pools and tiering."""
@@ -2420,6 +2570,22 @@ class OffloadingConnectorScheduler:
             residency_suffix,
         )
 
+    def preempt_unified_request(self, req_id: str) -> None:
+        """Withdraw the admission before its GPU blocks are freed/reassigned."""
+        unified = getattr(self, "unified", None)
+        if unified is None:
+            return
+        status = self._req_status.get(req_id)
+        if status is None:
+            return
+        unified.cancel_request(req_id)
+        self._drop_pending_boundary_offloads(status, "preempted")
+        self._drop_draft_deferred(status)
+        self._current_batch_jobs_to_flush.update(status.transfer_jobs)
+        status.unified_junction_offered = False
+        # The core increments num_preemptions immediately after this callback.
+        status.unified_preemptions = status.req.num_preemptions + 1
+
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
@@ -2427,6 +2593,13 @@ class OffloadingConnectorScheduler:
         for req_id in scheduler_output.preempted_req_ids or ():
             req_status = self._req_status.get(req_id)
             if req_status is None:
+                continue
+            if (
+                req_status.unified_preemptions
+                and req_status.unified_preemptions == req_status.req.num_preemptions
+            ):
+                # Already handled at admission loss. This notification may
+                # arrive after a new load or boundary handoff was admitted.
                 continue
             # Preemption returns the request's blocks to the pool, so
             # boundary states not yet handed to a store job are gone.
@@ -2443,6 +2616,9 @@ class OffloadingConnectorScheduler:
                 # preserve the window registered by this fresh load.
                 continue
             self._drop_draft_deferred(req_status)
+            unified = getattr(self, "unified", None)
+            if unified is not None:
+                unified.cancel_request(req_id)
             if not req_status.transfer_jobs:
                 continue
             any_jid = next(iter(req_status.transfer_jobs))
@@ -2476,6 +2652,17 @@ class OffloadingConnectorScheduler:
 
         boundary_store_jobs = self._build_boundary_state_store_jobs(scheduler_output)
         normal_store_jobs = self._build_store_jobs(scheduler_output)
+        unified = getattr(self, "unified", None)
+        if unified is not None:
+            for job_id, job in (boundary_store_jobs | normal_store_jobs).items():
+                from vllm.v1.kv_offload.unified.manager import ComponentTransferSpec
+
+                spec = job.transfer_spec[1]
+                assert isinstance(spec, ComponentTransferSpec)
+                unified.bind_job(job_id, job.req_id, spec, True)
+                job.generation = spec.gen
+                self._jobs[job_id].generation = spec.gen
+            unified.end_step()
         meta = OffloadingConnectorMetadata(
             load_jobs=self._current_batch_load_jobs,
             store_jobs=boundary_store_jobs | normal_store_jobs,
@@ -2499,6 +2686,40 @@ class OffloadingConnectorScheduler:
             meta = OffloadingWorkerMetadata()
         completed_receive_reqs = set()
         completed_jobs = dict(meta.completed_jobs)
+        receive_candidates = self._receive_waiting.copy()
+        unified = getattr(self, "unified", None)
+        if unified is not None:
+            for job_id in tuple(completed_jobs):
+                if (
+                    job_id not in self._jobs
+                    or self._jobs[job_id].generation is not None
+                ):
+                    completed_jobs.pop(job_id)
+            for (job_id, gen, rank, kind), nbytes in meta.job_bytes.items():
+                status = self._jobs.get(job_id)
+                if status is not None and status.generation == gen:
+                    if not 0 <= rank < unified.table.num_workers:
+                        raise ValueError("Invalid DMA rank")
+                    if (rank, kind) not in status.byte_receipts:
+                        unified.record_dma(job_id, gen, rank, nbytes, kind)
+                        status.byte_receipts.add((rank, kind))
+            for (job_id, gen), (completed, failed) in meta.job_results.items():
+                status = self._jobs.get(job_id)
+                if status is None:
+                    unified.receipt(job_id, gen, completed, failed)
+                elif status.generation == gen:
+                    if (
+                        completed | failed
+                    ) & ~unified.table.all_ranks or failed & ~completed:
+                        raise ValueError("Invalid component rank receipt")
+                    status.completed_ranks |= completed
+                    status.failed_ranks |= failed
+                    if status.completed_ranks == unified.table.all_ranks:
+                        status.failed |= bool(status.failed_ranks)
+                        if status.receive_txn is None:
+                            completed_jobs[job_id] = self.config.num_workers
+                        else:
+                            receive_candidates.add(job_id)
         host_hits = self.host_kv_hits
         manages_receives = host_hits is not None and host_hits.history_pool is not None
         if manages_receives:
@@ -2508,6 +2729,7 @@ class OffloadingConnectorScheduler:
                 status = self._jobs.get(attempt)
                 if status is not None and status.receive_txn is not None:
                     status.receive_txn.complete(completed, failed, table.all_ranks)
+                    receive_candidates.add(attempt)
             # Counts remain the ABI of ordinary transfer jobs. ReceiveTxn
             # ignores them, including duplicates of an already retired job.
             for job_id in list(completed_jobs):
@@ -2516,14 +2738,25 @@ class OffloadingConnectorScheduler:
                     status is not None and status.receive_txn is not None
                 ):
                     del completed_jobs[job_id]
-            for job_id, status in self._jobs.items():
+            for job_id in receive_candidates:
+                status = self._jobs.get(job_id)
+                if status is None:
+                    self._receive_waiting.discard(job_id)
+                    continue
                 txn = status.receive_txn
                 if (
                     txn is not None
+                    and (
+                        status.generation is None
+                        or status.completed_ranks == table.all_ranks
+                    )
                     and txn.completed_ranks == table.all_ranks
-                    and table.watermark >= txn.step
                 ):
-                    status.failed = bool(txn.failed_ranks)
+                    if table.watermark < txn.step:
+                        self._receive_waiting.add(job_id)
+                        continue
+                    self._receive_waiting.discard(job_id)
+                    status.failed |= bool(txn.failed_ranks)
                     completed_jobs[job_id] = self.config.num_workers
         for job_id, count in completed_jobs.items():
             assert count > 0
@@ -2535,7 +2768,9 @@ class OffloadingConnectorScheduler:
                     self._stale_job_threshold,
                 )
                 continue
-            job_status = self._jobs[job_id]
+            job_status = self._jobs.get(job_id)
+            if job_status is None:
+                continue
             if job_id in meta.failed_jobs:
                 job_status.failed = True
             job_status.pending_count -= count
@@ -2544,19 +2779,28 @@ class OffloadingConnectorScheduler:
             assert job_status.pending_count == 0
 
             req_status = self._req_status[job_status.req_id]
-            if job_status.is_store and job_status.failed:
+            if job_status.generation is not None:
+                assert unified is not None
+                unified.complete_job(job_id, not job_status.failed)
+            if (
+                job_status.is_store
+                and job_status.failed
+                and job_status.generation is None
+            ):
                 # The tier never received valid data: drop the keys rather
                 # than publishing them as loadable.
                 self.manager.complete_store(
                     job_status.keys, req_status.req_context, success=False
                 )
             elif job_status.is_store:
-                self.manager.complete_store(job_status.keys, req_status.req_context)
+                if job_status.generation is None:
+                    self.manager.complete_store(job_status.keys, req_status.req_context)
                 counters = getattr(self, "_offload_counters", None)
-                if counters is not None:
+                if counters is not None and not job_status.failed:
                     counters.count_stored(job_status.keys)
             else:
-                self.manager.complete_load(job_status.keys, req_status.req_context)
+                if job_status.generation is None:
+                    self.manager.complete_load(job_status.keys, req_status.req_context)
                 metrics = getattr(self, "store_metrics", None)
                 if metrics is not None:
                     metrics.complete_receive(
@@ -2595,6 +2839,7 @@ class OffloadingConnectorScheduler:
                 self._remove_pending_job(job_id, identities)
 
             del self._jobs[job_id]
+            self._receive_waiting.discard(job_id)
             req_status.transfer_jobs.remove(job_id)
             if not req_status.transfer_jobs and req_status.req.is_finished():
                 del self._req_status[job_status.req_id]
@@ -2651,7 +2896,16 @@ class OffloadingConnectorScheduler:
         req_context = (
             req_status.req_context if req_status else _create_req_context(request)
         )
-        self.manager.on_request_finished(req_context)
+        unified = getattr(self, "unified", None)
+        from vllm.v1.request import RequestStatus
+
+        if unified is not None and request.status not in (
+            RequestStatus.FINISHED_STOPPED,
+            RequestStatus.FINISHED_LENGTH_CAPPED,
+        ):
+            unified.cancel_request(req_context.req_id)
+        else:
+            self.manager.on_request_finished(req_context)
 
         if req_status is None:
             return False, None
@@ -2907,6 +3161,7 @@ class OffloadingConnectorScheduler:
         # Discard jobs and save job_counter to be able to discard worker responses
         self._stale_job_threshold = self._job_counter
         self._jobs.clear()
+        self._receive_waiting.clear()
         self._block_id_to_pending_jobs.clear()
 
         # Note: _current_batch_jobs_to_flush is intentionally NOT cleared.

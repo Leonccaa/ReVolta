@@ -19,6 +19,7 @@ import time
 from collections import Counter, OrderedDict, deque
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field, is_dataclass
+from queue import Empty, SimpleQueue
 from typing import Any
 
 import numpy as np
@@ -29,6 +30,7 @@ from vllm.v1.kv_offload.host.page_table import (
     HostPage,
     HostPageTable,
     PageHandle,
+    PageKind,
     PageState,
 )
 from vllm.v1.kv_offload.host.ssd import (
@@ -151,6 +153,7 @@ class _Round:
     started: float
     loading: set[PageHandle] = field(default_factory=set)
     holds: list[tuple[PageHandle, int]] = field(default_factory=list)
+    keys: set[OffloadKey] = field(default_factory=set)
 
 
 class HostPageSsd:
@@ -175,6 +178,7 @@ class HostPageSsd:
         self._window = options["write_threads"]
         self._max_pending = options["max_pending_blocks"]
         self._jobs: dict[int, _Job] = {}
+        self._expired_rounds: set[str] = set()
         self._page_jobs: dict[int, int] = {}
         self._submit: deque[int] = deque()
         self._deferred: OrderedDict[PageHandle, None] = OrderedDict()
@@ -207,6 +211,12 @@ class HostPageSsd:
             },
             getattr(spec, "block_size_factor", 1),
         )
+        self._component_tier: _HostTier | None = None
+        self._component_salt = b""
+        self._losses: SimpleQueue[tuple[str, tuple[OffloadKey, PageHandle] | None]] = (
+            SimpleQueue()
+        )
+        self._file_evidence: dict[str, tuple[OffloadKey, PageHandle]] = {}
         self._limiter = _WriteRateLimiter(options["write_bytes_per_second"])
         self._tier = _HostTier(
             self._limiter,
@@ -246,6 +256,79 @@ class HostPageSsd:
         )
         if self.enabled:
             table.persistence = self
+
+    def enable_components(self, layout: dict) -> None:
+        """unified host budgeting versioned component namespace; MAIN serialization
+        stays unchanged.
+
+        One controller, queue, IO limit, row export and root budget. The two
+        file mappers isolate the new component ABI from legacy MAIN files.
+        unit SSD transactions will replace the shared cache's file-level eviction
+        authority.
+        """
+        if self._component_tier is not None:
+            return
+        options = self.options
+        spec = _HostSpec(
+            self._spec.vllm_config,
+            self._spec.kv_cache_config,
+            {
+                **self._spec.persistent_layout,
+                "unified_components": {"abi": "state-draft-row-v1", "layout": layout},
+            },
+        )
+        self._component_tier = _HostTier(
+            self._limiter,
+            offloading_spec=spec,
+            primary_kv_view=self._tier._primary_kv_view,
+            tier_type="revolta_fs",
+            root_dir=options["root_dir"],
+            max_size_bytes=options["max_size_bytes"],
+            min_free_bytes=options.get("min_free_bytes"),
+            max_files=options["max_files"],
+            content_manifest_path=options.get("content_manifest_path"),
+            content_verify=options.get("content_verify", "stat"),
+            n_read_threads=1,
+            n_write_threads=self._window,
+            store_timeout_s=0,
+            drain_timeout_s=0,
+            max_inflight_store_blocks=self._max_pending + self._window,
+            write_delay_s=0,
+        )
+        if self.enabled:
+            self._tier._cache.loss_listeners.append(self._file_lost)
+
+    def _file_lost(self, path: str) -> None:
+        # Called under the FS cache lock. Snapshot the immutable proof before
+        # a later same-path write can publish a different physical epoch.
+        # Graph mutations still happen only on the scheduler thread.
+        self._losses.put((path, self._file_evidence.get(path)))
+
+    def _tier_for_key(self, key: OffloadKey):
+        if (
+            self._component_tier is not None
+            and self.table.kind_for_key(key) != PageKind.MAIN
+        ):
+            return self._component_tier
+        return self._tier
+
+    def _poll_losses(self) -> None:
+        while True:
+            try:
+                path, evidence = self._losses.get_nowait()
+            except Empty:
+                break
+            if evidence is None or self._file_evidence.get(path) != evidence:
+                continue
+            del self._file_evidence[path]
+            key, incarnation = evidence
+            policy = self.table.value_policy
+            if policy is not None:
+                policy.ssd_lost(key, incarnation)
+            page = self._page(incarnation)
+            if page is not None and page.key == key:
+                self.table.unpersist(incarnation)
+            self.stats_counter["ssd_evidence_lost"] += 1
 
     # --- state -----------------------------------------------------------
 
@@ -295,6 +378,11 @@ class HostPageSsd:
         files can never hit each other."""
         epoch = self.table.ssd_epoch
         salt = b"" if epoch == 0 else self._salts.setdefault(epoch, os.urandom(16))
+        if (
+            self._component_tier is not None
+            and self.table.kind_for_key(key) != PageKind.MAIN
+        ):
+            salt += self._component_salt
         return host_page_tier_key(key, salt)
 
     def _store_jobs(self) -> int:
@@ -325,12 +413,14 @@ class HostPageSsd:
             is_promotion=job.loading,
             req_context=self._ctx,
         )
+        key = self.table.get(job.handle).key
+        assert key is not None
         try:
             if job.loading:
-                self._tier.submit_load(meta)
+                self._tier_for_key(key).submit_load(meta)
                 self._inflight_loads += 1
             else:
-                self._tier.submit_store(meta)
+                self._tier_for_key(key).submit_store(meta)
                 self._inflight_stores += 1
         except Exception:
             logger.exception("Host KV SSD job %d submission failed", job.job_id)
@@ -353,8 +443,36 @@ class HostPageSsd:
                 self._inflight_loads -= 1
             else:
                 self._inflight_stores -= 1
+        file_present = success
+        if success and self._component_tier is not None:
+            page = self._page(job.handle)
+            if (
+                page is not None
+                and page.valid
+                and page.key is not None
+                and job.tier_key == self._tier_key(page.key)
+            ):
+                tier = self._tier_for_key(page.key)
+                path = tier.file_mapper.get_file_name(job.tier_key)
+                # A later file job may have evicted this completed store
+                # before the scheduler polled its receipt. A notification
+                # without installed evidence must not be forgotten.
+                key = page.key
+
+                def remember_file() -> None:
+                    self._file_evidence[path] = (key, job.handle)
+
+                file_present = not tier.disabled and tier._cache.lookup(
+                    path, remember_file
+                )
         if job.loading:
             ok = self.table.complete_load(job.handle, success)
+            if ok and not file_present:
+                self.table.unpersist(job.handle)
+                if self.table.value_policy is not None:
+                    page = self.table.get(job.handle)
+                    assert page.key is not None
+                    self.table.value_policy.ssd_lost(page.key, job.handle)
             self.stats_counter["prefetch_verified" if ok else "prefetch_failed"] += 1
             for req_id in self._waiters.pop(job.handle, set()):
                 round_ = self._rounds.get(req_id)
@@ -372,7 +490,7 @@ class HostPageSsd:
             # 24 h volume). A store of a page invalidated meanwhile still
             # wrote its file: charged, not recorded as persisted.
             self._queue.account([job.tier_key])
-            if self.table.mark_persisted(job.handle):
+            if file_present and self.table.mark_persisted(job.handle):
                 self.stats_counter["pages_written"] += 1
             else:
                 self.stats_counter["store_failures"] += 1
@@ -395,10 +513,16 @@ class HostPageSsd:
         self.table.finish_io(job.handle, job.job_id)
 
     def _poll(self) -> None:
-        for result in self._tier.get_finished_jobs():
-            job = self._jobs.get(result.job_id)
-            if job is not None:
-                self._finish(job, result.success)
+        self._poll_losses()
+        tiers = [self._tier]
+        if self._component_tier is not None:
+            tiers.append(self._component_tier)
+        for tier in tiers:
+            for result in tier.get_finished_jobs():
+                job = self._jobs.get(result.job_id)
+                if job is not None:
+                    self._finish(job, result.success)
+        self._poll_losses()
 
     # --- PersistenceHooks ------------------------------------------------
 
@@ -440,11 +564,29 @@ class HostPageSsd:
     def on_reset(self) -> None:
         self._discard_queue()
         self._deferred.clear()
+        self._file_evidence.clear()
         for job_id in list(self._submit):
             self._finish(self._jobs[job_id], False)
         self._submit.clear()
-        for req_id in list(self._rounds):
+        for req_id in set(self._rounds) | self._expired_rounds:
             self.cancel(req_id)
+
+    def reset_components(self, handles: list[PageHandle]) -> None:
+        """Connector-only reset cannot invalidate MAIN's active bindings/ABI."""
+        self._component_salt = os.urandom(16)
+        self._queue.drop(handles, "evicted")
+        self.stats_counter["component_resets"] += 1
+        self.stats_counter["component_reset_pages"] += len(handles)
+        for handle in handles:
+            self._deferred.pop(handle, None)
+        for path, (key, _) in tuple(self._file_evidence.items()):
+            if self.table.kind_for_key(key) != PageKind.MAIN:
+                del self._file_evidence[path]
+        for job_id in tuple(self._submit):
+            page = self._page(self._jobs[job_id].handle)
+            if page is not None and page.kind != PageKind.MAIN:
+                self._submit.remove(job_id)
+                self._finish(self._jobs[job_id], False)
 
     # --- per step --------------------------------------------------------
 
@@ -487,7 +629,9 @@ class HostPageSsd:
 
     # --- prefetch quota ---------------------------------------------------
 
-    def prefetch(self, req_id: str, keys: Iterable[OffloadKey]) -> list[OffloadKey]:
+    def prefetch(
+        self, req_id: str, keys: Iterable[OffloadKey], *, extend: bool = False
+    ) -> list[OffloadKey]:
         """One prefetch round per request per T_pf, in chain order.
 
         The connector lookup calls this for the first keys missing from the
@@ -500,48 +644,65 @@ class HostPageSsd:
             return []
         now = self.clock()
         self._expire_prefetch(now)
-        if req_id in self._rounds:
+        if req_id in self._expired_rounds:
+            return []
+        if req_id in self._rounds and not extend:
             self.stats_counter["prefetch_round_limited"] += 1
             return []
-        round_ = _Round(now)
+        round_ = self._rounds.get(req_id, _Round(now))
         issued: list[OffloadKey] = []
         headroom: int | None = None
         per_req = self.options["prefetch_max_per_request"]
         for key in keys:
+            if key in round_.keys:
+                continue
             handle = self.table.lookup(key)
             if handle is not None:
                 page = self.table.get(handle)
                 if (
                     page.state == PageState.LOADING
                     and page.handle.page_id in self._page_jobs
-                    and len(round_.loading) < per_req
+                    and len(round_.keys) < per_req
                 ):
                     round_.loading.add(handle)
+                    round_.keys.add(key)
                     self._waiters.setdefault(handle, set()).add(req_id)
                 continue
-            if len(round_.loading) >= per_req:
+            if len(round_.keys) >= per_req:
                 self.stats_counter["prefetch_request_quota"] += 1
                 break
             if self._inflight_loads >= self.options["prefetch_max_inflight"]:
                 self.stats_counter["prefetch_global_quota"] += 1
                 break
             try:
-                if self._tier.lookup(self._tier_key(key)) is not True:
+                if self._tier_for_key(key).lookup(self._tier_key(key)) is not True:
                     break
             except OSError:
                 self.stats_counter["prefetch_lookup_failures"] += 1
                 break
             if headroom is None:
                 headroom = self.table.net_headroom()
-            if headroom < 1:
+            if headroom < 1 and self.table.reservation_ledger is None:
                 self.stats_counter["prefetch_no_headroom"] += 1
                 break
-            handle = self.table.reserve(loading_key=key, writeback=False)
+            ledger = self.table.reservation_ledger
+            temporary = None
+            if ledger is None:
+                handle = self.table.reserve(loading_key=key, writeback=False)
+            else:
+                temporary = ledger.reserve_frames(
+                    1, "prefetch", loading_key=key, writeback=False
+                )
+                handle = temporary[0] if temporary else None
             if handle is None:
                 break
             headroom -= 1
             self._new_job(self.table.get(handle), loading=True)
+            if temporary is not None:
+                assert ledger is not None
+                ledger.release_temporary(temporary)
             round_.loading.add(handle)
+            round_.keys.add(key)
             self._waiters.setdefault(handle, set()).add(req_id)
             issued.append(key)
         if round_.loading:
@@ -577,6 +738,7 @@ class HostPageSsd:
 
     def cancel(self, req_id: str) -> None:
         """Withdraw a request's waiting; physical reads finish on their own."""
+        self._expired_rounds.discard(req_id)
         round_ = self._rounds.pop(req_id, None)
         if round_ is None:
             return
@@ -594,6 +756,10 @@ class HostPageSsd:
                 if round_.loading or round_.holds:
                     self.stats_counter["prefetch_timeouts"] += 1
                 self.cancel(req_id)
+                if self._component_tier is not None:
+                    # A multi-call unified lookup keeps its original deadline.
+                    # Its final answer/cancellation opens the next episode.
+                    self._expired_rounds.add(req_id)
 
     # --- shutdown --------------------------------------------------------
 
@@ -731,9 +897,10 @@ class HostPageSsd:
             self.quarantined = True
             # Stop the pool without joining: a hung writer keeps its row and
             # the region stays mapped (transfer regression). Queued tasks are dropped.
-            pool = getattr(self._tier, "_pool", None)
-            if pool is not None:
-                pool.shutdown(wait=False)
+            for tier in (self._tier, self._component_tier):
+                pool = getattr(tier, "_pool", None)
+                if pool is not None:
+                    pool.shutdown(wait=False)
             self._limiter.stopped.set()
             logger.error(
                 "Host KV SSD IO did not finish; quarantining %d rows "
@@ -742,6 +909,14 @@ class HostPageSsd:
             )
             return
         self._limiter.stopped.set()
+        if self._component_tier is not None:
+            cache = self._tier._cache
+            if self._file_lost in cache.loss_listeners:
+                cache.loss_listeners.remove(self._file_lost)
+            if deadline is not None:
+                self._component_tier.set_shutdown_deadline(deadline)
+            self._component_tier.shutdown()
+            self._component_tier._primary_kv_view = None  # type: ignore[assignment]
         if deadline is None:
             self._tier.shutdown()
         else:

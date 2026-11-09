@@ -645,12 +645,26 @@ class KVCacheManager:
             return None
         # Long-context mode: every domain must have room too; otherwise the
         # scheduler waits or preempts exactly as for a full unified pool.
-        if ledger is not None and not ledger.admit(
-            request, per_group, reserved_blocks_per_group
-        ):
-            if self.host_kv_hits is not None:
-                self.host_kv_hits.release_lookup(request.request_id)
-            return None
+        if ledger is not None:
+            host_table = getattr(self.block_pool, "host_pages", None)
+            unified = host_table.reservation_ledger if host_table is not None else None
+            new_credit = unified is not None and (
+                request.request_id not in unified.requests
+                or unified.requests[request.request_id].draining
+            )
+            if unified is not None and not unified.admit(
+                request.request_id, unified.build_frames_per_request
+            ):
+                if self.host_kv_hits is not None:
+                    self.host_kv_hits.release_lookup(request.request_id)
+                return None
+            if not ledger.admit(request, per_group, reserved_blocks_per_group):
+                if new_credit:
+                    assert unified is not None
+                    unified.finish(request.request_id)
+                if self.host_kv_hits is not None:
+                    self.host_kv_hits.release_lookup(request.request_id)
+                return None
 
         if (
             new_computed_block_list is not self.empty_kv_cache_blocks.blocks

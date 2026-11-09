@@ -36,6 +36,7 @@ class Transfer:
     start_event: torch.Event
     end_event: torch.Event
     num_bytes: int
+    retired: bool = False
 
 
 def compute_sub_block_ptrs(
@@ -191,6 +192,9 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         self._transfer_events: dict[int, torch.Event] = {}
         # queue of transfers (job_id, stream, event)
         self._transfers: deque[Transfer] = deque()
+        # Submission can fail before a usable end event exists. Keep its
+        # stream and events alive until wait() proves that all access retired.
+        self._failed_transfers: dict[int, Transfer] = {}
         # list of CUDA streams available for re-use
         self._stream_pool: list[torch.cuda.Stream] = []
         # list of CUDA events available for re-use
@@ -329,12 +333,6 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         # must also wait: the compute stream may still be zeroing freshly
         # allocated destination blocks. Otherwise that zeroing can overwrite
         # restored cache data after the transfer completes.
-        stream.wait_stream(torch.cuda.current_stream())
-        if self._transfers:
-            last_transfer: Transfer = self._transfers[-1]
-            last_event = last_transfer.end_event
-            # assure job will start only after the previous one completes
-            stream.wait_event(last_event)
         # CPU->GPU reads from host pinned memory, which is never written
         # by a concurrent GPU stream, so CU_MEMCPY_SRC_ACCESS_ORDER_ANY is
         # safe and lets the driver pipeline source reads. GPU->CPU reads
@@ -342,16 +340,30 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         # writing; we must keep STREAM ordering so source reads are gated
         # by the transfer stream's wait_stream(compute) barrier.
         is_src_access_order_any = not self.gpu_to_cpu
-        with torch.cuda.stream(stream):
-            start_event.record(stream)
-            if num_copy_ops > 0:
-                ops.swap_blocks_batch(
-                    batch_src,
-                    batch_dst,
-                    batch_sizes,
-                    is_src_access_order_any=is_src_access_order_any,
-                )
-            end_event.record(stream)
+        try:
+            stream.wait_stream(torch.cuda.current_stream())
+            if self._transfers:
+                # Assure job will start only after the previous one completes.
+                stream.wait_event(self._transfers[-1].end_event)
+            with torch.cuda.stream(stream):
+                start_event.record(stream)
+                if num_copy_ops > 0:
+                    ops.swap_blocks_batch(
+                        batch_src,
+                        batch_dst,
+                        batch_sizes,
+                        is_src_access_order_any=is_src_access_order_any,
+                    )
+                end_event.record(stream)
+        except Exception:
+            # A batch may enqueue copies before raising, before an end event
+            # is registered for wait(job_id). Drain that stream before failure
+            # reporting permits either the host source or GPU destination reuse.
+            self._failed_transfers[job_id] = Transfer(
+                job_id, stream, start_event, end_event, num_transfer_bytes
+            )
+            self.wait({job_id})
+            raise
 
         self._transfer_events[job_id] = end_event
         self._transfers.append(
@@ -369,7 +381,9 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
 
     def get_finished(self) -> list[TransferResult]:
         results: list[TransferResult] = []
-        while self._transfers and self._transfers[0].end_event.query():
+        while self._transfers and (
+            self._transfers[0].retired or self._transfers[0].end_event.query()
+        ):
             transfer = self._transfers.popleft()
             transfer_time = (
                 transfer.start_event.elapsed_time(transfer.end_event) * 1e-3
@@ -391,14 +405,30 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
 
     def wait(self, job_ids: set[int]):
         for job_id in job_ids:
+            transfer = self._failed_transfers.get(job_id)
+            if transfer is not None:
+                # On failure keep the fence for a later retry. An absent end
+                # event alone must never imply completion of a partial copy.
+                transfer.stream.synchronize()
+                del self._failed_transfers[job_id]
+                self._stream_pool.append(transfer.stream)
+                self._event_pool.extend((transfer.end_event, transfer.start_event))
             event = self._transfer_events.get(job_id)
             if event is not None:
                 event.synchronize()
 
+    def drain(self) -> None:
+        self.wait(set(self._failed_transfers))
+        # Retirement is separate from delivery. get_finished() still owns
+        # each success receipt, even if another direction fails this drain.
+        for transfer in self._transfers:
+            if not transfer.retired:
+                transfer.end_event.synchronize()
+                transfer.retired = True
+
     def shutdown(self) -> None:
-        while self._transfers:
-            transfer = self._transfers.popleft()
-            transfer.end_event.synchronize()
+        self.drain()
+        self._transfers.clear()
         self._transfer_events.clear()
         self._stream_pool.clear()
         self._event_pool.clear()

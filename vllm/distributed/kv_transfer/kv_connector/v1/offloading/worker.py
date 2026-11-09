@@ -338,7 +338,7 @@ class OffloadingConnectorWorker:
         return kv_connector_stats
 
     def shutdown(self) -> None:
+        self.worker.shutdown()
         self._unsubmitted_store_jobs.clear()
         self._load_jobs.clear()
         self._connector_worker_meta = OffloadingWorkerMetadata()
-        self.worker.shutdown()

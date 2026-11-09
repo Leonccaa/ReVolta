@@ -385,6 +385,65 @@ class Sm70SparseConfig:
     """Startup capability rejection; individual calls also check tensor layouts."""
 
 
+LONG_CONTEXT_DEFAULT_HOT_POOL_RATIO = 0.10
+"""Hot-page share of the host history pool when neither hot size is given."""
+
+
+@config
+class LongContextKVConfig:
+    """Active Host KV long-context mode for compressed-sparse (QSA) models.
+
+    When enabled, the main QSA K/V history is budgeted in a host memory pool
+    (the authoritative copy) with a GPU hot-page pool; recurrent state, drafter
+    windows and the compressed index stay on the GPU. Startup checks that each
+    pool holds at least one ``max_model_len`` request, and the scheduler admits
+    or grows a request only when the GPU state segment, the GPU history
+    segment, the host history pool and the hot-page pool all have room. A
+    request that does not fit waits (or preempts under the existing rules); it
+    is never rejected for lack of pool memory. Disabled, nothing here has any
+    effect.
+    """
+
+    enabled: bool = False
+    """Turn on long-context mode; every other field is inert while False."""
+    host_pool_gib: float | None = Field(default=None, gt=0)
+    """Host history pool for the main QSA K/V, in GiB summed over all workers
+    (like ``kv_offloading_size``). Exactly one of this and
+    ``host_pool_tokens`` is required when enabled."""
+    host_pool_tokens: int | None = Field(default=None, gt=0)
+    """Host history pool sized in history tokens (rounded down to whole KV
+    blocks) instead of GiB."""
+    hot_pool_gib: float | None = Field(default=None, gt=0)
+    """GPU hot-page pool per GPU, in GiB. At most one of this and
+    ``hot_pool_ratio``; with neither, the ratio defaults to
+    ``LONG_CONTEXT_DEFAULT_HOT_POOL_RATIO``."""
+    hot_pool_ratio: float | None = Field(default=None, gt=0, le=1)
+    """GPU hot-page pool as a fraction of the host history pool's tokens."""
+    prewarm_hot_pool: bool = True
+    """Warm the hot-page pool from the last prefill step's selection."""
+    prefill_staging_gib: float = Field(default=0.0, ge=0)
+    """GPU memory per GPU reserved for append-prefill history staging."""
+    state_blocks: int | None = Field(default=None, gt=0)
+    """GPU state-segment block IDs (recurrent states, PLE states, drafter
+    windows, checkpoints). None reserves ``max_num_seqs`` worst-case requests
+    plus the pool's null block."""
+
+    def validate_settings(self) -> None:
+        """Reject contradictory sizes; called only when the mode is enabled."""
+        if not self.enabled:
+            return
+        if (self.host_pool_gib is None) == (self.host_pool_tokens is None):
+            raise ValueError(
+                "kernel_config.long_context_kv needs exactly one of host_pool_gib "
+                "and host_pool_tokens when enabled."
+            )
+        if self.hot_pool_gib is not None and self.hot_pool_ratio is not None:
+            raise ValueError(
+                "kernel_config.long_context_kv accepts at most one of "
+                "hot_pool_gib and hot_pool_ratio."
+            )
+
+
 @config
 class KernelConfig:
     """Configuration for kernel selection and warmup behavior."""
@@ -515,6 +574,9 @@ class KernelConfig:
     draft indexer stays replicated.
     """
 
+    long_context_kv: LongContextKVConfig = Field(default_factory=LongContextKVConfig)
+    """Active Host KV long-context mode and its pool sizes (off by default)."""
+
     qsa_cross_group_hit_check: bool = False
     """Report a prefix hit only when every KV cache group is complete at it.
 
@@ -619,6 +681,9 @@ class KernelConfig:
             ignored_factors.add("sm70_fp8")
         if not self.sm70_sparse.active:
             ignored_factors.add("sm70_sparse")
+        if not self.long_context_kv.enabled:
+            # An unused mode must not perturb existing graph caches.
+            ignored_factors.add("long_context_kv")
         factors = get_hash_factors(self, ignored_factors)
         factors["ir_op_priority"] = self.ir_op_priority.compute_hash()
         return hash_factors(factors)

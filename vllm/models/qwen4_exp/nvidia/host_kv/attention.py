@@ -21,7 +21,7 @@ from vllm.models.qwen4_exp.nvidia.ops.qsa import (
 )
 from vllm.triton_utils import triton
 
-from .pool import LayerScales
+from .pool import HostKVResourceError, LayerScales, _check_product, _check_storage
 
 
 class SparseAttentionPlan:
@@ -57,25 +57,38 @@ class SparseAttentionPlan:
             self.warps = 2
         self.tiles = triton.cdiv(selection_width, self.block_n)
         self.splits = min(1 << (self.tiles.bit_length() - 1), target)
+        _check_product("attention grid Y", kv_heads, limit=65535)
+        _check_product("attention selection elements", rows, selection_width)
+        _check_product(
+            "attention partial elements", self.splits, rows, query_heads, head_dim
+        )
+        _check_product(
+            "attention query tile", triton.next_power_of_2(group), head_dim, limit=65536
+        )
         self.rows, self.heads, self.kv_heads = rows, query_heads, kv_heads
         self.dim, self.width = head_dim, selection_width
         self.e4m3 = e4m3
         self.scales = LayerScales() if scales is None else scales
-        self.output = torch.empty(
-            (rows, query_heads, head_dim), dtype=output_dtype, device=device
-        )
-        self.lse = torch.empty((rows, query_heads), dtype=torch.float32, device=device)
-        if self.splits == 1:
-            self.partial_output, self.partial_lse = self.output, self.lse
-        else:
-            self.partial_output = torch.empty(
-                (self.splits, rows, query_heads, head_dim),
-                dtype=torch.float32,
-                device=device,
+        try:
+            self.output = torch.empty(
+                (rows, query_heads, head_dim), dtype=output_dtype, device=device
             )
-            self.partial_lse = torch.empty(
-                (self.splits, rows, query_heads), dtype=torch.float32, device=device
+            self.lse = torch.empty(
+                (rows, query_heads), dtype=torch.float32, device=device
             )
+            if self.splits == 1:
+                self.partial_output, self.partial_lse = self.output, self.lse
+            else:
+                self.partial_output = torch.empty(
+                    (self.splits, rows, query_heads, head_dim),
+                    dtype=torch.float32,
+                    device=device,
+                )
+                self.partial_lse = torch.empty(
+                    (self.splits, rows, query_heads), dtype=torch.float32, device=device
+                )
+        except (RuntimeError, MemoryError) as error:
+            raise HostKVResourceError("QSA workspace allocation failed") from error
 
     def run(
         self,
@@ -128,6 +141,18 @@ class SparseAttentionPlan:
             or output_gate.stride(-1) != 1
         ):
             raise ValueError("QSA output gate must match query")
+        for tensor in (query, block_table):
+            _check_storage(tensor, index_limit=2**31 - 1)
+        if output_gate is not None:
+            _check_storage(output_gate, index_limit=2**31 - 1)
+        for tensor in (key, value):
+            _check_storage(tensor)
+            # The unchanged QSA kernel promotes the page term to int64.
+            # Its independent within-page expressions remain int32.
+            extent = 1 + sum(
+                (n - 1) * abs(s) for n, s in zip(tensor.shape[1:], tensor.stride()[1:])
+            )
+            _check_product("QSA within-page elements", extent)
         gate_s0 = output_gate.stride(0) if output_gate is not None else 0
         gate_s1 = output_gate.stride(1) if output_gate is not None else 0
         _qsa_sparse_paged_gqa_splitk_kernel[(self.rows, self.kv_heads, self.splits)](

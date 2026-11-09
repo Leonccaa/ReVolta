@@ -12,6 +12,7 @@ from vllm.models.qwen4_exp.nvidia.host_kv import (
     ActiveHostKV,
     HostKVConfig,
     LayerScales,
+    UnsupportedHostKVConfig,
 )
 from vllm.models.qwen4_exp.nvidia.host_kv.attention import SparseAttentionPlan
 
@@ -80,6 +81,7 @@ def _case(e4m3, width, *, rows=3):
     qpos = torch.tensor([511, 511, 61], dtype=torch.int64)[:rows].contiguous()
     if width > 1:
         selection[0, :2] = 7  # Repeated attention columns remain repeated.
+    if width > 1 and rows > 1:
         selection[1].fill_(-1)  # Entirely masked query, including its LSE.
     lengths = torch.tensor([512, 509], dtype=torch.int32)
     plan = SparseAttentionPlan(
@@ -191,3 +193,36 @@ def test_eviction_append_and_new_query_still_match_original_kernel():
     mapped = pool.gather(selection, requests, lengths, qpos)
     actual = plan.run(query, hk, hv, mapped, pool.hot_block_table, requests)
     assert torch.equal(expected.view(torch.uint8), actual.view(torch.uint8))
+
+
+@pytest.mark.parametrize("e4m3", [False, True])
+def test_growing_visibility_matches_original_output_and_lse(e4m3):
+    pool, source, query, selection, requests, lengths, qpos, plan = _case(
+        e4m3, 17, rows=1
+    )
+    k, v = source.unbind(1)
+    hk, hv = pool.hot.unbind(1)
+    selection.fill_(-1)
+    for length in (61, 62, 64, 65):
+        lengths.fill_(length)
+        qpos.fill_(length - 1)
+        selection[0, :3] = torch.tensor([0, length - 1, length - 1], dtype=torch.int32)
+        expected = plan.run(query, k, v, selection, pool.block_table, requests).clone()
+        expected_lse = plan.lse.clone()
+        mapped = pool.gather(selection, requests, lengths, qpos)
+        actual = plan.run(query, hk, hv, mapped, pool.hot_block_table, requests)
+        assert torch.equal(expected.view(torch.uint8), actual.view(torch.uint8))
+        assert torch.equal(expected_lse.view(torch.uint8), plan.lse.view(torch.uint8))
+
+
+def test_attention_workspace_product_rejection_precedes_allocation():
+    with pytest.raises(UnsupportedHostKVConfig, match="partial elements"):
+        SparseAttentionPlan(
+            rows=2**20,
+            query_heads=4096,
+            kv_heads=1,
+            head_dim=16,
+            selection_width=1,
+            device="cpu",
+            e4m3=False,
+        )

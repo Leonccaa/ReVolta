@@ -21,6 +21,7 @@ from vllm.v1.attention.kv_cache_view import KVPageLayout
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.v1.core.long_context_kv import LongContextCapacityPlan
 
 logger = init_logger(__name__)
 
@@ -1054,6 +1055,9 @@ class KVCacheConfig:
     For models with multiple types of attention, there will be multiple groups,
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
+    long_context_plan: LongContextCapacityPlan | None = None
+    """Domain capacities of the long-context (Active Host KV) mode; None when
+    the mode is off. The scheduler's KV cache manager admits against it."""
 
     @property
     def has_mamba_layers(self) -> bool:

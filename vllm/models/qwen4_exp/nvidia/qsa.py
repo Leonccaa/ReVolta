@@ -412,7 +412,13 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 )
 
             for_each_pass(
-                host, selection, token_to_req, block_table, sequence_lengths, attend
+                host,
+                selection,
+                token_to_req,
+                block_table,
+                sequence_lengths,
+                attend,
+                single_pass=attn_metadata.max_query_len <= host.store.shape.decode_rows,
             )
             return output
 
@@ -498,6 +504,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             block_table,
             sequence_lengths,
             attend_dcp,
+            single_pass=attn_metadata.max_query_len <= host.store.shape.decode_rows,
         )
         merged = cast(
             torch.Tensor,

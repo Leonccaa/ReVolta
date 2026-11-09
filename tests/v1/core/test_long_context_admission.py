@@ -63,19 +63,37 @@ def build(
     config.cache_config.enable_prefix_caching = prefix_caching
     if settings is not None:
         config.kernel_config.long_context_kv = settings
+        if settings.enabled and settings.main_kv_placement == "host":
+            from vllm.config import KVTransferConfig
+
+            config.kv_transfer_config = KVTransferConfig(
+                kv_connector="OffloadingConnector",
+                kv_role="kv_both",
+                kv_connector_extra_config={"cpu_bytes_to_use": 4 * GiB},
+            )
     specs = production_specs(
         speculative_blocks=speculative_tokens, drafter=bool(speculative_tokens)
     )
     (worker,) = get_kv_cache_configs(
         config, [specs], [PHYSICAL_BLOCKS * POOL_BLOCK_BYTES]
     )
-    return Scheduler(
+    scheduler = Scheduler(
         vllm_config=config,
         kv_cache_config=generate_scheduler_kv_cache_config([worker]),
         structured_output_manager=StructuredOutputManager(config),
         block_size=16,
         hash_block_size=16,
     )
+    if (
+        settings is not None
+        and settings.enabled
+        and settings.main_kv_placement == "host"
+    ):
+        # Exercise D-A at startup, then keep this scheduler-only fixture's
+        # original scope. Its fake step has no worker to complete real I/O;
+        # connector transfer/retirement is covered by connector unit tests.
+        scheduler.connector = None
+    return scheduler
 
 
 def settings(**kw) -> LongContextKVConfig:

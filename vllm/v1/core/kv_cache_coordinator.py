@@ -74,15 +74,47 @@ class KVCacheCoordinator(ABC):
         self.engine_use_eagle = use_eagle
         self.shared_prefix_boundary = 0
         self.admission_ledger = None
+        from vllm.v1.core.history_block_pool import HistoryBlockPool
 
-        segments = kv_cache_config.block_segments
-        if segments is None:
-            self.block_pool = BlockPool(
-                num_gpu_blocks=kv_cache_config.num_blocks,
+        def make_pool(index: int, num_blocks: int) -> BlockPool:
+            host = bool(kv_cache_config.host_kv_layers) and (
+                kv_cache_config.block_segments is None
+                or index == kv_cache_config.block_segments.primary
+            )
+            pool_cls = HistoryBlockPool if host else BlockPool
+            pool = pool_cls(
+                num_gpu_blocks=num_blocks,
                 enable_caching=enable_caching,
                 hash_block_size=hash_block_size,
                 enable_kv_cache_events=enable_kv_cache_events,
-                metrics_collector=metrics_collector,
+                metrics_collector=metrics_collector if host else None,
+            )
+            if isinstance(pool, HistoryBlockPool):
+                from vllm.v1.kv_offload.host.region import host_region_layout
+
+                layout = host_region_layout(kv_cache_config, "")
+                group_id = next(
+                    i
+                    for i, group in enumerate(kv_cache_config.kv_cache_groups)
+                    if set(kv_cache_config.host_kv_layers).intersection(
+                        group.layer_names
+                    )
+                )
+                pool.configure_host(layout.num_pages, layout.num_workers, group_id)
+            return pool
+
+        segments = kv_cache_config.block_segments
+        if segments is None:
+            self.block_pool = (
+                make_pool(0, kv_cache_config.num_blocks)
+                if (kv_cache_config.host_kv_layers)
+                else BlockPool(
+                    num_gpu_blocks=kv_cache_config.num_blocks,
+                    enable_caching=enable_caching,
+                    hash_block_size=hash_block_size,
+                    enable_kv_cache_events=enable_kv_cache_events,
+                    metrics_collector=metrics_collector,
+                )
             )
             self.block_pools = (self.block_pool,)
             self._group_block_pools = None
@@ -90,14 +122,16 @@ class KVCacheCoordinator(ABC):
             # One pool per block space. Block IDs repeat across pools, so the
             # residency metrics (keyed by block ID) follow the primary pool.
             self.block_pools = tuple(
-                BlockPool(
+                make_pool(index, num_blocks)
+                if kv_cache_config.host_kv_layers
+                else BlockPool(
                     num_gpu_blocks=num_blocks,
                     enable_caching=enable_caching,
                     hash_block_size=hash_block_size,
                     enable_kv_cache_events=enable_kv_cache_events,
-                    metrics_collector=(
-                        metrics_collector if index == segments.primary else None
-                    ),
+                    metrics_collector=metrics_collector
+                    if index == segments.primary
+                    else None,
                 )
                 for index, num_blocks in enumerate(segments.num_blocks)
             )

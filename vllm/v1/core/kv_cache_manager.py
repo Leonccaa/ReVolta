@@ -680,6 +680,15 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
+        from vllm.v1.core.history_block_pool import HistoryBlockPool
+
+        if isinstance(self.block_pool, HistoryBlockPool):
+            manager = self.coordinator.single_type_managers[
+                self.block_pool.host_group_id
+            ]
+            self.block_pool.release_request(
+                request.request_id, manager.req_to_blocks.get(request.request_id, ())
+            )
         self.coordinator.free(request.request_id)
         if self.admission_ledger is not None:
             self.admission_ledger.release(request.request_id)
@@ -735,7 +744,8 @@ class KVCacheManager:
         if pools is not None:
             # Separate block spaces: reset all of them or none.
             if any(
-                pool.get_num_free_blocks() != pool.num_gpu_blocks - 1 for pool in pools
+                pool.free_block_queue.num_free_blocks != pool.num_gpu_blocks - 1
+                for pool in pools
             ):
                 logger.warning(
                     "Failed to reset prefix cache because some blocks are not freed yet"

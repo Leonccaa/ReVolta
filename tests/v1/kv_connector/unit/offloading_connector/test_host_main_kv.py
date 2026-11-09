@@ -46,7 +46,10 @@ pytestmark = pytest.mark.cpu_test
 
 @pytest.mark.parametrize("tiering", [False, True])
 @pytest.mark.parametrize("grouped", [False, True])
-def test_host_transfer_registration_and_real_cpu_budget(monkeypatch, tiering, grouped):
+@pytest.mark.parametrize("padded", [False, True])
+def test_host_transfer_registration_and_real_cpu_budget(
+    monkeypatch, tiering, grouped, padded
+):
     config = production_config(
         max_model_len=4 * SPAN,
         max_num_seqs=1,
@@ -73,6 +76,19 @@ def test_host_transfer_registration_and_real_cpu_budget(monkeypatch, tiering, gr
         replace(t, size=t.size // t.num_blocks * 2, num_blocks=2)
         for t in cfg.kv_cache_tensors
     ]
+    if padded:
+        # Exercise the retained bridge with actual interior padding. Both
+        # backing budget paths must cover the physical descriptor exactly.
+        cfg.kv_cache_tensors = [
+            replace(
+                t,
+                size=t.size + 4096 * t.num_blocks,
+                page_stride_bytes=t.page_stride_bytes + 4096,
+            )
+            if t.page_stride_bytes is not None
+            else t
+            for t in cfg.kv_cache_tensors
+        ]
     cfg.num_blocks = 2
     store = HostHistoryStore(
         HostHistoryShape(

@@ -6,6 +6,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorWorkerMetadata,
 )
+from vllm.v1.kv_offload.host.page_table import SealTicket
 from vllm.v1.kv_offload.worker.worker import TransferSpec
 
 ReqId = str
@@ -47,6 +48,8 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
     # Reported only when load_failure_recompute_enabled; a failed job is also
     # in completed_jobs so the scheduler releases its bookkeeping as usual.
     failed_jobs: dict[int, int] = field(default_factory=dict)
+    seal_results: dict[SealTicket, tuple[int, int, int]] = field(default_factory=dict)
+    completed_steps: dict[int, int] = field(default_factory=dict)
 
     def mark_completed(self, job_id: int) -> None:
         """Record a transfer job completion from this worker."""
@@ -68,4 +71,16 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
         for job_id, v in other.failed_jobs.items():
             failed[job_id] = failed.get(job_id, 0) + v
 
-        return OffloadingWorkerMetadata(completed_jobs=merged, failed_jobs=failed)
+        seals = dict(self.seal_results)
+        for ticket, masks in other.seal_results.items():
+            old = seals.get(ticket, (0, 0, 0))
+            seals[ticket] = (old[0] | masks[0], old[1] | masks[1], old[2] | masks[2])
+        steps = dict(self.completed_steps)
+        for step, ranks in other.completed_steps.items():
+            steps[step] = steps.get(step, 0) | ranks
+        return OffloadingWorkerMetadata(
+            completed_jobs=merged,
+            failed_jobs=failed,
+            seal_results=seals,
+            completed_steps=steps,
+        )

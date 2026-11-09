@@ -13,13 +13,9 @@ as RAM prefixes until LRU eviction. Mutations require a new reservation/COW.
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import cast
 
-from vllm.v1.kv_offload.base import OffloadKey, ReqContext, get_offload_group_idx
-from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
-from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
-
-_CONTEXT = ReqContext(req_id="host-kv-prefix")
+from vllm.v1.kv_offload.base import OffloadKey, get_offload_group_idx
+from vllm.v1.kv_offload.host.page_table import HostPageTable, PageHandle, Result
 
 
 @dataclass(eq=False)
@@ -27,10 +23,14 @@ class HostKVPage:
     """A single-use lease. Its bytes must not be retained after release."""
 
     key: OffloadKey
-    block_id: int
+    handle: PageHandle
     _pool: "HostKVPool"
     _writing: bool
     _closed: bool = False
+
+    @property
+    def block_id(self) -> int:
+        return self.handle.page_id
 
     @property
     def view(self) -> memoryview:
@@ -62,12 +62,19 @@ class HostKVPool:
     """Borrow a fixed C-contiguous CPU buffer shaped [slots, ...].
 
     The buffer already contains the authoritative KV storage. This class only
-    allocates metadata and reuses the CPU offload manager's LRU/refcounts. It
+    delegates physical handles, leases and LRU to HostPageTable. It
     neither copies into another CPU pool nor allocates a shared offload region.
     All rows contain the same main-KV group, including every owned layer.
     """
 
-    def __init__(self, view: memoryview, *, group_idx: int, block_tokens: int):
+    def __init__(
+        self,
+        view: memoryview,
+        *,
+        group_idx: int,
+        block_tokens: int,
+        table: HostPageTable | None = None,
+    ):
         if (
             view.readonly
             or not view.c_contiguous
@@ -87,7 +94,13 @@ class HostKVPool:
         self.page_bytes = view.nbytes // self.num_blocks
         if not self.page_bytes:
             raise ValueError("Host KV pages must not be empty")
-        self._manager = CPUOffloadingManager(self.num_blocks, cache_policy="lru")
+        if table is not None and len(table.pages) != self.num_blocks:
+            raise ValueError("Host view and physical page table differ in size")
+        self.table = (
+            table
+            if table is not None
+            else HostPageTable(self.num_blocks, zero_page=False)
+        )
         self._leases: set[HostKVPage] = set()
 
     def _check_key(self, key: OffloadKey) -> None:
@@ -97,31 +110,36 @@ class HostKVPool:
     def _check_lease(self, page: HostKVPage) -> None:
         if page._pool is not self or page not in self._leases:
             raise ValueError("Foreign or released host KV lease")
+        self.table.get(page.handle)
 
-    def _lease(self, key: OffloadKey, block_id: int, writing: bool) -> HostKVPage:
-        page = HostKVPage(key, block_id, self, writing)
+    def _lease(self, key: OffloadKey, handle: PageHandle, writing: bool) -> HostKVPage:
+        page = HostKVPage(key, handle, self, writing)
         self._leases.add(page)
+        self.table.pin(handle, id(page))
         return page
 
-    def lookup(self, key: OffloadKey) -> bool | None:
+    def lookup(self, key: OffloadKey) -> PageHandle | None:
         self._check_key(key)
-        return self._manager.lookup(key, _CONTEXT)
+        return self.table.lookup(key)
 
-    def is_ready(self, key: OffloadKey) -> bool:
+    def is_ready(self, handle: PageHandle | None) -> bool:
         """Side-effect-free readiness for the complete-prefix contract residency
         probe."""
-        self._check_key(key)
-        return self._manager.is_ready_resident(key)
+        if handle is None:
+            return False
+        try:
+            return self.table.is_ready(handle)
+        except ValueError:
+            return False
 
     def reserve(self, key: OffloadKey) -> HostKVPage | None:
         """Reserve an unpublished row; None means resident, in flight or full."""
-        if self.lookup(key) is not False:
+        if self.lookup(key) is not None:
             return None
-        output = self._manager.prepare_store([key], _CONTEXT)
-        if output is None:
+        handle = self.table.reserve(loading_key=key)
+        if handle is None:
             return None
-        spec = cast(CPULoadStoreSpec, output.store_spec)
-        return self._lease(key, int(spec.block_ids[0]), True)
+        return self._lease(key, handle, True)
 
     def publish(self, page: HostKVPage) -> None:
         """After the producer's host-visible fence, make an immutable read lease.
@@ -132,16 +150,17 @@ class HostKVPool:
         self._check_lease(page)
         if not page._writing:
             raise ValueError("Host KV page is already published")
-        self._manager.complete_store([page.key], _CONTEXT)
-        self._manager.prepare_load([page.key], _CONTEXT)
+        record = self.table.get(page.handle)
+        record.compute_result = record.seal_result = Result.OK
+        self.table.publish(page.handle, page.key)
         page._writing = False
 
-    def pin(self, key: OffloadKey) -> HostKVPage | None:
-        if self.lookup(key) is not True:
+    def pin(self, handle: PageHandle | None) -> HostKVPage | None:
+        if handle is None or not self.is_ready(handle):
             return None
-        spec = cast(CPULoadStoreSpec, self._manager.prepare_load([key], _CONTEXT))
-        self._manager.touch([key], _CONTEXT)
-        return self._lease(key, int(spec.block_ids[0]), False)
+        key = self.table.get(handle).key
+        assert key is not None
+        return self._lease(key, handle, False)
 
     def release(self, page: HostKVPage) -> None:
         """Abort unpublished bytes, or leave a published row cached in place."""
@@ -149,9 +168,11 @@ class HostKVPool:
             return
         self._check_lease(page)
         if page._writing:
-            self._manager.complete_store([page.key], _CONTEXT, success=False)
-        else:
-            self._manager.complete_load([page.key], _CONTEXT)
+            record = self.table.get(page.handle)
+            if self.table.index.get(page.key) == page.handle:
+                del self.table.index[page.key]
+            record.valid = False
+        self.table.release(page.handle, id(page))
         page._closed = True
         self._leases.remove(page)
 
@@ -162,7 +183,7 @@ class HostKVPool:
             self._check_key(key)
         pages = []
         for key in keys:
-            page = self.pin(key)
+            page = self.pin(self.lookup(key))
             if page is None:
                 break
             pages.append(page)

@@ -129,6 +129,8 @@ def request(scheduler, name, length, max_tokens=1):
 
 
 def complete(scheduler, output, *, received=(), invalid=()):
+    from tests.v1.core.long_context_kv_utils import host_step_receipts
+
     received = {
         rid
         for rid in received
@@ -155,7 +157,9 @@ def complete(scheduler, output, *, received=(), invalid=()):
             prompt_logprobs_dict={},
             pooler_output=[],
             kv_connector_output=KVConnectorOutput(
-                finished_recving=set(received), invalid_block_ids=set(invalid)
+                finished_recving=set(received),
+                invalid_block_ids=set(invalid),
+                kv_connector_worker_meta=host_step_receipts(scheduler, output),
             ),
         ),
     )

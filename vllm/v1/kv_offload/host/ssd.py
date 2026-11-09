@@ -212,7 +212,7 @@ class HostKVPrefixCache:
         SSD existence and pending reservations never qualify. Call poll on
         the controller thread before a lookup to publish completed reads.
         """
-        return not self._closed and self.pool.is_ready(key)
+        return not self._closed and self.pool.is_ready(self.pool.lookup(key))
 
     def _has_capacity(self) -> bool:
         if self.pending_blocks >= self._max_pending:
@@ -256,7 +256,7 @@ class HostKVPrefixCache:
         # integration.
         if any(p.key == key and not load for p, load in self._pending.values()):
             return False
-        page = self.pool.pin(key)
+        page = self.pool.pin(self.pool.lookup(key))
         return page is not None and self._submit(page, loading=False)
 
     def prefetch(self, key: OffloadKey) -> bool:
@@ -264,7 +264,7 @@ class HostKVPrefixCache:
         self.poll()
         if not self.enabled or not self._has_capacity():
             return False
-        if self.pool.lookup(key) is not False:
+        if self.pool.lookup(key) is not None:
             return False
         tier = self._tier
         if tier is None:

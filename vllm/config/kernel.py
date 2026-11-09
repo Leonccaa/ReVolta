@@ -412,14 +412,22 @@ class LongContextKVConfig:
     hot_pool_gib: (
         Annotated[float, Field(gt=0, allow_inf_nan=False)] | Literal["auto"] | None
     ) = None
-    """Total fixed hot-pool budget per GPU in GiB, covering payload, slot metadata,
+    """Guaranteed minimum hot slots, converted from a per-GPU GiB budget
+    covering payload, slot metadata,
     shared workspace and write staging. Per-history-block metadata is charged
     separately to the history segment. At most one of this and
     ``hot_pool_ratio`` may be set. ``auto`` uses the remaining KV memory after
     state, demand-sized history and prefill staging. With neither set, use
-    ``auto``. The host pool must still be sized explicitly."""
+    ``auto`` (a change from the previous implicit ratio sizing). Auto guarantees
+    the per-step verify working set. The actual hot region may be larger than
+    either minimum; static host allocation allocates a static pool. A minimum that
+    cannot coexist
+    with the active working set is a startup error. The host pool must still
+    be sized explicitly."""
     hot_pool_ratio: float | None = Field(default=None, gt=0, le=1)
-    """GPU hot-page pool as a fraction of the host history pool's tokens."""
+    """Guaranteed minimum hot slots, using the existing conversion from a
+    fraction of the host history pool's rank-local tokens. Mutually exclusive
+    with hot_pool_gib; the actual hot region may be larger."""
     prewarm_hot_pool: bool = True
     """Warm the hot-page pool from the last prefill step's selection."""
     prefill_staging_gib: float = Field(default=0.0, ge=0)

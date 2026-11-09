@@ -8,7 +8,7 @@ is the smaller unit readers address; padding must divide uniformly over it.
 """
 
 from dataclasses import dataclass
-from math import prod
+from math import lcm, prod
 
 import torch
 
@@ -21,6 +21,95 @@ def align_up(size: int, alignment: int = 16) -> int:
     if size < 0 or alignment <= 0:
         raise ValueError("Invalid byte size or alignment")
     return (size + alignment - 1) // alignment * alignment
+
+
+def padded_page_stride(
+    payload_bytes: int,
+    slot_bytes: int,
+    *,
+    subdivisions: int = 1,
+    subpage_payload_bytes: int | None = None,
+    element_bytes: int = 1,
+    max_stride_bytes: int = 2**31 - 1,
+) -> int:
+    """Smallest page holding an integer number of hot slots and kernel pages.
+
+    Each subpage must hold its logical payload and have an element-aligned
+    stride. Reject unsupported/overflowing layouts before allocating storage.
+    The physical description never changes an ordinary KV spec.
+    """
+    if min(payload_bytes, slot_bytes, subdivisions, element_bytes) <= 0:
+        raise ValueError("Invalid padded KV page geometry")
+    if subpage_payload_bytes is None:
+        if payload_bytes % subdivisions:
+            raise ValueError("Logical payload must divide over kernel subpages")
+        subpage_payload_bytes = payload_bytes // subdivisions
+    if subpage_payload_bytes <= 0 or subpage_payload_bytes % element_bytes:
+        raise ValueError("Kernel payload must be element aligned")
+    alignment = lcm(slot_bytes, subdivisions * element_bytes)
+    stride = align_up(
+        max(payload_bytes, subdivisions * subpage_payload_bytes), alignment
+    )
+    if stride > max_stride_bytes:
+        raise ValueError("No supported padded KV page stride satisfies the geometry")
+    return stride
+
+
+def _logical_page(
+    view: torch.Tensor, block_id: int, subdivisions: int, block_dim: int
+) -> torch.Tensor:
+    if (
+        subdivisions < 1
+        or block_id < 0
+        or not 0 <= block_dim < view.ndim
+        or view.shape[block_dim] % subdivisions
+        or (block_id + 1) * subdivisions > view.shape[block_dim]
+    ):
+        raise ValueError("Invalid logical KV page range")
+    return view.narrow(block_dim, block_id * subdivisions, subdivisions)
+
+
+def pack_page_payload(
+    view: torch.Tensor, block_id: int, subdivisions: int = 1, *, block_dim: int = 0
+) -> torch.Tensor:
+    """Pack each kernel subpage's logical elements in order as raw bytes.
+
+    Padding between or inside physical scheduler pages is excluded. The view
+    defines the payload (including scales, when present), never a raw [0,P)
+    prefix. The returned allocation is independent even for contiguous pages.
+    """
+    page = _logical_page(view, block_id, subdivisions, block_dim).movedim(block_dim, 0)
+    return (
+        page.clone(memory_format=torch.contiguous_format).reshape(-1).view(torch.uint8)
+    )
+
+
+def scatter_page_payload(
+    packed: torch.Tensor,
+    view: torch.Tensor,
+    block_id: int,
+    subdivisions: int = 1,
+    *,
+    block_dim: int = 0,
+) -> None:
+    """Scatter packed logical bytes through the destination's actual strides.
+
+    Physical padding and other pages remain untouched. Stream ordering,
+    ownership and cross-device transport belong to the seal/restore caller.
+    """
+    page = _logical_page(view, block_id, subdivisions, block_dim).movedim(block_dim, 0)
+    if (
+        packed.dtype != torch.uint8
+        or packed.ndim != 1
+        or not packed.is_contiguous()
+        or packed.device != view.device
+        or packed.numel() != page.numel() * page.element_size()
+    ):
+        raise ValueError("Packed KV payload does not match the logical page")
+    source = packed
+    if packed.storage_offset() % view.element_size():
+        source = packed.clone()  # A byte-frame header need not be element aligned.
+    page.copy_(source.view(view.dtype).reshape(page.shape))
 
 
 @dataclass(frozen=True)

@@ -170,7 +170,8 @@ def test_unpublished_write_through_is_unreadable(tmp_path, caches):
     page.view[:] = payload()
     for k in keys[1:]:
         commit(c.pool, k)
-    assert c.pool.lookup(keys[0]) is None
+    assert c.pool.lookup(keys[0]) is not None
+    assert not c.pool.is_ready(c.pool.lookup(keys[0]))
     assert not c.reader_ready(keys[0])
     assert manager.get_computed_blocks(request)[1] == 0
     assert connector.get_num_new_matched_tokens(request, 0) == (0, False)
@@ -259,7 +260,8 @@ def test_failed_external_extension_preserves_local_leases(
     keys = fill(c, request, 7)
     assert manager.get_computed_blocks(request)[1] == 4 * BS
     pin = c.pool.pin
-    monkeypatch.setattr(c.pool, "pin", lambda k: None if k == keys[-1] else pin(k))
+    failed_handle = c.pool.lookup(keys[-1])
+    monkeypatch.setattr(c.pool, "pin", lambda h: None if h == failed_handle else pin(h))
     assert connector.get_num_new_matched_tokens(request, 4 * BS) == (0, False)
     assert [p.key for p in hits.pinned_pages(request.request_id)] == keys[:4]
     assert len(c.pool._leases) == 4
@@ -275,7 +277,8 @@ def test_pin_failure_is_a_miss_with_no_partial_lease(
     manager, connector, request, hits = paths(c)
     keys = fill(c, request, 4)
     pin = c.pool.pin
-    monkeypatch.setattr(c.pool, "pin", lambda k: None if k == keys[1] else pin(k))
+    failed_handle = c.pool.lookup(keys[1])
+    monkeypatch.setattr(c.pool, "pin", lambda h: None if h == failed_handle else pin(h))
     if path == "gpu":
         assert manager.get_computed_blocks(request)[1] == 0
     else:
@@ -355,7 +358,7 @@ def test_cold_promotion_reports_only_verified_common_prefix(tmp_path, caches, da
         ]
     else:
         assert second.stats()["load_failures"] == 1
-        assert second.pool.lookup(keys[1]) is False
+        assert second.pool.lookup(keys[1]) is None
     hits.release_uncommitted()
 
 

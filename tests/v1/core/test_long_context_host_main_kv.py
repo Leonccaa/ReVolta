@@ -35,7 +35,7 @@ from .test_long_context_split_pool import GPU_BUDGET, WORKERS, _layer_specs
 pytestmark = pytest.mark.cpu_test
 
 LOCAL = SPAN // 2
-HOST_META_BYTES = 14 * LOCAL + 4  # 12 hot maps + wanted + ready, generation
+HOST_META_BYTES = 14 * LOCAL + 8  # 12 hot maps + wanted + ready, generation
 HOST_PAGE_BYTES = MAIN_KV_BLOCK_BYTES  # one block, 12 layers, one worker
 MAIN_KV = [f"model.layers.{layer}.self_attn" for layer in range(3, 48, 4)]
 
@@ -54,7 +54,8 @@ def configs(lc, *, max_model_len=512 * 1024, memory=GPU_BUDGET, max_num_seqs=8):
         max_model_len=max_model_len, long_context=lc, max_num_seqs=max_num_seqs
     )
     config.model_config.original_max_model_len = max_model_len
-    config.kv_transfer_config = None
+    if lc.main_kv_placement == "host":
+        config.kv_transfer_config = SimpleNamespace(kv_connector="OffloadingConnector")
     specs = production_specs()
     return get_kv_cache_configs(config, [specs] * WORKERS, [memory] * WORKERS)
 
@@ -128,8 +129,11 @@ def test_history_ids_never_outnumber_host_pages():
 
 
 def test_hot_pool_must_hold_one_row_and_every_request_tail():
-    with pytest.raises(ValueError, match="one query row with 8 request tails"):
-        configs(host_settings(hot_pool_gib=0.01), max_model_len=1000)
+    (cfg, *_) = configs(host_settings(hot_pool_gib=0.01), max_model_len=1000)
+    plan = cfg.long_context_plan
+    assert plan.hot_pool_groups >= plan.hot_pool_min_groups
+    assert plan.hot_pool_groups >= plan.geometry.hot_reserve_groups(1000)
+    assert plan.hot_pool_groups > plan.hot_pool_min_groups
 
 
 def test_host_placement_accepts_builtin_connector_and_refuses_int8():
@@ -140,7 +144,6 @@ def test_host_placement_accepts_builtin_connector_and_refuses_int8():
 
     (host_cfg,) = get_kv_cache_configs(config, [production_specs()], [GPU_BUDGET])
     assert host_cfg.host_kv_layers == MAIN_KV
-    config.kv_transfer_config = None
     specs = production_specs()
     for name in MAIN_KV:
         specs[name] = FullAttentionSpec(
@@ -218,6 +221,21 @@ def test_worker_binds_one_host_store_to_the_qsa_layers(monkeypatch):
     if os.environ.get("TRITON_INTERPRET") != "1":
         pytest.skip("The CPU host store needs TRITON_INTERPRET=1")
     from vllm.models.qwen4_exp.nvidia.host_kv.engine import build_host_history_store
+    from vllm.models.qwen4_exp.nvidia.host_kv.history import HostHistoryStore
+
+    # This production-size geometry fixture uses ordinary CPU backing. The
+    # shared row layout and registration are tested with bounded real mmaps.
+    def cpu_store(*args, **kwargs):
+        kwargs.pop("region_layout")
+        kwargs.pop("rank")
+        return HostHistoryStore(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "vllm.models.qwen4_exp.nvidia.host_kv.engine.HostHistoryStore", cpu_store
+    )
+    monkeypatch.setattr(
+        "vllm.distributed.get_world_group", lambda: SimpleNamespace(rank_in_group=0)
+    )
 
     (cfg, *_) = configs(
         host_settings(host_pool_tokens=8 * SPAN, hot_pool_gib=0.2, state_blocks=71),
@@ -234,6 +252,7 @@ def test_worker_binds_one_host_store_to_the_qsa_layers(monkeypatch):
         for name in cfg.host_kv_layers
     }
     vllm_config = production_config(max_model_len=4 * SPAN, max_num_seqs=1)
+    vllm_config.instance_id = "cpu-binding-fixture"
     store = build_host_history_store(
         cfg,
         vllm_config,
@@ -247,7 +266,11 @@ def test_worker_binds_one_host_store_to_the_qsa_layers(monkeypatch):
     assert (shape.kernel_block_tokens, shape.kernel_blocks_per_block) == (LOCAL, 1)
     assert (shape.num_layers, shape.kv_heads, shape.head_dim) == (12, 1, 256)
     assert shape.dtype == torch.uint8 and shape.hot_slots == plan.hot_pool_groups
-    assert shape.rows_per_pass == (plan.hot_pool_groups - 9) // 513 >= 1
+    assert (
+        shape.rows_per_pass
+        == min(shape.read_rows, (plan.hot_pool_groups - 9) // 513)
+        >= 1
+    )
     # Host bytes: one page per history ID and layer, within the host pool.
     assert store.host.numel() == 8 * HOST_PAGE_BYTES
     assert store.host_page(3).numel() == HOST_PAGE_BYTES
@@ -257,6 +280,7 @@ def test_worker_binds_one_host_store_to_the_qsa_layers(monkeypatch):
         + store.wanted.numel() * 4
         + store.ready.numel()
         + store.generation.numel() * 4
+        + store.page_of.numel() * 4
     )
     assert meta == shape.num_blocks * HOST_META_BYTES
     assert store.hot.numel() < plan.gpu_hot_pool_bytes
@@ -326,6 +350,7 @@ def test_host_placement_preserves_r2_streaming_progress(
                 block_size=16,
                 hash_block_size=16,
             )
+            scheduler.connector = None  # Scheduler-only fixture has no I/O worker.
         return scheduler
 
     monkeypatch.setattr(regression, "_scheduler", host_scheduler)

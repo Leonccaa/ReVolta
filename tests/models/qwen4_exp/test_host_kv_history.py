@@ -84,6 +84,9 @@ class Engine:
     def __init__(self, shape, *, dcp=(1, 0), seed=7):
         self.shape = shape
         self.store = HostHistoryStore(shape, ["l0", "l1"], device="cpu")
+        self.store.bind_pages(
+            [(hid, shape.num_blocks - hid) for hid in range(1, shape.num_blocks)]
+        )
         self.layer = self.store.layer("l1")
         self.world, self.rank = dcp
         self.paged = torch.zeros(
@@ -234,7 +237,8 @@ class Engine:
     def check_bytes(self) -> None:
         """Host pages equal the paged cache for every committed slot."""
         ready = self.store.ready.view(-1, KBS).bool()
-        host = self.layer.host_view.permute(0, 2, 1, 3, 4)[ready]
+        logical = self.layer.host_view[self.store.page_of.long()].flatten(0, 1)
+        host = logical.permute(0, 2, 1, 3, 4)[ready]
         paged = self.paged.permute(0, 2, 1, 3, 4)[ready]
         assert ready.sum() > 0
         assert torch.equal(_bits(host), _bits(paged))
@@ -363,9 +367,10 @@ def test_host_page_is_one_contiguous_block_for_all_layers():
     page = engine.store.host_page(block)
     assert page.is_contiguous()
     assert page.shape == (1, 2, 2, KBS, HEADS, DIM)
-    assert page.data_ptr() == engine.store.host[block].data_ptr()
+    physical = int(engine.store.page_of[block])
+    assert page.data_ptr() == engine.store.host[physical].data_ptr()
     # Layer l1's page bytes are its kernel-block view of the same block.
-    assert torch.equal(_bits(page[0, 1]), _bits(engine.layer.host_view[block]))
+    assert torch.equal(_bits(page[0, 1]), _bits(engine.layer.host_view[physical, 0]))
     with pytest.raises(IndexError):
         engine.store.host_page(engine.shape.num_blocks)
 

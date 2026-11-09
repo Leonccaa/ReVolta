@@ -1674,6 +1674,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Finish offload stores whose source blocks this step reuses before
             # zeroing them below; see ActiveKVConnector.handle_preemptions.
             self.kv_connector.handle_preemptions(scheduler_output)
+            host_step = getattr(scheduler_output, "host_kv", None)
+            if host_step is not None:
+                assert self.host_history is not None
+                self.host_history.bind_pages(host_step.bindings)
             if scheduler_output.new_block_ids_to_zero:
                 self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
             if scheduler_output.total_num_scheduled_tokens == 0:
@@ -1948,6 +1952,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         aux_hidden_states = self.execute_model_state.aux_hidden_states
         finished_req_ids = self.execute_model_state.finished_req_ids
         self.execute_model_state = None
+        if getattr(self, "host_history", None) is not None:
+            self.kv_connector.seal_host_step()
         mtp_profile_ctx = self._sm70_v2_mtp_profile_pending
         self._sm70_v2_mtp_profile_pending = None
 
@@ -2225,6 +2231,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if hasattr(self, "kv_caches"):
             self.kv_caches.clear()
+        if self.host_history is not None:
+            self.host_history.close()
+            self.kv_connector.close_host_kv()
         self.host_history = None
         if hasattr(self, "attn_groups"):
             self.attn_groups.clear()

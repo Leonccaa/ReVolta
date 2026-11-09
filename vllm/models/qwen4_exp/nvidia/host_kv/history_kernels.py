@@ -26,18 +26,22 @@ def local_length(length, WORLD: tl.constexpr, RANK: tl.constexpr, IL: tl.constex
 @triton.jit
 def store_offsets(
     kernel_block,
+    PageOf,
     plane,
     offset,
     head,
     dim,
     HS0: tl.constexpr,
+    HSS: tl.constexpr,
     HS1: tl.constexpr,
     HS2: tl.constexpr,
     HS3: tl.constexpr,
+    RATIO: tl.constexpr,
 ):
     # Widen every independent product before adding it to the block term.
     return (
-        tl.cast(kernel_block, tl.int64) * HS0
+        tl.load(PageOf + kernel_block // RATIO).to(tl.int64) * HS0
+        + (kernel_block % RATIO).to(tl.int64) * HSS
         + tl.cast(plane, tl.int64) * HS1
         + tl.cast(offset, tl.int64) * HS2
         + tl.cast(head, tl.int64) * HS3
@@ -53,14 +57,17 @@ def write_slots(
     Host,
     Hot,
     Map,
+    PageOf,
     KS0: tl.constexpr,
     KS1: tl.constexpr,
     VS0: tl.constexpr,
     VS1: tl.constexpr,
     HS0: tl.constexpr,
+    HSS: tl.constexpr,
     HS1: tl.constexpr,
     HS2: tl.constexpr,
     HS3: tl.constexpr,
+    RATIO: tl.constexpr,
     KBS: tl.constexpr,
     H: tl.constexpr,
     D: tl.constexpr,
@@ -73,10 +80,14 @@ def write_slots(
     valid = slot >= 0
     safe = tl.maximum(slot, 0)
     kernel_block, offset = safe // KBS, safe % KBS
+    page = tl.load(PageOf + kernel_block // RATIO)
+    valid = valid & (page > 0)
     lane = valid & (x < H * D)
     key = tl.load(K + row * KS0 + (x // D) * KS1 + x % D, lane, 0)
     value = tl.load(V + row * VS0 + (x // D) * VS1 + x % D, lane, 0)
-    host = store_offsets(kernel_block, 0, offset, x // D, x % D, HS0, HS1, HS2, HS3)
+    host = store_offsets(
+        kernel_block, PageOf, 0, offset, x // D, x % D, HS0, HSS, HS1, HS2, HS3, RATIO
+    )
     tl.store(Host + host, key, lane)
     tl.store(Host + host + HS1, value, lane)
     hot_slot = tl.load(Map + kernel_block * (KBS // 4) + offset // 4, valid, -1)
@@ -86,11 +97,14 @@ def write_slots(
 
 
 @triton.jit
-def commit_slots(Slot, Ready, N: tl.constexpr, B: tl.constexpr):
+def commit_slots(
+    Slot, Ready, PageOf, SPAN: tl.constexpr, N: tl.constexpr, B: tl.constexpr
+):
     """Publish rows after a kernel boundary that follows both copies."""
     i = tl.program_id(0).to(tl.int64) * B + tl.arange(0, B)
     slot = tl.load(Slot + i, i < N, -1).to(tl.int64)
-    tl.store(Ready + tl.maximum(slot, 0), 1, (i < N) & (slot >= 0))
+    page = tl.load(PageOf + tl.maximum(slot, 0) // SPAN)
+    tl.store(Ready + tl.maximum(slot, 0), 1, (i < N) & (slot >= 0) & (page > 0))
 
 
 @triton.jit
@@ -239,10 +253,13 @@ def gather_groups(
     Misses,
     MissSlots,
     Count,
+    PageOf,
     HS0: tl.constexpr,
+    HSS: tl.constexpr,
     HS1: tl.constexpr,
     HS2: tl.constexpr,
     HS3: tl.constexpr,
+    RATIO: tl.constexpr,
     KBS: tl.constexpr,
     H: tl.constexpr,
     D: tl.constexpr,
@@ -259,8 +276,23 @@ def gather_groups(
         kernel_block = gid // (KBS // 4)
         offset = gid % (KBS // 4) * 4 + within
         ready = tl.load(Ready + kernel_block * KBS + offset)
-        host = store_offsets(kernel_block, plane, offset, head, dim, HS0, HS1, HS2, HS3)
-        payload = tl.load(Host + host, (x < 8 * H * D) & (ready != 0), 0)
+        page = tl.load(PageOf + kernel_block // RATIO)
+        tl.device_assert(page >= 0, "unbound host page read")
+        host = store_offsets(
+            kernel_block,
+            PageOf,
+            plane,
+            offset,
+            head,
+            dim,
+            HS0,
+            HSS,
+            HS1,
+            HS2,
+            HS3,
+            RATIO,
+        )
+        payload = tl.load(Host + host, (x < 8 * H * D) & (ready != 0) & (page >= 0), 0)
         tl.store(Hot + slot * (8 * H * D) + x, payload, x < 8 * H * D)
 
 

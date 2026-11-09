@@ -120,6 +120,11 @@ class CPUOffloadingSpec(OffloadingSpec):
         self.cpu_group_page_sizes: dict[int, int] = {}
         self.cpu_group_num_blocks: dict[int, int] = {}
         host_layers = set(getattr(kv_cache_config, "host_kv_layers", ()))
+        # static host allocation still registers host main K/V as a canonical transfer
+        # tensor.
+        # Keep both budget paths in lockstep with that bridge. receive transactions must
+        # remove
+        # the canonical member and this charge together with ReceiveTxn.
         host_page = getattr(kv_cache_config, "host_kv_page_size_bytes", 0)
         world_size = vllm_config.parallel_config.world_size
         if self.partition_by_group:

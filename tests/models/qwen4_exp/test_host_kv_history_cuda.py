@@ -137,7 +137,7 @@ def test_writes_equal_the_paged_cache_writer(e4m3):
     arms.write(key, value, slots)
     torch.accelerator.synchronize()
     ready = arms.store.ready.view(arms.blocks, PAGE).bool().cpu()
-    host = arms.layer.host_view.permute(0, 2, 1, 3, 4)[ready]
+    host = arms.layer.host_view.flatten(0, 1).permute(0, 2, 1, 3, 4)[ready]
     paged = arms.paged.cpu().permute(0, 2, 1, 3, 4)[ready]
     assert int(ready.sum()) == int((slots >= 0).sum()) + PAGE  # + null block
     assert torch.equal(host.view(torch.uint8), paged.view(torch.uint8))

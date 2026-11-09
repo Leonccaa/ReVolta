@@ -68,6 +68,14 @@ def compute_sub_block_ptrs(
     """
     assert skip_count < block_size_factor
 
+    page_of = getattr(tensor, "_host_page_of", None)
+    if page_of is not None:
+        block_ids = page_of[block_ids]
+        if (block_ids < 0).any():
+            raise ValueError(
+                "static host allocation bridge accessed an unbound host history ID"
+            )
+
     num_sub_blocks = len(output)
     base_ptr = tensor.data_ptr()
     row_stride = tensor.stride(0)
@@ -90,7 +98,7 @@ def compute_sub_block_ptrs(
     output[:] = flat[skip_count : skip_count + num_sub_blocks]
 
 
-def pin_mmap_region(region: SharedOffloadRegion) -> None:
+def pin_mmap_region(region: SharedOffloadRegion, flags: int = 0) -> None:
     """Register the entire mmap as CUDA pinned memory via cudaHostRegister."""
     rank = region.rank
 
@@ -105,7 +113,7 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
     fcntl.flock(region.fd, fcntl.LOCK_EX)
     try:
         result = torch.cuda.cudart().cudaHostRegister(
-            base_ptr, region.total_size_bytes, 0
+            base_ptr, region.total_size_bytes, flags
         )
     finally:
         fcntl.flock(region.fd, fcntl.LOCK_UN)
@@ -563,6 +571,9 @@ class CpuGpuOffloadingHandlers:
                 gpu_tensor = kv_cache_tensor.tensor.view(torch.int8).view(
                     (-1, gpu_page_size_bytes)
                 )
+                page_of = getattr(kv_cache_tensor.tensor, "_host_page_of", None)
+                if page_of is not None:
+                    gpu_tensor._host_page_of = page_of
                 cpu_page_size_bytes = gpu_page_size_bytes * block_size_factor
 
                 tensor_region = tensor_regions.get(tensor_idx, mmap_region)

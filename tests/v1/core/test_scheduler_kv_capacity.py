@@ -121,11 +121,19 @@ def make_scheduler(config, worker_cache):
 def step(scheduler):
     output = scheduler.schedule()
     ids = list(output.num_scheduled_tokens)
+    from tests.v1.core.long_context_kv_utils import host_step_receipts
+    from vllm.v1.outputs import KVConnectorOutput
+
+    meta = host_step_receipts(scheduler, output)
+    kv_output = KVConnectorOutput(kv_connector_worker_meta=meta) if meta else None
+    if not ids and kv_output is not None:
+        scheduler.update_host_kv_output(kv_output)
     if ids:
         scheduler.update_from_output(
             output,
             ModelRunnerOutput(
                 req_ids=ids,
+                kv_connector_output=kv_output,
                 req_id_to_index={rid: i for i, rid in enumerate(ids)},
                 # A partial prefill produces no sampled token. Only the
                 # completed prompt and decode steps return a model output.

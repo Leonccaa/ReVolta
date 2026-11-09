@@ -27,6 +27,8 @@ from vllm.v1.core.long_context_kv import (
     plan_long_context_capacity,
     validate_long_context_plan,
 )
+from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+from vllm.v1.kv_offload.host.region import HostRegionLayout, host_region_layout
 
 pytestmark = pytest.mark.cpu_test
 
@@ -63,6 +65,28 @@ def sparse_zero_payloads(tmp_path, monkeypatch):
         )
 
     monkeypatch.setattr(torch, "zeros", sparse_zeros)
+
+    def sparse_region(layout, rank):
+        # Preserve the production shared row geometry without populating a
+        # 24-112 GiB mapping in this bounded CPU runner.
+        path = tmp_path / f"region-{len(paths)}"
+        paths.append(path)
+        size = layout.num_pages * layout.worker_bytes * layout.num_workers
+        region = SharedOffloadRegion.__new__(SharedOffloadRegion)
+        region._base = torch.from_file(
+            str(path), shared=True, size=size, dtype=torch.int8
+        )
+        region._views = []
+        region._row_stride = layout.worker_bytes * layout.num_workers
+        region._worker_offset = rank * layout.worker_bytes
+        region._worker_area_end = (rank + 1) * layout.worker_bytes
+        region.num_blocks, region.rank = layout.num_pages, rank
+        region.total_size_bytes = size
+        region.is_pinned = region._creator = region._scheduler_unlink = False
+        region.mmap_obj = region.fd = None
+        return region
+
+    monkeypatch.setattr(HostRegionLayout, "open", sparse_region)
 
 
 def _geometry(model, dcp, max_write_rows):
@@ -128,7 +152,7 @@ def test_real_store_fits_the_total_budget(
     geo, dtype, heads = _geometry(model, dcp, write_rows)
     receipt = dataclasses.asdict(geo)
     gib = (
-        ab.hot_pool_gib_for_rows(receipt, write_rows, seqs)
+        ab.hot_pool_gib_for_rows(receipt, min(write_rows, geo.hot_read_rows), seqs)
         if budget == "single-pass"
         else budget
     )
@@ -190,7 +214,7 @@ def test_real_store_fits_the_total_budget(
         == shape.num_blocks * geo.main_kv_bytes_per_block
     )
     if budget == "single-pass":
-        assert shape.rows_per_pass >= write_rows
+        assert shape.rows_per_pass == min(write_rows, geo.hot_read_rows)
 
 
 def test_store_budget_handles_split_kernel_blocks(sparse_zero_payloads):
@@ -241,6 +265,7 @@ def test_auto_real_store_uses_all_remaining_bytes(
         from vllm.v1.core.kv_cache_utils import get_kv_cache_configs
 
         config = production_config(long_context=settings)
+        config.instance_id = "cpu-budget-fixture"
         config.model_config.original_max_model_len = config.model_config.max_model_len
         specs = production_specs(speculative_blocks=0)  # State replay enabled.
         for name, spec in list(specs.items()):
@@ -267,6 +292,9 @@ def test_auto_real_store_uses_all_remaining_bytes(
         monkeypatch.setattr(
             "vllm.distributed.get_dcp_group",
             lambda: SimpleNamespace(world_size=2, rank_in_group=1),
+        )
+        monkeypatch.setattr(
+            "vllm.distributed.get_world_group", lambda: SimpleNamespace(rank_in_group=1)
         )
         config.parallel_config.cp_kv_cache_interleave_size = 1
         store = build_host_history_store(
@@ -329,10 +357,22 @@ def test_auto_real_store_uses_all_remaining_bytes(
             geo.local_block_tokens, geo.hot_layers
         ).items()
     }
-    assert (
-        store.host.untyped_storage().nbytes()
-        == shape.num_blocks * geo.main_kv_bytes_per_block
-    )
+    if store.region is None:
+        assert (
+            store.host.untyped_storage().nbytes()
+            == shape.num_blocks * geo.main_kv_bytes_per_block
+        )
+    else:
+        layout = host_region_layout(cfg, config.instance_id)
+        assert (
+            store.host.untyped_storage().nbytes()
+            == layout.num_pages * geo.host_bytes_per_block
+        )
+        assert store.host.stride(0) * shape.dtype.itemsize == geo.host_bytes_per_block
+        assert (
+            store.host.numel() * shape.dtype.itemsize
+            == layout.num_pages * geo.main_kv_bytes_per_block
+        )
     assert shape.num_blocks * geo.host_bytes_per_block <= plan.host_pool_bytes
     used = (
         plan.gpu_state_bytes

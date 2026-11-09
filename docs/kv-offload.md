@@ -280,6 +280,35 @@ Prometheus endpoint or a prompt-token hit rate. The delayed queue's `written` an
 `written_bytes_24h` count submitted rows and page bytes, which may still fail or be
 skipped by the disk tier; they do not prove successful physical writes.
 
+## Active Host KV development configuration
+
+`kernel_config.long_context_kv` is an experimental, opt-in configuration for
+QSA main K/V in host memory. Host placement requires the built-in
+`OffloadingConnector`; state and draft prefix transfers still use that connector.
+This development interface does not extend the project's supported deployment
+scope.
+
+`hot_pool_gib` and `hot_pool_ratio` are mutually exclusive ways to set a
+**guaranteed minimum number of hot slots**. GiB sizing converts the total
+per-worker budget, including payload, metadata and shared scratch, into whole
+slots. Ratio sizing retains the conversion from a fraction of the host pool's
+rank-local tokens. Neither setting imposes an upper limit on the actual pool.
+The current implementation allocates a static pool and may raise it to fit the
+minimum active working set. A requested minimum that cannot coexist with that
+working set causes a startup configuration error; it is never silently reduced.
+
+With neither setting supplied, or with `hot_pool_gib="auto"`, the hot pool uses
+the KV budget remaining after state, demand-sized history and prefill staging.
+Auto guarantees the configured verify working set, capped by each request's
+maximum local history. **Omitting both settings now selects auto, replacing the
+older implicit ratio sizing.** The host pool must still be sized explicitly.
+
+The host reader reserves a fixed `R_cap=256` rows of indices scratch. Startup
+checks the resolved decode capture sizes and `max_num_seqs` times the verify
+width against that limit. Uniform decode uses one pass; mixed batches require
+`mixed_mode != FULL`. Dynamic sharing between index pages and hot slots remains
+a later development phase.
+
 ## See also
 
 - [Reference launch tutorial](getting-started.md)

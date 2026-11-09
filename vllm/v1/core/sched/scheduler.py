@@ -348,6 +348,10 @@ class Scheduler(SchedulerInterface):
             else None
         )
         self.host_region = None
+        # host SSD persistence: host-page SSD controller, attached by EngineCore when
+        # host_kv.ssd is enabled; flush plan set by EngineCore.shutdown.
+        self.host_kv_ssd: Any = None
+        self.host_kv_flush_plan: Any = None
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
         )
@@ -634,6 +638,10 @@ class Scheduler(SchedulerInterface):
         host_pool = getattr(self, "host_history_pool", None)
         if host_pool is not None:
             host_pool.start_step(self.current_step)
+            ssd = getattr(self, "host_kv_ssd", None)
+            if ssd is not None:
+                # Before admission: background SSD IO only takes net headroom.
+                ssd.step()
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -2827,6 +2835,8 @@ class Scheduler(SchedulerInterface):
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
+        if getattr(self, "host_kv_ssd", None) is not None:
+            self.host_kv_ssd.cancel(request_id)
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
@@ -3078,14 +3088,49 @@ class Scheduler(SchedulerInterface):
             pool.host_pages.complete_step(step, ranks)
 
     def shutdown(self) -> None:
+        ssd = getattr(self, "host_kv_ssd", None)
+        plan = getattr(self, "host_kv_flush_plan", None)
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
         if self.connector is not None:
+            deadline = None if plan is None else plan.deadline
+            if ssd is not None and deadline is not None:
+                # One shutdown window: the ordinary fs drain and the host KV
+                # final flush share the deadline instead of adding up.
+                manager = getattr(
+                    getattr(self.connector, "connector_scheduler", None),
+                    "manager",
+                    None,
+                )
+                cap = getattr(manager, "set_shutdown_deadline", None)
+                if cap is not None:
+                    cap(deadline)
             self.connector.shutdown()
         if self.ec_connector is not None:
             self.ec_connector.shutdown()
+        if ssd is not None:
+            from vllm.v1.kv_offload.host.persist import run_final_flush
+
+            # Design 3.5 step 4 (after executor shutdown), then step 5.
+            run_final_flush(ssd, plan, ssd.clock())
+            ssd.close()
+            self.host_kv_ssd = None
         if self.host_region is not None:
-            self.host_region.cleanup()
+            pages = getattr(self.host_history_pool, "host_pages", None)
+            if (ssd is not None and ssd.quarantined) or (
+                pages is not None
+                and ssd is not None
+                and any(any(j < 0 for j in p.io) for p in pages.pages)
+            ):
+                # transfer regression: an SSD transfer may still touch the rows. Keep
+                # the
+                # region mapped and linked rather than risk a fault.
+                logger.error(
+                    "Host KV region %s kept after SSD IO quarantine",
+                    getattr(self.host_region, "mmap_path", "?"),
+                )
+            else:
+                self.host_region.cleanup()
             self.host_region = None
 
     ########################################################################

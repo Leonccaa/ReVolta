@@ -160,9 +160,23 @@ class EngineCore:
         if getattr(self.scheduler, "host_history_pool", None) is not None:
             from vllm.v1.kv_offload.host.region import host_region_layout
 
-            cast(Any, self.scheduler).host_region = host_region_layout(
-                kv_cache_config, vllm_config.instance_id
-            ).open(None)
+            host_layout = host_region_layout(kv_cache_config, vllm_config.instance_id)
+            host_scheduler = cast(Any, self.scheduler)
+            host_scheduler.host_region = host_layout.open(None)
+            from vllm.v1.kv_offload.host.persist import create_host_page_ssd
+
+            host_scheduler.host_kv_ssd = create_host_page_ssd(
+                vllm_config,
+                kv_cache_config,
+                host_scheduler.host_history_pool.host_pages,
+                host_scheduler.host_region,
+                host_layout,
+            )
+            connector_scheduler = getattr(
+                host_scheduler.connector, "connector_scheduler", None
+            )
+            if host_scheduler.host_kv_ssd is not None and connector_scheduler:
+                connector_scheduler.host_page_ssd = host_scheduler.host_kv_ssd
         if self.scheduler.connector is not None:  # type: ignore
             self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore
 
@@ -777,6 +791,26 @@ class EngineCore:
             # More efficient to abort all as a single batch.
             self.abort_requests(request_ids)
 
+    def _host_kv_shutdown_deadline(self) -> float | None:
+        """Shared monotonic shutdown deadline (t0 + shutdown_timeout - 5 s).
+
+        The engine records t0 when
+        shutdown is
+        requested and owns this deadline for the page ownership drain, the fs drain and
+        the host SSD persistence final flush. Prefer its ``shutdown_deadline``; the
+        fallback
+        below derives the same value and is removed at merge.
+        """
+        from vllm.v1.kv_offload.host.persist import shared_shutdown_deadline
+
+        deadline = getattr(self, "shutdown_deadline", None)
+        if deadline is not None:
+            return deadline
+        return shared_shutdown_deadline(
+            getattr(self, "shutdown_requested_at", None),
+            self.vllm_config.shutdown_timeout,
+        )
+
     def shutdown(self):
         host_scheduler = cast(Any, self.scheduler)
         host_pool = getattr(host_scheduler, "host_history_pool", None)
@@ -808,13 +842,30 @@ class EngineCore:
                 if output is not None and output.kv_connector_worker_meta is not None:
                     host_scheduler.update_host_kv_output(output)
                     host_scheduler.connector.update_connector_output(output)
+            # Host SSD IO owners (negative ids) belong to final_flush below.
             if host_pool._jobs or any(
-                p.ticket or p.io for p in host_pool.host_pages.pages
+                p.ticket or any(j >= 0 for j in p.io)
+                for p in host_pool.host_pages.pages
             ):
                 raise RuntimeError("Host KV drain left owners, retaining resources")
             if host_pool.host_pages.watermark != host_scheduler.current_step:
                 raise RuntimeError("Host KV drain left a step gap, retaining resources")
             self._host_kv_drained = True
+        host_ssd = getattr(self.scheduler, "host_kv_ssd", None)
+        if host_ssd is not None:
+            from vllm.v1.kv_offload.host.persist import plan_final_flush
+
+            t0 = getattr(self, "shutdown_requested_at", None)
+            plan = plan_final_flush(
+                host_ssd.options["shutdown_flush_timeout_s"],
+                self.vllm_config.shutdown_timeout,
+                self._host_kv_shutdown_deadline(),
+                time.monotonic(),
+                t0,
+            )
+            if self.vllm_config.shutdown_timeout <= 0:
+                logger.warning("Host KV SSD final flush skipped: %s", plan.reason)
+            cast(Any, self.scheduler).host_kv_flush_plan = plan
         self.structured_output_manager.clear_backend()
         if self.model_executor:
             self.model_executor.shutdown()
@@ -1384,6 +1435,9 @@ class EngineCoreProc(EngineCore):
             signal_callback = SignalCallback(wakeup_engine)
 
             def signal_handler(signum, frame):
+                if engine_core.shutdown_state == EngineShutdownState.RUNNING:
+                    # t0 of the --shutdown-timeout window (host KV SSD flush).
+                    engine_core.shutdown_requested_at = time.monotonic()
                 engine_core.shutdown_state = EngineShutdownState.REQUESTED
                 signal_callback.trigger()
                 if signum == signal.SIGTERM:
@@ -1519,6 +1573,8 @@ class EngineCoreProc(EngineCore):
             return True
 
         if self.shutdown_state == EngineShutdownState.REQUESTED:
+            if getattr(self, "shutdown_requested_at", None) is None:
+                self.shutdown_requested_at = time.monotonic()
             shutdown_timeout = self.vllm_config.shutdown_timeout
 
             logger.info("Shutdown initiated (timeout=%d)", shutdown_timeout)

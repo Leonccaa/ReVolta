@@ -58,6 +58,15 @@ def host_kv_ssd_config(config: "KVTransferConfig | None") -> dict | None:
         "max_pending_blocks",
         "write_bytes_per_second",
         "drain_timeout_s",
+        # host SSD persistence host-page persistence (host/persist.py).
+        "write_delay_s",
+        "write_warn_bytes_24h",
+        "write_threads",
+        "shutdown_flush_timeout_s",
+        "shutdown_io_grace_s",
+        "prefetch_max_inflight",
+        "prefetch_max_per_request",
+        "prefetch_timeout_s",
     }
     if options.keys() - allowed:
         raise ValueError("Unknown host_kv.ssd options")
@@ -81,6 +90,36 @@ def host_kv_ssd_config(config: "KVTransferConfig | None") -> dict | None:
         or timeout < 0
     ):
         raise ValueError("host_kv.ssd drain_timeout_s must be finite and >= 0")
+    for name, default in (
+        ("write_threads", 4),
+        ("prefetch_max_inflight", 16),
+        ("prefetch_max_per_request", 8),
+    ):
+        value = options.setdefault(name, default)
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"host_kv.ssd {name} must be a positive integer")
+    warn = options.setdefault("write_warn_bytes_24h", 10**12)
+    if type(warn) is not int or warn < 0:
+        raise ValueError("host_kv.ssd write_warn_bytes_24h must be an int >= 0")
+    # write_delay_s follows revolta_fs (300 s). shutdown_flush_timeout_s is a
+    # best-effort budget, not a hard exit bound: the API process SIGKILLs the
+    # engine core --shutdown-timeout (default 30 s) after SIGTERM, and request
+    # drain, executor shutdown and the ordinary fs drain share that window.
+    # EngineCore therefore also truncates it to the remaining window - 5 s.
+    for name, seconds_default in (
+        ("write_delay_s", 300.0),
+        ("shutdown_flush_timeout_s", 10.0),
+        ("shutdown_io_grace_s", 2.0),
+        ("prefetch_timeout_s", 5.0),
+    ):
+        seconds = options.setdefault(name, seconds_default)
+        if (
+            isinstance(seconds, bool)
+            or not isinstance(seconds, (int, float))
+            or not math.isfinite(seconds)
+            or seconds < 0
+        ):
+            raise ValueError(f"host_kv.ssd {name} must be finite and >= 0")
     if options.get("content_verify", "stat") not in ("stat", "full"):
         raise ValueError("host_kv.ssd content_verify must be stat or full")
     return options

@@ -7,8 +7,10 @@ names a physical incarnation, so invalidating a hash never retires DMA.
 """
 
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Protocol
 
 from vllm.v1.kv_offload.base import OffloadKey
 
@@ -78,6 +80,27 @@ class HostPage:
     failed_ranks: int = 0
 
 
+class PersistenceHooks(Protocol):
+    """host SSD persistence SSD controller callbacks; every call runs on the scheduler
+    thread.
+
+    SSD IO owners and prefetch holds use negative ids. Connector jobs and
+    request leases keep their existing non-negative ids.
+    """
+
+    def on_published(self, handle: PageHandle) -> None: ...
+
+    def try_writeback(self, page: "HostPage", headroom_before: int) -> bool: ...
+
+    def on_evict(self, page: "HostPage") -> None: ...
+
+    def on_reset(self) -> None: ...
+
+
+def is_ssd_owner(owner_id: int) -> bool:
+    return owner_id < 0
+
+
 class HostPageTable:
     """One allocator, four owner classes, and a gap-free rank watermark.
 
@@ -102,6 +125,14 @@ class HostPageTable:
         self._steps: dict[int, int] = {}
         self.watermark = 0
         self.ssd_epoch = 0
+        # host SSD persistence: SSD persistence hooks (None keeps the page ownership
+        # behaviour exactly).
+        self.persistence: PersistenceHooks | None = None
+        # The sum of committed R_host
+        # reservations (parked
+        # readbacks, protected successors). Background IO may only consume
+        # pages beyond it . page ownership has no such reservation.
+        self.committed_reserve: Callable[[], int] = lambda: 0
 
     def get(self, handle: PageHandle) -> HostPage:
         if not 0 <= handle.page_id < len(self.pages):
@@ -156,16 +187,45 @@ class HostPageTable:
             ) and self.reclaimable(page):
                 self._recycle(page)
 
-    def reserve(self, *, loading_key: OffloadKey | None = None) -> PageHandle | None:
+    def is_persisted(self, page: HostPage) -> bool:
+        return page.persisted_epoch == page.handle.epoch
+
+    def net_headroom(self, pending: int = 0) -> int:
+        """Reclaimable pages left after R_host and this step's allocations."""
+        return self.available() - self.committed_reserve() - pending
+
+    def reserve(
+        self,
+        *,
+        loading_key: OffloadKey | None = None,
+        pending: int = 1,
+        writeback: bool = True,
+    ) -> PageHandle | None:
+        """Allocate one page. ``pending`` counts this and the caller's later
+        reservations of the same batch, so a pre-eviction write never takes a
+        page that the already-admitted batch still needs."""
         if loading_key is not None and loading_key in self.index:
             return None
         self.collect()
         if not self._free:
+            hooks = self.persistence if writeback else None
+            headroom: int | None = None
             for page_id in list(self._lru):
                 page = self.pages[page_id]
-                if self.reclaimable(page):
-                    self._recycle(page)
-                    break
+                if not self.reclaimable(page):
+                    continue
+                if hooks is not None:
+                    if headroom is None:
+                        headroom = self.net_headroom(pending)
+                    if hooks.try_writeback(page, headroom):
+                        # The write added an IO owner: no longer reclaimable.
+                        headroom -= 1
+                        continue
+                    hooks.on_evict(page)
+                elif self.persistence is not None:
+                    self.persistence.on_evict(page)
+                self._recycle(page)
+                break
         if not self._free:
             return None
         page = self.pages[self._free.pop()]
@@ -223,7 +283,43 @@ class HostPageTable:
         if page.state == PageState.READY:
             self.index[key] = handle
             self._lru[handle.page_id] = None
+            if self.persistence is not None:
+                self.persistence.on_published(handle)
         return page.state == PageState.READY
+
+    def complete_load(self, handle: PageHandle, ok: bool) -> bool:
+        """Finish an SSD read into a LOADING page; the caller retires its IO.
+
+        A verified read becomes READY and is already persisted. A failed or
+        invalidated (reset) read leaves lookup and is recycled after its IO.
+        """
+        try:
+            page = self.get(handle)
+        except ValueError:
+            return False
+        if page.state != PageState.LOADING:
+            return False
+        if ok and page.valid:
+            page.state = PageState.READY
+            page.compute_result = page.seal_result = Result.OK
+            page.persisted_epoch = handle.epoch
+            return True
+        if page.key is not None and self.index.get(page.key) == handle:
+            del self.index[page.key]
+        self._lru.pop(handle.page_id, None)
+        page.valid = False
+        return False
+
+    def mark_persisted(self, handle: PageHandle) -> bool:
+        """Record a completed SSD store of exactly this incarnation."""
+        try:
+            page = self.get(handle)
+        except ValueError:
+            return False
+        if not page.valid or page.state != PageState.READY:
+            return False
+        page.persisted_epoch = handle.epoch
+        return True
 
     def open_seal(
         self, handle: PageHandle, hid: int, hgen: int, key: OffloadKey, step: int
@@ -285,6 +381,8 @@ class HostPageTable:
         self.index.clear()
         self._lru.clear()
         self.ssd_epoch += 1
+        if self.persistence is not None:
+            self.persistence.on_reset()
         for page in self.pages[self._first :]:
             if page.state != PageState.FREE:
                 page.valid = False

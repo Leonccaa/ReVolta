@@ -73,12 +73,15 @@ class HistoryBlockPool(BlockPool):
     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
         blocks = super().get_new_blocks(num_blocks)
         scope = self.admission_observer._scope if self.admission_observer else ()
-        for block in blocks:
+        for index, block in enumerate(blocks):
             hid = block.block_id
             self.unbind(hid)
             self.hgen[hid] += 1
             if scope is not None and HOST in scope:
-                handle = self.host_pages.reserve()
+                # host SSD persistence: a pre-eviction SSD write may only take pages
+                # beyond the
+                # rest of this admitted batch.
+                handle = self.host_pages.reserve(pending=len(blocks) - index)
                 assert handle is not None, "Host admission did not reserve enough pages"
                 self.host_pages.bind(handle, hid, self.hgen[hid], self.step)
                 self.bindings[hid] = handle

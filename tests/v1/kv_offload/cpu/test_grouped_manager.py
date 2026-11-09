@@ -31,6 +31,17 @@ CTX = ReqContext("test")
 GROUPS = (0, 2, 3, 4, 5)
 
 
+@pytest.mark.parametrize("policy", ["lru", "arc"])
+def test_prepare_load_rolls_back_earlier_group_pins(policy):
+    m = manager(capacity=2, policy=policy)
+    first, later = key(0, 1), key(2, 1)
+    store(m, [first])
+    with pytest.raises(AssertionError):
+        m.prepare_load([first, later], CTX)
+    assert m.managers[0]._policy.get(first).ref_cnt == 0
+    assert store(m, [key(0, 2), key(0, 3)]) is not None
+
+
 @pytest.mark.parametrize("error_code", [1, 2])
 def test_mmap_registration_failure_is_fatal(monkeypatch, tmp_path, error_code):
     from vllm.v1.kv_offload.cpu import gpu_worker as worker

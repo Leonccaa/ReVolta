@@ -147,9 +147,13 @@ class CPUOffloadingManager(OffloadingManager):
             block = self._policy.get(key)
             assert block is not None, f"Block {key!r} not found in cache"
             assert block.is_ready, f"Block {key!r} is not ready for reading"
-            block.ref_cnt += 1
             blocks.append(block)
-        return self._get_load_store_spec(keys, blocks)
+        # Validate the whole batch and build its descriptor before pinning.
+        # A missing later key or descriptor failure must leave no partial pin.
+        spec = self._get_load_store_spec(keys, blocks)
+        for block in blocks:
+            block.ref_cnt += 1
+        return spec
 
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
         self._policy.touch(keys)
@@ -435,11 +439,18 @@ class GroupedCPUOffloadingManager(OffloadingManager):
         self, keys: Collection[OffloadKey], req_context: ReqContext
     ) -> CPULoadStoreSpec:
         block_ids: dict[OffloadKey, int] = {}
-        for group_idx, group_keys in self._partition(keys).items():
-            spec = self.managers[group_idx].prepare_load(group_keys, req_context)
-            assert isinstance(spec, CPULoadStoreSpec)
-            block_ids.update(zip(group_keys, map(int, spec.block_ids)))
-        return CPULoadStoreSpec([block_ids[key] for key in keys])
+        pinned: dict[int, list[OffloadKey]] = {}
+        try:
+            for group_idx, group_keys in self._partition(keys).items():
+                spec = self.managers[group_idx].prepare_load(group_keys, req_context)
+                pinned[group_idx] = group_keys
+                assert isinstance(spec, CPULoadStoreSpec)
+                block_ids.update(zip(group_keys, map(int, spec.block_ids)))
+            return CPULoadStoreSpec([block_ids[key] for key in keys])
+        except Exception:
+            for group_idx, group_keys in pinned.items():
+                self.managers[group_idx].complete_load(group_keys, req_context)
+            raise
 
     def complete_load(self, keys: Collection[OffloadKey], req_context: ReqContext):
         for group_idx, group_keys in self._partition(keys).items():

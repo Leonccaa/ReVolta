@@ -506,6 +506,18 @@ class KernelConfig:
     """Share FP16 indexer keys across M2..8 queries of one request on SM70
     (1CatAI #1127; opt-in here, also VLLM_SM70_QSA_SHARED_KEY=1)."""
 
+    qsa_cross_group_hit_check: bool = False
+    """Report a prefix hit only when every KV cache group is complete at it.
+
+    Checks the final hit of the GPU prefix cache and of the offloading
+    connector against one per-group rule (full attention: every block; Mamba
+    align: the state at the hit; sliding window: its window), turns an
+    incomplete hit into a miss, trims extra full-attention blocks, and checks
+    the connector's load plan against the same hit. Also lets an owner of
+    storage outside these pools register residency probes. Scheduler-only;
+    off keeps the existing lookup results unchanged.
+    """
+
     ple_disk_cascade: bool | None = None
     """Allow resident FP8 PLE tiers to spill to mapped checkpoint storage.
 
@@ -574,6 +586,8 @@ class KernelConfig:
             "qsa_auto_e4m3_reason",
             # Sampler-only switch; it does not change any compiled graph.
             "sm70_greedy_verify",
+            # Scheduler-only prefix-hit check; no compiled graph changes.
+            "qsa_cross_group_hit_check",
         }
         if not self.sm70_skinny_moe_applicable:
             ignored_factors.add("sm70_skinny_moe")

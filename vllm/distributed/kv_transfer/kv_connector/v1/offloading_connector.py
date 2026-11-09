@@ -163,6 +163,11 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA, SupportsVmmSafeTransf
         assert self.connector_scheduler is not None
         self.connector_scheduler.update_connector_output(connector_output)
 
+    def take_failed_loads(self) -> set[str]:
+        if self.connector_scheduler is None:
+            return set()
+        return self.connector_scheduler.take_failed_loads()
+
     def request_finished(
         self,
         request: "Request",

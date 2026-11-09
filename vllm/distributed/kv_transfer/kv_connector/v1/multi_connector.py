@@ -246,6 +246,12 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         for c in self._connectors:
             c.register_kv_caches(kv_caches)
 
+    def take_failed_loads(self) -> set[str]:
+        failed: set[str] = set()
+        for c in self._connectors:
+            failed |= c.take_failed_loads()
+        return failed
+
     def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
         for c in self._connectors:
             c.bind_gpu_block_pool(gpu_block_pool)

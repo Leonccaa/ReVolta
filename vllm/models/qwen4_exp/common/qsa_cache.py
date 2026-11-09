@@ -170,22 +170,37 @@ def compressed_qsa_slot_mapping(
     storage_block_size: int,
     compress_ratio: int,
     out: torch.Tensor | None = None,
+    *,
+    index_dcp_world_size: int = 1,
+    index_dcp_rank: int = 0,
 ) -> torch.Tensor:
-    """Build boundary-only slots for an ``MLAAttentionSpec`` QSA cache."""
+    """Build boundary-only slots for an ``MLAAttentionSpec`` QSA cache.
+
+    With a DCP-sharded indexer, group ``g`` is written only by rank
+    ``g % index_dcp_world_size`` at local column ``g // index_dcp_world_size``.
+    """
 
     if storage_block_size <= 0 or compress_ratio <= 0:
         raise ValueError("QSA block size and compression ratio must be positive")
+    if index_dcp_world_size < 1 or not 0 <= index_dcp_rank < index_dcp_world_size:
+        raise ValueError("QSA indexer DCP rank must belong to its world size")
     compressed_positions = torch.div(
         logical_positions.clamp_min(0), compress_ratio, rounding_mode="floor"
+    )
+    owned = compressed_positions.remainder(index_dcp_world_size) == index_dcp_rank
+    local_columns = torch.div(
+        compressed_positions, index_dcp_world_size, rounding_mode="floor"
     )
     slots = _logical_to_physical_qsa_slots(
         block_table,
         token_to_req,
-        compressed_positions,
+        local_columns,
         storage_block_size,
     )
-    valid = (logical_positions >= 0) & (
-        (logical_positions + 1).remainder(compress_ratio) == 0
+    valid = (
+        (logical_positions >= 0)
+        & ((logical_positions + 1).remainder(compress_ratio) == 0)
+        & owned
     )
     slots = torch.where(valid, slots, PAD_SLOT_ID).to(torch.int64)
     if out is not None:
@@ -233,6 +248,8 @@ def _build_qsa_metadata_kernel(
     num_block_table_columns: tl.constexpr,
     IGNORE_COMMON_SLOT_MASK: tl.constexpr,
     MAP_PLAIN_SLOT: tl.constexpr,
+    INDEX_DCP_WORLD: tl.constexpr,
+    index_dcp_rank,
     launch_pdl: tl.constexpr,
     TOKEN_BLOCK_SIZE: tl.constexpr,
     REQUEST_SCAN_SIZE: tl.constexpr,
@@ -311,11 +328,14 @@ def _build_qsa_metadata_kernel(
         )
     elif compress_ratio != 1:
         compressed_position = tl.maximum(logical_position, 0) // compress_ratio
-        logical_block = compressed_position // storage_block_size
+        # A DCP-sharded indexer stores group g on rank g % W at column g // W.
+        local_column = compressed_position // INDEX_DCP_WORLD
+        logical_block = local_column // storage_block_size
         valid = (
             mapped
             & (logical_position >= 0)
             & ((logical_position + 1) % compress_ratio == 0)
+            & (compressed_position % INDEX_DCP_WORLD == index_dcp_rank)
             & (logical_block < num_block_table_columns)
         )
         physical_block = tl.load(
@@ -330,9 +350,7 @@ def _build_qsa_metadata_kernel(
             valid &= (
                 tl.load(common_slot_mapping_ptr + token_idx, mask=mapped, other=-1) >= 0
             )
-        slot = physical_block * storage_block_size + (
-            compressed_position % storage_block_size
-        )
+        slot = physical_block * storage_block_size + (local_column % storage_block_size)
     if (circular_buffer_size > 0) or (compress_ratio != 1) or MAP_PLAIN_SLOT:
         tl.store(
             slot_mapping_ptr + token_idx,
@@ -414,6 +432,8 @@ def build_qsa_metadata_triton(
     request_capacity: int | None = None,
     ignore_common_slot_mask: bool = False,
     map_plain_slot: bool = False,
+    index_dcp_world_size: int = 1,
+    index_dcp_rank: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build QSA side-cache and optional pre-indexer work metadata."""
     num_tokens = common_attn_metadata.num_actual_tokens
@@ -472,6 +492,8 @@ def build_qsa_metadata_triton(
         block_table.shape[1],
         IGNORE_COMMON_SLOT_MASK=ignore_common_slot_mask,
         MAP_PLAIN_SLOT=map_plain_slot,
+        INDEX_DCP_WORLD=index_dcp_world_size,
+        index_dcp_rank=index_dcp_rank,
         launch_pdl=_metadata_launch_pdl(),
         TOKEN_BLOCK_SIZE=128,
         REQUEST_SCAN_SIZE=request_scan_size,
@@ -496,6 +518,8 @@ def _build_qsa_metadata_torch(
     request_capacity: int | None = None,
     ignore_common_slot_mask: bool = False,
     map_plain_slot: bool = False,
+    index_dcp_world_size: int = 1,
+    index_dcp_rank: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     del request_capacity
     num_tokens = common_attn_metadata.num_actual_tokens
@@ -547,6 +571,8 @@ def _build_qsa_metadata_torch(
             storage_block_size,
             compress_ratio,
             slot_mapping_buffer,
+            index_dcp_world_size=index_dcp_world_size,
+            index_dcp_rank=index_dcp_rank,
         )
         if not ignore_common_slot_mask:
             slot_mapping.masked_fill_(
@@ -623,6 +649,10 @@ class QSAForwardMetadata(AttentionMetadata):
     query_start_loc_cpu: torch.Tensor | None = None
     max_seq_len: int | None = None
     seq_lens_cpu_upper_bound: torch.Tensor | None = None
+    # DCP sharding of a compressed indexer cache: this rank holds groups
+    # g % index_dcp_world_size == index_dcp_rank at columns g // world.
+    index_dcp_world_size: int = 1
+    index_dcp_rank: int = 0
 
 
 class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
@@ -661,6 +691,14 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
         else:
             self.compress_ratio = 1
         self.storage_block_size = kv_cache_spec.storage_block_size
+        self.index_dcp_sharded = (
+            isinstance(kv_cache_spec, MLAAttentionSpec)
+            and self.compress_ratio != 1
+            and kv_cache_spec.dcp_sharded
+            and self.dcp_world_size > 1
+        )
+        self.index_dcp_world_size = self.dcp_world_size if self.index_dcp_sharded else 1
+        self.index_dcp_rank = _current_dcp_rank() if self.index_dcp_sharded else 0
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.token_to_req_buffer = torch.empty(
             max_tokens, dtype=torch.int32, device=device
@@ -729,7 +767,13 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
         table_counts_local_tokens = (
             self.kv_cache_spec.dcp_sharded or self.reads_sharded_group
         )
-        if table_counts_local_tokens and self.dcp_world_size > 1:
+        # A DCP-sharded side page (the sharded indexer) already declares its
+        # rank-local span; only a replicated side page declares the global one.
+        if (
+            table_counts_local_tokens
+            and self.dcp_world_size > 1
+            and not self.kv_cache_spec.dcp_sharded
+        ):
             if group_block_size % self.dcp_world_size:
                 raise RuntimeError("QSA replicated page must cover whole DCP group")
             group_block_size //= self.dcp_world_size
@@ -800,6 +844,8 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             ignore_common_slot_mask=(
                 build_k_work and self.reads_sharded_group and self.dcp_world_size > 1
             ),
+            index_dcp_world_size=self.index_dcp_world_size,
+            index_dcp_rank=self.index_dcp_rank,
         )
         if common_attn_metadata.is_dummy_batch and (
             self.is_circular_buffer or self.compress_ratio != 1
@@ -821,6 +867,8 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             seq_lens_cpu_upper_bound=getattr(
                 common_attn_metadata, "seq_lens_cpu_upper_bound", None
             ),
+            index_dcp_world_size=self.index_dcp_world_size,
+            index_dcp_rank=self.index_dcp_rank,
         )
 
 
@@ -876,7 +924,11 @@ class QSAStateBackend(AttentionBackend):
 def qsa_dcp_block_geometry(
     vllm_config: VllmConfig, prefix: str
 ) -> tuple[int, int, bool]:
-    """Return local main slots, replicated side span, and main DCP ownership.
+    """Return local main slots, the global side span, and main DCP ownership.
+
+    The second value is the global token span of a side (indexer, ring) page.
+    A replicated side page stores that whole span; a DCP-sharded indexer page
+    (``qsa_index_dcp_sharded``) stores ``span // dcp`` tokens of it.
 
     A cache block spans ``block_size`` global tokens at every DCP size, so the
     prefix-cache and recurrent-state granularity match DCP1. The target main
@@ -899,6 +951,47 @@ def qsa_dcp_block_geometry(
         block_size,
         not is_draft,
     )
+
+
+def qsa_index_dcp_sharded(
+    vllm_config: VllmConfig, prefix: str, compress_ratio: int
+) -> bool:
+    """Whether this compressed indexer cache is sharded over the DCP group.
+
+    Only the target indexer is sharded (``kernel_config.qsa_dcp_index_shard``);
+    the MTP draft keeps a replicated indexer. Each scheduler block must hold a
+    whole number of groups per rank so local pages align with global blocks.
+    """
+    kernel_config = getattr(vllm_config, "kernel_config", None)
+    if not getattr(kernel_config, "qsa_dcp_index_shard", False):
+        return False
+    dcp = vllm_config.parallel_config.decode_context_parallel_size
+    if dcp <= 1 or "mtp" in prefix.split("."):
+        return False
+    spec = getattr(vllm_config, "speculative_config", None)
+    method = getattr(spec, "method", None) if spec is not None else None
+    if method is not None and "mtp" in str(method):
+        # MTP steps reuse the target's global selection and keep a replicated
+        # draft indexer; that combination has not been qualified.
+        raise ValueError("QSA indexer DCP sharding does not support MTP drafting yet")
+    from vllm.platforms import current_platform
+
+    if current_platform.is_rocm():
+        # The AMD QSA path has no sharded scorer or merge.
+        raise ValueError("QSA indexer DCP sharding is implemented for NVIDIA GPUs only")
+    block_size = vllm_config.cache_config.block_size
+    if block_size % (compress_ratio * dcp):
+        raise ValueError(
+            f"QSA indexer DCP sharding needs block size {block_size} divisible "
+            f"by compress ratio x DCP = {compress_ratio * dcp}"
+        )
+    return True
+
+
+def _current_dcp_rank() -> int:
+    from vllm.distributed import get_dcp_group
+
+    return get_dcp_group().rank_in_group
 
 
 class _QSAStateCache(nn.Module, AttentionLayerBase):
@@ -1021,13 +1114,15 @@ class QSACompressedKeyCache(_QSAStateCache):
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         _, side_block_size, _ = qsa_dcp_block_geometry(vllm_config, self.prefix)
+        sharded = qsa_index_dcp_sharded(vllm_config, self.prefix, self.compress_ratio)
+        dcp = vllm_config.parallel_config.decode_context_parallel_size
         return MLAAttentionSpec(
-            block_size=side_block_size,
+            block_size=side_block_size // dcp if sharded else side_block_size,
             num_kv_heads=1,
             head_size=self.head_size,
             dtype=self.dtype,
             compress_ratio=self.compress_ratio,
-            dcp_sharded=False,
+            dcp_sharded=sharded,
         )
 
 

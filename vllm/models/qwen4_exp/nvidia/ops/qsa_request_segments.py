@@ -59,6 +59,8 @@ def _build_segments(
     compress,
     MAX_ROWS: tl.constexpr,
     BLOCK_M: tl.constexpr,
+    INDEX_DCP_WORLD: tl.constexpr = 1,
+    INDEX_DCP_RANK: tl.constexpr = 0,
 ):
     row = tl.arange(0, BLOCK_M)
     req = tl.load(requests + row * stride_request, row < num_rows, other=-1)
@@ -89,6 +91,12 @@ def _build_segments(
     pos = tl.load(positions + row * stride_position, row < num_rows, other=-1)
     # Match paged Triton's signed division, including padded negative positions.
     vis = tl.minimum((pos + 1) // compress, length // compress)
+    if INDEX_DCP_WORLD > 1:
+        # A DCP-sharded indexer owns groups g % W == rank at columns g // W, so
+        # the visible prefix of global groups maps to this local prefix.
+        vis = (
+            tl.maximum(vis, 0) + INDEX_DCP_WORLD - 1 - INDEX_DCP_RANK
+        ) // INDEX_DCP_WORLD
     tl.store(visible + row, vis, row < num_rows)
 
 
@@ -232,6 +240,8 @@ def qsa_mqa_request_segments(
     *,
     max_rows: int = 4,
     score_divisor: float = math.sqrt(128),
+    index_dcp_world_size: int = 1,
+    index_dcp_rank: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Rebuild the segment descriptors and score into caller-owned buffers.
 
@@ -294,6 +304,8 @@ def qsa_mqa_request_segments(
             compress,
             MAX_ROWS=max_rows,
             BLOCK_M=triton.next_power_of_2(m),
+            INDEX_DCP_WORLD=index_dcp_world_size,
+            INDEX_DCP_RANK=index_dcp_rank,
             num_warps=4,
         )
         if columns:
@@ -376,6 +388,8 @@ def qsa_mqa_request_segments_paged(
     query_positions: torch.Tensor,
     sequence_lengths: torch.Tensor,
     compress_ratio: int,
+    index_dcp_world_size: int = 1,
+    index_dcp_rank: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Drop-in for `qsa.qsa_mqa_paged` on supported batches.
 
@@ -397,4 +411,6 @@ def qsa_mqa_request_segments_paged(
         workspace,
         max_rows=4,
         score_divisor=math.sqrt(q.shape[2]),
+        index_dcp_world_size=index_dcp_world_size,
+        index_dcp_rank=index_dcp_rank,
     )

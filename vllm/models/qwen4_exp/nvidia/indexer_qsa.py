@@ -25,6 +25,7 @@ from ..common.qsa_cache import (
     QSAForwardMetadata,
     QSAKeyStateCache,
     canonical_qsa_rope_positions,
+    qsa_index_dcp_sharded,
 )
 from .ops.qsa_pre_indexer import qsa_pre_indexer
 
@@ -170,6 +171,12 @@ class QSAIndexer(nn.Module):
             cache_config=cache_config,
             vllm_config=vllm_config,
         )
+        if qsa_index_dcp_sharded(
+            vllm_config, self.compressed_key_cache.prefix, self.compress_ratio
+        ):
+            from .ops.qsa import validate_qsa_index_dcp_shard_runtime
+
+            validate_qsa_index_dcp_shard_runtime(self.token_topk // self.compress_ratio)
 
     @property
     def output_width(self) -> int:
@@ -358,6 +365,8 @@ class QSAIndexer(nn.Module):
             shared_key_scoring=self.shared_key_scoring,
             max_seq_len=compressed_metadata.max_seq_len,
             seq_lens_cpu_upper_bound=compressed_metadata.seq_lens_cpu_upper_bound,
+            index_dcp_world_size=compressed_metadata.index_dcp_world_size,
+            index_dcp_rank=compressed_metadata.index_dcp_rank,
         )
 
 

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import math
 import os
+from collections.abc import Callable
 from itertools import pairwise
 from typing import Any
 
@@ -203,6 +204,8 @@ def _qsa_mqa_paged_kernel(
     MAX_N: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
     ORDERED_HEAD_SUM: tl.constexpr = False,
+    INDEX_DCP_WORLD: tl.constexpr = 1,
+    INDEX_DCP_RANK: tl.constexpr = 0,
 ) -> None:
     row = tl.program_id(0)
     dims = tl.arange(0, BLOCK_D)
@@ -219,6 +222,12 @@ def _qsa_mqa_paged_kernel(
         (query_position + 1) // COMPRESS_RATIO,
         sequence_length // COMPRESS_RATIO,
     )
+    if INDEX_DCP_WORLD > 1:
+        # A DCP-sharded indexer owns groups g % W == rank at columns g // W, so
+        # the visible prefix of global groups maps to this local prefix.
+        visible = (
+            tl.maximum(visible, 0) + INDEX_DCP_WORLD - 1 - INDEX_DCP_RANK
+        ) // INDEX_DCP_WORLD
     if tl.program_id(1) == 0:
         tl.store(visible_blocks_ptr + row, visible)
     tile_start = tl.program_id(1) * TILES_PER_PROG
@@ -301,6 +310,8 @@ def _qsa_visible_blocks_kernel(
     rows,
     num_requests,
     COMPRESS_RATIO: tl.constexpr,
+    INDEX_DCP_WORLD: tl.constexpr = 1,
+    INDEX_DCP_RANK: tl.constexpr = 0,
 ) -> None:
     row = tl.program_id(0)
     request = tl.load(token_to_req_ptr + row, mask=row < rows, other=-1)
@@ -316,6 +327,12 @@ def _qsa_visible_blocks_kernel(
         (query_position + 1) // COMPRESS_RATIO,
         sequence_length // COMPRESS_RATIO,
     )
+    if INDEX_DCP_WORLD > 1:
+        # A DCP-sharded indexer owns groups g % W == rank at columns g // W, so
+        # the visible prefix of global groups maps to this local prefix.
+        visible = (
+            tl.maximum(visible, 0) + INDEX_DCP_WORLD - 1 - INDEX_DCP_RANK
+        ) // INDEX_DCP_WORLD
     tl.store(
         visible_blocks_ptr + row,
         tl.where(valid_request, tl.maximum(visible, 0), 0),
@@ -1161,8 +1178,18 @@ def qsa_mqa_paged(
     num_columns: int | None = None,
     score_scale: float | None = None,
     shared_key_scoring: bool = False,
+    index_dcp_world_size: int = 1,
+    index_dcp_rank: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute QSA scores directly from a paged compressed-key cache."""
+    """Compute QSA scores directly from a paged compressed-key cache.
+
+    With a DCP-sharded indexer the cache and page table hold this rank's local
+    columns; visible lengths are converted to the local prefix. The native
+    shared-key scorer derives visibility from positions and the sequence
+    length, so it receives equivalent local values instead (see
+    ``_shared_key_local_inputs``); each local column's score is computed
+    exactly as for the matching global column.
+    """
 
     _validate_mqa(q)
     if not q.is_cuda or not HAS_TRITON:
@@ -1194,13 +1221,28 @@ def qsa_mqa_paged(
     if shared_key_scoring and 0 < columns <= capacity and q.shape[0]:
         from .qsa_shared_key import maybe_shared_key_scores
 
+        positions_arg, lengths_arg = query_positions, sequence_lengths
+        # Convert only inputs the unsharded gate would accept, so sharding never
+        # widens the shared-key support domain (e.g. non-contiguous positions).
+        if (
+            index_dcp_world_size > 1
+            and query_positions.is_contiguous()
+            and sequence_lengths.is_contiguous()
+        ):
+            positions_arg, lengths_arg = _shared_key_local_inputs(
+                query_positions,
+                sequence_lengths,
+                compress_ratio,
+                index_dcp_world_size,
+                index_dcp_rank,
+            )
         result = maybe_shared_key_scores(
             q,
             k_cache,
             page_table,
             token_to_req,
-            query_positions,
-            sequence_lengths,
+            positions_arg,
+            lengths_arg,
             compress_ratio,
             columns,
             score_divisor,
@@ -1255,6 +1297,8 @@ def qsa_mqa_paged(
         STAGES=2,
         MAX_N=MAX_N,
         COMPRESS_RATIO=compress_ratio,
+        INDEX_DCP_WORLD=index_dcp_world_size,
+        INDEX_DCP_RANK=index_dcp_rank,
         num_warps=2,
     )
     return logits, visible_blocks
@@ -1342,11 +1386,74 @@ def _sm70_qsa_lexicographic_topk_op():
     return torch.ops._C.qsa_lexicographic_topk
 
 
+def _shared_key_local_inputs(
+    query_positions: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    compress_ratio: int,
+    world: int,
+    rank: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Positions and lengths whose visible group count is this rank's prefix.
+
+    The native shared-key scorer computes ``min(position + 1, length) //
+    compress_ratio`` visible groups and scores columns below it. A rank owning
+    global groups ``g = c * world + rank`` sees the local prefix
+    ``V_r = (V + world - 1 - rank) // world`` of the global count ``V``.
+    Passing ``position' = V_r(pos) * compress_ratio - 1`` and
+    ``length' = V_r(len) * compress_ratio`` makes the kernel see exactly
+    ``V_r`` (``V_r`` is monotone, so the min commutes). Each output column's
+    reduction does not depend on the visible count, so local columns are
+    scored like the matching global ones (verified bit for bit on SM70 by
+    test_shared_key_scores_sharded_match_global). Domain: real QSA metadata
+    (positions far below int64 overflow; padded rows are negative and map to
+    zero visible groups). Fixed shapes and no host sync.
+    """
+    c = compress_ratio
+    prefix = query_positions.to(torch.int64) + 1
+    visible = torch.clamp(prefix // c, min=0)
+    local = (visible + (world - 1 - rank)) // world
+    positions = (local * c - 1).to(query_positions.dtype)
+    seq_visible = torch.clamp(sequence_lengths.to(torch.int64) // c, min=0)
+    lengths = ((seq_visible + (world - 1 - rank)) // world * c).to(
+        sequence_lengths.dtype
+    )
+    return positions.contiguous(), lengths.contiguous()
+
+
+def validate_qsa_index_dcp_shard_runtime(block_topk: int) -> None:
+    """Reject sharded-indexer setups the candidate merge cannot run.
+
+    Called when a sharded indexer layer is built, so an unsupported device or
+    budget fails at startup instead of at the first merge. The merge reuses
+    the exact SM70 lexicographic top-k, which takes 512 selected groups.
+    """
+    if not current_platform.is_cuda() or not current_platform.is_device_capability(70):
+        raise ValueError(
+            "QSA indexer DCP sharding needs NVIDIA SM70 GPUs: its candidate "
+            "merge uses the exact SM70 lexicographic top-k"
+        )
+    if block_topk != 512:
+        raise ValueError(
+            "QSA indexer DCP sharding needs 512 selected groups per row "
+            f"(indexer budget / compress ratio), got {block_topk}"
+        )
+    if not (
+        hasattr(torch.ops._C_qsa_sm70, "qsa_lexicographic_topk")
+        or hasattr(torch.ops._C, "qsa_lexicographic_topk")
+    ):
+        raise ValueError(
+            "QSA indexer DCP sharding needs the qsa_lexicographic_topk op, "
+            "which this build does not provide"
+        )
+
+
 def _qsa_visible_blocks(
     token_to_req: torch.Tensor,
     query_positions: torch.Tensor,
     sequence_lengths: torch.Tensor,
     compress_ratio: int,
+    index_dcp_world_size: int = 1,
+    index_dcp_rank: int = 0,
 ) -> torch.Tensor:
     rows = query_positions.shape[0]
     visible = torch.empty(rows, dtype=torch.int32, device=query_positions.device)
@@ -1359,6 +1466,8 @@ def _qsa_visible_blocks(
             rows,
             sequence_lengths.shape[0],
             COMPRESS_RATIO=compress_ratio,
+            INDEX_DCP_WORLD=index_dcp_world_size,
+            INDEX_DCP_RANK=index_dcp_rank,
             num_warps=1,
         )
     return visible
@@ -1539,6 +1648,9 @@ def _qsa_select_by_request(
     query_start_loc_cpu: torch.Tensor,
     max_seq_len: int | None = None,
     seq_lens_cpu_upper_bound: torch.Tensor | None = None,
+    *,
+    index_dcp_world_size: int = 1,
+    index_dcp_rank: int = 0,
 ) -> bool:
     """Select a multi-request batch one long request at a time.
 
@@ -1576,6 +1688,9 @@ def _qsa_select_by_request(
         bound_args: dict[str, Any] = (
             {"max_seq_len": host_bound} if host_bound is not None else {}
         )
+        if index_dcp_world_size > 1:
+            bound_args["index_dcp_world_size"] = index_dcp_world_size
+            bound_args["index_dcp_rank"] = index_dcp_rank
         if request is None:
             qsa_select_paged_tokens(
                 q[start:end],
@@ -1619,12 +1734,33 @@ def qsa_select_paged_tokens(
     shared_key_scoring: bool = False,
     max_seq_len: int | None = None,
     seq_lens_cpu_upper_bound: torch.Tensor | None = None,
+    index_dcp_world_size: int = 1,
+    index_dcp_rank: int = 0,
 ) -> torch.Tensor:
     """Score and select QSA indices, using a host bound when available.
 
     Host lengths only bound scoring storage. Device visibility still masks
     every row; callers without a host bound retain the existing fallback.
+
+    With a DCP-sharded indexer (``index_dcp_world_size > 1``) this rank scores
+    only its local columns. Every host-side routing decision (chunking, cuBLAS
+    eligibility, score width) uses bounds that are identical on all ranks, so
+    each rank issues the same sequence of cross-rank merges.
     """
+    world = index_dcp_world_size
+    if world < 1 or not 0 <= index_dcp_rank < world:
+        raise ValueError("QSA indexer DCP rank must belong to its world size")
+    # Unsharded calls keep their exact previous signatures.
+    shard_kwargs: dict[str, Any] = (
+        {"index_dcp_world_size": world, "index_dcp_rank": index_dcp_rank}
+        if world > 1
+        else {}
+    )
+    if world > 1 and shared_key_scoring:
+        logger.info_once(
+            "QSA indexer DCP sharding allows the native shared-key scorer on "
+            "rank-local columns when eligible (see 'Using SM70 QSA shared-key')."
+        )
 
     rows = q.shape[0]
     output_width = token_topk + compress_ratio - 1
@@ -1647,6 +1783,7 @@ def qsa_select_paged_tokens(
         query_start_loc_cpu,
         max_seq_len,
         seq_lens_cpu_upper_bound,
+        **shard_kwargs,
     ):
         return out
 
@@ -1656,12 +1793,17 @@ def qsa_select_paged_tokens(
     contiguous_keys: torch.Tensor | None = None
     key_valid: torch.Tensor | None = None
     all_visible: torch.Tensor | None = None
-    if _use_sm70_qsa_indexer_cublas(q, k_cache, page_table):
+    if _use_sm70_qsa_indexer_cublas(q, k_cache, page_table) and (
+        world == 1 or max_seq_len is not None
+    ):
+        # Sharded ranks need a host bound: a device max of their local
+        # visibility differs by rank and would desynchronize the merges.
         all_visible = _qsa_visible_blocks(
             token_to_req,
             query_positions,
             sequence_lengths,
             compress_ratio,
+            **shard_kwargs,
         )
         # cuBLAS has a rectangular host-side launch shape, unlike the paged
         # Triton kernel's device-side early exit. Bound it to this chunk's live
@@ -1669,7 +1811,8 @@ def qsa_select_paged_tokens(
         # model-capacity tail. The host upper bound removes the scalar sync;
         # device visibility masks any extra columns before top-k selection.
         live_blocks = (
-            max_seq_len // compress_ratio
+            # The same local upper bound on every rank (ceil over ranks).
+            -(-(max_seq_len // compress_ratio) // world)
             if max_seq_len is not None
             else int(all_visible.max().item())
         )
@@ -1728,6 +1871,7 @@ def qsa_select_paged_tokens(
                 query_positions[row_slice],
                 sequence_lengths,
                 compress_ratio,
+                **shard_kwargs,
             )
         else:
             logits, visible_blocks = qsa_mqa_paged(
@@ -1739,6 +1883,7 @@ def qsa_select_paged_tokens(
                 sequence_lengths,
                 compress_ratio,
                 shared_key_scoring=shared_key_scoring,
+                **shard_kwargs,
             )
         blocks = blocks_buffer[: row_end - row_start]
         use_cooperative_topk = (
@@ -1775,6 +1920,17 @@ def qsa_select_paged_tokens(
                 block_topk,
                 score_columns,
             )
+        if world > 1:
+            # Local columns -> global groups, merged across the DCP group.
+            blocks = _merge_sharded_index_blocks(
+                blocks,
+                logits,
+                visible_blocks,
+                world,
+                index_dcp_rank,
+                block_topk,
+                row_keys=(token_to_req[row_slice], query_positions[row_slice]),
+            )
         expand_qsa_block_indices_cuda(
             blocks,
             query_positions[row_slice],
@@ -1785,6 +1941,367 @@ def qsa_select_paged_tokens(
             out[row_slice],
         )
     return out
+
+
+_INDEX_SHARD_PAD_ID = torch.iinfo(torch.int32).max
+# -inf; pads are excluded by group id and length, never by score.
+_INDEX_SHARD_PAD_SCORE_BITS = -8388608  # 0xFF800000 as int32
+_index_shard_merge_calls = 0
+
+
+@triton.jit
+def _index_shard_pack_or_map_kernel(
+    indices_ptr,
+    values_ptr,
+    output_ptr,
+    stride_indices_row,
+    stride_indices_col,
+    stride_values_row,
+    stride_values_col,
+    K: tl.constexpr,
+    WORLD: tl.constexpr,
+    RANK: tl.constexpr,
+    PACK: tl.constexpr,
+    BLOCK: tl.constexpr,
+    PAD_ID: tl.constexpr = _INDEX_SHARD_PAD_ID,
+    PAD_SCORE_BITS: tl.constexpr = _INDEX_SHARD_PAD_SCORE_BITS,
+):
+    """Gather raw int32 words, either packing candidates or mapping positions."""
+    row = tl.program_id(0)
+    lane = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    index = tl.load(
+        indices_ptr + row * stride_indices_row + lane * stride_indices_col,
+        lane < K,
+        other=-1,
+    )
+    valid = (lane < K) & (index >= 0)
+    # Masked lanes never read unwritten logits, including an empty rank's col 0.
+    value = tl.load(
+        values_ptr + row * stride_values_row + tl.maximum(index, 0) * stride_values_col,
+        valid,
+        other=0,
+    )
+    if PACK:
+        tl.store(
+            output_ptr + row * (2 * K) + lane,
+            tl.where(valid, value, PAD_SCORE_BITS),
+            lane < K,
+        )
+        tl.store(
+            output_ptr + row * (2 * K) + K + lane,
+            tl.where(valid, index * WORLD + RANK, PAD_ID),
+            lane < K,
+        )
+    else:
+        tl.store(output_ptr + row * K + lane, tl.where(valid, value, -1), lane < K)
+
+
+@triton.jit
+def _index_shard_merge_kernel(
+    gathered_ptr,
+    scores_ptr,
+    groups_ptr,
+    lengths_ptr,
+    stride_rank,
+    stride_row,
+    stride_col,
+    K: tl.constexpr,
+    WORLD: tl.constexpr,
+    SEARCH_STEPS: tl.constexpr,
+    BLOCK: tl.constexpr,
+    RANK_BLOCK: tl.constexpr,
+    PAD_ID: tl.constexpr = _INDEX_SHARD_PAD_ID,
+    PAD_SCORE_BITS: tl.constexpr = _INDEX_SHARD_PAD_SCORE_BITS,
+):
+    row = tl.program_id(0)
+    rank = tl.program_id(1)
+    tile = tl.program_id(2)
+    lane = tile * BLOCK + tl.arange(0, BLOCK)
+    base = gathered_ptr + rank * stride_rank + row * stride_row
+    group = tl.load(base + (K + lane) * stride_col, lane < K, other=PAD_ID)
+    score = tl.load(base + lane * stride_col, lane < K, other=PAD_SCORE_BITS)
+    position = lane
+    for peer in tl.static_range(WORLD):
+        if peer != rank:
+            lo = tl.full((BLOCK,), 0, tl.int32)
+            hi = tl.full((BLOCK,), K, tl.int32)
+            for _ in range(SEARCH_STEPS):
+                mid = (lo + hi) // 2
+                other = tl.load(
+                    gathered_ptr
+                    + peer * stride_rank
+                    + row * stride_row
+                    + (K + mid) * stride_col,
+                    (lane < K) & (mid < K),
+                    other=PAD_ID,
+                )
+                before = (other < group) | ((other == group) & (peer < rank))
+                advance = (mid < K) & before
+                lo = tl.where(advance, mid + 1, lo)
+                hi = tl.where(advance, hi, mid)
+            position += lo
+    tl.store(scores_ptr + row * (WORLD * K) + position, score, lane < K)
+    tl.store(groups_ptr + row * (WORLD * K) + position, group, lane < K)
+
+    if (rank == 0) & (tile == 0):
+        # Lower_bound(INT32_MAX) is each list's valid prefix length. One CTA
+        # writes the row sum, with no initialization, atomics or extra launch.
+        peers = tl.arange(0, RANK_BLOCK)
+        lo = tl.full((RANK_BLOCK,), 0, tl.int32)
+        hi = tl.full((RANK_BLOCK,), K, tl.int32)
+        for _ in range(SEARCH_STEPS):
+            mid = (lo + hi) // 2
+            other = tl.load(
+                gathered_ptr
+                + peers * stride_rank
+                + row * stride_row
+                + (K + mid) * stride_col,
+                (peers < WORLD) & (mid < K),
+                other=PAD_ID,
+            )
+            advance = (mid < K) & (other < PAD_ID)
+            lo = tl.where(advance, mid + 1, lo)
+            hi = tl.where(advance, hi, mid)
+        tl.store(lengths_ptr + row, tl.sum(tl.where(peers < WORLD, lo, 0), 0))
+
+
+def _pack_index_shard_candidates(
+    blocks: torch.Tensor, logits: torch.Tensor, world: int, rank: int
+) -> torch.Tensor:
+    rows, k = blocks.shape
+    # The kernel reads raw words with no bounds beyond these shapes; the torch
+    # reference would raise on the same mistakes, so check them on the host.
+    if blocks.dtype != torch.int32 or logits.dtype != torch.float32:
+        raise TypeError("QSA shard pack expects int32 blocks and float32 logits")
+    if logits.dim() != 2 or logits.shape[0] < rows or logits.device != blocks.device:
+        raise ValueError("QSA shard pack needs logits rows for every selection row")
+    packed = torch.empty((rows, 2 * k), dtype=torch.int32, device=blocks.device)
+    _index_shard_pack_or_map_kernel[(rows, triton.cdiv(k, 128))](
+        blocks,
+        logits.view(torch.int32),
+        packed,
+        *blocks.stride(),
+        *logits.stride(),
+        k,
+        world,
+        rank,
+        True,
+        128,
+    )
+    return packed
+
+
+def _sort_index_shard_candidates(
+    gathered: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    world, rows, width = gathered.shape
+    k = width // 2
+    # Integer stores preserve every FP32 bit pattern, including signaling NaNs.
+    scores = torch.empty((rows, world * k), dtype=torch.int32, device=gathered.device)
+    groups = torch.empty_like(scores)
+    lengths = torch.empty((rows,), dtype=torch.int32, device=gathered.device)
+    _index_shard_merge_kernel[(rows, world, triton.cdiv(k, 128))](
+        gathered,
+        scores,
+        groups,
+        lengths,
+        *gathered.stride(),
+        k,
+        world,
+        k.bit_length(),
+        128,
+        triton.next_power_of_2(world),
+    )
+    return scores.view(torch.float32), groups, lengths
+
+
+def _map_index_shard_positions(
+    positions: torch.Tensor, groups: torch.Tensor
+) -> torch.Tensor:
+    rows, k = positions.shape
+    # The kernel writes row * k + lane, so allocate a row-major output.
+    merged = torch.empty((rows, k), dtype=torch.int32, device=positions.device)
+    _index_shard_pack_or_map_kernel[(rows, triton.cdiv(k, 128))](
+        positions,
+        groups,
+        merged,
+        *positions.stride(),
+        *groups.stride(),
+        k,
+        1,
+        0,
+        False,
+        128,
+    )
+    return merged
+
+
+def _check_index_shard_plan(
+    rows: int,
+    block_topk: int,
+    world: int,
+    row_keys: tuple[torch.Tensor, torch.Tensor] | None,
+    all_gather: Callable[[torch.Tensor], torch.Tensor],
+) -> None:
+    """Debug: fail if DCP ranks are not merging the same rows in step.
+
+    All-gathers a fixed [1, 6] int64 descriptor (per-process call index, rows,
+    top-k, world, request and position checksums) right before the candidate
+    all-gather. Host-synchronizing; skipped during CUDA graph capture.
+    """
+    global _index_shard_merge_calls
+    _index_shard_merge_calls += 1
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        return
+    device = row_keys[0].device if row_keys is not None else None
+    desc = torch.tensor(
+        [_index_shard_merge_calls, rows, block_topk, world, 0, 0],
+        dtype=torch.int64,
+        device=device,
+    )
+    if row_keys is not None:
+        weights = torch.arange(1, rows + 1, dtype=torch.int64, device=device)
+        for slot, key in ((4, row_keys[0]), (5, row_keys[1])):
+            desc[slot] = (key[:rows].to(torch.int64) * weights).sum()
+    seen = all_gather(desc.unsqueeze(0))
+    if seen.shape != (world, 6) or not bool((seen == seen[:1]).all()):
+        raise RuntimeError(
+            "QSA indexer DCP shard ranks disagree before the candidate "
+            "all-gather (call, rows, top-k, world, request sum, position "
+            f"sum per rank): {seen.tolist()}"
+        )
+
+
+def _check_index_shard_local_order(blocks: torch.Tensor) -> None:
+    """Debug: fail unless each row is ascending with -1 only at the tail.
+
+    The fused merge relies on this order and would silently misplace
+    candidates otherwise. Host-synchronizing; skipped during graph capture.
+    """
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        return
+    valid = blocks >= 0
+    pad_then_valid = (~valid[:, :-1]) & valid[:, 1:]
+    not_ascending = valid[:, 1:] & (blocks[:, 1:] <= blocks[:, :-1])
+    if bool(pad_then_valid.any()) or bool(not_ascending.any()):
+        raise RuntimeError(
+            "QSA shard merge needs ascending local columns with -1 only at "
+            "the tail; set VLLM_QSA_INDEX_SHARD_FUSED_MERGE=0 to use the "
+            "torch reference merge"
+        )
+
+
+def _merge_sharded_index_blocks(
+    blocks: torch.Tensor,
+    logits: torch.Tensor,
+    visible_blocks: torch.Tensor,
+    world: int,
+    rank: int,
+    block_topk: int,
+    *,
+    row_keys: tuple[torch.Tensor, torch.Tensor] | None = None,
+    all_gather: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    select: Callable[[torch.Tensor, torch.Tensor, torch.Tensor, int], None]
+    | None = None,
+    use_triton: bool | None = None,
+) -> torch.Tensor:
+    """Merge rank-local top-k groups into the unsharded global selection.
+
+    ``blocks`` holds this rank's selected local columns (ascending, -1 padded).
+    Each candidate carries its own key: the FP32 score it was selected with
+    and its global group ``column * world + rank``. All ranks all-gather the
+    fixed-shape candidate rows, order them by global group (pads last), and
+    rerun the same lexicographic top-k: its "lower position wins ties, emit
+    positions ascending" rule then equals "lower global group wins, emit
+    groups ascending". Every rank calls this with the same shapes, so the
+    collective sequence stays aligned across the DCP group.
+
+    The exact local selector emits increasing columns, hence each rank's
+    global groups are already sorted. For candidate (rank r, offset j), its
+    stable merged position is j plus each earlier rank's upper_bound(group)
+    and each later rank's lower_bound(group). This also orders repeated pad
+    ids by (rank, offset), exactly as argsort(stable=True) on rank-major input.
+    Distinct candidates therefore write distinct positions covering [0, W*K).
+    Scores move as int32 words throughout, and the valid prefix length is the
+    sum of lower_bound(INT32_MAX) over ranks. Top-k sees identical score bits,
+    positions and lengths, so both its tie-breaking and output are unchanged.
+
+    By default only the SM70 exact-top-k path uses Triton, unless
+    VLLM_QSA_INDEX_SHARD_FUSED_MERGE=0 selects the torch reference.
+    ``use_triton=False`` retains the torch reference, and True allows
+    interpreter testing with a supplied selector. The Triton merge requires
+    every rank's ``blocks`` to be ascending with -1 only at the tail (the
+    exact selector guarantees it; VLLM_QSA_INDEX_SHARD_DEBUG checks it). All
+    production shapes are fixed, with no host sync.
+    """
+    del visible_blocks  # local lengths are already encoded by -1 padding
+    rows = blocks.shape[0]
+    if blocks.shape != (rows, block_topk):
+        raise ValueError("QSA shard merge expects [rows, block_topk] selections")
+    if use_triton is None:
+        use_triton = (
+            envs.VLLM_QSA_INDEX_SHARD_FUSED_MERGE
+            and _use_sm70_qsa_lexicographic_topk(block_topk)
+        )
+    if use_triton and envs.VLLM_QSA_INDEX_SHARD_DEBUG:
+        _check_index_shard_local_order(blocks)
+    if use_triton:
+        packed = _pack_index_shard_candidates(blocks, logits, world, rank)
+    else:
+        valid = blocks >= 0
+        columns = blocks.clamp_min(0).long()
+        # Fixed shape: -1 lanes gather column 0, which is in bounds but may be
+        # unwritten when this rank sees no column; those bits are replaced by a
+        # deterministic pad here and never leave this function.
+        score_bits = torch.where(
+            valid,
+            torch.gather(logits[:rows], 1, columns).view(torch.int32),
+            torch.full_like(blocks, _INDEX_SHARD_PAD_SCORE_BITS),
+        )
+        groups = torch.where(
+            valid, blocks * world + rank, torch.full_like(blocks, _INDEX_SHARD_PAD_ID)
+        )
+        packed = torch.cat((score_bits, groups), dim=1)
+    if all_gather is None:
+        from vllm.distributed import get_dcp_group
+
+        all_gather = lambda t: get_dcp_group().all_gather(t, dim=0)  # noqa: E731
+    if envs.VLLM_QSA_INDEX_SHARD_DEBUG:
+        _check_index_shard_plan(rows, block_topk, world, row_keys, all_gather)
+    gathered = all_gather(packed.unsqueeze(0))
+    if gathered.shape != (world, rows, 2 * block_topk):
+        # Catches a local world/wrapper mismatch only: all_gather sizes its
+        # output from this rank's input. Cross-rank row layout is checked by
+        # VLLM_QSA_INDEX_SHARD_DEBUG; a rank that never arrives still hangs.
+        raise RuntimeError(
+            f"QSA indexer shard all-gather shape {tuple(gathered.shape)} != "
+            f"{(world, rows, 2 * block_topk)}"
+        )
+    if use_triton:
+        sorted_scores, sorted_groups, lengths = _sort_index_shard_candidates(gathered)
+    else:
+        cand_scores = (
+            gathered[:, :, :block_topk]
+            .permute(1, 0, 2)
+            .reshape(rows, -1)
+            .view(torch.float32)
+        )
+        cand_groups = gathered[:, :, block_topk:].permute(1, 0, 2).reshape(rows, -1)
+        order = torch.argsort(cand_groups, dim=1, stable=True)
+        sorted_groups = torch.gather(cand_groups, 1, order)
+        sorted_scores = torch.gather(cand_scores, 1, order).contiguous()
+        lengths = (sorted_groups != _INDEX_SHARD_PAD_ID).sum(dim=1, dtype=torch.int32)
+    positions = torch.empty((rows, block_topk), dtype=torch.int32, device=blocks.device)
+    if select is None:
+        if not _use_sm70_qsa_lexicographic_topk(block_topk):
+            raise RuntimeError("QSA indexer DCP sharding needs the exact SM70 top-k")
+        _sm70_qsa_lexicographic_topk_op()(sorted_scores, lengths, positions, block_topk)
+    else:
+        select(sorted_scores, lengths, positions, block_topk)
+    if use_triton:
+        return _map_index_shard_positions(positions, sorted_groups)
+    merged = torch.gather(sorted_groups, 1, positions.clamp_min(0).long())
+    return torch.where(positions >= 0, merged, torch.full_like(merged, -1))
 
 
 def _qsa_xqa_page4_shape_supported(

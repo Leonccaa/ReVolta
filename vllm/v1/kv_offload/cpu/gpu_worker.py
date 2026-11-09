@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import ctypes
 import fcntl
 import time
 from collections import deque
@@ -163,7 +164,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         for gpu_tensor, cpu_tensor in zip(gpu_tensors, cpu_tensors):
             assert gpu_tensor.dtype == torch.int8
             assert gpu_tensor.ndim == 2
-            assert gpu_tensor.is_cuda
+            assert gpu_tensor.device.type in ("cuda", "cpu")
             assert cpu_tensor.dtype == torch.int8
             assert cpu_tensor.ndim == 2
             assert cpu_tensor.device.type == "cpu"
@@ -178,6 +179,11 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
             cpu_tensors if gpu_to_cpu else gpu_tensors
         )
         self.gpu_to_cpu: bool = gpu_to_cpu
+        # Host-placed main K/V shares the history IDs and transfer job with
+        # the index. It is copied only after the compute/previous-job fences.
+        self._host_tensor_indices = {
+            index for index, tensor in enumerate(gpu_tensors) if not tensor.is_cuda
+        }
         self.kv_cache_groups_data_refs = kv_cache_groups_data_refs
 
         # GPU blocks may be smaller
@@ -252,6 +258,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         all_src = np.empty(num_copy_ops, dtype=np.int64)
         all_dst = np.empty(num_copy_ops, dtype=np.int64)
         all_sizes = np.empty(num_copy_ops, dtype=np.int64)
+        host_copies = np.zeros(num_copy_ops, dtype=bool)
 
         src_offset = 0
         dst_offset = 0
@@ -304,6 +311,9 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
                 )
 
                 all_sizes[op_idx:end_idx] = data_ref.page_size_bytes
+                host_copies[op_idx:end_idx] = t_idx in getattr(
+                    self, "_host_tensor_indices", ()
+                )
                 num_transfer_bytes += group_size * data_ref.page_size_bytes
                 op_idx = end_idx
 
@@ -314,9 +324,9 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         assert dst_offset == num_dst_blocks
         assert op_idx == num_copy_ops
 
-        batch_src = torch.from_numpy(all_src)
-        batch_dst = torch.from_numpy(all_dst)
-        batch_sizes = torch.from_numpy(all_sizes)
+        batch_src = torch.from_numpy(all_src[~host_copies])
+        batch_dst = torch.from_numpy(all_dst[~host_copies])
+        batch_sizes = torch.from_numpy(all_sizes[~host_copies])
 
         stream = self._stream_pool.pop() if self._stream_pool else torch.cuda.Stream()
         start_event = (
@@ -348,7 +358,17 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
                 stream.wait_event(self._transfers[-1].end_event)
             with torch.cuda.stream(stream):
                 start_event.record(stream)
-                if num_copy_ops > 0:
+                if host_copies.any():
+                    # UVA writes can still be running on the compute stream.
+                    # CPU copies must wait for those writes and ID retirement.
+                    stream.synchronize()
+                    for src, dst, size in zip(
+                        all_src[host_copies],
+                        all_dst[host_copies],
+                        all_sizes[host_copies],
+                    ):
+                        ctypes.memmove(int(dst), int(src), int(size))
+                if batch_src.numel() > 0:
                     ops.swap_blocks_batch(
                         batch_src,
                         batch_dst,

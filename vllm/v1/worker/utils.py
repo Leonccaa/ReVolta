@@ -216,7 +216,9 @@ class KVBlockZeroer:
                     continue
                 kv = static_forward_context[layer_name].kv_cache
                 if isinstance(spec, FullAttentionSpec):
-                    if not isinstance(kv, torch.Tensor):
+                    # Empty: main K/V in the host history store (long-context
+                    # mode), which begins new blocks itself.
+                    if not isinstance(kv, torch.Tensor) or kv.numel() == 0:
                         continue
                     kernel_bs, ratio = _resolve_zeroer_kernel_layout(
                         spec,
@@ -685,6 +687,8 @@ def clear_layer_kv_caches(layers: Iterable[Any]) -> None:
             continue
         kv_cache = layer.kv_cache
         layer.kv_cache = torch.tensor([]) if isinstance(kv_cache, torch.Tensor) else []
+        if getattr(layer, "host_history", None) is not None:
+            layer.host_history = None
 
         impl = getattr(layer, "impl", None)
         if impl is not None:

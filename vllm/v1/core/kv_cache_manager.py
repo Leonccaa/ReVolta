@@ -19,7 +19,7 @@ from vllm.v1.core.kv_cache_hit_contract import (
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
-from vllm.v1.core.long_context_kv import LongContextAdmissionLedger
+from vllm.v1.core.long_context_kv import SEGMENT_NAMES, LongContextAdmissionLedger
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
@@ -254,6 +254,8 @@ class KVCacheManager:
         per_group: Sequence[int],
         reserved_blocks: int,
         reserved_per_group: Sequence[int] | None = None,
+        *,
+        reason: str = "allocation",
     ) -> bool:
         """Separate block spaces: whether each pool has room for its groups.
 
@@ -268,7 +270,7 @@ class KVCacheManager:
             if blocks:
                 pool = coordinator.group_block_pool(group_id)
                 demand[id(pool)] = demand.get(id(pool), 0) + blocks
-        for pool in coordinator.block_pools:
+        for segment, pool in enumerate(coordinator.block_pools):
             # Preserve the scalar API for callers without a group vector.
             reserve = (
                 reserved_blocks
@@ -276,6 +278,15 @@ class KVCacheManager:
                 else 0
             )
             if demand.get(id(pool), 0) > pool.get_num_free_blocks() - reserve:
+                logger.debug(
+                    "Long-context admission blocked: reason=%s domain=%s "
+                    "demand=%d free=%d reserved=%d",
+                    reason,
+                    SEGMENT_NAMES[segment],
+                    demand.get(id(pool), 0),
+                    pool.get_num_free_blocks(),
+                    reserve,
+                )
                 return False
         return True
 
@@ -504,6 +515,7 @@ class KVCacheManager:
         split = self._segment_pools() is not None
         per_group_needed = ledger is not None or split
         if full_sequence_must_fit or num_tokens_to_reserve:
+            reason = "async successor" if num_tokens_to_reserve else "full ISL"
             # First check and fail if the full request sequence won't fit.
             full_num_tokens = min(request.num_tokens, self.max_model_len)
             reserve_num_tokens = min(
@@ -533,7 +545,7 @@ class KVCacheManager:
                 num_blocks_to_allocate = sum(per_group)
             if split:
                 if not self._segment_pools_have_room(
-                    per_group, reserved_blocks, reserved_blocks_per_group
+                    per_group, reserved_blocks, reserved_blocks_per_group, reason=reason
                 ):
                     if self.host_kv_hits is not None:
                         self.host_kv_hits.release_lookup(request.request_id)
@@ -545,7 +557,7 @@ class KVCacheManager:
                     self.host_kv_hits.release_lookup(request.request_id)
                 return None
             if ledger is not None and not ledger.admit(
-                request, per_group, reserved_blocks_per_group
+                request, per_group, reserved_blocks_per_group, reason=reason
             ):
                 if self.host_kv_hits is not None:
                     self.host_kv_hits.release_lookup(request.request_id)

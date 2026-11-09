@@ -113,6 +113,15 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 ],
             }
 
+        if getattr(kv_cache_config, "host_kv_layers", None):
+            if self.persistent_layout is None:
+                self.persistent_layout = {}
+            self.persistent_layout["host_main_kv"] = {
+                "version": "history-block-all-layers-v1",
+                "layers": list(kv_cache_config.host_kv_layers),
+                "page_bytes": kv_cache_config.host_kv_page_size_bytes,
+            }
+
         from vllm.v1.attention.kv_cache_view import (
             has_planar_kv_cache,
             kv_storage_metadata,

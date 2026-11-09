@@ -163,9 +163,13 @@ def _allocate_kv_cache(
     for group in kv_cache_config.kv_cache_groups:
         for layer_name in group.layer_names:
             layer_names.add(layer_name)
-    assert layer_names == (kv_cache_raw_tensors.keys() | shared_layers.keys()), (
-        "Some layers are not correctly initialized"
-    )
+    # Long-context host placement: these layers' main K/V lives in the host
+    # history store, not in a GPU tensor.
+    host_layers = set(getattr(kv_cache_config, "host_kv_layers", None) or ())
+    assert not host_layers & kv_cache_raw_tensors.keys()
+    assert layer_names == (
+        kv_cache_raw_tensors.keys() | shared_layers.keys() | host_layers
+    ), "Some layers are not correctly initialized"
     return kv_cache_raw_tensors
 
 
@@ -185,8 +189,10 @@ def _reshape_kv_cache(
     kernel_block_sizes: list[int],
     shared_kv_cache_layers: dict[str, str],
     packed_members: dict[str, tuple[int, int]] | None = None,
+    host_kv_layers: Iterable[str] = (),
 ) -> dict[str, Any]:
     kv_caches: dict[str, Any] = {}
+    host_kv_layers = set(host_kv_layers)
     has_attn, has_mamba = False, False
 
     for group in attn_groups:
@@ -215,6 +221,9 @@ def _reshape_kv_cache(
         for layer_name in group.layer_names:
             if layer_name in shared_kv_cache_layers:
                 # Shared layer — tensor will be aliased to its target later.
+                continue
+            if layer_name in host_kv_layers:
+                # Main K/V in the host history store; bound separately.
                 continue
 
             kv_raw_tensor = kv_cache_raw_tensors[layer_name]
@@ -404,6 +413,7 @@ def init_kv_cache(
         cache_dtype=cache_dtype,
         shared_kv_cache_layers=shared_kv_cache_layers,
         packed_members=_packed_attention_members(kv_cache_config),
+        host_kv_layers=getattr(kv_cache_config, "host_kv_layers", None) or (),
     )
     bind_kv_cache(kv_caches, forward_context, runner_kv_caches)
     return kv_caches

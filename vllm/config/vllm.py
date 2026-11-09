@@ -275,6 +275,24 @@ def _resolve_gdn_spec_state_replay(vllm_config: "VllmConfig") -> bool:
     if spec is None or not spec.use_dflash() or spec.use_dflash_ddtree():
         return False
     policy = spec.sm70_dflash2
+    long_context = getattr(
+        getattr(vllm_config, "kernel_config", None), "long_context_kv", None
+    )
+    replay_defaulted = False
+    if long_context is not None and long_context.enabled:
+        if policy.spec_state_replay is None:
+            replay_defaulted = True
+            policy.spec_state_replay = True
+            logger.info_once(
+                "Long-context KV mode enables sm70_dflash2.spec_state_replay "
+                "by default."
+            )
+        elif policy.spec_state_replay is False:
+            logger.warning_once(
+                "Long-context KV mode has sm70_dflash2.spec_state_replay=False "
+                "explicitly configured. GDN keeps a state block per draft "
+                "position and capacity includes those speculative state blocks."
+            )
     if policy.spec_state_replay is False:
         return False
     if policy.spec_state_replay is None and not SM70_DFLASH2_SPEC_STATE_REPLAY_DEFAULT:
@@ -285,13 +303,15 @@ def _resolve_gdn_spec_state_replay(vllm_config: "VllmConfig") -> bool:
                 raise ValueError(
                     "sm70_dflash2.spec_state_replay=True and "
                     "sm70_dflash2.fused_gdn_verify=True cannot be enabled "
-                    "together. Disable one of these explicit settings."
+                    "together. Disable one of these settings."
                 )
             policy.fused_gdn_verify = False
             logger.info_once(
                 "Disabling the automatic sm70_dflash2.fused_gdn_verify "
-                "default because sm70_dflash2.spec_state_replay=True was "
-                "explicitly requested."
+                "default because %s.",
+                "long-context KV mode enables state replay by default"
+                if replay_defaulted
+                else "sm70_dflash2.spec_state_replay=True was explicitly requested",
             )
         else:
             logger.info_once(

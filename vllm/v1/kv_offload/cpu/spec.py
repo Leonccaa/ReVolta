@@ -119,6 +119,8 @@ class CPUOffloadingSpec(OffloadingSpec):
 
         self.cpu_group_page_sizes: dict[int, int] = {}
         self.cpu_group_num_blocks: dict[int, int] = {}
+        host_layers = set(getattr(kv_cache_config, "host_kv_layers", ()))
+        host_page = getattr(kv_cache_config, "host_kv_page_size_bytes", 0)
         world_size = vllm_config.parallel_config.world_size
         if self.partition_by_group:
             mamba_groups: set[int] = set()
@@ -133,6 +135,8 @@ class CPUOffloadingSpec(OffloadingSpec):
                     for tensor in kv_cache_config.kv_cache_tensors
                     if not layer_names.isdisjoint(tensor.shared_by)
                 )
+                if not layer_names.isdisjoint(host_layers):
+                    page_size += host_page
                 self.cpu_group_page_sizes[i] = page_size * self.block_size_factor
                 if i in mamba_specs:
                     mamba_groups.add(i)
@@ -216,8 +220,8 @@ class CPUOffloadingSpec(OffloadingSpec):
                         t.size // kv_tensor_num_blocks(kv_cache_config, t)
                         for t in kv_cache_config.kv_cache_tensors
                     )
-                    * self.block_size_factor
-                )
+                    + host_page
+                ) * self.block_size_factor
             kv_bytes_per_offloaded_block = self.cpu_page_size_per_worker * world_size
             self.num_blocks = (
                 int(cpu_bytes_to_use) // kv_bytes_per_offloaded_block

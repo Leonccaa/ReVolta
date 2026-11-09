@@ -12941,6 +12941,11 @@ class GPUModelRunner(
             kv_cache_config: Configuration for the KV cache, including the KV
             cache size of each layer
         """
+        if getattr(kv_cache_config, "host_kv_layers", None):
+            raise NotImplementedError(
+                "kernel_config.long_context_kv with main_kv_placement='host' "
+                "requires Model Runner V2."
+            )
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
         self._mamba_bufs = None

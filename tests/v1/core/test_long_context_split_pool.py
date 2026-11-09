@@ -79,6 +79,7 @@ def settings(**kw) -> LongContextKVConfig:
     if "host_pool_tokens" not in kw:
         kw.setdefault("host_pool_gib", 200.0)
     kw.setdefault("hot_pool_gib", 0.6)
+    kw.setdefault("main_kv_placement", "gpu")
     return LongContextKVConfig(enabled=True, **kw)
 
 

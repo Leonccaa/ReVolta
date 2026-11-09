@@ -1271,12 +1271,29 @@ class Scheduler(SchedulerInterface):
                             # Ask the allocator for the successor's net demand.
                             # A full-ISL reservation, block slack or allocated
                             # lookahead may already cover the entire margin.
+                            # Prefill samples one token. If that ends this turn,
+                            # no speculative decode step will ever execute. Its
+                            # own lookahead still needs room to finish prefill.
+                            spec_successor_tokens = (
+                                1 + self.num_spec_tokens
+                                if self._remaining_output_tokens(request) > 1
+                                else 0
+                            )
                             num_tokens_to_reserve = min(
                                 request.num_tokens
-                                + 1
-                                + self.num_spec_tokens
+                                + spec_successor_tokens
                                 + self.num_lookahead_tokens,
                                 self.max_model_len,
+                            )
+                            logger.debug(
+                                "Long-context async reservation: request=%s "
+                                "prefill_tokens=%d spec_successor_tokens=%d "
+                                "lookahead=%d reserve_tokens=%d",
+                                request.request_id,
+                                request.num_tokens,
+                                spec_successor_tokens,
+                                self.num_lookahead_tokens,
+                                num_tokens_to_reserve,
                             )
 
                 new_blocks = self.kv_cache_manager.allocate_slots(
@@ -1583,7 +1600,7 @@ class Scheduler(SchedulerInterface):
         empty_demand = [0] * len(ledger.group_domains)
         if ledger.blocking_domain(request, empty_demand) != HOT:
             return False
-        reclaimed = False
+        reclaimed = 0
         for peer in reversed(list(self.requests.values())):
             if (
                 peer is request
@@ -1598,10 +1615,19 @@ class Scheduler(SchedulerInterface):
             ):
                 continue
             self._preempt_request(peer, timestamp, enqueue=False)
-            reclaimed = True
+            reclaimed += 1
             if ledger.blocking_domain(request, empty_demand) != HOT:
                 break
-        return reclaimed
+        if reclaimed:
+            logger.debug(
+                "Long-context HOT reclamation: request=%s peers=%d "
+                "hot_used=%d hot_capacity=%d",
+                request.request_id,
+                reclaimed,
+                ledger.hot_used,
+                ledger.plan.hot_pool_groups,
+            )
+        return reclaimed > 0
 
     def _preempt_request(
         self, request: Request, timestamp: float, *, enqueue: bool = True

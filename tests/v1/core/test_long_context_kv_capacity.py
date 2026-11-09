@@ -513,7 +513,12 @@ def kv_cache_configs(
     return get_kv_cache_configs(config, [specs] * WORKERS, [memory] * WORKERS)
 
 
-def test_auto_uses_each_workers_effective_budget_and_admits_against_smallest():
+def test_auto_uses_each_workers_effective_budget_and_admits_against_smallest(
+    monkeypatch,
+):
+    # Static hot-pool arm; the shared region keeps one common plan instead
+    # (test_history_shared_region.py).
+    monkeypatch.setattr("vllm.v1.core.long_context_kv.SHARED_HOT_REGION", False)
     settings = LongContextKVConfig(enabled=True, host_pool_gib=112)
     config = production_config(max_model_len=32, long_context=settings)
     config.model_config.original_max_model_len = 32

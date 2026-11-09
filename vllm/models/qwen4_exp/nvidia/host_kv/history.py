@@ -53,6 +53,7 @@ from .budget import (
     HISTORY_METADATA,
     QSA_ROW_GROUPS,
     READ_ROWS,
+    SHARED_PER_SLOT,
     TAIL_GROUPS,
     history_fixed_memory_bytes,
 )
@@ -125,6 +126,11 @@ class HostHistoryShape:
     """Startup context bound, allowing short histories below the 513-row bound."""
     decode_rows: int = 1
     """Maximum verify rows of one request; uniform decode stays one pass."""
+    slots_per_block: int = 0
+    """shared hot region shared region: k hot slots alias each history ID's index page,
+    so
+    ``hot_slots == num_blocks * k`` and only DONATED IDs' slots are usable.
+    0 keeps the static, separately allocated hot pool."""
 
     def conservative_pass_geometry(self) -> tuple[int, int, list[int]]:
         """Planner inputs safe for any request assignment, without device reads.
@@ -191,7 +197,20 @@ class HostHistoryShape:
         )
 
     def fixed_device_memory_bytes(self) -> dict[str, int]:
-        """Required hot-pool reservation, by tensor name (no rounding)."""
+        """Required hot-pool reservation, by tensor name (no rounding).
+
+        The shared region bills slot payload (the index pages) and per-slot
+        metadata per history ID instead."""
+        parts = self._static_fixed_bytes()
+        if self.slots_per_block:
+            parts = {
+                name: size
+                for name, size in parts.items()
+                if name not in SHARED_PER_SLOT
+            }
+        return parts
+
+    def _static_fixed_bytes(self) -> dict[str, int]:
         return history_fixed_memory_bytes(
             slots=self.hot_slots,
             num_layers=self.num_layers,
@@ -230,6 +249,12 @@ class HostHistoryShape:
             raise ValueError("Host history dimensions must be positive integers")
         if self.max_context_tokens is not None and self.max_context_tokens < 1:
             raise ValueError("Host history context bound must be positive")
+        if self.slots_per_block and (
+            type(self.slots_per_block) is not int
+            or self.slots_per_block < 0
+            or self.hot_slots != self.num_blocks * self.slots_per_block
+        ):
+            raise ValueError("Shared hot region needs num_blocks * k slots")
         if self.kernel_block_tokens % 4:
             raise UnsupportedHostKVConfig(
                 "Host history kernel blocks must hold a multiple of four tokens"
@@ -264,6 +289,46 @@ class HostHistoryShape:
                 "selection grid Y": 65535,
             }.get(name, 2**31 - 1)
             _check_product(name, *factors, limit=limit)
+
+
+def _check_hot_alias(
+    view: torch.Tensor, shape: HostHistoryShape, device: torch.device
+) -> torch.Tensor:
+    """A layer's hot slots as a uniform-stride alias of its index pages.
+
+    The view must cover the whole index storage, start at it, and keep the
+    page boundary on a slot boundary (non-divisible strides are rejected at
+    planning time)."""
+    s = shape
+    slot_shape = (s.hot_slots, 2, 4, s.kv_heads, s.head_dim)
+    storage = view.untyped_storage()
+    if (
+        view.shape != slot_shape
+        or view.dtype != s.dtype
+        or view.device != device
+        or not view.is_contiguous()
+        or view.storage_offset() != 0
+        or view.data_ptr() != storage.data_ptr()
+        or storage.nbytes() != view.numel() * view.element_size()
+    ):
+        raise ValueError("Shared hot region view does not alias whole index pages")
+    return view
+
+
+def hot_alias_view(index: torch.Tensor, shape: HostHistoryShape) -> torch.Tensor:
+    """Alias ``[num_blocks, P_pad]`` index storage as ``[num_blocks*k, 2, 4,
+    H, D]`` hot slots. No copy: the result shares the storage."""
+    s = shape
+    storage = index.untyped_storage()
+    raw = torch.empty(0, dtype=torch.uint8, device=index.device)
+    raw.set_(storage, 0, (storage.nbytes(),))
+    slot_bytes = 8 * s.kv_heads * s.head_dim * s.dtype.itemsize
+    if storage.nbytes() != s.num_blocks * s.slots_per_block * slot_bytes:
+        raise ValueError(
+            f"Index storage of {storage.nbytes()} bytes is not {s.num_blocks} "
+            f"pages of {s.slots_per_block} hot slots"
+        )
+    return raw.view(s.dtype).view(s.hot_slots, 2, 4, s.kv_heads, s.head_dim)
 
 
 def _allocate_host(numel: int, dtype: torch.dtype) -> torch.Tensor:
@@ -302,8 +367,11 @@ class HostHistoryStore:
         debug: bool = False,
         region_layout: HostRegionLayout | None = None,
         rank: int = 0,
+        hot_views: Sequence[torch.Tensor] | None = None,
     ) -> None:
         shape.validate()
+        if (hot_views is None) != (shape.slots_per_block == 0):
+            raise ValueError("Shared hot region needs one aliased view per layer")
         if len(layer_names) != shape.num_layers or len(set(layer_names)) != len(
             layer_names
         ):
@@ -370,11 +438,24 @@ class HostHistoryStore:
             self.ready[: s.kernel_blocks_per_block * kbs] = 1
             self.generation = torch.zeros(s.num_blocks, **i32)
             slots = s.hot_slots
-            self.hot = torch.zeros(
-                (layers, slots, 2, 4, h, d), dtype=s.dtype, device=device
-            )
+            self.hot: torch.Tensor | list[torch.Tensor]
+            if hot_views is None:
+                self.hot = torch.zeros(
+                    (layers, slots, 2, 4, h, d), dtype=s.dtype, device=device
+                )
+            else:
+                self.hot = [_check_hot_alias(view, s, device) for view in hot_views]
+                if len(self.hot) != layers:
+                    raise ValueError("Shared hot region needs one view per layer")
             self.group_to_slot = torch.full((layers, s.num_groups), -1, **i32)
             self.slot_owner = torch.full((layers, slots), -1, **i32)
+            # Shared region: the null ID's slots are never hot. Every other ID
+            # starts DONATED, matching the scheduler's initial roles.
+            self.slot_owner[:, : s.slots_per_block] = -2
+            self.available_slots = (
+                slots - s.slots_per_block if s.slots_per_block else slots
+            )
+            self.step_passes: list[tuple[int, int]] | None = None
             self.age = torch.zeros((layers, slots), dtype=torch.int64, device=device)
             self.clock = torch.zeros(layers, dtype=torch.int64, device=device)
             self.eviction_hand = torch.zeros(layers, **i32)
@@ -419,13 +500,23 @@ class HostHistoryStore:
             raise
 
     def fixed_device_memory_bytes(self) -> dict[str, int]:
-        """Actual fixed tensor bytes, excluding host pages and history metadata."""
+        """Actual fixed tensor bytes, excluding host pages and history metadata.
+
+        The shared region's aliased payload and per-slot arrays are billed per
+        history ID and are excluded here."""
+        shape = getattr(self, "shape", None)
+        shared = (
+            SHARED_PER_SLOT
+            if shape is not None and shape.slots_per_block
+            else frozenset()
+        )
         return tensor_storage_bytes(
             {
                 name: value
                 for name, value in vars(self).items()
                 if name
                 not in HISTORY_METADATA
+                | shared
                 | {
                     "host",
                     "host_device",
@@ -568,6 +659,74 @@ class HostHistoryStore:
             ids, self.group_to_slot, self.slot_owner, self.age, s.num_groups,
             s.hot_slots, s.groups_per_block, 256,
         )  # fmt: skip
+
+    # ----- shared hot region shared region
+    # --------------------------------------------------
+
+    def apply_roles(self, donate: Sequence[int], claim: Sequence[int]) -> None:
+        """Step-head role changes, on the forward stream, outside graphs.
+
+        Order (frozen design 4.4): donate (retire the ID's own groups, then
+        free its slots), claim (unmap residents, reserve), then the caller
+        zeroes and begins the new IDs. The forward stream orders these after
+        the previous step's reads of those slots."""
+        s = self.shape
+        if not s.slots_per_block:
+            if donate or claim:
+                raise ValueError("Static hot pool has no shared-region roles")
+            return
+        if set(donate) & set(claim) or 0 in donate or 0 in claim:
+            raise ValueError("Invalid shared-region role update")
+        kp = triton.next_power_of_2(s.slots_per_block)
+        if donate:
+            ids = self._block_ids(list(donate))
+            grid = (ids.numel(), triton.cdiv(s.groups_per_block, 256), s.num_layers)
+            hk.retire_blocks[grid](
+                ids, self.group_to_slot, self.slot_owner, self.age, s.num_groups,
+                s.hot_slots, s.groups_per_block, 256,
+            )  # fmt: skip
+            hk.set_block_slots[(ids.numel(), s.num_layers)](
+                ids, self.group_to_slot, self.slot_owner, self.age, s.num_groups,
+                s.hot_slots, s.slots_per_block, kp, False,
+            )  # fmt: skip
+        if claim:
+            ids = self._block_ids(list(claim))
+            hk.set_block_slots[(ids.numel(), s.num_layers)](
+                ids, self.group_to_slot, self.slot_owner, self.age, s.num_groups,
+                s.hot_slots, s.slots_per_block, kp, True,
+            )  # fmt: skip
+
+    def set_step_plan(
+        self,
+        hot_slots: int | None,
+        passes: list[tuple[int, int]] | None,
+    ) -> None:
+        """The scheduler's U_step and this rank's (identical) mixed-step plan."""
+        if hot_slots is not None and self.shape.slots_per_block:
+            self.available_slots = hot_slots
+        self.step_passes = passes
+
+    def reset_hot_state(self) -> None:
+        """After profiling/capture: every non-null ID DONATED, no residency,
+        no binding. Dummy runs may have written any index page or slot."""
+        s = self.shape
+        self.group_to_slot.fill_(-1)
+        self.slot_owner.fill_(-1)
+        if s.slots_per_block:
+            self.slot_owner[:, : s.slots_per_block] = -2
+            self.available_slots = s.hot_slots - s.slots_per_block
+        self.age.zero_()
+        self.clock.zero_()
+        self.eviction_hand.zero_()
+        self.wanted.zero_()
+        self.ready.zero_()
+        self.ready[: s.kernel_blocks_per_block * s.kernel_block_tokens] = 1
+        if self.region is not None:
+            self.page_of.fill_(-1)
+            self.page_of[0] = 0
+            self.page_of_cpu[:] = -1
+            self.page_of_cpu[0] = 0
+        self.step_passes = None
 
     def mark_ready(self, block_ids: list[int] | torch.Tensor) -> None:
         """Make bound pages readable after ReceiveTxn restores their indexes.
@@ -861,11 +1020,14 @@ def for_each_pass(
         if rows > layer.store.shape.read_rows:
             raise ValueError("Decode rows exceed host-history R_cap")
         passes = [(0, rows)] if rows else []
+    if passes is None and not single_pass:
+        passes = getattr(layer.store, "step_passes", None)
+        if passes is not None and (not passes or passes[-1][1] != rows):
+            raise ValueError("Host-history step plan does not cover the rows")
     if passes is None:
-        # Keep the conservative numerical plan until the runner supplies real
-        # CPU batch metadata (shared hot region). Use the same planner with an uncapped
-        # G,
-        # charging every request's tail, without reading GPU tensors.
+        # No CPU batch metadata (dummy/profile runs, static pool): the
+        # conservative plan, charging every request's tail, over the slots
+        # available this step, without reading GPU tensors.
         from .planning import plan_passes
 
         s = layer.store.shape
@@ -873,7 +1035,7 @@ def for_each_pass(
         passes = plan_passes(
             [rows] + [0] * (s.max_requests - 1),
             groups,
-            s.hot_slots,
+            getattr(layer.store, "available_slots", s.hot_slots),
             s.read_rows,
             row_groups=row_groups,
             tail_groups=tail_groups,

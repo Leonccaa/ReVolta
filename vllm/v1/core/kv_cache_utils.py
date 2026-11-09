@@ -3287,6 +3287,7 @@ def get_long_context_geometry(
     block_tokens = 0
     main_kv_dcp = 1
     state_blocks = 0
+    state_inflight_blocks = 0
     ring_blocks = 0
     compress_ratio = 0
     hot_head_dim = 0
@@ -3322,6 +3323,15 @@ def get_long_context_geometry(
         elif kinds <= {MambaSpec, SlidingWindowSpec}:
             group_domains.append((LC_STATE,))
             state_blocks += blocks
+            if (
+                group.layer_names
+                and MambaSpec in kinds
+                and vllm_config.cache_config.mamba_cache_mode == "align"
+                and getattr(vllm_config.scheduler_config, "async_scheduling", False)
+            ):
+                # With an asynchronous frame in flight, the next boundary
+                # block is allocated before the previous checkpoint retires.
+                state_inflight_blocks += 1
         else:
             raise ValueError(
                 f"kernel_config.long_context_kv cannot place KV cache group "
@@ -3360,6 +3370,7 @@ def get_long_context_geometry(
         state_bytes_per_block=state_owner_bytes + sum(page for _, page in standalone),
         unified_bytes_per_block=layout.bytes_per_block,
         state_blocks_per_request=state_blocks,
+        state_inflight_blocks=state_inflight_blocks,
         ring_blocks_per_request=ring_blocks,
         max_model_len=vllm_config.model_config.max_model_len,
         hot_group_tokens=compress_ratio,
@@ -3377,10 +3388,12 @@ def get_long_context_geometry(
     )
     settings = _long_context_settings(vllm_config)
     if settings is not None and settings.main_kv_placement == "host":
+        strides = _long_context_index_strides(layout, geometry)
         geometry = replace(
             geometry,
-            index_bytes_per_block=sum(_long_context_index_strides(layout, geometry)),
+            index_bytes_per_block=sum(strides),
             logical_index_bytes_per_block=sum(layout.compressed_page_sizes),
+            index_page_strides=tuple(strides),
         )
     return geometry
 
@@ -3662,9 +3675,14 @@ def get_kv_cache_configs(
             zip(projected_groups_per_worker, available_memory)
         ):
             worker_plan = long_context_plan
+            # The shared hot region shared region keeps the common plan on every worker:
+            # the
+            # same history IDs and hot capacity (U_step) on every rank, so the
+            # pass plans match. A larger worker's extra memory stays unused.
             if (
                 long_context_plan.hot_pool_source == "auto"
                 and not long_context_plan.main_kv_on_gpu
+                and not long_context_plan.hot_slots_per_block
             ):
                 worker_plan = plan_long_context_capacity(
                     vllm_config.kernel_config.long_context_kv,

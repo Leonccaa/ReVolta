@@ -191,15 +191,19 @@ def test_dflash_idle_peer_reserves_only_executable_successor(
             assert ledger.in_use == recount(s)
             assert ledger.hot_used <= ledger.plan.hot_pool_groups
             assert peer.status == RequestStatus.WAITING_FOR_STREAMING_REQ
-            assert peer.num_preemptions == 0
-            assert s.kv_cache_manager.get_block_ids(peer.request_id) == peer_blocks
+            if not (matched and max_tokens > 1):
+                assert peer.num_preemptions == 0
+                assert s.kv_cache_manager.get_block_ids(peer.request_id) == peer_blocks
             if target.is_finished():
                 break
         if matched and max_tokens > 1:
-            # A real possible spec step still needs nine pages. No running
-            # work can release the idle peer's two pages in this interval.
-            assert target.status == RequestStatus.WAITING
-            assert not s.running and not s._inflight_prefills
+            # A real possible spec step still needs nine pages, and no running
+            # work can release the idle peer's two pages: the extended load regression
+            # wait
+            # exit  recomputes the idle session once, and the
+            # target finishes instead of waiting forever.
+            assert target.status == RequestStatus.FINISHED_LENGTH_CAPPED
+            assert peer.num_preemptions == 1
             assert ledger.blocked[HOST] > 0
         else:
             assert target.status == RequestStatus.FINISHED_LENGTH_CAPPED

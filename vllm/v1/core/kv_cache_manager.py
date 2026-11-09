@@ -231,6 +231,8 @@ class KVCacheManager:
                 physical_segments=kv_cache_config.block_segments is not None,
             )
             self.block_pool.admission_observer = self.admission_ledger
+            if getattr(self.block_pool, "slots_per_block", 0):
+                self.admission_ledger.elastic_pool = self.block_pool
             self.coordinator.admission_ledger = self.admission_ledger
             logger.info("%s", plan.describe())
 
@@ -503,6 +505,21 @@ class KVCacheManager:
             new_computed_block_list = new_computed_blocks.blocks
         else:
             new_computed_block_list = self.empty_kv_cache_blocks.blocks
+        from vllm.v1.core.history_block_pool import HistoryBlockPool
+
+        if isinstance(self.block_pool, HistoryBlockPool) and self.block_pool.elastic:
+            # shared hot region HOST gate: this candidate's own hit pages are kept,
+            # never
+            # counted as reclaimable cached bindings.
+            group_id = self.block_pool.host_group_id
+            self.block_pool.keep_hids = frozenset(
+                block.block_id
+                for block in (
+                    new_computed_block_list[group_id]
+                    if group_id < len(new_computed_block_list)
+                    else ()
+                )
+            )
 
         # The number of computed tokens is the number of computed tokens plus
         # the new prefix caching hits
@@ -757,7 +774,12 @@ class KVCacheManager:
         if pools is not None:
             # Separate block spaces: reset all of them or none.
             if any(
-                pool.free_block_queue.num_free_blocks != pool.num_gpu_blocks - 1
+                getattr(
+                    pool,
+                    "num_physically_free_blocks",
+                    lambda pool=pool: pool.free_block_queue.num_free_blocks,
+                )()
+                != pool.num_gpu_blocks - 1
                 for pool in pools
             ):
                 logger.warning(

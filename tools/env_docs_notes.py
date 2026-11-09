@@ -96,6 +96,15 @@ NOTES: dict[str, dict[str, str]] = {
         metrics="",
     ),
     # ---- reference deployment ---------------------------------------------
+    "VLLM_SM70_HOST_KV_STATIC_HOT_POOL": dict(
+        section="deployment",
+        since="0.2.0",
+        range="0, 1",
+        tradeoff="Long-context host placement only. 1 restores the separate "
+        "static hot-page pool (history IDs capped by host pages); the default "
+        "shares free history-ID index pages with the hot slots.",
+        metrics="",
+    ),
     "VLLM_QWEN4EXP_PLE_HOST_GIB": dict(
         section="deployment",
         since="1Cat",

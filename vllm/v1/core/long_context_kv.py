@@ -49,7 +49,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
@@ -139,7 +139,37 @@ class LongContextGeometry:
     dcp_interleave: int = 1
     hot_read_rows: int | None = 256
     logical_index_bytes_per_block: int = 0
+    index_page_strides: tuple[int, ...] = ()
+    """Physical GPU index page stride per layer (P_pad), host placement only."""
+    state_inflight_blocks: int = 0
+    """Extra state IDs one request holds while an asynchronous frame is in
+    flight (one per aligned recurrent group). A segment for one request
+    needs them, or that request preempts itself forever."""
     """Host ABI index bytes, excluding GPU page padding (host placement only)."""
+
+    @property
+    def shared_slots_per_block(self) -> int:
+        """k for the shared hot region shared region: hot slots one index page holds, or
+        0
+        when the index pages cannot alias one hot slot grid per layer."""
+        strides = self.index_page_strides
+        slot = self.hot_slot_bytes // max(self.hot_layers, 1)
+        if (
+            not strides
+            or len(strides) != self.hot_layers
+            or len(set(strides)) != 1
+            or slot <= 0
+            or self.hot_slot_bytes % self.hot_layers
+            or strides[0] % slot
+        ):
+            return 0
+        return strides[0] // slot
+
+    def shared_slot_metadata_bytes(self, max_num_seqs: int) -> int:
+        """Per-slot device metadata of the shared region (slot owner, age,
+        gather scratch, identity hot table), charged per history ID as k x."""
+        layers = self.hot_layers
+        return 12 * layers + 16 + 4 * max_num_seqs
 
     @property
     def local_block_tokens(self) -> int:
@@ -270,6 +300,11 @@ class LongContextCapacityPlan:
     only budgets admission."""
     hot_pool_source: Literal["manual", "auto"] = "manual"
     """Whether the hot pool was explicitly sized or took the remaining budget."""
+    hot_slots_per_block: int = 0
+    """shared hot region shared region: k hot slots alias each DONATED history ID's
+    index
+    page; 0 keeps the static hot pool. ``hot_pool_bytes`` then holds only the
+    region's fixed scratch, and ``hot_pool_groups`` the largest region."""
     hot_pool_min_groups: int = 0
     """Guaranteed slot floor. The static static host allocation pool may exceed this
     floor; shared hot region
@@ -288,10 +323,15 @@ class LongContextCapacityPlan:
     def history_bytes_per_block(self) -> int:
         """GPU bytes of one history block ID on one worker."""
         geo = self.geometry
-        return geo.index_bytes_per_block + (
-            geo.main_kv_bytes_per_block
-            if self.main_kv_on_gpu
-            else geo.host_metadata_bytes_per_block
+        return (
+            geo.index_bytes_per_block
+            + (
+                geo.main_kv_bytes_per_block
+                if self.main_kv_on_gpu
+                else geo.host_metadata_bytes_per_block
+            )
+            + self.hot_slots_per_block
+            * geo.shared_slot_metadata_bytes(self.max_num_seqs)
         )
 
     @property
@@ -363,7 +403,16 @@ class LongContextCapacityPlan:
             DOMAIN_NAMES[GPU_HISTORY]: self.gpu_history_blocks
             // (history + geo.ring_blocks_per_request),
             DOMAIN_NAMES[HOST]: self.host_history_blocks // history,
-            HOT_POOL_NAME: self.hot_pool_groups // geo.hot_reserve_groups(num_tokens),
+            HOT_POOL_NAME: (
+                self.gpu_history_blocks
+                // (
+                    history
+                    + geo.ring_blocks_per_request
+                    + cdiv(geo.hot_reserve_groups(num_tokens), self.hot_slots_per_block)
+                )
+                if self.hot_slots_per_block
+                else self.hot_pool_groups // geo.hot_reserve_groups(num_tokens)
+            ),
             "max_num_seqs": self.max_num_seqs,
         }
 
@@ -408,11 +457,13 @@ class LongContextCapacityPlan:
                 f"{_ceil_gib(history * geo.host_bytes_per_block):.2f} "
                 f"(or host_pool_tokens >= {history * geo.block_tokens})."
             )
-        if self.state_blocks < geo.state_blocks_per_request:
+        state_need = geo.state_blocks_per_request + geo.state_inflight_blocks
+        if self.state_blocks < state_need:
             problems.append(
                 f"{DOMAIN_NAMES[STATE]} has {self.state_blocks} state blocks but "
-                f"one request needs {geo.state_blocks_per_request}; set "
-                f"state_blocks >= {geo.state_blocks_per_request}."
+                f"one request needs {state_need} ({geo.state_blocks_per_request} "
+                f"plus {geo.state_inflight_blocks} while an asynchronous frame "
+                f"is in flight); set state_blocks >= {state_need}."
             )
         hot_need = geo.hot_reserve_groups(max_len)
         auto_hot_shortfall = False
@@ -480,6 +531,20 @@ class LongContextCapacityPlan:
                 f"prefill_staging_gib or state_blocks, or raise "
                 f"gpu_memory_utilization."
             )
+        if self.hot_slots_per_block:
+            k = self.hot_slots_per_block
+            floor = cdiv(max(self.hot_pool_min_groups, hot_need), k)
+            need = history + geo.ring_blocks_per_request + floor
+            if self.gpu_history_blocks < need:
+                problems.append(
+                    f"{DOMAIN_NAMES[GPU_HISTORY]} shared region holds "
+                    f"{self.gpu_history_blocks} IDs ({k} hot slots each) but one "
+                    f"{max_len:,}-token request needs {history} history + "
+                    f"{geo.ring_blocks_per_request} ring IDs and a hot floor of "
+                    f"{floor} IDs; lower hot_pool_gib/hot_pool_ratio, "
+                    "prefill_staging_gib or state_blocks, or raise "
+                    "gpu_memory_utilization."
+                )
         if problems and not auto_hot_shortfall:
             fitting = self.max_fitting_len()
             if fitting:
@@ -556,7 +621,10 @@ def plan_long_context_capacity(
     state_blocks = (
         settings.state_blocks
         if settings.state_blocks is not None
-        else max_num_seqs * geometry.state_blocks_per_request
+        else max(
+            max_num_seqs * geometry.state_blocks_per_request,
+            geometry.state_blocks_per_request + geometry.state_inflight_blocks,
+        )
     )
     plan = LongContextCapacityPlan(
         geometry=geometry,
@@ -632,6 +700,8 @@ def plan_long_context_capacity(
         hot_pool_source="auto" if auto else "manual",
         hot_pool_min_groups=floor,
     )
+    if not main_kv_on_gpu and _shared_region_enabled(geometry):
+        return _shared_region_plan(plan, auto)
     if auto and not main_kv_on_gpu:
         return replace(plan, gpu_history_blocks=history_blocks)
     # GPU placement retains the existing physical history allocation. Its
@@ -642,6 +712,67 @@ def plan_long_context_capacity(
         # Every history ID owns a host page: never more IDs than pages.
         history_blocks = min(history_blocks, plan.host_page_blocks)
     return replace(plan, gpu_history_blocks=history_blocks)
+
+
+# shared hot region shared hot region for host placement whenever the index pages can
+# alias
+# hot slots. False (or VLLM_SM70_HOST_KV_STATIC_HOT_POOL=1) keeps the page ownership
+# static pool, the rollback and comparison arm.
+SHARED_HOT_REGION = True
+
+
+def _shared_region_enabled(geometry: LongContextGeometry) -> bool:
+    import vllm.envs as envs
+
+    return (
+        SHARED_HOT_REGION
+        and not envs.VLLM_SM70_HOST_KV_STATIC_HOT_POOL
+        and geometry.shared_slots_per_block > 0
+    )
+
+
+def shared_region_fixed_bytes(geometry: LongContextGeometry, max_num_seqs: int) -> int:
+    """Fixed device bytes of the shared region: everything of the static
+    store that is neither slot payload nor per-slot metadata."""
+    from vllm.models.qwen4_exp.nvidia.host_kv.budget import (
+        SHARED_PER_SLOT,
+        history_fixed_memory_bytes,
+    )
+
+    parts = history_fixed_memory_bytes(
+        # Any slot count beyond 256 * 512 bills the full victim-count tiles.
+        slots=256 * 512,
+        num_layers=geometry.hot_layers,
+        slot_bytes=geometry.hot_slot_bytes,
+        max_requests=max_num_seqs,
+        selection_width=4 * (geometry.hot_row_groups - 1) + 3,
+        max_write_rows=geometry.hot_max_write_rows,
+        row_groups=geometry.hot_row_groups,
+        tail_groups=geometry.hot_tail_groups,
+        read_rows=geometry.hot_read_rows,
+    )
+    return sum(size for name, size in parts.items() if name not in SHARED_PER_SLOT)
+
+
+def _shared_region_plan(
+    plan: LongContextCapacityPlan, auto: bool
+) -> LongContextCapacityPlan:
+    """Give the whole remaining budget to history IDs; the hot region is the
+    DONATED part of their index pages, above a guaranteed floor (slots).
+
+    Manual values keep their converted slot count as the floor. Auto keeps
+    no static floor: the floor is the admitted requests' verify working sets.
+    """
+    geo = plan.geometry
+    k = geo.shared_slots_per_block
+    plan = replace(
+        plan,
+        hot_slots_per_block=k,
+        hot_pool_bytes=shared_region_fixed_bytes(geo, plan.max_num_seqs),
+        hot_pool_min_groups=0 if auto else plan.hot_pool_min_groups,
+    )
+    blocks = plan.gpu_history_budget_blocks
+    return replace(plan, gpu_history_blocks=blocks, hot_pool_groups=blocks * k)
 
 
 def validate_long_context_plan(plan: LongContextCapacityPlan) -> None:
@@ -681,6 +812,10 @@ class LongContextAdmissionLedger:
     _hot: dict[str, int] = field(default_factory=dict)
     _block_domains: list[tuple[int, ...]] = field(default_factory=list)
     _scope: tuple[int, ...] | None = None
+    elastic_pool: Any = None
+    """shared hot region shared region (a HistoryBlockPool with slots per block): HOST
+    is
+    answered by the page table and HOT by the GPU history pool's floor."""
 
     def __post_init__(self) -> None:
         self._block_domains = [()] * self.num_blocks
@@ -763,11 +898,28 @@ class LongContextAdmissionLedger:
         if reserved_per_group is not None:
             reserved = self.domain_demand(reserved_per_group)
             demand = [used + future for used, future in zip(demand, reserved)]
+        pool = self.elastic_pool
         for domain in self.ledger_domains:
+            if pool is not None and domain == HOST:
+                # The candidate's evictable hit IDs are in the block demand,
+                # but they keep their own pages: only fresh pages need room.
+                if demand[domain] - pool.host_kept_free() > (
+                    pool.host_reclaimable_after()
+                ):
+                    return domain
+                continue
             if demand[domain] > self.free(domain):
                 return domain
         need = self.plan.geometry.hot_reserve_groups(self.hot_tokens(request))
         additional = max(need - self._hot.get(request.request_id, 0), 0)
+        if pool is not None:
+            # The floor after this commit must stay DONATED next to the new
+            # IDs: U_nonreclaimable + dU + R_gpu + ceil(F / k) <= A.
+            floor = self.plan.hot_floor_groups(self.hot_used + additional)
+            extra = pool.floor_blocks(floor) - pool.floor_blocks()
+            if extra > 0 and demand[GPU_HISTORY] + extra > pool.get_num_free_blocks():
+                return HOT
+            return None
         if self.hot_used + additional > self.plan.hot_pool_groups:
             return HOT
         return None
@@ -809,9 +961,13 @@ class LongContextAdmissionLedger:
         )
         self._hot[request.request_id] = groups
         self.hot_used += groups - previous
+        if self.elastic_pool is not None:
+            self.elastic_pool.set_hot_floor(self.plan.hot_floor_groups(self.hot_used))
 
     def release(self, request_id: str) -> None:
         self.hot_used -= self._hot.pop(request_id, 0)
+        if self.elastic_pool is not None:
+            self.elastic_pool.set_hot_floor(self.plan.hot_floor_groups(self.hot_used))
 
     def snapshot(self) -> dict[str, tuple[int, int]]:
         """(used, capacity) per domain, for logs and tests."""
@@ -819,5 +975,9 @@ class LongContextAdmissionLedger:
             DOMAIN_NAMES[d]: (self.in_use[d], self.capacity[d])
             for d in (STATE, GPU_HISTORY, HOST)
         }
-        out[HOT_POOL_NAME] = (self.hot_used, self.plan.hot_pool_groups)
+        out[HOT_POOL_NAME] = (
+            (self.hot_used, self.elastic_pool.hot_slots())
+            if self.elastic_pool is not None
+            else (self.hot_used, self.plan.hot_pool_groups)
+        )
         return out

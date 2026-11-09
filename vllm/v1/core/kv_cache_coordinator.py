@@ -101,6 +101,12 @@ class KVCacheCoordinator(ABC):
                     )
                 )
                 pool.configure_host(layout.num_pages, layout.num_workers, group_id)
+                plan = kv_cache_config.long_context_plan
+                if plan is not None and plan.hot_slots_per_block:
+                    pool.configure_elastic(
+                        plan.hot_slots_per_block,
+                        min_floor_slots=plan.hot_pool_min_groups,
+                    )
             return pool
 
         segments = kv_cache_config.block_segments

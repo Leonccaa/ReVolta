@@ -150,9 +150,45 @@ def retire_blocks(
     active = g < GPB
     slot = tl.load(Map + layer * G + gid, active, -1)
     resident = active & (slot >= 0)
+    # Owner guard: a slot another group or a reserved ID page owns is kept.
+    owner = tl.load(Owner + layer * S + tl.maximum(slot, 0), resident, -3)
+    resident = resident & (owner == gid)
     tl.store(Owner + layer * S + tl.maximum(slot, 0), -1, resident)
     tl.store(Age + layer * S + tl.maximum(slot, 0), 0, resident)
     tl.store(Map + layer * G + gid, -1, active)
+
+
+@triton.jit
+def set_block_slots(
+    Blocks,
+    Map,
+    Owner,
+    Age,
+    G: tl.constexpr,
+    S: tl.constexpr,
+    K: tl.constexpr,
+    KP: tl.constexpr,
+    CLAIM: tl.constexpr,
+):
+    """Shared region roles of whole ID pages, every layer (grid: ids, layers).
+
+    Claim: unmap any group resident in the page's k slots, then reserve them
+    (owner -2, age 0). Donate: the caller first retired the ID's own groups;
+    the reserved slots become free hot slots (owner -1)."""
+    i = tl.program_id(0)
+    layer = tl.program_id(1).to(tl.int64)
+    block = tl.load(Blocks + i).to(tl.int64)
+    x = tl.arange(0, KP)
+    valid = x < K
+    slot = block * K + x
+    owner = tl.load(Owner + layer * S + slot, valid, -2)
+    if CLAIM:
+        tl.store(Map + layer * G + tl.maximum(owner, 0), -1, valid & (owner >= 0))
+        tl.store(Owner + layer * S + slot, -2, valid)
+        tl.store(Age + layer * S + slot, 0, valid)
+    else:
+        tl.store(Owner + layer * S + slot, -1, valid & (owner == -2))
+        tl.store(Age + layer * S + slot, 0, valid & (owner == -2))
 
 
 @triton.jit

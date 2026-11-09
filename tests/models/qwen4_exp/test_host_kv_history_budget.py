@@ -254,6 +254,8 @@ def test_store_budget_handles_split_kernel_blocks(sparse_zero_payloads):
 def test_auto_real_store_uses_all_remaining_bytes(
     model, host_gib, sparse_zero_payloads, monkeypatch
 ):
+    # Static hot-pool arm: the shared region bills its slots per history ID.
+    monkeypatch.setattr("vllm.v1.core.long_context_kv.SHARED_HOT_REGION", False)
     settings = LongContextKVConfig(
         enabled=True,
         host_pool_gib=host_gib,

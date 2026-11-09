@@ -26,9 +26,36 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
-from .history import TAIL_GROUPS, HostHistoryShape, HostHistoryStore
+from .history import TAIL_GROUPS, HostHistoryShape, HostHistoryStore, hot_alias_view
 
 logger = init_logger(__name__)
+
+
+def shared_index_tensors(
+    kv_cache_config: KVCacheConfig,
+    kv_caches: dict[str, torch.Tensor] | None,
+    num_layers: int,
+) -> list[torch.Tensor]:
+    """The index tensors whose pages carry the shared hot region, one per
+    host layer in layer order (the padded, explicit-stride index tensors)."""
+    tensors = [
+        tensor
+        for tensor in kv_cache_config.kv_cache_tensors
+        if tensor.page_stride_bytes is not None
+    ]
+    if kv_caches is None or len(tensors) != num_layers:
+        raise RuntimeError(
+            "The shared hot region needs one padded index tensor per host layer"
+        )
+    views = []
+    for tensor in tensors:
+        view = kv_caches[tensor.shared_by[0]]
+        if view.untyped_storage().nbytes() != tensor.size:
+            raise RuntimeError("Index tensor storage differs from its plan")
+        views.append(view)
+    if len({v.untyped_storage().data_ptr() for v in views}) != num_layers:
+        raise RuntimeError("Shared hot region layers must not share index pages")
+    return views
 
 
 def build_host_history_store(
@@ -37,6 +64,7 @@ def build_host_history_store(
     forward_context: dict[str, Any],
     kernel_block_sizes: list[int],
     device: torch.device,
+    kv_caches: dict[str, torch.Tensor] | None = None,
 ) -> HostHistoryStore | None:
     """Allocate the store for ``host_kv_layers`` and bind it to the layers."""
     names = list(getattr(kv_cache_config, "host_kv_layers", None) or [])
@@ -110,7 +138,12 @@ def build_host_history_store(
         kv_heads=spec.num_kv_heads,
         head_dim=spec.head_size,
         dtype=spec.dtype,
-        hot_slots=plan.hot_pool_groups,
+        hot_slots=(
+            kv_cache_config.num_blocks * plan.hot_slots_per_block
+            if plan.hot_slots_per_block
+            else plan.hot_pool_groups
+        ),
+        slots_per_block=plan.hot_slots_per_block,
         max_requests=vllm_config.scheduler_config.max_num_seqs,
         selection_width=widths.pop(),
         max_write_rows=vllm_config.scheduler_config.max_num_batched_tokens,
@@ -137,12 +170,19 @@ def build_host_history_store(
     from vllm.v1.kv_offload.host.region import host_region_layout
 
     layout = host_region_layout(kv_cache_config, vllm_config.instance_id)
+    hot_views = None
+    if plan.hot_slots_per_block:
+        hot_views = [
+            hot_alias_view(index, shape)
+            for index in shared_index_tensors(kv_cache_config, kv_caches, len(names))
+        ]
     store = HostHistoryStore(
         shape,
         names,
         device=device,
         region_layout=layout,
         rank=get_world_group().rank_in_group,
+        hot_views=hot_views,
     )
     if store.fixed_device_memory_bytes() != shape.fixed_device_memory_bytes():
         raise ValueError(

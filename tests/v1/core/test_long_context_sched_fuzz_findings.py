@@ -36,10 +36,6 @@ def _update(request_id: str, tokens: int, max_tokens: int, *, resumable=True):
     return update
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="K2: a re-queued streaming session holding KV blocks the queue head",
-)
 @pytest.mark.parametrize(
     "domain,max_num_seqs,target_pages,full_isl",
     [
@@ -172,6 +168,43 @@ def test_k1_stale_async_frame_after_a_session_stops(enabled):
     assert session.is_finished()
 
 
+@pytest.mark.parametrize("queued_input", [False, True])
+def test_preempted_session_stopped_by_its_in_flight_frame_stays_queued(
+    queued_input,
+):
+    """Found by the fuzzer on the merged shared hot region tree (seed 185, async depth
+    2).
+
+    The scheduler preempts a running streaming session while the frame with
+    its final token is still in flight. When that frame stops the session,
+    the continuing session was enqueued again and then the batch removal of
+    stopped preempted requests dropped every entry: it was in no queue.
+    """
+    s = _async_spec_scheduler(False)
+    session = make_requests(1, 2 * SPAN, 4, tag="k7")[0]
+    session.resumable = True
+    s.add_request(session)
+    first = _decode_once(s, session)
+    if queued_input:
+        s.add_request(_update(session.request_id, 64, 3))  # queued while running
+    # Preempt as the running loop does, before the final frame returns.
+    s.running.remove(session)
+    s._preempt_request(session, 0.0)
+    assert session.status == RequestStatus.PREEMPTED
+    s.update_from_output(first, _output(s, first, 7))
+    queued = [r for r in (*s.waiting, *s.skipped_waiting) if r is session]
+    assert len(queued) == 1
+    if not queued_input:
+        s.add_request(_update(session.request_id, 64, 3))
+    s.add_request(_update(session.request_id, 1, 1, resumable=False))
+    for _ in range(64):
+        output = s.schedule()
+        complete(s, output)
+        if session.is_finished():
+            break
+    assert session.is_finished()
+
+
 def test_stale_async_frame_after_a_session_stops_with_queued_input():
     """Like K1, but the next input is already queued at the stop.
 
@@ -261,32 +294,44 @@ def _drive_frames(s, requests, steps: int, frames: int) -> int:
     "frames",
     [
         1,
-        pytest.param(
-            2,
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="K5: two in-flight frames exceed a one-request state segment",
-            ),
-        ),
+        2,
     ],
 )
 def test_k5_one_request_finishes_in_a_one_request_state_segment(frames):
     """Async (two frames in flight) + DFlash, state segment for one request.
 
-    Startup accepts ``state_blocks == state_blocks_per_request``. A lone long
-    prefill must then finish, but while two chunks are in flight its state
-    demand exceeds that bound: it preempts itself at the third chunk and
-    restarts forever.
+    Startup used to accept ``state_blocks == state_blocks_per_request``; while
+    two chunks are in flight the state demand exceeds that bound and a lone
+    long prefill preempted itself forever. Startup now requires the in-flight
+    peak, and with that size the request finishes.
     """
-    probe = _async_spec_scheduler(True)
+    probe = build(
+        settings(host_pool_tokens=40 * SPAN, hot_pool_gib=0.8),
+        speculative_tokens=7,
+        async_scheduling=True,
+    )
     per_request = probe.kv_cache_manager.admission_ledger.plan.geometry
+    # Startup now requires the in-flight peak, refusing the livelocking size.
+    assert per_request.state_inflight_blocks > 0
+    with pytest.raises(ValueError, match="asynchronous frame"):
+        build(
+            settings(
+                host_pool_tokens=40 * SPAN,
+                hot_pool_gib=0.8,
+                state_blocks=per_request.state_blocks_per_request,
+            ),
+            speculative_tokens=7,
+            async_scheduling=True,
+        )
     s = build(
         settings(
             host_pool_tokens=40 * SPAN,
             hot_pool_gib=0.8,
-            state_blocks=per_request.state_blocks_per_request,
+            state_blocks=per_request.state_blocks_per_request
+            + per_request.state_inflight_blocks,
         ),
         speculative_tokens=7,
+        async_scheduling=True,
     )
     s.vllm_config.scheduler_config.async_scheduling = True
     s = AsyncScheduler(
@@ -307,13 +352,7 @@ def test_k5_one_request_finishes_in_a_one_request_state_segment(frames):
     "policy",
     [
         "fcfs",
-        pytest.param(
-            "priority",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="K4: completed parked loads starve behind a priority head",
-            ),
-        ),
+        "priority",
     ],
 )
 def test_k4_completed_loads_are_promoted_under_priority(policy, spec):
@@ -360,9 +399,14 @@ def test_k4_completed_loads_are_promoted_under_priority(policy, spec):
     for request in loads:
         request.priority = 2
         s.add_request(request)
-    s.connector.get_num_new_matched_tokens = lambda req, _: (
-        (5 * SPAN, True) if req in loads else (0, False)
-    )
+
+    def matched(req, local):
+        # Like the real connector, report only tokens beyond the local hit;
+        # once promoted, a load can be preempted and looked up again.
+        external = max(5 * SPAN - local, 0) if req in loads else 0
+        return external, external > 0
+
+    s.connector.get_num_new_matched_tokens = matched
     output = s.schedule()
     assert all(r.status == RequestStatus.WAITING_FOR_REMOTE_KVS for r in loads)
     complete(s, output, received={r.request_id for r in loads})
@@ -376,10 +420,6 @@ def test_k4_completed_loads_are_promoted_under_priority(policy, spec):
     assert urgent.is_finished() and all(r.is_finished() for r in loads)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="K4: a completed load behind an earlier skipped request is never promoted",
-)
 def test_k4_completed_load_behind_a_skipped_request_under_fcfs():
     """FCFS form of K4, with a hot pool for one max-length request.
 

@@ -1,12 +1,36 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""page ownership history IDs and physical host-page bindings. Hot slots remain
-static."""
+"""History IDs, physical host-page bindings and the elastic GPU shared region.
+
+page ownership added history-ID generations and host-page bindings. shared hot region
+adds the shared
+region: the free history IDs whose index pages carry no prefix (DONATED) lend
+their pages to the hot four-token slots of every layer. Each block ID has one
+role, owned here on the scheduler thread:
+
+- NULL (ID 0): never donated.
+- INUSE: referenced, including ring scratch; its slots are reserved (-2).
+- CACHED: unreferenced with a valid hash; slots reserved, prefix retained.
+- DONATED: unreferenced without a hash; its k slots belong to the hot region.
+- DRAINING: a failed load target or a block with in-flight transfers; reserved
+  until those accesses retire, then donated.
+
+The hot floor F (slots) keeps ceil(F / k) IDs DONATED. Allocation takes cached
+IDs above the index-cache target first, then DONATED IDs above the floor, then
+the remaining cached IDs; it never goes below the floor. The worker applies
+the per-step role changes (donate, then claim) on the forward stream before
+zeroing and beginning new IDs, so every rank sees the same hot capacity.
+"""
 
 from collections.abc import Iterable
+from dataclasses import dataclass, field
 
 from vllm.v1.core.block_pool import BlockPool
-from vllm.v1.core.kv_cache_utils import KVCacheBlock, get_block_hash
+from vllm.v1.core.kv_cache_utils import (
+    FreeKVCacheBlockQueue,
+    KVCacheBlock,
+    get_block_hash,
+)
 from vllm.v1.core.long_context_kv import HOST
 from vllm.v1.kv_offload.base import make_offload_key
 from vllm.v1.kv_offload.host.page_table import (
@@ -19,7 +43,24 @@ from vllm.v1.kv_offload.host.page_table import (
 from vllm.v1.request import Request
 
 
+@dataclass
+class SharedRegionStep:
+    """Per-step role changes of the shared region, identical on every rank."""
+
+    donate: list[int] = field(default_factory=list)
+    """IDs whose slots join the hot region (retire their groups, owner -1)."""
+    claim: list[int] = field(default_factory=list)
+    """IDs whose slots leave the hot region (unmap, owner -2), before zeroing."""
+    hot_slots: int = 0
+    """U_step: hot slots per layer available during this step."""
+    floor_slots: int = 0
+    """F: guaranteed hot slots after this step's admissions."""
+
+
 class HistoryBlockPool(BlockPool):
+    slots_per_block = 0
+    """k: hot slots per history ID page; 0 keeps the static page ownership hot pool."""
+
     def configure_host(self, num_pages: int, num_workers: int, group_id: int) -> None:
         self.host_pages = HostPageTable(num_pages, num_workers)
         self.host_group_id = group_id
@@ -32,6 +73,253 @@ class HistoryBlockPool(BlockPool):
         self.last_scheduled: dict[str, int] = {}
         self.step = 0
         self._jobs: dict[int, tuple[list[PageHandle], int]] = {}
+        self._job_hids: dict[int, list[int]] = {}
+
+    # ----- shared hot region shared region
+    # ---------------------------------------------------
+
+    def configure_elastic(
+        self,
+        slots_per_block: int,
+        *,
+        min_floor_slots: int = 0,
+        index_cache_target: int | None = None,
+    ) -> None:
+        """Lend unhashed free ID pages to the hot region.
+
+        ``index_cache_target`` is T_idx: cached IDs above it are evicted
+        before the hot region shrinks; below it, the region above the floor
+        is used first. None starts at half of the region above the minimum
+        floor until value arbitration (value arbitration) adjusts it.
+        """
+        if slots_per_block < 1 or min_floor_slots < 0:
+            raise ValueError("Invalid shared-region geometry")
+        self.slots_per_block = slots_per_block
+        self.min_floor_slots = min_floor_slots
+        self.floor_slots = min_floor_slots
+        usable = self.num_gpu_blocks - 1
+        if self.floor_blocks() > usable:
+            raise ValueError(
+                f"Hot floor of {min_floor_slots} slots needs {self.floor_blocks()} "
+                f"history IDs, more than the {usable} available"
+            )
+        self.index_cache_target = (
+            (usable - self.floor_blocks()) // 2
+            if index_cache_target is None
+            else index_cache_target
+        )
+        self.donated_queue = FreeKVCacheBlockQueue([])
+        for block in self.free_block_queue.get_all_free_blocks():
+            if block.block_hash is None:
+                self.free_block_queue.remove(block)
+                self.donated_queue.append(block)
+        # Worker view after the last emitted step: 1 = slots in the hot region.
+        # The worker starts with every non-null ID donated (owner -1).
+        self.device_free = bytearray(self.num_gpu_blocks)
+        for block in self.donated_queue.get_all_free_blocks():
+            self.device_free[block.block_id] = 1
+        self.held: dict[int, int] = {}
+        """Free unhashed IDs not yet donated: hid -> retire_after step (or -1
+        while transfers are in flight)."""
+        self.draining: dict[int, int] = {}
+        """Referenced IDs that must drain when freed: hid -> retire_after."""
+        self._io_hids: dict[int, int] = {}
+        self._dirty: set[int] = set()
+        self.keep_hids: frozenset[int] = frozenset()
+        self.stats = {
+            "cached_evicted_for_floor": 0,
+            "cached_evicted_for_host": 0,
+            "cached_evicted_for_allocation": 0,
+        }
+
+    @property
+    def elastic(self) -> bool:
+        return self.slots_per_block > 0
+
+    def floor_blocks(self, floor_slots: int | None = None) -> int:
+        slots = self.floor_slots if floor_slots is None else floor_slots
+        return -(-slots // self.slots_per_block)
+
+    def num_donated(self) -> int:
+        return self.donated_queue.num_free_blocks
+
+    def num_cached_free(self) -> int:
+        return self.free_block_queue.num_free_blocks
+
+    def raw_free_blocks(self) -> int:
+        """Unreferenced IDs that allocation may take (cached plus donated)."""
+        if not self.elastic:
+            return super().get_num_free_blocks()
+        return self.free_block_queue.num_free_blocks + self.num_donated()
+
+    def hot_slots(self) -> int:
+        """U: hot slots per layer with the current roles."""
+        return self.num_donated() * self.slots_per_block
+
+    def set_hot_floor(self, floor_slots: int) -> None:
+        """Raise or lower F; donate cached IDs until the floor is DONATED."""
+        self.floor_slots = max(self.min_floor_slots, floor_slots)
+        self._ensure_floor()
+
+    def _ensure_floor(self) -> None:
+        need = self.floor_blocks()
+        while self.num_donated() < need and self.free_block_queue.num_free_blocks:
+            block = self.free_block_queue.popleft()
+            self._maybe_evict_cached_block(block)
+            self.stats["cached_evicted_for_floor"] += 1
+            self._to_donated(block)
+
+    def _to_donated(self, block: KVCacheBlock) -> None:
+        """A free, unhashed ID: donate it, or hold it while accesses remain."""
+        hid = block.block_id
+        self.unbind(hid)
+        self._dirty.add(hid)
+        retire_after = self.draining.pop(hid, None)
+        if self._io_hids.get(hid):
+            self.held[hid] = -1 if retire_after is None else retire_after
+        elif retire_after is not None and (self.host_pages.watermark < retire_after):
+            self.held[hid] = retire_after
+        else:
+            self.donated_queue.append(block)
+
+    def _release_held(self) -> None:
+        watermark = self.host_pages.watermark
+        for hid, retire_after in list(self.held.items()):
+            if self._io_hids.get(hid) or watermark < retire_after:
+                continue
+            del self.held[hid]
+            self.donated_queue.append(self.blocks[hid])
+            self._dirty.add(hid)
+
+    def mark_draining(self, hids: Iterable[int], retire_after: int) -> None:
+        """NEW_LOAD failure targets: reserve until accesses up to the step
+        ``retire_after`` retire, then donate (receive transactions merge point)."""
+        for hid in hids:
+            self.draining[hid] = max(self.draining.get(hid, 0), retire_after)
+
+    def host_reclaimable_after(self) -> int:
+        """|Reclaimable_after| for HOST admission, excluding ``keep_hids``.
+
+        FREE and owner-free retired pages, plus pages whose every binding is
+        a retired, unreferenced cached ID outside this candidate's hits.
+        """
+        table = self.host_pages
+        count = table.available()
+        pages: dict[int, list[int]] = {}
+        block = self.free_block_queue.fake_free_list_head.next_free_block
+        tail = self.free_block_queue.fake_free_list_tail
+        while block is not None and block is not tail:
+            handle = self.bindings.get(block.block_id)
+            if handle is not None:
+                pages.setdefault(handle.page_id, []).append(block.block_id)
+            block = block.next_free_block
+        for hids in pages.values():
+            if self._cached_page_reclaimable(hids):
+                count += 1
+        return count
+
+    def host_kept_free(self) -> int:
+        """This candidate's unreferenced hit IDs that hold a page: counted in
+        its block demand, but they need no fresh page."""
+        return sum(
+            self.blocks[hid].ref_cnt == 0 and hid in self.bindings
+            for hid in self.keep_hids
+        )
+
+    def _cached_page_reclaimable(self, hids: list[int]) -> bool:
+        if any(hid in self.keep_hids for hid in hids):
+            return False
+        page = self.host_pages.get(self.bindings[hids[0]])
+        if page.leases or page.io or page.ticket or len(page.binds) != len(hids):
+            return False
+        if any((hid, self.hgen[hid]) not in page.binds for hid in hids):
+            return False
+        watermark = self.host_pages.watermark
+        return (
+            watermark >= page.last_use
+            and all(watermark >= r.retire_after for r in page.retirements)
+            and all(
+                watermark >= self.last_use.get((hid, self.hgen[hid]), 0) for hid in hids
+            )
+        )
+
+    def _reclaim_cached_page(self) -> bool:
+        """Free one host page held only by retired cached bindings.
+
+        The GPU IDs lose their hashes and become DONATED first, which is the
+        index-cache-first order; then their bindings retire the page.
+        """
+        pages: dict[int, list[KVCacheBlock]] = {}
+        block = self.free_block_queue.fake_free_list_head.next_free_block
+        tail = self.free_block_queue.fake_free_list_tail
+        while block is not None and block is not tail:
+            handle = self.bindings.get(block.block_id)
+            if handle is not None:
+                pages.setdefault(handle.page_id, []).append(block)
+            block = block.next_free_block
+        for blocks in pages.values():
+            if self._cached_page_reclaimable([b.block_id for b in blocks]):
+                for victim in blocks:
+                    self.free_block_queue.remove(victim)
+                    self._maybe_evict_cached_block(victim)
+                    self.stats["cached_evicted_for_host"] += 1
+                    self._to_donated(victim)
+                return True
+        return False
+
+    def _reserve_page(self, pending: int = 1) -> PageHandle | None:
+        """Reserve one page; when none is reclaimable, retire one page held
+        only by retired cached bindings and retry. The unbound READY page is
+        then recycled by the table's LRU scan, so it passes the host SSD persistence
+        pre-eviction write-back/evict hooks like any other READY page."""
+        handle = self.host_pages.reserve(pending=pending)
+        while handle is None and self.elastic and self._reclaim_cached_page():
+            handle = self.host_pages.reserve(pending=pending)
+        return handle
+
+    def _pop_elastic(self, num_blocks: int) -> list[KVCacheBlock]:
+        cached = self.free_block_queue.num_free_blocks
+        donated = self.num_donated()
+        spare = donated - self.floor_blocks()
+        if num_blocks > cached + max(spare, 0):
+            raise ValueError(f"Cannot get {num_blocks} free blocks above the hot floor")
+        first = min(num_blocks, max(cached - self.index_cache_target, 0))
+        then = min(num_blocks - first, max(spare, 0))
+        last = num_blocks - first - then
+        blocks = self.free_block_queue.popleft_n(first)
+        blocks += self.donated_queue.popleft_n(then)
+        blocks += self.free_block_queue.popleft_n(last)
+        self.stats["cached_evicted_for_allocation"] += sum(
+            b.block_hash is not None for b in blocks
+        )
+        self._dirty.update(b.block_id for b in blocks)
+        return blocks
+
+    def finish_roles(self) -> SharedRegionStep:
+        """Net role changes against the worker's view, after the final
+        executed set and job tracking of this step are known."""
+        if not self.elastic:
+            return SharedRegionStep()
+        self._release_held()
+        self._ensure_floor()
+        step = SharedRegionStep(floor_slots=self.floor_slots)
+        donated = {b.block_id for b in self.donated_queue.get_all_free_blocks()}
+        for hid in sorted(self._dirty):
+            free = hid in donated
+            if free != bool(self.device_free[hid]):
+                (step.donate if free else step.claim).append(hid)
+                self.device_free[hid] = int(free)
+        self._dirty.clear()
+        step.hot_slots = self.hot_slots()
+        assert sum(self.device_free) == len(donated), "shared-region roles diverged"
+        return step
+
+    def filter_zero_ids(self, block_ids: list[int] | None) -> list[int] | None:
+        """Never zero a page the hot region owns after this step's roles."""
+        if not self.elastic or not block_ids:
+            return block_ids
+        kept = [hid for hid in block_ids if not self.device_free[hid]]
+        return kept or None
 
     def _can_retire_binding(self, hid: int) -> bool:
         handle = self.bindings.get(hid)
@@ -46,6 +334,9 @@ class HistoryBlockPool(BlockPool):
         )
 
     def get_num_free_blocks(self) -> int:
+        if self.elastic:
+            # GPU domain only; HOST is answered by host_reclaimable_after().
+            return max(self.raw_free_blocks() - self.floor_blocks(), 0)
         if not hasattr(self, "host_pages"):
             return super().get_num_free_blocks()
         # page ownership conservatively charges each candidate, including ring scratch.
@@ -77,7 +368,18 @@ class HistoryBlockPool(BlockPool):
             self.binding_updates[hid] = -1
 
     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
-        blocks = super().get_new_blocks(num_blocks)
+        if self.elastic:
+            blocks = self._pop_elastic(num_blocks)
+            for block in blocks:
+                self._maybe_evict_cached_block(block)
+                assert block.ref_cnt == 0
+                block.ref_cnt += 1
+                if self.metrics_collector:
+                    self.metrics_collector.on_block_allocated(block)
+            if self.admission_observer is not None:
+                self.admission_observer.on_allocated(blocks)
+        else:
+            blocks = super().get_new_blocks(num_blocks)
         scope = self.admission_observer._scope if self.admission_observer else ()
         for index, block in enumerate(blocks):
             hid = block.block_id
@@ -87,7 +389,7 @@ class HistoryBlockPool(BlockPool):
                 # host SSD persistence: a pre-eviction SSD write may only take pages
                 # beyond the
                 # rest of this admitted batch.
-                handle = self.host_pages.reserve(pending=len(blocks) - index)
+                handle = self._reserve_page(pending=len(blocks) - index)
                 assert handle is not None, "Host admission did not reserve enough pages"
                 self.host_pages.bind(handle, hid, self.hgen[hid], self.step)
                 self.bindings[hid] = handle
@@ -205,11 +507,67 @@ class HistoryBlockPool(BlockPool):
                 page = self.host_pages.get(self.bindings[hid])
                 page.last_use = max(page.last_use, last_use)
 
+    def touch(self, blocks) -> None:
+        if not self.elastic:
+            return super().touch(blocks)
+        observer = self.admission_observer
+        for block in blocks:
+            if block.ref_cnt == 0 and not block.is_null:
+                if block.block_hash is not None:
+                    self.free_block_queue.remove(block)
+                elif block.block_id in self.held:
+                    raise ValueError("A held history ID cannot be referenced")
+                else:
+                    self.donated_queue.remove(block)
+                self._dirty.add(block.block_id)
+                if observer is not None:
+                    observer.on_acquired(block)
+            block.ref_cnt += 1
+            if self.metrics_collector:
+                self.metrics_collector.on_block_accessed(block)
+
+    def evict_blocks(self, block_ids: set[int]) -> None:
+        if not self.elastic:
+            return super().evict_blocks(block_ids)
+        for block_id in block_ids:
+            assert block_id < len(self.blocks), f"Invalid block_id {block_id}"
+            block = self.blocks[block_id]
+            free_cached = (
+                block.ref_cnt == 0
+                and not block.is_null
+                and block.block_hash is not None
+            )
+            if self._maybe_evict_cached_block(block) and free_cached:
+                self.free_block_queue.remove(block)
+                self._to_donated(block)
+
+    def _free_elastic(self, blocks: list[KVCacheBlock], reuse_first: bool) -> None:
+        for block in blocks:
+            block.ref_cnt -= 1
+        freed = [b for b in blocks if b.ref_cnt == 0 and not b.is_null]
+        if self.admission_observer is not None:
+            self.admission_observer.on_released(freed)
+        cached = []
+        for block in freed:
+            if block.block_hash is not None and (
+                reuse_first or not self.enable_caching
+            ):
+                # A prefix that can never hit again is not worth an ID page.
+                self._maybe_evict_cached_block(block)
+            if block.block_hash is None:
+                self._to_donated(block)
+            else:
+                cached.append(block)
+        self.free_block_queue.append_n(cached)
+
     def free_blocks(
         self, ordered_blocks: Iterable[KVCacheBlock], reuse_first: bool = False
     ) -> None:
         blocks = list(ordered_blocks)
-        super().free_blocks(blocks, reuse_first)
+        if self.elastic:
+            self._free_elastic(blocks, reuse_first)
+        else:
+            super().free_blocks(blocks, reuse_first)
         for block in blocks:
             hid = block.block_id
             if hid in self.bindings and block.ref_cnt == 0:
@@ -220,9 +578,17 @@ class HistoryBlockPool(BlockPool):
                         hid, self.hgen[hid]
                     ] = "cached"
 
+    def num_physically_free_blocks(self) -> int:
+        """Unreferenced IDs, independent of host and hot-floor caps."""
+        if self.elastic:
+            return self.raw_free_blocks() + len(self.held)
+        return super().get_num_free_blocks()
+
     def reset_prefix_cache(self) -> bool:
         # Check physical GPU references independently of the host capacity cap.
-        if super().get_num_free_blocks() != self.num_gpu_blocks - 1:
+        if self.num_physically_free_blocks() != self.num_gpu_blocks - 1:
+            return False
+        if self.elastic and self.held:
             return False
         self.host_pages.reset()
         self.binding_updates.update({hid: -1 for hid in self.bindings})
@@ -230,9 +596,27 @@ class HistoryBlockPool(BlockPool):
         self.last_use.clear()
         self.new_hashes.clear()
         self.pending_seals.clear()
-        return super().reset_prefix_cache()
+        if not self.elastic:
+            return super().reset_prefix_cache()
+        # One queue for the base check; afterwards no ID has a hash, so every
+        # one of them is donated.
+        self.free_block_queue.append_n(self.donated_queue.popleft_n(self.num_donated()))
+        if not super().reset_prefix_cache():
+            return False
+        for block in self.free_block_queue.popleft_n(
+            self.free_block_queue.num_free_blocks
+        ):
+            self.donated_queue.append(block)
+            self._dirty.add(block.block_id)
+        return True
 
     def track_job(self, job_id: int, hids: list[int]) -> None:
+        if self.elastic:
+            # A transfer reads/writes whole index pages: keep those IDs out of
+            # the hot region until every rank finished the job.
+            self._job_hids[job_id] = list(hids)
+            for hid in hids:
+                self._io_hids[hid] = self._io_hids.get(hid, 0) + 1
         handles = list({self.bindings[hid] for hid in hids if hid in self.bindings})
         for handle in handles:
             self.host_pages.start_io(handle, job_id)
@@ -252,3 +636,9 @@ class HistoryBlockPool(BlockPool):
             for handle in handles:
                 self.host_pages.finish_io(handle, job_id)
             del self._jobs[job_id]
+            for hid in self._job_hids.pop(job_id, ()):
+                left = self._io_hids[hid] - 1
+                if left:
+                    self._io_hids[hid] = left
+                else:
+                    del self._io_hids[hid]

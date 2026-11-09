@@ -1247,6 +1247,7 @@ class Scheduler(SchedulerInterface):
                     )
 
                 reserved_blocks = 0
+                reserved_per_group = None
                 if load_kv_async:
                     # Parked transfers cannot be preempted to recover memory.
                     # Protect earlier prefills and this load's first spec step.
@@ -1254,6 +1255,34 @@ class Scheduler(SchedulerInterface):
                         self._inflight_prefill_reserved_blocks()
                         + self._spec_decode_step_blocks
                     )
+                    if self.kv_cache_manager.admission_ledger is not None:
+                        managers = (
+                            self.kv_cache_manager.coordinator.single_type_managers
+                        )
+                        reserved_per_group = [0] * len(managers)
+                        for inflight in self._inflight_prefills:
+                            remaining = self._request_remaining_blocks_per_group(
+                                inflight
+                            )
+                            for group_id, count in enumerate(remaining):
+                                reserved_per_group[group_id] += count
+                        if self.num_spec_tokens:
+                            for group_id, manager in enumerate(managers):
+                                if not isinstance(
+                                    manager.kv_cache_spec,
+                                    (
+                                        MambaSpec,
+                                        CircularBufferSpec,
+                                        KpoolTailSpec,
+                                        CrossAttentionSpec,
+                                    ),
+                                ):
+                                    reserved_per_group[group_id] += cdiv(
+                                        1
+                                        + self.num_spec_tokens
+                                        + self.num_lookahead_tokens,
+                                        manager.block_size,
+                                    )
 
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
@@ -1266,6 +1295,7 @@ class Scheduler(SchedulerInterface):
                     num_encoder_tokens=num_encoder_tokens,
                     full_sequence_must_fit=self.scheduler_reserve_full_isl,
                     reserved_blocks=reserved_blocks,
+                    reserved_blocks_per_group=reserved_per_group,
                 )
 
                 if new_blocks is None:
@@ -1529,6 +1559,11 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        # A lookup can be deferred before allocation (budget, encoder or an
+        # asynchronous tier). Only admitted requests retain host prefix pins.
+        host_hits = self.kv_cache_manager.host_kv_hits
+        if host_hits is not None:
+            host_hits.release_uncommitted()
         return scheduler_output
 
     def _build_kv_connector_meta(
@@ -2960,6 +2995,9 @@ class Scheduler(SchedulerInterface):
         return self.connector.request_finished_all_groups(request, block_ids)
 
     def _request_remaining_blocks(self, request: Request) -> int:
+        return sum(self._request_remaining_blocks_per_group(request))
+
+    def _request_remaining_blocks_per_group(self, request: Request) -> list[int]:
         """Remaining allocator demand through prefill and speculative promotion."""
         full_num_tokens = min(request.num_tokens, self.max_model_len)
         num_tokens = full_num_tokens
@@ -2968,7 +3006,7 @@ class Scheduler(SchedulerInterface):
                 num_tokens + 1 + self.num_spec_tokens + self.num_lookahead_tokens,
                 self.max_model_len,
             )
-        return self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
+        return self.kv_cache_manager.coordinator.get_num_blocks_to_allocate_per_group(
             request_id=request.request_id,
             num_tokens=num_tokens,
             new_computed_blocks=self.kv_cache_manager.empty_kv_cache_blocks.blocks,

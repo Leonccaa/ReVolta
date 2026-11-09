@@ -1146,6 +1146,9 @@ def test_awq_multimodal_metadata_through_real_model_config(tmp_path):
     hf.save_pretrained(model)
     cfg = ModelConfig(
         model=str(model),
+        # Pin the fixture's codec: a CPU platform can automatically select
+        # awq_marlin, while this test exercises AWQ metadata identity.
+        quantization="awq",
         dtype="half",
         max_model_len=524288,
         language_model_only=False,

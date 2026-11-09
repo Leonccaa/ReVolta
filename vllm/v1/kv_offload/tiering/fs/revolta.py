@@ -181,6 +181,8 @@ def store_verified_block(
     key: OffloadKey,
     identity: bytes,
     snapshot_guard: Callable[[], contextlib.AbstractContextManager[bool]] | None = None,
+    *,
+    direct_io: bool = True,
 ) -> bool:
     """Publish one page with its payload checksum and full identity.
 
@@ -193,6 +195,8 @@ def store_verified_block(
     ``snapshot_guard`` brackets that computation: while inside it, the buffer
     must not be released; if it yields False the buffer may already have been
     released and nothing is written (``StoreCancelled``).
+    ``direct_io=False`` permits unaligned host-pool rows without a staging copy;
+    the default preserves the existing aligned CPU-offload I/O contract.
     """
     existing = read_page_identity(dest_path)
     if existing is not None and existing[1:] == (identity, bytes(key)):
@@ -208,7 +212,11 @@ def store_verified_block(
     try:
         fd = os.open(
             tmp_path,
-            os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_TRUNC | O_DIRECT,
+            os.O_CREAT
+            | os.O_EXCL
+            | os.O_WRONLY
+            | os.O_TRUNC
+            | (O_DIRECT if direct_io else 0),
             0o644,
         )
         try:
@@ -247,16 +255,19 @@ def load_verified_block(
     block_size: int,
     key: OffloadKey,
     identity: bytes,
+    *,
+    direct_io: bool = True,
 ) -> None:
     """Read one page into ``view`` and delete confirmed verification failures.
 
     The destination slice may hold partial data after a failure; the caller
     reports the load as failed so the slot is never marked ready.
+    ``direct_io=False`` reads unaligned host-pool rows with buffered readv.
     """
     fd: int | None = None
     payload = view.cast("B")[offset : offset + block_size]
     try:
-        fd = os.open(source_path, os.O_RDONLY | O_DIRECT)
+        fd = os.open(source_path, os.O_RDONLY | (O_DIRECT if direct_io else 0))
         file_size = os.fstat(fd).st_size
         if file_size != block_size:
             raise ChecksumError(source_path, f"size {file_size}, expected {block_size}")

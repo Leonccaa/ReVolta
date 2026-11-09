@@ -17,6 +17,9 @@ with the external store skipped once, and it finishes normally. Other
 requests are not touched.
 """
 
+from collections import deque
+from contextlib import nullcontext
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -28,6 +31,7 @@ from tests.v1.kv_connector.unit.offloading_connector.utils import (
 )
 from tests.v1.kv_connector.unit.utils import EOS_TOKEN_ID
 from vllm.config.kernel import LongContextKVConfig
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheGroupSpec,
@@ -161,7 +165,7 @@ def _store_prefix(runner, num_blocks: int) -> list[int]:
 
 
 def _check_pool_drained(runner) -> None:
-    for pool in (runner.scheduler.kv_cache_manager.coordinator.block_pool,):
+    for pool in runner.scheduler.kv_cache_manager.coordinator.block_pools:
         assert pool.get_num_free_blocks() == pool.num_gpu_blocks - 1
 
 
@@ -302,3 +306,162 @@ def test_disabled_gate_keeps_the_assert(request_runner, monkeypatch):
     runner.new_request(token_ids=prompt)
     with pytest.raises(AssertionError):
         runner._run(decoded_tokens=[0, EOS_TOKEN_ID], complete_transfers=True)
+
+
+@pytest.mark.parametrize(
+    "failure", ["short_table", "local_alignment", "short_keys", "prepare"]
+)
+@pytest.mark.parametrize("gate", ["contract", "long_context"])
+def test_preparation_errors_recompute_before_creating_job(
+    request_runner, monkeypatch, failure, gate
+):
+    runner = _runner(request_runner, monkeypatch, gate, async_scheduling=False)
+    prompt = _store_prefix(runner, 3)
+    recorder = _Recorder(runner)
+    cs = runner.connector_scheduler
+    prepare = cs.update_state_after_alloc
+
+    def fail_plan(request, blocks, external):
+        if external:
+            state = cs._req_status[request.request_id]
+            if failure == "short_table":
+                blocks = KVCacheBlocks(
+                    tuple(
+                        [] if i == 0 else group for i, group in enumerate(blocks.blocks)
+                    )
+                )
+            elif failure == "local_alignment":
+                state.num_locally_computed_tokens = 1
+            elif failure == "short_keys":
+                state.group_states[0].offload_keys.clear()
+            else:
+
+                def fail_prepare(*args):
+                    raise RuntimeError("prepare failed")
+
+                runner.manager.prepare_load = fail_prepare
+        return prepare(request, blocks, external)
+
+    cs.update_state_after_alloc = fail_plan
+    runner.new_request(token_ids=prompt)
+    request = runner.scheduler.requests[str(runner.req_id)]
+    _finish(runner, recorder)
+    assert request.status == RequestStatus.FINISHED_STOPPED
+    assert cs.num_abandoned_loads == 1
+    assert recorder.load_jobs == []
+    assert recorder.unpublished_release == [True]
+    assert not cs._jobs
+    assert not cs._current_batch_load_jobs
+
+
+@pytest.mark.parametrize("is_load", [False, True])
+def test_rejected_worker_submission_reports_failure_after_drain(
+    request_runner, monkeypatch, is_load
+):
+    runner = _runner(request_runner, monkeypatch, "contract", async_scheduling=False)
+    worker = runner.worker_connector.connector_worker
+    calls = []
+    worker.worker.transfer_async = lambda job_id, spec: False
+    worker.worker.wait = lambda job_ids: calls.append(set(job_ids))
+    worker.worker.get_finished = lambda: []
+    if is_load:
+        worker._load_jobs[42] = "failed"
+    worker._submit_transfer(42, (None, None))
+    assert calls == [{42}]
+    assert worker.get_finished(set()) == (set(), {"failed"} if is_load else set())
+    meta = worker.build_connector_worker_meta()
+    assert meta.failed_jobs == {42: 1}
+    assert meta.completed_jobs == {42: 1}
+    assert worker.get_finished(set()) == (set(), set())
+    assert worker.build_connector_worker_meta() is None
+
+
+@pytest.mark.parametrize("failure", ["copy", "end_event"])
+def test_partial_submission_drains_before_failure_is_returned(monkeypatch, failure):
+    from vllm.v1.kv_offload.base import CanonicalKVCacheRef, GPULoadStoreSpec
+    from vllm.v1.kv_offload.cpu import gpu_worker
+    from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+
+    calls = []
+    stream = SimpleNamespace(
+        wait_stream=lambda other: None, synchronize=lambda: calls.append("drained")
+    )
+    start = SimpleNamespace(record=lambda other: calls.append("start"))
+
+    def record_end(other):
+        calls.append("end")
+        raise RuntimeError("event failed")
+
+    end = SimpleNamespace(record=record_end)
+
+    def copy(*args, **kwargs):
+        calls.append("copies enqueued")
+        if failure == "copy":
+            raise RuntimeError("batch failed after partial submission")
+
+    handler = gpu_worker.SingleDirectionOffloadingHandler.__new__(
+        gpu_worker.SingleDirectionOffloadingHandler
+    )
+    handler.gpu_to_cpu = False
+    handler.src_tensors = [torch.empty((1, 8), dtype=torch.int8)]
+    handler.dst_tensors = [torch.empty((1, 8), dtype=torch.int8)]
+    handler.src_block_size_factor = handler.dst_block_size_factor = 1
+    handler.kv_cache_groups_data_refs = [[CanonicalKVCacheRef(0, 8)]]
+    handler._stream_pool = [stream]
+    handler._event_pool = [end, start]
+    handler._transfers = deque()
+    handler._transfer_events = {}
+    handler._failed_transfers = {}
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: object())
+    monkeypatch.setattr(torch.cuda, "stream", lambda other: nullcontext())
+    monkeypatch.setattr(gpu_worker.ops, "swap_blocks_batch", copy)
+    with pytest.raises(RuntimeError):
+        handler.transfer_async(
+            42, (CPULoadStoreSpec([0]), GPULoadStoreSpec([0], [1], [0]))
+        )
+    assert calls[-1] == "drained"
+    assert "copies enqueued" in calls
+    assert not handler._transfer_events
+    assert not handler._transfers
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_rejected_load_submission_recomputes_through_scheduler(
+    request_runner, monkeypatch, async_scheduling
+):
+    runner = _runner(request_runner, monkeypatch, "contract", async_scheduling)
+    prompt = _store_prefix(runner, 3)
+    recorder = _Recorder(runner)
+    handler = runner.offloading_spec.handler
+    transfer = handler.transfer_async
+
+    def reject_load(job_id, spec):
+        if isinstance(spec[0], runner_utils.MockLoadStoreSpec):
+            # The fixture's fence recorder requires the rejected descriptor
+            # even though this handler never queues or completes its I/O.
+            handler.transfer_specs[job_id] = spec
+            return False
+        return transfer(job_id, spec)
+
+    handler.transfer_async = reject_load
+    runner.new_request(token_ids=prompt)
+    request = runner.scheduler.requests[str(runner.req_id)]
+    _finish(runner, recorder)
+    assert request.status == RequestStatus.FINISHED_STOPPED
+    assert recorder.voided == [request.request_id]
+    assert recorder.unpublished_release == [True]
+    assert runner.connector_scheduler.num_abandoned_loads == 1
+
+
+def test_lookup_error_is_a_miss_before_admission(request_runner, monkeypatch):
+    runner = _runner(request_runner, monkeypatch, "contract", False)
+
+    def fail_lookup(*args):
+        raise AssertionError("offload keys incomplete")
+
+    runner.manager.lookup.side_effect = fail_lookup
+    runner.new_request(token_ids=[0] * 9)
+    request = runner.scheduler.requests[str(runner.req_id)]
+    _finish(runner, _Recorder(runner))
+    assert request.status == RequestStatus.FINISHED_STOPPED
+    assert runner.connector_scheduler.num_abandoned_loads == 0

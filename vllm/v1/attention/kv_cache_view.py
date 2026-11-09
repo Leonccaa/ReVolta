@@ -383,6 +383,7 @@ def kv_storage_metadata(kv_cache_config, configured_dtype: str) -> dict:
     owners, without retaining a tensor or a storage pointer.
     """
     from vllm.v1.attention.kv_codecs import resolve_kv_codec
+    from vllm.v1.kv_cache_interface import kv_tensor_num_blocks
 
     owners = {}
     for group in kv_cache_config.kv_cache_groups:
@@ -433,7 +434,7 @@ def kv_storage_metadata(kv_cache_config, configured_dtype: str) -> dict:
         "owners": owners,
         "tensors": [
             {
-                "bytes_per_block": t.size // kv_cache_config.num_blocks,
+                "bytes_per_block": t.size // kv_tensor_num_blocks(kv_cache_config, t),
                 "shared_by": list(t.shared_by),
                 "packed_members": list(t.packed_members or []),
             }

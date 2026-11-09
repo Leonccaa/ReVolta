@@ -4,8 +4,11 @@
 
 The scheduler runs the deployed compressed-sparse + GDN layout (TP4/DCP2,
 1,664-token blocks, no speculation) with a capacity plan from the startup
-path. Requests that do not fit a domain must wait or be preempted, never fail,
-and the ledger must match the blocks the managers actually hold.
+path. The GPU state and history segments are separate block pools (see
+test_long_context_split_pool.py); the ledger observes the history pool and
+admits against the host and hot-page pools. Requests that do not fit a domain
+must wait or be preempted, never fail, and the ledger must match the blocks
+the managers actually hold.
 """
 
 from dataclasses import replace
@@ -21,7 +24,14 @@ from vllm.v1.core.kv_cache_utils import (
     get_request_block_hasher,
     init_none_hash,
 )
-from vllm.v1.core.long_context_kv import GPU_HISTORY, HOST, HOT, STATE, GiB
+from vllm.v1.core.long_context_kv import (
+    GPU_HISTORY,
+    HOST,
+    HOT,
+    STATE,
+    STATE_SEGMENT,
+    GiB,
+)
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
@@ -90,7 +100,9 @@ def make_requests(n, prompt_len, max_tokens, *, same_prompt=False, tag="r"):
 
 
 def recount(scheduler) -> list[int]:
-    """Blocks each domain really holds, from the managers' block tables."""
+    """Blocks each ledger domain really holds, from the managers' block
+    tables. The state segment is its own pool, which the ledger does not
+    observe (it stays 0 there)."""
     manager = scheduler.kv_cache_manager
     ledger = manager.admission_ledger
     held: list[set[int]] = [set(), set(), set()]
@@ -100,7 +112,13 @@ def recount(scheduler) -> list[int]:
                 if not block.is_null and block.ref_cnt > 0:
                     for domain in ledger.group_domains[group_id]:
                         held[domain].add(block.block_id)
+    if ledger.physical_segments:
+        held[STATE] = set()
     return [len(ids) for ids in held]
+
+
+def state_pool(scheduler):
+    return scheduler.kv_cache_manager.coordinator.block_pools[STATE_SEGMENT]
 
 
 def run(scheduler, requests, *, check=True, max_steps=20000):
@@ -171,7 +189,7 @@ def test_hot_pool_limits_concurrency_without_preemption():
     plan = scheduler.kv_cache_manager.admission_ledger.plan
     per_request = plan.geometry.hot_reserve_groups(MAX_MODEL_LEN)
     assert per_request == 513 + 9  # one decode row, plus the pinned tail
-    hot_gib = 2 * plan.geometry.hot_bytes_for_groups(per_request) / GiB + 1e-6
+    hot_gib = plan.geometry.hot_bytes_for_groups(2 * per_request, 8) / GiB + 1e-6
     scheduler = build(settings(hot_pool_gib=hot_gib))
     ledger = scheduler.kv_cache_manager.admission_ledger
     assert ledger.plan.hot_pool_groups // per_request == 2
@@ -184,17 +202,54 @@ def test_hot_pool_limits_concurrency_without_preemption():
     assert sum(r.num_preemptions for r in requests) == 0
 
 
+def test_appended_input_must_reserve_its_larger_hot_working_set():
+    scheduler = build(settings())
+    ledger = scheduler.kv_cache_manager.admission_ledger
+    geo = ledger.plan.geometry
+    ledger.plan = replace(
+        ledger.plan, hot_pool_groups=geo.hot_reserve_groups(MAX_MODEL_LEN)
+    )
+    short = make_requests(1, 100, 1, tag="short")[0]
+    peer = make_requests(1, 4000, 1, tag="peer")[0]
+    empty_demand = [0] * len(ledger.group_domains)
+    for request in (short, peer):
+        assert ledger.admit(request, empty_demand)
+        ledger.commit(request)
+    before = ledger.hot_used
+    # A resumed stream can append prompt tokens after the original admission.
+    short.num_prompt_tokens = 10000
+    assert not ledger.admit(short, empty_demand)
+    assert ledger.hot_used == before
+    ledger.release(peer.request_id)
+    assert ledger.admit(short, empty_demand)
+    ledger.commit(short)
+    assert ledger.hot_used == geo.hot_reserve_groups(10001)
+    ledger.commit(short)
+    assert ledger.hot_used == geo.hot_reserve_groups(10001)
+    ledger.release(short.request_id)
+    assert ledger.hot_used == 0
+
+
 def test_state_segment_limits_concurrency():
     probe = build(settings())
     per_request = probe.kv_cache_manager.admission_ledger.plan.geometry
     assert per_request.state_blocks_per_request == 6 * 2 + 2
     # One request peaks at all 14 state blocks (GDN boundary states and PLE),
-    # but holds fewer when admitted; the segment is never overcommitted.
+    # but holds fewer when admitted. The state segment is a pool of its own
+    # now, so it refuses by itself and is never overcommitted.
     scheduler = build(settings(state_blocks=2 * 14))
-    ledger = scheduler.kv_cache_manager.admission_ledger
+    pool = state_pool(scheduler)
+    assert pool.num_gpu_blocks == 2 * 14 + 1
     requests = make_requests(6, 2 * SPAN, 8)
-    run(scheduler, requests)
-    assert ledger.blocked[STATE] > 0
+    lowest = pool.num_gpu_blocks
+    for request in requests:
+        scheduler.add_request(request)
+    while scheduler.has_unfinished_requests():
+        step(scheduler)
+        lowest = min(lowest, pool.get_num_free_blocks())
+    assert lowest < 14  # the pool ran short and held requests back
+    assert pool.get_num_free_blocks() == pool.num_gpu_blocks - 1
+    assert all(r.status == RequestStatus.FINISHED_LENGTH_CAPPED for r in requests)
 
 
 def test_shared_prefix_counts_once():
@@ -220,6 +275,10 @@ def test_shared_prefix_counts_once():
     assert ledger.in_use == [0, 0, 0]
 
 
+def _without_block_ids(trace):
+    return [(tokens, preempted) for tokens, _, preempted in trace]
+
+
 @pytest.mark.parametrize("prefix_caching", [False, True])
 def test_unbinding_plan_schedules_exactly_like_the_disabled_mode(prefix_caching):
     def workload():
@@ -235,15 +294,10 @@ def test_unbinding_plan_schedules_exactly_like_the_disabled_mode(prefix_caching)
         prefix_caching=prefix_caching,
     )
     assert roomy.kv_cache_manager.admission_ledger is not None
-    # Same steps, same block IDs, same preemptions when no domain binds.
-    assert run(disabled, workload()) == run(roomy, workload())
+    # Same steps, same scheduled tokens, same preemptions when no domain
+    # binds. Block IDs differ: the state groups number their own pool.
+    (off_trace, off_peak) = run(disabled, workload())
+    (on_trace, on_peak) = run(roomy, workload())
+    assert _without_block_ids(off_trace) == _without_block_ids(on_trace)
+    assert off_peak == on_peak
     assert roomy.kv_cache_manager.admission_ledger.blocked == [0, 0, 0, 0]
-
-
-def test_physical_pool_untouched_by_the_plan():
-    disabled = build(None)
-    enabled = build(settings())
-    assert disabled.kv_cache_config.num_blocks == enabled.kv_cache_config.num_blocks
-    assert replace(enabled.kv_cache_config, long_context_plan=None) == (
-        disabled.kv_cache_config
-    )

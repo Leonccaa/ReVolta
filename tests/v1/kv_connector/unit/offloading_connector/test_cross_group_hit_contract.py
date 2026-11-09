@@ -45,7 +45,7 @@ DRAFT_WINDOW = 45
 DRAFT_NEED = 3
 
 
-def _scheduler(num_tokens: int, check: bool):
+def _scheduler(num_tokens: int, check: bool, *, eagle: bool = False):
     kv_config = KVCacheConfig(
         num_blocks=64,
         kv_cache_tensors=[],
@@ -86,7 +86,7 @@ def _scheduler(num_tokens: int, check: bool):
     config.cache_config.hash_block_size = None
     config.cache_config.prefix_cache_retention_interval = 0
     config.kv_transfer_config.kv_connector_extra_config = {}
-    config.speculative_config = SimpleNamespace(use_eagle_kv_cache=lambda: False)
+    config.speculative_config = SimpleNamespace(use_eagle_kv_cache=lambda: eagle)
     if check:
         config.kernel_config.qsa_cross_group_hit_check = True
     # With check False the attribute is a MagicMock, which must not enable it.
@@ -128,10 +128,80 @@ def test_contract_is_off_by_default():
     rules = scheduler.hit_contract.rules
     assert (rules[FULL].need, rules[FULL].block_size) == (HitNeed.PREFIX, PAGE)
     assert (rules[MAMBA].need, rules[MAMBA].block_size) == (HitNeed.STATE, PAGE)
-    assert (rules[DRAFT].need, rules[DRAFT].window_blocks) == (
+    assert (rules[DRAFT].need, rules[DRAFT].window_tokens) == (
         HitNeed.WINDOW,
-        DRAFT_NEED,
+        DRAFT_WINDOW - 1,
     )
+
+
+@pytest.mark.parametrize("missing", [None, 1, 2, 3])
+def test_window_off_grid_hit_and_missing_payload(missing):
+    kv = KVCacheConfig(
+        num_blocks=64,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["full"],
+                FullAttentionSpec(
+                    block_size=12, num_kv_heads=1, head_size=1, dtype=torch.float32
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["window"],
+                SlidingWindowSpec(
+                    block_size=16,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=45,
+                ),
+            ),
+        ],
+    )
+    config = MagicMock()
+    config.parallel_config.decode_context_parallel_size = 1
+    config.parallel_config.prefill_context_parallel_size = 1
+    config.parallel_config.world_size = 1
+    config.cache_config.block_size = 4
+    config.cache_config.hash_block_size = None
+    config.cache_config.enable_prefix_caching = True
+    config.cache_config.prefix_cache_retention_interval = 0
+    config.kv_transfer_config.kv_connector_extra_config = {}
+    config.speculative_config = None
+    config.kernel_config.qsa_cross_group_hit_check = True
+    scheduler = OffloadingConnectorScheduler(MockOffloadingSpec(config, kv))
+    req = MagicMock()
+    req.request_id = "off-grid"
+    req.skip_reading_prefix_cache = False
+    req.kv_transfer_params = None
+    req.block_hashes = [BlockHash(f"h{i}".encode()) for i in range(16)]
+    req.num_computed_tokens = 0
+    req.num_prompt_tokens = req.num_tokens = 65
+    req.shared_prefix_boundary = 0
+    req.is_finished.return_value = False
+    scheduler.on_new_request(req)
+    state = scheduler._req_status[req.request_id]
+    state.update_offload_keys()
+    present = set(state.group_states[0].offload_keys[:5])
+    present.update(
+        state.group_states[1].offload_keys[i] for i in (1, 2, 3) if i != missing
+    )
+    _set_present(scheduler, present)
+    assert list(scheduler.hit_contract.rules[1].required_blocks(60)) == [1, 2, 3]
+    hit, _ = scheduler.get_num_new_matched_tokens(req, 0)
+    assert hit == (60 if missing is None else 0)
+
+
+@pytest.mark.parametrize("missing_state", [False, True])
+def test_prefix_probe_cap_preserves_eagle_lookbehind(missing_state):
+    scheduler, req, groups = _scheduler(128, check=True, eagle=True)
+    present = _keys(
+        groups, {FULL: {0, 1, 2}, MAMBA: set() if missing_state else {0}, DRAFT: {0, 1}}
+    )
+    _set_present(scheduler, present)
+    scheduler.hit_contract.register_probe(FULL, lambda g, i, h, bid: i == 0)
+    hit, _ = scheduler.get_num_new_matched_tokens(req, 0)
+    assert hit == (0 if missing_state else PAGE)
 
 
 @pytest.mark.parametrize("local_blocks", [0, 2, 4])

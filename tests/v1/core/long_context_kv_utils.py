@@ -40,6 +40,10 @@ class ProductionModelConfig:
         del parallel_config
         return 1
 
+    def get_num_attention_heads(self, parallel_config) -> int:
+        del parallel_config
+        return 24
+
     def get_total_num_hidden_layers(self) -> int:
         return 48
 

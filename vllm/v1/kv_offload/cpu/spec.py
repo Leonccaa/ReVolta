@@ -7,7 +7,13 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.single_type_kv_cache_manager import MambaManager
-from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec, UniformTypeKVCacheSpecs
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    MambaSpec,
+    UniformTypeKVCacheSpecs,
+    has_block_segments,
+    kv_tensor_num_blocks,
+)
 from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
     GPULoadStoreSpec,
@@ -123,7 +129,7 @@ class CPUOffloadingSpec(OffloadingSpec):
                 # by its largest layer spec. Physical tensor sizes/shared_by are
                 # preserved and give identical budgets on scheduler and workers.
                 page_size = sum(
-                    tensor.size // kv_cache_config.num_blocks
+                    tensor.size // kv_tensor_num_blocks(kv_cache_config, tensor)
                     for tensor in kv_cache_config.kv_cache_tensors
                     if not layer_names.isdisjoint(tensor.shared_by)
                 )
@@ -201,6 +207,25 @@ class CPUOffloadingSpec(OffloadingSpec):
                 if kv_cache_config.num_blocks > 0
                 else 0
             )
+            if has_block_segments(kv_cache_config):
+                # Separate block spaces: one CPU page holds one block of a
+                # single space (its block ID names no block of the other), so
+                # it needs the largest space's per-block bytes.
+                segments = kv_cache_config.block_segments
+                assert segments is not None
+                layer_space = {
+                    name: segments.group_segments[group_id]
+                    for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+                    for name in group.layer_names
+                }
+                space_bytes = [0] * len(segments.num_blocks)
+                for t in kv_cache_config.kv_cache_tensors:
+                    space_bytes[layer_space[t.shared_by[0]]] += t.size // (
+                        kv_tensor_num_blocks(kv_cache_config, t)
+                    )
+                self.cpu_page_size_per_worker = (
+                    max(space_bytes) * self.block_size_factor
+                )
             kv_bytes_per_offloaded_block = self.cpu_page_size_per_worker * world_size
             self.num_blocks = (
                 int(cpu_bytes_to_use) // kv_bytes_per_offloaded_block

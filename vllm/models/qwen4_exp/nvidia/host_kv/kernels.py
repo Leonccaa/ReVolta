@@ -315,28 +315,32 @@ def select_bucket_victims(
         recent_start = tl.sum(free + old, 0) + tl.sum(
             tl.where(tiles < tile, recent, 0), 0
         )
-        tl.device_assert(
-            tl.sum(free + old + recent, 0) >= count, "host KV capacity exceeded"
-        )
-        chunk: tl.constexpr = triton.cdiv(S, C * B) * B
-        for base in range(
-            tile.to(tl.int64) * chunk, (tile + 1).to(tl.int64) * chunk, B
-        ):
-            offset = base + tl.arange(0, B)
-            x = offset + tl.load(Hand)
-            x = tl.where(x >= S, x - S, x)
-            bucket = victim_bucket(x, Wanted, Owner, Age, Clock, S)
-            bucket = tl.where(offset < S, bucket, 3)
-            for b in tl.static_range(3):
-                start = tl.where(
-                    b == 0, free_start, tl.where(b == 1, old_start, recent_start)
-                )
-                eligible = bucket == b
-                rank = start + tl.cumsum(eligible.to(tl.int32)) - 1
-                tl.store(Victims + rank, x.to(tl.int32), eligible & (rank < count))
-            free_start += tl.sum((bucket == 0).to(tl.int32), 0)
-            old_start += tl.sum((bucket == 1).to(tl.int32), 0)
-            recent_start += tl.sum((bucket == 2).to(tl.int32), 0)
+        if tl.sum(free + old + recent, 0) < count:
+            # No CTA writes victims in this case. Clear the downstream count
+            # even when assertions are disabled, so stale scratch is unusable.
+            if tile == 0:
+                tl.store(Count, 0)
+            tl.device_assert(False, "host KV capacity exceeded")
+        else:
+            chunk: tl.constexpr = triton.cdiv(S, C * B) * B
+            for base in range(
+                tile.to(tl.int64) * chunk, (tile + 1).to(tl.int64) * chunk, B
+            ):
+                offset = base + tl.arange(0, B)
+                x = offset + tl.load(Hand)
+                x = tl.where(x >= S, x - S, x)
+                bucket = victim_bucket(x, Wanted, Owner, Age, Clock, S)
+                bucket = tl.where(offset < S, bucket, 3)
+                for b in tl.static_range(3):
+                    start = tl.where(
+                        b == 0, free_start, tl.where(b == 1, old_start, recent_start)
+                    )
+                    eligible = bucket == b
+                    rank = start + tl.cumsum(eligible.to(tl.int32)) - 1
+                    tl.store(Victims + rank, x.to(tl.int32), eligible & (rank < count))
+                free_start += tl.sum((bucket == 0).to(tl.int32), 0)
+                old_start += tl.sum((bucket == 1).to(tl.int32), 0)
+                recent_start += tl.sum((bucket == 2).to(tl.int32), 0)
 
 
 @triton.jit

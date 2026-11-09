@@ -3260,6 +3260,16 @@ def get_long_context_geometry(
             "(QSA) + linear-attention KV cache layout."
         )
     parallel = vllm_config.parallel_config
+    settings = _long_context_settings(vllm_config)
+    if (
+        settings is not None
+        and settings.main_kv_placement == "host"
+        and getattr(parallel, "data_parallel_size", 1) > 1
+    ):
+        raise ValueError(
+            "long-context host KV does not support data parallelism: "
+            "live DP dummy batches have no hot-capacity reservation."
+        )
     transfer = getattr(vllm_config, "kv_transfer_config", None)
     if transfer is not None and (
         transfer.kv_connector != "OffloadingConnector"
@@ -3671,25 +3681,10 @@ def get_kv_cache_configs(
     )
     if long_context_plan is not None:
         configs = []
-        for worker_index, (groups, memory) in enumerate(
-            zip(projected_groups_per_worker, available_memory)
-        ):
+        for worker_index, groups in enumerate(projected_groups_per_worker):
             worker_plan = long_context_plan
-            # The shared hot region shared region keeps the common plan on every worker:
-            # the
-            # same history IDs and hot capacity (U_step) on every rank, so the
-            # pass plans match. A larger worker's extra memory stays unused.
-            if (
-                long_context_plan.hot_pool_source == "auto"
-                and not long_context_plan.main_kv_on_gpu
-                and not long_context_plan.hot_slots_per_block
-            ):
-                worker_plan = plan_long_context_capacity(
-                    vllm_config.kernel_config.long_context_kv,
-                    long_context_plan.geometry,
-                    memory,
-                    long_context_plan.max_num_seqs,
-                )
+            # Static and shared hot pools use the common minimum-budget plan.
+            # Equal capacity keeps every rank's pass boundaries identical.
             logger.info(
                 "long-context KV worker=%d %s", worker_index, worker_plan.describe()
             )

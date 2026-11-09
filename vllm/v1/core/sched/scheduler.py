@@ -352,8 +352,8 @@ class Scheduler(SchedulerInterface):
         # host_kv.ssd is enabled; flush plan set by EngineCore.shutdown.
         self.host_kv_ssd: Any = None
         self.host_kv_flush_plan: Any = None
-        if self.host_history_pool is not None and self.host_history_pool.elastic:
-            # shared hot region: R_host for background IO headroom .
+        if self.host_history_pool is not None:
+            # R_host protects admitted HOST demand with either GPU pool layout.
             self.host_history_pool.host_pages.committed_reserve = (
                 self._host_committed_reserve
             )
@@ -1766,7 +1766,11 @@ class Scheduler(SchedulerInterface):
         epoch = arbiter.begin_step(
             self.current_step, None if last is None else now - last
         )
-        arbiter.end_step(self.current_step)
+        assert self.host_history_pool is not None
+        arbiter.end_step(
+            self.current_step,
+            completed_step=self.host_history_pool.host_pages.watermark,
+        )
         return epoch
 
     def _host_kv_batch(

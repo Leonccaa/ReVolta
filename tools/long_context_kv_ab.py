@@ -981,11 +981,13 @@ def _host_store_checks(
             history_tensor_bytes
             + store["metadata_bytes"]
             + store.get("per_slot_gpu_bytes", 0)
+            + store.get("shadow_gpu_bytes", 0)
             == plan["gpu_history_bytes"],
             {
                 "tensors": history_tensor_bytes,
                 "store_metadata": store["metadata_bytes"],
                 "per_slot": store.get("per_slot_gpu_bytes", 0),
+                "shadow": store.get("shadow_gpu_bytes", 0),
                 "plan": plan["gpu_history_bytes"],
             },
         )
@@ -1157,6 +1159,7 @@ def segment_tensor_checks(structure: dict[str, Any], arm: str) -> list[dict[str,
         used += (
             store.get("metadata_bytes", 0)
             + store.get("per_slot_gpu_bytes", 0)
+            + store.get("shadow_gpu_bytes", 0)
             + store.get("hot_bytes", 0)
             + store.get("scratch_gpu_bytes", 0)
             + int(plan.get("staging_bytes", 0))
@@ -1358,6 +1361,11 @@ def _host_store_dict(
 
         # Billed per history ID in the history segment, not as hot scratch.
         per_slot = {n: other.pop(n) for n in sorted(SHARED_PER_SLOT) if n in other}
+    # value arbitration value arbitration: the layer-0 shadow records (1 B per history
+    # group) are billed per history ID in the history segment. They live on
+    # a helper object, so the tensor scan above does not see them.
+    shadow = getattr(store, "shadow", None)
+    shadow_bytes = nbytes(shadow.epoch) if shadow is not None else 0
     bound = [
         name
         for name in host_layers
@@ -1398,6 +1406,7 @@ def _host_store_dict(
         "scratch_gpu_tensors": other,
         "per_slot_gpu_bytes": sum(per_slot.values()),
         "per_slot_gpu_tensors": per_slot,
+        "shadow_gpu_bytes": shadow_bytes,
         "layers": list(store.layer_index),
         "bound_layers": bound,
     }

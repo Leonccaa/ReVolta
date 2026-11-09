@@ -429,3 +429,133 @@ def test_static_hot_pool_rollback_switch(monkeypatch):
     monkeypatch.setenv("VLLM_SM70_HOST_KV_STATIC_HOT_POOL", "1")
     static = plan()
     assert static.hot_slots_per_block == 0 and static.hot_pool_groups > 0
+
+
+def test_static_auto_workers_share_pass_plan(monkeypatch):
+    import torch
+
+    from tests.v1.core.long_context_kv_utils import production_config, production_specs
+    from vllm.config.kernel import LongContextKVConfig
+    from vllm.models.qwen4_exp.nvidia.host_kv.history import (
+        HostHistoryShape,
+        for_each_pass,
+    )
+    from vllm.v1.core.kv_cache_utils import get_kv_cache_configs
+
+    monkeypatch.setenv("VLLM_SM70_HOST_KV_STATIC_HOT_POOL", "1")
+    config = production_config(
+        max_model_len=262144,
+        long_context=LongContextKVConfig(enabled=True, host_pool_gib=96.13),
+    )
+    config.model_config.original_max_model_len = 262144
+    workers = get_kv_cache_configs(
+        config,
+        [production_specs(speculative_blocks=0)] * 2,
+        [int(3.6 * (1 << 30)), int(3.7 * (1 << 30))],
+    )
+    plans = []
+    for worker in workers:
+        plan = worker.long_context_plan
+        assert plan.hot_slots_per_block == 0
+        shape = HostHistoryShape(
+            num_blocks=worker.num_blocks,
+            kernel_blocks_per_block=1,
+            kernel_block_tokens=832,
+            num_layers=12,
+            kv_heads=1,
+            head_dim=256,
+            dtype=torch.uint8,
+            hot_slots=plan.hot_pool_groups,
+            max_requests=8,
+            selection_width=2051,
+            max_write_rows=8192,
+            dcp_world_size=2,
+            max_context_tokens=262144,
+            decode_rows=8,
+        )
+        intervals: list[tuple[int, int]] = []
+        layer = SimpleNamespace(
+            store=SimpleNamespace(shape=shape), gather=lambda *args: args[0]
+        )
+        selection = torch.zeros((2048, 1), dtype=torch.int32)
+        for_each_pass(
+            layer,
+            selection,
+            selection[:, 0],
+            torch.empty(8, 1),
+            torch.empty(8),
+            lambda start, end, _, intervals=intervals: intervals.append((start, end)),
+        )
+        plans.append(intervals)
+    assert plans[0] == plans[1]
+    assert workers[0].long_context_plan == workers[1].long_context_plan
+
+
+@pytest.mark.parametrize("static", [False, True])
+def test_background_io_keeps_committed_host_reserve(monkeypatch, static):
+    from tests.v1.core.test_long_context_admission import (
+        SPAN,
+        build,
+        make_requests,
+        settings,
+    )
+    from vllm.v1.kv_offload.host.page_table import Result
+
+    monkeypatch.setenv("VLLM_SM70_HOST_KV_STATIC_HOT_POOL", str(int(static)))
+    scheduler = build(
+        settings(main_kv_placement="host", host_pool_tokens=40 * SPAN), max_num_seqs=2
+    )
+    (request,) = make_requests(1, 12 * SPAN, 1, tag="reserve")
+    scheduler.add_request(request)
+    assert scheduler.schedule().total_num_scheduled_tokens > 0
+    table = scheduler.host_history_pool.host_pages
+    needed = scheduler._host_committed_reserve()
+    assert needed > 0
+    assert table.committed_reserve() == needed
+    # Competing background writes may hold only the surplus pages. Once the
+    # headroom is exhausted, pre-eviction writes must yield to admitted work.
+    calls = []
+
+    def try_writeback(page, headroom):
+        calls.append(headroom)
+        if headroom <= 0:
+            return False
+        table.start_io(page.handle, -page.handle.page_id)
+        return True
+
+    table.persistence = SimpleNamespace(
+        try_writeback=try_writeback,
+        on_evict=lambda page: None,
+        on_published=lambda handle: None,
+    )
+    while table.num_free():
+        handle = table.reserve(writeback=False)
+        page = table.get(handle)
+        page.compute_result = page.seal_result = Result.OK
+        table.publish(handle, bytes([handle.page_id]))
+    headroom = table.net_headroom(pending=1)
+    assert headroom > 0
+    allocated = table.reserve()
+    assert allocated is not None
+    table.pin(allocated, 1000)
+    assert calls == list(range(headroom, -1, -1))
+    assert table.available() == needed
+
+
+@pytest.mark.parametrize("static", [False, True])
+def test_host_placement_rejects_dp_dummy_at_startup(monkeypatch, static):
+    from tests.v1.core.long_context_kv_utils import production_config, production_specs
+    from vllm.config.kernel import LongContextKVConfig
+    from vllm.v1.core.kv_cache_utils import get_kv_cache_configs
+
+    monkeypatch.setenv("VLLM_SM70_HOST_KV_STATIC_HOT_POOL", str(int(static)))
+    config = production_config(
+        max_model_len=262144,
+        long_context=LongContextKVConfig(enabled=True, host_pool_gib=96.13),
+    )
+    config.model_config.original_max_model_len = 262144
+    config.parallel_config.data_parallel_size = 2
+    with pytest.raises(ValueError, match="host.*data parallel"):
+        get_kv_cache_configs(
+            config, [production_specs(speculative_blocks=0)], [int(3.6 * (1 << 30))]
+        )

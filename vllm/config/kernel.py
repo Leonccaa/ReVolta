@@ -506,6 +506,15 @@ class KernelConfig:
     """Share FP16 indexer keys across M2..8 queries of one request on SM70
     (1CatAI #1127; opt-in here, also VLLM_SM70_QSA_SHARED_KEY=1)."""
 
+    qsa_dcp_index_shard: bool = False
+    """Shard the target QSA compressed indexer keys over the DCP group.
+
+    Group g is owned by DCP rank ``g % dcp`` at local column ``g // dcp``. Each
+    rank scores only its own groups; local top-k candidates are merged across
+    the group into the unchanged global selection. Requires DCP > 1; the MTP
+    draft indexer stays replicated.
+    """
+
     qsa_cross_group_hit_check: bool = False
     """Report a prefix hit only when every KV cache group is complete at it.
 

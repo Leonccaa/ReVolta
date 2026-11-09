@@ -353,6 +353,8 @@ if TYPE_CHECKING:
     VLLM_SM70_QWEN38_GDN_NO_PACK: bool = False
     VLLM_SM70_MTP_GDN_DIRECT_OUTPUT: bool = False
     VLLM_SM70_QSA_SHARED_KEY: bool = False
+    VLLM_QSA_INDEX_SHARD_DEBUG: bool = False
+    VLLM_QSA_INDEX_SHARD_FUSED_MERGE: bool = True
     VLLM_DFLASH2_LOOKUP_ADAPTIVE: bool = True
     VLLM_DFLASH2_LOOKUP_NSTRONG: int = 6
     VLLM_DFLASH2_LOOKUP_AGREE: int = 0
@@ -4637,6 +4639,37 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
+    ),
+    "VLLM_QSA_INDEX_SHARD_DEBUG": env_var(
+        lambda: bool(int(os.getenv("VLLM_QSA_INDEX_SHARD_DEBUG", "0"))),
+        description=(
+            "Debug check for kernel_config.qsa_dcp_index_shard: before each "
+            "QSA indexer candidate all-gather, all-gather a fixed-size row "
+            "descriptor (call index, rows, top-k, request/position checksums) "
+            "and fail if DCP ranks disagree. Synchronizes the host; skipped "
+            "during CUDA graph capture."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_QSA_INDEX_SHARD_FUSED_MERGE": env_var(
+        lambda: bool(int(os.getenv("VLLM_QSA_INDEX_SHARD_FUSED_MERGE", "1"))),
+        description=(
+            "With kernel_config.qsa_dcp_index_shard on SM70, merge the DCP "
+            "ranks' top-k candidates with the fused Triton kernels. Set 0 to "
+            "fall back to the torch reference merge, which gives the same "
+            "selection bit for bit but runs more small kernels."
+        ),
+        category="experimental",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
         user_visible=False,
     ),
     "VLLM_SM70_QSA_SHARED_KEY": env_var(
@@ -13398,7 +13431,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # potantially caused by a bug in the driver (535 series),
     # if might be helpful to set VLLM_SKIP_P2P_CHECK=0
     # so that vLLM can verify if p2p is actually working.
-    # See https://github.com/vllm-project/vllm/blob/a9b15c606fea67a072416ea0ea115261a2756058/vllm/distributed/device_communicators/custom_all_reduce_utils.py#L101-L108 for details. # noqa
+    # See
+    # https://github.com/vllm-project/vllm/blob/a9b15c606fea67a072416ea0ea115261a2756058/vllm/distributed/device_communicators/custom_all_reduce_utils.py#L101-L108
+    # for details. # noqa
     "VLLM_SKIP_P2P_CHECK": env_var(
         lambda: os.getenv("VLLM_SKIP_P2P_CHECK", "1") == "1",
         description=(

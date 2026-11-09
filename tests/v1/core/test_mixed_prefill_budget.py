@@ -27,6 +27,16 @@ def test_budget_adapts_to_gpu_cost_and_ignores_short_boundaries():
     assert 2400 <= budget.tokens <= 2512
 
 
+def test_budget_recovers_after_stall_from_small_values():
+    budget = MixedPrefillBudget(8192, 250)
+    budget.update(MixedPrefillTiming(512, 16, 512, 6000))
+    assert budget.tokens <= 48
+    for _ in range(200):
+        n = budget.tokens
+        budget.update(MixedPrefillTiming(n, 16, n, 12))
+    assert budget.tokens > 1024
+
+
 @pytest.mark.parametrize("elapsed", [0, -1, float("nan"), float("inf")])
 def test_invalid_timing_does_not_change_budget(elapsed):
     budget = MixedPrefillBudget(8192, 250)

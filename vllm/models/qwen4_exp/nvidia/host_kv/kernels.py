@@ -250,8 +250,9 @@ def victim_bucket(x, Wanted, Owner, Age, Clock, S: tl.constexpr):
     needed = tl.load(Wanted + tl.maximum(owner, 0), (x < S) & (owner >= 0), 0)
     # Free, older than eight calls, recently touched resident. Wanted
     # always wins over age, including current hits whose age was just updated.
+    # Owner -2 is a reserved shared-region slot (an in-use ID page): never.
     bucket = tl.where(owner < 0, 0, tl.where(age < tl.load(Clock) - 8, 1, 2))
-    return tl.where((x < S) & (needed == 0), bucket, 3)
+    return tl.where((x < S) & (needed == 0) & (owner != -2), bucket, 3)
 
 
 @triton.jit

@@ -17,6 +17,21 @@ READ_ROWS = 256
 HISTORY_METADATA = frozenset(
     {"ready", "generation", "group_to_slot", "wanted", "page_of"}
 )
+# shared hot region shared region: slot payload aliases the index pages, and these
+# per-slot
+# tensors scale with history IDs; both are billed per ID, not as fixed bytes.
+SHARED_PER_SLOT = frozenset(
+    {
+        "hot",
+        "slot_owner",
+        "age",
+        "wanted_groups",
+        "miss_groups",
+        "miss_slots",
+        "victim_slots",
+        "hot_block_table",
+    }
+)
 
 
 def history_metadata_bytes(local_tokens: int, num_layers: int) -> dict[str, int]:

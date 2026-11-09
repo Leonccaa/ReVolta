@@ -34,6 +34,15 @@ from .test_long_context_split_pool import GPU_BUDGET, WORKERS, _layer_specs
 
 pytestmark = pytest.mark.cpu_test
 
+
+@pytest.fixture(autouse=True)
+def _static_hot_pool(monkeypatch):
+    # These page ownership regressions pin the static hot-pool arm (host-page-capped
+    # history IDs). The shared hot region shared region has its own scheduler tests in
+    # test_history_shared_region.py.
+    monkeypatch.setattr("vllm.v1.core.long_context_kv.SHARED_HOT_REGION", False)
+
+
 LOCAL = SPAN // 2
 HOST_META_BYTES = 14 * LOCAL + 8  # 12 hot maps + wanted + ready, generation
 HOST_PAGE_BYTES = MAIN_KV_BLOCK_BYTES  # one block, 12 layers, one worker

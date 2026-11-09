@@ -194,13 +194,13 @@ def make_profile(seed: int, **overrides: Any) -> Profile:
 # Scheduler construction.
 # ---------------------------------------------------------------------------
 
-_GEOMETRY: dict[tuple[str, int], Any] = {}
+_GEOMETRY: dict[tuple[str, int, bool], Any] = {}
 
 
-def _geometry(placement: str, spec: int):
+def _geometry(placement: str, spec: int, async_scheduling: bool = False):
     from .test_long_context_admission import build, settings
 
-    key = (placement, spec)
+    key = (placement, spec, async_scheduling)
     if key not in _GEOMETRY:
         probe = build(
             settings(
@@ -209,6 +209,7 @@ def _geometry(placement: str, spec: int):
                 main_kv_placement=placement,
             ),
             speculative_tokens=spec,
+            async_scheduling=async_scheduling,
         )
         _GEOMETRY[key] = probe.kv_cache_manager.admission_ledger.plan.geometry
     return _GEOMETRY[key]
@@ -224,7 +225,9 @@ def build_scheduler(profile: Profile):
 
     from .test_long_context_admission import build, settings
 
-    geo = _geometry(profile.placement, profile.speculative_tokens)
+    geo = _geometry(
+        profile.placement, profile.speculative_tokens, profile.async_scheduling
+    )
     per_request = geo.hot_reserve_groups(MAX_MODEL_LEN)
     groups = int(per_request * profile.hot_requests)
     if profile.placement == "host":
@@ -241,12 +244,17 @@ def build_scheduler(profile: Profile):
         main_kv_placement=profile.placement,
     )
     if profile.state_requests:
-        kwargs["state_blocks"] = geo.state_blocks_per_request * profile.state_requests
+        # The startup minimum: one request plus its in-flight frame peak.
+        kwargs["state_blocks"] = max(
+            geo.state_blocks_per_request * profile.state_requests,
+            geo.state_blocks_per_request + geo.state_inflight_blocks,
+        )
     base = build(
         settings(**kwargs),
         max_num_seqs=profile.max_num_seqs,
         reserve_full_isl=profile.full_isl,
         speculative_tokens=profile.speculative_tokens,
+        async_scheduling=profile.async_scheduling,
     )
     config = base.vllm_config
     config.scheduler_config.policy = "priority" if profile.priority_policy else "fcfs"
@@ -1012,7 +1020,12 @@ class Driver:
                         f" but {refs.get(id(block), 0)} owners"
                     )
                 used += block.ref_cnt > 0
-            free, expected = pool.get_num_free_blocks(), pool.num_gpu_blocks - 1 - used
+            # The shared region's free count excludes its hot floor and the
+            # static pool's excludes withheld host pages: compare physically
+            # unreferenced IDs.
+            physical = getattr(pool, "num_physically_free_blocks", None)
+            free = physical() if physical else pool.get_num_free_blocks()
+            expected = pool.num_gpu_blocks - 1 - used
             if (
                 pool is getattr(s, "host_history_pool", None)
                 and self.pipeline
@@ -1220,8 +1233,13 @@ class Driver:
         if s.requests or s.waiting or s.skipped_waiting or s.running:
             self.fail(f"requests left after drain: {sorted(s.requests)}")
         for index, pool in enumerate(s.kv_cache_manager.coordinator.block_pools):
-            if pool.get_num_free_blocks() != pool.num_gpu_blocks - 1:
+            free = getattr(pool, "num_physically_free_blocks", pool.get_num_free_blocks)
+            if free() != pool.num_gpu_blocks - 1:
                 self.fail(f"pool {index} not empty after drain")
+            if getattr(pool, "slots_per_block", 0) and (
+                pool.floor_slots != pool.min_floor_slots or pool.held
+            ):
+                self.fail(f"pool {index} kept a hot floor or held IDs after drain")
         if ledger.in_use != [0, 0, 0] or ledger.hot_used or ledger._hot:
             self.fail(f"ledger not zero after drain: {ledger.snapshot()}")
         if s._inflight_prefills or s.finished_recving_kv_req_ids:

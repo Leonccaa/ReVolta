@@ -52,10 +52,13 @@ def build(
     prefix_caching: bool = True,
     reserve_full_isl: bool = False,
     speculative_tokens: int = 0,
+    async_scheduling: bool = False,
 ):
     config = make_config(
         max_model_len=MAX_MODEL_LEN, speculative_tokens=speculative_tokens
     )
+    # Set before planning: the state geometry covers an in-flight frame.
+    config.scheduler_config.async_scheduling = async_scheduling
     if speculative_tokens:
         config.speculative_config.method = "dflash"
     config.scheduler_config.max_num_seqs = max_num_seqs

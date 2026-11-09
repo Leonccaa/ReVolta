@@ -293,7 +293,7 @@ scope.
 per-worker budget, including payload, metadata and shared scratch, into whole
 slots. Ratio sizing retains the conversion from a fraction of the host pool's
 rank-local tokens. Neither setting imposes an upper limit on the actual pool.
-The current implementation allocates a static pool and may raise it to fit the
+The static pool (see the shared hot region below) may be raised to fit the
 minimum active working set. A requested minimum that cannot coexist with that
 working set causes a startup configuration error; it is never silently reduced.
 
@@ -306,8 +306,17 @@ older implicit ratio sizing.** The host pool must still be sized explicitly.
 The host reader reserves a fixed `R_cap=256` rows of indices scratch. Startup
 checks the resolved decode capture sizes and `max_num_seqs` times the verify
 width against that limit. Uniform decode uses one pass; mixed batches require
-`mixed_mode != FULL`. Dynamic sharing between index pages and hot slots remains
-a later development phase.
+`mixed_mode != FULL`.
+
+**Shared hot region.** When every QSA layer's padded index page holds a whole
+number of hot slots, the hot slots alias the index pages of free history IDs
+that carry no cached prefix. The KV budget then goes to history IDs; the hot
+region grows and shrinks with them, above a floor that keeps the admitted
+requests' verify working sets (and any manual minimum) resident. Growth first
+evicts cached prefix indexes beyond their share, then shrinks the hot region to
+the floor, and only then preempts. Every worker uses one common plan, so pass
+plans match across ranks. `VLLM_SM70_HOST_KV_STATIC_HOT_POOL=1` restores the
+separate static pool.
 
 ## See also
 

@@ -352,6 +352,11 @@ class Scheduler(SchedulerInterface):
         # host_kv.ssd is enabled; flush plan set by EngineCore.shutdown.
         self.host_kv_ssd: Any = None
         self.host_kv_flush_plan: Any = None
+        if self.host_history_pool is not None and self.host_history_pool.elastic:
+            # shared hot region: R_host for background IO headroom .
+            self.host_history_pool.host_pages.committed_reserve = (
+                self._host_committed_reserve
+            )
         if self.host_history_pool is not None and self.connector is not None:
             from vllm.distributed.kv_transfer.kv_connector.v1 import (
                 offloading_connector,
@@ -931,6 +936,17 @@ class Scheduler(SchedulerInterface):
                         break
 
                     # The request cannot be scheduled.
+                    victim = (
+                        max(self.running, key=lambda r: (r.priority, r.arrival_time))
+                        if self.policy == SchedulingPolicy.PRIORITY
+                        else self.running[-1]
+                    )
+                    if victim is request and self._reclaim_idle_sessions(
+                        request, scheduled_timestamp, holders=True, beside=request
+                    ):
+                        # Long-context: rather than preempting itself, the
+                        # last runnable request recomputes an idle KV holder.
+                        continue
                     # Preempt the lowest-priority request.
                     if self.policy == SchedulingPolicy.PRIORITY:
                         preempted_req = max(
@@ -1068,6 +1084,10 @@ class Scheduler(SchedulerInterface):
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
+            # Wait exits : once the queue head cannot allocate,
+            # waiting requests that already hold KV (completed async loads,
+            # re-queued sessions) go first, so they finish and release it.
+            holders_only = False
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
@@ -1078,6 +1098,11 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+
+                if holders_only and not self._is_waiting_kv_holder(request):
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
@@ -1351,6 +1376,13 @@ class Scheduler(SchedulerInterface):
                         request, scheduled_timestamp
                     ):
                         continue
+                    if holders_only or self._has_waiting_kv_holder(request):
+                        holders_only = True
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
+                    if self._reclaim_idle_sessions(request, scheduled_timestamp):
+                        continue
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -1474,6 +1506,10 @@ class Scheduler(SchedulerInterface):
             # re-queue requests skipped in this pass ahead of older skipped items.
             if step_skipped_waiting:
                 self.skipped_waiting.prepend_requests(step_skipped_waiting)
+            if holders_only and not self.running:
+                # Every KV holder was refused too and nothing runs: recompute
+                # one holder so the next step can make progress .
+                self._reclaim_idle_sessions(None, scheduled_timestamp, holders=True)
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
@@ -1600,10 +1636,6 @@ class Scheduler(SchedulerInterface):
             from vllm.v1.kv_offload.host.receive import HostReceiveSpec
 
             tickets = host_pool.finish_schedule(num_scheduled_tokens)
-            scheduler_output.host_kv = HostKVStep(
-                self.current_step, list(host_pool.binding_updates.items()), tickets
-            )
-            host_pool.binding_updates.clear()
             metadata = scheduler_output.kv_connector_metadata
             if isinstance(metadata, OffloadingConnectorMetadata):
                 for job_id, job in (metadata.load_jobs | metadata.store_jobs).items():
@@ -1617,6 +1649,25 @@ class Scheduler(SchedulerInterface):
                     start = sum(gpu.group_sizes[:group_id])
                     end = start + gpu.group_sizes[group_id]
                     host_pool.track_job(job_id, gpu.block_ids[start:end].tolist())
+            # Roles after job tracking: an ID with an in-flight transfer is
+            # held, never donated to the hot region this step.
+            roles = host_pool.finish_roles()
+            scheduler_output.host_kv = HostKVStep(
+                self.current_step,
+                list(host_pool.binding_updates.items()),
+                tickets,
+                donate=roles.donate,
+                claim=roles.claim,
+                hot_slots=roles.hot_slots,
+                floor_slots=roles.floor_slots,
+                requests=self._host_kv_batch(num_scheduled_tokens)
+                if host_pool.elastic
+                else {},
+            )
+            host_pool.binding_updates.clear()
+            scheduler_output.new_block_ids_to_zero = host_pool.filter_zero_ids(
+                scheduler_output.new_block_ids_to_zero
+            )
 
         self._pending_preempted_req_ids = set()
 
@@ -1639,10 +1690,92 @@ class Scheduler(SchedulerInterface):
             host_hits.release_uncommitted()
         return scheduler_output
 
+    def _host_kv_batch(
+        self, num_scheduled_tokens: dict[str, int]
+    ) -> dict[str, tuple[int, int, int]]:
+        """shared hot region planner inputs: rows, G_q at the length after this step and
+        the
+        decode/prefill class. Runs before the computed-token update."""
+        from vllm.models.qwen4_exp.nvidia.host_kv.planning import history_groups
+
+        ledger = self.kv_cache_manager.admission_ledger
+        assert ledger is not None
+        geo = ledger.plan.geometry
+        dcp, interleave = geo.dcp_world_size, geo.dcp_interleave
+        out = {}
+        for req_id, rows in num_scheduled_tokens.items():
+            request = self.requests[req_id]
+            length = min(request.num_computed_tokens + rows, geo.max_model_len)
+            groups = history_groups(length, dcp, interleave)
+            kind = 0 if rows <= geo.decode_rows_per_request else 1
+            out[req_id] = (rows, groups, kind)
+        return out
+
     def _build_kv_connector_meta(
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
         return connector.build_connector_meta(scheduler_output)
+
+    def _is_waiting_kv_holder(self, request: Request) -> bool:
+        """A waiting request that holds KV and can run without a lookup."""
+        if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+            return request.request_id in self.finished_recving_kv_req_ids
+        return (
+            request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+            and request.num_computed_tokens > 0
+        )
+
+    def _has_waiting_kv_holder(self, blocked: Request) -> bool:
+        if self.kv_cache_manager.admission_ledger is None:
+            return False
+        return any(
+            peer is not blocked and self._is_waiting_kv_holder(peer)
+            for peer in itertools.chain(self.waiting, self.skipped_waiting)
+        )
+
+    def _reclaim_idle_sessions(
+        self,
+        request: Request | None,
+        timestamp: float,
+        *,
+        holders: bool = False,
+        beside: Request | None = None,
+    ) -> bool:
+        """load regression for GPU, HOST and STATE refusals: with nothing running,
+        nothing
+        else can release KV, so recompute one idle KV-holding peer and retry.
+
+        Only peers without in-flight tokens. Promoted loads and re-queued
+        partial prefills (``holders``) are reclaimed only after every holder
+        was refused, or instead of the last running request (``beside``)
+        preempting itself; parked loads still waiting for their transfer
+        never."""
+        if self.kv_cache_manager.admission_ledger is None or any(
+            r is not beside for r in self.running
+        ):
+            return False
+        for peer in reversed(list(self.requests.values())):
+            if (
+                peer is request
+                or peer.status
+                not in (
+                    RequestStatus.WAITING,
+                    RequestStatus.PREEMPTED,
+                    RequestStatus.WAITING_FOR_STREAMING_REQ,
+                )
+                or peer.num_computed_tokens == 0
+                or peer.num_in_flight_tokens != 0
+                or (peer in self._inflight_prefills and not holders)
+            ):
+                continue
+            self._preempt_request(peer, timestamp, enqueue=False)
+            logger.debug(
+                "Long-context idle reclamation: request=%s peer=%s",
+                None if request is None else request.request_id,
+                peer.request_id,
+            )
+            return True
+        return False
 
     def _reclaim_waiting_hot_reservations(
         self, request: Request, timestamp: float
@@ -3208,6 +3341,19 @@ class Scheduler(SchedulerInterface):
             total_computed_tokens=request.num_computed_tokens,
             num_tokens_main_model=full_num_tokens,
             apply_admission_cap=True,
+        )
+
+    def _host_committed_reserve(self) -> int:
+        """R_host: fresh private pages the admitted in-flight prefills and
+        parked loads still need for their host-group blocks (ring IDs own no
+        page). Background SSD writes must leave them free."""
+        pool = self.host_history_pool
+        assert pool is not None
+        group_id = pool.host_group_id
+        return sum(
+            self._request_remaining_blocks_per_group(request)[group_id]
+            for request in self._inflight_prefills
+            if not request.is_finished()
         )
 
     def _inflight_prefill_reserved_blocks(self) -> int:

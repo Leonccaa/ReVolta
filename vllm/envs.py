@@ -842,6 +842,7 @@ if TYPE_CHECKING:
     VLLM_SM70_USE_BREAKABLE_CUDAGRAPH: bool = False
     VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH: bool = False
     VLLM_SM70_QWEN38_HYBRID_PLE: bool = False
+    VLLM_SM70_HOST_KV_STATIC_HOT_POOL: bool = False
     VLLM_SM70_SYNC_BEFORE_COMPILE_GRAPH_FORWARD: bool = False
     VLLM_SM70_FLASH_V100_0DOT3_ELIMINATE_NOOPS: bool = False
     VLLM_SM70_FLASH_V100_0DOT3_EAGER_PROFILE_RUN: bool = True
@@ -13140,6 +13141,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Keep local pinned-host PLE shards for Qwen3.8 decode while its prefill
     # uses the asynchronous CPU/disk-mmap offload result.
+    "VLLM_SM70_HOST_KV_STATIC_HOT_POOL": env_var(
+        lambda: bool(
+            os.getenv("VLLM_SM70_HOST_KV_STATIC_HOT_POOL", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+        ),
+        description=(
+            "Long-context host placement: keeps the separate static hot-page "
+            "pool instead of the shared region that lends free history-ID "
+            "index pages to hot slots. Default off. Set 1 only to roll back "
+            "or compare the hot-pool arms."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False; read when the long-context plan is built.",
+        automatic_conditions=(),
+        acceleration_paths=("Active Host KV hot pages",),
+        user_visible=True,
+    ),
     "VLLM_SM70_QWEN38_HYBRID_PLE": env_var(
         lambda: bool(
             os.getenv("VLLM_SM70_QWEN38_HYBRID_PLE", "0").strip().lower()
@@ -20195,6 +20214,8 @@ def compile_factors() -> dict[str, object]:
 
     ignored_factors: set[str] = {
         "MAX_JOBS",
+        # Scheduler/KV planning only; never changes compiled code.
+        "VLLM_SM70_HOST_KV_STATIC_HOT_POOL",
         "VLLM_RPC_BASE_PATH",
         "VLLM_USE_MODELSCOPE",
         "VLLM_RINGBUFFER_WARNING_INTERVAL",

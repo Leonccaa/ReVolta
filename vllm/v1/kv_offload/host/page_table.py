@@ -58,6 +58,16 @@ class HostKVStep:
     step: int
     bindings: list[tuple[int, int]]
     seals: list[SealTicket]
+    # shared hot region shared region, applied in order on the forward stream: donate,
+    # claim, then the zeroing/begin of new IDs. Empty for the static pool.
+    donate: list[int] = field(default_factory=list)
+    claim: list[int] = field(default_factory=list)
+    hot_slots: int = 0
+    """U_step: hot slots per layer during this step (0: static pool)."""
+    floor_slots: int = 0
+    requests: dict[str, tuple[int, int, int]] = field(default_factory=dict)
+    """CPU batch metadata: req_id -> (query rows, G_q, class), class 0 for
+    decode/verify rows and 1 for prefill. Planner input on every rank."""
 
 
 @dataclass

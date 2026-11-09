@@ -737,6 +737,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.compilation_config.static_forward_context,
                 kernel_block_sizes,
                 self.device,
+                kv_caches_dict,
             )
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
 
@@ -760,6 +761,38 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cache_dtype=self.cache_config.cache_dtype,
             runner_only_attn_layers=set(),
             static_forward_context=self.compilation_config.static_forward_context,
+        )
+
+    def _set_host_kv_plan(self, scheduler_output, input_batch) -> None:
+        """shared hot region: this rank's mixed-step pass intervals from scheduler
+        metadata.
+
+        Every rank has the same batch order, U_step and (rows, G_q), so the
+        intervals match across ranks; no device value is read."""
+        store = getattr(self, "host_history", None)
+        host_step = getattr(scheduler_output, "host_kv", None)
+        if store is None or host_step is None or not host_step.requests:
+            if store is not None:
+                store.set_step_plan(None, None)
+            return
+        from vllm.models.qwen4_exp.nvidia.host_kv.planning import plan_step_passes
+
+        s = store.shape
+        rows = [host_step.requests[req_id][0] for req_id in input_batch.req_ids]
+        if max(rows, default=0) <= s.decode_rows:
+            store.set_step_plan(host_step.hot_slots or None, None)
+            return
+        store.set_step_plan(
+            host_step.hot_slots or None,
+            plan_step_passes(
+                input_batch.req_ids,
+                input_batch.num_tokens,
+                host_step.requests,
+                host_step.hot_slots or store.available_slots,
+                s.read_rows,
+                row_groups=s.row_groups,
+                tail_groups=s.tail_groups,
+            ),
         )
 
     def _zero_block_ids(self, block_ids: list[int]) -> None:
@@ -1677,7 +1710,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             host_step = getattr(scheduler_output, "host_kv", None)
             if host_step is not None:
                 assert self.host_history is not None
+                if self.host_history.shape.slots_per_block and not getattr(
+                    self, "_host_history_live", False
+                ):
+                    # Profiling, warmup and capture ran dummy batches over the
+                    # shared index pages: start serving from the scheduler's
+                    # initial roles (every non-null ID DONATED, no binding).
+                    self.host_history.reset_hot_state()
+                    self._host_history_live = True
                 self.host_history.bind_pages(host_step.bindings)
+                # shared hot region step head: donate, claim, then zero/begin new IDs
+                # below.
+                self.host_history.apply_roles(host_step.donate, host_step.claim)
+                self.host_history.set_step_plan(
+                    getattr(host_step, "hot_slots", 0) or None, None
+                )
             if scheduler_output.new_block_ids_to_zero:
                 self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
             if scheduler_output.total_num_scheduled_tokens == 0:
@@ -1720,6 +1767,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Common case.
             # Prepare all the inputs and copy to the input buffers.
             input_batch = self.prepare_inputs(scheduler_output, batch_desc)
+            self._set_host_kv_plan(scheduler_output, input_batch)
             early_model_inputs, ple_prepared = self.prepare_model_inputs_early(
                 input_batch, batch_desc.cg_mode
             )
@@ -1743,6 +1791,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self._set_active_loras(*lora_inputs)
         else:
             # No actual tokens to run. A dummy run for DP or memory profiling.
+            host_history = getattr(self, "host_history", None)
+            if host_history is not None:
+                host_history.set_step_plan(None, None)
             input_batch = InputBatch.make_dummy(
                 batch_desc.num_reqs or num_reqs,
                 batch_desc.num_tokens,

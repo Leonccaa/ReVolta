@@ -72,9 +72,10 @@ class _Plant(Extension):
                 return
             s.waiting.add_request(next(iter(s.waiting)))  # queued twice
         elif self.fault == "stall":
-            if s.running:
-                return
-            s.max_num_running_reqs = 0  # nothing new is ever admitted
+            from vllm.v1.core.sched.interface import PauseState
+
+            # Nothing is scheduled any more, whatever is running at the time.
+            s._pause_state = PauseState.PAUSED_ALL
         elif self.fault == "pin":
             driver.conn.pins["ghost"] += 1
         self.planted = True
@@ -85,7 +86,9 @@ class _Plant(Extension):
     [
         ("ledger", "ledger in_use"),
         ("hot", "hot reservation of freed request"),
-        ("queue", "queued 2 times"),
+        # A duplicate queue entry is caught when counted or when the request
+        # finishes while still queued, whichever the trajectory reaches first.
+        ("queue", "queued 2 times|still queued"),
         ("stall", "no progress"),
         ("pin", "connector pins"),
     ],

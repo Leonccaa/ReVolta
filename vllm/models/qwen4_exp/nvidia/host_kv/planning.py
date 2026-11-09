@@ -82,6 +82,41 @@ def plan_passes(
     return passes
 
 
+def plan_step_passes(
+    batch_req_ids: Sequence[str],
+    num_rows: int,
+    requests: dict[str, tuple[int, int, int]],
+    hot_slots: int,
+    R_cap: int,
+    *,
+    row_groups: int = QSA_ROW_GROUPS,
+    tail_groups: int = TAIL_GROUPS,
+) -> list[tuple[int, int]]:
+    """A mixed step's pass intervals from scheduler metadata (shared hot region).
+
+    ``batch_req_ids`` is the worker's row order; every rank has the same
+    order, U_step and per-request (rows, G_q), so every rank computes the same
+    intervals with no device readback. Rows past the scheduled tokens
+    (padding) belong to no request (G = 0) and only consume R_cap.
+    """
+    rows = [requests[req_id][0] for req_id in batch_req_ids]
+    groups = [requests[req_id][1] for req_id in batch_req_ids]
+    pad = num_rows - sum(rows)
+    if pad < 0:
+        raise ValueError("Host-history batch has fewer rows than scheduled")
+    if pad:
+        rows.append(pad)
+        groups.append(0)
+    return plan_passes(
+        rows,
+        groups,
+        hot_slots,
+        R_cap,
+        row_groups=row_groups,
+        tail_groups=tail_groups,
+    )
+
+
 def validate_graph_capacity(
     R_cap: int,
     capture_sizes: Sequence[int],

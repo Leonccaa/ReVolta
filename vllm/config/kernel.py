@@ -458,10 +458,14 @@ class LongContextKVConfig:
     between the GPU prefix-index cache and the hot pages by bounded value
     feedback. False keeps the fixed default split. Scheduler-only; it never
     affects correctness or admission and is excluded from the compile hash."""
-    value_arbiter_settings: dict[str, float | int | str] = Field(default_factory=dict)
+    value_arbiter_settings: dict[str, bool | float | int | str] = Field(
+        default_factory=dict
+    )
     """Overrides of the arbitration window, dead band, quantum and the
     placeholder cost weights (``bw_uva``, ``bw_h2d``, ``w_async``,
-    ``w_ttft``) for measurement runs. Excluded from the compile hash."""
+    ``w_ttft``) for measurement runs. ``busy_time`` defaults to true and
+    uses the union of dispatch-to-output busy spans; false restores the
+    historical step-to-step wall clock. Excluded from the compile hash."""
 
     def validate_settings(self) -> None:
         """Reject contradictory sizes; called only when the mode is enabled."""

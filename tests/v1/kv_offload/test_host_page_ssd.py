@@ -107,8 +107,7 @@ class Env:
         self.backing[start : start + ROW] = payload(n)
         if bind is not None:
             self.table.bind(handle, bind, 0)
-        page = self.table.get(handle)
-        page.compute_result = page.seal_result = Result.OK
+        self.table.producer_result(handle, compute=Result.OK, seal=Result.OK)
         self.table.publish(handle, key(n))
         return handle
 
@@ -326,7 +325,7 @@ def test_persisted_page_not_rewritten_and_other_copy_is_not_persisted(tmp_path, 
     # A SHADOW copy of the same hash is not READY and never inherits it.
     handle = env.table.reserve()
     page = env.table.get(handle)
-    page.compute_result = page.seal_result = Result.OK
+    env.table.producer_result(handle, compute=Result.OK, seal=Result.OK)
     env.table.publish(handle, key(1))
     assert page.state == PageState.SHADOW and not env.table.is_persisted(page)
     # A new incarnation after eviction is not persisted until its own write.
@@ -571,8 +570,7 @@ def test_full_length_host_page_key_is_written_and_hits_after_restart(tmp_path, e
     assert handle is not None
     start = handle.page_id * ROW
     writer.backing[start : start + ROW] = payload(5)
-    page = writer.table.get(handle)
-    page.compute_result = page.seal_result = Result.OK
+    writer.table.producer_result(handle, compute=Result.OK, seal=Result.OK)
     writer.table.publish(handle, long_key)
     report = writer.ssd.final_flush(budget_s=5.0, io_grace_s=5.0)
     assert (report.candidates, report.completed, report.failed) == (1, 1, 0)
@@ -913,8 +911,7 @@ def test_history_pool_batch_admission_survives_writeback(tmp_path):
     try:
         for n in range(3):
             handle = table.reserve()
-            page = table.get(handle)
-            page.compute_result = page.seal_result = Result.OK
+            table.producer_result(handle, compute=Result.OK, seal=Result.OK)
             table.publish(handle, key(n))
         assert table.available() == 3
         blocks = pool.get_new_blocks(2)

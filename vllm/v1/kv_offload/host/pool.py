@@ -173,8 +173,7 @@ class HostKVPool:
         self._check_lease(page)
         if not page._writing:
             raise ValueError("Host KV page is already published")
-        record = self.table.get(page.handle)
-        record.compute_result = record.seal_result = Result.OK
+        self.table.producer_result(page.handle, compute=Result.OK, seal=Result.OK)
         self.table.publish(page.handle, page.key)
         page._writing = False
 
@@ -191,10 +190,7 @@ class HostKVPool:
             return
         self._check_lease(page)
         if page._writing:
-            record = self.table.get(page.handle)
-            if self.table.index.get(page.key) == page.handle:
-                del self.table.index[page.key]
-            record.valid = False
+            self.table.invalidate(page.handle)
         self.table.release(page.handle, id(page))
         page._closed = True
         self._leases.remove(page)

@@ -563,7 +563,7 @@ def test_real_engine_queue_feedback_deadline(depth, drop_last):
         EngineCore.step_with_batch_queue(engine)
     assert len(arb.decisions) == 3
     assert arb.decisions[0].reason == ("counters_missing" if drop_last else "one_sided")
-    assert all(d.reason != "counters_missing" for d in arb.decisions[1:])
+    assert all(d.reason != "counters_missing" for d in list(arb.decisions)[1:])
     assert arb.value_moves == (2 if drop_last else 3)
     assert arb.late_reports == 0
     assert len(arb.windows) <= 2 and len(arb._partial) <= 1

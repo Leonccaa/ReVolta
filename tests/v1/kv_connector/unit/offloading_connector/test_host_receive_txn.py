@@ -55,8 +55,9 @@ def setup_receive(
                 other = pool.host_pages.reserve(loading_key=ticket.key)
             else:
                 other = pool.host_pages.reserve()
-                record = pool.host_pages.get(other)
-                record.compute_result = record.seal_result = Result.OK
+                pool.host_pages.producer_result(
+                    other, compute=Result.OK, seal=Result.OK
+                )
                 pool.host_pages.publish(other, ticket.key)
             assert other is not None
         pool.host_pages.seal_result(
@@ -198,8 +199,7 @@ def test_partial_reuse_and_new_load_keep_absolute_source_indices():
     for index in (2, 3):
         key = make_offload_key(chain_hash(hits.rule, index), hits.rule.group_id)
         handle = table.reserve()
-        page = table.get(handle)
-        page.compute_result = page.seal_result = Result.OK
+        table.producer_result(handle, compute=Result.OK, seal=Result.OK)
         table.publish(handle, key)
         handles[index] = handle
     job_id, txn = lookup_allocate(scheduler, connector, request)
@@ -308,8 +308,7 @@ def publish_sources(scheduler, request, indices):
     for index in indices:
         key = make_offload_key(chain_hash(hits.rule, index), hits.rule.group_id)
         handle = table.reserve()
-        page = table.get(handle)
-        page.compute_result = page.seal_result = Result.OK
+        table.producer_result(handle, compute=Result.OK, seal=Result.OK)
         table.publish(handle, key)
         handles[index] = handle
     return handles
@@ -403,13 +402,16 @@ def test_local_validator_rejects_stale_or_failed_producers(damage):
     assert hits.local_validator(0, 0, key_hash, hid)
     page = pool.host_pages.get(handle)
     if damage == "compute":
-        page.compute_result = Result.FAILED
+        pool.host_pages.producer_result(
+            handle, compute=Result.FAILED, seal=page.seal_result
+        )
     elif damage == "generation":
         pool.hgen[hid] += 1
     elif damage == "epoch":
+        # Deliberate malformed-epoch fault injection, not a lifecycle event.
         page.handle = replace(handle, epoch=handle.epoch + 1)
     else:
-        page.valid = False
+        pool.host_pages.invalidate(handle)
     assert not hits.local_validator(0, 0, key_hash, hid)
     assert hits.plan_reuse(request, 0, 16) == 0
 

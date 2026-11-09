@@ -29,9 +29,10 @@ sides, missing counters, or arbitration disabled, T_idx does not move.
 from __future__ import annotations
 
 import math
+from collections import deque
 from collections.abc import Callable, Hashable, Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 
 from vllm.logger import init_logger
 
@@ -57,6 +58,50 @@ HOT_FORCED_PREFILL = 10
 NUM_HOT_COUNTERS = 11
 
 
+class BusyTime:
+    """Union of outstanding dispatch-to-output intervals, on a monotonic clock.
+
+    Each completion owns the union since the previous completion. Overlapping
+    batches never double charge; idle gaps and empty steps never open a span.
+    Completion order need not equal dispatch order. Duplicate receipts add zero.
+    """
+
+    def __init__(self) -> None:
+        self.steps: set[int] = set()
+        self.since: float | None = None
+
+    @staticmethod
+    def has_work(output: Any) -> bool:
+        """Transfers and role/seal work are busy even without forward tokens."""
+        if output.total_num_scheduled_tokens:
+            return True
+        host = output.host_kv
+        if host is not None and (
+            host.bindings or host.seals or host.donate or host.claim
+        ):
+            return True
+        meta = output.kv_connector_metadata
+        return bool(
+            getattr(meta, "load_jobs", None)
+            or getattr(meta, "store_jobs", None)
+            or getattr(meta, "jobs_to_flush", None)
+        )
+
+    def start(self, step: int, now: float) -> None:
+        if not self.steps:
+            self.since = now
+        self.steps.add(step)
+
+    def finish(self, step: int, now: float) -> float | None:
+        if step not in self.steps:
+            return None
+        assert self.since is not None
+        seconds = max(0.0, now - self.since)
+        self.steps.remove(step)
+        self.since = now if self.steps else None
+        return seconds
+
+
 @dataclass(frozen=True)
 class ArbiterConfig:
     """Arbitration settings. The four weights are placeholders until the value
@@ -65,6 +110,9 @@ class ArbiterConfig:
 
     enabled: bool = True
     """False pins T_idx at the shared hot region default split; nothing else changes."""
+    busy_time: bool = True
+    """Use dispatch-to-output busy interval union, excluding idle gaps.
+    False retains the historical begin_step-to-begin_step wall clock."""
     window_steps: int = 32
     delta: float = 0.25
     """Dead band: one side must be (1 + delta) times denser to move T_idx."""
@@ -109,7 +157,9 @@ class ArbiterConfig:
 
     @classmethod
     def from_settings(
-        cls, enabled: bool, settings: Mapping[str, float | int | str] | None = None
+        cls,
+        enabled: bool,
+        settings: Mapping[str, bool | float | int | str] | None = None,
     ) -> ArbiterConfig:
         """From ``long_context_kv.value_arbitration`` and
         ``value_arbiter_settings`` (measurement overrides)."""
@@ -124,8 +174,11 @@ class ArbiterConfig:
             "w_async": float,
             "w_ttft": float,
             "one_sided": str,
+            "busy_time": bool,
         }
         settings = dict(settings or {})
+        if "busy_time" in settings and type(settings["busy_time"]) is not bool:
+            raise ValueError("busy_time must be a boolean")
         unknown = set(settings) - set(kinds)
         if unknown:
             raise ValueError(f"Unknown value arbiter settings: {sorted(unknown)}")
@@ -266,6 +319,7 @@ class WindowStats:
     idx_refetch_txns: int = 0
     step_seconds: float = 0.0
     timed_steps: int = 0
+    busy_pending: set[int] = field(default_factory=set)
 
     @property
     def complete(self) -> bool:
@@ -322,9 +376,11 @@ class ValueArbiter:
         self.value_donated = 0
         self.forced_clamps = 0
         self.forced_delta = 0
-        self.decisions: list[Decision] = []
+        self.decisions: deque[Decision] = deque(maxlen=256)
+        self.decision_counts: dict[str, int] = {}
         self.late_reports = 0
         self._step_window: dict[int, int] = {}
+        self._busy_window: dict[int, int] = {}
         self._partial: dict[int, tuple[int, list[int]]] = {}
         self.forced_counts = forced_counts
         """Pool-side forced cache evictions (floor, growth, host reclaim)."""
@@ -346,6 +402,21 @@ class ValueArbiter:
             window.step_seconds += step_seconds
             window.timed_steps += 1
         return self.window
+
+    def mark_busy(self, step: int) -> None:
+        window = self._step_window.get(step)
+        if window is not None:
+            self._busy_window[step] = window
+            self.windows[window].busy_pending.add(step)
+
+    def record_step_seconds(self, step: int, seconds: float) -> None:
+        """Record a completion's busy share; counters may have arrived first."""
+        window = self._busy_window.pop(step, self._step_window.get(step))
+        stats = self.windows.get(window) if window is not None else None
+        if stats is not None:
+            stats.busy_pending.discard(step)
+            stats.step_seconds += max(0.0, seconds)
+            stats.timed_steps += 1
 
     def add_hot_counters(self, step: int, counters: Iterable[int] | None) -> None:
         """Counters of ``step`` complete over all ranks; None marks them lost."""
@@ -419,10 +490,14 @@ class ValueArbiter:
         decision = None
         for window in sorted(self.windows):
             stats = self.windows[window]
-            if window >= self.window or (
-                not stats.complete
-                and stats.steps
-                and feedback_step < max(stats.steps) + self.config.lag_steps
+            if (
+                stats.busy_pending
+                or window >= self.window
+                or (
+                    not stats.complete
+                    and stats.steps
+                    and feedback_step < max(stats.steps) + self.config.lag_steps
+                )
             ):
                 continue
             decision = self._evaluate(window, stats, snap, forced_delta)
@@ -510,7 +585,9 @@ class ValueArbiter:
             forced_delta=forced_delta,
         )
         self.decisions.append(decision)
-        logger.info(
+        self.decision_counts[reason] = self.decision_counts.get(reason, 0) + 1
+        log = logger.info if value_delta or forced_delta else logger.debug
+        log(
             "host KV arbitration window %d: hot density %s, index density %s "
             "-> %s (%s), T_idx %d, value target %d, value delta %d, "
             "forced delta %d (total %d), Q %d, forced clamps %d, hot refetch %d/%d, "

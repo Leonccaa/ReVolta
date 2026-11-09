@@ -92,6 +92,7 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
     """Register the entire mmap as CUDA pinned memory via cudaHostRegister."""
     rank = region.rank
 
+    assert region._base is not None
     base_ptr = region._base.data_ptr()
     # Long-term pinning can migrate pages. Concurrent registrations of the
     # same shared region can hold pins that prevent another worker's migration

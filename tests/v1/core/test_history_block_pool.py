@@ -8,6 +8,7 @@ import pytest
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.history_block_pool import HistoryBlockPool
 from vllm.v1.core.long_context_kv import HOST
+from vllm.v1.kv_offload.base import make_offload_key
 from vllm.v1.kv_offload.host.page_table import PageState
 
 
@@ -222,15 +223,78 @@ def test_failed_receipt_after_request_free_unbinds_cache_and_waits_for_watermark
     assert p.host_pages.pages[ticket.handle.page_id].state == PageState.FREE
 
 
-def test_loaded_prefix_hash_and_binding_survive_deferral_without_execution():
+@pytest.mark.parametrize("hash_blocks_per_page", [1, 2])
+def test_loaded_prefix_hash_and_binding_survive_deferral_without_execution(
+    hash_blocks_per_page,
+):
     # Async receive completion caches valid loaded blocks before admission.
     # Budget or hot-pool pressure can defer that request in the same schedule.
     p = pool()
     p.start_step(1)
     blocks = p.get_new_blocks(1)
-    cache(p, request(), blocks)
+    req = request()
+    req.block_hashes = [b"a" * 32, b"b" * 32][:hash_blocks_per_page]
+    p.cache_full_blocks(req, blocks, 0, 1, 16 * hash_blocks_per_page, 0)
     handle = p.bindings[blocks[0].block_id]
     assert p.finish_schedule([]) == []
-    assert p.get_cached_block(b"a" * 32, [0]) == blocks
+    assert p.get_cached_block(b"".join(req.block_hashes), [0]) == blocks
     assert p.bindings[blocks[0].block_id] == handle
     assert p.host_pages.get(handle).compute_result.value == "pending"
+    p.start_step(2)
+    [ticket] = p.finish_schedule(["a"])
+    assert ticket.handle == handle and ticket.step == 2
+    assert ticket.key == make_offload_key(req.block_hashes[-1], 0)
+    p.host_pages.seal_result(ticket, 3, 0)
+    p.host_pages.complete_step(1, 3)
+    p.host_pages.complete_step(2, 3)
+    assert p.host_pages.is_ready(handle)
+    p.evict_blocks({blocks[0].block_id})
+    p.unbind(blocks[0].block_id)
+    assert p.host_pages.lookup(ticket.key) == handle
+
+
+def test_real_scheduler_restored_prefix_deferral_eventually_publishes(monkeypatch):
+    from tests.v1.core.test_async_kv_admission import HybridMockConnector, complete
+    from tests.v1.core.test_long_context_admission import (
+        SPAN,
+        build,
+        make_requests,
+        settings,
+    )
+    from vllm.config import KVTransferConfig
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+    from vllm.v1.request import RequestStatus
+
+    s = build(settings(main_kv_placement="host", hot_pool_gib=0.8))
+    cfg = s.vllm_config
+    cfg.kv_transfer_config = KVTransferConfig(
+        kv_connector="MockKVConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={"matched_tokens": SPAN, "is_async": True},
+    )
+    s.connector = HybridMockConnector(cfg, KVConnectorRole.SCHEDULER, s.kv_cache_config)
+    [req] = make_requests(1, 2 * SPAN + 100, 1)
+    s.add_request(req)
+    first = s.schedule()
+    assert req.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    complete(s, first, received={req.request_id})
+    original = s.kv_cache_manager.allocate_slots
+    monkeypatch.setattr(s.kv_cache_manager, "allocate_slots", lambda *a, **kw: None)
+    deferred = s.schedule()
+    assert req.request_id not in deferred.num_scheduled_tokens
+    assert not deferred.host_kv.seals
+    p = s.host_history_pool
+    restored = {hid: p.bindings[hid] for hid, _, _ in p.new_hashes[req.request_id]}
+    assert restored
+    complete(s, deferred)
+    monkeypatch.setattr(s.kv_cache_manager, "allocate_slots", original)
+    resumed = s.schedule()
+    assert req.request_id in resumed.num_scheduled_tokens
+    assert restored.keys() <= {t.hid for t in resumed.host_kv.seals}
+    complete(s, resumed)
+    for hid, handle in restored.items():
+        assert p.host_pages.is_ready(handle)
+        key = p.host_pages.get(handle).key
+        p.evict_blocks({hid})
+        p.unbind(hid)
+        assert p.host_pages.lookup(key) == handle

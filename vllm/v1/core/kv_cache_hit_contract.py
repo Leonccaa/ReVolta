@@ -143,9 +143,18 @@ class KVHitContract:
         self.hash_block_size = hash_block_size
         self.rules: dict[int, GroupHitRule] = {r.group_id: r for r in rules}
         self._probes: dict[int, ResidencyProbe] = {}
+        self._local_validators: dict[int, ResidencyProbe] = {}
         self.stats = HitContractStats()
 
     # --- probes -----------------------------------------------------------
+
+    def register_local_validator(
+        self, group_id: int, validator: ResidencyProbe
+    ) -> None:
+        """Validate concrete GPU identities after lookup, without a host cap."""
+        if group_id not in self.rules:
+            raise ValueError("A local validator requires a managed GPU group")
+        self._local_validators[group_id] = validator
 
     def register_probe(
         self,
@@ -200,7 +209,12 @@ class KVHitContract:
         return bool(self._probes)
 
     def probe_cap(
-        self, chain_hash: ChainHashFn, start_tokens: int, max_tokens: int
+        self,
+        chain_hash: ChainHashFn,
+        start_tokens: int,
+        max_tokens: int,
+        *,
+        group_starts: Mapping[int, int] | None = None,
     ) -> int:
         """Largest length <= ``max_tokens`` such that every probed PREFIX group
         holds all its blocks from ``start_tokens`` on. Other probed groups
@@ -210,7 +224,8 @@ class KVHitContract:
             rule = self.rules[group_id]
             if rule.need is not HitNeed.PREFIX:
                 continue
-            for index in rule.required_blocks(cap, start_tokens):
+            start = (group_starts or {}).get(group_id, start_tokens)
+            for index in rule.required_blocks(cap, start):
                 block_hash = chain_hash(rule, index)
                 if block_hash is None or not self._probe_ready(
                     probe, group_id, index, block_hash, None
@@ -230,6 +245,8 @@ class KVHitContract:
         block_ok: Callable[[GroupHitRule, int], bool | None],
         chain_hash: ChainHashFn,
         gpu_block_id: Callable[[GroupHitRule, int], int | None] | None = None,
+        *,
+        group_starts: Mapping[int, int] | None = None,
     ) -> str | None:
         """Return why a hit ending at ``end_tokens`` (extending one that ends
         at ``start_tokens``) is incomplete, or None when it is complete.
@@ -248,7 +265,9 @@ class KVHitContract:
                     f"{rule.block_size}-token state grid"
                 )
             probe = self._probes.get(rule.group_id)
-            for index in rule.required_blocks(end_tokens, start_tokens):
+            validator = self._local_validators.get(rule.group_id)
+            start = (group_starts or {}).get(rule.group_id, start_tokens)
+            for index in rule.required_blocks(end_tokens, start):
                 held = block_ok(rule, index)
                 if held is False:
                     return (
@@ -257,6 +276,21 @@ class KVHitContract:
                     )
                 if held is None and probe is None:
                     return f"group {rule.group_id}: unmanaged group without a probe"
+                if validator is not None:
+                    block_hash = chain_hash(rule, index)
+                    block_id = (
+                        None if gpu_block_id is None else gpu_block_id(rule, index)
+                    )
+                    if (
+                        block_hash is None
+                        or block_id is None
+                        or not self._probe_ready(
+                            validator, rule.group_id, index, block_hash, block_id
+                        )
+                    ):
+                        return (
+                            f"group {rule.group_id}: invalid local binding at {index}"
+                        )
                 if probe is not None:
                     block_hash = chain_hash(rule, index)
                     block_id = (

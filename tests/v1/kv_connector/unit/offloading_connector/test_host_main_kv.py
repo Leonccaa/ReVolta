@@ -77,8 +77,8 @@ def test_host_transfer_registration_and_real_cpu_budget(
         for t in cfg.kv_cache_tensors
     ]
     if padded:
-        # Exercise the retained bridge with actual interior padding. Both
-        # backing budget paths must cover the physical descriptor exactly.
+        # G0 padding belongs only to the GPU index arena. Both backing budget
+        # paths must exclude its entire allocation, including ring aliases.
         cfg.kv_cache_tensors = [
             replace(
                 t,
@@ -133,10 +133,19 @@ def test_host_transfer_registration_and_real_cpu_budget(
     monkeypatch.setattr(worker, "_register_handlers", captured.append)
     worker.register_kv_caches(caches)
     (canonical,) = captured
-    host = canonical.tensors[-1]
-    assert host.tensor.data_ptr() == store.host.data_ptr()
-    assert host.page_size_bytes == store.shape.page_bytes == cfg.host_kv_page_size_bytes
-    assert canonical.group_data_refs[0][-1].tensor_idx == len(canonical.tensors) - 1
+    assert not canonical.group_data_refs[cfg.host_kv_group_id]
+    assert all(t.tensor.data_ptr() != store.host.data_ptr() for t in canonical.tensors)
+    excluded = {name for name in caches if name not in cfg.connector_transfer_layers()}
+    excluded_storage = {
+        caches[name].untyped_storage()._cdata
+        for name in excluded
+        if isinstance(caches[name], torch.Tensor)
+    }
+    assert all(
+        t.tensor.untyped_storage()._cdata not in excluded_storage
+        for t in canonical.tensors
+    )
+    assert cfg.host_kv_group_id not in spec.cpu_group_page_sizes
     required = (
         sum(t.page_size_bytes for t in canonical.tensors) * spec.block_size_factor
         if not grouped
@@ -229,7 +238,9 @@ def test_host_store_waits_for_producer_and_copies_the_correct_subpage(
 
 @pytest.mark.parametrize("failure", [None, "copy", "end"])
 @pytest.mark.parametrize("factor", [1, 2])
-def test_host_bytes_and_ready_are_one_load_transaction(monkeypatch, failure, factor):
+def test_ordinary_cpu_tensor_copy_cannot_publish_host_receive(
+    monkeypatch, failure, factor
+):
     state = _streams(monkeypatch)
     shape = HostHistoryShape(
         num_blocks=4,
@@ -320,7 +331,8 @@ def test_host_bytes_and_ready_are_one_load_transaction(monkeypatch, failure, fac
         meta = worker.build_connector_worker_meta()
         assert meta.completed_jobs == {wave: 1}
         assert meta.failed_jobs == ({wave: 1} if failure else {})
-        assert bool(store.ready[8:12].all()) is (failure is None)
+        # G0 publication now requires explicit ReceiveTxn source identities.
+        assert not store.ready[8:12].any()
         assert not worker._host_load_blocks
         assert worker.get_finished(set()) == (set(), set())
     worker.shutdown()

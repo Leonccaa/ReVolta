@@ -39,6 +39,24 @@ class HostKVPage:
         view = self._pool.view.cast("B")[start : start + self._pool.page_bytes]
         return view if self._writing else view.toreadonly()
 
+    def release(self) -> None:
+        self._pool.release(self)
+
+
+@dataclass(eq=False)
+class HostPageLease:
+    """Scheduler lease over an existing shared-region physical page."""
+
+    key: OffloadKey
+    handle: PageHandle
+    table: HostPageTable
+    _closed: bool = False
+
+    def release(self) -> None:
+        if not self._closed:
+            self.table.release(self.handle, id(self))
+            self._closed = True
+
 
 @dataclass
 class HostKVPrefix:
@@ -51,11 +69,16 @@ class HostKVPrefix:
 
     group_idx: int
     available_tokens: int
-    pages: tuple[HostKVPage, ...]
+    pages: tuple[HostKVPage | HostPageLease, ...]
+    start_block: int = 0
+
+    @property
+    def entries(self) -> tuple[tuple[int, HostKVPage | HostPageLease], ...]:
+        return tuple(enumerate(self.pages, self.start_block))
 
     def release(self) -> None:
         for page in self.pages:
-            page._pool.release(page)
+            page.release()
 
 
 class HostKVPool:
@@ -182,11 +205,16 @@ class HostKVPool:
         for key in keys:
             self._check_key(key)
         pages = []
-        for key in keys:
-            page = self.pin(self.lookup(key))
-            if page is None:
-                break
-            pages.append(page)
+        try:
+            for key in keys:
+                page = self.pin(self.lookup(key))
+                if page is None:
+                    break
+                pages.append(page)
+        except Exception:
+            for page in pages:
+                self.release(page)
+            raise
         return HostKVPrefix(
             self.group_idx, len(pages) * self.block_tokens, tuple(pages)
         )

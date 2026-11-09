@@ -861,10 +861,19 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
         if not getattr(self, "_closed", True):
             logger.info("revolta_fs stats: %s", self.get_revolta_stats())
         if not getattr(self, "_closed", True):
-            self._pool.shutdown(wait=True)
+            deadline = getattr(self, "_shutdown_deadline", None)
+            if deadline is None:
+                self._pool.shutdown(wait=True)
+            else:
+                self._pool.shutdown(wait=True, deadline=deadline)
             if self._mtime_thread is not None:
                 self._mtime_queue.put(None)
-                self._mtime_thread.join()
+                timeout = (
+                    None if deadline is None else max(0.0, deadline - time.monotonic())
+                )
+                self._mtime_thread.join(timeout=timeout)
+                if self._mtime_thread.is_alive():
+                    raise TimeoutError("Tiering metadata drain deadline reached")
                 self._mtime_thread = None
             self._cache.release()
             self._closed = True

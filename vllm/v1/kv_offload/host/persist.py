@@ -50,7 +50,7 @@ logger = init_logger(__name__)
 
 # Bump whenever the persisted row format changes. Old files then never hit
 # (no cross-version migration, Leon 2026-11-07).
-HOST_PAGE_ABI = "host-page-v2.1:row=workers*[main_kv|logical_index]"
+HOST_PAGE_ABI = "host-page-v2.2:row=workers*[main_kv|logical_index]:key=sha256"
 # The engine-core process is SIGKILLed --shutdown-timeout after SIGTERM.
 # Every shutdown step must finish this long before that point.
 SHUTDOWN_MARGIN_S = 5.0
@@ -104,19 +104,13 @@ def plan_final_flush(
     applies.
     """
     if shutdown_timeout <= 0:
-        return FlushPlan(0.0, None, t0, "shutdown_timeout=0 skips final flush")
+        return FlushPlan(0.0, deadline, t0, "shutdown_timeout=0 skips final flush")
     if deadline is None:
         return FlushPlan(configured_s, None, t0, "no shutdown deadline")
     budget = min(configured_s, deadline - now)
     if budget <= 0:
         return FlushPlan(0.0, deadline, t0, "shutdown window exhausted")
     return FlushPlan(budget, deadline, t0, "ok")
-
-
-def shared_shutdown_deadline(t0: float | None, shutdown_timeout: float) -> float | None:
-    if t0 is None or shutdown_timeout <= 0:
-        return None
-    return t0 + shutdown_timeout - SHUTDOWN_MARGIN_S
 
 
 def shutdown_window_warning(
@@ -292,12 +286,16 @@ class HostPageSsd:
         return page is not None and page.valid and page.state == PageState.READY
 
     def _tier_key(self, key: OffloadKey) -> OffloadKey:
-        """Epoch 0 is stable across restarts. A reset gets a process-unique
-        salt, so pre- and post-reset files can never hit each other."""
+        """Fixed-length SSD key for a host page key.
+
+        A host page's block hash concatenates the hashes of every hash block
+        it covers (98 x 32 bytes for a 1568-token page), far longer than a
+        file name may be. The SSD key is a SHA-256 of the full key instead;
+        the file's xattr binds that digest. Epoch 0 is stable across
+        restarts. A reset gets a process-unique salt, so pre- and post-reset
+        files can never hit each other."""
         epoch = self.table.ssd_epoch
-        if epoch == 0:
-            return key
-        salt = self._salts.setdefault(epoch, os.urandom(16))
+        salt = b"" if epoch == 0 else self._salts.setdefault(epoch, os.urandom(16))
         digest = hashlib.sha256(salt + bytes(key)).digest()
         return make_offload_key(digest, get_offload_group_idx(key))
 
@@ -605,13 +603,11 @@ class HostPageSsd:
             report.skipped = "closed"
             return report
         flush_deadline = start + max(0.0, budget)
-        hard = None
         if deadline is not None:
             flush_deadline = min(flush_deadline, deadline)
-            hard = deadline + SHUTDOWN_MARGIN_S / 2
         grace_deadline = flush_deadline + grace
-        if hard is not None:
-            grace_deadline = min(grace_deadline, hard)
+        if deadline is not None:
+            grace_deadline = min(grace_deadline, deadline)
         self._flushing = True
         self._report = report
         self._phase = "budget"
@@ -680,7 +676,9 @@ class HostPageSsd:
         self._report = None
         return report
 
-    def close(self, io_grace_s: float | None = None) -> None:
+    def close(
+        self, io_grace_s: float | None = None, *, deadline: float | None = None
+    ) -> None:
         """Shutdown step 5: join started IO, or quarantine if it never ends."""
         if self._closed:
             return
@@ -694,13 +692,20 @@ class HostPageSsd:
             self.options["shutdown_io_grace_s"] if io_grace_s is None else io_grace_s
         )
         end = self.clock() + grace
+        if deadline is not None:
+            end = min(end, deadline)
         while self._jobs and self.clock() < end:
             self._poll()
             time.sleep(0.002)
         self._poll()
         self._closed = True
         if self._queue.volume is not None:
-            self._queue.volume.persist()
+            if deadline is None:
+                self._queue.volume.persist()
+            else:
+                from vllm.v1.kv_offload.host.shutdown import wait_until
+
+                wait_until(self._queue.volume.persist, deadline, "host-ssd-volume")
         if self.table.persistence is self:
             self.table.persistence = None
         if self._jobs:
@@ -718,7 +723,13 @@ class HostPageSsd:
             )
             return
         self._limiter.stopped.set()
-        self._tier.shutdown()
+        if deadline is None:
+            self._tier.shutdown()
+        else:
+            from vllm.v1.kv_offload.host.shutdown import wait_until
+
+            self._tier.set_shutdown_deadline(deadline)
+            wait_until(self._tier.shutdown, deadline, "host-ssd-close")
         # Drop the row export so the scheduler can unmap the region.
         self._tier._primary_kv_view = None  # type: ignore[assignment]
         logger.info("Host KV SSD stats: %s", self.stats())

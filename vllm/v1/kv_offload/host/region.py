@@ -3,6 +3,7 @@
 """Logical host-page ABI, independent of padded GPU index allocations."""
 
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
@@ -30,6 +31,21 @@ class HostRegionLayout:
             self.worker_bytes,
             scheduler_only_unlink=True,
         )
+
+
+class HostRegionOwner:
+    """Parent-only unlink responsibility, established before worker startup.
+
+    Owning the name does not map, populate or register the backing. Local
+    worker mappings close independently. Call cleanup only after every worker
+    access has retired, or after startup rollback confirmed worker exit.
+    """
+
+    def __init__(self, layout: HostRegionLayout):
+        self.mmap_path = f"/dev/shm/vllm_offload_host_v2_{layout.instance_id}.mmap"
+
+    def cleanup(self) -> None:
+        Path(self.mmap_path).unlink(missing_ok=True)
 
 
 def host_region_layout(config: KVCacheConfig, instance_id: str) -> HostRegionLayout:

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Real shared host rows, alias strides, indirection, null and logical seals."""
 
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -13,10 +14,85 @@ import torch
 from vllm.models.qwen4_exp.nvidia.host_kv.history import (
     HostHistoryShape,
     HostHistoryStore,
+    HostKVResourceError,
 )
 from vllm.v1.attention.kv_cache_view import pack_page_payload
 from vllm.v1.kv_offload.host.page_table import PageHandle, SealTicket
 from vllm.v1.kv_offload.host.region import HostRegionLayout
+
+
+@pytest.mark.parametrize("failure", ["registration", "metadata", "registered_metadata"])
+def test_constructor_failure_closes_local_mapping_but_owner_unlinks(
+    monkeypatch, failure
+):
+    from vllm.models.qwen4_exp.nvidia.host_kv import history
+
+    shape = HostHistoryShape(
+        num_blocks=4,
+        kernel_blocks_per_block=1,
+        kernel_block_tokens=16,
+        num_layers=1,
+        kv_heads=1,
+        head_dim=8,
+        dtype=torch.uint8,
+        hot_slots=32,
+        max_requests=1,
+        selection_width=4,
+        max_write_rows=4,
+        row_groups=2,
+    )
+    layout = HostRegionLayout(uuid4().hex, 4, 1, shape.page_bytes, (96,))
+    owner = layout.open(None)
+    regions = []
+    mappings = []
+    unregisters = []
+    original_open = HostRegionLayout.open
+
+    def record_open(self, rank):
+        region = original_open(self, rank)
+        regions.append(region)
+        mappings.append(region.mmap_obj)
+        return region
+
+    def fail(*_, **__):
+        raise RuntimeError("injected metadata allocation failure")
+
+    def unregister(ptr):
+        unregisters.append(ptr)
+        return SimpleNamespace(value=0)
+
+    monkeypatch.setattr(HostRegionLayout, "open", record_open)
+    monkeypatch.setattr(torch, "full", fail)
+    monkeypatch.setattr(
+        torch.cuda,
+        "cudart",
+        lambda: SimpleNamespace(
+            cudaHostRegister=lambda *_: SimpleNamespace(
+                value=int(failure == "registration")
+            ),
+            cudaHostUnregister=unregister,
+        ),
+    )
+    monkeypatch.setattr(torch.accelerator, "device_index", lambda _: nullcontext())
+    monkeypatch.setattr(history, "get_accelerator_view_from_cpu_tensor", lambda t: t)
+    try:
+        with pytest.raises((HostKVResourceError, RuntimeError)):
+            HostHistoryStore(
+                shape,
+                ["l"],
+                device="cpu" if failure == "metadata" else "cuda:0",
+                region_layout=layout,
+            )
+        [region] = regions
+        assert region.fd is None and region.mmap_obj is None
+        assert mappings[0].closed
+        assert len(unregisters) == int(failure == "registered_metadata")
+        assert Path(region.mmap_path).exists()  # Worker never owns unlink.
+    finally:
+        for region in regions:
+            region.cleanup()
+        owner.cleanup()
+    assert not Path(owner.mmap_path).exists()
 
 
 @pytest.mark.parametrize("ratio", [1, 2, 3])
@@ -159,7 +235,7 @@ def test_whole_region_registration_and_scheduler_only_unlink(monkeypatch):
     assert not Path(path).exists()
 
 
-def test_retained_bridge_resolves_live_physical_pages_through_handler_factory(
+def test_canonical_handler_keeps_strides_without_host_page_remapping(
     monkeypatch,
 ):
     from vllm.v1.kv_offload.base import (
@@ -172,8 +248,6 @@ def test_retained_bridge_resolves_live_physical_pages_through_handler_factory(
     monkeypatch.setattr(gpu_worker, "is_pin_memory_available", lambda: False)
     backing = torch.zeros((7, 160), dtype=torch.int8)
     main = backing[:, 32:96]
-    page_of = np.array([0, 6, -1, 2], dtype=np.int32)
-    main._host_page_of = page_of
     handlers = gpu_worker.CpuGpuOffloadingHandlers(
         CanonicalKVCaches(
             [CanonicalKVCacheTensor(main, 64)], [[CanonicalKVCacheRef(0, 64)]]
@@ -183,17 +257,14 @@ def test_retained_bridge_resolves_live_physical_pages_through_handler_factory(
     )
     try:
         tensor = handlers.gpu_to_cpu_handler.src_tensors[0]
-        assert tensor._host_page_of is page_of
+        assert not hasattr(tensor, "_host_page_of")
         assert tensor.data_ptr() == main.data_ptr() and tensor.stride(0) == 160
         assert tensor.untyped_storage()._cdata == backing.untyped_storage()._cdata
         ptrs = np.empty(2, dtype=np.int64)
         gpu_worker.compute_sub_block_ptrs(np.array([1, 3]), 1, ptrs, tensor)
-        assert ptrs.tolist() == [main.data_ptr() + 6 * 160, main.data_ptr() + 2 * 160]
-        page_of[1] = 5
+        assert ptrs.tolist() == [main.data_ptr() + 160, main.data_ptr() + 3 * 160]
         gpu_worker.compute_sub_block_ptrs(np.array([1]), 1, ptrs[:1], tensor)
-        assert ptrs[0] == main.data_ptr() + 5 * 160
-        with pytest.raises(ValueError, match="unbound"):
-            gpu_worker.compute_sub_block_ptrs(np.array([2]), 1, ptrs[:1], tensor)
+        assert ptrs[0] == main.data_ptr() + 160
     finally:
         handlers.gpu_to_cpu_handler.shutdown()
         handlers.cpu_to_gpu_handler.shutdown()

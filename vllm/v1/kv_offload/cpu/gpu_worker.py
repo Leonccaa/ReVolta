@@ -68,14 +68,6 @@ def compute_sub_block_ptrs(
     """
     assert skip_count < block_size_factor
 
-    page_of = getattr(tensor, "_host_page_of", None)
-    if page_of is not None:
-        block_ids = page_of[block_ids]
-        if (block_ids < 0).any():
-            raise ValueError(
-                "static host allocation bridge accessed an unbound host history ID"
-            )
-
     num_sub_blocks = len(output)
     base_ptr = tensor.data_ptr()
     row_stride = tensor.stride(0)
@@ -571,9 +563,6 @@ class CpuGpuOffloadingHandlers:
                 gpu_tensor = kv_cache_tensor.tensor.view(torch.int8).view(
                     (-1, gpu_page_size_bytes)
                 )
-                page_of = getattr(kv_cache_tensor.tensor, "_host_page_of", None)
-                if page_of is not None:
-                    gpu_tensor._host_page_of = page_of
                 cpu_page_size_bytes = gpu_page_size_bytes * block_size_factor
 
                 tensor_region = tensor_regions.get(tensor_idx, mmap_region)

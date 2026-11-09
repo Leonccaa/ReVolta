@@ -79,10 +79,12 @@ class CPUOffloadingSpec(OffloadingSpec):
                 "cpu_bytes_to_use must be specified in kv_connector_extra_config"
             )
 
+        host_group = getattr(kv_cache_config, "host_kv_group_id", None)
+        host_layers = getattr(kv_cache_config, "host_kv_layers", ())
         cacheable_groups = {
             i: group
             for i, group in enumerate(kv_cache_config.kv_cache_groups)
-            if group.kv_cache_spec.prefix_cacheable
+            if group.kv_cache_spec.prefix_cacheable and i != host_group
         }
         mamba_specs = {}
         for i, group in cacheable_groups.items():
@@ -119,13 +121,14 @@ class CPUOffloadingSpec(OffloadingSpec):
 
         self.cpu_group_page_sizes: dict[int, int] = {}
         self.cpu_group_num_blocks: dict[int, int] = {}
-        host_layers = set(getattr(kv_cache_config, "host_kv_layers", ()))
-        # static host allocation still registers host main K/V as a canonical transfer
-        # tensor.
-        # Keep both budget paths in lockstep with that bridge. receive transactions must
-        # remove
-        # the canonical member and this charge together with ReceiveTxn.
-        host_page = getattr(kv_cache_config, "host_kv_page_size_bytes", 0)
+        transfer_tensors = kv_cache_config.kv_cache_tensors
+        if host_layers:
+            transfer_layers = kv_cache_config.connector_transfer_layers()
+            transfer_tensors = [
+                tensor
+                for tensor in transfer_tensors
+                if not transfer_layers.isdisjoint(tensor.shared_by)
+            ]
         world_size = vllm_config.parallel_config.world_size
         if self.partition_by_group:
             mamba_groups: set[int] = set()
@@ -137,11 +140,9 @@ class CPUOffloadingSpec(OffloadingSpec):
                 # preserved and give identical budgets on scheduler and workers.
                 page_size = sum(
                     tensor.size // kv_tensor_num_blocks(kv_cache_config, tensor)
-                    for tensor in kv_cache_config.kv_cache_tensors
+                    for tensor in transfer_tensors
                     if not layer_names.isdisjoint(tensor.shared_by)
                 )
-                if not layer_names.isdisjoint(host_layers):
-                    page_size += host_page
                 self.cpu_group_page_sizes[i] = page_size * self.block_size_factor
                 if i in mamba_specs:
                     mamba_groups.add(i)
@@ -208,7 +209,7 @@ class CPUOffloadingSpec(OffloadingSpec):
                 self.state_slots_reference_tokens,
             )
         else:
-            total_gpu_kv_bytes = sum(t.size for t in kv_cache_config.kv_cache_tensors)
+            total_gpu_kv_bytes = sum(t.size for t in transfer_tensors)
             self.cpu_page_size_per_worker = (
                 total_gpu_kv_bytes
                 // kv_cache_config.num_blocks
@@ -223,9 +224,8 @@ class CPUOffloadingSpec(OffloadingSpec):
                 self.cpu_page_size_per_worker = (
                     sum(
                         t.size // kv_tensor_num_blocks(kv_cache_config, t)
-                        for t in kv_cache_config.kv_cache_tensors
+                        for t in transfer_tensors
                     )
-                    + host_page
                 ) * self.block_size_factor
             kv_bytes_per_offloaded_block = self.cpu_page_size_per_worker * world_size
             self.num_blocks = (

@@ -407,6 +407,10 @@ class KVConnectorBase_V1(ABC):
         """
         return set()
 
+    def set_shutdown_deadline(self, deadline: float) -> None:
+        """Receive the engine's absolute monotonic shutdown deadline."""
+        return
+
     def shutdown(self):
         """
         Shutdown the connector. This is called when the worker process

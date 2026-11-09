@@ -62,17 +62,18 @@ def caches():
         result.close()
 
 
-def connector_for(manager):
+def connector_for(manager, *, dcp_world=1, workers=1, eagle=False):
     config = MagicMock()
-    config.parallel_config.decode_context_parallel_size = 1
+    config.parallel_config.decode_context_parallel_size = dcp_world
     config.parallel_config.prefill_context_parallel_size = 1
-    config.parallel_config.world_size = 1
+    config.parallel_config.world_size = workers
     config.cache_config.enable_prefix_caching = True
     config.cache_config.block_size = BS
     config.cache_config.hash_block_size = None
     config.cache_config.prefix_cache_retention_interval = 0
     config.kv_transfer_config.kv_connector_extra_config = {}
-    config.speculative_config = SimpleNamespace(use_eagle_kv_cache=lambda: False)
+    config.speculative_config = SimpleNamespace(use_eagle_kv_cache=lambda: eagle)
+    config.model_config.get_total_num_hidden_layers.return_value = 48
     config.kernel_config.qsa_cross_group_hit_check = True
     connector = OffloadingConnectorScheduler(
         MockOffloadingSpec(config, manager.kv_cache_config)
@@ -125,9 +126,13 @@ def test_both_paths_intersect_the_reader_ready_host_prefix(tmp_path, caches, gro
     manager, connector, request, hits = paths(c)
     keys = fill(c, request, 5)
     # Five main-KV pages plus the recurrent checkpoint at four pages.
-    assert manager.get_computed_blocks(request)[1] == 4 * BS
+    assert manager.get_computed_blocks(request)[1] == (7 if group == 0 else 4) * BS
     assert connector.get_num_new_matched_tokens(request, 0) == (4 * BS, True)
-    assert hits.rule.group_id in manager.hit_contract._probes
+    if group == 0:
+        assert hits.rule.group_id not in manager.hit_contract._probes
+        assert hits.rule.group_id in manager.hit_contract._local_validators
+    else:
+        assert hits.rule.group_id in manager.hit_contract._probes
     assert hits.rule.group_id in connector.hit_contract._probes
     assert all(c.reader_ready(k) for k in keys)
     hits.release_uncommitted()
@@ -197,7 +202,7 @@ def test_lookup_pins_survive_admission_and_load_until_free(tmp_path, caches, pat
     assert c.pool.reserve(key(99)) is None  # lookup -> allocation
     assert manager.allocate_slots(request, 1, **args) is not None
     assert request.request_id in hits._active and not hits._pending
-    assert [p.key for p in hits.pinned_pages(request.request_id)] == keys
+    assert [p.key for _, p in hits.pinned_pages(request.request_id)] == keys
     if path == "connector":
         connector.update_state_after_alloc(
             request, manager.get_blocks(request.request_id), tokens
@@ -263,7 +268,7 @@ def test_failed_external_extension_preserves_local_leases(
     failed_handle = c.pool.lookup(keys[-1])
     monkeypatch.setattr(c.pool, "pin", lambda h: None if h == failed_handle else pin(h))
     assert connector.get_num_new_matched_tokens(request, 4 * BS) == (0, False)
-    assert [p.key for p in hits.pinned_pages(request.request_id)] == keys[:4]
+    assert [p.key for _, p in hits.pinned_pages(request.request_id)] == keys[:4]
     assert len(c.pool._leases) == 4
     hits.release_uncommitted()
     assert not c.pool._leases
@@ -310,7 +315,7 @@ def test_probe_checks_live_gpu_binding_with_the_connector_key(tmp_path, caches):
     c = caches(tmp_path, pages=pool(slots=7, group=0), enabled=False)
     bindings: dict[int, OffloadKey] = {}
     manager, _, request, hits = paths(c, binding=lambda bid, k: bindings.get(bid) == k)
-    keys = fill(c, request, 7)
+    fill(c, request, 7)
     assert manager.get_computed_blocks(request)[1] == 0
     for block in manager.block_pool.blocks:
         if block.block_hash is not None and get_group_id(block.block_hash) == 0:
@@ -318,7 +323,7 @@ def test_probe_checks_live_gpu_binding_with_the_connector_key(tmp_path, caches):
                 get_block_hash(block.block_hash), 0
             )
     assert manager.get_computed_blocks(request)[1] == 7 * BS
-    assert [p.key for p in hits._pending[request.request_id].pages] == keys
+    assert not hits._pending and not c.pool._leases
     # Simulate a block ID reassigned to another generation/key by its owner.
     bindings.clear()
     assert manager.get_computed_blocks(request)[1] == 0

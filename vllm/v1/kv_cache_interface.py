@@ -1111,8 +1111,33 @@ class KVCacheConfig:
     segment's block IDs (long-context mode, ``main_kv_placement="host"``)."""
 
     @property
+    def host_kv_group_id(self) -> int | None:
+        if not self.host_kv_layers:
+            return None
+        names = set(self.host_kv_layers)
+        groups = [
+            i
+            for i, group in enumerate(self.kv_cache_groups)
+            if not names.isdisjoint(group.layer_names)
+        ]
+        if len(groups) != 1:
+            raise ValueError("Host main K/V must belong to one group")
+        return groups[0]
+
+    def connector_transfer_layers(self) -> set[str]:
+        """Canonical transport members, separate from the main+index page ABI."""
+        host_group = self.host_kv_group_id
+        return {
+            name
+            for i, group in enumerate(self.kv_cache_groups)
+            if host_group is None
+            or (i != host_group and group.kv_cache_spec.prefix_cacheable)
+            for name in group.layer_names
+        }
+
+    @property
     def host_kv_page_size_bytes(self) -> int:
-        """One history ID's host payload, transferred with its index group."""
+        """Main KV bytes in a physical host row, excluding its logical index."""
         if not self.host_kv_layers:
             return 0
         assert self.long_context_plan is not None

@@ -142,6 +142,17 @@ class HostPageTable:
             raise ValueError("Stale host page epoch")
         return page
 
+    def diagnostics(self) -> dict[str, int]:
+        pages = self.pages[self._first :]
+        return {
+            "binds": sum(len(p.binds) for p in pages),
+            "leases": sum(len(p.leases) for p in pages),
+            "io": sum(len(p.io) for p in pages),
+            "tickets": sum(p.ticket is not None for p in pages),
+            "unretired_pages": sum(not self._retired(p) for p in pages),
+            "watermark": self.watermark,
+        }
+
     def lookup(self, key: OffloadKey) -> PageHandle | None:
         return self.index.get(key)
 
@@ -157,6 +168,7 @@ class HostPageTable:
     def reclaimable(self, page: HostPage) -> bool:
         return (
             page.handle.page_id >= self._first
+            and not (page.state == PageState.LOADING and page.valid)
             and not (page.binds or page.leases or page.io or page.ticket)
             and self._retired(page)
         )
@@ -331,9 +343,14 @@ class HostPageTable:
             raise ValueError("Seal writer has no valid binding")
         if page.writer is not None and page.writer[:2] != (hid, hgen):
             raise ValueError("Seal belongs to another producer")
+        if page.compute_result == Result.FAILED:
+            raise ValueError("A failed producer cannot retry seal")
         self._next_ticket += 1
         ticket = SealTicket(self._next_ticket, hid, hgen, handle, key, step)
         page.ticket = ticket
+        # Completion belongs to this ticket, never a previous failed attempt.
+        page.completed_ranks = page.failed_ranks = 0
+        page.compute_result = page.seal_result = Result.PENDING
         page.writer = (hid, hgen, step)
         page.last_use = max(page.last_use, step)
         return ticket

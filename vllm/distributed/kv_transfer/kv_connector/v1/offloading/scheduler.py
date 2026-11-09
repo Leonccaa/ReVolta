@@ -58,6 +58,7 @@ from vllm.v1.kv_offload.base import (
     get_offload_group_idx,
     make_offload_key,
 )
+from vllm.v1.kv_offload.host.receive import HostReceiveSpec, ReceiveTxn
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
@@ -91,6 +92,7 @@ class TransferJobStatus:
     sliding_window_block_ids: list[BlockIdentity] | None = None
     # A worker reported this load as failed (load_failure_recompute_enabled).
     failed: bool = False
+    receive_txn: ReceiveTxn | None = None
 
 
 class GroupOffloadConfig(NamedTuple):
@@ -345,6 +347,7 @@ class SchedulerOffloadConfig(NamedTuple):
                 if spec.kv_cache_config.kv_cache_groups[
                     idx
                 ].kv_cache_spec.prefix_cacheable
+                and idx != spec.kv_cache_config.host_kv_group_id
             ),
             block_size_factor=spec.block_size_factor,
             offload_prompt_only=spec.offload_prompt_only,
@@ -495,7 +498,19 @@ class OffloadingConnectorScheduler:
     num_skipped_draft_blocks: int = 0
 
     def __init__(self, spec: OffloadingSpec):
+        self.kv_cache_config = spec.kv_cache_config
         self.config = SchedulerOffloadConfig.from_spec(spec)
+        if (
+            spec.kv_cache_config.host_kv_layers
+            and self.config.cpu_draft_offload == "none"
+            and any(
+                g.draft_window_tokens is not None for g in self.config.kv_group_configs
+            )
+        ):
+            raise ValueError(
+                "Host KV prefix recovery requires cpu.draft_offload='all' or "
+                "'window' for the draft WINDOW group"
+            )
         self._group_config_by_idx = {
             group.group_idx: group for group in self.config.kv_group_configs
         }
@@ -1395,6 +1410,22 @@ class OffloadingConnectorScheduler:
         src_spec = self.manager.prepare_load(keys_to_load, req_status.req_context)
 
         load_job_id = self._generate_job_id()
+        txn = None
+        host_hits = self.host_kv_hits
+        if host_hits is not None and host_hits.history_pool is not None:
+            try:
+                txn = host_hits.build_receive(
+                    request,
+                    blocks.blocks,
+                    num_locally_computed_tokens,
+                    num_cached_tokens,
+                    load_job_id,
+                )
+                host_hits.start_receive(txn)
+            except Exception:
+                self.manager.complete_load(keys_to_load, req_status.req_context)
+                raise
+            src_spec = HostReceiveSpec(src_spec, txn)
         self._current_batch_load_jobs[load_job_id] = TransferJob(
             req_id=request.request_id,
             transfer_spec=(src_spec, dst_spec),
@@ -1406,6 +1437,7 @@ class OffloadingConnectorScheduler:
             pending_count=self.config.num_workers,
             keys=set(keys_to_load),
             is_store=False,
+            receive_txn=txn,
         )
 
         if self._blocks_being_loaded is not None:
@@ -1475,17 +1507,54 @@ class OffloadingConnectorScheduler:
         probed stores, and an incomplete answer is reported as a miss."""
         req = req_status.req
         host_hits = self.host_kv_hits
-        if host_hits is not None:
+        if host_hits is not None and host_hits.cache is not None:
             host_hits.cache.poll()
+        group_starts = None
+        reuse_end = num_computed_tokens
+        if host_hits is not None:
+            reuse_end = host_hits.plan_reuse(
+                req, num_computed_tokens, self._hash_block_size
+            )
+            group_starts = {host_hits.rule.group_id: reuse_end}
         chain_hash = chain_hash_from_request(req.block_hashes, self._hash_block_size)
         hit_cap = None
         if contract.has_probes:
             hit_cap = contract.probe_cap(
-                chain_hash, num_computed_tokens, req.num_tokens
+                chain_hash,
+                num_computed_tokens,
+                req.num_tokens,
+                group_starts=group_starts,
             )
+        source_cap = hit_cap
+        if (
+            host_hits is not None
+            and host_hits.history_pool is not None
+            and hit_cap is not None
+            and self._eagle_state_shift is not None
+        ):
+            # G0's virtual full-attention reach replaces its old backend
+            # lookup. Preserve the existing one-page state lookbehind.
+            hit_cap = max(0, hit_cap - self._eagle_state_shift)
         num_hit_tokens = self._lookup(req_status, shrink, hit_cap)
+        if host_hits is not None and host_hits.history_pool is not None:
+            # Preserve junction discovery after G0 leaves backend membership.
+            # Its source-aware probe cap is the full-attention reach.
+            req_status.external_full_attention_hit_tokens = max(
+                req_status.external_full_attention_hit_tokens, source_cap or 0
+            )
         if not num_hit_tokens:
             return num_hit_tokens
+        if host_hits is not None and host_hits.history_pool is not None:
+            # Borrow only full blocks within the shared endpoint. build_receive
+            # rejects partial G0 endpoints before rebinding immutable sources.
+            reuse_end = min(
+                reuse_end,
+                (num_computed_tokens + num_hit_tokens)
+                // host_hits.rule.block_size
+                * host_hits.rule.block_size,
+            )
+            host_hits.trim_reuse(req.request_id, reuse_end)
+            group_starts = {host_hits.rule.group_id: reuse_end}
 
         def _block_ok(rule: GroupHitRule, index: int) -> bool | None:
             if rule.group_id not in self._group_config_by_idx:
@@ -1500,12 +1569,16 @@ class OffloadingConnectorScheduler:
             num_computed_tokens,
             _block_ok,
             chain_hash,
+            group_starts=group_starts,
         )
         if reason is not None:
             contract.reject(reason, req.request_id)
             return 0
         if host_hits is not None and not host_hits.pin_hit(
-            req.request_id, chain_hash, num_computed_tokens + num_hit_tokens
+            req.request_id,
+            chain_hash,
+            start=reuse_end if host_hits.local_only else 0,
+            end=num_computed_tokens + num_hit_tokens,
         ):
             contract.reject("host prefix could not be pinned", req.request_id)
             return 0
@@ -1553,6 +1626,14 @@ class OffloadingConnectorScheduler:
             num_local_tokens,
             _block_ok,
             chain_hash_from_request(req_status.req.block_hashes, self._hash_block_size),
+            # G0's concrete source identities are checked by build_receive.
+            # STATE/WINDOW keep num_local_tokens as their independent start.
+            group_starts=(
+                {self.host_kv_hits.rule.group_id: num_cached_tokens}
+                if self.host_kv_hits is not None
+                and self.host_kv_hits.history_pool is not None
+                else None
+            ),
         )
 
     def _count_admitted_lookup(
@@ -2302,7 +2383,35 @@ class OffloadingConnectorScheduler:
         if not isinstance(meta, OffloadingWorkerMetadata):
             assert meta is None
             meta = OffloadingWorkerMetadata()
-        for job_id, count in meta.completed_jobs.items():
+        completed_receive_reqs = set()
+        completed_jobs = dict(meta.completed_jobs)
+        host_hits = self.host_kv_hits
+        manages_receives = host_hits is not None and host_hits.history_pool is not None
+        if manages_receives:
+            assert host_hits is not None and host_hits.history_pool is not None
+            table = host_hits.history_pool.host_pages
+            for attempt, (completed, failed) in meta.receive_results.items():
+                status = self._jobs.get(attempt)
+                if status is not None and status.receive_txn is not None:
+                    status.receive_txn.complete(completed, failed, table.all_ranks)
+            # Counts remain the ABI of ordinary transfer jobs. ReceiveTxn
+            # ignores them, including duplicates of an already retired job.
+            for job_id in list(completed_jobs):
+                status = self._jobs.get(job_id)
+                if job_id in meta.receive_results or (
+                    status is not None and status.receive_txn is not None
+                ):
+                    del completed_jobs[job_id]
+            for job_id, status in self._jobs.items():
+                txn = status.receive_txn
+                if (
+                    txn is not None
+                    and txn.completed_ranks == table.all_ranks
+                    and table.watermark >= txn.step
+                ):
+                    status.failed = bool(txn.failed_ranks)
+                    completed_jobs[job_id] = self.config.num_workers
+        for job_id, count in completed_jobs.items():
             assert count > 0
             if job_id < self._stale_job_threshold:
                 self._complete_stale_load(job_id, count, job_id in meta.failed_jobs)
@@ -2340,6 +2449,10 @@ class OffloadingConnectorScheduler:
                     # A worker could not read the keys back: the GPU blocks
                     # hold no valid prefix. The scheduler recomputes.
                     self._abandon_load(job_status.req_id, "transfer failed")
+                if job_status.receive_txn is not None:
+                    assert host_hits is not None
+                    host_hits.retire_receive(job_status.receive_txn)
+                    completed_receive_reqs.add(job_status.req_id)
             if self._block_id_to_pending_jobs:
                 # Sliding window blocks are tracked from store creation
                 # and must be cleaned up unconditionally.
@@ -2354,6 +2467,10 @@ class OffloadingConnectorScheduler:
             req_status.transfer_jobs.remove(job_id)
             if not req_status.transfer_jobs and req_status.req.is_finished():
                 del self._req_status[job_status.req_id]
+        if manages_receives:
+            # A worker may finish before other ranks or the step watermark.
+            # Emit one request completion only after the transaction retires.
+            connector_output.finished_recving = completed_receive_reqs
 
     def _complete_stale_load(self, job_id: int, count: int, failed: bool) -> None:
         """Account a worker report of a load job discarded by reset_cache.
@@ -2420,6 +2537,8 @@ class OffloadingConnectorScheduler:
         # Register them so future block reuse triggers a flush.
         for job_id in req_status.transfer_jobs:
             job_status = self._jobs[job_id]
+            if job_status.receive_txn is not None:
+                job_status.receive_txn.cancelled = True
             for bid in job_status.non_sliding_window_block_ids or ():
                 self._block_id_to_pending_jobs.setdefault(bid, set()).add(job_id)
         return False, None
@@ -2601,6 +2720,8 @@ class OffloadingConnectorScheduler:
     def reset_cache(self) -> None:
         """Reset the offloading manager cache, evicting all stored blocks."""
 
+        if any(status.receive_txn is not None for status in self._jobs.values()):
+            raise RuntimeError("Receive transactions must retire before cache reset")
         # reset_cache cannot be called in the middle of a schedule step
         assert not self._current_batch_load_jobs
         assert not self._current_batch_jobs_to_flush

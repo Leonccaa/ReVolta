@@ -271,7 +271,7 @@ def test_core_waits_for_all_rank_drains_before_executor_shutdown(monkeypatch, fa
         host_history_pool=SimpleNamespace(host_pages=table, _jobs={}),
         current_step=int(failure == "gap"),
         update_from_output=lambda *args: events.append("batch-result"),
-        shutdown=lambda: events.append("scheduler-shutdown-close-unlink"),
+        shutdown=lambda **_: events.append("scheduler-shutdown-close-unlink"),
     )
     receipts: list[tuple[int, None, str | None]] = [(0, None, None), (1, None, None)]
     if failure == "rank-error":
@@ -281,12 +281,13 @@ def test_core_waits_for_all_rank_drains_before_executor_shutdown(monkeypatch, fa
     elif failure == "duplicate-rank":
         receipts[1] = receipts[0]
 
-    def rpc(method):
+    def rpc(method, **_):
         assert method == "drain_host_kv"
         events.append("rank-drains")
         return receipts
 
     engine = core.EngineCore.__new__(core.EngineCore)
+    engine.vllm_config = SimpleNamespace(shutdown_timeout=30)
     engine.scheduler = scheduler
     engine.model_executor = SimpleNamespace(
         collective_rpc=rpc, shutdown=lambda: events.append("executor-shutdown")
@@ -311,5 +312,8 @@ def test_core_waits_for_all_rank_drains_before_executor_shutdown(monkeypatch, fa
             "scheduler-shutdown-close-unlink",
             "cleanup",
         ]
+        # A completed shutdown stays completed even after its budget expires.
+        engine.vllm_config.shutdown_timeout = 0
         engine.shutdown()
         assert events.count("rank-drains") == 1
+        assert events.count("executor-shutdown") == 1

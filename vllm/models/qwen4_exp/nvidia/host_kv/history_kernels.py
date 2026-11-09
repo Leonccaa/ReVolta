@@ -363,3 +363,258 @@ def remap_selection(
     tl.device_assert((~valid) | (slot >= 0), "selected KV has no hot slot")
     out = tl.where(valid & (slot >= 0), slot * 4 + safe % 4, -1)
     tl.store(Out + row * OS0 + col, out, col < W)
+
+
+# ----- selection-union gather: union gather of a mixed step (selection-union gather)
+# ------------------------------
+#
+# One scan kernel per input kind (request tails, selection rows) runs in four
+# modes over the same gid computation:
+#   MARK   (0): atomic_or the class bits; count each first claim and append it
+#               to Touched only while it fits M. The count saturates nothing,
+#               so a caller can compare it with any capacity; Touched is
+#               complete exactly when the count is at most M.
+#   FIRST  (1): atomic_max a first-reference code (larger = earlier row group,
+#               the tail code exceeds every row group's code).
+#   COUNT  (2): compare-and-swap the code of the row group that references a
+#               gid first with a sentinel, so each gid is counted once, in
+#               ``Hist[0]`` (tail) or ``Hist[1 + row_group]``.
+#   RESET  (3): store zero at every gid the same inputs reference.
+# RESET after MARK or COUNT restores the all-zero state for these gids
+# without relying on a bounded Touched list.
+
+UNION_MARK = 0
+UNION_FIRST = 1
+UNION_COUNT = 2
+UNION_RESET = 3
+
+
+@triton.jit
+def _union_update(
+    gid,
+    valid,
+    code,
+    Wanted,
+    Touched,
+    Count,
+    Hist,
+    hist_slot,
+    sentinel,
+    M: tl.constexpr,
+    MODE: tl.constexpr,
+):
+    # One code per lane (the interpreter does not broadcast atomic values).
+    code = code + tl.zeros_like(valid.to(tl.int32))
+    if MODE == 0:
+        old = tl.atomic_or(Wanted + gid, code, mask=valid, sem="relaxed")
+        first = valid & (old == 0)
+        rank = tl.cumsum(first.to(tl.int32)) - 1
+        count = tl.sum(first.to(tl.int32), 0)
+        if count > 0:
+            start = tl.atomic_add(Count, count, sem="relaxed")
+            tl.store(Touched + start + rank, gid, first & (start + rank < M))
+    elif MODE == 1:
+        tl.atomic_max(Wanted + gid, code, mask=valid, sem="relaxed")
+    elif MODE == 2:
+        # Invalid lanes compare against -1, which no code equals.
+        expected = tl.where(valid, code, -1)
+        new = sentinel + tl.zeros_like(code)
+        old = tl.atomic_cas(Wanted + gid, expected, new, sem="relaxed")
+        won = valid & (old == expected)
+        count = tl.sum(won.to(tl.int32), 0)
+        if count > 0:
+            tl.atomic_add(Hist + hist_slot, count, sem="relaxed")
+    else:
+        tl.store(Wanted + gid, 0, valid)
+
+
+@triton.jit
+def union_tail(
+    Table,
+    SeqLens,
+    Ready,
+    Class,
+    Wanted,
+    Touched,
+    Count,
+    Hist,
+    tail_code,
+    sentinel,
+    TS0,
+    KBS: tl.constexpr,
+    M: tl.constexpr,
+    WORLD: tl.constexpr,
+    RANK: tl.constexpr,
+    IL: tl.constexpr,
+    MODE: tl.constexpr,
+):
+    """Every request's newest 32 local tokens (nine groups), as mark_tail."""
+    req = tl.program_id(0).to(tl.int64)
+    length = local_length(tl.load(SeqLens + req), WORLD, RANK, IL)
+    token = length - 32 + tl.arange(0, 32)
+    valid = token >= 0
+    safe = tl.maximum(token, 0)
+    kernel_block = tl.load(Table + req * TS0 + safe // KBS, valid, 0).to(tl.int64)
+    if MODE == 0:
+        ready = tl.load(Ready + kernel_block * KBS + safe % KBS, valid, 1)
+        tl.device_assert((~valid) | (ready != 0), "tail KV is not committed")
+        code = tl.load(Class + req)
+    else:
+        code = tail_code
+    gid = kernel_block * (KBS // 4) + (safe % KBS) // 4
+    _union_update(gid, valid, code, Wanted, Touched, Count, Hist, 0, sentinel, M, MODE)
+
+
+@triton.jit
+def union_selection(
+    Indices,
+    Req,
+    Table,
+    SeqLens,
+    Ready,
+    Class,
+    Wanted,
+    Touched,
+    Count,
+    Hist,
+    num_row_groups,
+    sentinel,
+    IS0,
+    TS0,
+    W: tl.constexpr,
+    KBS: tl.constexpr,
+    M: tl.constexpr,
+    B: tl.constexpr,
+    WORLD: tl.constexpr,
+    RANK: tl.constexpr,
+    IL: tl.constexpr,
+    MODE: tl.constexpr,
+    ROW_GROUP: tl.constexpr = 8,
+):
+    """Selected groups of rows given relative to an eight-row-aligned start.
+
+    Every column claims its own group, so no selection layout is assumed."""
+    row = tl.program_id(0).to(tl.int64)
+    col = tl.program_id(1).to(tl.int64) * B + tl.arange(0, B)
+    req = tl.load(Req + row).to(tl.int64)
+    length = local_length(tl.load(SeqLens + req), WORLD, RANK, IL)
+    token = tl.load(Indices + row * IS0 + col, col < W, -1)
+    valid = (col < W) & (token >= 0) & (token < length)
+    safe = tl.maximum(token, 0)
+    kernel_block = tl.load(Table + req * TS0 + safe // KBS, valid, 0).to(tl.int64)
+    row_group = (row // ROW_GROUP).to(tl.int32)
+    if MODE == 0:
+        tl.device_assert(
+            (token < 0) | (token < length), "host KV selection past length"
+        )
+        ready = tl.load(Ready + kernel_block * KBS + safe % KBS, valid, 1)
+        tl.device_assert((~valid) | (ready != 0), "selected KV is not committed")
+        code = tl.load(Class + req)
+    else:
+        code = num_row_groups - row_group
+    gid = kernel_block * (KBS // 4) + (safe % KBS) // 4
+    _union_update(
+        gid, valid, code, Wanted, Touched, Count, Hist, 1 + row_group, sentinel,
+        M, MODE,
+    )  # fmt: skip
+
+
+@triton.jit
+def begin_fill(MissCount, Clock):
+    """Start filling marked groups: the clock moves only when a fill runs."""
+    tl.store(MissCount, 0)
+    tl.store(Clock, tl.load(Clock) + 1)
+
+
+@triton.jit
+def collect_misses_classed(
+    Touched,
+    WantedCount,
+    Wanted,
+    Map,
+    Age,
+    Clock,
+    Misses,
+    Count,
+    M: tl.constexpr,
+    B: tl.constexpr,
+):
+    """``collect_misses``, except a hit only prefill rows want (class bits 1)
+    keeps ``max(age, clock - 9)``: older ages drop to the old bucket, a page a
+    recent decode row touched keeps that age."""
+    i = tl.program_id(0).to(tl.int64) * B + tl.arange(0, B)
+    active = i < tl.load(WantedCount)
+    gid = tl.load(Touched + i, active, 0)
+    slot = tl.load(Map + gid, active, -1)
+    missing = active & (slot < 0)
+    clock = tl.load(Clock)
+    bits = tl.load(Wanted + gid, active, 0)
+    age = tl.load(Age + tl.maximum(slot, 0), active & (slot >= 0), 0)
+    hit_age = tl.where(bits == 1, tl.maximum(age, clock - 9), clock)
+    tl.store(Age + tl.maximum(slot, 0), hit_age, active & (slot >= 0))
+    rank = tl.cumsum(missing.to(tl.int32)) - 1
+    count = tl.sum(missing.to(tl.int32), 0)
+    if count > 0:
+        start = tl.atomic_add(Count, count, sem="relaxed")
+        tl.device_assert(start + count <= M, "host KV miss bound exceeded")
+        tl.store(Misses + start + rank, gid, missing & (start + rank < M))
+
+
+@triton.jit
+def age_prefill_misses(
+    Misses,
+    MissSlots,
+    Count,
+    Wanted,
+    Age,
+    Clock,
+    Counters,
+    B: tl.constexpr,
+):
+    """Insert groups only prefill rows want as old (``clock - 9``)."""
+    i = tl.program_id(0).to(tl.int64) * B + tl.arange(0, B)
+    active = i < tl.load(Count)
+    gid = tl.load(Misses + i, active, 0)
+    slot = tl.load(MissSlots + i, active, 0)
+    prefill = active & (tl.load(Wanted + gid, active, 0) == 1)
+    tl.store(Age + slot, tl.load(Clock) - 9, prefill)
+    count = tl.sum(prefill.to(tl.int64), 0)
+    if count > 0:
+        tl.atomic_add(Counters + 2, count, sem="relaxed")
+
+
+@triton.jit
+def accumulate_union(WantedCount, MissCount, Counters):
+    """Device counters: union groups and missed groups of every fill."""
+    tl.store(Counters, tl.load(Counters) + tl.load(WantedCount).to(tl.int64))
+    tl.store(Counters + 1, tl.load(Counters + 1) + tl.load(MissCount).to(tl.int64))
+
+
+@triton.jit
+def build_microblock_table(
+    Table,
+    SeqLens,
+    Map,
+    Out,
+    requests,
+    TS0,
+    WMB: tl.constexpr,
+    KBS: tl.constexpr,
+    B: tl.constexpr,
+    WORLD: tl.constexpr,
+    RANK: tl.constexpr,
+    IL: tl.constexpr,
+):
+    """Page-size-4 table: ``Out[q, m]`` is the hot slot of the group that
+    holds local tokens ``[4m, 4m + 4)`` of request q, the same lookup
+    ``remap_selection`` applies per column. Groups past a request's length,
+    rows past ``requests`` and non-resident groups read -1."""
+    req = tl.program_id(0).to(tl.int64)
+    m = tl.program_id(1).to(tl.int64) * B + tl.arange(0, B)
+    seq = tl.load(SeqLens + tl.minimum(req, requests - 1))
+    length = tl.where(req < requests, local_length(seq, WORLD, RANK, IL), 0)
+    valid = (m < WMB) & (m * 4 < length)
+    gpk: tl.constexpr = KBS // 4
+    kernel_block = tl.load(Table + req * TS0 + m // gpk, valid, 0).to(tl.int64)
+    slot = tl.load(Map + kernel_block * gpk + m % gpk, valid, -1)
+    tl.store(Out + req * WMB + m, tl.where(valid, slot, -1), m < WMB)

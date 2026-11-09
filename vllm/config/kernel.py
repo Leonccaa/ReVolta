@@ -442,6 +442,17 @@ class LongContextKVConfig:
     hot-page pool. ``gpu``: in the GPU history segment next to the
     compressed index (the same-plan reference arm); the host and hot pools
     then only budget admission."""
+    prefill_gather: Literal["passes", "union"] = "passes"
+    """Mixed steps with ``main_kv_placement="host"``. ``passes``: remap the
+    selection in query-row passes that fit the hot slots (R_cap rows each).
+    ``union`` (selection-union gather): fill the union of the step's selections into hot
+    slots
+    once per window of whole eight-row groups and run the GPU arm's attention
+    call unchanged on a page-size-4 table, so the result does not depend on
+    the window split. Decode steps are unaffected."""
+    prefill_insert_age: Literal["old", "recent"] = "old"
+    """``union`` only: hot groups that only prefill rows want are inserted
+    as old (first evicted) or recent."""
     value_arbitration: bool = True
     """Host placement with the shared GPU region only: move the boundary
     between the GPU prefix-index cache and the hot pages by bounded value

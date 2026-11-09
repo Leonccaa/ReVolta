@@ -185,6 +185,10 @@ class HostPageTable:
             and self._retired(page)
         )
 
+    def num_free(self) -> int:
+        """Pages on the free list: O(1) lower bound of ``available()``."""
+        return len(self._free)
+
     def available(self) -> int:
         return len(self._free) + sum(
             self.reclaimable(p) and p.state != PageState.FREE

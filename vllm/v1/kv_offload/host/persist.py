@@ -14,7 +14,6 @@ or writes a row while that row holds an SSD IO owner in HostPageTable, so a
 row is never recycled under a transfer. SSD owner ids are negative.
 """
 
-import hashlib
 import os
 import time
 from collections import Counter, OrderedDict, deque
@@ -25,19 +24,19 @@ from typing import Any
 import numpy as np
 
 from vllm.logger import init_logger
-from vllm.v1.kv_offload.base import (
-    OffloadKey,
-    ReqContext,
-    get_offload_group_idx,
-    make_offload_key,
-)
+from vllm.v1.kv_offload.base import OffloadKey, ReqContext
 from vllm.v1.kv_offload.host.page_table import (
     HostPage,
     HostPageTable,
     PageHandle,
     PageState,
 )
-from vllm.v1.kv_offload.host.ssd import HostKVLayout, _HostTier, _WriteRateLimiter
+from vllm.v1.kv_offload.host.ssd import (
+    HostKVLayout,
+    _HostTier,
+    _WriteRateLimiter,
+    host_page_tier_key,
+)
 from vllm.v1.kv_offload.tiering.base import JobMetadata
 from vllm.v1.kv_offload.tiering.delayed_write import (
     VOLUME_FILE,
@@ -296,8 +295,7 @@ class HostPageSsd:
         files can never hit each other."""
         epoch = self.table.ssd_epoch
         salt = b"" if epoch == 0 else self._salts.setdefault(epoch, os.urandom(16))
-        digest = hashlib.sha256(salt + bytes(key)).digest()
-        return make_offload_key(digest, get_offload_group_idx(key))
+        return host_page_tier_key(key, salt)
 
     def _store_jobs(self) -> int:
         return len(self._jobs) - self._inflight_loads
@@ -334,7 +332,6 @@ class HostPageSsd:
             else:
                 self._tier.submit_store(meta)
                 self._inflight_stores += 1
-                self._queue.account([job.tier_key])
         except Exception:
             logger.exception("Host KV SSD job %d submission failed", job.job_id)
             self.stats_counter["submit_failures"] += 1
@@ -370,8 +367,15 @@ class HostPageSsd:
                     self._next_lease -= 1
                     self.table.pin(job.handle, self._next_lease)
                     round_.holds.append((job.handle, self._next_lease))
-        elif success and self.table.mark_persisted(job.handle):
-            self.stats_counter["pages_written"] += 1
+        elif success:
+            # Charge completed stores only (delayed_written and the shared
+            # 24 h volume). A store of a page invalidated meanwhile still
+            # wrote its file: charged, not recorded as persisted.
+            self._queue.account([job.tier_key])
+            if self.table.mark_persisted(job.handle):
+                self.stats_counter["pages_written"] += 1
+            else:
+                self.stats_counter["store_failures"] += 1
         else:
             self.stats_counter[
                 "store_failures" if job.submitted else "store_cancelled"
@@ -486,10 +490,11 @@ class HostPageSsd:
     def prefetch(self, req_id: str, keys: Iterable[OffloadKey]) -> list[OffloadKey]:
         """One prefetch round per request per T_pf, in chain order.
 
-        Connector lookup calls this for
-        the first missing keys,
-        then pins ``holds(req_id)`` as NEW_LOAD sources and calls
-        ``release_holds``. No hit is reported before verification.
+        The connector lookup calls this for the first keys missing from the
+        page table and waits while ``waiting(req_id)``. Verified pages are
+        READY and held for the request; its lookup pins them as NEW_LOAD
+        sources, then calls ``cancel`` to drop the round and its holds. No
+        hit is reported before verification.
         """
         if not self.enabled or self._flushing:
             return []
@@ -543,6 +548,20 @@ class HostPageSsd:
             self._rounds[req_id] = round_
             self.stats_counter["prefetch_issued"] += len(issued)
         return issued
+
+    def poll(self) -> None:
+        """Scheduler thread, before a lookup: publish finished reads and
+        expire prefetch rounds older than T_pf."""
+        if self._closed or self._flushing:
+            return
+        self._poll()
+        self._expire_prefetch(self.clock())
+
+    def waiting(self, req_id: str) -> bool:
+        """The request's prefetch round still has reads in flight. False
+        once every read has finished, failed, or the round expired."""
+        round_ = self._rounds.get(req_id)
+        return round_ is not None and bool(round_.loading)
 
     def holds(self, req_id: str) -> list[PageHandle]:
         round_ = self._rounds.get(req_id)

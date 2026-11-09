@@ -26,6 +26,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.counters import (
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.kv_cache_hit_contract import (
+    ChainHashFn,
     GroupHitRule,
     HitNeed,
     KVHitContract,
@@ -489,6 +490,12 @@ class OffloadingConnectorScheduler:
     """Implementation of Scheduler side methods"""
 
     host_kv_hits: "HostKVHitManager | None" = None
+    # host SSD persistence host-page SSD controller (attached by EngineCore when
+    # host_kv.ssd
+    # is enabled) and the requests that already used their one prefetch
+    # round in this lookup episode (until admission or finish).
+    host_page_ssd: Any = None
+    _host_ssd_prefetched: set[str] | None = None
     # value arbitration value arbitration: called with each successfully completed
     # receive
     # transaction before it retires (None: arbitration off).
@@ -1121,14 +1128,103 @@ class OffloadingConnectorScheduler:
         self, request: Request, num_computed_tokens: int
     ) -> tuple[int | None, bool]:
         if not getattr(self, "_recompute_failed_loads", False):
-            return self._get_num_new_matched_tokens(request, num_computed_tokens)
+            result = self._get_num_new_matched_tokens(request, num_computed_tokens)
+        else:
+            try:
+                result = self._get_num_new_matched_tokens(request, num_computed_tokens)
+            except (AssertionError, IndexError, KeyError, ValueError, RuntimeError):
+                # Nothing has been admitted or transferred yet. A lookup
+                # failure is a miss, preserving any independently verified
+                # local prefix.
+                logger.debug(
+                    "KV lookup failed for %s", request.request_id, exc_info=True
+                )
+                result = 0, False
+        if result[0] is not None:
+            # A final answer: its lookup leases (if any) now protect the
+            # prefetched pages. Drop the round and its holds.
+            self._end_host_ssd_round(request.request_id)
+        return result
+
+    # --- host-page SSD prefetch (host SSD persistence x receive transactions)
+    # -----------------------------------
+
+    def _host_ssd(self) -> Any:
+        ssd = getattr(self, "host_page_ssd", None)
+        host_hits = self.host_kv_hits
+        if (
+            ssd is None
+            or host_hits is None
+            or host_hits.history_pool is None
+            or not ssd.enabled
+        ):
+            return None
+        return ssd
+
+    def _host_ssd_prefetch(
+        self,
+        contract: KVHitContract,
+        req: Request,
+        chain_hash: ChainHashFn,
+        start_tokens: int,
+        group_starts: dict[int, int] | None,
+    ) -> bool:
+        """Start one SSD prefetch round for the G0 pages the host table lacks.
+
+        Returns True while the request must wait for its reads (the lookup
+        is then deferred). A round ends when every read finished (verified
+        pages become READY and held), failed, or T_pf passed; afterwards
+        the lookup goes on with whatever is READY, so a failure or timeout
+        degrades to a shorter hit or a recompute, never an endless wait.
+        Each request gets one round per lookup episode.
+        """
+        ssd = self._host_ssd()
+        host_hits = self.host_kv_hits
+        if ssd is None or host_hits is None:
+            return False
+        req_id = req.request_id
+        ssd.poll()
+        if ssd.waiting(req_id):
+            return True
+        prefetched = self._host_ssd_prefetched
+        if prefetched is None:
+            prefetched = self._host_ssd_prefetched = set()
+        if req_id in prefetched:
+            return False
+        prefetched.add(req_id)
+        rule = host_hits.rule
+        cap = contract.probe_cap(
+            chain_hash, start_tokens, req.num_tokens, group_starts=group_starts
+        )
+        keys = []
+        for index in range(
+            cap // rule.block_size, (req.num_tokens - 1) // rule.block_size
+        ):
+            block_hash = chain_hash(rule, index)
+            if block_hash is None:
+                break
+            keys.append(make_offload_key(block_hash, rule.group_id))
+        if not keys:
+            return False
         try:
-            return self._get_num_new_matched_tokens(request, num_computed_tokens)
-        except (AssertionError, IndexError, KeyError, ValueError, RuntimeError):
-            # Nothing has been admitted or transferred yet. A lookup failure
-            # is a miss, preserving any independently verified local prefix.
-            logger.debug("KV lookup failed for %s", request.request_id, exc_info=True)
-            return 0, False
+            ssd.prefetch(req_id, keys)
+        except Exception:
+            # Best effort: a prefetch error is a miss for these pages.
+            logger.warning("Host KV SSD prefetch failed for %s", req_id, exc_info=True)
+            ssd.cancel(req_id)
+            return False
+        return ssd.waiting(req_id)
+
+    def _end_host_ssd_round(self, req_id: str) -> None:
+        ssd = getattr(self, "host_page_ssd", None)
+        if ssd is not None:
+            ssd.cancel(req_id)
+
+    def _forget_host_ssd_request(self, req_id: str) -> None:
+        """Admitted or finished: a later lookup may prefetch again."""
+        prefetched = self._host_ssd_prefetched
+        if prefetched is not None:
+            prefetched.discard(req_id)
 
     def _get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int
@@ -1228,6 +1324,7 @@ class OffloadingConnectorScheduler:
     def update_state_after_alloc(
         self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
     ):
+        self._forget_host_ssd_request(request.request_id)
         if not getattr(self, "_recompute_failed_loads", False):
             return self._update_state_after_alloc(request, blocks, num_external_tokens)
         try:
@@ -1521,6 +1618,10 @@ class OffloadingConnectorScheduler:
             )
             group_starts = {host_hits.rule.group_id: reuse_end}
         chain_hash = chain_hash_from_request(req.block_hashes, self._hash_block_size)
+        if contract.has_probes and self._host_ssd_prefetch(
+            contract, req, chain_hash, num_computed_tokens, group_starts
+        ):
+            return None
         hit_cap = None
         if contract.has_probes:
             hit_cap = contract.probe_cap(
@@ -2519,6 +2620,8 @@ class OffloadingConnectorScheduler:
         """
         # TODO(orozery): possibly kickoff offload for last block
         # which may have been deferred due to async scheduling
+        self._forget_host_ssd_request(request.request_id)
+        self._end_host_ssd_round(request.request_id)
         if getattr(self, "_recompute_failed_loads", False):
             self._skip_external_once.discard(request.request_id)
             self._failed_loads.discard(request.request_id)

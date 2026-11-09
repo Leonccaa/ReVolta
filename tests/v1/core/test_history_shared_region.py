@@ -250,6 +250,41 @@ def test_ledger_host_gate_uses_reclaimable_after():
     assert ledger.blocking_domain(req, [3]) == HOST
 
 
+def test_ledger_host_gate_scans_cached_ids_only_when_free_pages_fall_short():
+    # admit() runs for every allocating request on every step; the cached-ID
+    # scan must not run while the free list alone covers the fresh pages.
+    p = pool(blocks=9, pages=9)
+    ledger = LongContextAdmissionLedger(_plan(), 9, physical_segments=True)
+    ledger.elastic_pool = p
+    ledger.plan.geometry.max_model_len = 10**6
+    req = SimpleNamespace(request_id="d", num_prompt_tokens=4, max_tokens=0)
+    calls: list[int] = []
+
+    def counted(target):
+        scan = target.host_reclaimable_after
+
+        def wrapped():
+            calls.append(1)
+            return scan()
+
+        target.host_reclaimable_after = wrapped
+
+    counted(p)
+    assert ledger.blocking_domain(req, [0]) is None
+    assert p.host_pages.num_free() >= 2
+    assert ledger.blocking_domain(req, [2]) is None
+    assert calls == []
+    # Short of free pages: the scan decides, with the same verdicts as before.
+    q, _ = _cached_page_pool()
+    ledger.elastic_pool = q
+    counted(q)
+    assert q.host_pages.num_free() == 0
+    assert ledger.blocking_domain(req, [1]) == HOST and calls == [1]
+    retire(q, 1)
+    assert ledger.blocking_domain(req, [2]) is None
+    assert ledger.blocking_domain(req, [3]) == HOST
+
+
 def test_two_long_prefills_plan_128_passes_of_16_rows():
     passes = plan_step_passes(
         ["a", "b"], 2048, {"a": (1024, 65536, 1), "b": (1024, 65536, 1)}, 8242, 256

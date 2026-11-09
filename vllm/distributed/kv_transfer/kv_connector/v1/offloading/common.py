@@ -50,6 +50,10 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
     failed_jobs: dict[int, int] = field(default_factory=dict)
     seal_results: dict[SealTicket, tuple[int, int, int]] = field(default_factory=dict)
     completed_steps: dict[int, int] = field(default_factory=dict)
+    # value arbitration hot-side arbitration counters: step -> (rank mask, summed
+    # values),
+    # one step late (see host_kv/shadow.py).
+    value_counters: dict[int, tuple[int, tuple[int, ...]]] = field(default_factory=dict)
     # ReceiveTxn attempts use rank masks across steps and duplicate outputs.
     receive_results: dict[int, tuple[int, int]] = field(default_factory=dict)
 
@@ -80,6 +84,13 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
         steps = dict(self.completed_steps)
         for step, ranks in other.completed_steps.items():
             steps[step] = steps.get(step, 0) | ranks
+        counters = dict(self.value_counters)
+        for step, (ranks, values) in other.value_counters.items():
+            old_ranks, old_values = counters.get(step, (0, (0,) * len(values)))
+            counters[step] = (
+                old_ranks | ranks,
+                tuple(a + b for a, b in zip(old_values, values)),
+            )
         receives = dict(self.receive_results)
         for attempt, (completed, failed_ranks) in other.receive_results.items():
             prior = receives.get(attempt, (0, 0))
@@ -89,5 +100,6 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
             failed_jobs=failed,
             seal_results=seals,
             completed_steps=steps,
+            value_counters=counters,
             receive_results=receives,
         )

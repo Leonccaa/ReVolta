@@ -367,6 +367,7 @@ class HostHistoryStore:
         debug: bool = False,
         region_layout: HostRegionLayout | None = None,
         rank: int = 0,
+        value_shadow: bool = False,
         hot_views: Sequence[torch.Tensor] | None = None,
     ) -> None:
         shape.validate()
@@ -484,6 +485,14 @@ class HostHistoryStore:
             self.staging_slots = torch.arange(
                 s.max_write_rows, dtype=torch.int64, device=device
             )
+            # value arbitration value arbitration: layer-0 shadow records and counters.
+            # None
+            # (arbitration off) launches nothing extra.
+            self.shadow = None
+            if value_shadow:
+                from .shadow import HotShadowTable
+
+                self.shadow = HotShadowTable(s.num_groups, s.groups_per_block, device)
             self.layers = [
                 HostHistoryLayer(self, index, name)
                 for index, name in enumerate(layer_names)
@@ -659,6 +668,8 @@ class HostHistoryStore:
             ids, self.group_to_slot, self.slot_owner, self.age, s.num_groups,
             s.hot_slots, s.groups_per_block, 256,
         )  # fmt: skip
+        if self.shadow is not None:
+            self.shadow.clear_blocks(ids)
 
     # ----- shared hot region shared region
     # --------------------------------------------------
@@ -691,6 +702,12 @@ class HostHistoryStore:
             )  # fmt: skip
         if claim:
             ids = self._block_ids(list(claim))
+            if self.shadow is not None:
+                # value arbitration: residents a claim unmaps are forced evictions,
+                # counted
+                # apart from value-driven ones; the ID's own records go.
+                self.shadow.count_claims(ids, self.slot_owner[0], s.slots_per_block)
+                self.shadow.clear_blocks(ids)
             hk.set_block_slots[(ids.numel(), s.num_layers)](
                 ids, self.group_to_slot, self.slot_owner, self.age, s.num_groups,
                 s.hot_slots, s.slots_per_block, kp, True,
@@ -719,6 +736,8 @@ class HostHistoryStore:
         self.clock.zero_()
         self.eviction_hand.zero_()
         self.wanted.zero_()
+        if self.shadow is not None:
+            self.shadow.reset()
         self.ready.zero_()
         self.ready[: s.kernel_blocks_per_block * s.kernel_block_tokens] = 1
         if self.region is not None:
@@ -920,6 +939,9 @@ class HostHistoryLayer:
             self.clock, store.miss_groups, store.miss_count, m, 256,
             debug=store.debug,
         )  # fmt: skip
+        shadow = store.shadow if self.index == 0 else None
+        if shadow is not None:
+            shadow.check_misses(store, triton.cdiv(m, 256))
         kernels.count_victim_buckets[(store.victim_tiles,)](
             store.wanted, self.slot_owner, self.age, self.clock, store.miss_count,
             store.victim_counts, self.eviction_hand, s.hot_slots,
@@ -931,6 +953,9 @@ class HostHistoryLayer:
             s.hot_slots, store.victim_tiles, 512,
             triton.next_power_of_2(store.victim_tiles), debug=store.debug,
         )  # fmt: skip
+        if shadow is not None:
+            # Before allocation overwrites the victims' owners.
+            shadow.record_victims(store, self.slot_owner, triton.cdiv(m, 256))
         kernels.allocate_slots[(triton.cdiv(m, 256),)](
             self.group_to_slot, self.slot_owner, self.age, self.clock,
             store.miss_groups, store.miss_slots, store.miss_count,

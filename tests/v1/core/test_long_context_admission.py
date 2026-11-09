@@ -51,14 +51,21 @@ def build(
     max_num_seqs: int = 8,
     prefix_caching: bool = True,
     reserve_full_isl: bool = False,
+    speculative_tokens: int = 0,
 ):
-    config = make_config(max_model_len=MAX_MODEL_LEN, speculative_tokens=0)
+    config = make_config(
+        max_model_len=MAX_MODEL_LEN, speculative_tokens=speculative_tokens
+    )
+    if speculative_tokens:
+        config.speculative_config.method = "dflash"
     config.scheduler_config.max_num_seqs = max_num_seqs
     config.scheduler_config.scheduler_reserve_full_isl = reserve_full_isl
     config.cache_config.enable_prefix_caching = prefix_caching
     if settings is not None:
         config.kernel_config.long_context_kv = settings
-    specs = production_specs(speculative_blocks=0, drafter=False)
+    specs = production_specs(
+        speculative_blocks=speculative_tokens, drafter=bool(speculative_tokens)
+    )
     (worker,) = get_kv_cache_configs(
         config, [specs], [PHYSICAL_BLOCKS * POOL_BLOCK_BYTES]
     )

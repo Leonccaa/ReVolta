@@ -476,3 +476,13 @@ def test_hot_layout_refuses_unsupported_dcp():
     config.parallel_config.decode_context_parallel_size = 4
     with pytest.raises(ValueError, match="DCP1 or DCP2"):
         get_long_context_geometry(config, groups)
+
+
+def test_split_pool_rejects_custom_connector_with_builtin_name():
+    config = production_config()
+    groups = get_kv_cache_groups(config, production_specs())
+    config.kv_transfer_config = SimpleNamespace(
+        kv_connector="OffloadingConnector", kv_connector_module_path="custom.connector"
+    )
+    with pytest.raises(ValueError, match="built-in implementation"):
+        get_long_context_geometry(config, groups)

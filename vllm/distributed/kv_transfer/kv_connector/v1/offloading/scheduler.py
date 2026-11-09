@@ -63,6 +63,10 @@ from vllm.v1.request import Request
 
 logger = init_logger(__name__)
 
+# Unified pools retain their existing integer identity. Split pools must carry
+# the segment through every store fence, including destinations and zeroing.
+BlockIdentity = int | tuple[int, int]
+
 if TYPE_CHECKING:
     from vllm.v1.kv_offload.cpu.dependency import CPUBlockDependencyIndex
     from vllm.v1.kv_offload.host.hit import HostKVHitManager
@@ -81,10 +85,10 @@ class TransferJobStatus:
     is_store: bool
     # Store src block IDs whose ref_cnt protects them while the request
     # runs. Only registered in _block_id_to_pending_jobs on request_finished.
-    non_sliding_window_block_ids: list[int] | None = None
+    non_sliding_window_block_ids: list[BlockIdentity] | None = None
     # Store src block IDs that may be freed before the request finishes.
     # Registered in _block_id_to_pending_jobs at store creation time.
-    sliding_window_block_ids: list[int] | None = None
+    sliding_window_block_ids: list[BlockIdentity] | None = None
     # A worker reported this load as failed (load_failure_recompute_enabled).
     failed: bool = False
 
@@ -579,7 +583,8 @@ class OffloadingConnectorScheduler:
         # Populated only for finished requests (running-request blocks are
         # protected by their ref_cnt) and for sliding window blocks (which can
         # be freed before a request finishes).
-        self._block_id_to_pending_jobs: dict[int, set[int]] = {}
+        self._block_segments = spec.kv_cache_config.block_segments
+        self._block_id_to_pending_jobs: dict[BlockIdentity, set[int]] = {}
         self.num_rejected_boundary_offers = 0
         self.num_skipped_draft_blocks = 0
         self._reported_skipped_draft_blocks = 0
@@ -763,13 +768,38 @@ class OffloadingConnectorScheduler:
         self._job_counter += 1
         return job_id
 
-    def _remove_pending_job(self, job_id: int, block_ids: list[int] | None) -> None:
+    def _block_identity(self, group_idx: int, block_id: int) -> BlockIdentity:
+        segments = getattr(self, "_block_segments", None)
+        if segments is None:
+            return block_id
+        return segments.group_segments[group_idx], block_id
+
+    def _transfer_block_identities(
+        self, block_ids: list[int], group_sizes: list[int]
+    ) -> Sequence[BlockIdentity]:
+        if getattr(self, "_block_segments", None) is None:
+            return block_ids
+        offset = 0
+        identities: list[BlockIdentity] = []
+        for group_idx, size in enumerate(group_sizes):
+            identities.extend(
+                self._block_identity(group_idx, bid)
+                for bid in block_ids[offset : offset + size]
+            )
+            offset += size
+        return identities
+
+    def _remove_pending_job(
+        self, job_id: int, block_ids: Iterable[BlockIdentity]
+    ) -> None:
         # Registration is idempotent because each block maps to a set of job IDs.
         # MTP lookahead may report the same physical block ID more than once, so
         # completion must use the same set semantics instead of removing twice.
-        for bid in set(block_ids or ()):
-            pending = self._block_id_to_pending_jobs[bid]
-            pending.remove(job_id)
+        for bid in set(block_ids):
+            pending = self._block_id_to_pending_jobs.get(bid)
+            if pending is None:
+                continue
+            pending.discard(job_id)
             if not pending:
                 del self._block_id_to_pending_jobs[bid]
 
@@ -1131,7 +1161,6 @@ class OffloadingConnectorScheduler:
         if skip_once and request.request_id in skip_once:
             # The previous external load of this request was abandoned
             # (take_failed_loads): recompute from the local hit this time.
-            skip_once.discard(request.request_id)
             num_hit_tokens = 0
         elif request.skip_reading_prefix_cache:
             num_hit_tokens = 0
@@ -1204,6 +1233,11 @@ class OffloadingConnectorScheduler:
             self._count_admitted_lookup(counters, request, num_external_tokens)
 
         if num_external_tokens == 0:
+            # Admission succeeded: this request will actually recompute. A
+            # lookup followed by capacity/budget deferral must keep the marker.
+            skip_once = getattr(self, "_skip_external_once", None)
+            if skip_once:
+                skip_once.discard(request.request_id)
             return
 
         req_status = self._req_status[request.request_id]
@@ -1327,13 +1361,14 @@ class OffloadingConnectorScheduler:
                 )
 
         # Fence dst blocks against finished-request pending stores.
+        dst_identities = self._transfer_block_identities(dst_block_ids, group_sizes)
         if (
             self._block_id_to_pending_jobs
-            and not self._block_id_to_pending_jobs.keys().isdisjoint(dst_block_ids)
+            and not self._block_id_to_pending_jobs.keys().isdisjoint(dst_identities)
         ):
             self._current_batch_jobs_to_flush.update(
                 jid
-                for bid in dst_block_ids
+                for bid in dst_identities
                 for jid in self._block_id_to_pending_jobs.get(bid, ())
             )
 
@@ -1383,11 +1418,16 @@ class OffloadingConnectorScheduler:
         releases the request's blocks and recomputes, and the next lookup of
         this request offers no external hit."""
         self.num_abandoned_loads += 1
-        self._failed_loads.add(req_id)
-        self._skip_external_once.add(req_id)
         status = self._req_status.get(req_id)
-        if status is not None:
+        if status is not None and not status.req.is_finished():
+            self._failed_loads.add(req_id)
+            self._skip_external_once.add(req_id)
             status.draft_reofferable.clear()
+        else:
+            self._failed_loads.discard(req_id)
+            skip_once = getattr(self, "_skip_external_once", None)
+            if skip_once:
+                skip_once.discard(req_id)
         logger.warning_once(
             "Offloading connector abandoned an external KV load and recomputes "
             "the request instead (further cases are logged at debug level)."
@@ -1540,6 +1580,9 @@ class OffloadingConnectorScheduler:
         store_jobs: dict[int, TransferJob] = {}
         # iterate over both new and cached requests
         for req_id, new_block_id_groups, preempted in yield_req_data(scheduler_output):
+            skip_once = getattr(self, "_skip_external_once", None)
+            if skip_once:
+                skip_once.discard(req_id)
             req_status = self._req_status[req_id]
             req_status.update_offload_keys()
             req = req_status.req
@@ -1555,7 +1598,9 @@ class OffloadingConnectorScheduler:
                 # Fence new blocks against in-flight stores.
                 if self._block_id_to_pending_jobs:
                     new_blocks_flat = [
-                        bid for new_blocks in new_block_id_groups for bid in new_blocks
+                        self._block_identity(group_idx, bid)
+                        for group_idx, new_blocks in enumerate(new_block_id_groups)
+                        for bid in new_blocks
                     ]
                     if not self._block_id_to_pending_jobs.keys().isdisjoint(
                         new_blocks_flat
@@ -1676,8 +1721,8 @@ class OffloadingConnectorScheduler:
             group_sizes: list[int] = [0] * self.config.num_kv_cache_groups
             block_indices: list[int] = [0] * self.config.num_kv_cache_groups
             src_block_ids: list[int] = []
-            sliding_window_block_ids: list[int] = []
-            non_sliding_window_block_ids: list[int] = []
+            sliding_window_block_ids: list[BlockIdentity] = []
+            non_sliding_window_block_ids: list[BlockIdentity] = []
             for group_config in self.config.kv_group_configs:
                 group_state = req_status.group_states[group_config.group_idx]
                 if group_config.requires_exact_boundary_source:
@@ -1714,10 +1759,13 @@ class OffloadingConnectorScheduler:
                             start_gpu_block_idx = gpu_block_idx + i
                         src_block_ids.append(block_id)
                         num_group_blocks += 1
+                        identity = self._block_identity(
+                            group_config.group_idx, block_id
+                        )
                         if is_sliding_window:
-                            sliding_window_block_ids.append(block_id)
+                            sliding_window_block_ids.append(identity)
                         else:
-                            non_sliding_window_block_ids.append(block_id)
+                            non_sliding_window_block_ids.append(identity)
 
                 group_sizes[group_config.group_idx] = num_group_blocks
                 block_indices[group_config.group_idx] = start_gpu_block_idx or 0
@@ -2046,13 +2094,14 @@ class OffloadingConnectorScheduler:
                 )
                 job_id = self._generate_job_id()
                 req_status.transfer_jobs.add(job_id)
-                self._block_id_to_pending_jobs.setdefault(block_id, set()).add(job_id)
+                identity = self._block_identity(group_idx, block_id)
+                self._block_id_to_pending_jobs.setdefault(identity, set()).add(job_id)
                 self._jobs[job_id] = TransferJobStatus(
                     req_id=req_id,
                     pending_count=self.config.num_workers,
                     keys=keys_to_store,
                     is_store=True,
-                    sliding_window_block_ids=[block_id],
+                    sliding_window_block_ids=[identity],
                 )
 
                 group_sizes = [0] * num_groups
@@ -2222,8 +2271,12 @@ class OffloadingConnectorScheduler:
         new_block_ids_to_zero = getattr(scheduler_output, "new_block_ids_to_zero", None)
         if new_block_ids_to_zero and self._block_id_to_pending_jobs:
             for block_id in new_block_ids_to_zero:
+                segments = getattr(self, "_block_segments", None)
+                identity = (
+                    (segments.primary, block_id) if segments is not None else block_id
+                )
                 self._current_batch_jobs_to_flush.update(
-                    self._block_id_to_pending_jobs.get(block_id, ())
+                    self._block_id_to_pending_jobs.get(identity, ())
                 )
 
         boundary_store_jobs = self._build_boundary_state_store_jobs(scheduler_output)
@@ -2290,13 +2343,12 @@ class OffloadingConnectorScheduler:
             if self._block_id_to_pending_jobs:
                 # Sliding window blocks are tracked from store creation
                 # and must be cleaned up unconditionally.
-                self._remove_pending_job(job_id, job_status.sliding_window_block_ids)
+                identities = set(job_status.sliding_window_block_ids or ())
                 # Non-sliding-window blocks are only tracked after
                 # request_finished, so only clean up for finished requests.
                 if req_status.req.is_finished():
-                    self._remove_pending_job(
-                        job_id, job_status.non_sliding_window_block_ids
-                    )
+                    identities.update(job_status.non_sliding_window_block_ids or ())
+                self._remove_pending_job(job_id, identities)
 
             del self._jobs[job_id]
             req_status.transfer_jobs.remove(job_id)
@@ -2341,6 +2393,9 @@ class OffloadingConnectorScheduler:
         """
         # TODO(orozery): possibly kickoff offload for last block
         # which may have been deferred due to async scheduling
+        if getattr(self, "_recompute_failed_loads", False):
+            self._skip_external_once.discard(request.request_id)
+            self._failed_loads.discard(request.request_id)
         req_status = self._req_status.get(request.request_id)
 
         req_context = (
@@ -2576,6 +2631,8 @@ class OffloadingConnectorScheduler:
                 group_state.next_stored_block_idx = 0
         for req_id in finished_req_ids:
             del self._req_status[req_id]
+        self._skip_external_once.intersection_update(self._req_status)
+        self._failed_loads.intersection_update(self._req_status)
 
         # A load still in flight keeps its failure path: remember its request
         # so a failed completion after the reset is abandoned, not promoted.

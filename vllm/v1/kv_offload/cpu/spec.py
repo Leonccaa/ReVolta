@@ -208,23 +208,15 @@ class CPUOffloadingSpec(OffloadingSpec):
                 else 0
             )
             if has_block_segments(kv_cache_config):
-                # Separate block spaces: one CPU page holds one block of a
-                # single space (its block ID names no block of the other), so
-                # it needs the largest space's per-block bytes.
-                segments = kv_cache_config.block_segments
-                assert segments is not None
-                layer_space = {
-                    name: segments.group_segments[group_id]
-                    for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
-                    for name in group.layer_names
-                }
-                space_bytes = [0] * len(segments.num_blocks)
-                for t in kv_cache_config.kv_cache_tensors:
-                    space_bytes[layer_space[t.shared_by[0]]] += t.size // (
-                        kv_tensor_num_blocks(kv_cache_config, t)
-                    )
+                # The unpartitioned worker allocates a CPU view for EVERY
+                # canonical tensor. Independent GPU spaces do not alias their
+                # CPU backing, even when a key uses only one space's views.
                 self.cpu_page_size_per_worker = (
-                    max(space_bytes) * self.block_size_factor
+                    sum(
+                        t.size // kv_tensor_num_blocks(kv_cache_config, t)
+                        for t in kv_cache_config.kv_cache_tensors
+                    )
+                    * self.block_size_factor
                 )
             kv_bytes_per_offloaded_block = self.cpu_page_size_per_worker * world_size
             self.num_blocks = (

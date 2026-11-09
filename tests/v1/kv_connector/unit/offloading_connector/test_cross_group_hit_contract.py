@@ -431,7 +431,10 @@ def test_load_plan_with_evicted_state_is_abandoned(check: bool):
         assert scheduler.take_failed_loads() == set()
         present.add(groups[MAMBA].offload_keys[5])
         assert scheduler.get_num_new_matched_tokens(req, 0) == (0, False)
-        # Only the retry right after the abandoned load skips the tier.
+        # Repeated lookup after deferral must still skip the tier, until an
+        # allocation actually admits a recompute.
+        assert scheduler.get_num_new_matched_tokens(req, 0) == (0, False)
+        scheduler.update_state_after_alloc(req, _alloc(0), 0)
         assert scheduler.get_num_new_matched_tokens(req, 0)[0] == 192
     else:
         assert len(scheduler._current_batch_load_jobs) == 1

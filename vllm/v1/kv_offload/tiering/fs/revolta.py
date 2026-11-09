@@ -36,6 +36,7 @@ import weakref
 from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING
 
+from vllm.config.utils import normalize_value
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import OffloadKey, get_offload_group_idx
 from vllm.v1.kv_offload.tiering.base import (
@@ -58,6 +59,30 @@ if TYPE_CHECKING:
     from vllm.v1.kv_offload.base import OffloadingSpec
 
 logger = init_logger(__name__)
+
+
+def _persistent_kv_tensors(kv_cache_config):
+    """Keep the pre-split tensor schema for caches using the unified pool.
+
+    normalize_value retains the dataclass's fully qualified name. Converting
+    to a dict would change the namespace too, even with identical fields.
+    Explicit tensor block counts retain their physical identity, including in
+    a unified cache. Only the new field's absent/default value is omitted.
+    """
+    tensors = kv_cache_config.kv_cache_tensors
+    if getattr(kv_cache_config, "block_segments", None) is not None:
+        return tensors
+    normalized = []
+    for tensor in tensors:
+        type_name, items = normalize_value(tensor)
+        normalized.append(
+            (
+                type_name,
+                tuple((k, v) for k, v in items if k != "num_blocks" or v is not None),
+            )
+        )
+    return normalized
+
 
 CHECKSUM_XATTR = "user.revolta.kv_crc32c"
 # Version, payload CRC32C, full SHA-256 namespace digest, key length; then key.
@@ -452,12 +477,27 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
                             }
                             for group in offloading_spec.kv_cache_config.kv_cache_groups
                         ],
-                        "tensors": offloading_spec.kv_cache_config.kv_cache_tensors,
+                        "tensors": _persistent_kv_tensors(
+                            offloading_spec.kv_cache_config
+                        ),
                         "primary_shape": primary_kv_view.shape[1:],
                         "primary_strides": primary_kv_view.strides,
                         "primary_format": primary_kv_view.format,
                         "block_size_factor": offloading_spec.block_size_factor,
                         "layout": getattr(offloading_spec, "persistent_layout", None),
+                        **(
+                            {
+                                "split_layout_version": 1,
+                                "block_segments": (
+                                    offloading_spec.kv_cache_config.block_segments
+                                ),
+                            }
+                            if getattr(
+                                offloading_spec.kv_cache_config, "block_segments", None
+                            )
+                            is not None
+                            else {}
+                        ),
                     }
                 ),
             }

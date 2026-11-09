@@ -3250,10 +3250,13 @@ def get_long_context_geometry(
         )
     parallel = vllm_config.parallel_config
     transfer = getattr(vllm_config, "kv_transfer_config", None)
-    if transfer is not None and transfer.kv_connector != "OffloadingConnector":
+    if transfer is not None and (
+        transfer.kv_connector != "OffloadingConnector"
+        or getattr(transfer, "kv_connector_module_path", None) is not None
+    ):
         raise ValueError(
             "kernel_config.long_context_kv requires OffloadingConnector "
-            "when KV transfer is enabled."
+            "with its built-in implementation when KV transfer is enabled."
         )
     if parallel.pipeline_parallel_size > 1:
         raise ValueError(

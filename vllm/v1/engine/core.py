@@ -185,6 +185,9 @@ class EngineCore:
             )
             if host_scheduler.host_kv_ssd is not None and connector_scheduler:
                 connector_scheduler.host_page_ssd = host_scheduler.host_kv_ssd
+                unified = getattr(connector_scheduler, "unified", None)
+                if unified is not None:
+                    unified.attach_ssd(host_scheduler.host_kv_ssd)
         if self.scheduler.connector is not None:  # type: ignore
             self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore
 

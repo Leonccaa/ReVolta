@@ -1,8 +1,201 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import pytest
+
+from tests.v1.core.test_async_scheduler import _make_model_runner_output
 from tests.v1.core.test_history_shared_region import _host_scheduler
 from tests.v1.core.test_long_context_admission import make_requests
 from tests.v1.core.test_scheduler_kv_capacity import step
+from tests.v1.core.utils import create_requests, create_scheduler
+
+
+@pytest.mark.parametrize("hybrid", [False, True], ids=["single-group", "hybrid"])
+@pytest.mark.parametrize("async_scheduling", [False, True], ids=["sync", "async"])
+def test_first_token_accounting_after_reset(hybrid, async_scheduling, monkeypatch):
+    from tests.v1.core.test_long_context_admission import build
+    from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    if hybrid:
+        # Plan the deployed QSA/GDN geometry with the async in-flight allowance.
+        base = build(None, async_scheduling=async_scheduling)
+        scheduler_cls = AsyncScheduler if async_scheduling else Scheduler
+        scheduler = scheduler_cls(
+            vllm_config=base.vllm_config,
+            kv_cache_config=base.kv_cache_config,
+            structured_output_manager=base.structured_output_manager,
+            block_size=16,
+            hash_block_size=16,
+            log_stats=True,
+        )
+        assert len(scheduler.kv_cache_config.kv_cache_groups) > 1
+        (request,) = make_requests(1, 128, 3, tag="reset-metrics")
+    else:
+        scheduler = create_scheduler(
+            async_scheduling=async_scheduling, enable_prefix_caching=True
+        )
+        (request,) = create_requests(num_requests=1, num_tokens=64, max_tokens=3)
+
+    assert scheduler.vllm_config.observability_config.enable_store_metrics
+    metrics = scheduler.store_metrics
+    assert metrics is not None
+    metrics.next_export = float("inf")
+    now = 100.0
+    monkeypatch.setattr("vllm.v1.core.sched.scheduler.time.monotonic", lambda: now)
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    if async_scheduling:
+        assert request.num_output_placeholders == 1
+        assert scheduler.reset_prefix_cache(reset_running_requests=True)
+        assert request.async_tokens_to_discard == 1
+        now = 110.0
+        scheduler.update_from_output(output, _make_model_runner_output(output))
+        assert request.async_tokens_to_discard == 0
+        assert request.num_output_tokens == 0
+        assert not request.store_attempt.first_token
+        assert not metrics.observations
+        assert not any(
+            count
+            for name, count in metrics.counters.items()
+            if name.startswith("prompt_tokens_")
+        )
+        output = scheduler.schedule()
+
+    now = 120.0
+    scheduler.update_from_output(output, _make_model_runner_output(output))
+    assert request.num_output_tokens == 1
+    assert request.store_attempt.first_token
+    assert [item for item in metrics.observations if item[0] == "ttft"] == [
+        ("ttft", "compute", 20.0)
+    ]
+    assert (
+        sum(
+            count
+            for name, count in metrics.counters.items()
+            if name.startswith("prompt_tokens_")
+        )
+        == request.num_prompt_tokens
+    )
+    first_counters = metrics.counters.copy()
+    first_observations = list(metrics.observations)
+    while scheduler.has_unfinished_requests():
+        now += 10.0
+        output = scheduler.schedule()
+        scheduler.update_from_output(output, _make_model_runner_output(output))
+    assert request.num_output_tokens == 3
+    assert metrics.counters == first_counters
+    assert list(metrics.observations) == first_observations
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True], ids=["sync", "async"])
+def test_first_token_accounting_precedes_streaming_turn_end(
+    async_scheduling, monkeypatch
+):
+    scheduler = create_scheduler(
+        async_scheduling=async_scheduling, enable_prefix_caching=True
+    )
+    (request,) = create_requests(num_requests=1, num_tokens=64, max_tokens=1)
+    request.resumable = True
+    metrics = scheduler.store_metrics
+    assert metrics is not None
+    metrics.next_export = float("inf")
+    end_turn = scheduler._end_streaming_turn
+    ended = []
+
+    def checked_end_turn(request, status_before_stop):
+        assert request.store_attempt.first_token
+        assert metrics.counters["prompt_tokens_compute"] == request.num_prompt_tokens
+        assert sum(phase == "ttft" for phase, _, _ in metrics.observations) == 1
+        ended.append(request.request_id)
+        end_turn(request, status_before_stop)
+
+    monkeypatch.setattr(scheduler, "_end_streaming_turn", checked_end_turn)
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    scheduler.update_from_output(output, _make_model_runner_output(output))
+    assert ended == [request.request_id]
+    assert request.num_output_tokens == 1
+
+
+def test_hybrid_failed_receive_relooks_up_retained_local_prefix():
+    from tests.v1.kv_connector.unit.offloading_connector.test_host_receive_txn import (
+        SPAN,
+        publish_sources,
+        setup_receive,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+        OffloadingWorkerMetadata,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
+        OffloadingConnector,
+    )
+    from vllm.v1.metrics.stats import PrefixCacheStats
+    from vllm.v1.metrics.store import StoreMetrics
+    from vllm.v1.outputs import KVConnectorOutput
+    from vllm.v1.request import RequestStatus
+
+    scheduler, offload, request, _ = setup_receive(
+        local_blocks=2, keep_local_state=True
+    )
+    publish_sources(scheduler, request, (2, 3))
+    connector = object.__new__(OffloadingConnector)
+    connector.connector_scheduler, connector.connector_worker = offload, None
+    scheduler.connector = connector
+    scheduler.log_stats = scheduler.kv_cache_manager.log_stats = True
+    scheduler.kv_cache_manager.prefix_cache_stats = PrefixCacheStats()
+    scheduler.connector_prefix_cache_stats = PrefixCacheStats()
+    metrics = scheduler.store_metrics = offload.store_metrics = StoreMetrics()
+    metrics.next_export = float("inf")
+    scheduler.current_step = 1
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    attempt = request.store_attempt
+    assert attempt.local == 2 * SPAN
+    assert attempt.external == 2 * SPAN
+    job_id = next(iter(output.kv_connector_metadata.load_jobs))
+    table = scheduler.host_history_pool.host_pages
+    receipt = KVConnectorOutput(
+        finished_recving={request.request_id},
+        kv_connector_worker_meta=OffloadingWorkerMetadata(
+            receive_results={job_id: (table.all_ranks, 1)},
+            completed_jobs={job_id: 4},
+            completed_steps={2: table.all_ranks},
+        ),
+    )
+    scheduler.update_host_kv_output(receipt)
+    scheduler._update_from_kv_xfer_finished(receipt)
+    assert request.num_computed_tokens == 0
+    assert request.request_id in scheduler.failed_recving_kv_req_ids
+    assert scheduler._try_promote_blocked_waiting_request(request)
+    assert request.num_computed_tokens == 0
+    assert all(
+        not ids for ids in scheduler.kv_cache_manager.get_block_ids(request.request_id)
+    )
+    assert request.prefix_cache_attempt > attempt.attempt
+    assert not attempt.first_token
+
+    while scheduler.has_unfinished_requests():
+        step(scheduler)
+    fresh = request.store_attempt
+    assert fresh is not attempt
+    assert fresh.lookup == {"local", "external"}
+    assert fresh.local == 2 * SPAN
+    assert fresh.external == 0
+    assert metrics.counters["prompt_tokens_host_reuse"] == 2 * SPAN
+    assert (
+        metrics.counters["prompt_tokens_compute"]
+        == request.num_prompt_tokens - 2 * SPAN
+    )
+    assert (
+        sum(
+            count
+            for name, count in metrics.counters.items()
+            if name.startswith("prompt_tokens_")
+        )
+        == request.num_prompt_tokens
+    )
+    assert sum(phase == "ttft" for phase, _, _ in metrics.observations) == 1
 
 
 def test_lookup_retries_do_not_inflate_admitted_prefix_tokens(monkeypatch):

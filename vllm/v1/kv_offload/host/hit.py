@@ -57,6 +57,7 @@ class HostKVHitManager:
         self.rule = GroupHitRule(group_id, HitNeed.PREFIX, block_tokens)
         self._gpu_binding_ready = gpu_binding_ready
         self.local_only = False
+        self.release_components: Callable[[str], None] = lambda req_id: None
         self._pending: dict[str, HostKVPrefix] = {}
         self._active: dict[str, HostKVPrefix] = {}
         self._reuse: dict[str, tuple[ReceiveEntry, ...]] = {}
@@ -103,6 +104,13 @@ class HostKVHitManager:
             self.rule.group_id, self.probe, block_size=self.rule.block_size
         )
         connector.host_kv_hits = self
+        from vllm.v1.kv_offload.unified.manager import UnifiedStoreManager
+
+        if self.history_pool is not None and isinstance(
+            connector.manager, UnifiedStoreManager
+        ):
+            connector.manager.attach(self.history_pool)
+            self.release_components = connector.manager.release_lookup
 
     @classmethod
     def attach(
@@ -441,6 +449,7 @@ class HostKVHitManager:
             self.history_pool.host_pages.finish_io(handle, txn.attempt_id)
 
     def release_lookup(self, request_id: str) -> None:
+        self.release_components(request_id)
         prefix = self._pending.pop(request_id, None)
         if prefix is not None:
             prefix.release()

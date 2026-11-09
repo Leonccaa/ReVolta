@@ -6,12 +6,16 @@ Hashes name published immutable content. Every owner and completion instead
 names a physical incarnation, so invalidating a hash never retires DMA.
 """
 
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from enum import Enum
 from heapq import heapify, heappop, heappush
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from vllm.v1.kv_offload.unified.ledger import HostReservationLedger
 
 from vllm.v1.kv_offload.base import OffloadKey, get_offload_group_idx
 
@@ -100,6 +104,18 @@ class HostPage:
     kind: PageKind = PageKind.MAIN
     group: int = 0
     revision: int = 0
+    lru_clock: int = 0
+
+
+class PageValuePolicy(Protocol):
+    def refresh(self, page: HostPage) -> None: ...
+    def published(self, page: HostPage) -> None: ...
+    def lost(self, page: HostPage) -> None: ...
+    def persisted(self, page: HostPage) -> None: ...
+    def reset(self) -> None: ...
+    def ssd_lost(self, key: OffloadKey, handle: PageHandle) -> None: ...
+    def order(self, page: HostPage) -> tuple[int, int]: ...
+    def select(self, pending: int, writeback: bool) -> HostPage | None: ...
 
 
 class PersistenceHooks(Protocol):
@@ -170,6 +186,17 @@ class HostPageTable:
         # readbacks, protected successors). Background IO may only consume
         # pages beyond it . page ownership has no such reservation.
         self.committed_reserve: Callable[[], int] = lambda: 0
+        self.reservation_ledger: HostReservationLedger | None = None
+        self.kind_for_key: Callable[[OffloadKey], PageKind] = lambda key: PageKind.MAIN
+        self.value_policy: PageValuePolicy | None = None
+        self._lru_clock = 0
+        self.dma_bytes: Counter[str] = Counter()
+
+    def refresh_value(self, handle: PageHandle) -> None:
+        """Logical references and SSD evidence share incremental reclamation's revision
+        boundary."""
+        with suppress(ValueError):
+            self._refresh(self.get(handle))
 
     def get(self, handle: PageHandle) -> HostPage:
         if not 0 <= handle.page_id < len(self.pages):
@@ -260,7 +287,8 @@ class HostPageTable:
                 (min(r.retire_after for r in page.retirements), *identity),
             )
             self._retiring_live.add(pid)
-        if self.reclaimable(page):
+        reclaimable = self.reclaimable(page)
+        if reclaimable:
             self._candidates.add(pid)
             if page.state != PageState.READY:
                 self._auto.add(pid)
@@ -270,6 +298,18 @@ class HostPageTable:
                 heap[:] = [entry for entry in heap if self._current(entry)]
                 heapify(heap)
                 self.heap_compactions += 1
+        # The revision above invalidates old heap entries for every event.
+        # Payment retirement and heap insertion only become possible once
+        # the physical owners have actually retired.
+        if reclaimable and self.reservation_ledger is not None:
+            self.reservation_ledger.owner_changed(page.handle)
+        if reclaimable and self.value_policy is not None:
+            self.value_policy.refresh(page)
+
+    def describe(self, handle: PageHandle, kind: PageKind, group: int) -> None:
+        page = self.get(handle)
+        page.kind, page.group = kind, group
+        self._refresh(page)
 
     def touch(self, handle: PageHandle, step: int) -> None:
         """Record an access without changing the canonical LRU order."""
@@ -296,11 +336,15 @@ class HostPageTable:
         if page.key is not None and self.index.get(page.key) == handle:
             del self.index[page.key]
         page.valid = False
+        if self.value_policy is not None:
+            self.value_policy.lost(page)
         self._refresh(page)
 
     def _recycle(self, page: HostPage) -> None:
         assert self.reclaimable(page)
         handle = page.handle
+        if self.value_policy is not None:
+            self.value_policy.lost(page)
         if page.key is not None and self.index.get(page.key) == handle:
             del self.index[page.key]
         self._lru.pop(handle.page_id, None)
@@ -353,6 +397,14 @@ class HostPageTable:
         if loading_key is not None and loading_key in self.index:
             return None
         self.collect()
+        if not self._free and self.value_policy is not None:
+            victim = self.value_policy.select(pending, writeback)
+            if victim is not None:
+                if self.persistence is not None:
+                    self.persistence.on_evict(victim)
+                self._recycle(victim)
+            if not self._free:
+                return None
         if not self._free:
             hooks = self.persistence if writeback else None
             headroom: int | None = None
@@ -381,6 +433,7 @@ class HostPageTable:
         page.key = loading_key
         if loading_key is not None:
             page.group = get_offload_group_idx(loading_key)
+            page.kind = self.kind_for_key(loading_key)
             self.index[loading_key] = page.handle
             self._lru[page.handle.page_id] = None
         self._refresh(page)
@@ -389,6 +442,9 @@ class HostPageTable:
     def bind(self, handle: PageHandle, hid: int, hgen: int, step: int = 0) -> None:
         page = self.get(handle)
         page.binds[hid, hgen] = "inuse"
+        ledger = self.reservation_ledger
+        if ledger is not None and handle in ledger.main_pending:
+            ledger.release_temporary(ledger.main_pending.pop(handle))
         if page.state == PageState.PRIVATE and page.writer is None:
             page.writer = (hid, hgen, step)
         self._refresh(page)
@@ -406,6 +462,8 @@ class HostPageTable:
     def pin(self, handle: PageHandle, lease_id: int) -> None:
         page = self.get(handle)
         page.leases.add(lease_id)
+        self._lru_clock += 1
+        page.lru_clock = self._lru_clock
         self._refresh(page)
         if handle.page_id in self._lru:
             self._lru.move_to_end(handle.page_id)
@@ -445,6 +503,11 @@ class HostPageTable:
         if page.state == PageState.READY:
             self.index[key] = handle
             self._lru[handle.page_id] = None
+            self._lru_clock += 1
+            page.lru_clock = self._lru_clock
+            if self.value_policy is not None:
+                self.value_policy.published(page)
+                self._refresh(page)
             if self.persistence is not None:
                 self.persistence.on_published(handle)
         return page.state == PageState.READY
@@ -467,6 +530,8 @@ class HostPageTable:
             page.persisted_epoch = handle.epoch
             self.persisted_pages += 1
             self._refresh(page)
+            if self.value_policy is not None:
+                self.value_policy.published(page)
             return True
         if page.key is not None and self.index.get(page.key) == handle:
             del self.index[page.key]
@@ -487,7 +552,16 @@ class HostPageTable:
             page.persisted_epoch = handle.epoch
             self.persisted_pages += 1
             self._refresh(page)
+            if self.value_policy is not None:
+                self.value_policy.persisted(page)
         return True
+
+    def unpersist(self, handle: PageHandle) -> None:
+        page = self.get(handle)
+        if self.is_persisted(page):
+            self.persisted_pages -= 1
+            page.persisted_epoch = None
+            self._refresh(page)
 
     def open_seal(
         self, handle: PageHandle, hid: int, hgen: int, key: OffloadKey, step: int
@@ -513,7 +587,12 @@ class HostPageTable:
         return ticket
 
     def seal_result(
-        self, ticket: SealTicket, completed: int, failed: int, compute_failed: int = 0
+        self,
+        ticket: SealTicket,
+        completed: int,
+        failed: int,
+        compute_failed: int = 0,
+        dma_bytes: dict[int, int] | None = None,
     ) -> bool:
         try:
             page = self.get(ticket.handle)
@@ -525,6 +604,16 @@ class HostPageTable:
             raise ValueError("Unknown worker rank in seal receipt")
         if (failed | compute_failed) & ~completed:
             raise ValueError("Failure must have a retired rank receipt")
+        if dma_bytes is not None:
+            if any(
+                not 0 <= rank < self.num_workers or nbytes < 0
+                for rank, nbytes in dma_bytes.items()
+            ):
+                raise ValueError("Invalid seal DMA bytes")
+            fresh = completed & ~page.completed_ranks & ~failed
+            self.dma_bytes["dma_d2h_main"] += sum(
+                nbytes for rank, nbytes in dma_bytes.items() if fresh & (1 << rank)
+            )
         page.completed_ranks |= completed
         page.failed_ranks |= failed
         if compute_failed:
@@ -558,6 +647,8 @@ class HostPageTable:
         self.ssd_epoch += 1
         if self.persistence is not None:
             self.persistence.on_reset()
+        if self.value_policy is not None:
+            self.value_policy.reset()
         for page in self.pages[self._first :]:
             # unbind may collect another private page from this snapshot.
             if self.pages[page.handle.page_id] is not page:

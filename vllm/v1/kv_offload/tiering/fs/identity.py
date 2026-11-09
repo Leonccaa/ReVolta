@@ -34,6 +34,36 @@ def canonical_digest(value) -> str:
     return hashlib.sha256(data.encode()).hexdigest()
 
 
+def _kernel_identity(config):
+    """Preserve pre-unified host budgeting identities for legacy and disabled
+    configurations.
+
+    Dataclass normalization includes optional fields, even None. Adding the
+    inert host_store_gib field must not change existing MAIN file names or
+    prefix seeds. An explicitly changed active configuration retains the
+    existing full-configuration identity contract.
+    """
+    value = normalize_value(config)
+
+    def legacy(node):
+        if isinstance(node, tuple):
+            if len(node) == 2 and node[0] == "vllm.config.kernel.LongContextKVConfig":
+                fields = dict(node[1])
+                return (
+                    node[0],
+                    tuple(
+                        item
+                        for item in node[1]
+                        if item[0] != "host_store_gib"
+                        or (fields.get("enabled", False) and item[1] is not None)
+                    ),
+                )
+            return tuple(legacy(part) for part in node)
+        return node
+
+    return legacy(value)
+
+
 def _fields(config, names: tuple[str, ...]) -> dict:
     return {name: getattr(config, name, None) for name in names}
 
@@ -385,7 +415,7 @@ def get_revolta_identity(
                 ),
             ),
             "attention": getattr(vllm_config, "attention_config", None),
-            "kernel": getattr(vllm_config, "kernel_config", None),
+            "kernel": _kernel_identity(getattr(vllm_config, "kernel_config", None)),
             "additional": getattr(vllm_config, "additional_config", None),
             "compile_hash": vllm_config.compute_hash(),
         }

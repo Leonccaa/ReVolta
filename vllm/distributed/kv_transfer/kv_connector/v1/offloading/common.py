@@ -24,6 +24,7 @@ class TransferJob:
 
     req_id: ReqId
     transfer_spec: TransferSpec
+    generation: int | None = None
 
 
 @dataclass
@@ -50,6 +51,7 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
     # in completed_jobs so the scheduler releases its bookkeeping as usual.
     failed_jobs: dict[int, int] = field(default_factory=dict)
     seal_results: dict[SealTicket, tuple[int, int, int]] = field(default_factory=dict)
+    seal_bytes: dict[SealTicket, dict[int, int]] = field(default_factory=dict)
     completed_steps: dict[int, int] = field(default_factory=dict)
     # value arbitration hot-side arbitration counters: step -> (rank mask, summed
     # values),
@@ -57,6 +59,9 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
     value_counters: dict[int, tuple[int, tuple[int, ...]]] = field(default_factory=dict)
     # ReceiveTxn attempts use rank masks across steps and duplicate outputs.
     receive_results: dict[int, tuple[int, int]] = field(default_factory=dict)
+
+    job_results: dict[tuple[int, int], tuple[int, int]] = field(default_factory=dict)
+    job_bytes: dict[tuple[int, int, int, str], int] = field(default_factory=dict)
 
     def mark_completed(self, job_id: int) -> None:
         """Record a transfer job completion from this worker."""
@@ -82,6 +87,9 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
         for ticket, masks in other.seal_results.items():
             old = seals.get(ticket, (0, 0, 0))
             seals[ticket] = (old[0] | masks[0], old[1] | masks[1], old[2] | masks[2])
+        seal_bytes = {t: ranks.copy() for t, ranks in self.seal_bytes.items()}
+        for ticket, byte_ranks in other.seal_bytes.items():
+            seal_bytes[ticket] = seal_bytes.get(ticket, {}) | byte_ranks
         steps = dict(self.completed_steps)
         for step, ranks in other.completed_steps.items():
             steps[step] = steps.get(step, 0) | ranks
@@ -104,10 +112,17 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
         for attempt, (completed, failed_ranks) in other.receive_results.items():
             prior = receives.get(attempt, (0, 0))
             receives[attempt] = (prior[0] | completed, prior[1] | failed_ranks)
+        jobs = dict(self.job_results)
+        for identity, job_masks in other.job_results.items():
+            prior = jobs.get(identity, (0, 0))
+            jobs[identity] = (prior[0] | job_masks[0], prior[1] | job_masks[1])
         return OffloadingWorkerMetadata(
+            job_results=jobs,
+            job_bytes=self.job_bytes | other.job_bytes,
             completed_jobs=merged,
             failed_jobs=failed,
             seal_results=seals,
+            seal_bytes=seal_bytes,
             completed_steps=steps,
             value_counters=counters,
             receive_results=receives,

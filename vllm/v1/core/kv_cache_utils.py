@@ -3450,6 +3450,40 @@ def _plan_long_context_kv(
         )
     if settings.main_kv_placement == "host":
         _check_host_main_kv(vllm_config, workers[0][0])
+        transfer = vllm_config.kv_transfer_config
+        extra = getattr(transfer, "kv_connector_extra_config", {})
+        legacy_cpu = extra.get("cpu_bytes_to_use")
+        if legacy_cpu is not None and (
+            isinstance(legacy_cpu, bool)
+            or not isinstance(legacy_cpu, int)
+            or legacy_cpu <= 0
+        ):
+            raise ValueError("cpu_bytes_to_use must be positive integral bytes")
+        if settings.host_store_gib is not None:
+            if legacy_cpu is not None:
+                raise ValueError("host_store_gib conflicts with cpu_bytes_to_use")
+        elif legacy_cpu is not None:
+            # legacy-budget conversion: only host placement has two physical legacy
+            # budgets.
+            # Do not mutate configuration or compound this conversion across
+            # worker planning calls. Token-sized legacy pools use the same ABI.
+            geometry = next(iter(geometries))
+            assert (
+                settings.host_pool_gib is not None
+                or settings.host_pool_tokens is not None
+            )
+            legacy_host = (
+                int(settings.host_pool_gib * (1 << 30))
+                if settings.host_pool_gib is not None
+                else ((settings.host_pool_tokens or 0) // geometry.block_tokens)
+                * geometry.host_bytes_per_block
+            )
+            settings = replace(
+                settings,
+                host_pool_gib=None,
+                host_pool_tokens=None,
+                host_store_gib=(legacy_host + int(legacy_cpu)) / (1 << 30),
+            )
     plan = plan_long_context_capacity(
         settings,
         geometries.pop(),

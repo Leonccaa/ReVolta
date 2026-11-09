@@ -296,6 +296,9 @@ class HistoryBlockPool(BlockPool):
         """
         table = self.host_pages
         count = table.available()
+        ledger = table.reservation_ledger
+        if ledger is not None:
+            count -= sum(c.unused for c in ledger.requests.values())
         pages: dict[int, list[int]] = {}
         block = self.free_block_queue.fake_free_list_head.next_free_block
         tail = self.free_block_queue.fake_free_list_tail
@@ -348,14 +351,26 @@ class HistoryBlockPool(BlockPool):
             if handle is not None:
                 pages.setdefault(handle.page_id, []).append(block)
             block = block.next_free_block
-        for blocks in pages.values():
-            if self._cached_page_reclaimable([b.block_id for b in blocks]):
-                for victim in blocks:
-                    self.free_block_queue.remove(victim)
-                    self._maybe_evict_cached_block(victim)
-                    self.stats["cached_evicted_for_host"] += 1
-                    self._to_donated(victim)
-                return True
+        candidates = [
+            blocks
+            for blocks in pages.values()
+            if self._cached_page_reclaimable([b.block_id for b in blocks])
+        ]
+        policy = self.host_pages.value_policy
+        if policy is not None:
+            candidates = sorted(
+                candidates,
+                key=lambda blocks: policy.order(
+                    self.host_pages.get(self.bindings[blocks[0].block_id])
+                ),
+            )
+        for blocks in candidates:
+            for victim in blocks:
+                self.free_block_queue.remove(victim)
+                self._maybe_evict_cached_block(victim)
+                self.stats["cached_evicted_for_host"] += 1
+                self._to_donated(victim)
+            return True
         return False
 
     def _reserve_page(self, pending: int = 1) -> PageHandle | None:
@@ -363,6 +378,13 @@ class HistoryBlockPool(BlockPool):
         only by retired cached bindings and retry. The unbound READY page is
         then recycled by the table's LRU scan, so it passes the host SSD persistence
         pre-eviction write-back/evict hooks like any other READY page."""
+        ledger = self.host_pages.reservation_ledger
+        if ledger is not None:
+            handles = ledger.reserve_frames(1, "main", reserved=True, pending=pending)
+            if handles is None:
+                return None
+            ledger.main_pending[handles[0]] = handles
+            return handles[0]
         handle = self.host_pages.reserve(pending=pending)
         while handle is None and self.elastic and self._reclaim_cached_page():
             handle = self.host_pages.reserve(pending=pending)
@@ -440,6 +462,9 @@ class HistoryBlockPool(BlockPool):
         # with
         # its source-aware four-domain admission contract.
         available = self.host_pages.available()
+        ledger = self.host_pages.reservation_ledger
+        if ledger is not None:
+            available -= sum(c.unused for c in ledger.requests.values())
         count = 0
         block = self.free_block_queue.fake_free_list_head.next_free_block
         tail = self.free_block_queue.fake_free_list_tail

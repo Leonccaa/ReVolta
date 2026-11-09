@@ -213,6 +213,8 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
         Returns:
             TieringOffloadingManager instance
         """
+        if getattr(self, "unified_host", False):
+            return self._get_unified_manager()
         if not self._manager:
             kv_events_config = self.vllm_config.kv_events_config
             enable_events = (
@@ -299,6 +301,8 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
 
     @override
     def create_handlers(self, kv_caches: CanonicalKVCaches) -> CpuGpuOffloadingHandlers:
+        if getattr(self, "unified_host", False):
+            return super().create_handlers(kv_caches)
         world_size = self.vllm_config.parallel_config.world_size
         rank = torch.accelerator.current_device_index()
         if self.partition_by_group:

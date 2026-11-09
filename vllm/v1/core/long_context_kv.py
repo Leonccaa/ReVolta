@@ -645,10 +645,9 @@ def plan_long_context_capacity(
     if settings.host_pool_tokens is not None:
         host_blocks = settings.host_pool_tokens // geometry.block_tokens
     else:
-        assert settings.host_pool_gib is not None
-        host_blocks = int(settings.host_pool_gib * GiB) // (
-            geometry.host_bytes_per_block
-        )
+        host_gib = settings.host_store_gib or settings.host_pool_gib
+        assert host_gib is not None
+        host_blocks = int(host_gib * GiB) // (geometry.host_bytes_per_block)
     host_bytes = host_blocks * geometry.host_bytes_per_block
 
     staging = int(settings.prefill_staging_gib * GiB)
@@ -949,9 +948,13 @@ class LongContextAdmissionLedger:
                 # cover the need (admit runs for every allocating request on
                 # every step; most decode steps need no fresh page).
                 fresh = demand[domain] - pool.host_kept_free()
+                free_frames = pool.host_pages.num_free()
+                unified = pool.host_pages.reservation_ledger
+                if unified is not None:
+                    free_frames -= sum(c.unused for c in unified.requests.values())
                 if (
                     fresh > 0
-                    and fresh > pool.host_pages.num_free()
+                    and fresh > free_frames
                     and fresh > pool.host_reclaimable_after()
                 ):
                     return domain

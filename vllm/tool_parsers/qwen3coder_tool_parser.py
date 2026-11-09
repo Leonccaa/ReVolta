@@ -138,6 +138,8 @@ class Qwen3CoderToolParser(ToolParser):
         self._string_waiting_space = False
         self._has_streamed_string = False
         self._string_waiting_header = False
+        self._fallback_text = ""
+        self._content_chars_sent = 0
 
     def _convert_param_value(
         self, param_value: str, param_name: str, param_config: dict, func_name: str
@@ -600,6 +602,10 @@ class Qwen3CoderToolParser(ToolParser):
             content_index = content_index if content_index >= 0 else idx
             content = model_output[:content_index]  # .rstrip()
             valid_tool_calls = [tc for tc in tool_calls if tc is not None]
+            if not valid_tool_calls:
+                return ExtractedToolCallInformation(
+                    tools_called=False, tool_calls=[], content=model_output
+                )
             return ExtractedToolCallInformation(
                 tools_called=(len(valid_tool_calls) > 0),
                 tool_calls=valid_tool_calls,
@@ -746,6 +752,128 @@ class Qwen3CoderToolParser(ToolParser):
         )
 
     def extract_tool_calls_streaming(
+        self,
+        previous_text: str,
+        current_text: str,
+        delta_text: str,
+        previous_token_ids: Sequence[int],
+        current_token_ids: Sequence[int],
+        delta_token_ids: Sequence[int],
+        request: ChatCompletionRequest,
+    ) -> DeltaMessage | None:
+        result = DeltaMessage()
+        calls: dict[int, DeltaToolCall] = {}
+        initial_previous_text = previous_text
+        # Like ParserEngine's feed loop, consume every available transition.
+        # A delta may contain the opener, several calls and their closing tags.
+        while True:
+            before = self._streaming_progress()
+            delta = self._extract_tool_calls_streaming(
+                previous_text,
+                current_text,
+                delta_text,
+                previous_token_ids,
+                current_token_ids,
+                delta_token_ids,
+                request,
+            )
+            if delta is not None:
+                if delta.content is not None:
+                    result.content = (result.content or "") + delta.content
+                for call in delta.tool_calls:
+                    if call.index not in calls:
+                        calls[call.index] = call
+                    elif call.function is not None:
+                        function = calls[call.index].function
+                        assert function is not None
+                        function.arguments = (function.arguments or "") + (
+                            call.function.arguments or ""
+                        )
+                if delta.tool_calls and self.header_sent and not self.json_started:
+                    tool_start = self._tool_start_positions(current_text)[
+                        self.current_tool_index
+                    ]
+                    function_start = current_text.find(
+                        self.tool_call_prefix, tool_start
+                    )
+                    header_end = current_text.find(">", function_start)
+                    if (
+                        function_start < len(initial_previous_text)
+                        and not current_text[header_end + 1 :].strip()
+                    ):
+                        # Keep an existing incremental header-only event. A
+                        # new opener/body burst still drains in this delta.
+                        break
+            if before == self._streaming_progress() or self.current_tool_index >= len(
+                self._tool_start_positions(current_text)
+            ):
+                break
+            # Revisit the buffer without replaying its prefix or resetting state.
+            previous_text = current_text
+            previous_token_ids = current_token_ids
+        result.tool_calls = list(calls.values())
+        if self.in_function and self.current_tool_index < len(self.prev_tool_call_arr):
+            # An unfinished XML call has only the bytes already emitted, not
+            # the placeholder {}. Chat must not invent a closing brace on length.
+            self.prev_tool_call_arr[self.current_tool_index]["arguments"] = (
+                self.streamed_args_for_tool[self.current_tool_index]
+            )
+        # Until the first call is committed, all emitted content is a prefix
+        # of current_text. Remember the rest, including partial marker suffixes.
+        self._fallback_text = current_text
+        if result is not None and result.content:
+            self._content_chars_sent += len(result.content)
+        return result if result.content is not None or result.tool_calls else None
+
+    def _streaming_progress(
+        self,
+    ) -> tuple[int, bool, bool, bool, bool, bool, int, int, int]:
+        return (
+            self.current_tool_index,
+            self.is_tool_call_started,
+            self.header_sent,
+            self.in_function,
+            self.json_started,
+            self.json_closed,
+            self.param_count,
+            self._string_sent_to,
+            self.json_tool_calls_streamed,
+        )
+
+    def finish_streaming(self) -> DeltaMessage | None:
+        # A header/argument already sent cannot be rolled back into text.
+        if self.prev_tool_call_arr:
+            return None
+        if self.streaming_request is not None:
+            parsed = self.extract_tool_calls(
+                self._fallback_text, self.streaming_request
+            )
+            if parsed.tools_called:
+                self.streamed_args_for_tool = [
+                    call.function.arguments for call in parsed.tool_calls
+                ]
+                content = (parsed.content or "")[self._content_chars_sent :]
+                self._content_chars_sent = len(self._fallback_text)
+                return DeltaMessage(
+                    content=content or None,
+                    tool_calls=[
+                        DeltaToolCall(
+                            index=index,
+                            id=call.id,
+                            type="function",
+                            function=DeltaFunctionCall(
+                                name=call.function.name,
+                                arguments=call.function.arguments,
+                            ),
+                        )
+                        for index, call in enumerate(parsed.tool_calls)
+                    ],
+                )
+        pending = self._fallback_text[self._content_chars_sent :]
+        self._content_chars_sent = len(self._fallback_text)
+        return DeltaMessage(content=pending) if pending else None
+
+    def _extract_tool_calls_streaming(
         self,
         previous_text: str,
         current_text: str,

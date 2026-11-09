@@ -321,6 +321,8 @@ class Parser:
         delta_token_ids: list[int],
         request: ChatCompletionRequest | ResponsesRequest,
         prompt_token_ids: list[int] | None = None,
+        *,
+        finished: bool = False,
     ) -> DeltaMessage | None:
         """Parse a single streaming delta, orchestrating reasoning then
         tool call extraction via internal stream state.
@@ -682,6 +684,8 @@ class DelegatingParser(Parser):
         delta_token_ids: list[int],
         request: ChatCompletionRequest | ResponsesRequest,
         prompt_token_ids: list[int] | None = None,
+        *,
+        finished: bool = False,
     ) -> DeltaMessage | None:
         state = self._stream_state
 
@@ -785,6 +789,19 @@ class DelegatingParser(Parser):
 
         state.previous_text = current_text
         state.previous_token_ids = current_token_ids
+
+        # Follow upstream #44017's finish propagation and the engine adapters'
+        # finish_streaming hook, so every serving entry point shares cleanup.
+        if finished and self._in_tool_call_phase(state):
+            assert self._tool_parser is not None
+            flush_delta = self._tool_parser.finish_streaming()
+            if flush_delta is not None:
+                if delta_message is None:
+                    delta_message = flush_delta
+                else:
+                    delta_message.content = (delta_message.content or "") + (
+                        flush_delta.content or ""
+                    )
         return delta_message
 
 

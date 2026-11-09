@@ -729,6 +729,7 @@ class OpenAIServingChat(OpenAIServing):
                             delta_token_ids=as_list(output.token_ids),
                             request=request,
                             prompt_token_ids=res.prompt_token_ids,
+                            finished=output.finish_reason is not None,
                         )
                         if delta_message and delta_message.tool_calls:
                             tools_streamed[i] = True
@@ -852,17 +853,22 @@ class OpenAIServingChat(OpenAIServing):
                         # detected by partial parsing
                         if should_check and tool_parser and auto_tools_called:
                             latest_delta_len = 0
+                            latest_call = next(
+                                (
+                                    tc
+                                    for tc in delta_message.tool_calls
+                                    if tc.index == index
+                                ),
+                                None,
+                            )
                             if (
-                                isinstance(
-                                    delta_message.tool_calls[0].function,
+                                latest_call is not None
+                                and isinstance(
+                                    latest_call.function,
                                     DeltaFunctionCall,
                                 )
-                            ) and isinstance(
-                                delta_message.tool_calls[0].function.arguments, str
-                            ):
-                                latest_delta_len = len(
-                                    delta_message.tool_calls[0].function.arguments
-                                )
+                            ) and isinstance(latest_call.function.arguments, str):
+                                latest_delta_len = len(latest_call.function.arguments)
 
                             # get the expected call based on partial JSON
                             # parsing which "autocompletes" the JSON.
@@ -1652,21 +1658,17 @@ class OpenAIServingChat(OpenAIServing):
         Create a delta message for remaining tool arguments, preserving
         id/type/name from the original delta.
         """
-        original_tc = next(
-            (tc for tc in delta_message.tool_calls if tc.index == index),
-            None,
+        result = delta_message.model_copy(deep=True)
+        for tool_call in result.tool_calls:
+            if tool_call.index == index:
+                if tool_call.function is None:
+                    tool_call.function = DeltaFunctionCall()
+                tool_call.function.arguments = remaining_call
+                return result
+        result.tool_calls.append(
+            DeltaToolCall(
+                index=index,
+                function=DeltaFunctionCall(arguments=remaining_call),
+            )
         )
-        original_fn = original_tc.function if original_tc else None
-        return DeltaMessage(
-            tool_calls=[
-                DeltaToolCall(
-                    index=index,
-                    id=original_tc.id if original_tc else None,
-                    type=original_tc.type if original_tc else None,
-                    function=DeltaFunctionCall(
-                        name=original_fn.name if original_fn else None,
-                        arguments=remaining_call,
-                    ),
-                )
-            ]
-        )
+        return result

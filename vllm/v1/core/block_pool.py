@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable, Sequence
 from itertools import groupby
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from vllm.distributed.kv_events import (
     MEDIUM_GPU,
@@ -27,6 +27,9 @@ from vllm.v1.core.kv_cache_utils import (
     maybe_convert_block_hash,
 )
 from vllm.v1.request import Request
+
+if TYPE_CHECKING:
+    from vllm.v1.core.long_context_kv import LongContextAdmissionLedger
 
 logger = init_logger(__name__)
 
@@ -146,6 +149,10 @@ class BlockPool:
         metrics_collector: Optional metrics collector for tracking block residency.
     """
 
+    # Long-context mode only: observes reference-count transitions so the
+    # per-domain admission ledger stays exact. None leaves the pool as is.
+    admission_observer: "LongContextAdmissionLedger | None" = None
+
     def __init__(
         self,
         num_gpu_blocks: int,
@@ -180,6 +187,7 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+        self.admission_observer = None
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -359,6 +367,8 @@ class BlockPool:
                 block.ref_cnt += 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
+        if self.admission_observer is not None:
+            self.admission_observer.on_allocated(ret)
         return ret
 
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
@@ -406,11 +416,14 @@ class BlockPool:
         Args:
             blocks: A list of blocks to touch.
         """
+        observer = self.admission_observer
         for block in blocks:
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
             if block.ref_cnt == 0 and not block.is_null:
                 self.free_block_queue.remove(block)
+                if observer is not None:
+                    observer.on_acquired(block)
             block.ref_cnt += 1
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
@@ -438,6 +451,8 @@ class BlockPool:
         freed_blocks = [
             block for block in blocks_list if block.ref_cnt == 0 and not block.is_null
         ]
+        if self.admission_observer is not None:
+            self.admission_observer.on_released(freed_blocks)
         if self.enable_caching:
             # Uncached scratch has no reusable prefix to evict, and blocks a
             # sliding window has moved past (``reuse_first``) can never serve a

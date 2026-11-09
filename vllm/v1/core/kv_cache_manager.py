@@ -18,6 +18,7 @@ from vllm.v1.core.kv_cache_hit_contract import (
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.long_context_kv import LongContextAdmissionLedger
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
@@ -118,6 +119,11 @@ class KVCacheBlocks:
 
 
 class KVCacheManager:
+    # Long-context mode: joint admission over the GPU state segment, GPU
+    # history segment, host history pool and hot-page pool. Without a plan
+    # (the default) allocation is exactly the unified-pool path.
+    admission_ledger: LongContextAdmissionLedger | None = None
+
     def __init__(
         self,
         kv_cache_config: KVCacheConfig,
@@ -193,6 +199,22 @@ class KVCacheManager:
         self.empty_kv_cache_blocks = KVCacheBlocks(
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
+
+        self.admission_ledger = None
+        plan = kv_cache_config.long_context_plan
+        if plan is not None:
+            if len(plan.geometry.group_domains) != self.num_kv_cache_groups:
+                raise ValueError(
+                    "Long-context plan describes "
+                    f"{len(plan.geometry.group_domains)} KV cache groups, but "
+                    f"the scheduler has {self.num_kv_cache_groups}."
+                )
+            self.admission_ledger = LongContextAdmissionLedger(
+                plan, kv_cache_config.num_blocks
+            )
+            self.block_pool.admission_observer = self.admission_ledger
+            self.coordinator.admission_ledger = self.admission_ledger
+            logger.info("%s", plan.describe())
 
     @property
     def usage(self) -> float:
@@ -395,22 +417,37 @@ class KVCacheManager:
             self.max_model_len,
         )
 
+        ledger = self.admission_ledger
         if full_sequence_must_fit:
             # First check and fail if the full request sequence won't fit.
             full_num_tokens = min(request.num_tokens, self.max_model_len)
 
-            num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
-                request_id=request.request_id,
-                num_tokens=full_num_tokens,
-                new_computed_blocks=new_computed_block_list,
-                num_encoder_tokens=num_encoder_tokens,
-                total_computed_tokens=total_computed_tokens,
-                num_tokens_main_model=full_num_tokens,
-                apply_admission_cap=True,
-            )
+            if ledger is None:
+                num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
+                    request_id=request.request_id,
+                    num_tokens=full_num_tokens,
+                    new_computed_blocks=new_computed_block_list,
+                    num_encoder_tokens=num_encoder_tokens,
+                    total_computed_tokens=total_computed_tokens,
+                    num_tokens_main_model=full_num_tokens,
+                    apply_admission_cap=True,
+                )
+            else:
+                per_group = self.coordinator.get_num_blocks_to_allocate_per_group(
+                    request_id=request.request_id,
+                    num_tokens=full_num_tokens,
+                    new_computed_blocks=new_computed_block_list,
+                    num_encoder_tokens=num_encoder_tokens,
+                    total_computed_tokens=total_computed_tokens,
+                    num_tokens_main_model=full_num_tokens,
+                    apply_admission_cap=True,
+                )
+                num_blocks_to_allocate = sum(per_group)
             if num_blocks_to_allocate > (
                 self.block_pool.get_num_free_blocks() - reserved_blocks
             ):
+                return None
+            if ledger is not None and not ledger.admit(request, per_group):
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
@@ -433,20 +470,36 @@ class KVCacheManager:
             num_prompt_tokens=request.num_prompt_tokens,
         )
 
-        num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
-            request_id=request.request_id,
-            num_tokens=num_tokens_need_slot,
-            new_computed_blocks=new_computed_block_list,
-            num_encoder_tokens=num_encoder_tokens,
-            total_computed_tokens=num_local_computed_tokens
-            + num_external_computed_tokens,
-            num_tokens_main_model=num_tokens_main_model,
-        )
+        if ledger is None:
+            num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
+                request_id=request.request_id,
+                num_tokens=num_tokens_need_slot,
+                new_computed_blocks=new_computed_block_list,
+                num_encoder_tokens=num_encoder_tokens,
+                total_computed_tokens=num_local_computed_tokens
+                + num_external_computed_tokens,
+                num_tokens_main_model=num_tokens_main_model,
+            )
+        else:
+            per_group = self.coordinator.get_num_blocks_to_allocate_per_group(
+                request_id=request.request_id,
+                num_tokens=num_tokens_need_slot,
+                new_computed_blocks=new_computed_block_list,
+                num_encoder_tokens=num_encoder_tokens,
+                total_computed_tokens=num_local_computed_tokens
+                + num_external_computed_tokens,
+                num_tokens_main_model=num_tokens_main_model,
+            )
+            num_blocks_to_allocate = sum(per_group)
 
         if num_blocks_to_allocate > (
             self.block_pool.get_num_free_blocks() - reserved_blocks
         ):
             # Cannot allocate new blocks
+            return None
+        # Long-context mode: every domain must have room too; otherwise the
+        # scheduler waits or preempts exactly as for a full unified pool.
+        if ledger is not None and not ledger.admit(request, per_group):
             return None
 
         if (
@@ -468,6 +521,8 @@ class KVCacheManager:
             num_tokens_main_model,
             num_encoder_tokens,
         )
+        if ledger is not None:
+            ledger.commit(request)
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
@@ -496,6 +551,8 @@ class KVCacheManager:
             request: The request to free the blocks.
         """
         self.coordinator.free(request.request_id)
+        if self.admission_ledger is not None:
+            self.admission_ledger.release(request.request_id)
 
     def remove_skipped_blocks(
         self,

@@ -17,7 +17,6 @@ with the external store skipped once, and it finishes normally. Other
 requests are not touched.
 """
 
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -28,6 +27,7 @@ from tests.v1.kv_connector.unit.offloading_connector.utils import (
     generate_store_output,
 )
 from tests.v1.kv_connector.unit.utils import EOS_TOKEN_ID
+from vllm.config.kernel import LongContextKVConfig
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheGroupSpec,
@@ -71,7 +71,7 @@ def _runner(request_runner, monkeypatch, gate: str, async_scheduling: bool):
         if gate == "contract":
             config.kernel_config.qsa_cross_group_hit_check = True
         elif gate == "long_context":
-            config.kernel_config.long_context_kv = SimpleNamespace(
+            config.kernel_config.long_context_kv = LongContextKVConfig(
                 enabled=True, host_pool_gib=1.0
             )
         return config

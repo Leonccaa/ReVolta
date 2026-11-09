@@ -290,3 +290,172 @@ def test_changed_input_graph_replay_includes_append_write_gather_and_attention(e
             assert not torch.equal(first, actual)
     torch.accelerator.synchronize()
     assert torch.equal(source.cpu().view(torch.uint8), pool.host.view(torch.uint8))
+
+
+@pytest.mark.parametrize("e4m3", [False, True])
+def test_changed_length_graph_replay_reads_prewritten_rows_and_reentered_suffix(e4m3):
+    pool, source, query, selection, requests, lengths, qpos, plan = _setup(
+        e4m3, rows=1, heads=6, width=17
+    )
+    selection.fill_(-1)
+    selection[0, 0] = 60
+    lengths.fill_(61)
+    qpos.fill_(60)
+    hk, hv = pool.hot.unbind(1)
+
+    def body():
+        pool.gather(selection, requests, lengths, qpos)
+        plan.run(query, hk, hv, pool.indices, pool.hot_block_table, requests)
+
+    warm_stream = torch.cuda.Stream()
+    warm_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warm_stream):
+        body()
+    torch.cuda.current_stream().wait_stream(warm_stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        body()
+    pointers = (pool.indices.data_ptr(), pool.hot.data_ptr(), plan.output.data_ptr())
+    for reenter in (False, True):
+        if reenter:
+            lengths.fill_(61)
+            pool.truncate(lengths)
+            # Restore committed source bytes ahead of the visible frontier.
+            for req in range(pool.config.requests):
+                positions = torch.arange(
+                    61, 4096, dtype=torch.int32, device=pool.device
+                )
+                pages = pool.block_table[req, positions.long() // 32].long()
+                key = source[pages, 0, positions.long() % 32].contiguous()
+                value = source[pages, 1, positions.long() % 32].contiguous()
+                pool.write_encoded(
+                    key, value, torch.full_like(positions, req), positions
+                )
+        for length in (61, 62, 63, 64, 65, 61, 64, 129):
+            lengths.fill_(length)
+            qpos.fill_(length - 1)
+            selection[0, 0] = length - 1
+            graph.replay()
+            actual, actual_lse = plan.output.clone(), plan.lse.clone()
+            slot = int(pool.indices[0, 0]) // 4
+            page = int(pool.block_table[0, (length - 1) // 32])
+            torch.accelerator.synchronize()
+            assert torch.equal(
+                pool.hot[slot, :, (length - 1) % 4].cpu(),
+                pool.host[page, :, (length - 1) % 32],
+            )
+            expected, expected_lse = _assert_original(
+                pool, source, query, selection, requests, plan
+            )
+            assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+            assert torch.equal(
+                actual_lse.view(torch.uint8), expected_lse.view(torch.uint8)
+            )
+            assert pointers == (
+                pool.indices.data_ptr(),
+                pool.hot.data_ptr(),
+                plan.output.data_ptr(),
+            )
+
+
+@pytest.mark.parametrize("ratio", [0.1, 0.2])
+@pytest.mark.parametrize("policy", ["bucket", "lru"])
+def test_large_parallel_lru_metadata_is_graph_capturable(ratio, policy):
+    config = HostKVConfig(
+        8,
+        262144,
+        16,
+        2051,
+        1,
+        hot_ratio=ratio,
+        qsa_block_topk=512,
+        eviction_policy=policy,
+    )
+    layout = torch.empty((65536, 2, 32, 1, 256), dtype=torch.uint8, device="meta")
+    pool = ActiveHostKV(config, layout, device="cuda")
+    # This gate exercises large sort/assignment with synthetic ready payload.
+    # Native write and byte-preserving UVA are checked by the other gates.
+    pool.host.fill_(56)
+    pool.ready.fill_(1)
+    selection = torch.full((16, 2051), -1, dtype=torch.int32, device=pool.device)
+    expanded = (
+        torch.arange(512, dtype=torch.int32, device=pool.device)[:, None] * 4
+        + torch.arange(4, dtype=torch.int32, device=pool.device)
+    ).flatten()
+    selection[:, :2048] = expanded
+    requests = torch.arange(16, dtype=torch.int32, device=pool.device) % 8
+    lengths = torch.full((8,), 262144, dtype=torch.int32, device=pool.device)
+    qpos = torch.full((16,), 262143, dtype=torch.int64, device=pool.device)
+    args = (selection, requests, lengths, qpos)
+    warm_stream = torch.cuda.Stream()
+    warm_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warm_stream):
+        pool.gather(*args)
+    torch.cuda.current_stream().wait_stream(warm_stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        pool.gather(*args)
+    for step in range(6):
+        selection[:, :2048] = expanded + step * 4096 * 4
+        graph.replay()
+        assert (pool.indices[:, :2048] >= 0).all()
+        owners = pool.slot_owner[pool.slot_owner >= 0]
+        assert owners.unique().numel() == owners.numel()
+        slots = pool.group_to_slot.flatten()[owners.long()]
+        assert torch.equal(pool.slot_owner[slots.long()], owners)
+        selected_slots = pool.indices[:, :2048] // 4
+        selected_owners = pool.slot_owner[selected_slots.long()]
+        assert torch.equal(
+            selected_owners // config.groups_per_request,
+            requests[:, None].expand_as(selected_owners),
+        )
+        assert torch.equal(
+            selected_owners % config.groups_per_request,
+            selection[:, :2048] // 4,
+        )
+        assert (pool.hot[selected_slots.long()] == 56).all()
+        assert int(pool.wanted_count) == 8 * (512 + 8)
+        graph.replay()
+        assert int(pool.miss_count) == 0
+
+
+@pytest.mark.parametrize("e4m3", [False, True])
+def test_qsa_513_groups_per_row_at_exact_capacity_in_graph(e4m3):
+    config = HostKVConfig(1, 20000, 8, 2051, 1, hot_groups=4113, qsa_block_topk=512)
+    dtype = torch.uint8 if e4m3 else torch.float16
+    layout = torch.empty((625, 2, 32, 1, 256), dtype=dtype, device="meta")
+    pool = ActiveHostKV(config, layout, device="cuda")
+    pool.host.fill_(56)
+    pool.ready.fill_(1)
+    starts = torch.arange(8, device=pool.device) * 513 * 4
+    base = (starts[:, None] + torch.arange(2051, device=pool.device)).int()
+    selection = base.clone()
+    requests = torch.zeros(8, dtype=torch.int32, device=pool.device)
+    lengths = torch.tensor([19999], dtype=torch.int32, device=pool.device)
+    qpos = (starts + 2050).long()
+
+    def body():
+        pool.gather(selection, requests, lengths, qpos)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        body()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        body()
+    pointers = (pool.hot.data_ptr(), pool.indices.data_ptr())
+    for step in range(4):
+        selection.copy_(base + step * 4)
+        qpos.copy_(starts + 2050 + step * 4)
+        graph.replay()
+        assert int(pool.wanted_count) == pool.slots == 4113
+        assert (pool.indices >= 0).all()
+        assert pool.slot_owner.unique().numel() == pool.slots
+        owners = pool.slot_owner[(pool.indices // 4).long()]
+        assert torch.equal(owners, selection // 4)
+        assert (pool.hot == 56).all()
+        assert pointers == (pool.hot.data_ptr(), pool.indices.data_ptr())
+        graph.replay()
+        assert int(pool.miss_count) == 0

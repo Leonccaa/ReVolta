@@ -11,7 +11,7 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from functools import partial
-from typing import Any, NamedTuple, NewType, TypeAlias, cast, overload
+from typing import TYPE_CHECKING, Any, NamedTuple, NewType, TypeAlias, cast, overload
 
 from vllm import envs
 from vllm.config import KVTransferConfig, VllmConfig
@@ -21,6 +21,15 @@ from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import format_gib
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.core.long_context_kv import GPU_HISTORY as LC_GPU_HISTORY
+from vllm.v1.core.long_context_kv import HOST as LC_HOST
+from vllm.v1.core.long_context_kv import STATE as LC_STATE
+from vllm.v1.core.long_context_kv import (
+    LongContextCapacityPlan,
+    LongContextGeometry,
+    plan_long_context_capacity,
+    validate_long_context_plan,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     ChunkedLocalAttentionSpec,
@@ -40,6 +49,9 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.request import Request
 from vllm.v1.utils import tensor_data
+
+if TYPE_CHECKING:
+    from vllm.config.kernel import LongContextKVConfig
 
 # BlockHash represents the hash of a single KV-cache block used for
 # prefix caching.  Treating it as a distinct type from `bytes` helps
@@ -3187,6 +3199,143 @@ def _project_kv_cache_groups_to_worker(
     return projected_groups
 
 
+def _long_context_settings(vllm_config: VllmConfig) -> "LongContextKVConfig | None":
+    kernel_config = getattr(vllm_config, "kernel_config", None)
+    settings = getattr(kernel_config, "long_context_kv", None)
+    return settings if settings is not None and settings.enabled else None
+
+
+def get_long_context_geometry(
+    vllm_config: VllmConfig, kv_cache_groups: list[KVCacheGroupSpec]
+) -> LongContextGeometry:
+    """Per-block costs of the long-context mode for one worker's groups.
+
+    The mode needs the compressed-sparse + linear-attention layout: the main
+    K/V group moves to the host history pool, the compressed index and ring
+    stay in the GPU history segment, and recurrent states and drafter windows
+    form the GPU state segment. Costs follow today's owner pages, so a state
+    block is charged every owner page even after the split.
+    """
+    layout = _get_csa_linear_tensor_layout(kv_cache_groups)
+    if layout is None:
+        raise ValueError(
+            "kernel_config.long_context_kv requires the compressed-sparse "
+            "(QSA) + linear-attention KV cache layout."
+        )
+    parallel = vllm_config.parallel_config
+    if parallel.pipeline_parallel_size > 1:
+        raise ValueError(
+            "kernel_config.long_context_kv does not support pipeline parallelism."
+        )
+    spec_config = vllm_config.speculative_config
+    if spec_config is not None and not spec_config.use_dflash():
+        raise ValueError(
+            "kernel_config.long_context_kv supports DFlash drafting or no "
+            "speculation; other drafters keep a full-history QSA cache."
+        )
+    dcp = getattr(parallel, "decode_context_parallel_size", 1)
+
+    group_domains: list[tuple[int, ...]] = []
+    block_tokens = 0
+    state_blocks = 0
+    ring_blocks = 0
+    compress_ratio = 0
+    for group in kv_cache_groups:
+        spec = group.kv_cache_spec
+        members = (
+            list(spec.kv_cache_specs.values())
+            if isinstance(spec, UniformTypeKVCacheSpecs)
+            else [spec]
+        )
+        kinds = {type(member) for member in members}
+        blocks = (
+            cdiv(spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes)
+            if group.layer_names
+            else 0
+        )
+        if FullAttentionSpec in kinds:
+            group_domains.append((LC_GPU_HISTORY, LC_HOST))
+            block_tokens = next(
+                member for member in members if type(member) is FullAttentionSpec
+            ).global_block_size(dcp)
+            compress_ratio = max(
+                getattr(member, "compress_ratio", 1) for member in members
+            )
+        elif kinds == {CircularBufferSpec}:
+            group_domains.append((LC_GPU_HISTORY,))
+            ring_blocks += blocks
+        elif kinds <= {MambaSpec, SlidingWindowSpec}:
+            group_domains.append((LC_STATE,))
+            state_blocks += blocks
+        else:
+            raise ValueError(
+                f"kernel_config.long_context_kv cannot place KV cache group "
+                f"{group.layer_names[:2]} "
+                f"({sorted(k.__name__ for k in kinds)})."
+            )
+    if compress_ratio <= 1:
+        raise ValueError("long-context mode needs a compressed indexer cache.")
+
+    text_config = getattr(vllm_config.model_config, "hf_text_config", None)
+    budget = int(getattr(text_config, "indexer_budget", None) or 2048)
+    num_spec = int(getattr(spec_config, "num_speculative_tokens", 0) or 0)
+    owner_bytes = sum(
+        layout.owner_page_size(i) for i in range(len(layout.main_kv_owners))
+    )
+    _, standalone = layout.auxiliary_tensor_plan()
+    workers = getattr(parallel, "tensor_parallel_size", 1) * (
+        parallel.pipeline_parallel_size
+    )
+    return LongContextGeometry(
+        block_tokens=block_tokens,
+        num_workers=workers,
+        main_kv_bytes_per_block=owner_bytes,
+        index_bytes_per_block=sum(layout.compressed_page_sizes),
+        state_bytes_per_block=owner_bytes + sum(page for _, page in standalone),
+        unified_bytes_per_block=layout.bytes_per_block,
+        state_blocks_per_request=state_blocks,
+        ring_blocks_per_request=ring_blocks,
+        max_model_len=vllm_config.model_config.max_model_len,
+        hot_group_tokens=compress_ratio,
+        # Top-k compressed groups plus the group holding the uncompressed tail.
+        hot_row_groups=budget // compress_ratio + 1,
+        decode_rows_per_request=1 + num_spec,
+        group_domains=tuple(group_domains),
+    )
+
+
+def _plan_long_context_kv(
+    vllm_config: VllmConfig,
+    projected_groups_per_worker: list[list[KVCacheGroupSpec]],
+    available_memory: list[int],
+) -> LongContextCapacityPlan | None:
+    """Plan and check the long-context pools; None when the mode is off."""
+    settings = _long_context_settings(vllm_config)
+    if settings is None:
+        return None
+    workers = [
+        (groups, memory)
+        for groups, memory in zip(projected_groups_per_worker, available_memory)
+        if groups
+    ]
+    if not workers:
+        raise ValueError("kernel_config.long_context_kv needs a KV cache.")
+    geometries = {get_long_context_geometry(vllm_config, g) for g, _ in workers}
+    if len(geometries) != 1:
+        raise ValueError(
+            "kernel_config.long_context_kv needs the same cache geometry on "
+            "every worker."
+        )
+    plan = plan_long_context_capacity(
+        settings,
+        geometries.pop(),
+        min(memory for _, memory in workers),
+        vllm_config.scheduler_config.max_num_seqs,
+    )
+    validate_long_context_plan(plan)
+    return plan
+
+
 def get_kv_cache_configs(
     vllm_config: VllmConfig,
     kv_cache_specs: list[dict[str, KVCacheSpec]],
@@ -3310,6 +3459,12 @@ def get_kv_cache_configs(
             partial(_estimate_max_model_len_from_groups, vllm_config, groups),
         )
 
+    # Long-context mode: refuse to start unless every pool holds one
+    # max_model_len request. The unified pool above is still allocated as is.
+    long_context_plan = _plan_long_context_kv(
+        vllm_config, projected_groups_per_worker, available_memory
+    )
+
     kv_cache_configs: list[KVCacheConfig] = []
     for projected_groups, kv_cache_spec_one_worker, available_memory_one_worker in zip(
         projected_groups_per_worker, kv_cache_specs, available_memory
@@ -3340,6 +3495,7 @@ def get_kv_cache_configs(
 
         if len(kv_cache_config.kv_cache_groups) > 0:
             _report_kv_cache_config(vllm_config, kv_cache_config)
+        kv_cache_config.long_context_plan = long_context_plan
 
     return kv_cache_configs
 

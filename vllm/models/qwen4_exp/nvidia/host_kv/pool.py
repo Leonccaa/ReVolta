@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Single-layer host authority with a bounded, request/group-keyed GPU LRU.
+"""Single-layer host authority with a bounded, request/group-keyed GPU cache.
 
 This module owns its allocations, not scheduler block IDs. A CPU allocation is
 an explicit interpreter fixture, never a pageable substitute for CUDA's pinned
@@ -22,6 +22,28 @@ from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 from . import kernels
 
 
+class UnsupportedHostKVConfig(ValueError):
+    """Valid dimensions exceed this prototype's capacity or address limits."""
+
+
+class HostKVResourceError(RuntimeError):
+    """Allocation or UVA initialization failed for an admitted configuration."""
+
+
+def _check_product(name: str, *sizes: int, limit: int = 2**31 - 1) -> None:
+    if math.prod(sizes) > limit:
+        raise UnsupportedHostKVConfig(f"{name} exceeds the supported limit {limit}")
+
+
+def _check_storage(tensor: torch.Tensor, *, index_limit: int = 2**63 - 1) -> None:
+    # Check bytes as well as element offsets before any pointer arithmetic.
+    extent = 1 + sum((n - 1) * abs(s) for n, s in zip(tensor.shape, tensor.stride()))
+    _check_product("strided tensor elements", extent, limit=index_limit)
+    _check_product(
+        "strided tensor bytes", extent, tensor.element_size(), limit=2**63 - 1
+    )
+
+
 @dataclass(frozen=True)
 class LayerScales:
     """Calibrated per-layer K/V scalars, outside the dense E4M3 payload."""
@@ -36,6 +58,15 @@ class LayerScales:
 
 @dataclass(frozen=True)
 class HostKVConfig:
+    """Fixed admission geometry and eviction policy for one layer.
+
+    Set qsa_block_topk for selector-expanded input, with four columns per
+    selected block. DCP2 interleave 1/2 compaction uses qsa_group_columns=2
+    and either the full padded buffer or its narrowed prefix. Gather checks
+    that each column chunk fits one local four-token hot group. Omitting
+    qsa_block_topk retains the arbitrary-column capacity contract.
+    """
+
     requests: int
     max_tokens: int
     rows: int
@@ -44,6 +75,17 @@ class HostKVConfig:
     hot_groups: int | None = None
     hot_ratio: float | None = None
     max_misses: int | None = None
+    qsa_block_topk: int | None = None
+    qsa_group_columns: int = 4
+    eviction_policy: str = "bucket"
+
+    @property
+    def row_groups(self) -> int:
+        # Arbitrary columns retain their original bound. The QSA contract is
+        # opt-in because width alone cannot establish the selector's layout.
+        if self.qsa_block_topk is None:
+            return self.selection_width
+        return self.qsa_block_topk + 1
 
     @property
     def groups_per_request(self) -> int:
@@ -51,34 +93,59 @@ class HostKVConfig:
 
     @property
     def required_groups(self) -> int:
-        """Conservative union bound, also valid for arbitrary sparse columns.
+        """Union bound in four-token groups, including unaligned tails.
 
-        Do not assume the selector emits complete groups or that DCP-local
-        columns retain global groups. This also admits arbitrary prefill rows.
+        QSA expands each selected block to four columns and appends at most
+        three columns from one open group. Thus 512 blocks touch at most 513
+        groups per row. Rows may select disjoint groups, even for one request.
         """
         g = self.groups_per_request
         return min(
             self.requests * g,
-            self.rows * min(self.selection_width, g) + self.requests * min(9, g),
+            self.rows * min(self.row_groups, g) + self.requests * min(9, g),
         )
 
     def capacities(self) -> tuple[int, int]:
-        if (
-            min(
-                self.requests,
-                self.max_tokens,
-                self.rows,
-                self.selection_width,
-                self.max_write_rows,
-            )
-            <= 0
-        ):
+        dimensions = (
+            self.requests,
+            self.max_tokens,
+            self.rows,
+            self.selection_width,
+            self.max_write_rows,
+        )
+        if any(type(n) is not int or n <= 0 for n in dimensions):
             raise ValueError("Host KV dimensions must be positive")
+        if type(self.qsa_group_columns) is not int or self.qsa_group_columns not in (
+            2,
+            4,
+        ):
+            raise UnsupportedHostKVConfig("QSA group columns must be 2 or 4")
+        if self.qsa_block_topk is not None:
+            if (
+                type(self.qsa_block_topk) is not int
+                or not 1 <= self.qsa_block_topk <= 512
+            ):
+                raise UnsupportedHostKVConfig("QSA requires 1..512 blocks")
+            widths = {4 * self.qsa_block_topk + 3}
+            if self.qsa_group_columns == 2:
+                widths.add((self.qsa_block_topk + 1) * 2)
+            if self.selection_width not in widths:
+                raise UnsupportedHostKVConfig(
+                    "QSA requires the expanded or DCP2 selection width"
+                )
+        if self.eviction_policy not in ("bucket", "lru"):
+            raise UnsupportedHostKVConfig("eviction_policy must be bucket or lru")
+        for name, sizes in (
+            ("requests * max_tokens", (self.requests, self.max_tokens)),
+            ("rows * selection_width", (self.rows, self.selection_width)),
+            ("max_write_rows", (self.max_write_rows,)),
+            ("selection grid Y", (triton.cdiv(self.selection_width, 128),)),
+        ):
+            limit = 65535 if name == "selection grid Y" else 2**31 - 1
+            _check_product(name, *sizes, limit=limit)
         if (self.hot_groups is None) == (self.hot_ratio is None):
             raise ValueError("Specify exactly one of hot_groups and hot_ratio")
         total = self.requests * self.groups_per_request
-        if total >= 2**31 or self.max_tokens >= 2**31:
-            raise ValueError("Host KV metadata requires signed int32 coordinates")
         if self.hot_ratio is not None:
             if not math.isfinite(self.hot_ratio) or not 0 < self.hot_ratio <= 1:
                 raise ValueError("hot_ratio must be in (0, 1]")
@@ -87,16 +154,20 @@ class HostKVConfig:
             assert self.hot_groups is not None
             slots = self.hot_groups
         misses = self.required_groups if self.max_misses is None else self.max_misses
+        if any(type(n) is not int or n <= 0 for n in (slots, misses)):
+            raise ValueError("Host KV capacities must be positive integers")
         if not self.required_groups <= slots <= total:
-            raise ValueError(
+            raise UnsupportedHostKVConfig(
                 f"hot capacity must be between {self.required_groups} and {total} "
                 "groups for this selection shape (including the 32-token tail); "
                 "reduce the query batch or increase capacity"
             )
         if not self.required_groups <= misses <= slots:
-            raise ValueError("max_misses must cover the full cold-step union bound")
-        if slots * 4 >= 2**31:
-            raise ValueError("Hot token coordinates exceed signed int32")
+            raise UnsupportedHostKVConfig(
+                "max_misses must cover the full cold-step union bound"
+            )
+        _check_product("hot token coordinates", slots, 4)
+        _check_product("requests * hot_groups", self.requests, slots)
         return slots, misses
 
 
@@ -114,6 +185,7 @@ class ActiveHostKV:
     followed by a ready-flag kernel on that stream. Readers cannot consume an
     uncommitted token. CPU inspection or release of this object requires the
     caller to wait for that stream; there is no hidden synchronization here.
+    Consume each gather's attention before any subsequent pool mutation.
     """
 
     def __init__(
@@ -153,9 +225,25 @@ class ActiveHostKV:
                 raise ValueError("Host KV carrier has overlapping or invalid strides")
             extent += (size - 1) * stride
         columns = triton.cdiv(config.max_tokens, page_tokens)
+        _check_storage(layout_like)
+        _check_product("requests * host table columns", config.requests, columns)
+        _check_product("physical page coordinates", pages)
+        _check_product("group transfer elements", 8, heads, dim, limit=16384)
+        for name, shape in (
+            ("hot payload bytes", (slots, 8, heads, dim)),
+            ("encoding scratch bytes", (config.max_write_rows, 2, heads, dim)),
+        ):
+            _check_product(name, *shape, layout_like.element_size(), limit=2**63 - 1)
+        if block_table is None and config.requests * columns > pages:
+            raise ValueError("Host carrier has too few physical pages")
         if block_table is None:
-            block_table = torch.arange(config.requests * columns, dtype=torch.int32)
-            block_table = block_table.reshape(config.requests, columns)
+            try:
+                block_table = torch.arange(config.requests * columns, dtype=torch.int32)
+                block_table = block_table.reshape(config.requests, columns)
+            except (RuntimeError, MemoryError) as error:
+                raise HostKVResourceError(
+                    "Host block table allocation failed"
+                ) from error
         if (
             block_table.device.type != "cpu"
             or block_table.dtype != torch.int32
@@ -173,61 +261,91 @@ class ActiveHostKV:
         self.page_tokens, self.columns = page_tokens, columns
         self.heads, self.dim = heads, dim
         self.is_e4m3 = layout_like.dtype == torch.uint8
-        self.host = torch.empty_strided(
-            layout_like.shape,
-            layout_like.stride(),
-            dtype=layout_like.dtype,
-            device="cpu",
-            pin_memory=device.type == "cuda",
-        )
-        self.hot = torch.empty(
-            (slots, 2, 4, heads, dim), dtype=layout_like.dtype, device=device
-        )
-        self.device = self.hot.device
-        if device.type == "cuda":
-            # The existing native helper maps the entire strided storage.
-            # Keep the pinned allocation alive for as long as its alias is used.
-            with torch.accelerator.device_index(self.device.index):
-                self.host_device = get_accelerator_view_from_cpu_tensor(self.host)
-        else:
-            self.host_device = self.host
-        self.block_table = block_table.to(self.device, copy=True).contiguous()
-        self.hot_block_table = torch.arange(
-            slots, dtype=torch.int32, device=self.device
-        )
-        self.hot_block_table = self.hot_block_table.repeat(config.requests, 1)
-        r, t, g = config.requests, config.max_tokens, config.groups_per_request
-        self.group_to_slot = torch.full(
-            (r, g), -1, dtype=torch.int32, device=self.device
-        )
-        self.slot_owner = torch.full(
-            (slots,), -1, dtype=torch.int32, device=self.device
-        )
-        self.age = torch.zeros(slots, dtype=torch.int64, device=self.device)
-        self.clock = torch.zeros((), dtype=torch.int64, device=self.device)
-        self.ready = torch.zeros((r, t), dtype=torch.int32, device=self.device)
-        self.claims = torch.zeros_like(self.ready)
-        self.wanted = torch.zeros_like(self.group_to_slot)
-        self.miss_groups = torch.empty(misses, dtype=torch.int32, device=self.device)
-        self.miss_slots = torch.empty_like(self.miss_groups)
-        self.miss_count = torch.zeros((), dtype=torch.int32, device=self.device)
-        self.indices = torch.empty(
-            (config.rows, config.selection_width), dtype=torch.int32, device=self.device
-        )
-        self.encoded = torch.empty(
-            (config.max_write_rows, 2, 1, heads, dim),
-            dtype=layout_like.dtype,
-            device=self.device,
-        )
-        self.encoding_slots = torch.arange(
-            config.max_write_rows, dtype=torch.int64, device=self.device
-        )
-        self.k_scale = torch.tensor(
-            [scales.key], dtype=torch.float32, device=self.device
-        )
-        self.v_scale = torch.tensor(
-            [scales.value], dtype=torch.float32, device=self.device
-        )
+        try:
+            self.host = torch.empty_strided(
+                layout_like.shape,
+                layout_like.stride(),
+                dtype=layout_like.dtype,
+                device="cpu",
+                pin_memory=device.type == "cuda",
+            )
+            self.hot = torch.empty(
+                (slots, 2, 4, heads, dim), dtype=layout_like.dtype, device=device
+            )
+            self.device = self.hot.device
+            if device.type == "cuda":
+                # The existing native helper maps the entire strided storage.
+                # Keep the pinned allocation alive for as long as its alias is used.
+                with torch.accelerator.device_index(self.device.index):
+                    self.host_device = get_accelerator_view_from_cpu_tensor(self.host)
+            else:
+                self.host_device = self.host
+            self.block_table = block_table.to(self.device, copy=True).contiguous()
+            self.hot_block_table = torch.arange(
+                slots, dtype=torch.int32, device=self.device
+            )
+            self.hot_block_table = self.hot_block_table.repeat(config.requests, 1)
+            r, t, g = config.requests, config.max_tokens, config.groups_per_request
+            self.group_to_slot = torch.full(
+                (r, g), -1, dtype=torch.int32, device=self.device
+            )
+            self.slot_owner = torch.full(
+                (slots,), -1, dtype=torch.int32, device=self.device
+            )
+            self.age = torch.zeros(slots, dtype=torch.int64, device=self.device)
+            self.clock = torch.zeros((), dtype=torch.int64, device=self.device)
+            self.eviction_hand = torch.zeros((), dtype=torch.int32, device=self.device)
+            self.ready = torch.zeros((r, t), dtype=torch.int32, device=self.device)
+            self.claims = torch.zeros_like(self.ready)
+            self.wanted = torch.zeros_like(self.group_to_slot)
+            self.wanted_groups = torch.empty(
+                misses, dtype=torch.int32, device=self.device
+            )
+            self.wanted_count = torch.zeros((), dtype=torch.int32, device=self.device)
+            priority_slots = slots if config.eviction_policy == "lru" else 0
+            self.priority = torch.empty(
+                priority_slots, dtype=torch.int64, device=self.device
+            )
+            self.sorted_priority = torch.empty_like(self.priority)
+            self.victim_slots = torch.empty(
+                slots if config.eviction_policy == "lru" else misses,
+                dtype=torch.int64 if config.eviction_policy == "lru" else torch.int32,
+                device=self.device,
+            )
+            self.victim_tiles = min(triton.cdiv(slots, 512), 256)
+            self.victim_counts = torch.empty(
+                (3, self.victim_tiles), dtype=torch.int32, device=self.device
+            )
+            # A bounded fixed grid also works during capture and at zero misses.
+            self.gather_workers = min(misses, 256)
+            self.miss_groups = torch.empty(
+                misses, dtype=torch.int32, device=self.device
+            )
+            self.miss_slots = torch.empty_like(self.miss_groups)
+            self.miss_count = torch.zeros((), dtype=torch.int32, device=self.device)
+            self.indices = torch.empty(
+                (config.rows, config.selection_width),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self.encoded = torch.empty(
+                (config.max_write_rows, 2, 1, heads, dim),
+                dtype=layout_like.dtype,
+                device=self.device,
+            )
+            self.encoding_slots = torch.arange(
+                config.max_write_rows, dtype=torch.int64, device=self.device
+            )
+            self.k_scale = torch.tensor(
+                [scales.key], dtype=torch.float32, device=self.device
+            )
+            self.v_scale = torch.tensor(
+                [scales.value], dtype=torch.float32, device=self.device
+            )
+        except (RuntimeError, MemoryError) as error:
+            raise HostKVResourceError(
+                "Host KV allocation or UVA initialization failed"
+            ) from error
 
     def _metadata(
         self,
@@ -333,6 +451,8 @@ class ActiveHostKV:
             raise ValueError("Invalid encoded host KV write shape, device or dtype")
         self._metadata(requests, (n,))
         self._metadata(positions, (n,))
+        _check_storage(key)
+        _check_storage(value)
         c = self.config
         if self.device.type == "cpu":
             active = positions != -1
@@ -344,7 +464,6 @@ class ActiveHostKV:
             ids = req.long() * c.max_tokens + pos
             if ids.unique().numel() != ids.numel():
                 raise ValueError("duplicate host KV write coordinate")
-        self.claims.zero_()
         kernels.claim_writes[(triton.cdiv(n, 128),)](
             requests,
             positions,
@@ -381,6 +500,7 @@ class ActiveHostKV:
             requests,
             positions,
             self.ready,
+            self.claims,
             n,
             c.max_tokens,
             128,
@@ -408,15 +528,48 @@ class ActiveHostKV:
             # tl.device_assert is a no-op in Triton's interpreter. Validate
             # values with torch here; the CUDA branch never inspects values.
             self._cpu_validate_gather(selection, requests, lengths, query_positions)
-        self.wanted.zero_()
-        self.miss_count.zero_()
+        self._gather_metadata(selection, requests, lengths, query_positions)
+        self._gather_payload()
+        self._remap(selection, requests, lengths, query_positions)
+        return self.indices
+
+    def _gather_metadata(
+        self,
+        selection: torch.Tensor,
+        requests: torch.Tensor,
+        lengths: torch.Tensor,
+        query_positions: torch.Tensor,
+    ) -> None:
+        self._mark_and_collect(selection, requests, lengths, query_positions)
+        self._sort_victims()
+        self._select_victims()
+        self._update_mapping()
+
+    def _mark_and_collect(
+        self,
+        selection: torch.Tensor,
+        requests: torch.Tensor,
+        lengths: torch.Tensor,
+        query_positions: torch.Tensor,
+    ) -> None:
+        c = self.config
+        kernels.clear_wanted[(triton.cdiv(self.max_misses, 256),)](
+            self.wanted,
+            self.wanted_groups,
+            self.wanted_count,
+            256,
+        )
+        kernels.begin_gather[(1,)](self.wanted_count, self.miss_count, self.clock)
         kernels.mark_tail[(c.requests,)](
             lengths,
             self.ready,
             self.wanted,
+            self.wanted_groups,
+            self.wanted_count,
             c.requests,
             c.max_tokens,
             c.groups_per_request,
+            self.max_misses,
             debug=True,
         )
         grid = (c.rows, triton.cdiv(c.selection_width, 128))
@@ -427,26 +580,91 @@ class ActiveHostKV:
             query_positions,
             self.ready,
             self.wanted,
+            self.wanted_groups,
+            self.wanted_count,
             c.requests,
             c.max_tokens,
             c.groups_per_request,
             c.selection_width,
+            self.max_misses,
             128,
+            c.qsa_group_columns if c.qsa_block_topk is not None else 0,
+            c.row_groups * c.qsa_group_columns,
             debug=True,
         )
-        groups = c.requests * c.groups_per_request
-        kernels.collect_misses[(triton.cdiv(groups, 256),)](
-            self.wanted,
+        kernels.collect_misses[(triton.cdiv(self.max_misses, 256),)](
+            self.wanted_groups,
+            self.wanted_count,
             self.group_to_slot,
+            self.age,
+            self.clock,
             self.miss_groups,
             self.miss_count,
-            groups,
             self.max_misses,
             256,
             debug=True,
         )
-        kernels.allocate_slots[(1,)](
+
+    def _sort_victims(self) -> None:
+        if self.config.eviction_policy != "lru":
+            return
+        kernels.prepare_slot_priorities[(triton.cdiv(self.slots, 256),)](
             self.wanted,
+            self.slot_owner,
+            self.age,
+            self.clock,
+            self.priority,
+            self.slots,
+            256,
+        )
+        # Stable age sorting preserves (age, slot) step-LRU without the old
+        # serial O(misses * slots) reduction. CUDA uses PyTorch's parallel sort.
+        # Fixed outputs are preallocated. Sort scratch is owned by PyTorch's
+        # allocator / graph private pool and must be warmed before capture.
+        try:
+            torch.sort(
+                self.priority,
+                stable=True,
+                out=(self.sorted_priority, self.victim_slots),
+            )
+        except torch.OutOfMemoryError as error:
+            raise HostKVResourceError(
+                "Host KV sort workspace allocation failed"
+            ) from error
+
+    def _select_victims(self) -> None:
+        if self.config.eviction_policy == "lru":
+            return
+        kernels.count_victim_buckets[(self.victim_tiles,)](
+            self.wanted,
+            self.slot_owner,
+            self.age,
+            self.clock,
+            self.miss_count,
+            self.victim_counts,
+            self.eviction_hand,
+            self.slots,
+            self.victim_tiles,
+            512,
+        )
+        kernels.select_bucket_victims[(self.victim_tiles,)](
+            self.wanted,
+            self.slot_owner,
+            self.age,
+            self.clock,
+            self.miss_count,
+            self.victim_counts,
+            self.victim_slots,
+            self.eviction_hand,
+            self.slots,
+            self.victim_tiles,
+            512,
+            triton.next_power_of_2(self.victim_tiles),
+            debug=True,
+        )
+
+    def _update_mapping(self) -> None:
+        kernels.allocate_slots[(triton.cdiv(self.max_misses, 256),)](
             self.group_to_slot,
             self.slot_owner,
             self.age,
@@ -454,17 +672,22 @@ class ActiveHostKV:
             self.miss_groups,
             self.miss_slots,
             self.miss_count,
-            self.slots,
+            self.victim_slots,
+            self.sorted_priority,
+            self.eviction_hand,
             self.max_misses,
-            triton.next_power_of_2(self.slots),
-            num_warps=8,
+            self.slots,
+            256,
+            self.config.eviction_policy == "lru",
             debug=True,
         )
-        kernels.gather_groups[(self.max_misses,)](
+
+    def _gather_payload(self) -> None:
+        c = self.config
+        kernels.gather_groups[(self.gather_workers,)](
             self.host_device,
             self.hot,
             self.block_table,
-            lengths,
             self.ready,
             self.miss_groups,
             self.miss_slots,
@@ -478,6 +701,16 @@ class ActiveHostKV:
             self.dim,
             triton.next_power_of_2(8 * self.heads * self.dim),
         )
+
+    def _remap(
+        self,
+        selection: torch.Tensor,
+        requests: torch.Tensor,
+        lengths: torch.Tensor,
+        query_positions: torch.Tensor,
+    ) -> None:
+        c = self.config
+        grid = (c.rows, triton.cdiv(c.selection_width, 128))
         kernels.remap_selection[grid](
             selection,
             requests,
@@ -491,7 +724,6 @@ class ActiveHostKV:
             128,
             debug=True,
         )
-        return self.indices
 
     def _cpu_validate_gather(
         self,
@@ -513,6 +745,19 @@ class ActiveHostKV:
         for tokens, req, qpos in zip(
             selection, requests.tolist(), query_positions.tolist()
         ):
+            if c.qsa_block_topk is not None:
+                limit = c.row_groups * c.qsa_group_columns
+                if (tokens[limit:] >= 0).any():
+                    raise ValueError("host KV QSA group layout exceeded")
+                for start in range(
+                    0, min(limit, c.selection_width), c.qsa_group_columns
+                ):
+                    chunk = tokens[start : start + c.qsa_group_columns]
+                    active = chunk >= 0
+                    if active.any() and (
+                        chunk[0] < 0 or (chunk[active] // 4 != chunk[0] // 4).any()
+                    ):
+                        raise ValueError("host KV QSA group layout exceeded")
             valid = (tokens >= 0) & (tokens < lengths[req]) & (tokens <= qpos)
             if not self.ready[req, tokens[valid].long()].all():
                 raise ValueError("selected KV is not committed")

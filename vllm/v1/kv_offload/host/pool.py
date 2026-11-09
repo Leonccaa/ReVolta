@@ -1,0 +1,171 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Prefix metadata over caller-owned host KV pages, with no payload allocation.
+
+The controller thread owns this API. The I/O threads only access leased bytes.
+host KV pool/host-history integration must delegate slot ownership to this adapter (or
+implement the same lease
+contract in their allocator); two allocators must never own the same buffer.
+Only full, immutable, host-visible pages may be published under prefix hashes.
+Active requests, DMA and SSD jobs all retain leases. Unreferenced pages remain
+as RAM prefixes until LRU eviction. Mutations require a new reservation/COW.
+"""
+
+from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import cast
+
+from vllm.v1.kv_offload.base import OffloadKey, ReqContext, get_offload_group_idx
+from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+
+_CONTEXT = ReqContext(req_id="host-kv-prefix")
+
+
+@dataclass(eq=False)
+class HostKVPage:
+    """A single-use lease. Its bytes must not be retained after release."""
+
+    key: OffloadKey
+    block_id: int
+    _pool: "HostKVPool"
+    _writing: bool
+    _closed: bool = False
+
+    @property
+    def view(self) -> memoryview:
+        self._pool._check_lease(self)
+        start = self.block_id * self._pool.page_bytes
+        view = self._pool.view.cast("B")[start : start + self._pool.page_bytes]
+        return view if self._writing else view.toreadonly()
+
+
+@dataclass
+class HostKVPrefix:
+    """This group's contiguous prefix, pinned until release; no global hit.
+
+    complete-prefix contract intersects this absolute length with index/state/draft
+    availability
+    across every rank, then commits its own complete-prefix transaction.
+    """
+
+    group_idx: int
+    available_tokens: int
+    pages: tuple[HostKVPage, ...]
+
+    def release(self) -> None:
+        for page in self.pages:
+            page._pool.release(page)
+
+
+class HostKVPool:
+    """Borrow a fixed C-contiguous CPU buffer shaped [slots, ...].
+
+    The buffer already contains the authoritative KV storage. This class only
+    allocates metadata and reuses the CPU offload manager's LRU/refcounts. It
+    neither copies into another CPU pool nor allocates a shared offload region.
+    All rows contain the same main-KV group, including every owned layer.
+    """
+
+    def __init__(self, view: memoryview, *, group_idx: int, block_tokens: int):
+        if (
+            view.readonly
+            or not view.c_contiguous
+            or view.ndim < 2
+            or view.shape is None
+            or view.shape[0] < 1
+        ):
+            raise ValueError("Host KV requires a writable contiguous CPU row buffer")
+        if type(group_idx) is not int or not 0 <= group_idx < 2**32:
+            raise ValueError("Invalid host KV group index")
+        if type(block_tokens) is not int or block_tokens <= 0:
+            raise ValueError("block_tokens must be a positive global token span")
+        self.view = view
+        self.group_idx = group_idx
+        self.block_tokens = block_tokens
+        self.num_blocks = view.shape[0]
+        self.page_bytes = view.nbytes // self.num_blocks
+        if not self.page_bytes:
+            raise ValueError("Host KV pages must not be empty")
+        self._manager = CPUOffloadingManager(self.num_blocks, cache_policy="lru")
+        self._leases: set[HostKVPage] = set()
+
+    def _check_key(self, key: OffloadKey) -> None:
+        if len(key) <= 4 or get_offload_group_idx(key) != self.group_idx:
+            raise ValueError("Key does not identify this host KV group")
+
+    def _check_lease(self, page: HostKVPage) -> None:
+        if page._pool is not self or page not in self._leases:
+            raise ValueError("Foreign or released host KV lease")
+
+    def _lease(self, key: OffloadKey, block_id: int, writing: bool) -> HostKVPage:
+        page = HostKVPage(key, block_id, self, writing)
+        self._leases.add(page)
+        return page
+
+    def lookup(self, key: OffloadKey) -> bool | None:
+        self._check_key(key)
+        return self._manager.lookup(key, _CONTEXT)
+
+    def is_ready(self, key: OffloadKey) -> bool:
+        """Side-effect-free readiness for the complete-prefix contract residency
+        probe."""
+        self._check_key(key)
+        return self._manager.is_ready_resident(key)
+
+    def reserve(self, key: OffloadKey) -> HostKVPage | None:
+        """Reserve an unpublished row; None means resident, in flight or full."""
+        if self.lookup(key) is not False:
+            return None
+        output = self._manager.prepare_store([key], _CONTEXT)
+        if output is None:
+            return None
+        spec = cast(CPULoadStoreSpec, output.store_spec)
+        return self._lease(key, int(spec.block_ids[0]), True)
+
+    def publish(self, page: HostKVPage) -> None:
+        """After the producer's host-visible fence, make an immutable read lease.
+
+        The producer must have filled the whole row, including deterministic
+        padding. Publishing partial/speculative/uncommitted bytes is forbidden.
+        """
+        self._check_lease(page)
+        if not page._writing:
+            raise ValueError("Host KV page is already published")
+        self._manager.complete_store([page.key], _CONTEXT)
+        self._manager.prepare_load([page.key], _CONTEXT)
+        page._writing = False
+
+    def pin(self, key: OffloadKey) -> HostKVPage | None:
+        if self.lookup(key) is not True:
+            return None
+        spec = cast(CPULoadStoreSpec, self._manager.prepare_load([key], _CONTEXT))
+        self._manager.touch([key], _CONTEXT)
+        return self._lease(key, int(spec.block_ids[0]), False)
+
+    def release(self, page: HostKVPage) -> None:
+        """Abort unpublished bytes, or leave a published row cached in place."""
+        if page._pool is self and page._closed:
+            return
+        self._check_lease(page)
+        if page._writing:
+            self._manager.complete_store([page.key], _CONTEXT, success=False)
+        else:
+            self._manager.complete_load([page.key], _CONTEXT)
+        page._closed = True
+        self._leases.remove(page)
+
+    def acquire_prefix(self, keys: Sequence[OffloadKey]) -> HostKVPrefix:
+        """Keys are in the scheduler's prefix-chain order, starting at token 0."""
+        # Validate before pinning so a mixed-group caller cannot leak references.
+        for key in keys:
+            self._check_key(key)
+        pages = []
+        for key in keys:
+            page = self.pin(key)
+            if page is None:
+                break
+            pages.append(page)
+        return HostKVPrefix(
+            self.group_idx, len(pages) * self.block_tokens, tuple(pages)
+        )

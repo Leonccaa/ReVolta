@@ -728,7 +728,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.device, pin_memory=is_pin_memory_available()
         )
         self._kv_block_zeroer.init_meta(
-            attn_groups_iter=(group for groups in self.attn_groups for group in groups),
+            # With separate block spaces the IDs to zero name primary-space
+            # blocks only; another space's tensors must not be touched.
+            attn_groups_iter=(
+                group
+                for groups in self.attn_groups
+                for group in groups
+                # getattr: tests may build the runner without __init__.
+                if getattr(self, "kv_cache_config", None) is None
+                or self.kv_cache_config.in_primary_block_space(group.kv_cache_group_id)
+            ),
             kernel_block_sizes=self._kernel_block_sizes,
             cache_dtype=self.cache_config.cache_dtype,
             runner_only_attn_layers=set(),

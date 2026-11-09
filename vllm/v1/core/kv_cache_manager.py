@@ -4,11 +4,12 @@
 import itertools
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal, overload
+from typing import TYPE_CHECKING, Literal, overload
 
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_hit_contract import (
     KVHitContract,
@@ -29,6 +30,9 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request
+
+if TYPE_CHECKING:
+    from vllm.v1.kv_offload.host.hit import HostKVHitManager
 
 logger = init_logger(__name__)
 
@@ -123,6 +127,9 @@ class KVCacheManager:
     # history segment, host history pool and hot-page pool. Without a plan
     # (the default) allocation is exactly the unified-pool path.
     admission_ledger: LongContextAdmissionLedger | None = None
+    # Explicitly attached by the host allocator after both complete-prefix contract
+    # paths exist.
+    host_kv_hits: "HostKVHitManager | None" = None
 
     def __init__(
         self,
@@ -179,6 +186,7 @@ class KVCacheManager:
             self.hit_contract = KVHitContract(
                 local_hit_rules(self.coordinator.single_type_managers),
                 path="gpu-prefix-cache",
+                hash_block_size=hash_block_size,
             )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
@@ -209,8 +217,13 @@ class KVCacheManager:
                     f"{len(plan.geometry.group_domains)} KV cache groups, but "
                     f"the scheduler has {self.num_kv_cache_groups}."
                 )
+            # With separate block spaces the state and GPU history pools
+            # enforce themselves; the ledger observes the history pool (the
+            # main-K/V group's host pages live there) for the host domain.
             self.admission_ledger = LongContextAdmissionLedger(
-                plan, kv_cache_config.num_blocks
+                plan,
+                kv_cache_config.num_blocks,
+                physical_segments=kv_cache_config.block_segments is not None,
             )
             self.block_pool.admission_observer = self.admission_ledger
             self.coordinator.admission_ledger = self.admission_ledger
@@ -221,9 +234,49 @@ class KVCacheManager:
         """Get the KV cache usage.
 
         Returns:
-            The KV cache usage (between 0.0 and 1.0).
+            The KV cache usage (between 0.0 and 1.0). With separate block
+            spaces, the fullest one.
         """
-        return self.block_pool.get_usage()
+        pools = self._segment_pools()
+        if pools is None:
+            return self.block_pool.get_usage()
+        return max(pool.get_usage() for pool in pools)
+
+    def _segment_pools(self) -> "tuple[BlockPool, ...] | None":
+        """The pools of separate block spaces, or None for one shared pool."""
+        # getattr: tests may build these objects without __init__.
+        pools = getattr(getattr(self, "coordinator", None), "block_pools", ())
+        return pools if len(pools) > 1 else None
+
+    def _segment_pools_have_room(
+        self,
+        per_group: Sequence[int],
+        reserved_blocks: int,
+        reserved_per_group: Sequence[int] | None = None,
+    ) -> bool:
+        """Separate block spaces: whether each pool has room for its groups.
+
+        Future demand stays in group units so state/history IDs and host
+        pages are reserved in their own domains.
+        """
+        coordinator = self.coordinator
+        demand: dict[int, int] = {}
+        for group_id, blocks in enumerate(per_group):
+            if reserved_per_group is not None:
+                blocks += reserved_per_group[group_id]
+            if blocks:
+                pool = coordinator.group_block_pool(group_id)
+                demand[id(pool)] = demand.get(id(pool), 0) + blocks
+        for pool in coordinator.block_pools:
+            # Preserve the scalar API for callers without a group vector.
+            reserve = (
+                reserved_blocks
+                if reserved_per_group is None and pool is self.block_pool
+                else 0
+            )
+            if demand.get(id(pool), 0) > pool.get_num_free_blocks() - reserve:
+                return False
+        return True
 
     def make_prefix_cache_stats(self) -> PrefixCacheStats | None:
         """Get (and reset) the prefix cache stats.
@@ -254,6 +307,9 @@ class KVCacheManager:
         # (which happens when the request requires prompt logprobs
         # or calls a pooling model with all pooling).
         request.shared_prefix_boundary = 0
+        host_hits = self.host_kv_hits
+        if host_hits is not None:
+            host_hits.begin_lookup(request.request_id)
         if not self.enable_caching or request.skip_reading_prefix_cache:
             return self.empty_kv_cache_blocks, 0
 
@@ -266,6 +322,7 @@ class KVCacheManager:
         max_cache_hit_length = request.num_tokens - 1
         # getattr: tests may build this object without __init__.
         contract = getattr(self, "hit_contract", None)
+        probe_cap = None
         if contract is not None:
             chain_hash = chain_hash_from_request(
                 request.block_hashes, self.hash_block_size
@@ -273,14 +330,21 @@ class KVCacheManager:
             if contract.has_probes:
                 # Stop before the first block a probed store no longer holds,
                 # so the fixed point lands on the common complete prefix.
-                max_cache_hit_length = contract.probe_cap(
-                    chain_hash, 0, max_cache_hit_length
+                probe_cap = contract.probe_cap(chain_hash, 0, max_cache_hit_length)
+        if probe_cap is None:
+            computed_blocks, num_new_computed_tokens = (
+                self.coordinator.find_longest_cache_hit(
+                    request.block_hashes, max_cache_hit_length
                 )
-        computed_blocks, num_new_computed_tokens = (
-            self.coordinator.find_longest_cache_hit(
-                request.block_hashes, max_cache_hit_length
             )
-        )
+        else:
+            computed_blocks, num_new_computed_tokens = (
+                self.coordinator.find_longest_cache_hit(
+                    request.block_hashes,
+                    max_cache_hit_length,
+                    max_final_hit_length=probe_cap,
+                )
+            )
         if contract is not None:
             computed_blocks, num_new_computed_tokens = settle_local_hit(
                 contract,
@@ -289,6 +353,16 @@ class KVCacheManager:
                 num_new_computed_tokens,
                 chain_hash,
             )
+            if (
+                host_hits is not None
+                and num_new_computed_tokens
+                and not host_hits.pin_hit(
+                    request.request_id, chain_hash, num_new_computed_tokens
+                )
+            ):
+                contract.reject("host prefix could not be pinned", request.request_id)
+                computed_blocks = tuple([] for _ in computed_blocks)
+                num_new_computed_tokens = 0
 
         # Keep the existing two-value lookup API used by 1Cat connectors. The
         # synchronous coordinator exposes the junction from this lookup only.
@@ -316,6 +390,7 @@ class KVCacheManager:
         num_encoder_tokens: int = 0,
         full_sequence_must_fit: bool = False,
         reserved_blocks: int = 0,
+        reserved_blocks_per_group: Sequence[int] | None = None,
     ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append.
 
@@ -343,6 +418,8 @@ class KVCacheManager:
                 requests when chunked prefill would otherwise only check the first chunk
             reserved_blocks: Free blocks to leave for other in-flight prefills
                 and the candidate async load's speculative promotion margin.
+            reserved_blocks_per_group: The same future demand in group units
+                for split pools and domain admission.
 
         Blocks layout:
         ```
@@ -418,11 +495,15 @@ class KVCacheManager:
         )
 
         ledger = self.admission_ledger
+        # Separate block spaces (long-context mode): each pool is checked
+        # against its own groups' demand.
+        split = self._segment_pools() is not None
+        per_group_needed = ledger is not None or split
         if full_sequence_must_fit:
             # First check and fail if the full request sequence won't fit.
             full_num_tokens = min(request.num_tokens, self.max_model_len)
 
-            if ledger is None:
+            if not per_group_needed:
                 num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
                     request_id=request.request_id,
                     num_tokens=full_num_tokens,
@@ -443,11 +524,24 @@ class KVCacheManager:
                     apply_admission_cap=True,
                 )
                 num_blocks_to_allocate = sum(per_group)
-            if num_blocks_to_allocate > (
+            if split:
+                if not self._segment_pools_have_room(
+                    per_group, reserved_blocks, reserved_blocks_per_group
+                ):
+                    if self.host_kv_hits is not None:
+                        self.host_kv_hits.release_lookup(request.request_id)
+                    return None
+            elif num_blocks_to_allocate > (
                 self.block_pool.get_num_free_blocks() - reserved_blocks
             ):
+                if self.host_kv_hits is not None:
+                    self.host_kv_hits.release_lookup(request.request_id)
                 return None
-            if ledger is not None and not ledger.admit(request, per_group):
+            if ledger is not None and not ledger.admit(
+                request, per_group, reserved_blocks_per_group
+            ):
+                if self.host_kv_hits is not None:
+                    self.host_kv_hits.release_lookup(request.request_id)
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
@@ -470,7 +564,7 @@ class KVCacheManager:
             num_prompt_tokens=request.num_prompt_tokens,
         )
 
-        if ledger is None:
+        if not per_group_needed:
             num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
                 request_id=request.request_id,
                 num_tokens=num_tokens_need_slot,
@@ -492,14 +586,29 @@ class KVCacheManager:
             )
             num_blocks_to_allocate = sum(per_group)
 
-        if num_blocks_to_allocate > (
+        if split:
+            # Separate block spaces: the state and history pools each need
+            # room for their own groups.
+            if not self._segment_pools_have_room(
+                per_group, reserved_blocks, reserved_blocks_per_group
+            ):
+                if self.host_kv_hits is not None:
+                    self.host_kv_hits.release_lookup(request.request_id)
+                return None
+        elif num_blocks_to_allocate > (
             self.block_pool.get_num_free_blocks() - reserved_blocks
         ):
             # Cannot allocate new blocks
+            if self.host_kv_hits is not None:
+                self.host_kv_hits.release_lookup(request.request_id)
             return None
         # Long-context mode: every domain must have room too; otherwise the
         # scheduler waits or preempts exactly as for a full unified pool.
-        if ledger is not None and not ledger.admit(request, per_group):
+        if ledger is not None and not ledger.admit(
+            request, per_group, reserved_blocks_per_group
+        ):
+            if self.host_kv_hits is not None:
+                self.host_kv_hits.release_lookup(request.request_id)
             return None
 
         if (
@@ -523,6 +632,8 @@ class KVCacheManager:
         )
         if ledger is not None:
             ledger.commit(request)
+        if self.host_kv_hits is not None:
+            self.host_kv_hits.commit_lookup(request.request_id)
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
@@ -553,6 +664,8 @@ class KVCacheManager:
         self.coordinator.free(request.request_id)
         if self.admission_ledger is not None:
             self.admission_ledger.release(request.request_id)
+        if self.host_kv_hits is not None:
+            self.host_kv_hits.release_request(request.request_id)
 
     def remove_skipped_blocks(
         self,
@@ -580,7 +693,15 @@ class KVCacheManager:
         Args:
             block_ids: Set of block IDs to evict from cache.
         """
-        self.block_pool.evict_blocks(block_ids)
+        pools = self._segment_pools()
+        if pools is None:
+            self.block_pool.evict_blocks(block_ids)
+            return
+        # Separate block spaces: a reported ID cannot name its space, so evict
+        # it from every pool that has it. Losing an extra cached prefix only
+        # costs a recompute; the hit lookup needs every group anyway.
+        for pool in pools:
+            pool.evict_blocks({i for i in block_ids if i < pool.num_gpu_blocks})
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
@@ -591,7 +712,19 @@ class KVCacheManager:
             bool: True if the prefix cache is successfully reset,
             False otherwise.
         """
-        if not self.block_pool.reset_prefix_cache():
+        pools = self._segment_pools()
+        if pools is not None:
+            # Separate block spaces: reset all of them or none.
+            if any(
+                pool.get_num_free_blocks() != pool.num_gpu_blocks - 1 for pool in pools
+            ):
+                logger.warning(
+                    "Failed to reset prefix cache because some blocks are not freed yet"
+                )
+                return False
+            for pool in pools:
+                pool.reset_prefix_cache()
+        elif not self.block_pool.reset_prefix_cache():
             return False
         if self.log_stats:
             assert self.prefix_cache_stats is not None
@@ -638,7 +771,11 @@ class KVCacheManager:
         Returns:
             A list of KV cache events.
         """
-        events = self.block_pool.take_events()
+        pools = self._segment_pools()
+        if pools is None:
+            events = self.block_pool.take_events()
+        else:
+            events = [event for pool in pools for event in pool.take_events()]
         for event in events:
             if not isinstance(event, BlockStored):
                 continue
@@ -706,8 +843,15 @@ class KVCacheManager:
     def take_new_block_ids(self) -> list[int]:
         """Drain and return new attention block IDs for zeroing."""
         ids: list[int] = []
+        split = self._segment_pools() is not None
         for mgr in self.coordinator.single_type_managers:
-            ids.extend(mgr.take_new_block_ids())
+            new_ids = mgr.take_new_block_ids()
+            # Separate block spaces: the workers zero only the primary
+            # (history) segment's tensors, where every attention group that
+            # records new IDs lives; an ID of another space would name a
+            # different block there.
+            if not split or mgr.block_pool is self.block_pool:
+                ids.extend(new_ids)
         return ids
 
     def take_boundary_state_offloads(

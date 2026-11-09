@@ -170,6 +170,42 @@ class HostKVConfig:
         _check_product("requests * hot_groups", self.requests, slots)
         return slots, misses
 
+    def device_memory_bytes(
+        self, *, page_tokens: int, token_bytes: int
+    ) -> dict[str, int]:
+        """Persistent device allocations of ActiveHostKV, excluding attention.
+
+        ``token_bytes`` includes both K and V of one local token. This also
+        supports capacity planning below the admission minimum. Transient
+        allocator overhead and the optional LRU sort scratch are additional.
+        """
+        total = self.requests * self.groups_per_request
+        slots = self.hot_groups
+        if slots is None:
+            assert self.hot_ratio is not None
+            slots = math.ceil(total * self.hot_ratio)
+        misses = self.required_groups if self.max_misses is None else self.max_misses
+        tiles = min(triton.cdiv(slots, 512), 256)
+        metadata = (
+            4 * self.requests * triton.cdiv(self.max_tokens, page_tokens)
+            + 4 * self.requests * slots  # hot block table
+            + 8 * total  # group_to_slot and wanted
+            + 12 * slots  # owner and age
+            + 8 * self.requests * self.max_tokens  # ready and claims
+            + 12 * misses  # wanted_groups, miss_groups and miss_slots
+            + 12 * tiles  # victim_counts
+            + 28  # clock, hand, counters and scales
+        )
+        metadata += 24 * slots if self.eviction_policy == "lru" else 4 * misses
+        return {
+            "payload": slots * 4 * token_bytes,
+            "metadata": metadata,
+            "workspace": (
+                4 * self.rows * self.selection_width
+                + self.max_write_rows * (token_bytes + 8)
+            ),
+        }
+
 
 class ActiveHostKV:
     """Owned host pages and GPU replicas for one layer on one device.

@@ -19,9 +19,20 @@ K/V pages for the attention gathers. This module only does the bookkeeping:
   ``allocate_slots`` return None, so the scheduler queues or preempts it under
   its existing rules; nothing here raises at runtime.
 
-The physical allocator is not split yet: until it is, the unified pool still
-holds every block and is checked as before, and the domain capacities act as an
-additional admission constraint.
+Physically the GPU KV cache is split into two block spaces
+(``KVCacheConfig.block_segments``): the state segment and the history segment
+each have their own block pool, null block, free queue, prefix-cache map and
+eviction, and their own tensors on every worker. Those two domains are
+therefore enforced by the pools themselves; the ledger only enforces the host
+history pool and the hot-page pool.
+
+Main K/V placement: until the host pool (host KV pool) is addressed by history block
+IDs, the main K/V pages stay on the GPU next to the compressed index, in the
+history segment (``main_kv_on_gpu``). The history segment then costs index +
+main K/V bytes per block, and the hot-page and host pools are admission
+budgets only. Moving the main K/V to the host only changes the history
+segment's per-block bytes and which tensors the worker allocates; block IDs,
+hashes and the scheduler side stay as they are.
 """
 
 from __future__ import annotations
@@ -49,10 +60,15 @@ GPU_HISTORY = 1
 HOST = 2
 DOMAIN_NAMES = ("GPU state segment", "GPU history segment", "host history pool")
 HOT_POOL_NAME = "GPU hot-page pool"
+
+# Physical block spaces (``KVCacheConfig.block_segments``) in long-context mode.
+STATE_SEGMENT = 0
+HISTORY_SEGMENT = 1
+SEGMENT_NAMES = ("state", "history")
 # Index of the hot-page pool in blocked-admission counters.
 HOT = 3
 
-# Tokens of the newest history pinned in the hot pool per request (host KV pool), and
+# Local tokens of newest history pinned in the hot pool per request (host KV pool), and
 # the groups they can touch when not aligned to a group boundary.
 HOT_TAIL_TOKENS = 32
 
@@ -77,15 +93,16 @@ class LongContextGeometry:
     block_tokens: int
     """Global tokens addressed by one history block ID."""
     num_workers: int
-    """Workers holding a distinct main-K/V shard (TP x DCP x PP ranks)."""
+    """Workers holding a main-K/V shard (TP x PP ranks, including DCP ranks)."""
     main_kv_bytes_per_block: int
     """Main QSA K/V bytes of one history block on one worker (all layers)."""
     index_bytes_per_block: int
     """GPU bytes of one history block on one worker: compressed index pages,
     shared with the compressor ring."""
     state_bytes_per_block: int
-    """GPU bytes of one state block ID on one worker (every owner page plus
-    standalone drafter pages)."""
+    """GPU bytes of one state block ID on one worker: one owner-shaped page
+    for every physical main-KV owner that hosts a state or drafter layer,
+    plus the standalone drafter pages."""
     unified_bytes_per_block: int
     """Bytes of one block in today's unified pool, for reference."""
     state_blocks_per_request: int
@@ -95,7 +112,7 @@ class LongContextGeometry:
     max_model_len: int
     """Context limit the startup check must cover."""
     hot_group_tokens: int
-    """Tokens per hot-page group (the indexer compression ratio)."""
+    """Local tokens per physical hot slot, currently four."""
     hot_row_groups: int
     """Distinct groups one query row can select (top-k groups plus the
     uncompressed tail)."""
@@ -103,6 +120,12 @@ class LongContextGeometry:
     """Query rows of one request in a decode/verify step (1 + draft tokens)."""
     group_domains: tuple[tuple[int, ...], ...]
     """Domains charged by each KV cache group, in group order."""
+    dcp_world_size: int = 1
+    hot_layers: int = 1
+    hot_max_write_rows: int = 1
+    hot_query_heads: int = 1
+    hot_head_dim: int = 256
+    hot_kv_heads: int = 1
 
     @property
     def host_bytes_per_block(self) -> int:
@@ -124,23 +147,79 @@ class LongContextGeometry:
         attention reads it, and the newest tokens stay pinned. A request can
         never need more groups than its own history has.
         """
-        groups = cdiv(max(num_tokens, 1), self.hot_group_tokens)
+        groups = cdiv(
+            cdiv(max(num_tokens, 1), self.dcp_world_size), self.hot_group_tokens
+        )
         bound = self.decode_rows_per_request * min(self.hot_row_groups, groups) + min(
             self.hot_tail_groups, groups
         )
         return min(groups, bound)
 
-    def hot_groups_for_bytes(self, num_bytes: int) -> int:
-        """Hot-pool groups (per layer) that ``num_bytes`` per worker hold."""
-        return (num_bytes * self.block_tokens) // (
-            self.main_kv_bytes_per_block * self.hot_group_tokens
-        )
-
-    def hot_bytes_for_groups(self, groups: int) -> int:
+    @property
+    def hot_slot_bytes(self) -> int:
+        """All layers' payload for one worker-local four-token slot."""
         return cdiv(
-            groups * self.main_kv_bytes_per_block * self.hot_group_tokens,
+            self.main_kv_bytes_per_block * self.dcp_world_size * self.hot_group_tokens,
             self.block_tokens,
         )
+
+    def hot_memory_bytes(self, groups: int, max_num_seqs: int = 1) -> dict[str, int]:
+        """Decode/verify prototype allocations per worker, including workspace.
+
+        This describes bucket eviction and the fixed Triton attention plan.
+        Prefill staging, CUDA graph pools and allocator overhead are separate.
+        It does not establish engine integration or physical concurrency.
+        """
+        from vllm.models.qwen4_exp.nvidia.host_kv.pool import HostKVConfig
+        from vllm.models.qwen4_exp.nvidia.ops.qsa import _qsa_sparse_launch_profile
+
+        local_tokens = cdiv(self.max_model_len, self.dcp_world_size)
+        rows = max_num_seqs * self.decode_rows_per_request
+        width = 4 * (self.hot_row_groups - 1) + 3
+        config = HostKVConfig(
+            requests=max_num_seqs,
+            max_tokens=local_tokens,
+            rows=rows,
+            selection_width=width,
+            max_write_rows=self.hot_max_write_rows,
+            hot_groups=groups,
+            qsa_block_topk=self.hot_row_groups - 1,
+            qsa_group_columns=2 if self.dcp_world_size == 2 else 4,
+        )
+        token_bytes = self.hot_slot_bytes // (4 * self.hot_layers)
+        parts = config.device_memory_bytes(
+            page_tokens=self.block_tokens // self.dcp_world_size,
+            token_bytes=token_bytes,
+        )
+        group = self.hot_query_heads // self.hot_kv_heads
+        block_n, target, _ = _qsa_sparse_launch_profile(
+            rows * self.hot_kv_heads,
+            1 << (group - 1).bit_length(),
+            True,
+        )
+        tiles = cdiv(width, block_n)
+        splits = min(1 << (tiles.bit_length() - 1), target)
+        attention = rows * self.hot_query_heads * (2 * self.hot_head_dim + 4)
+        if splits > 1:
+            attention += (
+                splits * rows * self.hot_query_heads * (4 * self.hot_head_dim + 4)
+            )
+        parts["workspace"] += attention
+        return {name: value * self.hot_layers for name, value in parts.items()}
+
+    def hot_groups_for_bytes(self, num_bytes: int, max_num_seqs: int = 1) -> int:
+        """Largest slot count covered by the full per-worker device budget."""
+        low, high = 0, num_bytes // self.hot_slot_bytes
+        while low < high:
+            mid = (low + high + 1) // 2
+            if self.hot_bytes_for_groups(mid, max_num_seqs) <= num_bytes:
+                low = mid
+            else:
+                high = mid - 1
+        return low
+
+    def hot_bytes_for_groups(self, groups: int, max_num_seqs: int = 1) -> int:
+        return sum(self.hot_memory_bytes(groups, max_num_seqs).values())
 
 
 @dataclass(frozen=True)
@@ -162,10 +241,28 @@ class LongContextCapacityPlan:
     host_history_blocks: int
     hot_pool_groups: int
     prewarm_hot_pool: bool = True
+    main_kv_on_gpu: bool = False
+    """Main QSA K/V pages stay in the GPU history segment (addressed by the
+    history block ID, next to the index pages) instead of the host pool. Set
+    by the startup path until the host pool serves the attention; the hot
+    pool then takes no GPU memory and only budgets admission."""
 
     @property
     def gpu_state_bytes(self) -> int:
         return (self.state_blocks + 1) * self.geometry.state_bytes_per_block
+
+    @property
+    def history_bytes_per_block(self) -> int:
+        """GPU bytes of one history block ID on one worker."""
+        geo = self.geometry
+        return geo.index_bytes_per_block + (
+            geo.main_kv_bytes_per_block if self.main_kv_on_gpu else 0
+        )
+
+    @property
+    def gpu_hot_pool_bytes(self) -> int:
+        """GPU memory the hot-page pool takes (none while main K/V is on GPU)."""
+        return 0 if self.main_kv_on_gpu else self.hot_pool_bytes
 
     @property
     def gpu_history_budget_bytes(self) -> int:
@@ -173,8 +270,23 @@ class LongContextCapacityPlan:
         return (
             self.gpu_budget_bytes
             - self.gpu_state_bytes
-            - self.hot_pool_bytes
+            - self.gpu_hot_pool_bytes
             - self.staging_bytes
+        )
+
+    @property
+    def gpu_history_bytes(self) -> int:
+        return (self.gpu_history_blocks + 1) * self.history_bytes_per_block
+
+    def segment_num_blocks(self) -> tuple[int, int]:
+        """Blocks of the (state, history) segments, null blocks included."""
+        return self.state_blocks + 1, self.gpu_history_blocks + 1
+
+    def group_segments(self) -> tuple[int, ...]:
+        """Physical segment of each KV cache group."""
+        return tuple(
+            STATE_SEGMENT if STATE in domains else HISTORY_SEGMENT
+            for domains in self.geometry.group_domains
         )
 
     def capacity(self, domain: int) -> int:
@@ -183,7 +295,7 @@ class LongContextCapacityPlan:
         ]
 
     def max_concurrency(self, num_tokens: int) -> dict[str, int]:
-        """Requests of ``num_tokens`` each domain could hold at once."""
+        """Arithmetic domain bounds for decode. Physical concurrency is unverified."""
         geo = self.geometry
         history = geo.history_blocks(num_tokens)
         return {
@@ -234,20 +346,21 @@ class LongContextCapacityPlan:
             )
         hot_need = geo.hot_reserve_groups(max_len)
         if self.hot_pool_groups < hot_need:
+            hot_gib = _ceil_gib(geo.hot_bytes_for_groups(hot_need, self.max_num_seqs))
             problems.append(
                 f"{HOT_POOL_NAME} holds {self.hot_pool_groups} groups per layer "
                 f"but one request reserves {hot_need}; set hot_pool_gib >= "
-                f"{_ceil_gib(geo.hot_bytes_for_groups(hot_need)):.2f}."
+                f"{hot_gib:.2f}."
             )
         gpu_need = (history + geo.ring_blocks_per_request + 1) * (
-            geo.index_bytes_per_block
+            self.history_bytes_per_block
         )
         if self.gpu_history_blocks < history + geo.ring_blocks_per_request:
             left = self.gpu_history_budget_bytes
             problems.append(
                 f"{DOMAIN_NAMES[GPU_HISTORY]} has {_fmt_gib(max(left, 0))} per GPU "
                 f"after state {_fmt_gib(self.gpu_state_bytes)}, hot pool "
-                f"{_fmt_gib(self.hot_pool_bytes)} and staging "
+                f"{_fmt_gib(self.gpu_hot_pool_bytes)} and staging "
                 f"{_fmt_gib(self.staging_bytes)} (of "
                 f"{_fmt_gib(self.gpu_budget_bytes)}), but one request needs "
                 f"{_fmt_gib(gpu_need)}; free "
@@ -267,20 +380,25 @@ class LongContextCapacityPlan:
         geo = self.geometry
         max_len = geo.max_model_len
         concurrency = self.max_concurrency(max_len)
-        history_bytes = (self.gpu_history_blocks + 1) * geo.index_bytes_per_block
+        main_kv = (
+            "main K/V on GPU in the history segment, hot pool budgets admission only"
+            if self.main_kv_on_gpu
+            else "main K/V in the host pool"
+        )
         return (
-            f"long-context KV plan: GPU budget {_fmt_gib(self.gpu_budget_bytes)}"
+            f"long-context KV plan ({main_kv}): GPU budget "
+            f"{_fmt_gib(self.gpu_budget_bytes)}"
             f"/GPU = state {self.state_blocks}+1 blocks "
             f"({_fmt_gib(self.gpu_state_bytes)}) + hot pool "
             f"{self.hot_pool_groups} groups/layer "
-            f"({_fmt_gib(self.hot_pool_bytes)}) + staging "
+            f"({_fmt_gib(self.gpu_hot_pool_bytes)}) + staging "
             f"{_fmt_gib(self.staging_bytes)} + history {self.gpu_history_blocks}"
-            f"+1 blocks ({_fmt_gib(history_bytes)}); host pool "
+            f"+1 blocks ({_fmt_gib(self.gpu_history_bytes)}); host pool "
             f"{self.host_history_blocks} blocks "
             f"({self.host_history_blocks * geo.block_tokens:,} tokens, "
             f"{_fmt_gib(self.host_history_blocks * geo.host_bytes_per_block)} "
             f"over {geo.num_workers} workers); requests of {max_len:,} tokens "
-            f"held at once: "
+            "arithmetic domain bounds (physical concurrency unverified): "
             + ", ".join(f"{name} {count}" for name, count in concurrency.items())
         )
 
@@ -290,8 +408,13 @@ def plan_long_context_capacity(
     geometry: LongContextGeometry,
     gpu_budget_bytes: int,
     max_num_seqs: int,
+    *,
+    main_kv_on_gpu: bool = False,
 ) -> LongContextCapacityPlan:
-    """Split one worker's KV budget and the configured pools into domains."""
+    """Split one worker's KV budget and the configured pools into domains.
+
+    ``main_kv_on_gpu`` keeps the main K/V pages in the GPU history segment
+    (see ``LongContextCapacityPlan.main_kv_on_gpu``)."""
     settings.validate_settings()
     if settings.host_pool_tokens is not None:
         host_blocks = settings.host_pool_tokens // geometry.block_tokens
@@ -303,7 +426,9 @@ def plan_long_context_capacity(
     host_bytes = host_blocks * geometry.host_bytes_per_block
 
     if settings.hot_pool_gib is not None:
-        hot_groups = geometry.hot_groups_for_bytes(int(settings.hot_pool_gib * GiB))
+        hot_groups = geometry.hot_groups_for_bytes(
+            int(settings.hot_pool_gib * GiB), max_num_seqs
+        )
     else:
         from vllm.config.kernel import LONG_CONTEXT_DEFAULT_HOT_POOL_RATIO
 
@@ -312,9 +437,11 @@ def plan_long_context_capacity(
             if settings.hot_pool_ratio is not None
             else LONG_CONTEXT_DEFAULT_HOT_POOL_RATIO
         )
-        hot_tokens = int(host_blocks * geometry.block_tokens * ratio)
+        hot_tokens = int(
+            host_blocks * geometry.block_tokens * ratio / geometry.dcp_world_size
+        )
         hot_groups = hot_tokens // geometry.hot_group_tokens
-    hot_bytes = geometry.hot_bytes_for_groups(hot_groups)
+    hot_bytes = geometry.hot_bytes_for_groups(hot_groups, max_num_seqs)
     staging = int(settings.prefill_staging_gib * GiB)
 
     state_blocks = (
@@ -334,9 +461,10 @@ def plan_long_context_capacity(
         host_history_blocks=host_blocks,
         hot_pool_groups=hot_groups,
         prewarm_hot_pool=settings.prewarm_hot_pool,
+        main_kv_on_gpu=main_kv_on_gpu,
     )
     left = plan.gpu_history_budget_bytes
-    history_blocks = max(left // geometry.index_bytes_per_block - 1, 0)
+    history_blocks = max(left // plan.history_bytes_per_block - 1, 0)
     return replace(plan, gpu_history_blocks=history_blocks)
 
 
@@ -364,6 +492,10 @@ class LongContextAdmissionLedger:
 
     plan: LongContextCapacityPlan
     num_blocks: int
+    physical_segments: bool = False
+    """The state and GPU history domains are separate block pools that
+    enforce themselves; the ledger only observes the history pool and admits
+    against the host and hot-page pools."""
     in_use: list[int] = field(default_factory=lambda: [0, 0, 0])
     hot_used: int = 0
     blocked: list[int] = field(default_factory=lambda: [0, 0, 0, 0])
@@ -420,6 +552,13 @@ class LongContextAdmissionLedger:
                 self.in_use[domain] -= 1
 
     # -- admission ------------------------------------------------------------
+    @property
+    def ledger_domains(self) -> tuple[int, ...]:
+        """Block domains this ledger admits against (the others are pools)."""
+        if self.physical_segments:
+            return (HOST,)
+        return (STATE, GPU_HISTORY, HOST)
+
     def free(self, domain: int) -> int:
         return self.capacity[domain] - self.in_use[domain]
 
@@ -438,21 +577,32 @@ class LongContextAdmissionLedger:
         )
 
     def blocking_domain(
-        self, request: Request, per_group_blocks: Sequence[int]
+        self,
+        request: Request,
+        per_group_blocks: Sequence[int],
+        reserved_per_group: Sequence[int] | None = None,
     ) -> int | None:
         """The first domain without room for this step, or None if all fit."""
         demand = self.domain_demand(per_group_blocks)
-        for domain in (STATE, GPU_HISTORY, HOST):
+        if reserved_per_group is not None:
+            reserved = self.domain_demand(reserved_per_group)
+            demand = [used + future for used, future in zip(demand, reserved)]
+        for domain in self.ledger_domains:
             if demand[domain] > self.free(domain):
                 return domain
-        if request.request_id not in self._hot:
-            need = self.plan.geometry.hot_reserve_groups(self.hot_tokens(request))
-            if self.hot_used + need > self.plan.hot_pool_groups:
-                return HOT
+        need = self.plan.geometry.hot_reserve_groups(self.hot_tokens(request))
+        additional = max(need - self._hot.get(request.request_id, 0), 0)
+        if self.hot_used + additional > self.plan.hot_pool_groups:
+            return HOT
         return None
 
-    def admit(self, request: Request, per_group_blocks: Sequence[int]) -> bool:
-        domain = self.blocking_domain(request, per_group_blocks)
+    def admit(
+        self,
+        request: Request,
+        per_group_blocks: Sequence[int],
+        reserved_per_group: Sequence[int] | None = None,
+    ) -> bool:
+        domain = self.blocking_domain(request, per_group_blocks, reserved_per_group)
         if domain is None:
             return True
         self.blocked[domain] += 1
@@ -465,12 +615,13 @@ class LongContextAdmissionLedger:
         return False
 
     def commit(self, request: Request) -> None:
-        """Reserve hot-pool room once the request holds blocks."""
-        if request.request_id in self._hot:
-            return
-        groups = self.plan.geometry.hot_reserve_groups(self.hot_tokens(request))
+        """Reserve through completion, including any appended streaming input."""
+        previous = self._hot.get(request.request_id, 0)
+        groups = max(
+            previous, self.plan.geometry.hot_reserve_groups(self.hot_tokens(request))
+        )
         self._hot[request.request_id] = groups
-        self.hot_used += groups
+        self.hot_used += groups - previous
 
     def release(self, request_id: str) -> None:
         self.hot_used -= self._hot.pop(request_id, 0)

@@ -154,7 +154,7 @@ def _oracle(specs: list[KVCacheSpec], present: dict[int, set[int]], limit: int) 
 def test_required_blocks_per_need():
     prefix = GroupHitRule(0, HitNeed.PREFIX, 16)
     state = GroupHitRule(1, HitNeed.STATE, 16)
-    window = GroupHitRule(2, HitNeed.WINDOW, 16, window_blocks=3)
+    window = GroupHitRule(2, HitNeed.WINDOW, 16, window_tokens=48)
     assert list(prefix.required_blocks(80)) == [0, 1, 2, 3, 4]
     assert list(state.required_blocks(80)) == [4]
     assert list(window.required_blocks(80)) == [2, 3, 4]
@@ -166,6 +166,74 @@ def test_required_blocks_per_need():
     # A hit inside a block needs that block; a window then counts one more.
     assert list(prefix.required_blocks(72)) == [0, 1, 2, 3, 4]
     assert list(window.required_blocks(72)) == [1, 2, 3, 4]
+
+
+@pytest.mark.parametrize("block_size", [4, 12, 16, 32])
+@pytest.mark.parametrize("window", [1, 2, 16, 17, 32, 45, 65])
+def test_window_blocks_match_token_interval(block_size, window):
+    rule = GroupHitRule(0, HitNeed.WINDOW, block_size, window_tokens=window - 1)
+    for end in range(1, 3 * block_size + window):
+        # A token interval oracle, independent of the block endpoint formula.
+        required = {
+            token // block_size for token in range(max(0, end - window + 1), end)
+        }
+        # A partial current page is retained even for a one-token window.
+        if end % block_size:
+            required.add(end // block_size)
+        assert set(rule.required_blocks(end)) == required
+
+
+@pytest.mark.parametrize("probe_group", [0, 7])
+@pytest.mark.parametrize("cap_blocks", [1, 2])
+def test_prefix_probe_cap_preserves_eagle_state_lookup(probe_group, cap_blocks):
+    config = KVCacheConfig(
+        num_blocks=64,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["full"], _full()),
+            KVCacheGroupSpec(["state"], _mamba()),
+        ],
+    )
+    manager = KVCacheManager(
+        config,
+        max_model_len=4096,
+        hash_block_size=BS,
+        enable_caching=True,
+        use_eagle=True,
+        cross_group_hit_check=True,
+    )
+    request = _request(4)
+    _cache(manager, request, {0: {0, 1, 2, 3}, 1: {cap_blocks - 1}})
+    before = manager.get_computed_blocks(request)[1]
+    assert before == cap_blocks * BS
+    manager.hit_contract.register_probe(
+        probe_group,
+        lambda g, i, h, bid: i < cap_blocks,
+        block_size=BS,
+    )
+    assert manager.get_computed_blocks(request)[1] == before
+    manager.hit_contract.register_probe(probe_group, lambda g, i, h, bid: False)
+    assert manager.get_computed_blocks(request)[1] == 0
+
+
+@pytest.mark.parametrize("group_id", [0, 1])
+def test_probe_exception_is_a_miss(group_id):
+    manager = _manager([_full(), _mamba()], check=True)
+    request = _request(3)
+    _cache(manager, request, {0: {0, 1, 2}, 1: {1}})
+
+    def failed_probe(*args):
+        raise OSError("host read failed")
+
+    manager.hit_contract.register_probe(group_id, failed_probe)
+    assert manager.get_computed_blocks(request)[1] == 0
+
+
+def test_probe_only_group_requires_hash_grid():
+    manager = _manager([_full(), _mamba()], check=True)
+    with pytest.raises(ValueError, match="multiple of hash_block_size"):
+        manager.hit_contract.register_probe(7, lambda *args: True, block_size=BS + 1)
+    assert 7 not in manager.hit_contract.rules
 
 
 def test_flag_reads_only_a_real_true():
@@ -188,7 +256,7 @@ def test_rules_follow_the_managers():
         HitNeed.STATE,
         HitNeed.WINDOW,
     ]
-    assert rules[3].window_blocks == SW_BLOCKS
+    assert rules[3].window_tokens == _window().sliding_window - 1
     assert _manager([_full(), _mamba()], check=False).hit_contract is None
 
 

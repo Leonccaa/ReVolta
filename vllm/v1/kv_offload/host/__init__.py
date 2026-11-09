@@ -1,3 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Host KV support utilities."""
+"""Opt-in host-authoritative main-KV prefix storage (host-history integration
+integration contract)."""

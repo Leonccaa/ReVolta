@@ -1020,6 +1020,10 @@ class KVCacheTensor:
     """Attention layers that split each physical block of this tensor,
     interleaved one kernel block at a time in this order. ``None`` means at
     most one attention layer owns each block."""
+    num_blocks: int | None = None
+    """Blocks this tensor holds when the KV cache has separate block spaces
+    (``KVCacheConfig.block_segments``); ``None`` means
+    ``KVCacheConfig.num_blocks``."""
 
 
 @dataclass
@@ -1035,6 +1039,40 @@ class KVCacheGroupSpec:
     kv_cache_spec: KVCacheSpec
     # Whether this group contains EAGLE/MTP draft attention layers.
     is_eagle_group: bool = False
+
+
+@dataclass(frozen=True)
+class KVBlockSegments:
+    """Independent block-ID spaces of one KV cache (long-context mode).
+
+    Each segment has its own block pool, null block (ID 0), free queue,
+    prefix-cache hash map and eviction; a block ID is only meaningful inside
+    its segment. Every KV cache group lives in exactly one segment, and the
+    tensors of its layers hold that segment's number of blocks.
+    """
+
+    names: tuple[str, ...]
+    """Display name of each segment."""
+    num_blocks: tuple[int, ...]
+    """Blocks of each segment, including its null block."""
+    group_segments: tuple[int, ...]
+    """Segment of each KV cache group, in group order."""
+    primary: int
+    """Segment whose count is ``KVCacheConfig.num_blocks`` and whose pool
+    serves pool-wide consumers (connectors binding one GPU block pool)."""
+
+    def __post_init__(self) -> None:
+        if len(self.names) != len(self.num_blocks):
+            raise ValueError("KVBlockSegments needs one name per segment.")
+        if any(n < 1 for n in self.num_blocks):
+            raise ValueError("Every KV block segment needs its null block.")
+        if any(not 0 <= s < len(self.num_blocks) for s in self.group_segments):
+            raise ValueError("KV cache group assigned to an unknown segment.")
+        if not 0 <= self.primary < len(self.num_blocks):
+            raise ValueError("Unknown primary KV block segment.")
+
+    def group_num_blocks(self, group_id: int) -> int:
+        return self.num_blocks[self.group_segments[group_id]]
 
 
 @dataclass
@@ -1058,6 +1096,32 @@ class KVCacheConfig:
     long_context_plan: LongContextCapacityPlan | None = None
     """Domain capacities of the long-context (Active Host KV) mode; None when
     the mode is off. The scheduler's KV cache manager admits against it."""
+    block_segments: KVBlockSegments | None = None
+    """Separate block-ID spaces (long-context mode: a GPU state segment and a
+    GPU history segment). None: one pool of ``num_blocks`` shared by every
+    group, as before. With segments, ``num_blocks`` is the primary segment's
+    count; use ``group_num_blocks`` / ``tensor_num_blocks``."""
+
+    def group_num_blocks(self, group_id: int) -> int:
+        """Blocks addressable by the given KV cache group's block IDs."""
+        if self.block_segments is None:
+            return self.num_blocks
+        return self.block_segments.group_num_blocks(group_id)
+
+    def in_primary_block_space(self, group_id: int) -> bool:
+        """Whether a group's block IDs are those of ``num_blocks`` (always,
+        without block segments). The scheduler announces new blocks for
+        zeroing in the primary space only, so workers zero only its layers."""
+        segments = self.block_segments
+        if segments is None or group_id >= len(segments.group_segments):
+            return True
+        return segments.group_segments[group_id] == segments.primary
+
+    def tensor_num_blocks(self, tensor: KVCacheTensor) -> int:
+        """Blocks held by one of ``kv_cache_tensors``."""
+        if tensor.num_blocks is None:
+            return self.num_blocks
+        return tensor.num_blocks
 
     @property
     def has_mamba_layers(self) -> bool:
@@ -1066,3 +1130,15 @@ class KVCacheConfig:
     @property
     def needs_kv_cache_zeroing(self) -> bool:
         return self.has_mamba_layers
+
+
+def kv_tensor_num_blocks(config: KVCacheConfig, tensor: KVCacheTensor) -> int:
+    """Blocks of one of ``config.kv_cache_tensors``; tolerant of configs and
+    tensors built without the block-space fields (test doubles)."""
+    num_blocks = getattr(tensor, "num_blocks", None)
+    return num_blocks if isinstance(num_blocks, int) else config.num_blocks
+
+
+def has_block_segments(config: object) -> bool:
+    """Whether a KV cache config has separate block spaces."""
+    return isinstance(getattr(config, "block_segments", None), KVBlockSegments)

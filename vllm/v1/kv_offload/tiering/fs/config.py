@@ -4,6 +4,7 @@
 
 import fcntl
 import json
+import math
 import os
 from collections.abc import Callable
 from contextlib import ExitStack
@@ -31,6 +32,60 @@ def validate_fs_budget(max_size_bytes: Any, min_free_bytes: Any = None) -> None:
 FS_TIER_TYPES = ("fs", "revolta_fs")
 
 
+def host_kv_ssd_config(config: "KVTransferConfig | None") -> dict | None:
+    """Opt-in direct host-KV persistence options; no pool or I/O is created.
+
+    host-history integration supplies the host pool and calls HostKVPrefixCache
+    explicitly. Register
+    its root here as well so EngineCore uses the existing persistent hash seed.
+    This does not route main KV through the ordinary CPU offload pool.
+    """
+    if config is None or config.kv_connector != "OffloadingConnector":
+        return None
+    options = config.kv_connector_extra_config.get("host_kv.ssd", {})
+    if not isinstance(options, dict) or type(options.get("enabled", False)) is not bool:
+        raise ValueError("host_kv.ssd must be a dict with a boolean enabled")
+    if not options.get("enabled", False):
+        return None
+    allowed = {
+        "enabled",
+        "root_dir",
+        "max_size_bytes",
+        "min_free_bytes",
+        "max_files",
+        "content_manifest_path",
+        "content_verify",
+        "max_pending_blocks",
+        "write_bytes_per_second",
+        "drain_timeout_s",
+    }
+    if options.keys() - allowed:
+        raise ValueError("Unknown host_kv.ssd options")
+    validate_fs_budget(options.get("max_size_bytes"), options.get("min_free_bytes"))
+    if not isinstance(options.get("root_dir"), str) or not options["root_dir"]:
+        raise ValueError("host_kv.ssd requires a non-empty root_dir")
+    options = dict(options)
+    for name, default in (
+        ("max_pending_blocks", 64),
+        ("write_bytes_per_second", 64 << 20),
+        ("max_files", 1_000_000),
+    ):
+        value = options.setdefault(name, default)
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"host_kv.ssd {name} must be a positive integer")
+    timeout = options.setdefault("drain_timeout_s", 30.0)
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or not math.isfinite(timeout)
+        or timeout < 0
+    ):
+        raise ValueError("host_kv.ssd drain_timeout_s must be finite and >= 0")
+    if options.get("content_verify", "stat") not in ("stat", "full"):
+        raise ValueError("host_kv.ssd content_verify must be stat or full")
+    return options
+
+
 def fs_tier_configs(config: "KVTransferConfig | None") -> list[dict]:
     if config is None or config.kv_connector != "OffloadingConnector":
         return []
@@ -38,6 +93,11 @@ def fs_tier_configs(config: "KVTransferConfig | None") -> list[dict]:
     if not isinstance(tiers, list) or any(not isinstance(t, dict) for t in tiers):
         raise ValueError("secondary_tiers must be a list of tier configurations")
     result = [tier for tier in tiers if tier.get("type") in FS_TIER_TYPES]
+    host = host_kv_ssd_config(config)
+    if host is not None:
+        # Seed registration only: TieringOffloadingSpec still constructs its
+        # ordinary secondary tiers solely from secondary_tiers.
+        result.append({**host, "type": "revolta_fs"})
     for tier in result:
         validate_fs_budget(tier.get("max_size_bytes"), tier.get("min_free_bytes"))
         if not isinstance(tier.get("root_dir"), str) or not tier["root_dir"]:

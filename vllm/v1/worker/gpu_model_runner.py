@@ -2221,7 +2221,15 @@ class GPUModelRunner(
         """
         self._kv_block_zeroer = KVBlockZeroer(self.device, self.pin_memory)
         self._kv_block_zeroer.init_meta(
-            attn_groups_iter=self._kv_cache_spec_attn_group_iterator(),
+            # With separate block spaces the IDs to zero name primary-space
+            # blocks only; another space's tensors must not be touched.
+            attn_groups_iter=(
+                group
+                for group in self._kv_cache_spec_attn_group_iterator()
+                # getattr: tests may build the runner without __init__.
+                if getattr(self, "kv_cache_config", None) is None
+                or self.kv_cache_config.in_primary_block_space(group.kv_cache_group_id)
+            ),
             kernel_block_sizes=self._kernel_block_sizes,
             cache_dtype=self.cache_config.cache_dtype,
             runner_only_attn_layers=self.runner_only_attn_layers,

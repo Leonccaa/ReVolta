@@ -21,6 +21,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MambaSpec,
     UniformTypeKVCacheSpecs,
+    has_block_segments,
 )
 from vllm.v1.request import Request
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
@@ -117,6 +118,23 @@ def warmup_kernels(
 
     block_count = _warmup_block_counter(model_runner)
     kv_cache_specs = [group.kv_cache_spec for group in kv_cache_groups]
+    # Block IDs are numbered per block space: one space normally, a state and
+    # a history space in long-context mode (KVCacheConfig.block_segments).
+    segments = (
+        model_runner.kv_cache_config.block_segments
+        if has_block_segments(model_runner.kv_cache_config)
+        else None
+    )
+    group_spaces = (
+        list(segments.group_segments)
+        if segments is not None
+        else [0] * num_kv_cache_groups
+    )
+    space_blocks = (
+        list(segments.num_blocks)
+        if segments is not None
+        else [model_runner.kv_cache_config.num_blocks]
+    )
 
     # SamplingParams exercising all sampling features.
     if model_runner.is_pooling_model:
@@ -143,15 +161,18 @@ def warmup_kernels(
             decode_block_deltas = [
                 d - p for d, p in zip(decode_block_counts, prefill_block_counts)
             ]
-            max_blocks_per_req = sum(decode_block_counts)
+            space_blocks_per_req = [0] * len(space_blocks)
+            for space, count in zip(group_spaces, decode_block_counts):
+                space_blocks_per_req[space] += count
             num_reqs = min(
                 model_runner.scheduler_config.max_num_seqs,
                 model_runner.scheduler_config.max_num_batched_tokens
                 // max(prompt_len, 1 + num_spec_steps),
                 # Reserve block 0 (null block) and ensure enough blocks.
-                max(
-                    1,
-                    (model_runner.kv_cache_config.num_blocks - 1) // max_blocks_per_req,
+                *(
+                    max(1, (blocks - 1) // per_req)
+                    for blocks, per_req in zip(space_blocks, space_blocks_per_req)
+                    if per_req
                 ),
             )
             if profile_idx:
@@ -160,13 +181,15 @@ def warmup_kernels(
                 continue
 
             req_ids = [f"_warmup_{profile_idx}_{i}_" for i in range(num_reqs)]
-            next_block_id = 1
+            next_block_ids = [1] * len(space_blocks)
 
-            def _alloc_blocks(num_blocks: int) -> list[int]:
-                nonlocal next_block_id
-                return list(
-                    range(next_block_id, next_block_id := next_block_id + num_blocks)
-                )
+            def _alloc_blocks(
+                num_blocks: int, group_id: int, next_ids: list[int] = next_block_ids
+            ) -> list[int]:
+                space = group_spaces[group_id]
+                first = next_ids[space]
+                next_ids[space] = first + num_blocks
+                return list(range(first, first + num_blocks))
 
             new_reqs = [
                 NewRequestData.from_request(
@@ -176,7 +199,9 @@ def warmup_kernels(
                         sampling_params,
                         pooling_params,
                     ),
-                    block_ids=tuple(_alloc_blocks(n) for n in prefill_block_counts),
+                    block_ids=tuple(
+                        _alloc_blocks(n, g) for g, n in enumerate(prefill_block_counts)
+                    ),
                     prefill_token_ids=prompt_token_ids,
                 )
                 for i in range(num_reqs)
@@ -214,7 +239,10 @@ def warmup_kernels(
                 new_block = any(decode_block_deltas)
                 cached_req_data.new_block_ids = [
                     (
-                        tuple(_alloc_blocks(n) for n in decode_block_deltas)
+                        tuple(
+                            _alloc_blocks(n, g)
+                            for g, n in enumerate(decode_block_deltas)
+                        )
                         if new_block
                         else None
                     )

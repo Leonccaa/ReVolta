@@ -84,6 +84,23 @@ def _fill(pool, length=None):
     return rows
 
 
+@pytest.mark.parametrize("policy", ["bucket", "lru"])
+@pytest.mark.parametrize("e4m3", [False, True])
+def test_device_memory_account_matches_allocated_tensors(policy, e4m3):
+    pool = _pool(_config(eviction_policy=policy), e4m3=e4m3)
+    actual = sum(
+        t.numel() * t.element_size()
+        for name, t in vars(pool).items()
+        if isinstance(t, torch.Tensor) and name not in ("host", "host_device")
+    )
+    parts = pool.config.device_memory_bytes(
+        page_tokens=pool.page_tokens,
+        token_bytes=2 * pool.heads * pool.dim * pool.hot.element_size(),
+    )
+    assert parts["payload"] == pool.hot.numel() * pool.hot.element_size()
+    assert sum(parts.values()) == actual
+
+
 def _step(pool, tokens, length=None, requests=None, qpos=None):
     c = pool.config
     length = c.max_tokens if length is None else length

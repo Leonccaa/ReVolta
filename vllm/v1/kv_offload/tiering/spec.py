@@ -38,7 +38,7 @@ from typing_extensions import override
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, kv_tensor_num_blocks
 from vllm.v1.kv_offload.base import CanonicalKVCaches, OffloadingManager
 from vllm.v1.kv_offload.cpu.gpu_worker import CpuGpuOffloadingHandlers
 from vllm.v1.kv_offload.cpu.manager import GroupedCPUOffloadingManager
@@ -105,7 +105,8 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 "group_pages": self.cpu_group_page_sizes,
                 "tensors": [
                     {
-                        "page_size": tensor.size // kv_cache_config.num_blocks,
+                        "page_size": tensor.size
+                        // kv_tensor_num_blocks(kv_cache_config, tensor),
                         "shared_by": list(tensor.shared_by),
                     }
                     for tensor in kv_cache_config.kv_cache_tensors

@@ -3,6 +3,7 @@
 """Long-context (Active Host KV) configuration, capacity plan and startup check."""
 
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pydantic
 import pytest
@@ -76,8 +77,55 @@ def test_production_geometry_reproduces_the_m0_ledger():
     # 512 top-k groups + tail group per row, 8 verify rows, 9 pinned groups.
     assert (geo.hot_row_groups, geo.decode_rows_per_request) == (513, 8)
     assert geo.hot_reserve_groups(MI) == 8 * 513 + 9
-    assert geo.hot_reserve_groups(100) == 25  # never more than its history
+    assert geo.hot_reserve_groups(100) == 13  # never more than its history
     assert geometry(num_spec=0).hot_reserve_groups(MI) == 513 + 9
+
+
+def test_hot_slots_use_worker_local_dcp_geometry():
+    geo = geometry()
+    # Twelve layers of [slot, K/V, four LOCAL tokens, head=1, dim=256] uint8.
+    assert geo.hot_slot_bytes == 12 * 2 * 4 * 256 == 24_576
+    rank0_tokens = [
+        (4 * group + offset) // 2 for group in range(0, 1024, 2) for offset in (0, 2)
+    ]
+    assert len({token // 4 for token in rank0_tokens}) == 512
+    parts = geo.hot_memory_bytes(4113, 1)
+    assert parts["payload"] == 4113 * 24_576
+    assert parts["metadata"] > 0
+    assert parts["workspace"] > 0
+    budget = geo.hot_bytes_for_groups(4113, 1)
+    assert geo.hot_groups_for_bytes(budget, 1) == 4113
+    assert geo.hot_groups_for_bytes(budget - 1, 1) == 4112
+
+
+def test_hot_memory_includes_actual_attention_workspace():
+    from vllm.models.qwen4_exp.nvidia.host_kv.attention import SparseAttentionPlan
+    from vllm.models.qwen4_exp.nvidia.host_kv.pool import HostKVConfig
+
+    geo = geometry(max_model_len=128)
+    rows = 8
+    plan = SparseAttentionPlan(
+        rows=rows,
+        query_heads=24,
+        kv_heads=1,
+        head_dim=256,
+        selection_width=2051,
+        device="cpu",
+        e4m3=True,
+    )
+    storages = {
+        t.data_ptr(): t.numel() * t.element_size()
+        for t in vars(plan).values()
+        if isinstance(t, torch.Tensor)
+    }
+    config = HostKVConfig(
+        1, 64, rows, 2051, 8192, hot_groups=16, qsa_block_topk=512, qsa_group_columns=2
+    )
+    pool_parts = config.device_memory_bytes(page_tokens=832, token_bytes=512)
+    actual = geo.hot_memory_bytes(16)
+    assert actual["workspace"] == 12 * (
+        pool_parts["workspace"] + sum(storages.values())
+    )
 
 
 def expected(n, max_len, *, replay, shard, hot_gib, host_gib):
@@ -85,8 +133,9 @@ def expected(n, max_len, *, replay, shard, hot_gib, host_gib):
     state_per_req = 6 * (2 if replay else 9) + 2 + 15
     state_blocks = n * state_per_req
     index_bytes = INDEX_BLOCK_BYTES // (2 if shard else 1)
-    hot_groups = int(hot_gib * GiB) * SPAN // (MAIN_KV_BLOCK_BYTES * 4)
-    hot_bytes = -(-hot_groups * MAIN_KV_BLOCK_BYTES * 4 // SPAN)
+    geo = geometry(max_model_len=max_len, speculative_blocks=0 if replay else 7)
+    hot_groups = geo.hot_groups_for_bytes(int(hot_gib * GiB), n)
+    hot_bytes = geo.hot_bytes_for_groups(hot_groups, n)
     left = GPU_BUDGET - (state_blocks + 1) * STATE_BLOCK_BYTES - hot_bytes
     gpu_history = max(left // index_bytes - 1, 0)
     host_blocks = int(host_gib * GiB) // HOST_BLOCK_BYTES
@@ -135,15 +184,20 @@ def test_capacity_combinations(n, max_len, host_gib, replay, shard, hot_gib):
     assert plan.host_history_blocks >= n * geo.history_blocks(max_len)
     assert plan.hot_pool_groups == want["hot_pool_groups"]
     assert min(plan.max_concurrency(max_len).values()) == want["concurrency"]
-    # Every case holds at least one full request, so startup accepts it; the
-    # GPU history segment is what limits concurrency below n.
-    assert plan.startup_problems() == []
+    assert bool(plan.startup_problems()) is (want["concurrency"] == 0)
+    assert plan.hot_pool_bytes == sum(
+        geo.hot_memory_bytes(plan.hot_pool_groups, n).values()
+    )
+    if plan.hot_pool_groups:
+        assert plan.hot_pool_bytes <= int(hot_gib * GiB)
+        assert geo.hot_bytes_for_groups(plan.hot_pool_groups + 1, n) > int(
+            hot_gib * GiB
+        )
 
 
 def test_capacity_table_headlines():
-    """TP4/DCP2 capacity derived from the reference geometry below."""
-    # 8 x 1Mi, state replay on, index sharded (index sharding), 0.5 GiB hot pool: the
-    # GPU history segment holds 7,461 blocks, 11 x (631 + 1).
+    """Domain arithmetic only; physical engine concurrency is unverified."""
+    # Dense ready/claims/maps and workspace exceed 0.5 GiB before payload.
     geo = replace(
         geometry(speculative_blocks=0), index_bytes_per_block=INDEX_BLOCK_BYTES // 2
     )
@@ -153,14 +207,19 @@ def test_capacity_table_headlines():
         GPU_BUDGET,
         8,
     )
-    assert plan.gpu_history_blocks == 7461
-    assert plan.max_concurrency(MI) == {
-        "GPU state segment": 8,
-        "GPU history segment": 11,
-        "host history pool": 8,
-        "GPU hot-page pool": 10,
-        "max_num_seqs": 8,
-    }
+    assert plan.hot_pool_groups == 0
+    assert plan.max_concurrency(MI)["GPU hot-page pool"] == 0
+    assert any("hot-page pool" in p for p in plan.startup_problems())
+    # One GiB accounts for payload, metadata and workspace, still below eight
+    # requests' worst-case decode union. This is an arithmetic upper bound.
+    larger = plan_long_context_capacity(
+        LongContextKVConfig(enabled=True, host_pool_gib=96.13, hot_pool_gib=1.0),
+        geo,
+        GPU_BUDGET,
+        8,
+    )
+    assert 0 < larger.max_concurrency(MI)["GPU hot-page pool"] < 8
+
     # Replicated index, replay off: only 3 x 1Mi fit on the GPU side.
     plan = plan_long_context_capacity(
         LongContextKVConfig(enabled=True, host_pool_gib=96.13, hot_pool_gib=0.5),
@@ -180,7 +239,7 @@ def test_hot_pool_ratio_defaults_to_ten_percent_of_host_history():
         8,
     )
     assert plan.host_history_blocks == 8 * 631
-    assert plan.hot_pool_groups == int(8 * 631 * SPAN * 0.10) // 4
+    assert plan.hot_pool_groups == int(8 * 631 * SPAN * 0.10 / 2) // 4
     half = plan_long_context_capacity(
         LongContextKVConfig(
             enabled=True, host_pool_tokens=8 * 631 * SPAN, hot_pool_ratio=0.05
@@ -189,7 +248,7 @@ def test_hot_pool_ratio_defaults_to_ten_percent_of_host_history():
         GPU_BUDGET,
         8,
     )
-    assert half.hot_pool_groups == int(8 * 631 * SPAN * 0.05) // 4
+    assert half.hot_pool_groups == int(8 * 631 * SPAN * 0.05 / 2) // 4
     # 10 % of 8 x 1Mi on every GPU is 2.4 GiB: too much next to the index.
     assert plan.hot_pool_bytes > 2.3 * GiB
 
@@ -207,7 +266,7 @@ def test_hot_pool_ratio_defaults_to_ten_percent_of_host_history():
             dict(host_pool_gib=96.13, hot_pool_gib=0.01),
             None,
             "GPU hot-page pool",
-            dict(hot_pool_gib=0.05),
+            dict(hot_pool_gib=0.3),
         ),
         (
             dict(host_pool_gib=96.13, hot_pool_gib=0.5, state_blocks=10),
@@ -254,7 +313,7 @@ def test_startup_suggestion_values_round_trip():
     hot = next(p for p in problems if "hot-page pool" in p)
     host_gib = float(host.split("host_pool_gib >= ")[1].split(" ")[0])
     hot_gib = float(hot.split("hot_pool_gib >= ")[1].rstrip("."))
-    assert (host_gib, hot_gib) == (12.02, 0.05)
+    assert (host_gib, hot_gib) == (12.02, 0.28)
     fixed = plan_long_context_capacity(
         LongContextKVConfig(enabled=True, host_pool_gib=host_gib, hot_pool_gib=hot_gib),
         geo,
@@ -264,7 +323,7 @@ def test_startup_suggestion_values_round_trip():
     assert fixed.startup_problems() == []
     # A 7 GiB pool fits a shorter context, which the error also reports.
     short = plan_long_context_capacity(
-        LongContextKVConfig(enabled=True, host_pool_gib=7.0, hot_pool_gib=0.05),
+        LongContextKVConfig(enabled=True, host_pool_gib=7.0, hot_pool_gib=0.3),
         geo,
         GPU_BUDGET,
         1,
@@ -272,9 +331,9 @@ def test_startup_suggestion_values_round_trip():
     assert short.max_fitting_len() == 367 * SPAN
     assert "largest max_model_len is 610,688" in short.startup_problems()[-1]
     # A hot pool below one request's verify working set caps the context at
-    # the history it can pin whole: 3,495 groups x 4 tokens.
+    # the history it can pin whole: 3,495 local groups x eight global tokens.
     tiny_hot = replace(short, hot_pool_groups=3495, host_history_blocks=631)
-    assert tiny_hot.max_fitting_len() == 3495 * 4
+    assert tiny_hot.max_fitting_len() == 3495 * 8
 
 
 def test_settings_validation():
@@ -319,32 +378,49 @@ def test_disabled_mode_does_not_change_the_compile_hash():
     assert enabled != base
 
 
-def kv_cache_configs(settings, *, max_model_len=MI, memory=GPU_BUDGET):
+def kv_cache_configs(
+    settings, *, max_model_len=MI, memory=GPU_BUDGET, speculative_blocks=7
+):
     config = production_config(max_model_len=max_model_len, long_context=settings)
     config.model_config.original_max_model_len = max_model_len
-    specs = production_specs()
+    specs = production_specs(speculative_blocks=speculative_blocks)
     return get_kv_cache_configs(config, [specs] * WORKERS, [memory] * WORKERS)
 
 
-def test_startup_attaches_the_plan_without_changing_the_unified_pool():
-    off = kv_cache_configs(LongContextKVConfig())
+def test_startup_splits_the_pool_into_state_and_history_segments():
+    # With the main K/V still on the GPU a history block costs index + main
+    # K/V (6.39 MB/GPU), so 8 x 1Mi needs GDN state replay (s = 0) in 6.05 GiB.
+    off = kv_cache_configs(LongContextKVConfig(), speculative_blocks=0)
     on = kv_cache_configs(
-        LongContextKVConfig(enabled=True, host_pool_gib=13.0, hot_pool_gib=0.1)
+        LongContextKVConfig(enabled=True, host_pool_gib=13.0, hot_pool_gib=1.0),
+        speculative_blocks=0,
     )
     for disabled, enabled in zip(off, on):
         assert disabled.long_context_plan is None
-        assert enabled.long_context_plan is not None
-        assert (
-            disabled.num_blocks
-            == enabled.num_blocks
-            == GPU_BUDGET // (POOL_BLOCK_BYTES)
-        )
-        assert disabled.kv_cache_tensors == enabled.kv_cache_tensors
+        assert disabled.block_segments is None
+        assert disabled.num_blocks == GPU_BUDGET // POOL_BLOCK_BYTES
+        plan = enabled.long_context_plan
+        assert plan is not None and plan.main_kv_on_gpu
+        assert enabled.block_segments.num_blocks == plan.segment_num_blocks()
+        assert enabled.num_blocks == plan.gpu_history_blocks + 1
         assert disabled.kv_cache_groups == enabled.kv_cache_groups
+        assert sum(t.size for t in enabled.kv_cache_tensors) == (
+            plan.gpu_state_bytes + plan.gpu_history_bytes
+        )
     plan = on[0].long_context_plan
+    assert plan.state_blocks == 8 * 29
     assert plan.gpu_budget_bytes == GPU_BUDGET
     assert plan.host_history_blocks == 13 * GiB // (WORKERS * MAIN_KV_BLOCK_BYTES)
     assert plan.geometry.max_model_len == MI
+    assert plan.history_bytes_per_block == POOL_BLOCK_BYTES
+    assert plan.gpu_history_blocks == (
+        (GPU_BUDGET - 233 * STATE_BLOCK_BYTES) // POOL_BLOCK_BYTES - 1
+    )
+    # Without replay the 1Mi request does not fit next to 8 requests' states.
+    with pytest.raises(ValueError, match="largest max_model_len is 930,176"):
+        kv_cache_configs(
+            LongContextKVConfig(enabled=True, host_pool_gib=13.0, hot_pool_gib=1.0)
+        )
 
 
 def test_startup_rejects_too_small_pools():
@@ -378,3 +454,25 @@ def test_unsupported_layouts_are_rejected_at_startup():
     geo = get_long_context_geometry(no_spec, no_drafter)
     assert geo.decode_rows_per_request == 1
     assert geo.state_blocks_per_request == 6 * 9 + 2
+
+
+@pytest.mark.parametrize("connector", ["SimpleCPUOffloadConnector", "MultiConnector"])
+def test_split_pool_rejects_connectors_with_ambiguous_failure_ids(connector):
+    config = production_config()
+    groups = get_kv_cache_groups(config, production_specs())
+    config.kv_transfer_config = SimpleNamespace(kv_connector=connector)
+    with pytest.raises(ValueError, match="requires OffloadingConnector"):
+        get_long_context_geometry(config, groups)
+    config.kv_transfer_config.kv_connector = "OffloadingConnector"
+    assert get_long_context_geometry(config, groups).group_domains[0] == (
+        GPU_HISTORY,
+        HOST,
+    )
+
+
+def test_hot_layout_refuses_unsupported_dcp():
+    config = production_config()
+    groups = get_kv_cache_groups(config, production_specs())
+    config.parallel_config.decode_context_parallel_size = 4
+    with pytest.raises(ValueError, match="DCP1 or DCP2"):
+        get_long_context_geometry(config, groups)

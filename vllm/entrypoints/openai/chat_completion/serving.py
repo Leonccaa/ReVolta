@@ -729,16 +729,8 @@ class OpenAIServingChat(OpenAIServing):
                             delta_token_ids=as_list(output.token_ids),
                             request=request,
                             prompt_token_ids=res.prompt_token_ids,
+                            finished=output.finish_reason is not None,
                         )
-                        if output.finish_reason is not None and tool_parser is not None:
-                            pending = tool_parser.finish_streaming()
-                            if pending is not None:
-                                if delta_message is None:
-                                    delta_message = pending
-                                else:
-                                    delta_message.content = (
-                                        delta_message.content or ""
-                                    ) + (pending.content or "")
                         if delta_message and delta_message.tool_calls:
                             tools_streamed[i] = True
                         held = held_whitespace[i]

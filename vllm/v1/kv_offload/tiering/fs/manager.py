@@ -205,6 +205,10 @@ class FileSystemTierManager(SecondaryTierManager):
         active threads to complete.
         """
         if not self._closed:
-            self._pool.shutdown(wait=True)
+            deadline = getattr(self, "_shutdown_deadline", None)
+            if deadline is None:
+                self._pool.shutdown(wait=True)
+            else:
+                self._pool.shutdown(wait=True, deadline=deadline)
             self._cache.release()
             self._closed = True

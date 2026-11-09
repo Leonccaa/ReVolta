@@ -24,6 +24,7 @@ import time
 from collections import defaultdict
 from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass, field
+from functools import partial
 
 import numpy as np
 
@@ -706,17 +707,30 @@ class TieringOffloadingManager(OffloadingManager):
 
         yield from self.primary_tier.take_events()
 
+    def set_shutdown_deadline(self, deadline: float) -> None:
+        """Share the absolute host KV deadline with every secondary tier."""
+        self._shutdown_deadline = deadline
+
     def shutdown(self) -> None:
         """Shutdown all tiers and release resources."""
+        deadline = getattr(self, "_shutdown_deadline", None)
+
+        def bounded(callback, phase):
+            if deadline is None:
+                return callback()
+            from vllm.v1.kv_offload.host.shutdown import wait_until
+
+            return wait_until(callback, deadline, phase)
+
         # Pending delayed writes that are still live are submitted now, the
         # newest first; the tier's own bounded drain (drain_timeout_s) writes
         # what it can and drops the rest, so this never prolongs shutdown
         # beyond that bound.
         for tier, queue in self._delayed.items():
             pending = queue.take_all_newest_first()
-            if pending:
+            if pending and (deadline is None or time.monotonic() < deadline):
                 before = queue.stats["written"]
-                self._write_delayed(tier, pending)
+                bounded(partial(self._write_delayed, tier, pending), "tiering-submit")
                 logger.info(
                     "%s: submitted %d delayed rows at shutdown (bounded by the "
                     "tier's drain timeout)",
@@ -724,8 +738,11 @@ class TieringOffloadingManager(OffloadingManager):
                     queue.stats["written"] - before,
                 )
             if queue.volume is not None:
-                queue.volume.persist()
+                bounded(queue.volume.persist, "tiering-volume")
             logger.info("Delayed writes (%s): %s", tier.tier_type, queue.summary())
         for tier in self.secondary_tiers:
-            tier.shutdown()
-        self.primary_tier.shutdown()
+            if deadline is not None:
+                tier.set_shutdown_deadline(deadline)
+            bounded(tier.shutdown, "tiering-drain")
+        # Do not release the primary view while any tier still owns IO.
+        bounded(self.primary_tier.shutdown, "tiering-primary-close")

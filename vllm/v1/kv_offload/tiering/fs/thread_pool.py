@@ -277,14 +277,16 @@ class DualQueueThreadPool:
         with self._condition:
             return self._stop
 
-    def shutdown(self, wait: bool = True) -> None:
+    def shutdown(self, wait: bool = True, deadline: float | None = None) -> None:
         if self._drain_timeout_s > 0:
             # Let queued stores run for a bounded time; loads are dropped
             # (nothing will consume their results).
-            deadline = time.monotonic() + self._drain_timeout_s
+            drain_deadline = time.monotonic() + self._drain_timeout_s
+            if deadline is not None:
+                drain_deadline = min(drain_deadline, deadline)
             with self._condition:
                 self._load_q.clear()
-            while time.monotonic() < deadline:
+            while time.monotonic() < drain_deadline:
                 with self._condition:
                     if not self._store_q and not self._active_stores:
                         break
@@ -304,7 +306,14 @@ class DualQueueThreadPool:
             logger.warning("Dropped %d queued store tasks at shutdown", dropped)
         if wait:
             for t in self._threads:
-                t.join()
+                timeout = (
+                    None if deadline is None else max(0.0, deadline - time.monotonic())
+                )
+                t.join(timeout=timeout)
+            if any(t.is_alive() for t in self._threads):
+                raise TimeoutError(
+                    "Tiering drain deadline reached; IO still owns backing"
+                )
 
     def _worker(self, load_priority: bool) -> None:
         # Wait for tasks, process from primary queue first, fall back to secondary.

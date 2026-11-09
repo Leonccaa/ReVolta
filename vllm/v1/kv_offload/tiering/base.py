@@ -53,6 +53,9 @@ class SecondaryTierManager(ABC):
     async jobs; get_finished_jobs() polls for completion.
     """
 
+    def set_shutdown_deadline(self, deadline: float) -> None:
+        self._shutdown_deadline = deadline
+
     def __init__(
         self,
         offloading_spec: "OffloadingSpec",

@@ -2524,13 +2524,21 @@ class OffloadingConnectorScheduler:
         """Delayed secondary-tier writes are queued or in flight: the idle
         engine wakes about once a second to service them (EngineCoreProc)."""
         pending = getattr(self.manager, "has_pending_delayed_writes", None)
-        return bool(pending()) if pending is not None else False
+        # host SSD persistence: the host-page SSD queue (attached by EngineCore) also
+        # counts.
+        host_ssd = getattr(self, "host_page_ssd", None)
+        return (bool(pending()) if pending is not None else False) or (
+            host_ssd is not None and host_ssd.has_pending()
+        )
 
     def persistence_step(self) -> None:
         """Idle engine, scheduler thread: write due rows, poll completions."""
         step = getattr(self.manager, "delayed_write_step", None)
         if step is not None:
             step()
+        host_ssd = getattr(self, "host_page_ssd", None)
+        if host_ssd is not None:
+            host_ssd.step()
 
     def _drop_superseded_state_writes(self, req_status: RequestOffloadState) -> None:
         """state_latest_only (secondary tiers with delayed writes): of the

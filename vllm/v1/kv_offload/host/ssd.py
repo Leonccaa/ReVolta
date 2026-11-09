@@ -74,17 +74,24 @@ class _WriteRateLimiter:
         self._next = 0.0
         self._lock = threading.Lock()
         self.stopped = threading.Event()
+        self.unthrottled = threading.Event()
+
+    def unthrottle(self) -> None:
+        """Final flush: lift the rate limit. A writer already waiting finishes
+        at most one page interval (page / rate) first."""
+        self.unthrottled.set()
 
     def acquire(self, size: int) -> None:
         with self._lock:
-            while True:
+            while not self.unthrottled.is_set():
                 now = time.monotonic()
                 delay = max(0.0, self._next - now)
                 if self.stopped.wait(delay):
                     raise StoreCancelled("Host KV SSD writer stopped")
                 if time.monotonic() >= self._next:
                     break
-            self._next = max(time.monotonic(), self._next) + size / self._rate
+            if not self.unthrottled.is_set():
+                self._next = max(time.monotonic(), self._next) + size / self._rate
 
 
 class _HostTier(RevoltaFileSystemTierManager):

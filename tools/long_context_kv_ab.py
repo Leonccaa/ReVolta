@@ -192,6 +192,65 @@ SCENARIOS: dict[str, Scenario] = {
             ),
         ),
     ),
+    # Determinism study: variants of "concurrent" that remove one factor.
+    "conc-greedy": Scenario(
+        "conc-greedy",
+        (
+            Phase(
+                "x0",
+                (
+                    _one("x-700", "x-a", 700, 160),
+                    _one("x-1900", "x-b", 1900, 96),
+                    _one("x-3300", "x-c", 3300, 128),
+                    _one("x-4300", "x-d", 4300, 64),
+                ),
+            ),
+        ),
+    ),
+    "conc-samelen": Scenario(
+        "conc-samelen",
+        (
+            Phase(
+                "x0",
+                (
+                    _one("x-700", "x-a", 700, 96),
+                    _one("x-1900", "x-b", 1900, 96),
+                    _one("x-3300", "x-c", 3300, 96),
+                    _one("x-4300", "x-d", 4300, 96),
+                ),
+            ),
+        ),
+    ),
+    "conc-short4": Scenario(
+        # Every prompt fits one step: one prefill step, then pure decode
+        # whose row count steps down 4 -> 3 -> 2 -> 1.
+        "conc-short4",
+        (
+            Phase(
+                "y0",
+                (
+                    _one("y-150", "y-a", 150, 160),
+                    _one("y-300", "y-b", 300, 96),
+                    _one("y-450", "y-c", 450, 128),
+                    _one("y-600", "y-d", 600, 64),
+                ),
+            ),
+        ),
+    ),
+    "conc-short4-samelen": Scenario(
+        "conc-short4-samelen",
+        (
+            Phase(
+                "y0",
+                (
+                    _one("y-150", "y-a", 150, 96),
+                    _one("y-300", "y-b", 300, 96),
+                    _one("y-450", "y-c", 450, 96),
+                    _one("y-600", "y-d", 600, 96),
+                ),
+            ),
+        ),
+    ),
     "prefix": Scenario(
         "prefix",
         (
@@ -266,6 +325,21 @@ CONFIGS: dict[str, EngineConfig] = {
     "main": EngineConfig(8192, 4, 2048, ("short", "chunked", "concurrent", "prefix")),
     # The tight arms derive their host pool from the recorded geometry.
     "tight": EngineConfig(8192, 4, 2048, ("reuse", "preempt")),
+    # Determinism study (same engine shape as main).
+    "det": EngineConfig(
+        8192,
+        4,
+        2048,
+        (
+            "concurrent",
+            "conc-greedy",
+            "conc-samelen",
+            "conc-short4",
+            "conc-short4-samelen",
+            "short",
+            "chunked",
+        ),
+    ),
 }
 
 
@@ -1462,11 +1536,30 @@ class Recorder:
         zeroer = getattr(runner, "_kv_block_zeroer", None)
         if zeroer is not None:
             self._wrap_zeroer(zeroer)
+        self.steps: list[list[list[Any]]] = []
+        self.budgets = []
+        self._wrap_schedule()
         self.reset_phase()
 
     def reset_phase(self) -> None:
         self.allocated = [[] for _ in _pools(self.sched)]
         self.preemptions = []
+        self.steps = []
+        self.budgets: list[int] = []
+
+    def _wrap_schedule(self) -> None:
+        sched = self.sched
+        original = sched.schedule
+
+        def schedule(*args: Any, **kwargs: Any) -> Any:
+            out = original(*args, **kwargs)
+            counts = getattr(out, "num_scheduled_tokens", None) or {}
+            if counts:
+                self.steps.append([[str(r), int(n)] for r, n in counts.items()])
+                self.budgets.append(int(getattr(out, "mixed_prefill_budget", -1)))
+            return out
+
+        sched.schedule = schedule
 
     def _wrap_pool(self, index: int, pool: Any) -> None:
         original = pool.get_new_blocks
@@ -1567,11 +1660,31 @@ def _preempted_names(
     return counts
 
 
+def _named_steps(
+    steps: list[list[list[Any]]], records: list[dict[str, Any]]
+) -> list[list[list[Any]]]:
+    """Scheduled tokens per engine step, request IDs mapped to names."""
+
+    def name_of(rid: str) -> str:
+        for rec in records:
+            ext = str(rec["request_id"])
+            if rid == ext or rid.startswith(ext + "-"):
+                return str(rec["name"])
+        return rid
+
+    return [[[name_of(rid), n] for rid, n in step] for step in steps]
+
+
 def run_scenarios(
-    llm: Any, sched: Any, recorder: Recorder, names: Sequence[str], seed: int
+    llm: Any,
+    sched: Any,
+    recorder: Recorder,
+    names: Sequence[str],
+    seed: int,
+    repeat: int = 1,
 ) -> list[dict[str, Any]]:
     results = []
-    for name in names:
+    for rep_index, name in enumerate([n for _ in range(repeat) for n in names]):
         scenario = SCENARIOS[name]
         reset_ok = llm.reset_prefix_cache()
         phases = []
@@ -1599,6 +1712,8 @@ def run_scenarios(
                     "allocated": [sorted(set(ids)) for ids in recorder.allocated],
                     "allocated_count": [len(ids) for ids in recorder.allocated],
                     "preemptions": list(recorder.preemptions),
+                    "schedule": _named_steps(recorder.steps, records),
+                    "mixed_prefill_budget": list(recorder.budgets),
                     "preempted_requests": _preempted_names(
                         recorder.preemptions, records
                     ),
@@ -1612,6 +1727,7 @@ def run_scenarios(
                 "expect_preemption": scenario.expect_preemption,
                 "expect_reuse": scenario.expect_reuse,
                 "prefix_reset_before": reset_ok,
+                "repeat": rep_index // max(len(names), 1),
                 "seconds": round(time.time() - t0, 3),
                 "phases": phases,
             }
@@ -1867,7 +1983,7 @@ def resolve_engine_args(
         max_model_len=config.max_model_len,
         max_num_seqs=config.max_num_seqs,
         max_num_batched_tokens=config.max_num_batched_tokens,
-        enable_prefix_caching=True,
+        enable_prefix_caching=not args.no_prefix_caching,
         mamba_cache_mode="align",
         gpu_memory_utilization=args.gpu_memory_utilization,
         enforce_eager=not args.graphs,
@@ -1880,6 +1996,20 @@ def resolve_engine_args(
         kwargs["num_gpu_blocks_override"] = args.num_gpu_blocks_override
     if args.async_scheduling != "default":
         kwargs["async_scheduling"] = args.async_scheduling == "on"
+    if args.mixed_prefill_latency_ms is not None:
+        kwargs["mixed_prefill_step_latency_ms"] = args.mixed_prefill_latency_ms
+    if args.prefill_pressure_budget is not None:
+        kwargs["prefill_pressure_token_budget"] = args.prefill_pressure_budget
+    if placement == "host":
+        # Host main K/V moves state/draft prefixes through the built-in
+        # connector; the engine refuses host placement without it.
+        kwargs["kv_transfer_config"] = {
+            "kv_connector": "OffloadingConnector",
+            "kv_role": "kv_both",
+            "kv_connector_extra_config": {
+                "cpu_bytes_to_use": int(args.offload_cpu_mib) << 20
+            },
+        }
     return kwargs, derived
 
 
@@ -2032,7 +2162,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         result["structure"] = structure
         recorder = Recorder(sched, runner)
         result["status"] = "running"
-        scenarios = run_scenarios(llm, sched, recorder, config.scenarios, args.seed)
+        scenarios = run_scenarios(
+            llm, sched, recorder, config.scenarios, args.seed, args.repeat
+        )
         result["scenarios"] = scenarios
         result["memory_end"] = _memory()
         result["zeroing_calls"] = {
@@ -2090,6 +2222,27 @@ def cmd_run(args: argparse.Namespace) -> int:
         checks.append(
             check("no ERROR log records", not capture.errors, capture.errors[:5])
         )
+        if args.explicit_shutdown:
+            region = getattr(sched, "host_region", None)
+            region_path = getattr(region, "mmap_path", None)
+            core = engine.engine_core.engine_core
+            recorder = runner = structure = None
+            engine.engine_core.shutdown()
+            drained = bool(getattr(core, "_host_kv_drained", False))
+            unlinked = region_path is None or not os.path.exists(region_path)
+            result["shutdown"] = {
+                "region_path": region_path,
+                "host_kv_drained": drained,
+                "region_unlinked": unlinked,
+            }
+            if placement == "host":
+                checks.append(
+                    check(
+                        "host KV drained and region unlinked at shutdown",
+                        drained and unlinked and region_path is not None,
+                        result["shutdown"],
+                    )
+                )
         result["checks"] = checks
         result["status"] = "ok"
         if any(c["ok"] is False for c in checks):
@@ -2237,7 +2390,40 @@ def build_parser() -> argparse.ArgumentParser:
         "max_num_batched_tokens rows from --geometry-from",
     )
     run.add_argument("--state-blocks", type=int, default=None)
+    run.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help="run the config's scenario list this many times in one process",
+    )
+    run.add_argument("--no-prefix-caching", action="store_true")
+    run.add_argument(
+        "--mixed-prefill-latency-ms",
+        type=float,
+        default=None,
+        help="scheduler mixed_prefill_step_latency_ms (0 disables the "
+        "timing-fed prefill budget; default: the engine's)",
+    )
+    run.add_argument(
+        "--prefill-pressure-budget",
+        type=int,
+        default=None,
+        help="scheduler prefill_pressure_token_budget: a fixed cap on prefill "
+        "tokens per step while decode is runnable",
+    )
     run.add_argument("--num-gpu-blocks-override", type=int, default=None)
+    run.add_argument(
+        "--offload-cpu-mib",
+        type=int,
+        default=512,
+        help="OffloadingConnector CPU backing of the on-host arm, MiB",
+    )
+    run.add_argument(
+        "--explicit-shutdown",
+        action="store_true",
+        help="shut the engine core down before writing the JSON and record "
+        "the host KV drain and region unlink",
+    )
     run.add_argument(
         "--geometry-from",
         default=None,

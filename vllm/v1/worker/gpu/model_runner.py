@@ -782,6 +782,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if max(rows, default=0) <= s.decode_rows:
             store.set_step_plan(host_step.hot_slots or None, None)
             return
+        if s.prefill_gather == "union":
+            # selection-union gather: the union path plans its own windows from (rows,
+            # G_q,
+            # class) and U_step, identically on every rank.
+            from vllm.models.qwen4_exp.nvidia.host_kv.history import UnionStepInfo
+
+            batch = [host_step.requests[req_id] for req_id in input_batch.req_ids]
+            store.set_step_plan(
+                host_step.hot_slots or None,
+                None,
+                UnionStepInfo(
+                    capacity=host_step.hot_slots or store.available_slots,
+                    rows_by_req=tuple(rows),
+                    groups=tuple(groups for _, groups, _ in batch),
+                    decode=tuple(kind == 0 for _, _, kind in batch),
+                ),
+            )
+            return
         store.set_step_plan(
             host_step.hot_slots or None,
             plan_step_passes(

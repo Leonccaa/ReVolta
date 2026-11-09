@@ -88,6 +88,53 @@ def history_fixed_memory_bytes(
     }
 
 
+def union_gather_memory_bytes(
+    *,
+    table_rows: int,
+    table_tokens: int,
+    max_tokens: int,
+    max_requests: int,
+    output_heads: int,
+    head_dim: int,
+    dcp_world_size: int = 1,
+    output_itemsize: int = 2,
+) -> dict[str, int]:
+    """Peak device bytes the selection-union gather union path adds per worker (one
+    layer at a
+    time, shared by the layers; everything is reused across windows).
+
+    ``table_tokens`` is the block table's logical capacity in rank-local
+    tokens (``width * kernel_block_tokens``), ``table_rows`` its rows.
+    Multi-window steps hold a temporary copy of the attention outputs (DCP:
+    FP32 partial output and LSE of all gathered heads; otherwise the gated
+    output rows); windows merge by row slice, so no ``where`` result is
+    allocated. Grouped page4 calls with whole-batch shapes grow its cached
+    plan workspace (pages/masks, 8 bytes x 4160 per eight-row group) and the
+    DCP wrapper's FP16 slice output; both are billed here because the remap
+    passes never reached them. The ``passes`` arm allocates none of this.
+    """
+    if min(table_rows, table_tokens, max_tokens, max_requests, output_heads) < 1:
+        raise ValueError("Invalid union-gather byte geometry")
+    dcp = dcp_world_size > 1
+    bill = {
+        "microblock_table": 4 * table_rows * (table_tokens // 4),
+        "union_scan": 4 * (max_tokens + 1),
+        "union_counters": 8 * 4,
+        "masked_requests": 4 * max_tokens,
+        "request_classes": 4 * max_requests,
+        "window_output": max_tokens
+        * output_heads
+        * head_dim
+        * (4 if dcp else output_itemsize),
+        "window_lse": 4 * max_tokens * output_heads if dcp else 0,
+        "grouped_plan_workspace": (max_tokens // 8) * 4160 * 8,
+        "grouped_slice_output": (
+            max_tokens * (output_heads // dcp_world_size) * head_dim * 2 if dcp else 0
+        ),
+    }
+    return bill
+
+
 def shared_history_memory_bytes(
     *,
     num_blocks: int,

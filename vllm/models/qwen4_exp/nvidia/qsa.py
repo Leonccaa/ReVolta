@@ -359,6 +359,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         token_to_req: torch.Tensor,
         sequence_lengths: torch.Tensor,
         output_gate: torch.Tensor | None = None,
+        query_positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Sparse attention over the main K/V in the host history store.
 
@@ -368,7 +369,14 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         passes that fit the hot pool. Positions and sequence lengths are not
         passed to the sparse kernel: the remapped IDs are not positions, and
         the selection is already causal (the remap also drops columns at or
-        past each request's length)."""
+        past each request's length).
+
+        With ``prefill_gather="union"`` a mixed step (more query rows than a
+        decode step) instead fills the union of its selections into the hot
+        slots per window of whole eight-row groups and runs the GPU arm's
+        attention call unchanged: original selection, positions and lengths,
+        a page-size-4 table of hot slots, every row (other windows' rows
+        masked to request -1). Decode steps keep the single remap pass."""
         if self.sliding_window != (-1, -1) or self.alibi_slopes is not None:
             raise NotImplementedError("QSA host history needs plain attention")
         if self.sinks is not None:
@@ -382,7 +390,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         topk_buffer = getattr(layer, "topk_indices_buffer", None)
         if topk_buffer is None:
             raise RuntimeError("QSA owner did not provide its top-k buffer")
-        from .host_kv.history import for_each_pass
+        from .host_kv.history import for_each_pass, run_union_windows
         from .ops.qsa import qsa_sparse_paged_attention
 
         selection = topk_buffer[:num_tokens]
@@ -391,6 +399,14 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         hot_table = host.store.hot_block_table
         key_cache, value_cache = host.key_cache, host.value_cache
         k_scale, v_scale = layer._k_scale_float, layer._v_scale_float
+        decode_rows = host.store.shape.decode_rows
+        union = (
+            attn_metadata.max_query_len > decode_rows
+            and host.store.shape.prefill_gather == "union"
+            # Union windows read counts on the host; inside a graph capture
+            # (never expected: QSA is a splitting op) keep the remap passes.
+            and not (query.is_cuda and torch.cuda.is_current_stream_capturing())
+        )
         if not getattr(layer, "qsa_dcp_sharded", False):
             query = query[:num_tokens]
             out = output[:num_tokens]
@@ -411,6 +427,44 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                     v_scale=v_scale,
                 )
 
+            if union:
+                metadata: dict[str, torch.Tensor] = {
+                    "sequence_lengths": sequence_lengths
+                }
+                if query_positions is not None:
+                    metadata["query_positions"] = query_positions[:num_tokens]
+                if gate is not None:
+                    metadata["output_gate"] = gate
+
+                def attend_union(
+                    table: torch.Tensor, requests: torch.Tensor, outs
+                ) -> None:
+                    # The GPU arm's call (forward_qsa), hot K/V and table.
+                    qsa_sparse_paged_attention(
+                        query,
+                        key_cache,
+                        value_cache,
+                        selection,
+                        table,
+                        requests,
+                        outs[0],
+                        kv_cache_dtype=self.kv_cache_dtype,
+                        k_scale=k_scale,
+                        v_scale=v_scale,
+                        **metadata,
+                    )
+
+                run_union_windows(
+                    host,
+                    selection,
+                    token_to_req,
+                    block_table,
+                    sequence_lengths,
+                    [out],
+                    attend_union,
+                    attend,
+                )
+                return output
             for_each_pass(
                 host,
                 selection,
@@ -418,7 +472,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 block_table,
                 sequence_lengths,
                 attend,
-                single_pass=attn_metadata.max_query_len <= host.store.shape.decode_rows,
+                single_pass=attn_metadata.max_query_len <= decode_rows,
             )
             return output
 
@@ -497,15 +551,60 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                     lse=rows_lse[grouped:],
                 )
 
-        for_each_pass(
-            host,
-            local_indices,
-            token_to_req,
-            block_table,
-            sequence_lengths,
-            attend_dcp,
-            single_pass=attn_metadata.max_query_len <= host.store.shape.decode_rows,
-        )
+        def attend_dcp_union(table: torch.Tensor, requests: torch.Tensor, outs) -> None:
+            # The GPU arm's _forward_qsa_dcp routes on the whole batch shape:
+            # grouped page4 for the leading multiple of eight rows (when
+            # eligible), Triton for the rest with the local width.
+            rows_out, rows_lse = outs
+            grouped = qsa_dcp_sparse_paged_attention_sm70_grouped_page4(
+                gathered_query,
+                key_cache,
+                value_cache,
+                local_indices,
+                table,
+                requests,
+                rows_out,
+                rows_lse,
+                self.kv_cache_dtype,
+                k_scale,
+                v_scale,
+            )
+            if grouped < num_tokens:
+                qsa_sparse_paged_attention(
+                    gathered_query[grouped:],
+                    key_cache,
+                    value_cache,
+                    local_indices[grouped:, :local_width],
+                    table,
+                    requests[grouped:],
+                    rows_out[grouped:],
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                    lse=rows_lse[grouped:],
+                )
+
+        if union:
+            run_union_windows(
+                host,
+                local_indices,
+                token_to_req,
+                block_table,
+                sequence_lengths,
+                [partial_output, partial_lse],
+                attend_dcp_union,
+                attend_dcp,
+            )
+        else:
+            for_each_pass(
+                host,
+                local_indices,
+                token_to_req,
+                block_table,
+                sequence_lengths,
+                attend_dcp,
+                single_pass=attn_metadata.max_query_len <= decode_rows,
+            )
         merged = cast(
             torch.Tensor,
             self.dcp_combine(
@@ -1060,6 +1159,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 token_to_req=side_metadata.token_to_req,
                 sequence_lengths=side_metadata.seq_lens,
                 output_gate=output_gate,
+                query_positions=side_metadata.logical_positions,
             )
         else:
             impl.do_kv_cache_update(

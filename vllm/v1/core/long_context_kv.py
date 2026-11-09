@@ -286,6 +286,8 @@ class LongContextCapacityPlan:
     """Host history pool summed over all workers."""
     hot_pool_bytes: int
     staging_bytes: int
+    """Prefill staging, plus the union-gather transients with
+    ``prefill_gather="union"`` (``union_gather_bytes``)."""
     state_blocks: int
     """Usable state block IDs (a null block is charged separately)."""
     gpu_history_blocks: int
@@ -593,6 +595,33 @@ class LongContextCapacityPlan:
         )
 
 
+def union_gather_bytes(geometry: LongContextGeometry, max_num_seqs: int) -> int:
+    """Per-worker device bytes of the selection-union gather union path (prefill
+    transients)."""
+    from vllm.models.qwen4_exp.nvidia.host_kv.budget import (
+        union_gather_memory_bytes,
+    )
+    from vllm.models.qwen4_exp.nvidia.host_kv.planning import max_local_tokens
+
+    dcp = geometry.dcp_world_size
+    local_block = max(geometry.block_tokens // dcp, 4)
+    local = max_local_tokens(geometry.max_model_len, dcp, geometry.dcp_interleave)
+    # One spare kernel block covers the runner's table padding.
+    table_tokens = (-(-local // local_block) + 1) * local_block
+    heads = geometry.hot_query_heads * (dcp if dcp > 1 else 1)
+    return sum(
+        union_gather_memory_bytes(
+            table_rows=max_num_seqs,
+            table_tokens=table_tokens,
+            max_tokens=geometry.hot_max_write_rows,
+            max_requests=max_num_seqs,
+            output_heads=heads,
+            head_dim=geometry.hot_head_dim,
+            dcp_world_size=dcp,
+        ).values()
+    )
+
+
 def plan_long_context_capacity(
     settings: LongContextKVConfig,
     geometry: LongContextGeometry,
@@ -623,6 +652,11 @@ def plan_long_context_capacity(
     host_bytes = host_blocks * geometry.host_bytes_per_block
 
     staging = int(settings.prefill_staging_gib * GiB)
+    if not main_kv_on_gpu and getattr(settings, "prefill_gather", "passes") == "union":
+        # selection-union gather union windows: page-size-4 table, window output copies
+        # and the
+        # grouped workspace growth are prefill transients next to staging.
+        staging += union_gather_bytes(geometry, max_num_seqs)
 
     state_blocks = (
         settings.state_blocks

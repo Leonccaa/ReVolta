@@ -59,6 +59,22 @@ from .budget import (
 )
 from .pool import HostKVResourceError, UnsupportedHostKVConfig, _check_product
 
+# Row-group size of union windows and the masking of other windows' rows.
+# Module constants only so mutation tests can show the tests depend on them.
+_UNION_ROW_GROUP = 8
+_MASK_OTHER_WINDOWS = True
+
+UNION_STAT_NAMES = (
+    "calls",
+    "l0",
+    "l1",
+    "l2",
+    "l3_groups",
+    "windows",
+    "syncs",
+    "probe_overflows",
+)
+
 
 def tensor_storage_bytes(values: Mapping[str, object]) -> dict[str, int]:
     """Bill owned storage once, including per-layer lists and aliased views.
@@ -126,6 +142,14 @@ class HostHistoryShape:
     """Startup context bound, allowing short histories below the 513-row bound."""
     decode_rows: int = 1
     """Maximum verify rows of one request; uniform decode stays one pass."""
+    prefill_gather: str = "passes"
+    """Mixed steps: ``passes`` (remap passes within R_cap) or ``union``
+    (selection-union gather/selection-union gather: one union fill per window of whole
+    eight-row groups, a
+    page-size-4 table over the hot slots and the original selection)."""
+    prefill_insert_age: str = "old"
+    """Union path only: ``old`` inserts groups that only prefill rows want at
+    ``clock - 9`` (first evicted), ``recent`` at ``clock``."""
     slots_per_block: int = 0
     """shared hot region shared region: k hot slots alias each history ID's index page,
     so
@@ -269,6 +293,10 @@ class HostHistoryShape:
             raise UnsupportedHostKVConfig("DCP interleave must divide a kernel block")
         if self.qsa_group_columns not in (0, 2, 4):
             raise UnsupportedHostKVConfig("QSA group columns must be 0, 2 or 4")
+        if self.prefill_gather not in ("passes", "union"):
+            raise ValueError("prefill_gather must be 'passes' or 'union'")
+        if self.prefill_insert_age not in ("old", "recent"):
+            raise ValueError("prefill_insert_age must be 'old' or 'recent'")
         if self.rows_per_pass < 1:
             need = self.row_groups + self.max_requests * self.tail_groups
             raise UnsupportedHostKVConfig(
@@ -485,6 +513,15 @@ class HostHistoryStore:
             self.staging_slots = torch.arange(
                 s.max_write_rows, dtype=torch.int64, device=device
             )
+            # selection-union gather union scratch is allocated on first use of a mixed
+            # union
+            # step and billed by ``union_gather_memory_bytes``, so the
+            # ``passes`` arm allocates exactly what it did before.
+            self.union_scratch: dict[str, torch.Tensor] = {}
+            self.union_stats: dict[str, int] = dict.fromkeys(UNION_STAT_NAMES, 0)
+            # This step's CPU batch metadata for the union path (shared hot region
+            # runner).
+            self.union_step: UnionStepInfo | None = None
             # value arbitration value arbitration: layer-0 shadow records and counters.
             # None
             # (arbitration off) launches nothing extra.
@@ -534,6 +571,8 @@ class HostHistoryStore:
                     "page_of",
                     "index_payloads",
                     "_seal_sources",
+                    "union_scratch",
+                    "union_stats",
                 }
             }
         )
@@ -717,11 +756,15 @@ class HostHistoryStore:
         self,
         hot_slots: int | None,
         passes: list[tuple[int, int]] | None,
+        union: UnionStepInfo | None = None,
     ) -> None:
-        """The scheduler's U_step and this rank's (identical) mixed-step plan."""
+        """The scheduler's U_step and this rank's (identical) mixed-step plan:
+        remap passes, or the union path's CPU batch metadata (selection-union
+        gather)."""
         if hot_slots is not None and self.shape.slots_per_block:
             self.available_slots = hot_slots
         self.step_passes = passes
+        self.union_step = union
 
     def reset_hot_state(self) -> None:
         """After profiling/capture: every non-null ID DONATED, no residency,
@@ -746,6 +789,7 @@ class HostHistoryStore:
             self.page_of_cpu[:] = -1
             self.page_of_cpu[0] = 0
         self.step_passes = None
+        self.union_step = None
 
     def mark_ready(self, block_ids: list[int] | torch.Tensor) -> None:
         """Make bound pages readable after ReceiveTxn restores their indexes.
@@ -934,11 +978,39 @@ class HostHistoryLayer:
             s.kernel_block_tokens, m, 128, *geometry, s.qsa_group_columns,
             debug=store.debug,
         )  # fmt: skip
-        kernels.collect_misses[(triton.cdiv(m, 256),)](
-            store.wanted_groups, store.wanted_count, self.group_to_slot, self.age,
-            self.clock, store.miss_groups, store.miss_count, m, 256,
-            debug=store.debug,
+        self._fill_from_marks()
+        out = store.indices[:rows, :width]
+        hk.remap_selection[grid](
+            selection, token_to_req, block_table, seq_lens, self.group_to_slot,
+            out, selection.stride(0), block_table.stride(0), out.stride(0), width,
+            s.kernel_block_tokens, 128, *geometry, debug=store.debug,
         )  # fmt: skip
+        return out
+
+    def _fill_from_marks(
+        self, *, classed: bool = False, counters: torch.Tensor | None = None
+    ) -> None:
+        """Make the marked groups (Touched/Count) resident.
+
+        Same kernels and order for the remap passes and the union windows:
+        collect misses, pick victims (never a wanted slot), allocate, copy
+        from the host pages through ``page_of``. ``classed`` (union path,
+        ``prefill_insert_age=old``) ages groups only prefill rows want as old.
+        """
+        store, s = self.store, self.store.shape
+        m = store.max_misses
+        if classed:
+            hk.collect_misses_classed[(triton.cdiv(m, 256),)](
+                store.wanted_groups, store.wanted_count, store.wanted,
+                self.group_to_slot, self.age, self.clock, store.miss_groups,
+                store.miss_count, m, 256, debug=store.debug,
+            )  # fmt: skip
+        else:
+            kernels.collect_misses[(triton.cdiv(m, 256),)](
+                store.wanted_groups, store.wanted_count, self.group_to_slot,
+                self.age, self.clock, store.miss_groups, store.miss_count, m, 256,
+                debug=store.debug,
+            )  # fmt: skip
         shadow = store.shadow if self.index == 0 else None
         if shadow is not None:
             shadow.check_misses(store, triton.cdiv(m, 256))
@@ -969,13 +1041,100 @@ class HostHistoryLayer:
             s.kernel_block_tokens, s.kv_heads, s.head_dim,
             triton.next_power_of_2(8 * s.kv_heads * s.head_dim),
         )  # fmt: skip
-        out = store.indices[:rows, :width]
-        hk.remap_selection[grid](
-            selection, token_to_req, block_table, seq_lens, self.group_to_slot,
-            out, selection.stride(0), block_table.stride(0), out.stride(0), width,
-            s.kernel_block_tokens, 128, *geometry, debug=store.debug,
+        if classed:
+            assert counters is not None
+            hk.age_prefill_misses[(triton.cdiv(m, 256),)](
+                store.miss_groups, store.miss_slots, store.miss_count,
+                store.wanted, self.age, self.clock, counters, 256,
+            )  # fmt: skip
+        if counters is not None:
+            hk.accumulate_union[(1,)](store.wanted_count, store.miss_count, counters)
+
+    # ----- selection-union gather union windows (mixed steps)
+    # --------------------------------
+
+    def _union_buffers(self, rows: int, table_numel: int) -> dict[str, torch.Tensor]:
+        """Lazily sized union scratch, shared by the layers (one stream)."""
+        store = self.store
+        scratch = store.union_scratch
+        i32 = dict(dtype=torch.int32, device=store.device)
+        groups = triton.cdiv(rows, 1)
+        if "scan" not in scratch or scratch["scan"].numel() < groups + 1:
+            scratch["scan"] = torch.zeros(groups + 1, **i32)
+        if "counters" not in scratch:
+            scratch["counters"] = torch.zeros(4, dtype=torch.int64, device=store.device)
+        if "table" not in scratch or scratch["table"].numel() < table_numel:
+            scratch["table"] = torch.empty(max(table_numel, 1), **i32)
+        if "requests" not in scratch or scratch["requests"].numel() < rows:
+            scratch["requests"] = torch.empty(rows, **i32)
+        return scratch
+
+    def _union_scan(
+        self,
+        mode: int,
+        selection: torch.Tensor,
+        token_to_req: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        req_class: torch.Tensor,
+        scan: torch.Tensor,
+        num_row_groups: int = 0,
+        *,
+        tails: bool = True,
+    ) -> None:
+        """One pass of ``union_tail``/``union_selection`` in ``mode``.
+
+        ``selection`` rows start on an eight-row boundary of the step."""
+        store, s = self.store, self.store.shape
+        geometry = (s.dcp_world_size, s.dcp_rank, s.interleave)
+        tail_code, sentinel = num_row_groups + 1, num_row_groups + 2
+        if tails:
+            hk.union_tail[(seq_lens.shape[0],)](
+                block_table, seq_lens, store.ready, req_class, store.wanted,
+                store.wanted_groups, store.wanted_count, scan, tail_code,
+                sentinel, block_table.stride(0), s.kernel_block_tokens,
+                store.max_misses, *geometry, mode, debug=store.debug,
+            )  # fmt: skip
+        rows, width = selection.shape
+        if rows == 0:
+            return
+        hk.union_selection[(rows, triton.cdiv(width, 128))](
+            selection, token_to_req, block_table, seq_lens, store.ready,
+            req_class, store.wanted, store.wanted_groups, store.wanted_count,
+            scan, num_row_groups, sentinel, selection.stride(0),
+            block_table.stride(0), width, s.kernel_block_tokens,
+            store.max_misses, 128, *geometry, mode, _UNION_ROW_GROUP,
+            debug=store.debug,
         )  # fmt: skip
-        return out
+
+    def _union_clear(self) -> None:
+        """Clear the previous fill's marks (a complete Touched list)."""
+        store = self.store
+        m = store.max_misses
+        kernels.clear_wanted[(triton.cdiv(m, 256),)](
+            store.wanted, store.wanted_groups, store.wanted_count, 256
+        )
+        store.wanted_count.zero_()
+
+    def build_microblock_table(
+        self, block_table: torch.Tensor, seq_lens: torch.Tensor, out: torch.Tensor
+    ) -> torch.Tensor:
+        """Page-size-4 table of the hot slots, one row per block-table row.
+
+        Its logical capacity equals the block table's (``width * kbs`` local
+        tokens), so the grouped route's synthetic positions/lengths are the
+        GPU arm's. Valid until the next fill of any layer."""
+        s = self.store.shape
+        width = block_table.shape[1] * s.groups_per_kernel_block
+        table = out[: block_table.shape[0] * width].view(block_table.shape[0], width)
+        hk.build_microblock_table[
+            (block_table.shape[0], triton.cdiv(width, 256))
+        ](
+            block_table, seq_lens, self.group_to_slot, table, seq_lens.shape[0],
+            block_table.stride(0), width, s.kernel_block_tokens, 256,
+            s.dcp_world_size, s.dcp_rank, s.interleave,
+        )  # fmt: skip
+        return table
 
     def _cpu_validate(
         self,
@@ -983,6 +1142,8 @@ class HostHistoryLayer:
         token_to_req: torch.Tensor,
         block_table: torch.Tensor,
         seq_lens: torch.Tensor,
+        *,
+        check_capacity: bool = True,
     ) -> None:
         """Torch checks for the interpreter, where device asserts are no-ops."""
         s = self.store.shape
@@ -1019,8 +1180,17 @@ class HostHistoryLayer:
             if len(row_groups) > s.row_groups:
                 raise ValueError("host history QSA group bound exceeded")
             groups |= row_groups
-        if len(groups) > self.store.max_misses:
+        if check_capacity and len(groups) > self.store.max_misses:
             raise ValueError("host history hot capacity exceeded")
+        if not check_capacity:
+            # Union path: what gather_groups asserts on the device.
+            ratio = s.kernel_blocks_per_block
+            per_group = s.groups_per_kernel_block
+            pages = self.store.page_of[
+                torch.tensor(sorted({g // per_group // ratio for g in groups})).long()
+            ]
+            if (pages < 0).any():
+                raise ValueError("unbound host page read")
 
 
 def for_each_pass(
@@ -1080,3 +1250,290 @@ def for_each_pass(
         cursor = end
     if cursor != rows:
         raise ValueError("Host-history pass intervals do not cover the query rows")
+
+
+@dataclass
+class UnionWindowResult:
+    """What one union call did (host-side, no device read needed)."""
+
+    level: str
+    """``l0`` (CPU bound, no sync), ``l1`` (exact probe, one window) or
+    ``l2`` (exact greedy windows, with ``l3`` per-row groups if any)."""
+    windows: int
+    syncs: int
+    l3_groups: int
+    spans: list[tuple[int, int, str]]
+    """Executed row spans in order: ``(start, end, "union" | "rows")``."""
+
+
+def for_each_union_window(
+    layer: HostHistoryLayer,
+    selection: torch.Tensor,
+    token_to_req: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    outputs: Sequence[torch.Tensor],
+    attend_union,
+    attend_rows,
+    *,
+    capacity: int,
+    fast_path: bool = False,
+    req_class: torch.Tensor | None = None,
+    max_window_groups: int | None = None,
+) -> UnionWindowResult:
+    """Attend a mixed step from the union of its selections (selection-union gather,
+    selection-union gather).
+
+    ``attend_union(table, requests, outs)`` runs the unchanged attention on
+    every row with the original ``selection``, the hot K/V and the page-size-4
+    ``table``, writing all rows of ``outs`` (same shapes as ``outputs``); rows
+    whose request is -1 belong to another window and are discarded.
+    ``attend_rows(start, end, hot_ids)`` is the remap-pass callback, used for
+    an eight-row group that does not fit alone (L3); it writes ``outputs``
+    rows directly.
+
+    ``capacity`` is the step's hot capacity U, identical on every rank. Each
+    window holds whole eight-row groups whose exact union, every request's
+    tail counted once, is at most U. A window's table and hot slots are valid
+    only until its attention is consumed; the next window rebuilds both on
+    the same stream. ``fast_path`` (L0) asserts a CPU bound already proved
+    that the whole step fits; otherwise one host read decides (L1) and each
+    further window costs one host read (L2). Rank-local window counts may
+    differ: no collective runs between windows.
+
+    ``req_class`` holds per-request class bits (2 decode, 1 prefill) when
+    ``prefill_insert_age`` is ``old``. ``max_window_groups`` caps windows (a
+    test and A/B hook; any legal split gives the same bits)."""
+    store, s = layer.store, layer.store.shape
+    if store.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("host-history union windows synchronize; not in a graph")
+    rows, width = selection.shape
+    requests = seq_lens.shape[0]
+    if (
+        selection.ndim != 2
+        or not 0 < rows <= s.max_write_rows
+        or width > s.selection_width
+        or selection.dtype != torch.int32
+        or selection.stride(1) != 1
+        or token_to_req.shape != (rows,)
+        or token_to_req.dtype != torch.int32
+        or not token_to_req.is_contiguous()
+        or block_table.ndim != 2
+        or block_table.dtype != torch.int32
+        or block_table.stride(1) != 1
+        or block_table.shape[0] < requests
+        or not 0 < requests <= s.max_requests
+        or seq_lens.ndim != 1
+        or not seq_lens.is_contiguous()
+        or not 0 < capacity <= s.hot_slots
+        or (max_window_groups is not None and max_window_groups < 1)
+        or any(o.shape[0] != rows for o in outputs)
+    ):
+        raise ValueError("Invalid host history union tensors")
+    if store.device.type == "cpu":
+        layer._cpu_validate(
+            selection, token_to_req, block_table, seq_lens, check_capacity=False
+        )
+    classed = s.prefill_insert_age == "old"
+    if req_class is None:
+        req_class = torch.ones(requests, dtype=torch.int32, device=store.device)
+    elif req_class.shape != (requests,) or req_class.dtype != torch.int32:
+        raise ValueError("Invalid host history request classes")
+    if not classed:
+        # Bits only steer insertion age; without the policy every claim is 1.
+        req_class = torch.ones(requests, dtype=torch.int32, device=store.device)
+    width_mb = block_table.shape[1] * s.groups_per_kernel_block
+    scratch = layer._union_buffers(rows, block_table.shape[0] * width_mb)
+    scan, counters = scratch["scan"], scratch["counters"]
+    stats = store.union_stats
+    stats["calls"] += 1
+    step = _UNION_ROW_GROUP
+    groups8 = triton.cdiv(rows, step)
+    single = max_window_groups is None or max_window_groups >= groups8
+    args = (block_table, seq_lens, req_class, scan)
+
+    def fill_and_attend(start: int, end: int, outs) -> None:
+        # Marks for [start, end) are in place (Touched complete).
+        hk.begin_fill[(1,)](store.miss_count, layer.clock)
+        layer._fill_from_marks(classed=classed, counters=counters)
+        table = layer.build_microblock_table(block_table, seq_lens, scratch["table"])
+        if start == 0 and end == rows:
+            attend_union(table, token_to_req, outs)
+            return
+        masked = scratch["requests"][:rows]
+        masked.copy_(token_to_req)
+        if _MASK_OTHER_WINDOWS:
+            masked[:start].fill_(-1)
+            masked[end:].fill_(-1)
+        attend_union(table, masked, outs)
+
+    layer._union_clear()
+    syncs = 0
+    if single:
+        layer._union_scan(hk.UNION_MARK, selection, token_to_req, *args)
+        if fast_path:
+            if (store.debug or store.device.type == "cpu") and int(
+                store.wanted_count.item()
+            ) > capacity:
+                raise RuntimeError("union fast path bound below the exact union")
+            stats["l0"] += 1
+            stats["windows"] += 1
+            fill_and_attend(0, rows, outputs)
+            return UnionWindowResult("l0", 1, 0, 0, [(0, rows, "union")])
+        count = int(store.wanted_count.item())
+        syncs += 1
+        if count <= capacity:
+            stats["l1"] += 1
+            stats["windows"] += 1
+            stats["syncs"] += syncs
+            fill_and_attend(0, rows, outputs)
+            return UnionWindowResult("l1", 1, syncs, 0, [(0, rows, "union")])
+        # Overflow: Touched may be incomplete. Rescan the same inputs to
+        # restore every claimed gid to zero; residency, ages and the clock
+        # were never touched.
+        stats["probe_overflows"] += 1
+        layer._union_scan(hk.UNION_RESET, selection, token_to_req, *args)
+        store.wanted_count.zero_()
+
+    from .planning import union_window_groups
+
+    temporaries = [torch.empty_like(o) for o in outputs]
+    spans: list[tuple[int, int, str]] = []
+    windows = l3_groups = 0
+    group = 0
+    while group < groups8:
+        layer._union_clear()
+        start = step * group
+        rest_sel, rest_req = selection[start:], token_to_req[start:]
+        remaining = groups8 - group
+        scan[: remaining + 1].zero_()
+        layer._union_scan(hk.UNION_FIRST, rest_sel, rest_req, *args, remaining)
+        layer._union_scan(hk.UNION_COUNT, rest_sel, rest_req, *args, remaining)
+        layer._union_scan(hk.UNION_RESET, rest_sel, rest_req, *args, remaining)
+        counts = scan[: remaining + 1].tolist()
+        syncs += 1
+        limit = None if max_window_groups is None else max_window_groups
+        taken = union_window_groups(counts[0], counts[1:], capacity, limit)
+        if taken == 0:
+            # L3: this eight-row group alone exceeds U; run its rows through
+            # the remap passes, one row per pass (a row and every tail fit
+            # the floor). Outputs are written directly.
+            end = min(start + step, rows)
+            for_each_pass(
+                layer,
+                selection[start:end],
+                token_to_req[start:end],
+                block_table,
+                seq_lens,
+                lambda a, b, ids, base=start: attend_rows(base + a, base + b, ids),
+                passes=[(i, i + 1) for i in range(end - start)],
+            )
+            spans.append((start, end, "rows"))
+            l3_groups += 1
+            group += 1
+            continue
+        end = min(step * (group + taken), rows)
+        layer._union_scan(
+            hk.UNION_MARK, selection[start:end], token_to_req[start:end], *args
+        )
+        if store.debug or store.device.type == "cpu":
+            exact = counts[0] + sum(counts[1 : taken + 1])
+            if int(store.wanted_count.item()) != exact:
+                raise RuntimeError("union window marks differ from its plan")
+        fill_and_attend(start, end, temporaries)
+        for output, temporary in zip(outputs, temporaries, strict=True):
+            output[start:end].copy_(temporary[start:end])
+        spans.append((start, end, "union"))
+        windows += 1
+        group += taken
+    stats["l2"] += 1
+    stats["windows"] += windows
+    stats["l3_groups"] += l3_groups
+    stats["syncs"] += syncs
+    return UnionWindowResult("l2", windows, syncs, l3_groups, spans)
+
+
+@dataclass(frozen=True)
+class UnionStepInfo:
+    """CPU batch metadata of one step for the union path (supplied by shared hot
+    region).
+
+    ``capacity`` is U_step, identical on every rank. ``rows_by_req`` and
+    ``groups`` (from the maximum rank-local length) follow the block-table
+    row order; ``decode`` marks decode-class requests (a request's last
+    prefill chunk may be marked decode to keep its pages recent)."""
+
+    capacity: int
+    rows_by_req: tuple[int, ...] | None = None
+    groups: tuple[int, ...] | None = None
+    decode: tuple[bool, ...] | None = None
+
+
+def run_union_windows(
+    layer: HostHistoryLayer,
+    selection: torch.Tensor,
+    token_to_req: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    outputs: Sequence[torch.Tensor],
+    attend_union,
+    attend_rows,
+) -> UnionWindowResult:
+    """Model entry: derive U, the L0 decision and classes, then run windows.
+
+    With ``store.union_step`` (this step's ``UnionStepInfo``) the L0 bound is
+    exact per request. Without it the static pool's capacity and a shape
+    bound are used: ``sum_q min(G_q, rg*r_q + tg) <= min(n*G_max, rg*rows +
+    tg*n)``, and classes come from per-request row counts on the device."""
+    from .planning import history_groups, union_fast_path
+
+    store, s = layer.store, layer.store.shape
+    rows, requests = selection.shape[0], seq_lens.shape[0]
+    info: UnionStepInfo | None = getattr(store, "union_step", None)
+    req_class = None
+    if info is not None:
+        capacity = min(info.capacity, s.hot_slots)
+        fast = (
+            info.rows_by_req is not None
+            and info.groups is not None
+            and len(info.rows_by_req) == requests
+            and sum(info.rows_by_req) == rows
+            and union_fast_path(
+                info.rows_by_req,
+                info.groups,
+                capacity,
+                row_groups=s.row_groups,
+                tail_groups=s.tail_groups,
+            )
+        )
+        if info.decode is not None and len(info.decode) == requests:
+            req_class = torch.tensor(
+                [2 if d else 1 for d in info.decode], dtype=torch.int32
+            ).to(store.device, non_blocking=True)
+    else:
+        # Static pool, or no CPU batch metadata (dummy/profile runs): the
+        # slots usable this step (shared hot region keeps reserved shared-region slots
+        # out).
+        capacity = min(getattr(store, "available_slots", s.hot_slots), s.hot_slots)
+        bound = s.row_groups * rows + s.tail_groups * requests
+        if s.max_context_tokens is not None:
+            g_max = history_groups(s.max_context_tokens, s.dcp_world_size, s.interleave)
+            bound = min(bound, requests * g_max)
+        fast = bound <= capacity
+    if req_class is None and s.prefill_insert_age == "old":
+        counts = torch.zeros(requests, dtype=torch.int32, device=store.device)
+        counts.index_add_(0, token_to_req.long(), torch.ones_like(token_to_req))
+        req_class = torch.where(counts <= s.decode_rows, 2, 1).to(torch.int32)
+    return for_each_union_window(
+        layer,
+        selection,
+        token_to_req,
+        block_table,
+        seq_lens,
+        outputs,
+        attend_union,
+        attend_rows,
+        capacity=capacity,
+        fast_path=fast,
+        req_class=req_class,
+    )

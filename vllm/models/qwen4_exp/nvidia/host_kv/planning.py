@@ -82,6 +82,105 @@ def plan_passes(
     return passes
 
 
+UNION_ROW_GROUP = 8
+"""Mixed-step windows hold whole groups of eight query rows: the grouped
+page4 planner's unit, so a window never splits one of its plans."""
+
+
+def union_bound(
+    rows_by_req: Sequence[int],
+    G: Sequence[int],
+    *,
+    row_groups: int = QSA_ROW_GROUPS,
+    tail_groups: int = TAIL_GROUPS,
+) -> int:
+    """Upper bound on one call's union, every request's tail included once.
+
+    Unlike ``plan_passes`` this has no R_cap: the union path's row count does
+    not use the indices scratch."""
+    if len(rows_by_req) != len(G) or any(n < 0 for n in (*rows_by_req, *G)):
+        raise ValueError("Invalid union-bound geometry")
+    return sum(
+        min(g, row_groups * rows + tail_groups) for rows, g in zip(rows_by_req, G)
+    )
+
+
+def union_fast_path(
+    rows_by_req: Sequence[int],
+    G: Sequence[int],
+    U: int,
+    *,
+    row_groups: int = QSA_ROW_GROUPS,
+    tail_groups: int = TAIL_GROUPS,
+) -> bool:
+    """L0: the whole mixed step fits one window by a CPU bound (no sync).
+
+    ``G`` must use the maximum rank-local length (``history_groups``) and
+    ``U`` the step's common hot capacity, so every rank decides alike."""
+    return (
+        union_bound(rows_by_req, G, row_groups=row_groups, tail_groups=tail_groups) <= U
+    )
+
+
+def plan_union_windows_upper(
+    rows_by_req: Sequence[int],
+    G: Sequence[int],
+    U: int,
+    *,
+    row_groups: int = QSA_ROW_GROUPS,
+    tail_groups: int = TAIL_GROUPS,
+) -> list[tuple[int, int]] | None:
+    """Greedy windows of whole eight-row groups by the CPU bound.
+
+    Rows of a request are contiguous, in request order. Windows are planned on
+    group boundaries directly (rounding row-wise ends would either overflow or
+    stall). Returns None if one eight-row group alone exceeds the bound, which
+    the executor resolves by its per-row fallback (L3)."""
+    owner = [req for req, rows in enumerate(rows_by_req) for _ in range(rows)]
+    total = len(owner)
+    windows: list[tuple[int, int]] = []
+
+    def cost(start: int, end: int) -> int:
+        counts = [0] * len(G)
+        for req in owner[start:end]:
+            counts[req] += 1
+        return union_bound(counts, G, row_groups=row_groups, tail_groups=tail_groups)
+
+    start = 0
+    while start < total:
+        end = start
+        while end < total:
+            nxt = min(end + UNION_ROW_GROUP, total)
+            if cost(start, nxt) > U:
+                break
+            end = nxt
+        if end == start:
+            return None
+        windows.append((start, end))
+        start = end
+    return windows
+
+
+def union_window_groups(
+    tail: int, first_entries: Sequence[int], U: int, max_groups: int | None = None
+) -> int:
+    """Eight-row groups the exact greedy window takes from its start.
+
+    ``first_entries[g]`` counts gids whose first reference at or after the
+    window start lies in its g-th row group, tails excluded; ``tail`` counts
+    the tail gids once. The union of the first k groups is therefore
+    ``tail + sum(first_entries[:k])``. Returns 0 when one group does not fit.
+    """
+    used, taken = tail, 0
+    limit = len(first_entries) if max_groups is None else max_groups
+    while taken < min(limit, len(first_entries)):
+        if used + first_entries[taken] > U:
+            break
+        used += first_entries[taken]
+        taken += 1
+    return taken
+
+
 def plan_step_passes(
     batch_req_ids: Sequence[str],
     num_rows: int,

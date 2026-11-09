@@ -1973,6 +1973,8 @@ def resolve_long_context(
         settings["host_pool_tokens"] = args.host_pool_tokens or host_tokens
     if args.state_blocks is not None:
         settings["state_blocks"] = args.state_blocks
+    if getattr(args, "prefill_gather", None) is not None:
+        settings["prefill_gather"] = args.prefill_gather
     return settings, derived
 
 
@@ -2418,6 +2420,13 @@ def build_parser() -> argparse.ArgumentParser:
         "max_num_batched_tokens rows from --geometry-from",
     )
     run.add_argument("--state-blocks", type=int, default=None)
+    run.add_argument(
+        "--prefill-gather",
+        choices=("passes", "union"),
+        default=None,
+        help="host placement: mixed-step reads by remap passes or by the "
+        "union windows (default: the engine's)",
+    )
     run.add_argument(
         "--repeat",
         type=int,

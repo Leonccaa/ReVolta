@@ -130,6 +130,9 @@ def build_host_history_store(
         plan.geometry.decode_rows_per_request,
         mixed_full=mode.mixed_mode() == CUDAGraphMode.FULL,
     )
+    long_context = getattr(
+        getattr(vllm_config, "kernel_config", None), "long_context_kv", None
+    )
     shape = HostHistoryShape(
         num_blocks=kv_cache_config.num_blocks,
         kernel_blocks_per_block=storage_block // kernel_block,
@@ -158,6 +161,8 @@ def build_host_history_store(
         read_rows=read_rows,
         max_context_tokens=plan.geometry.max_model_len,
         decode_rows=plan.geometry.decode_rows_per_request,
+        prefill_gather=getattr(long_context, "prefill_gather", "passes"),
+        prefill_insert_age=getattr(long_context, "prefill_insert_age", "old"),
     )
     # Check before allocating (and again before publishing layer bindings).
     fixed_bytes = sum(shape.fixed_device_memory_bytes().values())
@@ -195,7 +200,7 @@ def build_host_history_store(
         "Long-context host memory: %d physical pages, %d history IDs, %d layers "
         "(%.2f GiB logical shard, %.2f GiB registered region), "
         "hot pool %d groups per layer, %d "
-        "query rows per gather pass.",
+        "query rows per gather pass, mixed steps by %s.",
         layout.num_pages,
         shape.num_blocks,
         shape.num_layers,
@@ -203,5 +208,6 @@ def build_host_history_store(
         layout.num_pages * layout.worker_bytes * layout.num_workers / (1 << 30),
         shape.hot_slots,
         shape.rows_per_pass,
+        shape.prefill_gather,
     )
     return store

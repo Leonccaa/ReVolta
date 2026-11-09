@@ -658,10 +658,16 @@ def test_route_hooks_reach_both_qsa_paths(monkeypatch):
     host_source = inspect.getsource(impl.forward_qsa_host)
     assert "from .host_kv.history import for_each_pass" in host_source
     assert "from .ops.qsa import qsa_sparse_paged_attention" in host_source
-    # The host path passes neither positions nor sequence lengths.
+    # The remap passes pass neither positions nor sequence lengths; the
+    # union path (selection-union gather) makes the GPU arm's call, positions and
+    # lengths
+    # included, behind its own hook.
     attend = host_source[host_source.index("def attend(") :]
-    attend = attend[: attend.index("for_each_pass(")]
+    attend = attend[: attend.index("if union:")]
     assert "query_positions" not in attend and "sequence_lengths" not in attend
+    assert "from .host_kv.history import for_each_pass, run_union_windows" in (
+        host_source
+    )
     calls: list[dict[str, Any]] = []
     monkeypatch.setattr(qsa_ops, "qsa_sparse_paged_attention", _fake_attention(calls))
     monkeypatch.setattr(history, "for_each_pass", lambda *a, **k: None)

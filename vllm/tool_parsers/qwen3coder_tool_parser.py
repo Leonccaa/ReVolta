@@ -138,6 +138,8 @@ class Qwen3CoderToolParser(ToolParser):
         self._string_waiting_space = False
         self._has_streamed_string = False
         self._string_waiting_header = False
+        self._fallback_text = ""
+        self._content_chars_sent = 0
 
     def _convert_param_value(
         self, param_value: str, param_name: str, param_config: dict, func_name: str
@@ -600,6 +602,10 @@ class Qwen3CoderToolParser(ToolParser):
             content_index = content_index if content_index >= 0 else idx
             content = model_output[:content_index]  # .rstrip()
             valid_tool_calls = [tc for tc in tool_calls if tc is not None]
+            if not valid_tool_calls:
+                return ExtractedToolCallInformation(
+                    tools_called=False, tool_calls=[], content=model_output
+                )
             return ExtractedToolCallInformation(
                 tools_called=(len(valid_tool_calls) > 0),
                 tool_calls=valid_tool_calls,
@@ -746,6 +752,40 @@ class Qwen3CoderToolParser(ToolParser):
         )
 
     def extract_tool_calls_streaming(
+        self,
+        previous_text: str,
+        current_text: str,
+        delta_text: str,
+        previous_token_ids: Sequence[int],
+        current_token_ids: Sequence[int],
+        delta_token_ids: Sequence[int],
+        request: ChatCompletionRequest,
+    ) -> DeltaMessage | None:
+        result = self._extract_tool_calls_streaming(
+            previous_text,
+            current_text,
+            delta_text,
+            previous_token_ids,
+            current_token_ids,
+            delta_token_ids,
+            request,
+        )
+        # Until the first call is committed, all emitted content is a prefix
+        # of current_text. Remember the rest, including partial marker suffixes.
+        self._fallback_text = current_text
+        if result is not None and result.content:
+            self._content_chars_sent += len(result.content)
+        return result
+
+    def finish_streaming(self) -> DeltaMessage | None:
+        # A header/argument already sent cannot be rolled back into text.
+        if self.prev_tool_call_arr:
+            return None
+        pending = self._fallback_text[self._content_chars_sent :]
+        self._content_chars_sent = len(self._fallback_text)
+        return DeltaMessage(content=pending) if pending else None
+
+    def _extract_tool_calls_streaming(
         self,
         previous_text: str,
         current_text: str,

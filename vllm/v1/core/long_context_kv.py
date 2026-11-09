@@ -305,6 +305,10 @@ class LongContextCapacityPlan:
     index
     page; 0 keeps the static hot pool. ``hot_pool_bytes`` then holds only the
     region's fixed scratch, and ``hot_pool_groups`` the largest region."""
+    value_shadow: bool = False
+    """value arbitration value arbitration with the shared region: every worker
+    allocates
+    the layer-0 shadow records, billed per history ID."""
     hot_pool_min_groups: int = 0
     """Guaranteed slot floor. The static static host allocation pool may exceed this
     floor; shared hot region
@@ -332,6 +336,8 @@ class LongContextCapacityPlan:
             )
             + self.hot_slots_per_block
             * geo.shared_slot_metadata_bytes(self.max_num_seqs)
+            # value arbitration layer-0 shadow records: one byte per four-token group.
+            + (geo.local_block_tokens // 4 if self.value_shadow else 0)
         )
 
     @property
@@ -701,7 +707,7 @@ def plan_long_context_capacity(
         hot_pool_min_groups=floor,
     )
     if not main_kv_on_gpu and _shared_region_enabled(geometry):
-        return _shared_region_plan(plan, auto)
+        return _shared_region_plan(plan, auto, settings.value_arbitration)
     if auto and not main_kv_on_gpu:
         return replace(plan, gpu_history_blocks=history_blocks)
     # GPU placement retains the existing physical history allocation. Its
@@ -755,7 +761,7 @@ def shared_region_fixed_bytes(geometry: LongContextGeometry, max_num_seqs: int) 
 
 
 def _shared_region_plan(
-    plan: LongContextCapacityPlan, auto: bool
+    plan: LongContextCapacityPlan, auto: bool, value_arbitration: bool = False
 ) -> LongContextCapacityPlan:
     """Give the whole remaining budget to history IDs; the hot region is the
     DONATED part of their index pages, above a guaranteed floor (slots).
@@ -770,6 +776,7 @@ def _shared_region_plan(
         hot_slots_per_block=k,
         hot_pool_bytes=shared_region_fixed_bytes(geo, plan.max_num_seqs),
         hot_pool_min_groups=0 if auto else plan.hot_pool_min_groups,
+        value_shadow=value_arbitration,
     )
     blocks = plan.gpu_history_budget_blocks
     return replace(plan, gpu_history_blocks=blocks, hot_pool_groups=blocks * k)

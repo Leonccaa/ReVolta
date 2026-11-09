@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from itertools import islice
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -489,6 +489,10 @@ class OffloadingConnectorScheduler:
     """Implementation of Scheduler side methods"""
 
     host_kv_hits: "HostKVHitManager | None" = None
+    # value arbitration value arbitration: called with each successfully completed
+    # receive
+    # transaction before it retires (None: arbitration off).
+    value_restore_hook: Callable[[ReceiveTxn], None] | None = None
 
     # Mamba boundary-state hand-offs the host tier could not accept in the
     # step they were offered (see _build_boundary_state_store_jobs).
@@ -2451,6 +2455,11 @@ class OffloadingConnectorScheduler:
                     self._abandon_load(job_status.req_id, "transfer failed")
                 if job_status.receive_txn is not None:
                     assert host_hits is not None
+                    hook = self.value_restore_hook
+                    if hook is not None and not job_status.failed:
+                        # value arbitration: a finally admitted, complete receive; its
+                        # NEW_LOAD entries did the index H2D.
+                        hook(job_status.receive_txn)
                     host_hits.retire_receive(job_status.receive_txn)
                     completed_receive_reqs.add(job_status.req_id)
             if self._block_id_to_pending_jobs:

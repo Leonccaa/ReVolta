@@ -118,6 +118,11 @@ class ActiveKVConnector(KVConnector):
             self.kv_connector.handle_preemptions(kv_connector_metadata)
         self._handled_metadata = None
         self._host_step = getattr(scheduler_output, "host_kv", None)
+        shadow = getattr(getattr(self, "_host_store", None), "shadow", None)
+        epoch = getattr(self._host_step, "arbiter_epoch", None)
+        if shadow is not None and epoch is not None:
+            # Forward stream, before this step's gathers (outside graphs).
+            shadow.set_window(epoch)
         self._host_sealed = False
         self._host_seal_failed = False
         self._host_event = None
@@ -174,6 +179,11 @@ class ActiveKVConnector(KVConnector):
             seal_failed = rank if self._host_seal_failed else compute_failed
             meta.seal_results[ticket] = (rank, seal_failed, compute_failed)
         meta.completed_steps[step.step] = rank
+        shadow = getattr(getattr(self, "_host_store", None), "shadow", None)
+        if shadow is not None:
+            lagged = shadow.harvest(step.step)
+            if lagged is not None:
+                meta.value_counters[lagged[0]] = (rank, tuple(lagged[1]))
         output.kv_connector_worker_meta = meta
         self._host_step = None
         self._host_event = None

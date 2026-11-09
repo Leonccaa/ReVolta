@@ -2227,6 +2227,8 @@ class GPUModelRunner(
             runner_only_attn_layers=self.runner_only_attn_layers,
             static_forward_context=(self.compilation_config.static_forward_context),
         )
+        kv_cache_config = getattr(self, "kv_cache_config", None)
+        self._kv_block_zeroer.num_blocks = getattr(kv_cache_config, "num_blocks", None)
 
     def _zero_block_ids(self, block_ids: list[int]) -> None:
         """Zero the KV cache memory for the given block IDs."""
@@ -2354,6 +2356,9 @@ class GPUModelRunner(
         # stale NaN/data from corrupting attention or SSM computation.
         if scheduler_output.new_block_ids_to_zero:
             self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
+        # Partial prefix-cache copies; absent from outputs built by older code.
+        if kv_block_copies := getattr(scheduler_output, "kv_block_copies", None):
+            self._kv_block_zeroer.copy_block_ids(kv_block_copies)
 
         # Free the cached encoder outputs.
         for mm_hash in scheduler_output.free_encoder_mm_hashes:

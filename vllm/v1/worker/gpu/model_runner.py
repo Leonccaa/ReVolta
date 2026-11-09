@@ -734,6 +734,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             runner_only_attn_layers=set(),
             static_forward_context=self.compilation_config.static_forward_context,
         )
+        kv_cache_config = getattr(self, "kv_cache_config", None)
+        self._kv_block_zeroer.num_blocks = getattr(kv_cache_config, "num_blocks", None)
 
     def _zero_block_ids(self, block_ids: list[int]) -> None:
         """Clear cache blocks before their first use after allocation."""
@@ -1643,6 +1645,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_connector.handle_preemptions(scheduler_output)
             if scheduler_output.new_block_ids_to_zero:
                 self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
+            # Partial prefix-cache copies; absent from outputs built by older code.
+            if kv_block_copies := getattr(scheduler_output, "kv_block_copies", None):
+                self._kv_block_zeroer.copy_block_ids(kv_block_copies)
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
                 empty_output = self.kv_connector.no_forward(scheduler_output)

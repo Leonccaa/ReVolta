@@ -543,6 +543,10 @@ class EngineArgs:
     prefix_cache_retention_interval: int | None = (
         CacheConfig.prefix_cache_retention_interval
     )
+    partial_prefix_cache: bool = CacheConfig.partial_prefix_cache
+    partial_prefix_cache_max_fraction: float = (
+        CacheConfig.partial_prefix_cache_max_fraction
+    )
     prefix_caching_hash_algo: PrefixCachingHashAlgo = (
         CacheConfig.prefix_caching_hash_algo
     )
@@ -1195,6 +1199,13 @@ class EngineArgs:
         cache_group.add_argument(
             "--prefix-cache-retention-interval",
             **cache_kwargs["prefix_cache_retention_interval"],
+        )
+        cache_group.add_argument(
+            "--partial-prefix-cache", **cache_kwargs["partial_prefix_cache"]
+        )
+        cache_group.add_argument(
+            "--partial-prefix-cache-max-fraction",
+            **cache_kwargs["partial_prefix_cache_max_fraction"],
         )
         cache_group.add_argument(
             "--calculate-kv-scales", **cache_kwargs["calculate_kv_scales"]
@@ -2057,6 +2068,8 @@ class EngineArgs:
             enable_prefix_caching=self.enable_prefix_caching,
             prefix_caching_hash_algo=self.prefix_caching_hash_algo,
             prefix_cache_retention_interval=self.prefix_cache_retention_interval,
+            partial_prefix_cache=self.partial_prefix_cache,
+            partial_prefix_cache_max_fraction=self.partial_prefix_cache_max_fraction,
             calculate_kv_scales=self.calculate_kv_scales,
             kv_cache_dtype_skip_layers=self.kv_cache_dtype_skip_layers,
             kv_sharing_fast_prefill=self.kv_sharing_fast_prefill,

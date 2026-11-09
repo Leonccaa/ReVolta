@@ -59,13 +59,25 @@ class SharedOffloadRegion:
             self._worker_offset = rank * cpu_page_size
             # exclusive upper bound for this worker's area within each row
             self._worker_area_end = (rank + 1) * cpu_page_size
+        self.fd: int | None = None
+        self.mmap_obj: mmap.mmap | None = None
+        self._base: torch.Tensor | None = None
+        self._views: list[torch.Tensor] = []
+        self.is_pinned = False
+        try:
+            self._open_mapping(rank, num_blocks, cpu_page_size)
+        except BaseException:
+            # A parent HostRegionOwner tracks scheduler-only names even if
+            # this constructor never returns to its caller.
+            self.cleanup()
+            raise
+
+    def _open_mapping(self, rank: int | None, num_blocks: int, cpu_page_size: int):
         try:
             # Exclusive create — only one worker succeeds
-            self.fd: int | None = os.open(
-                self.mmap_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600
-            )
-            os.ftruncate(self.fd, self.total_size_bytes)
+            self.fd = os.open(self.mmap_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
             self._creator = True
+            os.ftruncate(self.fd, self.total_size_bytes)
             logger.info(
                 "Created mmap file %s (%.2f GB)",
                 self.mmap_path,
@@ -76,7 +88,7 @@ class SharedOffloadRegion:
             _wait_for_file_size(self.fd, self.total_size_bytes)
             logger.info("Opened existing mmap file %s", self.mmap_path)
 
-        self.mmap_obj: mmap.mmap | None = mmap.mmap(
+        self.mmap_obj = mmap.mmap(
             self.fd,
             self.total_size_bytes,
             flags=mmap.MAP_SHARED,
@@ -112,8 +124,6 @@ class SharedOffloadRegion:
             )
 
         self._base = torch.frombuffer(memoryview(self.mmap_obj), dtype=torch.int8)
-        self._views: list[torch.Tensor] = []
-        self.is_pinned: bool = False
 
     def create_next_view(self, tensor_page_size: int) -> torch.Tensor:
         """Allocate a strided int8 view for this worker, one canonical tensor.
@@ -138,6 +148,7 @@ class SharedOffloadRegion:
             tensor_page_size: Bytes per block for this  tensor.
         """
         assert self.rank is not None
+        assert self._base is not None
         new_offset = self._worker_offset + tensor_page_size
         assert new_offset <= self._worker_area_end, (
             f"Worker offset {new_offset} exceeds worker area end "
@@ -160,6 +171,7 @@ class SharedOffloadRegion:
         Shape: (num_blocks, row_stride_bytes). Secondary tiers address
         block *b* as ``view[b]``.
         """
+        assert self._base is not None
         kv_tensor = self._base.view(self.num_blocks, self._row_stride)
         np_arr = kv_tensor.numpy()
         assert np_arr.ctypes.data == self._base.data_ptr(), (

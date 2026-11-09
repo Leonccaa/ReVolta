@@ -442,6 +442,15 @@ class LongContextKVConfig:
     hot-page pool. ``gpu``: in the GPU history segment next to the
     compressed index (the same-plan reference arm); the host and hot pools
     then only budget admission."""
+    value_arbitration: bool = True
+    """Host placement with the shared GPU region only: move the boundary
+    between the GPU prefix-index cache and the hot pages by bounded value
+    feedback. False keeps the fixed default split. Scheduler-only; it never
+    affects correctness or admission and is excluded from the compile hash."""
+    value_arbiter_settings: dict[str, float | int | str] = Field(default_factory=dict)
+    """Overrides of the arbitration window, dead band, quantum and the
+    placeholder cost weights (``bw_uva``, ``bw_h2d``, ``w_async``,
+    ``w_ttft``) for measurement runs. Excluded from the compile hash."""
 
     def validate_settings(self) -> None:
         """Reject contradictory sizes; called only when the mode is enabled."""
@@ -700,6 +709,19 @@ class KernelConfig:
             # An unused mode must not perturb existing graph caches.
             ignored_factors.add("long_context_kv")
         factors = get_hash_factors(self, ignored_factors)
+        if "long_context_kv" in factors:
+            # Scheduler-only arbitration knobs keep the previous identity.
+            lc_factor = factors["long_context_kv"]
+            assert isinstance(lc_factor, tuple)
+            name, items = lc_factor
+            factors["long_context_kv"] = (
+                name,
+                tuple(
+                    item
+                    for item in items
+                    if item[0] not in ("value_arbitration", "value_arbiter_settings")
+                ),
+            )
         factors["ir_op_priority"] = self.ir_op_priority.compute_hash()
         return hash_factors(factors)
 

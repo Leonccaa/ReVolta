@@ -56,6 +56,7 @@ from vllm.v1.core.sched.request_queue import (
     create_request_queue,
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
+from vllm.v1.core.value_arbiter import BusyTime
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
@@ -66,6 +67,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
+from vllm.v1.metrics.store import CPU_SAMPLE_STRIDE, StoreMetrics
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.ddtree_payload import DDTreeDraftPayload
@@ -369,7 +371,17 @@ class Scheduler(SchedulerInterface):
                 hits.attach_connector(self.connector.connector_scheduler)
         self.value_arbiter: Any = None
         self._value_step_clock: float | None = None
+        self._value_busy = BusyTime()
         self._init_value_arbiter()
+        self.store_metrics = (
+            StoreMetrics()
+            if self.log_stats and vllm_config.observability_config.enable_store_metrics
+            else None
+        )
+        self._store_schedule_cpu: dict[int, int] = {}
+        offload_scheduler = getattr(self.connector, "connector_scheduler", None)
+        if offload_scheduler is not None:
+            offload_scheduler.store_metrics = self.store_metrics
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
         )
@@ -653,6 +665,12 @@ class Scheduler(SchedulerInterface):
 
     def schedule(self) -> SchedulerOutput:
         self.current_step += 1
+        store_cpu_start = (
+            time.thread_time_ns()
+            if self.store_metrics is not None
+            and self.current_step % CPU_SAMPLE_STRIDE == 0
+            else 0
+        )
         host_pool = getattr(self, "host_history_pool", None)
         if host_pool is not None:
             host_pool.start_step(self.current_step)
@@ -1156,10 +1174,24 @@ class Scheduler(SchedulerInterface):
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
+                    if self.store_metrics is not None:
+                        self.store_metrics.begin_lookup(request)
+                    elif self.log_stats:
+                        request.prefix_cache_attempt += 1
                     # Get locally-cached tokens.
                     new_computed_blocks, num_new_local_computed_tokens = (
                         self.kv_cache_manager.get_computed_blocks(request)
                     )
+                    if (
+                        self.store_metrics is not None
+                        and self.cache_config.enable_prefix_caching
+                    ):
+                        self.store_metrics.lookup(
+                            request,
+                            "local",
+                            request.num_tokens,
+                            num_new_local_computed_tokens,
+                        )
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
@@ -1172,6 +1204,20 @@ class Scheduler(SchedulerInterface):
                             ext_tokens, load_kv_async = 0, False
 
                         if ext_tokens is None:
+                            if self.store_metrics is not None:
+                                self.store_metrics.lookup(
+                                    request,
+                                    "external",
+                                    request.num_tokens - num_new_local_computed_tokens,
+                                    0,
+                                )
+                            ssd = self.host_kv_ssd
+                            reason = (
+                                "ssd_prefetch"
+                                if ssd is not None and ssd.waiting(request.request_id)
+                                else "connector"
+                            )
+                            self._store_retry(request, reason, scheduled_timestamp)
                             # The request cannot be scheduled because
                             # the KVConnector couldn't determine
                             # the number of matched tokens.
@@ -1180,11 +1226,22 @@ class Scheduler(SchedulerInterface):
                             continue
 
                         num_external_computed_tokens = ext_tokens
+                        if self.store_metrics is not None:
+                            self.store_metrics.prefetch_ready(
+                                request, scheduled_timestamp
+                            )
 
                         connector_prefix_cache_queries = (
                             request.num_tokens - num_new_local_computed_tokens
                         )
                         connector_prefix_cache_hits = num_external_computed_tokens
+                        if self.store_metrics is not None:
+                            self.store_metrics.lookup(
+                                request,
+                                "external",
+                                connector_prefix_cache_queries,
+                                connector_prefix_cache_hits,
+                            )
 
                     # Total computed tokens (local + external).
                     num_computed_tokens = (
@@ -1232,6 +1289,7 @@ class Scheduler(SchedulerInterface):
                     ):
                         # If chunked_prefill is disabled,
                         # we can stop the scheduling here.
+                        self._store_retry(request, "budget", scheduled_timestamp)
                         break
 
                     num_new_tokens = min(num_new_tokens, token_budget)
@@ -1239,6 +1297,7 @@ class Scheduler(SchedulerInterface):
                     if is_prefill and prefill_token_budget is not None:
                         num_new_tokens = min(num_new_tokens, prefill_token_budget)
                         if num_new_tokens == 0:
+                            self._store_retry(request, "budget", scheduled_timestamp)
                             request_queue.pop_request()
                             step_skipped_waiting.prepend_request(request)
                             continue
@@ -1250,6 +1309,7 @@ class Scheduler(SchedulerInterface):
                     )
                     num_new_tokens = limit_prefill(request.request_id, num_new_tokens)
                     if num_new_tokens == 0:
+                        self._store_retry(request, "budget", scheduled_timestamp)
                         break
 
                     # Schedule encoder inputs.
@@ -1268,6 +1328,7 @@ class Scheduler(SchedulerInterface):
                         )
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
+                            self._store_retry(request, "budget", scheduled_timestamp)
                             break
 
                 # Skip block alignment when setting up async receive (no local work).
@@ -1279,6 +1340,7 @@ class Scheduler(SchedulerInterface):
                         num_external_computed_tokens,
                     )
                     if num_new_tokens == 0:
+                        self._store_retry(request, "budget", scheduled_timestamp)
                         break
 
                 # Handles an edge case when P/D Disaggregation
@@ -1369,6 +1431,7 @@ class Scheduler(SchedulerInterface):
                 )
 
                 if new_blocks is None:
+                    self._store_retry(request, "capacity", scheduled_timestamp)
                     # The request cannot be scheduled.
 
                     # NOTE: we need to untouch the request from the encode cache
@@ -1404,18 +1467,9 @@ class Scheduler(SchedulerInterface):
                         load_abandoned = request_id in abandoned
                         abandoned.discard(request_id)
                         self._void_failed_loads(abandoned)
-                    if (
-                        self.connector_prefix_cache_stats is not None
-                        and connector_prefix_cache_queries != 0
-                    ):
-                        self.connector_prefix_cache_stats.record(
-                            num_tokens=connector_prefix_cache_queries,
-                            num_hits=connector_prefix_cache_hits,
-                            preempted=request.num_preemptions > 0,
-                        )
-
                 request = request_queue.pop_request()
                 if load_abandoned:
+                    self._store_retry(request, "connector", scheduled_timestamp)
                     # The connector could not restore a complete prefix after
                     # all and issued no transfer. Park the request as a failed
                     # remote load that already finished: the next step releases
@@ -1439,6 +1493,12 @@ class Scheduler(SchedulerInterface):
                     self.finished_recving_kv_req_ids.add(request_id)
                     self._inflight_prefills.add(request)
                     continue
+                self._record_prefix_admission(
+                    request,
+                    num_new_local_computed_tokens,
+                    num_external_computed_tokens,
+                    scheduled_timestamp,
+                )
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
@@ -1466,6 +1526,10 @@ class Scheduler(SchedulerInterface):
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
                     )
+                    if self.store_metrics is not None:
+                        state = self.store_metrics.state(request)
+                        if not state.scheduled:
+                            state.scheduled = scheduled_timestamp
                 if request.status == RequestStatus.WAITING:
                     scheduled_new_reqs.append(request)
                 elif request.status == RequestStatus.PREEMPTED:
@@ -1693,7 +1757,64 @@ class Scheduler(SchedulerInterface):
         host_hits = self.kv_cache_manager.host_kv_hits
         if host_hits is not None:
             host_hits.release_uncommitted()
+        arbiter = self.value_arbiter
+        if (
+            arbiter is not None
+            and getattr(getattr(arbiter, "config", None), "busy_time", False)
+            and self._value_busy.has_work(scheduler_output)
+        ):
+            # The worker dispatch boundary. Concurrent batches share one busy
+            # interval; each output owns only time since the previous output.
+            self._value_busy.start(self.current_step, time.monotonic())
+            arbiter.mark_busy(self.current_step)
+        if store_cpu_start:
+            self._store_schedule_cpu[id(scheduler_output)] = (
+                time.thread_time_ns() - store_cpu_start
+            )
         return scheduler_output
+
+    def _store_retry(self, request: Request, reason: str, timestamp: float) -> None:
+        metrics = getattr(self, "store_metrics", None)
+        if metrics is not None:
+            metrics.retry(request, reason, timestamp)
+
+    def _record_prefix_admission(
+        self, request: Request, local: int, external: int, now: float
+    ) -> None:
+        if not self.log_stats:
+            return
+        if request.prefix_cache_recorded_attempt == request.prefix_cache_attempt:
+            return
+        request.prefix_cache_recorded_attempt = request.prefix_cache_attempt
+        if self.log_stats:
+            stats = self.kv_cache_manager.prefix_cache_stats
+            if (
+                stats is not None
+                and self.cache_config.enable_prefix_caching
+                and not request.skip_reading_prefix_cache
+            ):
+                stats.record(request.num_tokens, local, request.num_preemptions > 0)
+            stats = self.connector_prefix_cache_stats
+            if (
+                stats is not None
+                and request.num_tokens > local
+                and not request.skip_reading_prefix_cache
+            ):
+                stats.record(
+                    request.num_tokens - local, external, request.num_preemptions > 0
+                )
+        if self.store_metrics is not None:
+            self.store_metrics.admit(
+                request,
+                local,
+                external,
+                self.host_history_pool is not None,
+                now,
+                local_query=self.cache_config.enable_prefix_caching
+                and not request.skip_reading_prefix_cache,
+                external_query=self.connector is not None
+                and not request.skip_reading_prefix_cache,
+            )
 
     def _init_value_arbiter(self) -> None:
         """value arbitration: bounded value feedback on T_idx, only for the shared
@@ -1764,7 +1885,11 @@ class Scheduler(SchedulerInterface):
         now = time.monotonic()
         last, self._value_step_clock = self._value_step_clock, now
         epoch = arbiter.begin_step(
-            self.current_step, None if last is None else now - last
+            self.current_step,
+            None
+            if getattr(getattr(arbiter, "config", None), "busy_time", False)
+            or last is None
+            else now - last,
         )
         assert self.host_history_pool is not None
         arbiter.end_step(
@@ -1933,6 +2058,9 @@ class Scheduler(SchedulerInterface):
         if request.spec_token_ids:
             request.spec_token_ids = []
         request.num_preemptions += 1
+        if self.store_metrics is not None:
+            self.store_metrics.preempt(request, timestamp)
+        request.prefix_cache_attempt += 1
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
 
@@ -2318,6 +2446,17 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        schedule_cpu = (
+            self._store_schedule_cpu.pop(id(scheduler_output), None)
+            if self.store_metrics is not None
+            else None
+        )
+        store_cpu_start = time.thread_time_ns() if schedule_cpu is not None else 0
+        host_meta = scheduler_output.host_kv
+        if host_meta is not None and host_meta.step in self._value_busy.steps:
+            seconds = self._value_busy.finish(host_meta.step, time.monotonic())
+            assert self.value_arbiter is not None and seconds is not None
+            self.value_arbiter.record_step_seconds(host_meta.step, seconds)
         if getattr(self, "host_history_pool", None) is not None:
             self.update_host_kv_output(model_runner_output.kv_connector_output)
         self.mixed_prefill_budget.update(model_runner_output.mixed_prefill_timing)
@@ -2450,6 +2589,10 @@ class Scheduler(SchedulerInterface):
 
             # Check for stop and update request status.
             if new_token_ids:
+                if self.store_metrics is not None:
+                    state = request.store_attempt
+                    if state is None or not state.first_token:
+                        self.store_metrics.first_token(request, time.monotonic())
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids
                 )
@@ -2682,6 +2825,10 @@ class Scheduler(SchedulerInterface):
                 engine_core_outputs[0] = eco = EngineCoreOutputs()
             eco.scheduler_stats = stats
 
+        if self.store_metrics is not None and schedule_cpu is not None:
+            self.store_metrics.step_cpu(
+                schedule_cpu + time.thread_time_ns() - store_cpu_start
+            )
         return engine_core_outputs
 
     @staticmethod
@@ -2992,6 +3139,8 @@ class Scheduler(SchedulerInterface):
                 self.connector.on_new_request(request)
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
+                if self.store_metrics is not None:
+                    self.store_metrics.queued(request, request.events[-1].timestamp)
 
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
@@ -3253,6 +3402,24 @@ class Scheduler(SchedulerInterface):
             kv_connector_stats=connector_stats_payload,
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
+            store_stats=self._export_store_stats(),
+        )
+
+    def _export_store_stats(self):
+        metrics = getattr(self, "store_metrics", None)
+        if metrics is None:
+            return None
+        now = time.monotonic()
+        if now < metrics.next_export:
+            return None
+        offload = getattr(self.connector, "connector_scheduler", None)
+        return metrics.export(
+            now,
+            pool=self.host_history_pool,
+            ssd=self.host_kv_ssd,
+            arbiter=self.value_arbiter,
+            manager=getattr(offload, "manager", None),
+            ledger=self.kv_cache_manager.admission_ledger,
         )
 
     def _observe_rejection_fallbacks(
@@ -3461,6 +3628,9 @@ class Scheduler(SchedulerInterface):
         assert self.connector is not None
 
         if request.request_id in self.failed_recving_kv_req_ids:
+            if self.store_metrics is not None:
+                self.store_metrics.fail(request, time.monotonic())
+            request.prefix_cache_attempt += 1
             # Request had KV load failures; num_computed_tokens was already
             # updated in _update_requests_with_invalid_blocks
             if request.num_computed_tokens:
@@ -3475,6 +3645,8 @@ class Scheduler(SchedulerInterface):
             self.failed_recving_kv_req_ids.remove(request.request_id)
         else:
             # Now that the blocks are ready, actually cache them.
+            if self.store_metrics is not None:
+                self.store_metrics.restored(request, time.monotonic())
             # This will cache the blocks iff caching is enabled.
             self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
 
@@ -3494,6 +3666,7 @@ class Scheduler(SchedulerInterface):
             # update_from_output(), based on worker-side connector signals
             # in KVConnectorOutput.finished_recving
             if request.request_id not in self.finished_recving_kv_req_ids:
+                self._store_retry(request, "receive", time.monotonic())
                 return False
             self._update_waiting_for_remote_kv(request)
             if request.num_preemptions:
@@ -3749,6 +3922,11 @@ class Scheduler(SchedulerInterface):
 
         if not total_failed_requests:
             return set()
+
+        if self.store_metrics is not None:
+            failure_time = time.monotonic()
+            for req_id in async_failed_req_ids | sync_failed_req_ids:
+                self.store_metrics.fail(self.requests[req_id], failure_time)
 
         # evict invalid blocks and downstream dependent blocks from cache
         # only when not using recompute policy (where blocks will be recomputed

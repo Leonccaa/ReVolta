@@ -65,6 +65,12 @@ class ObservabilityConfig:
     enable_mfu_metrics: bool = False
     """Enable Model FLOPs Utilization (MFU) metrics."""
 
+    enable_store_metrics: bool = True
+    """Enable scheduler store counters and bounded CPU/TTFT samples.
+    CPU timing samples every 17th step; exports at most once per 60 seconds.
+    On by default; disable with --no-enable-store-metrics. Requires log stats.
+    No GPU sync."""
+
     enable_mm_processor_stats: bool = False
     """Enable collection of timing statistics for multimodal processor operations.
     This is for internal use only (e.g., benchmarks) and is not exposed as a CLI

@@ -196,6 +196,7 @@ class SchedulerStats:
     cudagraph_stats: CUDAGraphStat | None = None
 
     perf_stats: PerfStats | None = None
+    store_stats: dict[str, Any] | None = None
 
 
 @dataclass

@@ -149,6 +149,9 @@ class Request:
         # and PP run ahead of the GPU); `num_computed_tokens` counts them
         # optimistically.
         self.num_in_flight_tokens = 0
+        # Of those, tokens scheduled for a streaming-input turn that has
+        # already stopped: their outputs are discarded when they return.
+        self.num_stale_in_flight_tokens = 0
 
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0

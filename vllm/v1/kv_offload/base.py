@@ -278,6 +278,9 @@ class OffloadingManager(ABC):
         """Evict all tracked blocks and reset internal state."""
         return
 
+    def set_shutdown_deadline(self, deadline: float) -> None:
+        self._shutdown_deadline = deadline
+
     def shutdown(self) -> None:
         """Shutdown the manager and release any resources."""
         return

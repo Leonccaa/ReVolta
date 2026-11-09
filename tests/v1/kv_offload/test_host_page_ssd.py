@@ -359,7 +359,7 @@ def test_final_flush_deadline_cancels_queued_and_drains_started_writes(
     assert not any(p.io for p in env.table.pages)
 
 
-def _shutdown_with(env, plan=None):
+def _shutdown_with(env, plan=None, deadline=None):
     from vllm.v1.core.sched.scheduler import Scheduler
 
     calls = []
@@ -379,7 +379,7 @@ def _shutdown_with(env, plan=None):
         host_region=Region(),
         host_history_pool=SimpleNamespace(host_pages=env.table),
     )
-    Scheduler.shutdown(fake)
+    Scheduler.shutdown(fake, deadline=deadline)
     return calls
 
 
@@ -407,11 +407,24 @@ def test_io_that_never_finishes_quarantines_without_hanging(tmp_path, envs, gate
     plan = persist.FlushPlan(0.2, None, None, "test")
     env.ssd.options["shutdown_io_grace_s"] = 0.2
     started = time.monotonic()
-    calls = _shutdown_with(env, plan)
+    with pytest.raises(TimeoutError, match="retaining region"):
+        _shutdown_with(env, plan)
     assert time.monotonic() - started < 3
-    assert calls == []  # region neither unmapped nor unlinked
     assert env.ssd.quarantined
     assert env.table.get(first).io  # the hung row keeps its owner
+
+
+def test_scheduler_deadline_bounds_ssd_without_engine_plan(tmp_path, envs, gate):
+    env = envs(tmp_path / "ssd", shutdown_io_grace_s=5)
+    handle = env.publish(1)
+    gate.blocked.add(handle.page_id)
+    env.ssd.step()
+    assert gate.started.wait(1)
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        _shutdown_with(env, deadline=started + 0.1)
+    assert time.monotonic() - started < 1
+    assert env.ssd.quarantined and env.table.get(handle).io
 
 
 # ---------------------------------------------------------------- item 7
@@ -522,6 +535,35 @@ def test_reset_epoch_and_layout_change_never_hit_old_files(tmp_path, envs):
     assert same.table.is_ready(same.table.lookup(key(1)))
 
 
+def test_full_length_host_page_key_is_written_and_hits_after_restart(tmp_path, envs):
+    """A host page key concatenates one 32-byte hash per hash block (98 for a
+    1568-token page). Its hex alone is 6272 characters, far over the 255-byte
+    file name limit; the SSD key must stay short and stable across restarts."""
+    root = tmp_path / "ssd"
+    long_key = make_offload_key(b"".join(sha256(i) for i in range(98)), 0)
+    assert len(long_key) == 98 * 32 + 4
+    writer = envs(root, write_delay_s=300)
+    handle = writer.table.reserve()
+    assert handle is not None
+    start = handle.page_id * ROW
+    writer.backing[start : start + ROW] = payload(5)
+    page = writer.table.get(handle)
+    page.compute_result = page.seal_result = Result.OK
+    writer.table.publish(handle, long_key)
+    report = writer.ssd.final_flush(budget_s=5.0, io_grace_s=5.0)
+    assert (report.candidates, report.completed, report.failed) == (1, 1, 0)
+    files = page_files(root)
+    assert len(files) == 1 and all(len(f.name) < 255 for f in files)
+    writer.ssd.close(io_grace_s=5)
+    same = envs(root)
+    assert same.ssd.prefetch("r", [long_key]) == [long_key]
+    assert same.settle(lambda: not same.ssd._jobs)
+    loaded = same.table.lookup(long_key)
+    assert same.table.is_ready(loaded)
+    row = loaded.page_id * ROW
+    assert bytes(same.backing[row : row + ROW]) == payload(5)
+
+
 def test_reset_during_store_and_load_never_publishes_old_content(tmp_path, envs, gate):
     root = tmp_path / "ssd"
     seed = envs(root)
@@ -626,18 +668,24 @@ def test_prefetch_respects_net_headroom(tmp_path, envs):
 
 
 def test_flush_plan_truncates_to_shutdown_window():
-    deadline = persist.shared_shutdown_deadline(100.0, 30)
+    from vllm.v1.engine.core import EngineCore
+
+    engine = EngineCore.__new__(EngineCore)
+    engine.vllm_config = SimpleNamespace(shutdown_timeout=30)
+    engine._shutdown_requested_at = 100.0
+    deadline = engine.shutdown_deadline()
     assert deadline == 100 + 30 - SHUTDOWN_MARGIN_S
-    assert persist.shared_shutdown_deadline(None, 30) is None
-    assert persist.shared_shutdown_deadline(100.0, 0) is None
     assert plan_final_flush(10, 30, None, 50).budget_s == 10
     plan = plan_final_flush(10, 30, deadline, 104.0)
     assert plan.budget_s == 10 and plan.deadline == deadline
     assert plan_final_flush(10, 30, deadline, 118.0).budget_s == pytest.approx(7.0)
     plan = plan_final_flush(10, 30, deadline, 126.0)
     assert plan.budget_s == 0 and plan.reason == "shutdown window exhausted"
-    plan = plan_final_flush(10, 0, None, 100.0)
+    engine.vllm_config.shutdown_timeout = 0
+    deadline = engine.shutdown_deadline()
+    plan = plan_final_flush(10, 0, deadline, 100.0)
     assert plan.budget_s == 0 and "shutdown_timeout=0" in plan.reason
+    assert plan.deadline == deadline == 95.0
 
 
 def test_startup_window_warning():
@@ -701,29 +749,124 @@ def test_engine_core_shutdown_plans_flush_from_signal_time(monkeypatch):
     monkeypatch.setattr(core_module, "cleanup_dist_env_and_memory", lambda: None)
     plans = []
     scheduler = SimpleNamespace(
-        host_history_pool=None,
+        host_history_pool=SimpleNamespace(),
         host_kv_ssd=SimpleNamespace(options={"shutdown_flush_timeout_s": 10.0}),
         host_kv_flush_plan=None,
     )
-    scheduler.shutdown = lambda: plans.append(scheduler.host_kv_flush_plan)
+    deadlines = []
+
+    def shutdown(deadline=None):
+        plans.append(scheduler.host_kv_flush_plan)
+        deadlines.append(deadline)
+
+    scheduler.shutdown = shutdown
     for timeout, elapsed, budget in ((30, 20.0, 5.0), (30, 1.0, 10.0), (0, 0.0, 0.0)):
-        fake = SimpleNamespace(
-            scheduler=scheduler,
-            model_executor=None,
-            structured_output_manager=SimpleNamespace(clear_backend=lambda: None),
-            vllm_config=SimpleNamespace(shutdown_timeout=timeout),
-            shutdown_requested_at=time.monotonic() - elapsed,
-        )
-        fake._host_kv_shutdown_deadline = (
-            lambda fake=fake: EngineCore._host_kv_shutdown_deadline(fake)
-        )
-        EngineCore.shutdown(fake)
+        engine = EngineCore.__new__(EngineCore)
+        engine.scheduler = scheduler
+        engine.model_executor = None
+        engine.structured_output_manager = SimpleNamespace(clear_backend=lambda: None)
+        engine.vllm_config = SimpleNamespace(shutdown_timeout=timeout)
+        engine._shutdown_requested_at = time.monotonic() - elapsed
+        engine.shutdown()
         assert plans[-1].budget_s == pytest.approx(budget, abs=0.2)
+        assert plans[-1].deadline == deadlines[-1] == engine.shutdown_deadline()
     # A shared deadline provided by the shutdown owner takes precedence.
-    fake.vllm_config.shutdown_timeout = 30
-    fake.shutdown_deadline = time.monotonic() + 3
-    EngineCore.shutdown(fake)
+    engine._host_kv_shutdown_complete = False
+    engine.vllm_config.shutdown_timeout = 30
+    deadline = time.monotonic() + 3
+    engine.shutdown_deadline = lambda: deadline
+    engine.shutdown()
     assert plans[-1].budget_s == pytest.approx(3.0, abs=0.2)
+    assert plans[-1].deadline == deadlines[-1] == deadline
+
+
+def test_engine_fs_and_ssd_share_deadline_without_extra_grace(
+    tmp_path, envs, gate, monkeypatch
+):
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+        OffloadingConnectorScheduler,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
+        OffloadingConnector,
+    )
+    from vllm.v1.core.sched.scheduler import Scheduler
+    from vllm.v1.engine.core import EngineCore
+    from vllm.v1.kv_offload.tiering.fs.manager import FileSystemTierManager
+    from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
+    from vllm.v1.kv_offload.tiering.manager import TieringOffloadingManager
+
+    env = envs(tmp_path / "ssd", shutdown_io_grace_s=5)
+    handle = env.publish(1)
+    gate.blocked.add(handle.page_id)
+    env.ssd.step()
+    assert gate.started.wait(1)
+    assert all(job_id < 0 for job_id in env.table.get(handle).io)
+
+    fs_gate = threading.Event()
+    fs_entered = threading.Event()
+    tier = FileSystemTierManager.__new__(FileSystemTierManager)
+    tier._pool = DualQueueThreadPool(0, 1, drain_timeout_s=30)
+    tier._cache = SimpleNamespace(release=lambda: None)
+    tier._closed = False
+    tier.tier_type = "fs"
+
+    def fs_io():
+        fs_entered.set()
+        fs_gate.wait()
+
+    tier._pool.enqueue_store(1, 1, [fs_io])
+    assert fs_entered.wait(1)
+    manager = TieringOffloadingManager.__new__(TieringOffloadingManager)
+    manager._delayed = {}
+    manager.secondary_tiers = [tier]
+    manager.primary_tier = SimpleNamespace(shutdown=lambda: None)
+    connector_scheduler = OffloadingConnectorScheduler.__new__(
+        OffloadingConnectorScheduler
+    )
+    connector_scheduler.manager = manager
+    connector = OffloadingConnector.__new__(OffloadingConnector)
+    connector.connector_worker = None
+    connector.connector_scheduler = connector_scheduler
+    released = []
+    region = SimpleNamespace(cleanup=lambda: released.append("region"))
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.kv_event_publisher = scheduler.ec_connector = None
+    scheduler.connector = connector
+    scheduler.host_region = region
+    scheduler.host_kv_ssd = env.ssd
+    scheduler.host_history_pool = SimpleNamespace(
+        _jobs={}, host_pages=env.table, pending_seals={}
+    )
+    scheduler.current_step = env.table.watermark
+    engine = EngineCore.__new__(EngineCore)
+    engine.scheduler = scheduler
+    engine.vllm_config = SimpleNamespace(shutdown_timeout=5.2)
+    engine.model_executor = SimpleNamespace(
+        collective_rpc=lambda *_, **__: [(0, None, None)], shutdown=lambda: None
+    )
+    engine.structured_output_manager = SimpleNamespace(clear_backend=lambda: None)
+    monkeypatch.setattr("vllm.v1.engine.core.cleanup_dist_env_and_memory", lambda: None)
+    timer = threading.Timer(0.04, fs_gate.set)
+    timer.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(TimeoutError):
+            engine.shutdown()
+        assert time.monotonic() - started < 1
+        assert tier._closed and engine._host_kv_drained
+        assert manager._shutdown_deadline == tier._shutdown_deadline
+        assert manager._shutdown_deadline == engine.shutdown_deadline()
+        assert scheduler.host_kv_flush_plan.deadline == engine.shutdown_deadline()
+        assert env.ssd.quarantined and engine._host_kv_quarantined
+        assert not getattr(engine, "_host_kv_shutdown_complete", False)
+        assert scheduler.host_region is region and scheduler.host_kv_ssd is env.ssd
+        assert env.table.get(handle).io and not released
+        with pytest.raises(RuntimeError, match="quarantined"):
+            engine.shutdown()
+    finally:
+        fs_gate.set()
+        timer.join()
+        tier._pool.shutdown()
 
 
 def test_history_pool_batch_admission_survives_writeback(tmp_path):

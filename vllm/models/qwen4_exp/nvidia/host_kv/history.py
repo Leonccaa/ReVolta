@@ -319,32 +319,37 @@ class HostHistoryStore:
         h, d = s.kv_heads, s.head_dim
         dims = (s.num_blocks, s.kernel_blocks_per_block, layers, 2, kbs, h, d)
         self.region = None
+        self._registration_finalizer = None
+        self.layers: list[HostHistoryLayer] = []
+        self.layer_index: dict[str, int] = {}
         self.index_payloads: list[torch.Tensor] = []
-        if region_layout is None:
-            flat = _allocate_host(math.prod(dims), s.dtype)
-            self.host = flat.view(dims)
-        else:
-            self.region = region_layout.open(rank)
-            raw = self.region.create_next_view(region_layout.main_bytes)
-            # Unflatten preserves the row stride across other workers and
-            # this rank's logical index payload. No reshape may copy here.
-            self.host = raw.view(s.dtype).unflatten(1, dims[1:])
-            self.index_payloads = [
-                self.region.create_next_view(n).view(torch.uint8)
-                for n in region_layout.index_bytes
-            ]
-            flat = self.region._base
-        if device.type == "cuda" and self.region is None:
-            _register_host(flat)
-            # Unregister only when the store goes away; views must not
-            # outlive it.
-            weakref.finalize(self, _unregister_host, flat)
-        elif device.type == "cuda":
-            from vllm.v1.kv_offload.cpu.gpu_worker import pin_mmap_region
-
-            assert self.region is not None
-            pin_mmap_region(self.region, flags=3)
+        self._seal_sources: list[torch.Tensor] = []
+        flat = raw = None
         try:
+            if region_layout is None:
+                flat = _allocate_host(math.prod(dims), s.dtype)
+                self.host = flat.view(dims)
+            else:
+                self.region = region_layout.open(rank)
+                raw = self.region.create_next_view(region_layout.main_bytes)
+                # Unflatten preserves the row stride across other workers and
+                # this rank's logical index payload. No reshape may copy here.
+                self.host = raw.view(s.dtype).unflatten(1, dims[1:])
+                self.index_payloads = [
+                    self.region.create_next_view(n).view(torch.uint8)
+                    for n in region_layout.index_bytes
+                ]
+                flat = self.region._base
+            if device.type == "cuda" and self.region is None:
+                _register_host(flat)
+                self._registration_finalizer = weakref.finalize(
+                    self, _unregister_host, flat
+                )
+            elif device.type == "cuda":
+                from vllm.v1.kv_offload.cpu.gpu_worker import pin_mmap_region
+
+                assert self.region is not None
+                pin_mmap_region(self.region, flags=3)
             if device.type == "cuda":
                 with torch.accelerator.device_index(device.index):
                     self.host_device = get_accelerator_view_from_cpu_tensor(self.host)
@@ -357,10 +362,9 @@ class HostHistoryStore:
                 else torch.full((s.num_blocks,), -1, **i32)
             )
             self.page_of[0] = 0
-            # CPU mirror is used only by the temporary static host allocation transfer
-            # bridge.
+            # Control-plane binding checks for seal and diagnostic host views.
+            # ReceiveTxn addresses its sources directly by physical handle.
             self.page_of_cpu = self.page_of.cpu().numpy().copy()
-            self._seal_sources: list[torch.Tensor] = []
             self.ready = torch.zeros(kb * kbs, dtype=torch.uint8, device=device)
             # The null block is never written; reading it yields zeros.
             self.ready[: s.kernel_blocks_per_block * kbs] = 1
@@ -399,15 +403,20 @@ class HostHistoryStore:
             self.staging_slots = torch.arange(
                 s.max_write_rows, dtype=torch.int64, device=device
             )
-        except (RuntimeError, MemoryError) as error:
-            raise HostKVResourceError(
-                "Host history GPU metadata or UVA allocation failed"
-            ) from error
-        self.layers = [
-            HostHistoryLayer(self, index, name)
-            for index, name in enumerate(layer_names)
-        ]
-        self.layer_index = {name: index for index, name in enumerate(layer_names)}
+            self.layers = [
+                HostHistoryLayer(self, index, name)
+                for index, name in enumerate(layer_names)
+            ]
+            self.layer_index = {name: index for index, name in enumerate(layer_names)}
+        except BaseException as error:
+            # Drop constructor aliases before releasing the mmap buffer export.
+            flat = raw = None
+            self.close()
+            if isinstance(error, (RuntimeError, MemoryError)):
+                raise HostKVResourceError(
+                    "Host history registration, metadata or UVA allocation failed"
+                ) from error
+            raise
 
     def fixed_device_memory_bytes(self) -> dict[str, int]:
         """Actual fixed tensor bytes, excluding host pages and history metadata."""
@@ -487,12 +496,15 @@ class HostHistoryStore:
 
     def close(self) -> None:
         """Called only after all workers' drain acknowledgements were collected."""
+        self.layers.clear()
+        self.layer_index.clear()
+        self.index_payloads.clear()
+        self._seal_sources.clear()
+        self.host = self.host_device = None
+        if self._registration_finalizer is not None:
+            self._registration_finalizer()
+            self._registration_finalizer = None
         if self.region is not None:
-            self.layers.clear()
-            self.layer_index.clear()
-            self.index_payloads.clear()
-            self._seal_sources.clear()
-            self.host = self.host_device = None
             self.region.cleanup()
             self.region = None
 
@@ -558,8 +570,7 @@ class HostHistoryStore:
         )  # fmt: skip
 
     def mark_ready(self, block_ids: list[int] | torch.Tensor) -> None:
-        """Publish whole pages filled outside the forward pass (a RAM/SSD
-        tier restoring main K/V into newly begun IDs, host prefix adapter).
+        """Make bound pages readable after ReceiveTxn restores their indexes.
 
         The host bytes must be complete and ordered before the next forward
         on this stream; the IDs must already have been begun (so no stale

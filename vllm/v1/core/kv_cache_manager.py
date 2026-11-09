@@ -182,7 +182,7 @@ class KVCacheManager:
         # None keeps the coordinator's answer unchanged.
         self.hash_block_size = hash_block_size
         self.hit_contract: KVHitContract | None = None
-        if cross_group_hit_check and enable_caching:
+        if (cross_group_hit_check and enable_caching) or kv_cache_config.host_kv_layers:
             self.hit_contract = KVHitContract(
                 local_hit_rules(self.coordinator.single_type_managers),
                 path="gpu-prefix-cache",
@@ -191,6 +191,10 @@ class KVCacheManager:
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
+        if kv_cache_config.host_kv_layers:
+            from vllm.v1.kv_offload.host.hit import HostKVHitManager
+
+            self.host_kv_hits = HostKVHitManager.for_history(self)
         self.kv_cache_event_metadata = tuple(
             (
                 get_kv_cache_spec_kind(group.kv_cache_spec).value,
@@ -367,6 +371,7 @@ class KVCacheManager:
             )
             if (
                 host_hits is not None
+                and not host_hits.local_only
                 and num_new_computed_tokens
                 and not host_hits.pin_hit(
                     request.request_id, chain_hash, num_new_computed_tokens
@@ -508,6 +513,14 @@ class KVCacheManager:
             num_local_computed_tokens + num_external_computed_tokens,
             self.max_model_len,
         )
+        if self.host_kv_hits is not None and num_external_computed_tokens:
+            extended = self.host_kv_hits.extend_local_blocks(
+                request, new_computed_block_list, total_computed_tokens
+            )
+            if extended is None:
+                self.host_kv_hits.release_lookup(request.request_id)
+                return None
+            new_computed_block_list = extended
 
         ledger = self.admission_ledger
         # Separate block spaces (long-context mode): each pool is checked

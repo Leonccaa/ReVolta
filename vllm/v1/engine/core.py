@@ -15,7 +15,7 @@ from functools import partial
 from inspect import isclass, signature
 from logging import DEBUG
 from multiprocessing.queues import Queue
-from typing import Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import msgspec
 import zmq
@@ -88,6 +88,10 @@ from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
 
+if TYPE_CHECKING:
+    from vllm.v1.core.history_block_pool import HistoryBlockPool
+    from vllm.v1.kv_offload.host.region import HostRegionOwner
+
 HANDSHAKE_TIMEOUT_MINS = 5
 
 _R = TypeVar("_R")  # Return type for collective_rpc
@@ -110,6 +114,8 @@ class EngineCore:
         load_general_plugins()
 
         self.vllm_config = vllm_config
+        self._shutdown_requested_at: float | None = None
+        self._host_region_owner: HostRegionOwner | None = None
         if not vllm_config.parallel_config.data_parallel_rank_local:
             logger.info(
                 "Initializing a V1 LLM engine (v%s) with config: %s",
@@ -163,6 +169,8 @@ class EngineCore:
             host_layout = host_region_layout(kv_cache_config, vllm_config.instance_id)
             host_scheduler = cast(Any, self.scheduler)
             host_scheduler.host_region = host_layout.open(None)
+            # Hand startup name ownership to the scheduler mapping once open.
+            self._host_region_owner = None
             from vllm.v1.kv_offload.host.persist import create_host_page_ssd
 
             host_scheduler.host_kv_ssd = create_host_page_ssd(
@@ -321,7 +329,38 @@ class EngineCore:
         vllm_config.validate_block_size()
 
         # Initialize kv cache and warmup the execution
-        self.model_executor.initialize_from_config(kv_cache_configs)
+        if scheduler_kv_cache_config.host_kv_layers:
+            from vllm.v1.kv_offload.host.region import (
+                HostRegionOwner,
+                host_region_layout,
+            )
+
+            self._host_region_owner = HostRegionOwner(
+                host_region_layout(scheduler_kv_cache_config, vllm_config.instance_id)
+            )
+        try:
+            self.model_executor.initialize_from_config(kv_cache_configs)
+        except BaseException:
+            # The name is already owned even if registration, allocation or
+            # warmup failed before scheduler construction. Never unlink after
+            # merely requesting worker termination: verify their exit first.
+            if self._host_region_owner is not None:
+                try:
+                    self.model_executor.shutdown()
+                    workers = getattr(self.model_executor, "workers", ())
+                    if any(w.proc.is_alive() for w in workers):
+                        logger.error(
+                            "Host KV startup quarantined: workers still alive; "
+                            "retaining %s",
+                            self._host_region_owner.mmap_path,
+                        )
+                    else:
+                        self._host_region_owner.cleanup()
+                except BaseException:
+                    logger.exception(
+                        "Host KV startup rollback failed; retaining backing"
+                    )
+            raise
 
         elapsed = time.time() - start
         compile_time = vllm_config.compilation_config.compilation_time
@@ -791,86 +830,135 @@ class EngineCore:
             # More efficient to abort all as a single batch.
             self.abort_requests(request_ids)
 
-    def _host_kv_shutdown_deadline(self) -> float | None:
-        """Shared monotonic shutdown deadline (t0 + shutdown_timeout - 5 s).
+    def request_shutdown(self) -> None:
+        """Record t0 once, at REQUESTED, including request-drain time."""
+        if getattr(self, "_shutdown_requested_at", None) is None:
+            self._shutdown_requested_at = time.monotonic()
+        if (
+            getattr(self, "shutdown_state", EngineShutdownState.RUNNING)
+            == EngineShutdownState.RUNNING
+        ):
+            self.shutdown_state = EngineShutdownState.REQUESTED
 
-        The engine records t0 when
-        shutdown is
-        requested and owns this deadline for the page ownership drain, the fs drain and
-        the host SSD persistence final flush. Prefer its ``shutdown_deadline``; the
-        fallback
-        below derives the same value and is removed at merge.
+    def shutdown_deadline(self) -> float | None:
+        """Shared absolute monotonic deadline: t0 + shutdown_timeout - 5s.
+
+        None before REQUESTED. page ownership, tiering and host SSD persistence must
+        consume this same
+        deadline; zero/expired budget never authorizes releasing live IO.
         """
-        from vllm.v1.kv_offload.host.persist import shared_shutdown_deadline
+        t0 = getattr(self, "_shutdown_requested_at", None)
+        if t0 is None:
+            return None
+        return t0 + self.vllm_config.shutdown_timeout - 5.0
 
-        deadline = getattr(self, "shutdown_deadline", None)
-        if deadline is not None:
-            return deadline
-        return shared_shutdown_deadline(
-            getattr(self, "shutdown_requested_at", None),
-            self.vllm_config.shutdown_timeout,
+    def _drain_host_kv(
+        self, host_scheduler: Any, host_pool: "HistoryBlockPool", deadline: float
+    ) -> None:
+        from vllm.v1.kv_offload.host.shutdown import remaining, wait_until
+
+        queue = getattr(self, "batch_queue", None)
+        while queue:
+            future, scheduled, execute_future = queue[-1]
+            output = wait_until(future.result, deadline, "batch-output")
+            if output is None:
+                wait_until(execute_future.result, deadline, "batch-execute")
+                raise RuntimeError("Host KV shutdown has a failed batch")
+            self.scheduler.update_from_output(scheduled, output)
+            queue.pop()
+        receipts = wait_until(
+            lambda: self.model_executor.collective_rpc(
+                "drain_host_kv", timeout=remaining(deadline)
+            ),
+            deadline,
+            "rank-drain",
         )
+        ranks = [rank for rank, _, _ in receipts]
+        self._host_kv_received_ranks = ranks
+        expected = set(range(host_pool.host_pages.num_workers))
+        failures = [error for _, _, error in receipts if error is not None]
+        if set(ranks) != expected or len(ranks) != len(expected) or failures:
+            raise RuntimeError(
+                f"Host KV drain failed, retaining resources {receipts!r}"
+            )
+        for _, output, _ in receipts:
+            if output is not None and output.kv_connector_worker_meta is not None:
+                host_scheduler.update_host_kv_output(output)
+                host_scheduler.connector.update_connector_output(output)
+        # SSD IO owners (negative ids) retire in final_flush after worker IO.
+        if host_pool._jobs or any(
+            p.ticket or any(job_id >= 0 for job_id in p.io)
+            for p in host_pool.host_pages.pages
+        ):
+            raise RuntimeError("Host KV drain left owners, retaining resources")
+        if host_pool.host_pages.watermark != host_scheduler.current_step:
+            raise RuntimeError("Host KV drain left a step gap, retaining resources")
+        self._host_kv_drained = True
+
+    def _host_kv_shutdown_deadline(self) -> float | None:
+        """Read the shared deadline owned by the shutdown controller."""
+        return self.shutdown_deadline()
 
     def shutdown(self):
+        if getattr(self, "_host_kv_shutdown_complete", False):
+            return
+        if getattr(self, "_host_kv_quarantined", False):
+            raise RuntimeError("Host KV shutdown quarantined; retaining resources")
         host_scheduler = cast(Any, self.scheduler)
         host_pool = getattr(host_scheduler, "host_history_pool", None)
-        if (
-            host_pool is not None
-            and self.model_executor
-            and not getattr(self, "_host_kv_drained", False)
-        ):
-            # Consume every submitted batch through the normal scheduler
-            # output path before asking workers for their final IO receipts.
-            queue = getattr(self, "batch_queue", None)
-            while queue:
-                future, scheduled, execute_future = queue[-1]
-                output = future.result()
-                if output is None:
-                    execute_future.result()
-                    raise RuntimeError("Host KV shutdown has a failed batch")
-                self.scheduler.update_from_output(scheduled, output)
-                queue.pop()
-            receipts = self.model_executor.collective_rpc("drain_host_kv")
-            ranks = [rank for rank, _, _ in receipts]
-            expected = set(range(host_pool.host_pages.num_workers))
-            failures = [error for _, _, error in receipts if error is not None]
-            if set(ranks) != expected or len(ranks) != len(expected) or failures:
-                raise RuntimeError(
-                    f"Host KV drain failed, retaining resources {receipts!r}"
-                )
-            for _, output, _ in receipts:
-                if output is not None and output.kv_connector_worker_meta is not None:
-                    host_scheduler.update_host_kv_output(output)
-                    host_scheduler.connector.update_connector_output(output)
-            # Host SSD IO owners (negative ids) belong to final_flush below.
-            if host_pool._jobs or any(
-                p.ticket or any(j >= 0 for j in p.io)
-                for p in host_pool.host_pages.pages
+        deadline = None
+        if host_pool is not None:
+            self.request_shutdown()
+            deadline = self.shutdown_deadline()
+            assert deadline is not None
+        try:
+            if (
+                host_pool is not None
+                and self.model_executor
+                and not getattr(self, "_host_kv_drained", False)
             ):
-                raise RuntimeError("Host KV drain left owners, retaining resources")
-            if host_pool.host_pages.watermark != host_scheduler.current_step:
-                raise RuntimeError("Host KV drain left a step gap, retaining resources")
-            self._host_kv_drained = True
-        host_ssd = getattr(self.scheduler, "host_kv_ssd", None)
-        if host_ssd is not None:
-            from vllm.v1.kv_offload.host.persist import plan_final_flush
+                assert deadline is not None
+                self._drain_host_kv(host_scheduler, host_pool, deadline)
+            host_ssd = getattr(host_scheduler, "host_kv_ssd", None)
+            if host_ssd is not None:
+                from vllm.v1.kv_offload.host.persist import plan_final_flush
 
-            t0 = getattr(self, "shutdown_requested_at", None)
-            plan = plan_final_flush(
-                host_ssd.options["shutdown_flush_timeout_s"],
-                self.vllm_config.shutdown_timeout,
-                self._host_kv_shutdown_deadline(),
-                time.monotonic(),
-                t0,
+                host_scheduler.host_kv_flush_plan = plan_final_flush(
+                    host_ssd.options["shutdown_flush_timeout_s"],
+                    self.vllm_config.shutdown_timeout,
+                    self._host_kv_shutdown_deadline(),
+                    time.monotonic(),
+                    getattr(self, "_shutdown_requested_at", None),
+                )
+            self.structured_output_manager.clear_backend()
+            if self.model_executor:
+                if deadline is None:
+                    self.model_executor.shutdown()
+                else:
+                    from vllm.v1.kv_offload.host.shutdown import wait_until
+
+                    wait_until(self.model_executor.shutdown, deadline, "executor-stop")
+            if self.scheduler:
+                if deadline is None:
+                    self.scheduler.shutdown()
+                else:
+                    self.scheduler.shutdown(deadline=deadline)
+        except TimeoutError:
+            if host_pool is None:
+                raise
+            self._host_kv_quarantined = True
+            logger.exception(
+                "Host KV shutdown quarantined (not a successful drain or SIGKILL): "
+                "deadline=%s status=%s pending_seals=%d missing_ranks=%s",
+                deadline,
+                host_pool.host_pages.diagnostics(),
+                sum([len(p) for p in getattr(host_pool, "pending_seals", {}).values()]),
+                sorted(
+                    set(range(host_pool.host_pages.num_workers))
+                    - set(getattr(self, "_host_kv_received_ranks", ()))
+                ),
             )
-            if self.vllm_config.shutdown_timeout <= 0:
-                logger.warning("Host KV SSD final flush skipped: %s", plan.reason)
-            cast(Any, self.scheduler).host_kv_flush_plan = plan
-        self.structured_output_manager.clear_backend()
-        if self.model_executor:
-            self.model_executor.shutdown()
-        if self.scheduler:
-            self.scheduler.shutdown()
+            raise
 
         # Undo the gc.freeze() from __init__ so that the objects allocated
         # during engine startup (model weights, KV caches, etc.) become
@@ -880,6 +968,8 @@ class EngineCore:
         # Tear down distributed state initialized in this EngineCore process
         # before it exits and release cached memory.
         cleanup_dist_env_and_memory()
+        if host_pool is not None:
+            self._host_kv_shutdown_complete = True
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         self.model_executor.profile(is_start, profile_prefix)
@@ -1435,10 +1525,7 @@ class EngineCoreProc(EngineCore):
             signal_callback = SignalCallback(wakeup_engine)
 
             def signal_handler(signum, frame):
-                if engine_core.shutdown_state == EngineShutdownState.RUNNING:
-                    # t0 of the --shutdown-timeout window (host KV SSD flush).
-                    engine_core.shutdown_requested_at = time.monotonic()
-                engine_core.shutdown_state = EngineShutdownState.REQUESTED
+                engine_core.request_shutdown()
                 signal_callback.trigger()
                 if signum == signal.SIGTERM:
                     get_watch_dog().handle_failure("SIGTERM")
@@ -1573,8 +1660,7 @@ class EngineCoreProc(EngineCore):
             return True
 
         if self.shutdown_state == EngineShutdownState.REQUESTED:
-            if getattr(self, "shutdown_requested_at", None) is None:
-                self.shutdown_requested_at = time.monotonic()
+            self.request_shutdown()
             shutdown_timeout = self.vllm_config.shutdown_timeout
 
             logger.info("Shutdown initiated (timeout=%d)", shutdown_timeout)
@@ -1597,6 +1683,15 @@ class EngineCoreProc(EngineCore):
                     )
 
             self.shutdown_state = EngineShutdownState.SHUTTING_DOWN
+
+        deadline = self.shutdown_deadline()
+        if (
+            getattr(self.scheduler, "host_history_pool", None) is not None
+            and deadline is not None
+            and time.monotonic() >= deadline
+        ):
+            logger.error("Host KV request-drain budget exhausted; entering shutdown")
+            return False
 
         # Exit when no work remaining
         if not self.has_work():

@@ -50,6 +50,8 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
     failed_jobs: dict[int, int] = field(default_factory=dict)
     seal_results: dict[SealTicket, tuple[int, int, int]] = field(default_factory=dict)
     completed_steps: dict[int, int] = field(default_factory=dict)
+    # ReceiveTxn attempts use rank masks across steps and duplicate outputs.
+    receive_results: dict[int, tuple[int, int]] = field(default_factory=dict)
 
     def mark_completed(self, job_id: int) -> None:
         """Record a transfer job completion from this worker."""
@@ -78,9 +80,14 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
         steps = dict(self.completed_steps)
         for step, ranks in other.completed_steps.items():
             steps[step] = steps.get(step, 0) | ranks
+        receives = dict(self.receive_results)
+        for attempt, (completed, failed_ranks) in other.receive_results.items():
+            prior = receives.get(attempt, (0, 0))
+            receives[attempt] = (prior[0] | completed, prior[1] | failed_ranks)
         return OffloadingWorkerMetadata(
             completed_jobs=merged,
             failed_jobs=failed,
             seal_results=seals,
             completed_steps=steps,
+            receive_results=receives,
         )

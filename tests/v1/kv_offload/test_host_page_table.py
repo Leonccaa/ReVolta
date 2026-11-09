@@ -175,6 +175,34 @@ def test_cancelled_loading_waits_for_io_and_step():
     assert table.reserve(loading_key=key(2)) is not None
 
 
+def test_live_loading_cannot_be_recycled_before_owner_is_installed():
+    table = HostPageTable(2)
+    handle = table.reserve(loading_key=key(1))
+    assert not table.reclaimable(table.get(handle))
+    assert table.reserve() is None
+    table.start_io(handle, 9)
+    table.reset()
+    assert table.reserve() is None
+    table.finish_io(handle, 9)
+    replacement = table.reserve()
+    assert replacement.page_id == handle.page_id
+    assert replacement.epoch == handle.epoch + 1
+
+
+def test_seal_only_retry_does_not_inherit_previous_ticket_masks():
+    table = HostPageTable(2, 2)
+    handle = private(table)
+    old = table.open_seal(handle, 1, 1, key(1), 1)
+    assert table.seal_result(old, 3, 2)
+    retry = table.open_seal(handle, 1, 1, key(1), 2)
+    assert not table.seal_result(old, 3, 0)
+    assert not table.seal_result(retry, 1, 0)
+    assert table.lookup(key(1)) is None
+    assert table.get(handle).failed_ranks == 0
+    assert table.seal_result(retry, 2, 0)
+    assert table.is_ready(handle)
+
+
 def test_zero_page_is_permanent_and_bad_receipts_are_rejected():
     table = HostPageTable(1)
     assert table.available() == 0 and table.reserve() is None

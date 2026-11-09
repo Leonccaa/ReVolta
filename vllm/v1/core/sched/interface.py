@@ -236,8 +236,8 @@ class SchedulerInterface(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def shutdown(self) -> None:
-        """Shutdown the scheduler."""
+    def shutdown(self, deadline: float | None = None) -> None:
+        """Shutdown using the engine's shared absolute monotonic deadline."""
         raise NotImplementedError
 
     def get_kv_connector(self) -> "KVConnectorBase_V1 | None":

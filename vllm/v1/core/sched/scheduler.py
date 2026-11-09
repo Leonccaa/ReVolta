@@ -352,6 +352,16 @@ class Scheduler(SchedulerInterface):
         # host_kv.ssd is enabled; flush plan set by EngineCore.shutdown.
         self.host_kv_ssd: Any = None
         self.host_kv_flush_plan: Any = None
+        if self.host_history_pool is not None and self.connector is not None:
+            from vllm.distributed.kv_transfer.kv_connector.v1 import (
+                offloading_connector,
+            )
+
+            assert isinstance(self.connector, offloading_connector.OffloadingConnector)
+            hits = self.kv_cache_manager.host_kv_hits
+            if hits is not None:
+                assert self.connector.connector_scheduler is not None
+                hits.attach_connector(self.connector.connector_scheduler)
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
         )
@@ -1587,6 +1597,7 @@ class Scheduler(SchedulerInterface):
             )
             from vllm.v1.kv_offload.base import GPULoadStoreSpec
             from vllm.v1.kv_offload.host.page_table import HostKVStep
+            from vllm.v1.kv_offload.host.receive import HostReceiveSpec
 
             tickets = host_pool.finish_schedule(num_scheduled_tokens)
             scheduler_output.host_kv = HostKVStep(
@@ -1597,6 +1608,9 @@ class Scheduler(SchedulerInterface):
             if isinstance(metadata, OffloadingConnectorMetadata):
                 for job_id, job in (metadata.load_jobs | metadata.store_jobs).items():
                     source, target = job.transfer_spec
+                    if isinstance(source, HostReceiveSpec):
+                        # ReceiveTxn owns physical handles and rank retirement.
+                        continue
                     gpu = source if isinstance(source, GPULoadStoreSpec) else target
                     assert isinstance(gpu, GPULoadStoreSpec)
                     group_id = host_pool.host_group_id
@@ -3087,34 +3101,29 @@ class Scheduler(SchedulerInterface):
         for step, ranks in meta.completed_steps.items():
             pool.host_pages.complete_step(step, ranks)
 
-    def shutdown(self) -> None:
+    def shutdown(self, deadline: float | None = None) -> None:
         ssd = getattr(self, "host_kv_ssd", None)
         plan = getattr(self, "host_kv_flush_plan", None)
+        if deadline is None and plan is not None:
+            deadline = plan.deadline
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
         if self.connector is not None:
-            deadline = None if plan is None else plan.deadline
-            if ssd is not None and deadline is not None:
-                # One shutdown window: the ordinary fs drain and the host KV
-                # final flush share the deadline instead of adding up.
-                manager = getattr(
-                    getattr(self.connector, "connector_scheduler", None),
-                    "manager",
-                    None,
-                )
-                cap = getattr(manager, "set_shutdown_deadline", None)
-                if cap is not None:
-                    cap(deadline)
+            if deadline is not None:
+                self.connector.set_shutdown_deadline(deadline)
             self.connector.shutdown()
         if self.ec_connector is not None:
             self.ec_connector.shutdown()
         if ssd is not None:
-            from vllm.v1.kv_offload.host.persist import run_final_flush
+            from vllm.v1.kv_offload.host.persist import FlushPlan, run_final_flush
 
+            if plan is None and deadline is not None:
+                plan = FlushPlan(
+                    ssd.options["shutdown_flush_timeout_s"], deadline, None, "ok"
+                )
             # Design 3.5 step 4 (after executor shutdown), then step 5.
             run_final_flush(ssd, plan, ssd.clock())
-            ssd.close()
-            self.host_kv_ssd = None
+            ssd.close(deadline=deadline)
         if self.host_region is not None:
             pages = getattr(self.host_history_pool, "host_pages", None)
             if (ssd is not None and ssd.quarantined) or (
@@ -3129,9 +3138,11 @@ class Scheduler(SchedulerInterface):
                     "Host KV region %s kept after SSD IO quarantine",
                     getattr(self.host_region, "mmap_path", "?"),
                 )
+                raise TimeoutError("Host KV SSD shutdown quarantined; retaining region")
             else:
                 self.host_region.cleanup()
             self.host_region = None
+        self.host_kv_ssd = None
 
     ########################################################################
     # KV Connector Related Methods

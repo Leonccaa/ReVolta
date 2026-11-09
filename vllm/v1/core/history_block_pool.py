@@ -12,6 +12,7 @@ from vllm.v1.kv_offload.base import make_offload_key
 from vllm.v1.kv_offload.host.page_table import (
     HostPageTable,
     PageHandle,
+    PageState,
     Result,
     SealTicket,
 )
@@ -27,6 +28,7 @@ class HistoryBlockPool(BlockPool):
         self.last_use: dict[tuple[int, int], int] = {}
         self.binding_updates: dict[int, int] = {}
         self.new_hashes: dict[str, list[tuple[int, int, bytes]]] = {}
+        self.pending_seals: dict[str, dict[tuple[int, int, PageHandle], bytes]] = {}
         self.last_scheduled: dict[str, int] = {}
         self.step = 0
         self._jobs: dict[int, tuple[list[PageHandle], int]] = {}
@@ -67,6 +69,10 @@ class HistoryBlockPool(BlockPool):
         handle = self.bindings.pop(hid, None)
         if handle is not None:
             hgen = self.hgen[hid]
+            for request_id, pending in list(self.pending_seals.items()):
+                pending.pop((hid, hgen, handle), None)
+                if not pending:
+                    del self.pending_seals[request_id]
             self.host_pages.unbind(handle, hid, hgen, self.last_use.pop((hid, hgen), 0))
             self.binding_updates[hid] = -1
 
@@ -109,21 +115,49 @@ class HistoryBlockPool(BlockPool):
         )
         if kv_cache_group_id == self.host_group_id:
             entries = self.new_hashes.setdefault(request.request_id, [])
-            for block in blocks[num_cached_blocks:num_full_blocks]:
-                if not block.is_null and block.block_hash is not None:
+            for index in range(num_cached_blocks, num_full_blocks):
+                block = blocks[index]
+                if (
+                    not block.is_null
+                    and block.block_hash is not None
+                    and self.host_pages.get(self.bindings[block.block_id]).state
+                    == PageState.PRIVATE
+                ):
                     entries.append(
                         (
                             block.block_id,
                             self.hgen[block.block_id],
-                            get_block_hash(block.block_hash),
+                            request.block_hashes[
+                                (index + 1) * (block_size // self.hash_block_size) - 1
+                            ],
                         )
                     )
+            # A receive may cache these blocks before admission. Preserve
+            # their physical identities across steps until an actual producer
+            # executes. Include pending local hits shared by another request.
+            pending = self.pending_seals.setdefault(request.request_id, {})
+            for index, block in enumerate(blocks[:num_full_blocks]):
+                hid = block.block_id
+                handle = self.bindings.get(hid)
+                if handle is not None and block.block_hash is not None:
+                    page = self.host_pages.get(handle)
+                    if (
+                        page.valid
+                        and page.state == PageState.PRIVATE
+                        and not page.ticket
+                    ):
+                        # Host keys use the terminal request-chain hash, while
+                        # the GPU group hash concatenates all base-block hashes.
+                        pending[hid, self.hgen[hid], handle] = request.block_hashes[
+                            (index + 1) * (block_size // self.hash_block_size) - 1
+                        ]
 
     def start_step(self, step: int) -> None:
         self.step = step
         self.new_hashes.clear()
 
     def cancel_scheduled(self, request_id: str) -> None:
+        self.pending_seals.pop(request_id, None)
         for hid, hgen, _ in self.new_hashes.pop(request_id, []):
             if self.hgen[hid] == hgen:
                 self.evict_blocks({hid})
@@ -136,10 +170,19 @@ class HistoryBlockPool(BlockPool):
         tickets = []
         for request_id in executed:
             self.last_scheduled[request_id] = self.step
-            for hid, hgen, block_hash in self.new_hashes.get(request_id, []):
-                if self.hgen[hid] != hgen:
+            for (hid, hgen, handle), block_hash in self.pending_seals.pop(
+                request_id, {}
+            ).items():
+                if self.hgen[hid] != hgen or self.bindings.get(hid) != handle:
                     continue
-                handle = self.bindings[hid]
+                page = self.host_pages.get(handle)
+                if not page.valid or page.state != PageState.PRIVATE or page.ticket:
+                    continue
+                block = self.blocks[hid]
+                if block.block_hash is None or not get_block_hash(
+                    block.block_hash
+                ).endswith(block_hash):
+                    continue
                 tickets.append(
                     self.host_pages.open_seal(
                         handle,
@@ -152,6 +195,7 @@ class HistoryBlockPool(BlockPool):
         return tickets
 
     def release_request(self, request_id: str, blocks: Iterable[KVCacheBlock]) -> None:
+        self.pending_seals.pop(request_id, None)
         last_use = self.last_scheduled.pop(request_id, 0)
         for block in blocks:
             hid = block.block_id
@@ -185,6 +229,7 @@ class HistoryBlockPool(BlockPool):
         self.bindings.clear()
         self.last_use.clear()
         self.new_hashes.clear()
+        self.pending_seals.clear()
         return super().reset_prefix_cache()
 
     def track_job(self, job_id: int, hids: list[int]) -> None:

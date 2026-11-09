@@ -74,6 +74,10 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA, SupportsVmmSafeTransf
         elif role == KVConnectorRole.WORKER:
             self.connector_worker = OffloadingConnectorWorker(spec)
 
+    def set_shutdown_deadline(self, deadline: float) -> None:
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.manager.set_shutdown_deadline(deadline)
+
     def shutdown(self) -> None:
         if self.connector_worker is not None:
             self.connector_worker.shutdown()

@@ -31,6 +31,7 @@ from vllm.v1.kv_offload.base import (
     GPULoadStoreSpec,
     OffloadingSpec,
 )
+from vllm.v1.kv_offload.host.receive import HostReceiveSpec
 from vllm.v1.kv_offload.worker.worker import (
     OffloadingWorker,
     TransferSpec,
@@ -59,6 +60,8 @@ class OffloadingConnectorWorker:
         self._host_history: HostHistoryStore | None = None
         self._host_group_id: int | None = None
         self._host_load_blocks: dict[int, list[int]] = {}
+        self._host_index_views: list[torch.Tensor] = []
+        self._receive_attempts: dict[int, int] = {}
         # Report failed transfers to the scheduler (which recomputes a failed
         # load and drops a failed store) instead of asserting.
         from vllm.v1.core.kv_cache_hit_contract import (
@@ -69,6 +72,12 @@ class OffloadingConnectorWorker:
 
     def _register_handlers(self, kv_caches: CanonicalKVCaches):
         for src_cls, dst_cls, handler in self.spec.get_handlers(kv_caches):
+            if self._host_history is not None and dst_cls is GPULoadStoreSpec:
+                from vllm.v1.kv_offload.host.worker import HostReceiveHandler
+
+                handler = HostReceiveHandler(
+                    handler, self._host_history, self._host_index_views
+                )
             self.worker.register_handler(src_cls, dst_cls, handler)
 
     def register_kv_caches(
@@ -97,6 +106,7 @@ class OffloadingConnectorWorker:
 
         packed = packed_kv_members(self.spec.kv_cache_config)
         host_names = set(getattr(self.spec.kv_cache_config, "host_kv_layers", ()))
+        transfer_names = self.spec.kv_cache_config.connector_transfer_layers()
 
         # layer_name -> (num_blocks, page_size_bytes) tensor
         tensors_per_block: dict[str, tuple[torch.Tensor, ...]] = {}
@@ -112,7 +122,7 @@ class OffloadingConnectorWorker:
             else:
                 per_layer_specs = {}
             for layer_name in group_layer_names:
-                if layer_name in host_names:
+                if layer_name not in transfer_names:
                     continue
                 layer_kv_cache_spec = per_layer_specs.get(
                     layer_name, group_kv_cache_spec
@@ -148,13 +158,9 @@ class OffloadingConnectorWorker:
                         padded=layer_kv_cache_spec.page_size_padded is not None,
                     )
                     if layer_name in physical_strides:
-                        # Transitional static host allocation bridge preserves the whole
-                        # physical
-                        # index page. receive transactions seal/restore uses logical
-                        # pack/scatter
-                        # and removes G0 from these canonical transfer views.
+                        # Remaining canonical members keep their physical
+                        # transfer ABI. G0 is excluded from this registration.
                         unpadded_page_size_bytes[layer_name] = page
-
                 elif isinstance(layer_kv_cache_spec, MambaSpec):
                     state_tensors = kv_caches[layer_name]
                     assert isinstance(state_tensors, list)
@@ -256,21 +262,17 @@ class OffloadingConnectorWorker:
                 raise ValueError("Host main K/V must belong to one transfer group")
             (self._host_group_id,) = group_ids
             self._host_history = store
-            page_bytes = self.spec.kv_cache_config.host_kv_page_size_bytes
-            if store.shape.page_bytes != page_bytes:
-                raise ValueError("Host main K/V transfer page differs from the plan")
-            index = len(block_tensors)
-            main_view = store.host.view(torch.int8).flatten(1)
-            main_view._host_page_of = store.page_of_cpu
-            block_tensors.append(
-                CanonicalKVCacheTensor(
-                    tensor=main_view,
-                    page_size_bytes=page_bytes,
-                )
-            )
-            group_data_refs[self._host_group_id].append(
-                CanonicalKVCacheRef(index, page_bytes)
-            )
+            self._host_index_views = [
+                kv_caches[name]
+                for name in self.spec.kv_cache_config.kv_cache_groups[
+                    self._host_group_id
+                ].layer_names
+                if name not in host_names
+            ]
+            if any(
+                not isinstance(view, torch.Tensor) for view in self._host_index_views
+            ):
+                raise ValueError("Host index members require tensor views")
 
         canonical_kv_caches = CanonicalKVCaches(
             tensors=block_tensors,
@@ -347,14 +349,10 @@ class OffloadingConnectorWorker:
 
         for job_id, entry in metadata.load_jobs.items():
             self._load_jobs[job_id] = entry.req_id
-            if getattr(self, "_host_history", None) is not None:
-                target = entry.transfer_spec[1]
-                assert isinstance(target, GPULoadStoreSpec)
-                group_id = self._host_group_id
-                assert group_id is not None
-                start = sum(target.group_sizes[:group_id])
-                end = start + target.group_sizes[group_id]
-                self._host_load_blocks[job_id] = target.block_ids[start:end].tolist()
+            source = entry.transfer_spec[0]
+            if isinstance(source, HostReceiveSpec):
+                self._receive_attempts[job_id] = source.txn.attempt_id
+                self._host_load_blocks[job_id] = [e.hid for e in source.txn.new_loads]
             self._submit_transfer(job_id, entry.transfer_spec)
 
     def _submit_transfer(self, job_id: int, transfer_spec: TransferSpec) -> None:
@@ -425,10 +423,16 @@ class OffloadingConnectorWorker:
             if host_history is not None:
                 blocks = self._host_load_blocks.pop(job_id, [])
                 if transfer_result.success:
-                    # All group copies on this worker retired. Publish the
-                    # host bytes before reporting receive completion. The
-                    # scheduler still waits for every rank before execution.
-                    host_history.mark_ready(blocks)
+                    # All group copies on this worker retired. Only NEW_LOAD
+                    # IDs become ready. REUSE_LOCAL keeps its original state.
+                    # The scheduler still waits for every rank and the step.
+                    try:
+                        host_history.mark_ready(blocks)
+                    except Exception:
+                        if not self._report_failures:
+                            raise
+                        transfer_result.success = False
+                        self._connector_worker_meta.mark_failed(job_id)
             if (
                 transfer_result.transfer_time
                 and transfer_result.transfer_size is not None
@@ -441,6 +445,7 @@ class OffloadingConnectorWorker:
                 )
 
             self._connector_worker_meta.mark_completed(job_id)
+            self._receive_receipt(job_id, transfer_result.success)
             req_id = self._load_jobs.pop(job_id, None)
             if req_id is not None:
                 finished_recving.add(req_id)
@@ -450,12 +455,25 @@ class OffloadingConnectorWorker:
                 self._host_load_blocks.pop(job_id, None)
             self._connector_worker_meta.mark_failed(job_id)
             self._connector_worker_meta.mark_completed(job_id)
+            self._receive_receipt(job_id, False)
             req_id = self._load_jobs.pop(job_id, None)
             if req_id is not None:
                 finished_recving.add(req_id)
         failed_submissions.clear()
 
         return set(), finished_recving
+
+    def _receive_receipt(self, job_id: int, success: bool) -> None:
+        attempt = getattr(self, "_receive_attempts", {}).pop(job_id, None)
+        if attempt is None:
+            return
+        from vllm.distributed import get_world_group
+
+        rank = 1 << get_world_group().rank_in_group
+        self._connector_worker_meta.receive_results[attempt] = (
+            rank,
+            0 if success else rank,
+        )
 
     def build_connector_worker_meta(self) -> OffloadingWorkerMetadata | None:
         """Return completed transfer job IDs since the last call."""
@@ -494,5 +512,7 @@ class OffloadingConnectorWorker:
         self._failed_submissions.clear()
         self._pending_failed_submissions.clear()
         getattr(self, "_host_load_blocks", {}).clear()
+        getattr(self, "_receive_attempts", {}).clear()
+        getattr(self, "_host_index_views", []).clear()
         self._host_history = None
         self._connector_worker_meta = OffloadingWorkerMetadata()

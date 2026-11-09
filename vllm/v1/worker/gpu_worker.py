@@ -1541,8 +1541,12 @@ class Worker(WorkerBase):
     def drain_host_kv(self):
         """Control RPC. All ranks acknowledge before any executor teardown."""
         try:
-            output = cast(Any, self.model_runner).kv_connector.drain_host_kv()
-            torch.accelerator.synchronize()
+            # In-process executors may run this bounded control wait on a
+            # daemon thread; CUDA's current device is thread-local.
+            assert self.device is not None
+            with torch.accelerator.device_index(self.device.index):
+                output = cast(Any, self.model_runner).kv_connector.drain_host_kv()
+                torch.accelerator.synchronize()
             return self.rank, output, None
         except Exception as error:
             return self.rank, None, repr(error)

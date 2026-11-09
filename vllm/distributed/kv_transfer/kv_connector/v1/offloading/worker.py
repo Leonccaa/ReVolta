@@ -50,6 +50,7 @@ class OffloadingConnectorWorker:
         self._unsubmitted_store_jobs: list[tuple[int, TransferSpec]] = []
         self._connector_worker_meta = OffloadingWorkerMetadata()
         self._failed_submissions: set[int] = set()
+        self._pending_failed_submissions: set[int] = set()
         # Report failed transfers to the scheduler (which recomputes a failed
         # load and drops a failed store) instead of asserting.
         from vllm.v1.core.kv_cache_hit_contract import (
@@ -276,7 +277,13 @@ class OffloadingConnectorWorker:
         self._unsubmitted_store_jobs.clear()
 
         if kv_connector_metadata.jobs_to_flush:
-            self.worker.wait(kv_connector_metadata.jobs_to_flush)
+            # Failed loads retain their destination allocation until receive
+            # completion. A cancelled request's terminal flush can defer these
+            # drains to get_finished without exposing those blocks to compute.
+            pending_loads = self._pending_failed_submissions.intersection(
+                self._load_jobs
+            )
+            self.worker.wait(kv_connector_metadata.jobs_to_flush - pending_loads)
 
     def start_kv_transfers(self, metadata: OffloadingConnectorMetadata):
         for job_id, transfer_spec in self._unsubmitted_store_jobs:
@@ -300,7 +307,16 @@ class OffloadingConnectorWorker:
             assert success
         # Drain any submitted part before the scheduler can reuse destinations
         # or release source pins. wait must also accept an unsubmitted job ID.
-        self.worker.wait({job_id})
+        try:
+            self.worker.wait({job_id})
+        except Exception:
+            # The handler still owns the fence. Retry it from get_finished,
+            # retaining the scheduler's source pins and destination blocks.
+            self._pending_failed_submissions.add(job_id)
+            logger.warning(
+                "KV transfer job %d is still awaiting drain", job_id, exc_info=True
+            )
+            return
         self._failed_submissions.add(job_id)
 
     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
@@ -321,10 +337,18 @@ class OffloadingConnectorWorker:
             blocked on remote KV (and free aborted-during-load reqs).
         """
         finished_recving: set[str] = set()
+        pending: set[int] = getattr(self, "_pending_failed_submissions", set())
+        for job_id in list(pending):
+            try:
+                self.worker.wait({job_id})
+            except Exception:
+                continue
+            pending.remove(job_id)
+            self._failed_submissions.add(job_id)
         failed_submissions: set[int] = getattr(self, "_failed_submissions", set())
         for transfer_result in self.worker.get_finished():
             job_id = transfer_result.job_id
-            if job_id in failed_submissions:
+            if job_id in failed_submissions or job_id in pending:
                 # Report this drained, partially submitted job once below.
                 continue
             # getattr: tests may build this object without __init__.
@@ -384,4 +408,6 @@ class OffloadingConnectorWorker:
         self.worker.shutdown()
         self._unsubmitted_store_jobs.clear()
         self._load_jobs.clear()
+        self._failed_submissions.clear()
+        self._pending_failed_submissions.clear()
         self._connector_worker_meta = OffloadingWorkerMetadata()

@@ -161,6 +161,7 @@ def build_host_history_store(
         read_rows=read_rows,
         max_context_tokens=plan.geometry.max_model_len,
         decode_rows=plan.geometry.decode_rows_per_request,
+        staged_writethrough=getattr(long_context, "staged_writethrough", True),
         prefill_gather=getattr(long_context, "prefill_gather", "passes"),
         prefill_insert_age=getattr(long_context, "prefill_insert_age", "old"),
     )

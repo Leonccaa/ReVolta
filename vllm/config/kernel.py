@@ -452,6 +452,10 @@ class LongContextKVConfig:
     hot-page pool. ``gpu``: in the GPU history segment next to the
     compressed index (the same-plan reference arm); the host and hot pools
     then only budget admission."""
+    staged_writethrough: bool = True
+    """Stage eager prefill writes on device and submit merged same-stream D2H
+    copies. Decode/capture uses word-vectorized UVA. False retains the legacy
+    writer. Byte-preserving and excluded from compile and SSD identities."""
     prefill_gather: Literal["passes", "union"] = "passes"
     """Mixed steps with ``main_kv_placement="host"``. ``passes``: remap the
     selection in query-row passes that fit the hot slots (R_cap rows each).
@@ -761,6 +765,7 @@ class KernelConfig:
                         "latest_only",
                         "superseded_keep_ssd",
                         "enable_junction_evidence",
+                        "staged_writethrough",
                     )
                     and not (
                         item[0] == "host_store_gib"

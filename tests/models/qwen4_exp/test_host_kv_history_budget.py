@@ -106,6 +106,7 @@ def _geometry(model, dcp, max_write_rows):
                 dcp_world_size=dcp,
                 main_kv_bytes_per_block=geo.main_kv_bytes_per_block * 2 // dcp,
                 hot_max_write_rows=max_write_rows,
+                hot_staged_writethrough=True,
             ),
             torch.uint8,
             1,
@@ -131,6 +132,7 @@ def _geometry(model, dcp, max_write_rows):
             dcp_world_size=dcp,
             hot_layers=1,
             hot_max_write_rows=max_write_rows,
+            hot_staged_writethrough=True,
             hot_query_heads=24 // dcp,
             hot_head_dim=256,
             hot_kv_heads=2 // dcp,
@@ -182,6 +184,7 @@ def test_real_store_fits_the_total_budget(
         max_requests=seqs,
         selection_width=2051,
         max_write_rows=write_rows,
+        staged_writethrough=plan.geometry.hot_staged_writethrough,
         dcp_world_size=dcp,
         dcp_rank=dcp - 1,
     )
@@ -232,6 +235,7 @@ def test_store_budget_handles_split_kernel_blocks(sparse_zero_payloads):
         max_requests=4,
         selection_width=2051,
         max_write_rows=2048,
+        staged_writethrough=geo.hot_staged_writethrough,
         dcp_world_size=2,
     )
     store = HostHistoryStore(shape, ["l0"], device="cpu")
@@ -319,6 +323,7 @@ def test_auto_real_store_uses_all_remaining_bytes(
         geo, dtype, heads = _geometry("standin", 1, 2048)
         budget = 3 * GiB
         plan = plan_long_context_capacity(settings, geo, budget, 4)
+        geo = plan.geometry
         store = HostHistoryStore(
             HostHistoryShape(
                 num_blocks=plan.gpu_history_blocks + 1,
@@ -332,6 +337,7 @@ def test_auto_real_store_uses_all_remaining_bytes(
                 max_requests=4,
                 selection_width=2051,
                 max_write_rows=2048,
+                staged_writethrough=geo.hot_staged_writethrough,
             ),
             ["l0"],
             device="cpu",

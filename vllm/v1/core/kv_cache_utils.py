@@ -3402,6 +3402,7 @@ def get_long_context_geometry(
         geometry = replace(
             geometry,
             index_bytes_per_block=sum(strides),
+            hot_staged_writethrough=settings.staged_writethrough,
             logical_index_bytes_per_block=sum(layout.compressed_page_sizes),
             index_page_strides=tuple(strides),
         )

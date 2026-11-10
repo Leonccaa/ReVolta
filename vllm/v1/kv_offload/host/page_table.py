@@ -361,6 +361,16 @@ class HostPageTable:
         )
         self._free.append(handle.page_id)
 
+    def discard_cached(self, handle: PageHandle) -> bool:
+        """Release a retired immutable cache frame without writeback."""
+        page = self.pages[handle.page_id]
+        if page.handle != handle or page.state != PageState.READY:
+            return False
+        if not self.reclaimable(page):
+            return False
+        self._recycle(page)
+        return True
+
     def collect(self) -> None:
         work = 0
         for heap in (self._retiring, self._pending):

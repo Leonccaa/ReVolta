@@ -69,3 +69,15 @@ def test_disabled_configuration_is_inert():
     LongContextKVConfig(
         enabled=False, host_store_gib=98, host_pool_gib=90
     ).validate_settings()
+
+
+def test_retention_defaults_and_compile_identity():
+    from vllm.config import KernelConfig
+
+    settings = LongContextKVConfig(enabled=True, host_store_gib=4)
+    assert settings.latest_only and not settings.superseded_keep_ssd
+    config = KernelConfig(long_context_kv=settings)
+    original = config.compute_hash()
+    settings.latest_only = False
+    settings.superseded_keep_ssd = True
+    assert config.compute_hash() == original

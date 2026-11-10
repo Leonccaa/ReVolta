@@ -64,6 +64,18 @@ class UnifiedStoreManager(OffloadingManager):
         self.rejected_step: set[OffloadKey] = set()
         self._receipts: dict[int, tuple[int, int]] = {}
         self.ssd: Any = None
+        self.retention: Any = None
+        settings = getattr(
+            getattr(getattr(spec, "vllm_config", None), "kernel_config", None),
+            "long_context_kv",
+            None,
+        )
+        self.latest_only = bool(
+            settings is not None and settings.enabled and settings.latest_only
+        )
+        self.superseded_keep_ssd = bool(
+            self.latest_only and settings is not None and settings.superseded_keep_ssd
+        )
         self.kind_by_group: dict[int, PageKind] = {}
         from vllm.v1.kv_cache_interface import MambaSpec, UniformTypeKVCacheSpecs
 
@@ -152,6 +164,11 @@ class UnifiedStoreManager(OffloadingManager):
         self.ledger = HostReservationLedger(self.table, reclaim)
         self.ledger.build_frames_per_request = self.build_frames_per_request
         self.attached = True
+        if self.latest_only:
+            from vllm.v1.kv_offload.unified.retention import LatestCheckpoints
+
+            self.retention = LatestCheckpoints(self, self.superseded_keep_ssd)
+            self.units.on_event = self.retention.event
         for handle in tuple(self.table.index.values()):
             page = self.table.get(handle)
             if page.state == PageState.READY:
@@ -169,6 +186,12 @@ class UnifiedStoreManager(OffloadingManager):
             from vllm.v1.kv_offload.unified.ssd import UnitSsdStore
 
             ssd.unit_store = UnitSsdStore(self, ssd)
+            if self.retention is not None:
+                self.retention.reset()
+                for unit in tuple(self.units.units.values()):
+                    self.retention.observe(unit)
+        elif self.superseded_keep_ssd:
+            raise ValueError("superseded_keep_ssd requires an enabled unified SSD")
 
     def admit_build(self, req_id: str, frames: int) -> bool:
         return self.ledger.admit(req_id, frames)
@@ -333,6 +356,8 @@ class UnifiedStoreManager(OffloadingManager):
                     self.pending.pop(key, None)
                     self.table.invalidate(build.handles[key])
                     self._component_retired(key, False, "source_not_dispatched")
+        if self.retention is not None:
+            self.retention.step()
 
     def _unindex_waiter(self, req_id: str) -> None:
         for key in self._wait_keys.pop(req_id, ()):
@@ -514,6 +539,8 @@ class UnifiedStoreManager(OffloadingManager):
         return handle is not None and self.table.is_ready(handle)
 
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> bool | None:
+        if self.retention is not None and self.retention.blocked_key(key):
+            return False
         if (
             self.ssd is not None
             and self.ssd.unit_store is not None
@@ -541,6 +568,10 @@ class UnifiedStoreManager(OffloadingManager):
 
     def hold_lookup(self, req_id: str, keys: Iterable[OffloadKey]) -> bool:
         ordered = tuple(dict.fromkeys(keys))
+        if self.retention is not None and any(
+            self.retention.blocked_key(k) for k in ordered
+        ):
+            return False
         handles = tuple(self.table.lookup(k) for k in ordered)
         if any(h is None or not self.table.is_ready(h) for h in handles):
             return False
@@ -742,6 +773,8 @@ class UnifiedStoreManager(OffloadingManager):
     def drop_pending_secondary_writes(
         self, keys: Collection[OffloadKey], req_id: str | None = None
     ) -> None:
+        if self.latest_only:
+            return
         if self.ssd is not None:
             handles = [self.table.lookup(k) for k in keys]
             self.ssd._queue.drop([h for h in handles if h is not None], "superseded")
@@ -884,6 +917,7 @@ class UnifiedStoreManager(OffloadingManager):
             ),
             "variant_registration_draining_main": len(self._draining_main),
             "value_work_max": self.value.work_max,
+            **(self.retention.snapshot() if self.retention is not None else {}),
             **(self.bytes + self.table.dma_bytes),
             **(
                 self.ssd.unit_store.snapshot()

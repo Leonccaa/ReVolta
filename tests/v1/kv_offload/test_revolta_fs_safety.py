@@ -1306,3 +1306,32 @@ def test_real_speculative_config_runner_identity(tmp_path, method):
     else:
         assert speculative.draft_model_config is target
     assert get_revolta_identity(cfg, str(tmp_path / "kv"), manifest) is not None
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_retention_policy_does_not_change_persistent_identity(tmp_path, enabled):
+    """Checkpoint retention flags pick which units are kept, not page encoding.
+
+    Toggling them (or upgrading to a build that adds them) must keep the
+    persisted namespace, otherwise every committed unit becomes unreachable.
+    """
+    from vllm.config.kernel import KernelConfig
+    from vllm.v1.kv_offload.tiering.fs.identity import _kernel_identity
+
+    model = _checkpoint(tmp_path)
+    manifest = _write_manifest(tmp_path, {"target": str(model)})
+    config = make_spec(model).vllm_config
+    config.kernel_config = KernelConfig()
+    config.kernel_config.long_context_kv.enabled = enabled
+    if enabled:
+        config.kernel_config.long_context_kv.host_store_gib = 8.0
+    digests = set()
+    for latest_only, keep_ssd in ((True, False), (False, False), (True, True)):
+        config.kernel_config.long_context_kv.latest_only = latest_only
+        config.kernel_config.long_context_kv.superseded_keep_ssd = keep_ssd
+        identity = get_revolta_identity(config, str(tmp_path / "kv"), manifest)
+        assert identity is not None
+        digests.add(identity.persistent_digest)
+        text = repr(_kernel_identity(config.kernel_config))
+        assert "latest_only" not in text and "superseded_keep_ssd" not in text
+    assert len(digests) == 1

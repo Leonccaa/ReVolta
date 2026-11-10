@@ -34,6 +34,9 @@ def canonical_digest(value) -> str:
     return hashlib.sha256(data.encode()).hexdigest()
 
 
+_RETENTION_POLICY_FIELDS = ("latest_only", "superseded_keep_ssd")
+
+
 def _kernel_identity(config):
     """Preserve pre-unified host budgeting identities for legacy and disabled
     configurations.
@@ -54,8 +57,14 @@ def _kernel_identity(config):
                     tuple(
                         item
                         for item in node[1]
-                        if item[0] != "host_store_gib"
-                        or (fields.get("enabled", False) and item[1] is not None)
+                        # Checkpoint retention policy decides which units are
+                        # kept, not how any page is encoded, so it must not move
+                        # persisted files to a new namespace.
+                        if item[0] not in _RETENTION_POLICY_FIELDS
+                        and (
+                            item[0] != "host_store_gib"
+                            or (fields.get("enabled", False) and item[1] is not None)
+                        )
                     ),
                 )
             return tuple(legacy(part) for part in node)

@@ -151,6 +151,18 @@ aborts its reservation and contributes zero tokens. The existing complete-prefix
 fixed-point search and final check intersect main KV with index, state and
 draft availability. Successful publication alone never reports a global hit.
 
+The unified host-page store restores a committed unit as one inventory across
+bounded IO batches. A page already loading is shared with its existing reader;
+the unit waits for verification and keeps the frame leased. The per-request and
+global prefetch quotas limit concurrent reads, rather than the inventory size.
+For a unit, `prefetch_timeout_s` budgets each IO window: its waiter deadline is
+the number of required windows times that setting. A legacy single-page round
+adopted by a unit uses the unit's deadline. Repeated lookup does not renew it.
+Selection misses, unavailable resident pages and reservation failures have
+separate prefetch counters. A MAIN-only selection still requires a matching
+committed endpoint; a conversation edited before that endpoint cannot reuse
+the unit's recurrent state.
+
 Each path pins every required main-KV row from token zero through the final
 common hit before returning it. If any pin fails, acquired rows are released
 and that path reports a miss. External extensions acquire their new prefix

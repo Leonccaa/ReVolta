@@ -874,6 +874,10 @@ class HostPageSsd:
     def _expire_prefetch(self, now: float) -> None:
         timeout = self.options["prefetch_timeout_s"]
         for req_id, round_ in list(self._rounds.items()):
+            if self.unit_store is not None and self.unit_store.requests.get(req_id):
+                # A full-inventory transaction may have adopted these reads.
+                # Its window-counted waiter deadline owns the lookup episode.
+                continue
             if now - round_.started >= timeout:
                 if round_.loading or round_.holds:
                     self.stats_counter["prefetch_timeouts"] += 1

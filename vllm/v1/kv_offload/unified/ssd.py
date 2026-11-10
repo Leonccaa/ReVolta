@@ -92,6 +92,7 @@ class PrefetchTxn:
     complete: bool = False
     sources: frozenset[OffloadKey] = frozenset()
     waiter_deadlines: dict[str, float] = field(default_factory=dict)
+    borrowed: set[OffloadKey] = field(default_factory=set)
 
 
 class UnitSsdStore:
@@ -913,6 +914,7 @@ class UnitSsdStore:
                     self._restore(self.manifests[uid], self.manifest_paths[uid])
                 candidates[uid] = None
         if not candidates:
+            self.events["prefetch_no_manifest"] += 1
             return None
         if all(self.table.kind_for_key(k) == PageKind.MAIN for k in keys):
             requested = set(keys)
@@ -923,6 +925,7 @@ class UnitSsdStore:
                 in requested
             }
             if not candidates:
+                self.events["prefetch_no_matching_endpoint"] += 1
                 return None
         for uid in sorted(
             candidates,
@@ -933,6 +936,16 @@ class UnitSsdStore:
                 return list(self.units.units[uid].keys)
         return []
 
+    def _prefetch_deadline(self, pages: int) -> float:
+        # T_pf budgets one IO window. A committed inventory can span many
+        # windows; the per-request quota limits concurrency, not total work.
+        window = min(
+            self.ssd.options["prefetch_max_per_request"],
+            self.ssd.options["prefetch_max_inflight"],
+        )
+        rounds = max(1, (pages + window - 1) // window)
+        return self.ssd.clock() + rounds * self.ssd.options["prefetch_timeout_s"]
+
     def _prefetch_unit(self, req_id: str, unit: Unit) -> bool:
         if not self.manifest_ok(unit):
             self.events["prefetch_manifest_generation_mismatch"] += 1
@@ -940,10 +953,14 @@ class UnitSsdStore:
         txn = self.prefetches.get(unit.uid)
         if txn is not None:
             if txn.failed:
+                self.events["prefetch_transaction_draining"] += 1
                 return False
             txn.waiters.add(req_id)
             txn.waiter_deadlines.setdefault(
-                req_id, self.ssd.clock() + self.ssd.options["prefetch_timeout_s"]
+                req_id,
+                self._prefetch_deadline(
+                    len(txn.pending) + len(txn.active) + len(txn.borrowed)
+                ),
             )
             self.requests.setdefault(req_id, set()).add(unit.uid)
             return True
@@ -969,14 +986,21 @@ class UnitSsdStore:
                 self.events["prefetch_identity_failed"] += 1
                 self.drop(unit.uid)
                 return False
-        handles, missing = {}, []
+        handles, missing, borrowed = {}, [], set()
         for key in unit.keys:
             handle = self.table.lookup(key)
             if handle is None:
                 missing.append(key)
             elif not self.table.is_ready(handle):
-                pins.close()
-                return False
+                if self.table.get(handle).state != PageState.LOADING:
+                    pins.close()
+                    self.events["prefetch_resident_not_ready"] += 1
+                    return False
+                # A single-page lookup or another unit may already own this
+                # read (including a later batch). Keep its handle and wait for
+                # READY; never issue a second read into the same frame.
+                handles[key] = handle
+                borrowed.add(key)
             else:
                 handles[key] = handle
         cost = len(missing) + sum(
@@ -994,6 +1018,7 @@ class UnitSsdStore:
             for handle in handles.values():
                 self.table.release(handle, owner)
             pins.close()
+            self.events["prefetch_reservation_failed"] += 1
             return False
         for key, handle in zip(missing, fresh):
             self.table.install_loading(handle, key)
@@ -1012,10 +1037,12 @@ class UnitSsdStore:
             {req_id},
         )
         self.prefetches[unit.uid] = txn
-        txn.sources = frozenset(missing)
-        txn.waiter_deadlines[req_id] = (
-            self.ssd.clock() + self.ssd.options["prefetch_timeout_s"]
+        txn.borrowed = borrowed
+        txn.sources = frozenset((*missing, *borrowed))
+        txn.waiter_deadlines[req_id] = self._prefetch_deadline(
+            len(missing) + len(borrowed)
         )
+        self.events["prefetch_joined_loading_pages"] += len(borrowed)
         self.requests.setdefault(req_id, set()).add(unit.uid)
         self.events["prefetch_transactions_started"] += 1
         self.advance_prefetches()
@@ -1037,6 +1064,23 @@ class UnitSsdStore:
         for txn in tuple(self.prefetches.values()):
             unit = self.units.units.get(txn.uid)
             txn.failed |= unit is None or unit.gen != txn.gen
+            for key in tuple(txn.borrowed):
+                handle = txn.handles[key]
+                if self.table.is_ready(handle):
+                    txn.borrowed.remove(key)
+                elif not self.table.get(handle).valid:
+                    txn.failed = True
+                    self.events["prefetch_borrowed_load_failed"] += 1
+                    txn.borrowed.remove(key)
+                elif handle.page_id not in self.ssd._page_jobs and not any(
+                    not other.failed and key in other.pending
+                    for other in self.prefetches.values()
+                ):
+                    # The original transaction was cancelled before this
+                    # batch was submitted. Its remaining consumer owns IO now.
+                    txn.borrowed.remove(key)
+                    txn.pending.append(key)
+                    self.events["prefetch_adopted_pending_pages"] += 1
             for req_id in tuple(txn.waiters):
                 if self.ssd.clock() >= txn.waiter_deadlines[req_id]:
                     txn.waiters.remove(req_id)
@@ -1069,7 +1113,7 @@ class UnitSsdStore:
                 continue
             if txn.failed:
                 self._finish_prefetch(txn)
-            elif not txn.pending:
+            elif not txn.pending and not txn.borrowed:
                 if not txn.complete:
                     self.events["prefetch_latency_us"] += int(
                         (self.ssd.clock() - txn.started) * 1e6
@@ -1079,7 +1123,11 @@ class UnitSsdStore:
     def _finish_prefetch(self, txn: PrefetchTxn) -> None:
         del self.prefetches[txn.uid]
         for key, handle in txn.handles.items():
-            if not self.table.is_ready(handle):
+            if (
+                key not in txn.borrowed
+                and not self.table.is_ready(handle)
+                and not (self.table.get(handle).leases - {txn.owner})
+            ):
                 self.table.invalidate(handle)
             self.table.release(handle, txn.owner)
         txn.pins.close()

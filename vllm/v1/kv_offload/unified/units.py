@@ -86,6 +86,7 @@ class UnitIndex:
         # that a manifest has been committed.
         self.manifest_ok: Callable[[Unit], bool] | None = None
         self.on_event: Callable[[str, Unit], None] = lambda event, unit: None
+        self.on_retention_offer: Callable[[Unit, dict], None] = lambda unit, data: None
         self.on_reset: Callable[[], None] = lambda: None
         self.protected: set[UnitId] = set()
         self.registration_blocked: set[UnitId] = set()
@@ -267,6 +268,7 @@ class UnitIndex:
                 for flag in ("junction", "branch"):
                     if offer.retention.get(flag):
                         u.retention[flag] = True
+                self.on_retention_offer(u, offer.retention)
                 self.on_event("observe", u)
             return u
         self._generation += 1
@@ -286,6 +288,7 @@ class UnitIndex:
         u.draft_range = offer.draft_range
         u.retention = dict(offer.retention)
         self._changed(keys)
+        self.on_retention_offer(u, offer.retention)
         self.on_event("register", u)
         return u
 

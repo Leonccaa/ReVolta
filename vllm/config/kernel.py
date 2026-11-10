@@ -404,6 +404,8 @@ class LongContextKVConfig:
     """Turn on long-context mode; every other field is inert while False."""
     latest_only: bool = True
     """Keep each observed chain's latest, resend and structural branch points."""
+    enable_junction_evidence: bool = True
+    """Require successor evidence for junction retention; False uses legacy policy."""
     superseded_keep_ssd: bool = False
     """Archive superseded checkpoints on SSD before releasing their RAM."""
     host_store_gib: float | None = Field(default=None, gt=0, allow_inf_nan=False)
@@ -758,6 +760,7 @@ class KernelConfig:
                         "value_arbiter_settings",
                         "latest_only",
                         "superseded_keep_ssd",
+                        "enable_junction_evidence",
                     )
                     and not (
                         item[0] == "host_store_gib"

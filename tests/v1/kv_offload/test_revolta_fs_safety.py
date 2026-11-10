@@ -1326,7 +1326,15 @@ def test_retention_policy_does_not_change_persistent_identity(tmp_path, enabled)
     if enabled:
         config.kernel_config.long_context_kv.host_store_gib = 8.0
     digests = set()
-    for latest_only, keep_ssd in ((True, False), (False, False), (True, True)):
+    for latest_only, keep_ssd, evidence in (
+        (True, False, True),
+        (True, False, False),
+        (False, False, True),
+        (False, False, False),
+        (True, True, True),
+        (True, True, False),
+    ):
+        config.kernel_config.long_context_kv.enable_junction_evidence = evidence
         config.kernel_config.long_context_kv.latest_only = latest_only
         config.kernel_config.long_context_kv.superseded_keep_ssd = keep_ssd
         identity = get_revolta_identity(config, str(tmp_path / "kv"), manifest)
@@ -1334,4 +1342,5 @@ def test_retention_policy_does_not_change_persistent_identity(tmp_path, enabled)
         digests.add(identity.persistent_digest)
         text = repr(_kernel_identity(config.kernel_config))
         assert "latest_only" not in text and "superseded_keep_ssd" not in text
+        assert "enable_junction_evidence" not in text
     assert len(digests) == 1

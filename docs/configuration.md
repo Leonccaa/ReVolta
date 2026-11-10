@@ -328,3 +328,13 @@ operator shape, dtype and native checks still decide each dispatch.
 - [Reference launch tutorial](getting-started.md)
 - [Checkpoint preparation](checkpoints.md)
 - [KV offload modes](kv-offload.md)
+
+### Junction retention evidence
+
+`kernel_config.long_context_kv.enable_junction_evidence` is a deployment boolean,
+default `true` (introduced in 0.2, experimental). It applies when long-context
+mode and `latest_only` are enabled. It requires registered content successors
+for permanent junction retention. Set it to `false` to restore the legacy
+latest-only policy. It does not change compilation or persisted page identity.
+See [checkpoint retention](kv-offload.md#checkpoint-retention-evidence) for
+migration rules, limits and counters.

@@ -323,3 +323,40 @@ separate static pool.
 - [Reference launch tutorial](getting-started.md)
 - [Measured readback times](performance.md#coming-back-to-a-document)
 - [Known limits](known-limits.md)
+
+### Checkpoint retention evidence
+
+With long-context `latest_only` enabled, `enable_junction_evidence` (boolean,
+default `true`, deployment scope, introduced in 0.2, experimental) keeps each
+observed leaf's latest checkpoint and exact resend point. A capture records
+where recurrent state is needed; it does not by itself prove a branch.
+
+A captured point is retained when a registered continuation differs from the
+request's own next page. If the request has no complete next page, an existing
+continuation grants conservative `short_tail_junction` retention. The consumer
+also recognizes distinct registered successors arriving later. Confirmed reasons
+carry a version and exact content binding in optional manifest metadata and
+survive child eviction and clean restart. Ordinary value eviction still applies.
+Prompt identity is used only for equality; a second identity never confirms a
+branch.
+
+On startup, both legacy `junction` and `branch` booleans are treated as hints.
+The complete validated manifest graph determines effective retention. Old flags
+are preserved without bulk metadata rewrites. Only newly confirmed reasons need
+normal manifest updates. Missing legacy request metadata retains the existing
+predecessor fallback. A checkpoint without a complete newer witness is kept.
+
+This policy adds no grace timer or watch queue. MAIN tails not covered by a
+registered checkpoint remain unknown; an older state may be superseded. A later
+request can recompute from the remaining shallower state and capture a new
+checkpoint. Recompute may span much of the prompt. MAIN pages and files are not
+deleted by this policy.
+
+Set `enable_junction_evidence=false` to replay the previous latest-only producer,
+consumer and metadata behavior. The switch has no effect with `latest_only=false`.
+It changes neither SSD namespace nor compilation hash. Turning it off cannot
+restore already deleted state. `superseded_keep_ssd=true` retains committed cold
+checkpoints and releases only safe RAM copies. Existing `branch_points`,
+`chain_latest_units`, `resend_points`, `superseded_pending`, `superseded_revoked`,
+`superseded_freed_bytes` and `superseded_ssd_deleted_bytes` report effective policy
+state; no additional statistics are emitted with the switch off.

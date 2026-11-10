@@ -34,7 +34,11 @@ def canonical_digest(value) -> str:
     return hashlib.sha256(data.encode()).hexdigest()
 
 
-_RETENTION_POLICY_FIELDS = ("latest_only", "superseded_keep_ssd")
+_RETENTION_POLICY_FIELDS = (
+    "latest_only",
+    "superseded_keep_ssd",
+    "enable_junction_evidence",
+)
 
 
 def _kernel_identity(config):

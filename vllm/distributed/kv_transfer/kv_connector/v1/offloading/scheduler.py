@@ -1435,6 +1435,12 @@ class OffloadingConnectorScheduler:
         if counters is not None:
             self._count_admitted_lookup(counters, request, num_external_tokens)
 
+        unified = getattr(self, "unified", None)
+        if unified is not None and unified.latest_only:
+            # A streaming session may have rewritten its prompt since its
+            # previous admission, even with the same length and block hashes.
+            self._req_status[request.request_id].unified_prompt_identity = None
+
         if num_external_tokens == 0:
             # Admission succeeded: this request will actually recompute. A
             # lookup followed by capacity/budget deferral must keep the marker.

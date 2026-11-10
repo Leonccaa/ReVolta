@@ -734,7 +734,9 @@ def test_engine_args_size_pools_from_a_geometry(tmp_path):
     )  # fmt: skip
     lc = kwargs["kernel_config"]["long_context_kv"]
     assert derived["hot_pool_rows"] == 2048
-    assert lc["hot_pool_gib"] == ab.hot_pool_gib_for_rows(GEOMETRY, 2048, 4)
+    assert lc["hot_pool_gib"] == ab.hot_pool_gib_for_rows(
+        dict(GEOMETRY, hot_staged_writethrough=True), 2048, 4
+    )
     kwargs, derived = ab.resolve_engine_args(
         _args(
             "--arm", "on-host", "--config", "tight",
@@ -804,7 +806,12 @@ def test_sizing_refreshes_write_rows_from_the_requested_scenario(tmp_path):
         ),
         ab.CONFIGS["probe"],
     )  # fmt: skip
-    expected = dict(GEOMETRY, max_model_len=4096, hot_max_write_rows=1024)
+    expected = dict(
+        GEOMETRY,
+        max_model_len=4096,
+        hot_max_write_rows=1024,
+        hot_staged_writethrough=True,
+    )
     assert kwargs["kernel_config"]["long_context_kv"]["hot_pool_gib"] == (
         ab.hot_pool_gib_for_rows(expected, 1024, 2)
     )

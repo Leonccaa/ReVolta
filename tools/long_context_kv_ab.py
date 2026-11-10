@@ -488,6 +488,15 @@ def tight_settings(
         return {"num_gpu_blocks_override": s_req + history + ring + max(3, s_req // 2)}
     if placement not in ("gpu", "host"):
         raise ValueError(f"unknown placement {placement!r}")
+    from vllm.config.kernel import LongContextKVConfig
+
+    geometry = dict(
+        geometry,
+        hot_staged_writethrough=placement == "host"
+        and geometry.get(
+            "hot_staged_writethrough", LongContextKVConfig().staged_writethrough
+        ),
+    )
     index = int(geometry["index_bytes_per_block"])
     state_blocks = s_req + max(1, s_req // 2)
     target = history + ring + 3
@@ -1944,8 +1953,12 @@ def resolve_long_context(
     if geometry is not None:
         # A geometry receipt can come from another scenario. Staging must
         # match this run's scheduler, not the recorded run's write rows.
+        from vllm.config.kernel import LongContextKVConfig
+
         geometry = dict(
             geometry,
+            hot_staged_writethrough=placement == "host"
+            and LongContextKVConfig().staged_writethrough,
             max_model_len=config.max_model_len,
             hot_max_write_rows=config.max_num_batched_tokens,
         )

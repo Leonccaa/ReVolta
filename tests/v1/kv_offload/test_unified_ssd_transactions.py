@@ -29,11 +29,15 @@ pytestmark = pytest.mark.cpu_test
 
 
 class UnitEnv(Env):
-    def __init__(self, root, pages=40, clock=None, **overrides):
+    def __init__(
+        self, root, pages=40, clock=None, latest_only=False, keep_ssd=False, **overrides
+    ):
         self.table = HostPageTable(pages, num_workers=1)
         self.backing = bytearray(pages * ROW)
         self.manager = manager(pages=pages, workers=1)
         self.manager.attached = False
+        self.manager.latest_only = latest_only
+        self.manager.superseded_keep_ssd = keep_ssd
         self.manager.attach(SimpleNamespace(host_pages=self.table, elastic=False))
         self.manager.kind_by_group = {g: PageKind.STATE for g in range(1, 8)} | {
             8: PageKind.DRAFT

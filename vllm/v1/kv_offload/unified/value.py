@@ -30,6 +30,11 @@ class UnitValuePolicy:
             and p.revision == revision
             and p.key is not None
             and self.table.reclaimable(p)
+            and not (
+                self.units.protected
+                and (component := self.units.components.get(p.key)) is not None
+                and component.refs & self.units.protected
+            )
         )
 
     def refresh(self, page: HostPage) -> None:

@@ -74,6 +74,7 @@ class WriteTxn:
     remaining: set[OffloadKey] = field(default_factory=set)
     manifest_job: int | None = None
     manifest: dict | None = None
+    retention: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -96,6 +97,20 @@ class PrefetchTxn:
     borrowed: set[OffloadKey] = field(default_factory=set)
 
 
+@dataclass
+class DeleteTxn:
+    uid: UnitId
+    gen: int
+    keys: tuple[OffloadKey, ...]
+    manifests: dict[UnitId, tuple[str, dict]]
+    protected: set[UnitId]
+    handles: set[PageHandle]
+    pins: ExitStack
+    owner: int
+    witness: Unit
+    deleted_bytes: int = 0
+
+
 class UnitSsdStore:
     def __init__(self, manager: Any, ssd: Any):
         self.manager, self.ssd = manager, ssd
@@ -108,7 +123,8 @@ class UnitSsdStore:
         self.files: dict[OffloadKey, dict] = {}
         self.writes: dict[UnitId, WriteTxn] = {}
         self.max_write_transactions = max(2, min(ssd._max_pending, 2 * ssd._window))
-        self.manifest_jobs: dict[int, WriteTxn] = {}
+        self.manifest_jobs: dict[int, WriteTxn | DeleteTxn] = {}
+        self.superseded_files: set[OffloadKey] = set()
         self.prefetches: dict[UnitId, PrefetchTxn] = {}
         self.requests: dict[str, set[UnitId]] = {}
         self.single_claims: dict[int, str] = {}
@@ -142,6 +158,7 @@ class UnitSsdStore:
         self.control_path = os.path.join(self.directory, "epoch.json")
         os.makedirs(self.directory, exist_ok=True)
         self.units.manifest_ok = self.manifest_ok
+        self._previous_event = self.units.on_event
         self.units.on_event = self.unit_event
         self.units.on_reset = self.reset
         opts = ssd.options
@@ -247,7 +264,7 @@ class UnitSsdStore:
                 states.setdefault(str(get_offload_group_idx(key)), []).append(key.hex())
             elif kind == PageKind.DRAFT:
                 drafts.append(key.hex())
-        return {
+        document = {
             "schema": SCHEMA,
             "namespace": self.namespace,
             "reset_epoch": unit.uid.reset,
@@ -264,6 +281,9 @@ class UnitSsdStore:
                 self.descriptor(k, placeholder=placeholder) for k in unit.keys
             ],
         }
+        if self.manager.latest_only and unit.retention:
+            document["retention"] = dict(unit.retention)
+        return document
 
     def manifest_bytes(self, unit: Unit) -> int:
         cached = self._manifest_sizes.get(unit.uid)
@@ -333,6 +353,7 @@ class UnitSsdStore:
 
     def unit_event(self, event: str, unit: Unit) -> None:
         self._obligation_cache.pop(unit.uid, None)
+        self._manifest_sizes.pop(unit.uid, None)
         if self._rebuilding:
             return
         if event == "register":
@@ -351,6 +372,7 @@ class UnitSsdStore:
             # A CPU value revocation need not discard an independently committed
             # disk variant. Its graph can be rebuilt by a later cold lookup.
         self.credit.event(event, unit)
+        self._previous_event(event, unit)
 
     def rebuild(self) -> None:
         started = time.monotonic()
@@ -488,6 +510,7 @@ class UnitSsdStore:
                 record["B"],
                 record["A"],
                 tuple(record["draft_range"]),
+                record.get("retention", {}) if self.manager.latest_only else {},
             )
         )
         if u is None:
@@ -558,6 +581,11 @@ class UnitSsdStore:
         self.credit.reconcile(promote=False, reason="redirty")
 
     def drop(self, uid: UnitId) -> bool:
+        if (
+            uid in self.units.protected
+            or UnitId(uid.boundary, uid.reset) in self.units.registration_blocked
+        ):
+            return False
         if uid in self.writes or uid in self.prefetches:
             return False
         if uid not in self.manifests:
@@ -617,10 +645,183 @@ class UnitSsdStore:
         )
         return True
 
-    def start_write(self, unit: Unit, headroom: int | None = None) -> bool:
+    def supersede(self, uid: UnitId, witness: Unit) -> None:
+        """Delete exact old manifests durably before withdrawing the RAM graph."""
+        if uid in self.units.registration_blocked:
+            return
+        if self.retention_updates_pending():
+            return
+        if (
+            self.ssd._store_jobs() >= self.ssd._max_pending
+            or self.ssd._inflight_stores >= self.ssd._window
+        ):
+            return
+        b = self.units.units.get(uid)
+        records = {
+            v: (self.manifest_paths[v], r)
+            for v, r in self.manifests.items()
+            if v.boundary == uid.boundary and v.reset == uid.reset
+        }
+        keys = (
+            b.keys
+            if b is not None
+            else tuple(
+                dict.fromkeys(
+                    OffloadKey(bytes.fromhex(c["key"]))
+                    for _, r in records.values()
+                    for c in r["components"]
+                    if c["kind"] != PageKind.MAIN.value
+                )
+            )
+        )
+        if not records:
+            if b is not None:
+                self.manager.retention.commit(uid, b.gen, keys)
+            self.superseded_files.update(keys)
+            return
+        protected = {uid, witness.uid} | set(records)
+        if witness.parent is not None:
+            protected.add(witness.parent)
+        if b is not None:
+            protected.update(b.variants)
+        inventory = set(keys) | set(witness.keys)
+        for v in records:
+            old = self.units.units.get(v)
+            if old is not None:
+                inventory.update(old.keys)
+        handles = {
+            c.cpu
+            for k in inventory
+            if (c := self.units.components.get(k)) is not None and c.cpu is not None
+        }
+        cost = sum(self.table.reclaimable(self.table.get(h)) for h in handles)
+        if cost > self.table.net_headroom():
+            return
+        owner, pins = self.owner(), ExitStack()
+        for handle in handles:
+            self.table.pin(handle, owner)
+        for k in inventory:
+            pins.enter_context(self.cache.read(self.path(k)))
+        witness_path = self.manifest_paths.get(witness.uid)
+        if witness_path is not None:
+            pins.enter_context(self.cache.read(witness_path))
+        self.units.protected.update(protected)
+        self.units.registration_blocked.add(uid)
+        txn = DeleteTxn(
+            uid,
+            0 if b is None else b.gen,
+            keys,
+            records,
+            protected,
+            handles,
+            pins,
+            owner,
+            witness,
+        )
+        self.ssd._next_job -= 1
+        job_id = self.ssd._next_job
+        self.manifest_jobs[job_id] = txn
+        self.ssd._inflight_stores += 1
+        task = functools.partial(self._delete_manifests, txn)
+        self.ssd._tier._pool.enqueue_store(job_id, 1, [task], n_blocks=1)
+
+    def _delete_manifests(self, txn: DeleteTxn) -> None:
+        for path, _ in txn.manifests.values():
+            size = os.path.getsize(path) if os.path.exists(path) else 0
+            if not self.cache.discard(path):
+                raise RuntimeError("Checkpoint manifest is still protected")
+            txn.deleted_bytes += size
+        fd = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def _supersede_done(self, txn: DeleteTxn, success: bool) -> None:
+        retention = self.manager.retention
+        same_epoch = txn.uid.reset == self.units.reset_epoch
+        unchanged = all(
+            self.manifest_paths.get(uid) == path and self.manifests.get(uid) is record
+            for uid, (path, record) in txn.manifests.items()
+        )
+        commit = (
+            same_epoch
+            and success
+            and unchanged
+            and retention.can_commit(txn.uid, txn.witness)
+        )
+        txn.pins.close()
+        for handle in txn.handles:
+            self.table.release(handle, txn.owner)
+        # Protection can overlap between disjoint deletions sharing a witness.
+        still_protected = set().union(
+            *(
+                t.protected
+                for t in self.manifest_jobs.values()
+                if isinstance(t, DeleteTxn)
+            )
+        )
+        self.units.protected.difference_update(txn.protected - still_protected)
+        self.units.registration_blocked.discard(txn.uid)
+        for handle in txn.handles:
+            self.table.refresh_value(handle)
+        self.manager.events["superseded_ssd_deleted_bytes"] += txn.deleted_bytes
+        if not same_epoch:
+            return
+        # The worker may already have unlinked a point that became a branch
+        # or resend while IO was in flight. Keep its graph and republish its
+        # manifest through the ordinary write transaction before exposing SSD
+        # recovery again. Failed/partial unlinks use the same repair path.
+        for uid, (path, record) in txn.manifests.items():
+            if (
+                self.manifest_paths.get(uid) == path
+                and self.manifests.get(uid) is record
+            ):
+                unit = self.units.units.get(uid)
+                if not commit and unit is None:
+                    unit = self._restore(record, path)
+                self.remove_manifest(uid)
+                self.retired_manifests.discard(path)
+                if not commit and unit is not None:
+                    self.schedule(unit, self.ssd.clock())
+                    self.start_write(unit)
+        if commit:
+            retention.commit(txn.uid, txn.gen, txn.keys)
+            self.superseded_files.update(txn.keys)
+            self._clean_superseded_files()
+        retention.dirty = True
+
+    def _clean_superseded_files(self) -> None:
+        for key in tuple(self.superseded_files):
+            if self.table.kind_for_key(key) == PageKind.MAIN:
+                self.superseded_files.discard(key)
+                continue
+            c = self.units.components.get(key)
+            if self.manifest_refs.get(key) or c is not None and c.refs:
+                self.superseded_files.discard(key)
+                continue
+            path = self.path(key)
+            size = os.path.getsize(path) if os.path.exists(path) else 0
+            if self.discard_file(path):
+                self.manager.events["superseded_ssd_deleted_bytes"] += size
+                self.files.pop(key, None)
+                self.superseded_files.discard(key)
+
+    def retention_updates_pending(self) -> bool:
+        return any(
+            self.units.units[uid].retention != record.get("retention", {})
+            for uid, record in self.manifests.items()
+            if uid in self.units.units
+        )
+
+    def start_write(
+        self, unit: Unit, headroom: int | None = None, *, refresh: bool = False
+    ) -> bool:
+        if UnitId(unit.uid.boundary, unit.uid.reset) in self.units.registration_blocked:
+            return False
         if unit.parent is None or not unit.complete:
             return False
-        if self.manifest_ok(unit):
+        if self.manifest_ok(unit) and not refresh:
             return True
         if unit.uid in self.writes:
             return self.writes[unit.uid].gen == unit.gen
@@ -673,6 +874,7 @@ class UnitSsdStore:
             owner,
             self.ssd.clock(),
         )
+        txn.retention = dict(unit.retention)
         self.writes[unit.uid] = txn
         txn.remaining = set(missing)
         self._obligation_cache.pop(unit.uid, None)
@@ -824,6 +1026,11 @@ class UnitSsdStore:
         ):
             return
         txn.manifest = self.document(unit)
+        if self.manager.latest_only:
+            if txn.retention:
+                txn.manifest["retention"] = txn.retention
+            else:
+                txn.manifest.pop("retention", None)
         self.ssd._next_job -= 1
         job_id = self.ssd._next_job
         txn.manifest_job = job_id
@@ -847,6 +1054,9 @@ class UnitSsdStore:
         if txn is None:
             return
         self.ssd._inflight_stores -= 1
+        if isinstance(txn, DeleteTxn):
+            self._supersede_done(txn, success)
+            return
         txn.manifest_job = None
         unit = self.units.units.get(txn.uid)
         if success:
@@ -911,6 +1121,8 @@ class UnitSsdStore:
         candidates: dict[UnitId, None] = {}
         for key in keys:
             for uid in tuple(self.manifest_refs.get(key, ())):
+                if UnitId(uid.boundary, uid.reset) in self.units.registration_blocked:
+                    continue
                 if uid not in self.units.units:
                     self._restore(self.manifests[uid], self.manifest_paths[uid])
                 candidates[uid] = None
@@ -1164,9 +1376,20 @@ class UnitSsdStore:
             if uid in self.prefetches
         )
 
+    def retention_step(self) -> None:
+        if self.manager.retention is not None:
+            self.manager.retention.step()
+            self._clean_superseded_files()
+            for uid, record in tuple(self.manifests.items()):
+                unit = self.units.units.get(uid)
+                if unit is not None and unit.retention != record.get("retention", {}):
+                    self.start_write(unit, refresh=True)
+                    break
+
     def step(self) -> None:
         self.advance_prefetches()
         self.advance_writes()
+        self.retention_step()
         stalled = self.credit.events["rate_stalled"]
         self.credit.tick()
         if self.credit.events["rate_stalled"] != stalled:
@@ -1466,6 +1689,7 @@ class UnitSsdStore:
         self.flushing = self.ssd._flushing = True
         self.ssd._report, self.ssd._phase = report, "budget"
         self.ssd._poll()
+        self.retention_step()
         self.ssd._discard_queue()
         self.ssd._deferred.clear()
         for req_id in tuple(set(self.requests) | set(self.ssd._rounds)):
@@ -1517,6 +1741,7 @@ class UnitSsdStore:
             while self.ssd.clock() < end:
                 self.ssd._poll()
                 self.advance_prefetches()
+                self.retention_step()
                 if queue:
                     unit = queue[0]
                     if (

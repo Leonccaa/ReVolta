@@ -56,6 +56,7 @@ class Unit:
     boundary_position: int = 0
     ahead_position: int = 0
     draft_range: tuple[int, int] = (0, 0)
+    retention: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,7 @@ class VariantOffer:
     boundary_position: int = 0
     ahead_position: int = 0
     draft_range: tuple[int, int] = (0, 0)
+    retention: dict = field(default_factory=dict)
 
 
 class UnitIndex:
@@ -85,6 +87,8 @@ class UnitIndex:
         self.manifest_ok: Callable[[Unit], bool] | None = None
         self.on_event: Callable[[str, Unit], None] = lambda event, unit: None
         self.on_reset: Callable[[], None] = lambda: None
+        self.protected: set[UnitId] = set()
+        self.registration_blocked: set[UnitId] = set()
 
     def _changed(self, keys: Iterable[OffloadKey]) -> None:
         unique = set(keys)
@@ -213,6 +217,8 @@ class UnitIndex:
         return True
 
     def register(self, offer: VariantOffer) -> Unit | None:
+        if offer.boundary in self.registration_blocked:
+            return None
         b = self.units.get(offer.boundary)
         reason = (
             "variant_b_absent_terminal"
@@ -251,7 +257,18 @@ class UnitIndex:
             return None
         uid = UnitId(b.uid.boundary, b.uid.reset, offer.ahead)
         if uid in self.units:
-            return self.units[uid]
+            u = self.units[uid]
+            if offer.retention:
+                # Reusing an existing checkpoint does not publish a newer
+                # request's point. Its prior resend exemption lasts until a
+                # genuinely newer boundary has registered successfully.
+                if not u.retention:
+                    u.retention.update(offer.retention)
+                for flag in ("junction", "branch"):
+                    if offer.retention.get(flag):
+                        u.retention[flag] = True
+                self.on_event("observe", u)
+            return u
         self._generation += 1
         # Materialize transitive component references. A shared STATE/DRAFT
         # page must consider every variant's cold-recovery predicate too.
@@ -267,6 +284,7 @@ class UnitIndex:
         u.boundary_position = offer.boundary_position
         u.ahead_position = offer.ahead_position
         u.draft_range = offer.draft_range
+        u.retention = dict(offer.retention)
         self._changed(keys)
         self.on_event("register", u)
         return u
@@ -376,6 +394,8 @@ class UnitIndex:
         u = self.units.get(uid)
         if u is None or u.gen != gen:
             return False
+        if uid in self.protected:
+            return False
         # Remove eligibility first; then all logical references; only then
         # refresh pages and expose zero-reference reclaim candidates.
         u.complete = False
@@ -392,6 +412,8 @@ class UnitIndex:
         return True
 
     def reset(self) -> None:
+        self.protected.clear()
+        self.registration_blocked.clear()
         for uid in tuple(self.units):
             if uid in self.units:
                 self.revoke(uid, self.units[uid].gen, "reset")

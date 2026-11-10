@@ -368,6 +368,10 @@ class HostPageSsd:
                 self.unit_store.writes
                 or self.unit_store.prefetches
                 or self.unit_store.due
+                or self.unit_store.manifest_jobs
+                or self.unit_store.superseded_files
+                or self.unit_store.manager.retention is not None
+                and self.unit_store.manager.retention.pending
             )
         )
 
@@ -759,6 +763,12 @@ class HostPageSsd:
         for key in keys:
             if (
                 self.unit_store is not None
+                and self.unit_store.manager.retention is not None
+                and self.unit_store.manager.retention.blocked_key(key)
+            ):
+                break
+            if (
+                self.unit_store is not None
                 and self.table.kind_for_key(key) != PageKind.MAIN
                 and key not in self.unit_store.files
             ):
@@ -1077,6 +1087,16 @@ def create_host_page_ssd(
     """None unless kv_connector_extra_config["host_kv.ssd"]["enabled"]."""
     options = host_kv_ssd_config(vllm_config.kv_transfer_config)
     if options is None:
+        settings = getattr(
+            getattr(vllm_config, "kernel_config", None), "long_context_kv", None
+        )
+        if (
+            settings is not None
+            and settings.enabled
+            and settings.latest_only
+            and settings.superseded_keep_ssd
+        ):
+            raise ValueError("superseded_keep_ssd requires an enabled unified SSD")
         return None
     identity = {
         "num_workers": layout.num_workers,

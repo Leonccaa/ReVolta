@@ -284,3 +284,148 @@ def test_delayed_preemption_keeps_fresh_resumed_load():
     assert not m.ledger.requests[req.request_id].draining
     assert m._loads[req.request_id]
     assert all(not b.failed for b in m.builds.values())
+
+
+@pytest.mark.parametrize("speculative_tokens", [0, 1])
+def test_latest_metadata_uses_actual_resend_fallback(speculative_tokens):
+    from vllm.v1.core.kv_cache_hit_contract import chain_hash_from_request
+
+    scheduler = build(
+        host_settings(host_pool_tokens=128 * SPAN),
+        max_num_seqs=2,
+        with_connector=True,
+        speculative_tokens=speculative_tokens,
+    )
+    (request,) = make_requests(1, 8 * SPAN + 1, 16)
+    scheduler.add_request(request)
+    connector = scheduler.connector.connector_scheduler
+    m = connector.unified
+    assert m.latest_only
+    for _ in range(12):
+        advance(scheduler)
+    span = connector.host_kv_hits.rule.block_size
+    position = (request.num_prompt_tokens - 1) // span * span
+    position -= connector._eagle_state_shift or 0
+    chain = chain_hash_from_request(request.block_hashes, connector._hash_block_size)
+    expected = chain(connector.host_kv_hits.rule, position // span - 1)
+    variants = [u for u in m.units.units.values() if u.parent is not None]
+    assert variants
+    assert all(u.retention["resend"] == expected.hex() for u in variants)
+    assert any(u.uid.boundary == expected for u in variants)
+    assert not m.retention.branches
+
+
+@pytest.mark.parametrize("latest_only", [False, True])
+@pytest.mark.parametrize("speculative_tokens", [0, 1])
+@pytest.mark.parametrize("prompt_extra", [0, SPAN // 2])
+def test_continuous_identical_resend_hit_does_not_decrease(
+    latest_only, speculative_tokens, prompt_extra
+):
+    from vllm.v1.request import RequestStatus
+
+    settings = host_settings(host_pool_tokens=128 * SPAN)
+    settings.latest_only = latest_only
+    scheduler = build(
+        settings,
+        max_num_seqs=2,
+        with_connector=True,
+        speculative_tokens=speculative_tokens,
+    )
+    connector = scheduler.connector.connector_scheduler
+    m = connector.unified
+    hits = []
+    for retry in range(4):
+        (request,) = make_requests(
+            1, 8 * SPAN + prompt_extra, 16, tag=f"resend-{retry}"
+        )
+        scheduler.add_request(request)
+        for _ in range(12):
+            advance(scheduler)
+        status = connector._req_status[request.request_id]
+        hits.append(status.num_locally_computed_tokens)
+        scheduler.finish_requests([request.request_id], RequestStatus.FINISHED_ABORTED)
+        connector.persistence_step()
+        if latest_only:
+            assert not m.retention.branches
+    assert hits[1] > 0
+    assert hits[1:] == [hits[1]] * 3
+
+
+@pytest.mark.parametrize("speculative_tokens", [0, 1])
+@pytest.mark.parametrize("tail_tokens", [SPAN // 2, SPAN, 2 * SPAN])
+def test_short_sibling_junction_survives(speculative_tokens, tail_tokens):
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core.kv_cache_hit_contract import chain_hash_from_request
+    from vllm.v1.core.kv_cache_utils import get_request_block_hasher
+    from vllm.v1.kv_offload.unified.units import UnitId
+    from vllm.v1.request import Request, RequestStatus
+
+    scheduler = build(
+        host_settings(host_pool_tokens=128 * SPAN),
+        max_num_seqs=2,
+        with_connector=True,
+        speculative_tokens=speculative_tokens,
+    )
+    (parent,) = make_requests(1, 8 * SPAN, 16, tag="parent")
+    scheduler.add_request(parent)
+    for _ in range(12):
+        advance(scheduler)
+    scheduler.finish_requests([parent.request_id], RequestStatus.FINISHED_ABORTED)
+    connector = scheduler.connector.connector_scheduler
+    connector.persistence_step()
+    common = 4 * SPAN
+    child = Request(
+        request_id="short-sibling",
+        prompt_token_ids=parent.prompt_token_ids[:common] + [2000] * tail_tokens,
+        sampling_params=parent.sampling_params,
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(16, sha256),
+    )
+    scheduler.add_request(child)
+    for _ in range(12):
+        advance(scheduler)
+    assert child.shared_prefix_boundary == common
+    chain = chain_hash_from_request(child.block_hashes, connector._hash_block_size)
+    uid = UnitId(
+        chain(connector.host_kv_hits.rule, common // SPAN - 1),
+        connector.unified.units.reset_epoch,
+    )
+    assert uid in connector.unified.retention.branches
+    assert uid in connector.unified.units.units
+
+
+@pytest.mark.parametrize("speculative_tokens", [0, 1])
+def test_prompt_identity_includes_incomplete_hash_block(speculative_tokens):
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core.kv_cache_utils import get_request_block_hasher
+    from vllm.v1.request import Request, RequestStatus
+
+    scheduler = build(
+        host_settings(host_pool_tokens=128 * SPAN),
+        max_num_seqs=2,
+        with_connector=True,
+        speculative_tokens=speculative_tokens,
+    )
+    connector = scheduler.connector.connector_scheduler
+    (parent,) = make_requests(1, 8 * SPAN + SPAN // 2 + 1, 16, tag="parent")
+    scheduler.add_request(parent)
+    for _ in range(12):
+        advance(scheduler)
+    identity = connector._req_status[parent.request_id].prompt_identity(16)
+    scheduler.finish_requests([parent.request_id], RequestStatus.FINISHED_ABORTED)
+    connector.persistence_step()
+    # The only differing token lies beyond all complete hash blocks, not just
+    # beyond the last storage block. Length and every block hash still match.
+    child = Request(
+        request_id="different-last-token",
+        prompt_token_ids=parent.prompt_token_ids[:-1] + [2000],
+        sampling_params=parent.sampling_params,
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(16, sha256),
+    )
+    assert child.block_hashes == parent.block_hashes[: len(child.block_hashes)]
+    scheduler.add_request(child)
+    for _ in range(12):
+        advance(scheduler)
+    status = connector._req_status[child.request_id]
+    assert status.prompt_identity(16) != identity

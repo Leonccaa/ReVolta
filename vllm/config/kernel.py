@@ -402,6 +402,10 @@ class LongContextKVConfig:
 
     enabled: bool = False
     """Turn on long-context mode; every other field is inert while False."""
+    latest_only: bool = True
+    """Keep each observed chain's latest, resend and structural branch points."""
+    superseded_keep_ssd: bool = False
+    """Archive superseded checkpoints on SSD before releasing their RAM."""
     host_store_gib: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     """Unified host budget across MAIN, STATE and DRAFT, summed over workers.
     Includes ZERO_PAGE and build reservations. Mutually exclusive with the
@@ -748,7 +752,13 @@ class KernelConfig:
                 tuple(
                     item
                     for item in items
-                    if item[0] not in ("value_arbitration", "value_arbiter_settings")
+                    if item[0]
+                    not in (
+                        "value_arbitration",
+                        "value_arbiter_settings",
+                        "latest_only",
+                        "superseded_keep_ssd",
+                    )
                     and not (
                         item[0] == "host_store_gib"
                         and self.long_context_kv.host_store_gib is None

@@ -426,6 +426,25 @@ class RequestOffloadState:
     transfer_jobs: set[int] = field(default_factory=set)
     unified_junction_offered: bool = False
     unified_preemptions: int = 0
+    unified_prompt_identity: tuple[int, str] | None = None
+
+    def prompt_identity(self, hash_block_size: int) -> str:
+        """Include the unhashed prompt tail without rehashing its full prefix."""
+        from vllm.utils.hashing import sha256
+        from vllm.v1.core.kv_cache_utils import generate_block_hash_extra_keys
+
+        length = self.req.num_prompt_tokens
+        cached = self.unified_prompt_identity
+        if cached is None or cached[0] != length:
+            blocks = length // hash_block_size
+            start = blocks * hash_block_size
+            parent = self.req.block_hashes[blocks - 1] if blocks else None
+            extra, _ = generate_block_hash_extra_keys(self.req, start, length, 0)
+            identity = sha256(
+                (length, parent, tuple(self.req.all_token_ids[start:length]), extra)
+            ).hex()
+            cached = self.unified_prompt_identity = (length, identity)
+        return cached[1]
 
     def __post_init__(self) -> None:
         self.group_states = tuple(
@@ -2559,6 +2578,41 @@ class OffloadingConnectorScheduler:
                         break
                     main.append(make_offload_key(h, main_group))
                 if len(main) >= ahead // span:
+                    retention = {}
+                    if unified.latest_only:
+                        resend = max(
+                            0,
+                            (status.req.num_prompt_tokens - 1) // span * span
+                            - (self._eagle_state_shift or 0),
+                        )
+                        resend_hash = (
+                            chain(self.host_kv_hits.rule, resend // span - 1)
+                            if resend > 0
+                            else None
+                        )
+                        prompt_end = status.req.num_prompt_tokens // span * span - (
+                            self._eagle_state_shift or 0
+                        )
+                        identity = status.prompt_identity(self._hash_block_size)
+                        prior = unified.retention.variants.get(
+                            UnitId(h_b, unified.units.reset_epoch, h_a)
+                        )
+                        identical = (
+                            prior is not None
+                            and prior.retention.get("prompt_identity") == identity
+                        )
+                        retention = {
+                            "request_length": status.req.num_prompt_tokens,
+                            "prompt_identity": identity,
+                            "resend": None
+                            if resend_hash is None
+                            else resend_hash.hex(),
+                            # An earlier junction has a complete continuation.
+                            # At the last full block, suppress only a confirmed
+                            # identical prompt, including its partial tail.
+                            "junction": boundary == junction
+                            and (junction < prompt_end or not identical),
+                        }
                     unified.offer_variant(
                         req_id,
                         VariantOffer(
@@ -2569,6 +2623,7 @@ class OffloadingConnectorScheduler:
                             boundary,
                             ahead,
                             (draft_start, boundary),
+                            retention,
                         ),
                     )
 
@@ -3128,6 +3183,11 @@ class OffloadingConnectorScheduler:
         # host SSD persistence: the host-page SSD queue (attached by EngineCore) also
         # counts.
         host_ssd = getattr(self, "host_page_ssd", None)
+        unified = getattr(self, "unified", None)
+        if unified is not None and unified.retention is not None:
+            unified.retention.refresh()
+            if unified.retention.pending:
+                return True
         return (bool(pending()) if pending is not None else False) or (
             host_ssd is not None and host_ssd.has_pending()
         )
@@ -3140,6 +3200,9 @@ class OffloadingConnectorScheduler:
         host_ssd = getattr(self, "host_page_ssd", None)
         if host_ssd is not None:
             host_ssd.step()
+        unified = getattr(self, "unified", None)
+        if unified is not None and unified.retention is not None:
+            unified.retention.step()
 
     def _drop_superseded_state_writes(self, req_status: RequestOffloadState) -> None:
         """state_latest_only (secondary tiers with delayed writes): of the

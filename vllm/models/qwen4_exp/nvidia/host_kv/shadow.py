@@ -13,6 +13,8 @@ capture the gather kernels); the window epoch is a device scalar for the
 same reason. Values are read back asynchronously, one step late.
 """
 
+import time
+
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -26,6 +28,72 @@ from vllm.v1.core.value_arbiter import (
 )
 
 EPOCH_MOD = 127
+
+
+@triton.jit
+def hot_count_gather(Wanted, Misses, Counters):
+    """One stream-ordered update after layer 0 collected its misses."""
+    wanted = tl.load(Wanted).to(tl.int64)
+    misses = tl.load(Misses).to(tl.int64)
+    tl.store(Counters, tl.load(Counters) + wanted)
+    tl.store(Counters + 1, tl.load(Counters + 1) + misses)
+
+
+@triton.jit
+def hot_count_slots(Owner, Counters, N: tl.constexpr, B: tl.constexpr):
+    i = tl.program_id(0) * B + tl.arange(0, B)
+    owner = tl.load(Owner + i, i < N, -1)
+    valid = tl.sum((owner >= 0).to(tl.int64), 0)
+    tl.atomic_add(Counters + 2, valid, sem="relaxed")
+
+
+class HotCacheMetrics:
+    """Layer-0 telemetry, independent of value arbitration and graph-safe.
+
+    Owns 24 device bytes and 24 pinned host bytes. Only the once-a-minute
+    snapshot scans slots or queues D2H. Polling its event never synchronizes.
+    """
+
+    def __init__(self, device: torch.device) -> None:
+        self.counters = torch.zeros(3, dtype=torch.int64, device=device)
+        self.host = torch.zeros(3, dtype=torch.int64, pin_memory=device.type == "cuda")
+        self.device = device
+        self.event: torch.cuda.Event | None = None
+        self.pending: int | None = None
+        self.next_snapshot = 0.0
+
+    def reset(self) -> None:
+        self.counters.zero_()
+        self.pending = None
+        self.event = None
+        self.next_snapshot = 0.0
+
+    def count(self, store) -> None:
+        hot_count_gather[(1,)](store.wanted_count, store.miss_count, self.counters)
+
+    def harvest(
+        self, step: int, owner: torch.Tensor
+    ) -> tuple[int, int, int, int] | None:
+        result = None
+        if self.pending is not None:
+            if self.event is not None and not self.event.query():
+                return None
+            wanted, misses, valid = self.host.tolist()
+            result = (self.pending, wanted, misses, valid)
+            self.pending = None
+        now = time.monotonic()
+        if now >= self.next_snapshot:
+            self.counters[2:3].zero_()
+            hot_count_slots[(triton.cdiv(owner.numel(), 1024),)](
+                owner, self.counters, owner.numel(), 1024
+            )
+            self.host.copy_(self.counters, non_blocking=True)
+            if self.device.type == "cuda":
+                self.event = torch.cuda.Event()
+                self.event.record()
+            self.pending = step
+            self.next_snapshot = now + 60.0
+        return result
 
 
 @triton.jit

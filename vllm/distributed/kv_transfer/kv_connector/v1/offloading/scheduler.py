@@ -1196,6 +1196,15 @@ class OffloadingConnectorScheduler:
             elif result[0] == 0:
                 unified.release_lookup(request.request_id)
         if result[0] is not None:
+            metrics = getattr(self, "store_metrics", None)
+            ssd = getattr(self, "host_page_ssd", None)
+            if metrics is not None and ssd is not None:
+                metrics.prefetched(
+                    request,
+                    ssd,
+                    getattr(self, "hit_contract", None),
+                    num_computed_tokens + result[0],
+                )
             # A final answer: its lookup leases (if any) now protect the
             # prefetched pages. Drop the round and its holds.
             self._end_host_ssd_round(request.request_id)

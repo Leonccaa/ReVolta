@@ -3513,6 +3513,9 @@ class Scheduler(SchedulerInterface):
                 if pool.blocks[ticket.hid].ref_cnt == 0:
                     pool.unbind(ticket.hid)
         pool.complete_jobs(meta.completed_jobs)
+        metrics = getattr(self, "store_metrics", None)
+        if metrics is not None:
+            metrics.worker_hot(meta.hot_metrics)
         for step, ranks in meta.completed_steps.items():
             pool.host_pages.complete_step(step, ranks)
         arbiter = getattr(self, "value_arbiter", None)

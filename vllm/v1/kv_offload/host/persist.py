@@ -524,6 +524,10 @@ class HostPageSsd:
                     assert page.key is not None
                     self.table.value_policy.ssd_lost(page.key, job.handle)
             self.stats_counter["prefetch_verified" if ok else "prefetch_failed"] += 1
+            if ok:
+                # Ordinary and unit prefetches retire through this same point.
+                self.stats_counter["verified_load_pages"] += 1
+                self.stats_counter["verified_load_bytes"] += self.page_bytes
             for req_id in self._waiters.pop(job.handle, set()):
                 round_ = self._rounds.get(req_id)
                 if round_ is None or job.handle not in round_.loading:
@@ -843,7 +847,7 @@ class HostPageSsd:
                 if txn is not None:
                     handles.extend(
                         txn.handles[k]
-                        for k in txn.sources
+                        for k in txn.waiter_sources.get(req_id, ())
                         if self.table.is_ready(txn.handles[k])
                     )
         return handles

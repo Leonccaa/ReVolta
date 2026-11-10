@@ -18,10 +18,13 @@ from vllm.v1.kv_offload.unified.units import UnitId, VariantOffer
 pytestmark = pytest.mark.cpu_test
 
 
-def enable(m, keep=False):
+def enable(m, keep=False, evidence=False):
     m.latest_only = True
+    m.enable_junction_evidence = evidence
     m.retention = LatestCheckpoints(m, keep)
     m.units.on_event = m.retention.event
+    if evidence:
+        m.units.on_retention_offer = m.retention.offer_evidence
     m.spec.unified_frame_bytes = ROW
     return m
 

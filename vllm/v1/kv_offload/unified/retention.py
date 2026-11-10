@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Content-prefix checkpoint retention, owned by the scheduler thread."""
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -22,6 +24,8 @@ class LatestCheckpoints:
         self.manager = manager
         self.units, self.table = manager.units, manager.table
         self.keep_ssd = keep_ssd
+        self.evidence_enabled = manager.enable_junction_evidence
+        self.reasons: dict[UnitId, str] = {}
         self.root = Prefix()
         self.nodes: dict[UnitId, Prefix] = {}
         self.variants: dict[UnitId, Unit] = {}
@@ -51,6 +55,7 @@ class LatestCheckpoints:
                 for v in store.manifests
             ):
                 self.branches.discard(unit.uid)
+                self.reasons.pop(unit.uid, None)
         self.dirty = True
 
     def observe(self, unit: Unit) -> None:
@@ -58,7 +63,7 @@ class LatestCheckpoints:
             return
         if unit.uid in self.variants:
             self.variants[unit.uid] = unit
-            if unit.retention.get("branch") or unit.retention.get("junction"):
+            if self.confirmed(unit):
                 self.branches.add(unit.parent)
             self.dirty = True
             return
@@ -83,12 +88,83 @@ class LatestCheckpoints:
                 self.nodes[unit.parent] = node
         node.variants.add(unit.uid)
         self.variants[unit.uid] = unit
-        if unit.retention.get("branch") or unit.retention.get("junction"):
+        if self.confirmed(unit):
             self.branches.add(unit.parent)
         self.dirty = True
 
+    @staticmethod
+    def evidence_identity(
+        uid: UnitId, keys: tuple[OffloadKey, ...], boundary: int, ahead: int
+    ) -> str:
+        # Bind a reason to exact validated content, not a process-local B gen.
+        data = [
+            uid.boundary.hex(),
+            uid.reset,
+            uid.ahead.hex() if uid.ahead else None,
+            boundary,
+            ahead,
+            [k.hex() for k in keys],
+        ]
+        return hashlib.sha256(
+            json.dumps(data, separators=(",", ":")).encode()
+        ).hexdigest()
+
+    def evidence(self, unit: Unit, reason: str) -> dict:
+        return {
+            "version": 1,
+            "reason": reason,
+            "content": self.evidence_identity(
+                unit.uid, unit.keys, unit.boundary_position, unit.ahead_position
+            ),
+        }
+
+    def valid_evidence(self, unit: Unit, evidence: Any) -> bool:
+        return (
+            isinstance(evidence, dict)
+            and evidence.get("version") == 1
+            and evidence.get("reason")
+            in ("distinct_successors", "other_successor", "short_tail_junction")
+            and evidence == self.evidence(unit, evidence["reason"])
+        )
+
+    def confirmed(self, unit: Unit) -> bool:
+        if not self.evidence_enabled:
+            return bool(unit.retention.get("branch") or unit.retention.get("junction"))
+        evidence = unit.retention.get("evidence")
+        if self.valid_evidence(unit, evidence):
+            assert isinstance(evidence, dict)
+            assert unit.parent is not None
+            self.reasons.setdefault(unit.parent, evidence["reason"])
+            return True
+        return False
+
+    def offer_evidence(self, unit: Unit, data: dict) -> None:
+        # Successful registration is the only offer merge point. Preserve the
+        # previous request_length/resend/identity when reusing an existing UID.
+        evidence = data.get("evidence")
+        if self.valid_evidence(unit, evidence) and not self.valid_evidence(
+            unit, unit.retention.get("evidence")
+        ):
+            assert isinstance(evidence, dict)
+            unit.retention["evidence"] = dict(evidence)
+
+    def successor_reason(
+        self, main: list[OffloadKey], depth: int, own_next: OffloadKey | None
+    ) -> str | None:
+        self.refresh()
+        node = self.root
+        for key in main[:depth]:
+            child = node.children.get(key)
+            if child is None:
+                return None
+            node = child
+        if any(key != own_next for key in node.children):
+            return "short_tail_junction" if own_next is None else "other_successor"
+        return None
+
     def reset(self) -> None:
         self.root = Prefix()
+        self.reasons.clear()
         self.nodes.clear()
         self.variants.clear()
         self.branches.clear()
@@ -114,6 +190,10 @@ class LatestCheckpoints:
                 del self.variants[uid]
         live_b = {u.parent for u in self.variants.values()}
         self.branches.intersection_update(live_b)
+        if self.evidence_enabled:
+            self.reasons = {
+                uid: reason for uid, reason in self.reasons.items() if uid in live_b
+            }
         for uid in tuple(self.nodes):
             if uid not in live_b:
                 self.nodes[uid].boundary = None
@@ -162,6 +242,8 @@ class LatestCheckpoints:
             ancestor = node.boundary or nearest[node]
             if len(node.children) > 1 and ancestor is not None:
                 self.branches.add(ancestor)
+                if self.evidence_enabled:
+                    self.reasons.setdefault(ancestor, "distinct_successors")
             witnesses = [self.variants[v] for v in node.variants]
             prior = chain_tips[node]
             if prior is not None:
@@ -209,10 +291,28 @@ class LatestCheckpoints:
                 self.pending[boundary] = tip.uid
         for uid in self.branches:
             b = self.units.units.get(uid)
+            if b is None and self.evidence_enabled and store is not None:
+                # Restore metadata, never payload, to publish a newly proven
+                # reason for a disk-only boundary through the same SSD owner.
+                for variant in tuple(self.variants.values()):
+                    if variant.parent == uid and variant.uid in store.manifests:
+                        store._restore(
+                            store.manifests[variant.uid],
+                            store.manifest_paths[variant.uid],
+                        )
+                b = self.units.units.get(uid)
             if b is not None:
                 for v in b.variants:
                     variant = self.units.units[v]
-                    if not variant.retention.get("branch"):
+                    if self.evidence_enabled:
+                        if not self.valid_evidence(
+                            variant, variant.retention.get("evidence")
+                        ):
+                            variant.retention["evidence"] = self.evidence(
+                                variant, self.reasons[uid]
+                            )
+                            self.units.on_event("retention", variant)
+                    elif not variant.retention.get("branch"):
                         variant.retention["branch"] = True
                         self.units.on_event("retention", variant)
         self.dirty = False

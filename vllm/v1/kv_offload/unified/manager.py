@@ -73,6 +73,11 @@ class UnifiedStoreManager(OffloadingManager):
         self.latest_only = bool(
             settings is not None and settings.enabled and settings.latest_only
         )
+        self.enable_junction_evidence = bool(
+            self.latest_only
+            and settings is not None
+            and settings.enable_junction_evidence
+        )
         self.superseded_keep_ssd = bool(
             self.latest_only and settings is not None and settings.superseded_keep_ssd
         )
@@ -169,6 +174,8 @@ class UnifiedStoreManager(OffloadingManager):
 
             self.retention = LatestCheckpoints(self, self.superseded_keep_ssd)
             self.units.on_event = self.retention.event
+            if self.enable_junction_evidence:
+                self.units.on_retention_offer = self.retention.offer_evidence
         for handle in tuple(self.table.index.values()):
             page = self.table.get(handle)
             if page.state == PageState.READY:

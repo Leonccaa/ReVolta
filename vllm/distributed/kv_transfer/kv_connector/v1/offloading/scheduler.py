@@ -2613,6 +2613,39 @@ class OffloadingConnectorScheduler:
                             "junction": boundary == junction
                             and (junction < prompt_end or not identical),
                         }
+                    if unified.latest_only and unified.enable_junction_evidence:
+                        # Capture is a hint; only a different registered successor
+                        # (or a conservative short tail) grants permanent retention.
+                        retention["junction"] = boundary == junction
+                        if boundary == junction and not identical:
+                            next_hash = chain(self.host_kv_hits.rule, boundary // span)
+                            own_next = (
+                                None
+                                if next_hash is None
+                                else make_offload_key(next_hash, main_group)
+                            )
+                            reason = unified.retention.successor_reason(
+                                main, boundary // span, own_next
+                            )
+                            if reason is not None:
+                                evidence_keys = tuple(
+                                    dict.fromkeys(
+                                        (
+                                            *unified.units.units[uid].keys,
+                                            *main[: ahead // span],
+                                        )
+                                    )
+                                )
+                                retention["evidence"] = {
+                                    "version": 1,
+                                    "reason": reason,
+                                    "content": unified.retention.evidence_identity(
+                                        UnitId(h_b, unified.units.reset_epoch, h_a),
+                                        evidence_keys,
+                                        boundary,
+                                        ahead,
+                                    ),
+                                }
                     unified.offer_variant(
                         req_id,
                         VariantOffer(

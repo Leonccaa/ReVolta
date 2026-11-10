@@ -181,7 +181,8 @@ def test_legacy_branch_metadata_keeps_legacy_resend_fallback(tmp_path):
         reader.ssd.close(io_grace_s=5)
 
 
-def test_junction_update_through_real_connector_metadata_entry():
+@pytest.mark.parametrize("evidence", [False, True])
+def test_junction_update_through_real_connector_metadata_entry(evidence):
     from tests.v1.kv_connector.unit.offloading_connector.test_unified_lifecycle import (
         SPAN,
         advance,
@@ -191,6 +192,12 @@ def test_junction_update_through_real_connector_metadata_entry():
     from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 
     scheduler = scheduler_with_connector()
+    m = scheduler.connector.connector_scheduler.unified
+    m.enable_junction_evidence = evidence
+    m.retention.evidence_enabled = evidence
+    m.units.on_retention_offer = (
+        m.retention.offer_evidence if evidence else lambda unit, data: None
+    )
     (producer,) = make_requests(1, 8 * SPAN, 16, tag="junction-producer")
     scheduler.add_request(producer)
     connector = scheduler.connector.connector_scheduler
@@ -219,7 +226,8 @@ def test_junction_update_through_real_connector_metadata_entry():
     connector.build_connector_meta(output)
     assert variant.retention.get("junction") is True
     m.retention.refresh()
-    assert variant.parent in m.retention.branches
+    assert (variant.parent in m.retention.branches) is not evidence
+    # This synthetic capture sees only its own child: it remains a hint.
 
 
 def test_branch_resend_manifest_survives_other_branch_growth(tmp_path):

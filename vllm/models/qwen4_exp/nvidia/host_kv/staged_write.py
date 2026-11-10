@@ -113,7 +113,7 @@ def plan_write(
         size = count * row_bytes
         if offset == 0 and count == kbs:
             copy = Copy2D(packed * row_bytes, destination, 2 * size)
-            # Merge arithmetic destination strides, including unordered page bindings.
+            # Coalesce the fixed subpage pitch to keep every 2D pitch bounded.
             if copies and copies[-1].height >= 1 and copies[-1].width == copy.width:
                 prev = copies[-1]
                 sp = (
@@ -126,7 +126,7 @@ def plan_write(
                 )
                 if (
                     sp == copy.width
-                    and dp >= copy.width
+                    and dp == subpage_stride
                     and copy.source == prev.source + prev.height * sp
                     and copy.destination == prev.destination + prev.height * dp
                 ):

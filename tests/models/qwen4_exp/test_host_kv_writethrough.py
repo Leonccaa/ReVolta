@@ -106,6 +106,11 @@ def test_descriptors_merge_by_subpage_and_have_no_token_calls():
     assert len(plan.copies) == 2
     assert [copy.height for copy in plan.copies] == [3, 3]
     assert all(copy.width == 256 for copy in plan.copies)
+    # A last full subpage followed by a far physical page stays two 1D copies.
+    far = plan_write(list(range(40, 56)), [0, 1, 1 << 20], 3, 8, 16, 8192, 512, 128)
+    assert len(far.copies) == 2
+    assert all(copy.height == 1 for copy in far.copies)
+
     with pytest.raises(ValueError, match="Duplicate"):
         plan_write([24, 24], [0, 1], 3, 8, 16, 8192, 512, 128)
 
@@ -158,32 +163,35 @@ def test_cpu_block_mirror_append_overwrite_and_padding():
 
 
 def test_mixed_batch_stages_prefill_and_keeps_decode_uva():
-    shape = HostHistoryShape(
-        num_blocks=4,
-        kernel_blocks_per_block=1,
-        kernel_block_tokens=8,
-        num_layers=1,
-        kv_heads=1,
-        head_dim=16,
-        dtype=torch.uint8,
-        hot_slots=32,
-        max_requests=2,
-        selection_width=4,
-        max_write_rows=8,
-        row_groups=2,
-    )
-    stores = [
-        HostHistoryStore(replace(shape, staged_writethrough=flag), ["a"], device="cpu")
-        for flag in (False, True)
-    ]
-    try:
-        slots = torch.tensor([8, 9, 16, 17, -1], dtype=torch.int64)
-        key = torch.arange(80).reshape(5, 1, 16).to(torch.uint8)
-        stores[1].prepare_write([-1, -1, 16, 17, -1])
-        for store in stores:
-            store.layers[0].write_encoded(key, key, slots)
-        assert torch.equal(stores[0].host, stores[1].host)
-        assert torch.equal(stores[0].ready, stores[1].ready)
-    finally:
-        for store in stores:
-            store.close()
+    for dim in (8, 16):
+        shape = HostHistoryShape(
+            num_blocks=4,
+            kernel_blocks_per_block=1,
+            kernel_block_tokens=8,
+            num_layers=1,
+            kv_heads=1,
+            head_dim=dim,
+            dtype=torch.uint8,
+            hot_slots=32,
+            max_requests=2,
+            selection_width=4,
+            max_write_rows=8,
+            row_groups=2,
+        )
+        stores = [
+            HostHistoryStore(
+                replace(shape, staged_writethrough=flag), ["a"], device="cpu"
+            )
+            for flag in (False, True)
+        ]
+        try:
+            slots = torch.tensor([8, 9, 16, 17, -1], dtype=torch.int64)
+            key = torch.arange(5 * dim).reshape(5, 1, dim).to(torch.uint8)
+            stores[1].prepare_write([-1, -1, 16, 17, -1])
+            for store in stores:
+                store.layers[0].write_encoded(key, key, slots)
+            assert torch.equal(stores[0].host, stores[1].host)
+            assert torch.equal(stores[0].ready, stores[1].ready)
+        finally:
+            for store in stores:
+                store.close()

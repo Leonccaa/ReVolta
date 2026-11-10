@@ -957,15 +957,18 @@ class HostHistoryLayer:
         if plan is not None:
             if n > len(plan.targets):
                 raise ValueError("Write rows exceed the step plan")
-            hk.stage_slots[(n,)](
-                key, value, slot_mapping, self.host_device, self.hot,
-                store.write_stage, store.write_targets,
-                self.group_to_slot, store.page_of,
-                key.stride(0), key.stride(1), value.stride(0), value.stride(1),
-                *self.host_view.stride()[:5], s.kernel_blocks_per_block,
-                s.kernel_block_tokens, s.kv_heads, s.head_dim,
-                triton.next_power_of_2(s.kv_heads * s.head_dim),
-            )  # fmt: skip
+            if self._word_writer_eligible(key, value):
+                self._write_words(key, value, slot_mapping, staged=True)
+            else:
+                hk.stage_slots[(n,)](
+                    key, value, slot_mapping, self.host_device, self.hot,
+                    store.write_stage, store.write_targets,
+                    self.group_to_slot, store.page_of,
+                    key.stride(0), key.stride(1), value.stride(0), value.stride(1),
+                    *self.host_view.stride()[:5], s.kernel_blocks_per_block,
+                    s.kernel_block_tokens, s.kv_heads, s.head_dim,
+                    triton.next_power_of_2(s.kv_heads * s.head_dim),
+                )  # fmt: skip
             assert store.write_stage is not None
             if store.device.type == "cuda":
                 from .staged_write import submit
@@ -992,21 +995,7 @@ class HostHistoryLayer:
                             copy.width,
                         )
         elif s.staged_writethrough and self._word_writer_eligible(key, value):
-            words = s.kv_heads * s.head_dim * s.dtype.itemsize // 8
-            rows = max(1, 256 // triton.next_power_of_2(words))
-            word_strides = tuple(
-                stride * s.dtype.itemsize // 8 for stride in self.host_view.stride()[:4]
-            )
-            hk.write_slots_vector[(triton.cdiv(n, rows),)](
-                key.view(torch.int64), value.view(torch.int64), slot_mapping,
-                self.host_device.view(torch.int64), self.hot.view(torch.int64),
-                self.group_to_slot, store.page_of, n,
-                key.stride(0) * s.dtype.itemsize // 8,
-                value.stride(0) * s.dtype.itemsize // 8,
-                *word_strides,
-                s.kernel_blocks_per_block, s.kernel_block_tokens, words,
-                triton.next_power_of_2(words), rows,
-            )  # fmt: skip
+            self._write_words(key, value, slot_mapping, staged=False)
         else:
             hk.write_slots[(n,)](
                 key, value, slot_mapping, self.host_device, self.hot,
@@ -1025,6 +1014,35 @@ class HostHistoryLayer:
             n,
             256,
         )
+
+    def _write_words(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        slots: torch.Tensor,
+        *,
+        staged: bool,
+    ) -> None:
+        """Use one word kernel for staged prefill and mixed/pure decode UVA."""
+        store, s = self.store, self.store.shape
+        assert store.write_stage is not None and store.write_targets is not None
+        n = slots.shape[0]
+        words = s.kv_heads * s.head_dim * s.dtype.itemsize // 8
+        rows = max(1, 256 // triton.next_power_of_2(words))
+        word_strides = tuple(
+            stride * s.dtype.itemsize // 8 for stride in self.host_view.stride()[:4]
+        )
+        hk.write_slots_vector[(triton.cdiv(n, rows),)](
+            key.view(torch.int64), value.view(torch.int64), slots,
+            self.host_device.view(torch.int64), self.hot.view(torch.int64),
+            store.write_stage.view(torch.int64), store.write_targets,
+            self.group_to_slot, store.page_of, n,
+            key.stride(0) * s.dtype.itemsize // 8,
+            value.stride(0) * s.dtype.itemsize // 8,
+            *word_strides,
+            s.kernel_blocks_per_block, s.kernel_block_tokens, words,
+            triton.next_power_of_2(words), rows, staged,
+        )  # fmt: skip
 
     def _word_writer_eligible(self, key: torch.Tensor, value: torch.Tensor) -> bool:
         """The vector kernel needs contiguous heads and 16-byte aligned rows."""

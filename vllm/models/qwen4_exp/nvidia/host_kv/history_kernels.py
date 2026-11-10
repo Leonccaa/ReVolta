@@ -157,6 +157,8 @@ def write_slots_vector(
     Slot,
     Host,
     Hot,
+    Stage,
+    Targets,
     Map,
     PageOf,
     N,
@@ -171,6 +173,7 @@ def write_slots_vector(
     W: tl.constexpr,
     WB: tl.constexpr,
     ROWS: tl.constexpr,
+    STAGED: tl.constexpr,
 ):
     """All strides and W are in 8-byte words. One program = ROWS rows."""
     r = (tl.program_id(0) * ROWS + tl.arange(0, ROWS)).to(tl.int64)
@@ -189,8 +192,18 @@ def write_slots_vector(
     value = tl.load(V + src_v[:, None] + x[None, :], lane, 0)
     base = page * HS0 + (kb % RATIO) * HSS + off * HS2
     base = tl.multiple_of(base, 2)
-    tl.store(Host + base[:, None] + x[None, :], key, lane)
-    tl.store(Host + (base + HS1)[:, None] + x[None, :], value, lane)
+    host_lane = lane
+    if STAGED:
+        k_target = tl.load(Targets + r * 2, rmask, -1).to(tl.int64)
+        v_target = tl.load(Targets + r * 2 + 1, rmask, -1).to(tl.int64)
+        staged = k_target >= 0
+        stage_k = tl.multiple_of(k_target * W, 2)
+        stage_v = tl.multiple_of(v_target * W, 2)
+        tl.store(Stage + stage_k[:, None] + x[None, :], key, lane & staged[:, None])
+        tl.store(Stage + stage_v[:, None] + x[None, :], value, lane & staged[:, None])
+        host_lane = lane & ~staged[:, None]
+    tl.store(Host + base[:, None] + x[None, :], key, host_lane)
+    tl.store(Host + (base + HS1)[:, None] + x[None, :], value, host_lane)
     hot_slot = tl.load(Map + kb * (KBS // 4) + off // 4, valid, -1).to(tl.int64)
     hot = tl.multiple_of(hot_slot * (8 * W) + (off % 4) * W, 2)
     hmask = lane & (hot_slot >= 0)[:, None]

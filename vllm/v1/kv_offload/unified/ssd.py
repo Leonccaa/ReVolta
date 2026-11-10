@@ -112,6 +112,7 @@ class UnitSsdStore:
         self.single_claims: dict[int, str] = {}
         self.retired_manifests: set[str] = set()
         self.due: dict[UnitId, float] = {}
+        self.filtered_variants: set[UnitId] = set()
         self._due_heap: list[tuple[float, int, UnitId]] = []
         self._due_sequence = 0
         self._manifest_sizes: dict[UnitId, tuple[int, int]] = {}
@@ -270,6 +271,7 @@ class UnitSsdStore:
         return cached[1]
 
     def schedule(self, unit: Unit, when: float) -> None:
+        self.filtered_variants.discard(unit.uid)
         self.due[unit.uid] = when
         self._due_sequence += 1
         heappush(self._due_heap, (when, self._due_sequence, unit.uid))
@@ -334,6 +336,7 @@ class UnitSsdStore:
         if event == "register":
             self.schedule(unit, self.ssd.clock() + self.ssd.options["write_delay_s"])
         elif event == "revoke":
+            self.filtered_variants.discard(unit.uid)
             self.due.pop(unit.uid, None)
             self._manifest_sizes.pop(unit.uid, None)
             self._manifest_names.pop(unit.uid, None)
@@ -1176,6 +1179,7 @@ class UnitSsdStore:
         self.manifest_refs.clear()
         self.files.clear()
         self.due.clear()
+        self.filtered_variants.clear()
         self._due_heap.clear()
         self._manifest_sizes.clear()
         self._manifest_names.clear()
@@ -1207,26 +1211,142 @@ class UnitSsdStore:
             p.handle: self.dirty_since.get(p.handle, now) for p in dirty_pages
         }
         dirty_by_kind: Counter[str] = Counter()
+        categories = (
+            "inflight_io",
+            "ready_queued_due",
+            "ready_queued_not_due",
+            "ready_unreferenced",
+            "ready_filtered",
+            "ready_unqueued",
+            "private",
+            "shadow",
+            "other_unwritable",
+        )
+        classified: dict[str, int | float] = {
+            f"dirty_{category}_{metric}": 0
+            for category in categories
+            for metric in ("bytes", "oldest_age_s")
+        }
+        # Snapshot-only joins: deduplicate physical handles and ignore marked
+        # queue entries. No classification scan runs in the scheduler step.
+        queued: dict[PageHandle, float] = {}
+        queue = self.ssd._queue
+        for batch in queue._batches:
+            for handle in batch.keys:
+                if handle not in queue._drops:
+                    queued[handle] = min(queued.get(handle, batch.due), batch.due)
+        for handle in self.ssd._deferred:
+            queued[handle] = now
+        writable_oldest = 0.0
+        writable_bytes = 0
         for page in dirty_pages:
             dirty_by_kind[f"dirty_{page.kind.value}_bytes"] += self.ssd.page_bytes
+            age = max(0.0, now - self.dirty_since[page.handle])
+            component = self.units.components.get(page.key)
+            variants = (
+                set()
+                if component is None
+                else {uid for uid in component.refs if uid.ahead is not None}
+            )
+            due = [self.due[uid] for uid in variants if uid in self.due]
+            due.extend(
+                txn.started
+                for uid in variants
+                if (txn := self.writes.get(uid)) is not None and not txn.failed
+            )
+            # With no variant, the ordinary single-page writer consumes the
+            # queue. Variant pages require an eligible transaction instead.
+            if not variants and page.handle in queued:
+                due.append(queued[page.handle])
+            eligible = bool(due) and (bool(variants) or page.handle not in queue._drops)
+            inflight = bool(
+                page.io
+                or page.ticket is not None
+                or page.handle.page_id in self.ssd._page_jobs
+            )
+            writable = not inflight and self.ssd._writable(page)
+            if inflight:
+                category = "inflight_io"
+            elif not writable:
+                category = (
+                    page.state.value
+                    if page.state in (PageState.PRIVATE, PageState.SHADOW)
+                    else "other_unwritable"
+                )
+            elif not eligible and (
+                page.handle in queue._drops
+                or variants
+                and variants <= self.filtered_variants
+            ):
+                category = "ready_filtered"
+            elif not variants:
+                category = "ready_unreferenced"
+            elif eligible:
+                category = (
+                    "ready_queued_due" if min(due) <= now else "ready_queued_not_due"
+                )
+            else:
+                category = "ready_unqueued"
+            classified[f"dirty_{category}_bytes"] += self.ssd.page_bytes
+            oldest_key = f"dirty_{category}_oldest_age_s"
+            classified[oldest_key] = max(classified[oldest_key], age)
+            if eligible and writable:
+                writable_bytes += self.ssd.page_bytes
+                writable_oldest = max(writable_oldest, age)
         referenced = {self.path(k) for k in recoverable} | set(
             self.manifest_paths.values()
         )
         pages = tuple(self.cache._pages.items())
+        current_roots = tuple(
+            path + os.sep
+            for path in (
+                f"{self.ssd._tier.file_mapper.base_path}_r"
+                f"{self.ssd._tier.file_mapper.rank}",
+                f"{self.ssd._component_tier.file_mapper.base_path}_r"
+                f"{self.ssd._component_tier.file_mapper.rank}",
+                self.directory,
+            )
+        )
+        orphans: Counter[str] = Counter()
+        for path, size in pages:
+            if path.endswith(".tmp"):
+                orphans["ssd_temporary_bytes"] += size
+            elif path not in referenced:
+                orphans["ssd_orphan_bytes"] += size
+                category = (
+                    "current_namespace_no_manifest"
+                    if path.startswith(current_roots)
+                    else "old_namespace_referenced"
+                    if self.cache._pins.get(path) or path in self.cache._writing
+                    else "old_namespace_zero_ref"
+                )
+                orphans[f"ssd_orphan_{category}_bytes"] += size
         return {
             **self.credit.snapshot(),
             **self.events,
             "manifests": len(self.manifests),
             "recoverable_bytes": len(recoverable) * self.ssd.page_bytes,
             "total_dirty_bytes": len(dirty_pages) * self.ssd.page_bytes,
+            "total_unpersisted_physical_bytes": len(dirty_pages) * self.ssd.page_bytes,
+            "oldest_unpersisted_physical_age_s": now
+            - min(self.dirty_since.values(), default=now),
             "oldest_dirty_age_s": now - min(self.dirty_since.values(), default=now),
+            "writable_dirty_bytes": writable_bytes,
+            "oldest_writable_dirty_age_s": writable_oldest,
+            **classified,
             **dirty_by_kind,
             "ssd_bytes": self.cache._bytes,
             "ssd_reserved_bytes": self.cache._reserved,
-            "ssd_orphan_bytes": sum(
-                n for p, n in pages if p not in referenced and not p.endswith(".tmp")
-            ),
-            "ssd_temporary_bytes": sum(n for p, n in pages if p.endswith(".tmp")),
+            **{
+                key: orphans[key]
+                for key in (
+                    "ssd_orphan_bytes",
+                    "ssd_temporary_bytes",
+                    "ssd_orphan_old_namespace_zero_ref_bytes",
+                    "ssd_orphan_old_namespace_referenced_bytes",
+                    "ssd_orphan_current_namespace_no_manifest_bytes",
+                )
+            },
             "ssd_inflight_write_bytes": self.ssd._inflight_stores * self.ssd.page_bytes,
             "ssd_inflight_read_bytes": self.ssd._inflight_loads * self.ssd.page_bytes,
             "prefetch_budget_bytes": self.read_budget_bytes,

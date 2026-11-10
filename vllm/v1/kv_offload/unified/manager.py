@@ -40,6 +40,7 @@ class Build:
     pending: set[OffloadKey]
     dispatched: set[OffloadKey] = field(default_factory=set)
     failed: bool = False
+    failure_reason: str | None = None
     newly_protected: tuple[PageHandle, ...] = ()
     already_owned: tuple[PageHandle, ...] = ()
 
@@ -97,6 +98,8 @@ class UnifiedStoreManager(OffloadingManager):
         self._latest_variant_offers: dict[str, VariantOffer] = {}
         self._missing_main: dict[str, dict[tuple[UnitId, bytes], set[OffloadKey]]] = {}
         self._waiting_boundaries: dict[UnitId, set[str]] = {}
+        self._draining_variants: set[str] = set()
+        self._draining_main: dict[OffloadKey, PageHandle] = {}
         self.num_stored_blocks = 0
         self.num_evicted_blocks = 0
         self.evicted_blocks_by_reason: Counter[str] = Counter()
@@ -144,6 +147,7 @@ class UnifiedStoreManager(OffloadingManager):
         self.value = UnitValuePolicy(self.table, self.units)
         self.value.on_ready = self._on_ready
         self.value.on_reset = self._on_table_reset
+        self.value.on_seal_retired = self._on_seal_retired
         reclaim = pool._reclaim_cached_page if pool.elastic else lambda: False
         self.ledger = HostReservationLedger(self.table, reclaim)
         self.ledger.build_frames_per_request = self.build_frames_per_request
@@ -174,6 +178,23 @@ class UnifiedStoreManager(OffloadingManager):
         if group not in self.kind_by_group:
             raise ValueError("Component key is outside the unified support matrix")
         return self.kind_by_group[group]
+
+    def component_available(self, key: OffloadKey) -> bool:
+        """READY or already dispatched; never a promise to read an old source."""
+        pending = self.pending.get(key)
+        return self.is_ready_resident(key) or (
+            pending is not None
+            and key in self._dispatched
+            and self.table.get(pending[0]).valid
+            and (pending[1] is None or not pending[1].failed)
+        )
+
+    def _fail_build(self, build: Build, reason: str) -> None:
+        build.failed = True
+        if build.failure_reason is None:
+            build.failure_reason = reason
+            self.units.events[f"build_failed_{reason}"] += 1
+        self.units.revoke(build.uid, build.gen, "build_failed")
 
     def begin_boundary(
         self, req_id: str, boundary: bytes, keys: Iterable[OffloadKey]
@@ -281,21 +302,23 @@ class UnifiedStoreManager(OffloadingManager):
         if build.pending:
             return
         if build.failed:
-            self.units.revoke(build.uid, build.gen, "build_failed")
+            self._fail_build(build, build.failure_reason or "finish_union_incomplete")
         elif not self.units.finish(build.uid, build.gen):
-            build.failed = True
-            self.units.revoke(build.uid, build.gen, "build_failed")
+            self._fail_build(build, "finish_union_incomplete")
         for h in build.handles.values():
             self.table.release(h, id(build))
         self.builds.pop((build.uid, build.gen), None)
         for req_id in tuple(self._waiting_boundaries.get(build.uid, ())):
             self.retry_variants(req_id)
 
-    def _component_retired(self, key: OffloadKey, ok: bool) -> None:
+    def _component_retired(
+        self, key: OffloadKey, ok: bool, reason: str = "finish_union_incomplete"
+    ) -> None:
         for identity in self.dependents.pop(key, ()):
             build = self.builds.get(identity)
             if build is not None:
-                build.failed |= not ok
+                if not ok:
+                    self._fail_build(build, reason)
                 build.pending.discard(key)
                 self._finish_build(build)
 
@@ -305,12 +328,11 @@ class UnifiedStoreManager(OffloadingManager):
         for build in tuple(self.builds.values()):
             absent = build.pending - build.dispatched
             if absent:
-                build.failed = True
-                self.units.revoke(build.uid, build.gen, "build_failed")
+                self._fail_build(build, "source_not_dispatched")
                 for key in absent:
                     self.pending.pop(key, None)
                     self.table.invalidate(build.handles[key])
-                    self._component_retired(key, False)
+                    self._component_retired(key, False, "source_not_dispatched")
 
     def _unindex_waiter(self, req_id: str) -> None:
         for key in self._wait_keys.pop(req_id, ()):
@@ -347,7 +369,11 @@ class UnifiedStoreManager(OffloadingManager):
                 self._index_waiter(req_id)
 
     def clear_waiter(self, req_id: str) -> None:
+        prior_keys = self._wait_keys.get(req_id, set()).copy()
         self._unindex_waiter(req_id)
+        for key in prior_keys:
+            if key not in self.waiting_on:
+                self._draining_main.pop(key, None)
         self._missing_main.pop(req_id, None)
         boundaries = {uid for uid, _ in self.waiting.pop(req_id, {})}
         for uid in boundaries:
@@ -355,6 +381,25 @@ class UnifiedStoreManager(OffloadingManager):
             waiters.discard(req_id)
             if not waiters:
                 del self._waiting_boundaries[uid]
+        self._draining_variants.discard(req_id)
+
+    def _on_seal_retired(self, key: OffloadKey) -> None:
+        self._draining_main.pop(key, None)
+        for req_id in tuple(self.waiting_on.get(key, ())):
+            if req_id in self._draining_variants:
+                self.retry_variants(req_id)
+
+    def _can_drain(self, offer: VariantOffer) -> bool:
+        b = self.units.units.get(offer.boundary)
+        if b is None or b.gen != offer.gen:
+            return False
+        if not b.complete and (b.uid, b.gen) not in self.builds:
+            return False
+        return all(
+            k in self._draining_main
+            and self.table.get(self._draining_main[k]).ticket is not None
+            for k in self._missing_keys(offer)
+        )
 
     def _missing_keys(self, offer: VariantOffer) -> set[OffloadKey]:
         return {
@@ -400,6 +445,13 @@ class UnifiedStoreManager(OffloadingManager):
         offers = self.waiting.get(req_id, {})
         for key, offer in tuple(offers.items()):
             b = self.units.units.get(offer.boundary)
+            if b is None:
+                self.units.events["variant_b_absent_terminal"] += 1
+                self.units.events["variant_b_missing"] += 1
+            if req_id in self._draining_variants and not self._can_drain(offer):
+                self.events["variant_finish_incomplete"] += 1
+                self._remove_offer(req_id, key)
+                continue
             if (
                 b is None
                 or b.gen != offer.gen
@@ -424,7 +476,20 @@ class UnifiedStoreManager(OffloadingManager):
     def on_request_finished(self, req_context: ReqContext) -> None:
         # Normal end: accepted stores are allowed to publish after completion.
         # Only unused credit is returned now; accepted DMA moves to DRAINING.
-        self.clear_waiter(req_context.req_id)
+        req_id = req_context.req_id
+        # Retain only offers whose remaining inputs have already been accepted.
+        # Seal tickets name exact physical incarnations, without retaining GPU IDs.
+        if self.waiting.get(req_id):
+            missing = set().union(*self._missing_main[req_id].values())
+            for page in self.table.pages[1:]:
+                if (
+                    page.valid
+                    and page.ticket is not None
+                    and page.ticket.key in missing
+                ):
+                    self._draining_main[page.ticket.key] = page.handle
+            self._draining_variants.add(req_id)
+            self.retry_variants(req_id)
         self._latest_variant_offers.pop(req_context.req_id, None)
         self.release_lookup(req_context.req_id)
         self.end_step()
@@ -432,14 +497,13 @@ class UnifiedStoreManager(OffloadingManager):
         if self.ssd is not None:
             self.ssd.cancel(req_context.req_id)
 
-    def cancel_request(self, req_id: str) -> None:
+    def cancel_request(self, req_id: str, reason: str = "cancel") -> None:
         self.clear_waiter(req_id)
         self._latest_variant_offers.pop(req_id, None)
         self.release_lookup(req_id)
         for b in tuple(self.builds.values()):
             if b.req_id == req_id:
-                b.failed = True
-                self.units.revoke(b.uid, b.gen, "build_failed")
+                self._fail_build(b, reason)
         self.end_step()
         self.ledger.finish(req_id)
         if self.ssd is not None:
@@ -636,7 +700,9 @@ class UnifiedStoreManager(OffloadingManager):
                 del self.pending[k]
                 self._dispatched.discard(k)
             self.table.finish_io(h, gen)
-            self._component_retired(k, ok)
+            self._component_retired(
+                k, ok, "dma_failed_mask" if not success else "finish_union_incomplete"
+            )
 
     def complete_store(
         self,
@@ -703,8 +769,11 @@ class UnifiedStoreManager(OffloadingManager):
                 store.credit.supersede(variants, target)
                 for uid in variants:
                     store.due.pop(uid, None)
+                    store.filtered_variants.add(uid)
 
     def _on_table_reset(self) -> None:
+        self._draining_variants.clear()
+        self._draining_main.clear()
         self._latest_variant_offers.clear()
         for req_id in tuple(self._lookup_holds):
             self.release_lookup(req_id)
@@ -714,14 +783,16 @@ class UnifiedStoreManager(OffloadingManager):
         self._missing_main.clear()
         self._waiting_boundaries.clear()
         for build in self.builds.values():
-            build.failed = True
+            self._fail_build(build, "reset")
 
     def reset_cache(self) -> None:
+        self._draining_variants.clear()
+        self._draining_main.clear()
         self._latest_variant_offers.clear()
         for req_id in tuple(self._lookup_holds):
             self.release_lookup(req_id)
         for b in tuple(self.builds.values()):
-            b.failed = True
+            self._fail_build(b, "reset")
         self.waiting.clear()
         self.waiting_on.clear()
         self._wait_keys.clear()
@@ -807,6 +878,11 @@ class UnifiedStoreManager(OffloadingManager):
                 len(h) for h in self._lookup_holds.values()
             ),
             "physical_charges": len(self.ledger.charges),
+            "variant_registration_draining_requests": len(self._draining_variants),
+            "variant_registration_draining_offers": sum(
+                len(self.waiting.get(req_id, ())) for req_id in self._draining_variants
+            ),
+            "variant_registration_draining_main": len(self._draining_main),
             "value_work_max": self.value.work_max,
             **(self.bytes + self.table.dma_bytes),
             **(

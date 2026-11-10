@@ -3410,7 +3410,24 @@ class Scheduler(SchedulerInterface):
             store_stats=self._export_store_stats(),
         )
 
-    def _export_store_stats(self):
+    def get_idle_stats(self) -> tuple[SchedulerStats | None, float | None]:
+        metrics = self.store_metrics
+        if metrics is None:
+            return None, None
+        payload = self._export_store_stats(idle=True)
+        stats = None
+        if payload is not None:
+            # Do not drain step-owned prefix, eviction or connector statistics.
+            stats = SchedulerStats(
+                num_running_reqs=len(self.running),
+                num_waiting_reqs=len(self.waiting),
+                num_skipped_waiting_reqs=len(self.skipped_waiting),
+                kv_cache_usage=self.kv_cache_manager.usage,
+                store_stats=payload,
+            )
+        return stats, max(0.0, metrics.next_export - time.monotonic())
+
+    def _export_store_stats(self, *, idle: bool = False):
         metrics = getattr(self, "store_metrics", None)
         if metrics is None:
             return None
@@ -3425,6 +3442,7 @@ class Scheduler(SchedulerInterface):
             arbiter=self.value_arbiter,
             manager=getattr(offload, "manager", None),
             ledger=self.kv_cache_manager.admission_ledger,
+            idle=idle,
         )
 
     def _observe_rejection_fallbacks(

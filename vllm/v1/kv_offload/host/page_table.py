@@ -108,6 +108,7 @@ class HostPage:
 
 
 class PageValuePolicy(Protocol):
+    def on_seal_retired(self, key: OffloadKey) -> None: ...
     def refresh(self, page: HostPage) -> None: ...
     def published(self, page: HostPage) -> None: ...
     def lost(self, page: HostPage) -> None: ...
@@ -639,6 +640,8 @@ class HostPageTable:
         self._refresh(page)
         if page.compute_result == Result.OK and page.seal_result == Result.OK:
             self.publish(ticket.handle, ticket.key)
+        if self.value_policy is not None:
+            self.value_policy.on_seal_retired(ticket.key)
         self.collect()
         return True
 

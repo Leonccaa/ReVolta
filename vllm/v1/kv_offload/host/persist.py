@@ -582,7 +582,9 @@ class HostPageSsd:
 
     def on_published(self, handle: PageHandle) -> None:
         if self.unit_store is not None:
-            self.unit_store.dirty_since.setdefault(handle, self.clock())
+            # A PRIVATE frame may already have appeared in a snapshot. Its
+            # writable wait starts at publication, not private allocation.
+            self.unit_store.dirty_since[handle] = self.clock()
         if self.enabled and not self._flushing:
             self._queue.enqueue([handle], self._ctx)
 

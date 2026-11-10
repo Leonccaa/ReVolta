@@ -19,6 +19,7 @@ class UnitValuePolicy:
         self.work_max = 0
         self.on_ready: Callable[[OffloadKey], None] = lambda key: None
         self.on_reset: Callable[[], None] = lambda: None
+        self.on_seal_retired: Callable[[OffloadKey], None] = lambda key: None
         table.value_policy = self
 
     def _valid(self, entry: tuple[int, int, int, int, int]) -> bool:

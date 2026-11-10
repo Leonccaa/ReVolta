@@ -2417,6 +2417,12 @@ class OffloadingConnectorScheduler:
         span = plan.geometry.block_tokens
         main_group = self.kv_cache_config.host_kv_group_id
         assert main_group is not None
+        # Preview the same block mirror that _build_store_jobs will consume.
+        # Do not advance its frontiers or retain any GPU source beyond this step.
+        block_updates = {
+            rid: (groups, resumed)
+            for rid, groups, resumed in yield_req_data(scheduler_output)
+        }
         for req_id, status in self._req_status.items():
             boundaries = {entry[2] for entry in status.pending_boundary_offloads}
             # A request can reuse B from an earlier request and publish a new
@@ -2433,6 +2439,19 @@ class OffloadingConnectorScheduler:
             if not boundaries:
                 continue
             status.update_offload_keys()
+            cap = min(
+                status.req.num_computed_tokens
+                + scheduler_output.num_scheduled_tokens.get(req_id, 0),
+                status.req.num_tokens,
+            )
+            if status.max_offload_tokens is not None:
+                cap = min(cap, status.max_offload_tokens)
+            if self.config.offload_prompt_only:
+                cap = min(cap, status.req.num_prompt_tokens)
+            handoffs = {
+                (g, b) for g, source, b in status.pending_boundary_offloads if source
+            }
+            groups, resumed = block_updates.get(req_id, (None, False))
             chain = chain_hash_from_request(
                 status.req.block_hashes, self._hash_block_size
             )
@@ -2442,6 +2461,8 @@ class OffloadingConnectorScheduler:
                 if h_b is None:
                     continue
                 components = []
+                sources: set[OffloadKey] = set()
+                inventory_complete = True
                 draft_start = boundary
                 for group in self.config.kv_group_configs:
                     keys = status.group_states[group.group_idx].offload_keys
@@ -2449,6 +2470,14 @@ class OffloadingConnectorScheduler:
                     if group.requires_exact_boundary_source:
                         if 0 < end <= len(keys):
                             components.append(keys[end - 1])
+                            if (
+                                boundary <= cap
+                                and boundary % group.offloaded_block_size == 0
+                                and (group.group_idx, boundary) in handoffs
+                            ):
+                                sources.add(keys[end - 1])
+                        else:
+                            inventory_complete = False
                     elif group.draft_window_tokens is not None:
                         window = group.sliding_window_size_in_blocks
                         assert window is not None
@@ -2457,9 +2486,53 @@ class OffloadingConnectorScheduler:
                             max(0, end - window) * group.offloaded_block_size,
                         )
                         components.extend(keys[max(0, end - window) : end])
+                        inventory_complete &= end <= len(keys)
+                        state = status.group_states[group.group_idx]
+                        ids = [] if resumed else list(state.block_ids)
+                        if groups:
+                            ids.extend(groups[group.group_idx])
+                        factor = self.config.block_size_factor
+                        first_held = self._first_held_draft_block(status, group)
+                        deferred = status.draft_deferred.get(group.group_idx, set())
+                        frontier = max(
+                            status.draft_frontier.get(group.group_idx, 0),
+                            state.next_stored_block_idx,
+                        )
+                        for i in range(max(0, end - window), min(end, len(keys))):
+                            selected = (
+                                i >= state.next_stored_block_idx
+                                if self.config.cpu_draft_offload == "all"
+                                else self.config.cpu_draft_offload == "window"
+                                and (i in deferred or i >= frontier)
+                            )
+                            if (
+                                req_id in block_updates
+                                and selected
+                                and first_held <= i < cap // group.offloaded_block_size
+                                and (
+                                    self.config.cpu_draft_offload != "all"
+                                    or group.alignment_block_count is None
+                                    or i % group.alignment_block_count
+                                    >= group.alignment_block_count - window
+                                )
+                                and (i + 1) * factor <= len(ids)
+                                and ids[(i + 1) * factor - 1] != 0
+                            ):
+                                sources.add(keys[i])
                 uid = UnitId(h_b, unified.units.reset_epoch)
                 existing = unified.units.units.get(uid)
                 if existing is None:
+                    if not inventory_complete or any(
+                        k not in sources and not unified.component_available(k)
+                        for k in components
+                    ):
+                        unified.events[
+                            "junction_host_b_unavailable"
+                            if boundary == junction
+                            else "boundary_source_unavailable"
+                        ] += 1
+                        unified.rejected_step.update(components)
+                        continue
                     build = unified.begin_boundary(req_id, h_b, components)
                     if build is None:
                         unified.rejected_step.update(components)
@@ -2591,7 +2664,7 @@ class OffloadingConnectorScheduler:
         status = self._req_status.get(req_id)
         if status is None:
             return
-        unified.cancel_request(req_id)
+        unified.cancel_request(req_id, reason="preempt")
         self._drop_pending_boundary_offloads(status, "preempted")
         self._drop_draft_deferred(status)
         self._current_batch_jobs_to_flush.update(status.transfer_jobs)
@@ -2631,7 +2704,7 @@ class OffloadingConnectorScheduler:
             self._drop_draft_deferred(req_status)
             unified = getattr(self, "unified", None)
             if unified is not None:
-                unified.cancel_request(req_id)
+                unified.cancel_request(req_id, reason="preempt")
             if not req_status.transfer_jobs:
                 continue
             any_jid = next(iter(req_status.transfer_jobs))

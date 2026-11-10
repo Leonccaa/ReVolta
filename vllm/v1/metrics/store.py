@@ -7,6 +7,7 @@ most once per minute; request state dies with its Request, samples are bounded.
 CPU/SSD residency here does not claim global (GPU-inclusive) serviceability.
 """
 
+import time
 from collections import Counter, deque
 from dataclasses import dataclass, field
 from typing import Any
@@ -315,11 +316,16 @@ class StoreMetrics:
         arbiter: Any = None,
         manager: Any = None,
         ledger: Any = None,
+        idle: bool = False,
     ) -> dict[str, Any] | None:
         if now < self.next_export:
             return None
         self.next_export = now + 60.0
-        gauges: dict[str, float] = {"step_cpu_sample_stride": CPU_SAMPLE_STRIDE}
+        gauges: dict[str, float] = {
+            "step_cpu_sample_stride": CPU_SAMPLE_STRIDE,
+            "store_snapshot_unix_s": time.time(),
+            "store_snapshot_idle": int(idle),
+        }
         totals: dict[str, int] = {}
         if pool is not None:
             table = pool.host_pages

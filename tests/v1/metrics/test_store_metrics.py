@@ -280,3 +280,53 @@ def test_full_external_hit_keeps_mandatory_final_token_replay_in_compute():
     assert m.counters["prompt_tokens_host_load"] == 99
     assert m.counters["prompt_tokens_compute"] == 1
     assert m.counters["prefix_restored_external_hits"] == 100
+
+
+@pytest.mark.parametrize("local_blocks", [0, 2, 4])
+def test_external_prefix_receipt_classifies_actual_main_sources(local_blocks):
+    from tests.v1.core.long_context_kv_utils import SPAN
+    from tests.v1.kv_connector.unit.offloading_connector.test_host_receive_txn import (
+        lookup_allocate,
+        setup_receive,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+        OffloadingWorkerMetadata,
+    )
+    from vllm.v1.core.kv_cache_hit_contract import chain_hash_from_request
+    from vllm.v1.kv_offload.base import make_offload_key
+    from vllm.v1.kv_offload.host.page_table import Result
+    from vllm.v1.outputs import KVConnectorOutput
+
+    scheduler, connector, r, _ = setup_receive(local_blocks=local_blocks)
+    hits = scheduler.kv_cache_manager.host_kv_hits
+    table = scheduler.host_history_pool.host_pages
+    chain = chain_hash_from_request(r.block_hashes, 16)
+    for index in range(local_blocks, 4):
+        h = table.reserve()
+        table.producer_result(h, compute=Result.OK, seal=Result.OK)
+        table.publish(h, make_offload_key(chain(hits.rule, index), hits.rule.group_id))
+    m = connector.store_metrics = StoreMetrics()
+    m.begin_lookup(r)
+    job_id, txn = lookup_allocate(scheduler, connector, r)
+    # The complete multi-group local prefix is zero even with four bound MAINs.
+    m.admit(r, 0, 4 * SPAN, True, 11.0)
+    assert connector._jobs[job_id].metric_attempt is r.store_attempt
+    table.complete_step(2, table.all_ranks)
+    connector.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={job_id: connector.config.num_workers},
+                receive_results={job_id: (table.all_ranks, 0)},
+            )
+        )
+    )
+    assert job_id not in connector._jobs
+    assert r.store_attempt.restored and not r.store_attempt.failed
+    m.first_token(r, 13.0)
+    assert m.counters["prefix_restored_external_hits"] == 4 * SPAN
+    assert m.counters["prompt_tokens_host_reuse"] == local_blocks * SPAN
+    assert m.counters["prompt_tokens_host_load"] == (4 - local_blocks) * SPAN
+    assert m.counters["prompt_tokens_compute"] == r.num_prompt_tokens - 4 * SPAN
+    assert not m.counters["prompt_tokens_gpu"]
+    assert not m.counters["prompt_tokens_ssd"]
+    assert len(txn.new_loads) == 4 - local_blocks

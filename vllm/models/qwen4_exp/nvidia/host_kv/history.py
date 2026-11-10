@@ -396,6 +396,7 @@ class HostHistoryStore:
         region_layout: HostRegionLayout | None = None,
         rank: int = 0,
         value_shadow: bool = False,
+        store_metrics: bool = False,
         hot_views: Sequence[torch.Tensor] | None = None,
     ) -> None:
         shape.validate()
@@ -526,6 +527,11 @@ class HostHistoryStore:
             # None
             # (arbitration off) launches nothing extra.
             self.shadow = None
+            self.hot_metrics = None
+            if store_metrics:
+                from .shadow import HotCacheMetrics
+
+                self.hot_metrics = HotCacheMetrics(device)
             if value_shadow:
                 from .shadow import HotShadowTable
 
@@ -781,6 +787,8 @@ class HostHistoryStore:
         self.wanted.zero_()
         if self.shadow is not None:
             self.shadow.reset()
+        if self.hot_metrics is not None:
+            self.hot_metrics.reset()
         self.ready.zero_()
         self.ready[: s.kernel_blocks_per_block * s.kernel_block_tokens] = 1
         if self.region is not None:
@@ -1012,6 +1020,8 @@ class HostHistoryLayer:
                 debug=store.debug,
             )  # fmt: skip
         shadow = store.shadow if self.index == 0 else None
+        if self.index == 0 and store.hot_metrics is not None:
+            store.hot_metrics.count(store)
         if shadow is not None:
             shadow.check_misses(store, triton.cdiv(m, 256))
         kernels.count_victim_buckets[(store.victim_tiles,)](

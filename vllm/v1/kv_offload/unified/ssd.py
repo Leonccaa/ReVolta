@@ -91,6 +91,7 @@ class PrefetchTxn:
     failed: bool = False
     complete: bool = False
     sources: frozenset[OffloadKey] = frozenset()
+    waiter_sources: dict[str, frozenset[OffloadKey]] = field(default_factory=dict)
     waiter_deadlines: dict[str, float] = field(default_factory=dict)
     borrowed: set[OffloadKey] = field(default_factory=set)
 
@@ -956,6 +957,12 @@ class UnitSsdStore:
                 self.events["prefetch_transaction_draining"] += 1
                 return False
             txn.waiters.add(req_id)
+            txn.waiter_sources.setdefault(
+                req_id,
+                frozenset(
+                    k for k in txn.sources if not self.table.is_ready(txn.handles[k])
+                ),
+            )
             txn.waiter_deadlines.setdefault(
                 req_id,
                 self._prefetch_deadline(
@@ -1039,6 +1046,7 @@ class UnitSsdStore:
         self.prefetches[unit.uid] = txn
         txn.borrowed = borrowed
         txn.sources = frozenset((*missing, *borrowed))
+        txn.waiter_sources[req_id] = txn.sources
         txn.waiter_deadlines[req_id] = self._prefetch_deadline(
             len(missing) + len(borrowed)
         )
@@ -1084,6 +1092,7 @@ class UnitSsdStore:
             for req_id in tuple(txn.waiters):
                 if self.ssd.clock() >= txn.waiter_deadlines[req_id]:
                     txn.waiters.remove(req_id)
+                    txn.waiter_sources.pop(req_id, None)
                     self.requests.get(req_id, set()).discard(txn.uid)
                     self.ssd._expired_rounds.add(req_id)
                     self.events["prefetch_waiter_timeout"] += 1
@@ -1144,6 +1153,7 @@ class UnitSsdStore:
             txn = self.prefetches.get(uid)
             if txn is not None:
                 txn.waiters.discard(req_id)
+                txn.waiter_sources.pop(req_id, None)
                 self.events["prefetch_waiter_cancelled"] += 1
         self.advance_prefetches()
 

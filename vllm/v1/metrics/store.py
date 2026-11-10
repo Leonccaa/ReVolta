@@ -44,6 +44,7 @@ class PrefixAttempt:
     # Disjoint MAIN-token coverage. STATE/DRAFT never add token coverage.
     intervals: list[tuple[int, int, str]] = field(default_factory=list)
     ssd_handles: set[Any] = field(default_factory=set)
+    ssd_intervals: list[tuple[int, int, str]] = field(default_factory=list)
 
 
 def _finish_wait(state: PrefixAttempt, phase: str, now: float) -> None:
@@ -88,6 +89,20 @@ class StoreMetrics:
         self.observations: deque[tuple[str, str, float]] = deque(maxlen=4096)
         self.next_export = 0.0
         self.previous: dict[str, int] = {}
+        self.hot_previous: dict[int, tuple[int, int, int]] = {}
+        self.hot_valid_slots: int | None = None
+
+    def worker_hot(self, reports: dict[int, tuple[int, int, int, int]]) -> None:
+        """Layer 0 cumulative groups summed over ranks; occupancy from rank 0."""
+        for rank, (step, wanted, misses, valid) in reports.items():
+            previous = self.hot_previous.get(rank, (-1, 0, 0))
+            if step <= previous[0]:
+                continue
+            self.counters["gpu_hot_wanted_groups_total"] += wanted - previous[1]
+            self.counters["gpu_hot_miss_groups_total"] += misses - previous[2]
+            self.hot_previous[rank] = (step, wanted, misses)
+            if rank == 0:
+                self.hot_valid_slots = valid
 
     def state(self, request: Any) -> PrefixAttempt:
         state = request.store_attempt
@@ -103,6 +118,9 @@ class StoreMetrics:
                 if state is not None
                 else 0.0,
                 prefetch_start=state.prefetch_start if state is not None else 0.0,
+                ssd_handles=state.ssd_handles.copy()
+                if state is not None and not (state.admitted or state.failed)
+                else set(),
             )
         return state
 
@@ -136,6 +154,52 @@ class StoreMetrics:
     def prefetch_ready(self, request: Any, now: float) -> None:
         state = self.state(request)
         _finish_wait(state, "prefetch", now)
+
+    def prefetched(self, request: Any, ssd: Any, contract: Any, end: int) -> None:
+        """Capture verified request holds before the lookup releases them.
+
+        MAIN pages cover their block, recurrent STATE covers the prefix it
+        restores, and DRAFT covers its required window blocks. Unused pages
+        and pages loaded by an earlier request supply no read lineage.
+        """
+        from vllm.v1.core.kv_cache_hit_contract import (
+            HitNeed,
+            chain_hash_from_request,
+        )
+        from vllm.v1.kv_offload.base import make_offload_key
+
+        state = self.state(request)
+        # Capacity/budget retries stay in the same request lookup episode.
+        # Keep incarnation handles until admission, revalidate and remap them
+        # for each final answer, then discard them on a new admitted attempt.
+        handles = state.ssd_handles | set(ssd.holds(request.request_id))
+        state.ssd_handles = {
+            h
+            for h in handles
+            if ssd.table.pages[h.page_id].handle == h and ssd.table.is_ready(h)
+        }
+        state.ssd_intervals.clear()
+        if not state.ssd_handles or contract is None:
+            return
+        keys = {ssd.table.get(h).key for h in state.ssd_handles}
+        chain = chain_hash_from_request(request.block_hashes, contract.hash_block_size)
+        for rule in contract.rules.values():
+            for index in rule.required_blocks(end):
+                block_hash = chain(rule, index)
+                if block_hash is None:
+                    continue
+                if make_offload_key(block_hash, rule.group_id) in keys:
+                    start = 0 if rule.need is HitNeed.STATE else index * rule.block_size
+                    cover(
+                        state.ssd_intervals,
+                        start,
+                        min(end, (index + 1) * rule.block_size),
+                        "ssd",
+                    )
+
+    def _cover_ssd(self, state: PrefixAttempt) -> None:
+        for lo, hi, source in state.ssd_intervals:
+            cover(state.intervals, lo, min(hi, state.coverage_end), source)
 
     def admit(
         self,
@@ -178,6 +242,7 @@ class StoreMetrics:
             state.coverage_end,
             "host_load",
         )
+        self._cover_ssd(state)
         if external:
             state.receive_start = now
         else:
@@ -265,6 +330,7 @@ class StoreMetrics:
             if entry.handle in state.ssd_handles:
                 source = "ssd"
             cover(state.intervals, lo, hi, source)
+        self._cover_ssd(state)
         self.restored(request, now)
 
     def observe(self, phase: str, source: str, seconds: float) -> None:
@@ -327,6 +393,8 @@ class StoreMetrics:
             "store_snapshot_idle": int(idle),
         }
         totals: dict[str, int] = {}
+        if self.hot_valid_slots is not None:
+            gauges["gpu_hot_valid_slots"] = self.hot_valid_slots
         if pool is not None:
             table = pool.host_pages
             gauges.update(
@@ -389,9 +457,18 @@ class StoreMetrics:
             gauges["gpu_hot_committed_groups"] = ledger.hot_used
         if ssd is not None:
             totals.update({f"host_ssd_{k}": v for k, v in ssd.stats_counter.items()})
-            totals["host_ssd_verified_load_bytes"] = (
-                ssd.stats_counter["prefetch_verified"] * ssd.page_bytes
+            totals["host_ssd_verified_load_bytes"] = ssd.stats_counter.get(
+                "verified_load_bytes",
+                ssd.stats_counter["prefetch_verified"] * ssd.page_bytes,
             )
+            totals["host_ssd_verified_load_pages"] = ssd.stats_counter.get(
+                "verified_load_pages", ssd.stats_counter["prefetch_verified"]
+            )
+            unit_store = getattr(ssd, "unit_store", None)
+            if unit_store is not None:
+                verified = unit_store.events["prefetch_verified_bytes"]
+                totals["unified_verified_load_bytes"] = verified
+                totals["unified_verified_load_pages"] = verified // ssd.page_bytes
             delayed = ssd._queue.summary()
             totals.update(
                 {

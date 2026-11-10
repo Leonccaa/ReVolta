@@ -189,6 +189,11 @@ def build_host_history_store(
         rank=get_world_group().rank_in_group,
         hot_views=hot_views,
         value_shadow=bool(plan.hot_slots_per_block and plan.value_shadow),
+        store_metrics=getattr(
+            getattr(vllm_config, "observability_config", None),
+            "enable_store_metrics",
+            False,
+        ),
     )
     if store.fixed_device_memory_bytes() != shape.fixed_device_memory_bytes():
         raise ValueError(

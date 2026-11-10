@@ -57,6 +57,8 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
     # values),
     # one step late (see host_kv/shadow.py).
     value_counters: dict[int, tuple[int, tuple[int, ...]]] = field(default_factory=dict)
+    # Rank -> (snapshot step, cumulative layer-0 wanted, misses, valid slots).
+    hot_metrics: dict[int, tuple[int, int, int, int]] = field(default_factory=dict)
     # ReceiveTxn attempts use rank masks across steps and duplicate outputs.
     receive_results: dict[int, tuple[int, int]] = field(default_factory=dict)
 
@@ -125,5 +127,6 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
             seal_bytes=seal_bytes,
             completed_steps=steps,
             value_counters=counters,
+            hot_metrics=self.hot_metrics | other.hot_metrics,
             receive_results=receives,
         )

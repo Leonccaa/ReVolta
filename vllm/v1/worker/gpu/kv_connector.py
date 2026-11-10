@@ -192,6 +192,13 @@ class ActiveKVConnector(KVConnector):
             if lagged is not None:
                 meta.value_counters[lagged[0]] = (rank, tuple(lagged[1]))
         output.kv_connector_worker_meta = meta
+        store = getattr(self, "_host_store", None)
+        hot_metrics = getattr(store, "hot_metrics", None)
+        if hot_metrics is not None:
+            assert store is not None
+            report = hot_metrics.harvest(step.step, store.slot_owner[0])
+            if report is not None:
+                meta.hot_metrics[get_world_group().rank_in_group] = report
         self._host_step = None
         self._host_event = None
 

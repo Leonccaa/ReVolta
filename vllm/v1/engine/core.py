@@ -1590,6 +1590,12 @@ class EngineCoreProc(EngineCore):
         while not self.has_work() and self.is_running():
             # Notify callbacks waiting for engine to become idle.
             self._notify_idle_state_callbacks()
+            stats, stats_timeout = self.scheduler.get_idle_stats()
+            if stats is not None:
+                # Like step statistics, send once through a frontend channel.
+                self.output_queue.put_nowait(
+                    (0, EngineCoreOutputs(scheduler_stats=stats))
+                )
             if self.input_queue.empty():
                 # Drain aborts queue; all aborts are also processed via input_queue.
                 with self.aborts_queue.mutex:
@@ -1605,10 +1611,10 @@ class EngineCoreProc(EngineCore):
             )
             try:
                 with get_watch_dog().disable():
-                    if block and persistence_pending:
-                        req = self.input_queue.get(timeout=1.0)
-                    else:
-                        req = self.input_queue.get(block=block)
+                    timeout = stats_timeout
+                    if persistence_pending:
+                        timeout = 1.0 if timeout is None else min(1.0, timeout)
+                    req = self.input_queue.get(block=block, timeout=timeout)
                 self._handle_client_request(*req)
                 get_watch_dog().feed()
             except queue.Empty:

@@ -536,10 +536,13 @@ def test_idle_engine_bounds_wait_only_with_pending_writes(pending, monkeypatch):
         input_queue=Input(),
         aborts_queue=queue.Queue(),
         process_input_queue_block=True,
-        scheduler=SimpleNamespace(get_kv_connector=lambda: connector),
+        scheduler=SimpleNamespace(
+            get_kv_connector=lambda: connector,
+            get_idle_stats=lambda: (None, None),
+        ),
     )
     core.EngineCoreProc._process_input_queue(instance)
     if pending:
-        assert observed == [{"timeout": 1.0}] and steps == [1]
+        assert observed == [{"block": True, "timeout": 1.0}] and steps == [1]
     else:
-        assert observed == [{"block": True}] and steps == []
+        assert observed == [{"block": True, "timeout": None}] and steps == []

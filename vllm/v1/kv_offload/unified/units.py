@@ -215,10 +215,12 @@ class UnitIndex:
     def register(self, offer: VariantOffer) -> Unit | None:
         b = self.units.get(offer.boundary)
         reason = (
-            "variant_b_missing"
-            if b is None or not b.complete
+            "variant_b_absent_terminal"
+            if b is None
             else "variant_b_regen"
             if b.gen != offer.gen
+            else "variant_b_building_wait"
+            if not b.complete
             else "variant_main_missing"
             if not offer.main
             or any(
@@ -229,6 +231,8 @@ class UnitIndex:
         )
         if reason is not None:
             self.events[reason] += 1
+            if reason in ("variant_b_absent_terminal", "variant_b_building_wait"):
+                self.events["variant_b_missing"] += 1
             return None
         assert b is not None
         if (

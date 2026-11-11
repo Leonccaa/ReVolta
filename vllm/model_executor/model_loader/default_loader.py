@@ -438,11 +438,17 @@ class DefaultModelLoader(BaseModelLoader):
 
         if self.counter_before_loading_weights == 0.0:
             self.counter_before_loading_weights = time.perf_counter()
-        # Apply the prefix.
-        return (
-            (source.prefix + name, tensor)
-            for name, tensor in decode_csf_scale_streams(weights_iterator)
-        )
+
+        def iterate() -> Generator[tuple[str, torch.Tensor], None, None]:
+            for name, tensor in decode_csf_scale_streams(weights_iterator):
+                yield source.prefix + name, tensor
+            # Only record an exhausted source, never an unconsumed iterator.
+            if self.load_config.load_format != "npcache":
+                from vllm.utils.checkpoint_cache import record_checkpoint_files
+
+                record_checkpoint_files(hf_weights_files)
+
+        return iterate()
 
     def _skip_weight_for(self, model: nn.Module) -> Callable[[str], bool] | None:
         """The model's own skip predicate, plus, for direct I/O under pipeline

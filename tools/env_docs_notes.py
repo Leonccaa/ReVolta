@@ -34,6 +34,27 @@ _LOOKUP = (
 )
 
 NOTES: dict[str, dict[str, str]] = {
+    "REVOLTA_RESEARCH_CHECKPOINT_CACHE_DROP": dict(
+        section="deployment",
+        since="0.2.0",
+        range="0, 1",
+        tradeoff="Research, engine startup only; default off. 1 requests clean "
+        "checkpoint cache eviction before host KV allocation, after a world "
+        "load barrier. Skips live mappings and PLE disk/cascade modes. May "
+        "slow later reloads or other engines reading the same checkpoint. "
+        "See startup logs for advised files/bytes and cgroup usage; no metric.",
+        metrics="",
+    ),
+    "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB": dict(
+        section="deployment",
+        since="1Cat",
+        range="non-negative GiB or unset",
+        tradeoff="Unset reserves min(host limit / 4, 8 GiB), preserving the "
+        "small-host margin without scaling it to tens of GiB. Explicit values "
+        "override the cap. The warning-only preflight counts shared CPU KV "
+        "storage separately; automatic placement also uses this reserve.",
+        metrics="",
+    ),
     # ---- promoted research switches -------------------------------------
     "VLLM_SM70_GDN_CPU_SPEC_QSL": dict(
         section="promoted",

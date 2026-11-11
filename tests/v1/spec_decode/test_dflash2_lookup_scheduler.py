@@ -956,3 +956,48 @@ def test_multi_request_preemption_restores_qualification(chain_factory):
     before = int(chain.spec._native_lookup.stats.counters[0])
     chain.step()
     assert int(chain.spec._native_lookup.stats.counters[0]) == before + 1
+
+
+@pytest.mark.parametrize("width", [1, 3, 4])
+def test_multi_request_narrow_ladder_bypasses_at_normal_entry(chain_factory, width):
+    chain = chain_factory(ladder={2: width}, max_requests=3, collect_counts=True)
+    native = chain.spec._native_lookup
+    chain.add("a")
+    chain.add("b")
+    chain.step()
+    chain.step()
+    assert native.eligible[:2].tolist() == [0, 0], "NARROW_LADDER_BYPASS"
+    assert native.stats.counters.tolist() == [0] * 18
+    assert chain.runner.draft_tokens_handler.num_draft_tokens == width
+    record = chain.step(accepted=1)
+    assert set(map(len, record.output.scheduled_spec_decode_tokens.values())) == {width}
+    chain.scheduler.finish_requests("b", RequestStatus.FINISHED_ABORTED)
+    chain.step()
+    assert native.eligible[0] == 1
+    assert int(native.stats.counters[0]) == 1
+    assert chain.runner.draft_tokens_handler.num_draft_tokens == 7
+
+
+def test_async_three_request_delayed_feedback_and_cancel(chain_factory):
+    chain = chain_factory(
+        async_scheduling=True, sparse=True, max_requests=3, collect_counts=True
+    )
+    requests = [chain.add(name) for name in ("a", "b", "c")]
+    chain.step()
+    chain.step()
+    native = chain.spec._native_lookup
+    assert native.eligible[:3].tolist() == [1, 1, 1]
+    output, batch = chain.schedule()
+    pending = chain.execute(output, batch, feedback=False)
+    assert [request.num_output_placeholders for request in requests] == [8] * 3
+    next_output, next_batch = chain.schedule()
+    newer = chain.execute(next_output, next_batch, feedback=False)
+    assert [request.num_output_placeholders for request in requests] == [16] * 3
+    chain.feedback(pending.output, pending.model_output)
+    chain.feedback(newer.output, newer.model_output)
+    assert [request.num_output_placeholders for request in requests] == [0] * 3
+    assert int(native.stats.counters[0]) == 9
+    chain.scheduler.finish_requests("b", RequestStatus.FINISHED_ABORTED)
+    chain.step()
+    assert native.eligible[:2].tolist() == [1, 1]
+    assert int(native.stats.counters[0]) == 11

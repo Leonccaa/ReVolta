@@ -349,3 +349,26 @@ def test_multi_request_real_capture_replay(limit):
     torch.accelerator.synchronize()
     assert not native.eligible.any()
     assert native.stats.counters.cpu().tolist()[:4] == [batch.num_reqs] * 4
+
+
+@pytest.mark.parametrize("n", [2, 3])
+def test_configured_two_request_limit(n):
+    parts = multi_fixture(n=n, limit=2)
+    apply_fixture(parts)
+    expected = n if n == 2 else 0
+    assert parts[0].eligible.tolist() == [int(expected > 0)] * n + [0] * (4 - n)
+    assert int(parts[0].stats.counters[0]) == expected
+
+
+def test_first_token_gate_remains_per_row():
+    parts = multi_fixture(n=3)
+    parts[3][1, 0] = 0  # One row disagrees; admission of other rows stays valid.
+    original_draft = parts[3].clone()
+    original_q = parts[4][1].clone()
+    apply_fixture(parts)
+    assert parts[0].eligible.tolist() == [1, 1, 1, 0]
+    assert parts[0].stats.counters.tolist()[:4] == [3, 3, 2, 2]
+    assert torch.equal(parts[3][1], original_draft[1])
+    assert torch.equal(parts[4][1], original_q)
+    assert parts[0].use[0, 1:].any() and parts[0].use[2, 1:].any()
+    assert not parts[0].use[1].any()

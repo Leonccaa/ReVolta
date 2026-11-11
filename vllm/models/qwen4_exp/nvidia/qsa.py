@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, ClassVar, cast
 import torch
 from torch import nn
 
-from vllm.config import CacheConfig, ModelConfig, VllmConfig
+from vllm.config import CacheConfig, CUDAGraphMode, ModelConfig, VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
@@ -66,6 +66,7 @@ from ..common.qsa_cache import (
     qsa_dcp_block_geometry,
 )
 from .indexer_qsa import QSAIndexer
+from .ops.qsa_coalesce import QSACoalescedExchange, QSACoalesceWorkspace
 
 if TYPE_CHECKING:
     from .host_kv.history import HostHistoryLayer
@@ -360,6 +361,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         sequence_lengths: torch.Tensor,
         output_gate: torch.Tensor | None = None,
         query_positions: torch.Tensor | None = None,
+        gathered_query: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Sparse attention over the main K/V in the host history store.
 
@@ -505,7 +507,8 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             local_block_size=host.kernel_block_tokens,
         )
         group = get_dcp_group()
-        gathered_query = group.all_gather(query[:num_tokens].contiguous(), dim=1)
+        if gathered_query is None:
+            gathered_query = group.all_gather(query[:num_tokens].contiguous(), dim=1)
         partial_output = layer.dcp_partial_output_buffer[:num_tokens]
         partial_lse = layer.dcp_partial_lse_buffer[:num_tokens]
         if partial_output.shape != gathered_query.shape:
@@ -772,6 +775,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         dcp_local_indices_buffer: torch.Tensor | None = None,
         dcp_partial_output_buffer: torch.Tensor | None = None,
         dcp_partial_lse_buffer: torch.Tensor | None = None,
+        coalesce_workspace: QSACoalesceWorkspace | None = None,
     ) -> None:
         nn.Module.__init__(self)
         cache_config = vllm_config.cache_config
@@ -896,6 +900,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.dcp_local_indices_buffer = dcp_local_indices_buffer
         self.dcp_partial_output_buffer = dcp_partial_output_buffer
         self.dcp_partial_lse_buffer = dcp_partial_lse_buffer
+        self.coalesce_workspace = coalesce_workspace
         self.attn_type = AttentionType.DECODER
         self.kv_cache_dtype = cache_config.cache_dtype
         if self.kv_cache_dtype in ("fp8", "fp8_e4m3") and (
@@ -1123,10 +1128,33 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 key[:num_tokens],
                 value[:num_tokens],
             )
+        exchange = None
+        # FULL graph descriptors are replicated across DCP ranks. The runner
+        # rejects prefill/mixed batches from uniform decode before dispatch.
+        context = get_forward_context()
+        descriptor = context.batch_descriptor
+        workspace = self.coalesce_workspace
+        if (
+            workspace is not None
+            and host is not None
+            and self.qsa_dcp_sharded
+            and side_metadata.index_dcp_world_size == 2
+            and not self.indexer.skip_topk
+            and context.cudagraph_runtime_mode
+            in (CUDAGraphMode.NONE, CUDAGraphMode.FULL)
+            and descriptor is not None
+            and descriptor.uniform
+            and descriptor.num_tokens == num_tokens == query.shape[0]
+            and workspace.supports(query, num_tokens)
+        ):
+            exchange = QSACoalescedExchange(workspace, query)
+        # Keep the disabled call signature and all original kernels unchanged.
+        indexer_kwargs = {} if exchange is None else {"coalesced_exchange": exchange}
         selected = self.indexer(
             hidden_states,
             positions,
             self.topk_indices_buffer[:num_tokens],
+            **indexer_kwargs,
         )
         if selected.shape != (
             num_tokens,
@@ -1160,6 +1188,11 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 sequence_lengths=side_metadata.seq_lens,
                 output_gate=output_gate,
                 query_positions=side_metadata.logical_positions,
+                **(
+                    {"gathered_query": exchange.gathered_query}
+                    if exchange is not None and exchange.gathered_query is not None
+                    else {}
+                ),
             )
         else:
             impl.do_kv_cache_update(

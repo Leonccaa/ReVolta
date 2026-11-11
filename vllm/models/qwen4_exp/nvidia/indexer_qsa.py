@@ -27,6 +27,7 @@ from ..common.qsa_cache import (
     canonical_qsa_rope_positions,
     qsa_index_dcp_sharded,
 )
+from .ops.qsa_coalesce import QSACoalescedExchange
 from .ops.qsa_pre_indexer import qsa_pre_indexer
 
 
@@ -207,6 +208,8 @@ class QSAIndexer(nn.Module):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         out: torch.Tensor | None = None,
+        *,
+        coalesced_exchange: QSACoalescedExchange | None = None,
     ) -> torch.Tensor:
         """Return fixed-width request-relative token indices padded with ``-1``."""
 
@@ -367,6 +370,11 @@ class QSAIndexer(nn.Module):
             seq_lens_cpu_upper_bound=compressed_metadata.seq_lens_cpu_upper_bound,
             index_dcp_world_size=compressed_metadata.index_dcp_world_size,
             index_dcp_rank=compressed_metadata.index_dcp_rank,
+            **(
+                {"coalesced_exchange": coalesced_exchange}
+                if coalesced_exchange is not None
+                else {}
+            ),
         )
 
 

@@ -324,6 +324,8 @@ def test_runner_does_not_dispatch_short_prefill_as_tail(
 
     runner = mrv2.GPUModelRunner.__new__(mrv2.GPUModelRunner)
     runner.update_pp_decode_requests = lambda: None
+    runner.device = torch.device("cpu")
+    runner.kv_connector = SimpleNamespace(handle_preemptions=lambda _: None)
     for method in ("finish_requests", "free_states", "add_requests", "update_requests"):
         setattr(runner, method, lambda _: None)
     runner.block_tables = SimpleNamespace(apply_staged_writes=lambda: None)

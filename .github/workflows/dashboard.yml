@@ -29,7 +29,7 @@ jobs:
         with:
           node-version: "22"
       - name: Install CPU HTTP test dependencies
-        run: python -m pip install 'fastapi>=0.141.1,<0.142.0' httpx 'prometheus-client>=0.26.0' 'prometheus-fastapi-instrumentator>=8.1.0,<9.0.0'
+        run: python -m pip install 'fastapi>=0.141.1,<0.142.0' httpx 'prometheus-client>=0.26.0' 'prometheus-fastapi-instrumentator>=8.1.0,<9.0.0' regex
       - name: Dashboard ASGI routes and native scrape integration
         run: python -m unittest discover -s tests/entrypoints/serve/dashboard -p 'test_*.py' -v
       - name: Browser metric math and local cache

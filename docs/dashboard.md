@@ -122,7 +122,7 @@ These checks need no model, GPU, Torch import or running inference service:
 
 ```sh
 uv venv .venv
-uv pip install --python .venv/bin/python 'fastapi>=0.141.1,<0.142.0' httpx prometheus-client prometheus-fastapi-instrumentator uvicorn
+uv pip install --python .venv/bin/python 'fastapi>=0.141.1,<0.142.0' httpx prometheus-client prometheus-fastapi-instrumentator regex uvicorn
 .venv/bin/python -m unittest discover -s tests/entrypoints/serve/dashboard -p 'test_*.py' -v
 node --test tests/entrypoints/serve/dashboard/test_metrics.mjs
 ```

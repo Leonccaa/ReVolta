@@ -1059,12 +1059,13 @@ class HostHistoryLayer:
             if active.unique().numel() != active.numel():
                 raise ValueError("duplicate host history write slot")
         store = self.store
-        capturing = (
-            s.staged_writethrough
+        plan = store.write_plan if s.staged_writethrough else None
+        if (
+            plan is not None
             and store.device.type == "cuda"
             and torch.cuda.is_current_stream_capturing()
-        )
-        plan = store.write_plan if s.staged_writethrough and not capturing else None
+        ):
+            plan = None
         if plan is not None:
             if n > len(plan.targets):
                 raise ValueError("Write rows exceed the step plan")

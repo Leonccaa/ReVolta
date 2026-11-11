@@ -300,7 +300,8 @@ def test_disjoint_aliases_use_the_reference_run_join():
     assert len(plan.copies) == 1
 
 
-def test_pure_decode_retains_legacy_writer(monkeypatch):
+@pytest.mark.parametrize("cuda_metadata", [False, True])
+def test_pure_decode_retains_legacy_writer(monkeypatch, cuda_metadata):
     from vllm.models.qwen4_exp.nvidia.host_kv import history
 
     shape = HostHistoryShape(
@@ -319,6 +320,16 @@ def test_pure_decode_retains_legacy_writer(monkeypatch):
         row_groups=2,
     )
     store = HostHistoryStore(shape, ["a"], device="cpu")
+    store.begin_blocks([1, 2])
+    if cuda_metadata:
+        # Keep all tensors and interpreter kernels on CPU, but exercise the
+        # CUDA metadata branch without allowing a capture-state API query.
+        store.device = torch.device("cuda")
+    monkeypatch.setattr(
+        history.torch.cuda,
+        "is_current_stream_capturing",
+        Mock(side_effect=AssertionError("decode capture query")),
+    )
     calls = []
     original = history.hk.write_slots
 
@@ -337,7 +348,6 @@ def test_pure_decode_retains_legacy_writer(monkeypatch):
         Mock(side_effect=AssertionError("decode vector")),
     )
     try:
-        store.begin_blocks([1, 2])
         key = torch.ones((4, 1, 16), dtype=torch.uint8)
         store.layers[0].write_encoded(key, key, torch.tensor([8, 9, 16, 17]))
         assert calls == [(4,)]

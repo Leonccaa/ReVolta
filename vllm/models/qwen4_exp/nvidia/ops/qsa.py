@@ -1386,6 +1386,30 @@ def _sm70_qsa_lexicographic_topk_op():
     return torch.ops._C.qsa_lexicographic_topk
 
 
+@triton.jit
+def _shared_key_local_inputs_kernel(
+    Positions,
+    Lengths,
+    OutPositions,
+    OutLengths,
+    NP: tl.constexpr,
+    NL: tl.constexpr,
+    C: tl.constexpr,
+    WORLD: tl.constexpr,
+    RANK: tl.constexpr,
+    B: tl.constexpr,
+):
+    i = tl.program_id(0) * B + tl.arange(0, B)
+    pos = tl.load(Positions + i, i < NP, 0).to(tl.int64)
+    length = tl.load(Lengths + i, i < NL, 0).to(tl.int64)
+    # Clamp after division, as in the torch reference. For negative numerators
+    # the floor/truncation difference vanishes under max(..., 0).
+    vp = tl.maximum((pos + 1) // C, 0)
+    vl = tl.maximum(length // C, 0)
+    tl.store(OutPositions + i, ((vp + WORLD - 1 - RANK) // WORLD) * C - 1, i < NP)
+    tl.store(OutLengths + i, ((vl + WORLD - 1 - RANK) // WORLD) * C, i < NL)
+
+
 def _shared_key_local_inputs(
     query_positions: torch.Tensor,
     sequence_lengths: torch.Tensor,
@@ -1408,6 +1432,36 @@ def _shared_key_local_inputs(
     (positions far below int64 overflow; padded rows are negative and map to
     zero visible groups). Fixed shapes and no host sync.
     """
+    if (
+        os.environ.get("REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED", "0") == "1"
+        and (query_positions.is_cuda or os.environ.get("TRITON_INTERPRET") == "1")
+        and query_positions.is_contiguous()
+        and sequence_lengths.is_contiguous()
+        and query_positions.device == sequence_lengths.device
+        and query_positions.ndim == sequence_lengths.ndim == 1
+        and query_positions.dtype in (torch.int32, torch.int64)
+        and sequence_lengths.dtype in (torch.int32, torch.int64)
+        and compress_ratio > 0
+        and world > 0
+        and 0 <= rank < world
+    ):
+        positions = torch.empty_like(query_positions)
+        lengths = torch.empty_like(sequence_lengths)
+        n = max(positions.numel(), lengths.numel())
+        if n:
+            _shared_key_local_inputs_kernel[(triton.cdiv(n, 128),)](
+                query_positions,
+                sequence_lengths,
+                positions,
+                lengths,
+                positions.numel(),
+                lengths.numel(),
+                compress_ratio,
+                world,
+                rank,
+                128,
+            )
+        return positions, lengths
     c = compress_ratio
     prefix = query_positions.to(torch.int64) + 1
     visible = torch.clamp(prefix // c, min=0)

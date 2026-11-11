@@ -1,0 +1,51 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- SPDX-FileCopyrightText: Copyright contributors to the ReVolta project -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>ReVolta Engine Status</title>
+  <link rel="stylesheet" href="assets/dashboard.css">
+  <script type="module" src="assets/dashboard.mjs"></script>
+</head>
+<body>
+<main>
+  <header>
+    <div><p class="eyebrow">REVOLTA · ENGINE DASHBOARD</p><h1>ReVolta Engine Status <span id="model"></span></h1></div>
+    <span id="health" class="health" role="status" data-state="connecting">Connecting</span>
+  </header>
+  <p id="connection" class="connection" role="status">Connecting to this engine…</p>
+  <form id="auth" hidden>
+    <label for="key">API key</label>
+    <input id="key" type="password" autocomplete="off" spellcheck="false" required placeholder="Enter this engine's API key">
+    <button type="submit">Connect</button>
+    <span>Kept in this tab's memory only.</span>
+  </form>
+  <section class="lifetime" aria-label="Cumulative engine statistics">
+    <p class="scope">Since engine start</p><dl id="lifetime"></dl>
+  </section>
+  <div class="tools">
+    <span id="coverage">Waiting for the first sample</span>
+    <div class="window-control"><span>Statistics window</span><div class="segments" role="group" aria-label="Statistics window">
+      <button data-window="60" aria-pressed="true">1 min</button><button data-window="300" aria-pressed="false">5 min</button><button data-window="900" aria-pressed="false">15 min</button>
+    </div></div>
+  </div>
+  <section id="cards" class="grid" aria-label="Engine performance"></section>
+  <footer>
+    <div><a id="engine" href="https://github.com/Leonccaa/ReVolta" target="_blank" rel="noopener noreferrer">Engine: ReVolta</a><span id="observation"></span></div>
+    <div class="cache-controls"><label><input id="remember" type="checkbox" checked> Remember history</label><button id="clear" class="quiet">Clear history</button><button id="disconnect" class="quiet" hidden>Disconnect</button></div>
+    <p>History covers observations made by this browser. Window averages use counter changes over actual elapsed time. Gaps have no chart points; they cannot reconstruct earlier activity.</p>
+    <p id="cache-state"></p>
+  </footer>
+</main>
+<dialog id="details" aria-labelledby="detail-title">
+  <div class="dialog-header"><div><h2 id="detail-title"></h2><p id="detail-scope"></p></div><button id="close" autofocus aria-label="Close details">Close</button></div>
+  <div id="detail-tabs" class="segments tabs" role="group" aria-label="Cache detail category" hidden></div>
+  <div id="detail-body" class="dialog-body"></div>
+  <div class="dialog-footer">Cumulative counters come from the engine. Window values cover browser observations. Missing metrics are shown as —.</div>
+</dialog>
+<noscript>This dashboard requires JavaScript. The engine's Prometheus metrics remain available at /metrics.</noscript>
+</body>
+</html>

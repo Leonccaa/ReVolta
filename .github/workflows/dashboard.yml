@@ -1,0 +1,36 @@
+name: dashboard
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/dashboard.yml
+      - vllm/entrypoints/serve/dashboard/**
+      - vllm/entrypoints/serve/instrumentator/metrics.py
+      - vllm/entrypoints/openai/cli_args.py
+      - vllm/entrypoints/openai/api_server.py
+      - tests/entrypoints/serve/dashboard/**
+
+permissions:
+  contents: read
+
+jobs:
+  cpu:
+    name: dashboard CPU
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "22"
+      - name: Install CPU HTTP test dependencies
+        run: python -m pip install 'fastapi>=0.141.1,<0.142.0' httpx 'prometheus-client>=0.26.0' 'prometheus-fastapi-instrumentator>=8.1.0,<9.0.0'
+      - name: Dashboard ASGI routes and native scrape integration
+        run: python -m unittest discover -s tests/entrypoints/serve/dashboard -p 'test_*.py' -v
+      - name: Browser metric math and local cache
+        run: node --test tests/entrypoints/serve/dashboard/test_metrics.mjs

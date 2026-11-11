@@ -320,8 +320,11 @@ def test_source_captures_python_positional_arguments(checkpoint):
 
 
 @pytest.mark.parametrize("shorthand", [True, False])
-def test_real_cli_parser_normalize_serialize_worker_rebuild(checkpoint, shorthand):
-    raw = {"dflash2_lookup": HEAD, "ngram_assist": False}
+@pytest.mark.parametrize("limit", [1, 3])
+def test_real_cli_parser_normalize_serialize_worker_rebuild(
+    checkpoint, shorthand, limit
+):
+    raw = {"dflash2_lookup": HEAD | {"max_requests": limit}, "ngram_assist": False}
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
     argv = [
         "--model",
@@ -352,7 +355,8 @@ def test_real_cli_parser_normalize_serialize_worker_rebuild(checkpoint, shorthan
         checkpoint["target_model_config"], checkpoint["target_parallel_config"]
     )
     source = spec.resolved_dflash2_lookup.source
-    assert source.keys == tuple(sorted(HEAD))
+    assert source.keys == tuple(sorted((*HEAD, "max_requests")))
+    assert spec.resolved_dflash2_lookup.max_requests == limit
     assert source.system_fields == (
         "enforce_eager",
         "target_model_config",
@@ -379,7 +383,7 @@ def test_trusted_schema_and_cli_injection_rejection(checkpoint):
     for field, value in (
         ("schema_version", 2),
         ("schema_version", True),
-        ("admission_version", 2),
+        ("admission_version", 3),
         ("admission_version", True),
         ("verify_tokens", 15),
         ("nmin", "3"),
@@ -1061,3 +1065,74 @@ def test_model_and_engine_config_copy_rebuild_derived_state(checkpoint):
     assert copied.speculative_config is None
     assert "_temporary_runtime_state" not in asdict(cloned)
     assert "ModelConfig" in prepare_object_to_dump(cloned)
+
+
+@pytest.mark.parametrize("limit", [1, 2, 3])
+@pytest.mark.parametrize("transport", ["json", "pickle", "cloudpickle"])
+def test_max_requests_source_hash_and_worker_rebuild(
+    checkpoint, monkeypatch, limit, transport
+):
+    from vllm.config.utils import replace
+
+    spec = build(checkpoint, dflash2_lookup=HEAD | {"max_requests": limit})
+    resolved = spec.resolved_dflash2_lookup
+    assert resolved.max_requests == limit
+    assert "max_requests" in resolved.source.keys, "MAX_REQUESTS_SOURCE"
+    assert replace(spec).resolved_dflash2_lookup == resolved
+    assert resolved.admission_version == (1 if limit == 1 else 2)
+    monkeypatch.setenv(ENV, "29")
+    if transport == "json":
+        rebuilt = SpeculativeConfig.from_worker_payload(
+            json.loads(json.dumps(spec.to_worker_payload())),
+            target_model_config=checkpoint["target_model_config"],
+            target_parallel_config=checkpoint["target_parallel_config"],
+        )
+    else:
+        codec = pickle if transport == "pickle" else cloudpickle
+        rebuilt = codec.loads(codec.dumps(spec))
+    assert rebuilt.resolved_dflash2_lookup == resolved
+    assert rebuilt.compute_hash() == spec.compute_hash()
+    assert envs.compile_factors(rebuilt) == envs.compile_factors(spec)
+    monkeypatch.delenv(ENV)
+    hashes = {
+        build(checkpoint, dflash2_lookup=HEAD | {"max_requests": n}).compute_hash()
+        for n in (1, 2, 3)
+    }
+    assert len(hashes) == 3, "MAX_REQUESTS_HASH"
+    off = build(checkpoint)
+    for n in (1, 2, 3):
+        closed = build(checkpoint, dflash2_lookup={"max_requests": n})
+        assert closed.compute_hash() == off.compute_hash()
+        assert envs.compile_factors(closed) == envs.compile_factors(off)
+
+
+@pytest.mark.parametrize("limit", [0, 4, -1, True, False, "2", 2.0, None])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_max_requests_range_is_strict(checkpoint, limit, enabled):
+    with pytest.raises(ValueError, match="max_requests"):
+        build(
+            checkpoint,
+            dflash2_lookup=HEAD | {"enabled": enabled, "max_requests": limit},
+        )
+
+
+def test_max_requests_default_and_single_request_cache_identity(checkpoint):
+    spec = build(checkpoint, dflash2_lookup=HEAD)
+    assert spec.resolved_dflash2_lookup.max_requests == 3
+    assert "max_requests" not in spec.resolved_dflash2_lookup.source.keys
+    single = build(checkpoint, dflash2_lookup=HEAD | {"max_requests": 1})
+    options = single.resolved_dflash2_lookup.graph_options()
+    assert options == (1, "gpu_head", "longest", 3, 16, 65536, "first_token", 7, 7, 1)
+
+
+@pytest.mark.parametrize("bad", [0, 4, True, "2"])
+def test_worker_rejects_invalid_max_requests(checkpoint, bad):
+    spec = build(checkpoint, dflash2_lookup=HEAD)
+    payload = spec.to_worker_payload()
+    payload["lookup"]["max_requests"] = bad
+    with pytest.raises(ValueError):
+        SpeculativeConfig.from_worker_payload(
+            payload,
+            target_model_config=checkpoint["target_model_config"],
+            target_parallel_config=checkpoint["target_parallel_config"],
+        )

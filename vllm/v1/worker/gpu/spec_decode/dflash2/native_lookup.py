@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Native seven-token lookup with per-step single-request admission."""
+"""Native seven-token lookup with per-step bounded batch admission."""
 
 from typing import Any
 
@@ -42,6 +42,49 @@ def _native_eligibility_kernel(
         & (length < MAX_LEN)
     )
     tl.store(eligible + row, allowed.to(tl.int32))
+
+
+@triton.jit
+def _native_batch_eligibility_kernel(
+    mapping,
+    sampled,
+    total_len,
+    control,
+    eligible,
+    mapping_stride: tl.constexpr,
+    STATES: tl.constexpr,
+    HISTORY: tl.constexpr,
+    MAX_LEN: tl.constexpr,
+    NMIN: tl.constexpr,
+    MAX_REQUESTS: tl.constexpr,
+    ROWS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # One program establishes the all-or-none decision before any history scan.
+    # The live count is replay input, independent of the captured padded shape.
+    row = tl.arange(0, BLOCK)
+    live = tl.load(control + 2)
+    active = (row < live) & (row < ROWS)
+    slot = tl.load(mapping + row * mapping_stride, mask=active, other=-1)
+    valid_slot = (slot >= 0) & (slot < STATES)
+    length = tl.load(total_len + slot, mask=active & valid_slot, other=0)
+    sampled_count = tl.load(sampled + row, mask=active, other=0)
+    row_ok = (
+        valid_slot
+        & (sampled_count > 0)
+        & (length >= NMIN + 1)
+        & (length <= HISTORY)
+        & (length < MAX_LEN)
+    )
+    batch_ok = (
+        (live >= 1)
+        & (live <= MAX_REQUESTS)
+        & (live <= ROWS)
+        & (tl.load(control) != 0)
+        & (tl.load(control + 1) != 0)
+        & (tl.min(tl.where(active, row_ok.to(tl.int32), 1), 0) != 0)
+    )
+    tl.store(eligible + row, (active & batch_ok).to(tl.int32), mask=row < ROWS)
 
 
 @triton.jit
@@ -116,26 +159,34 @@ class NativeDFlash2Lookup:
         self.search_window = config.search_window
         self.max_model_len = max_model_len
         self.stats = stats
+        self.max_requests = config.max_requests
         self.tokens = torch.zeros((max_num_reqs, 7), dtype=torch.int32, device=device)
         self.match = torch.zeros(max_num_reqs, dtype=torch.int32, device=device)
         self.valid = torch.zeros_like(self.match)
         self.eligible = torch.zeros_like(self.match)
         self.use = torch.zeros_like(self.tokens)
         self.sampled = torch.zeros_like(self.match)
-        self.control = torch.zeros(2, dtype=torch.int32, device=device)
+        self.control = torch.zeros(
+            2 if self.max_requests == 1 else 3, dtype=torch.int32, device=device
+        )
 
     def reset_for_capture(self) -> None:
         self.control.zero_()
         self.sampled.zero_()
 
-    def prepare(self, batch: Any, sampled: torch.Tensor, *, real_run: bool) -> None:
-        single = (
-            batch.num_reqs == 1
+    def prepare(
+        self, batch: Any, sampled: torch.Tensor, *, real_run: bool, draft_width: int = 7
+    ) -> None:
+        allowed = (
+            1 <= batch.num_reqs <= self.max_requests
+            and draft_width == 7
             and not batch.has_structured_output_reqs
-            and not batch.is_prefilling_np[0]
+            and not batch.is_prefilling_np[: batch.num_reqs].any()
         )
-        self.control[0].fill_(int(single))
+        self.control[0].fill_(int(allowed))
         self.control[1].fill_(int(real_run))
+        if self.max_requests > 1:
+            self.control[2].fill_(batch.num_reqs)
         self.sampled.zero_()
         self.sampled[: batch.num_reqs].copy_(
             sampled[: batch.num_reqs], non_blocking=True
@@ -154,19 +205,38 @@ class NativeDFlash2Lookup:
         if states is None:
             raise RuntimeError("Native lookup history must be bound before capture")
         history, lengths = states.all_token_ids.gpu, states.total_len.gpu
-        _native_eligibility_kernel[(num_reqs,)](
-            mapping,
-            self.sampled,
-            lengths,
-            self.control,
-            self.eligible,
-            mapping_stride=7,
-            STATES=lengths.numel(),
-            HISTORY=history.shape[1],
-            MAX_LEN=self.max_model_len,
-            NMIN=self.nmin,
-            num_warps=1,
-        )
+        if self.max_requests == 1:
+            # Keep the original kernel topology, scratch and padded graph shapes.
+            _native_eligibility_kernel[(num_reqs,)](
+                mapping,
+                self.sampled,
+                lengths,
+                self.control,
+                self.eligible,
+                mapping_stride=7,
+                STATES=lengths.numel(),
+                HISTORY=history.shape[1],
+                MAX_LEN=self.max_model_len,
+                NMIN=self.nmin,
+                num_warps=1,
+            )
+        else:
+            _native_batch_eligibility_kernel[(1,)](
+                mapping,
+                self.sampled,
+                lengths,
+                self.control,
+                self.eligible,
+                mapping_stride=7,
+                STATES=lengths.numel(),
+                HISTORY=history.shape[1],
+                MAX_LEN=self.max_model_len,
+                NMIN=self.nmin,
+                MAX_REQUESTS=self.max_requests,
+                ROWS=num_reqs,
+                BLOCK=triton.next_power_of_2(num_reqs),
+                num_warps=1,
+            )
         suffix_lookup(
             history,
             lengths,

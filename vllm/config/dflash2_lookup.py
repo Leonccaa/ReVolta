@@ -89,6 +89,9 @@ class DFlash2LookupConfig:
     """Collect lookup counters when the engine's existing statistics switch permits."""
     expand: DFlash2LookupExpandConfig = Field(default_factory=DFlash2LookupExpandConfig)
     """Reserved expansion configuration, supporting only enabled=false."""
+    max_requests: StrictInt = Field(default=3, ge=1, le=3)
+    """Maximum live decode requests per lookup batch.
+    Set to 1 for single-request admission."""
 
     @field_validator("policy", mode="before")
     @classmethod
@@ -138,7 +141,8 @@ class ResolvedDFlash2Lookup(BaseModel):
         frozen=True, extra="forbid", revalidate_instances="always"
     )
     schema_version: Literal[1] = 1
-    admission_version: Literal[1] = 1
+    admission_version: Literal[1, 2] = 1
+    max_requests: StrictInt = Field(default=1, ge=1, le=3)
     mode: Literal["off", "gpu_head", "legacy_host", "legacy_gpu"]
     policy: Literal["longest"] | None = None
     nmin: StrictInt | None = None
@@ -157,12 +161,26 @@ class ResolvedDFlash2Lookup(BaseModel):
     def _validate_policy(cls, value: Any) -> Any:
         return _supported_policy(value)
 
-    @field_validator("schema_version", "admission_version", mode="before")
+    @field_validator("schema_version", mode="before")
     @classmethod
     def _validate_version(cls, value: Any) -> Any:
         if type(value) is not int or value != 1:
             raise ValueError("Unsupported resolved lookup schema version")
         return value
+
+    @field_validator("admission_version", mode="before")
+    @classmethod
+    def _validate_admission_version(cls, value: Any) -> Any:
+        if type(value) is not int or value not in (1, 2):
+            raise ValueError("Unsupported resolved lookup admission version")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_admission(self) -> "ResolvedDFlash2Lookup":
+        expected = 2 if self.max_requests > 1 else 1
+        if self.admission_version != expected:
+            raise ValueError("Inconsistent lookup admission version and max_requests")
+        return self
 
     @model_validator(mode="after")
     def _validate_factors(self) -> "ResolvedDFlash2Lookup":
@@ -181,7 +199,7 @@ class ResolvedDFlash2Lookup(BaseModel):
         return self
 
     def graph_options(self) -> tuple[Any, ...]:
-        """Versioned forward identity for native single-request admission."""
+        """Versioned forward identity, retaining the single-request cache key."""
         return (
             self.schema_version,
             self.mode,
@@ -192,6 +210,7 @@ class ResolvedDFlash2Lookup(BaseModel):
             self.gate,
             self.draft_tokens,
             self.verify_tokens,
+            *((self.max_requests,) if self.max_requests > 1 else ()),
             self.admission_version,
         )
 
@@ -357,8 +376,11 @@ def resolve_lookup(
     if mode == "gpu_head":
         assert lookup is not None
         nmin, nmax = lookup.nmin, lookup.nmax
+    max_requests = lookup.max_requests if mode == "gpu_head" and lookup else 1
     return ResolvedDFlash2Lookup(
         mode=mode,
+        max_requests=max_requests,
+        admission_version=2 if max_requests > 1 else 1,
         policy=lookup.policy if mode == "gpu_head" else None,
         nmin=nmin,
         nmax=nmax,

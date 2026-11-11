@@ -355,6 +355,9 @@ if TYPE_CHECKING:
     VLLM_SM70_QSA_SHARED_KEY: bool = False
     VLLM_QSA_INDEX_SHARD_DEBUG: bool = False
     VLLM_QSA_INDEX_SHARD_FUSED_MERGE: bool = True
+    REVOLTA_RESEARCH_HOST_DECODE_FAST: bool = False
+    REVOLTA_RESEARCH_HOST_DECODE_FAST_ORDERED: bool = False
+    REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED: bool = False
     VLLM_DFLASH2_LOOKUP_ADAPTIVE: bool = True
     VLLM_DFLASH2_LOOKUP_NSTRONG: int = 6
     VLLM_DFLASH2_LOOKUP_AGREE: int = 0
@@ -4650,6 +4653,50 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "descriptor (call index, rows, top-k, request/position checksums) "
             "and fail if DCP ranks disagree. Synchronizes the host; skipped "
             "during CUDA graph capture."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "REVOLTA_RESEARCH_HOST_DECODE_FAST": env_var(
+        lambda: os.getenv("REVOLTA_RESEARCH_HOST_DECODE_FAST", "0") == "1",
+        description=(
+            "Fuse host-history decode writes, marks and refill launches. "
+            "Default off pending GPU validation; restart with 0 to restore "
+            "the original path."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "REVOLTA_RESEARCH_HOST_DECODE_FAST_ORDERED": env_var(
+        lambda: os.getenv("REVOLTA_RESEARCH_HOST_DECODE_FAST_ORDERED", "0") == "1",
+        description=(
+            "With REVOLTA_RESEARCH_HOST_DECODE_FAST=1, keep the fused mark "
+            "kernel's tail claims ordered before selection claims so refill "
+            "pairing matches the unfused baseline's cache evolution. "
+            "Default off; restart with 0 to restore the unordered fused "
+            "mark. No effect while the parent switch is 0."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED": env_var(
+        lambda: os.getenv("REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED", "0") == "1",
+        description=(
+            "Fuse integer metadata conversion for the DCP-sharded shared-key "
+            "scorer. Default off pending GPU validation; restart with 0 to "
+            "use the torch reference."
         ),
         category="experimental",
         declared_default="False",
@@ -20216,6 +20263,10 @@ def compile_factors(speculative_config: Any = None) -> dict[str, object]:
         "MAX_JOBS",
         # Scheduler/KV planning only; never changes compiled code.
         "VLLM_SM70_HOST_KV_STATIC_HOT_POOL",
+        # Runtime branches inside opaque QSA ops; no traced graph change.
+        "REVOLTA_RESEARCH_HOST_DECODE_FAST",
+        "REVOLTA_RESEARCH_HOST_DECODE_FAST_ORDERED",
+        "REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED",
         "VLLM_RPC_BASE_PATH",
         "VLLM_USE_MODELSCOPE",
         "VLLM_RINGBUFFER_WARNING_INTERVAL",

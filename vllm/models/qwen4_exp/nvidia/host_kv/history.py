@@ -19,8 +19,10 @@ A step's query rows are processed in passes whose QSA union bound fits the
 hot pool, so no selection can exceed it.
 
 Writes encode with the cache's own writer into a staging row, then copy the
-bytes to the host page and refresh a resident hot group, and a separate kernel
-publishes them (``ready``). All of it is ordered on the caller's stream; a
+bytes to the host page and refresh a resident hot group. The default path
+publishes them (``ready``) in a separate kernel; the opt-in decode path
+publishes in the writer, before the next kernel boundary. All of it is
+ordered on the caller's stream; a
 host-side reader (SSD persistence, connectors) must wait on ``fence()``.
 
 Calls must be serialized on one CUDA stream. Every launch has a fixed grid;
@@ -66,6 +68,11 @@ from .staged_write import WritePlan
 # Module constants only so mutation tests can show the tests depend on them.
 _UNION_ROW_GROUP = 8
 _MASK_OTHER_WINDOWS = True
+
+# Environment name of the ordered fused-mark sub-switch. Exported as a
+# module sentinel: the interpreter gates fail fast (instead of raising
+# confusing AttributeErrors) when a CPU harness imports an older tree.
+ORDERED_SUB_SWITCH_ENV = "REVOLTA_RESEARCH_HOST_DECODE_FAST_ORDERED"
 
 UNION_STAT_NAMES = (
     "calls",
@@ -417,6 +424,16 @@ class HostHistoryStore:
         if device.type == "cpu" and os.environ.get("TRITON_INTERPRET") != "1":
             raise ValueError("CPU host history fixtures require TRITON_INTERPRET=1")
         self.shape, self.device, self.debug = shape, device, debug
+        # Runtime-only experiment: does not alter cache identity or config hash.
+        self.decode_fast = (
+            os.environ.get("REVOLTA_RESEARCH_HOST_DECODE_FAST", "0") == "1"
+        )
+        # Sub-switch: the fused mark kernel keeps the two phases' Touched
+        # lists separate (tail first) so the Misses/victims pairing matches
+        # the unfused baseline. Read once per process, like decode_fast.
+        self.decode_fast_ordered = (
+            self.decode_fast and os.environ.get(ORDERED_SUB_SWITCH_ENV, "0") == "1"
+        )
         s = shape
         kb, kbs, layers = s.num_kernel_blocks, s.kernel_block_tokens, s.num_layers
         h, d = s.kv_heads, s.head_dim
@@ -500,6 +517,16 @@ class HostHistoryStore:
             self.wanted = torch.zeros(s.num_groups, **i32)
             self.wanted_groups = torch.empty(slots, **i32)
             self.wanted_count = torch.zeros((), **i32)
+            # Selection segment of the ordered fused mark kernel. Allocated
+            # only while the sub-switch is on (so with both switches off the
+            # store allocates exactly the candidate baseline); excluded from
+            # the fixed-bytes accounting below, like the union scratch.
+            self.wanted_sel: torch.Tensor | None = (
+                torch.empty(slots, **i32) if self.decode_fast_ordered else None
+            )
+            self.sel_count: torch.Tensor | None = (
+                torch.zeros((), **i32) if self.decode_fast_ordered else None
+            )
             self.miss_groups = torch.empty(slots, **i32)
             self.miss_slots = torch.empty(slots, **i32)
             self.miss_count = torch.zeros((), **i32)
@@ -614,6 +641,11 @@ class HostHistoryStore:
                     "write_target_buffers",
                     "write_target_arrays",
                     "write_target_events",
+                    # Ordered-mark scratch: allocated only while the sub
+                    # switch is on; kept out of the frozen fixed-bytes bill
+                    # like the union scratch (4 * slots + 4 bytes when on).
+                    "wanted_sel",
+                    "sel_count",
                 }
             }
         )
@@ -986,6 +1018,8 @@ class HostHistoryLayer:
         kv_cache_dtype: str,
         k_scale: torch.Tensor,
         v_scale: torch.Tensor,
+        *,
+        decode: bool | None = None,
     ) -> None:
         """Encode with the cache's own writer, then commit (``write_encoded``).
 
@@ -998,6 +1032,11 @@ class HostHistoryLayer:
             return
         if n > s.max_write_rows:
             raise ValueError("host history write exceeds its staging rows")
+        if decode is None:
+            # Keep the parent attention forward byte-identical for Dynamo
+            # source hashing. Small append/padded calls use the same safe
+            # fusion; large prefill writes always retain the original path.
+            decode = n <= s.read_rows and n <= s.max_requests * s.decode_rows
         key, value = key[:n], value[:n]
         k_stage, v_stage = store.staging[:n].unbind(1)
         if self.store.device.type == "cuda":
@@ -1027,10 +1066,15 @@ class HostHistoryLayer:
         else:
             k_stage[:, 0].copy_(key)
             v_stage[:, 0].copy_(value)
-        self.write_encoded(k_stage[:, 0], v_stage[:, 0], slot_mapping)
+        self.write_encoded(k_stage[:, 0], v_stage[:, 0], slot_mapping, decode=decode)
 
     def write_encoded(
-        self, key: torch.Tensor, value: torch.Tensor, slot_mapping: torch.Tensor
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        *,
+        decode: bool = False,
     ) -> None:
         """Copy encoded ``[n, H, D]`` rows to their slots, then publish them.
 
@@ -1107,6 +1151,7 @@ class HostHistoryLayer:
                             copy.width,
                         )
         else:
+            fast = decode and store.decode_fast
             hk.write_slots[(n,)](
                 key, value, slot_mapping, self.host_device, self.hot,
                 self.group_to_slot, self.store.page_of,
@@ -1114,7 +1159,10 @@ class HostHistoryLayer:
                 value.stride(1), *self.host_view.stride()[:5],
                 s.kernel_blocks_per_block, s.kernel_block_tokens,
                 s.kv_heads, s.head_dim, triton.next_power_of_2(s.kv_heads * s.head_dim),
+                Ready=store.ready, COMMIT=fast,
             )  # fmt: skip
+            if fast:
+                return
         # A separate kernel boundary publishes rows only after both copies.
         hk.commit_slots[(triton.cdiv(n, 256),)](
             slot_mapping,
@@ -1175,6 +1223,8 @@ class HostHistoryLayer:
         token_to_req: torch.Tensor,
         block_table: torch.Tensor,
         seq_lens: torch.Tensor,
+        *,
+        decode: bool = False,
     ) -> torch.Tensor:
         """Make every selected group resident and return hot token IDs.
 
@@ -1208,24 +1258,46 @@ class HostHistoryLayer:
             self._cpu_validate(selection, token_to_req, block_table, seq_lens)
         geometry = (s.dcp_world_size, s.dcp_rank, s.interleave)
         m = store.max_misses
-        kernels.clear_wanted[(triton.cdiv(m, 256),)](
-            store.wanted, store.wanted_groups, store.wanted_count, 256
-        )
-        kernels.begin_gather[(1,)](store.wanted_count, store.miss_count, self.clock)
-        hk.mark_tail[(requests,)](
-            block_table, seq_lens, store.ready, store.wanted, store.wanted_groups,
-            store.wanted_count, block_table.stride(0), s.kernel_block_tokens, m,
-            *geometry, debug=store.debug,
-        )  # fmt: skip
+        if store.decode_fast_ordered:
+            # The previous call (any layout) left marks in one or both lists.
+            hk.clear_wanted_ordered[(triton.cdiv(m, 256),)](
+                store.wanted, store.wanted_groups, store.wanted_count,
+                store.wanted_sel, store.sel_count, 256,
+            )  # fmt: skip
+            hk.begin_gather_ordered[(1,)](
+                store.wanted_count, store.sel_count, store.miss_count, self.clock
+            )
+        else:
+            kernels.clear_wanted[(triton.cdiv(m, 256),)](
+                store.wanted, store.wanted_groups, store.wanted_count, 256
+            )
+            kernels.begin_gather[(1,)](store.wanted_count, store.miss_count, self.clock)
         grid = (rows, triton.cdiv(width, 128))
-        hk.mark_selection[grid](
-            selection, token_to_req, block_table, seq_lens, store.ready,
-            store.wanted, store.wanted_groups, store.wanted_count,
-            selection.stride(0), block_table.stride(0), width,
-            s.kernel_block_tokens, m, 128, *geometry, s.qsa_group_columns,
-            debug=store.debug,
-        )  # fmt: skip
-        self._fill_from_marks()
+        fast = decode and store.decode_fast
+        ordered = fast and store.decode_fast_ordered
+        if fast:
+            hk.mark_decode[(rows + requests, grid[1])](
+                selection, token_to_req, block_table, seq_lens, store.ready,
+                store.wanted, store.wanted_groups, store.wanted_count,
+                selection.stride(0), block_table.stride(0), width,
+                s.kernel_block_tokens, m, 128, *geometry, s.qsa_group_columns,
+                rows, Sel=store.wanted_sel, SelCount=store.sel_count,
+                ORDERED=ordered, debug=store.debug,
+            )  # fmt: skip
+        else:
+            hk.mark_tail[(requests,)](
+                block_table, seq_lens, store.ready, store.wanted, store.wanted_groups,
+                store.wanted_count, block_table.stride(0), s.kernel_block_tokens, m,
+                *geometry, debug=store.debug,
+            )  # fmt: skip
+            hk.mark_selection[grid](
+                selection, token_to_req, block_table, seq_lens, store.ready,
+                store.wanted, store.wanted_groups, store.wanted_count,
+                selection.stride(0), block_table.stride(0), width,
+                s.kernel_block_tokens, m, 128, *geometry, s.qsa_group_columns,
+                debug=store.debug,
+            )  # fmt: skip
+        self._fill_from_marks(fast=fast, ordered=ordered)
         out = store.indices[:rows, :width]
         hk.remap_selection[grid](
             selection, token_to_req, block_table, seq_lens, self.group_to_slot,
@@ -1235,7 +1307,12 @@ class HostHistoryLayer:
         return out
 
     def _fill_from_marks(
-        self, *, classed: bool = False, counters: torch.Tensor | None = None
+        self,
+        *,
+        classed: bool = False,
+        counters: torch.Tensor | None = None,
+        fast: bool = False,
+        ordered: bool = False,
     ) -> None:
         """Make the marked groups (Touched/Count) resident.
 
@@ -1243,6 +1320,8 @@ class HostHistoryLayer:
         collect misses, pick victims (never a wanted slot), allocate, copy
         from the host pages through ``page_of``. ``classed`` (union path,
         ``prefill_insert_age=old``) ages groups only prefill rows want as old.
+        ``ordered`` (single-pass decode with the ordered sub-switch) reads the
+        fused mark kernel's two lists instead of the flat Touched list.
         """
         store, s = self.store, self.store.shape
         m = store.max_misses
@@ -1251,6 +1330,13 @@ class HostHistoryLayer:
                 store.wanted_groups, store.wanted_count, store.wanted,
                 self.group_to_slot, self.age, self.clock, store.miss_groups,
                 store.miss_count, m, 256, debug=store.debug,
+            )  # fmt: skip
+        elif ordered:
+            hk.collect_misses_ordered[(triton.cdiv(2 * m, 256),)](
+                store.wanted_groups, store.wanted_count, store.wanted_sel,
+                store.sel_count, store.wanted, self.group_to_slot, self.age,
+                self.clock, store.miss_groups, store.miss_count, m, 256,
+                debug=store.debug,
             )  # fmt: skip
         else:
             kernels.collect_misses[(triton.cdiv(m, 256),)](
@@ -1277,18 +1363,22 @@ class HostHistoryLayer:
         if shadow is not None:
             # Before allocation overwrites the victims' owners.
             shadow.record_victims(store, self.slot_owner, triton.cdiv(m, 256))
-        kernels.allocate_slots[(triton.cdiv(m, 256),)](
-            self.group_to_slot, self.slot_owner, self.age, self.clock,
-            store.miss_groups, store.miss_slots, store.miss_count,
-            store.victim_slots, store.victim_slots, self.eviction_hand, m,
-            s.hot_slots, 256, False, debug=store.debug,
-        )  # fmt: skip
+        if not fast:
+            kernels.allocate_slots[(triton.cdiv(m, 256),)](
+                self.group_to_slot, self.slot_owner, self.age, self.clock,
+                store.miss_groups, store.miss_slots, store.miss_count,
+                store.victim_slots, store.victim_slots, self.eviction_hand, m,
+                s.hot_slots, 256, False, debug=store.debug,
+            )  # fmt: skip
         hk.gather_groups[(store.gather_workers,)](
             self.host_device, self.hot, store.ready, store.miss_groups,
             store.miss_slots, store.miss_count, store.page_of,
             *self.host_view.stride()[:5], s.kernel_blocks_per_block,
             s.kernel_block_tokens, s.kv_heads, s.head_dim,
             triton.next_power_of_2(8 * s.kv_heads * s.head_dim),
+            Map=self.group_to_slot, Owner=self.slot_owner, Age=self.age,
+            Clock=self.clock, Victims=store.victim_slots, Hand=self.eviction_hand,
+            S=s.hot_slots, M=m, ALLOCATE=fast,
         )  # fmt: skip
         if classed:
             assert counters is not None
@@ -1360,9 +1450,16 @@ class HostHistoryLayer:
         """Clear the previous fill's marks (a complete Touched list)."""
         store = self.store
         m = store.max_misses
-        kernels.clear_wanted[(triton.cdiv(m, 256),)](
-            store.wanted, store.wanted_groups, store.wanted_count, 256
-        )
+        if store.wanted_sel is not None and store.sel_count is not None:
+            hk.clear_wanted_ordered[(triton.cdiv(m, 256),)](
+                store.wanted, store.wanted_groups, store.wanted_count,
+                store.wanted_sel, store.sel_count, 256,
+            )  # fmt: skip
+            store.sel_count.zero_()
+        else:
+            kernels.clear_wanted[(triton.cdiv(m, 256),)](
+                store.wanted, store.wanted_groups, store.wanted_count, 256
+            )
         store.wanted_count.zero_()
 
     def build_microblock_table(
@@ -1494,7 +1591,11 @@ def for_each_pass(
         ):
             raise ValueError("Invalid host-history pass intervals")
         hot_ids = layer.gather(
-            selection[start:end], token_to_req[start:end], block_table, seq_lens
+            selection[start:end],
+            token_to_req[start:end],
+            block_table,
+            seq_lens,
+            **({"decode": True} if single_pass else {}),
         )
         attend(start, end, hot_ids)
         cursor = end

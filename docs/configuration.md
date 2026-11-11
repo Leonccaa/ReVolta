@@ -371,3 +371,7 @@ for permanent junction retention. Set it to `false` to restore the legacy
 latest-only policy. It does not change compilation or persisted page identity.
 See [checkpoint retention](kv-offload.md#checkpoint-retention-evidence) for
 migration rules, limits and counters.
+
+## Host decode experiments
+
+`REVOLTA_RESEARCH_HOST_DECODE_FAST=1` fuses three pairs of host-history decode kernels. `REVOLTA_RESEARCH_HOST_DECODE_FAST_ORDERED=1` (requires the parent switch) additionally keeps the fused mark kernel's tail claims ordered before selection claims, so refill pairing and cache evolution match the unfused baseline; it costs no extra kernel launches and no phase parallelism (ordering comes from per-phase mark bits and a second wanted list, not from scheduling), at the price of one extra int32-per-hot-slot scratch tensor allocated unconditionally. `REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED=1` fuses integer metadata conversion in the DCP-sharded shared-key scorer. All are experimental and default to `0`; GPU correctness and matched performance validation are required before deployment. Set either to `0` and restart to restore its original path. The switches act inside opaque QSA operators and do not change the torch compilation key or SSD cache identity.

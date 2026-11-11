@@ -11,6 +11,7 @@ Add a variable here to document it, then run `python tools/gen_env_docs.py`.
 """
 
 SECTIONS = {
+    "research": "Pregraph preparation research switches",
     "promoted": "Promoted research switches (0.2.0rc5)",
     "deployment": "Settings used by the reference deployment",
     "profile": "Values applied by the ReVolta profile",
@@ -34,6 +35,32 @@ _LOOKUP = (
 )
 
 NOTES: dict[str, dict[str, str]] = {
+    "REVOLTA_RESEARCH_PREGRAPH_GDN_COMMON_CACHE": dict(
+        section="research",
+        since="unreleased research",
+        range="0, 1",
+        tradeoff="Deployment scope, default off. MRV2 FULL replay only: retain "
+        "one pure-speculative batch's common GDN metadata, guarded by all CPU "
+        "geometry values and the live GPU offset buffer layout. Removes repeated "
+        "host construction, mask H2D and token-index arange on a hit. Mixed and "
+        "capture batches use the original builder. Accepted counts, state IDs "
+        "and request mapping are never cached. GPU bitwise and throughput "
+        "validation pending. Set 0 and restart to restore the original builder.",
+        metrics="no dedicated counter; compare decode throughput "
+        "and preparation traces",
+    ),
+    "REVOLTA_RESEARCH_PREGRAPH_REPLAY_VIEWS": dict(
+        section="research",
+        since="unreleased research",
+        range="0, 1",
+        tradeoff="Deployment scope, default off. MRV2 FULL replay only: share "
+        "read-only state-ID and query-offset tensor views within each metadata "
+        "group for one step. No cross-step reuse or change to kernels, storage, "
+        "accepted counts or fences. GPU bitwise and throughput validation "
+        "pending. Set 0 and restart to restore per-layer view construction.",
+        metrics="no dedicated counter; compare decode throughput "
+        "and preparation traces",
+    ),
     "REVOLTA_RESEARCH_CHECKPOINT_CACHE_DROP": dict(
         section="deployment",
         since="0.2.0",

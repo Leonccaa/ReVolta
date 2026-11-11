@@ -687,6 +687,62 @@ def compute_common_gdn_attn_metadata(
     )
 
 
+class CommonGDNMetadataCache:
+    """One-entry cache of pure-speculative batch geometry, never request state.
+
+    The GPU query offsets remain a view of the runner's live input buffer.
+    Holding that view also keeps its storage alive, so a recycled address cannot
+    hit the key. Mixed batches always use the original builder, including its
+    optional offset validation. Call only outside capture, for FULL replay.
+    """
+
+    def __init__(self) -> None:
+        self._key: tuple[object, ...] | None = None
+        self._metadata: CommonGDNSpecMetadata | None = None
+
+    def get(
+        self,
+        *,
+        num_decode_draft_tokens_cpu: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        query_start_loc_cpu: torch.Tensor,
+        num_spec_state_tokens: int,
+        legacy_mixed_decode_routing: bool,
+    ) -> CommonGDNSpecMetadata | None:
+        # Only CPU tensors are inspected for values. No D2H or device fence.
+        key = (
+            num_decode_draft_tokens_cpu.numpy().tobytes(),
+            tuple(num_decode_draft_tokens_cpu.shape),
+            num_decode_draft_tokens_cpu.dtype,
+            query_start_loc_cpu.numpy().tobytes(),
+            tuple(query_start_loc_cpu.shape),
+            query_start_loc_cpu.dtype,
+            query_start_loc.device,
+            query_start_loc.dtype,
+            query_start_loc.data_ptr(),
+            tuple(query_start_loc.shape),
+            query_start_loc.stride(),
+            num_spec_state_tokens,
+            legacy_mixed_decode_routing,
+        )
+        if key == self._key:
+            return self._metadata
+        metadata = compute_common_gdn_attn_metadata(
+            num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+            query_start_loc=query_start_loc,
+            query_start_loc_cpu=query_start_loc_cpu,
+            num_spec_state_tokens=num_spec_state_tokens,
+            legacy_mixed_decode_routing=legacy_mixed_decode_routing,
+        )
+        # Cache neither mixed nor non-spec batches. The retained tensors are
+        # read-only constants, apart from the live query-offset view.
+        if metadata is not None and metadata.num_prefills == metadata.num_decodes == 0:
+            self._key, self._metadata = key, metadata
+        else:
+            self._key, self._metadata = None, None
+        return metadata
+
+
 def build_attn_metadata(
     attn_groups: list[list[AttentionGroup]],
     num_reqs: int,

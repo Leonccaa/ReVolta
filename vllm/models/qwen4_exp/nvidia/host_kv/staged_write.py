@@ -200,83 +200,108 @@ def plan_prefill_write(
         return None
     span = kbs * world
     cycle = world * interleave
-
-    def local_before(offset: int) -> int:
-        full, tail = divmod(offset, cycle)
-        return full * interleave + min(max(tail - rank * interleave, 0), interleave)
-
-    # (physical slot, logical block, local offset, count). A rank's local
-    # offsets are contiguous even when its global rows are interleaved.
-    runs: list[tuple[int, int, int, int]] = []
-    for block in range(start // span, (start + count - 1) // span + 1):
-        if block >= len(table):
-            return None
-        lo = local_before(max(start - block * span, 0))
-        hi = local_before(min(start + count - block * span, span))
-        if lo == hi:
-            continue
-        physical = int(table[block])
-        hid = physical // ratio
-        if physical < 0 or hid >= len(pages) or int(pages[hid]) <= 0:
-            return None
-        runs.append((physical * kbs + lo, block, lo, hi - lo))
-    runs.sort()
-    # Aliased table entries can also produce disjoint slices of one subpage.
-    # The reference joins those slices in slot order; leave that case to it.
-    if any(a[0] // kbs == b[0] // kbs for a, b in zip(runs, runs[1:])):
+    first, last = start // span, (start + count - 1) // span
+    if last >= len(table):
         return None
-    targets.fill(-1)
-    # Mutable descriptor fields allow one allocation per final copy, without
-    # dataclasses.replace for every full subpage joined to a 2D copy.
-    copies: list[list[int]] = []
-    packed = 0
-    for slot, block, offset, take in runs:
-        physical = slot // kbs
-        hid, sub = divmod(physical, ratio)
-        destination = (
-            int(pages[hid]) * page_stride + sub * subpage_stride + offset * row_bytes
+    blocks = np.arange(first, last + 1, dtype=np.int64)
+    left = np.maximum(start - blocks * span, 0)
+    right = np.minimum(start + count - blocks * span, span)
+    if world == 1:
+        lo, hi = left, right
+    elif interleave == 1:
+        lo = (left + world - 1 - rank) // world
+        hi = (right + world - 1 - rank) // world
+    else:
+        lo = left // cycle * interleave + np.clip(
+            left % cycle - rank * interleave, 0, interleave
         )
-        values = ramp[:take]
-        if world == 1:
-            row = block * span + offset - start
-            rows: slice | NDArray[np.int64] = slice(row, row + take)
-        elif interleave == 1:
-            row = block * span + offset * world + rank - start
-            rows = slice(row, row + take * world, world)
-        else:
-            local = values + offset
-            rows = (
-                block * span
-                + local // interleave * cycle
-                + rank * interleave
-                + local % interleave
-                - start
-            )
-        targets[rows, 0] = values + packed
-        targets[rows, 1] = values + packed + take
-        size = take * row_bytes
-        if offset == 0 and take == kbs:
-            source, width = packed * row_bytes, 2 * size
-            prev = copies[-1] if copies else None
-            if (
-                prev is not None
-                and prev[2] == width
-                and source == prev[0] + prev[3] * width
-                and destination == prev[1] + prev[3] * subpage_stride
-                and (prev[3] == 1 or prev[4:] == [width, subpage_stride])
-            ):
-                prev[3] += 1
-                prev[4:] = [width, subpage_stride]
-            else:
-                copies.append([source, destination, width, 1, 0, 0])
-        else:
-            copies.append(
-                [packed * row_bytes, destination, size, 2, size, plane_stride]
-            )
-        packed += 2 * take
-    return WritePlan(
-        targets, tuple(Copy2D(*copy) for copy in copies), packed * row_bytes
+        hi = right // cycle * interleave + np.clip(
+            right % cycle - rank * interleave, 0, interleave
+        )
+    active = hi > lo
+    physical = np.asarray(table[first : last + 1], dtype=np.int64)[active]
+    blocks, lo, take = blocks[active], lo[active], (hi - lo)[active]
+    if len(physical) == 0:
+        targets.fill(-1)
+        return WritePlan(targets, (), 0)
+    hid = physical // ratio
+    if np.any(physical < 0) or np.any(hid >= len(pages)):
+        return None
+    page = np.asarray(pages)[hid].astype(np.int64, copy=False)
+    if np.any(page <= 0):
+        return None
+    order = np.argsort(physical)
+    physical, blocks, lo, take, page = (
+        array[order] for array in (physical, blocks, lo, take, page)
     )
+    # Disjoint aliases of a subpage need the reference's run joining too.
+    if np.any(physical[1:] == physical[:-1]):
+        return None
+    ends = np.cumsum(take)
+    prefix = ends - take
+    local_rows = int(ends[-1])
+    # The store supplies a chunk-sized ramp. Small standalone callers can
+    # still supply a subpage ramp without changing the planning contract.
+    linear = (
+        ramp[:local_rows]
+        if len(ramp) >= local_rows
+        else np.arange(local_rows, dtype=np.int64)
+    )
+    token_prefix = np.repeat(prefix, take)
+    if world == 1:
+        rows = linear + np.repeat(blocks * span + lo - prefix - start, take)
+    elif interleave == 1:
+        rows = linear * world + np.repeat(
+            blocks * span + rank + (lo - prefix) * world - start, take
+        )
+    else:
+        local = linear + np.repeat(lo - prefix, take)
+        rows = (
+            np.repeat(blocks * span + rank * interleave - start, take)
+            + local // interleave * cycle
+            + local % interleave
+        )
+    targets.fill(-1)
+    k_target = linear + token_prefix
+    targets[rows, 0] = k_target
+    targets[rows, 1] = k_target + np.repeat(take, take)
+
+    destination = (
+        page * page_stride + physical % ratio * subpage_stride + lo * row_bytes
+    )
+    source = 2 * prefix * row_bytes
+    size = take * row_bytes
+    full = (lo == 0) & (take == kbs)
+    # Only full, consecutive subpages may join. Source packing already makes
+    # their source pitch exactly 2*kbs*row_bytes. Partial planes stay separate.
+    join = full[1:] & full[:-1] & (destination[1:] - destination[:-1] == subpage_stride)
+    starts_of_copies = np.concatenate(([0], np.flatnonzero(~join) + 1))
+    copy_heights = np.diff(np.concatenate((starts_of_copies, [len(take)])))
+    copies = []
+    for begin, height in zip(starts_of_copies, copy_heights):
+        nbytes = int(size[begin])
+        if full[begin]:
+            width = 2 * nbytes
+            h = int(height)
+            copy = Copy2D(
+                int(source[begin]),
+                int(destination[begin]),
+                width,
+                h,
+                width if h > 1 else 0,
+                subpage_stride if h > 1 else 0,
+            )
+        else:
+            copy = Copy2D(
+                int(source[begin]),
+                int(destination[begin]),
+                nbytes,
+                2,
+                nbytes,
+                plane_stride,
+            )
+        copies.append(copy)
+    return WritePlan(targets, tuple(copies), 2 * local_rows * row_bytes)
 
 
 @lru_cache(maxsize=1)

@@ -6,6 +6,7 @@ import random
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
+from uuid import uuid4
 
 import numpy as np
 import pytest
@@ -21,6 +22,7 @@ from vllm.models.qwen4_exp.nvidia.host_kv.staged_write import (
     plan_write,
     prefill_slots,
 )
+from vllm.v1.kv_offload.host.region import HostRegionLayout
 
 
 @pytest.mark.parametrize(
@@ -153,7 +155,9 @@ def test_closed_passes_match_greedy_and_errors():
 
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize("mixed", [False, True])
-def test_runtime_fastplan_bytes_and_fallback(rank, mixed):
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.float16])
+@pytest.mark.parametrize("shared", [False, True])
+def test_runtime_fastplan_bytes_and_fallback(rank, mixed, dtype, shared):
     shape = HostHistoryShape(
         num_blocks=6,
         kernel_blocks_per_block=3,
@@ -161,7 +165,7 @@ def test_runtime_fastplan_bytes_and_fallback(rank, mixed):
         num_layers=2,
         kv_heads=1,
         head_dim=16,
-        dtype=torch.uint8,
+        dtype=dtype,
         hot_slots=64,
         max_requests=2,
         selection_width=4,
@@ -171,13 +175,24 @@ def test_runtime_fastplan_bytes_and_fallback(rank, mixed):
         dcp_rank=rank,
         interleave=2,
     )
-    stores = [
-        HostHistoryStore(
-            replace(shape, staged_writethrough=flag), ["a", "b"], device="cpu"
-        )
-        for flag in (False, True)
-    ]
+    stores, owners = [], []
     try:
+        for flag in (False, True):
+            layout = None
+            if shared:
+                layout = HostRegionLayout(uuid4().hex, 8, 2, shape.page_bytes, (96,))
+                owners.append(layout.open(None))
+            stores.append(
+                HostHistoryStore(
+                    replace(shape, staged_writethrough=flag),
+                    ["a", "b"],
+                    device="cpu",
+                    region_layout=layout,
+                    rank=rank,
+                )
+            )
+            if shared:
+                stores[-1].region._base.view(torch.uint8).fill_(0xA5)
         for store in stores:
             store.bind_pages([(1, 4), (2, 2), (3, 5)])
             store.begin_blocks([1, 2, 3])
@@ -198,16 +213,20 @@ def test_runtime_fastplan_bytes_and_fallback(rank, mixed):
             # Decode positions are GPU-owned: supply them only to the writer.
             if mixed:
                 slots[31:33] = [80, 81]
-            key = torch.arange(padded * 16).reshape(padded, 1, 16).to(torch.uint8)
+            key = torch.arange(padded * 16).reshape(padded, 1, 16).to(dtype)
             for store in stores:
                 for layer in store.layers:
                     layer.write_encoded(key, key + 1, torch.tensor(slots))
             assert torch.equal(stores[0].host, stores[1].host)
             assert torch.equal(stores[0].ready, stores[1].ready)
+            if shared:
+                assert torch.equal(stores[0].region._base, stores[1].region._base)
             assert ptrs == [t.data_ptr() for t in stores[1].write_target_buffers]
     finally:
         for store in stores:
             store.close()
+        for owner in owners:
+            owner.cleanup()
 
 
 def test_pinned_buffer_waits_only_for_its_own_copy():

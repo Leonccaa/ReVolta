@@ -541,7 +541,7 @@ class HostHistoryStore:
                 self.write_target_events: list[torch.cuda.Event | None] = [None, None]
                 self.write_target_index = 0
                 self.write_target_ramp = np.arange(
-                    s.kernel_block_tokens, dtype=np.int64
+                    max(s.max_write_rows, s.kernel_block_tokens), dtype=np.int64
                 )
             self.staging_slots = torch.arange(
                 s.max_write_rows, dtype=torch.int64, device=device

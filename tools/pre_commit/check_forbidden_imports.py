@@ -53,6 +53,7 @@ CHECK_IMPORTS = {
             "tests/utils.py",
             # pickle and cloudpickle
             "vllm/v1/serial_utils.py",
+            "tests/config/test_dflash2_lookup_config.py",
         },
     ),
     "base64": ForbiddenImport(

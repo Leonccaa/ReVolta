@@ -1771,6 +1771,18 @@ class EngineArgs:
         if self.speculative_config is None:
             return None
 
+        from vllm.config.dflash2_lookup import capture_lookup_source
+
+        injected_fields: tuple[str, ...] = (
+            "target_model_config",
+            "target_parallel_config",
+        )
+        if "enforce_eager" not in self.speculative_config:
+            injected_fields += ("enforce_eager",)
+        lookup_source = capture_lookup_source(
+            self.speculative_config, system_fields=tuple(sorted(injected_fields))
+        )
+
         if "enforce_eager" not in self.speculative_config:
             self.speculative_config["enforce_eager"] = False
             logger.info_once(
@@ -1788,7 +1800,9 @@ class EngineArgs:
                 "target_parallel_config": target_parallel_config,
             }
         )
-        return SpeculativeConfig(**self.speculative_config)
+        return SpeculativeConfig.from_engine_args(
+            self.speculative_config, lookup_source
+        )
 
     def _maybe_apply_sm70_mtp_defaults(
         self,

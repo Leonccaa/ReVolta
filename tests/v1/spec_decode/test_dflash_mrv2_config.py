@@ -2,13 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+from transformers import Qwen3Config
 
+from vllm.config import ModelConfig, ParallelConfig
 from vllm.config.scheduler import SchedulerConfig
-from vllm.config.sm70_dflash2 import Sm70DFlash2Config
 from vllm.config.speculative import (
     SpeculativeConfig,
     get_dflash_model_draft_tokens,
@@ -207,27 +209,41 @@ def test_draft_token_handler_exposes_only_selected_verify_width() -> None:
         handler.set_draft_tokens(batch, proposals, num_draft_tokens=16)
 
 
-def _adaptive_lookup_config() -> SpeculativeConfig:
-    config = object.__new__(SpeculativeConfig)
-    config.method = "dflash"
-    config.ngram_assist = True
-    config.num_speculative_tokens = 15
-    config.sm70_dflash2 = Sm70DFlash2Config()
-    config.ddtree_disable_tree_verify = False
-    config.disable_padded_drafter_batch = False
-    config.draft_model_config = SimpleNamespace(
-        hf_config=SimpleNamespace(
-            dflash_config={"block_size": 8, "selector_top_k": 16}
+def _adaptive_lookup_config(tmp_path: Path) -> SpeculativeConfig:
+    for name, architecture in (
+        ("target", "Qwen3ForCausalLM"),
+        ("draft", "DFlash2DraftModel"),
+    ):
+        Qwen3Config(
+            architectures=[architecture],
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            head_dim=64,
+            vocab_size=128,
+            max_position_embeddings=8192,
+            dflash_config={"block_size": 8, "selector_top_k": 16},
+        ).save_pretrained(tmp_path / name)
+    return SpeculativeConfig(
+        method="dflash",
+        model=str(tmp_path / "draft"),
+        ngram_assist=True,
+        num_speculative_tokens=15,
+        target_model_config=ModelConfig(
+            model=str(tmp_path / "target"),
+            dtype="float16",
+            max_model_len=8192,
+            skip_tokenizer_init=True,
         ),
-        verify_with_parallel_config=lambda *_args: None,
-        verify_with_model_config=lambda *_args: None,
+        target_parallel_config=ParallelConfig(),
     )
-    config.verify_with_parallel_config = lambda *_args: None
-    config.verify_with_model_config = lambda *_args: None
-    return config
 
 
-def test_adaptive_lookup_disables_async_scheduling_by_default(monkeypatch) -> None:
+def test_adaptive_lookup_disables_async_scheduling_by_default(
+    monkeypatch, tmp_path
+) -> None:
     monkeypatch.setenv("VLLM_DFLASH2_LOOKUP_ADAPTIVE", "1")
     scheduler = SchedulerConfig(
         max_model_len=8192,
@@ -237,13 +253,15 @@ def test_adaptive_lookup_disables_async_scheduling_by_default(monkeypatch) -> No
 
     config = VllmConfig(
         scheduler_config=scheduler,
-        speculative_config=_adaptive_lookup_config(),
+        speculative_config=_adaptive_lookup_config(tmp_path),
     )
 
     assert config.scheduler_config.async_scheduling is False
 
 
-def test_adaptive_lookup_rejects_explicit_async_scheduling(monkeypatch) -> None:
+def test_adaptive_lookup_rejects_explicit_async_scheduling(
+    monkeypatch, tmp_path
+) -> None:
     monkeypatch.setenv("VLLM_DFLASH2_LOOKUP_ADAPTIVE", "1")
     scheduler = SchedulerConfig(
         max_model_len=8192,
@@ -254,7 +272,7 @@ def test_adaptive_lookup_rejects_explicit_async_scheduling(monkeypatch) -> None:
     with pytest.raises(ValueError, match="adaptive q8/q16 lookup verification"):
         VllmConfig(
             scheduler_config=scheduler,
-            speculative_config=_adaptive_lookup_config(),
+            speculative_config=_adaptive_lookup_config(tmp_path),
         )
 
 

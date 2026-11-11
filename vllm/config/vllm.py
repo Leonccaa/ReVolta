@@ -1776,6 +1776,9 @@ class VllmConfig:
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
 
+        if self.speculative_config is not None:
+            self.speculative_config.require_lookup_runtime()
+
         from vllm.revolta_profile import (
             all_visible_devices_sm70,
             apply_revolta_kernel_profile,
@@ -1938,7 +1941,7 @@ class VllmConfig:
         adaptive_dflash_lookup = bool(
             self.speculative_config is not None
             and uses_adaptive_dflash_lookup(self.speculative_config)
-            and envs.VLLM_DFLASH2_LOOKUP_ADAPTIVE
+            and self.speculative_config.lookup_env("VLLM_DFLASH2_LOOKUP_ADAPTIVE")
         )
         dflash_width_policy = (
             getattr(self.speculative_config, "dflash_concurrency_drafts", None)

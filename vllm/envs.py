@@ -1021,6 +1021,7 @@ if TYPE_CHECKING:
     VLLM_QWEN4EXP_PLE_HOST_GIB: float | None = None
     VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB: float | None = None
     VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB: float | None = None
+    REVOLTA_RESEARCH_CHECKPOINT_CACHE_DROP: bool = False
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -16097,7 +16098,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Host memory in GiB the automatic PLE placement leaves untouched for the
     # engine processes, checkpoint loading and other tenants; the rest is
     # shared equally by the tensor-parallel ranks that pin the table.
-    # Unset: 25 % of the physical host memory.
+    # Unset: 25 % of the host memory limit, capped at 8 GiB.
     "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB": env_var(
         lambda: (
             None
@@ -16108,13 +16109,31 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "Host memory in GiB the automatic PLE placement leaves untouched "
             "for the engine processes, checkpoint loading and other tenants; "
             "the rest is shared equally by the tensor-parallel ranks that pin "
-            "the table. Unset: 25 % of the physical host memory."
+            "the table. Unset: 25 % of the host memory limit, capped at 8 GiB. "
+            "CPU KV pools are accounted separately in the preflight."
         ),
         category="configuration",
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
+    ),
+    "REVOLTA_RESEARCH_CHECKPOINT_CACHE_DROP": env_var(
+        lambda: bool(int(os.getenv("REVOLTA_RESEARCH_CHECKPOINT_CACHE_DROP", "0"))),
+        description=(
+            "Experimental startup-only checkpoint cache advice in GPU workers. "
+            "After all ranks finish main and draft loading, advise DONTNEED on "
+            "DefaultModelLoader inputs that no rank still maps. PLE disk and "
+            "cascade modes skip all inputs. Logs advised bytes and cgroup "
+            "memory.current/file before and after; actual eviction is not "
+            "guaranteed. Set 0 to disable."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("Checkpoint loading (startup, GPU worker)",),
         user_visible=True,
     ),
     # Log model inspection after loading.

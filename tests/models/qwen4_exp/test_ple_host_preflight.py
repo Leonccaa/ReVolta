@@ -39,7 +39,7 @@ def test_unavailable_cgroup_limit_falls_back_to_meminfo(monkeypatch, tmp_path, l
 def test_cgroup_shortage_counts_cpu_kv_pool_once(monkeypatch):
     set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_GIB", "12")
     set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", None)
-    monkeypatch.setattr(ple, "cgroup_host_memory", lambda: (128 * GIB, 120 * GIB))
+    monkeypatch.setattr(ple, "cgroup_host_memory", lambda: (128 * GIB, 100 * GIB))
     monkeypatch.setattr(ple, "available_host_bytes", lambda: 400 * GIB)
     warnings = []
     monkeypatch.setattr(
@@ -49,7 +49,7 @@ def test_cgroup_shortage_counts_cpu_kv_pool_once(monkeypatch):
     assert len(warnings) == 1
     message = warnings[0]
     assert "cgroup" in message and "48.0" in message and "CPU KV" in message
-    assert "120.0" in message and "32.0" in message
+    assert "100.0" in message and "reserve 8.0" in message
 
 
 def test_existing_preflight_cannot_pass_on_host_ram_above_container_limit(monkeypatch):
@@ -87,6 +87,43 @@ def test_resolved_cpu_pool_is_a_total_not_per_rank(connector, extra):
         cache_config=NS(kv_offloading_size=48),
     )
     assert ple.cpu_kv_offload_bytes(config) == 48 * GIB
+
+
+@pytest.mark.parametrize("total,expected", [(16, 4), (30, 7.5), (32, 8), (196, 8)])
+def test_default_host_reserve_is_capped(monkeypatch, total, expected):
+    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", None)
+    assert ple.ple_host_reserve_bytes(total * GIB) == int(expected * GIB)
+    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", "49")
+    assert ple.ple_host_reserve_bytes(total * GIB) == 49 * GIB
+
+
+@pytest.mark.parametrize("enabled,expected", [(True, 98), (False, 48)])
+def test_unified_host_store_replaces_legacy_pool_once(enabled, expected):
+    config = NS(
+        kernel_config=NS(long_context_kv=NS(enabled=enabled, host_store_gib=98)),
+        kv_transfer_config=NS(
+            kv_connector="OffloadingConnector",
+            kv_connector_extra_config={"cpu_bytes_to_use": 48 * GIB},
+        ),
+        cache_config=NS(kv_offloading_size=48),
+    )
+    assert ple.cpu_kv_offload_bytes(config) == expected * GIB
+
+
+def test_production_sized_budget_logs_shared_98_gib_and_8_gib_reserve(monkeypatch):
+    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_GIB", "12")
+    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", None)
+    monkeypatch.setattr(
+        ple, "preflight_host_memory", lambda: (196 * GIB, 188 * GIB, "cgroup")
+    )
+    messages = []
+    monkeypatch.setattr(
+        ple.logger, "info", lambda msg, *args: messages.append(msg % args)
+    )
+    ple.check_ple_host_share(NS(ple_layer_ids=[1]), 4, cpu_kv_bytes=98 * GIB)
+    assert len(messages) == 1
+    assert "upper bound 48.0" in messages[0]
+    assert "CPU KV pool 98.0 GiB total, reserve 8.0" in messages[0]
 
 
 def test_explicit_partial_host_placement_warns_and_keeps_existing_split(monkeypatch):

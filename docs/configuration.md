@@ -213,8 +213,10 @@ is configuration, tuning, experimental, debug or deprecated.
 
 | Name | Type | Default | Range | Category | Since | Effect and trade-off |
 |---|---|---|---|---|---|---|
+| `REVOLTA_RESEARCH_CHECKPOINT_CACHE_DROP` | bool | `False` | 0, 1 | experimental | 0.2.0 | Research, engine startup only; default off. 1 requests clean checkpoint cache eviction before host KV allocation, after a world load barrier. Skips live mappings and PLE disk/cascade modes. May slow later reloads or other engines reading the same checkpoint. See startup logs for advised files/bytes and cgroup usage; no metric. |
 | `VLLM_PLE_OFFLOAD_READY_TIMEOUT` | float | `600.0` | seconds | configuration | 1Cat | How long startup waits for the PLE offload worker. Raise it on slow storage; the reference deployment uses 1200. |
 | `VLLM_QWEN4EXP_PLE_HOST_GIB` | float \| None | `None` | GiB per TP rank; unset = automatic | configuration | 1Cat | Caps pinned host memory for the PLE table. Lower values leave host RAM for CPU KV offload but move more PLE rows to disk; the reference deployment uses 12. |
+| `VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB` | float \| None | `None` | non-negative GiB or unset | configuration | 1Cat | Unset reserves min(host limit / 4, 8 GiB), preserving the small-host margin without scaling it to tens of GiB. Explicit values override the cap. The warning-only preflight counts shared CPU KV storage separately; automatic placement also uses this reserve. |
 | `VLLM_SM70_AWQ_MOE_INT4_ZERO` | bool | `False` | 0, 1 | experimental | 0.2.0 | Packs AWQ zero points into nibbles: less resident metadata, lossless. Needs compact metadata and a native build with the packed kernels. |
 | `VLLM_SM70_DFLASH2_FUSED_QKV_PACK` | bool | `False` | 0, 1 | configuration | 1Cat | One Triton launch instead of three copies and a concat in the DFlash2 verifier. Outputs are bitwise identical either way. |
 | `VLLM_SM70_FLASH_ATTN_V100` | bool | `True` | 0, 1 | configuration | 1Cat | Default on (set in the image). 0 only to diagnose backend selection; prefer --attention-backend to choose a backend. |

@@ -42,6 +42,7 @@ from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu.attn_utils import (
+    CommonGDNMetadataCache,
     CommonGDNSpecMetadata,
     build_attn_metadata,
     compute_common_gdn_attn_metadata,
@@ -425,7 +426,17 @@ class MambaHybridModelState(DefaultModelState):
             if self._use_common_gdn_metadata:
                 speculative_config = self.vllm_config.speculative_config
                 assert speculative_config is not None
-                common_gdn_metadata = compute_common_gdn_attn_metadata(
+                common_metadata_builder = compute_common_gdn_attn_metadata
+                if (
+                    envs.REVOLTA_RESEARCH_PREGRAPH_GDN_COMMON_CACHE
+                    and cudagraph_mode == CUDAGraphMode.FULL
+                ):
+                    cache = getattr(self, "_pregraph_gdn_common_cache", None)
+                    if cache is None:
+                        cache = CommonGDNMetadataCache()
+                        self._pregraph_gdn_common_cache = cache
+                    common_metadata_builder = cache.get
+                common_gdn_metadata = common_metadata_builder(
                     num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
                     query_start_loc=input_batch.query_start_loc,
                     query_start_loc_cpu=query_start_loc_cpu,
@@ -586,6 +597,13 @@ class MambaHybridModelState(DefaultModelState):
             return None
         forward_context = self.vllm_config.compilation_config.static_forward_context
         layers: list[GDNSpecReplayLayer] = []
+        # Layers sharing one builder also share its metadata tensors. Reuse
+        # their two tensor views within this step; never cache live state or
+        # views across batches. The disabled path creates views as before.
+        reuse_views = envs.REVOLTA_RESEARCH_PREGRAPH_REPLAY_VIEWS and full_graph
+        views: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] | None = (
+            {} if reuse_views else None
+        )
         launch: tuple[int, int] | None = None
         for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
             for layer_name in group.layer_names:
@@ -611,14 +629,25 @@ class MambaHybridModelState(DefaultModelState):
                 launch = layer_launch
                 assert metadata.spec_state_indices_tensor is not None
                 assert metadata.spec_query_start_loc is not None
+                if views is not None:
+                    key = (id(metadata), layer_launch[0])
+                    if key not in views:
+                        views[key] = (
+                            metadata.spec_state_indices_tensor[: layer_launch[0], 0],
+                            metadata.spec_query_start_loc[: layer_launch[0] + 1],
+                        )
+                    base_state_ids, cu_seqlens = views[key]
+                else:
+                    base_state_ids = metadata.spec_state_indices_tensor[
+                        : layer_launch[0], 0
+                    ]
+                    cu_seqlens = metadata.spec_query_start_loc[: layer_launch[0] + 1]
                 layers.append(
                     GDNSpecReplayLayer(
                         layer=layer,
                         group_id=group_id,
-                        base_state_ids=metadata.spec_state_indices_tensor[
-                            : layer_launch[0], 0
-                        ],
-                        cu_seqlens=metadata.spec_query_start_loc[: layer_launch[0] + 1],
+                        base_state_ids=base_state_ids,
+                        cu_seqlens=cu_seqlens,
                     )
                 )
         if launch is None:

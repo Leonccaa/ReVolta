@@ -358,6 +358,8 @@ if TYPE_CHECKING:
     REVOLTA_RESEARCH_HOST_DECODE_FAST: bool = False
     REVOLTA_RESEARCH_HOST_DECODE_FAST_ORDERED: bool = False
     REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED: bool = False
+    REVOLTA_RESEARCH_PREGRAPH_GDN_COMMON_CACHE: bool = False
+    REVOLTA_RESEARCH_PREGRAPH_REPLAY_VIEWS: bool = False
     VLLM_DFLASH2_LOOKUP_ADAPTIVE: bool = True
     VLLM_DFLASH2_LOOKUP_NSTRONG: int = 6
     VLLM_DFLASH2_LOOKUP_AGREE: int = 0
@@ -4654,6 +4656,35 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "descriptor (call index, rows, top-k, request/position checksums) "
             "and fail if DCP ranks disagree. Synchronizes the host; skipped "
             "during CUDA graph capture."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "REVOLTA_RESEARCH_PREGRAPH_GDN_COMMON_CACHE": env_var(
+        lambda: os.getenv("REVOLTA_RESEARCH_PREGRAPH_GDN_COMMON_CACHE", "0") == "1",
+        description=(
+            "Cache one pure-speculative FULL replay batch's common GDN geometry. "
+            "CPU offsets, draft counts and GPU offset-buffer layout guard reuse; "
+            "request state and accepted counts remain live. Default off pending "
+            "GPU equivalence and performance validation."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "REVOLTA_RESEARCH_PREGRAPH_REPLAY_VIEWS": env_var(
+        lambda: os.getenv("REVOLTA_RESEARCH_PREGRAPH_REPLAY_VIEWS", "0") == "1",
+        description=(
+            "Share GDN replay metadata tensor views among layers using the same "
+            "metadata object within a FULL replay step. No cross-step state "
+            "cache. Default off pending GPU equivalence and performance validation."
         ),
         category="experimental",
         declared_default="False",
@@ -20286,6 +20317,9 @@ def compile_factors(speculative_config: Any = None) -> dict[str, object]:
         "REVOLTA_RESEARCH_HOST_DECODE_FAST",
         "REVOLTA_RESEARCH_HOST_DECODE_FAST_ORDERED",
         "REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED",
+        # Host metadata construction only; captured model operations unchanged.
+        "REVOLTA_RESEARCH_PREGRAPH_GDN_COMMON_CACHE",
+        "REVOLTA_RESEARCH_PREGRAPH_REPLAY_VIEWS",
         "VLLM_RPC_BASE_PATH",
         "VLLM_USE_MODELSCOPE",
         "VLLM_RINGBUFFER_WARNING_INTERVAL",

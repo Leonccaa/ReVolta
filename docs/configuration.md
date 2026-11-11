@@ -196,6 +196,13 @@ type and default as registered in `vllm/envs.py`; *Since* is the first
 release with the variable (1Cat = inherited from 1Cat-vLLM); *Category*
 is configuration, tuning, experimental, debug or deprecated.
 
+### Pregraph preparation research switches
+
+| Name | Type | Default | Range | Category | Since | Effect and trade-off |
+|---|---|---|---|---|---|---|
+| `REVOLTA_RESEARCH_PREGRAPH_GDN_COMMON_CACHE` | bool | `False` | 0, 1 | experimental | unreleased research | Deployment scope, default off. MRV2 FULL replay only: retain one pure-speculative batch's common GDN metadata, guarded by all CPU geometry values and the live GPU offset buffer layout. Removes repeated host construction, mask H2D and token-index arange on a hit. Mixed and capture batches use the original builder. Accepted counts, state IDs and request mapping are never cached. GPU bitwise and throughput validation pending. Set 0 and restart to restore the original builder. Metrics: no dedicated counter; compare decode throughput and preparation traces. |
+| `REVOLTA_RESEARCH_PREGRAPH_REPLAY_VIEWS` | bool | `False` | 0, 1 | experimental | unreleased research | Deployment scope, default off. MRV2 FULL replay only: share read-only state-ID and query-offset tensor views within each metadata group for one step. No cross-step reuse or change to kernels, storage, accepted counts or fences. GPU bitwise and throughput validation pending. Set 0 and restart to restore per-layer view construction. Metrics: no dedicated counter; compare decode throughput and preparation traces. |
+
 ### Promoted research switches (0.2.0rc5)
 
 | Name | Type | Default | Range | Category | Since | Effect and trade-off |

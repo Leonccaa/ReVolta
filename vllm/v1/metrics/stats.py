@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.v1.metrics.perf import PerfStats
+from vllm.v1.spec_decode.lookup_stats import LookupStatsMessage
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 if TYPE_CHECKING:
@@ -188,6 +189,7 @@ class SchedulerStats:
     kv_cache_eviction_events: list[KVCacheEvictionEvent] = field(default_factory=list)
 
     spec_decoding_stats: SpecDecodingStats | None = None
+    lookup_stats: LookupStatsMessage | None = None
     kv_connector_stats: dict[str, Any] | None = None
 
     waiting_lora_adapters: dict[str, int] = field(default_factory=dict)

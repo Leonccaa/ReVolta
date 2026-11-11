@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+
 # Copyright 2023 The vLLM team.
 # Adapted from
 # https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/parallel_state.py
@@ -57,6 +58,7 @@ from vllm.utils.system_utils import suppress_stdout
 from vllm.utils.torch_utils import (
     direct_register_custom_op,
 )
+from vllm.v1.spec_decode.lookup_quarantine import context_isolated
 
 if TYPE_CHECKING:
     from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
@@ -2265,6 +2267,8 @@ def get_node_count() -> int:
 
 
 def destroy_model_parallel():
+    if context_isolated():
+        return
     """Set the groups to none and destroy them."""
     global _TP
 
@@ -2304,6 +2308,8 @@ def destroy_model_parallel():
 
 
 def destroy_distributed_environment():
+    if context_isolated():
+        return
     global _WORLD, _NODE_COUNT
     if _WORLD:
         _WORLD.destroy()
@@ -2314,6 +2320,8 @@ def destroy_distributed_environment():
 
 
 def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
+    if context_isolated():
+        return
     # Reset environment variable cache
     envs.disable_envs_cache()
 

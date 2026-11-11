@@ -55,6 +55,8 @@ def _native_fuse_kernel(
     eligible,
     use,
     NMIN: tl.constexpr,
+    counters=None,
+    COLLECT_STATS: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     offsets = tl.arange(0, 8)
@@ -69,6 +71,20 @@ def _native_fuse_kernel(
         & (tl.load(valid + row) > 0)
         & (first == first_lookup)
     )
+    if COLLECT_STATS:
+        candidate = (tl.load(match + row) >= NMIN) & (tl.load(valid + row) > 0)
+        tl.atomic_add(counters, 1)
+        tl.atomic_add(counters + 1, candidate.to(tl.uint64))
+        tl.atomic_add(counters + 2, take.to(tl.uint64))
+        tl.atomic_add(counters + 3, (take & (tl.load(valid + row) >= 2)).to(tl.uint64))
+        if candidate:
+            length = tl.load(match + row)
+            bucket = tl.full((), 0, tl.int32)
+            limits: tl.constexpr = (1, 2, 3, 4, 5, 6, 8, 12, 16, 32, 64, 128)
+            for boundary in tl.static_range(12):
+                bucket += (length > limits[boundary]).to(tl.int32)
+            tl.atomic_add(counters + 4 + bucket, 1)
+            tl.atomic_add(counters + 17, length.to(tl.uint64))
     replace = take & (offsets > 0) & (offsets < tl.load(valid + row)) & mask
     tokens = tl.load(lookup + row * lookup_stride + offsets, mask=mask, other=0)
     tl.store(draft + row * draft_stride + offsets, tokens, mask=replace)
@@ -84,6 +100,8 @@ class NativeDFlash2Lookup:
         max_num_reqs: int,
         max_model_len: int,
         device: torch.device,
+        *,
+        stats=None,
     ):
         if (
             config.mode != "gpu_head"
@@ -97,6 +115,7 @@ class NativeDFlash2Lookup:
         self.nmin, self.nmax = config.nmin, config.nmax
         self.search_window = config.search_window
         self.max_model_len = max_model_len
+        self.stats = stats
         self.tokens = torch.zeros((max_num_reqs, 7), dtype=torch.int32, device=device)
         self.match = torch.zeros(max_num_reqs, dtype=torch.int32, device=device)
         self.valid = torch.zeros_like(self.match)
@@ -174,6 +193,8 @@ class NativeDFlash2Lookup:
             self.eligible,
             self.use,
             NMIN=self.nmin,
+            counters=None if self.stats is None else self.stats.counters,
+            COLLECT_STATS=self.stats is not None,
             num_warps=1,
         )
         if logits is not None:

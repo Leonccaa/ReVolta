@@ -545,11 +545,14 @@ class DFlash2Speculator(DFlashSpeculator):
         ):
             if device.type != "cuda":
                 raise ValueError("Native DFlash2 lookup requires CUDA")
+            from vllm.v1.worker.gpu.spec_decode.dflash2.stats import create_exporter
+
             self._native_lookup = NativeDFlash2Lookup(
                 speculative_config.resolved_dflash2_lookup,
                 self.max_num_reqs,
                 self.max_model_len,
                 device,
+                stats=create_exporter(vllm_config, device),
             )
         self._req_states = None
         self._lookup_current_req_key: tuple[int, ...] = ()

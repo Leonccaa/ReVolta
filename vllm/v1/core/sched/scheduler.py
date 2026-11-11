@@ -2828,6 +2828,7 @@ class Scheduler(SchedulerInterface):
                 # We must return the stats even if there are no request
                 # outputs this step.
                 engine_core_outputs[0] = eco = EngineCoreOutputs()
+            stats.lookup_stats = getattr(model_runner_output, "lookup_stats", None)
             eco.scheduler_stats = stats
 
         if self.store_metrics is not None and schedule_cpu is not None:

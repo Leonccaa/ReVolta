@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+
 """
 NOTE: Coding style guide for this file:
 This model runner is shared by all models: text and multimodal, generative
@@ -66,6 +68,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+from vllm.v1.spec_decode.lookup_quarantine import isolated, require_reusable_context
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
 from vllm.v1.worker.gpu.attn_utils import (
@@ -171,6 +174,7 @@ def _detach_model_runtime_state(model: nn.Module) -> None:
 
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        require_reusable_context()
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
@@ -1787,7 +1791,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
                 empty_output = self.kv_connector.no_forward(scheduler_output)
-                return empty_output
+                from vllm.v1.worker.gpu.spec_decode.dflash2.stats import (
+                    attach_empty_output,
+                )
+
+                return attach_empty_output(self, empty_output)
 
         # Get batch descriptor and sync across DP ranks.
         num_reqs = len(scheduler_output.num_scheduled_tokens)
@@ -2267,6 +2275,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         self._sm70_v2_mtp_profile_report(mtp_profile_ctx)
 
+        native = getattr(self.speculator, "_native_lookup", None)
+        stats = getattr(native, "stats", None)
+        if stats is not None:
+            stats.submitted()
+            model_runner_output.lookup_stats = stats.service()
+
         if self.use_async_scheduling:
             return async_output
         return async_output.get_output()
@@ -2320,6 +2334,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def shutdown(self) -> None:
         """Release GPU tensors (model weights, KV caches, workspace) so that
         memory is reclaimable when running in the same process."""
+        if isolated(self):
+            return
         torch.accelerator.synchronize()
         # CUDA graph managers own graph pools, captured outputs, and persistent
         # attention metadata. Drop both target and draft managers first.

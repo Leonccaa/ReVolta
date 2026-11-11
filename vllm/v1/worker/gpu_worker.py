@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+
 """A GPU worker class."""
 
 import gc
@@ -68,6 +70,7 @@ from vllm.v1.outputs import (
     DraftTokenIds,
     ModelRunnerOutput,
 )
+from vllm.v1.spec_decode.lookup_quarantine import isolated, require_reusable_context
 from vllm.v1.utils import compute_iteration_details, report_usage_stats
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
@@ -125,6 +128,7 @@ class Worker(WorkerBase):
         distributed_init_method: str,
         is_driver_worker: bool = False,
     ):
+        require_reusable_context()
         super().__init__(
             vllm_config=vllm_config,
             local_rank=local_rank,
@@ -132,6 +136,10 @@ class Worker(WorkerBase):
             distributed_init_method=distributed_init_method,
             is_driver_worker=is_driver_worker,
         )
+
+        from vllm.v1.spec_decode.lookup_stats import set_worker_rank
+
+        set_worker_rank(vllm_config, rank)
 
         # configure float32 matmul precision according to vLLM env.
         precision = envs.VLLM_FLOAT32_MATMUL_PRECISION
@@ -1098,6 +1106,9 @@ class Worker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        from vllm.v1.worker.gpu.spec_decode.dflash2.stats import begin_worker_activity
+
+        begin_worker_activity(self)
         return self.model_runner.sample_tokens(grammar_output)
 
     def _use_sm70_static_pp_hidden_transfer(self, num_tokens: int) -> bool:
@@ -1190,6 +1201,9 @@ class Worker(WorkerBase):
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        from vllm.v1.worker.gpu.spec_decode.dflash2.stats import begin_worker_activity
+
+        begin_worker_activity(self)
         # ensure any previous non-blocking PP sends are complete
         if self._pp_send_work:
             for handle in self._pp_send_work:
@@ -1538,6 +1552,29 @@ class Worker(WorkerBase):
         self._weight_update_active = False
         self._is_checkpoint_format = True
 
+    def get_lookup_stats_status(self):
+        native = getattr(
+            getattr(self.model_runner, "speculator", None), "_native_lookup", None
+        )
+        exporter = getattr(native, "stats", None)
+        return self.rank, exporter is not None
+
+    def drain_lookup_stats(
+        self,
+        *,
+        stats_deadline_monotonic: float,
+        expected_generation: str,
+        expected_owner: str,
+    ):
+        from vllm.v1.worker.gpu.spec_decode.dflash2.stats import drain_worker
+
+        return drain_worker(
+            self,
+            stats_deadline_monotonic=stats_deadline_monotonic,
+            expected_generation=expected_generation,
+            expected_owner=expected_owner,
+        )
+
     def drain_host_kv(self):
         """Control RPC. All ranks acknowledge before any executor teardown."""
         try:
@@ -1552,6 +1589,8 @@ class Worker(WorkerBase):
             return self.rank, None, repr(error)
 
     def shutdown(self) -> None:
+        if isolated(self):
+            return
         # Undo the freeze from compile_or_warm_up_model so that objects
         # allocated at startup can be collected when the worker is torn down
         # in-process.

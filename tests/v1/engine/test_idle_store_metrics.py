@@ -16,6 +16,13 @@ from prometheus_client import Counter as PromCounter
 from tests.v1.core.utils import create_scheduler
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.metrics.store import StoreMetricsProm
+from vllm.v1.spec_decode.lookup_stats import (
+    ZERO,
+    LookupStatsAccumulator,
+    LookupStatsMessage,
+    LookupStatsRegistration,
+    LookupStatsSnapshot,
+)
 
 
 @pytest.mark.parametrize("persistence_pending", [False, True])
@@ -58,6 +65,21 @@ def test_idle_polls_export_deltas_and_resume_without_double_counting(
 
     engine = object.__new__(EngineCoreProc)
     engine.scheduler = scheduler
+    registration = LookupStatsRegistration(0, "output", "worker-generation", 0)
+    engine.lookup_stats = LookupStatsAccumulator(registration)
+    lookup_totals = (1,) + ZERO[1:]
+    engine.lookup_stats.merge(
+        LookupStatsMessage(
+            registration.owner,
+            registration.generation,
+            2,
+            LookupStatsSnapshot(1, 1, lookup_totals, 999.0),
+        )
+    )
+    engine.model_executor = Mock()
+    engine.model_executor.collective_rpc.side_effect = AssertionError(
+        "IDLE_MUST_NOT_ISSUE_LOOKUP_RPC"
+    )
     engine.has_work = lambda: False
     engine.is_running = lambda: True
     engine._notify_idle_state_callbacks = Mock()
@@ -73,6 +95,14 @@ def test_idle_polls_export_deltas_and_resume_without_double_counting(
     assert len(outputs) == 3
     assert log.call_count == 3
     assert all(client == 0 for client, _ in outputs)
+    assert all(out.scheduler_stats.lookup_stats is None for _, out in outputs)
+    state = engine.lookup_stats
+    assert (state.producer, state.covered, state.sequence) == (2, 1, 1), (
+        "IDLE_LOOKUP_WATERMARK_UNCHANGED"
+    )
+    assert state.totals == lookup_totals, "IDLE_LOOKUP_COUNTS_UNCHANGED"
+    assert state.timestamp == 999.0 and state.pending == 1
+    engine.model_executor.collective_rpc.assert_not_called()
     payloads = [out.scheduler_stats.store_stats for _, out in outputs]
     assert [p["gauges"]["store_snapshot_unix_s"] for p in payloads] == [
         1000.0,

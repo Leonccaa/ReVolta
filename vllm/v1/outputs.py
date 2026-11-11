@@ -11,6 +11,7 @@ import torch
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.spec_decode.lookup_stats import LookupStatsMessage
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_events import KVConnectorKVEvents
@@ -298,6 +299,7 @@ class ModelRunnerOutput:
 
     # Completed GPU timing only; CUDA events never cross process boundaries.
     mixed_prefill_timing: MixedPrefillTiming | None = None
+    lookup_stats: LookupStatsMessage | None = None
 
     @staticmethod
     def with_kv_conn_output_only(

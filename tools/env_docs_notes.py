@@ -148,21 +148,13 @@ NOTES: dict[str, dict[str, str]] = {
         metrics="",
     ),
     # ---- anonymous usage statistics ---------------------------------------
-    "REVOLTA_NO_USAGE_STATS": dict(
-        section="usage",
-        since="0.2.0",
-        range="0, 1",
-        tradeoff="Turns the ReVolta usage report off for this fork without "
-        "touching the upstream variables. Nothing is collected or sent when "
-        "off; see the usage statistics guide.",
-        metrics="",
-    ),
     "VLLM_NO_USAGE_STATS": dict(
         section="usage",
         since="1Cat",
         range="0, 1",
         tradeoff="Upstream opt-out, honoured as-is: 1 turns the usage report "
-        "off. Same effect as REVOLTA_NO_USAGE_STATS=1.",
+        "off. The Do Not Track variables and the do_not_track file have the "
+        "same effect.",
         metrics="",
     ),
     "VLLM_DO_NOT_TRACK": dict(

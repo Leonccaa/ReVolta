@@ -15,7 +15,6 @@ from vllm.v1 import utils as v1_utils
 REVOLTA_COLLECTOR = "https://ai.19b.net/api/usage"
 
 OPT_OUT_VARS = (
-    "REVOLTA_NO_USAGE_STATS",
     "VLLM_NO_USAGE_STATS",
     "VLLM_DO_NOT_TRACK",
     "DO_NOT_TRACK",
@@ -98,12 +97,12 @@ def test_every_opt_out_switch_disables(name, monkeypatch):
 
 
 def test_opt_out_value_other_than_one_keeps_it_on(monkeypatch):
-    monkeypatch.setenv("REVOLTA_NO_USAGE_STATS", "0")
+    monkeypatch.setenv("VLLM_NO_USAGE_STATS", "0")
     assert usage_lib.is_usage_stats_enabled() is True
 
 
 def test_one_opt_out_is_enough_among_several(monkeypatch):
-    monkeypatch.setenv("REVOLTA_NO_USAGE_STATS", "0")
+    monkeypatch.setenv("DO_NOT_TRACK", "0")
     monkeypatch.setenv("VLLM_NO_USAGE_STATS", "1")
     assert usage_lib.is_usage_stats_enabled() is False
 
@@ -321,7 +320,7 @@ def test_broken_config_never_raises(capture_report):
 
 
 def test_disabled_reports_nothing(capture_report, monkeypatch):
-    monkeypatch.setenv("REVOLTA_NO_USAGE_STATS", "1")
+    monkeypatch.setenv("VLLM_NO_USAGE_STATS", "1")
     # The config is never read: the function returns before touching it.
     v1_utils.report_usage_stats(vllm_config=None)
     assert capture_report == {}
@@ -433,7 +432,6 @@ def test_notice_is_logged_once_per_process(monkeypatch):
     assert len(notices) == 1
     text = notices[0]
     assert REVOLTA_COLLECTOR in text
-    assert "REVOLTA_NO_USAGE_STATS=1" in text
     assert "VLLM_NO_USAGE_STATS=1" in text
     assert "DO_NOT_TRACK" in text
     assert "docs/usage-stats.md" in text
@@ -447,7 +445,7 @@ def test_no_notice_when_collection_is_off(monkeypatch):
         debug=lambda *args: None,
     )
     monkeypatch.setattr(usage_lib, "logger", fake)
-    monkeypatch.setenv("REVOLTA_NO_USAGE_STATS", "1")
+    monkeypatch.setenv("VLLM_NO_USAGE_STATS", "1")
 
     v1_utils.report_usage_stats(vllm_config=None)
 

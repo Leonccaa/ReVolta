@@ -71,8 +71,7 @@ Any one of these disables collection and sending:
 
 | Setting | Effect |
 | --- | --- |
-| `REVOLTA_NO_USAGE_STATS=1` | ReVolta's own switch; turns off this fork without touching the upstream variables. |
-| `VLLM_NO_USAGE_STATS=1` | Upstream switch, honoured as-is. |
+| `VLLM_NO_USAGE_STATS=1` | Upstream switch, honoured as-is: 1 turns the usage report off. |
 | `VLLM_DO_NOT_TRACK=1` or `DO_NOT_TRACK=1` | [Do Not Track](https://contribute.ispr.io/what-do-not-track-dnt-is-and-how-to-enable-it-in-all-of-your-browsers/) convention, honoured as-is. |
 | A `do_not_track` file in `VLLM_CONFIG_ROOT` | File-based opt-out (by default `~/.config/vllm/do_not_track`). |
 

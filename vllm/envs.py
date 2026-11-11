@@ -183,7 +183,6 @@ if TYPE_CHECKING:
     VLLM_USAGE_STATS_SERVER: str = "https://ai.19b.net/api/usage"
     VLLM_NO_USAGE_STATS: bool = False
     VLLM_DO_NOT_TRACK: bool = False
-    REVOLTA_NO_USAGE_STATS: bool = False
     VLLM_USAGE_SOURCE: str = "production"
     VLLM_CONFIGURE_LOGGING: bool = True
     VLLM_LOGGING_LEVEL: str = "INFO"
@@ -2344,9 +2343,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "with its own collector instead of the upstream vLLM server; set "
             "this to point somewhere else, or to an empty string to send "
             "nothing. Collection itself is turned off with "
-            "REVOLTA_NO_USAGE_STATS=1, VLLM_NO_USAGE_STATS=1, "
-            "VLLM_DO_NOT_TRACK=1, DO_NOT_TRACK=1 or a do_not_track file in "
-            "VLLM_CONFIG_ROOT."
+            "VLLM_NO_USAGE_STATS=1, VLLM_DO_NOT_TRACK=1, DO_NOT_TRACK=1 or a "
+            "do_not_track file in VLLM_CONFIG_ROOT."
         ),
         category="configuration",
         declared_default="'https://ai.19b.net/api/usage'",
@@ -2380,22 +2378,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
         description=(
             "vLLM: do not track. The consumer locations and unset defaults are"
             " listed below."
-        ),
-        category="configuration",
-        declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
-        acceleration_paths=(),
-        user_visible=True,
-    ),
-    "REVOLTA_NO_USAGE_STATS": env_var(
-        lambda: os.environ.get("REVOLTA_NO_USAGE_STATS", "0") == "1",
-        description=(
-            "ReVolta switch that turns anonymous usage statistics off for "
-            "this fork without touching the upstream variables. Any of "
-            "VLLM_NO_USAGE_STATS=1, VLLM_DO_NOT_TRACK=1, DO_NOT_TRACK=1 or a "
-            "do_not_track file in VLLM_CONFIG_ROOT also turns it off; see "
-            "docs/usage-stats.md."
         ),
         category="configuration",
         declared_default="False",
@@ -20387,7 +20369,6 @@ def compile_factors(speculative_config: Any = None) -> dict[str, object]:
         "VLLM_USAGE_STATS_SERVER",
         "VLLM_NO_USAGE_STATS",
         "VLLM_DO_NOT_TRACK",
-        "REVOLTA_NO_USAGE_STATS",
         "VLLM_LOGGING_LEVEL",
         "VLLM_REVOLTA_PROFILE_PROVENANCE",
         # Host metadata and opaque custom-op launch order/tiling only; outputs

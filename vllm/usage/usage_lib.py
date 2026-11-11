@@ -78,16 +78,11 @@ def is_usage_stats_enabled() -> bool:
     ReVolta collects its own statistics (see ``docs/usage-stats.md``), so this
     is on unless one of the following turns it off:
 
-    - ``REVOLTA_NO_USAGE_STATS=1`` (the ReVolta switch)
     - ``VLLM_NO_USAGE_STATS=1``
     - ``VLLM_DO_NOT_TRACK=1`` or ``DO_NOT_TRACK=1``
     - a ``do_not_track`` file in ``VLLM_CONFIG_ROOT``
     """
-    if (
-        envs.REVOLTA_NO_USAGE_STATS
-        or envs.VLLM_NO_USAGE_STATS
-        or envs.VLLM_DO_NOT_TRACK
-    ):
+    if envs.VLLM_NO_USAGE_STATS or envs.VLLM_DO_NOT_TRACK:
         return False
     return not os.path.exists(_do_not_track_path())
 
@@ -105,9 +100,9 @@ def _log_usage_notice() -> None:
         "CUDA runtime, ReVolta version, model architecture and a configuration "
         "summary (parallelism, KV cache, speculative decoding, max model "
         "length). No prompts, outputs, model paths, host names or IP addresses "
-        "are collected. Turn it off with REVOLTA_NO_USAGE_STATS=1 (also "
-        "VLLM_NO_USAGE_STATS=1, VLLM_DO_NOT_TRACK=1, DO_NOT_TRACK=1 or a "
-        "do_not_track file in VLLM_CONFIG_ROOT). See %s.",
+        "are collected. Turn it off with VLLM_NO_USAGE_STATS=1 (also "
+        "VLLM_DO_NOT_TRACK=1, DO_NOT_TRACK=1 or a do_not_track file in "
+        "VLLM_CONFIG_ROOT). See %s.",
         target,
         _USAGE_STATS_DOCS,
     )

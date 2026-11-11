@@ -358,6 +358,7 @@ if TYPE_CHECKING:
     REVOLTA_RESEARCH_HOST_DECODE_FAST: bool = False
     REVOLTA_RESEARCH_HOST_DECODE_FAST_ORDERED: bool = False
     REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED: bool = False
+    REVOLTA_RESEARCH_QSA_DECODE_COALESCE_AG: bool = False
     REVOLTA_RESEARCH_PREGRAPH_GDN_COMMON_CACHE: bool = False
     REVOLTA_RESEARCH_PREGRAPH_REPLAY_VIEWS: bool = False
     VLLM_DFLASH2_LOOKUP_ADAPTIVE: bool = True
@@ -4729,6 +4730,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "Fuse integer metadata conversion for the DCP-sharded shared-key "
             "scorer. Default off pending GPU validation; restart with 0 to "
             "use the torch reference."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "REVOLTA_RESEARCH_QSA_DECODE_COALESCE_AG": env_var(
+        lambda: os.getenv("REVOLTA_RESEARCH_QSA_DECODE_COALESCE_AG", "0") == "1",
+        description=(
+            "Coalesce sharded index candidates and main Q in one DCP2 "
+            "AllGather for uniform FULL-graph host decode. Default off; "
+            "requires identical settings on all ranks and GPU validation. "
+            "Restart with 0 to restore two exchanges."
         ),
         category="experimental",
         declared_default="False",

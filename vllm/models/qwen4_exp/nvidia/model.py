@@ -88,6 +88,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, get_kv_quan
 
 from ..config import Qwen4ExpConfig
 from .hyperconnection import GatedResidual, HyperConnectionConfig
+from .ops.qsa_coalesce import QSACoalesceWorkspace
 from .sm70_fp16_gemv import enable_qwen38_sm70_fp16_gemv
 from .sm70_fp16_hc import enable_qwen38_sm70_fp16_fused_hc
 
@@ -369,6 +370,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         dcp_local_indices_buffer: torch.Tensor | None = None,
         dcp_partial_output_buffer: torch.Tensor | None = None,
         dcp_partial_lse_buffer: torch.Tensor | None = None,
+        coalesce_workspace: QSACoalesceWorkspace | None = None,
     ) -> None:
         super().__init__()
         config: Qwen4ExpTextConfig = vllm_config.model_config.hf_text_config
@@ -427,6 +429,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
                     dcp_local_indices_buffer=dcp_local_indices_buffer,
                     dcp_partial_output_buffer=dcp_partial_output_buffer,
                     dcp_partial_lse_buffer=dcp_partial_lse_buffer,
+                    coalesce_workspace=coalesce_workspace,
                 )
         else:
             raise ValueError(f"Invalid layer_type {layer_type}")
@@ -642,6 +645,7 @@ class Qwen4ExpModel(nn.Module, EagleModelMixin):
         dcp_local_indices_buffer: torch.Tensor | None = None
         dcp_partial_output_buffer: torch.Tensor | None = None
         dcp_partial_lse_buffer: torch.Tensor | None = None
+        coalesce_workspace: QSACoalesceWorkspace | None = None
         if self._qsa_layer_ids:
             topk_indices_buffer = torch.empty(
                 vllm_config.scheduler_config.max_num_batched_tokens,
@@ -674,6 +678,24 @@ class Qwen4ExpModel(nn.Module, EagleModelMixin):
                 self.dcp_local_indices_buffer = dcp_local_indices_buffer
                 self.dcp_partial_output_buffer = dcp_partial_output_buffer
                 self.dcp_partial_lse_buffer = dcp_partial_lse_buffer
+                capture_sizes = vllm_config.compilation_config.cudagraph_capture_sizes
+                if (
+                    envs.REVOLTA_RESEARCH_QSA_DECODE_COALESCE_AG
+                    and vllm_config.kernel_config.qsa_dcp_index_shard
+                    and vllm_config.kernel_config.long_context_kv.enabled
+                    and vllm_config.kernel_config.long_context_kv.main_kv_placement
+                    == "host"
+                    and capture_sizes
+                ):
+                    coalesce_workspace = QSACoalesceWorkspace(
+                        max(capture_sizes),
+                        int(config.indexer_budget)
+                        // int(config.indexer_compress_ratio),
+                        gathered_heads // 2,
+                        int(config.head_dim),
+                        vllm_config.model_config.dtype,
+                    )
+                    self.coalesce_workspace = coalesce_workspace
         self.embed_tokens = VocabParallelEmbedding(self.vocab_size, config.hidden_size)
 
         def get_layer(prefix: str) -> Qwen4ExpDecoderLayer:
@@ -686,6 +708,7 @@ class Qwen4ExpModel(nn.Module, EagleModelMixin):
                 dcp_local_indices_buffer=dcp_local_indices_buffer,
                 dcp_partial_output_buffer=dcp_partial_output_buffer,
                 dcp_partial_lse_buffer=dcp_partial_lse_buffer,
+                coalesce_workspace=coalesce_workspace,
             )
 
         self.start_layer, self.end_layer, self.layers = make_layers(

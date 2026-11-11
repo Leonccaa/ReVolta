@@ -556,3 +556,6 @@ REVOLTA_GDN_CPU_SPEC_QSL legacy-name
 REVOLTA_GDN_CPU_SPEC_QSL_CHECK_FILE legacy-name
 REVOLTA_QSA_GROUPED_LPT legacy-name
 REVOLTA_SKINNY_MPLAN legacy-name
+# Deliberately mirrors upstream VLLM_NO_USAGE_STATS for ReVolta's own opt-out;
+# the naming rule targets SM70/research switches, not this fork-level switch.
+REVOLTA_NO_USAGE_STATS legacy-name

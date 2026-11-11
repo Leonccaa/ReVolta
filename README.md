@@ -81,6 +81,8 @@ For another checkpoint, use its [preparation guide](docs/checkpoints.md) before 
 | Compare measured speed, KV capacity and quantization quality | [Performance](docs/performance.md) |
 | Check support scope and limitations | [Known limits](docs/known-limits.md) |
 
+ReVolta sends anonymous usage statistics (hardware, version and a configuration summary, never prompts or model paths) to its own collector by default; see [Anonymous usage statistics](docs/usage-stats.md) for what is collected and how to turn it off.
+
 ## Known limits
 
 - V100 16 GB, TP2/TP8, and other models have not been tested.

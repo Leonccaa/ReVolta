@@ -28,7 +28,12 @@ from torch.autograd.profiler import record_function
 
 import vllm.envs as envs
 from vllm.logger import init_logger
-from vllm.usage.usage_lib import UsageContext, is_usage_stats_enabled, usage_message
+from vllm.usage.usage_lib import (
+    UsageContext,
+    is_usage_stats_enabled,
+    sanitize_usage_value,
+    usage_message,
+)
 from vllm.utils.network_utils import get_open_zmq_ipc_path, get_tcp_uri
 from vllm.utils.system_utils import decorate_logs, kill_process_tree, set_process_title
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -638,11 +643,53 @@ def copy_slice(
 def report_usage_stats(
     vllm_config, usage_context: UsageContext = UsageContext.ENGINE_CONTEXT
 ) -> None:
-    """Report usage statistics if enabled."""
+    """Report usage statistics if enabled.
+
+    Best effort by design: reading the configuration must never break a
+    startup, so any error here is swallowed with a debug line.
+    """
 
     if not is_usage_stats_enabled():
         return
 
+    try:
+        _report_usage_stats(vllm_config, usage_context)
+    except Exception as e:  # noqa: BLE001 - telemetry must not affect the engine
+        logger.debug("ReVolta usage report skipped: %s", type(e).__name__)
+
+
+def _revolta_usage_summary(vllm_config) -> dict[str, Any]:
+    """ReVolta configuration summary: numbers and mode names only.
+
+    Deliberately excludes anything request-scoped or host-scoped: no prompts,
+    outputs, model paths, served model names, host names, IP addresses or
+    operator-defined strings.
+    """
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    model_config = getattr(vllm_config, "model_config", None)
+
+    # Active Host KV long-context mode (off by default).
+    long_context_kv = getattr(
+        getattr(vllm_config, "kernel_config", None), "long_context_kv", None
+    )
+
+    # Speculative decoding method and draft length; None when disabled.
+    speculative = getattr(vllm_config, "speculative_config", None)
+
+    summary: dict[str, Any] = {
+        "max_model_len": getattr(model_config, "max_model_len", None),
+        "decode_context_parallel_size": getattr(
+            parallel_config, "decode_context_parallel_size", 1
+        ),
+        "enable_long_context_kv": bool(getattr(long_context_kv, "enabled", False)),
+        "main_kv_placement": getattr(long_context_kv, "main_kv_placement", None),
+        "speculative_method": getattr(speculative, "method", None),
+        "num_speculative_tokens": getattr(speculative, "num_speculative_tokens", None),
+    }
+    return summary
+
+
+def _report_usage_stats(vllm_config, usage_context: UsageContext) -> None:
     from vllm.model_executor.model_loader import get_architecture_class_name
 
     parallel_config = vllm_config.parallel_config
@@ -652,32 +699,40 @@ def report_usage_stats(
     if vllm_config.kv_transfer_config is not None:
         kv_connector = vllm_config.kv_transfer_config.kv_connector
 
+    extra_kvs = {
+        # Common configuration
+        "dtype": str(vllm_config.model_config.dtype),
+        "block_size": vllm_config.cache_config.block_size,
+        "gpu_memory_utilization": vllm_config.cache_config.gpu_memory_utilization,
+        "kv_cache_memory_bytes": vllm_config.cache_config.kv_cache_memory_bytes,
+        # Quantization
+        "quantization": vllm_config.model_config.quantization,
+        "kv_cache_dtype": str(vllm_config.cache_config.cache_dtype),
+        # Feature flags
+        "enable_lora": bool(vllm_config.lora_config),
+        "enable_prefix_caching": vllm_config.cache_config.enable_prefix_caching,
+        "enforce_eager": vllm_config.model_config.enforce_eager,
+        "disable_custom_all_reduce": parallel_config.disable_custom_all_reduce,
+        # Distributed parallelism settings
+        "tensor_parallel_size": parallel_config.tensor_parallel_size,
+        "data_parallel_size": parallel_config.data_parallel_size,
+        "pipeline_parallel_size": parallel_config.pipeline_parallel_size,
+        "enable_expert_parallel": parallel_config.enable_expert_parallel,
+        # All2All backend for MoE expert parallel
+        "all2all_backend": parallel_config.all2all_backend,
+        # KV connector used
+        "kv_connector": kv_connector,
+        # ReVolta configuration summary (no paths, no host names)
+        **_revolta_usage_summary(vllm_config),
+    }
+
     usage_message.report_usage(
         get_architecture_class_name(vllm_config.model_config),
         usage_context,
+        # Every value is screened here, at the collection site: a value that
+        # could carry a path, a URL or a host name is dropped, not redacted.
         extra_kvs={
-            # Common configuration
-            "dtype": str(vllm_config.model_config.dtype),
-            "block_size": vllm_config.cache_config.block_size,
-            "gpu_memory_utilization": vllm_config.cache_config.gpu_memory_utilization,
-            "kv_cache_memory_bytes": vllm_config.cache_config.kv_cache_memory_bytes,
-            # Quantization
-            "quantization": vllm_config.model_config.quantization,
-            "kv_cache_dtype": str(vllm_config.cache_config.cache_dtype),
-            # Feature flags
-            "enable_lora": bool(vllm_config.lora_config),
-            "enable_prefix_caching": vllm_config.cache_config.enable_prefix_caching,
-            "enforce_eager": vllm_config.model_config.enforce_eager,
-            "disable_custom_all_reduce": parallel_config.disable_custom_all_reduce,
-            # Distributed parallelism settings
-            "tensor_parallel_size": parallel_config.tensor_parallel_size,
-            "data_parallel_size": parallel_config.data_parallel_size,
-            "pipeline_parallel_size": parallel_config.pipeline_parallel_size,
-            "enable_expert_parallel": parallel_config.enable_expert_parallel,
-            # All2All backend for MoE expert parallel
-            "all2all_backend": parallel_config.all2all_backend,
-            # KV connector used
-            "kv_connector": kv_connector,
+            key: sanitize_usage_value(value) for key, value in extra_kvs.items()
         },
     )
 

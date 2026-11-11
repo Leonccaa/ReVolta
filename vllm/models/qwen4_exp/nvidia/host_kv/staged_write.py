@@ -12,6 +12,9 @@ from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 
+import numpy as np
+from numpy.typing import NDArray
+
 
 @dataclass(frozen=True)
 class Copy2D:
@@ -25,7 +28,7 @@ class Copy2D:
 
 @dataclass(frozen=True)
 class WritePlan:
-    targets: tuple[tuple[int, int], ...]
+    targets: tuple[tuple[int, int], ...] | NDArray[np.int64]
     copies: tuple[Copy2D, ...]
     payload_bytes: int
 
@@ -146,6 +149,134 @@ def plan_write(
             )
         packed += 2 * count
     return WritePlan(tuple(targets), tuple(copies), packed * row_bytes)
+
+
+def plan_prefill_write(
+    tables: Mapping[int, Sequence[int]],
+    indices: Sequence[int],
+    counts: Sequence[int],
+    starts: Sequence[int],
+    prefilling: Sequence[bool],
+    targets: NDArray[np.int64],
+    ramp: NDArray[np.int64],
+    pages: Sequence[int],
+    ratio: int,
+    kbs: int,
+    row_bytes: int,
+    page_stride: int,
+    subpage_stride: int,
+    plane_stride: int,
+    world: int,
+    rank: int,
+    interleave: int,
+) -> WritePlan | None:
+    """Single contiguous prefill, planned in subpages rather than tokens.
+
+    Return None for multi-request/mixed batches, unsupported CP geometry,
+    missing/unbound pages or overlapping slots; the caller uses plan_write.
+    Sort only subpage runs to preserve the reference's physical-slot packing.
+    ``targets`` and ``ramp`` are reusable contiguous int64 CPU arrays owned by
+    the caller. Their lifetime must extend through the target HtoD operation.
+    """
+    if not (len(indices) == len(counts) == len(starts) == len(prefilling) == 1):
+        return None
+    count, start = int(counts[0]), int(starts[0])
+    if (
+        not prefilling[0]
+        or count <= 0
+        or start < 0
+        or count > len(targets)
+        or world < 1
+        or not 0 <= rank < world
+        or interleave < 1
+        or kbs < 1
+        or kbs % interleave
+        or ratio < 1
+        or len(ramp) < kbs
+    ):
+        return None
+    table = tables.get(int(indices[0]))
+    if table is None:
+        return None
+    span = kbs * world
+    cycle = world * interleave
+
+    def local_before(offset: int) -> int:
+        full, tail = divmod(offset, cycle)
+        return full * interleave + min(max(tail - rank * interleave, 0), interleave)
+
+    # (physical slot, logical block, local offset, count). A rank's local
+    # offsets are contiguous even when its global rows are interleaved.
+    runs: list[tuple[int, int, int, int]] = []
+    for block in range(start // span, (start + count - 1) // span + 1):
+        if block >= len(table):
+            return None
+        lo = local_before(max(start - block * span, 0))
+        hi = local_before(min(start + count - block * span, span))
+        if lo == hi:
+            continue
+        physical = int(table[block])
+        hid = physical // ratio
+        if physical < 0 or hid >= len(pages) or int(pages[hid]) <= 0:
+            return None
+        runs.append((physical * kbs + lo, block, lo, hi - lo))
+    runs.sort()
+    # Aliased table entries can also produce disjoint slices of one subpage.
+    # The reference joins those slices in slot order; leave that case to it.
+    if any(a[0] // kbs == b[0] // kbs for a, b in zip(runs, runs[1:])):
+        return None
+    targets.fill(-1)
+    # Mutable descriptor fields allow one allocation per final copy, without
+    # dataclasses.replace for every full subpage joined to a 2D copy.
+    copies: list[list[int]] = []
+    packed = 0
+    for slot, block, offset, take in runs:
+        physical = slot // kbs
+        hid, sub = divmod(physical, ratio)
+        destination = (
+            int(pages[hid]) * page_stride + sub * subpage_stride + offset * row_bytes
+        )
+        values = ramp[:take]
+        if world == 1:
+            row = block * span + offset - start
+            rows: slice | NDArray[np.int64] = slice(row, row + take)
+        elif interleave == 1:
+            row = block * span + offset * world + rank - start
+            rows = slice(row, row + take * world, world)
+        else:
+            local = values + offset
+            rows = (
+                block * span
+                + local // interleave * cycle
+                + rank * interleave
+                + local % interleave
+                - start
+            )
+        targets[rows, 0] = values + packed
+        targets[rows, 1] = values + packed + take
+        size = take * row_bytes
+        if offset == 0 and take == kbs:
+            source, width = packed * row_bytes, 2 * size
+            prev = copies[-1] if copies else None
+            if (
+                prev is not None
+                and prev[2] == width
+                and source == prev[0] + prev[3] * width
+                and destination == prev[1] + prev[3] * subpage_stride
+                and (prev[3] == 1 or prev[4:] == [width, subpage_stride])
+            ):
+                prev[3] += 1
+                prev[4:] = [width, subpage_stride]
+            else:
+                copies.append([source, destination, width, 1, 0, 0])
+        else:
+            copies.append(
+                [packed * row_bytes, destination, size, 2, size, plane_stride]
+            )
+        packed += 2 * take
+    return WritePlan(
+        targets, tuple(Copy2D(*copy) for copy in copies), packed * row_bytes
+    )
 
 
 @lru_cache(maxsize=1)

@@ -37,7 +37,9 @@ import weakref
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
+import numpy as np
 import torch
+from numpy.typing import NDArray
 
 from vllm.triton_utils import triton
 from vllm.utils.torch_utils import (
@@ -515,6 +517,8 @@ class HostHistoryStore:
                 (s.max_write_rows, 2, 1, h, d), dtype=s.dtype, device=device
             )
             self.write_plan: WritePlan | None = None
+            self.write_plan_all_prefill = False
+            self.write_plan_kind = "none"
             self.write_stage = self.write_targets = None
             if s.staged_writethrough:
                 self.write_stage = torch.empty(
@@ -522,6 +526,22 @@ class HostHistoryStore:
                 )
                 self.write_targets = torch.empty(
                     (s.max_write_rows, 2), dtype=torch.int64, device=device
+                )
+                self.write_target_buffers = [
+                    torch.empty(
+                        (s.max_write_rows, 2),
+                        dtype=torch.int64,
+                        pin_memory=device.type == "cuda",
+                    )
+                    for _ in range(2)
+                ]
+                self.write_target_arrays = [
+                    t.numpy() for t in self.write_target_buffers
+                ]
+                self.write_target_events: list[torch.cuda.Event | None] = [None, None]
+                self.write_target_index = 0
+                self.write_target_ramp = np.arange(
+                    s.kernel_block_tokens, dtype=np.int64
                 )
             self.staging_slots = torch.arange(
                 s.max_write_rows, dtype=torch.int64, device=device
@@ -591,6 +611,9 @@ class HostHistoryStore:
                     "_seal_sources",
                     "union_scratch",
                     "union_stats",
+                    "write_target_buffers",
+                    "write_target_arrays",
+                    "write_target_events",
                 }
             }
         )
@@ -774,6 +797,7 @@ class HostHistoryStore:
         """Plan once at step head from CPU page bindings, without a device read."""
         from .staged_write import plan_write
 
+        self.write_plan_all_prefill = False
         if not self.shape.staged_writethrough:
             self.write_plan = None
             return
@@ -789,11 +813,98 @@ class HostHistoryStore:
             self.shape.kv_heads * self.shape.head_dim * item,
             *(stride * item for stride in view.stride()[:3]),
         )
+        self.write_plan_kind = "fallback"
+        targets = self._write_target_array(len(slots))
+        if len(slots):
+            targets[:] = self.write_plan.targets
+        self._upload_write_targets(len(slots))
+
+    def _write_target_array(self, rows: int) -> NDArray[np.int64]:
+        index = self.write_target_index
+        event = self.write_target_events[index]
+        # Only the HtoD consumes this pinned buffer. Do not wait for the model
+        # or the later DtoH payload copies, and never overwrite an in-flight HtoD.
+        if event is not None and not event.query():
+            event.synchronize()
+        return self.write_target_arrays[index][:rows]
+
+    def _upload_write_targets(self, rows: int) -> None:
         assert self.write_targets is not None
-        targets = torch.tensor(self.write_plan.targets, dtype=torch.int64).reshape(
-            -1, 2
+        index = self.write_target_index
+        self.write_targets[:rows].copy_(
+            self.write_target_buffers[index][:rows], non_blocking=True
         )
-        self.write_targets[: len(slots)].copy_(targets, non_blocking=True)
+        if self.device.type == "cuda":
+            event = self.write_target_events[index]
+            if event is None:
+                event = self.write_target_events[index] = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(self.device))
+        self.write_target_index = 1 - index
+
+    def prepare_prefill_write(
+        self,
+        tables: Mapping[int, Sequence[int]],
+        indices: Sequence[int],
+        counts: Sequence[int],
+        starts: Sequence[int],
+        prefilling: Sequence[bool],
+        padded_rows: int,
+        world: int,
+        rank: int,
+        interleave: int,
+    ) -> None:
+        """Use the run planner when its CPU metadata proves eligibility."""
+        from .staged_write import plan_prefill_write, prefill_slots
+
+        s = self.shape
+        if not s.staged_writethrough:
+            self.write_plan = None
+            return
+        if padded_rows > s.max_write_rows:
+            raise ValueError("Write plan exceeds one chunk")
+        view = self.layers[0].host_view
+        item = view.element_size()
+        targets = self._write_target_array(padded_rows)
+        strides = view.stride()
+        plan = plan_prefill_write(
+            tables,
+            indices,
+            counts,
+            starts,
+            prefilling,
+            targets,
+            self.write_target_ramp,
+            self.page_of_cpu,
+            s.kernel_blocks_per_block,
+            s.kernel_block_tokens,
+            s.kv_heads * s.head_dim * item,
+            strides[0] * item,
+            strides[1] * item,
+            strides[2] * item,
+            world,
+            rank,
+            interleave,
+        )
+        if plan is None:
+            self.prepare_write(
+                prefill_slots(
+                    tables,
+                    indices,
+                    counts,
+                    starts,
+                    prefilling,
+                    padded_rows,
+                    s.kernel_block_tokens,
+                    world,
+                    rank,
+                    interleave,
+                )
+            )
+        else:
+            self.write_plan = plan
+            self.write_plan_kind = "runs"
+            self._upload_write_targets(padded_rows)
+        self.write_plan_all_prefill = all(prefilling)
 
     def set_step_plan(
         self,
@@ -957,7 +1068,7 @@ class HostHistoryLayer:
         if plan is not None:
             if n > len(plan.targets):
                 raise ValueError("Write rows exceed the step plan")
-            if self._word_writer_eligible(key, value):
+            if store.write_plan_all_prefill and self._word_writer_eligible(key, value):
                 self._write_words(key, value, slot_mapping, staged=True)
             else:
                 hk.stage_slots[(n,)](
@@ -994,8 +1105,6 @@ class HostHistoryLayer:
                             + row * (copy.source_pitch or copy.width),
                             copy.width,
                         )
-        elif s.staged_writethrough and self._word_writer_eligible(key, value):
-            self._write_words(key, value, slot_mapping, staged=False)
         else:
             hk.write_slots[(n,)](
                 key, value, slot_mapping, self.host_device, self.hot,
@@ -1023,7 +1132,7 @@ class HostHistoryLayer:
         *,
         staged: bool,
     ) -> None:
-        """Use one word kernel for staged prefill and mixed/pure decode UVA."""
+        """Use the word kernel for proven all-prefill batches only."""
         store, s = self.store, self.store.shape
         assert store.write_stage is not None and store.write_targets is not None
         n = slots.shape[0]
@@ -1373,6 +1482,7 @@ def for_each_pass(
             s.read_rows,
             row_groups=row_groups,
             tail_groups=tail_groups,
+            single_request_fast=s.staged_writethrough,
         )
     cursor = 0
     for start, end in passes:

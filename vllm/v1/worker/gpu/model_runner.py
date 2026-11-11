@@ -777,22 +777,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if store is None or not store.shape.staged_writethrough:
             return
         store.write_plan = None
+        store.write_plan_kind = "none"
+        store.write_plan_all_prefill = False
         if cg_mode != CUDAGraphMode.NONE or not input_batch.is_prefilling_np.any():
             return
-        from vllm.models.qwen4_exp.nvidia.host_kv.staged_write import prefill_slots
-
-        slots = prefill_slots(
+        store.prepare_prefill_write(
             self.block_tables.cpu_mirrors[self._host_write_group],
             input_batch.idx_mapping_np,
             input_batch.num_scheduled_tokens,
             input_batch.num_computed_prefill_tokens_np,
             input_batch.is_prefilling_np,
             input_batch.num_tokens_after_padding,
-            store.shape.kernel_block_tokens,
             *self.block_tables.group_cp(self._host_write_group),
             self.block_tables.cp_interleave,
         )
-        store.prepare_write(slots)
 
     def _set_host_kv_plan(self, scheduler_output, input_batch) -> None:
         """shared hot region: this rank's mixed-step pass intervals from scheduler
@@ -841,6 +839,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 s.read_rows,
                 row_groups=s.row_groups,
                 tail_groups=s.tail_groups,
+                single_request_fast=s.staged_writethrough,
             ),
         )
 

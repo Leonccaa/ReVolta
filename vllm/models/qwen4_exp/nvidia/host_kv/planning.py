@@ -35,6 +35,7 @@ def plan_passes(
     *,
     row_groups: int = QSA_ROW_GROUPS,
     tail_groups: int = TAIL_GROUPS,
+    single_request_fast: bool = False,
 ) -> list[tuple[int, int]]:
     """Greedily take the longest contiguous interval in request/query order.
 
@@ -53,6 +54,25 @@ def plan_passes(
         or tail_groups < 0
     ):
         raise ValueError("Invalid host-history pass geometry")
+    if (
+        single_request_fast
+        and len(G) == 1
+        and type(row_groups) is int
+        and type(tail_groups) is int
+    ):
+        rows, groups = rows_by_req[0], G[0]
+        if rows == 0:
+            return []
+        if min(groups, row_groups + tail_groups) > avail:
+            raise ValueError("Host-history hot floor cannot hold one row")
+        # C1 cost is min(G, row_groups * n + tail_groups). When G fits,
+        # only R_cap limits a pass; otherwise the unsaturated bound does.
+        limit = (
+            R_cap
+            if groups <= avail
+            else min(R_cap, (avail - tail_groups) // row_groups)
+        )
+        return [(start, min(start + limit, rows)) for start in range(0, rows, limit)]
     tails = [min(g, tail_groups) for g in G]
     base = sum(tails)
     passes: list[tuple[int, int]] = []
@@ -190,6 +210,7 @@ def plan_step_passes(
     *,
     row_groups: int = QSA_ROW_GROUPS,
     tail_groups: int = TAIL_GROUPS,
+    single_request_fast: bool = False,
 ) -> list[tuple[int, int]]:
     """A mixed step's pass intervals from scheduler metadata (shared hot region).
 
@@ -213,6 +234,7 @@ def plan_step_passes(
         R_cap,
         row_groups=row_groups,
         tail_groups=tail_groups,
+        single_request_fast=single_request_fast,
     )
 
 

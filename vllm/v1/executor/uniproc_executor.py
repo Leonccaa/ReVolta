@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 import os
 from collections.abc import Callable
 from concurrent.futures import Future
@@ -20,6 +21,11 @@ from vllm.v1.executor.abstract import Executor
 from vllm.v1.executor.vllm_net_devices import set_worker_net_device
 from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
 from vllm.v1.serial_utils import run_method
+from vllm.v1.spec_decode.lookup_quarantine import (
+    isolated,
+    require_available_context,
+    require_reusable_context,
+)
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 logger = init_logger(__name__)
@@ -47,6 +53,7 @@ class AsyncOutputFuture(Future):
 class UniProcExecutor(Executor):
     def _init_executor(self) -> None:
         """Initialize the worker and load the model."""
+        require_reusable_context()
         self.driver_worker = WorkerWrapperBase(rpc_rank=0)
         distributed_init_method, rank, local_rank = self._distributed_args()
         kwargs = dict(
@@ -105,6 +112,7 @@ class UniProcExecutor(Executor):
         non_block: bool = False,
         single_value: bool = False,
     ) -> Any:
+        require_available_context()
         if kwargs is None:
             kwargs = {}
 
@@ -152,11 +160,14 @@ class UniProcExecutor(Executor):
         return self.collective_rpc("take_draft_token_ids", single_value=True)
 
     def check_health(self) -> None:
+        require_available_context()
         # UniProcExecutor will always be healthy as long as
         # it's running.
         return
 
     def shutdown(self) -> None:
+        if isolated(self):
+            return
         if worker := self.driver_worker:
             worker.shutdown()
 

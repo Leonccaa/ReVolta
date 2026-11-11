@@ -123,6 +123,132 @@ rule. `"greedy"` still works. MTP must stay `"greedy"`; see
 - Setting `dflash_concurrency_drafts` turns off async scheduling; `--async-scheduling`
   together with it is an error. Pipeline parallelism is not supported with DFlash2.
 
+## Native history lookup (optional)
+
+Native lookup is **off by default**. It searches committed token history for a
+continuation and fuses it into the seven-token DFlash2 proposal when the first
+lookup token agrees with the neural proposal. The original first token and its
+proposal distribution are preserved. Short continuations replace only the
+available positions; the remaining neural suffix retains its original proposal
+probabilities.
+
+The recommended opt-in recipe is C64: longest match, suffix lengths 5 through 16,
+a 65,536-token search window and the strict `first_token` gate. Merge this fragment
+into the DFlash2 speculative config above, retaining its model and other settings:
+
+```json
+{
+  "num_speculative_tokens": 7,
+  "dflash_concurrency_drafts": {"4": 3, "5": 4},
+  "dflash2_lookup": {
+    "enabled": true,
+    "policy": "longest",
+    "nmin": 5,
+    "nmax": 16,
+    "search_window": 65536,
+    "gate": "first_token",
+    "collect_stats": true
+  }
+}
+```
+
+Use `--no-async-scheduling` with this ladder. Omitting `dflash2_lookup` or setting
+`"enabled": false` leaves lookup disabled. When enabling it, `policy`, `nmin` and
+`nmax` must be explicit; no lookup recipe is selected automatically.
+
+- Only a batch containing one eligible decode request attempts lookup. Multiple
+  requests, mixed prefill, grammar constraints, no sampled token or insufficient
+  sequence space bypass lookup for the whole batch. Eligibility is recalculated
+  each round; returning to one request needs no waiting period.
+- The configured proposal/resource width remains seven; it does not expand to
+  fifteen or allocate per-request q16 graphs. The existing concurrency ladder
+  can still reduce the actual verification width: with the example above,
+  one to three requests use W=7, four use W=3, and five or more use W=4. Lookup
+  itself stays bypassed for multiple requests.
+- Fixed width seven **without a concurrency ladder** permits async scheduling,
+  subject to the existing executor, model and state-replay constraints. Lookup
+  does not itself turn async off. A nonempty ladder and explicit async scheduling
+  are incompatible and raise an error; with async unspecified, the existing
+  ladder rule selects synchronous scheduling.
+- This version supports only `longest` and `first_token`. `nearest` and expansion
+  are rejected, including expansion enabled together with lookup disabled.
+- Legacy `ngram_assist` and lookup environment settings remain compatible; no
+  removal version is set. Use explicit `dflash2_lookup` settings for new setups.
+  Do not combine enabled native lookup with legacy assist, prompt-lookup bounds
+  or lookup environment overrides. Conflict checks and effective-mode warnings
+  distinguish omitted settings from explicit null, empty or disabled inputs.
+
+### Lookup measurements and limits
+
+In one TP4 greedy A/X observation on four V100 GPUs, effective tokens committed
+per round increased by about **2.3%** (long reasoning about **3.6%**, repeated
+editing about **0.8%**). Outputs were token-identical across six long requests.
+The observed mean round time decreased by about 0.5%; there are not enough
+repeated measurements to establish a stable speed change. **Gains with sampling
+have not been measured.** This is a reduction in verification rounds, not an
+end-to-end throughput claim.
+
+These observations used the pre-rebuild candidate with seven drafts, DCP2,
+`spec_state_replay=false` and a 48 GiB host KV store. They are not measurements
+of the rebuilt branch on current main, nor evidence for a larger host KV
+capacity. The method remains optional; gains depend on repeated content and
+proposal acceptance.
+
+CPU exact-enumeration and single-GPU dense/sparse distribution tests cover the
+proposal changes, including short continuations and full acceptance with a bonus
+token. They do not establish real-model TP4 sampling gains or full release
+qualification. Current-main TP4 off/on comparisons, real-model graph/KV resources,
+content-level CPU KV reload, sustained concurrency and the full statistics cost
+budget remain part of release acceptance.
+
+### Lookup statistics
+
+Collection is effective only when native lookup, `collect_stats` and the engine's
+existing statistics logging are all enabled. `collect_stats` defaults to true
+inside the optional lookup config; it does not enable lookup. With collection
+disabled, no lookup counter/export buffers or counter graph nodes are created.
+The switch is an instance-startup setting, not a hot toggle.
+
+Metrics use the `vllm:dflash2_lookup_` prefix and existing model/engine labels,
+without request IDs or token text:
+
+| Suffix | Type | Meaning |
+| --- | --- | --- |
+| `eligible_rounds_total` | Counter | Eligible single-request lookup attempts, including misses |
+| `candidate_rounds_total` | Counter | Match meets `nmin` and has at least one continuation token |
+| `gate_pass_rounds_total` | Counter | Candidate's first token agrees with the neural first token |
+| `adopted_rounds_total` | Counter | Gate passes and at least one later proposal position is replaced |
+| `match_length` | Histogram | Candidate suffix-match length; exposes bucket, count and sum |
+| `stats_pending` | Gauge | Observed producer watermark exceeds the exported coverage |
+| `stats_producer` | Gauge | Producer submission watermark, not the eligible-round count |
+| `stats_covered` | Gauge | Producer watermark covered by the latest applied snapshot |
+| `stats_last_export_timestamp_seconds` | Gauge | Time of the latest applied snapshot |
+
+The match histogram has boundaries 1, 2, 3, 4, 5, 6, 8, 12, 16, 32, 64, 128 and
++Inf. Misses do not enter a zero bucket. Adoption rate is
+`rate(adopted_rounds_total) / rate(eligible_rounds_total)` with the full prefix;
+a zero denominator means no samples. Adoption describes proposal replacement,
+not verifier acceptance or saved rounds.
+
+Only the designated output rank publishes counters. Owner, worker generation
+and sequence checks prevent duplicate application; a restarted instance may
+reset counters. During activity, completed cumulative snapshots travel with
+normal outputs. Idle tails wait for resumed activity or normal shutdown, with
+pending/coverage/export time making the lag visible. No statistics RPC is sent
+while idle. Normal shutdown records a final receipt with sequence, coverage and
+completion status; the API metrics endpoint may already be closed. Abnormal
+termination can lose the unexported tail. UniProc conservatively isolates an
+instance whose outstanding device access cannot be proved complete and requires
+process restart.
+
+The three logical counter/snapshot/pinned arrays total 432 bytes, plus CPU
+metadata, two CUDA events, one export stream and allocator/graph overhead.
+Single-V100 component measurements observed query/merge thread-CPU p99 of about
+1.9, 2.8 and 33.9 microseconds for idle, pending and completed slots, and about
+68.3 microseconds for the full snapshot-triggering service. These are component
+costs, not TP4 end-to-end overhead bounds; the TP4 statistics percentage remains
+to be measured against a real-model decode-round denominator.
+
 ## State replay (optional)
 
 GDN speculative state replay keeps two recurrent-state blocks per running request instead of nine: the verifier stores no per-draft state, and after sampling the accepted tokens are replayed into the request's block. It is enabled by default in current development for the supported ordinary DFlash2 route and set explicitly in the recommended configuration. Released 0.1.4–0.1.5 require that explicit `true`:

@@ -703,6 +703,10 @@ class MPClient(EngineCoreClient):
             return
         vllm_config = self.vllm_config
         response = msgspec.msgpack.decode(payload, type=EngineCoreReadyResponse)
+        if response.lookup_stats_registration is not None:
+            from vllm.v1.spec_decode.lookup_stats import register_frontend
+
+            register_frontend(vllm_config, response.lookup_stats_registration)
         vllm_config.model_config.max_model_len = min(
             vllm_config.model_config.max_model_len, response.max_model_len
         )

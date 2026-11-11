@@ -120,9 +120,15 @@ def replace(dataclass_instance: ConfigT, /, **kwargs) -> ConfigT:
     """Like [`dataclasses.replace`](https://docs.python.org/3/library/dataclasses.html#dataclasses.replace),
     but compatible with Pydantic dataclasses which use `pydantic.fields.Field` instead
     of `dataclasses.field`"""
+    replacement = getattr(dataclass_instance, "__replace__", None)
+    if replacement is not None:
+        return cast(ConfigT, replacement(**kwargs))
     cls = type(dataclass_instance)
-    dataclass_dict = dataclass_instance.__dict__
-    dataclass_dict = {k: v for k, v in dataclass_dict.items() if is_init_field(cls, k)}
+    dataclass_dict = {
+        item.name: getattr(dataclass_instance, item.name)
+        for item in fields(cls)
+        if is_init_field(cls, item.name)
+    }
     dataclass_dict.update(kwargs)
     return cls(**dataclass_dict)
 

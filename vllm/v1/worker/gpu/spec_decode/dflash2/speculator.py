@@ -25,6 +25,7 @@ from vllm.v1.worker.gpu.spec_decode.dflash2.lookup import (
     fuse_draft,
     suffix_lookup,
 )
+from vllm.v1.worker.gpu.spec_decode.dflash2.native_lookup import NativeDFlash2Lookup
 from vllm.v1.worker.gpu.spec_decode.dflash2.ngram_assist import DFlash2NgramAssist
 
 logger = init_logger(__name__)
@@ -359,6 +360,8 @@ class DFlash2Speculator(DFlashSpeculator):
     _speculator_name = "DFlash2"
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        if vllm_config.speculative_config is not None:
+            vllm_config.speculative_config.require_lookup_runtime()
         super().__init__(vllm_config, device)
         self._sm70_dflash2_policy = capture_sm70_dflash2_config(vllm_config)
         self._context_kv_graphs: dict[int, torch.cuda.CUDAGraph] = {}
@@ -535,6 +538,22 @@ class DFlash2Speculator(DFlashSpeculator):
         self._lookup_enabled = bool(
             ngram_assist and self.draft_block < self.num_speculative_steps
         )
+        self._native_lookup = None
+        if (
+            speculative_config is not None
+            and speculative_config.resolved_dflash2_lookup.mode == "gpu_head"
+        ):
+            if device.type != "cuda":
+                raise ValueError("Native DFlash2 lookup requires CUDA")
+            from vllm.v1.worker.gpu.spec_decode.dflash2.stats import create_exporter
+
+            self._native_lookup = NativeDFlash2Lookup(
+                speculative_config.resolved_dflash2_lookup,
+                self.max_num_reqs,
+                self.max_model_len,
+                device,
+                stats=create_exporter(vllm_config, device),
+            )
         self._req_states = None
         self._lookup_current_req_key: tuple[int, ...] = ()
         self._lookup_current_eligible = False
@@ -547,15 +566,33 @@ class DFlash2Speculator(DFlashSpeculator):
             assert speculative_config.prompt_lookup_max is not None
             self._lookup_nmin = int(speculative_config.prompt_lookup_min)
             self._lookup_nmax = int(speculative_config.prompt_lookup_max)
-            self._lookup_nstrong = envs.VLLM_DFLASH2_LOOKUP_NSTRONG
-            self._lookup_agree = envs.VLLM_DFLASH2_LOOKUP_AGREE
-            self._lookup_nmin_tail = envs.VLLM_DFLASH2_LOOKUP_NMIN_TAIL
-            self._lookup_long_min = envs.VLLM_DFLASH2_LOOKUP_LONG_MIN
-            self._lookup_search = envs.VLLM_DFLASH2_LOOKUP_SEARCH
-            self._lookup_adaptive = envs.VLLM_DFLASH2_LOOKUP_ADAPTIVE
-            self._lookup_entry_streak = envs.VLLM_DFLASH2_LOOKUP_ENTRY_STREAK
-            self._lookup_sticky_steps = envs.VLLM_DFLASH2_LOOKUP_STICKY
-            self._lookup_cheap_context = envs.VLLM_DFLASH2_LOOKUP_CHEAP_CONTEXT
+            self._lookup_nstrong = speculative_config.lookup_env(
+                "VLLM_DFLASH2_LOOKUP_NSTRONG"
+            )
+            self._lookup_agree = speculative_config.lookup_env(
+                "VLLM_DFLASH2_LOOKUP_AGREE"
+            )
+            self._lookup_nmin_tail = speculative_config.lookup_env(
+                "VLLM_DFLASH2_LOOKUP_NMIN_TAIL"
+            )
+            self._lookup_long_min = speculative_config.lookup_env(
+                "VLLM_DFLASH2_LOOKUP_LONG_MIN"
+            )
+            self._lookup_search = speculative_config.lookup_env(
+                "VLLM_DFLASH2_LOOKUP_SEARCH"
+            )
+            self._lookup_adaptive = speculative_config.lookup_env(
+                "VLLM_DFLASH2_LOOKUP_ADAPTIVE"
+            )
+            self._lookup_entry_streak = speculative_config.lookup_env(
+                "VLLM_DFLASH2_LOOKUP_ENTRY_STREAK"
+            )
+            self._lookup_sticky_steps = speculative_config.lookup_env(
+                "VLLM_DFLASH2_LOOKUP_STICKY"
+            )
+            self._lookup_cheap_context = speculative_config.lookup_env(
+                "VLLM_DFLASH2_LOOKUP_CHEAP_CONTEXT"
+            )
             self._lookup_tokens = torch.zeros(
                 self.max_num_reqs,
                 self.num_speculative_steps,
@@ -652,6 +689,9 @@ class DFlash2Speculator(DFlashSpeculator):
         """Refresh lookup eligibility and controller inputs before replay."""
         super()._prepare_proposal_runtime(input_batch, num_sampled, num_rejected)
         del num_rejected
+        native = getattr(self, "_native_lookup", None)
+        if native is not None:
+            native.prepare(input_batch, num_sampled, real_run=self._debug_real_proposal)
         if not self._lookup_enabled:
             return
 
@@ -760,6 +800,8 @@ class DFlash2Speculator(DFlashSpeculator):
         return self._record_lookup_width(width, reason)
 
     def capture(self) -> None:
+        if self._native_lookup is not None:
+            self._native_lookup.reset_for_capture()
         super().capture()
         if (
             not (
@@ -1165,6 +1207,18 @@ class DFlash2Speculator(DFlashSpeculator):
 
     def _apply_lookup(self, num_reqs: int) -> None:
         """Fuse a history continuation into the DFlash2 proposal exactly."""
+        native = getattr(self, "_native_lookup", None)
+        if native is not None:
+            native.apply(
+                self._req_states,
+                self.sample_idx_mapping,
+                self.draft_tokens,
+                num_reqs,
+                self.draft_logits,
+                self._cached_candidate_ids,
+                self._cached_candidate_scores,
+            )
+            return
         if not self._lookup_enabled or self._req_states is None:
             return
 

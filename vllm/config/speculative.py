@@ -3,18 +3,41 @@
 
 import copy
 import math
-from typing import TYPE_CHECKING, Any, Literal, get_args
+from dataclasses import fields
+from typing import TYPE_CHECKING, Any, Literal, get_args, get_type_hints
 
-from pydantic import Field, SkipValidation, field_validator, model_validator
+from pydantic import (
+    Field,
+    ModelWrapValidatorHandler,
+    SerializerFunctionWrapHandler,
+    SkipValidation,
+    TypeAdapter,
+    ValidationInfo,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 from typing_extensions import Self
 
 from vllm.config import LoadConfig
 from vllm.config.cache import CacheDType
+from vllm.config.dflash2_lookup import (
+    SYSTEM_FIELDS,
+    DFlash2LookupConfig,
+    LookupSource,
+    ResolvedDFlash2Lookup,
+    capture_lookup_source,
+    lookup_env_factors,
+    raw_speculative_input,
+    resolve_lookup,
+    validate_lookup_conflicts,
+    validate_lookup_input,
+)
 from vllm.config.kernel import MoEBackend
 from vllm.config.model import ModelConfig
 from vllm.config.parallel import ParallelConfig
 from vllm.config.sm70_dflash2 import Sm70DFlash2Config
-from vllm.config.utils import config
+from vllm.config.utils import config, is_init_field
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_text_config
 from vllm.utils.hashing import safe_hash
@@ -454,10 +477,291 @@ class SpeculativeConfig:
     sm70_dflash2: Sm70DFlash2Config = Field(default_factory=Sm70DFlash2Config)
     """Per-engine SM70 DFlash2 verifier policy; automatic when not specified."""
 
+    dflash2_lookup: DFlash2LookupConfig | None = None
+    """Native seven-token GPU lookup configuration; runtime integration is pending."""
+
     gdn_spec_state_replay: bool = Field(default=False, init=False)
     """Resolved by VllmConfig: GDN layers replay accepted tokens rather than
     keeping one state block per speculative position
     (sm70_dflash2.spec_state_replay)."""
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _capture_lookup_before_normalization(
+        cls, data: Any, handler: ModelWrapValidatorHandler[Self], info: ValidationInfo
+    ) -> Self:
+        if isinstance(data, cls):
+            return handler(data)
+        raw = raw_speculative_input(cls, data)
+        context = info.context or {}
+        trusted = context.get("dflash2_lookup_resolved")
+        source = (
+            trusted.source
+            if trusted is not None
+            else context.get("dflash2_lookup_source") or capture_lookup_source(raw)
+        )
+        lookup = validate_lookup_input(raw.get("dflash2_lookup"))
+        if trusted is None:
+            validate_lookup_conflicts(lookup, source)
+            factors = context.get("dflash2_lookup_env_factors")
+            if factors is None:
+                factors = lookup_env_factors()
+            if source.environment:
+                logger.warning_once(
+                    "Legacy VLLM_DFLASH2_LOOKUP_* inputs are deprecated for new "
+                    "configurations. Values are fixed at config resolution."
+                )
+        else:
+            factors = trusted.env_factors
+        result = handler(data)
+        resolved = resolve_lookup(result, source, factors)
+        if trusted is not None and resolved != trusted:
+            raise ValueError("Inconsistent resolved DFlash2 lookup worker record")
+        result.__dict__["_lookup_resolved"] = resolved
+        result.__dict__["_lookup_input"] = copy.deepcopy(
+            {name: value for name, value in raw.items() if name not in SYSTEM_FIELDS}
+        )
+        return result
+
+    @property
+    def resolved_dflash2_lookup(self) -> ResolvedDFlash2Lookup:
+        return self.__dict__["_lookup_resolved"]
+
+    def lookup_env(self, name: str) -> Any:
+        """Read a legacy lookup option fixed by the configuration owner."""
+        value = dict(self.resolved_dflash2_lookup.env_factors)[name]
+        if not isinstance(value, (int, bool)):
+            raise ValueError(f"Invalid legacy lookup environment value for {name}")
+        return value
+
+    def __replace__(self, **changes: Any) -> Self:
+        """Copy normalized fields using the owner's source and environment snapshot.
+
+        Copies without changes retain validated resolved state.
+        Explicit changes update provenance and may change the resolved mode.
+        Existing derived policy is retained through the normal constructor.
+        """
+        if not changes:
+            return copy.copy(self)
+        saved = self.resolved_dflash2_lookup
+        changed_source = capture_lookup_source(
+            changes,
+            environment=saved.source.environment,
+            system_fields=tuple(
+                name for name in saved.source.system_fields if name not in changes
+            ),
+        )
+        source_updates: dict[str, Any] = {
+            "system_fields": changed_source.system_fields,
+        }
+        if "dflash2_lookup" in changes:
+            source_updates.update(
+                root=changed_source.root,
+                keys=changed_source.keys,
+                expand_keys=changed_source.expand_keys,
+            )
+        if "ngram_assist" in changes:
+            source_updates["ngram_assist"] = changed_source.ngram_assist
+        prompts = set(saved.source.prompt_fields)
+        for name in ("prompt_lookup_min", "prompt_lookup_max"):
+            if name in changes:
+                prompts.discard(name)
+                if changes[name] is not None:
+                    prompts.add(name)
+        source_updates["prompt_fields"] = tuple(
+            name
+            for name in ("prompt_lookup_min", "prompt_lookup_max")
+            if name in prompts
+        )
+        source = LookupSource.model_validate(saved.source.model_dump() | source_updates)
+        values = {
+            item.name: getattr(self, item.name)
+            for item in fields(self)
+            if is_init_field(type(self), item.name)
+        }
+        # Non-ngram methods normalize unused prompt bounds to zero. Restore
+        # their constructor sentinel before validating the copied fields.
+        if self.method not in ("ngram", "ngram_gpu") and not self.ngram_assist:
+            for name in ("prompt_lookup_min", "prompt_lookup_max"):
+                if values[name] == 0:
+                    values[name] = None
+        values.update(changes)
+        result = TypeAdapter(type(self)).validate_python(
+            values,
+            context={
+                "dflash2_lookup_source": source,
+                "dflash2_lookup_env_factors": saved.env_factors,
+            },
+        )
+        result.gdn_spec_state_replay = self.gdn_spec_state_replay
+        return result
+
+    @classmethod
+    def from_engine_args(cls, values: dict[str, Any], source: LookupSource) -> Self:
+        return TypeAdapter(cls).validate_python(
+            values, context={"dflash2_lookup_source": source}
+        )
+
+    @model_serializer(mode="wrap")
+    def _serialize_compatible(self, handler: SerializerFunctionWrapHandler) -> Any:
+        # Keep existing diagnostic serialization compatible when lookup is off.
+        # Resolved transport is deliberately separate from user constructor input.
+        result = handler(self)
+        if self.dflash2_lookup is None or not self.dflash2_lookup.enabled:
+            result.pop("dflash2_lookup", None)
+        return result
+
+    def to_worker_payload(self) -> dict[str, Any]:
+        """JSON-safe input and resolved state; model/parallel configs travel separately.
+
+        Keep the original input to avoid reconstructing prompt defaults as user
+        intent. Target configs are supplied by the enclosing worker configuration.
+        """
+        raw = dict(self.__dict__["_lookup_input"])
+        if isinstance(raw.get("sm70_dflash2"), Sm70DFlash2Config):
+            user_fields = {
+                field.name
+                for field in fields(Sm70DFlash2Config)
+                if is_init_field(Sm70DFlash2Config, field.name)
+            }
+            raw["sm70_dflash2"] = TypeAdapter(Sm70DFlash2Config).dump_python(
+                raw["sm70_dflash2"], include=user_fields
+            )
+        return {
+            "schema_version": 1,
+            "input": TypeAdapter(dict[str, Any]).dump_python(raw, mode="json"),
+            "lookup": self.resolved_dflash2_lookup.model_dump(mode="json"),
+            "derived": {
+                "gdn_spec_state_replay": self.gdn_spec_state_replay,
+                "sm70_dflash2": TypeAdapter(Sm70DFlash2Config).dump_python(
+                    self.sm70_dflash2, mode="json"
+                ),
+            },
+        }
+
+    @classmethod
+    def from_worker_payload(
+        cls,
+        payload: dict[str, Any],
+        *,
+        target_model_config: ModelConfig | None = None,
+        target_parallel_config: ParallelConfig | None = None,
+    ) -> Self:
+        """Internal trusted JSON rebuild, or one-time upgrade of legacy raw input.
+
+        This is an internal transport entry point. CLI dictionaries always use
+        the ordinary constructor and cannot inject a resolved record.
+        """
+        if "schema_version" not in payload:
+            values = dict(payload)
+            derived = None
+            if "draft_model_config" in values:
+                # Previous diagnostic payloads contain normalized prompt zeros
+                # and init=False policy fields. Upgrade once at the config owner.
+                policy = values.get("sm70_dflash2", Sm70DFlash2Config())
+                if isinstance(policy, Sm70DFlash2Config):
+                    policy = TypeAdapter(Sm70DFlash2Config).dump_python(policy)
+                derived = {
+                    "gdn_spec_state_replay": values.pop("gdn_spec_state_replay", False),
+                    "sm70_dflash2": policy,
+                }
+                values["sm70_dflash2"] = {
+                    name: value
+                    for name, value in policy.items()
+                    if is_init_field(Sm70DFlash2Config, name)
+                }
+                if values.get("method") not in (
+                    "ngram",
+                    "ngram_gpu",
+                ) and not values.get("ngram_assist"):
+                    for name in ("prompt_lookup_min", "prompt_lookup_max"):
+                        if values.get(name) == 0:
+                            values[name] = None
+            target_model = target_model_config or values.get("target_model_config")
+            target_parallel = target_parallel_config or values.get(
+                "target_parallel_config"
+            )
+            for name in SYSTEM_FIELDS:
+                values.pop(name, None)
+            values.update(
+                target_model_config=target_model, target_parallel_config=target_parallel
+            )
+            result = TypeAdapter(cls).validate_python(values)
+            if derived is not None:
+                result._restore_worker_derived(derived)
+            return result
+        if (
+            payload.keys() != {"schema_version", "input", "lookup", "derived"}
+            or type(payload["schema_version"]) is not int
+            or payload["schema_version"] != 1
+        ):
+            raise ValueError("Unsupported speculative worker payload schema")
+        resolved = ResolvedDFlash2Lookup.model_validate(payload["lookup"])
+        values = dict(payload["input"])
+        if SYSTEM_FIELDS.intersection(values):
+            raise ValueError("Worker input must not override model/parallel configs")
+        values.update(
+            target_model_config=target_model_config,
+            target_parallel_config=target_parallel_config,
+        )
+        result = TypeAdapter(cls).validate_python(
+            values, context={"dflash2_lookup_resolved": resolved}
+        )
+        result._restore_worker_derived(payload["derived"])
+        return result
+
+    def _restore_worker_derived(self, derived: dict[str, Any]) -> None:
+        if derived.keys() != {"gdn_spec_state_replay", "sm70_dflash2"}:
+            raise ValueError("Invalid speculative worker derived fields")
+        self.gdn_spec_state_replay = TypeAdapter(bool).validate_python(
+            derived["gdn_spec_state_replay"], strict=True
+        )
+        # These policy fields use init=False and cannot go through a user input
+        # constructor. Rebuild the validated policy, then restore its decisions.
+        policy = dict(derived["sm70_dflash2"])
+        internal = {
+            field.name: policy.pop(field.name)
+            for field in fields(Sm70DFlash2Config)
+            if not is_init_field(Sm70DFlash2Config, field.name)
+        }
+        self.sm70_dflash2 = TypeAdapter(Sm70DFlash2Config).validate_python(policy)
+        annotations = get_type_hints(Sm70DFlash2Config)
+        for field in fields(Sm70DFlash2Config):
+            if field.name in internal:
+                value = TypeAdapter(annotations[field.name]).validate_python(
+                    internal[field.name]
+                )
+                setattr(self.sm70_dflash2, field.name, value)
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        # Multiprocess workers use pickle/cloudpickle for the enclosing config.
+        # Restore normalized objects without rerunning post-init or reading envs.
+        if "_lookup_resolved" not in state:
+            # Old pickle payloads must be upgraded once by the config owner.
+            raise ValueError(
+                "Legacy speculative pickle requires coordinator upgrade "
+                "through from_worker_payload"
+            )
+        resolved = ResolvedDFlash2Lookup.model_validate(state["_lookup_resolved"])
+        restored = object.__new__(type(self))
+        restored.__dict__.update(state)
+        restored.dflash2_lookup = validate_lookup_input(state.get("dflash2_lookup"))
+        validate_lookup_conflicts(restored.dflash2_lookup, resolved.source)
+        if resolve_lookup(restored, resolved.source, resolved.env_factors) != resolved:
+            raise ValueError("Inconsistent resolved DFlash2 lookup pickle")
+        self.__dict__.update(restored.__dict__)
+        self.__dict__["_lookup_resolved"] = resolved
+
+    def require_lookup_runtime(self) -> None:
+        resolved = self.__dict__.get("_lookup_resolved")
+        if (
+            resolved is not None
+            and resolved.mode == "gpu_head"
+            and resolved.policy != "longest"
+        ):
+            raise ValueError(
+                "dflash2_lookup provides only the longest policy in this release"
+            )
 
     def compute_hash(self) -> str:
         """
@@ -474,6 +778,9 @@ class SpeculativeConfig:
         factors: list[Any] = [
             ("use_local_argmax_reduction", self.use_local_argmax_reduction)
         ]
+        resolved_lookup = self.__dict__.get("_lookup_resolved")
+        if resolved_lookup is not None and resolved_lookup.mode == "gpu_head":
+            factors.append(("dflash2_lookup", resolved_lookup.graph_options()))
         # dflash_concurrency_drafts is left out: it only picks how many drafts
         # are verified and which uniform decode sizes get CUDA graphs; compile
         # ranges come from compilation_config, and graphs are not persisted.

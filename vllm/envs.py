@@ -20206,7 +20206,7 @@ def validate_environ(hard_fail: bool) -> None:
                 logger.warning("Unknown vLLM environment variable detected: %s", env)
 
 
-def compile_factors() -> dict[str, object]:
+def compile_factors(speculative_config: Any = None) -> dict[str, object]:
     """Return env vars used for torch.compile cache keys.
 
     Start with every known vLLM env var; drop entries in `ignored_factors`;
@@ -20313,8 +20313,16 @@ def compile_factors() -> dict[str, object]:
 
     from vllm.config.utils import normalize_value
 
+    resolved_lookup = (
+        speculative_config.resolved_dflash2_lookup
+        if speculative_config is not None
+        else None
+    )
+    lookup_prefix = "VLLM_DFLASH2_LOOKUP_"
     factors: dict[str, object] = {}
     for factor, getter in environment_variables.items():
+        if resolved_lookup is not None and factor.startswith(lookup_prefix):
+            continue
         if factor in ignored_factors:
             continue
 
@@ -20330,6 +20338,9 @@ def compile_factors() -> dict[str, object]:
 
         factors[factor] = normalize_value(raw)
 
+    if resolved_lookup is not None:
+        factors.update(resolved_lookup.env_factors)
+
     # Out-of-tree switches. Forks, plugins and out-of-tree backends read
     # their own VLLM_-prefixed variables straight from os.environ, so this
     # module never sees them -- yet they select kernels and therefore change
@@ -20339,6 +20350,8 @@ def compile_factors() -> dict[str, object]:
     # over-invalidated cache costs a recompile, a wrongly reused one costs
     # correctness.
     for name, value in os.environ.items():
+        if resolved_lookup is not None and name.startswith(lookup_prefix):
+            continue
         if not name.startswith("VLLM_"):
             continue
         if name in factors or name in ignored_factors:

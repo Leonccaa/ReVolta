@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 import gc
 import os
 import queue
@@ -82,6 +83,7 @@ from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+from vllm.v1.spec_decode.lookup_stats import initialize_owner, merge_output
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import IterationDetails, compute_iteration_details
 from vllm.version import __version__ as VLLM_VERSION
@@ -124,9 +126,30 @@ class EngineCore:
             )
 
         self.log_stats = log_stats
+        self.lookup_stats = initialize_owner(vllm_config, log_stats)
+        from vllm.v1.spec_decode.lookup_shutdown import LookupStatsShutdown
+
+        self.lookup_stats_shutdown = (
+            LookupStatsShutdown(self) if self.lookup_stats else None
+        )
 
         # Setup Model.
         self.model_executor = executor_class(vllm_config)
+        if self.lookup_stats is not None:
+            statuses = self.model_executor.collective_rpc("get_lookup_stats_status")
+            expected_rank = self.lookup_stats.registration.output_rank
+            expected = {
+                (rank, rank == expected_rank)
+                for rank in range(vllm_config.parallel_config.world_size)
+            }
+            if set(statuses) != expected or len(statuses) != len(expected):
+                raise RuntimeError(
+                    f"Lookup effective_collect_stats readback failed {statuses!r}"
+                )
+            logger.info(
+                "Lookup effective_collect_stats=True output_rank=%d period=1s",
+                expected_rank,
+            )
         if executor_fail_callback is not None:
             self.model_executor.register_failure_callback(executor_fail_callback)
 
@@ -573,6 +596,7 @@ class EngineCore:
         # during the model execution.
         self._process_aborts_queue()
         profile_part_t0 = time.perf_counter() if profile_ddtree_engine else 0.0
+        merge_output(self, model_output)
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
@@ -771,6 +795,7 @@ class EngineCore:
         # during the model execution.
         self._process_aborts_queue()
         trace_update_t0 = time.perf_counter() if trace_log else 0.0
+        merge_output(self, model_output)
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
@@ -903,6 +928,35 @@ class EngineCore:
         return self.shutdown_deadline()
 
     def shutdown(self):
+        controller = getattr(self, "lookup_stats_shutdown", None)
+        if controller is None:
+            return self._shutdown_resources()
+        if not controller.lock.acquire(blocking=False):
+            return
+        try:
+            if controller.started:
+                return
+            controller.started = True
+            controller.protect_uniproc()
+            self.request_shutdown()
+            shared = self.shutdown_deadline()
+            assert shared is not None
+            controller.drain_batches(shared)
+            return self._shutdown_resources()
+        except BaseException as error:
+            if controller.receipt is None:
+                receipt = controller.finish(
+                    prerequisite_error=f"prerequisite_failed/{type(error).__name__}"
+                )
+                if not receipt.isolated and not getattr(
+                    self, "_host_kv_quarantined", False
+                ):
+                    self.model_executor.shutdown()
+            raise
+        finally:
+            controller.lock.release()
+
+    def _shutdown_resources(self):
         if getattr(self, "_host_kv_shutdown_complete", False):
             return
         if getattr(self, "_host_kv_quarantined", False):
@@ -933,6 +987,11 @@ class EngineCore:
                     time.monotonic(),
                     getattr(self, "_shutdown_requested_at", None),
                 )
+            controller = getattr(self, "lookup_stats_shutdown", None)
+            if controller is not None:
+                receipt = controller.finish()
+                if receipt.isolated:
+                    return
             self.structured_output_manager.clear_backend()
             if self.model_executor:
                 if deadline is None:
@@ -1862,6 +1921,9 @@ class EngineCoreProc(EngineCore):
                 dp_stats_address=self.frontend_stats_publish_address,
                 dtype=str(self.vllm_config.model_config.dtype).removeprefix("torch."),
                 vllm_version=VLLM_VERSION,
+                lookup_stats_registration=(
+                    self.lookup_stats.registration if self.lookup_stats else None
+                ),
             )
             ready_payload = msgspec.msgpack.encode(ready_response)
             for input_socket in input_sockets:

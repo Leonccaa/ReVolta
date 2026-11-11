@@ -27,7 +27,10 @@ PROFILE_NOTE = (
 
 _BITWISE = "Outputs are bitwise identical either way."
 _LOOKUP = (
-    "Experimental, ngram_assist only (speculative_config ngram_assist, default off). "
+    "Legacy ngram_assist only (default off). Kept for compatibility with no "
+    "removal version set. New configurations use explicit dflash2_lookup "
+    "settings; see the native history lookup guide. Legacy values and cache "
+    "factors are fixed at configuration resolution. "
 )
 
 NOTES: dict[str, dict[str, str]] = {

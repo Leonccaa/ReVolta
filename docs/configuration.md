@@ -80,6 +80,37 @@ or disable custom all-reduce with `--disable-custom-all-reduce`.
 - Media limits and request budgets: see
   [multimodal input limits](../.github/MULTIMODAL_INPUTS.md).
 
+## Optional native DFlash2 lookup
+
+The `dflash2_lookup` object inside `--speculative-config` is disabled by default.
+See [native history lookup](dflash2.md#native-history-lookup-optional) for the C64
+recipe, scheduling limits, measurements and statistics.
+
+| Field | Default | Accepted settings |
+| --- | --- | --- |
+| `enabled` | `false` | Boolean; enable explicitly |
+| `policy` | unset | `longest`; required when enabled |
+| `nmin`, `nmax` | unset | Positive integers with `nmin <= nmax`; required when enabled |
+| `search_window` | `65536` | Positive token distance in committed history |
+| `gate` | `first_token` | Strict agreement with the original first draft token |
+| `collect_stats` | `true` | Also requires the engine's effective statistics switch |
+| `expand.enabled` | `false` | Must remain false, even when lookup is disabled |
+
+Native lookup requires a seven-token DFlash2 selector drafter and seven configured
+speculative tokens. It only attempts lookup on an eligible single-request decode
+batch. Multiple requests bypass lookup while the existing concurrency ladder
+continues to choose the verification width. Fixed seven without a ladder permits
+async subject to existing constraints; a nonempty ladder rejects explicit async
+and otherwise selects synchronous scheduling.
+
+Raw input provenance is captured before normalization and preserved through worker
+reconstruction. Worker environment changes do not reinterpret resolved lookup
+settings. Enabled native lookup rejects conflicting legacy assist, prompt bounds
+or lookup environment inputs; explicit disabled/null/empty inputs retain the
+existing effective-mode warnings. Legacy inputs remain compatible without a
+scheduled removal. Lookup configuration changes isolate active compile/graph
+identities; provenance and the statistics switch are not model-forward factors.
+
 ## Sampling parameters
 
 The server takes default sampling values from the checkpoint's `generation_config.json`
@@ -234,15 +265,15 @@ The ReVolta profile (`vllm/revolta_profile.py`) sets these on SM70 + TP4 + FP16 
 
 | Name | Type | Default | Range | Category | Since | Effect and trade-off |
 |---|---|---|---|---|---|---|
-| `VLLM_DFLASH2_LOOKUP_ADAPTIVE` | bool | `True` | 0, 1 | experimental | 1Cat | Experimental, ngram_assist only (speculative_config ngram_assist, default off). Adaptive q8/q16 lookup width. |
-| `VLLM_DFLASH2_LOOKUP_AGREE` | int | `Computed when unset: max(0, int('0'))` | integer >= 0 | experimental | 1Cat | Experimental, ngram_assist only (speculative_config ngram_assist, default off). Leading tokens the lookup and the draft must agree on (0 = none). |
-| `VLLM_DFLASH2_LOOKUP_CHEAP_CONTEXT` | int | `Computed when unset: max(0, int('0'))` | integer >= 0 | experimental | 1Cat | Experimental, ngram_assist only (speculative_config ngram_assist, default off). Context length below which lookup is always tried (0 = off). |
-| `VLLM_DFLASH2_LOOKUP_ENTRY_STREAK` | int | `Computed when unset: max(1, int('2'))` | integer >= 1 | experimental | 1Cat | Experimental, ngram_assist only (speculative_config ngram_assist, default off). Consecutive hits before lookup mode starts. |
-| `VLLM_DFLASH2_LOOKUP_LONG_MIN` | int | `Computed when unset: max(1, int('6'))` | integer >= 1 | experimental | 1Cat | Experimental, ngram_assist only (speculative_config ngram_assist, default off). Minimum length of a long match. |
-| `VLLM_DFLASH2_LOOKUP_NMIN_TAIL` | int | `Computed when unset: max(1, int('4'))` | integer >= 1 | experimental | 1Cat | Experimental, ngram_assist only (speculative_config ngram_assist, default off). Smallest n-gram accepted for the lookup tail. |
-| `VLLM_DFLASH2_LOOKUP_NSTRONG` | int | `Computed when unset: max(1, int('6'))` | integer >= 1 | experimental | 1Cat | Experimental, ngram_assist only (speculative_config ngram_assist, default off). n-gram length that counts as a strong prompt match. |
-| `VLLM_DFLASH2_LOOKUP_SEARCH` | int | `Computed when unset: max(1, int(str(1 << 30)))` | integer >= 1 | experimental | 1Cat | Experimental, ngram_assist only (speculative_config ngram_assist, default off). Context searched for matches (default unbounded). |
-| `VLLM_DFLASH2_LOOKUP_STICKY` | int | `Computed when unset: max(0, int('3'))` | integer >= 0 | experimental | 1Cat | Experimental, ngram_assist only (speculative_config ngram_assist, default off). Steps lookup mode stays on after a hit. |
+| `VLLM_DFLASH2_LOOKUP_ADAPTIVE` | bool | `True` | 0, 1 | experimental | 1Cat | Legacy ngram_assist only (default off). Kept for compatibility with no removal version set. New configurations use explicit dflash2_lookup settings; see the native history lookup guide. Legacy values and cache factors are fixed at configuration resolution. Adaptive q8/q16 lookup width. |
+| `VLLM_DFLASH2_LOOKUP_AGREE` | int | `Computed when unset: max(0, int('0'))` | integer >= 0 | experimental | 1Cat | Legacy ngram_assist only (default off). Kept for compatibility with no removal version set. New configurations use explicit dflash2_lookup settings; see the native history lookup guide. Legacy values and cache factors are fixed at configuration resolution. Leading tokens the lookup and the draft must agree on (0 = none). |
+| `VLLM_DFLASH2_LOOKUP_CHEAP_CONTEXT` | int | `Computed when unset: max(0, int('0'))` | integer >= 0 | experimental | 1Cat | Legacy ngram_assist only (default off). Kept for compatibility with no removal version set. New configurations use explicit dflash2_lookup settings; see the native history lookup guide. Legacy values and cache factors are fixed at configuration resolution. Context length below which lookup is always tried (0 = off). |
+| `VLLM_DFLASH2_LOOKUP_ENTRY_STREAK` | int | `Computed when unset: max(1, int('2'))` | integer >= 1 | experimental | 1Cat | Legacy ngram_assist only (default off). Kept for compatibility with no removal version set. New configurations use explicit dflash2_lookup settings; see the native history lookup guide. Legacy values and cache factors are fixed at configuration resolution. Consecutive hits before lookup mode starts. |
+| `VLLM_DFLASH2_LOOKUP_LONG_MIN` | int | `Computed when unset: max(1, int('6'))` | integer >= 1 | experimental | 1Cat | Legacy ngram_assist only (default off). Kept for compatibility with no removal version set. New configurations use explicit dflash2_lookup settings; see the native history lookup guide. Legacy values and cache factors are fixed at configuration resolution. Minimum length of a long match. |
+| `VLLM_DFLASH2_LOOKUP_NMIN_TAIL` | int | `Computed when unset: max(1, int('4'))` | integer >= 1 | experimental | 1Cat | Legacy ngram_assist only (default off). Kept for compatibility with no removal version set. New configurations use explicit dflash2_lookup settings; see the native history lookup guide. Legacy values and cache factors are fixed at configuration resolution. Smallest n-gram accepted for the lookup tail. |
+| `VLLM_DFLASH2_LOOKUP_NSTRONG` | int | `Computed when unset: max(1, int('6'))` | integer >= 1 | experimental | 1Cat | Legacy ngram_assist only (default off). Kept for compatibility with no removal version set. New configurations use explicit dflash2_lookup settings; see the native history lookup guide. Legacy values and cache factors are fixed at configuration resolution. n-gram length that counts as a strong prompt match. |
+| `VLLM_DFLASH2_LOOKUP_SEARCH` | int | `Computed when unset: max(1, int(str(1 << 30)))` | integer >= 1 | experimental | 1Cat | Legacy ngram_assist only (default off). Kept for compatibility with no removal version set. New configurations use explicit dflash2_lookup settings; see the native history lookup guide. Legacy values and cache factors are fixed at configuration resolution. Context searched for matches (default unbounded). |
+| `VLLM_DFLASH2_LOOKUP_STICKY` | int | `Computed when unset: max(0, int('3'))` | integer >= 0 | experimental | 1Cat | Legacy ngram_assist only (default off). Kept for compatibility with no removal version set. New configurations use explicit dflash2_lookup settings; see the native history lookup guide. Legacy values and cache factors are fixed at configuration resolution. Steps lookup mode stays on after a hit. |
 | `VLLM_DFLASH_COMPACT_AUX_HIDDEN` | bool | `True` | 0, 1 | configuration | 1Cat | Concatenates the target auxiliary hidden states directly in the draft projection dtype (DFlash and DFlash2 drafts); avoids an extra full-precision copy. |
 | `VLLM_DFLASH_DEBUG_CONTEXT_KV` | bool | `False` | 0, 1 | debug | 1Cat | Debug: log the draft context KV. |
 | `VLLM_DFLASH_DEBUG_CORRUPTION` | bool | `False` | 0, 1 | debug | 1Cat | Debug, MRv1 only: draft corruption diagnostics. |

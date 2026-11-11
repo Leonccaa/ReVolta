@@ -97,6 +97,121 @@ def write_slots(
 
 
 @triton.jit
+def stage_slots(
+    K,
+    V,
+    Slot,
+    Host,
+    Hot,
+    Stage,
+    Targets,
+    Map,
+    PageOf,
+    KS0: tl.constexpr,
+    KS1: tl.constexpr,
+    VS0: tl.constexpr,
+    VS1: tl.constexpr,
+    HS0: tl.constexpr,
+    HSS: tl.constexpr,
+    HS1: tl.constexpr,
+    HS2: tl.constexpr,
+    HS3: tl.constexpr,
+    RATIO: tl.constexpr,
+    KBS: tl.constexpr,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    B: tl.constexpr,
+):
+    """Write planned rows to compact GPU storage, refresh hot, retain decode UVA."""
+    row = tl.program_id(0).to(tl.int64)
+    x = tl.arange(0, B).to(tl.int64)
+    slot = tl.load(Slot + row).to(tl.int64)
+    valid = slot >= 0
+    safe = tl.maximum(slot, 0)
+    kernel_block, offset = safe // KBS, safe % KBS
+    page = tl.load(PageOf + kernel_block // RATIO)
+    valid = valid & (page > 0)
+    lane = valid & (x < H * D)
+    key = tl.load(K + row * KS0 + (x // D) * KS1 + x % D, lane, 0)
+    value = tl.load(V + row * VS0 + (x // D) * VS1 + x % D, lane, 0)
+    host = store_offsets(
+        kernel_block, PageOf, 0, offset, x // D, x % D, HS0, HSS, HS1, HS2, HS3, RATIO
+    )
+    k_target = tl.load(Targets + row * 2).to(tl.int64)
+    v_target = tl.load(Targets + row * 2 + 1).to(tl.int64)
+    staged = k_target >= 0
+    tl.store(Stage + k_target * (H * D) + x, key, lane & staged)
+    tl.store(Stage + v_target * (H * D) + x, value, lane & staged)
+    tl.store(Host + host, key, lane & ~staged)
+    tl.store(Host + host + HS1, value, lane & ~staged)
+    hot_slot = tl.load(Map + kernel_block * (KBS // 4) + offset // 4, valid, -1)
+    hot = hot_slot.to(tl.int64) * (8 * H * D) + (offset % 4) * H * D + x
+    tl.store(Hot + hot, key, lane & (hot_slot >= 0))
+    tl.store(Hot + hot + 4 * H * D, value, lane & (hot_slot >= 0))
+
+
+@triton.jit
+def write_slots_vector(
+    K,
+    V,
+    Slot,
+    Host,
+    Hot,
+    Stage,
+    Targets,
+    Map,
+    PageOf,
+    N,
+    KS0: tl.constexpr,
+    VS0: tl.constexpr,
+    HS0: tl.constexpr,
+    HSS: tl.constexpr,
+    HS1: tl.constexpr,
+    HS2: tl.constexpr,
+    RATIO: tl.constexpr,
+    KBS: tl.constexpr,
+    W: tl.constexpr,
+    WB: tl.constexpr,
+    ROWS: tl.constexpr,
+    STAGED: tl.constexpr,
+):
+    """All strides and W are in 8-byte words. One program = ROWS rows."""
+    r = (tl.program_id(0) * ROWS + tl.arange(0, ROWS)).to(tl.int64)
+    rmask = r < N
+    x = tl.max_contiguous(tl.arange(0, WB), WB).to(tl.int64)
+    slot = tl.load(Slot + r, rmask, -1).to(tl.int64)
+    valid = slot >= 0
+    safe = tl.maximum(slot, 0)
+    kb, off = safe // KBS, safe % KBS
+    page = tl.load(PageOf + kb // RATIO, valid, 0).to(tl.int64)
+    valid = valid & (page > 0)
+    lane = valid[:, None] & (x < W)[None, :]
+    src_k = tl.multiple_of(r * KS0, 2)
+    src_v = tl.multiple_of(r * VS0, 2)
+    key = tl.load(K + src_k[:, None] + x[None, :], lane, 0)
+    value = tl.load(V + src_v[:, None] + x[None, :], lane, 0)
+    base = page * HS0 + (kb % RATIO) * HSS + off * HS2
+    base = tl.multiple_of(base, 2)
+    host_lane = lane
+    if STAGED:
+        k_target = tl.load(Targets + r * 2, rmask, -1).to(tl.int64)
+        v_target = tl.load(Targets + r * 2 + 1, rmask, -1).to(tl.int64)
+        staged = k_target >= 0
+        stage_k = tl.multiple_of(k_target * W, 2)
+        stage_v = tl.multiple_of(v_target * W, 2)
+        tl.store(Stage + stage_k[:, None] + x[None, :], key, lane & staged[:, None])
+        tl.store(Stage + stage_v[:, None] + x[None, :], value, lane & staged[:, None])
+        host_lane = lane & ~staged[:, None]
+    tl.store(Host + base[:, None] + x[None, :], key, host_lane)
+    tl.store(Host + (base + HS1)[:, None] + x[None, :], value, host_lane)
+    hot_slot = tl.load(Map + kb * (KBS // 4) + off // 4, valid, -1).to(tl.int64)
+    hot = tl.multiple_of(hot_slot * (8 * W) + (off % 4) * W, 2)
+    hmask = lane & (hot_slot >= 0)[:, None]
+    tl.store(Hot + hot[:, None] + x[None, :], key, hmask)
+    tl.store(Hot + (hot + 4 * W)[:, None] + x[None, :], value, hmask)
+
+
+@triton.jit
 def commit_slots(
     Slot, Ready, PageOf, SPAN: tl.constexpr, N: tl.constexpr, B: tl.constexpr
 ):

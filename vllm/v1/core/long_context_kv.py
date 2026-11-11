@@ -133,6 +133,7 @@ class LongContextGeometry:
     dcp_world_size: int = 1
     hot_layers: int = 1
     hot_max_write_rows: int = 1
+    hot_staged_writethrough: bool = False
     hot_query_heads: int = 1
     hot_head_dim: int = 256
     hot_kv_heads: int = 1
@@ -245,13 +246,21 @@ class LongContextGeometry:
             max_requests=max_num_seqs,
             selection_width=4 * (self.hot_row_groups - 1) + 3,
             max_write_rows=self.hot_max_write_rows,
+            staged_writethrough=self.hot_staged_writethrough,
             row_groups=self.hot_row_groups,
             tail_groups=self.hot_tail_groups,
             read_rows=self.hot_read_rows,
         )
         payload = parts.pop("hot")
         workspace = sum(
-            parts.pop(name) for name in ("indices", "staging", "staging_slots")
+            parts.pop(name, 0)
+            for name in (
+                "indices",
+                "staging",
+                "staging_slots",
+                "write_stage",
+                "write_targets",
+            )
         )
         return {
             "payload": payload,
@@ -638,6 +647,10 @@ def plan_long_context_capacity(
     settings.validate_settings()
     if main_kv_on_gpu is None:
         main_kv_on_gpu = settings.main_kv_placement == "gpu"
+    geometry = replace(
+        geometry,
+        hot_staged_writethrough=not main_kv_on_gpu and settings.staged_writethrough,
+    )
     if main_kv_on_gpu:
         # The reference arm retains its original admission sizing and never
         # allocates the host reader scratch.
@@ -786,6 +799,7 @@ def shared_region_fixed_bytes(geometry: LongContextGeometry, max_num_seqs: int) 
         max_requests=max_num_seqs,
         selection_width=4 * (geometry.hot_row_groups - 1) + 3,
         max_write_rows=geometry.hot_max_write_rows,
+        staged_writethrough=geometry.hot_staged_writethrough,
         row_groups=geometry.hot_row_groups,
         tail_groups=geometry.hot_tail_groups,
         read_rows=geometry.hot_read_rows,

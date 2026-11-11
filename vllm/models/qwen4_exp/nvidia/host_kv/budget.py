@@ -56,6 +56,7 @@ def history_fixed_memory_bytes(
     row_groups: int = QSA_ROW_GROUPS,
     tail_groups: int = TAIL_GROUPS,
     read_rows: int | None = READ_ROWS,
+    staged_writethrough: bool = False,
 ) -> dict[str, int]:
     """Exact bytes by tensor name; ``slot_bytes`` includes every layer.
 
@@ -68,7 +69,7 @@ def history_fixed_memory_bytes(
         if read_rows is None
         else read_rows
     )
-    return {
+    parts = {
         "hot": slots * slot_bytes,
         "slot_owner": 4 * num_layers * slots,
         "age": 8 * num_layers * slots,
@@ -86,6 +87,11 @@ def history_fixed_memory_bytes(
         "staging": max_write_rows * (slot_bytes // (4 * num_layers)),
         "staging_slots": 8 * max_write_rows,
     }
+
+    if staged_writethrough:
+        parts["write_stage"] = parts["staging"]
+        parts["write_targets"] = 16 * max_write_rows
+    return parts
 
 
 def union_gather_memory_bytes(

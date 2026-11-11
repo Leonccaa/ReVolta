@@ -58,7 +58,9 @@ def geometry(*, max_model_len=MI, speculative_blocks=7, num_spec=7):
     groups = get_kv_cache_groups(
         config, production_specs(speculative_blocks=speculative_blocks)
     )
-    return get_long_context_geometry(config, groups)
+    return replace(
+        get_long_context_geometry(config, groups), hot_staged_writethrough=True
+    )
 
 
 def test_production_geometry_reproduces_the_m0_ledger():
@@ -125,11 +127,19 @@ def test_hot_memory_uses_the_engine_store_workspace():
         max_requests=1,
         selection_width=2051,
         max_write_rows=8192,
+        staged_writethrough=geo.hot_staged_writethrough,
     )
     parts = shape.fixed_device_memory_bytes()
     actual = geo.hot_memory_bytes(4113)
     assert actual["workspace"] == sum(
-        parts[name] for name in ("indices", "staging", "staging_slots")
+        parts[name]
+        for name in (
+            "indices",
+            "staging",
+            "staging_slots",
+            "write_stage",
+            "write_targets",
+        )
     )
     assert sum(actual.values()) == sum(parts.values())
 

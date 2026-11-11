@@ -739,6 +739,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.device,
                 kv_caches_dict,
             )
+            assert self.host_history is not None
+            if self.host_history.shape.staged_writethrough:
+                names = set(self.kv_cache_config.host_kv_layers)
+                self._host_write_group = next(
+                    i
+                    for i, group in enumerate(self.kv_cache_config.kv_cache_groups)
+                    if names.intersection(group.layer_names)
+                )
+                self.block_tables.cpu_mirrors[self._host_write_group] = {}
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
 
     def _init_kv_zero_meta(self) -> None:
@@ -761,6 +770,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cache_dtype=self.cache_config.cache_dtype,
             runner_only_attn_layers=set(),
             static_forward_context=self.compilation_config.static_forward_context,
+        )
+
+    def _set_host_write_plan(self, input_batch, cg_mode) -> None:
+        store = getattr(self, "host_history", None)
+        if store is None or not store.shape.staged_writethrough:
+            return
+        store.write_plan = None
+        store.write_plan_kind = "none"
+        store.write_plan_all_prefill = False
+        if cg_mode != CUDAGraphMode.NONE or not input_batch.is_prefilling_np.any():
+            return
+        store.prepare_prefill_write(
+            self.block_tables.cpu_mirrors[self._host_write_group],
+            input_batch.idx_mapping_np,
+            input_batch.num_scheduled_tokens,
+            input_batch.num_computed_prefill_tokens_np,
+            input_batch.is_prefilling_np,
+            input_batch.num_tokens_after_padding,
+            *self.block_tables.group_cp(self._host_write_group),
+            self.block_tables.cp_interleave,
         )
 
     def _set_host_kv_plan(self, scheduler_output, input_batch) -> None:
@@ -810,6 +839,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 s.read_rows,
                 row_groups=s.row_groups,
                 tail_groups=s.tail_groups,
+                single_request_fast=s.staged_writethrough,
             ),
         )
 
@@ -1795,6 +1825,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Prepare all the inputs and copy to the input buffers.
             input_batch = self.prepare_inputs(scheduler_output, batch_desc)
             self._set_host_kv_plan(scheduler_output, input_batch)
+            self._set_host_write_plan(input_batch, batch_desc.cg_mode)
             early_model_inputs, ple_prepared = self.prepare_model_inputs_early(
                 input_batch, batch_desc.cg_mode
             )
@@ -1821,6 +1852,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             host_history = getattr(self, "host_history", None)
             if host_history is not None:
                 host_history.set_step_plan(None, None)
+                host_history.write_plan = None
             input_batch = InputBatch.make_dummy(
                 batch_desc.num_reqs or num_reqs,
                 batch_desc.num_tokens,

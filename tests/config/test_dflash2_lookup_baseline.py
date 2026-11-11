@@ -127,7 +127,7 @@ def compatibility_snapshot(tmp_path, new_config=None):
         None,
         {},
         {"enabled": False},
-        {"enabled": False, "policy": "nearest", "nmin": 3, "nmax": 16},
+        {"enabled": False, "policy": "longest", "nmin": 3, "nmax": 16},
     ],
 )
 def test_existing_configuration_matches_fixed_main(tmp_path, new_config):

@@ -80,7 +80,7 @@ def build(checkpoint, **kwargs):
         None,
         {},
         {"enabled": False},
-        {"enabled": False, "policy": "nearest", "nmin": 3, "nmax": 16},
+        {"enabled": False, "policy": "longest", "nmin": 3, "nmax": 16},
     ],
 )
 @pytest.mark.parametrize(
@@ -133,7 +133,7 @@ def test_absent_matrix_and_source_before_normalization(checkpoint, legacy):
         {"prompt_lookup_min": None, "prompt_lookup_max": None},
     ],
 )
-@pytest.mark.parametrize("policy", ["longest", "nearest"])
+@pytest.mark.parametrize("policy", ["longest"])
 def test_new_enabled_accepts_only_inert_legacy(checkpoint, legacy, policy):
     spec = build(checkpoint, dflash2_lookup=HEAD | {"policy": policy}, **legacy)
     assert spec.resolved_dflash2_lookup.mode == "gpu_head"
@@ -254,8 +254,7 @@ def test_concurrency_and_startup_guard(checkpoint):
     spec = build(
         checkpoint, dflash2_lookup=HEAD, dflash_concurrency_drafts={4: 3, 5: 4}
     )
-    with pytest.raises(NotImplementedError, match="runtime is not implemented"):
-        VllmConfig(speculative_config=spec)
+    spec.require_lookup_runtime()
     with pytest.raises(ValueError, match="without ngram_assist"):
         build(checkpoint, ngram_assist=True, dflash_concurrency_drafts={4: 3})
 
@@ -437,7 +436,6 @@ def test_active_hash_ignores_provenance_and_disabled_presets(checkpoint):
         == active.compute_hash()
     )
     for patch in (
-        {"policy": "nearest"},
         {"nmin": 4},
         {"nmax": 17},
         {"search_window": 1024},
@@ -793,8 +791,8 @@ def test_config_traversal_and_logging_accept_private_state(checkpoint, new, lega
     assert copy.copy(spec).resolved_dflash2_lookup == spec.resolved_dflash2_lookup
     assert copy.deepcopy(spec).resolved_dflash2_lookup == spec.resolved_dflash2_lookup
     if spec.dflash2_lookup is not None:
-        child = replace(spec.dflash2_lookup, policy="nearest")
-        assert child.policy == "nearest"
+        child = replace(spec.dflash2_lookup, policy="longest")
+        assert child.policy == "longest"
         assert replace(child.expand).enabled is False
 
 
@@ -895,33 +893,30 @@ def test_absent_new_interface_has_no_disabled_mode_warning(checkpoint, caplog):
     )
 
 
-@pytest.mark.parametrize(
-    "policy,ladder", [("longest", None), ("nearest", None), ("longest", {4: 3})]
-)
-def test_stage_two_runtime_boundary(checkpoint, policy, ladder):
-    spec = build(
-        checkpoint,
-        dflash2_lookup=HEAD | {"policy": policy},
-        dflash_concurrency_drafts=ladder,
-    )
-    if policy == "longest" and ladder is None:
-        spec.require_lookup_runtime()
-    else:
-        with pytest.raises(NotImplementedError, match="stage three"):
-            spec.require_lookup_runtime()
+@pytest.mark.parametrize("ladder", [None, {4: 3, 5: 4}])
+def test_native_runtime_accepts_concurrency_ladder(checkpoint, ladder):
+    spec = build(checkpoint, dflash2_lookup=HEAD, dflash_concurrency_drafts=ladder)
+    spec.require_lookup_runtime()
+    baseline = build(checkpoint, dflash2_lookup=HEAD)
+    assert spec.compute_hash() == baseline.compute_hash()
+    assert envs.compile_factors(spec) == envs.compile_factors(baseline)
 
 
-def test_native_async_is_reserved_for_stage_three(checkpoint):
-    from vllm.config import SchedulerConfig
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("policy", ["nearest", "other", "", 1, False])
+def test_unprovided_policy_fails_at_configuration(checkpoint, enabled, policy):
+    with pytest.raises(ValueError, match="policy .*not provided in this release"):
+        build(checkpoint, dflash2_lookup=HEAD | {"enabled": enabled, "policy": policy})
 
+
+@pytest.mark.parametrize("codec", [pickle, cloudpickle])
+def test_worker_restore_rejects_unprovided_policy(checkpoint, codec):
     spec = build(checkpoint, dflash2_lookup=HEAD)
-    with pytest.raises(NotImplementedError, match="stage three"):
-        VllmConfig(
-            speculative_config=spec,
-            scheduler_config=SchedulerConfig(
-                max_model_len=512, is_encoder_decoder=False, async_scheduling=True
-            ),
-        )
+    state = spec.__getstate__()
+    state["dflash2_lookup"].policy = "nearest"
+    with pytest.raises(ValueError, match="not provided in this release"):
+        restored = object.__new__(SpeculativeConfig)
+        restored.__setstate__(codec.loads(codec.dumps(state)))
 
 
 @pytest.mark.parametrize("replay", [False, True])
@@ -938,16 +933,27 @@ def test_native_kv_geometry_remains_seven(checkpoint, replay):
     assert not uses_adaptive_dflash_lookup(spec)
 
 
-@pytest.mark.parametrize("async_scheduling", [False, None])
-def test_native_engine_defaults_to_stage_two_sync(
-    checkpoint, monkeypatch, async_scheduling
+@pytest.mark.parametrize("async_scheduling", [False, None, True])
+@pytest.mark.parametrize("ladder", [None, {4: 3, 5: 4}])
+@pytest.mark.parametrize("padded", [False, True])
+def test_native_engine_uses_existing_async_rules(
+    checkpoint, monkeypatch, async_scheduling, ladder, padded
 ):
     from vllm.config import SchedulerConfig
 
-    spec = build(checkpoint, dflash2_lookup=HEAD)
+    spec = build(
+        checkpoint,
+        dflash2_lookup=HEAD,
+        dflash_concurrency_drafts=ladder,
+        disable_padded_drafter_batch=padded,
+    )
     monkeypatch.setattr(current_platform, "is_cuda", lambda: False)
     monkeypatch.setattr(envs, "VLLM_USE_MEGA_AOT_ARTIFACT", False)
-    config = VllmConfig(
+    # Test the engine decision before the CPU hardware adapter disables async.
+    monkeypatch.setattr(
+        current_platform, "check_and_update_config", lambda config: None
+    )
+    kwargs = dict(
         model_config=checkpoint["target_model_config"],
         parallel_config=checkpoint["target_parallel_config"],
         speculative_config=spec,
@@ -959,7 +965,80 @@ def test_native_engine_defaults_to_stage_two_sync(
             async_scheduling=async_scheduling,
         ),
     )
-    assert config.scheduler_config.async_scheduling is False
+    if async_scheduling is True and (ladder or padded):
+        message = (
+            "ignores dflash_concurrency_drafts"
+            if ladder
+            else "disable_padded_drafter_batch"
+        )
+        with pytest.raises(ValueError, match=message):
+            VllmConfig(**kwargs)
+    else:
+        config = VllmConfig(**kwargs)
+        assert config.scheduler_config.async_scheduling is (
+            async_scheduling is not False and not ladder and not padded
+        )
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_cli_rejects_nearest_in_this_release(checkpoint, enabled):
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    raw = {
+        "method": "dflash",
+        "model": checkpoint["model"],
+        "num_speculative_tokens": 7,
+        "dflash2_lookup": HEAD | {"enabled": enabled, "policy": "nearest"},
+    }
+    args = EngineArgs.from_cli_args(
+        parser.parse_args(
+            [
+                "--model",
+                checkpoint["target_model_config"].model,
+                "--speculative-config",
+                json.dumps(raw),
+            ]
+        )
+    )
+    with pytest.raises(ValueError, match="not provided in this release"):
+        args.create_speculative_config(
+            checkpoint["target_model_config"], checkpoint["target_parallel_config"]
+        )
+
+
+@pytest.mark.parametrize("async_scheduling", [None, True])
+def test_native_async_respects_executor_capability(
+    checkpoint, monkeypatch, async_scheduling
+):
+    from vllm.config import SchedulerConfig
+    from vllm.v1.executor.abstract import Executor
+
+    class SyncExecutor:
+        @staticmethod
+        def supports_async_scheduling():
+            return False
+
+    spec = build(checkpoint, dflash2_lookup=HEAD)
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(
+        current_platform, "check_and_update_config", lambda config: None
+    )
+    monkeypatch.setattr(Executor, "get_class", lambda config: SyncExecutor)
+    kwargs = dict(
+        model_config=checkpoint["target_model_config"],
+        parallel_config=checkpoint["target_parallel_config"],
+        speculative_config=spec,
+        scheduler_config=SchedulerConfig(
+            max_model_len=512,
+            max_num_batched_tokens=512,
+            is_encoder_decoder=False,
+            async_scheduling=async_scheduling,
+        ),
+    )
+    if async_scheduling:
+        with pytest.raises(ValueError, match="does not support async scheduling yet"):
+            VllmConfig(**kwargs)
+    else:
+        assert VllmConfig(**kwargs).scheduler_config.async_scheduling is False
 
 
 def test_model_and_engine_config_copy_rebuild_derived_state(checkpoint):

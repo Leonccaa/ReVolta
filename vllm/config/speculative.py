@@ -757,11 +757,10 @@ class SpeculativeConfig:
         if (
             resolved is not None
             and resolved.mode == "gpu_head"
-            and (resolved.policy != "longest" or self.dflash_concurrency_drafts)
+            and resolved.policy != "longest"
         ):
-            raise NotImplementedError(
-                "dflash2_lookup runtime is not implemented for nearest or "
-                "concurrency ladders until W21 stage three"
+            raise ValueError(
+                "dflash2_lookup provides only the longest policy in this release"
             )
 
     def compute_hash(self) -> str:

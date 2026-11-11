@@ -1778,13 +1778,6 @@ class VllmConfig:
 
         if self.speculative_config is not None:
             self.speculative_config.require_lookup_runtime()
-            resolved_lookup = self.speculative_config.__dict__.get("_lookup_resolved")
-            if resolved_lookup is not None and resolved_lookup.mode == "gpu_head":
-                if self.scheduler_config.async_scheduling:
-                    raise NotImplementedError(
-                        "Native lookup async requires W21 stage three"
-                    )
-                self.scheduler_config.async_scheduling = False
 
         from vllm.revolta_profile import (
             all_visible_devices_sm70,

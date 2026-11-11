@@ -36,6 +36,15 @@ SYSTEM_FIELDS = frozenset(
 )
 
 
+def _supported_policy(value: Any) -> Any:
+    if value is not None and value != "longest":
+        raise ValueError(
+            f"dflash2_lookup policy {value!r} is not provided in this release; "
+            "use 'longest'"
+        )
+    return value
+
+
 @config
 class DFlash2LookupExpandConfig:
     """Reserved expansion sentinel for the first native-width implementation."""
@@ -66,7 +75,7 @@ class DFlash2LookupConfig:
 
     enabled: StrictBool = False
     """Enable native-width GPU head fusion."""
-    policy: Literal["longest", "nearest"] | None = None
+    policy: Literal["longest"] | None = None
     """Search policy, required when enabled until release defaults are selected."""
     nmin: StrictInt | None = Field(default=None, ge=1)
     """Minimum suffix length, required when enabled."""
@@ -80,6 +89,11 @@ class DFlash2LookupConfig:
     """Collect lookup counters when the engine's existing statistics switch permits."""
     expand: DFlash2LookupExpandConfig = Field(default_factory=DFlash2LookupExpandConfig)
     """Reserved expansion configuration, supporting only enabled=false."""
+
+    @field_validator("policy", mode="before")
+    @classmethod
+    def _validate_policy(cls, value: Any) -> Any:
+        return _supported_policy(value)
 
     @model_validator(mode="wrap")
     @classmethod
@@ -126,7 +140,7 @@ class ResolvedDFlash2Lookup(BaseModel):
     schema_version: Literal[1] = 1
     admission_version: Literal[1] = 1
     mode: Literal["off", "gpu_head", "legacy_host", "legacy_gpu"]
-    policy: Literal["longest", "nearest"] | None = None
+    policy: Literal["longest"] | None = None
     nmin: StrictInt | None = None
     nmax: StrictInt | None = None
     search_window: StrictInt | None = None
@@ -137,6 +151,11 @@ class ResolvedDFlash2Lookup(BaseModel):
     # Values already normalized exactly as envs.compile_factors does.
     env_factors: tuple[tuple[str, StrictBool | StrictInt | str], ...]
     source: LookupSource
+
+    @field_validator("policy", mode="before")
+    @classmethod
+    def _validate_policy(cls, value: Any) -> Any:
+        return _supported_policy(value)
 
     @field_validator("schema_version", "admission_version", mode="before")
     @classmethod

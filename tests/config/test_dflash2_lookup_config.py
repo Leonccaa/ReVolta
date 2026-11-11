@@ -895,6 +895,73 @@ def test_absent_new_interface_has_no_disabled_mode_warning(checkpoint, caplog):
     )
 
 
+@pytest.mark.parametrize(
+    "policy,ladder", [("longest", None), ("nearest", None), ("longest", {4: 3})]
+)
+def test_stage_two_runtime_boundary(checkpoint, policy, ladder):
+    spec = build(
+        checkpoint,
+        dflash2_lookup=HEAD | {"policy": policy},
+        dflash_concurrency_drafts=ladder,
+    )
+    if policy == "longest" and ladder is None:
+        spec.require_lookup_runtime()
+    else:
+        with pytest.raises(NotImplementedError, match="stage three"):
+            spec.require_lookup_runtime()
+
+
+def test_native_async_is_reserved_for_stage_three(checkpoint):
+    from vllm.config import SchedulerConfig
+
+    spec = build(checkpoint, dflash2_lookup=HEAD)
+    with pytest.raises(NotImplementedError, match="stage three"):
+        VllmConfig(
+            speculative_config=spec,
+            scheduler_config=SchedulerConfig(
+                max_model_len=512, is_encoder_decoder=False, async_scheduling=True
+            ),
+        )
+
+
+@pytest.mark.parametrize("replay", [False, True])
+def test_native_kv_geometry_remains_seven(checkpoint, replay):
+    spec = build(checkpoint, dflash2_lookup=HEAD)
+    # The engine derives this flag after selecting the target GDN policy.
+    spec.gdn_spec_state_replay = replay
+    config = object.__new__(VllmConfig)
+    config.speculative_config = spec
+    assert spec.num_speculative_tokens == 7
+    assert spec.num_speculative_state_tokens() == 7
+    assert config.num_lookahead_tokens == 8
+    assert spec.num_speculative_state_blocks() == (0 if replay else 7)
+    assert not uses_adaptive_dflash_lookup(spec)
+
+
+@pytest.mark.parametrize("async_scheduling", [False, None])
+def test_native_engine_defaults_to_stage_two_sync(
+    checkpoint, monkeypatch, async_scheduling
+):
+    from vllm.config import SchedulerConfig
+
+    spec = build(checkpoint, dflash2_lookup=HEAD)
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(envs, "VLLM_USE_MEGA_AOT_ARTIFACT", False)
+    config = VllmConfig(
+        model_config=checkpoint["target_model_config"],
+        parallel_config=checkpoint["target_parallel_config"],
+        speculative_config=spec,
+        scheduler_config=SchedulerConfig(
+            max_model_len=512,
+            max_num_seqs=2,
+            max_num_batched_tokens=512,
+            is_encoder_decoder=False,
+            async_scheduling=async_scheduling,
+        ),
+    )
+    assert config.scheduler_config.async_scheduling is False
+
+
 def test_model_and_engine_config_copy_rebuild_derived_state(checkpoint):
     from dataclasses import asdict
 

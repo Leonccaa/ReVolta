@@ -34,8 +34,14 @@ def _suffix_lookup_kernel(
     NMIN: tl.constexpr,
     BLOCK: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    NATIVE: tl.constexpr,
 ):
     req = tl.program_id(0)
+    if NATIVE:
+        offsets = tl.arange(0, BLOCK_K)
+        tl.store(
+            out_tokens_ptr + req * out_tokens_stride + offsets, 0, mask=offsets < k
+        )
     tl.store(out_len_ptr + req, 0)
     tl.store(out_valid_ptr + req, 0)
     if tl.load(eligible_ptr + req) == 0:
@@ -45,7 +51,7 @@ def _suffix_lookup_kernel(
         return
 
     total_len = tl.load(total_len_ptr + req_state)
-    if total_len < NMIN + 2:
+    if total_len < NMIN + (1 if NATIVE else 2):
         return
     base = all_token_ids_ptr + req_state.to(tl.int64) * all_token_ids_stride
     suffix_end = total_len - 1
@@ -248,6 +254,7 @@ def suffix_lookup(
     out_tokens: torch.Tensor | None = None,
     out_len: torch.Tensor | None = None,
     out_valid: torch.Tensor | None = None,
+    native: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Find recent continuations of each request's current suffix."""
     if not 1 <= nmin <= nmax:
@@ -278,6 +285,7 @@ def suffix_lookup(
         k=num_draft_tokens,
         NMAX=nmax,
         NMIN=nmin,
+        NATIVE=native,
         BLOCK=1024,
         BLOCK_K=triton.next_power_of_2(num_draft_tokens),
         num_warps=4,

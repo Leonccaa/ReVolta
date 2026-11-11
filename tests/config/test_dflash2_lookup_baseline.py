@@ -36,7 +36,7 @@ def test_registered_lookup_defaults_match_fixed_main():
         for name, value in envs.compile_factors().items()
         if name.startswith("VLLM_DFLASH2_LOOKUP_")
     }
-    assert actual == expected
+    assert json.dumps(actual, sort_keys=True) == json.dumps(expected, sort_keys=True)
 
 
 def _serialization_fallback(value):
@@ -140,7 +140,9 @@ def test_existing_configuration_matches_fixed_main(tmp_path, new_config):
         json.dumps(envs.compile_factors(), sort_keys=True).encode()
     ).hexdigest()
     for name, snapshot in actual.items():
-        assert snapshot["lookup_env_factors"] == expected["lookup_env_defaults"]
+        assert json.dumps(snapshot["lookup_env_factors"], sort_keys=True) == json.dumps(
+            expected["lookup_env_defaults"], sort_keys=True
+        )
         assert snapshot["compile_factors_sha256"] == live_env_hash
         assert (
             snapshot["serialization_sha256"]
@@ -150,3 +152,11 @@ def test_existing_configuration_matches_fixed_main(tmp_path, new_config):
             snapshot["speculative_hash"]
             == expected["snapshots"][name]["speculative_hash"]
         )
+
+
+def test_fixed_default_fingerprint_detects_boolean_zero(monkeypatch):
+    monkeypatch.setitem(
+        envs.environment_variables, "VLLM_DFLASH2_LOOKUP_AGREE", lambda: False
+    )
+    with pytest.raises(AssertionError):
+        test_registered_lookup_defaults_match_fixed_main()

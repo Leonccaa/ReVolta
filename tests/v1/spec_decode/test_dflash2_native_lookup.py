@@ -406,11 +406,11 @@ def test_speculator_entry_and_closed_noop_preserve_rng(monkeypatch):
     spec.draft_tokens, spec.draft_logits = draft, logits
     spec._cached_candidate_ids, spec._cached_candidate_scores = ids, scores
     spec._debug_real_proposal = True
-    spec._prepare_proposal_runtime(batch, sampled, sampled)
-    spec._apply_lookup(2)
     spec.speculative_config = SimpleNamespace(
         num_speculative_tokens=7, dflash_concurrency_drafts=None
     )
+    spec._prepare_proposal_runtime(batch, sampled, sampled)
+    spec._apply_lookup(2)
     assert spec.next_num_draft_tokens() == 7
     assert native.use[0].tolist() == [0, 1, 1, 1, 0, 0, 0]
     spec._native_lookup = None

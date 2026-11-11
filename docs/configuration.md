@@ -94,12 +94,14 @@ recipe, scheduling limits, measurements and statistics.
 | `search_window` | `65536` | Positive token distance in committed history |
 | `gate` | `first_token` | Strict agreement with the original first draft token |
 | `collect_stats` | `true` | Also requires the engine's effective statistics switch |
+| `max_requests` | `3` | Strict integer from 1 to 3; set to 1 for single-request admission |
 | `expand.enabled` | `false` | Must remain false, even when lookup is disabled |
 
 Native lookup requires a seven-token DFlash2 selector drafter and seven configured
-speculative tokens. It only attempts lookup on an eligible single-request decode
-batch. Multiple requests bypass lookup while the existing concurrency ladder
-continues to choose the verification width. Fixed seven without a ladder permits
+speculative tokens. It attempts lookup only when every live row is an eligible
+decode request, the batch contains at most `max_requests` requests, and the
+existing concurrency ladder selects width seven. Otherwise the entire batch
+bypasses lookup. Four or more requests always bypass lookup. Fixed seven without a ladder permits
 async subject to existing constraints; a nonempty ladder rejects explicit async
 and otherwise selects synchronous scheduling.
 

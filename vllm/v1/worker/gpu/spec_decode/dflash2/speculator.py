@@ -691,7 +691,14 @@ class DFlash2Speculator(DFlashSpeculator):
         del num_rejected
         native = getattr(self, "_native_lookup", None)
         if native is not None:
-            native.prepare(input_batch, num_sampled, real_run=self._debug_real_proposal)
+            native.prepare(
+                input_batch,
+                num_sampled,
+                real_run=self._debug_real_proposal,
+                draft_width=dflash_drafts_for_requests(
+                    self.speculative_config, input_batch.num_reqs
+                ),
+            )
         if not self._lookup_enabled:
             return
 

@@ -105,6 +105,8 @@ def chain_factory(native_allocation_config, monkeypatch):
         budget=128,
         enabled=True,
         max_num_seqs=8,
+        max_requests=1,
+        collect_counts=False,
     ):
         original = native_allocation_config
         with monkeypatch.context() as capability:
@@ -124,6 +126,7 @@ def chain_factory(native_allocation_config, monkeypatch):
                     "nmin": 5,
                     "nmax": 16,
                     "search_window": 65536,
+                    "max_requests": max_requests,
                 },
             )
         with monkeypatch.context() as capability:
@@ -147,7 +150,12 @@ def chain_factory(native_allocation_config, monkeypatch):
                 cache_config=CacheConfig(block_size=16, enable_prefix_caching=False),
                 compilation_config=CompilationConfig(cudagraph_mode="NONE"),
             )
-        return DecodeChain(config, sparse=sparse, blocks=blocks)
+        chain = DecodeChain(config, sparse=sparse, blocks=blocks)
+        if collect_counts:
+            chain.spec._native_lookup.stats = SimpleNamespace(
+                counters=torch.zeros(18, dtype=torch.uint64, device=DEVICE)
+            )
+        return chain
 
     return create
 
@@ -411,15 +419,22 @@ class DecodeChain:
         spec._prepare_proposal_runtime(batch, counts, rejected)
         spec._apply_lookup(n)
         native = spec._native_lookup
+        limit = self.config.speculative_config.dflash2_lookup.max_requests
         eligible = (
-            n == 1
+            1 <= n <= limit
+            and spec.next_num_draft_tokens() == 7
             and not batch.has_structured_output_reqs
-            and not batch.is_prefilling_np[0]
-            and int(counts[0]) > 0
-            and int(states.total_len.gpu[batch.idx_mapping[0]]) < 512
+            and not batch.is_prefilling_np[:n].any()
+            and all(
+                int(counts[row]) > 0
+                and 6 <= int(states.total_len.gpu[batch.idx_mapping[row]]) < 512
+                for row in range(n)
+            )
         )
         if native is not None:
-            assert native.eligible[:n].tolist() == [int(eligible)] + [0] * (n - 1)
+            assert native.eligible[:n].tolist() == [int(eligible)] * n, (
+                "SCHEDULER_BATCH_ADMISSION"
+            )
             if not eligible:
                 assert not native.use[:n].any()
                 assert not native.match[:n].any()
@@ -432,23 +447,26 @@ class DecodeChain:
                 if scores is not None:
                     assert torch.equal(scores, original_scores)
             else:
-                candidate, match, valid = candidates[0]
-                assert int(native.match[0]) == match
-                assert int(native.valid[0]) == valid
-                assert native.use[0].tolist() == [
-                    int(0 < col < valid) for col in range(7)
-                ]
-                if valid:
-                    assert spec.draft_tokens[0, :valid].tolist() == candidate[:valid]
-                slot = int(batch.idx_mapping[0])
-                assert torch.equal(spec.draft_logits[slot, 0], original[1][slot, 0])
-                for col in range(1, int(native.valid[0])):
-                    token = int(spec.draft_tokens[0, col])
-                    assert spec.draft_logits[slot, col, token] == 0
-                    assert torch.isfinite(spec.draft_logits[slot, col]).sum() == 1
-                    if scores is not None:
-                        assert scores[slot, col, 0] == 0
-                        assert spec._cached_candidate_ids[slot, col, 0] == token
+                for row in range(n):
+                    candidate, match, valid = candidates[row]
+                    assert int(native.match[row]) == match
+                    assert int(native.valid[row]) == valid
+                    assert native.use[row].tolist() == [
+                        int(0 < col < valid) for col in range(7)
+                    ]
+                    if valid:
+                        assert (
+                            spec.draft_tokens[row, :valid].tolist() == candidate[:valid]
+                        )
+                    slot = int(batch.idx_mapping[row])
+                    assert torch.equal(spec.draft_logits[slot, 0], original[1][slot, 0])
+                    for col in range(1, int(native.valid[row])):
+                        token = int(spec.draft_tokens[row, col])
+                        assert spec.draft_logits[slot, col, token] == 0
+                        assert torch.isfinite(spec.draft_logits[slot, col]).sum() == 1
+                        if scores is not None:
+                            assert scores[slot, col, 0] == 0
+                            assert spec._cached_candidate_ids[slot, col, 0] == token
         for row, name in enumerate(batch.req_ids):
             slot = states.req_id_to_index[name]
             self.previous[name] = (
@@ -871,3 +889,115 @@ def test_waiting_request_does_not_disable_single_scheduled_decode(chain_factory)
     assert record.batch.req_ids == ["a"]
     assert chain.spec._native_lookup.eligible[0] == 1
     assert chain.spec._native_lookup.use[0, 1:].any()
+
+
+@pytest.mark.parametrize("sparse", [False, True])
+def test_multi_request_scheduler_switches_and_counts(chain_factory, sparse):
+    chain = chain_factory(
+        ladder={4: 3, 5: 4}, sparse=sparse, max_requests=3, collect_counts=True
+    )
+    native = chain.spec._native_lookup
+
+    def step(expected, **kwargs):
+        before = int(native.stats.counters[0])
+        record = chain.step(**kwargs)
+        assert (
+            native.eligible[: record.batch.num_reqs].tolist()
+            == [int(expected > 0)] * record.batch.num_reqs
+        )
+        assert int(native.stats.counters[0]) - before == expected, (
+            "SCHEDULER_ROW_COUNTS"
+        )
+        return record
+
+    chain.add("a")
+    step(0)
+    step(1)
+    chain.add("b")
+    step(0)  # mixed prefill invalidates the whole batch immediately
+    two = step(2, accepted=1)
+    assert two.batch.num_reqs == 2
+    chain.add("c")
+    step(0)
+    three = step(3, accepted=1)
+    assert three.batch.num_reqs == 3
+    chain.add("d")
+    step(0)
+    four = step(0, accepted=1)
+    assert four.batch.num_reqs == 4
+    assert chain.runner.draft_tokens_handler.num_draft_tokens == 3
+    step(0)  # consume the previous seven-token rows truncated by the handler
+    chain.scheduler.finish_requests("d", RequestStatus.FINISHED_ABORTED)
+    restored = step(3)
+    assert set(map(len, restored.output.scheduled_spec_decode_tokens.values())) == {3}
+    assert chain.runner.draft_tokens_handler.num_draft_tokens == 7
+    chain.scheduler.finish_requests("b", RequestStatus.FINISHED_ABORTED)
+    step(2)
+    chain.add("replacement", prompt_length=24)
+    step(0)
+    step(3)
+    chain.scheduler.finish_requests(
+        ["c", "replacement"], RequestStatus.FINISHED_ABORTED
+    )
+    step(1)
+
+
+def test_multi_request_preemption_restores_qualification(chain_factory):
+    chain = chain_factory(blocks=9, max_requests=3, collect_counts=True)
+    chain.add("a", prompt_length=56)
+    victim = chain.add("b", prompt_length=56)
+    chain.step()
+    record = chain.step()
+    assert "b" in record.output.preempted_req_ids
+    assert victim.status == RequestStatus.PREEMPTED
+    chain.scheduler.finish_requests("a", RequestStatus.FINISHED_ABORTED)
+    prefill = chain.step()
+    assert prefill.batch.is_prefilling_np.tolist() == [True]
+    before = int(chain.spec._native_lookup.stats.counters[0])
+    chain.step()
+    assert int(chain.spec._native_lookup.stats.counters[0]) == before + 1
+
+
+@pytest.mark.parametrize("width", [1, 3, 4])
+def test_multi_request_narrow_ladder_bypasses_at_normal_entry(chain_factory, width):
+    chain = chain_factory(ladder={2: width}, max_requests=3, collect_counts=True)
+    native = chain.spec._native_lookup
+    chain.add("a")
+    chain.add("b")
+    chain.step()
+    chain.step()
+    assert native.eligible[:2].tolist() == [0, 0], "NARROW_LADDER_BYPASS"
+    assert native.stats.counters.tolist() == [0] * 18
+    assert chain.runner.draft_tokens_handler.num_draft_tokens == width
+    record = chain.step(accepted=1)
+    assert set(map(len, record.output.scheduled_spec_decode_tokens.values())) == {width}
+    chain.scheduler.finish_requests("b", RequestStatus.FINISHED_ABORTED)
+    chain.step()
+    assert native.eligible[0] == 1
+    assert int(native.stats.counters[0]) == 1
+    assert chain.runner.draft_tokens_handler.num_draft_tokens == 7
+
+
+def test_async_three_request_delayed_feedback_and_cancel(chain_factory):
+    chain = chain_factory(
+        async_scheduling=True, sparse=True, max_requests=3, collect_counts=True
+    )
+    requests = [chain.add(name) for name in ("a", "b", "c")]
+    chain.step()
+    chain.step()
+    native = chain.spec._native_lookup
+    assert native.eligible[:3].tolist() == [1, 1, 1]
+    output, batch = chain.schedule()
+    pending = chain.execute(output, batch, feedback=False)
+    assert [request.num_output_placeholders for request in requests] == [8] * 3
+    next_output, next_batch = chain.schedule()
+    newer = chain.execute(next_output, next_batch, feedback=False)
+    assert [request.num_output_placeholders for request in requests] == [16] * 3
+    chain.feedback(pending.output, pending.model_output)
+    chain.feedback(newer.output, newer.model_output)
+    assert [request.num_output_placeholders for request in requests] == [0] * 3
+    assert int(native.stats.counters[0]) == 9
+    chain.scheduler.finish_requests("b", RequestStatus.FINISHED_ABORTED)
+    chain.step()
+    assert native.eligible[:2].tolist() == [1, 1]
+    assert int(native.stats.counters[0]) == 11

@@ -147,7 +147,8 @@ into the DFlash2 speculative config above, retaining its model and other setting
     "nmax": 16,
     "search_window": 65536,
     "gate": "first_token",
-    "collect_stats": true
+    "collect_stats": true,
+    "max_requests": 3
   }
 }
 ```
@@ -156,15 +157,18 @@ Use `--no-async-scheduling` with this ladder. Omitting `dflash2_lookup` or setti
 `"enabled": false` leaves lookup disabled. When enabling it, `policy`, `nmin` and
 `nmax` must be explicit; no lookup recipe is selected automatically.
 
-- Only a batch containing one eligible decode request attempts lookup. Multiple
-  requests, mixed prefill, grammar constraints, no sampled token or insufficient
-  sequence space bypass lookup for the whole batch. Eligibility is recalculated
-  each round; returning to one request needs no waiting period.
+- A batch of one to `max_requests` eligible decode requests attempts lookup.
+  `max_requests` defaults to 3 and accepts integers from 1 to 3; set it to 1 to
+  restore single-request admission without rebuilding the image. Mixed prefill,
+  grammar constraints, any row without a sampled token or sufficient sequence
+  space, and batches whose concurrency ladder selects a width below seven
+  bypass lookup for the whole batch. Eligibility is recalculated every round.
+  Padding rows do not count; returning to an eligible batch resumes immediately.
 - The configured proposal/resource width remains seven; it does not expand to
   fifteen or allocate per-request q16 graphs. The existing concurrency ladder
   can still reduce the actual verification width: with the example above,
   one to three requests use W=7, four use W=3, and five or more use W=4. Lookup
-  itself stays bypassed for multiple requests.
+  bypasses batches of four or more requests, even without a ladder.
 - Fixed width seven **without a concurrency ladder** permits async scheduling,
   subject to the existing executor, model and state-replay constraints. Lookup
   does not itself turn async off. A nonempty ladder and explicit async scheduling
@@ -214,7 +218,7 @@ without request IDs or token text:
 
 | Suffix | Type | Meaning |
 | --- | --- | --- |
-| `eligible_rounds_total` | Counter | Eligible single-request lookup attempts, including misses |
+| `eligible_rounds_total` | Counter | Eligible request-row lookup attempts, including misses |
 | `candidate_rounds_total` | Counter | Match meets `nmin` and has at least one continuation token |
 | `gate_pass_rounds_total` | Counter | Candidate's first token agrees with the neural first token |
 | `adopted_rounds_total` | Counter | Gate passes and at least one later proposal position is replaced |
@@ -223,6 +227,10 @@ without request IDs or token text:
 | `stats_producer` | Gauge | Producer submission watermark, not the eligible-round count |
 | `stats_covered` | Gauge | Producer watermark covered by the latest applied snapshot |
 | `stats_last_export_timestamp_seconds` | Gauge | Time of the latest applied snapshot |
+
+Each eligible row contributes one attempt, so a three-request batch can add
+three attempts while the producer submission watermark advances once. Gate
+checks, histories, proposal probabilities and RNG positions remain per request.
 
 The match histogram has boundaries 1, 2, 3, 4, 5, 6, 8, 12, 16, 32, 64, 128 and
 +Inf. Misses do not enter a zero bucket. Adoption rate is

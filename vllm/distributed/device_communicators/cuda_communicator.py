@@ -655,17 +655,30 @@ class CudaCommunicator(DeviceCommunicatorBase):
             raise ValueError("No PyNCCL communicator found")
 
     def destroy(self):
-        if self.pynccl_comm is not None:
-            self.pynccl_comm.destroy()
-            self.pynccl_comm = None
-        if self.ca_comm is not None:
-            self.ca_comm = None
-        if self.fi_ar_comm is not None:
-            self.fi_ar_comm.destroy()
-            self.fi_ar_comm = None
-        if self.all2all_manager is not None:
-            self.all2all_manager.destroy()
-            self.all2all_manager = None  # type: ignore[assignment]
+        from vllm.distributed.shutdown import Cleanup, ShutdownError, shutdown_deadline
+
+        with shutdown_deadline():
+            previous: list[str] = getattr(self, "_destroy_errors", [])
+            if previous:
+                raise ShutdownError("; ".join(previous))
+            cleanup = Cleanup()
+            # Publish the live error list before a later stage can interrupt
+            # teardown. A no-op retry must not erase a partial close failure.
+            self._destroy_errors = cleanup.errors
+            for name, method in (
+                ("pynccl_comm", "destroy"),
+                ("ca_comm", "close"),
+                ("fi_ar_comm", "destroy"),
+                ("all2all_manager", "destroy"),
+            ):
+                resource = getattr(self, name, None)
+                # Keep failed owners: a no-op retry cannot prove that a partial
+                # IPC allocation was physically released.
+                if resource is not None and cleanup.run(
+                    name, getattr(resource, method)
+                ):
+                    setattr(self, name, None)
+            cleanup.finish()
 
     def all_gatherv(
         self,

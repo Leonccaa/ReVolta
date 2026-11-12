@@ -29,6 +29,7 @@ from vllm.utils.network_utils import (
     get_tcp_uri,
     zmq_socket_ctx,
 )
+from vllm.utils.process_reaping import ProcessRetirement, process_reap_timeout
 from vllm.utils.system_utils import get_mp_context
 from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.executor import Executor
@@ -138,11 +139,16 @@ class CoreEngineProcManager:
         from vllm.v1.engine.core import EngineCoreProc
 
         self.processes: list[BaseProcess] = []
+        self.retirements: dict[BaseProcess, ProcessRetirement] = {}
+        retirement_writers = []
         local_dp_ranks = []
         for index in range(local_engine_count):
             local_index = local_start_index + index
             global_index = start_index + index
 
+            # Separate one-way terminal receipts from startup handshaking.
+            retirement_reader, retirement_writer = context.Pipe(duplex=False)
+            retirement_writers.append(retirement_writer)
             # Start EngineCore in background process.
             local_dp_ranks.append(local_index)
             self.processes.append(
@@ -150,11 +156,24 @@ class CoreEngineProcManager:
                     target=EngineCoreProc.run_engine_core,
                     name=f"EngineCore_DP{global_index}" if is_dp else "EngineCore",
                     kwargs=common_kwargs
-                    | {"dp_rank": global_index, "local_dp_rank": local_index},
+                    | {
+                        "dp_rank": global_index,
+                        "local_dp_rank": local_index,
+                        "retirement_pipe": retirement_writer,
+                    },
                 )
             )
 
-        self._finalizer = weakref.finalize(self, shutdown, self.processes)
+            self.retirements[self.processes[-1]] = ProcessRetirement(retirement_reader)
+
+        self._reap_timeout = process_reap_timeout(vllm_config)
+        self._finalizer = weakref.finalize(
+            self,
+            shutdown,
+            self.processes,
+            retirements=self.retirements,
+            reap_timeout=self._reap_timeout,
+        )
         self.manager_stopped = threading.Event()
         self.failed_proc_name: str | None = None
 
@@ -193,6 +212,8 @@ class CoreEngineProcManager:
                 ):
                     proc.start()
         finally:
+            for writer in retirement_writers:
+                writer.close()
             # Kill other procs if not all are running.
             if self.finished_procs():
                 self.shutdown()
@@ -201,7 +222,12 @@ class CoreEngineProcManager:
         """Shutdown engine core processes with configurable timeout."""
         self.manager_stopped.set()
         if self._finalizer.detach() is not None:
-            shutdown(self.processes, timeout=timeout)
+            shutdown(
+                self.processes,
+                timeout=timeout,
+                retirements=self.retirements,
+                reap_timeout=self._reap_timeout,
+            )
 
     def monitor_engine_liveness(self) -> None:
         """Monitor engine core process liveness."""

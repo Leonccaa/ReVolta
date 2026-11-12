@@ -58,6 +58,14 @@ or disable custom all-reduce with `--disable-custom-all-reduce`.
   flight can stay unanswered until the container runtime kills the server, and CPU
   offload cleanup does not run (see [Support and known limits](known-limits.md)). Keep the
   container stop grace period (for example `docker stop --time 120`) above this value.
+- **`--shutdown-reap-timeout`** controls the process-exit wait after a worker or
+  local EngineCore reports terminal retirement. It defaults to `--shutdown-timeout`
+  and is capped by that value; `0` disables the extra wait. A receipt grants time
+  for finalizers and kernel thread-group exit; it does not prove successful cleanup
+  or process exit. Missing receipts and exhausted budgets retain signal escalation.
+  Request draining and SSD flush deadlines are unchanged. Terminal EngineCore
+  shutdown completes scheduler persistence before waiting for retired workers.
+  The container stop grace period must also cover this process-exit wait.
 - **`--gpu-memory-utilization 0.95`** passed the full gate, including the multimodal
   stress test with 8 concurrent requests. Higher values ran out of memory in earlier
   multimodal stress tests. If you change concurrency or media limits, measure again.

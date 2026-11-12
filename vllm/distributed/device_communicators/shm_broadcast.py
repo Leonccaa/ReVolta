@@ -5,7 +5,7 @@ import pickle
 import sys
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from multiprocessing import shared_memory
 from pickle import PickleBuffer
@@ -190,8 +190,11 @@ class SpinCondition:
         # Sends cancellation ping that will cause the reader to wake up.
         # This is done from a monitor thread in the same process as the reader.
         if self.is_reader:
-            logger.debug("Canceling waiting reads on SHM Buffer")
-            self.write_cancel_socket.send(b"\x00")
+            # The in-process peer is connected during initialization. A full
+            # queue already contains a wakeup; shutdown must never wait for it
+            # or for a synchronous log handler before waking the main thread.
+            with suppress(zmq.Again):
+                self.write_cancel_socket.send(b"\x00", flags=zmq.NOBLOCK)
 
     def wait(self, timeout_ms: int | None = None) -> None:
         """Wait for data on the shared memory buffer.
@@ -211,14 +214,11 @@ class SpinCondition:
             events = dict(self.poller.poll(timeout=timeout_ms))
 
             if self.read_cancel_socket in events:
-                logger.debug("Poller received cancel event")
+                return
             elif self.local_notify_socket in events:
-                logger.debug("Poller received notify event")
                 # Since zmq.CONFLATE is set, there will only be one notification
                 # to read from the socket
                 self.local_notify_socket.recv(flags=zmq.NOBLOCK, copy=False)
-            else:
-                logger.debug("Poller timed out")
 
     def notify(self):
         """Notifies all readers to wake up"""
@@ -554,6 +554,8 @@ class MessageQueue:
     def shutdown(self):
         """If this is an idle reader, wakes it up so it can clean up and shut
         down"""
+        if self.shutting_down:
+            return
         self.shutting_down = True
         if self._spin_condition is not None:
             self._spin_condition.cancel()

@@ -1175,6 +1175,12 @@ class VllmConfig:
     may not run.
     """
 
+    shutdown_reap_timeout: float | None = Field(default=None, ge=0)
+    """Extra process-exit wait after a terminal retirement receipt. None uses
+    shutdown_timeout; explicit values are capped by shutdown_timeout. This
+    changes no request-drain or persistence deadline and adds no GPU work.
+    """
+
     watchdog_config: WatchdogConfig = Field(default_factory=WatchdogConfig)
     """Optional stack-dump diagnostics; excluded from the computation graph hash.
 

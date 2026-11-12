@@ -55,6 +55,12 @@ from vllm.utils.network_utils import (
     get_open_port,
 )
 from vllm.utils.ompmultiprocessing import OMPProcessManager
+from vllm.utils.process_reaping import (
+    ProcessRetirement,
+    notify_process_retired,
+    process_reap_timeout,
+    reap_processes,
+)
 from vllm.utils.system_utils import (
     _maybe_force_spawn,
     decorate_logs,
@@ -106,8 +112,10 @@ class FutureWrapper(Future):
 
 class MultiprocExecutor(Executor):
     supports_pp: bool = True
+    _defer_worker_reap: bool = False
 
     def __init__(self, vllm_config: VllmConfig, monitor_workers: bool = True):
+        self._shutdown_lock = threading.Lock()
         self.monitor_workers = monitor_workers
         super().__init__(vllm_config)
 
@@ -197,6 +205,10 @@ class MultiprocExecutor(Executor):
                 if inherited_fds is not None:
                     inherited_fds.append(unready_worker_handle.death_writer.fileno())
                     inherited_fds.append(unready_worker_handle.ready_pipe.fileno())
+                    assert unready_worker_handle.retirement is not None
+                    inherited_fds.append(
+                        unready_worker_handle.retirement.reader.fileno()
+                    )
 
             # Workers must be created before wait_for_ready to avoid
             # deadlock, since worker.init_device() does a device sync.
@@ -246,7 +258,15 @@ class MultiprocExecutor(Executor):
                     if uw.death_writer is not None:
                         uw.death_writer.close()
                         uw.death_writer = None
-                self._ensure_worker_termination([uw.proc for uw in unready_workers])
+                self._ensure_worker_termination(
+                    [uw.proc for uw in unready_workers],
+                    {
+                        uw.proc: uw.retirement
+                        for uw in unready_workers
+                        if uw.retirement is not None
+                    },
+                    process_reap_timeout(getattr(self, "vllm_config", None)),
+                )
 
         self.output_rank = self._get_output_rank()
 
@@ -284,12 +304,15 @@ class MultiprocExecutor(Executor):
                 return
             _self.is_failed = True
             proc_name = next(h.proc.name for h in workers if h.proc.sentinel == died[0])
-            _self.shutdown()
-            callback = _self.failure_callback
-            if callback is not None:
-                _self.failure_callback = None
-                callback()
-            logger.error("Worker proc %s died unexpectedly.", proc_name)
+            try:
+                _self.shutdown()
+            finally:
+                # A failed reap must still wake the engine's failure path.
+                callback = _self.failure_callback
+                if callback is not None:
+                    _self.failure_callback = None
+                    callback()
+                logger.error("Worker proc %s died unexpectedly.", proc_name)
 
         if not inline:
             Thread(
@@ -405,38 +428,55 @@ class MultiprocExecutor(Executor):
         return future if non_block else future.result()
 
     @staticmethod
-    def _ensure_worker_termination(worker_procs: list[BaseProcess]):
-        """Ensure that all worker processes are terminated. Assumes workers have
-        received termination requests. Waits for processing, then sends
-        termination and kill signals if needed."""
+    def _ensure_worker_termination(
+        worker_procs: list[BaseProcess],
+        retirements: dict[BaseProcess, ProcessRetirement] | None = None,
+        reap_timeout: float = 0,
+        defer_retired: bool = False,
+    ):
+        if not time:
+            return [proc for proc in worker_procs if proc.is_alive()]
+        return reap_processes(
+            worker_procs,
+            retirements,
+            reap_timeout=reap_timeout,
+            defer_retired=defer_retired,
+        )
 
-        def wait_for_termination(procs, timeout):
-            if not time:
-                # If we are in late stage shutdown, the interpreter may replace
-                # `time` with `None`.
-                return all(not proc.is_alive() for proc in procs)
-            start_time = time.time()
-            while time.time() - start_time < timeout:
-                if all(not proc.is_alive() for proc in procs):
-                    return True
-                time.sleep(0.1)
-            return False
-
-        active_procs = lambda: [proc for proc in worker_procs if proc.is_alive()]
-        # Give processes time to clean themselves up properly first
-        if wait_for_termination(active_procs(), 4):
-            return
-
-        # Send SIGTERM if still running
-        for p in active_procs():
-            p.terminate()
-        if not wait_for_termination(active_procs(), 4):
-            # Send SIGKILL if still running
-            for p in active_procs():
-                p.kill()
+    def reap_workers(self) -> None:
+        """Finish terminal reaping after scheduler persistence and cleanup."""
+        if workers := getattr(self, "workers", None):
+            retirements = {
+                w.proc: w.retirement
+                for w in workers
+                if w.retirement is not None and w.retirement.observe()
+            }
+            unreaped = reap_processes(
+                list(retirements),
+                retirements,
+                reap_timeout=process_reap_timeout(getattr(self, "vllm_config", None)),
+                started_at=getattr(self, "_worker_reap_started_at", None),
+            )
+            if unreaped:
+                raise ShutdownIncompleteError("Retired workers remain unreaped")
 
     def shutdown(self):
+        """Serialize monitor and engine shutdown; started is not completed."""
+        lock = getattr(self, "_shutdown_lock", None)
+        if lock is None:
+            # Also allow cleanup of objects whose initialization never started.
+            return self._shutdown_workers_and_queues()
+        with lock:
+            try:
+                return self._shutdown_workers_and_queues()
+            except BaseException:
+                self._worker_shutdown_incomplete = True
+                raise
+
+    def _shutdown_workers_and_queues(self):
         """Properly shut down the executor and its workers"""
+        if getattr(self, "_worker_shutdown_incomplete", False):
+            raise ShutdownIncompleteError("Worker exit remains unconfirmed")
         if not getattr(self, "shutting_down", False):
             self.shutting_down = True
 
@@ -447,7 +487,22 @@ class MultiprocExecutor(Executor):
                     if w.death_writer is not None:
                         w.death_writer.close()
                         w.death_writer = None
-                self._ensure_worker_termination([w.proc for w in workers])
+                self._worker_reap_started_at = time.monotonic()
+                unreaped = self._ensure_worker_termination(
+                    [w.proc for w in workers],
+                    {
+                        w.proc: w.retirement
+                        for w in workers
+                        if getattr(w, "retirement", None) is not None
+                    },
+                    process_reap_timeout(getattr(self, "vllm_config", None)),
+                    getattr(self, "_defer_worker_reap", False),
+                )
+                if unreaped:
+                    self._worker_shutdown_incomplete = True
+                    raise ShutdownIncompleteError(
+                        "Worker exit unconfirmed after signal escalation"
+                    )
 
                 for w in workers:
                     # Shutdown response queues
@@ -504,6 +559,7 @@ class UnreadyWorkerProcHandle:
     rank: int
     ready_pipe: Connection
     death_writer: Connection | None = None
+    retirement: ProcessRetirement | None = None
 
 
 @dataclass
@@ -517,6 +573,7 @@ class WorkerProcHandle:
     # `peer_worker_response_mqs[i]`
     peer_worker_response_mqs: list[MessageQueue | None]
     death_writer: Connection | None = None
+    retirement: ProcessRetirement | None = None
 
     @classmethod
     def from_unready_handle(
@@ -531,6 +588,7 @@ class WorkerProcHandle:
             worker_response_mq=worker_response_mq,
             peer_worker_response_mqs=peer_worker_response_mqs,
             death_writer=unready_handle.death_writer,
+            retirement=unready_handle.retirement,
         )
 
 
@@ -665,9 +723,16 @@ class WorkerProc:
         ready_reader, ready_writer = context.Pipe(duplex=False)
         # Death pipe to let child detect parent process exit
         death_reader, death_writer = context.Pipe(duplex=False)
+        retirement_reader, retirement_writer = context.Pipe(duplex=False)
         if inherited_fds is not None:
             inherited_fds = inherited_fds.copy()
-            inherited_fds.extend((ready_reader.fileno(), death_writer.fileno()))
+            inherited_fds.extend(
+                (
+                    ready_reader.fileno(),
+                    death_writer.fileno(),
+                    retirement_reader.fileno(),
+                )
+            )
         process_kwargs = {
             "vllm_config": vllm_config,
             "local_rank": local_rank,
@@ -676,6 +741,7 @@ class WorkerProc:
             "input_shm_handle": input_shm_handle,
             "ready_pipe": ready_writer,
             "death_pipe": death_reader,
+            "retirement_pipe": retirement_writer,
             "shared_worker_lock": shared_worker_lock,
             "is_driver_worker": is_driver_worker,
             # Have the worker close parent end of this worker's pipes too
@@ -698,9 +764,12 @@ class WorkerProc:
         # Close child ends of pipes here in the parent
         ready_writer.close()
         death_reader.close()
+        retirement_writer.close()
         # Keep death_writer open in parent - when parent exits,
         # death_reader in child will get EOFError
-        return UnreadyWorkerProcHandle(proc, rank, ready_reader, death_writer)
+        return UnreadyWorkerProcHandle(
+            proc, rank, ready_reader, death_writer, ProcessRetirement(retirement_reader)
+        )
 
     @staticmethod
     def wait_for_response_handle_ready(
@@ -877,6 +946,10 @@ class WorkerProc:
         inherited_close_errors: list[Exception] = []
         ready_writer = kwargs.pop("ready_pipe")
         death_pipe = kwargs.pop("death_pipe", None)
+        retirement_pipe = kwargs.pop("retirement_pipe", None)
+
+        def report_isolated() -> None:
+            notify_process_retired(retirement_pipe, isolated=True)
 
         try:
             # Explicitly close inherited pipes so hidden fork references cannot
@@ -953,7 +1026,10 @@ class WorkerProc:
             # Only this terminal entrypoint may bypass destructors. A native
             # finalize/synchronize can hang after a peer is lost. Include pipe
             # and watchdog teardown in the same process-wide hard deadline.
-            with distributed_shutdown.process_shutdown_guard():
+            guard_kwargs = (
+                {"on_isolate": report_isolated} if retirement_pipe is not None else {}
+            )
+            with distributed_shutdown.process_shutdown_guard(**guard_kwargs):
                 try:
                     if worker is not None and getattr(
                         worker, "_death_pipe_shutdown_started", False
@@ -1022,7 +1098,9 @@ class WorkerProc:
                     logger.exception(
                         "Worker shutdown failed; isolating process (exit=1)"
                     )
+                    report_isolated()
                     os._exit(1)
+                notify_process_retired(retirement_pipe)
 
     class ResponseStatus(Enum):
         SUCCESS = auto()

@@ -35,6 +35,7 @@ from vllm.usage.usage_lib import (
     usage_message,
 )
 from vllm.utils.network_utils import get_open_zmq_ipc_path, get_tcp_uri
+from vllm.utils.process_reaping import ProcessRetirement, reap_processes
 from vllm.utils.system_utils import decorate_logs, kill_process_tree, set_process_title
 from vllm.v1.core.sched.output import SchedulerOutput
 
@@ -595,7 +596,13 @@ def wait_for_completion_or_failure(
 
 # Note(rob): shutdown function cannot be a bound method,
 # else the gc cannot collect the object.
-def shutdown(procs: list[BaseProcess], timeout: float | None = None) -> None:
+def shutdown(
+    procs: list[BaseProcess],
+    timeout: float | None = None,
+    *,
+    retirements: dict[BaseProcess, "ProcessRetirement"] | None = None,
+    reap_timeout: float = 0,
+) -> None:
     """Shutdown processes with timeout.
 
     Args:
@@ -606,6 +613,28 @@ def shutdown(procs: list[BaseProcess], timeout: float | None = None) -> None:
         # Keep a small grace period for best-effort cleanup paths that do not
         # have a user-configured shutdown timeout.
         timeout = 5.0
+
+    if retirements is not None:
+        # A terminal receipt suppresses further signals while the process is
+        # only waiting for finalizers/kernel exit. It is not proof of exit.
+        for proc in procs:
+            receipt = retirements.get(proc)
+            if proc.is_alive() and not (receipt is not None and receipt.observe()):
+                proc.terminate()
+
+        def kill(proc: BaseProcess) -> None:
+            if (pid := proc.pid) is not None:
+                kill_process_tree(pid)
+
+        reap_processes(
+            procs,
+            retirements,
+            reap_timeout=reap_timeout,
+            graceful_timeout=timeout,
+            terminate_timeout=None,
+            kill=kill,
+        )
+        return
 
     # Shutdown the process.
     for proc in procs:

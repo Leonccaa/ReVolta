@@ -145,12 +145,8 @@ class PyNcclCommunicator:
             stream.synchronize()
             del data
 
-    def destroy(self):
-        from vllm.distributed.shutdown import (
-            ShutdownIncompleteError,
-            remaining_shutdown_time,
-        )
-
+    def start_abort(self):
+        """Start this independent abort once; destroy observes completion."""
         abort_thread = getattr(self, "_abort_thread", None)
         if abort_thread is None:
             if not self.available or not hasattr(self, "comm"):
@@ -171,6 +167,17 @@ class PyNcclCommunicator:
             abort_thread = threading.Thread(target=_abort, daemon=True)
             self._abort_thread = abort_thread
             abort_thread.start()
+
+    def destroy(self):
+        from vllm.distributed.shutdown import (
+            ShutdownIncompleteError,
+            remaining_shutdown_time,
+        )
+
+        self.start_abort()
+        abort_thread = getattr(self, "_abort_thread", None)
+        if abort_thread is None:
+            return
         abort_thread.join(timeout=remaining_shutdown_time())
         if abort_thread.is_alive():
             raise ShutdownIncompleteError(

@@ -1032,6 +1032,7 @@ class EngineCore:
         cleanup_dist_env_and_memory()
         if host_pool is not None:
             self._host_kv_shutdown_complete = True
+        self._resources_shutdown_complete = True
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         self.model_executor.profile(is_start, profile_prefix)
@@ -1534,6 +1535,7 @@ class EngineCoreProc(EngineCore):
         # Ensure we can serialize transformer config after spawning
         maybe_register_config_serialize_by_value()
 
+        retirement_pipe = kwargs.pop("retirement_pipe", None)
         engine_core: EngineCoreProc | None = None
         signal_callback: SignalCallback | None = None
         try:
@@ -1615,7 +1617,22 @@ class EngineCoreProc(EngineCore):
             if signal_callback is not None:
                 signal_callback.stop()
             if engine_core is not None:
-                engine_core.shutdown()
+                engine_core._shutdown_for_process_exit(retirement_pipe)
+
+    def _shutdown_for_process_exit(self, retirement_pipe) -> None:
+        from vllm.utils.process_reaping import notify_process_retired
+        from vllm.v1.executor.multiproc_executor import MultiprocExecutor
+
+        executor = self.model_executor
+        # Retired workers cannot issue new IO. Persist and release engine
+        # resources before spending the kernel-exit budget.
+        if isinstance(executor, MultiprocExecutor):
+            executor._defer_worker_reap = True
+        self.shutdown()
+        if getattr(self, "_resources_shutdown_complete", False):
+            notify_process_retired(retirement_pipe)
+        if isinstance(executor, MultiprocExecutor):
+            executor.reap_workers()
 
     def _init_data_parallel(self, vllm_config: VllmConfig):
         pass

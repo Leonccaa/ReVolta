@@ -2288,7 +2288,17 @@ def destroy_model_parallel():
 
     with shutdown_deadline():
         cleanup = Cleanup()
-        for name in ("_TP", "_DCP", "_PCP", "_PP", "_DP", "_EP", "_EPLB"):
+        names = ("_TP", "_DCP", "_PCP", "_PP", "_DP", "_EP", "_EPLB")
+        # All GPU work and graphs have retired before this entrypoint. Start
+        # independent native aborts together, then retain the established group
+        # release order. No collective or per-group deadline is introduced.
+        for name in names:
+            group = globals()[name]
+            communicator = getattr(group, "device_communicator", None)
+            comm = getattr(communicator, "pynccl_comm", None)
+            if (start_abort := getattr(comm, "start_abort", None)) is not None:
+                start_abort()
+        for name in names:
             group = globals()[name]
             if group is not None and cleanup.run(name, group.destroy):
                 globals()[name] = None

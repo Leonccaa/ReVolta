@@ -50,7 +50,9 @@ def remaining_shutdown_time() -> float:
 
 
 @contextmanager
-def process_shutdown_guard() -> Iterator[None]:
+def process_shutdown_guard(
+    on_isolate: Callable[[], None] | None = None,
+) -> Iterator[None]:
     """Isolate a terminal worker stuck in native cleanup, with failure status.
 
     Do not run Python/native destructors against an unretired CUDA context.
@@ -62,6 +64,8 @@ def process_shutdown_guard() -> Iterator[None]:
         # Inherited stderr may share its open file description with the parent.
         # Neither a blocking write nor changing its flags is safe here. The
         # parent observes the failure exit and owns shutdown diagnostics.
+        if on_isolate is not None:
+            on_isolate()
         os._exit(1)
 
     guard = threading.Timer(PROCESS_SHUTDOWN_TIMEOUT_S, expire)

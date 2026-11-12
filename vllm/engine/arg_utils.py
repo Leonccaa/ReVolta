@@ -752,6 +752,7 @@ class EngineArgs:
     tokens_only: bool = False
 
     shutdown_timeout: int = 30
+    shutdown_reap_timeout: float | None = None
 
     watchdog_config: WatchdogConfig = get_field(VllmConfig, "watchdog_config")
 
@@ -1610,6 +1611,14 @@ class EngineArgs:
             default=30,
             help="Shutdown timeout in seconds. 0 = abort, >0 = wait. "
             "ReVolta default: 30 (upstream vLLM: 0).",
+        )
+
+        parser.add_argument(
+            "--shutdown-reap-timeout",
+            type=float,
+            default=None,
+            help="Process-exit wait after a retirement receipt, in seconds. "
+            "Defaults to and is capped by --shutdown-timeout; 0 disables it.",
         )
 
         parser.add_argument(
@@ -2573,6 +2582,7 @@ class EngineArgs:
             performance_mode=self.performance_mode,
             weight_transfer_config=self.weight_transfer_config,
             shutdown_timeout=self.shutdown_timeout,
+            shutdown_reap_timeout=self.shutdown_reap_timeout,
             watchdog_config=self.watchdog_config,
         )
 

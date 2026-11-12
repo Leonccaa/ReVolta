@@ -71,6 +71,8 @@ def build(source: Path, destination: Path) -> None:
     config = json.loads((source / "config.json").read_text())
     text_config = config.get("text_config", config)
     num_experts = text_config["num_experts"]
+    if type(num_experts) is not int or num_experts <= 0:
+        raise ValueError("Expected a positive integer num_experts")
     # Preserve layer/prefix names and every value; fuse only the routed experts.
     prefixes = {
         name.split(".experts.")[0] + ".experts."
@@ -81,14 +83,37 @@ def build(source: Path, destination: Path) -> None:
         raise ValueError("Source has no routed MTP experts")
     for prefix in sorted(prefixes):
         fused_names = [prefix + "gate_up_proj", prefix + "down_proj"]
+        expert_names = {name for name in tensors if name.startswith(prefix)}
         if any(name in tensors for name in fused_names) and not all(
             name in tensors for name in fused_names
         ):
             raise ValueError(f"Incomplete fused routed experts: {prefix}")
         if not all(name in tensors for name in fused_names):
+            expected_names = {
+                f"{prefix}{e}.{projection}.weight"
+                for e in range(num_experts)
+                for projection in ("gate_proj", "up_proj", "down_proj")
+            }
+            if expert_names != expected_names:
+                raise ValueError(f"Incomplete or unexpected routed experts: {prefix}")
+            down = tensors[f"{prefix}0.down_proj.weight"]
+            if down.ndim != 2 or any(size <= 0 for size in down.shape):
+                raise ValueError(f"Expected nonempty [H,I] down projection: {prefix}")
+            hidden_size, intermediate_size = down.shape
             projections = {}
             for projection in ("gate_proj", "up_proj", "down_proj"):
                 names = [f"{prefix}{e}.{projection}.weight" for e in range(num_experts)]
+                shape = (
+                    (hidden_size, intermediate_size)
+                    if projection == "down_proj"
+                    else (intermediate_size, hidden_size)
+                )
+                # Check every input before stack/cat can promote dtype or hide
+                # complementary but individually invalid gate/up dimensions.
+                for name in names:
+                    tensor = tensors[name]
+                    if tensor.dtype != torch.bfloat16 or tensor.shape != shape:
+                        raise ValueError(f"Expected BF16 {shape} expert: {name}")
                 projections[projection] = torch.stack([tensors.pop(n) for n in names])
             tensors[fused_names[0]] = torch.cat(
                 (projections["gate_proj"], projections["up_proj"]), dim=1
@@ -100,6 +125,8 @@ def build(source: Path, destination: Path) -> None:
             or down.dtype != torch.bfloat16
             or gate_up.ndim != 3
             or down.ndim != 3
+            or down.shape[0] != num_experts
+            or any(size <= 0 for size in down.shape)
             or gate_up.shape != (num_experts, 2 * down.shape[2], down.shape[1])
         ):
             raise ValueError(f"Expected BF16 [E,2I,H]/[E,H,I] experts: {prefix}")

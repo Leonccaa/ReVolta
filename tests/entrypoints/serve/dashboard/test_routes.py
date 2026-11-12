@@ -205,8 +205,17 @@ class DashboardRoutesTest(unittest.TestCase):
                 self.assertEqual(denied.status_code, 401)
                 self.assertEqual(denied.headers["WWW-Authenticate"], "Bearer")
                 self.assertEqual(denied.headers["Cache-Control"], "no-store")
+                # The body keeps the shape the server's own error DTO produces.
                 self.assertEqual(
-                    denied.json()["error"]["code"], HTTPStatus.UNAUTHORIZED.value
+                    denied.json(),
+                    {
+                        "error": {
+                            "message": "Unauthorized",
+                            "type": "Unauthorized",
+                            "param": None,
+                            "code": HTTPStatus.UNAUTHORIZED.value,
+                        }
+                    },
                 )
             for path in ("/dashboard/config", "/dashboard/metrics"):
                 accepted = client.get(

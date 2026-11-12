@@ -25,6 +25,12 @@ or disable custom all-reduce with `--disable-custom-all-reduce`.
 
 ## Launch options
 
+- **`--enable-dashboard` (boolean, default `false`, experimental).** Enable the
+  Python API server's built-in aggregate metrics page at `/dashboard/`. All rate
+  and window calculations run in the browser, with optional local history.
+  Dashboard data follows the engine API-key configuration. No engine background
+  collector is added. This opt-in feature is prepared independently of release
+  acceptance; see [Dashboard](dashboard.md) for scopes, caching and CPU checks.
 - **`draft_sample_method`: `greedy` for MTP, `probabilistic` for DFlash2.** With MTP, a
   probabilistic draft corrupts output above `max_num_seqs=2` at temperature > 0
   (upstream 1Cat-vLLM issue #656), so MTP must stay `greedy`. For DFlash2, `probabilistic`

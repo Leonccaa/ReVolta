@@ -5,6 +5,8 @@
 export const POLL_SECONDS = 2;
 export const GAP_SECONDS = 10;
 export const RETENTION_SECONDS = 900;
+export const STORE_STALE_SECONDS = 180;
+const STORE_FUTURE_SECONDS = 10;
 const P = 'vllm:';
 const fields = {
   input: 'prompt_tokens_total', output: 'generation_tokens_total',
@@ -99,6 +101,19 @@ function rows(metrics, name, selector = {}) {
 function sum(metrics, name, selector) {
   const entries = rows(metrics, name, selector);
   return entries.length ? entries.reduce((total, row) => total + row.value, 0) : null;
+}
+
+export function storeSnapshot(sample, online, now = null) {
+  // Store occupancy is a state snapshot carrying an engine-side timestamp. The
+  // bars and the occupancy rows must share this rule so they can never
+  // disagree: a snapshot is current only while the service is online, it is
+  // recent and its age can be verified.
+  const stamp = sample?.v.storeTimestamp;
+  if (!finite(stamp)) return {current: false, age: null};
+  const observedAge = sample.t - stamp;
+  const current = Boolean(online) && observedAge <= STORE_STALE_SECONDS &&
+    observedAge >= -STORE_FUTURE_SECONDS;
+  return {current, age: Math.max(0, (finite(now) ? now : sample.t) - stamp)};
 }
 
 export function makeSnapshot(text, t) {

@@ -4,7 +4,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   chartPoints, fraction, makeSnapshot, parseMetrics, prefillObservation,
-  sameEpoch, statistics, ttftQuantile, windowStatistics,
+  sameEpoch, statistics, STORE_STALE_SECONDS, storeSnapshot, ttftQuantile, windowStatistics,
 } from '../../../../vllm/entrypoints/serve/dashboard/static/metrics.mjs';
 import {
   CACHE_BYTES, CACHE_SCHEMA, MAX_SAMPLES, ObservationHistory,
@@ -185,18 +185,51 @@ test('Histogram count and buckets must describe the same observations', () => {
   assert.equal(ttftQuantile(b, a, 0.5), null);
 });
 
+test('Store occupancy freshness is one rule with a verifiable snapshot age', () => {
+  const fresh = storeSnapshot(snapshot(1), true);
+  assert.equal(fresh.current, true); assert.equal(fresh.age, 0);
+  assert.equal(storeSnapshot(snapshot(1), false).current, false);
+
+  const stale = storeSnapshot({...snapshot(1), t: baseTime + 2 + STORE_STALE_SECONDS + 1}, true);
+  assert.equal(stale.current, false); assert.equal(stale.age, STORE_STALE_SECONDS + 1);
+
+  // The last observed value keeps ageing while the service is unreachable.
+  assert.equal(storeSnapshot(snapshot(1), false, baseTime + 122).age, 120);
+
+  const future = storeSnapshot({...snapshot(1), t: baseTime - 60}, true);
+  assert.equal(future.current, false); assert.equal(future.age, 0); // Engine clock ahead of the observation.
+
+  const missing = storeSnapshot(makeSnapshot('', baseTime), true);
+  assert.equal(missing.current, false); assert.equal(missing.age, null);
+});
+
 test('Browser cache restores same-instance history and is scoped by URL path', () => {
   const storage = memory();
-  const a = new ObservationHistory({storage, scope: '/a/'}); a.connect('engine', baseTime);
+  const a = new ObservationHistory({storage, scope: '/a/', remember: true}); a.connect('engine', baseTime);
   a.append(snapshot(0)); a.append(snapshot(1)); a.save(baseTime + 2, true);
-  const b = new ObservationHistory({storage, scope: '/a/'}); b.connect('engine', baseTime + 3);
+  const b = new ObservationHistory({storage, scope: '/a/', remember: true}); b.connect('engine', baseTime + 3);
   assert.equal(b.samples.length, 2); close(b.latestPrefill.rate, 600 / 0.45);
-  const c = new ObservationHistory({storage, scope: '/b/'}); c.connect('engine', baseTime + 3);
+  const c = new ObservationHistory({storage, scope: '/b/', remember: true}); c.connect('engine', baseTime + 3);
   assert.equal(c.samples.length, 0);
 });
 
+test('Remembering is opt-in and writes nothing before it is enabled', () => {
+  const storage = memory(), history = new ObservationHistory({storage, scope: '/a/'});
+  assert.equal(history.remember, false); assert.equal(history.cacheState, 'Disabled');
+  history.connect('engine', baseTime);
+  for (const step of [0, 1, 2]) history.append(snapshot(step));
+  history.save(baseTime + 6, true);
+  assert.equal(storage.writes, 0); assert.equal(storage.getItem(history.key), null);
+  history.setRemember(true);
+  assert.equal(storage.writes, 1);
+  assert.ok(storage.getItem(history.key).includes('example/model'));
+  const restored = new ObservationHistory({storage, scope: '/a/', remember: true});
+  restored.connect('engine', baseTime + 7);
+  assert.equal(restored.samples.length, 3);
+});
+
 test('A new engine identity or a counter reset clears cached history', () => {
-  const storage = memory(), history = new ObservationHistory({storage});
+  const storage = memory(), history = new ObservationHistory({storage, remember: true});
   history.connect('old', baseTime); history.append(snapshot(0)); history.append(snapshot(1));
   history.connect('new', baseTime + 4);
   assert.equal(history.samples.length, 0); assert.equal(history.latestPrefill, null);
@@ -205,7 +238,7 @@ test('A new engine identity or a counter reset clears cached history', () => {
 });
 
 test('Cache bounds, schema, corruption, future times and retention are enforced', () => {
-  const storage = memory(), history = new ObservationHistory({storage});
+  const storage = memory(), history = new ObservationHistory({storage, remember: true});
   history.connect('a', baseTime);
   for (let i = 0; i < 1000; i++) history.append(snapshot(i));
   assert.ok(history.samples.length <= MAX_SAMPLES);
@@ -213,22 +246,22 @@ test('Cache bounds, schema, corruption, future times and retention are enforced'
   history.save(baseTime + 2000, true); assert.ok(storage.getItem(history.key).length <= CACHE_BYTES);
   for (const value of ['{', JSON.stringify({schema: CACHE_SCHEMA + 1, instance: 'a', samples: [snapshot(0)]}), JSON.stringify({schema: CACHE_SCHEMA, instance: 'a', samples: [snapshot(0), snapshot(2), snapshot(1)]})]) {
     storage.setItem(history.key, value);
-    const copy = new ObservationHistory({storage}); copy.connect('a', baseTime + 10); assert.equal(copy.samples.length, 0);
+    const copy = new ObservationHistory({storage, remember: true}); copy.connect('a', baseTime + 10); assert.equal(copy.samples.length, 0);
   }
   storage.setItem(history.key, JSON.stringify({schema: CACHE_SCHEMA, instance: 'a', samples: [snapshot(0), snapshot(10000)]}));
-  const copy = new ObservationHistory({storage}); copy.connect('a', baseTime + 10000);
+  const copy = new ObservationHistory({storage, remember: true}); copy.connect('a', baseTime + 10000);
   assert.equal(copy.samples.length, 0);
 });
 
 test('Writes are throttled and storage denial degrades to in-memory operation', () => {
-  const storage = memory(), history = new ObservationHistory({storage});
+  const storage = memory(), history = new ObservationHistory({storage, remember: true});
   history.connect('a', baseTime);
   for (let i = 0; i < 10; i++) history.append(snapshot(i));
   assert.equal(storage.writes, 1);
   history.save(baseTime + 18, true); assert.equal(storage.writes, 2);
   history.setRemember(false); assert.equal(storage.getItem(history.key), null);
   history.append(snapshot(10)); assert.equal(storage.writes, 2);
-  const blocked = new ObservationHistory({storage: {getItem() { throw Error('blocked'); }, setItem() { throw Error('quota'); }}});
+  const blocked = new ObservationHistory({storage: {getItem() { throw Error('blocked'); }, setItem() { throw Error('quota'); }}, remember: true});
   blocked.connect('a', baseTime); blocked.append(snapshot(0)); assert.equal(blocked.samples.length, 1);
   assert.equal(blocked.cacheState, 'Memory only');
 });

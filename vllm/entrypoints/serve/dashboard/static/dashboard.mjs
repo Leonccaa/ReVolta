@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright contributors to the ReVolta project
 import {
   add, chartPoints, delta, finite, fraction, GAP_SECONDS, makeSnapshot,
-  ratio, statistics, windowStatistics,
+  ratio, statistics, storeSnapshot, windowStatistics,
 } from './metrics.mjs';
 import {ObservationHistory} from './history.mjs';
 
@@ -28,7 +28,7 @@ function duration(value) {
   if (value < 86400) return `${Math.floor(value / 3600)}h ${Math.floor(value % 3600 / 60)}m`;
   return `${Math.floor(value / 86400)}d ${Math.floor(value % 86400 / 3600)}h`;
 }
-const rows = entries => `<dl class="rows">${entries.map(([label, value]) => `<div><dt>${escape(label)}</dt><dd>${escape(value)}</dd></div>`).join('')}</dl>`;
+const rows = (entries, kind = '') => `<dl class="rows${kind ? ` ${kind}` : ''}">${entries.map(([label, value]) => `<div><dt>${escape(label)}</dt><dd>${escape(value)}</dd></div>`).join('')}</dl>`;
 const kpi = (label, value, unit, caption, window = false) => `<div class="kpi${window ? ' window' : ''}"><small>${escape(label)}</small><strong>${escape(value)}</strong><span class="unit">${escape(unit)}</span><p>${escape(caption)}</p></div>`;
 const titles = {requests: 'Requests', decode: 'Decode', prefill: 'Prefill', cache: 'Cache', speculative: 'Speculative decoding', latency: 'Latency'};
 const scope = location.pathname;
@@ -36,7 +36,7 @@ const prefKey = `revolta-dashboard:preferences:${scope}`;
 let storage = null, preferences = {};
 try { storage = localStorage; preferences = JSON.parse(storage.getItem(prefKey) || '{}') || {}; } catch { /* Private mode can block storage. */ }
 let windowSeconds = [60, 300, 900].includes(preferences.window) ? preferences.window : 60;
-const history = new ObservationHistory({storage, scope, remember: preferences.remember !== false});
+const history = new ObservationHistory({storage, scope, remember: preferences.remember === true});
 let info = null, token = '', state = 'connecting', message = 'Connecting to this engine…';
 let timer, inFlight = false, detailCard = null, cacheTab = 'summary', connectionGeneration = 0;
 const windowLabel = () => `Last ${windowSeconds / 60} min`;
@@ -74,14 +74,14 @@ function bar(label, used, capacity, note, kind = '') {
 
 function cacheBars(end, stats, fresh, tab = 'summary') {
   const v = end.v;
-  const storeFresh = fresh && finite(v.storeTimestamp) && end.t - v.storeTimestamp <= 180 && end.t >= v.storeTimestamp - 10;
-  const value = key => storeFresh ? v[key] : null;
+  const store = storeSnapshot(end, fresh);
+  const value = key => store.current ? v[key] : null;
   const bars = [
     ['gpu', bar('GPU Hot', value('hotUsed'), value('hotCapacity'), `Group hit rate ${percent(stats.hotHit)}`)],
     ['ram', bar('RAM', value('ramUsed'), value('ramCapacity'), `${bytes(value('ramUsed'))} · Δ ${signedBytes(stats.ramChange)} · ${byteRate(stats.ramChangeRate)}`, 'ram')],
     ['ssd', bar('SSD', value('ssdUsed'), value('ssdCapacity'), `${v.ssdCapacity === null ? 'Capacity not exported' : bytes(value('ssdUsed'))} · Δ ${signedBytes(stats.ssdChange)} · ${byteRate(stats.ssdChangeRate)}`, 'ssd')],
   ].filter(([key]) => tab === 'summary' || tab === key).map(([, html]) => html).join('');
-  return `<div class="occupancy">${bars}</div><p class="note">${storeFresh ? `Store snapshot ${duration(Math.max(0, end.t - v.storeTimestamp))} ago` : 'Store occupancy unavailable or stale'} · ${tab === 'gpu' ? 'GPU Hot hits count cache groups.' : 'RAM / SSD rates are net occupancy changes.'}</p>`;
+  return `<div class="occupancy">${bars}</div><p class="note">${store.current ? `Store snapshot ${duration(store.age)} ago` : 'Store occupancy unavailable or stale'} · ${tab === 'gpu' ? 'GPU Hot hits count cache groups.' : 'RAM / SSD rates are net occupancy changes.'}</p>`;
 }
 
 function render() {
@@ -150,7 +150,7 @@ function render() {
   }
   $('#engine').textContent = `Engine: ReVolta ${info?.version || '—'}`;
   $('#observation').textContent = history.samples.length ? `Last observed ${new Date(end.t * 1000).toLocaleTimeString()} · ${history.samples.length} retained samples` : 'No browser observations yet';
-  $('#cache-state').textContent = `${history.cacheState} · Up to 15 minutes / 500 samples · Saves at most every 30 seconds and on page exit. API keys are never saved.`;
+  $('#cache-state').textContent = `${history.cacheState} · Up to 15 minutes / 500 samples · Saves at most every 30 seconds and on page exit · Stores aggregate values, model names and metric label keys · API keys are never saved.`;
   if (detailCard) renderDetails(w, life, end);
 }
 
@@ -199,13 +199,21 @@ function renderDetails(w, life, end) {
   let current = '';
   if (detailCard === 'cache') {
     const v = end.v;
+    // The occupancy rows and the bars above them use one freshness rule. When
+    // the store snapshot is stale or the service is offline, the numbers are
+    // not current occupancy, so they are reported as unavailable with the age
+    // of the last value this browser actually observed.
+    const store = storeSnapshot(end, state === 'online', Date.now() / 1000);
+    const occupancy = (used, capacity) => store.current
+      ? `${bytes(used)} / ${bytes(capacity)}`
+      : `Unavailable${store.age === null ? '' : ` · last observed ${duration(store.age)} ago`}`;
     const occupancyRows = [
       ['gpu', 'Engine KV usage (max across engines)', percent(v.kv)],
-      ['ram', 'RAM allocation / capacity', `${bytes(v.ramUsed)} / ${bytes(v.ramCapacity)}`],
-      ['ssd', 'SSD allocation / capacity', `${bytes(v.ssdUsed)} / ${bytes(v.ssdCapacity)}`],
+      ['ram', 'RAM allocation / capacity', occupancy(v.ramUsed, v.ramCapacity)],
+      ['ssd', 'SSD allocation / capacity', occupancy(v.ssdUsed, v.ssdCapacity)],
     ].filter(([key]) => cacheTab === 'summary' || cacheTab === key).map(([, label, value]) => [label, value]);
-    current = `<h3>Current occupancy · last reported snapshot</h3>${cacheBars(end, w, state === 'online', cacheTab)}${rows(occupancyRows)}`;
-    explanation += ' Occupancy is a current snapshot. Δ and bytes/s describe net occupancy change within the selected window. Startup occupancy and unobserved peaks cannot be recovered from counters. SSD utilization stays unavailable when this build does not export capacity.';
+    current = `<h3>Current occupancy · last reported snapshot</h3>${cacheBars(end, w, state === 'online', cacheTab)}${rows(occupancyRows, 'occupancy')}`;
+    explanation += ' Occupancy is a current snapshot. Δ and bytes/s describe net occupancy change within the selected window. RAM and SSD allocation lines follow the occupancy bars: they become unavailable with the age of the last observed value when the store snapshot is stale or the service is offline. Startup occupancy and unobserved peaks cannot be recovered from counters. SSD utilization stays unavailable when this build does not export capacity.';
   }
   body.innerHTML = `${current}<div class="detail-grid"><section><h3>${windowLabel()}</h3>${rows(selected)}</section><section><h3>Since engine start</h3>${rows(since)}</section></div><p class="explanation">${escape(explanation)}</p>`;
   body.scrollTop = scroll;

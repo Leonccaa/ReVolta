@@ -17,7 +17,9 @@ function validSnapshot(sample) {
 }
 
 export class ObservationHistory {
-  constructor({storage = null, scope = '', remember = true} = {}) {
+  // Remembering is opt-in: a history object stores nothing until a caller
+  // enables it, so a page or a caller that forgets to decide stays in memory.
+  constructor({storage = null, scope = '', remember = false} = {}) {
     this.storage = storage;
     this.key = `revolta-dashboard:${CACHE_SCHEMA}:${scope}`;
     this.remember = remember;

@@ -95,6 +95,8 @@ try {
     lifetime: document.querySelector('#lifetime')?.textContent,
     cache: document.querySelector('[data-card=cache]')?.textContent,
     cacheState: document.querySelector('#cache-state')?.textContent,
+    remember: document.querySelector('#remember')?.checked,
+    occupancyRows: [...document.querySelectorAll('#detail-body .rows div')].map(e => [e.querySelector('dt').textContent, e.querySelector('dd').textContent]),
     open: document.querySelector('#details')?.open,
     dialog: document.querySelector('#detail-body')?.textContent,
     overflow: document.documentElement ? document.documentElement.scrollWidth > window.innerWidth : false,
@@ -105,6 +107,11 @@ try {
   const control = async command => (await fetch(base + '/__fixture', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(command)})).json();
   const viewport = width => call('Emulation.setDeviceMetricsOverride', {width, height: 1040, deviceScaleFactor: 1, mobile: width <= 390});
   const click = selector => evaluate(`(() => {const element=document.querySelector(${JSON.stringify(selector)});element.focus();element.click();})()`);
+  const occupancyRow = async label => {
+    const rows = (await probe()).occupancyRows;
+    const row = rows.find(([name]) => name === label);
+    return row ? row[1] : '';
+  };
   const screenshot = async name => {
     const result = await call('Page.captureScreenshot', {format: 'png', captureBeyondViewport: true});
     await writeFile(resolve(output, name), Buffer.from(result.data, 'base64'));
@@ -122,6 +129,15 @@ try {
   assert.ok(p.prefillCaption.includes('completed request'));
   assert.ok(Number(p.decode) > 0 && Number(p.decodeAverage) > 0);
   report.checks.push('Native metric parsing, six equal cards, Now/window values, cache formula and full numeric prefill');
+  assert.equal(p.remember, false, 'Remember history defaults to off');
+  assert.equal(await evaluate("Object.keys(localStorage).some(key=>key.startsWith('revolta-dashboard:1:'))"), false, 'Nothing is stored while remembering is off');
+  await click('[data-details=cache]');
+  await until(async () => (await probe()).open, 'Cache dialog');
+  await click('[data-tab=ram]');
+  assert.match(await occupancyRow('RAM allocation / capacity'), /^\d+(\.\d+)? GiB \/ \d+(\.\d+)? GiB$/, 'Online occupancy row is not a current value');
+  await click('#close');
+  await until(async () => !(await probe()).open, 'Dialog closes');
+  report.checks.push('Remember history defaults off and online occupancy rows show current values');
   for (const seconds of [60, 300, 900]) {
     await click(`[data-window="${seconds}"]`);
     p = await probe();
@@ -130,6 +146,11 @@ try {
     assert.ok(Number(p.decodeAverage) > 0);
   }
   await screenshot('desktop.png');
+  await click('#remember');
+  assert.equal((await probe()).remember, true, 'Remember history turns on');
+  await until(async () => await evaluate("Object.keys(localStorage).some(key=>key.startsWith('revolta-dashboard:1:'))"), 'Local history is written after enabling');
+  const savedHistory = await evaluate("localStorage[Object.keys(localStorage).find(key=>key.startsWith('revolta-dashboard:1:'))]");
+  assert.ok(savedHistory.includes('example/cpu-fixture') && savedHistory.includes('model_name'), 'Saved history must contain the model name and counter label keys');
   const originalSampleCount = Number((await probe()).samples.match(/(\d+) retained/)[1]);
   await call('Page.reload');
   await until(async () => (await probe()).health === 'Online', 'Reload from browser cache');
@@ -200,13 +221,30 @@ try {
 
   await control({mode: 'stale-store'});
   await until(async () => (await probe()).cache.includes('unavailable or stale'), 'Stale store occupancy');
-  await control({mode: 'missing-optional'});
-  await until(async () => (await probe()).hit === '—', 'Missing optional metric compatibility');
+  await click('[data-details=cache]');
+  await until(async () => (await probe()).open, 'Cache dialog while stale');
+  await click('[data-tab=ram]');
+  assert.match(await occupancyRow('RAM allocation / capacity'), /^Unavailable · last observed \d/, 'Stale store left the RAM allocation row current');
+  await click('[data-tab=ssd]');
+  assert.match(await occupancyRow('SSD allocation / capacity'), /^Unavailable · last observed \d/, 'Stale store left the SSD allocation row current');
   assert.equal((await probe()).badText, false);
+  await click('#close');
+  await until(async () => !(await probe()).open, 'Dialog closes after the stale check');
+  report.checks.push('Stale store snapshot makes both occupancy allocation lines unavailable with the last observed age');
   await control({mode: 'offline'});
   await until(async () => (await probe()).health === 'Offline', 'Offline mode');
   assert.equal((await probe()).decode, '—');
+  await click('[data-details=cache]');
+  await until(async () => (await probe()).open, 'Cache dialog while offline');
+  await click('[data-tab=ram]');
+  assert.match(await occupancyRow('RAM allocation / capacity'), /^Unavailable · last observed \d/, 'Offline left the RAM allocation row current');
+  assert.equal((await probe()).badText, false);
+  await click('#close');
+  await until(async () => !(await probe()).open, 'Dialog closes after the offline check');
   await screenshot('offline.png');
+  await control({mode: 'missing-optional'});
+  await until(async () => (await probe()).hit === '—', 'Missing optional metric compatibility');
+  assert.equal((await probe()).badText, false);
   await control({mode: 'missing-all'});
   await until(async () => (await probe()).message.includes('Inference token metrics'), 'Disabled/missing statistics');
   await control({mode: 'escaped-label'});
@@ -234,6 +272,7 @@ try {
   await control({mode: 'normal'});
   await evaluate("document.querySelector('#key').value='cpu-test-key';document.querySelector('#auth').requestSubmit()");
   await until(async () => (await probe()).health === 'Online', 'Reconnect after in-flight disconnect');
+  assert.ok(await evaluate("Object.keys(localStorage).some(key=>key.startsWith('revolta-dashboard:1:'))"), 'Enabled remembering stores history');
   await click('#remember');
   assert.equal(await evaluate("Object.keys(localStorage).some(key=>key.startsWith('revolta-dashboard:1:'))"), false);
   await call('Page.reload');

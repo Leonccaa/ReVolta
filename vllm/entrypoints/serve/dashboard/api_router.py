@@ -8,7 +8,9 @@ import secrets
 import time
 from argparse import Namespace
 from collections.abc import Sequence
+from http import HTTPStatus
 from pathlib import Path
+from typing import Annotated
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
@@ -28,6 +30,33 @@ HEADERS = {
         "frame-ancestors 'self'; form-action 'none'"
     ),
 }
+
+
+def rejection(
+    status_code: int, message: str, *, authenticate: bool = False
+) -> JSONResponse:
+    """Build a complete data-endpoint rejection.
+
+    The API server registers a global HTTPException handler that rebuilds the
+    body and drops `exc.headers`. These endpoints are authorized inside their
+    own dependency, so a rejection is returned as a finished response and its
+    authentication and cache headers survive that chain.
+    """
+    headers = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
+    if authenticate:
+        headers["WWW-Authenticate"] = "Bearer"
+    return JSONResponse(
+        {
+            "error": {
+                "message": message,
+                "type": HTTPStatus(status_code).phrase,
+                "param": None,
+                "code": status_code,
+            }
+        },
+        status_code=status_code,
+        headers=headers,
+    )
 
 
 def initialize_dashboard(args: Namespace) -> None:
@@ -61,18 +90,16 @@ def attach_router(
         "X-ReVolta-Started-At": str(args._dashboard_started_at),
     }
 
-    def authorize(request: Request) -> None:
+    def authorize(request: Request) -> JSONResponse | None:
+        """Return a finished rejection response, or None when authorized."""
         if not token_hashes:
-            return
+            return None
         scheme, _, token = request.headers.get("Authorization", "").partition(" ")
         digest = hashlib.sha256(token.encode()).digest()
         matches = [secrets.compare_digest(digest, key) for key in token_hashes]
         if scheme.lower() != "bearer" or not any(matches):
-            raise HTTPException(
-                status_code=401,
-                detail="Unauthorized",
-                headers={"WWW-Authenticate": "Bearer", "Cache-Control": "no-store"},
-            )
+            return rejection(401, "Unauthorized", authenticate=True)
+        return None
 
     @app.get("/dashboard", include_in_schema=False)
     async def dashboard_redirect(request: Request) -> RedirectResponse:
@@ -93,10 +120,12 @@ def attach_router(
         response.headers["Content-Type"] = media_type
         return response
 
-    @app.get(
-        "/dashboard/config", dependencies=[Depends(authorize)], include_in_schema=False
-    )
-    def dashboard_config() -> JSONResponse:
+    @app.get("/dashboard/config", include_in_schema=False)
+    def dashboard_config(
+        denied: Annotated[JSONResponse | None, Depends(authorize)],
+    ) -> JSONResponse:
+        if denied is not None:
+            return denied
         return JSONResponse(
             {
                 "instance_id": args._dashboard_instance_id,
@@ -106,15 +135,17 @@ def attach_router(
             headers=data_headers,
         )
 
-    @app.get(
-        "/dashboard/metrics", dependencies=[Depends(authorize)], include_in_schema=False
-    )
-    def dashboard_metrics() -> Response:
+    @app.get("/dashboard/metrics", include_in_schema=False)
+    def dashboard_metrics(
+        denied: Annotated[JSONResponse | None, Depends(authorize)],
+    ) -> Response:
+        if denied is not None:
+            return denied
         # Reuse the ordinary scrape registry; a sync endpoint runs collection in
         # FastAPI's thread pool. Do not contact EngineCore or maintain a sampler.
         engine = getattr(app.state, "engine_client", None)
         if engine is not None and getattr(engine, "errored", False):
-            raise HTTPException(status_code=503, detail="Engine unavailable")
+            return rejection(503, "Engine unavailable")
         return Response(
             generate_latest(registry),
             headers={**data_headers, "Content-Type": CONTENT_TYPE_LATEST},

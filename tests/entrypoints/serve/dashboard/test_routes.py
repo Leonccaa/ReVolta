@@ -6,15 +6,20 @@
 Run: python -m unittest discover -s tests/entrypoints/serve/dashboard -p 'test_*.py'
 """
 
+import ast
 import importlib.util
+import logging
 import unittest
 from argparse import Namespace
 from copy import deepcopy
+from http import HTTPStatus
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 from prometheus_client import CollectorRegistry, Counter
+from pydantic import BaseModel
 
 ROOT = Path(__file__).resolve().parents[4]
 SPEC = importlib.util.spec_from_file_location(
@@ -23,6 +28,56 @@ SPEC = importlib.util.spec_from_file_location(
 assert SPEC is not None and SPEC.loader is not None
 dashboard = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(dashboard)
+
+
+def extract(names, path, namespace):
+    """Load selected top-level definitions without importing the engine stack."""
+    tree = ast.parse(path.read_text())
+    found = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)
+    }
+    assert set(names) <= set(found), f"Missing {sorted(set(names) - set(found))}"
+    body: list[ast.stmt] = [found[name] for name in names]
+    exec(compile(ast.Module(body=body, type_ignores=[]), str(path), "exec"), namespace)
+
+
+def api_server_exception_chain_app(keys=()):
+    """Dashboard routes under the real API server HTTPException handler.
+
+    `vllm.entrypoints.openai.server_utils` and its error DTOs are loaded with
+    their original source; only the OpenAI model base class is replaced by
+    pydantic's BaseModel so no engine or CUDA import is needed.
+    """
+    namespace = {
+        "BaseModel": BaseModel,
+        "HTTPStatus": HTTPStatus,
+        "HTTPException": HTTPException,
+        "Request": Request,
+        "JSONResponse": JSONResponse,
+        "OpenAIBaseModel": BaseModel,
+        "logger": logging.getLogger("dashboard-test"),
+        "sanitize_message": str,
+    }
+    extract(
+        ["ErrorInfo", "ErrorResponse"],
+        ROOT / "vllm/entrypoints/openai/engine/protocol.py",
+        namespace,
+    )
+    extract(
+        ["http_exception_handler"],
+        ROOT / "vllm/entrypoints/openai/server_utils.py",
+        namespace,
+    )
+    app = FastAPI()
+    app.state.args = Namespace(enable_dashboard=True, log_error_stack=False)
+    # api_server registers the handler with exactly this call.
+    app.exception_handler(HTTPException)(namespace["http_exception_handler"])
+    registry = CollectorRegistry()
+    Counter("vllm:prompt_tokens", "Input", registry=registry).inc(100)
+    dashboard.attach_router(app, registry, keys, version="0.0.0+cpu-chain")
+    return app
 
 
 def make_app(enabled=True, keys=(), root_path="", args=None):
@@ -141,6 +196,33 @@ class DashboardRoutesTest(unittest.TestCase):
                 client.get("/inference-proxy/dashboard/assets/metrics.mjs").status_code,
                 200,
             )
+
+    def test_openai_server_exception_chain_keeps_rejection_headers(self):
+        app = api_server_exception_chain_app(keys=("chain-test-key",))
+        with TestClient(app) as client:
+            for path in ("/dashboard/config", "/dashboard/metrics"):
+                denied = client.get(path)
+                self.assertEqual(denied.status_code, 401)
+                self.assertEqual(denied.headers["WWW-Authenticate"], "Bearer")
+                self.assertEqual(denied.headers["Cache-Control"], "no-store")
+                self.assertEqual(
+                    denied.json()["error"]["code"], HTTPStatus.UNAUTHORIZED.value
+                )
+            for path in ("/dashboard/config", "/dashboard/metrics"):
+                accepted = client.get(
+                    path, headers={"Authorization": "Bearer chain-test-key"}
+                )
+                self.assertEqual(accepted.status_code, 200)
+                self.assertEqual(accepted.headers["Cache-Control"], "no-store")
+
+    def test_openai_server_exception_chain_keeps_dead_engine_headers(self):
+        app = api_server_exception_chain_app()
+        app.state.engine_client = Namespace(errored=True)
+        with TestClient(app) as client:
+            response = client.get("/dashboard/metrics")
+            self.assertEqual(response.status_code, 503)
+            self.assertEqual(response.headers["Cache-Control"], "no-store")
+            self.assertEqual(response.json()["error"]["code"], 503)
 
     def test_asset_allowlist_blocks_arbitrary_files(self):
         with TestClient(make_app()) as client:

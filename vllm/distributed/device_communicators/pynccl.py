@@ -146,22 +146,39 @@ class PyNcclCommunicator:
             del data
 
     def destroy(self):
-        if self.available and not self.disabled:
-            # ncclCommAbort can block until all CUDA graphs that
-            # captured NCCL ops on this comm are destroyed — and
-            # those graphs are released later in this same main-
-            # thread teardown, so a direct call here self-deadlocks.
-            # Run it in a daemon thread with a timeout: the main
-            # thread proceeds, the graphs drop, and the abort returns.
+        from vllm.distributed.shutdown import (
+            ShutdownIncompleteError,
+            remaining_shutdown_time,
+        )
+
+        abort_thread = getattr(self, "_abort_thread", None)
+        if abort_thread is None:
+            if not self.available or not hasattr(self, "comm"):
+                return
+            # Disable use immediately, but retain the handle and completion
+            # state until abort really returns. A retry must join this thread,
+            # never start a second abort on the same native communicator.
+            self.disabled = True
+            self._abort_error: str | None = None
+
             def _abort():
-                with torch.accelerator.device_index(self.device.index):
-                    self.nccl.ncclCommAbort(self.comm)
+                try:
+                    with torch.accelerator.device_index(self.device.index):
+                        self.nccl.ncclCommAbort(self.comm)
+                except BaseException as error:
+                    self._abort_error = f"{type(error).__name__}: {error}"
 
             abort_thread = threading.Thread(target=_abort, daemon=True)
+            self._abort_thread = abort_thread
             abort_thread.start()
-            abort_thread.join(timeout=5.0)
-            self.available = False
-            self.disabled = True
+        abort_thread.join(timeout=remaining_shutdown_time())
+        if abort_thread.is_alive():
+            raise ShutdownIncompleteError(
+                "PyNCCL abort incomplete at shutdown deadline"
+            )
+        if self._abort_error is not None:
+            raise ShutdownIncompleteError(f"PyNCCL abort failed: {self._abort_error}")
+        self.available = False
 
     def all_reduce(
         self,

@@ -33,6 +33,7 @@ from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
+from functools import partial
 from multiprocessing import shared_memory
 from typing import TYPE_CHECKING, Any, Protocol
 from unittest.mock import patch
@@ -1471,17 +1472,26 @@ class GroupCoordinator:
         # Custom communicators may depend on the torch groups (including their
         # CPU rendezvous group). Release them while those groups are still live.
         # The caller must retire GPU work and release captured graphs first.
-        if self.device_communicator is not None:
-            self.device_communicator.destroy()
-            self.device_communicator = None
-        if hasattr(self, "device_group"):
-            torch.distributed.destroy_process_group(self.device_group)
-            del self.device_group
-        if hasattr(self, "cpu_group"):
-            torch.distributed.destroy_process_group(self.cpu_group)
-            del self.cpu_group
-        if self.mq_broadcaster is not None:
+        from vllm.distributed.shutdown import Cleanup, shutdown_deadline
+
+        with shutdown_deadline():
+            cleanup = Cleanup()
+            name = getattr(self, "unique_name", "group")
+            communicator = getattr(self, "device_communicator", None)
+            if communicator is not None and cleanup.run(
+                name + ".custom", communicator.destroy
+            ):
+                self.device_communicator = None
+            for attr in ("device_group", "cpu_group"):
+                if hasattr(self, attr) and cleanup.run(
+                    name + "." + attr,
+                    partial(
+                        torch.distributed.destroy_process_group, getattr(self, attr)
+                    ),
+                ):
+                    delattr(self, attr)
             self.mq_broadcaster = None
+            cleanup.finish()
 
     def prepare_communication_buffer_for_model(self, model: torch.nn.Module):
         if self.device_communicator is not None:
@@ -2274,53 +2284,31 @@ def destroy_model_parallel():
     if context_isolated():
         return
     """Set the groups to none and destroy them."""
-    global _TP
+    from vllm.distributed.shutdown import Cleanup, shutdown_deadline
 
-    if _TP:
-        _TP.destroy()
-    _TP = None
-
-    global _DCP
-    if _DCP:
-        _DCP.destroy()
-    _DCP = None
-
-    global _PCP
-    if _PCP:
-        _PCP.destroy()
-    _PCP = None
-
-    global _PP
-    if _PP:
-        _PP.destroy()
-    _PP = None
-
-    global _DP
-    if _DP:
-        _DP.destroy()
-    _DP = None
-
-    global _EP
-    if _EP:
-        _EP.destroy()
-    _EP = None
-
-    global _EPLB
-    if _EPLB:
-        _EPLB.destroy()
-    _EPLB = None
+    with shutdown_deadline():
+        cleanup = Cleanup()
+        for name in ("_TP", "_DCP", "_PCP", "_PP", "_DP", "_EP", "_EPLB"):
+            group = globals()[name]
+            if group is not None and cleanup.run(name, group.destroy):
+                globals()[name] = None
+        cleanup.finish()
 
 
 def destroy_distributed_environment():
     if context_isolated():
         return
     global _WORLD, _NODE_COUNT
-    if _WORLD:
-        _WORLD.destroy()
-    _WORLD = None
-    _NODE_COUNT = None
-    if torch.distributed.is_initialized():
-        torch.distributed.destroy_process_group()
+    from vllm.distributed.shutdown import Cleanup, shutdown_deadline
+
+    with shutdown_deadline():
+        cleanup = Cleanup()
+        if _WORLD is not None and cleanup.run("WORLD", _WORLD.destroy):
+            _WORLD = None
+        _NODE_COUNT = None
+        if torch.distributed.is_initialized():
+            cleanup.run("default", torch.distributed.destroy_process_group)
+        cleanup.finish()
 
 
 def cleanup_dist_env_and_memory(shutdown_ray: bool = False):

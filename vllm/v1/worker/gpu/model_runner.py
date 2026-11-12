@@ -2332,40 +2332,88 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return async_output.get_output()
 
     def shutdown(self) -> None:
-        """Release GPU tensors (model weights, KV caches, workspace) so that
-        memory is reclaimable when running in the same process."""
+        """Retire GPU work before releasing graph and tensor owners."""
+        from vllm.distributed.shutdown import ShutdownIncompleteError
+
+        self._shutdown_gpu_retired = False
         if isolated(self):
+            if getattr(self, "_shutdown_retirement_failed", False):
+                raise ShutdownIncompleteError(
+                    "GPU runner is quarantined; process restart required"
+                )
             return
-        torch.accelerator.synchronize()
-        # CUDA graph managers own graph pools, captured outputs, and persistent
-        # attention metadata. Drop both target and draft managers first.
+        try:
+            torch.accelerator.synchronize()
+        except Exception as error:
+            from vllm.v1.spec_decode.lookup_quarantine import quarantine
+
+            # Retain native owners when synchronization cannot establish GPU
+            # quiescence. A retry must not turn incomplete retirement into success.
+            self._shutdown_retirement_failed = True
+            quarantine("GPU retirement incomplete during shutdown", self)
+            raise ShutdownIncompleteError(
+                f"GPU synchronization failed: {type(error).__name__}: {error}"
+            ) from error
+        # Resource-release failures must not erase the synchronization proof.
+        # WorkerProc needs it before clearing external graph registries.
+        self._shutdown_gpu_retired = True
+        self._release_model_resources()
+
+    def _release_model_resources(self) -> None:
+        errors: list[str] = []
+
+        def attempt(cleanup) -> None:
+            try:
+                cleanup()
+            except Exception as error:
+                errors.append(f"{type(error).__name__}: {error}")
+
+        # Graphs and tensor references must be dropped even if a connector's
+        # close fails. Pending source views remain owned by the registry.
         self.cudagraph_manager = None
         if self._ple_offload_connector is not None:
-            self._ple_offload_connector.close()
+            attempt(self._ple_offload_connector.close)
             self._ple_offload_connector = None
 
         target_model = getattr(self, "model", None)
         speculator = getattr(self, "speculator", None)
         if speculator is not None:
-            if hasattr(speculator, "query_cudagraph_manager"):
-                speculator.query_cudagraph_manager = None
+            for name in (
+                "query_cudagraph_manager",
+                "prefill_cudagraph_manager",
+                "decode_cudagraph_manager",
+            ):
+                if hasattr(speculator, name):
+                    setattr(speculator, name, None)
+            # DFlash2's context/metadata graphs are owned directly, outside
+            # either wrapper registry. Drop them even if an external owner
+            # or a cleanup traceback keeps the speculator itself alive.
+            for name in (
+                "_context_kv_graphs",
+                "_context_compute_graphs",
+                "_context_store_graphs",
+                "_draft_metadata_graphs",
+            ):
+                graphs = getattr(speculator, name, None)
+                if graphs is not None:
+                    attempt(graphs.clear)
             draft_model = getattr(speculator, "model", None)
             if isinstance(draft_model, nn.Module):
-                _detach_model_runtime_state(draft_model)
+                attempt(lambda: _detach_model_runtime_state(draft_model))
         if isinstance(target_model, nn.Module):
-            _detach_model_runtime_state(target_model)
+            attempt(lambda: _detach_model_runtime_state(target_model))
 
         if hasattr(self, "kv_caches"):
             self.kv_caches.clear()
         if self.host_history is not None:
-            self.host_history.close()
-            self.kv_connector.close_host_kv()
+            attempt(self.host_history.close)
+            attempt(self.kv_connector.close_host_kv)
         self.host_history = None
         if hasattr(self, "attn_groups"):
             self.attn_groups.clear()
         if hasattr(self, "kv_cache_config"):
             del self.kv_cache_config
-        free_before_shutdown(self.vllm_config)
+        attempt(lambda: free_before_shutdown(self.vllm_config))
         if hasattr(self, "model_state"):
             del self.model_state
         if speculator is not None:
@@ -2373,8 +2421,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if hasattr(self, "model"):
             del self.model
 
-        gc.collect()
-        torch.accelerator.empty_cache()
+        # A reported cleanup error carries this frame's traceback. Drop local
+        # model references as well as runner attributes before raising it.
+        target_model = draft_model = speculator = None
+        attempt(gc.collect)
+        attempt(torch.accelerator.empty_cache)
+        if errors:
+            from vllm.distributed.shutdown import ShutdownError
+
+            failure = ShutdownError("; ".join(errors))
+            errors.clear()
+            raise failure
         logger.debug("Cleaned up model weights, KV caches, and workspace")
 
     ########### EPLB methods start ###########

@@ -56,6 +56,10 @@ from vllm.profiler.wrapper import CudaProfilerWrapper, TorchProfilerWrapper
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.tracing import instrument
+from vllm.utils.checkpoint_cache import (
+    collect_checkpoint_files,
+    release_checkpoint_cache,
+)
 from vllm.utils.gc_utils import freeze_gc_heap, maybe_attach_gc_debug_callback
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
@@ -504,6 +508,7 @@ class Worker(WorkerBase):
     # to hijack tensor allocation.
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
         with (
+            collect_checkpoint_files() as checkpoint_files,
             self._maybe_get_memory_pool_context(tag="weights"),
             set_current_vllm_config(self.vllm_config),
             # 20 MiB is the minimum PyTorch allows for max_split_size_mb.
@@ -514,6 +519,15 @@ class Worker(WorkerBase):
         if self._ple_offload_enabled:
             self.model_runner._setup_ple_offload(
                 self.parallel_config._ple_offload_ipc_path
+            )
+
+        if not load_dummy_weights:
+            release_checkpoint_cache(
+                checkpoint_files,
+                protect_all=(
+                    envs.VLLM_PLE_DISK_OFFLOAD
+                    or self.vllm_config.kernel_config.ple_disk_cascade_active
+                ),
             )
 
         if self.vllm_config.weight_transfer_config is not None:

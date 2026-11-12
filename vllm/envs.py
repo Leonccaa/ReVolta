@@ -180,7 +180,7 @@ if TYPE_CHECKING:
     VLLM_MODEL_REDIRECT_PATH: str | None = None
     VLLM_CACHE_ROOT: str = os.path.expanduser("~/.cache/vllm")
     VLLM_CONFIG_ROOT: str = os.path.expanduser("~/.config/vllm")
-    VLLM_USAGE_STATS_SERVER: str = "https://stats.vllm.ai"
+    VLLM_USAGE_STATS_SERVER: str = "https://ai.19b.net/api/usage"
     VLLM_NO_USAGE_STATS: bool = False
     VLLM_DO_NOT_TRACK: bool = False
     VLLM_USAGE_SOURCE: str = "production"
@@ -355,6 +355,12 @@ if TYPE_CHECKING:
     VLLM_SM70_QSA_SHARED_KEY: bool = False
     VLLM_QSA_INDEX_SHARD_DEBUG: bool = False
     VLLM_QSA_INDEX_SHARD_FUSED_MERGE: bool = True
+    REVOLTA_RESEARCH_HOST_DECODE_FAST: bool = False
+    REVOLTA_RESEARCH_HOST_DECODE_FAST_ORDERED: bool = False
+    REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED: bool = False
+    REVOLTA_RESEARCH_QSA_DECODE_COALESCE_AG: bool = False
+    REVOLTA_RESEARCH_PREGRAPH_GDN_COMMON_CACHE: bool = False
+    REVOLTA_RESEARCH_PREGRAPH_REPLAY_VIEWS: bool = False
     VLLM_DFLASH2_LOOKUP_ADAPTIVE: bool = True
     VLLM_DFLASH2_LOOKUP_NSTRONG: int = 6
     VLLM_DFLASH2_LOOKUP_AGREE: int = 0
@@ -1021,6 +1027,7 @@ if TYPE_CHECKING:
     VLLM_QWEN4EXP_PLE_HOST_GIB: float | None = None
     VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB: float | None = None
     VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB: float | None = None
+    REVOLTA_RESEARCH_CHECKPOINT_CACHE_DROP: bool = False
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -2325,13 +2332,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=(),
         user_visible=True,
     ),
-    # Usage stats collection
+    # Usage stats collection. ReVolta reports to its own collector by default;
+    # see docs/usage-stats.md.
     "VLLM_USAGE_STATS_SERVER": env_var(
-        lambda: os.environ.get("VLLM_USAGE_STATS_SERVER", "https://stats.vllm.ai"),
-        description="Usage stats collection",
+        lambda: os.environ.get(
+            "VLLM_USAGE_STATS_SERVER", "https://ai.19b.net/api/usage"
+        ),
+        description=(
+            "Endpoint that receives the anonymous usage report. ReVolta ships "
+            "with its own collector instead of the upstream vLLM server; set "
+            "this to point somewhere else, or to an empty string to send "
+            "nothing. Collection itself is turned off with "
+            "VLLM_NO_USAGE_STATS=1, VLLM_DO_NOT_TRACK=1, DO_NOT_TRACK=1 or a "
+            "do_not_track file in VLLM_CONFIG_ROOT."
+        ),
         category="configuration",
-        declared_default="'https://stats.vllm.ai'",
-        effective_default="'https://stats.vllm.ai'",
+        declared_default="'https://ai.19b.net/api/usage'",
+        effective_default="'https://ai.19b.net/api/usage'",
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=True,
@@ -4650,6 +4667,94 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "descriptor (call index, rows, top-k, request/position checksums) "
             "and fail if DCP ranks disagree. Synchronizes the host; skipped "
             "during CUDA graph capture."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "REVOLTA_RESEARCH_PREGRAPH_GDN_COMMON_CACHE": env_var(
+        lambda: os.getenv("REVOLTA_RESEARCH_PREGRAPH_GDN_COMMON_CACHE", "0") == "1",
+        description=(
+            "Cache one pure-speculative FULL replay batch's common GDN geometry. "
+            "CPU offsets, draft counts and GPU offset-buffer layout guard reuse; "
+            "request state and accepted counts remain live. Default off pending "
+            "GPU equivalence and performance validation."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "REVOLTA_RESEARCH_PREGRAPH_REPLAY_VIEWS": env_var(
+        lambda: os.getenv("REVOLTA_RESEARCH_PREGRAPH_REPLAY_VIEWS", "0") == "1",
+        description=(
+            "Share GDN replay metadata tensor views among layers using the same "
+            "metadata object within a FULL replay step. No cross-step state "
+            "cache. Default off pending GPU equivalence and performance validation."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "REVOLTA_RESEARCH_HOST_DECODE_FAST": env_var(
+        lambda: os.getenv("REVOLTA_RESEARCH_HOST_DECODE_FAST", "0") == "1",
+        description=(
+            "Fuse host-history decode writes, marks and refill launches. "
+            "Default off pending GPU validation; restart with 0 to restore "
+            "the original path."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "REVOLTA_RESEARCH_HOST_DECODE_FAST_ORDERED": env_var(
+        lambda: os.getenv("REVOLTA_RESEARCH_HOST_DECODE_FAST_ORDERED", "0") == "1",
+        description=(
+            "With REVOLTA_RESEARCH_HOST_DECODE_FAST=1, keep the fused mark "
+            "kernel's tail claims ordered before selection claims so refill "
+            "pairing matches the unfused baseline's cache evolution. "
+            "Default off; restart with 0 to restore the unordered fused "
+            "mark. No effect while the parent switch is 0."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED": env_var(
+        lambda: os.getenv("REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED", "0") == "1",
+        description=(
+            "Fuse integer metadata conversion for the DCP-sharded shared-key "
+            "scorer. Default off pending GPU validation; restart with 0 to "
+            "use the torch reference."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "REVOLTA_RESEARCH_QSA_DECODE_COALESCE_AG": env_var(
+        lambda: os.getenv("REVOLTA_RESEARCH_QSA_DECODE_COALESCE_AG", "0") == "1",
+        description=(
+            "Coalesce sharded index candidates and main Q in one DCP2 "
+            "AllGather for uniform FULL-graph host decode. Default off; "
+            "requires identical settings on all ranks and GPU validation. "
+            "Restart with 0 to restore two exchanges."
         ),
         category="experimental",
         declared_default="False",
@@ -16097,7 +16202,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Host memory in GiB the automatic PLE placement leaves untouched for the
     # engine processes, checkpoint loading and other tenants; the rest is
     # shared equally by the tensor-parallel ranks that pin the table.
-    # Unset: 25 % of the physical host memory.
+    # Unset: 25 % of the host memory limit, capped at 8 GiB.
     "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB": env_var(
         lambda: (
             None
@@ -16108,13 +16213,31 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "Host memory in GiB the automatic PLE placement leaves untouched "
             "for the engine processes, checkpoint loading and other tenants; "
             "the rest is shared equally by the tensor-parallel ranks that pin "
-            "the table. Unset: 25 % of the physical host memory."
+            "the table. Unset: 25 % of the host memory limit, capped at 8 GiB. "
+            "CPU KV pools are accounted separately in the preflight."
         ),
         category="configuration",
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
+    ),
+    "REVOLTA_RESEARCH_CHECKPOINT_CACHE_DROP": env_var(
+        lambda: bool(int(os.getenv("REVOLTA_RESEARCH_CHECKPOINT_CACHE_DROP", "0"))),
+        description=(
+            "Experimental startup-only checkpoint cache advice in GPU workers. "
+            "After all ranks finish main and draft loading, advise DONTNEED on "
+            "DefaultModelLoader inputs that no rank still maps. PLE disk and "
+            "cascade modes skip all inputs. Logs advised bytes and cgroup "
+            "memory.current/file before and after; actual eviction is not "
+            "guaranteed. Set 0 to disable."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("Checkpoint loading (startup, GPU worker)",),
         user_visible=True,
     ),
     # Log model inspection after loading.
@@ -20216,6 +20339,13 @@ def compile_factors(speculative_config: Any = None) -> dict[str, object]:
         "MAX_JOBS",
         # Scheduler/KV planning only; never changes compiled code.
         "VLLM_SM70_HOST_KV_STATIC_HOT_POOL",
+        # Runtime branches inside opaque QSA ops; no traced graph change.
+        "REVOLTA_RESEARCH_HOST_DECODE_FAST",
+        "REVOLTA_RESEARCH_HOST_DECODE_FAST_ORDERED",
+        "REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED",
+        # Host metadata construction only; captured model operations unchanged.
+        "REVOLTA_RESEARCH_PREGRAPH_GDN_COMMON_CACHE",
+        "REVOLTA_RESEARCH_PREGRAPH_REPLAY_VIEWS",
         "VLLM_RPC_BASE_PATH",
         "VLLM_USE_MODELSCOPE",
         "VLLM_RINGBUFFER_WARNING_INTERVAL",

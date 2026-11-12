@@ -25,6 +25,7 @@ from vllm.models.qwen4_exp.nvidia.ops.sm70_qsa_tuning import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
+from .qsa_coalesce import QSACoalescedExchange
 from .qsa_request_segments import (
     qsa_mqa_request_segments_paged,
     request_segments_unsupported,
@@ -1386,6 +1387,30 @@ def _sm70_qsa_lexicographic_topk_op():
     return torch.ops._C.qsa_lexicographic_topk
 
 
+@triton.jit
+def _shared_key_local_inputs_kernel(
+    Positions,
+    Lengths,
+    OutPositions,
+    OutLengths,
+    NP: tl.constexpr,
+    NL: tl.constexpr,
+    C: tl.constexpr,
+    WORLD: tl.constexpr,
+    RANK: tl.constexpr,
+    B: tl.constexpr,
+):
+    i = tl.program_id(0) * B + tl.arange(0, B)
+    pos = tl.load(Positions + i, i < NP, 0).to(tl.int64)
+    length = tl.load(Lengths + i, i < NL, 0).to(tl.int64)
+    # Clamp after division, as in the torch reference. For negative numerators
+    # the floor/truncation difference vanishes under max(..., 0).
+    vp = tl.maximum((pos + 1) // C, 0)
+    vl = tl.maximum(length // C, 0)
+    tl.store(OutPositions + i, ((vp + WORLD - 1 - RANK) // WORLD) * C - 1, i < NP)
+    tl.store(OutLengths + i, ((vl + WORLD - 1 - RANK) // WORLD) * C, i < NL)
+
+
 def _shared_key_local_inputs(
     query_positions: torch.Tensor,
     sequence_lengths: torch.Tensor,
@@ -1408,6 +1433,36 @@ def _shared_key_local_inputs(
     (positions far below int64 overflow; padded rows are negative and map to
     zero visible groups). Fixed shapes and no host sync.
     """
+    if (
+        os.environ.get("REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED", "0") == "1"
+        and (query_positions.is_cuda or os.environ.get("TRITON_INTERPRET") == "1")
+        and query_positions.is_contiguous()
+        and sequence_lengths.is_contiguous()
+        and query_positions.device == sequence_lengths.device
+        and query_positions.ndim == sequence_lengths.ndim == 1
+        and query_positions.dtype in (torch.int32, torch.int64)
+        and sequence_lengths.dtype in (torch.int32, torch.int64)
+        and compress_ratio > 0
+        and world > 0
+        and 0 <= rank < world
+    ):
+        positions = torch.empty_like(query_positions)
+        lengths = torch.empty_like(sequence_lengths)
+        n = max(positions.numel(), lengths.numel())
+        if n:
+            _shared_key_local_inputs_kernel[(triton.cdiv(n, 128),)](
+                query_positions,
+                sequence_lengths,
+                positions,
+                lengths,
+                positions.numel(),
+                lengths.numel(),
+                compress_ratio,
+                world,
+                rank,
+                128,
+            )
+        return positions, lengths
     c = compress_ratio
     prefix = query_positions.to(torch.int64) + 1
     visible = torch.clamp(prefix // c, min=0)
@@ -1736,6 +1791,7 @@ def qsa_select_paged_tokens(
     seq_lens_cpu_upper_bound: torch.Tensor | None = None,
     index_dcp_world_size: int = 1,
     index_dcp_rank: int = 0,
+    coalesced_exchange: QSACoalescedExchange | None = None,
 ) -> torch.Tensor:
     """Score and select QSA indices, using a host bound when available.
 
@@ -1844,6 +1900,16 @@ def qsa_select_paged_tokens(
         if exact_topk
         else torch.empty((_TOPK_WORKSPACE_BYTES,), dtype=torch.uint8, device=q.device)
     )
+    # A split/scorer chunk must not exchange only a subset of the main Q.
+    # All these predicates use replicated shapes/config, never local data.
+    if not (
+        world == 2
+        and rows <= rows_per_chunk
+        and exact_topk
+        and envs.VLLM_QSA_INDEX_SHARD_FUSED_MERGE
+        and not envs.VLLM_QSA_INDEX_SHARD_DEBUG
+    ):
+        coalesced_exchange = None
     for row_start in range(0, rows, rows_per_chunk):
         row_end = min(row_start + rows_per_chunk, rows)
         row_slice = slice(row_start, row_end)
@@ -1922,6 +1988,11 @@ def qsa_select_paged_tokens(
             )
         if world > 1:
             # Local columns -> global groups, merged across the DCP group.
+            merge_kwargs: dict[str, Any] = (
+                {"coalesced_exchange": coalesced_exchange}
+                if coalesced_exchange is not None
+                else {}
+            )
             blocks = _merge_sharded_index_blocks(
                 blocks,
                 logits,
@@ -1930,6 +2001,7 @@ def qsa_select_paged_tokens(
                 index_dcp_rank,
                 block_topk,
                 row_keys=(token_to_req[row_slice], query_positions[row_slice]),
+                **merge_kwargs,
             )
         expand_qsa_block_indices_cuda(
             blocks,
@@ -2204,6 +2276,7 @@ def _merge_sharded_index_blocks(
     select: Callable[[torch.Tensor, torch.Tensor, torch.Tensor, int], None]
     | None = None,
     use_triton: bool | None = None,
+    coalesced_exchange: QSACoalescedExchange | None = None,
 ) -> torch.Tensor:
     """Merge rank-local top-k groups into the unsharded global selection.
 
@@ -2245,7 +2318,10 @@ def _merge_sharded_index_blocks(
         )
     if use_triton and envs.VLLM_QSA_INDEX_SHARD_DEBUG:
         _check_index_shard_local_order(blocks)
-    if use_triton:
+    if coalesced_exchange is not None:
+        assert world == 2 and use_triton
+        gathered = coalesced_exchange.exchange(blocks, logits, rank)
+    elif use_triton:
         packed = _pack_index_shard_candidates(blocks, logits, world, rank)
     else:
         valid = blocks >= 0
@@ -2262,13 +2338,14 @@ def _merge_sharded_index_blocks(
             valid, blocks * world + rank, torch.full_like(blocks, _INDEX_SHARD_PAD_ID)
         )
         packed = torch.cat((score_bits, groups), dim=1)
-    if all_gather is None:
-        from vllm.distributed import get_dcp_group
+    if coalesced_exchange is None:
+        if all_gather is None:
+            from vllm.distributed import get_dcp_group
 
-        all_gather = lambda t: get_dcp_group().all_gather(t, dim=0)  # noqa: E731
-    if envs.VLLM_QSA_INDEX_SHARD_DEBUG:
-        _check_index_shard_plan(rows, block_topk, world, row_keys, all_gather)
-    gathered = all_gather(packed.unsqueeze(0))
+            all_gather = lambda t: get_dcp_group().all_gather(t, dim=0)  # noqa: E731
+        if envs.VLLM_QSA_INDEX_SHARD_DEBUG:
+            _check_index_shard_plan(rows, block_topk, world, row_keys, all_gather)
+        gathered = all_gather(packed.unsqueeze(0))
     if gathered.shape != (world, rows, 2 * block_topk):
         # Catches a local world/wrapper mismatch only: all_gather sizes its
         # output from this rank's input. Cross-rank row layout is checked by

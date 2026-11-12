@@ -11,9 +11,11 @@ Add a variable here to document it, then run `python tools/gen_env_docs.py`.
 """
 
 SECTIONS = {
+    "research": "Pregraph preparation research switches",
     "promoted": "Promoted research switches (0.2.0rc5)",
     "deployment": "Settings used by the reference deployment",
     "profile": "Values applied by the ReVolta profile",
+    "usage": "Anonymous usage statistics",
     "dflash": "DFlash2 and DFlash draft settings",
     "retiring": "Deprecated, removed in 0.2.0rc6",
 }
@@ -34,6 +36,53 @@ _LOOKUP = (
 )
 
 NOTES: dict[str, dict[str, str]] = {
+    "REVOLTA_RESEARCH_PREGRAPH_GDN_COMMON_CACHE": dict(
+        section="research",
+        since="unreleased research",
+        range="0, 1",
+        tradeoff="Deployment scope, default off. MRV2 FULL replay only: retain "
+        "one pure-speculative batch's common GDN metadata, guarded by all CPU "
+        "geometry values and the live GPU offset buffer layout. Removes repeated "
+        "host construction, mask H2D and token-index arange on a hit. Mixed and "
+        "capture batches use the original builder. Accepted counts, state IDs "
+        "and request mapping are never cached. GPU bitwise and throughput "
+        "validation pending. Set 0 and restart to restore the original builder.",
+        metrics="no dedicated counter; compare decode throughput "
+        "and preparation traces",
+    ),
+    "REVOLTA_RESEARCH_PREGRAPH_REPLAY_VIEWS": dict(
+        section="research",
+        since="unreleased research",
+        range="0, 1",
+        tradeoff="Deployment scope, default off. MRV2 FULL replay only: share "
+        "read-only state-ID and query-offset tensor views within each metadata "
+        "group for one step. No cross-step reuse or change to kernels, storage, "
+        "accepted counts or fences. GPU bitwise and throughput validation "
+        "pending. Set 0 and restart to restore per-layer view construction.",
+        metrics="no dedicated counter; compare decode throughput "
+        "and preparation traces",
+    ),
+    "REVOLTA_RESEARCH_CHECKPOINT_CACHE_DROP": dict(
+        section="deployment",
+        since="0.2.0",
+        range="0, 1",
+        tradeoff="Research, engine startup only; default off. 1 requests clean "
+        "checkpoint cache eviction before host KV allocation, after a world "
+        "load barrier. Skips live mappings and PLE disk/cascade modes. May "
+        "slow later reloads or other engines reading the same checkpoint. "
+        "See startup logs for advised files/bytes and cgroup usage; no metric.",
+        metrics="",
+    ),
+    "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB": dict(
+        section="deployment",
+        since="1Cat",
+        range="non-negative GiB or unset",
+        tradeoff="Unset reserves min(host limit / 4, 8 GiB), preserving the "
+        "small-host margin without scaling it to tens of GiB. Explicit values "
+        "override the cap. The warning-only preflight counts shared CPU KV "
+        "storage separately; automatic placement also uses this reserve.",
+        metrics="",
+    ),
     # ---- promoted research switches -------------------------------------
     "VLLM_SM70_GDN_CPU_SPEC_QSL": dict(
         section="promoted",
@@ -96,6 +145,42 @@ NOTES: dict[str, dict[str, str]] = {
         since="0.2.0",
         range="0, 1",
         tradeoff="Deprecated alias of VLLM_SM70_GDN_SKINNY_MPLAN; removed in 0.2.0rc6.",
+        metrics="",
+    ),
+    # ---- anonymous usage statistics ---------------------------------------
+    "VLLM_NO_USAGE_STATS": dict(
+        section="usage",
+        since="1Cat",
+        range="0, 1",
+        tradeoff="Upstream opt-out, honoured as-is: 1 turns the usage report "
+        "off. The Do Not Track variables and the do_not_track file have the "
+        "same effect.",
+        metrics="",
+    ),
+    "VLLM_DO_NOT_TRACK": dict(
+        section="usage",
+        since="1Cat",
+        range="0, 1",
+        tradeoff="Honours the cross-project Do Not Track convention "
+        "(DO_NOT_TRACK counts too): 1 turns the usage report off.",
+        metrics="",
+    ),
+    "VLLM_USAGE_STATS_SERVER": dict(
+        section="usage",
+        since="1Cat",
+        range="URL, empty to disable sending",
+        tradeoff="Where the report goes. ReVolta defaults to its own "
+        "collector; an empty string keeps the local log file but sends "
+        "nothing.",
+        metrics="",
+    ),
+    "VLLM_USAGE_SOURCE": dict(
+        section="usage",
+        since="1Cat",
+        range="short label",
+        tradeoff="Deployment label reported with the anonymous report "
+        "(production by default). A value that looks like a path or a URL is "
+        "reported as custom instead.",
         metrics="",
     ),
     # ---- reference deployment ---------------------------------------------

@@ -100,12 +100,14 @@ recipe, scheduling limits, measurements and statistics.
 | `search_window` | `65536` | Positive token distance in committed history |
 | `gate` | `first_token` | Strict agreement with the original first draft token |
 | `collect_stats` | `true` | Also requires the engine's effective statistics switch |
+| `max_requests` | `3` | Strict integer from 1 to 3; set to 1 for single-request admission |
 | `expand.enabled` | `false` | Must remain false, even when lookup is disabled |
 
 Native lookup requires a seven-token DFlash2 selector drafter and seven configured
-speculative tokens. It only attempts lookup on an eligible single-request decode
-batch. Multiple requests bypass lookup while the existing concurrency ladder
-continues to choose the verification width. Fixed seven without a ladder permits
+speculative tokens. It attempts lookup only when every live row is an eligible
+decode request, the batch contains at most `max_requests` requests, and the
+existing concurrency ladder selects width seven. Otherwise the entire batch
+bypasses lookup. Four or more requests always bypass lookup. Fixed seven without a ladder permits
 async subject to existing constraints; a nonempty ladder rejects explicit async
 and otherwise selects synchronous scheduling.
 
@@ -200,6 +202,13 @@ type and default as registered in `vllm/envs.py`; *Since* is the first
 release with the variable (1Cat = inherited from 1Cat-vLLM); *Category*
 is configuration, tuning, experimental, debug or deprecated.
 
+### Pregraph preparation research switches
+
+| Name | Type | Default | Range | Category | Since | Effect and trade-off |
+|---|---|---|---|---|---|---|
+| `REVOLTA_RESEARCH_PREGRAPH_GDN_COMMON_CACHE` | bool | `False` | 0, 1 | experimental | unreleased research | Deployment scope, default off. MRV2 FULL replay only: retain one pure-speculative batch's common GDN metadata, guarded by all CPU geometry values and the live GPU offset buffer layout. Removes repeated host construction, mask H2D and token-index arange on a hit. Mixed and capture batches use the original builder. Accepted counts, state IDs and request mapping are never cached. GPU bitwise and throughput validation pending. Set 0 and restart to restore the original builder. Metrics: no dedicated counter; compare decode throughput and preparation traces. |
+| `REVOLTA_RESEARCH_PREGRAPH_REPLAY_VIEWS` | bool | `False` | 0, 1 | experimental | unreleased research | Deployment scope, default off. MRV2 FULL replay only: share read-only state-ID and query-offset tensor views within each metadata group for one step. No cross-step reuse or change to kernels, storage, accepted counts or fences. GPU bitwise and throughput validation pending. Set 0 and restart to restore per-layer view construction. Metrics: no dedicated counter; compare decode throughput and preparation traces. |
+
 ### Promoted research switches (0.2.0rc5)
 
 | Name | Type | Default | Range | Category | Since | Effect and trade-off |
@@ -217,8 +226,10 @@ is configuration, tuning, experimental, debug or deprecated.
 
 | Name | Type | Default | Range | Category | Since | Effect and trade-off |
 |---|---|---|---|---|---|---|
+| `REVOLTA_RESEARCH_CHECKPOINT_CACHE_DROP` | bool | `False` | 0, 1 | experimental | 0.2.0 | Research, engine startup only; default off. 1 requests clean checkpoint cache eviction before host KV allocation, after a world load barrier. Skips live mappings and PLE disk/cascade modes. May slow later reloads or other engines reading the same checkpoint. See startup logs for advised files/bytes and cgroup usage; no metric. |
 | `VLLM_PLE_OFFLOAD_READY_TIMEOUT` | float | `600.0` | seconds | configuration | 1Cat | How long startup waits for the PLE offload worker. Raise it on slow storage; the reference deployment uses 1200. |
 | `VLLM_QWEN4EXP_PLE_HOST_GIB` | float \| None | `None` | GiB per TP rank; unset = automatic | configuration | 1Cat | Caps pinned host memory for the PLE table. Lower values leave host RAM for CPU KV offload but move more PLE rows to disk; the reference deployment uses 12. |
+| `VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB` | float \| None | `None` | non-negative GiB or unset | configuration | 1Cat | Unset reserves min(host limit / 4, 8 GiB), preserving the small-host margin without scaling it to tens of GiB. Explicit values override the cap. The warning-only preflight counts shared CPU KV storage separately; automatic placement also uses this reserve. |
 | `VLLM_SM70_AWQ_MOE_INT4_ZERO` | bool | `False` | 0, 1 | experimental | 0.2.0 | Packs AWQ zero points into nibbles: less resident metadata, lossless. Needs compact metadata and a native build with the packed kernels. |
 | `VLLM_SM70_DFLASH2_FUSED_QKV_PACK` | bool | `False` | 0, 1 | configuration | 1Cat | One Triton launch instead of three copies and a concat in the DFlash2 verifier. Outputs are bitwise identical either way. |
 | `VLLM_SM70_FLASH_ATTN_V100` | bool | `True` | 0, 1 | configuration | 1Cat | Default on (set in the image). 0 only to diagnose backend selection; prefer --attention-backend to choose a backend. |
@@ -266,6 +277,15 @@ The ReVolta profile (`vllm/revolta_profile.py`) sets these on SM70 + TP4 + FP16 
 | `VLLM_SM70_SKIP_REJECTED_BATCH_PACKS` | bool | `False` | `1` | 0, 1 | experimental | 0.2.0 | Skips batch packs the precision policy never admits; saves about 199 MiB per rank. |
 | `VLLM_USE_AOT_COMPILE` | bool | `False` | `0` | 0, 1 | configuration | 1Cat | AOT compile reuse. The profile sets 0 on the reference deployment. |
 | `VLLM_V2_CUDAGRAPH_MEM_MIB` | float | `0.0` | `700` (AWQ), `1200` (AWQ+DFlash2), `700` (NVFP4) | MiB | configuration | 1Cat | CUDA graph memory reserved before sizing the KV cache (MRv2 does not profile it). Too low risks OOM at capture; too high wastes KV. Profile: 700 (AWQ, NVFP4), 1200 (AWQ + DFlash2). |
+
+### Anonymous usage statistics
+
+| Name | Type | Default | Range | Category | Since | Effect and trade-off |
+|---|---|---|---|---|---|---|
+| `VLLM_DO_NOT_TRACK` | bool | `False` | 0, 1 | configuration | 1Cat | Honours the cross-project Do Not Track convention (DO_NOT_TRACK counts too): 1 turns the usage report off. |
+| `VLLM_NO_USAGE_STATS` | bool | `False` | 0, 1 | configuration | 1Cat | Upstream opt-out, honoured as-is: 1 turns the usage report off. The Do Not Track variables and the do_not_track file have the same effect. |
+| `VLLM_USAGE_SOURCE` | str | `'production'` | short label | configuration | 1Cat | Deployment label reported with the anonymous report (production by default). A value that looks like a path or a URL is reported as custom instead. |
+| `VLLM_USAGE_STATS_SERVER` | str | `'https://ai.19b.net/api/usage'` | URL, empty to disable sending | configuration | 1Cat | Where the report goes. ReVolta defaults to its own collector; an empty string keeps the local log file but sends nothing. |
 
 ### DFlash2 and DFlash draft settings
 
@@ -375,3 +395,11 @@ for permanent junction retention. Set it to `false` to restore the legacy
 latest-only policy. It does not change compilation or persisted page identity.
 See [checkpoint retention](kv-offload.md#checkpoint-retention-evidence) for
 migration rules, limits and counters.
+
+## Host decode experiments
+
+`REVOLTA_RESEARCH_HOST_DECODE_FAST=1` fuses three pairs of host-history decode kernels. `REVOLTA_RESEARCH_HOST_DECODE_FAST_ORDERED=1` (requires the parent switch) additionally keeps the fused mark kernel's tail claims ordered before selection claims, so refill pairing and cache evolution match the unfused baseline; it costs no extra kernel launches and no phase parallelism (ordering comes from per-phase mark bits and a second wanted list, not from scheduling), at the price of one extra int32-per-hot-slot scratch tensor allocated unconditionally. `REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED=1` fuses integer metadata conversion in the DCP-sharded shared-key scorer. All are experimental and default to `0`; GPU correctness and matched performance validation are required before deployment. Set either to `0` and restart to restore its original path. The switches act inside opaque QSA operators and do not change the torch compilation key or SSD cache identity.
+
+## QSA decode exchange experiment
+
+`REVOLTA_RESEARCH_QSA_DECODE_COALESCE_AG` is an experimental boolean (`0` by default; `1` enables), introduced as a research candidate. It combines index candidates and main query into one AllGather for host QSA DCP2 uniform decode with fixed padded FULL-graph rows and the exact fused index merge. Prefill, mixed batches, split scoring, debug merges and unsupported geometry retain both original exchanges. Set it identically on every worker before model initialization; changing it requires a restart and graph recapture. One model-level fixed workspace is shared by serial QSA layers: for maximum captured rows R, local heads H, head dimension D and compressed top-k K it uses `12*R*(2*K+H*D/2) + 4*R*H*D` bytes. Historical index and host KV layouts are unchanged. GPU bitwise correctness, collective liveness, capacity and unprofiled decode throughput remain validation requirements; no performance claim is made.

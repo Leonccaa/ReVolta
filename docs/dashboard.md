@@ -129,8 +129,11 @@ when the history is restored or extended, and the storage entry itself survives
 until it is replaced or removed. To remove it: use **Clear history** to delete
 the observations and start a new window, turn **Remember history** off (which
 deletes the stored record immediately while allowing in-memory observation to
-continue), or clear this site's browsing data in the browser. Storage denial,
-quota errors and corrupted caches fall back to memory without breaking the page.
+continue), or clear this site's browsing data in the browser. While remembering
+is off, opening the page also drops a record an earlier session left behind, so
+turning the option off does not keep model names or label keys on disk. Storage
+denial, quota errors and corrupted caches fall back to memory without breaking
+the page.
 
 The cache is scoped to browser origin, dashboard path, schema and service
 instance. Reloading the same service can restore observed history after successful

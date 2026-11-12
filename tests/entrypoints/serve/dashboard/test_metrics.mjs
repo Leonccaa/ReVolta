@@ -214,8 +214,12 @@ test('Browser cache restores same-instance history and is scoped by URL path', (
 });
 
 test('Remembering is opt-in and writes nothing before it is enabled', () => {
-  const storage = memory(), history = new ObservationHistory({storage, scope: '/a/'});
+  const storage = memory();
+  storage.setItem(`revolta-dashboard:${CACHE_SCHEMA}:/a/`, JSON.stringify({schema: CACHE_SCHEMA, instance: 'engine', samples: [snapshot(0)]}));
+  const history = new ObservationHistory({storage, scope: '/a/'});
   assert.equal(history.remember, false); assert.equal(history.cacheState, 'Disabled');
+  assert.equal(storage.getItem(history.key), null, 'A record from a remembering session is dropped when remembering is off');
+  storage.writes = 0; // Do not count the seeded record or the drop as page writes.
   history.connect('engine', baseTime);
   for (const step of [0, 1, 2]) history.append(snapshot(step));
   history.save(baseTime + 6, true);

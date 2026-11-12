@@ -286,7 +286,14 @@ try {
   await until(async () => evaluate(`document.querySelector('#health').textContent==='Online' && document.querySelector('#observation').textContent.includes('1 retained')`), 'Engine restart starts a new observation window');
   await click('#clear');
   assert.ok((await probe()).samples.includes('No browser observations'));
+  await evaluate("localStorage.setItem('revolta-dashboard:1:/dashboard/', JSON.stringify({schema:1, instance:'x', samples:[]}))");
+  assert.equal(await evaluate("Object.keys(localStorage).some(key=>key.startsWith('revolta-dashboard:1:'))"), true, 'Seeded a leftover record');
+  await call('Page.reload');
+  await until(async () => (await probe()).health === 'Online', 'Reload with remembering off');
+  assert.equal((await probe()).remember, false);
+  assert.equal(await evaluate("Object.keys(localStorage).some(key=>key.startsWith('revolta-dashboard:1:'))"), false, 'A leftover record is dropped while remembering is off');
   report.checks.push('Engine restart invalidates old observations and clear-history control');
+  report.checks.push('Leftover local history is dropped when remembering is off');
   assert.deepEqual(report.exceptions, []);
   await writeFile(resolve(output, 'acceptance.json'), JSON.stringify(report, null, 2));
   console.log(JSON.stringify({checks: report.checks, viewports: report.viewports.map(v => v.width), exceptions: report.exceptions}));

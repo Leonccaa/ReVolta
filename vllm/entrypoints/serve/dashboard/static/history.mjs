@@ -28,6 +28,9 @@ export class ObservationHistory {
     this.latestPrefill = null;
     this.lastSaved = 0;
     this.cacheState = remember ? 'Memory only' : 'Disabled';
+    if (!this.remember) this.clear();
+    // A record left by an earlier session that remembered by default must not
+    // keep model names and label keys on disk while remembering is off.
   }
 
   connect(instance, now) {

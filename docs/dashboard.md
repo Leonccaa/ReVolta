@@ -27,6 +27,11 @@ When a key is configured, enter it in the page. The key remains in that tab's
 memory and is sent in an Authorization header; it is never placed in a URL or
 saved to browser storage. The unauthenticated HTML shell contains no metrics.
 Configuration follows the ordinary server's CLI-key-over-environment priority.
+A rejected data request answers `401` with `WWW-Authenticate: Bearer` and
+`Cache-Control: no-store`. The dashboard builds that response inside its own
+authorization step rather than raising an exception, so the API server's shared
+`HTTPException` handler, which rebuilds the body without the exception headers,
+cannot strip them. A dead engine answers `503` with the same no-store header.
 
 Routes use the server's reverse-proxy root path, and assets/data use relative
 URLs. The page becomes available with the API server after model loading. An
@@ -80,28 +85,59 @@ horizontal bars and net changes; it does not infer peak occupancy before the
 browser observed it. RAM/SSD input shares use all classified prompt tokens as
 their denominator. They are **not** conditional tier lookup hit rates. GPU Hot
 hit rate uses groups, not tokens. Current store occupancy becomes unavailable
-when its snapshot is older than 180 seconds or its age cannot be verified.
-SSD bytes can be shown without a capacity, but SSD utilization remains
-unavailable when this engine build does not export capacity. Native engine KV
-utilization is available in Cache details; with multiple engines it shows the
-maximum exported fraction. Missing metrics are shown as `—`, not zero.
+when its snapshot is older than 180 seconds or its age cannot be verified. The
+`RAM allocation / capacity` and `SSD allocation / capacity` lines follow the
+occupancy bars and use the same rule: when the store snapshot is stale or the
+service is offline they report `Unavailable` plus the age of the last observed
+value, instead of repeating a number that is no longer current. SSD bytes can be
+shown without a capacity, but SSD utilization remains unavailable when this
+engine build does not export capacity. Native engine KV utilization is available
+in Cache details; with multiple engines it shows the maximum exported fraction.
+Missing metrics are shown as `—`, not zero.
 
 ## Browser history and caching
 
-**Remember history** is enabled initially and can be turned off. It stores only
-aggregate observations in local browser storage: at most 15 minutes, 500 samples
-and 1.5 MiB of serialized UTF-8 data. Writes are throttled to once per 30 seconds
-and flushed when the page is hidden or exited. **Clear history** deletes those
-observations and starts a new window; disabling remembering removes the stored
-history while allowing in-memory observation to continue. Storage denial, quota
-errors and corrupted caches fall back to memory without breaking the page.
+**Remember history** is off by default. Nothing is written to browser storage
+until you turn it on, and a first visit only observes in memory. When it is on,
+one local storage record holds aggregate observations, limited to at most 15
+minutes of samples, 500 samples and 1.5 MiB of serialized UTF-8 data. Writes are
+throttled to once per 30 seconds and flushed when the page is hidden or exited.
+
+The saved fields are:
+
+- the schema version and the service instance ID the observations belong to;
+- each observation's browser-side timestamp;
+- aggregate counter, gauge and store-occupancy values (tokens, completed
+  requests, cache and speculative-decoding counters, running/waiting counts,
+  engine KV utilization, RAM/SSD byte totals and the store snapshot timestamp);
+- the model names taken from the metric labels;
+- for each tracked counter series (input tokens, output tokens and completed
+  requests) the value together with that series' full label key and value list,
+  which includes the model name and engine labels;
+- time-to-first-token histogram bucket counts and the completed-prefill
+  histogram values with their label keys.
+
+A model name can itself contain a deployment path, and label values are stored
+verbatim, so treat the stored record as revealing which model this service
+served. API keys are never part of it. The selected statistics window and the
+remembering choice are stored separately as page preferences and contain no
+metric values.
+
+There is **no automatic expiry**. A record that is no longer being written stays
+in browser storage indefinitely; samples older than 15 minutes are only dropped
+when the history is restored or extended, and the storage entry itself survives
+until it is replaced or removed. To remove it: use **Clear history** to delete
+the observations and start a new window, turn **Remember history** off (which
+deletes the stored record immediately while allowing in-memory observation to
+continue), or clear this site's browsing data in the browser. Storage denial,
+quota errors and corrupted caches fall back to memory without breaking the page.
 
 The cache is scoped to browser origin, dashboard path, schema and service
 instance. Reloading the same service can restore observed history after successful
-authentication. An engine restart, model/engine-series change or a decreasing
-counter invalidates it. Client clock reversal also starts a new observation
-segment. API workers in one service share an identity; independent service
-restarts do not.
+authentication, but only when remembering is on. An engine restart,
+model/engine-series change or a decreasing counter invalidates it. Client clock
+reversal also starts a new observation segment. API workers in one service share
+an identity; independent service restarts do not.
 
 Hidden tabs stop polling. A gap has no instantaneous chart points. Counter-based
 window averages can still cover the gap if the same service's counters remain
@@ -127,12 +163,14 @@ uv pip install --python .venv/bin/python 'fastapi>=0.141.1,<0.142.0' httpx prome
 node --test tests/entrypoints/serve/dashboard/test_metrics.mjs
 ```
 
-The Python suite exercises actual ASGI routes, authentication, disabled routes,
-shared worker identity, proxy paths, assets and exporter responses. The JavaScript
-suite exercises parsing, counter math, rolling/partial windows, prefill matching,
-histogram bounds, reset detection and browser-cache behavior. Use Node 22 or
-later. Browser verification uses a CPU fixture service, including mobile dialogs,
-reload, offline/missing metrics and authentication; these results do not establish
+The Python suite exercises actual ASGI routes, authentication, the API server's
+HTTPException handler chain, disabled routes, shared worker identity, proxy
+paths, assets and exporter responses. The JavaScript suite exercises parsing,
+counter math, rolling/partial windows, store-snapshot freshness, prefill
+matching, histogram bounds, reset detection and browser-cache behavior. Use Node
+22 or later. Browser verification uses a CPU fixture service, including mobile
+dialogs, reload, offline/stale-store occupancy, missing metrics and
+authentication with local history off by default; these results do not establish
 GPU serving performance or production readiness.
 
 To repeat the browser check with an installed Chromium or Chrome executable:

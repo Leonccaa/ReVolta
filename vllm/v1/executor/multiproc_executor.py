@@ -776,6 +776,13 @@ class WorkerProc:
         self.worker.shutdown()
         self.rpc_broadcast_mq = None
         self.worker_response_mq = None
+        # Dynamo can retain compiled callables after the runner drops its model.
+        # Their CUDA graphs keep NCCL communicators alive, so finalize can wait
+        # forever if we destroy process groups first. This process owns all of
+        # these wrappers and will not execute another forward after shutdown.
+        from vllm.compilation.cuda_graph import CUDAGraphWrapper
+
+        CUDAGraphWrapper.clear_all_graphs()
         destroy_model_parallel()
         destroy_distributed_environment()
 

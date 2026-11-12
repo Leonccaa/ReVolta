@@ -1468,14 +1468,18 @@ class GroupCoordinator:
         return self.device_communicator.recv(size, dtype, src)
 
     def destroy(self):
+        # Custom communicators may depend on the torch groups (including their
+        # CPU rendezvous group). Release them while those groups are still live.
+        # The caller must retire GPU work and release captured graphs first.
+        if self.device_communicator is not None:
+            self.device_communicator.destroy()
+            self.device_communicator = None
         if hasattr(self, "device_group"):
             torch.distributed.destroy_process_group(self.device_group)
             del self.device_group
         if hasattr(self, "cpu_group"):
             torch.distributed.destroy_process_group(self.cpu_group)
             del self.cpu_group
-        if self.device_communicator is not None:
-            self.device_communicator.destroy()
         if self.mq_broadcaster is not None:
             self.mq_broadcaster = None
 

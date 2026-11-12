@@ -659,6 +659,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.pynccl_comm.destroy()
             self.pynccl_comm = None
         if self.ca_comm is not None:
+            # Captured callables can still reference this object. Do not rely
+            # on __del__ to release its IPC resources before the torch groups.
+            self.ca_comm.close()
             self.ca_comm = None
         if self.fi_ar_comm is not None:
             self.fi_ar_comm.destroy()

@@ -15,6 +15,7 @@ SECTIONS = {
     "promoted": "Promoted research switches (0.2.0rc5)",
     "deployment": "Settings used by the reference deployment",
     "profile": "Values applied by the ReVolta profile",
+    "usage": "Anonymous usage statistics",
     "dflash": "DFlash2 and DFlash draft settings",
     "retiring": "Deprecated, removed in 0.2.0rc6",
 }
@@ -144,6 +145,42 @@ NOTES: dict[str, dict[str, str]] = {
         since="0.2.0",
         range="0, 1",
         tradeoff="Deprecated alias of VLLM_SM70_GDN_SKINNY_MPLAN; removed in 0.2.0rc6.",
+        metrics="",
+    ),
+    # ---- anonymous usage statistics ---------------------------------------
+    "VLLM_NO_USAGE_STATS": dict(
+        section="usage",
+        since="1Cat",
+        range="0, 1",
+        tradeoff="Upstream opt-out, honoured as-is: 1 turns the usage report "
+        "off. The Do Not Track variables and the do_not_track file have the "
+        "same effect.",
+        metrics="",
+    ),
+    "VLLM_DO_NOT_TRACK": dict(
+        section="usage",
+        since="1Cat",
+        range="0, 1",
+        tradeoff="Honours the cross-project Do Not Track convention "
+        "(DO_NOT_TRACK counts too): 1 turns the usage report off.",
+        metrics="",
+    ),
+    "VLLM_USAGE_STATS_SERVER": dict(
+        section="usage",
+        since="1Cat",
+        range="URL, empty to disable sending",
+        tradeoff="Where the report goes. ReVolta defaults to its own "
+        "collector; an empty string keeps the local log file but sends "
+        "nothing.",
+        metrics="",
+    ),
+    "VLLM_USAGE_SOURCE": dict(
+        section="usage",
+        since="1Cat",
+        range="short label",
+        tradeoff="Deployment label reported with the anonymous report "
+        "(production by default). A value that looks like a path or a URL is "
+        "reported as custom instead.",
         metrics="",
     ),
     # ---- reference deployment ---------------------------------------------

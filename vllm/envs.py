@@ -180,7 +180,7 @@ if TYPE_CHECKING:
     VLLM_MODEL_REDIRECT_PATH: str | None = None
     VLLM_CACHE_ROOT: str = os.path.expanduser("~/.cache/vllm")
     VLLM_CONFIG_ROOT: str = os.path.expanduser("~/.config/vllm")
-    VLLM_USAGE_STATS_SERVER: str = "https://stats.vllm.ai"
+    VLLM_USAGE_STATS_SERVER: str = "https://ai.19b.net/api/usage"
     VLLM_NO_USAGE_STATS: bool = False
     VLLM_DO_NOT_TRACK: bool = False
     VLLM_USAGE_SOURCE: str = "production"
@@ -2332,13 +2332,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=(),
         user_visible=True,
     ),
-    # Usage stats collection
+    # Usage stats collection. ReVolta reports to its own collector by default;
+    # see docs/usage-stats.md.
     "VLLM_USAGE_STATS_SERVER": env_var(
-        lambda: os.environ.get("VLLM_USAGE_STATS_SERVER", "https://stats.vllm.ai"),
-        description="Usage stats collection",
+        lambda: os.environ.get(
+            "VLLM_USAGE_STATS_SERVER", "https://ai.19b.net/api/usage"
+        ),
+        description=(
+            "Endpoint that receives the anonymous usage report. ReVolta ships "
+            "with its own collector instead of the upstream vLLM server; set "
+            "this to point somewhere else, or to an empty string to send "
+            "nothing. Collection itself is turned off with "
+            "VLLM_NO_USAGE_STATS=1, VLLM_DO_NOT_TRACK=1, DO_NOT_TRACK=1 or a "
+            "do_not_track file in VLLM_CONFIG_ROOT."
+        ),
         category="configuration",
-        declared_default="'https://stats.vllm.ai'",
-        effective_default="'https://stats.vllm.ai'",
+        declared_default="'https://ai.19b.net/api/usage'",
+        effective_default="'https://ai.19b.net/api/usage'",
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=True,

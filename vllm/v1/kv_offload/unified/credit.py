@@ -69,8 +69,10 @@ class PersistenceCredit:
             if self.available()
             else 0
         )
-        self.q_eff = min(self.io_bytes, self.h)
-        self.d_dyn = self.h - self.q_eff
+        # IO capacity bounds live writes; a throughput estimate only bounds
+        # durability guarantees. A short shutdown window must still admit IO.
+        self.q_eff = min(self.io_bytes, self.capacity_bytes)
+        self.d_dyn = max(0, self.h - self.q_eff)
         self.guaranteed.intersection_update(self.units.units)
         self.excluded.intersection_update(self.units.units)
         variants = self._variants()

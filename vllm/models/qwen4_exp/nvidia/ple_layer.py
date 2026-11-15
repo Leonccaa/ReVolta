@@ -1832,9 +1832,10 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                     out=embedding_output.reshape(-1, self.head_dim),
                 )
             return output
-        if self._is_cpu_offloaded:
-            # Cascade: the resident tiers are gathered here, the rows beyond
-            # them arrive from the worker in the shared output buffer.
+        if self._is_cpu_offloaded and self._keeps_local_tables:
+            # Only cascade merges resident tiers with the worker's rows.
+            # Hybrid decode uses the complete local table and submits no
+            # remote request, so it must not capture a wait on that result.
             remote_rows = self.wait_offloaded_output(hidden_states, num_tokens)
             return self.ngram_embedding(ngram_ids, remote_rows=remote_rows).flatten(-2)
         return self.ngram_embedding(ngram_ids).flatten(-2)

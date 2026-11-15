@@ -921,6 +921,25 @@ class QSAStateBackend(AttentionBackend):
         return (0, 1, 2, 3)
 
 
+def is_mtp_draft_prefix(prefix: str) -> bool:
+    return "mtp" in prefix.split(".")
+
+
+def qsa_draft_dcp_sharded(vllm_config: VllmConfig) -> bool:
+    """Shard the MTP draft with the target in long-context M5 deployments."""
+    # Like the neighbouring helpers, read the optional configs defensively:
+    # draft loaders also build specs from partial configurations.
+    spec = getattr(vllm_config, "speculative_config", None)
+    kernel_config = getattr(vllm_config, "kernel_config", None)
+    long_context = getattr(kernel_config, "long_context_kv", None)
+    return bool(
+        getattr(spec, "method", None) == "mtp"
+        and vllm_config.parallel_config.decode_context_parallel_size > 1
+        and getattr(kernel_config, "qsa_dcp_index_shard", False)
+        and getattr(long_context, "enabled", False)
+    )
+
+
 def qsa_dcp_block_geometry(
     vllm_config: VllmConfig, prefix: str
 ) -> tuple[int, int, bool]:
@@ -934,8 +953,8 @@ def qsa_dcp_block_geometry(
     prefix-cache and recurrent-state granularity match DCP1. The target main
     K/V is sharded: each rank holds ``block_size // dcp`` slots of it, and the
     allocator packs ``dcp`` such layers into one physical page, the page a
-    recurrent state needs. The standalone MTP drafter keeps its entire QSA cache
-    replicated, and every selector covers the full span on each rank.
+    recurrent state needs. The MTP drafter follows the target in long-context
+    M5 deployments and otherwise keeps its main K/V replicated.
     """
     block_size = vllm_config.cache_config.block_size
     dcp = vllm_config.parallel_config.decode_context_parallel_size
@@ -945,11 +964,11 @@ def qsa_dcp_block_geometry(
         raise ValueError(
             f"Qwen4Exp QSA block size {block_size} must divide over DCP {dcp}"
         )
-    is_draft = "mtp" in prefix.split(".")
+    replicated = is_mtp_draft_prefix(prefix) and not qsa_draft_dcp_sharded(vllm_config)
     return (
-        block_size if is_draft else block_size // dcp,
+        block_size if replicated else block_size // dcp,
         block_size,
-        not is_draft,
+        not replicated,
     )
 
 
@@ -958,21 +977,23 @@ def qsa_index_dcp_sharded(
 ) -> bool:
     """Whether this compressed indexer cache is sharded over the DCP group.
 
-    Only the target indexer is sharded (``kernel_config.qsa_dcp_index_shard``);
-    the MTP draft keeps a replicated indexer. Each scheduler block must hold a
-    whole number of groups per rank so local pages align with global blocks.
+    The MTP draft follows the target only in long-context M5 deployments.
+    Each scheduler block must hold a whole number of groups per rank so local
+    pages align with global blocks.
     """
     kernel_config = getattr(vllm_config, "kernel_config", None)
     if not getattr(kernel_config, "qsa_dcp_index_shard", False):
         return False
     dcp = vllm_config.parallel_config.decode_context_parallel_size
-    if dcp <= 1 or "mtp" in prefix.split("."):
+    if dcp <= 1:
+        return False
+    draft_sharded = qsa_draft_dcp_sharded(vllm_config)
+    if is_mtp_draft_prefix(prefix) and not draft_sharded:
         return False
     spec = getattr(vllm_config, "speculative_config", None)
     method = getattr(spec, "method", None) if spec is not None else None
-    if method is not None and "mtp" in str(method):
-        # MTP steps reuse the target's global selection and keep a replicated
-        # draft indexer; that combination has not been qualified.
+    if method is not None and "mtp" in str(method) and not draft_sharded:
+        # Outside long-context M5, the draft indexer remains replicated.
         raise ValueError("QSA indexer DCP sharding does not support MTP drafting yet")
     from vllm.platforms import current_platform
 
@@ -1105,6 +1126,8 @@ class QSAKeyStateCache(_QSAStateCache):
             head_size=self.head_size,
             head_size_v=0,
             dtype=self.dtype,
+            # A compression group needs four consecutive raw keys, so the
+            # ring stays replicated even when the draft main/index is sharded.
             dcp_sharded=False,
         )
 

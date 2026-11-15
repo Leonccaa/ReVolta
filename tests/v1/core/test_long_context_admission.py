@@ -36,7 +36,7 @@ from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
-from .long_context_kv_utils import POOL_BLOCK_BYTES, SPAN, production_specs
+from .long_context_kv_utils import POOL_BLOCK_BYTES, SPAN, mtp_specs, production_specs
 from .test_scheduler_kv_capacity import make_config, step
 
 pytestmark = pytest.mark.cpu_test
@@ -52,6 +52,7 @@ def build(
     prefix_caching: bool = True,
     reserve_full_isl: bool = False,
     speculative_tokens: int = 0,
+    speculative_method: str = "dflash",
     async_scheduling: bool = False,
     with_connector: bool = False,
 ):
@@ -61,7 +62,7 @@ def build(
     # Set before planning: the state geometry covers an in-flight frame.
     config.scheduler_config.async_scheduling = async_scheduling
     if speculative_tokens:
-        config.speculative_config.method = "dflash"
+        config.speculative_config.method = speculative_method
     config.scheduler_config.max_num_seqs = max_num_seqs
     config.scheduler_config.scheduler_reserve_full_isl = reserve_full_isl
     config.cache_config.enable_prefix_caching = prefix_caching
@@ -77,8 +78,12 @@ def build(
                 # second physical CPU backing to merge into its HOST budget.
                 kv_connector_extra_config={},
             )
-    specs = production_specs(
-        speculative_blocks=speculative_tokens, drafter=bool(speculative_tokens)
+    specs = (
+        mtp_specs(replay=False)
+        if speculative_tokens and speculative_method == "mtp"
+        else production_specs(
+            speculative_blocks=speculative_tokens, drafter=bool(speculative_tokens)
+        )
     )
     (worker,) = get_kv_cache_configs(
         config, [specs], [PHYSICAL_BLOCKS * POOL_BLOCK_BYTES]

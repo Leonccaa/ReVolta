@@ -480,10 +480,24 @@ class SpeculativeConfig:
     dflash2_lookup: DFlash2LookupConfig | None = None
     """Native seven-token GPU lookup configuration; runtime integration is pending."""
 
+    gdn_state_replay: bool | None = None
+    """Replay accepted target GDN inputs for MTP on SM70 with Model Runner V2,
+    synchronous scheduling and align caching. None keeps MTP replay off.
+    DFlash continues to use sm70_dflash2.spec_state_replay.
+    """
+
+    gdn_state_replay_graph: bool | None = None
+    """Capture accepted-state replay for FULL verify shapes; mixed steps are eager.
+
+    None uses sm70_dflash2.spec_state_replay_graph for DFlash and True for
+    other methods. An explicit value overrides the legacy graph switch.
+    Only effective when GDN state replay resolves on.
+    """
+
     gdn_spec_state_replay: bool = Field(default=False, init=False)
     """Resolved by VllmConfig: GDN layers replay accepted tokens rather than
-    keeping one state block per speculative position
-    (sm70_dflash2.spec_state_replay)."""
+    keeping one state block per speculative position (gdn_state_replay for MTP,
+    or sm70_dflash2.spec_state_replay for DFlash)."""
 
     @model_validator(mode="wrap")
     @classmethod
@@ -609,6 +623,10 @@ class SpeculativeConfig:
         result = handler(self)
         if self.dflash2_lookup is None or not self.dflash2_lookup.enabled:
             result.pop("dflash2_lookup", None)
+        if self.gdn_state_replay is None:
+            result.pop("gdn_state_replay", None)
+        if self.gdn_state_replay_graph is None:
+            result.pop("gdn_state_replay_graph", None)
         return result
 
     def to_worker_payload(self) -> dict[str, Any]:
@@ -791,6 +809,8 @@ class SpeculativeConfig:
         # Listed only when on, so speculative methods without it keep their keys.
         if self.gdn_spec_state_replay:
             factors.append(("gdn_spec_state_replay", True))
+            if self.gdn_state_replay_graph is not None:
+                factors.append(("gdn_state_replay_graph", self.gdn_state_replay_graph))
         # Eagle3 and extract_hidden_states affect the computation graph because
         # they return intermediate hidden states in addition to the final hidden state.
         uses_aux_hidden_states = (
@@ -2014,6 +2034,12 @@ class SpeculativeConfig:
         if self.gdn_spec_state_replay:
             return 0
         return self.num_speculative_state_tokens()
+
+    def gdn_replay_graph_enabled(self) -> bool:
+        """Resolve the graph switch without borrowing DFlash policy for MTP."""
+        if self.gdn_state_replay_graph is not None:
+            return self.gdn_state_replay_graph
+        return self.sm70_dflash2.spec_state_replay_graph if self.use_dflash() else True
 
     def uses_draft_model(self) -> bool:
         return self.method == "draft_model"

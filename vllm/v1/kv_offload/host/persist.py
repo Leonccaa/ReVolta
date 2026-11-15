@@ -911,10 +911,12 @@ class HostPageSsd:
     ) -> FlushReport:
         """Shutdown step 4: write unpersisted READY pages, newest first.
 
-        The budget is best effort. At its end no new page is submitted and
-        queued writes are cancelled; writes already started may drain for the
-        IO grace period. A write that still does not finish quarantines the
-        region (no unmap, no unlink) instead of hanging shutdown.
+        The budget is best effort: pages are submitted until it ends, at most
+        until the IO grace period before ``deadline``; queued writes are then
+        cancelled and writes already started drain for the grace period. A
+        zero or exhausted budget submits nothing new. Unwritten pages miss on
+        the next start. A write that still does not finish quarantines the
+        region (no unmap) instead of hanging shutdown.
         """
         if self.unit_store is not None:
             return self.unit_store.final_flush(budget_s, deadline, io_grace_s)
@@ -931,7 +933,8 @@ class HostPageSsd:
             return report
         flush_deadline = start + max(0.0, budget)
         if deadline is not None:
-            flush_deadline = min(flush_deadline, deadline)
+            # IO started before the end still gets its grace before the deadline.
+            flush_deadline = min(flush_deadline, deadline - max(0.0, grace))
         grace_deadline = flush_deadline + grace
         if deadline is not None:
             grace_deadline = min(grace_deadline, deadline)
@@ -1052,7 +1055,7 @@ class HostPageSsd:
             self._limiter.stopped.set()
             logger.error(
                 "Host KV SSD IO did not finish; quarantining %d rows "
-                "(region kept mapped and linked)",
+                "(region kept mapped)",
                 len(self._jobs),
             )
             return

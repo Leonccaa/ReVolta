@@ -233,10 +233,10 @@ class MambaHybridModelState(DefaultModelState):
         )
         assert self._align_mode or not self._spec_state_replay
         self._spec_replay_step: GDNSpecReplayStep | None = None
-        policy = getattr(speculative_config, "sm70_dflash2", None)
         self._spec_replay_graphs = GDNSpecReplayGraphs(
             enabled=self._spec_state_replay
-            and bool(getattr(policy, "spec_state_replay_graph", True))
+            and speculative_config is not None
+            and speculative_config.gdn_replay_graph_enabled()
         )
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:

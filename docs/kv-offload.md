@@ -258,12 +258,11 @@ including time in the queue. Completion polling reports overdue jobs as failed
 after any protected source snapshot finishes. Each page shares the job deadline.
 An active kernel I/O call still has to return before its worker can shut down.
 
-Keep `--shutdown-timeout` positive when this tier is enabled (ReVolta's default is 30;
-upstream vLLM's is 0), and keep `ssd.drain_timeout_s` below it. With
-`--shutdown-timeout 0` a stop that arrives while requests are in flight kills the engine
-process at once: the tier never reaches its bounded drain, and the HTTP server can wait
-for the unfinished requests until the container runtime kills it. This affects every
-deployment, with or without a disk tier.
+Set a positive `--shutdown-timeout` when this tier should drain at shutdown (the
+default is 0, as upstream vLLM), and keep `ssd.drain_timeout_s` below it. With
+`--shutdown-timeout 0` a stop aborts in-flight requests and stops the engine process at
+once: the tier never reaches its bounded drain, and queued writes are lost (misses on
+the next start).
 
 Counters of a `revolta_fs` tier (pages written, existing, verified, checksum
 failures, pages skipped after a failure in the same chain, modification-time updates,
@@ -287,6 +286,23 @@ QSA main K/V in host memory. Host placement requires the built-in
 `OffloadingConnector`; state and draft prefix transfers still use that connector.
 This development interface does not extend the project's supported deployment
 scope.
+
+An MTP drafter (`speculative_config.method="mtp"`) shares the target's KV cache
+groups, block table and block hashes in this mode. Its main K/V, compressed
+index and raw-key ring stay in GPU history tensors, charged for every history
+ID, and a host row carries the draft's pages next to the target's index pages.
+CPU and SSD prefix hits therefore restore the draft together with the target
+and its recurrent state, through the same host rows, SSD files and shutdown
+path as without a drafter. As with any EAGLE-style drafter, a hit stops one
+block early: a prompt of L tokens reuses at most floor((L-1-S)/S)*S tokens for
+a block of S tokens. With `kernel_config.qsa_dcp_index_shard` and DCP2 the
+draft's main K/V and index are sharded like the target's (the raw-key ring
+stays replicated); index sharding with MTP is not supported outside this mode.
+`speculative_config.gdn_state_replay=true` replays the accepted target GDN
+inputs for MTP, so recurrent layers keep two state blocks per request instead
+of one per draft position; `gdn_state_replay_graph` (default true) captures
+that replay for FULL verify shapes. The SSD tier's content manifest only needs
+the target checkpoint, which also holds the MTP layers.
 
 `hot_pool_gib` and `hot_pool_ratio` are mutually exclusive ways to set a
 **guaranteed minimum number of hot slots**. GiB sizing converts the total

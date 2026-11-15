@@ -1672,7 +1672,8 @@ class UnitSsdStore:
         started = self.ssd.clock()
         end = started + max(0.0, budget)
         if deadline is not None:
-            end = min(end, deadline)
+            # IO started before the end still gets its grace before the deadline.
+            end = min(end, deadline - max(0.0, grace))
         report = FlushReport(planned_budget_s=max(0.0, end - started))
         if self.ssd._closed:
             report.skipped = "closed"
@@ -1689,7 +1690,6 @@ class UnitSsdStore:
         self.flushing = self.ssd._flushing = True
         self.ssd._report, self.ssd._phase = report, "budget"
         self.ssd._poll()
-        self.retention_step()
         self.ssd._discard_queue()
         self.ssd._deferred.clear()
         for req_id in tuple(set(self.requests) | set(self.ssd._rounds)):

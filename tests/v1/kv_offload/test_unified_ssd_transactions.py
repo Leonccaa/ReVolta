@@ -844,7 +844,7 @@ def test_cached_credit_bills_match_live_graph_after_each_ssd_event(env):
     assert_credit()
 
 
-def test_full_queue_skips_source_scans_and_shrink_drains_owners(tmp_path, monkeypatch):
+def test_full_queue_skips_source_scans_and_rate_shrink_keeps_io(tmp_path, monkeypatch):
     import threading
 
     from vllm.v1.kv_offload.host.ssd import _HostTier
@@ -874,13 +874,17 @@ def test_full_queue_skips_source_scans_and_shrink_drains_owners(tmp_path, monkey
         env.store.credit.rate = env.store.credit.floor_rate = 1
         env.store.credit.reconcile(promote=False)
         env.ssd.step()
-        assert txn.failed
-        assert not env.ssd._submit
+        assert not txn.failed
+        assert env.store.credit.bytes == 0
+        assert env.store.credit.q_eff == 2 * ROW
+        assert env.ssd._store_jobs() <= 2
         assert all(txn.owner in env.table.get(h).leases for h in txn.handles.values())
         release.set()
         assert env.settle(lambda: not env.store.writes and not env.ssd._jobs)
+        assert env.store.manifest_ok(unit)
         assert not env.store.cache._pins and not env.store.cache._claims
         assert env.manager.units.recoverable(unit.uid, "cpu")
+        assert env.manager.units.cold_recoverable(unit.uid)
         assert env.store.credit.bytes == 0
         assert_conserved(env.manager)
     finally:

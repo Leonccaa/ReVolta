@@ -193,7 +193,11 @@ def test_state_blocks_follow_the_resolved_flag(replay):
 def _replay_config(**overrides):
     policy = SimpleNamespace(spec_state_replay=None, fused_gdn_verify=False)
     spec = SimpleNamespace(
-        use_dflash=lambda: True, use_dflash_ddtree=lambda: False, sm70_dflash2=policy
+        method="dflash",
+        gdn_state_replay=None,
+        use_dflash=lambda: True,
+        use_dflash_ddtree=lambda: False,
+        sm70_dflash2=policy,
     )
     config = SimpleNamespace(
         speculative_config=spec,
@@ -639,3 +643,24 @@ def test_replay_graphs_capture_on_the_second_full_step(monkeypatch):
         **kw,
     )
     assert eager == [1, 1] and replays == [1]
+
+
+@pytest.mark.parametrize("general", [False, True])
+@pytest.mark.parametrize("geometry", [(4, 12, 128), (16, 48, 128), (1, 2, 16)])
+def test_mixed_qkv_verify_geometry_policy(general, geometry):
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+        QwenGatedDeltaNetAttention,
+    )
+
+    key_heads, value_heads, head_dim = geometry
+    layer = SimpleNamespace(
+        _replay_general_geometry=general,
+        num_k_heads=key_heads,
+        num_v_heads=value_heads,
+        head_k_dim=head_dim,
+        head_v_dim=head_dim,
+        tp_size=1,
+    )
+    assert QwenGatedDeltaNetAttention._mixed_qkv_verify_geometry_supported(layer) == (
+        general or geometry == (4, 12, 128)
+    )

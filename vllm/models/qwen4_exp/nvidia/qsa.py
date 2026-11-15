@@ -64,6 +64,7 @@ from ..common.qsa_cache import (
     QSAForwardMetadata,
     build_qsa_metadata,
     qsa_dcp_block_geometry,
+    qsa_draft_dcp_sharded,
 )
 from .indexer_qsa import QSAIndexer
 from .ops.qsa_coalesce import QSACoalescedExchange, QSACoalesceWorkspace
@@ -94,6 +95,7 @@ class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
         self.replicated_draft = (
             vllm_config.parallel_config.decode_context_parallel_size == 2
             and all("mtp" in name.split(".") for name in layer_names)
+            and not qsa_draft_dcp_sharded(vllm_config)
         )
         if self.replicated_draft:
             max_tokens = vllm_config.scheduler_config.max_num_batched_tokens

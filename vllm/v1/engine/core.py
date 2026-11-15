@@ -192,7 +192,11 @@ class EngineCore:
             host_layout = host_region_layout(kv_cache_config, vllm_config.instance_id)
             host_scheduler = cast(Any, self.scheduler)
             host_scheduler.host_region = host_layout.open(None)
-            # Hand startup name ownership to the scheduler mapping once open.
+            # Every worker mapped the region in initialize_from_config and this
+            # is the last mapping; nothing reopens it by name. Remove the name
+            # now so the kernel frees the backing with the last mapping, even
+            # if every process is killed.
+            host_scheduler.host_region.unlink()
             self._host_region_owner = None
             from vllm.v1.kv_offload.host.persist import create_host_page_ssd
 

@@ -180,6 +180,29 @@ def test_canonical_block_table_does_not_shrink_sharded_page(sharded: bool) -> No
     assert torch.equal(canonical, pages)
 
 
+def test_canonical_block_table_of_a_tp_sharded_indexer_page() -> None:
+    # TP4/DCP2: the indexer page covers 416 of the 832 local main tokens the
+    # shared table counts, yet still names the same physical page.
+    builder = object.__new__(QSAMetadataBuilder)
+    builder.kv_cache_spec = MLAAttentionSpec(
+        block_size=416,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float16,
+        compress_ratio=4,
+        dcp_sharded=True,
+        shard_world=4,
+    )
+    builder.kernel_block_size = 16
+    builder.dcp_world_size = 2
+    builder.reads_sharded_group = True
+    builder.block_table_buffer = torch.empty((2, 4), dtype=torch.int32)
+    expansion = 832 // 16
+    pages = torch.tensor([[3, 9, 4], [6, 1, 8]], dtype=torch.int32)
+    table = (pages[:, :, None] * expansion + torch.arange(expansion)).reshape(2, -1)
+    assert torch.equal(builder._canonical_block_table(table.to(torch.int32)), pages)
+
+
 def test_metadata_carries_index_ownership() -> None:
     fields = qsa_cache.QSAForwardMetadata.__dataclass_fields__
     assert fields["index_dcp_world_size"].default == 1

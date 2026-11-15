@@ -769,16 +769,14 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
         table_counts_local_tokens = (
             self.kv_cache_spec.dcp_sharded or self.reads_sharded_group
         )
-        # A DCP-sharded side page (the sharded indexer) already declares its
-        # rank-local span; only a replicated side page declares the global one.
-        if (
-            table_counts_local_tokens
-            and self.dcp_world_size > 1
-            and not self.kv_cache_spec.dcp_sharded
-        ):
-            if group_block_size % self.dcp_world_size:
-                raise RuntimeError("QSA replicated page must cover whole DCP group")
-            group_block_size //= self.dcp_world_size
+        # The table counts the group's rank-local main tokens. A side page
+        # declares its own span: global for a replicated one, a TP-shard of
+        # it for the sharded indexer. Both map back to the group's local span.
+        if table_counts_local_tokens and self.dcp_world_size > 1:
+            global_span = self.kv_cache_spec.global_block_size(self.dcp_world_size)
+            if global_span % self.dcp_world_size:
+                raise RuntimeError("QSA page must cover whole DCP group")
+            group_block_size = global_span // self.dcp_world_size
         if group_block_size % kernel_block_size:
             raise RuntimeError(
                 "QSA scheduler block size must be divisible by the KV-group "

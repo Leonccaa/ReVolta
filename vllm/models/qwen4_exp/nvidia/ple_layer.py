@@ -852,8 +852,8 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             # device/KV estimate, which can reject not-yet-padded CSA pages.
             host_budget = self._cap_derived_host_budget(table_bytes)
             logger.info(
-                "Qwen4Exp hybrid PLE auto placement: %s of the table go to "
-                "host memory before cache layout resolution",
+                "Qwen4Exp PLE auto placement: %s of the table go to host "
+                "memory (hybrid or long-context host KV placement)",
                 format_gib(host_budget),
             )
         else:

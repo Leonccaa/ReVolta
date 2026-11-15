@@ -288,6 +288,23 @@ QSA main K/V in host memory. Host placement requires the built-in
 This development interface does not extend the project's supported deployment
 scope.
 
+An MTP drafter (`speculative_config.method="mtp"`) shares the target's KV cache
+groups, block table and block hashes in this mode. Its main K/V, compressed
+index and raw-key ring stay in GPU history tensors, charged for every history
+ID, and a host row carries the draft's pages next to the target's index pages.
+CPU and SSD prefix hits therefore restore the draft together with the target
+and its recurrent state, through the same host rows, SSD files and shutdown
+path as without a drafter. As with any EAGLE-style drafter, a hit stops one
+block early: a prompt of L tokens reuses at most floor((L-1-S)/S)*S tokens for
+a block of S tokens. With `kernel_config.qsa_dcp_index_shard` and DCP2 the
+draft's main K/V and index are sharded like the target's (the raw-key ring
+stays replicated); index sharding with MTP is not supported outside this mode.
+`speculative_config.gdn_state_replay=true` replays the accepted target GDN
+inputs for MTP, so recurrent layers keep two state blocks per request instead
+of one per draft position; `gdn_state_replay_graph` (default true) captures
+that replay for FULL verify shapes. The SSD tier's content manifest only needs
+the target checkpoint, which also holds the MTP layers.
+
 `hot_pool_gib` and `hot_pool_ratio` are mutually exclusive ways to set a
 **guaranteed minimum number of hot slots**. GiB sizing converts the total
 per-worker budget, including payload, metadata and shared scratch, into whole

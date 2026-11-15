@@ -813,6 +813,7 @@ def initialize_static_draft_vocab(
             group=tp_group.device_group,
         )
     torch.accelerator.synchronize(device)
+    reduced_head.quant_method.process_weights_after_loading(reduced_head)
 
     fingerprints = payload.get("fingerprints")
     ranking_fingerprint = None

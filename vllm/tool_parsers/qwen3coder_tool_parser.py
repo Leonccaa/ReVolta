@@ -114,7 +114,10 @@ class Qwen3CoderToolParser(ToolParser):
 
     def _reset_streaming_state(self):
         """Reset all streaming state."""
+        # The block cursor also advances over skipped whitespace-only blocks.
         self.current_tool_index = 0
+        self.skipped_tool_blocks = 0
+        self.content_search_start = 0
         self.is_tool_call_started = False
         self.header_sent = False
         self.current_tool_id = None
@@ -140,6 +143,36 @@ class Qwen3CoderToolParser(ToolParser):
         self._string_waiting_header = False
         self._fallback_text = ""
         self._content_chars_sent = 0
+
+    def _current_call_index(self) -> int:
+        """Keep emitted call indices dense while the block cursor skips empties."""
+        return self.current_tool_index - self.skipped_tool_blocks
+
+    def _skip_empty_tool_block(
+        self, current_text: str, block_start_idx: int, block_end_idx: int
+    ) -> DeltaMessage | None:
+        self.current_tool_index += 1
+        self.skipped_tool_blocks += 1
+        self.content_search_start = block_end_idx + len(self.tool_call_end_token)
+        # finish_streaming must not replay the skipped wrapper and whitespace.
+        self._content_chars_sent += self.content_search_start - block_start_idx
+        self.is_tool_call_started = False
+
+        next_start = current_text.find(
+            self.tool_call_start_token, self.content_search_start
+        )
+        if next_start != -1:
+            tail = current_text[self.content_search_start : next_start]
+            if not tail.strip():
+                self._content_chars_sent += len(tail)
+                return None
+        else:
+            tail = current_text[self.content_search_start :]
+            held_prefix = self._trailing_tool_marker_prefix(current_text)
+            if held_prefix:
+                tail = tail[: -len(held_prefix)]
+        # The existing feed loop will consume any following block iteratively.
+        return DeltaMessage(content=tail) if tail else None
 
     def _convert_param_value(
         self, param_value: str, param_name: str, param_config: dict, func_name: str
@@ -434,7 +467,7 @@ class Qwen3CoderToolParser(ToolParser):
 
     def _complete_unstreamed_arguments(self, tool_text: str) -> str | None:
         """Arguments of a function that closed before any of them were sent."""
-        if self.streamed_args_for_tool[self.current_tool_index]:
+        if self.streamed_args_for_tool[self._current_call_index()]:
             return None
         func_start = tool_text.find(self.tool_call_prefix) + len(self.tool_call_prefix)
         func_content_end = tool_text.find(self.function_end_token, func_start)
@@ -457,10 +490,10 @@ class Qwen3CoderToolParser(ToolParser):
                 parsed_tool = self._parse_xml_function_call(
                     func_content, warn_duplicates=False
                 )
-                if parsed_tool and self.current_tool_index < len(
+                if parsed_tool and self._current_call_index() < len(
                     self.prev_tool_call_arr
                 ):
-                    self.prev_tool_call_arr[self.current_tool_index]["arguments"] = (
+                    self.prev_tool_call_arr[self._current_call_index()]["arguments"] = (
                         parsed_tool.function.arguments
                     )
             except Exception:
@@ -470,12 +503,12 @@ class Qwen3CoderToolParser(ToolParser):
                     exc_info=True,
                 )
 
-        if self.current_tool_index < len(self.streamed_args_for_tool):
-            self.streamed_args_for_tool[self.current_tool_index] += "}"
+        if self._current_call_index() < len(self.streamed_args_for_tool):
+            self.streamed_args_for_tool[self._current_call_index()] += "}"
         else:
             logger.warning(
                 "streamed_args_for_tool out of sync: index=%d len=%d",
-                self.current_tool_index,
+                self._current_call_index(),
                 len(self.streamed_args_for_tool),
             )
 
@@ -737,7 +770,7 @@ class Qwen3CoderToolParser(ToolParser):
     def _record_string_delta(self, fragment: str) -> DeltaMessage | None:
         if not fragment:
             return None
-        index = self.current_tool_index
+        index = self._current_call_index()
         self.streamed_args_for_tool[index] += fragment
         # During length truncation expected state is the real JSON prefix,
         # never stale {} and never an invented closed/successful call.
@@ -812,14 +845,16 @@ class Qwen3CoderToolParser(ToolParser):
             previous_text = current_text
             previous_token_ids = current_token_ids
         result.tool_calls = list(calls.values())
-        if self.in_function and self.current_tool_index < len(self.prev_tool_call_arr):
+        if self.in_function and self._current_call_index() < len(
+            self.prev_tool_call_arr
+        ):
             # An unfinished XML call has only the bytes already emitted, not
             # the placeholder {}. Chat must not invent a closing brace on length.
-            self.prev_tool_call_arr[self.current_tool_index]["arguments"] = (
-                self.streamed_args_for_tool[self.current_tool_index]
+            self.prev_tool_call_arr[self._current_call_index()]["arguments"] = (
+                self.streamed_args_for_tool[self._current_call_index()]
             )
-        # Until the first call is committed, all emitted content is a prefix
-        # of current_text. Remember the rest, including partial marker suffixes.
+        # Track consumed text, including skipped empty blocks, so the literal
+        # fallback flushes only the rest, including partial marker suffixes.
         self._fallback_text = current_text
         if result is not None and result.content:
             self._content_chars_sent += len(result.content)
@@ -981,8 +1016,10 @@ class Qwen3CoderToolParser(ToolParser):
             tool_start_candidates = [
                 pos
                 for pos in (
-                    current_text.find(self.tool_call_start_token),
-                    current_text.find(self.tool_call_prefix),
+                    current_text.find(
+                        self.tool_call_start_token, self.content_search_start
+                    ),
+                    current_text.find(self.tool_call_prefix, self.content_search_start),
                 )
                 if pos != -1
             ]
@@ -1012,6 +1049,7 @@ class Qwen3CoderToolParser(ToolParser):
                     and delta_text.strip() == ""
                 ):
                     # We just ended a tool call, skip whitespace
+                    self._content_chars_sent += len(delta_text)
                     return None
                 # Normal content, no tool call
                 return DeltaMessage(content=delta_text)
@@ -1094,7 +1132,7 @@ class Qwen3CoderToolParser(ToolParser):
                     return DeltaMessage(
                         tool_calls=[
                             DeltaToolCall(
-                                index=self.current_tool_index,
+                                index=self._current_call_index(),
                                 id=self.current_tool_id,
                                 function=DeltaFunctionCall(
                                     name=self.current_function_name,
@@ -1104,6 +1142,15 @@ class Qwen3CoderToolParser(ToolParser):
                             )
                         ]
                     )
+            elif (
+                tool_end_idx != -1
+                and not current_text[
+                    tool_start_idx + len(self.tool_call_start_token) : tool_end_idx
+                ].strip()
+            ):
+                return self._skip_empty_tool_block(
+                    current_text, tool_start_idx, tool_end_idx
+                )
             return None
 
         # We've sent header, now handle function body
@@ -1123,27 +1170,27 @@ class Qwen3CoderToolParser(ToolParser):
                     self.json_closed = True
                     self.in_function = False
                     self.accumulated_params = {}
-                    self.prev_tool_call_arr[self.current_tool_index]["arguments"] = (
+                    self.prev_tool_call_arr[self._current_call_index()]["arguments"] = (
                         complete_arguments
                     )
-                    self.streamed_args_for_tool[self.current_tool_index] = (
+                    self.streamed_args_for_tool[self._current_call_index()] = (
                         complete_arguments
                     )
                     return DeltaMessage(
                         tool_calls=[
                             DeltaToolCall(
-                                index=self.current_tool_index,
+                                index=self._current_call_index(),
                                 function=DeltaFunctionCall(
                                     arguments=complete_arguments
                                 ),
                             )
                         ]
                     )
-                self.streamed_args_for_tool[self.current_tool_index] += "{"
+                self.streamed_args_for_tool[self._current_call_index()] += "{"
                 return DeltaMessage(
                     tool_calls=[
                         DeltaToolCall(
-                            index=self.current_tool_index,
+                            index=self._current_call_index(),
                             function=DeltaFunctionCall(arguments="{"),
                         )
                     ]
@@ -1264,16 +1311,16 @@ class Qwen3CoderToolParser(ToolParser):
             if json_fragments:
                 combined = "".join(json_fragments)
 
-                if self.current_tool_index < len(self.streamed_args_for_tool):
-                    self.streamed_args_for_tool[self.current_tool_index] += combined
+                if self._current_call_index() < len(self.streamed_args_for_tool):
+                    self.streamed_args_for_tool[self._current_call_index()] += combined
                     if self._has_streamed_string:
-                        self.prev_tool_call_arr[self.current_tool_index][
+                        self.prev_tool_call_arr[self._current_call_index()][
                             "arguments"
-                        ] = self.streamed_args_for_tool[self.current_tool_index]
+                        ] = self.streamed_args_for_tool[self._current_call_index()]
                 else:
                     logger.warning(
                         "streamed_args_for_tool out of sync: index=%d len=%d",
-                        self.current_tool_index,
+                        self._current_call_index(),
                         len(self.streamed_args_for_tool),
                     )
 
@@ -1288,7 +1335,7 @@ class Qwen3CoderToolParser(ToolParser):
                 return DeltaMessage(
                     tool_calls=[
                         DeltaToolCall(
-                            index=self.current_tool_index,
+                            index=self._current_call_index(),
                             function=DeltaFunctionCall(arguments=combined),
                         )
                     ]
@@ -1306,7 +1353,7 @@ class Qwen3CoderToolParser(ToolParser):
                 result = DeltaMessage(
                     tool_calls=[
                         DeltaToolCall(
-                            index=self.current_tool_index,
+                            index=self._current_call_index(),
                             function=DeltaFunctionCall(arguments="}"),
                         )
                     ]

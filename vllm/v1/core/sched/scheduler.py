@@ -3555,9 +3555,9 @@ class Scheduler(SchedulerInterface):
                 and ssd is not None
                 and any(any(j < 0 for j in p.io) for p in pages.pages)
             ):
-                # transfer regression: an SSD transfer may still touch the rows. Keep
-                # the
-                # region mapped and linked rather than risk a fault.
+                # An SSD transfer may still touch the rows: keep the region
+                # mapped rather than risk a fault. Its name was removed at
+                # startup, so process exit still frees the backing.
                 logger.error(
                     "Host KV region %s kept after SSD IO quarantine",
                     getattr(self.host_region, "mmap_path", "?"),

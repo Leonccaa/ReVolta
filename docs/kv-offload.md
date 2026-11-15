@@ -258,12 +258,11 @@ including time in the queue. Completion polling reports overdue jobs as failed
 after any protected source snapshot finishes. Each page shares the job deadline.
 An active kernel I/O call still has to return before its worker can shut down.
 
-Keep `--shutdown-timeout` positive when this tier is enabled (ReVolta's default is 30;
-upstream vLLM's is 0), and keep `ssd.drain_timeout_s` below it. With
-`--shutdown-timeout 0` a stop that arrives while requests are in flight kills the engine
-process at once: the tier never reaches its bounded drain, and the HTTP server can wait
-for the unfinished requests until the container runtime kills it. This affects every
-deployment, with or without a disk tier.
+Set a positive `--shutdown-timeout` when this tier should drain at shutdown (the
+default is 0, as upstream vLLM), and keep `ssd.drain_timeout_s` below it. With
+`--shutdown-timeout 0` a stop aborts in-flight requests and stops the engine process at
+once: the tier never reaches its bounded drain, and queued writes are lost (misses on
+the next start).
 
 Counters of a `revolta_fs` tier (pages written, existing, verified, checksum
 failures, pages skipped after a failure in the same chain, modification-time updates,

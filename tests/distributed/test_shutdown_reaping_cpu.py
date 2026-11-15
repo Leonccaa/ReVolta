@@ -411,8 +411,13 @@ def test_cli_exposes_reap_budget_without_changing_shutdown_default(value):
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
     argv = [] if value is None else ["--shutdown-reap-timeout", str(value)]
     args = EngineArgs.from_cli_args(parser.parse_args(argv))
-    assert args.shutdown_timeout == 30
+    assert args.shutdown_timeout == 0
     assert args.shutdown_reap_timeout == value
+    # Capped by the default shutdown_timeout of 0.
+    assert reaping.process_reap_timeout(args) == 0
+    args = EngineArgs.from_cli_args(
+        parser.parse_args([*argv, "--shutdown-timeout", "30"])
+    )
     assert reaping.process_reap_timeout(args) == (
         30 if value is None else min(30, value)
     )

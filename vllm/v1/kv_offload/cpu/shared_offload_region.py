@@ -234,6 +234,13 @@ class SharedOffloadRegion:
             except Exception:
                 logger.warning("Failed to close fd %s", self.fd, exc_info=True)
             self.fd = None
+        self.unlink()
+
+    def unlink(self) -> None:
+        """Remove the name if this mapping owns it; mappings stay valid.
+
+        The kernel frees the backing when the last mapping goes away.
+        """
         # Engine shutdown stops workers before the scheduler. The scheduler
         # therefore owns final unlink even if a worker won the creation race.
         if (

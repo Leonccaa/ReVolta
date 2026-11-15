@@ -52,12 +52,14 @@ or disable custom all-reduce with `--disable-custom-all-reduce`.
   Waiting for incoming work does not count as a stall: the timeout window restarts when
   the process resumes. This is a diagnostic aid, not a recovery mechanism: the process is
   not restarted or killed.
-- **`--shutdown-timeout 30` (ReVolta default since 0.2.0; upstream vLLM: 0).** On SIGTERM
-  the engine lets in-flight requests run for up to this many seconds, then aborts the rest
-  and answers them. With `0` the engine process is stopped at once: requests still in
-  flight can stay unanswered until the container runtime kills the server, and CPU
-  offload cleanup does not run (see [Support and known limits](known-limits.md)). Keep the
-  container stop grace period (for example `docker stop --time 120`) above this value.
+- **`--shutdown-timeout` (default `0`, as upstream vLLM).** With `0` a stop aborts
+  in-flight requests and stops the engine at once; the host KV SSD final flush is skipped.
+  A positive value lets in-flight requests run for up to that many seconds (with host
+  KV, that value minus 5 s), then aborts the rest. With the host KV SSD tier the time
+  left in that window is used for a best-effort final flush: pages are written until it
+  ends, and pages not written are misses on the next start. Keep the container stop grace
+  period (for example `docker stop --time 120`) above this value plus
+  `--shutdown-reap-timeout`.
 - **`--shutdown-reap-timeout`** controls the process-exit wait after a worker or
   local EngineCore reports terminal retirement. It defaults to `--shutdown-timeout`
   and is capped by that value; `0` disables the extra wait. A receipt grants time

@@ -631,3 +631,41 @@ def test_restart_after_reset_rebuilds_retention_in_restored_epoch(tmp_path):
         assert_conserved(reader.manager)
     finally:
         reader.ssd.close(io_grace_s=5)
+
+
+@pytest.mark.parametrize("expired_deadline", [False, True])
+def test_final_flush_without_budget_does_not_refresh_retention(
+    tmp_path, monkeypatch, expired_deadline
+):
+    env = UnitEnv(tmp_path, pages=100, latest_only=True)
+    try:
+        unit = env_point(env, 2)
+        env.persist(unit)
+        point(env.manager, [0, 1, 2, 3])
+        point(env.manager, [0, 1, 2, 4])
+        env.manager.retention.refresh()
+        assert env.store.retention_updates_pending()
+        assert (
+            not env.ssd._jobs and not env.store.manifest_jobs and not env.store.writes
+        )
+        pool = env.ssd._tier._pool
+        enqueue = pool.enqueue_store
+        submissions = []
+
+        def observe(*args, **kwargs):
+            submissions.append(args[0])
+            return enqueue(*args, **kwargs)
+
+        monkeypatch.setattr(pool, "enqueue_store", observe)
+        report = env.ssd.final_flush(
+            budget_s=0, deadline=env.ssd.clock() if expired_deadline else None
+        )
+        assert submissions == []
+        assert report.skipped == "no budget"
+        assert report.other_io_stuck == 0 and not report.quarantined
+        assert (
+            not env.ssd._jobs and not env.store.manifest_jobs and not env.store.writes
+        )
+        assert env.store.retention_updates_pending()
+    finally:
+        env.ssd.close(io_grace_s=5)

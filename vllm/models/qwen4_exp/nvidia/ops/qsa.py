@@ -1387,14 +1387,14 @@ def _sm70_qsa_lexicographic_topk_op():
     return torch.ops._C.qsa_lexicographic_topk
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["NP", "NL"])
 def _shared_key_local_inputs_kernel(
     Positions,
     Lengths,
     OutPositions,
     OutLengths,
-    NP: tl.constexpr,
-    NL: tl.constexpr,
+    NP,
+    NL,
     C: tl.constexpr,
     WORLD: tl.constexpr,
     RANK: tl.constexpr,

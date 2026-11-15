@@ -108,6 +108,38 @@ def test_fused_shard_metadata_empty_and_noncontiguous_fallback(monkeypatch):
         assert all(torch.equal(a, b) for a, b in zip(expected, actual))
 
 
+@pytest.mark.parametrize("n", [1, 16, 129, 257])
+def test_commit_slots_runtime_count_matches_reference(n):
+    from vllm.models.qwen4_exp.nvidia.host_kv.history_kernels import commit_slots
+
+    span, block = 16, 128
+    slots = torch.arange(n + 8, dtype=torch.int64) + span
+    slots[6::7] = -1  # Padded writes do not publish a row.
+    ready = torch.zeros(n + 8 + span, dtype=torch.uint8)
+    page_of = torch.ones((ready.numel() + span - 1) // span, dtype=torch.int64)
+    page_of[0::2] = 0
+    expected = ready.clone()
+    for slot in slots[:n].tolist():
+        if slot >= 0 and page_of[slot // span] > 0:
+            expected[slot] = 1
+
+    commit_slots[((n + block - 1) // block,)](slots, ready, page_of, span, n, block)
+    assert torch.equal(ready, expected)
+
+
+@pytest.mark.parametrize("np,nl", [(1, 1), (16, 2), (129, 17), (257, 129)])
+def test_fused_shard_metadata_runtime_counts_match_reference(monkeypatch, np, nl):
+    from vllm.models.qwen4_exp.nvidia.ops.qsa import _shared_key_local_inputs
+
+    positions = torch.arange(np, dtype=torch.int64) * 3 - 4
+    lengths = torch.arange(nl, dtype=torch.int32) * 7
+    monkeypatch.setenv("REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED", "0")
+    expected = _shared_key_local_inputs(positions, lengths, 4, 2, 1)
+    monkeypatch.setenv("REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED", "1")
+    actual = _shared_key_local_inputs(positions, lengths, 4, 2, 1)
+    assert all(torch.equal(a, b) for a, b in zip(actual, expected))
+
+
 class _CommitKernelSpy:
     """Count ``commit_slots`` launches (the unfused publish path)."""
 

@@ -90,7 +90,7 @@ class ActiveKVConnector(KVConnector):
         # the proposal, so the step cannot retire before the proposal does.
         self._draft_in_host = False
         self._seal_event = None
-        self._late_seals: tuple[list[Any], bool, bool, Any] | None = None
+        self._late_seals: tuple[list[Any], bool, bool, Any, int | None] | None = None
         # Connector worker owns the registered store, including test doubles.
         worker = getattr(self.kv_connector, "connector_worker", None)
         if worker is not None and getattr(worker, "_host_history", None) is not None:
@@ -202,9 +202,6 @@ class ActiveKVConnector(KVConnector):
 
         if step is not None and self._host_event is not None:
             self._host_event.synchronize()
-            if getattr(self, "_draft_in_host", False) and self._seal_event is not None:
-                # The proposal's host accesses precede the after-draft seal.
-                self._seal_event.synchronize()
         elif step is not None and self._host_store is not None:
             # No-forward and aborted producer steps still need a physical
             # retirement fence before a rank can advance the watermark.
@@ -217,21 +214,32 @@ class ActiveKVConnector(KVConnector):
         assert isinstance(meta, OffloadingWorkerMetadata)
         rank = 1 << get_world_group().rank_in_group
         if late is not None:
-            # The previous step's seal, queued after its draft proposal.
-            tickets, sealed, seal_failed, event = late
+            # The previous step's seal, queued after its draft proposal; with
+            # the draft in the host store, that step retires here as well.
+            tickets, sealed, seal_failed, event, late_step = late
             if event is not None:
                 event.synchronize()
             self._report_seals(meta, rank, tickets, sealed, seal_failed)
+            if late_step is not None:
+                meta.completed_steps[late_step] = rank
             self._late_seals = None
         if step is None:
             output.kv_connector_worker_meta = meta
             return
+        # A host draft reads and writes pages until the after-draft fence: its
+        # step retires with the next receipt instead of waiting here.
+        draft_step = (
+            getattr(self, "_draft_in_host", False)
+            and getattr(self, "_seal_event", None) is not None
+            and not final
+        )
         if getattr(self, "_seal_after_draft", False) and not final:
             self._late_seals = (
                 step.seals,
                 self._host_sealed,
                 self._host_seal_failed,
                 self._seal_event,
+                step.step if draft_step else None,
             )
         else:
             event = getattr(self, "_seal_event", None)
@@ -240,7 +248,8 @@ class ActiveKVConnector(KVConnector):
             self._report_seals(
                 meta, rank, step.seals, self._host_sealed, self._host_seal_failed
             )
-        meta.completed_steps[step.step] = rank
+        if not draft_step:
+            meta.completed_steps[step.step] = rank
         shadow = getattr(getattr(self, "_host_store", None), "shadow", None)
         if shadow is not None:
             lagged = shadow.harvest(step.step)

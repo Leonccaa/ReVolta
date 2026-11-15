@@ -370,18 +370,70 @@ def test_mtp_seal_follows_the_draft_and_reports_with_the_next_receipt(monkeypatc
     assert meta.seal_results == {second: (1, 0, 0)}
 
 
-def test_step_with_a_host_draft_retires_after_the_proposal(monkeypatch):
+def _labelled_fences(conn, events):
+    """Every fence gets its own name, so a test sees which one was awaited."""
+    count = {"n": 0}
+
+    def fence():
+        count["n"] += 1
+        name = f"fence-{count['n']}"
+        return SimpleNamespace(synchronize=lambda: events.append(name))
+
+    conn._host_store.fence = fence
+
+
+def _forward_step(conn, number):
+    ticket = SealTicket(number, number, 1, PageHandle(number, 0), b"key", number)
+    conn._host_step = HostKVStep(number, [], [ticket])
+    conn._host_sealed = conn._host_seal_failed = False
+    conn._host_event = conn._seal_event = None
+    conn.seal_host_step()  # target fence
+    conn.seal_host_step(after_draft=True)  # draft fence, after the proposal
+
+
+def test_step_with_a_host_draft_retires_with_the_next_receipt(monkeypatch):
     events: list[str] = []
     conn, _ = connector(monkeypatch, events)
     conn._seal_after_draft = conn._draft_in_host = True
-    conn._seal_event = conn._late_seals = None
-    conn.seal_host_step()
-    conn.seal_host_step(after_draft=True)
-    assert events == ["seal-d2h"]
+    conn._late_seals = None
+    _labelled_fences(conn, events)
+
+    _forward_step(conn, 1)  # fences 1 (target) and 2 (draft)
     meta = conn.post_forward(set()).kv_connector_worker_meta
-    # Both the target fence and the fence after the draft retired first.
-    assert events == ["seal-d2h", "host-visible", "host-visible"]
+    # The step waits for the target only; the draft's host accesses are still
+    # in flight, so the step is not reported complete yet.
+    assert events == ["seal-d2h", "fence-1"]
+    assert meta.completed_steps == {}
+
+    _forward_step(conn, 2)  # fences 3 and 4
+    meta = conn.post_forward(set()).kv_connector_worker_meta
+    # Step 1 retires once its draft fence has been awaited.
+    assert events.index("fence-2") > events.index("fence-3")
     assert meta.completed_steps == {1: 1}
+
+    conn.kv_connector.connector_worker = SimpleNamespace(
+        drain=lambda: (set(), set(), None)
+    )
+    meta = conn.drain_host_kv().kv_connector_worker_meta
+    # The drain waits for step 2's draft fence and reports it.
+    assert events.index("fence-4") > events.index("fence-2")
+    assert meta.completed_steps == {2: 1}
+
+
+def test_idle_step_takes_the_deferred_step_with_it(monkeypatch):
+    events: list[str] = []
+    conn, _ = connector(monkeypatch, events)
+    conn._seal_after_draft = conn._draft_in_host = True
+    conn._late_seals = None
+    _labelled_fences(conn, events)
+    _forward_step(conn, 1)
+    assert conn.post_forward(set()).kv_connector_worker_meta.completed_steps == {}
+    # A step without a forward has no draft: it reports itself and step 1.
+    conn._host_step = HostKVStep(2, [], [])
+    conn._host_sealed = conn._host_seal_failed = False
+    conn._host_event = conn._seal_event = None
+    meta = conn.post_forward(set()).kv_connector_worker_meta
+    assert meta.completed_steps == {1: 1, 2: 1}
 
 
 def test_mtp_step_without_its_draft_seal_reports_compute_failure(monkeypatch):

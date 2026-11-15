@@ -1337,6 +1337,27 @@ def _use_sm70_qsa_indexer_cublas(
     )
 
 
+def _qsa_cublas_route_columns(
+    score_columns: int,
+    max_seq_len: int | None,
+    compress_ratio: int,
+    world: int,
+    block_topk: int,
+    capacity_columns: int,
+) -> int:
+    """Width the cuBLAS-or-paged choice is made on.
+
+    The work threshold was set for indexer shards of at most DCP width. A wider
+    split (the TP group) keeps the route of the DCP split: cuBLAS and the paged
+    scorer need not agree on the last bit, so a route that flipped with the
+    shard width could change which near-tied group is selected.
+    """
+    if max_seq_len is None or world <= 2:
+        return score_columns
+    live = -(-(max_seq_len // compress_ratio) // 2)
+    return min(capacity_columns * world // 2, max(block_topk, live))
+
+
 def _qsa_indexer_cublas_work_supported(rows: int, columns: int) -> bool:
     return rows * columns >= _SM70_INDEXER_CUBLAS_MIN_SCORE_ELEMENTS
 
@@ -1873,7 +1894,17 @@ def qsa_select_paged_tokens(
             else int(all_visible.max().item())
         )
         score_columns = min(capacity_columns, max(block_topk, live_blocks))
-        if _qsa_indexer_cublas_work_supported(rows, score_columns):
+        if _qsa_indexer_cublas_work_supported(
+            rows,
+            _qsa_cublas_route_columns(
+                score_columns,
+                max_seq_len,
+                compress_ratio,
+                world,
+                block_topk,
+                capacity_columns,
+            ),
+        ):
             logger.info_once(
                 "Using SM70 QSA indexer prefill cuBLAS path "
                 "(single-request FP16, rows=%d, score_tile_mib=%d).",

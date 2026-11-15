@@ -1416,3 +1416,39 @@ def test_coalesce_needs_a_pair_sharded_index(tp: int, fails: bool) -> None:
             require_dcp2_index_world(config)
     else:
         require_dcp2_index_world(config)
+
+
+@pytest.mark.parametrize("max_seq", [4096, 6528, 8206, 12000, 16384, 100000])
+@pytest.mark.parametrize("rows", [512, 700, 1024, 1678, 2047, 2048, 6528])
+def test_cublas_route_does_not_flip_with_a_wider_split(rows: int, max_seq: int) -> None:
+    from vllm.models.qwen4_exp.nvidia.ops.qsa import (
+        _qsa_cublas_route_columns,
+        _qsa_indexer_cublas_work_supported,
+    )
+
+    ratio, topk, capacity = 4, 512, 1 << 20
+
+    def route(world: int) -> bool:
+        live = -(-(max_seq // ratio) // world)
+        local = min(capacity // world, max(topk, live))
+        columns = _qsa_cublas_route_columns(
+            local, max_seq, ratio, world, topk, capacity // world
+        )
+        return _qsa_indexer_cublas_work_supported(rows, columns)
+
+    # The DCP-sized split decides as before; four ranks decide the same way.
+    assert route(4) == route(2)
+
+
+def test_second_prefill_chunk_of_an_8k_prompt_keeps_cublas_at_four_ranks() -> None:
+    from vllm.models.qwen4_exp.nvidia.ops.qsa import (
+        _qsa_cublas_route_columns,
+        _qsa_indexer_cublas_work_supported,
+    )
+
+    # 1678 rows ending at position 8206: 513 local columns at four ranks would
+    # fall under the work threshold, 1026 at two ranks reach it.
+    rows, max_seq = 1678, 8206
+    assert not _qsa_indexer_cublas_work_supported(rows, 513)
+    columns = _qsa_cublas_route_columns(513, max_seq, 4, 4, 512, 1 << 18)
+    assert _qsa_indexer_cublas_work_supported(rows, columns)

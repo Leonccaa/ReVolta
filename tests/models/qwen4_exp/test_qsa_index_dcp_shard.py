@@ -25,10 +25,13 @@ TARGET = "model.layers.3.self_attn.indexer.compressed_key_cache"
 DRAFT = "mtp.layers.0.self_attn.indexer.compressed_key_cache"
 
 
-def _config(shard: bool, block_size: int = 1664, dcp: int = 2):
+def _config(shard: bool, block_size: int = 1664, dcp: int = 2, tp: int | None = None):
     return SimpleNamespace(
         cache_config=SimpleNamespace(block_size=block_size),
-        parallel_config=SimpleNamespace(decode_context_parallel_size=dcp),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=dcp,
+            tensor_parallel_size=dcp if tp is None else tp,
+        ),
         kernel_config=SimpleNamespace(qsa_dcp_index_shard=shard),
     )
 
@@ -58,6 +61,23 @@ def test_sharded_target_indexer_geometry() -> None:
     assert spec.storage_block_size == 208
     replicated = _side(TARGET).get_kv_cache_spec(_config(False))
     assert spec.page_size_bytes * 2 == replicated.page_size_bytes
+
+
+def test_indexer_shards_over_the_tp_group() -> None:
+    config = _config(True, block_size=1664, dcp=2, tp=4)
+    spec = _side(TARGET).get_kv_cache_spec(config)
+    assert spec.dcp_sharded and spec.shard_world == 4
+    assert spec.block_size == 416 and spec.storage_block_size == 104
+    # One scheduler block still spans the same global tokens as the main K/V.
+    assert spec.global_block_size(2) == 1664
+    dcp_only = _side(TARGET).get_kv_cache_spec(_config(True))
+    assert dcp_only.shard_world == 0
+    assert spec.page_size_bytes * 2 == dcp_only.page_size_bytes
+    # Every TP rank of a DCP group owns a disjoint quarter of the groups.
+    assert qsa_cache.qsa_index_shard_world(config) == 4
+    assert qsa_index_dcp_sharded(config, TARGET, 4)
+    with pytest.raises(ValueError, match="divisible"):
+        qsa_index_dcp_sharded(_config(True, block_size=1668, tp=8), TARGET, 4)
 
 
 def test_draft_indexer_stays_replicated() -> None:
@@ -1079,8 +1099,45 @@ def test_uniform_spec_with_sharded_indexer_keeps_main_representative() -> None:
     assert uniform.page_size_bytes == main.page_size_bytes + index.page_size_bytes
 
 
+def test_uniform_spec_with_tp_sharded_indexer_keeps_main_block() -> None:
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, UniformTypeKVCacheSpecs
+
+    main = FullAttentionSpec(
+        block_size=832,
+        num_kv_heads=1,
+        head_size=256,
+        dtype=torch.uint8,
+        dcp_sharded=True,
+    )
+    index = MLAAttentionSpec(
+        block_size=416,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float16,
+        compress_ratio=4,
+        dcp_sharded=True,
+        shard_world=4,
+    )
+    # The indexer comes first: the group must still use the main K/V block.
+    uniform = UniformTypeKVCacheSpecs.from_specs(
+        {"layers.3.attn.indexer.k": index, "layers.3.attn": main}, 2
+    )
+    assert uniform is not None
+    assert uniform.block_size == 832 and uniform.global_block_size(2) == 1664
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=1 << 20),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=2, prefill_context_parallel_size=1
+        ),
+    )
+    # A quarter of the context lives on each rank, in blocks of 416 slots.
+    assert index.max_memory_usage_bytes(config) == (
+        -(-(1 << 20) // 4 // 416) * index.page_size_bytes
+    )
+
+
 def test_builder_injects_this_rank(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(qsa_cache, "_current_dcp_rank", lambda: 1)
+    monkeypatch.setattr(qsa_cache, "_current_tp_rank", lambda: 1)
     spec = MLAAttentionSpec(
         block_size=832,
         num_kv_heads=1,
@@ -1090,7 +1147,9 @@ def test_builder_injects_this_rank(monkeypatch: pytest.MonkeyPatch) -> None:
         dcp_sharded=True,
     )
     config = SimpleNamespace(
-        parallel_config=SimpleNamespace(decode_context_parallel_size=2),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=2, tensor_parallel_size=2
+        ),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=64, max_num_seqs=2),
     )
     from vllm.v1.attention.backend import AttentionMetadataBuilder

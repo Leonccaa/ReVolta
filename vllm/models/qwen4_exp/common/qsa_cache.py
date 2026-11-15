@@ -697,8 +697,10 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             and kv_cache_spec.dcp_sharded
             and self.dcp_world_size > 1
         )
-        self.index_dcp_world_size = self.dcp_world_size if self.index_dcp_sharded else 1
-        self.index_dcp_rank = _current_dcp_rank() if self.index_dcp_sharded else 0
+        self.index_dcp_world_size = (
+            qsa_index_shard_world(vllm_config) if self.index_dcp_sharded else 1
+        )
+        self.index_dcp_rank = _current_tp_rank() if self.index_dcp_sharded else 0
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.token_to_req_buffer = torch.empty(
             max_tokens, dtype=torch.int32, device=device
@@ -1001,18 +1003,35 @@ def qsa_index_dcp_sharded(
         # The AMD QSA path has no sharded scorer or merge.
         raise ValueError("QSA indexer DCP sharding is implemented for NVIDIA GPUs only")
     block_size = vllm_config.cache_config.block_size
-    if block_size % (compress_ratio * dcp):
+    world = qsa_index_shard_world(vllm_config)
+    if block_size % (compress_ratio * world):
         raise ValueError(
-            f"QSA indexer DCP sharding needs block size {block_size} divisible "
-            f"by compress ratio x DCP = {compress_ratio * dcp}"
+            f"QSA indexer sharding needs block size {block_size} divisible "
+            f"by compress ratio x TP = {compress_ratio * world}"
         )
     return True
+
+
+def qsa_index_shard_world(vllm_config: VllmConfig) -> int:
+    """Ranks one sharded compressed indexer is split over: the whole TP group.
+
+    Every TP rank holds all query heads of the replicated index projection, so
+    it can score its own groups; DCP ranks are TP ranks, so this refines the
+    DCP split (rank ``r`` owns groups ``g % tp == r``).
+    """
+    return vllm_config.parallel_config.tensor_parallel_size
 
 
 def _current_dcp_rank() -> int:
     from vllm.distributed import get_dcp_group
 
     return get_dcp_group().rank_in_group
+
+
+def _current_tp_rank() -> int:
+    from vllm.distributed import get_tp_group
+
+    return get_tp_group().rank_in_group
 
 
 class _QSAStateCache(nn.Module, AttentionLayerBase):
@@ -1138,14 +1157,16 @@ class QSACompressedKeyCache(_QSAStateCache):
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         _, side_block_size, _ = qsa_dcp_block_geometry(vllm_config, self.prefix)
         sharded = qsa_index_dcp_sharded(vllm_config, self.prefix, self.compress_ratio)
+        world = qsa_index_shard_world(vllm_config)
         dcp = vllm_config.parallel_config.decode_context_parallel_size
         return MLAAttentionSpec(
-            block_size=side_block_size // dcp if sharded else side_block_size,
+            block_size=side_block_size // world if sharded else side_block_size,
             num_kv_heads=1,
             head_size=self.head_size,
             dtype=self.dtype,
             compress_ratio=self.compress_ratio,
             dcp_sharded=sharded,
+            shard_world=world if sharded and world != dcp else 0,
         )
 
 

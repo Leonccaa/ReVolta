@@ -2340,9 +2340,9 @@ def _merge_sharded_index_blocks(
         packed = torch.cat((score_bits, groups), dim=1)
     if coalesced_exchange is None:
         if all_gather is None:
-            from vllm.distributed import get_dcp_group
+            from vllm.distributed import get_tp_group
 
-            all_gather = lambda t: get_dcp_group().all_gather(t, dim=0)  # noqa: E731
+            all_gather = lambda t: get_tp_group().all_gather(t, dim=0)  # noqa: E731
         if envs.VLLM_QSA_INDEX_SHARD_DEBUG:
             _check_index_shard_plan(rows, block_topk, world, row_keys, all_gather)
         gathered = all_gather(packed.unsqueeze(0))

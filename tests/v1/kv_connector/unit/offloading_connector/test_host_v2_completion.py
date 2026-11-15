@@ -370,6 +370,72 @@ def test_mtp_seal_follows_the_draft_and_reports_with_the_next_receipt(monkeypatc
     assert meta.seal_results == {second: (1, 0, 0)}
 
 
+def _labelled_fences(conn, events):
+    """Every fence gets its own name, so a test sees which one was awaited."""
+    count = {"n": 0}
+
+    def fence():
+        count["n"] += 1
+        name = f"fence-{count['n']}"
+        return SimpleNamespace(synchronize=lambda: events.append(name))
+
+    conn._host_store.fence = fence
+
+
+def _forward_step(conn, number):
+    ticket = SealTicket(number, number, 1, PageHandle(number, 0), b"key", number)
+    conn._host_step = HostKVStep(number, [], [ticket])
+    conn._host_sealed = conn._host_seal_failed = False
+    conn._host_event = conn._seal_event = None
+    conn.seal_host_step()  # target fence
+    conn.seal_host_step(after_draft=True)  # draft fence, after the proposal
+
+
+def test_step_with_a_host_draft_retires_with_the_next_receipt(monkeypatch):
+    events: list[str] = []
+    conn, _ = connector(monkeypatch, events)
+    conn._seal_after_draft = conn._draft_in_host = True
+    conn._late_seals = None
+    _labelled_fences(conn, events)
+
+    _forward_step(conn, 1)  # fences 1 (target) and 2 (draft)
+    meta = conn.post_forward(set()).kv_connector_worker_meta
+    # The step waits for the target only; the draft's host accesses are still
+    # in flight, so the step is not reported complete yet.
+    assert events == ["seal-d2h", "fence-1"]
+    assert meta.completed_steps == {}
+
+    _forward_step(conn, 2)  # fences 3 and 4
+    meta = conn.post_forward(set()).kv_connector_worker_meta
+    # Step 1 retires once its draft fence has been awaited.
+    assert events.index("fence-2") > events.index("fence-3")
+    assert meta.completed_steps == {1: 1}
+
+    conn.kv_connector.connector_worker = SimpleNamespace(
+        drain=lambda: (set(), set(), None)
+    )
+    meta = conn.drain_host_kv().kv_connector_worker_meta
+    # The drain waits for step 2's draft fence and reports it.
+    assert events.index("fence-4") > events.index("fence-2")
+    assert meta.completed_steps == {2: 1}
+
+
+def test_idle_step_takes_the_deferred_step_with_it(monkeypatch):
+    events: list[str] = []
+    conn, _ = connector(monkeypatch, events)
+    conn._seal_after_draft = conn._draft_in_host = True
+    conn._late_seals = None
+    _labelled_fences(conn, events)
+    _forward_step(conn, 1)
+    assert conn.post_forward(set()).kv_connector_worker_meta.completed_steps == {}
+    # A step without a forward has no draft: it reports itself and step 1.
+    conn._host_step = HostKVStep(2, [], [])
+    conn._host_sealed = conn._host_seal_failed = False
+    conn._host_event = conn._seal_event = None
+    meta = conn.post_forward(set()).kv_connector_worker_meta
+    assert meta.completed_steps == {1: 1, 2: 1}
+
+
 def test_mtp_step_without_its_draft_seal_reports_compute_failure(monkeypatch):
     events: list[str] = []
     conn, ticket = connector(monkeypatch, events)
@@ -383,3 +449,63 @@ def test_mtp_step_without_its_draft_seal_reports_compute_failure(monkeypatch):
     meta = conn.post_forward(set()).kv_connector_worker_meta
     assert meta.seal_results == {ticket: (1, 1, 1)}
     assert "seal-d2h" not in events
+
+
+def test_draft_host_layer_does_not_reuse_the_target_write_plan():
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    # A draft layer in the host store writes the draft's own positions; the
+    # staged write plan of the target's prefill rows is cleared before the
+    # proposal (the recursive steps would otherwise copy to the target's rows).
+    source = textwrap.dedent(inspect.getsource(GPUModelRunner.sample_tokens))
+    tree = ast.parse(source)
+    clears = [
+        n.lineno
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Assign)
+        and any(
+            isinstance(t, ast.Attribute) and t.attr == "write_plan" for t in n.targets
+        )
+    ]
+    proposals = [
+        n.lineno
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "propose"
+    ]
+    assert len(clears) == 1 and len(proposals) == 1
+    assert clears[0] < proposals[0]
+
+
+def test_page_of_a_cancelled_request_waits_for_its_host_draft(monkeypatch):
+    events: list[str] = []
+    conn, _ = connector(monkeypatch, events)
+    conn._seal_after_draft = conn._draft_in_host = True
+    conn._late_seals = None
+    _labelled_fences(conn, events)
+    table = HostPageTable(2, 1)  # the zero page and one usable page
+    page = table.reserve()
+    assert page is not None
+    # Step 1 touches the page; the request is cancelled afterwards, and its
+    # draft proposal of step 1 may still be reading and writing the page.
+    table.bind(page, 1, 0, step=1)
+    table.touch(page, 1)
+    table.unbind(page, 1, 0, last_use=1)
+
+    def apply(meta):
+        for step, ranks in sorted(meta.completed_steps.items()):
+            table.complete_step(step, ranks)
+
+    _forward_step(conn, 1)
+    apply(conn.post_forward(set()).kv_connector_worker_meta)
+    assert table.watermark == 0 and "fence-2" not in events
+    # Nothing can take the page while the draft of step 1 is unretired.
+    assert table.reserve() is None
+
+    _forward_step(conn, 2)
+    apply(conn.post_forward(set()).kv_connector_worker_meta)
+    # Step 2's receipt awaited step 1's draft fence first, then reported it.
+    assert "fence-2" in events and table.watermark == 1
+    taken = table.reserve()
+    assert taken is not None and taken.page_id == page.page_id

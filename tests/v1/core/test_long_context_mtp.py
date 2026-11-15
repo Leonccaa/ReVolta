@@ -54,15 +54,14 @@ def build(lc, specs, *, mtp=True):
     return config, cfg
 
 
-@pytest.mark.parametrize("shard_draft", [False, True])
-def test_draft_caches_stay_on_gpu_and_join_the_host_row(shard_draft):
-    specs = mtp_specs(shard_index=shard_draft, shard_draft=shard_draft)
+def test_replicated_draft_stays_on_gpu_and_joins_the_host_row():
+    specs = mtp_specs()
     _, cfg = build(settings(), specs)
     plan = cfg.long_context_plan
     assert plan is not None and not plan.main_kv_on_gpu
-    # Only the target's main K/V moves to the host store.
+    # A replicated draft has its own page geometry: only the target's main K/V
+    # moves to the host store, the draft keeps GPU history tensors.
     assert sorted(cfg.host_kv_layers) == sorted(TARGET_MAIN)
-    # The draft stays in the target's main and ring groups.
     main_group = cfg.host_kv_group_id
     assert main_group is not None
     names = cfg.kv_cache_groups[main_group].layer_names
@@ -88,10 +87,9 @@ def test_draft_caches_stay_on_gpu_and_join_the_host_row(shard_draft):
     assert geo.index_bytes_per_block == sum(geo.index_page_strides) + draft_bytes
 
 
-@pytest.mark.parametrize("shard_draft", [False, True])
-def test_draft_does_not_change_the_state_segment(shard_draft):
+def test_replicated_draft_does_not_change_the_state_segment():
     lc = settings()
-    specs = mtp_specs(shard_index=shard_draft, shard_draft=shard_draft)
+    specs = mtp_specs()
     target = {name: spec for name, spec in specs.items() if "mtp" not in name}
     _, base = build(lc, target, mtp=False)
     _, cfg = build(lc, specs)
@@ -106,6 +104,120 @@ def test_draft_does_not_change_the_state_segment(shard_draft):
         if t.num_blocks == c.long_context_plan.segment_num_blocks()[0]
     )
     assert [shared for _, shared in state(cfg)] == [shared for _, shared in state(base)]
+
+
+def test_sharded_draft_main_is_one_more_host_layer():
+    specs = mtp_specs(shard_index=True, shard_draft=True)
+    target = {name: spec for name, spec in specs.items() if "mtp" not in name}
+    _, base = build(settings(), target, mtp=False)
+    _, cfg = build(settings(draft_main_placement="host"), specs)
+    plan, base_plan = cfg.long_context_plan, base.long_context_plan
+    # The sharded draft main K/V has the target's geometry: it joins the host
+    # store as the last layer, with no GPU tensor and no state-segment page.
+    assert cfg.host_kv_layers == [*TARGET_MAIN, DRAFT]
+    owners = {n for t in cfg.kv_cache_tensors for n in t.shared_by}
+    assert DRAFT not in owners
+    # Its index (and ring) is a padded history tensor beside the target's,
+    # whose pages carry the draft layer's hot slots.
+    index = next(
+        t for t in cfg.kv_cache_tensors if f"{DRAFT}.compressed" in t.shared_by
+    )
+    assert index.shared_by == [f"{DRAFT}.compressed", f"{DRAFT}.compressor_state"]
+    padded = [t for t in cfg.kv_cache_tensors if t.page_stride_bytes is not None]
+    assert len(padded) == len(cfg.host_kv_layers) and padded[-1] is index
+    geo, base_geo = plan.geometry, base_plan.geometry
+    layer_page = specs[DRAFT].page_size_bytes
+    assert geo.hot_layers == len(TARGET_MAIN) + 1
+    assert geo.main_kv_bytes_per_block == base_geo.main_kv_bytes_per_block + layer_page
+    assert geo.hot_slot_bytes // geo.hot_layers == (
+        base_geo.hot_slot_bytes // base_geo.hot_layers
+    )
+    assert geo.shared_slots_per_block == base_geo.shared_slots_per_block > 0
+    assert geo.index_page_strides == (
+        *base_geo.index_page_strides,
+        base_geo.index_page_strides[-1],
+    )
+    assert geo.state_bytes_per_block == base_geo.state_bytes_per_block
+    # Host row: 13 main K/V layers and 13 index pages.
+    layout = host_region_layout(cfg, "test")
+    assert layout.main_bytes == geo.main_kv_bytes_per_block
+    assert len(layout.index_bytes) == len(cfg.host_kv_layers)
+    assert geo.host_bytes_per_block == layout.worker_bytes * layout.num_workers
+    # GPU history pays for the draft index, not for its main K/V.
+    gpu = plan.history_bytes_per_block - base_plan.history_bytes_per_block
+    assert 0 < gpu < layer_page
+
+
+def test_sharded_draft_main_follows_draft_main_placement():
+    specs = mtp_specs(shard_index=True, shard_draft=True)
+    _, gpu = build(settings(), specs)  # default: "gpu"
+    _, host = build(settings(draft_main_placement="host"), specs)
+    # "gpu": the draft stays beside the index in GPU history, as before.
+    assert gpu.host_kv_layers == TARGET_MAIN
+    assert not gpu.long_context_plan.draft_main_on_host
+    assert host.host_kv_layers == [*TARGET_MAIN, DRAFT]
+    assert host.long_context_plan.draft_main_on_host
+    # "host" lowers the GPU bytes of every history ID and so raises the number
+    # of 512K contexts the same budget can hold.
+    gpu_bytes = gpu.long_context_plan.geometry.index_bytes_per_block
+    host_bytes = host.long_context_plan.geometry.index_bytes_per_block
+    assert host_bytes < gpu_bytes
+    assert (
+        host.long_context_plan.gpu_history_blocks
+        > gpu.long_context_plan.gpu_history_blocks
+    )
+
+
+def test_draft_main_placement_is_told_apart_by_layout_not_by_the_setting():
+    from vllm.config.kernel import KernelConfig
+    from vllm.v1.kv_offload.tiering.fs.identity import (
+        _kernel_identity,
+        canonical_digest,
+    )
+    from vllm.v1.kv_offload.tiering.fs.revolta import _persistent_kv_tensors
+
+    # The setting itself is not part of the persisted identity ...
+    def kernel(placement):
+        return KernelConfig(long_context_kv=settings(draft_main_placement=placement))
+
+    assert canonical_digest(_kernel_identity(kernel("gpu"))) == canonical_digest(
+        _kernel_identity(kernel("host"))
+    )
+    # ... the page layout is: the host layer list and tensors differ.
+    specs = mtp_specs(shard_index=True, shard_draft=True)
+    _, gpu = build(settings(), specs)
+    _, host = build(settings(draft_main_placement="host"), specs)
+
+    def layout(cfg):
+        return canonical_digest(
+            {
+                "groups": [list(g.layer_names) for g in cfg.kv_cache_groups],
+                "tensors": _persistent_kv_tensors(cfg),
+                "host": list(cfg.host_kv_layers),
+            }
+        )
+
+    assert layout(gpu) != layout(host)
+
+
+def test_draft_main_placement_falls_back_to_gpu(caplog):
+    # A draft that does not share the target's geometry, or main K/V on the
+    # GPU, leaves the layout of "gpu" and says so.
+    caplog.set_level("WARNING")
+    _, replicated = build(settings(draft_main_placement="host"), mtp_specs())
+    _, base = build(settings(), mtp_specs())
+    assert replicated.host_kv_layers == base.host_kv_layers == TARGET_MAIN
+    assert "draft_main_placement='host' needs a draft" in caplog.text
+    caplog.clear()
+    _, gpu_main = build(
+        settings(main_kv_placement="gpu", draft_main_placement="host"),
+        mtp_specs(shard_index=True, shard_draft=True),
+    )
+    assert (
+        not gpu_main.host_kv_layers
+        and not gpu_main.long_context_plan.draft_main_on_host
+    )
+    assert "needs main_kv_placement='host'" in caplog.text
 
 
 def test_mtp_admission_and_other_drafters():
@@ -134,3 +246,20 @@ def test_gpu_placement_charges_the_draft_to_history():
         plan.geometry.index_bytes_per_block
         == base.long_context_plan.geometry.index_bytes_per_block + draft
     )
+
+
+def test_sharded_draft_layer_gets_its_own_hot_slot_index_tensor():
+    import torch
+
+    from vllm.models.qwen4_exp.nvidia.host_kv.engine import shared_index_tensors
+
+    _, cfg = build(
+        settings(draft_main_placement="host"),
+        mtp_specs(shard_index=True, shard_draft=True),
+    )
+    padded = [t for t in cfg.kv_cache_tensors if t.page_stride_bytes is not None]
+    kv_caches = {t.shared_by[0]: torch.empty(t.size, dtype=torch.uint8) for t in padded}
+    views = shared_index_tensors(cfg, kv_caches, len(cfg.host_kv_layers))
+    # One distinct index tensor per host layer, the draft's last like its layer.
+    assert len(views) == len(cfg.host_kv_layers) == len(TARGET_MAIN) + 1
+    assert views[-1] is kv_caches[f"{DRAFT}.compressed"]

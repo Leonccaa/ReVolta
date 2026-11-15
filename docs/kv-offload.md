@@ -298,6 +298,31 @@ block early: a prompt of L tokens reuses at most floor((L-1-S)/S)*S tokens for
 a block of S tokens. With `kernel_config.qsa_dcp_index_shard` and DCP2 the
 draft's main K/V and index are sharded like the target's (the raw-key ring
 stays replicated); index sharding with MTP is not supported outside this mode.
+`kernel_config.long_context_kv.draft_main_placement` chooses where such a
+sharded draft's main K/V lives; the draft index and raw-key ring always stay in
+GPU history.
+
+- `"gpu"` (default): the draft's main K/V is a GPU history tensor, charged for
+  every history ID (about 1.13 MB per ID per GPU with DCP2 and the index split
+  over two ranks). Draft forwards read only GPU memory, so decode is fastest.
+- `"host"`: the draft's main K/V is one more layer of the host store, reached
+  through the hot pool like the target's. Each history ID then costs about
+  0.71 MB (about 1.13 MB with `"gpu"`), so the same GPU budget holds many more
+  contexts at 1M tokens. Measured on four V100 GPUs with sampling and a single
+  request, a decode round takes about 0.2 ms (under 1%) longer than with
+  `"gpu"`. The setting is a different configuration of the same build: with
+  `"host"` the output is not guaranteed to be bitwise equal to `"gpu"`, because
+  the draft's proposals, and with them the shapes of the verified batches,
+  can differ.
+
+Pick `"host"` for deployments with many long sessions or high concurrency at
+long context, where the number of history IDs limits throughput. Pick `"gpu"`
+when single-request speed matters more than context concurrency. `"host"`
+needs `main_kv_placement="host"` and a draft that shares the target's sharded
+geometry (`qsa_dcp_index_shard` with DCP); if either is missing, the draft stays
+on the GPU and a warning is logged. Changing the value changes the host row
+layout, so an SSD tier written with the other value is not read back.
+
 `speculative_config.gdn_state_replay=true` replays the accepted target GDN
 inputs for MTP, so recurrent layers keep two state blocks per request instead
 of one per draft position; `gdn_state_replay_graph` (default true) captures

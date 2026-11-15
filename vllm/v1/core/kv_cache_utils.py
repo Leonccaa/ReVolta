@@ -2603,7 +2603,10 @@ def _is_mtp_layer(name: str) -> bool:
 
 
 def _get_csa_linear_tensor_layout(
-    kv_cache_groups: list[KVCacheGroupSpec], *, separate_mtp: bool = False
+    kv_cache_groups: list[KVCacheGroupSpec],
+    *,
+    separate_mtp: bool = False,
+    host_mtp: bool = False,
 ) -> _CSALinearTensorLayout | None:
     compressed_sparse: Mapping[str, KVCacheSpec] | None = None
     compressor_state: Mapping[str, KVCacheSpec] | None = None
@@ -2634,9 +2637,20 @@ def _get_csa_linear_tensor_layout(
         return None
 
     mtp_tensors: list[tuple[list[str], int]] = []
+    host_tuples: list[_CSALinearCacheTuple] = []
     if separate_mtp:
-        # The long-context mode keeps the MTP draft's caches on the GPU: they
-        # neither join the host store nor shape the state segment's owners.
+        # The long-context mode never lets the MTP draft shape the state
+        # segment's owners. A draft whose main K/V has the target's geometry
+        # (sharded like it) becomes one more host layer with ``host_mtp``;
+        # otherwise its caches stay as GPU history tensors.
+        target_main = next(
+            (
+                s
+                for n, s in compressed_sparse.items()
+                if not _is_mtp_layer(n) and type(s) is FullAttentionSpec
+            ),
+            None,
+        )
         mtp_tuples = _get_csa_linear_cache_tuples(
             _CSALinearRoles(
                 main_kv={
@@ -2659,6 +2673,9 @@ def _get_csa_linear_tensor_layout(
             )
         )
         for cache in mtp_tuples:
+            if host_mtp and cache.main_kv[1] == target_main:
+                host_tuples.append(cache)
+                continue
             mtp_tensors.append(([cache.main_kv[0]], cache.main_kv[1].page_size_bytes))
             mtp_tensors.append(
                 (
@@ -2689,17 +2706,33 @@ def _get_csa_linear_tensor_layout(
     main_kv_page_sizes = [
         compressed_sparse[name].page_size_bytes for name in main_kv_names
     ]
+    if host_mtp and mtp_tensors and not host_tuples:
+        logger.warning(
+            "draft_main_placement='host' needs a draft whose main K/V has the "
+            "target's sharded geometry; the MTP draft stays on the GPU."
+        )
+    owner_page_sizes = list(main_kv_page_sizes)
+    compressed_page_sizes = [
+        compressed_sparse[name].page_size_bytes for name in compressed_names
+    ]
+    compressor_state_names = list(compressor_state)
+    for cache in host_tuples:
+        # Host draft layers follow the target's: same host row and hot-slot
+        # geometry, an index page beside the target's, no state-segment owner.
+        main_kv_names.append(cache.main_kv[0])
+        main_kv_page_sizes.append(cache.main_kv[1].page_size_bytes)
+        compressed_names.append(cache.compressed[0])
+        compressed_page_sizes.append(cache.compressed[1].page_size_bytes)
+        compressor_state_names.append(cache.compressor_state[0])
     return _CSALinearTensorLayout(
         main_kv_names=main_kv_names,
         compressed_names=compressed_names,
-        compressor_state_names=list(compressor_state),
+        compressor_state_names=compressor_state_names,
         mamba_groups=mamba_groups,
         main_kv_page_sizes=main_kv_page_sizes,
-        compressed_page_sizes=[
-            compressed_sparse[name].page_size_bytes for name in compressed_names
-        ],
+        compressed_page_sizes=compressed_page_sizes,
         main_kv_owners=_pack_csa_linear_main_kv(
-            main_kv_page_sizes,
+            owner_page_sizes,
             _csa_linear_state_page(
                 member
                 for group in mamba_groups
@@ -3309,14 +3342,29 @@ def get_long_context_geometry(
     form the GPU state segment. A state block keeps today's owner-shaped
     pages (each GDN/PLE/drafter layer pads to its owner's page).
     """
-    layout = _get_csa_linear_tensor_layout(kv_cache_groups, separate_mtp=True)
+    settings = _long_context_settings(vllm_config)
+    if (
+        settings is not None
+        and settings.draft_main_placement == "host"
+        and settings.main_kv_placement != "host"
+    ):
+        logger.warning(
+            "draft_main_placement='host' needs main_kv_placement='host'; "
+            "the MTP draft stays on the GPU."
+        )
+    layout = _get_csa_linear_tensor_layout(
+        kv_cache_groups,
+        separate_mtp=True,
+        host_mtp=settings is not None
+        and settings.main_kv_placement == "host"
+        and settings.draft_main_placement == "host",
+    )
     if layout is None:
         raise ValueError(
             "kernel_config.long_context_kv requires the compressed-sparse "
             "(QSA) + linear-attention KV cache layout."
         )
     parallel = vllm_config.parallel_config
-    settings = _long_context_settings(vllm_config)
     if (
         settings is not None
         and settings.main_kv_placement == "host"
@@ -3424,8 +3472,11 @@ def get_long_context_geometry(
             "long-context hot slots require four-token QSA groups and 1..512 selections"
         )
     num_spec = int(getattr(spec_config, "num_speculative_tokens", 0) or 0)
+    owned = {i for owner in layout.main_kv_owners for i in owner}
     owner_bytes = sum(
         layout.owner_page_size(i) for i in range(len(layout.main_kv_owners))
+    ) + sum(  # host draft layers own no state-segment page
+        page for i, page in enumerate(layout.main_kv_page_sizes) if i not in owned
     )
     _, standalone = layout.auxiliary_tensor_plan()
     # A state block ID takes one page in every owner-shaped tensor that holds
@@ -3617,7 +3668,9 @@ def get_long_context_kv_cache_config(
     tensors. Block IDs of the two segments overlap; a group's block table
     only ever indexes its own segment's tensors.
     """
-    layout = _get_csa_linear_tensor_layout(kv_cache_groups, separate_mtp=True)
+    layout = _get_csa_linear_tensor_layout(
+        kv_cache_groups, separate_mtp=True, host_mtp=plan.draft_main_on_host
+    )
     if layout is None:
         raise ValueError(
             "kernel_config.long_context_kv requires the compressed-sparse "

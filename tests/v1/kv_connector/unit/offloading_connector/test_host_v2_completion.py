@@ -476,3 +476,36 @@ def test_draft_host_layer_does_not_reuse_the_target_write_plan():
     ]
     assert len(clears) == 1 and len(proposals) == 1
     assert clears[0] < proposals[0]
+
+
+def test_page_of_a_cancelled_request_waits_for_its_host_draft(monkeypatch):
+    events: list[str] = []
+    conn, _ = connector(monkeypatch, events)
+    conn._seal_after_draft = conn._draft_in_host = True
+    conn._late_seals = None
+    _labelled_fences(conn, events)
+    table = HostPageTable(2, 1)  # the zero page and one usable page
+    page = table.reserve()
+    assert page is not None
+    # Step 1 touches the page; the request is cancelled afterwards, and its
+    # draft proposal of step 1 may still be reading and writing the page.
+    table.bind(page, 1, 0, step=1)
+    table.touch(page, 1)
+    table.unbind(page, 1, 0, last_use=1)
+
+    def apply(meta):
+        for step, ranks in sorted(meta.completed_steps.items()):
+            table.complete_step(step, ranks)
+
+    _forward_step(conn, 1)
+    apply(conn.post_forward(set()).kv_connector_worker_meta)
+    assert table.watermark == 0 and "fence-2" not in events
+    # Nothing can take the page while the draft of step 1 is unretired.
+    assert table.reserve() is None
+
+    _forward_step(conn, 2)
+    apply(conn.post_forward(set()).kv_connector_worker_meta)
+    # Step 2's receipt awaited step 1's draft fence first, then reported it.
+    assert "fence-2" in events and table.watermark == 1
+    taken = table.reserve()
+    assert taken is not None and taken.page_id == page.page_id

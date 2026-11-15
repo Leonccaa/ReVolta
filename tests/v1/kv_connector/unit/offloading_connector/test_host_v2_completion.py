@@ -383,3 +383,30 @@ def test_mtp_step_without_its_draft_seal_reports_compute_failure(monkeypatch):
     meta = conn.post_forward(set()).kv_connector_worker_meta
     assert meta.seal_results == {ticket: (1, 1, 1)}
     assert "seal-d2h" not in events
+
+
+def test_draft_host_layer_does_not_reuse_the_target_write_plan():
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    # A draft layer in the host store writes the draft's own positions; the
+    # staged write plan of the target's prefill rows is cleared before the
+    # proposal (the recursive steps would otherwise copy to the target's rows).
+    source = textwrap.dedent(inspect.getsource(GPUModelRunner.sample_tokens))
+    tree = ast.parse(source)
+    clears = [
+        n.lineno
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Assign)
+        and any(
+            isinstance(t, ast.Attribute) and t.attr == "write_plan" for t in n.targets
+        )
+    ]
+    proposals = [
+        n.lineno
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "propose"
+    ]
+    assert len(clears) == 1 and len(proposals) == 1
+    assert clears[0] < proposals[0]

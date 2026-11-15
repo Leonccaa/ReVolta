@@ -2201,6 +2201,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # read the aux hidden states instead and get None here.
                 if pre_hc_hidden_states is not None:
                     spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+            store = getattr(self, "host_history", None)
+            if store is not None and any(
+                "mtp" in name.split(".") for name in store.layer_index
+            ):
+                # An MTP draft layer in the host store writes its own rows:
+                # the target's staged prefill write plan does not describe
+                # the draft's recursive positions.
+                store.write_plan = None
+                store.write_plan_kind = "none"
+                store.write_plan_all_prefill = False
             mtp_draft_start = self._sm70_v2_mtp_profile_start(mtp_profile_ctx)
             draft_tokens = self.speculator.propose(
                 input_batch,

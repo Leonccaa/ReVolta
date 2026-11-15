@@ -74,10 +74,10 @@ def make_job(
     )
 
 
-def drain(tier: FileSystemTierManager, max_rounds: int = 40) -> list:
+def drain(tier: FileSystemTierManager, max_rounds: int = 500) -> list:
     """
-    Call get_finished_jobs() repeatedly until no new results arrive for 5
-    consecutive rounds or max_rounds is reached.
+    Call get_finished_jobs() until results arrive, then no new results arrive
+    for 5 consecutive rounds, or max_rounds is reached.
     """
     results = []
     idle = 0
@@ -89,7 +89,7 @@ def drain(tier: FileSystemTierManager, max_rounds: int = 40) -> list:
             idle = 0
         else:
             idle += 1
-            if idle >= 5:
+            if results and idle >= 5:
                 break
     return results
 

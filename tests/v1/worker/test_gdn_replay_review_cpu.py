@@ -51,6 +51,7 @@ def _patch_env_flag(monkeypatch, name, value):
 def _config(policy):
     return SimpleNamespace(
         speculative_config=SimpleNamespace(
+            method="dflash",
             use_dflash=lambda: True,
             use_dflash_ddtree=lambda: False,
             sm70_dflash2=policy,

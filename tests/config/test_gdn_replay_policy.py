@@ -63,6 +63,9 @@ def engine_config(monkeypatch, tmp_path):
         replay=None,
         packed=None,
         long_context=False,
+        gdn_replay=None,
+        replay_graph=None,
+        legacy_graph=True,
     ):
         target = tmp_path / "target"
         target.mkdir(exist_ok=True)
@@ -129,8 +132,12 @@ def engine_config(monkeypatch, tmp_path):
                 method=method,
                 num_speculative_tokens=7 if method == "dflash" else 4,
                 draft_sample_method="greedy",
+                gdn_state_replay=gdn_replay,
+                gdn_state_replay_graph=replay_graph,
                 sm70_dflash2=Sm70DFlash2Config(
-                    spec_state_replay=replay, fused_gdn_verify=packed
+                    spec_state_replay=replay,
+                    spec_state_replay_graph=legacy_graph,
+                    fused_gdn_verify=packed,
                 ),
             )
         )
@@ -310,3 +317,231 @@ def test_long_context_replay_overrides_automatic_packed_default(engine_config):
 def test_long_context_replay_rejects_explicit_packed_conflict(engine_config):
     with pytest.raises(ValueError, match="cannot be enabled together"):
         engine_config(long_context=True, packed=True)
+
+
+@pytest.mark.parametrize("replay", [None, False, True])
+def test_linear_verify_replay_is_opt_in(engine_config, replay):
+    spec = engine_config(2560, method="mtp", gdn_replay=replay).speculative_config
+    assert spec.gdn_spec_state_replay is (replay is True)
+    assert spec.num_speculative_state_blocks() == (0 if replay else 4)
+    # DFlash defaults do not become MTP input policy.
+    assert spec.sm70_dflash2.spec_state_replay is None
+
+
+@pytest.mark.parametrize("graph", [None, False, True])
+def test_mtp_replay_worker_transport_and_graph_policy(engine_config, graph):
+    spec = engine_config(
+        2560, method="mtp", gdn_replay=True, replay_graph=graph
+    ).speculative_config
+    assert spec.gdn_spec_state_replay
+    assert spec.gdn_replay_graph_enabled() is (graph is not False)
+    rebuilt = SpeculativeConfig.from_worker_payload(
+        json.loads(json.dumps(spec.to_worker_payload())),
+        target_model_config=spec.target_model_config,
+        target_parallel_config=spec.target_parallel_config,
+    )
+    assert rebuilt.gdn_state_replay is True
+    assert rebuilt.gdn_spec_state_replay
+    assert rebuilt.gdn_replay_graph_enabled() is (graph is not False)
+    assert rebuilt.compute_hash() == spec.compute_hash()
+    from vllm.config import replace
+
+    copied = replace(spec, gdn_state_replay_graph=graph)
+    assert copied.gdn_state_replay is True
+    assert copied.gdn_spec_state_replay
+    assert copied.gdn_replay_graph_enabled() is (graph is not False)
+
+
+@pytest.mark.parametrize("replay", [False, True])
+def test_mtp_resolver_drives_real_gdn_spec_and_padded_state_table(
+    engine_config, replay
+):
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm.model_executor.layers.mamba.abstract import MambaBase
+    from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+    from vllm.v1.attention.backends.utils import mamba_get_block_table_tensor
+
+    config = engine_config(2560, method="mtp", gdn_replay=replay)
+    config.cache_config.mamba_block_size = 16
+    layer = SimpleNamespace(
+        mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+        is_kv_cache_tp_replicated=False,
+        get_state_shape=lambda: ((7, 2560), (12, 128, 128)),
+        get_state_dtype=lambda: (torch.float16, torch.float32),
+    )
+    spec = MambaBase.get_kv_cache_spec(layer, config)
+    assert spec.num_speculative_blocks == (0 if replay else 4)
+    assert spec.num_replayed_speculative_blocks == (4 if replay else 0)
+    assert (
+        spec.max_memory_usage_bytes(config)
+        == (2 if replay else 6) * spec.page_size_bytes
+    )
+    blocks = torch.arange(24, dtype=torch.int32).reshape(2, 12) + 1
+    table = mamba_get_block_table_tensor(blocks, torch.tensor([17, 33]), spec, "align")
+    assert table.shape == (2, 5)
+    assert table[:, 0].ge(0).all()
+    assert table[:, 1:].eq(-1).all() if replay else table.ge(0).all()
+
+
+@pytest.mark.parametrize("replay", [False, True])
+@pytest.mark.parametrize("graph", [False, True])
+def test_target_replay_survives_real_draft_construction(
+    engine_config, monkeypatch, replay, graph
+):
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm.model_executor.layers.mamba.abstract import MambaBase
+    from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+    from vllm.v1.worker.gpu.model_states import default as default_state
+    from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
+
+    config = engine_config(
+        2560,
+        method="mtp",
+        gdn_replay=replay,
+        replay_graph=graph,
+        legacy_graph=not graph,
+    )
+    spec = config.speculative_config
+    depth = 4
+    assert not spec.draft_model_config.is_hybrid
+    policy = asdict(spec.sm70_dflash2)
+    config.cache_config.mamba_block_size = 16
+    layer = SimpleNamespace(
+        mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+        is_kv_cache_tp_replicated=False,
+        get_state_shape=lambda: ((7, 2560), (12, 128, 128)),
+        get_state_dtype=lambda: (torch.float16, torch.float32),
+    )
+
+    def check_target():
+        assert spec.gdn_spec_state_replay is replay, "target replay overwritten"
+        assert asdict(spec.sm70_dflash2) == policy, "target verifier policy overwritten"
+        resolved = MambaBase.get_kv_cache_spec(layer, config)
+        assert resolved.num_speculative_blocks == (0 if replay else depth)
+        assert resolved.num_replayed_speculative_blocks == (depth if replay else 0)
+        assert resolved.max_memory_usage_bytes(config) // resolved.page_size_bytes == (
+            2 if replay else 2 + depth
+        )
+        # Run the real target state constructor after the draft, as MRV2 does.
+        # Only rotary setup is unrelated to the recurrent-state contract.
+        monkeypatch.setattr(default_state, "get_rope_state", lambda *a, **kw: None)
+        state = MambaHybridModelState(
+            config, torch.nn.Module(), None, torch.device("cpu")
+        )
+        assert state._spec_state_replay is replay
+        assert state._spec_replay_graphs.enabled is (replay and graph)
+        return state
+
+    initial_state = check_target()
+    for _ in range(2):
+        from vllm.v1.attention.backends import fa_utils
+
+        # Device discovery is simulated; no native attention runs on CPU.
+        monkeypatch.setattr(
+            fa_utils, "is_flash_attn_varlen_func_available", lambda: False
+        )
+        from vllm.models.qwen4_exp.nvidia.mtp import _make_draft_vllm_config
+
+        draft = _make_draft_vllm_config(config, mtp_start_layer_idx=4)
+        assert draft.is_speculative_draft
+        assert draft.model_config is spec.draft_model_config
+        assert draft.speculative_config is spec
+        assert initial_state._spec_state_replay is replay
+        assert initial_state._spec_replay_graphs.enabled is (replay and graph)
+        check_target()
+
+
+def test_mtp_replay_disables_packed_verifier(engine_config, caplog):
+    spec = engine_config(
+        2560, method="mtp", gdn_replay=True, packed=True
+    ).speculative_config
+    assert spec.gdn_spec_state_replay
+    assert not spec.sm70_dflash2.fused_gdn_verify
+    assert "gdn_state_replay=True was explicitly requested for MTP" in caplog.text
+
+
+@pytest.mark.parametrize("method", ["mtp", "dflash"])
+@pytest.mark.parametrize("graph", [None, False, True])
+def test_replay_graph_override_and_default(engine_config, method, graph):
+    spec = engine_config(
+        2560,
+        method=method,
+        gdn_replay=True if method == "mtp" else None,
+        replay=True if method == "dflash" else None,
+        replay_graph=graph,
+        legacy_graph=False,
+    ).speculative_config
+    assert spec.gdn_replay_graph_enabled() is (
+        graph if graph is not None else method == "mtp"
+    )
+    replay_hash = spec.compute_hash()
+    spec.gdn_state_replay_graph = not spec.gdn_replay_graph_enabled()
+    assert spec.compute_hash() != replay_hash
+    spec.gdn_spec_state_replay = False
+    inactive_hash = spec.compute_hash()
+    spec.gdn_state_replay_graph = not spec.gdn_state_replay_graph
+    assert spec.compute_hash() == inactive_hash
+
+
+@pytest.mark.parametrize("replay", [None, False, True])
+def test_dflash_keeps_legacy_replay_input(engine_config, replay):
+    spec = engine_config(2560, replay=False, gdn_replay=replay).speculative_config
+    assert not spec.gdn_spec_state_replay
+    assert spec.sm70_dflash2.spec_state_replay is False
+
+
+@pytest.mark.parametrize("method", ["mtp", "dflash"])
+def test_default_replay_fields_are_absent_from_serialization(engine_config, method):
+    from pydantic import TypeAdapter
+
+    spec = engine_config(2560, method=method).speculative_config
+    adapter = TypeAdapter(SpeculativeConfig)
+    for payload in (
+        adapter.dump_python(spec),
+        json.loads(adapter.dump_json(spec, fallback=str)),
+    ):
+        assert "gdn_state_replay" not in payload
+        assert "gdn_state_replay_graph" not in payload
+
+
+@pytest.mark.parametrize(
+    "condition",
+    ["hybrid", "sm70", "mrv2", "align", "async", "pp", "core_op", "mixed_qkv"],
+)
+def test_mtp_replay_uses_existing_platform_conditions(
+    engine_config, monkeypatch, condition
+):
+    from vllm.config.vllm import _resolve_gdn_spec_state_replay
+    from vllm.platforms import current_platform
+
+    config = engine_config(2560, method="mtp", gdn_replay=True)
+    assert config.speculative_config.gdn_spec_state_replay
+    if condition == "hybrid":
+        monkeypatch.setattr(
+            type(config.model_config), "is_hybrid", property(lambda _: False)
+        )
+    elif condition == "sm70":
+        monkeypatch.setattr(
+            current_platform, "is_device_capability", lambda *a, **k: False
+        )
+    elif condition == "mrv2":
+        monkeypatch.setattr(
+            type(config), "use_v2_model_runner", property(lambda _: False)
+        )
+    elif condition == "align":
+        config.cache_config.mamba_cache_mode = "none"
+    elif condition == "async":
+        config.scheduler_config.async_scheduling = True
+    elif condition == "pp":
+        config.parallel_config.pipeline_parallel_size = 2
+    elif condition == "core_op":
+        monkeypatch.setenv("VLLM_SM70_QWEN_GDN_SPEC_CORE_OP", "1")
+    else:
+        monkeypatch.setenv("VLLM_SM70_FUSED_SIGMOID_MIXED_QKV", "0")
+    assert not _resolve_gdn_spec_state_replay(config)

@@ -275,10 +275,7 @@ def _resolve_gdn_spec_state_replay(vllm_config: "VllmConfig") -> bool:
     if spec is None or spec.use_dflash_ddtree():
         return False
     is_mtp = spec.method == "mtp"
-    if is_mtp:
-        if spec.gdn_state_replay is not True:
-            return False
-    elif not spec.use_dflash():
+    if not is_mtp and not spec.use_dflash():
         return False
     policy = spec.sm70_dflash2
     long_context = getattr(
@@ -308,7 +305,7 @@ def _resolve_gdn_spec_state_replay(vllm_config: "VllmConfig") -> bool:
         policy.fused_gdn_verify = False
         logger.info_once(
             "Disabling sm70_dflash2.fused_gdn_verify because "
-            "gdn_state_replay=True was explicitly requested for MTP."
+            "GDN state replay is enabled for MTP."
         )
     if policy.fused_gdn_verify:
         if policy.spec_state_replay is True:

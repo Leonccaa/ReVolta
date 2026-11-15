@@ -338,7 +338,7 @@ separate static pool.
 
 During speculative decoding, DFlash2 and MTP can maintain GDN recurrent state by replaying the accepted tokens after sampling instead of saving a state for every draft position. Each running request then needs a fixed two state blocks per GDN cache group, regardless of draft length. The startup log confirms this with `recurrent layers keep 2 state blocks per running request`.
 
-Keep replay enabled, especially for long contexts and concurrent requests: the saved GPU memory leaves more room for KV history. DFlash2 enables replay by default on the supported ordinary route; MTP currently requires explicit configuration below.
+Keep replay enabled, especially for long contexts and concurrent requests: the saved GPU memory leaves more room for KV history. MTP and DFlash2 enable replay by default on their supported ordinary routes.
 
 In a four-GPU TP4/DCP2 measurement with MTP4 and sampling, replay added about **0.6 ms per decode round (2%)** at one concurrent request. With eight concurrent long-context requests, disabling replay used about **0.87 GiB more GPU memory per GPU**. These measurements describe that configuration, not a general overhead guarantee.
 
@@ -346,7 +346,7 @@ Replay and per-draft state storage use different computation paths. Outputs are 
 
 Set these fields in `--speculative-config` for the supported SM70 route with Model Runner V2, `--mamba-cache-mode align`, synchronous scheduling and no pipeline parallelism:
 
-- **MTP:** set `"gdn_state_replay": true`. Its default is `null` (`None` in Python), which leaves MTP replay off. `gdn_state_replay_graph` also defaults to `null`, resolving to `true` for MTP; set it to `true` explicitly to retain CUDA graph replay for FULL verify shapes. Mixed steps replay eagerly.
+- **MTP:** `"gdn_state_replay"` defaults to `null` (`None` in Python), selecting replay on the supported route. Set it to `false` to disable replay, or `true` to request it explicitly. `gdn_state_replay_graph` also defaults to `null`, resolving to `true` for MTP; set it to `true` explicitly to retain CUDA graph replay for FULL verify shapes. Mixed steps replay eagerly.
 - **DFlash2:** set `"sm70_dflash2": {"spec_state_replay": true}`. The omitted replay field defaults to `null`, selecting replay on the ordinary supported route while yielding to an enabled packed verifier. Its `spec_state_replay_graph` defaults to `true`; a non-null top-level `gdn_state_replay_graph` overrides that graph setting. See [DFlash2 state replay](dflash2.md#state-replay-optional) for route details.
 
 ## See also

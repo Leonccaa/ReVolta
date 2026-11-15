@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GDN speculative state replay: allocation, state tables and replay indices (CPU)."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -284,7 +285,7 @@ def _gdn_spec(sm70, method, num_tokens):
         config.speculative_config = None
     else:
         spec = config.speculative_config
-        # Replay requested (off by default): only the method decides.
+        # DFlash explicitly requests replay; MTP uses its supported-route default.
         spec.sm70_dflash2.spec_state_replay = True
         spec.method = method
         spec.num_speculative_tokens = num_tokens
@@ -317,26 +318,37 @@ def _legacy_gdn_spec(num_speculative_blocks):
 
 
 @pytest.mark.parametrize(("method", "num_tokens"), [("mtp", 4), ("mtp", 1), (None, 0)])
-def test_mtp_and_no_speculation_keep_their_gdn_allocation(sm70, method, num_tokens):
-    # Every other condition for replay holds; only the method differs from DFlash.
+def test_mtp_default_and_no_speculation_gdn_allocation(sm70, method, num_tokens):
     spec = _gdn_spec(sm70, method, num_tokens)
-    assert spec == _legacy_gdn_spec(num_tokens)
-    assert spec.num_replayed_speculative_blocks == 0
+    replay = method == "mtp"
+    assert spec == replace(
+        _legacy_gdn_spec(num_tokens),
+        num_speculative_blocks=0,
+        num_replayed_speculative_blocks=num_tokens if replay else 0,
+    )
+    assert spec.num_speculative_blocks == (0 if replay else num_tokens)
+    assert spec.num_replayed_speculative_blocks == (num_tokens if replay else 0)
     config = SimpleNamespace(cache_config=SimpleNamespace(mamba_cache_mode="align"))
     page = spec.page_size_bytes
-    assert spec.max_memory_usage_bytes(config) == (2 + num_tokens) * page
-    # The state table keeps one real block per speculative position.
+    assert page == _legacy_gdn_spec(num_tokens).page_size_bytes
+    assert spec.max_memory_usage_bytes(config) == 2 * page
     block_table = torch.arange(2 * 12, dtype=torch.int32).view(2, 12) + 100
     seq_lens = torch.tensor([BS + 1, 3 * BS])
     out = mamba_get_block_table_tensor(block_table, seq_lens, spec, "align")
     legacy = mamba_get_block_table_tensor(
         block_table, seq_lens, _legacy_gdn_spec(num_tokens), "align"
     )
-    assert torch.equal(out, legacy)
-    assert (out != PAD_SLOT_ID).all()
+    assert torch.equal(out[:, :1], legacy[:, :1])
+    if replay:
+        legacy[:, 1:] = PAD_SLOT_ID
+        assert torch.equal(out, legacy)
+        assert (out[:, 1:] == PAD_SLOT_ID).all()
+    else:
+        assert torch.equal(out, legacy)
+        assert (out != PAD_SLOT_ID).all()
 
 
-def test_dflash_replay_is_the_only_change_to_gdn_allocation(sm70):
+def test_dflash_replay_gdn_allocation(sm70):
     spec = _gdn_spec(sm70, "dflash", 7)
     assert spec.num_speculative_blocks == 0
     assert spec.num_replayed_speculative_blocks == 7

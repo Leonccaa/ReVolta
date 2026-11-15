@@ -482,7 +482,8 @@ class SpeculativeConfig:
 
     gdn_state_replay: bool | None = None
     """Replay accepted target GDN inputs for MTP on SM70 with Model Runner V2,
-    synchronous scheduling and align caching. None keeps MTP replay off.
+    synchronous scheduling and align caching. None enables MTP replay on the
+    supported route; False disables it.
     DFlash continues to use sm70_dflash2.spec_state_replay.
     """
 

@@ -236,11 +236,13 @@ def test_explicit_choices_are_respected(engine_config, replay, packed, expected)
 
 @pytest.mark.parametrize("method", [None, "mtp"])
 @pytest.mark.parametrize("replay", [None, False, True])
-def test_other_methods_keep_their_compilation_configuration(
-    engine_config, method, replay
-):
+def test_replay_disabled_keeps_compilation_configuration(engine_config, method, replay):
     config = engine_config(
-        2560, method=method, replay=replay, packed=True if replay is True else None
+        2560,
+        method=method,
+        replay=replay,
+        packed=True if replay is True else None,
+        gdn_replay=False,
     )
     spec = config.speculative_config
     assert spec is None or not spec.gdn_spec_state_replay
@@ -320,10 +322,10 @@ def test_long_context_replay_rejects_explicit_packed_conflict(engine_config):
 
 
 @pytest.mark.parametrize("replay", [None, False, True])
-def test_linear_verify_replay_is_opt_in(engine_config, replay):
+def test_mtp_replay_defaults_on_for_supported_route(engine_config, replay):
     spec = engine_config(2560, method="mtp", gdn_replay=replay).speculative_config
-    assert spec.gdn_spec_state_replay is (replay is True)
-    assert spec.num_speculative_state_blocks() == (0 if replay else 4)
+    assert spec.gdn_spec_state_replay is (replay is not False)
+    assert spec.num_speculative_state_blocks() == (4 if replay is False else 0)
     # DFlash defaults do not become MTP input policy.
     assert spec.sm70_dflash2.spec_state_replay is None
 
@@ -386,7 +388,7 @@ def test_mtp_resolver_drives_real_gdn_spec_and_padded_state_table(
     assert table[:, 1:].eq(-1).all() if replay else table.ge(0).all()
 
 
-@pytest.mark.parametrize("replay", [False, True])
+@pytest.mark.parametrize("replay", [None, False, True])
 @pytest.mark.parametrize("graph", [False, True])
 def test_target_replay_survives_real_draft_construction(
     engine_config, monkeypatch, replay, graph
@@ -408,6 +410,7 @@ def test_target_replay_survives_real_draft_construction(
         legacy_graph=not graph,
     )
     spec = config.speculative_config
+    replay = replay is not False
     depth = 4
     assert not spec.draft_model_config.is_hybrid
     policy = asdict(spec.sm70_dflash2)
@@ -463,7 +466,7 @@ def test_mtp_replay_disables_packed_verifier(engine_config, caplog):
     ).speculative_config
     assert spec.gdn_spec_state_replay
     assert not spec.sm70_dflash2.fused_gdn_verify
-    assert "gdn_state_replay=True was explicitly requested for MTP" in caplog.text
+    assert "GDN state replay is enabled for MTP" in caplog.text
 
 
 @pytest.mark.parametrize("method", ["mtp", "dflash"])
@@ -514,13 +517,14 @@ def test_default_replay_fields_are_absent_from_serialization(engine_config, meth
     "condition",
     ["hybrid", "sm70", "mrv2", "align", "async", "pp", "core_op", "mixed_qkv"],
 )
+@pytest.mark.parametrize("replay", [None, True])
 def test_mtp_replay_uses_existing_platform_conditions(
-    engine_config, monkeypatch, condition
+    engine_config, monkeypatch, condition, replay
 ):
     from vllm.config.vllm import _resolve_gdn_spec_state_replay
     from vllm.platforms import current_platform
 
-    config = engine_config(2560, method="mtp", gdn_replay=True)
+    config = engine_config(2560, method="mtp", gdn_replay=replay)
     assert config.speculative_config.gdn_spec_state_replay
     if condition == "hybrid":
         monkeypatch.setattr(

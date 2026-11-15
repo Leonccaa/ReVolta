@@ -626,9 +626,10 @@ def test_unsupported_layouts_are_rejected_at_startup():
     with pytest.raises(ValueError, match="compressed-sparse"):
         get_long_context_geometry(config, get_kv_cache_groups(config, plain))
     groups = get_kv_cache_groups(config, production_specs())
-    mtp = production_config(long_context=settings, dflash=False)
-    with pytest.raises(ValueError, match="DFlash drafting or no speculation"):
-        get_long_context_geometry(mtp, groups)
+    # A drafter that is neither DFlash nor MTP keeps its own full-history cache.
+    other = production_config(long_context=settings, dflash=False)
+    with pytest.raises(ValueError, match="DFlash or MTP drafting"):
+        get_long_context_geometry(other, groups)
     pp = production_config(long_context=settings)
     pp.parallel_config.pipeline_parallel_size = 2
     with pytest.raises(ValueError, match="pipeline parallelism"):

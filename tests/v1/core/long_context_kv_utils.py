@@ -161,3 +161,59 @@ def production_specs(
                 sliding_window=2048,
             )
     return specs
+
+
+def mtp_config(**kwargs):
+    """``production_config`` with a K=4 MTP drafter instead of DFlash."""
+    config = production_config(num_speculative_tokens=4, dflash=False, **kwargs)
+    config.speculative_config.method = "mtp"
+    config.speculative_config.use_eagle_kv_cache = lambda: True
+    return config
+
+
+def mtp_specs(
+    *, replay: bool = True, shard_index: bool = False, shard_draft: bool = False
+) -> dict[str, KVCacheSpec]:
+    """Target specs plus one QSA MTP draft layer (main K/V, index and ring).
+
+    ``shard_index`` shards the target indexers over DCP; ``shard_draft`` shards
+    the draft's main K/V, and its indexer too when ``shard_index`` is set.
+    """
+    from dataclasses import replace
+
+    specs = production_specs(speculative_blocks=0 if replay else 4, drafter=False)
+    if shard_index:
+        specs = {
+            name: (
+                replace(spec, block_size=SPAN // DCP, dcp_sharded=True)
+                if type(spec) is MLAAttentionSpec
+                else spec
+            )
+            for name, spec in specs.items()
+        }
+    prefix = "mtp.layers.48.self_attn"
+    specs[prefix] = FullAttentionSpec(
+        block_size=SPAN // DCP if shard_draft else SPAN,
+        num_kv_heads=1,
+        head_size=256,
+        dtype=torch.uint8,
+        dcp_sharded=shard_draft,
+    )
+    index_sharded = shard_draft and shard_index
+    specs[f"{prefix}.compressed"] = MLAAttentionSpec(
+        block_size=SPAN // DCP if index_sharded else SPAN,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float16,
+        compress_ratio=4,
+        dcp_sharded=index_sharded,
+    )
+    specs[f"{prefix}.compressor_state"] = CircularBufferSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=128,
+        head_size_v=0,
+        dtype=torch.float16,
+        dcp_sharded=False,
+    )
+    return specs

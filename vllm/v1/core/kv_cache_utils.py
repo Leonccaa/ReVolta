@@ -2130,6 +2130,10 @@ class _CSALinearTensorLayout:
     # Sliding-window attention of a DFlash drafter (see
     # `_fit_csa_linear_auxiliary_specs`).
     auxiliary_groups: list[KVCacheGroupSpec] = field(default_factory=list)
+    # Long-context mode only: MTP draft main K/V and index (+ its ring) as
+    # GPU history tensors, ``(shared_by, page bytes)``. They stay members of
+    # the target's groups, so they share its block table and hashes.
+    mtp_tensors: list[tuple[list[str], int]] = field(default_factory=list)
 
     @property
     def bytes_per_block(self) -> int:
@@ -2387,7 +2391,14 @@ def _get_kv_cache_groups_csa_linear(
         raise ValueError(
             "CSA+linear layers must share one global block span and compression ratio."
         )
-    main_kv_pages = [cache.main_kv[1].page_size_bytes for cache in tuples]
+    # The long-context mode allocates MTP draft caches as separate GPU history
+    # tensors, so only the target's main K/V shapes the state segment owners.
+    owner_tuples = (
+        [cache for cache in tuples if not _is_mtp_layer(cache.main_kv[0])]
+        if _long_context_settings(vllm_config) is not None
+        else tuples
+    )
+    main_kv_pages = [cache.main_kv[1].page_size_bytes for cache in owner_tuples]
 
     padded_compressor_specs: dict[str, KVCacheSpec] = {
         cache.compressor_state[0]: replace(
@@ -2414,7 +2425,7 @@ def _get_kv_cache_groups_csa_linear(
         KVCacheGroupSpec(list(compressed_sparse_specs), compressed_sparse_uniform),
         KVCacheGroupSpec(list(padded_compressor_specs), compressor_uniform),
     ]
-    main_kv_names = [cache.main_kv[0] for cache in tuples]
+    main_kv_names = [cache.main_kv[0] for cache in owner_tuples]
     owners = _pack_csa_linear_main_kv(
         main_kv_pages, _csa_linear_state_page(roles.mamba.values())
     )
@@ -2587,8 +2598,12 @@ def _fit_csa_linear_auxiliary_specs(
     }
 
 
+def _is_mtp_layer(name: str) -> bool:
+    return "mtp" in name.split(".")
+
+
 def _get_csa_linear_tensor_layout(
-    kv_cache_groups: list[KVCacheGroupSpec],
+    kv_cache_groups: list[KVCacheGroupSpec], *, separate_mtp: bool = False
 ) -> _CSALinearTensorLayout | None:
     compressed_sparse: Mapping[str, KVCacheSpec] | None = None
     compressor_state: Mapping[str, KVCacheSpec] | None = None
@@ -2617,6 +2632,46 @@ def _get_csa_linear_tensor_layout(
             return None
     if compressed_sparse is None or compressor_state is None:
         return None
+
+    mtp_tensors: list[tuple[list[str], int]] = []
+    if separate_mtp:
+        # The long-context mode keeps the MTP draft's caches on the GPU: they
+        # neither join the host store nor shape the state segment's owners.
+        mtp_tuples = _get_csa_linear_cache_tuples(
+            _CSALinearRoles(
+                main_kv={
+                    n: cast(FullAttentionSpec, s)
+                    for n, s in compressed_sparse.items()
+                    if _is_mtp_layer(n) and type(s) is FullAttentionSpec
+                },
+                compressed={
+                    n: cast(MLAAttentionSpec, s)
+                    for n, s in compressed_sparse.items()
+                    if _is_mtp_layer(n) and type(s) is MLAAttentionSpec
+                },
+                compressor_state={
+                    n: cast(CircularBufferSpec, s)
+                    for n, s in compressor_state.items()
+                    if _is_mtp_layer(n)
+                },
+                mamba={},
+                auxiliary={},
+            )
+        )
+        for cache in mtp_tuples:
+            mtp_tensors.append(([cache.main_kv[0]], cache.main_kv[1].page_size_bytes))
+            mtp_tensors.append(
+                (
+                    [cache.compressed[0], cache.compressor_state[0]],
+                    cache.compressed[1].page_size_bytes,
+                )
+            )
+        compressed_sparse = {
+            n: s for n, s in compressed_sparse.items() if not _is_mtp_layer(n)
+        }
+        compressor_state = {
+            n: s for n, s in compressor_state.items() if not _is_mtp_layer(n)
+        }
 
     main_kv_names = [
         name
@@ -2656,6 +2711,7 @@ def _get_csa_linear_tensor_layout(
             ),
         ),
         auxiliary_groups=auxiliary_groups,
+        mtp_tensors=mtp_tensors,
     )
 
 
@@ -3253,7 +3309,7 @@ def get_long_context_geometry(
     form the GPU state segment. A state block keeps today's owner-shaped
     pages (each GDN/PLE/drafter layer pads to its owner's page).
     """
-    layout = _get_csa_linear_tensor_layout(kv_cache_groups)
+    layout = _get_csa_linear_tensor_layout(kv_cache_groups, separate_mtp=True)
     if layout is None:
         raise ValueError(
             "kernel_config.long_context_kv requires the compressed-sparse "
@@ -3284,10 +3340,14 @@ def get_long_context_geometry(
             "kernel_config.long_context_kv does not support pipeline parallelism."
         )
     spec_config = vllm_config.speculative_config
-    if spec_config is not None and not spec_config.use_dflash():
+    if (
+        spec_config is not None
+        and not spec_config.use_dflash()
+        and getattr(spec_config, "method", None) != "mtp"
+    ):
         raise ValueError(
-            "kernel_config.long_context_kv supports DFlash drafting or no "
-            "speculation; other drafters keep a full-history QSA cache."
+            "kernel_config.long_context_kv supports DFlash or MTP drafting, or "
+            "no speculation."
         )
     dcp = getattr(parallel, "decode_context_parallel_size", 1)
     if dcp not in (1, 2):
@@ -3318,7 +3378,13 @@ def get_long_context_geometry(
         if FullAttentionSpec in kinds:
             group_domains.append((LC_GPU_HISTORY, LC_HOST))
             full_spec = next(
-                member for member in members if type(member) is FullAttentionSpec
+                member
+                for name, member in (
+                    spec.kv_cache_specs.items()
+                    if isinstance(spec, UniformTypeKVCacheSpecs)
+                    else [(group.layer_names[0], spec)]
+                )
+                if type(member) is FullAttentionSpec and name in layout.main_kv_names
             )
             block_tokens = full_spec.global_block_size(dcp)
             main_kv_dcp = dcp if full_spec.dcp_sharded else 1
@@ -3372,13 +3438,16 @@ def get_long_context_geometry(
     workers = getattr(parallel, "tensor_parallel_size", 1) * (
         parallel.pipeline_parallel_size
     )
+    # MTP draft pages live on the GPU for every history ID and travel in the
+    # host row with the target's index pages (host_region_layout).
+    mtp_bytes = sum(page for _, page in layout.mtp_tensors)
     geometry = LongContextGeometry(
         block_tokens=block_tokens,
         num_workers=workers,
         main_kv_bytes_per_block=owner_bytes,
-        index_bytes_per_block=sum(layout.compressed_page_sizes),
+        index_bytes_per_block=sum(layout.compressed_page_sizes) + mtp_bytes,
         state_bytes_per_block=state_owner_bytes + sum(page for _, page in standalone),
-        unified_bytes_per_block=layout.bytes_per_block,
+        unified_bytes_per_block=layout.bytes_per_block + mtp_bytes,
         state_blocks_per_request=state_blocks,
         state_inflight_blocks=state_inflight_blocks,
         ring_blocks_per_request=ring_blocks,
@@ -3401,9 +3470,9 @@ def get_long_context_geometry(
         strides = _long_context_index_strides(layout, geometry)
         geometry = replace(
             geometry,
-            index_bytes_per_block=sum(strides),
+            index_bytes_per_block=sum(strides) + mtp_bytes,
             hot_staged_writethrough=settings.staged_writethrough,
-            logical_index_bytes_per_block=sum(layout.compressed_page_sizes),
+            logical_index_bytes_per_block=sum(layout.compressed_page_sizes) + mtp_bytes,
             index_page_strides=tuple(strides),
         )
     return geometry
@@ -3548,7 +3617,7 @@ def get_long_context_kv_cache_config(
     tensors. Block IDs of the two segments overlap; a group's block table
     only ever indexes its own segment's tensors.
     """
-    layout = _get_csa_linear_tensor_layout(kv_cache_groups)
+    layout = _get_csa_linear_tensor_layout(kv_cache_groups, separate_mtp=True)
     if layout is None:
         raise ValueError(
             "kernel_config.long_context_kv requires the compressed-sparse "
@@ -3600,6 +3669,10 @@ def get_long_context_kv_cache_config(
     tensors.extend(
         KVCacheTensor(size=page * num_state, shared_by=[name], num_blocks=num_state)
         for name, page in standalone
+    )
+    tensors.extend(
+        KVCacheTensor(size=page * num_history, shared_by=names, num_blocks=num_history)
+        for names, page in layout.mtp_tensors
     )
     return KVCacheConfig(
         num_blocks=num_history,

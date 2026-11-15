@@ -86,6 +86,9 @@ class ActiveKVConnector(KVConnector):
         # rows after sampling, so their seal follows the proposal and its
         # receipt is reported by the next receipt (or the drain).
         self._seal_after_draft = False
+        # A draft main K/V that lives in the host store is read and written by
+        # the proposal, so the step cannot retire before the proposal does.
+        self._draft_in_host = False
         self._seal_event = None
         self._late_seals: tuple[list[Any], bool, bool, Any] | None = None
         # Connector worker owns the registered store, including test doubles.
@@ -102,6 +105,7 @@ class ActiveKVConnector(KVConnector):
             ]
             self._host_indices = [kv_caches_dict[name] for name in members]
             self._seal_after_draft = any("mtp" in n.split(".") for n in members)
+            self._draft_in_host = any("mtp" in n.split(".") for n in names)
 
     def handle_preemptions(self, scheduler_output: "SchedulerOutput") -> None:
         # Deferred stores read blocks written by the previous step. A block
@@ -198,6 +202,9 @@ class ActiveKVConnector(KVConnector):
 
         if step is not None and self._host_event is not None:
             self._host_event.synchronize()
+            if getattr(self, "_draft_in_host", False) and self._seal_event is not None:
+                # The proposal's host accesses precede the after-draft seal.
+                self._seal_event.synchronize()
         elif step is not None and self._host_store is not None:
             # No-forward and aborted producer steps still need a physical
             # retirement fence before a rank can advance the watermark.

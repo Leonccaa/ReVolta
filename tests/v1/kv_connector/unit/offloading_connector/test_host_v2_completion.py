@@ -370,6 +370,20 @@ def test_mtp_seal_follows_the_draft_and_reports_with_the_next_receipt(monkeypatc
     assert meta.seal_results == {second: (1, 0, 0)}
 
 
+def test_step_with_a_host_draft_retires_after_the_proposal(monkeypatch):
+    events: list[str] = []
+    conn, _ = connector(monkeypatch, events)
+    conn._seal_after_draft = conn._draft_in_host = True
+    conn._seal_event = conn._late_seals = None
+    conn.seal_host_step()
+    conn.seal_host_step(after_draft=True)
+    assert events == ["seal-d2h"]
+    meta = conn.post_forward(set()).kv_connector_worker_meta
+    # Both the target fence and the fence after the draft retired first.
+    assert events == ["seal-d2h", "host-visible", "host-visible"]
+    assert meta.completed_steps == {1: 1}
+
+
 def test_mtp_step_without_its_draft_seal_reports_compute_failure(monkeypatch):
     events: list[str] = []
     conn, ticket = connector(monkeypatch, events)

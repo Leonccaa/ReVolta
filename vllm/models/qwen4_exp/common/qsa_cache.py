@@ -1020,12 +1020,6 @@ def qsa_index_shard_world(vllm_config: VllmConfig) -> int:
     return vllm_config.parallel_config.tensor_parallel_size
 
 
-def _current_dcp_rank() -> int:
-    from vllm.distributed import get_dcp_group
-
-    return get_dcp_group().rank_in_group
-
-
 def _current_tp_rank() -> int:
     from vllm.distributed import get_tp_group
 

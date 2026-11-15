@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -52,7 +52,7 @@ class KVConnector:
     def set_disabled(self, disabled: bool) -> None:
         pass
 
-    def seal_host_step(self) -> None:
+    def seal_host_step(self, after_draft: bool = False) -> None:
         pass
 
     def close_host_kv(self) -> None:
@@ -82,6 +82,12 @@ class ActiveKVConnector(KVConnector):
         self._host_seal_failed = False
         self._host_drain_output: KVConnectorOutput | None = None
         self._host_drain_complete = False
+        # MTP draft pages ride in the host row. The drafter writes this step's
+        # rows after sampling, so their seal follows the proposal and its
+        # receipt is reported by the next receipt (or the drain).
+        self._seal_after_draft = False
+        self._seal_event = None
+        self._late_seals: tuple[list[Any], bool, bool, Any] | None = None
         # Connector worker owns the registered store, including test doubles.
         worker = getattr(self.kv_connector, "connector_worker", None)
         if worker is not None and getattr(worker, "_host_history", None) is not None:
@@ -89,11 +95,13 @@ class ActiveKVConnector(KVConnector):
             config = worker.spec.kv_cache_config
             names = set(config.host_kv_layers)
             group_id = worker._host_group_id
-            self._host_indices = [
-                kv_caches_dict[name]
+            members = [
+                name
                 for name in config.kv_cache_groups[group_id].layer_names
                 if name not in names
             ]
+            self._host_indices = [kv_caches_dict[name] for name in members]
+            self._seal_after_draft = any("mtp" in n.split(".") for n in members)
 
     def handle_preemptions(self, scheduler_output: "SchedulerOutput") -> None:
         # Deferred stores read blocks written by the previous step. A block
@@ -126,6 +134,7 @@ class ActiveKVConnector(KVConnector):
         self._host_sealed = False
         self._host_seal_failed = False
         self._host_event = None
+        self._seal_event = None
         self.kv_connector.bind_connector_metadata(kv_connector_metadata)
 
         # TODO: sort out KV Connectors' use of forward_context
@@ -135,11 +144,18 @@ class ActiveKVConnector(KVConnector):
             with set_forward_context(None, self.vllm_config):
                 self.kv_connector.start_load_kv(get_forward_context())
 
-    def seal_host_step(self) -> None:
+    def seal_host_step(self, after_draft: bool = False) -> None:
         step = self._host_step
         if step is None or self._host_sealed:
             return
         assert self._host_store is not None
+        late = getattr(self, "_seal_after_draft", False)
+        if late != after_draft:
+            if not after_draft:
+                # The target forward's host reads retire at this fence; the
+                # seal itself follows the draft proposal.
+                self._host_event = self._host_store.fence()
+            return
         # Submission or context errors propagate. Only a successfully retired
         # stream may report a seal-only failure and preserve local GPU hashes.
         try:
@@ -149,21 +165,40 @@ class ActiveKVConnector(KVConnector):
             if event is not None:
                 event.synchronize()
             self._host_seal_failed = True
-        self._host_event = self._host_store.fence()
+        if late:
+            self._seal_event = self._host_store.fence()
+        else:
+            self._host_event = self._host_store.fence()
         self._host_sealed = True
 
-    def _host_receipt(self, output: KVConnectorOutput) -> None:
+    def _report_seals(self, meta, rank, tickets, sealed, seal_failed) -> None:
+        from vllm.distributed import get_world_group
+
+        for ticket in tickets:
+            compute_failed = 0 if sealed else rank
+            failed = rank if seal_failed else compute_failed
+            meta.seal_results[ticket] = (rank, failed, compute_failed)
+            payloads = getattr(self._host_store, "index_payloads", None)
+            if not failed and isinstance(payloads, list):
+                meta.seal_bytes[ticket] = {
+                    get_world_group().rank_in_group: sum(
+                        p.shape[1] * p.element_size() for p in payloads
+                    )
+                }
+
+    def _host_receipt(self, output: KVConnectorOutput, final: bool = False) -> None:
         step = getattr(self, "_host_step", None)
-        if step is None:
+        late = getattr(self, "_late_seals", None)
+        if step is None and late is None:
             return
         from vllm.distributed import get_world_group
         from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
             OffloadingWorkerMetadata,
         )
 
-        if self._host_event is not None:
+        if step is not None and self._host_event is not None:
             self._host_event.synchronize()
-        elif self._host_store is not None:
+        elif step is not None and self._host_store is not None:
             # No-forward and aborted producer steps still need a physical
             # retirement fence before a rank can advance the watermark.
             event = self._host_store.fence()
@@ -174,17 +209,30 @@ class ActiveKVConnector(KVConnector):
             meta = OffloadingWorkerMetadata()
         assert isinstance(meta, OffloadingWorkerMetadata)
         rank = 1 << get_world_group().rank_in_group
-        for ticket in step.seals:
-            compute_failed = 0 if self._host_sealed else rank
-            seal_failed = rank if self._host_seal_failed else compute_failed
-            meta.seal_results[ticket] = (rank, seal_failed, compute_failed)
-            payloads = getattr(self._host_store, "index_payloads", None)
-            if not seal_failed and isinstance(payloads, list):
-                meta.seal_bytes[ticket] = {
-                    get_world_group().rank_in_group: sum(
-                        p.shape[1] * p.element_size() for p in payloads
-                    )
-                }
+        if late is not None:
+            # The previous step's seal, queued after its draft proposal.
+            tickets, sealed, seal_failed, event = late
+            if event is not None:
+                event.synchronize()
+            self._report_seals(meta, rank, tickets, sealed, seal_failed)
+            self._late_seals = None
+        if step is None:
+            output.kv_connector_worker_meta = meta
+            return
+        if getattr(self, "_seal_after_draft", False) and not final:
+            self._late_seals = (
+                step.seals,
+                self._host_sealed,
+                self._host_seal_failed,
+                self._seal_event,
+            )
+        else:
+            event = getattr(self, "_seal_event", None)
+            if event is not None:
+                event.synchronize()
+            self._report_seals(
+                meta, rank, step.seals, self._host_sealed, self._host_seal_failed
+            )
         meta.completed_steps[step.step] = rank
         shadow = getattr(getattr(self, "_host_store", None), "shadow", None)
         if shadow is not None:
@@ -233,7 +281,7 @@ class ActiveKVConnector(KVConnector):
             return output
         # Keep receipts across a failed drain on this or another rank. Parent
         # shutdown consumes them only after every rank has acknowledged.
-        self._host_receipt(output)
+        self._host_receipt(output, final=True)
         worker = getattr(self.kv_connector, "connector_worker", None)
         assert worker is not None
         sending, receiving, meta = worker.drain()

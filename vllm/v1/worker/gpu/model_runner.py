@@ -2263,6 +2263,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 ),
             )
 
+        if getattr(self, "host_history", None) is not None:
+            # MTP draft pages in the host row are complete only now; a no-op
+            # unless the host row carries them.
+            self.kv_connector.seal_host_step(after_draft=True)
         # Post-step KV connector related operations.
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
         model_runner_output.kv_connector_output = kv_connector_output

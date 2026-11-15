@@ -317,3 +317,69 @@ def test_core_waits_for_all_rank_drains_before_executor_shutdown(monkeypatch, fa
         engine.shutdown()
         assert events.count("rank-drains") == 1
         assert events.count("executor-shutdown") == 1
+
+
+def test_mtp_seal_follows_the_draft_and_reports_with_the_next_receipt(monkeypatch):
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    # The after-draft seal sits after the proposal and before the receipt.
+    tree = ast.parse(textwrap.dedent(inspect.getsource(GPUModelRunner.sample_tokens)))
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
+    lines = lambda attr: sorted(  # noqa: E731
+        n.lineno
+        for n in calls
+        if isinstance(n.func, ast.Attribute) and n.func.attr == attr
+    )
+    draft_seal = [
+        n.lineno
+        for n in calls
+        if isinstance(n.func, ast.Attribute)
+        and n.func.attr == "seal_host_step"
+        and any(k.arg == "after_draft" for k in n.keywords)
+    ]
+    assert len(draft_seal) == 1
+    assert lines("propose")[-1] < draft_seal[0] < lines("post_forward")[-1]
+
+    events: list[str] = []
+    conn, first = connector(monkeypatch, events)
+    conn._seal_after_draft = True
+    conn._seal_event = conn._late_seals = None
+    conn.seal_host_step()
+    assert events == []  # only the retirement fence, no seal before the draft
+    conn.seal_host_step(after_draft=True)
+    assert events == ["seal-d2h"]
+    meta = conn.post_forward(set()).kv_connector_worker_meta
+    assert meta.completed_steps == {1: 1} and not meta.seal_results
+    assert events == ["seal-d2h", "host-visible"]
+
+    second = SealTicket(2, 2, 1, PageHandle(2, 0), b"key2", 2)
+    conn._host_step = HostKVStep(2, [], [second])
+    conn._host_sealed = conn._host_seal_failed = False
+    conn._host_event = conn._seal_event = None
+    conn.seal_host_step()
+    conn.seal_host_step(after_draft=True)
+    meta = conn.post_forward(set()).kv_connector_worker_meta
+    # The first step's seal is reported here, after its event retired.
+    assert meta.seal_results == {first: (1, 0, 0)}
+    assert meta.completed_steps == {2: 1}
+
+    conn.kv_connector.connector_worker = SimpleNamespace(
+        drain=lambda: (set(), set(), None)
+    )
+    meta = conn.drain_host_kv().kv_connector_worker_meta
+    assert meta.seal_results == {second: (1, 0, 0)}
+
+
+def test_mtp_step_without_its_draft_seal_reports_compute_failure(monkeypatch):
+    events: list[str] = []
+    conn, ticket = connector(monkeypatch, events)
+    conn._seal_after_draft = True
+    conn._seal_event = conn._late_seals = None
+    conn.seal_host_step()
+    assert not conn.post_forward(set()).kv_connector_worker_meta.seal_results
+    conn._host_step = HostKVStep(2, [], [])
+    conn._host_sealed = conn._host_seal_failed = False
+    conn._host_event = None
+    meta = conn.post_forward(set()).kv_connector_worker_meta
+    assert meta.seal_results == {ticket: (1, 1, 1)}
+    assert "seal-d2h" not in events

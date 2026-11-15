@@ -927,13 +927,16 @@ def is_mtp_draft_prefix(prefix: str) -> bool:
 
 def qsa_draft_dcp_sharded(vllm_config: VllmConfig) -> bool:
     """Shard the MTP draft with the target in long-context M5 deployments."""
+    # Like the neighbouring helpers, read the optional configs defensively:
+    # draft loaders also build specs from partial configurations.
     spec = getattr(vllm_config, "speculative_config", None)
-    return (
-        spec is not None
-        and spec.method == "mtp"
+    kernel_config = getattr(vllm_config, "kernel_config", None)
+    long_context = getattr(kernel_config, "long_context_kv", None)
+    return bool(
+        getattr(spec, "method", None) == "mtp"
         and vllm_config.parallel_config.decode_context_parallel_size > 1
-        and vllm_config.kernel_config.qsa_dcp_index_shard
-        and vllm_config.kernel_config.long_context_kv.enabled
+        and getattr(kernel_config, "qsa_dcp_index_shard", False)
+        and getattr(long_context, "enabled", False)
     )
 
 

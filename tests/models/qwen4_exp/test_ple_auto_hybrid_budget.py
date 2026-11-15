@@ -90,3 +90,50 @@ def test_hybrid_host_budget_does_not_group_provisional_cache_pages(monkeypatch):
     placement = Embedding._plan_placement(_table(), torch.device("cuda:0"))
     assert placement.host_rows == ROWS
     envs.disable_envs_cache()
+
+
+def _long_context_config(enabled: bool, placement: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=8192),
+        cache_config=SimpleNamespace(gpu_memory_utilization=0.9),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=4, local_world_size=4, data_parallel_size_local=1
+        ),
+        kernel_config=SimpleNamespace(
+            long_context_kv=SimpleNamespace(
+                enabled=enabled, main_kv_placement=placement
+            )
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("enabled", "placement", "explicit", "host_rows"),
+    [
+        (True, "host", None, ROWS),  # unset: the whole table goes to host
+        (True, "host", 8 * ROW_BYTES, 8),  # an explicit budget still wins
+        (True, "gpu", None, 0),  # main K/V on the device: placement unchanged
+        (False, "host", None, 0),  # ordinary mode: placement unchanged
+    ],
+)
+def test_long_context_host_kv_keeps_the_table_on_host(
+    monkeypatch, enabled, placement, explicit, host_rows
+):
+    envs.disable_envs_cache()
+    monkeypatch.setenv("VLLM_SM70_QWEN38_HYBRID_PLE", "0")
+    monkeypatch.setattr(ple, "ple_host_budget_bytes", lambda: explicit)
+    monkeypatch.setattr(ple, "ple_cascade_configured", lambda: False)
+    monkeypatch.setattr(ple, "ple_vram_reserve_bytes", lambda _total: 0)
+    monkeypatch.setattr(ple, "ple_host_reserve_bytes", lambda _total: 0)
+    monkeypatch.setattr(ple, "kv_cache_bytes_for_max_model_len", lambda _cfg: 0)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _device: (1000, 1000))
+    monkeypatch.setattr(ple, "available_host_bytes", lambda: 10000)
+    monkeypatch.setattr(ple, "total_host_bytes", lambda: 10000)
+    monkeypatch.setattr(
+        ple,
+        "get_current_vllm_config",
+        lambda: _long_context_config(enabled, placement),
+    )
+    placement_plan = Embedding._plan_placement(_table(), torch.device("cuda:0"))
+    assert placement_plan.host_rows == host_rows
+    envs.disable_envs_cache()

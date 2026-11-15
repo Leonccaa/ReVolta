@@ -645,6 +645,16 @@ def _pin_host_tensor_exact(tensor: torch.Tensor) -> None:
     finalizer.atexit = False  # type: ignore[misc]
 
 
+def _long_context_host_placement() -> bool:
+    """Whether the main K/V of long-context mode lives in the host pool."""
+    kernel_config = getattr(get_current_vllm_config(), "kernel_config", None)
+    long_context = getattr(kernel_config, "long_context_kv", None)
+    return bool(
+        getattr(long_context, "enabled", False)
+        and getattr(long_context, "main_kv_placement", None) == "host"
+    )
+
+
 class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
     """TP-sharded FP8 PLE table split between device memory and pinned host.
 
@@ -826,7 +836,11 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         table_bytes = total_rows * row_bytes
         explicit_host = ple_host_budget_bytes()
         cascade = ple_cascade_configured()
-        hybrid = envs.VLLM_SM70_QWEN38_HYBRID_PLE
+        # Long-context host KV spends every spare device byte on history IDs, so
+        # an unset budget keeps the whole table on host, as hybrid placement does.
+        hybrid = envs.VLLM_SM70_QWEN38_HYBRID_PLE or (
+            explicit_host is None and _long_context_host_placement()
+        )
         spill = None
         if cascade or (explicit_host is None and not hybrid):
             spill = self._device_spill_bytes(device, table_bytes)
@@ -838,8 +852,8 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             # device/KV estimate, which can reject not-yet-padded CSA pages.
             host_budget = self._cap_derived_host_budget(table_bytes)
             logger.info(
-                "Qwen4Exp hybrid PLE auto placement: %s of the table go to "
-                "host memory before cache layout resolution",
+                "Qwen4Exp PLE auto placement: %s of the table go to host "
+                "memory (hybrid or long-context host KV placement)",
                 format_gib(host_budget),
             )
         else:

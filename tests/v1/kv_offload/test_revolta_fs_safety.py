@@ -1065,7 +1065,10 @@ def test_manifest_bound_quantization_file_changes_identity(tmp_path, role):
     manifest = _write_manifest(tmp_path, {"target": model.model})
     before = get_revolta_identity(cfg, str(root), manifest)
     assert before is not None
+    stat = path.stat()
     path.write_text('{"version":2}')
+    # Stat verification needs a changed mtime even on coarse-clock filesystems.
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
     assert get_revolta_identity(cfg, str(root), manifest) is None
     manifest = _write_manifest(tmp_path, {"target": model.model})
     after = get_revolta_identity(cfg, str(root), manifest)
@@ -1258,7 +1261,11 @@ def test_multimodal_encoder_fp8_requires_manifest_bound_fixed_scales(
         else:
             assert identity is not None
             assert scale_path is not None
+            stat = scale_path.stat()
             scale_path.write_text('{"layer": {"q": 2, "k": 1, "v": 1}}')
+            os.utime(
+                scale_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000)
+            )
             assert get_revolta_identity(cfg, str(root), manifest) is None
             manifest = _write_manifest(tmp_path, {"target": cfg.model_config.model})
             updated = get_revolta_identity(cfg, str(root), manifest)

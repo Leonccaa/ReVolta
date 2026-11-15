@@ -88,7 +88,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, get_kv_quan
 
 from ..config import Qwen4ExpConfig
 from .hyperconnection import GatedResidual, HyperConnectionConfig
-from .ops.qsa_coalesce import QSACoalesceWorkspace
+from .ops.qsa_coalesce import QSACoalesceWorkspace, require_dcp2_index_world
 from .sm70_fp16_gemv import enable_qwen38_sm70_fp16_gemv
 from .sm70_fp16_hc import enable_qwen38_sm70_fp16_fused_hc
 
@@ -687,6 +687,7 @@ class Qwen4ExpModel(nn.Module, EagleModelMixin):
                     == "host"
                     and capture_sizes
                 ):
+                    require_dcp2_index_world(vllm_config)
                     coalesce_workspace = QSACoalesceWorkspace(
                         max(capture_sizes),
                         int(config.indexer_budget)

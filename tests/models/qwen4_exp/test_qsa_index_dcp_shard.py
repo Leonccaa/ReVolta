@@ -1402,3 +1402,17 @@ def test_paged_wrapper_sharded_shared_key_matches_global(
                 scores_l[row, :n].view(torch.int32),
                 scores_g[row, rank::world][:n].view(torch.int32),
             )
+
+
+@pytest.mark.parametrize(("tp", "fails"), [(2, False), (4, True)])
+def test_coalesce_needs_a_pair_sharded_index(tp: int, fails: bool) -> None:
+    from vllm.models.qwen4_exp.nvidia.ops.qsa_coalesce import (
+        require_dcp2_index_world,
+    )
+
+    config = _config(True, dcp=2, tp=tp)
+    if fails:
+        with pytest.raises(ValueError, match="split over 4 ranks"):
+            require_dcp2_index_world(config)
+    else:
+        require_dcp2_index_world(config)

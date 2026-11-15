@@ -217,10 +217,8 @@ def write_slots_vector(
     tl.store(Hot + (hot + 4 * W)[:, None] + x[None, :], value, hmask)
 
 
-@triton.jit
-def commit_slots(
-    Slot, Ready, PageOf, SPAN: tl.constexpr, N: tl.constexpr, B: tl.constexpr
-):
+@triton.jit(do_not_specialize=["N"])
+def commit_slots(Slot, Ready, PageOf, SPAN: tl.constexpr, N, B: tl.constexpr):
     """Publish rows after a kernel boundary that follows both copies."""
     i = tl.program_id(0).to(tl.int64) * B + tl.arange(0, B)
     slot = tl.load(Slot + i, i < N, -1).to(tl.int64)

@@ -65,7 +65,13 @@ def _kernel_identity(config):
                         # kept, not how any page is encoded, so it must not move
                         # persisted files to a new namespace.
                         if item[0]
-                        not in (*_RETENTION_POLICY_FIELDS, "staged_writethrough")
+                        not in (
+                            *_RETENTION_POLICY_FIELDS,
+                            "staged_writethrough",
+                            # Its effect is the host layer list, which the page
+                            # layout digest already covers.
+                            "draft_main_placement",
+                        )
                         and (
                             item[0] != "host_store_gib"
                             or (fields.get("enabled", False) and item[1] is not None)

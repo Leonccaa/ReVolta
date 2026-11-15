@@ -110,7 +110,7 @@ def test_sharded_draft_main_is_one_more_host_layer():
     specs = mtp_specs(shard_index=True, shard_draft=True)
     target = {name: spec for name, spec in specs.items() if "mtp" not in name}
     _, base = build(settings(), target, mtp=False)
-    _, cfg = build(settings(), specs)
+    _, cfg = build(settings(draft_main_placement="host"), specs)
     plan, base_plan = cfg.long_context_plan, base.long_context_plan
     # The sharded draft main K/V has the target's geometry: it joins the host
     # store as the last layer, with no GPU tensor and no state-segment page.
@@ -148,6 +148,78 @@ def test_sharded_draft_main_is_one_more_host_layer():
     assert 0 < gpu < layer_page
 
 
+def test_sharded_draft_main_follows_draft_main_placement():
+    specs = mtp_specs(shard_index=True, shard_draft=True)
+    _, gpu = build(settings(), specs)  # default: "gpu"
+    _, host = build(settings(draft_main_placement="host"), specs)
+    # "gpu": the draft stays beside the index in GPU history, as before.
+    assert gpu.host_kv_layers == TARGET_MAIN
+    assert not gpu.long_context_plan.draft_main_on_host
+    assert host.host_kv_layers == [*TARGET_MAIN, DRAFT]
+    assert host.long_context_plan.draft_main_on_host
+    # "host" lowers the GPU bytes of every history ID and so raises the number
+    # of 512K contexts the same budget can hold.
+    gpu_bytes = gpu.long_context_plan.geometry.index_bytes_per_block
+    host_bytes = host.long_context_plan.geometry.index_bytes_per_block
+    assert host_bytes < gpu_bytes
+    assert (
+        host.long_context_plan.gpu_history_blocks
+        > gpu.long_context_plan.gpu_history_blocks
+    )
+
+
+def test_draft_main_placement_is_told_apart_by_layout_not_by_the_setting():
+    from vllm.config.kernel import KernelConfig
+    from vllm.v1.kv_offload.tiering.fs.identity import (
+        _kernel_identity,
+        canonical_digest,
+    )
+    from vllm.v1.kv_offload.tiering.fs.revolta import _persistent_kv_tensors
+
+    # The setting itself is not part of the persisted identity ...
+    def kernel(placement):
+        return KernelConfig(long_context_kv=settings(draft_main_placement=placement))
+
+    assert canonical_digest(_kernel_identity(kernel("gpu"))) == canonical_digest(
+        _kernel_identity(kernel("host"))
+    )
+    # ... the page layout is: the host layer list and tensors differ.
+    specs = mtp_specs(shard_index=True, shard_draft=True)
+    _, gpu = build(settings(), specs)
+    _, host = build(settings(draft_main_placement="host"), specs)
+
+    def layout(cfg):
+        return canonical_digest(
+            {
+                "groups": [list(g.layer_names) for g in cfg.kv_cache_groups],
+                "tensors": _persistent_kv_tensors(cfg),
+                "host": list(cfg.host_kv_layers),
+            }
+        )
+
+    assert layout(gpu) != layout(host)
+
+
+def test_draft_main_placement_falls_back_to_gpu(caplog):
+    # A draft that does not share the target's geometry, or main K/V on the
+    # GPU, leaves the layout of "gpu" and says so.
+    caplog.set_level("WARNING")
+    _, replicated = build(settings(draft_main_placement="host"), mtp_specs())
+    _, base = build(settings(), mtp_specs())
+    assert replicated.host_kv_layers == base.host_kv_layers == TARGET_MAIN
+    assert "draft_main_placement='host' needs a draft" in caplog.text
+    caplog.clear()
+    _, gpu_main = build(
+        settings(main_kv_placement="gpu", draft_main_placement="host"),
+        mtp_specs(shard_index=True, shard_draft=True),
+    )
+    assert (
+        not gpu_main.host_kv_layers
+        and not gpu_main.long_context_plan.draft_main_on_host
+    )
+    assert "needs main_kv_placement='host'" in caplog.text
+
+
 def test_mtp_admission_and_other_drafters():
     config = mtp_config(long_context=settings())
     config.kv_transfer_config = SimpleNamespace(kv_connector="OffloadingConnector")
@@ -181,7 +253,10 @@ def test_sharded_draft_layer_gets_its_own_hot_slot_index_tensor():
 
     from vllm.models.qwen4_exp.nvidia.host_kv.engine import shared_index_tensors
 
-    _, cfg = build(settings(), mtp_specs(shard_index=True, shard_draft=True))
+    _, cfg = build(
+        settings(draft_main_placement="host"),
+        mtp_specs(shard_index=True, shard_draft=True),
+    )
     padded = [t for t in cfg.kv_cache_tensors if t.page_stride_bytes is not None]
     kv_caches = {t.shared_by[0]: torch.empty(t.size, dtype=torch.uint8) for t in padded}
     views = shared_index_tensors(cfg, kv_caches, len(cfg.host_kv_layers))

@@ -309,6 +309,9 @@ class LongContextCapacityPlan:
     history block ID, next to the index pages) instead of the host pool
     (``main_kv_placement="gpu"``); the hot pool then takes no GPU memory and
     only budgets admission."""
+    draft_main_on_host: bool = False
+    """An MTP draft with the target's geometry keeps its main K/V in the host
+    store (``draft_main_placement="host"`` beside host-placed main K/V)."""
     hot_pool_source: Literal["manual", "auto"] = "manual"
     """Whether the hot pool was explicitly sized or took the remaining budget."""
     hot_slots_per_block: int = 0
@@ -691,6 +694,9 @@ def plan_long_context_capacity(
         hot_pool_groups=0,
         prewarm_hot_pool=settings.prewarm_hot_pool,
         main_kv_on_gpu=main_kv_on_gpu,
+        draft_main_on_host=(
+            not main_kv_on_gpu and settings.draft_main_placement == "host"
+        ),
     )
     auto = settings.hot_pool_gib == "auto" or (
         settings.hot_pool_gib is None and settings.hot_pool_ratio is None

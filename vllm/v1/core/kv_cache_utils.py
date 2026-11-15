@@ -2706,6 +2706,11 @@ def _get_csa_linear_tensor_layout(
     main_kv_page_sizes = [
         compressed_sparse[name].page_size_bytes for name in main_kv_names
     ]
+    if host_mtp and mtp_tensors and not host_tuples:
+        logger.warning(
+            "draft_main_placement='host' needs a draft whose main K/V has the "
+            "target's sharded geometry; the MTP draft stays on the GPU."
+        )
     owner_page_sizes = list(main_kv_page_sizes)
     compressed_page_sizes = [
         compressed_sparse[name].page_size_bytes for name in compressed_names
@@ -3338,10 +3343,21 @@ def get_long_context_geometry(
     pages (each GDN/PLE/drafter layer pads to its owner's page).
     """
     settings = _long_context_settings(vllm_config)
+    if (
+        settings is not None
+        and settings.draft_main_placement == "host"
+        and settings.main_kv_placement != "host"
+    ):
+        logger.warning(
+            "draft_main_placement='host' needs main_kv_placement='host'; "
+            "the MTP draft stays on the GPU."
+        )
     layout = _get_csa_linear_tensor_layout(
         kv_cache_groups,
         separate_mtp=True,
-        host_mtp=settings is not None and settings.main_kv_placement == "host",
+        host_mtp=settings is not None
+        and settings.main_kv_placement == "host"
+        and settings.draft_main_placement == "host",
     )
     if layout is None:
         raise ValueError(
@@ -3653,7 +3669,7 @@ def get_long_context_kv_cache_config(
     only ever indexes its own segment's tensors.
     """
     layout = _get_csa_linear_tensor_layout(
-        kv_cache_groups, separate_mtp=True, host_mtp=not plan.main_kv_on_gpu
+        kv_cache_groups, separate_mtp=True, host_mtp=plan.draft_main_on_host
     )
     if layout is None:
         raise ValueError(

@@ -1344,3 +1344,19 @@ def test_retention_policy_does_not_change_persistent_identity(tmp_path, enabled)
         assert "latest_only" not in text and "superseded_keep_ssd" not in text
         assert "enable_junction_evidence" not in text
     assert len(digests) == 1
+
+
+def test_mtp_draft_inside_the_target_checkpoint_keeps_the_tier(tmp_path):
+    # An MTP drafter loads its layers from the target checkpoint. A manifest
+    # of the target alone covers it, and the drafter still binds the identity.
+    model = _checkpoint(tmp_path)
+    manifest = _write_manifest(tmp_path, {"target": str(model)})
+    config = make_spec(model).vllm_config
+    config.speculative_config = None
+    plain = get_revolta_identity(config, str(tmp_path / "kv"), manifest)
+    draft = _draft(model)
+    draft.method = "mtp"
+    config.speculative_config = draft
+    mtp = get_revolta_identity(config, str(tmp_path / "kv"), manifest)
+    assert plain is not None and mtp is not None
+    assert mtp.persistent_digest != plain.persistent_digest

@@ -307,11 +307,13 @@ GPU history.
   over two ranks). Draft forwards read only GPU memory, so decode is fastest.
 - `"host"`: the draft's main K/V is one more layer of the host store, reached
   through the hot pool like the target's. Each history ID then costs about
-  0.71 MB (less with `qsa_dcp_index_shard` over the whole TP group), so the same
-  GPU budget holds many more contexts at 1M tokens. The price is that each of
-  the draft's forwards in a step may read host pages, which adds time per
-  decode round (TODO: measured cost per concurrency, pending the 4-GPU
-  attribution runs).
+  0.71 MB (about 1.13 MB with `"gpu"`), so the same GPU budget holds many more
+  contexts at 1M tokens. Measured on four V100 GPUs with sampling and a single
+  request, a decode round takes about 0.2 ms (under 1%) longer than with
+  `"gpu"`. The setting is a different configuration of the same build: with
+  `"host"` the output is not guaranteed to be bitwise equal to `"gpu"`, because
+  the draft's proposals, and with them the shapes of the verified batches,
+  can differ.
 
 Pick `"host"` for deployments with many long sessions or high concurrency at
 long context, where the number of history IDs limits throughput. Pick `"gpu"`

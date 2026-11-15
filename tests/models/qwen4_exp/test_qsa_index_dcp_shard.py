@@ -983,8 +983,9 @@ def test_fused_merge_graph_replays_changed_candidates(world: int, rows: int) -> 
         assert torch.equal(merged, expected), length
 
 
-def test_sharding_rejects_mtp_drafting() -> None:
+def test_sharding_rejects_mtp_drafting_without_long_context() -> None:
     config = _config(True)
+    config.kernel_config.long_context_kv = SimpleNamespace(enabled=False)
     config.speculative_config = SimpleNamespace(method="mtp")
     with pytest.raises(ValueError, match="MTP"):
         qsa_index_dcp_sharded(config, TARGET, 4)

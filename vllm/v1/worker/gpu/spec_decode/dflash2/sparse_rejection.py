@@ -49,7 +49,6 @@ class DFlash2LogitsFallback:
 @triton.jit
 def _compact_target_reference_rows_kernel(
     probe,
-    temperatures,
     top_ps,
     row_to_request,
     reference_rows,
@@ -61,14 +60,13 @@ def _compact_target_reference_rows_kernel(
     row = tl.program_id(0)
     col = tl.arange(0, block)
     request = tl.load(row_to_request + row)
-    temperature = tl.load(temperatures + request)
     top_p = tl.load(top_ps + request)
     values = tl.load(probe + row * row_stride + col, col < width, -float("inf"))
-    first = tl.load(probe + row * row_stride) / temperature
-    cutoff = tl.load(probe + row * row_stride + top_k - 1) / temperature
-    last = tl.load(probe + row * row_stride + width - 1) / temperature
-    logits = values / temperature
-    keep = (col < width) & (logits >= cutoff)
+    first = tl.load(probe + row * row_stride)
+    cutoff = tl.load(probe + row * row_stride + top_k - 1)
+    last = tl.load(probe + row * row_stride + width - 1)
+    logits = values
+    keep = (col < width) & (col < top_k)
     logits = tl.where(keep, logits, -float("inf"))
     probabilities = tl.exp(logits - tl.max(logits, 0))
     probabilities /= tl.sum(probabilities, 0)
@@ -94,16 +92,14 @@ def _compact_target_reference_rows_kernel(
 
 def _compact_target_reference_rows_gpu(
     probe: torch.Tensor,
-    temperatures: torch.Tensor,
     top_ps: torch.Tensor,
     row_to_request: torch.Tensor,
 ) -> np.ndarray:
-    """Copy only fallback decisions, preserving the request-slot parameter map."""
+    """Check FP32 temperature-scaled probes using the request-slot mapping."""
     rows, width = probe.shape
     result = torch.empty(rows, device=probe.device, dtype=torch.bool)
     _compact_target_reference_rows_kernel[(rows,)](
         probe,
-        temperatures,
         top_ps,
         row_to_request,
         result,
@@ -137,12 +133,11 @@ def _compact_target_reference_rows(
     temperature = np.asarray(temperature, dtype=np.float32).reshape(-1, 1)
     top_p = np.asarray(top_p, dtype=np.float32).reshape(-1, 1)
     if vocab_ordered:
-        # The wider probe contains all cutoff ties unless its last value
-        # reaches the top-k boundary. Descending vocabulary order also
-        # reproduces a split top-p tie in the reference's retained suffix.
+        # If a tie reaches the end of the probe, unseen candidates may have
+        # smaller vocabulary IDs. Otherwise keep the index-ordered prefix.
         logits = probe / temperature
         truncated = probe[:, -1] >= probe[:, _TARGET_TOP_K - 1]
-        keep_k = logits >= logits[:, _TARGET_TOP_K - 1 : _TARGET_TOP_K]
+        keep_k = np.arange(probe.shape[1])[None, :] < _TARGET_TOP_K
         logits = np.where(keep_k, logits, -np.inf)
         with np.errstate(invalid="ignore", over="ignore", divide="ignore"):
             probs = np.exp(logits - logits.max(axis=-1, keepdims=True))
@@ -429,8 +424,9 @@ def try_dflash2_sparse_target_rejection(
     draft_topk_ids, draft_topk_logits = sparse_draft_logits
     idx = input_batch.idx_mapping_np
     states = rejection_sampler.sampler.sampling_states
-    # Preserve the small single-request path. The large-vocabulary reference
-    # uses stable radix order; retain the existing fallback for other sorts.
+    # The large-vocabulary reference
+    # uses ascending vocabulary IDs at ties; keep the existing fallback for
+    # probes that do not establish the global candidate order.
     retain_ties = idx.size > 1 and getattr(states, "vocab_size", 0) >= 32768
     probe_k = _TARGET_PROBE_K if retain_ties else _TARGET_TOP_K + 1
     fallback = None
@@ -444,19 +440,23 @@ def try_dflash2_sparse_target_rejection(
         target_topk_ids, target_topk_logits = model.get_topk_tokens_and_logits(
             sample_hidden_states, probe_k
         )
-    if retain_ties:
-        target_topk_logits, target_topk_ids = sort_topk_with_vocab_ties(
-            target_topk_logits,
-            target_topk_ids,
-            vocab_size=states.vocab_size,
-            descending=True,
-        )
+    # Use the same FP32 copy and temperature kernel as the dense sampler.
+    # Scaling may merge adjacent scores, so resolve ties only afterwards.
+    target_topk_logits = torch.empty_like(
+        target_topk_logits, dtype=torch.float32
+    ).copy_(target_topk_logits)
+    states.apply_temperature(target_topk_logits, input_batch.expanded_idx_mapping, idx)
+    target_topk_logits, target_topk_ids = sort_topk_with_vocab_ties(
+        target_topk_logits,
+        target_topk_ids,
+        vocab_size=states.vocab_size,
+        descending=True,
+    )
     # Packed verifier rows need their own request's sampling parameters.
     # Reusing the first request misses ambiguous nuclei in heterogeneous batches.
     if retain_ties:
         reference_rows = _compact_target_reference_rows_gpu(
             target_topk_logits,
-            states.temperature.gpu,
             states.top_p.gpu,
             input_batch.expanded_idx_mapping,
         )
@@ -464,7 +464,7 @@ def try_dflash2_sparse_target_rejection(
         num_logits = np.diff(input_batch.cu_num_logits_np)
         reference_rows = _compact_target_reference_rows(
             target_topk_logits,
-            np.repeat(states.temperature.np[idx], num_logits),
+            1.0,
             np.repeat(states.top_p.np[idx], num_logits),
         )
     reference_reqs = np.flatnonzero(

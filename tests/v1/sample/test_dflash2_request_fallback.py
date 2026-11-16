@@ -11,6 +11,7 @@ import torch
 
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.worker.gpu.sample.gumbel import apply_temperature
+from vllm.v1.worker.gpu.sample.states import SamplingStates
 from vllm.v1.worker.gpu.spec_decode.dflash2 import sparse_rejection
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import rejection_sample
 
@@ -92,6 +93,9 @@ def test_partial_fallback_matches_dense_with_request_slot_permutation(
         temperature=SimpleNamespace(np=temp_np, gpu=temperatures),
         top_p=SimpleNamespace(np=p_np, gpu=top_ps),
         seeds=SimpleNamespace(gpu=seeds),
+    )
+    states.apply_temperature = lambda x, mapping, idx: SamplingStates.apply_temperature(
+        states, x, mapping, idx
     )
     sampler = SimpleNamespace(
         sampling_states=states, use_fp64_gumbel=use_fp64, apply_sampling_params=process
@@ -197,15 +201,14 @@ def test_gpu_reference_guard_preserves_cpu_boundary_fallbacks(amplitude):
     # Explicitly hit a top-p boundary, with nonidentity request-slot mapping.
     support = probe[5, :20] / temperature[mapping[5]]
     top_p[mapping[5]] = support.softmax(0)[:4].sum()
+    apply_temperature(probe, mapping, temperature)
     cpu = sparse_rejection._compact_target_reference_rows(
         probe,
-        temperature[mapping].cpu().numpy(),
+        1.0,
         top_p[mapping].cpu().numpy(),
         vocab_ordered=True,
     )
-    gpu = sparse_rejection._compact_target_reference_rows_gpu(
-        probe, temperature, top_p, mapping
-    )
+    gpu = sparse_rejection._compact_target_reference_rows_gpu(probe, top_p, mapping)
     assert gpu[:6].all()
     # The GPU's wider rounding margin may add conservative reference rows.
     assert not (cpu & ~gpu).any()

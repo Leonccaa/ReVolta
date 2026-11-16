@@ -101,7 +101,15 @@ class SamplingStates:
 
         top_k = self.top_k.gpu[expanded_idx_mapping] if do_top_k else None
         top_p = self.top_p.gpu[expanded_idx_mapping] if do_top_p else None
-        return apply_top_k_top_p(logits, top_k, top_p)
+        has_topp_only_rows = bool(
+            np.any(
+                (self.top_k.np[idx_mapping_np] >= self.vocab_size)
+                & (self.top_p.np[idx_mapping_np] < 1.0)
+            )
+        )
+        return apply_top_k_top_p(
+            logits, top_k, top_p, has_topp_only_rows=has_topp_only_rows
+        )
 
     def max_num_logprobs(self, idx_mapping_np: np.ndarray) -> int:
         return int(np.max(self.num_logprobs[idx_mapping_np]))

@@ -799,7 +799,6 @@ def _dflash2_compact_target_row(
     target_logits_ptr,
     target_stride,
     row,
-    temperature,
     top_p,
     TOP_K: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -817,19 +816,10 @@ def _dflash2_compact_target_row(
         mask=mask,
         other=float("-inf"),
     ).to(tl.float32)
-    if temperature != 1.0:
-        logits = logits / temperature
-
-    if LIMIT_K < TOP_K:
-        cutoff = tl.load(target_logits_ptr + row * target_stride + LIMIT_K - 1).to(
-            tl.float32
-        )
-        if temperature != 1.0:
-            cutoff = cutoff / temperature
-        # Keep every member of a tied top-k boundary within the admitted
-        # shortlist. The host guard rejects truncated boundary ties.
-        mask &= logits >= cutoff
-        logits = tl.where(mask, logits, float("-inf"))
+    # Candidates are score-descending, with ascending vocabulary IDs at ties.
+    # Match upstream dense top-k by retaining only the first LIMIT_K entries.
+    mask &= offsets < LIMIT_K
+    logits = tl.where(mask, logits, float("-inf"))
 
     # get_topk_tokens_and_logits returns scores in descending order. Apply
     # nucleus filtering only within that exact top-k support, matching the
@@ -916,7 +906,6 @@ def _dflash2_sparse_topk_rejection_kernel(
                     target_logits_ptr,
                     target_stride,
                     row,
-                    temperature,
                     top_p,
                     TOP_K=TARGET_TOP_K,
                     BLOCK_K=TARGET_BLOCK_K,
@@ -980,7 +969,6 @@ def _dflash2_sparse_topk_rejection_kernel(
         target_logits_ptr,
         target_stride,
         resample_row,
-        temperature,
         top_p,
         TOP_K=TARGET_TOP_K,
         BLOCK_K=TARGET_BLOCK_K,
@@ -1071,10 +1059,11 @@ def dflash2_sparse_topk_rejection_sample(
     """Run exact DFlash2 rejection on compact top-k distributions.
 
     Callers must enforce the no-penalty/no-logit-bias contract and provide
-    target candidates after a global top-k merge. Draft scores must be the
+    target candidates after FP32 temperature scaling and a global top-k merge.
+    Draft scores must be the
     temperature-applied scores used to draw the corresponding proposal.
-    With target_top_k smaller than the shortlist, callers must retain all
-    cutoff ties and order equal target scores by descending vocabulary ID.
+    With target_top_k smaller than the shortlist, only that prefix is kept.
+    Callers must order equal target scores by ascending vocabulary ID.
     """
     if target_topk_ids.ndim != 2 or target_topk_logits.ndim != 2:
         raise ValueError("target top-k tensors must be two-dimensional")

@@ -6,7 +6,7 @@ import math
 import pytest
 import torch
 
-from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+from vllm.v1.worker.gpu.sample.gumbel import apply_temperature, gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
     dflash2_sparse_topk_rejection_sample,
     rejection_sample,
@@ -180,8 +180,14 @@ def test_dflash2_sparse_topk_matches_dense_rejection(
     top_p_rows = torch.full((num_logits,), top_p, dtype=torch.float32, device=device)
     from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 
+    scaled_target = target_dense.clone()
+    apply_temperature(
+        scaled_target,
+        torch.arange(num_logits, device=device),
+        torch.full((num_logits,), temperature, device=device),
+    )
     processed_target = apply_top_k_top_p(
-        target_dense.clone() / temperature,
+        scaled_target,
         top_k_tensor,
         top_p_rows,
     )
@@ -257,6 +263,7 @@ def test_dflash2_sparse_topk_matches_dense_rejection(
         padded_logits[:, :target_top_k].copy_(target_topk_logits)
         target_topk_ids = padded_ids[:, :target_top_k]
         target_topk_logits = padded_logits[:, :target_top_k]
+    apply_temperature(target_topk_logits, expanded_idx_mapping, temperature_per_req)
     sparse_sampled, sparse_num_sampled = dflash2_sparse_topk_rejection_sample(
         target_topk_ids,
         target_topk_logits,

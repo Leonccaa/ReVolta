@@ -131,7 +131,7 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             if self.persistent_layout is None:
                 self.persistent_layout = {"config_hash": vllm_config.compute_hash()}
             self.persistent_layout["kv_storage"] = kv_storage_metadata(
-                kv_cache_config, vllm_config.cache_config.cache_dtype
+                kv_cache_config, vllm_config.cache_config.cache_dtype, vllm_config
             )
             if any(
                 tier.get("type") in FS_TIER_TYPES

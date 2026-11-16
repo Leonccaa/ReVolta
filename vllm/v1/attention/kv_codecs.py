@@ -197,6 +197,18 @@ FP8_PER_TOKEN_HEAD = KVCodec(
     rounding="nearest_even",
     layout="inline_scale",
 )
+FP8_E4M3_PER_TOKEN_HEAD = KVCodec(
+    "fp8_e4m3_per_token_head",
+    (),
+    torch.uint8,
+    torch.float8_e4m3fn,
+    quantized=True,
+    scale_granularity="token_head",
+    scale_dtype=torch.float32,
+    scale_encoding="fp32",
+    rounding="nearest_even",
+    layout="planar_scales",
+)
 
 KV_CODECS: tuple[KVCodec, ...] = (
     FP16,
@@ -206,8 +218,11 @@ KV_CODECS: tuple[KVCodec, ...] = (
     INT8,
     INT8_PER_TOKEN_HEAD,
     FP8_PER_TOKEN_HEAD,
+    FP8_E4M3_PER_TOKEN_HEAD,
 )
-_BY_ALIAS = {alias: codec for codec in KV_CODECS for alias in codec.aliases}
+_BY_ALIAS = {
+    alias: codec for codec in KV_CODECS for alias in (codec.name, *codec.aliases)
+}
 
 
 def resolve_kv_codec(kv_cache_dtype: str | None) -> KVCodec | None:

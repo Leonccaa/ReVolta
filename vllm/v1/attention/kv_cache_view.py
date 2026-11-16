@@ -310,11 +310,11 @@ def bind_planar_kv_cache(
     page_size_bytes: int,
     member_index: int = 0,
     member_count: int = 1,
+    dtype: torch.dtype = torch.int8,
 ) -> torch.Tensor:
     if (
-        kernel_block_size != INT8_KERNEL_TOKENS
-        or scheduler_block_size % kernel_block_size
-    ):
+        dtype == torch.int8 and kernel_block_size != INT8_KERNEL_TOKENS
+    ) or scheduler_block_size % kernel_block_size:
         raise ValueError("INT8 v1 uses 16-token kernel pages dividing scheduler blocks")
     layout = KVPageLayout(kernel_block_size, num_heads, head_size, head_size)
     owner = KVPhysicalPage(page_size_bytes, member_count, member_index)
@@ -324,7 +324,7 @@ def bind_planar_kv_cache(
         raise ValueError("Physical padding must preserve 16-byte kernel alignment")
     # Capacity carrier only. Its final width is not a mathematical head size.
     row = head_size + 4
-    return raw.view(torch.int8).as_strided(
+    return raw.view(dtype).as_strided(
         (num_blocks * subdivisions, 2, kernel_block_size, num_heads, row),
         (
             kernel_bytes * member_count,
@@ -412,7 +412,7 @@ class KVCacheView:
             )
 
         if codec.layout == "planar_scales":
-            if b != INT8_KERNEL_TOKENS:
+            if codec.storage_dtype == torch.int8 and b != INT8_KERNEL_TOKENS:
                 raise ValueError("INT8 v1 requires a 16-token kernel-page carrier")
             layout = KVPageLayout(b, h, head_size, head_size, item)
             if (
@@ -463,7 +463,7 @@ class KVCacheView:
         return cls(codec, key, value, None, None, stride, 2 * b * h * head_size * item)
 
 
-def kv_storage_metadata(kv_cache_config, configured_dtype: str) -> dict:
+def kv_storage_metadata(kv_cache_config, configured_dtype: str, vllm_config) -> dict:
     """Versioned persistent identity for C's FileMapper.persistent_layout.
 
     Logical prefix hashes stay unchanged inside an engine. A persistent cache
@@ -473,6 +473,7 @@ def kv_storage_metadata(kv_cache_config, configured_dtype: str) -> dict:
     """
     from vllm.v1.attention.kv_codecs import resolve_kv_codec
     from vllm.v1.kv_cache_interface import kv_tensor_num_blocks
+    from vllm.v1.worker.utils import qsa_planar_kernel_block_size
 
     owners = {}
     for group in kv_cache_config.kv_cache_groups:
@@ -495,14 +496,21 @@ def kv_storage_metadata(kv_cache_config, configured_dtype: str) -> dict:
                 entry["head_size"] = spec.head_size
                 entry["head_size_v"] = getattr(spec, "head_size_v", spec.head_size)
                 if codec is not None and codec.layout == "planar_scales":
+                    tokens = (
+                        INT8_KERNEL_TOKENS
+                        if codec.storage_dtype == torch.int8
+                        else qsa_planar_kernel_block_size(
+                            group_spec.block_size, vllm_config
+                        )
+                    )
                     layout = KVPageLayout(
-                        INT8_KERNEL_TOKENS,
+                        tokens,
                         spec.num_kv_heads,
                         spec.head_size,
                         entry["head_size_v"],
                     )
                     entry["kernel_page"] = {
-                        "tokens": INT8_KERNEL_TOKENS,
+                        "tokens": tokens,
                         "alignment": 16,
                         "region_offsets": [
                             0,
@@ -512,7 +520,7 @@ def kv_storage_metadata(kv_cache_config, configured_dtype: str) -> dict:
                         ],
                         "region_bytes": layout.page_size_bytes,
                         "member_stride": spec.page_size_bytes
-                        // (spec.storage_block_size // INT8_KERNEL_TOKENS),
+                        // (spec.storage_block_size // tokens),
                     }
             else:
                 entry["shapes"] = list(spec.shapes)
@@ -538,7 +546,7 @@ def has_planar_kv_cache(kv_cache_config) -> bool:
 
     return any(
         isinstance(spec, AttentionSpec)
-        and spec.kv_quant_mode == KVQuantMode.INT8_PLANAR
+        and spec.kv_quant_mode in (KVQuantMode.INT8_PLANAR, KVQuantMode.FP8_E4M3_PLANAR)
         for group in kv_cache_config.kv_cache_groups
         for spec in getattr(
             group.kv_cache_spec, "kv_cache_specs", {"owner": group.kv_cache_spec}

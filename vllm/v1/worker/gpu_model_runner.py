@@ -12752,7 +12752,10 @@ class GPUModelRunner(
                     )
                     from vllm.v1.kv_cache_interface import KVQuantMode
 
-                    if kv_cache_spec.kv_quant_mode == KVQuantMode.INT8_PLANAR:
+                    if kv_cache_spec.kv_quant_mode in (
+                        KVQuantMode.INT8_PLANAR,
+                        KVQuantMode.FP8_E4M3_PLANAR,
+                    ):
                         if inv_order != list(range(5)):
                             raise ValueError(
                                 "Planar KV requires block-major NHD layout"
@@ -12765,6 +12768,7 @@ class GPUModelRunner(
                             num_heads=kv_cache_spec.num_kv_heads,
                             head_size=kv_cache_spec.head_size,
                             page_size_bytes=kv_cache_spec.page_size_bytes,
+                            dtype=dtype,
                         )
                     else:
                         kv_cache = bind_attention_cache(

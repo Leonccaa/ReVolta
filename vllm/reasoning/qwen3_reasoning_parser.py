@@ -149,8 +149,8 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
 
         The <think> token is placed in the prompt by the chat template,
         so typically only </think> appears in the generated output.
-        If <think> is present (e.g. from a different template), it is
-        stripped before extraction.
+        A leading <think> (e.g. from a different template) is stripped
+        before extraction.
 
         When thinking is explicitly disabled,
         returns (None, model_output) — all output is content.
@@ -167,11 +167,10 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
             # an answer are literal text when reasoning was already disabled.
             return None, model_output
 
-        # Strip <think> if present in the generated output.
+        # Strip only a leading <think>, preserving openers inside reasoning.
         model_output_parts = model_output.partition(self.start_token)
-        model_output = (
-            model_output_parts[2] if model_output_parts[1] else model_output_parts[0]
-        )
+        if model_output_parts[1] and not model_output_parts[0]:
+            model_output = model_output_parts[2]
 
         if self.end_token in model_output:
             reasoning, _, content = model_output.partition(self.end_token)

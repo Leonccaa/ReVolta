@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Mapping, Sequence
 from concurrent.futures import Executor, ThreadPoolExecutor
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import replace
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, Generic, overload
 
@@ -1012,6 +1013,17 @@ class BaseRenderer(ABC, Generic[_T]):
             )
         )
 
+    def _apply_sanitize_control_tokens(self, chat_params: ChatParams) -> ChatParams:
+        if not getattr(self.model_config, "sanitize_control_tokens", False):
+            return chat_params
+        return replace(
+            chat_params,
+            chat_template_kwargs={
+                **chat_params.chat_template_kwargs,
+                "sanitize_control_tokens": True,
+            },
+        )
+
     def render_chat(
         self,
         conversations: Sequence[list["ChatCompletionMessageParam"]],
@@ -1021,6 +1033,7 @@ class BaseRenderer(ABC, Generic[_T]):
         prompt_extras: dict[str, Any] | None = None,
         skip_mm_cache: bool = False,
     ):
+        chat_params = self._apply_sanitize_control_tokens(chat_params)
         arrival_time = time.time()
 
         if tok_params is None:
@@ -1057,6 +1070,7 @@ class BaseRenderer(ABC, Generic[_T]):
         prompt_extras: dict[str, Any] | None = None,
         skip_mm_cache: bool = False,
     ):
+        chat_params = self._apply_sanitize_control_tokens(chat_params)
         arrival_time = time.time()
 
         if tok_params is None:

@@ -2146,6 +2146,57 @@ def test_undeclared_tool_without_tools_is_unchanged(qwen3_tokenizer, tools):
 
 
 @pytest.mark.parametrize(
+    "text",
+    [
+        "An inline `<function=get_current_weather></function>` is documentation.",
+        "The prefix `<function=` and `</function>` are documentation.",
+        "<function=get_current_weather><parameter=city>Paris</parameter>",
+    ],
+)
+def test_bare_function_mentions_are_content(qwen3_tool_parser, qwen3_tokenizer, text):
+    request = ChatCompletionRequest(model=MODEL, messages=[])
+    parsed = qwen3_tool_parser.extract_tool_calls(text, request)
+    assert not parsed.tools_called
+    assert parsed.content == text
+    content = ""
+    for delta in stream_delta_message_generator(
+        qwen3_tool_parser, qwen3_tokenizer, text, request
+    ):
+        assert not delta.tool_calls
+        content += delta.content or ""
+    final = qwen3_tool_parser.finish_streaming()
+    if final:
+        assert not final.tool_calls
+        content += final.content or ""
+    assert content == text
+
+
+def test_bare_function_at_line_start(qwen3_tool_parser, qwen3_tokenizer):
+    from tests.tool_parsers.utils import run_tool_extraction_streaming
+
+    prefix = "A `<function=example></function>` is mentioned here.\n  "
+    text = prefix + (
+        "<function=get_current_weather><parameter=city>Paris</parameter></function>"
+    )
+    request = ChatCompletionRequest(model=MODEL, messages=[])
+    parsed = qwen3_tool_parser.extract_tool_calls(text, request)
+    assert parsed.tools_called
+    assert parsed.content == prefix
+    assert len(parsed.tool_calls) == 1
+    function = parsed.tool_calls[0].function
+    assert function.name == "get_current_weather"
+    assert json.loads(function.arguments) == {"city": "Paris"}
+    reconstructor = run_tool_extraction_streaming(qwen3_tool_parser, text, request)
+    final = qwen3_tool_parser.finish_streaming()
+    if final:
+        reconstructor.append_delta(final)
+    assert reconstructor.other_content == prefix
+    assert len(reconstructor.tool_calls) == 1
+    assert reconstructor.tool_calls[0].function.name == function.name
+    assert reconstructor.tool_calls[0].function.arguments == function.arguments
+
+
+@pytest.mark.parametrize(
     "body",
     [
         "<function=read><parameter=path>a.py</parameter></function>",

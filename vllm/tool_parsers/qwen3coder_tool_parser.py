@@ -418,7 +418,11 @@ class Qwen3CoderToolParser(ToolParser):
 
         # Back-off strategy if no tool_call tags found
         if len(raw_tool_calls) == 0:
-            raw_tool_calls = [model_output]
+            return re.findall(
+                r"^[^\S\n]*<function=(.*?)</function>",
+                model_output,
+                re.MULTILINE | re.DOTALL,
+            )
 
         raw_function_calls = []
         for tool_call in raw_tool_calls:
@@ -443,9 +447,10 @@ class Qwen3CoderToolParser(ToolParser):
         # surrounding <tool_call> tag. Non-streaming already falls back to this
         # format; keep streaming behavior consistent.
         if not positions:
-            func_idx = text.find(self.tool_call_prefix)
-            if func_idx != -1:
-                positions.append(func_idx)
+            positions = [
+                match.end() - len(self.tool_call_prefix)
+                for match in re.finditer(r"^[^\S\n]*<function=", text, re.MULTILINE)
+            ]
         return positions
 
     def _trailing_tool_marker_prefix(self, text: str) -> str:
@@ -646,7 +651,7 @@ class Qwen3CoderToolParser(ToolParser):
 
             # Extract content before tool calls
             content_index = model_output.find(self.tool_call_start_token)
-            idx = model_output.find(self.tool_call_prefix)
+            idx = next(iter(self._tool_start_positions(model_output)), -1)
             content_index = content_index if content_index >= 0 else idx
             content = model_output[:content_index]  # .rstrip()
             valid_tool_calls = [tc for tc in tool_calls if tc is not None]
@@ -1042,13 +1047,8 @@ class Qwen3CoderToolParser(ToolParser):
             # Check if tool call is starting
             tool_start_candidates = [
                 pos
-                for pos in (
-                    current_text.find(
-                        self.tool_call_start_token, self.content_search_start
-                    ),
-                    current_text.find(self.tool_call_prefix, self.content_search_start),
-                )
-                if pos != -1
+                for pos in self._tool_start_positions(current_text)
+                if pos >= self.content_search_start
             ]
             tool_start = min(tool_start_candidates) if tool_start_candidates else -1
             if self.tool_call_start_token_id in delta_token_ids or tool_start != -1:
@@ -1104,6 +1104,14 @@ class Qwen3CoderToolParser(ToolParser):
             tool_text = current_text[
                 tool_start_idx : tool_end_idx + len(self.tool_call_end_token)
             ]
+
+        # Bare functions must close before committing a tool header; otherwise
+        # finish_streaming can still return the buffered markup as content.
+        if (
+            not tool_text.startswith(self.tool_call_start_token)
+            and self.function_end_token not in tool_text
+        ):
+            return None
 
         # Looking for function header
         if not self.header_sent:

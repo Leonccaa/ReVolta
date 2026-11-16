@@ -6,6 +6,7 @@ from collections.abc import Generator
 from unittest.mock import MagicMock
 
 import pytest
+from openai.types.responses import WebSearchTool
 from openai.types.responses.function_tool import FunctionTool
 from xgrammar import StructuralTag
 
@@ -20,6 +21,7 @@ from vllm.entrypoints.openai.engine.protocol import (
     FunctionCall,
     ToolCall,
 )
+from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.tokenizers import TokenizerLike, get_tokenizer
 from vllm.tokenizers.detokenizer_utils import detokenize_incrementally
 from vllm.tool_parsers.qwen3coder_tool_parser import (
@@ -2032,3 +2034,199 @@ def test_empty_block_keeps_nonempty_literal_fallback(qwen3_tool_parser):
     assert pending is not None
     assert pending.content == literal
     assert qwen3_tool_parser.finish_streaming() is None
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "<function=undeclared><parameter=city>Paris</parameter></function>",
+        '{"name":"undeclared","arguments":{"city":"Paris"}}',
+    ],
+)
+def test_undeclared_tool_name_is_content(qwen3_tool_parser, qwen3_tokenizer, body):
+    text = "Example:\n<tool_call>" + body + "</tool_call>\nDone."
+    request = ChatCompletionRequest(
+        model=MODEL,
+        messages=[],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_current_weather",
+                    "parameters": WEATHER_PARAMS,
+                },
+            },
+            {
+                "type": "function",
+                "function": {"name": "calculate_area", "parameters": AREA_PARAMS},
+            },
+        ],
+    )
+    parsed = qwen3_tool_parser.extract_tool_calls(text, request)
+    assert not parsed.tools_called
+    assert parsed.content == text
+    content = ""
+    for delta in stream_delta_message_generator(
+        qwen3_tool_parser, qwen3_tokenizer, text, request
+    ):
+        assert not delta.tool_calls
+        content += delta.content or ""
+    final = qwen3_tool_parser.finish_streaming()
+    if final:
+        assert not final.tool_calls
+        content += final.content or ""
+    assert content == text
+
+    from tests.tool_parsers.utils import run_tool_extraction_streaming
+
+    # A speculative burst can contain the prefix and the whole rejected call.
+    for chunks in ([text], [text[:-2], text[-2:]]):
+        parser = Qwen3CoderToolParser(qwen3_tokenizer, tools=qwen3_tool_parser.tools)
+        reconstructor = run_tool_extraction_streaming(parser, chunks, request)
+        final = parser.finish_streaming()
+        if final:
+            reconstructor.append_delta(final)
+        assert not reconstructor.tool_calls
+        assert reconstructor.other_content == text
+
+
+def test_undeclared_tool_plain_spelling_is_content(qwen3_tool_parser, qwen3_tokenizer):
+    from tests.tool_parsers.utils import run_tool_extraction_streaming
+
+    text = "Example: <tool_call><function=undeclared></function></tool_call> Done."
+    request = ChatCompletionRequest(
+        model=MODEL,
+        messages=[],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_current_weather",
+                    "parameters": WEATHER_PARAMS,
+                },
+            },
+        ],
+    )
+    parsed = qwen3_tool_parser.extract_tool_calls(text, request)
+    assert not parsed.tools_called
+    assert parsed.content == text
+    # Single-character deltas spell the markers with ordinary tokens.
+    reconstructor = run_tool_extraction_streaming(
+        qwen3_tool_parser, list(text), request
+    )
+    final = qwen3_tool_parser.finish_streaming()
+    if final:
+        reconstructor.append_delta(final)
+    assert not reconstructor.tool_calls
+    assert reconstructor.other_content == text
+
+
+@pytest.mark.parametrize("tools", [None, []])
+def test_undeclared_tool_without_tools_is_unchanged(qwen3_tokenizer, tools):
+    from tests.tool_parsers.utils import run_tool_extraction_streaming
+
+    text = (
+        "<tool_call><function=undeclared><parameter=city>Paris</parameter>"
+        "</function></tool_call>"
+    )
+    request = ChatCompletionRequest(model=MODEL, messages=[])
+    parser = Qwen3CoderToolParser(qwen3_tokenizer, tools=tools)
+    parsed = parser.extract_tool_calls(text, request)
+    assert parsed.tools_called
+    assert parsed.content is None
+    assert len(parsed.tool_calls) == 1
+    call = parsed.tool_calls[0].function
+    assert call.name == "undeclared"
+    assert json.loads(call.arguments) == {"city": "Paris"}
+    reconstructor = run_tool_extraction_streaming(parser, text, request)
+    assert reconstructor.other_content == ""
+    assert len(reconstructor.tool_calls) == 1
+    assert reconstructor.tool_calls[0].function.name == call.name
+    assert reconstructor.tool_calls[0].function.arguments == call.arguments
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "<function=read><parameter=path>a.py</parameter></function>",
+        '{"name":"read","arguments":{"path":"a.py"}}',
+    ],
+)
+def test_responses_nonfunction_tool_before_function(qwen3_tokenizer, body):
+    from tests.tool_parsers.utils import run_tool_extraction_streaming
+
+    request = ResponsesRequest(
+        model=MODEL,
+        input="Read the file",
+        tools=[
+            WebSearchTool(type="web_search"),
+            FunctionTool(
+                type="function",
+                name="read",
+                parameters={
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                },
+                strict=False,
+            ),
+        ],
+    )
+    text = "<tool_call>" + body + "</tool_call>"
+    parser = Qwen3CoderToolParser(qwen3_tokenizer, tools=request.tools)
+    parsed = parser.extract_tool_calls(text, request)
+    assert parsed.tools_called
+    assert parsed.content is None
+    assert len(parsed.tool_calls) == 1
+    function = parsed.tool_calls[0].function
+    assert function.name == "read"
+    assert json.loads(function.arguments) == {"path": "a.py"}
+    parser = Qwen3CoderToolParser(qwen3_tokenizer, tools=request.tools)
+    reconstructor = run_tool_extraction_streaming(parser, text, request)
+    assert reconstructor.other_content == ""
+    assert len(reconstructor.tool_calls) == 1
+    assert reconstructor.tool_calls[0].function.name == function.name
+    assert reconstructor.tool_calls[0].function.arguments == function.arguments
+
+
+def test_undeclared_then_declared_in_one_burst(qwen3_tokenizer):
+    request = ChatCompletionRequest(
+        model=MODEL,
+        messages=[],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "read",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                    },
+                },
+            },
+        ],
+    )
+    prefix = "Before.\n"
+    rejected = "<tool_call><function=example></function></tool_call>"
+    middle = "\nBetween.\n"
+    accepted = (
+        "<tool_call><function=read><parameter=path>a.py</parameter>"
+        "</function></tool_call>"
+    )
+    text = prefix + rejected + middle + accepted
+    parser = Qwen3CoderToolParser(qwen3_tokenizer, tools=request.tools)
+    parsed = parser.extract_tool_calls(text, request)
+    assert parsed.tools_called
+    assert parsed.content == prefix
+    assert len(parsed.tool_calls) == 1
+    function = parsed.tool_calls[0].function
+    assert function.name == "read"
+    assert json.loads(function.arguments) == {"path": "a.py"}
+    ids = qwen3_tokenizer.encode(text, add_special_tokens=False)
+    parser = Qwen3CoderToolParser(qwen3_tokenizer, tools=request.tools)
+    delta = parser.extract_tool_calls_streaming("", text, text, [], ids, ids, request)
+    assert delta is not None
+    assert delta.content == prefix + rejected + middle
+    assert len(delta.tool_calls) == 1
+    assert delta.tool_calls[0].function.name == function.name
+    assert delta.tool_calls[0].function.arguments == function.arguments
+    assert parser.finish_streaming() is None

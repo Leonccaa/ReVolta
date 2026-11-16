@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from types import SimpleNamespace
 
 import numpy as np
@@ -50,6 +51,9 @@ def test_compact_guard_checks_each_rows_sampling_parameters(temperature):
     assert _compact_target_requires_reference(probe, temperatures, top_p) == expected
 
 
+@pytest.mark.skipif(
+    os.environ.get("TRITON_INTERPRET") != "1", reason="CPU Triton interpreter required"
+)
 @pytest.mark.parametrize(
     ("temperatures", "top_ps"),
     [([0.5, 2.0, 1.0], [0.95, 0.9, 1.0]), ([1.0, 2.0, 0.1], [0.8, 0.9, 0.8])],

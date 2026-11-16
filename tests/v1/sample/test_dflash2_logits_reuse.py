@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Dense fallback must reuse one projection and retain exact sampling logits."""
 
+import os
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -78,6 +79,9 @@ def test_fused_candidates_do_not_require_dense_logits(monkeypatch):
     assert torch.equal(result[0], ids)
 
 
+@pytest.mark.skipif(
+    os.environ.get("TRITON_INTERPRET") != "1", reason="CPU Triton interpreter required"
+)
 @pytest.mark.parametrize("gather_rank", [False, True])
 def test_cutoff_fallback_records_completed_projection_on_every_rank(
     monkeypatch, gather_rank

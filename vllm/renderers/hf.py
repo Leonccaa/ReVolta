@@ -27,6 +27,7 @@ from vllm.entrypoints.chat_utils import (
     parse_chat_messages,
     parse_chat_messages_async,
 )
+from vllm.exceptions import VLLMValidationError
 from vllm.inputs import EmbedsPrompt
 from vllm.inputs.engine import MultiModalInput
 from vllm.logger import init_logger
@@ -918,6 +919,24 @@ def replace_vision_chunk_video_placeholder(
     return prompt_raw
 
 
+def _prepare_sanitize_control_tokens(
+    chat_template_kwargs: dict[str, Any],
+    content_format: str,
+    has_mm_inputs: bool,
+) -> None:
+    if not chat_template_kwargs.get("sanitize_control_tokens"):
+        return
+    # vLLM inserts multimodal placeholders into "string" content, where
+    # transformers would sanitize them too
+    if has_mm_inputs and content_format == "string":
+        raise VLLMValidationError(
+            "`sanitize_control_tokens` does not support multimodal inputs with "
+            "the 'string' chat template content format."
+        )
+    # transformers only sanitizes control tokens when tokenizing
+    chat_template_kwargs["tokenize"] = True
+
+
 class HfRenderer(BaseRenderer[HfTokenizer]):
     def __init__(
         self,
@@ -982,16 +1001,17 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
             )
 
         messages = self._prepare_developer_messages(messages, params)
+        content_format = resolve_chat_template_content_format(
+            chat_template=params.chat_template,
+            tools=params.chat_template_kwargs.get("tools"),
+            given_format=params.chat_template_content_format,
+            tokenizer=tokenizer,
+            model_config=model_config,
+        )
         conversation, mm_data, mm_uuids = parse_chat_messages(
             messages,
             model_config,
-            content_format=resolve_chat_template_content_format(
-                chat_template=params.chat_template,
-                tools=params.chat_template_kwargs.get("tools"),
-                given_format=params.chat_template_content_format,
-                tokenizer=tokenizer,
-                model_config=model_config,
-            ),
+            content_format=content_format,
             media_io_kwargs=params.media_io_kwargs,
             mm_processor_kwargs=params.mm_processor_kwargs,
         )
@@ -1014,6 +1034,11 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
             if chat_template_kwargs.get("tokenize") is False:
                 logger.warning_once(_TOKENIZE_OVERRIDE_WARNING)
             chat_template_kwargs["tokenize"] = True
+        _prepare_sanitize_control_tokens(
+            chat_template_kwargs,
+            content_format,
+            has_mm_inputs=bool(mm_data or prompt_embeds_tensors),
+        )
 
         prompt_raw = safe_apply_chat_template(
             model_config,
@@ -1090,16 +1115,17 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
             )
 
         messages = self._prepare_developer_messages(messages, params)
+        content_format = resolve_chat_template_content_format(
+            chat_template=params.chat_template,
+            tools=params.chat_template_kwargs.get("tools"),
+            given_format=params.chat_template_content_format,
+            tokenizer=tokenizer,
+            model_config=model_config,
+        )
         conversation, mm_data, mm_uuids = await parse_chat_messages_async(
             messages,
             model_config,
-            content_format=resolve_chat_template_content_format(
-                chat_template=params.chat_template,
-                tools=params.chat_template_kwargs.get("tools"),
-                given_format=params.chat_template_content_format,
-                tokenizer=tokenizer,
-                model_config=model_config,
-            ),
+            content_format=content_format,
             media_io_kwargs=params.media_io_kwargs,
             mm_processor_kwargs=params.mm_processor_kwargs,
         )
@@ -1119,6 +1145,11 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
             if chat_template_kwargs.get("tokenize") is False:
                 logger.warning_once(_TOKENIZE_OVERRIDE_WARNING)
             chat_template_kwargs["tokenize"] = True
+        _prepare_sanitize_control_tokens(
+            chat_template_kwargs,
+            content_format,
+            has_mm_inputs=bool(mm_data or prompt_embeds_tensors),
+        )
 
         prompt_raw = await self._apply_chat_template_async(
             model_config,

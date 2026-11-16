@@ -365,6 +365,11 @@ class CudaGraphManager:
             self._capture_sizes.sort()
         self._init_candidates()
 
+    @property
+    def max_captured_tokens(self) -> int:
+        """Largest batch size ``dispatch`` can route to a captured graph."""
+        return len(self._candidates) - 1
+
     def _init_candidates(self) -> None:
         """Build priority-ordered candidate lists for each token count."""
         capture_sizes = self._capture_sizes

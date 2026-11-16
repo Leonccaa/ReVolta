@@ -620,6 +620,7 @@ class EngineArgs:
     )
     io_processor_plugin: str | None = None
     renderer_num_workers: int = 1
+    sanitize_control_tokens: bool = ModelConfig.sanitize_control_tokens
     skip_mm_profiling: bool = MultiModalConfig.skip_mm_profiling
     video_pruning_rate: float | None = MultiModalConfig.video_pruning_rate
     mm_tensor_ipc: MMTensorIPC = MultiModalConfig.mm_tensor_ipc
@@ -919,6 +920,10 @@ class EngineArgs:
         model_group.add_argument(
             "--renderer-num-workers",
             **model_kwargs["renderer_num_workers"],
+        )
+        model_group.add_argument(
+            "--sanitize-control-tokens",
+            **model_kwargs["sanitize_control_tokens"],
         )
 
         # Model loading arguments
@@ -1715,6 +1720,7 @@ class EngineArgs:
             mm_tensor_ipc=self.mm_tensor_ipc,
             io_processor_plugin=self.io_processor_plugin,
             renderer_num_workers=self.renderer_num_workers,
+            sanitize_control_tokens=self.sanitize_control_tokens,
         )
 
     def validate_tensorizer_args(self):

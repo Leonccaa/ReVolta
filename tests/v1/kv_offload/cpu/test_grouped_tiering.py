@@ -24,6 +24,7 @@ from vllm.v1.kv_offload.base import (
     make_offload_key,
 )
 from vllm.v1.kv_offload.cpu.manager import GroupedCPUOffloadingManager
+from vllm.v1.kv_offload.tiering.fs.identity import KV_COMPAT_EPOCH
 
 GROUP_PAGES = {0: 8192, 2: 4096}
 WORLD_SIZE = 2
@@ -390,7 +391,8 @@ def test_spec_declares_layout_and_rejects_unsupported_topology(monkeypatch, topo
         return
     spec = spec_module.TieringOffloadingSpec(config, cache)
     layout = spec.persistent_layout
-    assert layout["config_hash"] == "configuration-hash"
+    assert layout["kv_compat_epoch"] == KV_COMPAT_EPOCH
+    assert "config_hash" not in layout
     assert layout["model_revision"] == "fixed-model-revision"
     assert layout["tensors"] == [{"page_size": 4096, "shared_by": ["a", "b"]}]
     # Changing runtime capacity does not change physical bytes per cache row.

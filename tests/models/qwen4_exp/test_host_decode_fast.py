@@ -38,7 +38,7 @@ pytestmark = pytest.mark.skipif(
 def test_decode_growth_eviction_reuse_matches_paged_bytes_and_attention(
     monkeypatch, e4m3, world, rank
 ):
-    monkeypatch.setenv("REVOLTA_RESEARCH_HOST_DECODE_FAST", "1")
+    monkeypatch.setenv("VLLM_SM70_HOST_DECODE_FAST", "1")
     engine = Engine(
         _shape(
             e4m3,
@@ -85,9 +85,9 @@ def test_fused_shard_metadata_matches_torch_for_padding_and_boundaries(
     lengths = torch.tensor([-99, 0, c - 1, c, 32768, 2**30], dtype=dtype)
     for world in (2, 3, 4):
         for rank in range(world):
-            monkeypatch.setenv("REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED", "0")
+            monkeypatch.setenv("VLLM_SM70_QSA_LOCAL_INPUTS_FUSED", "0")
             expected = _shared_key_local_inputs(positions, lengths, c, world, rank)
-            monkeypatch.setenv("REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED", "1")
+            monkeypatch.setenv("VLLM_SM70_QSA_LOCAL_INPUTS_FUSED", "1")
             actual = _shared_key_local_inputs(positions, lengths, c, world, rank)
             assert all(torch.equal(a, b) for a, b in zip(expected, actual))
             assert actual[0].dtype == dtype and actual[1].dtype == dtype
@@ -96,15 +96,15 @@ def test_fused_shard_metadata_matches_torch_for_padding_and_boundaries(
 def test_fused_shard_metadata_empty_and_noncontiguous_fallback(monkeypatch):
     from vllm.models.qwen4_exp.nvidia.ops.qsa import _shared_key_local_inputs
 
-    monkeypatch.setenv("REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED", "1")
+    monkeypatch.setenv("VLLM_SM70_QSA_LOCAL_INPUTS_FUSED", "1")
     for positions, lengths in (
         (torch.empty(0, dtype=torch.int64), torch.empty(0, dtype=torch.int32)),
         (torch.arange(20, dtype=torch.int64)[::2], torch.tensor([32])),
     ):
         actual = _shared_key_local_inputs(positions, lengths, 4, 2, 1)
-        monkeypatch.setenv("REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED", "0")
+        monkeypatch.setenv("VLLM_SM70_QSA_LOCAL_INPUTS_FUSED", "0")
         expected = _shared_key_local_inputs(positions, lengths, 4, 2, 1)
-        monkeypatch.setenv("REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED", "1")
+        monkeypatch.setenv("VLLM_SM70_QSA_LOCAL_INPUTS_FUSED", "1")
         assert all(torch.equal(a, b) for a, b in zip(expected, actual))
 
 
@@ -133,9 +133,9 @@ def test_fused_shard_metadata_runtime_counts_match_reference(monkeypatch, np, nl
 
     positions = torch.arange(np, dtype=torch.int64) * 3 - 4
     lengths = torch.arange(nl, dtype=torch.int32) * 7
-    monkeypatch.setenv("REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED", "0")
+    monkeypatch.setenv("VLLM_SM70_QSA_LOCAL_INPUTS_FUSED", "0")
     expected = _shared_key_local_inputs(positions, lengths, 4, 2, 1)
-    monkeypatch.setenv("REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED", "1")
+    monkeypatch.setenv("VLLM_SM70_QSA_LOCAL_INPUTS_FUSED", "1")
     actual = _shared_key_local_inputs(positions, lengths, 4, 2, 1)
     assert all(torch.equal(a, b) for a, b in zip(actual, expected))
 
@@ -158,9 +158,9 @@ def _four_same_group_engine(monkeypatch, spy, fast):
     ``max_requests=4`` makes the parent-free heuristic (a write of at most
     ``max_requests * decode_rows`` rows) select the fused publish, exactly
     like a production prefill chunk of that size hits the fused write path
-    while ``REVOLTA_RESEARCH_HOST_DECODE_FAST=1`` (review N2).
+    while ``VLLM_SM70_HOST_DECODE_FAST=1`` (review N2).
     """
-    monkeypatch.setenv("REVOLTA_RESEARCH_HOST_DECODE_FAST", "1" if fast else "0")
+    monkeypatch.setenv("VLLM_SM70_HOST_DECODE_FAST", "1" if fast else "0")
     spy.calls = 0
     engine = Engine(_shape(True, blocks=40, rows_per_pass=2, requests=4), seed=29)
     assert engine.store.decode_fast is fast
@@ -197,9 +197,9 @@ def test_fused_write_of_four_same_group_tokens_publishes_like_baseline(monkeypat
 
 
 def _switch_path_trace(monkeypatch, orig_run, outs, fast):
-    """Rebuild the store under ``REVOLTA_RESEARCH_HOST_DECODE_FAST`` and run
+    """Rebuild the store under ``VLLM_SM70_HOST_DECODE_FAST`` and run
     the decode/eviction/reuse trace, recording every attention output."""
-    monkeypatch.setenv("REVOLTA_RESEARCH_HOST_DECODE_FAST", "1" if fast else "0")
+    monkeypatch.setenv("VLLM_SM70_HOST_DECODE_FAST", "1" if fast else "0")
     engine = Engine(_shape(True, blocks=65, rows_per_pass=2, requests=2), seed=17)
 
     def record(self, *args, **kwargs):
@@ -261,7 +261,7 @@ def _ordered_marks_trace(monkeypatch, *, fast, ordered, world=1, rank=0):
     """Run the decode trace under the fused mark kernel and snapshot, after
     every step, the effective Touched stream, the Misses list and the whole
     eviction state (mapping, owners, ages, hand, ready)."""
-    monkeypatch.setenv("REVOLTA_RESEARCH_HOST_DECODE_FAST", "1" if fast else "0")
+    monkeypatch.setenv("VLLM_SM70_HOST_DECODE_FAST", "1" if fast else "0")
     monkeypatch.setenv(
         "REVOLTA_RESEARCH_HOST_DECODE_FAST_ORDERED", "1" if ordered else "0"
     )
@@ -336,7 +336,7 @@ def test_ordered_fused_marks_keep_baseline_touched_and_miss_order(
 
 
 def test_ordered_sub_switch_requires_parent_switch(monkeypatch):
-    monkeypatch.setenv("REVOLTA_RESEARCH_HOST_DECODE_FAST", "0")
+    monkeypatch.setenv("VLLM_SM70_HOST_DECODE_FAST", "0")
     monkeypatch.setenv("REVOLTA_RESEARCH_HOST_DECODE_FAST_ORDERED", "1")
     engine = Engine(_shape(True, blocks=33), seed=5)
     assert not engine.store.decode_fast

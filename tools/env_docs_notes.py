@@ -12,7 +12,7 @@ Add a variable here to document it, then run `python tools/gen_env_docs.py`.
 
 SECTIONS = {
     "research": "Pregraph preparation research switches",
-    "promoted": "Promoted research switches (0.2.0rc5)",
+    "promoted": "Promoted research switches",
     "deployment": "Settings used by the reference deployment",
     "profile": "Values applied by the ReVolta profile",
     "usage": "Anonymous usage statistics",
@@ -63,14 +63,11 @@ NOTES: dict[str, dict[str, str]] = {
         "and preparation traces",
     ),
     "REVOLTA_RESEARCH_CHECKPOINT_CACHE_DROP": dict(
-        section="deployment",
+        section="promoted",
         since="0.2.0",
         range="0, 1",
-        tradeoff="Research, engine startup only; default off. 1 requests clean "
-        "checkpoint cache eviction before host KV allocation, after a world "
-        "load barrier. Skips live mappings and PLE disk/cascade modes. May "
-        "slow later reloads or other engines reading the same checkpoint. "
-        "See startup logs for advised files/bytes and cgroup usage; no metric.",
+        tradeoff="Deprecated alias of VLLM_SM70_CHECKPOINT_CACHE_DROP; "
+        "removed in 0.2.0rc13. The new name wins when both are set.",
         metrics="",
     ),
     "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB": dict(
@@ -115,6 +112,51 @@ NOTES: dict[str, dict[str, str]] = {
         tradeoff="ng=2 tiling is 8-26% faster at M = 9..24 and 33..48 on V100; "
         "other M keep the fixed plan. Only with VLLM_SM70_QWEN38_GDN_NO_PACK. "
         + _BITWISE,
+        metrics="",
+    ),
+    "VLLM_SM70_HOST_DECODE_FAST": dict(
+        section="promoted",
+        since="0.2.0",
+        range="0, 1",
+        tradeoff="Default on. Long-context host KV decode only: fuses three "
+        "pairs of host-history decode kernels. Set 0 and restart to restore "
+        "the original kernels; ordinary GPU KV paths are unaffected.",
+        metrics="",
+    ),
+    "VLLM_SM70_QSA_LOCAL_INPUTS_FUSED": dict(
+        section="promoted",
+        since="0.2.0",
+        range="0, 1",
+        tradeoff="Default on. DCP-sharded shared-key scorer: one fused "
+        "integer metadata conversion instead of the torch reference. Set 0 "
+        "and restart to restore the torch reference.",
+        metrics="",
+    ),
+    "VLLM_SM70_CHECKPOINT_CACHE_DROP": dict(
+        section="promoted",
+        since="0.2.0",
+        range="0, 1",
+        tradeoff="Default on; engine startup only. 1 requests clean "
+        "checkpoint cache eviction before host KV allocation, after a world "
+        "load barrier. Skips live mappings and PLE disk/cascade modes. May "
+        "slow later reloads or other engines reading the same checkpoint. "
+        "See startup logs for advised files/bytes and cgroup usage; no metric.",
+        metrics="",
+    ),
+    "REVOLTA_RESEARCH_HOST_DECODE_FAST": dict(
+        section="promoted",
+        since="0.2.0",
+        range="0, 1",
+        tradeoff="Deprecated alias of VLLM_SM70_HOST_DECODE_FAST; removed in "
+        "0.2.0rc13. The new name wins when both are set.",
+        metrics="",
+    ),
+    "REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED": dict(
+        section="promoted",
+        since="0.2.0",
+        range="0, 1",
+        tradeoff="Deprecated alias of VLLM_SM70_QSA_LOCAL_INPUTS_FUSED; "
+        "removed in 0.2.0rc13. The new name wins when both are set.",
         metrics="",
     ),
     "REVOLTA_GDN_CPU_SPEC_QSL": dict(

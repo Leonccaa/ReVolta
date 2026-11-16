@@ -43,6 +43,7 @@ import numpy as np
 import torch
 from numpy.typing import NDArray
 
+from vllm import envs
 from vllm.triton_utils import triton
 from vllm.utils.torch_utils import (
     async_tensor_h2d,
@@ -424,10 +425,9 @@ class HostHistoryStore:
         if device.type == "cpu" and os.environ.get("TRITON_INTERPRET") != "1":
             raise ValueError("CPU host history fixtures require TRITON_INTERPRET=1")
         self.shape, self.device, self.debug = shape, device, debug
-        # Runtime-only experiment: does not alter cache identity or config hash.
-        self.decode_fast = (
-            os.environ.get("REVOLTA_RESEARCH_HOST_DECODE_FAST", "0") == "1"
-        )
+        # Long-context host KV decode fast path; read once per process, like
+        # the interpreter gates around this store.
+        self.decode_fast = envs.VLLM_SM70_HOST_DECODE_FAST
         # Sub-switch: the fused mark kernel keeps the two phases' Touched
         # lists separate (tail first) so the Misses/victims pairing matches
         # the unfused baseline. Read once per process, like decode_fast.

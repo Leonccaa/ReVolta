@@ -1455,7 +1455,7 @@ def _shared_key_local_inputs(
     zero visible groups). Fixed shapes and no host sync.
     """
     if (
-        os.environ.get("REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED", "0") == "1"
+        envs.VLLM_SM70_QSA_LOCAL_INPUTS_FUSED
         and (query_positions.is_cuda or os.environ.get("TRITON_INTERPRET") == "1")
         and query_positions.is_contiguous()
         and sequence_lengths.is_contiguous()

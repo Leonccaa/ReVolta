@@ -107,13 +107,18 @@ class KVCacheSpec:
     block_size: int
     dcp_sharded: bool = field(default=False, kw_only=True)
     """Whether context parallel ranks own disjoint token slots in this cache."""
+    shard_world: int = field(default=0, kw_only=True)
+    """Ranks sharing this cache's token slots when that is not the DCP size
+    (the QSA indexer shards over the whole TP group); 0 means the DCP size."""
 
     def global_block_size(
         self, dcp_world_size: int = 1, pcp_world_size: int = 1
     ) -> int:
         """Token span represented by one physical block on this rank."""
         if self.dcp_sharded:
-            return self.block_size * dcp_world_size * pcp_world_size
+            return (
+                self.block_size * (self.shard_world or dcp_world_size) * pcp_world_size
+            )
         return self.block_size
 
     @property
@@ -276,8 +281,9 @@ class FullAttentionSpec(AttentionSpec):
         pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
         # Note(hc): each dcp rank only need save
         # (max_model_len//dcp_world_size) tokens locally.
-        if self.dcp_sharded and dcp_world_size * pcp_world_size > 1:
-            max_model_len = cdiv(max_model_len, dcp_world_size * pcp_world_size)
+        world = (self.shard_world or dcp_world_size) * pcp_world_size
+        if self.dcp_sharded and world > 1:
+            max_model_len = cdiv(max_model_len, world)
         return cdiv(max_model_len, self.block_size) * self.page_size_bytes
 
     @classmethod
@@ -440,6 +446,7 @@ class MLAAttentionSpec(FullAttentionSpec):
             "All attention layers in the same KV cache group must be MLAAttentionSpec."
         )
         assert len({spec.dcp_sharded for spec in specs}) == 1
+        assert len({spec.shard_world for spec in specs}) == 1
         cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
         compress_ratio_set = set(spec.compress_ratio for spec in specs)
         model_version_set = set(spec.model_version for spec in specs)
@@ -454,6 +461,7 @@ class MLAAttentionSpec(FullAttentionSpec):
         return cls(
             block_size=specs[0].block_size,
             dcp_sharded=specs[0].dcp_sharded,
+            shard_world=specs[0].shard_world,
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
             dtype=specs[0].dtype,
@@ -939,7 +947,12 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         """
         if cls.is_uniform_type(kv_cache_specs, dcp_world_size):
             specs = list(kv_cache_specs.values())
-            representative = next((s for s in specs if s.dcp_sharded), specs[0])
+            # A TP-sharded member (the indexer) has a smaller block_size; the
+            # group's block is the one of the DCP-sharded main K/V.
+            representative = next(
+                (s for s in specs if s.dcp_sharded and not s.shard_world),
+                next((s for s in specs if s.dcp_sharded), specs[0]),
+            )
             return cls(
                 block_size=representative.block_size,
                 kv_cache_specs=kv_cache_specs,

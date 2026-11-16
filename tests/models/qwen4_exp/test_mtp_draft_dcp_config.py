@@ -84,7 +84,8 @@ def test_geometry_decision_table(method, m5, long_context, dcp, sharded):
         spec = QSACompressedKeyCache.get_kv_cache_spec(side, config)
         index_sharded = m5 and dcp > 1 and (prefix == TARGET or sharded)
         assert spec.dcp_sharded is index_sharded
-        assert spec.block_size == (1664 // dcp if index_sharded else 1664)
+        # The indexer is split over the whole TP group (4), not only DCP.
+        assert spec.block_size == (1664 // 4 if index_sharded else 1664)
         assert spec.storage_block_size == spec.block_size // 4
 
     ring = QSAKeyStateCache.get_kv_cache_spec(

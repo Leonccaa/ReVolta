@@ -82,6 +82,18 @@ def _unpack_query(
     tl.store(dest + 1, (bits >> 16).to(tl.uint16), valid)
 
 
+def require_dcp2_index_world(vllm_config) -> None:
+    """The exchange gathers over the DCP pair, so it needs a pair-sharded index."""
+    from ...common.qsa_cache import qsa_index_shard_world
+
+    world = qsa_index_shard_world(vllm_config)
+    if world != 2:
+        raise ValueError(
+            "REVOLTA_RESEARCH_QSA_DECODE_COALESCE_AG exchanges candidates over "
+            f"two ranks, but the sharded indexer is split over {world} ranks"
+        )
+
+
 class QSACoalesceWorkspace:
     """One workspace per model, shared by its serial QSA layers and graphs.
 

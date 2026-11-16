@@ -37,7 +37,9 @@ def test_qsa_real_cache_specs_keep_only_target_main_sharded(
 ) -> None:
     config = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=1600),
-        parallel_config=SimpleNamespace(decode_context_parallel_size=2),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=2, tensor_parallel_size=2
+        ),
     )
     main = _bare_qsa_attention(output_width=4)
     main.layer_name = prefix

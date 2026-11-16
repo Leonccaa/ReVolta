@@ -25,10 +25,13 @@ TARGET = "model.layers.3.self_attn.indexer.compressed_key_cache"
 DRAFT = "mtp.layers.0.self_attn.indexer.compressed_key_cache"
 
 
-def _config(shard: bool, block_size: int = 1664, dcp: int = 2):
+def _config(shard: bool, block_size: int = 1664, dcp: int = 2, tp: int | None = None):
     return SimpleNamespace(
         cache_config=SimpleNamespace(block_size=block_size),
-        parallel_config=SimpleNamespace(decode_context_parallel_size=dcp),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=dcp,
+            tensor_parallel_size=dcp if tp is None else tp,
+        ),
         kernel_config=SimpleNamespace(qsa_dcp_index_shard=shard),
     )
 
@@ -58,6 +61,23 @@ def test_sharded_target_indexer_geometry() -> None:
     assert spec.storage_block_size == 208
     replicated = _side(TARGET).get_kv_cache_spec(_config(False))
     assert spec.page_size_bytes * 2 == replicated.page_size_bytes
+
+
+def test_indexer_shards_over_the_tp_group() -> None:
+    config = _config(True, block_size=1664, dcp=2, tp=4)
+    spec = _side(TARGET).get_kv_cache_spec(config)
+    assert spec.dcp_sharded and spec.shard_world == 4
+    assert spec.block_size == 416 and spec.storage_block_size == 104
+    # One scheduler block still spans the same global tokens as the main K/V.
+    assert spec.global_block_size(2) == 1664
+    dcp_only = _side(TARGET).get_kv_cache_spec(_config(True))
+    assert dcp_only.shard_world == 0
+    assert spec.page_size_bytes * 2 == dcp_only.page_size_bytes
+    # Every TP rank of a DCP group owns a disjoint quarter of the groups.
+    assert qsa_cache.qsa_index_shard_world(config) == 4
+    assert qsa_index_dcp_sharded(config, TARGET, 4)
+    with pytest.raises(ValueError, match="divisible"):
+        qsa_index_dcp_sharded(_config(True, block_size=1668, tp=8), TARGET, 4)
 
 
 def test_draft_indexer_stays_replicated() -> None:
@@ -158,6 +178,29 @@ def test_canonical_block_table_does_not_shrink_sharded_page(sharded: bool) -> No
     table = (pages[:, :, None] * expansion + torch.arange(expansion)).reshape(2, -1)
     canonical = builder._canonical_block_table(table.to(torch.int32))
     assert torch.equal(canonical, pages)
+
+
+def test_canonical_block_table_of_a_tp_sharded_indexer_page() -> None:
+    # TP4/DCP2: the indexer page covers 416 of the 832 local main tokens the
+    # shared table counts, yet still names the same physical page.
+    builder = object.__new__(QSAMetadataBuilder)
+    builder.kv_cache_spec = MLAAttentionSpec(
+        block_size=416,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float16,
+        compress_ratio=4,
+        dcp_sharded=True,
+        shard_world=4,
+    )
+    builder.kernel_block_size = 16
+    builder.dcp_world_size = 2
+    builder.reads_sharded_group = True
+    builder.block_table_buffer = torch.empty((2, 4), dtype=torch.int32)
+    expansion = 832 // 16
+    pages = torch.tensor([[3, 9, 4], [6, 1, 8]], dtype=torch.int32)
+    table = (pages[:, :, None] * expansion + torch.arange(expansion)).reshape(2, -1)
+    assert torch.equal(builder._canonical_block_table(table.to(torch.int32)), pages)
 
 
 def test_metadata_carries_index_ownership() -> None:
@@ -1079,8 +1122,45 @@ def test_uniform_spec_with_sharded_indexer_keeps_main_representative() -> None:
     assert uniform.page_size_bytes == main.page_size_bytes + index.page_size_bytes
 
 
+def test_uniform_spec_with_tp_sharded_indexer_keeps_main_block() -> None:
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, UniformTypeKVCacheSpecs
+
+    main = FullAttentionSpec(
+        block_size=832,
+        num_kv_heads=1,
+        head_size=256,
+        dtype=torch.uint8,
+        dcp_sharded=True,
+    )
+    index = MLAAttentionSpec(
+        block_size=416,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float16,
+        compress_ratio=4,
+        dcp_sharded=True,
+        shard_world=4,
+    )
+    # The indexer comes first: the group must still use the main K/V block.
+    uniform = UniformTypeKVCacheSpecs.from_specs(
+        {"layers.3.attn.indexer.k": index, "layers.3.attn": main}, 2
+    )
+    assert uniform is not None
+    assert uniform.block_size == 832 and uniform.global_block_size(2) == 1664
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=1 << 20),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=2, prefill_context_parallel_size=1
+        ),
+    )
+    # A quarter of the context lives on each rank, in blocks of 416 slots.
+    assert index.max_memory_usage_bytes(config) == (
+        -(-(1 << 20) // 4 // 416) * index.page_size_bytes
+    )
+
+
 def test_builder_injects_this_rank(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(qsa_cache, "_current_dcp_rank", lambda: 1)
+    monkeypatch.setattr(qsa_cache, "_current_tp_rank", lambda: 1)
     spec = MLAAttentionSpec(
         block_size=832,
         num_kv_heads=1,
@@ -1090,7 +1170,9 @@ def test_builder_injects_this_rank(monkeypatch: pytest.MonkeyPatch) -> None:
         dcp_sharded=True,
     )
     config = SimpleNamespace(
-        parallel_config=SimpleNamespace(decode_context_parallel_size=2),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=2, tensor_parallel_size=2
+        ),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=64, max_num_seqs=2),
     )
     from vllm.v1.attention.backend import AttentionMetadataBuilder
@@ -1320,3 +1402,53 @@ def test_paged_wrapper_sharded_shared_key_matches_global(
                 scores_l[row, :n].view(torch.int32),
                 scores_g[row, rank::world][:n].view(torch.int32),
             )
+
+
+@pytest.mark.parametrize(("tp", "fails"), [(2, False), (4, True)])
+def test_coalesce_needs_a_pair_sharded_index(tp: int, fails: bool) -> None:
+    from vllm.models.qwen4_exp.nvidia.ops.qsa_coalesce import (
+        require_dcp2_index_world,
+    )
+
+    config = _config(True, dcp=2, tp=tp)
+    if fails:
+        with pytest.raises(ValueError, match="split over 4 ranks"):
+            require_dcp2_index_world(config)
+    else:
+        require_dcp2_index_world(config)
+
+
+@pytest.mark.parametrize("max_seq", [4096, 6528, 8206, 12000, 16384, 100000])
+@pytest.mark.parametrize("rows", [512, 700, 1024, 1678, 2047, 2048, 6528])
+def test_cublas_route_does_not_flip_with_a_wider_split(rows: int, max_seq: int) -> None:
+    from vllm.models.qwen4_exp.nvidia.ops.qsa import (
+        _qsa_cublas_route_columns,
+        _qsa_indexer_cublas_work_supported,
+    )
+
+    ratio, topk, capacity = 4, 512, 1 << 20
+
+    def route(world: int) -> bool:
+        live = -(-(max_seq // ratio) // world)
+        local = min(capacity // world, max(topk, live))
+        columns = _qsa_cublas_route_columns(
+            local, max_seq, ratio, world, topk, capacity // world
+        )
+        return _qsa_indexer_cublas_work_supported(rows, columns)
+
+    # The DCP-sized split decides as before; four ranks decide the same way.
+    assert route(4) == route(2)
+
+
+def test_second_prefill_chunk_of_an_8k_prompt_keeps_cublas_at_four_ranks() -> None:
+    from vllm.models.qwen4_exp.nvidia.ops.qsa import (
+        _qsa_cublas_route_columns,
+        _qsa_indexer_cublas_work_supported,
+    )
+
+    # 1678 rows ending at position 8206: 513 local columns at four ranks would
+    # fall under the work threshold, 1026 at two ranks reach it.
+    rows, max_seq = 1678, 8206
+    assert not _qsa_indexer_cublas_work_supported(rows, 513)
+    columns = _qsa_cublas_route_columns(513, max_seq, 4, 4, 512, 1 << 18)
+    assert _qsa_indexer_cublas_work_supported(rows, columns)

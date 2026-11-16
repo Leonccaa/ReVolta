@@ -439,6 +439,16 @@ def get_revolta_identity(
             "additional": getattr(vllm_config, "additional_config", None),
             "compile_hash": vllm_config.compute_hash(),
         }
+        kernel = getattr(vllm_config, "kernel_config", None)
+        if (
+            getattr(kernel, "qsa_dcp_index_shard", False)
+            and vllm_config.parallel_config.decode_context_parallel_size > 1
+        ):
+            # The indexer is split over the TP group; pages written when it
+            # was split over DCP ranks only have another layout.
+            identity["index_shard_world"] = (
+                vllm_config.parallel_config.tensor_parallel_size
+            )
         return RevoltaIdentity(content, canonical_digest(identity))
     except (
         ManifestError,

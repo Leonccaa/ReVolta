@@ -298,6 +298,14 @@ block early: a prompt of L tokens reuses at most floor((L-1-S)/S)*S tokens for
 a block of S tokens. With `kernel_config.qsa_dcp_index_shard` and DCP2 the
 draft's main K/V and index are sharded like the target's (the raw-key ring
 stays replicated); index sharding with MTP is not supported outside this mode.
+`qsa_dcp_index_shard` splits each compressed indexer over every tensor-parallel
+rank (four ranks with TP4 and DCP2), not only over the DCP pair: rank `r` holds
+the groups `g` with `g % TP == r`, scores only those, and the ranks merge their
+candidates into the same selection an unsplit indexer would make. With TP4/DCP2
+this halves the GPU bytes of every history ID's index again, so the same budget
+holds about twice as many contexts. Cached pages written with a narrower split
+are not read back. The research switch `REVOLTA_RESEARCH_QSA_DECODE_COALESCE_AG`
+exchanges candidates over the DCP pair only and is rejected with this split.
 `kernel_config.long_context_kv.draft_main_placement` chooses where such a
 sharded draft's main K/V lives; the draft index and raw-key ring always stay in
 GPU history.

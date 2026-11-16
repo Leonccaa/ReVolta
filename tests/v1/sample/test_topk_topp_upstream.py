@@ -210,6 +210,34 @@ def _upstream_joint_reference(logits, k, p):
     return candidates, sampler.apply_top_k_top_p_pytorch(candidates.clone(), None, p)
 
 
+def _add_small_joint_ties(logits, k, p):
+    """Make 2-8 equal scores near active top-k and top-p cutoffs."""
+    order = logits.argsort(dim=-1, descending=True, stable=True)
+    vocab = logits.shape[1]
+    for row in range(logits.shape[0]):
+        limit = int(k[row])
+        if limit < vocab:
+            start, end = max(0, limit - 2), min(vocab, limit + 2)
+            value = logits[row, order[row, limit - 1]].clone()
+            logits[row, order[row, start:end]] = value
+
+    _, reference = _upstream_joint_reference(logits, k, p)
+    counts = torch.isfinite(reference).sum(-1)
+    for row in range(logits.shape[0]):
+        limit, count = int(k[row]), int(counts[row])
+        if p[row] < 1.0 and limit > 1:
+            start, end = max(0, count - 2), min(limit, count + 2)
+            boundary = count - 1
+            # Merge overlapping cutoff groups instead of breaking the
+            # top-k tie. Their union has at most eight entries.
+            if limit < vocab and end > max(0, limit - 2):
+                start = min(start, max(0, limit - 2))
+                end = min(vocab, limit + 2)
+                boundary = limit - 1
+            value = logits[row, order[row, boundary]].clone()
+            logits[row, order[row, start:end]] = value
+
+
 def _assert_joint_contract(logits, actual, candidates, reference, p):
     kept = torch.isfinite(actual)
     common = kept & torch.isfinite(reference)
@@ -232,12 +260,12 @@ def _assert_joint_contract(logits, actual, candidates, reference, p):
 def test_joint_comparison_reference_on_cpu(top_k, pattern):
     generator = torch.Generator().manual_seed(423)
     logits = torch.randn(5, 256, generator=generator)
-    if pattern == "ties":
-        logits.round_()
-    elif pattern == "quantized":
+    if pattern == "quantized":
         logits = logits.half().float()
     k = torch.full((5,), top_k, dtype=torch.int32)
     p = torch.full((5,), 0.95)
+    if pattern == "ties":
+        _add_small_joint_ties(logits, k, p)
     candidates, reference = _upstream_joint_reference(logits, k, p)
     # Independent stable sort applies the upstream top-k index tie-break.
     indices = logits.argsort(dim=-1, descending=True, stable=True)[:, :top_k]
@@ -251,6 +279,27 @@ def test_joint_comparison_reference_on_cpu(top_k, pattern):
     changed.view(torch.int32)[retained[0], retained[1]] ^= 1
     with pytest.raises(AssertionError):
         _assert_joint_contract(logits, changed, candidates, reference, p)
+
+
+def test_small_joint_ties_cross_both_cutoffs_on_cpu():
+    generator = torch.Generator().manual_seed(423)
+    logits = torch.randn(3, 256, generator=generator)
+    k = torch.tensor([20, 128, 256], dtype=torch.int32)
+    p = torch.tensor([0.5, 0.95, 0.5])
+    _add_small_joint_ties(logits, k, p)
+    ordered = logits.sort(dim=-1, descending=True).values
+    for row in range(2):
+        cutoff = ordered[row, k[row] - 1]
+        assert cutoff == ordered[row, k[row]]
+        assert 2 <= int((logits[row] == cutoff).sum()) <= 8
+    candidates, reference = _upstream_joint_reference(logits, k, p)
+    kept = torch.isfinite(reference)
+    boundary = reference.masked_fill(~kept, float("inf")).amin(-1)
+    for row in range(3):
+        ties = logits[row] == boundary[row]
+        assert 2 <= int(ties.sum()) <= 8
+        assert (ties & kept[row]).any()
+        assert (ties & torch.isfinite(candidates[row]) & ~kept[row]).any()
 
 
 def test_joint_reference_normalizes_after_index_ordered_topk():
@@ -293,12 +342,17 @@ def test_topp_comparison_accepts_boundary_but_rejects_distant_token_on_cpu():
 @pytest.mark.parametrize("top_p", [0.01, 0.5, 0.95, 1.0])
 @pytest.mark.parametrize("pattern", ["random", "ties", "quantized"])
 def test_joint_cutoff_support_and_value_bits(rows, top_k, top_p, pattern):
-    logits = _logits(rows, pattern)
+    # Huge rounded groups remain in k-only tests. In joint filtering the
+    # upstream top-p stage can reintroduce an entire huge cutoff group;
+    # exercise small cutoff ties here without changing the assertions.
+    logits = _logits(rows, "random" if pattern == "ties" else pattern)
     k = torch.full((rows,), top_k or logits.shape[1], device="cuda", dtype=torch.int32)
     p = torch.full((rows,), top_p, device="cuda")
     if top_k is not None:
         k[4::4] = 1
     p[4::4] = 1.0
+    if pattern == "ties":
+        _add_small_joint_ties(logits, k, p)
     active_k = k if top_k is not None else None
     actual = sampler.apply_top_k_top_p(logits.clone(), active_k, p)
     candidates, reference = _upstream_joint_reference(logits, k, p)

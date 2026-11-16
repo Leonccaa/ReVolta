@@ -176,7 +176,7 @@ def _load_gdn_i32_ptr(ptr_to_ptr):
     return tl.multiple_of(ptr, 16)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_spec_decodes", "batch_size"])
 def _dflash2_gdn_group_metadata_kernel(
     block_table_ptrs,
     state_output_ptrs,

@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import os
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import numpy as np
 import torch
@@ -46,11 +45,6 @@ from vllm.v1.worker.gpu.spec_decode.eagle.cudagraph import (
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
 
 logger = init_logger(__name__)
-
-if TYPE_CHECKING:
-    from vllm.v1.worker.gpu.spec_decode.eagle.draft_vocab_tail import (
-        GlobalDraftVocabTail,
-    )
 
 
 def _mtp_decode_warmup_request_sizes(
@@ -108,7 +102,6 @@ class EagleSpeculator:
         self.share_mtp_topk_indices = False
         self._static_draft_vocab: StaticDraftVocabRuntime | None = None
         self._reduced_draft_logits: torch.Tensor | None = None
-        self._draft_vocab_tail: GlobalDraftVocabTail | None = None
 
         # DP configuration
         self.dp_size = vllm_config.parallel_config.data_parallel_size
@@ -240,32 +233,10 @@ class EagleSpeculator:
         )
 
     def _maybe_initialize_static_draft_vocab(self) -> None:
-        self._draft_vocab_tail = None
-        for name in (
-            "VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_GPU_LRU",
-            "VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_FUSED_PROPOSAL",
-            "VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_FULL_REFRESH_INTERVAL",
-            "VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_PREFILL_TOPK",
-        ):
-            if name in os.environ:
-                raise ValueError(f"{name} is supported only by V1, not V2.")
-        tail_size = envs.VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_TAIL_SIZE
-        if tail_size != 0:
-            if not 1 <= tail_size <= 2048:
-                raise ValueError("Global MTP draft tail size must be in [1, 2048].")
-            if (
-                self.method != "mtp"
-                or not envs.VLLM_SM70_MTP_STATIC_DRAFT_VOCAB_RANKING
-                or envs.VLLM_SM70_MTP_STATIC_DRAFT_VOCAB_SIZE <= 0
-            ):
-                raise ValueError(
-                    "Global MTP draft tail requires mtp and a static vocabulary "
-                    "(RANKING/SIZE)."
-                )
         if self.method != "mtp":
             return
         # Resolve only explicit static controls, without model-specific dynamic
-        # vocabulary defaults.
+        # vocabulary defaults. V2 currently implements the static shortlist.
         config = resolve_mtp_draft_vocab_config(self.method)
         if config.ranking_path is None:
             return
@@ -294,46 +265,6 @@ class EagleSpeculator:
             runtime.lm_head.weight.shape[0],
             runtime.ranking_fingerprint,
         )
-        if tail_size:
-            from vllm.distributed import get_tp_group
-            from vllm.v1.worker.gpu.spec_decode.eagle.draft_vocab_tail import (
-                GlobalDraftVocabTail,
-            )
-
-            tp = get_tp_group()
-            tail = GlobalDraftVocabTail(
-                runtime,
-                self.model.lm_head,
-                config.ranking_path,
-                tail_size,
-                self.max_num_reqs,
-                self.num_speculative_steps,
-                self.draft_logits,
-                tp.world_size,
-                tp.rank_in_group,
-            )
-            self._draft_vocab_tail = tail
-            if self.draft_logits is not None:
-                self._reduced_draft_logits = tail.reduced_draft_logits
-            logger.info(
-                "Enabled global MTP draft vocabulary tail: "
-                "base=%d tail=%d tp=%d sink=%d draft_sample=%s",
-                runtime.shortlist_size,
-                tail_size,
-                tp.world_size,
-                tail.sink,
-                self.speculative_config.draft_sample_method,
-            )
-
-    def update_draft_vocab_tail(
-        self,
-        sampled: torch.Tensor,
-        num_sampled: torch.Tensor,
-        num_reqs: int,
-        idx_mapping: torch.Tensor,
-    ) -> None:
-        if self._draft_vocab_tail is not None:
-            self._draft_vocab_tail.update(sampled, num_sampled, num_reqs, idx_mapping)
 
     def set_attn(
         self,
@@ -492,20 +423,6 @@ class EagleSpeculator:
     ) -> torch.Tensor:
         runtime = self._static_draft_vocab
         if runtime is not None:
-            tail = self._draft_vocab_tail
-            if tail is not None:
-                if draft_logits is None and self.use_local_argmax_reduction:
-                    return tail.sample_greedy(hidden_states)
-                return tail.sample_probabilistic(
-                    hidden_states,
-                    idx_mapping,
-                    self.temperature,
-                    self.seeds,
-                    pos,
-                    draft_step,
-                    draft_logits,
-                    self.use_fp64_gumbel,
-                )
             if draft_logits is None and self.use_local_argmax_reduction:
                 token_ids = runtime.logits_processor.get_top_tokens(
                     runtime.lm_head, hidden_states
@@ -846,8 +763,6 @@ class EagleSpeculator:
         self.temperature.copy_(temperature)
         self.seeds.copy_(seeds)
         self.idx_mapping[:num_reqs].copy_(input_batch.idx_mapping)
-        if self.draft_logits is not None and self._draft_vocab_tail is not None:
-            self.idx_mapping[num_reqs:].fill_(-1)
 
         # Get the input ids and last token indices for the speculator.
         prepare_eagle_inputs(

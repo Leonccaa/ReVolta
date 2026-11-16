@@ -846,6 +846,8 @@ class EagleSpeculator:
         self.temperature.copy_(temperature)
         self.seeds.copy_(seeds)
         self.idx_mapping[:num_reqs].copy_(input_batch.idx_mapping)
+        if self.draft_logits is not None and self._draft_vocab_tail is not None:
+            self.idx_mapping[num_reqs:].fill_(-1)
 
         # Get the input ids and last token indices for the speculator.
         prepare_eagle_inputs(

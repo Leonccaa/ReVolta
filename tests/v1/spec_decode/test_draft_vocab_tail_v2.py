@@ -352,7 +352,12 @@ def test_probabilistic_mapping_eviction_and_greedy_fallback(tmp_path, monkeypatc
             )
 
 
-def test_pending_proposal_q_survives_other_requests_tail_changes(tmp_path):
+def test_pending_proposal_q_survives_other_requests_tail_changes(tmp_path, monkeypatch):
+    import numpy as np
+
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager
+    from vllm.v1.worker.gpu.input_batch import InputBuffers
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
     tail, weight, _ = _tail(tmp_path, probabilistic=True)
@@ -362,60 +367,126 @@ def test_pending_proposal_q_survives_other_requests_tail_changes(tmp_path):
     spec.draft_logits = tail.draft_logits
     spec.use_fp64_gumbel = True
     spec.use_local_argmax_reduction = False
+    spec.share_mtp_topk_indices = False
+    spec.max_num_reqs = 8
+    spec.max_model_len = 128
+    spec.num_speculative_steps = 4
+    spec.dp_size = 1
+    spec.dp_rank = 0
     spec.temperature = torch.ones(8)
     spec.seeds = torch.arange(8, dtype=torch.int64) + 93
+    spec.idx_mapping = torch.zeros(8, dtype=torch.int32)
+    spec.current_draft_step = torch.tensor(0, dtype=torch.int64)
+    spec.last_token_indices = torch.zeros(8, dtype=torch.int64)
+    spec.hidden_states = torch.zeros(40, 4, dtype=torch.float16)
+    spec.draft_tokens = torch.zeros(8, 4, dtype=torch.int64)
+    spec.input_buffers = InputBuffers(8, 40, torch.device("cpu"))
     generator = torch.Generator().manual_seed(121)
-    hidden = torch.randn(8, 4, generator=generator, dtype=torch.float16)
-    positions = torch.arange(8, dtype=torch.int64) + 15
-    mapping = torch.arange(8, dtype=torch.int32)
-    for step in range(4):
-        spec._sample_draft(
-            hidden, mapping, positions, torch.tensor(step), spec.draft_logits
+    features = torch.randn(40, 4, generator=generator, dtype=torch.float16)
+    spec.run_model = lambda n, *args, **kwargs: (features[:n], features[:n])
+    spec.block_tables = SimpleNamespace(compute_slot_mappings=lambda *args: {})
+    spec.kv_cache_config = None
+    spec._build_draft_attn_metadata = lambda **kwargs: {}
+    monkeypatch.setattr(eagle, "build_slot_mappings_by_layer", lambda *args: {})
+    replays = []
+
+    def manager(query_len, callback):
+        # Real candidate construction/dispatch; CPU callbacks replace GPU replay only.
+        result = object.__new__(CudaGraphManager)
+        result.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+        result._capture_sizes = [n * query_len for n in (1, 2, 4, 8)]
+        result.decode_query_lens = (query_len,)
+        result.max_num_reqs = 8
+        result._dflash_width_reqs = {}
+        result._sm70_dflash2_tail_graphs = False
+        result._candidates = []
+        result._capture_descs = {}
+        result._init_candidates()
+        result._graphs_captured = True
+
+        def graph_callback(desc):
+            replays.append((query_len, desc.num_reqs))
+            callback(desc.num_reqs, desc.num_tokens, {}, {}, None)
+            if desc.num_reqs == 4:
+                assert (
+                    tail.draft_logits[inactive].numpy().tobytes()
+                    == before[inactive].numpy().tobytes()
+                )
+
+        result.run_fullgraph = graph_callback
+        return result
+
+    spec.prefill_cudagraph_manager = manager(5, spec.prefill)
+    spec.decode_cudagraph_manager = manager(1, spec.generate_draft)
+
+    def batch(mapping, padded_tokens):
+        count = len(mapping)
+        return SimpleNamespace(
+            num_reqs=count,
+            idx_mapping=torch.tensor(mapping, dtype=torch.int32),
+            num_scheduled_tokens=np.full(count, 5, dtype=np.int32),
+            num_tokens=5 * count,
+            num_tokens_after_padding=padded_tokens,
+            query_start_loc=torch.arange(count + 1, dtype=torch.int32) * 5,
+            seq_lens=torch.full((count,), 25, dtype=torch.int32),
+            input_ids=torch.zeros(padded_tokens, dtype=torch.int32),
+            positions=torch.arange(padded_tokens, dtype=torch.int64),
+            is_prefilling_np=np.zeros(count, dtype=np.bool_),
         )
+
+    def propose(current):
+        count = current.num_reqs
+        return spec.propose(
+            current,
+            {},
+            {},
+            features[: current.num_tokens_after_padding],
+            None,
+            torch.ones(count, dtype=torch.int32),
+            torch.zeros(count, dtype=torch.int32),
+            torch.zeros(8, dtype=torch.int64),
+            torch.zeros(8, dtype=torch.int64),
+            torch.ones(8),
+            torch.arange(8, dtype=torch.int64) + 93,
+        )
+
+    # A full batch leaves every persistent mapping entry pointing at a real request.
+    propose(batch(list(range(8)), 40))
+    assert spec.idx_mapping.tolist() == list(range(8))
     before = tail.draft_logits.clone()
-    pending_q = before[7].numpy().tobytes()
+    pending = 3
+    pending_q = before[pending].numpy().tobytes()
     old = int(tail.slot_token[0])
-    assert torch.isfinite(before[7, :, old]).all()
+    assert torch.isfinite(before[pending, :, old]).all()
     union = torch.cat((tail.runtime.token_id_map, tail.slot_token))
     new = next(i for i in range(tail.tokenizer_vocab_size) if i not in union)
 
-    # Only requests 6 and 2 are verified and drafted in the intervening batch.
-    active = torch.tensor([6, 2], dtype=torch.int32)
+    # Real dispatch expands three active requests to four graph request rows.
+    active = batch([6, 2, 1], 20)
     spec.update_draft_vocab_tail(
-        torch.tensor([[new], [int(tail.runtime.token_id_map[0])]]),
-        torch.ones(2, dtype=torch.int32),
-        2,
-        active,
+        torch.tensor([[new]] + [[int(tail.runtime.token_id_map[0])]] * 2),
+        torch.ones(3, dtype=torch.int32),
+        3,
+        active.idx_mapping,
     )
     assert old not in tail.slot_token and new in tail.slot_token
-    assert torch.isneginf(tail.draft_logits[active.long()]).all()
-    inactive = torch.tensor([0, 1, 3, 4, 5, 7])
+    assert torch.isneginf(tail.draft_logits[active.idx_mapping.long()]).all()
+    inactive = torch.tensor([0, 3, 4, 5, 7])
     assert (
         tail.draft_logits[inactive].numpy().tobytes()
         == before[inactive].numpy().tobytes()
     )
-    # Graph padding must not write request 0 or any other real request.
-    padded_mapping = torch.tensor([6, 2, -1], dtype=torch.int32)
-    for step in range(4):
-        spec._sample_draft(
-            hidden[[6, 2, 0]],
-            padded_mapping,
-            positions[[6, 2, 0]],
-            torch.tensor(step),
-            spec.draft_logits,
-        )
-        assert (
-            tail.draft_logits[inactive].numpy().tobytes()
-            == before[inactive].numpy().tobytes()
-        )
-    assert torch.isneginf(tail.draft_logits[active.long(), :, old]).all()
-    assert torch.isfinite(tail.draft_logits[active.long(), :, new]).all()
+    propose(active)
+    assert replays[-4:] == [(5, 4), (1, 4), (1, 4), (1, 4)]
+    assert spec.idx_mapping.tolist() == [6, 2, 1, -1, -1, -1, -1, -1]
+    assert torch.isneginf(tail.draft_logits[active.idx_mapping.long(), :, old]).all()
+    assert torch.isfinite(tail.draft_logits[active.idx_mapping.long(), :, new]).all()
 
-    # Resume request 7 through the real runner verification call site.
+    # Resume the skipped request through the real runner verification call site.
     consumed = []
 
-    def verify(logits, batch, q):
-        consumed.append(q[batch.idx_mapping.long()].numpy().tobytes())
+    def verify(logits, current, q):
+        consumed.append(q[current.idx_mapping.long()].numpy().tobytes())
         return SimpleNamespace(num_sampled=torch.ones(1, dtype=torch.int32))
 
     runner = object.__new__(GPUModelRunner)
@@ -426,15 +497,11 @@ def test_pending_proposal_q_survives_other_requests_tail_changes(tmp_path):
     runner.req_states = SimpleNamespace(
         prefill_len=SimpleNamespace(gpu=torch.zeros(8, dtype=torch.int32))
     )
-    batch = SimpleNamespace(
-        logits_indices=torch.arange(5),
-        num_draft_tokens=4,
-        num_reqs=1,
-        idx_mapping=torch.tensor([7], dtype=torch.int32),
-        seq_lens=torch.tensor([25], dtype=torch.int32),
-        cu_num_logits=torch.tensor([0, 5], dtype=torch.int32),
-    )
-    runner.sample(hidden[:5], batch, None)
+    resume = batch([pending], 5)
+    resume.logits_indices = torch.arange(5)
+    resume.num_draft_tokens = 4
+    resume.cu_num_logits = torch.tensor([0, 5], dtype=torch.int32)
+    runner.sample(features[:5], resume, None)
     assert consumed == [pending_q]
 
 

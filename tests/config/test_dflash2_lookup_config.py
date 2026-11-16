@@ -75,6 +75,39 @@ def build(checkpoint, **kwargs):
 
 
 @pytest.mark.parametrize(
+    "method,includes_draft",
+    [
+        ("dflash", True),  # DFlash and DFlash2 use this method.
+        ("dflash_ddtree", True),
+        ("dspark", True),
+        ("eagle3", True),
+        ("extract_hidden_states", True),
+        ("eagle", False),
+        ("mtp", False),
+    ],
+)
+def test_speculative_hash_draft_model_config(checkpoint, method, includes_draft):
+    spec = build(checkpoint)
+    spec.method = method
+    draft = spec.draft_model_config
+    baseline = spec.compute_hash()
+    assert spec.compute_hash() == baseline
+
+    draft.quantization = "fp8"
+    assert (spec.compute_hash() != baseline) is includes_draft
+    draft.quantization = None
+    assert spec.compute_hash() == baseline
+
+    draft.model += "-other"
+    assert (spec.compute_hash() != baseline) is includes_draft
+    draft.model = draft.model.removesuffix("-other")
+    assert spec.compute_hash() == baseline
+
+    draft.hf_config.eagle_aux_hidden_state_layer_ids = [0, 1]
+    assert (spec.compute_hash() != baseline) is includes_draft
+
+
+@pytest.mark.parametrize(
     "new",
     [
         None,

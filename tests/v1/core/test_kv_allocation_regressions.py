@@ -121,7 +121,7 @@ def test_ring_cannot_steal_mamba_hit(tail):
     assert pool.cached_block_hash_to_block.get_one_block(key) is hit
     assert len(ring.req_to_blocks["r"]) == 1
     assert ring.allocate_new_blocks("r", 33, 33) == []
-    coordinator.free("r")
+    coordinator.free(SimpleNamespace(request_id="r"))
     assert hit.ref_cnt == 0
 
 

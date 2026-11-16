@@ -221,6 +221,22 @@ class KVCacheCoordinator(ABC):
         # rather than the prompt's final (unrestorable) alignment boundary.
         for manager in self.single_type_managers:
             manager.mamba_replay_lookbehind = self.mamba_state_lookbehind
+        # DFlash2's sub-page drafter takes no whole-state-page rewind.
+        # Reuse the existing retention configuration rather than adding an API.
+        sub_page_drafter = any(
+            manager.kv_cache_group_id in self.eagle_group_ids
+            and manager.block_size < alignment
+            for manager in self.single_type_managers
+        )
+        for manager in mamba:
+            manager.keep_decode_resume_state = (
+                self.enable_caching
+                and sparse_mamba
+                and not page_granular_drop
+                and sub_page_drafter
+                and manager.mamba_cache_mode == "align"
+                and manager.block_size == alignment
+            )
         if interval < 0 or interval % alignment:
             raise ValueError(
                 f"prefix_cache_retention_interval ({interval}) must be a non-negative "
@@ -497,15 +513,16 @@ class KVCacheCoordinator(ABC):
         for manager in self.single_type_managers:
             self._cache_manager_blocks(manager, request, num_computed_tokens)
 
-    def free(self, request_id: str) -> None:
+    def free(self, request: Request) -> None:
         """
         Free the blocks for the request.
 
         Args:
-            request_id: The request ID.
+            request: The request to free.
         """
         for manager in self.single_type_managers:
-            manager.free(request_id)
+            manager.cache_blocks_on_free(request)
+            manager.free(request.request_id)
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> list[int]:
         """

@@ -404,6 +404,10 @@ class SingleTypeKVCacheManager(ABC):
         """
         return None
 
+    def cache_blocks_on_free(self, request: Request) -> None:
+        """Cache any final state before returning the request's blocks."""
+        return None
+
     def free(self, request_id: str) -> None:
         """
         Free the blocks for the request.
@@ -1288,6 +1292,7 @@ class MambaManager(SingleTypeKVCacheManager):
         self, kv_cache_spec: MambaSpec, block_pool: BlockPool, **kwargs
     ) -> None:
         super().__init__(kv_cache_spec, block_pool, **kwargs)
+        self.keep_decode_resume_state = False
         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
@@ -1363,6 +1368,17 @@ class MambaManager(SingleTypeKVCacheManager):
     ) -> None:
         assert isinstance(self.kv_cache_spec, MambaSpec)
 
+        # Adapted from vLLM #67053 (2a150785400f): retain the latest
+        # decode boundary through both the generic and pending-list sweeps.
+        if self.keep_decode_resume_state and num_prompt_tokens is not None:
+            resume_idx = self._decode_resume_block_idx(
+                processed_computed_tokens, num_prompt_tokens
+            )
+            if (
+                resume_idx is not None
+                and self.req_to_blocks[request_id][resume_idx].block_hash is None
+            ):
+                processed_computed_tokens = resume_idx * self.block_size + 1
         super().remove_skipped_blocks(
             request_id, processed_computed_tokens, num_prompt_tokens
         )
@@ -1650,6 +1666,40 @@ class MambaManager(SingleTypeKVCacheManager):
                         (block_idx + 1) * self.block_size,
                     )
                 )
+
+    def _decode_resume_block_idx(
+        self, processed_tokens: int, num_prompt_tokens: int
+    ) -> int | None:
+        idx = processed_tokens // self.block_size - 1
+        if idx < num_prompt_tokens // self.block_size:
+            return None
+        return idx
+
+    def cache_blocks_on_free(self, request: Request) -> None:
+        """Supplement the last local boundary; running handoffs stay unchanged."""
+        if not self.keep_decode_resume_state:
+            return
+        blocks = self.req_to_blocks.get(request.request_id, [])
+        idx = self._decode_resume_block_idx(
+            max(0, request.num_computed_tokens - request.num_in_flight_tokens),
+            request.num_prompt_tokens,
+        )
+        num_hashed_tokens = len(request.block_hashes) * self.block_pool.hash_block_size
+        if (
+            idx is None
+            or idx >= len(blocks)
+            or blocks[idx].block_hash is not None
+            or num_hashed_tokens < (idx + 1) * self.block_size
+        ):
+            return
+        self.block_pool.cache_full_blocks(
+            request=request,
+            blocks=blocks,
+            num_cached_blocks=idx,
+            num_full_blocks=idx + 1,
+            block_size=self.block_size,
+            kv_cache_group_id=self.kv_cache_group_id,
+        )
 
     def new_step_starts(self) -> None:
         self.cached_blocks_this_step.clear()

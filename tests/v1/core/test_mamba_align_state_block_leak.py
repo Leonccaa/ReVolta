@@ -11,10 +11,13 @@ be forgotten either: before the fix the next allocation overwrote the single
 request finished or was preempted.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.single_type_kv_cache_manager import MambaManager
 from vllm.v1.kv_cache_interface import MambaSpec
 
@@ -204,3 +207,67 @@ def test_speculative_rollback_keeps_owned_blocks_without_negative_admission(
     manager.allocate_new_blocks(RID, 2 * BLOCK_SIZE + 1, 2 * BLOCK_SIZE + 1)
     manager.free(RID)
     assert pool.get_num_free_blocks() == free_before
+
+
+@pytest.mark.parametrize("finish", [False, True])
+@pytest.mark.parametrize("spec_blocks", [0, 7])
+def test_decode_retention_fits_existing_budget_and_releases_on_exit(
+    finish, spec_blocks
+):
+    pool = BlockPool(256, True, BLOCK_SIZE)
+    manager = MambaManager(
+        MambaSpec(
+            block_size=BLOCK_SIZE,
+            shapes=((1,),),
+            dtypes=(torch.float16,),
+            mamba_cache_mode="align",
+            num_speculative_blocks=spec_blocks,
+        ),
+        pool,
+        enable_caching=True,
+        kv_cache_group_id=0,
+    )
+    manager.keep_decode_resume_state = True
+    request = SimpleNamespace(
+        request_id=RID,
+        block_hashes=[BlockHash(str(i).encode()) for i in range(20)],
+    )
+    free_before = pool.get_num_free_blocks()
+    prompt = 2 * BLOCK_SIZE + 1
+    processed = 0
+    previous_source = None
+    peak = 0
+    for end in range(3, 12 * BLOCK_SIZE, 3):
+        manager.new_step_starts()
+        resume = processed // BLOCK_SIZE - 1
+        unregistered = (
+            resume >= prompt // BLOCK_SIZE
+            and not manager.req_to_blocks[RID][resume].is_null
+            and manager.req_to_blocks[RID][resume].block_hash is None
+        )
+        manager.remove_skipped_blocks(RID, processed, prompt)
+        if previous_source is not None:
+            assert previous_source.ref_cnt == 1
+        if unregistered:
+            assert not manager.req_to_blocks[RID][resume].is_null
+        manager.allocate_new_blocks(RID, end + spec_blocks, end + spec_blocks)
+        blocks = manager.req_to_blocks[RID]
+        previous_source = blocks[len(blocks) - 1 - spec_blocks]
+        assert not previous_source.is_null
+        peak = max(peak, _held(manager))
+        assert _held(manager) <= 2 + spec_blocks
+        # Register the completed boundary in the same step as real scheduling.
+        manager.cache_blocks(
+            request,
+            processed + 1,
+            BLOCK_SIZE,
+            retention_interval=0,
+            replay_boundaries=((processed + 1) // BLOCK_SIZE * BLOCK_SIZE,),
+        )
+        processed = end
+        if not finish and end >= 7 * BLOCK_SIZE:
+            break
+    assert peak == 2 + spec_blocks
+    manager.free(RID)
+    assert pool.get_num_free_blocks() == free_before
+    assert not manager.req_to_blocks and not manager.last_state_block_idx

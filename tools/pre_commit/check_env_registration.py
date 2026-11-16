@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Reject new VLLM_* environment reads that bypass vllm/envs.py.
+"""Reject new VLLM_* and REVOLTA_* environment reads that bypass vllm/envs.py.
 
 `envs.compile_factors()` hashes every registered variable into the
 torch.compile cache key. A switch read straight from `os.environ` is invisible
@@ -17,6 +17,10 @@ from pathlib import Path
 import regex as re
 
 ENVS_FILE = "vllm/envs.py"
+
+# Prefixes whose reads must be registered. REVOLTA_* covers research switches
+# (REVOLTA_RESEARCH_*) and the legacy unprefixed ReVolta switches.
+PREFIXES = ("VLLM_", "REVOLTA_")
 
 # Direct reads that existed when this check was added. Register them in
 # vllm/envs.py (or delete them) and drop them from this list over time; do not
@@ -42,9 +46,11 @@ def native_reads(content: str) -> list[tuple[str, int]]:
         return re.sub(r"[^\n]", " ", token) if token.startswith(("//", "/*")) else token
 
     source = tokens.sub(mask_comments, content)
-    aliases = list(re.finditer(r'\b(\w+)\s*=\s*"(VLLM_[A-Z0-9_]+)"', source))
+    aliases = list(
+        re.finditer(r'\b(\w+)\s*=\s*"((?:VLLM|REVOLTA)_[A-Z0-9_]+)"', source)
+    )
     calls = re.finditer(
-        r'\b(\w+)\s*(?:<[^>\n]*>)?\s*\(\s*(?:"(VLLM_[A-Z0-9_]+)"|(\w+)\b)',
+        r'\b(\w+)\s*(?:<[^>\n]*>)?\s*\(\s*(?:"((?:VLLM|REVOLTA)_[A-Z0-9_]+)"|(\w+)\b)',
         source,
     )
     reads = []
@@ -69,7 +75,9 @@ def native_reads(content: str) -> list[tuple[str, int]]:
 def scan_native_file(path: str, known: set[str]) -> int:
     content = Path(path).read_text(encoding="utf-8")
     missing = {
-        (name, line) for name, line in native_reads(content) if name not in known
+        (name, line)
+        for name, line in native_reads(content)
+        if name not in known and name not in BASELINE
     }
     for name, line in sorted(missing):
         print(
@@ -220,7 +228,7 @@ def scan_file(path: str, known: set[str]) -> int:
         )
         if not isinstance(name, str):
             continue
-        if not name.startswith("VLLM_"):
+        if not name.startswith(PREFIXES):
             continue
         if name in known or name in BASELINE:
             continue

@@ -20,6 +20,9 @@ def attach_router(app: FastAPI):
     """Mount prometheus metrics to a FastAPI app."""
 
     registry = get_prometheus_registry()
+    dashboard_enabled = getattr(
+        getattr(app.state, "args", None), "enable_dashboard", False
+    )
 
     # `response_class=PrometheusResponse` is needed to return an HTTP response
     # with header "Content-Type: text/plain; version=0.0.4; charset=utf-8"
@@ -33,6 +36,7 @@ def attach_router(app: FastAPI):
             "/ping",
             "/version",
             "/server_info",
+            *(["/dashboard.*"] if dashboard_enabled else []),
         ],
         registry=registry,
     ).add().instrument(app).expose(app, response_class=PrometheusResponse)
@@ -43,3 +47,12 @@ def attach_router(app: FastAPI):
     # Workaround for 307 Redirect for /metrics
     metrics_route.path_regex = re.compile("^/metrics(?P<path>.*)$")
     app.routes.append(metrics_route)
+
+    if dashboard_enabled:
+        from vllm import envs
+        from vllm.entrypoints.serve.dashboard.api_router import attach_router
+        from vllm.version import __version__
+
+        args = app.state.args
+        keys = [key for key in (args.api_key or [envs.VLLM_API_KEY]) if key]
+        attach_router(app, registry, keys, version=__version__)

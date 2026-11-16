@@ -464,13 +464,15 @@ def ple_host_reserve_bytes(host_total_bytes: int) -> int:
 
     The engine processes, the checkpoint loading and other tenants of the
     host need room that no single rank can measure; on a 30 GB host the
-    default keeps 7.5 GiB.
+    default keeps 7.5 GiB. Cap it at 8 GiB on larger hosts: CPU KV pools
+    are budgeted separately by the preflight, rather than hidden in a
+    reserve that grows with host capacity. This is not an OOM guarantee.
     """
 
     reserve = env_gib_bytes("VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB")
     if reserve is not None:
         return reserve
-    return host_total_bytes // 4
+    return min(host_total_bytes // 4, 8 * 1024**3)
 
 
 def ple_vram_reserve_bytes(device_total_bytes: int) -> int:
@@ -554,6 +556,15 @@ def preflight_host_memory() -> tuple[int | None, int | None, str]:
 
 def cpu_kv_offload_bytes(config: Any) -> int:
     """Resolved CPU pool size, summed across TP ranks (not multiplied by TP)."""
+    long_context = getattr(
+        getattr(config, "kernel_config", None), "long_context_kv", None
+    )
+    if getattr(long_context, "enabled", False):
+        # Unified MAIN/STATE/DRAFT storage replaces the connector pool and is
+        # one shared allocation, not one allocation per rank or group.
+        host_store_gib = getattr(long_context, "host_store_gib", None)
+        if host_store_gib is not None:
+            return max(0, int(host_store_gib * 2**30))
     transfer = getattr(config, "kv_transfer_config", None)
     extra = getattr(transfer, "kv_connector_extra_config", {})
     if getattr(transfer, "kv_connector", None) in (

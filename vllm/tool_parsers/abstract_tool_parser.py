@@ -155,6 +155,14 @@ class ToolParser:
     def get_structural_tag(self, request: ChatCompletionRequest):
         return None
 
+    def finish_streaming(self) -> DeltaMessage | None:
+        """Release buffered content at termination, if the parser supports it.
+
+        Called after the final extraction, including length/stop-string ends
+        with no delta text or EOS token. Never retract already emitted calls.
+        """
+        return None
+
     def extract_tool_calls(
         self, model_output: str, request: ChatCompletionRequest
     ) -> ExtractedToolCallInformation:

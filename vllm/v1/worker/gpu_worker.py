@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+
 """A GPU worker class."""
 
 import gc
@@ -9,7 +11,7 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import deepcopy
 from datetime import timedelta
 from types import NoneType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import regex as re
@@ -54,6 +56,11 @@ from vllm.profiler.wrapper import CudaProfilerWrapper, TorchProfilerWrapper
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.tracing import instrument
+from vllm.utils.checkpoint_cache import (
+    collect_checkpoint_files,
+    release_checkpoint_cache,
+)
+from vllm.utils.gc_utils import freeze_gc_heap, maybe_attach_gc_debug_callback
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
 from vllm.utils.torch_utils import (
@@ -67,6 +74,7 @@ from vllm.v1.outputs import (
     DraftTokenIds,
     ModelRunnerOutput,
 )
+from vllm.v1.spec_decode.lookup_quarantine import isolated, require_reusable_context
 from vllm.v1.utils import compute_iteration_details, report_usage_stats
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
@@ -124,6 +132,7 @@ class Worker(WorkerBase):
         distributed_init_method: str,
         is_driver_worker: bool = False,
     ):
+        require_reusable_context()
         super().__init__(
             vllm_config=vllm_config,
             local_rank=local_rank,
@@ -131,6 +140,10 @@ class Worker(WorkerBase):
             distributed_init_method=distributed_init_method,
             is_driver_worker=is_driver_worker,
         )
+
+        from vllm.v1.spec_decode.lookup_stats import set_worker_rank
+
+        set_worker_rank(vllm_config, rank)
 
         # configure float32 matmul precision according to vLLM env.
         precision = envs.VLLM_FLOAT32_MATMUL_PRECISION
@@ -495,6 +508,7 @@ class Worker(WorkerBase):
     # to hijack tensor allocation.
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
         with (
+            collect_checkpoint_files() as checkpoint_files,
             self._maybe_get_memory_pool_context(tag="weights"),
             set_current_vllm_config(self.vllm_config),
             # 20 MiB is the minimum PyTorch allows for max_split_size_mb.
@@ -505,6 +519,15 @@ class Worker(WorkerBase):
         if self._ple_offload_enabled:
             self.model_runner._setup_ple_offload(
                 self.parallel_config._ple_offload_ipc_path
+            )
+
+        if not load_dummy_weights:
+            release_checkpoint_cache(
+                checkpoint_files,
+                protect_all=(
+                    envs.VLLM_PLE_DISK_OFFLOAD
+                    or self.vllm_config.kernel_config.ple_disk_cascade_active
+                ),
             )
 
         if self.vllm_config.weight_transfer_config is not None:
@@ -987,11 +1010,22 @@ class Worker(WorkerBase):
         )
 
         activate_triton_jit_monitor()
+        self._freeze_gc_after_warmup()
 
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,
             encoder=self.compilation_config.encoder_compilation_time,
         )
+
+    @staticmethod
+    def _freeze_gc_after_warmup() -> None:
+        # Move the startup heap (model, compiled graphs, CUDA graphs, Triton
+        # kernels, PLE/offload state) out of the collector's view, so that
+        # oldest-generation collections during serving do not scan it. With
+        # tensor parallelism a pause on any rank stalls every rank at the next
+        # collective. Same as the EngineCore process; undone in shutdown().
+        freeze_gc_heap()
+        maybe_attach_gc_debug_callback()
 
     def reset_mm_cache(self) -> None:
         self.model_runner.reset_mm_cache()
@@ -1086,6 +1120,9 @@ class Worker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        from vllm.v1.worker.gpu.spec_decode.dflash2.stats import begin_worker_activity
+
+        begin_worker_activity(self)
         return self.model_runner.sample_tokens(grammar_output)
 
     def _use_sm70_static_pp_hidden_transfer(self, num_tokens: int) -> bool:
@@ -1178,6 +1215,9 @@ class Worker(WorkerBase):
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        from vllm.v1.worker.gpu.spec_decode.dflash2.stats import begin_worker_activity
+
+        begin_worker_activity(self)
         # ensure any previous non-blocking PP sends are complete
         if self._pp_send_work:
             for handle in self._pp_send_work:
@@ -1526,7 +1566,49 @@ class Worker(WorkerBase):
         self._weight_update_active = False
         self._is_checkpoint_format = True
 
+    def get_lookup_stats_status(self):
+        native = getattr(
+            getattr(self.model_runner, "speculator", None), "_native_lookup", None
+        )
+        exporter = getattr(native, "stats", None)
+        return self.rank, exporter is not None
+
+    def drain_lookup_stats(
+        self,
+        *,
+        stats_deadline_monotonic: float,
+        expected_generation: str,
+        expected_owner: str,
+    ):
+        from vllm.v1.worker.gpu.spec_decode.dflash2.stats import drain_worker
+
+        return drain_worker(
+            self,
+            stats_deadline_monotonic=stats_deadline_monotonic,
+            expected_generation=expected_generation,
+            expected_owner=expected_owner,
+        )
+
+    def drain_host_kv(self):
+        """Control RPC. All ranks acknowledge before any executor teardown."""
+        try:
+            # In-process executors may run this bounded control wait on a
+            # daemon thread; CUDA's current device is thread-local.
+            assert self.device is not None
+            with torch.accelerator.device_index(self.device.index):
+                output = cast(Any, self.model_runner).kv_connector.drain_host_kv()
+                torch.accelerator.synchronize()
+            return self.rank, output, None
+        except Exception as error:
+            return self.rank, None, repr(error)
+
     def shutdown(self) -> None:
+        if isolated(self):
+            return
+        # Undo the freeze from compile_or_warm_up_model so that objects
+        # allocated at startup can be collected when the worker is torn down
+        # in-process.
+        gc.unfreeze()
         from vllm.v1.worker.gpu.shutdown import log_loaded_attention_route_summaries
 
         log_loaded_attention_route_summaries()

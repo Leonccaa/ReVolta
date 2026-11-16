@@ -21,6 +21,7 @@ from vllm.v1.attention.kv_cache_view import KVPageLayout
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.v1.core.long_context_kv import LongContextCapacityPlan
 
 logger = init_logger(__name__)
 
@@ -106,13 +107,18 @@ class KVCacheSpec:
     block_size: int
     dcp_sharded: bool = field(default=False, kw_only=True)
     """Whether context parallel ranks own disjoint token slots in this cache."""
+    shard_world: int = field(default=0, kw_only=True)
+    """Ranks sharing this cache's token slots when that is not the DCP size
+    (the QSA indexer shards over the whole TP group); 0 means the DCP size."""
 
     def global_block_size(
         self, dcp_world_size: int = 1, pcp_world_size: int = 1
     ) -> int:
         """Token span represented by one physical block on this rank."""
         if self.dcp_sharded:
-            return self.block_size * dcp_world_size * pcp_world_size
+            return (
+                self.block_size * (self.shard_world or dcp_world_size) * pcp_world_size
+            )
         return self.block_size
 
     @property
@@ -275,8 +281,9 @@ class FullAttentionSpec(AttentionSpec):
         pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
         # Note(hc): each dcp rank only need save
         # (max_model_len//dcp_world_size) tokens locally.
-        if self.dcp_sharded and dcp_world_size * pcp_world_size > 1:
-            max_model_len = cdiv(max_model_len, dcp_world_size * pcp_world_size)
+        world = (self.shard_world or dcp_world_size) * pcp_world_size
+        if self.dcp_sharded and world > 1:
+            max_model_len = cdiv(max_model_len, world)
         return cdiv(max_model_len, self.block_size) * self.page_size_bytes
 
     @classmethod
@@ -439,6 +446,7 @@ class MLAAttentionSpec(FullAttentionSpec):
             "All attention layers in the same KV cache group must be MLAAttentionSpec."
         )
         assert len({spec.dcp_sharded for spec in specs}) == 1
+        assert len({spec.shard_world for spec in specs}) == 1
         cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
         compress_ratio_set = set(spec.compress_ratio for spec in specs)
         model_version_set = set(spec.model_version for spec in specs)
@@ -453,6 +461,7 @@ class MLAAttentionSpec(FullAttentionSpec):
         return cls(
             block_size=specs[0].block_size,
             dcp_sharded=specs[0].dcp_sharded,
+            shard_world=specs[0].shard_world,
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
             dtype=specs[0].dtype,
@@ -938,7 +947,12 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         """
         if cls.is_uniform_type(kv_cache_specs, dcp_world_size):
             specs = list(kv_cache_specs.values())
-            representative = next((s for s in specs if s.dcp_sharded), specs[0])
+            # A TP-sharded member (the indexer) has a smaller block_size; the
+            # group's block is the one of the DCP-sharded main K/V.
+            representative = next(
+                (s for s in specs if s.dcp_sharded and not s.shard_world),
+                next((s for s in specs if s.dcp_sharded), specs[0]),
+            )
             return cls(
                 block_size=representative.block_size,
                 kv_cache_specs=kv_cache_specs,
@@ -1019,6 +1033,14 @@ class KVCacheTensor:
     """Attention layers that split each physical block of this tensor,
     interleaved one kernel block at a time in this order. ``None`` means at
     most one attention layer owns each block."""
+    num_blocks: int | None = None
+    """Blocks this tensor holds when the KV cache has separate block spaces
+    (``KVCacheConfig.block_segments``); ``None`` means
+    ``KVCacheConfig.num_blocks``."""
+    page_stride_bytes: int | None = None
+    """Physical scheduler-page stride for this tensor's members. None uses
+    the spec page size. Explicit strides require num_blocks; padding belongs
+    to the allocation, not to the logical payload or ordinary-mode spec."""
 
 
 @dataclass
@@ -1034,6 +1056,40 @@ class KVCacheGroupSpec:
     kv_cache_spec: KVCacheSpec
     # Whether this group contains EAGLE/MTP draft attention layers.
     is_eagle_group: bool = False
+
+
+@dataclass(frozen=True)
+class KVBlockSegments:
+    """Independent block-ID spaces of one KV cache (long-context mode).
+
+    Each segment has its own block pool, null block (ID 0), free queue,
+    prefix-cache hash map and eviction; a block ID is only meaningful inside
+    its segment. Every KV cache group lives in exactly one segment, and the
+    tensors of its layers hold that segment's number of blocks.
+    """
+
+    names: tuple[str, ...]
+    """Display name of each segment."""
+    num_blocks: tuple[int, ...]
+    """Blocks of each segment, including its null block."""
+    group_segments: tuple[int, ...]
+    """Segment of each KV cache group, in group order."""
+    primary: int
+    """Segment whose count is ``KVCacheConfig.num_blocks`` and whose pool
+    serves pool-wide consumers (connectors binding one GPU block pool)."""
+
+    def __post_init__(self) -> None:
+        if len(self.names) != len(self.num_blocks):
+            raise ValueError("KVBlockSegments needs one name per segment.")
+        if any(n < 1 for n in self.num_blocks):
+            raise ValueError("Every KV block segment needs its null block.")
+        if any(not 0 <= s < len(self.num_blocks) for s in self.group_segments):
+            raise ValueError("KV cache group assigned to an unknown segment.")
+        if not 0 <= self.primary < len(self.num_blocks):
+            raise ValueError("Unknown primary KV block segment.")
+
+    def group_num_blocks(self, group_id: int) -> int:
+        return self.num_blocks[self.group_segments[group_id]]
 
 
 @dataclass
@@ -1054,6 +1110,72 @@ class KVCacheConfig:
     For models with multiple types of attention, there will be multiple groups,
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
+    long_context_plan: LongContextCapacityPlan | None = None
+    """Domain capacities of the long-context (Active Host KV) mode; None when
+    the mode is off. The scheduler's KV cache manager admits against it."""
+    block_segments: KVBlockSegments | None = None
+    """Separate block-ID spaces (long-context mode: a GPU state segment and a
+    GPU history segment). None: one pool of ``num_blocks`` shared by every
+    group, as before. With segments, ``num_blocks`` is the primary segment's
+    count; use ``group_num_blocks`` / ``tensor_num_blocks``."""
+    host_kv_layers: list[str] = field(default_factory=list)
+    """Attention layers without a GPU tensor: their main K/V lives in each
+    worker's host history store, addressed by the primary (history)
+    segment's block IDs (long-context mode, ``main_kv_placement="host"``)."""
+
+    @property
+    def host_kv_group_id(self) -> int | None:
+        if not self.host_kv_layers:
+            return None
+        names = set(self.host_kv_layers)
+        groups = [
+            i
+            for i, group in enumerate(self.kv_cache_groups)
+            if not names.isdisjoint(group.layer_names)
+        ]
+        if len(groups) != 1:
+            raise ValueError("Host main K/V must belong to one group")
+        return groups[0]
+
+    def connector_transfer_layers(self) -> set[str]:
+        """Canonical transport members, separate from the main+index page ABI."""
+        host_group = self.host_kv_group_id
+        return {
+            name
+            for i, group in enumerate(self.kv_cache_groups)
+            if host_group is None
+            or (i != host_group and group.kv_cache_spec.prefix_cacheable)
+            for name in group.layer_names
+        }
+
+    @property
+    def host_kv_page_size_bytes(self) -> int:
+        """Main KV bytes in a physical host row, excluding its logical index."""
+        if not self.host_kv_layers:
+            return 0
+        assert self.long_context_plan is not None
+        return self.long_context_plan.geometry.main_kv_bytes_per_block
+
+    def group_num_blocks(self, group_id: int) -> int:
+        """Blocks addressable by the given KV cache group's block IDs."""
+        if self.block_segments is None:
+            return self.num_blocks
+        return self.block_segments.group_num_blocks(group_id)
+
+    def in_primary_block_space(self, group_id: int) -> bool:
+        """Whether a group's block IDs are those of ``num_blocks`` (always,
+        without block segments). The scheduler announces new blocks for
+        zeroing in the primary space only, so workers zero only its layers."""
+        segments = self.block_segments
+        if segments is None or group_id >= len(segments.group_segments):
+            return True
+        return segments.group_segments[group_id] == segments.primary
+
+    def tensor_num_blocks(self, tensor: KVCacheTensor) -> int:
+        """Blocks held by one of ``kv_cache_tensors``."""
+        if tensor.num_blocks is None:
+            return self.num_blocks
+        return tensor.num_blocks
 
     @property
     def has_mamba_layers(self) -> bool:
@@ -1062,3 +1184,15 @@ class KVCacheConfig:
     @property
     def needs_kv_cache_zeroing(self) -> bool:
         return self.has_mamba_layers
+
+
+def kv_tensor_num_blocks(config: KVCacheConfig, tensor: KVCacheTensor) -> int:
+    """Blocks of one of ``config.kv_cache_tensors``; tolerant of configs and
+    tensors built without the block-space fields (test doubles)."""
+    num_blocks = getattr(tensor, "num_blocks", None)
+    return num_blocks if isinstance(num_blocks, int) else config.num_blocks
+
+
+def has_block_segments(config: object) -> bool:
+    """Whether a KV cache config has separate block spaces."""
+    return isinstance(getattr(config, "block_segments", None), KVBlockSegments)

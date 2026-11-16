@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, cast
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -18,6 +20,7 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    KVCacheTensor,
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -161,9 +164,13 @@ def _allocate_kv_cache(
     for group in kv_cache_config.kv_cache_groups:
         for layer_name in group.layer_names:
             layer_names.add(layer_name)
-    assert layer_names == (kv_cache_raw_tensors.keys() | shared_layers.keys()), (
-        "Some layers are not correctly initialized"
-    )
+    # Long-context host placement: these layers' main K/V lives in the host
+    # history store, not in a GPU tensor.
+    host_layers = set(getattr(kv_cache_config, "host_kv_layers", None) or ())
+    assert not host_layers & kv_cache_raw_tensors.keys()
+    assert layer_names == (
+        kv_cache_raw_tensors.keys() | shared_layers.keys() | host_layers
+    ), "Some layers are not correctly initialized"
     return kv_cache_raw_tensors
 
 
@@ -183,8 +190,11 @@ def _reshape_kv_cache(
     kernel_block_sizes: list[int],
     shared_kv_cache_layers: dict[str, str],
     packed_members: dict[str, tuple[int, int]] | None = None,
+    host_kv_layers: Iterable[str] = (),
+    tensor_descriptions: dict[str, KVCacheTensor] | None = None,
 ) -> dict[str, Any]:
     kv_caches: dict[str, Any] = {}
+    host_kv_layers = set(host_kv_layers)
     has_attn, has_mamba = False, False
 
     for group in attn_groups:
@@ -214,14 +224,31 @@ def _reshape_kv_cache(
             if layer_name in shared_kv_cache_layers:
                 # Shared layer — tensor will be aliased to its target later.
                 continue
+            if layer_name in host_kv_layers:
+                # Main K/V in the host history store; bound separately.
+                continue
 
             kv_raw_tensor = kv_cache_raw_tensors[layer_name]
             packed = (packed_members or {}).get(layer_name)
             member_index, member_count = packed if packed is not None else (0, 1)
             # A packed physical block holds one page of every member.
-            block_bytes = kv_cache_spec.page_size_bytes * member_count
-            assert kv_raw_tensor.numel() % block_bytes == 0
-            num_blocks = kv_raw_tensor.numel() // block_bytes
+            page_bytes = kv_cache_spec.page_size_bytes
+            description = (tensor_descriptions or {}).get(layer_name)
+            if description is not None and description.page_stride_bytes is not None:
+                page_bytes = description.page_stride_bytes
+                num_blocks = description.num_blocks
+                if (
+                    num_blocks is None
+                    or num_blocks < 1
+                    or page_bytes < kv_cache_spec.page_size_bytes
+                    or description.size != kv_raw_tensor.numel()
+                    or kv_raw_tensor.numel() != num_blocks * page_bytes * member_count
+                ):
+                    raise ValueError("Invalid explicit KV tensor page description")
+            else:
+                block_bytes = page_bytes * member_count
+                assert kv_raw_tensor.numel() % block_bytes == 0
+                num_blocks = kv_raw_tensor.numel() // block_bytes
 
             if isinstance(kv_cache_spec, AttentionSpec):
                 has_attn = True
@@ -267,7 +294,7 @@ def _reshape_kv_cache(
                         kernel_block_size=kernel_block_size,
                         num_heads=kv_cache_spec.num_kv_heads,
                         head_size=kv_cache_spec.head_size,
-                        page_size_bytes=kv_cache_spec.page_size_bytes,
+                        page_size_bytes=page_bytes,
                         member_index=member_index,
                         member_count=member_count,
                     )
@@ -276,7 +303,7 @@ def _reshape_kv_cache(
                         kv_raw_tensor,
                         shape=kv_cache_shape,
                         dtype=dtype,
-                        page_size_bytes=kv_cache_spec.page_size_bytes,
+                        page_size_bytes=page_bytes,
                         scheduler_block_size=kv_cache_spec.storage_block_size,
                         kernel_block_size=kernel_block_size,
                         block_dim=inv_order[0],
@@ -291,7 +318,9 @@ def _reshape_kv_cache(
                 storage_offset_bytes = 0
                 for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
                     dtype_size = get_dtype_size(dtype)
-                    num_element_per_page = kv_cache_spec.page_size_bytes // dtype_size
+                    if page_bytes % dtype_size:
+                        raise ValueError("KV state page stride is not element aligned")
+                    num_element_per_page = page_bytes // dtype_size
                     target_shape = (num_blocks, *shape)
                     stride = torch.empty(target_shape).stride()
                     target_stride = (num_element_per_page, *stride[1:])
@@ -402,6 +431,12 @@ def init_kv_cache(
         cache_dtype=cache_dtype,
         shared_kv_cache_layers=shared_kv_cache_layers,
         packed_members=_packed_attention_members(kv_cache_config),
+        host_kv_layers=getattr(kv_cache_config, "host_kv_layers", None) or (),
+        tensor_descriptions={
+            name: tensor
+            for tensor in kv_cache_config.kv_cache_tensors
+            for name in tensor.shared_by
+        },
     )
     bind_kv_cache(kv_caches, forward_context, runner_kv_caches)
     return kv_caches
@@ -435,6 +470,53 @@ class CommonGDNSpecMetadata:
     spec_sequence_masks: torch.Tensor
     spec_token_indx: torch.Tensor
     non_spec_token_indx: torch.Tensor
+
+
+# VLLM_SM70_GDN_CPU_SPEC_QSL (default off): build the GDN spec/non-spec query
+# offsets on the host instead of indexing GPU tensors with boolean masks (two
+# host syncs per step in mixed prefill + spec-decode batches). Integer offsets
+# only; the values are identical either way.
+_GDN_CPU_SPEC_QUERY_START_LOC = envs.VLLM_SM70_GDN_CPU_SPEC_QSL
+# Validation: while this file exists, also compute the offsets the original way
+# on the GPU and compare (adds the host syncs back; never enable it for timing
+# runs). Mismatches are logged as errors.
+_GDN_CPU_SPEC_QSL_CHECK_FILE = envs.VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE
+_GDN_CPU_SPEC_QSL_CHECK_STATE = {"checked": 0, "mismatched": 0}
+
+
+def _check_cpu_spec_qsl(
+    query_lens: torch.Tensor,
+    spec_sequence_masks: torch.Tensor,
+    spec_query_start_loc: torch.Tensor,
+    non_spec_query_start_loc: torch.Tensor,
+) -> None:
+    import logging
+
+    ref_spec = torch.zeros_like(spec_query_start_loc)
+    torch.cumsum(query_lens[spec_sequence_masks], dim=0, out=ref_spec[1:])
+    ref_non_spec = torch.zeros_like(non_spec_query_start_loc)
+    torch.cumsum(query_lens[~spec_sequence_masks], dim=0, out=ref_non_spec[1:])
+    state = _GDN_CPU_SPEC_QSL_CHECK_STATE
+    state["checked"] += 1
+    same = torch.equal(ref_spec, spec_query_start_loc) and torch.equal(
+        ref_non_spec, non_spec_query_start_loc
+    )
+    log = logging.getLogger("vllm.revolta.gdn_qsl_check")
+    if not same:
+        state["mismatched"] += 1
+        log.error(
+            "GDN QSL check MISMATCH spec=%s/%s non_spec=%s/%s",
+            spec_query_start_loc.tolist(),
+            ref_spec.tolist(),
+            non_spec_query_start_loc.tolist(),
+            ref_non_spec.tolist(),
+        )
+    if state["checked"] in (1, 10, 100) or state["checked"] % 500 == 0:
+        log.warning(
+            "GDN QSL check: %d mixed steps checked, %d mismatched",
+            state["checked"],
+            state["mismatched"],
+        )
 
 
 def compute_common_gdn_attn_metadata(
@@ -523,36 +605,70 @@ def compute_common_gdn_attn_metadata(
         non_spec_token_indx = index[:num_non_spec_tokens]
         spec_token_indx = index[num_non_spec_tokens:]
 
-        spec_query_start_loc = torch.zeros(
-            num_spec_decodes + 1,
-            dtype=torch.int32,
-            device=query_start_loc.device,
-        )
-        torch.cumsum(
-            query_lens[spec_sequence_masks],
-            dim=0,
-            out=spec_query_start_loc[1:],
-        )
-        non_spec_query_start_loc = torch.zeros(
-            query_lens.numel() - num_spec_decodes + 1,
-            dtype=torch.int32,
-            device=query_start_loc.device,
-        )
-        torch.cumsum(
-            query_lens[~spec_sequence_masks],
-            dim=0,
-            out=non_spec_query_start_loc[1:],
-        )
-        non_spec_query_start_loc_cpu = torch.zeros(
-            query_lens_cpu.numel() - num_spec_decodes + 1,
-            dtype=torch.int32,
-            device="cpu",
-        )
-        torch.cumsum(
-            query_lens_cpu[~spec_sequence_masks_cpu],
-            dim=0,
-            out=non_spec_query_start_loc_cpu[1:],
-        )
+        if _GDN_CPU_SPEC_QUERY_START_LOC:
+            # Same integer offsets as the GPU branch below, built on the host
+            # from CPU masks and sent in one pinned copy: boolean-mask
+            # indexing of a GPU tensor needs nonzero() and blocks the host.
+            num_non_spec = query_lens_cpu.numel() - num_spec_decodes
+            offsets_cpu = torch.zeros(
+                num_spec_decodes + 1 + num_non_spec + 1,
+                dtype=torch.int32,
+                pin_memory=query_start_loc.is_cuda,
+            )
+            torch.cumsum(
+                query_lens_cpu[spec_sequence_masks_cpu],
+                dim=0,
+                out=offsets_cpu[1 : num_spec_decodes + 1],
+            )
+            torch.cumsum(
+                query_lens_cpu[~spec_sequence_masks_cpu],
+                dim=0,
+                out=offsets_cpu[num_spec_decodes + 2 :],
+            )
+            offsets = offsets_cpu.to(query_start_loc.device, non_blocking=True)
+            spec_query_start_loc = offsets[: num_spec_decodes + 1]
+            non_spec_query_start_loc = offsets[num_spec_decodes + 1 :]
+            non_spec_query_start_loc_cpu = offsets_cpu[num_spec_decodes + 1 :].clone()
+            if _GDN_CPU_SPEC_QSL_CHECK_FILE and os.path.exists(
+                _GDN_CPU_SPEC_QSL_CHECK_FILE
+            ):
+                _check_cpu_spec_qsl(
+                    query_lens,
+                    spec_sequence_masks,
+                    spec_query_start_loc,
+                    non_spec_query_start_loc,
+                )
+        else:
+            spec_query_start_loc = torch.zeros(
+                num_spec_decodes + 1,
+                dtype=torch.int32,
+                device=query_start_loc.device,
+            )
+            torch.cumsum(
+                query_lens[spec_sequence_masks],
+                dim=0,
+                out=spec_query_start_loc[1:],
+            )
+            non_spec_query_start_loc = torch.zeros(
+                query_lens.numel() - num_spec_decodes + 1,
+                dtype=torch.int32,
+                device=query_start_loc.device,
+            )
+            torch.cumsum(
+                query_lens[~spec_sequence_masks],
+                dim=0,
+                out=non_spec_query_start_loc[1:],
+            )
+            non_spec_query_start_loc_cpu = torch.zeros(
+                query_lens_cpu.numel() - num_spec_decodes + 1,
+                dtype=torch.int32,
+                device="cpu",
+            )
+            torch.cumsum(
+                query_lens_cpu[~spec_sequence_masks_cpu],
+                dim=0,
+                out=non_spec_query_start_loc_cpu[1:],
+            )
 
     return CommonGDNSpecMetadata(
         num_prefills=num_prefills,
@@ -569,6 +685,62 @@ def compute_common_gdn_attn_metadata(
         spec_token_indx=spec_token_indx,
         non_spec_token_indx=non_spec_token_indx,
     )
+
+
+class CommonGDNMetadataCache:
+    """One-entry cache of pure-speculative batch geometry, never request state.
+
+    The GPU query offsets remain a view of the runner's live input buffer.
+    Holding that view also keeps its storage alive, so a recycled address cannot
+    hit the key. Mixed batches always use the original builder, including its
+    optional offset validation. Call only outside capture, for FULL replay.
+    """
+
+    def __init__(self) -> None:
+        self._key: tuple[object, ...] | None = None
+        self._metadata: CommonGDNSpecMetadata | None = None
+
+    def get(
+        self,
+        *,
+        num_decode_draft_tokens_cpu: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        query_start_loc_cpu: torch.Tensor,
+        num_spec_state_tokens: int,
+        legacy_mixed_decode_routing: bool,
+    ) -> CommonGDNSpecMetadata | None:
+        # Only CPU tensors are inspected for values. No D2H or device fence.
+        key = (
+            num_decode_draft_tokens_cpu.numpy().tobytes(),
+            tuple(num_decode_draft_tokens_cpu.shape),
+            num_decode_draft_tokens_cpu.dtype,
+            query_start_loc_cpu.numpy().tobytes(),
+            tuple(query_start_loc_cpu.shape),
+            query_start_loc_cpu.dtype,
+            query_start_loc.device,
+            query_start_loc.dtype,
+            query_start_loc.data_ptr(),
+            tuple(query_start_loc.shape),
+            query_start_loc.stride(),
+            num_spec_state_tokens,
+            legacy_mixed_decode_routing,
+        )
+        if key == self._key:
+            return self._metadata
+        metadata = compute_common_gdn_attn_metadata(
+            num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+            query_start_loc=query_start_loc,
+            query_start_loc_cpu=query_start_loc_cpu,
+            num_spec_state_tokens=num_spec_state_tokens,
+            legacy_mixed_decode_routing=legacy_mixed_decode_routing,
+        )
+        # Cache neither mixed nor non-spec batches. The retained tensors are
+        # read-only constants, apart from the live query-offset view.
+        if metadata is not None and metadata.num_prefills == metadata.num_decodes == 0:
+            self._key, self._metadata = key, metadata
+        else:
+            self._key, self._metadata = None, None
+        return metadata
 
 
 def build_attn_metadata(

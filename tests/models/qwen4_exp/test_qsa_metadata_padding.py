@@ -349,6 +349,20 @@ def test_qsa_canonical_block_table_keeps_physical_pages() -> None:
     assert builder._canonical_block_table(table) is table
 
 
+def _side_spec(block_size: int):
+    """A replicated QSA side page, as the builder's real spec."""
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+    return MLAAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float16,
+        compress_ratio=4,
+        dcp_sharded=False,
+    )
+
+
 def _dcp2_selector_builder(buffer_width: int) -> qsa_cache.QSAMetadataBuilder:
     """A target QSA selector builder with the measured TP4/DCP2 geometry.
 
@@ -361,7 +375,7 @@ def _dcp2_selector_builder(buffer_width: int) -> qsa_cache.QSAMetadataBuilder:
 
     builder = object.__new__(qsa_cache.QSAMetadataBuilder)
     builder.block_table_buffer = torch.empty((1, buffer_width), dtype=torch.int32)
-    builder.kv_cache_spec = SimpleNamespace(block_size=3136, dcp_sharded=False)
+    builder.kv_cache_spec = _side_spec(3136)
     builder.kernel_block_size = 32
     builder.has_sharded_main_owner = True
     builder.reads_sharded_group = True
@@ -532,7 +546,7 @@ def test_qsa_dcp_local_span_must_divide_kernel_block() -> None:
     silently round: masking it would read the wrong compressed page."""
 
     builder = _dcp2_selector_builder(buffer_width=4)
-    builder.kv_cache_spec = SimpleNamespace(block_size=3200, dcp_sharded=False)
+    builder.kv_cache_spec = _side_spec(3200)
     builder.kernel_block_size = 128
     table = torch.arange(675, 700, dtype=torch.int32).unsqueeze(0)
     with pytest.raises(RuntimeError, match="must be divisible"):

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -12,6 +13,9 @@ from vllm.config.model import LogprobsMode
 from vllm.logger import init_logger
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.triton_utils import HAS_TRITON
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
 if HAS_TRITON:
     from vllm.v1.sample.ops.topk_topp_triton import apply_top_k_top_p_triton
@@ -321,30 +325,46 @@ def compiled_random_sample(logits: torch.Tensor) -> torch.Tensor:
 
 
 def apply_top_k_top_p(
-    logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
+    logits: torch.Tensor,
+    k: torch.Tensor | None,
+    p: torch.Tensor | None,
+    has_topp_only_rows: bool = True,
 ) -> torch.Tensor:
+    """Apply top-k and/or top-p masking to logits.
+
+    has_topp_only_rows must be True if any row has p < 1 and
+    k >= logits.shape[-1] (no active top-k).
+    """
     if p is None and k is None:
         return logits
 
-    if current_platform.is_cpu():
-        if HAS_TRITON:
-            return apply_top_k_top_p_triton(logits, k, p)
-        return apply_top_k_top_p_pytorch(logits, k, p, allow_cpu_sync=True)
+    if HAS_TRITON:
+        return apply_top_k_top_p_triton(
+            logits, k, p, has_topp_only_rows=has_topp_only_rows
+        )
 
-    if (
-        HAS_TRITON
-        and current_platform.is_cuda()
-        and logits.dtype == torch.float32
-        and logits.shape[0] >= 2
-        and logits.shape[1] >= 32768
-    ):
-        return apply_top_k_top_p_triton(logits, k, p)
+    is_cpu = current_platform.is_cpu()
+    return apply_top_k_top_p_pytorch(logits, k, p, allow_cpu_sync=is_cpu)
 
-    if HAS_TRITON and logits.shape[0] >= 8:
-        return apply_top_k_top_p_triton(logits, k, p)
 
-    # Use pytorch sort implementation for small batch sizes.
-    return apply_top_k_top_p_pytorch(logits, k, p)
+def warmup_top_k_top_p(logits: torch.Tensor, vllm_config: "VllmConfig") -> None:
+    """Warm native filtering in the existing dummy sampler runs."""
+    if not HAS_TRITON:
+        return
+    # Cover small-batch split counts and singleton scalar specializations,
+    # plus the monolithic path for the maximum speculative-expanded batch.
+    logits = logits.to(torch.float32)
+    batch_size = vllm_config.scheduler_config.max_num_seqs * (
+        vllm_config.num_speculative_tokens + 1
+    )
+    vocab_size = logits.shape[1]
+    for rows in (*range(1, min(batch_size, 64) + 1), batch_size):
+        k = torch.full(
+            (rows,), min(20, vocab_size), dtype=torch.int32, device=logits.device
+        )
+        p = torch.full((rows,), 0.95, dtype=torch.float32, device=logits.device)
+        for top_k, top_p in ((k, None), (None, p), (k, p)):
+            apply_top_k_top_p(logits[:1].expand(rows, -1).clone(), top_k, top_p)
 
 
 def apply_top_k_top_p_pytorch(
@@ -352,8 +372,6 @@ def apply_top_k_top_p_pytorch(
     k: torch.Tensor | None,
     p: torch.Tensor | None,
     allow_cpu_sync: bool = False,
-    *,
-    rowwise_sort: bool = False,
 ) -> torch.Tensor:
     """Apply top-k and top-p masks to the logits.
 
@@ -370,20 +388,7 @@ def apply_top_k_top_p_pytorch(
             # Avoid sorting vocab for top-k only case.
             return apply_top_k_only(logits, k)
 
-    if rowwise_sort and logits.shape[0] > 1:
-        # Bound radix-sort scratch while retaining the original batch shape
-        # for the softmax and cumulative sum below.
-        logits_sort = torch.empty_like(logits)
-        logits_idx = torch.empty_like(logits, dtype=torch.int64)
-        for row in range(logits.shape[0]):
-            torch.sort(
-                logits[row : row + 1],
-                dim=-1,
-                descending=False,
-                out=(logits_sort[row : row + 1], logits_idx[row : row + 1]),
-            )
-    else:
-        logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
+    logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
 
     if k is not None:
         # Apply top-k.

@@ -835,6 +835,15 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
+        if intermediate_size_per_partition % self.group_size != 0:
+            raise ValueError(
+                "SM70 AWQ MoE requires the down_proj input size per TP shard "
+                "to be a multiple of the AWQ group size; got "
+                f"intermediate_size_per_partition={intermediate_size_per_partition}, "
+                f"group_size={self.group_size}. Choose a tensor parallel size "
+                "that keeps quantization groups intact. Padding cannot repair "
+                "scale/zero-point assignments across shard boundaries."
+            )
         extra_weight_attrs.update(
             {
                 "is_transposed": True,

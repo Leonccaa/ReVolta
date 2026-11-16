@@ -7,7 +7,13 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.single_type_kv_cache_manager import MambaManager
-from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec, UniformTypeKVCacheSpecs
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    MambaSpec,
+    UniformTypeKVCacheSpecs,
+    has_block_segments,
+    kv_tensor_num_blocks,
+)
 from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
     GPULoadStoreSpec,
@@ -67,16 +73,20 @@ class CPUOffloadingSpec(OffloadingSpec):
     def __init__(self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig):
         super().__init__(vllm_config, kv_cache_config)
 
+        self.unified_host = bool(getattr(kv_cache_config, "host_kv_layers", ()))
+        self.unified_region = None
         cpu_bytes_to_use = self.extra_config.get("cpu_bytes_to_use")
-        if not cpu_bytes_to_use:
+        if not cpu_bytes_to_use and not self.unified_host:
             raise Exception(
                 "cpu_bytes_to_use must be specified in kv_connector_extra_config"
             )
 
+        host_group = getattr(kv_cache_config, "host_kv_group_id", None)
+        host_layers = getattr(kv_cache_config, "host_kv_layers", ())
         cacheable_groups = {
             i: group
             for i, group in enumerate(kv_cache_config.kv_cache_groups)
-            if group.kv_cache_spec.prefix_cacheable
+            if group.kv_cache_spec.prefix_cacheable and i != host_group
         }
         mamba_specs = {}
         for i, group in cacheable_groups.items():
@@ -88,7 +98,8 @@ class CPUOffloadingSpec(OffloadingSpec):
         # Equal-sized Mamba/attention blocks need matching checkpoint coverage.
         # Keep the existing layout for single groups and mixed block geometry.
         self.partition_by_group = (
-            kv_cache_config.num_blocks > 0
+            not self.unified_host
+            and kv_cache_config.num_blocks > 0
             and len(cacheable_groups) > 1
             and bool(mamba_specs)
             and len({self.gpu_block_size[i] for i in cacheable_groups}) == 1
@@ -113,6 +124,14 @@ class CPUOffloadingSpec(OffloadingSpec):
 
         self.cpu_group_page_sizes: dict[int, int] = {}
         self.cpu_group_num_blocks: dict[int, int] = {}
+        transfer_tensors = kv_cache_config.kv_cache_tensors
+        if host_layers:
+            transfer_layers = kv_cache_config.connector_transfer_layers()
+            transfer_tensors = [
+                tensor
+                for tensor in transfer_tensors
+                if not transfer_layers.isdisjoint(tensor.shared_by)
+            ]
         world_size = vllm_config.parallel_config.world_size
         if self.partition_by_group:
             mamba_groups: set[int] = set()
@@ -123,8 +142,8 @@ class CPUOffloadingSpec(OffloadingSpec):
                 # by its largest layer spec. Physical tensor sizes/shared_by are
                 # preserved and give identical budgets on scheduler and workers.
                 page_size = sum(
-                    tensor.size // kv_cache_config.num_blocks
-                    for tensor in kv_cache_config.kv_cache_tensors
+                    tensor.size // kv_tensor_num_blocks(kv_cache_config, tensor)
+                    for tensor in transfer_tensors
                     if not layer_names.isdisjoint(tensor.shared_by)
                 )
                 self.cpu_group_page_sizes[i] = page_size * self.block_size_factor
@@ -140,7 +159,7 @@ class CPUOffloadingSpec(OffloadingSpec):
                 if i not in mamba_groups
             )
             state_page = sum(self.cpu_group_page_sizes[i] for i in mamba_groups)
-            budget_per_worker = int(cpu_bytes_to_use) // world_size
+            budget_per_worker = int(cpu_bytes_to_use or 0) // world_size
 
             assert mamba_spec is not None
             block_size = mamba_spec.block_size * self.block_size_factor
@@ -193,7 +212,7 @@ class CPUOffloadingSpec(OffloadingSpec):
                 self.state_slots_reference_tokens,
             )
         else:
-            total_gpu_kv_bytes = sum(t.size for t in kv_cache_config.kv_cache_tensors)
+            total_gpu_kv_bytes = sum(t.size for t in transfer_tensors)
             self.cpu_page_size_per_worker = (
                 total_gpu_kv_bytes
                 // kv_cache_config.num_blocks
@@ -201,9 +220,19 @@ class CPUOffloadingSpec(OffloadingSpec):
                 if kv_cache_config.num_blocks > 0
                 else 0
             )
+            if has_block_segments(kv_cache_config):
+                # The unpartitioned worker allocates a CPU view for EVERY
+                # canonical tensor. Independent GPU spaces do not alias their
+                # CPU backing, even when a key uses only one space's views.
+                self.cpu_page_size_per_worker = (
+                    sum(
+                        t.size // kv_tensor_num_blocks(kv_cache_config, t)
+                        for t in transfer_tensors
+                    )
+                ) * self.block_size_factor
             kv_bytes_per_offloaded_block = self.cpu_page_size_per_worker * world_size
             self.num_blocks = (
-                int(cpu_bytes_to_use) // kv_bytes_per_offloaded_block
+                int(cpu_bytes_to_use or 0) // kv_bytes_per_offloaded_block
                 if kv_bytes_per_offloaded_block > 0
                 else 0
             )
@@ -215,8 +244,53 @@ class CPUOffloadingSpec(OffloadingSpec):
         self._handlers: CpuGpuOffloadingHandlers | None = None
 
         self.eviction_policy: str = self.extra_config.get("eviction_policy", "lru")
+        if self.unified_host:
+            from vllm.v1.kv_offload.host.region import host_region_layout
+
+            layout = host_region_layout(kv_cache_config, vllm_config.instance_id)
+            if (
+                self.block_size_factor != 1
+                or self.cpu_page_size_per_worker > layout.worker_bytes
+            ):
+                raise ValueError(
+                    "Unified host component layout exceeds the MAIN frame ABI"
+                )
+            if (
+                self.eviction_policy != "lru"
+                or int(self.extra_config.get("store_threshold", 0)) >= 2
+            ):
+                raise ValueError("Unified host requires LRU and unfiltered stores")
+            tiers = self.extra_config.get("secondary_tiers", [])
+            ssd = self.extra_config.get("host_kv.ssd", {})
+            if tiers:
+                if any(t.get("type") not in ("fs", "revolta_fs") for t in tiers):
+                    raise ValueError(
+                        "Unified host supports only HostPageSsd persistence"
+                    )
+                if not isinstance(ssd, dict) or not ssd.get("enabled", False):
+                    raise ValueError(
+                        "Unified host requires host_kv.ssd for legacy FS config; "
+                        "no secondary fallback"
+                    )
+                if any(
+                    float(t.get("write_delay_s", 300))
+                    != float(ssd.get("write_delay_s", 300))
+                    for t in tiers
+                ):
+                    raise ValueError("Conflicting write_delay_s for unified host SSD")
+            self.num_blocks = layout.num_pages
+            self.unified_frame_bytes = layout.worker_bytes * layout.num_workers
+
+    def _get_unified_manager(self) -> OffloadingManager:
+        if self._manager is None:
+            from vllm.v1.kv_offload.unified.manager import UnifiedStoreManager
+
+            self._manager = UnifiedStoreManager(self)
+        return self._manager
 
     def get_manager(self) -> OffloadingManager:
+        if self.unified_host:
+            return self._get_unified_manager()
         if not self._manager:
             kv_events_config = self.vllm_config.kv_events_config
             enable_events = (
@@ -253,6 +327,15 @@ class CPUOffloadingSpec(OffloadingSpec):
         return self._manager
 
     def create_handlers(self, kv_caches: CanonicalKVCaches) -> CpuGpuOffloadingHandlers:
+        if self.unified_host:
+            if self.unified_region is None:
+                raise ValueError("Unified component views need the MAIN region owner")
+            return CpuGpuOffloadingHandlers(
+                kv_caches=kv_caches,
+                block_size_factor=self.block_size_factor,
+                num_cpu_blocks=self.num_blocks,
+                unified_region=self.unified_region,
+            )
         return CpuGpuOffloadingHandlers(
             kv_caches=kv_caches,
             block_size_factor=self.block_size_factor,

@@ -203,8 +203,9 @@ def _gather_ple_fp8_from_pinned_kernel(
 ):
     """Gather and dequantize one PLE row per program from pinned host memory."""
 
-    row_idx = tl.program_id(0)
-    local_idx = tl.load(ids_ptr + row_idx)
+    # int64 row offsets: row * embedding_dim overflows int32 past 2**31.
+    row_idx = tl.program_id(0).to(tl.int64)
+    local_idx = tl.load(ids_ptr + row_idx).to(tl.int64)
     offsets = tl.arange(0, BLOCK_D)
     mask = offsets < embedding_dim
     byte_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8))
@@ -228,7 +229,7 @@ def _dequantize_ple_fp8_bytes_kernel(
 ):
     """Dequantize raw E4M3FN bytes without exposing FP8 to SM70 Inductor."""
 
-    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < numel
     raw = tl.load(input_ptr + offsets, mask=mask, other=0)
     scale = tl.load(scale_ptr).to(tl.float32)
@@ -644,6 +645,16 @@ def _pin_host_tensor_exact(tensor: torch.Tensor) -> None:
     finalizer.atexit = False  # type: ignore[misc]
 
 
+def _long_context_host_placement() -> bool:
+    """Whether the main K/V of long-context mode lives in the host pool."""
+    kernel_config = getattr(get_current_vllm_config(), "kernel_config", None)
+    long_context = getattr(kernel_config, "long_context_kv", None)
+    return bool(
+        getattr(long_context, "enabled", False)
+        and getattr(long_context, "main_kv_placement", None) == "host"
+    )
+
+
 class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
     """TP-sharded FP8 PLE table split between device memory and pinned host.
 
@@ -825,7 +836,11 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         table_bytes = total_rows * row_bytes
         explicit_host = ple_host_budget_bytes()
         cascade = ple_cascade_configured()
-        hybrid = envs.VLLM_SM70_QWEN38_HYBRID_PLE
+        # Long-context host KV spends every spare device byte on history IDs, so
+        # an unset budget keeps the whole table on host, as hybrid placement does.
+        hybrid = envs.VLLM_SM70_QWEN38_HYBRID_PLE or (
+            explicit_host is None and _long_context_host_placement()
+        )
         spill = None
         if cascade or (explicit_host is None and not hybrid):
             spill = self._device_spill_bytes(device, table_bytes)
@@ -837,8 +852,8 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             # device/KV estimate, which can reject not-yet-padded CSA pages.
             host_budget = self._cap_derived_host_budget(table_bytes)
             logger.info(
-                "Qwen4Exp hybrid PLE auto placement: %s of the table go to "
-                "host memory before cache layout resolution",
+                "Qwen4Exp PLE auto placement: %s of the table go to host "
+                "memory (hybrid or long-context host KV placement)",
                 format_gib(host_budget),
             )
         else:
@@ -1831,9 +1846,10 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                     out=embedding_output.reshape(-1, self.head_dim),
                 )
             return output
-        if self._is_cpu_offloaded:
-            # Cascade: the resident tiers are gathered here, the rows beyond
-            # them arrive from the worker in the shared output buffer.
+        if self._is_cpu_offloaded and self._keeps_local_tables:
+            # Only cascade merges resident tiers with the worker's rows.
+            # Hybrid decode uses the complete local table and submits no
+            # remote request, so it must not capture a wait on that result.
             remote_rows = self.wait_offloaded_output(hidden_states, num_tokens)
             return self.ngram_embedding(ngram_ids, remote_rows=remote_rows).flatten(-2)
         return self.ngram_embedding(ngram_ids).flatten(-2)

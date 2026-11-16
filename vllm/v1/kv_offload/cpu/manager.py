@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections import OrderedDict
-from collections.abc import Collection, Iterable, Mapping
+from collections import Counter, OrderedDict
+from collections.abc import Callable, Collection, Iterable, Mapping
 from typing import Literal
 
 from vllm.v1.kv_offload.base import (
@@ -24,6 +24,13 @@ _CACHE_POLICIES: dict[str, type[CachePolicy]] = {
     "lru": LRUCachePolicy,
     "arc": ARCCachePolicy,
 }
+
+# Why a stored CPU-tier block left the cache (observability only).
+# "capacity" and "superseded" are policy evictions under space pressure;
+# together with "dependency" they equal ``num_evicted_blocks`` and removal events.
+# "superseded" marks blocks the scheduler had demoted as superseded states.
+# "reset" counts blocks dropped by ``reset_cache`` (no removal event).
+EVICTION_REASONS: tuple[str, ...] = ("capacity", "superseded", "reset", "dependency")
 
 
 class CPUOffloadingManager(OffloadingManager):
@@ -58,6 +65,20 @@ class CPUOffloadingManager(OffloadingManager):
         self._policy: CachePolicy = policy_cls(cache_capacity=num_blocks)
         self.store_threshold: int = store_threshold
         self.max_tracker_size: int = max_tracker_size
+
+        # Cumulative counters for observability (blocks).
+        self.num_stored_blocks: int = 0
+        self.num_evicted_blocks: int = 0
+        # Read-only bookkeeping: evicted blocks by reason, and the cached keys
+        # currently demoted (only for policies that implement demote). Never
+        # consulted by any admission or eviction decision.
+        self.evicted_blocks_by_reason: Counter[str] = Counter()
+        self._tracks_demotion: bool = (
+            type(self._policy).demote is not CachePolicy.demote
+        )
+        self._demoted: set[OffloadKey] = set()
+        # Optional resident-only dependency bookkeeping, installed by scheduler.
+        self.cache_observer: Callable[[OffloadKey, bool], None] | None = None
 
         # Number of block references. It is ordered so can evict the LRU entry in O(1).
         self.counts: OrderedDict[OffloadKey, int] | None = (
@@ -126,15 +147,23 @@ class CPUOffloadingManager(OffloadingManager):
             block = self._policy.get(key)
             assert block is not None, f"Block {key!r} not found in cache"
             assert block.is_ready, f"Block {key!r} is not ready for reading"
-            block.ref_cnt += 1
             blocks.append(block)
-        return self._get_load_store_spec(keys, blocks)
+        # Validate the whole batch and build its descriptor before pinning.
+        # A missing later key or descriptor failure must leave no partial pin.
+        spec = self._get_load_store_spec(keys, blocks)
+        for block in blocks:
+            block.ref_cnt += 1
+        return spec
 
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
         self._policy.touch(keys)
+        if self._demoted:
+            self._demoted.difference_update(keys)
 
     def demote(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
         self._policy.demote(keys)
+        if self._tracks_demotion:
+            self._demoted.update(k for k in keys if self._policy.get(k) is not None)
 
     def complete_load(
         self, keys: Collection[OffloadKey], req_context: ReqContext
@@ -175,6 +204,11 @@ class CPUOffloadingManager(OffloadingManager):
             for key, block in evicted:
                 self._free_block(block)
                 to_evict.append(key)
+            self.num_evicted_blocks += len(evicted)
+            self._record_evictions(to_evict)
+            if self.cache_observer is not None:
+                for key in to_evict:
+                    self.cache_observer(key, False)
 
         if to_evict and self.events is not None:
             self.events.append(
@@ -192,6 +226,9 @@ class CPUOffloadingManager(OffloadingManager):
 
         for key, block in zip(keys_to_store, blocks):
             self._policy.insert(key, block)
+            if self.cache_observer is not None:
+                self.cache_observer(key, True)
+        self.num_stored_blocks += len(keys_to_store)
 
         # build store specs for allocated blocks
         store_spec = self._get_load_store_spec(keys_to_store, blocks)
@@ -222,6 +259,9 @@ class CPUOffloadingManager(OffloadingManager):
                 if block is not None and not block.is_ready:
                     self._policy.remove(key)
                     self._free_block(block)
+                    self._demoted.discard(key)
+                    if self.cache_observer is not None:
+                        self.cache_observer(key, False)
 
         if stored_keys and self.events is not None:
             self.events.append(
@@ -238,15 +278,75 @@ class CPUOffloadingManager(OffloadingManager):
         # pre-reset jobs, so no lazy cleanup is needed. The scheduler also
         # flushes in-flight load job IDs to the workers before any new stores
         # can begin, preventing a cross-direction data race on reused offload block IDs.
+        num_cached = self._num_allocated_blocks - len(self._free_list)
+        if num_cached:
+            self.evicted_blocks_by_reason["reset"] += num_cached
+        self._demoted.clear()
+        if self.cache_observer is not None:
+            # The observer owns no nonresident entries; notify before clear.
+            for key in self.resident_keys():
+                self.cache_observer(key, False)
         self._policy.clear()
 
         self._free_list.clear()
         self._num_allocated_blocks = 0
 
+    def is_ready_resident(self, key: OffloadKey) -> bool:
+        """Resident and readable; no recency, admission-counter or ref change."""
+        block = self._policy.get(key)
+        return block is not None and block.is_ready
+
+    def is_demoted(self, key: OffloadKey) -> bool:
+        """Demoted (superseded) and not touched since; read-only."""
+        return key in self._demoted
+
+    def resident_keys(self) -> list[OffloadKey]:
+        """Snapshot without touching recency or lookup/admission counters."""
+        if isinstance(self._policy, LRUCachePolicy):
+            return list(self._policy.blocks)
+        assert isinstance(self._policy, ARCCachePolicy)
+        return list(self._policy.t1) + list(self._policy.t2)
+
+    def remove_dependency_blocks(
+        self, keys: Collection[OffloadKey]
+    ) -> list[OffloadKey]:
+        """Remove proven dead blocks, retaining all pinned or unfinished slots."""
+        removed = []
+        for key in keys:
+            block = self._policy.get(key)
+            if block is None or block.ref_cnt != 0:
+                continue
+            self._policy.remove(key)
+            self._free_block(block)
+            self._demoted.discard(key)
+            if self.cache_observer is not None:
+                self.cache_observer(key, False)
+            removed.append(key)
+        if removed:
+            self.num_evicted_blocks += len(removed)
+            self.evicted_blocks_by_reason["dependency"] += len(removed)
+            if self.events is not None:
+                self.events.append(
+                    OffloadingEvent(keys=removed, medium=self.medium, removed=True)
+                )
+        return removed
+
     def take_events(self) -> Iterable[OffloadingEvent]:
         if self.events is not None:
             yield from self.events
             self.events.clear()
+
+    def _record_evictions(self, keys: list[OffloadKey]) -> None:
+        superseded = 0
+        if self._demoted:
+            for key in keys:
+                if key in self._demoted:
+                    self._demoted.discard(key)
+                    superseded += 1
+        if superseded:
+            self.evicted_blocks_by_reason["superseded"] += superseded
+        if len(keys) > superseded:
+            self.evicted_blocks_by_reason["capacity"] += len(keys) - superseded
 
 
 class GroupedCPUOffloadingManager(OffloadingManager):
@@ -273,6 +373,44 @@ class GroupedCPUOffloadingManager(OffloadingManager):
     def on_request_finished(self, req_context: ReqContext) -> None:
         for manager in self.managers.values():
             manager.on_request_finished(req_context)
+
+    @property
+    def state_latest_only(self) -> bool:
+        """Any group's tiering manager has a state_latest_only tier."""
+        return any(
+            getattr(m, "state_latest_only", False) is True
+            for m in self.managers.values()
+        )
+
+    def drop_pending_secondary_writes(self, keys: Collection[OffloadKey]) -> int:
+        dropped = 0
+        for group_idx, group_keys in self._partition(keys).items():
+            drop = getattr(
+                self.managers[group_idx], "drop_pending_secondary_writes", None
+            )
+            if drop is not None:
+                dropped += drop(group_keys)
+        return dropped
+
+    def has_pending_delayed_writes(self) -> bool:
+        return any(
+            bool(getattr(m, "has_pending_delayed_writes", lambda: False)())
+            for m in self.managers.values()
+        )
+
+    def delayed_write_step(self) -> None:
+        for manager in self.managers.values():
+            step = getattr(manager, "delayed_write_step", None)
+            if step is not None:
+                step()
+
+    def delayed_write_stats(self) -> dict[str, dict[str, int]]:
+        out: dict[str, dict[str, int]] = {}
+        for group_idx, manager in self.managers.items():
+            stats = getattr(manager, "delayed_write_stats", None)
+            for tier, values in (stats() if stats is not None else {}).items():
+                out[f"{tier}[group {group_idx}]"] = values
+        return out
 
     def shutdown(self) -> None:
         for manager in self.managers.values():
@@ -301,11 +439,18 @@ class GroupedCPUOffloadingManager(OffloadingManager):
         self, keys: Collection[OffloadKey], req_context: ReqContext
     ) -> CPULoadStoreSpec:
         block_ids: dict[OffloadKey, int] = {}
-        for group_idx, group_keys in self._partition(keys).items():
-            spec = self.managers[group_idx].prepare_load(group_keys, req_context)
-            assert isinstance(spec, CPULoadStoreSpec)
-            block_ids.update(zip(group_keys, map(int, spec.block_ids)))
-        return CPULoadStoreSpec([block_ids[key] for key in keys])
+        pinned: dict[int, list[OffloadKey]] = {}
+        try:
+            for group_idx, group_keys in self._partition(keys).items():
+                spec = self.managers[group_idx].prepare_load(group_keys, req_context)
+                pinned[group_idx] = group_keys
+                assert isinstance(spec, CPULoadStoreSpec)
+                block_ids.update(zip(group_keys, map(int, spec.block_ids)))
+            return CPULoadStoreSpec([block_ids[key] for key in keys])
+        except Exception:
+            for group_idx, group_keys in pinned.items():
+                self.managers[group_idx].complete_load(group_keys, req_context)
+            raise
 
     def complete_load(self, keys: Collection[OffloadKey], req_context: ReqContext):
         for group_idx, group_keys in self._partition(keys).items():

@@ -65,9 +65,25 @@ class OffloadingHandler(ABC):
     def wait(self, job_ids: set[int]) -> None:
         """
         Wait for jobs to finish (blocking).
+
+        Partially submitted jobs must remain waitable after transfer_async
+        raises or returns False. Return only after all their source and
+        destination accesses have retired. Raise if draining fails or their
+        completion cannot be established.
+
         Args:
             job_ids: The set of job IDs to wait for.
         """
+
+    def drain(self) -> None:
+        """Retire all accesses before any handler releases shared resources.
+
+        Handlers with outstanding transfers must override this method. Raise
+        if retirement cannot be established, retaining all backing for retry.
+        This phase must not release tensors or mappings shared with a peer.
+        Successful receipts remain available from get_finished() exactly once.
+        """
+        return
 
     def shutdown(self) -> None:
         """Shutdown the handler and release any resources."""
@@ -172,5 +188,10 @@ class OffloadingWorker:
             handler.wait(job_ids)
 
     def shutdown(self) -> None:
+        # A handler can share its tensors and mappings with another direction.
+        # No backing may be released until every handler has retired its work.
+        # If any drain raises, preserve all backing so shutdown can be retried.
+        for handler in self.handlers:
+            handler.drain()
         for handler in self.handlers:
             handler.shutdown()

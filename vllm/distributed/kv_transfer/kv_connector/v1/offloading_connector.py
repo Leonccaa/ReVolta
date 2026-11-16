@@ -74,6 +74,10 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA, SupportsVmmSafeTransf
         elif role == KVConnectorRole.WORKER:
             self.connector_worker = OffloadingConnectorWorker(spec)
 
+    def set_shutdown_deadline(self, deadline: float) -> None:
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.manager.set_shutdown_deadline(deadline)
+
     def shutdown(self) -> None:
         if self.connector_worker is not None:
             self.connector_worker.shutdown()
@@ -163,6 +167,11 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA, SupportsVmmSafeTransf
         assert self.connector_scheduler is not None
         self.connector_scheduler.update_connector_output(connector_output)
 
+    def take_failed_loads(self) -> set[str]:
+        if self.connector_scheduler is None:
+            return set()
+        return self.connector_scheduler.take_failed_loads()
+
     def request_finished(
         self,
         request: "Request",
@@ -182,6 +191,15 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA, SupportsVmmSafeTransf
     def take_events(self) -> Iterable[KVCacheEvent]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.take_events()
+
+    def has_pending_persistence(self) -> bool:
+        return self.connector_scheduler is not None and (
+            self.connector_scheduler.has_pending_persistence()
+        )
+
+    def persistence_step(self) -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.persistence_step()
 
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: VllmConfig) -> str | None:
@@ -205,9 +223,29 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA, SupportsVmmSafeTransf
         return True
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
-        if self.connector_worker is None:
-            return None  # We only emit stats from the worker-side
-        return self.connector_worker.get_kv_connector_stats()
+        if self.connector_worker is not None:
+            return self.connector_worker.get_kv_connector_stats()
+        if self.connector_scheduler is None:
+            return None
+        # Scheduler side: CPU-tier evictions by reason, skipped draft blocks
+        # (cpu.draft_offload), stored blocks by kind, lookup shrink by cause
+        # and draft window use of hits since the last call.
+        deltas = self.connector_scheduler.cpu_tier_eviction_deltas()
+        skipped_draft = self.connector_scheduler.skipped_draft_blocks_delta()
+        residency = self.connector_scheduler.cpu_residency_snapshot()
+        labelled = self.connector_scheduler.offload_counter_deltas()
+        if not deltas and not skipped_draft and not labelled and residency is None:
+            return None
+        stats = OffloadingConnectorStats()
+        if deltas:
+            stats.record_evictions(deltas)
+        if skipped_draft:
+            stats.record_skipped_draft_blocks(skipped_draft)
+        if residency is not None:
+            stats.record_residency(residency)
+        for key, counts in labelled.items():
+            stats.record_labelled_counts(key, counts)
+        return stats
 
     @classmethod
     def build_kv_connector_stats(

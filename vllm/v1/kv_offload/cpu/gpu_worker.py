@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import ctypes
 import fcntl
 import time
 from collections import deque
@@ -36,6 +37,7 @@ class Transfer:
     start_event: torch.Event
     end_event: torch.Event
     num_bytes: int
+    retired: bool = False
 
 
 def compute_sub_block_ptrs(
@@ -88,10 +90,11 @@ def compute_sub_block_ptrs(
     output[:] = flat[skip_count : skip_count + num_sub_blocks]
 
 
-def pin_mmap_region(region: SharedOffloadRegion) -> None:
+def pin_mmap_region(region: SharedOffloadRegion, flags: int = 0) -> None:
     """Register the entire mmap as CUDA pinned memory via cudaHostRegister."""
     rank = region.rank
 
+    assert region._base is not None
     base_ptr = region._base.data_ptr()
     # Long-term pinning can migrate pages. Concurrent registrations of the
     # same shared region can hold pins that prevent another worker's migration
@@ -102,7 +105,7 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
     fcntl.flock(region.fd, fcntl.LOCK_EX)
     try:
         result = torch.cuda.cudart().cudaHostRegister(
-            base_ptr, region.total_size_bytes, 0
+            base_ptr, region.total_size_bytes, flags
         )
     finally:
         fcntl.flock(region.fd, fcntl.LOCK_UN)
@@ -161,7 +164,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         for gpu_tensor, cpu_tensor in zip(gpu_tensors, cpu_tensors):
             assert gpu_tensor.dtype == torch.int8
             assert gpu_tensor.ndim == 2
-            assert gpu_tensor.is_cuda
+            assert gpu_tensor.device.type in ("cuda", "cpu")
             assert cpu_tensor.dtype == torch.int8
             assert cpu_tensor.ndim == 2
             assert cpu_tensor.device.type == "cpu"
@@ -176,6 +179,11 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
             cpu_tensors if gpu_to_cpu else gpu_tensors
         )
         self.gpu_to_cpu: bool = gpu_to_cpu
+        # Host-placed main K/V shares the history IDs and transfer job with
+        # the index. It is copied only after the compute/previous-job fences.
+        self._host_tensor_indices = {
+            index for index, tensor in enumerate(gpu_tensors) if not tensor.is_cuda
+        }
         self.kv_cache_groups_data_refs = kv_cache_groups_data_refs
 
         # GPU blocks may be smaller
@@ -191,6 +199,9 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         self._transfer_events: dict[int, torch.Event] = {}
         # queue of transfers (job_id, stream, event)
         self._transfers: deque[Transfer] = deque()
+        # Submission can fail before a usable end event exists. Keep its
+        # stream and events alive until wait() proves that all access retired.
+        self._failed_transfers: dict[int, Transfer] = {}
         # list of CUDA streams available for re-use
         self._stream_pool: list[torch.cuda.Stream] = []
         # list of CUDA events available for re-use
@@ -247,6 +258,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         all_src = np.empty(num_copy_ops, dtype=np.int64)
         all_dst = np.empty(num_copy_ops, dtype=np.int64)
         all_sizes = np.empty(num_copy_ops, dtype=np.int64)
+        host_copies = np.zeros(num_copy_ops, dtype=bool)
 
         src_offset = 0
         dst_offset = 0
@@ -299,6 +311,9 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
                 )
 
                 all_sizes[op_idx:end_idx] = data_ref.page_size_bytes
+                host_copies[op_idx:end_idx] = t_idx in getattr(
+                    self, "_host_tensor_indices", ()
+                )
                 num_transfer_bytes += group_size * data_ref.page_size_bytes
                 op_idx = end_idx
 
@@ -309,9 +324,9 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         assert dst_offset == num_dst_blocks
         assert op_idx == num_copy_ops
 
-        batch_src = torch.from_numpy(all_src)
-        batch_dst = torch.from_numpy(all_dst)
-        batch_sizes = torch.from_numpy(all_sizes)
+        batch_src = torch.from_numpy(all_src[~host_copies])
+        batch_dst = torch.from_numpy(all_dst[~host_copies])
+        batch_sizes = torch.from_numpy(all_sizes[~host_copies])
 
         stream = self._stream_pool.pop() if self._stream_pool else torch.cuda.Stream()
         start_event = (
@@ -329,12 +344,6 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         # must also wait: the compute stream may still be zeroing freshly
         # allocated destination blocks. Otherwise that zeroing can overwrite
         # restored cache data after the transfer completes.
-        stream.wait_stream(torch.cuda.current_stream())
-        if self._transfers:
-            last_transfer: Transfer = self._transfers[-1]
-            last_event = last_transfer.end_event
-            # assure job will start only after the previous one completes
-            stream.wait_event(last_event)
         # CPU->GPU reads from host pinned memory, which is never written
         # by a concurrent GPU stream, so CU_MEMCPY_SRC_ACCESS_ORDER_ANY is
         # safe and lets the driver pipeline source reads. GPU->CPU reads
@@ -342,16 +351,40 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         # writing; we must keep STREAM ordering so source reads are gated
         # by the transfer stream's wait_stream(compute) barrier.
         is_src_access_order_any = not self.gpu_to_cpu
-        with torch.cuda.stream(stream):
-            start_event.record(stream)
-            if num_copy_ops > 0:
-                ops.swap_blocks_batch(
-                    batch_src,
-                    batch_dst,
-                    batch_sizes,
-                    is_src_access_order_any=is_src_access_order_any,
-                )
-            end_event.record(stream)
+        try:
+            stream.wait_stream(torch.cuda.current_stream())
+            if self._transfers:
+                # Assure job will start only after the previous one completes.
+                stream.wait_event(self._transfers[-1].end_event)
+            with torch.cuda.stream(stream):
+                start_event.record(stream)
+                if host_copies.any():
+                    # UVA writes can still be running on the compute stream.
+                    # CPU copies must wait for those writes and ID retirement.
+                    stream.synchronize()
+                    for src, dst, size in zip(
+                        all_src[host_copies],
+                        all_dst[host_copies],
+                        all_sizes[host_copies],
+                    ):
+                        ctypes.memmove(int(dst), int(src), int(size))
+                if batch_src.numel() > 0:
+                    ops.swap_blocks_batch(
+                        batch_src,
+                        batch_dst,
+                        batch_sizes,
+                        is_src_access_order_any=is_src_access_order_any,
+                    )
+                end_event.record(stream)
+        except Exception:
+            # A batch may enqueue copies before raising, before an end event
+            # is registered for wait(job_id). Drain that stream before failure
+            # reporting permits either the host source or GPU destination reuse.
+            self._failed_transfers[job_id] = Transfer(
+                job_id, stream, start_event, end_event, num_transfer_bytes
+            )
+            self.wait({job_id})
+            raise
 
         self._transfer_events[job_id] = end_event
         self._transfers.append(
@@ -369,7 +402,9 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
 
     def get_finished(self) -> list[TransferResult]:
         results: list[TransferResult] = []
-        while self._transfers and self._transfers[0].end_event.query():
+        while self._transfers and (
+            self._transfers[0].retired or self._transfers[0].end_event.query()
+        ):
             transfer = self._transfers.popleft()
             transfer_time = (
                 transfer.start_event.elapsed_time(transfer.end_event) * 1e-3
@@ -391,14 +426,30 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
 
     def wait(self, job_ids: set[int]):
         for job_id in job_ids:
+            transfer = self._failed_transfers.get(job_id)
+            if transfer is not None:
+                # On failure keep the fence for a later retry. An absent end
+                # event alone must never imply completion of a partial copy.
+                transfer.stream.synchronize()
+                del self._failed_transfers[job_id]
+                self._stream_pool.append(transfer.stream)
+                self._event_pool.extend((transfer.end_event, transfer.start_event))
             event = self._transfer_events.get(job_id)
             if event is not None:
                 event.synchronize()
 
+    def drain(self) -> None:
+        self.wait(set(self._failed_transfers))
+        # Retirement is separate from delivery. get_finished() still owns
+        # each success receipt, even if another direction fails this drain.
+        for transfer in self._transfers:
+            if not transfer.retired:
+                transfer.end_event.synchronize()
+                transfer.retired = True
+
     def shutdown(self) -> None:
-        while self._transfers:
-            transfer = self._transfers.popleft()
-            transfer.end_event.synchronize()
+        self.drain()
+        self._transfers.clear()
         self._transfer_events.clear()
         self._stream_pool.clear()
         self._event_pool.clear()
@@ -461,6 +512,7 @@ class CpuGpuOffloadingHandlers:
         group_page_sizes: dict[int, int] | None = None,
         group_mmap_regions: dict[int, SharedOffloadRegion] | None = None,
         group_num_blocks: dict[int, int] | None = None,
+        unified_region: SharedOffloadRegion | None = None,
     ):
         gpu_tensors: list[torch.Tensor] = []
         cpu_tensors: list[torch.Tensor] = []
@@ -507,6 +559,14 @@ class CpuGpuOffloadingHandlers:
                 for region in group_mmap_regions.values():
                     pin_mmap_region(region)
 
+            if unified_region is not None:
+                from vllm.v1.kv_offload.unified.layout import transfer_layout
+
+                worker_bytes = unified_region.worker_bytes
+                self.transfer_layout = transfer_layout(
+                    kv_caches, unified_region._row_stride, worker_bytes
+                )
+            kind_offset = 0
             for tensor_idx, kv_cache_tensor in enumerate(kv_caches.tensors):
                 gpu_page_size_bytes = kv_cache_tensor.page_size_bytes
                 gpu_tensor = kv_cache_tensor.tensor.view(torch.int8).view(
@@ -515,7 +575,16 @@ class CpuGpuOffloadingHandlers:
                 cpu_page_size_bytes = gpu_page_size_bytes * block_size_factor
 
                 tensor_region = tensor_regions.get(tensor_idx, mmap_region)
-                if tensor_region is not None:
+                if unified_region is not None:
+                    if not unified_region.is_pinned and pin_memory:
+                        raise ValueError(
+                            "Unified region must be registered by its owner"
+                        )
+                    cpu_tensor = unified_region.create_view_at(
+                        kind_offset, cpu_page_size_bytes
+                    )
+                    kind_offset += cpu_page_size_bytes
+                elif tensor_region is not None:
                     cpu_tensor = tensor_region.create_next_view(cpu_page_size_bytes)
                 else:
                     t0 = time.monotonic()

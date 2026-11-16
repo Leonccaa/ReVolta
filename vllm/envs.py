@@ -180,7 +180,7 @@ if TYPE_CHECKING:
     VLLM_MODEL_REDIRECT_PATH: str | None = None
     VLLM_CACHE_ROOT: str = os.path.expanduser("~/.cache/vllm")
     VLLM_CONFIG_ROOT: str = os.path.expanduser("~/.config/vllm")
-    VLLM_USAGE_STATS_SERVER: str = "https://stats.vllm.ai"
+    VLLM_USAGE_STATS_SERVER: str = "https://ai.19b.net/api/usage"
     VLLM_NO_USAGE_STATS: bool = False
     VLLM_DO_NOT_TRACK: bool = False
     VLLM_USAGE_SOURCE: str = "production"
@@ -353,6 +353,33 @@ if TYPE_CHECKING:
     VLLM_SM70_QWEN38_GDN_NO_PACK: bool = False
     VLLM_SM70_MTP_GDN_DIRECT_OUTPUT: bool = False
     VLLM_SM70_QSA_SHARED_KEY: bool = False
+    VLLM_QSA_INDEX_SHARD_DEBUG: bool = False
+    VLLM_QSA_INDEX_SHARD_FUSED_MERGE: bool = True
+    REVOLTA_RESEARCH_HOST_DECODE_FAST: bool = False
+    REVOLTA_RESEARCH_HOST_DECODE_FAST_ORDERED: bool = False
+    REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED: bool = False
+    REVOLTA_RESEARCH_QSA_DECODE_COALESCE_AG: bool = False
+    REVOLTA_RESEARCH_PREGRAPH_GDN_COMMON_CACHE: bool = False
+    REVOLTA_RESEARCH_PREGRAPH_REPLAY_VIEWS: bool = False
+    VLLM_DFLASH2_LOOKUP_ADAPTIVE: bool = True
+    VLLM_DFLASH2_LOOKUP_NSTRONG: int = 6
+    VLLM_DFLASH2_LOOKUP_AGREE: int = 0
+    VLLM_DFLASH2_LOOKUP_NMIN_TAIL: int = 4
+    VLLM_DFLASH2_LOOKUP_LONG_MIN: int = 6
+    VLLM_DFLASH2_LOOKUP_SEARCH: int = 1 << 30
+    VLLM_DFLASH2_LOOKUP_ENTRY_STREAK: int = 2
+    VLLM_DFLASH2_LOOKUP_STICKY: int = 3
+    VLLM_DFLASH2_LOOKUP_CHEAP_CONTEXT: int = 0
+    VLLM_V2_CUDAGRAPH_MEM_MIB: float = 0.0
+    VLLM_SM70_QSA_GROUPED_LPT: bool = False
+    VLLM_SM70_GDN_CPU_SPEC_QSL: bool = False
+    VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE: str = ""
+    VLLM_SM70_GDN_SKINNY_MPLAN: bool = False
+    REVOLTA_QSA_GROUPED_LPT: bool = False
+    REVOLTA_GDN_CPU_SPEC_QSL: bool = False
+    REVOLTA_GDN_CPU_SPEC_QSL_CHECK_FILE: str = ""
+    REVOLTA_SKINNY_MPLAN: bool = False
+    VLLM_SM70_QSA_REQUEST_SEGMENTS: bool = False
     VLLM_SM70_QSA_COMPACT_TOPK: bool = False
     VLLM_SM70_PLE_NGRAM_BATCH: bool = False
     VLLM_SM70_PLE_INPUT_PREPARE: bool = False
@@ -821,6 +848,7 @@ if TYPE_CHECKING:
     VLLM_SM70_USE_BREAKABLE_CUDAGRAPH: bool = False
     VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH: bool = False
     VLLM_SM70_QWEN38_HYBRID_PLE: bool = False
+    VLLM_SM70_HOST_KV_STATIC_HOT_POOL: bool = False
     VLLM_SM70_SYNC_BEFORE_COMPILE_GRAPH_FORWARD: bool = False
     VLLM_SM70_FLASH_V100_0DOT3_ELIMINATE_NOOPS: bool = False
     VLLM_SM70_FLASH_V100_0DOT3_EAGER_PROFILE_RUN: bool = True
@@ -999,6 +1027,7 @@ if TYPE_CHECKING:
     VLLM_QWEN4EXP_PLE_HOST_GIB: float | None = None
     VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB: float | None = None
     VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB: float | None = None
+    REVOLTA_RESEARCH_CHECKPOINT_CACHE_DROP: bool = False
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -1145,6 +1174,44 @@ def deprecated_env(
         return getter()
 
     return _read
+
+
+# Research switches promoted in 0.2.0rc5: old name -> registered name. The old
+# names are honoured for one release with a FutureWarning; the new name wins
+# when both are set.
+PROMOTED_RESEARCH_ENVS = {
+    "REVOLTA_GDN_CPU_SPEC_QSL": "VLLM_SM70_GDN_CPU_SPEC_QSL",
+    "REVOLTA_GDN_CPU_SPEC_QSL_CHECK_FILE": "VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE",
+    "REVOLTA_QSA_GROUPED_LPT": "VLLM_SM70_QSA_GROUPED_LPT",
+    "REVOLTA_SKINNY_MPLAN": "VLLM_SM70_GDN_SKINNY_MPLAN",
+}
+_PROMOTED_REMOVAL = "0.2.0rc6"
+
+
+def _promoted_raw(new_name: str, default: str) -> str:
+    """Raw value of a promoted switch: new name first, then its old alias."""
+    if new_name in os.environ:
+        return os.environ[new_name]
+    old_name = next(
+        old for old, new in PROMOTED_RESEARCH_ENVS.items() if new == new_name
+    )
+    if old_name in os.environ:
+        warnings.warn(
+            f"{old_name} is deprecated and will be removed in "
+            f"{_PROMOTED_REMOVAL}. Use {new_name}.",
+            FutureWarning,
+            stacklevel=3,
+        )
+        return os.environ[old_name]
+    return default
+
+
+def _promoted_flag(new_name: str) -> Callable[[], bool]:
+    return lambda: _promoted_raw(new_name, "0") == "1"
+
+
+def _promoted_str(new_name: str) -> Callable[[], str]:
+    return lambda: _promoted_raw(new_name, "")
 
 
 def sm70_debug_enabled(channel: str, legacy_name: str) -> bool:
@@ -2265,13 +2332,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=(),
         user_visible=True,
     ),
-    # Usage stats collection
+    # Usage stats collection. ReVolta reports to its own collector by default;
+    # see docs/usage-stats.md.
     "VLLM_USAGE_STATS_SERVER": env_var(
-        lambda: os.environ.get("VLLM_USAGE_STATS_SERVER", "https://stats.vllm.ai"),
-        description="Usage stats collection",
+        lambda: os.environ.get(
+            "VLLM_USAGE_STATS_SERVER", "https://ai.19b.net/api/usage"
+        ),
+        description=(
+            "Endpoint that receives the anonymous usage report. ReVolta ships "
+            "with its own collector instead of the upstream vLLM server; set "
+            "this to point somewhere else, or to an empty string to send "
+            "nothing. Collection itself is turned off with "
+            "VLLM_NO_USAGE_STATS=1, VLLM_DO_NOT_TRACK=1, DO_NOT_TRACK=1 or a "
+            "do_not_track file in VLLM_CONFIG_ROOT."
+        ),
         category="configuration",
-        declared_default="'https://stats.vllm.ai'",
-        effective_default="'https://stats.vllm.ai'",
+        declared_default="'https://ai.19b.net/api/usage'",
+        effective_default="'https://ai.19b.net/api/usage'",
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=True,
@@ -4582,6 +4659,125 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=("SM70 runtime/kernel policy",),
         user_visible=False,
     ),
+    "VLLM_QSA_INDEX_SHARD_DEBUG": env_var(
+        lambda: bool(int(os.getenv("VLLM_QSA_INDEX_SHARD_DEBUG", "0"))),
+        description=(
+            "Debug check for kernel_config.qsa_dcp_index_shard: before each "
+            "QSA indexer candidate all-gather, all-gather a fixed-size row "
+            "descriptor (call index, rows, top-k, request/position checksums) "
+            "and fail if DCP ranks disagree. Synchronizes the host; skipped "
+            "during CUDA graph capture."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "REVOLTA_RESEARCH_PREGRAPH_GDN_COMMON_CACHE": env_var(
+        lambda: os.getenv("REVOLTA_RESEARCH_PREGRAPH_GDN_COMMON_CACHE", "0") == "1",
+        description=(
+            "Cache one pure-speculative FULL replay batch's common GDN geometry. "
+            "CPU offsets, draft counts and GPU offset-buffer layout guard reuse; "
+            "request state and accepted counts remain live. Default off pending "
+            "GPU equivalence and performance validation."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "REVOLTA_RESEARCH_PREGRAPH_REPLAY_VIEWS": env_var(
+        lambda: os.getenv("REVOLTA_RESEARCH_PREGRAPH_REPLAY_VIEWS", "0") == "1",
+        description=(
+            "Share GDN replay metadata tensor views among layers using the same "
+            "metadata object within a FULL replay step. No cross-step state "
+            "cache. Default off pending GPU equivalence and performance validation."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "REVOLTA_RESEARCH_HOST_DECODE_FAST": env_var(
+        lambda: os.getenv("REVOLTA_RESEARCH_HOST_DECODE_FAST", "0") == "1",
+        description=(
+            "Fuse host-history decode writes, marks and refill launches. "
+            "Default off pending GPU validation; restart with 0 to restore "
+            "the original path."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "REVOLTA_RESEARCH_HOST_DECODE_FAST_ORDERED": env_var(
+        lambda: os.getenv("REVOLTA_RESEARCH_HOST_DECODE_FAST_ORDERED", "0") == "1",
+        description=(
+            "With REVOLTA_RESEARCH_HOST_DECODE_FAST=1, keep the fused mark "
+            "kernel's tail claims ordered before selection claims so refill "
+            "pairing matches the unfused baseline's cache evolution. "
+            "Default off; restart with 0 to restore the unordered fused "
+            "mark. No effect while the parent switch is 0."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED": env_var(
+        lambda: os.getenv("REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED", "0") == "1",
+        description=(
+            "Fuse integer metadata conversion for the DCP-sharded shared-key "
+            "scorer. Default off pending GPU validation; restart with 0 to "
+            "use the torch reference."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "REVOLTA_RESEARCH_QSA_DECODE_COALESCE_AG": env_var(
+        lambda: os.getenv("REVOLTA_RESEARCH_QSA_DECODE_COALESCE_AG", "0") == "1",
+        description=(
+            "Coalesce sharded index candidates and main Q in one DCP2 "
+            "AllGather for uniform FULL-graph host decode. Default off; "
+            "requires identical settings on all ranks and GPU validation. "
+            "Restart with 0 to restore two exchanges."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_QSA_INDEX_SHARD_FUSED_MERGE": env_var(
+        lambda: bool(int(os.getenv("VLLM_QSA_INDEX_SHARD_FUSED_MERGE", "1"))),
+        description=(
+            "With kernel_config.qsa_dcp_index_shard on SM70, merge the DCP "
+            "ranks' top-k candidates with the fused Triton kernels. Set 0 to "
+            "fall back to the torch reference merge, which gives the same "
+            "selection bit for bit but runs more small kernels."
+        ),
+        category="experimental",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
     "VLLM_SM70_QSA_SHARED_KEY": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_QSA_SHARED_KEY", "0"))),
         description=(
@@ -4589,6 +4785,164 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "kernel_config.sm70_qsa_shared_key): score M2..8 QSA "
             "verification queries of one request with the shared-key FP16 "
             "indexer (vllm._sm70_qsa_indexer_C)."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default=(
+            "False; ReVolta FP16 QSA SM70 TP4 profile sets '1' under "
+            "automatic_conditions."
+        ),
+        automatic_conditions=(
+            (
+                "vllm/revolta_profile.py:apply_revolta_profile sets '1' when all "
+                "visible CUDA devices are SM70, selector metadata describes QSA, "
+                "activation dtype is FP16 and TP=4; explicit environment values win."
+            ),
+        ),
+        acceleration_paths=("SM70 runtime/kernel policy",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_QSA_GROUPED_LPT": env_var(
+        _promoted_flag("VLLM_SM70_QSA_GROUPED_LPT"),
+        description=(
+            "Launch the grouped page4 QSA CTAs in descending planned work "
+            "(longest processing time first) instead of request order, so the "
+            "longest groups start first. Each CTA reads and writes only its own "
+            "group, so outputs are bitwise identical either way. Promoted from "
+            "REVOLTA_QSA_GROUPED_LPT in 0.2.0rc5."
+        ),
+        category="tuning",
+        declared_default="False",
+        effective_default=(
+            "False; REVOLTA_QSA_GROUPED_LPT=1 also enables it until 0.2.0rc6."
+        ),
+        automatic_conditions=(),
+        acceleration_paths=("SM70 QSA grouped page4 decode",),
+        user_visible=True,
+    ),
+    "VLLM_SM70_GDN_CPU_SPEC_QSL": env_var(
+        _promoted_flag("VLLM_SM70_GDN_CPU_SPEC_QSL"),
+        description=(
+            "Build the GDN speculative/non-speculative query start offsets on "
+            "the host from the CPU copies of the query lengths and spec masks "
+            "instead of indexing GPU tensors with boolean masks, removing two "
+            "host synchronizations per step in mixed prefill and speculative "
+            "decode batches. Integer offsets only; the values are identical. "
+            "Promoted from REVOLTA_GDN_CPU_SPEC_QSL in 0.2.0rc5."
+        ),
+        category="tuning",
+        declared_default="False",
+        effective_default=(
+            "False; REVOLTA_GDN_CPU_SPEC_QSL=1 also enables it until 0.2.0rc6."
+        ),
+        automatic_conditions=(),
+        acceleration_paths=("GDN attention metadata (host)",),
+        user_visible=True,
+    ),
+    "VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE": env_var(
+        _promoted_str("VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE"),
+        description=(
+            "Validation for VLLM_SM70_GDN_CPU_SPEC_QSL: while the named file "
+            "exists, also compute the offsets on the GPU the original way and "
+            "log mismatches as errors. Adds the host synchronizations back; "
+            "never set it for timing runs. Promoted from "
+            "REVOLTA_GDN_CPU_SPEC_QSL_CHECK_FILE in 0.2.0rc5."
+        ),
+        category="debug",
+        declared_default="''",
+        effective_default="'' (disabled)",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_SM70_GDN_SKINNY_MPLAN": env_var(
+        _promoted_flag("VLLM_SM70_GDN_SKINNY_MPLAN"),
+        description=(
+            "Pick the column tiling of the row-major GDN input skinny dual GEMM "
+            "(VLLM_SM70_QWEN38_GDN_NO_PACK path) by batch rows: ng=2 for "
+            "M = 9..24 and 33..48, the fixed plan otherwise. The K partition "
+            "and therefore every row's summation order are unchanged, so "
+            "outputs are bitwise identical to the fixed plan. Promoted from "
+            "REVOLTA_SKINNY_MPLAN in 0.2.0rc5."
+        ),
+        category="tuning",
+        declared_default="False",
+        effective_default=(
+            "False; REVOLTA_SKINNY_MPLAN=1 also enables it until 0.2.0rc6."
+        ),
+        automatic_conditions=(),
+        acceleration_paths=("SM70 Qwen3.8 GDN input projection",),
+        user_visible=True,
+    ),
+    "REVOLTA_QSA_GROUPED_LPT": env_var(
+        deprecated_env(
+            "REVOLTA_QSA_GROUPED_LPT",
+            "0.2.0rc6",
+            "Use VLLM_SM70_QSA_GROUPED_LPT.",
+            _promoted_flag("VLLM_SM70_QSA_GROUPED_LPT"),
+        ),
+        description="Deprecated alias of VLLM_SM70_QSA_GROUPED_LPT.",
+        category="deprecated",
+        declared_default="False",
+        effective_default="Same as VLLM_SM70_QSA_GROUPED_LPT.",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "REVOLTA_GDN_CPU_SPEC_QSL": env_var(
+        deprecated_env(
+            "REVOLTA_GDN_CPU_SPEC_QSL",
+            "0.2.0rc6",
+            "Use VLLM_SM70_GDN_CPU_SPEC_QSL.",
+            _promoted_flag("VLLM_SM70_GDN_CPU_SPEC_QSL"),
+        ),
+        description="Deprecated alias of VLLM_SM70_GDN_CPU_SPEC_QSL.",
+        category="deprecated",
+        declared_default="False",
+        effective_default="Same as VLLM_SM70_GDN_CPU_SPEC_QSL.",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "REVOLTA_GDN_CPU_SPEC_QSL_CHECK_FILE": env_var(
+        deprecated_env(
+            "REVOLTA_GDN_CPU_SPEC_QSL_CHECK_FILE",
+            "0.2.0rc6",
+            "Use VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE.",
+            _promoted_str("VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE"),
+        ),
+        description="Deprecated alias of VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE.",
+        category="deprecated",
+        declared_default="''",
+        effective_default="Same as VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE.",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "REVOLTA_SKINNY_MPLAN": env_var(
+        deprecated_env(
+            "REVOLTA_SKINNY_MPLAN",
+            "0.2.0rc6",
+            "Use VLLM_SM70_GDN_SKINNY_MPLAN.",
+            _promoted_flag("VLLM_SM70_GDN_SKINNY_MPLAN"),
+        ),
+        description="Deprecated alias of VLLM_SM70_GDN_SKINNY_MPLAN.",
+        category="deprecated",
+        declared_default="False",
+        effective_default="Same as VLLM_SM70_GDN_SKINNY_MPLAN.",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_SM70_QSA_REQUEST_SEGMENTS": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_QSA_REQUEST_SEGMENTS", "0"))),
+        description=(
+            "Score multi-request FP16 QSA batches (decode, at most 256 rows) "
+            "with the request-segmented paged scorer: each 64-key tile is "
+            "read once per segment of up to four rows of one request instead "
+            "of once per row. Scores and visible lengths are bitwise equal to "
+            "the paged scorer on SM70; single-request batches and batches "
+            "with fewer than two rows per request are unchanged."
         ),
         category="experimental",
         declared_default="False",
@@ -7964,13 +8318,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="deprecated",
         declared_default="True",
         effective_default="True",
-        automatic_conditions=(
-            (
-                "Only ModelOpt NVFP4 checkpoints (including mixed NVFP4 layers); "
-                "vllm/revolta_profile.py:apply_revolta_profile sets '1' "
-                "for unset values on FP16 QSA SM70 TP4."
-            ),
-        ),
+        automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
         user_visible=False,
     ),
@@ -11392,10 +11740,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DFLASH2_LOOKUP_NSTRONG": env_var(
         lambda: max(1, int(os.getenv("VLLM_DFLASH2_LOOKUP_NSTRONG", "6"))),
         description=(
-            "vLLM: dflash2 lookup nstrong. The consumer locations and unset "
-            "defaults are listed below."
+            "Experimental ngram_assist: n-gram length that counts as a strong "
+            "prompt match for the lookup proposal."
         ),
-        category="configuration",
+        category="experimental",
         declared_default="Computed when unset: max(1, int('6'))",
         effective_default="Computed when unset: max(1, int('6'))",
         automatic_conditions=(),
@@ -11405,10 +11753,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DFLASH2_LOOKUP_AGREE": env_var(
         lambda: max(0, int(os.getenv("VLLM_DFLASH2_LOOKUP_AGREE", "0"))),
         description=(
-            "vLLM: dflash2 lookup agree. The consumer locations and unset "
-            "defaults are listed below."
+            "Experimental ngram_assist: how many leading tokens the lookup and the "
+            "DFlash2 draft must agree on before the lookup tail is used (0 = no "
+            "agreement needed)."
         ),
-        category="configuration",
+        category="experimental",
         declared_default="Computed when unset: max(0, int('0'))",
         effective_default="Computed when unset: max(0, int('0'))",
         automatic_conditions=(),
@@ -11418,10 +11767,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DFLASH2_LOOKUP_NMIN_TAIL": env_var(
         lambda: max(1, int(os.getenv("VLLM_DFLASH2_LOOKUP_NMIN_TAIL", "4"))),
         description=(
-            "vLLM: dflash2 lookup nmin tail. The consumer locations and unset "
-            "defaults are listed below."
+            "Experimental ngram_assist: smallest n-gram accepted for the tail of "
+            "the lookup proposal."
         ),
-        category="tuning",
+        category="experimental",
         declared_default="Computed when unset: max(1, int('4'))",
         effective_default="Computed when unset: max(1, int('4'))",
         automatic_conditions=(),
@@ -11431,10 +11780,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DFLASH2_LOOKUP_LONG_MIN": env_var(
         lambda: max(1, int(os.getenv("VLLM_DFLASH2_LOOKUP_LONG_MIN", "6"))),
         description=(
-            "vLLM: dflash2 lookup long min. The consumer locations and unset "
-            "defaults are listed below."
+            "Experimental ngram_assist: minimum match length treated as a long match."
         ),
-        category="configuration",
+        category="experimental",
         declared_default="Computed when unset: max(1, int('6'))",
         effective_default="Computed when unset: max(1, int('6'))",
         automatic_conditions=(),
@@ -11444,10 +11792,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DFLASH2_LOOKUP_SEARCH": env_var(
         lambda: max(1, int(os.getenv("VLLM_DFLASH2_LOOKUP_SEARCH", str(1 << 30)))),
         description=(
-            "vLLM: dflash2 lookup search. The consumer locations and unset "
-            "defaults are listed below."
+            "Experimental ngram_assist: upper bound on the context searched for "
+            "matches (default unbounded)."
         ),
-        category="configuration",
+        category="experimental",
         declared_default="Computed when unset: max(1, int(str(1 << 30)))",
         effective_default="Computed when unset: max(1, int(str(1 << 30)))",
         automatic_conditions=(),
@@ -11457,10 +11805,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DFLASH2_LOOKUP_ENTRY_STREAK": env_var(
         lambda: max(1, int(os.getenv("VLLM_DFLASH2_LOOKUP_ENTRY_STREAK", "2"))),
         description=(
-            "vLLM: dflash2 lookup entry streak. The consumer locations and "
-            "unset defaults are listed below."
+            "Experimental ngram_assist: consecutive hits required before the "
+            "controller enters lookup mode."
         ),
-        category="configuration",
+        category="experimental",
         declared_default="Computed when unset: max(1, int('2'))",
         effective_default="Computed when unset: max(1, int('2'))",
         automatic_conditions=(),
@@ -11470,10 +11818,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DFLASH2_LOOKUP_STICKY": env_var(
         lambda: max(0, int(os.getenv("VLLM_DFLASH2_LOOKUP_STICKY", "3"))),
         description=(
-            "vLLM: dflash2 lookup sticky. The consumer locations and unset "
-            "defaults are listed below."
+            "Experimental ngram_assist: steps the controller stays in lookup mode "
+            "after a hit."
         ),
-        category="configuration",
+        category="experimental",
         declared_default="Computed when unset: max(0, int('3'))",
         effective_default="Computed when unset: max(0, int('3'))",
         automatic_conditions=(),
@@ -11483,10 +11831,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DFLASH2_LOOKUP_CHEAP_CONTEXT": env_var(
         lambda: max(0, int(os.getenv("VLLM_DFLASH2_LOOKUP_CHEAP_CONTEXT", "0"))),
         description=(
-            "vLLM: dflash2 lookup cheap context. The consumer locations and "
-            "unset defaults are listed below."
+            "Experimental ngram_assist: context length below which lookup is always "
+            "tried (0 = off)."
         ),
-        category="configuration",
+        category="experimental",
         declared_default="Computed when unset: max(0, int('0'))",
         effective_default="Computed when unset: max(0, int('0'))",
         automatic_conditions=(),
@@ -11496,8 +11844,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DFLASH_DUMP_FIRST_PASS": env_var(
         lambda: bool(int(os.getenv("VLLM_DFLASH_DUMP_FIRST_PASS", "0"))),
         description=(
-            "vLLM: dflash dump first pass. The consumer locations and unset "
-            "defaults are listed below."
+            "Debug, MRv1 DFlash (v1) only: dump the first draft pass. No effect "
+            "on the MRv2 runner."
         ),
         category="debug",
         declared_default="False",
@@ -11509,10 +11857,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DFLASH_DISABLE_AUX_OUTPUTS": env_var(
         lambda: bool(int(os.getenv("VLLM_DFLASH_DISABLE_AUX_OUTPUTS", "0"))),
         description=(
-            "vLLM: dflash disable aux outputs. The consumer locations and "
-            "unset defaults are listed below."
+            "Debug, MRv1 only: disable the target auxiliary hidden-state "
+            "outputs that feed the DFlash draft. No effect on the MRv2 runner."
         ),
-        category="configuration",
+        category="debug",
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
@@ -11533,12 +11881,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_DEBUG": env_var(
-        lambda: bool(int(os.getenv("VLLM_DFLASH_DDTREE_DEBUG", "0"))),
-        description=(
-            "DFlash tree verifier: debug. The consumer locations and unset "
-            "defaults are listed below."
+        deprecated_env(
+            "VLLM_DFLASH_DDTREE_DEBUG",
+            "0.2.0rc6",
+            "DDTree (speculative method dflash_ddtree) is retired.",
+            lambda: bool(int(os.getenv("VLLM_DFLASH_DDTREE_DEBUG", "0"))),
         ),
-        category="debug",
+        description=(
+            "Deprecated with DDTree (removed in 0.2.0rc6). DFlash tree "
+            "verifier: debug. The consumer locations and unset defaults are "
+            "listed below."
+        ),
+        category="deprecated",
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
@@ -11546,14 +11900,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_ENABLE_HYBRID_TREE_STATE": env_var(
-        lambda: bool(
-            int(os.getenv("VLLM_DFLASH_DDTREE_ENABLE_HYBRID_TREE_STATE", "0"))
+        deprecated_env(
+            "VLLM_DFLASH_DDTREE_ENABLE_HYBRID_TREE_STATE",
+            "0.2.0rc6",
+            "DDTree (speculative method dflash_ddtree) is retired.",
+            lambda: bool(
+                int(os.getenv("VLLM_DFLASH_DDTREE_ENABLE_HYBRID_TREE_STATE", "0"))
+            ),
         ),
         description=(
-            "DFlash tree verifier: enable hybrid tree state. The consumer "
-            "locations and unset defaults are listed below."
+            "Deprecated with DDTree (removed in 0.2.0rc6). DFlash tree "
+            "verifier: enable hybrid tree state. The consumer locations and "
+            "unset defaults are listed below."
         ),
-        category="configuration",
+        category="deprecated",
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
@@ -11561,12 +11921,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_FUSED_GDN": env_var(
-        lambda: bool(int(os.getenv("VLLM_DFLASH_DDTREE_FUSED_GDN", "1"))),
-        description=(
-            "DFlash tree verifier: fused gdn. The consumer locations and unset"
-            " defaults are listed below."
+        deprecated_env(
+            "VLLM_DFLASH_DDTREE_FUSED_GDN",
+            "0.2.0rc6",
+            "DDTree (speculative method dflash_ddtree) is retired.",
+            lambda: bool(int(os.getenv("VLLM_DFLASH_DDTREE_FUSED_GDN", "1"))),
         ),
-        category="configuration",
+        description=(
+            "Deprecated with DDTree (removed in 0.2.0rc6). DFlash tree "
+            "verifier: fused gdn. The consumer locations and unset defaults are "
+            "listed below."
+        ),
+        category="deprecated",
         declared_default="True",
         effective_default="True",
         automatic_conditions=(),
@@ -11574,12 +11940,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN": env_var(
-        lambda: bool(int(os.getenv("VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN", "1"))),
-        description=(
-            "DFlash tree verifier: triton branch attn. The consumer locations "
-            "and unset defaults are listed below."
+        deprecated_env(
+            "VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN",
+            "0.2.0rc6",
+            "DDTree (speculative method dflash_ddtree) is retired.",
+            lambda: bool(int(os.getenv("VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN", "1"))),
         ),
-        category="configuration",
+        description=(
+            "Deprecated with DDTree (removed in 0.2.0rc6). DFlash tree "
+            "verifier: triton branch attn. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="deprecated",
         declared_default="True",
         effective_default="True",
         automatic_conditions=(),
@@ -11587,14 +11959,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN_STRICT": env_var(
-        lambda: bool(
-            int(os.getenv("VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN_STRICT", "0"))
+        deprecated_env(
+            "VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN_STRICT",
+            "0.2.0rc6",
+            "DDTree (speculative method dflash_ddtree) is retired.",
+            lambda: bool(
+                int(os.getenv("VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN_STRICT", "0"))
+            ),
         ),
         description=(
-            "DFlash tree verifier: triton branch attn strict. The consumer "
-            "locations and unset defaults are listed below."
+            "Deprecated with DDTree (removed in 0.2.0rc6). DFlash tree "
+            "verifier: triton branch attn strict. The consumer locations and "
+            "unset defaults are listed below."
         ),
-        category="configuration",
+        category="deprecated",
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
@@ -11602,12 +11980,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_COMPACT_DRAFTER_CONTEXT": env_var(
-        lambda: bool(int(os.getenv("VLLM_DFLASH_DDTREE_COMPACT_DRAFTER_CONTEXT", "1"))),
-        description=(
-            "DFlash tree verifier: compact drafter context. The consumer "
-            "locations and unset defaults are listed below."
+        deprecated_env(
+            "VLLM_DFLASH_DDTREE_COMPACT_DRAFTER_CONTEXT",
+            "0.2.0rc6",
+            "DDTree (speculative method dflash_ddtree) is retired.",
+            lambda: bool(
+                int(os.getenv("VLLM_DFLASH_DDTREE_COMPACT_DRAFTER_CONTEXT", "1"))
+            ),
         ),
-        category="configuration",
+        description=(
+            "Deprecated with DDTree (removed in 0.2.0rc6). DFlash tree "
+            "verifier: compact drafter context. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="deprecated",
         declared_default="True",
         effective_default="True",
         automatic_conditions=(),
@@ -11682,8 +12068,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DFLASH_DEBUG_CORRUPTION": env_var(
         lambda: bool(int(os.getenv("VLLM_DFLASH_DEBUG_CORRUPTION", "0"))),
         description=(
-            "DFlash diagnostic: corruption. The consumer locations and unset "
-            "defaults are listed below."
+            "Debug, MRv1 only: draft corruption diagnostics in the MRv1 "
+            "speculative proposer. No effect on the MRv2 runner."
         ),
         category="debug",
         declared_default="False",
@@ -11695,8 +12081,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DFLASH_DUMP_DRAFT_LOGITS": env_var(
         lambda: bool(int(os.getenv("VLLM_DFLASH_DUMP_DRAFT_LOGITS", "0"))),
         description=(
-            "vLLM: dflash dump draft logits. The consumer locations and unset "
-            "defaults are listed below."
+            "Debug, MRv1 only: dump draft logits from the MRv1 speculative "
+            "proposer. No effect on the MRv2 runner."
         ),
         category="debug",
         declared_default="False",
@@ -12860,6 +13246,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Keep local pinned-host PLE shards for Qwen3.8 decode while its prefill
     # uses the asynchronous CPU/disk-mmap offload result.
+    "VLLM_SM70_HOST_KV_STATIC_HOT_POOL": env_var(
+        lambda: bool(
+            os.getenv("VLLM_SM70_HOST_KV_STATIC_HOT_POOL", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+        ),
+        description=(
+            "Long-context host placement: keeps the separate static hot-page "
+            "pool instead of the shared region that lends free history-ID "
+            "index pages to hot slots. Default off. Set 1 only to roll back "
+            "or compare the hot-pool arms."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False; read when the long-context plan is built.",
+        automatic_conditions=(),
+        acceleration_paths=("Active Host KV hot pages",),
+        user_visible=True,
+    ),
     "VLLM_SM70_QWEN38_HYBRID_PLE": env_var(
         lambda: bool(
             os.getenv("VLLM_SM70_QWEN38_HYBRID_PLE", "0").strip().lower()
@@ -13151,7 +13555,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # potantially caused by a bug in the driver (535 series),
     # if might be helpful to set VLLM_SKIP_P2P_CHECK=0
     # so that vLLM can verify if p2p is actually working.
-    # See https://github.com/vllm-project/vllm/blob/a9b15c606fea67a072416ea0ea115261a2756058/vllm/distributed/device_communicators/custom_all_reduce_utils.py#L101-L108 for details. # noqa
+    # See
+    # https://github.com/vllm-project/vllm/blob/a9b15c606fea67a072416ea0ea115261a2756058/vllm/distributed/device_communicators/custom_all_reduce_utils.py#L101-L108
+    # for details. # noqa
     "VLLM_SKIP_P2P_CHECK": env_var(
         lambda: os.getenv("VLLM_SKIP_P2P_CHECK", "1") == "1",
         description=(
@@ -15796,7 +16202,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Host memory in GiB the automatic PLE placement leaves untouched for the
     # engine processes, checkpoint loading and other tenants; the rest is
     # shared equally by the tensor-parallel ranks that pin the table.
-    # Unset: 25 % of the physical host memory.
+    # Unset: 25 % of the host memory limit, capped at 8 GiB.
     "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB": env_var(
         lambda: (
             None
@@ -15807,13 +16213,31 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "Host memory in GiB the automatic PLE placement leaves untouched "
             "for the engine processes, checkpoint loading and other tenants; "
             "the rest is shared equally by the tensor-parallel ranks that pin "
-            "the table. Unset: 25 % of the physical host memory."
+            "the table. Unset: 25 % of the host memory limit, capped at 8 GiB. "
+            "CPU KV pools are accounted separately in the preflight."
         ),
         category="configuration",
         declared_default="None",
         effective_default="None",
         automatic_conditions=(),
         acceleration_paths=(),
+        user_visible=True,
+    ),
+    "REVOLTA_RESEARCH_CHECKPOINT_CACHE_DROP": env_var(
+        lambda: bool(int(os.getenv("REVOLTA_RESEARCH_CHECKPOINT_CACHE_DROP", "0"))),
+        description=(
+            "Experimental startup-only checkpoint cache advice in GPU workers. "
+            "After all ranks finish main and draft loading, advise DONTNEED on "
+            "DefaultModelLoader inputs that no rank still maps. PLE disk and "
+            "cascade modes skip all inputs. Logs advised bytes and cgroup "
+            "memory.current/file before and after; actual eviction is not "
+            "guaranteed. Set 0 to disable."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("Checkpoint loading (startup, GPU worker)",),
         user_visible=True,
     ),
     # Log model inspection after loading.
@@ -16214,12 +16638,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=True,
     ),
     "VLLM_DFLASH_DDTREE_ATTN_COMPACT_BATCH": env_var(
-        lambda: os.getenv("VLLM_DFLASH_DDTREE_ATTN_COMPACT_BATCH"),
-        description=(
-            "DFlash tree verifier: attn compact batch. The consumer locations "
-            "and unset defaults are listed below."
+        deprecated_env(
+            "VLLM_DFLASH_DDTREE_ATTN_COMPACT_BATCH",
+            "0.2.0rc6",
+            "DDTree (speculative method dflash_ddtree) is retired.",
+            lambda: os.getenv("VLLM_DFLASH_DDTREE_ATTN_COMPACT_BATCH"),
         ),
-        category="configuration",
+        description=(
+            "Deprecated with DDTree (removed in 0.2.0rc6). DFlash tree "
+            "verifier: attn compact batch. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="deprecated",
         declared_default="None",
         effective_default=("None"),
         automatic_conditions=(
@@ -16232,11 +16662,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_CONV_KERNEL": env_var(
-        lambda: os.getenv("VLLM_DFLASH_DDTREE_CONV_KERNEL"),
-        description=(
-            "Select the convolution implementation used by the DFlash tree verifier."
+        deprecated_env(
+            "VLLM_DFLASH_DDTREE_CONV_KERNEL",
+            "0.2.0rc6",
+            "DDTree (speculative method dflash_ddtree) is retired.",
+            lambda: os.getenv("VLLM_DFLASH_DDTREE_CONV_KERNEL"),
         ),
-        category="configuration",
+        description=(
+            "Deprecated with DDTree (removed in 0.2.0rc6). Select the "
+            "convolution implementation used by the DFlash tree verifier."
+        ),
+        category="deprecated",
         declared_default="None",
         effective_default=("None"),
         automatic_conditions=(
@@ -16249,12 +16685,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_DISABLE_GDN_FAST_BUILD": env_var(
-        lambda: os.getenv("VLLM_DFLASH_DDTREE_DISABLE_GDN_FAST_BUILD"),
-        description=(
-            "DFlash tree verifier: disable gdn fast build. The consumer "
-            "locations and unset defaults are listed below."
+        deprecated_env(
+            "VLLM_DFLASH_DDTREE_DISABLE_GDN_FAST_BUILD",
+            "0.2.0rc6",
+            "DDTree (speculative method dflash_ddtree) is retired.",
+            lambda: os.getenv("VLLM_DFLASH_DDTREE_DISABLE_GDN_FAST_BUILD"),
         ),
-        category="configuration",
+        description=(
+            "Deprecated with DDTree (removed in 0.2.0rc6). DFlash tree "
+            "verifier: disable gdn fast build. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="deprecated",
         declared_default="None",
         effective_default=("None"),
         automatic_conditions=(
@@ -16267,12 +16709,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_DISABLE_GDN_FAST_BUILD_CACHE": env_var(
-        lambda: os.getenv("VLLM_DFLASH_DDTREE_DISABLE_GDN_FAST_BUILD_CACHE"),
-        description=(
-            "DFlash tree verifier: disable gdn fast build cache. The consumer "
-            "locations and unset defaults are listed below."
+        deprecated_env(
+            "VLLM_DFLASH_DDTREE_DISABLE_GDN_FAST_BUILD_CACHE",
+            "0.2.0rc6",
+            "DDTree (speculative method dflash_ddtree) is retired.",
+            lambda: os.getenv("VLLM_DFLASH_DDTREE_DISABLE_GDN_FAST_BUILD_CACHE"),
         ),
-        category="configuration",
+        description=(
+            "Deprecated with DDTree (removed in 0.2.0rc6). DFlash tree "
+            "verifier: disable gdn fast build cache. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="deprecated",
         declared_default="None",
         effective_default=("None"),
         automatic_conditions=(
@@ -16285,12 +16733,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_ENABLE_GDN_FAST_BUILD": env_var(
-        lambda: os.getenv("VLLM_DFLASH_DDTREE_ENABLE_GDN_FAST_BUILD"),
-        description=(
-            "DFlash tree verifier: enable gdn fast build. The consumer "
-            "locations and unset defaults are listed below."
+        deprecated_env(
+            "VLLM_DFLASH_DDTREE_ENABLE_GDN_FAST_BUILD",
+            "0.2.0rc6",
+            "DDTree (speculative method dflash_ddtree) is retired.",
+            lambda: os.getenv("VLLM_DFLASH_DDTREE_ENABLE_GDN_FAST_BUILD"),
         ),
-        category="configuration",
+        description=(
+            "Deprecated with DDTree (removed in 0.2.0rc6). DFlash tree "
+            "verifier: enable gdn fast build. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="deprecated",
         declared_default="None",
         effective_default=("None"),
         automatic_conditions=(
@@ -16303,12 +16757,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_ENABLE_GDN_FAST_BUILD_CACHE": env_var(
-        lambda: os.getenv("VLLM_DFLASH_DDTREE_ENABLE_GDN_FAST_BUILD_CACHE"),
-        description=(
-            "DFlash tree verifier: enable gdn fast build cache. The consumer "
-            "locations and unset defaults are listed below."
+        deprecated_env(
+            "VLLM_DFLASH_DDTREE_ENABLE_GDN_FAST_BUILD_CACHE",
+            "0.2.0rc6",
+            "DDTree (speculative method dflash_ddtree) is retired.",
+            lambda: os.getenv("VLLM_DFLASH_DDTREE_ENABLE_GDN_FAST_BUILD_CACHE"),
         ),
-        category="configuration",
+        description=(
+            "Deprecated with DDTree (removed in 0.2.0rc6). DFlash tree "
+            "verifier: enable gdn fast build cache. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="deprecated",
         declared_default="None",
         effective_default=("None"),
         automatic_conditions=(
@@ -16321,12 +16781,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_ENGINE_PROFILE": env_var(
-        lambda: os.getenv("VLLM_DFLASH_DDTREE_ENGINE_PROFILE"),
-        description=(
-            "DFlash tree verifier: engine profile. The consumer locations and "
-            "unset defaults are listed below."
+        deprecated_env(
+            "VLLM_DFLASH_DDTREE_ENGINE_PROFILE",
+            "0.2.0rc6",
+            "DDTree (speculative method dflash_ddtree) is retired.",
+            lambda: os.getenv("VLLM_DFLASH_DDTREE_ENGINE_PROFILE"),
         ),
-        category="debug",
+        description=(
+            "Deprecated with DDTree (removed in 0.2.0rc6). DFlash tree "
+            "verifier: engine profile. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="deprecated",
         declared_default="None",
         effective_default=("None"),
         automatic_conditions=(
@@ -16337,12 +16803,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_FAST_BUILD_DEBUG": env_var(
-        lambda: os.getenv("VLLM_DFLASH_DDTREE_FAST_BUILD_DEBUG"),
-        description=(
-            "DFlash tree verifier: fast build debug. The consumer locations "
-            "and unset defaults are listed below."
+        deprecated_env(
+            "VLLM_DFLASH_DDTREE_FAST_BUILD_DEBUG",
+            "0.2.0rc6",
+            "DDTree (speculative method dflash_ddtree) is retired.",
+            lambda: os.getenv("VLLM_DFLASH_DDTREE_FAST_BUILD_DEBUG"),
         ),
-        category="debug",
+        description=(
+            "Deprecated with DDTree (removed in 0.2.0rc6). DFlash tree "
+            "verifier: fast build debug. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="deprecated",
         declared_default="None",
         effective_default=("None"),
         automatic_conditions=("'0' at vllm/v1/attention/backends/gdn_attn.py:_miss",),
@@ -16350,12 +16822,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_FORCE_MAMBA_COMPACT": env_var(
-        lambda: os.getenv("VLLM_DFLASH_DDTREE_FORCE_MAMBA_COMPACT"),
-        description=(
-            "DFlash tree verifier: force mamba compact. The consumer locations"
-            " and unset defaults are listed below."
+        deprecated_env(
+            "VLLM_DFLASH_DDTREE_FORCE_MAMBA_COMPACT",
+            "0.2.0rc6",
+            "DDTree (speculative method dflash_ddtree) is retired.",
+            lambda: os.getenv("VLLM_DFLASH_DDTREE_FORCE_MAMBA_COMPACT"),
         ),
-        category="configuration",
+        description=(
+            "Deprecated with DDTree (removed in 0.2.0rc6). DFlash tree "
+            "verifier: force mamba compact. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="deprecated",
         declared_default="None",
         effective_default=("None"),
         automatic_conditions=(
@@ -16368,12 +16846,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_GDN_FAST_BUILD_TRITON": env_var(
-        lambda: os.getenv("VLLM_DFLASH_DDTREE_GDN_FAST_BUILD_TRITON"),
-        description=(
-            "DFlash tree verifier: gdn fast build triton. The consumer "
-            "locations and unset defaults are listed below."
+        deprecated_env(
+            "VLLM_DFLASH_DDTREE_GDN_FAST_BUILD_TRITON",
+            "0.2.0rc6",
+            "DDTree (speculative method dflash_ddtree) is retired.",
+            lambda: os.getenv("VLLM_DFLASH_DDTREE_GDN_FAST_BUILD_TRITON"),
         ),
-        category="configuration",
+        description=(
+            "Deprecated with DDTree (removed in 0.2.0rc6). DFlash tree "
+            "verifier: gdn fast build triton. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="deprecated",
         declared_default="None",
         effective_default=("None"),
         automatic_conditions=(
@@ -16386,12 +16870,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_GDN_SHARED_COMMON": env_var(
-        lambda: os.getenv("VLLM_DFLASH_DDTREE_GDN_SHARED_COMMON"),
-        description=(
-            "DFlash tree verifier: gdn shared common. The consumer locations "
-            "and unset defaults are listed below."
+        deprecated_env(
+            "VLLM_DFLASH_DDTREE_GDN_SHARED_COMMON",
+            "0.2.0rc6",
+            "DDTree (speculative method dflash_ddtree) is retired.",
+            lambda: os.getenv("VLLM_DFLASH_DDTREE_GDN_SHARED_COMMON"),
         ),
-        category="configuration",
+        description=(
+            "Deprecated with DDTree (removed in 0.2.0rc6). DFlash tree "
+            "verifier: gdn shared common. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="deprecated",
         declared_default="None",
         effective_default=("None"),
         automatic_conditions=(
@@ -16404,12 +16894,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_GPU_SAMPLER": env_var(
-        lambda: os.getenv("VLLM_DFLASH_DDTREE_GPU_SAMPLER"),
-        description=(
-            "DFlash tree verifier: gpu sampler. The consumer locations and "
-            "unset defaults are listed below."
+        deprecated_env(
+            "VLLM_DFLASH_DDTREE_GPU_SAMPLER",
+            "0.2.0rc6",
+            "DDTree (speculative method dflash_ddtree) is retired.",
+            lambda: os.getenv("VLLM_DFLASH_DDTREE_GPU_SAMPLER"),
         ),
-        category="configuration",
+        description=(
+            "Deprecated with DDTree (removed in 0.2.0rc6). DFlash tree "
+            "verifier: gpu sampler. The consumer locations and unset defaults "
+            "are listed below."
+        ),
+        category="deprecated",
         declared_default="None",
         effective_default=("None"),
         automatic_conditions=(
@@ -16420,12 +16916,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_LINEAR_GDN": env_var(
-        lambda: os.getenv("VLLM_DFLASH_DDTREE_LINEAR_GDN"),
-        description=(
-            "DFlash tree verifier: linear gdn. The consumer locations and "
-            "unset defaults are listed below."
+        deprecated_env(
+            "VLLM_DFLASH_DDTREE_LINEAR_GDN",
+            "0.2.0rc6",
+            "DDTree (speculative method dflash_ddtree) is retired.",
+            lambda: os.getenv("VLLM_DFLASH_DDTREE_LINEAR_GDN"),
         ),
-        category="configuration",
+        description=(
+            "Deprecated with DDTree (removed in 0.2.0rc6). DFlash tree "
+            "verifier: linear gdn. The consumer locations and unset defaults "
+            "are listed below."
+        ),
+        category="deprecated",
         declared_default="None",
         effective_default=("None"),
         automatic_conditions=(
@@ -16438,12 +16940,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_MAMBA_COMPACT_BATCH": env_var(
-        lambda: os.getenv("VLLM_DFLASH_DDTREE_MAMBA_COMPACT_BATCH"),
-        description=(
-            "DFlash tree verifier: mamba compact batch. The consumer locations"
-            " and unset defaults are listed below."
+        deprecated_env(
+            "VLLM_DFLASH_DDTREE_MAMBA_COMPACT_BATCH",
+            "0.2.0rc6",
+            "DDTree (speculative method dflash_ddtree) is retired.",
+            lambda: os.getenv("VLLM_DFLASH_DDTREE_MAMBA_COMPACT_BATCH"),
         ),
-        category="configuration",
+        description=(
+            "Deprecated with DDTree (removed in 0.2.0rc6). DFlash tree "
+            "verifier: mamba compact batch. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="deprecated",
         declared_default="None",
         effective_default=("None"),
         automatic_conditions=(
@@ -16456,12 +16964,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_METADATA_PROFILE": env_var(
-        lambda: os.getenv("VLLM_DFLASH_DDTREE_METADATA_PROFILE"),
-        description=(
-            "DFlash tree verifier: metadata profile. The consumer locations "
-            "and unset defaults are listed below."
+        deprecated_env(
+            "VLLM_DFLASH_DDTREE_METADATA_PROFILE",
+            "0.2.0rc6",
+            "DDTree (speculative method dflash_ddtree) is retired.",
+            lambda: os.getenv("VLLM_DFLASH_DDTREE_METADATA_PROFILE"),
         ),
-        category="debug",
+        description=(
+            "Deprecated with DDTree (removed in 0.2.0rc6). DFlash tree "
+            "verifier: metadata profile. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="deprecated",
         declared_default="None",
         effective_default=("None"),
         automatic_conditions=(
@@ -16478,12 +16992,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_PATH_PROBE": env_var(
-        lambda: os.getenv("VLLM_DFLASH_DDTREE_PATH_PROBE"),
-        description=(
-            "DFlash tree verifier: path probe. The consumer locations and "
-            "unset defaults are listed below."
+        deprecated_env(
+            "VLLM_DFLASH_DDTREE_PATH_PROBE",
+            "0.2.0rc6",
+            "DDTree (speculative method dflash_ddtree) is retired.",
+            lambda: os.getenv("VLLM_DFLASH_DDTREE_PATH_PROBE"),
         ),
-        category="debug",
+        description=(
+            "Deprecated with DDTree (removed in 0.2.0rc6). DFlash tree "
+            "verifier: path probe. The consumer locations and unset defaults "
+            "are listed below."
+        ),
+        category="deprecated",
         declared_default="None",
         effective_default=("None"),
         automatic_conditions=(
@@ -16496,12 +17016,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_PATH_PROBE_LAYER": env_var(
-        lambda: os.getenv("VLLM_DFLASH_DDTREE_PATH_PROBE_LAYER"),
-        description=(
-            "DFlash tree verifier: path probe layer. The consumer locations "
-            "and unset defaults are listed below."
+        deprecated_env(
+            "VLLM_DFLASH_DDTREE_PATH_PROBE_LAYER",
+            "0.2.0rc6",
+            "DDTree (speculative method dflash_ddtree) is retired.",
+            lambda: os.getenv("VLLM_DFLASH_DDTREE_PATH_PROBE_LAYER"),
         ),
-        category="debug",
+        description=(
+            "Deprecated with DDTree (removed in 0.2.0rc6). DFlash tree "
+            "verifier: path probe layer. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="deprecated",
         declared_default="None",
         effective_default=("None"),
         automatic_conditions=(
@@ -16515,12 +17041,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_PATH_PROBE_MAX_REPORTS": env_var(
-        lambda: os.getenv("VLLM_DFLASH_DDTREE_PATH_PROBE_MAX_REPORTS"),
-        description=(
-            "DFlash tree verifier: path probe max reports. The consumer "
-            "locations and unset defaults are listed below."
+        deprecated_env(
+            "VLLM_DFLASH_DDTREE_PATH_PROBE_MAX_REPORTS",
+            "0.2.0rc6",
+            "DDTree (speculative method dflash_ddtree) is retired.",
+            lambda: os.getenv("VLLM_DFLASH_DDTREE_PATH_PROBE_MAX_REPORTS"),
         ),
-        category="debug",
+        description=(
+            "Deprecated with DDTree (removed in 0.2.0rc6). DFlash tree "
+            "verifier: path probe max reports. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="deprecated",
         declared_default="None",
         effective_default=("None"),
         automatic_conditions=(
@@ -16533,12 +17065,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_PATH_PROBE_NODE_LIMIT": env_var(
-        lambda: os.getenv("VLLM_DFLASH_DDTREE_PATH_PROBE_NODE_LIMIT"),
-        description=(
-            "DFlash tree verifier: path probe node limit. The consumer "
-            "locations and unset defaults are listed below."
+        deprecated_env(
+            "VLLM_DFLASH_DDTREE_PATH_PROBE_NODE_LIMIT",
+            "0.2.0rc6",
+            "DDTree (speculative method dflash_ddtree) is retired.",
+            lambda: os.getenv("VLLM_DFLASH_DDTREE_PATH_PROBE_NODE_LIMIT"),
         ),
-        category="debug",
+        description=(
+            "Deprecated with DDTree (removed in 0.2.0rc6). DFlash tree "
+            "verifier: path probe node limit. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="deprecated",
         declared_default="None",
         effective_default=("None"),
         automatic_conditions=(
@@ -16551,12 +17089,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_PROFILE": env_var(
-        lambda: os.getenv("VLLM_DFLASH_DDTREE_PROFILE"),
-        description=(
-            "DFlash tree verifier: profile. The consumer locations and unset "
-            "defaults are listed below."
+        deprecated_env(
+            "VLLM_DFLASH_DDTREE_PROFILE",
+            "0.2.0rc6",
+            "DDTree (speculative method dflash_ddtree) is retired.",
+            lambda: os.getenv("VLLM_DFLASH_DDTREE_PROFILE"),
         ),
-        category="debug",
+        description=(
+            "Deprecated with DDTree (removed in 0.2.0rc6). DFlash tree "
+            "verifier: profile. The consumer locations and unset defaults are "
+            "listed below."
+        ),
+        category="deprecated",
         declared_default="None",
         effective_default=("None"),
         automatic_conditions=(
@@ -16569,12 +17113,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_QLA_GDN": env_var(
-        lambda: os.getenv("VLLM_DFLASH_DDTREE_QLA_GDN"),
-        description=(
-            "DFlash tree verifier: qla gdn. The consumer locations and unset "
-            "defaults are listed below."
+        deprecated_env(
+            "VLLM_DFLASH_DDTREE_QLA_GDN",
+            "0.2.0rc6",
+            "DDTree (speculative method dflash_ddtree) is retired.",
+            lambda: os.getenv("VLLM_DFLASH_DDTREE_QLA_GDN"),
         ),
-        category="configuration",
+        description=(
+            "Deprecated with DDTree (removed in 0.2.0rc6). DFlash tree "
+            "verifier: qla gdn. The consumer locations and unset defaults are "
+            "listed below."
+        ),
+        category="deprecated",
         declared_default="None",
         effective_default=("None"),
         automatic_conditions=(
@@ -16587,12 +17137,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_SERIAL_GDN": env_var(
-        lambda: os.getenv("VLLM_DFLASH_DDTREE_SERIAL_GDN"),
-        description=(
-            "DFlash tree verifier: serial gdn. The consumer locations and "
-            "unset defaults are listed below."
+        deprecated_env(
+            "VLLM_DFLASH_DDTREE_SERIAL_GDN",
+            "0.2.0rc6",
+            "DDTree (speculative method dflash_ddtree) is retired.",
+            lambda: os.getenv("VLLM_DFLASH_DDTREE_SERIAL_GDN"),
         ),
-        category="configuration",
+        description=(
+            "Deprecated with DDTree (removed in 0.2.0rc6). DFlash tree "
+            "verifier: serial gdn. The consumer locations and unset defaults "
+            "are listed below."
+        ),
+        category="deprecated",
         declared_default="None",
         effective_default=("None"),
         automatic_conditions=(
@@ -16605,12 +17161,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_SKIP_MAMBA_COMPACT": env_var(
-        lambda: os.getenv("VLLM_DFLASH_DDTREE_SKIP_MAMBA_COMPACT"),
-        description=(
-            "DFlash tree verifier: skip mamba compact. The consumer locations "
-            "and unset defaults are listed below."
+        deprecated_env(
+            "VLLM_DFLASH_DDTREE_SKIP_MAMBA_COMPACT",
+            "0.2.0rc6",
+            "DDTree (speculative method dflash_ddtree) is retired.",
+            lambda: os.getenv("VLLM_DFLASH_DDTREE_SKIP_MAMBA_COMPACT"),
         ),
-        category="configuration",
+        description=(
+            "Deprecated with DDTree (removed in 0.2.0rc6). DFlash tree "
+            "verifier: skip mamba compact. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="deprecated",
         declared_default="None",
         effective_default=("None"),
         automatic_conditions=(
@@ -16623,9 +17185,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_STOCHASTIC_TOPK_LOGITS": env_var(
-        lambda: os.getenv("VLLM_DFLASH_DDTREE_STOCHASTIC_TOPK_LOGITS"),
-        description="Select stochastic top-k logits in the DFlash tree sampler.",
-        category="configuration",
+        deprecated_env(
+            "VLLM_DFLASH_DDTREE_STOCHASTIC_TOPK_LOGITS",
+            "0.2.0rc6",
+            "DDTree (speculative method dflash_ddtree) is retired.",
+            lambda: os.getenv("VLLM_DFLASH_DDTREE_STOCHASTIC_TOPK_LOGITS"),
+        ),
+        description=(
+            "Deprecated with DDTree (removed in 0.2.0rc6). Select stochastic "
+            "top-k logits in the DFlash tree sampler."
+        ),
+        category="deprecated",
         declared_default="None",
         effective_default=("None"),
         automatic_conditions=(
@@ -16638,12 +17208,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_TARGET_FORWARD_NVTX": env_var(
-        lambda: os.getenv("VLLM_DFLASH_DDTREE_TARGET_FORWARD_NVTX"),
-        description=(
-            "DFlash tree verifier: target forward nvtx. The consumer locations"
-            " and unset defaults are listed below."
+        deprecated_env(
+            "VLLM_DFLASH_DDTREE_TARGET_FORWARD_NVTX",
+            "0.2.0rc6",
+            "DDTree (speculative method dflash_ddtree) is retired.",
+            lambda: os.getenv("VLLM_DFLASH_DDTREE_TARGET_FORWARD_NVTX"),
         ),
-        category="debug",
+        description=(
+            "Deprecated with DDTree (removed in 0.2.0rc6). DFlash tree "
+            "verifier: target forward nvtx. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="deprecated",
         declared_default="None",
         effective_default=("None"),
         automatic_conditions=(
@@ -16656,12 +17232,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_TARGET_FORWARD_PROFILER_STEP": env_var(
-        lambda: os.getenv("VLLM_DFLASH_DDTREE_TARGET_FORWARD_PROFILER_STEP"),
-        description=(
-            "DFlash tree verifier: target forward profiler step. The consumer "
-            "locations and unset defaults are listed below."
+        deprecated_env(
+            "VLLM_DFLASH_DDTREE_TARGET_FORWARD_PROFILER_STEP",
+            "0.2.0rc6",
+            "DDTree (speculative method dflash_ddtree) is retired.",
+            lambda: os.getenv("VLLM_DFLASH_DDTREE_TARGET_FORWARD_PROFILER_STEP"),
         ),
-        category="debug",
+        description=(
+            "Deprecated with DDTree (removed in 0.2.0rc6). DFlash tree "
+            "verifier: target forward profiler step. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="deprecated",
         declared_default="None",
         effective_default=("None"),
         automatic_conditions=(
@@ -16674,12 +17256,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_TRACE_JSONL": env_var(
-        lambda: os.getenv("VLLM_DFLASH_DDTREE_TRACE_JSONL"),
-        description=(
-            "DFlash tree verifier: trace jsonl. The consumer locations and "
-            "unset defaults are listed below."
+        deprecated_env(
+            "VLLM_DFLASH_DDTREE_TRACE_JSONL",
+            "0.2.0rc6",
+            "DDTree (speculative method dflash_ddtree) is retired.",
+            lambda: os.getenv("VLLM_DFLASH_DDTREE_TRACE_JSONL"),
         ),
-        category="debug",
+        description=(
+            "Deprecated with DDTree (removed in 0.2.0rc6). DFlash tree "
+            "verifier: trace jsonl. The consumer locations and unset defaults "
+            "are listed below."
+        ),
+        category="deprecated",
         declared_default="None",
         effective_default=("None"),
         automatic_conditions=(
@@ -16700,12 +17288,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_TRACE_KV_CACHE_DIFF": env_var(
-        lambda: os.getenv("VLLM_DFLASH_DDTREE_TRACE_KV_CACHE_DIFF"),
-        description=(
-            "DFlash tree verifier: trace kv cache diff. The consumer locations"
-            " and unset defaults are listed below."
+        deprecated_env(
+            "VLLM_DFLASH_DDTREE_TRACE_KV_CACHE_DIFF",
+            "0.2.0rc6",
+            "DDTree (speculative method dflash_ddtree) is retired.",
+            lambda: os.getenv("VLLM_DFLASH_DDTREE_TRACE_KV_CACHE_DIFF"),
         ),
-        category="debug",
+        description=(
+            "Deprecated with DDTree (removed in 0.2.0rc6). DFlash tree "
+            "verifier: trace kv cache diff. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="deprecated",
         declared_default="None",
         effective_default=("None"),
         automatic_conditions=(
@@ -16718,12 +17312,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_TRITON_SAMPLER": env_var(
-        lambda: os.getenv("VLLM_DFLASH_DDTREE_TRITON_SAMPLER"),
-        description=(
-            "DFlash tree verifier: triton sampler. The consumer locations and "
-            "unset defaults are listed below."
+        deprecated_env(
+            "VLLM_DFLASH_DDTREE_TRITON_SAMPLER",
+            "0.2.0rc6",
+            "DDTree (speculative method dflash_ddtree) is retired.",
+            lambda: os.getenv("VLLM_DFLASH_DDTREE_TRITON_SAMPLER"),
         ),
-        category="configuration",
+        description=(
+            "Deprecated with DDTree (removed in 0.2.0rc6). DFlash tree "
+            "verifier: triton sampler. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="deprecated",
         declared_default="None",
         effective_default=("None"),
         automatic_conditions=(
@@ -16740,12 +17340,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE": env_var(
-        lambda: os.getenv("VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE"),
-        description=(
-            "DFlash tree verifier: verify row trace. The consumer locations "
-            "and unset defaults are listed below."
+        deprecated_env(
+            "VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE",
+            "0.2.0rc6",
+            "DDTree (speculative method dflash_ddtree) is retired.",
+            lambda: os.getenv("VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE"),
         ),
-        category="debug",
+        description=(
+            "Deprecated with DDTree (removed in 0.2.0rc6). DFlash tree "
+            "verifier: verify row trace. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="deprecated",
         declared_default="None",
         effective_default=("None"),
         automatic_conditions=(
@@ -16762,12 +17368,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE_CONTEXT": env_var(
-        lambda: os.getenv("VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE_CONTEXT"),
-        description=(
-            "DFlash tree verifier: verify row trace context. The consumer "
-            "locations and unset defaults are listed below."
+        deprecated_env(
+            "VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE_CONTEXT",
+            "0.2.0rc6",
+            "DDTree (speculative method dflash_ddtree) is retired.",
+            lambda: os.getenv("VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE_CONTEXT"),
         ),
-        category="debug",
+        description=(
+            "Deprecated with DDTree (removed in 0.2.0rc6). DFlash tree "
+            "verifier: verify row trace context. The consumer locations and "
+            "unset defaults are listed below."
+        ),
+        category="deprecated",
         declared_default="None",
         effective_default=("None"),
         automatic_conditions=(
@@ -16780,12 +17392,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE_TOPK": env_var(
-        lambda: os.getenv("VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE_TOPK"),
-        description=(
-            "DFlash tree verifier: verify row trace topk. The consumer "
-            "locations and unset defaults are listed below."
+        deprecated_env(
+            "VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE_TOPK",
+            "0.2.0rc6",
+            "DDTree (speculative method dflash_ddtree) is retired.",
+            lambda: os.getenv("VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE_TOPK"),
         ),
-        category="debug",
+        description=(
+            "Deprecated with DDTree (removed in 0.2.0rc6). DFlash tree "
+            "verifier: verify row trace topk. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="deprecated",
         declared_default="None",
         effective_default=("None"),
         automatic_conditions=(
@@ -16798,12 +17416,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DDTREE_WORKER_PROFILE": env_var(
-        lambda: os.getenv("VLLM_DFLASH_DDTREE_WORKER_PROFILE"),
-        description=(
-            "DFlash tree verifier: worker profile. The consumer locations and "
-            "unset defaults are listed below."
+        deprecated_env(
+            "VLLM_DFLASH_DDTREE_WORKER_PROFILE",
+            "0.2.0rc6",
+            "DDTree (speculative method dflash_ddtree) is retired.",
+            lambda: os.getenv("VLLM_DFLASH_DDTREE_WORKER_PROFILE"),
         ),
-        category="debug",
+        description=(
+            "Deprecated with DDTree (removed in 0.2.0rc6). DFlash tree "
+            "verifier: worker profile. The consumer locations and unset "
+            "defaults are listed below."
+        ),
+        category="deprecated",
         declared_default="None",
         effective_default=("None"),
         automatic_conditions=(
@@ -16841,12 +17465,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DEBUG_COORD_TRACE": env_var(
-        lambda: os.getenv("VLLM_DFLASH_DEBUG_COORD_TRACE"),
-        description=(
-            "DFlash diagnostic: coord trace. The consumer locations and unset "
-            "defaults are listed below."
+        deprecated_env(
+            "VLLM_DFLASH_DEBUG_COORD_TRACE",
+            "0.2.0rc6",
+            "glm5next is outside the supported models; the switch goes away with it.",
+            lambda: os.getenv("VLLM_DFLASH_DEBUG_COORD_TRACE"),
         ),
-        category="debug",
+        description=(
+            "Deprecated (removed in 0.2.0rc6): coordinate trace of the glm5next "
+            "sparse indexer (kpool). "
+            "Only the glm5next model reads it, and glm5next is not a "
+            "supported model."
+        ),
+        category="deprecated",
         declared_default="None",
         effective_default=("None"),
         automatic_conditions=(
@@ -16860,12 +17491,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_DFLASH_DEBUG_PP_AUX_DUMP_LIMIT": env_var(
-        lambda: os.getenv("VLLM_DFLASH_DEBUG_PP_AUX_DUMP_LIMIT"),
-        description=(
-            "DFlash diagnostic: pp aux dump limit. The consumer locations and "
-            "unset defaults are listed below."
+        deprecated_env(
+            "VLLM_DFLASH_DEBUG_PP_AUX_DUMP_LIMIT",
+            "0.2.0rc6",
+            "glm5next is outside the supported models; the switch goes away with it.",
+            lambda: os.getenv("VLLM_DFLASH_DEBUG_PP_AUX_DUMP_LIMIT"),
         ),
-        category="debug",
+        description=(
+            "Deprecated (removed in 0.2.0rc6): dump limit of the glm5next "
+            "pipeline-parallel auxiliary states. "
+            "Only the glm5next model reads it, and glm5next is not a "
+            "supported model."
+        ),
+        category="deprecated",
         declared_default="None",
         effective_default=("None"),
         automatic_conditions=("'2' at vllm/models/glm5next/nvidia/model.py:__init__",),
@@ -19625,7 +20263,64 @@ def is_set(name: str):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+# Deprecated switches that call sites read straight from os.environ.
+# validate_environ() logs one warning per set name each time it runs (once per
+# engine-config build; several API server processes each log their own). The
+# getters also raise a FutureWarning when read, so users may see both.
+_DDTREE_RETIRED = "DDTree (speculative method dflash_ddtree) is retired"
+_GLM5NEXT_RETIRED = "glm5next is outside the supported models"
+RETIRING_ENVS: dict[str, str] = {
+    "VLLM_DFLASH_DDTREE_ATTN_COMPACT_BATCH": _DDTREE_RETIRED,
+    "VLLM_DFLASH_DDTREE_COMPACT_DRAFTER_CONTEXT": _DDTREE_RETIRED,
+    "VLLM_DFLASH_DDTREE_CONV_KERNEL": _DDTREE_RETIRED,
+    "VLLM_DFLASH_DDTREE_DEBUG": _DDTREE_RETIRED,
+    "VLLM_DFLASH_DDTREE_DISABLE_GDN_FAST_BUILD": _DDTREE_RETIRED,
+    "VLLM_DFLASH_DDTREE_DISABLE_GDN_FAST_BUILD_CACHE": _DDTREE_RETIRED,
+    "VLLM_DFLASH_DDTREE_ENABLE_GDN_FAST_BUILD": _DDTREE_RETIRED,
+    "VLLM_DFLASH_DDTREE_ENABLE_GDN_FAST_BUILD_CACHE": _DDTREE_RETIRED,
+    "VLLM_DFLASH_DDTREE_ENABLE_HYBRID_TREE_STATE": _DDTREE_RETIRED,
+    "VLLM_DFLASH_DDTREE_ENGINE_PROFILE": _DDTREE_RETIRED,
+    "VLLM_DFLASH_DDTREE_FAST_BUILD_DEBUG": _DDTREE_RETIRED,
+    "VLLM_DFLASH_DDTREE_FORCE_MAMBA_COMPACT": _DDTREE_RETIRED,
+    "VLLM_DFLASH_DDTREE_FUSED_GDN": _DDTREE_RETIRED,
+    "VLLM_DFLASH_DDTREE_GDN_FAST_BUILD_TRITON": _DDTREE_RETIRED,
+    "VLLM_DFLASH_DDTREE_GDN_SHARED_COMMON": _DDTREE_RETIRED,
+    "VLLM_DFLASH_DDTREE_GPU_SAMPLER": _DDTREE_RETIRED,
+    "VLLM_DFLASH_DDTREE_LINEAR_GDN": _DDTREE_RETIRED,
+    "VLLM_DFLASH_DDTREE_MAMBA_COMPACT_BATCH": _DDTREE_RETIRED,
+    "VLLM_DFLASH_DDTREE_METADATA_PROFILE": _DDTREE_RETIRED,
+    "VLLM_DFLASH_DDTREE_PATH_PROBE": _DDTREE_RETIRED,
+    "VLLM_DFLASH_DDTREE_PATH_PROBE_LAYER": _DDTREE_RETIRED,
+    "VLLM_DFLASH_DDTREE_PATH_PROBE_MAX_REPORTS": _DDTREE_RETIRED,
+    "VLLM_DFLASH_DDTREE_PATH_PROBE_NODE_LIMIT": _DDTREE_RETIRED,
+    "VLLM_DFLASH_DDTREE_PROFILE": _DDTREE_RETIRED,
+    "VLLM_DFLASH_DDTREE_QLA_GDN": _DDTREE_RETIRED,
+    "VLLM_DFLASH_DDTREE_SERIAL_GDN": _DDTREE_RETIRED,
+    "VLLM_DFLASH_DDTREE_SKIP_MAMBA_COMPACT": _DDTREE_RETIRED,
+    "VLLM_DFLASH_DDTREE_STOCHASTIC_TOPK_LOGITS": _DDTREE_RETIRED,
+    "VLLM_DFLASH_DDTREE_TARGET_FORWARD_NVTX": _DDTREE_RETIRED,
+    "VLLM_DFLASH_DDTREE_TARGET_FORWARD_PROFILER_STEP": _DDTREE_RETIRED,
+    "VLLM_DFLASH_DDTREE_TRACE_JSONL": _DDTREE_RETIRED,
+    "VLLM_DFLASH_DDTREE_TRACE_KV_CACHE_DIFF": _DDTREE_RETIRED,
+    "VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN": _DDTREE_RETIRED,
+    "VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN_STRICT": _DDTREE_RETIRED,
+    "VLLM_DFLASH_DDTREE_TRITON_SAMPLER": _DDTREE_RETIRED,
+    "VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE": _DDTREE_RETIRED,
+    "VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE_CONTEXT": _DDTREE_RETIRED,
+    "VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE_TOPK": _DDTREE_RETIRED,
+    "VLLM_DFLASH_DDTREE_WORKER_PROFILE": _DDTREE_RETIRED,
+    "VLLM_DFLASH_DEBUG_COORD_TRACE": _GLM5NEXT_RETIRED,
+    "VLLM_DFLASH_DEBUG_PP_AUX_DUMP_LIMIT": _GLM5NEXT_RETIRED,
+}
+
+
 def validate_environ(hard_fail: bool) -> None:
+    for name in sorted(set(RETIRING_ENVS) & set(os.environ)):
+        logger.warning(
+            "%s is deprecated and will be removed in 0.2.0rc6: %s.",
+            name,
+            RETIRING_ENVS[name],
+        )
     for env in os.environ:
         if env.startswith("VLLM_") and env not in environment_variables:
             if hard_fail:
@@ -19634,7 +20329,7 @@ def validate_environ(hard_fail: bool) -> None:
                 logger.warning("Unknown vLLM environment variable detected: %s", env)
 
 
-def compile_factors() -> dict[str, object]:
+def compile_factors(speculative_config: Any = None) -> dict[str, object]:
     """Return env vars used for torch.compile cache keys.
 
     Start with every known vLLM env var; drop entries in `ignored_factors`;
@@ -19642,6 +20337,15 @@ def compile_factors() -> dict[str, object]:
 
     ignored_factors: set[str] = {
         "MAX_JOBS",
+        # Scheduler/KV planning only; never changes compiled code.
+        "VLLM_SM70_HOST_KV_STATIC_HOT_POOL",
+        # Runtime branches inside opaque QSA ops; no traced graph change.
+        "REVOLTA_RESEARCH_HOST_DECODE_FAST",
+        "REVOLTA_RESEARCH_HOST_DECODE_FAST_ORDERED",
+        "REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED",
+        # Host metadata construction only; captured model operations unchanged.
+        "REVOLTA_RESEARCH_PREGRAPH_GDN_COMMON_CACHE",
+        "REVOLTA_RESEARCH_PREGRAPH_REPLAY_VIEWS",
         "VLLM_RPC_BASE_PATH",
         "VLLM_USE_MODELSCOPE",
         "VLLM_RINGBUFFER_WARNING_INTERVAL",
@@ -19667,6 +20371,16 @@ def compile_factors() -> dict[str, object]:
         "VLLM_DO_NOT_TRACK",
         "VLLM_LOGGING_LEVEL",
         "VLLM_REVOLTA_PROFILE_PROVENANCE",
+        # Host metadata and opaque custom-op launch order/tiling only; outputs
+        # are bitwise identical and the compiled graph does not change.
+        "VLLM_SM70_QSA_GROUPED_LPT",
+        "VLLM_SM70_GDN_CPU_SPEC_QSL",
+        "VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE",
+        "VLLM_SM70_GDN_SKINNY_MPLAN",
+        "REVOLTA_QSA_GROUPED_LPT",
+        "REVOLTA_GDN_CPU_SPEC_QSL",
+        "REVOLTA_GDN_CPU_SPEC_QSL_CHECK_FILE",
+        "REVOLTA_SKINNY_MPLAN",
         "VLLM_LOGGING_PREFIX",
         "VLLM_LOGGING_STREAM",
         "VLLM_LOGGING_CONFIG_PATH",
@@ -19682,6 +20396,11 @@ def compile_factors() -> dict[str, object]:
         # moe_forward_shared custom op at run time, so the traced graph does not
         # depend on it, and registering it must not recompile any deployment.
         "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_DFLASH_MAX_TOKENS",
+        # QSA scorer route for multi-request batches. It is chosen inside the
+        # qwen4_exp_qsa_with_output custom op at run time, so the traced graph
+        # does not depend on it, and registering it must not recompile any
+        # deployment.
+        "VLLM_SM70_QSA_REQUEST_SEGMENTS",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
         "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS",
@@ -19724,8 +20443,16 @@ def compile_factors() -> dict[str, object]:
 
     from vllm.config.utils import normalize_value
 
+    resolved_lookup = (
+        speculative_config.resolved_dflash2_lookup
+        if speculative_config is not None
+        else None
+    )
+    lookup_prefix = "VLLM_DFLASH2_LOOKUP_"
     factors: dict[str, object] = {}
     for factor, getter in environment_variables.items():
+        if resolved_lookup is not None and factor.startswith(lookup_prefix):
+            continue
         if factor in ignored_factors:
             continue
 
@@ -19741,6 +20468,9 @@ def compile_factors() -> dict[str, object]:
 
         factors[factor] = normalize_value(raw)
 
+    if resolved_lookup is not None:
+        factors.update(resolved_lookup.env_factors)
+
     # Out-of-tree switches. Forks, plugins and out-of-tree backends read
     # their own VLLM_-prefixed variables straight from os.environ, so this
     # module never sees them -- yet they select kernels and therefore change
@@ -19750,6 +20480,8 @@ def compile_factors() -> dict[str, object]:
     # over-invalidated cache costs a recompile, a wrongly reused one costs
     # correctness.
     for name, value in os.environ.items():
+        if resolved_lookup is not None and name.startswith(lookup_prefix):
+            continue
         if not name.startswith("VLLM_"):
             continue
         if name in factors or name in ignored_factors:

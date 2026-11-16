@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+
 """
 NOTE: Coding style guide for this file:
 This model runner is shared by all models: text and multimodal, generative
@@ -22,7 +24,7 @@ import gc
 import os
 import time
 from copy import deepcopy
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
 import torch
@@ -66,6 +68,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+from vllm.v1.spec_decode.lookup_quarantine import isolated, require_reusable_context
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
 from vllm.v1.worker.gpu.attn_utils import (
@@ -131,7 +134,31 @@ from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.mamba_utils import pad_mamba_block_table_widths
 from vllm.v1.worker.utils import KVBlockZeroer, clear_layer_kv_caches
 
+if TYPE_CHECKING:
+    from vllm.models.qwen4_exp.nvidia.host_kv.history import HostHistoryStore
+
 logger = init_logger(__name__)
+
+
+def _reclaim_before_draft_load() -> tuple[int, int]:
+    """Free target-loading temporaries before the draft model allocates.
+
+    Checkpoint conversion can leave reference cycles that still hold replaced
+    tensors. Collect them and return cached blocks so the draft does not stack
+    on top of them. Returns the allocated bytes before and after.
+    """
+    allocated_before = torch.accelerator.memory_allocated()
+    gc.collect()
+    torch.accelerator.empty_cache()
+    allocated_after = torch.accelerator.memory_allocated()
+    logger.info(
+        "Target loading cleanup before draft load: allocated %d -> %d bytes, "
+        "reserved %d bytes",
+        allocated_before,
+        allocated_after,
+        torch.accelerator.memory_reserved(),
+    )
+    return allocated_before, allocated_after
 
 
 def _detach_model_runtime_state(model: nn.Module) -> None:
@@ -147,6 +174,7 @@ def _detach_model_runtime_state(model: nn.Module) -> None:
 
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        require_reusable_context()
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
@@ -495,6 +523,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 assert self.speculative_config is not None
                 set_eagle3_aux_hidden_state_layers(self.model, self.speculative_config)
             if self.speculator is not None:
+                _reclaim_before_draft_load()
                 self.speculator.load_model(self.model)
                 eplb_models_added = self.eplb.maybe_register_speculator(
                     self.speculator, self.speculative_config, load_dummy_weights
@@ -674,7 +703,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.speculator.init_cudagraph_manager(cudagraph_mode)
         elif self.speculator is not None:
             # Preserve the existing Eagle initialization order.
-            self.speculator.init_cudagraph_manager(cudagraph_mode)
+            self.speculator.init_cudagraph_manager(
+                cudagraph_mode,
+                capture_context=(
+                    self.cudagraph_manager.get_capture_context()
+                    if cudagraph_mode
+                    else None
+                ),
+            )
             # HACK(woosuk)
             self.speculator.set_attn(
                 self.model_state, self.kv_cache_config, self.block_tables
@@ -691,6 +727,31 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             kernel_block_sizes,
             self.vllm_config,
         )
+        self.host_history: HostHistoryStore | None = None
+        if getattr(self.kv_cache_config, "host_kv_layers", None):
+            # Long-context mode with the main QSA K/V in host memory: one page
+            # per history block ID, bound to the QSA layers before any capture.
+            from vllm.models.qwen4_exp.nvidia.host_kv.engine import (
+                build_host_history_store,
+            )
+
+            self.host_history = build_host_history_store(
+                self.kv_cache_config,
+                self.vllm_config,
+                self.compilation_config.static_forward_context,
+                kernel_block_sizes,
+                self.device,
+                kv_caches_dict,
+            )
+            assert self.host_history is not None
+            if self.host_history.shape.staged_writethrough:
+                names = set(self.kv_cache_config.host_kv_layers)
+                self._host_write_group = next(
+                    i
+                    for i, group in enumerate(self.kv_cache_config.kv_cache_groups)
+                    if names.intersection(group.layer_names)
+                )
+                self.block_tables.cpu_mirrors[self._host_write_group] = {}
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
 
     def _init_kv_zero_meta(self) -> None:
@@ -699,17 +760,101 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.device, pin_memory=is_pin_memory_available()
         )
         self._kv_block_zeroer.init_meta(
-            attn_groups_iter=(group for groups in self.attn_groups for group in groups),
+            # With separate block spaces the IDs to zero name primary-space
+            # blocks only; another space's tensors must not be touched.
+            attn_groups_iter=(
+                group
+                for groups in self.attn_groups
+                for group in groups
+                # getattr: tests may build the runner without __init__.
+                if getattr(self, "kv_cache_config", None) is None
+                or self.kv_cache_config.in_primary_block_space(group.kv_cache_group_id)
+            ),
             kernel_block_sizes=self._kernel_block_sizes,
             cache_dtype=self.cache_config.cache_dtype,
             runner_only_attn_layers=set(),
             static_forward_context=self.compilation_config.static_forward_context,
         )
 
+    def _set_host_write_plan(self, input_batch, cg_mode) -> None:
+        store = getattr(self, "host_history", None)
+        if store is None or not store.shape.staged_writethrough:
+            return
+        store.write_plan = None
+        store.write_plan_kind = "none"
+        store.write_plan_all_prefill = False
+        if cg_mode != CUDAGraphMode.NONE or not input_batch.is_prefilling_np.any():
+            return
+        store.prepare_prefill_write(
+            self.block_tables.cpu_mirrors[self._host_write_group],
+            input_batch.idx_mapping_np,
+            input_batch.num_scheduled_tokens,
+            input_batch.num_computed_prefill_tokens_np,
+            input_batch.is_prefilling_np,
+            input_batch.num_tokens_after_padding,
+            *self.block_tables.group_cp(self._host_write_group),
+            self.block_tables.cp_interleave,
+        )
+
+    def _set_host_kv_plan(self, scheduler_output, input_batch) -> None:
+        """shared hot region: this rank's mixed-step pass intervals from scheduler
+        metadata.
+
+        Every rank has the same batch order, U_step and (rows, G_q), so the
+        intervals match across ranks; no device value is read."""
+        store = getattr(self, "host_history", None)
+        host_step = getattr(scheduler_output, "host_kv", None)
+        if store is None or host_step is None or not host_step.requests:
+            if store is not None:
+                store.set_step_plan(None, None)
+            return
+        from vllm.models.qwen4_exp.nvidia.host_kv.planning import plan_step_passes
+
+        s = store.shape
+        rows = [host_step.requests[req_id][0] for req_id in input_batch.req_ids]
+        if max(rows, default=0) <= s.decode_rows:
+            store.set_step_plan(host_step.hot_slots or None, None)
+            return
+        if s.prefill_gather == "union":
+            # selection-union gather: the union path plans its own windows from (rows,
+            # G_q,
+            # class) and U_step, identically on every rank.
+            from vllm.models.qwen4_exp.nvidia.host_kv.history import UnionStepInfo
+
+            batch = [host_step.requests[req_id] for req_id in input_batch.req_ids]
+            store.set_step_plan(
+                host_step.hot_slots or None,
+                None,
+                UnionStepInfo(
+                    capacity=host_step.hot_slots or store.available_slots,
+                    rows_by_req=tuple(rows),
+                    groups=tuple(groups for _, groups, _ in batch),
+                    decode=tuple(kind == 0 for _, _, kind in batch),
+                ),
+            )
+            return
+        store.set_step_plan(
+            host_step.hot_slots or None,
+            plan_step_passes(
+                input_batch.req_ids,
+                input_batch.num_tokens,
+                host_step.requests,
+                host_step.hot_slots or store.available_slots,
+                s.read_rows,
+                row_groups=s.row_groups,
+                tail_groups=s.tail_groups,
+                single_request_fast=s.staged_writethrough,
+            ),
+        )
+
     def _zero_block_ids(self, block_ids: list[int]) -> None:
         """Clear cache blocks before their first use after allocation."""
         if hasattr(self, "_kv_block_zeroer"):
             self._kv_block_zeroer.zero_block_ids(block_ids)
+        # The same new history IDs start a new life of their host pages.
+        host_history = getattr(self, "host_history", None)
+        if host_history is not None:
+            host_history.begin_blocks(block_ids)
 
     def _warmup_sm70_aux_kernels(self) -> None:
         """Warm SM70 kernels whose production cache exists only in MRV2."""
@@ -791,14 +936,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             intermediate_tensors = self.intermediate_tensors[:num_tokens]
 
         # Execute the model.
-        self.execute_model(
-            dummy_scheduler_output,
-            intermediate_tensors=intermediate_tensors,
-            dummy_run=True,
-            skip_attn_for_dummy_run=skip_attn,
-            is_profile=is_profile,
-        )
-        self.kv_connector.set_disabled(False)
+        try:
+            self.execute_model(
+                dummy_scheduler_output,
+                intermediate_tensors=intermediate_tensors,
+                dummy_run=True,
+                skip_attn_for_dummy_run=skip_attn,
+                is_profile=is_profile,
+            )
+        finally:
+            self.kv_connector.set_disabled(False)
 
         # Non-last PP ranks don't produce output for sampling.
         if not self.is_last_pp_rank:
@@ -866,7 +1013,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     @torch.inference_mode()
     def _dummy_sampler_run(self, hidden_states: torch.Tensor) -> None:
         num_reqs = hidden_states.shape[0]
+        from vllm.v1.sample.ops.topk_topp_sampler import warmup_top_k_top_p
+
         logits = self.model.compute_logits(hidden_states)
+        warmup_top_k_top_p(logits, self.vllm_config)
         dummy_input_batch = InputBatch.make_dummy(
             num_reqs, num_reqs, self.input_buffers
         )
@@ -1599,6 +1749,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        if (
+            dummy_run
+            and getattr(self, "host_history", None) is not None
+            and getattr(self, "_host_history_live", False)
+        ):
+            # Dummy batches have no scheduler hot-capacity reservation. Only
+            # initialization may use them, followed by the first-step reset.
+            raise RuntimeError(
+                "Host KV dummy batches are only supported before serving"
+            )
         if not dummy_run:
             if self.device.type == "cuda":
                 self.mixed_prefill_timer.begin(scheduler_output)
@@ -1612,12 +1772,33 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Finish offload stores whose source blocks this step reuses before
             # zeroing them below; see ActiveKVConnector.handle_preemptions.
             self.kv_connector.handle_preemptions(scheduler_output)
+            host_step = getattr(scheduler_output, "host_kv", None)
+            if host_step is not None:
+                assert self.host_history is not None
+                if not getattr(self, "_host_history_live", False):
+                    # Profiling, warmup and capture ran dummy batches over the
+                    # shared index pages: start serving from the scheduler's
+                    # initial roles (every non-null ID DONATED, no binding).
+                    if self.host_history.shape.slots_per_block:
+                        self.host_history.reset_hot_state()
+                    self._host_history_live = True
+                self.host_history.bind_pages(host_step.bindings)
+                # shared hot region step head: donate, claim, then zero/begin new IDs
+                # below.
+                self.host_history.apply_roles(host_step.donate, host_step.claim)
+                self.host_history.set_step_plan(
+                    getattr(host_step, "hot_slots", 0) or None, None
+                )
             if scheduler_output.new_block_ids_to_zero:
                 self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
                 empty_output = self.kv_connector.no_forward(scheduler_output)
-                return empty_output
+                from vllm.v1.worker.gpu.spec_decode.dflash2.stats import (
+                    attach_empty_output,
+                )
+
+                return attach_empty_output(self, empty_output)
 
         # Get batch descriptor and sync across DP ranks.
         num_reqs = len(scheduler_output.num_scheduled_tokens)
@@ -1654,6 +1835,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Common case.
             # Prepare all the inputs and copy to the input buffers.
             input_batch = self.prepare_inputs(scheduler_output, batch_desc)
+            self._set_host_kv_plan(scheduler_output, input_batch)
+            self._set_host_write_plan(input_batch, batch_desc.cg_mode)
             early_model_inputs, ple_prepared = self.prepare_model_inputs_early(
                 input_batch, batch_desc.cg_mode
             )
@@ -1677,6 +1860,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self._set_active_loras(*lora_inputs)
         else:
             # No actual tokens to run. A dummy run for DP or memory profiling.
+            host_history = getattr(self, "host_history", None)
+            if host_history is not None:
+                host_history.set_step_plan(None, None)
+                host_history.write_plan = None
             input_batch = InputBatch.make_dummy(
                 batch_desc.num_reqs or num_reqs,
                 batch_desc.num_tokens,
@@ -1886,6 +2073,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         aux_hidden_states = self.execute_model_state.aux_hidden_states
         finished_req_ids = self.execute_model_state.finished_req_ids
         self.execute_model_state = None
+        if getattr(self, "host_history", None) is not None:
+            self.kv_connector.seal_host_step()
         mtp_profile_ctx = self._sm70_v2_mtp_profile_pending
         self._sm70_v2_mtp_profile_pending = None
 
@@ -1948,6 +2137,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_sampled_tokens=num_sampled,
             main_stream=self.main_stream,
             copy_stream=self.output_copy_stream,
+            rejection_fallback_count=(
+                self.rejection_sampler.fallback_count
+                if self.rejection_sampler is not None
+                else None
+            ),
         )
 
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
@@ -2010,6 +2204,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # read the aux hidden states instead and get None here.
                 if pre_hc_hidden_states is not None:
                     spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+            store = getattr(self, "host_history", None)
+            if store is not None and any(
+                "mtp" in name.split(".") for name in store.layer_index
+            ):
+                # An MTP draft layer in the host store writes its own rows:
+                # the target's staged prefill write plan does not describe
+                # the draft's recursive positions.
+                store.write_plan = None
+                store.write_plan_kind = "none"
+                store.write_plan_all_prefill = False
             mtp_draft_start = self._sm70_v2_mtp_profile_start(mtp_profile_ctx)
             draft_tokens = self.speculator.propose(
                 input_batch,
@@ -2072,6 +2276,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 ),
             )
 
+        if getattr(self, "host_history", None) is not None:
+            # MTP draft pages in the host row are complete only now; a no-op
+            # unless the host row carries them.
+            self.kv_connector.seal_host_step(after_draft=True)
         # Post-step KV connector related operations.
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
         model_runner_output.kv_connector_output = kv_connector_output
@@ -2083,6 +2291,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             None if mtp_profile_ctx is None else mtp_profile_ctx["total_gpu_start"],
         )
         self._sm70_v2_mtp_profile_report(mtp_profile_ctx)
+
+        native = getattr(self.speculator, "_native_lookup", None)
+        stats = getattr(native, "stats", None)
+        if stats is not None:
+            stats.submitted()
+            model_runner_output.lookup_stats = stats.service()
 
         if self.use_async_scheduling:
             return async_output
@@ -2135,34 +2349,88 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return async_output.get_output()
 
     def shutdown(self) -> None:
-        """Release GPU tensors (model weights, KV caches, workspace) so that
-        memory is reclaimable when running in the same process."""
-        torch.accelerator.synchronize()
-        # CUDA graph managers own graph pools, captured outputs, and persistent
-        # attention metadata. Drop both target and draft managers first.
+        """Retire GPU work before releasing graph and tensor owners."""
+        from vllm.distributed.shutdown import ShutdownIncompleteError
+
+        self._shutdown_gpu_retired = False
+        if isolated(self):
+            if getattr(self, "_shutdown_retirement_failed", False):
+                raise ShutdownIncompleteError(
+                    "GPU runner is quarantined; process restart required"
+                )
+            return
+        try:
+            torch.accelerator.synchronize()
+        except Exception as error:
+            from vllm.v1.spec_decode.lookup_quarantine import quarantine
+
+            # Retain native owners when synchronization cannot establish GPU
+            # quiescence. A retry must not turn incomplete retirement into success.
+            self._shutdown_retirement_failed = True
+            quarantine("GPU retirement incomplete during shutdown", self)
+            raise ShutdownIncompleteError(
+                f"GPU synchronization failed: {type(error).__name__}: {error}"
+            ) from error
+        # Resource-release failures must not erase the synchronization proof.
+        # WorkerProc needs it before clearing external graph registries.
+        self._shutdown_gpu_retired = True
+        self._release_model_resources()
+
+    def _release_model_resources(self) -> None:
+        errors: list[str] = []
+
+        def attempt(cleanup) -> None:
+            try:
+                cleanup()
+            except Exception as error:
+                errors.append(f"{type(error).__name__}: {error}")
+
+        # Graphs and tensor references must be dropped even if a connector's
+        # close fails. Pending source views remain owned by the registry.
         self.cudagraph_manager = None
         if self._ple_offload_connector is not None:
-            self._ple_offload_connector.close()
+            attempt(self._ple_offload_connector.close)
             self._ple_offload_connector = None
 
         target_model = getattr(self, "model", None)
         speculator = getattr(self, "speculator", None)
         if speculator is not None:
-            if hasattr(speculator, "query_cudagraph_manager"):
-                speculator.query_cudagraph_manager = None
+            for name in (
+                "query_cudagraph_manager",
+                "prefill_cudagraph_manager",
+                "decode_cudagraph_manager",
+            ):
+                if hasattr(speculator, name):
+                    setattr(speculator, name, None)
+            # DFlash2's context/metadata graphs are owned directly, outside
+            # either wrapper registry. Drop them even if an external owner
+            # or a cleanup traceback keeps the speculator itself alive.
+            for name in (
+                "_context_kv_graphs",
+                "_context_compute_graphs",
+                "_context_store_graphs",
+                "_draft_metadata_graphs",
+            ):
+                graphs = getattr(speculator, name, None)
+                if graphs is not None:
+                    attempt(graphs.clear)
             draft_model = getattr(speculator, "model", None)
             if isinstance(draft_model, nn.Module):
-                _detach_model_runtime_state(draft_model)
+                attempt(lambda: _detach_model_runtime_state(draft_model))
         if isinstance(target_model, nn.Module):
-            _detach_model_runtime_state(target_model)
+            attempt(lambda: _detach_model_runtime_state(target_model))
 
         if hasattr(self, "kv_caches"):
             self.kv_caches.clear()
+        if self.host_history is not None:
+            attempt(self.host_history.close)
+            attempt(self.kv_connector.close_host_kv)
+        self.host_history = None
         if hasattr(self, "attn_groups"):
             self.attn_groups.clear()
         if hasattr(self, "kv_cache_config"):
             del self.kv_cache_config
-        free_before_shutdown(self.vllm_config)
+        attempt(lambda: free_before_shutdown(self.vllm_config))
         if hasattr(self, "model_state"):
             del self.model_state
         if speculator is not None:
@@ -2170,8 +2438,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if hasattr(self, "model"):
             del self.model
 
-        gc.collect()
-        torch.accelerator.empty_cache()
+        # A reported cleanup error carries this frame's traceback. Drop local
+        # model references as well as runner attributes before raising it.
+        target_model = draft_model = speculator = None
+        attempt(gc.collect)
+        attempt(torch.accelerator.empty_cache)
+        if errors:
+            from vllm.distributed.shutdown import ShutdownError
+
+            failure = ShutdownError("; ".join(errors))
+            errors.clear()
+            raise failure
         logger.debug("Cleaned up model weights, KV caches, and workspace")
 
     ########### EPLB methods start ###########

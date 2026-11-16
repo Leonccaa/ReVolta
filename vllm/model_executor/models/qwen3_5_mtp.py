@@ -443,6 +443,23 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal, SupportsPP):
 
     @staticmethod
     def _mtp_quant_disabled_in_hf_config(*hf_configs: object) -> bool:
+        def excludes_entire_mtp(module: object) -> bool:
+            pattern = str(module).strip().lower()
+            return (
+                pattern == "mtp"
+                or pattern.startswith("mtp*")
+                or ".mtp*" in pattern
+                or pattern.endswith(".mtp")
+            )
+
+        def references_mtp(module: object) -> bool:
+            pattern = str(module).strip().lower()
+            return (
+                excludes_entire_mtp(pattern)
+                or pattern.startswith("mtp.")
+                or ".mtp." in pattern
+            )
+
         for cfg in hf_configs:
             if cfg is None:
                 continue
@@ -450,16 +467,31 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal, SupportsPP):
             if quant_cfg is None:
                 continue
 
-            modules_to_not_convert = None
             if isinstance(quant_cfg, dict):
                 modules_to_not_convert = quant_cfg.get("modules_to_not_convert")
+                ignore = quant_cfg.get("ignore")
             else:
                 modules_to_not_convert = getattr(
                     quant_cfg, "modules_to_not_convert", None
                 )
+                ignore = getattr(quant_cfg, "ignore", None)
 
-            if modules_to_not_convert and any(
-                str(module) in ("mtp", "model.mtp") for module in modules_to_not_convert
+            excluded_modules = list(modules_to_not_convert or ()) + list(ignore or ())
+            if any(excludes_entire_mtp(module) for module in excluded_modules):
+                return True
+
+            quant_method = (
+                quant_cfg.get("quant_method")
+                if isinstance(quant_cfg, dict)
+                else getattr(quant_cfg, "quant_method", None)
+            )
+            # Compressed-tensors checkpoints use ``ignore`` to describe the
+            # full-precision MTP projection set.  FP8 checkpoints instead use
+            # ``modules_to_not_convert`` for selected norms/gates inside an
+            # otherwise quantized MTP branch; those entries must not disable
+            # quantization for the whole draft model.
+            if str(quant_method).lower() == "compressed-tensors" and any(
+                references_mtp(module) for module in ignore or ()
             ):
                 return True
 
@@ -489,15 +521,15 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal, SupportsPP):
                 vllm_config.model_config.hf_config,
             )
         ):
-            # Qwen3.5/Qwen3.6 AWQ checkpoints commonly keep the MTP branch in
-            # full precision (`modules_to_not_convert` includes "mtp"). Build
-            # that branch unquantized so loader params match checkpoint tensors.
+            # Some AWQ/compressed-tensors checkpoints keep all quantizable MTP
+            # projections in full precision. Build that branch unquantized so
+            # loader params match those checkpoint tensors.
             self.quant_config = None
             mtp_vllm_config = copy.copy(vllm_config)
             mtp_vllm_config.quant_config = None
             logger.info(
                 "Qwen3_5MTP: disabling quantization for MTP branch based on "
-                "config.quantization_config.modules_to_not_convert."
+                "config.quantization_config exclusions."
             )
 
         super().__init__()

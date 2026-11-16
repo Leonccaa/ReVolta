@@ -1,0 +1,41 @@
+{
+  "baseline_sha": "f17a23e0e0e5611cb678100387f1a21c011da2e3",
+  "lookup_env_defaults": {
+    "VLLM_DFLASH2_LOOKUP_ADAPTIVE": true,
+    "VLLM_DFLASH2_LOOKUP_AGREE": 0,
+    "VLLM_DFLASH2_LOOKUP_CHEAP_CONTEXT": 0,
+    "VLLM_DFLASH2_LOOKUP_ENTRY_STREAK": 2,
+    "VLLM_DFLASH2_LOOKUP_LONG_MIN": 6,
+    "VLLM_DFLASH2_LOOKUP_NMIN_TAIL": 4,
+    "VLLM_DFLASH2_LOOKUP_NSTRONG": 6,
+    "VLLM_DFLASH2_LOOKUP_SEARCH": 1073741824,
+    "VLLM_DFLASH2_LOOKUP_STICKY": 3
+  },
+  "snapshots": {
+    "legacy_gpu": {
+      "compile_factors_sha256": "4f0e96cc17a5d1f69787572cdd8826c4b469cb386fa139ee14765934f1f44bae",
+      "serialization_sha256": "0f998aba392697a282385ecf43b6543ab5a23f70718c8f4b523fb842e13c7438",
+      "speculative_hash": "909c502c91fe529f2eef826ac6e49d3b"
+    },
+    "legacy_host": {
+      "compile_factors_sha256": "4f0e96cc17a5d1f69787572cdd8826c4b469cb386fa139ee14765934f1f44bae",
+      "serialization_sha256": "5dd34486210b59c9803a29c1e0a84333421e1932656bc81f3eb9dc2c0c80a299",
+      "speculative_hash": "909c502c91fe529f2eef826ac6e49d3b"
+    },
+    "legacy_prompt": {
+      "compile_factors_sha256": "4f0e96cc17a5d1f69787572cdd8826c4b469cb386fa139ee14765934f1f44bae",
+      "serialization_sha256": "44badfd3540243ba95020f4cf940ab20e3c35c15a5edcce7a9924431a44d50a4",
+      "speculative_hash": "909c502c91fe529f2eef826ac6e49d3b"
+    },
+    "ngram": {
+      "compile_factors_sha256": "4f0e96cc17a5d1f69787572cdd8826c4b469cb386fa139ee14765934f1f44bae",
+      "serialization_sha256": "279cf43d641082cacc4c1f3b490548fc9b72d5adb58e681f27819a113e8bce0e",
+      "speculative_hash": "c54a9587a87299e702c282ca6d61cf07"
+    },
+    "off": {
+      "compile_factors_sha256": "4f0e96cc17a5d1f69787572cdd8826c4b469cb386fa139ee14765934f1f44bae",
+      "serialization_sha256": "44badfd3540243ba95020f4cf940ab20e3c35c15a5edcce7a9924431a44d50a4",
+      "speculative_hash": "909c502c91fe529f2eef826ac6e49d3b"
+    }
+  }
+}

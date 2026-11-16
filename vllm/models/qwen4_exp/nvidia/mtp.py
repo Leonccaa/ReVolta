@@ -48,6 +48,7 @@ from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
 
+from ..common.qsa_cache import qsa_draft_dcp_sharded
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 
 try:
@@ -333,11 +334,46 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
                 quant_config=draft_vllm_config.quant_config,
                 prefix=f"{prefix}.fc_hidden",
             )
+            dcp_local_indices_buffer: torch.Tensor | None = None
+            dcp_partial_output_buffer: torch.Tensor | None = None
+            dcp_partial_lse_buffer: torch.Tensor | None = None
+            if qsa_draft_dcp_sharded(draft_vllm_config):
+                parallel_config = draft_vllm_config.parallel_config
+                if parallel_config.decode_context_parallel_size != 2:
+                    raise NotImplementedError("Qwen4Exp QSA supports DCP1 or DCP2")
+                # Draft graphs capture their own addresses; do not borrow the
+                # target's workspaces or overwrite the draft's top-k selection.
+                max_tokens = draft_vllm_config.scheduler_config.max_num_batched_tokens
+                dcp_local_indices_buffer = torch.empty(
+                    max_tokens,
+                    int(config.indexer_budget) + int(config.indexer_compress_ratio) - 1,
+                    dtype=torch.int32,
+                )
+                gathered_heads = (
+                    int(config.num_attention_heads)
+                    // parallel_config.tensor_parallel_size
+                    * 2
+                )
+                dcp_partial_output_buffer = torch.empty(
+                    max_tokens,
+                    gathered_heads,
+                    int(config.head_dim),
+                    dtype=torch.float32,
+                )
+                dcp_partial_lse_buffer = torch.empty(
+                    max_tokens, gathered_heads, dtype=torch.float32
+                )
+                self.dcp_local_indices_buffer = dcp_local_indices_buffer
+                self.dcp_partial_output_buffer = dcp_partial_output_buffer
+                self.dcp_partial_lse_buffer = dcp_partial_lse_buffer
             self.layers = nn.ModuleList(
                 Qwen4ExpDecoderLayer(
                     draft_vllm_config,
                     layer_type="full_attention",
                     prefix=f"{prefix}.layers.{self.mtp_start_layer_idx + idx}",
+                    dcp_local_indices_buffer=dcp_local_indices_buffer,
+                    dcp_partial_output_buffer=dcp_partial_output_buffer,
+                    dcp_partial_lse_buffer=dcp_partial_lse_buffer,
                 )
                 for idx in range(self.num_mtp_layers)
             )
@@ -530,13 +566,11 @@ class _Qwen4ExpMTPDecodeGraphModel(nn.Module):
     },
 )
 class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
-    # Qwen4Exp repacks the small BF16/shared/MTP tensors separately from the
-    # target experts and PLE tables. Loading the standalone drafter from that
-    # compact shard set avoids scanning the full target checkpoint a second
-    # time. The remaining patterns preserve compatibility with conventional
-    # Hugging Face checkpoint layouts.
+    # A BF16-named shard may contain only KV scales, with the MTP body in
+    # ordinary shards. Select the full checkpoint, including compact BF16
+    # layouts; skip_checkpoint_weight filters target tensors before reading
+    # them in the standard mapped/direct safetensors iterator.
     allow_patterns_overrides = [
-        "model-bf16-*.safetensors",
         "*.safetensors",
         "*.bin",
         "*.pt",

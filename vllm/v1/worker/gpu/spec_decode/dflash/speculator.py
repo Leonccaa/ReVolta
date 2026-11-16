@@ -579,8 +579,8 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.draft_max_seq_len = min(
             max_seq_len + self.num_query_per_req, self.max_model_len
         )
-        self._prepare_proposal_runtime(input_batch, num_sampled, num_rejected)
         self._debug_real_proposal = not dummy_run and not is_profile
+        self._prepare_proposal_runtime(input_batch, num_sampled, num_rejected)
 
         # NOTE: To avoid CPU-GPU synchronization without CPU knowing the
         # number of rejected tokens, we maintain the size of input_ids and

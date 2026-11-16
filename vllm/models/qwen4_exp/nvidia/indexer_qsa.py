@@ -25,7 +25,9 @@ from ..common.qsa_cache import (
     QSAForwardMetadata,
     QSAKeyStateCache,
     canonical_qsa_rope_positions,
+    qsa_index_dcp_sharded,
 )
+from .ops.qsa_coalesce import QSACoalescedExchange
 from .ops.qsa_pre_indexer import qsa_pre_indexer
 
 
@@ -170,6 +172,12 @@ class QSAIndexer(nn.Module):
             cache_config=cache_config,
             vllm_config=vllm_config,
         )
+        if qsa_index_dcp_sharded(
+            vllm_config, self.compressed_key_cache.prefix, self.compress_ratio
+        ):
+            from .ops.qsa import validate_qsa_index_dcp_shard_runtime
+
+            validate_qsa_index_dcp_shard_runtime(self.token_topk // self.compress_ratio)
 
     @property
     def output_width(self) -> int:
@@ -200,6 +208,8 @@ class QSAIndexer(nn.Module):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         out: torch.Tensor | None = None,
+        *,
+        coalesced_exchange: QSACoalescedExchange | None = None,
     ) -> torch.Tensor:
         """Return fixed-width request-relative token indices padded with ``-1``."""
 
@@ -274,14 +284,13 @@ class QSAIndexer(nn.Module):
                 ),
             )
         else:
-            # Unfused reference path
-            from flashinfer.norm import gemma_rmsnorm
-
+            # The torch reference also works where FlashInfer's CuTe RMSNorm
+            # is unsupported (including SM70). Keep the Gemma (1 + weight)
+            # multiplier and normalization in FP32 until the final cast.
             q = projected_q.reshape(-1, self.index_n_heads, self.index_head_dim)
-            q = gemma_rmsnorm(
-                q.reshape(-1, self.index_head_dim),
-                self.q_layernorm.weight,
-                self.q_layernorm.variance_epsilon,
+            q = cast(
+                torch.Tensor,
+                self.q_layernorm.forward_native(q.reshape(-1, self.index_head_dim)),
             ).reshape_as(q)
             q = apply_qsa_rope(self.rotary_emb, positions, q)
 
@@ -307,10 +316,11 @@ class QSAIndexer(nn.Module):
                 self.compress_ratio,
                 rope_position_cache,
             )
-            compressed_keys = gemma_rmsnorm(
-                pooled.reshape(-1, self.index_head_dim),
-                self.k_layernorm.weight,
-                self.k_layernorm.variance_epsilon,
+            compressed_keys = cast(
+                torch.Tensor,
+                self.k_layernorm.forward_native(
+                    pooled.reshape(-1, self.index_head_dim)
+                ),
             ).reshape(-1, 1, self.index_head_dim)
             if getattr(self.rotary_emb, "mrope_section", None):
                 first_positions = first_positions.transpose(0, 1)
@@ -358,6 +368,13 @@ class QSAIndexer(nn.Module):
             shared_key_scoring=self.shared_key_scoring,
             max_seq_len=compressed_metadata.max_seq_len,
             seq_lens_cpu_upper_bound=compressed_metadata.seq_lens_cpu_upper_bound,
+            index_dcp_world_size=compressed_metadata.index_dcp_world_size,
+            index_dcp_rank=compressed_metadata.index_dcp_rank,
+            **(
+                {"coalesced_exchange": coalesced_exchange}
+                if coalesced_exchange is not None
+                else {}
+            ),
         )
 
 

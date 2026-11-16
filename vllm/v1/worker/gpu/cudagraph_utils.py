@@ -22,6 +22,7 @@ from vllm.config.speculative import (
     uses_adaptive_dflash_lookup,
 )
 from vllm.distributed.parallel_state import (
+    GraphCaptureContext,
     get_pp_group,
     graph_capture,
     is_global_first_rank,
@@ -317,6 +318,7 @@ class CudaGraphManager:
 
         self.graphs: dict[BatchExecutionDescriptor, torch.cuda.CUDAGraph] = {}
         self.pool = current_platform.get_global_graph_pool() if cudagraph_mode else None
+        self.capture_context: GraphCaptureContext | None = None
 
         self._graphs_captured = False
         self._candidates: list[list[BatchExecutionDescriptor]] = []
@@ -447,6 +449,13 @@ class CudaGraphManager:
     def needs_capture(self) -> bool:
         return len(self._capture_descs) > 0
 
+    def get_capture_context(self) -> GraphCaptureContext:
+        if self.capture_context is None:
+            self.capture_context = GraphCaptureContext(
+                torch.cuda.Stream(device=self.device)
+            )
+        return self.capture_context
+
     @torch.inference_mode()
     def capture(
         self,
@@ -465,7 +474,7 @@ class CudaGraphManager:
         captured_attn_states: dict[
             BatchExecutionDescriptor, CapturedAttentionState
         ] = {}
-        with graph_capture(device=self.device):
+        with graph_capture(device=self.device, context=self.get_capture_context()):
             # Capture in order: PIECEWISE first, then FULL. PIECEWISE has larger
             # activations so FULL activations should fit in already allocated
             # buffers in the graph pool.
@@ -519,7 +528,11 @@ class CudaGraphManager:
                             # Sync offloader's copy stream before capture.
                             # Finish any pre-capture offloader prefetches.
                             get_offloader().sync_prev_onload()
-                            with torch.cuda.graph(graph, self.pool):
+                            with torch.cuda.graph(
+                                graph,
+                                self.pool,
+                                stream=self.get_capture_context().stream,
+                            ):
                                 forward_fn(CUDAGraphMode.NONE)
                                 # Join offloader's copy stream after forward to avoid
                                 # unjoined stream error. The last layer's start_prefetch
@@ -743,6 +756,23 @@ class ModelCudaGraphManager(CudaGraphManager):
                         assert attn_metadata is None
                     batch_descriptor = BatchDescriptor(
                         num_tokens=num_tokens,
+                        has_lora=has_lora,
+                        attention_context_bucket=desc.attention_context_bucket,
+                    )
+                if (
+                    desc.cg_mode == CUDAGraphMode.FULL
+                    and cg_mode in (CUDAGraphMode.NONE, CUDAGraphMode.FULL)
+                    and envs.REVOLTA_RESEARCH_QSA_DECODE_COALESCE_AG
+                ):
+                    # V2 captures FULL graphs directly. Pass the replicated
+                    # decode plan to opaque QSA ops; metadata alone cannot
+                    # distinguish same-shaped prefill and decode batches.
+                    # Use it for capture warmups too, so kernels/collectives
+                    # are initialized before entering CUDA graph capture.
+                    batch_descriptor = BatchDescriptor(
+                        num_tokens=num_tokens,
+                        num_reqs=num_reqs,
+                        uniform=desc.uniform_token_count is not None,
                         has_lora=has_lora,
                         attention_context_bucket=desc.attention_context_bucket,
                     )

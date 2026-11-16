@@ -43,6 +43,8 @@ class SharedOffloadRegion:
         rank: int | None,
         num_workers: int,
         cpu_page_size: int,
+        *,
+        scheduler_only_unlink: bool = False,
     ) -> None:
         self.page_size = mmap.PAGESIZE
 
@@ -52,20 +54,34 @@ class SharedOffloadRegion:
         self.num_blocks = num_blocks
         self.rank = rank
         self._scheduler_unlink = rank is None
+        self._scheduler_only_unlink = scheduler_only_unlink
         # interleaved-layout stride: one row = all workers' data for one block
+        self.worker_bytes = cpu_page_size
         self._row_stride = cpu_page_size * num_workers
         if rank is not None:
             # byte offset to this worker's first slot within each block row
             self._worker_offset = rank * cpu_page_size
             # exclusive upper bound for this worker's area within each row
             self._worker_area_end = (rank + 1) * cpu_page_size
+        self.fd: int | None = None
+        self.mmap_obj: mmap.mmap | None = None
+        self._base: torch.Tensor | None = None
+        self._views: list[torch.Tensor] = []
+        self.is_pinned = False
+        try:
+            self._open_mapping(rank, num_blocks, cpu_page_size)
+        except BaseException:
+            # A parent HostRegionOwner tracks scheduler-only names even if
+            # this constructor never returns to its caller.
+            self.cleanup()
+            raise
+
+    def _open_mapping(self, rank: int | None, num_blocks: int, cpu_page_size: int):
         try:
             # Exclusive create — only one worker succeeds
-            self.fd: int | None = os.open(
-                self.mmap_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600
-            )
-            os.ftruncate(self.fd, self.total_size_bytes)
+            self.fd = os.open(self.mmap_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
             self._creator = True
+            os.ftruncate(self.fd, self.total_size_bytes)
             logger.info(
                 "Created mmap file %s (%.2f GB)",
                 self.mmap_path,
@@ -76,7 +92,7 @@ class SharedOffloadRegion:
             _wait_for_file_size(self.fd, self.total_size_bytes)
             logger.info("Opened existing mmap file %s", self.mmap_path)
 
-        self.mmap_obj: mmap.mmap | None = mmap.mmap(
+        self.mmap_obj = mmap.mmap(
             self.fd,
             self.total_size_bytes,
             flags=mmap.MAP_SHARED,
@@ -112,8 +128,6 @@ class SharedOffloadRegion:
             )
 
         self._base = torch.frombuffer(memoryview(self.mmap_obj), dtype=torch.int8)
-        self._views: list[torch.Tensor] = []
-        self.is_pinned: bool = False
 
     def create_next_view(self, tensor_page_size: int) -> torch.Tensor:
         """Allocate a strided int8 view for this worker, one canonical tensor.
@@ -138,6 +152,7 @@ class SharedOffloadRegion:
             tensor_page_size: Bytes per block for this  tensor.
         """
         assert self.rank is not None
+        assert self._base is not None
         new_offset = self._worker_offset + tensor_page_size
         assert new_offset <= self._worker_area_end, (
             f"Worker offset {new_offset} exceeds worker area end "
@@ -154,12 +169,35 @@ class SharedOffloadRegion:
         self._views.append(worker_layer_view)
         return worker_layer_view
 
+    def create_view_at(self, offset: int, length: int) -> torch.Tensor:
+        """Overlapping kind view at an explicit offset in this rank's frame.
+
+        Does not advance the MAIN/index view cursor and owns no registration.
+        Every component ID indexes the same physical row on every rank.
+        """
+        if self.rank is None or self._base is None:
+            raise ValueError("Kind views require a worker mapping")
+        # _worker_area_end is fixed even after create_next_view advanced the
+        # cursor. Derive the frame width from rank, not that cursor.
+        worker_bytes = self.worker_bytes
+        if offset < 0 or length <= 0 or offset + length > worker_bytes:
+            raise ValueError("Kind view exceeds its unified frame")
+        view = torch.as_strided(
+            self._base,
+            size=(self.num_blocks, length),
+            stride=(self._row_stride, 1),
+            storage_offset=self.rank * worker_bytes + offset,
+        )
+        self._views.append(view)
+        return view
+
     def create_kv_memoryview(self) -> memoryview:
         """Return a zero-copy memoryview over the entire KV buffer.
 
         Shape: (num_blocks, row_stride_bytes). Secondary tiers address
         block *b* as ``view[b]``.
         """
+        assert self._base is not None
         kv_tensor = self._base.view(self.num_blocks, self._row_stride)
         np_arr = kv_tensor.numpy()
         assert np_arr.ctypes.data == self._base.data_ptr(), (
@@ -196,11 +234,19 @@ class SharedOffloadRegion:
             except Exception:
                 logger.warning("Failed to close fd %s", self.fd, exc_info=True)
             self.fd = None
+        self.unlink()
+
+    def unlink(self) -> None:
+        """Remove the name if this mapping owns it; mappings stay valid.
+
+        The kernel frees the backing when the last mapping goes away.
+        """
         # Engine shutdown stops workers before the scheduler. The scheduler
         # therefore owns final unlink even if a worker won the creation race.
-        if (self._creator or self._scheduler_unlink) and getattr(
-            self, "mmap_path", None
-        ):
+        if (
+            self._scheduler_unlink
+            or (self._creator and not self._scheduler_only_unlink)
+        ) and getattr(self, "mmap_path", None):
             try:
                 os.unlink(self.mmap_path)
                 logger.info("Removed mmap file %s", self.mmap_path)

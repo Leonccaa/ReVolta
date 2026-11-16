@@ -261,6 +261,25 @@ def _runtime_ok(x: torch.Tensor, weight: torch.Tensor) -> bool:
     )
 
 
+_ROUTER_BATCH_SHAPE = (512, 2560)
+
+
+def _router_batch_shape_ok(prefix: str, shape: tuple[int, int]) -> bool:
+    """The packed M5/M10 router kernel is built for the Flash-Next router
+    [512 experts, 2560]. Other widths (smaller test models) keep the plain
+    FP16 GEMV route."""
+    if shape == _ROUTER_BATCH_SHAPE:
+        return True
+    logger.info_once(
+        "SM70 MTP router batch pack skipped for %s: shape %s is not %s.",
+        prefix,
+        shape,
+        _ROUTER_BATCH_SHAPE,
+        scope="process",
+    )
+    return False
+
+
 def _pack_router_batch_weight(weight: torch.Tensor) -> torch.Tensor:
     """Keep four K640 partitions contiguous for each N8 output tile."""
     if weight.dtype != torch.float16 or weight.shape != (512, 2560):
@@ -794,9 +813,11 @@ def enable_qwen38_sm70_fp16_gemv(
             child.forward_fused_silu_and_mul = MethodType(
                 _forward_shared_batch_silu, child
             )
-        if envs.VLLM_SM70_MTP_ROUTER_BATCH and str(
-            getattr(child, "prefix", "")
-        ).endswith(_ROUTER_SUFFIX):
+        if (
+            envs.VLLM_SM70_MTP_ROUTER_BATCH
+            and str(getattr(child, "prefix", "")).endswith(_ROUTER_SUFFIX)
+            and _router_batch_shape_ok(prefix, shape)
+        ):
             from .sm70_fp16_hc import _mtp_batch_runtime_contract
 
             if _mtp_batch_runtime_contract(vllm_config):

@@ -1482,6 +1482,9 @@ package_data = {
         "model_executor/layers/quantization/utils/configs/*.json",
         "entrypoints/serve/instrumentator/static/*.js",
         "entrypoints/serve/instrumentator/static/*.css",
+        "entrypoints/serve/dashboard/static/*.html",
+        "entrypoints/serve/dashboard/static/*.css",
+        "entrypoints/serve/dashboard/static/*.mjs",
         "distributed/kv_transfer/kv_connector/v1/hf3fs/utils/*.cpp",
         # DeepGEMM JIT include headers (vendored via cmake)
         "third_party/deep_gemm/include/**/*.cuh",

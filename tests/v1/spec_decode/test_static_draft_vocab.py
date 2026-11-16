@@ -3,12 +3,15 @@
 
 from collections import OrderedDict
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
+from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 from vllm.v1.spec_decode.static_draft_vocab import (
     DynamicDraftVocabPrefillBootstrapState,
+    StaticDraftVocabRuntime,
     build_static_draft_vocab_tp_plan,
     compact_dynamic_draft_vocab_tail_state,
     initialize_dynamic_draft_vocab,
@@ -20,6 +23,38 @@ from vllm.v1.spec_decode.static_draft_vocab import (
     update_dynamic_draft_vocab_lru_state,
     validate_dynamic_draft_vocab_prefill_topk,
 )
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("local_argmax", [False, True])
+def test_static_draft_vocab_greedy_mapping(enabled, local_argmax) -> None:
+    hidden = torch.eye(2)
+    weight = torch.tensor([[0.0, 1.0], [9.0, 0.0], [1.0, 2.0], [0.0, 8.0]])
+    token_map = torch.tensor([3, 0, 2])
+    reduced_head = weight[token_map]
+    proposer = object.__new__(SpecDecodeBaseProposer)
+    proposer.method = "mtp"
+    proposer.use_local_argmax_reduction = local_argmax
+    proposer.model = SimpleNamespace(
+        compute_logits=lambda h, **kw: h @ weight.T,
+        get_top_tokens=lambda h, **kw: (h @ weight.T).argmax(-1),
+    )
+    proposer._static_draft_vocab = None
+    if enabled:
+        processor = SimpleNamespace(
+            get_top_tokens=Mock(side_effect=lambda head, h: (h @ head.T).argmax(-1)),
+        )
+        proposer._static_draft_vocab = StaticDraftVocabRuntime(
+            reduced_head, processor, token_map, 4, 3, None
+        )
+        proposer._compute_logits_for_step = lambda h, step: h @ reduced_head.T
+    expected_logits = hidden @ weight.T
+    if enabled:
+        expected_logits[:, 1] = -torch.inf
+    actual = proposer._greedy_sample(hidden)
+    assert actual.numpy().tobytes() == expected_logits.argmax(-1).numpy().tobytes()
+    if enabled and local_argmax:
+        processor.get_top_tokens.assert_called_once_with(reduced_head, hidden)
 
 
 def test_dynamic_draft_vocab_is_the_default_mtp_route(monkeypatch) -> None:
@@ -145,6 +180,14 @@ def test_build_static_draft_vocab_tp_plan_balances_global_selection() -> None:
     assert plan.destination_token_ids == ((0, 1, 2), (3, 4, 5))
     assert plan.split_matrix == ((3, 1), (0, 2))
     assert plan.gathered_token_ids == (0, 1, 2, 3, 4, 5)
+
+
+@pytest.mark.parametrize("size", [32768, 49152, 65536, 98304])
+def test_static_draft_vocab_tp4_shapes(size) -> None:
+    plan = build_static_draft_vocab_tp_plan(
+        range(248320), [(r * 62080, (r + 1) * 62080) for r in range(4)], size
+    )
+    assert [len(ids) for ids in plan.destination_token_ids] == [size // 4] * 4
 
 
 def test_build_static_draft_vocab_tp_plan_rejects_duplicates() -> None:

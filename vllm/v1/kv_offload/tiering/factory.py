@@ -63,3 +63,9 @@ SecondaryTierFactory.register_tier(
     "vllm.v1.kv_offload.tiering.fs.manager",
     "FileSystemTierManager",
 )
+
+SecondaryTierFactory.register_tier(
+    "revolta_fs",
+    "vllm.v1.kv_offload.tiering.fs.revolta",
+    "RevoltaFileSystemTierManager",
+)

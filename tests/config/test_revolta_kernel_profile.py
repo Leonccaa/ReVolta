@@ -27,7 +27,7 @@ def test_cascade_profile_preserves_explicit_choices(
     profile.apply_revolta_kernel_profile(kernel, enabled=enabled)
     assert kernel.ple_disk_cascade is expected
     audit = json.loads(profile.profile_audit(enabled=enabled, kernel_config=kernel))
-    assert len(audit["values"]) == 45
+    assert len(audit["values"]) == 46
     assert "ple_disk_cascade" not in audit["values"]
     assert audit["kernel_config"]["ple_disk_cascade"] == {
         "value": expected,

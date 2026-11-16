@@ -2347,6 +2347,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         self.num_k_heads = config.linear_num_key_heads
         self.num_v_heads = config.linear_num_value_heads
+        for name, heads in (
+            ("linear_num_key_heads", self.num_k_heads),
+            ("linear_num_value_heads", self.num_v_heads),
+        ):
+            if heads % self.tp_size:
+                raise ValueError(
+                    f"GDN {name}={heads} must be divisible by "
+                    f"tensor_parallel_size={self.tp_size}"
+                )
         self.head_k_dim = config.linear_key_head_dim
         self.head_v_dim = config.linear_value_head_dim
         self.conv_kernel_size = config.linear_conv_kernel_dim
@@ -2494,6 +2503,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.spec_state_replay = bool(
             vllm_config.speculative_config is not None
             and vllm_config.speculative_config.gdn_spec_state_replay
+        )
+        self._replay_general_geometry = bool(
+            self.spec_state_replay
+            and vllm_config.speculative_config is not None
+            and not vllm_config.speculative_config.use_dflash()
         )
         if self.spec_state_replay:
             self._init_spec_state_replay(vllm_config)
@@ -5351,6 +5365,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         """
         return self.spec_state_replay or _sm70_mixed_qkv_verify_tokens_ok(num_tokens)
 
+    def _mixed_qkv_verify_geometry_supported(self) -> bool:
+        # The legacy shape band is a dispatch policy, not a kernel limit.
+        # Non-DFlash replay uses the general kernel geometry; DFlash keeps
+        # its existing dispatch policy.
+        return self._replay_general_geometry or (
+            self.num_k_heads // self.tp_size == 4
+            and self.num_v_heads // self.tp_size == 12
+            and self.head_k_dim == self.head_v_dim == 128
+        )
+
     def _replay_reads_strided_qkv(self, mixed_qkv: torch.Tensor | None) -> bool:
         """Whether replay lets the mixed-QKV verifier read row-strided input.
 
@@ -5659,12 +5683,22 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
                 mixed_qkv_spec = mixed_qkv
                 mixed_qkv_non_spec = None
+                # Non-spec rows must read the **gathered** gate so they stay
+                # in step with their QKV rows. The gather used to happen only in
+                # the prefill branch below, so a pure-decode batch consumed the
+                # un-gathered gate -> misaligned gating -> wrong mamba state
+                # recurrence -> degenerate output (repetition loops) and draft
+                # tokens that never match.
+                a_non_spec, b_non_spec = None, None
             else:
                 mixed_qkv_spec = mixed_qkv.index_select(0, spec_token_indx)
                 mixed_qkv_non_spec = mixed_qkv.index_select(0, non_spec_token_indx)
+                a_non_spec = a.index_select(0, non_spec_token_indx)
+                b_non_spec = b.index_select(0, non_spec_token_indx)
         else:
             mixed_qkv_spec = None
             mixed_qkv_non_spec = mixed_qkv
+            a_non_spec, b_non_spec = a, b
 
         if mixed_qkv_non_spec is not None:
             _sm70_gdn_graph_buffer_copy(
@@ -5912,9 +5946,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and ddtree_parent_ids is None
             and attn_metadata.num_spec_decodes > 0
             and current_platform.is_device_capability(70)
-            and self.num_k_heads // self.tp_size == 4
-            and self.num_v_heads // self.tp_size == 12
-            and self.head_k_dim == self.head_v_dim == 128
+            and self._mixed_qkv_verify_geometry_supported()
             and ssm_state.dtype == torch.float32
             and mixed_qkv_spec is not None
             and (
@@ -5941,12 +5973,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             assert mixed_qkv_non_spec is not None, (
                 "mixed_qkv_non_spec must be provided for prefill path"
             )
-            if spec_sequence_masks is not None:
-                a_non_spec = a.index_select(0, non_spec_token_indx)
-                b_non_spec = b.index_select(0, non_spec_token_indx)
-            else:
-                a_non_spec = a
-                b_non_spec = b
+            # a_non_spec / b_non_spec are gathered once at the spec/non-spec
+            # split above; do not re-derive them here.
 
             if self.enable_sm70_legacy_prefill_prep:
                 query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(
@@ -6166,7 +6194,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     raise RuntimeError(
                         "GDN speculative state replay records the mixed-QKV "
                         "verifier's inputs; this batch took the split q/k/v "
-                        "verifier. Set sm70_dflash2.spec_state_replay=false."
+                        "verifier. Set gdn_state_replay=false (or the legacy "
+                        "sm70_dflash2.spec_state_replay=false for DFlash)."
                     )
                 assert query_spec is not None
                 assert key_spec is not None
@@ -6331,8 +6360,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out_non_spec, last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,
-                    a=a,
-                    b=b,
+                    a=a_non_spec,
+                    b=b_non_spec,
                     dt_bias=self.dt_bias,
                     q=query_non_spec,
                     k=key_non_spec,

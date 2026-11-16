@@ -190,3 +190,72 @@ def test_reserved_block_count_matches_speculative_tail(spec, expected) -> None:
         )
         == expected
     )
+
+
+def test_warmup_numbers_block_ids_per_block_space(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Long-context mode: the state and history spaces number their blocks
+    independently, so warmup must keep each group's IDs inside its space and
+    size the batch by the tighter space."""
+    from vllm.v1.kv_cache_interface import KVBlockSegments
+
+    attention_spec = _full_attention_spec()
+    mamba_spec = _mamba_spec("align")
+    # Space 0 (state) holds 2 requests' worst-case states, space 1 is roomy.
+    # A decode step of the default 6-token prompt with 4 speculative tokens.
+    per_request_states = _reserved_block_count(
+        6 + 1 + 4,
+        mamba_spec,
+        num_lookahead_tokens=4,
+        max_model_len=64,
+        max_encoder_len=0,
+    )
+    segments = KVBlockSegments(
+        names=("state", "history"),
+        num_blocks=(2 * per_request_states + 1, 64),
+        group_segments=(1, 0),
+        primary=1,
+    )
+    runner = SimpleNamespace(
+        num_speculative_steps=4,
+        scheduler_config=SimpleNamespace(max_num_seqs=4, max_num_batched_tokens=128),
+        max_model_len=64,
+        compilation_config=SimpleNamespace(static_forward_context={}),
+        kv_cache_config=SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(kv_cache_spec=attention_spec),
+                SimpleNamespace(kv_cache_spec=mamba_spec),
+            ],
+            num_blocks=64,
+            block_segments=segments,
+        ),
+        vllm_config=SimpleNamespace(num_lookahead_tokens=4),
+        model_state=SimpleNamespace(max_encoder_len=0),
+        is_pooling_model=False,
+        is_last_pp_rank=True,
+        model_config=SimpleNamespace(get_vocab_size=lambda: 64),
+        kv_connector=SimpleNamespace(set_disabled=lambda disabled: None),
+    )
+    executions: list[Any] = []
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    warmup_kernels(runner, executions.append, lambda _: None)
+
+    prefill = executions[0]
+    assert len(prefill.scheduled_new_reqs) == 2  # limited by the state space
+    ids: list[list[int]] = [[], []]
+    for req in prefill.scheduled_new_reqs:
+        for group_id, block_ids in enumerate(req.block_ids):
+            ids[group_id].extend(block_ids)
+    decode = executions[1].scheduled_cached_reqs
+    for new in decode.new_block_ids:
+        for group_id, block_ids in enumerate(new or ()):
+            ids[group_id].extend(block_ids)
+    for group_id, space in enumerate(segments.group_segments):
+        assert ids[group_id]
+        assert len(set(ids[group_id])) == len(ids[group_id])
+        assert (
+            min(ids[group_id]) > 0 and max(ids[group_id]) < (segments.num_blocks[space])
+        )
+    # Both spaces start at block 1: the IDs overlap across groups.
+    assert set(ids[0]) & set(ids[1])

@@ -57,6 +57,12 @@ class StreamingUpdate:
 
 
 class Request:
+    # Immutable defaults keep disabled telemetry out of each request's field
+    # dictionary. Lifecycle accounting materializes only fields it changes.
+    prefix_cache_attempt: int = 0
+    prefix_cache_recorded_attempt: int = -1
+    store_attempt: Any = None
+
     def __init__(
         self,
         request_id: str,
@@ -149,6 +155,9 @@ class Request:
         # and PP run ahead of the GPU); `num_computed_tokens` counts them
         # optimistically.
         self.num_in_flight_tokens = 0
+        # Of those, tokens scheduled for a streaming-input turn that has
+        # already stopped: their outputs are discarded when they return.
+        self.num_stale_in_flight_tokens = 0
 
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0

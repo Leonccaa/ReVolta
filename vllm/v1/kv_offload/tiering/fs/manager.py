@@ -65,6 +65,7 @@ class FileSystemTierManager(SecondaryTierManager):
         max_size_bytes: int | None = None,
         min_free_bytes: int | None = None,
         max_files: int = 1_000_000,
+        external_eviction: bool = False,
     ):
         """
         Args:
@@ -92,20 +93,10 @@ class FileSystemTierManager(SecondaryTierManager):
         root_dir = os.path.realpath(root_dir)
 
         # Create file mapper
-        self.file_mapper = FileMapper.from_offloading_spec(
-            root_dir=root_dir,
-            offloading_spec=offloading_spec,
-            gpu_blocks_per_file=offloading_spec.block_size_factor,
-        )
+        self.file_mapper = self._make_file_mapper(root_dir, offloading_spec)
 
         # Write config file
-        config_path = self.file_mapper.get_config_file_path()
-        os.makedirs(os.path.dirname(config_path), exist_ok=True)
-        if not os.path.exists(config_path):
-            with open(config_path, "w") as f:
-                json.dump(
-                    self.file_mapper.get_run_config(), f, indent=2, sort_keys=True
-                )
+        self._write_run_config()
 
         if (
             n_read_threads < 0
@@ -114,7 +105,7 @@ class FileSystemTierManager(SecondaryTierManager):
         ):
             raise ValueError("FS tier requires at least one I/O thread")
         self._cache = FileSystemCache.acquire(
-            root_dir, max_size_bytes, min_free_bytes, max_files
+            root_dir, max_size_bytes, min_free_bytes, max_files, external_eviction
         )
         self._closed = False
         try:
@@ -122,10 +113,33 @@ class FileSystemTierManager(SecondaryTierManager):
                 n_read_threads,
                 n_write_threads,
                 thread_name_prefix="vllm_kv_py_fs",
+                **self._pool_options(),
             )
         except BaseException:
             self._cache.release()
             raise
+
+    def _pool_options(self) -> dict:
+        """Extra DualQueueThreadPool options (none for the plain fs tier)."""
+        return {}
+
+    def _make_file_mapper(
+        self, root_dir: str, offloading_spec: "OffloadingSpec"
+    ) -> FileMapper:
+        return FileMapper.from_offloading_spec(
+            root_dir=root_dir,
+            offloading_spec=offloading_spec,
+            gpu_blocks_per_file=offloading_spec.block_size_factor,
+        )
+
+    def _write_run_config(self) -> None:
+        config_path = self.file_mapper.get_config_file_path()
+        os.makedirs(os.path.dirname(config_path), exist_ok=True)
+        if not os.path.exists(config_path):
+            with open(config_path, "w") as f:
+                json.dump(
+                    self.file_mapper.get_run_config(), f, indent=2, sort_keys=True
+                )
 
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         return RequestOffloadingContext()
@@ -192,6 +206,10 @@ class FileSystemTierManager(SecondaryTierManager):
         active threads to complete.
         """
         if not self._closed:
-            self._pool.shutdown(wait=True)
+            deadline = getattr(self, "_shutdown_deadline", None)
+            if deadline is None:
+                self._pool.shutdown(wait=True)
+            else:
+                self._pool.shutdown(wait=True, deadline=deadline)
             self._cache.release()
             self._closed = True

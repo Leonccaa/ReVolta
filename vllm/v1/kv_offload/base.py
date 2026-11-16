@@ -50,6 +50,12 @@ class ReqContext:
     kv_transfer_params: dict[str, Any] | None = None
 
 
+SUPERSEDED_STATE_RULES = ("request", "request_fixed", "extend")
+# Values of kv_connector_extra_config "cpu.draft_offload" (see
+# OffloadingSpec.cpu_draft_offload).
+CPU_DRAFT_OFFLOAD_MODES = ("all", "window", "none")
+
+
 class OffloadPolicy(Enum):
     # Offload only newly-computed blocks as they arrive; prefix-hit
     # blocks (already offloaded by a prior request) are skipped.
@@ -272,6 +278,9 @@ class OffloadingManager(ABC):
         """Evict all tracked blocks and reset internal state."""
         return
 
+    def set_shutdown_deadline(self, deadline: float) -> None:
+        self._shutdown_deadline = deadline
+
     def shutdown(self) -> None:
         """Shutdown the manager and release any resources."""
         return
@@ -356,6 +365,14 @@ class CanonicalKVCacheRef:
     # The un-padded page size per block in bytes
     page_size_bytes: int
 
+    # Optional worker ABI details used by long-context unified views.
+    subdivision: int = 1
+    dtypes: tuple[str, ...] = ()
+    scale: str = "none"
+    # Logical Mamba state tensors inside the transferred physical prefix.
+    member_offsets: tuple[int, ...] = ()
+    member_lengths: tuple[int, ...] = ()
+
 
 @dataclass
 class CanonicalKVCaches:
@@ -404,6 +421,59 @@ class OffloadingSpec(ABC):
         # they are evicted before other conversations' reusable prefixes.
         self.demote_superseded_states: bool = bool(
             self.extra_config.get("demote_superseded_states", True)
+        )
+        # Which states a finished request demotes (see
+        # OffloadingConnectorScheduler._demote_superseded_states):
+        #   request        its own states in [hit, last block - 3), the last
+        #                  block counted with decode output (historical)
+        #   request_fixed  the same, the last block counted from the prompt,
+        #                  since decode-time states are never offloaded
+        #   extend         request_fixed + the state at the hit point once this
+        #                  request stored a newer state past it
+        # Junctions (shared prefixes) are never demoted.
+        self.superseded_state_rule: str = str(
+            self.extra_config.get("superseded_state_rule", "request")
+        )
+        if self.superseded_state_rule not in SUPERSEDED_STATE_RULES:
+            raise ValueError(
+                f"superseded_state_rule must be one of {SUPERSEDED_STATE_RULES}, "
+                f"got {self.superseded_state_rule!r}"
+            )
+        # "cpu.draft_offload": which blocks of a speculative draft model's
+        # sliding-window KV cache group are offloaded (see
+        # OffloadingConnectorScheduler). The draft KV is projected from target
+        # hidden states, so a missing draft window limits a prefix hit to
+        # where the window is complete:
+        #   all     every block (historical behaviour)
+        #   window  only the window before each boundary at which this request
+        #           stores a recurrent state, and before its shared-prefix
+        #           junction; other draft blocks are skipped
+        #   none    no draft block; the tier then cannot serve a prefix hit
+        #           that needs a draft window
+        self.cpu_draft_offload: str = str(
+            self.extra_config.get("cpu.draft_offload", "all")
+        )
+        if self.cpu_draft_offload not in CPU_DRAFT_OFFLOAD_MODES:
+            raise ValueError(
+                f"cpu.draft_offload must be one of {CPU_DRAFT_OFFLOAD_MODES}, "
+                f"got {self.cpu_draft_offload!r}"
+            )
+
+        for key in (
+            "cpu.enable_dependency_eviction",
+            "cpu.residency_stats",
+            "cpu.offload_counters",
+        ):
+            if type(self.extra_config.get(key, False)) is not bool:
+                raise ValueError(f"{key} must be a bool")
+        self.cpu_enable_dependency_eviction: bool = self.extra_config.get(
+            "cpu.enable_dependency_eviction", False
+        )
+        self.cpu_residency_stats: bool = self.extra_config.get(
+            "cpu.residency_stats", False
+        )
+        self.cpu_offload_counters: bool = self.extra_config.get(
+            "cpu.offload_counters", False
         )
 
         parallel_config = vllm_config.parallel_config

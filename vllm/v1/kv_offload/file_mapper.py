@@ -74,8 +74,13 @@ class FileMapper:
         offloading_spec: OffloadingSpec,
         gpu_blocks_per_file: int = 1,
         parallel_agnostic: bool = False,
+        extra_layout: dict | None = None,
     ) -> "FileMapper":
-        """Build a FileMapper from an OffloadingSpec."""
+        """Build a FileMapper from an OffloadingSpec.
+
+        ``extra_layout`` is merged into the spec's persistent layout, so a tier
+        can bind its own on-disk format and identity into the directory hash.
+        """
         vllm_config = offloading_spec.vllm_config
         kv_cache_config = offloading_spec.kv_cache_config
 
@@ -101,7 +106,9 @@ class FileMapper:
             dtype=dtype,
             kv_cache_groups=kv_cache_groups,
             parallel_agnostic=parallel_agnostic,
-            persistent_layout=getattr(offloading_spec, "persistent_layout", None),
+            persistent_layout=_merge_layout(
+                getattr(offloading_spec, "persistent_layout", None), extra_layout
+            ),
         )
 
     def get_file_name(self, key: OffloadKey) -> str:
@@ -132,3 +139,11 @@ class FileMapper:
         ]
         safe_model_name = fields["model_name"].replace("/", "_")
         return f"{root_dir}/{safe_model_name}_{digest}"
+
+
+def _merge_layout(base: dict | None, extra: dict | None) -> dict | None:
+    if not extra:
+        return base
+    merged = dict(base or {})
+    merged.update(extra)
+    return merged

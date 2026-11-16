@@ -236,9 +236,16 @@ class SchedulerInterface(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def shutdown(self) -> None:
-        """Shutdown the scheduler."""
+    def shutdown(self, deadline: float | None = None) -> None:
+        """Shutdown using the engine's shared absolute monotonic deadline."""
         raise NotImplementedError
 
     def get_kv_connector(self) -> "KVConnectorBase_V1 | None":
         return None
+
+    def get_idle_stats(self) -> "tuple[SchedulerStats | None, float | None]":
+        """Return due idle statistics and seconds until the next export.
+
+        None as the timeout disables timed wakeups for statistics.
+        """
+        return None, None

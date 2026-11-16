@@ -34,7 +34,9 @@ and has the generic `linux_x86_64` tag.
 pip install "https://github.com/Leonccaa/ReVolta/releases/download/v0.1.4/revolta-0.1.4-cp312-cp312-linux_x86_64.whl"
 ```
 
-ReVolta does not send the anonymous usage statistics that upstream vLLM reports.
+ReVolta does not report to the upstream vLLM statistics server. It sends its own
+anonymous usage report; see [Anonymous usage statistics](usage-stats.md) for what it
+contains and how to turn it off.
 
 Or use the Docker image:
 

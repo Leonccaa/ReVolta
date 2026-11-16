@@ -545,6 +545,11 @@ def validate_api_server_args(args):
 def setup_server(args):
     """Validate API server args and create the server socket."""
 
+    if getattr(args, "enable_dashboard", False):
+        from vllm.entrypoints.serve.dashboard.api_router import initialize_dashboard
+
+        initialize_dashboard(args)
+
     log_version_and_model(logger, VLLM_VERSION, args.model)
     log_non_default_args(args)
 

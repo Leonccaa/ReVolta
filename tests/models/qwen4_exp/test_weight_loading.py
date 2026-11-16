@@ -19,19 +19,9 @@ from vllm.models.qwen4_exp.nvidia.model import (
     _validate_qsa_e4m3_scale_load,
 )
 from vllm.models.qwen4_exp.nvidia.mtp import (
-    Qwen4ExpMTP,
     _validate_mtp_expert_weights_loaded,
 )
 from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAAttention
-
-
-def test_mtp_loader_prefers_compact_bf16_checkpoint_shards() -> None:
-    assert Qwen4ExpMTP.allow_patterns_overrides == [
-        "model-bf16-*.safetensors",
-        "*.safetensors",
-        "*.bin",
-        "*.pt",
-    ]
 
 
 @pytest.mark.parametrize(

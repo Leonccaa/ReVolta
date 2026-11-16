@@ -27,7 +27,9 @@ from vllm.v1.metrics.stats import (
     PromptTokenStats,
     SchedulerStats,
 )
+from vllm.v1.metrics.store import StoreMetricsProm
 from vllm.v1.metrics.utils import create_metric_per_engine
+from vllm.v1.spec_decode.lookup_metrics import LookupStatsFrontend, LookupStatsProm
 from vllm.v1.spec_decode.metrics import SpecDecodingLogging, SpecDecodingProm
 
 logger = init_logger(__name__)
@@ -110,6 +112,7 @@ class LoggingStatLogger(StatLoggerBase):
         self.connector_prefix_caching_metrics = CachingMetrics()
         self.mm_caching_metrics = CachingMetrics()
 
+        self.lookup_stats_logging = LookupStatsFrontend(vllm_config)
         self.spec_decoding_logging = SpecDecodingLogging()
         kv_transfer_config = self.vllm_config.kv_transfer_config
         self.kv_connector_logging = KVConnectorLogging(kv_transfer_config)
@@ -170,6 +173,10 @@ class LoggingStatLogger(StatLoggerBase):
             self._track_iteration_stats(iteration_stats)
 
         if scheduler_stats is not None:
+            if scheduler_stats.lookup_stats is not None:
+                self.lookup_stats_logging.observe(
+                    scheduler_stats.lookup_stats, engine_idx
+                )
             self.prefix_caching_metrics.observe(scheduler_stats.prefix_cache_stats)
 
             if scheduler_stats.connector_prefix_cache_stats is not None:
@@ -273,6 +280,7 @@ class LoggingStatLogger(StatLoggerBase):
             *log_args,
         )
 
+        self.lookup_stats_logging.log(log_fn, self.log_prefix)
         self.spec_decoding_logging.log(log_fn=log_fn)
         self.kv_connector_logging.log(log_fn=log_fn)
         if self.cudagraph_logging is not None:
@@ -435,6 +443,9 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         }
         per_engine_labelvalues = self.per_engine_labelvalues
 
+        self.lookup_stats_prom = LookupStatsProm(
+            vllm_config, labelnames, per_engine_labelvalues
+        )
         self.spec_decoding_prom = self._spec_decoding_cls(
             vllm_config.speculative_config, labelnames, per_engine_labelvalues
         )
@@ -443,6 +454,17 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
         self.perf_metrics_prom = self._perf_metrics_cls(
             vllm_config, labelnames, per_engine_labelvalues
+        )
+        self.store_metrics_prom = (
+            StoreMetricsProm(
+                self._counter_cls,
+                self._gauge_cls,
+                self._histogram_cls,
+                labelnames,
+                per_engine_labelvalues,
+            )
+            if vllm_config.observability_config.enable_store_metrics
+            else None
         )
 
         #
@@ -518,7 +540,10 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
 
         gauge_kv_cache_usage = self._gauge_cls(
             name="vllm:kv_cache_usage_perc",
-            documentation="KV-cache usage. 1 means 100 percent usage.",
+            documentation=(
+                "Maximum allocatable usage across GPU KV segments; elastic "
+                "segments subtract their hot floor. 1 means 100 percent."
+            ),
             multiprocess_mode="mostrecent",
             labelnames=labelnames,
         )
@@ -542,7 +567,8 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         counter_prefix_cache_queries = self._counter_cls(
             name="vllm:prefix_cache_queries",
             documentation=(
-                "Prefix cache queries, in terms of number of queried tokens."
+                "Prefix tokens queried by admitted requests, once per "
+                "admission attempt."
             ),
             labelnames=labelnames,
         )
@@ -566,8 +592,8 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         counter_connector_prefix_cache_queries = self._counter_cls(
             name="vllm:external_prefix_cache_queries",
             documentation=(
-                "External prefix cache queries from KV connector "
-                "cross-instance cache sharing, in terms of number of queried tokens."
+                "External prefix tokens queried by admitted requests, once per "
+                "admission attempt. Admission does not prove successful restoration."
             ),
             labelnames=labelnames,
         )
@@ -1064,6 +1090,11 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
     ):
         """Log to prometheus."""
         if scheduler_stats is not None:
+            if (
+                scheduler_stats.store_stats is not None
+                and self.store_metrics_prom is not None
+            ):
+                self.store_metrics_prom.observe(scheduler_stats.store_stats, engine_idx)
             self.gauge_scheduler_running[engine_idx].set(
                 scheduler_stats.num_running_reqs
             )
@@ -1095,6 +1126,8 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                     scheduler_stats.connector_prefix_cache_stats.hits
                 )
 
+            if scheduler_stats.lookup_stats is not None:
+                self.lookup_stats_prom.observe(scheduler_stats.lookup_stats, engine_idx)
             if scheduler_stats.spec_decoding_stats is not None:
                 self.spec_decoding_prom.observe(
                     scheduler_stats.spec_decoding_stats, engine_idx

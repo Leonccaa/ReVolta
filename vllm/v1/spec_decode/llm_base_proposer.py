@@ -659,6 +659,11 @@ class SpecDecodeBaseProposer:
                 return self._compute_logits_for_step(
                     hidden_states, spec_step_idx
                 ).argmax(dim=-1)
+            if self.use_local_argmax_reduction:
+                token_ids = self._static_draft_vocab.logits_processor.get_top_tokens(
+                    self._static_draft_vocab.lm_head, hidden_states
+                )
+                return self._static_draft_vocab.token_id_map[token_ids]
             token_ids = self._compute_logits_for_step(
                 hidden_states, spec_step_idx
             ).argmax(dim=-1)
@@ -2475,11 +2480,6 @@ class SpecDecodeBaseProposer:
             raise ValueError("Dynamic GPU LRU requires a dynamic draft tail.")
         if gpu_lru_enabled and not fused_proposal_enabled:
             raise ValueError("Dynamic GPU LRU requires fused TP2/TP4 proposal.")
-        if not self._enable_probabilistic_draft_probs:
-            raise ValueError(
-                "Static draft vocabulary phase one requires standard "
-                "probabilistic rejection sampling."
-            )
         target_lm_head = getattr(self.model, "lm_head", None)
         if target_lm_head is None or not hasattr(target_lm_head, "weight"):
             raise ValueError("MTP model does not expose a shared target LM-head.")

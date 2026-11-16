@@ -16,6 +16,7 @@ from vllm.tracing import instrument
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.system_utils import update_environment_variables
 from vllm.v1.kv_cache_interface import KVCacheSpec
+from vllm.v1.spec_decode.lookup_quarantine import isolated
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -224,6 +225,8 @@ class WorkerWrapperBase:
         self.vllm_config: VllmConfig
 
     def shutdown(self) -> None:
+        if isolated(self):
+            return
         if self.worker is not None:
             self.worker.shutdown()
 

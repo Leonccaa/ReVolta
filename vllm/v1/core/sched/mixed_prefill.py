@@ -41,8 +41,10 @@ class MixedPrefillBudget:
         )
         desired = self.target_ms / self.ms_per_token
         # Grow slowly on fast devices; react promptly to a long-context stall.
-        desired = min(desired, self.tokens * 1.25)
+        # Growth is at least one quantum, otherwise a budget at or below three
+        # quanta can never round back up after a stall (48 * 1.25 -> 48).
         quantum = min(16, self.max_tokens)
+        desired = min(desired, max(self.tokens * 1.25, self.tokens + quantum))
         self.tokens = max(
             quantum,
             min(self.max_tokens, int(desired) // quantum * quantum),

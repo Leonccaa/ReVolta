@@ -3,7 +3,7 @@
 import contextlib
 from collections.abc import Callable
 from dataclasses import asdict, fields
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from pydantic import Field, field_validator
 
@@ -386,6 +386,137 @@ class Sm70SparseConfig:
 
 
 @config
+class LongContextKVConfig:
+    """Active Host KV long-context mode for compressed-sparse (QSA) models.
+
+    When enabled, the main QSA K/V history is budgeted in a host memory pool
+    (the authoritative copy) with a GPU hot-page pool; recurrent state, drafter
+    windows and the compressed index stay on the GPU. Startup checks that each
+    pool holds at least one ``max_model_len`` request, and the scheduler admits
+    or grows a request only when the GPU state segment, the GPU history
+    segment, the host history pool and the hot-page pool all have room. A
+    request that does not fit waits (or preempts under the existing rules); it
+    is never rejected for lack of pool memory. Disabled, nothing here has any
+    effect.
+    """
+
+    enabled: bool = False
+    """Turn on long-context mode; every other field is inert while False."""
+    latest_only: bool = True
+    """Keep each observed chain's latest, resend and structural branch points."""
+    enable_junction_evidence: bool = True
+    """Require successor evidence for junction retention; False uses legacy policy."""
+    superseded_keep_ssd: bool = False
+    """Archive superseded checkpoints on SSD before releasing their RAM."""
+    host_store_gib: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    """Unified host budget across MAIN, STATE and DRAFT, summed over workers.
+    Includes ZERO_PAGE and build reservations. Mutually exclusive with the
+    legacy host_pool_gib/host_pool_tokens and connector cpu_bytes_to_use."""
+    host_pool_gib: float | None = Field(default=None, gt=0)
+    """Host history pool for the main QSA K/V, in GiB summed over all workers
+    (like ``kv_offloading_size``). Exactly one of this and
+    ``host_pool_tokens`` is required when enabled."""
+    host_pool_tokens: int | None = Field(default=None, gt=0)
+    """Host history pool sized in history tokens (rounded down to whole KV
+    blocks) instead of GiB."""
+    hot_pool_gib: (
+        Annotated[float, Field(gt=0, allow_inf_nan=False)] | Literal["auto"] | None
+    ) = None
+    """Guaranteed minimum hot slots, converted from a per-GPU GiB budget
+    covering payload, slot metadata,
+    shared workspace and write staging. Per-history-block metadata is charged
+    separately to the history segment. At most one of this and
+    ``hot_pool_ratio`` may be set. ``auto`` uses the remaining KV memory after
+    state, demand-sized history and prefill staging. With neither set, use
+    ``auto`` (a change from the previous implicit ratio sizing). Auto guarantees
+    the per-step verify working set. The actual hot region may be larger than
+    either minimum; static host allocation allocates a static pool. A minimum that
+    cannot coexist
+    with the active working set is a startup error. The host pool must still
+    be sized explicitly."""
+    hot_pool_ratio: float | None = Field(default=None, gt=0, le=1)
+    """Guaranteed minimum hot slots, using the existing conversion from a
+    fraction of the host history pool's rank-local tokens. Mutually exclusive
+    with hot_pool_gib; the actual hot region may be larger."""
+    prewarm_hot_pool: bool = True
+    """Warm the hot-page pool from the last prefill step's selection."""
+    prefill_staging_gib: float = Field(default=0.0, ge=0)
+    """GPU memory per GPU reserved for append-prefill history staging."""
+    state_blocks: int | None = Field(default=None, gt=0)
+    """GPU state-segment block IDs (recurrent states, PLE states, drafter
+    windows, checkpoints). None reserves ``max_num_seqs`` worst-case requests
+    plus the pool's null block."""
+    main_kv_placement: Literal["host", "gpu"] = "host"
+    """Where the main QSA K/V history lives. ``host``: one page per history
+    block ID in a pinned host store on every worker, read through the GPU
+    hot-page pool. ``gpu``: in the GPU history segment next to the
+    compressed index (the same-plan reference arm); the host and hot pools
+    then only budget admission."""
+    draft_main_placement: Literal["gpu", "host"] = "gpu"
+    """Where an MTP draft's main K/V lives when it has the target's sharded
+    geometry (``qsa_dcp_index_shard`` with DCP). ``gpu``: in the GPU history
+    segment, next to its index pages: fastest decode. ``host``: one more
+    layer of the host store, so each history ID takes fewer GPU bytes and the
+    context concurrency limit rises, at the price of draft forwards reading
+    host pages. ``host`` needs ``main_kv_placement="host"``; otherwise, or for
+    a draft that does not share the target's geometry, the draft stays on
+    the GPU and a warning is logged."""
+    staged_writethrough: bool = True
+    """Stage eager prefill writes on device and submit merged same-stream D2H
+    copies. Decode/capture uses word-vectorized UVA. False retains the legacy
+    writer. Byte-preserving and excluded from compile and SSD identities."""
+    prefill_gather: Literal["passes", "union"] = "passes"
+    """Mixed steps with ``main_kv_placement="host"``. ``passes``: remap the
+    selection in query-row passes that fit the hot slots (R_cap rows each).
+    ``union`` (selection-union gather): fill the union of the step's selections into hot
+    slots
+    once per window of whole eight-row groups and run the GPU arm's attention
+    call unchanged on a page-size-4 table, so the result does not depend on
+    the window split. Decode steps are unaffected."""
+    prefill_insert_age: Literal["old", "recent"] = "old"
+    """``union`` only: hot groups that only prefill rows want are inserted
+    as old (first evicted) or recent."""
+    value_arbitration: bool = True
+    """Host placement with the shared GPU region only: move the boundary
+    between the GPU prefix-index cache and the hot pages by bounded value
+    feedback. False keeps the fixed default split. Scheduler-only; it never
+    affects correctness or admission and is excluded from the compile hash."""
+    value_arbiter_settings: dict[str, bool | float | int | str] = Field(
+        default_factory=dict
+    )
+    """Overrides of the arbitration window, dead band, quantum and the
+    placeholder cost weights (``bw_uva``, ``bw_h2d``, ``w_async``,
+    ``w_ttft``) for measurement runs. ``busy_time`` defaults to true and
+    uses the union of dispatch-to-output busy spans; false restores the
+    historical step-to-step wall clock. Excluded from the compile hash."""
+
+    def validate_settings(self) -> None:
+        """Reject contradictory sizes; called only when the mode is enabled."""
+        if not self.enabled:
+            return
+        if (
+            sum(
+                x is not None
+                for x in (
+                    self.host_store_gib,
+                    self.host_pool_gib,
+                    self.host_pool_tokens,
+                )
+            )
+            != 1
+        ):
+            raise ValueError(
+                "kernel_config.long_context_kv needs exactly one of host_store_gib, "
+                "host_pool_gib and host_pool_tokens when enabled."
+            )
+        if self.hot_pool_gib is not None and self.hot_pool_ratio is not None:
+            raise ValueError(
+                "kernel_config.long_context_kv accepts at most one of "
+                "hot_pool_gib and hot_pool_ratio."
+            )
+
+
+@config
 class KernelConfig:
     """Configuration for kernel selection and warmup behavior."""
 
@@ -506,6 +637,30 @@ class KernelConfig:
     """Share FP16 indexer keys across M2..8 queries of one request on SM70
     (1CatAI #1127; opt-in here, also VLLM_SM70_QSA_SHARED_KEY=1)."""
 
+    qsa_dcp_index_shard: bool = False
+    """Shard the target QSA compressed indexer keys over the DCP group.
+
+    Group g is owned by DCP rank ``g % dcp`` at local column ``g // dcp``. Each
+    rank scores only its own groups; local top-k candidates are merged across
+    the group into the unchanged global selection. Requires DCP > 1; the MTP
+    draft indexer stays replicated.
+    """
+
+    long_context_kv: LongContextKVConfig = Field(default_factory=LongContextKVConfig)
+    """Active Host KV long-context mode and its pool sizes (off by default)."""
+
+    qsa_cross_group_hit_check: bool = False
+    """Report a prefix hit only when every KV cache group is complete at it.
+
+    Checks the final hit of the GPU prefix cache and of the offloading
+    connector against one per-group rule (full attention: every block; Mamba
+    align: the state at the hit; sliding window: its window), turns an
+    incomplete hit into a miss, trims extra full-attention blocks, and checks
+    the connector's load plan against the same hit. Also lets an owner of
+    storage outside these pools register residency probes. Scheduler-only;
+    off keeps the existing lookup results unchanged.
+    """
+
     ple_disk_cascade: bool | None = None
     """Allow resident FP8 PLE tiers to spill to mapped checkpoint storage.
 
@@ -574,6 +729,8 @@ class KernelConfig:
             "qsa_auto_e4m3_reason",
             # Sampler-only switch; it does not change any compiled graph.
             "sm70_greedy_verify",
+            # Scheduler-only prefix-hit check; no compiled graph changes.
+            "qsa_cross_group_hit_check",
         }
         if not self.sm70_skinny_moe_applicable:
             ignored_factors.add("sm70_skinny_moe")
@@ -596,7 +753,35 @@ class KernelConfig:
             ignored_factors.add("sm70_fp8")
         if not self.sm70_sparse.active:
             ignored_factors.add("sm70_sparse")
+        if not self.long_context_kv.enabled:
+            # An unused mode must not perturb existing graph caches.
+            ignored_factors.add("long_context_kv")
         factors = get_hash_factors(self, ignored_factors)
+        if "long_context_kv" in factors:
+            # Scheduler-only arbitration knobs keep the previous identity.
+            lc_factor = factors["long_context_kv"]
+            assert isinstance(lc_factor, tuple)
+            name, items = lc_factor
+            factors["long_context_kv"] = (
+                name,
+                tuple(
+                    item
+                    for item in items
+                    if item[0]
+                    not in (
+                        "value_arbitration",
+                        "value_arbiter_settings",
+                        "latest_only",
+                        "superseded_keep_ssd",
+                        "enable_junction_evidence",
+                        "staged_writethrough",
+                    )
+                    and not (
+                        item[0] == "host_store_gib"
+                        and self.long_context_kv.host_store_gib is None
+                    )
+                ),
+            )
         factors["ir_op_priority"] = self.ir_op_priority.compute_hash()
         return hash_factors(factors)
 

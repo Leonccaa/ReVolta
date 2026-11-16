@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GDN speculative state replay: allocation, state tables and replay indices (CPU)."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -193,7 +194,11 @@ def test_state_blocks_follow_the_resolved_flag(replay):
 def _replay_config(**overrides):
     policy = SimpleNamespace(spec_state_replay=None, fused_gdn_verify=False)
     spec = SimpleNamespace(
-        use_dflash=lambda: True, use_dflash_ddtree=lambda: False, sm70_dflash2=policy
+        method="dflash",
+        gdn_state_replay=None,
+        use_dflash=lambda: True,
+        use_dflash_ddtree=lambda: False,
+        sm70_dflash2=policy,
     )
     config = SimpleNamespace(
         speculative_config=spec,
@@ -223,8 +228,8 @@ def sm70(monkeypatch):
     return config_module._resolve_gdn_spec_state_replay
 
 
-def test_replay_is_off_by_default_and_on_when_requested(sm70):
-    assert sm70(_replay_config()) is False
+def test_replay_is_on_by_default_and_on_when_requested(sm70):
+    assert sm70(_replay_config()) is True
     requested = SimpleNamespace(spec_state_replay=True, fused_gdn_verify=False)
     assert sm70(_replay_config(**{"speculative_config.sm70_dflash2": requested}))
 
@@ -280,7 +285,7 @@ def _gdn_spec(sm70, method, num_tokens):
         config.speculative_config = None
     else:
         spec = config.speculative_config
-        # Replay requested (off by default): only the method decides.
+        # DFlash explicitly requests replay; MTP uses its supported-route default.
         spec.sm70_dflash2.spec_state_replay = True
         spec.method = method
         spec.num_speculative_tokens = num_tokens
@@ -313,26 +318,37 @@ def _legacy_gdn_spec(num_speculative_blocks):
 
 
 @pytest.mark.parametrize(("method", "num_tokens"), [("mtp", 4), ("mtp", 1), (None, 0)])
-def test_mtp_and_no_speculation_keep_their_gdn_allocation(sm70, method, num_tokens):
-    # Every other condition for replay holds; only the method differs from DFlash.
+def test_mtp_default_and_no_speculation_gdn_allocation(sm70, method, num_tokens):
     spec = _gdn_spec(sm70, method, num_tokens)
-    assert spec == _legacy_gdn_spec(num_tokens)
-    assert spec.num_replayed_speculative_blocks == 0
+    replay = method == "mtp"
+    assert spec == replace(
+        _legacy_gdn_spec(num_tokens),
+        num_speculative_blocks=0,
+        num_replayed_speculative_blocks=num_tokens if replay else 0,
+    )
+    assert spec.num_speculative_blocks == (0 if replay else num_tokens)
+    assert spec.num_replayed_speculative_blocks == (num_tokens if replay else 0)
     config = SimpleNamespace(cache_config=SimpleNamespace(mamba_cache_mode="align"))
     page = spec.page_size_bytes
-    assert spec.max_memory_usage_bytes(config) == (2 + num_tokens) * page
-    # The state table keeps one real block per speculative position.
+    assert page == _legacy_gdn_spec(num_tokens).page_size_bytes
+    assert spec.max_memory_usage_bytes(config) == 2 * page
     block_table = torch.arange(2 * 12, dtype=torch.int32).view(2, 12) + 100
     seq_lens = torch.tensor([BS + 1, 3 * BS])
     out = mamba_get_block_table_tensor(block_table, seq_lens, spec, "align")
     legacy = mamba_get_block_table_tensor(
         block_table, seq_lens, _legacy_gdn_spec(num_tokens), "align"
     )
-    assert torch.equal(out, legacy)
-    assert (out != PAD_SLOT_ID).all()
+    assert torch.equal(out[:, :1], legacy[:, :1])
+    if replay:
+        legacy[:, 1:] = PAD_SLOT_ID
+        assert torch.equal(out, legacy)
+        assert (out[:, 1:] == PAD_SLOT_ID).all()
+    else:
+        assert torch.equal(out, legacy)
+        assert (out != PAD_SLOT_ID).all()
 
 
-def test_dflash_replay_is_the_only_change_to_gdn_allocation(sm70):
+def test_dflash_replay_gdn_allocation(sm70):
     spec = _gdn_spec(sm70, "dflash", 7)
     assert spec.num_speculative_blocks == 0
     assert spec.num_replayed_speculative_blocks == 7
@@ -406,16 +422,16 @@ def test_release_default_is_one_switch(sm70, monkeypatch):
     from vllm.config import sm70_dflash2
 
     # The release default lives in one constant, read through vllm.config.vllm.
-    assert sm70_dflash2.SM70_DFLASH2_SPEC_STATE_REPLAY_DEFAULT is False
-    assert config_module.SM70_DFLASH2_SPEC_STATE_REPLAY_DEFAULT is False
-    assert sm70(_replay_config()) is False
-    monkeypatch.setattr(config_module, "SM70_DFLASH2_SPEC_STATE_REPLAY_DEFAULT", True)
+    assert sm70_dflash2.SM70_DFLASH2_SPEC_STATE_REPLAY_DEFAULT is True
+    assert config_module.SM70_DFLASH2_SPEC_STATE_REPLAY_DEFAULT is True
     # Default on: None resolves on, explicit False still turns replay off.
     assert sm70(_replay_config()) is True
     explicit = SimpleNamespace(spec_state_replay=False, fused_gdn_verify=False)
     assert (
         sm70(_replay_config(**{"speculative_config.sm70_dflash2": explicit})) is False
     )
+    monkeypatch.setattr(config_module, "SM70_DFLASH2_SPEC_STATE_REPLAY_DEFAULT", False)
+    assert sm70(_replay_config()) is False
 
 
 _FUSED_TABLE_CODE = r"""
@@ -639,3 +655,24 @@ def test_replay_graphs_capture_on_the_second_full_step(monkeypatch):
         **kw,
     )
     assert eager == [1, 1] and replays == [1]
+
+
+@pytest.mark.parametrize("general", [False, True])
+@pytest.mark.parametrize("geometry", [(4, 12, 128), (16, 48, 128), (1, 2, 16)])
+def test_mixed_qkv_verify_geometry_policy(general, geometry):
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+        QwenGatedDeltaNetAttention,
+    )
+
+    key_heads, value_heads, head_dim = geometry
+    layer = SimpleNamespace(
+        _replay_general_geometry=general,
+        num_k_heads=key_heads,
+        num_v_heads=value_heads,
+        head_k_dim=head_dim,
+        head_v_dim=head_dim,
+        tp_size=1,
+    )
+    assert QwenGatedDeltaNetAttention._mixed_qkv_verify_geometry_supported(layer) == (
+        general or geometry == (4, 12, 128)
+    )

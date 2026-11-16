@@ -264,7 +264,7 @@ def _apply_sm70_qwen38_decode_defaults(
 def _resolve_gdn_spec_state_replay(vllm_config: "VllmConfig") -> bool:
     """Whether GDN layers replay accepted tokens instead of keeping per-draft states.
 
-    Supported for linear DFlash verification on SM70 with Model Runner V2, align
+    Supported for linear DFlash/MTP verification on SM70 with Model Runner V2, align
     prefix caching and synchronous scheduling: the verifier route that records
     its inputs and the replay after sampling are wired there. Elsewhere the
     per-position state blocks remain.
@@ -272,26 +272,56 @@ def _resolve_gdn_spec_state_replay(vllm_config: "VllmConfig") -> bool:
     from vllm.platforms import current_platform
 
     spec = vllm_config.speculative_config
-    if spec is None or not spec.use_dflash() or spec.use_dflash_ddtree():
+    if spec is None or spec.use_dflash_ddtree():
+        return False
+    is_mtp = spec.method == "mtp"
+    if not is_mtp and not spec.use_dflash():
         return False
     policy = spec.sm70_dflash2
-    if policy.spec_state_replay is False:
+    long_context = getattr(
+        getattr(vllm_config, "kernel_config", None), "long_context_kv", None
+    )
+    replay_defaulted = False
+    if not is_mtp and long_context is not None and long_context.enabled:
+        if policy.spec_state_replay is None:
+            replay_defaulted = True
+            policy.spec_state_replay = True
+            logger.info_once(
+                "Long-context KV mode enables sm70_dflash2.spec_state_replay "
+                "by default."
+            )
+        elif policy.spec_state_replay is False:
+            logger.warning_once(
+                "Long-context KV mode has sm70_dflash2.spec_state_replay=False "
+                "explicitly configured. GDN keeps a state block per draft "
+                "position and capacity includes those speculative state blocks."
+            )
+    replay = spec.gdn_state_replay if is_mtp else policy.spec_state_replay
+    if replay is False:
         return False
-    if policy.spec_state_replay is None and not SM70_DFLASH2_SPEC_STATE_REPLAY_DEFAULT:
+    if replay is None and not SM70_DFLASH2_SPEC_STATE_REPLAY_DEFAULT:
         return False
+    if is_mtp and policy.fused_gdn_verify:
+        policy.fused_gdn_verify = False
+        logger.info_once(
+            "Disabling sm70_dflash2.fused_gdn_verify because "
+            "GDN state replay is enabled for MTP."
+        )
     if policy.fused_gdn_verify:
         if policy.spec_state_replay is True:
             if "fused_gdn_verify" in policy.explicit_fields:
                 raise ValueError(
                     "sm70_dflash2.spec_state_replay=True and "
                     "sm70_dflash2.fused_gdn_verify=True cannot be enabled "
-                    "together. Disable one of these explicit settings."
+                    "together. Disable one of these settings."
                 )
             policy.fused_gdn_verify = False
             logger.info_once(
                 "Disabling the automatic sm70_dflash2.fused_gdn_verify "
-                "default because sm70_dflash2.spec_state_replay=True was "
-                "explicitly requested."
+                "default because %s.",
+                "long-context KV mode enables state replay by default"
+                if replay_defaulted
+                else "sm70_dflash2.spec_state_replay=True was explicitly requested",
             )
         else:
             logger.info_once(
@@ -322,10 +352,11 @@ def _resolve_gdn_spec_state_replay(vllm_config: "VllmConfig") -> bool:
     if not envs.VLLM_SM70_FUSED_SIGMOID_MIXED_QKV:
         reasons.append("VLLM_SM70_FUSED_SIGMOID_MIXED_QKV is off")
     if reasons:
-        if policy.spec_state_replay:
+        if replay:
             logger.warning_once(
-                "sm70_dflash2.spec_state_replay is not supported here (%s); "
+                "%s is not supported here (%s); "
                 "GDN layers keep one state block per speculative position.",
+                "gdn_state_replay" if is_mtp else "sm70_dflash2.spec_state_replay",
                 ", ".join(reasons),
             )
         return False
@@ -1149,6 +1180,15 @@ class VllmConfig:
     """Shutdown grace period for in-flight requests. Shutdown will be delayed for
     up to this amount of time to allow already-running requests to complete. Any
     remaining requests are aborted once the timeout is reached.
+
+    With 0 (the default, as upstream) in-flight requests are aborted at once and
+    the host KV SSD final flush is skipped.
+    """
+
+    shutdown_reap_timeout: float | None = Field(default=None, ge=0)
+    """Extra process-exit wait after a terminal retirement receipt. None uses
+    shutdown_timeout; explicit values are capped by shutdown_timeout. This
+    changes no request-drain or persistence deadline and adds no GPU work.
     """
 
     watchdog_config: WatchdogConfig = Field(default_factory=WatchdogConfig)
@@ -1752,6 +1792,9 @@ class VllmConfig:
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
 
+        if self.speculative_config is not None:
+            self.speculative_config.require_lookup_runtime()
+
         from vllm.revolta_profile import (
             all_visible_devices_sm70,
             apply_revolta_kernel_profile,
@@ -1914,7 +1957,7 @@ class VllmConfig:
         adaptive_dflash_lookup = bool(
             self.speculative_config is not None
             and uses_adaptive_dflash_lookup(self.speculative_config)
-            and envs.VLLM_DFLASH2_LOOKUP_ADAPTIVE
+            and self.speculative_config.lookup_env("VLLM_DFLASH2_LOOKUP_ADAPTIVE")
         )
         dflash_width_policy = (
             getattr(self.speculative_config, "dflash_concurrency_drafts", None)
@@ -2395,7 +2438,12 @@ class VllmConfig:
                     "dual-compile lane: async disk-mmap prefill plus local "
                     "pinned-UVA decode."
                 )
-        if self.speculative_config is not None:
+        # Derived draft configs share the target's speculative config. Replay
+        # and verifier policy belong to the target: resolving against a
+        # non-recurrent draft would overwrite the target before MRV2 builds
+        # its state specs and model state. Preserve the resolved target policy
+        # through every internal draft replacement, including attention setup.
+        if self.speculative_config is not None and not self.is_speculative_draft:
             policy = self.speculative_config.sm70_dflash2
             policy.resolve(
                 qualified=(

@@ -201,3 +201,48 @@ print(hash_factors(envs.compile_factors()))
         "compile_factors hash differs between fresh initializations - "
         "dynamic env vars may not be properly ignored"
     )
+
+
+def test_replace_excludes_dynamic_attributes_and_rebuilds_noninit_fields():
+    from dataclasses import asdict, field
+
+    from vllm.config.utils import replace
+
+    @dataclass
+    class DerivedConfig:
+        value: int = 2
+        doubled: int = field(init=False)
+
+        def __post_init__(self):
+            self.doubled = 2 * self.value
+
+    original = DerivedConfig()
+    original.__dict__["_runtime_state"] = object()
+    cloned = replace(original, value=5)
+    assert asdict(original) == {"value": 2, "doubled": 4}
+    assert asdict(cloned) == {"value": 5, "doubled": 10}
+    assert not hasattr(cloned, "_runtime_state")
+
+
+def test_replace_pydantic_noninit_fields_are_recomputed():
+    from pydantic import Field
+
+    from vllm.config.utils import config, replace
+
+    @config
+    class DerivedConfig:
+        value: int = 2
+        """Input value."""
+        doubled: int = Field(default=0, init=False)
+        """Derived value, excluded from constructor inputs."""
+
+        def __post_init__(self):
+            self.doubled = 2 * self.value
+
+    original = DerivedConfig()
+    original.__dict__["_runtime_state"] = object()
+    cloned = replace(original, value=5)
+    assert cloned.value == 5
+    assert cloned.doubled == 10
+    assert original.doubled == 4
+    assert not hasattr(cloned, "_runtime_state")

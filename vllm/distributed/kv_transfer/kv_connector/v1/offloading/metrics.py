@@ -15,6 +15,42 @@ from vllm.v1.kv_offload.worker.worker import TransferType
 
 logger = init_logger(__name__)
 
+# Key in ``OffloadingConnectorStats.data`` for CPU-tier evictions reported by
+# the scheduler side: a list of {"reason": str, "blocks": int} entries.
+CPU_EVICTIONS_KEY = "cpu_evicted_blocks"
+# Key in ``OffloadingConnectorStats.data`` for speculative draft-model blocks
+# the scheduler did not offload (kv_connector_extra_config "cpu.draft_offload"):
+# a list of block counts.
+CPU_DRAFT_SKIPPED_KEY = "cpu_draft_blocks_skipped"
+CPU_RESIDENT_KEY = "cpu_resident_blocks"
+
+# Labelled scheduler-side counters (see offloading/counters.py): key in
+# ``OffloadingConnectorStats.data`` -> (Prometheus name, label, documentation).
+# Each entry is a list of {"label": str, "count": int}.
+LABELLED_COUNTERS: dict[str, tuple[str, str, str]] = {
+    "cpu_stored_blocks": (
+        "vllm:kv_offload_cpu_stored_blocks",
+        "kind",
+        "Blocks whose store to the CPU offload tier completed, by KV cache "
+        "group kind: target, draft (a speculative drafter's sliding window, "
+        "as recognised by cpu.draft_offload) or state (recurrent state).",
+    ),
+    "lookup_shrink_tokens": (
+        "vllm:kv_offload_lookup_shrink_tokens",
+        "cause",
+        "Tokens by which sliding-window and recurrent-state groups lowered an "
+        "admitted request's offload lookup below the full-attention reach, by "
+        "cause: draft_window, recurrent_state, sliding_window, page_align.",
+    ),
+    "hit_draft_window_needed": (
+        "vllm:kv_offload_hit_draft_window_needed",
+        "needed",
+        "External prefix hits on a model with a draft sliding-window group: "
+        "needed=true when fewer tokens than the draft window remain to be "
+        "prefilled after the hit, so the drafter reads the loaded window.",
+    ),
+}
+
 
 @dataclass
 class OffloadingOperationMetrics:
@@ -30,12 +66,14 @@ class OffloadingConnectorStats(KVConnectorStats):
             self.reset()
 
     def reset(self):
-        self.data: dict[str, list[OffloadingOperationMetrics]] = {}
+        # Transfer ops per transfer type; CPU_EVICTIONS_KEY holds eviction
+        # entries ({"reason", "blocks"}) from the scheduler side.
+        self.data: dict[str, list[Any]] = {}
 
     def aggregate(self, other: KVConnectorStats) -> KVConnectorStats:
         if not other.is_empty():
             for k, v in other.data.items():
-                if k not in self.data:
+                if k == CPU_RESIDENT_KEY or k not in self.data:
                     self.data[k] = v
                 else:
                     accumulator = self.data[k]
@@ -53,6 +91,25 @@ class OffloadingConnectorStats(KVConnectorStats):
         return_dict: dict[str, int | float] = {}
         for transfer_type, ops_list in self.data.items():
             assert isinstance(ops_list, list)
+            if transfer_type == CPU_EVICTIONS_KEY:
+                for entry in ops_list:
+                    key = f"{CPU_EVICTIONS_KEY}_{entry['reason']}"
+                    return_dict[key] = return_dict.get(key, 0) + entry["blocks"]
+                continue
+            if transfer_type == CPU_DRAFT_SKIPPED_KEY:
+                return_dict[CPU_DRAFT_SKIPPED_KEY] = sum(ops_list)
+                continue
+            if transfer_type == CPU_RESIDENT_KEY:
+                for entry in ops_list[-1:]:
+                    for row in entry:
+                        key = f"{CPU_RESIDENT_KEY}_{row['kind']}_{row['status']}"
+                        return_dict[key] = row["blocks"]
+                continue
+            if transfer_type in LABELLED_COUNTERS:
+                for entry in ops_list:
+                    key = f"{transfer_type}_{entry['label']}"
+                    return_dict[key] = return_dict.get(key, 0) + entry["count"]
+                continue
             total_bytes = 0
             total_time = 0.0
             for op in ops_list:
@@ -65,6 +122,28 @@ class OffloadingConnectorStats(KVConnectorStats):
 
     def is_empty(self) -> bool:
         return not self.data
+
+    def record_evictions(self, blocks_by_reason: dict[str, int]) -> None:
+        entries = self.data.setdefault(CPU_EVICTIONS_KEY, [])
+        for reason, blocks in blocks_by_reason.items():
+            entries.append({"reason": reason, "blocks": blocks})
+
+    def record_skipped_draft_blocks(self, blocks: int) -> None:
+        self.data.setdefault(CPU_DRAFT_SKIPPED_KEY, []).append(blocks)
+
+    def record_residency(self, totals: dict[tuple[str, str], int]) -> None:
+        self.data[CPU_RESIDENT_KEY] = [
+            [
+                {"kind": kind, "status": status, "blocks": blocks}
+                for (kind, status), blocks in totals.items()
+            ]
+        ]
+
+    def record_labelled_counts(self, key: str, counts: dict[str, int]) -> None:
+        assert key in LABELLED_COUNTERS, key
+        entries = self.data.setdefault(key, [])
+        for label, count in counts.items():
+            entries.append({"label": label, "count": count})
 
     def record_transfer(self, num_bytes: int, time: float, transfer_type: TransferType):
         src, dst = transfer_type
@@ -114,6 +193,44 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
             labelnames=labelnames + ["transfer_type"],
         )
 
+        self.counter_cpu_evicted_blocks: dict[tuple[int, str], PromMetricT] = {}
+        self._counter_cpu_evicted_blocks = self._counter_cls(
+            name="vllm:kv_offload_cpu_evicted_blocks",
+            documentation=(
+                "Blocks evicted from the CPU offload tier, by reason: capacity "
+                "(policy eviction), superseded (evicted after being demoted as "
+                "a superseded state), reset (dropped by a cache reset)."
+            ),
+            labelnames=labelnames + ["reason"],
+        )
+
+        self.counter_cpu_draft_blocks_skipped: dict[int, PromMetricT] = {}
+        # Register lazily: disabled configurations expose exactly the old metrics.
+        self._gauge_cpu_resident_blocks: PromMetricT | None = None
+        self._counter_cpu_draft_blocks_skipped = self._counter_cls(
+            name="vllm:kv_offload_cpu_draft_blocks_skipped",
+            documentation=(
+                "Speculative draft-model KV blocks not offloaded to the CPU "
+                "tier because of kv_connector_extra_config cpu.draft_offload."
+            ),
+            labelnames=labelnames,
+        )
+
+        # key -> labelled counter; (engine_idx, key, label) -> bound counter
+        transfer_config = vllm_config.kv_transfer_config
+        counters_enabled = transfer_config is not None and (
+            transfer_config.kv_connector_extra_config.get("cpu.offload_counters", False)
+            is True
+        )
+        self._labelled_counters: dict[str, PromMetricT] = {
+            key: self._counter_cls(
+                name=name, documentation=doc, labelnames=labelnames + [label]
+            )
+            for key, (name, label, doc) in LABELLED_COUNTERS.items()
+            if counters_enabled
+        }
+        self.labelled_counters: dict[tuple[int, str, str], PromMetricT] = {}
+
         self._histogram_transfer_size = self._histogram_cls(
             name="vllm:kv_offload_size",
             documentation="Histogram of KV offload transfer size, in bytes.",
@@ -130,6 +247,34 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
         """
 
         for transfer_type, ops in transfer_stats_data.items():
+            if transfer_type == CPU_EVICTIONS_KEY:
+                self._observe_evictions(ops, engine_idx)
+                continue
+            if transfer_type == CPU_DRAFT_SKIPPED_KEY:
+                self._observe_draft_skipped(ops, engine_idx)
+                continue
+            if transfer_type == CPU_RESIDENT_KEY:
+                if self._gauge_cpu_resident_blocks is None:
+                    self._gauge_cpu_resident_blocks = self._gauge_cls(
+                        name="vllm:kv_offload_cpu_resident_blocks",
+                        documentation=(
+                            "Resident CPU blocks by kind and conservative usability."
+                        ),
+                        labelnames=self._labelnames + ["kind", "status"],
+                    )
+                for snapshot in ops[-1:]:
+                    for row in snapshot:
+                        self._gauge_cpu_resident_blocks.labels(
+                            *(
+                                self.per_engine_labelvalues[engine_idx]
+                                + [row["kind"], row["status"]]
+                            )
+                        ).set(row["blocks"])
+                continue
+            if transfer_type in LABELLED_COUNTERS:
+                if transfer_type in self._labelled_counters:
+                    self._observe_labelled(transfer_type, ops, engine_idx)
+                continue
             # Cache:
             if (engine_idx, transfer_type) not in self.histogram_transfer_size:
                 self.histogram_transfer_size[(engine_idx, transfer_type)] = (
@@ -163,3 +308,35 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
                 self.counter_kv_transfer_time[(engine_idx, transfer_type)].inc(
                     op["op_time"]
                 )
+
+    def _observe_evictions(self, entries: list[Any], engine_idx: int) -> None:
+        for entry in entries:
+            key = (engine_idx, entry["reason"])
+            if key not in self.counter_cpu_evicted_blocks:
+                self.counter_cpu_evicted_blocks[key] = (
+                    self._counter_cpu_evicted_blocks.labels(
+                        *(self.per_engine_labelvalues[engine_idx] + [entry["reason"]])
+                    )
+                )
+            self.counter_cpu_evicted_blocks[key].inc(entry["blocks"])
+
+    def _observe_draft_skipped(self, counts: list[Any], engine_idx: int) -> None:
+        if engine_idx not in self.counter_cpu_draft_blocks_skipped:
+            self.counter_cpu_draft_blocks_skipped[engine_idx] = (
+                self._counter_cpu_draft_blocks_skipped.labels(
+                    *self.per_engine_labelvalues[engine_idx]
+                )
+            )
+        for count in counts:
+            self.counter_cpu_draft_blocks_skipped[engine_idx].inc(count)
+
+    def _observe_labelled(self, key: str, entries: list[Any], engine_idx: int) -> None:
+        for entry in entries:
+            cache_key = (engine_idx, key, entry["label"])
+            counter = self.labelled_counters.get(cache_key)
+            if counter is None:
+                counter = self._labelled_counters[key].labels(
+                    *(self.per_engine_labelvalues[engine_idx] + [entry["label"]])
+                )
+                self.labelled_counters[cache_key] = counter
+            counter.inc(entry["count"])

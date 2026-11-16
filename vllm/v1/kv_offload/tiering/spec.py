@@ -38,13 +38,14 @@ from typing_extensions import override
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, kv_tensor_num_blocks
 from vllm.v1.kv_offload.base import CanonicalKVCaches, OffloadingManager
 from vllm.v1.kv_offload.cpu.gpu_worker import CpuGpuOffloadingHandlers
 from vllm.v1.kv_offload.cpu.manager import GroupedCPUOffloadingManager
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
+from vllm.v1.kv_offload.tiering.fs.config import FS_TIER_TYPES
 from vllm.v1.kv_offload.tiering.manager import (
     CPUPrimaryTierOffloadingManager,
     TieringOffloadingManager,
@@ -104,11 +105,21 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 "group_pages": self.cpu_group_page_sizes,
                 "tensors": [
                     {
-                        "page_size": tensor.size // kv_cache_config.num_blocks,
+                        "page_size": tensor.size
+                        // kv_tensor_num_blocks(kv_cache_config, tensor),
                         "shared_by": list(tensor.shared_by),
                     }
                     for tensor in kv_cache_config.kv_cache_tensors
                 ],
+            }
+
+        if getattr(kv_cache_config, "host_kv_layers", None):
+            if self.persistent_layout is None:
+                self.persistent_layout = {}
+            self.persistent_layout["host_main_kv"] = {
+                "version": "history-block-all-layers-v1",
+                "layers": list(kv_cache_config.host_kv_layers),
+                "page_bytes": kv_cache_config.host_kv_page_size_bytes,
             }
 
         from vllm.v1.attention.kv_cache_view import (
@@ -122,7 +133,10 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             self.persistent_layout["kv_storage"] = kv_storage_metadata(
                 kv_cache_config, vllm_config.cache_config.cache_dtype
             )
-            if any(tier.get("type") == "fs" for tier in self.secondary_tier_configs):
+            if any(
+                tier.get("type") in FS_TIER_TYPES
+                for tier in self.secondary_tier_configs
+            ):
                 raise ValueError(
                     "INT8 v1 SSD requires aligned FS framing; raw O_DIRECT pages "
                     "are unsupported. Use CPU offload until FS framing is integrated."
@@ -199,6 +213,8 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
         Returns:
             TieringOffloadingManager instance
         """
+        if getattr(self, "unified_host", False):
+            return self._get_unified_manager()
         if not self._manager:
             kv_events_config = self.vllm_config.kv_events_config
             enable_events = (
@@ -285,6 +301,8 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
 
     @override
     def create_handlers(self, kv_caches: CanonicalKVCaches) -> CpuGpuOffloadingHandlers:
+        if getattr(self, "unified_host", False):
+            return super().create_handlers(kv_caches)
         world_size = self.vllm_config.parallel_config.world_size
         rank = torch.accelerator.current_device_index()
         if self.partition_by_group:

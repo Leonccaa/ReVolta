@@ -1155,11 +1155,13 @@ def test_mamba_boundary_store_flushes_before_source_block_reuse():
     assert second_meta.jobs_to_flush == {job_id}
 
 
-def test_mamba_boundary_store_retries_while_host_tier_is_busy():
+def test_mamba_boundary_store_dropped_when_host_tier_is_busy():
     # The core offers a boundary state once; with a few state slots per
-    # group the host tier can be fully pinned by in-flight transfers.
+    # group the host tier can be fully pinned by in-flight transfers. The
+    # offer is not kept for a later step: by then the source block may
+    # belong to another request.
     scheduler = _make_exact_boundary_scheduler()
-    scheduler.manager.prepare_store.side_effect = [None, None]
+    scheduler.manager.prepare_store.side_effect = [None]
     first = _empty_store_output(
         num_scheduled_tokens={"req": 16},
         boundary_state_offloads={"req": [(1, 99, 16)]},
@@ -1167,32 +1169,57 @@ def test_mamba_boundary_store_retries_while_host_tier_is_busy():
 
     assert scheduler.build_connector_meta(first).store_jobs == {}
     req_status = scheduler._req_status["req"]
-    assert req_status.pending_boundary_offloads == [(1, 99, 16)]
+    assert req_status.pending_boundary_offloads == []
     assert scheduler._block_id_to_pending_jobs == {}
     assert req_status.transfer_jobs == set()
+    assert scheduler.num_rejected_boundary_offers == 1
 
-    # Still busy on a step where the request is not scheduled at all.
-    req_status.req.num_computed_tokens = 16
-    idle = _empty_store_output()
-    assert scheduler.build_connector_meta(idle).store_jobs == {}
-    assert req_status.pending_boundary_offloads == [(1, 99, 16)]
-
+    # The host tier has room again: nothing is stored from the old offer.
     scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
         generate_store_output(keys)
     )
-    meta = scheduler.build_connector_meta(_empty_store_output())
-
-    [job_id] = meta.store_jobs
-    src_spec, _ = meta.store_jobs[job_id].transfer_spec
-    assert src_spec.block_ids.tolist() == [99]
-    assert src_spec.group_sizes == [0, 1]
-    assert scheduler._block_id_to_pending_jobs == {99: {job_id}}
-    assert req_status.pending_boundary_offloads == []
-    assert req_status.transfer_jobs == {job_id}
-    assert scheduler.manager.prepare_store.call_count == 3
+    req_status.req.num_computed_tokens = 16
+    assert scheduler.build_connector_meta(_empty_store_output()).store_jobs == {}
+    assert scheduler.manager.prepare_store.call_count == 1
 
 
-def test_mamba_boundary_reoffer_supersedes_pending_entry():
+def test_rejected_boundary_offer_never_reads_reused_source_block():
+    # Reproduces a review finding against the earlier cross-step retry: the
+    # request moves past the boundary, its state block 99 is freed (no store
+    # job references it, so no flush is due) and given to another request,
+    # which writes its own data into it. A retried store would then copy that
+    # data under this request's boundary key.
+    scheduler = _make_exact_boundary_scheduler()
+    scheduler.manager.prepare_store.side_effect = [None]
+    scheduler.build_connector_meta(
+        _empty_store_output(
+            num_scheduled_tokens={"req": 16},
+            boundary_state_offloads={"req": [(1, 99, 16)]},
+        )
+    )
+    req_status = scheduler._req_status["req"]
+    req_status.req.num_computed_tokens = 32
+    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+
+    # Block 99 now belongs to "other", which is scheduled this step.
+    reuse = _empty_store_output(
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=["req"], new_block_ids=[None], resumed_req_ids=set()
+        ),
+        num_scheduled_tokens={"req": 1},
+    )
+    meta = scheduler.build_connector_meta(reuse)
+
+    for job in meta.store_jobs.values():
+        src_spec, _ = job.transfer_spec
+        assert 99 not in src_spec.block_ids.tolist()
+    assert 99 not in scheduler._block_id_to_pending_jobs
+    assert all(job.sliding_window_block_ids != [99] for job in scheduler._jobs.values())
+
+
+def test_mamba_boundary_reoffer_after_rejection_is_stored():
     scheduler = _make_exact_boundary_scheduler()
     scheduler.manager.prepare_store.side_effect = [None]
     scheduler.build_connector_meta(
@@ -1216,7 +1243,7 @@ def test_mamba_boundary_reoffer_supersedes_pending_entry():
 
 
 @pytest.mark.parametrize("how", ["preempted", "finished"])
-def test_pending_boundary_offloads_dropped_when_blocks_are_freed(how):
+def test_rejected_boundary_offer_leaves_nothing_on_free(how):
     scheduler = _make_exact_boundary_scheduler()
     scheduler.manager.prepare_store.side_effect = [None]
     scheduler.build_connector_meta(
@@ -1226,7 +1253,7 @@ def test_pending_boundary_offloads_dropped_when_blocks_are_freed(how):
         )
     )
     req_status = scheduler._req_status["req"]
-    assert req_status.pending_boundary_offloads == [(1, 99, 16)]
+    assert req_status.pending_boundary_offloads == []
     scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
         generate_store_output(keys)
     )
@@ -1236,12 +1263,10 @@ def test_pending_boundary_offloads_dropped_when_blocks_are_freed(how):
             _empty_store_output(preempted_req_ids={"req"})
         )
         assert meta.store_jobs == {}
-        assert req_status.pending_boundary_offloads == []
     else:
         req_status.req.is_finished.return_value = True
         assert scheduler.request_finished(req_status.req) == (False, None)
         assert "req" not in scheduler._req_status
-        assert req_status.pending_boundary_offloads == []
     # The freed source block must never be read by a late store.
     assert scheduler._block_id_to_pending_jobs == {}
 

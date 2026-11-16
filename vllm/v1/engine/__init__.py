@@ -18,6 +18,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.metrics.stats import PrefillStats, SchedulerStats
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors
 from vllm.v1.serial_utils import UtilityResult
+from vllm.v1.spec_decode.lookup_stats import LookupStatsRegistration
 
 # Type for pause_generation mode parameter.
 # - "abort": Abort all in-flight requests immediately (default).
@@ -77,6 +78,7 @@ class EngineCoreReadyResponse:
     dp_stats_address: str | None
     dtype: str
     vllm_version: str
+    lookup_stats_registration: LookupStatsRegistration | None = None
 
 
 class EngineCoreRequest(

@@ -34,6 +34,7 @@ class BlockTables:
         self.cp_rank = cp_rank
         self.cp_interleave = cp_interleave
 
+        self.cpu_mirrors: dict[int, dict[int, list[int]]] = {}
         self.num_kv_cache_groups = len(self.block_sizes)
         assert len(max_num_blocks_per_group) == self.num_kv_cache_groups
         if slot_mapping_enabled is None:
@@ -130,6 +131,11 @@ class BlockTables:
             bpk = self.blocks_per_kv_block[i]
             if bpk > 1:
                 block_ids = [b * bpk + k for b in block_ids for k in range(bpk)]
+            if i in self.cpu_mirrors:
+                table = self.cpu_mirrors[i]
+                row = [] if overwrite else table.get(req_index, [])
+                row[start : start + len(block_ids)] = block_ids
+                table[req_index] = row
             self.block_tables[i].stage_write(req_index, start, block_ids)
             self.num_blocks.np[i, req_index] = start + len(block_ids)
 

@@ -2221,7 +2221,15 @@ class GPUModelRunner(
         """
         self._kv_block_zeroer = KVBlockZeroer(self.device, self.pin_memory)
         self._kv_block_zeroer.init_meta(
-            attn_groups_iter=self._kv_cache_spec_attn_group_iterator(),
+            # With separate block spaces the IDs to zero name primary-space
+            # blocks only; another space's tensors must not be touched.
+            attn_groups_iter=(
+                group
+                for group in self._kv_cache_spec_attn_group_iterator()
+                # getattr: tests may build the runner without __init__.
+                if getattr(self, "kv_cache_config", None) is None
+                or self.kv_cache_config.in_primary_block_space(group.kv_cache_group_id)
+            ),
             kernel_block_sizes=self._kernel_block_sizes,
             cache_dtype=self.cache_config.cache_dtype,
             runner_only_attn_layers=self.runner_only_attn_layers,
@@ -11506,7 +11514,10 @@ class GPUModelRunner(
 
         hidden_states = torch.rand_like(hidden_states)
 
+        from vllm.v1.sample.ops.topk_topp_sampler import warmup_top_k_top_p
+
         logits = self.model.compute_logits(hidden_states)
+        warmup_top_k_top_p(logits, self.vllm_config)
         num_reqs = logits.size(0)
 
         dummy_tensors = lambda v: torch.full((num_reqs,), v, device=self.device)
@@ -12933,6 +12944,11 @@ class GPUModelRunner(
             kv_cache_config: Configuration for the KV cache, including the KV
             cache size of each layer
         """
+        if getattr(kv_cache_config, "host_kv_layers", None):
+            raise NotImplementedError(
+                "kernel_config.long_context_kv with main_kv_placement='host' "
+                "requires Model Runner V2."
+            )
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
         self._mamba_bufs = None

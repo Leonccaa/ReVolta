@@ -677,6 +677,7 @@ class EngineArgs:
         ObservabilityConfig.enable_layerwise_nvtx_tracing
     )
     enable_mfu_metrics: bool = ObservabilityConfig.enable_mfu_metrics
+    enable_store_metrics: bool = ObservabilityConfig.enable_store_metrics
     enable_logging_iteration_details: bool = (
         ObservabilityConfig.enable_logging_iteration_details
     )
@@ -751,6 +752,7 @@ class EngineArgs:
     tokens_only: bool = False
 
     shutdown_timeout: int = 0
+    shutdown_reap_timeout: float | None = None
 
     watchdog_config: WatchdogConfig = get_field(VllmConfig, "watchdog_config")
 
@@ -1408,6 +1410,10 @@ class EngineArgs:
             **observability_kwargs["enable_mfu_metrics"],
         )
         observability_group.add_argument(
+            "--enable-store-metrics",
+            **observability_kwargs["enable_store_metrics"],
+        )
+        observability_group.add_argument(
             "--enable-logging-iteration-details",
             **observability_kwargs["enable_logging_iteration_details"],
         )
@@ -1607,6 +1613,14 @@ class EngineArgs:
         )
 
         parser.add_argument(
+            "--shutdown-reap-timeout",
+            type=float,
+            default=None,
+            help="Process-exit wait after a retirement receipt, in seconds. "
+            "Defaults to and is capped by --shutdown-timeout; 0 disables it.",
+        )
+
+        parser.add_argument(
             "--gdn-prefill-backend",
             dest="gdn_prefill_backend",
             choices=["flashinfer", "triton", "cutedsl", "flashqla_sm70"],
@@ -1765,6 +1779,18 @@ class EngineArgs:
         if self.speculative_config is None:
             return None
 
+        from vllm.config.dflash2_lookup import capture_lookup_source
+
+        injected_fields: tuple[str, ...] = (
+            "target_model_config",
+            "target_parallel_config",
+        )
+        if "enforce_eager" not in self.speculative_config:
+            injected_fields += ("enforce_eager",)
+        lookup_source = capture_lookup_source(
+            self.speculative_config, system_fields=tuple(sorted(injected_fields))
+        )
+
         if "enforce_eager" not in self.speculative_config:
             self.speculative_config["enforce_eager"] = False
             logger.info_once(
@@ -1782,7 +1808,9 @@ class EngineArgs:
                 "target_parallel_config": target_parallel_config,
             }
         )
-        return SpeculativeConfig(**self.speculative_config)
+        return SpeculativeConfig.from_engine_args(
+            self.speculative_config, lookup_source
+        )
 
     def _maybe_apply_sm70_mtp_defaults(
         self,
@@ -2486,6 +2514,7 @@ class EngineArgs:
             cudagraph_metrics=self.cudagraph_metrics,
             enable_layerwise_nvtx_tracing=self.enable_layerwise_nvtx_tracing,
             enable_mfu_metrics=self.enable_mfu_metrics,
+            enable_store_metrics=self.enable_store_metrics,
             enable_mm_processor_stats=self.enable_mm_processor_stats,
             enable_logging_iteration_details=self.enable_logging_iteration_details,
         )
@@ -2552,6 +2581,7 @@ class EngineArgs:
             performance_mode=self.performance_mode,
             weight_transfer_config=self.weight_transfer_config,
             shutdown_timeout=self.shutdown_timeout,
+            shutdown_reap_timeout=self.shutdown_reap_timeout,
             watchdog_config=self.watchdog_config,
         )
 

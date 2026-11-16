@@ -20,6 +20,7 @@ COMMON_DEFAULTS = {
     "VLLM_SM70_GREEDY_VERIFY": "1",
     "VLLM_SM70_SKIP_REJECTED_BATCH_PACKS": "1",
     "VLLM_SM70_QSA_SHARED_KEY": "1",
+    "VLLM_SM70_QSA_REQUEST_SEGMENTS": "1",
     "VLLM_SM70_QSA_COMPACT_TOPK": "1",
     "VLLM_SM70_PLE_NGRAM_BATCH": "1",
     "VLLM_SM70_PLE_INPUT_PREPARE": "1",
@@ -57,7 +58,6 @@ NVFP4_DEFAULTS = {
     "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE": "1",
     "VLLM_SM70_NVFP4_MOE_GROUPED_DECODE": "0",
     "VLLM_SM70_NVFP4_TURBOMIND": "1",
-    "VLLM_SM70_FP8_TURBOMIND": "1",
     "VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL": "1",
     "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES": "1",
     "VLLM_V2_CUDAGRAPH_MEM_MIB": "700",
@@ -104,7 +104,12 @@ AUDITED_NAMES = tuple(
 )
 # Keep the AWQ audit inventory byte-compatible. Format-specific entries are
 # included in NVFP4 audits and provenance transport only.
-_ALL_AUDITED_NAMES = tuple(sorted(set(AUDITED_NAMES) | set(NVFP4_DEFAULTS)))
+# VLLM_SM70_FP8_TURBOMIND is no longer written (its unset default is already 1;
+# kernel_config.sm70_fp8.enabled replaces it for FP8 linear layers) but stays
+# audited for NVFP4 mixed checkpoints, whose MoE consumers still read it.
+_ALL_AUDITED_NAMES = tuple(
+    sorted(set(AUDITED_NAMES) | set(NVFP4_DEFAULTS) | {"VLLM_SM70_FP8_TURBOMIND"})
+)
 # Diagnostic transport only: never use it to resolve an operator setting.
 # The VLLM_ prefix also carries it through worker environment propagation.
 _PROVENANCE_ENV = "VLLM_REVOLTA_PROFILE_PROVENANCE"
@@ -187,9 +192,37 @@ def has_qsa_capability(model_config: Any) -> bool:
     )
     values = [getattr(text, field, None) for field in fields]
     return all(isinstance(v, int) and v > 0 for v in values) and any(
-        kind in ("full_attention", "qwen_sparse_attention")
+        kind in ("full_attention", "qwen_sparse_attention", "indexed_attention")
         for kind in (getattr(text, "layer_types", None) or ())
     )
+
+
+def _has_awq_qpn_shape(model_config: Any, tensor_parallel_size: int) -> bool:
+    """The measured native-g32 QPN banks are E512, K=2560, TP shard N=160.
+
+    Missing metadata keeps AWQ's generic admission. Do not turn its implicit
+    fallback into an explicit fail-closed QPN request for an unknown shape.
+    """
+    text = getattr(model_config, "hf_text_config", None)
+    if tensor_parallel_size != 4 or any(
+        getattr(text, name, None) != value
+        for name, value in (
+            ("hidden_size", 2560),
+            ("moe_intermediate_size", 640),
+            ("num_experts", 512),
+            ("num_experts_per_tok", 10),
+        )
+    ):
+        return False
+    for owner in ("hf_config", "hf_text_config", "model_arch_config"):
+        quant = getattr(getattr(model_config, owner, None), "quantization_config", None)
+        if quant is not None:
+            return (
+                isinstance(quant, dict)
+                and quant.get("q_group_size", quant.get("group_size")) == 32
+                and quant.get("w_bit", quant.get("bits")) == 4
+            )
+    return False
 
 
 def all_visible_devices_sm70() -> bool:
@@ -305,9 +338,10 @@ def apply_revolta_profile(
         return False
     defaults = dict(COMMON_DEFAULTS)
     if getattr(model_config, "quantization", None) == "awq":
-        defaults.update(AWQ_DEFAULTS)
-        if speculative_method == "dflash":
-            defaults.update(AWQ_DFLASH_DEFAULTS)
+        if _has_awq_qpn_shape(model_config, tensor_parallel_size):
+            defaults.update(AWQ_DEFAULTS)
+            if speculative_method == "dflash":
+                defaults.update(AWQ_DFLASH_DEFAULTS)
     elif has_nvfp4_weights(model_config):
         defaults.update(NVFP4_DEFAULTS)
     if interconnect_mode != "no_p2p":

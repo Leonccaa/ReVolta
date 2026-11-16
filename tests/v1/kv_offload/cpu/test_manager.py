@@ -29,6 +29,26 @@ def make_req_context(
 _EMPTY_REQ_CTX = make_req_context()
 
 
+@pytest.mark.parametrize("failure", ["missing", "unready", "descriptor"])
+@pytest.mark.parametrize("policy", ["lru", "arc"])
+def test_prepare_load_failure_leaves_no_partial_pin(monkeypatch, failure, policy):
+    manager = CPUOffloadingManager(3, cache_policy=policy)
+    keys = to_keys([0, 1])
+    manager.prepare_store(keys, _EMPTY_REQ_CTX)
+    manager.complete_store(keys[:1] if failure == "unready" else keys, _EMPTY_REQ_CTX)
+    if failure == "missing":
+        keys[1] = to_key(99)
+    if failure == "descriptor":
+
+        def fail_descriptor(*args):
+            raise RuntimeError("descriptor failed")
+
+        monkeypatch.setattr(manager, "_get_load_store_spec", fail_descriptor)
+    with pytest.raises((AssertionError, RuntimeError)):
+        manager.prepare_load(keys, _EMPTY_REQ_CTX)
+    assert manager._policy.get(keys[0]).ref_cnt == 0
+
+
 @dataclass
 class ExpectedPrepareStoreOutput:
     keys_to_store: list[int]

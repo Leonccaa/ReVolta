@@ -14,7 +14,7 @@ import torch
 
 from tests.quantization.utils import is_quant_method_supported
 from vllm.config.model import ModelConfig
-from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptFp8Config,
     ModelOptMixedPrecisionConfig,
@@ -516,3 +516,27 @@ def test_modelopt_mixed_precision_builds_w4a16_sibling_config():
     assert config.nvfp4_config.LinearMethodCls is m.ModelOptNvFp4LinearMethod
     assert config.w4a16_nvfp4_config.quant_method == "W4A16_NVFP4"
     assert config.w4a16_nvfp4_config.LinearMethodCls is m.ModelOptNvFp4W4A16LinearMethod
+
+
+@pytest.mark.parametrize("layer_type", [LinearBase, ParallelLMHead])
+def test_modelopt_mixed_precision_rejects_unknown_linear_algo(layer_type):
+    config = _mixed_precision_config({"model.proj": {"quant_algo": "UNKNOWN"}})
+    with pytest.raises(ValueError, match="UNKNOWN.*model.proj"):
+        config.get_quant_method(Mock(spec=layer_type), "model.proj")
+
+
+@pytest.mark.parametrize("layer_type", [LinearBase, ParallelLMHead])
+def test_modelopt_mixed_precision_keeps_unquantized_layers(layer_type):
+    config = _mixed_precision_config({"model.proj": {"quant_algo": ""}})
+    layer = Mock(spec=layer_type)
+    assert isinstance(
+        config.get_quant_method(layer, "model.proj"), UnquantizedLinearMethod
+    )
+    assert isinstance(
+        config.get_quant_method(layer, "model.other"), UnquantizedLinearMethod
+    )
+    config.quantized_layers["model.proj"]["quant_algo"] = "UNKNOWN"
+    config.exclude_modules = ["model.proj"]
+    assert isinstance(
+        config.get_quant_method(layer, "model.proj"), UnquantizedLinearMethod
+    )

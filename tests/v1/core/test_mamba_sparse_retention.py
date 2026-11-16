@@ -790,3 +790,52 @@ def test_dflash_decode_retention_requires_prefix_caching():
     )
     state = cm.coordinator.single_type_managers[1]
     assert not state.keep_decode_resume_state
+
+
+def test_dflash_decode_windows_keep_ordinary_cache_priority():
+    prompt = 2 * STATE_BLOCK + 14
+    final = 7 * STATE_BLOCK + DRAFT_BLOCK + 10
+    cm = dflash2_manager(length=final + STATE_BLOCK)
+    request = _prompt("windows", prompt)
+    cold_prefill(cm, request, use_eagle=False, budget=512)
+    drafter = cm.coordinator.single_type_managers[DRAFTER_GROUP]
+    need = SlidingWindowManager._contiguous_blocks_for_hit(
+        drafter.kv_cache_spec.sliding_window, DRAFT_BLOCK, True
+    )
+    first = 3 * STATE_BLOCK // DRAFT_BLOCK + 1 - need
+    first_block = None
+    released_first = False
+    while request.num_computed_tokens < final:
+        start = request.num_computed_tokens
+        request.num_tokens = start + 1
+        request.block_hashes = _prompt("windows", start + 8).block_hashes
+        for manager in cm.coordinator.single_type_managers:
+            manager.new_step_starts()
+            manager.remove_skipped_blocks(request.request_id, start, prompt)
+            manager.allocate_new_blocks(request.request_id, start + 8, start + 8)
+        cm.coordinator.cache_blocks(request, request.num_tokens)
+        draft_blocks = drafter.req_to_blocks[request.request_id]
+        if first_block is None and len(draft_blocks) > first:
+            first_block = draft_blocks[first]
+            assert not first_block.is_null
+        if first_block is not None and draft_blocks[first].is_null:
+            # The first decode window must survive even before its complete
+            # lookahead is available. It is free, ordinary evictable cache.
+            assert first_block.ref_cnt == 0
+            assert first_block.block_hash is not None
+            released_first = True
+        request.num_computed_tokens = min(start + 3, final)
+    assert released_first
+    request.num_tokens = final + 1
+    request.block_hashes = _prompt("windows", final + 1).block_hashes
+    cm.coordinator.free(request)
+    hashes = BlockHashListWithBlockSize(request.block_hashes, DRAFT_BLOCK, DRAFT_BLOCK)
+    for boundary in range(3 * STATE_BLOCK, 8 * STATE_BLOCK, STATE_BLOCK):
+        end = boundary // DRAFT_BLOCK + 1
+        for index in range(end - need, end):
+            cached = cm.block_pool.get_cached_block(hashes[index], [DRAFTER_GROUP])
+            assert cached is not None, (boundary, index)
+            assert cached[0].ref_cnt == 0
+    _, hit = cm.get_computed_blocks(request)
+    assert hit == 7 * STATE_BLOCK
+    assert all(b.ref_cnt == 0 for b in cm.block_pool.blocks if not b.is_null)

@@ -165,7 +165,7 @@ def test_small_chunks_preserve_hybrid_resend_window(length, eagle):
             not block.is_null for block in swa.req_to_blocks[request.request_id]
         )
         assert real_blocks <= specs[2].max_admission_blocks_per_request(512, 262144)
-    cache.coordinator.free(request.request_id)
+    cache.coordinator.free(request)
     _, hit = cache.get_computed_blocks(request)
     expected = (length // 8192 - 1) * 8192 if eagle else (length - 1) // 8192 * 8192
     assert hit == max(expected, 0)

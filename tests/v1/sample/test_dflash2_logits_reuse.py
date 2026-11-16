@@ -11,6 +11,7 @@ import torch
 
 from vllm.model_executor.layers import logits_processor as logits_module
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.v1.worker.gpu.sample.states import SamplingStates
 from vllm.v1.worker.gpu.spec_decode.dflash2 import sparse_rejection
 
 
@@ -98,16 +99,25 @@ def test_cutoff_fallback_records_completed_projection_on_every_rank(
     probe = torch.ones(8, 21)  # Ties crossing top-k require exact full-vocab fallback.
     model = SimpleNamespace(
         get_topk_tokens_and_logits=Mock(side_effect=AssertionError("legacy call")),
-        get_topk_tokens_and_logits_with_fallback=lambda *args: (None, probe, fallback),
+        get_topk_tokens_and_logits_with_fallback=lambda *args: (
+            torch.arange(21).expand(8, -1),
+            probe,
+            fallback,
+        ),
     )
     states = SimpleNamespace(
-        temperature=SimpleNamespace(np=np.array([0.7])),
+        vocab_size=64,
+        temperature=SimpleNamespace(np=np.array([0.7]), gpu=torch.tensor([0.7])),
         top_p=SimpleNamespace(np=np.array([0.8])),
+    )
+    states.apply_temperature = lambda x, mapping, idx: SamplingStates.apply_temperature(
+        states, x, mapping, idx
     )
     batch = SimpleNamespace(
         has_structured_output_reqs=False,
         idx_mapping_np=np.array([0]),
         cu_num_logits_np=np.array([0, 8]),
+        expanded_idx_mapping=torch.zeros(8, dtype=torch.int32),
     )
     result = sparse_rejection.try_dflash2_sparse_target_rejection(
         model,

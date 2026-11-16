@@ -10,6 +10,7 @@ import torch
 from vllm.v1.sample.ops.topk_topp_triton import (
     sort_topk_with_vocab_ties,
 )
+from vllm.v1.worker.gpu.sample.states import SamplingStates
 from vllm.v1.worker.gpu.spec_decode.dflash2 import sparse_rejection
 from vllm.v1.worker.gpu.spec_decode.dflash2.sparse_rejection import (
     _compact_target_requires_reference,
@@ -72,18 +73,30 @@ def test_compact_rejection_uses_request_mapping_and_variable_row_counts(
     probe[:, :2] = 2.0
     probe[:, -1] = -20.0
     states = SimpleNamespace(
-        temperature=SimpleNamespace(np=np.array(temperatures)),
+        vocab_size=256,
+        temperature=SimpleNamespace(
+            np=np.array(temperatures), gpu=torch.tensor(temperatures)
+        ),
         top_p=SimpleNamespace(np=np.array(top_ps)),
+    )
+    states.apply_temperature = lambda x, mapping, idx: SamplingStates.apply_temperature(
+        states, x, mapping, idx
     )
     batch = SimpleNamespace(
         has_structured_output_reqs=False,
         idx_mapping_np=np.array([2, 0]),
         cu_num_logits_np=np.array([0, 1, 3]),
+        expanded_idx_mapping=torch.tensor([2, 0, 0]),
     )
     # Request 2 is unambiguous; the two rows of request 0 need the reference.
     # No GPU sampling should be attempted after detecting the split tie.
     result = sparse_rejection.try_dflash2_sparse_target_rejection(
-        SimpleNamespace(get_topk_tokens_and_logits=lambda *args: (None, probe)),
+        SimpleNamespace(
+            get_topk_tokens_and_logits=lambda *args: (
+                torch.arange(21).expand(3, -1),
+                probe,
+            )
+        ),
         Speculator(),
         SimpleNamespace(sampler=SimpleNamespace(sampling_states=states)),
         SimpleNamespace(device=SimpleNamespace(type="cuda")),

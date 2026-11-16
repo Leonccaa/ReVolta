@@ -148,11 +148,11 @@ def _qsa_grouped_page4_supported(
     flash_attn_v100_cuda,
     kv_cache_dtype: str,
 ) -> bool:
-    if kv_cache_dtype == "int8":
+    if resolve_kv_codec(kv_cache_dtype) in (INT8, FP8_E4M3_PER_TOKEN_HEAD):
         capability = getattr(flash_attn_v100_cuda, "int8_page4_abi_version", None)
         return (
             callable(capability)
-            and capability() == 1
+            and capability() == 2
             and callable(
                 getattr(flash_attn_v100_cuda, "grouped_sparse_int8_page4_fwd", None)
             )
@@ -2879,10 +2879,8 @@ def qsa_dcp_sparse_paged_attention_sm70_grouped_page4(
     multiple of eight, or 0 when the route does not apply. The caller runs the
     remaining rows through ``qsa_sparse_paged_attention``.
     """
-    # The new planar codec uses Triton until its native page4 step is ready.
-    if resolve_kv_codec(kv_cache_dtype) is FP8_E4M3_PER_TOKEN_HEAD:
-        return 0
-    if kv_cache_dtype == "int8":
+    codec = resolve_kv_codec(kv_cache_dtype)
+    if codec in (INT8, FP8_E4M3_PER_TOKEN_HEAD):
         from .qsa_int8 import dcp_grouped
 
         return dcp_grouped(
@@ -2896,6 +2894,7 @@ def qsa_dcp_sparse_paged_attention_sm70_grouped_page4(
             lse,
             k_scale_cache,
             v_scale_cache,
+            codec=codec,
         )
 
     heads = 6

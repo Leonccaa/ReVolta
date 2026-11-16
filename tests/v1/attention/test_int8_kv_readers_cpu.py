@@ -226,7 +226,7 @@ def test_fail_closed_native_abi(monkeypatch):
         "flash_attn_v100.flash_attn_interface",
         SimpleNamespace(flash_attn_v100_cuda=SimpleNamespace()),
     )
-    with pytest.raises(RuntimeError, match="ABI v1"):
+    with pytest.raises(RuntimeError, match="ABI v2"):
         reader.require_int8_abi()
 
 
@@ -305,7 +305,7 @@ def test_grouped_int8_capability_does_not_inherit_legacy_abi():
         grouped_sparse_page4_plan_fwd=lambda: None,
     )
     assert not _qsa_grouped_page4_supported(old, "int8")
-    old.int8_page4_abi_version = lambda: 1
+    old.int8_page4_abi_version = lambda: 2
     old.grouped_sparse_int8_page4_fwd = lambda: None
     assert _qsa_grouped_page4_supported(old, "int8")
 

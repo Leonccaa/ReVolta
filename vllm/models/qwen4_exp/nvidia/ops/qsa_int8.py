@@ -331,9 +331,9 @@ def require_int8_abi():
     from flash_attn_v100.flash_attn_interface import flash_attn_v100_cuda as native
 
     version = getattr(native, "int8_page4_abi_version", None)
-    if not callable(version) or version() != 1:
+    if not callable(version) or version() != 2:
         raise RuntimeError(
-            "INT8 KV requires Flash-V100 page4 ABI v1; rebuild the wheel"
+            "INT8 KV requires Flash-V100 page4 ABI v2; rebuild the wheel"
         )
     for name in (
         "decode_int8_page4_fwd",
@@ -492,11 +492,13 @@ def triton_attention(
     return out
 
 
-def native_decode(q, k, v, indices, table, requests, positions, seq_lens, out, sk, sv):
+def native_decode(
+    q, k, v, indices, table, requests, positions, seq_lens, out, sk, sv, *, codec=INT8
+):
     from .qsa import _qsa_xqa_page4_block_table, _qsa_xqa_page4_workspace
 
     native = require_int8_abi()
-    mapping = validate_planes(q, k, v, sk, sv)
+    mapping = validate_planes(q, k, v, sk, sv, codec)
     pages, lengths = _qsa_xqa_page4_block_table(
         indices,
         table,
@@ -529,12 +531,25 @@ def native_decode(q, k, v, indices, table, requests, positions, seq_lens, out, s
 
 
 def native_grouped(
-    q, k, v, indices, table, requests, positions, seq_lens, out, sk, sv, lse=None
+    q,
+    k,
+    v,
+    indices,
+    table,
+    requests,
+    positions,
+    seq_lens,
+    out,
+    sk,
+    sv,
+    lse=None,
+    *,
+    codec=INT8,
 ):
     from .qsa import _qsa_grouped_page4_workspace
 
     native = require_int8_abi()
-    mapping = validate_planes(q, k, v, sk, sv)
+    mapping = validate_planes(q, k, v, sk, sv, codec)
     rows = q.shape[0]
     padded = triton.cdiv(rows, 8) * 8
     if padded != rows:
@@ -614,22 +629,45 @@ def sparse_attention(
     if q.shape[0] == 0:
         return out
     native_shape = (
-        codec is INT8
+        q.dtype == torch.float16
         and q.shape[1] % 6 == 0
         and q.shape[2] == 256
         and indices.shape[1] == 2051
-        and k.shape[1:] == (16, 1, 256)
+        and k.shape[2:] == (1, 256)
+        and (codec is FP8_E4M3_PER_TOKEN_HEAD or k.shape[1] == 16)
         and positions is not None
         and seq_lens is not None
     )
     if native_shape and lse is None:
         if q.shape[0] < 8 and q.shape[1] == 6:
             native_decode(
-                q, k, v, indices, table, requests, positions, seq_lens, out, sk, sv
+                q,
+                k,
+                v,
+                indices,
+                table,
+                requests,
+                positions,
+                seq_lens,
+                out,
+                sk,
+                sv,
+                codec=codec,
             )
         else:
             native_grouped(
-                q, k, v, indices, table, requests, positions, seq_lens, out, sk, sv
+                q,
+                k,
+                v,
+                indices,
+                table,
+                requests,
+                positions,
+                seq_lens,
+                out,
+                sk,
+                sv,
+                codec=codec,
             )
         if gate is not None:
             _qsa_output_gate(out, gate.view_as(q))
@@ -650,10 +688,18 @@ def sparse_attention(
     )
 
 
-def dcp_grouped(q, k, v, indices, table, requests, out, lse, sk, sv):
-    """INT8 DCP uses the same owner mapping on each rank, with separate scales."""
-    require_int8_abi()
-    if q.shape[0] < 8 or q.shape[1] % 6 or indices.shape[1] != 2051:
+def dcp_grouped(q, k, v, indices, table, requests, out, lse, sk, sv, *, codec=INT8):
+    """Row-scaled DCP uses the same owner mapping on each rank."""
+    if codec is INT8:
+        require_int8_abi()
+    rows = q.shape[0]
+    if codec is FP8_E4M3_PER_TOKEN_HEAD:
+        from .qsa import _SM70_QSA_DCP_GROUPED_PAGE4_MIN_ROWS
+
+        if q.dtype != torch.float16 or rows < _SM70_QSA_DCP_GROUPED_PAGE4_MIN_ROWS:
+            return 0
+        rows = rows // 8 * 8
+    if rows < 8 or q.shape[1] % 6 or indices.shape[1] != 2051:
         return 0
     capacity = table.shape[1] * k.shape[1]
     positions = torch.full(
@@ -663,6 +709,18 @@ def dcp_grouped(q, k, v, indices, table, requests, out, lse, sk, sv):
         (table.shape[0],), capacity, device=q.device, dtype=torch.int32
     )
     native_grouped(
-        q, k, v, indices, table, requests, positions, lengths, out, sk, sv, lse
+        q[:rows],
+        k,
+        v,
+        indices[:rows],
+        table,
+        requests[:rows],
+        positions[:rows],
+        lengths,
+        out[:rows],
+        sk,
+        sv,
+        lse[:rows],
+        codec=codec,
     )
-    return q.shape[0]
+    return rows

@@ -303,25 +303,13 @@ class LogitsProcessor(PluggableLayer):
             )
         return logits
 
-    def get_top_tokens(
+    def get_local_top1(
         self,
         lm_head: VocabParallelEmbedding,
         hidden_states: torch.Tensor,
         embedding_bias: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Vocab-parallel argmax without all-gathering full logits.
-
-        Each TP rank computes local argmax, then only the (value, index) pairs
-        are gathered and reduced. Communication: O(batch * 2 * tp_size) vs
-        O(batch * vocab_size).
-        """
-        if self.scale <= 0.0 and self.scale != 1.0:
-            raise ValueError(
-                "The local argmax reduction optimization is not supported for "
-                "non-positive logit scaling factors."
-            )
-        tp_size = get_tensor_model_parallel_world_size()
-
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return this shard's maximum values and global vocabulary indices."""
         local_top1 = lm_head.maybe_get_sm70_lm_head_top1(hidden_states, embedding_bias)
         if local_top1 is None:
             logits = lm_head.quant_method.apply(
@@ -345,6 +333,24 @@ class LogitsProcessor(PluggableLayer):
         else:
             local_max_vals, global_indices = local_top1
 
+        return local_max_vals, global_indices
+
+    def get_top_tokens(
+        self,
+        lm_head: VocabParallelEmbedding,
+        hidden_states: torch.Tensor,
+        embedding_bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Vocab-parallel argmax gathering only (value, index) pairs."""
+        if self.scale <= 0.0 and self.scale != 1.0:
+            raise ValueError(
+                "The local argmax reduction optimization is not supported for "
+                "non-positive logit scaling factors."
+            )
+        tp_size = get_tensor_model_parallel_world_size()
+        local_max_vals, global_indices = self.get_local_top1(
+            lm_head, hidden_states, embedding_bias
+        )
         if tp_size == 1:
             self._maybe_dump_top_token_margin(
                 lm_head, hidden_states, embedding_bias, global_indices

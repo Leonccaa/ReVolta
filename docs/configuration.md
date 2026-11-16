@@ -96,6 +96,20 @@ or disable custom all-reduce with `--disable-custom-all-reduce`.
 - Media limits and request budgets: see
   [multimodal input limits](../.github/MULTIMODAL_INPUTS.md).
 
+## Optional MTP draft vocabulary in model runner V2
+
+Enable a static shortlist with `VLLM_SM70_MTP_STATIC_DRAFT_VOCAB_RANKING=<ranking.pt>` and `VLLM_SM70_MTP_STATIC_DRAFT_VOCAB_SIZE=65536`. The ranking artifact must match the model vocabulary and TP size. Static drafting maps both greedy and probabilistic proposals back to full vocabulary token IDs.
+
+Set `VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_TAIL_SIZE=512` to add a global LRU tail shared by all concurrent requests in that worker group. The default is `0` (disabled); supported capacities are 1–2048, with 512 or 1024 recommended as starting points. Each step updates the tail from actual accepted/recovered/bonus output tokens in request-row order. Seeds come from the next T entries after the static base in the ranking. There is no per-request tail, target top-k bootstrap, adaptive capacity or periodic full-head refresh.
+
+The tail requires `method="mtp"`, an enabled static shortlist, an FP16 LM-head, no logits soft cap, scale 1, at least B+T ranking entries, and a model padding token outside the static base for SINK. Unsupported configurations raise `ValueError` at startup. `VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_GPU_LRU`, `VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_FUSED_PROPOSAL`, `VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_FULL_REFRESH_INTERVAL` and `VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_PREFILL_TOPK` are V1-only; setting any of them in V2 is an error, including setting it to zero.
+
+Greedy drafting uses local base top1 plus tail logits; with local argmax reduction disabled it uses concatenated logits and argmax. Probabilistic drafting samples the concatenation and maps the processed proposal logits to the full vocabulary for verification. The tail implementation supports both draft sampling methods; the deployment sampling guidance above and the existing hardware/model support scope still apply. CPU interpreter tests do not establish GPU, CUDA graph or production acceptance.
+
+Each rank reserves T physical FP16 weight rows, even though the global effective tail capacity is T across all ranks. Tail weights cost `2*T*H` bytes per rank: with H=2560, 512 costs 2.5 MiB and 1024 costs 5 MiB. State, token maps and sampling buffers add memory; probabilistic processed logits use `4*max_num_seqs*K*(B+TP*T)` bytes in addition to the existing full-vocabulary verification buffer. Measure acceptance length, round time and throughput on the intended workload before choosing a capacity.
+
+Before requests, confirm the existing `Enabled static MTP draft vocabulary` message and one `Enabled global MTP draft vocabulary tail: base=%d tail=%d tp=%d sink=%d draft_sample=%s` message on each TP rank, with the configured tail size. For TP4 all four ranks must report the configured value. This confirms activation; output correctness and performance require separate GPU acceptance.
+
 ## Optional native DFlash2 lookup
 
 The `dflash2_lookup` object inside `--speculative-config` is disabled by default.

@@ -149,15 +149,28 @@ def test_dummy_warmup_covers_filter_modes_and_split_boundary(monkeypatch):
     seen = set()
 
     def filter_logits(logits, k, p):
+        assert logits.dtype == torch.float32
         seen.add((logits.shape[0], k is not None, p is not None))
         return logits
 
     monkeypatch.setattr(sampler, "HAS_TRITON", True)
     monkeypatch.setattr(sampler, "apply_top_k_top_p", filter_logits)
-    sampler.warmup_top_k_top_p(torch.randn(65, 32))
-    for rows in (1, 5, 10, 20, 40, 64, 65):
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_seqs=16), num_speculative_tokens=4
+    )
+    sampler.warmup_top_k_top_p(torch.randn(16, 32, dtype=torch.float16), config)
+    for rows in (1, 5, 10, 20, 40, 64, 80):
         for has_k, has_p in ((True, False), (False, True), (True, True)):
             assert (rows, has_k, has_p) in seen
+
+
+@GPU
+def test_fp16_warmup_runs_expanded_native_modes():
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_seqs=16), num_speculative_tokens=4
+    )
+    sampler.warmup_top_k_top_p(_logits(16, "random").half(), config)
+    torch.accelerator.synchronize()
 
 
 def _assert_topp_boundary(logits, actual, reference):
@@ -187,7 +200,17 @@ def _assert_topp_boundary(logits, actual, reference):
     assert (logits[different] >= lower[different]).all()
 
 
-def _assert_joint_contract(logits, actual, reference, k, p, pattern):
+def _upstream_joint_reference(logits, k, p):
+    cutoff = logits.sort(-1, descending=True).values.gather(1, (k.long() - 1)[:, None])
+    ties = logits == cutoff
+    topk_mask = (logits > cutoff) | (
+        ties & (ties.cumsum(-1) <= (k - (logits > cutoff).sum(-1))[:, None])
+    )
+    candidates = logits.masked_fill(~topk_mask, -float("inf"))
+    return candidates, sampler.apply_top_k_top_p_pytorch(candidates.clone(), None, p)
+
+
+def _assert_joint_contract(logits, actual, candidates, reference, p):
     kept = torch.isfinite(actual)
     common = kept & torch.isfinite(reference)
     assert torch.equal(
@@ -195,23 +218,11 @@ def _assert_joint_contract(logits, actual, reference, k, p, pattern):
     )
     assert torch.equal(actual[kept].view(torch.int32), logits[kept].view(torch.int32))
 
-    if pattern == "random" and (k < 128).all():
-        assert torch.equal(kept, torch.isfinite(reference))
-        return
-
-    cutoff = logits.sort(-1, descending=True).values.gather(1, (k.long() - 1)[:, None])
-    ties = logits == cutoff
-    # The sort reference keeps every top-k cutoff tie. Upstream instead
-    # retains the first k tokens, so top-p must normalize that candidate set.
-    strict_topk_mask = (logits > cutoff) | (
-        ties & (ties.cumsum(-1) <= (k - (logits > cutoff).sum(-1))[:, None])
-    )
-    assert not (kept & ~strict_topk_mask).any()
-    strict_topk = logits.masked_fill(~strict_topk_mask, -float("inf"))
-    normalized = sampler.apply_top_k_top_p_pytorch(strict_topk.clone(), None, p)
+    topk_mask = torch.isfinite(candidates)
+    assert not (kept & ~topk_mask).any()
     no_topp = p == 1.0
-    assert torch.equal(kept[no_topp], strict_topk_mask[no_topp])
-    _assert_topp_boundary(strict_topk, actual, normalized)
+    assert torch.equal(kept[no_topp], topk_mask[no_topp])
+    _assert_topp_boundary(candidates, actual, reference)
 
 
 @pytest.mark.parametrize(
@@ -227,18 +238,34 @@ def test_joint_comparison_reference_on_cpu(top_k, pattern):
         logits = logits.half().float()
     k = torch.full((5,), top_k, dtype=torch.int32)
     p = torch.full((5,), 0.95)
-    reference = sampler.apply_top_k_top_p_pytorch(logits.clone(), k, p)
+    candidates, reference = _upstream_joint_reference(logits, k, p)
     # Independent stable sort applies the upstream top-k index tie-break.
     indices = logits.argsort(dim=-1, descending=True, stable=True)[:, :top_k]
-    candidates = torch.full_like(logits, -float("inf"))
-    candidates.scatter_(1, indices, logits.gather(1, indices))
-    actual = sampler.apply_top_k_top_p_pytorch(candidates, None, p)
-    _assert_joint_contract(logits, actual, reference, k, p, pattern)
+    stable_candidates = torch.full_like(logits, -float("inf"))
+    stable_candidates.scatter_(1, indices, logits.gather(1, indices))
+    assert torch.equal(candidates, stable_candidates)
+    actual = sampler.apply_top_k_top_p_pytorch(stable_candidates, None, p)
+    _assert_joint_contract(logits, actual, candidates, reference, p)
     retained = torch.isfinite(actual).nonzero()[0]
     changed = actual.clone()
     changed.view(torch.int32)[retained[0], retained[1]] ^= 1
     with pytest.raises(AssertionError):
-        _assert_joint_contract(logits, changed, reference, k, p, pattern)
+        _assert_joint_contract(logits, changed, candidates, reference, p)
+
+
+def test_joint_reference_normalizes_after_index_ordered_topk():
+    logits = torch.full((2, 256), -20.0)
+    logits[:, :18] = 2.0
+    logits[:, 18:24] = 1.0
+    k = torch.full((2,), 20, dtype=torch.int32)
+    p = torch.full((2,), 0.5)
+    candidates, reference = _upstream_joint_reference(logits, k, p)
+    old_reference = sampler.apply_top_k_top_p_pytorch(logits.clone(), k, p)
+    assert torch.equal(torch.isfinite(candidates).sum(-1), k.long())
+    assert torch.isfinite(candidates[:, :20]).all()
+    assert torch.isneginf(candidates[:, 20:]).all()
+    assert torch.isfinite(old_reference).sum(-1).tolist() == [11, 11]
+    assert torch.isfinite(reference).sum(-1).tolist() == [10, 10]
 
 
 def test_topp_comparison_accepts_boundary_but_rejects_distant_token_on_cpu():
@@ -274,5 +301,5 @@ def test_joint_cutoff_support_and_value_bits(rows, top_k, top_p, pattern):
     p[4::4] = 1.0
     active_k = k if top_k is not None else None
     actual = sampler.apply_top_k_top_p(logits.clone(), active_k, p)
-    reference = sampler.apply_top_k_top_p_pytorch(logits.clone(), active_k, p)
-    _assert_joint_contract(logits, actual, reference, k, p, pattern)
+    candidates, reference = _upstream_joint_reference(logits, k, p)
+    _assert_joint_contract(logits, actual, candidates, reference, p)

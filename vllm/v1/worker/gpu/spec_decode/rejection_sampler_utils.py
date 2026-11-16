@@ -820,16 +820,10 @@ def _dflash2_compact_target_row(
     if temperature != 1.0:
         logits = logits / temperature
 
-    if LIMIT_K < TOP_K:
-        cutoff = tl.load(target_logits_ptr + row * target_stride + LIMIT_K - 1).to(
-            tl.float32
-        )
-        if temperature != 1.0:
-            cutoff = cutoff / temperature
-        # Keep every member of a tied top-k boundary within the admitted
-        # shortlist. The host guard rejects truncated boundary ties.
-        mask &= logits >= cutoff
-        logits = tl.where(mask, logits, float("-inf"))
+    # Candidates are score-descending, with ascending vocabulary IDs at ties.
+    # Match upstream dense top-k by retaining only the first LIMIT_K entries.
+    mask &= offsets < LIMIT_K
+    logits = tl.where(mask, logits, float("-inf"))
 
     # get_topk_tokens_and_logits returns scores in descending order. Apply
     # nucleus filtering only within that exact top-k support, matching the
@@ -1073,8 +1067,8 @@ def dflash2_sparse_topk_rejection_sample(
     Callers must enforce the no-penalty/no-logit-bias contract and provide
     target candidates after a global top-k merge. Draft scores must be the
     temperature-applied scores used to draw the corresponding proposal.
-    With target_top_k smaller than the shortlist, callers must retain all
-    cutoff ties and order equal target scores by descending vocabulary ID.
+    With target_top_k smaller than the shortlist, only that prefix is kept.
+    Callers must order equal target scores by ascending vocabulary ID.
     """
     if target_topk_ids.ndim != 2 or target_topk_logits.ndim != 2:
         raise ValueError("target top-k tensors must be two-dimensional")

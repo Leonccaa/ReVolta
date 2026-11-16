@@ -118,7 +118,7 @@ def test_shortlist_order_preserves_radix_ties_and_value_bits(width, descending):
             [-0.0, 0.0, -float("inf"), float("inf"), float("nan"), -float("nan")],
             device="cuda",
         )
-        ordered_ids, permutation = ids.sort(dim=-1, descending=descending)
+        ordered_ids, permutation = ids.sort(dim=-1)
         ordered_values = values.gather(1, permutation)
         ordered_values, permutation = ordered_values.sort(
             dim=-1, descending=descending, stable=True

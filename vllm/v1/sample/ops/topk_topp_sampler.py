@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -12,6 +13,9 @@ from vllm.config.model import LogprobsMode
 from vllm.logger import init_logger
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.triton_utils import HAS_TRITON
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
 if HAS_TRITON:
     from vllm.v1.sample.ops.topk_topp_triton import apply_top_k_top_p_triton
@@ -343,20 +347,24 @@ def apply_top_k_top_p(
     return apply_top_k_top_p_pytorch(logits, k, p, allow_cpu_sync=is_cpu)
 
 
-def warmup_top_k_top_p(logits: torch.Tensor) -> None:
+def warmup_top_k_top_p(logits: torch.Tensor, vllm_config: "VllmConfig") -> None:
     """Warm native filtering in the existing dummy sampler runs."""
     if not HAS_TRITON:
         return
     # Cover small-batch split counts and singleton scalar specializations,
-    # plus the monolithic path when the dummy batch exceeds the split limit.
-    batch_size, vocab_size = logits.shape
+    # plus the monolithic path for the maximum speculative-expanded batch.
+    logits = logits.to(torch.float32)
+    batch_size = vllm_config.scheduler_config.max_num_seqs * (
+        vllm_config.num_speculative_tokens + 1
+    )
+    vocab_size = logits.shape[1]
     for rows in (*range(1, min(batch_size, 64) + 1), batch_size):
         k = torch.full(
             (rows,), min(20, vocab_size), dtype=torch.int32, device=logits.device
         )
         p = torch.full((rows,), 0.95, dtype=torch.float32, device=logits.device)
         for top_k, top_p in ((k, None), (None, p), (k, p)):
-            apply_top_k_top_p(logits[:rows].clone(), top_k, top_p)
+            apply_top_k_top_p(logits[:1].expand(rows, -1).clone(), top_k, top_p)
 
 
 def apply_top_k_top_p_pytorch(

@@ -1645,16 +1645,23 @@ def _sort_topk_with_vocab_ties_kernel(
     # even its signed-zero/NaN bits survive the reordering.
     bits = tl.where(value == 0, 0, bits)
     numeric = tl.where((bits & 0x80000000) != 0, ~bits, bits ^ 0x80000000)
-    key = (numeric.to(tl.uint64) << 32) | (token.to(tl.uint64) << 8) | col.to(tl.uint64)
+    ordered_token = 0xFFFFFF - token if descending else token
+    key = (
+        (numeric.to(tl.uint64) << 32)
+        | (ordered_token.to(tl.uint64) << 8)
+        | col.to(tl.uint64)
+    )
     pad: tl.constexpr = 0 if descending else 0xFFFFFFFFFFFFFFFF
     key = tl.where(valid, key, pad)
     ordered = tl.sort(key, descending=descending)
     source_col = tl.minimum((ordered & 255).to(tl.int32), block - 1)
     ordered_value = tl.gather(value, source_col, axis=0)
     tl.store(out_values + row * width + col, ordered_value, valid)
+    ordered_token = ((ordered >> 8) & 0xFFFFFF).to(tl.int64)
+    token = 0xFFFFFF - ordered_token if descending else ordered_token
     tl.store(
         out_indices + row * width + col,
-        ((ordered >> 8) & 0xFFFFFF).to(tl.int64),
+        token,
         valid,
     )
 
@@ -1666,7 +1673,7 @@ def sort_topk_with_vocab_ties(
     vocab_size: int,
     descending: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Order a shortlist by score, then vocabulary ID, retaining value bits."""
+    """Order by score and ascending vocabulary ID, retaining value bits."""
     if (
         not values.is_cuda
         or values.dtype != torch.float32
@@ -1675,7 +1682,7 @@ def sort_topk_with_vocab_ties(
         or values.stride(-1) != 1
         or indices.stride(-1) != 1
     ):
-        indices, permutation = indices.sort(dim=-1, descending=descending)
+        indices, permutation = indices.sort(dim=-1)
         values = values.gather(1, permutation)
         values, permutation = values.sort(dim=-1, descending=descending, stable=True)
         return values, indices.gather(1, permutation)

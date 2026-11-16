@@ -68,7 +68,7 @@ def _compact_target_reference_rows_kernel(
     cutoff = tl.load(probe + row * row_stride + top_k - 1) / temperature
     last = tl.load(probe + row * row_stride + width - 1) / temperature
     logits = values / temperature
-    keep = (col < width) & (logits >= cutoff)
+    keep = (col < width) & (col < top_k)
     logits = tl.where(keep, logits, -float("inf"))
     probabilities = tl.exp(logits - tl.max(logits, 0))
     probabilities /= tl.sum(probabilities, 0)
@@ -137,12 +137,11 @@ def _compact_target_reference_rows(
     temperature = np.asarray(temperature, dtype=np.float32).reshape(-1, 1)
     top_p = np.asarray(top_p, dtype=np.float32).reshape(-1, 1)
     if vocab_ordered:
-        # The wider probe contains all cutoff ties unless its last value
-        # reaches the top-k boundary. Descending vocabulary order also
-        # reproduces a split top-p tie in the reference's retained suffix.
+        # If a tie reaches the end of the probe, unseen candidates may have
+        # smaller vocabulary IDs. Otherwise keep the index-ordered prefix.
         logits = probe / temperature
         truncated = probe[:, -1] >= probe[:, _TARGET_TOP_K - 1]
-        keep_k = logits >= logits[:, _TARGET_TOP_K - 1 : _TARGET_TOP_K]
+        keep_k = np.arange(probe.shape[1])[None, :] < _TARGET_TOP_K
         logits = np.where(keep_k, logits, -np.inf)
         with np.errstate(invalid="ignore", over="ignore", divide="ignore"):
             probs = np.exp(logits - logits.max(axis=-1, keepdims=True))
@@ -430,7 +429,8 @@ def try_dflash2_sparse_target_rejection(
     idx = input_batch.idx_mapping_np
     states = rejection_sampler.sampler.sampling_states
     # Preserve the small single-request path. The large-vocabulary reference
-    # uses stable radix order; retain the existing fallback for other sorts.
+    # uses ascending vocabulary IDs at ties; keep the existing fallback for
+    # probes that do not establish the global candidate order.
     retain_ties = idx.size > 1 and getattr(states, "vocab_size", 0) >= 32768
     probe_k = _TARGET_PROBE_K if retain_ties else _TARGET_TOP_K + 1
     fallback = None

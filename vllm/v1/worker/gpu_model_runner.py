@@ -11517,7 +11517,7 @@ class GPUModelRunner(
         from vllm.v1.sample.ops.topk_topp_sampler import warmup_top_k_top_p
 
         logits = self.model.compute_logits(hidden_states)
-        warmup_top_k_top_p(logits)
+        warmup_top_k_top_p(logits, self.vllm_config)
         num_reqs = logits.size(0)
 
         dummy_tensors = lambda v: torch.full((num_reqs,), v, device=self.device)

@@ -14,9 +14,7 @@ from vllm.utils import checkpoint_cache as cache
 
 @pytest.fixture
 def enabled(monkeypatch):
-    monkeypatch.setitem(
-        vars(cache.envs), "REVOLTA_RESEARCH_CHECKPOINT_CACHE_DROP", True
-    )
+    monkeypatch.setitem(vars(cache.envs), "VLLM_SM70_CHECKPOINT_CACHE_DROP", True)
     events = []
     group = SimpleNamespace(barrier=lambda: events.append("host-allocation-fence"))
 
@@ -40,9 +38,7 @@ def test_main_and_draft_collection_and_scope_reset(enabled, tmp_path):
 
 
 def test_disabled_does_not_advise_or_synchronize(monkeypatch, tmp_path):
-    monkeypatch.setitem(
-        vars(cache.envs), "REVOLTA_RESEARCH_CHECKPOINT_CACHE_DROP", False
-    )
+    monkeypatch.setitem(vars(cache.envs), "VLLM_SM70_CHECKPOINT_CACHE_DROP", False)
     advise, synchronize = Mock(), Mock()
     monkeypatch.setattr(os, "posix_fadvise", advise)
     monkeypatch.setattr(cache, "_synchronize_loaders", synchronize)
@@ -222,7 +218,7 @@ def _gloo_drop_worker(rank, rendezvous, files, waiting, loaded, release, results
     )
     parallel_state.get_world_group = lambda: group
     torch.accelerator.synchronize = lambda: waiting.set() if rank == 0 else None
-    vars(cache.envs)["REVOLTA_RESEARCH_CHECKPOINT_CACHE_DROP"] = True
+    vars(cache.envs)["VLLM_SM70_CHECKPOINT_CACHE_DROP"] = True
     advised = []
 
     def advise(fd, offset, length, advice):

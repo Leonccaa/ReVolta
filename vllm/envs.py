@@ -356,11 +356,7 @@ if TYPE_CHECKING:
     VLLM_QSA_INDEX_SHARD_DEBUG: bool = False
     VLLM_QSA_INDEX_SHARD_FUSED_MERGE: bool = True
     REVOLTA_RESEARCH_HOST_DECODE_FAST: bool = False
-    REVOLTA_RESEARCH_HOST_DECODE_FAST_ORDERED: bool = False
     REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED: bool = False
-    REVOLTA_RESEARCH_QSA_DECODE_COALESCE_AG: bool = False
-    REVOLTA_RESEARCH_PREGRAPH_GDN_COMMON_CACHE: bool = False
-    REVOLTA_RESEARCH_PREGRAPH_REPLAY_VIEWS: bool = False
     VLLM_DFLASH2_LOOKUP_ADAPTIVE: bool = True
     VLLM_DFLASH2_LOOKUP_NSTRONG: int = 6
     VLLM_DFLASH2_LOOKUP_AGREE: int = 0
@@ -375,9 +371,9 @@ if TYPE_CHECKING:
     VLLM_SM70_GDN_CPU_SPEC_QSL: bool = False
     VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE: str = ""
     VLLM_SM70_GDN_SKINNY_MPLAN: bool = False
+    VLLM_SM70_HOST_DECODE_FAST: bool = True
+    VLLM_SM70_QSA_LOCAL_INPUTS_FUSED: bool = True
     REVOLTA_QSA_GROUPED_LPT: bool = False
-    REVOLTA_GDN_CPU_SPEC_QSL: bool = False
-    REVOLTA_GDN_CPU_SPEC_QSL_CHECK_FILE: str = ""
     REVOLTA_SKINNY_MPLAN: bool = False
     VLLM_SM70_QSA_REQUEST_SEGMENTS: bool = False
     VLLM_SM70_QSA_COMPACT_TOPK: bool = False
@@ -1027,6 +1023,7 @@ if TYPE_CHECKING:
     VLLM_QWEN4EXP_PLE_HOST_GIB: float | None = None
     VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB: float | None = None
     VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB: float | None = None
+    VLLM_SM70_CHECKPOINT_CACHE_DROP: bool = True
     REVOLTA_RESEARCH_CHECKPOINT_CACHE_DROP: bool = False
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
@@ -1176,16 +1173,24 @@ def deprecated_env(
     return _read
 
 
-# Research switches promoted in 0.2.0rc5: old name -> registered name. The old
-# names are honoured for one release with a FutureWarning; the new name wins
-# when both are set.
+# Research switches promoted to VLLM_SM70_* names (0.2.0rc5 and 0.2.0rc12):
+# old name -> registered name. The old names are honoured for one release
+# with a FutureWarning; the new name wins when both are set.
 PROMOTED_RESEARCH_ENVS = {
-    "REVOLTA_GDN_CPU_SPEC_QSL": "VLLM_SM70_GDN_CPU_SPEC_QSL",
-    "REVOLTA_GDN_CPU_SPEC_QSL_CHECK_FILE": "VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE",
     "REVOLTA_QSA_GROUPED_LPT": "VLLM_SM70_QSA_GROUPED_LPT",
     "REVOLTA_SKINNY_MPLAN": "VLLM_SM70_GDN_SKINNY_MPLAN",
+    "REVOLTA_RESEARCH_HOST_DECODE_FAST": "VLLM_SM70_HOST_DECODE_FAST",
+    "REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED": "VLLM_SM70_QSA_LOCAL_INPUTS_FUSED",
+    "REVOLTA_RESEARCH_CHECKPOINT_CACHE_DROP": "VLLM_SM70_CHECKPOINT_CACHE_DROP",
 }
-_PROMOTED_REMOVAL = "0.2.0rc6"
+# Release that drops each promoted switch's old alias, keyed by new name.
+_PROMOTED_REMOVALS = {
+    "VLLM_SM70_QSA_GROUPED_LPT": "0.2.0rc6",
+    "VLLM_SM70_GDN_SKINNY_MPLAN": "0.2.0rc6",
+    "VLLM_SM70_HOST_DECODE_FAST": "0.2.0rc13",
+    "VLLM_SM70_QSA_LOCAL_INPUTS_FUSED": "0.2.0rc13",
+    "VLLM_SM70_CHECKPOINT_CACHE_DROP": "0.2.0rc13",
+}
 
 
 def _promoted_raw(new_name: str, default: str) -> str:
@@ -1198,7 +1203,7 @@ def _promoted_raw(new_name: str, default: str) -> str:
     if old_name in os.environ:
         warnings.warn(
             f"{old_name} is deprecated and will be removed in "
-            f"{_PROMOTED_REMOVAL}. Use {new_name}.",
+            f"{_PROMOTED_REMOVALS[new_name]}. Use {new_name}.",
             FutureWarning,
             stacklevel=3,
         )
@@ -1206,12 +1211,8 @@ def _promoted_raw(new_name: str, default: str) -> str:
     return default
 
 
-def _promoted_flag(new_name: str) -> Callable[[], bool]:
-    return lambda: _promoted_raw(new_name, "0") == "1"
-
-
-def _promoted_str(new_name: str) -> Callable[[], str]:
-    return lambda: _promoted_raw(new_name, "")
+def _promoted_flag(new_name: str, default: str = "0") -> Callable[[], bool]:
+    return lambda: _promoted_raw(new_name, default) == "1"
 
 
 def sm70_debug_enabled(channel: str, legacy_name: str) -> bool:
@@ -4675,93 +4676,39 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=(),
         user_visible=False,
     ),
-    "REVOLTA_RESEARCH_PREGRAPH_GDN_COMMON_CACHE": env_var(
-        lambda: os.getenv("REVOLTA_RESEARCH_PREGRAPH_GDN_COMMON_CACHE", "0") == "1",
+    "VLLM_SM70_HOST_DECODE_FAST": env_var(
+        _promoted_flag("VLLM_SM70_HOST_DECODE_FAST", "1"),
         description=(
-            "Cache one pure-speculative FULL replay batch's common GDN geometry. "
-            "CPU offsets, draft counts and GPU offset-buffer layout guard reuse; "
-            "request state and accepted counts remain live. Default off pending "
-            "GPU equivalence and performance validation."
+            "Fuse host-history decode writes, marks and refill launches on "
+            "the long-context host KV path. Set 0 to restore the original "
+            "kernels. Promoted from REVOLTA_RESEARCH_HOST_DECODE_FAST in "
+            "0.2.0rc12."
         ),
-        category="experimental",
-        declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
-        acceleration_paths=(),
-        user_visible=False,
-    ),
-    "REVOLTA_RESEARCH_PREGRAPH_REPLAY_VIEWS": env_var(
-        lambda: os.getenv("REVOLTA_RESEARCH_PREGRAPH_REPLAY_VIEWS", "0") == "1",
-        description=(
-            "Share GDN replay metadata tensor views among layers using the same "
-            "metadata object within a FULL replay step. No cross-step state "
-            "cache. Default off pending GPU equivalence and performance validation."
+        category="tuning",
+        declared_default="True",
+        effective_default=(
+            "True; REVOLTA_RESEARCH_HOST_DECODE_FAST also controls it until 0.2.0rc13."
         ),
-        category="experimental",
-        declared_default="False",
-        effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
-        user_visible=False,
+        acceleration_paths=("Host-history decode (host KV)",),
+        user_visible=True,
     ),
-    "REVOLTA_RESEARCH_HOST_DECODE_FAST": env_var(
-        lambda: os.getenv("REVOLTA_RESEARCH_HOST_DECODE_FAST", "0") == "1",
-        description=(
-            "Fuse host-history decode writes, marks and refill launches. "
-            "Default off pending GPU validation; restart with 0 to restore "
-            "the original path."
-        ),
-        category="experimental",
-        declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
-        acceleration_paths=(),
-        user_visible=False,
-    ),
-    "REVOLTA_RESEARCH_HOST_DECODE_FAST_ORDERED": env_var(
-        lambda: os.getenv("REVOLTA_RESEARCH_HOST_DECODE_FAST_ORDERED", "0") == "1",
-        description=(
-            "With REVOLTA_RESEARCH_HOST_DECODE_FAST=1, keep the fused mark "
-            "kernel's tail claims ordered before selection claims so refill "
-            "pairing matches the unfused baseline's cache evolution. "
-            "Default off; restart with 0 to restore the unordered fused "
-            "mark. No effect while the parent switch is 0."
-        ),
-        category="experimental",
-        declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
-        acceleration_paths=(),
-        user_visible=False,
-    ),
-    "REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED": env_var(
-        lambda: os.getenv("REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED", "0") == "1",
+    "VLLM_SM70_QSA_LOCAL_INPUTS_FUSED": env_var(
+        _promoted_flag("VLLM_SM70_QSA_LOCAL_INPUTS_FUSED", "1"),
         description=(
             "Fuse integer metadata conversion for the DCP-sharded shared-key "
-            "scorer. Default off pending GPU validation; restart with 0 to "
-            "use the torch reference."
+            "scorer. Set 0 to use the torch reference. Promoted from "
+            "REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED in 0.2.0rc12."
         ),
-        category="experimental",
-        declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
-        acceleration_paths=(),
-        user_visible=False,
-    ),
-    "REVOLTA_RESEARCH_QSA_DECODE_COALESCE_AG": env_var(
-        lambda: os.getenv("REVOLTA_RESEARCH_QSA_DECODE_COALESCE_AG", "0") == "1",
-        description=(
-            "Coalesce sharded index candidates and main Q in one DCP2 "
-            "AllGather for uniform FULL-graph host decode. Default off; "
-            "requires identical settings on all ranks and GPU validation. "
-            "Restart with 0 to restore two exchanges."
+        category="tuning",
+        declared_default="True",
+        effective_default=(
+            "True; REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED also controls "
+            "it until 0.2.0rc13."
         ),
-        category="experimental",
-        declared_default="False",
-        effective_default="False",
         automatic_conditions=(),
-        acceleration_paths=(),
-        user_visible=False,
+        acceleration_paths=("QSA shared-key scoring (DCP shard)",),
+        user_visible=True,
     ),
     "VLLM_QSA_INDEX_SHARD_FUSED_MERGE": env_var(
         lambda: bool(int(os.getenv("VLLM_QSA_INDEX_SHARD_FUSED_MERGE", "1"))),
@@ -4821,7 +4768,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=True,
     ),
     "VLLM_SM70_GDN_CPU_SPEC_QSL": env_var(
-        _promoted_flag("VLLM_SM70_GDN_CPU_SPEC_QSL"),
+        lambda: os.getenv("VLLM_SM70_GDN_CPU_SPEC_QSL", "0") == "1",
         description=(
             "Build the GDN speculative/non-speculative query start offsets on "
             "the host from the CPU copies of the query lengths and spec masks "
@@ -4832,15 +4779,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         category="tuning",
         declared_default="False",
-        effective_default=(
-            "False; REVOLTA_GDN_CPU_SPEC_QSL=1 also enables it until 0.2.0rc6."
-        ),
+        effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("GDN attention metadata (host)",),
         user_visible=True,
     ),
     "VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE": env_var(
-        _promoted_str("VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE"),
+        lambda: os.getenv("VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE", ""),
         description=(
             "Validation for VLLM_SM70_GDN_CPU_SPEC_QSL: while the named file "
             "exists, also compute the offsets on the GPU the original way and "
@@ -4889,36 +4834,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=(),
         user_visible=False,
     ),
-    "REVOLTA_GDN_CPU_SPEC_QSL": env_var(
-        deprecated_env(
-            "REVOLTA_GDN_CPU_SPEC_QSL",
-            "0.2.0rc6",
-            "Use VLLM_SM70_GDN_CPU_SPEC_QSL.",
-            _promoted_flag("VLLM_SM70_GDN_CPU_SPEC_QSL"),
-        ),
-        description="Deprecated alias of VLLM_SM70_GDN_CPU_SPEC_QSL.",
-        category="deprecated",
-        declared_default="False",
-        effective_default="Same as VLLM_SM70_GDN_CPU_SPEC_QSL.",
-        automatic_conditions=(),
-        acceleration_paths=(),
-        user_visible=False,
-    ),
-    "REVOLTA_GDN_CPU_SPEC_QSL_CHECK_FILE": env_var(
-        deprecated_env(
-            "REVOLTA_GDN_CPU_SPEC_QSL_CHECK_FILE",
-            "0.2.0rc6",
-            "Use VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE.",
-            _promoted_str("VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE"),
-        ),
-        description="Deprecated alias of VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE.",
-        category="deprecated",
-        declared_default="''",
-        effective_default="Same as VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE.",
-        automatic_conditions=(),
-        acceleration_paths=(),
-        user_visible=False,
-    ),
     "REVOLTA_SKINNY_MPLAN": env_var(
         deprecated_env(
             "REVOLTA_SKINNY_MPLAN",
@@ -4930,6 +4845,51 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="deprecated",
         declared_default="False",
         effective_default="Same as VLLM_SM70_GDN_SKINNY_MPLAN.",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "REVOLTA_RESEARCH_HOST_DECODE_FAST": env_var(
+        deprecated_env(
+            "REVOLTA_RESEARCH_HOST_DECODE_FAST",
+            "0.2.0rc13",
+            "Use VLLM_SM70_HOST_DECODE_FAST.",
+            _promoted_flag("VLLM_SM70_HOST_DECODE_FAST", "1"),
+        ),
+        description="Deprecated alias of VLLM_SM70_HOST_DECODE_FAST.",
+        category="deprecated",
+        declared_default="False",
+        effective_default="Same as VLLM_SM70_HOST_DECODE_FAST.",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED": env_var(
+        deprecated_env(
+            "REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED",
+            "0.2.0rc13",
+            "Use VLLM_SM70_QSA_LOCAL_INPUTS_FUSED.",
+            _promoted_flag("VLLM_SM70_QSA_LOCAL_INPUTS_FUSED", "1"),
+        ),
+        description="Deprecated alias of VLLM_SM70_QSA_LOCAL_INPUTS_FUSED.",
+        category="deprecated",
+        declared_default="False",
+        effective_default="Same as VLLM_SM70_QSA_LOCAL_INPUTS_FUSED.",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "REVOLTA_RESEARCH_CHECKPOINT_CACHE_DROP": env_var(
+        deprecated_env(
+            "REVOLTA_RESEARCH_CHECKPOINT_CACHE_DROP",
+            "0.2.0rc13",
+            "Use VLLM_SM70_CHECKPOINT_CACHE_DROP.",
+            _promoted_flag("VLLM_SM70_CHECKPOINT_CACHE_DROP", "1"),
+        ),
+        description="Deprecated alias of VLLM_SM70_CHECKPOINT_CACHE_DROP.",
+        category="deprecated",
+        declared_default="False",
+        effective_default="Same as VLLM_SM70_CHECKPOINT_CACHE_DROP.",
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=False,
@@ -16223,19 +16183,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=(),
         user_visible=True,
     ),
-    "REVOLTA_RESEARCH_CHECKPOINT_CACHE_DROP": env_var(
-        lambda: bool(int(os.getenv("REVOLTA_RESEARCH_CHECKPOINT_CACHE_DROP", "0"))),
+    "VLLM_SM70_CHECKPOINT_CACHE_DROP": env_var(
+        _promoted_flag("VLLM_SM70_CHECKPOINT_CACHE_DROP", "1"),
         description=(
-            "Experimental startup-only checkpoint cache advice in GPU workers. "
-            "After all ranks finish main and draft loading, advise DONTNEED on "
+            "Startup-only checkpoint page-cache advice in GPU workers. After "
+            "all ranks finish main and draft loading, advise DONTNEED on "
             "DefaultModelLoader inputs that no rank still maps. PLE disk and "
             "cascade modes skip all inputs. Logs advised bytes and cgroup "
             "memory.current/file before and after; actual eviction is not "
-            "guaranteed. Set 0 to disable."
+            "guaranteed. Set 0 to disable. Promoted from "
+            "REVOLTA_RESEARCH_CHECKPOINT_CACHE_DROP in 0.2.0rc12."
         ),
-        category="experimental",
-        declared_default="False",
-        effective_default="False",
+        category="configuration",
+        declared_default="True",
+        effective_default=(
+            "True; REVOLTA_RESEARCH_CHECKPOINT_CACHE_DROP also controls it "
+            "until 0.2.0rc13."
+        ),
         automatic_conditions=(),
         acceleration_paths=("Checkpoint loading (startup, GPU worker)",),
         user_visible=True,
@@ -20340,12 +20304,13 @@ def compile_factors(speculative_config: Any = None) -> dict[str, object]:
         # Scheduler/KV planning only; never changes compiled code.
         "VLLM_SM70_HOST_KV_STATIC_HOT_POOL",
         # Runtime branches inside opaque QSA ops; no traced graph change.
+        "VLLM_SM70_HOST_DECODE_FAST",
+        "VLLM_SM70_QSA_LOCAL_INPUTS_FUSED",
         "REVOLTA_RESEARCH_HOST_DECODE_FAST",
-        "REVOLTA_RESEARCH_HOST_DECODE_FAST_ORDERED",
         "REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED",
-        # Host metadata construction only; captured model operations unchanged.
-        "REVOLTA_RESEARCH_PREGRAPH_GDN_COMMON_CACHE",
-        "REVOLTA_RESEARCH_PREGRAPH_REPLAY_VIEWS",
+        # Startup page-cache advice; no compiled code involved.
+        "VLLM_SM70_CHECKPOINT_CACHE_DROP",
+        "REVOLTA_RESEARCH_CHECKPOINT_CACHE_DROP",
         "VLLM_RPC_BASE_PATH",
         "VLLM_USE_MODELSCOPE",
         "VLLM_RINGBUFFER_WARNING_INTERVAL",
@@ -20378,8 +20343,6 @@ def compile_factors(speculative_config: Any = None) -> dict[str, object]:
         "VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE",
         "VLLM_SM70_GDN_SKINNY_MPLAN",
         "REVOLTA_QSA_GROUPED_LPT",
-        "REVOLTA_GDN_CPU_SPEC_QSL",
-        "REVOLTA_GDN_CPU_SPEC_QSL_CHECK_FILE",
         "REVOLTA_SKINNY_MPLAN",
         "VLLM_LOGGING_PREFIX",
         "VLLM_LOGGING_STREAM",

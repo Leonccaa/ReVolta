@@ -43,6 +43,7 @@ import numpy as np
 import torch
 from numpy.typing import NDArray
 
+from vllm import envs
 from vllm.triton_utils import triton
 from vllm.utils.torch_utils import (
     async_tensor_h2d,
@@ -68,11 +69,6 @@ from .staged_write import WritePlan
 # Module constants only so mutation tests can show the tests depend on them.
 _UNION_ROW_GROUP = 8
 _MASK_OTHER_WINDOWS = True
-
-# Environment name of the ordered fused-mark sub-switch. Exported as a
-# module sentinel: the interpreter gates fail fast (instead of raising
-# confusing AttributeErrors) when a CPU harness imports an older tree.
-ORDERED_SUB_SWITCH_ENV = "REVOLTA_RESEARCH_HOST_DECODE_FAST_ORDERED"
 
 UNION_STAT_NAMES = (
     "calls",
@@ -424,16 +420,9 @@ class HostHistoryStore:
         if device.type == "cpu" and os.environ.get("TRITON_INTERPRET") != "1":
             raise ValueError("CPU host history fixtures require TRITON_INTERPRET=1")
         self.shape, self.device, self.debug = shape, device, debug
-        # Runtime-only experiment: does not alter cache identity or config hash.
-        self.decode_fast = (
-            os.environ.get("REVOLTA_RESEARCH_HOST_DECODE_FAST", "0") == "1"
-        )
-        # Sub-switch: the fused mark kernel keeps the two phases' Touched
-        # lists separate (tail first) so the Misses/victims pairing matches
-        # the unfused baseline. Read once per process, like decode_fast.
-        self.decode_fast_ordered = (
-            self.decode_fast and os.environ.get(ORDERED_SUB_SWITCH_ENV, "0") == "1"
-        )
+        # Long-context host KV decode fast path; read once per process, like
+        # the interpreter gates around this store.
+        self.decode_fast = envs.VLLM_SM70_HOST_DECODE_FAST
         s = shape
         kb, kbs, layers = s.num_kernel_blocks, s.kernel_block_tokens, s.num_layers
         h, d = s.kv_heads, s.head_dim
@@ -517,16 +506,6 @@ class HostHistoryStore:
             self.wanted = torch.zeros(s.num_groups, **i32)
             self.wanted_groups = torch.empty(slots, **i32)
             self.wanted_count = torch.zeros((), **i32)
-            # Selection segment of the ordered fused mark kernel. Allocated
-            # only while the sub-switch is on (so with both switches off the
-            # store allocates exactly the candidate baseline); excluded from
-            # the fixed-bytes accounting below, like the union scratch.
-            self.wanted_sel: torch.Tensor | None = (
-                torch.empty(slots, **i32) if self.decode_fast_ordered else None
-            )
-            self.sel_count: torch.Tensor | None = (
-                torch.zeros((), **i32) if self.decode_fast_ordered else None
-            )
             self.miss_groups = torch.empty(slots, **i32)
             self.miss_slots = torch.empty(slots, **i32)
             self.miss_count = torch.zeros((), **i32)
@@ -641,11 +620,6 @@ class HostHistoryStore:
                     "write_target_buffers",
                     "write_target_arrays",
                     "write_target_events",
-                    # Ordered-mark scratch: allocated only while the sub
-                    # switch is on; kept out of the frozen fixed-bytes bill
-                    # like the union scratch (4 * slots + 4 bytes when on).
-                    "wanted_sel",
-                    "sel_count",
                 }
             }
         )
@@ -1258,31 +1232,19 @@ class HostHistoryLayer:
             self._cpu_validate(selection, token_to_req, block_table, seq_lens)
         geometry = (s.dcp_world_size, s.dcp_rank, s.interleave)
         m = store.max_misses
-        if store.decode_fast_ordered:
-            # The previous call (any layout) left marks in one or both lists.
-            hk.clear_wanted_ordered[(triton.cdiv(m, 256),)](
-                store.wanted, store.wanted_groups, store.wanted_count,
-                store.wanted_sel, store.sel_count, 256,
-            )  # fmt: skip
-            hk.begin_gather_ordered[(1,)](
-                store.wanted_count, store.sel_count, store.miss_count, self.clock
-            )
-        else:
-            kernels.clear_wanted[(triton.cdiv(m, 256),)](
-                store.wanted, store.wanted_groups, store.wanted_count, 256
-            )
-            kernels.begin_gather[(1,)](store.wanted_count, store.miss_count, self.clock)
+        kernels.clear_wanted[(triton.cdiv(m, 256),)](
+            store.wanted, store.wanted_groups, store.wanted_count, 256
+        )
+        kernels.begin_gather[(1,)](store.wanted_count, store.miss_count, self.clock)
         grid = (rows, triton.cdiv(width, 128))
         fast = decode and store.decode_fast
-        ordered = fast and store.decode_fast_ordered
         if fast:
             hk.mark_decode[(rows + requests, grid[1])](
                 selection, token_to_req, block_table, seq_lens, store.ready,
                 store.wanted, store.wanted_groups, store.wanted_count,
                 selection.stride(0), block_table.stride(0), width,
                 s.kernel_block_tokens, m, 128, *geometry, s.qsa_group_columns,
-                rows, Sel=store.wanted_sel, SelCount=store.sel_count,
-                ORDERED=ordered, debug=store.debug,
+                rows, debug=store.debug,
             )  # fmt: skip
         else:
             hk.mark_tail[(requests,)](
@@ -1297,7 +1259,7 @@ class HostHistoryLayer:
                 s.kernel_block_tokens, m, 128, *geometry, s.qsa_group_columns,
                 debug=store.debug,
             )  # fmt: skip
-        self._fill_from_marks(fast=fast, ordered=ordered)
+        self._fill_from_marks(fast=fast)
         out = store.indices[:rows, :width]
         hk.remap_selection[grid](
             selection, token_to_req, block_table, seq_lens, self.group_to_slot,
@@ -1312,7 +1274,6 @@ class HostHistoryLayer:
         classed: bool = False,
         counters: torch.Tensor | None = None,
         fast: bool = False,
-        ordered: bool = False,
     ) -> None:
         """Make the marked groups (Touched/Count) resident.
 
@@ -1320,8 +1281,6 @@ class HostHistoryLayer:
         collect misses, pick victims (never a wanted slot), allocate, copy
         from the host pages through ``page_of``. ``classed`` (union path,
         ``prefill_insert_age=old``) ages groups only prefill rows want as old.
-        ``ordered`` (single-pass decode with the ordered sub-switch) reads the
-        fused mark kernel's two lists instead of the flat Touched list.
         """
         store, s = self.store, self.store.shape
         m = store.max_misses
@@ -1330,13 +1289,6 @@ class HostHistoryLayer:
                 store.wanted_groups, store.wanted_count, store.wanted,
                 self.group_to_slot, self.age, self.clock, store.miss_groups,
                 store.miss_count, m, 256, debug=store.debug,
-            )  # fmt: skip
-        elif ordered:
-            hk.collect_misses_ordered[(triton.cdiv(2 * m, 256),)](
-                store.wanted_groups, store.wanted_count, store.wanted_sel,
-                store.sel_count, store.wanted, self.group_to_slot, self.age,
-                self.clock, store.miss_groups, store.miss_count, m, 256,
-                debug=store.debug,
             )  # fmt: skip
         else:
             kernels.collect_misses[(triton.cdiv(m, 256),)](
@@ -1450,16 +1402,9 @@ class HostHistoryLayer:
         """Clear the previous fill's marks (a complete Touched list)."""
         store = self.store
         m = store.max_misses
-        if store.wanted_sel is not None and store.sel_count is not None:
-            hk.clear_wanted_ordered[(triton.cdiv(m, 256),)](
-                store.wanted, store.wanted_groups, store.wanted_count,
-                store.wanted_sel, store.sel_count, 256,
-            )  # fmt: skip
-            store.sel_count.zero_()
-        else:
-            kernels.clear_wanted[(triton.cdiv(m, 256),)](
-                store.wanted, store.wanted_groups, store.wanted_count, 256
-            )
+        kernels.clear_wanted[(triton.cdiv(m, 256),)](
+            store.wanted, store.wanted_groups, store.wanted_count, 256
+        )
         store.wanted_count.zero_()
 
     def build_microblock_table(

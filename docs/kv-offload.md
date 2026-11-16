@@ -304,11 +304,9 @@ the groups `g` with `g % TP == r`, scores only those, and the ranks merge their
 candidates into the same selection an unsplit indexer would make. With TP4/DCP2
 this halves the GPU bytes of every history ID's index again, so the same budget
 holds about twice as many contexts. Cached pages written with a narrower split
-are not read back. The research switch `REVOLTA_RESEARCH_QSA_DECODE_COALESCE_AG`
-exchanges candidates over the DCP pair only and is rejected with this split.
-`kernel_config.long_context_kv.draft_main_placement` chooses where such a
-sharded draft's main K/V lives (default `host`); the draft index and raw-key
-ring always stay in GPU history.
+are not read back. `kernel_config.long_context_kv.draft_main_placement` chooses
+where such a sharded draft's main K/V lives (default `host`); the draft index
+and raw-key ring always stay in GPU history.
 
 - `"host"` (default): the draft's main K/V is one more layer of the host
   store, reached through the hot pool like the target's. Each history ID then

@@ -356,11 +356,7 @@ if TYPE_CHECKING:
     VLLM_QSA_INDEX_SHARD_DEBUG: bool = False
     VLLM_QSA_INDEX_SHARD_FUSED_MERGE: bool = True
     REVOLTA_RESEARCH_HOST_DECODE_FAST: bool = False
-    REVOLTA_RESEARCH_HOST_DECODE_FAST_ORDERED: bool = False
     REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED: bool = False
-    REVOLTA_RESEARCH_QSA_DECODE_COALESCE_AG: bool = False
-    REVOLTA_RESEARCH_PREGRAPH_GDN_COMMON_CACHE: bool = False
-    REVOLTA_RESEARCH_PREGRAPH_REPLAY_VIEWS: bool = False
     VLLM_DFLASH2_LOOKUP_ADAPTIVE: bool = True
     VLLM_DFLASH2_LOOKUP_NSTRONG: int = 6
     VLLM_DFLASH2_LOOKUP_AGREE: int = 0
@@ -4690,35 +4686,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=(),
         user_visible=False,
     ),
-    "REVOLTA_RESEARCH_PREGRAPH_GDN_COMMON_CACHE": env_var(
-        lambda: os.getenv("REVOLTA_RESEARCH_PREGRAPH_GDN_COMMON_CACHE", "0") == "1",
-        description=(
-            "Cache one pure-speculative FULL replay batch's common GDN geometry. "
-            "CPU offsets, draft counts and GPU offset-buffer layout guard reuse; "
-            "request state and accepted counts remain live. Default off pending "
-            "GPU equivalence and performance validation."
-        ),
-        category="experimental",
-        declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
-        acceleration_paths=(),
-        user_visible=False,
-    ),
-    "REVOLTA_RESEARCH_PREGRAPH_REPLAY_VIEWS": env_var(
-        lambda: os.getenv("REVOLTA_RESEARCH_PREGRAPH_REPLAY_VIEWS", "0") == "1",
-        description=(
-            "Share GDN replay metadata tensor views among layers using the same "
-            "metadata object within a FULL replay step. No cross-step state "
-            "cache. Default off pending GPU equivalence and performance validation."
-        ),
-        category="experimental",
-        declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
-        acceleration_paths=(),
-        user_visible=False,
-    ),
     "VLLM_SM70_HOST_DECODE_FAST": env_var(
         _promoted_flag("VLLM_SM70_HOST_DECODE_FAST", "1"),
         description=(
@@ -4736,22 +4703,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=("Host-history decode (host KV)",),
         user_visible=True,
     ),
-    "REVOLTA_RESEARCH_HOST_DECODE_FAST_ORDERED": env_var(
-        lambda: os.getenv("REVOLTA_RESEARCH_HOST_DECODE_FAST_ORDERED", "0") == "1",
-        description=(
-            "With REVOLTA_RESEARCH_HOST_DECODE_FAST=1, keep the fused mark "
-            "kernel's tail claims ordered before selection claims so refill "
-            "pairing matches the unfused baseline's cache evolution. "
-            "Default off; restart with 0 to restore the unordered fused "
-            "mark. No effect while the parent switch is 0."
-        ),
-        category="experimental",
-        declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
-        acceleration_paths=(),
-        user_visible=False,
-    ),
     "VLLM_SM70_QSA_LOCAL_INPUTS_FUSED": env_var(
         _promoted_flag("VLLM_SM70_QSA_LOCAL_INPUTS_FUSED", "1"),
         description=(
@@ -4768,21 +4719,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=("QSA shared-key scoring (DCP shard)",),
         user_visible=True,
-    ),
-    "REVOLTA_RESEARCH_QSA_DECODE_COALESCE_AG": env_var(
-        lambda: os.getenv("REVOLTA_RESEARCH_QSA_DECODE_COALESCE_AG", "0") == "1",
-        description=(
-            "Coalesce sharded index candidates and main Q in one DCP2 "
-            "AllGather for uniform FULL-graph host decode. Default off; "
-            "requires identical settings on all ranks and GPU validation. "
-            "Restart with 0 to restore two exchanges."
-        ),
-        category="experimental",
-        declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
-        acceleration_paths=(),
-        user_visible=False,
     ),
     "VLLM_QSA_INDEX_SHARD_FUSED_MERGE": env_var(
         lambda: bool(int(os.getenv("VLLM_QSA_INDEX_SHARD_FUSED_MERGE", "1"))),
@@ -20413,11 +20349,7 @@ def compile_factors(speculative_config: Any = None) -> dict[str, object]:
         "VLLM_SM70_HOST_DECODE_FAST",
         "VLLM_SM70_QSA_LOCAL_INPUTS_FUSED",
         "REVOLTA_RESEARCH_HOST_DECODE_FAST",
-        "REVOLTA_RESEARCH_HOST_DECODE_FAST_ORDERED",
         "REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED",
-        # Host metadata construction only; captured model operations unchanged.
-        "REVOLTA_RESEARCH_PREGRAPH_GDN_COMMON_CACHE",
-        "REVOLTA_RESEARCH_PREGRAPH_REPLAY_VIEWS",
         # Startup page-cache advice; no compiled code involved.
         "VLLM_SM70_CHECKPOINT_CACHE_DROP",
         "REVOLTA_RESEARCH_CHECKPOINT_CACHE_DROP",

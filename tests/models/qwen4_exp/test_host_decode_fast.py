@@ -11,7 +11,7 @@ import torch
 # A CPU harness must import vllm from this worktree (the run_cpu.py script
 # next to the venv inserts its own directory first on sys.path). Fail fast
 # with the imported path instead of per-test AttributeErrors when it does not.
-from vllm.models.qwen4_exp.nvidia.host_kv import history as _history_module
+from vllm import envs as _envs
 
 from .test_host_kv_history import (
     Engine,
@@ -20,10 +20,10 @@ from .test_host_kv_history import (
     _shape,
 )
 
-if not hasattr(_history_module, "ORDERED_SUB_SWITCH_ENV"):
+if not hasattr(_envs, "VLLM_SM70_HOST_DECODE_FAST"):
     raise ImportError(
-        "the ordered fused-mark sub-switch is missing from "
-        f"{_history_module.__file__}; run this gate with a harness whose "
+        "VLLM_SM70_HOST_DECODE_FAST is missing from "
+        f"{_envs.__file__}; run this gate with a harness whose "
         "sys.path[0] is this worktree"
     )
 
@@ -255,90 +255,3 @@ def test_switch_off_then_on_same_inputs_matches_bits_after_store_rebuild(
     assert torch.equal(_bits(fast.layer.host_view), _bits(slow.layer.host_view))
     fast.store.close()
     slow.store.close()
-
-
-def _ordered_marks_trace(monkeypatch, *, fast, ordered, world=1, rank=0):
-    """Run the decode trace under the fused mark kernel and snapshot, after
-    every step, the effective Touched stream, the Misses list and the whole
-    eviction state (mapping, owners, ages, hand, ready)."""
-    monkeypatch.setenv("VLLM_SM70_HOST_DECODE_FAST", "1" if fast else "0")
-    monkeypatch.setenv(
-        "REVOLTA_RESEARCH_HOST_DECODE_FAST_ORDERED", "1" if ordered else "0"
-    )
-    engine = Engine(
-        _shape(
-            True,
-            blocks=65,
-            rows_per_pass=2,
-            requests=2,
-            dcp_world_size=world,
-            dcp_rank=rank,
-        ),
-        dcp=(world, rank),
-        seed=17,
-    )
-    assert engine.store.decode_fast_ordered is (fast and ordered)
-    engine.layer.gather = partial(engine.layer.gather, decode=True)
-    for req in ("a", "b"):
-        engine.write(req, list(range(120)))
-    steps = []
-    for _ in range(6):
-        for req in ("a", "b"):
-            engine.write(req, [engine.length[req]])
-        engine.step([(r, engine.length[r] - 1) for r in ("a", "b")])
-        store = engine.store
-        tail = store.wanted_groups[: int(store.wanted_count)].tolist()
-        if store.wanted_sel is None:
-            sel: list[int] = []
-        else:
-            sel = store.wanted_sel[: int(store.sel_count)].tolist()
-        # The ordered collect treats a selection claim of a tail-wanted group
-        # as the tail entry's duplicate; mirror that to get the stream the
-        # refill actually consumed (the plain layout keeps everything in one).
-        owned = [(int(store.wanted[g]) & 1) != 0 for g in sel]
-        stream = tail + [g for g, o in zip(sel, owned) if not o]
-        steps.append(
-            (
-                stream,
-                store.miss_groups[: int(store.miss_count)].tolist(),
-                engine.layer.group_to_slot.clone(),
-                engine.layer.slot_owner.clone(),
-                engine.layer.age.clone(),
-                engine.layer.eviction_hand.clone(),
-                store.ready.clone(),
-            )
-        )
-    engine.store.close()
-    return steps
-
-
-@pytest.mark.parametrize("world,rank", [(1, 0), (2, 1)])
-def test_ordered_fused_marks_keep_baseline_touched_and_miss_order(
-    monkeypatch, world, rank
-):
-    """Review N1: with the ordered sub-switch the fused mark kernel keeps the
-    baseline's Touched order (tail claims first), so the Misses/victims
-    pairing -- and the whole cache evolution -- matches the unfused path
-    item for item under the interpreter."""
-    baseline = _ordered_marks_trace(
-        monkeypatch, fast=False, ordered=False, world=world, rank=rank
-    )
-    ordered = _ordered_marks_trace(
-        monkeypatch, fast=True, ordered=True, world=world, rank=rank
-    )
-    assert len(baseline) == len(ordered) > 0
-    assert any(misses for _, misses, *_ in baseline)
-    for want, got in zip(baseline, ordered):
-        assert want[0] == got[0]  # Touched stream, item for item
-        assert want[1] == got[1]  # Misses order, item for item
-        for w, g in zip(want[2:], got[2:]):
-            assert torch.equal(w, g)  # mapping, owners, ages, hand, ready
-
-
-def test_ordered_sub_switch_requires_parent_switch(monkeypatch):
-    monkeypatch.setenv("VLLM_SM70_HOST_DECODE_FAST", "0")
-    monkeypatch.setenv("REVOLTA_RESEARCH_HOST_DECODE_FAST_ORDERED", "1")
-    engine = Engine(_shape(True, blocks=33), seed=5)
-    assert not engine.store.decode_fast
-    assert not engine.store.decode_fast_ordered
-    engine.store.close()

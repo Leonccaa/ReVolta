@@ -212,13 +212,6 @@ type and default as registered in `vllm/envs.py`; *Since* is the first
 release with the variable (1Cat = inherited from 1Cat-vLLM); *Category*
 is configuration, tuning, experimental, debug or deprecated.
 
-### Pregraph preparation research switches
-
-| Name | Type | Default | Range | Category | Since | Effect and trade-off |
-|---|---|---|---|---|---|---|
-| `REVOLTA_RESEARCH_PREGRAPH_GDN_COMMON_CACHE` | bool | `False` | 0, 1 | experimental | unreleased research | Deployment scope, default off. MRV2 FULL replay only: retain one pure-speculative batch's common GDN metadata, guarded by all CPU geometry values and the live GPU offset buffer layout. Removes repeated host construction, mask H2D and token-index arange on a hit. Mixed and capture batches use the original builder. Accepted counts, state IDs and request mapping are never cached. GPU bitwise and throughput validation pending. Set 0 and restart to restore the original builder. Metrics: no dedicated counter; compare decode throughput and preparation traces. |
-| `REVOLTA_RESEARCH_PREGRAPH_REPLAY_VIEWS` | bool | `False` | 0, 1 | experimental | unreleased research | Deployment scope, default off. MRV2 FULL replay only: share read-only state-ID and query-offset tensor views within each metadata group for one step. No cross-step reuse or change to kernels, storage, accepted counts or fences. GPU bitwise and throughput validation pending. Set 0 and restart to restore per-layer view construction. Metrics: no dedicated counter; compare decode throughput and preparation traces. |
-
 ### Promoted research switches
 
 | Name | Type | Default | Range | Category | Since | Effect and trade-off |
@@ -411,10 +404,6 @@ latest-only policy. It does not change compilation or persisted page identity.
 See [checkpoint retention](kv-offload.md#checkpoint-retention-evidence) for
 migration rules, limits and counters.
 
-## Host decode experiments
+## Host decode fast path
 
-`VLLM_SM70_HOST_DECODE_FAST` (default `1`) fuses three pairs of host-history decode kernels on the long-context host KV / DCP-sharded decode path; set `0` and restart to restore the original kernels. `REVOLTA_RESEARCH_HOST_DECODE_FAST_ORDERED=1` (requires the fused path) additionally keeps the fused mark kernel's tail claims ordered before selection claims, so refill pairing and cache evolution match the unfused baseline; it costs no extra kernel launches and no phase parallelism (ordering comes from per-phase mark bits and a second wanted list, not from scheduling), at the price of one extra int32-per-hot-slot scratch tensor allocated unconditionally. `VLLM_SM70_QSA_LOCAL_INPUTS_FUSED` (default `1`) fuses integer metadata conversion in the DCP-sharded shared-key scorer; set `0` to use the torch reference. Both switches were promoted from their research names in 0.2.0rc12; the former `REVOLTA_RESEARCH_HOST_DECODE_FAST` and `REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED` names are honoured as deprecated aliases until 0.2.0rc13, with the new name winning when both are set. Ordinary GPU KV paths are unaffected. The switches act inside opaque QSA operators and do not change the torch compilation key or SSD cache identity.
-
-## QSA decode exchange experiment
-
-`REVOLTA_RESEARCH_QSA_DECODE_COALESCE_AG` is an experimental boolean (`0` by default; `1` enables), introduced as a research candidate. It combines index candidates and main query into one AllGather for host QSA DCP2 uniform decode with fixed padded FULL-graph rows and the exact fused index merge. Prefill, mixed batches, split scoring, debug merges and unsupported geometry retain both original exchanges. Set it identically on every worker before model initialization; changing it requires a restart and graph recapture. One model-level fixed workspace is shared by serial QSA layers: for maximum captured rows R, local heads H, head dimension D and compressed top-k K it uses `12*R*(2*K+H*D/2) + 4*R*H*D` bytes. Historical index and host KV layouts are unchanged. GPU bitwise correctness, collective liveness, capacity and unprofiled decode throughput remain validation requirements; no performance claim is made.
+`VLLM_SM70_HOST_DECODE_FAST` (default `1`) fuses three pairs of host-history decode kernels on the long-context host KV / DCP-sharded decode path; set `0` and restart to restore the original kernels. `VLLM_SM70_QSA_LOCAL_INPUTS_FUSED` (default `1`) fuses integer metadata conversion in the DCP-sharded shared-key scorer; set `0` to use the torch reference. Both switches were promoted from their research names in 0.2.0rc12; the former `REVOLTA_RESEARCH_HOST_DECODE_FAST` and `REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED` names are honoured as deprecated aliases until 0.2.0rc13, with the new name winning when both are set. Ordinary GPU KV paths are unaffected. The switches act inside opaque QSA operators and do not change the torch compilation key or SSD cache identity.

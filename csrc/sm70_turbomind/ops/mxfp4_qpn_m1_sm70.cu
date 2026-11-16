@@ -503,7 +503,7 @@ __global__ void nvfp4_expand_raw_scales_sm70_kernel(
   const int col = static_cast<int>(index % n);
   int global_slot = 0;
   if (global_stride == 2) {
-    global_slot = interleaved_w13 ? ((col >> 5) & 1) : (col >= n / 2);
+    global_slot = interleaved_w13 ? (col & 1) : (col >= n / 2);
   }
   const float global_scale =
       global_scales[static_cast<size_t>(expert) * global_stride + global_slot];
@@ -575,7 +575,7 @@ __global__ void nvfp4_qpn_raw_scale_sm70_kernel(
 
   int global_slot = 0;
   if (is_w13) {
-    global_slot = interleaved_w13 ? (tile & 1) : (tile >= tiles_n32 / 2);
+    global_slot = interleaved_w13 ? (lane & 1) : (tile >= tiles_n32 / 2);
   }
   const float global_scale =
       __ldg(global_scales + static_cast<size_t>(expert) * (is_w13 ? 2 : 1) +
@@ -684,8 +684,9 @@ __global__ void nvfp4_qpn_w13_swiglu_batch_sm70_kernel(
     half scale_hi = __float2half(0.0f);
     half scale_lo = __float2half(0.0f);
     if constexpr (kRawScale) {
+      const int global_slot = kInterleaved ? (lane & 1) : projection;
       const float global_scale =
-          __ldg(global_scales + static_cast<size_t>(expert) * 2 + projection) *
+          __ldg(global_scales + static_cast<size_t>(expert) * 2 + global_slot) *
           16384.0f;
       scale_hi = __float2half_rn(global_scale);
       scale_lo = __float2half_rn(global_scale - __half2float(scale_hi));

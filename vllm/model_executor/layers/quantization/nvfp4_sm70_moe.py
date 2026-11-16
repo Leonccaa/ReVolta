@@ -1048,9 +1048,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             w13_tm_scales.append(prepared_w13[1])
             if raw_scale:
                 if fused_swiglu_prefill:
-                    physical_global = w13_global.repeat(
-                        intermediate // 32
-                    ).repeat_interleave(32)
+                    physical_global = w13_global.repeat(intermediate)
                 else:
                     physical_global = w13_global.repeat_interleave(intermediate)
                 w13_raw_scale_codes.append(

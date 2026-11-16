@@ -1031,6 +1031,8 @@ class HostHistoryLayer:
         self.host_device = store.host_device[:, :, index]
         self.host_view = store.host[:, :, index]
         self.hot = store.hot[index]
+        self._host_strides = self.host_view.stride()[:5]
+        self._copy_kwargs: dict[str, int] = {}
         if s.planar_scales:
             # Each subpage has a uniform history-row stride. Flattening all
             # subpages would cross other workers and logical index payloads.
@@ -1047,6 +1049,24 @@ class HostHistoryLayer:
             self.key_scale_cache = self.hot_cache.key_scale
             self.value_scale_cache = self.hot_cache.value_scale
             self.staging_cache = _planar_view(store.staging, 1, s)
+            host_layout, hot_layout = (
+                s.page_layout(s.kernel_block_tokens),
+                s.page_layout(4),
+            )
+            self._host_strides = (
+                *self.host_view.stride()[:2],
+                host_layout.value_offset,
+                s.kv_heads * s.head_dim,
+                s.head_dim,
+            )
+            self._copy_kwargs = dict(
+                PLANAR=True,
+                HOT_STRIDE=hot_layout.page_size_bytes,
+                HOST_K_SCALE=host_layout.key_scale_offset,
+                HOST_V_SCALE=host_layout.value_scale_offset,
+                HOT_K_SCALE=hot_layout.key_scale_offset,
+                HOT_V_SCALE=hot_layout.value_scale_offset,
+            )
         else:
             self.key_cache, self.value_cache = self.hot.unbind(1)
         self.group_to_slot = store.group_to_slot[index]
@@ -1087,6 +1107,41 @@ class HostHistoryLayer:
             # fusion; large prefill writes always retain the original path.
             decode = n <= s.read_rows and n <= s.max_requests * s.decode_rows
         key, value = key[:n], value[:n]
+        if s.planar_scales:
+            from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+                triton_reshape_and_cache_flash_per_token_head_quant,
+            )
+
+            stage = self.staging_cache
+            assert stage.key_scale is not None and stage.value_scale is not None
+            if store.device.type == "cuda":
+                triton_reshape_and_cache_flash_per_token_head_quant(
+                    key,
+                    value,
+                    stage.key,
+                    stage.value,
+                    stage.key_scale,
+                    stage.value_scale,
+                    store.staging_slots[:n],
+                )
+            else:
+                # As for legacy CPU fixtures, encode with the torch reference.
+                for source, payload, scales in (
+                    (key, stage.key, stage.key_scale),
+                    (value, stage.value, stage.value_scale),
+                ):
+                    encoded, scale = FP8_E4M3_PER_TOKEN_HEAD.encode(source)
+                    payload[:n, 0].copy_(encoded)
+                    scales[:n, 0].copy_(scale)
+            self.write_encoded(
+                stage.key[:n, 0],
+                stage.value[:n, 0],
+                slot_mapping,
+                key_scale=stage.key_scale[:n, 0],
+                value_scale=stage.value_scale[:n, 0],
+                decode=decode,
+            )
+            return
         k_stage, v_stage = store.staging[:n].unbind(1)
         if self.store.device.type == "cuda":
             from vllm._custom_ops import reshape_and_cache_flash
@@ -1123,6 +1178,8 @@ class HostHistoryLayer:
         value: torch.Tensor,
         slot_mapping: torch.Tensor,
         *,
+        key_scale: torch.Tensor | None = None,
+        value_scale: torch.Tensor | None = None,
         decode: bool = False,
     ) -> None:
         """Copy encoded ``[n, H, D]`` rows to their slots, then publish them.
@@ -1201,14 +1258,26 @@ class HostHistoryLayer:
                         )
         else:
             fast = decode and store.decode_fast
+            scale_kwargs: dict[str, object] = {}
+            if s.planar_scales:
+                assert key_scale is not None and value_scale is not None
+                scale_kwargs = dict(
+                    KScale=key_scale,
+                    VScale=value_scale,
+                    KSS0=key_scale.stride(0),
+                    KSS1=key_scale.stride(1),
+                    VSS0=value_scale.stride(0),
+                    VSS1=value_scale.stride(1),
+                )
             hk.write_slots[(n,)](
                 key, value, slot_mapping, self.host_device, self.hot,
                 self.group_to_slot, self.store.page_of,
                 key.stride(0), key.stride(1), value.stride(0),
-                value.stride(1), *self.host_view.stride()[:5],
+                value.stride(1), *self._host_strides,
                 s.kernel_blocks_per_block, s.kernel_block_tokens,
                 s.kv_heads, s.head_dim, triton.next_power_of_2(s.kv_heads * s.head_dim),
                 Ready=store.ready, COMMIT=fast,
+                **self._copy_kwargs, **scale_kwargs,
             )  # fmt: skip
             if fast:
                 return
@@ -1400,12 +1469,13 @@ class HostHistoryLayer:
         hk.gather_groups[(store.gather_workers,)](
             self.host_device, self.hot, store.ready, store.miss_groups,
             store.miss_slots, store.miss_count, store.page_of,
-            *self.host_view.stride()[:5], s.kernel_blocks_per_block,
+            *self._host_strides, s.kernel_blocks_per_block,
             s.kernel_block_tokens, s.kv_heads, s.head_dim,
             triton.next_power_of_2(8 * s.kv_heads * s.head_dim),
             Map=self.group_to_slot, Owner=self.slot_owner, Age=self.age,
             Clock=self.clock, Victims=store.victim_slots, Hand=self.eviction_hand,
             S=s.hot_slots, M=m, ALLOCATE=fast,
+            **self._copy_kwargs,
         )  # fmt: skip
         if classed:
             assert counters is not None

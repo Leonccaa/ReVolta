@@ -74,6 +74,18 @@ def write_slots(
     B: tl.constexpr,
     Ready=None,
     COMMIT: tl.constexpr = False,
+    KScale=None,
+    VScale=None,
+    KSS0: tl.constexpr = 0,
+    KSS1: tl.constexpr = 0,
+    VSS0: tl.constexpr = 0,
+    VSS1: tl.constexpr = 0,
+    PLANAR: tl.constexpr = False,
+    HOT_STRIDE: tl.constexpr = 0,
+    HOST_K_SCALE: tl.constexpr = 0,
+    HOST_V_SCALE: tl.constexpr = 0,
+    HOT_K_SCALE: tl.constexpr = 0,
+    HOT_V_SCALE: tl.constexpr = 0,
 ):
     """Copy one encoded row to its host page and, if resident, its hot group."""
     row = tl.program_id(0).to(tl.int64)
@@ -93,9 +105,29 @@ def write_slots(
     tl.store(Host + host, key, lane)
     tl.store(Host + host + HS1, value, lane)
     hot_slot = tl.load(Map + kernel_block * (KBS // 4) + offset // 4, valid, -1)
-    hot = hot_slot.to(tl.int64) * (8 * H * D) + (offset % 4) * H * D + x
+    hot_stride: tl.constexpr = HOT_STRIDE if PLANAR else 8 * H * D
+    hot = hot_slot.to(tl.int64) * hot_stride + (offset % 4) * H * D + x
     tl.store(Hot + hot, key, lane & (hot_slot >= 0))
     tl.store(Hot + hot + 4 * H * D, value, lane & (hot_slot >= 0))
+    if PLANAR:
+        head = x
+        scale_lane = valid & (head < H)
+        ks = tl.load(KScale + row * KSS0 + head * KSS1, scale_lane, 0)
+        vs = tl.load(VScale + row * VSS0 + head * VSS1, scale_lane, 0)
+        host_scale = (
+            page.to(tl.int64) * (HS0 // 4)
+            + (kernel_block % RATIO) * (HSS // 4)
+            + offset * H
+            + head
+        )
+        host_fp32 = Host.to(tl.pointer_type(tl.float32))
+        tl.store(host_fp32 + host_scale + HOST_K_SCALE // 4, ks, scale_lane)
+        tl.store(host_fp32 + host_scale + HOST_V_SCALE // 4, vs, scale_lane)
+        hot_scale = hot_slot.to(tl.int64) * (HOT_STRIDE // 4) + (offset % 4) * H + head
+        hot_fp32 = Hot.to(tl.pointer_type(tl.float32))
+        hot_lane = scale_lane & (hot_slot >= 0)
+        tl.store(hot_fp32 + hot_scale + HOT_K_SCALE // 4, ks, hot_lane)
+        tl.store(hot_fp32 + hot_scale + HOT_V_SCALE // 4, vs, hot_lane)
     if COMMIT:
         # Every consumer is on the same stream, after this kernel boundary.
         # The connector's retirement event still fences all host writes.
@@ -495,6 +527,12 @@ def gather_groups(
     S: tl.constexpr = 0,
     M: tl.constexpr = 0,
     ALLOCATE: tl.constexpr = False,
+    PLANAR: tl.constexpr = False,
+    HOT_STRIDE: tl.constexpr = 0,
+    HOST_K_SCALE: tl.constexpr = 0,
+    HOST_V_SCALE: tl.constexpr = 0,
+    HOT_K_SCALE: tl.constexpr = 0,
+    HOT_V_SCALE: tl.constexpr = 0,
 ):
     """Copy every committed row of each missed group (unready rows read 0)."""
     x = tl.arange(0, B).to(tl.int64)
@@ -539,7 +577,28 @@ def gather_groups(
             RATIO,
         )
         payload = tl.load(Host + host, (x < 8 * H * D) & (ready != 0) & (page >= 0), 0)
-        tl.store(Hot + slot * (8 * H * D) + x, payload, x < 8 * H * D)
+        hot_stride: tl.constexpr = HOT_STRIDE if PLANAR else 8 * H * D
+        tl.store(Hot + slot * hot_stride + x, payload, x < 8 * H * D)
+        if PLANAR:
+            scale_token, scale_head = x // H, x % H
+            scale_offset = gid % (KBS // 4) * 4 + scale_token
+            scale_ready = tl.load(
+                Ready + kernel_block * KBS + scale_offset, x < 4 * H, 0
+            )
+            host_scale = (
+                page.to(tl.int64) * (HS0 // 4)
+                + (kernel_block % RATIO) * (HSS // 4)
+                + scale_offset * H
+                + scale_head
+            )
+            host_fp32 = Host.to(tl.pointer_type(tl.float32))
+            scale_lane = (x < 4 * H) & (scale_ready != 0) & (page >= 0)
+            ks = tl.load(host_fp32 + host_scale + HOST_K_SCALE // 4, scale_lane, 0)
+            vs = tl.load(host_fp32 + host_scale + HOST_V_SCALE // 4, scale_lane, 0)
+            hot_scale = slot * (HOT_STRIDE // 4) + x
+            hot_fp32 = Hot.to(tl.pointer_type(tl.float32))
+            tl.store(hot_fp32 + hot_scale + HOT_K_SCALE // 4, ks, x < 4 * H)
+            tl.store(hot_fp32 + hot_scale + HOT_V_SCALE // 4, vs, x < 4 * H)
     # All selectors finished in the preceding kernel. Other gather CTAs
     # never read Hand, so advancing it here requires no grid barrier.
     if ALLOCATE and ((tl.program_id(0) == 0) & (count > 0)):

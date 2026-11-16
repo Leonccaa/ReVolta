@@ -44,6 +44,13 @@ def _ops():
     return reshape_and_cache_flash, qsa_sparse_paged_attention
 
 
+@pytest.mark.parametrize("rank", [0, 1])
+def test_planar_source_final_host_hot_and_recycle(rank):
+    from .test_host_kv_history import _planar_history_roundtrip
+
+    _planar_history_roundtrip("cuda", rank)
+
+
 class Arms:
     def __init__(self, e4m3: bool, *, rows_per_pass: int, requests: int = 2):
         self.dtype = torch.uint8 if e4m3 else torch.float16

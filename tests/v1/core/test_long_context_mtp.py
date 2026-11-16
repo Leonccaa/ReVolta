@@ -148,10 +148,20 @@ def test_sharded_draft_main_is_one_more_host_layer():
     assert 0 < gpu < layer_page
 
 
+def test_draft_main_placement_defaults_to_host():
+    # A sharded draft's main K/V joins the host store unless "gpu" is asked
+    # for explicitly (1M-context concurrency is history-ID bound).
+    assert LongContextKVConfig().draft_main_placement == "host"
+    specs = mtp_specs(shard_index=True, shard_draft=True)
+    _, cfg = build(settings(), specs)
+    assert cfg.long_context_plan.draft_main_on_host
+    assert cfg.host_kv_layers == [*TARGET_MAIN, DRAFT]
+
+
 def test_sharded_draft_main_follows_draft_main_placement():
     specs = mtp_specs(shard_index=True, shard_draft=True)
-    _, gpu = build(settings(), specs)  # default: "gpu"
-    _, host = build(settings(draft_main_placement="host"), specs)
+    _, gpu = build(settings(draft_main_placement="gpu"), specs)
+    _, host = build(settings(), specs)  # default: "host"
     # "gpu": the draft stays beside the index in GPU history, as before.
     assert gpu.host_kv_layers == TARGET_MAIN
     assert not gpu.long_context_plan.draft_main_on_host
@@ -185,8 +195,8 @@ def test_draft_main_placement_is_told_apart_by_layout_not_by_the_setting():
     )
     # ... the page layout is: the host layer list and tensors differ.
     specs = mtp_specs(shard_index=True, shard_draft=True)
-    _, gpu = build(settings(), specs)
-    _, host = build(settings(draft_main_placement="host"), specs)
+    _, gpu = build(settings(draft_main_placement="gpu"), specs)
+    _, host = build(settings(), specs)
 
     def layout(cfg):
         return canonical_digest(
@@ -205,7 +215,7 @@ def test_draft_main_placement_falls_back_to_gpu(caplog):
     # GPU, leaves the layout of "gpu" and says so.
     caplog.set_level("WARNING")
     _, replicated = build(settings(draft_main_placement="host"), mtp_specs())
-    _, base = build(settings(), mtp_specs())
+    _, base = build(settings(draft_main_placement="gpu"), mtp_specs())
     assert replicated.host_kv_layers == base.host_kv_layers == TARGET_MAIN
     assert "draft_main_placement='host' needs a draft" in caplog.text
     caplog.clear()

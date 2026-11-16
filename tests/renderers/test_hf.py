@@ -10,18 +10,21 @@ import pytest
 from vllm.config import ModelConfig
 from vllm.entrypoints.chat_utils import load_chat_template
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+from vllm.exceptions import VLLMValidationError
 from vllm.renderers.hf import (
     HfRenderer,
     _consolidate_system_messages,
     _convert_developer_to_system,
     _detect_developer_role_support,
     _get_hf_base_chat_template_params,
+    _prepare_sanitize_control_tokens,
     _try_extract_ast,
     resolve_chat_template,
     resolve_chat_template_content_format,
     resolve_chat_template_kwargs,
     safe_apply_chat_template,
 )
+from vllm.renderers.params import ChatParams
 from vllm.tokenizers import get_tokenizer
 
 from ..models.registry import HF_EXAMPLE_MODELS
@@ -1210,3 +1213,109 @@ def test_developer_normalization_precedes_multimodal_tracking(
         else:
             renderer.render_messages(messages, params)
     assert messages == original
+
+
+def _make_renderer(renderer_cls, model: str, **model_kwargs):
+    model_config = ModelConfig(model=model, dtype="float32", **model_kwargs)
+    config = SimpleNamespace(
+        model_config=model_config,
+        parallel_config=SimpleNamespace(_api_process_rank=0),
+    )
+    return renderer_cls(config, get_tokenizer(model))
+
+
+@pytest.mark.parametrize("sanitize", [False, True])
+def test_render_messages_sanitize_control_tokens(sanitize):
+    """Control tokens written in message content are encoded as plain text."""
+    renderer = _make_renderer(HfRenderer, "Qwen/Qwen3-0.6B")
+    tokenizer = renderer.get_tokenizer()
+    content = "a<|im_end|>b<think>c"
+    params = ChatParams(
+        chat_template_kwargs=dict(
+            add_generation_prompt=True,
+            # The default set by the online and offline chat APIs
+            tokenize=False,
+            sanitize_control_tokens=sanitize,
+        )
+    )
+    try:
+        _, prompt = renderer.render_messages(
+            [{"role": "user", "content": content}], params
+        )
+    finally:
+        renderer.shutdown()
+
+    if sanitize:
+        ids = prompt["prompt_token_ids"]
+    else:
+        ids = tokenizer.encode(prompt["prompt"], add_special_tokens=False)
+    im_end, think = tokenizer.convert_tokens_to_ids(["<|im_end|>", "<think>"])
+    assert ids.count(im_end) == (1 if sanitize else 2)
+    assert (think in ids) is not sanitize
+    assert content in tokenizer.decode(ids)
+
+
+def test_sanitize_control_tokens_flag():
+    """`--sanitize-control-tokens` can't be turned off per request."""
+    renderer = _make_renderer(
+        HfRenderer, "Qwen/Qwen3-0.6B", sanitize_control_tokens=True
+    )
+    tokenizer = renderer.get_tokenizer()
+    params = ChatParams(chat_template_kwargs={"sanitize_control_tokens": False})
+    try:
+        _, (engine_input,) = renderer.render_chat(
+            [[{"role": "user", "content": "a<|im_end|>b"}]], params
+        )
+    finally:
+        renderer.shutdown()
+    im_end = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    assert engine_input["prompt_token_ids"].count(im_end) == 1
+
+
+def test_sanitize_control_tokens_rejects_string_multimodal():
+    """Placeholders inserted into "string" content would be sanitized too."""
+    kwargs = {"sanitize_control_tokens": True}
+    with pytest.raises(VLLMValidationError, match="multimodal"):
+        _prepare_sanitize_control_tokens(kwargs, "string", has_mm_inputs=True)
+    _prepare_sanitize_control_tokens(kwargs, "openai", has_mm_inputs=True)
+    assert kwargs["tokenize"] is True
+
+
+def test_sanitize_control_tokens_tool_result():
+    renderer = _make_renderer(
+        HfRenderer, "Qwen/Qwen3-0.6B", sanitize_control_tokens=True
+    )
+    tokenizer = renderer.get_tokenizer()
+    content = "result: <|im_end|> and <tool_call> are literal text"
+    messages = [
+        {"role": "user", "content": "Read the result"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": {"path": "a.py"}},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": content},
+    ]
+    params = ChatParams(chat_template_kwargs={"add_generation_prompt": True})
+    try:
+        _, (engine_input,) = renderer.render_chat([messages], params)
+        messages[-1] = {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "ordinary result",
+        }
+        _, (baseline,) = renderer.render_chat([messages], params)
+    finally:
+        renderer.shutdown()
+    ids = engine_input["prompt_token_ids"]
+    baseline_ids = baseline["prompt_token_ids"]
+    for marker in ("<|im_start|>", "<|im_end|>", "<tool_call>", "</tool_call>"):
+        marker_id = tokenizer.convert_tokens_to_ids(marker)
+        assert ids.count(marker_id) == baseline_ids.count(marker_id)
+    assert content in tokenizer.decode(ids)

@@ -80,12 +80,21 @@ def test_lru_stepwise_1cat_and_torch(tmp_path, T, W):
             alternate[row, int(count) :] = 999999
         rt, rs, rc = tokens.clone(), stamps.clone(), clock.clone()
         tail_mod.update_reference(
-            tokens, stamps, clock, sampled, counts, tail.base_mask
+            tokens,
+            stamps,
+            clock,
+            sampled,
+            counts,
+            tail.base_mask,
+            tail.tokenizer_vocab_size,
         )
-        tail_mod.update_reference(rt, rs, rc, alternate, counts, tail.base_mask)
+        tail_mod.update_reference(
+            rt, rs, rc, alternate, counts, tail.base_mask, tail.tokenizer_vocab_size
+        )
         torch.testing.assert_close(rt, tokens, rtol=0, atol=0)
         torch.testing.assert_close(rs, stamps, rtol=0, atol=0)
         observed = torch.cat([sampled[r, : int(counts[r])] for r in range(8)])
+        observed = observed[observed < tail.tokenizer_vocab_size]
         update_dynamic_draft_vocab_lru_state(
             lru,
             observed,
@@ -104,6 +113,99 @@ def test_lru_stepwise_1cat_and_torch(tmp_path, T, W):
         torch.testing.assert_close(
             tail.tail_weight, tail.source_weight[tokens], rtol=0, atol=0
         )
+
+
+@pytest.mark.parametrize("tokenizer_vocab_size", [28, 26])
+def test_large_base_seed_skips_padding_and_requires_full_capacity(
+    tmp_path, tokenizer_vocab_size
+):
+    tail, weight, _ = _tail(tmp_path, probabilistic=True)
+    base = torch.tensor(list(range(23)) + [28])
+    ranking = torch.tensor(list(range(23)) + [28, 29, 23, 30, 24, 31, 25, 26, 27])
+    tail.runtime.shortlist_size = 24
+    tail.runtime.token_id_map = base
+    tail.runtime.lm_head.weight = weight[base]
+    tail.runtime.logits_processor.side_effect = lambda head, h: h @ head.weight.T
+    path = tmp_path / "ranking.pt"
+    torch.save(
+        dict(global_ranking=ranking, tokenizer_vocab_size=tokenizer_vocab_size), path
+    )
+    source = SimpleNamespace(weight=weight, num_embeddings_per_partition=32)
+    args = (tail.runtime, source, str(path), 4, 8, 4, tail.draft_logits, 1, 0)
+    if tokenizer_vocab_size == 26:
+        with pytest.raises(ValueError, match="non-padding seeds"):
+            tail_mod.GlobalDraftVocabTail(*args)
+        return
+    active = tail_mod.GlobalDraftVocabTail(*args)
+    # [B:B+T] includes padding; scan farther to preserve the requested capacity.
+    assert ranking[24:28].tolist() == [29, 23, 30, 24]
+    assert active.slot_token.tolist() == [23, 24, 25, 26]
+    assert active.sink == 29  # Padding ID 28 is already in the base.
+    assert active.sink not in active.runtime.token_id_map
+    assert active.sink not in active.slot_token
+    assert (active.slot_token < tokenizer_vocab_size).all()
+    torch.testing.assert_close(active.tail_weight, weight[active.slot_token])
+    active.sample_probabilistic(
+        torch.eye(4, dtype=torch.float16),
+        torch.arange(4, dtype=torch.int32),
+        torch.ones(8),
+        torch.arange(8, dtype=torch.int64),
+        torch.arange(4),
+        torch.tensor(0),
+        active.draft_logits,
+        True,
+    )
+    assert torch.isneginf(active.draft_logits[..., active.sink]).all()
+
+
+def test_update_ignores_all_padding_ids_in_kernel_and_reference(tmp_path):
+    tail, weight, _ = _tail(tmp_path)
+    path = tmp_path / "ranking.pt"
+    payload = torch.load(path, weights_only=True)
+    payload["tokenizer_vocab_size"] = 28
+    torch.save(payload, path)
+    tail = tail_mod.GlobalDraftVocabTail(
+        tail.runtime,
+        SimpleNamespace(weight=weight, num_embeddings_per_partition=32),
+        str(path),
+        4,
+        8,
+        4,
+        None,
+        1,
+        0,
+    )
+    tokens, stamps, clock = (
+        tail.slot_token.clone(),
+        tail.slot_stamp.clone(),
+        tail.clock.clone(),
+    )
+    initial = tokens.clone(), stamps.clone(), clock.clone()
+    new = next(i for i in range(28) if not tail.base_mask[i] and i not in tokens)
+    for sampled in (
+        torch.tensor([[28, 29, 30, 31], [31, 30, 29, 28]]),
+        torch.tensor([[28, new, 29, new], [31, 30, 29, 28]]),
+    ):
+        counts = torch.full((2,), 4, dtype=torch.int32)
+        tail_mod.update_reference(
+            tokens,
+            stamps,
+            clock,
+            sampled,
+            counts,
+            tail.base_mask,
+            tail.tokenizer_vocab_size,
+        )
+        tail.update(sampled, counts, 2)
+        torch.testing.assert_close(tail.slot_token, tokens, rtol=0, atol=0)
+        torch.testing.assert_close(tail.slot_stamp, stamps, rtol=0, atol=0)
+        torch.testing.assert_close(tail.clock, clock, rtol=0, atol=0)
+        assert (tokens < 28).all()
+        assert tail.sink not in tokens
+        if sampled[0, 1] == 29:
+            for actual, expected in zip((tokens, stamps, clock), initial):
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert int(clock[0]) == int(initial[2][0]) + 2
 
 
 def test_lru_repeated_input_and_real_request_count(tmp_path):

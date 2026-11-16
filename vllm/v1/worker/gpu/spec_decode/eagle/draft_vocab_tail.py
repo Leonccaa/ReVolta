@@ -29,6 +29,7 @@ def global_tail_update(
     num_reqs,
     sampled_stride: tl.constexpr,
     full_vocab: tl.constexpr,
+    tokenizer_vocab: tl.constexpr,
     T: tl.constexpr,
     BLOCK: tl.constexpr,
     RK: tl.constexpr,
@@ -42,7 +43,7 @@ def global_tail_update(
         count = tl.load(num_sampled + r)
         for j in range(count):
             token = tl.load(sampled + r * sampled_stride + j)
-            if (token >= 0) & (token < full_vocab):
+            if (token >= 0) & (token < tokenizer_vocab):
                 is_base = tl.load(base_mask + token)
                 if not is_base:
                     tick += 1
@@ -165,12 +166,13 @@ def update_reference(
     sampled: torch.Tensor,
     num_sampled: torch.Tensor,
     base_mask: torch.Tensor,
+    tokenizer_vocab_size: int,
 ) -> None:
     """Pure torch CPU oracle, using the same fixed physical slots."""
     for r in range(sampled.shape[0]):
         for token in sampled[r, : int(num_sampled[r])]:
             token_id = int(token)
-            if token_id < 0 or token_id >= base_mask.numel() or base_mask[token_id]:
+            if token_id < 0 or token_id >= tokenizer_vocab_size or base_mask[token_id]:
                 continue
             clock += 1
             hit = slot_token == token_id
@@ -207,6 +209,7 @@ class GlobalDraftVocabTail:
         self.base_size = runtime.shortlist_size
         self.tail_size = tail_size
         self.full_vocab_size = runtime.full_vocab_size
+        self.tokenizer_vocab_size = payload["tokenizer_vocab_size"]
         if ranking.numel() < self.base_size + tail_size:
             raise ValueError(
                 "Global MTP draft tail requires ranking length >= base + tail."
@@ -220,7 +223,7 @@ class GlobalDraftVocabTail:
         self.sink = next(
             (
                 i
-                for i in range(payload["tokenizer_vocab_size"], self.full_vocab_size)
+                for i in range(self.tokenizer_vocab_size, self.full_vocab_size)
                 if i not in base_ids
             ),
             -1,
@@ -230,6 +233,16 @@ class GlobalDraftVocabTail:
                 "Global MTP draft tail requires a padding token outside "
                 "the base vocabulary for SINK."
             )
+        seed = [
+            token_id
+            for token_id in ranking[self.base_size :].tolist()
+            if token_id < self.tokenizer_vocab_size and token_id not in base_ids
+        ][:tail_size]
+        if len(seed) < tail_size:
+            raise ValueError(
+                "Global MTP draft tail requires at least tail_size non-padding "
+                "seeds outside the base vocabulary after ranking position base."
+            )
         self.tp_size = tp_size
         self.tp_rank = tp_rank
         self.runtime = runtime
@@ -238,9 +251,7 @@ class GlobalDraftVocabTail:
         self.draft_logits = draft_logits
         device = self.source_weight.device
         T, B = tail_size, self.base_size
-        self.slot_token = (
-            ranking[B : B + T].to(device=device, dtype=torch.int64).clone()
-        )
+        self.slot_token = torch.tensor(seed, dtype=torch.int64, device=device)
         self.slot_stamp = torch.arange(1, T + 1, dtype=torch.int64, device=device)
         self.clock = torch.tensor([T], dtype=torch.int64, device=device)
         self.changed = torch.ones(T, dtype=torch.bool, device=device)
@@ -312,6 +323,7 @@ class GlobalDraftVocabTail:
             num_reqs,
             sampled.stride(0),
             self.full_vocab_size,
+            self.tokenizer_vocab_size,
             self.tail_size,
             triton.next_power_of_2(self.tail_size),
             self.draft_logits.shape[0] * self.draft_logits.shape[1]

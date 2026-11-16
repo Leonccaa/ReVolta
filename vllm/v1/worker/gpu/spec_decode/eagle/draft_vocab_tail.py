@@ -25,14 +25,11 @@ def global_tail_update(
     base_mask,
     sampled,
     num_sampled,
-    draft_logits,
     num_reqs,
     sampled_stride: tl.constexpr,
-    full_vocab: tl.constexpr,
     tokenizer_vocab: tl.constexpr,
     T: tl.constexpr,
     BLOCK: tl.constexpr,
-    RK: tl.constexpr,
 ):
     slots = tl.arange(0, BLOCK)
     tokens = tl.load(slot_token + slots, slots < T, other=-1)
@@ -58,14 +55,6 @@ def global_tail_update(
                             ),
                             0,
                         )
-                        if RK > 0:
-                            old_token = tl.sum(tl.where(slots == victim, tokens, 0), 0)
-                            rows = tl.arange(0, triton.next_power_of_2(RK))
-                            tl.store(
-                                draft_logits + rows * full_vocab + old_token,
-                                float("-inf"),
-                                rows < RK,
-                            )
                         replace = slots == victim
                         tokens = tl.where(replace, token, tokens)
                         stamps = tl.where(replace, tick, stamps)
@@ -131,13 +120,12 @@ def _merge_local(
         tl.float32
     )
     keys = B + tl.load(tail_tokens + slots, slots < T, other=0)
-    vals = tl.where(valid & (tl.abs(vals) < float("inf")), vals, float("-inf"))
+    vals = tl.where(valid, vals, float("-inf"))
     keys = tl.where(valid & (slots < T), keys, 0x7FFFFFFF)
     best = tl.max(vals, 0)
     key = tl.min(tl.where(vals == best, keys, 0x7FFFFFFF), 0)
     base_val = tl.load(base_values + row).to(tl.float32)
     base_key = tl.load(base_keys + row)
-    base_val = tl.where(tl.abs(base_val) < float("inf"), base_val, float("-inf"))
     use_base = (base_val > best) | ((base_val == best) & (base_key < key))
     tl.store(pairs + row * 2, tl.where(use_base, base_val, best))
     tl.store(pairs + row * 2 + 1, tl.where(use_base, base_key, key).to(tl.float32))
@@ -186,9 +174,33 @@ def update_reference(
 
 def merge_top1_reference(values: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
     """Pure torch total-order reduction: value descending, key ascending."""
-    values = values.masked_fill(~torch.isfinite(values), -torch.inf)
     best = values.max(-1, keepdim=True).values
     return keys.masked_fill(values != best, torch.iinfo(torch.int64).max).min(-1).values
+
+
+@triton.jit
+def _scatter_draft_logits(
+    reduced,
+    token_map,
+    idx_mapping,
+    draft_step,
+    output,
+    K: tl.constexpr,
+    E: tl.constexpr,
+    V: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    request = tl.load(idx_mapping + tl.program_id(0))
+    if request >= 0:
+        step = tl.load(draft_step)
+        columns = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        values = tl.load(
+            reduced + (request * K + step) * E + columns,
+            columns < E,
+            other=float("-inf"),
+        )
+        tokens = tl.load(token_map + columns, columns < E, other=0)
+        tl.store(output + (request * K + step) * V + tokens, values, columns < E)
 
 
 class GlobalDraftVocabTail:
@@ -309,8 +321,16 @@ class GlobalDraftVocabTail:
         )
 
     def update(
-        self, sampled: torch.Tensor, num_sampled: torch.Tensor, num_reqs: int
+        self,
+        sampled: torch.Tensor,
+        num_sampled: torch.Tensor,
+        num_reqs: int,
+        idx_mapping: torch.Tensor,
     ) -> None:
+        if self.draft_logits is not None:
+            self.draft_logits.index_fill_(
+                0, idx_mapping[:num_reqs].to(torch.int64), -torch.inf
+            )
         global_tail_update[(1,)](
             self.slot_token,
             self.slot_stamp,
@@ -319,16 +339,11 @@ class GlobalDraftVocabTail:
             self.base_mask,
             sampled,
             num_sampled,
-            self.draft_logits,
             num_reqs,
             sampled.stride(0),
-            self.full_vocab_size,
             self.tokenizer_vocab_size,
             self.tail_size,
             triton.next_power_of_2(self.tail_size),
-            self.draft_logits.shape[0] * self.draft_logits.shape[1]
-            if self.draft_logits is not None
-            else 0,
         )
         self._refresh()
 
@@ -408,9 +423,17 @@ class GlobalDraftVocabTail:
                 output_processed_logits_col=draft_step,
                 use_fp64=use_fp64,
             )
-            draft_logits.scatter_(
-                2,
-                self.ext_token_map.view(1, 1, -1).expand_as(self.reduced_draft_logits),
+            _scatter_draft_logits[
+                (hidden.shape[0], triton.cdiv(self.ext_token_map.numel(), 1024))
+            ](
                 self.reduced_draft_logits,
+                self.ext_token_map,
+                idx_mapping,
+                draft_step,
+                draft_logits,
+                draft_logits.shape[1],
+                self.ext_token_map.numel(),
+                self.full_vocab_size,
+                1024,
             )
         return self.ext_token_map[sampled]

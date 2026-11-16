@@ -2215,7 +2215,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             update_tail = getattr(self.speculator, "update_draft_vocab_tail", None)
             if update_tail is not None:
                 update_tail(
-                    sampler_output.sampled_token_ids, num_sampled, input_batch.num_reqs
+                    sampler_output.sampled_token_ids,
+                    num_sampled,
+                    input_batch.num_reqs,
+                    input_batch.idx_mapping,
                 )
             draft_tokens = self.speculator.propose(
                 input_batch,

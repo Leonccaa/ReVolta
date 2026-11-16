@@ -326,10 +326,14 @@ class EagleSpeculator:
             )
 
     def update_draft_vocab_tail(
-        self, sampled: torch.Tensor, num_sampled: torch.Tensor, num_reqs: int
+        self,
+        sampled: torch.Tensor,
+        num_sampled: torch.Tensor,
+        num_reqs: int,
+        idx_mapping: torch.Tensor,
     ) -> None:
         if self._draft_vocab_tail is not None:
-            self._draft_vocab_tail.update(sampled, num_sampled, num_reqs)
+            self._draft_vocab_tail.update(sampled, num_sampled, num_reqs, idx_mapping)
 
     def set_attn(
         self,

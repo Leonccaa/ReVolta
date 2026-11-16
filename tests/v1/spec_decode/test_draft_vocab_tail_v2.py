@@ -103,7 +103,7 @@ def test_lru_stepwise_1cat_and_torch(tmp_path, T, W):
             base_token_ids=base_ids,
             tail_size=T,
         )
-        tail.update(sampled, counts, 8)
+        tail.update(sampled, counts, 8, torch.arange(8))
         torch.testing.assert_close(tail.slot_token, tokens, rtol=0, atol=0)
         torch.testing.assert_close(tail.slot_stamp, stamps, rtol=0, atol=0)
         torch.testing.assert_close(tail.clock, clock, rtol=0, atol=0)
@@ -196,7 +196,7 @@ def test_update_ignores_all_padding_ids_in_kernel_and_reference(tmp_path):
             tail.base_mask,
             tail.tokenizer_vocab_size,
         )
-        tail.update(sampled, counts, 2)
+        tail.update(sampled, counts, 2, torch.arange(2))
         torch.testing.assert_close(tail.slot_token, tokens, rtol=0, atol=0)
         torch.testing.assert_close(tail.slot_stamp, stamps, rtol=0, atol=0)
         torch.testing.assert_close(tail.clock, clock, rtol=0, atol=0)
@@ -213,8 +213,8 @@ def test_lru_repeated_input_and_real_request_count(tmp_path):
     b, _, _ = _tail(tmp_path)
     sampled = torch.tensor([[30, 30, 29, 28, 27]] * 8)
     counts = torch.tensor([0, 5, 1, 2, 3, 4, 5, 5], dtype=torch.int32)
-    a.update(sampled, counts, 6)
-    b.update(sampled[:6].contiguous(), counts[:6], 6)
+    a.update(sampled, counts, 6, torch.arange(6))
+    b.update(sampled[:6].contiguous(), counts[:6], 6, torch.arange(6))
     torch.testing.assert_close(a.slot_token, b.slot_token, rtol=0, atol=0)
     torch.testing.assert_close(a.slot_stamp, b.slot_stamp, rtol=0, atol=0)
     torch.testing.assert_close(a.clock, b.clock, rtol=0, atol=0)
@@ -230,11 +230,11 @@ def test_greedy_k1_k2_total_order(tmp_path, tp):
         base_vals = torch.randn(M, generator=gen)
         base_keys = torch.full((M,), r * (B // tp), dtype=torch.int64)
         vals = torch.randn(M, T, generator=gen)
-        # Equal base/tail, tail/tail and cross-rank values; nonfinite inputs.
+        # Equal base/tail, tail/tail and cross-rank values; infinities compare directly.
         base_vals[:3] = 1
         vals[:3] = 1
-        vals[3, :3] = torch.tensor([torch.nan, torch.inf, -torch.inf])
-        base_vals[3] = torch.nan
+        vals[3, :2] = torch.tensor([torch.inf, -torch.inf])
+        base_vals[4] = torch.inf
         if r == 0:
             tail.tail_valid.zero_()
         tail_mod._merge_local[(M,)](
@@ -334,7 +334,12 @@ def test_probabilistic_mapping_eviction_and_greedy_fallback(tmp_path, monkeypatc
             old = int(tail.slot_token[0])
             new = next(i for i in range(tail.full_vocab_size - 1) if i not in union)
             for t, _, _ in tails:
-                t.update(torch.tensor([[new]]), torch.ones(1, dtype=torch.int32), 1)
+                t.update(
+                    torch.tensor([[new]] + [[int(t.runtime.token_id_map[0])]] * 6),
+                    torch.ones(7, dtype=torch.int32),
+                    7,
+                    mapping[:7],
+                )
             assert torch.isneginf(tail.draft_logits[..., old]).all()
             assert new in tail.slot_token
         for t, _, _ in tails:
@@ -345,6 +350,92 @@ def test_probabilistic_mapping_eviction_and_greedy_fallback(tmp_path, monkeypatc
             torch.testing.assert_close(
                 t.tail_weight[local], weight[t.slot_token[local]], rtol=0, atol=0
             )
+
+
+def test_pending_proposal_q_survives_other_requests_tail_changes(tmp_path):
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    tail, weight, _ = _tail(tmp_path, probabilistic=True)
+    spec = object.__new__(eagle.EagleSpeculator)
+    spec._static_draft_vocab = tail.runtime
+    spec._draft_vocab_tail = tail
+    spec.draft_logits = tail.draft_logits
+    spec.use_fp64_gumbel = True
+    spec.use_local_argmax_reduction = False
+    spec.temperature = torch.ones(8)
+    spec.seeds = torch.arange(8, dtype=torch.int64) + 93
+    generator = torch.Generator().manual_seed(121)
+    hidden = torch.randn(8, 4, generator=generator, dtype=torch.float16)
+    positions = torch.arange(8, dtype=torch.int64) + 15
+    mapping = torch.arange(8, dtype=torch.int32)
+    for step in range(4):
+        spec._sample_draft(
+            hidden, mapping, positions, torch.tensor(step), spec.draft_logits
+        )
+    before = tail.draft_logits.clone()
+    pending_q = before[7].numpy().tobytes()
+    old = int(tail.slot_token[0])
+    assert torch.isfinite(before[7, :, old]).all()
+    union = torch.cat((tail.runtime.token_id_map, tail.slot_token))
+    new = next(i for i in range(tail.tokenizer_vocab_size) if i not in union)
+
+    # Only requests 6 and 2 are verified and drafted in the intervening batch.
+    active = torch.tensor([6, 2], dtype=torch.int32)
+    spec.update_draft_vocab_tail(
+        torch.tensor([[new], [int(tail.runtime.token_id_map[0])]]),
+        torch.ones(2, dtype=torch.int32),
+        2,
+        active,
+    )
+    assert old not in tail.slot_token and new in tail.slot_token
+    assert torch.isneginf(tail.draft_logits[active.long()]).all()
+    inactive = torch.tensor([0, 1, 3, 4, 5, 7])
+    assert (
+        tail.draft_logits[inactive].numpy().tobytes()
+        == before[inactive].numpy().tobytes()
+    )
+    # Graph padding must not write request 0 or any other real request.
+    padded_mapping = torch.tensor([6, 2, -1], dtype=torch.int32)
+    for step in range(4):
+        spec._sample_draft(
+            hidden[[6, 2, 0]],
+            padded_mapping,
+            positions[[6, 2, 0]],
+            torch.tensor(step),
+            spec.draft_logits,
+        )
+        assert (
+            tail.draft_logits[inactive].numpy().tobytes()
+            == before[inactive].numpy().tobytes()
+        )
+    assert torch.isneginf(tail.draft_logits[active.long(), :, old]).all()
+    assert torch.isfinite(tail.draft_logits[active.long(), :, new]).all()
+
+    # Resume request 7 through the real runner verification call site.
+    consumed = []
+
+    def verify(logits, batch, q):
+        consumed.append(q[batch.idx_mapping.long()].numpy().tobytes())
+        return SimpleNamespace(num_sampled=torch.ones(1, dtype=torch.int32))
+
+    runner = object.__new__(GPUModelRunner)
+    runner.speculator = spec
+    runner.rejection_sampler = Mock(side_effect=verify)
+    runner.device = torch.device("cpu")
+    runner.model = SimpleNamespace(compute_logits=lambda h: h @ weight.T)
+    runner.req_states = SimpleNamespace(
+        prefill_len=SimpleNamespace(gpu=torch.zeros(8, dtype=torch.int32))
+    )
+    batch = SimpleNamespace(
+        logits_indices=torch.arange(5),
+        num_draft_tokens=4,
+        num_reqs=1,
+        idx_mapping=torch.tensor([7], dtype=torch.int32),
+        seq_lens=torch.tensor([25], dtype=torch.int32),
+        cu_num_logits=torch.tensor([0, 5], dtype=torch.int32),
+    )
+    runner.sample(hidden[:5], batch, None)
+    assert consumed == [pending_q]
 
 
 def test_sampling_distribution_fixed_seed(tmp_path):
@@ -492,6 +583,60 @@ def test_disabled_matches_baseline_and_does_not_import_tail(monkeypatch):
             expected = namespace["_sample_draft"](spec, *args)
             actual = spec._sample_draft(*args)
             assert expected.numpy().tobytes() == actual.numpy().tobytes()
+
+
+@pytest.mark.parametrize("static", [False, True])
+def test_disabled_probabilistic_matches_main_bytes(tmp_path, static):
+    import subprocess
+
+    source = subprocess.check_output(
+        [
+            "git",
+            "show",
+            "9b882072f3:vllm/v1/worker/gpu/spec_decode/eagle/speculator.py",
+        ],
+        text=True,
+    )
+    baseline = next(
+        n
+        for n in ast.walk(ast.parse(source))
+        if isinstance(n, ast.FunctionDef) and n.name == "_sample_draft"
+    )
+    namespace = dict(torch=torch, gumbel_sample=eagle.gumbel_sample)
+    exec(
+        compile(ast.Module(body=[baseline], type_ignores=[]), "<baseline>", "exec"),
+        namespace,
+    )
+    tail, weight, _ = _tail(tmp_path, probabilistic=True)
+    spec = object.__new__(eagle.EagleSpeculator)
+    spec._static_draft_vocab = tail.runtime if static else None
+    spec._draft_vocab_tail = None
+    spec.use_local_argmax_reduction = False
+    spec.use_fp64_gumbel = True
+    spec.temperature = torch.linspace(0, 1.4, 8)
+    spec.seeds = torch.arange(8, dtype=torch.int64) + 47
+    spec.model = SimpleNamespace(compute_logits=lambda h: h @ weight.T)
+    actual_full = (
+        torch.full((8, 4, 32), -torch.inf) if static else torch.zeros(8, 4, 32)
+    )
+    expected_full = actual_full.clone()
+    actual_reduced = torch.zeros(8, 4, 8) if static else None
+    expected_reduced = torch.zeros(8, 4, 8) if static else None
+    generator = torch.Generator().manual_seed(81)
+    mapping = torch.tensor([7, 0, 2, -1], dtype=torch.int32)
+    positions = torch.tensor([9, 17, 18, 0])
+    for step in range(4):
+        hidden = torch.randn(4, 4, generator=generator, dtype=torch.float16)
+        spec._reduced_draft_logits = expected_reduced
+        expected = namespace["_sample_draft"](
+            spec, hidden, mapping, positions, torch.tensor(step), expected_full
+        )
+        spec._reduced_draft_logits = actual_reduced
+        actual = spec._sample_draft(
+            hidden, mapping, positions, torch.tensor(step), actual_full
+        )
+        assert actual.numpy().tobytes() == expected.numpy().tobytes()
+        assert actual_full.numpy().tobytes() == expected_full.numpy().tobytes()
 
 
 @pytest.mark.parametrize("tp", [1, 2, 4])
@@ -654,8 +799,8 @@ def test_speculator_enabled_initialization_and_sampling(
         torch.ones((4, 1), dtype=torch.int64),
         torch.ones(4, dtype=torch.int32),
     )
-    spec.update_draft_vocab_tail(sampled, counts, 4)
-    update.assert_called_once_with(sampled, counts, 4)
+    spec.update_draft_vocab_tail(sampled, counts, 4, mapping)
+    update.assert_called_once_with(sampled, counts, 4, mapping)
 
 
 @pytest.mark.parametrize("with_tail", [False, True])
@@ -724,8 +869,9 @@ def test_runner_actual_call_order(monkeypatch, with_tail):
     runner.speculator = SimpleNamespace(supports_mm_inputs=False, propose=propose)
     if with_tail:
 
-        def update(sampled, num_sampled, num_reqs):
+        def update(sampled, num_sampled, num_reqs, idx_mapping):
             assert sampled is ids and num_sampled is counts and num_reqs == 1
+            assert idx_mapping is batch.idx_mapping
             calls.append("update")
 
         runner.speculator.update_draft_vocab_tail = update

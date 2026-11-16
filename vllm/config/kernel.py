@@ -452,15 +452,16 @@ class LongContextKVConfig:
     hot-page pool. ``gpu``: in the GPU history segment next to the
     compressed index (the same-plan reference arm); the host and hot pools
     then only budget admission."""
-    draft_main_placement: Literal["gpu", "host"] = "gpu"
+    draft_main_placement: Literal["gpu", "host"] = "host"
     """Where an MTP draft's main K/V lives when it has the target's sharded
-    geometry (``qsa_dcp_index_shard`` with DCP). ``gpu``: in the GPU history
-    segment, next to its index pages: fastest decode. ``host``: one more
+    geometry (``qsa_dcp_index_shard`` with DCP). ``host`` (default): one more
     layer of the host store, so each history ID takes fewer GPU bytes and the
     context concurrency limit rises, at the price of draft forwards reading
-    host pages. ``host`` needs ``main_kv_placement="host"``; otherwise, or for
-    a draft that does not share the target's geometry, the draft stays on
-    the GPU and a warning is logged."""
+    host pages. ``gpu``: in the GPU history segment, next to its index pages:
+    fastest decode and the layout earlier releases ran by default. ``host``
+    needs ``main_kv_placement="host"``; otherwise, or for a draft that does
+    not share the target's geometry, the draft stays on the GPU and a warning
+    is logged."""
     staged_writethrough: bool = True
     """Stage eager prefill writes on device and submit merged same-stream D2H
     copies. Decode/capture uses word-vectorized UVA. False retains the legacy

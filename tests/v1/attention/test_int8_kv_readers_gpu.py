@@ -9,13 +9,14 @@ import torch
 
 from vllm.models.qwen4_exp.nvidia.ops import qsa_int8 as reader
 from vllm.v1.attention.kv_cache_view import KVCacheView, bind_planar_kv_cache
-from vllm.v1.attention.kv_codecs import INT8
+from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD, INT8
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires SM70")
 
 
-def fixture(rows, member=1, padding=0):
-    reader.require_int8_abi()
+def fixture(rows, member=1, padding=0, codec=INT8):
+    if codec is INT8:
+        reader.require_int8_abi()
     torch.manual_seed(42)
     raw = torch.zeros(3 * (848640 + 2 * padding), dtype=torch.int8, device="cuda")
     carrier = bind_planar_kv_cache(
@@ -28,10 +29,16 @@ def fixture(rows, member=1, padding=0):
         page_size_bytes=424320 + padding,
         member_index=member,
         member_count=2,
+        dtype=codec.storage_dtype,
     )
-    view = KVCacheView.bind(carrier, INT8, 256)
-    view.key.random_(-128, 128)
-    view.value.random_(-128, 128)
+    view = KVCacheView.bind(carrier, codec, 256)
+    if codec is INT8:
+        view.key.random_(-128, 128)
+        view.value.random_(-128, 128)
+    else:
+        for payload in (view.key, view.value):
+            source = torch.randn(payload.shape, device=payload.device) * 8
+            payload.copy_(source.to(codec.element_dtype).view(torch.uint8))
     view.key_scale.uniform_(0.002, 0.008)
     view.value_scale.copy_(
         torch.logspace(-6, -1.7, 2448, device="cuda").view(153, 16, 1)
@@ -48,9 +55,10 @@ def fixture(rows, member=1, padding=0):
     return raw, view, q, indices, table, req, pos, lens
 
 
-def oracle(q, view, indices, table, requests):
+def oracle(q, view, indices, table, requests, codec=INT8):
     q, indices, table, requests = [x.cpu() for x in (q, indices, table, requests)]
-    k, v = view.key.cpu().double(), view.value.cpu().double()
+    k = view.key.cpu().view(codec.element_dtype).double()
+    v = view.value.cpu().view(codec.element_dtype).double()
     sk, sv = view.key_scale.cpu().double(), view.value_scale.cpu().double()
     output = torch.zeros_like(q, dtype=torch.float64)
     lse = torch.full(q.shape[:2], -math.inf, dtype=torch.float64)
@@ -68,6 +76,35 @@ def oracle(q, view, indices, table, requests):
         output[row] = torch.softmax(scores, -1) @ values
         lse[row] = torch.logsumexp(scores, -1) / math.log(2)
     return output.float(), lse.float()
+
+
+def test_triton_e4m3_partial_and_lse():
+    raw, view, q, ids, table, req, pos, lens = fixture(
+        5, padding=816, codec=FP8_E4M3_PER_TOKEN_HEAD
+    )
+    saved = raw.clone()
+    out = torch.empty(q.shape, dtype=torch.float32, device=q.device)
+    lse = torch.empty(q.shape[:2], dtype=torch.float32, device=q.device)
+    reader.sparse_attention(
+        q,
+        view.key,
+        view.value,
+        ids,
+        table,
+        req,
+        out,
+        None,
+        pos,
+        lens,
+        view.key_scale,
+        view.value_scale,
+        lse,
+        codec=FP8_E4M3_PER_TOKEN_HEAD,
+    )
+    ref, ref_lse = oracle(q, view, ids, table, req, FP8_E4M3_PER_TOKEN_HEAD)
+    torch.testing.assert_close(out.cpu(), ref, atol=0.004, rtol=0.015)
+    torch.testing.assert_close(lse.cpu(), ref_lse, atol=0.002, rtol=0.002)
+    assert torch.equal(saved, raw)
 
 
 @pytest.mark.parametrize("rows", [1, 5, 8, 17, 20, 40])

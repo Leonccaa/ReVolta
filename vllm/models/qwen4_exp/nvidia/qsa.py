@@ -234,6 +234,8 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             raise NotImplementedError("Qwen4Exp QSA requires FlashAttention")
         if self.dcp_world_size not in (1, 2):
             raise NotImplementedError("Qwen4Exp QSA supports DCP1 or DCP2")
+        from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD
+
         if self.kv_cache_dtype not in (
             "auto",
             "float16",
@@ -241,6 +243,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             "fp8",
             "fp8_e4m3",
             "int8",
+            FP8_E4M3_PER_TOKEN_HEAD.name,
         ):
             raise NotImplementedError(
                 "Qwen4Exp QSA requires FP16/BF16 or E4M3 main KV cache"
@@ -300,7 +303,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         value_cache = canonicalize_singleton_dim_strides(value_cache)
         if query.dtype not in (torch.float16, torch.bfloat16):
             raise NotImplementedError("Qwen4Exp QSA requires FP16/BF16 queries")
-        if self.kv_cache_dtype in ("fp8", "fp8_e4m3"):
+        if codec.element_dtype == torch.float8_e4m3fn:
             if key_cache.dtype != torch.uint8 or value_cache.dtype != torch.uint8:
                 raise RuntimeError("Qwen4Exp QSA E4M3 cache must use uint8 storage")
         elif self.kv_cache_dtype == "int8":
@@ -681,7 +684,10 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             local_indices.shape[1],
         )
         scale_kwargs = {}
-        if self.kv_cache_dtype == "int8":
+        from vllm.v1.attention.kv_codecs import resolve_kv_codec
+
+        codec = resolve_kv_codec(self.kv_cache_dtype)
+        if codec is not None and codec.per_token_head:
             scale_kwargs = {
                 "k_scale_cache": k_scale_cache,
                 "v_scale_cache": v_scale_cache,
@@ -746,7 +752,13 @@ def _verify_e4m3_kv_requirements(
             raise NotImplementedError("QSA INT8 requires FP16 activations on SM70")
         require_int8_abi()
         return
-    if cache_config.cache_dtype not in ("fp8", "fp8_e4m3"):
+    from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD
+
+    if cache_config.cache_dtype not in (
+        "fp8",
+        "fp8_e4m3",
+        FP8_E4M3_PER_TOKEN_HEAD.name,
+    ):
         return
     from .ops.qsa import qsa_e4m3_capability_reason
 
@@ -912,9 +924,14 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, model_config
         )
-        if self.kv_cache_dtype not in ("fp8", "fp8_e4m3", "int8") and (
-            self.kv_cache_torch_dtype != model_config.dtype
-        ):
+        from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD
+
+        if self.kv_cache_dtype not in (
+            "fp8",
+            "fp8_e4m3",
+            "int8",
+            FP8_E4M3_PER_TOKEN_HEAD.name,
+        ) and (self.kv_cache_torch_dtype != model_config.dtype):
             raise NotImplementedError(
                 "Qwen4Exp QSA main cache dtype must match the model dtype"
             )

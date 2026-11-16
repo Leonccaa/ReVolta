@@ -24,6 +24,7 @@ from vllm.models.qwen4_exp.nvidia.ops.sm70_qsa_tuning import (
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
+from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD, INT8, resolve_kv_codec
 
 from .qsa_request_segments import (
     qsa_mqa_request_segments_paged,
@@ -2878,6 +2879,9 @@ def qsa_dcp_sparse_paged_attention_sm70_grouped_page4(
     multiple of eight, or 0 when the route does not apply. The caller runs the
     remaining rows through ``qsa_sparse_paged_attention``.
     """
+    # The new planar codec uses Triton until its native page4 step is ready.
+    if resolve_kv_codec(kv_cache_dtype) is FP8_E4M3_PER_TOKEN_HEAD:
+        return 0
     if kv_cache_dtype == "int8":
         from .qsa_int8 import dcp_grouped
 
@@ -3241,7 +3245,8 @@ def qsa_sparse_paged_attention(
     result. Apply output gating after the cross-rank merge, not per rank.
     """
 
-    if kv_cache_dtype == "int8":
+    codec = resolve_kv_codec(kv_cache_dtype)
+    if codec in (INT8, FP8_E4M3_PER_TOKEN_HEAD):
         from .qsa_int8 import sparse_attention
 
         return sparse_attention(
@@ -3258,6 +3263,7 @@ def qsa_sparse_paged_attention(
             k_scale_cache,
             v_scale_cache,
             lse,
+            codec=codec,
         )
 
     if not q.is_cuda or not HAS_TRITON:

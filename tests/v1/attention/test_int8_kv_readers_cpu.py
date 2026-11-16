@@ -14,28 +14,30 @@ from vllm.v1.attention.kv_cache_view import (  # noqa: E402
     KVCacheView,
     bind_planar_kv_cache,
 )
-from vllm.v1.attention.kv_codecs import INT8  # noqa: E402
+from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD, INT8  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("TRITON_INTERPRET") != "1", reason="requires CPU interpreter harness"
 )
 
 
-def cache(member=1, padding=0, device="cpu"):
-    page = 424320 + padding
+def cache(member=1, padding=0, device="cpu", codec=INT8, block=16):
+    tokens = 832 if block == 64 else 816
+    page = tokens * 520 + padding
     raw = torch.zeros((3 * 2 * page,), dtype=torch.int8, device=device)
     carrier = bind_planar_kv_cache(
         raw,
         num_blocks=3,
-        scheduler_block_size=816,
-        kernel_block_size=16,
+        scheduler_block_size=tokens,
+        kernel_block_size=block,
         num_heads=1,
         head_size=256,
         page_size_bytes=page,
         member_index=member,
         member_count=2,
+        dtype=codec.storage_dtype,
     )
-    return raw, carrier, KVCacheView.bind(carrier, INT8, 256)
+    return raw, carrier, KVCacheView.bind(carrier, codec, 256)
 
 
 def test_exact_half2_subtraction_all_byte_pairs():
@@ -51,25 +53,116 @@ def test_exact_half2_subtraction_all_byte_pairs():
 @pytest.mark.parametrize("rows", [1, 5, 8, 17, 20, 40])
 @pytest.mark.parametrize("member,padding", [(0, 0), (1, 816)])
 def test_interpreted_reader_against_float64(rows, member, padding, repeat):
+    _check_reader(rows, member, padding, repeat, INT8)
+
+
+def test_interpreted_e4m3_reader_against_float64():
+    for repeat in (1, 5):  # One split and FP32 split/merge, same packed owner.
+        _check_reader(5, 1, 832, repeat, FP8_E4M3_PER_TOKEN_HEAD, block=64)
+
+
+@pytest.mark.parametrize("sharded", [False, True])
+def test_e4m3_forward_passes_planes_and_actual_rows(sharded, monkeypatch):
+    from vllm import distributed
+    from vllm.models.qwen4_exp.nvidia.ops import qsa, qsa_dcp
+    from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAFlashAttentionImpl as Impl
+
+    _, carrier, view = cache(codec=FP8_E4M3_PER_TOKEN_HEAD)
+    q = torch.zeros(7, 6, 256, dtype=torch.float16)
+    ids = torch.zeros(5, 9, dtype=torch.int32)
+    layer = SimpleNamespace(
+        topk_indices_buffer=ids,
+        qsa_dcp_sharded=sharded,
+        _k_scale_float=1.0,
+        _v_scale_float=1.0,
+        dcp_local_indices_buffer=torch.empty_like(ids),
+        dcp_partial_output_buffer=torch.empty(5, 12, 256),
+        dcp_partial_lse_buffer=torch.empty(5, 12),
+        cp_kv_cache_interleave_size=1,
+        indexer=SimpleNamespace(token_topk=8, compress_ratio=4),
+    )
+    calls = []
+
+    def attend(query, key, value, indices, table, requests, out, **kwargs):
+        assert query.shape[:2] == (5, 12 if sharded else 6)
+        assert kwargs["k_scale_cache"].data_ptr() == view.key_scale.data_ptr()
+        assert kwargs["v_scale_cache"].stride() == view.value_scale.stride()
+        assert kwargs["kv_cache_dtype"] == FP8_E4M3_PER_TOKEN_HEAD.name
+        out.fill_(2)
+        calls.append("attend")
+
+    monkeypatch.setattr(qsa, "qsa_sparse_paged_attention", attend)
+    monkeypatch.setattr(qsa_dcp, "qsa_localize_dcp_indices", lambda src, dst, **kw: src)
+    group = SimpleNamespace(all_gather=lambda tensor, dim: tensor.repeat(1, 2, 1))
+    monkeypatch.setattr(distributed, "get_dcp_group", lambda: group)
+
+    def combine(partial, lse, group, **kwargs):
+        assert partial.dtype == lse.dtype == torch.float32
+        calls.append("combine")
+        return partial[:, :6]
+
+    monkeypatch.setattr(qsa, "_qsa_output_gate", lambda *a: calls.append("gate"))
+    impl = SimpleNamespace(
+        head_size=256,
+        kv_cache_dtype=FP8_E4M3_PER_TOKEN_HEAD.name,
+        alibi_slopes=None,
+        sinks=None,
+        sliding_window=(-1, -1),
+        dcp_world_size=2,
+        dcp_rank=0,
+        dcp_combine=combine,
+    )
+    impl._forward_qsa_dcp = lambda *a, **kw: Impl._forward_qsa_dcp(impl, *a, **kw)
+    out = torch.empty_like(q)
+    metadata = SimpleNamespace(
+        num_actual_tokens=5, block_table=torch.zeros(1, 153, dtype=torch.int32)
+    )
+    Impl.forward_qsa(
+        impl,
+        layer,
+        q,
+        q,
+        q,
+        carrier,
+        metadata,
+        out,
+        torch.zeros(7, dtype=torch.int32),
+        output_gate=q,
+    )
+    assert calls == (["attend", "combine", "gate"] if sharded else ["attend"])
+    assert torch.all(out[:5] == 2) and not out[5:].count_nonzero()
+
+
+def _check_reader(rows, member, padding, repeat, codec, block=16):
     assert os.environ.get("TRITON_INTERPRET") == "1"
     torch.manual_seed(412)
-    _, _, view = cache(member, padding)
-    view.key.random_(-128, 128)
-    view.value.random_(-128, 128)
+    raw, _, view = cache(member, padding, codec=codec, block=block)
+    if codec is INT8:
+        view.key.random_(-128, 128)
+        view.value.random_(-128, 128)
+    else:
+        for payload in (view.key, view.value):
+            source = torch.randn(payload.shape, dtype=torch.float16) * 8
+            payload.copy_(source.to(codec.element_dtype).view(torch.uint8))
     view.key_scale.fill_(0.007)
     view.value_scale.fill_(0.013)
     q = torch.randn((rows, 6, 256), dtype=torch.float16) * 0.3
-    tokens = torch.tensor([15, 16, 815, 816, 1631, 1632, 2447, -1, 2448])
+    total = view.key.shape[0] * block
+    page = total // 3
+    tokens = torch.tensor(
+        [block - 1, block, page - 1, page, 2 * page - 1, 2 * page, total - 1, -1, total]
+    )
     indices = tokens.to(torch.int32).repeat(rows, repeat)
     # Vary token/head scales; a small value contribution must survive late-scale.
     for t in tokens[:7].tolist():
-        view.key_scale[t // 16, t % 16] = 2.0 ** (-(t % 9))
-        view.value_scale[t // 16, t % 16] = 2.0 ** (-(t % 17))
-    table = torch.arange(153, dtype=torch.int32)[None, :]
+        view.key_scale[t // block, t % block] = 2.0 ** (-(t % 9))
+        view.value_scale[t // block, t % block] = 2.0 ** (-(t % 17))
+    table = torch.arange(view.key.shape[0], dtype=torch.int32)[None, :]
     req = torch.zeros(rows, dtype=torch.int32)
     req[-1] = -1 if rows > 1 else 0
     out = torch.empty_like(q)
     lse = torch.empty((rows, 6), dtype=torch.float32)
+    saved = raw.clone()
     reader.triton_attention(
         q,
         view.key,
@@ -81,18 +174,22 @@ def test_interpreted_reader_against_float64(rows, member, padding, repeat):
         view.key_scale,
         view.value_scale,
         lse,
+        codec=codec,
     )
+    assert torch.equal(saved, raw)
+    key = view.key.view(codec.element_dtype)
+    value = view.value.view(codec.element_dtype)
     k = torch.stack(
         [
-            view.key[t // 16, t % 16, 0].double()
-            * view.key_scale[t // 16, t % 16, 0].double()
+            key[t // block, t % block, 0].double()
+            * view.key_scale[t // block, t % block, 0].double()
             for t in tokens[:7]
         ]
     )
     v = torch.stack(
         [
-            view.value[t // 16, t % 16, 0].double()
-            * view.value_scale[t // 16, t % 16, 0].double()
+            value[t // block, t % block, 0].double()
+            * view.value_scale[t // block, t % block, 0].double()
             for t in tokens[:7]
         ]
     )

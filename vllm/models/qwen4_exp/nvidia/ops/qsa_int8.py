@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Planar INT8 readers. Legacy QSA kernels remain in qsa.py unchanged."""
+"""Planar token/head readers. Legacy scalar QSA kernels remain unchanged."""
 
 import math
 
@@ -8,6 +8,7 @@ import torch
 
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.kv_cache_view import KVPageMapping
+from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD, INT8
 
 
 @triton.jit(do_not_specialize=["num_requests"])
@@ -66,6 +67,7 @@ def _int8_sparse_kernel(
     POSITIONS=None,
     SEQLENS=None,
     CAUSAL: tl.constexpr = True,
+    E4M3_DECODER: tl.constexpr = None,
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -146,6 +148,9 @@ def _int8_sparse_kernel(
             mask=valid[:, None],
             other=0.0,
         )
+        if KV_E4M3:
+            keys = E4M3_DECODER(keys)
+            values = E4M3_DECODER(values)
         keys = keys.to(query.dtype)
         values = values.to(query.dtype)
         key_scales = tl.load(
@@ -342,12 +347,17 @@ def require_int8_abi():
     return native
 
 
-def validate_planes(q, k, v, sk, sv):
-    if k.dtype != torch.int8 or v.dtype != torch.int8 or k.shape != v.shape:
-        raise ValueError("INT8 reader requires signed int8 K/V payloads")
+def validate_planes(q, k, v, sk, sv, codec=INT8):
+    if not codec.stores(k, v) or k.shape != v.shape:
+        raise ValueError(f"{codec.name} reader requires matching K/V payloads")
     if q.ndim != 3 or k.ndim != 4 or q.shape[2] != k.shape[3]:
         raise ValueError("INT8 reader Q/K/V shape mismatch")
-    if q.shape[1] % k.shape[2] or q.dtype != torch.float16:
+    query_dtypes = (
+        (torch.float16, torch.bfloat16)
+        if codec is FP8_E4M3_PER_TOKEN_HEAD
+        else (torch.float16,)
+    )
+    if q.shape[1] % k.shape[2] or q.dtype not in query_dtypes:
         raise ValueError("INT8 reader requires FP16 grouped-query heads")
     for plane in (sk, sv):
         if (
@@ -383,9 +393,17 @@ def triton_attention(
     max_seq_len=0,
     causal=True,
     softmax_scale=None,
+    codec=INT8,
 ):
     """FP32 late-scale reference/fallback; never expands the KV cache to Half."""
-    validate_planes(q, k, v, sk, sv)
+    validate_planes(q, k, v, sk, sv, codec)
+    decoder = None
+    if codec is FP8_E4M3_PER_TOKEN_HEAD:
+        from vllm.models.deepseek_v4.common.ops.fp8_software import (
+            fp8_e4m3fn_bits_to_fp32_bitcast,
+        )
+
+        decoder = fp8_e4m3fn_bits_to_fp32_bitcast
     rows, heads, dim = q.shape
     width = max_seq_len if dense else indices.shape[1]
     tiles = triton.cdiv(width, 32)
@@ -434,7 +452,8 @@ def triton_attention(
         NUM_TILES=tiles,
         BLOCK_M=max(16, triton.next_power_of_2(group)),
         BLOCK_N=32,
-        KV_E4M3=False,
+        KV_E4M3=codec is FP8_E4M3_PER_TOKEN_HEAD,
+        E4M3_DECODER=decoder,
         K_SCALES=sk,
         V_SCALES=sv,
         KS_BLOCK=sk.stride(0),
@@ -569,18 +588,34 @@ def native_grouped(
 
 
 def sparse_attention(
-    q, k, v, indices, table, requests, out, gate, positions, seq_lens, sk, sv, lse=None
+    q,
+    k,
+    v,
+    indices,
+    table,
+    requests,
+    out,
+    gate,
+    positions,
+    seq_lens,
+    sk,
+    sv,
+    lse=None,
+    *,
+    codec=INT8,
 ):
     from .qsa import _qsa_output_gate
 
-    require_int8_abi()
-    validate_planes(q, k, v, sk, sv)
+    if codec is INT8:
+        require_int8_abi()
+    validate_planes(q, k, v, sk, sv, codec)
     if out is None:
         out = torch.empty_like(q)
     if q.shape[0] == 0:
         return out
     native_shape = (
-        q.shape[1] % 6 == 0
+        codec is INT8
+        and q.shape[1] % 6 == 0
         and q.shape[2] == 256
         and indices.shape[1] == 2051
         and k.shape[1:] == (16, 1, 256)
@@ -611,6 +646,7 @@ def sparse_attention(
         sv,
         lse,
         gate.view_as(q) if gate is not None else None,
+        codec=codec,
     )
 
 

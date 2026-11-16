@@ -763,3 +763,61 @@ def test_e4m3_planar_metadata_uses_actual_kernel_geometry(monkeypatch):
         kernels.append(kernel)
     assert kernels[0]["region_offsets"] != kernels[1]["region_offsets"]
     assert kernels[0]["region_bytes"] != kernels[1]["region_bytes"]
+
+
+def test_e4m3_reference_zero_and_rounding_boundaries():
+    x = torch.tensor(
+        [[448.0, -448.0, 0.0, -0.0, 1.0625, 1.1875, 2**-10, 3 * 2**-10], [0.0] * 8],
+        dtype=torch.float32,
+    )
+    payload, scale = FP8_E4M3_PER_TOKEN_HEAD.encode(x)
+    assert payload.dtype == torch.uint8 and scale.dtype == torch.float32
+    assert payload[0].tolist() == [126, 254, 0, 128, 56, 58, 0, 2]
+    assert scale.tolist() == [1.0, 2**-126]
+    assert not payload[1].any()
+    # Independent scalar RN32 oracle, including the normal scale floor.
+    rows = torch.stack(
+        (torch.linspace(-65504, 65504, 256), torch.linspace(-1e-38, 1e-38, 256))
+    )
+    payload, scale = FP8_E4M3_PER_TOKEN_HEAD.encode(rows)
+    for row, values in enumerate(rows.tolist()):
+        s = max(torch.tensor(max(abs(v) for v in values) / 448).item(), 2**-126)
+        normalized = torch.tensor([v / s for v in values], dtype=torch.float32)
+        expected = normalized.to(torch.float8_e4m3fn).view(torch.uint8)
+        assert scale[row].item() == s
+        assert torch.equal(payload[row], expected)
+
+
+def test_e4m3_writer_dispatch_preserves_legacy_calls(monkeypatch):
+    from unittest.mock import Mock
+
+    from vllm import _custom_ops as ops
+    from vllm.v1.attention.ops import triton_reshape_and_cache_flash as writer
+
+    software = Mock()
+    legacy = Mock()
+    monkeypatch.setattr(
+        writer, "triton_reshape_and_cache_flash_per_token_head_quant", software
+    )
+    monkeypatch.setattr(
+        torch.ops._C_cache_ops, "reshape_and_cache_flash", legacy, raising=False
+    )
+    raw = torch.full((3 * 848640,), 77, dtype=torch.uint8)
+    view = KVCacheView.bind(
+        packed(raw, codec=FP8_E4M3_PER_TOKEN_HEAD), FP8_E4M3_PER_TOKEN_HEAD, 256
+    )
+    k = torch.zeros(1, 1, 256)
+    slots = torch.tensor([0])
+    scalar = torch.tensor(7.0)
+    args = (k, k, view.key, view.value, slots)
+    ops.reshape_and_cache_flash(
+        *args, FP8_E4M3_PER_TOKEN_HEAD.name, scalar, scalar, **view.scale_kwargs
+    )
+    software.assert_called_once_with(
+        k, k, view.key, view.value, view.key_scale, view.value_scale, slots
+    )
+    legacy.assert_not_called()
+    for dtype in ("auto", "fp8", "fp8_e4m3"):
+        ops.reshape_and_cache_flash(*args, dtype, scalar, scalar)
+        legacy.assert_called_with(*args, dtype, scalar, scalar)
+    assert software.call_count == 1

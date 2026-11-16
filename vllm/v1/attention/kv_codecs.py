@@ -105,12 +105,19 @@ class KVCodec:
         return cache.view(self.element_dtype).to(out_dtype) * scale
 
     def encode(self, values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Reference dynamic INT8 encoder; not used by the execution hot path.
+        """Reference dynamic encoder; not used by the execution hot path.
 
-        A non-finite row receives a NaN scale, propagating invalid inputs to
-        its readers instead of silently converting them into finite values.
+        The existing INT8 path gives a non-finite row a NaN scale, propagating
+        invalid inputs to its readers rather than making them finite.
         Legacy truncation retains its original multiplication order.
         """
+        if self is FP8_E4M3_PER_TOKEN_HEAD:
+            x = values.float()
+            # R4: RN division for both the scale and the normalized values.
+            scale = (x.abs().amax(dim=-1).double() / 448.0).float()
+            scale = scale.clamp_min(2.0**-126)
+            q = (x.double() / scale[..., None].double()).float()
+            return q.to(torch.float8_e4m3fn).view(torch.uint8), scale
         if self.element_dtype != torch.int8 or not self.per_token_head:
             raise ValueError(f"{self.name} has no dynamic INT8 reference encoder")
         x = values.float()

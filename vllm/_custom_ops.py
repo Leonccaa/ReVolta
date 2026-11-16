@@ -2701,6 +2701,24 @@ def reshape_and_cache_flash(
     k_scale_cache: torch.Tensor | None = None,
     v_scale_cache: torch.Tensor | None = None,
 ) -> None:
+    from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD
+
+    if kv_cache_dtype == FP8_E4M3_PER_TOKEN_HEAD.name:
+        from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+            triton_reshape_and_cache_flash_per_token_head_quant,
+        )
+
+        assert k_scale_cache is not None and v_scale_cache is not None
+        triton_reshape_and_cache_flash_per_token_head_quant(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            k_scale_cache,
+            v_scale_cache,
+            slot_mapping,
+        )
+        return
     if kv_cache_dtype == "int8":
         if k_scale_cache is None or v_scale_cache is None:
             raise ValueError("INT8 v1 writer requires both FP32 scale planes")

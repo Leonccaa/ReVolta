@@ -133,22 +133,6 @@ NOTES: dict[str, dict[str, str]] = {
         "removed in 0.2.0rc13. The new name wins when both are set.",
         metrics="",
     ),
-    "REVOLTA_GDN_CPU_SPEC_QSL": dict(
-        section="promoted",
-        since="0.2.0",
-        range="0, 1",
-        tradeoff="Deprecated alias of VLLM_SM70_GDN_CPU_SPEC_QSL; removed in "
-        "0.2.0rc6. The new name wins when both are set.",
-        metrics="",
-    ),
-    "REVOLTA_GDN_CPU_SPEC_QSL_CHECK_FILE": dict(
-        section="promoted",
-        since="0.2.0",
-        range="path",
-        tradeoff="Deprecated alias of VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE; "
-        "removed in 0.2.0rc6.",
-        metrics="",
-    ),
     "REVOLTA_QSA_GROUPED_LPT": dict(
         section="promoted",
         since="0.2.0",

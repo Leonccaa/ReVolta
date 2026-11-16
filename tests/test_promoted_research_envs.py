@@ -15,7 +15,6 @@ from vllm import envs
 
 # old name -> (new name, default when neither is set)
 FLAGS = {
-    "REVOLTA_GDN_CPU_SPEC_QSL": ("VLLM_SM70_GDN_CPU_SPEC_QSL", False),
     "REVOLTA_QSA_GROUPED_LPT": ("VLLM_SM70_QSA_GROUPED_LPT", False),
     "REVOLTA_SKINNY_MPLAN": ("VLLM_SM70_GDN_SKINNY_MPLAN", False),
     "REVOLTA_RESEARCH_HOST_DECODE_FAST": ("VLLM_SM70_HOST_DECODE_FAST", True),
@@ -28,10 +27,7 @@ FLAGS = {
         True,
     ),
 }
-STRS = {
-    "REVOLTA_GDN_CPU_SPEC_QSL_CHECK_FILE": "VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE",
-}
-ALL = {**{k: v[0] for k, v in FLAGS.items()}, **STRS}
+ALL = {k: v[0] for k, v in FLAGS.items()}
 
 
 @pytest.fixture(autouse=True)
@@ -93,13 +89,6 @@ def test_new_name_wins(monkeypatch, old, new_default):
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         assert getattr(envs, new) is not default
-
-
-def test_check_file_alias(monkeypatch, tmp_path):
-    path = str(tmp_path / "check")
-    monkeypatch.setenv("REVOLTA_GDN_CPU_SPEC_QSL_CHECK_FILE", path)
-    with pytest.warns(FutureWarning):
-        assert path == envs.VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE
 
 
 def test_switches_do_not_change_the_compile_cache_key(monkeypatch):

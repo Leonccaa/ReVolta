@@ -374,8 +374,6 @@ if TYPE_CHECKING:
     VLLM_SM70_HOST_DECODE_FAST: bool = True
     VLLM_SM70_QSA_LOCAL_INPUTS_FUSED: bool = True
     REVOLTA_QSA_GROUPED_LPT: bool = False
-    REVOLTA_GDN_CPU_SPEC_QSL: bool = False
-    REVOLTA_GDN_CPU_SPEC_QSL_CHECK_FILE: str = ""
     REVOLTA_SKINNY_MPLAN: bool = False
     VLLM_SM70_QSA_REQUEST_SEGMENTS: bool = False
     VLLM_SM70_QSA_COMPACT_TOPK: bool = False
@@ -1179,8 +1177,6 @@ def deprecated_env(
 # old name -> registered name. The old names are honoured for one release
 # with a FutureWarning; the new name wins when both are set.
 PROMOTED_RESEARCH_ENVS = {
-    "REVOLTA_GDN_CPU_SPEC_QSL": "VLLM_SM70_GDN_CPU_SPEC_QSL",
-    "REVOLTA_GDN_CPU_SPEC_QSL_CHECK_FILE": "VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE",
     "REVOLTA_QSA_GROUPED_LPT": "VLLM_SM70_QSA_GROUPED_LPT",
     "REVOLTA_SKINNY_MPLAN": "VLLM_SM70_GDN_SKINNY_MPLAN",
     "REVOLTA_RESEARCH_HOST_DECODE_FAST": "VLLM_SM70_HOST_DECODE_FAST",
@@ -1189,8 +1185,6 @@ PROMOTED_RESEARCH_ENVS = {
 }
 # Release that drops each promoted switch's old alias, keyed by new name.
 _PROMOTED_REMOVALS = {
-    "VLLM_SM70_GDN_CPU_SPEC_QSL": "0.2.0rc6",
-    "VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE": "0.2.0rc6",
     "VLLM_SM70_QSA_GROUPED_LPT": "0.2.0rc6",
     "VLLM_SM70_GDN_SKINNY_MPLAN": "0.2.0rc6",
     "VLLM_SM70_HOST_DECODE_FAST": "0.2.0rc13",
@@ -1219,10 +1213,6 @@ def _promoted_raw(new_name: str, default: str) -> str:
 
 def _promoted_flag(new_name: str, default: str = "0") -> Callable[[], bool]:
     return lambda: _promoted_raw(new_name, default) == "1"
-
-
-def _promoted_str(new_name: str) -> Callable[[], str]:
-    return lambda: _promoted_raw(new_name, "")
 
 
 def sm70_debug_enabled(channel: str, legacy_name: str) -> bool:
@@ -4778,7 +4768,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=True,
     ),
     "VLLM_SM70_GDN_CPU_SPEC_QSL": env_var(
-        _promoted_flag("VLLM_SM70_GDN_CPU_SPEC_QSL"),
+        lambda: os.getenv("VLLM_SM70_GDN_CPU_SPEC_QSL", "0") == "1",
         description=(
             "Build the GDN speculative/non-speculative query start offsets on "
             "the host from the CPU copies of the query lengths and spec masks "
@@ -4789,15 +4779,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         category="tuning",
         declared_default="False",
-        effective_default=(
-            "False; REVOLTA_GDN_CPU_SPEC_QSL=1 also enables it until 0.2.0rc6."
-        ),
+        effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("GDN attention metadata (host)",),
         user_visible=True,
     ),
     "VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE": env_var(
-        _promoted_str("VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE"),
+        lambda: os.getenv("VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE", ""),
         description=(
             "Validation for VLLM_SM70_GDN_CPU_SPEC_QSL: while the named file "
             "exists, also compute the offsets on the GPU the original way and "
@@ -4842,36 +4830,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="deprecated",
         declared_default="False",
         effective_default="Same as VLLM_SM70_QSA_GROUPED_LPT.",
-        automatic_conditions=(),
-        acceleration_paths=(),
-        user_visible=False,
-    ),
-    "REVOLTA_GDN_CPU_SPEC_QSL": env_var(
-        deprecated_env(
-            "REVOLTA_GDN_CPU_SPEC_QSL",
-            "0.2.0rc6",
-            "Use VLLM_SM70_GDN_CPU_SPEC_QSL.",
-            _promoted_flag("VLLM_SM70_GDN_CPU_SPEC_QSL"),
-        ),
-        description="Deprecated alias of VLLM_SM70_GDN_CPU_SPEC_QSL.",
-        category="deprecated",
-        declared_default="False",
-        effective_default="Same as VLLM_SM70_GDN_CPU_SPEC_QSL.",
-        automatic_conditions=(),
-        acceleration_paths=(),
-        user_visible=False,
-    ),
-    "REVOLTA_GDN_CPU_SPEC_QSL_CHECK_FILE": env_var(
-        deprecated_env(
-            "REVOLTA_GDN_CPU_SPEC_QSL_CHECK_FILE",
-            "0.2.0rc6",
-            "Use VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE.",
-            _promoted_str("VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE"),
-        ),
-        description="Deprecated alias of VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE.",
-        category="deprecated",
-        declared_default="''",
-        effective_default="Same as VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE.",
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=False,
@@ -20385,8 +20343,6 @@ def compile_factors(speculative_config: Any = None) -> dict[str, object]:
         "VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE",
         "VLLM_SM70_GDN_SKINNY_MPLAN",
         "REVOLTA_QSA_GROUPED_LPT",
-        "REVOLTA_GDN_CPU_SPEC_QSL",
-        "REVOLTA_GDN_CPU_SPEC_QSL_CHECK_FILE",
         "REVOLTA_SKINNY_MPLAN",
         "VLLM_LOGGING_PREFIX",
         "VLLM_LOGGING_STREAM",

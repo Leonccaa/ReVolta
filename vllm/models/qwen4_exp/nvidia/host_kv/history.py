@@ -7,7 +7,9 @@ one shared region whose rows contain every rank's main KV and logical index
 payload. A history ID is a binding, and a page can outlive an ID incarnation.
 The worker applies binding updates on the forward stream before using an ID.
 
-A layer's host view is ``[page, subpage, 2, kbs, H, D]``. Its strides retain
+A layer's host view is ``[page, subpage, 2, kbs, H, D]`` for legacy formats,
+or ``[page, subpage, member_bytes]`` for planar payload and scale regions.
+Its strides retain
 other ranks and index payload between rows. Layer views alias the registered
 backing, including when subpages cannot be flattened into a uniform stride.
 
@@ -49,6 +51,8 @@ from vllm.utils.torch_utils import (
     async_tensor_h2d,
     get_accelerator_view_from_cpu_tensor,
 )
+from vllm.v1.attention.kv_cache_view import KVCacheView, KVPageLayout
+from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD
 from vllm.v1.kv_offload.host.page_table import SealTicket
 from vllm.v1.kv_offload.host.region import HostRegionLayout
 
@@ -162,6 +166,22 @@ class HostHistoryShape:
     so
     ``hot_slots == num_blocks * k`` and only DONATED IDs' slots are usable.
     0 keeps the static, separately allocated hot pool."""
+    layout_cache_dtype: str = "auto"
+    """The owning attention spec's format, independent of payload dtype."""
+
+    def page_layout(self, tokens: int) -> KVPageLayout:
+        return KVPageLayout(
+            tokens,
+            self.kv_heads,
+            self.head_dim,
+            self.head_dim,
+            self.dtype.itemsize,
+            planar_scales=self.planar_scales,
+        )
+
+    @property
+    def planar_scales(self) -> bool:
+        return self.layout_cache_dtype == FP8_E4M3_PER_TOKEN_HEAD.name
 
     def conservative_pass_geometry(self) -> tuple[int, int, list[int]]:
         """Planner inputs safe for any request assignment, without device reads.
@@ -220,11 +240,7 @@ class HostHistoryShape:
         return (
             self.kernel_blocks_per_block
             * self.num_layers
-            * 2
-            * self.kernel_block_tokens
-            * self.kv_heads
-            * self.head_dim
-            * torch.empty((), dtype=self.dtype).element_size()
+            * self.page_layout(self.kernel_block_tokens).page_size_bytes
         )
 
     def fixed_device_memory_bytes(self) -> dict[str, int]:
@@ -245,11 +261,7 @@ class HostHistoryShape:
         return history_fixed_memory_bytes(
             slots=self.hot_slots,
             num_layers=self.num_layers,
-            slot_bytes=self.num_layers
-            * 8
-            * self.kv_heads
-            * self.head_dim
-            * self.dtype.itemsize,
+            slot_bytes=self.num_layers * self.page_layout(4).page_size_bytes,
             max_requests=self.max_requests,
             selection_width=self.selection_width,
             max_write_rows=self.max_write_rows,
@@ -257,6 +269,7 @@ class HostHistoryShape:
             row_groups=self.row_groups,
             tail_groups=self.tail_groups,
             read_rows=self.read_rows,
+            page_layout=self.page_layout(4) if self.planar_scales else None,
         )
 
     def validate(self) -> None:
@@ -336,7 +349,11 @@ def _check_hot_alias(
     page boundary on a slot boundary (non-divisible strides are rejected at
     planning time)."""
     s = shape
-    slot_shape = (s.hot_slots, 2, 4, s.kv_heads, s.head_dim)
+    slot_shape = (
+        (s.hot_slots, s.page_layout(4).page_size_bytes)
+        if s.planar_scales
+        else (s.hot_slots, 2, 4, s.kv_heads, s.head_dim)
+    )
     storage = view.untyped_storage()
     if (
         view.shape != slot_shape
@@ -353,18 +370,31 @@ def _check_hot_alias(
 
 def hot_alias_view(index: torch.Tensor, shape: HostHistoryShape) -> torch.Tensor:
     """Alias ``[num_blocks, P_pad]`` index storage as ``[num_blocks*k, 2, 4,
-    H, D]`` hot slots. No copy: the result shares the storage."""
+    H, D]`` hot slots (planar: ``[num_blocks*k, slot_bytes]``).
+    No copy: the result shares the storage."""
     s = shape
     storage = index.untyped_storage()
     raw = torch.empty(0, dtype=torch.uint8, device=index.device)
     raw.set_(storage, 0, (storage.nbytes(),))
-    slot_bytes = 8 * s.kv_heads * s.head_dim * s.dtype.itemsize
+    slot_bytes = s.page_layout(4).page_size_bytes
     if storage.nbytes() != s.num_blocks * s.slots_per_block * slot_bytes:
         raise ValueError(
             f"Index storage of {storage.nbytes()} bytes is not {s.num_blocks} "
             f"pages of {s.slots_per_block} hot slots"
         )
+    if s.planar_scales:
+        return raw.view(s.hot_slots, slot_bytes)
     return raw.view(s.dtype).view(s.hot_slots, 2, 4, s.kv_heads, s.head_dim)
+
+
+def _planar_view(raw: torch.Tensor, tokens: int, s: HostHistoryShape) -> KVCacheView:
+    """Bind one member while retaining its physical row stride and offset."""
+    h, d = s.kv_heads, s.head_dim
+    carrier = raw.as_strided(
+        (raw.shape[0], 2, tokens, h, d + 4),
+        (raw.stride(0), tokens * h * (d + 4), h * (d + 4), d + 4, 1),
+    )
+    return KVCacheView.bind(carrier, FP8_E4M3_PER_TOKEN_HEAD, d)
 
 
 def _allocate_host(numel: int, dtype: torch.dtype) -> torch.Tensor:
@@ -426,7 +456,22 @@ class HostHistoryStore:
         s = shape
         kb, kbs, layers = s.num_kernel_blocks, s.kernel_block_tokens, s.num_layers
         h, d = s.kv_heads, s.head_dim
-        dims = (s.num_blocks, s.kernel_blocks_per_block, layers, 2, kbs, h, d)
+        dims: tuple[int, ...] = (
+            s.num_blocks,
+            s.kernel_blocks_per_block,
+            layers,
+            2,
+            kbs,
+            h,
+            d,
+        )
+        if s.planar_scales:
+            dims = (
+                s.num_blocks,
+                s.kernel_blocks_per_block,
+                layers,
+                s.page_layout(kbs).page_size_bytes,
+            )
         self.region = None
         self._registration_finalizer = None
         self.layers: list[HostHistoryLayer] = []
@@ -482,7 +527,11 @@ class HostHistoryStore:
             self.hot: torch.Tensor | list[torch.Tensor]
             if hot_views is None:
                 self.hot = torch.zeros(
-                    (layers, slots, 2, 4, h, d), dtype=s.dtype, device=device
+                    (layers, slots, s.page_layout(4).page_size_bytes)
+                    if s.planar_scales
+                    else (layers, slots, 2, 4, h, d),
+                    dtype=s.dtype,
+                    device=device,
                 )
             else:
                 self.hot = [_check_hot_alias(view, s, device) for view in hot_views]
@@ -520,7 +569,11 @@ class HostHistoryStore:
                 torch.arange(slots, **i32).unsqueeze(0).repeat(s.max_requests, 1)
             )
             self.staging = torch.empty(
-                (s.max_write_rows, 2, 1, h, d), dtype=s.dtype, device=device
+                (s.max_write_rows, s.page_layout(1).page_size_bytes)
+                if s.planar_scales
+                else (s.max_write_rows, 2, 1, h, d),
+                dtype=s.dtype,
+                device=device,
             )
             self.write_plan: WritePlan | None = None
             self.write_plan_all_prefill = False
@@ -528,7 +581,11 @@ class HostHistoryStore:
             self.write_stage = self.write_targets = None
             if s.staged_writethrough:
                 self.write_stage = torch.empty(
-                    (2 * s.max_write_rows, h, d), dtype=s.dtype, device=device
+                    (s._static_fixed_bytes()["write_stage"],)
+                    if s.planar_scales
+                    else (2 * s.max_write_rows, h, d),
+                    dtype=s.dtype,
+                    device=device,
                 )
                 self.write_targets = torch.empty(
                     (s.max_write_rows, 2), dtype=torch.int64, device=device
@@ -629,7 +686,8 @@ class HostHistoryStore:
 
     def host_page(self, block_id: int) -> torch.Tensor:
         """Pinned CPU bytes of one history block, all layers:
-        ``[ratio, layers, 2, kernel_block_tokens, H, D]``, contiguous."""
+        ``[ratio, layers, 2, kernel_block_tokens, H, D]`` for legacy formats,
+        ``[ratio, layers, member_bytes]`` for planar pages, contiguous."""
         if not 0 <= block_id < self.shape.num_blocks:
             raise IndexError(f"history block {block_id} is out of range")
         page = int(self.page_of_cpu[block_id])
@@ -973,7 +1031,24 @@ class HostHistoryLayer:
         self.host_device = store.host_device[:, :, index]
         self.host_view = store.host[:, :, index]
         self.hot = store.hot[index]
-        self.key_cache, self.value_cache = self.hot.unbind(1)
+        if s.planar_scales:
+            # Each subpage has a uniform history-row stride. Flattening all
+            # subpages would cross other workers and logical index payloads.
+            self.host_cache = [
+                _planar_view(self.host_view[:, sub], s.kernel_block_tokens, s)
+                for sub in range(s.kernel_blocks_per_block)
+            ]
+            self.host_device_cache = [
+                _planar_view(self.host_device[:, sub], s.kernel_block_tokens, s)
+                for sub in range(s.kernel_blocks_per_block)
+            ]
+            self.hot_cache = _planar_view(self.hot, 4, s)
+            self.key_cache, self.value_cache = self.hot_cache.key, self.hot_cache.value
+            self.key_scale_cache = self.hot_cache.key_scale
+            self.value_scale_cache = self.hot_cache.value_scale
+            self.staging_cache = _planar_view(store.staging, 1, s)
+        else:
+            self.key_cache, self.value_cache = self.hot.unbind(1)
         self.group_to_slot = store.group_to_slot[index]
         self.slot_owner = store.slot_owner[index]
         self.age = store.age[index]

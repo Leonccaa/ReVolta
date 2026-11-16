@@ -3342,6 +3342,8 @@ def get_long_context_geometry(
     form the GPU state segment. A state block keeps today's owner-shaped
     pages (each GDN/PLE/drafter layer pads to its owner's page).
     """
+    from vllm.v1.kv_cache_interface import KVQuantMode
+
     settings = _long_context_settings(vllm_config)
     if (
         settings is not None
@@ -3410,6 +3412,7 @@ def get_long_context_geometry(
     compress_ratio = 0
     hot_head_dim = 0
     hot_kv_heads = 0
+    hot_layout_cache_dtype = None
     for group in kv_cache_groups:
         spec = group.kv_cache_spec
         members = (
@@ -3438,6 +3441,8 @@ def get_long_context_geometry(
             main_kv_dcp = dcp if full_spec.dcp_sharded else 1
             hot_head_dim = full_spec.head_size
             hot_kv_heads = full_spec.num_kv_heads
+            if full_spec.kv_quant_mode == KVQuantMode.FP8_E4M3_PLANAR:
+                hot_layout_cache_dtype = full_spec.layout_cache_dtype("auto")
             compress_ratio = max(
                 getattr(member, "compress_ratio", 1) for member in members
             )
@@ -3514,6 +3519,7 @@ def get_long_context_geometry(
         hot_query_heads=vllm_config.model_config.get_num_attention_heads(parallel),
         hot_head_dim=hot_head_dim,
         hot_kv_heads=hot_kv_heads,
+        hot_layout_cache_dtype=hot_layout_cache_dtype,
         dcp_interleave=getattr(parallel, "cp_kv_cache_interleave_size", 1),
     )
     settings = _long_context_settings(vllm_config)
@@ -3645,7 +3651,11 @@ def _check_host_main_kv(
             if type(member) is FullAttentionSpec and (
                 member.dtype not in (torch.uint8, torch.float16)
                 or member.kv_quant_mode
-                not in (KVQuantMode.NONE, KVQuantMode.FP8_PER_TENSOR)
+                not in (
+                    KVQuantMode.NONE,
+                    KVQuantMode.FP8_PER_TENSOR,
+                    KVQuantMode.FP8_E4M3_PLANAR,
+                )
             ):
                 raise ValueError(
                     "kernel_config.long_context_kv with main_kv_placement='host' "

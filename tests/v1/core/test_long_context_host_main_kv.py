@@ -176,6 +176,36 @@ def test_host_placement_accepts_builtin_connector_and_refuses_int8():
     assert cfg.host_kv_layers == []
 
 
+def test_planar_host_geometry_uses_owner_bytes_and_padded_index():
+    from dataclasses import replace
+
+    from vllm.v1.core.kv_cache_utils import get_kv_cache_configs
+    from vllm.v1.kv_offload.host.region import host_region_layout
+
+    config = production_config(
+        max_model_len=4 * SPAN,
+        long_context=host_settings(host_pool_tokens=8 * SPAN, hot_pool_gib=0.2),
+        max_num_seqs=1,
+    )
+    config.model_config.original_max_model_len = config.model_config.max_model_len
+    config.kv_transfer_config = SimpleNamespace(kv_connector="OffloadingConnector")
+    specs = production_specs()
+    for name in MAIN_KV:
+        specs[name] = replace(specs[name], kv_quant_mode=KVQuantMode.FP8_E4M3_PLANAR)
+    (cfg,) = get_kv_cache_configs(config, [specs], [GPU_BUDGET])
+    geo = cfg.long_context_plan.geometry
+    assert geo.main_kv_bytes_per_block == 12 * LOCAL * 520
+    assert geo.hot_slot_bytes == 12 * 2080
+    assert geo.shared_slots_per_block == geo.index_page_strides[0] // 2080
+    assert all(p % 2080 == 0 for p in geo.index_page_strides)
+    assert geo.index_bytes_per_block == sum(geo.index_page_strides)
+    assert geo.logical_index_bytes_per_block == INDEX_BLOCK_BYTES
+    layout = host_region_layout(cfg, "cpu-planar-geometry")
+    assert layout.main_bytes == cfg.host_kv_page_size_bytes == 12 * LOCAL * 520
+    assert sum(layout.index_bytes) == INDEX_BLOCK_BYTES
+    assert layout.worker_bytes * WORKERS == geo.host_bytes_per_block
+
+
 def test_worker_allocates_no_tensor_for_host_layers():
     from vllm.v1.worker.gpu.attn_utils import _allocate_kv_cache
 
@@ -224,7 +254,8 @@ def test_scheduler_queues_when_host_pages_run_out():
     assert any(preempted for _, _, preempted in trace)
 
 
-def test_worker_binds_one_host_store_to_the_qsa_layers(monkeypatch):
+@pytest.mark.parametrize("planar", [False, True])
+def test_worker_binds_one_host_store_to_the_qsa_layers(monkeypatch, planar):
     import os
 
     if os.environ.get("TRITON_INTERPRET") != "1":
@@ -245,6 +276,20 @@ def test_worker_binds_one_host_store_to_the_qsa_layers(monkeypatch):
     monkeypatch.setattr(
         "vllm.distributed.get_world_group", lambda: SimpleNamespace(rank_in_group=0)
     )
+    if planar:
+        from dataclasses import replace
+
+        original_specs = production_specs
+
+        def planar_specs():
+            specs = original_specs()
+            for name in MAIN_KV:
+                specs[name] = replace(
+                    specs[name], kv_quant_mode=KVQuantMode.FP8_E4M3_PLANAR
+                )
+            return specs
+
+        monkeypatch.setattr(__name__ + ".production_specs", planar_specs)
 
     (cfg, *_) = configs(
         host_settings(host_pool_tokens=8 * SPAN, hot_pool_gib=0.2, state_blocks=71),
@@ -275,14 +320,16 @@ def test_worker_binds_one_host_store_to_the_qsa_layers(monkeypatch):
     assert (shape.kernel_block_tokens, shape.kernel_blocks_per_block) == (LOCAL, 1)
     assert (shape.num_layers, shape.kv_heads, shape.head_dim) == (12, 1, 256)
     assert shape.dtype == torch.uint8 and shape.hot_slots == plan.hot_pool_groups
+    assert shape.planar_scales == planar
     assert (
         shape.rows_per_pass
         == min(shape.read_rows, (plan.hot_pool_groups - 9) // 513)
         >= 1
     )
     # Host bytes: one page per history ID and layer, within the host pool.
-    assert store.host.numel() == 8 * HOST_PAGE_BYTES
-    assert store.host_page(3).numel() == HOST_PAGE_BYTES
+    page_bytes = HOST_PAGE_BYTES + (12 * LOCAL * 8 if planar else 0)
+    assert store.host.numel() == 8 * page_bytes
+    assert store.host_page(3).numel() == page_bytes
     # GPU metadata per history block matches the plan's charge.
     meta = (
         store.group_to_slot.numel() * 4

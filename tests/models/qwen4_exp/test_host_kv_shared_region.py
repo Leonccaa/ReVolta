@@ -30,6 +30,7 @@ from .test_host_kv_history import (
     _prefill,
     _shape,
 )
+from .test_host_kv_history_budget import sparse_zero_payloads  # noqa: F401
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("TRITON_INTERPRET") != "1",
@@ -252,6 +253,57 @@ def test_non_divisible_standin_alias_and_sentinels():
     assert (index[0] == 0).all() and (index[2] == 0).all()
     with pytest.raises(ValueError, match="hot slots"):
         hot_alias_view(torch.zeros((3, 100352), dtype=torch.uint8), shape)
+
+
+@pytest.mark.usefixtures("sparse_zero_payloads")
+def test_planar_shared_alias_and_host_row_keep_member_strides():
+    from dataclasses import replace
+
+    from vllm.v1.attention.kv_cache_view import padded_page_stride
+    from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD
+    from vllm.v1.kv_offload.host.region import HostRegionLayout
+
+    slot = 2080
+    stride = padded_page_stride(100352, slot, element_bytes=2)
+    assert stride == 101920 and stride // slot == 49
+    shape = replace(
+        _shared_shape(blocks=3),
+        head_dim=256,
+        kernel_blocks_per_block=2,
+        hot_slots=3 * 49,
+        slots_per_block=49,
+        layout_cache_dtype=FP8_E4M3_PER_TOKEN_HEAD.name,
+    )
+    index = [torch.full((3, stride), 99, dtype=torch.uint8) for _ in range(2)]
+    before = [t.clone() for t in index]
+    layout = HostRegionLayout("cpu-planar-row", 3, 4, shape.page_bytes, (64, 64))
+
+    store = HostHistoryStore(
+        shape,
+        ["l0", "l1"],
+        device="cpu",
+        region_layout=layout,
+        rank=2,
+        hot_views=[hot_alias_view(t, shape) for t in index],
+    )
+    assert all(torch.equal(a, b) for a, b in zip(index, before))
+    layer = store.layer("l1")
+    cache = layer.host_cache[1]
+    assert cache.key.stride(0) == layout.worker_bytes * 4
+    assert cache.key.data_ptr() - store.host.data_ptr() == 3 * 8320
+    owner_before = store.region._base.clone()
+    cache.key_scale[1].fill_(3.0)
+    owner_after = store.region._base
+    changed = (owner_after != owner_before).nonzero().flatten()
+    start = cache.key_scale[1].data_ptr() - owner_after.data_ptr()
+    assert changed.numel() and changed.min() >= start
+    assert changed.max() < start + 16 * 4
+    layer.hot_cache.value_scale[2 * 49 - 1].fill_(5.0)
+    assert torch.equal(index[0], before[0])
+    changed = (index[1] != before[1]).nonzero()
+    assert (changed[:, 0] == 1).all()
+    assert changed[:, 1].min() >= stride - 16
+    assert changed[:, 1].max() < stride
 
 
 def test_alias_must_cover_whole_storage():

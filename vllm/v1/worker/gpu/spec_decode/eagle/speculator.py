@@ -18,6 +18,11 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.spec_decode.static_draft_vocab import (
+    StaticDraftVocabRuntime,
+    initialize_static_draft_vocab,
+    resolve_mtp_draft_vocab_config,
+)
 from vllm.v1.worker.gpu.attn_utils import (
     build_attn_metadata,
     build_slot_mappings_by_layer,
@@ -95,6 +100,8 @@ class EagleSpeculator:
             self.speculative_config.use_local_argmax_reduction
         )
         self.share_mtp_topk_indices = False
+        self._static_draft_vocab: StaticDraftVocabRuntime | None = None
+        self._reduced_draft_logits: torch.Tensor | None = None
 
         # DP configuration
         self.dp_size = vllm_config.parallel_config.data_parallel_size
@@ -204,6 +211,7 @@ class EagleSpeculator:
         ).keys()
 
         self.model = load_eagle_model(target_model, self.vllm_config)
+        self._maybe_initialize_static_draft_vocab()
         self._validate_local_argmax_reduction()
 
         draft_hf_config = self.draft_model_config.hf_config
@@ -222,6 +230,40 @@ class EagleSpeculator:
         ).keys()
         self.draft_attn_layer_names = set(all_attn_layers) - set(
             target_attn_layer_names
+        )
+
+    def _maybe_initialize_static_draft_vocab(self) -> None:
+        if self.method != "mtp":
+            return
+        # Resolve only explicit static controls, without model-specific dynamic
+        # vocabulary defaults. V2 currently implements the static shortlist.
+        config = resolve_mtp_draft_vocab_config(self.method)
+        if config.ranking_path is None:
+            return
+        runtime = initialize_static_draft_vocab(
+            self.model.lm_head,
+            config.ranking_path,
+            config.shortlist_size,
+            self.device,
+        )
+        self.model.add_module("sm70_static_draft_lm_head", runtime.lm_head)
+        self._static_draft_vocab = runtime
+        if self.draft_logits is not None:
+            self.draft_logits.fill_(-torch.inf)
+            self._reduced_draft_logits = torch.zeros(
+                self.max_num_reqs,
+                self.num_speculative_steps,
+                runtime.shortlist_size,
+                dtype=self.draft_logits.dtype,
+                device=self.device,
+            )
+        logger.info(
+            "Enabled static MTP draft vocabulary: size=%d full_vocab=%d "
+            "local_rows=%d ranking_sha256=%s",
+            runtime.shortlist_size,
+            runtime.full_vocab_size,
+            runtime.lm_head.weight.shape[0],
+            runtime.ranking_fingerprint,
         )
 
     def set_attn(
@@ -379,6 +421,40 @@ class EagleSpeculator:
         draft_step: torch.Tensor,
         draft_logits: torch.Tensor | None,
     ) -> torch.Tensor:
+        runtime = self._static_draft_vocab
+        if runtime is not None:
+            if draft_logits is None and self.use_local_argmax_reduction:
+                token_ids = runtime.logits_processor.get_top_tokens(
+                    runtime.lm_head, hidden_states
+                )
+            else:
+                logits = runtime.logits_processor(runtime.lm_head, hidden_states)
+                if draft_logits is None:
+                    token_ids = logits.argmax(dim=-1)
+                else:
+                    token_ids = gumbel_sample(
+                        logits,
+                        idx_mapping,
+                        self.temperature,
+                        self.seeds,
+                        pos + 1,
+                        apply_temperature=True,
+                        is_drafting=True,
+                        output_processed_logits=self._reduced_draft_logits,
+                        output_processed_logits_col=draft_step,
+                        use_fp64=self.use_fp64_gumbel,
+                    )
+                    # Keep rejection sampling in target-token coordinates.
+                    # Unselected columns remain -inf; previous steps retain
+                    # their temperature-applied logits in the reduced buffer.
+                    draft_logits.scatter_(
+                        2,
+                        runtime.token_id_map.view(1, 1, -1).expand_as(
+                            self._reduced_draft_logits
+                        ),
+                        self._reduced_draft_logits,
+                    )
+            return runtime.token_id_map[token_ids]
         if draft_logits is not None:
             logits = self.model.compute_logits(hidden_states)
             # This drafter's position contract keys the proposed token at pos + 1.

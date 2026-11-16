@@ -321,30 +321,42 @@ def compiled_random_sample(logits: torch.Tensor) -> torch.Tensor:
 
 
 def apply_top_k_top_p(
-    logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
+    logits: torch.Tensor,
+    k: torch.Tensor | None,
+    p: torch.Tensor | None,
+    has_topp_only_rows: bool = True,
 ) -> torch.Tensor:
+    """Apply top-k and/or top-p masking to logits.
+
+    has_topp_only_rows must be True if any row has p < 1 and
+    k >= logits.shape[-1] (no active top-k).
+    """
     if p is None and k is None:
         return logits
 
-    if current_platform.is_cpu():
-        if HAS_TRITON:
-            return apply_top_k_top_p_triton(logits, k, p)
-        return apply_top_k_top_p_pytorch(logits, k, p, allow_cpu_sync=True)
+    if HAS_TRITON:
+        return apply_top_k_top_p_triton(
+            logits, k, p, has_topp_only_rows=has_topp_only_rows
+        )
 
-    if (
-        HAS_TRITON
-        and current_platform.is_cuda()
-        and logits.dtype == torch.float32
-        and logits.shape[0] >= 2
-        and logits.shape[1] >= 32768
-    ):
-        return apply_top_k_top_p_triton(logits, k, p)
+    is_cpu = current_platform.is_cpu()
+    return apply_top_k_top_p_pytorch(logits, k, p, allow_cpu_sync=is_cpu)
 
-    if HAS_TRITON and logits.shape[0] >= 8:
-        return apply_top_k_top_p_triton(logits, k, p)
 
-    # Use pytorch sort implementation for small batch sizes.
-    return apply_top_k_top_p_pytorch(logits, k, p)
+def warmup_top_k_top_p(logits: torch.Tensor) -> None:
+    """Warm native filtering in the existing dummy sampler runs."""
+    if not HAS_TRITON:
+        return
+    # Cover small-batch split counts and singleton scalar specializations,
+    # plus the monolithic path when the dummy batch exceeds the split limit.
+    batch_size, vocab_size = logits.shape
+    for rows in (*range(1, min(batch_size, 64) + 1), batch_size):
+        k = torch.full(
+            (rows,), min(20, vocab_size), dtype=torch.int32, device=logits.device
+        )
+        p = torch.full((rows,), 0.95, dtype=torch.float32, device=logits.device)
+        for top_k, top_p in ((k, None), (None, p), (k, p)):
+            apply_top_k_top_p(logits[:rows].clone(), top_k, top_p)
 
 
 def apply_top_k_top_p_pytorch(
@@ -352,8 +364,6 @@ def apply_top_k_top_p_pytorch(
     k: torch.Tensor | None,
     p: torch.Tensor | None,
     allow_cpu_sync: bool = False,
-    *,
-    rowwise_sort: bool = False,
 ) -> torch.Tensor:
     """Apply top-k and top-p masks to the logits.
 
@@ -370,20 +380,7 @@ def apply_top_k_top_p_pytorch(
             # Avoid sorting vocab for top-k only case.
             return apply_top_k_only(logits, k)
 
-    if rowwise_sort and logits.shape[0] > 1:
-        # Bound radix-sort scratch while retaining the original batch shape
-        # for the softmax and cumulative sum below.
-        logits_sort = torch.empty_like(logits)
-        logits_idx = torch.empty_like(logits, dtype=torch.int64)
-        for row in range(logits.shape[0]):
-            torch.sort(
-                logits[row : row + 1],
-                dim=-1,
-                descending=False,
-                out=(logits_sort[row : row + 1], logits_idx[row : row + 1]),
-            )
-    else:
-        logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
+    logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
 
     if k is not None:
         # Apply top-k.

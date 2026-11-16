@@ -1013,7 +1013,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     @torch.inference_mode()
     def _dummy_sampler_run(self, hidden_states: torch.Tensor) -> None:
         num_reqs = hidden_states.shape[0]
+        from vllm.v1.sample.ops.topk_topp_sampler import warmup_top_k_top_p
+
         logits = self.model.compute_logits(hidden_states)
+        warmup_top_k_top_p(logits)
         dummy_input_batch = InputBatch.make_dummy(
             num_reqs, num_reqs, self.input_buffers
         )

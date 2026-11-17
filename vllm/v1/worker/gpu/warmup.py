@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import torch
 
-from vllm import PoolingParams, SamplingParams
+from vllm import PoolingParams, SamplingParams, envs
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -76,6 +76,60 @@ def _host_kv_warmup_profiles(
     if eager > max_tokens:
         return []
     return [(eager, 1), (eager, 2)]
+
+
+def _dflash_warmup_profiles(
+    model_runner: GPUModelRunner,
+    profiled_lengths: Sequence[int],
+) -> list[tuple[int, int]]:
+    """One extra prefill profile that compiles ``prepare_dflash_inputs``'
+    capped tile bucket.
+
+    ``_prepare_dflash_inputs_kernel`` specializes on
+    ``BLOCK_SIZE = min(cap, next_power_of_2(query_len + num_query_per_req))``;
+    every longer prefill reuses the capped variant. The default and advertised
+    warmup prompt lengths stay below the cap, so the first long real prefill
+    used to JIT-compile the capped tile during serving.
+    """
+    speculator = getattr(model_runner, "speculator", None)
+    if speculator is None:
+        return []
+    from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
+        PREPARE_DFLASH_INPUTS_TILE_CAP,
+        DFlashSpeculator,
+    )
+
+    if not isinstance(speculator, DFlashSpeculator):
+        return []
+    max_tokens = min(
+        model_runner.scheduler_config.max_num_batched_tokens,
+        model_runner.max_model_len,
+    )
+    # Shortest per-request query length whose draft span reaches the cap.
+    tile_prompt_len = (
+        PREPARE_DFLASH_INPUTS_TILE_CAP // 2 + 1 - speculator.num_query_per_req
+    )
+    if tile_prompt_len > max_tokens or max(profiled_lengths) >= tile_prompt_len:
+        return []
+    return [(tile_prompt_len, 1)]
+
+
+def _greedy_verify_warmup_enabled(model_runner: GPUModelRunner) -> bool:
+    """Whether the SM70 greedy MTP verification fast path can run.
+
+    It needs a draft-carrying decode step whose every request samples greedily
+    without logprobs, penalties, bias or bad words, which the sampler-warmup
+    parameters never satisfy; one greedy profile compiles the kernel instead.
+    """
+    if model_runner.num_speculative_steps <= 0 or model_runner.is_pooling_model:
+        return False
+    kernel_config = getattr(
+        getattr(model_runner, "vllm_config", None), "kernel_config", None
+    )
+    return bool(
+        getattr(kernel_config, "sm70_greedy_verify", False)
+        or envs.VLLM_SM70_GREEDY_VERIFY
+    )
 
 
 def _host_kv_group_id(model_runner: GPUModelRunner) -> int:
@@ -185,6 +239,12 @@ def warmup_kernels(
     host KV metadata (roles, page bindings, planner input) like the real
     scheduler's steps, so the step-head bookkeeping, the union windows and
     the staged write kernels are compiled before serving.
+
+    With a DFlash speculative config, one extra single-request prefill
+    compiles the draft-input kernel's capped tile bucket, and (with the SM70
+    greedy verification switch on) one extra all-greedy prefill+draft-decode
+    pair compiles the greedy MTP verification kernel, which no
+    sampler-warmup batch can reach.
     """
     num_spec_steps = model_runner.num_speculative_steps
     # Use 1 + num_spec_steps + 1 tokens so the prefill batch's per-request
@@ -203,6 +263,16 @@ def warmup_kernels(
     profiles: list[tuple[int, int]] = [(length, 1) for length in prompt_lengths]
     if host_store is not None:
         profiles += _host_kv_warmup_profiles(model_runner, prompt_lengths)
+    profiles += _dflash_warmup_profiles(
+        model_runner, [length for length, _ in profiles] + [1 + num_spec_steps]
+    )
+    # Draft-carrying decode steps only JIT-compile the SM70 greedy MTP
+    # verification kernel when every request samples greedily; run the
+    # default profile once more with plain greedy parameters for that.
+    greedy_profile_idx = -1
+    if _greedy_verify_warmup_enabled(model_runner):
+        greedy_profile_idx = len(profiles)
+        profiles.append((default_prompt_len, 1))
 
     kv_cache_groups = model_runner.kv_cache_config.kv_cache_groups
     num_kv_cache_groups = len(kv_cache_groups)
@@ -234,6 +304,9 @@ def warmup_kernels(
     else:
         sampling_params = SamplingParams.for_sampler_warmup()
         pooling_params = None
+    # Plain greedy parameters: the SM70 greedy verification fast path treats
+    # any sampler feature (temperature, logprobs, penalties, bias) as a miss.
+    greedy_sampling_params = SamplingParams(temperature=0.0)
 
     # Disable KV connector for all warmup runs. Kernel-advertised profiles run
     # with one request so adding an operator does not silently multiply startup
@@ -273,6 +346,11 @@ def warmup_kernels(
 
             req_ids = [f"_warmup_{profile_idx}_{i}_" for i in range(num_reqs)]
             next_block_ids = [1] * len(space_blocks)
+            profile_sampling_params = (
+                greedy_sampling_params
+                if profile_idx == greedy_profile_idx
+                else sampling_params
+            )
 
             def _alloc_blocks(
                 num_blocks: int, group_id: int, next_ids: list[int] = next_block_ids
@@ -287,7 +365,7 @@ def warmup_kernels(
                     Request(
                         req_ids[i],
                         prompt_token_ids,
-                        sampling_params,
+                        profile_sampling_params,
                         pooling_params,
                     ),
                     block_ids=tuple(

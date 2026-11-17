@@ -2380,7 +2380,14 @@ def _merge_sharded_index_blocks(
     if select is None:
         if not _use_sm70_qsa_lexicographic_topk(block_topk):
             raise RuntimeError("QSA indexer DCP sharding needs the exact SM70 top-k")
-        _sm70_qsa_lexicographic_topk_op()(sorted_scores, lengths, positions, block_topk)
+        if _SM70_QSA_MTP_TOPK and blocks.shape[0] in (5, 10):
+            torch.ops._C.qsa_lexicographic_topk(
+                sorted_scores, lengths, positions, block_topk, True
+            )
+        else:
+            _sm70_qsa_lexicographic_topk_op()(
+                sorted_scores, lengths, positions, block_topk
+            )
     else:
         select(sorted_scores, lengths, positions, block_topk)
     if use_triton:

@@ -3,6 +3,7 @@
 """ReVolta sends its own anonymous usage report, on by default and silent."""
 
 import json
+import time
 import types
 
 import pytest
@@ -28,6 +29,7 @@ CONTRACT_FIELDS = {
     "uuid",
     "log_time",
     "source",
+    "uptime_s",
     # Environment / hardware
     "provider",
     "num_cpu",
@@ -392,6 +394,62 @@ def test_full_report_matches_the_collector_contract(monkeypatch):
     assert captured["vllm_version"] == captured["revolta_version"]
     # A canonical UUID is what the collector deduplicates on.
     assert len(captured["uuid"]) == 36
+    # The startup report opens the uptime clock at zero.
+    assert captured["uptime_s"] == 0
+
+
+def test_heartbeat_repeats_startup_summary_with_uptime(monkeypatch):
+    """Every heartbeat replays the startup summary and carries uptime_s."""
+    message = usage_lib.UsageMessage()
+    captured = {}
+    monkeypatch.setattr(
+        usage_lib.UsageMessage,
+        "_send_to_server",
+        lambda self, data: captured.update(data),
+    )
+    monkeypatch.setattr(
+        usage_lib.UsageMessage, "_write_to_file", lambda self, data: None
+    )
+    # Pretend the startup report already ran, without touching hardware.
+    message._startup_data = {
+        "uuid": "u",
+        "model_architecture": "StubForCausalLM",
+        "max_model_len": 262144,
+    }
+    message._startup_mono = time.monotonic()
+
+    def no_hardware(*args, **kwargs):
+        raise AssertionError("heartbeat probed the hardware")
+
+    monkeypatch.setattr(usage_lib, "cuda_get_device_properties", no_hardware)
+    monkeypatch.setattr(usage_lib.cpuinfo, "get_cpu_info", no_hardware)
+    monkeypatch.setattr(usage_lib.psutil, "virtual_memory", no_hardware)
+    monkeypatch.setitem(usage_lib._GLOBAL_RUNTIME_DATA, "kv_cache_usage", 37)
+
+    sleeps = []
+
+    class _Stop(Exception):
+        pass
+
+    def fake_sleep(seconds):
+        if captured:
+            raise _Stop
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(usage_lib.time, "sleep", fake_sleep)
+
+    with pytest.raises(_Stop):
+        message._report_continuous_usage()
+
+    assert sleeps == [usage_lib._USAGE_STATS_INTERVAL]
+    # The cached startup summary is repeated verbatim.
+    assert captured["uuid"] == "u"
+    assert captured["model_architecture"] == "StubForCausalLM"
+    assert captured["max_model_len"] == 262144
+    # Runtime data still rides along, and uptime is a non-negative integer.
+    assert captured["kv_cache_usage"] == 37
+    assert isinstance(captured["uptime_s"], int)
+    assert captured["uptime_s"] >= 0
 
 
 def test_report_payload_is_json_serializable(monkeypatch):

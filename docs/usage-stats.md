@@ -6,7 +6,7 @@ Sending is **on by default** and completely silent: a network failure, an unreac
 
 ## What is sent
 
-One JSON object when the engine starts, then a short heartbeat every 10 minutes. The startup object describes the engine; the heartbeat only repeats the identifier and the timestamp.
+One JSON object when the engine starts, then a heartbeat every 10 minutes that repeats the full startup summary with a fresh timestamp and the engine uptime, so a collector deployed late or a lost startup report does not lose the configuration.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
@@ -30,6 +30,7 @@ One JSON object when the engine starts, then a short heartbeat every 10 minutes.
 | `env_var_json` | string | A serialized JSON object with a fixed allowlist of switches: `VLLM_USE_MODELSCOPE`, `VLLM_USE_FLASHINFER_SAMPLER`, `VLLM_USE_TRITON_AWQ` and `VLLM_ENABLE_V1_MULTIPROCESSING` (booleans), plus `VLLM_PP_LAYER_PARTITION` when it holds a numeric partition string such as `20,20`. |
 | `source` | string | Deployment label from `VLLM_USAGE_SOURCE` (`production` by default). Anything that looks like a path or a URL is reported as `custom`. |
 | `log_time` | number | Report time in nanoseconds since the epoch. |
+| `uptime_s` | number | Seconds elapsed since the startup report, counted on a monotonic clock; `0` in the startup report itself. |
 | `dtype` | string | Model dtype. |
 | `block_size` | number | KV cache block size. |
 | `gpu_memory_utilization` | number | Fraction of device memory the KV cache may use. |

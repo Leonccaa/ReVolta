@@ -49,6 +49,8 @@ def test_junction_without_state_handoff_is_not_admitted():
     connector._prepare_unified_boundaries(out)
     assert not m.builds and not m.pending
     assert m.events["junction_host_b_unavailable"] == 1
+    assert m.events["boundary_reject_state"] == 1
+    assert not m.events["boundary_reject_inventory"]
     m.end_step()
     assert not m.units.events["revoke_build_failed"]
 

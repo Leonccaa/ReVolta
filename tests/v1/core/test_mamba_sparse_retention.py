@@ -792,8 +792,8 @@ def test_dflash_decode_retention_requires_prefix_caching():
     assert not state.keep_decode_resume_state
 
 
-def test_dflash_decode_windows_keep_ordinary_cache_priority():
-    prompt = 2 * STATE_BLOCK + 14
+@pytest.mark.parametrize("prompt", [2 * STATE_BLOCK + 14, 65])
+def test_dflash_decode_windows_keep_ordinary_cache_priority(prompt):
     final = 7 * STATE_BLOCK + DRAFT_BLOCK + 10
     cm = dflash2_manager(length=final + STATE_BLOCK)
     request = _prompt("windows", prompt)

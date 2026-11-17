@@ -6,6 +6,7 @@ import math
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.kv_cache_view import KVPageMapping
 from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD, INT8
@@ -406,13 +407,31 @@ def triton_attention(
         decoder = fp8_e4m3fn_bits_to_fp32_bitcast
     rows, heads, dim = q.shape
     width = max_seq_len if dense else indices.shape[1]
-    tiles = triton.cdiv(width, 32)
-    splits = min(32, max(1, tiles))
-    partial = torch.empty((splits, *q.shape), device=q.device, dtype=torch.float32)
-    partial_lse = torch.empty(
-        (splits, rows, heads), device=q.device, dtype=torch.float32
-    )
     group = heads // k.shape[2]
+    if dense:
+        block_n = 32
+        tiles = triton.cdiv(width, block_n)
+        splits = min(32, max(1, tiles))
+        warps = 4
+    else:
+        from .qsa import _qsa_sparse_launch_profile
+
+        # Match scalar E4M3 union/prefill: sufficiently many row/head
+        # programs need no split-K workspace, regardless of prompt length.
+        block_n, target_splits, warps = _qsa_sparse_launch_profile(
+            rows * k.shape[2],
+            triton.next_power_of_2(group),
+            not current_platform.has_device_capability(80),
+        )
+        tiles = triton.cdiv(width, block_n)
+        splits = min(1 << (tiles.bit_length() - 1), target_splits)
+    if splits == 1 and not dense:
+        partial = partial_lse = out
+    else:
+        partial = torch.empty((splits, *q.shape), device=q.device, dtype=torch.float32)
+        partial_lse = torch.empty(
+            (splits, rows, heads), device=q.device, dtype=torch.float32
+        )
     # The legacy kernel's scale is fixed by D; adjust it explicitly for dense users.
     scale_ratio = (softmax_scale * dim**0.5) if softmax_scale is not None else 1.0
     _int8_sparse_kernel[(rows, k.shape[2], splits)](
@@ -451,7 +470,7 @@ def triton_attention(
         NUM_SPLITS=splits,
         NUM_TILES=tiles,
         BLOCK_M=max(16, triton.next_power_of_2(group)),
-        BLOCK_N=32,
+        BLOCK_N=block_n,
         KV_E4M3=codec is FP8_E4M3_PER_TOKEN_HEAD,
         E4M3_DECODER=decoder,
         K_SCALES=sk,
@@ -466,7 +485,7 @@ def triton_attention(
         POSITIONS=positions,
         SEQLENS=seq_lens,
         CAUSAL=causal,
-        num_warps=4,
+        num_warps=warps,
     )
     if splits == 1:
         return out

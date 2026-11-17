@@ -61,6 +61,55 @@ def test_interpreted_e4m3_reader_against_float64():
         _check_reader(5, 1, 832, repeat, FP8_E4M3_PER_TOKEN_HEAD, block=64)
 
 
+@pytest.mark.parametrize("codec", [INT8, FP8_E4M3_PER_TOKEN_HEAD])
+def test_planar_union_prefill_uses_scalar_workspace_bound(codec, monkeypatch):
+    from vllm.models.qwen4_exp.nvidia.ops import qsa
+
+    # TP1 union has two KV heads, so it cannot use the one-KV-head native
+    # reader. Exercise the public dispatch with full-width prefill metadata.
+    rows = 6432
+    query = torch.empty(rows, 24, 256, dtype=torch.float16, device="meta")
+    key = torch.empty(8, 4, 2, 256, dtype=codec.storage_dtype, device="meta")
+    scales = torch.empty(key.shape[:3], dtype=torch.float32, device="meta")
+    indices = torch.empty(rows, 2051, dtype=torch.int32, device="meta")
+    table = torch.empty(1, 8192, dtype=torch.int32, device="meta")
+    requests = torch.empty(rows, dtype=torch.int32, device="meta")
+    positions = torch.empty(rows, dtype=torch.int64, device="meta")
+    lengths = torch.empty(1, dtype=torch.int32, device="meta")
+    out = torch.empty_like(query)
+    calls = []
+
+    class Kernel:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                assert grid == (rows, 2, 1)
+                assert args[6] is args[7] is args[8] is out
+                assert kwargs["NUM_SPLITS"] == 1
+                assert kwargs["BLOCK_N"] == 16
+                assert kwargs["K_SCALES"] is kwargs["V_SCALES"] is scales
+                calls.append("direct")
+
+            return launch
+
+    monkeypatch.setattr(reader, "require_int8_abi", lambda: None)
+    monkeypatch.setattr(reader, "_int8_sparse_kernel", Kernel())
+    result = qsa.qsa_sparse_paged_attention(
+        query,
+        key,
+        key,
+        indices,
+        table,
+        requests,
+        out,
+        query_positions=positions,
+        sequence_lengths=lengths,
+        kv_cache_dtype=codec.name,
+        k_scale_cache=scales,
+        v_scale_cache=scales,
+    )
+    assert result is out and calls == ["direct"]
+
+
 @pytest.mark.parametrize("sharded", [False, True])
 def test_e4m3_forward_passes_planes_and_actual_rows(sharded, monkeypatch):
     from vllm import distributed

@@ -3,7 +3,7 @@
 Use this guide to select and prepare a checkpoint, its KV scales and its MTP draft.
 First [install ReVolta](getting-started.md#1-install); for a complete first launch, follow the tutorial.
 
-- **Weight formats:** standard AWQ, NVFP4, and NVIDIA FP4-Local.
+- **Weight formats:** standard AWQ, NVFP4, NVIDIA FP4-Local, and NVIDIA NVFP4-QAD.
 - **KV formats:** FP8 E4M3, FP16, and INT8.
 
 ## Models
@@ -14,6 +14,7 @@ First [install ReVolta](getting-started.md#1-install); for a complete first laun
 | [Base AWQ g32](https://huggingface.co/leoncca/Qwen3.8-Flash-Next-AWQ-g32) | Quantization quality measured; full serving acceptance not run |
 | [Standard NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4) | Full serving acceptance passed with format-specific settings |
 | [NVIDIA FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local) | Full serving acceptance passed with vision-tower TP4 |
+| [NVIDIA NVFP4-QAD](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4-QAD) | Loading and serving checks passed on four V100s; quantization quality not yet measured |
 
 Both AWQ checkpoints use group-size-32 4-bit routed experts, FP8 E4M3 PLE tables,
 and 16-bit remaining weights. Each includes calibrated QSA E4M3 K/V scales and an
@@ -254,6 +255,64 @@ vllm serve /data/revolta/views/fp4-local/target-512k \
   --no-async-scheduling --kv-cache-dtype fp8_e4m3 \
   --attention-backend FLASH_ATTN_V100 --kernel-config '{"ple_disk_cascade":false}' \
   --speculative-config '{"method":"mtp","num_speculative_tokens":4,"draft_sample_method":"greedy","attention_backend":"FLASH_ATTN_V100","kv_cache_dtype":"fp8_e4m3"}'
+```
+
+## NVIDIA NVFP4-QAD checkpoint setup
+
+`nvidia/Qwen3.8-Flash-Next-NVFP4-QAD` is a mixed-precision ModelOpt checkpoint:
+NVFP4 routed and shared experts, MXFP8 GDN and QSA projections (expanded to FP16
+at load), an FP8 PLE table, and a built-in MTP layer whose experts use FP8 block
+scales. It ships no QSA K/V scales, so it uses the per-token-head FP8 KV cache,
+which needs no calibration; with `--kv-cache-dtype auto` ReVolta selects it on
+its own. The built-in MTP layer follows the target's KV format.
+
+Validated on four V100s (TP4/DCP2, MTP4, `fp8_per_token_head`, long-context host
+KV): every quantized path loads and serves, and greedy, sampled, tool-call, 32K
+prefix-reuse and 4-way concurrent requests pass. Weights take 21.5 GiB per GPU,
+about 0.5 GiB less than the Uncensored AWQ checkpoint in the same configuration.
+Quantization quality against BF16 has not been measured yet.
+
+```bash
+python - <<'EOF'
+import json
+from pathlib import Path
+from huggingface_hub import snapshot_download
+
+base = Path("/data/revolta/models/nvfp4-qad")
+views = Path("/data/revolta/views/nvfp4-qad")
+snapshot_download("nvidia/Qwen3.8-Flash-Next-NVFP4-QAD",
+                  revision="eec0322cb03229cae4cd8e2fa45547542e472eac", local_dir=base)
+
+YARN = {"rope_type": "yarn", "factor": 2, "original_max_position_embeddings": 262144}
+
+def make_view(src: Path, dst: Path) -> None:
+    dst.mkdir(parents=True, exist_ok=False)
+    for item in src.iterdir():
+        if item.name not in ("config.json", ".cache", ".git"):
+            (dst / item.name).symlink_to(item.resolve(), target_is_directory=item.is_dir())
+    config = json.loads((src / "config.json").read_text())
+    text = config["text_config"]
+    rope = dict(text["rope_parameters"])
+    # Keep the outer default; YaRN applies only to text_config.
+    config["rope_parameters"] = dict(rope)
+    rope.update(YARN)
+    text["rope_parameters"] = dict(rope)
+    text["rope_scaling"] = dict(rope)
+    (dst / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+
+# The built-in MTP uses this same view; no separate draft directory is needed.
+make_view(base, views / "target-512k")
+EOF
+
+vllm serve /data/revolta/views/nvfp4-qad/target-512k \
+  --dtype half \
+  --tensor-parallel-size 4 --decode-context-parallel-size 2 \
+  --gpu-memory-utilization 0.95 --max-model-len 524288 \
+  --max-num-seqs 8 --max-num-batched-tokens 8192 \
+  --enable-chunked-prefill --enable-prefix-caching --mamba-cache-mode align \
+  --no-async-scheduling --kv-cache-dtype fp8_per_token_head \
+  --attention-backend FLASH_ATTN_V100 --kernel-config '{"ple_disk_cascade":false}' \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":4,"draft_sample_method":"greedy","attention_backend":"FLASH_ATTN_V100"}'
 ```
 
 ## Weight and KV formats

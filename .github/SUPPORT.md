@@ -14,7 +14,7 @@ In short:
 | KV offload | Off, CPU, or CPU + SSD tier |
 | KV cache | Scalar E4M3 in the documented reference recipes, or INT8; INT8 with the SSD tier is not supported |
 | Models | Qwen3.8 Flash-Next (QSA, multimodal) |
-| Checkpoints | AWQ g32, standard NVFP4 `RadixArk/Qwen3.8-Flash-Next-NVFP4`, `nvidia/Qwen3.8-Flash-Next-FP4-Local` |
+| Checkpoints | AWQ g32, standard NVFP4 `RadixArk/Qwen3.8-Flash-Next-NVFP4`, `nvidia/Qwen3.8-Flash-Next-FP4-Local`, `nvidia/Qwen3.8-Flash-Next-NVFP4-QAD` |
 
 Configurations outside our release gate (TP2/TP8, V100 16 GB, other models or
 topologies) are handled on a best-effort basis. Other GPU architectures,

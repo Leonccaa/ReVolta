@@ -8,8 +8,59 @@ import pytest
 import torch
 
 from vllm import _sm70_ops as ops
+from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.quantization import nvfp4_sm70_moe as moe
 from vllm.model_executor.models import qwen2_moe
+
+
+def test_graph_safe_decode_scratch_sharing(monkeypatch):
+    config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    method = object.__new__(moe.ModelOptNvFp4SM70MoEMethod)
+
+    # Exercise CUDA ownership with real CPU tensors and a native size stub.
+    empty, arange = torch.empty, torch.arange
+    monkeypatch.setattr(
+        torch, "empty", lambda *args, dtype, device: empty(*args, dtype=dtype)
+    )
+    monkeypatch.setattr(
+        torch, "arange", lambda *args, dtype, device: arange(*args, dtype=dtype)
+    )
+    monkeypatch.setattr(
+        torch.ops._moe_C,
+        "moe_permute_sort_workspace_size",
+        Mock(return_value=16),
+        raising=False,
+    )
+
+    def allocate(intermediate):
+        layer = NS(
+            w13_tm_weight=NS(device=torch.device("cuda:0")),
+            sm70_nvfp4_top_k=10,
+            sm70_nvfp4_num_experts=512,
+            sm70_nvfp4_hidden_size=2560,
+            sm70_nvfp4_intermediate_size=intermediate,
+            global_num_experts=512,
+        )
+        method._allocate_graph_safe_decode_buffers(layer)
+        return layer
+
+    with set_current_vllm_config(config):
+        first, second, other = allocate(160), allocate(160), allocate(320)
+        for name in method._persistent_buffers(first, 5):
+            if name != "output":
+                attr = f"_nvfp4_sm70_{name}"
+                scratch = getattr(first, attr)
+                assert scratch is getattr(second, attr)
+                assert scratch.data_ptr() != getattr(other, attr).data_ptr()
+        assert first._nvfp4_sm70_output.data_ptr() != (
+            second._nvfp4_sm70_output.data_ptr()
+        )
+
+        registry = config.compilation_config.static_forward_context
+        pool = registry["sm70_workspace:pool:nvfp4_moe_decode_scratch"]
+        assert len(pool) == 2
+        moe.clear_sm70_nvfp4_moe_workspaces()
+        assert not pool
 
 
 def test_raw_scale_shared_workspace_rejects_microbatching(monkeypatch):

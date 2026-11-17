@@ -38,6 +38,9 @@ from vllm.model_executor.layers.quantization.sm70_turbomind import (
     is_exact_sm70_cuda,
     unpack_mxfp4_weight,
 )
+from vllm.model_executor.layers.quantization.utils.sm70_layer_workspaces import (
+    workspace_pool,
+)
 from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
@@ -96,11 +99,13 @@ _QWEN38_DYNAMIC_QPN_BATCH_W13_SPLIT_K: Final = {
 _QWEN38_QPN_BATCH_FUSED_W13_TOKENS: Final = frozenset((4, 8, 16))
 _QWEN38_RAW_SCALE_WORKSPACE_ELEMENTS: Final = 512 * 160 * 320
 _qwen38_raw_scale_workspaces: dict[int, torch.Tensor] = {}
+_nvfp4_decode_scratch_workspaces: dict[tuple[int, ...], dict[str, torch.Tensor]] = {}
 
 
 def clear_sm70_nvfp4_moe_workspaces() -> None:
-    """Release process-global Qwen3.8 raw-scale expansion workspaces."""
+    """Release Qwen3.8 raw-scale and NVFP4 decode scratch workspace ownership."""
     _qwen38_raw_scale_workspaces.clear()
+    workspace_pool("nvfp4_moe_decode_scratch", _nvfp4_decode_scratch_workspaces).clear()
 
 
 def _raw_scales_match_prepared(
@@ -1341,77 +1346,102 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
     def _allocate_graph_safe_decode_buffers(self, layer: RoutedExperts) -> None:
         device = layer.w13_tm_weight.device
         top_k = int(layer.sm70_nvfp4_top_k)
-        max_slots = _GRAPH_SAFE_MAX_TOKENS * top_k
         experts = int(layer.sm70_nvfp4_num_experts)
         hidden = int(layer.sm70_nvfp4_hidden_size)
         intermediate = int(layer.sm70_nvfp4_intermediate_size)
+        global_experts = int(layer.global_num_experts)
 
         layer._nvfp4_sm70_output = torch.empty(
             _GRAPH_SAFE_MAX_TOKENS, hidden, dtype=torch.float16, device=device
         )
-        layer._nvfp4_sm70_permuted_input = torch.empty(
-            max_slots, hidden, dtype=torch.float16, device=device
+        config = get_current_vllm_config_or_none()
+        share_scratch = device.type == "cuda" and (
+            config is None or not config.parallel_config.use_ubatching
         )
-        layer._nvfp4_sm70_input_row_indices = torch.empty(
-            max_slots, dtype=torch.int32, device=device
-        )
-        layer._nvfp4_sm70_gate_up = torch.empty(
-            max_slots, 2 * intermediate, dtype=torch.float16, device=device
-        )
-        layer._nvfp4_sm70_intermediate = torch.empty(
-            max_slots, intermediate, dtype=torch.float16, device=device
-        )
-        layer._nvfp4_sm70_sorted_output = torch.empty(
-            max_slots, hidden, dtype=torch.float16, device=device
-        )
-        layer._nvfp4_sm70_expert_offsets = torch.empty(
-            experts + 1, dtype=torch.int32, device=device
-        )
-        layer._nvfp4_sm70_expert_offsets64 = torch.empty(
-            experts + 1, dtype=torch.int64, device=device
-        )
-        layer._nvfp4_sm70_inv_permuted_idx = torch.empty(
-            _GRAPH_SAFE_MAX_TOKENS,
-            top_k,
-            dtype=torch.int32,
-            device=device,
-        )
-        layer._nvfp4_sm70_topk_ids = torch.empty(
-            _GRAPH_SAFE_MAX_TOKENS,
-            top_k,
-            dtype=torch.int32,
-            device=device,
-        )
-        layer._nvfp4_sm70_token_expert_indices = torch.arange(
-            max_slots, dtype=torch.int32, device=device
-        ).view(_GRAPH_SAFE_MAX_TOKENS, top_k)
-        layer._nvfp4_sm70_permuted_idx = torch.empty(
-            max_slots, dtype=torch.int32, device=device
-        )
-        layer._nvfp4_sm70_permuted_experts_id = torch.empty(
-            max_slots, dtype=torch.int32, device=device
-        )
-        layer._nvfp4_sm70_sorted_row_idx = torch.empty(
-            max_slots, dtype=torch.int32, device=device
-        )
-        layer._nvfp4_sm70_topk_ids_for_sort = torch.empty(
-            max_slots, dtype=torch.int32, device=device
-        )
+        if share_scratch:
+            device_index = device.index
+            if device_index is None:
+                device_index = torch.accelerator.current_device_index()
+            pool = workspace_pool(
+                "nvfp4_moe_decode_scratch", _nvfp4_decode_scratch_workspaces
+            )
+            key = (device_index, top_k, experts, hidden, intermediate, global_experts)
+            scratch = pool.get(key)
+            if scratch is None:
+                scratch = self._build_decode_scratch(
+                    device, top_k, experts, hidden, intermediate, global_experts
+                )
+                pool[key] = scratch
+        else:
+            scratch = self._build_decode_scratch(
+                device, top_k, experts, hidden, intermediate, global_experts
+            )
+        for name, buf in scratch.items():
+            setattr(layer, f"_nvfp4_sm70_{name}", buf)
+
+    @staticmethod
+    def _build_decode_scratch(
+        device: torch.device,
+        top_k: int,
+        experts: int,
+        hidden: int,
+        intermediate: int,
+        global_experts: int,
+    ) -> dict[str, torch.Tensor]:
+        max_slots = _GRAPH_SAFE_MAX_TOKENS * top_k
         workspace_size = torch.ops._moe_C.moe_permute_sort_workspace_size(
-            max_slots, layer.global_num_experts
+            max_slots, global_experts
         )
-        layer._nvfp4_sm70_sort_workspace = torch.empty(
-            workspace_size, dtype=torch.int8, device=device
-        )
-        layer._nvfp4_sm70_dense_expert_ids = torch.arange(
-            experts, dtype=torch.int32, device=device
-        )
-        layer._nvfp4_sm70_compact_offsets = torch.arange(
-            max_slots + 1, dtype=torch.int32, device=device
-        )
-        layer._nvfp4_sm70_active_expert_ids = torch.empty(
-            max_slots, dtype=torch.int32, device=device
-        )
+        return {
+            "permuted_input": torch.empty(
+                max_slots, hidden, dtype=torch.float16, device=device
+            ),
+            "input_row_indices": torch.empty(
+                max_slots, dtype=torch.int32, device=device
+            ),
+            "gate_up": torch.empty(
+                max_slots, 2 * intermediate, dtype=torch.float16, device=device
+            ),
+            "intermediate": torch.empty(
+                max_slots, intermediate, dtype=torch.float16, device=device
+            ),
+            "sorted_output": torch.empty(
+                max_slots, hidden, dtype=torch.float16, device=device
+            ),
+            "expert_offsets": torch.empty(
+                experts + 1, dtype=torch.int32, device=device
+            ),
+            "expert_offsets64": torch.empty(
+                experts + 1, dtype=torch.int64, device=device
+            ),
+            "inv_permuted_idx": torch.empty(
+                _GRAPH_SAFE_MAX_TOKENS, top_k, dtype=torch.int32, device=device
+            ),
+            "topk_ids": torch.empty(
+                _GRAPH_SAFE_MAX_TOKENS, top_k, dtype=torch.int32, device=device
+            ),
+            "token_expert_indices": torch.arange(
+                max_slots, dtype=torch.int32, device=device
+            ).view(_GRAPH_SAFE_MAX_TOKENS, top_k),
+            "permuted_idx": torch.empty(max_slots, dtype=torch.int32, device=device),
+            "permuted_experts_id": torch.empty(
+                max_slots, dtype=torch.int32, device=device
+            ),
+            "sorted_row_idx": torch.empty(max_slots, dtype=torch.int32, device=device),
+            "topk_ids_for_sort": torch.empty(
+                max_slots, dtype=torch.int32, device=device
+            ),
+            "sort_workspace": torch.empty(
+                workspace_size, dtype=torch.int8, device=device
+            ),
+            "dense_expert_ids": torch.arange(experts, dtype=torch.int32, device=device),
+            "compact_offsets": torch.arange(
+                max_slots + 1, dtype=torch.int32, device=device
+            ),
+            "active_expert_ids": torch.empty(
+                max_slots, dtype=torch.int32, device=device
+            ),
+        }
 
     @staticmethod
     def _persistent_buffers(

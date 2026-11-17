@@ -2498,6 +2498,7 @@ class OffloadingConnectorScheduler:
                 if h_b is None:
                     continue
                 components = []
+                state_components: set[OffloadKey] = set()
                 sources: set[OffloadKey] = set()
                 inventory_complete = True
                 draft_start = boundary
@@ -2507,6 +2508,7 @@ class OffloadingConnectorScheduler:
                     if group.requires_exact_boundary_source:
                         if 0 < end <= len(keys):
                             components.append(keys[end - 1])
+                            state_components.add(keys[end - 1])
                             if (
                                 boundary <= cap
                                 and boundary % group.offloaded_block_size == 0
@@ -2559,15 +2561,25 @@ class OffloadingConnectorScheduler:
                 uid = UnitId(h_b, unified.units.reset_epoch)
                 existing = unified.units.units.get(uid)
                 if existing is None:
-                    if not inventory_complete or any(
-                        k not in sources and not unified.component_available(k)
+                    missing = [
+                        k
                         for k in components
-                    ):
+                        if k not in sources and not unified.component_available(k)
+                    ]
+                    if not inventory_complete or missing:
                         unified.events[
                             "junction_host_b_unavailable"
                             if boundary == junction
                             else "boundary_source_unavailable"
                         ] += 1
+                        # Which part was not ready: the inventory, a state
+                        # source or a draft-window block.
+                        if not inventory_complete:
+                            unified.events["boundary_reject_inventory"] += 1
+                        if any(k in state_components for k in missing):
+                            unified.events["boundary_reject_state"] += 1
+                        if any(k not in state_components for k in missing):
+                            unified.events["boundary_reject_draft"] += 1
                         unified.rejected_step.update(components)
                         continue
                     build = unified.begin_boundary(req_id, h_b, components)

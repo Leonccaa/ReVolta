@@ -33,6 +33,7 @@ def _mock_communicator() -> CustomAllreduce:
         "disabled",
         "tp2",
         "pex",
+        "no_push_topology",
         "unconnected",
         "unregistered",
         "cpu",
@@ -45,6 +46,7 @@ def _mock_communicator() -> CustomAllreduce:
 def test_qsa_candidate_gather_admission(monkeypatch, case):
     comm = _mock_communicator()
     comm.sm70_nvlink_tp4 = True
+    comm.sm70_pcie_switch = False
     comm.sm70_tp4_push_buffer_ptrs = [0] * 4
     inp = torch.empty((1, 40 if case == "capacity" else 1, 1024), dtype=torch.int32)
     monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda _: case != "cpu"))
@@ -53,6 +55,10 @@ def test_qsa_candidate_gather_admission(monkeypatch, case):
     elif case == "tp2":
         comm.world_size = 2
     elif case == "pex":
+        # PCIe switch P2P runs the same push protocol as NVLink.
+        comm.sm70_nvlink_tp4 = False
+        comm.sm70_pcie_switch = True
+    elif case == "no_push_topology":
         comm.sm70_nvlink_tp4 = False
     elif case == "unconnected":
         comm.fully_connected = False
@@ -74,7 +80,7 @@ def test_qsa_candidate_gather_admission(monkeypatch, case):
     op = Mock()
     monkeypatch.setattr(ops, "sm70_qsa_index_allgather", op)
     out = comm.sm70_qsa_index_allgather(inp)
-    if case in ("push", "capacity"):
+    if case in ("push", "capacity", "pex"):
         assert out.shape == (4, inp.shape[1], 1024) and out.dtype == torch.int32
         op.assert_called_once_with(comm._ptr, inp, out)
     else:

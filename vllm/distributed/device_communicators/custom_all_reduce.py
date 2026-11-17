@@ -968,7 +968,7 @@ class CustomAllreduce:
         if not (
             not self.disabled
             and self.world_size == 4
-            and self.sm70_nvlink_tp4
+            and (self.sm70_pcie_switch or self.sm70_nvlink_tp4)
             and self.fully_connected
             and self.sm70_tp4_push_buffer_ptrs is not None
             and inp.is_cuda

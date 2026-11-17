@@ -179,7 +179,7 @@ def qsa_candidate_allgather(monkeypatch, tp_size, pp_size, rank, distributed_ini
         init_test_distributed_environment(tp_size, pp_size, rank, distributed_init_port)
         tp = get_tp_group()
         ca = tp.device_communicator.ca_comm
-        assert not ca.disabled and ca.sm70_nvlink_tp4
+        assert not ca.disabled and (ca.sm70_pcie_switch or ca.sm70_nvlink_tp4)
         assert ca.sm70_tp4_push_buffer_ptrs is not None
         select = qsa._sm70_qsa_lexicographic_topk_op()
         moe = torch.ones(1, 2560, dtype=torch.float16, device=device)

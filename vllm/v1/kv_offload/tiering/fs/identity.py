@@ -30,62 +30,51 @@ PAGE_FORMAT = "revolta_fs/page-v2+crc32c-full-identity-xattr"
 # floating-point accumulation do not count.
 KV_COMPAT_EPOCH = 1
 
+# The persistent identity is a whitelist: only fields that certainly change the
+# bytes or the meaning of a stored page belong in it (see get_revolta_identity
+# and the persistent_layout of the tiering spec). Tuning options and whole
+# configuration objects stay out, so changing them never discards the archive.
+# A new feature that changes what is stored must add its field here, or add 1
+# to KV_COMPAT_EPOCH.
+_MODEL_FIELDS = ("dtype", "quantization", "quantization_config", "hf_overrides")
+# Structure of the resolved text model that shapes K/V (the checkpoint's own
+# config file is already covered by the content manifest).
+_TEXT_STRUCTURE_FIELDS = (
+    "num_hidden_layers",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "head_dim",
+    "hidden_size",
+    "rope_parameters",
+    "rope_scaling",
+    "rope_theta",
+    "partial_rotary_factor",
+    "sliding_window",
+    "layer_types",
+)
+# These change the tokens or embeddings of a multimodal prefix.
+_MULTIMODAL_FIELDS = (
+    "mm_processor_kwargs",
+    "media_io_kwargs",
+    "video_pruning_rate",
+    "mm_encoder_attn_dtype",
+    "mm_encoder_fp8_scale_path",
+)
+_DRAFT_FIELDS = (
+    "method",
+    "quantization",
+    "hf_overrides",
+    "kv_cache_dtype",
+    "mtp_expert_quantization",
+    "draft_tensor_parallel_size",
+)
+
 
 def canonical_digest(value) -> str:
     data = json.dumps(
         normalize_value(value), sort_keys=True, separators=(",", ":"), allow_nan=False
     )
     return hashlib.sha256(data.encode()).hexdigest()
-
-
-_RETENTION_POLICY_FIELDS = (
-    "latest_only",
-    "superseded_keep_ssd",
-    "enable_junction_evidence",
-)
-
-
-def _kernel_identity(config):
-    """Preserve pre-unified host budgeting identities for legacy and disabled
-    configurations.
-
-    Dataclass normalization includes optional fields, even None. Adding the
-    inert host_store_gib field must not change existing MAIN file names or
-    prefix seeds. An explicitly changed active configuration retains the
-    existing full-configuration identity contract.
-    """
-    value = normalize_value(config)
-
-    def legacy(node):
-        if isinstance(node, tuple):
-            if len(node) == 2 and node[0] == "vllm.config.kernel.LongContextKVConfig":
-                fields = dict(node[1])
-                return (
-                    node[0],
-                    tuple(
-                        item
-                        for item in node[1]
-                        # Checkpoint retention policy decides which units are
-                        # kept, not how any page is encoded, so it must not move
-                        # persisted files to a new namespace.
-                        if item[0]
-                        not in (
-                            *_RETENTION_POLICY_FIELDS,
-                            "staged_writethrough",
-                            # Its effect is the host layer list, which the page
-                            # layout digest already covers.
-                            "draft_main_placement",
-                        )
-                        and (
-                            item[0] != "host_store_gib"
-                            or (fields.get("enabled", False) and item[1] is not None)
-                        )
-                    ),
-                )
-            return tuple(legacy(part) for part in node)
-        return node
-
-    return legacy(value)
 
 
 def _fields(config, names: tuple[str, ...]) -> dict:
@@ -122,38 +111,12 @@ def _loader_identity(config) -> dict:
         config, "secondary_weights", None
     ):
         raise ManifestError("extra loader configuration/weights are not supported")
-    return {
-        "format": fmt,
-        "loader": f"{loader.__module__}.{loader.__qualname__}",
-        **_fields(
-            config,
-            ("ignore_patterns", "safetensors_load_strategy", "pt_load_map_location"),
-        ),
-    }
+    # Which checkpoint files are read; the files themselves are in the manifest.
+    return _fields(config, ("ignore_patterns",))
 
 
 def _model_identity(config) -> dict:
-    result = _fields(
-        config,
-        (
-            "model",
-            "revision",
-            "code_revision",
-            "dtype",
-            "quantization",
-            "quantization_config",
-            "hf_overrides",
-            "hf_config",
-            "hf_text_config",
-            "max_model_len",
-        ),
-    )
-    # HF configs can also be dataclasses. Their extra attributes (including
-    # quantization metadata) must survive generic dataclass normalization.
-    for name in ("hf_config", "hf_text_config"):
-        value = result[name]
-        if hasattr(value, "to_dict"):
-            result[name] = value.to_dict()
+    result = _fields(config, _MODEL_FIELDS)
     overrides = result["hf_overrides"]
     if callable(overrides):
         # SpeculativeConfig installs this built-in transformation itself. Its
@@ -165,8 +128,8 @@ def _model_identity(config) -> dict:
         result["hf_overrides"] = "SpeculativeConfig.hf_config_override"
     # Multimodal models: the encoder weights are part of the checkpoint (and
     # of its content manifest), and request block hashes already carry the
-    # multimodal input hashes; what remains is the effective processing
-    # configuration, which changes the tokens and embeddings of a prefix.
+    # multimodal input hashes; what remains is the processing configuration
+    # that changes the tokens and embeddings of a prefix.
     mm = getattr(config, "multimodal_config", None)
     if (
         getattr(mm, "mm_encoder_attn_dtype", None) == "fp8"
@@ -175,7 +138,13 @@ def _model_identity(config) -> dict:
         raise ManifestError(
             "runtime multimodal encoder scale calibration is not supported"
         )
-    result["multimodal_config"] = None if mm is None else _plain(mm)
+    result["multimodal_config"] = (
+        None if mm is None else _plain(_fields(mm, _MULTIMODAL_FIELDS))
+    )
+    text = getattr(config, "hf_text_config", None) or {}
+    if hasattr(text, "to_dict"):
+        text = text.to_dict()
+    result["text_structure"] = {name: text.get(name) for name in _TEXT_STRUCTURE_FIELDS}
     return result
 
 
@@ -372,21 +341,7 @@ def get_revolta_identity(
             if roots["target"] != draft_root:
                 roots["draft"] = draft_root
             draft_identity = {
-                **_fields(
-                    speculative,
-                    (
-                        "method",
-                        "model",
-                        "num_speculative_tokens",
-                        "quantization",
-                        "hf_overrides",
-                        "kv_cache_dtype",
-                        "mtp_expert_quantization",
-                        "attention_backend",
-                        "moe_backend",
-                        "draft_tensor_parallel_size",
-                    ),
-                ),
+                **_fields(speculative, _DRAFT_FIELDS),
                 "effective_model": _model_identity(draft),
                 "loader": _loader_identity(
                     getattr(speculative, "draft_load_config", None)
@@ -439,9 +394,10 @@ def get_revolta_identity(
                     "cp_kv_cache_interleave_size",
                 ),
             ),
-            "attention": getattr(vllm_config, "attention_config", None),
-            "kernel": _kernel_identity(getattr(vllm_config, "kernel_config", None)),
-            "additional": getattr(vllm_config, "additional_config", None),
+            # The backend fixes the order of K/V inside a page.
+            "attention_backend": getattr(
+                getattr(vllm_config, "attention_config", None), "backend", None
+            ),
         }
         kernel = getattr(vllm_config, "kernel_config", None)
         if (

@@ -15,7 +15,6 @@ from vllm.models.qwen4_exp.nvidia.host_kv.history import (
 )
 from vllm.models.qwen4_exp.nvidia.host_kv.staged_write import plan_write, prefill_slots
 from vllm.v1.kv_offload.host.region import HostRegionLayout
-from vllm.v1.kv_offload.tiering.fs.identity import _kernel_identity, canonical_digest
 
 
 @pytest.mark.parametrize("dtype", [torch.uint8, torch.float16])
@@ -124,7 +123,7 @@ def test_dcp_cpu_slot_partition_and_decode_rows():
         assert left[39:] == right[39:] == [-1] * 5
 
 
-def test_switch_keeps_legacy_compile_and_ssd_identity():
+def test_switch_keeps_legacy_compile_identity():
     a = KernelConfig(long_context_kv={"enabled": True, "host_store_gib": 4})
     b = KernelConfig(
         long_context_kv={
@@ -135,11 +134,6 @@ def test_switch_keeps_legacy_compile_and_ssd_identity():
     )
     assert a.long_context_kv.staged_writethrough is True
     assert a.compute_hash() == b.compute_hash()
-    assert canonical_digest(_kernel_identity(a)) == canonical_digest(
-        _kernel_identity(b)
-    )
-    identity = repr(_kernel_identity(a))
-    assert "staged_writethrough" not in identity
 
 
 def test_cpu_block_mirror_append_overwrite_and_padding():

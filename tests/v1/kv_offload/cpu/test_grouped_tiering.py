@@ -393,7 +393,7 @@ def test_spec_declares_layout_and_rejects_unsupported_topology(monkeypatch, topo
     layout = spec.persistent_layout
     assert layout["kv_compat_epoch"] == KV_COMPAT_EPOCH
     assert "config_hash" not in layout
-    assert layout["model_revision"] == "fixed-model-revision"
+    assert "model_revision" not in layout
     assert layout["tensors"] == [{"page_size": 4096, "shared_by": ["a", "b"]}]
     # Changing runtime capacity does not change physical bytes per cache row.
     cache.num_blocks *= 2

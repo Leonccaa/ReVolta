@@ -8,10 +8,11 @@ Source: c19296d49934329b0fbb6853759690bc6d6c11d9. State gathers follow
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from vllm.utils.hashing import sha256
 from vllm.v1.core.history_block_pool import HistoryBlockPool
+from vllm.v1.core.kv_cache_hit_contract import chain_hash_from_request
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     BlockHashListWithBlockSize,
@@ -196,9 +197,23 @@ class ExactEndIndex:
                             self.hash_block_size,
                             manager.block_size,
                         )
+                        chain_hash = chain_hash_from_request(
+                            request.block_hashes, self.hash_block_size
+                        )
                         for i in range(len(prefix), first):
                             cached = pool.get_cached_block(hashes[i], [g])
                             if cached is None:
+                                break
+                            if (
+                                host_hits is not None
+                                and g == host_hits.rule.group_id
+                                and not host_hits.local_validator(
+                                    g,
+                                    i,
+                                    cast(BlockHash, chain_hash(host_hits.rule, i)),
+                                    cached[0].block_id,
+                                )
+                            ):
                                 break
                             prefix.append(cached[0])
                         if len(prefix) != first:

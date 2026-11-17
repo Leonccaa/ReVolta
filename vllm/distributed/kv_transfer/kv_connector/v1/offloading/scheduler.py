@@ -1178,6 +1178,9 @@ class OffloadingConnectorScheduler:
         )
         self._req_status[request.request_id] = req_status
 
+    def skip_external_once(self, request_id: str) -> None:
+        self._skip_external_once.add(request_id)
+
     def get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int
     ) -> tuple[int | None, bool]:

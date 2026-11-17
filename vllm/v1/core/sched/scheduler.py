@@ -1193,6 +1193,26 @@ class Scheduler(SchedulerInterface):
                             num_new_local_computed_tokens,
                         )
 
+                    # A previous capacity rejection did not consume its hit.
+                    exact_end = self.kv_cache_manager.coordinator.exact_end
+                    exact_end.hits.pop(request.request_id, None)
+                    offload_scheduler = getattr(
+                        self.connector, "connector_scheduler", None
+                    )
+                    if self.connector is None or offload_scheduler is not None:
+                        new_computed_blocks, num_new_local_computed_tokens = (
+                            self.kv_cache_manager.extend_exact_end(
+                                request,
+                                new_computed_blocks,
+                                num_new_local_computed_tokens,
+                            )
+                        )
+                        if (
+                            offload_scheduler is not None
+                            and request.request_id in exact_end.hits
+                        ):
+                            offload_scheduler.skip_external_once(request.request_id)
+
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
                         ext_tokens, load_kv_async = (
@@ -1243,11 +1263,12 @@ class Scheduler(SchedulerInterface):
                                 connector_prefix_cache_hits,
                             )
 
-                    # A previous capacity rejection did not consume its hit.
-                    self.kv_cache_manager.coordinator.exact_end.hits.pop(
-                        request.request_id, None
-                    )
-                    if not num_external_computed_tokens and not load_kv_async:
+                    if (
+                        self.connector is not None
+                        and offload_scheduler is None
+                        and not num_external_computed_tokens
+                        and not load_kv_async
+                    ):
                         new_computed_blocks, num_new_local_computed_tokens = (
                             self.kv_cache_manager.extend_exact_end(
                                 request,

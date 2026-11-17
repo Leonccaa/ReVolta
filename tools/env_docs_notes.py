@@ -518,8 +518,8 @@ NOTES: dict[str, dict[str, str]] = {
         range="MiB",
         tradeoff="CUDA graph memory reserved before sizing the KV cache (MRv2 "
         "does not profile it). Too low risks OOM at capture; too high wastes "
-        "KV. Profile: 700 (AWQ, NVFP4), 1200 (DFlash2), 1050 (AWQ + DFlash2 "
-        "with fp8_per_token_head or int8 KV).",
+        "KV. Profile: 700 (AWQ, NVFP4), 1200 (DFlash2); with fp8_per_token_head "
+        "or int8 KV, 600 (MTP) and 1000 (AWQ + DFlash2).",
         metrics="",
     ),
     # ---- DFlash2 / DFlash draft ------------------------------------------

@@ -122,3 +122,17 @@ def test_resolved_modelopt_fp4(profile):
     config.hf_config = NS()
     assert profile.apply_revolta_profile(config, 4, is_sm70=True)
     assert all(os.environ.get(name) == value for name, value in NVFP4.items())
+
+
+@pytest.mark.parametrize("algo", ["NVFP4", "W4A16_NVFP4"])
+def test_nvfp4_dflash_reserves_the_dflash_graph_pool(profile, algo):
+    # Same graph set as AWQ DFlash2; with the MTP figure the extra graph memory
+    # is counted as KV and a large mixed step can run out of GPU memory.
+    assert profile.apply_revolta_profile(
+        model(algo), 4, is_sm70=True, speculative_method="dflash"
+    )
+    assert os.environ["VLLM_V2_CUDAGRAPH_MEM_MIB"] == "1200"
+    assert os.environ["VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS"] == "0"
+    for name, value in NVFP4.items():
+        if name != "VLLM_V2_CUDAGRAPH_MEM_MIB":
+            assert os.environ[name] == value

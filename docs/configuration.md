@@ -286,7 +286,7 @@ The ReVolta profile (`vllm/revolta_profile.py`) sets these on SM70 + TP4 + FP16 
 | `VLLM_SM70_AWQ_QWEN38_QPN_M1` | bool | `True` | `1` (AWQ) | 0, 1 | configuration | 1Cat | Single-token W13/W2 QPN route; 0 restores the legacy route. Changes reduction order. |
 | `VLLM_SM70_AWQ_TUNE_SMALL_SHAPES` | bool | `False` | `1` (AWQ) | 0, 1 | configuration | 1Cat | Tunes TurboMind small-M AWQ shapes at startup: longer warmup, faster small batches. |
 | `VLLM_SM70_CAR_VMM_SAFE` | bool | `False` | `1` (P2P/NVLink) | 0, 1 | experimental | 0.2.0 | Copies non-exportable (VMM) inputs into graph allocations while capturing custom all-reduce graphs, so expandable segments can stay on. Only with P2P or NVLink. |
-| `VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS` | bool | `True` | `0` (AWQ+DFlash2) | 0, 1 | configuration | 1Cat | Single-request DFlash2 verifier tail graphs. The AWQ DFlash profile sets 0 to keep the graph memory for the KV cache. |
+| `VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS` | bool | `True` | `0` (DFlash2) | 0, 1 | configuration | 1Cat | Single-request DFlash2 verifier tail graphs. The DFlash2 profile sets 0 to keep the graph memory for the KV cache. |
 | `VLLM_SM70_GREEDY_VERIFY` | bool | `False` | `1` | 0, 1 | experimental | 0.2.0 | Greedy MTP verification from TP-local argmax pairs instead of full-vocabulary logits; only when every request is plain greedy. |
 | `VLLM_SM70_NVFP4_MOE_GROUPED_DECODE` | bool | `False` | `0` (NVFP4) | 0, 1 | experimental | 1Cat | Grouped native-NVFP4 decode; the profile keeps it off pending quality admission. |
 | `VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL` | bool | `True` | `1` (NVFP4) | 0, 1 | configuration | 1Cat | One grouped TurboMind call for all routed experts in prefill. |
@@ -306,7 +306,7 @@ The ReVolta profile (`vllm/revolta_profile.py`) sets these on SM70 + TP4 + FP16 
 | `VLLM_SM70_QWEN38_WIDE_M` | bool | `False` | `1` | 0, 1 | experimental | 0.2.0 | Widens Qwen3.8 decode/verify routes from 4 to 8 requests (M up to 40); each VLLM_SM70_QWEN38_WIDE_M_* item can override it. |
 | `VLLM_SM70_SKIP_REJECTED_BATCH_PACKS` | bool | `False` | `1` | 0, 1 | experimental | 0.2.0 | Skips batch packs the precision policy never admits; saves about 199 MiB per rank. |
 | `VLLM_USE_AOT_COMPILE` | bool | `False` | `0` | 0, 1 | configuration | 1Cat | AOT compile reuse. The profile sets 0 on the reference deployment. |
-| `VLLM_V2_CUDAGRAPH_MEM_MIB` | float | `0.0` | `700` (AWQ), `1200` (AWQ+DFlash2), `700` (NVFP4) | MiB | configuration | 1Cat | CUDA graph memory reserved before sizing the KV cache (MRv2 does not profile it). Too low risks OOM at capture; too high wastes KV. Profile: 700 (AWQ, NVFP4), 1200 (AWQ + DFlash2). |
+| `VLLM_V2_CUDAGRAPH_MEM_MIB` | float | `0.0` | `700` (AWQ), `700` (NVFP4), `1200` (DFlash2), `1050` (AWQ+DFlash2, planar KV) | MiB | configuration | 1Cat | CUDA graph memory reserved before sizing the KV cache (MRv2 does not profile it). Too low risks OOM at capture; too high wastes KV. Profile: 700 (AWQ, NVFP4), 1200 (DFlash2), 1050 (AWQ + DFlash2 with fp8_per_token_head or int8 KV). |
 
 ### Anonymous usage statistics
 

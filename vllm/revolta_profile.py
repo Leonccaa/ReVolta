@@ -42,16 +42,6 @@ AWQ_DEFAULTS = {
     # Measured for the AWQ TP4 graph pool.
     "VLLM_V2_CUDAGRAPH_MEM_MIB": "700",
 }
-# DFlash2 also captures the eight-row verify graphs with their width shapes and
-# the drafter's graphs. The single-request verifier tail graphs add about
-# 0.3 GiB without a measured speed gain on the AWQ TP4 profile (greedy tokens
-# identical, 256K decode unchanged), so DFlash2 leaves them off; the remaining
-# pool is about 1.1 GiB. With the MTP figure the excess goes to the KV cache
-# and a large mixed step can OOM.
-AWQ_DFLASH_DEFAULTS = {
-    "VLLM_V2_CUDAGRAPH_MEM_MIB": "1200",
-    "VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS": "0",
-}
 NVFP4_DEFAULTS = {
     "VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE": "1",
     "VLLM_SM70_NVFP4_QWEN38_MOE_RAW_GROUPED_DECODE": "1",
@@ -62,6 +52,23 @@ NVFP4_DEFAULTS = {
     "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES": "1",
     "VLLM_V2_CUDAGRAPH_MEM_MIB": "700",
 }
+# DFlash2 also captures the eight-row verify graphs with their width shapes and
+# the drafter's graphs. The single-request verifier tail graphs add about
+# 0.3 GiB without a measured speed gain on the AWQ TP4 profile (greedy tokens
+# identical, 256K decode unchanged), so DFlash2 leaves them off; the remaining
+# pool is about 1.1 GiB. With the MTP figure the excess goes to the KV cache
+# and a large mixed step can OOM. The graphs depend on the speculative method,
+# not on the weight format, so AWQ and NVFP4 both use these values.
+DFLASH_DEFAULTS = {
+    "VLLM_V2_CUDAGRAPH_MEM_MIB": "1200",
+    "VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS": "0",
+}
+# With a planar KV cache (fp8_per_token_head, the QSA auto choice, or int8) the
+# AWQ DFlash2 graphs measured 0.92 GiB instead of 1.13 GiB with the scalar FP8
+# cache; the reserve keeps about 0.1 GiB of headroom. NVFP4 keeps 1200 until
+# its tail-off figure is measured.
+AWQ_DFLASH_PLANAR_KV_DEFAULTS = {"VLLM_V2_CUDAGRAPH_MEM_MIB": "1050"}
+PLANAR_KV_DTYPES = ("fp8_per_token_head", "int8")
 CUSTOM_AR_DEFAULTS = {"VLLM_SM70_CAR_VMM_SAFE": "1"}
 
 # Config defaults have their own audit namespace; never add them to the W9
@@ -316,13 +323,14 @@ def apply_revolta_profile(
     is_sm70: bool,
     interconnect_mode: InterconnectMode = "pex_p2p",
     speculative_method: str | None = None,
+    kv_cache_dtype: str | None = None,
 ) -> bool:
     """Apply before config defaults and before model/native module imports.
 
     Pass frontend_interconnect_mode(); this does not select an AR backend.
     Explicit environment overrides always win, including in no_p2p. A later
     call may refine a value this profile wrote (EngineArgs may not know the
-    speculative method that VllmConfig resolves).
+    speculative method or the KV dtype that VllmConfig resolves).
     """
     import torch
 
@@ -341,9 +349,13 @@ def apply_revolta_profile(
         if _has_awq_qpn_shape(model_config, tensor_parallel_size):
             defaults.update(AWQ_DEFAULTS)
             if speculative_method == "dflash":
-                defaults.update(AWQ_DFLASH_DEFAULTS)
+                defaults.update(DFLASH_DEFAULTS)
+                if kv_cache_dtype in PLANAR_KV_DTYPES:
+                    defaults.update(AWQ_DFLASH_PLANAR_KV_DEFAULTS)
     elif has_nvfp4_weights(model_config):
         defaults.update(NVFP4_DEFAULTS)
+        if speculative_method == "dflash":
+            defaults.update(DFLASH_DEFAULTS)
     if interconnect_mode != "no_p2p":
         defaults.update(CUSTOM_AR_DEFAULTS)
     for name, value in defaults.items():

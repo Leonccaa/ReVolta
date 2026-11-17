@@ -51,8 +51,9 @@ def profile_values(source: str) -> dict[str, list[str]]:
     labels = {
         "COMMON_DEFAULTS": "",
         "AWQ_DEFAULTS": "AWQ",
-        "AWQ_DFLASH_DEFAULTS": "AWQ+DFlash2",
         "NVFP4_DEFAULTS": "NVFP4",
+        "DFLASH_DEFAULTS": "DFlash2",
+        "AWQ_DFLASH_PLANAR_KV_DEFAULTS": "AWQ+DFlash2, planar KV",
         "CUSTOM_AR_DEFAULTS": "P2P/NVLink",
     }
     for node in ast.parse(source).body:

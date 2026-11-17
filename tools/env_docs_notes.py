@@ -363,7 +363,7 @@ NOTES: dict[str, dict[str, str]] = {
         section="profile",
         since="1Cat",
         range="0, 1",
-        tradeoff="Single-request DFlash2 verifier tail graphs. The AWQ DFlash "
+        tradeoff="Single-request DFlash2 verifier tail graphs. The DFlash2 "
         "profile sets 0 to keep the graph memory for the KV cache.",
         metrics="",
     ),
@@ -518,7 +518,8 @@ NOTES: dict[str, dict[str, str]] = {
         range="MiB",
         tradeoff="CUDA graph memory reserved before sizing the KV cache (MRv2 "
         "does not profile it). Too low risks OOM at capture; too high wastes "
-        "KV. Profile: 700 (AWQ, NVFP4), 1200 (AWQ + DFlash2).",
+        "KV. Profile: 700 (AWQ, NVFP4), 1200 (DFlash2), 1050 (AWQ + DFlash2 "
+        "with fp8_per_token_head or int8 KV).",
         metrics="",
     ),
     # ---- DFlash2 / DFlash draft ------------------------------------------

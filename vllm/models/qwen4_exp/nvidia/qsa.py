@@ -807,6 +807,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             raise ValueError("Qwen4Exp QSA requires a paged KV cache")
         if model_config.dtype not in (torch.float16, torch.bfloat16):
             raise NotImplementedError("Qwen4Exp QSA requires FP16 or BF16")
+        from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD
+
         if cache_config.cache_dtype not in (
             "auto",
             "float16",
@@ -814,6 +816,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             "fp8",
             "fp8_e4m3",
             "int8",
+            FP8_E4M3_PER_TOKEN_HEAD.name,
         ):
             raise NotImplementedError(
                 "Qwen4Exp QSA requires FP16/BF16 or E4M3 main KV cache"

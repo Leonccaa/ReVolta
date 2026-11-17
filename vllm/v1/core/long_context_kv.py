@@ -598,9 +598,10 @@ class LongContextCapacityPlan:
             else "main K/V in the host pool"
         )
         return (
-            f"long-context KV plan ({main_kv}): GPU budget "
+            f"long-context KV plan ({main_kv}): GPU KV budget "
             f"{_fmt_gib(self.gpu_budget_bytes)}"
-            f"/GPU = state {self.state_blocks}+1 blocks "
+            f"/GPU (left after weights, profiled activations and CUDA graphs) "
+            f"= state {self.state_blocks}+1 blocks "
             f"({_fmt_gib(self.gpu_state_bytes)}) + hot pool "
             f"{self.hot_pool_groups} groups/layer "
             f"({_fmt_gib(self.gpu_hot_pool_bytes)}) + staging "
@@ -615,7 +616,8 @@ class LongContextCapacityPlan:
             + f"; per-GPU bytes budget={self.gpu_budget_bytes}, "
             f"state={self.gpu_state_bytes}, history={self.gpu_history_bytes}, "
             f"hot={self.gpu_hot_pool_bytes}, staging={self.staging_bytes}, "
-            f"remaining={self.gpu_remaining_bytes}, "
+            f"history_rounding_unused={self.gpu_remaining_bytes} "
+            f"(less than one history block, not activation headroom), "
             f"hot_pool_source={self.hot_pool_source}, "
             f"hot_pool_min_groups={self.hot_pool_min_groups}, "
             f"hot_admission_bytes={self.hot_pool_bytes}"

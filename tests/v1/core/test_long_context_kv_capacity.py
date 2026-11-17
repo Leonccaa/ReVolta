@@ -308,7 +308,7 @@ def test_auto_uses_demand_sized_history_then_all_remaining_memory(host_gib, expl
         ("history", plan.gpu_history_bytes),
         ("hot", plan.gpu_hot_pool_bytes),
         ("staging", plan.staging_bytes),
-        ("remaining", plan.gpu_remaining_bytes),
+        ("history_rounding_unused", plan.gpu_remaining_bytes),
         ("hot_pool_source", "auto"),
     ):
         assert f"{key}={value}" in text

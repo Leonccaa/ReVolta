@@ -792,6 +792,182 @@ def test_dflash_decode_retention_requires_prefix_caching():
     assert not state.keep_decode_resume_state
 
 
+def _exact_end_scheduler(monkeypatch, *, mtp=False):
+    from tests.v1.core import test_long_context_admission as fixture
+    from tests.v1.core.long_context_kv_utils import mtp_specs, production_specs
+
+    monkeypatch.setattr(
+        fixture,
+        "production_specs",
+        lambda **kw: production_specs(speculative_blocks=0, drafter=True),
+    )
+    monkeypatch.setattr(fixture, "mtp_specs", lambda **kw: mtp_specs(replay=True))
+    return fixture.build(
+        fixture.settings(
+            main_kv_placement="host", host_pool_tokens=800_000, hot_pool_gib=0.6
+        ),
+        speculative_tokens=4 if mtp else 7,
+        speculative_method="mtp" if mtp else "dflash",
+        with_connector=True,
+    )
+
+
+def _exact_end_step(scheduler):
+    from tests.v1.core.long_context_kv_utils import host_step_receipts
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+        OffloadingWorkerMetadata,
+    )
+    from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
+
+    output = scheduler.schedule()
+    ids = list(output.num_scheduled_tokens)
+    meta = host_step_receipts(scheduler, output) or OffloadingWorkerMetadata()
+    connector = scheduler.connector.connector_scheduler
+    mask = scheduler.host_history_pool.host_pages.all_ranks
+    meta.job_results = {
+        (jid, job.generation): (mask, 0)
+        for jid, job in connector._jobs.items()
+        if job.generation is not None
+    }
+    kv_output = KVConnectorOutput(kv_connector_worker_meta=meta)
+    if not ids:
+        scheduler.update_host_kv_output(kv_output)
+        return output
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=ids,
+            req_id_to_index={rid: i for i, rid in enumerate(ids)},
+            sampled_token_ids=[
+                list(
+                    range(
+                        100,
+                        100
+                        + min(
+                            3, 1 + len(output.scheduled_spec_decode_tokens.get(rid, ()))
+                        ),
+                    )
+                )
+                if not scheduler.requests[rid].is_prefill_chunk
+                else []
+                for rid in ids
+            ],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            kv_connector_output=kv_output,
+        ),
+    )
+    alive = [
+        rid
+        for rid in ids
+        if rid in scheduler.requests and not scheduler.requests[rid].is_finished()
+    ]
+    if alive:
+        k = scheduler.num_spec_tokens
+        scheduler.update_draft_token_ids(
+            DraftTokenIds(
+                req_ids=alive,
+                draft_token_ids=[[1] * k for _ in alive],
+            )
+        )
+    return output
+
+
+def _finish_exact_end(scheduler, request):
+    scheduler.add_request(request)
+    while not request.is_finished():
+        _exact_end_step(scheduler)
+    return scheduler.kv_cache_manager.coordinator.exact_end
+
+
+@pytest.mark.parametrize("trim", [False, True])
+def test_exact_end_publish_revisit_consume_and_republish(monkeypatch, trim):
+    from tests.v1.core.test_long_context_admission import make_requests
+    from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id
+    from vllm.v1.core.single_type_kv_cache_manager import CircularBufferManager
+    from vllm.v1.kv_offload.host.page_table import PageState
+
+    scheduler = _exact_end_scheduler(monkeypatch)
+    [request] = make_requests(1, 2 * STATE_BLOCK - 10, 6 if trim else 7)
+    index = _finish_exact_end(scheduler, request)
+    entries = [e for bucket in index.index.values() for e in bucket]
+    assert request.last_accepted == 3
+    if trim:
+        assert request.num_computed_tokens != request.num_tokens - 1
+        assert not entries and not index.pending_gathers
+        return
+    [entry] = entries
+    assert entry.length == request.num_tokens
+    assert request.state_end > 2 * STATE_BLOCK > request.num_computed_tokens
+    [gather] = index.pending_gathers
+    assert gather.column == 2
+    assert gather.dst_block_ids == [
+        entry.groups[g][1][0][0].block_id for g in index.state_groups
+    ]
+    manager = scheduler.kv_cache_manager
+    pool = scheduler.host_history_pool
+    hid = entry.groups[pool.host_group_id][1][-1][0].block_id
+    handle = pool.bindings[hid]
+    # Deliver the pending fold on the idle notification step.
+    output = _exact_end_step(scheduler)
+    assert output.mamba_state_gathers == [gather]
+    assert not index.pending_gathers
+    [revisit] = make_requests(1, 1, 7, tag="revisit")
+    revisit = type(request)(
+        request_id=revisit.request_id,
+        prompt_token_ids=list(request.all_token_ids) + [777],
+        sampling_params=revisit.sampling_params,
+        pooling_params=None,
+        block_hasher=request._block_hasher,
+    )
+    blocks, aligned = manager.get_computed_blocks(revisit)
+    blocks, hit = manager.extend_exact_end(revisit, blocks, aligned)
+    assert hit == request.num_tokens - 1
+    ring = next(
+        m
+        for m in manager.coordinator.single_type_managers
+        if isinstance(m, CircularBufferManager)
+    )
+    assert (
+        ring.get_num_blocks_to_allocate(
+            revisit.request_id,
+            hit + 1,
+            blocks.blocks[ring.kv_cache_group_id],
+            hit,
+            hit + 1,
+        )
+        == 1
+    )
+    scheduler.add_request(revisit)
+    output = _exact_end_step(scheduler)
+    assert output.scheduled_new_reqs[0].num_computed_tokens == hit
+    assert not any(index.index.values())
+    assert pool.bindings[hid] == handle
+    assert pool.host_pages.get(handle).state == PageState.PRIVATE
+    for g, (_, held) in enumerate(entry.groups):
+        single = manager.coordinator.single_type_managers[g]
+        for block, expected in held:
+            assert block.ref_cnt == 1
+            if expected == make_block_hash_with_group_id(entry.key, g):
+                assert block.block_hash is None
+        if isinstance(single, CircularBufferManager):
+            assert single.req_to_blocks[revisit.request_id] == blocks.blocks[g]
+            assert not single.new_block_ids
+    # Admission removed the original entry, so a sibling cannot reuse it.
+    sibling_blocks, sibling_hit = manager.get_computed_blocks(revisit)
+    assert manager.extend_exact_end(revisit, sibling_blocks, sibling_hit)[1] == aligned
+    while not revisit.is_finished():
+        _exact_end_step(scheduler)
+    # Continuing the same tail fills it, seals it normally, then publishes anew.
+    assert pool.host_pages.get(handle).state == PageState.READY
+    assert any(
+        e.length == revisit.num_tokens
+        for bucket in index.index.values()
+        for e in bucket
+    )
+
+
 @pytest.mark.parametrize("prompt", [2 * STATE_BLOCK + 14, 65])
 def test_dflash_decode_windows_keep_ordinary_cache_priority(prompt):
     final = 7 * STATE_BLOCK + DRAFT_BLOCK + 10

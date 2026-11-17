@@ -175,6 +175,10 @@ class KVCacheCoordinator(ABC):
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
+        # vLLM #66881 HybridCheckpointManager: use the existing free hook.
+        from vllm.v1.core.exact_end import ExactEndIndex
+
+        self.exact_end = ExactEndIndex(self, hash_block_size)
 
     def group_block_pool(self, group_id: int) -> BlockPool:
         """The block pool that serves one KV cache group's block IDs."""

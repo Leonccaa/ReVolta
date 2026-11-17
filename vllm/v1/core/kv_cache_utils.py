@@ -66,6 +66,14 @@ BlockHash = NewType("BlockHash", bytes)
 # functions below pack/unpack the `BlockHash` and group id into/from the key.
 BlockHashWithGroupId = NewType("BlockHashWithGroupId", bytes)
 
+
+class MambaStateGather(NamedTuple):
+    """Finished replay-state fold; adapted from vLLM #67045."""
+
+    column: int
+    dst_block_ids: list[int]
+
+
 # ExternalBlockHash is used for reproducible prefix-cache block hashing.
 # It's a union of `bytes` and `int` to keep backward compatibility
 # after we default block hashing to use sha256 bytes.

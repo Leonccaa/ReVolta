@@ -21,10 +21,14 @@ from vllm.v1.kv_offload.tiering.fs.content_manifest import (
     rehash_and_verify,
     verify_manifest,
 )
-from vllm.version import __version__
 
 logger = init_logger(__name__)
 PAGE_FORMAT = "revolta_fs/page-v2+crc32c-full-identity-xattr"
+# Stored pages stay valid across engine versions. Add 1 only when a change
+# makes already stored KV/GDN state wrong (for example a fix to how it is
+# computed) or changes the page format. Differences that only reorder
+# floating-point accumulation do not count.
+KV_COMPAT_EPOCH = 1
 
 
 def canonical_digest(value) -> str:
@@ -153,7 +157,7 @@ def _model_identity(config) -> dict:
     overrides = result["hf_overrides"]
     if callable(overrides):
         # SpeculativeConfig installs this built-in transformation itself. Its
-        # resolved output is recorded below along with the producer version.
+        # resolved output is recorded below.
         from vllm.config.speculative import SpeculativeConfig
 
         if overrides is not SpeculativeConfig.hf_config_override:
@@ -407,7 +411,7 @@ def get_revolta_identity(
 
         identity = {
             "format": PAGE_FORMAT,
-            "producer_version": __version__,
+            "kv_compat_epoch": KV_COMPAT_EPOCH,
             "content_manifest_digest": content,
             "content_algorithm": manifest["algorithm"],
             "target": _model_identity(target),
@@ -432,12 +436,12 @@ def get_revolta_identity(
                     "rank",
                     "prefill_context_parallel_size",
                     "decode_context_parallel_size",
+                    "cp_kv_cache_interleave_size",
                 ),
             ),
             "attention": getattr(vllm_config, "attention_config", None),
             "kernel": _kernel_identity(getattr(vllm_config, "kernel_config", None)),
             "additional": getattr(vllm_config, "additional_config", None),
-            "compile_hash": vllm_config.compute_hash(),
         }
         kernel = getattr(vllm_config, "kernel_config", None)
         if (

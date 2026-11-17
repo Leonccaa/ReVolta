@@ -2547,6 +2547,51 @@ def test_eagle_with_sliding_window():
     assert num_tokens == 0
 
 
+def test_eagle_swa_short_prefill_keeps_first_aligned_hit():
+    manager = KVCacheManager(
+        KVCacheConfig(
+            num_blocks=16,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    ["target"],
+                    FullAttentionSpec(
+                        block_size=1664,
+                        num_kv_heads=1,
+                        head_size=1,
+                        dtype=torch.float16,
+                    ),
+                ),
+                KVCacheGroupSpec(
+                    ["drafter"],
+                    SlidingWindowSpec(
+                        block_size=832,
+                        num_kv_heads=1,
+                        head_size=1,
+                        dtype=torch.float16,
+                        sliding_window=2880,
+                    ),
+                    is_eagle_group=True,
+                ),
+            ],
+        ),
+        max_model_len=4096,
+        hash_block_size=16,
+        use_eagle=False,
+    )
+    token_ids = list(range(3000))
+    request = make_request("prefill", token_ids, 16, sha256)
+    assert manager.allocate_slots(request, len(token_ids)) is not None
+    manager.free(request)
+
+    revisit = make_request("revisit", token_ids, 16, sha256)
+    blocks, hit = manager.get_computed_blocks(revisit)
+    # Three cached drafter blocks are fewer than the five-block window.
+    # Pop the EAGLE lookahead before aligning, keeping the first 1664 tokens.
+    assert hit == 1664
+    assert [len(group) for group in blocks.blocks] == [1, 2]
+
+
 def test_eagle_swa_alignment_caches_extra_block():
     """Regression: SWA + EAGLE with `sliding_window <= alignment_tokens`.
 

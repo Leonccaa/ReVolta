@@ -958,7 +958,8 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
             for computed in computed_blocks:
                 del computed[num_contiguous_blocks:]
             while (
-                block_size != alignment_tokens  # Faster for common case.
+                not drop_eagle_block
+                and block_size != alignment_tokens  # Faster for common case.
                 and len(computed_blocks[0]) * block_size % alignment_tokens != 0
             ):
                 for computed in computed_blocks:

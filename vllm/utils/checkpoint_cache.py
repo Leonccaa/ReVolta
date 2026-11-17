@@ -28,9 +28,7 @@ _loading_files: ContextVar[set[str] | None] = ContextVar(
 def collect_checkpoint_files() -> Iterator[set[str]]:
     """Collect only this startup's loader inputs, including the draft model."""
     files: set[str] = set()
-    token = _loading_files.set(
-        files if envs.REVOLTA_RESEARCH_CHECKPOINT_CACHE_DROP else None
-    )
+    token = _loading_files.set(files if envs.VLLM_SM70_CHECKPOINT_CACHE_DROP else None)
     try:
         yield files
     finally:
@@ -123,8 +121,8 @@ def release_checkpoint_cache(files: set[str], *, protect_all: bool = False) -> N
     disk reader is outside this group, so its modes conservatively skip advice.
     All ranks must use the same switch and call this even with no local files.
     """
-    if not envs.REVOLTA_RESEARCH_CHECKPOINT_CACHE_DROP:
-        logger.info("Checkpoint cache drop disabled (research switch is off).")
+    if not envs.VLLM_SM70_CHECKPOINT_CACHE_DROP:
+        logger.info("Checkpoint cache drop disabled (switch is off).")
         return
     started = time.monotonic()
     group = _synchronize_loaders()

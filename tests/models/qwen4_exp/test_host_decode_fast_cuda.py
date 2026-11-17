@@ -14,9 +14,9 @@ def test_full_graph_fast_refill_matches_original_bits(monkeypatch):
 
     from .test_host_kv_history_cuda import DIM, QHEADS, SCALES, WIDTH, Arms
 
-    monkeypatch.setenv("REVOLTA_RESEARCH_HOST_DECODE_FAST", "0")
+    monkeypatch.setenv("VLLM_SM70_HOST_DECODE_FAST", "0")
     baseline = Arms(True, rows_per_pass=2)
-    monkeypatch.setenv("REVOLTA_RESEARCH_HOST_DECODE_FAST", "1")
+    monkeypatch.setenv("VLLM_SM70_HOST_DECODE_FAST", "1")
     candidate = Arms(True, rows_per_pass=2)
     lengths = [4100, 4000]
     for req, length in enumerate(lengths):
@@ -102,5 +102,5 @@ def test_full_graph_fast_refill_matches_original_bits(monkeypatch):
 def test_sharded_shared_key_fused_scores_match_global(monkeypatch, rows):
     from .test_qsa_index_dcp_shard import test_shared_key_scores_sharded_match_global
 
-    monkeypatch.setenv("REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED", "1")
+    monkeypatch.setenv("VLLM_SM70_QSA_LOCAL_INPUTS_FUSED", "1")
     test_shared_key_scores_sharded_match_global(world=2, rows=rows)

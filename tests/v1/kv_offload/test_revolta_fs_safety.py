@@ -32,6 +32,7 @@ from vllm.utils.hashing import sha256, sha256_cbor
 from vllm.v1.core import kv_cache_utils
 from vllm.v1.kv_offload.base import OffloadKey, make_offload_key
 from vllm.v1.kv_offload.tiering.fs import content_manifest, revolta
+from vllm.v1.kv_offload.tiering.fs import identity as identity_module
 from vllm.v1.kv_offload.tiering.fs.content_manifest import (
     ManifestError,
     build_manifest,
@@ -159,9 +160,16 @@ def test_another_namespace_page_is_rejected(tmp_path):
         "draft_load_format",
         "kv_dtype",
         "hash_algo",
+        "block_size",
+        "tp",
+        "dcp",
+        "cp_interleave",
+        "epoch",
     ],
 )
-def test_dedicated_identity_covers_effective_configuration(tmp_path, change):
+def test_dedicated_identity_covers_effective_configuration(
+    tmp_path, change, monkeypatch
+):
     model = _checkpoint(tmp_path)
     draft_dir = tmp_path / "draft"
     shutil.copytree(model, draft_dir)
@@ -208,10 +216,31 @@ def test_dedicated_identity_covers_effective_configuration(tmp_path, change):
         config.cache_config.cache_dtype = "float16"
     elif change == "hash_algo":
         config.cache_config.prefix_caching_hash_algo = "sha256_cbor"
+    elif change == "block_size":
+        config.cache_config.block_size = 32
+    elif change == "tp":
+        config.parallel_config.tensor_parallel_size = 2
+    elif change == "dcp":
+        config.parallel_config.decode_context_parallel_size = 2
+    elif change == "cp_interleave":
+        config.parallel_config.cp_kv_cache_interleave_size = 16
+    elif change == "epoch":
+        monkeypatch.setattr(identity_module, "KV_COMPAT_EPOCH", 2)
     after = get_revolta_identity(config, str(tmp_path / "kv"), manifest)
     assert after is not None
     assert before.persistent_digest != after.persistent_digest
-    assert config.compute_hash() == "cfg-1"  # compile identity deliberately unchanged
+
+
+def test_identity_ignores_engine_version_and_compile_hash(tmp_path, monkeypatch):
+    model = _checkpoint(tmp_path)
+    manifest = _write_manifest(tmp_path, {"target": str(model)})
+    config = make_spec(model).vllm_config
+    before = get_revolta_identity(config, str(tmp_path / "kv"), manifest)
+    assert before is not None
+    config.compute_hash = lambda: "cfg-2"
+    monkeypatch.setattr("vllm.version.__version__", "99.0.0")
+    after = get_revolta_identity(config, str(tmp_path / "kv"), manifest)
+    assert after == before
 
 
 def test_physical_layout_changes_namespace(tmp_path):
@@ -220,6 +249,18 @@ def test_physical_layout_changes_namespace(tmp_path):
     first = make_tier(tmp_path / "kv", view, spec=spec, content_manifest_path=manifest)
     first_digest = first._identity_digest
     first.shutdown()
+    digests = {first_digest}
+    # The host layer list is how draft_main_placement reaches the namespace.
+    for layers in (["main"], ["main", "draft"]):
+        spec.persistent_layout = {
+            "host_main_kv": {"layers": layers, "page_bytes": 4096}
+        }
+        tier = make_tier(
+            tmp_path / "kv", view, spec=spec, content_manifest_path=manifest
+        )
+        digests.add(tier._identity_digest)
+        tier.shutdown()
+    assert len(digests) == 3
     spec.persistent_layout = {"storage": {"strides": [64, 1], "role": "recurrent"}}
     second = make_tier(tmp_path / "kv", view, spec=spec, content_manifest_path=manifest)
     try:

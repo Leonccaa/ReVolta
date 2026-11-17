@@ -32,7 +32,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
     OffloadingConnector,
 )
-from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_utils import BlockHash, KVCacheBlock
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
@@ -400,6 +400,97 @@ def test_window_late_store_reads_only_held_blocks():
     req.num_computed_tokens = 192
     run.step(8, boundaries=(64,))
     assert 1 not in run.stored_blocks(DRAFT)
+
+
+@pytest.mark.skip_global_cleanup
+def test_decode_boundary_uses_core_handoff_and_held_draft_sources():
+    config = _vllm_config("window")
+    config.kv_transfer_config.kv_connector_extra_config["offload_prompt_only"] = False
+    kv_config = _kv_config(is_eagle_group=True)
+    spec = MockOffloadingSpec(config, kv_config)
+    from tests.v1.kv_connector.unit.offloading_connector.utils import (
+        generate_store_output,
+    )
+
+    spec.manager.prepare_store.side_effect = lambda keys, ctx: generate_store_output(
+        keys
+    )
+    connector = OffloadingConnectorScheduler(spec)
+    core = KVCacheManager(
+        kv_config,
+        max_model_len=256,
+        hash_block_size=DRAFT_BLOCK,
+        prefix_cache_retention_interval=0,
+    )
+    req = _request("decode", 2 * TARGET_BLOCK + 13)
+    connector.on_new_request(req)
+    connector.get_num_new_matched_tokens(req, 0)
+    managers = core.coordinator.single_type_managers
+    assert managers[MAMBA].keep_decode_resume_state
+    lengths = [0] * len(managers)
+    seen = set()
+    for end in [32, 64, req.num_prompt_tokens] + list(range(80, 166, 3)):
+        start = req.num_computed_tokens
+        if start >= req.num_prompt_tokens:
+            req.num_tokens = start + 1
+            req.block_hashes = _hashes(req.num_tokens // DRAFT_BLOCK)
+        for manager in managers:
+            manager.new_step_starts()
+            manager.remove_skipped_blocks(req.request_id, start, req.num_prompt_tokens)
+            manager.allocate_new_blocks(req.request_id, end + DRAFT_BLOCK, end)
+        core.coordinator.cache_blocks(req, min(end, req.num_tokens))
+        handoffs = core.take_boundary_state_offloads()
+        ids = tuple(
+            [b.block_id for b in m.req_to_blocks[req.request_id]] for m in managers
+        )
+        new = tuple(group[length:] for group, length in zip(ids, lengths))
+        output = _output(
+            req, end - start, new=ids if not start else None, cached=bool(start)
+        )
+        if start:
+            output.scheduled_cached_reqs.new_block_ids = [new]
+        output.boundary_state_offloads = handoffs
+        meta = connector.build_connector_meta(output)
+        for gid, bid, boundary in handoffs.get(req.request_id, []):
+            if boundary <= req.num_prompt_tokens:
+                continue
+            assert gid == MAMBA
+            seen.add(boundary)
+            assert (
+                managers[MAMBA]
+                .req_to_blocks[req.request_id][boundary // TARGET_BLOCK - 1]
+                .block_id
+                == bid
+            )
+            state_jobs = [
+                job
+                for job in meta.store_jobs.values()
+                if job.transfer_spec[0].group_sizes[MAMBA]
+            ]
+            assert any(
+                bid in job.transfer_spec[0].block_ids.tolist() for job in state_jobs
+            )
+        for job in meta.store_jobs.values():
+            src, _ = job.transfer_spec
+            if src.group_sizes[DRAFT]:
+                held = {
+                    b.block_id
+                    for b in managers[DRAFT].req_to_blocks[req.request_id]
+                    if not b.is_null
+                }
+                assert set(src.block_ids.tolist()[-src.group_sizes[DRAFT] :]) <= held
+        connector.update_connector_output(
+            SimpleNamespace(
+                kv_connector_worker_meta=OffloadingWorkerMetadata(
+                    completed_jobs={jid: 1 for jid in meta.store_jobs}
+                )
+            )
+        )
+        lengths = [len(group) for group in ids]
+        req.num_computed_tokens = end
+    assert seen == {96, 128, 160}
+    core.free(req)
+    assert all(b.ref_cnt == 0 for b in core.block_pool.blocks if not b.is_null)
 
 
 def test_window_junction_without_state_handoff():

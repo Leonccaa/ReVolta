@@ -34,9 +34,9 @@ class Qwen3ReasoningBoundary:
         if self.ended:
             return
         if token_id == self.start_token_id:
-            # Only the first opener starts reasoning; a later one is reasoning
-            # text, as in the text split (and already streamed as such).
-            if not self.start_seen:
+            # Only an opener before any decoded text starts reasoning.
+            # An opener inside reasoning is part of that text.
+            if not self.start_seen and before == 0:
                 self.start_seen = True
                 self.reasoning_start = after
         elif token_id == self.end_token_id:

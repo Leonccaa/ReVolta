@@ -365,6 +365,11 @@ class CudaGraphManager:
             self._capture_sizes.sort()
         self._init_candidates()
 
+    @property
+    def max_captured_tokens(self) -> int:
+        """Largest batch size ``dispatch`` can route to a captured graph."""
+        return len(self._candidates) - 1
+
     def _init_candidates(self) -> None:
         """Build priority-ordered candidate lists for each token count."""
         capture_sizes = self._capture_sizes
@@ -756,23 +761,6 @@ class ModelCudaGraphManager(CudaGraphManager):
                         assert attn_metadata is None
                     batch_descriptor = BatchDescriptor(
                         num_tokens=num_tokens,
-                        has_lora=has_lora,
-                        attention_context_bucket=desc.attention_context_bucket,
-                    )
-                if (
-                    desc.cg_mode == CUDAGraphMode.FULL
-                    and cg_mode in (CUDAGraphMode.NONE, CUDAGraphMode.FULL)
-                    and envs.REVOLTA_RESEARCH_QSA_DECODE_COALESCE_AG
-                ):
-                    # V2 captures FULL graphs directly. Pass the replicated
-                    # decode plan to opaque QSA ops; metadata alone cannot
-                    # distinguish same-shaped prefill and decode batches.
-                    # Use it for capture warmups too, so kernels/collectives
-                    # are initialized before entering CUDA graph capture.
-                    batch_descriptor = BatchDescriptor(
-                        num_tokens=num_tokens,
-                        num_reqs=num_reqs,
-                        uniform=desc.uniform_token_count is not None,
                         has_lora=has_lora,
                         attention_context_bucket=desc.attention_context_bucket,
                     )

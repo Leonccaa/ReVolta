@@ -1404,20 +1404,6 @@ def test_paged_wrapper_sharded_shared_key_matches_global(
             )
 
 
-@pytest.mark.parametrize(("tp", "fails"), [(2, False), (4, True)])
-def test_coalesce_needs_a_pair_sharded_index(tp: int, fails: bool) -> None:
-    from vllm.models.qwen4_exp.nvidia.ops.qsa_coalesce import (
-        require_dcp2_index_world,
-    )
-
-    config = _config(True, dcp=2, tp=tp)
-    if fails:
-        with pytest.raises(ValueError, match="split over 4 ranks"):
-            require_dcp2_index_world(config)
-    else:
-        require_dcp2_index_world(config)
-
-
 @pytest.mark.parametrize("max_seq", [4096, 6528, 8206, 12000, 16384, 100000])
 @pytest.mark.parametrize("rows", [512, 700, 1024, 1678, 2047, 2048, 6528])
 def test_cublas_route_does_not_flip_with_a_wider_split(rows: int, max_seq: int) -> None:

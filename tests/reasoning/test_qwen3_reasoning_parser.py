@@ -373,3 +373,34 @@ def test_reasoning_thinking_disabled(
 
     assert reasoning == expected_reasoning
     assert content == expected_content
+
+
+@pytest.mark.parametrize("prefix", ["", "Check the format. ", "\n", "  "])
+def test_think_opener_only_at_output_start(prefix):
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+    parser = ReasoningParserManager.get_reasoning_parser(parser_name)(tokenizer)
+    request = ChatCompletionRequest(model="test-model", messages=[])
+    text = prefix + "<think>Continue reasoning.</think>Answer."
+    expected = (prefix + "<think>" if prefix else "") + "Continue reasoning."
+    assert parser.extract_reasoning(text, request) == (expected, "Answer.")
+    ids = tokenizer.encode(text, add_special_tokens=False)
+    assert parser.extract_reasoning_with_token_ids(text, ids, request) == (
+        expected,
+        "Answer.",
+    )
+    reasoning, content = "", ""
+    for i in range(len(ids)):
+        previous = tokenizer.decode(ids[:i])
+        current = tokenizer.decode(ids[: i + 1])
+        delta = parser.extract_reasoning_streaming(
+            previous,
+            current,
+            current[len(previous) :],
+            ids[:i],
+            ids[: i + 1],
+            ids[i : i + 1],
+        )
+        if delta:
+            reasoning += delta.reasoning or ""
+            content += delta.content or ""
+    assert (reasoning, content) == (expected, "Answer.")

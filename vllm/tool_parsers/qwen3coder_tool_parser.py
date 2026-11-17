@@ -6,9 +6,11 @@ from collections.abc import Sequence
 from typing import Any
 
 import regex as re
+from openai.types.responses.function_tool import FunctionTool
 
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
+    ChatCompletionToolsParam,
 )
 from vllm.entrypoints.openai.engine.protocol import (
     DeltaFunctionCall,
@@ -33,6 +35,7 @@ from vllm.tool_parsers.structural_tag_registry import (
 )
 from vllm.tool_parsers.utils import (
     _TYPE_ALIASES,
+    _extract_tool_info,
     coerce_to_schema_type,
     extract_types_from_schema,
     find_tool_properties,
@@ -281,6 +284,14 @@ class Qwen3CoderToolParser(ToolParser):
                 return position
             search_idx = position + len(self.parameter_end_token)
 
+    def _is_declared_tool(self, name: str) -> bool:
+        tools = self.streaming_request.tools if self.streaming_request else self.tools
+        return not tools or any(
+            _extract_tool_info(tool)[0] == name
+            for tool in tools
+            if isinstance(tool, (ChatCompletionToolsParam, FunctionTool))
+        )
+
     def _parse_xml_function_call(
         self, function_call_str: str, *, warn_duplicates: bool = True
     ) -> ToolCall | None:
@@ -290,6 +301,8 @@ class Qwen3CoderToolParser(ToolParser):
         if end_index == -1:
             return None
         function_name = function_call_str[:end_index]
+        if not self._is_declared_tool(function_name):
+            return None
         param_config = find_tool_properties(self.tools, function_name)
         parameters = function_call_str[end_index + 1 :]
         param_dict = {}
@@ -339,8 +352,7 @@ class Qwen3CoderToolParser(ToolParser):
             ),
         )
 
-    @staticmethod
-    def _parse_json_function_call(payload: str) -> ToolCall | None:
+    def _parse_json_function_call(self, payload: str) -> ToolCall | None:
         """Parse the alternate Qwen/OpenCode JSON body inside ``<tool_call>``.
 
         Some Qwen coding prompts teach ``{"name": ..., "arguments": ...}``
@@ -359,6 +371,8 @@ class Qwen3CoderToolParser(ToolParser):
         name = raw_call.get("name")
         arguments = raw_call.get("arguments", {})
         if not isinstance(name, str) or not name:
+            return None
+        if not self._is_declared_tool(name):
             return None
         if isinstance(arguments, str):
             try:
@@ -404,7 +418,11 @@ class Qwen3CoderToolParser(ToolParser):
 
         # Back-off strategy if no tool_call tags found
         if len(raw_tool_calls) == 0:
-            raw_tool_calls = [model_output]
+            return re.findall(
+                r"^[^\S\n]*<function=(.*?)</function>",
+                model_output,
+                re.MULTILINE | re.DOTALL,
+            )
 
         raw_function_calls = []
         for tool_call in raw_tool_calls:
@@ -429,9 +447,10 @@ class Qwen3CoderToolParser(ToolParser):
         # surrounding <tool_call> tag. Non-streaming already falls back to this
         # format; keep streaming behavior consistent.
         if not positions:
-            func_idx = text.find(self.tool_call_prefix)
-            if func_idx != -1:
-                positions.append(func_idx)
+            positions = [
+                match.end() - len(self.tool_call_prefix)
+                for match in re.finditer(r"^[^\S\n]*<function=", text, re.MULTILINE)
+            ]
         return positions
 
     def _trailing_tool_marker_prefix(self, text: str) -> str:
@@ -585,6 +604,7 @@ class Qwen3CoderToolParser(ToolParser):
         model_output: str,
         request: ChatCompletionRequest,
     ) -> ExtractedToolCallInformation:
+        self.streaming_request = request
         # Quick check to avoid unnecessary processing
         if self.tool_call_prefix not in model_output:
             json_tool_calls = self._get_json_function_calls(model_output)
@@ -631,7 +651,7 @@ class Qwen3CoderToolParser(ToolParser):
 
             # Extract content before tool calls
             content_index = model_output.find(self.tool_call_start_token)
-            idx = model_output.find(self.tool_call_prefix)
+            idx = next(iter(self._tool_start_positions(model_output)), -1)
             content_index = content_index if content_index >= 0 else idx
             content = model_output[:content_index]  # .rstrip()
             valid_tool_calls = [tc for tc in tool_calls if tc is not None]
@@ -837,12 +857,24 @@ class Qwen3CoderToolParser(ToolParser):
                         # Keep an existing incremental header-only event. A
                         # new opener/body burst still drains in this delta.
                         break
-            if before == self._streaming_progress() or self.current_tool_index >= len(
-                self._tool_start_positions(current_text)
+            resume_content = (
+                self.current_tool_index > before[0]
+                and not self.is_tool_call_started
+                and self.current_function_name is not None
+                and not self._is_declared_tool(self.current_function_name)
+                and self.content_search_start < len(current_text)
+            )
+            if before == self._streaming_progress() or (
+                self.current_tool_index >= len(self._tool_start_positions(current_text))
+                and not resume_content
             ):
                 break
             # Revisit the buffer without replaying its prefix or resetting state.
-            previous_text = current_text
+            if resume_content:
+                previous_text = current_text[: self.content_search_start]
+                delta_text = current_text[self.content_search_start :]
+            else:
+                previous_text = current_text
             previous_token_ids = current_token_ids
         result.tool_calls = list(calls.values())
         if self.in_function and self._current_call_index() < len(
@@ -1015,13 +1047,8 @@ class Qwen3CoderToolParser(ToolParser):
             # Check if tool call is starting
             tool_start_candidates = [
                 pos
-                for pos in (
-                    current_text.find(
-                        self.tool_call_start_token, self.content_search_start
-                    ),
-                    current_text.find(self.tool_call_prefix, self.content_search_start),
-                )
-                if pos != -1
+                for pos in self._tool_start_positions(current_text)
+                if pos >= self.content_search_start
             ]
             tool_start = min(tool_start_candidates) if tool_start_candidates else -1
             if self.tool_call_start_token_id in delta_token_ids or tool_start != -1:
@@ -1045,7 +1072,11 @@ class Qwen3CoderToolParser(ToolParser):
                     return None
                 # Check if we're between tool calls - skip whitespace
                 if (
-                    current_text.rstrip().endswith(self.tool_call_end_token)
+                    (
+                        self.current_function_name is None
+                        or self._is_declared_tool(self.current_function_name)
+                    )
+                    and current_text.rstrip().endswith(self.tool_call_end_token)
                     and delta_text.strip() == ""
                 ):
                     # We just ended a tool call, skip whitespace
@@ -1074,6 +1105,14 @@ class Qwen3CoderToolParser(ToolParser):
                 tool_start_idx : tool_end_idx + len(self.tool_call_end_token)
             ]
 
+        # Bare functions must close before committing a tool header; otherwise
+        # finish_streaming can still return the buffered markup as content.
+        if (
+            not tool_text.startswith(self.tool_call_start_token)
+            and self.function_end_token not in tool_text
+        ):
+            return None
+
         # Looking for function header
         if not self.header_sent:
             if self.tool_call_prefix in tool_text:
@@ -1085,6 +1124,32 @@ class Qwen3CoderToolParser(ToolParser):
                 if func_end != -1:
                     # Found complete function name
                     self.current_function_name = tool_text[func_start:func_end]
+                    if not self._is_declared_tool(self.current_function_name):
+                        self.content_search_start = (
+                            tool_end_idx + len(self.tool_call_end_token)
+                            if tool_end_idx != -1
+                            else len(current_text)
+                        )
+                        next_tool_index = sum(
+                            pos < self.content_search_start
+                            for pos in tool_start_positions
+                        )
+                        self.skipped_tool_blocks += (
+                            next_tool_index - self.current_tool_index
+                        )
+                        self.current_tool_index = next_tool_index
+                        self.is_tool_call_started = False
+                        pending = self._trailing_tool_marker_prefix(
+                            current_text[: self.content_search_start]
+                        )
+                        content_end = self.content_search_start - len(pending)
+                        return DeltaMessage(
+                            content=current_text[
+                                max(
+                                    self._content_chars_sent, tool_start_idx
+                                ) : content_end
+                            ]
+                        )
                     self.current_tool_id = self._generate_tool_call_id()
                     self.header_sent = True
                     self.in_function = True

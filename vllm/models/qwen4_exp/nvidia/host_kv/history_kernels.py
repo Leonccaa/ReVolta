@@ -322,27 +322,6 @@ def append_wanted(gid, valid, Wanted, Touched, Count, M: tl.constexpr):
         tl.store(Touched + start + rank, gid, first & (start + rank < M))
 
 
-@triton.jit
-def append_wanted_bit(
-    gid, valid, Wanted, Touched, Count, M: tl.constexpr, BIT: tl.constexpr
-):
-    """``append_wanted`` for one mark phase of the ordered fused kernel.
-
-    Each phase owns one bit of ``Wanted`` and appends its first claims to its
-    own list, so a group the tail wants is listed ahead of selection-only
-    groups no matter which CTA runs first. ``collect_misses_ordered`` drops
-    the selection list's copy of a group both phases want.
-    """
-    old = tl.atomic_or(Wanted + gid, BIT, mask=valid, sem="relaxed")
-    first = valid & ((old & BIT) == 0)
-    rank = tl.cumsum(first.to(tl.int32)) - 1
-    count = tl.sum(first.to(tl.int32), 0)
-    if count > 0:
-        start = tl.atomic_add(Count, count, sem="relaxed")
-        tl.device_assert(start + count <= M, "host KV wanted bound exceeded")
-        tl.store(Touched + start + rank, gid, first & (start + rank < M))
-
-
 # ``ROW_OFFSET`` arrives from ``mark_decode``'s runtime row count, so it cannot
 # be a constant; the standalone launch keeps the default of zero.
 @triton.jit(do_not_specialize=["ROW_OFFSET"])
@@ -360,7 +339,6 @@ def mark_tail(
     RANK: tl.constexpr,
     IL: tl.constexpr,
     ROW_OFFSET=0,
-    ORDERED: tl.constexpr = False,
 ):
     """Keep each request's newest 32 local tokens resident (nine groups)."""
     req = tl.program_id(0).to(tl.int64) - ROW_OFFSET
@@ -372,10 +350,7 @@ def mark_tail(
     ready = tl.load(Ready + kernel_block * KBS + safe % KBS, valid, 1)
     tl.device_assert((~valid) | (ready != 0), "tail KV is not committed")
     gid = kernel_block * (KBS // 4) + (safe % KBS) // 4
-    if ORDERED:
-        append_wanted_bit(gid, valid, Wanted, Touched, Count, M, 1)
-    else:
-        append_wanted(gid, valid, Wanted, Touched, Count, M)
+    append_wanted(gid, valid, Wanted, Touched, Count, M)
 
 
 @triton.jit
@@ -398,9 +373,6 @@ def mark_selection(
     RANK: tl.constexpr,
     IL: tl.constexpr,
     QSA_COLUMNS: tl.constexpr,
-    ORDERED: tl.constexpr = False,
-    Sel=None,
-    SelCount=None,
 ):
     """Claim each selected group once; attention keeps every column."""
     row = tl.program_id(0).to(tl.int64)
@@ -426,23 +398,9 @@ def mark_selection(
             "host KV QSA group layout exceeded",
         )
         group = tl.max(tl.reshape(gid, (B // QSA_COLUMNS, QSA_COLUMNS)), 1)
-        if ORDERED:
-            append_wanted_bit(
-                tl.maximum(group, 0),
-                group >= 0,
-                Wanted,
-                Sel,
-                SelCount,
-                M,
-                2,
-            )
-        else:
-            append_wanted(tl.maximum(group, 0), group >= 0, Wanted, Touched, Count, M)
+        append_wanted(tl.maximum(group, 0), group >= 0, Wanted, Touched, Count, M)
     else:
-        if ORDERED:
-            append_wanted_bit(tl.maximum(gid, 0), valid, Wanted, Sel, SelCount, M, 2)
-        else:
-            append_wanted(tl.maximum(gid, 0), valid, Wanted, Touched, Count, M)
+        append_wanted(tl.maximum(gid, 0), valid, Wanted, Touched, Count, M)
 
 
 # ``ROWS`` is a runtime count and is relayed to ``mark_tail`` as its row offset.
@@ -468,17 +426,11 @@ def mark_decode(
     IL: tl.constexpr,
     QSA_COLUMNS: tl.constexpr,
     ROWS,
-    Sel=None,
-    SelCount=None,
-    ORDERED: tl.constexpr = False,
 ):
     """Independent tail and selection claims in one grid, then collect.
 
-    ORDERED (the ``REVOLTA_RESEARCH_HOST_DECODE_FAST_ORDERED`` sub-switch)
-    keeps the two phases' first claims in separate lists, the tail list
-    ahead of the selection list, so refill order and the Misses/victims
-    pairing match the two-kernel baseline. The phases stay fully parallel:
-    ordering comes from per-phase bits in ``Wanted``, not from scheduling.
+    The two phases stay fully parallel and share one Touched list; the
+    collect pass and refill pairing are the same as the two-kernel path.
     """
     if tl.program_id(0) < ROWS:
         mark_selection(
@@ -500,9 +452,6 @@ def mark_decode(
             RANK,
             IL,
             QSA_COLUMNS,
-            ORDERED,
-            Sel,
-            SelCount,
         )
     elif tl.program_id(1) == 0:
         mark_tail(
@@ -519,7 +468,6 @@ def mark_decode(
             RANK,
             IL,
             ROW_OFFSET=ROWS,
-            ORDERED=ORDERED,
         )
 
 
@@ -601,72 +549,6 @@ def gather_groups(
     if ALLOCATE and ((tl.program_id(0) == 0) & (count > 0)):
         last = tl.load(Victims + count - 1)
         tl.store(Hand, tl.where(last + 1 == S, 0, last + 1))
-
-
-@triton.jit
-def begin_gather_ordered(WantedCount, SelCount, MissCount, Clock):
-    """``begin_gather`` plus the selection segment of the ordered marks."""
-    tl.store(WantedCount, 0)
-    tl.store(SelCount, 0)
-    tl.store(MissCount, 0)
-    tl.store(Clock, tl.load(Clock) + 1)
-
-
-@triton.jit
-def clear_wanted_ordered(Wanted, Touched, Count, Sel, SelCount, B: tl.constexpr):
-    """``clear_wanted`` over both lists of the ordered fused mark kernel."""
-    i = tl.program_id(0).to(tl.int64) * B + tl.arange(0, B)
-    active = i < tl.load(Count)
-    gid = tl.load(Touched + i, active, 0)
-    tl.store(Wanted + gid, 0, active)
-    active = i < tl.load(SelCount)
-    gid = tl.load(Sel + i, active, 0)
-    tl.store(Wanted + gid, 0, active)
-
-
-@triton.jit
-def collect_misses_ordered(
-    Touched,
-    Count,
-    Sel,
-    SelCount,
-    Wanted,
-    Map,
-    Age,
-    Clock,
-    Misses,
-    MissCount,
-    M: tl.constexpr,
-    B: tl.constexpr,
-):
-    """``collect_misses`` over the ordered mark kernel's two Touched lists.
-
-    The logical order is the baseline's: every tail claim first, then the
-    selection claims whose group the tail does not also want (bit 1 of
-    ``Wanted`` marks tail-owned groups; the selection list can still hold a
-    copy because its CTA may have claimed first).
-    """
-    i = tl.program_id(0).to(tl.int64) * B + tl.arange(0, B)
-    tail = tl.load(Count)
-    active = i < tail + tl.load(SelCount)
-    in_sel = i >= tail
-    safe = tl.where(in_sel, i - tail, i)
-    gid = tl.where(
-        in_sel,
-        tl.load(Sel + safe, active & in_sel, 0),
-        tl.load(Touched + safe, active & ~in_sel, 0),
-    )
-    tail_owned = (tl.load(Wanted + gid, active & in_sel, 0) & 1) != 0
-    active &= ~(in_sel & tail_owned)
-    slot = tl.load(Map + gid, active, -1)
-    missing = active & (slot < 0)
-    tl.store(Age + tl.maximum(slot, 0), tl.load(Clock), active & (slot >= 0))
-    rank = tl.cumsum(missing.to(tl.int32)) - 1
-    count = tl.sum(missing.to(tl.int32), 0)
-    if count > 0:
-        start = tl.atomic_add(MissCount, count, sem="relaxed")
-        tl.device_assert(start + count <= M, "host KV miss bound exceeded")
-        tl.store(Misses + start + rank, gid, missing & (start + rank < M))
 
 
 @triton.jit

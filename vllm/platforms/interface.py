@@ -586,7 +586,10 @@ class Platform:
             kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
 
         kv_quant_mode = get_kv_quant_mode(cache_config.cache_dtype)
-        int8_planar = cache_config.cache_dtype == "int8"
+        from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD
+
+        # Planar formats store FP32 token/head scales in their own page areas.
+        planar = cache_config.cache_dtype in ("int8", FP8_E4M3_PER_TOKEN_HEAD.name)
 
         # Compute attention page size for 1 token
         if model_config.use_mla:
@@ -640,10 +643,8 @@ class Platform:
                 num_kv_heads=model_config.get_num_kv_heads(parallel_config),
                 head_size=model_config.get_head_size(),
                 dtype=kv_cache_dtype,
-                # Keep the existing E4M3 token grid for the first INT8 format.
-                kv_quant_mode=(
-                    get_kv_quant_mode("auto") if int8_planar else kv_quant_mode
-                ),
+                # Keep the existing E4M3 token grid for the planar formats.
+                kv_quant_mode=(get_kv_quant_mode("auto") if planar else kv_quant_mode),
             ).page_size_bytes
 
         # Compute mamba page size
@@ -747,7 +748,7 @@ class Platform:
                 cache_config.mamba_block_size = cache_config.block_size
 
         # Pad mamba page size to exactly match attention page size
-        if int8_planar:
+        if planar:
             # Evaluate a complete aligned page, never aligned bytes/token * B.
             attn_page_size = FullAttentionSpec(
                 block_size=cache_config.block_size,

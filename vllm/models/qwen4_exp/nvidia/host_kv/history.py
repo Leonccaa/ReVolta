@@ -7,7 +7,9 @@ one shared region whose rows contain every rank's main KV and logical index
 payload. A history ID is a binding, and a page can outlive an ID incarnation.
 The worker applies binding updates on the forward stream before using an ID.
 
-A layer's host view is ``[page, subpage, 2, kbs, H, D]``. Its strides retain
+A layer's host view is ``[page, subpage, 2, kbs, H, D]`` for legacy formats,
+or ``[page, subpage, member_bytes]`` for planar payload and scale regions.
+Its strides retain
 other ranks and index payload between rows. Layer views alias the registered
 backing, including when subpages cannot be flattened into a uniform stride.
 
@@ -49,6 +51,8 @@ from vllm.utils.torch_utils import (
     async_tensor_h2d,
     get_accelerator_view_from_cpu_tensor,
 )
+from vllm.v1.attention.kv_cache_view import KVCacheView, KVPageLayout, align_up
+from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD, INT8
 from vllm.v1.kv_offload.host.page_table import SealTicket
 from vllm.v1.kv_offload.host.region import HostRegionLayout
 
@@ -125,7 +129,7 @@ class HostHistoryShape:
     kv_heads: int
     head_dim: int
     dtype: torch.dtype
-    """Payload dtype: uint8 (E4M3) or float16."""
+    """Payload dtype: uint8 (E4M3), int8 (RNE) or float16."""
     hot_slots: int
     """Hot four-token groups per layer."""
     max_requests: int
@@ -162,6 +166,22 @@ class HostHistoryShape:
     so
     ``hot_slots == num_blocks * k`` and only DONATED IDs' slots are usable.
     0 keeps the static, separately allocated hot pool."""
+    layout_cache_dtype: str = "auto"
+    """The owning attention spec's format, independent of payload dtype."""
+
+    def page_layout(self, tokens: int) -> KVPageLayout:
+        return KVPageLayout(
+            tokens,
+            self.kv_heads,
+            self.head_dim,
+            self.head_dim,
+            self.dtype.itemsize,
+            planar_scales=self.planar_scales,
+        )
+
+    @property
+    def planar_scales(self) -> bool:
+        return self.layout_cache_dtype in (FP8_E4M3_PER_TOKEN_HEAD.name, "int8")
 
     def conservative_pass_geometry(self) -> tuple[int, int, list[int]]:
         """Planner inputs safe for any request assignment, without device reads.
@@ -220,11 +240,7 @@ class HostHistoryShape:
         return (
             self.kernel_blocks_per_block
             * self.num_layers
-            * 2
-            * self.kernel_block_tokens
-            * self.kv_heads
-            * self.head_dim
-            * torch.empty((), dtype=self.dtype).element_size()
+            * self.page_layout(self.kernel_block_tokens).page_size_bytes
         )
 
     def fixed_device_memory_bytes(self) -> dict[str, int]:
@@ -245,11 +261,7 @@ class HostHistoryShape:
         return history_fixed_memory_bytes(
             slots=self.hot_slots,
             num_layers=self.num_layers,
-            slot_bytes=self.num_layers
-            * 8
-            * self.kv_heads
-            * self.head_dim
-            * self.dtype.itemsize,
+            slot_bytes=self.num_layers * self.page_layout(4).page_size_bytes,
             max_requests=self.max_requests,
             selection_width=self.selection_width,
             max_write_rows=self.max_write_rows,
@@ -257,6 +269,7 @@ class HostHistoryShape:
             row_groups=self.row_groups,
             tail_groups=self.tail_groups,
             read_rows=self.read_rows,
+            page_layout=self.page_layout(4) if self.planar_scales else None,
         )
 
     def validate(self) -> None:
@@ -291,9 +304,9 @@ class HostHistoryShape:
             raise UnsupportedHostKVConfig(
                 "Host history kernel blocks must hold a multiple of four tokens"
             )
-        if self.dtype not in (torch.uint8, torch.float16):
+        if self.dtype not in (torch.uint8, torch.int8, torch.float16):
             raise UnsupportedHostKVConfig(
-                "Host history supports E4M3 (uint8) or FP16 main K/V"
+                "Host history supports E4M3 (uint8), RNE INT8 or FP16 main K/V"
             )
         if not 0 <= self.dcp_rank < self.dcp_world_size:
             raise ValueError("Host history DCP rank is out of range")
@@ -336,7 +349,11 @@ def _check_hot_alias(
     page boundary on a slot boundary (non-divisible strides are rejected at
     planning time)."""
     s = shape
-    slot_shape = (s.hot_slots, 2, 4, s.kv_heads, s.head_dim)
+    slot_shape = (
+        (s.hot_slots, s.page_layout(4).page_size_bytes)
+        if s.planar_scales
+        else (s.hot_slots, 2, 4, s.kv_heads, s.head_dim)
+    )
     storage = view.untyped_storage()
     if (
         view.shape != slot_shape
@@ -353,18 +370,32 @@ def _check_hot_alias(
 
 def hot_alias_view(index: torch.Tensor, shape: HostHistoryShape) -> torch.Tensor:
     """Alias ``[num_blocks, P_pad]`` index storage as ``[num_blocks*k, 2, 4,
-    H, D]`` hot slots. No copy: the result shares the storage."""
+    H, D]`` hot slots (planar: ``[num_blocks*k, slot_bytes]``).
+    No copy: the result shares the storage."""
     s = shape
     storage = index.untyped_storage()
     raw = torch.empty(0, dtype=torch.uint8, device=index.device)
     raw.set_(storage, 0, (storage.nbytes(),))
-    slot_bytes = 8 * s.kv_heads * s.head_dim * s.dtype.itemsize
+    slot_bytes = s.page_layout(4).page_size_bytes
     if storage.nbytes() != s.num_blocks * s.slots_per_block * slot_bytes:
         raise ValueError(
             f"Index storage of {storage.nbytes()} bytes is not {s.num_blocks} "
             f"pages of {s.slots_per_block} hot slots"
         )
+    if s.planar_scales:
+        return raw.view(s.dtype).view(s.hot_slots, slot_bytes)
     return raw.view(s.dtype).view(s.hot_slots, 2, 4, s.kv_heads, s.head_dim)
+
+
+def _planar_view(raw: torch.Tensor, tokens: int, s: HostHistoryShape) -> KVCacheView:
+    """Bind one member while retaining its physical row stride and offset."""
+    h, d = s.kv_heads, s.head_dim
+    carrier = raw.as_strided(
+        (raw.shape[0], 2, tokens, h, d + 4),
+        (raw.stride(0), tokens * h * (d + 4), h * (d + 4), d + 4, 1),
+    )
+    codec = INT8 if s.layout_cache_dtype == "int8" else FP8_E4M3_PER_TOKEN_HEAD
+    return KVCacheView.bind(carrier, codec, d)
 
 
 def _allocate_host(numel: int, dtype: torch.dtype) -> torch.Tensor:
@@ -426,7 +457,22 @@ class HostHistoryStore:
         s = shape
         kb, kbs, layers = s.num_kernel_blocks, s.kernel_block_tokens, s.num_layers
         h, d = s.kv_heads, s.head_dim
-        dims = (s.num_blocks, s.kernel_blocks_per_block, layers, 2, kbs, h, d)
+        dims: tuple[int, ...] = (
+            s.num_blocks,
+            s.kernel_blocks_per_block,
+            layers,
+            2,
+            kbs,
+            h,
+            d,
+        )
+        if s.planar_scales:
+            dims = (
+                s.num_blocks,
+                s.kernel_blocks_per_block,
+                layers,
+                s.page_layout(kbs).page_size_bytes,
+            )
         self.region = None
         self._registration_finalizer = None
         self.layers: list[HostHistoryLayer] = []
@@ -482,7 +528,11 @@ class HostHistoryStore:
             self.hot: torch.Tensor | list[torch.Tensor]
             if hot_views is None:
                 self.hot = torch.zeros(
-                    (layers, slots, 2, 4, h, d), dtype=s.dtype, device=device
+                    (layers, slots, s.page_layout(4).page_size_bytes)
+                    if s.planar_scales
+                    else (layers, slots, 2, 4, h, d),
+                    dtype=s.dtype,
+                    device=device,
                 )
             else:
                 self.hot = [_check_hot_alias(view, s, device) for view in hot_views]
@@ -520,7 +570,11 @@ class HostHistoryStore:
                 torch.arange(slots, **i32).unsqueeze(0).repeat(s.max_requests, 1)
             )
             self.staging = torch.empty(
-                (s.max_write_rows, 2, 1, h, d), dtype=s.dtype, device=device
+                (s.max_write_rows, s.page_layout(1).page_size_bytes)
+                if s.planar_scales
+                else (s.max_write_rows, 2, 1, h, d),
+                dtype=s.dtype,
+                device=device,
             )
             self.write_plan: WritePlan | None = None
             self.write_plan_all_prefill = False
@@ -528,7 +582,11 @@ class HostHistoryStore:
             self.write_stage = self.write_targets = None
             if s.staged_writethrough:
                 self.write_stage = torch.empty(
-                    (2 * s.max_write_rows, h, d), dtype=s.dtype, device=device
+                    (s._static_fixed_bytes()["write_stage"],)
+                    if s.planar_scales
+                    else (2 * s.max_write_rows, h, d),
+                    dtype=s.dtype,
+                    device=device,
                 )
                 self.write_targets = torch.empty(
                     (s.max_write_rows, 2), dtype=torch.int64, device=device
@@ -629,7 +687,8 @@ class HostHistoryStore:
 
     def host_page(self, block_id: int) -> torch.Tensor:
         """Pinned CPU bytes of one history block, all layers:
-        ``[ratio, layers, 2, kernel_block_tokens, H, D]``, contiguous."""
+        ``[ratio, layers, 2, kernel_block_tokens, H, D]`` for legacy formats,
+        ``[ratio, layers, member_bytes]`` for planar pages, contiguous."""
         if not 0 <= block_id < self.shape.num_blocks:
             raise IndexError(f"history block {block_id} is out of range")
         page = int(self.page_of_cpu[block_id])
@@ -799,6 +858,15 @@ class HostHistoryStore:
                 s.hot_slots, s.slots_per_block, kp, True,
             )  # fmt: skip
 
+    def _write_plan_kwargs(self) -> dict:
+        s = self.shape
+        if not s.planar_scales:
+            return {}
+        return dict(
+            page_layout=s.page_layout(s.kernel_block_tokens),
+            scale_offset=self.layers[0]._stage_scale_offset,
+        )
+
     def prepare_write(self, slots: Sequence[int]) -> None:
         """Plan once at step head from CPU page bindings, without a device read."""
         from .staged_write import plan_write
@@ -817,7 +885,8 @@ class HostHistoryStore:
             self.shape.kernel_blocks_per_block,
             self.shape.kernel_block_tokens,
             self.shape.kv_heads * self.shape.head_dim * item,
-            *(stride * item for stride in view.stride()[:3]),
+            *(stride * item for stride in self.layers[0]._host_strides[:3]),
+            **self._write_plan_kwargs(),
         )
         self.write_plan_kind = "fallback"
         targets = self._write_target_array(len(slots))
@@ -871,7 +940,7 @@ class HostHistoryStore:
         view = self.layers[0].host_view
         item = view.element_size()
         targets = self._write_target_array(padded_rows)
-        strides = view.stride()
+        strides = self.layers[0]._host_strides
         plan = plan_prefill_write(
             tables,
             indices,
@@ -890,6 +959,7 @@ class HostHistoryStore:
             world,
             rank,
             interleave,
+            **self._write_plan_kwargs(),
         )
         if plan is None:
             self.prepare_write(
@@ -973,7 +1043,48 @@ class HostHistoryLayer:
         self.host_device = store.host_device[:, :, index]
         self.host_view = store.host[:, :, index]
         self.hot = store.hot[index]
-        self.key_cache, self.value_cache = self.hot.unbind(1)
+        self._host_strides = self.host_view.stride()[:5]
+        self._copy_kwargs: dict[str, int] = {}
+        self._stage_scale_offset = 0
+        if s.planar_scales:
+            # Each subpage has a uniform history-row stride. Flattening all
+            # subpages would cross other workers and logical index payloads.
+            self.host_cache = [
+                _planar_view(self.host_view[:, sub], s.kernel_block_tokens, s)
+                for sub in range(s.kernel_blocks_per_block)
+            ]
+            self.host_device_cache = [
+                _planar_view(self.host_device[:, sub], s.kernel_block_tokens, s)
+                for sub in range(s.kernel_blocks_per_block)
+            ]
+            self.hot_cache = _planar_view(self.hot, 4, s)
+            self.key_cache, self.value_cache = self.hot_cache.key, self.hot_cache.value
+            self.key_scale_cache = self.hot_cache.key_scale
+            self.value_scale_cache = self.hot_cache.value_scale
+            self.staging_cache = _planar_view(store.staging, 1, s)
+            host_layout, hot_layout = (
+                s.page_layout(s.kernel_block_tokens),
+                s.page_layout(4),
+            )
+            self._host_strides = (
+                *self.host_view.stride()[:2],
+                host_layout.value_offset,
+                s.kv_heads * s.head_dim,
+                s.head_dim,
+            )
+            self._stage_scale_offset = align_up(
+                2 * s.max_write_rows * s.kv_heads * s.head_dim
+            )
+            self._copy_kwargs = dict(
+                PLANAR=True,
+                HOT_STRIDE=hot_layout.page_size_bytes,
+                HOST_K_SCALE=host_layout.key_scale_offset,
+                HOST_V_SCALE=host_layout.value_scale_offset,
+                HOT_K_SCALE=hot_layout.key_scale_offset,
+                HOT_V_SCALE=hot_layout.value_scale_offset,
+            )
+        else:
+            self.key_cache, self.value_cache = self.hot.unbind(1)
         self.group_to_slot = store.group_to_slot[index]
         self.slot_owner = store.slot_owner[index]
         self.age = store.age[index]
@@ -1012,6 +1123,45 @@ class HostHistoryLayer:
             # fusion; large prefill writes always retain the original path.
             decode = n <= s.read_rows and n <= s.max_requests * s.decode_rows
         key, value = key[:n], value[:n]
+        if s.planar_scales:
+            from vllm import _custom_ops as ops
+
+            stage = self.staging_cache
+            assert stage.key_scale is not None and stage.value_scale is not None
+            if store.device.type == "cuda":
+                ops.reshape_and_cache_flash(
+                    key,
+                    value,
+                    stage.key,
+                    stage.value,
+                    store.staging_slots[:n],
+                    s.layout_cache_dtype,
+                    k_scale,
+                    v_scale,
+                    k_scale_cache=stage.key_scale,
+                    v_scale_cache=stage.value_scale,
+                )
+            else:
+                # As for legacy CPU fixtures, encode with the torch reference.
+                codec = (
+                    INT8 if s.layout_cache_dtype == "int8" else FP8_E4M3_PER_TOKEN_HEAD
+                )
+                for source, payload, scales in (
+                    (key, stage.key, stage.key_scale),
+                    (value, stage.value, stage.value_scale),
+                ):
+                    encoded, scale = codec.encode(source)
+                    payload[:n, 0].copy_(encoded)
+                    scales[:n, 0].copy_(scale)
+            self.write_encoded(
+                stage.key[:n, 0],
+                stage.value[:n, 0],
+                slot_mapping,
+                key_scale=stage.key_scale[:n, 0],
+                value_scale=stage.value_scale[:n, 0],
+                decode=decode,
+            )
+            return
         k_stage, v_stage = store.staging[:n].unbind(1)
         if self.store.device.type == "cuda":
             from vllm._custom_ops import reshape_and_cache_flash
@@ -1048,6 +1198,8 @@ class HostHistoryLayer:
         value: torch.Tensor,
         slot_mapping: torch.Tensor,
         *,
+        key_scale: torch.Tensor | None = None,
+        value_scale: torch.Tensor | None = None,
         decode: bool = False,
     ) -> None:
         """Copy encoded ``[n, H, D]`` rows to their slots, then publish them.
@@ -1084,20 +1236,33 @@ class HostHistoryLayer:
             and torch.cuda.is_current_stream_capturing()
         ):
             plan = None
+        scale_kwargs: dict[str, object] = {}
+        if s.planar_scales:
+            assert key_scale is not None and value_scale is not None
+            scale_kwargs = dict(
+                KScale=key_scale,
+                VScale=value_scale,
+                KSS0=key_scale.stride(0),
+                KSS1=key_scale.stride(1),
+                VSS0=value_scale.stride(0),
+                VSS1=value_scale.stride(1),
+            )
         if plan is not None:
             if n > len(plan.targets):
                 raise ValueError("Write rows exceed the step plan")
             if store.write_plan_all_prefill and self._word_writer_eligible(key, value):
-                self._write_words(key, value, slot_mapping, staged=True)
+                self._write_words(key, value, slot_mapping, staged=True, **scale_kwargs)
             else:
                 hk.stage_slots[(n,)](
                     key, value, slot_mapping, self.host_device, self.hot,
                     store.write_stage, store.write_targets,
                     self.group_to_slot, store.page_of,
                     key.stride(0), key.stride(1), value.stride(0), value.stride(1),
-                    *self.host_view.stride()[:5], s.kernel_blocks_per_block,
+                    *self._host_strides, s.kernel_blocks_per_block,
                     s.kernel_block_tokens, s.kv_heads, s.head_dim,
                     triton.next_power_of_2(s.kv_heads * s.head_dim),
+                    STAGE_SCALE=self._stage_scale_offset,
+                    **self._copy_kwargs, **scale_kwargs,
                 )  # fmt: skip
             assert store.write_stage is not None
             if store.device.type == "cuda":
@@ -1130,10 +1295,11 @@ class HostHistoryLayer:
                 key, value, slot_mapping, self.host_device, self.hot,
                 self.group_to_slot, self.store.page_of,
                 key.stride(0), key.stride(1), value.stride(0),
-                value.stride(1), *self.host_view.stride()[:5],
+                value.stride(1), *self._host_strides,
                 s.kernel_blocks_per_block, s.kernel_block_tokens,
                 s.kv_heads, s.head_dim, triton.next_power_of_2(s.kv_heads * s.head_dim),
                 Ready=store.ready, COMMIT=fast,
+                **self._copy_kwargs, **scale_kwargs,
             )  # fmt: skip
             if fast:
                 return
@@ -1154,6 +1320,7 @@ class HostHistoryLayer:
         slots: torch.Tensor,
         *,
         staged: bool,
+        **scale_kwargs: object,
     ) -> None:
         """Use the word kernel for proven all-prefill batches only."""
         store, s = self.store, self.store.shape
@@ -1162,7 +1329,7 @@ class HostHistoryLayer:
         words = s.kv_heads * s.head_dim * s.dtype.itemsize // 8
         rows = max(1, 256 // triton.next_power_of_2(words))
         word_strides = tuple(
-            stride * s.dtype.itemsize // 8 for stride in self.host_view.stride()[:4]
+            stride * s.dtype.itemsize // 8 for stride in self._host_strides[:4]
         )
         hk.write_slots_vector[(triton.cdiv(n, rows),)](
             key.view(torch.int64), value.view(torch.int64), slots,
@@ -1174,6 +1341,8 @@ class HostHistoryLayer:
             *word_strides,
             s.kernel_blocks_per_block, s.kernel_block_tokens, words,
             triton.next_power_of_2(words), rows, staged,
+            H=s.kv_heads, STAGE_SCALE=self._stage_scale_offset,
+            **self._copy_kwargs, **scale_kwargs,
         )  # fmt: skip
 
     def _word_writer_eligible(self, key: torch.Tensor, value: torch.Tensor) -> bool:
@@ -1186,7 +1355,7 @@ class HostHistoryLayer:
             and key.stride(0) * item % 16 == value.stride(0) * item % 16 == 0
             and key.data_ptr() % 16 == value.data_ptr() % 16 == 0
             and self.host_view.data_ptr() % 16 == self.hot.data_ptr() % 16 == 0
-            and all(stride * item % 16 == 0 for stride in self.host_view.stride()[:4])
+            and all(stride * item % 16 == 0 for stride in self._host_strides[:4])
         )
 
     # ----- reads ----------------------------------------------------------
@@ -1325,12 +1494,13 @@ class HostHistoryLayer:
         hk.gather_groups[(store.gather_workers,)](
             self.host_device, self.hot, store.ready, store.miss_groups,
             store.miss_slots, store.miss_count, store.page_of,
-            *self.host_view.stride()[:5], s.kernel_blocks_per_block,
+            *self._host_strides, s.kernel_blocks_per_block,
             s.kernel_block_tokens, s.kv_heads, s.head_dim,
             triton.next_power_of_2(8 * s.kv_heads * s.head_dim),
             Map=self.group_to_slot, Owner=self.slot_owner, Age=self.age,
             Clock=self.clock, Victims=store.victim_slots, Hand=self.eviction_hand,
             S=s.hot_slots, M=m, ALLOCATE=fast,
+            **self._copy_kwargs,
         )  # fmt: skip
         if classed:
             assert counters is not None

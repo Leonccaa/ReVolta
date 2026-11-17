@@ -122,6 +122,135 @@ def test_forward_passes_arm_never_enters_the_union_path(monkeypatch, dcp):
     assert arms.store.union_scratch == {}
 
 
+@pytest.mark.parametrize("dcp", [(1, 0), (2, 0), (2, 1)])
+def test_planar_host_union_grouped_remainder_and_decode(monkeypatch, dcp):
+    from vllm.models.qwen4_exp.nvidia.ops import qsa as ops
+    from vllm.models.qwen4_exp.nvidia.ops import qsa_int8
+    from vllm.v1.attention.kv_cache_view import KVCacheView, bind_planar_kv_cache
+    from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD as codec
+
+    arms = UnionArms(e4m3=True, topk=8, rows_per_pass=9, dcp=dcp)
+    shape = dataclasses.replace(arms.store.shape, layout_cache_dtype=codec.name)
+    arms.store = HostHistoryStore(shape, ["attn"], device="cpu")
+    arms.store.bind_pages([(hid, 17 - hid) for hid in range(1, 17)])
+    arms.host = arms.store.layer("attn")
+    raw = torch.zeros(17 * shape.page_bytes, dtype=torch.uint8)
+    arms.paged = bind_planar_kv_cache(
+        raw,
+        num_blocks=17,
+        scheduler_block_size=16,
+        kernel_block_size=16,
+        num_heads=1,
+        head_size=16,
+        page_size_bytes=shape.page_bytes,
+        dtype=torch.uint8,
+    )
+    view = KVCacheView.bind(arms.paged, codec, 16)
+    arms.kv_dtype = arms.impl.kv_cache_dtype = codec.name
+    calls = []
+
+    def sparse(
+        q,
+        k,
+        v,
+        idx,
+        table,
+        req,
+        out,
+        *,
+        k_scale_cache,
+        v_scale_cache,
+        lse=None,
+        output_gate=None,
+        **kw,
+    ):
+        assert kw["kv_cache_dtype"] == codec.name
+        if k.data_ptr() == arms.host.key_cache.data_ptr():
+            assert k_scale_cache is arms.host.key_scale_cache
+            assert v_scale_cache is arms.host.value_scale_cache
+            calls.append(("rows", q.shape[0]))
+        qsa_int8.triton_attention(
+            q,
+            k,
+            v,
+            idx,
+            table,
+            req,
+            out,
+            k_scale_cache,
+            v_scale_cache,
+            lse=lse,
+            gate=None if output_gate is None else output_gate.view_as(q),
+            codec=codec,
+        )
+        return out
+
+    def grouped(q, k, v, idx, table, req, out, lse, dtype, ks, vs, **kw):
+        n = q.shape[0] // 8 * 8
+        if n:
+            if k.data_ptr() == arms.host.key_cache.data_ptr():
+                calls.append(("grouped", n))
+            sparse(
+                q[:n],
+                k,
+                v,
+                idx[:n],
+                table,
+                req[:n],
+                out[:n],
+                lse=lse[:n],
+                kv_cache_dtype=dtype,
+                **kw,
+            )
+        return n
+
+    monkeypatch.setattr(ops, "qsa_sparse_paged_attention", sparse)
+    monkeypatch.setattr(
+        ops, "qsa_dcp_sparse_paged_attention_sm70_grouped_page4", grouped
+    )
+
+    # Reference GPU pages come from source tensors, independently of final-host.
+    def write(req, positions):
+        key = torch.randn(len(positions), 1, 16, generator=arms.gen).half()
+        value = (
+            key.float() * torch.linspace(0.25, 4, len(positions))[:, None, None]
+        ).half()
+        slots = torch.tensor(
+            [
+                arms.blocks[req][p // (16 * arms.world)] * 16 + p // arms.world % 16
+                if p % arms.world == arms.rank
+                else -1
+                for p in positions
+            ],
+            dtype=torch.int64,
+        )
+        arms.host.write(
+            key, value, slots, codec.name, arms.layer._k_scale, arms.layer._v_scale
+        )
+        for source, payload, scales in (
+            (key, view.key, view.key_scale),
+            (value, view.value, view.value_scale),
+        ):
+            encoded, scale = codec.encode(source)
+            for row, slot in enumerate(slots.tolist()):
+                if slot >= 0:
+                    payload[slot // 16, slot % 16] = encoded[row]
+                    scales[slot // 16, slot % 16] = scale[row]
+        arms.length[req] = positions[-1] + 1
+
+    _sweep(monkeypatch, 1)
+    write(0, list(range(20)))
+    arms.step([(0, q) for q in range(19)])  # two leading groups + three rows
+    write(0, [20])
+    write(1, list(range(21)))
+    arms.step([(0, 20), (1, 20)])  # remap decode: hot hits and misses
+    arms.step([(0, 20)] + [(1, q) for q in range(10, 21)])
+    assert arms.store.union_stats["windows"] >= 5
+    assert ("rows", 3) in calls if dcp[0] > 1 else ("rows", 19) in calls
+    if dcp[0] > 1:
+        assert ("grouped", 16) in calls
+
+
 # --------------------------------------------------------------------------
 # Store level: one layer, both arms, explicit capacities.
 

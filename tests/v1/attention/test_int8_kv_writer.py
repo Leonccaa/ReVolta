@@ -11,7 +11,7 @@ pytest.importorskip("vllm.v1.attention.kv_cache_view", reason="v1 storage API ab
 
 from vllm import _custom_ops as ops
 from vllm.v1.attention.kv_cache_view import KVCacheView, bind_planar_kv_cache
-from vllm.v1.attention.kv_codecs import INT8
+from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD, INT8
 from vllm.v1.attention.ops.int8_kv import reference_int8_kv_write
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode
 from vllm.v1.worker.utils import KVBlockZeroer
@@ -19,9 +19,9 @@ from vllm.v1.worker.utils import KVBlockZeroer
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 
-def make_cache(device, heads=1, member=1):
+def make_cache(device, heads=1, member=1, codec=INT8):
     page = 848640 * heads
-    raw = torch.full((3 * page,), 77, dtype=torch.int8, device=device)
+    raw = torch.full((3 * page,), 77, dtype=codec.storage_dtype, device=device)
     carrier = bind_planar_kv_cache(
         raw,
         num_blocks=3,
@@ -32,8 +32,9 @@ def make_cache(device, heads=1, member=1):
         page_size_bytes=424320 * heads,
         member_index=member,
         member_count=2,
+        dtype=codec.storage_dtype,
     )
-    return raw, carrier, KVCacheView.bind(carrier, INT8, 256)
+    return raw, carrier, KVCacheView.bind(carrier, codec, 256)
 
 
 def write(k, v, view, slots):
@@ -44,7 +45,7 @@ def write(k, v, view, slots):
         view.key,
         view.value,
         slots,
-        "int8",
+        view.codec.name,
         view.key_scale,
         view.value_scale,
         **view.scale_kwargs,
@@ -146,3 +147,57 @@ def test_native_writer_zeroer_and_cpu_restore_full_owner():
     rebound = KVCacheView.bind(carrier, INT8, 256)
     assert rebound.key_scale.data_ptr() == view.key_scale.data_ptr()
     assert torch.equal(raw.cpu(), saved)
+
+
+def test_e4m3_writer_exact_bytes_and_graph_replay():
+    codec = FP8_E4M3_PER_TOKEN_HEAD
+    raw, _, view = make_cache("cuda", heads=3, codec=codec)
+    k = torch.randn(10, 6, 256, dtype=torch.float16, device="cuda")[:, ::2]
+    v = k.flip(-1)
+    k[0].zero_()
+    v[0].zero_()
+    k[1].fill_(448)
+    k[1, :, :5] = torch.tensor([0.0, -0.0, 1.0625, 1.1875, 2**-10], device="cuda")
+    v[2].fill_(-65504)
+    slots = torch.tensor([15, 16, 815, 816, 1631, 1632, -1, 17], device="cuda")
+
+    def oracle():
+        expected, _, ref = make_cache("cpu", heads=3, codec=codec)
+        for row, slot in enumerate(slots.cpu().tolist()):
+            if slot < 0:
+                continue
+            page, token = divmod(slot, ref.key.shape[1])
+            for source, payload, scales in (
+                (k, ref.key, ref.key_scale),
+                (v, ref.value, ref.value_scale),
+            ):
+                q, s = codec.encode(source[row].cpu())
+                payload[page, token].copy_(q)
+                scales[page, token].copy_(s)
+        return expected
+
+    expected = oracle()
+    write(k, v, view, slots)
+    assert torch.equal(raw.cpu(), expected)  # scales, peers and padding included
+    raw.fill_(77)
+    for row in range(slots.numel()):
+        write(k[row : row + 1], v[row : row + 1], view, slots[row : row + 1])
+    assert torch.equal(raw.cpu(), expected)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        write(k, v, view, slots)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        write(k, v, view, slots)
+    for seed in [0, 1, 9]:
+        torch.manual_seed(seed)
+        k.normal_()
+        v.normal_()
+        slots.copy_(torch.randperm(2448, device="cuda")[:8])
+        raw.fill_(77)
+        expected = oracle()
+        graph.replay()
+        assert torch.equal(raw.cpu(), expected)

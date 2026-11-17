@@ -24,7 +24,8 @@ Use `--dtype half`: V100 has no BF16 support.
 
 ## KV scales and draft selection
 
-E4M3 KV scales belong to a specific checkpoint revision. Keep
+For explicit `fp8` / `fp8_e4m3`, calibrated scalar E4M3 KV scales belong to a
+specific checkpoint revision. Keep
 `VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES=1` enabled: missing target scales then
 reject startup. Without it, missing target scales fall back to unit scale
 with a warning. That fallback is unvalidated and can saturate E4M3 values.
@@ -41,6 +42,15 @@ target-scale checking. Use the draft's own scales or set its
 
 DFlash2 drafts do not need these K/V scales. Their own configuration is in
 [DFlash2 speculative decoding](dflash2.md).
+The launch examples below explicitly select scalar `fp8_e4m3` for target and
+MTP; the strict-scale instructions apply to that recipe. Omitting the target
+CLI option selects `auto`, which now uses dynamic planar `fp8_per_token_head`
+for eligible QSA requests even when checkpoint scales exist. That format needs
+no KV scale overlay. MTP inherits it when draft dtype is omitted, or accepts
+the same explicit format; mixing planar target and scalar MTP is rejected.
+SM70 DFlash/DFlash2 still defaults to FP16 draft KV. See the
+[KV dtype comparison](configuration.md#launch-options) for eligibility and ABI.
+
 When target E4M3 scales are unavailable, FP16 KV needs no calibration but
 holds roughly half as many KV tokens at the same memory budget. INT8 KV
 computes per-token, per-head scales at runtime; in the supported speculative
@@ -249,12 +259,14 @@ vllm serve /data/revolta/views/fp4-local/target-512k \
 ## Weight and KV formats
 
 V100 stores compressed weights and KV, then converts them to FP16 for computation.
-The default is AWQ g32 with E4M3 KV.
+The documented reference recipe is AWQ g32 with explicit scalar E4M3 KV.
+The CLI default `auto` instead selects dynamic planar E4M3 for eligible QSA.
 
 ## Quantization comparison
 
 No ReVolta version is specified for these measurements. See
 [Quality measurements](performance.md#quality-measurements) for the datasets, reference and estimator.
+The E4M3 results below use the original scalar format, not planar E4M3.
 
 | Format | KL vs BF16 (reference below) | Top-1 agreement |
 | --- | ---: | ---: |
@@ -268,7 +280,8 @@ The first four rows use the same base BF16 reference; the Uncensored rows there 
 
 ## E4M3 KV
 
-Use the calibrated per-layer K/V scales included in the checkpoint. Keep
+For explicit scalar `fp8` / `fp8_e4m3`, use the calibrated per-layer K/V scales
+included in the checkpoint. Keep
 `VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES=1` enabled to reject missing scales.
 Without it, the loader warns and falls back to 1.0.
 

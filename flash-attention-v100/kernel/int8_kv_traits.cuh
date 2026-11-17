@@ -40,6 +40,10 @@ struct KVStorageTraits<KV_CACHE_DTYPE_INT8> {
   static constexpr int vector_alignment = 4;
 };
 
+template <>
+struct KVStorageTraits<KV_CACHE_DTYPE_FP8_E4M3_PER_TOKEN_HEAD>
+    : KVStorageTraits<KV_CACHE_DTYPE_FP8_E4M3> {};
+
 // Borrowed scale addresses use element strides from the public cache view.
 // No algorithm infers an inline/planar layout from a payload dtype.
 template <typename Scalar>
@@ -112,7 +116,9 @@ template <int KV_DTYPE, bool E4M3_BITS = false>
 struct KVCodecTraits : KVStorageTraits<KV_DTYPE>,
                        KVReader<KV_DTYPE, E4M3_BITS> {
   static constexpr int vector_elements = 8;
-  static constexpr bool per_token_head = KV_DTYPE == KV_CACHE_DTYPE_INT8;
+  static constexpr bool per_token_head =
+      KV_DTYPE == KV_CACHE_DTYPE_INT8 ||
+      KV_DTYPE == KV_CACHE_DTYPE_FP8_E4M3_PER_TOKEN_HEAD;
   static constexpr bool fp32_partials =
       per_token_head || KV_DTYPE == KV_CACHE_DTYPE_FP8_E4M3;
   static constexpr bool paired_byte_load =

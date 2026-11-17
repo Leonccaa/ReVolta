@@ -9,6 +9,14 @@ outside the store.
 This module needs neither Torch nor a CUDA context.
 """
 
+from __future__ import annotations
+
+from dataclasses import replace
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from vllm.v1.attention.kv_cache_view import KVPageLayout
+
 # 512 selected groups plus one open group per row; the newest 32 tokens of a
 # request touch at most nine four-token groups.
 QSA_ROW_GROUPS = 513
@@ -57,6 +65,7 @@ def history_fixed_memory_bytes(
     tail_groups: int = TAIL_GROUPS,
     read_rows: int | None = READ_ROWS,
     staged_writethrough: bool = False,
+    page_layout: KVPageLayout | None = None,
 ) -> dict[str, int]:
     """Exact bytes by tensor name; ``slot_bytes`` includes every layer.
 
@@ -88,8 +97,20 @@ def history_fixed_memory_bytes(
         "staging_slots": 8 * max_write_rows,
     }
 
+    if page_layout is not None:
+        parts["staging"] = (
+            max_write_rows * replace(page_layout, block_size=1).page_size_bytes
+        )
+
     if staged_writethrough:
         parts["write_stage"] = parts["staging"]
+        if page_layout is not None:
+            from vllm.v1.attention.kv_cache_view import align_up
+
+            rows = 2 * max_write_rows * page_layout.num_heads
+            parts["write_stage"] = align_up(
+                rows * page_layout.head_size * page_layout.element_bytes
+            ) + align_up(rows * 4)
         parts["write_targets"] = 16 * max_write_rows
     return parts
 
@@ -153,6 +174,7 @@ def shared_history_memory_bytes(
     read_rows: int = READ_ROWS,
     shadow_bytes_per_group: int = 1,
     counter_bytes: int = 64,
+    page_layout: KVPageLayout | None = None,
 ) -> tuple[dict[str, int], dict[str, int]]:
     """Frozen v2 shared-arena bill: per-ID and fixed device bytes.
 
@@ -201,6 +223,7 @@ def shared_history_memory_bytes(
         selection_width=selection_width,
         max_write_rows=max_write_rows,
         read_rows=read_rows,
+        page_layout=page_layout,
     )
     fixed = {
         name: size

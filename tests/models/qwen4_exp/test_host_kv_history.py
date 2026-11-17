@@ -435,3 +435,156 @@ def test_m6b_leased_pages_restore_into_history_ids_without_transferring_ownershi
     assert all(not page._closed for page in leases.pages)
     leases.release()
     assert not pool._leases
+
+
+def _planar_history_roundtrip(device, rank):
+    from uuid import uuid4
+
+    from vllm.v1.attention.kv_codecs import INT8 as codec
+    from vllm.v1.kv_offload.host.region import HostRegionLayout
+
+    shape = _shape(
+        blocks=6,
+        requests=1,
+        kernel_blocks_per_block=3,
+        kernel_block_tokens=8,
+        kv_heads=2,
+        head_dim=256,
+        dtype=codec.storage_dtype,
+        dcp_world_size=2,
+        dcp_rank=rank,
+        interleave=2,
+        layout_cache_dtype=codec.name,
+    )
+    layout = HostRegionLayout(uuid4().hex, 8, 2, shape.page_bytes, (96,))
+    owner = layout.open(None)
+    store = HostHistoryStore(
+        shape,
+        ["l0", "l1"],
+        device=device,
+        region_layout=layout,
+        rank=rank,
+    )
+    layer = store.layer("l1")
+
+    def compare(actual, expected):
+        assert actual.shape == expected.shape, "INCOMPLETE"
+        assert torch.equal(_bits(actual.cpu()), _bits(expected.cpu())), "FAIL"
+
+    try:
+        store.region._base.view(torch.uint8).fill_(0xA5)
+        expected_region = store.region._base.view(torch.uint8).clone()
+        expected_host = expected_region.as_strided(
+            layer.host_view.shape,
+            layer.host_view.stride(),
+            layer.host_view.storage_offset(),
+        )
+        store.bind_pages([(1, 4)])
+        store.begin_blocks([1])
+        expected_rows: dict[int, tuple[torch.Tensor, ...]] = {}
+        for step, length in enumerate((39, 39, 7)):
+            store.decode_fast = step > 0
+            if step == 2:
+                # Cancel/reuse: retire residency and readiness before a short tail.
+                store.bind_pages([(1, 2)])
+                store.begin_blocks([1])
+                assert not store.ready[24:48].any()
+                assert (layer.group_to_slot[6:12] == -1).all()
+                expected_rows.clear()
+            positions = range(35, 39) if step == 1 else range(length)
+            source = torch.arange(len(positions) * 512).reshape(-1, 2, 256)
+            key = ((source % 997 - 498).float() * (step + 1) / 17).half().to(device)
+            value = (key.float() * -0.375 + step).half()
+            key[0].zero_()
+            slots = torch.tensor(
+                [
+                    24 + t // 4 * 2 + t % 2 if t % 4 // 2 == rank else -1
+                    for t in positions
+                ],
+                dtype=torch.int64,
+                device=device,
+            )
+            encoded = [*codec.encode(key.cpu()), *codec.encode(value.cpu())]
+            layer.write(
+                key,
+                value,
+                slots,
+                codec.name,
+                torch.tensor(9.0, device=device),
+                torch.tensor(11.0, device=device),
+                decode=step == 1,
+            )
+            event = store.fence()
+            if event is not None:
+                event.synchronize()
+            page = 2 if step == 2 else 4
+            page_layout = shape.page_layout(8)
+            for row, slot in enumerate(slots.tolist()):
+                if slot < 0:
+                    continue
+                kb, off = divmod(slot, 8)
+                expected_rows[slot] = (
+                    encoded[0][row],
+                    encoded[2][row],
+                    encoded[1][row],
+                    encoded[3][row],
+                )
+                for offset, data in zip(
+                    (
+                        off * 512,
+                        page_layout.value_offset + off * 512,
+                        page_layout.key_scale_offset + off * 8,
+                        page_layout.value_scale_offset + off * 8,
+                    ),
+                    expected_rows[slot],
+                ):
+                    raw = _bits(data).flatten()
+                    expected_host[page, kb % 3, offset : offset + raw.numel()] = raw
+            compare(store.region._base, expected_region)
+            nlocal = len(expected_rows)
+            selection = torch.tensor(
+                [[0, 4, nlocal - 1, -1]], dtype=torch.int32, device=device
+            )
+            if nlocal < 5:
+                selection[0, 1] = 0
+            layer.gather(
+                selection,
+                torch.zeros(1, dtype=torch.int32, device=device),
+                torch.tensor([[3, 4, 5]], dtype=torch.int32, device=device),
+                torch.tensor([length], dtype=torch.int32, device=device),
+                decode=step > 0,
+            )
+            caches = (
+                layer.key_cache,
+                layer.value_cache,
+                layer.key_scale_cache,
+                layer.value_scale_cache,
+            )
+            for hot_slot, gid in enumerate(layer.slot_owner.tolist()):
+                if gid < 0:
+                    continue
+                for token in range(4):
+                    expected = expected_rows.get(gid * 4 + token)
+                    for i, cache in enumerate(caches):
+                        actual = cache[hot_slot, token]
+                        compare(
+                            actual,
+                            expected[i] if expected else torch.zeros_like(actual),
+                        )
+        # The same comparison must detect one changed final-host byte and missing data.
+        actual = layer.host_view[2, 0]
+        expected = expected_host[2, 0]
+        actual[0] ^= 1
+        with pytest.raises(AssertionError, match="FAIL"):
+            compare(actual, expected)
+        actual[0] ^= 1
+        with pytest.raises(AssertionError, match="INCOMPLETE"):
+            compare(actual[: page_layout.value_scale_offset], expected)
+    finally:
+        store.close()
+        owner.cleanup()
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_planar_write_gather_tail_and_recycle(rank):
+    _planar_history_roundtrip("cpu", rank)

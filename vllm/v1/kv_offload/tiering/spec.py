@@ -131,15 +131,15 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             if self.persistent_layout is None:
                 self.persistent_layout = {"kv_compat_epoch": KV_COMPAT_EPOCH}
             self.persistent_layout["kv_storage"] = kv_storage_metadata(
-                kv_cache_config, vllm_config.cache_config.cache_dtype
+                kv_cache_config, vllm_config.cache_config.cache_dtype, vllm_config
             )
             if any(
-                tier.get("type") in FS_TIER_TYPES
+                tier.get("type") in FS_TIER_TYPES and tier.get("type") != "revolta_fs"
                 for tier in self.secondary_tier_configs
             ):
                 raise ValueError(
-                    "INT8 v1 SSD requires aligned FS framing; raw O_DIRECT pages "
-                    "are unsupported. Use CPU offload until FS framing is integrated."
+                    "Planar KV SSD requires aligned FS framing via revolta_fs; "
+                    "raw O_DIRECT pages are unsupported."
                 )
 
         # Scheduler-side mmap (rank=None); kept for cleanup

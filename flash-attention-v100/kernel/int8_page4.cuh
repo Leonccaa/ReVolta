@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) 2025, D.Skryabin
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-// INT8-only specialization adapted from 1CatAI/1Cat-vLLM #1193/#1194.
+// Row-scaled specialization adapted from 1CatAI/1Cat-vLLM #1193/#1194.
 // Compile separately so legacy templates and PTX remain unchanged.
 #pragma once
 #include "int8_kv_traits.cuh"
@@ -1539,22 +1539,24 @@ inline int8_kv::KVScaleView bind(const at::Tensor& q, const at::Tensor& k,
   TORCH_CHECK(q.is_cuda() && q.scalar_type() == at::kHalf && q.dim() == 3 &&
                   q.size(1) == 6 && q.size(2) == 256 && q.is_contiguous(),
               "INT8 page4 requires contiguous CUDA FP16 [M,6,256] queries");
-  TORCH_CHECK(k.dim() == 4 && k.sizes() == v.sizes() &&
-                  k.scalar_type() == at::kChar &&
-                  v.scalar_type() == at::kChar && k.size(0) > 0 &&
-                  k.size(1) == 16 && k.size(2) == 1 && k.size(3) == 256 &&
-                  owner_span == 4 && k.stride(3) == 1 && v.stride(3) == 1 &&
-                  k.stride(1) == 256 && v.stride(1) == 256,
-              "INT8 page4 requires v1 owner pages and explicit mapping (4,4)");
+  TORCH_CHECK(
+      k.dim() == 4 && k.sizes() == v.sizes() &&
+          (k.scalar_type() == at::kChar || k.scalar_type() == at::kByte) &&
+          v.scalar_type() == k.scalar_type() && k.size(0) > 0 &&
+          k.size(1) == owner_span * 4 && k.size(2) == 1 && k.size(3) == 256 &&
+          owner_span > 0 && k.stride(3) == 1 && v.stride(3) == 1 &&
+          k.stride(1) == 256 && v.stride(1) == 256,
+      "Row-scaled page4 requires owner pages and explicit b/4 mapping");
   int8_kv::KVScaleView view;
   view.pages = {owner_span, 4};
   const at::Tensor planes[] = {sk, sv};
   int8_kv::KVScalePlane* targets[] = {&view.key, &view.value};
   for (int i = 0; i < 2; ++i) {
     const auto& s = planes[i];
-    TORCH_CHECK(s.sizes() == at::IntArrayRef({k.size(0), 16, 1}) &&
-                    s.scalar_type() == at::kFloat && s.device() == q.device(),
-                "INT8 page4 requires explicit CUDA FP32 [pages,16,1] scales");
+    TORCH_CHECK(
+        s.sizes() == at::IntArrayRef({k.size(0), k.size(1), 1}) &&
+            s.scalar_type() == at::kFloat && s.device() == q.device(),
+        "Row-scaled page4 requires explicit CUDA FP32 [pages,b,1] scales");
     *targets[i] = {s.data_ptr<float>(), s.stride(0), s.stride(1),
                    s.stride(2),         owner_span,  4};
   }
@@ -1570,14 +1572,17 @@ inline void metadata(const at::Tensor& t, const at::Tensor& q,
 }
 }  // namespace int8_page4
 
-int64_t flash_attention_int8_page4_abi_version() { return 1; }
+int64_t flash_attention_int8_page4_abi_version() { return 2; }
 
-at::Tensor flash_attention_decode_int8_page4(
-    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
-    at::Tensor& out, const at::Tensor& table, const at::Tensor& lengths,
-    at::Tensor& partial, at::Tensor& maxima, at::Tensor& sums,
-    const at::Tensor& active, const at::Tensor& sk, const at::Tensor& sv,
-    int64_t owner_span, double softmax_scale) {
+template <int KV_DTYPE>
+at::Tensor decode_row_scaled_page4(const at::Tensor& q, const at::Tensor& k,
+                                   const at::Tensor& v, at::Tensor& out,
+                                   const at::Tensor& table,
+                                   const at::Tensor& lengths,
+                                   at::Tensor& partial, at::Tensor& maxima,
+                                   at::Tensor& sums, const at::Tensor& active,
+                                   const at::Tensor& sk, const at::Tensor& sv,
+                                   int64_t owner_span, double softmax_scale) {
   const auto scales = int8_page4::bind(q, k, v, sk, sv, owner_span);
   for (const auto& t : {table, lengths, active})
     int8_page4::metadata(t, q, at::kInt);
@@ -1601,8 +1606,8 @@ at::Tensor flash_attention_decode_int8_page4(
   constexpr size_t bytes = sizeof(XQATCSmem256WideLayout<true, false>);
   auto kernel =
       int8_page4::flash_attention_decode_xqa_tc_partition_kernel_256_wide<
-          256, 6, true, threads, 1, 4, false, false, 3, kXQARouteAllSeqLens,
-          false, true, true, false, float>;
+          256, 6, true, threads, 1, 4, false, false, KV_DTYPE,
+          kXQARouteAllSeqLens, false, true, true, false, float>;
   C10_CUDA_CHECK(cudaFuncSetAttribute(
       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
   auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -1622,11 +1627,14 @@ at::Tensor flash_attention_decode_int8_page4(
   return out;
 }
 
-at::Tensor flash_attention_grouped_sparse_int8_page4(
-    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
-    at::Tensor& out, const at::Tensor& table, const at::Tensor& masks,
-    const at::Tensor& lengths, at::Tensor& lse, const at::Tensor& sk,
-    const at::Tensor& sv, int64_t owner_span, double softmax_scale) {
+template <int KV_DTYPE>
+at::Tensor grouped_row_scaled_page4(const at::Tensor& q, const at::Tensor& k,
+                                    const at::Tensor& v, at::Tensor& out,
+                                    const at::Tensor& table,
+                                    const at::Tensor& masks,
+                                    const at::Tensor& lengths, at::Tensor& lse,
+                                    const at::Tensor& sk, const at::Tensor& sv,
+                                    int64_t owner_span, double softmax_scale) {
   const auto scales = int8_page4::bind(q, k, v, sk, sv, owner_span);
   int8_page4::metadata(table, q, at::kInt);
   int8_page4::metadata(masks, q, at::ScalarType::UInt32);
@@ -1653,7 +1661,8 @@ at::Tensor flash_attention_grouped_sparse_int8_page4(
     using Output = decltype(tag);
     auto kernel =
         int8_page4::flash_attention_grouped_verify_e5m2_partial_kernel<
-            8, false, 4, false, false, false, 3, true, Output, false, true>;
+            8, false, 4, false, false, false, KV_DTYPE, true, Output, false,
+            true>;
     C10_CUDA_CHECK(cudaFuncSetAttribute(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
     kernel<<<dim3(1, 1, groups), kGroupedVerifyThreads, bytes,
@@ -1671,4 +1680,37 @@ at::Tensor flash_attention_grouped_sparse_int8_page4(
     launch(__half{});
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
+}
+
+at::Tensor flash_attention_decode_int8_page4(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+    at::Tensor& out, const at::Tensor& table, const at::Tensor& lengths,
+    at::Tensor& partial, at::Tensor& maxima, at::Tensor& sums,
+    const at::Tensor& active, const at::Tensor& sk, const at::Tensor& sv,
+    int64_t owner_span, double softmax_scale) {
+  if (k.scalar_type() == at::kByte) {
+    return decode_row_scaled_page4<
+        int8_kv::KV_CACHE_DTYPE_FP8_E4M3_PER_TOKEN_HEAD>(
+        q, k, v, out, table, lengths, partial, maxima, sums, active, sk, sv,
+        owner_span, softmax_scale);
+  }
+  return decode_row_scaled_page4<int8_kv::KV_CACHE_DTYPE_INT8>(
+      q, k, v, out, table, lengths, partial, maxima, sums, active, sk, sv,
+      owner_span, softmax_scale);
+}
+
+at::Tensor flash_attention_grouped_sparse_int8_page4(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+    at::Tensor& out, const at::Tensor& table, const at::Tensor& masks,
+    const at::Tensor& lengths, at::Tensor& lse, const at::Tensor& sk,
+    const at::Tensor& sv, int64_t owner_span, double softmax_scale) {
+  if (k.scalar_type() == at::kByte) {
+    return grouped_row_scaled_page4<
+        int8_kv::KV_CACHE_DTYPE_FP8_E4M3_PER_TOKEN_HEAD>(
+        q, k, v, out, table, masks, lengths, lse, sk, sv, owner_span,
+        softmax_scale);
+  }
+  return grouped_row_scaled_page4<int8_kv::KV_CACHE_DTYPE_INT8>(
+      q, k, v, out, table, masks, lengths, lse, sk, sv, owner_span,
+      softmax_scale);
 }

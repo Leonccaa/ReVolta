@@ -24,6 +24,7 @@ from vllm.models.qwen4_exp.nvidia.ops.sm70_qsa_tuning import (
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
+from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD, INT8, resolve_kv_codec
 
 from .qsa_request_segments import (
     qsa_mqa_request_segments_paged,
@@ -147,11 +148,11 @@ def _qsa_grouped_page4_supported(
     flash_attn_v100_cuda,
     kv_cache_dtype: str,
 ) -> bool:
-    if kv_cache_dtype == "int8":
+    if resolve_kv_codec(kv_cache_dtype) in (INT8, FP8_E4M3_PER_TOKEN_HEAD):
         capability = getattr(flash_attn_v100_cuda, "int8_page4_abi_version", None)
         return (
             callable(capability)
-            and capability() == 1
+            and capability() == 2
             and callable(
                 getattr(flash_attn_v100_cuda, "grouped_sparse_int8_page4_fwd", None)
             )
@@ -2895,7 +2896,8 @@ def qsa_dcp_sparse_paged_attention_sm70_grouped_page4(
     multiple of eight, or 0 when the route does not apply. The caller runs the
     remaining rows through ``qsa_sparse_paged_attention``.
     """
-    if kv_cache_dtype == "int8":
+    codec = resolve_kv_codec(kv_cache_dtype)
+    if codec in (INT8, FP8_E4M3_PER_TOKEN_HEAD):
         from .qsa_int8 import dcp_grouped
 
         return dcp_grouped(
@@ -2909,6 +2911,7 @@ def qsa_dcp_sparse_paged_attention_sm70_grouped_page4(
             lse,
             k_scale_cache,
             v_scale_cache,
+            codec=codec,
         )
 
     heads = 6
@@ -3258,7 +3261,8 @@ def qsa_sparse_paged_attention(
     result. Apply output gating after the cross-rank merge, not per rank.
     """
 
-    if kv_cache_dtype == "int8":
+    codec = resolve_kv_codec(kv_cache_dtype)
+    if codec in (INT8, FP8_E4M3_PER_TOKEN_HEAD):
         from .qsa_int8 import sparse_attention
 
         return sparse_attention(
@@ -3275,6 +3279,7 @@ def qsa_sparse_paged_attention(
             k_scale_cache,
             v_scale_cache,
             lse,
+            codec=codec,
         )
 
     if not q.is_cuda or not HAS_TRITON:

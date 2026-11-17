@@ -165,6 +165,9 @@ vllm serve /data/revolta/views/target-512k \
 
 Notes:
 
+- This recipe explicitly selects calibrated scalar `fp8_e4m3` for target and
+  MTP. The CLI default `auto` now selects dynamic planar E4M3 for eligible QSA;
+  see the [KV dtype comparison](configuration.md#launch-options) before changing it.
 - **Startup** takes roughly 10–15 minutes: weight and PLE loading, `torch.compile`
   and CUDA graph capture. Later starts reuse the compile cache. After an upgrade that
   cache can still be incomplete: keeping the 0.1.3 cache, MTP4 and DFlash2 each compiled

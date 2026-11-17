@@ -8,6 +8,7 @@ host row next to the target's index pages.
 """
 
 from collections import Counter
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +19,7 @@ from vllm.v1.core.kv_cache_utils import (
     get_kv_cache_groups,
     get_long_context_geometry,
 )
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode
 from vllm.v1.kv_offload.host.region import host_region_layout
 
 from .long_context_kv_utils import (
@@ -188,6 +190,35 @@ def test_sharded_draft_main_is_one_more_host_layer():
     # GPU history pays for the draft index, not for its main K/V.
     gpu = plan.history_bytes_per_block - base_plan.history_bytes_per_block
     assert 0 < gpu < layer_page
+
+
+@pytest.mark.parametrize("placement", ["gpu", "host"])
+def test_planar_mtp_main_carries_scales_in_existing_component(placement):
+    specs = {
+        name: (
+            replace(spec, kv_quant_mode=KVQuantMode.FP8_E4M3_PLANAR)
+            if type(spec) is FullAttentionSpec
+            else spec
+        )
+        for name, spec in mtp_specs(shard_index=True, shard_draft=True).items()
+    }
+    _, cfg = build(settings(draft_main_placement=placement), specs)
+    plan = cfg.long_context_plan
+    geo = plan.geometry
+    layout = host_region_layout(cfg, "test-planar-mtp")
+    draft_bytes = specs[DRAFT].block_size * 520
+    assert specs[DRAFT].page_size_bytes == draft_bytes
+    assert geo.hot_slot_bytes == len(cfg.host_kv_layers) * 2080
+    if placement == "host":
+        assert cfg.host_kv_layers == [*TARGET_MAIN, DRAFT]
+        assert layout.main_bytes == 13 * draft_bytes
+    else:
+        assert cfg.host_kv_layers == TARGET_MAIN
+        tensor = next(t for t in cfg.kv_cache_tensors if DRAFT in t.shared_by)
+        assert tensor.size == draft_bytes * tensor.num_blocks
+        assert draft_bytes in layout.index_bytes
+        assert layout.main_bytes == 12 * draft_bytes
+    assert layout.worker_bytes * WORKERS == geo.host_bytes_per_block
 
 
 def test_draft_main_placement_defaults_to_host():

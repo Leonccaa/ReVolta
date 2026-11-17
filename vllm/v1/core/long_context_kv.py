@@ -56,6 +56,7 @@ from vllm.utils.math_utils import cdiv
 
 if TYPE_CHECKING:
     from vllm.config.kernel import LongContextKVConfig
+    from vllm.v1.attention.kv_cache_view import KVPageLayout
     from vllm.v1.core.kv_cache_utils import KVCacheBlock
     from vllm.v1.request import Request
 
@@ -147,6 +148,16 @@ class LongContextGeometry:
     flight (one per aligned recurrent group). A segment for one request
     needs them, or that request preempts itself forever."""
     """Host ABI index bytes, excluding GPU page padding (host placement only)."""
+    hot_layout_cache_dtype: str | None = None
+    """Resolved planar main-owner format; legacy formats retain their old bill."""
+
+    @property
+    def hot_page_layout(self) -> KVPageLayout | None:
+        if self.hot_layout_cache_dtype is None:
+            return None
+        from vllm.v1.attention.kv_cache_view import KVPageLayout
+
+        return KVPageLayout(4, self.hot_kv_heads, self.hot_head_dim, self.hot_head_dim)
 
     @property
     def shared_slots_per_block(self) -> int:
@@ -223,6 +234,9 @@ class LongContextGeometry:
     @property
     def hot_slot_bytes(self) -> int:
         """All layers' payload for one worker-local four-token slot."""
+        layout = self.hot_page_layout
+        if layout is not None:
+            return self.hot_layers * layout.page_size_bytes
         return cdiv(
             self.main_kv_bytes_per_block * self.dcp_world_size * self.hot_group_tokens,
             self.block_tokens,
@@ -250,6 +264,7 @@ class LongContextGeometry:
             row_groups=self.hot_row_groups,
             tail_groups=self.hot_tail_groups,
             read_rows=self.hot_read_rows,
+            page_layout=self.hot_page_layout,
         )
         payload = parts.pop("hot")
         workspace = sum(
@@ -809,6 +824,7 @@ def shared_region_fixed_bytes(geometry: LongContextGeometry, max_num_seqs: int) 
         row_groups=geometry.hot_row_groups,
         tail_groups=geometry.hot_tail_groups,
         read_rows=geometry.hot_read_rows,
+        page_layout=geometry.hot_page_layout,
     )
     return sum(size for name, size in parts.items() if name not in SHARED_PER_SLOT)
 

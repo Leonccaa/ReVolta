@@ -9,7 +9,7 @@ from typing import Any
 
 import torch
 
-from vllm.config import CacheConfig, VllmConfig
+from vllm.config import CacheConfig, VllmConfig, set_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.models.interfaces import MultiModalEmbeddings
@@ -483,6 +483,13 @@ def select_common_block_size(
         if block_size_is_supported(backends, supported_size):
             return supported_size
     raise ValueError(f"No common block size for {kv_manager_block_size}. ")
+
+
+def qsa_planar_kernel_block_size(block_size: int, vllm_config: VllmConfig) -> int:
+    from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAFlashAttentionBackend
+
+    with set_current_vllm_config(vllm_config):
+        return select_common_block_size(block_size, [Qwen4ExpQSAFlashAttentionBackend])
 
 
 def prepare_kernel_block_sizes(

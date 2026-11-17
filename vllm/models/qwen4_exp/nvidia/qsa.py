@@ -53,6 +53,7 @@ from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionMetadataBuilder,
 )
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     FullAttentionSpec,
@@ -193,6 +194,7 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
         "fp8",
         "fp8_e4m3",
         "int8",
+        cast(CacheDType, FP8_E4M3_PER_TOKEN_HEAD.name),
     ]
 
     @staticmethod

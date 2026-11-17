@@ -14,6 +14,7 @@ from vllm.config.speculative_kv import (
     validate_speculative_kv_cache_dtype,
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD
 
 pytestmark = pytest.mark.skip_global_cleanup
 
@@ -126,6 +127,9 @@ def test_int8_target_dflash_rejected_for_every_draft_dtype(
         ("int8", "int8", "mtp"),
         ("fp8_e4m3", None, "mtp"),
         ("fp8_e4m3", "fp8_e4m3", "mtp"),
+        (FP8_E4M3_PER_TOKEN_HEAD.name, None, "dflash"),
+        (FP8_E4M3_PER_TOKEN_HEAD.name, None, "mtp"),
+        (FP8_E4M3_PER_TOKEN_HEAD.name, FP8_E4M3_PER_TOKEN_HEAD.name, "mtp"),
     ],
 )
 def test_compatible_kv_choices_are_unchanged(target_dtype, draft_dtype, method):
@@ -169,7 +173,8 @@ def test_explicit_sink_setting_overrides_top_level_default():
 
 
 @pytest.mark.parametrize(
-    "target_dtype,expected", [("int8", "int8"), ("fp8_e4m3", "auto")]
+    "target_dtype,expected",
+    [("int8", "int8"), ("fp8_e4m3", "auto"), (FP8_E4M3_PER_TOKEN_HEAD.name, "auto")],
 )
 def test_dflash_resolves_the_same_dtype_as_its_loader(sm70, target_dtype, expected):
     assert dflash_draft_cache_dtype(_config(target_dtype)) == expected

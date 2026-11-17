@@ -20,6 +20,7 @@ from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
+    KVQuantMode,
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowSpec,
@@ -121,12 +122,21 @@ def _drafter_group(groups):
     return drafter[0]
 
 
-def test_drafter_layers_share_main_kv_owner_slots() -> None:
+@pytest.mark.parametrize("planar", [False, True])
+def test_drafter_layers_share_main_kv_owner_slots(planar) -> None:
     config = _vllm_config()
-    baseline = _get_csa_linear_tensor_layout(
-        get_kv_cache_groups(config, _target_specs())
-    )
-    groups = get_kv_cache_groups(config, _target_specs() | _draft_specs((8, 9)))
+    target = _target_specs()
+    if planar:
+        target = {
+            name: replace(
+                spec, dtype=torch.uint8, kv_quant_mode=KVQuantMode.FP8_E4M3_PLANAR
+            )
+            if type(spec) is FullAttentionSpec
+            else spec
+            for name, spec in target.items()
+        }
+    baseline = _get_csa_linear_tensor_layout(get_kv_cache_groups(config, target))
+    groups = get_kv_cache_groups(config, target | _draft_specs((8, 9)))
     layout = _get_csa_linear_tensor_layout(groups)
     assert baseline is not None and layout is not None
 
@@ -137,10 +147,16 @@ def test_drafter_layers_share_main_kv_owner_slots() -> None:
     assert group.is_eagle_group
     assert not any(g.is_eagle_group for g in groups if g is not group)
     assert spec.block_size == 16
+    assert spec.dtype == torch.float16
+    assert spec.kv_quant_mode == KVQuantMode.NONE
     # One extra block in the manager's window (vllm-project/vllm#60560).
     assert spec.sliding_window == 32 + 16
     assert spec.real_page_size_bytes == 16 * 64 * 2 * 2
-    assert spec.page_size_bytes == layout.owner_page_size(0) == 16_384
+    assert (
+        spec.page_size_bytes
+        == layout.owner_page_size(0)
+        == (8320 if planar else 16_384)
+    )
 
     # Sharing owner slots costs no extra bytes per pool block.
     assert layout.bytes_per_block == baseline.bytes_per_block

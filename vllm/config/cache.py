@@ -13,6 +13,7 @@ from vllm.utils.torch_utils import (
     is_quantized_kv_cache,
     kv_cache_uses_per_token_head_scales,
 )
+from vllm.v1.attention.kv_codecs import FP8E4M3PerTokenHeadDType
 
 logger = init_logger(__name__)
 
@@ -33,6 +34,7 @@ CacheDType = Literal[
     "int8",
     "fp8_per_token_head",
     "nvfp4",
+    FP8E4M3PerTokenHeadDType,
 ]
 MambaDType = Literal["auto", "float32", "float16", "bfloat16"]
 MambaCacheMode = Literal["all", "align", "none"]
@@ -90,6 +92,8 @@ class CacheConfig:
     Some models (namely DeepSeekV3.2) default to fp8, set to bfloat16 to use
     bfloat16 instead, this is an invalid option for models that do not default
     to fp8.
+    QSA also supports planar E4M3 with dynamic per-token, per-head FP32 scales;
+    eligible QSA checkpoints without KV scales select this format automatically.
     """
     is_attention_free: bool = False
     """Whether the model is attention-free. This is primarily set in

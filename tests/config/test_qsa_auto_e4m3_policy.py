@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Automatic QSA storage requires real scalar calibration payloads."""
+"""Automatic QSA storage selects scalar or dynamic E4M3 scales."""
 
 import json
 import os
@@ -16,6 +16,7 @@ from vllm.models.qwen4_exp.common.kv_policy import (
     resolve_qsa_auto_e4m3,
 )
 from vllm.models.qwen4_exp.nvidia.ops import qsa
+from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD
 
 
 def _checkpoint(tmp_path, scales=None):
@@ -169,3 +170,28 @@ def test_diagnostics_do_not_change_inactive_kernel_hash():
     assert policy.compute_hash() == original
     policy.qsa_auto_e4m3_active = True
     assert policy.compute_hash() != original
+
+
+@pytest.mark.parametrize("method", [None, "mtp", "dflash"])
+def test_checkpoint_without_kv_scales_selects_planar(tmp_path, monkeypatch, method):
+    cfg = _config(_checkpoint(tmp_path, {"model.embed_tokens.weight": torch.ones(1)}))
+    cfg.speculative_config = SimpleNamespace(method=method) if method else None
+    monkeypatch.setattr(qsa, "qsa_e4m3_capability_reason", lambda dtype: None)
+    assert resolve_qsa_auto_e4m3(cfg)
+    assert cfg.cache_config.cache_dtype == FP8_E4M3_PER_TOKEN_HEAD.name
+    assert not cfg.cache_config.cache_dtype_from_checkpoint
+    assert cfg.kernel_config.qsa_auto_e4m3_active
+    assert cfg.kernel_config.qsa_auto_e4m3_reason is None
+
+
+def test_planar_dtype_is_exposed_by_existing_cli_and_qsa_backend():
+    from vllm.config import CacheConfig
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAFlashAttentionBackend
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+    dtype = FP8_E4M3_PER_TOKEN_HEAD.name
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = EngineArgs.from_cli_args(parser.parse_args(["--kv-cache-dtype", dtype]))
+    assert args.kv_cache_dtype == CacheConfig(cache_dtype=dtype).cache_dtype == dtype
+    assert dtype in Qwen4ExpQSAFlashAttentionBackend.supported_kv_cache_dtypes

@@ -13,7 +13,7 @@ reader unification is a separate change.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, get_args
 
 import torch
 
@@ -204,8 +204,9 @@ FP8_PER_TOKEN_HEAD = KVCodec(
     rounding="nearest_even",
     layout="inline_scale",
 )
+FP8E4M3PerTokenHeadDType = Literal["fp8_e4m3_per_token_head"]
 FP8_E4M3_PER_TOKEN_HEAD = KVCodec(
-    "fp8_e4m3_per_token_head",
+    get_args(FP8E4M3PerTokenHeadDType)[0],
     (),
     torch.uint8,
     torch.float8_e4m3fn,

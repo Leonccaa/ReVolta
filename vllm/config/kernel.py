@@ -628,11 +628,11 @@ class KernelConfig:
     """Observed selector decisions for loaded local layouts; diagnostic only."""
 
     qsa_auto_e4m3: bool = True
-    """Default eligible calibrated QSA caches to E4M3 without speculation."""
+    """Default eligible QSA caches to scalar or per-token-head E4M3."""
     qsa_auto_e4m3_active: bool = Field(default=False, init=False)
-    """Whether automatic calibrated QSA storage was selected."""
+    """Whether automatic QSA E4M3 storage was selected."""
     qsa_auto_e4m3_reason: str | None = Field(default=None, init=False)
-    """Startup reason when calibrated automatic storage cannot be selected."""
+    """Startup reason when automatic QSA E4M3 storage cannot be selected."""
 
     sm70_qsa_shared_key: bool = False
     """Share FP16 indexer keys across M2..8 queries of one request on SM70

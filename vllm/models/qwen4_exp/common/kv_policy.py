@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Calibrated QSA cache admission without loading model weights."""
+"""QSA cache format selection without loading model weights."""
 
 import json
 from pathlib import Path
 
 import torch
 from safetensors import SafetensorError, safe_open
+
+from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD
 
 
 def calibrated_qsa_checkpoint_reason(model_config) -> str | None:
@@ -26,6 +28,13 @@ def calibrated_qsa_checkpoint_reason(model_config) -> str | None:
         return "calibrated checkpoint index is not locally available"
     try:
         weight_map = json.loads(index.read_text())["weight_map"]
+        scale_suffixes = tuple(
+            f".layers.{owner}.self_attn.{kind}_scale"
+            for owner in owners
+            for kind in ("k", "v")
+        )
+        if not any(name.endswith(scale_suffixes) for name in weight_map):
+            return "checkpoint has no QSA K/V scales"
         required = {}
         for owner in owners:
             for kind in ("k", "v"):
@@ -57,14 +66,13 @@ def resolve_qsa_auto_e4m3(cfg) -> bool:
     policy.qsa_auto_e4m3_active = False
     model = cfg.model_config
     reason = None
+    cache_dtype = "fp8_e4m3"
     if not policy.qsa_auto_e4m3:
         reason = "disabled by KernelConfig"
     elif model is None or not getattr(model.hf_text_config, "indexer_n_heads", None):
         reason = "no QSA selector metadata"
     elif cfg.cache_config.cache_dtype != "auto":
         reason = "explicit KV dtype takes precedence"
-    elif cfg.speculative_config is not None:
-        reason = "automatic calibrated storage is qualified without speculation"
     elif cfg.cache_config.calculate_kv_scales:
         reason = "runtime scale calculation takes precedence"
     elif cfg.parallel_config.prefill_context_parallel_size != 1:
@@ -75,9 +83,14 @@ def resolve_qsa_auto_e4m3(cfg) -> bool:
         reason = qsa_e4m3_capability_reason(model.dtype)
         if reason is None:
             reason = calibrated_qsa_checkpoint_reason(model)
+            if reason == "checkpoint has no QSA K/V scales":
+                cache_dtype = FP8_E4M3_PER_TOKEN_HEAD.name
+                reason = None
+            elif reason is None and cfg.speculative_config is not None:
+                reason = "automatic calibrated storage is qualified without speculation"
     policy.qsa_auto_e4m3_reason = reason
     policy.qsa_auto_e4m3_active = reason is None
     if reason is None:
-        cfg.cache_config.cache_dtype = "fp8_e4m3"
+        cfg.cache_config.cache_dtype = cache_dtype
         cfg.cache_config.cache_dtype_from_checkpoint = False
     return policy.qsa_auto_e4m3_active

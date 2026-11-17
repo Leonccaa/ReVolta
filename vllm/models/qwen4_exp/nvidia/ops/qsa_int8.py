@@ -702,15 +702,16 @@ def sparse_attention(
 
 def dcp_grouped(q, k, v, indices, table, requests, out, lse, sk, sv, *, codec=INT8):
     """Row-scaled DCP uses the same owner mapping on each rank."""
+    from .qsa import _SM70_QSA_DCP_GROUPED_PAGE4_MIN_ROWS
+
+    # Like the scalar E4M3 route, decode-sized batches stay on the Triton
+    # split-K path; the grouped route only pays off for large prefill batches.
+    rows = q.shape[0]
+    if q.dtype != torch.float16 or rows < _SM70_QSA_DCP_GROUPED_PAGE4_MIN_ROWS:
+        return 0
+    rows = rows // 8 * 8
     if codec is INT8:
         require_int8_abi()
-    rows = q.shape[0]
-    if codec is FP8_E4M3_PER_TOKEN_HEAD:
-        from .qsa import _SM70_QSA_DCP_GROUPED_PAGE4_MIN_ROWS
-
-        if q.dtype != torch.float16 or rows < _SM70_QSA_DCP_GROUPED_PAGE4_MIN_ROWS:
-            return 0
-        rows = rows // 8 * 8
     if rows < 8 or q.shape[1] % 6 or indices.shape[1] != 2051:
         return 0
     capacity = table.shape[1] * k.shape[1]

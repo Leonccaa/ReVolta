@@ -42,6 +42,32 @@ def test_small_batches_stay_on_triton():
     assert written == 0
 
 
+@pytest.mark.parametrize("codec", ["int8", "planar"])
+def test_small_planar_batches_stay_on_triton(codec):
+    # DFlash2 verify batches (8 rows per request) must not take the grouped
+    # route for either planar codec.
+    from vllm.models.qwen4_exp.nvidia.ops import qsa_int8
+    from vllm.v1.attention.kv_codecs import INT8
+
+    rows = qsa_ops._SM70_QSA_DCP_GROUPED_PAGE4_MIN_ROWS - 1
+    dtype = torch.int8 if codec == "int8" else torch.uint8
+    q = torch.zeros((rows, 12, 256), dtype=torch.float16)
+    written = qsa_int8.dcp_grouped(
+        q,
+        torch.zeros((4, 16, 1, 256), dtype=dtype),
+        torch.zeros((4, 16, 1, 256), dtype=dtype),
+        torch.full((rows, WIDTH), -1, dtype=torch.int32),
+        torch.zeros((1, 4), dtype=torch.int32),
+        torch.zeros(rows, dtype=torch.int32),
+        torch.zeros(q.shape, dtype=torch.float32),
+        torch.zeros(q.shape[:2], dtype=torch.float32),
+        torch.ones((4, 16, 1), dtype=torch.float32),
+        torch.ones((4, 16, 1), dtype=torch.float32),
+        codec=INT8 if codec == "int8" else FP8_E4M3_PER_TOKEN_HEAD,
+    )
+    assert written == 0
+
+
 def _selection(positions, generator):
     """Model-format global selection: score-ordered blocks plus the open tail."""
     rows = []

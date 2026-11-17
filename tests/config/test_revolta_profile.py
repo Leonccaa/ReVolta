@@ -687,7 +687,9 @@ def test_graph_reserve_follows_the_speculative_method(
         ("awq", None, "fp8_per_token_head", "700"),
         ("modelopt_fp4", "mtp", "fp8_per_token_head", "600"),
         ("modelopt_fp4", "mtp", "auto", "700"),
-        ("modelopt_fp4", "dflash", "fp8_per_token_head", "1200"),
+        ("modelopt_fp4", "dflash", "fp8_per_token_head", "1024"),
+        ("modelopt_fp4", "dflash", "int8", "1024"),
+        ("modelopt_fp4", "dflash", "fp8_e4m3", "1200"),
     ],
 )
 def test_graph_reserve_follows_the_kv_dtype(

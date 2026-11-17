@@ -65,11 +65,12 @@ DFLASH_DEFAULTS = {
 }
 # With a planar KV cache (fp8_per_token_head, the QSA auto choice, or int8) the
 # graphs are smaller than with the scalar FP8 cache. Measured per GPU on TP4:
-# AWQ DFlash2 0.92 GiB (1.13 GiB with fp8_e4m3); MTP4 0.53 GiB (AWQ) and
-# 0.51 GiB (NVFP4). The reserves keep about 50 MiB of headroom; GPU memory is
-# the limit, so they stay tight. NVFP4 DFlash2 keeps 1200 until its tail-off
-# figure is measured; other KV dtypes keep the values above.
+# DFlash2 0.92 GiB (AWQ; 1.13 GiB with fp8_e4m3) and 0.95 GiB (NVFP4); MTP4
+# 0.53 GiB (AWQ) and 0.51 GiB (NVFP4). The reserves keep about 50 MiB of
+# headroom; GPU memory is the limit, so they stay tight. Other KV dtypes keep
+# the values above.
 AWQ_DFLASH_PLANAR_KV_DEFAULTS = {"VLLM_V2_CUDAGRAPH_MEM_MIB": "1000"}
+NVFP4_DFLASH_PLANAR_KV_DEFAULTS = {"VLLM_V2_CUDAGRAPH_MEM_MIB": "1024"}
 MTP_PLANAR_KV_DEFAULTS = {"VLLM_V2_CUDAGRAPH_MEM_MIB": "600"}
 PLANAR_KV_DTYPES = ("fp8_per_token_head", "int8")
 CUSTOM_AR_DEFAULTS = {"VLLM_SM70_CAR_VMM_SAFE": "1"}
@@ -361,6 +362,8 @@ def apply_revolta_profile(
         defaults.update(NVFP4_DEFAULTS)
         if speculative_method == "dflash":
             defaults.update(DFLASH_DEFAULTS)
+            if kv_cache_dtype in PLANAR_KV_DTYPES:
+                defaults.update(NVFP4_DFLASH_PLANAR_KV_DEFAULTS)
         elif speculative_method == "mtp" and kv_cache_dtype in PLANAR_KV_DTYPES:
             defaults.update(MTP_PLANAR_KV_DEFAULTS)
     if interconnect_mode != "no_p2p":

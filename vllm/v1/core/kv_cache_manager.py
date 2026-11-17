@@ -725,7 +725,7 @@ class KVCacheManager:
             self.block_pool.release_request(
                 request.request_id, manager.req_to_blocks.get(request.request_id, ())
             )
-        self.coordinator.free(request.request_id)
+        self.coordinator.free(request)
         if self.admission_ledger is not None:
             self.admission_ledger.release(request.request_id)
         if self.host_kv_hits is not None:

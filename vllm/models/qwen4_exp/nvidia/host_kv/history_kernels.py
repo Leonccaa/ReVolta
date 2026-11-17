@@ -439,7 +439,9 @@ def append_wanted(gid, valid, Wanted, Touched, Count, M: tl.constexpr):
         tl.store(Touched + start + rank, gid, first & (start + rank < M))
 
 
-@triton.jit
+# ``ROW_OFFSET`` arrives from ``mark_decode``'s runtime row count, so it cannot
+# be a constant; the standalone launch keeps the default of zero.
+@triton.jit(do_not_specialize=["ROW_OFFSET"])
 def mark_tail(
     Table,
     SeqLens,
@@ -453,7 +455,7 @@ def mark_tail(
     WORLD: tl.constexpr,
     RANK: tl.constexpr,
     IL: tl.constexpr,
-    ROW_OFFSET: tl.constexpr = 0,
+    ROW_OFFSET=0,
 ):
     """Keep each request's newest 32 local tokens resident (nine groups)."""
     req = tl.program_id(0).to(tl.int64) - ROW_OFFSET
@@ -518,7 +520,9 @@ def mark_selection(
         append_wanted(tl.maximum(gid, 0), valid, Wanted, Touched, Count, M)
 
 
-@triton.jit
+# ``ROWS`` is a runtime count and is relayed to ``mark_tail`` as its row offset.
+# As a constexpr it made every padded decode batch size compile a new kernel.
+@triton.jit(do_not_specialize=["ROWS"])
 def mark_decode(
     Indices,
     Req,
@@ -538,7 +542,7 @@ def mark_decode(
     RANK: tl.constexpr,
     IL: tl.constexpr,
     QSA_COLUMNS: tl.constexpr,
-    ROWS: tl.constexpr,
+    ROWS,
 ):
     """Independent tail and selection claims in one grid, then collect.
 

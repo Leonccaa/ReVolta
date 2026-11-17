@@ -204,7 +204,7 @@ def _coordinated_prefill(cm, request, block_size=32):
             manager.remove_skipped_blocks(request.request_id, start)
             manager.allocate_new_blocks(request.request_id, end, end)
         cm.coordinator.cache_blocks(request, end)
-    cm.coordinator.free(request.request_id)
+    cm.coordinator.free(request)
 
 
 @pytest.mark.parametrize("interval", [None, 0, 32, 16000])
@@ -327,7 +327,7 @@ def test_non_eagle_decode_preserves_new_completed_boundary(
         request.num_tokens = length
         request.block_hashes = _request("growing", length).block_hashes
         step(length - 1, length)
-    cm.coordinator.free(request.request_id)
+    cm.coordinator.free(request)
     _, hit = cm.get_computed_blocks(_request("growing", final_length + block_size))
     assert hit == 4 * block_size
     assert cm.block_pool.get_num_free_blocks() == 999
@@ -406,7 +406,7 @@ def test_bulk_prefill_materializes_every_admitted_state(eagle, length, interval_
     for i, block_hash in enumerate(hashes):
         if cached := cm.block_pool.get_cached_block(block_hash, [1]):
             assert materialized[cached[0].block_id] == (i + 1) * block_size
-    cm.coordinator.free(request.request_id)
+    cm.coordinator.free(request)
     _, hit = cm.get_computed_blocks(_request("bulk", length))
     assert hit == max(0, (length - 1) // block_size - int(eagle)) * block_size
     assert request.shared_prefix_boundary in ends
@@ -524,6 +524,7 @@ def _prompt(name: str, length: int) -> SimpleNamespace:
     request = _request(name, length, DRAFT_BLOCK)
     request.num_prompt_tokens = length
     request.num_computed_tokens = 0
+    request.num_in_flight_tokens = 0
     return request
 
 
@@ -639,6 +640,7 @@ def test_page_granular_eagle_drop_still_rewinds(variant, length, deepest):
     )
     coordinator = cm.coordinator
     assert state_lookbehind(coordinator) is True
+    assert not coordinator.single_type_managers[1].keep_decode_resume_state
     assert all(m.mamba_replay_lookbehind for m in coordinator.single_type_managers)
     assert (
         coordinator.get_replay_boundaries(
@@ -700,7 +702,7 @@ def test_sub_page_drafter_first_reuse_hits_the_full_prefix():
         # Only a chunk that ended exactly on the boundary writes that state.
         assert (index + 1) * STATE_BLOCK in materialized[block.block_id]
 
-    cm.coordinator.free(request.request_id)
+    cm.coordinator.free(request)
     _, hit = cm.get_computed_blocks(_prompt("doc", length))
     # Before the fix this was `deepest - STATE_BLOCK` and the junction repair
     # cost one extra 1,664-token re-prefill on this very request.
@@ -732,10 +734,108 @@ def test_engine_level_rewind_first_reuse_stays_rewound():
             [1],
         )[0]
         assert (index + 1) * STATE_BLOCK in materialized[block.block_id]
-    cm.coordinator.free(request.request_id)
+    cm.coordinator.free(request)
     reuse = _prompt("doc", length)
     _, hit = cm.get_computed_blocks(reuse)
     assert hit == deepest - STATE_BLOCK
     # Denser groups still reach the deepest boundary, so the junction that
     # repairs the gap is recorded -- the behaviour MTP4 keeps today.
     assert cm.coordinator.shared_prefix_boundary == deepest
+
+
+def test_dflash_decode_registers_running_boundaries_and_free_supplements_last():
+    prompt = 2 * STATE_BLOCK + 14
+    cm = dflash2_manager(length=8 * STATE_BLOCK)
+    request = _prompt("decode", prompt)
+    cold_prefill(cm, request, use_eagle=False, budget=512)
+    state = cm.coordinator.single_type_managers[1]
+    assert state.keep_decode_resume_state
+    state.take_pending_boundary_state_offloads()
+    running = set()
+    final = 6 * STATE_BLOCK
+    while request.num_computed_tokens < final:
+        start = request.num_computed_tokens
+        request.num_tokens = start + 1
+        request.block_hashes = _prompt("decode", start + 8).block_hashes
+        for manager in cm.coordinator.single_type_managers:
+            manager.new_step_starts()
+            manager.remove_skipped_blocks(request.request_id, start, prompt)
+            manager.allocate_new_blocks(request.request_id, start + 8, start + 8)
+        cm.coordinator.cache_blocks(request, request.num_tokens)
+        for _, gid, block, boundary in state.take_pending_boundary_state_offloads():
+            assert gid == 1 and not block.is_null and block.block_hash is not None
+            assert block.ref_cnt == 1
+            running.add(boundary)
+        request.num_computed_tokens = min(start + 3, final)
+    assert running == {3 * STATE_BLOCK, 4 * STATE_BLOCK, 5 * STATE_BLOCK}
+    last = state.req_to_blocks[request.request_id][5]
+    assert not last.is_null and last.block_hash is None
+    # The last accepted step crossed a boundary with no following allocate.
+    request.num_tokens = final + 1
+    request.block_hashes = _prompt("decode", final + 1).block_hashes
+    cm.coordinator.free(request)
+    assert set(published_state_blocks(cm, request)) >= set(range(2, 6))
+    assert last.block_hash is not None and last.ref_cnt == 0
+    assert not state.take_pending_boundary_state_offloads()
+    assert cm.block_pool.get_num_free_blocks() == cm.block_pool.num_gpu_blocks - 1
+
+
+def test_dflash_decode_retention_requires_prefix_caching():
+    cm = KVCacheManager(
+        KVCacheConfig(64, [], dflash2_groups(DRAFT_BLOCK)),
+        max_model_len=8 * STATE_BLOCK,
+        hash_block_size=DRAFT_BLOCK,
+        enable_caching=False,
+        prefix_cache_retention_interval=0,
+    )
+    state = cm.coordinator.single_type_managers[1]
+    assert not state.keep_decode_resume_state
+
+
+@pytest.mark.parametrize("prompt", [2 * STATE_BLOCK + 14, 65])
+def test_dflash_decode_windows_keep_ordinary_cache_priority(prompt):
+    final = 7 * STATE_BLOCK + DRAFT_BLOCK + 10
+    cm = dflash2_manager(length=final + STATE_BLOCK)
+    request = _prompt("windows", prompt)
+    cold_prefill(cm, request, use_eagle=False, budget=512)
+    drafter = cm.coordinator.single_type_managers[DRAFTER_GROUP]
+    need = SlidingWindowManager._contiguous_blocks_for_hit(
+        drafter.kv_cache_spec.sliding_window, DRAFT_BLOCK, True
+    )
+    first = 3 * STATE_BLOCK // DRAFT_BLOCK + 1 - need
+    first_block = None
+    released_first = False
+    while request.num_computed_tokens < final:
+        start = request.num_computed_tokens
+        request.num_tokens = start + 1
+        request.block_hashes = _prompt("windows", start + 8).block_hashes
+        for manager in cm.coordinator.single_type_managers:
+            manager.new_step_starts()
+            manager.remove_skipped_blocks(request.request_id, start, prompt)
+            manager.allocate_new_blocks(request.request_id, start + 8, start + 8)
+        cm.coordinator.cache_blocks(request, request.num_tokens)
+        draft_blocks = drafter.req_to_blocks[request.request_id]
+        if first_block is None and len(draft_blocks) > first:
+            first_block = draft_blocks[first]
+            assert not first_block.is_null
+        if first_block is not None and draft_blocks[first].is_null:
+            # The first decode window must survive even before its complete
+            # lookahead is available. It is free, ordinary evictable cache.
+            assert first_block.ref_cnt == 0
+            assert first_block.block_hash is not None
+            released_first = True
+        request.num_computed_tokens = min(start + 3, final)
+    assert released_first
+    request.num_tokens = final + 1
+    request.block_hashes = _prompt("windows", final + 1).block_hashes
+    cm.coordinator.free(request)
+    hashes = BlockHashListWithBlockSize(request.block_hashes, DRAFT_BLOCK, DRAFT_BLOCK)
+    for boundary in range(3 * STATE_BLOCK, 8 * STATE_BLOCK, STATE_BLOCK):
+        end = boundary // DRAFT_BLOCK + 1
+        for index in range(end - need, end):
+            cached = cm.block_pool.get_cached_block(hashes[index], [DRAFTER_GROUP])
+            assert cached is not None, (boundary, index)
+            assert cached[0].ref_cnt == 0
+    _, hit = cm.get_computed_blocks(request)
+    assert hit == 7 * STATE_BLOCK
+    assert all(b.ref_cnt == 0 for b in cm.block_pool.blocks if not b.is_null)

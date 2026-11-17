@@ -46,6 +46,7 @@ from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
 from vllm.v1.kv_offload.tiering.fs.config import FS_TIER_TYPES
+from vllm.v1.kv_offload.tiering.fs.identity import KV_COMPAT_EPOCH
 from vllm.v1.kv_offload.tiering.manager import (
     CPUPrimaryTierOffloadingManager,
     TieringOffloadingManager,
@@ -99,9 +100,8 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 )
             self.persistent_layout = {
                 "version": "grouped-worker-interleaved-v1",
-                "config_hash": vllm_config.compute_hash(),
+                "kv_compat_epoch": KV_COMPAT_EPOCH,
                 "attention_backend": str(backend),
-                "model_revision": vllm_config.model_config.revision,
                 "group_pages": self.cpu_group_page_sizes,
                 "tensors": [
                     {
@@ -129,7 +129,7 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
 
         if has_planar_kv_cache(kv_cache_config):
             if self.persistent_layout is None:
-                self.persistent_layout = {"config_hash": vllm_config.compute_hash()}
+                self.persistent_layout = {"kv_compat_epoch": KV_COMPAT_EPOCH}
             self.persistent_layout["kv_storage"] = kv_storage_metadata(
                 kv_cache_config, vllm_config.cache_config.cache_dtype, vllm_config
             )

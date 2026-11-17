@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU regressions for persistent identity, startup and concurrent chain I/O."""
 
-import copy
 import dataclasses
 import errno
 import json
@@ -32,6 +31,7 @@ from vllm.utils.hashing import sha256, sha256_cbor
 from vllm.v1.core import kv_cache_utils
 from vllm.v1.kv_offload.base import OffloadKey, make_offload_key
 from vllm.v1.kv_offload.tiering.fs import content_manifest, revolta
+from vllm.v1.kv_offload.tiering.fs import identity as identity_module
 from vllm.v1.kv_offload.tiering.fs.content_manifest import (
     ManifestError,
     build_manifest,
@@ -146,22 +146,21 @@ def test_another_namespace_page_is_rejected(tmp_path):
         "target_quantization",
         "target_dtype",
         "target_overrides",
-        "target_rope",
         "draft_method",
-        "draft_model",
-        "draft_tokens",
         "draft_quantization",
-        "effective_draft_quantization",
-        "effective_draft_dtype",
         "draft_overrides",
-        "draft_rope",
-        "load_format",
-        "draft_load_format",
         "kv_dtype",
-        "hash_algo",
+        "block_size",
+        "tp",
+        "dcp",
+        "cp_interleave",
+        "attention_backend",
+        "epoch",
     ],
 )
-def test_dedicated_identity_covers_effective_configuration(tmp_path, change):
+def test_dedicated_identity_covers_effective_configuration(
+    tmp_path, change, monkeypatch
+):
     model = _checkpoint(tmp_path)
     draft_dir = tmp_path / "draft"
     shutil.copytree(model, draft_dir)
@@ -179,39 +178,82 @@ def test_dedicated_identity_covers_effective_configuration(tmp_path, change):
         config.model_config.dtype = "float32"
     elif change == "target_overrides":
         config.model_config.hf_overrides = {"rope_theta": 20000}
-    elif change == "target_rope":
-        config.model_config.hf_config = {"rope_scaling": {"factor": 2}}
     elif change == "draft_method":
         spec.method = "eagle3"
-    elif change == "draft_model":
-        spec.model = str(model)
-    elif change == "draft_tokens":
-        spec.num_speculative_tokens = 8
     elif change == "draft_quantization":
         spec.quantization = "fp8"
-    elif change == "effective_draft_quantization":
-        spec.draft_model_config.quantization = "fp8"
-    elif change == "effective_draft_dtype":
-        spec.draft_model_config.dtype = "float32"
     elif change == "draft_overrides":
-        spec.draft_model_config.hf_overrides = {"rope_theta": 30000}
-    elif change == "draft_rope":
-        spec.draft_model_config.hf_text_config = {
-            "rope_parameters": {"rope_theta": 12345}
-        }
-    elif change == "load_format":
-        config.load_config.load_format = "safetensors"
-    elif change == "draft_load_format":
-        spec.draft_load_config = copy.copy(config.load_config)
-        spec.draft_load_config.load_format = "safetensors"
+        spec.hf_overrides = {"rope_theta": 30000}
     elif change == "kv_dtype":
         config.cache_config.cache_dtype = "float16"
-    elif change == "hash_algo":
-        config.cache_config.prefix_caching_hash_algo = "sha256_cbor"
+    elif change == "block_size":
+        config.cache_config.block_size = 32
+    elif change == "tp":
+        config.parallel_config.tensor_parallel_size = 2
+    elif change == "dcp":
+        config.parallel_config.decode_context_parallel_size = 2
+    elif change == "cp_interleave":
+        config.parallel_config.cp_kv_cache_interleave_size = 16
+    elif change == "attention_backend":
+        config.attention_config = SimpleNamespace(backend="FLASH_ATTN")
+    elif change == "epoch":
+        monkeypatch.setattr(identity_module, "KV_COMPAT_EPOCH", 2)
     after = get_revolta_identity(config, str(tmp_path / "kv"), manifest)
     assert after is not None
     assert before.persistent_digest != after.persistent_digest
-    assert config.compute_hash() == "cfg-1"  # compile identity deliberately unchanged
+
+
+def test_identity_ignores_engine_version_and_compile_hash(tmp_path, monkeypatch):
+    model = _checkpoint(tmp_path)
+    manifest = _write_manifest(tmp_path, {"target": str(model)})
+    config = make_spec(model).vllm_config
+    before = get_revolta_identity(config, str(tmp_path / "kv"), manifest)
+    assert before is not None
+    config.compute_hash = lambda: "cfg-2"
+    monkeypatch.setattr("vllm.version.__version__", "99.0.0")
+    after = get_revolta_identity(config, str(tmp_path / "kv"), manifest)
+    assert after == before
+
+
+def test_identity_ignores_tuning_options(tmp_path):
+    """Only fields that change stored bytes or meaning are in the identity."""
+    from vllm.config.kernel import KernelConfig
+
+    model = _checkpoint(tmp_path)
+    manifest = _write_manifest(tmp_path, {"target": str(model)})
+    config = make_spec(model).vllm_config
+    config.kernel_config = KernelConfig()
+    config.attention_config = SimpleNamespace(
+        backend="FLASH_ATTN", flash_attn_version=2
+    )
+    config.additional_config = {}
+    config.model_config.revision = "main"
+    config.model_config.max_model_len = 4096
+    config.model_config.hf_text_config = {"num_hidden_layers": 2}
+    config.model_config.quantization_config = {"bits": 4}
+    before = get_revolta_identity(config, str(tmp_path / "kv"), manifest)
+    assert before is not None
+    long_context = config.kernel_config.long_context_kv
+    long_context.host_pool_gib = 8.0
+    long_context.hot_pool_ratio = 0.5
+    long_context.prefill_gather = "union"
+    long_context.prefill_insert_age = "recent"
+    long_context.value_arbitration = False
+    config.kernel_config.sm70_awq.enabled = True
+    config.kernel_config.sm70_fp8.qpn8 = False
+    config.kernel_config.sm70_sparse.decode_bmm = False
+    config.attention_config.flash_attn_version = 3
+    config.additional_config = {"anything": 1}
+    config.model_config.revision = "other"
+    config.model_config.max_model_len = 8192
+    config.model_config.hf_text_config = {"num_hidden_layers": 4}
+    config.model_config.quantization_config = {"bits": 8}
+    config.cache_config.prefix_caching_hash_algo = "sha256_cbor"
+    config.load_config.ignore_patterns = ["other/**/*"]
+    config.cache_config.gpu_memory_utilization = 0.5
+    config.load_config.load_format = "safetensors"
+    after = get_revolta_identity(config, str(tmp_path / "kv"), manifest)
+    assert after == before
 
 
 def test_physical_layout_changes_namespace(tmp_path):
@@ -220,6 +262,18 @@ def test_physical_layout_changes_namespace(tmp_path):
     first = make_tier(tmp_path / "kv", view, spec=spec, content_manifest_path=manifest)
     first_digest = first._identity_digest
     first.shutdown()
+    digests = {first_digest}
+    # The host layer list is how draft_main_placement reaches the namespace.
+    for layers in (["main"], ["main", "draft"]):
+        spec.persistent_layout = {
+            "host_main_kv": {"layers": layers, "page_bytes": 4096}
+        }
+        tier = make_tier(
+            tmp_path / "kv", view, spec=spec, content_manifest_path=manifest
+        )
+        digests.add(tier._identity_digest)
+        tier.shutdown()
+    assert len(digests) == 3
     spec.persistent_layout = {"storage": {"strides": [64, 1], "role": "recurrent"}}
     second = make_tier(tmp_path / "kv", view, spec=spec, content_manifest_path=manifest)
     try:
@@ -672,6 +726,7 @@ def test_multimodal_model_is_supported_and_identified(tmp_path):
         limit_per_prompt: dict
         mm_processor_kwargs: dict | None = None
         mm_encoder_tp_mode: str = "weights"
+        media_io_kwargs: dict | None = None
 
     model = _checkpoint(tmp_path)
     manifest = _write_manifest(tmp_path, {"target": str(model)})
@@ -681,20 +736,18 @@ def test_multimodal_model_is_supported_and_identified(tmp_path):
     first = get_revolta_identity(config, str(tmp_path / "kv"), manifest)
     assert first is not None
     config.model_config.multimodal_config = MM(
-        limit_per_prompt={"image": 4}, mm_encoder_tp_mode="data"
+        limit_per_prompt={"image": 8},
+        mm_encoder_tp_mode="data",
+        media_io_kwargs={"video": {"fps": 2}},
     )
     second = get_revolta_identity(config, str(tmp_path / "kv"), manifest)
-    assert second is not None
-    assert second.persistent_digest != first.persistent_digest
+    assert second == first
     config.model_config.multimodal_config = MM(
         limit_per_prompt={"image": 4}, mm_processor_kwargs={"max_pixels": 1024}
     )
     third = get_revolta_identity(config, str(tmp_path / "kv"), manifest)
     assert third is not None
-    assert third.persistent_digest not in (
-        first.persistent_digest,
-        second.persistent_digest,
-    )
+    assert third.persistent_digest != first.persistent_digest
 
 
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
@@ -1177,9 +1230,10 @@ def test_awq_multimodal_metadata_through_real_model_config(tmp_path):
         assert not tier.disabled
     finally:
         tier.shutdown()
+    # Provenance notes in the quantization metadata do not change any page.
     cfg.hf_config.quantization_config["meta"]["selection"] += " updated"
     after = get_revolta_identity(spec.vllm_config, str(root), manifest)
-    assert after is not None and before != after
+    assert after == before
 
 
 @pytest.mark.parametrize(
@@ -1323,7 +1377,6 @@ def test_retention_policy_does_not_change_persistent_identity(tmp_path, enabled)
     persisted namespace, otherwise every committed unit becomes unreachable.
     """
     from vllm.config.kernel import KernelConfig
-    from vllm.v1.kv_offload.tiering.fs.identity import _kernel_identity
 
     model = _checkpoint(tmp_path)
     manifest = _write_manifest(tmp_path, {"target": str(model)})
@@ -1347,9 +1400,6 @@ def test_retention_policy_does_not_change_persistent_identity(tmp_path, enabled)
         identity = get_revolta_identity(config, str(tmp_path / "kv"), manifest)
         assert identity is not None
         digests.add(identity.persistent_digest)
-        text = repr(_kernel_identity(config.kernel_config))
-        assert "latest_only" not in text and "superseded_keep_ssd" not in text
-        assert "enable_junction_evidence" not in text
     assert len(digests) == 1
 
 

@@ -10,7 +10,7 @@ planner and forward kernel are compared in the CUDA tests at the end.
 """
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pytest
 import torch
@@ -979,7 +979,7 @@ def _production_case(seed, rows, e4m3, packed, share=True):
     )
 
 
-def _dcp_attention(case, key, value, table, token_to_req, outputs, kv_dtype):
+def _dcp_attention(case, key, value, table, token_to_req, outputs, kv_dtype, **scales):
     """The kernel sequence of ``_forward_qsa_dcp`` before the cross-rank merge."""
     from vllm.models.qwen4_exp.nvidia.ops.qsa import (
         qsa_dcp_sparse_paged_attention_sm70_grouped_page4,
@@ -1004,6 +1004,7 @@ def _dcp_attention(case, key, value, table, token_to_req, outputs, kv_dtype):
         kv_dtype,
         case["k_scale"],
         case["v_scale"],
+        **scales,
     )
     if grouped < q.shape[0]:
         qsa_sparse_paged_attention(
@@ -1018,23 +1019,74 @@ def _dcp_attention(case, key, value, table, token_to_req, outputs, kv_dtype):
             k_scale=case["k_scale"],
             v_scale=case["v_scale"],
             lse=lse[grouped:],
+            **scales,
         )
     return grouped
 
 
 @cuda
-@pytest.mark.parametrize("packed", [False, True])
-@pytest.mark.parametrize("e4m3", [False, True])
-@pytest.mark.parametrize("staging", [None, "windows"])
+@pytest.mark.parametrize(
+    "e4m3,packed,staging",
+    [
+        (e4m3, packed, staging)
+        for staging in (None, "windows")
+        for e4m3 in (False, True)
+        for packed in (False, True)
+    ]
+    + [("planar", True, "windows")],
+)
 def test_cuda_dcp_grouped_route_bitwise(e4m3, packed, staging, monkeypatch):
     from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
+    from vllm.v1.attention.kv_cache_view import (
+        KVCacheView,
+        KVPageLayout,
+        bind_planar_kv_cache,
+    )
+    from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD
 
     flash = _sm70_flash()
     kv_dtype = "fp8_e4m3" if e4m3 else "auto"
+    codec = FP8_E4M3_PER_TOKEN_HEAD if e4m3 == "planar" else None
+    if codec is not None:
+        kv_dtype = codec.name
     if not qsa_ops._qsa_grouped_page4_supported(flash.flash_attn_v100_cuda, kv_dtype):
         pytest.skip("Flash-V100 build has no grouped page4 route for this cache")
     monkeypatch.setattr(qsa_ops, "_SM70_QSA_DCP_GROUPED_PAGE4_MIN_ROWS", 64)
-    case = _production_case(816, 77, e4m3, packed, share=staging is None)
+    case = _production_case(
+        816, 77, e4m3 and codec is None, packed, share=staging is None
+    )
+    scales, copy_scales = {}, {}
+    if codec is not None:
+        blocks = case["key"].shape[0]
+        layout = KVPageLayout(16, 1, 256, 256)
+        raw = torch.zeros(
+            blocks * 2 * layout.page_size_bytes, dtype=torch.uint8, device="cuda"
+        )
+        carrier = bind_planar_kv_cache(
+            raw,
+            num_blocks=blocks,
+            scheduler_block_size=16,
+            kernel_block_size=16,
+            num_heads=1,
+            head_size=256,
+            page_size_bytes=layout.page_size_bytes,
+            member_count=2,
+            member_index=1,
+            dtype=torch.uint8,
+        )
+        view = KVCacheView.bind(carrier, codec, 256)
+        for name, payload, plane in (
+            ("key", view.key, view.key_scale),
+            ("value", view.value, view.value_scale),
+        ):
+            encoded, scale = codec.encode(case[name])
+            payload.copy_(encoded)
+            plane.copy_(scale)
+            case[name] = payload
+        scales = view.scale_kwargs
+        copy_scales = dict(
+            source_key_scale=view.key_scale, source_value_scale=view.value_scale
+        )
     rows = case["q"].shape[0]
 
     def fresh():
@@ -1052,6 +1104,7 @@ def test_cuda_dcp_grouped_route_bitwise(e4m3, packed, staging, monkeypatch):
         case["token_to_req"],
         expected,
         kv_dtype,
+        **scales,
     )
     assert grouped == 72
     page, blocks = case["key"].shape[1], case["key"].shape[0]
@@ -1099,10 +1152,24 @@ def test_cuda_dcp_grouped_route_bitwise(e4m3, packed, staging, monkeypatch):
         head_dim=256,
         dtype=case["key"].dtype,
         device="cuda",
+        codec=codec,
     )
     actual = fresh()
     result = qsa_union_gather_attention(
-        lambda k, v, t, r, o: _dcp_attention(case, k, v, t, r, o, kv_dtype),
+        lambda k, v, t, r, o: _dcp_attention(
+            case,
+            k,
+            v,
+            t,
+            r,
+            o,
+            kv_dtype,
+            **(
+                dict(k_scale_cache=arena.key_scale, v_scale_cache=arena.value_scale)
+                if codec is not None
+                else {}
+            ),
+        ),
         actual,
         case["local"],
         case["token_to_req"],
@@ -1111,6 +1178,7 @@ def test_cuda_dcp_grouped_route_bitwise(e4m3, packed, staging, monkeypatch):
         case["value"],
         arena,
         unit_tokens=2,
+        **copy_scales,
     )
     assert bool(result.complete)
     if staging == "windows":
@@ -1201,3 +1269,190 @@ def test_cuda_gather_from_pinned_host_pool():
     torch.accelerator.synchronize()
     assert torch.equal(arena.key, reference.key)
     assert torch.equal(arena.value, reference.value)
+
+
+def _planar_union_roundtrip(device, unit):
+    from vllm.models.qwen4_exp.nvidia.ops.qsa_int8 import triton_attention
+    from vllm.v1.attention.kv_cache_view import (
+        KVCacheView,
+        KVPageLayout,
+        bind_planar_kv_cache,
+    )
+    from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD as codec
+
+    # Packed member, b=8 source; b=4 arena. DCP2 transfers two local tokens.
+    layout = KVPageLayout(8, 2, DIM, DIM)
+    raw = torch.zeros(
+        7 * 2 * layout.page_size_bytes, dtype=torch.uint8, pin_memory=device == "cuda"
+    )
+    carrier = bind_planar_kv_cache(
+        raw,
+        num_blocks=7,
+        scheduler_block_size=8,
+        kernel_block_size=8,
+        num_heads=2,
+        head_size=DIM,
+        page_size_bytes=layout.page_size_bytes,
+        member_count=2,
+        member_index=1,
+        dtype=torch.uint8,
+    )
+    source = KVCacheView.bind(carrier, codec, DIM)
+    generator = torch.Generator().manual_seed(447)
+    original = torch.randn(2, 7, 8, 2, DIM, generator=generator).half()
+    original *= torch.linspace(0.25, 4, 8)[None, None, :, None, None]
+    for x, payload, scales in (
+        (original[0], source.key, source.key_scale),
+        (original[1], source.value, source.value_scale),
+    ):
+        encoded, scale = codec.encode(x)
+        payload.copy_(encoded)
+        scales.copy_(scale)
+    before = raw.clone()
+    arena = allocate_qsa_arena(
+        hot_microblocks=1,
+        staging_microblocks=2,
+        kv_heads=2,
+        head_dim=DIM,
+        dtype=torch.uint8,
+        device=device,
+        codec=codec,
+    )
+    for dst, src in (
+        (arena.key, source.key),
+        (arena.value, source.value),
+        (arena.key_scale, source.key_scale),
+        (arena.value_scale, source.value_scale),
+    ):
+        dst[0].copy_(src[0, :4])
+    resident = torch.full((14,), -1, dtype=torch.int32, device=device)
+    resident[0] = 0
+    indices = torch.tensor(
+        [[0, 1, 8 + 4 * (row // 8) + 1, 8 + 4 * (row // 8) + 2] for row in range(19)],
+        dtype=torch.int32,
+        device=device,
+    )
+    requests = torch.zeros(19, dtype=torch.int32, device=device)
+    table = torch.arange(7, dtype=torch.int32, device=device)[None]
+    query = torch.randn(19, GROUP * 2, DIM, generator=generator).half().to(device)
+    expected = [torch.empty_like(query), torch.empty(19, GROUP * 2, device=device)]
+    actual = [torch.empty_like(x) for x in expected]
+
+    def attention(k, v, table, req, outputs, sk=arena.key_scale, sv=arena.value_scale):
+        triton_attention(
+            query,
+            k,
+            v,
+            indices,
+            table,
+            req,
+            outputs[0],
+            sk,
+            sv,
+            lse=outputs[1],
+            codec=codec,
+        )
+
+    # The reference reader uses independent source views; pinned host remains
+    # the real transfer source for the CUDA gather.
+    attention(
+        source.key.to(device),
+        source.value.to(device),
+        table,
+        requests,
+        expected,
+        source.key_scale.to(device),
+        source.value_scale.to(device),
+    )
+    checked = []
+
+    def copy(k, v, arena, plan, **kw):
+        qsa_union_gather_copy(k, v, arena, plan, **kw)
+        reference = allocate_qsa_arena(
+            hot_microblocks=1,
+            staging_microblocks=2,
+            kv_heads=2,
+            head_dim=DIM,
+            dtype=torch.uint8,
+            device="cpu",
+            codec=codec,
+        )
+        for dst, src in (
+            (reference.key, arena.key),
+            (reference.value, arena.value),
+            (reference.key_scale, arena.key_scale),
+            (reference.value_scale, arena.value_scale),
+        ):
+            dst.copy_(src.cpu())
+        # Restore every destination unit to zero, then independently copy it.
+        n = int(plan.transfer_count)
+        for target in plan.transfer_arena_units[:n].tolist():
+            block, within = divmod(target, 4 // unit)
+            for dst in (
+                reference.key,
+                reference.value,
+                reference.key_scale,
+                reference.value_scale,
+            ):
+                dst[block, within * unit : (within + 1) * unit].zero_()
+        cpu_plan = replace(
+            plan,
+            transfer_source_units=plan.transfer_source_units.cpu(),
+            transfer_arena_units=plan.transfer_arena_units.cpu(),
+            transfer_count=plan.transfer_count.cpu(),
+        )
+        qsa_union_gather_copy_reference(k, v, reference, cpu_plan, **kw)
+        for got, want in (
+            (arena.key, reference.key),
+            (arena.value, reference.value),
+            (arena.key_scale, reference.key_scale),
+            (arena.value_scale, reference.value_scale),
+        ):
+            assert got.shape == want.shape, "INCOMPLETE"
+            assert torch.equal(got.cpu().view(torch.uint8), want.view(torch.uint8)), (
+                "FAIL"
+            )
+        checked.append(n)
+
+    result = qsa_union_gather_attention(
+        attention,
+        actual,
+        indices,
+        requests,
+        table,
+        source.key,
+        source.value,
+        arena,
+        unit_tokens=unit,
+        resident_microblocks=resident,
+        copy=copy,
+        source_key_scale=source.key_scale,
+        source_value_scale=source.value_scale,
+    )
+    assert result.windows == len(checked) == 2 and bool(result.complete)
+    _assert_bitwise(expected, actual)
+    assert torch.equal(raw, before)  # source and adjacent packed member untouched
+    # D68: compare actual arena bytes; a byte change fails, removal is incomplete.
+    data = arena.value_scale.cpu().contiguous().view(torch.uint8).flatten()
+
+    def compare(got):
+        assert got.shape == data.shape, "INCOMPLETE"
+        assert torch.equal(got, data), "FAIL"
+
+    changed = data.clone()
+    changed[0] ^= 1
+    with pytest.raises(AssertionError, match="FAIL"):
+        compare(changed)
+    with pytest.raises(AssertionError, match="INCOMPLETE"):
+        compare(data[:-1])
+
+
+@interpreter
+@pytest.mark.parametrize("unit", [2, 4])
+def test_planar_union_windows_copy_scales_and_output(unit):
+    _planar_union_roundtrip("cpu", unit)
+
+
+@cuda
+def test_cuda_planar_union_from_pinned_host():
+    _planar_union_roundtrip("cuda", 2)

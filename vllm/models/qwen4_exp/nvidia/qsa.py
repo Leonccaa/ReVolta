@@ -405,6 +405,9 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         hot_table = host.store.hot_block_table
         key_cache, value_cache = host.key_cache, host.value_cache
         k_scale, v_scale = layer._k_scale_float, layer._v_scale_float
+        scale_kwargs = (
+            host.hot_cache.scale_kwargs if host.store.shape.planar_scales else {}
+        )
         decode_rows = host.store.shape.decode_rows
         union = (
             attn_metadata.max_query_len > decode_rows
@@ -431,6 +434,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                     kv_cache_dtype=self.kv_cache_dtype,
                     k_scale=k_scale,
                     v_scale=v_scale,
+                    **scale_kwargs,
                 )
 
             if union:
@@ -457,6 +461,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                         kv_cache_dtype=self.kv_cache_dtype,
                         k_scale=k_scale,
                         v_scale=v_scale,
+                        **scale_kwargs,
                         **metadata,
                     )
 
@@ -542,6 +547,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 self.kv_cache_dtype,
                 k_scale,
                 v_scale,
+                **scale_kwargs,
             )
             if grouped < end - start:
                 qsa_sparse_paged_attention(
@@ -555,6 +561,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                     kv_cache_dtype=self.kv_cache_dtype,
                     k_scale=k_scale,
                     v_scale=v_scale,
+                    **scale_kwargs,
                     lse=rows_lse[grouped:],
                 )
 
@@ -575,6 +582,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 self.kv_cache_dtype,
                 k_scale,
                 v_scale,
+                **scale_kwargs,
             )
             if grouped < num_tokens:
                 qsa_sparse_paged_attention(
@@ -588,6 +596,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                     kv_cache_dtype=self.kv_cache_dtype,
                     k_scale=k_scale,
                     v_scale=v_scale,
+                    **scale_kwargs,
                     lse=rows_lse[grouped:],
                 )
 

@@ -146,16 +146,10 @@ def test_another_namespace_page_is_rejected(tmp_path):
         "target_quantization",
         "target_dtype",
         "target_overrides",
-        "target_rope",
         "draft_method",
         "draft_quantization",
-        "effective_draft_quantization",
-        "effective_draft_dtype",
         "draft_overrides",
-        "draft_rope",
-        "ignore_patterns",
         "kv_dtype",
-        "hash_algo",
         "block_size",
         "tp",
         "dcp",
@@ -184,28 +178,14 @@ def test_dedicated_identity_covers_effective_configuration(
         config.model_config.dtype = "float32"
     elif change == "target_overrides":
         config.model_config.hf_overrides = {"rope_theta": 20000}
-    elif change == "target_rope":
-        config.model_config.hf_text_config = {"rope_scaling": {"factor": 2}}
     elif change == "draft_method":
         spec.method = "eagle3"
     elif change == "draft_quantization":
         spec.quantization = "fp8"
-    elif change == "effective_draft_quantization":
-        spec.draft_model_config.quantization = "fp8"
-    elif change == "effective_draft_dtype":
-        spec.draft_model_config.dtype = "float32"
     elif change == "draft_overrides":
-        spec.draft_model_config.hf_overrides = {"rope_theta": 30000}
-    elif change == "draft_rope":
-        spec.draft_model_config.hf_text_config = {
-            "rope_parameters": {"rope_theta": 12345}
-        }
-    elif change == "ignore_patterns":
-        config.load_config.ignore_patterns = ["other/**/*"]
+        spec.hf_overrides = {"rope_theta": 30000}
     elif change == "kv_dtype":
         config.cache_config.cache_dtype = "float16"
-    elif change == "hash_algo":
-        config.cache_config.prefix_caching_hash_algo = "sha256_cbor"
     elif change == "block_size":
         config.cache_config.block_size = 32
     elif change == "tp":
@@ -249,7 +229,8 @@ def test_identity_ignores_tuning_options(tmp_path):
     config.additional_config = {}
     config.model_config.revision = "main"
     config.model_config.max_model_len = 4096
-    config.model_config.hf_text_config = {"architectures": ["A"], "vocab_size": 10}
+    config.model_config.hf_text_config = {"num_hidden_layers": 2}
+    config.model_config.quantization_config = {"bits": 4}
     before = get_revolta_identity(config, str(tmp_path / "kv"), manifest)
     assert before is not None
     long_context = config.kernel_config.long_context_kv
@@ -265,7 +246,10 @@ def test_identity_ignores_tuning_options(tmp_path):
     config.additional_config = {"anything": 1}
     config.model_config.revision = "other"
     config.model_config.max_model_len = 8192
-    config.model_config.hf_text_config = {"architectures": ["B"], "vocab_size": 20}
+    config.model_config.hf_text_config = {"num_hidden_layers": 4}
+    config.model_config.quantization_config = {"bits": 8}
+    config.cache_config.prefix_caching_hash_algo = "sha256_cbor"
+    config.load_config.ignore_patterns = ["other/**/*"]
     config.cache_config.gpu_memory_utilization = 0.5
     config.load_config.load_format = "safetensors"
     after = get_revolta_identity(config, str(tmp_path / "kv"), manifest)
@@ -742,6 +726,7 @@ def test_multimodal_model_is_supported_and_identified(tmp_path):
         limit_per_prompt: dict
         mm_processor_kwargs: dict | None = None
         mm_encoder_tp_mode: str = "weights"
+        media_io_kwargs: dict | None = None
 
     model = _checkpoint(tmp_path)
     manifest = _write_manifest(tmp_path, {"target": str(model)})
@@ -751,7 +736,9 @@ def test_multimodal_model_is_supported_and_identified(tmp_path):
     first = get_revolta_identity(config, str(tmp_path / "kv"), manifest)
     assert first is not None
     config.model_config.multimodal_config = MM(
-        limit_per_prompt={"image": 8}, mm_encoder_tp_mode="data"
+        limit_per_prompt={"image": 8},
+        mm_encoder_tp_mode="data",
+        media_io_kwargs={"video": {"fps": 2}},
     )
     second = get_revolta_identity(config, str(tmp_path / "kv"), manifest)
     assert second == first

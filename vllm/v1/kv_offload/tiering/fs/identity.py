@@ -36,30 +36,14 @@ KV_COMPAT_EPOCH = 1
 # configuration objects stay out, so changing them never discards the archive.
 # A new feature that changes what is stored must add its field here, or add 1
 # to KV_COMPAT_EPOCH.
-_MODEL_FIELDS = ("dtype", "quantization", "quantization_config", "hf_overrides")
-# Structure of the resolved text model that shapes K/V (the checkpoint's own
-# config file is already covered by the content manifest).
-_TEXT_STRUCTURE_FIELDS = (
-    "num_hidden_layers",
-    "num_attention_heads",
-    "num_key_value_heads",
-    "head_dim",
-    "hidden_size",
-    "rope_parameters",
-    "rope_scaling",
-    "rope_theta",
-    "partial_rotary_factor",
-    "sliding_window",
-    "layer_types",
-)
-# These change the tokens or embeddings of a multimodal prefix.
-_MULTIMODAL_FIELDS = (
-    "mm_processor_kwargs",
-    "media_io_kwargs",
-    "video_pruning_rate",
-    "mm_encoder_attn_dtype",
-    "mm_encoder_fp8_scale_path",
-)
+#
+# Weights, config files and checkpoint structure are covered by the content
+# manifest; the page keys already carry token and multimodal hashes. What is
+# left is what changes values without changing either.
+_MODEL_FIELDS = ("dtype", "quantization", "hf_overrides")
+# Server-level processor options are merged inside the processor and are not
+# part of the multimodal input hash (which only sees per-request kwargs).
+_MULTIMODAL_FIELDS = ("mm_processor_kwargs", "mm_encoder_fp8_scale_path")
 _DRAFT_FIELDS = (
     "method",
     "quantization",
@@ -97,7 +81,7 @@ def _local_model(config, role: str) -> str:
     return os.path.realpath(path)
 
 
-def _loader_identity(config) -> dict:
+def _check_loader(config) -> None:
     from vllm.model_executor.model_loader import _LOAD_FORMAT_TO_MODEL_LOADER
     from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 
@@ -111,25 +95,16 @@ def _loader_identity(config) -> dict:
         config, "secondary_weights", None
     ):
         raise ManifestError("extra loader configuration/weights are not supported")
-    # Which checkpoint files are read; the files themselves are in the manifest.
-    return _fields(config, ("ignore_patterns",))
 
 
-def _model_identity(config) -> dict:
-    result = _fields(config, _MODEL_FIELDS)
-    overrides = result["hf_overrides"]
+def _check_model(config) -> None:
+    overrides = getattr(config, "hf_overrides", None)
     if callable(overrides):
-        # SpeculativeConfig installs this built-in transformation itself. Its
-        # resolved output is recorded below.
+        # SpeculativeConfig installs this built-in transformation itself.
         from vllm.config.speculative import SpeculativeConfig
 
         if overrides is not SpeculativeConfig.hf_config_override:
             raise ManifestError("custom callable hf_overrides cannot be identified")
-        result["hf_overrides"] = "SpeculativeConfig.hf_config_override"
-    # Multimodal models: the encoder weights are part of the checkpoint (and
-    # of its content manifest), and request block hashes already carry the
-    # multimodal input hashes; what remains is the processing configuration
-    # that changes the tokens and embeddings of a prefix.
     mm = getattr(config, "multimodal_config", None)
     if (
         getattr(mm, "mm_encoder_attn_dtype", None) == "fp8"
@@ -138,13 +113,17 @@ def _model_identity(config) -> dict:
         raise ManifestError(
             "runtime multimodal encoder scale calibration is not supported"
         )
+
+
+def _model_identity(config) -> dict:
+    _check_model(config)
+    result = _fields(config, _MODEL_FIELDS)
+    if callable(result["hf_overrides"]):
+        result["hf_overrides"] = "SpeculativeConfig.hf_config_override"
+    mm = getattr(config, "multimodal_config", None)
     result["multimodal_config"] = (
         None if mm is None else _plain(_fields(mm, _MULTIMODAL_FIELDS))
     )
-    text = getattr(config, "hf_text_config", None) or {}
-    if hasattr(text, "to_dict"):
-        text = text.to_dict()
-    result["text_structure"] = {name: text.get(name) for name in _TEXT_STRUCTURE_FIELDS}
     return result
 
 
@@ -328,7 +307,7 @@ def get_revolta_identity(
             raise ManifestError("runtime KV scale calibration is not supported")
         target = vllm_config.model_config
         roots = {"target": _local_model(target, "target")}
-        loader = _loader_identity(vllm_config.load_config)
+        _check_loader(vllm_config.load_config)
         speculative = vllm_config.speculative_config
         draft_identity = None
         if speculative is not None:
@@ -342,12 +321,12 @@ def get_revolta_identity(
                 roots["draft"] = draft_root
             draft_identity = {
                 **_fields(speculative, _DRAFT_FIELDS),
-                "effective_model": _model_identity(draft),
-                "loader": _loader_identity(
-                    getattr(speculative, "draft_load_config", None)
-                    or vllm_config.load_config
-                ),
             }
+            _check_model(draft)
+            _check_loader(
+                getattr(speculative, "draft_load_config", None)
+                or vllm_config.load_config
+            )
         manifest = load_manifest(manifest_path)
         # Auxiliary directory inputs also require an exact file set. A newly
         # added file can change loader selection even if older files match.
@@ -370,14 +349,12 @@ def get_revolta_identity(
             "content_manifest_digest": content,
             "content_algorithm": manifest["algorithm"],
             "target": _model_identity(target),
-            "loader": loader,
             "draft": draft_identity,
             "cache": _fields(
                 vllm_config.cache_config,
                 (
                     "cache_dtype",
                     "block_size",
-                    "prefix_caching_hash_algo",
                     "mamba_cache_dtype",
                     "mamba_ssm_cache_dtype",
                     "mamba_block_size",

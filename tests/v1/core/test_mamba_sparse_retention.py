@@ -896,8 +896,10 @@ def test_exact_end_publish_revisit_consume_and_republish(monkeypatch, trim):
     if trim:
         assert request.num_computed_tokens != request.num_tokens - 1
         assert not entries and not index.pending_gathers
+        assert index.events == {"skip_end_mismatch": 1}
         return
     [entry] = entries
+    assert index.events == {"published": 1}
     assert entry.length == request.num_tokens
     assert request.state_end > 2 * STATE_BLOCK > request.num_computed_tokens
     [gather] = index.pending_gathers

@@ -382,6 +382,7 @@ class StoreMetrics:
         arbiter: Any = None,
         manager: Any = None,
         ledger: Any = None,
+        exact_end: Any = None,
         idle: bool = False,
     ) -> dict[str, Any] | None:
         if now < self.next_export:
@@ -453,6 +454,8 @@ class StoreMetrics:
             totals.update(
                 {f"reservation_{k}": v for k, v in manager.ledger.events.items()}
             )
+        if exact_end is not None:
+            totals.update({f"exact_end_{k}": v for k, v in exact_end.events.items()})
         if ledger is not None:
             gauges["gpu_hot_committed_groups"] = ledger.hot_used
         if ssd is not None:

@@ -221,6 +221,44 @@ def test_lru_repeated_input_and_real_request_count(tmp_path):
 
 
 @pytest.mark.parametrize("tp", [1, 2, 4])
+@pytest.mark.parametrize("empty_tail", [True, False])
+def test_greedy_merge_returns_real_tokens_for_nan_scores(tmp_path, tp, empty_tail):
+    # Warmup runs the drafter on placeholder hidden states, so scores can be
+    # NaN; the merged ID feeds target_logits[row, id] in rejection sampling.
+    tails = [_tail(tmp_path, tp=tp, rank=r)[0] for r in range(tp)]
+    T, B, M = 4, 8, 4
+    pairs = []
+    for r, tail in enumerate(tails):
+        if empty_tail:
+            tail.tail_valid.zero_()
+        base_vals = torch.full((M,), torch.nan)
+        base_keys = torch.full((M,), r * (B // tp), dtype=torch.int64)
+        vals = torch.full((M, T), torch.nan)
+        tail_mod._merge_local[(M,)](
+            base_vals,
+            base_keys,
+            vals,
+            tail.slot_token,
+            tail.tail_valid,
+            tail.local_pair,
+            B,
+            T,
+            4,
+        )
+        pairs.append(tail.local_pair.clone())
+    tail_mod._merge_global[(M,)](
+        torch.cat(pairs, -1),
+        tails[0].runtime.token_id_map,
+        tails[0].out_tokens,
+        B,
+        tp,
+        tp,
+    )
+    out = tails[0].out_tokens[:M]
+    assert torch.equal(out, tails[0].runtime.token_id_map[:1].expand(M))
+
+
+@pytest.mark.parametrize("tp", [1, 2, 4])
 def test_greedy_k1_k2_total_order(tmp_path, tp):
     tails = [_tail(tmp_path, tp=tp, rank=r)[0] for r in range(tp)]
     T, B, M = 4, 8, 8

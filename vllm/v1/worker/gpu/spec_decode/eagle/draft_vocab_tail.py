@@ -126,7 +126,13 @@ def _merge_local(
     key = tl.min(tl.where(vals == best, keys, 0x7FFFFFFF), 0)
     base_val = tl.load(base_values + row).to(tl.float32)
     base_key = tl.load(base_keys + row)
-    use_base = (base_val > best) | ((base_val == best) & (base_key < key))
+    # No tail key wins when no slot is valid or the values do not compare
+    # (NaN); the base key is always a real token, as with an argmax.
+    use_base = (
+        (key == 0x7FFFFFFF)
+        | (base_val > best)
+        | ((base_val == best) & (base_key < key))
+    )
     tl.store(pairs + row * 2, tl.where(use_base, base_val, best))
     tl.store(pairs + row * 2 + 1, tl.where(use_base, base_key, key).to(tl.float32))
 
@@ -143,6 +149,10 @@ def _merge_global(
     ).to(tl.int64)
     best = tl.max(vals, 0)
     key = tl.min(tl.where((ranks < TP) & (vals == best), keys, 0x7FFFFFFF), 0)
+    # Values that do not compare (NaN) leave no winner; every rank's key is a
+    # real token, so fall back to the smallest one instead of the sentinel.
+    any_key = tl.min(tl.where(ranks < TP, keys, 0x7FFFFFFF), 0)
+    key = tl.where(key == 0x7FFFFFFF, any_key, key)
     base_token = tl.load(token_map + key, key < B, other=0)
     tl.store(output + row, tl.where(key < B, base_token, key - B))
 

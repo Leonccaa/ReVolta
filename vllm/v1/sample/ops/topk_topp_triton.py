@@ -183,18 +183,30 @@ def _topk_topp_kernel(
                     write_pos = tl.where(outlier_mask, cumulative_pos, -1)
                     tl.store(BUFFER_ROW + write_pos, logits_blk, mask=outlier_mask)
 
-                # If no finite logits exist (all -inf), clamp min to
-                # max so the search converges to -inf (no masking).
-                min_logit = tl.minimum(min_logit, max_logit)
-
                 # Second passes: Ternary search for pivot
                 num_iters = 0
                 k_pivot = float("inf")
                 k_pivots_num = tl.zeros((), dtype=tl.uint32)
                 min_larger = float("inf")
                 num_min_larger = tl.zeros((), dtype=tl.uint32)
-                if num_finite_total <= k:
-                    # All finite logits survive top-k; skip the cutoff search.
+
+                # The whole-row search only probes pivots above min_logit.
+                # If the k-th largest logit is min_logit, top-k keeps every
+                # finite logit, including the entire tie at the minimum.
+                topk_masks_nothing = num_finite_total <= k
+                if not topk_masks_nothing and num_outliers <= k:
+                    num_min_logit = tl.zeros((), dtype=tl.uint32)
+                    for i in range(0, NUM_TILES):
+                        offs_n = i * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+                        logits_blk = tl.load(
+                            LOGITS_ROW + offs_n,
+                            mask=offs_n < VOCAB_SIZE,
+                            other=-float("inf"),
+                        )
+                        num_min_logit += tl.sum(logits_blk == min_logit)
+                    topk_masks_nothing = num_finite_total - num_min_logit < k
+
+                if topk_masks_nothing:
                     k_pivot = -float("inf")
                 elif num_outliers > k:
                     max_range = max_logit
@@ -374,11 +386,10 @@ def _topk_topp_kernel(
                 num_keep = num_duplicate_logit - (k_pivots_num - k)
                 num_kept = tl.zeros((), dtype=tl.uint32)
 
-                # Top-k only path.  If there are fewer finite values
-                # than k (e.g. grammar mask), keep everything.
-                final_pivot = k_pivot if num_finite_total > k else -float("inf")
+                # Rows that top-k leaves intact take standalone top-p below.
+                final_pivot = k_pivot
 
-                if TOPP_ENABLED and num_finite_total > k:
+                if TOPP_ENABLED and not topk_masks_nothing:
                     #### TOP-P SAMPLING AFTER TOP-K ####
                     p = tl.load(P + row_id)
                     if p < 1.0:
@@ -599,9 +610,8 @@ def _topk_topp_kernel(
             #### STANDALONE TOP-P SAMPLING ####
             # When the split top-p pipeline co-runs (mixed top-k + top-p
             # batches), it covers p-only rows (k >= VOCAB_SIZE); skip those
-            # here. Rows whose top-k was a no-op because they have <= k
-            # finite logits (e.g. grammar masks) are NOT covered by the
-            # split pipeline and must get standalone top-p here.
+            # here. Rows with k < VOCAB_SIZE whose top-k was a no-op
+            # still run standalone top-p here.
             run_standalone = True
             if SPLIT_COVERS_PONLY and TOPK_ENABLED:
                 run_standalone = tl.load(K + row_id) < VOCAB_SIZE
@@ -632,7 +642,7 @@ def _topk_topp_kernel(
                 max_sample = avg_logit + std_logit * 10.0
                 sum_exp_logits = 0.0
 
-                # First pass: compute max and min logits and sum_exp_logits
+                # First pass: compute max logit and sum_exp_logits
                 for i in range(0, NUM_TILES):
                     offs_n = i * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
                     mask_n = offs_n < VOCAB_SIZE
@@ -640,20 +650,9 @@ def _topk_topp_kernel(
                         LOGITS_ROW + offs_n, mask=mask_n, other=-float("inf")
                     )
                     max_logit = tl.maximum(max_logit, tl.max(logits_blk))
-                    # Exclude -inf from min to keep binary search bounds
-                    # finite (avoids NaN pivots).
-                    finite_blk = tl.where(
-                        logits_blk > -float("inf"), logits_blk, float("inf")
-                    )
-                    min_logit = tl.minimum(min_logit, tl.min(finite_blk))
-
                     probs_blk = tl.exp(logits_blk - max_sample)
                     probs_blk = tl.where(mask_n, probs_blk, 0.0)
                     sum_exp_logits += tl.sum(probs_blk)
-
-                # If no finite logits exist (all -inf), clamp min to
-                # max so the search converges to -inf (no masking).
-                min_logit = tl.minimum(min_logit, max_logit)
 
                 idx = tl.cast(p * 200, tl.int32)
                 idx = tl.maximum(0, tl.minimum(idx, 199))
@@ -686,7 +685,9 @@ def _topk_topp_kernel(
                     tl.store(BUFFER_ROW + write_pos, probs_blk, mask=outlier_mask)
 
                 max_range = tl.exp(max_logit - max_sample) / sum_exp_logits
-                min_range = tl.exp(min_logit - max_sample) / sum_exp_logits
+                # A nucleus that includes the smallest finite logit needs a
+                # pivot below its probability.
+                min_range = 0.0
 
                 p_pivot = 1.0
                 num_iters = 0

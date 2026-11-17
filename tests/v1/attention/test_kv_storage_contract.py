@@ -391,7 +391,7 @@ def test_prefix_reuses_int8_blocks_and_retains_dcp_grid(codec):
     manager.free(first)
 
 
-@pytest.mark.parametrize("dtype", ["fp8_e4m3", "int8"])
+@pytest.mark.parametrize("dtype", ["fp8_e4m3", "int8", "fp8_e4m3_per_token_head"])
 def test_platform_preserves_1632_grid(monkeypatch, dtype):
     from tests.platforms.test_hybrid_dcp_block_alignment import (
         _LooseBackend,
@@ -416,8 +416,9 @@ def test_platform_preserves_1632_grid(monkeypatch, dtype):
     Platform._align_hybrid_block_size(config, _LooseBackend)
     assert config.cache_config.block_size == 1632
     assert config.cache_config.mamba_block_size == 1632
+    # Planar pages hold 520 bytes per token/head at D=256, whatever the codec.
     assert config.cache_config.mamba_page_size_padded == (
-        848640 if dtype == "int8" else None
+        None if dtype == "fp8_e4m3" else 848640
     )
 
 

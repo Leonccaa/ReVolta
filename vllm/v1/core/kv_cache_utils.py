@@ -1168,7 +1168,8 @@ def unify_kv_cache_spec_page_size(
     from vllm.v1.kv_cache_interface import KVQuantMode
 
     if any(
-        isinstance(s, AttentionSpec) and s.kv_quant_mode == KVQuantMode.INT8_PLANAR
+        isinstance(s, AttentionSpec)
+        and s.kv_quant_mode in (KVQuantMode.INT8_PLANAR, KVQuantMode.FP8_E4M3_PLANAR)
         for s in kv_cache_spec.values()
     ):
         quantum = 16

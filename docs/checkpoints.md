@@ -363,15 +363,120 @@ about 5–8% slower. CPU offload works; the disk tier is not supported with INT8
 
 The checkpoint is about 126 GiB. Follow the
 [checkpoint setup](#standard-nvfp4-checkpoint-setup) for the pinned base,
-combined scale/draft pack and 512K views.
+combined scale/draft pack and 512K views. This section covers the settings that
+matter once it loads. It is a draft: values marked `TODO` are still being
+measured.
+
+### Automatic configuration
 
 `--quantization` is not needed. The engine reads `quant_algo: NVFP4` from the
 checkpoint and selects `modelopt_fp4`; this replaces a `--quantization` value given on
-the command line. On the FP16 QSA SM70 TP4 profile,
-ReVolta detects NVFP4 weights from checkpoint quantization metadata and sets
-the validated kernel switches and a 700 MiB CUDA graph reserve automatically.
+the command line. On the FP16 QSA SM70 TP4 profile, ReVolta detects NVFP4
+weights from checkpoint quantization metadata and sets the validated kernel
+switches for unset variables:
+
+- raw E4M3 block scales (`VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE=1`), which
+  avoid keeping a second FP16 copy of the scales;
+- raw grouped decode for 2–40 rows
+  (`VLLM_SM70_NVFP4_QWEN38_MOE_RAW_GROUPED_DECODE=1`);
+- QPN dynamic decode for every live width 2–16
+  (`VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE=1`);
+- TurboMind NVFP4 routes, grouped prefill and small-shape tuning, and a CUDA
+  graph reserve chosen by speculative method (next section).
+
 Explicit environment settings take precedence. The startup profile audit logs
 each value and its source (`profile`, `environment`, or `upstream_default`).
+The complete list is in
+[Values applied by the ReVolta profile](configuration.md#values-applied-by-the-revolta-profile).
+
+### CUDA graph reserve
+
+MRv2 does not profile graph memory, so the profile reserves it before sizing the
+KV cache through `VLLM_V2_CUDAGRAPH_MEM_MIB`:
+
+| Speculative method | KV cache dtype | Reserve per GPU |
+| --- | --- | ---: |
+| MTP | `fp8_per_token_head` or `int8` | 600 MiB |
+| MTP | other (for example `fp8_e4m3`) | 700 MiB |
+| DFlash2 | any | 1200 MiB, single-request tail graphs off |
+
+If the startup log shows `CUDA graphs took … more than the reserve`, set
+`VLLM_V2_CUDAGRAPH_MEM_MIB` to at least the value in the message, or lower
+`--gpu-memory-utilization`. Otherwise the KV pool takes memory the graphs need
+and a large mixed step can run out of GPU memory. Measured capture size for
+NVFP4 with DFlash2 and tail graphs off: `TODO(measure)`.
+
+### KV cache format
+
+For QSA models, `--kv-cache-dtype auto` selects `fp8_per_token_head`: planar
+E4M3 with a dynamic scale per token and head. It needs no calibrated KV scales,
+so the NVFP4 checkpoint works without the scale pack. `int8` also computes its
+scales at runtime. `fp8_e4m3` needs calibrated scales, which the
+[pack](#standard-nvfp4-checkpoint-setup) supplies; the launch example there
+selects it explicitly. With MTP, the draft must use the same KV format as the
+target. See [KV scales and draft selection](#kv-scales-and-draft-selection).
+
+### GPU memory per card
+
+Measured on 4×V100 with TP4, MTP4, `fp8_per_token_head` and long-context host
+KV, per GPU:
+
+| Item | Standard NVFP4 (RadixArk) |
+| --- | ---: |
+| Weights | 21.56 GiB |
+| torch peak | 1.41 GiB |
+| Non-torch | 0.15 GiB |
+| Warmup | 0.76 GiB |
+| CUDA graphs | 0.68 GiB (measured under the earlier reserve) |
+| GPU KV cache | 5.57 GiB |
+
+Uncensored AWQ weights take 22.01 GiB in the same configuration. Raw scales save
+about 1.69 GiB per GPU compared with prepared scales. A shared decode scratch
+buffer (about 91 MiB per GPU) is planned: `TODO(pending PR)`.
+
+### `--gpu-memory-utilization`
+
+With long-context host KV and DFlash2, `0.95` could run out of memory on a large
+mixed step because the graph reserve was too small. The reserve is fixed in new
+versions. For versions before the fix, use 0.92–0.93. Recommended value for the
+new version: `TODO(measure)`.
+
+### Speed compared with AWQ
+
+Same configuration and time window on 4×V100 PCIe, 250 W per GPU, TP4/DCP2.
+Single-request figures are per speculative round.
+
+| Measurement | Uncensored AWQ | Standard NVFP4 |
+| --- | ---: | ---: |
+| MTP4, 1 request, sampling | 28.36 ms | 28.67 ms |
+| MTP4, 1 request, greedy | 27.68 ms | 28.00 ms |
+| MTP4, 4 requests | 206.9 tok/s | 207.6 tok/s |
+| MTP4, 8 requests | 316.5 tok/s | 325.4 tok/s |
+| DFlash2, 1 request, sampling / greedy | 29.41 / 28.25 ms | 29.65 / 28.69 ms |
+| DFlash2, 1 request | 97.8 tok/s | 90.4 tok/s |
+| DFlash2, 4 requests | 243.4 tok/s | 238.3 tok/s |
+| DFlash2, 8 requests | 321.2 tok/s | 331.8 tok/s |
+
+- With MTP4, NVFP4 rounds are about 1.1% slower and single-request tok/s is
+  level. Single-request short-prompt throughput also depends on the MTP draft's
+  acceptance rate, which comes from the draft shipped with the checkpoint, not
+  from the NVFP4 kernel speed.
+- Prepared scales (`VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE=0`) run a single request
+  about 0.5 ms per round faster, but are slower at 4 and 8 requests and use
+  1.69 GiB more per GPU, so the profile does not select them. This is being
+  optimized: `TODO`.
+
+### Settings you may change
+
+Names are as defined in `vllm/envs.py`; see
+[configuration](configuration.md#values-applied-by-the-revolta-profile) for the rest.
+
+| Variable | When to change |
+| --- | --- |
+| `VLLM_V2_CUDAGRAPH_MEM_MIB` | Raise it when the startup warning above appears. A reserve that is too high wastes KV capacity. |
+| `VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE` | `0` keeps prepared FP16 scales: faster single request, slower at 4–8 requests, 1.69 GiB more per GPU. Raw scales cannot be combined with DBO or microbatching; the loader rejects that and asks you to disable this variable. |
+| `VLLM_SM70_NVFP4_QWEN38_MOE_RAW_GROUPED_DECODE` | Needs raw scale storage; with `RAW_SCALE=0` the raw grouped route is not used. |
+| `VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS` | The profile sets `0` for DFlash2. Set `1` to capture single-request verifier tails again, and raise the reserve to 1500 MiB (see [DFlash2](dflash2.md)). |
 
 ## NVIDIA FP4-Local
 

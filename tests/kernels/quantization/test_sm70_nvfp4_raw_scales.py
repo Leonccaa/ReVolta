@@ -40,7 +40,7 @@ def test_raw_scale_strict_expansion_all_e4m3_codes(stage, interleaved):
     )
     if stage == "w13":
         columns = torch.arange(shape[-1], device="cuda")
-        slots = ((columns // 32) % 2) if interleaved else (columns >= 160).long()
+        slots = (columns % 2) if interleaved else (columns >= 160).long()
         global_by_column = globals_[:, slots].unsqueeze(1)
     else:
         global_by_column = globals_.unsqueeze(1)
@@ -87,3 +87,88 @@ def test_raw_scale_admission_checks_effective_hmma_scale():
     out = torch.empty_like(prepared)
     assert _raw_scales_match_prepared(out, codes, globals_, prepared, False)
     assert torch.equal(out, prepared * 16384.0)
+
+
+@pytest.mark.parametrize("interleaved", [False, True])
+@pytest.mark.parametrize("equal_globals", [False, True])
+def test_prepared_w13_matches_raw_consumers(interleaved, equal_globals):
+    torch.manual_seed(442)
+    codes = torch.randint(0, 16, (2560, 320), device="cuda", dtype=torch.uint8)
+    raw = torch.randint(48, 80, (160, 320), device="cuda", dtype=torch.uint8)
+    globals_ = torch.tensor([2**-10, 2**-10 if equal_globals else 2**-9], device="cuda")
+    logical_global = globals_.repeat_interleave(160)
+    effective = (raw.view(torch.float8_e4m3fn).float() * logical_global).half()
+    weight, prepared, _ = sm70_ops.nvfp4_sm70_prepare(
+        codes, effective, 16, interleave_gated_silu=interleaved
+    )
+    physical_global = globals_.repeat(160) if interleaved else logical_global
+    raw_prepared = (
+        (prepared.float() / physical_global)
+        .to(torch.float8_e4m3fn)
+        .view(torch.uint8)
+        .contiguous()
+    )
+    weight = weight.unsqueeze(0).repeat(512, 1, 1)
+    prepared = prepared.unsqueeze(0).repeat(512, 1, 1)
+    raw_prepared = raw_prepared.unsqueeze(0).repeat(512, 1, 1)
+    globals_ = globals_.unsqueeze(0).repeat(512, 1)
+    expanded = torch.empty_like(prepared)
+    sm70_ops.nvfp4_expand_raw_scales_sm70_out(
+        expanded, raw_prepared, globals_, interleaved, False
+    )
+    assert torch.equal(expanded.view(torch.int16), prepared.view(torch.int16))
+
+    x = (torch.randn(8, 2560, device="cuda") * 0.1).half()
+    ids = torch.arange(80, device="cuda", dtype=torch.int32) % 3
+    projected, raw_projected = [
+        torch.empty(10, 320, device="cuda", dtype=torch.float16) for _ in range(2)
+    ]
+    sm70_ops.nvfp4_moe_qpn_m1_sm70_out(
+        projected, x[:1], weight, prepared, ids[:10], True, 4
+    )
+    sm70_ops.nvfp4_moe_qpn_raw_scale_sm70_out(
+        raw_projected,
+        x[:1],
+        weight,
+        raw_prepared,
+        globals_,
+        ids[:10],
+        True,
+        interleaved,
+        4,
+    )
+    assert torch.equal(raw_projected.view(torch.int16), projected.view(torch.int16))
+
+    fused, raw_fused = [
+        torch.empty(80, 160, device="cuda", dtype=torch.float16) for _ in range(2)
+    ]
+    sm70_ops.nvfp4_moe_qpn_w13_swiglu_batch_sm70_out(
+        fused, x, weight, prepared, ids, interleaved
+    )
+    sm70_ops.nvfp4_moe_qpn_raw_w13_swiglu_batch_sm70_out(
+        raw_fused, x, weight, raw_prepared, globals_, ids, interleaved
+    )
+    assert torch.equal(raw_fused.view(torch.int16), fused.view(torch.int16))
+
+    if not sm70_ops.has_nvfp4_raw_grouped_decode_dispatch():
+        pytest.skip("requires raw grouped-decode native operator")
+    # W2 is unused by the assertion; compare the real grouped W13 intermediate
+    # against the prepared-scale fused W13 result, with the same split-K=4.
+    grouped = torch.empty_like(fused)
+    sm70_ops.nvfp4_raw_grouped_decode_sm70_out(
+        torch.empty_like(x),
+        grouped,
+        torch.empty(1608, device="cuda", dtype=torch.int32),
+        x,
+        weight,
+        raw_prepared,
+        globals_,
+        torch.zeros(512, 160, 320, device="cuda", dtype=torch.int32),
+        torch.full((512, 10, 2560), 64, device="cuda", dtype=torch.uint8),
+        torch.full((512, 1), 2**-10, device="cuda"),
+        ids.view(8, 10),
+        torch.full((8, 10), 0.1, device="cuda"),
+        4,
+        interleaved,
+    )
+    assert torch.equal(grouped.view(torch.int16), fused.view(torch.int16))

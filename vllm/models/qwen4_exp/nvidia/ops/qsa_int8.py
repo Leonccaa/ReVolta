@@ -6,6 +6,9 @@ import math
 
 import torch
 
+from vllm.models.deepseek_v4.common.ops.fp8_software import (
+    fp8_e4m3fn_bits_to_fp32_bitcast,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.kv_cache_view import KVPageMapping
@@ -68,7 +71,6 @@ def _int8_sparse_kernel(
     POSITIONS=None,
     SEQLENS=None,
     CAUSAL: tl.constexpr = True,
-    E4M3_DECODER: tl.constexpr = None,
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -150,8 +152,8 @@ def _int8_sparse_kernel(
             other=0.0,
         )
         if KV_E4M3:
-            keys = E4M3_DECODER(keys)
-            values = E4M3_DECODER(values)
+            keys = fp8_e4m3fn_bits_to_fp32_bitcast(keys)
+            values = fp8_e4m3fn_bits_to_fp32_bitcast(values)
         keys = keys.to(query.dtype)
         values = values.to(query.dtype)
         key_scales = tl.load(
@@ -398,13 +400,6 @@ def triton_attention(
 ):
     """FP32 late-scale reference/fallback; never expands the KV cache to Half."""
     validate_planes(q, k, v, sk, sv, codec)
-    decoder = None
-    if codec is FP8_E4M3_PER_TOKEN_HEAD:
-        from vllm.models.deepseek_v4.common.ops.fp8_software import (
-            fp8_e4m3fn_bits_to_fp32_bitcast,
-        )
-
-        decoder = fp8_e4m3fn_bits_to_fp32_bitcast
     rows, heads, dim = q.shape
     width = max_seq_len if dense else indices.shape[1]
     group = heads // k.shape[2]
@@ -472,7 +467,6 @@ def triton_attention(
         BLOCK_M=max(16, triton.next_power_of_2(group)),
         BLOCK_N=block_n,
         KV_E4M3=codec is FP8_E4M3_PER_TOKEN_HEAD,
-        E4M3_DECODER=decoder,
         K_SCALES=sk,
         V_SCALES=sv,
         KS_BLOCK=sk.stride(0),

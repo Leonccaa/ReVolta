@@ -1263,6 +1263,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.sampler.apply_staged_writes()
 
     def update_requests(self, scheduler_output: SchedulerOutput) -> None:
+        if scheduler_output.mamba_state_gathers:
+            self.model_state.run_state_gathers(scheduler_output.mamba_state_gathers)
         # Add new blocks and update num_computed_tokens for the existing requests.
         reqs = scheduler_output.scheduled_cached_reqs
         num_computed_tokens_np = self.req_states.num_computed_tokens_np

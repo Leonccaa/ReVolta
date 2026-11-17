@@ -1034,6 +1034,12 @@ def _prepare_dflash_inputs_kernel(
                 tl.store(out_query_slot_mapping_ptr + block, PAD_SLOT_ID, mask=mask)
 
 
+# Upper bound of the ``BLOCK_SIZE`` tile of ``_prepare_dflash_inputs_kernel``;
+# startup kernel warmup sizes its prefill profiles by this cap so every tile
+# bucket the kernel can launch is compiled before serving.
+PREPARE_DFLASH_INPUTS_TILE_CAP = 256
+
+
 def prepare_dflash_inputs(
     input_buffers: InputBuffers,
     query_slot_mapping: torch.Tensor,
@@ -1077,7 +1083,10 @@ def prepare_dflash_inputs(
     # per-request query length, not the total token count across the batch.
     max_target_query_len = int(input_batch.num_scheduled_tokens.max())
     max_tokens_per_req = max_target_query_len + num_query_per_req
-    BLOCK_SIZE = min(256, triton.next_power_of_2(max(1, max_tokens_per_req)))
+    BLOCK_SIZE = min(
+        PREPARE_DFLASH_INPUTS_TILE_CAP,
+        triton.next_power_of_2(max(1, max_tokens_per_req)),
+    )
     num_blocks = triton.cdiv(max_tokens_per_req, BLOCK_SIZE)
     _prepare_dflash_inputs_kernel[(num_reqs, num_blocks)](
         input_buffers.input_ids,

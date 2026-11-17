@@ -9,7 +9,7 @@ from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.history_block_pool import HistoryBlockPool
 from vllm.v1.core.long_context_kv import HOST
 from vllm.v1.kv_offload.base import make_offload_key
-from vllm.v1.kv_offload.host.page_table import PageState
+from vllm.v1.kv_offload.host.page_table import PageState, Result
 
 
 def pool():
@@ -93,6 +93,35 @@ def test_ring_does_not_allocate_host_page_and_binding_updates_are_last_writer():
     assert fresh.block_id == ring[0].block_id
     assert p.hgen[fresh.block_id] == 2
     assert p.binding_updates[fresh.block_id] == handle.page_id
+
+
+def test_exact_tail_waits_for_receipts_without_sealing():
+    from vllm.v1.core.kv_cache_utils import BlockHash, make_block_hash_with_group_id
+    from vllm.v1.kv_offload.host.hit import HostKVHitManager
+
+    p = pool()
+    p.start_step(1)
+    [block] = p.get_new_blocks(1)
+    key = BlockHash(b"tail" * 8)
+    p.cache_under_key(block, make_block_hash_with_group_id(key, 0))
+    assert p.finish_schedule(["a"]) == []
+    p.release_request("a", [block])
+    p.free_blocks([block])
+    hits = HostKVHitManager(None, None, history_pool=p, block_tokens=16)
+    offload_key = make_offload_key(key, 0)
+    p.tail_ready(block.block_id)
+    assert hits.local_binding(block.block_id, offload_key) is None
+    p.host_pages.complete_step(1, 3)
+    p.tail_ready(block.block_id)
+    handle = p.bindings[block.block_id]
+    assert hits.local_binding(block.block_id, offload_key) == handle
+    page = p.host_pages.get(handle)
+    assert page.state == PageState.PRIVATE and page.ticket is None
+    assert page.seal_result == Result.PENDING
+    assert p.host_pages.lookup(offload_key) is None
+    p.host_pages.producer_result(handle, compute=Result.FAILED, seal=Result.PENDING)
+    p.tail_ready(block.block_id)
+    assert page.compute_result == Result.FAILED
 
 
 def test_transfer_job_keeps_detached_page_until_all_worker_completions():

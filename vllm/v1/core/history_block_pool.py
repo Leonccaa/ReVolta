@@ -630,6 +630,22 @@ class HistoryBlockPool(BlockPool):
                 self.last_use[key] = max(self.last_use.get(key, 0), last_use)
                 self.host_pages.touch(self.bindings[hid], last_use)
 
+    def tail_ready(self, hid: int) -> None:
+        """Mark a private tail computed once receipts cover its last write."""
+        handle = self.bindings.get(hid)
+        if handle is None:
+            return
+        page = self.host_pages.get(handle)
+        if (
+            page.state == PageState.PRIVATE
+            and page.ticket is None
+            and page.compute_result == Result.PENDING
+            and self.host_pages.watermark >= page.last_use
+        ):
+            self.host_pages.producer_result(
+                handle, compute=Result.OK, seal=page.seal_result
+            )
+
     def touch(self, blocks) -> None:
         if not self.elastic:
             return super().touch(blocks)

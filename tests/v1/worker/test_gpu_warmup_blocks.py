@@ -8,17 +8,24 @@ from typing import Any
 import pytest
 import torch
 
+from tests.utils import set_lazy_env
 from vllm.config.speculative import SpeculativeConfig
 from vllm.config.vllm import VllmConfig
 from vllm.models.qwen4_exp.nvidia.host_kv.history import HostHistoryShape
 from vllm.models.qwen4_exp.nvidia.host_kv.planning import history_groups
+from vllm.triton_utils import triton
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
+    PREPARE_DFLASH_INPUTS_TILE_CAP,
+    DFlashSpeculator,
+)
 from vllm.v1.worker.gpu.warmup import (
+    _dflash_warmup_profiles,
     _host_kv_warmup_profiles,
     _kernel_prefill_warmup_token_counts,
     _reserved_block_count,
@@ -443,3 +450,143 @@ def test_warmup_without_host_kv_attaches_no_steps(
 
     assert all(output.host_kv is None for output in executions)
     assert all(output.new_block_ids_to_zero is None for output in executions)
+
+
+def _dflash_speculator(num_query_per_req: int) -> DFlashSpeculator:
+    # Bypass the GPU-heavy __init__; warmup only reads the draft width.
+    speculator = object.__new__(DFlashSpeculator)
+    speculator.num_query_per_req = num_query_per_req
+    return speculator
+
+
+def _dflash_runner(
+    num_query_per_req: int = 8,
+    max_num_batched_tokens: int = 256,
+    sm70_greedy_verify: bool = False,
+) -> Any:
+    attention_spec = _full_attention_spec()
+    return SimpleNamespace(
+        num_speculative_steps=num_query_per_req - 1,
+        speculator=_dflash_speculator(num_query_per_req),
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=4,
+            max_num_batched_tokens=max_num_batched_tokens,
+        ),
+        max_model_len=256,
+        compilation_config=SimpleNamespace(static_forward_context={}),
+        kv_cache_config=SimpleNamespace(
+            kv_cache_groups=[SimpleNamespace(kv_cache_spec=attention_spec)],
+            num_blocks=256,
+        ),
+        vllm_config=SimpleNamespace(
+            num_lookahead_tokens=num_query_per_req,
+            kernel_config=SimpleNamespace(sm70_greedy_verify=sm70_greedy_verify),
+        ),
+        model_state=SimpleNamespace(max_encoder_len=0),
+        is_pooling_model=False,
+        is_last_pp_rank=True,
+        model_config=SimpleNamespace(get_vocab_size=lambda: 64),
+        kv_connector=SimpleNamespace(set_disabled=lambda disabled: None),
+    )
+
+
+# default prompt (1 + 7 spec + 1) -> span 17 (tile 32); the capped tile 256
+# starts at span 129, i.e. a per-request prefill query of exactly 121 tokens.
+_DFLASH_CAPPED_TILE_PROMPT = PREPARE_DFLASH_INPUTS_TILE_CAP // 2 + 1 - 8
+
+
+def test_dflash_warmup_profile_reaches_capped_tile_bucket() -> None:
+    """The draft-input kernel's tile bucket is a compile key: one prefill
+    whose query span first crosses half the cap compiles the variant every
+    longer real prefill reuses."""
+    runner = _dflash_runner(num_query_per_req=8)
+    profiles = _dflash_warmup_profiles(runner, [9, 33, 1 + 7])
+    assert profiles == [(_DFLASH_CAPPED_TILE_PROMPT, 1)]
+    span = _DFLASH_CAPPED_TILE_PROMPT + runner.speculator.num_query_per_req
+    assert triton.next_power_of_2(span) == PREPARE_DFLASH_INPUTS_TILE_CAP
+
+
+def test_dflash_warmup_profile_skipped_when_covered_or_unreachable() -> None:
+    # A profile at or past the bucket boundary already compiles the tile.
+    runner = _dflash_runner(num_query_per_req=8)
+    assert _dflash_warmup_profiles(runner, [9, _DFLASH_CAPPED_TILE_PROMPT]) == []
+    # The token budget cannot schedule a span that reaches the cap, so no
+    # real prefill can either: run no extra profile.
+    runner = _dflash_runner(num_query_per_req=8, max_num_batched_tokens=120)
+    assert _dflash_warmup_profiles(runner, [9]) == []
+    # Not a DFlash speculative config: unchanged behavior.
+    plain = _dflash_runner()
+    plain.speculator = None
+    assert _dflash_warmup_profiles(plain, [9]) == []
+
+
+def test_warmup_dflash_profile_compiles_capped_tile_before_serving(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _dflash_runner(num_query_per_req=8)
+    executions: list[Any] = []
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+
+    warmup_kernels(runner, executions.append, lambda _: None)
+
+    prefill_totals = [
+        o.total_num_scheduled_tokens for o in executions if o.scheduled_new_reqs
+    ]
+    assert prefill_totals == [9 * 4, _DFLASH_CAPPED_TILE_PROMPT]
+
+
+def test_warmup_greedy_profile_reaches_sm70_verify_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the SM70 greedy verification switch on, warmup runs one extra
+    all-greedy prefill+draft-decode pair: the fast path compiles
+    ``_greedy_verify_kernel`` only for a draft-carrying decode whose every
+    request is plain greedy without any sampler feature."""
+    set_lazy_env(monkeypatch, "VLLM_SM70_GREEDY_VERIFY", "1")
+    runner = _dflash_runner(num_query_per_req=8)
+    executions: list[Any] = []
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+
+    warmup_kernels(runner, executions.append, lambda _: None)
+
+    # Profiles run prefill, then a draft-carrying decode, then cleanup.
+    greedy_prefill = executions[-3]
+    assert greedy_prefill.scheduled_new_reqs
+    for req in greedy_prefill.scheduled_new_reqs:
+        params = req.sampling_params
+        assert params is not None
+        assert params.temperature == 0.0
+        assert params.logprobs is None
+        assert params.prompt_logprobs is None
+        assert params.frequency_penalty == 0.0
+        assert params.presence_penalty == 0.0
+        assert params.repetition_penalty == 1.0
+        assert not params.logit_bias
+        assert not params._bad_words_token_ids
+    greedy_decode = executions[-2]
+    drafts = greedy_decode.scheduled_spec_decode_tokens
+    assert drafts and all(len(v) == 7 for v in drafts.values())
+    assert set(greedy_decode.num_scheduled_tokens.values()) == {8}
+    assert executions[-1].total_num_scheduled_tokens == 0
+    # The ordinary profiles keep the all-features sampler-warmup parameters.
+    assert executions[0].scheduled_new_reqs[0].sampling_params.logprobs == 5
+
+
+def test_warmup_skips_greedy_profile_without_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_lazy_env(monkeypatch, "VLLM_SM70_GREEDY_VERIFY", None)
+    runner = _dflash_runner(num_query_per_req=8)
+    executions: list[Any] = []
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+
+    warmup_kernels(runner, executions.append, lambda _: None)
+
+    prefill_totals = [
+        o.total_num_scheduled_tokens for o in executions if o.scheduled_new_reqs
+    ]
+    # Only the default batch and the capped-tile profile, no greedy profile.
+    assert prefill_totals == [9 * 4, _DFLASH_CAPPED_TILE_PROMPT]
+    for output in executions:
+        for req in output.scheduled_new_reqs:
+            assert req.sampling_params.temperature != 0.0

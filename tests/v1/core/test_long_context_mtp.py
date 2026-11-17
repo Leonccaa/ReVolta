@@ -43,6 +43,48 @@ def settings(**kw) -> LongContextKVConfig:
     return LongContextKVConfig(enabled=True, **kw)
 
 
+def test_exact_end_mtp_completes_prefix_pages_before_consuming(monkeypatch):
+    from tests.v1.core.test_long_context_admission import make_requests
+    from tests.v1.core.test_mamba_sparse_retention import (
+        _exact_end_scheduler,
+        _exact_end_step,
+        _finish_exact_end,
+    )
+    from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id
+    from vllm.v1.request import Request
+
+    scheduler = _exact_end_scheduler(monkeypatch, mtp=True)
+    [request] = make_requests(1, 3 * SPAN + 20, 7)
+    index = _finish_exact_end(scheduler, request)
+    [entry] = [e for bucket in index.index.values() for e in bucket]
+    _exact_end_step(scheduler)
+    revisit = Request(
+        request_id="mtp-revisit",
+        prompt_token_ids=list(request.all_token_ids) + [777],
+        sampling_params=request.sampling_params,
+        pooling_params=None,
+        block_hasher=request._block_hasher,
+    )
+    manager = scheduler.kv_cache_manager
+    blocks, aligned = manager.get_computed_blocks(revisit)
+    assert aligned < request.num_computed_tokens // SPAN * SPAN
+    blocks, hit = manager.extend_exact_end(revisit, blocks, aligned)
+    assert hit == request.num_tokens - 1
+    pool = scheduler.host_history_pool
+    g = pool.host_group_id
+    assert len(blocks.blocks[g]) == 4
+    assert all(not b.is_null for b in blocks.blocks[g])
+    assert manager.allocate_slots(revisit, 1, hit, blocks, num_lookahead_tokens=4)
+    single = manager.coordinator.single_type_managers[g]
+    assert single.num_cached_block[revisit.request_id] == hit // SPAN
+    assert not any(index.index.values())
+    for group, (_, held) in enumerate(entry.groups):
+        for block, expected in held:
+            if expected == make_block_hash_with_group_id(entry.key, group):
+                assert block.block_hash is None
+    manager.free(revisit)
+
+
 def build(lc, specs, *, mtp=True):
     config = (mtp_config if mtp else production_config)(
         max_model_len=512 * 1024, long_context=lc

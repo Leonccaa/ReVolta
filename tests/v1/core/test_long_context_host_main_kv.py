@@ -56,6 +56,70 @@ def host_settings(**kw) -> LongContextKVConfig:
     return LongContextKVConfig(enabled=True, **kw)
 
 
+@pytest.mark.parametrize("checkpoint", ["hit", "miss", "unbound"])
+def test_exact_end_precedes_external_lookup(monkeypatch, checkpoint):
+    from unittest.mock import Mock
+
+    from vllm.v1.core.kv_cache_utils import BlockHashListWithBlockSize
+
+    from .test_mamba_sparse_retention import (
+        _exact_end_scheduler,
+        _exact_end_step,
+        _finish_exact_end,
+    )
+
+    scheduler = _exact_end_scheduler(monkeypatch)
+    connector = scheduler.connector.connector_scheduler
+    connector.config = connector.config._replace(offload_prompt_only=False)
+    [request] = make_requests(1, 3 * SPAN + 20, 7)
+    index = _finish_exact_end(scheduler, request)
+    _exact_end_step(scheduler)
+    [revisit] = make_requests(1, 1, 7, tag="revisit")
+    revisit = type(request)(
+        request_id=revisit.request_id,
+        prompt_token_ids=list(request.all_token_ids) + [777],
+        sampling_params=revisit.sampling_params,
+        pooling_params=None,
+        block_hasher=request._block_hasher,
+    )
+    manager = scheduler.kv_cache_manager
+    blocks, aligned = manager.get_computed_blocks(revisit)
+    if checkpoint == "miss":
+        index.index.clear()
+    elif checkpoint == "unbound":
+        pool = scheduler.host_history_pool
+        g = pool.host_group_id
+        assert len(blocks.blocks[g]) == aligned // SPAN < 3
+        hashes = BlockHashListWithBlockSize(request.block_hashes, 16, SPAN)
+        cached = pool.get_cached_block(hashes[2], [g])
+        pool.unbind(cached[0].block_id)
+        assert manager.extend_exact_end(revisit, blocks, aligned)[1] == aligned
+    lookup = Mock(wraps=connector._contract_lookup)
+    matched = Mock(wraps=connector.get_num_new_matched_tokens)
+    alloc = Mock(wraps=connector.update_state_after_alloc)
+    skip = Mock(wraps=connector.skip_external_once)
+    monkeypatch.setattr(connector, "_contract_lookup", lookup)
+    monkeypatch.setattr(connector, "get_num_new_matched_tokens", matched)
+    monkeypatch.setattr(connector, "update_state_after_alloc", alloc)
+    monkeypatch.setattr(connector, "skip_external_once", skip)
+    scheduler.add_request(revisit)
+    output = scheduler.schedule()
+    if checkpoint == "hit":
+        skip.assert_called_once_with(revisit.request_id)
+        matched.assert_called_once_with(revisit, request.num_tokens - 1)
+        assert alloc.call_args.args[2] == 0
+        lookup.assert_not_called()
+        assert not connector._req_status[revisit.request_id].transfer_jobs
+        assert (
+            output.scheduled_new_reqs[0].num_computed_tokens == request.num_tokens - 1
+        )
+    else:
+        skip.assert_not_called()
+        matched.assert_called_once_with(revisit, aligned)
+        lookup.assert_called_once()
+        assert alloc.call_args.args[2] == SPAN
+
+
 def configs(lc, *, max_model_len=512 * 1024, memory=GPU_BUDGET, max_num_seqs=8):
     from vllm.v1.core.kv_cache_utils import get_kv_cache_configs
 

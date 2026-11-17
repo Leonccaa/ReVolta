@@ -67,6 +67,35 @@ def test_raw_scale_strict_expansion_all_e4m3_codes(stage, interleaved):
     assert torch.equal(out, torch.full_like(out, 0.125))
 
 
+@pytest.mark.parametrize(
+    "stage,interleaved", [("w13", False), ("w13", True), ("w2", False)]
+)
+def test_raw_scale_fast_expansion_matches_hmma_reconstruction(stage, interleaved):
+    # The fast path reconstructs raw * (16384 * global) as hi + lo FP16 terms:
+    # one FP16 multiply for the low term, then one fused multiply-add.
+    shape = (512, 160, 320) if stage == "w13" else (512, 10, 2560)
+    gen = torch.Generator(device="cuda").manual_seed(17)
+    # Positive normal E4M3 codes, which are the encodings the fast path admits.
+    codes = torch.randint(8, 127, shape, generator=gen, device="cuda").to(torch.uint8)
+    width = 2 if stage == "w13" else 1
+    globals_ = torch.rand(512, width, generator=gen, device="cuda") * 2**-8 + 2**-12
+    if stage == "w13":
+        columns = torch.arange(shape[-1], device="cuda")
+        slots = (columns % 2) if interleaved else (columns >= 160).long()
+        global_by_column = globals_[:, slots].unsqueeze(1)
+    else:
+        global_by_column = globals_.unsqueeze(1)
+    scaled = (global_by_column * 16384.0).double()
+    hi = scaled.half()
+    lo = (scaled - hi.double()).half()
+    raw = ((codes.int() << 7) + 0x2000).short().view(torch.float16)
+    correction = (raw.double() * lo.double()).half()
+    expected = (raw.double() * hi.double() + correction.double()).half()
+    out = torch.empty(shape, dtype=torch.float16, device="cuda")
+    sm70_ops.nvfp4_expand_raw_scales_sm70_out(out, codes, globals_, interleaved, True)
+    assert torch.equal(out.view(torch.int16), expected.view(torch.int16))
+
+
 @pytest.mark.parametrize("code", [0, 1, 7, 128, 129, 255])
 def test_raw_scale_admission_rejects_unsupported_fast_encodings(code):
     shape = (512, 10, 2560)

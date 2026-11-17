@@ -679,9 +679,14 @@ def test_graph_reserve_follows_the_speculative_method(
         ("awq", "dflash", None, "1200"),
         ("awq", "dflash", "auto", "1200"),
         ("awq", "dflash", "fp8_e4m3", "1200"),
-        ("awq", "dflash", "fp8_per_token_head", "1050"),
-        ("awq", "dflash", "int8", "1050"),
-        ("awq", "mtp", "fp8_per_token_head", "700"),
+        ("awq", "dflash", "fp8_per_token_head", "1000"),
+        ("awq", "dflash", "int8", "1000"),
+        ("awq", "mtp", "fp8_per_token_head", "600"),
+        ("awq", "mtp", "int8", "600"),
+        ("awq", "mtp", "fp8_e4m3", "700"),
+        ("awq", None, "fp8_per_token_head", "700"),
+        ("modelopt_fp4", "mtp", "fp8_per_token_head", "600"),
+        ("modelopt_fp4", "mtp", "auto", "700"),
         ("modelopt_fp4", "dflash", "fp8_per_token_head", "1200"),
     ],
 )
@@ -712,7 +717,7 @@ def test_resolved_kv_dtype_refines_the_reserve(profile):
         speculative_method="dflash",
         kv_cache_dtype="fp8_per_token_head",
     )
-    assert os.environ[GRAPH_RESERVE] == "1050"
+    assert os.environ[GRAPH_RESERVE] == "1000"
     assert os.environ[TAIL_GRAPHS] == "0"
 
 

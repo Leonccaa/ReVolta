@@ -82,7 +82,10 @@ def test_export_is_bounded_low_frequency_delta_and_prometheus():
         m.step_cpu(1000000)
     m.observe("ttft", "mixed", 2.0)
     m.counters["host_ssd_pages_written"] += 3
-    first = m.export(60.0, ledger=SimpleNamespace(hot_used=7))
+    exact_end = SimpleNamespace(events={"published": 2, "skip_end_mismatch": 5})
+    first = m.export(60.0, ledger=SimpleNamespace(hot_used=7), exact_end=exact_end)
+    assert first["counters"]["exact_end_published"] == 2
+    assert first["counters"]["exact_end_skip_end_mismatch"] == 5
     assert first["gauges"]["step_cpu_seconds_p99"] == 0.001
     assert first["gauges"]["step_cpu_samples"] == 8192
     assert first["gauges"]["gpu_hot_committed_groups"] == 7

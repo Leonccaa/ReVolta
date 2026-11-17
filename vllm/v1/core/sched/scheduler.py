@@ -3483,6 +3483,7 @@ class Scheduler(SchedulerInterface):
             arbiter=self.value_arbiter,
             manager=getattr(offload, "manager", None),
             ledger=self.kv_cache_manager.admission_ledger,
+            exact_end=self.kv_cache_manager.coordinator.exact_end,
             idle=idle,
         )
 

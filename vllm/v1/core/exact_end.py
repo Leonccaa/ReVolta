@@ -6,6 +6,7 @@ Source: c19296d49934329b0fbb6853759690bc6d6c11d9. State gathers follow
 #67045 (d2a3815636ccc9eeedf31574a75e1e2d8afeca37); no partial-hit CoW.
 """
 
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
@@ -57,6 +58,8 @@ class ExactEndIndex:
         self.index: dict[BlockHash | None, list[ExactEnd]] = {}
         self.pending_gathers: list[MambaStateGather] = []
         self.hits: dict[str, ExactEnd] = {}
+        # Publish outcomes, exported with the store stats as exact_end_<name>.
+        self.events: Counter[str] = Counter()
 
     def _anchor(self, request: Request, boundary: int) -> BlockHash | None:
         return (
@@ -88,13 +91,20 @@ class ExactEndIndex:
             or request.status == RequestStatus.FINISHED_ABORTED
             or request.resumable
             or request.num_in_flight_tokens
-            or c != request.num_tokens - 1
-            or c % span == 0
-            or any(
-                m.num_speculative_blocks or m.mamba_cache_mode != "align"
-                for m in states
-            )
         ):
+            self.events["skip_not_final"] += 1
+            return
+        if c != request.num_tokens - 1:
+            # Speculative last step accepted past the stop point (c > N - 1).
+            self.events["skip_end_mismatch"] += 1
+            return
+        if c % span == 0:
+            self.events["skip_block_aligned"] += 1
+            return
+        if any(
+            m.num_speculative_blocks or m.mamba_cache_mode != "align" for m in states
+        ):
+            self.events["skip_layout"] += 1
             return
         key = self._key(request, c + 1)
         groups = []
@@ -122,11 +132,13 @@ class ExactEndIndex:
                 first = c // manager.block_size
                 selected = blocks[first : first + 1]
             if not selected or any(b.is_null for b in selected):
+                self.events["skip_block_missing"] += 1
                 return
             exact_key = make_block_hash_with_group_id(key, g)
             if not isinstance(manager, SlidingWindowManager) and any(
                 b.block_hash is not None for b in selected
             ):
+                self.events["skip_tail_registered"] += 1
                 return
             groups.append((first, [(b, b.block_hash or exact_key) for b in selected]))
         for g, (_, held) in enumerate(groups):
@@ -138,6 +150,7 @@ class ExactEndIndex:
             c + 1, key, tuple(request.all_token_ids[max(0, c - 7) : c + 1]), groups
         )
         self.index.setdefault(self._anchor(request, c // span * span), []).append(entry)
+        self.events["published"] += 1
         if request.last_accepted > 1:
             self.pending_gathers.append(
                 MambaStateGather(request.last_accepted - 1, dst)

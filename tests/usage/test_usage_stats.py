@@ -13,7 +13,7 @@ import vllm.envs as envs
 from vllm.usage import usage_lib
 from vllm.v1 import utils as v1_utils
 
-REVOLTA_COLLECTOR = "https://ai.19b.net/api/usage"
+REVOLTA_COLLECTOR = "https://usage.19b.net/api/"
 
 OPT_OUT_VARS = (
     "VLLM_NO_USAGE_STATS",

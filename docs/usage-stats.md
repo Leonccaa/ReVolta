@@ -64,7 +64,7 @@ The report also goes to a local file, `usage_stats.json` in the directory given 
 
 ## Where it goes
 
-`https://ai.19b.net/api/usage` — the ReVolta collector. Point it elsewhere with `VLLM_USAGE_STATS_SERVER`; set that variable to an empty string to keep the local file and send nothing. Each attempt waits at most 5 seconds, on a background thread, with no retry.
+`https://usage.19b.net/api/` — the ReVolta collector. Point it elsewhere with `VLLM_USAGE_STATS_SERVER`; set that variable to an empty string to keep the local file and send nothing. Each attempt waits at most 5 seconds, on a background thread, with no retry.
 
 ## Turning it off
 

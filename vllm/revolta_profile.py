@@ -42,16 +42,6 @@ AWQ_DEFAULTS = {
     # Measured for the AWQ TP4 graph pool.
     "VLLM_V2_CUDAGRAPH_MEM_MIB": "700",
 }
-# DFlash2 also captures the eight-row verify graphs with their width shapes and
-# the drafter's graphs. The single-request verifier tail graphs add about
-# 0.3 GiB without a measured speed gain on the AWQ TP4 profile (greedy tokens
-# identical, 256K decode unchanged), so DFlash2 leaves them off; the remaining
-# pool is about 1.1 GiB. With the MTP figure the excess goes to the KV cache
-# and a large mixed step can OOM.
-AWQ_DFLASH_DEFAULTS = {
-    "VLLM_V2_CUDAGRAPH_MEM_MIB": "1200",
-    "VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS": "0",
-}
 NVFP4_DEFAULTS = {
     "VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE": "1",
     "VLLM_SM70_NVFP4_QWEN38_MOE_RAW_GROUPED_DECODE": "1",
@@ -61,6 +51,17 @@ NVFP4_DEFAULTS = {
     "VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL": "1",
     "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES": "1",
     "VLLM_V2_CUDAGRAPH_MEM_MIB": "700",
+}
+# DFlash2 also captures the eight-row verify graphs with their width shapes and
+# the drafter's graphs. The single-request verifier tail graphs add about
+# 0.3 GiB without a measured speed gain on the AWQ TP4 profile (greedy tokens
+# identical, 256K decode unchanged), so DFlash2 leaves them off; the remaining
+# pool is about 1.1 GiB. With the MTP figure the excess goes to the KV cache
+# and a large mixed step can OOM. The graphs depend on the speculative method,
+# not on the weight format, so AWQ and NVFP4 both use these values.
+DFLASH_DEFAULTS = {
+    "VLLM_V2_CUDAGRAPH_MEM_MIB": "1200",
+    "VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS": "0",
 }
 CUSTOM_AR_DEFAULTS = {"VLLM_SM70_CAR_VMM_SAFE": "1"}
 
@@ -341,9 +342,11 @@ def apply_revolta_profile(
         if _has_awq_qpn_shape(model_config, tensor_parallel_size):
             defaults.update(AWQ_DEFAULTS)
             if speculative_method == "dflash":
-                defaults.update(AWQ_DFLASH_DEFAULTS)
+                defaults.update(DFLASH_DEFAULTS)
     elif has_nvfp4_weights(model_config):
         defaults.update(NVFP4_DEFAULTS)
+        if speculative_method == "dflash":
+            defaults.update(DFLASH_DEFAULTS)
     if interconnect_mode != "no_p2p":
         defaults.update(CUSTOM_AR_DEFAULTS)
     for name, value in defaults.items():

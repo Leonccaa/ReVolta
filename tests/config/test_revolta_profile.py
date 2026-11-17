@@ -655,7 +655,8 @@ TAIL_GRAPHS = "VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS"
         ("awq", None, "700"),
         ("awq", "mtp", "700"),
         ("awq", "dflash", "1200"),
-        ("modelopt_fp4", "dflash", "700"),
+        ("modelopt_fp4", "mtp", "700"),
+        ("modelopt_fp4", "dflash", "1200"),
     ],
 )
 def test_graph_reserve_follows_the_speculative_method(
@@ -715,12 +716,11 @@ def test_explicit_graph_reserve_wins_over_dflash(profile, monkeypatch):
         ("awq", None, None),
         ("awq", "mtp", None),
         ("awq", "dflash", "0"),
-        ("modelopt_fp4", "dflash", None),
+        ("modelopt_fp4", "mtp", None),
+        ("modelopt_fp4", "dflash", "0"),
     ],
 )
-def test_tail_graphs_are_off_only_for_awq_dflash(
-    profile, quantization, method, expected
-):
+def test_tail_graphs_are_off_only_for_dflash(profile, quantization, method, expected):
     assert profile.apply_revolta_profile(
         model(quantization), 4, is_sm70=True, speculative_method=method
     )

@@ -1110,19 +1110,14 @@ def create_host_page_ssd(
         has_planar_kv_cache,
         kv_storage_metadata,
     )
-    from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD
 
     if has_planar_kv_cache(kv_cache_config):
         storage = kv_storage_metadata(
             kv_cache_config, vllm_config.cache_config.cache_dtype, vllm_config
         )
-        if any(
-            owner.get("codec") == list(FP8_E4M3_PER_TOKEN_HEAD.cache_identity)
-            for owner in storage["owners"].values()
-        ):
-            # Reuse the physical ABI, including actual kernel-page geometry.
-            # Legacy host rows retain their existing namespace unchanged.
-            identity["kv_storage"] = storage
+        # Reuse the physical ABI, including actual kernel-page geometry.
+        # Legacy host rows retain their existing namespace unchanged.
+        identity["kv_storage"] = storage
     ssd = HostPageSsd(
         table,
         region.create_kv_memoryview(),

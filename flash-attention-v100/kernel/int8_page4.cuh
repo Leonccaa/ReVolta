@@ -1547,8 +1547,6 @@ inline int8_kv::KVScaleView bind(const at::Tensor& q, const at::Tensor& k,
           owner_span > 0 && k.stride(3) == 1 && v.stride(3) == 1 &&
           k.stride(1) == 256 && v.stride(1) == 256,
       "Row-scaled page4 requires owner pages and explicit b/4 mapping");
-  TORCH_CHECK(k.scalar_type() != at::kChar || owner_span == 4,
-              "INT8 page4 requires 16-token owner pages");
   int8_kv::KVScaleView view;
   view.pages = {owner_span, 4};
   const at::Tensor planes[] = {sk, sv};

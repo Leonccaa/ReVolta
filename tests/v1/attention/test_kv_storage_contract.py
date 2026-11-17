@@ -35,6 +35,13 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.gpu.attn_utils import _reshape_kv_cache
 
+PLANAR_CONFIG = SimpleNamespace(
+    model_config=SimpleNamespace(is_hybrid=True),
+    cache_config=SimpleNamespace(
+        mamba_ssm_cache_dtype="float32", mamba_cache_dtype="auto"
+    ),
+)
+
 
 def spec(dtype=torch.int8, mode=KVQuantMode.INT8_PLANAR):
     return FullAttentionSpec(
@@ -434,7 +441,7 @@ def test_ssd_frame_budget_and_persistent_namespace():
         kv_cache_groups=[KVCacheGroupSpec(["a", "b"], spec())],
         kv_cache_tensors=[tensor],
     )
-    meta = kv_storage_metadata(config, "int8", SimpleNamespace())
+    meta = kv_storage_metadata(config, "int8", PLANAR_CONFIG)
     assert meta["owners"]["b"]["codec"] == ["int8", 1, "planar_scales"]
     assert meta["tensors"][0]["packed_members"] == ["a", "b"]
     assert meta["tensors"][0]["bytes_per_block"] == 848640
@@ -567,7 +574,12 @@ def test_int8_draft_requires_ssd_framing_even_with_a_legacy_target(
 
     monkeypatch.setattr(CPUOffloadingSpec, "__init__", parent_init)
     config = SimpleNamespace(
-        cache_config=SimpleNamespace(cache_dtype=configured_dtype),
+        model_config=PLANAR_CONFIG.model_config,
+        cache_config=SimpleNamespace(
+            cache_dtype=configured_dtype,
+            mamba_ssm_cache_dtype="float32",
+            mamba_cache_dtype="auto",
+        ),
         compute_hash=lambda: "frozen-config",
     )
     cache = KVCacheConfig(
@@ -597,23 +609,24 @@ def test_int8_v1_kernel_geometry_is_part_of_persistent_identity():
     )
 
     raw = torch.empty(3 * 424320, dtype=torch.int8)
-    # 48 divides 816, but differs from v1's frozen 16-token file layout.
-    with pytest.raises(ValueError, match="16-token"):
-        bind_planar_kv_cache(
-            raw,
-            num_blocks=3,
-            scheduler_block_size=816,
-            kernel_block_size=48,
-            num_heads=1,
-            head_size=256,
-            page_size_bytes=424320,
-        )
+    assert replace(spec(), block_size=8).page_size_bytes == 4160
+    # The writer and readers use the actual owner page, including b != 16.
+    carrier = bind_planar_kv_cache(
+        raw,
+        num_blocks=3,
+        scheduler_block_size=816,
+        kernel_block_size=48,
+        num_heads=1,
+        head_size=256,
+        page_size_bytes=424320,
+    )
+    assert KVCacheView.bind(carrier, INT8, 256).subpage_mapping(4).owner_page_span == 12
     config = KVCacheConfig(
         num_blocks=3,
         kv_cache_groups=[KVCacheGroupSpec(["a"], spec())],
         kv_cache_tensors=[KVCacheTensor(size=raw.numel(), shared_by=["a"])],
     )
-    metadata = kv_storage_metadata(config, "int8", SimpleNamespace())
+    metadata = kv_storage_metadata(config, "int8", PLANAR_CONFIG)
     kernel = metadata["owners"]["a"].pop("kernel_page")
     assert metadata == {
         "version": "ordinary-kv-owner-v1",
@@ -713,16 +726,14 @@ def test_qsa_planar_kernel_selection_matches_worker(hybrid, block, hybrid_kernel
             mamba_ssm_cache_dtype="float32", mamba_cache_dtype="auto"
         ),
     )
-    owner_spec = replace(
-        spec(torch.uint8, KVQuantMode.FP8_E4M3_PLANAR), block_size=block
-    )
+    owner_spec = replace(spec(), block_size=block)
     cache = KVCacheConfig(3, [], [KVCacheGroupSpec(["a"], owner_spec)])
     group = AttentionGroup(Qwen4ExpQSAFlashAttentionBackend, ["a"], owner_spec, 0)
     with set_current_vllm_config(config):
         worker = prepare_kernel_block_sizes(cache, [[group]])
     assert worker == [qsa_planar_kernel_block_size(block, config)]
     assert worker == [hybrid_kernel if hybrid else block]
-    metadata = kv_storage_metadata(cache, FP8_E4M3_PER_TOKEN_HEAD.name, config)
+    metadata = kv_storage_metadata(cache, INT8.name, config)
     assert metadata["owners"]["a"]["kernel_page"]["tokens"] == worker[0]
 
 

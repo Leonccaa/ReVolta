@@ -56,7 +56,7 @@ def test_planar_owner_revolta_fs_round_trip(tmp_path, monkeypatch):
         KVPhysicalPage,
         bind_planar_kv_cache,
     )
-    from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD as codec
+    from vllm.v1.attention.kv_codecs import INT8 as codec
     from vllm.v1.kv_cache_interface import (
         FullAttentionSpec,
         KVCacheConfig,
@@ -72,8 +72,8 @@ def test_planar_owner_revolta_fs_round_trip(tmp_path, monkeypatch):
         block_size=48,
         num_kv_heads=1,
         head_size=256,
-        dtype=torch.uint8,
-        kv_quant_mode=KVQuantMode.FP8_E4M3_PLANAR,
+        dtype=codec.storage_dtype,
+        kv_quant_mode=KVQuantMode.INT8_PLANAR,
     )
     page_bytes = 2 * layer.page_size_bytes
     cache = KVCacheConfig(
@@ -96,7 +96,7 @@ def test_planar_owner_revolta_fs_round_trip(tmp_path, monkeypatch):
 
     monkeypatch.setattr(CPUOffloadingSpec, "__init__", parent_init)
     spec = TieringOffloadingSpec(config, cache)
-    raw = torch.zeros(3 * page_bytes, dtype=torch.uint8)
+    raw = torch.zeros(3 * page_bytes, dtype=codec.storage_dtype)
     for member in range(2):
         carrier = bind_planar_kv_cache(
             raw,
@@ -108,7 +108,7 @@ def test_planar_owner_revolta_fs_round_trip(tmp_path, monkeypatch):
             page_size_bytes=layer.page_size_bytes,
             member_index=member,
             member_count=2,
-            dtype=torch.uint8,
+            dtype=codec.storage_dtype,
         )
         view = KVCacheView.bind(carrier, codec, 256)
         for index, (data, scale) in enumerate(

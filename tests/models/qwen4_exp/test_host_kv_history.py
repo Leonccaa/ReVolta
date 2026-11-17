@@ -440,7 +440,7 @@ def test_m6b_leased_pages_restore_into_history_ids_without_transferring_ownershi
 def _planar_history_roundtrip(device, rank):
     from uuid import uuid4
 
-    from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD as codec
+    from vllm.v1.attention.kv_codecs import INT8 as codec
     from vllm.v1.kv_offload.host.region import HostRegionLayout
 
     shape = _shape(
@@ -450,6 +450,7 @@ def _planar_history_roundtrip(device, rank):
         kernel_block_tokens=8,
         kv_heads=2,
         head_dim=256,
+        dtype=codec.storage_dtype,
         dcp_world_size=2,
         dcp_rank=rank,
         interleave=2,

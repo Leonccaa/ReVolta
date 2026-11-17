@@ -52,7 +52,7 @@ from vllm.utils.torch_utils import (
     get_accelerator_view_from_cpu_tensor,
 )
 from vllm.v1.attention.kv_cache_view import KVCacheView, KVPageLayout, align_up
-from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD
+from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD, INT8
 from vllm.v1.kv_offload.host.page_table import SealTicket
 from vllm.v1.kv_offload.host.region import HostRegionLayout
 
@@ -129,7 +129,7 @@ class HostHistoryShape:
     kv_heads: int
     head_dim: int
     dtype: torch.dtype
-    """Payload dtype: uint8 (E4M3) or float16."""
+    """Payload dtype: uint8 (E4M3), int8 (RNE) or float16."""
     hot_slots: int
     """Hot four-token groups per layer."""
     max_requests: int
@@ -181,7 +181,7 @@ class HostHistoryShape:
 
     @property
     def planar_scales(self) -> bool:
-        return self.layout_cache_dtype == FP8_E4M3_PER_TOKEN_HEAD.name
+        return self.layout_cache_dtype in (FP8_E4M3_PER_TOKEN_HEAD.name, "int8")
 
     def conservative_pass_geometry(self) -> tuple[int, int, list[int]]:
         """Planner inputs safe for any request assignment, without device reads.
@@ -304,9 +304,9 @@ class HostHistoryShape:
             raise UnsupportedHostKVConfig(
                 "Host history kernel blocks must hold a multiple of four tokens"
             )
-        if self.dtype not in (torch.uint8, torch.float16):
+        if self.dtype not in (torch.uint8, torch.int8, torch.float16):
             raise UnsupportedHostKVConfig(
-                "Host history supports E4M3 (uint8) or FP16 main K/V"
+                "Host history supports E4M3 (uint8), RNE INT8 or FP16 main K/V"
             )
         if not 0 <= self.dcp_rank < self.dcp_world_size:
             raise ValueError("Host history DCP rank is out of range")
@@ -383,7 +383,7 @@ def hot_alias_view(index: torch.Tensor, shape: HostHistoryShape) -> torch.Tensor
             f"pages of {s.slots_per_block} hot slots"
         )
     if s.planar_scales:
-        return raw.view(s.hot_slots, slot_bytes)
+        return raw.view(s.dtype).view(s.hot_slots, slot_bytes)
     return raw.view(s.dtype).view(s.hot_slots, 2, 4, s.kv_heads, s.head_dim)
 
 
@@ -394,7 +394,8 @@ def _planar_view(raw: torch.Tensor, tokens: int, s: HostHistoryShape) -> KVCache
         (raw.shape[0], 2, tokens, h, d + 4),
         (raw.stride(0), tokens * h * (d + 4), h * (d + 4), d + 4, 1),
     )
-    return KVCacheView.bind(carrier, FP8_E4M3_PER_TOKEN_HEAD, d)
+    codec = INT8 if s.layout_cache_dtype == "int8" else FP8_E4M3_PER_TOKEN_HEAD
+    return KVCacheView.bind(carrier, codec, d)
 
 
 def _allocate_host(numel: int, dtype: torch.dtype) -> torch.Tensor:
@@ -1123,29 +1124,33 @@ class HostHistoryLayer:
             decode = n <= s.read_rows and n <= s.max_requests * s.decode_rows
         key, value = key[:n], value[:n]
         if s.planar_scales:
-            from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
-                triton_reshape_and_cache_flash_per_token_head_quant,
-            )
+            from vllm import _custom_ops as ops
 
             stage = self.staging_cache
             assert stage.key_scale is not None and stage.value_scale is not None
             if store.device.type == "cuda":
-                triton_reshape_and_cache_flash_per_token_head_quant(
+                ops.reshape_and_cache_flash(
                     key,
                     value,
                     stage.key,
                     stage.value,
-                    stage.key_scale,
-                    stage.value_scale,
                     store.staging_slots[:n],
+                    s.layout_cache_dtype,
+                    k_scale,
+                    v_scale,
+                    k_scale_cache=stage.key_scale,
+                    v_scale_cache=stage.value_scale,
                 )
             else:
                 # As for legacy CPU fixtures, encode with the torch reference.
+                codec = (
+                    INT8 if s.layout_cache_dtype == "int8" else FP8_E4M3_PER_TOKEN_HEAD
+                )
                 for source, payload, scales in (
                     (key, stage.key, stage.key_scale),
                     (value, stage.value, stage.value_scale),
                 ):
-                    encoded, scale = FP8_E4M3_PER_TOKEN_HEAD.encode(source)
+                    encoded, scale = codec.encode(source)
                     payload[:n, 0].copy_(encoded)
                     scales[:n, 0].copy_(scale)
             self.write_encoded(

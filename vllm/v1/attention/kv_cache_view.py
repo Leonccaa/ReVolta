@@ -14,8 +14,6 @@ import torch
 
 from vllm.v1.attention.kv_codecs import KVCodec
 
-INT8_KERNEL_TOKENS = 16
-
 
 def align_up(size: int, alignment: int = 16) -> int:
     if size < 0 or alignment <= 0:
@@ -312,10 +310,8 @@ def bind_planar_kv_cache(
     member_count: int = 1,
     dtype: torch.dtype = torch.int8,
 ) -> torch.Tensor:
-    if (
-        dtype == torch.int8 and kernel_block_size != INT8_KERNEL_TOKENS
-    ) or scheduler_block_size % kernel_block_size:
-        raise ValueError("INT8 v1 uses 16-token kernel pages dividing scheduler blocks")
+    if scheduler_block_size % kernel_block_size:
+        raise ValueError("Kernel pages must divide scheduler blocks")
     layout = KVPageLayout(kernel_block_size, num_heads, head_size, head_size)
     owner = KVPhysicalPage(page_size_bytes, member_count, member_index)
     subdivisions = scheduler_block_size // kernel_block_size
@@ -412,8 +408,6 @@ class KVCacheView:
             )
 
         if codec.layout == "planar_scales":
-            if codec.storage_dtype == torch.int8 and b != INT8_KERNEL_TOKENS:
-                raise ValueError("INT8 v1 requires a 16-token kernel-page carrier")
             layout = KVPageLayout(b, h, head_size, head_size, item)
             if (
                 base % 16
@@ -496,12 +490,8 @@ def kv_storage_metadata(kv_cache_config, configured_dtype: str, vllm_config) -> 
                 entry["head_size"] = spec.head_size
                 entry["head_size_v"] = getattr(spec, "head_size_v", spec.head_size)
                 if codec is not None and codec.layout == "planar_scales":
-                    tokens = (
-                        INT8_KERNEL_TOKENS
-                        if codec.storage_dtype == torch.int8
-                        else qsa_planar_kernel_block_size(
-                            group_spec.block_size, vllm_config
-                        )
+                    tokens = qsa_planar_kernel_block_size(
+                        group_spec.block_size, vllm_config
                     )
                     layout = KVPageLayout(
                         tokens,

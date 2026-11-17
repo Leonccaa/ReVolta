@@ -128,9 +128,7 @@ def test_drafter_layers_share_main_kv_owner_slots(planar) -> None:
     target = _target_specs()
     if planar:
         target = {
-            name: replace(
-                spec, dtype=torch.uint8, kv_quant_mode=KVQuantMode.FP8_E4M3_PLANAR
-            )
+            name: replace(spec, dtype=torch.int8, kv_quant_mode=KVQuantMode.INT8_PLANAR)
             if type(spec) is FullAttentionSpec
             else spec
             for name, spec in target.items()

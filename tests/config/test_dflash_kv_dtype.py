@@ -46,7 +46,7 @@ def sm70(monkeypatch):
     monkeypatch.setattr(
         vllm.platforms.current_platform,
         "is_device_capability",
-        lambda capability: capability == 70,
+        lambda capability, device_id=0: capability in (70, (7, 0)),
     )
 
 
@@ -92,29 +92,20 @@ def test_dflash_int8_rejected_before_loading_weights(
 @pytest.mark.parametrize("draft_dtype", [None, "float16", "auto", "int8"])
 @pytest.mark.parametrize("backend", [None, AttentionBackendEnum.FLASH_ATTN_V100])
 @pytest.mark.parametrize("sliding", [False, True])
-def test_int8_target_dflash_rejected_for_every_draft_dtype(
-    draft_dtype, backend, sliding
+def test_int8_target_dflash_uses_independent_draft_dtype(
+    sm70, draft_dtype, backend, sliding
 ):
     config = _config(draft_dtype=draft_dtype)
     config.speculative_config.attention_backend = backend
     config.speculative_config.draft_model_config.hf_config.dflash_config["use_swa"] = (
         sliding
     )
-    with pytest.raises(ValueError) as exc:
+    if draft_dtype == "int8" and sliding:
+        with pytest.raises(ValueError, match="DFlash2.*INT8"):
+            validate_speculative_kv_cache_dtype(config)
+    else:
         validate_speculative_kv_cache_dtype(config)
-    message = str(exc.value)
-    for text in (
-        "DFlash2",
-        "INT8 target",
-        "16-token kernel pages",
-        "block size",
-        "fp8_e4m3 (recommended)",
-        "float16",
-        "auto",
-        "mtp",
-    ):
-        assert text in message
-    assert "separate FP16 draft cache" not in message
+    assert dflash_draft_cache_dtype(config) == (draft_dtype or "auto")
 
 
 @pytest.mark.parametrize(
@@ -156,7 +147,7 @@ def test_full_attention_int8_dflash_keeps_the_existing_dense_route():
 
 
 def test_top_level_sink_bias_is_also_rejected():
-    config = _config()
+    config = _config("fp8_e4m3", "int8")
     hf_config = config.speculative_config.draft_model_config.hf_config
     hf_config.dflash_config = {"selector_top_k": 16}
     hf_config.add_swa_attention_sink_bias = True
@@ -174,7 +165,7 @@ def test_explicit_sink_setting_overrides_top_level_default():
 
 @pytest.mark.parametrize(
     "target_dtype,expected",
-    [("int8", "int8"), ("fp8_e4m3", "auto"), (FP8_E4M3_PER_TOKEN_HEAD.name, "auto")],
+    [("int8", "auto"), ("fp8_e4m3", "auto"), (FP8_E4M3_PER_TOKEN_HEAD.name, "auto")],
 )
 def test_dflash_resolves_the_same_dtype_as_its_loader(sm70, target_dtype, expected):
     assert dflash_draft_cache_dtype(_config(target_dtype)) == expected
@@ -183,17 +174,17 @@ def test_dflash_resolves_the_same_dtype_as_its_loader(sm70, target_dtype, expect
 @pytest.mark.parametrize(
     "method,target_dtype,draft_dtype,reject",
     [
-        ("dflash", "int8", None, True),
+        ("dflash", "int8", None, False),
         ("dflash", "fp8_e4m3", None, False),
         ("dflash", "float16", None, False),
         ("dflash", "auto", None, False),
-        ("dflash", "int8", "float16", True),
-        ("dflash", "int8", "auto", True),
+        ("dflash", "int8", "float16", False),
+        ("dflash", "int8", "auto", False),
         (None, "int8", None, False),
     ],
 )
 def test_engine_args_validates_kv_before_model_loading(
-    tmp_path, method, target_dtype, draft_dtype, reject
+    sm70, tmp_path, method, target_dtype, draft_dtype, reject
 ):
     from transformers import Qwen3Config
 

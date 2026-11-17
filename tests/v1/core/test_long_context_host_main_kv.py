@@ -145,7 +145,7 @@ def test_hot_pool_must_hold_one_row_and_every_request_tail():
     assert plan.hot_pool_groups > plan.hot_pool_min_groups
 
 
-def test_host_placement_accepts_builtin_connector_and_refuses_int8():
+def test_host_placement_accepts_builtin_connector_and_int8():
     config = production_config(long_context=host_settings(hot_pool_gib=1.0))
     config.model_config.original_max_model_len = config.model_config.max_model_len
     config.kv_transfer_config = SimpleNamespace(kv_connector="OffloadingConnector")
@@ -163,8 +163,9 @@ def test_host_placement_accepts_builtin_connector_and_refuses_int8():
             kv_quant_mode=KVQuantMode.INT8_PLANAR,
             dcp_sharded=True,
         )
-    with pytest.raises(ValueError, match="E4M3 or FP16"):
-        get_kv_cache_configs(config, [specs], [GPU_BUDGET])
+    (int8_cfg,) = get_kv_cache_configs(config, [specs], [GPU_BUDGET])
+    assert int8_cfg.host_kv_layers == MAIN_KV
+    assert int8_cfg.long_context_plan.geometry.hot_slot_bytes == 12 * 2080
     # The GPU placement keeps accepting both (as before this change).
     gpu = production_config(
         max_model_len=512 * 1024,

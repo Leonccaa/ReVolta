@@ -1278,12 +1278,14 @@ def _planar_union_roundtrip(device, unit):
         KVPageLayout,
         bind_planar_kv_cache,
     )
-    from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD as codec
+    from vllm.v1.attention.kv_codecs import INT8 as codec
 
     # Packed member, b=8 source; b=4 arena. DCP2 transfers two local tokens.
     layout = KVPageLayout(8, 2, DIM, DIM)
     raw = torch.zeros(
-        7 * 2 * layout.page_size_bytes, dtype=torch.uint8, pin_memory=device == "cuda"
+        7 * 2 * layout.page_size_bytes,
+        dtype=codec.storage_dtype,
+        pin_memory=device == "cuda",
     )
     carrier = bind_planar_kv_cache(
         raw,
@@ -1295,7 +1297,7 @@ def _planar_union_roundtrip(device, unit):
         page_size_bytes=layout.page_size_bytes,
         member_count=2,
         member_index=1,
-        dtype=torch.uint8,
+        dtype=codec.storage_dtype,
     )
     source = KVCacheView.bind(carrier, codec, DIM)
     generator = torch.Generator().manual_seed(447)
@@ -1314,7 +1316,7 @@ def _planar_union_roundtrip(device, unit):
         staging_microblocks=2,
         kv_heads=2,
         head_dim=DIM,
-        dtype=torch.uint8,
+        dtype=codec.storage_dtype,
         device=device,
         codec=codec,
     )
@@ -1373,7 +1375,7 @@ def _planar_union_roundtrip(device, unit):
             staging_microblocks=2,
             kv_heads=2,
             head_dim=DIM,
-            dtype=torch.uint8,
+            dtype=codec.storage_dtype,
             device="cpu",
             codec=codec,
         )

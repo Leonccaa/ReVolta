@@ -9,7 +9,7 @@ import torch
 from vllm.models.qwen4_exp.nvidia.ops import qsa as ops
 from vllm.models.qwen4_exp.nvidia.ops import qsa_int8 as reader
 from vllm.v1.attention.kv_cache_view import KVCacheView, bind_planar_kv_cache
-from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD
+from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD, INT8
 
 
 @pytest.fixture(autouse=True)
@@ -80,8 +80,8 @@ def test_workspace_partition_count_is_part_of_the_cache_key():
 
 
 @pytest.mark.parametrize("block,route,rows", [(4, "decode", 3), (64, "grouped", 9)])
-def test_planar_e4m3_native_mapping_and_workspace(block, route, rows, monkeypatch):
-    codec = FP8_E4M3_PER_TOKEN_HEAD
+def test_planar_int8_native_mapping_and_workspace(block, route, rows, monkeypatch):
+    codec = INT8
     raw = torch.zeros(2 * 2 * 128 * 520, dtype=torch.uint8)
     carrier = bind_planar_kv_cache(
         raw,

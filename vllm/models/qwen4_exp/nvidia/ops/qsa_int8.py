@@ -634,7 +634,6 @@ def sparse_attention(
         and q.shape[2] == 256
         and indices.shape[1] == 2051
         and k.shape[2:] == (1, 256)
-        and (codec is FP8_E4M3_PER_TOKEN_HEAD or k.shape[1] == 16)
         and positions is not None
         and seq_lens is not None
     )

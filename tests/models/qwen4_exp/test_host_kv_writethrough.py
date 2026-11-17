@@ -192,7 +192,7 @@ def test_mixed_batch_stages_prefill_and_keeps_decode_uva():
 
 
 def _planar_prefill_roundtrip(device, rank):
-    from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD as codec
+    from vllm.v1.attention.kv_codecs import INT8 as codec
 
     shape = HostHistoryShape(
         num_blocks=6,
@@ -201,7 +201,7 @@ def _planar_prefill_roundtrip(device, rank):
         num_layers=2,
         kv_heads=2,
         head_dim=256,
-        dtype=torch.uint8,
+        dtype=codec.storage_dtype,
         hot_slots=64,
         max_requests=2,
         selection_width=4,

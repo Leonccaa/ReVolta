@@ -36,7 +36,7 @@ computed by exactly one window with its full selection.
 
 Nothing in the model calls this module yet; the host-history integration integration
 wires it into
-``forward_qsa``. INT8 caches (per-token scale caches) are not supported.
+``forward_qsa``. Planar caches carry their token/head scale views in the arena.
 """
 
 from __future__ import annotations

@@ -274,13 +274,9 @@ class FullAttentionSpec(AttentionSpec):
         if self.head_size_v is None:
             object.__setattr__(self, "head_size_v", self.head_size)
         if self.kv_quant_mode == KVQuantMode.INT8_PLANAR and (
-            self.dtype != torch.int8
-            or self.head_size_v != self.head_size
-            or self.block_size % 16
+            self.dtype != torch.int8 or self.head_size_v != self.head_size
         ):
-            raise ValueError(
-                "INT8 v1 requires int8, equal K/V heads and 16-token blocks"
-            )
+            raise ValueError("INT8 requires int8 and equal K/V heads")
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_model_len = vllm_config.model_config.max_model_len

@@ -38,7 +38,6 @@ from typing_extensions import override
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.v1.attention.kv_codecs import INT8
 from vllm.v1.kv_cache_interface import KVCacheConfig, kv_tensor_num_blocks
 from vllm.v1.kv_offload.base import CanonicalKVCaches, OffloadingManager
 from vllm.v1.kv_offload.cpu.gpu_worker import CpuGpuOffloadingHandlers
@@ -135,21 +134,12 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 kv_cache_config, vllm_config.cache_config.cache_dtype, vllm_config
             )
             if any(
-                tier.get("type") in FS_TIER_TYPES
-                and (
-                    tier.get("type") != "revolta_fs"
-                    or any(
-                        owner.get("codec") == list(INT8.cache_identity)
-                        for owner in self.persistent_layout["kv_storage"][
-                            "owners"
-                        ].values()
-                    )
-                )
+                tier.get("type") in FS_TIER_TYPES and tier.get("type") != "revolta_fs"
                 for tier in self.secondary_tier_configs
             ):
                 raise ValueError(
-                    "INT8 v1 SSD requires aligned FS framing; raw O_DIRECT pages "
-                    "are unsupported. Use CPU offload until FS framing is integrated."
+                    "Planar KV SSD requires aligned FS framing via revolta_fs; "
+                    "raw O_DIRECT pages are unsupported."
                 )
 
         # Scheduler-side mmap (rank=None); kept for cleanup

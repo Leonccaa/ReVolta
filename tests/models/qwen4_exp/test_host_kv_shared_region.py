@@ -260,7 +260,7 @@ def test_planar_shared_alias_and_host_row_keep_member_strides():
     from dataclasses import replace
 
     from vllm.v1.attention.kv_cache_view import padded_page_stride
-    from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD
+    from vllm.v1.attention.kv_codecs import INT8
     from vllm.v1.kv_offload.host.region import HostRegionLayout
 
     slot = 2080
@@ -272,7 +272,8 @@ def test_planar_shared_alias_and_host_row_keep_member_strides():
         kernel_blocks_per_block=2,
         hot_slots=3 * 49,
         slots_per_block=49,
-        layout_cache_dtype=FP8_E4M3_PER_TOKEN_HEAD.name,
+        layout_cache_dtype=INT8.name,
+        dtype=torch.int8,
     )
     index = [torch.full((3, stride), 99, dtype=torch.uint8) for _ in range(2)]
     before = [t.clone() for t in index]

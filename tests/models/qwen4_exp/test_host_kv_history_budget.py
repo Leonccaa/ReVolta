@@ -246,7 +246,7 @@ def test_store_budget_handles_split_kernel_blocks(sparse_zero_payloads):
 
 
 def test_planar_owner_hot_and_staging_match_actual_budget():
-    from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD
+    from vllm.v1.attention.kv_codecs import INT8
     from vllm.v1.core.long_context_kv import shared_region_fixed_bytes
 
     geo, _, _ = _geometry("standin", 2, 2048)
@@ -257,13 +257,13 @@ def test_planar_owner_hot_and_staging_match_actual_budget():
         num_layers=2,
         kv_heads=1,
         head_dim=256,
-        dtype=torch.uint8,
+        dtype=torch.int8,
         hot_slots=600,
         max_requests=1,
         selection_width=2051,
         max_write_rows=17,
         staged_writethrough=True,
-        layout_cache_dtype=FP8_E4M3_PER_TOKEN_HEAD.name,
+        layout_cache_dtype=INT8.name,
     )
     store = HostHistoryStore(shape, ["l0", "l1"], device="cpu")
     actual = store.fixed_device_memory_bytes()
@@ -297,7 +297,7 @@ def test_planar_owner_hot_and_staging_match_actual_budget():
     assert layer.staging_cache.key_scale is not None
     assert layer.staging_cache.page_size_bytes == 544
     for cache in (*layer.host_cache, layer.hot_cache, layer.staging_cache):
-        assert cache.codec is FP8_E4M3_PER_TOKEN_HEAD
+        assert cache.codec is INT8
         assert (
             cache.key.untyped_storage().data_ptr()
             == cache.value.untyped_storage().data_ptr()

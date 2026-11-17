@@ -3441,7 +3441,10 @@ def get_long_context_geometry(
             main_kv_dcp = dcp if full_spec.dcp_sharded else 1
             hot_head_dim = full_spec.head_size
             hot_kv_heads = full_spec.num_kv_heads
-            if full_spec.kv_quant_mode == KVQuantMode.FP8_E4M3_PLANAR:
+            if full_spec.kv_quant_mode in (
+                KVQuantMode.INT8_PLANAR,
+                KVQuantMode.FP8_E4M3_PLANAR,
+            ):
                 hot_layout_cache_dtype = full_spec.layout_cache_dtype("auto")
             compress_ratio = max(
                 getattr(member, "compress_ratio", 1) for member in members
@@ -3649,17 +3652,18 @@ def _check_host_main_kv(
         )
         for member in members:
             if type(member) is FullAttentionSpec and (
-                member.dtype not in (torch.uint8, torch.float16)
+                member.dtype not in (torch.uint8, torch.int8, torch.float16)
                 or member.kv_quant_mode
                 not in (
                     KVQuantMode.NONE,
                     KVQuantMode.FP8_PER_TENSOR,
                     KVQuantMode.FP8_E4M3_PLANAR,
+                    KVQuantMode.INT8_PLANAR,
                 )
             ):
                 raise ValueError(
                     "kernel_config.long_context_kv with main_kv_placement='host' "
-                    "supports E4M3 or FP16 main K/V, not "
+                    "supports E4M3, RNE INT8 or FP16 main K/V, not "
                     f"{member.dtype} ({member.kv_quant_mode.name})."
                 )
 

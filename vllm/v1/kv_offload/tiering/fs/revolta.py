@@ -38,7 +38,7 @@ from typing import TYPE_CHECKING
 
 from vllm.config.utils import normalize_value
 from vllm.logger import init_logger
-from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD
+from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD, INT8
 from vllm.v1.kv_offload.base import OffloadKey, get_offload_group_idx
 from vllm.v1.kv_offload.tiering.base import (
     JobMetadata,
@@ -432,7 +432,8 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
         self._root_dir = os.path.realpath(root_dir)
         layout = getattr(offloading_spec, "persistent_layout", None) or {}
         self._direct_io = not any(
-            owner.get("codec") == list(FP8_E4M3_PER_TOKEN_HEAD.cache_identity)
+            owner.get("codec")
+            in (list(INT8.cache_identity), list(FP8_E4M3_PER_TOKEN_HEAD.cache_identity))
             for owner in layout.get("kv_storage", {}).get("owners", {}).values()
         )
         if mtime_update_interval_s < 0:

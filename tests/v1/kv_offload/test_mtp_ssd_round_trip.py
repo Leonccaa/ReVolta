@@ -19,7 +19,7 @@ from vllm.v1.attention.kv_cache_view import (
     pack_page_payload,
     scatter_page_payload,
 )
-from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD
+from vllm.v1.attention.kv_codecs import INT8
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode
 from vllm.v1.kv_offload.base import ReqContext
 from vllm.v1.kv_offload.host.page_table import HostPageTable, PageKind
@@ -35,7 +35,7 @@ def _cold_round_trip(root: Path, mode: str, planar=False):
     specs = mtp_specs()
     if planar:
         specs = {
-            name: replace(spec, kv_quant_mode=KVQuantMode.FP8_E4M3_PLANAR)
+            name: replace(spec, dtype=torch.int8, kv_quant_mode=KVQuantMode.INT8_PLANAR)
             if type(spec) is FullAttentionSpec
             else spec
             for name, spec in specs.items()
@@ -70,7 +70,7 @@ def _cold_round_trip(root: Path, mode: str, planar=False):
 
                 config = spec.vllm_config
                 config.model_config.is_hybrid = True
-                config.cache_config.cache_dtype = FP8_E4M3_PER_TOKEN_HEAD.name
+                config.cache_config.cache_dtype = INT8.name
                 config.cache_config.mamba_ssm_cache_dtype = "float32"
                 config.cache_config.mamba_cache_dtype = "auto"
                 return create_host_page_ssd(
@@ -90,9 +90,7 @@ def _cold_round_trip(root: Path, mode: str, planar=False):
                     "kv_storage"
                 ]["owners"]
                 for name in (*config.host_kv_layers, DRAFT):
-                    assert storage[name]["codec"] == list(
-                        FP8_E4M3_PER_TOKEN_HEAD.cache_identity
-                    )
+                    assert storage[name]["codec"] == list(INT8.cache_identity)
                     assert storage[name]["kernel_page"]["tokens"] == 64
             if mode == "write":
                 unit = env.variant(boundary=1, ahead=2)
@@ -120,7 +118,7 @@ def _cold_round_trip(root: Path, mode: str, planar=False):
                         view = torch.empty_strided(
                             (subdivisions, size // subdivisions),
                             (2 * size // subdivisions, 1),
-                            dtype=torch.uint8,
+                            dtype=torch.int8 if encoded_member else torch.uint8,
                         )
                         values = torch.arange(size).to(torch.uint8)
                         view.copy_(
@@ -135,14 +133,12 @@ def _cold_round_trip(root: Path, mode: str, planar=False):
                                     (view.stride(0), 64 * 260, 260, 260, 1),
                                     layer_index * page.page_size_bytes,
                                 )
-                                kv = KVCacheView.bind(
-                                    carrier, FP8_E4M3_PER_TOKEN_HEAD, 256
-                                )
+                                kv = KVCacheView.bind(carrier, INT8, 256)
                                 for index, (data, scale) in enumerate(
                                     ((kv.key, kv.key_scale), (kv.value, kv.value_scale))
                                 ):
                                     x = torch.arange(data.numel()).reshape(data.shape)
-                                    encoded, scales = FP8_E4M3_PER_TOKEN_HEAD.encode(
+                                    encoded, scales = INT8.encode(
                                         (x.float() % 509 - 254)
                                         * (index + row_index + layer_index + 1)
                                     )
@@ -206,7 +202,7 @@ def _cold_round_trip(root: Path, mode: str, planar=False):
                         restored = torch.empty_strided(
                             original.shape,
                             (2 * original.shape[1], 1),
-                            dtype=torch.uint8,
+                            dtype=original.dtype,
                         )
                         scatter_page_payload(
                             final_host[offset : offset + size],

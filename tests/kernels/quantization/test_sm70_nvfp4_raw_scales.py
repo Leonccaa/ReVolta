@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Raw-scale expansion and decode admission must cover E4M3 edge encodings."""
 
+import numpy as np
 import pytest
 import torch
 
@@ -89,8 +90,14 @@ def test_raw_scale_fast_expansion_matches_hmma_reconstruction(stage, interleaved
     hi = scaled.half()
     lo = (scaled - hi.double()).half()
     raw = ((codes.int() << 7) + 0x2000).short().view(torch.float16)
-    correction = (raw.double() * lo.double()).half()
-    expected = (raw.double() * hi.double() + correction.double()).half()
+
+    def to_half(x: torch.Tensor) -> torch.Tensor:
+        # torch rounds float64 to float16 through float32; NumPy rounds once,
+        # like the FP16 multiply and fused multiply-add on the GPU.
+        return torch.from_numpy(x.cpu().numpy().astype(np.float16)).cuda()
+
+    correction = to_half(raw.double() * lo.double())
+    expected = to_half(raw.double() * hi.double() + correction.double())
     out = torch.empty(shape, dtype=torch.float16, device="cuda")
     sm70_ops.nvfp4_expand_raw_scales_sm70_out(out, codes, globals_, interleaved, True)
     assert torch.equal(out.view(torch.int16), expected.view(torch.int16))

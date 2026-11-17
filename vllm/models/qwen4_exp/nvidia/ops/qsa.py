@@ -169,7 +169,7 @@ def _qsa_grouped_page4_supported(
     )
 
 
-@triton.jit(do_not_specialize=["num_requests"])
+@triton.jit(do_not_specialize=["num_requests", "num_rows", "num_columns"])
 def _qsa_mqa_paged_kernel(
     q_ptr,
     k_cache_ptr,
@@ -301,7 +301,7 @@ def _qsa_mqa_paged_kernel(
         )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["rows", "num_requests"])
 def _qsa_visible_blocks_kernel(
     token_to_req_ptr,
     query_positions_ptr,
@@ -340,7 +340,7 @@ def _qsa_visible_blocks_kernel(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["columns"])
 def _qsa_gather_single_request_keys_kernel(
     cache_ptr,
     page_table_ptr,
@@ -385,7 +385,7 @@ def _qsa_gather_single_request_keys_kernel(
     tl.store(valid_ptr + column, valid, mask=column < columns)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["width", "stride_score_row"])
 def _qsa_relu_headsum_visible_kernel(
     score_ptr,
     visible_ptr,
@@ -427,7 +427,7 @@ def _qsa_relu_headsum_visible_kernel(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["rows", "num_requests"])
 def _expand_qsa_indices_kernel(
     block_indices_ptr,
     query_positions_ptr,
@@ -651,7 +651,7 @@ def _qsa_resolve_physical_indices_kernel(
     )
 
 
-@triton.jit(do_not_specialize=["num_requests"])
+@triton.jit(do_not_specialize=["num_requests", "num_rows"])
 def _qsa_sparse_paged_gqa_splitk_kernel(
     q_ptr,
     k_cache_ptr,
@@ -865,7 +865,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_rows"])
 def _qsa_merge_splitk_kernel(
     partial_output_ptr,
     partial_lse_ptr,
@@ -2034,7 +2034,7 @@ _INDEX_SHARD_PAD_SCORE_BITS = -8388608  # 0xFF800000 as int32
 _index_shard_merge_calls = 0
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["stride_values_row"])
 def _index_shard_pack_or_map_kernel(
     indices_ptr,
     values_ptr,

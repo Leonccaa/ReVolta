@@ -7,7 +7,9 @@ import torch
 from vllm.triton_utils import tl, triton
 
 
-@triton.jit
+# The two request counts are runtime scalars: as ``tl.constexpr`` every padded
+# graph size compiled another copy of this kernel on its first inference step.
+@triton.jit(do_not_specialize=["num_reqs", "padded_reqs"])
 def _prepare_ngram(
     context,
     query_out,
@@ -15,8 +17,8 @@ def _prepare_ngram(
     mapping,
     computed,
     token_ids,
-    num_reqs: tl.constexpr,
-    padded_reqs: tl.constexpr,
+    num_reqs,
+    padded_reqs,
     context_len: tl.constexpr,
     token_stride: tl.constexpr,
     eos: tl.constexpr,

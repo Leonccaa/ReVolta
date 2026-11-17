@@ -226,7 +226,12 @@ def _compute_block_stats_kernel(
             )
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=[
+        "rejected_logsumexp_plane_stride",
+        "block_stats_plane_stride",
+    ]
+)
 def _rejection_kernel(
     # [num_reqs, num_speculative_steps + 1]
     sampled_ptr,

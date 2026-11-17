@@ -123,23 +123,12 @@ def test_sparse_prefix_matches_dense_topk_and_guard_on_cpu(top_p, temperature):
 )
 @pytest.mark.parametrize("top_p", [0.5, 0.95, 1.0])
 @pytest.mark.parametrize("temperature", [1.0, 1.6, 0.7])
-def test_sparse_and_dense_cutoffs_match_on_gpu(top_p, temperature, request):
+def test_sparse_and_dense_cutoffs_match_on_gpu(top_p, temperature):
     logits = _cutoff_input("cuda")
     p = torch.full((2,), top_p, device="cuda")
     k = torch.full((2,), 20, dtype=torch.int32, device="cuda")
     sparse, _ = _sparse_logits(logits, p, temperature)
     dense = apply_top_k_top_p_triton(_scaled(logits, temperature), k, p)
-    if temperature == 1.6 and top_p == 0.95:
-        request.node.add_marker(
-            pytest.mark.xfail(
-                strict=False,
-                reason=(
-                    "上游 Triton top-k/top-p 内核在 k 与 p 同时生效，"
-                    "且截止值存在并列时可保留多于 k 个 token；"
-                    "待上游修复后移除"
-                ),
-            )
-        )
     assert torch.equal(torch.isfinite(sparse), torch.isfinite(dense))
     assert torch.equal(sparse.view(torch.int32), dense.view(torch.int32))
 

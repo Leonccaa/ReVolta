@@ -240,3 +240,10 @@ def test_graph_replay_with_changed_inputs():
         # Two passes of four rows: same 2051-column tiles, per-pass splits.
         torch.testing.assert_close(s_out, expected, atol=2e-3, rtol=1e-2)
         assert (s_out.data_ptr(), arms.store.indices.data_ptr()) == pointers
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_planar_staged_vector_and_mixed_prefill(rank):
+    from .test_host_kv_writethrough import _planar_prefill_roundtrip
+
+    _planar_prefill_roundtrip("cuda", rank)

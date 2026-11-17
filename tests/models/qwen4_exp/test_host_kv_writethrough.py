@@ -195,3 +195,167 @@ def test_mixed_batch_stages_prefill_and_keeps_decode_uva():
         finally:
             for store in stores:
                 store.close()
+
+
+def _planar_prefill_roundtrip(device, rank):
+    from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD as codec
+
+    shape = HostHistoryShape(
+        num_blocks=6,
+        kernel_blocks_per_block=3,
+        kernel_block_tokens=8,
+        num_layers=2,
+        kv_heads=2,
+        head_dim=256,
+        dtype=torch.uint8,
+        hot_slots=64,
+        max_requests=2,
+        selection_width=4,
+        max_write_rows=128,
+        row_groups=2,
+        dcp_world_size=2,
+        dcp_rank=rank,
+        interleave=2,
+        layout_cache_dtype=codec.name,
+        staged_writethrough=True,
+    )
+    layout = HostRegionLayout(uuid4().hex, 8, 2, shape.page_bytes, (96,))
+    owner = layout.open(None)
+    store = HostHistoryStore(
+        shape, ["a", "b"], device=device, region_layout=layout, rank=rank
+    )
+    try:
+        store.region._base.view(torch.uint8).fill_(0xA5)
+        expected_region = store.region._base.view(torch.uint8).clone()
+        store.bind_pages([(1, 4), (2, 2)])
+        store.begin_blocks([1, 2])
+        for layer in store.layers:
+            layer.group_to_slot[:] = torch.arange(shape.num_groups, device=device)
+        tables = {0: [3, 4, 5, 6, 7, 8]}
+        for step, mode in enumerate(("runs", "mixed", "fallback")):
+            count, start = (90, 3) if mode != "mixed" else (60, 16)
+            slots = prefill_slots(
+                tables, [0], [count], [start], [True], count + 2, 8, 2, rank, 2
+            )
+            if mode == "mixed":
+                # Two decode rows retain UVA in the staged scalar kernel.
+                slots[-2:] = [24, 25]
+                store.prepare_write(slots[:-2] + [-1, -1])
+            else:
+                store.prepare_prefill_write(
+                    tables, [0], [count], [start], [True], len(slots), 2, rank, 2
+                )
+                fast = store.write_plan
+                assert store.write_plan_kind == "runs"
+                store.prepare_write(slots)
+                assert store.write_plan.copies == fast.copies
+                assert store.write_plan.payload_bytes == fast.payload_bytes
+                if mode == "runs":
+                    store.prepare_prefill_write(
+                        tables, [0], [count], [start], [True], len(slots), 2, rank, 2
+                    )
+            assert store.write_plan_all_prefill == (mode == "runs")
+            copies = store.write_plan.copies
+            payload, scales = copies[: len(copies) // 2], copies[len(copies) // 2 :]
+            assert any(c.width == 8192 and c.height > 1 for c in payload)
+            assert any(c.width < 8192 and c.height == 2 for c in payload)
+            for data, scale in zip(payload, scales):
+                assert scale.source == 131072 + data.source // 64
+                assert scale.width == data.width // 64
+                assert scale.source_pitch == data.source_pitch // 64
+                assert scale.destination_pitch == (
+                    data.destination_pitch if data.width == 8192 else 64
+                )
+            slots_tensor = torch.tensor(slots, dtype=torch.int64, device=device)
+            source = torch.arange(len(slots) * 512).reshape(-1, 2, 256)
+            key = ((source % 997 - 498).float() * (step + 1) / 17).half().to(device)
+            value = (key.float() * -0.375 + step).half()
+            key[0].zero_()
+            encoded = [*codec.encode(key.cpu()), *codec.encode(value.cpu())]
+            for layer in store.layers:
+                assert layer._word_writer_eligible(
+                    layer.staging_cache.key[:, 0], layer.staging_cache.value[:, 0]
+                )
+                layer.write(
+                    key,
+                    value,
+                    slots_tensor,
+                    codec.name,
+                    torch.tensor(9.0, device=device),
+                    torch.tensor(11.0, device=device),
+                )
+                event = store.fence()
+                if event is not None:
+                    event.synchronize()
+                expected_host = expected_region.as_strided(
+                    layer.host_view.shape,
+                    layer.host_view.stride(),
+                    layer.host_view.storage_offset(),
+                )
+                page_layout = shape.page_layout(8)
+                for row, slot in enumerate(slots):
+                    if slot < 0:
+                        continue
+                    kb, off = divmod(slot, 8)
+                    data = (
+                        encoded[0][row],
+                        encoded[2][row],
+                        encoded[1][row],
+                        encoded[3][row],
+                    )
+                    for offset, tensor in zip(
+                        (
+                            off * 512,
+                            page_layout.value_offset + off * 512,
+                            page_layout.key_scale_offset + off * 8,
+                            page_layout.value_scale_offset + off * 8,
+                        ),
+                        data,
+                    ):
+                        raw = tensor.contiguous().view(torch.uint8).flatten()
+                        expected_host[
+                            int(store.page_of_cpu[kb // 3]),
+                            kb % 3,
+                            offset : offset + raw.numel(),
+                        ] = raw
+                    for cache, tensor in zip(
+                        (
+                            layer.key_cache,
+                            layer.value_cache,
+                            layer.key_scale_cache,
+                            layer.value_scale_cache,
+                        ),
+                        data,
+                    ):
+                        assert torch.equal(cache[slot // 4, slot % 4].cpu(), tensor)
+                    assert store.ready[slot] == 1
+                assert torch.equal(
+                    store.region._base.view(torch.uint8), expected_region
+                )
+        # Use the actual final-host bytes for both required negative checks.
+        actual = store.region._base.view(torch.uint8)
+
+        def compare(data):
+            assert data.shape == expected_region.shape, "INCOMPLETE"
+            assert torch.equal(data, expected_region), "FAIL"
+
+        byte = (
+            layer.host_view.data_ptr()
+            - actual.data_ptr()
+            + 4 * layer.host_view.stride(0)
+            + page_layout.key_scale_offset
+        )
+        actual[byte] ^= 1
+        with pytest.raises(AssertionError, match="FAIL"):
+            compare(actual)
+        actual[byte] ^= 1
+        with pytest.raises(AssertionError, match="INCOMPLETE"):
+            compare(actual[:byte])
+    finally:
+        store.close()
+        owner.cleanup()
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_planar_staged_vector_and_mixed_prefill(rank):
+    _planar_prefill_roundtrip("cpu", rank)

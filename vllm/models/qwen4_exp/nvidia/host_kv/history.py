@@ -51,7 +51,7 @@ from vllm.utils.torch_utils import (
     async_tensor_h2d,
     get_accelerator_view_from_cpu_tensor,
 )
-from vllm.v1.attention.kv_cache_view import KVCacheView, KVPageLayout
+from vllm.v1.attention.kv_cache_view import KVCacheView, KVPageLayout, align_up
 from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD
 from vllm.v1.kv_offload.host.page_table import SealTicket
 from vllm.v1.kv_offload.host.region import HostRegionLayout
@@ -857,6 +857,15 @@ class HostHistoryStore:
                 s.hot_slots, s.slots_per_block, kp, True,
             )  # fmt: skip
 
+    def _write_plan_kwargs(self) -> dict:
+        s = self.shape
+        if not s.planar_scales:
+            return {}
+        return dict(
+            page_layout=s.page_layout(s.kernel_block_tokens),
+            scale_offset=self.layers[0]._stage_scale_offset,
+        )
+
     def prepare_write(self, slots: Sequence[int]) -> None:
         """Plan once at step head from CPU page bindings, without a device read."""
         from .staged_write import plan_write
@@ -875,7 +884,8 @@ class HostHistoryStore:
             self.shape.kernel_blocks_per_block,
             self.shape.kernel_block_tokens,
             self.shape.kv_heads * self.shape.head_dim * item,
-            *(stride * item for stride in view.stride()[:3]),
+            *(stride * item for stride in self.layers[0]._host_strides[:3]),
+            **self._write_plan_kwargs(),
         )
         self.write_plan_kind = "fallback"
         targets = self._write_target_array(len(slots))
@@ -929,7 +939,7 @@ class HostHistoryStore:
         view = self.layers[0].host_view
         item = view.element_size()
         targets = self._write_target_array(padded_rows)
-        strides = view.stride()
+        strides = self.layers[0]._host_strides
         plan = plan_prefill_write(
             tables,
             indices,
@@ -948,6 +958,7 @@ class HostHistoryStore:
             world,
             rank,
             interleave,
+            **self._write_plan_kwargs(),
         )
         if plan is None:
             self.prepare_write(
@@ -1033,6 +1044,7 @@ class HostHistoryLayer:
         self.hot = store.hot[index]
         self._host_strides = self.host_view.stride()[:5]
         self._copy_kwargs: dict[str, int] = {}
+        self._stage_scale_offset = 0
         if s.planar_scales:
             # Each subpage has a uniform history-row stride. Flattening all
             # subpages would cross other workers and logical index payloads.
@@ -1058,6 +1070,9 @@ class HostHistoryLayer:
                 host_layout.value_offset,
                 s.kv_heads * s.head_dim,
                 s.head_dim,
+            )
+            self._stage_scale_offset = align_up(
+                2 * s.max_write_rows * s.kv_heads * s.head_dim
             )
             self._copy_kwargs = dict(
                 PLANAR=True,
@@ -1216,20 +1231,33 @@ class HostHistoryLayer:
             and torch.cuda.is_current_stream_capturing()
         ):
             plan = None
+        scale_kwargs: dict[str, object] = {}
+        if s.planar_scales:
+            assert key_scale is not None and value_scale is not None
+            scale_kwargs = dict(
+                KScale=key_scale,
+                VScale=value_scale,
+                KSS0=key_scale.stride(0),
+                KSS1=key_scale.stride(1),
+                VSS0=value_scale.stride(0),
+                VSS1=value_scale.stride(1),
+            )
         if plan is not None:
             if n > len(plan.targets):
                 raise ValueError("Write rows exceed the step plan")
             if store.write_plan_all_prefill and self._word_writer_eligible(key, value):
-                self._write_words(key, value, slot_mapping, staged=True)
+                self._write_words(key, value, slot_mapping, staged=True, **scale_kwargs)
             else:
                 hk.stage_slots[(n,)](
                     key, value, slot_mapping, self.host_device, self.hot,
                     store.write_stage, store.write_targets,
                     self.group_to_slot, store.page_of,
                     key.stride(0), key.stride(1), value.stride(0), value.stride(1),
-                    *self.host_view.stride()[:5], s.kernel_blocks_per_block,
+                    *self._host_strides, s.kernel_blocks_per_block,
                     s.kernel_block_tokens, s.kv_heads, s.head_dim,
                     triton.next_power_of_2(s.kv_heads * s.head_dim),
+                    STAGE_SCALE=self._stage_scale_offset,
+                    **self._copy_kwargs, **scale_kwargs,
                 )  # fmt: skip
             assert store.write_stage is not None
             if store.device.type == "cuda":
@@ -1258,17 +1286,6 @@ class HostHistoryLayer:
                         )
         else:
             fast = decode and store.decode_fast
-            scale_kwargs: dict[str, object] = {}
-            if s.planar_scales:
-                assert key_scale is not None and value_scale is not None
-                scale_kwargs = dict(
-                    KScale=key_scale,
-                    VScale=value_scale,
-                    KSS0=key_scale.stride(0),
-                    KSS1=key_scale.stride(1),
-                    VSS0=value_scale.stride(0),
-                    VSS1=value_scale.stride(1),
-                )
             hk.write_slots[(n,)](
                 key, value, slot_mapping, self.host_device, self.hot,
                 self.group_to_slot, self.store.page_of,
@@ -1298,6 +1315,7 @@ class HostHistoryLayer:
         slots: torch.Tensor,
         *,
         staged: bool,
+        **scale_kwargs: object,
     ) -> None:
         """Use the word kernel for proven all-prefill batches only."""
         store, s = self.store, self.store.shape
@@ -1306,7 +1324,7 @@ class HostHistoryLayer:
         words = s.kv_heads * s.head_dim * s.dtype.itemsize // 8
         rows = max(1, 256 // triton.next_power_of_2(words))
         word_strides = tuple(
-            stride * s.dtype.itemsize // 8 for stride in self.host_view.stride()[:4]
+            stride * s.dtype.itemsize // 8 for stride in self._host_strides[:4]
         )
         hk.write_slots_vector[(triton.cdiv(n, rows),)](
             key.view(torch.int64), value.view(torch.int64), slots,
@@ -1318,6 +1336,8 @@ class HostHistoryLayer:
             *word_strides,
             s.kernel_blocks_per_block, s.kernel_block_tokens, words,
             triton.next_power_of_2(words), rows, staged,
+            H=s.kv_heads, STAGE_SCALE=self._stage_scale_offset,
+            **self._copy_kwargs, **scale_kwargs,
         )  # fmt: skip
 
     def _word_writer_eligible(self, key: torch.Tensor, value: torch.Tensor) -> bool:
@@ -1330,7 +1350,7 @@ class HostHistoryLayer:
             and key.stride(0) * item % 16 == value.stride(0) * item % 16 == 0
             and key.data_ptr() % 16 == value.data_ptr() % 16 == 0
             and self.host_view.data_ptr() % 16 == self.hot.data_ptr() % 16 == 0
-            and all(stride * item % 16 == 0 for stride in self.host_view.stride()[:4])
+            and all(stride * item % 16 == 0 for stride in self._host_strides[:4])
         )
 
     # ----- reads ----------------------------------------------------------

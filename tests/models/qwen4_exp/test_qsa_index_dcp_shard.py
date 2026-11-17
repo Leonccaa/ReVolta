@@ -401,6 +401,55 @@ def test_reference_keeps_signaling_nan_order() -> None:
     assert out.tolist() == [[1]]
 
 
+@pytest.mark.parametrize(
+    "route", ["push", "nccl", "tp2", "world2", "no_ca", "injected"]
+)
+def test_candidate_default_gather_route(monkeypatch, route):
+    from unittest.mock import Mock
+
+    import vllm.distributed as distributed
+    from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
+
+    world = 2 if route == "world2" else 4
+    blocks = torch.arange(2, dtype=torch.int32).unsqueeze(0)
+    logits = torch.ones(1, 2)
+    gathered = torch.cat(
+        [
+            torch.cat(
+                (logits.view(torch.int32), blocks * world + rank), dim=1
+            ).unsqueeze(0)
+            for rank in range(world)
+        ]
+    )
+    custom = Mock(return_value=gathered if route == "push" else None)
+    tp = SimpleNamespace(
+        world_size=2 if route == "tp2" else 4,
+        device_communicator=SimpleNamespace(
+            ca_comm=None
+            if route == "no_ca"
+            else SimpleNamespace(sm70_qsa_index_allgather=custom)
+        ),
+        all_gather=Mock(return_value=gathered),
+    )
+    monkeypatch.setattr(distributed, "get_tp_group", lambda: tp)
+    injected = Mock(return_value=gathered)
+    result = qsa_ops._merge_sharded_index_blocks(
+        blocks,
+        logits,
+        None,
+        world,
+        0,
+        2,
+        select=_reference_select,
+        use_triton=False,
+        all_gather=injected if route == "injected" else None,
+    )
+    assert result.tolist() == [[0, 1]]
+    assert custom.call_count == (1 if route in ("push", "nccl") else 0)
+    assert tp.all_gather.call_count == (0 if route in ("push", "injected") else 1)
+    assert injected.call_count == (1 if route == "injected" else 0)
+
+
 @pytest.mark.parametrize("columns", [1, 2])
 @pytest.mark.parametrize("use_triton", [False, True])
 def test_shard_merge_one_rank_empty(columns: int, use_triton: bool) -> None:

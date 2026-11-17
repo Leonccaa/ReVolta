@@ -93,6 +93,65 @@ bool _is_weak_contiguous(torch::Tensor& t) {
 #if !defined(USE_ROCM)
 namespace vllm {
 
+// SPDX-License-Identifier: Apache-2.0
+// Copyright contributors to the vLLM project.
+// Adapted from sm70_qwen38_hc_batch.cuh::gather_body: integer half-word +
+// tag push/poll/clear. Rank-major output follows QSA's NCCL all-gather layout.
+__global__ void __launch_bounds__(128, 1)
+    sm70_qsa_index_push_allgather(RankData buffers,
+                                  const uint4* __restrict__ input,
+                                  uint4* __restrict__ output, int rank,
+                                  int packs) {
+  constexpr int stride = kSm70QsaIndexPushBytes / sizeof(uint16_t);
+  auto* local =
+      const_cast<char*>(reinterpret_cast<const char*>(buffers.ptrs[rank]));
+  auto* counters = reinterpret_cast<uint32_t*>(local + kSm70QsaIndexPushOffset);
+  const uint32_t epoch = counters[blockIdx.x];
+  const uint32_t tag = epoch + 1u;
+  const int slot = epoch * 4 * stride;
+  const int offset = blockIdx.x * blockDim.x + threadIdx.x;
+  const uint4 value = input[offset];
+  const uint32_t raw[4] = {value.x, value.y, value.z, value.w};
+  uint32_t words[8];
+  #pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    words[2 * i] = (tag << 16) | (raw[i] & 0xffffu);
+    words[2 * i + 1] = (tag << 16) | (raw[i] >> 16);
+  }
+  const uint4 lo = make_uint4(words[0], words[1], words[2], words[3]);
+  const uint4 hi = make_uint4(words[4], words[5], words[6], words[7]);
+  #pragma unroll
+  for (int peer = 0; peer < 4; ++peer) {
+    auto* dest =
+        const_cast<char*>(reinterpret_cast<const char*>(buffers.ptrs[peer])) +
+        kSm70QsaIndexPushPacketOffset +
+        (slot + rank * stride) * sizeof(uint32_t);
+    sm70_push_store_volatile_16b(lo, dest, offset * 2);
+    sm70_push_store_volatile_16b(hi, dest, offset * 2 + 1);
+  }
+  #pragma unroll
+  for (int peer = 0; peer < 4; ++peer) {
+    void* source = local + kSm70QsaIndexPushPacketOffset +
+                   (slot + peer * stride) * sizeof(uint32_t);
+    uint4 a, b;
+    do {
+      sm70_push_load_volatile_16b(a, source, offset * 2);
+      sm70_push_load_volatile_16b(b, source, offset * 2 + 1);
+    } while ((a.x >> 16) != tag || (a.y >> 16) != tag || (a.z >> 16) != tag ||
+             (a.w >> 16) != tag || (b.x >> 16) != tag || (b.y >> 16) != tag ||
+             (b.z >> 16) != tag || (b.w >> 16) != tag);
+    output[peer * packs + offset] = make_uint4(
+        (a.x & 0xffffu) | (a.y << 16), (a.z & 0xffffu) | (a.w << 16),
+        (b.x & 0xffffu) | (b.y << 16), (b.z & 0xffffu) | (b.w << 16));
+    // Clear consumed packets before epoch reuse, including shrink/grow calls.
+    const uint4 empty = make_uint4(0, 0, 0, 0);
+    sm70_push_store_volatile_16b(empty, source, offset * 2);
+    sm70_push_store_volatile_16b(empty, source, offset * 2 + 1);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) counters[blockIdx.x] = (epoch + 1u) & 1u;
+}
+
 constexpr int kQwen38HcDownLocalElements = 88;
 constexpr int kQwen38HcDownLiveElements = 84;
 constexpr int kQwen38HcDownLocalLoraElements = 80;
@@ -995,6 +1054,23 @@ void sm70_qwen38_hc_batch(fptr_t _fa, torch::Tensor input,
       cooperative, full_unroll, c10::cuda::getCurrentCUDAStream().stream(),
       fused_chain);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+#endif
+}
+
+void sm70_qsa_index_allgather(fptr_t _fa, torch::Tensor& input,
+                              torch::Tensor& output) {
+#if defined(USE_ROCM)
+  TORCH_CHECK(false, "SM70 QSA all-gather is unavailable on ROCm");
+#else
+  auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  const int packs = input.numel() / 4;
+  const int threads = vllm::kSm70Tp4PushAllreduceThreads;
+  vllm::sm70_qsa_index_push_allgather<<<packs / threads, threads, 0, stream>>>(
+      fa->sm70_tp4_push_buffers_,
+      reinterpret_cast<const uint4*>(input.data_ptr()),
+      reinterpret_cast<uint4*>(output.data_ptr()), fa->rank_, packs);
 #endif
 }
 

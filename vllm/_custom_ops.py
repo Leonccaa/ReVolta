@@ -3178,6 +3178,10 @@ def sm70_qwen38_hc_batch(
     )
 
 
+def sm70_qsa_index_allgather(fa: int, inp: torch.Tensor, out: torch.Tensor) -> None:
+    _custom_ar_owner_namespace().sm70_qsa_index_allgather(fa, inp, out)
+
+
 def sm70_qwen38_hc_down_allgather(
     fa: int,
     inp: torch.Tensor,

@@ -10,6 +10,8 @@ import torch
 import vllm._custom_ops as ops
 from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
 
+pytestmark = pytest.mark.skip_global_cleanup
+
 
 def _mock_communicator() -> CustomAllreduce:
     communicator = object.__new__(CustomAllreduce)
@@ -20,6 +22,79 @@ def _mock_communicator() -> CustomAllreduce:
     communicator.tp8_hierarchical = False
     communicator.dispatch_max_size = 1024 * 1024
     return communicator
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "push",
+        "capacity",
+        "oversize",
+        "disabled",
+        "tp2",
+        "pex",
+        "unconnected",
+        "unregistered",
+        "cpu",
+        "dtype",
+        "layout",
+        "width",
+        "empty",
+    ],
+)
+def test_qsa_candidate_gather_admission(monkeypatch, case):
+    comm = _mock_communicator()
+    comm.sm70_nvlink_tp4 = True
+    comm.sm70_tp4_push_buffer_ptrs = [0] * 4
+    inp = torch.empty((1, 40 if case == "capacity" else 1, 1024), dtype=torch.int32)
+    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda _: case != "cpu"))
+    if case == "disabled":
+        comm.disabled = True
+    elif case == "tp2":
+        comm.world_size = 2
+    elif case == "pex":
+        comm.sm70_nvlink_tp4 = False
+    elif case == "unconnected":
+        comm.fully_connected = False
+    elif case == "unregistered":
+        comm.sm70_tp4_push_buffer_ptrs = None
+    elif case == "dtype":
+        inp = inp.to(torch.int64)
+    elif case == "layout":
+        inp = torch.empty((1, 1024, 2), dtype=torch.int32).transpose(1, 2)
+    elif case in ("oversize", "empty", "width"):
+        inp = torch.empty(
+            (
+                1,
+                41 if case == "oversize" else 0 if case == "empty" else 1,
+                6 if case == "width" else 1024,
+            ),
+            dtype=torch.int32,
+        )
+    op = Mock()
+    monkeypatch.setattr(ops, "sm70_qsa_index_allgather", op)
+    out = comm.sm70_qsa_index_allgather(inp)
+    if case in ("push", "capacity"):
+        assert out.shape == (4, inp.shape[1], 1024) and out.dtype == torch.int32
+        op.assert_called_once_with(comm._ptr, inp, out)
+    else:
+        assert out is None
+        op.assert_not_called()
+
+
+@pytest.mark.parametrize("sidecar_owner", [False, True])
+def test_qsa_gather_uses_communicator_dso(monkeypatch, sidecar_owner):
+    base = SimpleNamespace(init_custom_ar=Mock(), sm70_qsa_index_allgather=Mock())
+    sidecar = SimpleNamespace(sm70_qsa_index_allgather=Mock())
+    if sidecar_owner:
+        sidecar.init_custom_ar = Mock()
+    monkeypatch.setattr(torch.ops, "_C_custom_ar", base)
+    monkeypatch.setattr(torch.ops, "_C_custom_ar_flashnext", sidecar)
+    inp, out = torch.empty(1), torch.empty(4)
+    ops.sm70_qsa_index_allgather(123, inp, out)
+    owner, other = (sidecar, base) if sidecar_owner else (base, sidecar)
+    owner.sm70_qsa_index_allgather.assert_called_once_with(123, inp, out)
+    other.sm70_qsa_index_allgather.assert_not_called()
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])

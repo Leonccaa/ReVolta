@@ -158,3 +158,124 @@ def test_custom_allreduce(
     if world_size > torch.accelerator.device_count():
         pytest.skip("Not enough GPUs to run the test.")
     multi_process_parallel(monkeypatch, tp_size, pipeline_parallel_size, test_target)
+
+
+def _qsa_gather_bytes_status(source: bytes, final: bytes) -> str:
+    if len(final) != len(source):
+        return "INCOMPLETE"
+    return "PASS" if final == source else "FAIL"
+
+
+@ray.remote(num_gpus=1, max_calls=1)
+def qsa_candidate_allgather(monkeypatch, tp_size, pp_size, rank, distributed_init_port):
+    from vllm.models.qwen4_exp.nvidia.ops import qsa
+
+    with monkeypatch.context() as m:
+        m.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+        m.delenv("HIP_VISIBLE_DEVICES", raising=False)
+        m.setenv("VLLM_SM70_TP4_PUSH_ALLREDUCE", "1")
+        device = torch.device(f"cuda:{rank}")
+        torch.accelerator.set_device_index(device)
+        init_test_distributed_environment(tp_size, pp_size, rank, distributed_init_port)
+        tp = get_tp_group()
+        ca = tp.device_communicator.ca_comm
+        assert not ca.disabled and ca.sm70_nvlink_tp4
+        assert ca.sm70_tp4_push_buffer_ptrs is not None
+        select = qsa._sm70_qsa_lexicographic_topk_op()
+        moe = torch.ones(1, 2560, dtype=torch.float16, device=device)
+
+        def make_step(rows):
+            scores = torch.empty(rows, 2051, device=device).random_(0, 4)
+            lengths = torch.tensor(
+                [[2051, 0, 512, 1025, 300][r % 5] for r in range(rows)],
+                dtype=torch.int32,
+                device=device,
+            )
+            blocks = torch.empty(rows, 512, dtype=torch.int32, device=device)
+
+            def step():
+                select(scores, lengths, blocks, 512)
+                source = qsa._pack_index_shard_candidates(
+                    blocks, scores, 4, rank
+                ).unsqueeze(0)
+                outputs, reductions = [], []
+                for _ in range(13):
+                    final = ca.sm70_qsa_index_allgather(source)
+                    if rows <= 40:
+                        assert final is not None
+                    else:
+                        assert final is None
+                        final = tp.all_gather(source, dim=0)
+                    outputs.append(final)
+                    reductions.append(tensor_model_parallel_all_reduce(moe))
+                merged = qsa._merge_sharded_index_blocks(
+                    blocks,
+                    scores,
+                    lengths,
+                    4,
+                    rank,
+                    512,
+                    all_gather=lambda _: outputs[-1],
+                    use_triton=True,
+                )
+                return source, outputs, reductions, merged
+
+            def check(result):
+                source, outputs, reductions, merged = result
+                reference = tp.all_gather(source, dim=0)
+                expected = qsa._merge_sharded_index_blocks(
+                    blocks,
+                    scores,
+                    lengths,
+                    4,
+                    rank,
+                    512,
+                    all_gather=lambda _: reference,
+                    use_triton=True,
+                )
+                assert torch.equal(merged, expected)
+                raw_source = reference.cpu().numpy().tobytes()
+                for final, reduction in zip(outputs, reductions):
+                    assert torch.equal(
+                        final.view(torch.uint8), reference.view(torch.uint8)
+                    )
+                    assert torch.equal(reduction, moe * 4)
+                    raw_final = final.cpu().numpy().tobytes()
+                    assert _qsa_gather_bytes_status(raw_source, raw_final) == "PASS"
+                # D68: mutate only copies of the real final; retain real source/final.
+                changed = bytearray(raw_final)
+                changed[0] ^= 1
+                assert _qsa_gather_bytes_status(raw_source, bytes(changed)) == "FAIL"
+                assert (
+                    _qsa_gather_bytes_status(raw_source, raw_final[:-4096])
+                    == "INCOMPLETE"
+                )
+
+            return scores, step, check
+
+        graphs = {}
+        for rows in (1, 5, 10, 40, 41):
+            scores, step, check = make_step(rows)
+            check(step())  # Real pack/merge compilation and NCCL warmup before capture.
+            with graph_capture(device=device) as context:
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=context.stream):
+                    result = step()
+            graphs[rows] = (scores, graph, result, check)
+        # Odd replay counts, changed candidates, and shared-channel shrink/grow.
+        for rows in (10, 1, 5, 10, 40, 41):
+            scores, graph, result, check = graphs[rows]
+            for _ in range(3):
+                scores.random_(0, 4)
+                graph.replay()
+                check(result)
+
+
+def test_qsa_candidate_allgather_tp4(monkeypatch):
+    from vllm.platforms import current_platform
+
+    if torch.accelerator.device_count() < 4:
+        pytest.skip("Not enough GPUs to run the test.")
+    if not current_platform.is_cuda() or not current_platform.is_device_capability(70):
+        pytest.skip("Needs four fully connected NVLink SM70 GPUs.")
+    multi_process_parallel(monkeypatch, 4, 1, qsa_candidate_allgather)

@@ -964,6 +964,26 @@ class CustomAllreduce:
             fused_chain,
         )
 
+    def sm70_qsa_index_allgather(self, inp: torch.Tensor) -> torch.Tensor | None:
+        if not (
+            not self.disabled
+            and self.world_size == 4
+            and self.sm70_nvlink_tp4
+            and self.fully_connected
+            and self.sm70_tp4_push_buffer_ptrs is not None
+            and inp.is_cuda
+            and inp.dtype == torch.int32
+            and inp.ndim == 3
+            and inp.shape[0] == 1
+            and inp.shape[2] == 1024
+            and inp.is_contiguous()
+            and 0 < inp.nbytes <= 80 * 128 * 16
+        ):
+            return None
+        out = torch.empty((4, inp.shape[1], 1024), dtype=inp.dtype, device=inp.device)
+        ops.sm70_qsa_index_allgather(self._ptr, inp, out)
+        return out
+
     def can_sm70_qwen38_hc_shard(self, branches: torch.Tensor) -> bool:
         return bool(
             not self.disabled

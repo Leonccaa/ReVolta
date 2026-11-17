@@ -2350,7 +2350,17 @@ def _merge_sharded_index_blocks(
     if all_gather is None:
         from vllm.distributed import get_tp_group
 
-        all_gather = lambda t: get_tp_group().all_gather(t, dim=0)  # noqa: E731
+        tp = get_tp_group()
+
+        def all_gather(t: torch.Tensor) -> torch.Tensor:
+            if world == 4 and tp.world_size == 4:
+                ca_comm = getattr(tp.device_communicator, "ca_comm", None)
+                if ca_comm is not None:
+                    out = ca_comm.sm70_qsa_index_allgather(t)
+                    if out is not None:
+                        return out
+            return tp.all_gather(t, dim=0)
+
     if envs.VLLM_QSA_INDEX_SHARD_DEBUG:
         _check_index_shard_plan(rows, block_topk, world, row_keys, all_gather)
     gathered = all_gather(packed.unsqueeze(0))

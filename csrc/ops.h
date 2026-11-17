@@ -817,6 +817,8 @@ void sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
     fptr_t reg_output_buffer, int64_t reg_buffer_sz_bytes, double epsilon);
 void all_reduce_sum2(fptr_t _fa, torch::Tensor& inp_a, torch::Tensor& inp_b,
                      torch::Tensor& out);
+void sm70_qsa_index_allgather(fptr_t _fa, torch::Tensor& input,
+                              torch::Tensor& output);
 void sm70_qwen38_hc_down_allgather(fptr_t _fa, torch::Tensor& input,
                                    torch::Tensor& output);
 void sm70_qwen38_hc_batch(fptr_t _fa, torch::Tensor input,

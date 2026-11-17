@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 def dflash_draft_cache_dtype(config: "VllmConfig") -> "CacheDType":
     """The cache dtype a DFlash drafter is loaded with (``load_dflash_model``).
 
-    An explicit draft ``kv_cache_dtype`` wins; on SM70 an FP8 target keeps an
+    An explicit draft ``kv_cache_dtype`` wins; on SM70 an FP8/INT8 target keeps an
     FP16 drafter cache; otherwise the drafter inherits the target dtype.
     """
     from vllm.platforms import current_platform
@@ -25,7 +25,7 @@ def dflash_draft_cache_dtype(config: "VllmConfig") -> "CacheDType":
         return spec.kv_cache_dtype
     target = config.cache_config.cache_dtype
     if (
-        str(target).startswith("fp8")
+        (str(target).startswith("fp8") or target == "int8")
         and current_platform.is_cuda()
         and current_platform.is_device_capability(70)
     ):
@@ -37,14 +37,6 @@ def validate_speculative_kv_cache_dtype(config: "VllmConfig") -> None:
     spec = config.speculative_config
     if config.is_speculative_draft or spec is None:
         return
-    if spec.method == "dflash" and config.cache_config.cache_dtype == "int8":
-        raise ValueError(
-            "DFlash/DFlash2 does not support INT8 target KV: its attention "
-            "block size is incompatible with the 16-token kernel pages "
-            "required by the INT8 v1 planar layout, regardless of the draft "
-            "KV dtype. With DFlash2 use --kv-cache-dtype fp8_e4m3 (recommended), "
-            "float16, or auto. For INT8 KV use method='mtp'."
-        )
     if spec.method == "dflash" and dflash_draft_cache_dtype(config) == "int8":
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 

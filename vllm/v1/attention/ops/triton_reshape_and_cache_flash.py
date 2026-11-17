@@ -178,6 +178,7 @@ def _reshape_cache_per_token_head(
     HEAD_SIZE_PADDED: tl.constexpr,  # next_power_of_2(max(head_size, head_size_v))
     QUANT_MAX: tl.constexpr = 127.0,
     QUANT_MIN: tl.constexpr = -128.0,
+    E4M3_ENCODER: tl.constexpr = None,
 ):
     tok = tl.program_id(0)
     head = tl.program_id(1)
@@ -199,7 +200,12 @@ def _reshape_cache_per_token_head(
         other=0.0,
     ).to(tl.float32)
 
-    k_scale = tl.maximum(tl.max(tl.abs(k_h)) / QUANT_MAX, 1e-6)
+    # E4M3 math follows 1CatAI/1Cat-vLLM 4f565bae32, host_kv._write.
+    # Keep the legacy reciprocal/floor arithmetic in its own specialization.
+    if E4M3_ENCODER is not None:
+        k_scale = tl.maximum(tl.div_rn(tl.max(tl.abs(k_h)), 448.0), 2.0**-126)
+    else:
+        k_scale = tl.maximum(tl.max(tl.abs(k_h)) / QUANT_MAX, 1e-6)
     tl.store(
         k_scale_cache_ptr
         + blk * stride_ks_blk
@@ -208,7 +214,10 @@ def _reshape_cache_per_token_head(
         k_scale,
     )
 
-    k_q = tl.clamp(k_h * (1.0 / k_scale), QUANT_MIN, QUANT_MAX)
+    if E4M3_ENCODER is not None:
+        k_q = E4M3_ENCODER(tl.div_rn(k_h, k_scale))
+    else:
+        k_q = tl.clamp(k_h * (1.0 / k_scale), QUANT_MIN, QUANT_MAX)
     tl.store(
         key_cache_ptr
         + blk * stride_kc_blk
@@ -227,7 +236,10 @@ def _reshape_cache_per_token_head(
         other=0.0,
     ).to(tl.float32)
 
-    v_scale = tl.maximum(tl.max(tl.abs(v_h)) / QUANT_MAX, 1e-6)
+    if E4M3_ENCODER is not None:
+        v_scale = tl.maximum(tl.div_rn(tl.max(tl.abs(v_h)), 448.0), 2.0**-126)
+    else:
+        v_scale = tl.maximum(tl.max(tl.abs(v_h)) / QUANT_MAX, 1e-6)
     tl.store(
         v_scale_cache_ptr
         + blk * stride_vs_blk
@@ -236,7 +248,10 @@ def _reshape_cache_per_token_head(
         v_scale,
     )
 
-    v_q = tl.clamp(v_h * (1.0 / v_scale), QUANT_MIN, QUANT_MAX)
+    if E4M3_ENCODER is not None:
+        v_q = E4M3_ENCODER(tl.div_rn(v_h, v_scale))
+    else:
+        v_q = tl.clamp(v_h * (1.0 / v_scale), QUANT_MIN, QUANT_MAX)
     tl.store(
         value_cache_ptr
         + blk * stride_vc_blk
@@ -253,6 +268,7 @@ def _reshape_cache_per_token_head(
 _PER_TOKEN_HEAD_QUANT_PARAMS: dict[torch.dtype, tuple[float, float]] = {
     torch.int8: (127.0, -128.0),
     FP8_DTYPE: (FP8_MAX, FP8_MIN),
+    torch.uint8: (448.0, -448.0),  # Software E4M3FN planar payload.
 }
 
 
@@ -284,6 +300,15 @@ def triton_reshape_and_cache_flash_per_token_head_quant(
     quant_max, quant_min = quant_params
 
     num_tokens, num_kv_heads, head_size = key.shape
+    encoder = None
+    if cache_dtype == torch.uint8:
+        # Import after attention initialization to avoid the model import cycle.
+        from vllm.models.deepseek_v4.common.ops.fp8_software import (
+            fp32_to_fp8_e4m3fn_bits,
+        )
+
+        encoder = fp32_to_fp8_e4m3fn_bits
+        num_tokens = slot_mapping.shape[0]
     head_size_v = value.shape[2]
     head_size_padded = triton.next_power_of_2(max(head_size, head_size_v))
 
@@ -324,6 +349,7 @@ def triton_reshape_and_cache_flash_per_token_head_quant(
         HEAD_SIZE_PADDED=head_size_padded,
         QUANT_MAX=quant_max,
         QUANT_MIN=quant_min,
+        E4M3_ENCODER=encoder,
         num_warps=num_warps,
     )
 

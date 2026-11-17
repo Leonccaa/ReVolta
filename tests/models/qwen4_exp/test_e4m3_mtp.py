@@ -24,6 +24,7 @@ from vllm.models.qwen4_exp.nvidia.qsa import (
     Qwen4ExpQSAAttention,
     _verify_e4m3_kv_requirements,
 )
+from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD
 
 E4M3 = "fp8_e4m3"
 _MTP_SPEC = object()
@@ -210,6 +211,23 @@ def test_finalize_noop_for_fp16_cache(monkeypatch):
     stub = _make_qsa_stub(0.0, 0.0, dtype="float16")
     container = _FakeModel(stub)
     _finalize_qsa_e4m3_scale_load(container, set(), "float16")
+
+
+def test_planar_target_and_mtp_do_not_require_checkpoint_scalars(monkeypatch):
+    monkeypatch.setattr(model_mod, "is_offload_process", lambda: False)
+    dtype = FP8_E4M3_PER_TOKEN_HEAD.name
+    stub = _make_qsa_stub(0.0, 0.0, dtype=dtype)
+    container = _FakeModel(stub)
+    _finalize_qsa_e4m3_scale_load(
+        container,
+        set(),
+        dtype,
+        require_calibrated_target=True,
+        require_calibrated_speculative_draft=True,
+    )
+    stub.validate_loaded_kv_scales()
+    assert stub._qsa_kv_scales_finalized
+    assert not hasattr(stub, "k_scale") and not hasattr(stub, "v_scale")
 
 
 # --------------------------------------------------------------------------- #

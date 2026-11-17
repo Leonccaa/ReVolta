@@ -12,13 +12,18 @@ In short:
 | NVLink | Recommended; tested with community results on 4 × V100-SXM2 32 GB ([#2](https://github.com/Leonccaa/ReVolta/issues/2), [#38](https://github.com/Leonccaa/ReVolta/issues/38), [#37](https://github.com/Leonccaa/ReVolta/issues/37)) |
 | Host memory | 32 GiB tested minimum with the experimental whole-table PLE disk option; 80 GiB with the default pinned PLE table (KV offload off); 128 GiB recommended |
 | KV offload | Off, CPU, or CPU + SSD tier |
-| KV cache | E4M3 (default) or INT8; INT8 with the SSD tier is not supported |
+| KV cache | Scalar E4M3 in the documented reference recipes, or INT8; INT8 with the SSD tier is not supported |
 | Models | Qwen3.8 Flash-Next (QSA, multimodal) |
 | Checkpoints | AWQ g32, standard NVFP4 `RadixArk/Qwen3.8-Flash-Next-NVFP4`, `nvidia/Qwen3.8-Flash-Next-FP4-Local` |
 
 Configurations outside our release gate (TP2/TP8, V100 16 GB, other models or
 topologies) are handled on a best-effort basis. Other GPU architectures,
 ROCm/CPU/XPU/TPU serving and GGUF are not built.
+
+Eligible QSA `auto` requests now select L1 planar E4M3 (`fp8_per_token_head`),
+distinct from explicit scalar `fp8` / `fp8_e4m3`. This name and default change
+does not add a validated GPU or SSD configuration to the support table. See
+the [KV dtype comparison](../docs/configuration.md#launch-options).
 
 Include the complete launch command and environment in every report. Never
 include credentials or private deployment details. Report security

@@ -1841,8 +1841,9 @@ class VllmConfig:
 
         if resolve_qsa_auto_e4m3(self):
             logger.info_once(
-                "Defaulting calibrated QSA main KV storage to E4M3; "
-                "activations and recurrent states retain their precision."
+                "Defaulting QSA main KV storage to %s; "
+                "activations and recurrent states retain their precision.",
+                self.cache_config.cache_dtype,
             )
 
         self.try_verify_and_update_config()

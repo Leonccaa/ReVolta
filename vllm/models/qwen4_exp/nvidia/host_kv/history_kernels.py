@@ -74,6 +74,18 @@ def write_slots(
     B: tl.constexpr,
     Ready=None,
     COMMIT: tl.constexpr = False,
+    KScale=None,
+    VScale=None,
+    KSS0: tl.constexpr = 0,
+    KSS1: tl.constexpr = 0,
+    VSS0: tl.constexpr = 0,
+    VSS1: tl.constexpr = 0,
+    PLANAR: tl.constexpr = False,
+    HOT_STRIDE: tl.constexpr = 0,
+    HOST_K_SCALE: tl.constexpr = 0,
+    HOST_V_SCALE: tl.constexpr = 0,
+    HOT_K_SCALE: tl.constexpr = 0,
+    HOT_V_SCALE: tl.constexpr = 0,
 ):
     """Copy one encoded row to its host page and, if resident, its hot group."""
     row = tl.program_id(0).to(tl.int64)
@@ -93,9 +105,29 @@ def write_slots(
     tl.store(Host + host, key, lane)
     tl.store(Host + host + HS1, value, lane)
     hot_slot = tl.load(Map + kernel_block * (KBS // 4) + offset // 4, valid, -1)
-    hot = hot_slot.to(tl.int64) * (8 * H * D) + (offset % 4) * H * D + x
+    hot_stride: tl.constexpr = HOT_STRIDE if PLANAR else 8 * H * D
+    hot = hot_slot.to(tl.int64) * hot_stride + (offset % 4) * H * D + x
     tl.store(Hot + hot, key, lane & (hot_slot >= 0))
     tl.store(Hot + hot + 4 * H * D, value, lane & (hot_slot >= 0))
+    if PLANAR:
+        head = x
+        scale_lane = valid & (head < H)
+        ks = tl.load(KScale + row * KSS0 + head * KSS1, scale_lane, 0)
+        vs = tl.load(VScale + row * VSS0 + head * VSS1, scale_lane, 0)
+        host_scale = (
+            page.to(tl.int64) * (HS0 // 4)
+            + (kernel_block % RATIO) * (HSS // 4)
+            + offset * H
+            + head
+        )
+        host_fp32 = Host.to(tl.pointer_type(tl.float32))
+        tl.store(host_fp32 + host_scale + HOST_K_SCALE // 4, ks, scale_lane)
+        tl.store(host_fp32 + host_scale + HOST_V_SCALE // 4, vs, scale_lane)
+        hot_scale = hot_slot.to(tl.int64) * (HOT_STRIDE // 4) + (offset % 4) * H + head
+        hot_fp32 = Hot.to(tl.pointer_type(tl.float32))
+        hot_lane = scale_lane & (hot_slot >= 0)
+        tl.store(hot_fp32 + hot_scale + HOT_K_SCALE // 4, ks, hot_lane)
+        tl.store(hot_fp32 + hot_scale + HOT_V_SCALE // 4, vs, hot_lane)
     if COMMIT:
         # Every consumer is on the same stream, after this kernel boundary.
         # The connector's retirement event still fences all host writes.
@@ -127,6 +159,19 @@ def stage_slots(
     H: tl.constexpr,
     D: tl.constexpr,
     B: tl.constexpr,
+    KScale=None,
+    VScale=None,
+    KSS0: tl.constexpr = 0,
+    KSS1: tl.constexpr = 0,
+    VSS0: tl.constexpr = 0,
+    VSS1: tl.constexpr = 0,
+    PLANAR: tl.constexpr = False,
+    HOT_STRIDE: tl.constexpr = 0,
+    HOST_K_SCALE: tl.constexpr = 0,
+    HOST_V_SCALE: tl.constexpr = 0,
+    HOT_K_SCALE: tl.constexpr = 0,
+    HOT_V_SCALE: tl.constexpr = 0,
+    STAGE_SCALE: tl.constexpr = 0,
 ):
     """Write planned rows to compact GPU storage, refresh hot, retain decode UVA."""
     row = tl.program_id(0).to(tl.int64)
@@ -151,9 +196,33 @@ def stage_slots(
     tl.store(Host + host, key, lane & ~staged)
     tl.store(Host + host + HS1, value, lane & ~staged)
     hot_slot = tl.load(Map + kernel_block * (KBS // 4) + offset // 4, valid, -1)
-    hot = hot_slot.to(tl.int64) * (8 * H * D) + (offset % 4) * H * D + x
+    hot_stride: tl.constexpr = HOT_STRIDE if PLANAR else 8 * H * D
+    hot = hot_slot.to(tl.int64) * hot_stride + (offset % 4) * H * D + x
     tl.store(Hot + hot, key, lane & (hot_slot >= 0))
     tl.store(Hot + hot + 4 * H * D, value, lane & (hot_slot >= 0))
+
+    if PLANAR:
+        head = x
+        scale_lane = valid & (head < H)
+        ks = tl.load(KScale + row * KSS0 + head * KSS1, scale_lane, 0)
+        vs = tl.load(VScale + row * VSS0 + head * VSS1, scale_lane, 0)
+        stage_fp32 = Stage.to(tl.pointer_type(tl.float32)) + STAGE_SCALE // 4
+        tl.store(stage_fp32 + k_target * H + head, ks, scale_lane & staged)
+        tl.store(stage_fp32 + v_target * H + head, vs, scale_lane & staged)
+        host_scale = (
+            page.to(tl.int64) * (HS0 // 4)
+            + (kernel_block % RATIO) * (HSS // 4)
+            + offset * H
+            + head
+        )
+        host_fp32 = Host.to(tl.pointer_type(tl.float32))
+        tl.store(host_fp32 + host_scale + HOST_K_SCALE // 4, ks, scale_lane & ~staged)
+        tl.store(host_fp32 + host_scale + HOST_V_SCALE // 4, vs, scale_lane & ~staged)
+        hot_scale = hot_slot.to(tl.int64) * (HOT_STRIDE // 4) + (offset % 4) * H + head
+        hot_fp32 = Hot.to(tl.pointer_type(tl.float32))
+        hot_lane = scale_lane & (hot_slot >= 0)
+        tl.store(hot_fp32 + hot_scale + HOT_K_SCALE // 4, ks, hot_lane)
+        tl.store(hot_fp32 + hot_scale + HOT_V_SCALE // 4, vs, hot_lane)
 
 
 @triton.jit
@@ -180,6 +249,20 @@ def write_slots_vector(
     WB: tl.constexpr,
     ROWS: tl.constexpr,
     STAGED: tl.constexpr,
+    H: tl.constexpr = 1,
+    KScale=None,
+    VScale=None,
+    KSS0: tl.constexpr = 0,
+    KSS1: tl.constexpr = 0,
+    VSS0: tl.constexpr = 0,
+    VSS1: tl.constexpr = 0,
+    PLANAR: tl.constexpr = False,
+    HOT_STRIDE: tl.constexpr = 0,
+    HOST_K_SCALE: tl.constexpr = 0,
+    HOST_V_SCALE: tl.constexpr = 0,
+    HOT_K_SCALE: tl.constexpr = 0,
+    HOT_V_SCALE: tl.constexpr = 0,
+    STAGE_SCALE: tl.constexpr = 0,
 ):
     """All strides and W are in 8-byte words. One program = ROWS rows."""
     r = (tl.program_id(0) * ROWS + tl.arange(0, ROWS)).to(tl.int64)
@@ -211,10 +294,44 @@ def write_slots_vector(
     tl.store(Host + base[:, None] + x[None, :], key, host_lane)
     tl.store(Host + (base + HS1)[:, None] + x[None, :], value, host_lane)
     hot_slot = tl.load(Map + kb * (KBS // 4) + off // 4, valid, -1).to(tl.int64)
-    hot = tl.multiple_of(hot_slot * (8 * W) + (off % 4) * W, 2)
+    hot_stride: tl.constexpr = HOT_STRIDE // 8 if PLANAR else 8 * W
+    hot = tl.multiple_of(hot_slot * hot_stride + (off % 4) * W, 2)
     hmask = lane & (hot_slot >= 0)[:, None]
     tl.store(Hot + hot[:, None] + x[None, :], key, hmask)
     tl.store(Hot + (hot + 4 * W)[:, None] + x[None, :], value, hmask)
+
+    if PLANAR:
+        head = tl.arange(0, triton.next_power_of_2(H)).to(tl.int64)
+        scale_lane = valid[:, None] & (head < H)[None, :]
+        ks = tl.load(KScale + r[:, None] * KSS0 + head[None, :] * KSS1, scale_lane, 0)
+        vs = tl.load(VScale + r[:, None] * VSS0 + head[None, :] * VSS1, scale_lane, 0)
+        host_scale_lane = scale_lane
+        if STAGED:
+            stage_fp32 = Stage.to(tl.pointer_type(tl.float32)) + STAGE_SCALE // 4
+            tl.store(
+                stage_fp32 + k_target[:, None] * H + head[None, :],
+                ks,
+                scale_lane & staged[:, None],
+            )
+            tl.store(
+                stage_fp32 + v_target[:, None] * H + head[None, :],
+                vs,
+                scale_lane & staged[:, None],
+            )
+            host_scale_lane = scale_lane & ~staged[:, None]
+        host_scale = (page * (HS0 * 2) + (kb % RATIO) * (HSS * 2) + off * H)[
+            :, None
+        ] + head[None, :]
+        host_fp32 = Host.to(tl.pointer_type(tl.float32))
+        tl.store(host_fp32 + host_scale + HOST_K_SCALE // 4, ks, host_scale_lane)
+        tl.store(host_fp32 + host_scale + HOST_V_SCALE // 4, vs, host_scale_lane)
+        hot_scale = (hot_slot * (HOT_STRIDE // 4) + (off % 4) * H)[:, None] + head[
+            None, :
+        ]
+        hot_fp32 = Hot.to(tl.pointer_type(tl.float32))
+        hot_lane = scale_lane & (hot_slot >= 0)[:, None]
+        tl.store(hot_fp32 + hot_scale + HOT_K_SCALE // 4, ks, hot_lane)
+        tl.store(hot_fp32 + hot_scale + HOT_V_SCALE // 4, vs, hot_lane)
 
 
 @triton.jit(do_not_specialize=["N"])
@@ -499,6 +616,12 @@ def gather_groups(
     S: tl.constexpr = 0,
     M: tl.constexpr = 0,
     ALLOCATE: tl.constexpr = False,
+    PLANAR: tl.constexpr = False,
+    HOT_STRIDE: tl.constexpr = 0,
+    HOST_K_SCALE: tl.constexpr = 0,
+    HOST_V_SCALE: tl.constexpr = 0,
+    HOT_K_SCALE: tl.constexpr = 0,
+    HOT_V_SCALE: tl.constexpr = 0,
 ):
     """Copy every committed row of each missed group (unready rows read 0)."""
     x = tl.arange(0, B).to(tl.int64)
@@ -543,7 +666,28 @@ def gather_groups(
             RATIO,
         )
         payload = tl.load(Host + host, (x < 8 * H * D) & (ready != 0) & (page >= 0), 0)
-        tl.store(Hot + slot * (8 * H * D) + x, payload, x < 8 * H * D)
+        hot_stride: tl.constexpr = HOT_STRIDE if PLANAR else 8 * H * D
+        tl.store(Hot + slot * hot_stride + x, payload, x < 8 * H * D)
+        if PLANAR:
+            scale_token, scale_head = x // H, x % H
+            scale_offset = gid % (KBS // 4) * 4 + scale_token
+            scale_ready = tl.load(
+                Ready + kernel_block * KBS + scale_offset, x < 4 * H, 0
+            )
+            host_scale = (
+                page.to(tl.int64) * (HS0 // 4)
+                + (kernel_block % RATIO) * (HSS // 4)
+                + scale_offset * H
+                + scale_head
+            )
+            host_fp32 = Host.to(tl.pointer_type(tl.float32))
+            scale_lane = (x < 4 * H) & (scale_ready != 0) & (page >= 0)
+            ks = tl.load(host_fp32 + host_scale + HOST_K_SCALE // 4, scale_lane, 0)
+            vs = tl.load(host_fp32 + host_scale + HOST_V_SCALE // 4, scale_lane, 0)
+            hot_scale = slot * (HOT_STRIDE // 4) + x
+            hot_fp32 = Hot.to(tl.pointer_type(tl.float32))
+            tl.store(hot_fp32 + hot_scale + HOT_K_SCALE // 4, ks, x < 4 * H)
+            tl.store(hot_fp32 + hot_scale + HOT_V_SCALE // 4, vs, x < 4 * H)
     # All selectors finished in the preceding kernel. Other gather CTAs
     # never read Hand, so advancing it here requires no grid barrier.
     if ALLOCATE and ((tl.program_id(0) == 0) & (count > 0)):

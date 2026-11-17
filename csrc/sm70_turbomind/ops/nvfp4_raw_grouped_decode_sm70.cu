@@ -173,7 +173,7 @@ __global__ void w13_kernel(const half* x, const uint32_t* weights,
     for (int g = split * (160 / Split); g < (split + 1) * (160 / Split); ++g) {
       const size_t offset =
           (static_cast<size_t>(tile) * 320 + g * 2) * 32 + col;
-      const int slot = Interleaved ? (tile & 1) : projection;
+      const int slot = Interleaved ? (col & 1) : projection;
       const half scalar = read_scale(__ldg(s + (g * 10 + tile) * 32 + col),
                                      __ldg(globals + expert * 2 + slot));
       const half2 scale = __halves2half2(scalar, scalar);

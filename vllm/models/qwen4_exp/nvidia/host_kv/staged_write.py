@@ -11,9 +11,13 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 from numpy.typing import NDArray
+
+if TYPE_CHECKING:
+    from vllm.v1.attention.kv_cache_view import KVPageLayout
 
 
 @dataclass(frozen=True)
@@ -31,6 +35,48 @@ class WritePlan:
     targets: tuple[tuple[int, int], ...] | NDArray[np.int64]
     copies: tuple[Copy2D, ...]
     payload_bytes: int
+
+
+def _with_scales(
+    plan: WritePlan,
+    row_bytes: int,
+    page_stride: int,
+    subpage_stride: int,
+    layout: KVPageLayout | None,
+    scale_offset: int,
+) -> WritePlan:
+    """Reuse each payload run and packed row for its two FP32 scale planes."""
+    if layout is None or not plan.copies:
+        return plan
+    scale_row = layout.num_heads * 4
+    copies = []
+    for copy in plan.copies:
+        page, within = divmod(copy.destination, page_stride)
+        subpage, within = divmod(within, subpage_stride)
+        destination = (
+            page * page_stride
+            + subpage * subpage_stride
+            + layout.key_scale_offset
+            + within // row_bytes * scale_row
+        )
+        full = copy.width == 2 * layout.block_size * row_bytes
+        copies.append(
+            Copy2D(
+                scale_offset + copy.source // row_bytes * scale_row,
+                destination,
+                copy.width // row_bytes * scale_row,
+                copy.height,
+                copy.source_pitch // row_bytes * scale_row,
+                copy.destination_pitch
+                if full
+                else layout.value_scale_offset - layout.key_scale_offset,
+            )
+        )
+    return replace(
+        plan,
+        copies=plan.copies + tuple(copies),
+        payload_bytes=scale_offset + plan.payload_bytes // row_bytes * scale_row,
+    )
 
 
 def prefill_slots(
@@ -78,6 +124,8 @@ def plan_write(
     page_stride: int,
     subpage_stride: int,
     plane_stride: int,
+    page_layout: KVPageLayout | None = None,
+    scale_offset: int = 0,
 ) -> WritePlan:
     """Pack contiguous token runs as K-run, V-run. Merge full subpages in 2D.
 
@@ -148,7 +196,14 @@ def plan_write(
                 Copy2D(packed * row_bytes, destination, size, 2, size, plane_stride)
             )
         packed += 2 * count
-    return WritePlan(tuple(targets), tuple(copies), packed * row_bytes)
+    return _with_scales(
+        WritePlan(tuple(targets), tuple(copies), packed * row_bytes),
+        row_bytes,
+        page_stride,
+        subpage_stride,
+        page_layout,
+        scale_offset,
+    )
 
 
 def plan_prefill_write(
@@ -169,6 +224,8 @@ def plan_prefill_write(
     world: int,
     rank: int,
     interleave: int,
+    page_layout: KVPageLayout | None = None,
+    scale_offset: int = 0,
 ) -> WritePlan | None:
     """Single contiguous prefill, planned in subpages rather than tokens.
 
@@ -301,7 +358,14 @@ def plan_prefill_write(
                 plane_stride,
             )
         copies.append(copy)
-    return WritePlan(targets, tuple(copies), 2 * local_rows * row_bytes)
+    return _with_scales(
+        WritePlan(targets, tuple(copies), 2 * local_rows * row_bytes),
+        row_bytes,
+        page_stride,
+        subpage_stride,
+        page_layout,
+        scale_offset,
+    )
 
 
 @lru_cache(maxsize=1)

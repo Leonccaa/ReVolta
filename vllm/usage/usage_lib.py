@@ -189,6 +189,12 @@ class UsageContext(str, Enum):
 class UsageMessage:
     """Collect platform information and send it to the usage stats server."""
 
+    # Startup summary cached by ``_report_usage_once`` and the monotonic time
+    # it was taken; every heartbeat replays it. Both are assigned after the
+    # summary is copied from ``vars(self)``, so they are not part of it.
+    _startup_data: dict[str, Any]
+    _startup_mono: float
+
     def __init__(self) -> None:
         # NOTE: vLLM's server _only_ support flat KV pair.
         # Do not use nested fields.
@@ -330,9 +336,14 @@ class UsageMessage:
         self.log_time = _get_current_timestamp_ns()
         self.source = _source_label()
 
-        data = vars(self)
+        data = dict(vars(self))
         if extra_kvs:
             data.update(extra_kvs)
+
+        # Heartbeats replay this summary; uptime is measured from this point.
+        data["uptime_s"] = 0
+        self._startup_data = data
+        self._startup_mono = time.monotonic()
 
         self._write_to_file(data)
         self._send_to_server(data)
@@ -340,15 +351,16 @@ class UsageMessage:
     def _report_continuous_usage(self):
         """Report usage every 10 minutes.
 
-        This helps us to collect more data points for uptime of vLLM usages.
-        This function can also help send over performance metrics over time.
+        Each heartbeat repeats the cached startup summary with a fresh
+        timestamp and the uptime, so a collector that missed the startup
+        report still receives the configuration. This function can also
+        help send over performance metrics over time.
         """
         while True:
             time.sleep(_USAGE_STATS_INTERVAL)
-            data = {
-                "uuid": self.uuid,
-                "log_time": _get_current_timestamp_ns(),
-            }
+            data = dict(self._startup_data)
+            data["log_time"] = _get_current_timestamp_ns()
+            data["uptime_s"] = int(time.monotonic() - self._startup_mono)
             data.update(_GLOBAL_RUNTIME_DATA)
 
             self._write_to_file(data)

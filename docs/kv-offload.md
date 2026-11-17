@@ -194,7 +194,16 @@ slow the restart. See [Coming back to a document](performance.md#coming-back-to-
 
 **4. CPU + verified disk (`revolta_fs`, experimental).** A stricter variant of the
 filesystem tier meant to keep conversations reusable across engine restarts. Use
-`"type": "revolta_fs"` instead of `"fs"`; every `fs` key above still applies. It adds:
+`"type": "revolta_fs"` instead of `"fs"`; every `fs` key above still applies.
+
+L1 planar E4M3 is now named `fp8_per_token_head`; eligible QSA `auto` requests
+also select it. Its codec name and page layout isolate its SSD namespace from
+the old planar name and scalar E4M3, so those files miss rather than migrate.
+Explicit `fp8` / `fp8_e4m3` scalar identities remain unchanged. The readback
+measurements above describe the original scalar format; CPU checks of planar
+storage do not establish GPU/SSD release acceptance.
+
+The tier adds:
 
 - **Integrity:** each page carries a CRC32C of its contents in a user extended
   attribute, bound to the page's prefix and the tier's identity. A corrupted page, or

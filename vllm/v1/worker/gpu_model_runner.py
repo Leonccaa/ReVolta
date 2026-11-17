@@ -11892,7 +11892,7 @@ class GPUModelRunner(
                     torch.tensor([]) if isinstance(kv_cache, torch.Tensor) else []
                 )
             # Clean up quantized KV cache scale views
-            # (int8_per_token_head, fp8_per_token_head)
+            # (inline per-token-head quantization modes)
             if hasattr(layer, "impl"):
                 if hasattr(layer.impl, "_k_scale_cache"):
                     layer.impl._k_scale_cache = None

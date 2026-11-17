@@ -204,7 +204,7 @@ FP8_PER_TOKEN_HEAD = KVCodec(
     rounding="nearest_even",
     layout="inline_scale",
 )
-FP8E4M3PerTokenHeadDType = Literal["fp8_e4m3_per_token_head"]
+FP8E4M3PerTokenHeadDType = Literal["fp8_per_token_head"]
 FP8_E4M3_PER_TOKEN_HEAD = KVCodec(
     get_args(FP8E4M3PerTokenHeadDType)[0],
     (),
@@ -225,7 +225,6 @@ KV_CODECS: tuple[KVCodec, ...] = (
     FP8_E5M2,
     INT8,
     INT8_PER_TOKEN_HEAD,
-    FP8_PER_TOKEN_HEAD,
     FP8_E4M3_PER_TOKEN_HEAD,
 )
 _BY_ALIAS = {

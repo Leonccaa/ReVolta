@@ -71,8 +71,6 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
         return KVQuantMode.INT8_PLANAR
     if kv_cache_dtype == "int8_per_token_head":
         return KVQuantMode.INT8_PER_TOKEN_HEAD
-    if kv_cache_dtype == "fp8_per_token_head":
-        return KVQuantMode.FP8_PER_TOKEN_HEAD
     if kv_cache_dtype == "nvfp4":
         return KVQuantMode.NVFP4
     if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8"):
@@ -192,7 +190,6 @@ class AttentionSpec(KVCacheSpec):
             KVQuantMode.NONE: "auto",
             KVQuantMode.FP8_PER_TENSOR: "fp8",
             KVQuantMode.INT8_PER_TOKEN_HEAD: "int8_per_token_head",
-            KVQuantMode.FP8_PER_TOKEN_HEAD: "fp8_per_token_head",
             KVQuantMode.NVFP4: "nvfp4",
             KVQuantMode.INT8_PLANAR: "int8",
             KVQuantMode.FP8_E4M3_PLANAR: FP8_E4M3_PER_TOKEN_HEAD.name,

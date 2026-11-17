@@ -32,7 +32,6 @@ CacheDType = Literal[
     "turboquant_3bit_nc",
     "int8_per_token_head",
     "int8",
-    "fp8_per_token_head",
     "nvfp4",
     FP8E4M3PerTokenHeadDType,
 ]
@@ -92,8 +91,9 @@ class CacheConfig:
     Some models (namely DeepSeekV3.2) default to fp8, set to bfloat16 to use
     bfloat16 instead, this is an invalid option for models that do not default
     to fp8.
-    QSA also supports planar E4M3 with dynamic per-token, per-head FP32 scales;
-    eligible QSA checkpoints without KV scales select this format automatically.
+    QSA supports ``fp8_per_token_head``: planar E4M3 with dynamic per-token,
+    per-head FP32 scales. Eligible QSA auto requests select this format regardless
+    of checkpoint KV scales, including with speculation.
     """
     is_attention_free: bool = False
     """Whether the model is attention-free. This is primarily set in

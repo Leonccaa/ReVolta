@@ -89,7 +89,6 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "fp8_e5m2": torch.uint8,
     "int8": torch.int8,
     "int8_per_token_head": torch.int8,
-    "fp8_per_token_head": torch.uint8,
     FP8_E4M3_PER_TOKEN_HEAD.name: FP8_E4M3_PER_TOKEN_HEAD.storage_dtype,
     "fp8_inc": torch.float8_e4m3fn,
     "fp8_ds_mla": torch.uint8,

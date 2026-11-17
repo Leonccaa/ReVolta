@@ -391,7 +391,7 @@ def test_prefix_reuses_int8_blocks_and_retains_dcp_grid(codec):
     manager.free(first)
 
 
-@pytest.mark.parametrize("dtype", ["fp8_e4m3", "int8", "fp8_e4m3_per_token_head"])
+@pytest.mark.parametrize("dtype", ["fp8_e4m3", "int8", FP8_E4M3_PER_TOKEN_HEAD.name])
 def test_platform_preserves_1632_grid(monkeypatch, dtype):
     from tests.platforms.test_hybrid_dcp_block_alignment import (
         _LooseBackend,
@@ -691,7 +691,9 @@ def test_e4m3_planar_descriptor_and_page_bytes(tokens, page_bytes):
     from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 
     codec = FP8_E4M3_PER_TOKEN_HEAD
+    assert codec.name == "fp8_per_token_head"
     assert resolve_kv_codec(codec.name) is codec
+    assert resolve_kv_codec("fp8_e4m3_per_token_head") is None
     assert codec.cache_identity == (codec.name, 1, "planar_scales")
     assert codec.cache_identity != FP8_PER_TOKEN_HEAD.cache_identity
     assert codec.element_dtype == torch.float8_e4m3fn

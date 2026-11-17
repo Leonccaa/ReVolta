@@ -73,6 +73,7 @@ INT8_CONFIG = QuantConfig(
     kv_quant_mode=KVQuantMode.INT8_PER_TOKEN_HEAD,
     uses_trunc=True,
 )
+# Internal inline kernel fixture; its CLI entry is closed.
 FP8_CONFIG = QuantConfig(
     cache_dtype=FP8_DTYPE,
     kv_cache_dtype_str="fp8_per_token_head",
@@ -142,7 +143,7 @@ class TestIsQuantizedKvCache:
     def test_kv_quant_mode_fp8(self):
         from vllm.v1.kv_cache_interface import get_kv_quant_mode
 
-        assert get_kv_quant_mode("fp8_per_token_head") == KVQuantMode.FP8_PER_TOKEN_HEAD
+        assert get_kv_quant_mode("fp8_per_token_head") == KVQuantMode.FP8_E4M3_PLANAR
 
 
 # ===========================================================================

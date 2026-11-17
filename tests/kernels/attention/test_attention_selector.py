@@ -533,6 +533,12 @@ def test_flash_attn_rejects_unhandled_kv_cache_dtypes(kv_cache_dtype: str):
     from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
 
     assert not FlashAttentionBackend.supports_kv_cache_dtype(kv_cache_dtype)
+    if kv_cache_dtype == "fp8_per_token_head":
+        from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAFlashAttentionBackend
+        from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
+
+        assert not TritonAttentionBackend.supports_kv_cache_dtype(kv_cache_dtype)
+        assert Qwen4ExpQSAFlashAttentionBackend.supports_kv_cache_dtype(kv_cache_dtype)
 
 
 @pytest.mark.parametrize("kv_cache_dtype", ["fp8", "fp8_e4m3"])

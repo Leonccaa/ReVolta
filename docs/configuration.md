@@ -25,6 +25,30 @@ or disable custom all-reduce with `--disable-custom-all-reduce`.
 
 ## Launch options
 
+`--kv-cache-dtype` selects the storage format:
+
+| Value | Storage format / QSA auto selection |
+| --- | --- |
+| `fp8` / `fp8_e4m3` | Existing E4M3 with calibrated per-layer K/V scalar scales |
+| `fp8_per_token_head` | L1 planar E4M3FN with dynamic FP32 scales per token and head; no KV scale overlay needed |
+| `auto` (CLI default) | Planar E4M3 for eligible QSA requests, with or without checkpoint KV scales and speculation |
+| `int8` / `int8_per_token_head` | Existing planar RNE INT8 / inline truncating INT8, unchanged |
+| `float16` / `bfloat16` | Explicit model-precision storage, subject to existing hardware and backend support |
+
+QSA auto selection requires the existing `qsa_auto_e4m3` policy, QSA selector
+metadata, a supported operator dtype/device, no runtime scale calculation and
+prefill context parallelism of one. Otherwise the existing auto/model-dtype
+rules apply. Explicit values take precedence and retain their backend admission
+requirements. MTP inherits the target format
+unless specified; a planar target with an explicit scalar MTP draft remains
+unsupported. On SM70, DFlash/DFlash2 still defaults to an FP16 draft.
+
+`fp8_per_token_head` uses four page regions `[K | V | sK | sV]`, not upstream
+vLLM's inline FP8 page ABI. The old `fp8_e4m3_per_token_head` name is removed
+without an alias. Ordinary Triton attention does not accept the planar format;
+QSA uses its own backend. The explicit scalar recipes and their historical
+measurements remain unchanged; planar GPU acceptance is still pending.
+
 - **`--enable-dashboard` (boolean, default `false`, experimental).** Enable the
   Python API server's built-in aggregate metrics page at `/dashboard/`. All rate
   and window calculations run in the browser, with optional local history.

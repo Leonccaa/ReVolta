@@ -19,6 +19,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from tests.v1.kv_offload.test_revolta_fs import checkpoint_spec
 from vllm.config import KVTransferConfig
@@ -46,6 +47,127 @@ LAYOUT = HostKVLayout(
     layer_names=("qsa.0",),
     kv_scales=((1.0, 1.0),),
 )
+
+
+def test_planar_owner_revolta_fs_round_trip(tmp_path, monkeypatch):
+    from tests.v1.kv_offload.test_fs_tier import drain, make_job
+    from vllm.v1.attention.kv_cache_view import (
+        KVCacheView,
+        KVPhysicalPage,
+        bind_planar_kv_cache,
+    )
+    from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD as codec
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        KVCacheTensor,
+        KVQuantMode,
+    )
+    from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
+    from vllm.v1.kv_offload.tiering.fs.revolta import RevoltaFileSystemTierManager
+    from vllm.v1.kv_offload.tiering.spec import TieringOffloadingSpec
+
+    layer = FullAttentionSpec(
+        block_size=48,
+        num_kv_heads=1,
+        head_size=256,
+        dtype=torch.uint8,
+        kv_quant_mode=KVQuantMode.FP8_E4M3_PLANAR,
+    )
+    page_bytes = 2 * layer.page_size_bytes
+    cache = KVCacheConfig(
+        3,
+        [KVCacheTensor(3 * page_bytes, ["a", "b"], packed_members=["a", "b"])],
+        [KVCacheGroupSpec(["a", "b"], layer)],
+    )
+    spec, manifest = checkpoint_spec(tmp_path / "ssd")
+    config = spec.vllm_config
+    config.model_config.is_hybrid = True
+    config.cache_config.cache_dtype = codec.name
+    config.cache_config.mamba_ssm_cache_dtype = "float32"
+    config.cache_config.mamba_cache_dtype = "auto"
+
+    def parent_init(self, config, cache):
+        self.vllm_config, self.kv_cache_config = config, cache
+        self.block_size_factor = 1
+        self.extra_config = {"secondary_tiers": [{"type": "revolta_fs"}]}
+        self.partition_by_group = False
+
+    monkeypatch.setattr(CPUOffloadingSpec, "__init__", parent_init)
+    spec = TieringOffloadingSpec(config, cache)
+    raw = torch.zeros(3 * page_bytes, dtype=torch.uint8)
+    for member in range(2):
+        carrier = bind_planar_kv_cache(
+            raw,
+            num_blocks=3,
+            scheduler_block_size=48,
+            kernel_block_size=16,
+            num_heads=1,
+            head_size=256,
+            page_size_bytes=layer.page_size_bytes,
+            member_index=member,
+            member_count=2,
+            dtype=torch.uint8,
+        )
+        view = KVCacheView.bind(carrier, codec, 256)
+        for index, (data, scale) in enumerate(
+            ((view.key, view.key_scale), (view.value, view.value_scale))
+        ):
+            x = torch.arange(data.numel()).reshape(data.shape)
+            encoded, scales = codec.encode(
+                (x.float() % 509 - 254) * (member + index + 1)
+            )
+            data.copy_(encoded)
+            scale.copy_(scales)
+    source = (
+        KVPhysicalPage(layer.page_size_bytes, 2)
+        .raw_pages(carrier, 3)[0]
+        .view(torch.uint8)
+        .clone()
+    )
+    backing = torch.zeros((3, page_bytes), dtype=torch.uint8)
+    backing[0].copy_(source)
+    for mode in ("write", "read", "legacy"):
+        if mode == "legacy":
+            del spec.persistent_layout["kv_storage"]
+        tier = RevoltaFileSystemTierManager(
+            offloading_spec=spec,
+            primary_kv_view=memoryview(backing.numpy()),
+            tier_type="revolta_fs",
+            root_dir=str(tmp_path / "ssd"),
+            content_manifest_path=manifest,
+            max_size_bytes=1 << 20,
+            min_free_bytes=0,
+            n_read_threads=1,
+            n_write_threads=1,
+        )
+        try:
+            assert not tier.disabled
+            if mode == "legacy":
+                assert tier._direct_io and tier.lookup(key(1)) is False
+                continue
+            assert not tier._direct_io
+            if mode == "write":
+                tier.submit_store(make_job(1, [key(1)], [0]))
+            else:
+                assert tier.lookup(key(1)) is True
+                tier.submit_load(make_job(2, [key(1)], [1], is_promotion=True))
+            assert [r.success for r in drain(tier)] == [True]
+        finally:
+            tier.shutdown()
+    assert torch.equal(backing[1], source)
+    backing[1, -1] ^= 1
+    assert not torch.equal(backing[1], source)  # D68: one changed byte fails.
+
+    # The unsupported upstream O_DIRECT path keeps its existing rejection.
+    def upstream_init(self, config, cache):
+        parent_init(self, config, cache)
+        self.extra_config["secondary_tiers"] = [{"type": "fs"}]
+
+    monkeypatch.setattr(CPUOffloadingSpec, "__init__", upstream_init)
+    with pytest.raises(ValueError, match="aligned FS framing"):
+        TieringOffloadingSpec(config, cache)
 
 
 def key(n, group=0):

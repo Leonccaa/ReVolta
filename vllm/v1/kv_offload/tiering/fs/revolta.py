@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING
 
 from vllm.config.utils import normalize_value
 from vllm.logger import init_logger
+from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD
 from vllm.v1.kv_offload.base import OffloadKey, get_offload_group_idx
 from vllm.v1.kv_offload.tiering.base import (
     JobMetadata,
@@ -429,6 +430,11 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
         }
         self.disabled_reason: str | None = None
         self._root_dir = os.path.realpath(root_dir)
+        layout = getattr(offloading_spec, "persistent_layout", None) or {}
+        self._direct_io = not any(
+            owner.get("codec") == list(FP8_E4M3_PER_TOKEN_HEAD.cache_identity)
+            for owner in layout.get("kv_storage", {}).get("owners", {}).values()
+        )
         if mtime_update_interval_s < 0:
             raise ValueError("mtime_update_interval_s must be >= 0")
         self._mtime_interval = mtime_update_interval_s
@@ -718,6 +724,7 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
                 key,
                 self._identity_digest,
                 _job_snapshot_guard,
+                direct_io=self._direct_io,
             )
         self._count("pages_written" if written else "pages_existing")
 
@@ -736,6 +743,7 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
                     self._block_size,
                     key,
                     self._identity_digest,
+                    direct_io=self._direct_io,
                 )
             except ChecksumError as exc:
                 self._count("checksum_failures")

@@ -38,6 +38,7 @@ from typing_extensions import override
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.v1.attention.kv_codecs import INT8
 from vllm.v1.kv_cache_interface import KVCacheConfig, kv_tensor_num_blocks
 from vllm.v1.kv_offload.base import CanonicalKVCaches, OffloadingManager
 from vllm.v1.kv_offload.cpu.gpu_worker import CpuGpuOffloadingHandlers
@@ -135,6 +136,15 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             )
             if any(
                 tier.get("type") in FS_TIER_TYPES
+                and (
+                    tier.get("type") != "revolta_fs"
+                    or any(
+                        owner.get("codec") == list(INT8.cache_identity)
+                        for owner in self.persistent_layout["kv_storage"][
+                            "owners"
+                        ].values()
+                    )
+                )
                 for tier in self.secondary_tier_configs
             ):
                 raise ValueError(

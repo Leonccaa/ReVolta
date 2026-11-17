@@ -619,8 +619,7 @@ class SingleTypeKVCacheManager(ABC):
         # keeps normal cache priority while remaining evictable.
         hold = self._cached_window_at_last_boundary(num_prompt_tokens)
         if (
-            hold is not None
-            and self.use_eagle
+            self.use_eagle
             and not self.mamba_replay_lookbehind
             and self.alignment_tokens is not None
             and self.block_size < self.alignment_tokens
@@ -629,7 +628,11 @@ class SingleTypeKVCacheManager(ABC):
         ):
             # DFlash2 decode windows join the prompt window at ordinary cache
             # priority. Blocks are still freed and remain evictable.
-            hold = (hold[0], max(hold[1], num_skipped_blocks))
+            hold = (
+                (hold[0], max(hold[1], num_skipped_blocks))
+                if hold is not None
+                else (0, num_skipped_blocks)
+            )
         # `num_skipped_tokens` may include tokens that haven't been allocated yet
         # (e.g., when the attention window moves into the external computed tokens
         # range); `_remove_blocks_in_range` caps to the number of blocks that
@@ -955,7 +958,8 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
             for computed in computed_blocks:
                 del computed[num_contiguous_blocks:]
             while (
-                block_size != alignment_tokens  # Faster for common case.
+                not drop_eagle_block
+                and block_size != alignment_tokens  # Faster for common case.
                 and len(computed_blocks[0]) * block_size % alignment_tokens != 0
             ):
                 for computed in computed_blocks:

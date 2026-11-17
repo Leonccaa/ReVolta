@@ -256,7 +256,7 @@ def test_grouped_keeps_tiny_value_residual_in_fp32(codec):
 def test_planar_e4m3_native_readers(rows, route, block, dtype):
     codec = FP8_E4M3_PER_TOKEN_HEAD
     raw, view, q, ids, table, req, pos, lens = fixture(
-        rows, padding=832 if block == 64 else 816, codec=codec, block=block
+        rows, padding={4: 3264, 64: 832}[block], codec=codec, block=block
     )
     saved = raw.clone()
     out = torch.empty(q.shape, dtype=dtype, device=q.device)

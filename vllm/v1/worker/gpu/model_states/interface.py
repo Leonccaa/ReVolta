@@ -9,6 +9,7 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.tasks import GenerationTask
+from vllm.v1.core.kv_cache_utils import MambaStateGather
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.input_batch import InputBatch
@@ -61,6 +62,9 @@ class ModelState(ABC):
         return None
 
     def apply_staged_writes(self) -> None:
+        return None
+
+    def run_state_gathers(self, gathers: list[MambaStateGather]) -> None:
         return None
 
     def preprocess_state(

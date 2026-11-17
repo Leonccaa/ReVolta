@@ -1193,6 +1193,26 @@ class Scheduler(SchedulerInterface):
                             num_new_local_computed_tokens,
                         )
 
+                    # A previous capacity rejection did not consume its hit.
+                    exact_end = self.kv_cache_manager.coordinator.exact_end
+                    exact_end.hits.pop(request.request_id, None)
+                    offload_scheduler = getattr(
+                        self.connector, "connector_scheduler", None
+                    )
+                    if self.connector is None or offload_scheduler is not None:
+                        new_computed_blocks, num_new_local_computed_tokens = (
+                            self.kv_cache_manager.extend_exact_end(
+                                request,
+                                new_computed_blocks,
+                                num_new_local_computed_tokens,
+                            )
+                        )
+                        if (
+                            offload_scheduler is not None
+                            and request.request_id in exact_end.hits
+                        ):
+                            offload_scheduler.skip_external_once(request.request_id)
+
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
                         ext_tokens, load_kv_async = (
@@ -1242,6 +1262,20 @@ class Scheduler(SchedulerInterface):
                                 connector_prefix_cache_queries,
                                 connector_prefix_cache_hits,
                             )
+
+                    if (
+                        self.connector is not None
+                        and offload_scheduler is None
+                        and not num_external_computed_tokens
+                        and not load_kv_async
+                    ):
+                        new_computed_blocks, num_new_local_computed_tokens = (
+                            self.kv_cache_manager.extend_exact_end(
+                                request,
+                                new_computed_blocks,
+                                num_new_local_computed_tokens,
+                            )
+                        )
 
                     # Total computed tokens (local + external).
                     num_computed_tokens = (
@@ -1643,6 +1677,9 @@ class Scheduler(SchedulerInterface):
         # A Mamba ``align`` table is not append-only. Drain exact committed
         # boundary-state block IDs before the connector builds store jobs.
         boundary_state_offloads = self.kv_cache_manager.take_boundary_state_offloads()
+        exact_end = self.kv_cache_manager.coordinator.exact_end
+        mamba_state_gathers = exact_end.pending_gathers
+        exact_end.pending_gathers = []
 
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
@@ -1681,6 +1718,7 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
+            mamba_state_gathers=mamba_state_gathers,
             boundary_state_offloads=(
                 boundary_state_offloads if self.connector is not None else None
             ),
@@ -2557,6 +2595,8 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             )
+            request.state_end = request.num_computed_tokens
+            request.last_accepted = len(generated_token_ids)
             if scheduled_spec_token_ids and generated_token_ids:
                 num_draft_tokens = len(scheduled_spec_token_ids)
                 num_accepted = len(generated_token_ids) - 1

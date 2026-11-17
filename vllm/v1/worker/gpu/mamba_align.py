@@ -10,6 +10,7 @@ owns this tree's V1 DDTree state-selection compatibility path.
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm.v1.core.kv_cache_utils import MambaStateGather
 from vllm.v1.worker.mamba_utils import MambaSpecDecodeGPUContext
 
 # Temporal states are much larger than conv states. Splitting their byte range
@@ -278,6 +279,54 @@ def _postprocess_mamba_align_kernel(
         COPY_BLOCK_SIZE,
         TEMPORAL_TILES,
         SPEC_STATE_REPLAY,
+    )
+
+
+def run_state_gathers(
+    ctx: MambaSpecDecodeGPUContext,
+    gathers: list[MambaStateGather],
+    device: torch.device,
+) -> None:
+    """Fold finished replay conv windows; vLLM #67045 run_state_gathers.
+
+    Explicit block IDs survive request-row reuse. Each group gets a tiny
+    [dst, dst] table, using the existing overlap-safe precopy kernel.
+    """
+    tables = [
+        torch.tensor(
+            [[g.dst_block_ids[i], g.dst_block_ids[i]] for g in gathers],
+            dtype=torch.int32,
+            device=device,
+        )
+        for i in range(len(gathers[0].dst_block_ids))
+    ]
+    ptrs = torch.tensor(
+        [t.data_ptr() for t in tables], dtype=torch.uint64, device=device
+    )
+    count = len(gathers)
+    dst = torch.zeros(count, dtype=torch.int32, device=device)
+    src = torch.ones(count, dtype=torch.int32, device=device)
+    bias = torch.tensor([g.column for g in gathers], dtype=torch.int32, device=device)
+    rows = torch.arange(count, dtype=torch.int32, device=device)
+    query = torch.arange(count + 1, dtype=torch.int32, device=device)
+    _precopy_mamba_align_kernel[(count, ctx.num_states, _TEMPORAL_TILES)](
+        dst,
+        src,
+        bias,
+        ptrs,
+        2,
+        ctx.state_base_addrs,
+        ctx.state_block_strides,
+        ctx.state_elem_sizes,
+        ctx.state_inner_sizes,
+        ctx.state_conv_widths,
+        ctx.state_group_indices,
+        rows,
+        query,
+        count,
+        COPY_BLOCK_SIZE=1024,
+        TEMPORAL_TILES=_TEMPORAL_TILES,
+        SPEC_STATE_REPLAY=True,
     )
 
 

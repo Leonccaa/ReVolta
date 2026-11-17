@@ -253,7 +253,9 @@ class SingleTypeKVCacheManager(ABC):
         # All cached hits (including skipped nulls) are already cached; mark
         # them so cache_blocks() will not try to re-cache blocks that already
         # have a block_hash set.
-        self.num_cached_block[request_id] = len(req_blocks)
+        self.num_cached_block[request_id] = min(
+            len(req_blocks), num_total_computed_tokens // self.block_size
+        )
 
     def allocate_external_computed_blocks(
         self,
@@ -743,12 +745,15 @@ class CircularBufferManager(FullAttentionManager):
     ) -> int:
         del (
             num_tokens,
-            new_computed_blocks,
             total_computed_tokens,
             num_tokens_main_model,
             apply_admission_cap,
         )
-        return 0 if self.req_to_blocks.get(request_id) else 1
+        if self.req_to_blocks.get(request_id):
+            return 0
+        if new_computed_blocks:
+            return self._get_num_evictable_blocks(new_computed_blocks)
+        return 1
 
     def add_local_computed_blocks(
         self,
@@ -759,7 +764,11 @@ class CircularBufferManager(FullAttentionManager):
     ) -> None:
         # All groups must touch their cache hits before we take a free block.
         # allocate_new_blocks claims the ring after that coordinator pass.
-        del request_id, new_computed_blocks
+        # vLLM #66881 takes_frontier_hits: consuming ownership preserves the
+        # compressor ring and deliberately avoids new_block_ids (zeroing).
+        if new_computed_blocks:
+            self.block_pool.touch(new_computed_blocks)
+            self.req_to_blocks[request_id].extend(new_computed_blocks)
         del num_local_computed_tokens, num_external_computed_tokens
 
     def allocate_external_computed_blocks(

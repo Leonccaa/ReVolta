@@ -216,6 +216,11 @@ class BlockPool:
             cached_blocks.append(block)
         return cached_blocks
 
+    def cache_under_key(self, block: KVCacheBlock, key: BlockHashWithGroupId) -> None:
+        """Publish an exact checkpoint using the existing single-key map."""
+        block.block_hash = key
+        self.cached_block_hash_to_block.insert(key, block)
+
     def cache_full_blocks(
         self,
         request: Request,

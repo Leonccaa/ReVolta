@@ -38,6 +38,7 @@ from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilde
 from vllm.v1.attention.backends.short_conv_attn import (
     PleShortConvAttentionMetadataBuilder,
 )
+from vllm.v1.core.kv_cache_utils import MambaStateGather
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.utils import CpuGpuBuffer
@@ -56,6 +57,7 @@ from vllm.v1.worker.gpu.mamba_align import (
     preprocess_mamba_align_fused_kernel,
     run_mamba_align_postprocess,
     run_mamba_align_precopy,
+    run_state_gathers,
 )
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
@@ -304,6 +306,10 @@ class MambaHybridModelState(DefaultModelState):
                 [block_tables[group_id] for group_id in mamba_group_ids],
             )
         return ctx
+
+    def run_state_gathers(self, gathers: list[MambaStateGather]) -> None:
+        assert self._mamba_ctx is not None
+        run_state_gathers(self._mamba_ctx, gathers, self.device)
 
     def preprocess_state(
         self,

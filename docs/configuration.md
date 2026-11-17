@@ -291,7 +291,7 @@ The ReVolta profile (`vllm/revolta_profile.py`) sets these on SM70 + TP4 + FP16 
 | `VLLM_DO_NOT_TRACK` | bool | `False` | 0, 1 | configuration | 1Cat | Honours the cross-project Do Not Track convention (DO_NOT_TRACK counts too): 1 turns the usage report off. |
 | `VLLM_NO_USAGE_STATS` | bool | `False` | 0, 1 | configuration | 1Cat | Upstream opt-out, honoured as-is: 1 turns the usage report off. The Do Not Track variables and the do_not_track file have the same effect. |
 | `VLLM_USAGE_SOURCE` | str | `'production'` | short label | configuration | 1Cat | Deployment label reported with the anonymous report (production by default). A value that looks like a path or a URL is reported as custom instead. |
-| `VLLM_USAGE_STATS_SERVER` | str | `'https://ai.19b.net/api/usage'` | URL, empty to disable sending | configuration | 1Cat | Where the report goes. ReVolta defaults to its own collector; an empty string keeps the local log file but sends nothing. |
+| `VLLM_USAGE_STATS_SERVER` | str | `'https://usage.19b.net/api/'` | URL, empty to disable sending | configuration | 1Cat | Where the report goes. ReVolta defaults to its own collector; an empty string keeps the local log file but sends nothing. |
 
 ### DFlash2 and DFlash draft settings
 

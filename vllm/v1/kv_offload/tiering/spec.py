@@ -102,7 +102,6 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 "version": "grouped-worker-interleaved-v1",
                 "kv_compat_epoch": KV_COMPAT_EPOCH,
                 "attention_backend": str(backend),
-                "model_revision": vllm_config.model_config.revision,
                 "group_pages": self.cpu_group_page_sizes,
                 "tensors": [
                     {

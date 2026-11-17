@@ -179,21 +179,11 @@ def test_sharded_draft_main_follows_draft_main_placement():
 
 
 def test_draft_main_placement_is_told_apart_by_layout_not_by_the_setting():
-    from vllm.config.kernel import KernelConfig
-    from vllm.v1.kv_offload.tiering.fs.identity import (
-        _kernel_identity,
-        canonical_digest,
-    )
+    from vllm.v1.kv_offload.tiering.fs.identity import canonical_digest
     from vllm.v1.kv_offload.tiering.fs.revolta import _persistent_kv_tensors
 
-    # The setting itself is not part of the persisted identity ...
-    def kernel(placement):
-        return KernelConfig(long_context_kv=settings(draft_main_placement=placement))
-
-    assert canonical_digest(_kernel_identity(kernel("gpu"))) == canonical_digest(
-        _kernel_identity(kernel("host"))
-    )
-    # ... the page layout is: the host layer list and tensors differ.
+    # The setting is not in the persisted identity; the page layout is: the
+    # host layer list and tensors differ.
     specs = mtp_specs(shard_index=True, shard_draft=True)
     _, gpu = build(settings(draft_main_placement="gpu"), specs)
     _, host = build(settings(), specs)

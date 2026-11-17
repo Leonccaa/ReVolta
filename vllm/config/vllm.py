@@ -1845,6 +1845,20 @@ class VllmConfig:
                 "activations and recurrent states retain their precision.",
                 self.cache_config.cache_dtype,
             )
+        if revolta_profile_enabled:
+            # The DFlash2 graph reserve depends on the resolved KV dtype.
+            apply_revolta_profile(
+                self.model_config,
+                self.parallel_config.tensor_parallel_size,
+                is_sm70=True,
+                interconnect_mode=frontend_interconnect_mode(
+                    disable_custom_all_reduce=(
+                        self.parallel_config.disable_custom_all_reduce
+                    )
+                ),
+                speculative_method=getattr(self.speculative_config, "method", None),
+                kv_cache_dtype=self.cache_config.cache_dtype,
+            )
 
         self.try_verify_and_update_config()
         # Models may have supplied their own DCP defaults above; anything still

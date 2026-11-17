@@ -63,6 +63,12 @@ DFLASH_DEFAULTS = {
     "VLLM_V2_CUDAGRAPH_MEM_MIB": "1200",
     "VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS": "0",
 }
+# With a planar KV cache (fp8_per_token_head, the QSA auto choice, or int8) the
+# AWQ DFlash2 graphs measured 0.92 GiB instead of 1.13 GiB with the scalar FP8
+# cache; the reserve keeps about 0.1 GiB of headroom. NVFP4 keeps 1200 until
+# its tail-off figure is measured.
+AWQ_DFLASH_PLANAR_KV_DEFAULTS = {"VLLM_V2_CUDAGRAPH_MEM_MIB": "1050"}
+PLANAR_KV_DTYPES = ("fp8_per_token_head", "int8")
 CUSTOM_AR_DEFAULTS = {"VLLM_SM70_CAR_VMM_SAFE": "1"}
 
 # Config defaults have their own audit namespace; never add them to the W9
@@ -317,13 +323,14 @@ def apply_revolta_profile(
     is_sm70: bool,
     interconnect_mode: InterconnectMode = "pex_p2p",
     speculative_method: str | None = None,
+    kv_cache_dtype: str | None = None,
 ) -> bool:
     """Apply before config defaults and before model/native module imports.
 
     Pass frontend_interconnect_mode(); this does not select an AR backend.
     Explicit environment overrides always win, including in no_p2p. A later
     call may refine a value this profile wrote (EngineArgs may not know the
-    speculative method that VllmConfig resolves).
+    speculative method or the KV dtype that VllmConfig resolves).
     """
     import torch
 
@@ -343,6 +350,8 @@ def apply_revolta_profile(
             defaults.update(AWQ_DEFAULTS)
             if speculative_method == "dflash":
                 defaults.update(DFLASH_DEFAULTS)
+                if kv_cache_dtype in PLANAR_KV_DTYPES:
+                    defaults.update(AWQ_DFLASH_PLANAR_KV_DEFAULTS)
     elif has_nvfp4_weights(model_config):
         defaults.update(NVFP4_DEFAULTS)
         if speculative_method == "dflash":

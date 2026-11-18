@@ -498,7 +498,7 @@ if TYPE_CHECKING:
     VLLM_SM70_CAR_VMM_SAFE_PREALLOC: bool = True
     VLLM_SM70_INTERCONNECT: str = "auto"
     VLLM_SM70_PCIE_SWITCH_CUSTOM_AR: str = "auto"
-    VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES: int = 81920
+    VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES: int = 204800
     VLLM_SM70_PCIE_SWITCH_CAR_GRAPH_ONLY: bool = True
     VLLM_SM70_QWEN38_CONTRACT_MULTIMODAL: bool = True
     VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES: bool = False
@@ -7782,18 +7782,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=("SM70 collectives",),
         user_visible=False,
     ),
-    # Largest payload, in bytes, that the PCIe-switch mode sends through
-    # custom all-reduce. The TP4 push kernel covers up to 80 KiB; above that
-    # NCCL is as fast on PCIe.
+    # Include the selected FP16 graph push payloads through 200 KiB.
     "VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES": env_var(
-        lambda: int(os.getenv("VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES", "81920")),
+        lambda: int(os.getenv("VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES", "204800")),
         description=(
             "Largest payload in bytes that the SM70 PCIe-switch custom "
             "all-reduce mode handles; larger payloads use NCCL."
         ),
         category="tuning",
-        declared_default="81920",
-        effective_default="81920",
+        declared_default="204800",
+        effective_default="204800",
         automatic_conditions=(),
         acceleration_paths=("SM70 collectives",),
         user_visible=False,

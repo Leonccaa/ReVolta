@@ -202,6 +202,7 @@ class PagedLayer:
                 owner.spec, [owner.prefix], self.config, self.device
             )
             metadata[owner.prefix] = builder.build(0, common)
+            assert metadata[owner.prefix].query_start_loc is common.query_start_loc
         phase = torch.cat(
             [p + offset for p, (_, _, offset) in zip(positions, requests)]
         )

@@ -13,12 +13,25 @@ import pytest
 import torch
 from torch import nn
 
+from vllm.config import ModelConfig, VllmConfig, get_layers_from_vllm_config
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.quantization.awq import AWQConfig
+from vllm.model_executor.layers.quantization.awq_sm70_moe import AWQSM70MoEMethod
 from vllm.model_executor.models.registry import ModelRegistry
 from vllm.models.hy_v4_flash.configs import SPARSE_ATTENTION
 from vllm.models.hy_v4_flash.nvidia.model import HYV4FlashForCausalLM
+from vllm.platforms import current_platform
+from vllm.platforms.interface import DeviceCapability
 from vllm.transformers_utils.config import get_config, uses_mrope
 from vllm.transformers_utils.model_arch_config_convertor import (
     ModelArchConfigConvertorBase,
+)
+from vllm.utils.torch_utils import set_default_torch_dtype
+from vllm.v1.core.kv_cache_utils import get_kv_cache_configs
+from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
+    MLAAttentionSpec,
+    SlidingWindowMLASpec,
 )
 
 pytestmark = pytest.mark.skip_global_cleanup
@@ -61,38 +74,6 @@ def _params(names):
     return result
 
 
-class IndexAttention(nn.Module):
-    """Parameter names from the lane A / upstream attention contract."""
-
-    def __init__(self, vllm_config, config, layer_idx, topk_indices_buffer, prefix):
-        super().__init__()
-        for name in (
-            "kv_a_layernorm",
-            "kv_a_proj_with_mqa",
-            "kv_b_proj",
-            "linear_gate",
-            "o_proj",
-            "post_proj_norm",
-            "q_a_layernorm",
-            "q_a_proj",
-            "q_b_proj",
-        ):
-            setattr(self, name, _params("weight"))
-        self.learnable_sink_param = nn.Parameter(torch.empty(1))
-        if config.layer_types[layer_idx] == SPARSE_ATTENTION:
-            self.indexer = _params("intra_group_ape")
-            for name in (
-                "head_weight_projection",
-                "key_gate_projection",
-                "key_norm",
-                "key_value_projection",
-                "query_projection",
-                "token_key_norm",
-                "token_key_projection",
-            ):
-                setattr(self.indexer, name, _params("weight"))
-
-
 class IndexEngram(nn.Module):
     """Weight-facing part of the lane C contract, without host allocations."""
 
@@ -125,23 +106,121 @@ class IndexHash:
         self.maps.append(layer_id)
 
 
-@torch.inference_mode()
-def test_real_index_maps_exactly(checkpoint_metadata, cpu_vllm, monkeypatch):
-    for name, stubs in (
-        ("sm70.attention", {"HYV4FlashAttention": IndexAttention}),
-        (
-            "nvidia.engram",
-            {"FlashEngram": IndexEngram, "FlashNgramHashState": IndexHash},
-        ),
-    ):
-        path = f"vllm.models.hy_v4_flash.{name}"
-        module = ModuleType(path)
-        module.__dict__.update(stubs)
-        monkeypatch.setitem(sys.modules, path, module)
-    config = get_config(checkpoint_metadata, trust_remote_code=False)
-    cpu_vllm.model_config = SimpleNamespace(hf_text_config=config, dtype=torch.float16)
-    with torch.device("meta"):
+def _construct_model(checkpoint_metadata, cpu_vllm, monkeypatch, tmp_path, awq):
+    path = "vllm.models.hy_v4_flash.nvidia.engram"
+    module = ModuleType(path)
+    module.__dict__.update(FlashEngram=IndexEngram, FlashNgramHashState=IndexHash)
+    monkeypatch.setitem(sys.modules, path, module)
+    model_dir = checkpoint_metadata
+    if awq:
+        raw = json.loads((checkpoint_metadata / "config.json").read_text())
+        raw["quantization_config"] = {
+            "quant_method": "awq",
+            "bits": 4,
+            "group_size": 32,
+            "zero_point": True,
+            "version": "gemm",
+            "modules_to_not_convert": [
+                "self_attn",
+                "shared_experts",
+                "routed_expert_",
+                "engram_layer",
+                ".mlp.gate",
+                "layers.0.mlp",
+                "lm_head",
+                "dfly_layers",
+                "vit",
+            ],
+        }
+        model_dir = tmp_path
+        (model_dir / "config.json").write_text(json.dumps(raw))
+        # Exercise real SM70 AWQ dispatch without initializing CUDA.
+        monkeypatch.setenv("VLLM_SM70_QUANT_BACKEND", "turbomind")
+        monkeypatch.setenv("VLLM_SM70_AWQ_MOE_DISABLE", "0")
+        monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+        monkeypatch.setattr(
+            current_platform, "get_device_capability", lambda: DeviceCapability(7, 0)
+        )
+        monkeypatch.setattr(
+            current_platform, "has_device_capability", lambda c: c <= 70
+        )
+
+    cpu_vllm.model_config = ModelConfig(
+        model=str(model_dir),
+        dtype="half",
+        max_model_len=8192,
+        enforce_eager=True,
+        skip_tokenizer_init=True,
+    )
+    cpu_vllm.cache_config.cache_dtype = "float16"
+    cpu_vllm.scheduler_config.max_num_batched_tokens = 2048
+    # CPU platform defaults to disabling hybrid KV; test the M1 grouping.
+    cpu_vllm.scheduler_config.disable_hybrid_kv_cache_manager = False
+    cpu_vllm.quant_config = VllmConfig.get_quantization_config(
+        cpu_vllm.model_config, cpu_vllm.load_config
+    )
+    with torch.device("meta"), set_default_torch_dtype(torch.float16):
         candidate = HYV4FlashForCausalLM(vllm_config=cpu_vllm)
+    assert len(candidate.model.layers) == 42
+    assert candidate.lm_head.weight.dtype == torch.float32
+    assert all(p.is_meta for p in candidate.parameters())
+    if awq:
+        quant = cpu_vllm.quant_config
+        assert isinstance(quant, AWQConfig)
+        assert (quant.weight_bits, quant.group_size, quant.zero_point) == (4, 32, True)
+        for layer in candidate.model.layers[1:]:
+            assert isinstance(layer.mlp.experts.quant_method, AWQSM70MoEMethod)
+            assert layer.mlp.experts.w13_qweight.shape == (512, 1536, 384)
+            assert layer.mlp.experts.w2_qweight.shape == (512, 1536, 192)
+    return candidate
+
+
+def _assert_cache_specs(candidate, config):
+    owners = get_layers_from_vllm_config(config, AttentionLayerBase)
+    specs = {name: layer.get_kv_cache_spec(config) for name, layer in owners.items()}
+    assert len(specs) == 66
+    assert Counter(type(s) for s in specs.values()) == {
+        MLAAttentionSpec: 24,
+        SlidingWindowMLASpec: 30,
+        CircularBufferSpec: 12,
+    }
+    for layer in candidate.model.layers:
+        attn = layer.self_attn
+        spec = specs[attn.attn.prefix]
+        assert (spec.block_size, spec.head_size, spec.dtype) == (
+            256,
+            576,
+            torch.float16,
+        )
+        if attn.is_window_layer:
+            assert isinstance(spec, SlidingWindowMLASpec) and spec.sliding_window == 512
+        else:
+            assert isinstance(spec, MLAAttentionSpec) and spec.compress_ratio == 1
+            pool = specs[attn.indexer.k_cache.prefix]
+            ring = specs[attn.indexer.tail_cache.prefix]
+            assert (pool.block_size, pool.storage_block_size, pool.head_size) == (
+                256,
+                64,
+                128,
+            )
+            assert pool.dtype == torch.float16 and ring.block_size == 4
+    # Plan the startup allocation against a simulated per-rank KV budget.
+    (cache,) = get_kv_cache_configs(config, [specs], [2 << 30])
+    assert cache.num_blocks > 0
+    assert Counter(
+        name for group in cache.kv_cache_groups for name in group.layer_names
+    ) == Counter(specs.keys())
+
+
+@pytest.mark.parametrize("awq", [False, True], ids=["packed", "awq"])
+@torch.inference_mode()
+def test_real_index_maps_exactly(
+    checkpoint_metadata, cpu_vllm, monkeypatch, tmp_path, awq
+):
+    candidate = _construct_model(
+        checkpoint_metadata, cpu_vllm, monkeypatch, tmp_path, awq
+    )
+    _assert_cache_specs(candidate, cpu_vllm)
 
     # Count individual visits as well as unique parameters, so a wrong alias,
     # double load, repeated shard or omitted checkpoint key cannot pass.
@@ -163,14 +242,24 @@ def test_real_index_maps_exactly(checkpoint_metadata, cpu_vllm, monkeypatch):
 
     def checkpoint_weights():
         for name in keys:
-            if name.endswith(".experts.gate_up_proj"):
-                shape = (512, 3072, 1536)
-            elif name.endswith(".experts.down_proj"):
-                shape = (512, 1536, 1536)
+            prefix, _, leaf = name.rpartition(".")
+            if prefix.endswith(".experts") and leaf in ("gate_up_proj", "down_proj"):
+                gate_up = leaf == "gate_up_proj"
+                if awq:
+                    projections = (
+                        ("gate_proj", "up_proj") if gate_up else ("down_proj",)
+                    )
+                    for expert in range(512):
+                        for projection in projections:
+                            for suffix in ("qweight", "qzeros", "scales"):
+                                yield f"{prefix}.{expert}.{projection}.{suffix}", scalar
+                else:
+                    shape = (512, 3072 if gate_up else 1536, 1536)
+                    yield name, torch.empty(shape, device="meta")
             else:
                 yield name, scalar.view_as(scalar)
-                continue
-            yield name, torch.empty(shape, device="meta")
+                if awq and name.endswith(".multi_head_embedding.embedding.weight"):
+                    yield f"{name}_scale_inv", scalar
 
     loaded = candidate.load_weights(checkpoint_weights())
     hash_state = candidate.model.engram_hash
@@ -180,15 +269,22 @@ def test_real_index_maps_exactly(checkpoint_metadata, cpu_vllm, monkeypatch):
         for i in hash_state.maps
     }
     for i in hash_state.maps:
-        assert candidate.model.layers[i - 1].engram_layer.table_loads == ["weight"]
+        assert candidate.model.layers[i - 1].engram_layer.table_loads == (
+            ["weight", "weight_scale_inv"] if awq else ["weight"]
+        )
+    if awq:
+        tables |= {f"{name}_scale_inv" for name in tables}
     assert loaded == params.keys() | tables
     expected: Counter[tuple[str, str | int | None, int | None]] = Counter()
+    suffixes = ("qweight", "qzeros", "scales") if awq else ("weight",)
+    w13_suffixes = tuple(f".w13_{suffix}" for suffix in suffixes)
+    w2_suffixes = tuple(f".w2_{suffix}" for suffix in suffixes)
     for name in params:
-        if name.endswith(".w13_weight"):
+        if name.endswith(w13_suffixes):
             expected.update(
                 (name, shard, expert) for expert in range(512) for shard in ("w1", "w3")
             )
-        elif name.endswith(".w2_weight"):
+        elif name.endswith(w2_suffixes):
             expected.update((name, "w2", expert) for expert in range(512))
         elif name.endswith(".gate_up_proj.weight"):
             expected.update((name, shard, None) for shard in (0, 1))

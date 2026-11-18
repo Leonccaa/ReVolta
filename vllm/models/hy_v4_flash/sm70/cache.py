@@ -34,6 +34,7 @@ class FlashMetadata(AttentionMetadata):
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
     num_actual_tokens: int
+    query_start_loc: torch.Tensor
 
 
 class FlashMetadataBuilder(AttentionMetadataBuilder[FlashMetadata]):
@@ -71,6 +72,7 @@ class FlashMetadataBuilder(AttentionMetadataBuilder[FlashMetadata]):
             cm.block_table_tensor,
             cm.slot_mapping,
             0 if cm.is_dummy_batch else cm.num_actual_tokens,
+            cm.query_start_loc,
         )
 
 

@@ -184,7 +184,9 @@ def paged_attention(
 ) -> torch.Tensor:
     """Packed physical slots per query with FP32 softmax."""
     tokens, heads, dim = q.shape
-    out = q.new_empty((tokens, heads, latent))
+    out = q.new_empty(
+        (tokens, heads, latent), dtype=q.dtype if lse is None else torch.float32
+    )
     _paged_attention[(tokens, triton.cdiv(heads, 16))](
         q,
         cache,

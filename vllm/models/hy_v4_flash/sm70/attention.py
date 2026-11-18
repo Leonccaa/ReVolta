@@ -319,7 +319,7 @@ class HYV4FlashAttention(nn.Module):
                 latent, lse, self.dcp_group, return_lse=True, is_lse_base_on_e=True
             ),
         )
-        return apply_attn_sink(out, global_lse, self.learnable_sink_param)
+        return apply_attn_sink(out.half(), global_lse, self.learnable_sink_param)
 
     def _profile_dcp(self, q: torch.Tensor) -> None:
         assert self.dcp_group is not None and self.indexer is not None
@@ -328,7 +328,7 @@ class HYV4FlashAttention(nn.Module):
         gathered = self.dcp_group.all_gather(q.contiguous(), dim=1)
         rows, heads, _ = gathered.shape
         self._merge_dcp(
-            q.new_zeros((rows, heads, self.kv_lora_rank)),
+            q.new_zeros((rows, heads, self.kv_lora_rank), dtype=torch.float32),
             q.new_full((rows, heads), -torch.inf, dtype=torch.float32),
         )
         del gathered

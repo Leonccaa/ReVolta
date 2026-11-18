@@ -68,6 +68,7 @@ def test_dcp_lse_with_empty_shards(world):
     mask = torch.arange(73) >= torch.tensor([0, 1, 17, 73])[:, None]
     scores.masked_fill_(mask[:, None], -torch.inf)
     sink_col = sinks.view(1, -1, 1).expand(4, -1, -1)
+    expected_merge = scores.softmax(-1).nan_to_num() @ values
     expected = torch.cat((scores, sink_col), -1).softmax(-1)[..., :-1] @ values
     outputs, lses = [], []
     for rank in range(world):
@@ -81,19 +82,24 @@ def test_dcp_lse_with_empty_shards(world):
         if rank:
             assert not outputs[-1][1].any()
             assert lse[1].isneginf().all()
-    out, lse = _lse_weighted_combine(
-        torch.stack(outputs), torch.stack(lses), return_lse=True
-    )
+    partials = torch.stack(outputs)
+    partial_lses = torch.stack(lses)
+    out, lse = _lse_weighted_combine(partials, partial_lses, return_lse=True)
     torch.testing.assert_close(lse, scores.logsumexp(-1), atol=1e-6, rtol=1e-6)
     torch.testing.assert_close(
         apply_attn_sink(out, lse, sinks), expected, atol=1e-6, rtol=1e-5
     )
-    # The production CUDA path transports FP16 partials with FP32 LSE.
+    # Compare the FP32 merge with the previous FP16 partial writeback.
     rounded, _ = _lse_weighted_combine(
-        torch.stack(outputs).half().float(), torch.stack(lses), return_lse=True
+        partials.half().float(), partial_lses, return_lse=True
     )
-    rounded = apply_attn_sink(rounded.half(), lse, sinks).float()
-    torch.testing.assert_close(rounded, expected, atol=1e-3, rtol=2e-3)
+    error_fp32 = (out - expected_merge).norm()
+    error_fp16 = (rounded - expected_merge).norm()
+    assert error_fp32 < error_fp16 * 0.01
+    # Both paths still round the merged latent to FP16 before the sink.
+    for merged in (out, rounded):
+        actual = apply_attn_sink(merged.half(), lse, sinks).float()
+        torch.testing.assert_close(actual, expected, atol=1e-3, rtol=2e-3)
 
 
 @pytest.mark.skipif(
@@ -219,5 +225,7 @@ def test_cuda_shard_paged_and_splitk_lse(fp8):
             q, cache, slots, counts, None, scale, partial_state, partial_acc, lse=lse
         ),
     ):
-        torch.testing.assert_close(out().float(), expected, atol=2e-3, rtol=3e-3)
+        actual = out()
+        assert actual.dtype == torch.float32
+        torch.testing.assert_close(actual, expected, atol=2e-3, rtol=3e-3)
         torch.testing.assert_close(lse, expected_lse, atol=1e-4, rtol=1e-5)

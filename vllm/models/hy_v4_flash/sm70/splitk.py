@@ -147,7 +147,9 @@ def paged_attention_splitk(
 ) -> torch.Tensor:
     rows, heads, dim = q.shape
     splits, latent = partial_acc.shape[-2:]
-    out = q.new_empty((rows, heads, latent))
+    out = q.new_empty(
+        (rows, heads, latent), dtype=q.dtype if lse is None else torch.float32
+    )
     _decode_split[(rows, triton.cdiv(heads, 8), splits)](
         q,
         cache,

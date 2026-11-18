@@ -332,7 +332,6 @@ class HYV4FlashAttention(nn.Module):
             q.new_full((rows, heads), -torch.inf, dtype=torch.float32),
         )
         del gathered
-        self.indexer.profile_dcp(q)
 
     def _eager_slots(
         self,
@@ -418,6 +417,8 @@ class HYV4FlashAttention(nn.Module):
                 )
                 if self.dcp_group is not None:
                     self._profile_dcp(q)
+                if self.indexer is not None:
+                    self.indexer.profile(q)
             latent = torch.zeros_like(latent_q)
         if 0 < tokens < q.shape[0]:
             latent = torch.nn.functional.pad(

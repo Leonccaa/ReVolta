@@ -9,6 +9,8 @@ from vllm.models.deepseek_v4.common.ops.fp8_software import (
 )
 from vllm.triton_utils import tl, triton
 
+_INDEX_PREFILL_GROUP_TILE = 65536
+
 
 @triton.jit
 def load_main_kv(kb, d, r, live, LATENT: tl.constexpr):
@@ -351,4 +353,169 @@ def index_scores(
         rank,
         num_warps=4,
     )
+    return logits
+
+
+def index_prefill_key_rows(groups: int) -> int:
+    return min(groups, _INDEX_PREFILL_GROUP_TILE)
+
+
+@triton.jit
+def _gather_index_prefill_keys(
+    Pool,
+    Table,
+    Keys,
+    stride_pool_p,
+    stride_pool_g,
+    start,
+    live,
+    DIM: tl.constexpr,
+    PAGE: tl.constexpr,
+    PAGES_PER_BLOCK: tl.constexpr,
+    N: tl.constexpr,
+):
+    # Adapted from the DeepSeek V4 SM70 paged index key gather.
+    col = tl.program_id(0) * N + tl.arange(0, N)
+    group = start + col
+    logical_page = group // PAGE
+    page = tl.load(Table + logical_page // PAGES_PER_BLOCK, col < live, other=0)
+    page = page * PAGES_PER_BLOCK + logical_page % PAGES_PER_BLOCK
+    d = tl.arange(0, DIM)
+    keys = tl.load(
+        Pool
+        + page[:, None].to(tl.int64) * stride_pool_p
+        + (group % PAGE)[:, None] * stride_pool_g
+        + d[None, :],
+        col[:, None] < live,
+        other=0,
+    )
+    tl.store(Keys + col[:, None] * DIM + d[None, :], keys, col[:, None] < live)
+
+
+@triton.jit
+def _index_prefill_scores(
+    Q,
+    W,
+    Keys,
+    Logits,
+    stride_qt,
+    stride_qh,
+    first,
+    rows,
+    groups,
+    start,
+    width,
+    live,
+    HEADS: tl.constexpr,
+    H: tl.constexpr,
+    DIM: tl.constexpr,
+    RATIO: tl.constexpr,
+    WORLD: tl.constexpr,
+    RANK: tl.constexpr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+):
+    # As in the DeepSeek V4 SM70 contiguous prefill scorer, reuse the key tile
+    # across query rows. Keep each row's dot and head reduction together.
+    row_start = tl.program_id(0) * (M // H)
+    col_start = tl.program_id(1) * N
+    row = row_start + tl.arange(0, M // H)
+    col = col_start + tl.arange(0, N)
+    logits = tl.full((M // H, N), float("-inf"), tl.float32)
+    last = tl.minimum(row_start + M // H, rows) - 1
+    upper = ((first + last) // RATIO + WORLD - 1 - RANK) // WORLD
+    if start + col_start < upper:
+        m = tl.arange(0, M)
+        token = row_start + m // H
+        head = m % H
+        d = tl.arange(0, DIM)
+        valid = (token < rows) & (head < HEADS)
+        q = tl.load(
+            Q + token[:, None] * stride_qt + head[:, None] * stride_qh + d[None, :],
+            valid[:, None],
+            other=0,
+        )
+        w = tl.load(W + token * HEADS + head, valid, other=0)
+        k = tl.load(
+            Keys + col[:, None] * DIM + d[None, :], col[:, None] < live, other=0
+        )
+        q = q.reshape((M // H, H, DIM))
+        k_t = tl.broadcast_to(tl.trans(k)[None, :, :], (M // H, DIM, N))
+        scores = tl.maximum(tl.dot(q, k_t), 0.0)
+        weighted = scores * w.reshape((M // H, H, 1))
+        upper_by_row = ((first + row) // RATIO + WORLD - 1 - RANK) // WORLD
+        logits = tl.where(
+            start + col[None, :] < upper_by_row[:, None],
+            tl.sum(weighted, axis=1),
+            float("-inf"),
+        )
+    tl.store(
+        Logits + row[:, None] * groups + start + col[None, :],
+        logits,
+        (row[:, None] < rows) & (col[None, :] < width),
+    )
+
+
+def index_prefill_scores(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    pool: torch.Tensor,
+    table: torch.Tensor,
+    first: int,
+    groups: int,
+    ratio: int,
+    pages_per_block: int,
+    *,
+    world: int = 1,
+    rank: int = 0,
+) -> torch.Tensor:
+    rows, heads, dim = q.shape
+    h = max(16, triton.next_power_of_2(heads))
+    block_m, block_n = 4 * h, 64
+    key_rows = index_prefill_key_rows(groups)
+    keys = pool.new_empty((key_rows, dim))
+    logits = q.new_empty((rows, groups), dtype=torch.float32)
+    # The final group in the output can still be open, so only gather keys
+    # visible to at least one row. Convert the bound to rank-local group IDs.
+    upper = ((first + rows - 1) // ratio + world - 1 - rank) // world
+    for start in range(0, groups, key_rows):
+        width = min(key_rows, groups - start)
+        live = min(width, upper - start)
+        if live > 0:
+            _gather_index_prefill_keys[(triton.cdiv(live, 16),)](
+                pool,
+                table,
+                keys,
+                pool.stride(0),
+                pool.stride(1),
+                start,
+                live,
+                dim,
+                pool.shape[1],
+                pages_per_block,
+                16,
+            )
+        _index_prefill_scores[(triton.cdiv(rows, 4), triton.cdiv(width, block_n))](
+            q,
+            weights,
+            keys,
+            logits,
+            q.stride(0),
+            q.stride(1),
+            first,
+            rows,
+            groups,
+            start,
+            width,
+            live,
+            heads,
+            h,
+            dim,
+            ratio,
+            world,
+            rank,
+            block_m,
+            block_n,
+            num_warps=4,
+        )
     return logits

@@ -15,7 +15,7 @@ from vllm.v1.kv_cache_interface import CircularBufferSpec, MLAAttentionSpec
 from .cache import FlashCache, FlashMetadata, QuerySpan
 from .dcp import select_history
 from .decode import gather_decode_group, store_decode_group
-from .kernels import index_scores
+from .kernels import index_prefill_key_rows, index_prefill_scores, index_scores
 from .rotary import apply_rotary, rotary_phases
 
 
@@ -70,10 +70,13 @@ class FlashCompressedIndexer(nn.Module):
         self.dim = config.compressed_indexer_head_dim
         self.rope_dim = config.qk_rope_head_dim
         self.eps = config.rms_norm_eps
+        model_config = vllm_config.model_config
         if self.dcp_group is not None:
-            assert vllm_config.model_config is not None
-            self.max_model_len = vllm_config.model_config.max_model_len
+            assert model_config is not None
             self.max_decode_rows = vllm_config.scheduler_config.max_num_seqs
+        self.max_model_len = (
+            model_config.max_model_len if model_config is not None else 0
+        )
         self.logits_budget = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024 // 4
         for name, in_dim, out_dim in (
             ("query_projection", config.q_lora_rank, self.num_heads * self.dim),
@@ -249,24 +252,26 @@ class FlashCompressedIndexer(nn.Module):
         torch.sort(topk_groups, out=(sorted_groups, workspace.sort_order[:rows]))
         return sorted_groups
 
-    def profile_dcp(self, q: torch.Tensor) -> None:
-        assert self.dcp_group is not None
+    def profile(self, q: torch.Tensor) -> None:
         if self.max_model_len <= self.width:
             return
         rows = q.shape[0]
         groups = cdiv(self.max_model_len, self.ratio * self.dcp_world)
-        # Decode scores all requests together. Prefill may score as many rows
-        # as the configured logits budget allows in a single chunk.
-        elements = max(
-            min(rows, self.max_decode_rows) * groups,
-            min(rows * groups, self.logits_budget),
-        )
+        # Prefill holds FP32 logits and one tile of FP16 keys together.
+        scores = max(groups, min(rows * groups, self.logits_budget))
+        keys = index_prefill_key_rows(groups) * self.dim // 2
+        elements = scores + keys
+        if self.dcp_group is not None:
+            # Decode scores all requests together.
+            decode = min(rows, self.max_decode_rows) * groups
+            elements = max(elements, decode)
         score_scratch = q.new_empty((elements,), dtype=torch.float32)
-        select_history(
-            score_scratch[:rows, None],
-            q.new_zeros(rows, dtype=torch.int32),
-            self.dcp_group,
-        )
+        if self.dcp_group is not None:
+            select_history(
+                score_scratch[:rows, None],
+                q.new_zeros(rows, dtype=torch.int32),
+                self.dcp_group,
+            )
 
     def local_lengths(self, groups: torch.Tensor) -> torch.Tensor:
         return ((groups + self.dcp_world - 1 - self.dcp_rank) // self.dcp_world).int()
@@ -379,7 +384,7 @@ class FlashCompressedIndexer(nn.Module):
                     first + start, first + start + q.shape[0], device=q.device
                 )
                 if q.is_cuda:
-                    logits = index_scores(
+                    logits = index_prefill_scores(
                         q,
                         w,
                         pool,
@@ -404,4 +409,5 @@ class FlashCompressedIndexer(nn.Module):
                     tokens = expand_groups(selected, logical, self.ratio)
                 else:
                     tokens = select_tokens(logits, logical, self.ratio, self.history)
+                del logits
                 output[full_end + start : full_end + start + q.shape[0]] = tokens

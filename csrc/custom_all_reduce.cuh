@@ -155,6 +155,26 @@ constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
 static_assert(kSm70Qwen38HcGateEpochIndexBase + kSm70Qwen38HcGatePushBlocks <=
               kSm70Qwen38HcPushSignalBytes / sizeof(uint32_t));
 
+inline int sm70_pex_tp4_push_blocks(size_t bytes) {
+  // Keep these graph payloads in sync with _SM70_PEX_TP4_PUSH_BYTES.
+  switch (bytes) {
+    case 20 * kSm70Tp4PushAllreduceQwen4ExpBytes:
+    case 24 * kSm70Tp4PushAllreduceQwen4ExpBytes:
+    case 25 * kSm70Tp4PushAllreduceQwen4ExpBytes:
+    case 30 * kSm70Tp4PushAllreduceQwen4ExpBytes:
+    case 32 * kSm70Tp4PushAllreduceQwen4ExpBytes:
+    case 35 * kSm70Tp4PushAllreduceQwen4ExpBytes:
+    case 40 * kSm70Tp4PushAllreduceQwen4ExpBytes: {
+      constexpr int block_bytes = kSm70Tp4PushAllreduceThreads * 16;
+      return std::min(
+          kSm70Tp4PushAllreduceBlocks,
+          static_cast<int>((bytes + block_bytes - 1) / block_bytes));
+    }
+    default:
+      return 0;
+  }
+}
+
 inline int sm70_tp4_push_allreduce_blocks(size_t bytes,
                                           bool allow_generic = false) {
   // Experimental message-size admission, independent of model or batch shape.
@@ -1715,6 +1735,7 @@ class CustomAllreduce {
   std::map<IPC_KEY, char*> ipc_handles_;
   RankData sm70_tp4_push_buffers_{};
   bool sm70_tp4_push_buffers_registered_ = false;
+  bool sm70_pcie_switch_ = false;
   RankData sm70_tp8_hierarchical_push_buffers_{};
   bool sm70_tp8_hierarchical_push_buffers_registered_ = false;
 
@@ -1968,7 +1989,11 @@ class CustomAllreduce {
           status == cudaStreamCaptureStatusActive &&
           world_size_ == kSm70Tp4PushAllreduceWorldSize && fully_connected_ &&
           custom_allreduce_current_device_is_sm70()) {
-        const int push_blocks = sm70_tp4_push_allreduce_blocks(bytes, true);
+        int push_blocks =
+            sm70_pcie_switch_ ? sm70_pex_tp4_push_blocks(bytes) : 0;
+        if (push_blocks == 0) {
+          push_blocks = sm70_tp4_push_allreduce_blocks(bytes, true);
+        }
         if (push_blocks > 0) {
           sm70_cross_device_reduce_1stage_push<kSm70Tp4PushAllreduceWorldSize>
               <<<push_blocks, kSm70Tp4PushAllreduceThreads, 0, stream>>>(
@@ -2267,6 +2292,8 @@ class CustomAllreduce {
       const bool qwen4_exp_m1_enabled =
           bytes == kSm70Tp4PushAllreduceQwen4ExpBytes &&
           (qwen4_exp_m1 == nullptr || std::strcmp(qwen4_exp_m1, "1") == 0);
+      const int pex_push_blocks =
+          sm70_pcie_switch_ ? sm70_pex_tp4_push_blocks(bytes) : 0;
 
       if (sm70_tp8_hierarchical_push_buffers_registered_ &&
           status == cudaStreamCaptureStatusActive &&
@@ -2283,9 +2310,12 @@ class CustomAllreduce {
       if (sm70_tp4_push_buffers_registered_ &&
           status == cudaStreamCaptureStatusActive &&
           world_size_ == kSm70Tp4PushAllreduceWorldSize && fully_connected_ &&
-          (qwen38_batch || qwen38_m2 || qwen38_mtp5 || qwen4_exp_m1_enabled) &&
+          (pex_push_blocks > 0 || qwen38_batch || qwen38_m2 || qwen38_mtp5 ||
+           qwen4_exp_m1_enabled) &&
           custom_allreduce_current_device_is_sm70()) {
-        const int push_blocks = sm70_tp4_push_allreduce_blocks(bytes);
+        const int push_blocks = pex_push_blocks > 0
+                                    ? pex_push_blocks
+                                    : sm70_tp4_push_allreduce_blocks(bytes);
         if (push_blocks > 0) {
           sm70_cross_device_reduce_sum2_1stage_push<
               kSm70Tp4PushAllreduceWorldSize>

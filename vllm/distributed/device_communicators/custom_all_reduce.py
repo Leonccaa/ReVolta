@@ -34,6 +34,10 @@ logger = init_logger(__name__)
 
 _SM70_TP8_HIERARCHICAL_ELEMENTS = frozenset((4096, 8 * 4096))
 _SM70_TP8_HIERARCHICAL_SCRATCH_BYTES = 4 * 8 * 4096 * torch.float16.itemsize
+# Mirror sm70_pex_tp4_push_blocks in custom_all_reduce.cuh.
+_SM70_PEX_TP4_PUSH_BYTES = frozenset(
+    rows * 2560 * 2 for rows in (20, 24, 25, 30, 32, 35, 40)
+)
 _EXPANDABLE_SEGMENTS_TRUE_PATTERN = re.compile(
     r"((?:^|,)\s*expandable_segments\s*:\s*)True(?=\s*(?:,|$))"
 )
@@ -718,7 +722,7 @@ class CustomAllreduce:
         self.fully_connected = fully_connected
         self.tp8_hierarchical = tp8_hierarchical
         self._ptr = ops.init_custom_ar(
-            self.meta_ptrs, self.rank_data, rank, self.fully_connected
+            self.meta_ptrs, self.rank_data, rank, decision.mode
         )
         ops.register_buffer(self._ptr, self.buffer_ptrs)
         if long_prefill_fusion_enabled:
@@ -857,20 +861,27 @@ class CustomAllreduce:
     def should_custom_ar(self, inp: torch.Tensor):
         if self.disabled:
             return False
+        inp_size = inp.numel() * inp.element_size()
         if self.sm70_pcie_switch:
             if (
                 self.sm70_pcie_switch_max_bytes
-                and inp.numel() * inp.element_size() > self.sm70_pcie_switch_max_bytes
+                and inp_size > self.sm70_pcie_switch_max_bytes
             ):
                 return False
+            # Within the expanded cap, only admit the added graph push sizes.
+            mid_size = 80 * 1024 < inp_size <= 200 * 1024
             if (
-                self.sm70_pcie_switch_graph_only
-                and not torch.cuda.is_current_stream_capturing()
+                self.sm70_pcie_switch_graph_only or mid_size
+            ) and not torch.cuda.is_current_stream_capturing():
+                return False
+            if mid_size and (
+                inp.dtype != torch.float16
+                or self.sm70_tp4_push_buffer_ptrs is None
+                or inp_size not in _SM70_PEX_TP4_PUSH_BYTES
             ):
                 return False
         if inp.dtype not in (torch.float32, torch.float16, torch.bfloat16):
             return False
-        inp_size = inp.numel() * inp.element_size()
         # custom allreduce requires input byte size to be multiples of 16
         if inp_size % 16 != 0:
             return False
@@ -1462,6 +1473,7 @@ class CustomAllreduce:
             return self.all_reduce(input, registered=False)
 
     def can_sm70_tp4_push_sum2(self, inp: torch.Tensor) -> bool:
+        nbytes = inp.numel() * inp.element_size()
         return (
             not self.disabled
             and (self.sm70_pcie_switch or self.sm70_nvlink_tp4)
@@ -1472,7 +1484,10 @@ class CustomAllreduce:
             and self.should_custom_ar(inp)
             and self._IS_CAPTURING
             and torch.cuda.is_current_stream_capturing()
-            and _sm70_tp4_push_sum2_size(inp.numel() * inp.element_size())
+            and (
+                (self.sm70_pcie_switch and nbytes in _SM70_PEX_TP4_PUSH_BYTES)
+                or _sm70_tp4_push_sum2_size(nbytes)
+            )
         )
 
     def custom_all_reduce_sum2(

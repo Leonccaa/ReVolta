@@ -50,8 +50,18 @@ def test_prefill_scores_match_paged(monkeypatch, device, world):
     global_upper = positions // ratio
     reference = torch.empty(rows, groups)
     old, new = torch.empty_like(reference), torch.empty_like(reference)
-    # Exercise the same gather buffer across group tiles on a small fixture.
+    # Exercise both levels of key tiling on a small fixture.
     monkeypatch.setattr(kernels, "_INDEX_PREFILL_GROUP_TILE", 128)
+    monkeypatch.setattr(kernels, "_INDEX_PREFILL_GEMM_BUDGET", rows * heads * 64)
+    if device == "cpu":
+        mm = torch.mm
+
+        def cpu_mm(q, k, *, out_dtype):
+            return mm(q.to(out_dtype), k.to(out_dtype))
+
+        # CPU mm has no out_dtype argument. Run the same FP32 dot products.
+        monkeypatch.setattr(kernels.torch, "mm", cpu_mm)
+
     for rank in range(world):
         pool = torch.randn(
             num_blocks * pages_per_block, page + 1, dim, generator=rng

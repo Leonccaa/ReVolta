@@ -15,7 +15,12 @@ from vllm.v1.kv_cache_interface import CircularBufferSpec, MLAAttentionSpec
 from .cache import FlashCache, FlashMetadata, QuerySpan
 from .dcp import select_history
 from .decode import gather_decode_group, store_decode_group
-from .kernels import index_prefill_key_rows, index_prefill_scores, index_scores
+from .kernels import (
+    index_prefill_gemm_elements,
+    index_prefill_key_rows,
+    index_prefill_scores,
+    index_scores,
+)
 from .rotary import apply_rotary, rotary_phases
 
 
@@ -257,10 +262,12 @@ class FlashCompressedIndexer(nn.Module):
             return
         rows = q.shape[0]
         groups = cdiv(self.max_model_len, self.ratio * self.dcp_world)
-        # Prefill holds FP32 logits and one tile of FP16 keys together.
-        scores = max(groups, min(rows * groups, self.logits_budget))
-        keys = index_prefill_key_rows(groups) * self.dim // 2
-        elements = scores + keys
+        # Count logits, gathered FP16 keys and the FP32 GEMM output together.
+        logits = max(groups, min(rows * groups, self.logits_budget))
+        key_rows = index_prefill_key_rows(groups)
+        keys = key_rows * self.dim // 2
+        gemm = index_prefill_gemm_elements(rows * self.num_heads, key_rows)
+        elements = logits + keys + gemm
         if self.dcp_group is not None:
             # Decode scores all requests together.
             decode = min(rows, self.max_decode_rows) * groups

@@ -1,15 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from math import gcd
+
 import torch
 
 from vllm.models.deepseek_v4.common.ops.fp8_software import (
     fp8_e4m3fn_bits_to_fp32_bitcast,
     fp32_to_fp8_e4m3fn_bits,
 )
+from vllm.models.deepseek_v4.sm70.indexer import (
+    _EPILOGUE_BLOCK_H,
+    _EPILOGUE_BLOCK_K,
+    _PREFILL_TILE_MB,
+    _RELU_BLOCK_N,
+    _relu_weight_headsum,
+)
 from vllm.triton_utils import tl, triton
 
 _INDEX_PREFILL_GROUP_TILE = 65536
+_INDEX_PREFILL_GEMM_BUDGET = _PREFILL_TILE_MB * 2**18
 
 
 @triton.jit
@@ -360,6 +370,11 @@ def index_prefill_key_rows(groups: int) -> int:
     return min(groups, _INDEX_PREFILL_GROUP_TILE)
 
 
+def index_prefill_gemm_elements(rows: int, key_rows: int) -> int:
+    """Bound the FP32 GEMM output for rows of flattened query heads."""
+    return min(rows * key_rows, max(rows, _INDEX_PREFILL_GEMM_BUDGET))
+
+
 @triton.jit
 def _gather_index_prefill_keys(
     Pool,
@@ -393,66 +408,42 @@ def _gather_index_prefill_keys(
 
 
 @triton.jit
-def _index_prefill_scores(
-    Q,
+def _index_prefill_epilogue(
+    Scores,
     W,
-    Keys,
     Logits,
-    stride_qt,
-    stride_qh,
     first,
-    rows,
     groups,
     start,
     width,
-    live,
     HEADS: tl.constexpr,
-    H: tl.constexpr,
-    DIM: tl.constexpr,
     RATIO: tl.constexpr,
     WORLD: tl.constexpr,
     RANK: tl.constexpr,
-    M: tl.constexpr,
-    N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_H: tl.constexpr,
 ):
-    # As in the DeepSeek V4 SM70 contiguous prefill scorer, reuse the key tile
-    # across query rows. Keep each row's dot and head reduction together.
-    row_start = tl.program_id(0) * (M // H)
-    col_start = tl.program_id(1) * N
-    row = row_start + tl.arange(0, M // H)
-    col = col_start + tl.arange(0, N)
-    logits = tl.full((M // H, N), float("-inf"), tl.float32)
-    last = tl.minimum(row_start + M // H, rows) - 1
-    upper = ((first + last) // RATIO + WORLD - 1 - RANK) // WORLD
-    if start + col_start < upper:
-        m = tl.arange(0, M)
-        token = row_start + m // H
-        head = m % H
-        d = tl.arange(0, DIM)
-        valid = (token < rows) & (head < HEADS)
-        q = tl.load(
-            Q + token[:, None] * stride_qt + head[:, None] * stride_qh + d[None, :],
-            valid[:, None],
-            other=0,
-        )
-        w = tl.load(W + token * HEADS + head, valid, other=0)
-        k = tl.load(
-            Keys + col[:, None] * DIM + d[None, :], col[:, None] < live, other=0
-        )
-        q = q.reshape((M // H, H, DIM))
-        k_t = tl.broadcast_to(tl.trans(k)[None, :, :], (M // H, DIM, N))
-        scores = tl.maximum(tl.dot(q, k_t), 0.0)
-        weighted = scores * w.reshape((M // H, H, 1))
-        upper_by_row = ((first + row) // RATIO + WORLD - 1 - RANK) // WORLD
-        logits = tl.where(
-            start + col[None, :] < upper_by_row[:, None],
-            tl.sum(weighted, axis=1),
-            float("-inf"),
-        )
+    row = tl.program_id(0)
+    col = tl.program_id(1) * BLOCK_K + tl.arange(0, BLOCK_K)
+    upper = ((first + row) // RATIO + WORLD - 1 - RANK) // WORLD
+    visible = start + col < upper
+    acc = _relu_weight_headsum(
+        Scores,
+        W,
+        row,
+        col,
+        (col < width) & visible,
+        HEADS * width,
+        width,
+        HEADS,
+        HEADS,
+        BLOCK_K,
+        BLOCK_H,
+    )
     tl.store(
-        Logits + row[:, None] * groups + start + col[None, :],
-        logits,
-        (row[:, None] < rows) & (col[None, :] < width),
+        Logits + row * groups + start + col,
+        tl.where(visible, acc, float("-inf")),
+        col < width,
     )
 
 
@@ -470,52 +461,54 @@ def index_prefill_scores(
     rank: int = 0,
 ) -> torch.Tensor:
     rows, heads, dim = q.shape
-    h = max(16, triton.next_power_of_2(heads))
-    block_m, block_n = 4 * h, 64
+    q2 = q.flatten(0, 1)
     key_rows = index_prefill_key_rows(groups)
+    score_cols = index_prefill_gemm_elements(rows * heads, key_rows) // (rows * heads)
+    if score_cols < key_rows:
+        score_cols = score_cols // _RELU_BLOCK_N * _RELU_BLOCK_N or score_cols
+    block_h = gcd(heads, _EPILOGUE_BLOCK_H)
     keys = pool.new_empty((key_rows, dim))
     logits = q.new_empty((rows, groups), dtype=torch.float32)
     # The final group in the output can still be open, so only gather keys
     # visible to at least one row. Convert the bound to rank-local group IDs.
     upper = ((first + rows - 1) // ratio + world - 1 - rank) // world
-    for start in range(0, groups, key_rows):
-        width = min(key_rows, groups - start)
-        live = min(width, upper - start)
-        if live > 0:
-            _gather_index_prefill_keys[(triton.cdiv(live, 16),)](
-                pool,
-                table,
-                keys,
-                pool.stride(0),
-                pool.stride(1),
-                start,
-                live,
-                dim,
-                pool.shape[1],
-                pages_per_block,
-                16,
-            )
-        _index_prefill_scores[(triton.cdiv(rows, 4), triton.cdiv(width, block_n))](
-            q,
-            weights,
+    for start in range(0, upper, key_rows):
+        live = min(key_rows, upper - start)
+        _gather_index_prefill_keys[(triton.cdiv(live, 16),)](
+            pool,
+            table,
             keys,
-            logits,
-            q.stride(0),
-            q.stride(1),
-            first,
-            rows,
-            groups,
+            pool.stride(0),
+            pool.stride(1),
             start,
-            width,
             live,
-            heads,
-            h,
             dim,
-            ratio,
-            world,
-            rank,
-            block_m,
-            block_n,
-            num_warps=4,
+            pool.shape[1],
+            pages_per_block,
+            16,
         )
+        for col in range(0, live, score_cols):
+            key_tile = keys[col : min(col + score_cols, live)]
+            # As in the DeepSeek V4 SM70 cuBLAS scorer, fold heads into M.
+            # Keep the GEMM output in FP32 for the top-k score comparison.
+            scores = torch.mm(q2, key_tile.t(), out_dtype=torch.float32)
+            width = scores.shape[1]
+            _index_prefill_epilogue[(rows, triton.cdiv(width, _EPILOGUE_BLOCK_K))](
+                scores,
+                weights,
+                logits,
+                first,
+                groups,
+                start + col,
+                width,
+                heads,
+                ratio,
+                world,
+                rank,
+                _EPILOGUE_BLOCK_K,
+                block_h,
+                num_warps=4,
+            )
+            del scores
+    logits[:, upper:].fill_(-torch.inf)
     return logits

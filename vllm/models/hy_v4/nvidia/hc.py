@@ -47,6 +47,7 @@ def _ihc_pre_stage1(
     NUM_SPLITS: tl.constexpr,
     BLOCK_K: tl.constexpr,
     PARTIAL_STRIDE: tl.constexpr,
+    HAS_POST: tl.constexpr = True,
 ):
     token_idx = tl.program_id(0).to(tl.int64)
     split_idx = tl.program_id(1)
@@ -68,20 +69,20 @@ def _ihc_pre_stage1(
         tl.load(weight_ptr + weight_offsets, mask=weight_mask, other=0.0) * x[None, :],
         axis=1,
     )
-    post_mix = tl.sum(
-        tl.load(
-            weight_ptr + HC_MULT * K_TOTAL + weight_offsets,
-            mask=weight_mask,
-            other=0.0,
-        )
-        * x[None, :],
-        axis=1,
-    )
-
     partial = partial_ptr + (token_idx * NUM_SPLITS + split_idx) * PARTIAL_STRIDE
     tl.store(partial, sum_squares)
     tl.store(partial + 1 + hc_idx, pre_mix, mask=hc_mask)
-    tl.store(partial + 1 + HC_POW2 + hc_idx, post_mix, mask=hc_mask)
+    if HAS_POST:
+        post_mix = tl.sum(
+            tl.load(
+                weight_ptr + HC_MULT * K_TOTAL + weight_offsets,
+                mask=weight_mask,
+                other=0.0,
+            )
+            * x[None, :],
+            axis=1,
+        )
+        tl.store(partial + 1 + HC_POW2 + hc_idx, post_mix, mask=hc_mask)
 
 
 @triton.jit
@@ -102,6 +103,7 @@ def _ihc_pre_stage2(
     MAGNITUDE: tl.constexpr,
     NORM_EPS: tl.constexpr,
     HC_EPS: tl.constexpr,
+    HAS_POST: tl.constexpr = True,
 ):
     token_idx = tl.program_id(0).to(tl.int64)
     hidden_block_idx = tl.program_id(1)
@@ -116,29 +118,29 @@ def _ihc_pre_stage2(
         partial = partial_row + split_idx * PARTIAL_STRIDE
         sum_squares += tl.load(partial)
         pre_mix += tl.load(partial + 1 + hc_idx, mask=hc_mask, other=0.0)
-        post_mix += tl.load(
-            partial + 1 + HC_POW2 + hc_idx,
-            mask=hc_mask,
-            other=0.0,
-        )
+        if HAS_POST:
+            post_mix += tl.load(
+                partial + 1 + HC_POW2 + hc_idx,
+                mask=hc_mask,
+                other=0.0,
+            )
 
     reciprocal_rms = tl.rsqrt(sum_squares / K_TOTAL + NORM_EPS)
     pre_scale = tl.load(scale_ptr)
-    post_scale = tl.load(scale_ptr + 1)
     pre_base = tl.load(base_ptr + hc_idx, mask=hc_mask, other=0.0)
-    post_base = tl.load(base_ptr + HC_MULT + hc_idx, mask=hc_mask, other=0.0)
     pre = tl.sigmoid(pre_mix * reciprocal_rms * pre_scale + pre_base) + HC_EPS
 
-    if hidden_block_idx == 0:
-        post = (
-            MAGNITUDE * tl.sigmoid(post_mix * reciprocal_rms * post_scale + post_base)
-            + HC_EPS
-        )
-        tl.store(
-            post_ptr + token_idx * HC_MULT + hc_idx,
-            post,
-            mask=hc_mask,
-        )
+    if HAS_POST:
+        post_scale = tl.load(scale_ptr + 1)
+        post_base = tl.load(base_ptr + HC_MULT + hc_idx, mask=hc_mask, other=0.0)
+        if hidden_block_idx == 0:
+            post_logit = post_mix * reciprocal_rms * post_scale + post_base
+            post = MAGNITUDE * tl.sigmoid(post_logit) + HC_EPS
+            tl.store(
+                post_ptr + token_idx * HC_MULT + hc_idx,
+                post,
+                mask=hc_mask,
+            )
 
     hidden_offsets = hidden_block_idx * BLOCK_D + tl.arange(0, BLOCK_D)
     hidden_mask = hidden_offsets < HIDDEN_SIZE
@@ -539,6 +541,60 @@ class HYV4HCHeadLayer(nn.Module):
             The merged hidden state `[num_tokens, d]`.
 
         """
+        if not triton_ihc_supported(x):
+            return self.forward_native(x)
+
+        x = x.contiguous()
+        num_tokens, hc_mult, hidden_size = x.shape
+        output = x.new_empty((num_tokens, hidden_size))
+        if num_tokens == 0:
+            return output
+
+        k_total = hc_mult * hidden_size
+        hc_pow2 = triton.next_power_of_2(hc_mult)
+        num_splits = triton.cdiv(k_total, _BLOCK_K)
+        partial_stride = 1 + hc_pow2
+        partial = x.new_empty(
+            (num_tokens, num_splits, partial_stride), dtype=torch.float32
+        )
+        _ihc_pre_stage1[(num_tokens, num_splits)](
+            x,
+            self.hc_head_fn.weight,
+            partial,
+            K_TOTAL=k_total,
+            HC_MULT=hc_mult,
+            HC_POW2=hc_pow2,
+            NUM_SPLITS=num_splits,
+            BLOCK_K=_BLOCK_K,
+            PARTIAL_STRIDE=partial_stride,
+            HAS_POST=False,
+            num_warps=8,
+            enable_fp_fusion=False,
+        )
+        _ihc_pre_stage2[(num_tokens, triton.cdiv(hidden_size, _BLOCK_D))](
+            x,
+            partial,
+            self.hc_head_scale,
+            self.hc_head_base,
+            output,
+            None,
+            HIDDEN_SIZE=hidden_size,
+            K_TOTAL=k_total,
+            HC_MULT=hc_mult,
+            HC_POW2=hc_pow2,
+            NUM_SPLITS=num_splits,
+            PARTIAL_STRIDE=partial_stride,
+            BLOCK_D=_BLOCK_D,
+            MAGNITUDE=0.0,
+            NORM_EPS=self.config.rms_norm_eps,
+            HC_EPS=self.hc_eps,
+            HAS_POST=False,
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
+        return output
+
+    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         shape, x_dtype = x.size(), x.dtype
 
         x = x.flatten(1).float()  # [num_tokens, hc*d]

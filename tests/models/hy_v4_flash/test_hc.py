@@ -75,3 +75,39 @@ def test_triton_ihc_matches_eager(tokens):
     torch.testing.assert_close(
         scattered, post.forward_native(mixed, x, gates), atol=2e-4, rtol=1e-3
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("tokens", [1, 7])
+@torch.inference_mode()
+def test_triton_ihc_head_against_transformers(tokens, record_property):
+    from vllm.models.hy_v4.nvidia.hc import triton_ihc_supported
+
+    ref = pytest.importorskip("transformers.models.hy_v4_flash.modeling_hy_v4_flash")
+    torch.manual_seed(53)
+    config = HYV4FlashConfig()
+    head = HYV4HCHeadLayer(config, config.hidden_size)
+    head.hc_head_fn.weight.normal_(std=0.1)
+    head.hc_head_base.normal_(std=0.1)
+    head.hc_head_scale.fill_(0.5)
+    ref_head = ref.HYV4FlashHyperHead(config)
+    ref_head.hc_fn.copy_(head.hc_head_fn.weight)
+    ref_head.hc_base.copy_(head.hc_head_base)
+    ref_head.hc_scale.copy_(head.hc_head_scale)
+
+    x = torch.randn(tokens, config.hc_mult, config.hidden_size, dtype=torch.float16)
+    # Use the FP32 oracle before the final FP16 rounding, also for the native path.
+    expected = ref_head(x.float().unsqueeze(0)).squeeze(0)
+    head, x = head.cuda(), x.cuda()
+    assert triton_ihc_supported(x)
+    native = head.forward_native(x).cpu().float()
+    fused = head(x).cpu().float()
+    native_error, fused_error = native - expected, fused - expected
+    for name, metric in [
+        ("rel_l2", lambda err: err.norm() / expected.norm()),
+        ("max_abs", lambda err: err.abs().max()),
+    ]:
+        before, after = metric(native_error), metric(fused_error)
+        record_property(f"native_{name}", float(before))
+        record_property(f"fused_{name}", float(after))
+        assert after <= 10 * before, f"{name}: native={before}, fused={after}"

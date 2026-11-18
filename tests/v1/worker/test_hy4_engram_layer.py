@@ -16,24 +16,30 @@ import vllm.models.hy_v4_flash.nvidia.engram as engram
 pytestmark = pytest.mark.skip_global_cleanup
 
 
-def make_case(tmp_path):
+def make_case(tmp_path, *, model_shape=False):
     torch.manual_seed(77)
+    sizes = (
+        [[11, 13, 17, 19, 23, 29, 31, 37], [41, 43, 47, 53, 59, 61, 67, 71]]
+        if model_shape
+        else [[11, 13], [17, 19]]
+    )
+    head_dim = 96 if model_shape else 4
     config = SimpleNamespace(
-        hidden_size=8,
-        hc_mult=2,
+        hidden_size=3072 if model_shape else 8,
+        hc_mult=4 if model_shape else 2,
         engram_layer_ids=[2],
         engram_max_ngram_size=3,
-        engram_n_head_per_ngram=2,
-        engram_n_embed_per_ngram=8,
+        engram_n_head_per_ngram=len(sizes[0]),
+        engram_n_embed_per_ngram=len(sizes[0]) * head_dim,
         engram_fp8_embedding=True,
         engram_pad_id=3,
         engram_seed=42,
-        engram_layer_head_vocab_sizes={"2": [[11, 13], [17, 19]]},
+        engram_layer_head_vocab_sizes={"2": sizes},
         engram_lookup_table_size=32,
         vocab_size=32,
     )
     reference = HYV4FlashEngramLayer(config, 2)
-    source = torch.randn(60, 4, dtype=torch.bfloat16)
+    source = torch.randn(sum(map(sum, sizes)), head_dim, dtype=torch.bfloat16)
     scale = source.abs().amax(-1).clamp(min=1e-12) / 448
     codes = (source / scale[:, None]).clamp(-448, 448).to(torch.float8_e4m3fn)
     with torch.no_grad():
@@ -216,3 +222,81 @@ def test_cuda_whole_layer_against_cpu(tmp_path, monkeypatch):
     with override_forward_context(context):
         actual = gpu(hidden.cuda(), hashes.cuda()).cpu()
     torch.testing.assert_close(actual, cpu(hidden, hashes), rtol=2e-5, atol=3e-6)
+
+
+def checkpoint_reference(reference, source, hidden, ngrams, pad):
+    # Match the checkpoint's offline BF16 recipe; use FP32 from lookup onward.
+    reference.half().float()
+    reference.fp8_embedding = False
+    reference.multi_head_embedding.embedding.weight.copy_(
+        _fp8_round_trip(source).float()
+    )
+    streams = hidden.float()
+    return streams + reference(streams[None], ngrams[None], (~pad)[None])[0]
+
+
+def output_errors(actual, expected):
+    error = actual.float() - expected
+    return float(error.norm() / expected.norm()), float(error.abs().max())
+
+
+@torch.inference_mode()
+def test_fp16_model_shape_against_transformers(tmp_path, monkeypatch, record_property):
+    reference, source, _, _, path, layout, cfg, tokens, ngrams, hashes, hidden = (
+        make_case(tmp_path, model_shape=True)
+    )
+    layer = make_layer(reference, path, layout, cfg, 1, 0, monkeypatch).half()
+    hidden = hidden.half()
+    pad = tokens == layout.pad_token_id
+    expected = checkpoint_reference(reference, source, hidden, ngrams, pad)
+    actual = layer(hidden, hashes)
+    rel_l2, max_abs = output_errors(actual, expected)
+    record_property("native_rel_l2", rel_l2)
+    record_property("native_max_abs", max_abs)
+    assert rel_l2 < 0.01
+    assert max_abs < 0.02
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("num_tokens", [1, 6])
+@torch.inference_mode()
+def test_cuda_fused_engram_against_transformers(
+    tmp_path, monkeypatch, num_tokens, record_property
+):
+    from vllm.forward_context import override_forward_context
+
+    reference, source, _, _, path, layout, cfg, tokens, ngrams, hashes, hidden = (
+        make_case(tmp_path, model_shape=True)
+    )
+    cfg.device_config.device_type = "cuda"
+    gpu = make_layer(reference, path, layout, cfg, 1, 0, monkeypatch).cuda().half()
+    tokens, ngrams = tokens[:num_tokens], ngrams[:num_tokens]
+    hidden = hidden[:num_tokens].half()
+    pad = tokens == layout.pad_token_id
+    expected = checkpoint_reference(reference, source, hidden, ngrams, pad)
+    context = SimpleNamespace(
+        no_compile_layers=cfg.compilation_config.static_forward_context
+    )
+    streams = hidden.cuda()
+    ids = hashes[:num_tokens].to(device="cuda", dtype=torch.int32)
+    with override_forward_context(context):
+        native = gpu.forward_native(streams, ids).cpu()
+        fused = gpu(streams, ids).cpu()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = gpu(streams, ids)
+        # The graph must read the updated hash contents, not capture a pad decision.
+        ids[0].fill_(-1)
+        graph.replay()
+        torch.testing.assert_close(captured, gpu(streams, ids), rtol=0, atol=0)
+        torch.testing.assert_close(captured[0].cpu(), hidden[0], rtol=0, atol=0)
+    torch.testing.assert_close(fused[pad], hidden[pad], rtol=0, atol=0)
+
+    for name, before, after in zip(
+        ("rel_l2", "max_abs"),
+        output_errors(native, expected),
+        output_errors(fused, expected),
+    ):
+        record_property(f"native_{name}", before)
+        record_property(f"fused_{name}", after)
+        assert after <= 10 * before, f"{name}: native={before}, fused={after}"

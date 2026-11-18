@@ -142,47 +142,164 @@ def head_range(sizes, tp, rank):
 
 
 @triton.jit
+def _select_ptr(ptrs, index):
+    # Choose a checkpoint parameter without stacking weights at runtime.
+    ptr = ptrs[0]
+    for i in tl.static_range(1, len(ptrs)):
+        ptr = tl.where(index == i, ptrs[i], ptr)
+    return ptr
+
+
+@triton.jit
+def _row_rrms(row, dim: tl.constexpr, eps: tl.constexpr):
+    return tl.rsqrt(tl.sum(row * row, axis=0) / dim + eps)
+
+
+@triton.jit
 def _flash_engram_gather_kernel(
     storage_ptr,
     ids_ptr,
     output_ptr,
+    norm_ptrs,
     vocab_start,
     local_rows,
-    dim: tl.constexpr,
+    ids_stride_t,
+    ids_stride_h,
+    HEAD_START: tl.constexpr,
+    LOCAL_HEADS: tl.constexpr,
+    DIM: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    EPS: tl.constexpr,
 ):
-    row = tl.program_id(0).to(tl.int64)
-    index = tl.load(ids_ptr + row).to(tl.int64) - vocab_start
+    token = tl.program_id(0).to(tl.int64)
+    head = tl.program_id(1)
+    id_offset = token * ids_stride_t + (HEAD_START + head) * ids_stride_h
+    index = tl.load(ids_ptr + id_offset).to(tl.int64) - vocab_start
     owned = (index >= 0) & (index < local_rows)
     offsets = tl.arange(0, BLOCK_D)
+    mask = offsets < DIM
     storage = storage_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8))
-    raw = tl.load(storage + index * dim + offsets, owned & (offsets < dim), other=0)
-    scales = (storage + local_rows.to(tl.int64) * dim).to(tl.pointer_type(tl.bfloat16))
+    raw = tl.load(storage + index * DIM + offsets, owned & mask, other=0)
+    scales = (storage + local_rows.to(tl.int64) * DIM).to(tl.pointer_type(tl.bfloat16))
     scale = tl.load(scales + index, owned, other=0).to(tl.float32)
-    decoded = _e4m3fn_byte_to_float(raw) * scale
-    tl.store(output_ptr + row * dim + offsets, decoded, offsets < dim)
+    row = _e4m3fn_byte_to_float(raw) * scale
+    if len(norm_ptrs) > 0:
+        # The checkpoint dequantizes to BF16 before normalizing in FP32.
+        row = row.to(tl.bfloat16).to(tl.float32)
+        gamma = tl.load(_select_ptr(norm_ptrs, head) + offsets, mask, other=0)
+        row = row * _row_rrms(row, DIM, EPS) * gamma.to(tl.float32)
+    tl.store(output_ptr + (token * LOCAL_HEADS + head) * DIM + offsets, row, mask)
+
+
+@triton.jit
+def _flash_engram_gate_kernel(
+    hidden_ptr,
+    key_ptrs,
+    key_gamma_ptrs,
+    query_gamma_ptrs,
+    gate_ptr,
+    stride_t,
+    stride_c,
+    stride_d,
+    DIM: tl.constexpr,
+    HC: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    EPS: tl.constexpr,
+    DOT_SCALE: tl.constexpr,
+):
+    token = tl.program_id(0).to(tl.int64)
+    channel = tl.program_id(1)
+    d = tl.arange(0, BLOCK_D)
+    mask = d < DIM
+    key = tl.load(_select_ptr(key_ptrs, channel) + token * DIM + d, mask, 0)
+    query = tl.load(
+        hidden_ptr + token * stride_t + channel * stride_c + d * stride_d, mask, 0
+    )
+    key = key.to(tl.float32)
+    query = query.to(tl.float32)
+    key_gamma = tl.load(_select_ptr(key_gamma_ptrs, channel) + d, mask, 0)
+    query_gamma = tl.load(_select_ptr(query_gamma_ptrs, channel) + d, mask, 0)
+    key = key * _row_rrms(key, DIM, EPS) * key_gamma.to(tl.float32)
+    query = query * _row_rrms(query, DIM, EPS) * query_gamma.to(tl.float32)
+    dot = tl.sum(key * query, axis=0) * DOT_SCALE
+    magnitude = tl.sqrt(tl.maximum(tl.abs(dot), 1e-6))
+    signed = tl.where(dot > 0, magnitude, tl.where(dot < 0, -magnitude, 0.0))
+    tl.store(gate_ptr + token * HC + channel, tl.sigmoid(signed))
+
+
+@triton.jit
+def _flash_engram_value_kernel(
+    hidden_ptr,
+    ids_ptr,
+    value_ptr,
+    gate_ptr,
+    gamma_ptr,
+    scale_ptrs,
+    output_ptr,
+    stride_t,
+    stride_c,
+    stride_d,
+    ids_stride_t,
+    ids_stride_h,
+    DIM: tl.constexpr,
+    HC: tl.constexpr,
+    HASH_COLS: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    EPS: tl.constexpr,
+):
+    token = tl.program_id(0).to(tl.int64)
+    channel = tl.program_id(1)
+    h = tl.arange(0, BLOCK_H)
+    ids = tl.load(ids_ptr + token * ids_stride_t + h * ids_stride_h, h < HASH_COLS, -1)
+    valid = tl.sum((ids >= 0).to(tl.int32), axis=0) > 0
+    d = tl.arange(0, BLOCK_D)
+    mask = d < DIM
+    value = tl.load(value_ptr + token * DIM + d, mask, 0).to(tl.float32)
+    gamma = tl.load(gamma_ptr + d, mask, 0).to(tl.float32)
+    scale = tl.load(_select_ptr(scale_ptrs, channel) + d, mask, 0).to(tl.float32)
+    gate = tl.load(gate_ptr + token * HC + channel)
+    signal = gamma * value * _row_rrms(value, DIM, EPS)
+    # Round the Engram delta to the stream dtype before adding the residual.
+    delta = ((gate + scale) * signal).to(hidden_ptr.dtype.element_ty).to(tl.float32)
+    residual = tl.load(
+        hidden_ptr + token * stride_t + channel * stride_c + d * stride_d, mask, 0
+    ).to(tl.float32)
+    output = residual + tl.where(valid, delta, 0.0)
+    tl.store(output_ptr + (token * HC + channel) * DIM + d, output, mask)
 
 
 def flash_engram_gather(
-    indices: torch.Tensor,
+    hashes: torch.Tensor,
     output: torch.Tensor,
     layer_name: str,
+    norm_weights: list[torch.Tensor],
 ) -> None:
     table = get_forward_context().no_compile_layers[layer_name]
-    _flash_engram_gather_kernel[(indices.numel(),)](
+    local_heads = table.head_end - table.head_start
+    _flash_engram_gather_kernel[(hashes.shape[0], local_heads)](
         table._uva_ptr,
-        indices,
+        hashes,
         output,
+        tuple(norm_weights),
         table.vocab_start,
         table.local_rows,
-        dim=table.dim,
+        *hashes.stride(),
+        HEAD_START=table.head_start,
+        LOCAL_HEADS=local_heads,
+        DIM=table.dim,
         BLOCK_D=triton.next_power_of_2(table.dim),
-        num_warps=4,
+        EPS=torch.finfo(torch.float32).eps,
+        num_warps=1,
+        enable_fp_fusion=False,
     )
 
 
 def flash_engram_gather_fake(
-    indices: torch.Tensor, output: torch.Tensor, layer_name: str
+    hashes: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+    norm_weights: list[torch.Tensor],
 ) -> None:
     return
 
@@ -192,6 +309,79 @@ direct_register_custom_op(
     op_func=flash_engram_gather,
     mutates_args=["output"],
     fake_impl=flash_engram_gather_fake,
+)
+
+
+def flash_engram_apply(
+    hidden: torch.Tensor,
+    hashes: torch.Tensor,
+    keys: list[torch.Tensor],
+    value: torch.Tensor,
+    key_weights: list[torch.Tensor],
+    query_weights: list[torch.Tensor],
+    gamma: torch.Tensor,
+    scales: list[torch.Tensor],
+) -> torch.Tensor:
+    # Keep the Triton tuples of pointers inside the opaque op for Inductor.
+    num_tokens, hc_mult, dim = hidden.shape
+    hash_cols = hashes.shape[1]
+    gate = hidden.new_empty((num_tokens, hc_mult), dtype=torch.float32)
+    output = hidden.new_empty(hidden.shape)
+    grid = (num_tokens, hc_mult)
+    block_d = triton.next_power_of_2(dim)
+    eps = torch.finfo(torch.float32).eps
+    _flash_engram_gate_kernel[grid](
+        hidden,
+        tuple(keys),
+        tuple(key_weights),
+        tuple(query_weights),
+        gate,
+        *hidden.stride(),
+        DIM=dim,
+        HC=hc_mult,
+        BLOCK_D=block_d,
+        EPS=eps,
+        DOT_SCALE=dim**-0.5,
+        enable_fp_fusion=False,
+    )
+    _flash_engram_value_kernel[grid](
+        hidden,
+        hashes,
+        value,
+        gate,
+        gamma,
+        tuple(scales),
+        output,
+        *hidden.stride(),
+        *hashes.stride(),
+        DIM=dim,
+        HC=hc_mult,
+        HASH_COLS=hash_cols,
+        BLOCK_D=block_d,
+        BLOCK_H=triton.next_power_of_2(hash_cols),
+        EPS=eps,
+        enable_fp_fusion=False,
+    )
+    return output
+
+
+def flash_engram_apply_fake(
+    hidden: torch.Tensor,
+    hashes: torch.Tensor,
+    keys: list[torch.Tensor],
+    value: torch.Tensor,
+    key_weights: list[torch.Tensor],
+    query_weights: list[torch.Tensor],
+    gamma: torch.Tensor,
+    scales: list[torch.Tensor],
+) -> torch.Tensor:
+    return hidden.new_empty(hidden.shape)
+
+
+direct_register_custom_op(
+    op_name="hy4_flash_engram_apply",
+    op_func=flash_engram_apply,
+    fake_impl=flash_engram_apply_fake,
 )
 
 
@@ -253,28 +443,27 @@ class FlashEmbedding(nn.Module):
                 scale[local_start:local_end].copy_(scale_slice[start:end])
 
     def forward(self, hashes):
-        indices = hashes[:, self.head_start : self.head_end].long().contiguous()
-        output = torch.empty(
-            (*indices.shape, self.dim), dtype=torch.float32, device=hashes.device
-        )
-        if indices.numel() == 0:
+        if hashes.is_cuda or hashes.shape[0] == 0:
+            output = hashes.new_empty(
+                (hashes.shape[0], self.head_end - self.head_start, self.dim),
+                dtype=torch.float32,
+            )
+            if hashes.shape[0]:
+                torch.ops.vllm.hy4_flash_engram_gather(
+                    hashes, output, self.layer_name, []
+                )
             return output
-        if hashes.is_cuda:
-            torch.ops.vllm.hy4_flash_engram_gather(
-                indices.flatten(), output.view(-1, self.dim), self.layer_name
-            )
-        else:
-            local = indices - self.vocab_start
-            valid = (local >= 0) & (local < self.local_rows)
-            local = torch.where(valid, local, 0)
-            weights = self.storage[: self.local_rows * self.dim].view(
-                self.local_rows, self.dim
-            )
-            scales = self.storage[self.local_rows * self.dim :].view(torch.bfloat16)
-            rows = weights[local].view(torch.float8_e4m3fn).float()
-            output = rows * scales[local].float().unsqueeze(-1)
-            output.masked_fill_(~valid.unsqueeze(-1), 0)
-        return output
+        indices = hashes[:, self.head_start : self.head_end].long().contiguous()
+        local = indices - self.vocab_start
+        valid = (local >= 0) & (local < self.local_rows)
+        local = torch.where(valid, local, 0)
+        weights = self.storage[: self.local_rows * self.dim].view(
+            self.local_rows, self.dim
+        )
+        scales = self.storage[self.local_rows * self.dim :].view(torch.bfloat16)
+        rows = weights[local].view(torch.float8_e4m3fn).float()
+        output = rows * scales[local].float().unsqueeze(-1)
+        return output.masked_fill_(~valid.unsqueeze(-1), 0)
 
 
 class FlashEngram(nn.Module):
@@ -329,7 +518,43 @@ class FlashEngram(nn.Module):
             parameter, value if self.rank == 0 else torch.zeros_like(value)
         )
 
-    def forward(self, hidden, hashes):
+    def forward(self, hidden: torch.Tensor, hashes: torch.Tensor) -> torch.Tensor:
+        if not hidden.is_cuda:
+            return self.forward_native(hidden, hashes)
+        num_tokens = hidden.shape[0]
+        if num_tokens == 0:
+            return hidden
+
+        local = self.multi_head_embedding
+        x = hidden.new_empty((num_tokens, self.stop - self.start))
+        torch.ops.vllm.hy4_flash_engram_gather(
+            hashes,
+            x,
+            local.layer_name,
+            [norm.weight for norm in self.lookup_per_head_norms],
+        )
+        keys = [self._project(proj, x) for proj in self.key_projs]
+        value = self._project(self.value_proj, x)
+        return torch.ops.vllm.hy4_flash_engram_apply(
+            hidden,
+            hashes,
+            keys,
+            value,
+            [norm.weight for norm in self.norm_key],
+            [norm.weight for norm in self.norm_query],
+            self.unified_pre_gamma,
+            list(self.unified_per_hc_scales),
+        )
+
+    def _project(self, projection: nn.Linear, x: torch.Tensor) -> torch.Tensor:
+        result = projection(x)
+        if self.multi_head_embedding.tp_size > 1:
+            result = tensor_model_parallel_all_reduce(result)
+        return result
+
+    def forward_native(
+        self, hidden: torch.Tensor, hashes: torch.Tensor
+    ) -> torch.Tensor:
         local = self.multi_head_embedding
         rows = local(hashes).to(torch.bfloat16).float()
         eps = torch.finfo(torch.float32).eps
@@ -346,10 +571,7 @@ class FlashEngram(nn.Module):
         )
         gates = []
         for channel in range(self.hc_mult):
-            key = self.key_projs[channel](x)
-            if local.tp_size > 1:
-                key = tensor_model_parallel_all_reduce(key)
-            key = key.float()
+            key = self._project(self.key_projs[channel], x).float()
             query = hidden[:, channel].float()
             key = key * (key.square().mean(-1, keepdim=True) + eps).rsqrt()
             query = query * (query.square().mean(-1, keepdim=True) + eps).rsqrt()
@@ -358,10 +580,7 @@ class FlashEngram(nn.Module):
             gate = (key * query).sum(-1) * self.hidden_size**-0.5
             gates.append((gate.abs().clamp_min(1e-6).sqrt() * gate.sign()).sigmoid())
         gate = torch.stack(gates, dim=1)
-        value = self.value_proj(x)
-        if local.tp_size > 1:
-            value = tensor_model_parallel_all_reduce(value)
-        value = value.float()
+        value = self._project(self.value_proj, x).float()
         signal = (
             self.unified_pre_gamma.float()
             * value

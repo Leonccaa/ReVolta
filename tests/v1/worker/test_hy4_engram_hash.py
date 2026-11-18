@@ -101,6 +101,17 @@ def test_chunks_match_full_sequence():
     torch.testing.assert_close(torch.cat(pieces, dim=1), full, rtol=0, atol=0)
 
 
+def test_negative_and_padded_input():
+    _, maps, sizes, multipliers, primes, offsets = make_case()
+    starts = torch.tensor([0, 2, 2], dtype=torch.int32)
+    history = torch.tensor([[3, 3], [3, 3]], dtype=torch.int32)
+    args = (starts, history, maps, sizes, multipliers, primes, offsets)
+    actual = hash_ngrams_torch(torch.tensor([-1, 4, 3]), *args, 3, 2)
+    expected = hash_ngrams_torch(torch.tensor([3, 4, 3]), *args, 3, 2)
+    torch.testing.assert_close(actual[:, 1:], expected[:, 1:], rtol=0, atol=0)
+    assert (actual[:, 2] == -1).all()
+
+
 def test_hash_state_loads_each_layer_and_writes_output(monkeypatch):
     refs, maps, sizes, multipliers, primes, offsets = make_case()
     layers = (2, 12, 22, 32)

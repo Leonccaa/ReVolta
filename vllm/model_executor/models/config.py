@@ -248,6 +248,22 @@ class DeepseekV4ForCausalLMConfig(VerifyAndUpdateConfig):
                 )
 
 
+class HYV4FlashForCausalLMConfig(VerifyAndUpdateConfig):
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        from vllm.config.compilation import CompilationMode, CUDAGraphMode
+        from vllm.config.vllm import OptimizationLevel
+
+        compilation = vllm_config.compilation_config
+        if compilation.mode is None:
+            compilation.mode = CompilationMode.NONE
+        if (
+            compilation.cudagraph_mode is None
+            and vllm_config.optimization_level != OptimizationLevel.O0
+        ):
+            compilation.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+
+
 class GptOssForCausalLMConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
@@ -846,6 +862,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "GteModel": SnowflakeGteNewModelConfig,
     "GteNewForSequenceClassification": GteNewModelConfig,
     "GteNewModel": GteNewModelConfig,
+    "HYV4FlashForCausalLM": HYV4FlashForCausalLMConfig,
     "JambaForSequenceClassification": JambaForSequenceClassificationConfig,
     "JinaForRanking": JinaForRankingConfig,
     "JinaVLForRanking": JinaVLForSequenceClassificationConfig,

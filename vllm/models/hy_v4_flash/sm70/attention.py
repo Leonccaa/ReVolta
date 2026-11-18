@@ -23,6 +23,7 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
 
 from .cache import POOL_PAGE, FlashCache, FlashMetadata, FlashSWABackend
+from .decode import decode_slots
 from .indexpool import FlashCompressedIndexer
 from .kernels import paged_attention, paged_attention_torch
 from .rotary import apply_rotary, rotary_phases
@@ -177,35 +178,40 @@ class HYV4FlashAttention(nn.Module):
         cache = self.attn.kv_cache
         page = cache.shape[1]
         indices = self.topk_indices_buffer[:tokens, : self.width]
-        if self.indexer is not None:
-            self.indexer(
-                hidden_states[:tokens],
-                q_c[:tokens],
-                positions[:tokens],
-                self.inv_freq,
-                cos[:tokens],
-                sin[:tokens],
-                metadata[self.indexer.k_cache.prefix],
-                metadata[self.indexer.tail_cache.prefix],
-                indices,
-            )
-        elif self.is_window_layer:
-            for begin, end, prefix, length in main.spans:
-                indices[begin:end] = window_indices(
-                    torch.arange(prefix, length, device=q.device),
-                    self.window,
-                )
-        # Both selectors return compact, increasing logical slots with -1 padding.
-        # Translate in place using the main cache table (not the IndexPool table).
-        counts = torch.empty(tokens, dtype=torch.int32, device=q.device)
-        for req, (begin, end, _, _) in enumerate(main.spans):
-            rows = indices[begin:end]
-            live = rows >= 0
-            counts[begin:end] = live.sum(dim=-1, dtype=torch.int32)
-            blocks = main.block_table[req][rows.clamp_min(0) // page]
-            rows.copy_((blocks * page + rows % page).masked_fill(~live, -1))
-
         slots = main.slot_mapping[:tokens]
+        if q.is_cuda and main.decode:
+            counts = main.counts
+            assert counts is not None
+            groups = None
+            ratio = 1
+            if self.indexer is not None:
+                ratio = self.indexer.ratio
+                groups = self.indexer.decode_groups(
+                    hidden_states[:tokens],
+                    q_c[:tokens],
+                    positions[:tokens],
+                    self.inv_freq,
+                    cos[:tokens],
+                    sin[:tokens],
+                    metadata[self.indexer.k_cache.prefix],
+                    metadata[self.indexer.tail_cache.prefix],
+                    slots,
+                )
+            counts = counts[:tokens]
+            decode_slots(
+                main.seq_lens,
+                slots,
+                main.block_table,
+                groups,
+                indices,
+                counts,
+                page,
+                ratio,
+            )
+        else:
+            counts = self._eager_slots(
+                hidden_states, q_c, positions, cos, sin, metadata, indices, page
+            )
         if q.is_cuda:
             ops.concat_and_cache_mla(
                 kv_c[:tokens], k_pe[:tokens], cache, slots, "auto", self._k_scale
@@ -225,6 +231,49 @@ class HYV4FlashAttention(nn.Module):
             self.scaling,
             self.kv_lora_rank,
         )
+
+    def _eager_slots(
+        self,
+        hidden_states: torch.Tensor,
+        q_c: torch.Tensor,
+        positions: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        metadata: dict[str, FlashMetadata],
+        indices: torch.Tensor,
+        page: int,
+    ) -> torch.Tensor:
+        main = metadata[self.attn.prefix]
+        tokens = main.num_actual_tokens
+        if self.indexer is not None:
+            self.indexer(
+                hidden_states[:tokens],
+                q_c[:tokens],
+                positions[:tokens],
+                self.inv_freq,
+                cos[:tokens],
+                sin[:tokens],
+                metadata[self.indexer.k_cache.prefix],
+                metadata[self.indexer.tail_cache.prefix],
+                indices,
+            )
+        elif self.is_window_layer:
+            for begin, end, prefix, length in main.spans:
+                indices[begin:end] = window_indices(
+                    torch.arange(prefix, length, device=indices.device),
+                    self.window,
+                )
+        # Both selectors return compact, increasing logical slots with -1 padding.
+        # Translate in place using the main cache table (not the IndexPool table).
+        counts = torch.empty(tokens, dtype=torch.int32, device=indices.device)
+        for req, (begin, end, _, _) in enumerate(main.spans):
+            rows = indices[begin:end]
+            live = rows >= 0
+            counts[begin:end] = live.sum(dim=-1, dtype=torch.int32)
+            blocks = main.block_table[req][rows.clamp_min(0) // page]
+            rows.copy_((blocks * page + rows % page).masked_fill(~live, -1))
+
+        return counts
 
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor

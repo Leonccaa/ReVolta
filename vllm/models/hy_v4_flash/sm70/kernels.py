@@ -139,10 +139,13 @@ def _index_scores(
     Pool,
     Table,
     Logits,
+    Lengths,
+    Slots,
     stride_qt,
     stride_qh,
     stride_pool_p,
     stride_pool_g,
+    stride_table,
     FIRST,
     HEADS: tl.constexpr,
     DIM: tl.constexpr,
@@ -150,38 +153,52 @@ def _index_scores(
     PAGES_PER_BLOCK: tl.constexpr,
     GROUPS,
     RATIO: tl.constexpr,
+    GROUP_TOPK: tl.constexpr,
     H: tl.constexpr,
     N: tl.constexpr,
+    DECODE: tl.constexpr,
 ):
     # Weighted ReLU head-sum as in the DeepSeek V4 SM70 indexer, with
     # plain FP16 pages in place of software-decoded FP8 keys.
     row = tl.program_id(0)
     head = tl.arange(0, H)
     d = tl.arange(0, DIM)
-    g = tl.program_id(1) * N + tl.arange(0, N)
-    upper = (FIRST + row) // RATIO
-    logical_page = g // PAGE
-    page = tl.load(Table + logical_page // PAGES_PER_BLOCK, g < upper, other=0)
-    page = page * PAGES_PER_BLOCK + logical_page % PAGES_PER_BLOCK
-    k = tl.load(
-        Pool
-        + page[:, None].to(tl.int64) * stride_pool_p
-        + (g % PAGE)[:, None] * stride_pool_g
-        + d[None, :],
-        g[:, None] < upper,
-        other=0,
-    )
-    q = tl.load(
-        Q + row * stride_qt + head[:, None] * stride_qh + d[None, :],
-        head[:, None] < HEADS,
-        other=0,
-    )
-    w = tl.load(W + row * HEADS + head, head < HEADS, other=0)
-    scores = tl.maximum(tl.dot(q, tl.trans(k)), 0.0)
-    logits = tl.sum(scores * w[:, None], axis=0)
+    start = tl.program_id(1) * N
+    g = start + tl.arange(0, N)
+    if DECODE:
+        length = tl.load(Lengths + row)
+        active = (tl.load(Slots + row) >= 0) & (length > GROUP_TOPK * RATIO)
+        upper = tl.where(active, (length - 1) // RATIO, 0)
+    else:
+        upper = (FIRST + row) // RATIO
+    logits = tl.full((N,), float("-inf"), tl.float32)
+    if not DECODE or start < upper:
+        logical_page = g // PAGE
+        page = tl.load(
+            Table + row * stride_table + logical_page // PAGES_PER_BLOCK,
+            g < upper,
+            other=0,
+        )
+        page = page * PAGES_PER_BLOCK + logical_page % PAGES_PER_BLOCK
+        k = tl.load(
+            Pool
+            + page[:, None].to(tl.int64) * stride_pool_p
+            + (g % PAGE)[:, None] * stride_pool_g
+            + d[None, :],
+            g[:, None] < upper,
+            other=0,
+        )
+        q = tl.load(
+            Q + row * stride_qt + head[:, None] * stride_qh + d[None, :],
+            head[:, None] < HEADS,
+            other=0,
+        )
+        w = tl.load(W + row * HEADS + head, head < HEADS, other=0)
+        scores = tl.maximum(tl.dot(q, tl.trans(k)), 0.0)
+        logits = tl.where(g < upper, tl.sum(scores * w[:, None], axis=0), float("-inf"))
     tl.store(
         Logits + row * GROUPS + g,
-        tl.where(g < upper, logits, float("-inf")),
+        logits,
         g < GROUPS,
     )
 
@@ -195,18 +212,27 @@ def index_scores(
     groups: int,
     ratio: int,
     pages_per_block: int,
+    *,
+    logits: torch.Tensor | None = None,
+    lengths: torch.Tensor | None = None,
+    slots: torch.Tensor | None = None,
+    group_topk: int = 0,
 ) -> torch.Tensor:
-    logits = q.new_empty((q.shape[0], groups), dtype=torch.float32)
+    if logits is None:
+        logits = q.new_empty((q.shape[0], groups), dtype=torch.float32)
     _index_scores[(q.shape[0], triton.cdiv(groups, 64))](
         q,
         weights,
         pool,
         table,
         logits,
+        lengths,
+        slots,
         q.stride(0),
         q.stride(1),
         pool.stride(0),
         pool.stride(1),
+        table.stride(0) if lengths is not None else 0,
         first,
         q.shape[1],
         q.shape[2],
@@ -214,8 +240,10 @@ def index_scores(
         pages_per_block,
         groups,
         ratio,
+        group_topk,
         max(16, triton.next_power_of_2(q.shape[1])),
         64,
+        lengths is not None,
         num_warps=4,
     )
     return logits

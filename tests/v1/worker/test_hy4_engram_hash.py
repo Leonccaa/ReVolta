@@ -106,7 +106,9 @@ def test_negative_and_padded_input():
     starts = torch.tensor([0, 2, 2], dtype=torch.int32)
     history = torch.tensor([[3, 3], [3, 3]], dtype=torch.int32)
     args = (starts, history, maps, sizes, multipliers, primes, offsets)
-    actual = hash_ngrams_torch(torch.tensor([-1, 4, 3]), *args, 3, 2)
+    # The captured token count includes padding. The device offsets give the
+    # real end even when the padded input is a non-pad ID from a previous step.
+    actual = hash_ngrams_torch(torch.tensor([-1, 4, 7]), *args, 3, 3)
     expected = hash_ngrams_torch(torch.tensor([3, 4, 3]), *args, 3, 2)
     torch.testing.assert_close(actual[:, 1:], expected[:, 1:], rtol=0, atol=0)
     assert (actual[:, 2] == -1).all()
@@ -161,10 +163,10 @@ def test_hash_state_loads_each_layer_and_writes_output(monkeypatch):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_triton_matches_cpu():
     _, maps, sizes, multipliers, primes, offsets = make_case()
-    tokens = torch.tensor([4, 31, 35, 3, 8, 10, 1, 16, 3, 30, 38, 3], dtype=torch.int32)
+    tokens = torch.tensor([4, 31, 35, 3, 8, 10, 1, 16, 3, 30, 38, 8], dtype=torch.int32)
     starts = torch.tensor([0, 7, 11, 11], dtype=torch.int32)
     history = torch.tensor([[3, 3], [29, 34], [3, 3]], dtype=torch.int32)
     args = (tokens, starts, history, maps, sizes, multipliers, primes, offsets)
     expected = hash_ngrams_torch(*args, 3, 11)
-    result = hash_ngrams_triton(*(arg.cuda() for arg in args), 3, 11)
+    result = hash_ngrams_triton(*(arg.cuda() for arg in args), 3, 12)
     torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)

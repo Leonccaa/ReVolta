@@ -1,14 +1,15 @@
 # Dynamic Speculative Decoding
 
-Dynamic speculative decoding (DSD) changes the number of MTP draft tokens
+Dynamic speculative decoding (DSD) changes the number of published draft tokens
 per request as the scheduled batch size changes. A fully active decode
 batch with `C` requests and `K` drafts per request has `C × (K + 1)`
 verification rows. A smaller K can reduce verification work and skip
-draft forwards at higher concurrency.
+MTP draft forwards at higher concurrency.
 
-The ReVolta target configuration is MRv2 MTP on four V100s with TP4, DP1
-and PP1. GDN models require `--mamba-cache-mode align`. This profile's
-recommended thresholds are pending TP4 measurements.
+The ReVolta target configurations use MRv2 with MTP or DFlash (including
+DFlash2) on four V100s with TP4, DP1 and PP1. Hybrid MTP requires
+`--mamba-cache-mode align`. The thresholds for the MTP example below are
+pending TP4 measurements.
 
 ## Configuration
 
@@ -30,18 +31,22 @@ The scheduler counts requests with tokens scheduled in the current step.
 This includes prefill and decode. The chosen K controls the proposal for
 the next step. Current verification uses the drafts already published
 for each request, subject to the existing scheduling limits. At K=0,
-the MTP first forward updates draft KV and publishes zero drafts.
+both methods publish zero drafts. MTP updates draft KV in its first forward.
+DFlash still runs its full proposal, including the context KV update.
 
 The field can be omitted or set to `null` for fixed K. With DP greater
-than 1, the engine logs a message and uses fixed K. The DFlash2 field
-`dflash_concurrency_drafts` belongs to the DFlash method and is mutually
-exclusive with the MTP schedule.
+than 1, the engine logs a message and uses fixed K. With DFlash, the
+deprecated `dflash_concurrency_drafts` alias maps to the same schedule for
+one release. Set only one field. DSD is incompatible with legacy
+`ngram_assist`. The [DFlash2 setup](dflash2.md#settings) gives an example
+schedule and the async conditions.
 
 With FULL decode graphs enabled, ReVolta captures reachable narrower
 query widths for target verification and the first MTP forward at the
-existing request capture sizes. Later draft forwards share the existing
-single-step graphs. Batch shapes outside the capture grid follow the
-existing graph dispatch.
+existing request capture sizes. Later MTP draft forwards share the existing
+single-step graphs. DFlash captures narrower target widths at the request
+counts assigned to them by the schedule and keeps its existing drafter
+graphs. Batch shapes outside the capture grid follow the existing graph dispatch.
 
 Adapted from [vLLM #32374](https://github.com/vllm-project/vllm/pull/32374)
 and [vLLM #57053](https://github.com/vllm-project/vllm/pull/57053).

@@ -1466,18 +1466,23 @@ def test_align_cache_spec_uses_current_state_ids_and_accepted_slot(
     assert _effective_spec_initial_state_slots(meta) == [33]
 
 
-def test_dynamic_mtp_align_width_switch_keeps_previous_accepted_state(local_gdn_model):
+@pytest.mark.parametrize(("method", "wide_q"), [("mtp", 5), ("dflash", 8)])
+def test_dynamic_align_width_switch_keeps_previous_accepted_state(
+    local_gdn_model, method, wide_q
+):
     builder = _create_gdn_builder(
         local_gdn_model,
-        num_speculative_tokens=4,
+        num_speculative_tokens=wide_q - 1,
         mamba_cache_mode="align",
         use_full_cuda_graph=True,
         max_cudagraph_capture_size=8,
+        speculative_method=method,
     )
-    state_ids = torch.tensor([[30, 31, 32, 33, 34]], dtype=torch.int32)
-    block_table = torch.tensor([[0, 0, 30, 31, 32, 33, 34]], dtype=torch.int32)
+    slots = list(range(30, 30 + wide_q))
+    state_ids = torch.tensor([slots], dtype=torch.int32)
+    block_table = torch.tensor([[0, 0, *slots]], dtype=torch.int32)
     spec_ptr = None
-    for q, accepted in [(5, 1), (4, 5), (1, 4), (5, 1)]:
+    for q, accepted in [(wide_q, 1), (4, wide_q), (1, 4), (wide_q, 1)]:
         common = create_common_attn_metadata(
             BatchSpec(seq_lens=[33], query_lens=[q]), BLOCK_SIZE, DEVICE
         ).replace(block_table_tensor=block_table)
@@ -1496,7 +1501,7 @@ def test_dynamic_mtp_align_width_switch_keeps_previous_accepted_state(local_gdn_
             continue
         table = meta.spec_state_indices_tensor
         assert _effective_spec_initial_state_slots(meta)[0] == 29 + accepted
-        assert table[0].tolist() == [30, 31, 32, 33, 34]
+        assert table[0].tolist() == slots
         assert table.data_ptr() == capture.spec_state_indices_tensor.data_ptr()
         if spec_ptr is None:
             spec_ptr = table.data_ptr()

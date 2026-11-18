@@ -18,6 +18,7 @@ import vllm.v1.worker.gpu.attn_utils as attn_utils
 import vllm.v1.worker.gpu.spec_decode.dflash.speculator as dflash_speculator
 import vllm.v1.worker.gpu.spec_decode.dflash.utils as dflash_utils
 from vllm import envs
+from vllm.config.compilation import CUDAGraphMode
 from vllm.config.sm70_dflash2 import SM70_DFLASH2_LEGACY_FIELDS, Sm70DFlash2Config
 from vllm.config.speculative import (
     SpeculativeConfig,
@@ -2087,7 +2088,10 @@ def test_dflash_context_only_prefill_requires_every_live_request(mask, expected)
     assert dflash_speculator._is_context_only_prefill(batch) is expected
 
 
-def test_dflash_intermediate_prefill_materializes_context_without_query(monkeypatch):
+@pytest.mark.parametrize("intermediate_prefill", [True, False])
+def test_dflash_materializes_context_and_keeps_query_width(
+    monkeypatch, intermediate_prefill
+):
     prepare_inputs = Mock()
     monkeypatch.setattr(dflash_speculator, "prepare_dflash_inputs", prepare_inputs)
 
@@ -2123,10 +2127,20 @@ def test_dflash_intermediate_prefill_materializes_context_without_query(monkeypa
     speculator._context_slot_mappings = torch.zeros(1, 8, dtype=torch.int64)
     speculator._query_slot_mappings = torch.zeros(1, 8, dtype=torch.int64)
     speculator._layer_group_idx = None
+    speculator._debug_tensor_dump_dir = None
     speculator._context_only_prefill_logged = False
-    speculator._prepare_ngram_assist = Mock(
-        side_effect=AssertionError("ngram lookup must not run mid-prefill")
+    speculator._prepare_ngram_assist = Mock(return_value=False)
+    speculator.query_cudagraph_manager = Mock()
+    speculator._refresh_draft_graph_metadata = Mock(return_value=True)
+    speculator.dp_size = 1
+    speculator.dp_rank = 0
+    dispatch = Mock(
+        return_value=(
+            SimpleNamespace(num_reqs=1, num_tokens=8, cg_mode=CUDAGraphMode.FULL),
+            None,
+        )
     )
+    monkeypatch.setattr(dflash_speculator, "dispatch_cg_and_sync_dp", dispatch)
     speculator.model = SimpleNamespace(
         precompute_and_store_context_kv=Mock(),
     )
@@ -2135,7 +2149,7 @@ def test_dflash_intermediate_prefill_materializes_context_without_query(monkeypa
         num_reqs=1,
         num_tokens=4,
         seq_lens_cpu_upper_bound=torch.tensor([4], dtype=torch.int32),
-        is_incomplete_prefilling_np=np.array([True], dtype=np.bool_),
+        is_incomplete_prefilling_np=np.array([intermediate_prefill], dtype=np.bool_),
     )
     output = speculator.propose(
         input_batch=input_batch,
@@ -2149,6 +2163,7 @@ def test_dflash_intermediate_prefill_materializes_context_without_query(monkeypa
         next_prefill_tokens=torch.zeros(1, dtype=torch.int64),
         temperature=torch.ones(1),
         seeds=torch.zeros(1, dtype=torch.int64),
+        num_speculative_tokens=0,
     )
 
     prepare_inputs.assert_called_once()
@@ -2157,7 +2172,15 @@ def test_dflash_intermediate_prefill_materializes_context_without_query(monkeypa
         speculator.hidden_states[:4],
         torch.arange(12, dtype=torch.float32).view(4, 3),
     )
-    assert output.tolist() == [[-1] * 7]
+    if intermediate_prefill:
+        speculator._prepare_ngram_assist.assert_not_called()
+        dispatch.assert_not_called()
+        assert output.tolist() == [[-1] * 7]
+    else:
+        assert dispatch.call_args.args[1:] == (1, 8)
+        assert dispatch.call_args.kwargs["uniform_token_count"] == 8
+        speculator.query_cudagraph_manager.run_fullgraph.assert_called_once()
+        assert output.shape == (1, 7)
 
 
 def test_noncausal_dflash_capture_binds_paged_prefix_attention(monkeypatch):

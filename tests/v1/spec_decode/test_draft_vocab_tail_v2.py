@@ -5,6 +5,7 @@
 import ast
 import inspect
 from collections import OrderedDict
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -922,10 +923,21 @@ def test_speculator_enabled_initialization_and_sampling(
     update.assert_called_once_with(sampled, counts, 4, mapping)
 
 
-@pytest.mark.parametrize(("with_tail", "k"), [(False, 4), (True, 3), (True, 0)])
-def test_runner_actual_call_order(monkeypatch, with_tail, k):
+@pytest.mark.parametrize(
+    ("method", "with_tail", "k", "structured"),
+    [
+        ("mtp", False, 4, False),
+        ("mtp", True, 3, False),
+        ("mtp", True, 0, False),
+        ("dflash", False, None, False),
+        ("dflash", False, 3, False),
+        ("dflash", False, 3, True),
+        ("dflash", False, 0, True),
+    ],
+)
+def test_runner_actual_call_order(monkeypatch, method, with_tail, k, structured):
     from vllm.v1.worker.gpu import model_runner as runner_mod
-    from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
+    from vllm.v1.worker.gpu.spec_decode import utils
 
     calls = []
     runner = object.__new__(runner_mod.GPUModelRunner)
@@ -939,7 +951,7 @@ def test_runner_actual_call_order(monkeypatch, with_tail, k):
         idx_mapping=torch.tensor([0]),
         num_reqs=1,
         query_start_loc=torch.tensor([0, 1]),
-        has_structured_output_reqs=False,
+        has_structured_output_reqs=structured,
     )
     runner.execute_model_state = SimpleNamespace(
         input_batch=batch,
@@ -948,7 +960,7 @@ def test_runner_actual_call_order(monkeypatch, with_tail, k):
         hidden_states=torch.zeros(1, 4),
         aux_hidden_states=None,
         finished_req_ids=set(),
-        num_spec_tokens_to_schedule=k,
+        num_spec_tokens_to_schedule=4 if k is None else k,
     )
     runner._sm70_v2_mtp_profile_pending = None
     runner._sm70_v2_mtp_profile_start = Mock(return_value=None)
@@ -984,14 +996,27 @@ def test_runner_actual_call_order(monkeypatch, with_tail, k):
     runner.rejection_sampler = None
     runner.postprocess_sampled = lambda *args: calls.append("postprocess")
 
-    def propose(*args, num_speculative_tokens, **kwargs):
+    def propose(*args, **kwargs):
         calls.append("propose")
-        assert num_speculative_tokens == k
+        assert ("num_speculative_tokens" in kwargs) == (k is not None)
+        assert kwargs.get("num_speculative_tokens") == k
         return torch.tensor([[20, 21, 22, 23]])
 
     runner.num_speculative_steps = 4
-    runner.speculator = object.__new__(eagle.EagleSpeculator)
-    runner.speculator.method = "mtp"
+    if method == "dflash":
+        runner.speculator = object.__new__(runner_mod.DFlash2Speculator)
+        runner.speculator.speculative_config = SimpleNamespace(
+            num_speculative_tokens_per_batch_size=None if k is None else [(1, 1, k)]
+        )
+        runner.speculator.prepare_target_context = Mock()
+        runner.speculator._lookup_enabled = False
+        if k is not None:
+            runner.speculator.next_num_draft_tokens = Mock(
+                side_effect=AssertionError("DSD already chose the publication width")
+            )
+    else:
+        runner.speculator = object.__new__(eagle.EagleSpeculator)
+    runner.speculator.method = method
     runner.speculator.supports_mm_inputs = False
     runner.speculator.propose = propose
     runner.speculator._draft_vocab_tail = None
@@ -1003,7 +1028,13 @@ def test_runner_actual_call_order(monkeypatch, with_tail, k):
             calls.append("update")
 
         runner.speculator.update_draft_vocab_tail = update
-    runner.draft_tokens_handler = object.__new__(DraftTokensHandler)
+    handler = object.__new__(utils.DraftTokensHandler)
+    runner.draft_tokens_handler = handler
+    if structured:
+        monkeypatch.setattr(torch.cuda, "current_stream", Mock())
+        monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+        monkeypatch.setattr(utils, "async_copy_to_np", lambda tensor: tensor.numpy())
+        handler.device, handler.copy_stream, handler.copy_event = None, Mock(), Mock()
     runner.pp_handler = None
     runner.kv_connector = SimpleNamespace(post_forward=Mock(return_value=None))
     runner.mixed_prefill_timer = SimpleNamespace(finish=Mock(return_value=None))
@@ -1011,10 +1042,12 @@ def test_runner_actual_call_order(monkeypatch, with_tail, k):
     runner.eplb = SimpleNamespace(step=Mock())
     monkeypatch.setattr(runner_mod, "AsyncOutput", lambda **kwargs: SimpleNamespace())
     runner.sample_tokens(None)
-    assert runner.req_states.draft_tokens.tolist() == [
-        list(range(20, 20 + k)) + [-1] * (4 - k)
+    width = 4 if k is None else k
+    prefix = list(range(20, 20 + width))
+    assert runner.req_states.draft_tokens.tolist() == [prefix + [-1] * (4 - width)]
+    assert runner.take_draft_token_ids().draft_token_ids == [
+        prefix if structured else [-1] * width
     ]
-    assert runner.draft_tokens_handler.get_draft_tokens().draft_token_ids == [[-1] * k]
     assert calls == (
         ["sample", "postprocess", "update", "propose"]
         if with_tail

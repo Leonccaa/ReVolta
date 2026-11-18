@@ -207,7 +207,6 @@ class DecodeChain:
         self.spec = object.__new__(DFlash2Speculator)
         self.spec.speculative_config = config.speculative_config
         self.spec.num_speculative_steps = self.spec.draft_block = 7
-        self.spec._running_reqs = 0
         self.spec._lookup_enabled = False
         self.spec._debug_real_proposal = True
         self.spec._native_lookup = (
@@ -354,7 +353,7 @@ class DecodeChain:
             states.num_computed_tokens.gpu[batch.idx_mapping].tolist()
             == expected_computed
         )
-        self.propose(batch, counts, rejected)
+        self.propose(batch, counts, output.num_spec_tokens_to_schedule)
         model_output = ModelRunnerOutput(
             req_ids=batch.req_ids,
             req_id_to_index={name: i for i, name in enumerate(batch.req_ids)},
@@ -381,7 +380,7 @@ class DecodeChain:
             self.scheduler.update_draft_token_ids(self.runner.take_draft_token_ids())
         return engine_outputs
 
-    def propose(self, batch, counts, rejected):
+    def propose(self, batch, counts, width):
         spec, states = self.spec, self.runner.req_states
         n = batch.num_reqs
         candidates = []
@@ -416,13 +415,13 @@ class DecodeChain:
         original_scores = scores.clone() if scores is not None else None
         spec.sample_idx_mapping.fill_(-1)
         spec.sample_idx_mapping[: n * 7] = batch.idx_mapping.repeat_interleave(7)
-        spec._prepare_proposal_runtime(batch, counts, rejected)
+        spec._prepare_proposal_runtime(batch, counts, width)
         spec._apply_lookup(n)
         native = spec._native_lookup
         limit = self.config.speculative_config.dflash2_lookup.max_requests
         eligible = (
             1 <= n <= limit
-            and spec.next_num_draft_tokens() == 7
+            and width == 7
             and not batch.has_structured_output_reqs
             and not batch.is_prefilling_np[:n].any()
             and all(
@@ -479,7 +478,7 @@ class DecodeChain:
         self.runner.draft_tokens_handler.set_draft_tokens(
             batch,
             spec.draft_tokens[:n],
-            num_draft_tokens=spec.next_num_draft_tokens(),
+            num_draft_tokens=width,
         )
 
     def step(self, **kwargs):
@@ -647,7 +646,7 @@ def test_device_admission_uses_current_sample_and_space(chain_factory, reason):
     chain.propose(
         batch,
         torch.tensor([int(reason != "no_sample")], dtype=torch.int32, device=DEVICE),
-        torch.zeros(1, dtype=torch.int32, device=DEVICE),
+        record.output.num_spec_tokens_to_schedule,
     )
     states.total_len.gpu[slot] = committed
     assert not chain.spec._native_lookup.eligible.any()
@@ -765,7 +764,7 @@ def verify_rejection_round(chain, output, batch, accepted):
     assert torch.equal(
         chain.runner.model_state.postprocess_state.call_args.args[1], counts
     )
-    chain.propose(batch, counts, rejected)
+    chain.propose(batch, counts, output.num_spec_tokens_to_schedule)
     model_output = ModelRunnerOutput(
         req_ids=batch.req_ids,
         req_id_to_index={name: row for row, name in enumerate(batch.req_ids)},

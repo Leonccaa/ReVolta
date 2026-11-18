@@ -4,6 +4,7 @@
 import copy
 import math
 from dataclasses import fields
+from itertools import pairwise
 from typing import TYPE_CHECKING, Any, Literal, get_args, get_type_hints
 
 from pydantic import (
@@ -134,21 +135,6 @@ def get_dflash_model_draft_tokens(speculative_config: Any) -> int:
     if trained_tokens is not None and trained_tokens < verify_tokens:
         return trained_tokens
     return verify_tokens
-
-
-def dflash_drafts_for_requests(speculative_config: Any, num_reqs: int) -> int:
-    """Draft tokens the target verifies per request with ``num_reqs`` running.
-
-    Applies ``dflash_concurrency_drafts`` as a ladder: the entry with the largest
-    threshold not above ``num_reqs`` sets the width. Below every threshold, and
-    without a policy, this is ``num_speculative_tokens``.
-    """
-    drafts = int(getattr(speculative_config, "num_speculative_tokens", 0) or 0)
-    policy = getattr(speculative_config, "dflash_concurrency_drafts", None) or {}
-    reached = {int(t): int(w) for t, w in policy.items() if num_reqs >= int(t)}
-    if reached:
-        drafts = reached[max(reached)]
-    return drafts
 
 
 def check_dflash_concurrency_drafts(
@@ -321,15 +307,10 @@ class SpeculativeConfig:
     capability."""
 
     dflash_concurrency_drafts: dict[int, int] | None = None
-    """DFlash: verify fewer drafts per request at high concurrency, as a
-    ladder ``{min_running_requests: draft_tokens}``. Each entry holds from its
-    request count up to the next entry: ``{4: 3, 5: 4}`` verifies all drafts
-    for one to three running requests, three at four, and four from five up.
-    The drafter still proposes its trained block and the target verifies only
-    the first drafts, so a wide draft keeps its single-request acceptance
-    without paying for rejected verifier rows in large batches. Narrower target
-    decode graphs are captured for the request counts that use them. None
-    verifies ``num_speculative_tokens`` drafts at every concurrency."""
+    """Deprecated DFlash alias for ``num_speculative_tokens_per_batch_size``.
+    Each ``{min_scheduled_requests: draft_tokens}`` entry applies from its
+    threshold up to the next one. Below the first threshold, use
+    ``num_speculative_tokens``."""
 
     # Alternative drafting strategies
     parallel_drafting: bool = False
@@ -806,7 +787,7 @@ class SpeculativeConfig:
         resolved_lookup = self.__dict__.get("_lookup_resolved")
         if resolved_lookup is not None and resolved_lookup.mode == "gpu_head":
             factors.append(("dflash2_lookup", resolved_lookup.graph_options()))
-        # dflash_concurrency_drafts is left out: it only picks how many drafts
+        # DFlash's DSD schedule is left out: it only picks how many drafts
         # are verified and which uniform decode sizes get CUDA graphs; compile
         # ranges come from compilation_config, and graphs are not persisted.
         if self.sm70_dflash2.resolved and (
@@ -1855,12 +1836,36 @@ class SpeculativeConfig:
                 "Expected num_speculative_tokens to be greater "
                 f"than zero ({self.num_speculative_tokens})."
             )
-        check_dflash_concurrency_drafts(
-            self.dflash_concurrency_drafts,
-            dflash=self.use_dflash(),
-            ngram_assist=self.ngram_assist,
-            num_speculative_tokens=self.num_speculative_tokens,
-        )
+        ladder = self.dflash_concurrency_drafts
+        if ladder is not None:
+            if self.num_speculative_tokens_per_batch_size is not None:
+                raise ValueError(
+                    "Set only one of dflash_concurrency_drafts and "
+                    "num_speculative_tokens_per_batch_size."
+                )
+            check_dflash_concurrency_drafts(
+                ladder,
+                dflash=self.use_dflash(),
+                ngram_assist=self.ngram_assist,
+                num_speculative_tokens=self.num_speculative_tokens,
+            )
+            logger.warning_once(
+                "dflash_concurrency_drafts is deprecated and will be removed "
+                "after this release. Use num_speculative_tokens_per_batch_size."
+            )
+            if ladder:
+                steps = sorted(ladder.items())
+                first_threshold = steps[0][0]
+                last_threshold, last_drafts = steps[-1]
+                self.num_speculative_tokens_per_batch_size = [
+                    (1, first_threshold - 1, self.num_speculative_tokens),
+                    *[
+                        (start, next_start - 1, drafts)
+                        for (start, drafts), (next_start, _) in pairwise(steps)
+                    ],
+                    (last_threshold, last_threshold, last_drafts),
+                ]
+            self.dflash_concurrency_drafts = None
         if self.ngram_assist:
             if not self.use_dflash():
                 raise ValueError("ngram_assist is only supported with method='dflash'.")

@@ -117,6 +117,7 @@ from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.shutdown import free_before_shutdown
 from vllm.v1.worker.gpu.spec_decode import init_speculator
+from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dflash2.sparse_rejection import (
     DFlash2LogitsFallback,
     try_dflash2_sparse_target_rejection,
@@ -2229,7 +2230,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
             num_draft_tokens = None
             proposal_kwargs: dict[str, int] = {}
-            if self.speculator.method == "mtp":
+            speculator = self.speculator
+            if speculator.method == "mtp" or (
+                isinstance(speculator, DFlashSpeculator)
+                and speculator.speculative_config.num_speculative_tokens_per_batch_size
+                is not None
+            ):
                 num_draft_tokens = execute_model_state.num_spec_tokens_to_schedule
                 proposal_kwargs["num_speculative_tokens"] = num_draft_tokens
             draft_tokens = self.speculator.propose(
@@ -2274,7 +2280,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ):
                 draft_tokens[:, num_draft_tokens:] = -1
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
-            if hasattr(self.speculator, "next_num_draft_tokens"):
+            if num_draft_tokens is None and hasattr(
+                self.speculator, "next_num_draft_tokens"
+            ):
                 num_draft_tokens = self.speculator.next_num_draft_tokens()
             self.draft_tokens_handler.set_draft_tokens(
                 input_batch,

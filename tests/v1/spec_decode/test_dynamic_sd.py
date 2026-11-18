@@ -8,6 +8,7 @@ from tests.v1.core.utils import create_requests, create_scheduler
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+from vllm.v1.request import RequestStatus
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.structured_output import StructuredOutputManager
 
@@ -32,6 +33,7 @@ def _make_scheduler_with_dynamic_sd(
     max_num_batched_tokens: int = 8192,
     runtime_num_speculative_tokens: int = 3,
     async_scheduling: bool = False,
+    method="mtp",
 ) -> Scheduler:
     base_scheduler = create_scheduler(
         max_num_seqs=max_num_seqs,
@@ -41,6 +43,7 @@ def _make_scheduler_with_dynamic_sd(
 
     speculative_config = base_scheduler.vllm_config.speculative_config
     assert speculative_config is not None
+    speculative_config.method = method
     speculative_config.num_speculative_tokens_per_batch_size = schedule
 
     scheduler_cls = AsyncScheduler if async_scheduling else Scheduler
@@ -229,11 +232,13 @@ def test_scheduler_uses_scheduled_count_after_budget_truncates_verification():
     assert next_output.num_spec_tokens_to_schedule == 4
 
 
-def test_async_scheduler_reserves_new_width_and_counts_previous_width():
+@pytest.mark.parametrize("method", ["mtp", "dflash"])
+def test_async_scheduler_reserves_new_width_and_counts_previous_width(method):
     scheduler = _make_scheduler_with_dynamic_sd(
         [(1, 1, 4), (2, 2, 3), (3, 3, 0)],
         runtime_num_speculative_tokens=4,
         async_scheduling=True,
+        method=method,
     )
     reqs = create_requests(3)
     scheduler.add_request(reqs[0])
@@ -256,3 +261,12 @@ def test_async_scheduler_reserves_new_width_and_counts_previous_width():
         req.request_id: [-1] * 3 for req in reqs[:2]
     }
     assert all(req.spec_token_ids == [] for req in reqs)
+
+    scheduler.finish_requests(
+        [req.request_id for req in reqs[1:]], RequestStatus.FINISHED_ABORTED
+    )
+    fourth = scheduler.schedule()
+    assert fourth.num_scheduled_tokens == {reqs[0].request_id: 1}
+    assert fourth.scheduled_spec_decode_tokens == {}
+    assert fourth.num_spec_tokens_to_schedule == 4
+    assert reqs[0].spec_token_ids == [-1] * 4

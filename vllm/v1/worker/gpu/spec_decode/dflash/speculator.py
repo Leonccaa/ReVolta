@@ -10,10 +10,7 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
-from vllm.config.speculative import (
-    dflash_drafts_for_requests,
-    get_dflash_model_draft_tokens,
-)
+from vllm.config.speculative import get_dflash_model_draft_tokens
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_rank
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
@@ -54,9 +51,6 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         # Multimodal inputs not currently supported.
         self.supports_mm_inputs = False
-        # Running requests of the current proposal, for the verification width
-        # policy (dflash_concurrency_drafts).
-        self._running_reqs = 0
 
         # A lookup-augmented DFlash2 proposal may be wider than the checkpoint
         # block. The model still emits only its trained block; lookup fills the
@@ -519,17 +513,9 @@ class DFlashSpeculator(DraftModelSpeculator):
         self,
         input_batch: InputBatch,
         num_sampled: torch.Tensor,
-        num_rejected: torch.Tensor,
+        num_speculative_tokens: int | None = None,
     ) -> None:
         """Refresh optional proposal-controller state before graph replay."""
-        self._running_reqs = input_batch.num_reqs
-
-    def next_num_draft_tokens(self) -> int | None:
-        """Drafts the target verifies next step under
-        ``dflash_concurrency_drafts``; None keeps the full proposal."""
-        if not getattr(self.speculative_config, "dflash_concurrency_drafts", None):
-            return None
-        return dflash_drafts_for_requests(self.speculative_config, self._running_reqs)
 
     def _apply_ngram_assist(self, num_reqs: int) -> None:
         """Override model proposals for ngram-hit rows, if configured."""
@@ -571,6 +557,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         sampled_token_ids_cpu: np.ndarray | None = None,
         num_sampled_tokens_cpu: np.ndarray | None = None,
         all_token_ids_cpu: np.ndarray | None = None,
+        num_speculative_tokens: int | None = None,
     ) -> torch.Tensor:
         num_reqs = input_batch.num_reqs
         num_target_tokens = input_batch.num_tokens
@@ -580,7 +567,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             max_seq_len + self.num_query_per_req, self.max_model_len
         )
         self._debug_real_proposal = not dummy_run and not is_profile
-        self._prepare_proposal_runtime(input_batch, num_sampled, num_rejected)
+        self._prepare_proposal_runtime(input_batch, num_sampled, num_speculative_tokens)
 
         # NOTE: To avoid CPU-GPU synchronization without CPU knowing the
         # number of rejected tokens, we maintain the size of input_ids and

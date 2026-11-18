@@ -17,7 +17,6 @@ from vllm.compilation.sm70_decode_graph import sm70_decode_graph_compilation
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.config.speculative import (
-    dflash_drafts_for_requests,
     get_dflash_model_draft_tokens,
     uses_adaptive_dflash_lookup,
 )
@@ -276,24 +275,24 @@ class CudaGraphManager:
                 "Capturing SM70 DFlash2 target tail query lengths %s.",
                 self.decode_query_lens,
             )
-        # DFlash concurrency widths (dflash_concurrency_drafts): the target
-        # verifies a narrower uniform batch for some request counts, so capture
-        # those multi-request decode shapes, and only for the counts that use
-        # them (the same resolver the speculator applies at run time). The
-        # drafter keeps its block.
+        # Only the target captures narrower DFlash widths, at the batch sizes
+        # that the scheduler selects for each width.
         self._dflash_width_reqs: dict[int, frozenset[int]] = {}
-        policy = (
-            getattr(speculative_config, "dflash_concurrency_drafts", None)
+        dflash_schedule = (
+            speculative_config.num_speculative_tokens_per_batch_size
             if speculative_config is not None
             and speculative_config.method == "dflash"
             and isinstance(self, ModelCudaGraphManager)
             else None
         )
-        if policy:
+        if dflash_schedule is not None:
+            lookup = build_dynamic_sd_schedule_lookup(
+                dflash_schedule, self.max_num_reqs, decode_query_len - 1
+            )
             width_reqs: dict[int, set[int]] = defaultdict(set)
-            for num_reqs in range(2, self.max_num_reqs + 1):
-                query_len = dflash_drafts_for_requests(speculative_config, num_reqs) + 1
-                if 1 < query_len < decode_query_len:
+            for num_reqs, k in enumerate(lookup[1:], start=1):
+                query_len = k + 1
+                if query_len < decode_query_len:
                     width_reqs[query_len].add(num_reqs)
             self._dflash_width_reqs = {q: frozenset(r) for q, r in width_reqs.items()}
         if self._dflash_width_reqs:

@@ -43,6 +43,8 @@ Versions, power caps and the per-method breakdown are in [Performance](docs/perf
 
 In the AWQ and standard NVFP4 checkpoints only the routed experts are 4-bit: the PLE tables are FP8, and all other weights (attention, shared experts, embeddings, `lm_head` and the vision tower) stay BF16. NVIDIA FP4-Local is quantized further: its PLE table and parts of the vision tower and MTP layer are NVFP4, and its attention projections and shared experts are MXFP8; its `lm_head` stays BF16. V100 has no BF16 units, so ReVolta runs BF16 weights in FP16 (`--dtype half`). Bits per weight include quantization scales and zero points and exclude the MTP draft; the whole-model figure covers all 177 billion stored parameters, 51 billion of them in the PLE tables.
 
+**Hy4-flash (validation support, 0.2.0rc13):** text-only [tencent/Hy4-flash](https://huggingface.co/tencent/Hy4-flash) runs on four V100 32 GB GPUs with the [AWQ g32 checkpoint](https://huggingface.co/leoncca/Hy4-flash-AWQ-g32), FP8 attention KV and optional decode context parallelism up to 512K tokens. Support is frozen at this release. See [Hy4-flash](docs/hy4-flash.md).
+
 GPU KV pools use the recommended setup for each checkpoint (E4M3 target and draft KV, 512K, 8 sequences). Quality is measured with an E4M3 KV cache on 66 English, Chinese and code records against each checkpoint's own BF16 parent; method and other datasets are in [Quality measurements](docs/performance.md#quality-measurements). Test status, pinned revisions and preparation steps for each checkpoint are in [Checkpoints](docs/checkpoints.md).
 
 ## Quick start
@@ -80,6 +82,7 @@ For another checkpoint, use its [preparation guide](docs/checkpoints.md) before 
 | Look up deployment settings, sampling and memory budgets | [Configuration](docs/configuration.md) |
 | Compare measured speed, KV capacity and quantization quality | [Performance](docs/performance.md) |
 | Check support scope and limitations | [Known limits](docs/known-limits.md) |
+| Run Hy4-flash (validation support) | [Hy4-flash](docs/hy4-flash.md) |
 
 ## Known limits
 

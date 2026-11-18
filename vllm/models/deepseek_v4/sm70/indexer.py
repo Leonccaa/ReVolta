@@ -518,6 +518,36 @@ def _combine_index_queries(q: torch.Tensor, weights: torch.Tensor) -> torch.Tens
 
 
 @triton.jit
+def _relu_weight_headsum(
+    s_ptr,
+    w_ptr,
+    token,
+    k_offsets,
+    k_valid,
+    s_stride0,
+    s_stride1,
+    w_stride0,
+    num_heads: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    acc = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    for head in range(0, num_heads, BLOCK_H):
+        h_offsets = head + tl.arange(0, BLOCK_H)
+        s = tl.load(
+            s_ptr
+            + token * s_stride0
+            + h_offsets[:, None] * s_stride1
+            + k_offsets[None, :],
+            mask=k_valid[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        w = tl.load(w_ptr + token * w_stride0 + h_offsets).to(tl.float32)
+        acc += tl.sum(tl.maximum(s, 0.0) * w[:, None], axis=0)
+    return acc
+
+
+@triton.jit
 def _relu_weight_headsum_kernel(
     s_ptr,
     w_ptr,
@@ -544,20 +574,19 @@ def _relu_weight_headsum_kernel(
     k_offsets = k_base + tl.arange(0, BLOCK_K)
     k_valid = k_offsets < num_k
 
-    acc = tl.zeros((BLOCK_K,), dtype=tl.float32)
-    for head in range(0, num_heads, BLOCK_H):
-        h_offsets = head + tl.arange(0, BLOCK_H)
-        s = tl.load(
-            s_ptr
-            + token * s_stride0
-            + h_offsets[:, None] * s_stride1
-            + k_offsets[None, :],
-            mask=k_valid[None, :],
-            other=0.0,
-        ).to(tl.float32)
-        w = tl.load(w_ptr + token * w_stride0 + h_offsets).to(tl.float32)
-        acc += tl.sum(tl.maximum(s, 0.0) * w[:, None], axis=0)
-
+    acc = _relu_weight_headsum(
+        s_ptr,
+        w_ptr,
+        token,
+        k_offsets,
+        k_valid,
+        s_stride0,
+        s_stride1,
+        w_stride0,
+        num_heads,
+        BLOCK_K,
+        BLOCK_H,
+    )
     scale = tl.load(scale_ptr + k_offsets, mask=k_valid, other=0.0).to(tl.float32)
     tl.store(out_ptr + token * out_stride0 + k_offsets, acc * scale, mask=k_valid)
 

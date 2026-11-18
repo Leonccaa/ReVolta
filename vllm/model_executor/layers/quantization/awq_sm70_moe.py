@@ -460,6 +460,14 @@ def _is_qwen38_tp4_compact_metadata_shape(
     )
 
 
+def _supports_compact_metadata_shape(layer: RoutedExperts, group_size: int) -> bool:
+    return _is_qwen38_tp4_compact_metadata_shape(layer, group_size) or (
+        group_size == 32
+        and tuple(layer.w13_qweight.shape) == (512, 1536, 96)
+        and tuple(layer.w2_qweight.shape) == (512, 384, 192)
+    )
+
+
 def _resolve_compact_metadata(
     *, requested: bool, explicit: bool, native_available: bool, shape_ok: bool
 ) -> bool:
@@ -481,7 +489,7 @@ def _resolve_compact_metadata(
             )
         raise RuntimeError(
             "VLLM_SM70_AWQ_MOE_COMPACT_METADATA=1 currently requires "
-            "the exact Qwen3.8 TP4 E512 native-g32 W13/W2 shapes."
+            "Qwen3.8 TP4 or HYV4 Flash TP4 E512 native-g32 W13/W2 shapes."
         )
     logger.info_once(
         "SM70 AWQ MoE compact metadata default skipped (%s); "
@@ -494,7 +502,9 @@ def _resolve_compact_metadata(
 def _silu_and_mul_w13(
     layer: RoutedExperts, out: torch.Tensor, gate_up: torch.Tensor
 ) -> None:
-    if getattr(layer, "sm70_awq_moe_w13_interleaved", False):
+    if layer.swiglu_limit is not None:
+        torch.ops._C.silu_and_mul_with_clamp(out, gate_up, layer.swiglu_limit)
+    elif getattr(layer, "sm70_awq_moe_w13_interleaved", False):
         sm70_ops.silu_and_mul_interleaved(out, gate_up)
     else:
         torch.ops._C.silu_and_mul(out, gate_up)
@@ -985,7 +995,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             requested=envs.VLLM_SM70_AWQ_MOE_COMPACT_METADATA,
             explicit="VLLM_SM70_AWQ_MOE_COMPACT_METADATA" in os.environ,
             native_available=hasattr(torch.ops._C, "awq_sm70_prepare_compact"),
-            shape_ok=_is_qwen38_tp4_compact_metadata_shape(layer, self.group_size),
+            shape_ok=_supports_compact_metadata_shape(layer, self.group_size),
         )
         int4_zero = envs.VLLM_SM70_AWQ_MOE_INT4_ZERO
         if int4_zero and (
@@ -994,7 +1004,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         ):
             raise RuntimeError(
                 "VLLM_SM70_AWQ_MOE_INT4_ZERO=1 requires the exact compact "
-                "Qwen3.8 TP4 lane and a rebuilt int4-zero SM70 extension."
+                "TP4 shapes and a rebuilt int4-zero SM70 extension."
             )
         prepare_awq = (
             sm70_ops.awq_sm70_prepare_compact
@@ -1004,7 +1014,8 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         w13_tm_weights, w13_tm_scales, w13_meta = [], [], []
         w2_tm_weights, w2_tm_scales, w2_meta = [], [], []
         build_legacy_w13 = (
-            batched_gemm
+            layer.swiglu_limit is None
+            and batched_gemm
             and envs.VLLM_SM70_AWQ_MOE_LEGACY_SINGLE_TOKEN_COMPACT
             and hasattr(torch.ops._C, "awq_moe_single_token_sm70_out")
         )
@@ -1235,9 +1246,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 "SM70 AWQ int4 zero enabled (5 bytes per two metadata records)."
             )
         if compact_metadata:
-            logger.info_once(
-                "SM70 Qwen3.8 TP4 AWQ compact scale/zero metadata enabled."
-            )
+            logger.info_once("SM70 TP4 AWQ compact scale/zero metadata enabled.")
 
     def _allocate_buffers(self, layer: RoutedExperts) -> None:
         device = layer.w13_tm_weight.device
@@ -1709,10 +1718,14 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             and _single_token_indexed_w13_enabled()
             and _single_token_indexed_w2_enabled()
         )
-        if num_tokens == 1 and (
-            not layer.sm70_awq_moe_batched_gemm
-            or use_batched_single_token_strict
-            or use_batched_single_token_indexed
+        if (
+            layer.swiglu_limit is None
+            and num_tokens == 1
+            and (
+                not layer.sm70_awq_moe_batched_gemm
+                or use_batched_single_token_strict
+                or use_batched_single_token_indexed
+            )
         ):
             use_compact_w13 = _single_token_compact_w13_enabled()
             use_indexed_w13 = (

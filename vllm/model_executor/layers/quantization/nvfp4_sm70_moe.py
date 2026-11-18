@@ -706,6 +706,8 @@ def validate_nvfp4_sm70_moe_contract(moe: FusedMoEConfig) -> None:
         moe.experts_per_token,
     )
     glm53_tp8 = moe.tp_size == 8 and contract == (4096, 2048, 288, 8)
+    # The cropped HYV4 Flash validation checkpoint uses the same experts at TP1.
+    hy4_flash = moe.tp_size in (1, 4) and contract == (1536, 1536, 512, 16)
     if moe.tp_size not in _SUPPORTED_TP_SIZES and not glm53_tp8:
         raise NotImplementedError(
             "SM70 TurboMind NVFP4 MoE currently supports tensor parallel "
@@ -716,12 +718,13 @@ def validate_nvfp4_sm70_moe_contract(moe: FusedMoEConfig) -> None:
             "SM70 TurboMind NVFP4 MoE requires a positive local intermediate "
             f"size divisible by {NVFP4_GROUP_SIZE}, got {local_intermediate}."
         )
-    if contract not in _SUPPORTED_CONTRACTS:
+    if contract not in _SUPPORTED_CONTRACTS and not hy4_flash:
         raise NotImplementedError(
             "SM70 TurboMind NVFP4 MoE shape is not validated: "
             f"hidden={moe.hidden_dim}, intermediate={global_intermediate}, "
             f"experts={moe.num_experts}, top_k={moe.experts_per_token}. "
-            f"Validated contracts: {sorted(_SUPPORTED_CONTRACTS)}."
+            f"Supported contracts: {sorted(_SUPPORTED_CONTRACTS)}, "
+            "plus HYV4 Flash TP1/TP4."
         )
     if moe.moe_parallel_config.use_all2all_kernels:
         raise NotImplementedError(

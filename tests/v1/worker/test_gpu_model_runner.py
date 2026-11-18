@@ -1783,9 +1783,12 @@ def test_is_uniform_decode() -> None:
     )
 
 
+@pytest.mark.skip_global_cleanup
 def test_compute_force_uniform_decode_rejects_hybrid_prefills() -> None:
     runner = SimpleNamespace(
-        model_config=SimpleNamespace(is_hybrid=True),
+        model_config=SimpleNamespace(
+            is_hybrid=True, hf_text_config=SimpleNamespace(model_type="llama")
+        ),
         requests={"req_a": SimpleNamespace(num_prompt_tokens=8)},
     )
     compute = GPUModelRunner._compute_force_uniform_decode
@@ -1838,9 +1841,14 @@ def test_compute_force_uniform_decode_rejects_hybrid_prefills() -> None:
     mixed.total_num_scheduled_tokens += 1
     assert compute(runner, mixed) is False
 
-    # The guard is intentionally limited to stateful hybrid models.
+    # Hy4 Flash also keeps its one-token prefills out of the decode graph.
     runner.model_config.is_hybrid = False
     assert compute(runner, _schedule_new_request("req_new")) is None
+    runner.model_config.hf_text_config.model_type = "hy_v4_flash"
+    one_token_prefill = _schedule_new_request("req_new")
+    one_token_prefill.scheduled_new_reqs[0].prompt_token_ids = [1]
+    assert compute(runner, one_token_prefill) is False
+    assert compute(runner, decode) is None
 
 
 @pytest.mark.skipif(

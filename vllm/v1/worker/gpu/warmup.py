@@ -377,6 +377,7 @@ def warmup_kernels(
             ]
 
             prefill_output = SchedulerOutput.make_empty()
+            prefill_output.num_spec_tokens_to_schedule = num_spec_steps
             prefill_output.scheduled_new_reqs = new_reqs
             prefill_output.num_scheduled_tokens = {rid: prompt_len for rid in req_ids}
             prefill_output.total_num_scheduled_tokens = prompt_len * num_reqs
@@ -437,6 +438,7 @@ def warmup_kernels(
                 ]
 
                 decode_output = SchedulerOutput.make_empty()
+                decode_output.num_spec_tokens_to_schedule = num_spec_steps
                 decode_output.scheduled_cached_reqs = cached_req_data
                 decode_output.num_scheduled_tokens = {
                     req_id: 1 + num_spec_steps for req_id in req_ids

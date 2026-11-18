@@ -264,6 +264,12 @@ class SchedulerOutput:
 
     host_kv: "HostKVStep | None" = None
 
+    # Proposal width for the next step, independent of this step's verification.
+    num_spec_tokens_to_schedule: int = 0
+
+    # Whether no scheduled request can use the drafts proposed after this step.
+    skip_drafts: bool = False
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

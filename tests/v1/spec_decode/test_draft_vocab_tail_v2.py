@@ -5,6 +5,7 @@
 import ast
 import inspect
 from collections import OrderedDict
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -421,7 +422,13 @@ def test_pending_proposal_q_survives_other_requests_tail_changes(tmp_path, monke
     spec.input_buffers = InputBuffers(8, 40, torch.device("cpu"))
     generator = torch.Generator().manual_seed(121)
     features = torch.randn(40, 4, generator=generator, dtype=torch.float16)
-    spec.run_model = lambda n, *args, **kwargs: (features[:n], features[:n])
+    forwards = []
+
+    def run_model(n, *args, **kwargs):
+        forwards.append(n)
+        return features[:n], features[:n]
+
+    spec.run_model = run_model
     spec.block_tables = SimpleNamespace(compute_slot_mappings=lambda *args: {})
     spec.kv_cache_config = None
     spec._build_draft_attn_metadata = lambda **kwargs: {}
@@ -472,7 +479,7 @@ def test_pending_proposal_q_survives_other_requests_tail_changes(tmp_path, monke
             is_prefilling_np=np.zeros(count, dtype=np.bool_),
         )
 
-    def propose(current):
+    def propose(current, k=None):
         count = current.num_reqs
         return spec.propose(
             current,
@@ -486,6 +493,7 @@ def test_pending_proposal_q_survives_other_requests_tail_changes(tmp_path, monke
             torch.zeros(8, dtype=torch.int64),
             torch.ones(8),
             torch.arange(8, dtype=torch.int64) + 93,
+            num_speculative_tokens=k,
         )
 
     # A full batch leaves every persistent mapping entry pointing at a real request.
@@ -541,6 +549,12 @@ def test_pending_proposal_q_survives_other_requests_tail_changes(tmp_path, monke
     resume.cu_num_logits = torch.tensor([0, 5], dtype=torch.int32)
     runner.sample(features[:5], resume, None)
     assert consumed == [pending_q]
+
+    for k in (4, 3, 0, 1, 4):
+        forwards.clear()
+        proposal = propose(active, k)
+        assert forwards == [20] + [4] * max(0, k - 1)
+        assert proposal.shape == (3, 4)
 
 
 def test_sampling_distribution_fixed_seed(tmp_path):
@@ -908,9 +922,22 @@ def test_speculator_enabled_initialization_and_sampling(
     update.assert_called_once_with(sampled, counts, 4, mapping)
 
 
-@pytest.mark.parametrize("with_tail", [False, True])
-def test_runner_actual_call_order(monkeypatch, with_tail):
+@pytest.mark.parametrize(
+    ("method", "with_tail", "k", "structured"),
+    [
+        ("mtp", False, 4, False),
+        ("mtp", True, 3, False),
+        ("mtp", True, 0, False),
+        ("dflash", False, None, False),
+        ("dflash", False, 3, False),
+        ("dflash", False, 3, True),
+        ("dflash", False, 0, True),
+        ("dflash", False, 0, False),
+    ],
+)
+def test_runner_actual_call_order(monkeypatch, method, with_tail, k, structured):
     from vllm.v1.worker.gpu import model_runner as runner_mod
+    from vllm.v1.worker.gpu.spec_decode import utils
 
     calls = []
     runner = object.__new__(runner_mod.GPUModelRunner)
@@ -924,6 +951,7 @@ def test_runner_actual_call_order(monkeypatch, with_tail):
         idx_mapping=torch.tensor([0]),
         num_reqs=1,
         query_start_loc=torch.tensor([0, 1]),
+        has_structured_output_reqs=structured,
     )
     runner.execute_model_state = SimpleNamespace(
         input_batch=batch,
@@ -932,6 +960,7 @@ def test_runner_actual_call_order(monkeypatch, with_tail):
         hidden_states=torch.zeros(1, 4),
         aux_hidden_states=None,
         finished_req_ids=set(),
+        num_spec_tokens_to_schedule=4 if k is None else k,
     )
     runner._sm70_v2_mtp_profile_pending = None
     runner._sm70_v2_mtp_profile_start = Mock(return_value=None)
@@ -969,9 +998,31 @@ def test_runner_actual_call_order(monkeypatch, with_tail):
 
     def propose(*args, **kwargs):
         calls.append("propose")
-        return torch.zeros(1, 4, dtype=torch.int64)
+        assert ("num_speculative_tokens" in kwargs) == (k is not None)
+        assert kwargs.get("num_speculative_tokens") == k
+        return torch.tensor([[20, 21, 22, 23]])
 
-    runner.speculator = SimpleNamespace(supports_mm_inputs=False, propose=propose)
+    runner.num_speculative_steps = 4
+    if method == "dflash":
+        runner.speculator = object.__new__(runner_mod.DFlash2Speculator)
+        has_dsd = k is not None and (k > 0 or structured)
+        runner.speculator.speculative_config = SimpleNamespace(
+            num_speculative_tokens_per_batch_size=[(1, 1, k)] if has_dsd else None
+        )
+        runner.speculator.prepare_target_context = Mock()
+        runner.speculator._lookup_enabled = False
+        if k is not None:
+            runner.speculator.next_num_draft_tokens = Mock(
+                side_effect=AssertionError(
+                    "The runner already chose the publication width"
+                )
+            )
+    else:
+        runner.speculator = object.__new__(eagle.EagleSpeculator)
+    runner.speculator.method = method
+    runner.speculator.supports_mm_inputs = False
+    runner.speculator.propose = propose
+    runner.speculator._draft_vocab_tail = None
     if with_tail:
 
         def update(sampled, num_sampled, num_reqs, idx_mapping):
@@ -980,14 +1031,30 @@ def test_runner_actual_call_order(monkeypatch, with_tail):
             calls.append("update")
 
         runner.speculator.update_draft_vocab_tail = update
-    runner.draft_tokens_handler = SimpleNamespace(set_draft_tokens=Mock())
+    handler = object.__new__(utils.DraftTokensHandler)
+    runner.draft_tokens_handler = handler
+    if structured:
+        monkeypatch.setattr(torch.cuda, "current_stream", Mock())
+        monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+        monkeypatch.setattr(utils, "async_copy_to_np", lambda tensor: tensor.numpy())
+        handler.device, handler.copy_stream, handler.copy_event = None, Mock(), Mock()
     runner.pp_handler = None
     runner.kv_connector = SimpleNamespace(post_forward=Mock(return_value=None))
     runner.mixed_prefill_timer = SimpleNamespace(finish=Mock(return_value=None))
     runner.use_async_scheduling = True
     runner.eplb = SimpleNamespace(step=Mock())
-    monkeypatch.setattr(runner_mod, "AsyncOutput", lambda **kwargs: SimpleNamespace())
-    runner.sample_tokens(None)
+    monkeypatch.setattr(runner_mod, "AsyncOutput", SimpleNamespace)
+    output = runner.sample_tokens(None)
+    assert output.sampler_output.sampled_token_ids is ids
+    assert output.num_sampled_tokens is counts
+    if method == "dflash" and k is not None:
+        runner.speculator.next_num_draft_tokens.assert_not_called()
+    width = 4 if k is None else k
+    prefix = list(range(20, 20 + width))
+    assert runner.req_states.draft_tokens.tolist() == [prefix + [-1] * (4 - width)]
+    assert runner.take_draft_token_ids().draft_token_ids == [
+        prefix if structured else [-1] * width
+    ]
     assert calls == (
         ["sample", "postprocess", "update", "propose"]
         if with_tail

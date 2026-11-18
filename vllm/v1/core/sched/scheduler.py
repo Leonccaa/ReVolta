@@ -71,6 +71,7 @@ from vllm.v1.metrics.store import CPU_SAMPLE_STRIDE, StoreMetrics
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.ddtree_payload import DDTreeDraftPayload
+from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
@@ -292,9 +293,22 @@ class Scheduler(SchedulerInterface):
 
         self.use_eagle = False
         self.num_spec_tokens = vllm_config.num_speculative_tokens
+        self.dynamic_sd_lookup: list[int] | None = None
+        if (
+            speculative_config is not None
+            and speculative_config.num_speculative_tokens_per_batch_size is not None
+        ):
+            self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
+                speculative_config.num_speculative_tokens_per_batch_size,
+                vllm_max_batch_size=self.scheduler_config.max_num_seqs,
+                vllm_num_speculative_tokens=self.num_spec_tokens,
+            )
         # Last running total of rejection fallbacks seen from the workers.
         self._rejection_fallbacks_total = 0
         self.num_lookahead_tokens = vllm_config.num_lookahead_tokens
+        self.can_skip_drafts = (
+            self.num_lookahead_tokens > 0 and vllm_config.use_v2_model_runner
+        )
         if speculative_config and speculative_config.use_eagle_kv_cache():
             self.use_eagle = True
 
@@ -548,6 +562,50 @@ class Scheduler(SchedulerInterface):
             - request.num_output_placeholders,
         )
 
+    def _drafts_unused(
+        self, request: Request, num_computed_tokens: int, num_new_tokens: int
+    ) -> bool:
+        """Whether the drafts proposed for `request` after this step are sure to
+        go unused.
+
+        Drafts proposed after a step are verified in the request's next decode
+        step. They go unused when no such step follows, in two cases:
+
+        1. This step is a non-final prefill chunk. It samples no token, and the
+           scheduler drops drafts proposed after a prefill chunk.
+        2. This step samples the request's last output token: even if every
+           draft is rejected, the request reaches `max_tokens` and finishes.
+
+        Stop tokens and stop strings also end requests, but they cannot be known
+        in advance. This returns True only when it is sure.
+
+        The model runner proposes no drafts (K=0) in a step where this is True
+        for every scheduled request on every DP rank.
+
+        Args:
+            request: A request scheduled in this step.
+            num_computed_tokens: Tokens computed before this step, including
+                prefix-cache and KV-connector hits for a newly admitted request.
+            num_new_tokens: Tokens scheduled for this step.
+
+        """
+        # Case 1: a non-final prefill chunk stops before the request's last
+        # known token, so this step samples nothing.
+        if num_computed_tokens + num_new_tokens < request.num_tokens:
+            return True
+
+        # Case 2: this step samples the request's last output token. Drafts may
+        # all be rejected, so count only the output tokens the request is sure
+        # to have once this step finishes: the verified ones, plus one from each
+        # step that samples. This step samples one.
+        min_num_output_tokens = request.num_output_tokens + 1
+        if request.num_output_placeholders > 0:
+            # Async scheduling: a step that samples is still in flight, and it
+            # adds one more.
+            min_num_output_tokens += 1
+        # Reaching max_tokens finishes the request, so no step verifies the drafts.
+        return min_num_output_tokens >= request.max_tokens
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -759,6 +817,8 @@ class Scheduler(SchedulerInterface):
         encoder_compute_budget = self.max_num_encoder_input_tokens
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
+        # Stays set if a request is preempted later in this step.
+        drafts_needed = not self.can_skip_drafts
         scheduled_ddtree_payloads: dict[str, DDTreeDraftPayload] = {}
 
         # For logging.
@@ -1025,6 +1085,9 @@ class Scheduler(SchedulerInterface):
             if is_prefill and prefill_token_budget is not None:
                 prefill_token_budget -= num_new_tokens
             req_index += 1
+            drafts_needed = drafts_needed or not self._drafts_unused(
+                request, request.num_computed_tokens, num_new_tokens
+            )
 
             # Speculative decode related.
             if request.spec_token_ids:
@@ -1586,6 +1649,9 @@ class Scheduler(SchedulerInterface):
                     prefill_token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+                drafts_needed = drafts_needed or not self._drafts_unused(
+                    request, num_computed_tokens, num_new_tokens
+                )
                 if num_computed_tokens + num_new_tokens < request.num_tokens:
                     self._inflight_prefills.add(request)
                 # Encoder-related.
@@ -1681,6 +1747,12 @@ class Scheduler(SchedulerInterface):
         mamba_state_gathers = exact_end.pending_gathers
         exact_end.pending_gathers = []
 
+        num_spec_tokens_to_schedule = self.num_spec_tokens
+        if self.dynamic_sd_lookup is not None and num_scheduled_tokens:
+            num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
+                len(num_scheduled_tokens)
+            ]
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -1707,6 +1779,8 @@ class Scheduler(SchedulerInterface):
                 self.mixed_prefill_budget.tokens if control_mixed_prefill else 0
             ),
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
+            skip_drafts=not drafts_needed,
             scheduled_ddtree_payloads=scheduled_ddtree_payloads or None,
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             num_common_prefix_blocks=num_common_prefix_blocks,

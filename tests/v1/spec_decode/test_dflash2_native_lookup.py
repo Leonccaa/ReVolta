@@ -406,12 +406,15 @@ def test_speculator_entry_and_closed_noop_preserve_rng(monkeypatch):
     spec.draft_tokens, spec.draft_logits = draft, logits
     spec._cached_candidate_ids, spec._cached_candidate_scores = ids, scores
     spec._debug_real_proposal = True
-    spec.speculative_config = SimpleNamespace(
-        num_speculative_tokens=7, dflash_concurrency_drafts=None
-    )
-    spec._prepare_proposal_runtime(batch, sampled, sampled)
+    spec.num_speculative_steps = 7
+    spec._prepare_proposal_runtime(batch, sampled, 3)
     spec._apply_lookup(2)
-    assert spec.next_num_draft_tokens() == 7
+    assert not native.eligible.any()
+    assert not native.use.any()
+    spec._prepare_proposal_runtime(batch, sampled, 7)
+    spec._apply_lookup(2)
+    assert spec.next_num_draft_tokens() is None
+    assert native.eligible[0] == 1
     assert native.use[0].tolist() == [0, 1, 1, 1, 0, 0, 0]
     spec._native_lookup = None
     before = [value.clone() for value in (draft, logits, ids, scores)]
@@ -485,7 +488,7 @@ def test_native_target_capture_descriptors_have_no_per_request_q16(monkeypatch):
             method="dflash",
             ngram_assist=False,
             num_speculative_tokens=7,
-            dflash_concurrency_drafts=None,
+            num_speculative_tokens_per_batch_size=None,
         ),
     )
     manager = ModelCudaGraphManager(

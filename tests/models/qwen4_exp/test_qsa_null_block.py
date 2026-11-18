@@ -115,6 +115,7 @@ def test_draft_steps_preserve_dummy_flag(monkeypatch, dummy):
         False,
         SimpleNamespace(num_reqs=2, num_tokens=2, cg_mode=CUDAGraphMode.NONE),
         None,
+        draft.num_speculative_steps,
         is_dummy_batch=dummy,
     )
     assert build.call_count == 3

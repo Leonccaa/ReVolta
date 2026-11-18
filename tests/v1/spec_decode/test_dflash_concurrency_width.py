@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DFlash verifies fewer drafts per request at high concurrency."""
 
-import itertools
+import json
+from multiprocessing.reduction import ForkingPickler
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -12,77 +13,97 @@ import torch
 from vllm.config import CompilationConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.config.scheduler import SchedulerConfig
-from vllm.config.sm70_dflash2 import Sm70DFlash2Config
 from vllm.config.speculative import (
     SpeculativeConfig,
     check_dflash_concurrency_drafts,
-    dflash_drafts_for_requests,
 )
 from vllm.config.vllm import VllmConfig
+from vllm.platforms import current_platform
+from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.worker.gpu.cudagraph_utils import ModelCudaGraphManager
-from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
-from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
 
 pytestmark = pytest.mark.skip_global_cleanup
 
 
+pytest_plugins = ("tests.v1.spec_decode.test_dflash2_native_lookup",)
+
+
+@pytest.fixture
+def make_config(native_allocation_config):
+    model = native_allocation_config.model_config
+    parallel = native_allocation_config.parallel_config
+    draft = native_allocation_config.speculative_config.model
+
+    def make(fields):
+        return SpeculativeConfig(
+            method="dflash",
+            model=draft,
+            num_speculative_tokens=7,
+            target_model_config=model,
+            target_parallel_config=parallel,
+            **json.loads(fields),
+        )
+
+    return make
+
+
 @pytest.mark.parametrize(
-    ("policy", "num_reqs", "drafts"),
+    ("old", "new", "expected"),
     [
-        (None, 8, 7),
-        ({5: 4}, 1, 7),
-        ({5: 4}, 4, 7),
-        ({5: 4}, 5, 4),
-        ({5: 4}, 8, 4),
-        ({3: 5, 5: 3}, 3, 5),
-        ({3: 5, 5: 3}, 6, 3),
-        # A ladder: each entry holds up to the next one, and may widen again.
-        ({4: 3, 5: 4}, 3, 7),
-        ({4: 3, 5: 4}, 4, 3),
-        ({4: 3, 5: 4}, 5, 4),
-        ({4: 3, 5: 4}, 8, 4),
-        ({2: 4, 4: 7}, 3, 4),
-        ({2: 4, 4: 7}, 5, 7),
+        ('{"5":4,"4":3}', [[1, 3, 7], [4, 4, 3], [5, 5, 4]], [7, 7, 7, 3, 4, 4, 4, 4]),
+        ('{"4":3,"5":4}', [[1, 3, 7], [4, 4, 3], [5, 8, 4]], [7, 7, 7, 3, 4, 4, 4, 4]),
+        ('{"4":3,"5":4}', [[1, 3, 7], [4, 4, 3], [5, 5, 4]], [7, 7, 7, 3]),
+        ('{"3":3}', [[1, 2, 7], [3, 8, 3]], [7, 7, 3, 3, 3, 3, 3, 3]),
+        ('{"8":4}', [[1, 7, 7], [8, 8, 4]], [7, 7, 7, 7, 7, 7, 7, 4]),
     ],
 )
-def test_drafts_follow_the_running_request_count(policy, num_reqs, drafts) -> None:
-    spec = SimpleNamespace(num_speculative_tokens=7, dflash_concurrency_drafts=policy)
-    assert dflash_drafts_for_requests(spec, num_reqs) == drafts
-
-
-def _min_semantics(policy, num_reqs, nst=7):
-    """The first release: every threshold reached may only lower the width."""
-    drafts = nst
-    for min_reqs, width in (policy or {}).items():
-        if num_reqs >= min_reqs:
-            drafts = min(drafts, width)
-    return drafts
-
-
-def _monotone_policies(nst=7, max_reqs=8):
-    thresholds = range(2, max_reqs + 1)
-    for size in (1, 2, 3):
-        for keys in itertools.combinations(thresholds, size):
-            for widths in itertools.combinations_with_replacement(
-                range(nst - 1, 0, -1), size
-            ):
-                yield dict(zip(keys, widths))  # widths never increase with the count
-
-
-def test_ladder_matches_the_first_release_for_narrowing_policies() -> None:
-    # Every policy the first release could express (widths that only shrink as
-    # requests grow) resolves to the same width at every request count.
-    checked = 0
-    for policy in _monotone_policies():
-        spec = SimpleNamespace(
-            num_speculative_tokens=7, dflash_concurrency_drafts=policy
+def test_alias_migration(make_config, old, new, expected):
+    legacy = make_config('{"dflash_concurrency_drafts":' + old + "}")
+    canonical = make_config(json.dumps({"num_speculative_tokens_per_batch_size": new}))
+    assert legacy.dflash_concurrency_drafts is None
+    for spec in (legacy, canonical):
+        assert (
+            build_dynamic_sd_schedule_lookup(
+                spec.num_speculative_tokens_per_batch_size, len(expected), 7
+            )[1:]
+            == expected
         )
-        for num_reqs in range(0, 13):
-            assert dflash_drafts_for_requests(spec, num_reqs) == _min_semantics(
-                policy, num_reqs
-            ), (policy, num_reqs)
-            checked += 1
-    assert checked > 10_000
+
+
+def test_alias_config_copy_and_transport(make_config, monkeypatch):
+    warn = MagicMock()
+    monkeypatch.setattr("vllm.config.speculative.logger.warning_once", warn)
+    legacy = make_config('{"dflash_concurrency_drafts":{"4":3,"5":4}}')
+    schedule = [(1, 3, 7), (4, 4, 3), (5, 5, 4)]
+    warn.assert_called_once()
+    assert "num_speculative_tokens_per_batch_size" in warn.call_args.args[0]
+    rebuilt = SpeculativeConfig.from_worker_payload(
+        json.loads(json.dumps(legacy.to_worker_payload())),
+        target_model_config=legacy.target_model_config,
+        target_parallel_config=legacy.target_parallel_config,
+    )
+    for spec in (
+        legacy,
+        legacy.__replace__(enforce_eager=True),
+        ForkingPickler.loads(ForkingPickler.dumps(legacy)),
+        rebuilt,
+    ):
+        assert spec.dflash_concurrency_drafts is None
+        assert spec.num_speculative_tokens_per_batch_size == schedule
+
+
+def test_empty_alias_preserves_fixed_width(make_config):
+    fixed = make_config('{"dflash_concurrency_drafts":{}}')
+    assert fixed.num_speculative_tokens == 7
+    assert fixed.dflash_concurrency_drafts is None
+    assert fixed.num_speculative_tokens_per_batch_size is None
+
+
+def test_alias_conflict_even_with_empty_fields(make_config):
+    with pytest.raises(ValueError, match="Set only one of dflash_concurrency_drafts"):
+        make_config(
+            '{"dflash_concurrency_drafts":{},"num_speculative_tokens_per_batch_size":[]}'
+        )
 
 
 @pytest.mark.parametrize(
@@ -112,7 +133,7 @@ def test_policy_validation(policy, dflash, ngram_assist, ok) -> None:
             check()
 
 
-def _manager(monkeypatch, policy, tails=True, sizes=None):
+def _manager(monkeypatch, schedule, tails=True, sizes=None):
     # A V100 worker without the long-context attention operator.
     monkeypatch.setattr(
         "vllm.v1.attention.ops.sm70_e4m3_long.long_attention_enabled", lambda: False
@@ -142,7 +163,7 @@ def _manager(monkeypatch, policy, tails=True, sizes=None):
             method="dflash",
             ngram_assist=False,
             num_speculative_tokens=7,
-            dflash_concurrency_drafts=policy,
+            num_speculative_tokens_per_batch_size=schedule,
         ),
     )
     manager = ModelCudaGraphManager(
@@ -154,7 +175,7 @@ def _manager(monkeypatch, policy, tails=True, sizes=None):
 
 @pytest.mark.parametrize("tails", [True, False])
 def test_narrow_target_graphs_from_the_threshold_up(monkeypatch, tails) -> None:
-    manager = _manager(monkeypatch, {5: 4}, tails)
+    manager = _manager(monkeypatch, [(1, 4, 7), (5, 8, 4)], tails)
     assert manager.decode_query_lens[0] == 8 and 5 in manager.decode_query_lens
     for num_reqs in range(5, 9):
         assert num_reqs * 5 in manager._capture_sizes
@@ -175,10 +196,20 @@ def test_no_policy_keeps_the_capture_plan(monkeypatch) -> None:
     assert not manager._dflash_width_reqs
 
 
-def test_ladder_widths_capture_only_their_request_counts(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    "fields",
+    [
+        '{"dflash_concurrency_drafts":{"4":3,"5":4}}',
+        '{"num_speculative_tokens_per_batch_size":[[1,3,7],[4,4,3],[5,8,4]]}',
+    ],
+)
+def test_ladder_widths_capture_only_their_request_counts(
+    monkeypatch, make_config, fields
+):
+    schedule = make_config(fields).num_speculative_tokens_per_batch_size
     # {4: 3, 5: 4}: three drafts (q4) for four requests, four (q5) from five up,
     # all seven (q8) for one to three.
-    manager = _manager(monkeypatch, {4: 3, 5: 4}, tails=False)
+    manager = _manager(monkeypatch, schedule, tails=False)
     assert manager._dflash_width_reqs == {4: frozenset({4}), 5: frozenset(range(5, 9))}
     desc = manager.dispatch(4, 16, 4)
     assert desc.cg_mode == CUDAGraphMode.FULL and desc.uniform_token_count == 4
@@ -193,7 +224,7 @@ def test_ladder_widths_capture_only_their_request_counts(monkeypatch) -> None:
 
 def test_narrowing_policy_drops_unused_wide_shapes(monkeypatch) -> None:
     # {3: 5, 5: 3}: six-token rows only serve three and four requests now.
-    manager = _manager(monkeypatch, {3: 5, 5: 3}, tails=False)
+    manager = _manager(monkeypatch, [(1, 2, 7), (3, 4, 5), (5, 8, 3)], tails=False)
     assert manager._dflash_width_reqs == {
         6: frozenset({3, 4}),
         4: frozenset(range(5, 9)),
@@ -203,94 +234,53 @@ def test_narrowing_policy_drops_unused_wide_shapes(monkeypatch) -> None:
 def test_added_sizes_stay_within_the_largest_capture_size(monkeypatch) -> None:
     # Explicit capture sizes up to 32: 6-token widths for 6..8 requests (36..48
     # tokens) would leave the compiled decode range.
-    manager = _manager(monkeypatch, {2: 5}, sizes=[8, 16, 24, 32])
+    manager = _manager(monkeypatch, [(1, 1, 7), (2, 8, 5)], sizes=[8, 16, 24, 32])
     assert max(manager._capture_sizes) == 32
     assert {12, 18, 24, 30} <= set(manager._capture_sizes)
     assert not {36, 42, 48} & set(manager._capture_sizes)
 
 
-def _speculator(cls, policy, **attrs):
-    spec = object.__new__(cls)
-    spec.speculative_config = SimpleNamespace(
-        num_speculative_tokens=7, dflash_concurrency_drafts=policy
-    )
-    spec.num_speculative_steps = 7
-    spec._running_reqs = 0
-    for key, value in attrs.items():
-        setattr(spec, key, value)
-    return spec
-
-
-@pytest.mark.parametrize("cls", [DFlashSpeculator, DFlash2Speculator])
-def test_both_dflash_speculators_follow_the_policy(cls) -> None:
-    spec = _speculator(cls, {4: 3}, _lookup_enabled=False)
-    for num_reqs, drafts in ((1, 7), (3, 7), (4, 3), (8, 3)):
-        spec._prepare_proposal_runtime(
-            SimpleNamespace(num_reqs=num_reqs), torch.zeros(1), torch.zeros(1)
+def test_schedule_captures_single_request_and_zero_draft_width(monkeypatch):
+    manager = _manager(monkeypatch, [(1, 1, 3), (2, 8, 0)], tails=False)
+    assert manager._dflash_width_reqs == {4: frozenset({1}), 1: frozenset(range(2, 9))}
+    for c, q in ((1, 4), (4, 1)):
+        desc = manager.dispatch(c, c * q, q)
+        assert (desc.cg_mode, desc.num_reqs, desc.uniform_token_count) == (
+            CUDAGraphMode.FULL,
+            c,
+            q,
         )
-        assert spec.next_num_draft_tokens() == drafts
 
 
-def test_without_policy_the_plain_speculator_keeps_the_full_proposal() -> None:
-    # None: the draft-token handler keeps the proposal tensor width, as before.
-    spec = _speculator(DFlashSpeculator, None)
-    spec._prepare_proposal_runtime(
-        SimpleNamespace(num_reqs=8), torch.zeros(1), torch.zeros(1)
+@pytest.mark.parametrize("async_scheduling", [None, True])
+def test_schedule_defaults_to_sync_but_accepts_explicit_async(
+    make_config, monkeypatch, async_scheduling
+):
+    # The CPU platform turns async off after the model/executor checks.
+    monkeypatch.setattr(
+        current_platform, "check_and_update_config", lambda config: None
     )
-    assert spec.next_num_draft_tokens() is None
-
-
-def _width_config(policy) -> SpeculativeConfig:
-    config = object.__new__(SpeculativeConfig)
-    config.method = "dflash"
-    config.ngram_assist = False
-    config.num_speculative_tokens = 7
-    config.dflash_concurrency_drafts = policy
-    config.sm70_dflash2 = Sm70DFlash2Config()
-    config.ddtree_disable_tree_verify = False
-    config.disable_padded_drafter_batch = False
-    config.draft_model_config = SimpleNamespace(
-        hf_config=SimpleNamespace(
-            dflash_config={"block_size": 8, "selector_top_k": 16}
-        ),
-        verify_with_parallel_config=lambda *_args: None,
-        verify_with_model_config=lambda *_args: None,
-    )
-    config.verify_with_parallel_config = lambda *_args: None
-    config.verify_with_model_config = lambda *_args: None
-    return config
-
-
-def _scheduler(async_scheduling):
-    return SchedulerConfig(
-        max_model_len=8192, is_encoder_decoder=False, async_scheduling=async_scheduling
-    )
-
-
-def test_policy_disables_async_scheduling_by_default() -> None:
+    spec = make_config('{"dflash_concurrency_drafts":{"4":3}}')
     config = VllmConfig(
-        scheduler_config=_scheduler(None), speculative_config=_width_config({4: 3})
+        scheduler_config=SchedulerConfig(
+            max_model_len=8192,
+            is_encoder_decoder=False,
+            async_scheduling=async_scheduling,
+        ),
+        speculative_config=spec,
     )
-    assert config.scheduler_config.async_scheduling is False
+    assert config.scheduler_config.async_scheduling is bool(async_scheduling)
 
 
-def test_policy_rejects_explicit_async_scheduling() -> None:
-    with pytest.raises(ValueError, match="ignores dflash_concurrency_drafts"):
-        VllmConfig(
-            scheduler_config=_scheduler(True),
-            speculative_config=_width_config({4: 3}),
-        )
+def test_schedule_is_incompatible_with_legacy_ngram_assist(make_config):
+    spec = make_config(
+        '{"ngram_assist":true,"num_speculative_tokens_per_batch_size":[[1,8,3]]}'
+    )
+    with pytest.raises(ValueError, match="incompatible with ngram_assist"):
+        VllmConfig(speculative_config=spec)
 
 
-def test_policy_leaves_the_compile_hash_alone() -> None:
-    def config(policy):
-        spec = object.__new__(SpeculativeConfig)
-        spec.method = "dflash"
-        spec.use_local_argmax_reduction = False
-        spec.sm70_dflash2 = SimpleNamespace(resolved=False, explicit_fields=())
-        spec.draft_model_config = None
-        spec.ddtree_disable_tree_verify = False
-        spec.dflash_concurrency_drafts = policy
-        return spec
-
-    assert config(None).compute_hash() == config({4: 3}).compute_hash()
+def test_schedule_leaves_the_compile_hash_alone(make_config):
+    fixed = make_config("{}")
+    dynamic = make_config('{"num_speculative_tokens_per_batch_size":[[1,8,3]]}')
+    assert fixed.compute_hash() == dynamic.compute_hash()

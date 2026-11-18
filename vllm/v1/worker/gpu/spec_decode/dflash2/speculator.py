@@ -13,7 +13,6 @@ from vllm.config.sm70_dflash2 import (
     capture_sm70_dflash2_config,
     sm70_dflash2_enabled,
 )
-from vllm.config.speculative import dflash_drafts_for_requests
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
@@ -684,19 +683,19 @@ class DFlash2Speculator(DFlashSpeculator):
         self,
         input_batch,
         num_sampled: torch.Tensor,
-        num_rejected: torch.Tensor,
+        num_speculative_tokens: int | None = None,
     ) -> None:
         """Refresh lookup eligibility and controller inputs before replay."""
-        super()._prepare_proposal_runtime(input_batch, num_sampled, num_rejected)
-        del num_rejected
         native = getattr(self, "_native_lookup", None)
         if native is not None:
             native.prepare(
                 input_batch,
                 num_sampled,
                 real_run=self._debug_real_proposal,
-                draft_width=dflash_drafts_for_requests(
-                    self.speculative_config, input_batch.num_reqs
+                draft_width=(
+                    self.num_speculative_steps
+                    if num_speculative_tokens is None
+                    else num_speculative_tokens
                 ),
             )
         if not self._lookup_enabled:
@@ -758,13 +757,10 @@ class DFlash2Speculator(DFlashSpeculator):
         self._lookup_pending_num_reqs = num_reqs
         self._lookup_copy_pending = True
 
-    def next_num_draft_tokens(self) -> int:
-        """Choose the next target verification width: q8 or q16 with lookup,
-        otherwise the concurrency policy (``dflash_concurrency_drafts``)."""
+    def next_num_draft_tokens(self) -> int | None:
+        """Choose the verification width for legacy ngram assist."""
         if not self._lookup_enabled:
-            return dflash_drafts_for_requests(
-                self.speculative_config, self._running_reqs
-            )
+            return None
 
         num_reqs = len(self._lookup_current_req_key)
         if num_reqs == 0 or not self._lookup_current_eligible:

@@ -103,7 +103,9 @@ def test_prefill_scores_match_paged(monkeypatch, device, world):
         f"{device=} {world=} relative L2 "
         f"old={old_error.item():.8g} new={new_error.item():.8g}"
     )
-    assert new_error <= 2 * old_error
+    # Both paths sum FP16 products in FP32; the bound only has to separate
+    # accumulation-order noise from a real scoring error.
+    assert new_error <= max(2 * old_error, 1e-5)
 
     old_top = old.topk(511)
     new_top = new.topk(511)

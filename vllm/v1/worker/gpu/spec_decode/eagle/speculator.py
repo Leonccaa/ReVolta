@@ -583,11 +583,8 @@ class EagleSpeculator:
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+        skip_sample: bool = False,
     ) -> None:
-        last_token_indices = self.last_token_indices[:num_reqs]
-        pos = self.input_buffers.positions[last_token_indices]
-        idx_mapping = self.idx_mapping[:num_reqs]
-
         last_hidden_states, hidden_states = self.run_model(
             num_tokens,
             attn_metadata,
@@ -596,6 +593,13 @@ class EagleSpeculator:
             cudagraph_runtime_mode=cudagraph_runtime_mode,
             mm_inputs=mm_inputs,
         )
+        if skip_sample:
+            # This pass only keeps the drafter KV in sync.
+            return
+
+        last_token_indices = self.last_token_indices[:num_reqs]
+        pos = self.input_buffers.positions[last_token_indices]
+        idx_mapping = self.idx_mapping[:num_reqs]
         sample_hidden_states = last_hidden_states[last_token_indices]
 
         self.draft_tokens[:num_reqs, 0] = self._sample_draft(
@@ -876,7 +880,7 @@ class EagleSpeculator:
             max_query_len,
             has_prefill=bool(input_batch.is_prefilling_np.any()),
         )
-        prefill_batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
+        prefill_batch_desc, dp_sync_state = dispatch_cg_and_sync_dp(
             self.prefill_cudagraph_manager,
             num_reqs,
             num_tokens,
@@ -884,6 +888,9 @@ class EagleSpeculator:
             dp_size=self.dp_size,
             dp_rank=self.dp_rank,
             need_eager=is_profile,
+        )
+        num_tokens_across_dp = (
+            dp_sync_state.num_tokens_across_dp if dp_sync_state is not None else None
         )
 
         self._mtp_prefill_begin()
@@ -903,6 +910,7 @@ class EagleSpeculator:
                 num_tokens_across_dp=num_tokens_across_dp,
                 cudagraph_runtime_mode=prefill_batch_desc.cg_mode,
                 mm_inputs=mm_inputs,
+                skip_sample=num_speculative_tokens == 0,
             )
         self._mtp_prefill_end(num_reqs)
 
@@ -922,7 +930,7 @@ class EagleSpeculator:
 
         # Each request produces exactly 1 token per draft generation step,
         # enabling FULL graph replay.
-        decode_batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
+        decode_batch_desc, dp_sync_state = dispatch_cg_and_sync_dp(
             self.decode_cudagraph_manager,
             num_reqs,
             num_reqs,
@@ -930,6 +938,9 @@ class EagleSpeculator:
             dp_size=self.dp_size,
             dp_rank=self.dp_rank,
             need_eager=is_profile,
+        )
+        num_tokens_across_dp = (
+            dp_sync_state.num_tokens_across_dp if dp_sync_state is not None else None
         )
 
         # Generate the remaining drafts with the existing single-step graphs.

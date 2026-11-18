@@ -1817,7 +1817,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # cross-attention cache with dynamic encoder outputs.
             skip_compiled = True
 
-        batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
+        batch_desc, dp_sync_state = dispatch_cg_and_sync_dp(
             self.cudagraph_manager,
             num_reqs,
             num_toks,
@@ -1825,6 +1825,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.dp_size,
             self.dp_rank,
             need_eager=is_profile or skip_compiled,
+            allow_skip_drafts=scheduler_output.skip_drafts,
+        )
+        num_tokens_across_dp = (
+            dp_sync_state.num_tokens_across_dp if dp_sync_state is not None else None
         )
 
         if batch_desc.num_tokens == 0:
@@ -2045,6 +2049,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             output_intermediate_tensors = model_output
 
         finished_req_ids = scheduler_output.finished_req_ids
+        skip_drafts = (
+            dp_sync_state.skip_drafts
+            if dp_sync_state is not None
+            else scheduler_output.skip_drafts
+        )
         self.execute_model_state = ExecuteModelState(
             input_batch=input_batch,
             attn_metadata=attn_metadata,
@@ -2052,7 +2061,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states=hidden_states,
             aux_hidden_states=aux_hidden_states,
             finished_req_ids=finished_req_ids,
-            num_spec_tokens_to_schedule=scheduler_output.num_spec_tokens_to_schedule,
+            num_spec_tokens_to_schedule=(
+                0 if skip_drafts else scheduler_output.num_spec_tokens_to_schedule
+            ),
         )
         self._sm70_v2_mtp_profile_pending = mtp_profile_ctx
 
@@ -2231,7 +2242,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_draft_tokens = None
             proposal_kwargs: dict[str, int] = {}
             speculator = self.speculator
-            if speculator.method == "mtp" or (
+            if (
+                execute_model_state.num_spec_tokens_to_schedule == 0
+                or speculator.method == "mtp"
+            ) or (
                 isinstance(speculator, DFlashSpeculator)
                 and speculator.speculative_config.num_speculative_tokens_per_batch_size
                 is not None

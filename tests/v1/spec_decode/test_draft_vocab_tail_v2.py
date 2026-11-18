@@ -933,6 +933,7 @@ def test_speculator_enabled_initialization_and_sampling(
         ("dflash", False, 3, False),
         ("dflash", False, 3, True),
         ("dflash", False, 0, True),
+        ("dflash", False, 0, False),
     ],
 )
 def test_runner_actual_call_order(monkeypatch, method, with_tail, k, structured):
@@ -1005,14 +1006,17 @@ def test_runner_actual_call_order(monkeypatch, method, with_tail, k, structured)
     runner.num_speculative_steps = 4
     if method == "dflash":
         runner.speculator = object.__new__(runner_mod.DFlash2Speculator)
+        has_dsd = k is not None and (k > 0 or structured)
         runner.speculator.speculative_config = SimpleNamespace(
-            num_speculative_tokens_per_batch_size=None if k is None else [(1, 1, k)]
+            num_speculative_tokens_per_batch_size=[(1, 1, k)] if has_dsd else None
         )
         runner.speculator.prepare_target_context = Mock()
         runner.speculator._lookup_enabled = False
         if k is not None:
             runner.speculator.next_num_draft_tokens = Mock(
-                side_effect=AssertionError("DSD already chose the publication width")
+                side_effect=AssertionError(
+                    "The runner already chose the publication width"
+                )
             )
     else:
         runner.speculator = object.__new__(eagle.EagleSpeculator)
@@ -1040,8 +1044,12 @@ def test_runner_actual_call_order(monkeypatch, method, with_tail, k, structured)
     runner.mixed_prefill_timer = SimpleNamespace(finish=Mock(return_value=None))
     runner.use_async_scheduling = True
     runner.eplb = SimpleNamespace(step=Mock())
-    monkeypatch.setattr(runner_mod, "AsyncOutput", lambda **kwargs: SimpleNamespace())
-    runner.sample_tokens(None)
+    monkeypatch.setattr(runner_mod, "AsyncOutput", SimpleNamespace)
+    output = runner.sample_tokens(None)
+    assert output.sampler_output.sampled_token_ids is ids
+    assert output.num_sampled_tokens is counts
+    if method == "dflash" and k is not None:
+        runner.speculator.next_num_draft_tokens.assert_not_called()
     width = 4 if k is None else k
     prefix = list(range(20, 20 + width))
     assert runner.req_states.draft_tokens.tolist() == [prefix + [-1] * (4 - width)]

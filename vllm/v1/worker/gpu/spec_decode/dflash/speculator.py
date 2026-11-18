@@ -34,15 +34,6 @@ from vllm.v1.worker.utils import AttentionGroup
 logger = init_logger(__name__)
 
 
-def _is_context_only_prefill(input_batch: InputBatch) -> bool:
-    incomplete_prefill = input_batch.is_incomplete_prefilling_np
-    return bool(
-        incomplete_prefill is not None
-        and incomplete_prefill.size == input_batch.num_reqs
-        and np.all(incomplete_prefill)
-    )
-
-
 class DFlashSpeculator(DraftModelSpeculator):
     _speculator_name = "DFlash"  # For logging, so we can share methods with subclasses
 
@@ -138,7 +129,6 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.draft_kv_cache_group_id: int = -1
-        self._context_only_prefill_logged = False
         self._query_slot_mappings: torch.Tensor | None = None
         self._debug_proposal_stages = bool(
             int(os.getenv("VLLM_DFLASH_DEBUG_PROPOSAL_STAGES", "0"))
@@ -710,19 +700,8 @@ class DFlashSpeculator(DraftModelSpeculator):
             )
         self._debug_proposal_stage("context kv end")
 
-        if not dummy_run and _is_context_only_prefill(input_batch):
-            # Intermediate chunked-prefill steps only need to materialize the
-            # target hidden states into draft KV. Their proposed tokens cannot
-            # be consumed before the final prompt chunk, which will run the
-            # normal query graph and replace this sentinel output.
-            self.draft_tokens[:num_reqs].fill_(-1)
-            if not self._context_only_prefill_logged:
-                logger.info(
-                    "%s context-only path is skipping unused draft queries "
-                    "for intermediate prefill chunks.",
-                    self._speculator_name,
-                )
-                self._context_only_prefill_logged = True
+        if num_speculative_tokens == 0:
+            # The context K/V is in sync. No request needs the query pass.
             return self.draft_tokens[:num_reqs]
 
         if self._prepare_ngram_assist(
@@ -739,7 +718,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         with record_function_or_nullcontext("dflash: query and selector"):
             # Every DFlash step has exactly num_query_per_req tokens, so we can
             # use FULL CUDA graphs.
-            batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
+            batch_desc, dp_sync_state = dispatch_cg_and_sync_dp(
                 self.query_cudagraph_manager,
                 num_reqs,
                 num_query_tokens,
@@ -747,6 +726,11 @@ class DFlashSpeculator(DraftModelSpeculator):
                 dp_size=self.dp_size,
                 dp_rank=self.dp_rank,
                 need_eager=is_profile,
+            )
+            num_tokens_across_dp = (
+                dp_sync_state.num_tokens_across_dp
+                if dp_sync_state is not None
+                else None
             )
 
             num_reqs_padded = batch_desc.num_reqs or num_reqs

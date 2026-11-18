@@ -146,6 +146,54 @@ def test_hy4_tp4_compact_geometry():
     assert not _supports_compact_metadata_shape(layer, 32)
 
 
+def test_hy4_tp4_awq_resident_buffers_cpu(monkeypatch):
+    layer = SimpleNamespace(
+        moe_config=SimpleNamespace(has_bias=False, experts_per_token=16),
+        global_num_experts=512,
+        sm70_num_experts=512,
+        sm70_hidden_logical_size=1536,
+        sm70_w13_n_dim=768,
+        sm70_intermediate_size=384,
+        sm70_w2_n_dim=1536,
+        sm70_awq_qwen38_w2_chunk_tokens=0,
+        sm70_ptr_row_bytes=16,
+        w13_tm_weight=torch.empty(0, device="cpu"),
+    )
+    monkeypatch.setattr(
+        torch.ops._moe_C,
+        "moe_permute_sort_workspace_size",
+        lambda slots, experts: 1024,
+        raising=False,
+    )
+    method = AWQSM70MoEMethod(4, 32, True, layer)
+    method._allocate_buffers(layer)
+    assert layer._awq_moe_buf_max_tokens == 32
+    batch = method._get_buffers(layer, 8 * 16, 8, indexed_w13=False)
+    for name, shape in {
+        "output": (8, 1536),
+        "permuted_input": (128, 1536),
+        "gate_up": (128, 768),
+        "intermediate": (128, 384),
+        "sorted_output": (128, 1536),
+        "inv_permuted_idx": (8, 16),
+        "topk_ids": (8, 16),
+        "expert_offsets": (513,),
+    }.items():
+        assert batch[name].shape == shape
+        assert batch[name].is_contiguous()
+
+    single = method._get_buffers(layer, 16, 1, indexed_w13=False)
+    dynamic = method._get_buffers(layer, 33 * 16, 33, indexed_w13=False)
+    assert batch["output"].data_ptr() == single["output"].data_ptr()
+    assert dynamic["output"].data_ptr() != batch["output"].data_ptr()
+    batch["output"].fill_(1)
+    snapshot = batch["output"].clone()
+    single["output"].zero_()
+    assert torch.count_nonzero(batch["output"][0]) == 0
+    torch.testing.assert_close(batch["output"][1:], snapshot[1:], atol=0, rtol=0)
+    assert torch.all(snapshot[0] == 1)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("tokens", [1, 7, 67])
 @torch.inference_mode()
@@ -168,3 +216,68 @@ def test_sm70_awq_rtn_experts_against_torch(monkeypatch, tokens):
     )
     assert (actual.cpu().float() - expected).norm() / expected.norm() < 5e-3
     torch.testing.assert_close(actual.cpu().float(), expected, atol=1, rtol=1e-2)
+
+
+@pytest.fixture(scope="module")
+@torch.inference_mode()
+def hy4_tp4_awq_experts():
+    if not current_platform.is_device_capability(70):
+        pytest.skip("requires SM70 TurboMind")
+    torch.manual_seed(19)
+    layer = nn.Module()
+    layer.moe_config = SimpleNamespace(has_bias=False, tp_size=4, experts_per_token=16)
+    layer.global_num_experts = layer.local_num_experts = 512
+    layer.expert_map = None
+    layer.swiglu_limit = 10.0
+    layer.apply_router_weight_on_input = False
+    method = AWQSM70MoEMethod(4, 32, True, layer)
+    with torch.device("cuda"):
+        method.create_weights(layer, 512, 1536, 384, torch.float16)
+
+    refs = []
+    for expert in range(512):
+        matrices = []
+        for name, k, n, std in (("w13", 1536, 768, 0.17), ("w2", 384, 1536, 0.035)):
+            w = torch.randn(k // 32, 32, n, device="cuda", dtype=torch.float32) * std
+            packed, dequantized = _rtn(w.flatten(0, 1).T)
+            matrices.append(dequantized.half())
+            for suffix, tensor in packed.items():
+                getattr(layer, f"{name}_{suffix}")[expert].copy_(tensor)
+        w13, w2 = matrices
+        gate, up = w13.chunk(2, dim=0)
+        refs.append((gate, up, w2))
+
+    method.process_weights_after_loading(layer)
+    assert layer.sm70_awq_moe_batched_gemm
+    assert layer.sm70_awq_moe_compact_metadata
+    assert not layer.sm70_awq_moe_w13_interleaved
+    assert layer._awq_moe_buf_max_tokens == 32
+    return method, layer, refs
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("tokens", [1, 2, 8, 32, 33, 600])
+@torch.inference_mode()
+def test_hy4_tp4_awq_against_fp32(hy4_tp4_awq_experts, tokens):
+    method, layer, refs = hy4_tp4_awq_experts
+    torch.manual_seed(19)
+    x = torch.randn(tokens, 1536, device="cuda", dtype=torch.float16)
+    scores = torch.randn(tokens, 512, device="cuda", dtype=torch.float32).sigmoid()
+    bias = 0.10 * torch.randn(512, device="cuda", dtype=torch.float32)
+    ids = (scores + bias).topk(16, dim=-1).indices
+    weights = scores.gather(1, ids)
+    weights = 3.998 * (weights / weights.sum(-1, keepdim=True))
+
+    x_fp32 = x.float()
+    slot_outputs = x_fp32.new_empty((tokens * 16, 1536))
+    flat_ids = ids.flatten().cpu()
+    for expert, ref in enumerate(refs):
+        slots = (flat_ids == expert).nonzero().flatten().to(x.device)
+        if slots.numel() > 0:
+            slot_outputs[slots] = _reference(x_fp32[slots // 16], ref)
+    expected = (slot_outputs.view(tokens, 16, 1536) * weights.unsqueeze(-1)).sum(dim=1)
+
+    # Consume the resident output before another call can overwrite its first row.
+    actual = method.apply(layer, x, weights, ids.int(), None, None)
+    rel_l2 = (actual.float() - expected).norm() / expected.norm()
+    assert rel_l2.item() < 3e-3

@@ -11,6 +11,7 @@ from vllm.models.hy_v4_flash.common.ngram_hash import (
     hash_ngrams_torch,
     hash_ngrams_triton,
 )
+from vllm.models.hy_v4_flash.nvidia.engram import FlashNgramHashState
 
 pytestmark = pytest.mark.skip_global_cleanup
 
@@ -98,6 +99,52 @@ def test_chunks_match_full_sequence():
             compute(tokens[start:end], torch.tensor([history], dtype=torch.int32))
         )
     torch.testing.assert_close(torch.cat(pieces, dim=1), full, rtol=0, atol=0)
+
+
+def test_hash_state_loads_each_layer_and_writes_output(monkeypatch):
+    refs, maps, sizes, multipliers, primes, offsets = make_case()
+    layers = (2, 12, 22, 32)
+    config = SimpleNamespace(
+        engram_layer_ids=layers,
+        engram_max_ngram_size=3,
+        engram_n_head_per_ngram=2,
+        engram_n_embed_per_ngram=8,
+        engram_pad_id=3,
+        engram_seed=42,
+        vocab_size=32,
+        engram_layer_head_vocab_sizes={
+            str(layer): [[11, 13], [17, 19]] for layer in layers
+        },
+    )
+    state = FlashNgramHashState(config)
+    for index, layer in enumerate(layers):
+        state.load_lookup(maps[index], layer)
+    torch.testing.assert_close(state.multipliers, multipliers, rtol=0, atol=0)
+    tokens = torch.tensor([4, 31, 35, 3, 8], dtype=torch.int32)
+    history = torch.tensor([[3, 3]], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        query_start_loc=torch.tensor([0, 5]), num_actual_tokens=5
+    )
+    monkeypatch.setattr(
+        "vllm.models.hy_v4_flash.nvidia.engram.get_forward_context",
+        lambda: SimpleNamespace(attn_metadata={"attn": metadata}),
+    )
+    output = torch.empty((4, 5, 4), dtype=torch.int32)
+    state.prepare_hashes_with_output(tokens, history, "attn", output)
+    expected = hash_ngrams_torch(
+        tokens,
+        metadata.query_start_loc,
+        history,
+        maps,
+        sizes,
+        multipliers,
+        primes,
+        offsets,
+        3,
+        5,
+    )
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    assert len(refs) == 4
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

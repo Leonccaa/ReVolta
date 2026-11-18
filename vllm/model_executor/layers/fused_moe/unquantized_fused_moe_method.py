@@ -184,12 +184,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             layer.w2_weight.is_shuffled = True
 
         if not is_weight_update:
-            # Setup moe kernel only on the first call. For the unquantized
-            # method, moe_quant_config is either the constant
-            # FUSED_MOE_UNQUANTIZED_CONFIG or biased_moe_quant_config(...)
-            # which references layer.w{13,2}_bias; since weight updates
-            # mutate those bias tensors in place, the kernel does not need
-            # to be re-built.
+            # The config holds the layer's clamp and references any bias
+            # tensors. Weight updates mutate the biases in place, so there
+            # is no need to rebuild the kernel.
             self.moe_quant_config = self.get_fused_moe_quant_config(layer)
             assert self.moe_quant_config is not None
             assert self.experts_cls is not None
@@ -281,13 +278,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             )
 
     def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantConfig:
+        gemm1_clamp_limit = getattr(layer, "swiglu_limit", None)
         if self.moe.has_bias:
-            return biased_moe_quant_config(
-                layer.w13_bias,
-                layer.w2_bias,
-            )
-        else:
-            return FUSED_MOE_UNQUANTIZED_CONFIG
+            config = biased_moe_quant_config(layer.w13_bias, layer.w2_bias)
+            config.gemm1_clamp_limit = gemm1_clamp_limit
+            return config
+        if gemm1_clamp_limit is not None:
+            return FusedMoEQuantConfig.make(gemm1_clamp_limit=gemm1_clamp_limit)
+        return FUSED_MOE_UNQUANTIZED_CONFIG
 
     def apply(
         self,

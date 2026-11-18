@@ -11,6 +11,7 @@ from torch.nn import functional as F
 
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.fused_moe import UnquantizedFusedMoEMethod
+from vllm.model_executor.layers.fused_moe.config import FUSED_MOE_UNQUANTIZED_CONFIG
 from vllm.models.hy_v4_flash.configs import HYV4FlashConfig
 from vllm.models.hy_v4_flash.nvidia.model import HYV4FlashForCausalLM
 from vllm.models.hy_v4_flash.nvidia.moe import HYV4FlashMoE
@@ -225,6 +226,20 @@ def test_three_layer_body(
         atol=0,
         rtol=0,
     )
+
+
+def test_unquantized_expert_clamp_config(cpu_vllm):
+    config = HYV4FlashConfig(**_config(swiglu_limit=10.0))
+    with set_default_torch_dtype(torch.float16):
+        experts = HYV4FlashMoE(config, None, "mlp").experts
+    method = experts.quant_method
+    assert isinstance(method, UnquantizedFusedMoEMethod)
+    quant_config = method.get_fused_moe_quant_config(experts)
+    assert quant_config.gemm1_clamp_limit == 10.0
+    assert quant_config is not FUSED_MOE_UNQUANTIZED_CONFIG
+    default = method.get_fused_moe_quant_config(nn.Module())
+    assert default is FUSED_MOE_UNQUANTIZED_CONFIG
+    assert default.gemm1_clamp_limit is None
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])

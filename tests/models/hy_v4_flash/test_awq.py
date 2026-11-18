@@ -78,6 +78,8 @@ def _make_experts(monkeypatch, device):
             prefix="model.layers.0.mlp.experts",
         )
         model.layers[0].mlp.experts = experts
+        model.start_layer, model.end_layer = 0, 1
+        model._init_expert_mapping()
         assert isinstance(experts.quant_method, AWQSM70MoEMethod)
         weights = []
         refs = []

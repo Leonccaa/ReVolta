@@ -73,6 +73,7 @@ class HYV4FlashModel(HYV4Model):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self._init_expert_mapping()
         self.engram_hash = None
         self.engram_indices = {
             layer_id - 1: index
@@ -135,23 +136,29 @@ class HYV4FlashModel(HYV4Model):
             hidden = hidden + residual
         return self.norm(hidden)
 
+    def _init_expert_mapping(self) -> None:
+        mapping = fused_moe_make_expert_params_mapping(
+            self,
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.num_experts,
+        )
+        self._expert_mapping = {
+            ckpt: (param, expert_id, shard) for param, ckpt, expert_id, shard in mapping
+        }
+        # The default checkpoint loader also uses this mapping for NVFP4 coverage.
+        for idx in range(self.start_layer, self.end_layer):
+            if isinstance(mlp := self.layers[idx].mlp, HYV4FlashMoE):
+                mlp.experts.expert_mapping = mapping
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params = dict(self.named_parameters())
-        expert_mapping = {
-            ckpt: (param, expert_id, shard)
-            for param, ckpt, expert_id, shard in fused_moe_make_expert_params_mapping(
-                self,
-                ckpt_gate_proj_name="gate_proj",
-                ckpt_down_proj_name="down_proj",
-                ckpt_up_proj_name="up_proj",
-                num_experts=self.config.num_experts,
-            )
-        }
         loaded: set[str] = set()
         for name, value in weights:
             if match := _EXPERT.fullmatch(name):
                 prefix, projection, suffix = match.groups()
-                target, expert_id, shard = expert_mapping[projection]
+                target, expert_id, shard = self._expert_mapping[projection]
                 name = f"{prefix}{target}{suffix}"
                 param = params[name]
                 param.weight_loader(

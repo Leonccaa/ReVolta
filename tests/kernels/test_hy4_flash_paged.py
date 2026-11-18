@@ -727,17 +727,19 @@ def test_cuda_decode_graph_replays_eager(vllm_config, monkeypatch):
     )
     device = torch.device("cuda")
     rows = 4
+    prefixes = (2051, 512)
     torch.manual_seed(79)
     layers = [
         PagedLayer(
-            make_layer(vllm_config, config, idx, 2304, monkeypatch, device=device),
+            make_layer(
+                vllm_config, config, idx, sum(prefixes), monkeypatch, device=device
+            ),
             vllm_config,
             2304,
             requests=rows,
         )
         for idx in range(2)
     ]
-    prefixes = (2051, 512)
     for paged in layers:
         for weight in paged.layer.parameters():
             weight.normal_(std=0.15)

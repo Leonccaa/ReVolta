@@ -26,6 +26,9 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# 512 E4M3 bytes, four FP32 scales, and 64 two-byte RoPE values.
+FP8_DS_MLA_BYTES = 656
+
 
 # ---------------------------------------------------------------------------
 # KV cache quantization mode
@@ -432,7 +435,7 @@ class MLAAttentionSpec(FullAttentionSpec):
                 return self.storage_block_size * 584
             # V3.2 main MLA: 656-byte custom layout (kv_lora_rank=512 +
             # qk_rope_head_dim=64, head_size=576). See flashmla_sparse.py.
-            return self.block_size * 656
+            return self.block_size * FP8_DS_MLA_BYTES
         return (
             self.storage_block_size
             * self.num_kv_heads
@@ -668,6 +671,8 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         assert self.model_version is None, (
             f"Unsupported model version: {self.model_version}"
         )
+        if self.cache_dtype_str == "fp8_ds_mla":
+            return self.storage_block_size * FP8_DS_MLA_BYTES
         return (
             self.storage_block_size
             * self.num_kv_heads

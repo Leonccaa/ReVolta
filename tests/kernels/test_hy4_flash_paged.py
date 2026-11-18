@@ -26,6 +26,7 @@ from vllm.v1.core.kv_cache_utils import (
     generate_scheduler_kv_cache_config,
     get_kv_cache_config_from_groups,
     get_kv_cache_groups,
+    get_max_concurrency_for_kv_cache_config,
     get_request_block_hasher,
     init_none_hash,
 )
@@ -156,7 +157,11 @@ class PagedLayer:
             )
             self.tables[owner.prefix] = table.flip(0).view(requests, blocks)
             shape = owner.backend.get_kv_cache_shape(
-                (requests * blocks + 1) * page_ratio, page, 1, spec.head_size
+                (requests * blocks + 1) * page_ratio,
+                page,
+                1,
+                spec.head_size,
+                spec.layout_cache_dtype(config.cache_config.cache_dtype),
             )
             # Pad the page stride without changing the contiguous layout of each row.
             storage = torch.zeros(
@@ -421,12 +426,19 @@ def test_window_boundaries():
     assert rows[2].tolist() == list(range(1, 513))
 
 
-@pytest.mark.parametrize("n_swa", [0, 30])
-def test_scheduler_page_layout(vllm_config, monkeypatch, n_swa):
+@pytest.mark.parametrize(
+    "n_swa,cache_dtype", [(0, "auto"), (30, "auto"), (30, "fp8_ds_mla")]
+)
+def test_scheduler_page_layout(vllm_config, monkeypatch, n_swa, cache_dtype):
     from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 
-    vllm_config.model_config = SimpleNamespace(max_model_len=4096)
+    vllm_config.model_config = SimpleNamespace(max_model_len=8192)
+    vllm_config.cache_config.cache_dtype = cache_dtype
+    vllm_config.cache_config.gpu_memory_utilization = 0.95
+    vllm_config.parallel_config.tensor_parallel_size = 4
     vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = False
+    vllm_config.scheduler_config.max_num_batched_tokens = 2048
+    vllm_config.scheduler_config.max_num_seqs = 4
     cfg = text_config()
     cfg.kv_lora_rank = 512
     cfg.qk_rope_head_dim = cfg.swa_qk_rope_head_dim = 64
@@ -434,15 +446,21 @@ def test_scheduler_page_layout(vllm_config, monkeypatch, n_swa):
     cfg.layer_types = ["indexed_attention"] * 12 + ["sliding_attention"] * n_swa
     cfg.rope_for_layer = lambda i: {"rope_theta": 1e7 if i < 12 else 1e4}
     for idx in range(12 + n_swa):
-        make_layer(vllm_config, cfg, idx, 1, monkeypatch)
+        make_layer(vllm_config, cfg, idx, 1, monkeypatch, device="meta")
     layers = vllm_config.compilation_config.static_forward_context
     groups = get_kv_cache_groups(
         vllm_config, {name: layer.spec for name, layer in layers.items()}
     )
-    cache = get_kv_cache_config_from_groups(vllm_config, groups, 128 << 20)
+    # Use the profiled per-rank KV budget at 0.95 utilization for both layouts.
+    cache = get_kv_cache_config_from_groups(vllm_config, groups, int(2.9 * (1 << 30)))
+    if n_swa == 30:
+        tokens = int(8192 * get_max_concurrency_for_kv_cache_config(vllm_config, cache))
+        expected = (1126, 129918) if cache_dtype == "fp8_ds_mla" else (666, 76843)
+        assert (cache.num_blocks, tokens) == expected
+        print(f"TP4 {cache_dtype}: {cache.num_blocks} pool blocks, {tokens} tokens")
     coordinator = HybridKVCacheCoordinator(
         generate_scheduler_kv_cache_config([cache]),
-        4096,
+        8192,
         2048,
         False,
         True,
@@ -478,7 +496,11 @@ def test_scheduler_page_layout(vllm_config, monkeypatch, n_swa):
                 else spec.block_size
             )
             shape = layer.backend.get_kv_cache_shape(
-                2 * spec.storage_block_size // page, page, 1, spec.head_size
+                2 * spec.storage_block_size // page,
+                page,
+                1,
+                spec.head_size,
+                spec.layout_cache_dtype(cache_dtype),
             )
             layer.bind_kv_cache(
                 bind_attention_cache(
@@ -493,6 +515,14 @@ def test_scheduler_page_layout(vllm_config, monkeypatch, n_swa):
             )
             assert layer.kv_cache.shape == shape
             assert layer.kv_cache.stride(0) * layer.kv_cache.element_size() == stride
+            if isinstance(spec, CircularBufferSpec):
+                assert spec.dtype == torch.float32
+            elif cache_dtype == "fp8_ds_mla" and name.endswith(".attn"):
+                assert spec.dtype == torch.uint8
+                assert shape[-1] == 656
+                assert spec.real_page_size_bytes == spec.block_size * 656
+            else:
+                assert spec.dtype == torch.float16
 
 
 @torch.inference_mode()
@@ -718,18 +748,31 @@ def test_decode_metadata_reuses_runner_buffers(vllm_config):
     not current_platform.is_cuda() or not torch.accelerator.is_available(),
     reason="CUDA required",
 )
+@pytest.mark.parametrize("cache_dtype", ["auto", "fp8_ds_mla"])
 @torch.inference_mode()
-def test_cuda_decode_graph_replays_eager(vllm_config, monkeypatch, workspace_init):
+def test_cuda_decode_graph_replays_eager(
+    vllm_config, monkeypatch, workspace_init, cache_dtype
+):
     from vllm.v1.worker.workspace import lock_workspace
 
     config = text_config()
     config.qk_rope_head_dim = config.swa_qk_rope_head_dim = 16
+    vllm_config.cache_config.cache_dtype = cache_dtype
+    prefixes: tuple[int, ...] = (2051, 512)
+    replay_requests: tuple[tuple[int, ...], ...] = ((0, 1), (1,))
+    if cache_dtype == "fp8_ds_mla":
+        config.kv_lora_rank = 512
+        config.qk_rope_head_dim = config.swa_qk_rope_head_dim = 64
+        config.compressed_indexer_head_dim = 128
+        config.num_attention_heads = 8
+        config.swa_num_attention_heads = 16
+        prefixes = (2047, 2051, 510, 511)
+        replay_requests = ((1, 2, 3, 0), (3,))
     vllm_config.model_config = SimpleNamespace(
         max_model_len=2304, hf_text_config=config
     )
     device = torch.device("cuda")
     rows = 4
-    prefixes = (2051, 512)
     torch.manual_seed(79)
     layers = [
         PagedLayer(
@@ -825,7 +868,7 @@ def test_cuda_decode_graph_replays_eager(vllm_config, monkeypatch, workspace_ini
     forward(None)
     lock_workspace()
     expected_steps = []
-    for requests in ((0, 1), (1,)):
+    for requests in replay_requests:
         eager = forward(stage(requests))
         expected_caches = [owner.kv_cache.clone() for owner in owners]
         expected_steps.append((requests, eager, expected_caches))

@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Split-K decode for Hy4 Flash's FP16 paged MLA cache."""
+"""Split-K decode for Hy4 Flash's paged MLA cache."""
 
 import torch
 
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
+
+from .kernels import load_main_kv
 
 # Two 16-key tiles keep the SM70 shared-memory footprint within a CTA limit.
 _KEYS_PER_SPLIT = 32
@@ -68,8 +70,7 @@ def _decode_split(
             slot = tl.load(Indices + row * stride_indices + n, live, other=0)
             page = (slot // PAGE).to(tl.int64)
             kb = KV + page * stride_kvp + (slot % PAGE) * stride_kvr
-            k = tl.load(kb[:, None] + d[None, :], live[:, None], other=0)
-            kr = tl.load(kb[:, None] + LATENT + r[None, :], live[:, None], other=0)
+            k, kr = load_main_kv(kb, d, r, live, LATENT)
             logits = (tl.dot(q, tl.trans(k)) + tl.dot(qr, tl.trans(kr))) * SCALE
             logits = tl.where(live[None, :], logits, float("-inf"))
             new_max = tl.maximum(maximum, tl.max(logits, axis=1))

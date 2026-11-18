@@ -19,6 +19,7 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.kv_cache_interface import (
+    FP8_DS_MLA_BYTES,
     AttentionSpec,
     CircularBufferSpec,
     MLAAttentionSpec,
@@ -139,7 +140,11 @@ class FlashMetadataBuilder(AttentionMetadataBuilder[FlashMetadata]):
 
 class FlashSparseBackend(AttentionBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16]
-    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["auto", "float16"]
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        "auto",
+        "float16",
+        "fp8_ds_mla",
+    ]
 
     @staticmethod
     def get_name() -> str:
@@ -163,7 +168,8 @@ class FlashSparseBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
-        return (num_blocks, block_size, head_size)
+        row_size = FP8_DS_MLA_BYTES if cache_dtype_str == "fp8_ds_mla" else head_size
+        return (num_blocks, block_size, row_size)
 
     @classmethod
     def is_mla(cls) -> bool:

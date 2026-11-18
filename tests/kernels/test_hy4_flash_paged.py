@@ -8,7 +8,12 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+from vllm.config import (
+    DeviceConfig,
+    ParallelConfig,
+    VllmConfig,
+    set_current_vllm_config,
+)
 from vllm.distributed import parallel_state
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -1009,12 +1014,23 @@ def _cuda_hy4_dcp_worker(rank, world, cache_dtype, rendezvous, check):
 
     device = torch.device("cuda", rank)
     torch.accelerator.set_device_index(rank)
-    parallel_state.init_distributed_environment(
-        world_size=4, rank=rank, local_rank=rank, distributed_init_method=rendezvous
+    parallel_config = ParallelConfig(
+        tensor_parallel_size=4, decode_context_parallel_size=world
     )
-    parallel_state.initialize_model_parallel(
-        tensor_model_parallel_size=4, decode_context_model_parallel_size=world
+    vc = VllmConfig(
+        device_config=DeviceConfig(device=device), parallel_config=parallel_config
     )
+    with set_current_vllm_config(vc):
+        parallel_state.init_distributed_environment(
+            world_size=parallel_config.world_size,
+            rank=rank,
+            local_rank=rank,
+            distributed_init_method=rendezvous,
+        )
+        parallel_state.initialize_model_parallel(
+            tensor_model_parallel_size=parallel_config.tensor_parallel_size,
+            decode_context_model_parallel_size=parallel_config.decode_context_parallel_size,
+        )
     init_workspace_manager(device)
     try:
         check(rank, world, cache_dtype, device)

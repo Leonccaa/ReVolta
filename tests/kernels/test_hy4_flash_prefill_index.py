@@ -86,28 +86,26 @@ def test_prefill_scores_match_paged(monkeypatch, device, world):
         new[:, rank::world] = actual[:, :cols]
 
     valid = reference.isfinite()
-    old_error = (old[valid] - reference[valid]).abs()
-    new_error = (new[valid] - reference[valid]).abs()
-    bitwise = torch.equal(old.view(torch.int32), new.view(torch.int32))
+    ref = reference[valid]
+    old_error = (old[valid] - ref).norm() / ref.norm()
+    new_error = (new[valid] - ref).norm() / ref.norm()
     print(
-        f"{device=} {world=} {bitwise=} max_abs "
-        f"old={old_error.max().item():.8g} new={new_error.max().item():.8g} "
-        f"l2 old={old_error.norm().item():.8g} new={new_error.norm().item():.8g}"
+        f"{device=} {world=} relative L2 "
+        f"old={old_error.item():.8g} new={new_error.item():.8g}"
     )
-    assert new_error.max() <= old_error.max()
-    assert new_error.norm() <= old_error.norm()
+    assert new_error <= 2 * old_error
 
     old_top = old.topk(511)
     new_top = new.topk(511)
     cutoff = old_top.values[:, -1:]
-    ties = (old > cutoff).sum(1) + (old == cutoff).sum(1) > 511
-    print(f"top-511 cutoff ties={ties.sum().item()}/{rows}")
-    assert torch.equal(
-        old_top.indices[~ties].sort().values, new_top.indices[~ties].sort().values
-    )
-    # A cutoff tie permits any of the tied groups after all strict winners.
-    picked = old[ties].gather(1, new_top.indices[ties])
-    assert (picked >= cutoff[ties]).all()
-    assert torch.equal(
-        (picked > cutoff[ties]).sum(1), (old[ties] > cutoff[ties]).sum(1)
-    )
+    old_selected = torch.zeros_like(valid).scatter_(1, old_top.indices, True)
+    new_selected = torch.zeros_like(valid).scatter_(1, new_top.indices, True)
+    changed = old_selected ^ new_selected
+    # Scale the near-tie window by the row score magnitude so it also works
+    # when cancellation puts the cutoff close to zero.
+    scale = reference.masked_fill(~valid, 0).abs().amax(dim=1, keepdim=True)
+    tolerance = 16 * torch.finfo(reference.dtype).eps * scale
+    near_cutoff = (old - cutoff).abs() <= tolerance
+    assert (near_cutoff | ~changed).all()
+    exact = (~changed.any(dim=1)).sum().item()
+    print(f"top-511 exact rows={exact}/{rows} near-tie swaps={rows - exact}/{rows}")

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -710,12 +711,18 @@ def test_cuda_weighted_pool_scores():
     torch.testing.assert_close(actual.cpu(), expected, rtol=2e-3, atol=1e-4)
 
 
-def test_decode_metadata_reuses_runner_buffers(vllm_config):
+@pytest.mark.parametrize("world", [1, 2, 4])
+def test_decode_metadata_reuses_runner_buffers(vllm_config, world):
     from vllm.models.hy_v4_flash.sm70.cache import FlashMetadataBuilder
     from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
+    vllm_config.parallel_config.decode_context_parallel_size = world
     spec = MLAAttentionSpec(
-        block_size=256, num_kv_heads=1, head_size=576, dtype=torch.float16
+        block_size=256 // world,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.float16,
+        dcp_sharded=world > 1,
     )
     builder = FlashMetadataBuilder(spec, ["attn"], vllm_config, torch.device("cpu"))
     assert builder.get_cudagraph_support(vllm_config, spec) == (
@@ -737,7 +744,13 @@ def test_decode_metadata_reuses_runner_buffers(vllm_config):
         slot_mapping=slots,
         is_dummy_batch=True,
     )
-    captured = builder.build_for_cudagraph_capture(common)
+    # Exercise the CUDA decode branch with CPU storage and no host reads.
+    with (
+        patch.object(torch.Tensor, "is_cuda", True),
+        patch.object(torch.Tensor, "tolist", side_effect=AssertionError),
+        patch.object(torch.Tensor, "item", side_effect=AssertionError),
+    ):
+        captured = builder.build_for_cudagraph_capture(common)
     assert captured.decode and captured.num_actual_tokens == 3
     assert not captured.spans
     for rows, batch_lens in [(3, [2049, 512, 0]), (2, [520, 0])]:
@@ -748,20 +761,24 @@ def test_decode_metadata_reuses_runner_buffers(vllm_config):
         slots[:valid].fill_(7 * spec.block_size)
         table[valid:].zero_()
         slots[valid:].fill_(-1)
-        replay = builder.build(
-            0,
-            common.replace(
-                query_start_loc=starts[: rows + 1],
-                query_start_loc_cpu=starts[: rows + 1],
-                seq_lens=lengths[:rows],
-                seq_lens_cpu_upper_bound=lengths[:rows],
-                block_table_tensor=table[:rows],
-                slot_mapping=slots[:rows],
-                num_reqs=rows,
-                num_actual_tokens=rows,
-                is_dummy_batch=False,
-            ),
+        step = common.replace(
+            query_start_loc=starts[: rows + 1],
+            query_start_loc_cpu=starts[: rows + 1],
+            seq_lens=lengths[:rows],
+            block_table_tensor=table[:rows],
+            slot_mapping=slots[:rows],
+            num_reqs=rows,
+            num_actual_tokens=rows,
+            max_seq_len=max(batch_lens),
+            is_dummy_batch=False,
         )
+        with (
+            patch.object(torch.Tensor, "is_cuda", True),
+            patch.object(torch.Tensor, "tolist", side_effect=AssertionError),
+            patch.object(torch.Tensor, "item", side_effect=AssertionError),
+        ):
+            replay = builder.build(0, step)
+        assert replay.decode and not replay.spans
         for field in ("seq_lens", "query_start_loc", "block_table", "slot_mapping"):
             assert (
                 getattr(replay, field).data_ptr() == getattr(captured, field).data_ptr()
@@ -788,13 +805,11 @@ def test_decode_metadata_reuses_runner_buffers(vllm_config):
 def test_cuda_decode_graph_replays_eager(
     vllm_config, monkeypatch, workspace_init, cache_dtype
 ):
-    from vllm.v1.worker.workspace import lock_workspace
-
     config = text_config()
     config.qk_rope_head_dim = config.swa_qk_rope_head_dim = 16
     vllm_config.cache_config.cache_dtype = cache_dtype
     prefixes: tuple[int, ...] = (2051, 512)
-    replay_requests: tuple[tuple[int, ...], ...] = ((0, 1), (1,))
+    requests: tuple[tuple[int, ...], ...] = ((0, 1), (1,))
     if cache_dtype == "fp8_ds_mla":
         config.kv_lora_rank = 512
         config.qk_rope_head_dim = config.swa_qk_rope_head_dim = 64
@@ -802,7 +817,7 @@ def test_cuda_decode_graph_replays_eager(
         config.num_attention_heads = 8
         config.swa_num_attention_heads = 16
         prefixes = (2047, 2051, 510, 511)
-        replay_requests = ((1, 2, 3, 0), (3,))
+        requests = ((1, 2, 3, 0), (3,))
     vllm_config.model_config = SimpleNamespace(
         max_model_len=2304, hf_text_config=config
     )
@@ -820,6 +835,15 @@ def test_cuda_decode_graph_replays_eager(
         )
         for idx in range(2)
     ]
+    _check_cuda_decode_graph(vllm_config, config, layers, prefixes, {rows: requests})
+
+
+def _check_cuda_decode_graph(vllm_config, config, layers, prefixes, replay_batches):
+    from vllm.v1.worker.workspace import lock_workspace
+
+    device = layers[0].device
+    rows = max(replay_batches)
+    world = vllm_config.parallel_config.decode_context_parallel_size
     for paged in layers:
         for weight in paged.layer.parameters():
             weight.normal_(std=0.15)
@@ -854,8 +878,10 @@ def test_cuda_decode_graph_replays_eager(
         for owner in owners
     }
 
-    def stage(requests, dummy=False):
-        starts.copy_(torch.arange(rows + 1).clamp_max(rows if dummy else len(requests)))
+    def stage(requests, batch_size, dummy=False):
+        starts.copy_(
+            torch.arange(rows + 1).clamp_max(batch_size if dummy else len(requests))
+        )
         starts_gpu.copy_(starts)
         lengths.fill_(1 if dummy else 0)
         positions.zero_()
@@ -865,7 +891,7 @@ def test_cuda_decode_graph_replays_eager(
         metadata = {}
         for owner in owners:
             name = owner.prefix
-            table = stable_tables[name]
+            table = stable_tables[name][:batch_size]
             table.zero_()
             slots[name].fill_(-1)
             for row, req in enumerate(requests):
@@ -873,17 +899,24 @@ def test_cuda_decode_graph_replays_eager(
                 if name in main_prefixes:
                     page = owner.kv_cache.shape[1]
                     pos = prefixes[req]
+                    if owner.spec.dcp_sharded:
+                        if pos % world != parallel_state.get_dcp_group().rank_in_group:
+                            continue
+                        pos //= world
                     slots[name][row].copy_(table[row, pos // page] * page + pos % page)
             common = CommonAttentionMetadata(
-                query_start_loc=starts_gpu,
-                query_start_loc_cpu=starts,
-                seq_lens=lengths,
-                num_reqs=rows,
-                num_actual_tokens=rows,
+                query_start_loc=starts_gpu[: batch_size + 1],
+                query_start_loc_cpu=starts[: batch_size + 1],
+                seq_lens=lengths[:batch_size],
+                num_reqs=batch_size,
+                num_actual_tokens=batch_size,
                 max_query_len=1,
-                max_seq_len=2304,
+                max_seq_len=max(
+                    (prefixes[req] + 1 for req in requests),
+                    default=vllm_config.model_config.max_model_len,
+                ),
                 block_table_tensor=table,
-                slot_mapping=slots[name],
+                slot_mapping=slots[name][:batch_size],
                 is_dummy_batch=dummy,
             )
             builder = builders[name]
@@ -894,59 +927,84 @@ def test_cuda_decode_graph_replays_eager(
             )
         return metadata
 
-    def forward(metadata):
+    def forward(metadata, batch_size):
         with set_forward_context(metadata, vllm_config):
-            return tuple(paged.layer(positions, inputs) for paged in layers)
+            return tuple(
+                paged.layer(positions[:batch_size], inputs[:batch_size])
+                for paged in layers
+            )
 
     main_prefixes = {paged.layer.attn.prefix for paged in layers}
     positions.zero_()
-    forward(None)
+    forward(None, rows)
     lock_workspace()
-    expected_steps = []
-    for requests in replay_requests:
-        eager = forward(stage(requests))
-        expected_caches = [owner.kv_cache.clone() for owner in owners]
-        expected_steps.append((requests, eager, expected_caches))
-        for owner, before in zip(owners, initial):
-            owner.kv_cache.copy_(before)
+    for batch_size, replay_requests in replay_batches.items():
+        expected_steps = []
+        for requests in replay_requests:
+            eager = forward(stage(requests, batch_size), batch_size)
+            expected_caches = [owner.kv_cache.clone() for owner in owners]
+            expected_steps.append((requests, eager, expected_caches))
+            for owner, before in zip(owners, initial):
+                owner.kv_cache.copy_(before)
 
-    dummy = stage((), dummy=True)
-    warmup = torch.cuda.Stream()
-    warmup.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(warmup):
-        forward(dummy)
-    torch.cuda.current_stream().wait_stream(warmup)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured = forward(dummy)
-    for owner, before in zip(owners, initial):
-        assert torch.equal(owner.kv_cache, before)
-
-    for requests, eager, expected_caches in expected_steps:
-        metadata = stage(requests)
-        graph.replay()
-        for actual, expected in zip(captured, eager):
-            assert torch.isfinite(expected).all()
-            assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
-        for paged in layers:
-            layer = paged.layer
-            pad = slice(len(requests), rows)
-            assert layer.topk_indices_buffer[pad, : layer.width].eq(-1).all()
-            assert metadata[layer.attn.prefix].counts[pad].eq(0).all()
-            counts = metadata[layer.attn.prefix].counts
-            expected_counts = [min(prefixes[req] + 1, layer.width) for req in requests]
-            assert counts[: len(requests)].tolist() == expected_counts
-        for owner, before, expected in zip(owners, initial, expected_caches):
-            assert torch.equal(owner.kv_cache, expected)
-            pages_per_block = owner.spec.storage_block_size // owner.kv_cache.shape[1]
-            assert torch.equal(
-                owner.kv_cache[:pages_per_block], before[:pages_per_block]
+        dummy = stage((), batch_size, dummy=True)
+        stream = torch.cuda.Stream(device=device)
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            forward(dummy, batch_size)
+        torch.cuda.current_stream().wait_stream(stream)
+        capture = (
+            parallel_state.graph_capture(
+                device, parallel_state.GraphCaptureContext(stream)
             )
-            owner.kv_cache.copy_(before)
+            if world > 1
+            else nullcontext()
+        )
+        graph = torch.cuda.CUDAGraph()
+        with capture, torch.cuda.graph(graph, stream=stream):
+            captured = forward(dummy, batch_size)
+        torch.cuda.current_stream().wait_stream(stream)
+        for owner, before in zip(owners, initial):
+            assert torch.equal(
+                owner.kv_cache.view(torch.uint8), before.view(torch.uint8)
+            )
+
+        for requests, eager, expected_caches in expected_steps:
+            metadata = stage(requests, batch_size)
+            graph.replay()
+            for actual, expected in zip(captured, eager):
+                assert torch.isfinite(expected).all()
+                assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+            for paged in layers:
+                layer = paged.layer
+                pad = slice(len(requests), batch_size)
+                local_width = layer.width // layer.dcp_world
+                assert layer.topk_indices_buffer[pad, :local_width].eq(-1).all()
+                counts = metadata[layer.attn.prefix].counts
+                assert counts[pad].eq(0).all()
+                expected_counts = [
+                    min(prefixes[req] + 1, layer.width) for req in requests
+                ]
+                expected_counts = [
+                    (n + layer.dcp_world - 1 - layer.dcp_rank) // layer.dcp_world
+                    for n in expected_counts
+                ]
+                assert counts[: len(requests)].tolist() == expected_counts
+            for owner, before, expected in zip(owners, initial, expected_caches):
+                assert torch.equal(
+                    owner.kv_cache.view(torch.uint8), expected.view(torch.uint8)
+                )
+                pages_per_block = (
+                    owner.spec.storage_block_size // owner.kv_cache.shape[1]
+                )
+                assert torch.equal(
+                    owner.kv_cache[:pages_per_block], before[:pages_per_block]
+                )
+                owner.kv_cache.copy_(before)
 
 
 @torch.inference_mode()
-def _cuda_hy4_dcp_worker(rank, world, cache_dtype, rendezvous):
+def _cuda_hy4_dcp_worker(rank, world, cache_dtype, rendezvous, check):
     from vllm.v1.worker.workspace import init_workspace_manager, reset_workspace_manager
 
     device = torch.device("cuda", rank)
@@ -959,7 +1017,7 @@ def _cuda_hy4_dcp_worker(rank, world, cache_dtype, rendezvous):
     )
     init_workspace_manager(device)
     try:
-        _check_cuda_hy4_dcp(rank, world, cache_dtype, device)
+        check(rank, world, cache_dtype, device)
     finally:
         reset_workspace_manager()
         parallel_state.destroy_model_parallel()
@@ -1037,6 +1095,74 @@ def _check_cuda_hy4_dcp(rank, world, cache_dtype, device):
 def test_cuda_hy4_dcp_matches_tp4_eager(world, cache_dtype, tmp_path):
     torch.multiprocessing.spawn(
         _cuda_hy4_dcp_worker,
-        args=(world, cache_dtype, (tmp_path / "rendezvous").as_uri()),
+        args=(
+            world,
+            cache_dtype,
+            (tmp_path / "rendezvous").as_uri(),
+            _check_cuda_hy4_dcp,
+        ),
+        nprocs=4,
+    )
+
+
+def _check_cuda_hy4_dcp_graph(rank, world, cache_dtype, device):
+    config = text_config()
+    config.num_attention_heads = 32
+    config.swa_num_attention_heads = 64
+    config.kv_lora_rank = 512
+    config.qk_rope_head_dim = config.swa_qk_rope_head_dim = 64
+    config.compressed_indexer_num_attention_heads = 16
+    config.compressed_indexer_head_dim = 128
+    vc = VllmConfig(device_config=DeviceConfig(device=device))
+    vc.parallel_config.decode_context_parallel_size = world
+    vc.model_config = SimpleNamespace(max_model_len=2304, hf_text_config=config)
+    vc.cache_config.cache_dtype = cache_dtype
+    vc.scheduler_config.max_num_seqs = 4
+    prefixes = (2047, 2051, 510, 511)
+    torch.manual_seed(79)
+    with (
+        set_current_vllm_config(vc),
+        set_default_torch_dtype(torch.float16),
+        device,
+    ):
+        layers = [
+            PagedLayer(
+                HYV4FlashAttention(
+                    vc,
+                    config,
+                    idx,
+                    torch.empty(sum(prefixes), 2048, dtype=torch.int32),
+                    f"model.layers.{idx}.self_attn",
+                ),
+                vc,
+                2304,
+                requests=4,
+            )
+            for idx in range(2)
+        ]
+    _check_cuda_decode_graph(
+        vc,
+        config,
+        layers,
+        prefixes,
+        {1: ((0,), (1,)), 2: ((2, 3), (1, 0)), 4: ((1, 2, 3, 0), (3,))},
+    )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or torch.accelerator.device_count() < 4,
+    reason="TP4 requires four CUDA GPUs",
+)
+@pytest.mark.parametrize("world", [2, 4])
+@pytest.mark.parametrize("cache_dtype", ["auto", "fp8_ds_mla"])
+def test_cuda_hy4_dcp_graph_replays_eager(world, cache_dtype, tmp_path):
+    torch.multiprocessing.spawn(
+        _cuda_hy4_dcp_worker,
+        args=(
+            world,
+            cache_dtype,
+            (tmp_path / "rendezvous").as_uri(),
+            _check_cuda_hy4_dcp_graph,
+        ),
         nprocs=4,
     )

@@ -270,9 +270,6 @@ class HYV4FlashForCausalLMConfig(VerifyAndUpdateConfig):
                     "Hy4 Flash DCP requires TP4, DCP2 or DCP4, interleave 1, "
                     "PP1, PCP1 and no speculative decoding."
                 )
-            assert vllm_config.model_config is not None
-            if not vllm_config.model_config.enforce_eager:
-                raise NotImplementedError("Hy4 Flash DCP requires --enforce-eager.")
             parallel.set_dcp_defaults(comm_backend="a2a")
             if parallel.dcp_comm_backend != "a2a":
                 raise NotImplementedError("Hy4 Flash DCP requires A2A communication.")
@@ -280,9 +277,7 @@ class HYV4FlashForCausalLMConfig(VerifyAndUpdateConfig):
         compilation = vllm_config.compilation_config
         if compilation.mode is None:
             compilation.mode = CompilationMode.NONE
-        if dcp > 1:
-            compilation.cudagraph_mode = CUDAGraphMode.NONE
-        elif (
+        if (
             compilation.cudagraph_mode is None
             and vllm_config.optimization_level != OptimizationLevel.O0
         ):

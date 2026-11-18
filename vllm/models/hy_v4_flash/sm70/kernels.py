@@ -309,11 +309,9 @@ def _index_scores(
         w = tl.load(W + row * HEADS + head, head < HEADS, other=0)
         scores = tl.maximum(tl.dot(q, tl.trans(k)), 0.0)
         logits = tl.where(g < upper, tl.sum(scores * w[:, None], axis=0), float("-inf"))
-    tl.store(
-        Logits + row * GROUPS + g,
-        logits,
-        g < GROUPS,
-    )
+    # DCP selection reads only the live prefix, so unused tiles need no fill.
+    if not DECODE or WORLD == 1 or start < upper:
+        tl.store(Logits + row * GROUPS + g, logits, g < GROUPS)
 
 
 def index_scores(

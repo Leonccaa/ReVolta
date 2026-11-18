@@ -131,31 +131,23 @@ def test_cuda_candidate_pack_and_merge(world):
 
 
 @pytest.mark.parametrize("world", [1, 2, 4])
-def test_hy4_dcp_eager_config(world):
-    from types import SimpleNamespace
-
+def test_hy4_dcp_graph_config(world):
     from vllm.config import DeviceConfig, VllmConfig
     from vllm.config.compilation import CUDAGraphMode
     from vllm.model_executor.models.config import HYV4FlashForCausalLMConfig
 
     config = VllmConfig(device_config=DeviceConfig(device="cpu"))
-    config.model_config = SimpleNamespace(enforce_eager=False)
     config.parallel_config.tensor_parallel_size = 4
     config.parallel_config.decode_context_parallel_size = world
     config.parallel_config.dcp_comm_backend = None
     config.compilation_config.cudagraph_mode = None
     verify = HYV4FlashForCausalLMConfig.verify_and_update_config
-    if world == 1:
-        verify(config)
-        assert (
-            config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
-        )
-    else:
-        with pytest.raises(NotImplementedError, match="--enforce-eager"):
-            verify(config)
-        config.model_config.enforce_eager = True
-        verify(config)
-        assert config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+    verify(config)
+    assert config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
+    config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+    verify(config)
+    assert config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+    if world > 1:
         assert config.parallel_config.dcp_comm_backend == "a2a"
         config.parallel_config.dcp_kv_cache_interleave_size = 2
         with pytest.raises(NotImplementedError, match="interleave 1"):

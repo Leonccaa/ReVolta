@@ -56,7 +56,6 @@ class FlashMetadata(AttentionMetadata):
     decode: bool
     counts: torch.Tensor | None
     index_workspace: IndexPoolDecodeWorkspace | None
-    max_seq_len: int = 0
 
 
 class FlashMetadataBuilder(AttentionMetadataBuilder[FlashMetadata]):
@@ -139,7 +138,6 @@ class FlashMetadataBuilder(AttentionMetadataBuilder[FlashMetadata]):
             decode,
             self.counts,
             self.index_workspace,
-            cm.max_seq_len,
         )
 
 

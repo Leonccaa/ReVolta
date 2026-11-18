@@ -11,6 +11,7 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import CircularBufferSpec, MLAAttentionSpec
+from vllm.v1.worker.workspace import current_workspace_manager
 
 from .cache import FlashCache, FlashMetadata, QuerySpan
 from .dcp import select_history
@@ -82,6 +83,7 @@ class FlashCompressedIndexer(nn.Module):
         self.max_model_len = (
             model_config.max_model_len if model_config is not None else 0
         )
+        self.max_local_groups = cdiv(self.max_model_len, self.ratio * self.dcp_world)
         self.logits_budget = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024 // 4
         for name, in_dim, out_dim in (
             ("query_projection", config.q_lora_rank, self.num_heads * self.dim),
@@ -212,12 +214,16 @@ class FlashCompressedIndexer(nn.Module):
             self.dcp_rank,
         )
         groups = workspace.logits.shape[1]
-        logits: torch.Tensor | None = workspace.logits[:rows]
+        logits = workspace.logits[:rows]
         if self.dcp_group is not None:
-            if metadata.max_seq_len <= self.width:
+            if self.max_model_len <= self.width:
                 return None
-            groups = cdiv(metadata.max_seq_len, self.ratio * self.dcp_world)
-            logits = None
+            # The graph's score width is fixed. Device lengths limit cache
+            # reads and candidate selection on both live and padding rows.
+            groups = self.max_local_groups
+            (logits,) = current_workspace_manager().get_simultaneous(
+                ((rows, groups), torch.float32)
+            )
         elif groups == 0:
             return None
         query = self.query_projection(q_c)[0].view(rows, self.num_heads, self.dim)
@@ -261,17 +267,17 @@ class FlashCompressedIndexer(nn.Module):
         if self.max_model_len <= self.width:
             return
         rows = q.shape[0]
-        groups = cdiv(self.max_model_len, self.ratio * self.dcp_world)
+        groups = self.max_local_groups
+        if self.dcp_group is not None:
+            current_workspace_manager().get_simultaneous(
+                ((self.max_decode_rows, groups), torch.float32)
+            )
         # Count logits, gathered FP16 keys and the FP32 GEMM output together.
         logits = max(groups, min(rows * groups, self.logits_budget))
         key_rows = index_prefill_key_rows(groups)
         keys = key_rows * self.dim // 2
         gemm = index_prefill_gemm_elements(rows * self.num_heads, key_rows)
         elements = logits + keys + gemm
-        if self.dcp_group is not None:
-            # Decode scores all requests together.
-            decode = min(rows, self.max_decode_rows) * groups
-            elements = max(elements, decode)
         score_scratch = q.new_empty((elements,), dtype=torch.float32)
         if self.dcp_group is not None:
             select_history(

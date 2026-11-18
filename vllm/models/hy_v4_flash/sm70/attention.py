@@ -21,12 +21,14 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
+from vllm.v1.worker.workspace import current_workspace_manager
 
 from .cache import POOL_PAGE, FlashCache, FlashMetadata, FlashSWABackend
 from .decode import decode_slots
 from .indexpool import FlashCompressedIndexer
 from .kernels import paged_attention, paged_attention_torch
 from .rotary import apply_rotary, rotary_phases
+from .splitk import decode_workspace_specs, paged_attention_splitk
 from .swa import window_indices
 
 
@@ -157,6 +159,12 @@ class HYV4FlashAttention(nn.Module):
             )
             self.width = self.indexer.width
         self.topk_indices_buffer = topk_indices_buffer
+        self._decode_workspace_specs = decode_workspace_specs(
+            vllm_config.scheduler_config.max_num_seqs,
+            self.num_local_heads,
+            self.width,
+            self.kv_lora_rank,
+        )
         self.register_buffer(
             "_k_scale", torch.ones((), dtype=torch.float32), persistent=False
         )
@@ -216,6 +224,19 @@ class HYV4FlashAttention(nn.Module):
             ops.concat_and_cache_mla(
                 kv_c[:tokens], k_pe[:tokens], cache, slots, "auto", self._k_scale
             )
+            if main.decode:
+                workspace = current_workspace_manager().get_simultaneous(
+                    *self._decode_workspace_specs
+                )
+                return paged_attention_splitk(
+                    q[:tokens],
+                    cache,
+                    indices,
+                    counts,
+                    self.learnable_sink_param,
+                    self.scaling,
+                    *workspace,
+                )
             reader = paged_attention
         else:
             cache[slots // page, slots % page] = torch.cat(
@@ -303,6 +324,11 @@ class HYV4FlashAttention(nn.Module):
             )
         else:
             # Profile runs have no bound cache or scheduled slots.
+            if metadata is None and q.is_cuda:
+                # Reserve decode scratch before sizing the KV cache.
+                current_workspace_manager().get_simultaneous(
+                    *self._decode_workspace_specs
+                )
             latent = torch.zeros_like(latent_q)
         if 0 < tokens < q.shape[0]:
             latent = torch.nn.functional.pad(

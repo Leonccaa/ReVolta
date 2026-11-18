@@ -719,7 +719,9 @@ def test_decode_metadata_reuses_runner_buffers(vllm_config):
     reason="CUDA required",
 )
 @torch.inference_mode()
-def test_cuda_decode_graph_replays_eager(vllm_config, monkeypatch):
+def test_cuda_decode_graph_replays_eager(vllm_config, monkeypatch, workspace_init):
+    from vllm.v1.worker.workspace import lock_workspace
+
     config = text_config()
     config.qk_rope_head_dim = config.swa_qk_rope_head_dim = 16
     vllm_config.model_config = SimpleNamespace(
@@ -819,6 +821,9 @@ def test_cuda_decode_graph_replays_eager(vllm_config, monkeypatch):
             return tuple(paged.layer(positions, inputs) for paged in layers)
 
     main_prefixes = {paged.layer.attn.prefix for paged in layers}
+    positions.zero_()
+    forward(None)
+    lock_workspace()
     expected_steps = []
     for requests in ((0, 1), (1,)):
         eager = forward(stage(requests))

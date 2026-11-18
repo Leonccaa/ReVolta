@@ -446,7 +446,6 @@ def test_pending_proposal_q_survives_other_requests_tail_changes(tmp_path, monke
         result._sm70_dflash2_tail_graphs = False
         result._candidates = []
         result._capture_descs = {}
-        result._dynamic_sd_query_lens = set()
         result._init_candidates()
         result._graphs_captured = True
 

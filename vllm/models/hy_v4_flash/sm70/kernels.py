@@ -1,13 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from math import gcd
+
 import torch
 
 from vllm.models.deepseek_v4.common.ops.fp8_software import (
     fp8_e4m3fn_bits_to_fp32_bitcast,
     fp32_to_fp8_e4m3fn_bits,
 )
+from vllm.models.deepseek_v4.sm70.indexer import (
+    _EPILOGUE_BLOCK_H,
+    _EPILOGUE_BLOCK_K,
+    _PREFILL_TILE_MB,
+    _RELU_BLOCK_N,
+    _relu_weight_headsum,
+)
 from vllm.triton_utils import tl, triton
+
+_INDEX_PREFILL_GROUP_TILE = 65536
+_INDEX_PREFILL_GEMM_BUDGET = _PREFILL_TILE_MB * 2**18
 
 
 @triton.jit
@@ -103,6 +115,7 @@ def _paged_attention(
     Counts,
     Sinks,
     Out,
+    LSE,
     stride_qt,
     stride_qh,
     stride_kvp,
@@ -126,9 +139,13 @@ def _paged_attention(
     qb = Q + row * stride_qt + heads[:, None] * stride_qh
     q = tl.load(qb + d[None, :], heads[:, None] < HEADS, other=0)
     qr = tl.load(qb + LATENT + r[None, :], heads[:, None] < HEADS, other=0)
-    # Initialize with the sink's single denominator term and zero value.
-    m = tl.load(Sinks + heads, heads < HEADS, other=0).to(tl.float32)
-    z = tl.full((H,), 1.0, tl.float32)
+    if LSE is None:
+        # The sink contributes one denominator term and has zero value.
+        m = tl.load(Sinks + heads, heads < HEADS, other=0).to(tl.float32)
+        z = tl.full((H,), 1.0, tl.float32)
+    else:
+        m = tl.full((H,), -float("inf"), tl.float32)
+        z = tl.full((H,), 0.0, tl.float32)
     acc = tl.full((H, LATENT), 0.0, tl.float32)
     length = tl.load(Counts + row)
     for start in range(0, length, N):
@@ -145,6 +162,9 @@ def _paged_attention(
         acc = tl.dot(p.to(tl.float16), k, acc * rescale[:, None])
         z = z * rescale + tl.sum(p, axis=1)
         m = new_m
+    if LSE is not None:
+        tl.store(LSE + row * HEADS + heads, m + tl.log(z), heads < HEADS)
+        z = tl.where(length > 0, z, 1.0)
     tl.store(
         Out + row * stride_out + heads[:, None] * LATENT + d[None, :],
         acc / z[:, None],
@@ -157,13 +177,16 @@ def paged_attention(
     cache: torch.Tensor,
     slots: torch.Tensor,
     counts: torch.Tensor,
-    sinks: torch.Tensor,
+    sinks: torch.Tensor | None,
     scale: float,
     latent: int,
+    lse: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Packed physical slots per query with FP32 softmax."""
     tokens, heads, dim = q.shape
-    out = q.new_empty((tokens, heads, latent))
+    out = q.new_empty(
+        (tokens, heads, latent), dtype=q.dtype if lse is None else torch.float32
+    )
     _paged_attention[(tokens, triton.cdiv(heads, 16))](
         q,
         cache,
@@ -171,6 +194,7 @@ def paged_attention(
         counts,
         sinks,
         out,
+        lse,
         q.stride(0),
         q.stride(1),
         cache.stride(0),
@@ -244,6 +268,8 @@ def _index_scores(
     H: tl.constexpr,
     N: tl.constexpr,
     DECODE: tl.constexpr,
+    WORLD: tl.constexpr,
+    RANK: tl.constexpr,
 ):
     # Weighted ReLU head-sum as in the DeepSeek V4 SM70 indexer, with
     # plain FP16 pages in place of software-decoded FP8 keys.
@@ -258,6 +284,8 @@ def _index_scores(
         upper = tl.where(active, (length - 1) // RATIO, 0)
     else:
         upper = (FIRST + row) // RATIO
+    if WORLD > 1:
+        upper = (upper + WORLD - 1 - RANK) // WORLD
     logits = tl.full((N,), float("-inf"), tl.float32)
     if not DECODE or start < upper:
         logical_page = g // PAGE
@@ -283,11 +311,9 @@ def _index_scores(
         w = tl.load(W + row * HEADS + head, head < HEADS, other=0)
         scores = tl.maximum(tl.dot(q, tl.trans(k)), 0.0)
         logits = tl.where(g < upper, tl.sum(scores * w[:, None], axis=0), float("-inf"))
-    tl.store(
-        Logits + row * GROUPS + g,
-        logits,
-        g < GROUPS,
-    )
+    # DCP selection reads only the live prefix, so unused tiles need no fill.
+    if not DECODE or WORLD == 1 or start < upper:
+        tl.store(Logits + row * GROUPS + g, logits, g < GROUPS)
 
 
 def index_scores(
@@ -304,6 +330,8 @@ def index_scores(
     lengths: torch.Tensor | None = None,
     slots: torch.Tensor | None = None,
     group_topk: int = 0,
+    world: int = 1,
+    rank: int = 0,
 ) -> torch.Tensor:
     if logits is None:
         logits = q.new_empty((q.shape[0], groups), dtype=torch.float32)
@@ -331,6 +359,156 @@ def index_scores(
         max(16, triton.next_power_of_2(q.shape[1])),
         64,
         lengths is not None,
+        world,
+        rank,
         num_warps=4,
     )
+    return logits
+
+
+def index_prefill_key_rows(groups: int) -> int:
+    return min(groups, _INDEX_PREFILL_GROUP_TILE)
+
+
+def index_prefill_gemm_elements(rows: int, key_rows: int) -> int:
+    """Bound the FP32 GEMM output for rows of flattened query heads."""
+    return min(rows * key_rows, max(rows, _INDEX_PREFILL_GEMM_BUDGET))
+
+
+@triton.jit
+def _gather_index_prefill_keys(
+    Pool,
+    Table,
+    Keys,
+    stride_pool_p,
+    stride_pool_g,
+    start,
+    live,
+    DIM: tl.constexpr,
+    PAGE: tl.constexpr,
+    PAGES_PER_BLOCK: tl.constexpr,
+    N: tl.constexpr,
+):
+    # Adapted from the DeepSeek V4 SM70 paged index key gather.
+    col = tl.program_id(0) * N + tl.arange(0, N)
+    group = start + col
+    logical_page = group // PAGE
+    page = tl.load(Table + logical_page // PAGES_PER_BLOCK, col < live, other=0)
+    page = page * PAGES_PER_BLOCK + logical_page % PAGES_PER_BLOCK
+    d = tl.arange(0, DIM)
+    keys = tl.load(
+        Pool
+        + page[:, None].to(tl.int64) * stride_pool_p
+        + (group % PAGE)[:, None] * stride_pool_g
+        + d[None, :],
+        col[:, None] < live,
+        other=0,
+    )
+    tl.store(Keys + col[:, None] * DIM + d[None, :], keys, col[:, None] < live)
+
+
+@triton.jit
+def _index_prefill_epilogue(
+    Scores,
+    W,
+    Logits,
+    first,
+    groups,
+    start,
+    width,
+    HEADS: tl.constexpr,
+    RATIO: tl.constexpr,
+    WORLD: tl.constexpr,
+    RANK: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    row = tl.program_id(0)
+    col = tl.program_id(1) * BLOCK_K + tl.arange(0, BLOCK_K)
+    upper = ((first + row) // RATIO + WORLD - 1 - RANK) // WORLD
+    visible = start + col < upper
+    acc = _relu_weight_headsum(
+        Scores,
+        W,
+        row,
+        col,
+        (col < width) & visible,
+        HEADS * width,
+        width,
+        HEADS,
+        HEADS,
+        BLOCK_K,
+        BLOCK_H,
+    )
+    tl.store(
+        Logits + row * groups + start + col,
+        tl.where(visible, acc, float("-inf")),
+        col < width,
+    )
+
+
+def index_prefill_scores(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    pool: torch.Tensor,
+    table: torch.Tensor,
+    first: int,
+    groups: int,
+    ratio: int,
+    pages_per_block: int,
+    *,
+    world: int = 1,
+    rank: int = 0,
+) -> torch.Tensor:
+    rows, heads, dim = q.shape
+    q2 = q.flatten(0, 1)
+    key_rows = index_prefill_key_rows(groups)
+    score_cols = index_prefill_gemm_elements(rows * heads, key_rows) // (rows * heads)
+    if score_cols < key_rows:
+        score_cols = score_cols // _RELU_BLOCK_N * _RELU_BLOCK_N or score_cols
+    block_h = gcd(heads, _EPILOGUE_BLOCK_H)
+    keys = pool.new_empty((key_rows, dim))
+    logits = q.new_empty((rows, groups), dtype=torch.float32)
+    # The final group in the output can still be open, so only gather keys
+    # visible to at least one row. Convert the bound to rank-local group IDs.
+    upper = ((first + rows - 1) // ratio + world - 1 - rank) // world
+    for start in range(0, upper, key_rows):
+        live = min(key_rows, upper - start)
+        _gather_index_prefill_keys[(triton.cdiv(live, 16),)](
+            pool,
+            table,
+            keys,
+            pool.stride(0),
+            pool.stride(1),
+            start,
+            live,
+            dim,
+            pool.shape[1],
+            pages_per_block,
+            16,
+        )
+        for col in range(0, live, score_cols):
+            key_tile = keys[col : min(col + score_cols, live)]
+            # As in the DeepSeek V4 SM70 cuBLAS scorer, fold heads into M.
+            # Keep the GEMM output in FP32 for the top-k score comparison.
+            scores = torch.mm(q2, key_tile.t(), out_dtype=torch.float32)
+            width = scores.shape[1]
+            _index_prefill_epilogue[(rows, triton.cdiv(width, _EPILOGUE_BLOCK_K))](
+                scores,
+                weights,
+                logits,
+                first,
+                groups,
+                start + col,
+                width,
+                heads,
+                ratio,
+                world,
+                rank,
+                _EPILOGUE_BLOCK_K,
+                block_h,
+                num_warps=4,
+            )
+            del scores
+    logits[:, upper:].fill_(-torch.inf)
     return logits

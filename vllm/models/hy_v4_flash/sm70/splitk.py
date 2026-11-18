@@ -98,6 +98,7 @@ def _decode_merge(
     Counts,
     Sinks,
     Out,
+    LSE,
     HEADS: tl.constexpr,
     LATENT: tl.constexpr,
     SPLITS: tl.constexpr,
@@ -114,10 +115,20 @@ def _decode_merge(
     state = (row * HEADS + head) * SPLITS + split
     m = tl.load(State + state * 2, live, other=float("-inf"))
     total = tl.load(State + state * 2 + 1, live, other=0)
-    sink = tl.load(Sinks + head).to(tl.float32)
-    final_m = tl.maximum(tl.max(m, axis=0), sink)
+    final_m = tl.max(m, axis=0)
+    if LSE is None:
+        sink = tl.load(Sinks + head).to(tl.float32)
+        final_m = tl.maximum(final_m, sink)
+    else:
+        final_m = tl.where(final_m == -float("inf"), 0.0, final_m)
     w = tl.exp(m - final_m)
-    denominator = tl.sum(total * w, axis=0) + tl.exp(sink - final_m)
+    denominator = tl.sum(total * w, axis=0)
+    if LSE is None:
+        denominator += tl.exp(sink - final_m)
+    else:
+        if tl.program_id(2) == 0:
+            tl.store(LSE + row * HEADS + head, final_m + tl.log(denominator))
+        denominator = tl.where(denominator > 0, denominator, 1.0)
     acc = tl.load(Acc + state[:, None] * LATENT + d[None, :], live[:, None], other=0)
     numerator = tl.sum(acc * w[:, None], axis=0)
     tl.store(Out + (row * HEADS + head) * LATENT + d, numerator / denominator)
@@ -128,14 +139,17 @@ def paged_attention_splitk(
     cache: torch.Tensor,
     slots: torch.Tensor,
     counts: torch.Tensor,
-    sinks: torch.Tensor,
+    sinks: torch.Tensor | None,
     scale: float,
     partial_state: torch.Tensor,
     partial_acc: torch.Tensor,
+    lse: torch.Tensor | None = None,
 ) -> torch.Tensor:
     rows, heads, dim = q.shape
     splits, latent = partial_acc.shape[-2:]
-    out = q.new_empty((rows, heads, latent))
+    out = q.new_empty(
+        (rows, heads, latent), dtype=q.dtype if lse is None else torch.float32
+    )
     _decode_split[(rows, triton.cdiv(heads, 8), splits)](
         q,
         cache,
@@ -166,6 +180,7 @@ def paged_attention_splitk(
         counts,
         sinks,
         out,
+        lse,
         heads,
         latent,
         splits,

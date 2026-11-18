@@ -20,6 +20,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowMLASpec,
@@ -28,6 +29,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.worker.workspace import current_workspace_manager
 
 from .cache import POOL_PAGE, FlashCache, FlashMetadata, FlashSWABackend
+from .dcp import apply_attn_sink
 from .decode import decode_slots
 from .indexpool import FlashCompressedIndexer
 from .kernels import (
@@ -133,10 +135,18 @@ class HYV4FlashAttention(nn.Module):
             persistent=False,
         )
 
-        block_size = lcm(
-            vllm_config.cache_config.block_size,
-            POOL_PAGE * config.compressed_indexer_compress_ratio,
+        world = vllm_config.parallel_config.decode_context_parallel_size
+        global_page = POOL_PAGE * config.compressed_indexer_compress_ratio
+        block_size = (
+            global_page // world
+            if world > 1
+            else lcm(vllm_config.cache_config.block_size, global_page)
         )
+        sharded = world > 1 and not self.is_window_layer
+        if sharded:
+            layers, _, attention = prefix.rsplit(".", 2)
+            window_idx = config.layer_types.index("sliding_attention")
+            self._swa_prefix = f"{layers}.{window_idx}.{attention}.attn"
         fp8_kv = vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
         main_cache_dtype = "fp8_ds_mla" if fp8_kv else "auto"
         cache_args = dict(
@@ -146,7 +156,7 @@ class HYV4FlashAttention(nn.Module):
             dtype=torch.uint8 if fp8_kv else torch.float16,
             cache_dtype_str=main_cache_dtype,
             kv_quant_mode=get_kv_quant_mode(main_cache_dtype),
-            dcp_sharded=False,
+            dcp_sharded=sharded,
         )
         if self.is_window_layer:
             self.attn = FlashCache(
@@ -172,10 +182,13 @@ class HYV4FlashAttention(nn.Module):
             )
             self.width = self.indexer.width
         self.topk_indices_buffer = topk_indices_buffer
+        self.dcp_group = self.indexer.dcp_group if self.indexer is not None else None
+        self.dcp_world = world if sharded else 1
+        self.dcp_rank = self.dcp_group.rank_in_group if self.dcp_group else 0
         self._decode_workspace_specs = decode_workspace_specs(
             vllm_config.scheduler_config.max_num_seqs,
-            self.num_local_heads,
-            self.width,
+            self.num_local_heads * self.dcp_world,
+            self.width // self.dcp_world,
             self.kv_lora_rank,
         )
         self.register_buffer(
@@ -200,7 +213,13 @@ class HYV4FlashAttention(nn.Module):
         page = cache.shape[1]
         indices = self.topk_indices_buffer[:tokens, : self.width]
         slots = main.slot_mapping[:tokens]
+        local_width = self.width // self.dcp_world
         if q.is_cuda and main.decode:
+            active_slots = (
+                slots
+                if self.dcp_group is None
+                else metadata[self._swa_prefix].slot_mapping[:tokens]
+            )
             counts = main.counts
             assert counts is not None
             groups = None
@@ -216,23 +235,33 @@ class HYV4FlashAttention(nn.Module):
                     sin[:tokens],
                     metadata[self.indexer.k_cache.prefix],
                     metadata[self.indexer.tail_cache.prefix],
-                    slots,
+                    active_slots,
                 )
             counts = counts[:tokens]
             decode_slots(
                 main.seq_lens,
-                slots,
+                active_slots,
                 main.block_table,
                 groups,
-                indices,
+                indices[:, :local_width],
                 counts,
                 page,
                 ratio,
+                self.dcp_world,
+                self.dcp_rank,
             )
         else:
             counts = self._eager_slots(
                 hidden_states, q_c, positions, cos, sin, metadata, indices, page
             )
+        if self.dcp_group is not None:
+            indices = indices[:, :local_width]
+            q = self.dcp_group.all_gather(q[:tokens].contiguous(), dim=1)
+            lse = q.new_empty(q.shape[:2], dtype=torch.float32)
+            sinks = None
+        else:
+            lse = None
+            sinks = self.learnable_sink_param
         if q.is_cuda:
             if cache.dtype == torch.uint8:
                 cache_fp8_ds_mla(kv_c[:tokens], k_pe[:tokens], cache, slots)
@@ -241,27 +270,38 @@ class HYV4FlashAttention(nn.Module):
                     kv_c[:tokens], k_pe[:tokens], cache, slots, "auto", self._k_scale
                 )
             if main.decode:
-                workspace = current_workspace_manager().get_simultaneous(
+                state, acc = current_workspace_manager().get_simultaneous(
                     *self._decode_workspace_specs
                 )
-                return paged_attention_splitk(
+                latent = paged_attention_splitk(
                     q[:tokens],
                     cache,
                     indices,
                     counts,
-                    self.learnable_sink_param,
+                    sinks,
                     self.scaling,
-                    *workspace,
+                    state,
+                    acc,
+                    lse=lse,
                 )
-            reader = paged_attention
-        else:
-            if cache.dtype == torch.uint8:
-                kv = pack_fp8_ds_mla_torch(kv_c[:tokens], k_pe[:tokens])
             else:
-                kv = torch.cat((kv_c[:tokens], k_pe[:tokens]), dim=-1)
-            cache[slots // page, slots % page] = kv
-            reader = paged_attention_torch
-        return reader(
+                latent = paged_attention(
+                    q[:tokens],
+                    cache,
+                    indices,
+                    counts,
+                    sinks,
+                    self.scaling,
+                    self.kv_lora_rank,
+                    lse=lse,
+                )
+            return self._merge_dcp(latent, lse) if lse is not None else latent
+        if cache.dtype == torch.uint8:
+            kv = pack_fp8_ds_mla_torch(kv_c[:tokens], k_pe[:tokens])
+        else:
+            kv = torch.cat((kv_c[:tokens], k_pe[:tokens]), dim=-1)
+        cache[slots // page, slots % page] = kv
+        return paged_attention_torch(
             q[:tokens],
             cache,
             indices,
@@ -270,6 +310,28 @@ class HYV4FlashAttention(nn.Module):
             self.scaling,
             self.kv_lora_rank,
         )
+
+    def _merge_dcp(self, latent: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
+        assert self.dcp_group is not None
+        out, global_lse = cast(
+            tuple[torch.Tensor, torch.Tensor],
+            dcp_a2a_lse_reduce(
+                latent, lse, self.dcp_group, return_lse=True, is_lse_base_on_e=True
+            ),
+        )
+        return apply_attn_sink(out.half(), global_lse, self.learnable_sink_param)
+
+    def _profile_dcp(self, q: torch.Tensor) -> None:
+        assert self.dcp_group is not None and self.indexer is not None
+        # The profile has no cache. Exercise the real exchanges with empty
+        # partials and keep gathered Q live until A2A scratch has been used.
+        gathered = self.dcp_group.all_gather(q.contiguous(), dim=1)
+        rows, heads, _ = gathered.shape
+        self._merge_dcp(
+            q.new_zeros((rows, heads, self.kv_lora_rank), dtype=torch.float32),
+            q.new_full((rows, heads), -torch.inf, dtype=torch.float32),
+        )
+        del gathered
 
     def _eager_slots(
         self,
@@ -307,10 +369,16 @@ class HYV4FlashAttention(nn.Module):
         counts = torch.empty(tokens, dtype=torch.int32, device=indices.device)
         for req, (begin, end, _, _) in enumerate(main.spans):
             rows = indices[begin:end]
-            live = rows >= 0
+            if self.dcp_group is not None:
+                # All complete groups and the open group start on rank zero.
+                logical = rows[:, self.dcp_rank :: self.dcp_world] // self.dcp_world
+                rows = rows[:, : self.width // self.dcp_world]
+            else:
+                logical = rows
+            live = logical >= 0
             counts[begin:end] = live.sum(dim=-1, dtype=torch.int32)
-            blocks = main.block_table[req][rows.clamp_min(0) // page]
-            rows.copy_((blocks * page + rows % page).masked_fill(~live, -1))
+            blocks = main.block_table[req][logical.clamp_min(0) // page]
+            rows.copy_((blocks * page + logical % page).masked_fill(~live, -1))
 
         return counts
 
@@ -347,6 +415,10 @@ class HYV4FlashAttention(nn.Module):
                 current_workspace_manager().get_simultaneous(
                     *self._decode_workspace_specs
                 )
+                if self.dcp_group is not None:
+                    self._profile_dcp(q)
+                if self.indexer is not None:
+                    self.indexer.profile(q)
             latent = torch.zeros_like(latent_q)
         if 0 < tokens < q.shape[0]:
             latent = torch.nn.functional.pad(

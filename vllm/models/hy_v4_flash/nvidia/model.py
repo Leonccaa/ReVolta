@@ -123,7 +123,7 @@ class HYV4FlashModel(HYV4Model):
             self.engram_hash.prepare_hashes_with_output(
                 input_ids,
                 lookback_token_ids,
-                self.layers[0].self_attn.mla_attn.layer_name,
+                self.layers[0].self_attn.attn.prefix,
                 hashes,
             )
         residual = None

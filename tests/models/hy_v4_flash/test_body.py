@@ -87,10 +87,10 @@ def _config(**overrides):
     )
 
 
-def _install_attention(monkeypatch, cls):
-    path = "vllm.models.hy_v4_flash.sm70.attention"
+def _install_module(monkeypatch, name, **symbols):
+    path = f"vllm.models.hy_v4_flash.{name}"
     module = ModuleType(path)
-    module.__dict__["HYV4FlashAttention"] = cls
+    module.__dict__.update(symbols)
     monkeypatch.setitem(sys.modules, path, module)
 
 
@@ -133,6 +133,7 @@ def test_three_layer_body(
         def __init__(self, vllm_config, config, layer_idx, topk_indices_buffer, prefix):
             super().__init__()
             self.idx = layer_idx
+            self.attn = SimpleNamespace(prefix=f"{prefix}.attn")
 
         def forward(self, positions, hidden_states):
             layer = ref.layers[self.idx]
@@ -153,8 +154,36 @@ def test_three_layer_body(
             )
             return out.squeeze(0)
 
-    _install_attention(monkeypatch, ReferenceAttention)
-    config = HYV4FlashConfig(**cfg)
+    class IdentityEngram(nn.Module):
+        def __init__(self, vllm_config, layout, layer_id, prefix):
+            super().__init__()
+            assert layer_id == 2
+
+        def forward(self, hidden_states, hashes):
+            assert hidden_states.shape == (len(ids), 4, cfg["hidden_size"])
+            torch.testing.assert_close(hashes, torch.full_like(hashes, 17))
+            return hidden_states
+
+    class StubHash:
+        def __init__(self, config, dummy):
+            self.layout = None
+            self.offsets = torch.empty(1, 16)
+
+        def prepare_hashes_with_output(self, input_ids, lookback, layer_name, out):
+            assert input_ids is ids and lookback is history
+            assert layer_name == "model.layers.0.self_attn.attn"
+            out.fill_(17)
+
+    _install_module(
+        monkeypatch, "sm70.attention", HYV4FlashAttention=ReferenceAttention
+    )
+    _install_module(
+        monkeypatch,
+        "nvidia.engram",
+        FlashEngram=IdentityEngram,
+        FlashNgramHashState=StubHash,
+    )
+    config = HYV4FlashConfig(**cfg, engram_layer_ids=[2])
     cpu_vllm.model_config = SimpleNamespace(hf_text_config=config, dtype=torch.float32)
     candidate = HYV4FlashForCausalLM(vllm_config=cpu_vllm)
     weights = [
@@ -179,8 +208,9 @@ def test_three_layer_body(
     assert candidate.load_weights(weights) == set(dict(candidate.named_parameters()))
 
     ids = torch.tensor([2, 5, 18, 3, 7, 1])
+    history = torch.tensor([[0, 0]], dtype=torch.int32)
     with set_forward_context(None, cpu_vllm):
-        actual = candidate(ids, torch.arange(ids.numel()))
+        actual = candidate(ids, torch.arange(ids.numel()), lookback_token_ids=history)
     expected = ref(input_ids=ids[None], use_cache=False).last_hidden_state.squeeze(0)
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
     _record_error(record_property, "hidden", actual, expected)

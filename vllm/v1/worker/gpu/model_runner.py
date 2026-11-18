@@ -2217,6 +2217,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 store.write_plan_kind = "none"
                 store.write_plan_all_prefill = False
             mtp_draft_start = self._sm70_v2_mtp_profile_start(mtp_profile_ctx)
+            update_tail = getattr(self.speculator, "update_draft_vocab_tail", None)
+            if update_tail is not None:
+                update_tail(
+                    sampler_output.sampled_token_ids,
+                    num_sampled,
+                    input_batch.num_reqs,
+                    input_batch.idx_mapping,
+                )
             draft_tokens = self.speculator.propose(
                 input_batch,
                 attn_metadata,

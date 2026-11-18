@@ -76,7 +76,7 @@ def resolve(*, rank=0, size=4, cap=(7, 0), physical=None, visible=None, disabled
 def test_pex_auto_validates_all_edges_despite_skip_flag(topology):
     decision = resolve()
     assert decision.mode == "pex_p2p" and decision.fully_connected
-    assert decision.max_bytes == 81920 and decision.graph_only
+    assert decision.max_bytes == 204800 and decision.graph_only
     assert topology.driver.call_args_list == [((0, 1),), ((0, 2),), ((0, 3),)]
     topology.fresh.assert_called_once_with([0, 1, 2, 3])
     assert decision.nvml == "NVLink=False; PIX/PXB=True"
@@ -439,10 +439,10 @@ def test_constructor_uses_confirmed_policy_before_native_init(
         }[requested]
     )
     if enabled:
-        assert native.call_args.args[-1] is True
+        assert native.call_args.args[-1] == comm.interconnect_mode
         assert allocate.call_count == 2
         if pex:
-            assert comm.sm70_pcie_switch_max_bytes == 81920
+            assert comm.sm70_pcie_switch_max_bytes == 204800
             assert comm.sm70_pcie_switch_graph_only
     else:
         allocate.assert_not_called()

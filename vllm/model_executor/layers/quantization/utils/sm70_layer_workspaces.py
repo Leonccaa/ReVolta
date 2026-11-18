@@ -10,12 +10,36 @@ register their workspace here under their prefix, which is the same in every
 process, and apply() calls the opaque ops below with the prefix.
 """
 
+from collections.abc import MutableMapping
+from typing import TypeVar
+
 import torch
 
 from vllm.utils.torch_utils import direct_register_custom_op
 
 # Layer prefix -> the workspace its kernels write through.
 _layer_workspaces: dict[str, torch.Tensor] = {}
+_WORKSPACE_PREFIX = "sm70_workspace:"
+_K = TypeVar("_K")
+_V = TypeVar("_V")
+
+
+def _engine_workspace_registry():
+    from vllm.config import get_current_vllm_config_or_none
+    from vllm.forward_context import get_forward_context, is_forward_context_available
+
+    if is_forward_context_available():
+        return get_forward_context().no_compile_layers
+    config = get_current_vllm_config_or_none()
+    return config.compilation_config.static_forward_context if config else None
+
+
+def workspace_pool(name: str, legacy: MutableMapping[_K, _V]) -> MutableMapping[_K, _V]:
+    """Share bounded scratch within an engine, never between live engines."""
+    registry = _engine_workspace_registry()
+    if registry is None:
+        return legacy
+    return registry.setdefault(_WORKSPACE_PREFIX + "pool:" + name, {})
 
 
 def register_layer_workspace(layer: torch.nn.Module, workspace: torch.Tensor) -> None:

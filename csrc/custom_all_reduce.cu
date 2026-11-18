@@ -50,7 +50,7 @@ const char* capture_status_name(cudaStreamCaptureStatus status) {
 
 fptr_t init_custom_ar(const std::vector<fptr_t>& fake_ipc_ptrs,
                       torch::Tensor& rank_data, int64_t rank,
-                      bool fully_connected) {
+                      const std::string& interconnect_mode) {
   int world_size = fake_ipc_ptrs.size();
   if (world_size > 8)
     throw std::invalid_argument("world size > 8 is not supported");
@@ -63,9 +63,12 @@ fptr_t init_custom_ar(const std::vector<fptr_t>& fake_ipc_ptrs,
   for (int i = 0; i < world_size; i++) {
     ipc_ptrs[i] = reinterpret_cast<vllm::Signal*>(fake_ipc_ptrs[i]);
   }
-  return (fptr_t) new vllm::CustomAllreduce(ipc_ptrs, rank_data.data_ptr(),
-                                            rank_data.numel(), rank, world_size,
-                                            fully_connected);
+  const bool pcie_switch = interconnect_mode == "pex_p2p";
+  auto* fa = new vllm::CustomAllreduce(
+      ipc_ptrs, rank_data.data_ptr(), rank_data.numel(), rank, world_size,
+      pcie_switch || interconnect_mode == "nvlink");
+  fa->sm70_pcie_switch_ = pcie_switch;
+  return reinterpret_cast<fptr_t>(fa);
 }
 
 /**

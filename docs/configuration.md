@@ -17,8 +17,9 @@ values override the profile.
 ## Interconnect
 
 The engine selects the interconnect automatically and logs `SM70 interconnect=<mode>`.
-P2P uses custom all-reduce for messages up to 80 KiB inside CUDA graphs; other
-collectives use NCCL. On an SM70 TP4 group (under one PCIe switch, or on NVLink) the MoE
+PCIe switch P2P uses custom all-reduce inside CUDA graphs for messages up to 80 KiB
+and for FP16 payloads of 100, 120, 125, 150, 160, 175 and 200 KiB. On an SM70 TP4 group
+(under one PCIe switch, or on NVLink) the MoE
 output sum (sum2) uses its own push kernel at the sizes that have one and otherwise adds
 locally before the ordinary all-reduce. Override with `VLLM_SM70_INTERCONNECT=auto|pex|nccl|nvlink`
 or disable custom all-reduce with `--disable-custom-all-reduce`.
@@ -119,6 +120,20 @@ measurements remain unchanged; planar GPU acceptance is still pending.
   Without persistent cache storage, a recreated container compiles them again.
 - Media limits and request budgets: see
   [multimodal input limits](../.github/MULTIMODAL_INPUTS.md).
+
+## Optional MTP draft vocabulary in model runner V2
+
+Enable a static shortlist with `VLLM_SM70_MTP_STATIC_DRAFT_VOCAB_RANKING=<ranking.pt>` and `VLLM_SM70_MTP_STATIC_DRAFT_VOCAB_SIZE=65536`. The ranking artifact must match the model vocabulary and TP size. Static drafting maps both greedy and probabilistic proposals back to full vocabulary token IDs.
+
+Set `VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_TAIL_SIZE=512` to add a global LRU tail shared by all concurrent requests in that worker group. The default is `0` (disabled); supported capacities are 1–2048, with 512 or 1024 recommended as starting points. Each step updates the tail from actual accepted/recovered/bonus output tokens in request-row order. Seeds are the first T entries from ranking position B after skipping base tokens and all model padding IDs; fewer than T eligible seeds is a startup error. Output padding IDs are ignored during tail updates. There is no per-request tail, target top-k bootstrap, adaptive capacity or periodic full-head refresh.
+
+The tail requires `method="mtp"`, an enabled static shortlist, an FP16 LM-head, no logits soft cap, scale 1, at least T eligible non-padding seeds after ranking position B, and a model padding token outside the static base for SINK. SINK is the first such padding ID and never enters the tail. Unsupported configurations raise `ValueError` at startup. `VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_GPU_LRU`, `VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_FUSED_PROPOSAL`, `VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_FULL_REFRESH_INTERVAL` and `VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_PREFILL_TOPK` are V1-only; setting any of them in V2 is an error, including setting it to zero.
+
+Greedy drafting uses local base top1 plus tail logits; with local argmax reduction disabled it uses concatenated logits and argmax. Probabilistic drafting samples the concatenation and maps the processed proposal logits to the full vocabulary for verification. Pending probabilistic proposal distributions remain unchanged until their requests are verified, even when other requests change the shared tail. The tail implementation supports both draft sampling methods; the deployment sampling guidance above and the existing hardware/model support scope still apply. CPU interpreter tests do not establish GPU, CUDA graph or production acceptance.
+
+Each rank reserves T physical FP16 weight rows, even though the global effective tail capacity is T across all ranks. Tail weights cost `2*T*H` bytes per rank: with H=2560, 512 costs 2.5 MiB and 1024 costs 5 MiB. State, token maps and sampling buffers add memory; probabilistic processed logits use `4*max_num_seqs*K*(B+TP*T)` bytes in addition to the existing full-vocabulary verification buffer. Measure acceptance length, round time and throughput on the intended workload before choosing a capacity.
+
+Before requests, confirm the existing `Enabled static MTP draft vocabulary` message and one `Enabled global MTP draft vocabulary tail: base=%d tail=%d tp=%d sink=%d draft_sample=%s` message on each TP rank, with the configured tail size. For TP4 all four ranks must report the configured value. This confirms activation; output correctness and performance require separate GPU acceptance.
 
 ## Optional native DFlash2 lookup
 
@@ -306,7 +321,7 @@ The ReVolta profile (`vllm/revolta_profile.py`) sets these on SM70 + TP4 + FP16 
 | `VLLM_SM70_QWEN38_WIDE_M` | bool | `False` | `1` | 0, 1 | experimental | 0.2.0 | Widens Qwen3.8 decode/verify routes from 4 to 8 requests (M up to 40); each VLLM_SM70_QWEN38_WIDE_M_* item can override it. |
 | `VLLM_SM70_SKIP_REJECTED_BATCH_PACKS` | bool | `False` | `1` | 0, 1 | experimental | 0.2.0 | Skips batch packs the precision policy never admits; saves about 199 MiB per rank. |
 | `VLLM_USE_AOT_COMPILE` | bool | `False` | `0` | 0, 1 | configuration | 1Cat | AOT compile reuse. The profile sets 0 on the reference deployment. |
-| `VLLM_V2_CUDAGRAPH_MEM_MIB` | float | `0.0` | `700` (AWQ), `700` (NVFP4), `1200` (DFlash2), `1000` (AWQ+DFlash2, planar KV), `600` (MTP, planar KV) | MiB | configuration | 1Cat | CUDA graph memory reserved before sizing the KV cache (MRv2 does not profile it). Too low risks OOM at capture; too high wastes KV. Profile: 700 (AWQ, NVFP4), 1200 (DFlash2); with fp8_per_token_head or int8 KV, 600 (MTP) and 1000 (AWQ + DFlash2). |
+| `VLLM_V2_CUDAGRAPH_MEM_MIB` | float | `0.0` | `700` (AWQ), `700` (NVFP4), `1200` (DFlash2), `1000` (AWQ+DFlash2, planar KV), `1024` (NVFP4+DFlash2, planar KV), `600` (MTP, planar KV) | MiB | configuration | 1Cat | CUDA graph memory reserved before sizing the KV cache (MRv2 does not profile it). Too low risks OOM at capture; too high wastes KV. Profile: 700 (AWQ, NVFP4), 1200 (DFlash2); with fp8_per_token_head or int8 KV, 600 (MTP), 1000 (AWQ + DFlash2) and 1024 (NVFP4 + DFlash2). |
 
 ### Anonymous usage statistics
 

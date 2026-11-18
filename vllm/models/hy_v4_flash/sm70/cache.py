@@ -56,6 +56,7 @@ class FlashMetadata(AttentionMetadata):
     decode: bool
     counts: torch.Tensor | None
     index_workspace: IndexPoolDecodeWorkspace | None
+    max_seq_len: int = 0
 
 
 class FlashMetadataBuilder(AttentionMetadataBuilder[FlashMetadata]):
@@ -83,7 +84,10 @@ class FlashMetadataBuilder(AttentionMetadataBuilder[FlashMetadata]):
                 history = model.hf_text_config.compressed_indexer_group_topk - 1
                 groups = cdiv(model.max_model_len, ratio)
                 # Every sparse layer in this attention group uses the same scratch.
-                topk_shape = (rows, history) if groups > history + 1 else (rows, 0)
+                dcp = vllm_config.parallel_config.decode_context_parallel_size > 1
+                topk_shape = (
+                    (rows, history) if not dcp and groups > history + 1 else (rows, 0)
+                )
                 self.index_workspace = IndexPoolDecodeWorkspace(
                     torch.empty(
                         (rows, ratio, kv_cache_spec.head_size),
@@ -135,6 +139,7 @@ class FlashMetadataBuilder(AttentionMetadataBuilder[FlashMetadata]):
             decode,
             self.counts,
             self.index_workspace,
+            cm.max_seq_len,
         )
 
 
@@ -185,7 +190,7 @@ class FlashSparseBackend(AttentionBackend):
 
     @classmethod
     def supports_dcp(cls) -> bool:
-        return False
+        return True
 
     @classmethod
     def supports_pcp(cls) -> bool:

@@ -29,6 +29,7 @@ from vllm.v1.core.kv_cache_utils import (
     get_max_concurrency_for_kv_cache_config,
     get_request_block_hasher,
     init_none_hash,
+    resolve_kv_cache_block_sizes,
 )
 from vllm.v1.kv_cache_interface import CircularBufferSpec, SlidingWindowMLASpec
 from vllm.v1.request import Request
@@ -134,18 +135,21 @@ def hf_layers():
 class PagedLayer:
     """Feed the actual metadata builder and bind shuffled physical pages."""
 
-    def __init__(self, model, config, length, requests=1):
+    def __init__(self, model, config, length, requests=1, swa=None):
         self.layer = model
         self.config = config
         self.device = model.topk_indices_buffer.device
         self.owners = [model.attn]
         if model.indexer is not None:
             self.owners += [model.indexer.k_cache, model.indexer.tail_cache]
+        if swa is not None:
+            self.owners.append(swa.attn)
         self.tables = {}
         for owner in self.owners:
             spec = owner.spec
             ring = isinstance(spec, CircularBufferSpec)
-            blocks = 1 if ring else (length + spec.block_size - 1) // spec.block_size
+            span = spec.global_block_size(model.dcp_world, 1)
+            blocks = 1 if ring else (length + span - 1) // span
             page = (
                 compressed_kernel_block_size(spec)
                 if spec.storage_block_size != spec.block_size
@@ -184,10 +188,15 @@ class PagedLayer:
             table = self.tables[owner.prefix]
             span = owner.spec.block_size
             slots = torch.empty(0, dtype=torch.int64, device=self.device)
-            if owner is self.layer.attn:
+            if owner is self.layer.attn or isinstance(owner.spec, SlidingWindowMLASpec):
+                world = self.layer.dcp_world if owner.spec.dcp_sharded else 1
+                rank = self.layer.dcp_rank if owner.spec.dcp_sharded else 0
                 slots = torch.cat(
                     [
-                        table[i, p // span].long() * span + p % span
+                        (
+                            table[i, p // (span * world)].long() * span
+                            + p // world % span
+                        ).masked_fill(p % world != rank, -1)
                         for i, p in enumerate(positions)
                     ]
                 )
@@ -427,15 +436,26 @@ def test_window_boundaries():
 
 
 @pytest.mark.parametrize(
-    "n_swa,cache_dtype", [(0, "auto"), (30, "auto"), (30, "fp8_ds_mla")]
+    "n_swa,cache_dtype,world",
+    [
+        (0, "auto", 1),
+        (30, "auto", 1),
+        (30, "fp8_ds_mla", 1),
+        (30, "auto", 2),
+        (30, "fp8_ds_mla", 4),
+    ],
 )
-def test_scheduler_page_layout(vllm_config, monkeypatch, n_swa, cache_dtype):
+def test_scheduler_page_layout(vllm_config, monkeypatch, n_swa, cache_dtype, world):
     from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
 
     vllm_config.model_config = SimpleNamespace(max_model_len=8192)
     vllm_config.cache_config.cache_dtype = cache_dtype
     vllm_config.cache_config.gpu_memory_utilization = 0.95
     vllm_config.parallel_config.tensor_parallel_size = 4
+    vllm_config.parallel_config.decode_context_parallel_size = world
+    monkeypatch.setattr(
+        parallel_state, "_DCP", SimpleNamespace(world_size=world, rank_in_group=0)
+    )
     vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = False
     vllm_config.scheduler_config.max_num_batched_tokens = 2048
     vllm_config.scheduler_config.max_num_seqs = 4
@@ -453,21 +473,26 @@ def test_scheduler_page_layout(vllm_config, monkeypatch, n_swa, cache_dtype):
     )
     # Use the profiled per-rank KV budget at 0.95 utilization for both layouts.
     cache = get_kv_cache_config_from_groups(vllm_config, groups, int(2.9 * (1 << 30)))
-    if n_swa == 30:
+    if n_swa == 30 and world == 1:
         tokens = int(8192 * get_max_concurrency_for_kv_cache_config(vllm_config, cache))
         expected = (1126, 129918) if cache_dtype == "fp8_ds_mla" else (666, 76843)
         assert (cache.num_blocks, tokens) == expected
         print(f"TP4 {cache_dtype}: {cache.num_blocks} pool blocks, {tokens} tokens")
+    scheduler_cache = generate_scheduler_kv_cache_config([cache])
+    vllm_config.cache_config.enable_prefix_caching = True
+    scheduling, hashing = resolve_kv_cache_block_sizes(scheduler_cache, vllm_config)
+    assert scheduling == 256
+    assert hashing == 4
     coordinator = HybridKVCacheCoordinator(
-        generate_scheduler_kv_cache_config([cache]),
+        scheduler_cache,
         8192,
         2048,
         False,
         True,
         False,
+        world,
         1,
-        1,
-        256,
+        hashing,
     )
     assert len(set(name for group in groups for name in group.layer_names)) == len(
         layers
@@ -515,6 +540,16 @@ def test_scheduler_page_layout(vllm_config, monkeypatch, n_swa, cache_dtype):
             )
             assert layer.kv_cache.shape == shape
             assert layer.kv_cache.stride(0) * layer.kv_cache.element_size() == stride
+            if world > 1:
+                replicated = isinstance(
+                    spec, (CircularBufferSpec, SlidingWindowMLASpec)
+                )
+                assert spec.dcp_sharded == (not replicated)
+                assert spec.block_size == (
+                    4 if isinstance(spec, CircularBufferSpec) else 256 // world
+                )
+                if spec.storage_block_size != spec.block_size:
+                    assert page == 64 // world
             if isinstance(spec, CircularBufferSpec):
                 assert spec.dtype == torch.float32
             elif cache_dtype == "fp8_ds_mla" and name.endswith(".attn"):
@@ -908,3 +943,100 @@ def test_cuda_decode_graph_replays_eager(
                 owner.kv_cache[:pages_per_block], before[:pages_per_block]
             )
             owner.kv_cache.copy_(before)
+
+
+@torch.inference_mode()
+def _cuda_hy4_dcp_worker(rank, world, cache_dtype, rendezvous):
+    from vllm.v1.worker.workspace import init_workspace_manager, reset_workspace_manager
+
+    device = torch.device("cuda", rank)
+    torch.accelerator.set_device_index(rank)
+    parallel_state.init_distributed_environment(
+        world_size=4, rank=rank, local_rank=rank, distributed_init_method=rendezvous
+    )
+    parallel_state.initialize_model_parallel(
+        tensor_model_parallel_size=4, decode_context_model_parallel_size=world
+    )
+    init_workspace_manager(device)
+    try:
+        _check_cuda_hy4_dcp(rank, world, cache_dtype, device)
+    finally:
+        reset_workspace_manager()
+        parallel_state.destroy_model_parallel()
+        parallel_state.destroy_distributed_environment()
+
+
+def _check_cuda_hy4_dcp(rank, world, cache_dtype, device):
+    from vllm.v1.worker.workspace import lock_workspace
+
+    config = text_config()
+    config.num_attention_heads = 32
+    config.kv_lora_rank = 512
+    config.qk_rope_head_dim = config.swa_qk_rope_head_dim = 64
+    config.compressed_indexer_num_attention_heads = 16
+    config.compressed_indexer_head_dim = 128
+    torch.manual_seed(45)
+    batches = [
+        ((2047, 0), (1, 0)),
+        ((3, 2047), (1, 1)),  # Mixed prefill and decode, closing the old ring.
+        ((1, 2050), (1, 2)),
+        ((1, 2051), (1, 3)),  # Group close also occurs on the decode path.
+    ]
+    inputs = [
+        tuple(
+            (torch.randn(n, config.hidden_size, device=device).half(), p, 0)
+            for n, p in batch
+        )
+        for batch in batches
+    ]
+    reference: list[torch.Tensor] = []
+    actual: list[torch.Tensor] = []
+    weights = None
+    for size, results in ((1, reference), (world, actual)):
+        vc = VllmConfig(device_config=DeviceConfig(device=device))
+        vc.parallel_config.decode_context_parallel_size = size
+        vc.model_config = SimpleNamespace(max_model_len=2304, hf_text_config=config)
+        vc.cache_config.cache_dtype = cache_dtype
+        vc.scheduler_config.max_num_seqs = 2
+        with (
+            set_current_vllm_config(vc),
+            set_default_torch_dtype(torch.float16),
+            device,
+        ):
+            indices = torch.empty(2048, 2048, dtype=torch.int32)
+            sparse = HYV4FlashAttention(
+                vc, config, 0, indices, "model.layers.0.self_attn"
+            )
+            swa = HYV4FlashAttention(vc, config, 1, indices, "model.layers.1.self_attn")
+        if weights is None:
+            for weight in sparse.parameters():
+                weight.normal_(std=0.12)
+            sparse.q_b_proj.weight.add_(rank * 0.03)
+            sparse.learnable_sink_param.add_(rank * 0.25)
+            weights = sparse.state_dict()
+        else:
+            sparse.load_state_dict(weights)
+        if size > 1:
+            with set_forward_context(None, vc):
+                dummy = torch.cat([x for x, _, _ in inputs[0]])
+                sparse(torch.arange(len(dummy), device=device), dummy)
+            lock_workspace()
+        paged = PagedLayer(sparse, vc, 2304, requests=2, swa=swa)
+        for batch in inputs:
+            results.append(paged.step(*batch))
+    for out, expected in zip(actual, reference):
+        torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-3)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or torch.accelerator.device_count() < 4,
+    reason="TP4 requires four CUDA GPUs",
+)
+@pytest.mark.parametrize("world", [2, 4])
+@pytest.mark.parametrize("cache_dtype", ["auto", "fp8_ds_mla"])
+def test_cuda_hy4_dcp_matches_tp4_eager(world, cache_dtype, tmp_path):
+    torch.multiprocessing.spawn(
+        _cuda_hy4_dcp_worker,
+        args=(world, cache_dtype, (tmp_path / "rendezvous").as_uri()),
+        nprocs=4,
+    )

@@ -103,6 +103,7 @@ def _paged_attention(
     Counts,
     Sinks,
     Out,
+    LSE,
     stride_qt,
     stride_qh,
     stride_kvp,
@@ -126,9 +127,13 @@ def _paged_attention(
     qb = Q + row * stride_qt + heads[:, None] * stride_qh
     q = tl.load(qb + d[None, :], heads[:, None] < HEADS, other=0)
     qr = tl.load(qb + LATENT + r[None, :], heads[:, None] < HEADS, other=0)
-    # Initialize with the sink's single denominator term and zero value.
-    m = tl.load(Sinks + heads, heads < HEADS, other=0).to(tl.float32)
-    z = tl.full((H,), 1.0, tl.float32)
+    if LSE is None:
+        # The sink contributes one denominator term and has zero value.
+        m = tl.load(Sinks + heads, heads < HEADS, other=0).to(tl.float32)
+        z = tl.full((H,), 1.0, tl.float32)
+    else:
+        m = tl.full((H,), -float("inf"), tl.float32)
+        z = tl.full((H,), 0.0, tl.float32)
     acc = tl.full((H, LATENT), 0.0, tl.float32)
     length = tl.load(Counts + row)
     for start in range(0, length, N):
@@ -145,6 +150,9 @@ def _paged_attention(
         acc = tl.dot(p.to(tl.float16), k, acc * rescale[:, None])
         z = z * rescale + tl.sum(p, axis=1)
         m = new_m
+    if LSE is not None:
+        tl.store(LSE + row * HEADS + heads, m + tl.log(z), heads < HEADS)
+        z = tl.where(length > 0, z, 1.0)
     tl.store(
         Out + row * stride_out + heads[:, None] * LATENT + d[None, :],
         acc / z[:, None],
@@ -157,9 +165,10 @@ def paged_attention(
     cache: torch.Tensor,
     slots: torch.Tensor,
     counts: torch.Tensor,
-    sinks: torch.Tensor,
+    sinks: torch.Tensor | None,
     scale: float,
     latent: int,
+    lse: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Packed physical slots per query with FP32 softmax."""
     tokens, heads, dim = q.shape
@@ -171,6 +180,7 @@ def paged_attention(
         counts,
         sinks,
         out,
+        lse,
         q.stride(0),
         q.stride(1),
         cache.stride(0),
@@ -244,6 +254,8 @@ def _index_scores(
     H: tl.constexpr,
     N: tl.constexpr,
     DECODE: tl.constexpr,
+    WORLD: tl.constexpr,
+    RANK: tl.constexpr,
 ):
     # Weighted ReLU head-sum as in the DeepSeek V4 SM70 indexer, with
     # plain FP16 pages in place of software-decoded FP8 keys.
@@ -258,6 +270,8 @@ def _index_scores(
         upper = tl.where(active, (length - 1) // RATIO, 0)
     else:
         upper = (FIRST + row) // RATIO
+    if WORLD > 1:
+        upper = (upper + WORLD - 1 - RANK) // WORLD
     logits = tl.full((N,), float("-inf"), tl.float32)
     if not DECODE or start < upper:
         logical_page = g // PAGE
@@ -304,6 +318,8 @@ def index_scores(
     lengths: torch.Tensor | None = None,
     slots: torch.Tensor | None = None,
     group_topk: int = 0,
+    world: int = 1,
+    rank: int = 0,
 ) -> torch.Tensor:
     if logits is None:
         logits = q.new_empty((q.shape[0], groups), dtype=torch.float32)
@@ -331,6 +347,8 @@ def index_scores(
         max(16, triton.next_power_of_2(q.shape[1])),
         64,
         lengths is not None,
+        world,
+        rank,
         num_warps=4,
     )
     return logits

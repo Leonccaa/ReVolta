@@ -6,12 +6,14 @@ from torch import nn
 
 from vllm import envs
 from vllm.config import VllmConfig
+from vllm.distributed import get_dcp_group
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import CircularBufferSpec, MLAAttentionSpec
 
 from .cache import FlashCache, FlashMetadata, QuerySpan
+from .dcp import select_history
 from .decode import gather_decode_group, store_decode_group
 from .kernels import index_scores
 from .rotary import apply_rotary, rotary_phases
@@ -37,8 +39,14 @@ def select_tokens(
     history: int,
 ) -> torch.Tensor:
     """Select complete groups, then append the current group's visible prefix."""
-    current = positions // ratio
     selected = logits.topk(history, dim=-1, sorted=False).indices.sort(dim=-1).values
+    return expand_groups(selected, positions, ratio)
+
+
+def expand_groups(
+    selected: torch.Tensor, positions: torch.Tensor, ratio: int
+) -> torch.Tensor:
+    current = positions // ratio
     offsets = torch.arange(ratio, device=positions.device)
     recalled = (selected[..., None] * ratio + offsets).flatten(1)
     tail = current[:, None] * ratio + offsets
@@ -52,6 +60,9 @@ class FlashCompressedIndexer(nn.Module):
 
     def __init__(self, vllm_config: VllmConfig, config, prefix: str, block_size: int):
         super().__init__()
+        self.dcp_world = vllm_config.parallel_config.decode_context_parallel_size
+        self.dcp_group = get_dcp_group() if self.dcp_world > 1 else None
+        self.dcp_rank = self.dcp_group.rank_in_group if self.dcp_group else 0
         self.ratio = config.compressed_indexer_compress_ratio
         self.history = config.compressed_indexer_group_topk - 1
         self.width = (self.history + 1) * self.ratio
@@ -59,6 +70,10 @@ class FlashCompressedIndexer(nn.Module):
         self.dim = config.compressed_indexer_head_dim
         self.rope_dim = config.qk_rope_head_dim
         self.eps = config.rms_norm_eps
+        if self.dcp_group is not None:
+            assert vllm_config.model_config is not None
+            self.max_model_len = vllm_config.model_config.max_model_len
+            self.max_decode_rows = vllm_config.scheduler_config.max_num_seqs
         self.logits_budget = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024 // 4
         for name, in_dim, out_dim in (
             ("query_projection", config.q_lora_rank, self.num_heads * self.dim),
@@ -96,7 +111,7 @@ class FlashCompressedIndexer(nn.Module):
                 head_size=self.dim,
                 dtype=torch.float16,
                 compress_ratio=self.ratio,
-                dcp_sharded=False,
+                dcp_sharded=self.dcp_world > 1,
             ),
         )
         self.tail_cache = FlashCache(
@@ -185,28 +200,44 @@ class FlashCompressedIndexer(nn.Module):
             self.dim,
             page,
             pages_per_block,
+            self.dcp_world,
+            self.dcp_rank,
         )
-        logits = workspace.logits[:rows]
-        if logits.shape[1] == 0:
+        groups = workspace.logits.shape[1]
+        logits: torch.Tensor | None = workspace.logits[:rows]
+        if self.dcp_group is not None:
+            if metadata.max_seq_len <= self.width:
+                return None
+            groups = cdiv(metadata.max_seq_len, self.ratio * self.dcp_world)
+            logits = None
+        elif groups == 0:
             return None
         query = self.query_projection(q_c)[0].view(rows, self.num_heads, self.dim)
         query = self._rotate(query, cos[:, None], sin[:, None])
         weights = self.head_weight_projection(hidden)[0].float()
         weights *= self.num_heads**-0.5 * self.dim**-0.5
-        index_scores(
+        logits = index_scores(
             query,
             weights,
             pool,
             table,
             0,
-            logits.shape[1],
+            groups,
             self.ratio,
             pages_per_block,
             logits=logits,
             lengths=metadata.seq_lens,
             slots=slots,
             group_topk=self.history + 1,
+            world=self.dcp_world,
+            rank=self.dcp_rank,
         )
+        if self.dcp_group is not None:
+            lengths = metadata.seq_lens[:rows]
+            upper = ((lengths - 1) // self.ratio).masked_fill(
+                (slots < 0) | (lengths <= self.width), 0
+            )
+            return select_history(logits, self.local_lengths(upper), self.dcp_group)
         topk_groups = workspace.topk_groups[:rows]
         torch.topk(
             logits,
@@ -217,6 +248,28 @@ class FlashCompressedIndexer(nn.Module):
         sorted_groups = workspace.sorted_groups[:rows]
         torch.sort(topk_groups, out=(sorted_groups, workspace.sort_order[:rows]))
         return sorted_groups
+
+    def profile_dcp(self, q: torch.Tensor) -> None:
+        assert self.dcp_group is not None
+        if self.max_model_len <= self.width:
+            return
+        rows = q.shape[0]
+        groups = cdiv(self.max_model_len, self.ratio * self.dcp_world)
+        # Decode scores all requests together. Prefill may score as many rows
+        # as the configured logits budget allows in a single chunk.
+        elements = max(
+            min(rows, self.max_decode_rows) * groups,
+            min(rows * groups, self.logits_budget),
+        )
+        score_scratch = q.new_empty((elements,), dtype=torch.float32)
+        select_history(
+            score_scratch[:rows, None],
+            q.new_zeros(rows, dtype=torch.int32),
+            self.dcp_group,
+        )
+
+    def local_lengths(self, groups: torch.Tensor) -> torch.Tensor:
+        return ((groups + self.dcp_world - 1 - self.dcp_rank) // self.dcp_world).int()
 
     def prepare_groups(
         self,
@@ -244,13 +297,20 @@ class FlashCompressedIndexer(nn.Module):
                     (saved[:, self.dim].to(positions.dtype), group_pos)
                 )
             raw = raw.reshape(-1, self.ratio, self.dim)
+            group_pos = group_pos[:: self.ratio]
+            groups = torch.arange(first, end, device=keys.device)
+            if self.dcp_group is not None:
+                owner = slice(
+                    (self.dcp_rank - first) % self.dcp_world, None, self.dcp_world
+                )
+                raw, group_pos = raw[owner], group_pos[owner]
+                groups = groups[owner] // self.dcp_world
             values = self.key_value_projection(raw)
             gates = self.key_gate_projection(raw) + self.intra_group_ape
             pooled = self.key_norm((values * gates.softmax(dim=1)).sum(dim=1)).to(
                 keys.dtype
             )
-            cos, sin = rotary_phases(group_pos[:: self.ratio], inv_freq)
-            groups = torch.arange(first, end, device=keys.device)
+            cos, sin = rotary_phases(group_pos, inv_freq)
             pages = pool_page_ids(groups, table, page, pages_per_block)
             pool[pages, groups % page] = self._rotate(pooled, cos, sin)
         # Earlier members of the same still-open group are left in the ring.
@@ -310,7 +370,7 @@ class FlashCompressedIndexer(nn.Module):
             weights = self.head_weight_projection(hidden[full_end:end])[0].float()
             weights *= self.num_heads**-0.5 * self.dim**-0.5
             first = prefix + full_end - begin
-            groups = cdiv(length, self.ratio)
+            groups = cdiv(length, self.ratio * self.dcp_world)
             chunk = max(1, self.logits_budget // groups)
             for start in range(0, end - full_end, chunk):
                 stop = start + chunk
@@ -328,6 +388,8 @@ class FlashCompressedIndexer(nn.Module):
                         groups,
                         self.ratio,
                         pages_per_block,
+                        world=self.dcp_world,
+                        rank=self.dcp_rank,
                     )
                 else:
                     g = torch.arange(groups, device=q.device)
@@ -336,6 +398,10 @@ class FlashCompressedIndexer(nn.Module):
                     ].float()
                     logits = ((q.float() @ k.T).relu() * w[..., None]).sum(1)
                     logits.masked_fill_(g >= logical[:, None] // self.ratio, -torch.inf)
-                output[full_end + start : full_end + start + q.shape[0]] = (
-                    select_tokens(logits, logical, self.ratio, self.history)
-                )
+                if self.dcp_group is not None:
+                    local_lengths = self.local_lengths(logical // self.ratio)
+                    selected = select_history(logits, local_lengths, self.dcp_group)
+                    tokens = expand_groups(selected, logical, self.ratio)
+                else:
+                    tokens = select_tokens(logits, logical, self.ratio, self.history)
+                output[full_end + start : full_end + start + q.shape[0]] = tokens

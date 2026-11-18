@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Dynamic SD scheduling regressions adapted from vLLM #32374."""
 
+from types import SimpleNamespace
+
 import pytest
 
 from tests.v1.core.utils import create_requests, create_scheduler
@@ -60,6 +62,89 @@ def _add_requests_and_schedule(
     for request in requests:
         scheduler.add_request(request)
     return scheduler.schedule()
+
+
+def test_mtp_zero_drafts_preserves_prefill_forward():
+    from unittest.mock import Mock
+
+    import numpy as np
+    import torch
+
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+    from vllm.v1.worker.gpu.input_batch import InputBuffers
+    from vllm.v1.worker.gpu.spec_decode.eagle import speculator as eagle
+
+    spec = object.__new__(eagle.EagleSpeculator)
+    spec.method = "mtp"
+    spec.num_speculative_steps = 2
+    spec.max_num_reqs = 1
+    spec.dp_size, spec.dp_rank = 1, 0
+    spec.temperature = torch.ones(1)
+    spec.seeds = torch.zeros(1, dtype=torch.int64)
+    spec.idx_mapping = torch.zeros(1, dtype=torch.int32)
+    spec.last_token_indices = torch.tensor([3])
+    spec.current_draft_step = torch.tensor(0)
+    spec.input_buffers = InputBuffers(1, 4, torch.device("cpu"))
+    spec.share_mtp_topk_indices = False
+    spec.draft_logits = None
+    spec.draft_tokens = torch.zeros(1, 2, dtype=torch.int64)
+    spec.hidden_states = torch.zeros(4, 3)
+    target_hidden = torch.arange(12, dtype=torch.float32).view(4, 3)
+    draft_hidden = target_hidden + 1
+    spec.run_model = Mock(return_value=(draft_hidden, draft_hidden))
+    spec._sample_draft = Mock(return_value=torch.tensor([17]))
+    spec.multi_step_decode = Mock()
+    spec.prefill_cudagraph_manager = Mock()
+    spec.prefill_cudagraph_manager.dispatch.return_value = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.NONE, num_tokens=4, num_reqs=1
+    )
+    batch = SimpleNamespace(
+        num_reqs=1,
+        num_tokens=4,
+        num_tokens_after_padding=4,
+        num_scheduled_tokens=np.array([4]),
+        idx_mapping=torch.tensor([0], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 4], dtype=torch.int32),
+        seq_lens=torch.tensor([4], dtype=torch.int32),
+        input_ids=torch.tensor([1, 2, 3, 4], dtype=torch.int32),
+        positions=torch.arange(4),
+        is_prefilling_np=np.array([True]),
+    )
+    num_sampled = torch.ones(1, dtype=torch.int32)
+    num_rejected = torch.zeros(1, dtype=torch.int32)
+    last_sampled = torch.tensor([13])
+    next_prefill_tokens = torch.tensor([0])
+
+    def propose(k):
+        return spec.propose(
+            batch,
+            {},
+            {},
+            target_hidden,
+            None,
+            num_sampled,
+            num_rejected,
+            last_sampled,
+            next_prefill_tokens,
+            spec.temperature,
+            spec.seeds,
+            num_speculative_tokens=k,
+        )
+
+    propose(0)
+    spec.run_model.assert_called_once()
+    zero_draft_forward = spec.run_model.call_args
+    assert zero_draft_forward.args[0] == 4
+    spec._sample_draft.assert_not_called()
+    spec.multi_step_decode.assert_not_called()
+
+    spec.run_model.reset_mock()
+    assert propose(1)[0, 0] == 17
+    spec.run_model.assert_called_once_with(
+        *zero_draft_forward.args, **zero_draft_forward.kwargs
+    )
+    spec._sample_draft.assert_called_once()
 
 
 def test_dynamic_sd_uses_batch_size_schedule():

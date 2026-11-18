@@ -922,8 +922,11 @@ def test_speculator_enabled_initialization_and_sampling(
     update.assert_called_once_with(sampled, counts, 4, mapping)
 
 
-@pytest.mark.parametrize(("with_tail", "k"), [(False, 4), (True, 3), (True, 0)])
-def test_runner_actual_call_order(monkeypatch, with_tail, k):
+@pytest.mark.parametrize(
+    ("method", "with_tail", "k"),
+    [("mtp", False, 4), ("mtp", True, 3), ("mtp", True, 0), ("dflash", False, 0)],
+)
+def test_runner_actual_call_order(monkeypatch, method, with_tail, k):
     from vllm.v1.worker.gpu import model_runner as runner_mod
     from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 
@@ -990,11 +993,11 @@ def test_runner_actual_call_order(monkeypatch, with_tail, k):
         return torch.tensor([[20, 21, 22, 23]])
 
     runner.num_speculative_steps = 4
-    runner.speculator = object.__new__(eagle.EagleSpeculator)
-    runner.speculator.method = "mtp"
-    runner.speculator.supports_mm_inputs = False
-    runner.speculator.propose = propose
-    runner.speculator._draft_vocab_tail = None
+    runner.speculator = SimpleNamespace(
+        method=method, supports_mm_inputs=False, propose=propose
+    )
+    if method == "dflash":
+        runner.speculator.next_num_draft_tokens = Mock(return_value=4)
     if with_tail:
 
         def update(sampled, num_sampled, num_reqs, idx_mapping):
@@ -1009,8 +1012,12 @@ def test_runner_actual_call_order(monkeypatch, with_tail, k):
     runner.mixed_prefill_timer = SimpleNamespace(finish=Mock(return_value=None))
     runner.use_async_scheduling = True
     runner.eplb = SimpleNamespace(step=Mock())
-    monkeypatch.setattr(runner_mod, "AsyncOutput", lambda **kwargs: SimpleNamespace())
-    runner.sample_tokens(None)
+    monkeypatch.setattr(runner_mod, "AsyncOutput", SimpleNamespace)
+    output = runner.sample_tokens(None)
+    assert output.sampler_output.sampled_token_ids is ids
+    assert output.num_sampled_tokens is counts
+    if method == "dflash":
+        runner.speculator.next_num_draft_tokens.assert_not_called()
     assert runner.req_states.draft_tokens.tolist() == [
         list(range(20, 20 + k)) + [-1] * (4 - k)
     ]

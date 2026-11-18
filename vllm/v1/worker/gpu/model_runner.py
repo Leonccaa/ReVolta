@@ -1816,7 +1816,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # cross-attention cache with dynamic encoder outputs.
             skip_compiled = True
 
-        batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
+        batch_desc, dp_sync_state = dispatch_cg_and_sync_dp(
             self.cudagraph_manager,
             num_reqs,
             num_toks,
@@ -1824,6 +1824,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.dp_size,
             self.dp_rank,
             need_eager=is_profile or skip_compiled,
+            allow_skip_drafts=scheduler_output.skip_drafts,
+        )
+        num_tokens_across_dp = (
+            dp_sync_state.num_tokens_across_dp if dp_sync_state is not None else None
         )
 
         if batch_desc.num_tokens == 0:
@@ -2044,6 +2048,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             output_intermediate_tensors = model_output
 
         finished_req_ids = scheduler_output.finished_req_ids
+        skip_drafts = (
+            dp_sync_state.skip_drafts
+            if dp_sync_state is not None
+            else scheduler_output.skip_drafts
+        )
         self.execute_model_state = ExecuteModelState(
             input_batch=input_batch,
             attn_metadata=attn_metadata,
@@ -2051,7 +2060,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states=hidden_states,
             aux_hidden_states=aux_hidden_states,
             finished_req_ids=finished_req_ids,
-            num_spec_tokens_to_schedule=scheduler_output.num_spec_tokens_to_schedule,
+            num_spec_tokens_to_schedule=(
+                0 if skip_drafts else scheduler_output.num_spec_tokens_to_schedule
+            ),
         )
         self._sm70_v2_mtp_profile_pending = mtp_profile_ctx
 
@@ -2229,7 +2240,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
             num_draft_tokens = None
             proposal_kwargs: dict[str, int] = {}
-            if self.speculator.method == "mtp":
+            if (
+                execute_model_state.num_spec_tokens_to_schedule == 0
+                or self.speculator.method == "mtp"
+            ):
                 num_draft_tokens = execute_model_state.num_spec_tokens_to_schedule
                 proposal_kwargs["num_speculative_tokens"] = num_draft_tokens
             draft_tokens = self.speculator.propose(
@@ -2274,7 +2288,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ):
                 draft_tokens[:, num_draft_tokens:] = -1
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
-            if hasattr(self.speculator, "next_num_draft_tokens"):
+            if num_draft_tokens is None and hasattr(
+                self.speculator, "next_num_draft_tokens"
+            ):
                 num_draft_tokens = self.speculator.next_num_draft_tokens()
             self.draft_tokens_handler.set_draft_tokens(
                 input_batch,

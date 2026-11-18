@@ -93,6 +93,7 @@ def test_execute_rejects_prefill_before_dp_graph_dispatch(monkeypatch):
         num_scheduled_tokens={"tail": 4},
         total_num_scheduled_tokens=4,
         new_block_ids_to_zero=[],
+        skip_drafts=True,
     )
 
     class DispatchReached(Exception):
@@ -101,6 +102,7 @@ def test_execute_rejects_prefill_before_dp_graph_dispatch(monkeypatch):
     def dispatch(manager, num_reqs, num_tokens, uniform_token_count, *args, **kwargs):
         assert (num_reqs, num_tokens) == (1, 4)
         assert uniform_token_count is None
+        assert kwargs["allow_skip_drafts"]
         raise DispatchReached
 
     monkeypatch.setattr(mrv2, "dispatch_cg_and_sync_dp", dispatch)

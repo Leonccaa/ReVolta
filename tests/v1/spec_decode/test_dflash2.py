@@ -2069,29 +2069,11 @@ def test_dflash_disables_aot_schedule_only_for_sliding_draft_groups(monkeypatch)
     assert full_builder.aot_schedule is True
 
 
-@pytest.mark.parametrize(
-    ("mask", "expected"),
-    [
-        (np.array([True], dtype=np.bool_), True),
-        (np.array([True, True], dtype=np.bool_), True),
-        (np.array([True, False], dtype=np.bool_), False),
-        (np.array([False], dtype=np.bool_), False),
-        (None, False),
-    ],
-)
-def test_dflash_context_only_prefill_requires_every_live_request(mask, expected):
-    batch = SimpleNamespace(
-        num_reqs=1 if mask is None else mask.size,
-        is_incomplete_prefilling_np=mask,
-    )
-    assert dflash_speculator._is_context_only_prefill(batch) is expected
+def test_dflash2_zero_drafts_materializes_context_without_query():
+    from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+    from vllm.v1.worker.gpu.input_batch import InputBuffers
 
-
-def test_dflash_intermediate_prefill_materializes_context_without_query(monkeypatch):
-    prepare_inputs = Mock()
-    monkeypatch.setattr(dflash_speculator, "prepare_dflash_inputs", prepare_inputs)
-
-    speculator = DFlashSpeculator.__new__(DFlashSpeculator)
+    speculator = DFlash2Speculator.__new__(DFlash2Speculator)
     speculator.max_model_len = 256
     speculator.num_query_per_req = 8
     speculator.num_speculative_steps = 7
@@ -2100,7 +2082,7 @@ def test_dflash_intermediate_prefill_materializes_context_without_query(monkeypa
     speculator.max_num_tokens = 8
     speculator.hidden_states = torch.zeros(8, 3)
     speculator.draft_tokens = torch.zeros(1, 7, dtype=torch.int64)
-    speculator.input_buffers = object()
+    speculator.input_buffers = InputBuffers(1, 8, torch.device("cpu"))
     speculator.context_positions = torch.zeros(8, dtype=torch.int64)
     speculator.sample_indices = torch.zeros(7, dtype=torch.int64)
     speculator.sample_pos = torch.zeros(7, dtype=torch.int64)
@@ -2112,21 +2094,19 @@ def test_dflash_intermediate_prefill_materializes_context_without_query(monkeypa
     speculator.draft_kv_cache_group_id = 0
     speculator.draft_kv_cache_group_ids = [0]
     speculator.block_tables = SimpleNamespace(
-        slot_mappings=[torch.zeros(8, dtype=torch.int64)],
-        input_block_tables=[torch.zeros(1, 8, dtype=torch.int32)],
-        kernel_block_sizes=[1],
-        cp_rank=0,
-        cp_size=1,
+        input_block_tables=[torch.tensor([[2, 3]], dtype=torch.int32)],
+        kernel_block_sizes=[16],
         cp_interleave=1,
         group_cp=lambda group_id: (1, 0),
     )
     speculator._context_slot_mappings = torch.zeros(1, 8, dtype=torch.int64)
     speculator._query_slot_mappings = torch.zeros(1, 8, dtype=torch.int64)
     speculator._layer_group_idx = None
-    speculator._context_only_prefill_logged = False
-    speculator._prepare_ngram_assist = Mock(
-        side_effect=AssertionError("ngram lookup must not run mid-prefill")
-    )
+    speculator._lookup_enabled = False
+    speculator._prepared_context_batch = None
+    speculator._context_kv_graphs = {}
+    speculator._generate_draft = Mock()
+    speculator._prepare_ngram_assist = Mock()
     speculator.model = SimpleNamespace(
         precompute_and_store_context_kv=Mock(),
     )
@@ -2134,8 +2114,11 @@ def test_dflash_intermediate_prefill_materializes_context_without_query(monkeypa
     input_batch = SimpleNamespace(
         num_reqs=1,
         num_tokens=4,
-        seq_lens_cpu_upper_bound=torch.tensor([4], dtype=torch.int32),
-        is_incomplete_prefilling_np=np.array([True], dtype=np.bool_),
+        seq_lens_cpu_upper_bound=torch.tensor([20], dtype=torch.int32),
+        num_scheduled_tokens=np.array([4], dtype=np.int32),
+        positions=torch.arange(16, 20, dtype=torch.int64),
+        query_start_loc=torch.tensor([0, 4], dtype=torch.int32),
+        idx_mapping=torch.tensor([0], dtype=torch.int32),
     )
     output = speculator.propose(
         input_batch=input_batch,
@@ -2143,21 +2126,28 @@ def test_dflash_intermediate_prefill_materializes_context_without_query(monkeypa
         slot_mappings={},
         last_hidden_states=torch.arange(12, dtype=torch.float32).view(4, 3),
         aux_hidden_states=None,
-        num_sampled=torch.zeros(1, dtype=torch.int32),
-        num_rejected=torch.zeros(1, dtype=torch.int32),
+        num_sampled=torch.tensor([3], dtype=torch.int32),
+        num_rejected=torch.tensor([1], dtype=torch.int32),
         last_sampled=torch.zeros(1, dtype=torch.int64),
         next_prefill_tokens=torch.zeros(1, dtype=torch.int64),
         temperature=torch.ones(1),
         seeds=torch.zeros(1, dtype=torch.int64),
+        num_speculative_tokens=0,
     )
 
-    prepare_inputs.assert_called_once()
     speculator.model.precompute_and_store_context_kv.assert_called_once()
+    context_hidden, context_positions, context_slots = (
+        speculator.model.precompute_and_store_context_kv.call_args.args
+    )
+    assert context_positions.tolist() == [16, 17, 18, 0]
+    assert context_slots.tolist() == [48, 49, 50, PAD_SLOT_ID]
+    speculator._generate_draft.assert_not_called()
+    speculator._prepare_ngram_assist.assert_not_called()
     torch.testing.assert_close(
-        speculator.hidden_states[:4],
+        context_hidden,
         torch.arange(12, dtype=torch.float32).view(4, 3),
     )
-    assert output.tolist() == [[-1] * 7]
+    assert output.data_ptr() == speculator.draft_tokens.data_ptr()
 
 
 def test_noncausal_dflash_capture_binds_paged_prefix_attention(monkeypatch):

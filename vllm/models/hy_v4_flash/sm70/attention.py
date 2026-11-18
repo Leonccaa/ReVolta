@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Hy4 Flash text MLA with a shared FP16 paged reader for both layer types."""
+"""Hy4 Flash text MLA with a shared paged reader for both layer types."""
 
 from math import lcm
 from typing import cast
@@ -20,13 +20,17 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
 from vllm.model_executor.utils import set_weight_attrs
-from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
+from vllm.v1.kv_cache_interface import (
+    MLAAttentionSpec,
+    SlidingWindowMLASpec,
+    get_kv_quant_mode,
+)
 from vllm.v1.worker.workspace import current_workspace_manager
 
 from .cache import POOL_PAGE, FlashCache, FlashMetadata, FlashSWABackend
 from .decode import decode_slots
 from .indexpool import FlashCompressedIndexer
-from .kernels import paged_attention, paged_attention_torch
+from .kernels import pack_fp8_ds_mla_torch, paged_attention, paged_attention_torch
 from .rotary import apply_rotary, rotary_phases
 from .splitk import decode_workspace_specs, paged_attention_splitk
 from .swa import window_indices
@@ -128,11 +132,15 @@ class HYV4FlashAttention(nn.Module):
             vllm_config.cache_config.block_size,
             POOL_PAGE * config.compressed_indexer_compress_ratio,
         )
+        fp8_kv = vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
+        self.main_cache_dtype = "fp8_ds_mla" if fp8_kv else "auto"
         cache_args = dict(
             block_size=block_size,
             num_kv_heads=1,
             head_size=self.kv_lora_rank + self.qk_rope_head_dim,
-            dtype=torch.float16,
+            dtype=torch.uint8 if fp8_kv else torch.float16,
+            cache_dtype_str=self.main_cache_dtype,
+            kv_quant_mode=get_kv_quant_mode(self.main_cache_dtype),
             dcp_sharded=False,
         )
         if self.is_window_layer:
@@ -222,7 +230,12 @@ class HYV4FlashAttention(nn.Module):
             )
         if q.is_cuda:
             ops.concat_and_cache_mla(
-                kv_c[:tokens], k_pe[:tokens], cache, slots, "auto", self._k_scale
+                kv_c[:tokens],
+                k_pe[:tokens],
+                cache,
+                slots,
+                self.main_cache_dtype,
+                self._k_scale,
             )
             if main.decode:
                 workspace = current_workspace_manager().get_simultaneous(
@@ -239,9 +252,11 @@ class HYV4FlashAttention(nn.Module):
                 )
             reader = paged_attention
         else:
-            cache[slots // page, slots % page] = torch.cat(
-                (kv_c[:tokens], k_pe[:tokens]), dim=-1
-            )
+            if cache.dtype == torch.uint8:
+                kv = pack_fp8_ds_mla_torch(kv_c[:tokens], k_pe[:tokens])
+            else:
+                kv = torch.cat((kv_c[:tokens], k_pe[:tokens]), dim=-1)
+            cache[slots // page, slots % page] = kv
             reader = paged_attention_torch
         return reader(
             q[:tokens],

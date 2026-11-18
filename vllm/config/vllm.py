@@ -2974,9 +2974,12 @@ class VllmConfig:
         current_platform.check_and_update_config(self)
 
         spec_config = self.speculative_config
+        # A drafter's derived config does not schedule; the target's config
+        # validates and owns the schedule.
         if (
             spec_config
             and spec_config.num_speculative_tokens_per_batch_size is not None
+            and not self.is_speculative_draft
         ):
             from vllm.v1.spec_decode.dynamic.utils import (
                 validate_and_normalize_dynamic_sd_schedule,

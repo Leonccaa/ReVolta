@@ -797,7 +797,7 @@ torch::Tensor dynamic_4bit_int_moe_cpu(
 using fptr_t = int64_t;
 fptr_t init_custom_ar(const std::vector<int64_t>& fake_ipc_ptrs,
                       torch::Tensor& rank_data, int64_t rank,
-                      bool fully_connected);
+                      const std::string& interconnect_mode);
 void all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out,
                 fptr_t reg_buffer, int64_t reg_buffer_sz_bytes);
 void sm70_tp2_all_reduce_gemma_rms_norm(

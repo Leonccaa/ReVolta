@@ -3027,13 +3027,13 @@ def _custom_ar_owner_namespace():
 
 
 def init_custom_ar(
-    ipc_tensors: list[torch.Tensor],
+    ipc_tensors: list[int],
     rank_data: torch.Tensor,
     rank: int,
-    fully_connected: bool,
+    interconnect_mode: str,
 ) -> int:
     return _custom_ar_op("init_custom_ar")(
-        ipc_tensors, rank_data, rank, fully_connected
+        ipc_tensors, rank_data, rank, interconnect_mode
     )
 
 

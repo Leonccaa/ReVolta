@@ -8,6 +8,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from vllm import envs
 from vllm.distributed.device_communicators import cuda_communicator as cuda_comm
 from vllm.distributed.device_communicators import custom_all_reduce as car
 from vllm.distributed.device_communicators.cuda_communicator import CudaCommunicator
@@ -199,6 +200,45 @@ def test_ordinary_all_reduce_keeps_its_policy(monkeypatch, tokens):
     else:
         custom.custom_all_reduce.assert_not_called()
         comm.pynccl_comm.all_reduce.assert_called_once_with(inp)
+
+
+@pytest.mark.parametrize("tokens", [20, 24, 25, 30, 32, 35, 40])
+def test_pex_mid_size_dispatches_ordinary_and_sum2_to_push(monkeypatch, tokens):
+    monkeypatch.delenv("VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES", raising=False)
+    custom = _custom(monkeypatch)
+    custom.sm70_pcie_switch_max_bytes = envs.VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES
+    custom._vmm_safe = False
+    del custom.custom_all_reduce
+    inp = torch.ones(tokens, 2560, dtype=torch.float16)
+    custom.all_reduce = Mock(return_value=inp)
+    comm = _cuda(custom)
+    assert comm.all_reduce(inp) is inp
+    custom.all_reduce.assert_called_once_with(inp, registered=True)
+    assert custom.can_sm70_tp4_push_sum2(inp)
+    assert comm.all_reduce_sum2(inp, inp) is inp
+    custom.all_reduce_sum2.assert_called_once_with(inp, inp)
+    comm.pynccl_comm.all_reduce.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "tokens,capturing,push_registered",
+    [(21, True, True), (40, False, True), (40, True, False), (48, True, True)],
+)
+def test_pex_mid_size_outside_push_admission_uses_nccl(
+    monkeypatch, tokens, capturing, push_registered
+):
+    monkeypatch.delenv("VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES", raising=False)
+    custom = _custom(monkeypatch, capturing=capturing)
+    custom.sm70_pcie_switch_max_bytes = envs.VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES
+    if not push_registered:
+        custom.sm70_tp4_push_buffer_ptrs = None
+    comm = _cuda(custom)
+    inp = torch.ones(tokens, 2560, dtype=torch.float16)
+    assert comm.all_reduce(inp) is inp
+    assert torch.equal(comm.all_reduce_sum2(inp, inp), inp + inp)
+    custom.custom_all_reduce.assert_not_called()
+    custom.all_reduce_sum2.assert_not_called()
+    assert comm.pynccl_comm.all_reduce.call_count == 2
 
 
 @pytest.mark.parametrize("switch", [False, True])

@@ -75,6 +75,24 @@ def test_local_safetensors_reads_and_cpu_gather(tmp_path, monkeypatch):
     )[:, None, :]
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
+    # Exercise the 131072-row read boundary without allocating a full model table.
+    accesses.clear()
+    sizes = [131073] * 4
+    big_path = tmp_path / "chunked.safetensors"
+    big_codes = torch.zeros((sum(sizes), dim), dtype=torch.uint8).view(
+        torch.float8_e4m3fn
+    )
+    big_scales = torch.ones(sum(sizes), dtype=torch.bfloat16)
+    save_file({name: big_codes, name + "_scale_inv": big_scales}, big_path)
+    chunked = engram.FlashEmbedding(sizes, dim, config(), "chunked")
+    chunked.load_from_safetensors(str(big_path), name)
+    assert accesses == [
+        (slice(262146, 393218), slice(None)),
+        slice(262146, 393218),
+        (slice(393218, 393219), slice(None)),
+        slice(393218, 393219),
+    ]
+
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_cuda_gather_matches_cpu(tmp_path, monkeypatch):

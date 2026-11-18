@@ -180,6 +180,8 @@ GGUF are outside the build.
 
 There is no GPU CI. Releases are checked on the reference machine.
 
+Hy4-flash support is text-only, needs exactly four V100 32 GB GPUs, and is frozen at 0.2.0rc13: later versions are not guaranteed to keep it working. Image and video input, DFly2 speculative decoding and pipeline parallelism are not supported. See [Hy4-flash](hy4-flash.md).
+
 ## See also
 
 - [Reference launch tutorial](getting-started.md)

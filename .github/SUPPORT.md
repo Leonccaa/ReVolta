@@ -13,7 +13,7 @@ In short:
 | Host memory | 32 GiB tested minimum with the experimental whole-table PLE disk option; 80 GiB with the default pinned PLE table (KV offload off); 128 GiB recommended |
 | KV offload | Off, CPU, or CPU + SSD tier |
 | KV cache | Scalar E4M3 in the documented reference recipes, or INT8; INT8 with the SSD tier is not supported |
-| Models | Qwen3.8 Flash-Next (QSA, multimodal) |
+| Models | Qwen3.8 Flash-Next (QSA, multimodal); Hy4-flash text-only on exactly four V100 32 GB (validation support, frozen at 0.2.0rc13; see [Hy4-flash](../docs/hy4-flash.md)) |
 | Checkpoints | AWQ g32, standard NVFP4 `RadixArk/Qwen3.8-Flash-Next-NVFP4`, `nvidia/Qwen3.8-Flash-Next-FP4-Local`, `nvidia/Qwen3.8-Flash-Next-NVFP4-QAD` |
 
 Configurations outside our release gate (TP2/TP8, V100 16 GB, other models or

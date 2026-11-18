@@ -148,7 +148,7 @@ def _index_scores(
     DIM: tl.constexpr,
     PAGE: tl.constexpr,
     PAGES_PER_BLOCK: tl.constexpr,
-    GROUPS: tl.constexpr,
+    GROUPS,
     RATIO: tl.constexpr,
     H: tl.constexpr,
     N: tl.constexpr,

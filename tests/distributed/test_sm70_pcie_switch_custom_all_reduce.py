@@ -198,8 +198,7 @@ def test_upstream_instances_unchanged(monkeypatch):
     assert communicator.should_custom_ar(_fp16(1024 * 1024))
 
 
-def test_env_defaults_match_validated_pcie_switch_settings(monkeypatch):
-    # These values match the validated four-V100 PCIe-switch configuration.
+def test_env_defaults_match_pcie_switch_settings(monkeypatch):
     import vllm.envs as envs
 
     for name in (
@@ -210,5 +209,5 @@ def test_env_defaults_match_validated_pcie_switch_settings(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
     assert envs.environment_variables["VLLM_SM70_PCIE_SWITCH_CUSTOM_AR"]() == "auto"
-    assert envs.environment_variables["VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES"]() == 81920
+    assert envs.environment_variables["VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES"]() == 204800
     assert envs.environment_variables["VLLM_SM70_PCIE_SWITCH_CAR_GRAPH_ONLY"]() is True

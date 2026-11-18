@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, ClassVar, cast
 import torch
 from torch import nn
 
-from vllm.config import CacheConfig, CUDAGraphMode, ModelConfig, VllmConfig
+from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
@@ -53,6 +53,7 @@ from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionMetadataBuilder,
 )
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     FullAttentionSpec,
@@ -67,7 +68,6 @@ from ..common.qsa_cache import (
     qsa_draft_dcp_sharded,
 )
 from .indexer_qsa import QSAIndexer
-from .ops.qsa_coalesce import QSACoalescedExchange, QSACoalesceWorkspace
 
 if TYPE_CHECKING:
     from .host_kv.history import HostHistoryLayer
@@ -194,6 +194,7 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
         "fp8",
         "fp8_e4m3",
         "int8",
+        cast(CacheDType, FP8_E4M3_PER_TOKEN_HEAD.name),
     ]
 
     @staticmethod
@@ -235,6 +236,8 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             raise NotImplementedError("Qwen4Exp QSA requires FlashAttention")
         if self.dcp_world_size not in (1, 2):
             raise NotImplementedError("Qwen4Exp QSA supports DCP1 or DCP2")
+        from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD
+
         if self.kv_cache_dtype not in (
             "auto",
             "float16",
@@ -242,6 +245,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             "fp8",
             "fp8_e4m3",
             "int8",
+            FP8_E4M3_PER_TOKEN_HEAD.name,
         ):
             raise NotImplementedError(
                 "Qwen4Exp QSA requires FP16/BF16 or E4M3 main KV cache"
@@ -301,7 +305,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         value_cache = canonicalize_singleton_dim_strides(value_cache)
         if query.dtype not in (torch.float16, torch.bfloat16):
             raise NotImplementedError("Qwen4Exp QSA requires FP16/BF16 queries")
-        if self.kv_cache_dtype in ("fp8", "fp8_e4m3"):
+        if codec.element_dtype == torch.float8_e4m3fn:
             if key_cache.dtype != torch.uint8 or value_cache.dtype != torch.uint8:
                 raise RuntimeError("Qwen4Exp QSA E4M3 cache must use uint8 storage")
         elif self.kv_cache_dtype == "int8":
@@ -403,6 +407,9 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         hot_table = host.store.hot_block_table
         key_cache, value_cache = host.key_cache, host.value_cache
         k_scale, v_scale = layer._k_scale_float, layer._v_scale_float
+        scale_kwargs = (
+            host.hot_cache.scale_kwargs if host.store.shape.planar_scales else {}
+        )
         decode_rows = host.store.shape.decode_rows
         union = (
             attn_metadata.max_query_len > decode_rows
@@ -429,6 +436,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                     kv_cache_dtype=self.kv_cache_dtype,
                     k_scale=k_scale,
                     v_scale=v_scale,
+                    **scale_kwargs,
                 )
 
             if union:
@@ -455,6 +463,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                         kv_cache_dtype=self.kv_cache_dtype,
                         k_scale=k_scale,
                         v_scale=v_scale,
+                        **scale_kwargs,
                         **metadata,
                     )
 
@@ -540,6 +549,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 self.kv_cache_dtype,
                 k_scale,
                 v_scale,
+                **scale_kwargs,
             )
             if grouped < end - start:
                 qsa_sparse_paged_attention(
@@ -553,6 +563,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                     kv_cache_dtype=self.kv_cache_dtype,
                     k_scale=k_scale,
                     v_scale=v_scale,
+                    **scale_kwargs,
                     lse=rows_lse[grouped:],
                 )
 
@@ -573,6 +584,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 self.kv_cache_dtype,
                 k_scale,
                 v_scale,
+                **scale_kwargs,
             )
             if grouped < num_tokens:
                 qsa_sparse_paged_attention(
@@ -586,6 +598,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                     kv_cache_dtype=self.kv_cache_dtype,
                     k_scale=k_scale,
                     v_scale=v_scale,
+                    **scale_kwargs,
                     lse=rows_lse[grouped:],
                 )
 
@@ -682,7 +695,10 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             local_indices.shape[1],
         )
         scale_kwargs = {}
-        if self.kv_cache_dtype == "int8":
+        from vllm.v1.attention.kv_codecs import resolve_kv_codec
+
+        codec = resolve_kv_codec(self.kv_cache_dtype)
+        if codec is not None and codec.per_token_head:
             scale_kwargs = {
                 "k_scale_cache": k_scale_cache,
                 "v_scale_cache": v_scale_cache,
@@ -747,7 +763,13 @@ def _verify_e4m3_kv_requirements(
             raise NotImplementedError("QSA INT8 requires FP16 activations on SM70")
         require_int8_abi()
         return
-    if cache_config.cache_dtype not in ("fp8", "fp8_e4m3"):
+    from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD
+
+    if cache_config.cache_dtype not in (
+        "fp8",
+        "fp8_e4m3",
+        FP8_E4M3_PER_TOKEN_HEAD.name,
+    ):
         return
     from .ops.qsa import qsa_e4m3_capability_reason
 
@@ -777,7 +799,6 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         dcp_local_indices_buffer: torch.Tensor | None = None,
         dcp_partial_output_buffer: torch.Tensor | None = None,
         dcp_partial_lse_buffer: torch.Tensor | None = None,
-        coalesce_workspace: QSACoalesceWorkspace | None = None,
     ) -> None:
         nn.Module.__init__(self)
         cache_config = vllm_config.cache_config
@@ -786,6 +807,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             raise ValueError("Qwen4Exp QSA requires a paged KV cache")
         if model_config.dtype not in (torch.float16, torch.bfloat16):
             raise NotImplementedError("Qwen4Exp QSA requires FP16 or BF16")
+        from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD
+
         if cache_config.cache_dtype not in (
             "auto",
             "float16",
@@ -793,6 +816,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             "fp8",
             "fp8_e4m3",
             "int8",
+            FP8_E4M3_PER_TOKEN_HEAD.name,
         ):
             raise NotImplementedError(
                 "Qwen4Exp QSA requires FP16/BF16 or E4M3 main KV cache"
@@ -902,7 +926,6 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.dcp_local_indices_buffer = dcp_local_indices_buffer
         self.dcp_partial_output_buffer = dcp_partial_output_buffer
         self.dcp_partial_lse_buffer = dcp_partial_lse_buffer
-        self.coalesce_workspace = coalesce_workspace
         self.attn_type = AttentionType.DECODER
         self.kv_cache_dtype = cache_config.cache_dtype
         if self.kv_cache_dtype in ("fp8", "fp8_e4m3") and (
@@ -915,9 +938,14 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, model_config
         )
-        if self.kv_cache_dtype not in ("fp8", "fp8_e4m3", "int8") and (
-            self.kv_cache_torch_dtype != model_config.dtype
-        ):
+        from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD
+
+        if self.kv_cache_dtype not in (
+            "fp8",
+            "fp8_e4m3",
+            "int8",
+            FP8_E4M3_PER_TOKEN_HEAD.name,
+        ) and (self.kv_cache_torch_dtype != model_config.dtype):
             raise NotImplementedError(
                 "Qwen4Exp QSA main cache dtype must match the model dtype"
             )
@@ -1130,33 +1158,11 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 key[:num_tokens],
                 value[:num_tokens],
             )
-        exchange = None
-        # FULL graph descriptors are replicated across DCP ranks. The runner
-        # rejects prefill/mixed batches from uniform decode before dispatch.
-        context = get_forward_context()
-        descriptor = context.batch_descriptor
-        workspace = self.coalesce_workspace
-        if (
-            workspace is not None
-            and host is not None
-            and self.qsa_dcp_sharded
-            and side_metadata.index_dcp_world_size == 2
-            and not self.indexer.skip_topk
-            and context.cudagraph_runtime_mode
-            in (CUDAGraphMode.NONE, CUDAGraphMode.FULL)
-            and descriptor is not None
-            and descriptor.uniform
-            and descriptor.num_tokens == num_tokens == query.shape[0]
-            and workspace.supports(query, num_tokens)
-        ):
-            exchange = QSACoalescedExchange(workspace, query)
         # Keep the disabled call signature and all original kernels unchanged.
-        indexer_kwargs = {} if exchange is None else {"coalesced_exchange": exchange}
         selected = self.indexer(
             hidden_states,
             positions,
             self.topk_indices_buffer[:num_tokens],
-            **indexer_kwargs,
         )
         if selected.shape != (
             num_tokens,
@@ -1190,11 +1196,6 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 sequence_lengths=side_metadata.seq_lens,
                 output_gate=output_gate,
                 query_positions=side_metadata.logical_positions,
-                **(
-                    {"gathered_query": exchange.gathered_query}
-                    if exchange is not None and exchange.gathered_query is not None
-                    else {}
-                ),
             )
         else:
             impl.do_kv_cache_update(

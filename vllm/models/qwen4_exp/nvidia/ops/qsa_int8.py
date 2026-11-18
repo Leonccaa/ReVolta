@@ -1,13 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Planar INT8 readers. Legacy QSA kernels remain in qsa.py unchanged."""
+"""Planar token/head readers. Legacy scalar QSA kernels remain unchanged."""
 
 import math
 
 import torch
 
+from vllm.models.deepseek_v4.common.ops.fp8_software import (
+    fp8_e4m3fn_bits_to_fp32_bitcast,
+)
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.kv_cache_view import KVPageMapping
+from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD, INT8
 
 
 @triton.jit(do_not_specialize=["num_requests"])
@@ -146,6 +151,9 @@ def _int8_sparse_kernel(
             mask=valid[:, None],
             other=0.0,
         )
+        if KV_E4M3:
+            keys = fp8_e4m3fn_bits_to_fp32_bitcast(keys)
+            values = fp8_e4m3fn_bits_to_fp32_bitcast(values)
         keys = keys.to(query.dtype)
         values = values.to(query.dtype)
         key_scales = tl.load(
@@ -326,9 +334,9 @@ def require_int8_abi():
     from flash_attn_v100.flash_attn_interface import flash_attn_v100_cuda as native
 
     version = getattr(native, "int8_page4_abi_version", None)
-    if not callable(version) or version() != 1:
+    if not callable(version) or version() != 2:
         raise RuntimeError(
-            "INT8 KV requires Flash-V100 page4 ABI v1; rebuild the wheel"
+            "INT8 KV requires Flash-V100 page4 ABI v2; rebuild the wheel"
         )
     for name in (
         "decode_int8_page4_fwd",
@@ -342,12 +350,17 @@ def require_int8_abi():
     return native
 
 
-def validate_planes(q, k, v, sk, sv):
-    if k.dtype != torch.int8 or v.dtype != torch.int8 or k.shape != v.shape:
-        raise ValueError("INT8 reader requires signed int8 K/V payloads")
+def validate_planes(q, k, v, sk, sv, codec=INT8):
+    if not codec.stores(k, v) or k.shape != v.shape:
+        raise ValueError(f"{codec.name} reader requires matching K/V payloads")
     if q.ndim != 3 or k.ndim != 4 or q.shape[2] != k.shape[3]:
         raise ValueError("INT8 reader Q/K/V shape mismatch")
-    if q.shape[1] % k.shape[2] or q.dtype != torch.float16:
+    query_dtypes = (
+        (torch.float16, torch.bfloat16)
+        if codec is FP8_E4M3_PER_TOKEN_HEAD
+        else (torch.float16,)
+    )
+    if q.shape[1] % k.shape[2] or q.dtype not in query_dtypes:
         raise ValueError("INT8 reader requires FP16 grouped-query heads")
     for plane in (sk, sv):
         if (
@@ -383,18 +396,37 @@ def triton_attention(
     max_seq_len=0,
     causal=True,
     softmax_scale=None,
+    codec=INT8,
 ):
     """FP32 late-scale reference/fallback; never expands the KV cache to Half."""
-    validate_planes(q, k, v, sk, sv)
+    validate_planes(q, k, v, sk, sv, codec)
     rows, heads, dim = q.shape
     width = max_seq_len if dense else indices.shape[1]
-    tiles = triton.cdiv(width, 32)
-    splits = min(32, max(1, tiles))
-    partial = torch.empty((splits, *q.shape), device=q.device, dtype=torch.float32)
-    partial_lse = torch.empty(
-        (splits, rows, heads), device=q.device, dtype=torch.float32
-    )
     group = heads // k.shape[2]
+    if dense:
+        block_n = 32
+        tiles = triton.cdiv(width, block_n)
+        splits = min(32, max(1, tiles))
+        warps = 4
+    else:
+        from .qsa import _qsa_sparse_launch_profile
+
+        # Match scalar E4M3 union/prefill: sufficiently many row/head
+        # programs need no split-K workspace, regardless of prompt length.
+        block_n, target_splits, warps = _qsa_sparse_launch_profile(
+            rows * k.shape[2],
+            triton.next_power_of_2(group),
+            not current_platform.has_device_capability(80),
+        )
+        tiles = triton.cdiv(width, block_n)
+        splits = min(1 << (tiles.bit_length() - 1), target_splits)
+    if splits == 1 and not dense:
+        partial = partial_lse = out
+    else:
+        partial = torch.empty((splits, *q.shape), device=q.device, dtype=torch.float32)
+        partial_lse = torch.empty(
+            (splits, rows, heads), device=q.device, dtype=torch.float32
+        )
     # The legacy kernel's scale is fixed by D; adjust it explicitly for dense users.
     scale_ratio = (softmax_scale * dim**0.5) if softmax_scale is not None else 1.0
     _int8_sparse_kernel[(rows, k.shape[2], splits)](
@@ -433,8 +465,8 @@ def triton_attention(
         NUM_SPLITS=splits,
         NUM_TILES=tiles,
         BLOCK_M=max(16, triton.next_power_of_2(group)),
-        BLOCK_N=32,
-        KV_E4M3=False,
+        BLOCK_N=block_n,
+        KV_E4M3=codec is FP8_E4M3_PER_TOKEN_HEAD,
         K_SCALES=sk,
         V_SCALES=sv,
         KS_BLOCK=sk.stride(0),
@@ -447,7 +479,7 @@ def triton_attention(
         POSITIONS=positions,
         SEQLENS=seq_lens,
         CAUSAL=causal,
-        num_warps=4,
+        num_warps=warps,
     )
     if splits == 1:
         return out
@@ -473,11 +505,13 @@ def triton_attention(
     return out
 
 
-def native_decode(q, k, v, indices, table, requests, positions, seq_lens, out, sk, sv):
+def native_decode(
+    q, k, v, indices, table, requests, positions, seq_lens, out, sk, sv, *, codec=INT8
+):
     from .qsa import _qsa_xqa_page4_block_table, _qsa_xqa_page4_workspace
 
     native = require_int8_abi()
-    mapping = validate_planes(q, k, v, sk, sv)
+    mapping = validate_planes(q, k, v, sk, sv, codec)
     pages, lengths = _qsa_xqa_page4_block_table(
         indices,
         table,
@@ -510,12 +544,25 @@ def native_decode(q, k, v, indices, table, requests, positions, seq_lens, out, s
 
 
 def native_grouped(
-    q, k, v, indices, table, requests, positions, seq_lens, out, sk, sv, lse=None
+    q,
+    k,
+    v,
+    indices,
+    table,
+    requests,
+    positions,
+    seq_lens,
+    out,
+    sk,
+    sv,
+    lse=None,
+    *,
+    codec=INT8,
 ):
     from .qsa import _qsa_grouped_page4_workspace
 
     native = require_int8_abi()
-    mapping = validate_planes(q, k, v, sk, sv)
+    mapping = validate_planes(q, k, v, sk, sv, codec)
     rows = q.shape[0]
     padded = triton.cdiv(rows, 8) * 8
     if padded != rows:
@@ -569,32 +616,70 @@ def native_grouped(
 
 
 def sparse_attention(
-    q, k, v, indices, table, requests, out, gate, positions, seq_lens, sk, sv, lse=None
+    q,
+    k,
+    v,
+    indices,
+    table,
+    requests,
+    out,
+    gate,
+    positions,
+    seq_lens,
+    sk,
+    sv,
+    lse=None,
+    *,
+    codec=INT8,
 ):
     from .qsa import _qsa_output_gate
 
-    require_int8_abi()
-    validate_planes(q, k, v, sk, sv)
+    if codec is INT8:
+        require_int8_abi()
+    validate_planes(q, k, v, sk, sv, codec)
     if out is None:
         out = torch.empty_like(q)
     if q.shape[0] == 0:
         return out
     native_shape = (
-        q.shape[1] % 6 == 0
+        q.dtype == torch.float16
+        and q.shape[1] % 6 == 0
         and q.shape[2] == 256
         and indices.shape[1] == 2051
-        and k.shape[1:] == (16, 1, 256)
+        and k.shape[2:] == (1, 256)
         and positions is not None
         and seq_lens is not None
     )
     if native_shape and lse is None:
         if q.shape[0] < 8 and q.shape[1] == 6:
             native_decode(
-                q, k, v, indices, table, requests, positions, seq_lens, out, sk, sv
+                q,
+                k,
+                v,
+                indices,
+                table,
+                requests,
+                positions,
+                seq_lens,
+                out,
+                sk,
+                sv,
+                codec=codec,
             )
         else:
             native_grouped(
-                q, k, v, indices, table, requests, positions, seq_lens, out, sk, sv
+                q,
+                k,
+                v,
+                indices,
+                table,
+                requests,
+                positions,
+                seq_lens,
+                out,
+                sk,
+                sv,
+                codec=codec,
             )
         if gate is not None:
             _qsa_output_gate(out, gate.view_as(q))
@@ -611,13 +696,23 @@ def sparse_attention(
         sv,
         lse,
         gate.view_as(q) if gate is not None else None,
+        codec=codec,
     )
 
 
-def dcp_grouped(q, k, v, indices, table, requests, out, lse, sk, sv):
-    """INT8 DCP uses the same owner mapping on each rank, with separate scales."""
-    require_int8_abi()
-    if q.shape[0] < 8 or q.shape[1] % 6 or indices.shape[1] != 2051:
+def dcp_grouped(q, k, v, indices, table, requests, out, lse, sk, sv, *, codec=INT8):
+    """Row-scaled DCP uses the same owner mapping on each rank."""
+    from .qsa import _SM70_QSA_DCP_GROUPED_PAGE4_MIN_ROWS
+
+    # Like the scalar E4M3 route, decode-sized batches stay on the Triton
+    # split-K path; the grouped route only pays off for large prefill batches.
+    rows = q.shape[0]
+    if q.dtype != torch.float16 or rows < _SM70_QSA_DCP_GROUPED_PAGE4_MIN_ROWS:
+        return 0
+    rows = rows // 8 * 8
+    if codec is INT8:
+        require_int8_abi()
+    if rows < 8 or q.shape[1] % 6 or indices.shape[1] != 2051:
         return 0
     capacity = table.shape[1] * k.shape[1]
     positions = torch.full(
@@ -627,6 +722,18 @@ def dcp_grouped(q, k, v, indices, table, requests, out, lse, sk, sv):
         (table.shape[0],), capacity, device=q.device, dtype=torch.int32
     )
     native_grouped(
-        q, k, v, indices, table, requests, positions, lengths, out, sk, sv, lse
+        q[:rows],
+        k,
+        v,
+        indices[:rows],
+        table,
+        requests[:rows],
+        positions[:rows],
+        lengths,
+        out[:rows],
+        sk,
+        sv,
+        lse[:rows],
+        codec=codec,
     )
-    return q.shape[0]
+    return rows

@@ -8,6 +8,7 @@ host row next to the target's index pages.
 """
 
 from collections import Counter
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +19,7 @@ from vllm.v1.core.kv_cache_utils import (
     get_kv_cache_groups,
     get_long_context_geometry,
 )
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode
 from vllm.v1.kv_offload.host.region import host_region_layout
 
 from .long_context_kv_utils import (
@@ -39,6 +41,48 @@ def settings(**kw) -> LongContextKVConfig:
     kw.setdefault("host_pool_gib", 200.0)
     kw.setdefault("hot_pool_gib", 0.6)
     return LongContextKVConfig(enabled=True, **kw)
+
+
+def test_exact_end_mtp_completes_prefix_pages_before_consuming(monkeypatch):
+    from tests.v1.core.test_long_context_admission import make_requests
+    from tests.v1.core.test_mamba_sparse_retention import (
+        _exact_end_scheduler,
+        _exact_end_step,
+        _finish_exact_end,
+    )
+    from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id
+    from vllm.v1.request import Request
+
+    scheduler = _exact_end_scheduler(monkeypatch, mtp=True)
+    [request] = make_requests(1, 3 * SPAN + 20, 7)
+    index = _finish_exact_end(scheduler, request)
+    [entry] = [e for bucket in index.index.values() for e in bucket]
+    _exact_end_step(scheduler)
+    revisit = Request(
+        request_id="mtp-revisit",
+        prompt_token_ids=list(request.all_token_ids) + [777],
+        sampling_params=request.sampling_params,
+        pooling_params=None,
+        block_hasher=request._block_hasher,
+    )
+    manager = scheduler.kv_cache_manager
+    blocks, aligned = manager.get_computed_blocks(revisit)
+    assert aligned < request.num_computed_tokens // SPAN * SPAN
+    blocks, hit = manager.extend_exact_end(revisit, blocks, aligned)
+    assert hit == request.num_tokens - 1
+    pool = scheduler.host_history_pool
+    g = pool.host_group_id
+    assert len(blocks.blocks[g]) == 4
+    assert all(not b.is_null for b in blocks.blocks[g])
+    assert manager.allocate_slots(revisit, 1, hit, blocks, num_lookahead_tokens=4)
+    single = manager.coordinator.single_type_managers[g]
+    assert single.num_cached_block[revisit.request_id] == hit // SPAN
+    assert not any(index.index.values())
+    for group, (_, held) in enumerate(entry.groups):
+        for block, expected in held:
+            if expected == make_block_hash_with_group_id(entry.key, group):
+                assert block.block_hash is None
+    manager.free(revisit)
 
 
 def build(lc, specs, *, mtp=True):
@@ -148,10 +192,49 @@ def test_sharded_draft_main_is_one_more_host_layer():
     assert 0 < gpu < layer_page
 
 
+@pytest.mark.parametrize("placement", ["gpu", "host"])
+def test_planar_mtp_main_carries_scales_in_existing_component(placement):
+    specs = {
+        name: (
+            replace(spec, kv_quant_mode=KVQuantMode.FP8_E4M3_PLANAR)
+            if type(spec) is FullAttentionSpec
+            else spec
+        )
+        for name, spec in mtp_specs(shard_index=True, shard_draft=True).items()
+    }
+    _, cfg = build(settings(draft_main_placement=placement), specs)
+    plan = cfg.long_context_plan
+    geo = plan.geometry
+    layout = host_region_layout(cfg, "test-planar-mtp")
+    draft_bytes = specs[DRAFT].block_size * 520
+    assert specs[DRAFT].page_size_bytes == draft_bytes
+    assert geo.hot_slot_bytes == len(cfg.host_kv_layers) * 2080
+    if placement == "host":
+        assert cfg.host_kv_layers == [*TARGET_MAIN, DRAFT]
+        assert layout.main_bytes == 13 * draft_bytes
+    else:
+        assert cfg.host_kv_layers == TARGET_MAIN
+        tensor = next(t for t in cfg.kv_cache_tensors if DRAFT in t.shared_by)
+        assert tensor.size == draft_bytes * tensor.num_blocks
+        assert draft_bytes in layout.index_bytes
+        assert layout.main_bytes == 12 * draft_bytes
+    assert layout.worker_bytes * WORKERS == geo.host_bytes_per_block
+
+
+def test_draft_main_placement_defaults_to_host():
+    # A sharded draft's main K/V joins the host store unless "gpu" is asked
+    # for explicitly (1M-context concurrency is history-ID bound).
+    assert LongContextKVConfig().draft_main_placement == "host"
+    specs = mtp_specs(shard_index=True, shard_draft=True)
+    _, cfg = build(settings(), specs)
+    assert cfg.long_context_plan.draft_main_on_host
+    assert cfg.host_kv_layers == [*TARGET_MAIN, DRAFT]
+
+
 def test_sharded_draft_main_follows_draft_main_placement():
     specs = mtp_specs(shard_index=True, shard_draft=True)
-    _, gpu = build(settings(), specs)  # default: "gpu"
-    _, host = build(settings(draft_main_placement="host"), specs)
+    _, gpu = build(settings(draft_main_placement="gpu"), specs)
+    _, host = build(settings(), specs)  # default: "host"
     # "gpu": the draft stays beside the index in GPU history, as before.
     assert gpu.host_kv_layers == TARGET_MAIN
     assert not gpu.long_context_plan.draft_main_on_host
@@ -169,24 +252,14 @@ def test_sharded_draft_main_follows_draft_main_placement():
 
 
 def test_draft_main_placement_is_told_apart_by_layout_not_by_the_setting():
-    from vllm.config.kernel import KernelConfig
-    from vllm.v1.kv_offload.tiering.fs.identity import (
-        _kernel_identity,
-        canonical_digest,
-    )
+    from vllm.v1.kv_offload.tiering.fs.identity import canonical_digest
     from vllm.v1.kv_offload.tiering.fs.revolta import _persistent_kv_tensors
 
-    # The setting itself is not part of the persisted identity ...
-    def kernel(placement):
-        return KernelConfig(long_context_kv=settings(draft_main_placement=placement))
-
-    assert canonical_digest(_kernel_identity(kernel("gpu"))) == canonical_digest(
-        _kernel_identity(kernel("host"))
-    )
-    # ... the page layout is: the host layer list and tensors differ.
+    # The setting is not in the persisted identity; the page layout is: the
+    # host layer list and tensors differ.
     specs = mtp_specs(shard_index=True, shard_draft=True)
-    _, gpu = build(settings(), specs)
-    _, host = build(settings(draft_main_placement="host"), specs)
+    _, gpu = build(settings(draft_main_placement="gpu"), specs)
+    _, host = build(settings(), specs)
 
     def layout(cfg):
         return canonical_digest(
@@ -205,7 +278,7 @@ def test_draft_main_placement_falls_back_to_gpu(caplog):
     # GPU, leaves the layout of "gpu" and says so.
     caplog.set_level("WARNING")
     _, replicated = build(settings(draft_main_placement="host"), mtp_specs())
-    _, base = build(settings(), mtp_specs())
+    _, base = build(settings(draft_main_placement="gpu"), mtp_specs())
     assert replicated.host_kv_layers == base.host_kv_layers == TARGET_MAIN
     assert "draft_main_placement='host' needs a draft" in caplog.text
     caplog.clear()

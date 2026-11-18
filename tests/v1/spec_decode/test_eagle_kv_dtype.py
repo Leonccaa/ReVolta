@@ -19,6 +19,7 @@ from vllm.models.qwen4_exp.common.qsa_cache import QSAStateBackend
 from vllm.models.qwen4_exp.nvidia.model import _finalize_qsa_e4m3_scale_load
 from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAAttention
 from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
+from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD
 from vllm.v1.core.kv_cache_utils import (
     _get_csa_linear_tensor_layout,
     generate_scheduler_kv_cache_config,
@@ -31,6 +32,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
+    get_kv_quant_mode,
 )
 from vllm.v1.worker.gpu.attn_utils import _packed_attention_members, _reshape_kv_cache
 from vllm.v1.worker.gpu.spec_decode.eagle import utils
@@ -46,7 +48,11 @@ def _qsa(dtype):
     layer.num_kv_heads = 1
     layer.head_dim = 256
     layer.kv_cache_dtype = dtype
-    layer.kv_cache_torch_dtype = torch.uint8 if dtype == "fp8_e4m3" else torch.float16
+    layer.kv_cache_torch_dtype = (
+        torch.uint8
+        if dtype in ("fp8_e4m3", FP8_E4M3_PER_TOKEN_HEAD.name)
+        else torch.float16
+    )
     layer._qsa_kv_scales_finalized = dtype != "fp8_e4m3"
     layer.register_buffer("_k_scale", torch.tensor(0.0))
     layer.register_buffer("_v_scale", torch.tensor(0.0))
@@ -64,13 +70,13 @@ class _LoaderConfig:
     is_speculative_draft: bool = False
 
 
-def _load(monkeypatch, dtype, *, calibrated=True):
+def _load(monkeypatch, dtype, *, calibrated=True, target_dtype="fp8_e4m3"):
     target = nn.Module()
     target.model = nn.Module()
     target.model.embed_tokens = nn.Embedding(4, 4)
     target.lm_head = nn.Linear(4, 4, bias=False)
     config = _LoaderConfig(
-        CacheConfig(cache_dtype="fp8_e4m3", block_size=1600),
+        CacheConfig(cache_dtype=target_dtype, block_size=1600),
         SimpleNamespace(kv_cache_dtype=dtype, draft_model_config=object()),
         SimpleNamespace(decode_context_parallel_size=2),
     )
@@ -134,6 +140,21 @@ def test_e4m3_draft_still_requires_calibrated_scales(monkeypatch):
     _, _, load = _load(monkeypatch, "fp8_e4m3", calibrated=False)
     with pytest.raises(ValueError, match="Loaded 0/2 draft K/V scales"):
         load()
+
+
+@pytest.mark.parametrize("dtype", [None, FP8_E4M3_PER_TOKEN_HEAD.name])
+def test_mtp_inherits_planar_cache_without_scalars(monkeypatch, dtype):
+    name = FP8_E4M3_PER_TOKEN_HEAD.name
+    target, loaded, load = _load(
+        monkeypatch, dtype, calibrated=False, target_dtype=name
+    )
+    draft = load()
+    assert loaded == [target] and loaded[0] is target
+    layer = draft.model.self_attn
+    spec = layer.get_kv_cache_spec(target)
+    assert spec.dtype == torch.uint8 and spec.kv_quant_mode == get_kv_quant_mode(name)
+    assert spec.page_size_bytes == 1600 * 520
+    assert layer._qsa_kv_scales_finalized and not hasattr(layer, "k_scale")
 
 
 def test_production_e4m3_contract_snapshot(monkeypatch):

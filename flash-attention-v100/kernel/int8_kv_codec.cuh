@@ -15,6 +15,7 @@ constexpr int KV_CACHE_DTYPE_FP16 = 0;
 constexpr int KV_CACHE_DTYPE_FP8_E4M3 = 1;
 constexpr int KV_CACHE_DTYPE_FP8_E5M2 = 2;
 constexpr int KV_CACHE_DTYPE_INT8 = 3;
+constexpr int KV_CACHE_DTYPE_FP8_E4M3_PER_TOKEN_HEAD = 4;
 
 __device__ __forceinline__ float quiet_nan_f() {
   return __int_as_float(0x7fffffff);
@@ -299,6 +300,11 @@ struct KVReader {
     return __float2half_rn(scaled(cache, index, scale));
   }
 };
+
+// The planar format changes scale placement, not E4M3 payload conversion.
+template <bool E4M3_BITS>
+struct KVReader<KV_CACHE_DTYPE_FP8_E4M3_PER_TOKEN_HEAD, E4M3_BITS>
+    : KVReader<KV_CACHE_DTYPE_FP8_E4M3, E4M3_BITS> {};
 
 // Source-compatible entry points keep existing attention launch ABIs unchanged.
 template <int KV_DTYPE, bool E4M3_BITS = false>

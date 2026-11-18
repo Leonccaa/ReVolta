@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -45,6 +46,11 @@ from vllm.v1.worker.gpu.spec_decode.eagle.cudagraph import (
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.spec_decode.eagle.draft_vocab_tail import (
+        GlobalDraftVocabTail,
+    )
 
 
 def _mtp_decode_warmup_request_sizes(
@@ -102,6 +108,7 @@ class EagleSpeculator:
         self.share_mtp_topk_indices = False
         self._static_draft_vocab: StaticDraftVocabRuntime | None = None
         self._reduced_draft_logits: torch.Tensor | None = None
+        self._draft_vocab_tail: GlobalDraftVocabTail | None = None
 
         # DP configuration
         self.dp_size = vllm_config.parallel_config.data_parallel_size
@@ -233,10 +240,32 @@ class EagleSpeculator:
         )
 
     def _maybe_initialize_static_draft_vocab(self) -> None:
+        self._draft_vocab_tail = None
+        for name in (
+            "VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_GPU_LRU",
+            "VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_FUSED_PROPOSAL",
+            "VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_FULL_REFRESH_INTERVAL",
+            "VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_PREFILL_TOPK",
+        ):
+            if name in os.environ:
+                raise ValueError(f"{name} is supported only by V1, not V2.")
+        tail_size = envs.VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_TAIL_SIZE
+        if tail_size != 0:
+            if not 1 <= tail_size <= 2048:
+                raise ValueError("Global MTP draft tail size must be in [1, 2048].")
+            if (
+                self.method != "mtp"
+                or not envs.VLLM_SM70_MTP_STATIC_DRAFT_VOCAB_RANKING
+                or envs.VLLM_SM70_MTP_STATIC_DRAFT_VOCAB_SIZE <= 0
+            ):
+                raise ValueError(
+                    "Global MTP draft tail requires mtp and a static vocabulary "
+                    "(RANKING/SIZE)."
+                )
         if self.method != "mtp":
             return
         # Resolve only explicit static controls, without model-specific dynamic
-        # vocabulary defaults. V2 currently implements the static shortlist.
+        # vocabulary defaults.
         config = resolve_mtp_draft_vocab_config(self.method)
         if config.ranking_path is None:
             return
@@ -265,6 +294,46 @@ class EagleSpeculator:
             runtime.lm_head.weight.shape[0],
             runtime.ranking_fingerprint,
         )
+        if tail_size:
+            from vllm.distributed import get_tp_group
+            from vllm.v1.worker.gpu.spec_decode.eagle.draft_vocab_tail import (
+                GlobalDraftVocabTail,
+            )
+
+            tp = get_tp_group()
+            tail = GlobalDraftVocabTail(
+                runtime,
+                self.model.lm_head,
+                config.ranking_path,
+                tail_size,
+                self.max_num_reqs,
+                self.num_speculative_steps,
+                self.draft_logits,
+                tp.world_size,
+                tp.rank_in_group,
+            )
+            self._draft_vocab_tail = tail
+            if self.draft_logits is not None:
+                self._reduced_draft_logits = tail.reduced_draft_logits
+            logger.info(
+                "Enabled global MTP draft vocabulary tail: "
+                "base=%d tail=%d tp=%d sink=%d draft_sample=%s",
+                runtime.shortlist_size,
+                tail_size,
+                tp.world_size,
+                tail.sink,
+                self.speculative_config.draft_sample_method,
+            )
+
+    def update_draft_vocab_tail(
+        self,
+        sampled: torch.Tensor,
+        num_sampled: torch.Tensor,
+        num_reqs: int,
+        idx_mapping: torch.Tensor,
+    ) -> None:
+        if self._draft_vocab_tail is not None:
+            self._draft_vocab_tail.update(sampled, num_sampled, num_reqs, idx_mapping)
 
     def set_attn(
         self,
@@ -423,6 +492,20 @@ class EagleSpeculator:
     ) -> torch.Tensor:
         runtime = self._static_draft_vocab
         if runtime is not None:
+            tail = self._draft_vocab_tail
+            if tail is not None:
+                if draft_logits is None and self.use_local_argmax_reduction:
+                    return tail.sample_greedy(hidden_states)
+                return tail.sample_probabilistic(
+                    hidden_states,
+                    idx_mapping,
+                    self.temperature,
+                    self.seeds,
+                    pos,
+                    draft_step,
+                    draft_logits,
+                    self.use_fp64_gumbel,
+                )
             if draft_logits is None and self.use_local_argmax_reduction:
                 token_ids = runtime.logits_processor.get_top_tokens(
                     runtime.lm_head, hidden_states
@@ -500,11 +583,8 @@ class EagleSpeculator:
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+        skip_sample: bool = False,
     ) -> None:
-        last_token_indices = self.last_token_indices[:num_reqs]
-        pos = self.input_buffers.positions[last_token_indices]
-        idx_mapping = self.idx_mapping[:num_reqs]
-
         last_hidden_states, hidden_states = self.run_model(
             num_tokens,
             attn_metadata,
@@ -513,6 +593,13 @@ class EagleSpeculator:
             cudagraph_runtime_mode=cudagraph_runtime_mode,
             mm_inputs=mm_inputs,
         )
+        if skip_sample:
+            # This pass only keeps the drafter KV in sync.
+            return
+
+        last_token_indices = self.last_token_indices[:num_reqs]
+        pos = self.input_buffers.positions[last_token_indices]
+        idx_mapping = self.idx_mapping[:num_reqs]
         sample_hidden_states = last_hidden_states[last_token_indices]
 
         self.draft_tokens[:num_reqs, 0] = self._sample_draft(
@@ -531,13 +618,14 @@ class EagleSpeculator:
         skip_attn: bool,
         batch_desc: BatchExecutionDescriptor,
         num_tokens_across_dp: torch.Tensor | None,
+        num_speculative_tokens: int,
         is_dummy_batch: bool = False,
     ) -> None:
         positions = self.input_buffers.positions[:num_reqs]
         query_start_loc = self.input_buffers.query_start_loc[: num_reqs + 1]
         idx_mapping = self.idx_mapping[:num_reqs]
 
-        for step in range(1, self.num_speculative_steps):
+        for step in range(1, num_speculative_tokens):
             attn_metadata = None
             slot_mappings_by_layer = None
             if not skip_attn:
@@ -734,7 +822,10 @@ class EagleSpeculator:
         sampled_token_ids_cpu: np.ndarray | None = None,
         num_sampled_tokens_cpu: np.ndarray | None = None,
         all_token_ids_cpu: np.ndarray | None = None,
+        num_speculative_tokens: int | None = None,
     ) -> torch.Tensor:
+        if num_speculative_tokens is None:
+            num_speculative_tokens = self.num_speculative_steps
         num_tokens = input_batch.num_tokens_after_padding
         num_reqs = input_batch.num_reqs
         max_query_len = input_batch.num_scheduled_tokens.max()
@@ -763,6 +854,8 @@ class EagleSpeculator:
         self.temperature.copy_(temperature)
         self.seeds.copy_(seeds)
         self.idx_mapping[:num_reqs].copy_(input_batch.idx_mapping)
+        if self.draft_logits is not None and self._draft_vocab_tail is not None:
+            self.idx_mapping[num_reqs:].fill_(-1)
 
         # Get the input ids and last token indices for the speculator.
         prepare_eagle_inputs(
@@ -787,7 +880,7 @@ class EagleSpeculator:
             max_query_len,
             has_prefill=bool(input_batch.is_prefilling_np.any()),
         )
-        prefill_batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
+        prefill_batch_desc, dp_sync_state = dispatch_cg_and_sync_dp(
             self.prefill_cudagraph_manager,
             num_reqs,
             num_tokens,
@@ -795,6 +888,9 @@ class EagleSpeculator:
             dp_size=self.dp_size,
             dp_rank=self.dp_rank,
             need_eager=is_profile,
+        )
+        num_tokens_across_dp = (
+            dp_sync_state.num_tokens_across_dp if dp_sync_state is not None else None
         )
 
         self._mtp_prefill_begin()
@@ -814,12 +910,13 @@ class EagleSpeculator:
                 num_tokens_across_dp=num_tokens_across_dp,
                 cudagraph_runtime_mode=prefill_batch_desc.cg_mode,
                 mm_inputs=mm_inputs,
+                skip_sample=num_speculative_tokens == 0,
             )
         self._mtp_prefill_end(num_reqs)
 
-        if self.num_speculative_steps == 1:
-            # Early exit.
-            return self.draft_tokens[:num_reqs, :1]
+        if num_speculative_tokens <= 1:
+            # The first forward still synchronizes draft KV at K=0.
+            return self.draft_tokens[:num_reqs]
 
         # Prepare the inputs for the decode steps.
         prepare_eagle_decode(
@@ -833,7 +930,7 @@ class EagleSpeculator:
 
         # Each request produces exactly 1 token per draft generation step,
         # enabling FULL graph replay.
-        decode_batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
+        decode_batch_desc, dp_sync_state = dispatch_cg_and_sync_dp(
             self.decode_cudagraph_manager,
             num_reqs,
             num_reqs,
@@ -842,8 +939,11 @@ class EagleSpeculator:
             dp_rank=self.dp_rank,
             need_eager=is_profile,
         )
+        num_tokens_across_dp = (
+            dp_sync_state.num_tokens_across_dp if dp_sync_state is not None else None
+        )
 
-        # Generate the remaining num_speculative_steps - 1 draft tokens.
+        # Generate the remaining drafts with the existing single-step graphs.
         self._mtp_decode_begin()
         try:
             self.multi_step_decode(
@@ -851,6 +951,7 @@ class EagleSpeculator:
                 dummy_run and skip_attn_for_dummy_run,
                 decode_batch_desc,
                 num_tokens_across_dp,
+                num_speculative_tokens,
                 is_dummy_batch=dummy_run,
             )
         finally:

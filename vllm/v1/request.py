@@ -161,6 +161,10 @@ class Request:
 
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
+        # Physical running-state extent and sampled count before stop trimming
+        # (vLLM #67045 SpeculativeFrontiers).
+        self.state_end = 0
+        self.last_accepted = 1
         self.cache_salt: str | None = cache_salt
 
         # Multi-modal related

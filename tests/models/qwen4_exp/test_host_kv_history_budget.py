@@ -245,6 +245,66 @@ def test_store_budget_handles_split_kernel_blocks(sparse_zero_payloads):
     assert store.fixed_device_memory_bytes() == shape.fixed_device_memory_bytes()
 
 
+def test_planar_owner_hot_and_staging_match_actual_budget():
+    from vllm.v1.attention.kv_codecs import INT8
+    from vllm.v1.core.long_context_kv import shared_region_fixed_bytes
+
+    geo, _, _ = _geometry("standin", 2, 2048)
+    shape = HostHistoryShape(
+        num_blocks=3,
+        kernel_blocks_per_block=2,
+        kernel_block_tokens=16,
+        num_layers=2,
+        kv_heads=1,
+        head_dim=256,
+        dtype=torch.int8,
+        hot_slots=600,
+        max_requests=1,
+        selection_width=2051,
+        max_write_rows=17,
+        staged_writethrough=True,
+        layout_cache_dtype=INT8.name,
+    )
+    store = HostHistoryStore(shape, ["l0", "l1"], device="cpu")
+    actual = store.fixed_device_memory_bytes()
+    assert actual == shape.fixed_device_memory_bytes()
+    assert actual["hot"] == 2 * 600 * 2080
+    assert actual["staging"] == 17 * 544
+    assert actual["write_stage"] == 2 * 17 * 256 + 2 * 17 * 4 + 8
+    assert store.host.untyped_storage().nbytes() == 3 * shape.page_bytes
+    assert shape.page_bytes == 2 * 2 * 8320
+    geo = dataclasses.replace(
+        geo,
+        block_tokens=64,
+        main_kv_bytes_per_block=shape.page_bytes,
+        hot_layers=2,
+        hot_max_write_rows=17,
+        hot_layout_cache_dtype=shape.layout_cache_dtype,
+        hot_head_dim=shape.head_dim,
+        hot_kv_heads=shape.kv_heads,
+    )
+    assert geo.hot_slot_bytes == 2 * 2080
+    assert geo.hot_bytes_for_groups(600, 1) == sum(actual.values())
+    assert ab.hot_bytes_for_groups(dataclasses.asdict(geo), 600, 1) == sum(
+        actual.values()
+    )
+    shared_shape = dataclasses.replace(shape, slots_per_block=200)
+    # Shared planning reserves all 256 victim-count tiles at startup.
+    shared = shared_shape.fixed_device_memory_bytes()
+    shared["victim_counts"] = 12 * 256
+    assert shared_region_fixed_bytes(geo, 1) == sum(shared.values())
+    layer = store.layer("l1")
+    assert layer.staging_cache.key_scale is not None
+    assert layer.staging_cache.page_size_bytes == 544
+    for cache in (*layer.host_cache, layer.hot_cache, layer.staging_cache):
+        assert cache.codec is INT8
+        assert (
+            cache.key.untyped_storage().data_ptr()
+            == cache.value.untyped_storage().data_ptr()
+        )
+        assert cache.key_scale is not None and cache.value_scale is not None
+
+
 @pytest.mark.parametrize(
     "model,host_gib",
     [

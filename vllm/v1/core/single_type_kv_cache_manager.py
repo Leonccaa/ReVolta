@@ -253,7 +253,9 @@ class SingleTypeKVCacheManager(ABC):
         # All cached hits (including skipped nulls) are already cached; mark
         # them so cache_blocks() will not try to re-cache blocks that already
         # have a block_hash set.
-        self.num_cached_block[request_id] = len(req_blocks)
+        self.num_cached_block[request_id] = min(
+            len(req_blocks), num_total_computed_tokens // self.block_size
+        )
 
     def allocate_external_computed_blocks(
         self,
@@ -402,6 +404,10 @@ class SingleTypeKVCacheManager(ABC):
         blocks that can never serve a hit at any alignment-aligned prefix
         length.
         """
+        return None
+
+    def cache_blocks_on_free(self, request: Request) -> None:
+        """Cache any final state before returning the request's blocks."""
         return None
 
     def free(self, request_id: str) -> None:
@@ -614,6 +620,21 @@ class SingleTypeKVCacheManager(ABC):
         # of the prompt: a repeat of this prompt looks exactly that up, so it
         # keeps normal cache priority while remaining evictable.
         hold = self._cached_window_at_last_boundary(num_prompt_tokens)
+        if (
+            self.use_eagle
+            and not self.mamba_replay_lookbehind
+            and self.alignment_tokens is not None
+            and self.block_size < self.alignment_tokens
+            and num_prompt_tokens is not None
+            and processed_computed_tokens > num_prompt_tokens
+        ):
+            # DFlash2 decode windows join the prompt window at ordinary cache
+            # priority. Blocks are still freed and remain evictable.
+            hold = (
+                (hold[0], max(hold[1], num_skipped_blocks))
+                if hold is not None
+                else (0, num_skipped_blocks)
+            )
         # `num_skipped_tokens` may include tokens that haven't been allocated yet
         # (e.g., when the attention window moves into the external computed tokens
         # range); `_remove_blocks_in_range` caps to the number of blocks that
@@ -724,12 +745,15 @@ class CircularBufferManager(FullAttentionManager):
     ) -> int:
         del (
             num_tokens,
-            new_computed_blocks,
             total_computed_tokens,
             num_tokens_main_model,
             apply_admission_cap,
         )
-        return 0 if self.req_to_blocks.get(request_id) else 1
+        if self.req_to_blocks.get(request_id):
+            return 0
+        if new_computed_blocks:
+            return self._get_num_evictable_blocks(new_computed_blocks)
+        return 1
 
     def add_local_computed_blocks(
         self,
@@ -740,7 +764,11 @@ class CircularBufferManager(FullAttentionManager):
     ) -> None:
         # All groups must touch their cache hits before we take a free block.
         # allocate_new_blocks claims the ring after that coordinator pass.
-        del request_id, new_computed_blocks
+        # vLLM #66881 takes_frontier_hits: consuming ownership preserves the
+        # compressor ring and deliberately avoids new_block_ids (zeroing).
+        if new_computed_blocks:
+            self.block_pool.touch(new_computed_blocks)
+            self.req_to_blocks[request_id].extend(new_computed_blocks)
         del num_local_computed_tokens, num_external_computed_tokens
 
     def allocate_external_computed_blocks(
@@ -939,7 +967,8 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
             for computed in computed_blocks:
                 del computed[num_contiguous_blocks:]
             while (
-                block_size != alignment_tokens  # Faster for common case.
+                not drop_eagle_block
+                and block_size != alignment_tokens  # Faster for common case.
                 and len(computed_blocks[0]) * block_size % alignment_tokens != 0
             ):
                 for computed in computed_blocks:
@@ -1288,6 +1317,7 @@ class MambaManager(SingleTypeKVCacheManager):
         self, kv_cache_spec: MambaSpec, block_pool: BlockPool, **kwargs
     ) -> None:
         super().__init__(kv_cache_spec, block_pool, **kwargs)
+        self.keep_decode_resume_state = False
         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
@@ -1363,6 +1393,17 @@ class MambaManager(SingleTypeKVCacheManager):
     ) -> None:
         assert isinstance(self.kv_cache_spec, MambaSpec)
 
+        # Adapted from vLLM #67053 (2a150785400f): retain the latest
+        # decode boundary through both the generic and pending-list sweeps.
+        if self.keep_decode_resume_state and num_prompt_tokens is not None:
+            resume_idx = self._decode_resume_block_idx(
+                processed_computed_tokens, num_prompt_tokens
+            )
+            if (
+                resume_idx is not None
+                and self.req_to_blocks[request_id][resume_idx].block_hash is None
+            ):
+                processed_computed_tokens = resume_idx * self.block_size + 1
         super().remove_skipped_blocks(
             request_id, processed_computed_tokens, num_prompt_tokens
         )
@@ -1650,6 +1691,40 @@ class MambaManager(SingleTypeKVCacheManager):
                         (block_idx + 1) * self.block_size,
                     )
                 )
+
+    def _decode_resume_block_idx(
+        self, processed_tokens: int, num_prompt_tokens: int
+    ) -> int | None:
+        idx = processed_tokens // self.block_size - 1
+        if idx < num_prompt_tokens // self.block_size:
+            return None
+        return idx
+
+    def cache_blocks_on_free(self, request: Request) -> None:
+        """Supplement the last local boundary; running handoffs stay unchanged."""
+        if not self.keep_decode_resume_state:
+            return
+        blocks = self.req_to_blocks.get(request.request_id, [])
+        idx = self._decode_resume_block_idx(
+            max(0, request.num_computed_tokens - request.num_in_flight_tokens),
+            request.num_prompt_tokens,
+        )
+        num_hashed_tokens = len(request.block_hashes) * self.block_pool.hash_block_size
+        if (
+            idx is None
+            or idx >= len(blocks)
+            or blocks[idx].block_hash is not None
+            or num_hashed_tokens < (idx + 1) * self.block_size
+        ):
+            return
+        self.block_pool.cache_full_blocks(
+            request=request,
+            blocks=blocks,
+            num_cached_blocks=idx,
+            num_full_blocks=idx + 1,
+            block_size=self.block_size,
+            kv_cache_group_id=self.kv_cache_group_id,
+        )
 
     def new_step_starts(self) -> None:
         self.cached_blocks_this_step.clear()

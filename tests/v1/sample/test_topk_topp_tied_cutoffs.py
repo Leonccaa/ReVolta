@@ -8,7 +8,10 @@ import numpy as np
 import pytest
 import torch
 
+from vllm.v1.sample.ops import topk_topp_triton
+from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
 from vllm.v1.sample.ops.topk_topp_triton import (
+    apply_top_k_top_p_triton,
     sort_topk_with_vocab_ties,
 )
 from vllm.v1.worker.gpu.sample.states import SamplingStates
@@ -16,6 +19,82 @@ from vllm.v1.worker.gpu.spec_decode.dflash2 import sparse_rejection
 from vllm.v1.worker.gpu.spec_decode.dflash2.sparse_rejection import (
     _compact_target_requires_reference,
 )
+
+
+@pytest.fixture
+def pivot_device():
+    if os.environ.get("TRITON_INTERPRET") == "1":
+        return "cpu"
+    if torch.cuda.is_available():
+        return "cuda"
+    pytest.skip("CUDA or CPU Triton interpreter required")
+
+
+def _assert_pivot_support(logits, actual, expected):
+    kept = torch.isfinite(actual)
+    assert torch.equal(actual, logits.masked_fill(~kept, -float("inf")))
+    # Equal logits at a top-p boundary are interchangeable. Check the exact
+    # number kept at each value as well as the original value at each token.
+    assert torch.equal(actual.sort().values, expected.sort().values)
+
+
+@pytest.mark.parametrize("vocab", [32768, 248320])
+@pytest.mark.parametrize("rest", [-float("inf"), 1.0])
+@pytest.mark.parametrize(
+    "top_k,top_p",
+    [(20, None), (20, 1.0), (20, 0.8), (50, 0.95), (None, 0.95), (None, 0.8)],
+)
+def test_pivot_kernel_cutoff_below_smallest_finite_logit(
+    pivot_device, top_k, top_p, rest, vocab
+):
+    # Rows 0-1 have a tie at the smallest logit. Rows 2-3 include a
+    # grammar-style nucleus when the remaining vocabulary is masked.
+    x = torch.full((4, vocab), rest, device=pivot_device)
+    x[:2, :24] = 1.0
+    x[:2, :2] = 2.0
+    x[2:, 100] = 5.0
+    x[2:, 200] = 3.0
+    x[2:, 300] = 2.5
+    k = (
+        None
+        if top_k is None
+        else torch.full((4,), top_k, dtype=torch.int32, device=pivot_device)
+    )
+    p = None if top_p is None else torch.full((4,), top_p, device=pivot_device)
+    expected = apply_top_k_top_p_pytorch(x.clone(), k, p)
+
+    # Call the monolithic launcher directly, including for small p-only batches.
+    actual = x.clone()
+    topk_topp_triton._topk_topp(
+        actual,
+        torch.empty_like(x),
+        x.new_tensor(topk_topp_triton._PERCENTILE_TO_STD_TABLE),
+        x.new_tensor(topk_topp_triton._NORMAL_CDF_TO_SIGMA_TABLE),
+        k,
+        p,
+        -float("inf"),
+        x.shape[0],
+    )
+    _assert_pivot_support(x, actual, expected)
+
+
+@pytest.mark.parametrize("rows,top_k", [(1, 3), (65, None)])
+def test_monolithic_cutoff_after_grammar_or_min_p(pivot_device, rows, top_k):
+    # Three logits survive grammar or min_p masking. With p=0.95, the
+    # nucleus needs all three. A pure top-p batch of 65 bypasses the split path.
+    x = torch.full((rows, 4096), -float("inf"), device=pivot_device)
+    x[:, 100] = 5.0
+    x[:, 200] = 3.0
+    x[:, 300] = 2.5
+    k = (
+        None
+        if top_k is None
+        else torch.full((rows,), top_k, dtype=torch.int32, device=pivot_device)
+    )
+    p = torch.full((rows,), 0.95, device=pivot_device)
+    expected = apply_top_k_top_p_pytorch(x.clone(), k, p)
+    actual = apply_top_k_top_p_triton(x.clone(), k, p)
+    _assert_pivot_support(x, actual, expected)
 
 
 def test_compact_guard_only_rejects_ambiguous_cutoffs():

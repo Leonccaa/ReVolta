@@ -489,46 +489,75 @@ __device__ __forceinline__ half nvfp4_raw_scale_to_half(uint8_t scale_code,
   return __hfma(raw_scale, scale_hi, correction);
 }
 
-__global__ void nvfp4_expand_raw_scales_sm70_kernel(
-    half* __restrict__ output, const uint8_t* __restrict__ scale_codes,
-    const float* __restrict__ global_scales, size_t elements,
-    size_t scales_per_expert, int n, int global_stride, bool interleaved_w13,
-    bool fast_decode_rounding) {
-  const size_t index =
-      static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (index >= elements) {
-    return;
-  }
-  const int expert = static_cast<int>(index / scales_per_expert);
-  const int col = static_cast<int>(index % n);
-  int global_slot = 0;
-  if (global_stride == 2) {
-    global_slot = interleaved_w13 ? ((col >> 5) & 1) : (col >= n / 2);
-  }
-  const float global_scale =
-      global_scales[static_cast<size_t>(expert) * global_stride + global_slot];
+__device__ __forceinline__ half
+nvfp4_expand_raw_scale(uint8_t code, float global_scale, half scale_hi,
+                       half scale_lo, bool fast_decode_rounding) {
   if (fast_decode_rounding) {
-    const float scaled_global = global_scale * 16384.0f;
-    const half scale_hi = __float2half_rn(scaled_global);
-    const half scale_lo =
-        __float2half_rn(scaled_global - __half2float(scale_hi));
     // Validate the effective scale consumed by HMMA directly. Dividing back
     // to the stored scale could hide a mismatch through FP16 underflow.
-    output[index] =
-        nvfp4_raw_scale_to_half(scale_codes[index], scale_hi, scale_lo);
-  } else {
-    const unsigned code = scale_codes[index];
-    const unsigned magnitude = code & 0x7fU;
-    unsigned half_bits =
-        magnitude == 0x7fU ? 0x7e00U : (magnitude << 7U) + 0x2000U;
-    if (magnitude < 8U) {
-      const half subnormal = __float2half_rn(magnitude * 0x1p-9f);
-      half_bits = __half_as_ushort(subnormal);
-    }
-    half_bits |= (code & 0x80U) << 8U;
-    const half raw_scale = *reinterpret_cast<const half*>(&half_bits);
-    output[index] = __float2half_rn(__half2float(raw_scale) * global_scale);
+    return nvfp4_raw_scale_to_half(code, scale_hi, scale_lo);
   }
+  const unsigned magnitude = code & 0x7fU;
+  unsigned half_bits =
+      magnitude == 0x7fU ? 0x7e00U : (magnitude << 7U) + 0x2000U;
+  if (magnitude < 8U) {
+    const half subnormal = __float2half_rn(magnitude * 0x1p-9f);
+    half_bits = __half_as_ushort(subnormal);
+  }
+  half_bits |= (static_cast<unsigned>(code) & 0x80U) << 8U;
+  const half raw_scale = *reinterpret_cast<const half*>(&half_bits);
+  return __float2half_rn(__half2float(raw_scale) * global_scale);
+}
+
+// Each thread expands eight consecutive scales of one expert row: one 8-byte
+// code load and one 16-byte store, with the expert's global scales and their
+// FP16 high/low split computed once per thread instead of once per element.
+// n and the per-expert count are multiples of eight for both Qwen3.8 banks,
+// so the eight columns never cross an expert or a W13 half.
+constexpr int kNvfp4ExpandVec = 8;
+
+__global__ void nvfp4_expand_raw_scales_sm70_kernel(
+    half* __restrict__ output, const uint8_t* __restrict__ scale_codes,
+    const float* __restrict__ global_scales, int vectors,
+    int vectors_per_expert, int n, int global_stride, bool interleaved_w13,
+    bool fast_decode_rounding) {
+  const int vector = blockIdx.x * blockDim.x + threadIdx.x;
+  if (vector >= vectors) {
+    return;
+  }
+  const int expert = vector / vectors_per_expert;
+  const int col0 =
+      ((vector - expert * vectors_per_expert) * kNvfp4ExpandVec) % n;
+  const float* expert_globals =
+      global_scales + static_cast<size_t>(expert) * global_stride;
+  float global[2];
+  if (global_stride == 2 && interleaved_w13) {
+    global[0] = expert_globals[0];
+    global[1] = expert_globals[1];
+  } else {
+    const int slot = global_stride == 2 ? (col0 >= n / 2) : 0;
+    global[0] = global[1] = expert_globals[slot];
+  }
+  half hi[2];
+  half lo[2];
+#pragma unroll
+  for (int slot = 0; slot < 2; ++slot) {
+    const float scaled_global = global[slot] * 16384.0f;
+    hi[slot] = __float2half_rn(scaled_global);
+    lo[slot] = __float2half_rn(scaled_global - __half2float(hi[slot]));
+  }
+  const uint2 packed = reinterpret_cast<const uint2*>(scale_codes)[vector];
+  const uint8_t* codes = reinterpret_cast<const uint8_t*>(&packed);
+  uint4 out;
+  half* values = reinterpret_cast<half*>(&out);
+#pragma unroll
+  for (int i = 0; i < kNvfp4ExpandVec; ++i) {
+    // col0 is even, so the interleaved W13 slot is the element's parity.
+    const int slot = i & 1;
+    values[i] = nvfp4_expand_raw_scale(codes[i], global[slot], hi[slot],
+                                       lo[slot], fast_decode_rounding);
+  }
+  reinterpret_cast<uint4*>(output)[vector] = out;
 }
 
 template <int kSplitK>
@@ -575,7 +604,7 @@ __global__ void nvfp4_qpn_raw_scale_sm70_kernel(
 
   int global_slot = 0;
   if (is_w13) {
-    global_slot = interleaved_w13 ? (tile & 1) : (tile >= tiles_n32 / 2);
+    global_slot = interleaved_w13 ? (lane & 1) : (tile >= tiles_n32 / 2);
   }
   const float global_scale =
       __ldg(global_scales + static_cast<size_t>(expert) * (is_w13 ? 2 : 1) +
@@ -684,8 +713,9 @@ __global__ void nvfp4_qpn_w13_swiglu_batch_sm70_kernel(
     half scale_hi = __float2half(0.0f);
     half scale_lo = __float2half(0.0f);
     if constexpr (kRawScale) {
+      const int global_slot = kInterleaved ? (lane & 1) : projection;
       const float global_scale =
-          __ldg(global_scales + static_cast<size_t>(expert) * 2 + projection) *
+          __ldg(global_scales + static_cast<size_t>(expert) * 2 + global_slot) *
           16384.0f;
       scale_hi = __float2half_rn(global_scale);
       scale_lo = __float2half_rn(global_scale - __half2float(scale_hi));
@@ -1146,15 +1176,19 @@ void nvfp4_expand_raw_scales_sm70_out(torch::Tensor out,
                   out.get_device() == global_scales.get_device(),
               "nvfp4_expand_raw_scales_sm70_out: device mismatch");
 
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(out.data_ptr()) % 16 == 0 &&
+                  reinterpret_cast<uintptr_t>(scale_codes.data_ptr()) % 8 == 0,
+              "nvfp4_expand_raw_scales_sm70_out: vector alignment");
+
   const at::cuda::OptionalCUDAGuard device_guard(device_of(out));
   constexpr int threads = 256;
-  const size_t elements = static_cast<size_t>(out.numel());
-  const int blocks = static_cast<int>((elements + threads - 1) / threads);
+  const int vectors = static_cast<int>(out.numel() / kNvfp4ExpandVec);
+  const int blocks = (vectors + threads - 1) / threads;
   nvfp4_expand_raw_scales_sm70_kernel<<<blocks, threads, 0,
                                         at::cuda::getCurrentCUDAStream()>>>(
       reinterpret_cast<half*>(out.data_ptr<at::Half>()),
-      scale_codes.data_ptr<uint8_t>(), global_scales.data_ptr<float>(),
-      elements, static_cast<size_t>(out.numel() / out.size(0)),
+      scale_codes.data_ptr<uint8_t>(), global_scales.data_ptr<float>(), vectors,
+      static_cast<int>(out.numel() / out.size(0) / kNvfp4ExpandVec),
       static_cast<int>(out.size(2)), is_w13 ? 2 : 1, interleaved_w13,
       fast_decode_rounding);
   C10_CUDA_KERNEL_LAUNCH_CHECK();

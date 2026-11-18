@@ -12,7 +12,7 @@ Add a variable here to document it, then run `python tools/gen_env_docs.py`.
 
 SECTIONS = {
     "research": "Pregraph preparation research switches",
-    "promoted": "Promoted research switches (0.2.0rc5)",
+    "promoted": "Promoted research switches",
     "deployment": "Settings used by the reference deployment",
     "profile": "Values applied by the ReVolta profile",
     "usage": "Anonymous usage statistics",
@@ -36,41 +36,12 @@ _LOOKUP = (
 )
 
 NOTES: dict[str, dict[str, str]] = {
-    "REVOLTA_RESEARCH_PREGRAPH_GDN_COMMON_CACHE": dict(
-        section="research",
-        since="unreleased research",
-        range="0, 1",
-        tradeoff="Deployment scope, default off. MRV2 FULL replay only: retain "
-        "one pure-speculative batch's common GDN metadata, guarded by all CPU "
-        "geometry values and the live GPU offset buffer layout. Removes repeated "
-        "host construction, mask H2D and token-index arange on a hit. Mixed and "
-        "capture batches use the original builder. Accepted counts, state IDs "
-        "and request mapping are never cached. GPU bitwise and throughput "
-        "validation pending. Set 0 and restart to restore the original builder.",
-        metrics="no dedicated counter; compare decode throughput "
-        "and preparation traces",
-    ),
-    "REVOLTA_RESEARCH_PREGRAPH_REPLAY_VIEWS": dict(
-        section="research",
-        since="unreleased research",
-        range="0, 1",
-        tradeoff="Deployment scope, default off. MRV2 FULL replay only: share "
-        "read-only state-ID and query-offset tensor views within each metadata "
-        "group for one step. No cross-step reuse or change to kernels, storage, "
-        "accepted counts or fences. GPU bitwise and throughput validation "
-        "pending. Set 0 and restart to restore per-layer view construction.",
-        metrics="no dedicated counter; compare decode throughput "
-        "and preparation traces",
-    ),
     "REVOLTA_RESEARCH_CHECKPOINT_CACHE_DROP": dict(
-        section="deployment",
+        section="promoted",
         since="0.2.0",
         range="0, 1",
-        tradeoff="Research, engine startup only; default off. 1 requests clean "
-        "checkpoint cache eviction before host KV allocation, after a world "
-        "load barrier. Skips live mappings and PLE disk/cascade modes. May "
-        "slow later reloads or other engines reading the same checkpoint. "
-        "See startup logs for advised files/bytes and cgroup usage; no metric.",
+        tradeoff="Deprecated alias of VLLM_SM70_CHECKPOINT_CACHE_DROP; "
+        "removed in 0.2.0rc13. The new name wins when both are set.",
         metrics="",
     ),
     "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB": dict(
@@ -117,20 +88,49 @@ NOTES: dict[str, dict[str, str]] = {
         + _BITWISE,
         metrics="",
     ),
-    "REVOLTA_GDN_CPU_SPEC_QSL": dict(
+    "VLLM_SM70_HOST_DECODE_FAST": dict(
         section="promoted",
         since="0.2.0",
         range="0, 1",
-        tradeoff="Deprecated alias of VLLM_SM70_GDN_CPU_SPEC_QSL; removed in "
-        "0.2.0rc6. The new name wins when both are set.",
+        tradeoff="Default on. Long-context host KV decode only: fuses three "
+        "pairs of host-history decode kernels. Set 0 and restart to restore "
+        "the original kernels; ordinary GPU KV paths are unaffected.",
         metrics="",
     ),
-    "REVOLTA_GDN_CPU_SPEC_QSL_CHECK_FILE": dict(
+    "VLLM_SM70_QSA_LOCAL_INPUTS_FUSED": dict(
         section="promoted",
         since="0.2.0",
-        range="path",
-        tradeoff="Deprecated alias of VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE; "
-        "removed in 0.2.0rc6.",
+        range="0, 1",
+        tradeoff="Default on. DCP-sharded shared-key scorer: one fused "
+        "integer metadata conversion instead of the torch reference. Set 0 "
+        "and restart to restore the torch reference.",
+        metrics="",
+    ),
+    "VLLM_SM70_CHECKPOINT_CACHE_DROP": dict(
+        section="promoted",
+        since="0.2.0",
+        range="0, 1",
+        tradeoff="Default on; engine startup only. 1 requests clean "
+        "checkpoint cache eviction before host KV allocation, after a world "
+        "load barrier. Skips live mappings and PLE disk/cascade modes. May "
+        "slow later reloads or other engines reading the same checkpoint. "
+        "See startup logs for advised files/bytes and cgroup usage; no metric.",
+        metrics="",
+    ),
+    "REVOLTA_RESEARCH_HOST_DECODE_FAST": dict(
+        section="promoted",
+        since="0.2.0",
+        range="0, 1",
+        tradeoff="Deprecated alias of VLLM_SM70_HOST_DECODE_FAST; removed in "
+        "0.2.0rc13. The new name wins when both are set.",
+        metrics="",
+    ),
+    "REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED": dict(
+        section="promoted",
+        since="0.2.0",
+        range="0, 1",
+        tradeoff="Deprecated alias of VLLM_SM70_QSA_LOCAL_INPUTS_FUSED; "
+        "removed in 0.2.0rc13. The new name wins when both are set.",
         metrics="",
     ),
     "REVOLTA_QSA_GROUPED_LPT": dict(
@@ -363,7 +363,7 @@ NOTES: dict[str, dict[str, str]] = {
         section="profile",
         since="1Cat",
         range="0, 1",
-        tradeoff="Single-request DFlash2 verifier tail graphs. The AWQ DFlash "
+        tradeoff="Single-request DFlash2 verifier tail graphs. The DFlash2 "
         "profile sets 0 to keep the graph memory for the KV cache.",
         metrics="",
     ),
@@ -518,7 +518,9 @@ NOTES: dict[str, dict[str, str]] = {
         range="MiB",
         tradeoff="CUDA graph memory reserved before sizing the KV cache (MRv2 "
         "does not profile it). Too low risks OOM at capture; too high wastes "
-        "KV. Profile: 700 (AWQ, NVFP4), 1200 (AWQ + DFlash2).",
+        "KV. Profile: 700 (AWQ, NVFP4), 1200 (DFlash2); with fp8_per_token_head "
+        "or int8 KV, 600 (fixed MTP), 705 (dynamic MTP), 1000 (AWQ + DFlash2) "
+        "and 1024 (NVFP4 + DFlash2).",
         metrics="",
     ),
     # ---- DFlash2 / DFlash draft ------------------------------------------

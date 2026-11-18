@@ -389,6 +389,16 @@ class KVCacheManager:
 
         return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
 
+    def extend_exact_end(
+        self, request: Request, blocks: KVCacheBlocks, hit: int
+    ) -> tuple[KVCacheBlocks, int]:
+        if not self.enable_caching or request.skip_reading_prefix_cache:
+            return blocks, hit
+        extended, hit = self.coordinator.exact_end.extend(
+            request, blocks.blocks, hit, self.host_kv_hits
+        )
+        return self.create_kv_cache_blocks(extended), hit
+
     def allocate_slots(
         self,
         request: Request,
@@ -679,6 +689,9 @@ class KVCacheManager:
                 num_external_computed_tokens=num_external_computed_tokens,
             )
 
+        # All hit blocks are touched and every capacity check passed. Transfer
+        # ownership by dropping only exact keys (vLLM #66881, without CoW).
+        self.coordinator.exact_end.consume(request)
         new_blocks = self.coordinator.allocate_new_blocks(
             request.request_id,
             num_tokens_need_slot,
@@ -725,7 +738,8 @@ class KVCacheManager:
             self.block_pool.release_request(
                 request.request_id, manager.req_to_blocks.get(request.request_id, ())
             )
-        self.coordinator.free(request.request_id)
+        self.coordinator.exact_end.publish(request)
+        self.coordinator.free(request)
         if self.admission_ledger is not None:
             self.admission_ledger.release(request.request_id)
         if self.host_kv_hits is not None:
@@ -917,7 +931,7 @@ class KVCacheManager:
             self.coordinator.cache_blocks(request, num_computed_tokens)
 
     def create_kv_cache_blocks(
-        self, blocks: tuple[list[KVCacheBlock], ...]
+        self, blocks: tuple[Sequence[KVCacheBlock], ...]
     ) -> KVCacheBlocks:
         # Only create new KVCacheBlocks for non-empty blocks
         return KVCacheBlocks(blocks) if any(blocks) else self.empty_kv_cache_blocks

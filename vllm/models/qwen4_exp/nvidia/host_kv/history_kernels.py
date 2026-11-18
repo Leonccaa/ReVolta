@@ -74,6 +74,18 @@ def write_slots(
     B: tl.constexpr,
     Ready=None,
     COMMIT: tl.constexpr = False,
+    KScale=None,
+    VScale=None,
+    KSS0: tl.constexpr = 0,
+    KSS1: tl.constexpr = 0,
+    VSS0: tl.constexpr = 0,
+    VSS1: tl.constexpr = 0,
+    PLANAR: tl.constexpr = False,
+    HOT_STRIDE: tl.constexpr = 0,
+    HOST_K_SCALE: tl.constexpr = 0,
+    HOST_V_SCALE: tl.constexpr = 0,
+    HOT_K_SCALE: tl.constexpr = 0,
+    HOT_V_SCALE: tl.constexpr = 0,
 ):
     """Copy one encoded row to its host page and, if resident, its hot group."""
     row = tl.program_id(0).to(tl.int64)
@@ -93,9 +105,29 @@ def write_slots(
     tl.store(Host + host, key, lane)
     tl.store(Host + host + HS1, value, lane)
     hot_slot = tl.load(Map + kernel_block * (KBS // 4) + offset // 4, valid, -1)
-    hot = hot_slot.to(tl.int64) * (8 * H * D) + (offset % 4) * H * D + x
+    hot_stride: tl.constexpr = HOT_STRIDE if PLANAR else 8 * H * D
+    hot = hot_slot.to(tl.int64) * hot_stride + (offset % 4) * H * D + x
     tl.store(Hot + hot, key, lane & (hot_slot >= 0))
     tl.store(Hot + hot + 4 * H * D, value, lane & (hot_slot >= 0))
+    if PLANAR:
+        head = x
+        scale_lane = valid & (head < H)
+        ks = tl.load(KScale + row * KSS0 + head * KSS1, scale_lane, 0)
+        vs = tl.load(VScale + row * VSS0 + head * VSS1, scale_lane, 0)
+        host_scale = (
+            page.to(tl.int64) * (HS0 // 4)
+            + (kernel_block % RATIO) * (HSS // 4)
+            + offset * H
+            + head
+        )
+        host_fp32 = Host.to(tl.pointer_type(tl.float32))
+        tl.store(host_fp32 + host_scale + HOST_K_SCALE // 4, ks, scale_lane)
+        tl.store(host_fp32 + host_scale + HOST_V_SCALE // 4, vs, scale_lane)
+        hot_scale = hot_slot.to(tl.int64) * (HOT_STRIDE // 4) + (offset % 4) * H + head
+        hot_fp32 = Hot.to(tl.pointer_type(tl.float32))
+        hot_lane = scale_lane & (hot_slot >= 0)
+        tl.store(hot_fp32 + hot_scale + HOT_K_SCALE // 4, ks, hot_lane)
+        tl.store(hot_fp32 + hot_scale + HOT_V_SCALE // 4, vs, hot_lane)
     if COMMIT:
         # Every consumer is on the same stream, after this kernel boundary.
         # The connector's retirement event still fences all host writes.
@@ -127,6 +159,19 @@ def stage_slots(
     H: tl.constexpr,
     D: tl.constexpr,
     B: tl.constexpr,
+    KScale=None,
+    VScale=None,
+    KSS0: tl.constexpr = 0,
+    KSS1: tl.constexpr = 0,
+    VSS0: tl.constexpr = 0,
+    VSS1: tl.constexpr = 0,
+    PLANAR: tl.constexpr = False,
+    HOT_STRIDE: tl.constexpr = 0,
+    HOST_K_SCALE: tl.constexpr = 0,
+    HOST_V_SCALE: tl.constexpr = 0,
+    HOT_K_SCALE: tl.constexpr = 0,
+    HOT_V_SCALE: tl.constexpr = 0,
+    STAGE_SCALE: tl.constexpr = 0,
 ):
     """Write planned rows to compact GPU storage, refresh hot, retain decode UVA."""
     row = tl.program_id(0).to(tl.int64)
@@ -151,9 +196,33 @@ def stage_slots(
     tl.store(Host + host, key, lane & ~staged)
     tl.store(Host + host + HS1, value, lane & ~staged)
     hot_slot = tl.load(Map + kernel_block * (KBS // 4) + offset // 4, valid, -1)
-    hot = hot_slot.to(tl.int64) * (8 * H * D) + (offset % 4) * H * D + x
+    hot_stride: tl.constexpr = HOT_STRIDE if PLANAR else 8 * H * D
+    hot = hot_slot.to(tl.int64) * hot_stride + (offset % 4) * H * D + x
     tl.store(Hot + hot, key, lane & (hot_slot >= 0))
     tl.store(Hot + hot + 4 * H * D, value, lane & (hot_slot >= 0))
+
+    if PLANAR:
+        head = x
+        scale_lane = valid & (head < H)
+        ks = tl.load(KScale + row * KSS0 + head * KSS1, scale_lane, 0)
+        vs = tl.load(VScale + row * VSS0 + head * VSS1, scale_lane, 0)
+        stage_fp32 = Stage.to(tl.pointer_type(tl.float32)) + STAGE_SCALE // 4
+        tl.store(stage_fp32 + k_target * H + head, ks, scale_lane & staged)
+        tl.store(stage_fp32 + v_target * H + head, vs, scale_lane & staged)
+        host_scale = (
+            page.to(tl.int64) * (HS0 // 4)
+            + (kernel_block % RATIO) * (HSS // 4)
+            + offset * H
+            + head
+        )
+        host_fp32 = Host.to(tl.pointer_type(tl.float32))
+        tl.store(host_fp32 + host_scale + HOST_K_SCALE // 4, ks, scale_lane & ~staged)
+        tl.store(host_fp32 + host_scale + HOST_V_SCALE // 4, vs, scale_lane & ~staged)
+        hot_scale = hot_slot.to(tl.int64) * (HOT_STRIDE // 4) + (offset % 4) * H + head
+        hot_fp32 = Hot.to(tl.pointer_type(tl.float32))
+        hot_lane = scale_lane & (hot_slot >= 0)
+        tl.store(hot_fp32 + hot_scale + HOT_K_SCALE // 4, ks, hot_lane)
+        tl.store(hot_fp32 + hot_scale + HOT_V_SCALE // 4, vs, hot_lane)
 
 
 @triton.jit
@@ -180,6 +249,20 @@ def write_slots_vector(
     WB: tl.constexpr,
     ROWS: tl.constexpr,
     STAGED: tl.constexpr,
+    H: tl.constexpr = 1,
+    KScale=None,
+    VScale=None,
+    KSS0: tl.constexpr = 0,
+    KSS1: tl.constexpr = 0,
+    VSS0: tl.constexpr = 0,
+    VSS1: tl.constexpr = 0,
+    PLANAR: tl.constexpr = False,
+    HOT_STRIDE: tl.constexpr = 0,
+    HOST_K_SCALE: tl.constexpr = 0,
+    HOST_V_SCALE: tl.constexpr = 0,
+    HOT_K_SCALE: tl.constexpr = 0,
+    HOT_V_SCALE: tl.constexpr = 0,
+    STAGE_SCALE: tl.constexpr = 0,
 ):
     """All strides and W are in 8-byte words. One program = ROWS rows."""
     r = (tl.program_id(0) * ROWS + tl.arange(0, ROWS)).to(tl.int64)
@@ -211,10 +294,44 @@ def write_slots_vector(
     tl.store(Host + base[:, None] + x[None, :], key, host_lane)
     tl.store(Host + (base + HS1)[:, None] + x[None, :], value, host_lane)
     hot_slot = tl.load(Map + kb * (KBS // 4) + off // 4, valid, -1).to(tl.int64)
-    hot = tl.multiple_of(hot_slot * (8 * W) + (off % 4) * W, 2)
+    hot_stride: tl.constexpr = HOT_STRIDE // 8 if PLANAR else 8 * W
+    hot = tl.multiple_of(hot_slot * hot_stride + (off % 4) * W, 2)
     hmask = lane & (hot_slot >= 0)[:, None]
     tl.store(Hot + hot[:, None] + x[None, :], key, hmask)
     tl.store(Hot + (hot + 4 * W)[:, None] + x[None, :], value, hmask)
+
+    if PLANAR:
+        head = tl.arange(0, triton.next_power_of_2(H)).to(tl.int64)
+        scale_lane = valid[:, None] & (head < H)[None, :]
+        ks = tl.load(KScale + r[:, None] * KSS0 + head[None, :] * KSS1, scale_lane, 0)
+        vs = tl.load(VScale + r[:, None] * VSS0 + head[None, :] * VSS1, scale_lane, 0)
+        host_scale_lane = scale_lane
+        if STAGED:
+            stage_fp32 = Stage.to(tl.pointer_type(tl.float32)) + STAGE_SCALE // 4
+            tl.store(
+                stage_fp32 + k_target[:, None] * H + head[None, :],
+                ks,
+                scale_lane & staged[:, None],
+            )
+            tl.store(
+                stage_fp32 + v_target[:, None] * H + head[None, :],
+                vs,
+                scale_lane & staged[:, None],
+            )
+            host_scale_lane = scale_lane & ~staged[:, None]
+        host_scale = (page * (HS0 * 2) + (kb % RATIO) * (HSS * 2) + off * H)[
+            :, None
+        ] + head[None, :]
+        host_fp32 = Host.to(tl.pointer_type(tl.float32))
+        tl.store(host_fp32 + host_scale + HOST_K_SCALE // 4, ks, host_scale_lane)
+        tl.store(host_fp32 + host_scale + HOST_V_SCALE // 4, vs, host_scale_lane)
+        hot_scale = (hot_slot * (HOT_STRIDE // 4) + (off % 4) * H)[:, None] + head[
+            None, :
+        ]
+        hot_fp32 = Hot.to(tl.pointer_type(tl.float32))
+        hot_lane = scale_lane & (hot_slot >= 0)[:, None]
+        tl.store(hot_fp32 + hot_scale + HOT_K_SCALE // 4, ks, hot_lane)
+        tl.store(hot_fp32 + hot_scale + HOT_V_SCALE // 4, vs, hot_lane)
 
 
 @triton.jit(do_not_specialize=["N"])
@@ -322,28 +439,9 @@ def append_wanted(gid, valid, Wanted, Touched, Count, M: tl.constexpr):
         tl.store(Touched + start + rank, gid, first & (start + rank < M))
 
 
-@triton.jit
-def append_wanted_bit(
-    gid, valid, Wanted, Touched, Count, M: tl.constexpr, BIT: tl.constexpr
-):
-    """``append_wanted`` for one mark phase of the ordered fused kernel.
-
-    Each phase owns one bit of ``Wanted`` and appends its first claims to its
-    own list, so a group the tail wants is listed ahead of selection-only
-    groups no matter which CTA runs first. ``collect_misses_ordered`` drops
-    the selection list's copy of a group both phases want.
-    """
-    old = tl.atomic_or(Wanted + gid, BIT, mask=valid, sem="relaxed")
-    first = valid & ((old & BIT) == 0)
-    rank = tl.cumsum(first.to(tl.int32)) - 1
-    count = tl.sum(first.to(tl.int32), 0)
-    if count > 0:
-        start = tl.atomic_add(Count, count, sem="relaxed")
-        tl.device_assert(start + count <= M, "host KV wanted bound exceeded")
-        tl.store(Touched + start + rank, gid, first & (start + rank < M))
-
-
-@triton.jit
+# ``ROW_OFFSET`` arrives from ``mark_decode``'s runtime row count, so it cannot
+# be a constant; the standalone launch keeps the default of zero.
+@triton.jit(do_not_specialize=["ROW_OFFSET"])
 def mark_tail(
     Table,
     SeqLens,
@@ -357,8 +455,7 @@ def mark_tail(
     WORLD: tl.constexpr,
     RANK: tl.constexpr,
     IL: tl.constexpr,
-    ROW_OFFSET: tl.constexpr = 0,
-    ORDERED: tl.constexpr = False,
+    ROW_OFFSET=0,
 ):
     """Keep each request's newest 32 local tokens resident (nine groups)."""
     req = tl.program_id(0).to(tl.int64) - ROW_OFFSET
@@ -370,10 +467,7 @@ def mark_tail(
     ready = tl.load(Ready + kernel_block * KBS + safe % KBS, valid, 1)
     tl.device_assert((~valid) | (ready != 0), "tail KV is not committed")
     gid = kernel_block * (KBS // 4) + (safe % KBS) // 4
-    if ORDERED:
-        append_wanted_bit(gid, valid, Wanted, Touched, Count, M, 1)
-    else:
-        append_wanted(gid, valid, Wanted, Touched, Count, M)
+    append_wanted(gid, valid, Wanted, Touched, Count, M)
 
 
 @triton.jit
@@ -396,9 +490,6 @@ def mark_selection(
     RANK: tl.constexpr,
     IL: tl.constexpr,
     QSA_COLUMNS: tl.constexpr,
-    ORDERED: tl.constexpr = False,
-    Sel=None,
-    SelCount=None,
 ):
     """Claim each selected group once; attention keeps every column."""
     row = tl.program_id(0).to(tl.int64)
@@ -424,26 +515,14 @@ def mark_selection(
             "host KV QSA group layout exceeded",
         )
         group = tl.max(tl.reshape(gid, (B // QSA_COLUMNS, QSA_COLUMNS)), 1)
-        if ORDERED:
-            append_wanted_bit(
-                tl.maximum(group, 0),
-                group >= 0,
-                Wanted,
-                Sel,
-                SelCount,
-                M,
-                2,
-            )
-        else:
-            append_wanted(tl.maximum(group, 0), group >= 0, Wanted, Touched, Count, M)
+        append_wanted(tl.maximum(group, 0), group >= 0, Wanted, Touched, Count, M)
     else:
-        if ORDERED:
-            append_wanted_bit(tl.maximum(gid, 0), valid, Wanted, Sel, SelCount, M, 2)
-        else:
-            append_wanted(tl.maximum(gid, 0), valid, Wanted, Touched, Count, M)
+        append_wanted(tl.maximum(gid, 0), valid, Wanted, Touched, Count, M)
 
 
-@triton.jit
+# ``ROWS`` is a runtime count and is relayed to ``mark_tail`` as its row offset.
+# As a constexpr it made every padded decode batch size compile a new kernel.
+@triton.jit(do_not_specialize=["ROWS"])
 def mark_decode(
     Indices,
     Req,
@@ -463,18 +542,12 @@ def mark_decode(
     RANK: tl.constexpr,
     IL: tl.constexpr,
     QSA_COLUMNS: tl.constexpr,
-    ROWS: tl.constexpr,
-    Sel=None,
-    SelCount=None,
-    ORDERED: tl.constexpr = False,
+    ROWS,
 ):
     """Independent tail and selection claims in one grid, then collect.
 
-    ORDERED (the ``REVOLTA_RESEARCH_HOST_DECODE_FAST_ORDERED`` sub-switch)
-    keeps the two phases' first claims in separate lists, the tail list
-    ahead of the selection list, so refill order and the Misses/victims
-    pairing match the two-kernel baseline. The phases stay fully parallel:
-    ordering comes from per-phase bits in ``Wanted``, not from scheduling.
+    The two phases stay fully parallel and share one Touched list; the
+    collect pass and refill pairing are the same as the two-kernel path.
     """
     if tl.program_id(0) < ROWS:
         mark_selection(
@@ -496,9 +569,6 @@ def mark_decode(
             RANK,
             IL,
             QSA_COLUMNS,
-            ORDERED,
-            Sel,
-            SelCount,
         )
     elif tl.program_id(1) == 0:
         mark_tail(
@@ -515,7 +585,6 @@ def mark_decode(
             RANK,
             IL,
             ROW_OFFSET=ROWS,
-            ORDERED=ORDERED,
         )
 
 
@@ -547,6 +616,12 @@ def gather_groups(
     S: tl.constexpr = 0,
     M: tl.constexpr = 0,
     ALLOCATE: tl.constexpr = False,
+    PLANAR: tl.constexpr = False,
+    HOT_STRIDE: tl.constexpr = 0,
+    HOST_K_SCALE: tl.constexpr = 0,
+    HOST_V_SCALE: tl.constexpr = 0,
+    HOT_K_SCALE: tl.constexpr = 0,
+    HOT_V_SCALE: tl.constexpr = 0,
 ):
     """Copy every committed row of each missed group (unready rows read 0)."""
     x = tl.arange(0, B).to(tl.int64)
@@ -591,78 +666,33 @@ def gather_groups(
             RATIO,
         )
         payload = tl.load(Host + host, (x < 8 * H * D) & (ready != 0) & (page >= 0), 0)
-        tl.store(Hot + slot * (8 * H * D) + x, payload, x < 8 * H * D)
+        hot_stride: tl.constexpr = HOT_STRIDE if PLANAR else 8 * H * D
+        tl.store(Hot + slot * hot_stride + x, payload, x < 8 * H * D)
+        if PLANAR:
+            scale_token, scale_head = x // H, x % H
+            scale_offset = gid % (KBS // 4) * 4 + scale_token
+            scale_ready = tl.load(
+                Ready + kernel_block * KBS + scale_offset, x < 4 * H, 0
+            )
+            host_scale = (
+                page.to(tl.int64) * (HS0 // 4)
+                + (kernel_block % RATIO) * (HSS // 4)
+                + scale_offset * H
+                + scale_head
+            )
+            host_fp32 = Host.to(tl.pointer_type(tl.float32))
+            scale_lane = (x < 4 * H) & (scale_ready != 0) & (page >= 0)
+            ks = tl.load(host_fp32 + host_scale + HOST_K_SCALE // 4, scale_lane, 0)
+            vs = tl.load(host_fp32 + host_scale + HOST_V_SCALE // 4, scale_lane, 0)
+            hot_scale = slot * (HOT_STRIDE // 4) + x
+            hot_fp32 = Hot.to(tl.pointer_type(tl.float32))
+            tl.store(hot_fp32 + hot_scale + HOT_K_SCALE // 4, ks, x < 4 * H)
+            tl.store(hot_fp32 + hot_scale + HOT_V_SCALE // 4, vs, x < 4 * H)
     # All selectors finished in the preceding kernel. Other gather CTAs
     # never read Hand, so advancing it here requires no grid barrier.
     if ALLOCATE and ((tl.program_id(0) == 0) & (count > 0)):
         last = tl.load(Victims + count - 1)
         tl.store(Hand, tl.where(last + 1 == S, 0, last + 1))
-
-
-@triton.jit
-def begin_gather_ordered(WantedCount, SelCount, MissCount, Clock):
-    """``begin_gather`` plus the selection segment of the ordered marks."""
-    tl.store(WantedCount, 0)
-    tl.store(SelCount, 0)
-    tl.store(MissCount, 0)
-    tl.store(Clock, tl.load(Clock) + 1)
-
-
-@triton.jit
-def clear_wanted_ordered(Wanted, Touched, Count, Sel, SelCount, B: tl.constexpr):
-    """``clear_wanted`` over both lists of the ordered fused mark kernel."""
-    i = tl.program_id(0).to(tl.int64) * B + tl.arange(0, B)
-    active = i < tl.load(Count)
-    gid = tl.load(Touched + i, active, 0)
-    tl.store(Wanted + gid, 0, active)
-    active = i < tl.load(SelCount)
-    gid = tl.load(Sel + i, active, 0)
-    tl.store(Wanted + gid, 0, active)
-
-
-@triton.jit
-def collect_misses_ordered(
-    Touched,
-    Count,
-    Sel,
-    SelCount,
-    Wanted,
-    Map,
-    Age,
-    Clock,
-    Misses,
-    MissCount,
-    M: tl.constexpr,
-    B: tl.constexpr,
-):
-    """``collect_misses`` over the ordered mark kernel's two Touched lists.
-
-    The logical order is the baseline's: every tail claim first, then the
-    selection claims whose group the tail does not also want (bit 1 of
-    ``Wanted`` marks tail-owned groups; the selection list can still hold a
-    copy because its CTA may have claimed first).
-    """
-    i = tl.program_id(0).to(tl.int64) * B + tl.arange(0, B)
-    tail = tl.load(Count)
-    active = i < tail + tl.load(SelCount)
-    in_sel = i >= tail
-    safe = tl.where(in_sel, i - tail, i)
-    gid = tl.where(
-        in_sel,
-        tl.load(Sel + safe, active & in_sel, 0),
-        tl.load(Touched + safe, active & ~in_sel, 0),
-    )
-    tail_owned = (tl.load(Wanted + gid, active & in_sel, 0) & 1) != 0
-    active &= ~(in_sel & tail_owned)
-    slot = tl.load(Map + gid, active, -1)
-    missing = active & (slot < 0)
-    tl.store(Age + tl.maximum(slot, 0), tl.load(Clock), active & (slot >= 0))
-    rank = tl.cumsum(missing.to(tl.int32)) - 1
-    count = tl.sum(missing.to(tl.int32), 0)
-    if count > 0:
-        start = tl.atomic_add(MissCount, count, sem="relaxed")
-        tl.device_assert(start + count <= M, "host KV miss bound exceeded")
-        tl.store(Misses + start + rank, gid, missing & (start + rank < M))
 
 
 @triton.jit

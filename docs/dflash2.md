@@ -72,7 +72,7 @@ export VLLM_SM70_DFLASH2_FUSED_QKV_PACK=1
       "num_speculative_tokens": 7,
       "attention_backend": "FLASH_ATTN_V100",
       "draft_sample_method": "probabilistic",
-      "dflash_concurrency_drafts": {"4": 3, "5": 4},
+      "num_speculative_tokens_per_batch_size": [[1,3,7],[4,4,3],[5,8,4]],
       "sm70_dflash2": {"context_kv_graph": true, "context_pipeline": true,
         "verify_fastpath": true, "fused_gdn_metadata": true,
         "fused_smallq_metadata": true, "grouped_smallq_metadata": true,
@@ -103,25 +103,29 @@ rule. `"greedy"` still works. MTP must stay `"greedy"`; see
   kernel. It acts only on SM70 with DFlash2. In tests, greedy output was bit-identical and
   throughput about 1.5% higher. Like every `VLLM_*` variable, it is part of the
   torch.compile key, so a deployment that sets it builds its own compile cache.
-- **CUDA graph memory is set by the profile from 0.1.3.** With DFlash2 on AWQ TP4, the ReVolta profile reserves 1200 MiB per GPU (`VLLM_V2_CUDAGRAPH_MEM_MIB`) and leaves the single-request verifier tail graphs off (`VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS=0`). The graphs take about 1.1 GiB per GPU instead of 1.4 GiB. Greedy output was identical in the single-request comparison, including a 256K-token prompt; repeated comparisons found no consistent speed penalty at one or three requests. MTP4 keeps 700 MiB. Remove a previous explicit 1500 MiB setting to use the new default: environment values override the profile. If you turn the tail graphs back on, also set `VLLM_V2_CUDAGRAPH_MEM_MIB=1500`. A reserve smaller than the graphs lets the KV pool take that memory, and concurrent long prompts can then run out of GPU memory.
+- **CUDA graph memory is set by the profile from 0.1.3.** With DFlash2 on AWQ or NVFP4 TP4 (NVFP4 from 0.2.0), the ReVolta profile reserves 1200 MiB per GPU (`VLLM_V2_CUDAGRAPH_MEM_MIB`; 1000 MiB for AWQ and 1024 MiB for NVFP4 with the `fp8_per_token_head` or `int8` KV cache, whose graphs are smaller) and leaves the single-request verifier tail graphs off (`VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS=0`). The graphs take about 1.1 GiB per GPU instead of 1.4 GiB. Greedy output was identical in the single-request comparison, including a 256K-token prompt; repeated comparisons found no consistent speed penalty at one or three requests. MTP4 reserves 700 MiB, or 600 MiB with the `fp8_per_token_head` or `int8` KV cache. Remove a previous explicit 1500 MiB setting to use the new default: environment values override the profile. If you turn the tail graphs back on, also set `VLLM_V2_CUDAGRAPH_MEM_MIB=1500`. A reserve smaller than the graphs lets the KV pool take that memory, and concurrent long prompts can then run out of GPU memory.
 - **State replay is on by default in current development for the supported ordinary DFlash2 route.** The recommendation above sets `"spec_state_replay": true` explicitly, including for released 0.1.4–0.1.5, with `spec_state_replay_graph=true` retained as the graph default. Set `"spec_state_replay": false` to keep per-draft state blocks instead. It adds GPU KV capacity at a small per-step cost; see [State replay (optional)](#state-replay-optional).
-- **`dflash_concurrency_drafts`** maps a number of running requests (the threshold) to the
-  number of drafts the target verifies per request (the width). The drafter still drafts
-  7 tokens. With `{"4": 3, "5": 4}`, one to three running requests verify all 7 drafts,
-  four verify 3, and five or more verify 4.
-- The thresholds form a ladder: the entry with the largest threshold that is not above the
-  number of running requests sets the width. Below the lowest threshold, all drafts are
-  verified, and a higher entry can widen the width again. CUDA graphs are captured only
-  for the request counts that use each width. Thresholds must be 2 or more, and widths 1
-  to 7.
+- **`num_speculative_tokens_per_batch_size`** selects K from the number of requests
+  with tokens scheduled this step, including prefill. DFlash2 still drafts its
+  full block and publishes the first K drafts for later verification. The
+  current step verifies proposals already published. The example publishes 7
+  drafts at one to three requests, 3 at four, and 4 from five onward. The target
+  captures narrower decode graphs for the request counts assigned each width.
+  See [Dynamic Speculative Decoding](dynamic-speculative-decoding.md).
+- The deprecated `dflash_concurrency_drafts` alias remains available for one
+  release. Use one field at a time. The old `{"4": 3, "5": 4}` gives the same
+  widths as the example above.
 - Against `{"5": 4}`, this ladder gave identical output at 1 request and 9.7% more
   throughput at 4 requests (English, Chinese and code weighted equally); at 5–8 requests
   both use the same width.
-- For mostly Chinese loads, `{"3": 3}` verifies 3 drafts from three requests on; at three
-  requests that was about 15% faster in an earlier width sweep. For mostly code, `{"8": 4}`
-  measured best at 8 requests.
-- Setting `dflash_concurrency_drafts` turns off async scheduling; `--async-scheduling`
-  together with it is an error. Pipeline parallelism is not supported with DFlash2.
+- For mostly Chinese loads, `[[1,2,7],[3,8,3]]` matches the earlier
+  `{"3": 3}` sweep, which measured about 15% faster at three requests. For
+  mostly code, `[[1,7,7],[8,8,4]]` matches the old `{"8": 4}`, which measured
+  best at eight requests.
+- DFlash with a schedule defaults to synchronous scheduling. Keep
+  `--no-async-scheduling` for GDN state replay. Explicit `--async-scheduling`
+  uses per-position GDN state when the executor and model support async.
+  DFlash2 requires PP1.
 
 ## Native history lookup (optional)
 
@@ -139,7 +143,7 @@ into the DFlash2 speculative config above, retaining its model and other setting
 ```json
 {
   "num_speculative_tokens": 7,
-  "dflash_concurrency_drafts": {"4": 3, "5": 4},
+  "num_speculative_tokens_per_batch_size": [[1,3,7],[4,4,3],[5,8,4]],
   "dflash2_lookup": {
     "enabled": true,
     "policy": "longest",
@@ -153,27 +157,26 @@ into the DFlash2 speculative config above, retaining its model and other setting
 }
 ```
 
-Use `--no-async-scheduling` with this ladder. Omitting `dflash2_lookup` or setting
-`"enabled": false` leaves lookup disabled. When enabling it, `policy`, `nmin` and
+Use `--no-async-scheduling` for the recommended GDN replay setup. Omitting
+`dflash2_lookup` or setting `"enabled": false` leaves lookup disabled.
+When enabling it, `policy`, `nmin` and
 `nmax` must be explicit; no lookup recipe is selected automatically.
 
 - A batch of one to `max_requests` eligible decode requests attempts lookup.
   `max_requests` defaults to 3 and accepts integers from 1 to 3; set it to 1 to
   restore single-request admission without rebuilding the image. Mixed prefill,
   grammar constraints, any row without a sampled token or sufficient sequence
-  space, and batches whose concurrency ladder selects a width below seven
+  space, and batches whose current scheduler K is below seven
   bypass lookup for the whole batch. Eligibility is recalculated every round.
   Padding rows do not count; returning to an eligible batch resumes immediately.
 - The configured proposal/resource width remains seven; it does not expand to
-  fifteen or allocate per-request q16 graphs. The existing concurrency ladder
-  can still reduce the actual verification width: with the example above,
+  fifteen or allocate per-request q16 graphs. The DSD schedule
+  can still reduce the published width: with the example above,
   one to three requests use W=7, four use W=3, and five or more use W=4. Lookup
   bypasses batches of four or more requests, even without a ladder.
-- Fixed width seven **without a concurrency ladder** permits async scheduling,
-  subject to the existing executor, model and state-replay constraints. Lookup
-  does not itself turn async off. A nonempty ladder and explicit async scheduling
-  are incompatible and raise an error; with async unspecified, the existing
-  ladder rule selects synchronous scheduling.
+- Native lookup can run with explicit async scheduling at fixed or scheduled
+  widths, subject to the existing executor and model constraints. Async uses
+  per-position GDN state. A DFlash schedule defaults to synchronous scheduling.
 - This version supports only `longest` and `first_token`. `nearest` and expansion
   are rejected, including expansion enabled together with lookup disabled.
 - Legacy `ngram_assist` and lookup environment settings remain compatible; no

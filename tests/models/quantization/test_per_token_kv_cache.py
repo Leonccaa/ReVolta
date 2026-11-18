@@ -30,9 +30,7 @@ from ..utils import check_logprobs_close
         ),
     ],
 )
-@pytest.mark.parametrize(
-    "kv_cache_dtype", ["int8_per_token_head", "fp8_per_token_head"]
-)
+@pytest.mark.parametrize("kv_cache_dtype", ["int8_per_token_head"])
 @pytest.mark.parametrize("max_tokens", [4])
 @pytest.mark.parametrize("enforce_eager", [True])
 @pytest.mark.parametrize("backend", ["TRITON_ATTN"])

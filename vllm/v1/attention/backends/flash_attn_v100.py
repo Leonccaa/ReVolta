@@ -177,7 +177,7 @@ def _load_sm70_smallq_i32_ptr(ptrs, group_id):
     return tl.cast(ptr, tl.pointer_type(tl.int32))
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_reqs", "real_num_query_tokens"])
 def _sm70_prepare_grouped_smallq_decode_metadata_kernel(
     out_block_table_ptrs,
     out_seq_lens_ptrs,

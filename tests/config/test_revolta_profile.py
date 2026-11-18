@@ -622,7 +622,10 @@ def test_vllmconfig_profile_and_audit_receive_frontend_interconnect():
         and isinstance(node.func, ast.Name)
         and node.func.id in ("apply_revolta_profile", "profile_audit")
     ]
+    # The second profile call refines the graph reserve once the KV dtype
+    # is resolved.
     assert sorted(name for name, _ in calls) == [
+        "apply_revolta_profile",
         "apply_revolta_profile",
         "profile_audit",
     ]
@@ -655,7 +658,8 @@ TAIL_GRAPHS = "VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS"
         ("awq", None, "700"),
         ("awq", "mtp", "700"),
         ("awq", "dflash", "1200"),
-        ("modelopt_fp4", "dflash", "700"),
+        ("modelopt_fp4", "mtp", "700"),
+        ("modelopt_fp4", "dflash", "1200"),
     ],
 )
 def test_graph_reserve_follows_the_speculative_method(
@@ -667,6 +671,94 @@ def test_graph_reserve_follows_the_speculative_method(
     assert os.environ[GRAPH_RESERVE] == expected
     row = json.loads(profile.profile_audit(enabled=True))["values"][GRAPH_RESERVE]
     assert row == {"value": expected, "source": "profile"}
+
+
+@pytest.mark.parametrize(
+    ("quantization", "method", "kv", "expected"),
+    [
+        ("awq", "dflash", None, "1200"),
+        ("awq", "dflash", "auto", "1200"),
+        ("awq", "dflash", "fp8_e4m3", "1200"),
+        ("awq", "dflash", "fp8_per_token_head", "1000"),
+        ("awq", "dflash", "int8", "1000"),
+        ("awq", "mtp", "fp8_per_token_head", "600"),
+        ("awq", "mtp", "int8", "600"),
+        ("awq", "mtp", "fp8_e4m3", "700"),
+        ("awq", None, "fp8_per_token_head", "700"),
+        ("modelopt_fp4", "mtp", "fp8_per_token_head", "600"),
+        ("modelopt_fp4", "mtp", "auto", "700"),
+        ("modelopt_fp4", "dflash", "fp8_per_token_head", "1024"),
+        ("modelopt_fp4", "dflash", "int8", "1024"),
+        ("modelopt_fp4", "dflash", "fp8_e4m3", "1200"),
+    ],
+)
+def test_graph_reserve_follows_the_kv_dtype(
+    profile, quantization, method, kv, expected
+):
+    assert profile.apply_revolta_profile(
+        model(quantization),
+        4,
+        is_sm70=True,
+        speculative_method=method,
+        kv_cache_dtype=kv,
+    )
+    assert os.environ[GRAPH_RESERVE] == expected
+
+
+def test_resolved_kv_dtype_refines_the_reserve(profile):
+    # EngineArgs and the first VllmConfig call run before the KV dtype is
+    # resolved; the second VllmConfig call lowers only the profile value.
+    assert profile.apply_revolta_profile(
+        model(), 4, is_sm70=True, speculative_method="dflash"
+    )
+    assert os.environ[GRAPH_RESERVE] == "1200"
+    assert profile.apply_revolta_profile(
+        model(),
+        4,
+        is_sm70=True,
+        speculative_method="dflash",
+        kv_cache_dtype="fp8_per_token_head",
+    )
+    assert os.environ[GRAPH_RESERVE] == "1000"
+    assert os.environ[TAIL_GRAPHS] == "0"
+
+
+def test_explicit_reserve_wins_over_the_kv_tier(profile, monkeypatch):
+    monkeypatch.setenv(GRAPH_RESERVE, "1300")
+    assert profile.apply_revolta_profile(
+        model(),
+        4,
+        is_sm70=True,
+        speculative_method="dflash",
+        kv_cache_dtype="int8",
+    )
+    assert os.environ[GRAPH_RESERVE] == "1300"
+
+
+@pytest.mark.parametrize("override", [None, "620"])
+def test_mtp_dynamic_schedule_refines_the_planar_kv_reserve(
+    profile, monkeypatch, override
+):
+    if override is not None:
+        monkeypatch.setenv(GRAPH_RESERVE, override)
+    target = model()
+    assert profile.apply_revolta_profile(
+        target,
+        4,
+        is_sm70=True,
+        speculative_method="mtp",
+        kv_cache_dtype="fp8_per_token_head",
+    )
+    assert os.environ[GRAPH_RESERVE] == (override or "600")
+    assert profile.apply_revolta_profile(
+        target,
+        4,
+        is_sm70=True,
+        speculative_method="mtp",
+        kv_cache_dtype="fp8_per_token_head",
+        num_speculative_tokens_per_batch_size=[(1, 3, 4), (4, 8, 3)],
+    )
+    assert os.environ[GRAPH_RESERVE] == (override or "705")
 
 
 def test_dflash_leaves_every_other_default_alone(profile):
@@ -715,12 +807,11 @@ def test_explicit_graph_reserve_wins_over_dflash(profile, monkeypatch):
         ("awq", None, None),
         ("awq", "mtp", None),
         ("awq", "dflash", "0"),
-        ("modelopt_fp4", "dflash", None),
+        ("modelopt_fp4", "mtp", None),
+        ("modelopt_fp4", "dflash", "0"),
     ],
 )
-def test_tail_graphs_are_off_only_for_awq_dflash(
-    profile, quantization, method, expected
-):
+def test_tail_graphs_are_off_only_for_dflash(profile, quantization, method, expected):
     assert profile.apply_revolta_profile(
         model(quantization), 4, is_sm70=True, speculative_method=method
     )
@@ -752,12 +843,22 @@ def test_vllmconfig_profile_receives_the_speculative_method():
 
     assert config_module.__file__ is not None
     tree = ast.parse(Path(config_module.__file__).read_text())
-    (call,) = [
+    first, refine = [
         node
         for node in ast.walk(tree)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
         and node.func.id == "apply_revolta_profile"
     ]
-    value = next(k.value for k in call.keywords if k.arg == "speculative_method")
-    assert ast.unparse(value) == "getattr(self.speculative_config, 'method', None)"
+    for call in (first, refine):
+        value = next(k.value for k in call.keywords if k.arg == "speculative_method")
+        assert ast.unparse(value) == (
+            "getattr(self.speculative_config, 'method', None)"
+        )
+    refined = {k.arg: ast.unparse(k.value) for k in refine.keywords}
+    assert refined["kv_cache_dtype"] == "self.cache_config.cache_dtype"
+    schedule_field = "num_speculative_tokens_per_batch_size"
+    assert refined[schedule_field] == (
+        f"getattr(self.speculative_config, '{schedule_field}', None)"
+    )
+    assert "kv_cache_dtype" not in {k.arg for k in first.keywords}

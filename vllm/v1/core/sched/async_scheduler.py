@@ -12,9 +12,7 @@ logger = init_logger(__name__)
 class AsyncScheduler(Scheduler):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        # Template for speculative decoding placeholders. Each request must get
-        # its own list instance because scheduler outputs and worker feedback
-        # mutate spec-token rows in later phases.
+        # Slice once per step and give each request an independent list.
         self._spec_token_placeholders: tuple[int, ...] = (-1,) * self.num_spec_tokens
         self.pp_size = self.parallel_config.pipeline_parallel_size
         speculative_config = self.vllm_config.speculative_config
@@ -33,6 +31,8 @@ class AsyncScheduler(Scheduler):
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         super()._update_after_schedule(scheduler_output)
         spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
+        next_num_spec_tokens = scheduler_output.num_spec_tokens_to_schedule
+        spec_token_placeholders = self._spec_token_placeholders[:next_num_spec_tokens]
         for req_id in scheduler_output.num_scheduled_tokens:
             request = self.requests[req_id]
             if request.is_prefill_chunk:
@@ -48,10 +48,10 @@ class AsyncScheduler(Scheduler):
             # Add placeholders for the new draft/spec tokens.
             # We will update the actual spec token ids in the worker process.
             if (
-                request.num_computed_tokens + self.num_spec_tokens
+                request.num_computed_tokens + next_num_spec_tokens
                 <= self._drafter_max_model_len
             ):
-                request.spec_token_ids = list(self._spec_token_placeholders)
+                request.spec_token_ids = list(spec_token_placeholders)
             else:
                 request.spec_token_ids = []
 

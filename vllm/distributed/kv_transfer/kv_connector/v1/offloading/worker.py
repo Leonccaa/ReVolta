@@ -159,7 +159,8 @@ class OffloadingConnectorWorker:
                         layer_num_blocks.get(layer_name, num_blocks),
                         layer_kv_cache_spec.real_page_size_bytes,
                         planar=(
-                            layer_kv_cache_spec.kv_quant_mode == KVQuantMode.INT8_PLANAR
+                            layer_kv_cache_spec.kv_quant_mode
+                            in (KVQuantMode.INT8_PLANAR, KVQuantMode.FP8_E4M3_PLANAR)
                         ),
                         padded=layer_kv_cache_spec.page_size_padded is not None,
                     )

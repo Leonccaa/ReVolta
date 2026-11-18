@@ -24,8 +24,8 @@ from vllm.models.qwen4_exp.nvidia.ops.sm70_qsa_tuning import (
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
+from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD, INT8, resolve_kv_codec
 
-from .qsa_coalesce import QSACoalescedExchange
 from .qsa_request_segments import (
     qsa_mqa_request_segments_paged,
     request_segments_unsupported,
@@ -148,11 +148,11 @@ def _qsa_grouped_page4_supported(
     flash_attn_v100_cuda,
     kv_cache_dtype: str,
 ) -> bool:
-    if kv_cache_dtype == "int8":
+    if resolve_kv_codec(kv_cache_dtype) in (INT8, FP8_E4M3_PER_TOKEN_HEAD):
         capability = getattr(flash_attn_v100_cuda, "int8_page4_abi_version", None)
         return (
             callable(capability)
-            and capability() == 1
+            and capability() == 2
             and callable(
                 getattr(flash_attn_v100_cuda, "grouped_sparse_int8_page4_fwd", None)
             )
@@ -170,7 +170,7 @@ def _qsa_grouped_page4_supported(
     )
 
 
-@triton.jit(do_not_specialize=["num_requests"])
+@triton.jit(do_not_specialize=["num_requests", "num_rows", "num_columns"])
 def _qsa_mqa_paged_kernel(
     q_ptr,
     k_cache_ptr,
@@ -302,7 +302,7 @@ def _qsa_mqa_paged_kernel(
         )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["rows", "num_requests"])
 def _qsa_visible_blocks_kernel(
     token_to_req_ptr,
     query_positions_ptr,
@@ -341,7 +341,7 @@ def _qsa_visible_blocks_kernel(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["columns"])
 def _qsa_gather_single_request_keys_kernel(
     cache_ptr,
     page_table_ptr,
@@ -386,7 +386,7 @@ def _qsa_gather_single_request_keys_kernel(
     tl.store(valid_ptr + column, valid, mask=column < columns)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["width", "stride_score_row"])
 def _qsa_relu_headsum_visible_kernel(
     score_ptr,
     visible_ptr,
@@ -428,7 +428,7 @@ def _qsa_relu_headsum_visible_kernel(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["rows", "num_requests"])
 def _expand_qsa_indices_kernel(
     block_indices_ptr,
     query_positions_ptr,
@@ -652,7 +652,7 @@ def _qsa_resolve_physical_indices_kernel(
     )
 
 
-@triton.jit(do_not_specialize=["num_requests"])
+@triton.jit(do_not_specialize=["num_requests", "num_rows"])
 def _qsa_sparse_paged_gqa_splitk_kernel(
     q_ptr,
     k_cache_ptr,
@@ -866,7 +866,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_rows"])
 def _qsa_merge_splitk_kernel(
     partial_output_ptr,
     partial_lse_ptr,
@@ -1455,7 +1455,7 @@ def _shared_key_local_inputs(
     zero visible groups). Fixed shapes and no host sync.
     """
     if (
-        os.environ.get("REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED", "0") == "1"
+        envs.VLLM_SM70_QSA_LOCAL_INPUTS_FUSED
         and (query_positions.is_cuda or os.environ.get("TRITON_INTERPRET") == "1")
         and query_positions.is_contiguous()
         and sequence_lengths.is_contiguous()
@@ -1812,7 +1812,6 @@ def qsa_select_paged_tokens(
     seq_lens_cpu_upper_bound: torch.Tensor | None = None,
     index_dcp_world_size: int = 1,
     index_dcp_rank: int = 0,
-    coalesced_exchange: QSACoalescedExchange | None = None,
 ) -> torch.Tensor:
     """Score and select QSA indices, using a host bound when available.
 
@@ -1931,16 +1930,6 @@ def qsa_select_paged_tokens(
         if exact_topk
         else torch.empty((_TOPK_WORKSPACE_BYTES,), dtype=torch.uint8, device=q.device)
     )
-    # A split/scorer chunk must not exchange only a subset of the main Q.
-    # All these predicates use replicated shapes/config, never local data.
-    if not (
-        world == 2
-        and rows <= rows_per_chunk
-        and exact_topk
-        and envs.VLLM_QSA_INDEX_SHARD_FUSED_MERGE
-        and not envs.VLLM_QSA_INDEX_SHARD_DEBUG
-    ):
-        coalesced_exchange = None
     for row_start in range(0, rows, rows_per_chunk):
         row_end = min(row_start + rows_per_chunk, rows)
         row_slice = slice(row_start, row_end)
@@ -2019,11 +2008,6 @@ def qsa_select_paged_tokens(
             )
         if world > 1:
             # Local columns -> global groups, merged across the DCP group.
-            merge_kwargs: dict[str, Any] = (
-                {"coalesced_exchange": coalesced_exchange}
-                if coalesced_exchange is not None
-                else {}
-            )
             blocks = _merge_sharded_index_blocks(
                 blocks,
                 logits,
@@ -2032,7 +2016,6 @@ def qsa_select_paged_tokens(
                 index_dcp_rank,
                 block_topk,
                 row_keys=(token_to_req[row_slice], query_positions[row_slice]),
-                **merge_kwargs,
             )
         expand_qsa_block_indices_cuda(
             blocks,
@@ -2052,7 +2035,7 @@ _INDEX_SHARD_PAD_SCORE_BITS = -8388608  # 0xFF800000 as int32
 _index_shard_merge_calls = 0
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["stride_values_row"])
 def _index_shard_pack_or_map_kernel(
     indices_ptr,
     values_ptr,
@@ -2307,7 +2290,6 @@ def _merge_sharded_index_blocks(
     select: Callable[[torch.Tensor, torch.Tensor, torch.Tensor, int], None]
     | None = None,
     use_triton: bool | None = None,
-    coalesced_exchange: QSACoalescedExchange | None = None,
 ) -> torch.Tensor:
     """Merge rank-local top-k groups into the unsharded global selection.
 
@@ -2349,10 +2331,7 @@ def _merge_sharded_index_blocks(
         )
     if use_triton and envs.VLLM_QSA_INDEX_SHARD_DEBUG:
         _check_index_shard_local_order(blocks)
-    if coalesced_exchange is not None:
-        assert world == 2 and use_triton
-        gathered = coalesced_exchange.exchange(blocks, logits, rank)
-    elif use_triton:
+    if use_triton:
         packed = _pack_index_shard_candidates(blocks, logits, world, rank)
     else:
         valid = blocks >= 0
@@ -2369,14 +2348,13 @@ def _merge_sharded_index_blocks(
             valid, blocks * world + rank, torch.full_like(blocks, _INDEX_SHARD_PAD_ID)
         )
         packed = torch.cat((score_bits, groups), dim=1)
-    if coalesced_exchange is None:
-        if all_gather is None:
-            from vllm.distributed import get_tp_group
+    if all_gather is None:
+        from vllm.distributed import get_tp_group
 
-            all_gather = lambda t: get_tp_group().all_gather(t, dim=0)  # noqa: E731
-        if envs.VLLM_QSA_INDEX_SHARD_DEBUG:
-            _check_index_shard_plan(rows, block_topk, world, row_keys, all_gather)
-        gathered = all_gather(packed.unsqueeze(0))
+        all_gather = lambda t: get_tp_group().all_gather(t, dim=0)  # noqa: E731
+    if envs.VLLM_QSA_INDEX_SHARD_DEBUG:
+        _check_index_shard_plan(rows, block_topk, world, row_keys, all_gather)
+    gathered = all_gather(packed.unsqueeze(0))
     if gathered.shape != (world, rows, 2 * block_topk):
         # Catches a local world/wrapper mismatch only: all_gather sizes its
         # output from this rank's input. Cross-rank row layout is checked by
@@ -2403,7 +2381,14 @@ def _merge_sharded_index_blocks(
     if select is None:
         if not _use_sm70_qsa_lexicographic_topk(block_topk):
             raise RuntimeError("QSA indexer DCP sharding needs the exact SM70 top-k")
-        _sm70_qsa_lexicographic_topk_op()(sorted_scores, lengths, positions, block_topk)
+        if _SM70_QSA_MTP_TOPK and blocks.shape[0] in (5, 10):
+            torch.ops._C.qsa_lexicographic_topk(
+                sorted_scores, lengths, positions, block_topk, True
+            )
+        else:
+            _sm70_qsa_lexicographic_topk_op()(
+                sorted_scores, lengths, positions, block_topk
+            )
     else:
         select(sorted_scores, lengths, positions, block_topk)
     if use_triton:
@@ -2901,7 +2886,8 @@ def qsa_dcp_sparse_paged_attention_sm70_grouped_page4(
     multiple of eight, or 0 when the route does not apply. The caller runs the
     remaining rows through ``qsa_sparse_paged_attention``.
     """
-    if kv_cache_dtype == "int8":
+    codec = resolve_kv_codec(kv_cache_dtype)
+    if codec in (INT8, FP8_E4M3_PER_TOKEN_HEAD):
         from .qsa_int8 import dcp_grouped
 
         return dcp_grouped(
@@ -2915,6 +2901,7 @@ def qsa_dcp_sparse_paged_attention_sm70_grouped_page4(
             lse,
             k_scale_cache,
             v_scale_cache,
+            codec=codec,
         )
 
     heads = 6
@@ -3264,7 +3251,8 @@ def qsa_sparse_paged_attention(
     result. Apply output gating after the cross-rank merge, not per rank.
     """
 
-    if kv_cache_dtype == "int8":
+    codec = resolve_kv_codec(kv_cache_dtype)
+    if codec in (INT8, FP8_E4M3_PER_TOKEN_HEAD):
         from .qsa_int8 import sparse_attention
 
         return sparse_attention(
@@ -3281,6 +3269,7 @@ def qsa_sparse_paged_attention(
             k_scale_cache,
             v_scale_cache,
             lse,
+            codec=codec,
         )
 
     if not q.is_cuda or not HAS_TRITON:

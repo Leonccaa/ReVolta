@@ -881,7 +881,7 @@ def test_shard_merge_with_native_topk_matches_unsharded(
 ) -> None:
     # Local selection and the unsharded reference use the same op variant
     # (MTP-batch for 5/10 rows when VLLM_SM70_QSA_MTP_TOPK is on); the merge
-    # always reruns the standard exact op, as in qsa_select_paged_tokens.
+    # follows qsa_select_paged_tokens' existing MTP-batch gate.
     from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
 
     if not qsa_ops._use_sm70_qsa_lexicographic_topk(512):
@@ -956,6 +956,38 @@ def test_shard_merge_with_native_topk_matches_unsharded(
                 use_triton=use_triton,
             )
             assert torch.equal(merged, expected), (rank, use_triton)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs the SM70 top-k op")
+@pytest.mark.parametrize("rows", [5, 10])
+def test_shard_merge_decode_topk_equals_generic(rows: int) -> None:
+    """Both native selectors see the same TP4 merge scores and valid lengths."""
+    from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
+
+    if not qsa_ops._use_sm70_qsa_lexicographic_topk(512):
+        pytest.skip("exact SM70 top-k not selected on this device")
+    torch.manual_seed(462)
+    k, world, columns = 512, 4, 6001
+    scores = torch.randint(0, 8, (rows, columns), device="cuda").float()
+    visible = torch.tensor(
+        [6001, 0, 511, 512, 513, 2048, 2049, 3000, 5000, 6000][:rows],
+        dtype=torch.int32,
+        device="cuda",
+    )
+
+    def compare(s, lengths, out, kk):
+        generic = torch.empty_like(out)
+        torch.ops._C.qsa_lexicographic_topk(s, lengths, generic, kk)
+        torch.ops._C.qsa_lexicographic_topk(s, lengths, out, kk, True)
+        assert torch.equal(out, generic)
+
+    merged, _ = _merge_all_ranks(
+        scores, visible, world, k, select=compare, use_triton=True
+    )
+    expected = torch.empty(rows, k, dtype=torch.int32, device="cuda")
+    _reference_select(scores, visible, expected, k)
+    for result in merged:
+        assert torch.equal(result, expected)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA graph and SM70")
@@ -1402,20 +1434,6 @@ def test_paged_wrapper_sharded_shared_key_matches_global(
                 scores_l[row, :n].view(torch.int32),
                 scores_g[row, rank::world][:n].view(torch.int32),
             )
-
-
-@pytest.mark.parametrize(("tp", "fails"), [(2, False), (4, True)])
-def test_coalesce_needs_a_pair_sharded_index(tp: int, fails: bool) -> None:
-    from vllm.models.qwen4_exp.nvidia.ops.qsa_coalesce import (
-        require_dcp2_index_world,
-    )
-
-    config = _config(True, dcp=2, tp=tp)
-    if fails:
-        with pytest.raises(ValueError, match="split over 4 ranks"):
-            require_dcp2_index_world(config)
-    else:
-        require_dcp2_index_world(config)
 
 
 @pytest.mark.parametrize("max_seq", [4096, 6528, 8206, 12000, 16384, 100000])

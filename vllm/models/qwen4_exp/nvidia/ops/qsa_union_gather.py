@@ -36,7 +36,7 @@ computed by exactly one window with its full selection.
 
 Nothing in the model calls this module yet; the host-history integration integration
 wires it into
-``forward_qsa``. INT8 caches (per-token scale caches) are not supported.
+``forward_qsa``. Planar caches carry their token/head scale views in the arena.
 """
 
 from __future__ import annotations
@@ -44,10 +44,17 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import cast
 
 import torch
 
 from vllm.triton_utils import HAS_TRITON, tl, triton
+from vllm.v1.attention.kv_cache_view import (
+    KVCacheView,
+    KVPageLayout,
+    bind_planar_kv_cache,
+)
+from vllm.v1.attention.kv_codecs import KVCodec
 
 MICROBLOCK_TOKENS = 4
 # The grouped page4 planner deduplicates microblocks per group of eight rows.
@@ -69,6 +76,8 @@ class QSAArena:
     value: torch.Tensor
     staging_base: int
     staging_microblocks: int
+    key_scale: torch.Tensor | None = None
+    value_scale: torch.Tensor | None = None
 
     @property
     def num_microblocks(self) -> int:
@@ -83,6 +92,7 @@ def allocate_qsa_arena(
     head_dim: int,
     dtype: torch.dtype,
     device: torch.device | str,
+    codec: KVCodec | None = None,
 ) -> QSAArena:
     """Allocate a zero-filled arena with K/V interleaved per microblock.
 
@@ -93,6 +103,29 @@ def allocate_qsa_arena(
         raise ValueError("QSA arena regions must be non-negative")
     if hot_microblocks + staging_microblocks == 0:
         raise ValueError("QSA arena must hold at least one microblock")
+    if codec is not None and codec.layout == "planar_scales":
+        blocks = hot_microblocks + staging_microblocks
+        layout = KVPageLayout(MICROBLOCK_TOKENS, kv_heads, head_dim, head_dim)
+        raw = torch.zeros(blocks * layout.page_size_bytes, dtype=dtype, device=device)
+        carrier = bind_planar_kv_cache(
+            raw,
+            num_blocks=blocks,
+            scheduler_block_size=MICROBLOCK_TOKENS,
+            kernel_block_size=MICROBLOCK_TOKENS,
+            num_heads=kv_heads,
+            head_size=head_dim,
+            page_size_bytes=layout.page_size_bytes,
+            dtype=dtype,
+        )
+        view = KVCacheView.bind(carrier, codec, head_dim)
+        return QSAArena(
+            view.key,
+            view.value,
+            hot_microblocks,
+            staging_microblocks,
+            view.key_scale,
+            view.value_scale,
+        )
     storage = torch.zeros(
         (
             hot_microblocks + staging_microblocks,
@@ -363,6 +396,14 @@ if HAS_TRITON:
         UNITS_PER_MICROBLOCK: tl.constexpr,
         UNIT_NUMEL: tl.constexpr,
         BLOCK: tl.constexpr,
+        SourceKScale=None,
+        SourceVScale=None,
+        ArenaKScale=None,
+        ArenaVScale=None,
+        SOURCE_SCALE_BLOCK: tl.constexpr = 0,
+        ARENA_SCALE_BLOCK: tl.constexpr = 0,
+        UNIT_SCALES: tl.constexpr = 0,
+        SCALE_BLOCK: tl.constexpr = 1,
     ) -> None:
         # One program per list slot; slots past the device-side count exit, so
         # the launch shape is fixed and capture-safe. Plain vector loads also
@@ -397,6 +438,29 @@ if HAS_TRITON:
                     tl.load(source_value + offsets, mask=mask),
                     mask=mask,
                 )
+            if SourceKScale is not None:
+                offsets = tl.arange(0, SCALE_BLOCK)
+                source_scale = (
+                    page * SOURCE_SCALE_BLOCK
+                    + (source_unit % UNITS_PER_PAGE) * UNIT_SCALES
+                    + offsets
+                )
+                arena_scale = (
+                    microblock * ARENA_SCALE_BLOCK
+                    + (arena_unit % UNITS_PER_MICROBLOCK) * UNIT_SCALES
+                    + offsets
+                )
+                mask = offsets < UNIT_SCALES
+                tl.store(
+                    ArenaKScale + arena_scale,
+                    tl.load(SourceKScale + source_scale, mask=mask),
+                    mask=mask,
+                )
+                tl.store(
+                    ArenaVScale + arena_scale,
+                    tl.load(SourceVScale + source_scale, mask=mask),
+                    mask=mask,
+                )
 
 
 def qsa_union_gather_copy(
@@ -404,6 +468,9 @@ def qsa_union_gather_copy(
     source_value: torch.Tensor,
     arena: QSAArena,
     plan: QSAUnionGatherPlan,
+    *,
+    source_key_scale: torch.Tensor | None = None,
+    source_value_scale: torch.Tensor | None = None,
 ) -> None:
     """Copy the planned units from the source pages into the staging slots.
 
@@ -423,6 +490,18 @@ def qsa_union_gather_copy(
     if list_size == 0:
         return
     unit_numel = plan.unit_tokens * source_key.shape[2] * source_key.shape[3]
+    scale_kwargs = {}
+    if source_key_scale is not None:
+        scale_kwargs = dict(
+            SourceKScale=source_key_scale,
+            SourceVScale=source_value_scale,
+            ArenaKScale=arena.key_scale,
+            ArenaVScale=arena.value_scale,
+            SOURCE_SCALE_BLOCK=source_key_scale.stride(0),
+            ARENA_SCALE_BLOCK=cast(torch.Tensor, arena.key_scale).stride(0),
+            UNIT_SCALES=plan.unit_tokens * source_key.shape[2],
+            SCALE_BLOCK=triton.next_power_of_2(plan.unit_tokens * source_key.shape[2]),
+        )
     _qsa_union_gather_kernel[(list_size,)](
         source_key,
         source_value,
@@ -439,6 +518,7 @@ def qsa_union_gather_copy(
         UNITS_PER_MICROBLOCK=MICROBLOCK_TOKENS // plan.unit_tokens,
         UNIT_NUMEL=unit_numel,
         BLOCK=min(triton.next_power_of_2(unit_numel), 1024),
+        **scale_kwargs,
     )
 
 
@@ -447,6 +527,9 @@ def qsa_union_gather_copy_reference(
     source_value: torch.Tensor,
     arena: QSAArena,
     plan: QSAUnionGatherPlan,
+    *,
+    source_key_scale: torch.Tensor | None = None,
+    source_value_scale: torch.Tensor | None = None,
 ) -> None:
     """Torch reference of ``qsa_union_gather_copy`` (synchronizes the host)."""
     _check_views("source", source_key, source_value)
@@ -465,6 +548,13 @@ def qsa_union_gather_copy_reference(
     arena_tokens = (target % units_per_microblock * unit)[:, None] + offsets
     arena.key[microblocks, arena_tokens] = source_key[pages, tokens]
     arena.value[microblocks, arena_tokens] = source_value[pages, tokens]
+    if source_key_scale is not None:
+        cast(torch.Tensor, arena.key_scale)[microblocks, arena_tokens] = (
+            source_key_scale[pages, tokens]
+        )
+        cast(torch.Tensor, arena.value_scale)[microblocks, arena_tokens] = cast(
+            torch.Tensor, source_value_scale
+        )[pages, tokens]
 
 
 # --------------------------------------------------------------------------
@@ -559,9 +649,9 @@ def qsa_union_gather_attention(
     resident_microblocks: torch.Tensor | None = None,
     union_bound: int | None = None,
     max_windows: int | None = None,
-    copy: Callable[
-        [torch.Tensor, torch.Tensor, QSAArena, QSAUnionGatherPlan], None
-    ] = qsa_union_gather_copy,
+    source_key_scale: torch.Tensor | None = None,
+    source_value_scale: torch.Tensor | None = None,
+    copy: Callable[..., None] = qsa_union_gather_copy,
 ) -> QSAUnionGatherResult:
     """Run ``attention`` on arena copies of the selected source K/V.
 
@@ -584,6 +674,11 @@ def qsa_union_gather_attention(
     capacity = arena.staging_microblocks
     device = indices.device
     num_microblocks = num_source_blocks * page_size // MICROBLOCK_TOKENS
+    scale_kwargs = {}
+    if source_key_scale is not None:
+        scale_kwargs = dict(
+            source_key_scale=source_key_scale, source_value_scale=source_value_scale
+        )
 
     def make_plan(row_mask: torch.Tensor | None = None) -> QSAUnionGatherPlan:
         return plan_qsa_union_gather(
@@ -599,7 +694,7 @@ def qsa_union_gather_attention(
         )
 
     def run_single(plan: QSAUnionGatherPlan) -> QSAUnionGatherResult:
-        copy(source_key, source_value, arena, plan)
+        copy(source_key, source_value, arena, plan, **scale_kwargs)
         attention(arena.key, arena.value, plan.microblock_table, token_to_req, outputs)
         return QSAUnionGatherResult(
             1,
@@ -629,7 +724,7 @@ def qsa_union_gather_attention(
     def run_window(row_mask: torch.Tensor) -> None:
         nonlocal transfer_units, selected_tokens
         plan = make_plan(row_mask)
-        copy(source_key, source_value, arena, plan)
+        copy(source_key, source_value, arena, plan, **scale_kwargs)
         masked_requests = torch.where(row_mask, token_to_req, -1)
         attention(
             arena.key, arena.value, plan.microblock_table, masked_requests, temporaries

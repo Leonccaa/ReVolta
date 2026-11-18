@@ -7,6 +7,7 @@ import torch
 
 from vllm.models.qwen4_exp.nvidia.ops.qsa import qsa_sparse_paged_attention
 from vllm.models.qwen4_exp.nvidia.ops.qsa_dcp import qsa_localize_dcp_indices
+from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD
 
 pytestmark = [
     pytest.mark.skip_global_cleanup,
@@ -14,7 +15,7 @@ pytestmark = [
 ]
 
 
-@pytest.mark.parametrize("e4m3", [False, True])
+@pytest.mark.parametrize("e4m3", [False, True, "planar"])
 @pytest.mark.parametrize("width", [3, 2051])
 def test_dcp2_g12_attention_lse_matches_fp32_reference(e4m3, width):
     generator = torch.Generator().manual_seed(57431)
@@ -24,10 +25,21 @@ def test_dcp2_g12_attention_lse_matches_fp32_reference(e4m3, width):
     v = torch.randn((tokens, 1, dim), generator=generator).half()
     q = torch.randn((3, heads, dim), generator=generator).half().cuda()
     k_scale, v_scale = (0.125, 0.25) if e4m3 else (1.0, 1.0)
-    if e4m3:
+    scale_kwargs: dict[str, torch.Tensor] = {}
+    dtype = "fp8_e4m3" if e4m3 else "auto"
+    if e4m3 == "planar":
+        codec = FP8_E4M3_PER_TOKEN_HEAD
+        k, sk = codec.encode(k)
+        v, sv = codec.encode(v)
+        k_ref = codec.dequantize(k, sk, torch.float32).cuda()
+        v_ref = codec.dequantize(v, sv, torch.float32).cuda()
+        sk, sv = sk.cuda(), sv.cuda()
+        dtype = codec.name
+    elif e4m3:
         k = k.to(torch.float8_e4m3fn)
         v = v.to(torch.float8_e4m3fn)
-    k_ref, v_ref = k.float().cuda() * k_scale, v.float().cuda() * v_scale
+    if e4m3 != "planar":
+        k_ref, v_ref = k.float().cuda() * k_scale, v.float().cuda() * v_scale
     if e4m3:
         k, v = k.view(torch.uint8), v.view(torch.uint8)
     k, v = k.cuda(), v.cuda()
@@ -49,6 +61,13 @@ def test_dcp2_g12_attention_lse_matches_fp32_reference(e4m3, width):
         physical_k, physical_v = torch.empty_like(local_k), torch.empty_like(local_v)
         physical_k[table[0].long()] = local_k
         physical_v[table[0].long()] = local_v
+        if e4m3 == "planar":
+            scale_kwargs = {}
+            for name, source in (("k_scale_cache", sk), ("v_scale_cache", sv)):
+                local_scale = source[owned].reshape(-1, page, 1)
+                physical_scale = torch.empty_like(local_scale)
+                physical_scale[table[0].long()] = local_scale
+                scale_kwargs[name] = physical_scale
         qsa_localize_dcp_indices(
             indices,
             local_ids,
@@ -68,9 +87,10 @@ def test_dcp2_g12_attention_lse_matches_fp32_reference(e4m3, width):
             token_to_req,
             out=out,
             lse=lse,
-            kv_cache_dtype="fp8_e4m3" if e4m3 else "auto",
+            kv_cache_dtype=dtype,
             k_scale=k_scale,
             v_scale=v_scale,
+            **scale_kwargs,
         )
         assert torch.isfinite(out).all()
         assert torch.isneginf(lse[2]).all()
@@ -105,9 +125,17 @@ def test_dcp2_g12_attention_lse_matches_fp32_reference(e4m3, width):
         indices,
         full_table,
         token_to_req,
-        kv_cache_dtype="fp8_e4m3" if e4m3 else "auto",
+        kv_cache_dtype=dtype,
         k_scale=k_scale,
         v_scale=v_scale,
+        **(
+            {
+                "k_scale_cache": sk.reshape(-1, page, 1),
+                "v_scale_cache": sv.reshape(-1, page, 1),
+            }
+            if e4m3 == "planar"
+            else {}
+        ),
     )
     torch.testing.assert_close(baseline.float(), reference, rtol=3e-3, atol=2e-3)
     assert torch.equal(indices.cpu(), selection)

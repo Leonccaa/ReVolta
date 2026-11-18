@@ -17,6 +17,56 @@ from .test_mamba_sparse_retention import _mamba, _request
 pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
 
 
+def test_exact_end_gathers_use_finished_block_ids_and_accepted_offset(monkeypatch):
+    import torch
+
+    from vllm.v1.core.kv_cache_utils import MambaStateGather
+    from vllm.v1.worker.gpu import mamba_align
+
+    tensors = []
+    tensor = torch.tensor
+
+    def record_tensor(*args, **kwargs):
+        value = tensor(*args, **kwargs)
+        tensors.append(value)
+        return value
+
+    launches = []
+
+    class Kernel:
+        def __getitem__(self, grid):
+            return lambda *args, **kw: launches.append((grid, args, kw))
+
+    monkeypatch.setattr(torch, "tensor", record_tensor)
+    monkeypatch.setattr(mamba_align, "_precopy_mamba_align_kernel", Kernel())
+    ctx = SimpleNamespace(
+        num_states=4,
+        state_base_addrs=None,
+        state_block_strides=None,
+        state_elem_sizes=None,
+        state_inner_sizes=None,
+        state_conv_widths=None,
+        state_group_indices=None,
+    )
+    mamba_align.run_state_gathers(
+        ctx,
+        [MambaStateGather(2, [31, 47]), MambaStateGather(1, [53, 61])],
+        torch.device("cpu"),
+    )
+    assert tensors[0].tolist() == [[31, 31], [53, 53]]
+    assert tensors[1].tolist() == [[47, 47], [61, 61]]
+    grid, args, kw = launches[0]
+    assert grid == (2, 4, mamba_align._TEMPORAL_TILES)
+    assert args[0].tolist() == [0, 0]
+    assert args[1].tolist() == [1, 1]
+    assert args[2].tolist() == [2, 1]
+    assert args[3].tolist() == [tensors[0].data_ptr(), tensors[1].data_ptr()]
+    assert args[4] == 2
+    assert args[11].tolist() == [0, 1]
+    assert args[12].tolist() == [0, 1, 2]
+    assert kw["SPEC_STATE_REPLAY"]
+
+
 @pytest.mark.parametrize("budget,threshold", [(512, 0), (2048, 512)])
 def test_align_config_accepts_short_chunks(budget, threshold):
     config = SimpleNamespace(
@@ -165,7 +215,7 @@ def test_small_chunks_preserve_hybrid_resend_window(length, eagle):
             not block.is_null for block in swa.req_to_blocks[request.request_id]
         )
         assert real_blocks <= specs[2].max_admission_blocks_per_request(512, 262144)
-    cache.coordinator.free(request.request_id)
+    cache.coordinator.free(request)
     _, hit = cache.get_computed_blocks(request)
     expected = (length // 8192 - 1) * 8192 if eagle else (length - 1) // 8192 * 8192
     assert hit == max(expected, 0)

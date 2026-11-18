@@ -141,6 +141,7 @@ def build_host_history_store(
         kv_heads=spec.num_kv_heads,
         head_dim=spec.head_size,
         dtype=spec.dtype,
+        layout_cache_dtype=spec.layout_cache_dtype("auto"),
         hot_slots=(
             kv_cache_config.num_blocks * plan.hot_slots_per_block
             if plan.hot_slots_per_block

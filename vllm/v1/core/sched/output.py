@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from vllm.multimodal.inputs import MultiModalFeatureSpec
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
+    from vllm.v1.core.kv_cache_utils import MambaStateGather
     from vllm.v1.kv_offload.host.page_table import HostKVStep
     from vllm.v1.request import Request
     from vllm.v1.spec_decode.ddtree_payload import DDTreeDraftPayload
@@ -29,6 +30,7 @@ else:
     DDTreeDraftPayload = object
     Request = object
     HostKVStep = object
+    MambaStateGather = object
 
 
 @dataclass
@@ -258,8 +260,15 @@ class SchedulerOutput:
     # {request_id: [(group_id, block_id, boundary_tokens), ...]}.
     # Scheduler-local; cleared after connector metadata is built.
     boundary_state_offloads: dict[str, list[tuple[int, int, int]]] | None = None
+    mamba_state_gathers: list[MambaStateGather] | None = None
 
     host_kv: "HostKVStep | None" = None
+
+    # Proposal width for the next step, independent of this step's verification.
+    num_spec_tokens_to_schedule: int = 0
+
+    # Whether no scheduled request can use the drafts proposed after this step.
+    skip_drafts: bool = False
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

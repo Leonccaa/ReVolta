@@ -17,13 +17,38 @@ values override the profile.
 ## Interconnect
 
 The engine selects the interconnect automatically and logs `SM70 interconnect=<mode>`.
-P2P uses custom all-reduce for messages up to 80 KiB inside CUDA graphs; other
-collectives use NCCL. On an SM70 TP4 group (under one PCIe switch, or on NVLink) the MoE
+PCIe switch P2P uses custom all-reduce inside CUDA graphs for messages up to 80 KiB
+and for FP16 payloads of 100, 120, 125, 150, 160, 175 and 200 KiB. On an SM70 TP4 group
+(under one PCIe switch, or on NVLink) the MoE
 output sum (sum2) uses its own push kernel at the sizes that have one and otherwise adds
 locally before the ordinary all-reduce. Override with `VLLM_SM70_INTERCONNECT=auto|pex|nccl|nvlink`
 or disable custom all-reduce with `--disable-custom-all-reduce`.
 
 ## Launch options
+
+`--kv-cache-dtype` selects the storage format:
+
+| Value | Storage format / QSA auto selection |
+| --- | --- |
+| `fp8` / `fp8_e4m3` | Existing E4M3 with calibrated per-layer K/V scalar scales |
+| `fp8_per_token_head` | L1 planar E4M3FN with dynamic FP32 scales per token and head; no KV scale overlay needed |
+| `auto` (CLI default) | Planar E4M3 for eligible QSA requests, with or without checkpoint KV scales and speculation |
+| `int8` / `int8_per_token_head` | Existing planar RNE INT8 / inline truncating INT8, unchanged |
+| `float16` / `bfloat16` | Explicit model-precision storage, subject to existing hardware and backend support |
+
+QSA auto selection requires the existing `qsa_auto_e4m3` policy, QSA selector
+metadata, a supported operator dtype/device, no runtime scale calculation and
+prefill context parallelism of one. Otherwise the existing auto/model-dtype
+rules apply. Explicit values take precedence and retain their backend admission
+requirements. MTP inherits the target format
+unless specified; a planar target with an explicit scalar MTP draft remains
+unsupported. On SM70, DFlash/DFlash2 still defaults to an FP16 draft.
+
+`fp8_per_token_head` uses four page regions `[K | V | sK | sV]`, not upstream
+vLLM's inline FP8 page ABI. The old `fp8_e4m3_per_token_head` name is removed
+without an alias. Ordinary Triton attention does not accept the planar format;
+QSA uses its own backend. The explicit scalar recipes and their historical
+measurements remain unchanged; planar GPU acceptance is still pending.
 
 - **`--enable-dashboard` (boolean, default `false`, experimental).** Enable the
   Python API server's built-in aggregate metrics page at `/dashboard/`. All rate
@@ -38,6 +63,9 @@ or disable custom all-reduce with `--disable-custom-all-reduce`.
   to eight concurrent requests, at temperature 1 with thinking, including tool calls and
   structured output. `greedy` still works with DFlash2. This setting is about drafting and
   draft verification only; clients can still use any sampling parameters.
+- **`num_speculative_tokens_per_batch_size` (optional MRv2 MTP schedule).**
+  Chooses the number of drafts per request from the scheduled batch size.
+  See [Dynamic Speculative Decoding](dynamic-speculative-decoding.md).
 - **`--watchdog-config` (opt-in stack-dump watchdog, from 0.1.4, #33).** JSON with three
   fields: `dump_dir` (directory for the dump files; the empty default disables the
   watchdog), `timeout` (seconds without progress after which the process counts as stuck,
@@ -95,6 +123,20 @@ or disable custom all-reduce with `--disable-custom-all-reduce`.
   Without persistent cache storage, a recreated container compiles them again.
 - Media limits and request budgets: see
   [multimodal input limits](../.github/MULTIMODAL_INPUTS.md).
+
+## Optional MTP draft vocabulary in model runner V2
+
+Enable a static shortlist with `VLLM_SM70_MTP_STATIC_DRAFT_VOCAB_RANKING=<ranking.pt>` and `VLLM_SM70_MTP_STATIC_DRAFT_VOCAB_SIZE=65536`. The ranking artifact must match the model vocabulary and TP size. Static drafting maps both greedy and probabilistic proposals back to full vocabulary token IDs.
+
+Set `VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_TAIL_SIZE=512` to add a global LRU tail shared by all concurrent requests in that worker group. The default is `0` (disabled); supported capacities are 1–2048, with 512 or 1024 recommended as starting points. Each step updates the tail from actual accepted/recovered/bonus output tokens in request-row order. Seeds are the first T entries from ranking position B after skipping base tokens and all model padding IDs; fewer than T eligible seeds is a startup error. Output padding IDs are ignored during tail updates. There is no per-request tail, target top-k bootstrap, adaptive capacity or periodic full-head refresh.
+
+The tail requires `method="mtp"`, an enabled static shortlist, an FP16 LM-head, no logits soft cap, scale 1, at least T eligible non-padding seeds after ranking position B, and a model padding token outside the static base for SINK. SINK is the first such padding ID and never enters the tail. Unsupported configurations raise `ValueError` at startup. `VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_GPU_LRU`, `VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_FUSED_PROPOSAL`, `VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_FULL_REFRESH_INTERVAL` and `VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_PREFILL_TOPK` are V1-only; setting any of them in V2 is an error, including setting it to zero.
+
+Greedy drafting uses local base top1 plus tail logits; with local argmax reduction disabled it uses concatenated logits and argmax. Probabilistic drafting samples the concatenation and maps the processed proposal logits to the full vocabulary for verification. Pending probabilistic proposal distributions remain unchanged until their requests are verified, even when other requests change the shared tail. The tail implementation supports both draft sampling methods; the deployment sampling guidance above and the existing hardware/model support scope still apply. CPU interpreter tests do not establish GPU, CUDA graph or production acceptance.
+
+Each rank reserves T physical FP16 weight rows, even though the global effective tail capacity is T across all ranks. Tail weights cost `2*T*H` bytes per rank: with H=2560, 512 costs 2.5 MiB and 1024 costs 5 MiB. State, token maps and sampling buffers add memory; probabilistic processed logits use `4*max_num_seqs*K*(B+TP*T)` bytes in addition to the existing full-vocabulary verification buffer. Measure acceptance length, round time and throughput on the intended workload before choosing a capacity.
+
+Before requests, confirm the existing `Enabled static MTP draft vocabulary` message and one `Enabled global MTP draft vocabulary tail: base=%d tail=%d tp=%d sink=%d draft_sample=%s` message on each TP rank, with the configured tail size. For TP4 all four ranks must report the configured value. This confirms activation; output correctness and performance require separate GPU acceptance.
 
 ## Optional native DFlash2 lookup
 
@@ -212,31 +254,27 @@ type and default as registered in `vllm/envs.py`; *Since* is the first
 release with the variable (1Cat = inherited from 1Cat-vLLM); *Category*
 is configuration, tuning, experimental, debug or deprecated.
 
-### Pregraph preparation research switches
+### Promoted research switches
 
 | Name | Type | Default | Range | Category | Since | Effect and trade-off |
 |---|---|---|---|---|---|---|
-| `REVOLTA_RESEARCH_PREGRAPH_GDN_COMMON_CACHE` | bool | `False` | 0, 1 | experimental | unreleased research | Deployment scope, default off. MRV2 FULL replay only: retain one pure-speculative batch's common GDN metadata, guarded by all CPU geometry values and the live GPU offset buffer layout. Removes repeated host construction, mask H2D and token-index arange on a hit. Mixed and capture batches use the original builder. Accepted counts, state IDs and request mapping are never cached. GPU bitwise and throughput validation pending. Set 0 and restart to restore the original builder. Metrics: no dedicated counter; compare decode throughput and preparation traces. |
-| `REVOLTA_RESEARCH_PREGRAPH_REPLAY_VIEWS` | bool | `False` | 0, 1 | experimental | unreleased research | Deployment scope, default off. MRV2 FULL replay only: share read-only state-ID and query-offset tensor views within each metadata group for one step. No cross-step reuse or change to kernels, storage, accepted counts or fences. GPU bitwise and throughput validation pending. Set 0 and restart to restore per-layer view construction. Metrics: no dedicated counter; compare decode throughput and preparation traces. |
-
-### Promoted research switches (0.2.0rc5)
-
-| Name | Type | Default | Range | Category | Since | Effect and trade-off |
-|---|---|---|---|---|---|---|
-| `REVOLTA_GDN_CPU_SPEC_QSL` | bool | `False` | 0, 1 | deprecated | 0.2.0 | Deprecated alias of VLLM_SM70_GDN_CPU_SPEC_QSL; removed in 0.2.0rc6. The new name wins when both are set. |
-| `REVOLTA_GDN_CPU_SPEC_QSL_CHECK_FILE` | str | `''` | path | deprecated | 0.2.0 | Deprecated alias of VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE; removed in 0.2.0rc6. |
 | `REVOLTA_QSA_GROUPED_LPT` | bool | `False` | 0, 1 | deprecated | 0.2.0 | Deprecated alias of VLLM_SM70_QSA_GROUPED_LPT; removed in 0.2.0rc6. |
+| `REVOLTA_RESEARCH_CHECKPOINT_CACHE_DROP` | bool | `False` | 0, 1 | deprecated | 0.2.0 | Deprecated alias of VLLM_SM70_CHECKPOINT_CACHE_DROP; removed in 0.2.0rc13. The new name wins when both are set. |
+| `REVOLTA_RESEARCH_HOST_DECODE_FAST` | bool | `False` | 0, 1 | deprecated | 0.2.0 | Deprecated alias of VLLM_SM70_HOST_DECODE_FAST; removed in 0.2.0rc13. The new name wins when both are set. |
+| `REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED` | bool | `False` | 0, 1 | deprecated | 0.2.0 | Deprecated alias of VLLM_SM70_QSA_LOCAL_INPUTS_FUSED; removed in 0.2.0rc13. The new name wins when both are set. |
 | `REVOLTA_SKINNY_MPLAN` | bool | `False` | 0, 1 | deprecated | 0.2.0 | Deprecated alias of VLLM_SM70_GDN_SKINNY_MPLAN; removed in 0.2.0rc6. |
+| `VLLM_SM70_CHECKPOINT_CACHE_DROP` | bool | `True` | 0, 1 | configuration | 0.2.0 | Default on; engine startup only. 1 requests clean checkpoint cache eviction before host KV allocation, after a world load barrier. Skips live mappings and PLE disk/cascade modes. May slow later reloads or other engines reading the same checkpoint. See startup logs for advised files/bytes and cgroup usage; no metric. |
 | `VLLM_SM70_GDN_CPU_SPEC_QSL` | bool | `False` | 0, 1 | tuning | 0.2.0 | Removes two host synchronizations per step in mixed prefill + speculative batches; costs a host-side offset computation. Outputs are bitwise identical either way. |
 | `VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE` | str | `''` | path | debug | 0.2.0 | Validation only: adds the synchronizations back while the file exists. Never set for timing runs. |
 | `VLLM_SM70_GDN_SKINNY_MPLAN` | bool | `False` | 0, 1 | tuning | 0.2.0 | ng=2 tiling is 8-26% faster at M = 9..24 and 33..48 on V100; other M keep the fixed plan. Only with VLLM_SM70_QWEN38_GDN_NO_PACK. Outputs are bitwise identical either way. |
+| `VLLM_SM70_HOST_DECODE_FAST` | bool | `True` | 0, 1 | tuning | 0.2.0 | Default on. Long-context host KV decode only: fuses three pairs of host-history decode kernels. Set 0 and restart to restore the original kernels; ordinary GPU KV paths are unaffected. |
 | `VLLM_SM70_QSA_GROUPED_LPT` | bool | `False` | 0, 1 | tuning | 0.2.0 | Longest grouped page4 CTAs start first, which shortens the tail of uneven decode batches. Outputs are bitwise identical either way. |
+| `VLLM_SM70_QSA_LOCAL_INPUTS_FUSED` | bool | `True` | 0, 1 | tuning | 0.2.0 | Default on. DCP-sharded shared-key scorer: one fused integer metadata conversion instead of the torch reference. Set 0 and restart to restore the torch reference. |
 
 ### Settings used by the reference deployment
 
 | Name | Type | Default | Range | Category | Since | Effect and trade-off |
 |---|---|---|---|---|---|---|
-| `REVOLTA_RESEARCH_CHECKPOINT_CACHE_DROP` | bool | `False` | 0, 1 | experimental | 0.2.0 | Research, engine startup only; default off. 1 requests clean checkpoint cache eviction before host KV allocation, after a world load barrier. Skips live mappings and PLE disk/cascade modes. May slow later reloads or other engines reading the same checkpoint. See startup logs for advised files/bytes and cgroup usage; no metric. |
 | `VLLM_PLE_OFFLOAD_READY_TIMEOUT` | float | `600.0` | seconds | configuration | 1Cat | How long startup waits for the PLE offload worker. Raise it on slow storage; the reference deployment uses 1200. |
 | `VLLM_QWEN4EXP_PLE_HOST_GIB` | float \| None | `None` | GiB per TP rank; unset = automatic | configuration | 1Cat | Caps pinned host memory for the PLE table. Lower values leave host RAM for CPU KV offload but move more PLE rows to disk; the reference deployment uses 12. |
 | `VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB` | float \| None | `None` | non-negative GiB or unset | configuration | 1Cat | Unset reserves min(host limit / 4, 8 GiB), preserving the small-host margin without scaling it to tens of GiB. Explicit values override the cap. The warning-only preflight counts shared CPU KV storage separately; automatic placement also uses this reserve. |
@@ -266,7 +304,7 @@ The ReVolta profile (`vllm/revolta_profile.py`) sets these on SM70 + TP4 + FP16 
 | `VLLM_SM70_AWQ_QWEN38_QPN_M1` | bool | `True` | `1` (AWQ) | 0, 1 | configuration | 1Cat | Single-token W13/W2 QPN route; 0 restores the legacy route. Changes reduction order. |
 | `VLLM_SM70_AWQ_TUNE_SMALL_SHAPES` | bool | `False` | `1` (AWQ) | 0, 1 | configuration | 1Cat | Tunes TurboMind small-M AWQ shapes at startup: longer warmup, faster small batches. |
 | `VLLM_SM70_CAR_VMM_SAFE` | bool | `False` | `1` (P2P/NVLink) | 0, 1 | experimental | 0.2.0 | Copies non-exportable (VMM) inputs into graph allocations while capturing custom all-reduce graphs, so expandable segments can stay on. Only with P2P or NVLink. |
-| `VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS` | bool | `True` | `0` (AWQ+DFlash2) | 0, 1 | configuration | 1Cat | Single-request DFlash2 verifier tail graphs. The AWQ DFlash profile sets 0 to keep the graph memory for the KV cache. |
+| `VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS` | bool | `True` | `0` (DFlash2) | 0, 1 | configuration | 1Cat | Single-request DFlash2 verifier tail graphs. The DFlash2 profile sets 0 to keep the graph memory for the KV cache. |
 | `VLLM_SM70_GREEDY_VERIFY` | bool | `False` | `1` | 0, 1 | experimental | 0.2.0 | Greedy MTP verification from TP-local argmax pairs instead of full-vocabulary logits; only when every request is plain greedy. |
 | `VLLM_SM70_NVFP4_MOE_GROUPED_DECODE` | bool | `False` | `0` (NVFP4) | 0, 1 | experimental | 1Cat | Grouped native-NVFP4 decode; the profile keeps it off pending quality admission. |
 | `VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL` | bool | `True` | `1` (NVFP4) | 0, 1 | configuration | 1Cat | One grouped TurboMind call for all routed experts in prefill. |
@@ -286,7 +324,7 @@ The ReVolta profile (`vllm/revolta_profile.py`) sets these on SM70 + TP4 + FP16 
 | `VLLM_SM70_QWEN38_WIDE_M` | bool | `False` | `1` | 0, 1 | experimental | 0.2.0 | Widens Qwen3.8 decode/verify routes from 4 to 8 requests (M up to 40); each VLLM_SM70_QWEN38_WIDE_M_* item can override it. |
 | `VLLM_SM70_SKIP_REJECTED_BATCH_PACKS` | bool | `False` | `1` | 0, 1 | experimental | 0.2.0 | Skips batch packs the precision policy never admits; saves about 199 MiB per rank. |
 | `VLLM_USE_AOT_COMPILE` | bool | `False` | `0` | 0, 1 | configuration | 1Cat | AOT compile reuse. The profile sets 0 on the reference deployment. |
-| `VLLM_V2_CUDAGRAPH_MEM_MIB` | float | `0.0` | `700` (AWQ), `1200` (AWQ+DFlash2), `700` (NVFP4) | MiB | configuration | 1Cat | CUDA graph memory reserved before sizing the KV cache (MRv2 does not profile it). Too low risks OOM at capture; too high wastes KV. Profile: 700 (AWQ, NVFP4), 1200 (AWQ + DFlash2). |
+| `VLLM_V2_CUDAGRAPH_MEM_MIB` | float | `0.0` | `700` (AWQ), `700` (NVFP4), `1200` (DFlash2), `1000` (AWQ+DFlash2, planar KV), `1024` (NVFP4+DFlash2, planar KV), `600` (fixed MTP, planar KV), `705` (dynamic MTP, planar KV) | MiB | configuration | 1Cat | CUDA graph memory reserved before sizing the KV cache (MRv2 does not profile it). Too low risks OOM at capture; too high wastes KV. Profile: 700 (AWQ, NVFP4), 1200 (DFlash2); with fp8_per_token_head or int8 KV, 600 (fixed MTP), 705 (dynamic MTP), 1000 (AWQ + DFlash2) and 1024 (NVFP4 + DFlash2). |
 
 ### Anonymous usage statistics
 
@@ -295,7 +333,7 @@ The ReVolta profile (`vllm/revolta_profile.py`) sets these on SM70 + TP4 + FP16 
 | `VLLM_DO_NOT_TRACK` | bool | `False` | 0, 1 | configuration | 1Cat | Honours the cross-project Do Not Track convention (DO_NOT_TRACK counts too): 1 turns the usage report off. |
 | `VLLM_NO_USAGE_STATS` | bool | `False` | 0, 1 | configuration | 1Cat | Upstream opt-out, honoured as-is: 1 turns the usage report off. The Do Not Track variables and the do_not_track file have the same effect. |
 | `VLLM_USAGE_SOURCE` | str | `'production'` | short label | configuration | 1Cat | Deployment label reported with the anonymous report (production by default). A value that looks like a path or a URL is reported as custom instead. |
-| `VLLM_USAGE_STATS_SERVER` | str | `'https://ai.19b.net/api/usage'` | URL, empty to disable sending | configuration | 1Cat | Where the report goes. ReVolta defaults to its own collector; an empty string keeps the local log file but sends nothing. |
+| `VLLM_USAGE_STATS_SERVER` | str | `'https://usage.19b.net/api/'` | URL, empty to disable sending | configuration | 1Cat | Where the report goes. ReVolta defaults to its own collector; an empty string keeps the local log file but sends nothing. |
 
 ### DFlash2 and DFlash draft settings
 
@@ -406,10 +444,6 @@ latest-only policy. It does not change compilation or persisted page identity.
 See [checkpoint retention](kv-offload.md#checkpoint-retention-evidence) for
 migration rules, limits and counters.
 
-## Host decode experiments
+## Host decode fast path
 
-`REVOLTA_RESEARCH_HOST_DECODE_FAST=1` fuses three pairs of host-history decode kernels. `REVOLTA_RESEARCH_HOST_DECODE_FAST_ORDERED=1` (requires the parent switch) additionally keeps the fused mark kernel's tail claims ordered before selection claims, so refill pairing and cache evolution match the unfused baseline; it costs no extra kernel launches and no phase parallelism (ordering comes from per-phase mark bits and a second wanted list, not from scheduling), at the price of one extra int32-per-hot-slot scratch tensor allocated unconditionally. `REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED=1` fuses integer metadata conversion in the DCP-sharded shared-key scorer. All are experimental and default to `0`; GPU correctness and matched performance validation are required before deployment. Set either to `0` and restart to restore its original path. The switches act inside opaque QSA operators and do not change the torch compilation key or SSD cache identity.
-
-## QSA decode exchange experiment
-
-`REVOLTA_RESEARCH_QSA_DECODE_COALESCE_AG` is an experimental boolean (`0` by default; `1` enables), introduced as a research candidate. It combines index candidates and main query into one AllGather for host QSA DCP2 uniform decode with fixed padded FULL-graph rows and the exact fused index merge. Prefill, mixed batches, split scoring, debug merges and unsupported geometry retain both original exchanges. Set it identically on every worker before model initialization; changing it requires a restart and graph recapture. One model-level fixed workspace is shared by serial QSA layers: for maximum captured rows R, local heads H, head dimension D and compressed top-k K it uses `12*R*(2*K+H*D/2) + 4*R*H*D` bytes. Historical index and host KV layouts are unchanged. GPU bitwise correctness, collective liveness, capacity and unprofiled decode throughput remain validation requirements; no performance claim is made.
+`VLLM_SM70_HOST_DECODE_FAST` (default `1`) fuses three pairs of host-history decode kernels on the long-context host KV / DCP-sharded decode path; set `0` and restart to restore the original kernels. `VLLM_SM70_QSA_LOCAL_INPUTS_FUSED` (default `1`) fuses integer metadata conversion in the DCP-sharded shared-key scorer; set `0` to use the torch reference. Both switches were promoted from their research names in 0.2.0rc12; the former `REVOLTA_RESEARCH_HOST_DECODE_FAST` and `REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED` names are honoured as deprecated aliases until 0.2.0rc13, with the new name winning when both are set. Ordinary GPU KV paths are unaffected. The switches act inside opaque QSA operators and do not change the torch compilation key or SSD cache identity.

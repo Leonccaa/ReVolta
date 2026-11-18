@@ -17,7 +17,6 @@ from vllm.compilation.sm70_decode_graph import sm70_decode_graph_compilation
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.config.speculative import (
-    dflash_drafts_for_requests,
     get_dflash_model_draft_tokens,
     uses_adaptive_dflash_lookup,
 )
@@ -33,6 +32,10 @@ from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.spec_decode.dynamic.utils import (
+    DynamicSDSchedule,
+    build_dynamic_sd_schedule_lookup,
+)
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
@@ -82,10 +85,10 @@ def warn_if_graphs_outgrew_reserve(actual_bytes: int, reserve_bytes: int) -> int
     V2 reserves graph memory before capture. Whatever the graphs take beyond it
     comes out of the runtime headroom, so a large mixed batch can then run out
     of memory. Returns the suggested VLLM_V2_CUDAGRAPH_MEM_MIB, or 0 when the
-    reserve covered the graphs within max(64 MiB, 5%).
+    reserve covered the graphs within 5%.
     """
     excess = actual_bytes - reserve_bytes
-    if excess <= max(64 << 20, reserve_bytes // 20):
+    if excess <= reserve_bytes // 20:
         return 0
     suggested_mib = math.ceil(actual_bytes * 1.05 / (100 << 20)) * 100
     logger.warning(
@@ -272,24 +275,24 @@ class CudaGraphManager:
                 "Capturing SM70 DFlash2 target tail query lengths %s.",
                 self.decode_query_lens,
             )
-        # DFlash concurrency widths (dflash_concurrency_drafts): the target
-        # verifies a narrower uniform batch for some request counts, so capture
-        # those multi-request decode shapes, and only for the counts that use
-        # them (the same resolver the speculator applies at run time). The
-        # drafter keeps its block.
+        # Only the target captures narrower DFlash widths, at the batch sizes
+        # that the scheduler selects for each width.
         self._dflash_width_reqs: dict[int, frozenset[int]] = {}
-        policy = (
-            getattr(speculative_config, "dflash_concurrency_drafts", None)
+        dflash_schedule = (
+            speculative_config.num_speculative_tokens_per_batch_size
             if speculative_config is not None
             and speculative_config.method == "dflash"
             and isinstance(self, ModelCudaGraphManager)
             else None
         )
-        if policy:
+        if dflash_schedule is not None:
+            lookup = build_dynamic_sd_schedule_lookup(
+                dflash_schedule, self.max_num_reqs, decode_query_len - 1
+            )
             width_reqs: dict[int, set[int]] = defaultdict(set)
-            for num_reqs in range(2, self.max_num_reqs + 1):
-                query_len = dflash_drafts_for_requests(speculative_config, num_reqs) + 1
-                if 1 < query_len < decode_query_len:
+            for num_reqs, k in enumerate(lookup[1:], start=1):
+                query_len = k + 1
+                if query_len < decode_query_len:
                     width_reqs[query_len].add(num_reqs)
             self._dflash_width_reqs = {q: frozenset(r) for q, r in width_reqs.items()}
         if self._dflash_width_reqs:
@@ -364,6 +367,22 @@ class CudaGraphManager:
                         self._capture_sizes.append(size)
             self._capture_sizes.sort()
         self._init_candidates()
+        schedule = (
+            speculative_config.num_speculative_tokens_per_batch_size
+            if speculative_config is not None and speculative_config.method == "mtp"
+            else None
+        )
+        if (
+            schedule is not None
+            and decode_query_len > 1
+            and cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+        ):
+            self._add_dynamic_sd_candidates(schedule)
+
+    @property
+    def max_captured_tokens(self) -> int:
+        """Largest batch size ``dispatch`` can route to a captured graph."""
+        return len(self._candidates) - 1
 
     def _init_candidates(self) -> None:
         """Build priority-ordered candidate lists for each token count."""
@@ -445,6 +464,40 @@ class CudaGraphManager:
         for mode, descs in descs_by_mode.items():
             descs.sort(key=lambda d: d.num_tokens, reverse=True)
             self._capture_descs[mode] = descs
+
+    def _add_dynamic_sd_candidates(self, schedule: DynamicSDSchedule) -> None:
+        lookup = build_dynamic_sd_schedule_lookup(
+            schedule, self.max_num_reqs, self.decode_query_len - 1
+        )
+        query_lens = sorted(
+            {k + 1 for k in lookup[1:] if k + 1 < self.decode_query_len}
+        )
+        range_starts = dict.fromkeys(query_lens, 1)
+        full_descs = self._capture_descs.get(CUDAGraphMode.FULL, [])
+        narrow_descs = []
+        for wide_size in sorted(self._capture_sizes):
+            num_reqs, remainder = divmod(wide_size, self.decode_query_len)
+            if remainder or not 1 <= num_reqs <= self.max_num_reqs:
+                continue
+            for query_len in query_lens:
+                num_tokens = num_reqs * query_len
+                desc = BatchExecutionDescriptor(
+                    cg_mode=CUDAGraphMode.FULL,
+                    num_tokens=num_tokens,
+                    num_reqs=num_reqs,
+                    uniform_token_count=query_len,
+                )
+                narrow_descs.append(desc)
+                # Each width covers up to its next capture size. Replace entries
+                # since neighboring token counts can share the original list.
+                for size in range(range_starts[query_len], num_tokens + 1):
+                    self._candidates[size] = [desc, *self._candidates[size]]
+                range_starts[query_len] = num_tokens + 1
+
+        if narrow_descs:
+            self._capture_descs[CUDAGraphMode.FULL] = sorted(
+                [*full_descs, *narrow_descs], key=lambda d: d.num_tokens, reverse=True
+            )
 
     def needs_capture(self) -> bool:
         return len(self._capture_descs) > 0
@@ -756,23 +809,6 @@ class ModelCudaGraphManager(CudaGraphManager):
                         assert attn_metadata is None
                     batch_descriptor = BatchDescriptor(
                         num_tokens=num_tokens,
-                        has_lora=has_lora,
-                        attention_context_bucket=desc.attention_context_bucket,
-                    )
-                if (
-                    desc.cg_mode == CUDAGraphMode.FULL
-                    and cg_mode in (CUDAGraphMode.NONE, CUDAGraphMode.FULL)
-                    and envs.REVOLTA_RESEARCH_QSA_DECODE_COALESCE_AG
-                ):
-                    # V2 captures FULL graphs directly. Pass the replicated
-                    # decode plan to opaque QSA ops; metadata alone cannot
-                    # distinguish same-shaped prefill and decode batches.
-                    # Use it for capture warmups too, so kernels/collectives
-                    # are initialized before entering CUDA graph capture.
-                    batch_descriptor = BatchDescriptor(
-                        num_tokens=num_tokens,
-                        num_reqs=num_reqs,
-                        uniform=desc.uniform_token_count is not None,
                         has_lora=has_lora,
                         attention_context_bucket=desc.attention_context_bucket,
                     )

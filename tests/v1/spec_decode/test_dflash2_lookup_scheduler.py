@@ -7,6 +7,7 @@ state updates, input kernels, native lookup and handler methods are real.
 Set W21_TEST_DEVICE=cuda to exercise the same chain with UVA and CUDA events.
 """
 
+import json
 import os
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -41,9 +42,10 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
 from vllm.v1.worker.gpu import buffer_utils
+from vllm.v1.worker.gpu import model_runner as runner_module
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.input_batch import InputBuffers, get_num_sampled_and_rejected
-from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+from vllm.v1.worker.gpu.model_runner import ExecuteModelState, GPUModelRunner
 from vllm.v1.worker.gpu.spec_decode.dflash2.native_lookup import NativeDFlash2Lookup
 from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
 from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
@@ -107,6 +109,7 @@ def chain_factory(native_allocation_config, monkeypatch):
         max_num_seqs=8,
         max_requests=1,
         collect_counts=False,
+        speculative_fields=None,
     ):
         original = native_allocation_config
         with monkeypatch.context() as capability:
@@ -119,7 +122,6 @@ def chain_factory(native_allocation_config, monkeypatch):
                 target_parallel_config=ParallelConfig(),
                 num_speculative_tokens=7,
                 draft_sample_method="probabilistic",
-                dflash_concurrency_drafts=ladder,
                 dflash2_lookup={
                     "enabled": enabled,
                     "policy": "longest",
@@ -128,6 +130,7 @@ def chain_factory(native_allocation_config, monkeypatch):
                     "search_window": 65536,
                     "max_requests": max_requests,
                 },
+                **(speculative_fields or {"dflash_concurrency_drafts": ladder}),
             )
         with monkeypatch.context() as capability:
             if DEVICE.type == "cpu":
@@ -206,8 +209,8 @@ class DecodeChain:
         runner.draft_tokens_handler = DraftTokensHandler(DEVICE)
         self.spec = object.__new__(DFlash2Speculator)
         self.spec.speculative_config = config.speculative_config
+        self.spec.method = config.speculative_config.method
         self.spec.num_speculative_steps = self.spec.draft_block = 7
-        self.spec._running_reqs = 0
         self.spec._lookup_enabled = False
         self.spec._debug_real_proposal = True
         self.spec._native_lookup = (
@@ -354,7 +357,7 @@ class DecodeChain:
             states.num_computed_tokens.gpu[batch.idx_mapping].tolist()
             == expected_computed
         )
-        self.propose(batch, counts, rejected)
+        self.propose(batch, counts, output.num_spec_tokens_to_schedule)
         model_output = ModelRunnerOutput(
             req_ids=batch.req_ids,
             req_id_to_index={name: i for i, name in enumerate(batch.req_ids)},
@@ -381,7 +384,7 @@ class DecodeChain:
             self.scheduler.update_draft_token_ids(self.runner.take_draft_token_ids())
         return engine_outputs
 
-    def propose(self, batch, counts, rejected):
+    def propose(self, batch, counts, width):
         spec, states = self.spec, self.runner.req_states
         n = batch.num_reqs
         candidates = []
@@ -416,13 +419,13 @@ class DecodeChain:
         original_scores = scores.clone() if scores is not None else None
         spec.sample_idx_mapping.fill_(-1)
         spec.sample_idx_mapping[: n * 7] = batch.idx_mapping.repeat_interleave(7)
-        spec._prepare_proposal_runtime(batch, counts, rejected)
+        spec._prepare_proposal_runtime(batch, counts, width)
         spec._apply_lookup(n)
         native = spec._native_lookup
         limit = self.config.speculative_config.dflash2_lookup.max_requests
         eligible = (
             1 <= n <= limit
-            and spec.next_num_draft_tokens() == 7
+            and width == 7
             and not batch.has_structured_output_reqs
             and not batch.is_prefilling_np[:n].any()
             and all(
@@ -479,13 +482,73 @@ class DecodeChain:
         self.runner.draft_tokens_handler.set_draft_tokens(
             batch,
             spec.draft_tokens[:n],
-            num_draft_tokens=spec.next_num_draft_tokens(),
+            num_draft_tokens=width,
         )
 
     def step(self, **kwargs):
         output, batch = self.schedule()
         assert batch is not None
         return self.execute(output, batch, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        '{"dflash_concurrency_drafts":{"4":3,"5":4}}',
+        '{"num_speculative_tokens_per_batch_size":[[1,3,7],[4,4,3],[5,8,4]]}',
+    ],
+)
+def test_scheduler_passes_the_same_width_to_dflash2_for_both_fields(
+    chain_factory, monkeypatch, fields
+):
+    def async_output(**kwargs):
+        return SimpleNamespace(get_output=lambda: kwargs["model_runner_output"])
+
+    monkeypatch.setattr(runner_module, "AsyncOutput", async_output)
+    for num_reqs, expected in enumerate((7, 7, 7, 3, 4, 4, 4, 4), start=1):
+        chain = chain_factory(speculative_fields=json.loads(fields))
+        for req in range(num_reqs):
+            chain.add(str(req), prompt_length=8)
+        chain.step()
+        output, batch = chain.schedule()
+        assert batch is not None and batch.num_reqs == num_reqs
+        assert not output.skip_drafts
+        assert output.num_spec_tokens_to_schedule == expected
+
+        runner, spec = chain.runner, chain.spec
+        runner.is_last_pp_rank = True
+        runner.speculator = spec
+        runner.execute_model_state = ExecuteModelState(
+            batch, None, None, None, None, set(), output.num_spec_tokens_to_schedule
+        )
+        runner._sm70_v2_mtp_profile_pending = None
+        runner.model = SimpleNamespace(compute_logits=Mock())
+        runner.prompt_logprobs_worker = Mock()
+        runner.main_stream = runner.output_copy_stream = runner.rejection_sampler = None
+        runner.kv_connector = Mock()
+        runner.mixed_prefill_timer = Mock()
+        runner.eplb = Mock()
+        runner.use_async_scheduling = False
+        runner.sampler = Mock()
+        runner.sample = Mock(
+            return_value=(
+                SimpleNamespace(
+                    sampled_token_ids=torch.ones((num_reqs, 1), device=DEVICE)
+                ),
+                torch.ones(num_reqs, dtype=torch.int32, device=DEVICE),
+                torch.zeros(num_reqs, dtype=torch.int32, device=DEVICE),
+            )
+        )
+        runner.postprocess_sampled = Mock()
+        spec.supports_mm_inputs = False
+        spec.prepare_target_context = Mock()
+        spec.propose = Mock(
+            return_value=torch.ones((num_reqs, 7), dtype=torch.int64, device=DEVICE)
+        )
+
+        runner.sample_tokens(None)
+        assert spec.propose.call_args.kwargs["num_speculative_tokens"] == expected
+        assert runner.draft_tokens_handler.num_draft_tokens == expected
 
 
 @pytest.mark.parametrize("sparse", [False, True])
@@ -647,7 +710,7 @@ def test_device_admission_uses_current_sample_and_space(chain_factory, reason):
     chain.propose(
         batch,
         torch.tensor([int(reason != "no_sample")], dtype=torch.int32, device=DEVICE),
-        torch.zeros(1, dtype=torch.int32, device=DEVICE),
+        record.output.num_spec_tokens_to_schedule,
     )
     states.total_len.gpu[slot] = committed
     assert not chain.spec._native_lookup.eligible.any()
@@ -765,7 +828,7 @@ def verify_rejection_round(chain, output, batch, accepted):
     assert torch.equal(
         chain.runner.model_state.postprocess_state.call_args.args[1], counts
     )
-    chain.propose(batch, counts, rejected)
+    chain.propose(batch, counts, output.num_spec_tokens_to_schedule)
     model_output = ModelRunnerOutput(
         req_ids=batch.req_ids,
         req_id_to_index={name: row for row, name in enumerate(batch.req_ids)},

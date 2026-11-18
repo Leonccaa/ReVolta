@@ -194,7 +194,16 @@ slow the restart. See [Coming back to a document](performance.md#coming-back-to-
 
 **4. CPU + verified disk (`revolta_fs`, experimental).** A stricter variant of the
 filesystem tier meant to keep conversations reusable across engine restarts. Use
-`"type": "revolta_fs"` instead of `"fs"`; every `fs` key above still applies. It adds:
+`"type": "revolta_fs"` instead of `"fs"`; every `fs` key above still applies.
+
+L1 planar E4M3 is now named `fp8_per_token_head`; eligible QSA `auto` requests
+also select it. Its codec name and page layout isolate its SSD namespace from
+the old planar name and scalar E4M3, so those files miss rather than migrate.
+Explicit `fp8` / `fp8_e4m3` scalar identities remain unchanged. The readback
+measurements above describe the original scalar format; CPU checks of planar
+storage do not establish GPU/SSD release acceptance.
+
+The tier adds:
 
 - **Integrity:** each page carries a CRC32C of its contents in a user extended
   attribute, bound to the page's prefix and the tier's identity. A corrupted page, or
@@ -304,32 +313,32 @@ the groups `g` with `g % TP == r`, scores only those, and the ranks merge their
 candidates into the same selection an unsplit indexer would make. With TP4/DCP2
 this halves the GPU bytes of every history ID's index again, so the same budget
 holds about twice as many contexts. Cached pages written with a narrower split
-are not read back. The research switch `REVOLTA_RESEARCH_QSA_DECODE_COALESCE_AG`
-exchanges candidates over the DCP pair only and is rejected with this split.
-`kernel_config.long_context_kv.draft_main_placement` chooses where such a
-sharded draft's main K/V lives; the draft index and raw-key ring always stay in
-GPU history.
+are not read back. `kernel_config.long_context_kv.draft_main_placement` chooses
+where such a sharded draft's main K/V lives (default `host`); the draft index
+and raw-key ring always stay in GPU history.
 
-- `"gpu"` (default): the draft's main K/V is a GPU history tensor, charged for
+- `"host"` (default): the draft's main K/V is one more layer of the host
+  store, reached through the hot pool like the target's. Each history ID then
+  costs about 0.71 MB (about 1.13 MB with `"gpu"`), so the same GPU budget
+  holds many more contexts at 1M tokens. Measured on four V100 GPUs with
+  sampling and a single request, a decode round takes about 0.2 ms (under 1%)
+  longer than with `"gpu"`. The setting is a different configuration of the
+  same build: with `"host"` the output is not guaranteed to be bitwise equal
+  to `"gpu"`, because the draft's proposals, and with them the shapes of the
+  verified batches, can differ.
+- `"gpu"`: the draft's main K/V is a GPU history tensor, charged for
   every history ID (about 1.13 MB per ID per GPU with DCP2 and the index split
   over two ranks). Draft forwards read only GPU memory, so decode is fastest.
-- `"host"`: the draft's main K/V is one more layer of the host store, reached
-  through the hot pool like the target's. Each history ID then costs about
-  0.71 MB (about 1.13 MB with `"gpu"`), so the same GPU budget holds many more
-  contexts at 1M tokens. Measured on four V100 GPUs with sampling and a single
-  request, a decode round takes about 0.2 ms (under 1%) longer than with
-  `"gpu"`. The setting is a different configuration of the same build: with
-  `"host"` the output is not guaranteed to be bitwise equal to `"gpu"`, because
-  the draft's proposals, and with them the shapes of the verified batches,
-  can differ.
 
-Pick `"host"` for deployments with many long sessions or high concurrency at
-long context, where the number of history IDs limits throughput. Pick `"gpu"`
-when single-request speed matters more than context concurrency. `"host"`
-needs `main_kv_placement="host"` and a draft that shares the target's sharded
-geometry (`qsa_dcp_index_shard` with DCP); if either is missing, the draft stays
-on the GPU and a warning is logged. Changing the value changes the host row
-layout, so an SSD tier written with the other value is not read back.
+The default suits deployments with many long sessions or high concurrency at
+long context, where the number of history IDs limits throughput. Set `"gpu"`
+explicitly when single-request speed matters more than context concurrency,
+when pinned host memory is tight, or when output must stay bitwise comparable
+with releases that defaulted to `"gpu"`. `"host"` needs
+`main_kv_placement="host"` and a draft that shares the target's sharded
+geometry (`qsa_dcp_index_shard` with DCP); if either is missing, the draft
+stays on the GPU and a warning is logged. Changing the value changes the host
+row layout, so an SSD tier written with the other value is not read back.
 
 `speculative_config.gdn_state_replay=true` replays the accepted target GDN
 inputs for MTP, so recurrent layers keep two state blocks per request instead

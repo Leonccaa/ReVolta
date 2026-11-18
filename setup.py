@@ -1491,6 +1491,9 @@ package_data = {
         "third_party/deep_gemm/include/**/*.h",
         "third_party/deep_gemm/include/**/*.hpp",
         "sm70_profiles/*.json",
+        # Read at runtime: fallback chat templates and the NUMA launcher.
+        "transformers_utils/chat_templates/*.jinja",
+        "utils/numa_wrapper.sh",
     ],
 }
 

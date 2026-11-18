@@ -91,6 +91,7 @@ def test_spec_decode_stops_scheduling_drafts_at_drafter_context_limit(
     )
     scheduler.requests = {"r0": request}
     scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.num_spec_tokens_to_schedule = num_speculative_tokens
     scheduler_output.num_scheduled_tokens = {"r0": 5}
     scheduler_output.scheduled_spec_decode_tokens = {"r0": [-1] * 4}
     monkeypatch.setattr(

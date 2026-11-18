@@ -19,7 +19,7 @@ from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.utils.torch_utils import set_default_torch_dtype
-from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backend import AttentionCGSupport, CommonAttentionMetadata
 from vllm.v1.attention.kv_cache_view import bind_attention_cache
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
@@ -643,3 +643,218 @@ def test_cuda_weighted_pool_scores():
     expected.masked_fill_(groups >= (2054 + torch.arange(7)[:, None]) // 4, -torch.inf)
     actual = index_scores(query, weights, pool, table, 2054, 522, 4, 1)
     torch.testing.assert_close(actual.cpu(), expected, rtol=2e-3, atol=1e-4)
+
+
+def test_decode_metadata_reuses_runner_buffers(vllm_config):
+    from vllm.models.hy_v4_flash.sm70.cache import FlashMetadataBuilder
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+    spec = MLAAttentionSpec(
+        block_size=256, num_kv_heads=1, head_size=576, dtype=torch.float16
+    )
+    builder = FlashMetadataBuilder(spec, ["attn"], vllm_config, torch.device("cpu"))
+    assert builder.get_cudagraph_support(vllm_config, spec) == (
+        AttentionCGSupport.UNIFORM_BATCH
+    )
+    starts = torch.arange(4, dtype=torch.int32)
+    lengths = torch.ones(3, dtype=torch.int32)
+    table = torch.zeros(3, 10, dtype=torch.int32)
+    slots = torch.full((3,), -1, dtype=torch.int64)
+    common = CommonAttentionMetadata(
+        query_start_loc=starts,
+        query_start_loc_cpu=starts,
+        seq_lens=lengths,
+        num_reqs=3,
+        num_actual_tokens=3,
+        max_query_len=1,
+        max_seq_len=2304,
+        block_table_tensor=table,
+        slot_mapping=slots,
+        is_dummy_batch=True,
+    )
+    captured = builder.build_for_cudagraph_capture(common)
+    assert captured.decode and captured.num_actual_tokens == 3
+    assert not captured.spans
+    for rows, batch_lens in [(3, [2049, 512, 0]), (2, [520, 0])]:
+        valid = len(batch_lens) - 1
+        starts[valid + 1 :].fill_(valid)
+        lengths[:rows].copy_(torch.tensor(batch_lens))
+        table[:valid, 0].fill_(7)
+        slots[:valid].fill_(7 * spec.block_size)
+        table[valid:].zero_()
+        slots[valid:].fill_(-1)
+        replay = builder.build(
+            0,
+            common.replace(
+                query_start_loc=starts[: rows + 1],
+                query_start_loc_cpu=starts[: rows + 1],
+                seq_lens=lengths[:rows],
+                seq_lens_cpu_upper_bound=lengths[:rows],
+                block_table_tensor=table[:rows],
+                slot_mapping=slots[:rows],
+                num_reqs=rows,
+                num_actual_tokens=rows,
+                is_dummy_batch=False,
+            ),
+        )
+        for field in ("seq_lens", "query_start_loc", "block_table", "slot_mapping"):
+            assert (
+                getattr(replay, field).data_ptr() == getattr(captured, field).data_ptr()
+            )
+        assert replay.num_actual_tokens == rows
+        assert replay.seq_lens[-1] == 0
+        assert replay.query_start_loc[-1] == replay.query_start_loc[-2]
+        assert replay.slot_mapping[-1] == -1
+        assert replay.block_table[-1].eq(0).all()
+    one_token_prefill = common.replace(
+        seq_lens_cpu_upper_bound=lengths,
+        is_dummy_batch=False,
+        is_prefilling=torch.tensor([True, False, False]),
+    )
+    assert not builder.build(0, one_token_prefill).decode
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not torch.accelerator.is_available(),
+    reason="CUDA required",
+)
+@torch.inference_mode()
+def test_cuda_decode_graph_replays_eager(vllm_config, monkeypatch):
+    config = text_config()
+    config.qk_rope_head_dim = config.swa_qk_rope_head_dim = 16
+    vllm_config.model_config = SimpleNamespace(
+        max_model_len=2304, hf_text_config=config
+    )
+    device = torch.device("cuda")
+    rows = 4
+    torch.manual_seed(79)
+    layers = [
+        PagedLayer(
+            make_layer(vllm_config, config, idx, 2304, monkeypatch, device=device),
+            vllm_config,
+            2304,
+            requests=rows,
+        )
+        for idx in range(2)
+    ]
+    prefixes = (2051, 512)
+    for paged in layers:
+        for weight in paged.layer.parameters():
+            weight.normal_(std=0.15)
+        paged.step(
+            *(
+                (torch.randn(n, config.hidden_size, device=device).half(), 0, 0)
+                for n in prefixes
+            )
+        )
+
+    owners = [owner for paged in layers for owner in paged.owners]
+    initial = [owner.kv_cache.clone() for owner in owners]
+    starts = torch.empty(rows + 1, dtype=torch.int32)
+    starts_gpu = torch.empty_like(starts, device=device)
+    lengths = torch.empty(rows, dtype=torch.int32, device=device)
+    positions = torch.empty(rows, dtype=torch.int64, device=device)
+    inputs = torch.randn(rows, config.hidden_size, device=device).half()
+    tables = {
+        owner.prefix: paged.tables[owner.prefix]
+        for paged in layers
+        for owner in paged.owners
+    }
+    stable_tables = {name: torch.empty_like(table) for name, table in tables.items()}
+    slots = {
+        owner.prefix: torch.empty(rows, dtype=torch.int64, device=device)
+        for owner in owners
+    }
+    builders = {
+        owner.prefix: owner.backend.get_builder_cls()(
+            owner.spec, [owner.prefix], vllm_config, device
+        )
+        for owner in owners
+    }
+
+    def stage(requests, dummy=False):
+        starts.copy_(torch.arange(rows + 1).clamp_max(rows if dummy else len(requests)))
+        starts_gpu.copy_(starts)
+        lengths.fill_(1 if dummy else 0)
+        positions.zero_()
+        for row, req in enumerate(requests):
+            lengths[row] = prefixes[req] + 1
+            positions[row] = prefixes[req]
+        metadata = {}
+        for owner in owners:
+            name = owner.prefix
+            table = stable_tables[name]
+            table.zero_()
+            slots[name].fill_(-1)
+            for row, req in enumerate(requests):
+                table[row].copy_(tables[name][req])
+                if name in main_prefixes:
+                    page = owner.kv_cache.shape[1]
+                    pos = prefixes[req]
+                    slots[name][row].copy_(table[row, pos // page] * page + pos % page)
+            common = CommonAttentionMetadata(
+                query_start_loc=starts_gpu,
+                query_start_loc_cpu=starts,
+                seq_lens=lengths,
+                num_reqs=rows,
+                num_actual_tokens=rows,
+                max_query_len=1,
+                max_seq_len=2304,
+                block_table_tensor=table,
+                slot_mapping=slots[name],
+                is_dummy_batch=dummy,
+            )
+            builder = builders[name]
+            metadata[name] = (
+                builder.build_for_cudagraph_capture(common)
+                if dummy
+                else builder.build(0, common)
+            )
+        return metadata
+
+    def forward(metadata):
+        with set_forward_context(metadata, vllm_config):
+            return tuple(paged.layer(positions, inputs) for paged in layers)
+
+    main_prefixes = {paged.layer.attn.prefix for paged in layers}
+    expected_steps = []
+    for requests in ((0, 1), (1,)):
+        eager = forward(stage(requests))
+        expected_caches = [owner.kv_cache.clone() for owner in owners]
+        expected_steps.append((requests, eager, expected_caches))
+        for owner, before in zip(owners, initial):
+            owner.kv_cache.copy_(before)
+
+    dummy = stage((), dummy=True)
+    warmup = torch.cuda.Stream()
+    warmup.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup):
+        forward(dummy)
+    torch.cuda.current_stream().wait_stream(warmup)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = forward(dummy)
+    for owner, before in zip(owners, initial):
+        assert torch.equal(owner.kv_cache, before)
+
+    for requests, eager, expected_caches in expected_steps:
+        metadata = stage(requests)
+        graph.replay()
+        for actual, expected in zip(captured, eager):
+            assert torch.isfinite(expected).all()
+            assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+        for paged in layers:
+            layer = paged.layer
+            pad = slice(len(requests), rows)
+            assert layer.topk_indices_buffer[pad, : layer.width].eq(-1).all()
+            assert metadata[layer.attn.prefix].counts[pad].eq(0).all()
+            counts = metadata[layer.attn.prefix].counts
+            expected_counts = [min(prefixes[req] + 1, layer.width) for req in requests]
+            assert counts[: len(requests)].tolist() == expected_counts
+        for owner, before, expected in zip(owners, initial, expected_caches):
+            assert torch.equal(owner.kv_cache, expected)
+            pages_per_block = owner.spec.storage_block_size // owner.kv_cache.shape[1]
+            assert torch.equal(
+                owner.kv_cache[:pages_per_block], before[:pages_per_block]
+            )
+            owner.kv_cache.copy_(before)

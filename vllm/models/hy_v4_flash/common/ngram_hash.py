@@ -32,8 +32,11 @@ def _hash_ids_kernel(
     token = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
     layer = tl.program_id(1)
     valid = token < num_tokens
+    live_token = valid & (
+        token < tl.minimum(num_actual_tokens, tl.load(query_start_loc + num_queries))
+    )
     lo = tl.full((BLOCK_T,), 0, tl.int32)
-    hi = tl.full((BLOCK_T,), num_queries, tl.int32)
+    hi = tl.where(live_token, num_queries, 0)
     while tl.sum((lo < hi).to(tl.int32), 0) > 0:
         mid = (lo + hi) // 2
         end = tl.load(query_start_loc + mid + 1, lo < hi, other=0)
@@ -42,21 +45,21 @@ def _hash_ids_kernel(
         lo = tl.where(active & right, mid + 1, lo)
         hi = tl.where(active & ~right, mid, hi)
     req = tl.minimum(lo, num_queries - 1).to(tl.int64)
-    start = tl.load(query_start_loc + req)
+    start = tl.load(query_start_loc + req, live_token, other=0)
     pad = tl.load(token_maps + layer * map_stride + pad_token_id).to(tl.int64)
     size = tl.load(map_sizes + layer)
-    current = tl.load(input_ids + token, valid, other=pad_token_id)
+    current = tl.load(input_ids + token, live_token, other=pad_token_id)
     head = tl.arange(0, BLOCK_H)
     rolling = tl.full((BLOCK_T,), 0, tl.int64)
     for shift in tl.static_range(max_ngram):
         from_batch = token - shift >= start
         previous = tl.load(
             input_ids + tl.maximum(token - shift, 0),
-            valid & from_batch,
+            live_token & from_batch,
             other=pad_token_id,
         )
         col = max_ngram - 1 + token - start - shift
-        from_history = valid & ~from_batch & (col >= 0) & (col < max_ngram - 1)
+        from_history = live_token & ~from_batch & (col >= 0) & (col < max_ngram - 1)
         previous_history = tl.load(
             lookback + req * (max_ngram - 1) + tl.maximum(col, 0),
             from_history,
@@ -66,7 +69,7 @@ def _hash_ids_kernel(
         in_map = (original >= 0) & (original < size)
         mapped = tl.load(
             token_maps + layer * map_stride + tl.where(in_map, original, 0),
-            valid & in_map,
+            live_token & in_map,
             other=0,
         ).to(tl.int64)
         source = tl.where(in_map, mapped, pad)
@@ -80,7 +83,7 @@ def _hash_ids_kernel(
                 offsets + layer * total_heads + column, head < num_heads, 0
             )
             hashed = rolling[:, None] % prime[None, :] + offset[None, :]
-            live = (token < num_actual_tokens) & (current != pad_token_id)
+            live = live_token & (current != pad_token_id)
             hashed = tl.where(live[:, None], hashed, -1)
             target = (layer * num_tokens + token.to(tl.int64))[:, None] * total_heads
             tl.store(
@@ -137,7 +140,8 @@ def hash_ngrams_torch(
                     torch.remainder(rolling[:, None], primes[layer, columns])
                     + offsets[layer, columns]
                 ).int()
-    result[:, (rows >= num_actual_tokens) | (input_ids == pad_token_id), :] = -1
+    padded = (rows >= num_actual_tokens) | (rows >= query_start_loc[-1])
+    result[:, padded | (input_ids == pad_token_id), :] = -1
     return result
 
 

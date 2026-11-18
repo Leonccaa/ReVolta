@@ -12,6 +12,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import CircularBufferSpec, MLAAttentionSpec
 
 from .cache import FlashCache, FlashMetadata, QuerySpan
+from .decode import gather_decode_group, store_decode_group
 from .kernels import index_scores
 from .rotary import apply_rotary, rotary_phases
 
@@ -120,6 +121,102 @@ class FlashCompressedIndexer(nn.Module):
             ),
             -1,
         )
+
+    def decode_groups(
+        self,
+        hidden: torch.Tensor,
+        q_c: torch.Tensor,
+        positions: torch.Tensor,
+        inv_freq: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        metadata: FlashMetadata,
+        tail_metadata: FlashMetadata,
+        slots: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Update the decode caches and return the sorted history group IDs."""
+        workspace = metadata.index_workspace
+        assert workspace is not None
+        keys = self.token_key_norm(self.token_key_projection(hidden)[0])
+        rows = keys.shape[0]
+        pool, tail = self.k_cache.kv_cache, self.tail_cache.kv_cache
+        page = pool.shape[1]
+        pages_per_block = self.k_cache.spec.storage_block_size // page
+        table, ring_table = metadata.block_table, tail_metadata.block_table
+        raw = workspace.raw[:rows]
+        group_positions = workspace.positions[:rows]
+        gather_decode_group[(rows,)](
+            keys,
+            metadata.seq_lens,
+            slots,
+            ring_table,
+            tail,
+            raw,
+            group_positions,
+            ring_table.stride(0),
+            tail.stride(0),
+            tail.stride(1),
+            self.ratio,
+            self.dim,
+        )
+        values = self.key_value_projection(raw)
+        gates = self.key_gate_projection(raw) + self.intra_group_ape
+        pooled = self.key_norm((values * gates.softmax(dim=1)).sum(dim=1)).to(
+            keys.dtype
+        )
+        group_cos, group_sin = rotary_phases(group_positions, inv_freq)
+        store_decode_group[(rows,)](
+            keys,
+            positions,
+            self._rotate(pooled, group_cos, group_sin),
+            metadata.seq_lens,
+            slots,
+            table,
+            ring_table,
+            pool,
+            tail,
+            table.stride(0),
+            ring_table.stride(0),
+            pool.stride(0),
+            pool.stride(1),
+            tail.stride(0),
+            tail.stride(1),
+            self.ratio,
+            self.dim,
+            page,
+            pages_per_block,
+        )
+        logits = workspace.logits[:rows]
+        if logits.shape[1] == 0:
+            return None
+        query = self.query_projection(q_c)[0].view(rows, self.num_heads, self.dim)
+        query = self._rotate(query, cos[:, None], sin[:, None])
+        weights = self.head_weight_projection(hidden)[0].float()
+        weights *= self.num_heads**-0.5 * self.dim**-0.5
+        index_scores(
+            query,
+            weights,
+            pool,
+            table,
+            0,
+            logits.shape[1],
+            self.ratio,
+            pages_per_block,
+            logits=logits,
+            lengths=metadata.seq_lens,
+            slots=slots,
+            group_topk=self.history + 1,
+        )
+        topk_groups = workspace.topk_groups[:rows]
+        torch.topk(
+            logits,
+            self.history,
+            sorted=False,
+            out=(workspace.topk_values[:rows], topk_groups),
+        )
+        sorted_groups = workspace.sorted_groups[:rows]
+        torch.sort(topk_groups, out=(sorted_groups, workspace.sort_order[:rows]))
+        return sorted_groups
 
     def prepare_groups(
         self,

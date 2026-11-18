@@ -10,13 +10,19 @@ from torch import nn
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (
     AttentionBackend,
+    AttentionCGSupport,
     AttentionMetadata,
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    CircularBufferSpec,
+    MLAAttentionSpec,
+)
 
 POOL_PAGE = 64
 
@@ -28,6 +34,16 @@ class QuerySpan(NamedTuple):
     length: int
 
 
+class IndexPoolDecodeWorkspace(NamedTuple):
+    raw: torch.Tensor
+    positions: torch.Tensor
+    logits: torch.Tensor
+    topk_values: torch.Tensor
+    topk_groups: torch.Tensor
+    sorted_groups: torch.Tensor
+    sort_order: torch.Tensor
+
+
 @dataclass
 class FlashMetadata(AttentionMetadata):
     spans: tuple[QuerySpan, ...]
@@ -35,11 +51,14 @@ class FlashMetadata(AttentionMetadata):
     slot_mapping: torch.Tensor
     num_actual_tokens: int
     query_start_loc: torch.Tensor
+    seq_lens: torch.Tensor
+    decode: bool
+    counts: torch.Tensor | None
+    index_workspace: IndexPoolDecodeWorkspace | None
 
 
 class FlashMetadataBuilder(AttentionMetadataBuilder[FlashMetadata]):
-    # The indexer walks requests in eager mode. Use the scheduler's exact host
-    # lengths in M1 (no speculative decoding), without syncing device lengths.
+    _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
     uses_physical_block_table = True
 
     def __init__(
@@ -50,6 +69,39 @@ class FlashMetadataBuilder(AttentionMetadataBuilder[FlashMetadata]):
         device: torch.device,
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self.counts: torch.Tensor | None = None
+        self.index_workspace: IndexPoolDecodeWorkspace | None = None
+        if device.type == "cuda" and not isinstance(kv_cache_spec, CircularBufferSpec):
+            rows = vllm_config.scheduler_config.max_num_seqs
+            if (
+                isinstance(kv_cache_spec, MLAAttentionSpec)
+                and (ratio := kv_cache_spec.compress_ratio) > 1
+            ):
+                assert vllm_config.model_config is not None
+                model = vllm_config.model_config
+                history = model.hf_text_config.compressed_indexer_group_topk - 1
+                groups = cdiv(model.max_model_len, ratio)
+                # Every sparse layer in this attention group uses the same scratch.
+                topk_shape = (rows, history) if groups > history + 1 else (rows, 0)
+                self.index_workspace = IndexPoolDecodeWorkspace(
+                    torch.empty(
+                        (rows, ratio, kv_cache_spec.head_size),
+                        dtype=torch.float32,
+                        device=device,
+                    ),
+                    torch.empty(rows, dtype=torch.int64, device=device),
+                    torch.empty(
+                        (rows, groups if topk_shape[1] else 0),
+                        dtype=torch.float32,
+                        device=device,
+                    ),
+                    torch.empty(topk_shape, dtype=torch.float32, device=device),
+                    torch.empty(topk_shape, dtype=torch.int64, device=device),
+                    torch.empty(topk_shape, dtype=torch.int64, device=device),
+                    torch.empty(topk_shape, dtype=torch.int64, device=device),
+                )
+            else:
+                self.counts = torch.empty(rows, dtype=torch.int32, device=device)
 
     def build(
         self,
@@ -58,8 +110,11 @@ class FlashMetadataBuilder(AttentionMetadataBuilder[FlashMetadata]):
         fast_build: bool = False,
     ) -> FlashMetadata:
         cm = common_attn_metadata
+        decode = cm.max_query_len == 1 and (
+            cm.is_dummy_batch or cm.is_prefilling is None or not cm.is_prefilling.any()
+        )
         spans: tuple[QuerySpan, ...] = ()
-        if not cm.is_dummy_batch:
+        if not cm.is_dummy_batch and not (decode and cm.seq_lens.is_cuda):
             starts = cm.query_start_loc_cpu[: cm.num_reqs + 1].tolist()
             lens = cm.seq_lens_cpu_upper_bound
             assert lens is not None
@@ -67,12 +122,18 @@ class FlashMetadataBuilder(AttentionMetadataBuilder[FlashMetadata]):
                 QuerySpan(b, e, n - (e - b), n)
                 for b, e, n in zip(starts, starts[1:], lens[: cm.num_reqs].tolist())
             )
+        # The runner owns fixed device buffers for all four inputs. Its padded
+        # rows have zero sequence length and PAD slots, including dummy writes.
         return FlashMetadata(
             spans,
             cm.block_table_tensor,
             cm.slot_mapping,
-            0 if cm.is_dummy_batch else cm.num_actual_tokens,
+            cm.num_actual_tokens if decode or not cm.is_dummy_batch else 0,
             cm.query_start_loc,
+            cm.seq_lens,
+            decode,
+            self.counts,
+            self.index_workspace,
         )
 
 

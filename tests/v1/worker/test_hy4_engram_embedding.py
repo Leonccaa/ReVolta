@@ -118,6 +118,14 @@ def test_cuda_gather_matches_cpu(tmp_path, monkeypatch):
     ctx = SimpleNamespace(
         no_compile_layers=cuda_config.compilation_config.static_forward_context
     )
+    static_ids = ids.cuda()
     with override_forward_context(ctx):
-        actual = gpu(ids.cuda()).cpu()
-    torch.testing.assert_close(actual, cpu(ids), rtol=0, atol=0)
+        eager = gpu(static_ids)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = gpu(static_ids)
+    graph.replay()
+    torch.testing.assert_close(captured, eager, rtol=0, atol=0)
+    static_ids.copy_(ids.flip(0))
+    graph.replay()
+    torch.testing.assert_close(captured.cpu(), cpu(ids.flip(0)), rtol=0, atol=0)

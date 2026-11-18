@@ -80,4 +80,5 @@ def test_dummy_and_padding_use_engram_pad() -> None:
         kwargs["lookback_token_ids"], torch.full((4, 2), 99, dtype=torch.int32)
     )
     context = runner._prepare_ngram_context(2, 4)
+    assert context.data_ptr() == kwargs["lookback_token_ids"].data_ptr()
     torch.testing.assert_close(context[2:], torch.full((2, 2), 99, dtype=torch.int32))

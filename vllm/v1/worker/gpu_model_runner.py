@@ -8241,7 +8241,7 @@ class GPUModelRunner(
         self,
         scheduler_output: "SchedulerOutput",
     ) -> bool | None:
-        """Reject uniform-decode dispatch for hybrid-model prefills.
+        """Reject uniform-decode dispatch for hybrid and Hy4 Flash prefills.
 
         A prefill can have the same shape as a uniform decode batch, notably
         when its scheduled token count equals ``1 + num_speculative_tokens``.
@@ -8251,9 +8251,13 @@ class GPUModelRunner(
         current step as well.
 
         ``None`` preserves the normal shape heuristic. ``False`` is only
-        returned when a hybrid batch contains an unfinished prompt.
+        returned when a batch requiring a separate prefill path contains an
+        unfinished prompt.
         """
-        if not self.model_config.is_hybrid:
+        if (
+            not self.model_config.is_hybrid
+            and self.model_config.hf_text_config.model_type != "hy_v4_flash"
+        ):
             return None
 
         for new_req in scheduler_output.scheduled_new_reqs:

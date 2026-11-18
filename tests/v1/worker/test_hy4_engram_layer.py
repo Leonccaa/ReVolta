@@ -111,12 +111,9 @@ def make_layer(reference, path, layout, vllm_config, tp, rank, monkeypatch):
 
 def test_fp8_row_decode_against_reference(tmp_path):
     _, source, codes, scale, *_ = make_case(tmp_path)
-    actual = codes.float() * scale.float()[:, None]
+    actual = (codes.float() * scale.float()[:, None]).to(torch.bfloat16).float()
     expected = _fp8_round_trip(source).float()
-    error = actual - expected
-    rel_l2 = error.norm() / expected.norm()
-    assert rel_l2 < 0.004
-    assert error.abs().max() <= expected.abs().max() * 0.004
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_whole_layer_against_transformers(tmp_path, monkeypatch):
@@ -147,14 +144,7 @@ def test_whole_layer_against_transformers(tmp_path, monkeypatch):
             _fp8_round_trip(source).float()
         )
     expected_bf16 = reference(hidden[None], ngrams[None], mask)[0]
-    error_bf16 = actual - expected_bf16
-    assert error_bf16.norm() / expected_bf16.norm() < 0.004
-    with torch.no_grad():
-        reference.multi_head_embedding.embedding.weight.copy_(
-            codes.float() * scale.float()[:, None]
-        )
-    expected_same_rows = reference(hidden[None], ngrams[None], mask)[0]
-    torch.testing.assert_close(actual, expected_same_rows, rtol=1e-5, atol=3e-7)
+    torch.testing.assert_close(actual, expected_bf16, rtol=1e-5, atol=3e-7)
     torch.testing.assert_close(
         layer(hidden, hashes)[tokens == 3], hidden[tokens == 3], rtol=0, atol=0
     )
@@ -185,7 +175,7 @@ def test_tp4_reductions_match_single_rank(tmp_path, monkeypatch):
     partials = []
     for layer in shards:
         local = layer.multi_head_embedding
-        rows = local(hashes)
+        rows = local(hashes).to(torch.bfloat16).float()
         gamma = torch.stack(
             [norm.weight for norm in layer.lookup_per_head_norms]
         ).float()

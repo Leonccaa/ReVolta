@@ -327,7 +327,7 @@ class FlashEngram(nn.Module):
 
     def forward(self, hidden, hashes):
         local = self.multi_head_embedding
-        rows = local(hashes)
+        rows = local(hashes).to(torch.bfloat16).float()
         eps = torch.finfo(torch.float32).eps
         gamma = torch.stack(
             [norm.weight for norm in self.lookup_per_head_norms]

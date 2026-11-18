@@ -64,6 +64,7 @@ def _make_experts(monkeypatch, device):
     with torch.device(device):
         model = HYV4FlashModel.__new__(HYV4FlashModel)
         nn.Module.__init__(model)
+        model.config = SimpleNamespace(num_experts=4)
         model.layers = nn.ModuleList([nn.Module()])
         model.layers[0].mlp = nn.Module()
         experts = FusedMoE(
@@ -77,6 +78,8 @@ def _make_experts(monkeypatch, device):
             prefix="model.layers.0.mlp.experts",
         )
         model.layers[0].mlp.experts = experts
+        model.start_layer, model.end_layer = 0, 1
+        model._init_expert_mapping()
         assert isinstance(experts.quant_method, AWQSM70MoEMethod)
         weights = []
         refs = []

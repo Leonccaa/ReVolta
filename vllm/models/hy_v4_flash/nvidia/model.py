@@ -9,6 +9,7 @@ import regex as re
 import torch
 
 from vllm.config import CacheConfig, VllmConfig
+from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -24,12 +25,8 @@ from vllm.sequence import IntermediateTensors
 
 from .moe import HYV4FlashFeedForward, HYV4FlashMoE
 
-_AWQ_EXPERT = re.compile(
-    r"(layers\.\d+\.mlp\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)"
-    r"\.(qweight|qzeros|scales)"
-)
+_EXPERT = re.compile(r"(layers\.\d+\.mlp\.)(experts\.\d+\.[^.]+\.)([^.]+)")
 _PACKED_EXPERT = re.compile(r"(layers\.\d+\.mlp\.experts)\.(gate_up_proj|down_proj)")
-_EXPERT_SHARDS = {"gate_proj": "w1", "up_proj": "w3", "down_proj": "w2"}
 _ENGRAM = re.compile(r"layers\.(\d+)\.engram_layer\.(.+)")
 _SKIP_PREFIXES = ("vit.", "dfly_layers.", "model.dfly_layers.")
 
@@ -76,6 +73,7 @@ class HYV4FlashModel(HYV4Model):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self._init_expert_mapping()
         self.engram_hash = None
         self.engram_indices = {
             layer_id - 1: index
@@ -138,18 +136,33 @@ class HYV4FlashModel(HYV4Model):
             hidden = hidden + residual
         return self.norm(hidden)
 
+    def _init_expert_mapping(self) -> None:
+        mapping = fused_moe_make_expert_params_mapping(
+            self,
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.num_experts,
+        )
+        self._expert_mapping = {
+            ckpt: (param, expert_id, shard) for param, ckpt, expert_id, shard in mapping
+        }
+        # The default checkpoint loader also uses this mapping for NVFP4 coverage.
+        for idx in range(self.start_layer, self.end_layer):
+            if isinstance(mlp := self.layers[idx].mlp, HYV4FlashMoE):
+                mlp.experts.expert_mapping = mapping
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params = dict(self.named_parameters())
         loaded: set[str] = set()
         for name, value in weights:
-            if match := _AWQ_EXPERT.fullmatch(name):
-                prefix, expert_id, projection, suffix = match.groups()
-                shard = _EXPERT_SHARDS[projection]
-                weight = "w2" if shard == "w2" else "w13"
-                name = f"{prefix}.{weight}_{suffix}"
+            if match := _EXPERT.fullmatch(name):
+                prefix, projection, suffix = match.groups()
+                target, expert_id, shard = self._expert_mapping[projection]
+                name = f"{prefix}{target}{suffix}"
                 param = params[name]
                 param.weight_loader(
-                    param, value, name, shard_id=shard, expert_id=int(expert_id)
+                    param, value, name, shard_id=shard, expert_id=expert_id
                 )
             elif match := _PACKED_EXPERT.fullmatch(name):
                 prefix, projection = match.groups()

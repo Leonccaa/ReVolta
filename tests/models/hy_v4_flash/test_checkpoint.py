@@ -139,6 +139,7 @@ def test_real_index_maps_exactly(checkpoint_metadata, cpu_vllm, monkeypatch):
         module.__dict__.update(stubs)
         monkeypatch.setitem(sys.modules, path, module)
     config = get_config(checkpoint_metadata, trust_remote_code=False)
+    monkeypatch.setattr(HYV4FlashForCausalLM, "_load_engram_tables", lambda self: None)
     cpu_vllm.model_config = SimpleNamespace(hf_text_config=config, dtype=torch.float16)
     with torch.device("meta"):
         candidate = HYV4FlashForCausalLM(vllm_config=cpu_vllm)
@@ -163,6 +164,8 @@ def test_real_index_maps_exactly(checkpoint_metadata, cpu_vllm, monkeypatch):
 
     def checkpoint_weights():
         for name in keys:
+            if candidate.skip_checkpoint_weight(name):
+                continue
             if name.endswith(".experts.gate_up_proj"):
                 shape = (512, 3072, 1536)
             elif name.endswith(".experts.down_proj"):
@@ -175,13 +178,9 @@ def test_real_index_maps_exactly(checkpoint_metadata, cpu_vllm, monkeypatch):
     loaded = candidate.load_weights(checkpoint_weights())
     hash_state = candidate.model.engram_hash
     assert sorted(hash_state.maps) == [2, 12, 22, 32]
-    tables = {
-        f"model.layers.{i - 1}.engram_layer.multi_head_embedding.embedding.weight"
-        for i in hash_state.maps
-    }
     for i in hash_state.maps:
-        assert candidate.model.layers[i - 1].engram_layer.table_loads == ["weight"]
-    assert loaded == params.keys() | tables
+        assert candidate.model.layers[i - 1].engram_layer.table_loads == []
+    assert loaded == params.keys()
     expected: Counter[tuple[str, str | int | None, int | None]] = Counter()
     for name in params:
         if name.endswith(".w13_weight"):

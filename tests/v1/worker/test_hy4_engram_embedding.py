@@ -43,6 +43,9 @@ def test_local_safetensors_reads_and_cpu_gather(tmp_path, monkeypatch):
             accesses.append(item)
             return self.wrapped[item]
 
+        def get_dtype(self):
+            return self.wrapped.get_dtype()
+
     class Reader:
         def __init__(self, *args, **kwargs):
             self.wrapped = actual_open(*args, **kwargs)

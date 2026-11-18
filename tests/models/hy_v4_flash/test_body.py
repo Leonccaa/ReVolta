@@ -184,6 +184,7 @@ def test_three_layer_body(
         FlashNgramHashState=StubHash,
     )
     config = HYV4FlashConfig(**cfg, engram_layer_ids=[2])
+    monkeypatch.setattr(HYV4FlashForCausalLM, "_load_engram_tables", lambda self: None)
     cpu_vllm.model_config = SimpleNamespace(hf_text_config=config, dtype=torch.float32)
     candidate = HYV4FlashForCausalLM(vllm_config=cpu_vllm)
     weights = [

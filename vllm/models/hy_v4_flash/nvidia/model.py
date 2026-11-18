@@ -2,11 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """HYV4 Flash text backbone (vllm-project/vllm#68296)."""
 
+import json
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
 import regex as re
 import torch
+from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, cached_file
 
 from vllm.config import CacheConfig, VllmConfig
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -32,6 +35,7 @@ _PACKED_EXPERT = re.compile(r"(layers\.\d+\.mlp\.experts)\.(gate_up_proj|down_pr
 _EXPERT_SHARDS = {"gate_proj": "w1", "up_proj": "w3", "down_proj": "w2"}
 _ENGRAM = re.compile(r"layers\.(\d+)\.engram_layer\.(.+)")
 _SKIP_PREFIXES = ("vit.", "dfly_layers.", "model.dfly_layers.")
+_ENGRAM_WEIGHT = ".engram_layer.multi_head_embedding.embedding.weight"
 
 
 class HYV4FlashDecoderLayer(HYV4DecoderLayer):
@@ -171,10 +175,6 @@ class HYV4FlashModel(HYV4Model):
                         continue
                     engram_layer = self.layers[int(layer)].engram_layer
                     embedding = engram_layer.multi_head_embedding
-                    if leaf.startswith("multi_head_embedding.embedding."):
-                        embedding.load_weight(leaf.rsplit(".", 1)[1], value)
-                        loaded.add(name)
-                        continue
                     if leaf.startswith("lookup_per_head_norms."):
                         _, head, suffix = leaf.split(".", 2)
                         if not embedding.head_start <= int(head) < embedding.head_end:
@@ -222,6 +222,8 @@ class HYV4FlashForCausalLM(HYV4ForCausalLM):
             )
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         self.token_lookback_depth = self.model.token_lookback_depth
+        self.checkpoint_model_config = vllm_config.model_config
+        self.checkpoint_cache_dir = vllm_config.load_config.download_dir
 
     def forward(
         self,
@@ -241,19 +243,37 @@ class HYV4FlashForCausalLM(HYV4ForCausalLM):
 
     @staticmethod
     def skip_checkpoint_weight(name: str) -> bool:
-        return name.startswith(_SKIP_PREFIXES)
-
-    @staticmethod
-    def map_checkpoint_weight(name: str) -> bool:
-        # The host table loader copies only the rank's hash heads. Mapping the
-        # table avoids materializing the other heads in the direct I/O path.
-        return name.endswith(
-            (
-                ".engram_layer.multi_head_embedding.embedding.weight",
-                ".engram_layer.multi_head_embedding.embedding.weight_scale_inv",
-            )
+        return name.startswith(_SKIP_PREFIXES) or name.endswith(
+            (_ENGRAM_WEIGHT, _ENGRAM_WEIGHT + "_scale_inv")
         )
+
+    def _load_engram_tables(self) -> None:
+        if not self.model.engram_indices:
+            return
+        config = self.checkpoint_model_config
+        assert config is not None
+        index_path = cached_file(
+            config.model,
+            SAFE_WEIGHTS_INDEX_NAME,
+            cache_dir=self.checkpoint_cache_dir,
+            revision=config.revision,
+        )
+        assert index_path is not None
+        index = Path(index_path)
+        weight_map = json.loads(index.read_text())["weight_map"]
+        for layer_idx in self.model.engram_indices:
+            name = f"model.layers.{layer_idx}{_ENGRAM_WEIGHT}"
+            if name + "_scale_inv" not in weight_map:
+                raise ValueError(
+                    "Engram tables require FP8 weights and BF16 row scales"
+                )
+            path = index.parent / weight_map[name]
+            self.model.layers[
+                layer_idx
+            ].engram_layer.multi_head_embedding.load_from_safetensors(str(path), name)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self, skip_prefixes=list(_SKIP_PREFIXES))
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        self._load_engram_tables()
+        return loaded

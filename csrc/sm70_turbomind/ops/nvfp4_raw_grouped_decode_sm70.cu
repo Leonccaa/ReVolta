@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 // Opt-in Qwen3.8 TP4 raw-E4M3 grouped decode, M=1..40 (runtime M=2..40).
-// Dataflow derived from nvfp4_grouped_decode_sm70.cu; deterministic CSR
-// routing derived from awq_grouped_decode_sm70.cu. QPN MMA layout originates
-// in dnv2003/v100-skinny (MIT; see adjacent LICENSE.v100-skinny).
+// Dataflow and integer routing derived from nvfp4_grouped_decode_sm70.cu.
+// The compact plan layout comes from awq_grouped_decode_sm70.cu. QPN MMA
+// originates in dnv2003/v100-skinny (MIT; see adjacent LICENSE.v100-skinny).
 // Three launches, fixed storage, current stream, no allocation/readback/tuning.
 // K16 groups ascend inside each contiguous split. Four K4 MMA instructions
 // accumulate in FP32 per group; W13 joins splits in increasing split order.
@@ -42,84 +42,48 @@ __device__ __forceinline__ half read_scale(uint8_t code, float global) {
                 __float2half_rn(16384.0f));
 }
 
-// Deterministic, atomic-free routing plan. blockDim.x == kExperts.
-__global__ void __launch_bounds__(kExperts)
-    grouped_plan_kernel(const int32_t* __restrict__ ids, int routes, int cap,
-                        int32_t* __restrict__ plan, half* intermediate) {
-  __shared__ int s_id[kMaxRoutes];
-  __shared__ int s_ordinal[kMaxRoutes];
-  __shared__ int s_count[kExperts];
-  __shared__ int s_first_row[kExperts];
-  __shared__ int s_warp_packs[kExperts / 32];
-  __shared__ int s_warp_rows[kExperts / 32];
+// Upstream 1Cat eb8448193a reserves groups with integer atomics. Also reserve
+// a compact row span per expert so the existing plan needs only 400 rows.
+__global__ void grouped_plan_kernel(const int32_t* __restrict__ ids, int routes,
+                                    int32_t* __restrict__ plan,
+                                    half* intermediate) {
+  __shared__ int counts[kExperts];
+  __shared__ int group_base[kExperts];
+  __shared__ int row_base[kExperts];
+  __shared__ int total_groups, total_rows;
   const int t = threadIdx.x;
-  const int lane = t & 31;
-  const int warp = t >> 5;
-  s_count[t] = 0;
-  if (t < kMaxRoutes) {
-    int id = t < routes ? ids[t] : -1;
-    if (id < 0 || id >= kExperts) id = -1;  // invalid routes contribute zero
-    s_id[t] = id;
-    if (t < routes && id < 0) {
+  for (int e = t; e < kExperts; e += blockDim.x) counts[e] = 0;
+  if (t == 0) total_groups = total_rows = 0;
+  __syncthreads();
+  int expert = 0, ordinal = -1;
+  if (t < routes) {
+    expert = ids[t];
+    if (expert >= 0 && expert < kExperts) {
+      ordinal = atomicAdd(counts + expert, 1);
+    } else {
       for (int c = 0; c < 160; ++c)
         intermediate[t * 160 + c] = __float2half(0.f);
     }
   }
   __syncthreads();
-  if (warp == 0) {
-    for (int base = 0; base < routes; base += 32) {
-      const int r = base + lane;
-      const int id = r < routes ? s_id[r] : -1;
-      const unsigned peers = __match_any_sync(0xffffffffu, id);
-      const unsigned lower = peers & ((1u << lane) - 1u);
-      int ordinal = -1;
-      if (id >= 0) ordinal = s_count[id] + __popc(lower);
-      __syncwarp();
-      // The lowest lane of each id group advances that expert's count.
-      if (id >= 0 && lower == 0) s_count[id] += __popc(peers);
-      if (r < routes) s_ordinal[r] = ordinal;
-      __syncwarp();
+  for (int e = t; e < kExperts; e += blockDim.x) {
+    const int count = counts[e];
+    if (count > 0) {
+      group_base[e] = atomicAdd(&total_groups, (count + kPack - 1) / kPack);
+      row_base[e] = atomicAdd(&total_rows, count);
     }
   }
   __syncthreads();
-  // Block-wide exclusive scans (in expert order) of the pack and row counts.
-  const int count = s_count[t];
-  const int npacks = (count + cap - 1) / cap;
-  int packs_incl = npacks;
-  int rows_incl = count;
-#pragma unroll
-  for (int offset = 1; offset < 32; offset <<= 1) {
-    const int packs = __shfl_up_sync(0xffffffffu, packs_incl, offset);
-    const int rows = __shfl_up_sync(0xffffffffu, rows_incl, offset);
-    if (lane >= offset) {
-      packs_incl += packs;
-      rows_incl += rows;
+  if (t == 0) plan[0] = total_groups;
+  if (ordinal >= 0) {
+    const int row = row_base[expert] + ordinal;
+    plan[kPlanRows + row] = t;
+    if (ordinal % kPack == 0) {
+      const int group = group_base[expert] + ordinal / kPack;
+      plan[kPlanExperts + group] = expert;
+      plan[kPlanCounts + group] = min(kPack, counts[expert] - ordinal);
+      plan[kPlanStarts + group] = row;
     }
-  }
-  if (lane == 31) {
-    s_warp_packs[warp] = packs_incl;
-    s_warp_rows[warp] = rows_incl;
-  }
-  __syncthreads();
-  int packs_base = 0;
-  int rows_base = 0;
-  for (int w = 0; w < warp; ++w) {
-    packs_base += s_warp_packs[w];
-    rows_base += s_warp_rows[w];
-  }
-  const int first_pack = packs_base + packs_incl - npacks;
-  const int first_row = rows_base + rows_incl - count;
-  s_first_row[t] = first_row;
-  for (int p = 0; p < npacks; ++p) {
-    plan[kPlanExperts + first_pack + p] = t;
-    plan[kPlanCounts + first_pack + p] = min(cap, count - p * cap);
-    plan[kPlanStarts + first_pack + p] = first_row + p * cap;
-  }
-  if (t == kExperts - 1) plan[0] = packs_base + packs_incl;
-  __syncthreads();
-  if (t < routes) {
-    const int id = s_id[t];
-    if (id >= 0) plan[kPlanRows + s_first_row[id] + s_ordinal[t]] = t;
   }
 }
 
@@ -339,8 +303,8 @@ void run(torch::Tensor out, torch::Tensor intermediate, torch::Tensor plan,
   at::assert_no_overlap(out, plan);
   at::assert_no_overlap(intermediate, plan);
   const auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
-  grouped_plan_kernel<<<1, kExperts, 0, stream>>>(
-      ids.data_ptr<int32_t>(), routes, kPack, plan.data_ptr<int32_t>(),
+  grouped_plan_kernel<<<1, routes <= 256 ? 256 : 512, 0, stream>>>(
+      ids.data_ptr<int32_t>(), routes, plan.data_ptr<int32_t>(),
       reinterpret_cast<half*>(intermediate.data_ptr()));
 #define LAUNCH(S, I)                                        \
   w13_kernel<S, I><<<dim3(5, routes), 64 * S, 0, stream>>>( \

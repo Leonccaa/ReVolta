@@ -8,14 +8,10 @@ from vllm.triton_utils import tl, triton
 
 @triton.jit
 def _round_nearest_even_i32(x):
-    return tl.inline_asm_elementwise(
-        "cvt.rni.s32.f32 $0, $1;",
-        constraints="=r,f",
-        args=[x],
-        dtype=tl.int32,
-        is_pure=True,
-        pack=1,
-    )
+    # The encoder's mantissas fit in the unit-ULP binade around 1.5 * 2**23.
+    # FP32 addition then rounds ties to even in both Triton execution modes.
+    biased = x + 12582912.0
+    return biased.to(tl.int32, bitcast=True) - 0x4B400000
 
 
 @triton.jit

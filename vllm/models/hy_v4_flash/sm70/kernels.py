@@ -5,6 +5,7 @@ import torch
 
 from vllm.models.deepseek_v4.common.ops.fp8_software import (
     fp8_e4m3fn_bits_to_fp32_bitcast,
+    fp32_to_fp8_e4m3fn_bits,
 )
 from vllm.triton_utils import tl, triton
 
@@ -27,13 +28,62 @@ def load_main_kv(kb, d, r, live, LATENT: tl.constexpr):
 
 
 def pack_fp8_ds_mla_torch(kv_c: torch.Tensor, k_pe: torch.Tensor) -> torch.Tensor:
-    """CPU counterpart of concat_and_cache_mla's FP16-input fp8_ds_mla writer."""
+    """Torch reference for fp8_ds_mla with an FP16 RoPE tail."""
     groups = kv_c.float().unflatten(-1, (-1, 128))
     scales = (groups.abs().amax(-1) / 448.0).clamp_min(torch.finfo(torch.float32).tiny)
     codes = (groups / scales[..., None]).to(torch.float8_e4m3fn).flatten(-2)
     return torch.cat(
         (codes.view(torch.uint8), scales.view(torch.uint8), k_pe.view(torch.uint8)),
         dim=-1,
+    )
+
+
+@triton.jit
+def _cache_fp8_ds_mla(
+    Latent,
+    Rope,
+    Cache,
+    Slots,
+    stride_latent,
+    stride_rope,
+    stride_page,
+    stride_row,
+    PAGE: tl.constexpr,
+):
+    token = tl.program_id(0)
+    slot = tl.load(Slots + token)
+    if slot < 0:
+        return
+
+    row = Cache + (slot // PAGE) * stride_page + (slot % PAGE) * stride_row
+    group = tl.arange(0, 4)
+    d = group[:, None] * 128 + tl.arange(0, 128)[None, :]
+    values = tl.load(Latent + token * stride_latent + d).to(tl.float32)
+    amax = tl.max(tl.abs(values), axis=1)
+    scale = tl.maximum(tl.div_rn(amax, 448.0), 2.0**-126)
+    codes = fp32_to_fp8_e4m3fn_bits(tl.div_rn(values, scale[:, None]))
+    tl.store(row + d, codes)
+    tl.store((row + 512).to(tl.pointer_type(tl.float32)) + group, scale)
+
+    r = tl.arange(0, 64)
+    rope = tl.load(Rope + token * stride_rope + r)
+    tl.store((row + 528).to(tl.pointer_type(tl.float16)) + r, rope)
+
+
+def cache_fp8_ds_mla(
+    kv_c: torch.Tensor, k_pe: torch.Tensor, cache: torch.Tensor, slots: torch.Tensor
+) -> None:
+    _cache_fp8_ds_mla[(slots.numel(),)](
+        kv_c,
+        k_pe,
+        cache,
+        slots,
+        kv_c.stride(0),
+        k_pe.stride(0),
+        cache.stride(0),
+        cache.stride(1),
+        cache.shape[1],
+        num_warps=4,
     )
 
 

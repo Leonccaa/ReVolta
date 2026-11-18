@@ -763,6 +763,7 @@ def test_cuda_decode_graph_replays_eager(
     if cache_dtype == "fp8_ds_mla":
         config.kv_lora_rank = 512
         config.qk_rope_head_dim = config.swa_qk_rope_head_dim = 64
+        config.compressed_indexer_head_dim = 128
         config.num_attention_heads = 8
         config.swa_num_attention_heads = 16
         prefixes = (2047, 2051, 510, 511)

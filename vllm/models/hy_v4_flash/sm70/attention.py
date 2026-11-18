@@ -30,7 +30,12 @@ from vllm.v1.worker.workspace import current_workspace_manager
 from .cache import POOL_PAGE, FlashCache, FlashMetadata, FlashSWABackend
 from .decode import decode_slots
 from .indexpool import FlashCompressedIndexer
-from .kernels import pack_fp8_ds_mla_torch, paged_attention, paged_attention_torch
+from .kernels import (
+    cache_fp8_ds_mla,
+    pack_fp8_ds_mla_torch,
+    paged_attention,
+    paged_attention_torch,
+)
 from .rotary import apply_rotary, rotary_phases
 from .splitk import decode_workspace_specs, paged_attention_splitk
 from .swa import window_indices
@@ -133,14 +138,14 @@ class HYV4FlashAttention(nn.Module):
             POOL_PAGE * config.compressed_indexer_compress_ratio,
         )
         fp8_kv = vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
-        self.main_cache_dtype = "fp8_ds_mla" if fp8_kv else "auto"
+        main_cache_dtype = "fp8_ds_mla" if fp8_kv else "auto"
         cache_args = dict(
             block_size=block_size,
             num_kv_heads=1,
             head_size=self.kv_lora_rank + self.qk_rope_head_dim,
             dtype=torch.uint8 if fp8_kv else torch.float16,
-            cache_dtype_str=self.main_cache_dtype,
-            kv_quant_mode=get_kv_quant_mode(self.main_cache_dtype),
+            cache_dtype_str=main_cache_dtype,
+            kv_quant_mode=get_kv_quant_mode(main_cache_dtype),
             dcp_sharded=False,
         )
         if self.is_window_layer:
@@ -229,14 +234,12 @@ class HYV4FlashAttention(nn.Module):
                 hidden_states, q_c, positions, cos, sin, metadata, indices, page
             )
         if q.is_cuda:
-            ops.concat_and_cache_mla(
-                kv_c[:tokens],
-                k_pe[:tokens],
-                cache,
-                slots,
-                self.main_cache_dtype,
-                self._k_scale,
-            )
+            if cache.dtype == torch.uint8:
+                cache_fp8_ds_mla(kv_c[:tokens], k_pe[:tokens], cache, slots)
+            else:
+                ops.concat_and_cache_mla(
+                    kv_c[:tokens], k_pe[:tokens], cache, slots, "auto", self._k_scale
+                )
             if main.decode:
                 workspace = current_workspace_manager().get_simultaneous(
                     *self._decode_workspace_specs

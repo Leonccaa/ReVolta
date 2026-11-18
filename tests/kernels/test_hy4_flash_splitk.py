@@ -6,8 +6,8 @@ import os
 import pytest
 import torch
 
-from vllm import _custom_ops as ops
 from vllm.models.hy_v4_flash.sm70.kernels import (
+    cache_fp8_ds_mla,
     pack_fp8_ds_mla_torch,
     paged_attention,
     paged_attention_torch,
@@ -103,22 +103,32 @@ def test_fp8_main_kv_matches_reference(device, heads, width, lengths):
     kv_c = torch.randn(width, 4, 128, generator=rng)
     kv_c = (kv_c * torch.tensor([0.125, 1, 4, 2])[None, :, None]).flatten(1).half()
     kv_c[0, :128] = 0
-    k_pe = torch.randn(width, 64, generator=rng).half()
-    cache = torch.zeros(width // page, page + 1, 656, dtype=torch.uint8, device=device)
-    cache = cache[:, :page]
-    if device == "cuda":
-        ops.concat_and_cache_mla(
-            kv_c.to(device),
-            k_pe.to(device),
-            cache,
-            torch.arange(width, device=device),
-            "fp8_ds_mla",
-            torch.ones((), device=device),
+    # A power-of-two scale makes these E4M3FN midpoints exact after division.
+    # Cover the largest finite code, signed subnormals and ties on both sides.
+    edge_values = (
+        torch.tensor(
+            [448, -448, 2**-10, -(3 * 2**-10), 15 * 2**-10, 1.0625, -1.1875],
+            dtype=torch.float16,
         )
-    else:
-        cache.copy_(pack_fp8_ds_mla_torch(kv_c, k_pe).view_as(cache))
+        / 128
+    )
+    kv_c[0, 128:256] = 0
+    kv_c[0, 128 : 128 + edge_values.numel()] = edge_values
+    k_pe = torch.randn(width, 64, generator=rng).half()
+    storage = torch.zeros(
+        width // page + 1, page + 1, 656, dtype=torch.uint8, device=device
+    )
+    cache = storage[1:, :page]
+    cache_fp8_ds_mla(
+        torch.cat((kv_c[-1:], kv_c)).to(device),
+        torch.cat((k_pe[-1:], k_pe)).to(device),
+        cache,
+        torch.arange(-1, width, device=device),
+    )
+    assert storage[0].eq(0).all()
 
     packed = cache.cpu().reshape(width, 656)
+    assert torch.equal(packed, pack_fp8_ds_mla_torch(kv_c, k_pe))
     scales = packed[:, 512:528].view(torch.float32)
     groups = kv_c.float().reshape(width, 4, 128)
     expected_scales = (groups.abs().amax(-1) / 448).clamp_min(
@@ -129,7 +139,6 @@ def test_fp8_main_kv_matches_reference(device, heads, width, lengths):
     codes = packed[:, :512].view(torch.float8_e4m3fn).float().view_as(groups)
     scaled = groups / scales[..., None]
     nearest = scaled.to(torch.float8_e4m3fn).float()
-    # CPU and CUDA float division may round to opposite sides of a midpoint.
     torch.testing.assert_close(
         (codes - scaled).abs(), (nearest - scaled).abs(), rtol=0, atol=2e-4
     )

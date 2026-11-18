@@ -16,15 +16,21 @@ from vllm.models.hy_v4_flash.sm70.attention import HYV4FlashAttention
 from vllm.models.hy_v4_flash.sm70.kernels import index_scores, paged_attention
 from vllm.models.hy_v4_flash.sm70.swa import window_indices
 from vllm.platforms import current_platform
+from vllm.sampling_params import SamplingParams
+from vllm.utils.hashing import sha256
 from vllm.utils.torch_utils import set_default_torch_dtype
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.kv_cache_view import bind_attention_cache
+from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
     generate_scheduler_kv_cache_config,
     get_kv_cache_config_from_groups,
     get_kv_cache_groups,
+    get_request_block_hasher,
+    init_none_hash,
 )
 from vllm.v1.kv_cache_interface import CircularBufferSpec, SlidingWindowMLASpec
+from vllm.v1.request import Request
 from vllm.v1.worker.utils import compressed_kernel_block_size
 
 
@@ -371,9 +377,40 @@ def test_tp4_weight_loading_and_output(vllm_config, hf_layers, monkeypatch, idx)
         )
         results.append(PagedLayer(shard, vllm_config, length).step((x, 0, 0)))
         handle.remove()
-    assert_parity(torch.cat(head_results, dim=-1), expected_heads[0])
+    torch.testing.assert_close(
+        torch.cat(head_results, dim=-1), expected_heads[0], atol=0, rtol=0
+    )
     reduced = torch.stack(results).float().sum(0).half()
     assert_parity(model.post_proj_norm(reduced), full)
+
+
+@torch.inference_mode()
+def test_mixed_requests_preserve_independent_group_tails(
+    vllm_config, hf_layers, monkeypatch
+):
+    length = 21
+    model = make_layer(vllm_config, text_config(), 0, length * 2, monkeypatch)
+    load_layer(model, hf_layers[0][0].state_dict())
+    rng = torch.Generator().manual_seed(45)
+    a, b = torch.randn(2, length, 32, generator=rng).half().unbind()
+    pool = model.indexer.k_cache
+
+    def closed_groups(runner, req):
+        return pool.kv_cache[runner.tables[pool.prefix][req, 0], : length // 4]
+
+    solo = PagedLayer(model, vllm_config, length)
+    expected_a = solo.step((a, 0, 17))
+    pool_a = closed_groups(solo, 0).clone()
+    solo = PagedLayer(model, vllm_config, length)
+    expected_b = solo.step((b, 0, 223))
+    pool_b = closed_groups(solo, 0).clone()
+    paged = PagedLayer(model, vllm_config, length, requests=2)
+    for a0, a1, b0, b1 in [(0, 3, 0, 5), (3, 4, 5, 12), (4, 21, 12, 21)]:
+        result = paged.step((a[a0:a1], a0, 17), (b[b0:b1], b0, 223))
+        assert_parity(result[: a1 - a0], expected_a[a0:a1])
+        assert_parity(result[a1 - a0 :], expected_b[b0:b1])
+    torch.testing.assert_close(closed_groups(paged, 0), pool_a, atol=0, rtol=0)
+    torch.testing.assert_close(closed_groups(paged, 1), pool_b, atol=0, rtol=0)
 
 
 def test_window_boundaries():
@@ -455,6 +492,104 @@ def test_scheduler_page_layout(vllm_config, monkeypatch, n_swa):
             )
             assert layer.kv_cache.shape == shape
             assert layer.kv_cache.stride(0) * layer.kv_cache.element_size() == stride
+
+
+@torch.inference_mode()
+def test_page_aligned_prefix_reuse(vllm_config, hf_layers, monkeypatch):
+    prefix, length = 2048, 2061
+    cfg = text_config()
+    x = torch.randn(length, 32, generator=torch.Generator().manual_seed(92)).half()
+    vllm_config.model_config = SimpleNamespace(max_model_len=4096)
+    vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = False
+    models = [make_layer(vllm_config, cfg, i, length, monkeypatch) for i in range(2)]
+    for i, model in enumerate(models):
+        load_layer(model, hf_layers[0][i].state_dict())
+    # Compare against the same split without a cache hit, so the batch shapes match.
+    expected = []
+    for model in models:
+        cold = PagedLayer(model, vllm_config, length)
+        cold.step((x[:prefix], 0, 0))
+        expected.append(cold.step((x[prefix:], prefix, 0)))
+    owners = vllm_config.compilation_config.static_forward_context
+    groups = get_kv_cache_groups(
+        vllm_config, {name: layer.spec for name, layer in owners.items()}
+    )
+    cache = get_kv_cache_config_from_groups(vllm_config, groups, 2 << 20)
+    manager = KVCacheManager(
+        generate_scheduler_kv_cache_config([cache]),
+        max_model_len=4096,
+        max_in_flight_tokens=2048,
+        hash_block_size=256,
+        enable_caching=True,
+    )
+    paged = [PagedLayer(model, vllm_config, length) for model in models]
+    for tensor in cache.kv_cache_tensors:
+        raw = torch.zeros(tensor.size, dtype=torch.int8)
+        for name in tensor.shared_by:
+            owner = owners[name]
+            spec = owner.spec
+            page = (
+                compressed_kernel_block_size(spec)
+                if spec.storage_block_size != spec.block_size
+                else spec.block_size
+            )
+            shape = (
+                cache.num_blocks * spec.storage_block_size // page,
+                page,
+                spec.head_size,
+            )
+            owner.bind_kv_cache(
+                bind_attention_cache(
+                    raw,
+                    shape=shape,
+                    dtype=spec.dtype,
+                    page_size_bytes=spec.page_size_bytes,
+                    scheduler_block_size=spec.storage_block_size,
+                    kernel_block_size=page,
+                    block_dim=0,
+                )
+            )
+    init_none_hash(sha256)
+    hasher = get_request_block_hasher(256, sha256)
+    first = Request(
+        "first",
+        list(range(prefix)),
+        SamplingParams(max_tokens=1),
+        None,
+        block_hasher=hasher,
+    )
+    assert manager.allocate_slots(first, prefix) is not None
+    group_by_owner = {
+        name: i for i, group in enumerate(groups) for name in group.layer_names
+    }
+
+    def set_tables(request, runner):
+        block_ids = manager.get_block_ids(request.request_id)
+        for owner in runner.owners:
+            runner.tables[owner.prefix] = torch.tensor(
+                [block_ids[group_by_owner[owner.prefix]]], dtype=torch.int32
+            )
+
+    for runner in paged:
+        set_tables(first, runner)
+        runner.step((x[:prefix], 0, 0))
+    manager.free(first)
+    second = Request(
+        "second",
+        list(range(length)),
+        SamplingParams(max_tokens=1),
+        None,
+        block_hasher=hasher,
+    )
+    blocks, hit = manager.get_computed_blocks(second)
+    assert hit == prefix
+    ring_gid = group_by_owner[models[0].indexer.tail_cache.prefix]
+    assert not blocks.blocks[ring_gid]
+    assert manager.allocate_slots(second, length - hit, hit, blocks) is not None
+    for runner, target in zip(paged, expected):
+        set_tables(second, runner)
+        result = runner.step((x[prefix:], prefix, 0))
+        torch.testing.assert_close(result, target, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(

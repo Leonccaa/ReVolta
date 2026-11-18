@@ -85,10 +85,10 @@ def warn_if_graphs_outgrew_reserve(actual_bytes: int, reserve_bytes: int) -> int
     V2 reserves graph memory before capture. Whatever the graphs take beyond it
     comes out of the runtime headroom, so a large mixed batch can then run out
     of memory. Returns the suggested VLLM_V2_CUDAGRAPH_MEM_MIB, or 0 when the
-    reserve covered the graphs within max(64 MiB, 5%).
+    reserve covered the graphs within 5%.
     """
     excess = actual_bytes - reserve_bytes
-    if excess <= max(64 << 20, reserve_bytes // 20):
+    if excess <= reserve_bytes // 20:
         return 0
     suggested_mib = math.ceil(actual_bytes * 1.05 / (100 << 20)) * 100
     logger.warning(

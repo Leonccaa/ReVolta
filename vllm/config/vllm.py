@@ -1846,7 +1846,7 @@ class VllmConfig:
                 self.cache_config.cache_dtype,
             )
         if revolta_profile_enabled:
-            # The DFlash2 graph reserve depends on the resolved KV dtype.
+            # The graph reserve depends on the resolved KV dtype and draft schedule.
             apply_revolta_profile(
                 self.model_config,
                 self.parallel_config.tensor_parallel_size,
@@ -1858,6 +1858,11 @@ class VllmConfig:
                 ),
                 speculative_method=getattr(self.speculative_config, "method", None),
                 kv_cache_dtype=self.cache_config.cache_dtype,
+                num_speculative_tokens_per_batch_size=getattr(
+                    self.speculative_config,
+                    "num_speculative_tokens_per_batch_size",
+                    None,
+                ),
             )
 
         self.try_verify_and_update_config()

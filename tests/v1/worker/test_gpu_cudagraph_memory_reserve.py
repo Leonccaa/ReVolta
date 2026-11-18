@@ -51,9 +51,11 @@ GIB = 1 << 30
     [
         # MTP4 on the AWQ TP4 pool: within 0.3% of the 700 MiB reserve.
         (int(700.4 * MIB), 700 * MIB, 0),
-        # An overshoot within max(64 MiB, 5%) stays quiet.
-        (760 * MIB, 700 * MIB, 0),
+        # An overshoot within 5% stays quiet.
+        (630 * MIB, 600 * MIB, 0),
         (1560 * MIB, 1500 * MIB, 0),
+        # Dynamic MTP's graph pool exceeds the fixed MTP reserve by ~55 MiB.
+        (int(0.64 * GIB), 600 * MIB, 700),
         # DFlash2 against the MTP reserve: 1.37-1.39 GiB measured.
         (int(1.39 * GIB), 700 * MIB, 1500),
         (int(1.37 * GIB), 700 * MIB, 1500),

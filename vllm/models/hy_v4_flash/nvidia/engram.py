@@ -11,8 +11,11 @@ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import get_forward_context
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.hy_v4_flash.common.ngram_hash import (
     hash_ngrams_torch,
     hash_ngrams_triton,
@@ -268,3 +271,98 @@ class FlashEmbedding(nn.Module):
             output = rows * scales[local].float().unsqueeze(-1)
             output.masked_fill_(~valid.unsqueeze(-1), 0)
         return output
+
+
+class FlashEngram(nn.Module):
+    """Recall and gate a rank-sharded Flash Engram table into iHC streams."""
+
+    def __init__(self, vllm_config, layout, layer_id, prefix):
+        super().__init__()
+        config = vllm_config.model_config.hf_text_config
+        index = layout.layer_ids.index(layer_id)
+        sizes = [p for order in layout.primes[index] for p in order]
+        self.multi_head_embedding = FlashEmbedding(
+            sizes, layout.head_dim, vllm_config, f"{prefix}.multi_head_embedding"
+        )
+        self.hidden_size, self.hc_mult = config.hidden_size, config.hc_mult
+        local = self.multi_head_embedding
+        local_heads = local.head_end - local.head_start
+        self.lookup_per_head_norms = nn.ModuleList(
+            [nn.RMSNorm(layout.head_dim) for _ in range(local_heads)]
+        )
+        self.value_proj = nn.Linear(local_heads * layout.head_dim, self.hidden_size)
+        self.key_projs = nn.ModuleList(
+            [
+                nn.Linear(local_heads * layout.head_dim, self.hidden_size)
+                for _ in range(self.hc_mult)
+            ]
+        )
+        self.norm_key = nn.ModuleList(
+            [nn.RMSNorm(self.hidden_size) for _ in range(self.hc_mult)]
+        )
+        self.norm_query = nn.ModuleList(
+            [nn.RMSNorm(self.hidden_size) for _ in range(self.hc_mult)]
+        )
+        self.unified_pre_gamma = nn.Parameter(torch.empty(self.hidden_size))
+        self.unified_per_hc_scales = nn.ParameterList(
+            [nn.Parameter(torch.empty(self.hidden_size)) for _ in range(self.hc_mult)]
+        )
+        self.total_width = len(sizes) * layout.head_dim
+        self.start = local.head_start * layout.head_dim
+        self.stop = local.head_end * layout.head_dim
+        self.rank = get_tensor_model_parallel_rank()
+        for projection in [self.value_proj, *self.key_projs]:
+            set_weight_attrs(
+                projection.weight, {"weight_loader": self._load_projection}
+            )
+            set_weight_attrs(projection.bias, {"weight_loader": self._load_bias})
+
+    def _load_projection(self, parameter, value):
+        default_weight_loader(parameter, value[:, self.start : self.stop])
+
+    def _load_bias(self, parameter, value):
+        default_weight_loader(
+            parameter, value if self.rank == 0 else torch.zeros_like(value)
+        )
+
+    def forward(self, hidden, hashes):
+        local = self.multi_head_embedding
+        rows = local(hashes)
+        eps = torch.finfo(torch.float32).eps
+        gamma = torch.stack(
+            [norm.weight for norm in self.lookup_per_head_norms]
+        ).float()
+        rows = rows.masked_fill(
+            (hashes[:, local.head_start : local.head_end] < 0).unsqueeze(-1), 0
+        )
+        x = (
+            (rows * (rows.square().mean(-1, keepdim=True) + eps).rsqrt() * gamma)
+            .to(hidden.dtype)
+            .flatten(1)
+        )
+        gates = []
+        for channel in range(self.hc_mult):
+            key = self.key_projs[channel](x)
+            if local.tp_size > 1:
+                key = tensor_model_parallel_all_reduce(key)
+            key = key.float()
+            query = hidden[:, channel].float()
+            key = key * (key.square().mean(-1, keepdim=True) + eps).rsqrt()
+            query = query * (query.square().mean(-1, keepdim=True) + eps).rsqrt()
+            key = key * self.norm_key[channel].weight.float()
+            query = query * self.norm_query[channel].weight.float()
+            gate = (key * query).sum(-1) * self.hidden_size**-0.5
+            gates.append((gate.abs().clamp_min(1e-6).sqrt() * gate.sign()).sigmoid())
+        gate = torch.stack(gates, dim=1)
+        value = self.value_proj(x)
+        if local.tp_size > 1:
+            value = tensor_model_parallel_all_reduce(value)
+        value = value.float()
+        signal = (
+            self.unified_pre_gamma.float()
+            * value
+            * (value.square().mean(-1, keepdim=True) + eps).rsqrt()
+        )
+        scales = torch.stack(list(self.unified_per_hc_scales)).float()
+        result = ((gate.unsqueeze(-1) + scales) * signal.unsqueeze(1)).to(hidden.dtype)
+        return hidden + result.masked_fill((hashes < 0).all(-1)[:, None, None], 0)

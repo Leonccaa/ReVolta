@@ -364,8 +364,7 @@ about 5–8% slower. CPU offload works; the disk tier is not supported with INT8
 The checkpoint is about 126 GiB. Follow the
 [checkpoint setup](#standard-nvfp4-checkpoint-setup) for the pinned base,
 combined scale/draft pack and 512K views. This section covers the settings that
-matter once it loads. It is a draft: values marked `TODO` are still being
-measured.
+matter once it loads.
 
 ### Automatic configuration
 
@@ -398,13 +397,17 @@ KV cache through `VLLM_V2_CUDAGRAPH_MEM_MIB`:
 | --- | --- | ---: |
 | MTP | `fp8_per_token_head` or `int8` | 600 MiB |
 | MTP | other (for example `fp8_e4m3`) | 700 MiB |
-| DFlash2 | any | 1200 MiB, single-request tail graphs off |
+| DFlash2 | `fp8_per_token_head` or `int8` | 1024 MiB (1000 MiB for AWQ), single-request tail graphs off |
+| DFlash2 | other | 1200 MiB, single-request tail graphs off |
 
 If the startup log shows `CUDA graphs took … more than the reserve`, set
 `VLLM_V2_CUDAGRAPH_MEM_MIB` to at least the value in the message, or lower
 `--gpu-memory-utilization`. Otherwise the KV pool takes memory the graphs need
-and a large mixed step can run out of GPU memory. Measured capture size for
-NVFP4 with DFlash2 and tail graphs off: `TODO(measure)`.
+and a large mixed step can run out of GPU memory. Measured capture size per GPU
+with `fp8_per_token_head`: 0.51 GiB for NVFP4 with MTP4 and 0.95 GiB for NVFP4
+with DFlash2 (tail graphs off). Other capture sizes, such as additional draft
+widths from [dynamic speculative decoding](dynamic-speculative-decoding.md),
+add graphs: check the startup log after changing them.
 
 ### KV cache format
 
@@ -423,23 +426,24 @@ KV, per GPU:
 
 | Item | Standard NVFP4 (RadixArk) |
 | --- | ---: |
-| Weights | 21.56 GiB |
+| Weights | 21.48 GiB |
 | torch peak | 1.41 GiB |
 | Non-torch | 0.15 GiB |
-| Warmup | 0.76 GiB |
-| CUDA graphs | 0.68 GiB (measured under the earlier reserve) |
-| GPU KV cache | 5.57 GiB |
+| Warmup | 0.71 GiB |
+| CUDA graph reserve | 0.59 GiB |
+| GPU KV cache | 5.81 GiB |
 
 Uncensored AWQ weights take 22.01 GiB in the same configuration. Raw scales save
-about 1.69 GiB per GPU compared with prepared scales. A shared decode scratch
-buffer (about 91 MiB per GPU) is planned: `TODO(pending PR)`.
+about 1.69 GiB per GPU compared with prepared scales, and the MoE decode scratch
+is shared by all layers.
 
 ### `--gpu-memory-utilization`
 
-With long-context host KV and DFlash2, `0.95` could run out of memory on a large
-mixed step because the graph reserve was too small. The reserve is fixed in new
-versions. For versions before the fix, use 0.92–0.93. Recommended value for the
-new version: `TODO(measure)`.
+Use `0.95`. With long-context host KV, eight concurrent decodes plus three
+74K-token prompts completed at `0.95` with MTP4 and at `0.956` with DFlash2.
+Earlier versions reserved too little CUDA graph memory for NVFP4 with DFlash2
+and could run out of memory on a large mixed step at `0.95`; on those versions
+use 0.92–0.93.
 
 ### Speed compared with AWQ
 
@@ -461,10 +465,17 @@ Single-request figures are per speculative round.
   level. Single-request short-prompt throughput also depends on the MTP draft's
   acceptance rate, which comes from the draft shipped with the checkpoint, not
   from the NVFP4 kernel speed.
+- Graph all-reduces of 100–200 KiB now use the in-stream push kernel on PCIe
+  switches. Measured on NVFP4 after that change: MTP4 at 4 requests 214.7 →
+  224.0 tok/s and at 8 requests 316.9 → 328.7 tok/s; DFlash2 at 5 requests
+  243.7 → 269.9 tok/s. The table above predates it.
+- At four or more requests, three MTP drafts are faster than four (NVFP4, 4
+  requests: 240.9 against 217.5 tok/s), while one request accepts more with
+  four. [Dynamic speculative decoding](dynamic-speculative-decoding.md) switches
+  between them by batch size.
 - Prepared scales (`VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE=0`) run a single request
   about 0.5 ms per round faster, but are slower at 4 and 8 requests and use
-  1.69 GiB more per GPU, so the profile does not select them. This is being
-  optimized: `TODO`.
+  1.69 GiB more per GPU, so the profile does not select them.
 
 ### Settings you may change
 

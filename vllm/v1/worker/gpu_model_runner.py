@@ -1399,11 +1399,18 @@ class GPUModelRunner(
         # Only relevant for models using ALiBi (e.g, MPT)
         self.use_alibi = model_config.uses_alibi
 
-        ple_layer_ids = getattr(model_config.hf_text_config, "ple_layer_ids", ())
+        text_config = model_config.hf_text_config
+        ple_layer_ids = getattr(text_config, "ple_layer_ids", ())
         self.uses_ngram_embedding = bool(ple_layer_ids)
-        if self.uses_ngram_embedding:
-            self.ngram_context_len = int(model_config.hf_text_config.ngram_size) - 1
-            self.ngram_eos_token_id = int(model_config.hf_text_config.eos_token_id)
+        self.uses_flash_engram = text_config.model_type == "hy_v4_flash" and bool(
+            text_config.engram_layer_ids
+        )
+        if self.uses_flash_engram:
+            self.ngram_context_len = int(text_config.engram_max_ngram_size) - 1
+            self.ngram_eos_token_id = int(text_config.engram_pad_id)
+        elif self.uses_ngram_embedding:
+            self.ngram_context_len = int(text_config.ngram_size) - 1
+            self.ngram_eos_token_id = int(text_config.eos_token_id)
         else:
             self.ngram_context_len = 0
             self.ngram_eos_token_id = 0
@@ -1766,7 +1773,7 @@ class GPUModelRunner(
         self.inputs_embeds = self._make_buffer(
             self.max_num_tokens, self.inputs_embeds_size, dtype=self.dtype, numpy=False
         )
-        if self.uses_ngram_embedding:
+        if self.uses_ngram_embedding or self.uses_flash_engram:
             self.ngram_context = self._make_buffer(
                 self.max_num_reqs,
                 self.ngram_context_len,
@@ -6730,10 +6737,7 @@ class GPUModelRunner(
         num_reqs: int,
         num_reqs_padded: int,
     ) -> torch.Tensor:
-        """Copy committed per-request token history into the PLE context."""
-        if not self.uses_ngram_embedding:
-            raise RuntimeError("N-gram context requested for a non-PLE model")
-
+        """Copy committed per-request token history into the n-gram context."""
         eos_token_id = int(self.ngram_eos_token_id)
         context_cpu = self.ngram_context.np[:num_reqs_padded]
         context_cpu.fill(eos_token_id)
@@ -6811,6 +6815,26 @@ class GPUModelRunner(
                 num_reqs,
                 num_reqs_padded,
             )
+
+    def _maybe_add_flash_engram_kwargs(
+        self,
+        model_kwargs: dict[str, Any],
+        *,
+        num_reqs: int,
+        num_reqs_padded: int,
+        is_first_rank: bool,
+        is_encoder_decoder: bool,
+        use_dummy_context: bool,
+    ) -> None:
+        if not self.uses_flash_engram or not is_first_rank or is_encoder_decoder:
+            return
+        if use_dummy_context:
+            self.ngram_context.np[:num_reqs_padded].fill(self.ngram_eos_token_id)
+            self._copy_buffer_to_gpu(self.ngram_context, num_reqs_padded)
+            context = self.ngram_context.gpu[:num_reqs_padded]
+        else:
+            context = self._prepare_ngram_context(num_reqs, num_reqs_padded)
+        model_kwargs["lookback_token_ids"] = context
 
     def _preprocess(
         self,
@@ -6897,7 +6921,7 @@ class GPUModelRunner(
             model_kwargs = self._init_model_kwargs()
 
         if (
-            self.uses_ngram_embedding
+            (self.uses_ngram_embedding or self.uses_flash_engram)
             and is_first_rank
             and not is_encoder_decoder
             and input_ids is None
@@ -6913,6 +6937,14 @@ class GPUModelRunner(
             is_encoder_decoder=is_encoder_decoder,
             use_dummy_context=False,
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
+        )
+        self._maybe_add_flash_engram_kwargs(
+            model_kwargs,
+            num_reqs=num_reqs,
+            num_reqs_padded=num_reqs_padded,
+            is_first_rank=is_first_rank,
+            is_encoder_decoder=is_encoder_decoder,
+            use_dummy_context=False,
         )
 
         if self.uses_mrope:
@@ -11313,6 +11345,14 @@ class GPUModelRunner(
                 is_encoder_decoder=self.model_config.is_encoder_decoder,
                 use_dummy_context=True,
                 num_scheduled_tokens=num_scheduled_tokens,
+            )
+            self._maybe_add_flash_engram_kwargs(
+                model_kwargs,
+                num_reqs=num_reqs,
+                num_reqs_padded=num_reqs_padded,
+                is_first_rank=get_pp_group().is_first_rank,
+                is_encoder_decoder=self.model_config.is_encoder_decoder,
+                use_dummy_context=True,
             )
 
             if self._ple_offload_connector is not None:

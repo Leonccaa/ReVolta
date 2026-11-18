@@ -2084,14 +2084,10 @@ def group_and_unify_kv_cache_specs(
 ) -> list[UniformTypeKVCacheSpecs] | None:
     """
     Group the KV cache specs and unify each group into one UniformTypeKVCacheSpecs.
-    Currently, this is only used for DeepseekV4.
+    Hy4 Flash adds request-private IndexPool rings to the DeepSeek V4 layout.
     """
-    if not any(
-        isinstance(spec, SlidingWindowMLASpec) for spec in kv_cache_spec.values()
-    ):
-        return None
-
     mla_specs: dict[str, KVCacheSpec] = {}
+    ring_specs: dict[str, KVCacheSpec] = {}
     grouped_swa_mla_specs: dict[tuple[int, int], dict[str, KVCacheSpec]] = defaultdict(
         dict
     )
@@ -2103,8 +2099,13 @@ def group_and_unify_kv_cache_specs(
             grouped_swa_mla_specs[(spec.block_size, spec.sliding_window)][name] = spec
         elif isinstance(spec, MLAAttentionSpec):
             mla_specs[name] = spec
+        elif isinstance(spec, CircularBufferSpec):
+            ring_specs[name] = spec
+        else:
+            return None
 
-    assert len(mla_specs) > 0
+    if not mla_specs or not (grouped_swa_mla_specs or ring_specs):
+        return None
     mla_uniform_spec = UniformTypeKVCacheSpecs.from_specs(mla_specs)
     assert mla_uniform_spec is not None
 
@@ -2114,7 +2115,12 @@ def group_and_unify_kv_cache_specs(
         assert uniform_spec is not None
         swa_uniform_specs.append(uniform_spec)
 
-    return [mla_uniform_spec, *swa_uniform_specs]
+    groups = [mla_uniform_spec, *swa_uniform_specs]
+    if ring_specs:
+        ring_group = UniformTypeKVCacheSpecs.from_specs(ring_specs)
+        assert ring_group is not None
+        groups.append(ring_group)
+    return groups
 
 
 class _CSALinearCacheTuple(NamedTuple):
@@ -2824,20 +2830,10 @@ def _get_kv_cache_groups_uniform_groups(
         round_up(x, num_layer_tuples) for x in num_layer_tuples_per_group
     ]
 
-    swa_mla_specs = grouped_specs[1:]
-    assert all(
-        isinstance(spec, SlidingWindowMLASpec)
-        for group in swa_mla_specs
-        for spec in group.kv_cache_specs.values()
-    )
-
-    # Split each SWA UniformKV group into smaller groups to align their #(layer tuples)
-    # Possibly padding layer tuples for this.
-    # Additionally, we also pad KV blocks in each SWA layer, to align the page size
-    # with the corresponding layer in the full-MLA group.
+    # Pack SWA and request-private rings into matching full-MLA tensor slots.
     all_page_sizes = full_mla_spec.get_page_sizes()
-    swa_mla_groups = []
-    for sm_spec in swa_mla_specs:
+    short_lived_groups = []
+    for sm_spec in grouped_specs[1:]:
         sm_page_sizes = sm_spec.get_page_sizes()
         layers_per_size: dict[int, list[str]] = defaultdict(list)
         assert max(sm_page_sizes) <= max(all_page_sizes)
@@ -2875,14 +2871,14 @@ def _get_kv_cache_groups_uniform_groups(
             }
             sub_sm_spec = UniformTypeKVCacheSpecs.from_specs(group_layer_specs)
             assert sub_sm_spec is not None
-            swa_mla_groups.append(
+            short_lived_groups.append(
                 KVCacheGroupSpec(
                     layer_names=group_layer_names,
                     kv_cache_spec=sub_sm_spec,
                 )
             )
 
-    return [full_mla_group, *swa_mla_groups]
+    return [full_mla_group, *short_lived_groups]
 
 
 def _annotate_eagle_groups_deepseek_v4(

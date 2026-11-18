@@ -62,6 +62,9 @@ measurements remain unchanged; planar GPU acceptance is still pending.
   to eight concurrent requests, at temperature 1 with thinking, including tool calls and
   structured output. `greedy` still works with DFlash2. This setting is about drafting and
   draft verification only; clients can still use any sampling parameters.
+- **`num_speculative_tokens_per_batch_size` (optional MRv2 MTP schedule).**
+  Chooses the number of drafts per request from the scheduled batch size.
+  See [Dynamic Speculative Decoding](dynamic-speculative-decoding.md).
 - **`--watchdog-config` (opt-in stack-dump watchdog, from 0.1.4, #33).** JSON with three
   fields: `dump_dir` (directory for the dump files; the empty default disables the
   watchdog), `timeout` (seconds without progress after which the process counts as stuck,

@@ -228,6 +228,12 @@ class SpeculativeConfig:
     """The number of speculative tokens, if provided. It will default to the
     number in the draft model config if present; selector-based DFlash2 uses
     checkpoint ``block_size - 1``. Otherwise, it is required."""
+    num_speculative_tokens_per_batch_size: list[tuple[int, int, int]] | None = None
+    """Batch-size schedule used to dynamically choose speculative-token count.
+
+    Each entry is ``(range_start, range_end, num_speculative_tokens)`` with an
+    inclusive batch-size range.
+    """
     model: str | None = None
     """The name of the draft model, eagle head, or additional weights, if
     provided."""

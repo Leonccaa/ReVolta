@@ -2051,6 +2051,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states=hidden_states,
             aux_hidden_states=aux_hidden_states,
             finished_req_ids=finished_req_ids,
+            num_spec_tokens_to_schedule=scheduler_output.num_spec_tokens_to_schedule,
         )
         self._sm70_v2_mtp_profile_pending = mtp_profile_ctx
 
@@ -2064,16 +2065,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
     ) -> AsyncOutput | ModelRunnerOutput | None:
-        if self.execute_model_state is None:
+        execute_model_state = self.execute_model_state
+        if execute_model_state is None:
             # The prior execute_model call must have failed.
             return None
 
-        input_batch = self.execute_model_state.input_batch
-        attn_metadata = self.execute_model_state.attn_metadata
-        slot_mappings_by_layer = self.execute_model_state.slot_mappings_by_layer
-        hidden_states = self.execute_model_state.hidden_states
-        aux_hidden_states = self.execute_model_state.aux_hidden_states
-        finished_req_ids = self.execute_model_state.finished_req_ids
+        input_batch = execute_model_state.input_batch
+        attn_metadata = execute_model_state.attn_metadata
+        slot_mappings_by_layer = execute_model_state.slot_mappings_by_layer
+        hidden_states = execute_model_state.hidden_states
+        aux_hidden_states = execute_model_state.aux_hidden_states
+        finished_req_ids = execute_model_state.finished_req_ids
         self.execute_model_state = None
         if getattr(self, "host_history", None) is not None:
             self.kv_connector.seal_host_step()
@@ -2225,6 +2227,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     input_batch.num_reqs,
                     input_batch.idx_mapping,
                 )
+            num_draft_tokens = None
+            proposal_kwargs: dict[str, int] = {}
+            if self.speculator.method == "mtp":
+                num_draft_tokens = execute_model_state.num_spec_tokens_to_schedule
+                proposal_kwargs["num_speculative_tokens"] = num_draft_tokens
             draft_tokens = self.speculator.propose(
                 input_batch,
                 attn_metadata,
@@ -2256,12 +2263,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     if requires_host_token_state
                     else None
                 ),
+                **proposal_kwargs,
             )
             self._sm70_v2_mtp_profile_finish(
                 mtp_profile_ctx, "draft_total", mtp_draft_start
             )
+            if (
+                num_draft_tokens is not None
+                and num_draft_tokens < self.num_speculative_steps
+            ):
+                draft_tokens[:, num_draft_tokens:] = -1
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
-            num_draft_tokens = None
             if hasattr(self.speculator, "next_num_draft_tokens"):
                 num_draft_tokens = self.speculator.next_num_draft_tokens()
             self.draft_tokens_handler.set_draft_tokens(
@@ -2500,3 +2512,4 @@ class ExecuteModelState(NamedTuple):
     hidden_states: torch.Tensor | None
     aux_hidden_states: list[torch.Tensor] | None
     finished_req_ids: set[str]
+    num_spec_tokens_to_schedule: int

@@ -614,13 +614,14 @@ class EagleSpeculator:
         skip_attn: bool,
         batch_desc: BatchExecutionDescriptor,
         num_tokens_across_dp: torch.Tensor | None,
+        num_speculative_tokens: int,
         is_dummy_batch: bool = False,
     ) -> None:
         positions = self.input_buffers.positions[:num_reqs]
         query_start_loc = self.input_buffers.query_start_loc[: num_reqs + 1]
         idx_mapping = self.idx_mapping[:num_reqs]
 
-        for step in range(1, self.num_speculative_steps):
+        for step in range(1, num_speculative_tokens):
             attn_metadata = None
             slot_mappings_by_layer = None
             if not skip_attn:
@@ -817,7 +818,10 @@ class EagleSpeculator:
         sampled_token_ids_cpu: np.ndarray | None = None,
         num_sampled_tokens_cpu: np.ndarray | None = None,
         all_token_ids_cpu: np.ndarray | None = None,
+        num_speculative_tokens: int | None = None,
     ) -> torch.Tensor:
+        if num_speculative_tokens is None:
+            num_speculative_tokens = self.num_speculative_steps
         num_tokens = input_batch.num_tokens_after_padding
         num_reqs = input_batch.num_reqs
         max_query_len = input_batch.num_scheduled_tokens.max()
@@ -902,9 +906,9 @@ class EagleSpeculator:
             )
         self._mtp_prefill_end(num_reqs)
 
-        if self.num_speculative_steps == 1:
-            # Early exit.
-            return self.draft_tokens[:num_reqs, :1]
+        if num_speculative_tokens <= 1:
+            # The first forward still synchronizes draft KV at K=0.
+            return self.draft_tokens[:num_reqs]
 
         # Prepare the inputs for the decode steps.
         prepare_eagle_decode(
@@ -928,7 +932,7 @@ class EagleSpeculator:
             need_eager=is_profile,
         )
 
-        # Generate the remaining num_speculative_steps - 1 draft tokens.
+        # Generate the remaining drafts with the existing single-step graphs.
         self._mtp_decode_begin()
         try:
             self.multi_step_decode(
@@ -936,6 +940,7 @@ class EagleSpeculator:
                 dummy_run and skip_attn_for_dummy_run,
                 decode_batch_desc,
                 num_tokens_across_dp,
+                num_speculative_tokens,
                 is_dummy_batch=dummy_run,
             )
         finally:

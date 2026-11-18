@@ -264,6 +264,9 @@ class SchedulerOutput:
 
     host_kv: "HostKVStep | None" = None
 
+    # Proposal width for the next step, independent of this step's verification.
+    num_spec_tokens_to_schedule: int = 0
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

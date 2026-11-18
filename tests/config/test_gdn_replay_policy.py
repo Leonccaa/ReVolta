@@ -66,6 +66,8 @@ def engine_config(monkeypatch, tmp_path):
         gdn_replay=None,
         replay_graph=None,
         legacy_graph=True,
+        dynamic_schedule=None,
+        dp_size=1,
     ):
         target = tmp_path / "target"
         target.mkdir(exist_ok=True)
@@ -121,6 +123,7 @@ def engine_config(monkeypatch, tmp_path):
             tensor_parallel_size=4,
             decode_context_parallel_size=2 if hidden_size == 2560 else 1,
             distributed_executor_backend="mp",
+            data_parallel_size=dp_size,
         )
         spec = (
             None
@@ -131,6 +134,7 @@ def engine_config(monkeypatch, tmp_path):
                 model=str(draft) if method == "dflash" else None,
                 method=method,
                 num_speculative_tokens=7 if method == "dflash" else 4,
+                num_speculative_tokens_per_batch_size=dynamic_schedule,
                 draft_sample_method="greedy",
                 gdn_state_replay=gdn_replay,
                 gdn_state_replay_graph=replay_graph,
@@ -163,6 +167,23 @@ def engine_config(monkeypatch, tmp_path):
 
     yield build
     envs.disable_envs_cache()
+
+
+def test_dynamic_mtp_uses_fixed_k_with_data_parallelism(engine_config):
+    schedule = [[1, 3, 4], [4, 8, 3]]
+    single = engine_config(2560, method="mtp", dynamic_schedule=schedule)
+    assert single.speculative_config.num_speculative_tokens_per_batch_size == [
+        (1, 3, 4),
+        (4, 8, 3),
+    ]
+    parallel = engine_config(2560, method="mtp", dynamic_schedule=schedule, dp_size=2)
+    assert parallel.speculative_config.num_speculative_tokens_per_batch_size is None
+    assert parallel.num_speculative_tokens == 4
+
+
+def test_dynamic_mtp_explicit_empty_schedule_is_invalid(engine_config):
+    with pytest.raises(ValueError, match="must not be empty"):
+        engine_config(2560, method="mtp", dynamic_schedule=[])
 
 
 def test_explicit_replay_overrides_qualified_packed_default(engine_config):

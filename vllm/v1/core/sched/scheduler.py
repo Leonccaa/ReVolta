@@ -71,6 +71,7 @@ from vllm.v1.metrics.store import CPU_SAMPLE_STRIDE, StoreMetrics
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.ddtree_payload import DDTreeDraftPayload
+from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
@@ -292,6 +293,16 @@ class Scheduler(SchedulerInterface):
 
         self.use_eagle = False
         self.num_spec_tokens = vllm_config.num_speculative_tokens
+        self.dynamic_sd_lookup: list[int] | None = None
+        if (
+            speculative_config is not None
+            and speculative_config.num_speculative_tokens_per_batch_size is not None
+        ):
+            self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
+                speculative_config.num_speculative_tokens_per_batch_size,
+                vllm_max_batch_size=self.scheduler_config.max_num_seqs,
+                vllm_num_speculative_tokens=self.num_spec_tokens,
+            )
         # Last running total of rejection fallbacks seen from the workers.
         self._rejection_fallbacks_total = 0
         self.num_lookahead_tokens = vllm_config.num_lookahead_tokens
@@ -1681,6 +1692,12 @@ class Scheduler(SchedulerInterface):
         mamba_state_gathers = exact_end.pending_gathers
         exact_end.pending_gathers = []
 
+        num_spec_tokens_to_schedule = self.num_spec_tokens
+        if self.dynamic_sd_lookup is not None and num_scheduled_tokens:
+            num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
+                len(num_scheduled_tokens)
+            ]
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -1707,6 +1724,7 @@ class Scheduler(SchedulerInterface):
                 self.mixed_prefill_budget.tokens if control_mixed_prefill else 0
             ),
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             scheduled_ddtree_payloads=scheduled_ddtree_payloads or None,
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             num_common_prefix_blocks=num_common_prefix_blocks,

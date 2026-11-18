@@ -2998,6 +2998,47 @@ class VllmConfig:
             )
         current_platform.check_and_update_config(self)
 
+        spec_config = self.speculative_config
+        if (
+            spec_config
+            and spec_config.num_speculative_tokens_per_batch_size is not None
+        ):
+            from vllm.v1.spec_decode.dynamic.utils import (
+                validate_and_normalize_dynamic_sd_schedule,
+            )
+
+            validate_and_normalize_dynamic_sd_schedule(
+                spec_config.num_speculative_tokens_per_batch_size
+            )
+            if (
+                spec_config.method != "mtp"
+                or spec_config.dflash_concurrency_drafts is not None
+            ):
+                raise ValueError(
+                    "Dynamic speculative decoding requires method='mtp' "
+                    "without dflash_concurrency_drafts."
+                )
+            if self.parallel_config.data_parallel_size > 1:
+                logger.warning_once(
+                    "Disabling dynamic speculative decoding with data parallelism. "
+                    "Using fixed num_speculative_tokens=%d.",
+                    spec_config.num_speculative_tokens,
+                )
+                spec_config.num_speculative_tokens_per_batch_size = None
+            elif (
+                not self.use_v2_model_runner
+                or self.parallel_config.pipeline_parallel_size > 1
+            ):
+                raise ValueError("Dynamic speculative decoding requires MRv2 and PP1.")
+            elif (
+                self.model_config is not None
+                and self.model_config.is_hybrid
+                and self.cache_config.mamba_cache_mode != "align"
+            ):
+                raise ValueError(
+                    "Dynamic MTP on hybrid models requires mamba_cache_mode='align'."
+                )
+
         if self.use_v2_model_runner:
             self._validate_v2_model_runner()
 

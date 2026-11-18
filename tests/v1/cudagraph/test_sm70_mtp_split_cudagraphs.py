@@ -9,12 +9,17 @@ import torch
 
 from vllm.config import CompilationConfig, CUDAGraphMode
 from vllm.platforms.interface import DeviceCapability
-from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager
+from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager, ModelCudaGraphManager
+from vllm.v1.worker.gpu.spec_decode.eagle.cudagraph import (
+    DecodeEagleCudaGraphManager,
+    PrefillEagleCudaGraphManager,
+)
 
 
 def _make_config(max_num_seqs: int, verifier_sizes: list[int]):
     speculative_config = SimpleNamespace(
         method="mtp",
+        num_speculative_tokens_per_batch_size=None,
         num_speculative_state_tokens=lambda: 4,
     )
     return SimpleNamespace(
@@ -153,3 +158,44 @@ def test_dflash_lookup_captures_b1_q8_and_q16(monkeypatch) -> None:
     assert q8.uniform_token_count == 8
     assert q16.cg_mode == CUDAGraphMode.FULL
     assert q16.uniform_token_count == 16
+
+
+@pytest.mark.parametrize("split", [False, True])
+def test_dynamic_mtp_full_graph_shapes(monkeypatch, split):
+    from vllm.v1.worker.gpu import cudagraph_utils as cg
+
+    monkeypatch.setattr(cg, "_use_split_sm70_mtp_cudagraphs", lambda cfg: split)
+    monkeypatch.setattr(cg.current_platform, "get_global_graph_pool", lambda: None)
+    monkeypatch.setattr(cg, "get_pp_group", lambda: MagicMock())
+    config = _make_config(8, [5, 10, 20, 25, 40])
+    config.speculative_config.num_speculative_tokens_per_batch_size = [
+        (1, 3, 4),
+        (4, 7, 3),
+        (8, 8, 0),
+    ]
+    mode = CUDAGraphMode.FULL_AND_PIECEWISE
+    device = torch.device("cpu")
+    target = ModelCudaGraphManager(config, device, mode, 5)
+    first = PrefillEagleCudaGraphManager(config, device, mode, 5)
+    decode = DecodeEagleCudaGraphManager(
+        config, device, CUDAGraphMode.FULL_DECODE_ONLY, 1
+    )
+    assert first._capture_descs == target._capture_descs
+    for manager in (target, first):
+        manager._graphs_captured = True
+        for c, m, q in [(1, 5, 5), (4, 16, 4), (4, 20, 5), (5, 20, 4), (8, 8, 1)]:
+            desc = manager.dispatch(c, m, q)
+            assert desc in manager._capture_descs[CUDAGraphMode.FULL]
+            assert (desc.num_reqs, desc.num_tokens, desc.uniform_token_count) == (
+                c,
+                m,
+                q,
+            )
+        assert manager.dispatch(3, 15, 5).num_tokens == 20
+        assert manager.dispatch(4, 16, None).cg_mode == CUDAGraphMode.PIECEWISE
+        assert manager.dispatch(3, 12, 4).cg_mode == CUDAGraphMode.PIECEWISE
+    assert first.dispatch(3, 20, 4).cg_mode == CUDAGraphMode.PIECEWISE
+    assert {
+        desc.uniform_token_count for desc in decode._capture_descs[CUDAGraphMode.FULL]
+    } == {1}
+    assert config.compilation_config.cudagraph_capture_sizes == [5, 10, 20, 25, 40]

@@ -33,6 +33,10 @@ from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.spec_decode.dynamic.utils import (
+    DynamicSDSchedule,
+    build_dynamic_sd_schedule_lookup,
+)
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
@@ -364,6 +368,18 @@ class CudaGraphManager:
                         self._capture_sizes.append(size)
             self._capture_sizes.sort()
         self._init_candidates()
+        self._dynamic_sd_query_lens: set[int] = set()
+        schedule = (
+            speculative_config.num_speculative_tokens_per_batch_size
+            if speculative_config is not None and speculative_config.method == "mtp"
+            else None
+        )
+        if (
+            schedule is not None
+            and decode_query_len > 1
+            and cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+        ):
+            self._add_dynamic_sd_candidates(schedule)
 
     @property
     def max_captured_tokens(self) -> int:
@@ -450,6 +466,36 @@ class CudaGraphManager:
         for mode, descs in descs_by_mode.items():
             descs.sort(key=lambda d: d.num_tokens, reverse=True)
             self._capture_descs[mode] = descs
+
+    def _add_dynamic_sd_candidates(self, schedule: DynamicSDSchedule) -> None:
+        lookup = build_dynamic_sd_schedule_lookup(
+            schedule, self.max_num_reqs, self.decode_query_len - 1
+        )
+        self._dynamic_sd_query_lens = {
+            k + 1 for k in lookup[1:] if k + 1 < self.decode_query_len
+        }
+        full_descs = self._capture_descs.get(CUDAGraphMode.FULL, [])
+        narrow_descs = []
+        for wide_size in self._capture_sizes:
+            num_reqs, remainder = divmod(wide_size, self.decode_query_len)
+            if remainder or not 1 <= num_reqs <= self.max_num_reqs:
+                continue
+            for query_len in sorted(self._dynamic_sd_query_lens):
+                num_tokens = num_reqs * query_len
+                desc = BatchExecutionDescriptor(
+                    cg_mode=CUDAGraphMode.FULL,
+                    num_tokens=num_tokens,
+                    num_reqs=num_reqs,
+                    uniform_token_count=query_len,
+                )
+                narrow_descs.append(desc)
+                # Neighboring token counts can share the original padding list.
+                self._candidates[num_tokens] = [desc, *self._candidates[num_tokens]]
+
+        if narrow_descs:
+            self._capture_descs[CUDAGraphMode.FULL] = sorted(
+                [*full_descs, *narrow_descs], key=lambda d: d.num_tokens, reverse=True
+            )
 
     def needs_capture(self) -> bool:
         return len(self._capture_descs) > 0
@@ -558,6 +604,12 @@ class CudaGraphManager:
         """Find matching cudagraph descriptor from priority-ordered candidates."""
         if self._graphs_captured and 0 < num_tokens < len(self._candidates):
             for desc in self._candidates[num_tokens]:
+                if (
+                    desc.uniform_token_count in self._dynamic_sd_query_lens
+                    and desc.num_reqs != num_reqs
+                ):
+                    # Draft prefill can dispatch with the target's padded M.
+                    continue
                 if _is_compatible(desc, num_reqs, num_tokens, uniform_token_count):
                     return desc
         return BatchExecutionDescriptor(

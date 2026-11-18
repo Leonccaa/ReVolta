@@ -421,7 +421,13 @@ def test_pending_proposal_q_survives_other_requests_tail_changes(tmp_path, monke
     spec.input_buffers = InputBuffers(8, 40, torch.device("cpu"))
     generator = torch.Generator().manual_seed(121)
     features = torch.randn(40, 4, generator=generator, dtype=torch.float16)
-    spec.run_model = lambda n, *args, **kwargs: (features[:n], features[:n])
+    forwards = []
+
+    def run_model(n, *args, **kwargs):
+        forwards.append(n)
+        return features[:n], features[:n]
+
+    spec.run_model = run_model
     spec.block_tables = SimpleNamespace(compute_slot_mappings=lambda *args: {})
     spec.kv_cache_config = None
     spec._build_draft_attn_metadata = lambda **kwargs: {}
@@ -439,6 +445,7 @@ def test_pending_proposal_q_survives_other_requests_tail_changes(tmp_path, monke
         result._sm70_dflash2_tail_graphs = False
         result._candidates = []
         result._capture_descs = {}
+        result._dynamic_sd_query_lens = set()
         result._init_candidates()
         result._graphs_captured = True
 
@@ -472,7 +479,7 @@ def test_pending_proposal_q_survives_other_requests_tail_changes(tmp_path, monke
             is_prefilling_np=np.zeros(count, dtype=np.bool_),
         )
 
-    def propose(current):
+    def propose(current, k=None):
         count = current.num_reqs
         return spec.propose(
             current,
@@ -486,6 +493,7 @@ def test_pending_proposal_q_survives_other_requests_tail_changes(tmp_path, monke
             torch.zeros(8, dtype=torch.int64),
             torch.ones(8),
             torch.arange(8, dtype=torch.int64) + 93,
+            num_speculative_tokens=k,
         )
 
     # A full batch leaves every persistent mapping entry pointing at a real request.
@@ -541,6 +549,12 @@ def test_pending_proposal_q_survives_other_requests_tail_changes(tmp_path, monke
     resume.cu_num_logits = torch.tensor([0, 5], dtype=torch.int32)
     runner.sample(features[:5], resume, None)
     assert consumed == [pending_q]
+
+    for k in (4, 3, 0, 1, 4):
+        forwards.clear()
+        proposal = propose(active, k)
+        assert forwards == [20] + [4] * max(0, k - 1)
+        assert proposal.shape == (3, 4)
 
 
 def test_sampling_distribution_fixed_seed(tmp_path):
@@ -908,9 +922,10 @@ def test_speculator_enabled_initialization_and_sampling(
     update.assert_called_once_with(sampled, counts, 4, mapping)
 
 
-@pytest.mark.parametrize("with_tail", [False, True])
-def test_runner_actual_call_order(monkeypatch, with_tail):
+@pytest.mark.parametrize(("with_tail", "k"), [(False, 4), (True, 3), (True, 0)])
+def test_runner_actual_call_order(monkeypatch, with_tail, k):
     from vllm.v1.worker.gpu import model_runner as runner_mod
+    from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 
     calls = []
     runner = object.__new__(runner_mod.GPUModelRunner)
@@ -924,6 +939,7 @@ def test_runner_actual_call_order(monkeypatch, with_tail):
         idx_mapping=torch.tensor([0]),
         num_reqs=1,
         query_start_loc=torch.tensor([0, 1]),
+        has_structured_output_reqs=False,
     )
     runner.execute_model_state = SimpleNamespace(
         input_batch=batch,
@@ -932,6 +948,7 @@ def test_runner_actual_call_order(monkeypatch, with_tail):
         hidden_states=torch.zeros(1, 4),
         aux_hidden_states=None,
         finished_req_ids=set(),
+        num_spec_tokens_to_schedule=k,
     )
     runner._sm70_v2_mtp_profile_pending = None
     runner._sm70_v2_mtp_profile_start = Mock(return_value=None)
@@ -967,11 +984,17 @@ def test_runner_actual_call_order(monkeypatch, with_tail):
     runner.rejection_sampler = None
     runner.postprocess_sampled = lambda *args: calls.append("postprocess")
 
-    def propose(*args, **kwargs):
+    def propose(*args, num_speculative_tokens, **kwargs):
         calls.append("propose")
-        return torch.zeros(1, 4, dtype=torch.int64)
+        assert num_speculative_tokens == k
+        return torch.tensor([[20, 21, 22, 23]])
 
-    runner.speculator = SimpleNamespace(supports_mm_inputs=False, propose=propose)
+    runner.num_speculative_steps = 4
+    runner.speculator = object.__new__(eagle.EagleSpeculator)
+    runner.speculator.method = "mtp"
+    runner.speculator.supports_mm_inputs = False
+    runner.speculator.propose = propose
+    runner.speculator._draft_vocab_tail = None
     if with_tail:
 
         def update(sampled, num_sampled, num_reqs, idx_mapping):
@@ -980,7 +1003,7 @@ def test_runner_actual_call_order(monkeypatch, with_tail):
             calls.append("update")
 
         runner.speculator.update_draft_vocab_tail = update
-    runner.draft_tokens_handler = SimpleNamespace(set_draft_tokens=Mock())
+    runner.draft_tokens_handler = object.__new__(DraftTokensHandler)
     runner.pp_handler = None
     runner.kv_connector = SimpleNamespace(post_forward=Mock(return_value=None))
     runner.mixed_prefill_timer = SimpleNamespace(finish=Mock(return_value=None))
@@ -988,6 +1011,10 @@ def test_runner_actual_call_order(monkeypatch, with_tail):
     runner.eplb = SimpleNamespace(step=Mock())
     monkeypatch.setattr(runner_mod, "AsyncOutput", lambda **kwargs: SimpleNamespace())
     runner.sample_tokens(None)
+    assert runner.req_states.draft_tokens.tolist() == [
+        list(range(20, 20 + k)) + [-1] * (4 - k)
+    ]
+    assert runner.draft_tokens_handler.get_draft_tokens().draft_token_ids == [[-1] * k]
     assert calls == (
         ["sample", "postprocess", "update", "propose"]
         if with_tail

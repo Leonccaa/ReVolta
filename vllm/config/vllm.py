@@ -1846,7 +1846,7 @@ class VllmConfig:
                 self.cache_config.cache_dtype,
             )
         if revolta_profile_enabled:
-            # The DFlash2 graph reserve depends on the resolved KV dtype.
+            # The graph reserve depends on the resolved KV dtype and draft schedule.
             apply_revolta_profile(
                 self.model_config,
                 self.parallel_config.tensor_parallel_size,
@@ -1858,6 +1858,11 @@ class VllmConfig:
                 ),
                 speculative_method=getattr(self.speculative_config, "method", None),
                 kv_cache_dtype=self.cache_config.cache_dtype,
+                num_speculative_tokens_per_batch_size=getattr(
+                    self.speculative_config,
+                    "num_speculative_tokens_per_batch_size",
+                    None,
+                ),
             )
 
         self.try_verify_and_update_config()
@@ -1974,28 +1979,6 @@ class VllmConfig:
             and uses_adaptive_dflash_lookup(self.speculative_config)
             and self.speculative_config.lookup_env("VLLM_DFLASH2_LOOKUP_ADAPTIVE")
         )
-        dflash_width_policy = (
-            getattr(self.speculative_config, "dflash_concurrency_drafts", None)
-            if self.speculative_config is not None
-            else None
-        )
-        dflash_concurrency_width = bool(dflash_width_policy)
-        if dflash_width_policy:
-            unreachable = tuple(
-                sorted(
-                    int(min_reqs)
-                    for min_reqs in dflash_width_policy
-                    if int(min_reqs) > self.scheduler_config.max_num_seqs
-                )
-            )
-            if unreachable:
-                logger.warning_once(
-                    "dflash_concurrency_drafts thresholds %s exceed max_num_seqs=%d "
-                    "and never apply.",
-                    unreachable,
-                    self.scheduler_config.max_num_seqs,
-                )
-
         if self.scheduler_config.async_scheduling:
             # Async scheduling explicitly enabled, hard fail any incompatibilities.
             # Currently, async scheduling only support eagle speculative
@@ -2006,12 +1989,6 @@ class VllmConfig:
                     "configured maximum and is incompatible with adaptive q8/q16 "
                     "lookup verification. Disable async scheduling or set "
                     "VLLM_DFLASH2_LOOKUP_ADAPTIVE=0 to use fixed q16 verification."
-                )
-            if dflash_concurrency_width:
-                raise ValueError(
-                    "Async scheduling reserves num_speculative_tokens draft slots "
-                    "every step and ignores dflash_concurrency_drafts. Disable "
-                    "async scheduling or remove dflash_concurrency_drafts."
                 )
             if dflash_ddtree_tree_verify:
                 raise ValueError(
@@ -2058,11 +2035,14 @@ class VllmConfig:
                     "the scheduler."
                 )
                 self.scheduler_config.async_scheduling = False
-            elif dflash_concurrency_width:
-                logger.warning_once(
-                    "Disabling asynchronous scheduling because "
-                    "dflash_concurrency_drafts must return a per-step "
-                    "verification width to the scheduler."
+            elif (
+                self.speculative_config is not None
+                and self.speculative_config.use_dflash()
+                and self.speculative_config.num_speculative_tokens_per_batch_size
+                is not None
+            ):
+                logger.info_once(
+                    "Using synchronous scheduling by default for dynamic DFlash."
                 )
                 self.scheduler_config.async_scheduling = False
             elif dflash_ddtree_tree_verify:
@@ -2997,6 +2977,51 @@ class VllmConfig:
                 "to True to enable."
             )
         current_platform.check_and_update_config(self)
+
+        spec_config = self.speculative_config
+        # A drafter's derived config does not schedule; the target's config
+        # validates and owns the schedule.
+        if (
+            spec_config
+            and spec_config.num_speculative_tokens_per_batch_size is not None
+            and not self.is_speculative_draft
+        ):
+            from vllm.v1.spec_decode.dynamic.utils import (
+                validate_and_normalize_dynamic_sd_schedule,
+            )
+
+            validate_and_normalize_dynamic_sd_schedule(
+                spec_config.num_speculative_tokens_per_batch_size
+            )
+            if spec_config.method not in ("mtp", "dflash"):
+                raise ValueError(
+                    "Dynamic speculative decoding requires method='mtp' or 'dflash'."
+                )
+            if spec_config.ngram_assist:
+                raise ValueError(
+                    "Dynamic speculative decoding is incompatible with ngram_assist."
+                )
+            if self.parallel_config.data_parallel_size > 1:
+                logger.warning_once(
+                    "Disabling dynamic speculative decoding with data parallelism. "
+                    "Using fixed num_speculative_tokens=%d.",
+                    spec_config.num_speculative_tokens,
+                )
+                spec_config.num_speculative_tokens_per_batch_size = None
+            elif (
+                not self.use_v2_model_runner
+                or self.parallel_config.pipeline_parallel_size > 1
+            ):
+                raise ValueError("Dynamic speculative decoding requires MRv2 and PP1.")
+            elif (
+                spec_config.method == "mtp"
+                and self.model_config is not None
+                and self.model_config.is_hybrid
+                and self.cache_config.mamba_cache_mode != "align"
+            ):
+                raise ValueError(
+                    "Dynamic MTP on hybrid models requires mamba_cache_mode='align'."
+                )
 
         if self.use_v2_model_runner:
             self._validate_v2_model_runner()

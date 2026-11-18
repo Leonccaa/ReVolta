@@ -55,7 +55,8 @@ def profile_values(source: str) -> dict[str, list[str]]:
         "DFLASH_DEFAULTS": "DFlash2",
         "AWQ_DFLASH_PLANAR_KV_DEFAULTS": "AWQ+DFlash2, planar KV",
         "NVFP4_DFLASH_PLANAR_KV_DEFAULTS": "NVFP4+DFlash2, planar KV",
-        "MTP_PLANAR_KV_DEFAULTS": "MTP, planar KV",
+        "MTP_PLANAR_KV_DEFAULTS": "fixed MTP, planar KV",
+        "MTP_DSD_PLANAR_KV_DEFAULTS": "dynamic MTP, planar KV",
         "CUSTOM_AR_DEFAULTS": "P2P/NVLink",
     }
     for node in ast.parse(source).body:

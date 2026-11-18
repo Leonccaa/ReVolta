@@ -10,10 +10,7 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
-from vllm.config.speculative import (
-    dflash_drafts_for_requests,
-    get_dflash_model_draft_tokens,
-)
+from vllm.config.speculative import get_dflash_model_draft_tokens
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_rank
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
@@ -37,15 +34,6 @@ from vllm.v1.worker.utils import AttentionGroup
 logger = init_logger(__name__)
 
 
-def _is_context_only_prefill(input_batch: InputBatch) -> bool:
-    incomplete_prefill = input_batch.is_incomplete_prefilling_np
-    return bool(
-        incomplete_prefill is not None
-        and incomplete_prefill.size == input_batch.num_reqs
-        and np.all(incomplete_prefill)
-    )
-
-
 class DFlashSpeculator(DraftModelSpeculator):
     _speculator_name = "DFlash"  # For logging, so we can share methods with subclasses
 
@@ -54,9 +42,6 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         # Multimodal inputs not currently supported.
         self.supports_mm_inputs = False
-        # Running requests of the current proposal, for the verification width
-        # policy (dflash_concurrency_drafts).
-        self._running_reqs = 0
 
         # A lookup-augmented DFlash2 proposal may be wider than the checkpoint
         # block. The model still emits only its trained block; lookup fills the
@@ -144,7 +129,6 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.draft_kv_cache_group_id: int = -1
-        self._context_only_prefill_logged = False
         self._query_slot_mappings: torch.Tensor | None = None
         self._debug_proposal_stages = bool(
             int(os.getenv("VLLM_DFLASH_DEBUG_PROPOSAL_STAGES", "0"))
@@ -519,17 +503,9 @@ class DFlashSpeculator(DraftModelSpeculator):
         self,
         input_batch: InputBatch,
         num_sampled: torch.Tensor,
-        num_rejected: torch.Tensor,
+        num_speculative_tokens: int | None = None,
     ) -> None:
         """Refresh optional proposal-controller state before graph replay."""
-        self._running_reqs = input_batch.num_reqs
-
-    def next_num_draft_tokens(self) -> int | None:
-        """Drafts the target verifies next step under
-        ``dflash_concurrency_drafts``; None keeps the full proposal."""
-        if not getattr(self.speculative_config, "dflash_concurrency_drafts", None):
-            return None
-        return dflash_drafts_for_requests(self.speculative_config, self._running_reqs)
 
     def _apply_ngram_assist(self, num_reqs: int) -> None:
         """Override model proposals for ngram-hit rows, if configured."""
@@ -571,6 +547,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         sampled_token_ids_cpu: np.ndarray | None = None,
         num_sampled_tokens_cpu: np.ndarray | None = None,
         all_token_ids_cpu: np.ndarray | None = None,
+        num_speculative_tokens: int | None = None,
     ) -> torch.Tensor:
         num_reqs = input_batch.num_reqs
         num_target_tokens = input_batch.num_tokens
@@ -580,7 +557,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             max_seq_len + self.num_query_per_req, self.max_model_len
         )
         self._debug_real_proposal = not dummy_run and not is_profile
-        self._prepare_proposal_runtime(input_batch, num_sampled, num_rejected)
+        self._prepare_proposal_runtime(input_batch, num_sampled, num_speculative_tokens)
 
         # NOTE: To avoid CPU-GPU synchronization without CPU knowing the
         # number of rejected tokens, we maintain the size of input_ids and
@@ -723,19 +700,8 @@ class DFlashSpeculator(DraftModelSpeculator):
             )
         self._debug_proposal_stage("context kv end")
 
-        if not dummy_run and _is_context_only_prefill(input_batch):
-            # Intermediate chunked-prefill steps only need to materialize the
-            # target hidden states into draft KV. Their proposed tokens cannot
-            # be consumed before the final prompt chunk, which will run the
-            # normal query graph and replace this sentinel output.
-            self.draft_tokens[:num_reqs].fill_(-1)
-            if not self._context_only_prefill_logged:
-                logger.info(
-                    "%s context-only path is skipping unused draft queries "
-                    "for intermediate prefill chunks.",
-                    self._speculator_name,
-                )
-                self._context_only_prefill_logged = True
+        if num_speculative_tokens == 0:
+            # The context K/V is in sync. No request needs the query pass.
             return self.draft_tokens[:num_reqs]
 
         if self._prepare_ngram_assist(
@@ -752,7 +718,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         with record_function_or_nullcontext("dflash: query and selector"):
             # Every DFlash step has exactly num_query_per_req tokens, so we can
             # use FULL CUDA graphs.
-            batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
+            batch_desc, dp_sync_state = dispatch_cg_and_sync_dp(
                 self.query_cudagraph_manager,
                 num_reqs,
                 num_query_tokens,
@@ -760,6 +726,11 @@ class DFlashSpeculator(DraftModelSpeculator):
                 dp_size=self.dp_size,
                 dp_rank=self.dp_rank,
                 need_eager=is_profile,
+            )
+            num_tokens_across_dp = (
+                dp_sync_state.num_tokens_across_dp
+                if dp_sync_state is not None
+                else None
             )
 
             num_reqs_padded = batch_desc.num_reqs or num_reqs

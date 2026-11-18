@@ -735,6 +735,32 @@ def test_explicit_reserve_wins_over_the_kv_tier(profile, monkeypatch):
     assert os.environ[GRAPH_RESERVE] == "1300"
 
 
+@pytest.mark.parametrize("override", [None, "620"])
+def test_mtp_dynamic_schedule_refines_the_planar_kv_reserve(
+    profile, monkeypatch, override
+):
+    if override is not None:
+        monkeypatch.setenv(GRAPH_RESERVE, override)
+    target = model()
+    assert profile.apply_revolta_profile(
+        target,
+        4,
+        is_sm70=True,
+        speculative_method="mtp",
+        kv_cache_dtype="fp8_per_token_head",
+    )
+    assert os.environ[GRAPH_RESERVE] == (override or "600")
+    assert profile.apply_revolta_profile(
+        target,
+        4,
+        is_sm70=True,
+        speculative_method="mtp",
+        kv_cache_dtype="fp8_per_token_head",
+        num_speculative_tokens_per_batch_size=[(1, 3, 4), (4, 8, 3)],
+    )
+    assert os.environ[GRAPH_RESERVE] == (override or "705")
+
+
 def test_dflash_leaves_every_other_default_alone(profile):
     assert profile.apply_revolta_profile(
         model(), 4, is_sm70=True, speculative_method="dflash"
@@ -829,6 +855,10 @@ def test_vllmconfig_profile_receives_the_speculative_method():
         assert ast.unparse(value) == (
             "getattr(self.speculative_config, 'method', None)"
         )
-    kv = {k.arg: ast.unparse(k.value) for k in refine.keywords}["kv_cache_dtype"]
-    assert kv == "self.cache_config.cache_dtype"
+    refined = {k.arg: ast.unparse(k.value) for k in refine.keywords}
+    assert refined["kv_cache_dtype"] == "self.cache_config.cache_dtype"
+    schedule_field = "num_speculative_tokens_per_batch_size"
+    assert refined[schedule_field] == (
+        f"getattr(self.speculative_config, '{schedule_field}', None)"
+    )
     assert "kv_cache_dtype" not in {k.arg for k in first.keywords}

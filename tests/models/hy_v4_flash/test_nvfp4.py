@@ -185,17 +185,21 @@ def test_hy4_nvfp4_loader_tp4_cpu(sample, monkeypatch, tp1):
         torch.testing.assert_close(layer.w2_input_scale[expert], torch.tensor(0.03))
 
 
-def test_hy4_nvfp4_contract_is_tp4_only():
+def test_hy4_nvfp4_contract_for_single_gpu_standin():
+    moe = SimpleNamespace(
+        num_experts=512,
+        experts_per_token=16,
+        hidden_dim=1536,
+        intermediate_size_per_partition=1536,
+        tp_size=1,
+        moe_parallel_config=SimpleNamespace(use_all2all_kernels=False),
+    )
+    validate_nvfp4_sm70_moe_contract(moe)
+
+    moe.tp_size = 2
+    moe.intermediate_size_per_partition = 768
     with pytest.raises(NotImplementedError, match="shape is not validated"):
-        validate_nvfp4_sm70_moe_contract(
-            SimpleNamespace(
-                num_experts=512,
-                experts_per_token=16,
-                hidden_dim=1536,
-                intermediate_size_per_partition=768,
-                tp_size=2,
-            )
-        )
+        validate_nvfp4_sm70_moe_contract(moe)
 
 
 @pytest.mark.parametrize("method", [ModelOptNvFp4SM70MoEMethod, Mxfp4SM70MoEMethod])

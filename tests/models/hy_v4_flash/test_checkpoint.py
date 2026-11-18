@@ -111,6 +111,7 @@ def _construct_model(checkpoint_metadata, cpu_vllm, monkeypatch, tmp_path, awq):
     module = ModuleType(path)
     module.__dict__.update(FlashEngram=IndexEngram, FlashNgramHashState=IndexHash)
     monkeypatch.setitem(sys.modules, path, module)
+    monkeypatch.setattr(HYV4FlashForCausalLM, "_load_engram_tables", lambda self: None)
     model_dir = checkpoint_metadata
     if awq:
         raw = json.loads((checkpoint_metadata / "config.json").read_text())
@@ -242,6 +243,8 @@ def test_real_index_maps_exactly(
 
     def checkpoint_weights():
         for name in keys:
+            if candidate.skip_checkpoint_weight(name):
+                continue
             prefix, _, leaf = name.rpartition(".")
             if prefix.endswith(".experts") and leaf in ("gate_up_proj", "down_proj"):
                 gate_up = leaf == "gate_up_proj"
@@ -258,23 +261,13 @@ def test_real_index_maps_exactly(
                     yield name, torch.empty(shape, device="meta")
             else:
                 yield name, scalar.view_as(scalar)
-                if awq and name.endswith(".multi_head_embedding.embedding.weight"):
-                    yield f"{name}_scale_inv", scalar
 
     loaded = candidate.load_weights(checkpoint_weights())
     hash_state = candidate.model.engram_hash
     assert sorted(hash_state.maps) == [2, 12, 22, 32]
-    tables = {
-        f"model.layers.{i - 1}.engram_layer.multi_head_embedding.embedding.weight"
-        for i in hash_state.maps
-    }
     for i in hash_state.maps:
-        assert candidate.model.layers[i - 1].engram_layer.table_loads == (
-            ["weight", "weight_scale_inv"] if awq else ["weight"]
-        )
-    if awq:
-        tables |= {f"{name}_scale_inv" for name in tables}
-    assert loaded == params.keys() | tables
+        assert candidate.model.layers[i - 1].engram_layer.table_loads == []
+    assert loaded == params.keys()
     expected: Counter[tuple[str, str | int | None, int | None]] = Counter()
     suffixes = ("qweight", "qzeros", "scales") if awq else ("weight",)
     w13_suffixes = tuple(f".w13_{suffix}" for suffix in suffixes)

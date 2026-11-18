@@ -231,14 +231,18 @@ class FlashEmbedding(nn.Module):
 
     def load_from_safetensors(self, path, weight_name):
         """Read only this rank's row range, in bounded blocks, from one shard."""
-        self._allocate()
-        weight = self.storage[: self.local_rows * self.dim].view(
-            self.local_rows, self.dim
-        )
-        scale = self.storage[self.local_rows * self.dim :].view(torch.bfloat16)
         with safe_open(path, framework="pt", device="cpu") as reader:
             weight_slice = reader.get_slice(weight_name)
+            if weight_slice.get_dtype() == "BF16":
+                raise ValueError(
+                    "Engram tables require FP8 weights and BF16 row scales"
+                )
             scale_slice = reader.get_slice(weight_name + "_scale_inv")
+            self._allocate()
+            weight = self.storage[: self.local_rows * self.dim].view(
+                self.local_rows, self.dim
+            )
+            scale = self.storage[self.local_rows * self.dim :].view(torch.bfloat16)
             for start in range(self.vocab_start, self.vocab_end, 131072):
                 end = min(start + 131072, self.vocab_end)
                 local_start = start - self.vocab_start
@@ -327,7 +331,7 @@ class FlashEngram(nn.Module):
 
     def forward(self, hidden, hashes):
         local = self.multi_head_embedding
-        rows = local(hashes)
+        rows = local(hashes).to(torch.bfloat16).float()
         eps = torch.finfo(torch.float32).eps
         gamma = torch.stack(
             [norm.weight for norm in self.lookup_per_head_norms]

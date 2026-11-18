@@ -72,6 +72,8 @@ DFLASH_DEFAULTS = {
 AWQ_DFLASH_PLANAR_KV_DEFAULTS = {"VLLM_V2_CUDAGRAPH_MEM_MIB": "1000"}
 NVFP4_DFLASH_PLANAR_KV_DEFAULTS = {"VLLM_V2_CUDAGRAPH_MEM_MIB": "1024"}
 MTP_PLANAR_KV_DEFAULTS = {"VLLM_V2_CUDAGRAPH_MEM_MIB": "600"}
+# Dynamic MTP captured 0.64 GiB per rank on AWQ TP4 with planar KV.
+MTP_DSD_PLANAR_KV_DEFAULTS = {"VLLM_V2_CUDAGRAPH_MEM_MIB": "705"}
 PLANAR_KV_DTYPES = ("fp8_per_token_head", "int8")
 CUSTOM_AR_DEFAULTS = {"VLLM_SM70_CAR_VMM_SAFE": "1"}
 
@@ -328,6 +330,7 @@ def apply_revolta_profile(
     interconnect_mode: InterconnectMode = "pex_p2p",
     speculative_method: str | None = None,
     kv_cache_dtype: str | None = None,
+    num_speculative_tokens_per_batch_size: list[tuple[int, int, int]] | None = None,
 ) -> bool:
     """Apply before config defaults and before model/native module imports.
 
@@ -349,6 +352,11 @@ def apply_revolta_profile(
     if not enabled:
         return False
     defaults = dict(COMMON_DEFAULTS)
+    mtp_planar_kv_defaults = (
+        MTP_DSD_PLANAR_KV_DEFAULTS
+        if num_speculative_tokens_per_batch_size is not None
+        else MTP_PLANAR_KV_DEFAULTS
+    )
     if getattr(model_config, "quantization", None) == "awq":
         if _has_awq_qpn_shape(model_config, tensor_parallel_size):
             defaults.update(AWQ_DEFAULTS)
@@ -357,7 +365,7 @@ def apply_revolta_profile(
                 if kv_cache_dtype in PLANAR_KV_DTYPES:
                     defaults.update(AWQ_DFLASH_PLANAR_KV_DEFAULTS)
             elif speculative_method == "mtp" and kv_cache_dtype in PLANAR_KV_DTYPES:
-                defaults.update(MTP_PLANAR_KV_DEFAULTS)
+                defaults.update(mtp_planar_kv_defaults)
     elif has_nvfp4_weights(model_config):
         defaults.update(NVFP4_DEFAULTS)
         if speculative_method == "dflash":
@@ -365,7 +373,7 @@ def apply_revolta_profile(
             if kv_cache_dtype in PLANAR_KV_DTYPES:
                 defaults.update(NVFP4_DFLASH_PLANAR_KV_DEFAULTS)
         elif speculative_method == "mtp" and kv_cache_dtype in PLANAR_KV_DTYPES:
-            defaults.update(MTP_PLANAR_KV_DEFAULTS)
+            defaults.update(mtp_planar_kv_defaults)
     if interconnect_mode != "no_p2p":
         defaults.update(CUSTOM_AR_DEFAULTS)
     for name, value in defaults.items():

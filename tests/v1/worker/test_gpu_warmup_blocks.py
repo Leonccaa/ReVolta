@@ -99,6 +99,7 @@ def test_kernel_prefill_warmup_runs_default_batch_and_extra_profile(
         5,
         0,
     ]
+    assert [o.num_spec_tokens_to_schedule for o in executions] == [4, 4, 0, 4, 4, 0]
     assert connector_states == [True, False]
     assert len(samples) == 4
 
@@ -369,6 +370,7 @@ def test_host_kv_warmup_runs_host_steps(monkeypatch: pytest.MonkeyPatch) -> None
         10,
         0,
     ]
+    assert [o.num_spec_tokens_to_schedule for o in executions] == [4, 4, 0] * 4
 
     shape = runner.host_history.shape
     prefill = executions[6]  # eager single-request prefill

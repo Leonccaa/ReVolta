@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 import torch.distributed as dist
 
@@ -13,6 +15,12 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 )
 
 
+@dataclass
+class DPSyncState:
+    num_tokens_across_dp: torch.Tensor
+    skip_drafts: bool
+
+
 def sync_cudagraph_and_dp_padding(
     cudagraph_manager: CudaGraphManager | None,
     desired_batch_desc: BatchExecutionDescriptor,
@@ -21,18 +29,20 @@ def sync_cudagraph_and_dp_padding(
     uniform_token_count: int | None,
     dp_size: int,
     dp_rank: int,
-) -> tuple[BatchExecutionDescriptor, torch.Tensor | None]:
+    allow_skip_drafts: bool = False,
+) -> tuple[BatchExecutionDescriptor, DPSyncState | None]:
     """
     Coordinates the batch descriptor and DP padding across all ranks.
 
-    Returns (synced_batch_desc, num_tokens_across_dp).
+    Returns (synced_batch_desc, sync). The sync is None if no rank has work.
     """
     assert dp_size > 1, "DP size must be greater than 1"
     group = get_dp_group().cpu_group
-    tensor = torch.zeros(3, dp_size, dtype=torch.int32, device="cpu")
+    tensor = torch.zeros(4, dp_size, dtype=torch.int32, device="cpu")
     tensor[0][dp_rank] = num_tokens
     tensor[1][dp_rank] = desired_batch_desc.cg_mode.value
     tensor[2][dp_rank] = uniform_token_count or 0  # (0 means None)
+    tensor[3][dp_rank] = int(allow_skip_drafts)
     dist.all_reduce(tensor, group=group)
 
     num_tokens_across_dp = tensor[0]
@@ -45,6 +55,7 @@ def sync_cudagraph_and_dp_padding(
         )
         return synced_desc, None
 
+    sync = DPSyncState(num_tokens_across_dp, bool(torch.all(tensor[3] == 1)))
     synced_cg_mode = CUDAGraphMode(int(cg_mode_across_dp.min().item()))
 
     # If any rank wants to run eager, all ranks run eager
@@ -53,7 +64,7 @@ def sync_cudagraph_and_dp_padding(
             cg_mode=CUDAGraphMode.NONE,
             num_tokens=num_tokens,
             num_reqs=num_reqs,
-        ), num_tokens_across_dp
+        ), sync
 
     assert cudagraph_manager is not None, (
         "cudagraph_manager should only be None during profile run, "
@@ -76,7 +87,7 @@ def sync_cudagraph_and_dp_padding(
     # Update num_tokens_across_dp to reflect padded size.
     num_tokens_across_dp[:] = synced_desc.num_tokens
 
-    return synced_desc, num_tokens_across_dp
+    return synced_desc, sync
 
 
 def dispatch_cg_and_sync_dp(
@@ -87,7 +98,8 @@ def dispatch_cg_and_sync_dp(
     dp_size: int,
     dp_rank: int,
     need_eager: bool = False,
-) -> tuple[BatchExecutionDescriptor, torch.Tensor | None]:
+    allow_skip_drafts: bool = False,
+) -> tuple[BatchExecutionDescriptor, DPSyncState | None]:
     if need_eager:
         batch_desc = BatchExecutionDescriptor(
             cg_mode=CUDAGraphMode.NONE,
@@ -114,4 +126,5 @@ def dispatch_cg_and_sync_dp(
         uniform_token_count,
         dp_size,
         dp_rank,
+        allow_skip_drafts=allow_skip_drafts,
     )

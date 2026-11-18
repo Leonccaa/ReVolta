@@ -342,6 +342,7 @@ def test_runner_does_not_dispatch_short_prefill_as_tail(
         new_block_ids_to_zero=[],
         total_num_scheduled_tokens=query_len,
         num_scheduled_tokens={"r": query_len},
+        skip_drafts=False,
     )
 
     class DispatchObserved(Exception):

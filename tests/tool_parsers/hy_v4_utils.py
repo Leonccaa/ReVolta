@@ -114,7 +114,7 @@ def make_request(
 ) -> ChatCompletionRequest:
     extra: dict[str, Any] = {}
     if tools:
-        extra["tools"] = TOOLS
+        extra["tools"] = tool_dicts()
         extra["tool_choice"] = tool_choice
     return ChatCompletionRequest(model=MODEL, messages=messages, **extra, **kwargs)
 

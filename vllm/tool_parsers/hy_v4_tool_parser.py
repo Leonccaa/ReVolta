@@ -12,11 +12,13 @@ from urllib.parse import unquote
 
 import regex as re
 from openai.types.responses import ToolChoiceFunction
+from openai.types.responses.function_tool import FunctionTool
 
 from vllm.entrypoints.chat_utils import make_tool_call_id
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,
     ChatCompletionRequest,
+    ChatCompletionToolsParam,
 )
 from vllm.entrypoints.openai.engine.protocol import (
     DeltaFunctionCall,
@@ -30,7 +32,7 @@ from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers.abstract_tool_parser import ToolParser
-from vllm.tool_parsers.utils import partial_tag_overlap
+from vllm.tool_parsers.utils import _extract_tool_info, partial_tag_overlap
 
 logger = init_logger(__name__)
 
@@ -1123,9 +1125,14 @@ def _tools_to_plain(tools) -> list[ToolSchema] | None:
     """Convert tool-schema objects into plain dicts for the extractor."""
     if not tools:
         return None
+    # Chat Completions and Responses requests carry different tool types.
     return [
-        ToolSchema(name=t.function.name, parameters=t.function.parameters)
-        for t in tools
+        ToolSchema(name=name, parameters=parameters)
+        for name, parameters in (
+            _extract_tool_info(t)
+            for t in tools
+            if isinstance(t, (ChatCompletionToolsParam, FunctionTool))
+        )
     ]
 
 

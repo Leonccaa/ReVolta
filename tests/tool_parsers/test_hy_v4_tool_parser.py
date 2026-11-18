@@ -6,6 +6,8 @@ import json
 from typing import Any
 
 import pytest
+from openai.types.responses import WebSearchTool
+from openai.types.responses.function_tool import FunctionTool
 
 from tests.tool_parsers.hy_v4_utils import (
     ARG_KEY_BEGIN,
@@ -310,6 +312,24 @@ class TestStreaming:
             "get_weather",
         ]
         assert json.loads(calls[1]["args"]) == {"city": "Rome"}
+
+    def test_responses_api_function_tools(self, tokenizer):
+        """Responses requests carry flat function tools plus non-function ones."""
+        tools = [
+            FunctionTool(
+                type="function",
+                name="get_weather",
+                parameters={
+                    "type": "object",
+                    "properties": {"days": {"type": "integer"}},
+                },
+                strict=False,
+            ),
+            WebSearchTool(type="web_search"),
+        ]
+        parser = HYV4ToolParser(tokenizer, tools)
+        _, calls = stream(parser, tokenizer, block(call("get_weather", days="4")), 1)
+        assert json.loads(calls[0]["args"]) == {"days": 4}
 
     def test_unknown_tool_args_are_strings(self, tokenizer):
         parser = HYV4ToolParser(tokenizer, [tool("other")])

@@ -51,3 +51,27 @@ def test_eager_ihc_against_transformers(dtype):
     torch.testing.assert_close(
         head(scattered), ref_head(expected_post.unsqueeze(0)).squeeze(0), atol=0, rtol=0
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("tokens", [0, 1, 7, 128])
+@torch.inference_mode()
+def test_triton_ihc_matches_eager(tokens):
+    from vllm.models.hy_v4.nvidia.hc import triton_ihc_supported
+
+    torch.manual_seed(31)
+    config = HYV4FlashConfig()
+    with torch.device("cuda"):
+        pre = HYV4HCPreLayer(config, config.hidden_size)
+        post = HYV4HCPostLayer(config)
+        pre.hc_fn.weight.normal_(std=0.006)
+        x = torch.randn(tokens, 4, config.hidden_size, dtype=torch.float16)
+    assert triton_ihc_supported(x)
+    mixed, gates = pre(x)
+    expected, expected_gates = pre.forward_native(x)
+    torch.testing.assert_close(mixed, expected, atol=2e-4, rtol=1e-3)
+    torch.testing.assert_close(gates, expected_gates, atol=2e-6, rtol=2e-6)
+    scattered = post(mixed, x, gates)
+    torch.testing.assert_close(
+        scattered, post.forward_native(mixed, x, gates), atol=2e-4, rtol=1e-3
+    )

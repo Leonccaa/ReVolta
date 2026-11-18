@@ -64,6 +64,7 @@ def _make_experts(monkeypatch, device):
     with torch.device(device):
         model = HYV4FlashModel.__new__(HYV4FlashModel)
         nn.Module.__init__(model)
+        model.config = SimpleNamespace(num_experts=4)
         model.layers = nn.ModuleList([nn.Module()])
         model.layers[0].mlp = nn.Module()
         experts = FusedMoE(

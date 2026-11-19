@@ -90,13 +90,13 @@ def _interpreter_compact_full_support(
     target_logits_ptr,
     target_stride,
     row,
-    temperature,
     top_p,
     TOP_K: tl.constexpr,
     BLOCK_K: tl.constexpr,
     LIMIT_K: tl.constexpr,
 ):
-    # The smoke uses temperature=top_p=1 and the complete target shortlist.
+    # Same signature as _dflash2_compact_target_row, which no longer takes the
+    # temperature. The smoke uses top_p=1 and the complete target shortlist.
     # Avoid the interpreter's float/bool broadcasting bug in nucleus filtering.
     offsets = tl.arange(0, BLOCK_K)
     mask = offsets < TOP_K

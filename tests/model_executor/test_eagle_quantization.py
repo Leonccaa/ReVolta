@@ -23,6 +23,7 @@ def test_get_draft_quant_config_with_draft_model():
     mock_load_config = Mock(spec=LoadConfig)
     mock_speculative_config = Mock(spec=SpeculativeConfig)
     mock_speculative_config.draft_model_config = mock_draft_model_config
+    mock_speculative_config.draft_load_config = None
 
     mock_vllm_config = Mock(spec=VllmConfig)
     mock_vllm_config.speculative_config = mock_speculative_config
@@ -44,6 +45,7 @@ def test_get_draft_quant_config_with_draft_model():
 def test_get_draft_quant_config_without_draft_model():
     mock_speculative_config = Mock(spec=SpeculativeConfig)
     mock_speculative_config.draft_model_config = None
+    mock_speculative_config.draft_load_config = None
 
     mock_vllm_config = Mock(spec=VllmConfig)
     mock_vllm_config.speculative_config = mock_speculative_config
@@ -52,6 +54,25 @@ def test_get_draft_quant_config_without_draft_model():
     result = get_draft_quant_config(mock_vllm_config)
 
     assert result is None
+
+
+@pytest.mark.parametrize("use_draft_load", [False, True])
+def test_draft_quant_config_load_selection(use_draft_load):
+    target_load = LoadConfig(load_format="pt")
+    draft_load = LoadConfig(load_format="safetensors")
+    draft_model = Mock(spec=ModelConfig)
+    config = Mock(spec=VllmConfig)
+    config.load_config = target_load
+    config.speculative_config = Mock(spec=SpeculativeConfig)
+    config.speculative_config.draft_model_config = draft_model
+    config.speculative_config.draft_load_config = draft_load if use_draft_load else None
+
+    with patch.object(VllmConfig, "get_quantization_config") as get_quant:
+        get_draft_quant_config(config)
+
+    actual_model, actual_load = get_quant.call_args.args
+    assert actual_model is draft_model
+    assert actual_load is (draft_load if use_draft_load else target_load)
 
 
 @torch.inference_mode()

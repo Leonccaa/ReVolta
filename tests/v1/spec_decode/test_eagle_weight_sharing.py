@@ -8,6 +8,8 @@ import pytest
 import torch
 from torch import nn
 
+from vllm.config import LoadConfig
+from vllm.model_executor import model_loader
 from vllm.v1.worker.gpu.spec_decode.eagle import utils
 
 
@@ -56,7 +58,9 @@ def test_loader_shares_target_head_without_replacing_distinct_draft(
         "vllm.compilation.backends.set_model_tag", lambda _tag: nullcontext()
     )
     config = SimpleNamespace(
-        speculative_config=SimpleNamespace(draft_model_config=object())
+        speculative_config=SimpleNamespace(
+            draft_model_config=object(), draft_load_config=None
+        )
     )
 
     result = utils.load_eagle_model(target, config)
@@ -67,6 +71,34 @@ def test_loader_shares_target_head_without_replacing_distinct_draft(
     assert result.lm_head is expected
     assert layer.shared_head.head is expected
     assert result.lm_head.weight.data_ptr() == expected.weight.data_ptr()
+
+
+@pytest.mark.parametrize("use_draft_load", [False, True])
+def test_loader_selects_draft_or_target_load_config(monkeypatch, use_draft_load):
+    target_load = LoadConfig(load_format="pt")
+    draft_load = LoadConfig(load_format="safetensors")
+    target = make_model()
+    draft = make_model()
+    selected = []
+    config = SimpleNamespace(
+        load_config=target_load,
+        speculative_config=SimpleNamespace(
+            draft_model_config=object(),
+            draft_load_config=draft_load if use_draft_load else None,
+        ),
+    )
+
+    def get_model_loader(load_config):
+        selected.append(load_config)
+        return SimpleNamespace(load_model=lambda **_kwargs: draft)
+
+    monkeypatch.setattr(model_loader, "get_model_loader", get_model_loader)
+    monkeypatch.setattr(utils, "get_pp_group", lambda: SimpleNamespace(world_size=1))
+    monkeypatch.setattr(
+        "vllm.compilation.backends.set_model_tag", lambda _tag: nullcontext()
+    )
+    assert utils.load_eagle_model(target, config) is draft
+    assert selected[0] is (draft_load if use_draft_load else target_load)
 
 
 def test_target_head_resolution_prefers_language_model_and_keeps_fallback():

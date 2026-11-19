@@ -106,7 +106,9 @@ def load(monkeypatch, target, draft, *, method="mtp", async_scheduling=False):
         "vllm.compilation.backends.set_model_tag", lambda _t: nullcontext()
     )
     cfg = SimpleNamespace(
-        speculative_config=SimpleNamespace(draft_model_config=object(), method=method),
+        speculative_config=SimpleNamespace(
+            draft_model_config=object(), draft_load_config=None, method=method
+        ),
         scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
     )
     return utils.load_eagle_model(target, cfg)

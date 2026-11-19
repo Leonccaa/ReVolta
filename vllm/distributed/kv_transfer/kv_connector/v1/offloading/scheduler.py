@@ -666,11 +666,17 @@ class OffloadingConnectorScheduler:
         self.num_skipped_draft_blocks = 0
         self._reported_skipped_draft_blocks = 0
         self._dependency_index: CPUBlockDependencyIndex | None = None
-        if getattr(self, "unified", None) is None and (
+        if (
             self.config.cpu_enable_dependency_eviction
             or self.config.cpu_residency_stats
         ):
-            self._init_dependency_index(spec.kv_cache_config)
+            if getattr(self, "unified", None) is None:
+                self._init_dependency_index(spec.kv_cache_config)
+            else:
+                logger.warning(
+                    "cpu.enable_dependency_eviction and cpu.residency_stats have no "
+                    "effect with the long-context host KV tier; ignoring them."
+                )
         # Read-only counters (stored blocks by kind, lookup shrink, draft
         # window use); never consulted by any decision.
         self._offload_counters: OffloadCounters | None = None

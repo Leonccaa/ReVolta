@@ -58,6 +58,8 @@ States at a shared-prefix junction are never demoted. Under `request_fixed` and 
 `cpu.enable_dependency_eviction` removes provably unusable CPU blocks after a
 capacity eviction. `cpu.residency_stats` enables residency statistics independently.
 Both are experimental deployment settings in `kv_connector_extra_config`.
+With `kernel_config.long_context_kv` enabled (the host KV tier) neither key
+has an effect; the scheduler logs a warning and ignores them.
 
 - Type: boolean for both keys. Default: `false`. Non-boolean values are rejected
   at startup. With both keys absent or false, no dependency index or residency

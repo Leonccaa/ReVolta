@@ -1258,7 +1258,7 @@ class Scheduler(SchedulerInterface):
 
                     # A previous capacity rejection did not consume its hit.
                     exact_end = self.kv_cache_manager.coordinator.exact_end
-                    exact_end.hits.pop(request.request_id, None)
+                    exact_end.discard_hit(request.request_id)
                     offload_scheduler = getattr(
                         self.connector, "connector_scheduler", None
                     )

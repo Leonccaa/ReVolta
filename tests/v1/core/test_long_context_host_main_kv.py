@@ -63,6 +63,7 @@ def test_exact_end_precedes_external_lookup(monkeypatch, checkpoint):
     from vllm.v1.core.kv_cache_utils import BlockHashListWithBlockSize
 
     from .test_mamba_sparse_retention import (
+        _exact_end_entries,
         _exact_end_scheduler,
         _exact_end_step,
         _finish_exact_end,
@@ -85,7 +86,10 @@ def test_exact_end_precedes_external_lookup(monkeypatch, checkpoint):
     manager = scheduler.kv_cache_manager
     blocks, aligned = manager.get_computed_blocks(revisit)
     if checkpoint == "miss":
-        index.index.clear()
+        [entry] = _exact_end_entries(index)
+        group = index.state_groups[0]
+        block, _ = entry.groups[group][1][0]
+        manager.coordinator.group_block_pool(group).evict_blocks({block.block_id})
     elif checkpoint == "unbound":
         pool = scheduler.host_history_pool
         g = pool.host_group_id

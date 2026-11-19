@@ -881,6 +881,107 @@ def _finish_exact_end(scheduler, request):
     return scheduler.kv_cache_manager.coordinator.exact_end
 
 
+def _exact_end_entries(index):
+    return [
+        entry
+        for lengths in index.index.values()
+        for suffixes in lengths.values()
+        for keys in suffixes.values()
+        for matches in keys.values()
+        for entry in matches
+    ]
+
+
+def test_exact_end_duplicate_keys_survive_unrelated_eviction_and_consume():
+    from vllm import SamplingParams
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+    from vllm.v1.request import Request, RequestStatus
+
+    manager = _cache_manager(eagle=False, capacity=16)
+    index = manager.coordinator.exact_end
+    pool = manager.block_pool
+    init_none_hash(sha256)
+
+    def request(name, length, salt=None):
+        return Request(
+            request_id=name,
+            prompt_token_ids=list(range(length)),
+            sampling_params=SamplingParams(max_tokens=1),
+            pooling_params=None,
+            cache_salt=salt,
+            block_hasher=get_request_block_hasher(index.hash_block_size, sha256),
+        )
+
+    def publish(name, length, salt=None):
+        req = request(name, length, salt)
+        req.num_computed_tokens = req.state_end = length - 1
+        req.status = RequestStatus.FINISHED_STOPPED
+        for single in manager.coordinator.single_type_managers:
+            single.req_to_blocks[req.request_id] = pool.get_new_blocks(1)
+        manager.free(req)
+
+    publish("oldest", 12)
+    publish("longest", 14)
+    publish("duplicate", 12)
+    publish("salted", 14, "different")
+    short, duplicate, longest, salted = _exact_end_entries(index)
+    assert short.key == duplicate.key
+    assert longest.suffix == salted.suffix and longest.key != salted.key
+
+    def lookup(req):
+        return manager.extend_exact_end(req, manager.empty_kv_cache_blocks, 0)[1]
+
+    revisit = request("revisit", 14)
+    assert lookup(revisit) == 13 and index.hits[revisit.request_id] is longest
+    block, expected = longest.groups[0][1][0]
+    index.block_evicted(BlockPool(16, True, 8), block.block_id, expected)
+    index.block_evicted(pool, block.block_id, salted.groups[0][1][0][1])
+    assert index.hits[revisit.request_id] is longest
+    pool.evict_blocks({block.block_id})
+    pool.evict_blocks({block.block_id})
+    assert not index.hits
+    assert not longest.hit_requests
+    assert _exact_end_entries(index) == [short, duplicate, salted]
+    assert lookup(revisit) == 11 and index.hits[revisit.request_id] is short
+    second_revisit = request("second-revisit", 14)
+    assert (
+        lookup(second_revisit) == 11 and index.hits[second_revisit.request_id] is short
+    )
+    index.consume(revisit)
+    index.consume(second_revisit)
+    assert _exact_end_entries(index) == [duplicate, salted]
+    assert lookup(revisit) == 11 and index.hits[revisit.request_id] is duplicate
+
+    held = pool.get_new_blocks(1)
+    assert not manager.reset_prefix_cache()
+    assert _exact_end_entries(index) == [duplicate, salted]
+    pool.free_blocks(held)
+    assert manager.reset_prefix_cache()
+    assert manager.reset_prefix_cache()
+    assert not index.index and not index._by_block and not index.hits
+    assert lookup(revisit) == 0
+
+
+def test_exact_end_history_eviction_unlinks_other_groups(monkeypatch):
+    from tests.v1.core.test_long_context_admission import make_requests
+
+    scheduler = _exact_end_scheduler(monkeypatch)
+    [request] = make_requests(1, 2 * STATE_BLOCK - 10, 7)
+    index = _finish_exact_end(scheduler, request)
+    _exact_end_step(scheduler)
+    pool = scheduler.host_history_pool
+    cached = pool.get_cached_block(
+        index._key(request, request.num_tokens),
+        [
+            pool.host_group_id,
+        ],
+    )
+    assert cached is not None
+    pool.evict_blocks({cached[0].block_id})
+    assert not index.index and not index._by_block
+
+
 @pytest.mark.parametrize("trim", [False, True])
 def test_exact_end_publish_revisit_consume_and_republish(monkeypatch, trim):
     from tests.v1.core.test_long_context_admission import make_requests
@@ -891,7 +992,7 @@ def test_exact_end_publish_revisit_consume_and_republish(monkeypatch, trim):
     scheduler = _exact_end_scheduler(monkeypatch)
     [request] = make_requests(1, 2 * STATE_BLOCK - 10, 6 if trim else 7)
     index = _finish_exact_end(scheduler, request)
-    entries = [e for bucket in index.index.values() for e in bucket]
+    entries = _exact_end_entries(index)
     assert request.last_accepted == 3
     if trim:
         assert request.num_computed_tokens != request.num_tokens - 1
@@ -944,7 +1045,7 @@ def test_exact_end_publish_revisit_consume_and_republish(monkeypatch, trim):
     scheduler.add_request(revisit)
     output = _exact_end_step(scheduler)
     assert output.scheduled_new_reqs[0].num_computed_tokens == hit
-    assert not any(index.index.values())
+    assert not index.index
     assert pool.bindings[hid] == handle
     assert pool.host_pages.get(handle).state == PageState.PRIVATE
     for g, (_, held) in enumerate(entry.groups):
@@ -963,11 +1064,7 @@ def test_exact_end_publish_revisit_consume_and_republish(monkeypatch, trim):
         _exact_end_step(scheduler)
     # Continuing the same tail fills it, seals it normally, then publishes anew.
     assert pool.host_pages.get(handle).state == PageState.READY
-    assert any(
-        e.length == revisit.num_tokens
-        for bucket in index.index.values()
-        for e in bucket
-    )
+    assert any(e.length == revisit.num_tokens for e in _exact_end_entries(index))
 
 
 @pytest.mark.parametrize("prompt", [2 * STATE_BLOCK + 14, 65])

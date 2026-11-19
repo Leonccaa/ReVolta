@@ -8,6 +8,7 @@ import torch
 
 from vllm.config.dflash2_lookup import ResolvedDFlash2Lookup
 from vllm.triton_utils import tl, triton
+from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.spec_decode.dflash2.lookup import (
     _point_mass_draft_logits_kernel,
     suffix_lookup,
@@ -45,7 +46,7 @@ def _native_eligibility_kernel(
 
 
 @triton.jit
-def _native_batch_eligibility_kernel(
+def _native_row_eligibility_kernel(
     mapping,
     sampled,
     total_len,
@@ -60,7 +61,6 @@ def _native_batch_eligibility_kernel(
     ROWS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    # One program establishes the all-or-none decision before any history scan.
     # The live count is replay input, independent of the captured padded shape.
     row = tl.arange(0, BLOCK)
     live = tl.load(control + 2)
@@ -82,9 +82,8 @@ def _native_batch_eligibility_kernel(
         & (live <= ROWS)
         & (tl.load(control) != 0)
         & (tl.load(control + 1) != 0)
-        & (tl.min(tl.where(active, row_ok.to(tl.int32), 1), 0) != 0)
     )
-    tl.store(eligible + row, (active & batch_ok).to(tl.int32), mask=row < ROWS)
+    tl.store(eligible + row, (active & batch_ok & row_ok).to(tl.int32), mask=row < ROWS)
 
 
 @triton.jit
@@ -175,22 +174,36 @@ class NativeDFlash2Lookup:
         self.sampled.zero_()
 
     def prepare(
-        self, batch: Any, sampled: torch.Tensor, *, real_run: bool, draft_width: int = 7
+        self,
+        batch: InputBatch,
+        sampled: torch.Tensor,
+        *,
+        real_run: bool,
+        draft_width: int = 7,
     ) -> None:
-        allowed = (
-            1 <= batch.num_reqs <= self.max_requests
-            and draft_width == 7
-            and not batch.has_structured_output_reqs
-            and not batch.is_prefilling_np[: batch.num_reqs].any()
-        )
+        live = batch.num_reqs
+        allowed = 1 <= live <= self.max_requests and draft_width == 7
+        self.sampled.zero_()
+        self.sampled[:live].copy_(sampled[:live], non_blocking=True)
+        if allowed:
+            row_ok = ~batch.is_prefilling_np[:live]
+            if structured := batch.structured_output_req_ids:
+                for row, req_id in enumerate(batch.req_ids):
+                    if req_id in structured:
+                        row_ok[row] = False
+            # Reuse the sampled-count gate; no extra copy on uniform decode.
+            if not row_ok.all():
+                allowed = bool(row_ok.any())
+                if allowed:
+                    self.sampled[:live].mul_(
+                        torch.from_numpy(row_ok).to(
+                            self.sampled.device, non_blocking=True
+                        )
+                    )
         self.control[0].fill_(int(allowed))
         self.control[1].fill_(int(real_run))
         if self.max_requests > 1:
-            self.control[2].fill_(batch.num_reqs)
-        self.sampled.zero_()
-        self.sampled[: batch.num_reqs].copy_(
-            sampled[: batch.num_reqs], non_blocking=True
-        )
+            self.control[2].fill_(live)
 
     def apply(
         self,
@@ -221,7 +234,7 @@ class NativeDFlash2Lookup:
                 num_warps=1,
             )
         else:
-            _native_batch_eligibility_kernel[(1,)](
+            _native_row_eligibility_kernel[(1,)](
                 mapping,
                 self.sampled,
                 lengths,

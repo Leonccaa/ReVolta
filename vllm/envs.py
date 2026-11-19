@@ -20459,6 +20459,10 @@ def compile_factors(speculative_config: Any = None) -> dict[str, object]:
             continue
         if not name.startswith("VLLM_"):
             continue
+        # Older releases hashed an explicitly set zero as an unknown variable.
+        if name == "VLLM_SM70_IDLE_CLOCK_SECONDS" and value == "0":
+            factors[name] = value
+            continue
         if name in factors or name in ignored_factors:
             continue
         factors[name] = normalize_value(value)

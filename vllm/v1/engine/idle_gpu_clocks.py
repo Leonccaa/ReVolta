@@ -1,18 +1,38 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import queue
 import time
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from vllm.logger import init_logger
 from vllm.third_party import pynvml
+from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequestType, UtilityOutput
+from vllm.v1.engine.core import EngineCoreProc
 
 if TYPE_CHECKING:
     from vllm.v1.executor import Executor
     from vllm.v1.worker.worker_base import WorkerBase
 
 logger = init_logger(__name__)
+IDLE_CLOCK_RPC_TIMEOUT = 10.0
+_R = TypeVar("_R")
+
+
+def _call_idle_clock_workers(
+    executor: "Executor", method: Callable[["WorkerBase"], _R]
+) -> list[_R]:
+    try:
+        return executor.collective_rpc(method, timeout=IDLE_CLOCK_RPC_TIMEOUT)
+    except TimeoutError as exc:
+        from vllm.v1.executor.multiproc_executor import MultiprocExecutor
+
+        # Some rank replies may already have been consumed. Never reuse these
+        # queues, even during process cleanup.
+        if isinstance(executor, MultiprocExecutor):
+            executor.is_failed = True
+        raise RuntimeError(f"Executor failed during V100 idle clocks: {exc}") from exc
 
 
 def _worker_v100_uuid(worker: "WorkerBase") -> str | None:
@@ -85,8 +105,8 @@ class IdleGpuClocks:
             logger.warning("V100 idle clocks disabled for this cache connector")
             return None
 
+        uuids = _call_idle_clock_workers(executor, _worker_v100_uuid)
         try:
-            uuids = executor.collective_rpc(_worker_v100_uuid)
             if len(uuids) != tp or len(set(uuids)) != tp or None in uuids:
                 raise RuntimeError("expected a distinct V100 UUID from every rank")
             pynvml.nvmlInit()
@@ -124,16 +144,19 @@ class IdleGpuClocks:
 
         # The engine has no requests or queued batches. This FIFO RPC also
         # fences work on side streams, including already submitted KV copies.
-        receipts = self.executor.collective_rpc(_synchronize_worker_gpu)
+        receipts = _call_idle_clock_workers(self.executor, _synchronize_worker_gpu)
         if receipts != [True] * len(self.handles):
             self.enabled = False
             logger.warning("V100 idle clocks disabled: GPU work did not drain")
         elif still_idle():
-            self._lock()
+            self._lock(still_idle)
         return timeout
 
-    def _lock(self) -> None:
+    def _lock(self, still_idle: Callable[[], bool]) -> None:
         for uuid, handle in self.handles.items():
+            if not still_idle():
+                self.restore()
+                return
             try:
                 pynvml.nvmlDeviceSetGpuLockedClocks(handle, 405, 405)
             except Exception as exc:
@@ -166,3 +189,83 @@ class IdleGpuClocks:
             pynvml.nvmlShutdown()
         except pynvml.NVMLError:
             logger.exception("Failed to close NVML for V100 idle clocks")
+
+
+class _IdleClockInputQueue(queue.Queue[tuple[EngineCoreRequestType, Any]]):
+    adjust_timeout: Callable[[float | None], float | None] | None = None
+
+    def get(
+        self, block: bool = True, timeout: float | None = None
+    ) -> tuple[EngineCoreRequestType, Any]:
+        if block and self.adjust_timeout is not None:
+            timeout = self.adjust_timeout(timeout)
+        return super().get(block, timeout)
+
+
+class IdleClockEngineCoreProc(EngineCoreProc):
+    """Enable idle clock control without changing the default dispatch loop."""
+
+    _input_queue_cls = _IdleClockInputQueue
+    input_queue: _IdleClockInputQueue
+    _idle_gpu_clocks: IdleGpuClocks | None = None
+
+    def __init__(self, *args: Any, idle_clock_seconds: int, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self.idle_clock_seconds = idle_clock_seconds
+
+    def run_busy_loop(self):
+        clocks = self.start_idle_clocks(self.idle_clock_seconds)
+        try:
+            super().run_busy_loop()
+        finally:
+            # The process entry point keeps its shutdown signal handlers
+            # installed until this returns, so another stop signal can wait.
+            if clocks is not None:
+                clocks.close()
+
+    def start_idle_clocks(self, seconds: int) -> IdleGpuClocks | None:
+        clocks = IdleGpuClocks.start(seconds, self.model_executor)
+        self._idle_gpu_clocks = clocks
+        if clocks is not None:
+            self.input_queue.adjust_timeout = self._idle_clock_wait_timeout
+        return clocks
+
+    def _idle_clock_wait_timeout(self, timeout: float | None) -> float | None:
+        clocks = self._idle_gpu_clocks
+        assert clocks is not None
+
+        def still_idle() -> bool:
+            return self.is_running() and self.input_queue.empty()
+
+        if still_idle() and not self.model_executor.is_sleeping:
+            return clocks.wait_timeout(timeout, still_idle)
+        return timeout
+
+    def _process_engine_step(self) -> bool:
+        if self._idle_gpu_clocks is not None and self._idle_gpu_clocks.locked:
+            return False
+        return super()._process_engine_step()
+
+    def _handle_client_request(
+        self, request_type: EngineCoreRequestType, request: Any
+    ) -> None:
+        if (
+            self._idle_gpu_clocks is not None
+            and request_type
+            in (EngineCoreRequestType.ADD, EngineCoreRequestType.UTILITY)
+            and self.is_running()
+            and not self._idle_gpu_clocks.restore()
+        ):
+            if request_type == EngineCoreRequestType.ADD:
+                req, _ = request
+                self._send_error_outputs_to_client([req.request_id], req.client_index)
+            else:
+                client_idx, call_id, _, _ = request
+                output = UtilityOutput(
+                    call_id, failure_message="Failed to restore default V100 clocks"
+                )
+                self.output_queue.put_nowait(
+                    (client_idx, EngineCoreOutputs(utility_output=output))
+                )
+            return
+        super()._handle_client_request(request_type, request)

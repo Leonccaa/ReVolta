@@ -113,6 +113,8 @@ class ExactEndIndex:
     def block_evicted(
         self, pool: "BlockPool", block_id: int, expected: BlockHashWithGroupId
     ) -> None:
+        # Unlike upstream, unlink the entry without clearing the other blocks'
+        # dedicated keys; those blocks remain available for normal LRU eviction.
         for entry in tuple(self._by_block.get((pool, block_id, expected), ())):
             self._remove(entry)
 

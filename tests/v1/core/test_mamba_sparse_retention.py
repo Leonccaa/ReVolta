@@ -963,6 +963,61 @@ def test_exact_end_duplicate_keys_survive_unrelated_eviction_and_consume():
     assert lookup(revisit) == 0
 
 
+def test_exact_end_duplicate_key_eviction_preserves_other_copy():
+    from vllm import SamplingParams
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+    from vllm.v1.request import Request, RequestStatus
+
+    manager = _cache_manager(eagle=False, capacity=16)
+    index = manager.coordinator.exact_end
+    pool = manager.block_pool
+    init_none_hash(sha256)
+
+    def request(name):
+        return Request(
+            request_id=name,
+            prompt_token_ids=list(range(12)),
+            sampling_params=SamplingParams(max_tokens=1),
+            pooling_params=None,
+            block_hasher=get_request_block_hasher(index.hash_block_size, sha256),
+        )
+
+    for name in ("first", "second"):
+        req = request(name)
+        req.num_computed_tokens = req.state_end = 11
+        req.status = RequestStatus.FINISHED_STOPPED
+        for single in manager.coordinator.single_type_managers:
+            single.req_to_blocks[req.request_id] = pool.get_new_blocks(1)
+        manager.free(req)
+
+    first, second = _exact_end_entries(index)
+    assert first.key == second.key
+    revisit = request("revisit")
+
+    def lookup():
+        blocks, hit = manager.extend_exact_end(
+            revisit, manager.empty_kv_cache_blocks, 0
+        )
+        return hit, tuple(
+            tuple(block.block_id for block in group) for group in blocks.blocks
+        )
+
+    before = lookup()
+    assert before == (
+        11,
+        tuple(tuple(block.block_id for block, _ in held) for _, held in first.groups),
+    )
+    assert index.hits[revisit.request_id] is first
+    pool.evict_blocks({second.groups[0][1][0][0].block_id})
+    assert _exact_end_entries(index) == [first]
+    assert lookup() == before
+    assert index.hits[revisit.request_id] is first
+    pool.evict_blocks({first.groups[0][1][0][0].block_id})
+    assert not index.index and not index._by_block and not index.hits
+    assert lookup()[0] == 0
+
+
 def test_exact_end_history_eviction_unlinks_other_groups(monkeypatch):
     from tests.v1.core.test_long_context_admission import make_requests
 

@@ -512,6 +512,7 @@ if TYPE_CHECKING:
     VLLM_SM70_TP_LOCAL_TOPK20_SAMPLER: bool = False
     VLLM_SM70_TOPK_TOPP_8_WARPS: bool = False
     VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS: bool = True
+    VLLM_SM70_IDLE_CLOCK_SECONDS: int = 0
     VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH: int = 0
     VLLM_SM70_ASYNC_STAGED_INPUT_PREP: bool = False
     VLLM_SM70_ASYNC_CPU_TRACE: bool = False
@@ -7961,6 +7962,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
         user_visible=False,
+    ),
+    "VLLM_SM70_IDLE_CLOCK_SECONDS": env_var(
+        lambda: max(0, int(os.getenv("VLLM_SM70_IDLE_CLOCK_SECONDS", "0"))),
+        description=(
+            "Idle seconds before locking exclusively assigned V100 GPUs at "
+            "405 MHz. Zero disables idle clock control."
+        ),
+        category="configuration",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
     ),
     # Diagnostic SM70 async scheduling depth override. Default 0 preserves
     # upstream behavior. Values >2 let no-PP async scheduling enqueue more real
@@ -20297,6 +20311,8 @@ def compile_factors(speculative_config: Any = None) -> dict[str, object]:
 
     ignored_factors: set[str] = {
         "MAX_JOBS",
+        # Engine idle policy does not change compiled code.
+        "VLLM_SM70_IDLE_CLOCK_SECONDS",
         # Scheduler/KV planning only; never changes compiled code.
         "VLLM_SM70_HOST_KV_STATIC_HOT_POOL",
         # Runtime branches inside opaque QSA ops; no traced graph change.

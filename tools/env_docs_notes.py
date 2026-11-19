@@ -36,6 +36,16 @@ _LOOKUP = (
 )
 
 NOTES: dict[str, dict[str, str]] = {
+    "VLLM_SM70_IDLE_CLOCK_SECONDS": dict(
+        section="deployment",
+        since="0.2.0rc14",
+        range="non-negative integer seconds",
+        tradeoff="Zero disables clock control. A positive value opts in for a "
+        "single-host EngineCore process with exclusive V100 TP1 or TP4 GPUs. "
+        "Requires NVML clock permissions and host-side reset by GPU UUID on "
+        "abnormal exit before the GPUs can be reused.",
+        metrics="",
+    ),
     "REVOLTA_RESEARCH_CHECKPOINT_CACHE_DROP": dict(
         section="promoted",
         since="0.2.0",

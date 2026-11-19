@@ -4,7 +4,7 @@ import dataclasses
 import itertools
 import json
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import torch
@@ -915,21 +915,28 @@ def do_mamba_copy_block(copy_bufs: MambaCopyBuffers):
     )
 
 
-def cleanup_mamba_state_idx(
+def iter_mamba_state_reset_req_ids(
     scheduler_output: SchedulerOutput,
-    mamba_state_idx: dict[str, int],
-) -> None:
-    """Pop stale `mamba_state_idx` entries for finished/preempted/resumed reqs.
+) -> Iterator[str]:
+    """Identify requests whose previous Mamba block allocation is invalid.
 
     Force-preempted requests (e.g., during reset_prefix_cache / KV cache
     flush) appear in resumed_req_ids without a corresponding entry in
     preempted_req_ids, leaving stale entries that can point to block
     indices beyond the new (smaller) block allocation.
     """
-    finished_req_ids = scheduler_output.finished_req_ids
-    preempted_req_ids = scheduler_output.preempted_req_ids or set()
-    resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
-    for req_id in itertools.chain(finished_req_ids, preempted_req_ids, resumed_req_ids):
+    return itertools.chain(
+        scheduler_output.finished_req_ids,
+        scheduler_output.preempted_req_ids or (),
+        scheduler_output.scheduled_cached_reqs.resumed_req_ids,
+    )
+
+
+def cleanup_mamba_state_idx(
+    scheduler_output: SchedulerOutput,
+    mamba_state_idx: dict[str, int],
+) -> None:
+    for req_id in iter_mamba_state_reset_req_ids(scheduler_output):
         mamba_state_idx.pop(req_id, None)
 
 

@@ -41,6 +41,8 @@ def make_runner(monkeypatch):
     runner.requests = {}
     runner.num_prompt_logprobs = {}
     runner.encoder_cache = {}
+    runner.mamba_state_idx = {}
+    runner._mamba_accepted_token_state_rows = {}
     runner._dynamic_draft_vocab_prefill_bootstrap = Mock()
     runner.late_interaction_runner = Mock()
     runner._may_reorder_batch = lambda output: None

@@ -2398,7 +2398,9 @@ def _merge_sharded_index_blocks(
     if select is None:
         if not _use_sm70_qsa_lexicographic_topk(block_topk):
             raise RuntimeError("QSA indexer DCP sharding needs the exact SM70 top-k")
-        if _SM70_QSA_MTP_TOPK and blocks.shape[0] in (5, 10):
+        if _SM70_QSA_MTP_TOPK and (
+            rows in (5, 10) or (1 <= rows <= 16 and world * block_topk <= 2304)
+        ):
             torch.ops._C.qsa_lexicographic_topk(
                 sorted_scores, lengths, positions, block_topk, True
             )

@@ -40,3 +40,16 @@ def get_num_nans(logits: torch.Tensor) -> torch.Tensor:
         BLOCK_SIZE=BLOCK_SIZE,
     )
     return num_nans
+
+
+def sum_rows_per_request(
+    row_counts: torch.Tensor, cu_num_logits: torch.Tensor
+) -> torch.Tensor:
+    """Sum per-row counts into one count per request.
+
+    With speculative decoding a request owns rows
+    ``cu_num_logits[i]:cu_num_logits[i + 1]`` of the logits.
+    """
+    totals = torch.nn.functional.pad(row_counts.cumsum(0, dtype=torch.int32), (1, 0))
+    cu = cu_num_logits.long()
+    return totals[cu[1:]] - totals[cu[:-1]]

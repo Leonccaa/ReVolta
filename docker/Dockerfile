@@ -524,11 +524,12 @@ RUN --mount=type=bind,source=.git,target=.git \
 ARG vllm_target_device="cuda"
 ENV VLLM_TARGET_DEVICE=${vllm_target_device}
 
-# Skip adding +precompiled suffix to version (preserves git-derived version)
+# Keep the release version exact when packaging the prebuilt CUDA extensions.
 ENV VLLM_SKIP_PRECOMPILED_VERSION_SUFFIX=1
 # A linked Git worktree's .git file points outside the Docker build context.
-# Let callers provide the exact source version when SCM metadata is unavailable.
+# Allow an explicit release version and stamp the same revision as the image.
 ARG SETUPTOOLS_SCM_PRETEND_VERSION=""
+ARG VLLM_BUILD_COMMIT
 
 # Use existing torch for nightly builds
 RUN --mount=type=cache,target=/opt/uv/cache \

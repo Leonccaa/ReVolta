@@ -5,6 +5,7 @@
 import ast
 import importlib.util
 import os
+import runpy
 import subprocess
 import sys
 from pathlib import Path
@@ -17,45 +18,55 @@ import regex as re
 ROOT = Path(os.getenv("REVOLTA_SOURCE_ROOT") or Path(__file__).resolve().parents[2])
 
 
-def load_setup_function(name, **scope):
+def load_setup_function(name, *dependencies, **scope):
     tree = ast.parse((ROOT / "setup.py").read_text())
     nodes: list[ast.stmt] = [
-        n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in (name, *dependencies)
     ]
     assert nodes, f"setup.py is missing {name}"
     exec(compile(ast.Module(nodes, type_ignores=[]), "setup.py", "exec"), scope)
     return scope[name]
 
 
-@pytest.mark.parametrize("override", [None, "0.1.0+local.20261018.g0123456789"])
-def test_release_version_and_generated_stamp_agree(monkeypatch, override):
+@pytest.mark.parametrize(
+    ("override", "skip_suffix", "expected"),
+    [
+        (None, True, "0.2.0rc14"),
+        (None, False, "0.2.0rc14+precompiled"),
+        ("0.2.0rc15+local.g0123456789", True, "0.2.0rc15+local.g0123456789"),
+    ],
+)
+def test_release_version_and_generated_stamp_agree(
+    monkeypatch, tmp_path, override, skip_suffix, expected
+):
     from setuptools_scm import get_version
 
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "vllm").mkdir()
     monkeypatch.delenv("SETUPTOOLS_SCM_PRETEND_VERSION", raising=False)
     monkeypatch.delenv("SETUPTOOLS_SCM_PRETEND_VERSION_FOR_REVOLTA", raising=False)
     monkeypatch.delenv("VLLM_VERSION_OVERRIDE", raising=False)
+    commit = "0123456789abcdef0123456789abcdef01234567"
+    monkeypatch.setenv("VLLM_BUILD_COMMIT", commit)
     if override:
         monkeypatch.setenv("VLLM_VERSION_OVERRIDE", override)
-    stamps = []
-
-    def stamp(**kwargs):
-        stamps.append(os.environ.get("SETUPTOOLS_SCM_PRETEND_VERSION"))
-        # Use real setuptools-scm normalization without writing to the checkout.
-        kwargs.pop("write_to", None)
-        return get_version(**kwargs)
 
     fn = load_setup_function(
         "get_vllm_version",
+        "write_vllm_version",
         os=os,
-        sys=sys,
-        RELEASE_VERSION="0.1.0",
-        get_version=stamp,
-        envs=SimpleNamespace(VLLM_TARGET_DEVICE="empty"),
-        _no_device=lambda: True,
+        get_version=get_version,
+        envs=SimpleNamespace(VLLM_SKIP_PRECOMPILED_VERSION_SUFFIX=skip_suffix),
+        USE_PRECOMPILED_EXTENSIONS=True,
+        _no_device=lambda: False,
+        _is_cuda=lambda: True,
     )
-    actual = fn()
-    assert actual == (override or "0.1.0+empty")
-    assert stamps[-1] == actual
+    assert fn() == expected
+    stamp = runpy.run_path(str(tmp_path / "vllm/_version.py"))
+    assert stamp["__version__"] == expected
+    assert stamp["__commit_id__"] == commit
 
 
 def test_distribution_name_and_command():

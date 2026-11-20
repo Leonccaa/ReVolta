@@ -1301,6 +1301,7 @@ class EngineShutdownState(IntEnum):
 class EngineCoreProc(EngineCore):
     """ZMQ-wrapper for running EngineCore in background process."""
 
+    _input_queue_cls: type[queue.Queue[tuple[EngineCoreRequestType, Any]]] = queue.Queue
     ENGINE_CORE_DEAD = b"ENGINE_CORE_DEAD"
     addresses: EngineZmqAddresses
 
@@ -1317,7 +1318,7 @@ class EngineCoreProc(EngineCore):
         *,
         engine_index: int = 0,
     ):
-        self.input_queue = queue.Queue[tuple[EngineCoreRequestType, Any]]()
+        self.input_queue = self._input_queue_cls()
         self.output_queue = queue.Queue[tuple[int, EngineCoreOutputs] | bytes]()
         executor_fail_callback = lambda: self.input_queue.put_nowait(
             (EngineCoreRequestType.EXECUTOR_FAILED, b"")
@@ -1569,6 +1570,7 @@ class EngineCoreProc(EngineCore):
             vllm_config: VllmConfig = kwargs["vllm_config"]
             parallel_config: ParallelConfig = vllm_config.parallel_config
             data_parallel = parallel_config.data_parallel_size > 1 or dp_rank > 0
+            idle_seconds = envs.VLLM_SM70_IDLE_CLOCK_SECONDS
             if data_parallel:
                 parallel_config.data_parallel_rank_local = local_dp_rank
                 process_title = f"EngineCore_DP{dp_rank}"
@@ -1603,7 +1605,24 @@ class EngineCoreProc(EngineCore):
                 parallel_config.data_parallel_size = 1
                 parallel_config.data_parallel_size_local = 1
                 parallel_config.data_parallel_rank = 0
-                engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+                if idle_seconds and not data_parallel:
+                    if (
+                        parallel_config.enable_eplb
+                        and parallel_config.eplb_config.use_async
+                    ):
+                        raise ValueError(
+                            "V100 idle clocks cannot be enabled with asynchronous EPLB"
+                        )
+                    from vllm.v1.engine.idle_gpu_clocks import IdleClockEngineCoreProc
+
+                    engine_core = IdleClockEngineCoreProc(
+                        *args,
+                        engine_index=dp_rank,
+                        idle_clock_seconds=idle_seconds,
+                        **kwargs,
+                    )
+                else:
+                    engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
 
             assert engine_core is not None
 
@@ -1625,6 +1644,8 @@ class EngineCoreProc(EngineCore):
             signal.signal(signal.SIGINT, signal_handler)
 
             start_watch_dog(f"engine_{dp_rank}", vllm_config.watchdog_config, logger)
+            if idle_seconds and data_parallel:
+                logger.warning("V100 idle clocks disabled for data parallelism")
             engine_core.run_busy_loop()
 
         except SystemExit:

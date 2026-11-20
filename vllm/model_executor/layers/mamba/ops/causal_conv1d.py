@@ -755,6 +755,7 @@ def _causal_conv1d_update_kernel(
     block_idx_last_scheduled_token,  # (batch,)
     initial_state_idx,  # (batch,)
     o_ptr,  # (batch, dim, seqlen)
+    core_out_ptr,
     # Matrix dimensions
     batch: int,
     dim: tl.constexpr,
@@ -786,6 +787,10 @@ def _causal_conv1d_update_kernel(
     NP2_STATELEN: tl.constexpr,
     USE_PAD_SLOT: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    CORE_ROWS: tl.constexpr,
+    CORE_WIDTH: tl.constexpr,
+    CORE_ROWS_PER_SEQ: tl.constexpr,
+    CORE_BLOCK_ROWS: tl.constexpr,
 ):
     # ruff: noqa: E501
     idx_seq = tl.program_id(0)
@@ -794,6 +799,18 @@ def _causal_conv1d_update_kernel(
 
     # [BLOCK_N,] elements along the feature-dimension (channel)
     idx_feats = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    if CORE_ROWS:
+        # 1Cat #904/#924: initialize even the rows skipped by PAD/empty requests.
+        # Partition the allocation by launch capacity, independent of live cu.
+        local_row = tl.arange(0, CORE_BLOCK_ROWS)
+        row = idx_seq * CORE_ROWS_PER_SEQ + local_row
+        tl.store(
+            core_out_ptr + row[:, None] * CORE_WIDTH + idx_feats[None, :],
+            0,
+            ((local_row < CORE_ROWS_PER_SEQ) & (row < CORE_ROWS))[:, None]
+            & (idx_feats < CORE_WIDTH)[None, :],
+        )
 
     if IS_APC_ENABLED:
         # Get the state from the initial_state_idx
@@ -1080,6 +1097,8 @@ def causal_conv1d_update(
     block_idx_last_scheduled_token: torch.Tensor | None = None,
     initial_state_idx: torch.Tensor | None = None,
     validate_data=False,
+    *,
+    zero_core_out: torch.Tensor | None = None,
 ):
     """
     x: Input tensor which can take the following shapes:
@@ -1117,6 +1136,8 @@ def causal_conv1d_update(
             for example: conv_state_indices = [pad_slot_id, 1, 20, pad_slot_id]
             in this case, the kernel will not process entries at
             indices 0 and 3
+    zero_core_out: contiguous (rows, heads, head_size) GDN verifier output to
+        initialize. Its flattened row width must fit within the conv channels.
     out: (batch, dim) or (batch, dim, seqlen) or (num_tokens, dim), same shape as `x`
     """
     if validate_data:
@@ -1183,6 +1204,11 @@ def causal_conv1d_update(
     else:
         state_len = width - 1
     np2_statelen = triton.next_power_of_2(state_len)
+    core_rows = 0 if zero_core_out is None else zero_core_out.size(0)
+    core_width = (
+        0 if zero_core_out is None else zero_core_out.size(1) * zero_core_out.size(2)
+    )
+    core_rows_per_seq = triton.cdiv(core_rows, batch) if core_rows else 0
 
     def grid(META):
         return (
@@ -1202,6 +1228,7 @@ def causal_conv1d_update(
         block_idx_last_scheduled_token,
         initial_state_idx,
         out,
+        zero_core_out,
         # Matrix dimensions
         batch,
         dim,
@@ -1233,6 +1260,10 @@ def causal_conv1d_update(
         NP2_STATELEN=np2_statelen,
         USE_PAD_SLOT=pad_slot_id is not None,
         BLOCK_N=256,
+        CORE_ROWS=core_rows,
+        CORE_WIDTH=core_width,
+        CORE_ROWS_PER_SEQ=core_rows_per_seq,
+        CORE_BLOCK_ROWS=triton.next_power_of_2(core_rows_per_seq) if core_rows else 0,
     )
     if unsqueeze:
         out = out.squeeze(-1)

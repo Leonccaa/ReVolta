@@ -1424,6 +1424,11 @@ def test_dflash_tail_capture_matches_runtime_metadata(
     )
     runtime = builders[0].build(**runtime_kwargs)
     captured = builders[1].build_for_cudagraph_capture(common)
+    # q4/q5 use the same state table as q8 in DFlash2.
+    assert captured.max_query_len == runtime.max_query_len == query_len
+    if query_len > 1:
+        assert captured.spec_state_indices_tensor is not None
+        assert captured.spec_state_indices_tensor.shape[-1] == 8
     # Capture deliberately poisons state indices. Runtime preparation must
     # refresh the same storage referenced by the captured graph.
     tensor = (

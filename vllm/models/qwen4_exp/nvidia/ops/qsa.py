@@ -1917,6 +1917,13 @@ def qsa_select_paged_tokens(
             score_columns = capacity_columns
             all_visible = None
     rows_per_chunk = max(1, _LOGITS_WORKSPACE_BYTES // max(score_columns * 4, 1))
+    # Preserve the existing chunk boundaries and DCP collective sequence.
+    paged_columns = score_columns
+    if max_seq_len is not None and not torch.cuda.is_current_stream_capturing():
+        live_blocks = -(-(max_seq_len // compress_ratio) // world)
+        paged_columns = min(
+            capacity_columns, triton.cdiv(max(block_topk, live_blocks), 4) * 4
+        )
     chunk_rows = min(rows, rows_per_chunk)
     blocks_buffer = torch.empty(
         (chunk_rows, block_topk), dtype=torch.int32, device=q.device
@@ -1930,6 +1937,7 @@ def qsa_select_paged_tokens(
     for row_start in range(0, rows, rows_per_chunk):
         row_end = min(row_start + rows_per_chunk, rows)
         row_slice = slice(row_start, row_end)
+        topk_columns = score_columns
         if contiguous_keys is not None and key_valid is not None:
             assert all_visible is not None
             logits, visible_blocks = _qsa_mqa_cublas(
@@ -1985,9 +1993,11 @@ def qsa_select_paged_tokens(
                 query_positions[row_slice],
                 sequence_lengths,
                 compress_ratio,
+                num_columns=paged_columns,
                 shared_key_scoring=shared_key_scoring,
                 **shard_kwargs,
             )
+            topk_columns = paged_columns
         blocks = blocks_buffer[: row_end - row_start]
         use_cooperative_topk = (
             blocks.shape[0] <= 32
@@ -2021,7 +2031,7 @@ def qsa_select_paged_tokens(
                 blocks,
                 topk_workspace,
                 block_topk,
-                score_columns,
+                topk_columns,
             )
         if world > 1:
             # Local columns -> global groups, merged across the DCP group.

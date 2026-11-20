@@ -2346,6 +2346,12 @@ class GPUModelRunner(
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
+        # A lifecycle-only batch can return before Mamba input preprocessing.
+        if self.mamba_state_idx or self._mamba_accepted_token_state_rows:
+            for req_id in mamba_utils.iter_mamba_state_reset_req_ids(scheduler_output):
+                self.mamba_state_idx.pop(req_id, None)
+                self._mamba_accepted_token_state_rows.pop(req_id, None)
+
         self._dynamic_draft_vocab_prefill_bootstrap.clear_finished_requests(
             scheduler_output.finished_req_ids
         )

@@ -49,6 +49,10 @@ _R = TypeVar("_R")
 
 pynvml = import_pynvml()
 
+# Successful pair probes from communicator initialization, keyed by NVML index.
+# Negative NVLink P2P status does not establish that a physical link is absent.
+_usage_topology_cache: dict[tuple[int, int], dict[str, int | bool]] = {}
+
 # pytorch 2.5 uses cudnn sdpa by default, which will cause crash on some models
 # see https://github.com/huggingface/diffusers/issues/9704 for details
 torch.backends.cuda.enable_cudnn_sdp(False)
@@ -774,6 +778,9 @@ class NvmlCudaPlatform(CudaPlatformBase):
                         )
                         if p2p_status != pynvml.NVML_P2P_STATUS_OK:
                             return False
+                        a, b = physical_device_ids[i], physical_device_ids[j]
+                        key = (min(a, b), max(a, b))
+                        _usage_topology_cache.setdefault(key, {})["nvlink"] = True
                     except pynvml.NVMLError:
                         logger.exception(
                             "NVLink detection failed. This is normal if"
@@ -792,7 +799,7 @@ class NvmlCudaPlatform(CudaPlatformBase):
         """
         handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in physical_device_ids]
         for i, handle in enumerate(handles):
-            for peer_handle in handles[i + 1 :]:
+            for j, peer_handle in enumerate(handles[i + 1 :], start=i + 1):
                 try:
                     level = pynvml.nvmlDeviceGetTopologyCommonAncestor(
                         handle, peer_handle
@@ -800,6 +807,9 @@ class NvmlCudaPlatform(CudaPlatformBase):
                 except pynvml.NVMLError:
                     logger.exception("PCIe topology detection failed.")
                     return False
+                a, b = physical_device_ids[i], physical_device_ids[j]
+                key = (min(a, b), max(a, b))
+                _usage_topology_cache.setdefault(key, {})["level"] = level
                 if level > pynvml.NVML_TOPOLOGY_MULTIPLE:
                     return False
         return True

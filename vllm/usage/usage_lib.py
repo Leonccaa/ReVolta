@@ -293,6 +293,15 @@ class UsageMessage:
             )
         if current_platform.is_cuda():
             self.cuda_runtime = torch.version.cuda
+            if self.gpu_count and self.gpu_count > 1:
+                try:
+                    from vllm.usage.gpu_topology import collect_gpu_topology
+
+                    topology = collect_gpu_topology(self.gpu_count)
+                    if topology is not None:
+                        self.gpu_topology = topology
+                except Exception:  # noqa: BLE001 - optional telemetry
+                    pass
         if current_platform.is_xpu():
             self.xpu_runtime = torch.version.xpu
             self.gpu_count = torch.xpu.device_count()

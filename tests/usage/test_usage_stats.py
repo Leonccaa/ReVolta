@@ -43,6 +43,7 @@ CONTRACT_FIELDS = {
     "gpu_count",
     "gpu_type",
     "gpu_memory_per_device",
+    "gpu_topology",
     "env_var_json",
     # Engine / model
     "model_architecture",
@@ -450,6 +451,57 @@ def test_heartbeat_repeats_startup_summary_with_uptime(monkeypatch):
     assert captured["kv_cache_usage"] == 37
     assert isinstance(captured["uptime_s"], int)
     assert captured["uptime_s"] >= 0
+
+
+def test_topology_startup_and_heartbeat(monkeypatch):
+    from vllm import platforms
+    from vllm.usage import gpu_topology
+
+    platform = types.SimpleNamespace(
+        is_cuda_alike=lambda: True,
+        is_cuda=lambda: True,
+        is_xpu=lambda: False,
+        is_tpu=lambda: False,
+        device_count=lambda: 2,
+    )
+    monkeypatch.setattr(platforms, "current_platform", platform)
+    monkeypatch.setattr(
+        usage_lib, "cuda_get_device_properties", lambda *args: ("GPU", 1)
+    )
+    calls = []
+    topology = '[{"gpus":[0,1],"type":"PCIe","path":"PIX"}]'
+
+    def collect(n):
+        calls.append(n)
+        return topology
+
+    monkeypatch.setattr(gpu_topology, "collect_gpu_topology", collect)
+    reports = []
+    monkeypatch.setattr(
+        usage_lib.UsageMessage,
+        "_send_to_server",
+        lambda self, data: reports.append(data),
+    )
+    monkeypatch.setattr(
+        usage_lib.UsageMessage, "_write_to_file", lambda self, data: None
+    )
+    message = usage_lib.UsageMessage()
+    message._report_usage_once("Stub", usage_lib.UsageContext.ENGINE_CONTEXT, {})
+    assert calls == [2]
+
+    class StopHeartbeat(Exception):
+        pass
+
+    def sleep(_):
+        if len(reports) > 1:
+            raise StopHeartbeat
+
+    monkeypatch.setattr(usage_lib.time, "sleep", sleep)
+    with pytest.raises(StopHeartbeat):
+        message._report_continuous_usage()
+    assert len(reports) == 2
+    assert reports[0]["gpu_topology"] == reports[1]["gpu_topology"] == topology
+    assert calls == [2]
 
 
 def test_report_payload_is_json_serializable(monkeypatch):

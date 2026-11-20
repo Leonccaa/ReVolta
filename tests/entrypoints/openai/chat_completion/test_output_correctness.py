@@ -106,7 +106,19 @@ def _tokenizer():
     return tokenizer
 
 
-def _stream(serving, request, outputs, tokenizer=None, chat_template_kwargs=None):
+def _stream(
+    serving,
+    request,
+    outputs,
+    tokenizer=None,
+    chat_template_kwargs=None,
+    *,
+    metadata=None,
+    reasoning_parser=None,
+):
+    if metadata is None:
+        metadata = RequestResponseMetadata(request_id="test")
+
     async def collect():
         lines = [
             line
@@ -117,7 +129,8 @@ def _stream(serving, request, outputs, tokenizer=None, chat_template_kwargs=None
                 "test",
                 [],
                 tokenizer or _tokenizer(),
-                RequestResponseMetadata(request_id="test"),
+                metadata,
+                reasoning_parser=reasoning_parser,
                 chat_template_kwargs=chat_template_kwargs,
             )
         ]
@@ -394,6 +407,82 @@ def _qwen_stream(parser_kind, thinking, completions, monkeypatch, **kwargs):
         chat_template_kwargs=None if thinking else {"enable_thinking": False},
     )
     return chunks, outputs, [_encode(tokenizer, c) for c in completions]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("n", [1, 2])
+@pytest.mark.parametrize("mode", ["explicit", "prompt_open", "closed", "no_parser"])
+def test_chat_reasoning_usage(stream, n, mode, monkeypatch):
+    # Explicit generated markers reproduce #1443 without relying on #1433.
+    # Split multibyte characters also exercise tokens with no text delta.
+    if mode in ("explicit", "prompt_open"):
+        start = "<think>" if mode == "explicit" else ""
+        prompt = "q" if mode == "explicit" else "q<think>\n"
+        completions = [f"{start}想</think>yes", f"{start}🙂</think>x"][:n]
+        expected_reasoning = sum([3, 4][:n])
+    else:
+        prompt = "q<think>\n\n</think>\n\n"
+        completions = ["yes", "x"][:n]
+        expected_reasoning = 0
+
+    parser_cls = None if mode == "no_parser" else Qwen3ReasoningParser
+    monkeypatch.setattr(_WrappedParser, "reasoning_parser_cls", parser_cls)
+    monkeypatch.setattr(_WrappedParser, "tool_parser_cls", None)
+    serving = _serving(_WrappedParser if parser_cls else None)
+    tokenizer = _byte_tokenizer()
+    reasoning_parser = parser_cls(tokenizer) if parser_cls else None
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[{"role": "user", "content": "q"}],
+        n=n,
+        stream=stream,
+        stream_options={"include_usage": True} if stream else None,
+        include_reasoning=False,
+    )
+    outputs = _engine_outputs(request, tokenizer, prompt, completions)
+    metadata = RequestResponseMetadata(request_id="test")
+    if stream:
+        chunks = _stream(
+            serving,
+            request,
+            outputs,
+            tokenizer,
+            metadata=metadata,
+            reasoning_parser=reasoning_parser,
+        )
+        assert all(chunk.get("usage") is None for chunk in chunks[:-1])
+        assert chunks[-1]["choices"] == []
+        usage = chunks[-1]["usage"]
+    else:
+        response = asyncio.run(
+            serving.chat_completion_full_generator(
+                request,
+                _generate(outputs),
+                "test",
+                "test",
+                [],
+                tokenizer,
+                metadata,
+                reasoning_parser=reasoning_parser,
+            )
+        )
+        usage = response.model_dump()["usage"]
+
+    prompt_tokens = len(_encode(tokenizer, prompt))
+    completion_tokens = sum(len(_encode(tokenizer, text)) for text in completions)
+    assert usage["prompt_tokens"] == prompt_tokens
+    assert usage["completion_tokens"] == completion_tokens
+    assert usage["total_tokens"] == prompt_tokens + completion_tokens
+    if parser_cls:
+        assert usage["completion_tokens_details"] == {
+            "reasoning_tokens": expected_reasoning
+        }
+    else:
+        assert "completion_tokens_details" not in usage
+    assert metadata.final_usage_info is not None
+    assert metadata.final_usage_info.model_dump().get(
+        "completion_tokens_details"
+    ) == usage.get("completion_tokens_details")
 
 
 def _choices(chunks):

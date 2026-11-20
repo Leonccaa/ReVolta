@@ -191,7 +191,7 @@ def test_target_restores_global_outputs(monkeypatch, draft, vision):
         monkeypatch.setattr(model, "sp_all_gather", gather)
         if base_buffer is not None:
             backbone._mtp_hidden_buffer = torch.full_like(base_buffer, -1.0)
-        actual = backbone.forward(ids, positions, hc_sp=True, **kwargs)
+        actual = backbone._forward_layout(ids, positions, hc_sp=True, **kwargs)
         assert next(remaining, None) is None
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         if base_buffer is not None:
@@ -422,3 +422,14 @@ def test_aux_gather_preserves_fp8_bytes(monkeypatch):
     result = model._gather_aux_hidden_state(local.view(torch.float8_e4m3fn), 17)
     assert result.dtype == torch.float8_e4m3fn
     torch.testing.assert_close(result.view(torch.uint8), full)
+
+
+def test_compiled_backbone_signature_has_no_layout_argument():
+    # AOT compilation binds keyword-only parameters without their defaults,
+    # so the compiled entry points must keep the pre-SP signature.
+    import inspect
+
+    for cls in (model.Qwen4ExpModel, model._Qwen4ExpHcSpModel):
+        params = inspect.signature(cls.forward).parameters
+        assert "hc_sp" not in params
+        assert all(p.kind is not p.KEYWORD_ONLY for p in params.values())

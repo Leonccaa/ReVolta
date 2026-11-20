@@ -859,8 +859,31 @@ class Qwen4ExpModel(nn.Module, EagleModelMixin):
         query_start_loc: torch.Tensor | None = None,
         ngram_context: torch.Tensor | None = None,
         deepstack_input_embeds: IntermediateTensors | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
+        # Keep the compiled signature unchanged: AOT compilation binds
+        # keyword-only parameters without their defaults.
+        return self._forward_layout(
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
+            query_start_loc,
+            ngram_context,
+            deepstack_input_embeds,
+            hc_sp=False,
+        )
+
+    def _forward_layout(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        query_start_loc: torch.Tensor | None = None,
+        ngram_context: torch.Tensor | None = None,
+        deepstack_input_embeds: IntermediateTensors | None = None,
         *,
-        hc_sp: bool = False,
+        hc_sp: bool,
     ) -> torch.Tensor | IntermediateTensors:
         num_tokens = positions.shape[-1]
         hc_kwargs = {"hc_sp": True} if hc_sp else {}
@@ -1083,7 +1106,7 @@ class _Qwen4ExpHcSpModel(nn.Module):
         ngram_context: torch.Tensor | None = None,
         deepstack_input_embeds: IntermediateTensors | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-        return self._target_model.forward(
+        return self._target_model._forward_layout(
             input_ids,
             positions,
             intermediate_tensors,

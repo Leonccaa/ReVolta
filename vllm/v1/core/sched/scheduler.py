@@ -2555,6 +2555,7 @@ class Scheduler(SchedulerInterface):
             self.requests,
             structured_output_request_ids,
             scheduler_output.scheduled_spec_decode_tokens,
+            retain_invalid_draft=self._retains_invalid_grammar_draft,
         )
         return GrammarOutput(structured_output_request_ids, bitmask)
 
@@ -3065,8 +3066,23 @@ class Scheduler(SchedulerInterface):
                 # in the decoder's KV cache.
                 self.encoder_cache_manager.free_encoder_input(request, input_id)
 
+    @property
+    def _retains_invalid_grammar_draft(self) -> bool:
+        spec_config = self.vllm_config.speculative_config
+        return (
+            self.use_v2_model_runner
+            and not self.scheduler_config.async_scheduling
+            and spec_config is not None
+            and spec_config.rejection_sample_method == "standard"
+            and spec_config.draft_sample_method == "probabilistic"
+        )
+
     def _validate_grammar_draft_tokens(
-        self, request: Request, spec_token_ids: list[int]
+        self,
+        request: Request,
+        spec_token_ids: list[int],
+        *,
+        retain_invalid_draft: bool = False,
     ) -> list[int]:
         try:
             metadata = request.structured_output_request
@@ -3077,7 +3093,24 @@ class Scheduler(SchedulerInterface):
                 assert metadata is not None
                 grammar = metadata.grammar
                 assert isinstance(grammar, StructuredOutputGrammar)
-                return grammar.validate_tokens(spec_token_ids)
+                valid_tokens = grammar.validate_tokens(spec_token_ids)
+                params = request.sampling_params
+                if (
+                    retain_invalid_draft
+                    and params is not None
+                    and params.temperature > 0
+                    and len(valid_tokens) < len(spec_token_ids)
+                    and spec_token_ids[len(valid_tokens)] >= 0
+                    and not grammar.is_terminated()
+                    and (
+                        not valid_tokens
+                        or valid_tokens[-1] not in params.all_stop_token_ids
+                    )
+                ):
+                    # The original proposal must reach rejection sampling at this
+                    # position so it draws from the residual instead of a bonus row.
+                    return spec_token_ids[: len(valid_tokens) + 1]
+                return valid_tokens
         except Exception as exc:
             if request.structured_output_request is None:
                 raise
@@ -3087,6 +3120,7 @@ class Scheduler(SchedulerInterface):
         return spec_token_ids
 
     def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
+        retain_invalid_draft = self._retains_invalid_grammar_draft
         for req_id, spec_token_ids in zip(
             draft_token_ids.req_ids,
             draft_token_ids.draft_token_ids,
@@ -3105,7 +3139,7 @@ class Scheduler(SchedulerInterface):
 
             # Add newly generated spec token ids to the request.
             spec_token_ids = self._validate_grammar_draft_tokens(
-                request, spec_token_ids
+                request, spec_token_ids, retain_invalid_draft=retain_invalid_draft
             )
             request.spec_token_ids = list(spec_token_ids)
 

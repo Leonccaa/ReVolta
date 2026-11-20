@@ -8,6 +8,7 @@ import pytest
 from transformers import Qwen3Config
 
 from vllm.config import ModelConfig, ParallelConfig, SpeculativeConfig
+from vllm.config import speculative as impl
 from vllm.platforms import current_platform
 
 pytestmark = pytest.mark.skip_global_cleanup
@@ -177,3 +178,49 @@ def test_explicit_draft_yarn_is_preserved(tmp_path, monkeypatch):
     before = copy.deepcopy(draft_rope)
     spec = build(tmp_path, monkeypatch, YARN, draft_rope, 524288)
     assert spec.draft_model_config.hf_text_config.rope_parameters == before
+
+
+@pytest.mark.parametrize(
+    ("target_len", "draft_rope", "spec_len", "expected"),
+    [
+        (524288, DEFAULT, 524288, None),
+        (NATIVE, DEFAULT, NATIVE, NATIVE),
+        (524288, YARN, 524288, 524288),
+    ],
+)
+def test_precheck_constructs_once(
+    tmp_path, monkeypatch, target_len, draft_rope, spec_len, expected
+):
+    calls = []
+
+    def construct(**kwargs):
+        calls.append(kwargs["max_model_len"])
+        # Permit an overlong unscaled draft even if the original limit was passed.
+        # The assertion detects prechecking rather than error-triggered retrying.
+        kwargs["max_model_len"] = None
+        return ModelConfig(**kwargs)
+
+    monkeypatch.setattr(impl, "ModelConfig", construct)
+    build(tmp_path, monkeypatch, YARN, draft_rope, target_len, spec_len=spec_len)
+    assert calls == [expected]
+
+
+@pytest.mark.parametrize("target_len,expected", [(524288, None), (NATIVE, NATIVE)])
+@pytest.mark.parametrize(
+    "message", ["unrelated failure", "User-specified max_model_len ("]
+)
+def test_constructor_error_propagates_without_retry(
+    tmp_path, monkeypatch, target_len, expected, message
+):
+    calls = []
+    error = ValueError(message)
+
+    def construct(**kwargs):
+        calls.append(kwargs["max_model_len"])
+        raise error
+
+    monkeypatch.setattr(impl, "ModelConfig", construct)
+    with pytest.raises(ValueError) as caught:
+        build(tmp_path, monkeypatch, YARN, DEFAULT, target_len, spec_len=target_len)
+    assert caught.value.errors()[0]["ctx"]["error"] is error
+    assert calls == [expected]

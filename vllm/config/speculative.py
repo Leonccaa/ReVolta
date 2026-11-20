@@ -40,7 +40,9 @@ from vllm.config.parallel import ParallelConfig
 from vllm.config.sm70_dflash2 import Sm70DFlash2Config
 from vllm.config.utils import config, is_init_field
 from vllm.logger import init_logger
-from vllm.transformers_utils.config import get_hf_text_config
+from vllm.transformers_utils.config import get_config, get_hf_text_config
+from vllm.transformers_utils.gguf_utils import maybe_patch_hf_config_from_gguf
+from vllm.transformers_utils.utils import maybe_model_redirect
 from vllm.utils.hashing import safe_hash
 from vllm.utils.import_utils import LazyLoader, has_arctic_inference
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -1277,38 +1279,35 @@ class SpeculativeConfig:
                 self.prompt_lookup_min = 0
 
             if self.model is not None:
+                draft_max_model_len = self.max_model_len
+                if self.use_dflash_family() or (
+                    self.method == "draft_model" and "dflash" in self.model.lower()
+                ):
+                    # Mirror ModelConfig's HF config loading and overrides before
+                    # deciding whether the DFlash guard must validate the extension.
+                    model = maybe_model_redirect(self.model)
+                    hf_config = get_config(
+                        model,
+                        self.target_model_config.trust_remote_code,
+                        self.revision,
+                        self.code_revision,
+                        self.target_model_config.config_format,
+                        hf_overrides_fn=SpeculativeConfig.hf_config_override,
+                    )
+                    hf_config = maybe_patch_hf_config_from_gguf(model, hf_config)
+                    text = get_hf_text_config(hf_config)
+                    native = getattr(text, "max_position_embeddings", None)
+                    rope = getattr(text, "rope_parameters", None)
+                    if (
+                        native is not None
+                        and self.target_model_config.max_model_len > native
+                        and not (
+                            isinstance(rope, dict) and rope.get("rope_type") == "yarn"
+                        )
+                    ):
+                        draft_max_model_len = None
 
-                def make_draft_config(**kwargs: Any) -> ModelConfig:
-                    try:
-                        return ModelConfig(**kwargs)
-                    except ValueError as error:
-                        if "User-specified max_model_len (" not in str(error):
-                            raise
-                        # Only defer length validation if the DFlash guard must
-                        # extend an unscaled draft. All other failures stay intact.
-                        kwargs["max_model_len"] = None
-                        draft = ModelConfig(**kwargs)
-                        text = get_hf_text_config(draft.hf_config)
-                        native = getattr(text, "max_position_embeddings", None)
-                        rope = getattr(text, "rope_parameters", None)
-                        if (
-                            native is None
-                            or self.target_model_config.max_model_len <= native
-                            or (
-                                isinstance(rope, dict)
-                                and rope.get("rope_type") == "yarn"
-                            )
-                        ):
-                            raise error
-                        return draft
-
-                draft_config_factory = (
-                    make_draft_config
-                    if self.use_dflash_family()
-                    or (self.method == "draft_model" and "dflash" in self.model.lower())
-                    else ModelConfig
-                )
-                self.draft_model_config = draft_config_factory(
+                self.draft_model_config = ModelConfig(
                     model=self.model,
                     runner="draft",
                     tokenizer=self.target_model_config.tokenizer,
@@ -1321,7 +1320,7 @@ class SpeculativeConfig:
                     revision=self.revision,
                     code_revision=self.code_revision,
                     tokenizer_revision=self.target_model_config.tokenizer_revision,
-                    max_model_len=self.max_model_len,  # type: ignore[arg-type]
+                    max_model_len=draft_max_model_len,  # type: ignore[arg-type]
                     spec_target_max_model_len=self.target_model_config.max_model_len,
                     quantization=self.quantization,
                     enforce_eager=self.target_model_config.enforce_eager,

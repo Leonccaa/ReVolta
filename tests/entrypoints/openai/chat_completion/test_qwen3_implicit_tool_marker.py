@@ -25,10 +25,13 @@ from tests.entrypoints.openai.chat_completion.test_output_correctness import (
     _text,
     _tool_calls,
 )
+from tests.tool_parsers.test_qwen_xml_tool_grammar import JSON_OBJECT, JSON_SCHEMA
+from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.openai.engine.protocol import RequestResponseMetadata
 from vllm.parser.abstract_parser import _WrappedParser
 from vllm.reasoning.qwen3_reasoning_parser import Qwen3ReasoningParser
 from vllm.tool_parsers.qwen3coder_tool_parser import Qwen3CoderToolParser
+from vllm.tool_parsers.qwen3xml_tool_parser import Qwen3XMLToolParser
 
 REASONING = "Call f.\n"
 GRAMMAR_OUTPUT = {
@@ -66,10 +69,16 @@ def _tool_request(tok, choice, stream):
     return request
 
 
+def _chat_serving():
+    serving = _serving(_WrappedParser)
+    serving.tool_parser = _WrappedParser.tool_parser_cls
+    return serving
+
+
 def _full(tok, request, text):
     ids = tok.encode(text, add_special_tokens=False)
     response = asyncio.run(
-        _serving(_WrappedParser).chat_completion_full_generator(
+        _chat_serving().chat_completion_full_generator(
             request,
             _generate([_output(text, ids, "stop")]),
             "test",
@@ -97,7 +106,7 @@ def _streamed(tok, request, text, chunk):
         outputs.append(
             _output(tok.decode(piece), piece, "stop" if last else None),
         )
-    chunks = _stream(_serving(_WrappedParser), request, outputs, tok)
+    chunks = _stream(_chat_serving(), request, outputs, tok)
     return _choices(chunks)[0]
 
 
@@ -160,10 +169,64 @@ def test_parser_split_depends_only_on_json_constraint(tok):
         assert split(free) == (REASONING, "<tool_call>" + GRAMMAR_OUTPUT["required"])
 
 
-def test_json_response_format_content_after_implicit_end(tok):
-    request = _request(response_format={"type": "json_object"})
-    request.to_sampling_params(64, {})
-    assert request.structured_outputs.json_object
-    text = REASONING + "<tool_call>" + GRAMMAR_OUTPUT["named"]
-    split = Qwen3ReasoningParser(tok).extract_reasoning(text, request)
-    assert split == (REASONING, GRAMMAR_OUTPUT["named"])
+@pytest.mark.parametrize("parser_cls", [Qwen3CoderToolParser, Qwen3XMLToolParser])
+@pytest.mark.parametrize("response_format", [JSON_OBJECT, JSON_SCHEMA])
+@pytest.mark.parametrize("chunk", [None, 1, 5])
+@pytest.mark.parametrize("reasoning_end", ["</think>", ""])
+def test_auto_tools_with_response_format(
+    tok, monkeypatch, parser_cls, response_format, chunk, reasoning_end
+):
+    monkeypatch.setattr(_WrappedParser, "tool_parser_cls", parser_cls)
+    request = _request(stream=chunk is not None, response_format=response_format)
+    assert request.tool_choice == "auto"
+    request = parser_cls(tok, request.tools).adjust_request(request)
+    params = request.to_sampling_params(128, {})
+    assert params.structured_outputs.structural_tag is not None
+    assert request.response_format is None
+
+    # Replay the parser boundary, not the sampler. The implicit case checks
+    # that the opener, which doubles as a reasoning marker, reaches the parser.
+    text = REASONING + reasoning_end + XML_CALL
+    if chunk is None:
+        choice, calls = _full(tok, request, text)
+        assert calls == [("f", {"x": "v"})]
+        assert choice.message.reasoning == REASONING
+        assert not choice.message.content
+        assert choice.finish_reason == "tool_calls"
+    else:
+        choices = _streamed(tok, request, text, chunk)
+        assert _tool_calls(choices) == (["f"], {"x": "v"})
+        assert _text(choices, "reasoning") == REASONING
+        assert _text(choices, "content") == ""
+        assert choices[-1]["finish_reason"] == "tool_calls"
+
+
+@pytest.mark.parametrize("response_format", [JSON_OBJECT, JSON_SCHEMA])
+@pytest.mark.parametrize("chunk", [None, 1, 5])
+def test_json_response_format_content_after_implicit_end(tok, response_format, chunk):
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[{"role": "user", "content": "answer in JSON"}],
+        stream=chunk is not None,
+        response_format=response_format,
+    )
+    params = request.to_sampling_params(64, {})
+    assert params.structured_outputs.json_object or params.structured_outputs.json
+    answer = '{"answer": "ok"}'
+    text = REASONING + "<tool_call>" + answer
+    assert Qwen3ReasoningParser(tok).extract_reasoning(text, request) == (
+        REASONING,
+        answer,
+    )
+    if chunk is None:
+        choice, calls = _full(tok, request, text)
+        assert calls == []
+        assert choice.message.reasoning == REASONING
+        assert choice.message.content == answer
+        assert choice.finish_reason == "stop"
+    else:
+        choices = _streamed(tok, request, text, chunk)
+        assert not any(c["delta"].get("tool_calls") for c in choices)
+        assert _text(choices, "reasoning") == REASONING
+        assert _text(choices, "content") == answer
+        assert choices[-1]["finish_reason"] == "stop"

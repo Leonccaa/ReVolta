@@ -1513,10 +1513,11 @@ def apply_top_k_top_p_triton(
     mask_value: float = float("-inf"),
     has_topp_only_rows: bool = True,
 ) -> torch.Tensor:
-    """Apply combined top-k and top-p masking using Triton.
+    """Apply combined top-k and top-p masking.
 
     Top-k is applied first (by logit value), then top-p is applied
-    to the remaining k values (by probability).
+    to the remaining values (by probability). Single rows use the PyTorch
+    reference; larger batches use Triton.
 
     Args:
         logits: [batch_size, vocab_size] float32 tensor. The returned tensor
@@ -1559,6 +1560,17 @@ def apply_top_k_top_p_triton(
         p_ptr = p.to(torch.float32)
     else:
         p_ptr = logits  # Dummy pointer (won't be read)
+
+    # Match the reference at single-row cutoffs, including split ties.
+    if batch_size == 1:
+        from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
+
+        reference_logits = apply_top_k_top_p_pytorch(
+            logits, k_ptr if topk_enabled else None, p_ptr if topp_enabled else None
+        )
+        if mask_value != float("-inf"):
+            reference_logits.masked_fill_(torch.isneginf(reference_logits), mask_value)
+        return reference_logits
 
     num_sm = num_compute_units(logits.device.index)
 

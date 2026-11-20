@@ -18634,17 +18634,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_FLASHQLA_ORIGINAL_PREFILL": env_var(
         lambda: os.getenv("VLLM_SM70_FLASHQLA_ORIGINAL_PREFILL"),
         description=(
-            "SM70: flashqla original prefill. The consumer locations and unset"
-            " defaults are listed below."
+            "Select original SM70 FlashQLA prefill. If unset, use the legacy"
+            " FLASH_QLA_SM70_USE_ORIGINAL_TILELANG value, then detect nvcc."
         ),
         category="configuration",
         declared_default="None",
-        effective_default=("None"),
+        effective_default="None",
         automatic_conditions=(
-            (
-                "None at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn"
-                ".py:_sm70_flashqla_original_prefill_enabled"
-            ),
             (
                 "None at vllm/v1/attention/backends/gdn_attn.py:_sm70_flashqla_ori"
                 "ginal_prefill_enabled"

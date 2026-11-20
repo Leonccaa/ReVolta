@@ -8,6 +8,7 @@ while separately routing speculative verification rows. This mirrors the
 the slower prefill path during active MTP.
 """
 
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -31,6 +32,7 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     _sm70_qwen_gdn_spec_core_enabled,
     qwen_gdn_attention_core_spec_commit,
 )
+from vllm.v1.attention.backends import gdn_attn
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadata,
     GDNAttentionMetadataBuilder,
@@ -347,6 +349,165 @@ def _build(
                 ),
             )
     return builder.build(common_prefix_len=0, common_attn_metadata=common, **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("method", "toolkit", "primary", "legacy", "original"),
+    [
+        pytest.param("dflash", "missing", None, None, False, id="dflash-no-toolkit"),
+        pytest.param("mtp", "runtime", None, None, False, id="mtp-runtime-only"),
+        pytest.param("dflash", "nvcc", None, None, True, id="dflash-toolkit"),
+        pytest.param("mtp", "nvcc", None, None, True, id="mtp-toolkit"),
+        pytest.param("dflash", "missing", "1", "0", True, id="primary-on"),
+        pytest.param("mtp", "nvcc", "", "1", False, id="primary-off"),
+        pytest.param("mtp", "runtime", None, " yes ", True, id="legacy-on"),
+        pytest.param("dflash", "nvcc", None, " off ", False, id="legacy-off"),
+    ],
+)
+def test_sm70_flashqla_prefill_route(
+    monkeypatch,
+    request,
+    tmp_path,
+    local_gdn_model,
+    method,
+    toolkit,
+    primary,
+    legacy,
+    original,
+):
+    # Substitute TileLang's CUDA home and the GPU kernels, leaving metadata,
+    # GDN profiling warmup, and actual prefill dispatch on the real code path.
+    cuda_home = tmp_path / "cuda"
+    if toolkit != "missing":
+        (cuda_home / "lib64").mkdir(parents=True)
+    if toolkit == "nvcc":
+        nvcc = cuda_home / "bin" / "nvcc"
+        nvcc.parent.mkdir()
+        nvcc.touch()
+        nvcc.chmod(0o755)
+    monkeypatch.setitem(
+        sys.modules,
+        "tilelang.env",
+        SimpleNamespace(CUDA_HOME=str(cuda_home) if toolkit != "missing" else ""),
+    )
+    if cached_default := getattr(
+        gdn_attn, "_sm70_flashqla_default_original_prefill", None
+    ):
+        cached_default.cache_clear()
+        request.addfinalizer(cached_default.cache_clear)
+    for name, value in (
+        ("VLLM_SM70_FLASHQLA_ORIGINAL_PREFILL", primary),
+        ("FLASH_QLA_SM70_USE_ORIGINAL_TILELANG", legacy),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    monkeypatch.setenv("VLLM_SM70_FLASHQLA_DIRECT_OUTPUT", "1")
+    monkeypatch.setenv("VLLM_SM70_FLASHQLA_INDEXED_PREFILL", "0")
+    monkeypatch.setattr(qwen_gdn, "_SM70_GDN_PREFILL_WARMUP_KEYS", set())
+    monkeypatch.setattr(qwen_gdn, "_sm70_profile_trace_enabled", lambda: False)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+
+    def fake_post_conv(**kwargs):
+        tokens = kwargs["a"].shape[0]
+        qkv = torch.ones((1, tokens, 1, 128), dtype=torch.float16)
+        gate = torch.zeros((1, tokens, 1), dtype=torch.float32)
+        return qkv, qkv, qkv, gate, gate
+
+    monkeypatch.setattr(qwen_gdn, "causal_conv1d_fn", lambda x, *_a, **_kw: x)
+    monkeypatch.setattr(qwen_gdn, "fused_post_conv_prep", fake_post_conv)
+    monkeypatch.setattr(
+        qwen_gdn,
+        "fused_sigmoid_gating_delta_rule_update_mixed_qkv_out",
+        lambda **_: None,
+    )
+    calls = []
+
+    def fake_original(**kwargs):
+        calls.append(("tilelang", False, kwargs["chunk_indices"] is not None))
+        return None, None, kwargs["v"], None, kwargs["initial_state"] + 1
+
+    def fake_vlk(**kwargs):
+        calls.append(("vlk", kwargs["gate_is_exp"], False))
+        return kwargs["v"], kwargs["initial_state"] + 1
+
+    chunk_module = "flash_qla.ops.gated_delta_rule.chunk"
+    monkeypatch.setitem(
+        sys.modules,
+        chunk_module,
+        SimpleNamespace(chunk_gated_delta_rule_fwd_sm70_tilelang=fake_original),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        f"{chunk_module}.sm70",
+        SimpleNamespace(chunk_gated_delta_rule_fwd_sm70_vlk_varlen=fake_vlk),
+    )
+    builder = _create_gdn_builder(
+        local_gdn_model, num_speculative_tokens=4, speculative_method=method
+    )
+    builder.gdn_prefill_backend = "flashqla_sm70"
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[5], query_lens=[5]), BLOCK_SIZE, DEVICE
+    )
+    common.block_table_tensor.fill_(1)
+    draft_counts = torch.tensor([-1], dtype=torch.int32)
+    metadata = builder.build(
+        common_prefix_len=0,
+        common_attn_metadata=common,
+        num_decode_draft_tokens_cpu=draft_counts,
+        num_accepted_tokens=torch.ones(1, dtype=torch.int32),
+        common_gdn_metadata=compute_common_gdn_attn_metadata(
+            num_decode_draft_tokens_cpu=draft_counts,
+            query_start_loc=common.query_start_loc,
+            query_start_loc_cpu=common.query_start_loc_cpu,
+            num_spec_state_tokens=builder.num_spec_state_tokens,
+            legacy_mixed_decode_routing=False,
+        ),
+    )
+
+    layer = qwen_gdn.QwenGatedDeltaNetAttention.__new__(
+        qwen_gdn.QwenGatedDeltaNetAttention
+    )
+    torch.nn.Module.__init__(layer)
+    layer._prefill_kernels_warmed_up = False
+    layer.prefix = "linear_attn"
+    layer.gdn_prefill_backend = "flashqla_sm70"
+    layer.num_k_heads = layer.num_v_heads = layer.tp_size = 1
+    layer.head_k_dim = layer.head_v_dim = 128
+    layer.A_log = layer.dt_bias = torch.zeros(1)
+    layer.activation = "silu"
+    layer.conv1d = torch.nn.Conv1d(384, 384, 2, groups=384, bias=False)
+    layer.get_state_dtype = lambda: (torch.float16, torch.float32)
+    layer._can_use_flashqla_decode = lambda *_a, **_kw: False
+    layer._can_use_dflash2_packed_gdn_verify = lambda **_kw: False
+    layer._replay_reads_strided_qkv = lambda _qkv: False
+    layer.spec_state_replay = False
+    layer.enable_sm70_fused_sigmoid_mixed_qkv = True
+    layer.enable_packed_recurrent_decode = True
+    layer.enable_sm70_legacy_prefill_prep = False
+    chunk_op = qwen_gdn.ChunkGatedDeltaRule.__new__(qwen_gdn.ChunkGatedDeltaRule)
+    torch.nn.Module.__init__(chunk_op)
+    chunk_op._forward_method = chunk_op.forward_flashqla_sm70
+    layer.chunk_gated_delta_rule = chunk_op
+
+    context = SimpleNamespace(attn_metadata=None)
+    monkeypatch.setattr(qwen_gdn, "get_forward_context", lambda: context)
+    mixed_qkv = torch.zeros((5, 384), dtype=torch.float16)
+    gate = torch.zeros((5, 1), dtype=torch.float16)
+    out = torch.zeros((5, 1, 128), dtype=torch.float16)
+    kv_cache = (torch.zeros(2, 1, 384), torch.zeros(2, 1, 128, 128))
+    layer._forward_core(mixed_qkv, gate, gate, out, kv_cache)
+    context.attn_metadata = {layer.prefix: metadata}
+    layer._forward_core(mixed_qkv, gate, gate, out, kv_cache)
+
+    if original:
+        assert calls == [("tilelang", False, False), ("tilelang", False, True)]
+    else:
+        assert calls == [("vlk", False, False), ("vlk", True, False)]
+    assert (metadata.chunk_offsets is not None) is original
+    assert torch.all(out == 1)
+    assert torch.all(kv_cache[1][metadata.non_spec_state_indices_tensor] == 1)
 
 
 def _assert_gdn_metadata_equal(

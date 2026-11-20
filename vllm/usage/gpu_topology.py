@@ -70,7 +70,7 @@ def collect_gpu_topology(count: int) -> str | None:
             pynvml.NVML_TOPOLOGY_SYSTEM: "SYS",
         }
         # Count direct links only when all queried slots and active remotes are
-        # accounted for. An unsupported query is not evidence of zero links.
+        # accounted for.
         for pair in pairs:
             i, j = pair["gpus"]
             left, right = handles[i], handles[j]
@@ -106,6 +106,10 @@ def collect_gpu_topology(count: int) -> str | None:
                     try:
                         active = pynvml.nvmlDeviceGetNvLinkState(left, link)
                     except pynvml.NVMLError_InvalidArgument:
+                        break
+                    except pynvml.NVMLError_NotSupported:
+                        # Only slot zero indicates device-wide lack of NVLink.
+                        complete = link == 0
                         break
                     except Exception:  # noqa: BLE001
                         complete = False

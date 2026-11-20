@@ -15,6 +15,10 @@ class InvalidLink(Exception):
     pass
 
 
+class UnsupportedLink(Exception):
+    pass
+
+
 class FakeNvml:
     NVML_TOPOLOGY_SINGLE = 10
     NVML_TOPOLOGY_MULTIPLE = 20
@@ -25,6 +29,7 @@ class FakeNvml:
     NVML_P2P_STATUS_OK = 0
     NVML_NVLINK_MAX_LINKS = 4
     NVMLError_InvalidArgument = InvalidLink
+    NVMLError_NotSupported = UnsupportedLink
 
     def __init__(self, links, levels=None):
         self.links = links
@@ -119,10 +124,22 @@ def test_partial_nvlink_and_pcie(fake_probe):
     ]
 
 
-def test_pcie_only(fake_probe):
-    fake_probe({})
-    pairs = json.loads(gpu_topology.collect_gpu_topology(3))
-    assert all(p == {"gpus": p["gpus"], "type": "PCIe", "path": "PIX"} for p in pairs)
+@pytest.mark.parametrize("error", [InvalidLink, UnsupportedLink])
+def test_pcie_only(fake_probe, monkeypatch, error):
+    nvml, _ = fake_probe({}, levels={(0, 1): 20})
+
+    def link_state(handle, link):
+        raise error()
+
+    monkeypatch.setattr(nvml, "nvmlDeviceGetNvLinkState", link_state)
+    raw = gpu_topology.collect_gpu_topology(3)
+    assert raw is not None
+    assert json.loads(raw) == [
+        {"gpus": [0, 1], "type": "PCIe", "path": "PIX"},
+        {"gpus": [0, 2], "type": "PCIe", "path": "PIX"},
+        {"gpus": [1, 2], "type": "PCIe", "path": "PXB"},
+    ]
+    assert "physical-bus" not in raw
 
 
 def test_probe_failure_and_single_gpu(fake_probe, monkeypatch):
@@ -134,9 +151,21 @@ def test_probe_failure_and_single_gpu(fake_probe, monkeypatch):
     ]
 
 
-def test_incomplete_link_query_does_not_claim_pcie(fake_probe, monkeypatch):
+@pytest.mark.parametrize(
+    ("failed_link", "error"),
+    [(0, RuntimeError), (1, RuntimeError), (1, UnsupportedLink)],
+)
+def test_incomplete_link_query_does_not_claim_pcie(
+    fake_probe, monkeypatch, failed_link, error
+):
     nvml, _ = fake_probe({})
-    monkeypatch.setattr(nvml, "nvmlDeviceGetNvLinkState", lambda *args: 1 / 0)
+
+    def link_state(handle, link):
+        if link == failed_link:
+            raise error()
+        return False
+
+    monkeypatch.setattr(nvml, "nvmlDeviceGetNvLinkState", link_state)
     pair = json.loads(gpu_topology.collect_gpu_topology(2))[0]
     assert pair == {"gpus": [0, 1], "type": "unknown", "path": "PIX"}
 

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -8,6 +9,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from vllm.model_executor.kernels.ple.short_conv import dilated_prefill_short_conv
 from vllm.models.qwen4_exp.nvidia.ple_layer import Qwen4ExpPLELayer
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
@@ -355,3 +357,68 @@ def test_prefill_short_conv_channel_chunks_bound_memory(monkeypatch) -> None:
     # Output plus at most half a step per chunk buffer, plus index scratch.
     assert chunked <= 2.5 * batch_bytes, (chunked, batch_bytes)
     assert padded >= 4 * batch_bytes, (padded, batch_bytes)
+
+
+# The empty and NULL rows exercise the kernel contract, not active V2 prefills.
+PACKED_STEPS = {
+    2: (([19, 4], [4, 2], [True, False]), ([7, 22], [2, 4], [True, True])),
+    8: (
+        ([64, 3, 0, 5, 9, 2, 13, 4], [8, 2, 7, 3, 5, 1, 6, 0], [True, False] * 4),
+        ([6, 2, 11, 4, 3, 0, 8, 17], [2, 0, 6, 1, 8, 7, 3, 5], [True] * 8),
+    ),
+}
+
+
+def _packed_case(device, hidden, lengths, slots, initial, seed):
+    layer, x, (meta, state, weight, indices, n, decodes, tokens) = _case(
+        device,
+        torch.float16,
+        lengths=lengths,
+        decode_tokens=2,
+        state_indices=slots,
+        has_initial=initial,
+        hidden_size=hidden,
+        state_slots=9,
+        seed=seed,
+    )
+    # Model the align-cache block-table column, with unrelated speculative slots
+    # to its right. Do not clone the column into a contiguous fixture.
+    table = torch.full((n, 5), 1, device=device, dtype=indices.dtype)
+    table[:, 0] = indices
+    return layer, x, (meta, state, weight, table[:, 0], n, decodes, tokens)
+
+
+@pytest.mark.skipif(
+    os.getenv("TRITON_INTERPRET") != "1", reason="CPU Triton interpreter"
+)
+@pytest.mark.parametrize("transpose_state", [False, True])
+@pytest.mark.parametrize("concurrency", [2, 8])
+def test_packed_prefill_matches_cpu_reference_bitwise(concurrency, transpose_state):
+    for step, (lengths, slots, initial) in enumerate(PACKED_STEPS[concurrency]):
+        layer, x, (meta, state, weight, indices, n, decodes, tokens) = _packed_case(
+            "cpu", 129, lengths, slots, initial, step
+        )
+        if step == 0:
+            if transpose_state:
+                state = state.transpose(1, 2).contiguous().transpose(1, 2)
+            actual_state = state.clone()
+            expected_state = state.clone()
+            seed_weight = weight
+        expected = _reference_prefill_batched(
+            layer, x, meta, expected_state, seed_weight, indices, n, decodes, tokens
+        )
+        actual = dilated_prefill_short_conv(
+            x,
+            actual_state,
+            seed_weight,
+            meta.non_spec_query_start_loc[-n - 1 :].long() - decodes,
+            indices,
+            meta.has_initial_states_p,
+            meta.max_prefill_query_len,
+            layer.short_conv_dilation,
+            NULL_BLOCK_ID,
+        )
+        assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+        assert torch.equal(
+            actual_state.view(torch.int16), expected_state.view(torch.int16)
+        )

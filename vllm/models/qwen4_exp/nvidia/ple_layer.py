@@ -2419,7 +2419,6 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             )
         if num_prefills == 0 or x_p.numel() == 0:
             return torch.empty_like(x_p)
-        lengths = q_starts[1:] - q_starts[:-1]
         # Use the CPU-computed packing width from the metadata builder instead
         # of synchronizing on lengths.max().
         max_len = metadata.max_prefill_query_len
@@ -2428,6 +2427,46 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
 
         hidden_size = x_p.shape[1]
         state_len = self.conv_state_len
+        if (
+            envs.VLLM_SM70_PLE_PREFILL_CONV_CHUNK
+            and x_p.is_cuda
+            and x_p.dtype == torch.float16
+            and x_p.stride(1) == 1
+            and hidden_size == 10240
+            and state_len == 9
+            and self.short_conv_dilation == 3
+            and conv_weights.shape == (hidden_size, 4)
+            and conv_state.ndim == 3
+            and conv_state.shape[0] > 0
+            and conv_state.shape[1] == hidden_size
+            and conv_state.shape[2] >= state_len
+            and all(
+                t.device == x_p.device and t.dtype == x_p.dtype
+                for t in (conv_state, conv_weights)
+            )
+            and all(
+                t.device == x_p.device
+                for t in (q_starts, state_indices_tensor_p, has_initial_states_p)
+            )
+            and current_platform.is_device_capability((7, 0))
+        ):
+            from vllm.model_executor.kernels.ple.short_conv import (
+                dilated_prefill_short_conv,
+            )
+
+            return dilated_prefill_short_conv(
+                x_p,
+                conv_state,
+                conv_weights,
+                q_starts,
+                state_indices_tensor_p[:num_prefills],
+                has_initial_states_p[:num_prefills],
+                max_len,
+                self.short_conv_dilation,
+                NULL_BLOCK_ID,
+            )
+
+        lengths = q_starts[1:] - q_starts[:-1]
         positions = torch.arange(
             num_prefill_tokens, device=x_p.device, dtype=torch.int64
         )

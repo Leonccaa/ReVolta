@@ -749,6 +749,21 @@ DINLINE P sm70_push_reduce(P (&values)[ngpus]) {
   return downcast<P>(accumulator);
 }
 
+// Match the per-partition accumulation order of the TP4 two-stage reduction.
+template <typename P, typename A>
+DINLINE P sm70_push_reduce_partition(P (&values)[4], int owner) {
+  switch (owner) {
+    case 1:
+      return sm70_push_reduce<P, 4, A, 1>(values);
+    case 2:
+      return sm70_push_reduce<P, 4, A, 2>(values);
+    case 3:
+      return sm70_push_reduce<P, 4, A, 3>(values);
+    default:
+      return sm70_push_reduce<P, 4, A>(values);
+  }
+}
+
 template <typename P, int ngpus, typename A>
 DINLINE P packed_reduce_sum2(const P* ptrs_a[], const P* ptrs_b[], int idx) {
   P local = ptrs_a[0][idx];

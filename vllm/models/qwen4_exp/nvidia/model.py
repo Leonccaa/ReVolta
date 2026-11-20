@@ -547,6 +547,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 input_ids,
                 query_start_loc,
                 ngram_context,
+                **hc_kwargs,
             )
 
         # Fuse a pending combine with this HC module's mix when possible.

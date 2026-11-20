@@ -68,6 +68,7 @@ from vllm.model_executor.parameter import (
     ModelWeightParameter,
     PerTensorScaleParameter,
 )
+from vllm.models.common.ops.sequence_parallel import sp_all_gather, sp_shard
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
@@ -3021,9 +3022,11 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
+        *,
+        hc_sp: bool = False,
     ) -> torch.Tensor:
         input_ids = input_ids.reshape(-1)
-        if input_ids.shape[0] != hidden_states.shape[0]:
+        if not hc_sp and input_ids.shape[0] != hidden_states.shape[0]:
             raise ValueError(
                 "PLE expects input_ids and hidden_states to have the same "
                 f"token length, got {input_ids.shape[0]} and "
@@ -3036,6 +3039,10 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             ngram_context,
         )
         embeddings = self._dequantize_embeddings(embeddings, hidden_states.dtype)
+        if hc_sp:
+            # The embedding boundary returns complete rows in every placement.
+            # Resident and cascade lookups retain their existing TP reduction.
+            embeddings = sp_shard(embeddings, dynamic_pad=True)
         key, _ = self.key_proj(embeddings)
         value, _ = self.value_proj(embeddings)
         if (
@@ -3048,12 +3055,16 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             )
         else:
             gated_value, normalized = self._gate_norm(hidden_states, key, value)
+        if hc_sp:
+            normalized = sp_all_gather(normalized)[: input_ids.shape[0]]
         conv_output = torch.zeros_like(normalized)
         torch.ops.vllm.qwen4_exp_ple_short_conv(
             normalized,
             conv_output,
             self.prefix,
         )
+        if hc_sp:
+            conv_output = sp_shard(conv_output, dynamic_pad=True)
         if gated_value.ndim == 3:
             gated_value = gated_value.flatten(-2)
         return gated_value + conv_output

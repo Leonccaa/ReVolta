@@ -928,3 +928,64 @@ void gguf_lattice_blas_sm70_out(torch::Tensor out, torch::Tensor input,
                                 torch::Tensor weight, torch::Tensor stats,
                                 int64_t source_type, torch::Tensor scratch,
                                 int64_t group_size);
+
+void sm70_dflash2_fp16_m8_out(torch::Tensor output, torch::Tensor input,
+                              torch::Tensor packed, int64_t tile,
+                              int64_t warps);
+void sm70_dflash2_fp16_dispatch_out(torch::Tensor output, torch::Tensor input,
+                                    torch::Tensor packed, torch::Tensor weight,
+                                    int64_t tile, int64_t warps);
+void sm70_fp16_candidate_scores_out(torch::Tensor scores, torch::Tensor input,
+                                    torch::Tensor weight, torch::Tensor ids,
+                                    bool tiled_multirow = false);
+void sm70_fp16_masked_head_out(torch::Tensor scores, torch::Tensor input,
+                               torch::Tensor weight, torch::Tensor certified,
+                               bool tiled_multirow = false);
+
+void sm70_top1x_out(torch::Tensor out, torch::Tensor pairs,
+                    std::vector<int64_t> buffers, torch::Tensor seq,
+                    int64_t rank);
+
+void sm70_gdn_verify_out(torch::Tensor qkv, torch::Tensor a, torch::Tensor b,
+                         torch::Tensor A_log, torch::Tensor dt_bias,
+                         torch::Tensor state, torch::Tensor o, torch::Tensor cu,
+                         torch::Tensor idx, std::optional<torch::Tensor> nacc,
+                         int64_t H, int64_t HV, double scale, int64_t cfg,
+                         std::optional<torch::Tensor> rbuf,
+                         std::optional<torch::Tensor> rn,
+                         std::optional<torch::Tensor> ctr, int64_t tmax,
+                         std::optional<torch::Tensor> rmap,
+                         std::optional<torch::Tensor> ckt,
+                         std::optional<torch::Tensor> cks);
+
+void sm70_hcx_out(torch::Tensor p0, std::optional<torch::Tensor> p1,
+                  torch::Tensor res, torch::Tensor inj, torch::Tensor nw,
+                  double eps, torch::Tensor wd, torch::Tensor wu,
+                  torch::Tensor res_out, torch::Tensor blk_out,
+                  torch::Tensor inj_out, torch::Tensor xn, torch::Tensor sq,
+                  torch::Tensor dpart, torch::Tensor bar, torch::Tensor seq,
+                  std::vector<int64_t> ar, std::vector<int64_t> lora,
+                  std::vector<int64_t> hb, int64_t rank,
+                  std::optional<torch::Tensor> dbg, int64_t full,
+                  bool local_schedule);
+
+int64_t sm70_tp4_push_m64_buffer_size();
+void sm70_tp4_push_m64_out(torch::Tensor out, torch::Tensor input,
+                           const std::vector<int64_t>& ipc_ptrs, int64_t rank);
+
+void sm70_qwen38_hc_batch_cta8(fptr_t _fa, torch::Tensor input,
+                               torch::Tensor packed_down,
+                               torch::Tensor packed_up, torch::Tensor partials,
+                               torch::Tensor lora, torch::Tensor local_output,
+                               torch::Tensor output, torch::Tensor injection);
+
+void sm70_hc_ll_down_out(torch::Tensor x, torch::Tensor wd, torch::Tensor part,
+                         torch::Tensor cnt, std::vector<int64_t> ll,
+                         torch::Tensor seq, int64_t rank, int64_t variant,
+                         bool optimized_loads);
+void sm70_hc_ll_up_out(int64_t ll_lora, torch::Tensor wu, torch::Tensor x,
+                       torch::Tensor cnt, std::vector<int64_t> ll,
+                       torch::Tensor seq, torch::Tensor down_seq, int64_t rank,
+                       torch::Tensor out, torch::Tensor lora_out,
+                       torch::Tensor inj_out, int64_t warps,
+                       bool optimized_loads);

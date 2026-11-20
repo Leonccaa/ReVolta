@@ -167,6 +167,74 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
   #ifdef ENABLE_SM70_TURBOMIND
   ops.def(
+      "sm70_hc_ll_down_out(Tensor x, Tensor wd, Tensor(a!) part, Tensor(b!) "
+      "cnt, "
+      "int[] ll, Tensor(c!) seq, int rank, int variant, bool "
+      "optimized_loads=True) -> ()");
+  ops.impl("sm70_hc_ll_down_out", torch::kCUDA, &sm70_hc_ll_down_out);
+  ops.def(
+      "sm70_hc_ll_up_out(int ll_lora, Tensor wu, Tensor x, Tensor(a!) cnt, "
+      "int[] ll, Tensor(b!) seq, Tensor down_seq, int rank, Tensor(c!) out, "
+      "Tensor(d!) lora_out, Tensor(e!) inj_out, int warps, bool "
+      "optimized_loads=True) -> ()");
+  ops.impl("sm70_hc_ll_up_out", torch::kCUDA, &sm70_hc_ll_up_out);
+
+  ops.def(
+      "sm70_qwen38_hc_batch_cta8(int fa, Tensor input, Tensor packed_down, "
+      "Tensor packed_up, Tensor(a!) partials, Tensor(b!) lora, "
+      "Tensor(c!) local_output, Tensor(d!) output, Tensor(e!) injection) -> "
+      "()");
+  ops.impl("sm70_qwen38_hc_batch_cta8", torch::kCUDA,
+           &sm70_qwen38_hc_batch_cta8);
+  ops.def("sm70_tp4_push_m64_buffer_size() -> int",
+          &sm70_tp4_push_m64_buffer_size);
+  ops.def(
+      "sm70_tp4_push_m64_out(Tensor(a!) out, Tensor input, int[] ipc_ptrs, "
+      "int rank) -> ()");
+  ops.impl("sm70_tp4_push_m64_out", torch::kCUDA, &sm70_tp4_push_m64_out);
+
+  ops.def(
+      "sm70_top1x_out(Tensor(a!) out, Tensor pairs, int[] buffers, "
+      "Tensor(b!) seq, int rank) -> ()");
+  ops.impl("sm70_top1x_out", torch::kCUDA, &sm70_top1x_out);
+  ops.def(
+      "sm70_gdn_verify_out(Tensor qkv, Tensor a, Tensor b, Tensor A_log, "
+      "Tensor dt_bias, Tensor(a!) state, Tensor(b!) o, Tensor cu, Tensor idx, "
+      "Tensor? nacc, int H, int HV, float scale, int cfg, Tensor? rbuf, "
+      "Tensor? rn, Tensor? ctr, int tmax, Tensor? rmap=None, "
+      "Tensor? ckt=None, Tensor? cks=None) -> ()");
+  ops.impl("sm70_gdn_verify_out", torch::kCUDA, &sm70_gdn_verify_out);
+  ops.def(
+      "sm70_dflash2_fp16_m8_out(Tensor(a!) output, Tensor input, Tensor "
+      "packed, int tile, int warps) -> ()");
+  ops.impl("sm70_dflash2_fp16_m8_out", torch::kCUDA, &sm70_dflash2_fp16_m8_out);
+  ops.def(
+      "sm70_dflash2_fp16_dispatch_out(Tensor(a!) output, Tensor input, Tensor "
+      "packed, Tensor weight, int tile, int warps) -> ()");
+  ops.impl("sm70_dflash2_fp16_dispatch_out", torch::kCUDA,
+           &sm70_dflash2_fp16_dispatch_out);
+  ops.def(
+      "sm70_fp16_candidate_scores_out(Tensor(a!) scores, Tensor input, "
+      "Tensor weight, Tensor ids, bool tiled_multirow=False) -> ()");
+  ops.impl("sm70_fp16_candidate_scores_out", torch::kCUDA,
+           &sm70_fp16_candidate_scores_out);
+  ops.def(
+      "sm70_fp16_masked_head_out(Tensor(a!) scores, Tensor input, "
+      "Tensor weight, Tensor certified, bool tiled_multirow=False) -> ()");
+  ops.impl("sm70_fp16_masked_head_out", torch::kCUDA,
+           &sm70_fp16_masked_head_out);
+  ops.def("sm70_fp16_head_vocab_revision() -> int",
+          []() -> int64_t { return 2; });
+  ops.def(
+      "sm70_hcx_out(Tensor p0, Tensor? p1, Tensor res, Tensor inj, Tensor nw, "
+      "float eps, Tensor wd, Tensor wu, Tensor(a!) res_out, Tensor(b!) "
+      "blk_out, "
+      "Tensor(c!) inj_out, Tensor(d!) xn, Tensor(e!) sq, Tensor(f!) dpart, "
+      "Tensor(g!) bar, Tensor(h!) seq, int[] ar, int[] lora, int[] hb, int "
+      "rank, Tensor? dbg, int full, bool local_schedule=False) -> ()");
+  ops.impl("sm70_hcx_out", torch::kCUDA, &sm70_hcx_out);
+
+  ops.def(
       "gguf_affine_sm70_prepare(Tensor codes, Tensor scales, Tensor mins, "
       "int bits, int group_size=32) -> Tensor[]");
   ops.impl("gguf_affine_sm70_prepare", torch::kCUDA, &gguf_affine_sm70_prepare);

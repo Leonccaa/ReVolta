@@ -43,6 +43,28 @@ void top10(torch::Tensor weights, torch::Tensor ids, torch::Tensor source,
       logits.size(0));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
+void top10_batch(torch::Tensor weights, torch::Tensor ids, torch::Tensor source,
+                 torch::Tensor logits) {
+  TORCH_CHECK(logits.is_cuda() && logits.scalar_type() == at::kHalf &&
+                  logits.is_contiguous() && logits.dim() == 2 &&
+                  logits.size(0) >= 1 && logits.size(0) <= 64 &&
+                  logits.size(1) == 512,
+              "Expected contiguous CUDA FP16 router logits [M1..64,512]");
+  const c10::cuda::CUDAGuard guard(logits.device());
+  check_sm70();
+  check_output(weights, logits, at::kFloat);
+  check_output(ids, logits, at::kInt);
+  check_output(source, logits, at::kInt);
+  const int m = logits.size(0);
+  const int warps = m >= 4 ? 4 : 1;
+  vllm::sm70_router::
+      select_batch_kernel<<<(m + warps - 1) / warps, warps * 32, 0,
+                            at::cuda::getCurrentCUDAStream()>>>(
+          reinterpret_cast<const half*>(logits.data_ptr()),
+          weights.data_ptr<float>(), ids.data_ptr<int>(),
+          source.data_ptr<int>(), m);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
 void select_quantize(torch::Tensor weights, torch::Tensor ids,
                      torch::Tensor source, torch::Tensor q8,
                      torch::Tensor logits, torch::Tensor x) {
@@ -74,9 +96,13 @@ TORCH_LIBRARY(vllm_sm70_router, m) {
       "top10(Tensor(a!) weights, Tensor(b!) ids, Tensor(c!) source, Tensor "
       "logits) -> ()");
   m.def(
+      "top10_batch(Tensor(a!) weights, Tensor(b!) ids, Tensor(c!) source, "
+      "Tensor logits) -> ()");
+  m.def(
       "select_quantize(Tensor(a!) weights, Tensor(b!) ids, Tensor(c!) source, "
       "Tensor(d!) q8, Tensor logits, Tensor x) -> ()");
   m.impl("top10", torch::kCUDA, &top10);
+  m.impl("top10_batch", torch::kCUDA, &top10_batch);
   m.impl("select_quantize", torch::kCUDA, &select_quantize);
 }
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {}

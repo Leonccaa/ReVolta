@@ -943,13 +943,13 @@ void sm70_qwen38_hc_replicated(torch::Tensor input, torch::Tensor packed_down,
 #endif
 }
 
-void sm70_qwen38_hc_batch(fptr_t _fa, torch::Tensor input,
-                          torch::Tensor packed_down, torch::Tensor packed_up,
-                          torch::Tensor partials, torch::Tensor lora,
-                          torch::Tensor local_output, torch::Tensor output,
-                          torch::Tensor injection, bool round_down_partials,
-                          bool cooperative, bool full_unroll,
-                          bool fused_chain) {
+template <bool Split8>
+static void sm70_qwen38_hc_batch_impl(
+    fptr_t _fa, torch::Tensor input, torch::Tensor packed_down,
+    torch::Tensor packed_up, torch::Tensor partials, torch::Tensor lora,
+    torch::Tensor local_output, torch::Tensor output, torch::Tensor injection,
+    bool round_down_partials, bool cooperative, bool full_unroll,
+    bool fused_chain) {
 #if defined(USE_ROCM)
   TORCH_CHECK(false, "SM70 Qwen3.8 batch HC is unavailable on ROCm");
 #else
@@ -986,19 +986,64 @@ void sm70_qwen38_hc_batch(fptr_t _fa, torch::Tensor input,
                   output.sizes() == at::IntArrayRef({m, 2560}) &&
                   injection.sizes() == at::IntArrayRef({m, 4}),
               "Invalid batch HC output geometry");
-  vllm::qwen38_hc_batch::launch(
-      fa->sm70_tp4_push_buffers_, fa->rank_,
-      reinterpret_cast<const half*>(input.data_ptr()),
-      reinterpret_cast<const half*>(packed_down.data_ptr()),
-      reinterpret_cast<const half*>(packed_up.data_ptr()),
-      partials.data_ptr<float>(), reinterpret_cast<half*>(lora.data_ptr()),
-      reinterpret_cast<half*>(local_output.data_ptr()),
-      reinterpret_cast<half*>(output.data_ptr()),
-      reinterpret_cast<half*>(injection.data_ptr()), m, round_down_partials,
-      cooperative, full_unroll, c10::cuda::getCurrentCUDAStream().stream(),
-      fused_chain);
+  if constexpr (Split8) {
+    const auto stream = c10::cuda::getCurrentCUDAStream();
+    const auto buffers = fa->sm70_tp4_push_buffers_;
+    const int rank = fa->rank_;
+    const int groups = (m + 7) / 8;
+    const auto* x = reinterpret_cast<const half*>(input.data_ptr());
+    const auto* down = reinterpret_cast<const half*>(packed_down.data_ptr());
+    const auto* up = reinterpret_cast<const half*>(packed_up.data_ptr());
+    auto* a = reinterpret_cast<half*>(lora.data_ptr());
+    auto* inj = reinterpret_cast<half*>(injection.data_ptr());
+    auto* local = reinterpret_cast<half*>(local_output.data_ptr());
+    auto* full = reinterpret_cast<half*>(output.data_ptr());
+    auto* scratch = partials.data_ptr<float>();
+    vllm::qwen38_hc_batch::hc_down_cta_split<8>
+        <<<dim3(3, groups, 20), 256, 0, stream>>>(x, down, scratch, m);
+    vllm::qwen38_hc_batch::
+        down_gather_coalesced<<<(m * 88 + 127) / 128, 128, 0, stream>>>(
+            buffers, scratch, a, inj, rank, m);
+    vllm::qwen38_hc_batch::hc_up_cta_split_gather<8>
+        <<<dim3(80, groups), 256, 0, stream>>>(a, up, x, local, m, buffers,
+                                               rank, full);
+  } else {
+    vllm::qwen38_hc_batch::launch(
+        fa->sm70_tp4_push_buffers_, fa->rank_,
+        reinterpret_cast<const half*>(input.data_ptr()),
+        reinterpret_cast<const half*>(packed_down.data_ptr()),
+        reinterpret_cast<const half*>(packed_up.data_ptr()),
+        partials.data_ptr<float>(), reinterpret_cast<half*>(lora.data_ptr()),
+        reinterpret_cast<half*>(local_output.data_ptr()),
+        reinterpret_cast<half*>(output.data_ptr()),
+        reinterpret_cast<half*>(injection.data_ptr()), m, round_down_partials,
+        cooperative, full_unroll, c10::cuda::getCurrentCUDAStream().stream(),
+        fused_chain);
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 #endif
+}
+
+void sm70_qwen38_hc_batch(fptr_t _fa, torch::Tensor input,
+                          torch::Tensor packed_down, torch::Tensor packed_up,
+                          torch::Tensor partials, torch::Tensor lora,
+                          torch::Tensor local_output, torch::Tensor output,
+                          torch::Tensor injection, bool round_down_partials,
+                          bool cooperative, bool full_unroll,
+                          bool fused_chain) {
+  sm70_qwen38_hc_batch_impl<false>(
+      _fa, input, packed_down, packed_up, partials, lora, local_output, output,
+      injection, round_down_partials, cooperative, full_unroll, fused_chain);
+}
+
+void sm70_qwen38_hc_batch_cta8(fptr_t _fa, torch::Tensor input,
+                               torch::Tensor packed_down,
+                               torch::Tensor packed_up, torch::Tensor partials,
+                               torch::Tensor lora, torch::Tensor local_output,
+                               torch::Tensor output, torch::Tensor injection) {
+  sm70_qwen38_hc_batch_impl<true>(_fa, input, packed_down, packed_up, partials,
+                                  lora, local_output, output, injection, false,
+                                  false, false, true);
 }
 
 void sm70_qwen38_hc_down_allgather(fptr_t _fa, torch::Tensor& input,
@@ -1440,3 +1485,55 @@ fptr_t open_mem_handle(torch::Tensor& mem_handle) {
 void free_shared_buffer(fptr_t buffer) {
   AT_CUDA_CHECK(cudaFree(reinterpret_cast<void*>(buffer)));
 }
+
+#if defined(ENABLE_SM70_TURBOMIND)
+int64_t sm70_tp4_push_m64_buffer_size() {
+  return vllm::kSm70Tp4PushAllreduceSignalBytes +
+         vllm::kSm70Tp4PushAllreduceEpochs *
+             vllm::kSm70Tp4PushAllreduceWorldSize *
+             vllm::kSm70Tp4PushAllreduceM64Bytes;
+}
+
+void sm70_tp4_push_m64_out(torch::Tensor out, torch::Tensor input,
+                           const std::vector<int64_t>& ipc_ptrs, int64_t rank) {
+  using namespace vllm;
+  TORCH_CHECK(input.is_cuda() && out.device() == input.device() &&
+                  input.scalar_type() == at::kHalf &&
+                  out.scalar_type() == at::kHalf && input.is_contiguous() &&
+                  out.is_contiguous() && out.sizes() == input.sizes(),
+              "Expected same-device contiguous CUDA FP16 input and output");
+  const auto bytes = input.nbytes();
+  TORCH_CHECK(bytes > kSm70Tp4PushAllreduceM32Bytes &&
+                  bytes <= kSm70Tp4PushAllreduceM64Bytes &&
+                  bytes % (kSm70GemmaRmsNormHiddenSize * sizeof(half)) == 0,
+              "Expected a payload of 33..64 rows of 5120 FP16 elements");
+  TORCH_CHECK(ipc_ptrs.size() == kSm70Tp4PushAllreduceWorldSize && rank >= 0 &&
+                  rank < kSm70Tp4PushAllreduceWorldSize,
+              "Expected four peer buffers and a valid rank");
+  const c10::cuda::CUDAGuard guard(input.device());
+  TORCH_CHECK(custom_allreduce_current_device_is_sm70(),
+              "Expected an SM70 device");
+
+  RankData buffers{};
+  for (int peer = 0; peer < kSm70Tp4PushAllreduceWorldSize; ++peer) {
+    buffers.ptrs[peer] = reinterpret_cast<const void*>(ipc_ptrs[peer]);
+  }
+  const auto* x = reinterpret_cast<const half*>(input.data_ptr<at::Half>());
+  auto* y = reinterpret_cast<half*>(out.data_ptr<at::Half>());
+  const int packs = bytes / sizeof(packed_t<half>::P);
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  constexpr int threads = 2 * kSm70Tp4PushAllreduceThreads;
+  if (bytes >= 512 * 1024) {
+    sm70_cross_device_reduce_1stage_push<kSm70Tp4PushAllreduceWorldSize,
+                                         kSm70Tp4PushAllreduceM64Bytes, true>
+        <<<kSm70Tp4PushAllreduceBlocks, threads, 0, stream>>>(buffers, x, y,
+                                                              rank, packs);
+  } else {
+    sm70_cross_device_reduce_1stage_push<kSm70Tp4PushAllreduceWorldSize,
+                                         kSm70Tp4PushAllreduceM64Bytes>
+        <<<kSm70Tp4PushAllreduceBlocks, threads, 0, stream>>>(buffers, x, y,
+                                                              rank, packs);
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+#endif

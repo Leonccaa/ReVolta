@@ -729,6 +729,29 @@ class EngineCore:
                     # We aren't waiting for any tokens, get any grammar output
                     # and sample immediately.
                     trace_sample_t0 = time.perf_counter() if trace_log else 0.0
+                    # The async scheduler has no earlier structured step to
+                    # consume here, but this step can still have draft placeholders.
+                    requests = getattr(self.scheduler, "requests", None)
+                    if (
+                        requests is not None
+                        and self.async_scheduling
+                        and self.use_spec_decode
+                        and scheduler_output.has_structured_output_requests
+                        and any(
+                            -1 in tokens
+                            and (request := requests.get(req_id)) is not None
+                            and request.use_structured_output
+                            and not request.is_prefill_chunk
+                            for req_id, tokens in (
+                                scheduler_output.scheduled_spec_decode_tokens.items()
+                            )
+                        )
+                    ):
+                        draft_token_ids = self.model_executor.take_draft_token_ids()
+                        if draft_token_ids is not None:
+                            self.scheduler.update_draft_token_ids_in_output(
+                                draft_token_ids, scheduler_output
+                            )
                     grammar_output = self.scheduler.get_grammar_bitmask(
                         scheduler_output
                     )

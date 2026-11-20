@@ -337,14 +337,14 @@ void launch_fp8_qpn8_m32_twophase_sm70(const uint8_t* codes,
   }
   auto kernel =
       fp8_qpn8_m32_twophase_sm70_kernel<SplitK, PackedInput, Gated, FullRows,
-                                        false, BlockScaled, RowTiles, KUnroll>;
+                                        BlockScaled, RowTiles, KUnroll>;
   if constexpr (!FullRows) {
     // A full row-tile set drops the per-group row guard; the math per row is
     // identical, so this only fires when the batch fills the tile set.
     if (m == RowTiles * 8) {
-      kernel = fp8_qpn8_m32_twophase_sm70_kernel<SplitK, PackedInput, Gated,
-                                                 true, false, BlockScaled,
-                                                 RowTiles, KUnroll>;
+      kernel =
+          fp8_qpn8_m32_twophase_sm70_kernel<SplitK, PackedInput, Gated, true,
+                                            BlockScaled, RowTiles, KUnroll>;
     }
   }
   C10_CUDA_CHECK(cudaFuncSetAttribute(

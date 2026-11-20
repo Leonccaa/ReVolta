@@ -549,8 +549,9 @@ void run_batch(torch::Tensor out, torch::Tensor input, torch::Tensor codes,
   auto* y = reinterpret_cast<half*>(out.data_ptr<at::Half>());
   half* k16_out = gated ? vllm::sm70::k16_twin_for(out, twin) : nullptr;
   if (m <= 16) {
-    launch_batch<2, TurboMindLayout>(w, s, x, y, k16_out, n, k, m, global_scale,
-                                     gated, stream);
+    // Gated M9–16 already returned through the paired M16 kernel.
+    launch_qpn2_coop_batch<2, TurboMindLayout>(w, s, x, y, n, k, m,
+                                               global_scale, stream);
   } else if (m <= 24 || (m > 40 && m <= 48)) {
     launch_batch<3, TurboMindLayout>(w, s, x, y, k16_out, n, k, m, global_scale,
                                      gated, stream);

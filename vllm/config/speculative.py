@@ -1277,7 +1277,38 @@ class SpeculativeConfig:
                 self.prompt_lookup_min = 0
 
             if self.model is not None:
-                self.draft_model_config = ModelConfig(
+
+                def make_draft_config(**kwargs: Any) -> ModelConfig:
+                    try:
+                        return ModelConfig(**kwargs)
+                    except ValueError as error:
+                        if "User-specified max_model_len (" not in str(error):
+                            raise
+                        # Only defer length validation if the DFlash guard must
+                        # extend an unscaled draft. All other failures stay intact.
+                        kwargs["max_model_len"] = None
+                        draft = ModelConfig(**kwargs)
+                        text = get_hf_text_config(draft.hf_config)
+                        native = getattr(text, "max_position_embeddings", None)
+                        rope = getattr(text, "rope_parameters", None)
+                        if (
+                            native is None
+                            or self.target_model_config.max_model_len <= native
+                            or (
+                                isinstance(rope, dict)
+                                and rope.get("rope_type") == "yarn"
+                            )
+                        ):
+                            raise error
+                        return draft
+
+                draft_config_factory = (
+                    make_draft_config
+                    if self.use_dflash_family()
+                    or (self.method == "draft_model" and "dflash" in self.model.lower())
+                    else ModelConfig
+                )
+                self.draft_model_config = draft_config_factory(
                     model=self.model,
                     runner="draft",
                     tokenizer=self.target_model_config.tokenizer,
@@ -1290,16 +1321,7 @@ class SpeculativeConfig:
                     revision=self.revision,
                     code_revision=self.code_revision,
                     tokenizer_revision=self.target_model_config.tokenizer_revision,
-                    # Validate an explicit DFlash limit after inheriting YaRN.
-                    max_model_len=(
-                        None  # type: ignore[arg-type]
-                        if self.use_dflash_family()
-                        or (
-                            self.method == "draft_model"
-                            and "dflash" in self.model.lower()
-                        )
-                        else self.max_model_len
-                    ),
+                    max_model_len=self.max_model_len,  # type: ignore[arg-type]
                     spec_target_max_model_len=self.target_model_config.max_model_len,
                     quantization=self.quantization,
                     enforce_eager=self.target_model_config.enforce_eager,
@@ -1604,14 +1626,51 @@ class SpeculativeConfig:
                 f"{rope_parameters!r}."
             )
 
-        SpeculativeConfig._validate_target_yarn_extension(
-            rope_parameters,
-            draft_native_limit,
-            self.max_model_len,
-            self.target_model_config.max_model_len,
-            "Native MTP",
-        )
+        original_limit = rope_parameters.get("original_max_position_embeddings")
         factor = rope_parameters.get("factor")
+        try:
+            if original_limit is None or factor is None:
+                raise TypeError("YaRN original limit and factor must be present")
+            original_limit_value = float(original_limit)
+            factor_value = float(factor)
+            draft_native_limit_value = float(draft_native_limit)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(
+                "Native MTP YaRN extension requires numeric "
+                "original_max_position_embeddings and factor."
+            ) from error
+
+        if (
+            not math.isfinite(original_limit_value)
+            or not math.isfinite(factor_value)
+            or original_limit_value <= 0
+            or factor_value <= 1
+            or original_limit_value != draft_native_limit_value
+        ):
+            raise ValueError(
+                "Native MTP YaRN extension requires the target's positive "
+                "original_max_position_embeddings to match the drafter's "
+                "native max_position_embeddings and factor to be greater "
+                f"than one; got original={original_limit!r}, "
+                f"native={draft_native_limit!r}, factor={factor!r}."
+            )
+
+        scaled_limit = original_limit_value * factor_value
+        if not math.isfinite(scaled_limit):
+            raise ValueError(
+                "Native MTP YaRN extension requires a finite scaled limit."
+            )
+        validated_yarn_limit = int(scaled_limit)
+        validated_limit = min(
+            validated_yarn_limit,
+            self.target_model_config.max_model_len,
+        )
+        if self.max_model_len > validated_limit:
+            raise ValueError(
+                f"Native MTP max_model_len={self.max_model_len} exceeds the "
+                f"validated target YaRN limit={validated_limit}."
+            )
+
         draft_text_config.rope_parameters = copy.deepcopy(rope_parameters)
         logger.info(
             "Extended native MTP context from %s to %s with validated target "

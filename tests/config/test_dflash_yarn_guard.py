@@ -149,6 +149,29 @@ def test_detected_dflash_explicit_extension(tmp_path, monkeypatch):
     assert spec.draft_model_config.hf_text_config.rope_parameters["rope_type"] == "yarn"
 
 
+@pytest.mark.parametrize("draft_rope", [DEFAULT, YARN])
+def test_explicit_limit_validation_outside_guard(tmp_path, monkeypatch, draft_rope):
+    with pytest.raises(ValueError, match="User-specified max_model_len"):
+        build(
+            tmp_path,
+            monkeypatch,
+            YARN,
+            draft_rope,
+            NATIVE,
+            spec_len=1048576,
+        )
+
+
+def test_existing_yarn_explicit_limit_validation(tmp_path, monkeypatch):
+    with pytest.raises(ValueError, match="User-specified max_model_len"):
+        build(tmp_path, monkeypatch, YARN, YARN, 524288, spec_len=1048576)
+
+
+def test_explicit_extension_without_yarn_fails(tmp_path, monkeypatch):
+    with pytest.raises(ValueError, match="DFlash.*YaRN"):
+        build(tmp_path, monkeypatch, DEFAULT, DEFAULT, 524288, spec_len=524288)
+
+
 def test_explicit_draft_yarn_is_preserved(tmp_path, monkeypatch):
     draft_rope = dict(YARN, factor=3.0)
     before = copy.deepcopy(draft_rope)

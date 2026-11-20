@@ -34,14 +34,19 @@ def _sm70_gated_norm_device_supported(device_id: int | None) -> bool:
 
 
 # Rows admitted to the native exact gated RMSNorm: 16 tokens x 12 local value
-# heads by default; 48 x 12 with VLLM_SM70_QWEN38_WIDE_M_GATED_NORM (the
-# kernel is one warp per row and accepts up to 576 rows).
+# heads by default; 48 x 12 with VLLM_SM70_QWEN38_WIDE_M_GATED_NORM.
 _SM70_GATED_NORM_MAX_ROWS = 192
 _SM70_GATED_NORM_WIDE_MAX_ROWS = 576
+# Match the native kernel's signed int index for 128 contiguous columns.
+_SM70_GATED_NORM_INDEX_MAX_ROWS = (1 << 31) // 128
 
 
 def _sm70_gated_norm_shape_supported(
-    x: torch.Tensor, z: torch.Tensor | None, weight: torch.Tensor
+    x: torch.Tensor,
+    z: torch.Tensor | None,
+    weight: torch.Tensor,
+    *,
+    prefill: bool = False,
 ) -> bool:
     max_rows = (
         _SM70_GATED_NORM_WIDE_MAX_ROWS
@@ -51,7 +56,11 @@ def _sm70_gated_norm_shape_supported(
     return bool(
         z is not None
         and x.ndim == 2
-        and 1 <= x.shape[0] <= max_rows
+        and (
+            max_rows < x.shape[0] <= _SM70_GATED_NORM_INDEX_MAX_ROWS
+            if prefill
+            else 1 <= x.shape[0] <= max_rows
+        )
         and x.shape[1] == 128
         and z.shape == x.shape
         and weight.shape == (128,)
@@ -812,11 +821,10 @@ class RMSNormGated(CustomOp):
 
         return out.to(orig_dtype)
 
-    def forward_native(
-        self, x: torch.Tensor, z: torch.Tensor | None = None
-    ) -> torch.Tensor:
-        """PyTorch-native implementation equivalent to forward()."""
-        if (
+    def _can_use_sm70_exact(
+        self, x: torch.Tensor, z: torch.Tensor | None, *, prefill: bool = False
+    ) -> bool:
+        return bool(
             self._sm70_rmsnorm_gated_exact
             and not envs.VLLM_BATCH_INVARIANT
             and x.is_cuda
@@ -824,8 +832,14 @@ class RMSNormGated(CustomOp):
             and self.group_size is None
             and self.norm_before_gate
             and self.activation in ("sigmoid", "silu", "swish")
-            and _sm70_gated_norm_shape_supported(x, z, self.weight)
-        ):
+            and _sm70_gated_norm_shape_supported(x, z, self.weight, prefill=prefill)
+        )
+
+    def forward_native(
+        self, x: torch.Tensor, z: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """PyTorch-native implementation equivalent to forward()."""
+        if self._can_use_sm70_exact(x, z):
             return torch.ops.vllm.sm70_rmsnorm_gated_exact(
                 x, z, self.weight, self.eps, self.activation != "sigmoid"
             )

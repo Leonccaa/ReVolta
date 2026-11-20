@@ -45,6 +45,10 @@ struct Args {
   float* wout;
   float* wstate;
   int64_t qs0, qs1, is0, ts0, os0, os1, gs0, gs1, rs0, ls0;
+  // GPU DCP uses separate strided K/V planes and per-layer scales.
+  const unsigned char* paged_v;
+  int64_t kb, kt, vb, vt;
+  float k_scale, v_scale;
 };
 
 __device__ __forceinline__ float fast_exp2(float x) {
@@ -439,7 +443,7 @@ __global__ __launch_bounds__(256) void partial(Args a) {
 
 // One (row, head): combine the split states and partial outputs. Shared
 // scratch: weights/denom_parts[64], scalars[2].
-template <int NH = H>
+template <int NH = H, bool DEVICE_PAGED = false>
 __device__ __forceinline__ void merge_head(const Args& a, int row, int head,
                                            int t, float* weights,
                                            float* denom_parts, float* scalars) {
@@ -481,6 +485,7 @@ __device__ __forceinline__ void merge_head(const Args& a, int row, int head,
                           numerator);
   const float denominator = scalars[1];
   float result = denominator > 0 ? __fdiv_rn(numerator, denominator) : 0.f;
+  if constexpr (DEVICE_PAGED) result *= a.v_scale;
   if (a.wout) {
     a.wout[int64_t(row * NH + head) * D + t] = result;
     if (!t) {
@@ -510,6 +515,7 @@ __device__ __forceinline__ void merge_head(const Args& a, int row, int head,
 // used, with the same arithmetic as `partial` (half(e4m3 * scale), FP32
 // QK/PV). Half the tile footprint fits three CTAs per SM.
 constexpr int KP = 272;  // E4M3 tile row stride (bytes)
+template <bool DEVICE_PAGED = false>
 __global__ __launch_bounds__(256, 3) void partial_fp8_lite(Args a) {
   const int row = blockIdx.y, split = blockIdx.x;
   const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
@@ -521,22 +527,24 @@ __global__ __launch_bounds__(256, 3) void partial_fp8_lite(Args a) {
   __shared__ float lut[256];
   lut[t] = e4m3(t);
   const int req = a.requests[row];
-  const int64_t position = a.positions[row];
-  const int length = req >= 0 && req < a.num_requests ? a.lengths[req] : 0;
   if (t < C) {
     const int col = split * C + t;
     const int logical = col < a.width ? a.indices[row * a.is0 + col] : -1;
     int64_t slot = -1;
+    // DCP selection is already causal in global token space.
     if (req >= 0 && req < a.num_requests && logical >= 0 &&
-        logical <= position && logical < length &&
-        logical / a.page < a.table_width) {
+        logical / a.page < a.table_width &&
+        (DEVICE_PAGED ||
+         (logical <= a.positions[row] && logical < a.lengths[req]))) {
       const int physical = a.table[req * a.ts0 + logical / a.page];
       if (physical >= 0 && physical < a.blocks)
         slot = int64_t(physical) * a.page + logical % a.page;
     }
     slots[t] = slot;
-    kscale[t] = slot >= 0 ? __ldg(a.scales + slot * 2) : 0.f;
-    vscale[t] = slot >= 0 ? __ldg(a.scales + slot * 2 + 1) : 0.f;
+    if constexpr (!DEVICE_PAGED) {
+      kscale[t] = slot >= 0 ? __ldg(a.scales + slot * 2) : 0.f;
+      vscale[t] = slot >= 0 ? __ldg(a.scales + slot * 2 + 1) : 0.f;
+    }
   }
   const int head = t / 32, d8 = (t % 32) * 8;
   const uint4 qv = head < H ? __ldg(reinterpret_cast<const uint4*>(
@@ -554,10 +562,17 @@ __global__ __launch_bounds__(256, 3) void partial_fp8_lite(Args a) {
     vraw[i] = make_uint2(0, 0);
     if (slot >= 0) {
       const int block = slot / a.page, off = slot % a.page;
-      const int64_t base = (int64_t(block) * 2 * a.page + off) * D + dim;
-      kraw = __ldg(reinterpret_cast<const uint2*>(a.history + base));
-      vraw[i] = __ldg(reinterpret_cast<const uint2*>(a.history + base +
-                                                     int64_t(a.page) * D));
+      if constexpr (DEVICE_PAGED) {
+        kraw = __ldg(reinterpret_cast<const uint2*>(a.history + block * a.kb +
+                                                    off * a.kt + dim));
+        vraw[i] = __ldg(reinterpret_cast<const uint2*>(
+            a.paged_v + block * a.vb + off * a.vt + dim));
+      } else {
+        const int64_t base = (int64_t(block) * 2 * a.page + off) * D + dim;
+        kraw = __ldg(reinterpret_cast<const uint2*>(a.history + base));
+        vraw[i] = __ldg(reinterpret_cast<const uint2*>(a.history + base +
+                                                       int64_t(a.page) * D));
+      }
     }
     *reinterpret_cast<uint2*>(&tile[token][dim]) = kraw;
   }
@@ -566,7 +581,7 @@ __global__ __launch_bounds__(256, 3) void partial_fp8_lite(Args a) {
   const int r8 = (lane & 3) + ((lane & 16) ? 4 : 0);
   const int nr =
       nt * 32 + ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) ? 4 : 0);
-  const float ks = kscale[nr];
+  const float ks = DEVICE_PAGED ? 1.f : kscale[nr];
   float acc[8] = {};
 #pragma unroll
   for (int s = 0; s < 4; ++s) {
@@ -590,12 +605,13 @@ __global__ __launch_bounds__(256, 3) void partial_fp8_lite(Args a) {
     scores[kw][h][col] = acc[e];
   }
   __syncthreads();
+  float qk_scale = 0.0625f * 1.4426950408889634f;
+  if constexpr (DEVICE_PAGED) qk_scale *= a.k_scale;
   for (int v = t; v < 8 * C; v += 256) {
     const int h = v / C, k = v % C;
     const float sum = ((scores[0][h][k] + scores[1][h][k]) + scores[2][h][k]) +
                       scores[3][h][k];
-    scores[0][h][k] =
-        slots[k] >= 0 ? sum * (0.0625f * 1.4426950408889634f) : -1e20f;
+    scores[0][h][k] = slots[k] >= 0 ? sum * qk_scale : -1e20f;
   }
   __syncthreads();
   float maximum = fmaxf(scores[0][warp][lane], scores[0][warp][lane + 32]);
@@ -626,8 +642,9 @@ __global__ __launch_bounds__(256, 3) void partial_fp8_lite(Args a) {
   float result[H] = {};
 #pragma unroll 4
   for (int k = 0; k < C; ++k) {
-    const float value =
-        __half2float(__float2half_rn(__fmul_rn(lut[tile[k][t]], vscale[k])));
+    float value = lut[tile[k][t]];
+    if constexpr (!DEVICE_PAGED)
+      value = __half2float(__float2half_rn(__fmul_rn(value, vscale[k])));
 #pragma unroll
     for (int h = 0; h < H; ++h)
       result[h] = __fmaf_rn(scores[0][h][k], value, result[h]);
@@ -1411,11 +1428,11 @@ __global__ __launch_bounds__(256, MIN_BLOCKS) void rows_fp8(Args a) {
   }
 }
 
-template <int NH = H>
+template <int NH = H, bool DEVICE_PAGED = false>
 __global__ void merge_n(Args a) {
   __shared__ float weights[64], denom_parts[64], scalars[2];
-  merge_head<NH>(a, blockIdx.x / NH, blockIdx.x % NH, threadIdx.x, weights,
-                 denom_parts, scalars);
+  merge_head<NH, DEVICE_PAGED>(a, blockIdx.x / NH, blockIdx.x % NH, threadIdx.x,
+                               weights, denom_parts, scalars);
 }
 }  // namespace device_qsa
 
@@ -1630,7 +1647,7 @@ void device_qsa_out(
     return;
   }
   if (prefill && fp8 && !hot && a.tiles == 1) {
-    device_qsa::partial_fp8_lite<<<grid, 256, 0, stream>>>(a);
+    device_qsa::partial_fp8_lite<><<<grid, 256, 0, stream>>>(a);
   } else if (fp8 && hot_scales) {
     static int configured_dev = -1;
     const int cur_dev = q.device().index();
@@ -3114,7 +3131,66 @@ void dcp2_combine_gate_out(torch::Tensor partial_out, torch::Tensor partial_lse,
 
 }  // namespace dcp2_p2p
 
+// Adapt the imported H6 reader to ReVolta's rank-local GPU KV views.
+static void device_qsa_paged_dcp_out(torch::Tensor q, torch::Tensor k,
+                                     torch::Tensor v, torch::Tensor indices,
+                                     torch::Tensor table,
+                                     torch::Tensor requests, double k_scale,
+                                     double v_scale, torch::Tensor out,
+                                     torch::Tensor lse, torch::Tensor partial,
+                                     torch::Tensor state) {
+  using namespace device_qsa;
+  const c10::cuda::CUDAGuard guard(q.device());
+  Args a{};
+  a.M = q.size(0);
+  a.width = indices.size(1);
+  a.splits = (a.width + C - 1) / C;
+  TORCH_CHECK(a.M > 0 && a.M <= 20 && q.size(1) == 2 * H && q.size(2) == D &&
+              a.splits > 0 && a.splits <= 64);
+  TORCH_CHECK(partial.numel() >= a.M * H * a.splits * D &&
+              state.numel() >= a.M * H * a.splits * 2);
+  a.blocks = k.size(0);
+  a.page = k.size(1);
+  a.table_width = table.size(1);
+  a.num_requests = table.size(0);
+  a.history = k.data_ptr<uint8_t>();
+  a.paged_v = v.data_ptr<uint8_t>();
+  a.kb = k.stride(0);
+  a.kt = k.stride(1);
+  a.vb = v.stride(0);
+  a.vt = v.stride(1);
+  a.indices = indices.data_ptr<int>();
+  a.table = table.data_ptr<int>();
+  a.requests = requests.data_ptr<int>();
+  a.k_scale = static_cast<float>(k_scale);
+  a.v_scale = static_cast<float>(v_scale);
+  a.qs0 = q.stride(0);
+  a.qs1 = q.stride(1);
+  a.is0 = indices.stride(0);
+  a.ts0 = table.stride(0);
+  a.os0 = out.stride(0);
+  a.os1 = out.stride(1);
+  a.ls0 = lse.stride(0);
+  a.partial = partial.data_ptr<float>();
+  a.state = state.data_ptr<float>();
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const dim3 grid(a.splits, a.M);
+  for (int h = 0; h < 2 * H; h += H) {
+    a.q = reinterpret_cast<const half*>(q.data_ptr<at::Half>()) + h * a.qs1;
+    a.out_f32 = out.data_ptr<float>() + h * a.os1;
+    a.lse = lse.data_ptr<float>() + h;
+    partial_fp8_lite<true><<<grid, D, 0, stream>>>(a);
+    merge_n<H, true><<<a.M * H, D, 0, stream>>>(a);
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 TORCH_LIBRARY(vllm_sm70_qsa_device, m) {
+  m.def(
+      "run_paged_dcp(Tensor q, Tensor k, Tensor v, Tensor indices, Tensor "
+      "table, Tensor requests, float k_scale, float v_scale, Tensor(a!) out, "
+      "Tensor(b!) lse, Tensor(c!) partial, Tensor(d!) state) -> ()");
+  m.impl("run_paged_dcp", torch::kCUDA, &device_qsa_paged_dcp_out);
   m.def(
       "stage_host_run(Tensor history, Tensor scales, Tensor(a!) out, "
       "Tensor(b!) out_scales, int source_page, int target_page, int pages) "

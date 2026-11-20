@@ -40,6 +40,7 @@ def _forward_config():
 def test_qsa_h12_dcp_reader(monkeypatch, enabled, phase, rows, topk, native):
     layer = SimpleNamespace(
         sm70_qsa_paged_fp16_h12=enabled,
+        sm70_qsa_device_history=False,
         dcp_local_indices_buffer=torch.empty(rows, topk + 3, dtype=torch.int32),
         dcp_partial_output_buffer=torch.empty(rows, 12, 256),
         dcp_partial_lse_buffer=torch.empty(rows, 12),
@@ -117,6 +118,7 @@ def test_qsa_h12_workspace_survives_capture_lock(monkeypatch):
         dcp_partial_output_buffer=torch.empty(128, 12, 256),
         dcp_local_indices_buffer=torch.empty(128, 2051, dtype=torch.int32),
         sm70_qsa_paged_fp16_h12=True,
+        sm70_qsa_device_history=False,
         indexer=SimpleNamespace(token_topk=2048, compress_ratio=4),
         cp_kv_cache_interleave_size=1,
         impl=SimpleNamespace(dcp_world_size=2),

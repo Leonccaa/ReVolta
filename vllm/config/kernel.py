@@ -645,6 +645,10 @@ class KernelConfig:
     """Use the native FP16 paged QSA reader for eligible TP4/DCP2 target
     decode on SM70. Its reduction and probability rounding differ."""
 
+    sm70_qsa_device_history: bool = False
+    """Use native SM70 QSA GPU-cache reads for eligible TP4/DCP2 decode
+    and verification batches. This changes the local attention arithmetic."""
+
     qsa_dcp_index_shard: bool = False
     """Shard the target QSA compressed indexer keys over the DCP group.
 

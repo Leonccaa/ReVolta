@@ -585,13 +585,19 @@ class Qwen4ExpDecoderLayer(nn.Module):
         hidden_states, block_input, injection = mlp_hc.combine_and_mix(
             hidden_states, pending_attn, injection
         )
-        if self._sm70_hc_ll and isinstance(self.mlp, Qwen4ExpSparseMoeBlock):
+        mlp_out = self._forward_mlp(block_input, defer_tp_reduce=self._sm70_hc_ll)
+        return hidden_states, mlp_out, injection
+
+    def _forward_mlp(
+        self, block_input: torch.Tensor, *, defer_tp_reduce: bool
+    ) -> torch.Tensor | HCTensorParallelPartial:
+        if defer_tp_reduce and isinstance(self.mlp, Qwen4ExpSparseMoeBlock):
             runner = self.mlp.experts.runner
             if isinstance(runner, MoERunner) and runner.can_defer_tp_reduce():
-                partial = self.mlp(block_input, reduce_results=False)
-                return hidden_states, HCTensorParallelPartial(partial), injection
-        mlp_out = self.mlp(block_input)
-        return hidden_states, mlp_out, injection
+                return HCTensorParallelPartial(
+                    self.mlp(block_input, reduce_results=False)
+                )
+        return self.mlp(block_input)
 
 
 class Qwen4ExpMixtureOfExperts(MixtureOfExperts):

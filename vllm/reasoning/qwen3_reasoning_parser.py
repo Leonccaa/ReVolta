@@ -87,6 +87,30 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         """The token that ends reasoning content."""
         return "</think>"
 
+    def reasoning_eos_mask(
+        self, prompt_ids: Sequence[int]
+    ) -> tuple[tuple[int, ...], int, int] | None:
+        if not self.thinking_enabled or self.is_reasoning_end(prompt_ids):
+            return None
+        eos = tuple(
+            self.vocab[tag]
+            for tag in ("<|im_end|>", "<|endoftext|>")
+            if tag in self.vocab
+        )
+        if not eos:
+            return None
+        for token_id in reversed(prompt_ids):
+            if token_id in eos:
+                break
+            if token_id == self.start_token_id:
+                tool = self._tool_call_token_id
+                return (
+                    eos,
+                    self.end_token_id,
+                    self.end_token_id if tool is None else tool,
+                )
+        return None
+
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
         start_token_id = self.start_token_id
         end_token_id = self.end_token_id

@@ -120,6 +120,13 @@ class RejectionSampler:
 
         draft_sampled = input_batch.input_ids[input_batch.logits_indices]
         pos = input_batch.positions[input_batch.logits_indices]
+        reasoning_eos_rows = None
+        if (
+            self.synthetic_conditional_rates is not None
+            and (reasoning_eos := self.sampler.reasoning_eos) is not None
+            and reasoning_eos.active_requests(input_batch.idx_mapping_np)
+        ):
+            reasoning_eos_rows = logits.new_empty(logits.shape[0], dtype=torch.bool)
         processed_logits = self.sampler.apply_sampling_params(
             logits,
             input_batch.expanded_idx_mapping,
@@ -127,6 +134,7 @@ class RejectionSampler:
             pos,
             draft_sampled,
             input_batch.expanded_local_pos,
+            reasoning_eos_rows,
         )
         sampled, num_sampled = rejection_sample(
             processed_logits,
@@ -143,6 +151,7 @@ class RejectionSampler:
             self.synthetic_conditional_rates,
             use_fp64=self.sampler.use_fp64_gumbel,
             fallback_count=self.fallback_count,
+            reasoning_eos_rows=reasoning_eos_rows,
         )
         logprobs_tensors = self._get_logprobs_tensors(
             input_batch,

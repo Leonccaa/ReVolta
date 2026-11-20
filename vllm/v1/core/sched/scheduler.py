@@ -2305,11 +2305,16 @@ class Scheduler(SchedulerInterface):
         num_computed_tokens: list[int] = []
         num_output_tokens: list[int] = []
         resumed_req_ids = set()
+        qwen_reasoning_eos_ended_req_ids: set[str] | None = None
 
         num_running_reqs = len(running_reqs)
         for idx, req in enumerate(itertools.chain(running_reqs, resumed_reqs)):
             req_id = req.request_id
             req_ids.append(req_id)
+            if req.qwen_reasoning_eos_ended:
+                if qwen_reasoning_eos_ended_req_ids is None:
+                    qwen_reasoning_eos_ended_req_ids = set()
+                qwen_reasoning_eos_ended_req_ids.add(req_id)
             # NOTE: In PP+async scheduling, we consume token ids via a direct GPU
             # broadcast path (`input_batch.prev_sampled_token_ids`), so we can
             # omit this payload.
@@ -2349,6 +2354,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids=new_block_ids,
             num_computed_tokens=num_computed_tokens,
             num_output_tokens=num_output_tokens,
+            qwen_reasoning_eos_ended_req_ids=qwen_reasoning_eos_ended_req_ids,
         )
 
     @staticmethod

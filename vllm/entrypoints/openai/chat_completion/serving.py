@@ -14,6 +14,7 @@ import numpy as np
 import pybase64 as base64
 from fastapi import Request
 
+from vllm import envs
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.chat_utils import (
     ChatTemplateContentFormatOption,
@@ -72,6 +73,7 @@ from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.parser import ParserManager
 from vllm.parser.abstract_parser import Parser
 from vllm.reasoning import ReasoningParser
+from vllm.reasoning.qwen3_reasoning_parser import Qwen3ReasoningParser
 from vllm.renderers import ChatParams
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.tokenizers import TokenizerLike
@@ -214,6 +216,25 @@ class OpenAIServingChat(OpenAIServing):
             .chat_template_kwargs
         )
 
+    def _set_reasoning_eos_mask(
+        self,
+        request: ChatCompletionRequest,
+        sampling_params: SamplingParams,
+        reasoning_parser: ReasoningParser | None,
+        prompt_token_ids: list[int] | None,
+    ) -> None:
+        if (
+            envs.VLLM_QWEN_REASONING_EOS_MASK
+            and request.include_reasoning
+            and not sampling_params.ignore_eos
+            and prompt_token_ids
+            and isinstance(reasoning_parser, Qwen3ReasoningParser)
+            and self.engine_client.vllm_config.use_v2_model_runner
+        ):
+            sampling_params._qwen_reasoning_eos = reasoning_parser.reasoning_eos_mask(
+                prompt_token_ids
+            )
+
     async def render_chat_request(
         self,
         request: ChatCompletionRequest,
@@ -325,6 +346,9 @@ class OpenAIServingChat(OpenAIServing):
                 sampling_params = request.to_sampling_params(
                     max_tokens,
                     self.default_sampling_params,
+                )
+                self._set_reasoning_eos_mask(
+                    request, sampling_params, reasoning_parser, prompt_token_ids
                 )
 
             self._log_inputs(

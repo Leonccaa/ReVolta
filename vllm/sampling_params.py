@@ -318,6 +318,8 @@ class SamplingParams(
     # They are set in post_init.
     output_text_buffer_length: int = 0
     _eos_token_id: int | None = None
+    # Chat-only MRv2 metadata: candidate EOS IDs and the two closing boundaries.
+    _qwen_reasoning_eos: tuple[tuple[int, ...], int, int] | None = None
     _all_stop_token_ids: set[int] = msgspec.field(default_factory=set)
 
     # Fields used to construct logits processors
@@ -602,6 +604,18 @@ class SamplingParams(
         eos_token_id: int | None = None,
     ) -> None:
         """Update if there are non-default values from generation_config"""
+        eos_ids = generation_config.get("eos_token_id")
+        model_eos = {eos_ids} if isinstance(eos_ids, int) else set(eos_ids or ())
+        if self._qwen_reasoning_eos is not None:
+            candidates, end, tool = self._qwen_reasoning_eos
+            eos = tuple(
+                token_id
+                for token_id in candidates
+                if token_id == eos_token_id or token_id in model_eos
+            )
+            self._qwen_reasoning_eos = (
+                (eos, end, tool) if eos and not self.ignore_eos else None
+            )
         if not self.ignore_eos:
             self._eos_token_id = eos_token_id
 
@@ -611,20 +625,18 @@ class SamplingParams(
             self._all_stop_token_ids.add(eos_token_id)
 
         # Update eos_token_id for generation
-        if (eos_ids := generation_config.get("eos_token_id")) is not None:
-            # it can be either int or list of int
-            eos_ids = {eos_ids} if isinstance(eos_ids, int) else set(eos_ids)
+        if model_eos:
             if eos_token_id is not None:
                 # We don't need to include the primary eos_token_id in
                 # stop_token_ids since it's handled separately for stopping
                 # purposes.
-                eos_ids.discard(eos_token_id)
-            if eos_ids:
-                self._all_stop_token_ids.update(eos_ids)
+                model_eos.discard(eos_token_id)
+            if model_eos:
+                self._all_stop_token_ids.update(model_eos)
                 if not self.ignore_eos:
                     assert self.stop_token_ids is not None
-                    eos_ids.update(self.stop_token_ids)
-                    self.stop_token_ids = list(eos_ids)
+                    model_eos.update(self.stop_token_ids)
+                    self.stop_token_ids = list(model_eos)
 
     def validate_stop_token_ids_limit(self) -> None:
         """Call after update_from_generation_config (EOS ids merged)."""

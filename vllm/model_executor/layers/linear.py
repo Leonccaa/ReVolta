@@ -421,6 +421,17 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
             prepare_sm70_dsv4_fp13_gemv(layer)
 
+        self._prepare_sm70_dense(layer)
+        if getattr(layer, "_sm70_dflash2_fp16_m8", False) and not getattr(
+            layer, "_sm70_f16_prepared", False
+        ):
+            from vllm.model_executor.layers.quantization.sm70_dflash2_fp16 import (
+                prepare_dflash2_fp16_m8,
+            )
+
+            prepare_dflash2_fp16_m8(layer)
+
+    def _prepare_sm70_dense(self, layer: torch.nn.Module) -> None:
         force_enable = getattr(layer, "_sm70_f16_force_enable", False)
         if not envs.VLLM_SM70_ENABLE_DENSE_F16_FASTPATH and not force_enable:
             return
@@ -489,6 +500,14 @@ class UnquantizedLinearMethod(LinearMethodBase):
             return sm70_out
         if envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda_alike():
             return linear_batch_invariant(x, layer.weight, bias)
+        if hasattr(layer, "_sm70_dflash2_fp16_packed"):
+            from vllm.model_executor.layers.quantization.sm70_dflash2_fp16 import (
+                apply_dflash2_fp16_m8,
+            )
+
+            packed_out = apply_dflash2_fp16_m8(layer, x, bias)
+            if packed_out is not None:
+                return packed_out
         if envs.VLLM_SM70_UNQUANT_DEBUG and x.dim() >= 2:
             x_2d = x.reshape(-1, x.shape[-1])
             log_fn = (

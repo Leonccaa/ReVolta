@@ -576,6 +576,9 @@ class KernelConfig:
     sm70_rmsnorm_gated_exact: bool | None = None
     """Native gated norm; auto follows the Flash-Next model quality boundary."""
 
+    sm70_dflash2_fp16_m8: bool = False
+    """Opt in to packed FP16 M8 DFlash2 draft projections on SM70 TP4."""
+
     def resolve_sm70_rmsnorm_gated(self, *, qualified: bool) -> None:
         if self.sm70_rmsnorm_gated_exact is not None:
             return
@@ -753,6 +756,8 @@ class KernelConfig:
         }
         if not self.sm70_skinny_moe_applicable:
             ignored_factors.add("sm70_skinny_moe")
+        if not self.sm70_dflash2_fp16_m8:
+            ignored_factors.add("sm70_dflash2_fp16_m8")
         if not self.fused_fp16_aux_gemv_applicable:
             ignored_factors.add("fused_fp16_aux_gemv")
         if not self.qsa_auto_e4m3_active:

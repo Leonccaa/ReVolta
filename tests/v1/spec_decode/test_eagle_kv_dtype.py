@@ -77,7 +77,9 @@ def _load(monkeypatch, dtype, *, calibrated=True, target_dtype="fp8_e4m3"):
     target.lm_head = nn.Linear(4, 4, bias=False)
     config = _LoaderConfig(
         CacheConfig(cache_dtype=target_dtype, block_size=1600),
-        SimpleNamespace(kv_cache_dtype=dtype, draft_model_config=object()),
+        SimpleNamespace(
+            kv_cache_dtype=dtype, draft_model_config=object(), draft_load_config=None
+        ),
         SimpleNamespace(decode_context_parallel_size=2),
     )
     loaded = []

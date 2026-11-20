@@ -31,14 +31,13 @@ from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from multiprocessing.connection import Connection, wait
 from multiprocessing.reduction import ForkingPickler
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import msgspec
 import psutil
 import torch
 import torch.distributed as dist
 import zmq
-from cuda.bindings import driver as cuda_driver
 
 import vllm.envs as envs
 from vllm.config import VllmConfig, set_current_vllm_config
@@ -64,6 +63,7 @@ from vllm.model_executor.model_loader.utils import (
     process_weights_after_loading,
 )
 from vllm.model_executor.model_loader.weight_utils import initialize_dummy_weights
+from vllm.utils.import_utils import LazyLoader
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.system_utils import decorate_logs, get_mp_context
 from vllm.utils.torch_utils import set_default_torch_dtype
@@ -72,6 +72,11 @@ from vllm.v1.ple_offload.protocol import (
     PleOffloadRegistration,
     PleOffloadRequest,
 )
+
+if TYPE_CHECKING:
+    from cuda.bindings import driver as cuda_driver
+else:
+    cuda_driver = LazyLoader("cuda_driver", globals(), "cuda.bindings.driver")
 
 logger = init_logger(__name__)
 

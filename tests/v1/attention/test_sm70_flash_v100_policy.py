@@ -1948,10 +1948,16 @@ def test_sm70_mtp_cudagraph_capture_sizes_cover_production_concurrency(
     assert _sm70_mtp_cudagraph_capture_sizes(max_num_seqs, 5) == expected
 
 
-def test_sm70_speculative_cudagraph_shapes_are_tp_independent_and_bounded():
+@pytest.mark.parametrize("include_mixed_prefill", [False, True])
+def test_sm70_speculative_cudagraph_shapes_are_tp_independent_and_bounded(
+    include_mixed_prefill,
+):
     from vllm.config.vllm import _sm70_speculative_cudagraph_capture_sizes
 
-    assert _sm70_speculative_cudagraph_capture_sizes(4, 5) == [
+    mixed = [64, 96, 128, 160, 192, 256] if include_mixed_prefill else []
+    assert _sm70_speculative_cudagraph_capture_sizes(
+        4, 5, include_mixed_prefill=include_mixed_prefill
+    ) == [
         1,
         2,
         4,
@@ -1962,8 +1968,15 @@ def test_sm70_speculative_cudagraph_shapes_are_tp_independent_and_bounded():
         15,
         18,
         20,
+        *mixed,
     ]
-    assert _sm70_speculative_cudagraph_capture_sizes(256, 5)[-1] == 160
+    # Verifier shapes stop at 32 requests; larger sizes are the mixed-step set.
+    shapes = _sm70_speculative_cudagraph_capture_sizes(
+        256, 5, include_mixed_prefill=include_mixed_prefill
+    )
+    assert shapes[-1] == (256 if include_mixed_prefill else 160)
+    assert 32 * 5 in shapes
+    assert 64 * 5 not in shapes
     for concurrency in (2, 4, 8, 16, 32):
         assert concurrency * 8 in _sm70_speculative_cudagraph_capture_sizes(32, 8)
 

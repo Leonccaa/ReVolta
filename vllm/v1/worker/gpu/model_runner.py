@@ -1836,6 +1836,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             empty_output = self.kv_connector.no_forward(scheduler_output)
             return empty_output
 
+        if not dummy_run and batch_desc.cg_mode != CUDAGraphMode.NONE:
+            self.mixed_prefill_timer.mark_cuda_graph()
+
         early_model_inputs: dict[str, Any] | None = None
         ple_prepared = False
         if not dummy_run:

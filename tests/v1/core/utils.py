@@ -62,6 +62,7 @@ def create_scheduler(
     use_ec_connector: bool = False,
     ec_role: str | None = None,
     kv_cache_spec: KVCacheSpec | None = None,
+    mixed_prefill_latency_ms: float = SchedulerConfig.mixed_prefill_step_latency_ms,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -98,6 +99,7 @@ def create_scheduler(
         prefill_pressure_threshold=prefill_pressure_threshold,
         disable_chunked_mm_input=disable_chunked_mm_input,
         enable_chunked_prefill=enable_chunked_prefill,
+        mixed_prefill_step_latency_ms=mixed_prefill_latency_ms,
         async_scheduling=async_scheduling,
         is_encoder_decoder=model_config.is_encoder_decoder,
     )

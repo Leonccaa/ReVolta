@@ -97,6 +97,7 @@ from vllm.config.utils import get_field
 from vllm.config.vllm import (
     OptimizationLevel,
     PerformanceMode,
+    _sm70_max_cudagraph_capture_size,
     _sm70_mtp_cudagraph_capture_sizes,
     _sm70_speculative_cudagraph_capture_sizes,
 )
@@ -1972,9 +1973,16 @@ class EngineArgs:
                     f"mtp_split_verifier_cudagraph_shapes={cudagraph_capture_sizes}"
                 )
             else:
+                graph_mode = self.compilation_config.cudagraph_mode
                 cudagraph_capture_sizes = _sm70_speculative_cudagraph_capture_sizes(
                     self.max_num_seqs,
                     decode_query_len,
+                    include_mixed_prefill=(
+                        self.mixed_prefill_step_latency_ms > 0
+                        and (
+                            graph_mode is None or graph_mode.has_piecewise_cudagraphs()
+                        )
+                    ),
                 )
                 profile_updates.append(
                     f"mtp_cudagraph_shapes={cudagraph_capture_sizes}"
@@ -1983,8 +1991,13 @@ class EngineArgs:
                 self.compilation_config.cudagraph_capture_sizes = (
                     cudagraph_capture_sizes
                 )
-                self.compilation_config.max_cudagraph_capture_size = max(
-                    cudagraph_capture_sizes
+                max_tokens = self.max_num_batched_tokens
+                self.compilation_config.max_cudagraph_capture_size = (
+                    max(cudagraph_capture_sizes)
+                    if max_tokens is None
+                    else _sm70_max_cudagraph_capture_size(
+                        cudagraph_capture_sizes, max_tokens
+                    )
                 )
                 profile_updates.append(
                     "cudagraph_capture_sizes="

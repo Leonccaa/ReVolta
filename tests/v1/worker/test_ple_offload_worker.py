@@ -504,6 +504,8 @@ def test_ple_offload_wait_only_waits_for_done(
         "current_stream",
         lambda: stream,
     )
+    # Resolve the lazy driver before monkeypatch captures its target.
+    wait_flags = ple_offload_layer.cuda_driver.CUstreamWaitValue_flags
     monkeypatch.setattr(
         ple_offload_layer.cuda_driver,
         "CUstream",
@@ -537,7 +539,7 @@ def test_ple_offload_wait_only_waits_for_done(
             stream.cuda_stream,
             flag_tensor.data_ptr(),
             ple_offload_layer.CpuGpuSemaphore.DONE_VALUE,
-            ple_offload_layer.cuda_driver.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_EQ.value,
+            wait_flags.CU_STREAM_WAIT_VALUE_EQ.value,
         )
     ]
 

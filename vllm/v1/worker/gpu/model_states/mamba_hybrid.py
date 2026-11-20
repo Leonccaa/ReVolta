@@ -597,8 +597,10 @@ class MambaHybridModelState(DefaultModelState):
             for layer_name in group.layer_names:
                 layer = forward_context.get(layer_name)
                 metadata = attn_metadata.get(layer_name)
-                if not getattr(layer, "spec_state_replay", False) or not isinstance(
-                    metadata, GDNAttentionMetadata
+                if (
+                    layer is None
+                    or not getattr(layer, "spec_state_replay", False)
+                    or not isinstance(metadata, GDNAttentionMetadata)
                 ):
                     continue
                 if metadata.num_spec_decodes <= 0:
@@ -627,6 +629,9 @@ class MambaHybridModelState(DefaultModelState):
                         group_id=group_id,
                         base_state_ids=base_state_ids,
                         cu_seqlens=cu_seqlens,
+                        native_width=layer.native_gdn_verify_width(
+                            metadata, *layer_launch
+                        ),
                     )
                 )
         if launch is None:

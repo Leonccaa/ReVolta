@@ -14,6 +14,11 @@ The complete reference exports are in [step 3 of the tutorial](getting-started.m
 Use only the documented `VLLM_SM70_*` settings unless you are troubleshooting. Explicit
 values override the profile.
 
+`VLLM_SM70_MTP_GDN_NATIVE_VERIFY=1` enables experimental native GDN verification
+and accepted-state replay for eligible Flash-Next MTP batches on SM70 TP4.
+The default is `0`. Validate target outputs and committed states against Triton
+before enabling it for service.
+
 ## Interconnect
 
 The engine selects the interconnect automatically and logs `SM70 interconnect=<mode>`.

@@ -838,11 +838,13 @@ def _sm70_mtp_moe_fp16_shape_supported(
     ids: torch.Tensor,
     top_k: int,
     weighted: bool,
+    *,
+    batched: bool = False,
 ) -> bool:
     if weights is None or weights.ndim != 2 or weights.shape[1] != 10:
         return False
     m = weights.shape[0]
-    if m not in (1, 5):
+    if not (1 <= m <= 80 if batched else m in (1, 5)):
         return False
     n, k = (2560, 160) if weighted else (320, 2560)
     return (
@@ -857,6 +859,15 @@ def _sm70_mtp_moe_fp16_shape_supported(
         and all(
             t.device == a.device and t.is_contiguous() for t in (a, b, c, weights, ids)
         )
+    )
+
+
+def _sm70_mtp_moe_fp16_exact_enabled() -> bool:
+    return (
+        envs.VLLM_SM70_MTP_MOE_FP16_EXACT
+        and not envs.VLLM_BATCH_INVARIANT
+        and not _force_sm70_mtp_moe_legacy_config
+        and envs.VLLM_SM70_MTP_MOE_TUNED_CONFIG
     )
 
 
@@ -891,10 +902,7 @@ def dispatch_fused_moe_kernel(
     num_tokens = M * top_k
 
     if (
-        envs.VLLM_SM70_MTP_MOE_FP16_EXACT
-        and not envs.VLLM_BATCH_INVARIANT
-        and not _force_sm70_mtp_moe_legacy_config
-        and envs.VLLM_SM70_MTP_MOE_TUNED_CONFIG
+        _sm70_mtp_moe_fp16_exact_enabled()
         and sorted_token_ids is None
         and not (use_fp8_w8a8 or use_int8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
         and A_scale is None

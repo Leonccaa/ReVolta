@@ -17,6 +17,7 @@ from typing import Any, Literal
 
 import torch
 
+from vllm.model_executor.layers.ple_offload_layer import is_offload_process
 from vllm.platforms import current_platform
 from vllm.triton_utils import triton
 
@@ -119,10 +120,20 @@ def input_guard(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
 
 @functools.cache
 def get_available_device() -> str:
+    if is_offload_process():
+        return "cpu"
     try:
         return triton.runtime.driver.active.get_current_target().backend
     except (RuntimeError, AttributeError):
         return "cpu"
+
+
+def is_sm70() -> bool:
+    return (
+        not is_offload_process()
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_capability() == (7, 0)
+    )
 
 
 @functools.cache

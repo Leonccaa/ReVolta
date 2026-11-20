@@ -16,15 +16,7 @@ from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices
 from .op import exp
-from .utils import FLA_CHUNK_SIZE
-
-
-def _is_sm70() -> bool:
-    return (
-        torch.cuda.is_available()
-        and torch.cuda.get_device_capability()[0] == 7
-        and torch.cuda.get_device_capability()[1] == 0
-    )
+from .utils import FLA_CHUNK_SIZE, is_sm70
 
 
 def _parse_int_list(env_name: str, default_vals: list[int]) -> list[int]:
@@ -46,7 +38,7 @@ def _parse_int_list(env_name: str, default_vals: list[int]) -> list[int]:
 
 
 _use_sm70_kkt_schedule = (
-    os.getenv("VLLM_SM70_GDN_KKT_SCHEDULE", "1") == "1" and _is_sm70()
+    os.getenv("VLLM_SM70_GDN_KKT_SCHEDULE", "1") == "1" and is_sm70()
 )
 _kkt_configs = (
     [

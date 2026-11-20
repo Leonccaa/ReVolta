@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -9,6 +10,7 @@ import pytest
 import torch
 
 import vllm.v1.worker.gpu_model_runner as gpu_model_runner_module
+from tests.v1.core.utils import create_requests, create_scheduler
 from vllm.config import (
     AttentionConfig,
     CacheConfig,
@@ -25,6 +27,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
+from vllm.model_executor.layers.mamba.mamba_utils import get_conv_copy_spec
 from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 from vllm.sequence import IntermediateTensors
@@ -34,16 +37,20 @@ from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.attention.backend import MultipleOf
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.core.kv_cache_utils import estimate_max_model_len, get_kv_cache_configs
+from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
+    MambaSpec,
 )
-from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
+from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
+from vllm.v1.request import RequestStatus
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.gpu_input_batch import InputBatch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.utils import select_common_block_size
@@ -186,6 +193,159 @@ def _schedule_new_request(*req_ids: str) -> SchedulerOutput:
         finished_req_ids=set(),
         free_encoder_mm_hashes=[],
     )
+
+
+@pytest.fixture
+def cpu_mamba_runner(monkeypatch):
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.device = torch.device("cpu")
+    runner.pin_memory = False
+    runner.input_batch = InputBatch(
+        max_num_reqs=2,
+        max_model_len=128,
+        max_num_batched_tokens=128,
+        device=runner.device,
+        pin_memory=False,
+        vocab_size=100,
+        block_sizes=[BLOCK_SIZE],
+        kernel_block_sizes=[BLOCK_SIZE],
+    )
+    runner.requests = {}
+    runner.num_prompt_logprobs = {}
+    runner.encoder_cache = {}
+    runner.mamba_state_idx = {}
+    runner._mamba_accepted_token_state_rows = {}
+    runner._dynamic_draft_vocab_prefill_bootstrap = Mock()
+    runner.late_interaction_runner = Mock()
+    runner._may_reorder_batch = Mock()
+    runner.speculative_config = None
+    runner.is_pooling_model = False
+    runner.uses_mrope = False
+    runner.uses_xdrope_dim = 0
+    runner.use_async_scheduling = False
+    runner.use_async_spec_decode = False
+    runner.sync_spec_decode_accept_counts = False
+    runner.execute_model_state = None
+    runner.routed_experts_initialized = False
+    runner._sm70_async_worker_execute_trace_step = 0
+    runner.parallel_config = ParallelConfig()
+    monkeypatch.setattr(runner, "synchronize_input_prep", lambda **_: nullcontext())
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_last_rank=True),
+    )
+    monkeypatch.setattr(gpu_model_runner_module, "has_kv_transfer_group", lambda: False)
+    monkeypatch.setattr(gpu_model_runner_module, "has_ec_transfer", lambda: False)
+    return runner
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("cpu_postprocess", ["0", "1"])
+def test_zero_token_finish_allows_mamba_request_id_reuse(
+    cpu_mamba_runner, monkeypatch, cpu_postprocess
+):
+    monkeypatch.setenv("VLLM_MAMBA_ALIGN_CPU_POSTPROCESS", cpu_postprocess)
+    runner = cpu_mamba_runner
+    old = _schedule_new_request("req")
+    old.scheduled_new_reqs[0].block_ids = ([0, 1, 2, 3, 4, 5],)
+    runner._update_states(old)
+    runner.mamba_state_idx["req"] = 5
+    runner._mamba_accepted_token_state_rows["req"] = (0, runner.requests["req"])
+
+    finished = SchedulerOutput.make_empty()
+    finished.finished_req_ids.add("req")
+    assert runner.execute_model(finished) is EMPTY_MODEL_RUNNER_OUTPUT
+    assert "req" not in runner.requests
+
+    new = _schedule_new_request("req")
+    new.scheduled_new_reqs[0].block_ids = ([6, 7, 8],)
+    runner._update_states(new)
+    spec = MambaSpec(
+        block_size=BLOCK_SIZE,
+        shapes=((4, 2),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+        num_speculative_blocks=2,
+    )
+    kv_cache_config = KVCacheConfig(9, [], [KVCacheGroupSpec(["mamba"], spec)])
+    copy_funcs = (get_conv_copy_spec,)
+    copy_bufs = mamba_utils.MambaCopyBuffers.create(
+        2, kv_cache_config, copy_funcs, runner._make_buffer
+    )
+    mamba_utils.preprocess_mamba(
+        new,
+        kv_cache_config,
+        CacheConfig(enable_prefix_caching=True),
+        runner.mamba_state_idx,
+        runner.input_batch,
+        runner.requests,
+        {"mamba": SimpleNamespace(kv_cache=[torch.zeros(9, 4, 2)])},
+        copy_funcs,
+        copy_bufs,
+    )
+
+    assert runner.mamba_state_idx == {"req": 0}
+    assert runner._mamba_accepted_token_state_rows == {}
+    assert copy_bufs.offset == 0
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("end", ["finish", "preempt", "abort"])
+def test_mamba_state_cleanup_preserves_other_requests(cpu_mamba_runner, end):
+    runner = cpu_mamba_runner
+    scheduler = create_scheduler(max_model_len=128)
+    (request,) = create_requests(1, max_tokens=1, req_ids=["req"])
+    scheduler.add_request(request)
+    initial = scheduler.schedule()
+    runner._update_states(initial)
+    runner._update_states(_schedule_new_request("keep"))
+    req_state = runner.requests["req"]
+    keep_state = runner.requests["keep"]
+    runner.mamba_state_idx = {"req": 5, "keep": 2}
+    runner._mamba_accepted_token_state_rows = {
+        "req": (0, req_state),
+        "keep": (1, keep_state),
+    }
+
+    if end == "finish":
+        scheduler.update_from_output(
+            initial,
+            ModelRunnerOutput(
+                req_ids=["req"],
+                req_id_to_index={"req": 0},
+                sampled_token_ids=[[42]],
+            ),
+        )
+        assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+    elif end == "preempt":
+        scheduler.set_pause_state(PauseState.PAUSED_ALL)
+        assert scheduler.reset_prefix_cache(reset_running_requests=True)
+        assert request.status == RequestStatus.PREEMPTED
+    else:
+        scheduler.finish_requests("req", RequestStatus.FINISHED_ABORTED)
+        assert request.status == RequestStatus.FINISHED_ABORTED
+
+    output = scheduler.schedule()
+    assert output.total_num_scheduled_tokens == 0
+    if end == "preempt":
+        assert output.preempted_req_ids == {"req"}
+    else:
+        assert output.finished_req_ids == {"req"}
+    assert runner.execute_model(output) is EMPTY_MODEL_RUNNER_OUTPUT
+    assert runner.mamba_state_idx == {"keep": 2}
+    assert runner._mamba_accepted_token_state_rows == {"keep": (1, keep_state)}
+    assert runner.requests["keep"] is keep_state
+
+    if end == "preempt":
+        scheduler.set_pause_state(PauseState.UNPAUSED)
+        resumed = scheduler.schedule()
+        assert resumed.scheduled_cached_reqs.resumed_req_ids == {"req"}
+        runner._update_states(resumed)
+        assert runner.requests["req"] is req_state
+        assert runner.input_batch.req_ids == ["req"]
+    else:
+        assert "req" not in runner.requests
 
 
 def _schedule_cached_requests(
@@ -1783,9 +1943,12 @@ def test_is_uniform_decode() -> None:
     )
 
 
+@pytest.mark.skip_global_cleanup
 def test_compute_force_uniform_decode_rejects_hybrid_prefills() -> None:
     runner = SimpleNamespace(
-        model_config=SimpleNamespace(is_hybrid=True),
+        model_config=SimpleNamespace(
+            is_hybrid=True, hf_text_config=SimpleNamespace(model_type="llama")
+        ),
         requests={"req_a": SimpleNamespace(num_prompt_tokens=8)},
     )
     compute = GPUModelRunner._compute_force_uniform_decode
@@ -1838,9 +2001,14 @@ def test_compute_force_uniform_decode_rejects_hybrid_prefills() -> None:
     mixed.total_num_scheduled_tokens += 1
     assert compute(runner, mixed) is False
 
-    # The guard is intentionally limited to stateful hybrid models.
+    # Hy4 Flash also keeps its one-token prefills out of the decode graph.
     runner.model_config.is_hybrid = False
     assert compute(runner, _schedule_new_request("req_new")) is None
+    runner.model_config.hf_text_config.model_type = "hy_v4_flash"
+    one_token_prefill = _schedule_new_request("req_new")
+    one_token_prefill.scheduled_new_reqs[0].prompt_token_ids = [1]
+    assert compute(runner, one_token_prefill) is False
+    assert compute(runner, decode) is None
 
 
 @pytest.mark.skipif(

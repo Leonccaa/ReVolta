@@ -138,6 +138,8 @@ from vllm.v1.worker.utils import KVBlockZeroer, clear_layer_kv_caches
 if TYPE_CHECKING:
     from vllm.models.qwen4_exp.nvidia.host_kv.history import HostHistoryStore
 
+from vllm.v1.worker.workspace import lock_workspace
+
 logger = init_logger(__name__)
 
 
@@ -1096,6 +1098,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         compilation_counter.num_gpu_runner_capture_triggers += 1
 
         start_time = time.perf_counter()
+        # Grow the shared workspace to its largest use before any graph bakes
+        # in its address: a resize after capture frees what the graphs point at.
+        for layer in self.compilation_config.static_forward_context.values():
+            reserve = getattr(layer, "reserve_capture_workspace", None)
+            if callable(reserve):
+                reserve()
         gc.collect()
         torch.accelerator.empty_cache()
         start_free_gpu_memory = torch.cuda.mem_get_info()[0]
@@ -1148,6 +1156,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
         if self._ple_offload_connector is not None:
             self._ple_offload_connector.release_outputs()
+
+        # Lock workspace to prevent resizing during execution. A resize after
+        # capture frees the static cuda graph buffer (vLLM #55341).
+        lock_workspace()
 
         end_time = time.perf_counter()
         end_free_gpu_memory = torch.cuda.mem_get_info()[0]
@@ -1835,6 +1847,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # All DP ranks have zero tokens to run.
             empty_output = self.kv_connector.no_forward(scheduler_output)
             return empty_output
+
+        if not dummy_run and batch_desc.cg_mode != CUDAGraphMode.NONE:
+            self.mixed_prefill_timer.mark_cuda_graph()
 
         early_model_inputs: dict[str, Any] | None = None
         ple_prepared = False

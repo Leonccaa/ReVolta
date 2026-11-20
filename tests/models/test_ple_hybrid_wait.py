@@ -71,10 +71,8 @@ def lane(monkeypatch):
 
     def wait(_, pointer, value, flags):
         assert pointer == flag.data_ptr()
-        assert (
-            flags
-            == ple_offload_layer.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_EQ.value
-        )
+        wait_flags = ple_offload_layer.cuda_driver.CUstreamWaitValue_flags
+        assert flags == wait_flags.CU_STREAM_WAIT_VALUE_EQ.value
         events.append(("wait", value))
         # Fail immediately instead of letting an orphaned GPU wait hang pytest.
         assert flag.item() == value, "PLE wait has no completed remote producer"

@@ -6,9 +6,9 @@ Source: c19296d49934329b0fbb6853759690bc6d6c11d9. State gathers follow
 #67045 (d2a3815636ccc9eeedf31574a75e1e2d8afeca37); no partial-hit CoW.
 """
 
-from collections import Counter
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections import Counter, OrderedDict
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
 
 from vllm.utils.hashing import sha256
@@ -33,17 +33,27 @@ from vllm.v1.kv_offload.base import make_offload_key
 from vllm.v1.request import Request, RequestStatus
 
 if TYPE_CHECKING:
+    from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_coordinator import KVCacheCoordinator
     from vllm.v1.kv_offload.host.hit import HostKVHitManager
 
 
-@dataclass
+@dataclass(eq=False, slots=True)
 class ExactEnd:
+    anchor: BlockHash | None
     length: int
     key: BlockHash
     suffix: tuple[int, ...]
     # Per group: first logical block and blocks with their expected cache keys.
     groups: list[tuple[int, list[tuple[KVCacheBlock, BlockHashWithGroupId]]]]
+    hit_requests: set[str] = field(default_factory=set)
+
+
+# Within one anchor, index the end length, token suffix, and full checkpoint key.
+ExactEndBucket = dict[
+    int, dict[tuple[int, ...], dict[BlockHash, OrderedDict[ExactEnd, None]]]
+]
+BlockIdentity = tuple["BlockPool", int, BlockHashWithGroupId]
 
 
 class ExactEndIndex:
@@ -55,11 +65,58 @@ class ExactEndIndex:
             for i, m in enumerate(coordinator.single_type_managers)
             if isinstance(m, MambaManager)
         ]
-        self.index: dict[BlockHash | None, list[ExactEnd]] = {}
+        self.index: dict[BlockHash | None, ExactEndBucket] = {}
+        self._by_block: dict[BlockIdentity, set[ExactEnd]] = {}
         self.pending_gathers: list[MambaStateGather] = []
         self.hits: dict[str, ExactEnd] = {}
         # Publish outcomes, exported with the store stats as exact_end_<name>.
         self.events: Counter[str] = Counter()
+        if self.state_groups and coordinator.enable_caching:
+            for pool in coordinator.block_pools:
+                pool.exact_end_index = self
+
+    def discard_hit(self, request_id: str) -> None:
+        entry = self.hits.pop(request_id, None)
+        if entry is not None:
+            entry.hit_requests.remove(request_id)
+
+    def _block_identities(self, entry: ExactEnd) -> set[BlockIdentity]:
+        return {
+            (self.coordinator.group_block_pool(g), block.block_id, expected)
+            for g, (_, held) in enumerate(entry.groups)
+            for block, expected in held
+        }
+
+    def _remove(self, entry: ExactEnd) -> None:
+        lengths = self.index[entry.anchor]
+        suffixes = lengths[entry.length]
+        keys = suffixes[entry.suffix]
+        matches = keys[entry.key]
+        del matches[entry]
+        if not matches:
+            del keys[entry.key]
+            if not keys:
+                del suffixes[entry.suffix]
+                if not suffixes:
+                    del lengths[entry.length]
+                    if not lengths:
+                        del self.index[entry.anchor]
+        for block_key in self._block_identities(entry):
+            entries = self._by_block[block_key]
+            entries.remove(entry)
+            if not entries:
+                del self._by_block[block_key]
+        for request_id in entry.hit_requests:
+            del self.hits[request_id]
+        entry.hit_requests.clear()
+
+    def block_evicted(
+        self, pool: "BlockPool", block_id: int, expected: BlockHashWithGroupId
+    ) -> None:
+        # Unlike upstream, unlink the entry without clearing the other blocks'
+        # dedicated keys; those blocks remain available for normal LRU eviction.
+        for entry in tuple(self._by_block.get((pool, block_id, expected), ())):
+            self._remove(entry)
 
     def _anchor(self, request: Request, boundary: int) -> BlockHash | None:
         return (
@@ -79,7 +136,7 @@ class ExactEndIndex:
         )
 
     def publish(self, request: Request) -> None:
-        self.hits.pop(request.request_id, None)
+        self.discard_hit(request.request_id)
         managers = self.coordinator.single_type_managers
         if not self.state_groups or not self.coordinator.enable_caching:
             return
@@ -147,14 +204,42 @@ class ExactEndIndex:
                 if block.block_hash is None:
                     pool.cache_under_key(block, expected)
         entry = ExactEnd(
-            c + 1, key, tuple(request.all_token_ids[max(0, c - 7) : c + 1]), groups
+            self._anchor(request, c // span * span),
+            c + 1,
+            key,
+            tuple(request.all_token_ids[max(0, c - 7) : c + 1]),
+            groups,
         )
-        self.index.setdefault(self._anchor(request, c // span * span), []).append(entry)
+        lengths = self.index.setdefault(entry.anchor, {})
+        suffixes = lengths.setdefault(entry.length, {})
+        keys = suffixes.setdefault(entry.suffix, {})
+        matches = keys.get(entry.key)
+        if matches is None:
+            matches = keys[entry.key] = OrderedDict()
+        matches[entry] = None
+        for block_key in self._block_identities(entry):
+            self._by_block.setdefault(block_key, set()).add(entry)
         self.events["published"] += 1
         if request.last_accepted > 1:
             self.pending_gathers.append(
                 MambaStateGather(request.last_accepted - 1, dst)
             )
+
+    def _candidates(
+        self, request: Request, boundary: int, hit: int
+    ) -> Iterator[ExactEnd]:
+        lengths = self.index.get(self._anchor(request, boundary))
+        if lengths is None:
+            return
+        for n in sorted(lengths, reverse=True):
+            if not hit < n - 1 < request.num_tokens:
+                continue
+            suffix = tuple(request.all_token_ids[max(0, n - 8) : n])
+            keys = lengths[n].get(suffix)
+            if keys is not None:
+                matches = keys.get(self._key(request, n))
+                if matches is not None:
+                    yield from matches
 
     def extend(
         self,
@@ -163,21 +248,14 @@ class ExactEndIndex:
         hit: int,
         host_hits: "HostKVHitManager | None",
     ) -> tuple[tuple[Sequence[KVCacheBlock], ...], int]:
-        self.hits.pop(request.request_id, None)
+        self.discard_hit(request.request_id)
         if not self.state_groups:
             return blocks, hit
         managers = self.coordinator.single_type_managers
         span = managers[self.state_groups[0]].block_size
         for boundary in range((request.num_tokens - 1) // span * span, hit - 1, -span):
-            entries = self.index.get(self._anchor(request, boundary), [])
-            for entry in sorted(entries, key=lambda e: e.length, reverse=True):
+            for entry in self._candidates(request, boundary, hit):
                 n = entry.length
-                if (
-                    not hit < n - 1 < request.num_tokens
-                    or tuple(request.all_token_ids[max(0, n - 8) : n]) != entry.suffix
-                    or self._key(request, n) != entry.key
-                ):
-                    continue
                 result = []
                 for g, (first, held) in enumerate(entry.groups):
                     pool = self.coordinator.group_block_pool(g)
@@ -234,20 +312,18 @@ class ExactEndIndex:
                     result.append(prefix + [b for b, _ in held])
                 if len(result) == len(managers):
                     self.hits[request.request_id] = entry
+                    entry.hit_requests.add(request.request_id)
                     return tuple(result), n - 1
         return blocks, hit
 
     def consume(self, request: Request) -> None:
-        entry = self.hits.pop(request.request_id, None)
+        entry = self.hits.get(request.request_id)
         if entry is None:
             return
+        self._remove(entry)
         for g, (_, held) in enumerate(entry.groups):
             exact_key = make_block_hash_with_group_id(entry.key, g)
             pool = self.coordinator.group_block_pool(g)
             for block, expected in held:
                 if expected == exact_key:
                     pool._maybe_evict_cached_block(block)
-        span = self.coordinator.single_type_managers[self.state_groups[0]].block_size
-        self.index[self._anchor(request, (entry.length - 1) // span * span)].remove(
-            entry
-        )

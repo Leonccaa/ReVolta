@@ -17,18 +17,10 @@ from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices
 from .op import exp
-from .utils import FLA_CHUNK_SIZE, check_shared_mem, is_nvidia_hopper
+from .utils import FLA_CHUNK_SIZE, check_shared_mem, is_nvidia_hopper, is_sm70
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
-
-
-def _is_sm70() -> bool:
-    return (
-        torch.cuda.is_available()
-        and torch.cuda.get_device_capability()[0] == 7
-        and torch.cuda.get_device_capability()[1] == 0
-    )
 
 
 def _parse_int_list(env_name: str, default_vals: list[int]) -> list[int]:
@@ -50,7 +42,7 @@ def _parse_int_list(env_name: str, default_vals: list[int]) -> list[int]:
 
 
 _use_sm70_chunk_o_schedule = (
-    os.getenv("VLLM_SM70_GDN_CHUNK_O_SCHEDULE", "1") == "1" and _is_sm70()
+    os.getenv("VLLM_SM70_GDN_CHUNK_O_SCHEDULE", "1") == "1" and is_sm70()
 )
 _chunk_o_configs = (
     [

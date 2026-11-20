@@ -12,10 +12,17 @@ import sys
 import time
 from dataclasses import dataclass, field
 from functools import lru_cache
+from typing import TYPE_CHECKING
 
 import torch
 import torch.multiprocessing as torch_mp
-from cuda.bindings import driver as cuda_driver
+
+from vllm.utils.import_utils import LazyLoader
+
+if TYPE_CHECKING:
+    from cuda.bindings import driver as cuda_driver
+else:
+    cuda_driver = LazyLoader("cuda_driver", globals(), "cuda.bindings.driver")
 
 
 @lru_cache(maxsize=1)

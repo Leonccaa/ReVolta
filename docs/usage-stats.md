@@ -21,6 +21,7 @@ One JSON object when the engine starts, then a heartbeat every 10 minutes that r
 | `gpu_count` | number | Number of accelerators. |
 | `gpu_type` | string | Accelerator name. |
 | `gpu_memory_per_device` | number | Memory of one accelerator in bytes. |
+| `gpu_topology` | string | On CUDA with at least two visible GPUs, a JSON-encoded array of pairs. Each has `gpus` (two zero-based CUDA logical ordinals) and `type` (`NVLink`, `PCIe`, or `unknown`). When available, `path` is `PIX`, `PXB`, `PHB`, `NODE`, or `SYS`; `nvlink_count` is a positive integer for directly observed links, only when the count is complete. Unknown probes are not guessed. The startup snapshot is reused in heartbeats. |
 | `cuda_runtime` | string | CUDA runtime version. |
 | `xpu_runtime` | string | XPU runtime version, when the engine runs on XPU. |
 | `revolta_version` | string | The ReVolta release this engine was built from. This is the field to group reports by. |
@@ -58,7 +59,7 @@ The ReVolta part of the summary is the parallelism (including decode-context par
 
 ## What is never sent
 
-Prompts, outputs, token counts of individual requests, model paths or repository names, served model names, host names, IP addresses, user names, environment variables outside the allowlist above, and any free-form string setting (paths, URLs, file names). Values that look like paths are dropped before sending, not redacted afterwards.
+Prompts, outputs, token counts of individual requests, model paths or repository names, served model names, host names, IP addresses, user names, physical GPU identifiers, PCI addresses, serial numbers, environment variables outside the allowlist above, and any free-form string setting (paths, URLs, file names). Values that look like paths are dropped before sending, not redacted afterwards.
 
 The report also goes to a local file, `usage_stats.json` in the directory given by `VLLM_CONFIG_ROOT`, with the same content. A write failure there is ignored the same way a send failure is.
 

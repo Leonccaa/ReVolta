@@ -27,6 +27,39 @@ def test_budget_adapts_to_gpu_cost_and_ignores_short_boundaries():
     assert 2400 <= budget.tokens <= 2512
 
 
+def test_fixed_step_cost_just_below_target_does_not_collapse_the_budget():
+    # 240 ms of fixed cost leaves 10 ms of a 250 ms target; chunks of 40
+    # tokens would spend 96% of every mixed step on overhead.
+    budget = MixedPrefillBudget(4064, 250)
+    budget.tokens = 512
+    assert 896 <= _converge(budget, 240, 0.25) <= 960
+
+
+def test_graph_steps_let_a_small_budget_recover():
+    budget = MixedPrefillBudget(4064, 250)
+    for n in (512, 640, 768):
+        budget.tokens = n
+        budget.update(MixedPrefillTiming(n, 24, n, 150 + 0.15 * n))
+    budget.tokens = 80
+    for _ in range(8):
+        n = budget.tokens
+        budget.update(MixedPrefillTiming(n, 24, n, 60, cuda_graph=True))
+    assert budget.tokens == 992
+
+
+def test_graph_replayed_steps_do_not_teach_the_eager_cost():
+    budget = MixedPrefillBudget(4064, 250)
+    for _ in range(20):
+        n = budget.tokens
+        budget.update(MixedPrefillTiming(n, 24, n, 300 + 0.2 * n))
+    eager = budget.tokens
+    # A short prompt in a piecewise graph is much cheaper than an eager step
+    # of the same size. It must not shrink the budget for eager chunks.
+    for _ in range(20):
+        budget.update(MixedPrefillTiming(96, 24, 96, 60, cuda_graph=True))
+    assert budget.tokens == eager
+
+
 def test_budget_recovers_after_stall_from_small_values():
     budget = MixedPrefillBudget(8192, 250)
     budget.update(MixedPrefillTiming(512, 16, 512, 6000))
@@ -35,6 +68,29 @@ def test_budget_recovers_after_stall_from_small_values():
         n = budget.tokens
         budget.update(MixedPrefillTiming(n, 16, n, 12))
     assert budget.tokens > 1024
+
+
+def _converge(budget, fixed_ms, ms_per_token, steps=40):
+    for _ in range(steps):
+        n = budget.tokens
+        budget.update(MixedPrefillTiming(n, 32, n, fixed_ms + ms_per_token * n))
+    return budget.tokens
+
+
+def test_fixed_step_cost_below_target_is_not_charged_to_prefill():
+    # 60 ms of decode/launch cost plus 0.25 ms per prefill token: 250 ms
+    # leaves room for (250 - 60) / 0.25 = 760 prefill tokens.
+    budget = MixedPrefillBudget(4064, 250)
+    assert 736 <= _converge(budget, 60, 0.25) <= 768
+
+
+def test_fixed_step_cost_above_target_does_not_collapse_the_budget():
+    # Eager mixed steps can cost more than the target before any prefill.
+    # Splitting the prompt finer only multiplies those steps, so the budget
+    # must settle near fixed / per_token instead of the 16-token quantum.
+    budget = MixedPrefillBudget(4064, 250)
+    budget.tokens = 32
+    assert 1100 <= _converge(budget, 300, 0.25, steps=60) <= 1216
 
 
 @pytest.mark.parametrize("elapsed", [0, -1, float("nan"), float("inf")])
@@ -77,6 +133,12 @@ def test_timer_never_waits_and_keeps_delayed_sample_token_counts():
         sample = timer.finish()
         assert sample == MixedPrefillTiming(512, 16, 512, 300)
         assert len(events) == 2  # No events for pure decode.
+        timer.begin(output)
+        timer.mark_cuda_graph()
+        assert timer.finish() is None
+        events[-1].ready = True
+        timer.begin(SchedulerOutput.make_empty())
+        assert timer.finish() == MixedPrefillTiming(512, 16, 512, 300, True)
 
 
 def _resident(scheduler):
@@ -92,6 +154,50 @@ def _resident(scheduler):
         ),
     )
     return req
+
+
+def test_concurrent_short_prompts_do_not_collapse_the_budget():
+    scheduler = create_scheduler(max_model_len=512, max_num_batched_tokens=128)
+    scheduler.mixed_prefill_enabled = True
+    decode_ids = ["decode0", "decode1", "decode2"]
+    for req in create_requests(3, 32, max_tokens=64, req_ids=decode_ids):
+        scheduler.add_request(req)
+    scheduler.update_from_output(
+        scheduler.schedule(),
+        ModelRunnerOutput(
+            req_ids=decode_ids,
+            req_id_to_index={rid: i for i, rid in enumerate(decode_ids)},
+            sampled_token_ids=[[42]] * len(decode_ids),
+        ),
+    )
+
+    prompt = None
+    for i in range(40):
+        if prompt is None or prompt.is_finished():
+            prompt = create_requests(1, 120, max_tokens=1, req_ids=[f"prompt{i}"])[0]
+            scheduler.add_request(prompt)
+        step = scheduler.schedule()
+        assert step.mixed_decode_tokens == len(decode_ids)
+        prefill = step.mixed_prefill_tokens
+        req_ids = [*decode_ids, prompt.request_id]
+        scheduler.update_from_output(
+            step,
+            ModelRunnerOutput(
+                req_ids=req_ids,
+                req_id_to_index={rid: j for j, rid in enumerate(req_ids)},
+                sampled_token_ids=[[43]] * len(decode_ids)
+                + ([[44]] if prompt.num_computed_tokens == 120 else [[]]),
+                mixed_prefill_timing=MixedPrefillTiming(
+                    prefill,
+                    step.mixed_decode_tokens,
+                    step.mixed_prefill_budget,
+                    300 + 0.25 * prefill,
+                ),
+            ),
+        )
+
+    assert scheduler.mixed_prefill_budget.tokens == 128
+    assert step.mixed_prefill_tokens == 120
 
 
 def test_running_prefill_cannot_starve_later_resident_decode():
@@ -129,16 +235,35 @@ def test_pure_prefill_and_disabled_control_keep_full_budget():
     assert step.num_scheduled_tokens[long.request_id] == 1024
     assert step.mixed_prefill_tokens == 0
 
-    scheduler = create_scheduler(max_num_batched_tokens=1024)
+    scheduler = create_scheduler(
+        max_num_batched_tokens=1024, mixed_prefill_latency_ms=0
+    )
     resident = _resident(scheduler)
     scheduler.mixed_prefill_enabled = True
-    scheduler.scheduler_config.mixed_prefill_step_latency_ms = 0
     long = create_requests(num_requests=1, num_tokens=1536, req_ids=["long"])[0]
     scheduler.add_request(long)
     step = scheduler.schedule()
     assert step.num_scheduled_tokens["long"] == 1023
     assert step.num_scheduled_tokens[resident.request_id] == 1
-    assert step.mixed_prefill_tokens == 0
+    assert (step.mixed_prefill_tokens, step.mixed_decode_tokens) == (0, 0)
+    assert step.mixed_prefill_budget == 0
+    timer = MixedPrefillTimer()
+    with patch("torch.cuda.Event", side_effect=AssertionError("unexpected timing")):
+        timer.begin(step)
+        assert timer.finish() is None
+    outputs = scheduler.update_from_output(
+        step,
+        ModelRunnerOutput(
+            req_ids=[resident.request_id, "long"],
+            req_id_to_index={resident.request_id: 0, "long": 1},
+            sampled_token_ids=[[43], []],
+            mixed_prefill_timing=MixedPrefillTiming(512, 16, 512, 6000),
+        ),
+    )
+    assert [(out.request_id, out.new_token_ids) for out in outputs[0].outputs] == [
+        (resident.request_id, [43]),
+    ]
+    assert scheduler.mixed_prefill_budget.tokens == 512
 
 
 def test_adaptive_threshold_floor_does_not_override_mixed_latency_budget():

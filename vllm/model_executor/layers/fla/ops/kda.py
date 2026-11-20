@@ -25,22 +25,14 @@ from .index import prepare_chunk_indices
 from .l2norm import l2norm_fwd
 from .op import exp2, log
 from .solve_tril import solve_tril
-from .utils import FLA_CHUNK_SIZE, is_amd
+from .utils import FLA_CHUNK_SIZE, is_amd, is_sm70
 
 BT_LIST_AUTOTUNE = [32, 64, 128]
 NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if is_amd else [4, 8, 16, 32]
 
 
-def _is_sm70() -> bool:
-    return (
-        torch.cuda.is_available()
-        and torch.cuda.get_device_capability()[0] == 7
-        and torch.cuda.get_device_capability()[1] == 0
-    )
-
-
 _use_sm70_kda_prefill_schedule = (
-    os.getenv("VLLM_SM70_KDA_PREFILL_SCHEDULE", "1") == "1" and _is_sm70()
+    os.getenv("VLLM_SM70_KDA_PREFILL_SCHEDULE", "1") == "1" and is_sm70()
 )
 _recompute_w_u_configs = (
     [triton.Config({}, num_warps=num_warps, num_stages=2) for num_warps in [4, 8]]

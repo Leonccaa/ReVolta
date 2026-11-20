@@ -33,7 +33,7 @@ import torch.nn as nn
 from vllm import envs
 from vllm.compilation.counter import compilation_counter
 from vllm.config import VllmConfig
-from vllm.config.compilation import CUDAGraphMode
+from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
@@ -177,6 +177,24 @@ def _detach_model_runtime_state(model: nn.Module) -> None:
     for module in model.modules():
         if isinstance(module, TorchCompileWithNoGuardsWrapper):
             module.cleanup()
+
+
+def _should_use_hc_sp(
+    input_batch: InputBatch,
+    cg_mode: CUDAGraphMode,
+    min_tokens: int | None,
+    *,
+    skip_compiled: bool,
+    profile_hc_sp: bool,
+) -> bool:
+    return (
+        min_tokens is not None
+        and input_batch.num_tokens >= min_tokens
+        and cg_mode == CUDAGraphMode.NONE
+        and not skip_compiled
+        and input_batch.num_draft_tokens == 0
+        and (profile_hc_sp or input_batch.is_prefilling_np.all())
+    )
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -549,6 +567,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.speculator is not None:
                 prepare_communication_buffer_for_model(self.speculator.model)
 
+        if (
+            self.parallel_config.enable_hc_sp
+            and self.parallel_config.tensor_parallel_size > 1
+            and not self.use_pp
+            and self.dp_size == 1
+            and self.lora_config is None
+            and self.compilation_config.mode == CompilationMode.VLLM_COMPILE
+            and current_platform.is_device_capability(70)
+        ):
+            prepare_hc_sp = getattr(self.model, "prepare_hc_sp_model", None)
+            if prepare_hc_sp is not None:
+                prepare_hc_sp()
+                self._hc_sp_enabled = True
+
         # Initialize the components that require the model.
         self.model_state = init_model_state(
             self.vllm_config, self.model, self.encoder_cache, self.device
@@ -895,6 +927,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 "SM70 V2 auxiliary kernel warmup finished: %s", tuple(warmed)
             )
 
+    @property
+    def hc_sp_min_tokens(self) -> int | None:
+        if not getattr(self, "_hc_sp_enabled", False):
+            return None
+        cmax = (
+            self.cudagraph_manager.max_captured_tokens
+            if self.cudagraph_manager is not None
+            else self.compilation_config.max_cudagraph_capture_size or 0
+        )
+        return max(4096, cmax + 1)
+
     @torch.inference_mode()
     @step_eplb_after(is_dummy=True)
     def _dummy_run(
@@ -905,6 +948,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         uniform_decode: bool = False,
         skip_eplb: bool = False,
         is_profile: bool = False,
+        profile_hc_sp: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if skip_attn and not is_profile:
@@ -950,6 +994,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 dummy_run=True,
                 skip_attn_for_dummy_run=skip_attn,
                 is_profile=is_profile,
+                profile_hc_sp=profile_hc_sp,
             )
         finally:
             self.kv_connector.set_disabled(False)
@@ -1051,6 +1096,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         ):
             encoder_cache = self.model_state.encoder_runner.profile(
                 self.vllm_config, MULTIMODAL_REGISTRY
+            )
+        hc_sp_min_tokens = self.hc_sp_min_tokens
+        if hc_sp_min_tokens is not None and self.max_num_tokens >= hc_sp_min_tokens:
+            self._dummy_run(
+                self.max_num_tokens, skip_attn=True, is_profile=True, profile_hc_sp=True
             )
         hidden_states, sample_hidden_states = self._dummy_run(
             self.max_num_tokens, skip_attn=True, is_profile=True
@@ -1808,6 +1858,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
+        profile_hc_sp: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if (
             dummy_run
@@ -2073,6 +2124,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_tokens=input_batch.num_tokens_after_padding,
                 has_lora=self.lora_config is not None,
             )
+
+            if _should_use_hc_sp(
+                input_batch,
+                batch_desc.cg_mode,
+                getattr(self, "hc_sp_min_tokens", None),
+                skip_compiled=skip_compiled,
+                profile_hc_sp=profile_hc_sp and dummy_run and is_profile,
+            ):
+                model_inputs["hc_sp"] = True
 
             with set_forward_context(
                 attn_metadata,

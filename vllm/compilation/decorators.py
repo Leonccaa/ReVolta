@@ -94,6 +94,7 @@ def support_torch_compile(
     *,
     dynamic_arg_dims: dict[str, int | list[int] | dict[int, str]] | None,
     enable_if: Callable[[VllmConfig], bool] | None = None,
+    compile_prefix: str = "",
 ) -> Callable[[type[_T]], type[_T]]: ...
 
 
@@ -123,6 +124,7 @@ def support_torch_compile(
     mark_unbacked_dims: dict[str, int | list[int]] | None = None,
     enable_if: Callable[[VllmConfig], bool] | None = None,
     is_encoder: bool = False,
+    compile_prefix: str = "",
 ) -> Callable[[type[_T]], type[_T]] | type[_T]:
     """
     A decorator to add support for compiling the forward method of a class.
@@ -190,6 +192,8 @@ def support_torch_compile(
     max_num_batched_tokens, since encoder input shapes are unpredictable.
     This is typically used for vision encoder sub-modules in multimodal models.
 
+    `compile_prefix` names the backend cache namespace for a compiled view.
+
     `shape_invariants` is a function that gets compiled right before forward.
     The function should have the torch._check calls that are needed to set
     the relationships between different input sizes. For example:
@@ -243,6 +247,7 @@ def support_torch_compile(
             mark_unbacked_dims,
             enable_if,
             is_encoder,
+            compile_prefix,
         )
 
     if cls is not None:
@@ -335,6 +340,7 @@ def _support_torch_compile(
     mark_unbacked_dims: dict[str, int | list[int]] | None = None,
     enable_if: Callable[[VllmConfig], bool] | None = None,
     is_encoder: bool = False,
+    compile_prefix: str = "",
 ) -> type[_T]:
     """Internal implementation of support_torch_compile decorator."""
 
@@ -406,7 +412,7 @@ def _support_torch_compile(
         # Handled by monkeypatching `TorchCompileWithNoGuardsWrapper` into base class
         TorchCompileWithNoGuardsWrapper.__init__(
             self,
-            compile_prefix=cls.__name__ if is_encoder else "",
+            compile_prefix=compile_prefix or (cls.__name__ if is_encoder else ""),
             is_encoder=is_encoder,
         )
 

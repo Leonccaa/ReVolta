@@ -3,13 +3,16 @@
 """ReVolta sends its own anonymous usage report, on by default and silent."""
 
 import json
+import sys
 import time
 import types
+from unittest.mock import Mock
 
 import pytest
 import requests
 
 import vllm.envs as envs
+from tests.usage.test_gpu_topology import FakeNvml
 from vllm.usage import usage_lib
 from vllm.v1 import utils as v1_utils
 
@@ -43,6 +46,7 @@ CONTRACT_FIELDS = {
     "gpu_count",
     "gpu_type",
     "gpu_memory_per_device",
+    "gpu_topology",
     "env_var_json",
     # Engine / model
     "model_architecture",
@@ -450,6 +454,68 @@ def test_heartbeat_repeats_startup_summary_with_uptime(monkeypatch):
     assert captured["kv_cache_usage"] == 37
     assert isinstance(captured["uptime_s"], int)
     assert captured["uptime_s"] >= 0
+
+
+def test_topology_startup_and_heartbeat(monkeypatch):
+    from vllm import platforms
+    from vllm.usage import gpu_topology
+
+    platform = types.SimpleNamespace(
+        is_cuda_alike=lambda: True,
+        is_cuda=lambda: True,
+        is_xpu=lambda: False,
+        is_tpu=lambda: False,
+        device_count=lambda: 2,
+    )
+    monkeypatch.setattr(platforms, "current_platform", platform)
+    monkeypatch.setattr(
+        usage_lib, "cuda_get_device_properties", lambda *args: ("GPU", 1)
+    )
+    topology = '[{"gpus":[0,1],"type":"PCIe","path":"PIX"}]'
+    nvml = FakeNvml({})
+    init = Mock(wraps=nvml.nvmlInit)
+    link_state = Mock(wraps=nvml.nvmlDeviceGetNvLinkState)
+    monkeypatch.setattr(nvml, "nvmlInit", init)
+    monkeypatch.setattr(nvml, "nvmlDeviceGetNvLinkState", link_state)
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.platforms.cuda",
+        types.SimpleNamespace(pynvml=nvml, _usage_topology_cache={}),
+    )
+    monkeypatch.setattr(
+        gpu_topology.torch.cuda,
+        "get_device_properties",
+        lambda ordinal: types.SimpleNamespace(uuid=f"GPU-test-{ordinal}"),
+    )
+    reports = []
+    monkeypatch.setattr(
+        usage_lib.UsageMessage,
+        "_send_to_server",
+        lambda self, data: reports.append(data),
+    )
+    monkeypatch.setattr(
+        usage_lib.UsageMessage, "_write_to_file", lambda self, data: None
+    )
+    message = usage_lib.UsageMessage()
+    message._report_usage_once("Stub", usage_lib.UsageContext.ENGINE_CONTEXT, {})
+    init.assert_called_once_with()
+    link_state.assert_called_once_with(0, 0)
+    init.reset_mock()
+    link_state.reset_mock()
+
+    class StopHeartbeat(Exception):
+        pass
+
+    def sleep(_):
+        if len(reports) > 1:
+            raise StopHeartbeat
+
+    monkeypatch.setattr(usage_lib.time, "sleep", sleep)
+    with pytest.raises(StopHeartbeat):
+        message._report_continuous_usage()
+    assert len(reports) == 2
+    assert reports[0]["gpu_topology"] == reports[1]["gpu_topology"] == topology
+    assert init.call_count == link_state.call_count == 0
 
 
 def test_report_payload_is_json_serializable(monkeypatch):

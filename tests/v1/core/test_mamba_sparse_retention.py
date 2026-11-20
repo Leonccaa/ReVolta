@@ -892,6 +892,255 @@ def _exact_end_entries(index):
     ]
 
 
+def _r1_scheduler(
+    monkeypatch, d, threshold, *, replay=True, async_scheduling=False, batch_drafts=None
+):
+    from tests.v1.core import test_long_context_admission as fixture
+    from tests.v1.core.long_context_kv_utils import mtp_specs, production_specs
+    from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+
+    make_config = fixture.make_config
+
+    def configure(**kwargs):
+        config = make_config(**kwargs)
+        # CPU replacement for the VllmConfig platform/replay resolution.
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+        spec = config.speculative_config
+        spec.gdn_spec_state_replay = replay
+        spec.exact_end_draft_threshold = threshold
+        spec.num_speculative_tokens_per_batch_size = [
+            (1, 1, d),
+            (2, 8, d - 2 if batch_drafts is None else batch_drafts),
+        ]
+        return config
+
+    monkeypatch.setattr(fixture, "make_config", configure)
+    monkeypatch.setattr(
+        fixture,
+        "production_specs",
+        lambda **_: production_specs(speculative_blocks=0 if replay else d),
+    )
+    monkeypatch.setattr(fixture, "mtp_specs", lambda **_: mtp_specs(replay=replay))
+    if async_scheduling:
+        monkeypatch.setattr(fixture, "Scheduler", AsyncScheduler)
+    return fixture.build(
+        fixture.settings(),
+        speculative_tokens=d,
+        speculative_method="mtp" if d == 4 else "dflash",
+        async_scheduling=async_scheduling,
+    )
+
+
+def _r1_sample(scheduler, output, acceptance="all"):
+    from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+    from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
+
+    ids = list(output.num_scheduled_tokens)
+    widths = [1 + len(output.scheduled_spec_decode_tokens.get(rid, ())) for rid in ids]
+    counts = {
+        "all": widths,
+        "some": [min(2, q) for q in widths],
+        "none": [1] * len(ids),
+    }
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=ids,
+            req_id_to_index={rid: i for i, rid in enumerate(ids)},
+            sampled_token_ids=[
+                list(range(100, 100 + count))
+                if not scheduler.requests[rid].is_prefill_chunk
+                else []
+                for rid, count in zip(ids, counts[acceptance])
+            ],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    if not scheduler.scheduler_config.async_scheduling:
+        # Real MRv2 synchronous draft publication, without allocating CUDA
+        # events. Unstructured requests carry placeholders back to scheduler.
+        handler = DraftTokensHandler.__new__(DraftTokensHandler)
+        handler.set_draft_tokens(
+            SimpleNamespace(req_ids=ids, has_structured_output_reqs=False),
+            torch.full((len(ids), scheduler.num_spec_tokens), -1),
+            num_draft_tokens=0
+            if output.skip_drafts
+            else output.num_spec_tokens_to_schedule,
+        )
+        drafts = handler.get_draft_tokens()
+        assert isinstance(drafts, DraftTokenIds)
+        scheduler.update_draft_token_ids(drafts)
+
+
+@pytest.mark.parametrize("d", [4, 7], ids=["mtp4", "dflash2"])
+@pytest.mark.parametrize("remaining", [1, 2, "K", "K+1", "d", "d+1"])
+@pytest.mark.parametrize("acceptance", ["all", "some", "none"])
+def test_r1_caps_verification_and_consumes_exact_end(
+    monkeypatch, d, remaining, acceptance
+):
+    from tests.v1.core.test_long_context_admission import make_requests
+    from vllm.v1.outputs import DraftTokenIds
+    from vllm.v1.request import RequestStatus
+
+    k = 3
+    r = {"K": k, "K+1": k + 1, "d": d, "d+1": d + 1}.get(remaining, remaining)
+    scheduler = _r1_scheduler(monkeypatch, d, k)
+    assert scheduler.use_v2_model_runner
+    [request] = make_requests(1, STATE_BLOCK - 16, r + 1)
+    scheduler.add_request(request)
+    _r1_sample(scheduler, scheduler.schedule())
+    # Model a full-width proposal retained by a long row in the previous batch.
+    rid = request.request_id
+    scheduler.update_draft_token_ids(DraftTokenIds([rid], [[-1] * d]))
+
+    allocated = []
+    allocate = scheduler.kv_cache_manager.allocate_slots
+
+    def capture(req, width, **kwargs):
+        allocated.append((req.request_id, width, kwargs["num_lookahead_tokens"]))
+        return allocate(req, width, **kwargs)
+
+    monkeypatch.setattr(scheduler.kv_cache_manager, "allocate_slots", capture)
+    output = scheduler.schedule()
+    q = 1 if r <= k else min(d + 1, r)
+    assert output.num_scheduled_tokens == {rid: q}
+    assert allocated == [(rid, q, scheduler.num_lookahead_tokens)]
+    assert output.scheduled_spec_decode_tokens == (
+        {rid: [-1] * (q - 1)} if q > 1 else {}
+    )
+    assert not request.spec_token_ids
+    _r1_sample(scheduler, output, acceptance)
+    for _ in range(r - 1):
+        if request.is_finished():
+            break
+        _r1_sample(scheduler, scheduler.schedule(), acceptance)
+    assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+    assert request.num_output_tokens == r + 1
+    assert request.num_computed_tokens == request.num_tokens - 1
+    index = scheduler.kv_cache_manager.coordinator.exact_end
+    assert index.events == {"published": 1}
+    scheduler.add_request(
+        type(request)(
+            request_id="revisit",
+            prompt_token_ids=list(request.all_token_ids) + [777],
+            sampling_params=request.sampling_params,
+            pooling_params=None,
+            block_hasher=request._block_hasher,
+        )
+    )
+    revisit = scheduler.schedule()
+    assert revisit.scheduled_new_reqs[0].num_computed_tokens == request.num_tokens - 1
+    assert not index.index
+
+
+@pytest.mark.parametrize("d", [4, 7], ids=["mtp4", "dflash2"])
+@pytest.mark.parametrize(
+    "arm", ["default", "no-replay", "async", "block-aligned", "stop"]
+)
+def test_r1_control(monkeypatch, d, arm):
+    from tests.v1.core.test_long_context_admission import make_requests
+    from vllm.v1.request import RequestStatus
+
+    if arm == "async" and d != 4:
+        pytest.skip("Async comparison is MTP only")
+    r = 2 if arm in ("default", "no-replay", "async") else 4
+    scheduler = _r1_scheduler(
+        monkeypatch,
+        d,
+        None if arm == "default" else 1,
+        replay=arm not in ("no-replay", "async"),
+        async_scheduling=arm == "async",
+    )
+    prompt = STATE_BLOCK - (r if arm == "block-aligned" else 16)
+    [request] = make_requests(1, prompt, r + 1)
+    scheduler.add_request(request)
+    prefill = scheduler.schedule()
+    assert not prefill.skip_drafts
+    _r1_sample(scheduler, prefill)
+    if arm == "stop":
+        request.sampling_params.stop_token_ids = [101]
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {
+        request.request_id: min(d + 1, r) if arm in ("block-aligned", "stop") else d + 1
+    }
+    _r1_sample(scheduler, output)
+    index = scheduler.kv_cache_manager.coordinator.exact_end
+    if arm == "block-aligned":
+        assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+        assert request.num_computed_tokens == request.num_tokens - 1
+        assert index.events == {"skip_block_aligned": 1}
+    elif arm == "stop":
+        assert request.status == RequestStatus.FINISHED_STOPPED
+        assert index.events == {"skip_end_mismatch": 1}
+    else:
+        assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+        assert request.num_output_tokens == r + 1
+        assert request.num_computed_tokens == request.num_tokens - 1 + d + 1 - r
+        assert index.events == {"skip_end_mismatch": 1}
+
+
+@pytest.mark.parametrize("d", [4, 7], ids=["mtp4", "dflash2"])
+def test_r1_skips_drafts_only_for_whole_batch(monkeypatch, d):
+    from tests.v1.core.test_long_context_admission import make_requests
+
+    scheduler = _r1_scheduler(monkeypatch, d, d)
+    [short, short2] = make_requests(2, STATE_BLOCK - 16, d)
+    for request in (short, short2):
+        scheduler.add_request(request)
+    prefill = scheduler.schedule()
+    assert prefill.num_spec_tokens_to_schedule == d - 2
+    # d - 1 exceeds the actual two-row DSD width, even though it fits T.
+    assert not prefill.skip_drafts
+    _r1_sample(scheduler, prefill)
+    assert short.spec_token_ids == [-1] * (d - 2)
+    # The same two-row DSD width now suffices after even a full rejection.
+    decode = scheduler.schedule()
+    assert decode.skip_drafts
+    assert decode.num_scheduled_tokens == {
+        short.request_id: d - 1,
+        short2.request_id: d - 1,
+    }
+    _r1_sample(scheduler, decode, "none")
+    assert not short.spec_token_ids and not short2.spec_token_ids
+
+    [long] = make_requests(1, 64, 2 * d, tag="long")
+    scheduler.add_request(long)
+    mixed = scheduler.schedule()
+    assert not mixed.skip_drafts
+    _r1_sample(scheduler, mixed, "none")
+    tail = scheduler.schedule()
+    assert not tail.skip_drafts
+    assert short.request_id not in tail.scheduled_spec_decode_tokens
+    assert tail.num_scheduled_tokens[short.request_id] == 1
+    assert tail.scheduled_spec_decode_tokens[long.request_id] == [-1] * (d - 2)
+
+
+def test_r1_mixed_prefill_reserves_capped_decode_width(monkeypatch):
+    from tests.v1.core.test_long_context_admission import make_requests
+    from vllm.v1.outputs import DraftTokenIds
+
+    scheduler = _r1_scheduler(monkeypatch, 7, 2)
+    [short] = make_requests(1, 64, 3)
+    [prefill] = make_requests(1, 128, 20, tag="prefill")
+    scheduler.max_num_scheduled_tokens = 96
+    for request in (short, prefill):
+        scheduler.add_request(request)
+    output = scheduler.schedule()
+    assert output.skip_drafts
+    _r1_sample(scheduler, output)
+    assert prefill.is_prefill_chunk
+    scheduler.update_draft_token_ids(DraftTokenIds([short.request_id], [[-1] * 7]))
+    scheduler.running.reverse()
+    scheduler.mixed_prefill_enabled = True
+    scheduler.max_num_scheduled_tokens = 8
+    output = scheduler.schedule()
+    assert output.mixed_prefill_tokens == 7
+    assert output.mixed_decode_tokens == 1
+    assert output.skip_drafts
+
+
 def test_exact_end_duplicate_keys_survive_unrelated_eviction_and_consume():
     from vllm import SamplingParams
     from vllm.utils.hashing import sha256

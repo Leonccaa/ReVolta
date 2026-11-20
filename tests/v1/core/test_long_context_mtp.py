@@ -46,6 +46,7 @@ def settings(**kw) -> LongContextKVConfig:
 def test_exact_end_mtp_completes_prefix_pages_before_consuming(monkeypatch):
     from tests.v1.core.test_long_context_admission import make_requests
     from tests.v1.core.test_mamba_sparse_retention import (
+        _exact_end_entries,
         _exact_end_scheduler,
         _exact_end_step,
         _finish_exact_end,
@@ -56,7 +57,7 @@ def test_exact_end_mtp_completes_prefix_pages_before_consuming(monkeypatch):
     scheduler = _exact_end_scheduler(monkeypatch, mtp=True)
     [request] = make_requests(1, 3 * SPAN + 20, 7)
     index = _finish_exact_end(scheduler, request)
-    [entry] = [e for bucket in index.index.values() for e in bucket]
+    [entry] = _exact_end_entries(index)
     _exact_end_step(scheduler)
     revisit = Request(
         request_id="mtp-revisit",
@@ -77,7 +78,7 @@ def test_exact_end_mtp_completes_prefix_pages_before_consuming(monkeypatch):
     assert manager.allocate_slots(revisit, 1, hit, blocks, num_lookahead_tokens=4)
     single = manager.coordinator.single_type_managers[g]
     assert single.num_cached_block[revisit.request_id] == hit // SPAN
-    assert not any(index.index.values())
+    assert not index.index
     for group, (_, held) in enumerate(entry.groups):
         for block, expected in held:
             if expected == make_block_hash_with_group_id(entry.key, group):

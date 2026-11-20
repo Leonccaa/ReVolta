@@ -29,6 +29,7 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.request import Request
 
 if TYPE_CHECKING:
+    from vllm.v1.core.exact_end import ExactEndIndex
     from vllm.v1.core.long_context_kv import LongContextAdmissionLedger
 
 logger = init_logger(__name__)
@@ -152,6 +153,7 @@ class BlockPool:
     # Long-context mode only: observes reference-count transitions so the
     # per-domain admission ledger stays exact. None leaves the pool as is.
     admission_observer: "LongContextAdmissionLedger | None" = None
+    exact_end_index: "ExactEndIndex | None" = None
 
     def __init__(
         self,
@@ -402,6 +404,8 @@ class BlockPool:
             return False
 
         block.reset_hash()
+        if self.exact_end_index is not None:
+            self.exact_end_index.block_evicted(self, block.block_id, block_hash)
 
         if self.enable_kv_cache_events:
             self.kv_event_queue.append(
@@ -523,6 +527,10 @@ class BlockPool:
 
         # Remove all hashes from all blocks.
         for block in self.blocks:
+            if self.exact_end_index is not None and block.block_hash is not None:
+                self.exact_end_index.block_evicted(
+                    self, block.block_id, block.block_hash
+                )
             block.reset_hash()
 
         if self.metrics_collector:

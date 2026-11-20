@@ -130,6 +130,38 @@ def _dcp_a2a_send_recv_buffers(
     )
 
 
+def reserve_dcp_a2a_workspace(
+    num_tokens: int,
+    num_heads: int,
+    head_dim: int,
+    world_size: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> None:
+    """Grow the shared workspace to ``dcp_a2a_lse_reduce``'s largest buffers.
+
+    CUDA graphs bake in the workspace address; a later resize frees it while
+    the graphs keep writing there. Call before capture with the largest
+    ``[num_tokens, num_heads, head_dim]`` the combine will see.
+    """
+    if world_size <= 1 or not is_workspace_manager_initialized():
+        return
+    if num_heads % world_size != 0:
+        raise ValueError(
+            f"H={num_heads} must be divisible by DCP world size {world_size}."
+        )
+    _dcp_a2a_send_recv_buffers(
+        (
+            world_size,
+            num_tokens,
+            num_heads // world_size,
+            head_dim + _dcp_a2a_lse_pack_dim(dtype),
+        ),
+        device=device,
+        dtype=dtype,
+    )
+
+
 @triton.jit
 def _dcp_a2a_pack_send_kernel(
     out_ptr,

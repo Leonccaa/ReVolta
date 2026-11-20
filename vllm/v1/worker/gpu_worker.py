@@ -883,6 +883,11 @@ class Worker(WorkerBase):
         if hasattr(self.model_runner, "_warmup_sm70_aux_kernels"):
             self.model_runner._warmup_sm70_aux_kernels()
 
+        if self.use_v2_model_runner:
+            # Run full execute_model + sample_tokens before capture: a workspace
+            # resize after capture frees what the graphs point at (vLLM #55341).
+            warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
+
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
             cuda_graph_memory_bytes = self.model_runner.capture_model()
@@ -974,10 +979,7 @@ class Worker(WorkerBase):
 
             logger.debug(msg)
 
-        if self.use_v2_model_runner:
-            # V2: Run full execute_model + sample_tokens to JIT compile triton kernels.
-            warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
-        elif get_pp_group().is_last_rank:
+        if not self.use_v2_model_runner and get_pp_group().is_last_rank:
             # V1: Warm up sampler and preallocate memory buffer for logits and other
             # sampling related tensors of max possible shape to avoid memory
             # fragmentation issue.

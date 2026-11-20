@@ -388,6 +388,7 @@ if TYPE_CHECKING:
     VLLM_SM70_MTP_SHARED_BATCH: bool = True
     VLLM_SM70_MTP_Q8_PREFILL_MMQ: bool = False
     VLLM_SM70_MTP_PLE_CONV: bool = True
+    VLLM_SM70_PLE_GATE_NORM: bool = False
     VLLM_SM70_QWEN38_FUSED_HC_FP16: bool = False
     VLLM_SM70_QWEN38_BATCH_FASTPATH: bool = True
     VLLM_SM70_QWEN38_DUAL_COMPILE: bool = False
@@ -5168,14 +5169,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=("Flash-Next MTP draft",),
         user_visible=True,
     ),
-    # Fuse the MTP4 PLE rollback, depthwise convolution, SiLU and state commit.
+    # Fuse PLE rollback, depthwise convolution, SiLU and state commit.
     "VLLM_SM70_MTP_PLE_CONV": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_MTP_PLE_CONV", "1"))),
         description=(
-            "Fuses qualified MTP4 PLE rollback, ordered convolution taps, SiLU "
-            "and state commit. Default on after #703 exact state and model "
-            "qualification. Set 0 to diagnose PLE state updates with the "
-            "separate operations."
+            "Fuses eligible SM70 PLE speculative rollback, convolution, SiLU "
+            "and state commit for MTP and DFlash2. Set 0 to use the separate "
+            "operations."
         ),
         category="configuration",
         declared_default="True",
@@ -5184,7 +5184,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "availability checks still apply."
         ),
         automatic_conditions=(),
-        acceleration_paths=("MTP verifier", "Flash-Next qualified batch"),
+        acceleration_paths=("MTP verifier", "DFlash2 verifier"),
+        user_visible=True,
+    ),
+    "VLLM_SM70_PLE_GATE_NORM": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_PLE_GATE_NORM", "0"))),
+        description=(
+            "Opt in to SM70 Flash-Next FP16 PLE gate and norm fusion in full "
+            "decode graphs with dual compilation. The fused reduction can "
+            "change FP16 results."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("Flash-Next FULL decode graph",),
         user_visible=True,
     ),
     # Fuse the exact Qwen3.8 M=1 HyperConnection down/SiLU and up/gate-mix

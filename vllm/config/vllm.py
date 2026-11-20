@@ -1356,6 +1356,32 @@ class VllmConfig:
         return 0
 
     @property
+    def adaptive_mtp_enabled(self) -> bool:
+        """Whether synchronous MRv2 can adapt the single-request DSD width."""
+        mode = envs.VLLM_1CAT_ADAPTIVE_MTP
+        spec = self.speculative_config
+        if (
+            mode not in ("1", "true", "yes", "on", "auto")
+            or spec is None
+            or not spec.use_qwen4_exp_mtp()
+            or self.num_speculative_tokens < 3
+            or spec.num_speculative_tokens_per_batch_size is None
+            or self.scheduler_config.async_scheduling
+            or not self.use_v2_model_runner
+        ):
+            return False
+        if mode != "auto":
+            return True
+
+        from vllm.platforms import current_platform
+
+        return (
+            self.num_speculative_tokens >= 5
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability((7, 0))
+        )
+
+    @property
     def use_v2_model_runner(self) -> bool:
         use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
         architectures = (

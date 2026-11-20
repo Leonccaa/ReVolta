@@ -36,6 +36,7 @@ from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.spec_decode.dynamic.adaptive_mtp import MIN_ADAPTIVE_MTP_DEPTH
 from vllm.v1.spec_decode.dynamic.utils import (
     DynamicSDSchedule,
     build_dynamic_sd_schedule_lookup,
@@ -381,7 +382,9 @@ class CudaGraphManager:
             and decode_query_len > 1
             and cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
         ):
-            self._add_dynamic_sd_candidates(schedule)
+            self._add_dynamic_sd_candidates(
+                schedule, adaptive_mtp=vllm_config.adaptive_mtp_enabled
+            )
 
     @property
     def max_captured_tokens(self) -> int:
@@ -469,7 +472,9 @@ class CudaGraphManager:
             descs.sort(key=lambda d: d.num_tokens, reverse=True)
             self._capture_descs[mode] = descs
 
-    def _add_dynamic_sd_candidates(self, schedule: DynamicSDSchedule) -> None:
+    def _add_dynamic_sd_candidates(
+        self, schedule: DynamicSDSchedule, *, adaptive_mtp: bool
+    ) -> None:
         lookup = build_dynamic_sd_schedule_lookup(
             schedule, self.max_num_reqs, self.decode_query_len - 1
         )
@@ -497,6 +502,22 @@ class CudaGraphManager:
                 for size in range(range_starts[query_len], num_tokens + 1):
                     self._candidates[size] = [desc, *self._candidates[size]]
                 range_starts[query_len] = num_tokens + 1
+
+        if adaptive_mtp:
+            # Both the target and draft position 0 capture these descriptors.
+            # Later draft positions already use one query token per request.
+            for query_len in range(MIN_ADAPTIVE_MTP_DEPTH + 1, lookup[1] + 1):
+                if query_len >= len(self._candidates):
+                    break
+                desc = BatchExecutionDescriptor(
+                    cg_mode=CUDAGraphMode.FULL,
+                    num_tokens=query_len,
+                    num_reqs=1,
+                    uniform_token_count=query_len,
+                )
+                if desc not in self._candidates[query_len]:
+                    narrow_descs.append(desc)
+                    self._candidates[query_len] = [desc, *self._candidates[query_len]]
 
         if narrow_descs:
             self._capture_descs[CUDAGraphMode.FULL] = sorted(

@@ -1080,6 +1080,35 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         del self.v_scale
         self._qsa_kv_scales_finalized = True
 
+    def reserve_capture_workspace(self) -> None:
+        """Size the shared workspace for this layer's largest DCP combine.
+
+        The all-to-all combine takes its send/receive buffers from the shared
+        workspace, sized by the step's token count; reserve the largest step
+        (the partial-output buffer's rows) before CUDA graph capture.
+        """
+        from vllm.v1.attention.ops.dcp_alltoall import (
+            dcp_a2a_lse_reduce,
+            reserve_dcp_a2a_workspace,
+        )
+
+        partial = self.dcp_partial_output_buffer
+        if (
+            not self.qsa_dcp_sharded
+            or partial is None
+            or getattr(self.impl, "dcp_combine", None) is not dcp_a2a_lse_reduce
+        ):
+            return
+        max_tokens, num_heads, head_dim = partial.shape
+        reserve_dcp_a2a_workspace(
+            max_tokens,
+            num_heads,
+            head_dim,
+            self.impl.dcp_world_size,
+            partial.dtype,
+            partial.device,
+        )
+
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.attn_backend
 

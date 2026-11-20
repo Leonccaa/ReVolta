@@ -1272,8 +1272,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if scheduler_output.scheduled_new_reqs:
             self.req_states.apply_staged_writes()
             self.model_state.apply_staged_writes()
-        if self.sampler is not None:
-            self.sampler.apply_staged_writes()
+            if self.sampler is not None:
+                self.sampler.apply_staged_writes()
 
     def update_requests(self, scheduler_output: SchedulerOutput) -> None:
         if scheduler_output.mamba_state_gathers:

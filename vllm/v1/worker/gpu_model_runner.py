@@ -8913,6 +8913,8 @@ class GPUModelRunner(
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
+        if cudagraph_mode != CUDAGraphMode.NONE and not has_encoder_input:
+            self.mixed_prefill_timer.mark_cuda_graph()
         _sync_sm70_before_compile_graph_forward(cudagraph_mode)
         mtp_profile_events: (
             list[tuple[str, torch.cuda.Event, torch.cuda.Event]] | None

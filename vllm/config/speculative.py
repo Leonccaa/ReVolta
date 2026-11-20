@@ -40,7 +40,9 @@ from vllm.config.parallel import ParallelConfig
 from vllm.config.sm70_dflash2 import Sm70DFlash2Config
 from vllm.config.utils import config, is_init_field
 from vllm.logger import init_logger
-from vllm.transformers_utils.config import get_hf_text_config
+from vllm.transformers_utils.config import get_config, get_hf_text_config
+from vllm.transformers_utils.gguf_utils import maybe_patch_hf_config_from_gguf
+from vllm.transformers_utils.utils import maybe_model_redirect
 from vllm.utils.hashing import safe_hash
 from vllm.utils.import_utils import LazyLoader, has_arctic_inference
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -1277,6 +1279,34 @@ class SpeculativeConfig:
                 self.prompt_lookup_min = 0
 
             if self.model is not None:
+                draft_max_model_len = self.max_model_len
+                if self.use_dflash_family() or (
+                    self.method == "draft_model" and "dflash" in self.model.lower()
+                ):
+                    # Mirror ModelConfig's HF config loading and overrides before
+                    # deciding whether the DFlash guard must validate the extension.
+                    model = maybe_model_redirect(self.model)
+                    hf_config = get_config(
+                        model,
+                        self.target_model_config.trust_remote_code,
+                        self.revision,
+                        self.code_revision,
+                        self.target_model_config.config_format,
+                        hf_overrides_fn=SpeculativeConfig.hf_config_override,
+                    )
+                    hf_config = maybe_patch_hf_config_from_gguf(model, hf_config)
+                    text = get_hf_text_config(hf_config)
+                    native = getattr(text, "max_position_embeddings", None)
+                    rope = getattr(text, "rope_parameters", None)
+                    if (
+                        native is not None
+                        and self.target_model_config.max_model_len > native
+                        and not (
+                            isinstance(rope, dict) and rope.get("rope_type") == "yarn"
+                        )
+                    ):
+                        draft_max_model_len = None
+
                 self.draft_model_config = ModelConfig(
                     model=self.model,
                     runner="draft",
@@ -1290,7 +1320,7 @@ class SpeculativeConfig:
                     revision=self.revision,
                     code_revision=self.code_revision,
                     tokenizer_revision=self.target_model_config.tokenizer_revision,
-                    max_model_len=self.max_model_len,  # type: ignore[arg-type]
+                    max_model_len=draft_max_model_len,  # type: ignore[arg-type]
                     spec_target_max_model_len=self.target_model_config.max_model_len,
                     quantization=self.quantization,
                     enforce_eager=self.target_model_config.enforce_eager,
@@ -1341,6 +1371,9 @@ class SpeculativeConfig:
                     raise NotImplementedError(
                         f"Unsupported speculative method: '{self.method}'"
                     )
+
+                if self.use_dflash_family():
+                    self._inherit_target_rope_for_extended_dflash()
 
                 # Replace hf_config for EAGLE draft_model
                 if self.method in ("eagle", "eagle3") or self.use_dflash_family():
@@ -1645,6 +1678,92 @@ class SpeculativeConfig:
             self.max_model_len,
             factor,
         )
+
+    def _inherit_target_rope_for_extended_dflash(self) -> None:
+        draft = self.draft_model_config
+        target = self.target_model_config
+        draft_text = get_hf_text_config(draft.hf_config)
+        native_limit = getattr(draft_text, "max_position_embeddings", None)
+        # The DFlash worker uses the target limit for positions even when a
+        # smaller speculative max_model_len was supplied.
+        requested = target.max_model_len
+        if native_limit is None or requested <= native_limit:
+            return
+        draft_rope = getattr(draft_text, "rope_parameters", None)
+        if isinstance(draft_rope, dict) and draft_rope.get("rope_type") == "yarn":
+            return
+        target_text = get_hf_text_config(target.hf_config)
+        target_rope = getattr(target_text, "rope_parameters", None)
+        if not isinstance(target_rope, dict) or target_rope.get("rope_type") != "yarn":
+            raise ValueError(
+                "DFlash beyond draft max_position_embeddings requires target "
+                "YaRN rope_parameters or a YaRN-configured draft."
+            )
+        SpeculativeConfig._validate_target_yarn_extension(
+            target_rope, native_limit, requested, target.max_model_len, "DFlash"
+        )
+        inherited = copy.deepcopy(target_rope)
+        # The draft uses its own 1D RoPE geometry, not target multimodal layout.
+        inherited.pop("mrope_section", None)
+        inherited.pop("mrope_interleaved", None)
+        for key in ("rope_theta", "partial_rotary_factor", "rope_dim"):
+            if isinstance(draft_rope, dict) and key in draft_rope:
+                inherited[key] = draft_rope[key]
+            else:
+                inherited.pop(key, None)
+        draft_text.rope_parameters = inherited
+        draft.max_model_len = draft.get_and_verify_max_len(-1)
+
+    @staticmethod
+    def _validate_target_yarn_extension(
+        rope_parameters: dict,
+        draft_native_limit: int,
+        requested: int,
+        target_limit: int,
+        label: str,
+    ) -> None:
+        original_limit = rope_parameters.get("original_max_position_embeddings")
+        factor = rope_parameters.get("factor")
+        try:
+            if original_limit is None or factor is None:
+                raise TypeError("YaRN original limit and factor must be present")
+            original_limit_value = float(original_limit)
+            factor_value = float(factor)
+            draft_native_limit_value = float(draft_native_limit)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(
+                f"{label} YaRN extension requires numeric "
+                "original_max_position_embeddings and factor."
+            ) from error
+
+        if (
+            not math.isfinite(original_limit_value)
+            or not math.isfinite(factor_value)
+            or original_limit_value <= 0
+            or factor_value <= 1
+            or original_limit_value != draft_native_limit_value
+        ):
+            raise ValueError(
+                f"{label} YaRN extension requires the target's positive "
+                "original_max_position_embeddings to match the drafter's "
+                "native max_position_embeddings and factor to be greater "
+                f"than one; got original={original_limit!r}, "
+                f"native={draft_native_limit!r}, factor={factor!r}."
+            )
+
+        scaled_limit = original_limit_value * factor_value
+        if not math.isfinite(scaled_limit):
+            raise ValueError(f"{label} YaRN extension requires a finite scaled limit.")
+        validated_yarn_limit = int(scaled_limit)
+        validated_limit = min(
+            validated_yarn_limit,
+            target_limit,
+        )
+        if requested > validated_limit:
+            raise ValueError(
+                f"{label} max_model_len={requested} exceeds the "
+                f"validated target YaRN limit={validated_limit}."
+            )
 
     def _validate_suffix_decoding(self):
         if not has_arctic_inference():

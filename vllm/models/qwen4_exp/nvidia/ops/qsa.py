@@ -13,6 +13,7 @@ from typing import Any
 import regex as re
 import torch
 
+import vllm._custom_ops as ops
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.models.deepseek_v4.common.ops.fp8_software import (
@@ -1929,6 +1930,12 @@ def qsa_select_paged_tokens(
         (chunk_rows, block_topk), dtype=torch.int32, device=q.device
     )
     exact_topk = _use_sm70_qsa_lexicographic_topk(block_topk)
+    compact_batch_topk = (
+        exact_topk
+        and 2 <= rows <= 64
+        and envs.VLLM_SM70_QSA_COMPACT_TOPK
+        and _SM70_QSA_TOPK_LIBRARY is None
+    )
     topk_workspace = (
         None
         if exact_topk
@@ -2010,7 +2017,11 @@ def qsa_select_paged_tokens(
                 "Using exact SM70 QSA lexicographic top-k "
                 "(score descending, block index ascending)."
             )
-            if _SM70_QSA_MTP_TOPK and blocks.shape[0] in (5, 10):
+            if compact_batch_topk:
+                ops.qsa_lexicographic_topk_v154(
+                    logits, visible_blocks, blocks, block_topk, _SM70_QSA_MTP_TOPK
+                )
+            elif _SM70_QSA_MTP_TOPK and blocks.shape[0] in (5, 10):
                 torch.ops._C.qsa_lexicographic_topk(
                     logits, visible_blocks, blocks, block_topk, True
                 )

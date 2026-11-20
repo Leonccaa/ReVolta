@@ -4547,6 +4547,19 @@ def qsa_lexicographic_topk_v154(
     torch.ops._C.qsa_lexicographic_topk_v154(logits, lengths, output, k, decode_batch)
 
 
+if hasattr(torch.ops._C, "qsa_lexicographic_topk_v154"):
+
+    @register_fake("_C::qsa_lexicographic_topk_v154")
+    def _qsa_lexicographic_topk_v154_fake(
+        logits: torch.Tensor,
+        lengths: torch.Tensor,
+        output: torch.Tensor,
+        k: int,
+        decode_batch: bool = False,
+    ) -> None:
+        return None
+
+
 def qwen38_gdn_input_batch_sm70_v154_out(
     qkv: torch.Tensor,
     z: torch.Tensor,

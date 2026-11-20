@@ -35,6 +35,7 @@ def _load_operators():
     ):
         return None
 
+    torch.library.register_fake("vllm_sm70_qsa_indexer::run_batch")(fake)
     batched = getattr(torch.ops.vllm_sm70_qsa_indexer, "run_batched_decode", None)
     if batched is not None:
         torch.library.register_fake("vllm_sm70_qsa_indexer::run_batched_decode")(fake)
@@ -74,7 +75,8 @@ def maybe_shared_key_scores(
         return None
     scores = torch.empty((q.shape[0], columns), dtype=torch.float32, device=q.device)
     visible = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
-    torch.ops.vllm_sm70_qsa_indexer.run(
+    # One request's rows form a contiguous span in the QSA metadata.
+    torch.ops.vllm_sm70_qsa_indexer.run_batch(
         scores,
         visible,
         q,

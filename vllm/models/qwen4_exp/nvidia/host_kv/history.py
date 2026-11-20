@@ -153,7 +153,7 @@ class HostHistoryShape:
     decode_rows: int = 1
     """Maximum verify rows of one request; uniform decode stays one pass."""
     staged_writethrough: bool = False
-    prefill_gather: str = "passes"
+    prefill_gather: str = "union"
     """Mixed steps: ``passes`` (remap passes within R_cap) or ``union``
     (selection-union gather/selection-union gather: one union fill per window of whole
     eight-row groups, a

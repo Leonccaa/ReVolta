@@ -466,14 +466,14 @@ class LongContextKVConfig:
     """Stage eager prefill writes on device and submit merged same-stream D2H
     copies. Decode/capture uses word-vectorized UVA. False retains the legacy
     writer. Byte-preserving and excluded from compile and SSD identities."""
-    prefill_gather: Literal["passes", "union"] = "passes"
-    """Mixed steps with ``main_kv_placement="host"``. ``passes``: remap the
-    selection in query-row passes that fit the hot slots (R_cap rows each).
-    ``union`` (selection-union gather): fill the union of the step's selections into hot
-    slots
-    once per window of whole eight-row groups and run the GPU arm's attention
-    call unchanged on a page-size-4 table, so the result does not depend on
-    the window split. Decode steps are unaffected."""
+    prefill_gather: Literal["passes", "union"] = "union"
+    """Mixed steps with ``main_kv_placement="host"``. ``union`` (default,
+    selection-union gather): fill the union of the step's selections into
+    hot slots once per window of whole eight-row groups and run the GPU arm's
+    attention call unchanged on a page-size-4 table, so the result does not
+    depend on the window split. ``passes``: remap the selection in query-row
+    passes that fit the hot slots (R_cap rows each). Decode steps are
+    unaffected."""
     prefill_insert_age: Literal["old", "recent"] = "old"
     """``union`` only: hot groups that only prefill rows want are inserted
     as old (first evicted) or recent."""

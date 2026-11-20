@@ -16,17 +16,9 @@ from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices, prepare_chunk_offsets
 from .op import exp, exp2
-from .utils import FLA_CHUNK_SIZE, use_cuda_graph
+from .utils import FLA_CHUNK_SIZE, is_sm70, use_cuda_graph
 
 NUM_WARPS = [2, 4, 8, 16]
-
-
-def _is_sm70() -> bool:
-    return (
-        torch.cuda.is_available()
-        and torch.cuda.get_device_capability()[0] == 7
-        and torch.cuda.get_device_capability()[1] == 0
-    )
 
 
 def _parse_int_list(env_name: str, default_vals: list[int]) -> list[int]:
@@ -48,7 +40,7 @@ def _parse_int_list(env_name: str, default_vals: list[int]) -> list[int]:
 
 
 _use_sm70_delta_h_schedule = (
-    os.getenv("VLLM_SM70_GDN_DELTA_H_SCHEDULE", "1") == "1" and _is_sm70()
+    os.getenv("VLLM_SM70_GDN_DELTA_H_SCHEDULE", "1") == "1" and is_sm70()
 )
 _delta_h_configs = (
     [

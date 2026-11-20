@@ -58,6 +58,7 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_update,
     causal_conv1d_update_ddtree,
 )
+from vllm.model_executor.layers.ple_offload_layer import is_offload_process
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
 from vllm.model_executor.layers.quantization.awq_marlin import AWQMarlinConfig
@@ -1763,7 +1764,7 @@ def _resolve_gdn_prefill_backend(
     )
     backend = str(backend_cfg).strip().lower()
 
-    if not current_platform.is_cuda():
+    if is_offload_process() or not current_platform.is_cuda():
         return backend, "triton"
 
     head_k_dim = _get_gdn_head_k_dim(vllm_config)
@@ -2452,7 +2453,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             group_size=None,
             norm_before_gate=True,
             activation=output_gate_type,
-            device=current_platform.current_device(),
+            device=self.dt_bias.device,
         )
 
         self.out_proj = RowParallelLinear(
@@ -2466,6 +2467,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.chunk_gated_delta_rule = ChunkGatedDeltaRule()
         self.gdn_prefill_backend = self.chunk_gated_delta_rule.gdn_prefill_backend
         self._prefill_kernels_warmed_up = False
+        builds_on_accelerator = self.dt_bias.device.type not in ("cpu", "meta")
+        is_sm70 = builds_on_accelerator and current_platform.is_device_capability(70)
         self._sm70_spec_cache_stride = 1
         if vllm_config.speculative_config is not None:
             self._sm70_spec_cache_stride = max(
@@ -2474,7 +2477,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
         self.enable_sm70_gdn_rmsnorm_onepass = (
             _sm70_gdn_rmsnorm_onepass_enabled()
-            and current_platform.is_device_capability(70)
+            and is_sm70
             and self._sm70_spec_cache_stride == 1
             and self.hidden_size in (2560, 5120)
             and self.tp_size == 4
@@ -2483,7 +2486,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and not self.gqa_interleaved_layout
         )
         self.enable_sm70_gdn_qpn8_ba_split = (
-            current_platform.is_device_capability(70)
+            is_sm70
             and self._sm70_spec_cache_stride == 1
             and self.hidden_size in (2560, 5120)
             and self.tp_size == 4
@@ -2515,7 +2518,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             sm70_dflash2_enabled(
                 "fused_gdn_verify", capture_sm70_dflash2_config(vllm_config)
             )
-            and current_platform.is_device_capability(70)
+            and is_sm70
             and _is_dflash2_spec_config(vllm_config)
         )
         self.enable_sm70_dflash2_tp2_gdn_bv2 = bool(
@@ -2527,21 +2530,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             sm70_dflash2_enabled(
                 "fused_gdn_norm", capture_sm70_dflash2_config(vllm_config)
             )
-            and current_platform.is_device_capability(70)
+            and is_sm70
             and _is_dflash2_spec_config(vllm_config)
         )
         self.enable_sm70_dflash2_fused_gdn_split = bool(
             sm70_dflash2_enabled(
                 "fused_gdn_split", capture_sm70_dflash2_config(vllm_config)
             )
-            and current_platform.is_device_capability(70)
+            and is_sm70
             and _is_dflash2_spec_config(vllm_config)
         )
         self.enable_sm70_dflash2_fused_gdn_combined_split = bool(
             sm70_dflash2_enabled(
                 "fused_gdn_combined_split", capture_sm70_dflash2_config(vllm_config)
             )
-            and current_platform.is_device_capability(70)
+            and is_sm70
             and _is_dflash2_spec_config(vllm_config)
         )
         self._sm70_dflash2_combined_split_reason = (
@@ -2566,7 +2569,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
         self.enable_sm70_dflash2_fused_qkv_pack = bool(
             envs.VLLM_SM70_DFLASH2_FUSED_QKV_PACK
-            and current_platform.is_device_capability(70)
+            and is_sm70
             and _is_dflash2_spec_config(vllm_config)
         )
         self.compare_sm70_fused_sigmoid_mixed_qkv = (
@@ -2622,6 +2625,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 self.force_sm70_qwen_gdn_full_forward
                 or (
                     self.auto_sm70_qwen_gdn_full_forward
+                    and builds_on_accelerator
                     and _sm70_current_device_is_volta()
                 )
             )
@@ -2639,7 +2643,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 "SM70 Qwen GDN 0.0.3-style spec recurrent-core route armed."
             )
         self.enable_sm70_legacy_prefill_prep = envs.VLLM_SM70_GDN_LEGACY_PREFILL_PREP
-        if current_platform.is_device_capability(70) and (
+        if is_sm70 and (
             envs.VLLM_SM70_GDN_KKT_SCHEDULE
             or envs.VLLM_SM70_GDN_DELTA_H_SCHEDULE
             or envs.VLLM_SM70_GDN_CHUNK_O_SCHEDULE

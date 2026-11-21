@@ -15,7 +15,7 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.compilation.sm70_decode_graph import is_sm70_decode_graph_compiling
 from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.config.speculative_kv import dflash_draft_cache_dtype
-from vllm.distributed import get_pp_group
+from vllm.distributed import get_pp_group, get_tp_group
 from vllm.distributed.device_communicators.sm70_hc_ll import get_tp_hc_ll
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
@@ -633,6 +633,49 @@ class Qwen4ExpDecoderLayer(nn.Module):
         return self.mlp(block_input)
 
 
+def _prepare_sm70_hcx(config: VllmConfig, layers: Iterable[nn.Module]) -> None:
+    """Pack the target attention seams only, after checkpoint weights load."""
+    ll = get_tp_hc_ll()
+    compilation = config.compilation_config
+    mode = compilation.cudagraph_mode
+    if ll is None or not (
+        mode.separate_routine() and mode.decode_mode() == CUDAGraphMode.FULL
+    ):
+        logger.info_once(
+            "SM70 HCX not prepared: requires admitted NVLink HC LL and a separate "
+            "FULL decode graph."
+        )
+        return
+
+    from .sm70_hcx import Sm70HcxRuntime, pack_down, pack_up
+
+    static = compilation.static_forward_context
+    count = 0
+    for layer in layers:
+        if not (
+            isinstance(layer, Qwen4ExpDecoderLayer) and layer._sm70_hc_ll_attn_partial
+        ):
+            continue
+        module = layer.mlp_hyper_connection
+        name = f"qwen4exp.hcx.attn.{layer.layer_idx}"
+        down = module.input_mix_weight_down_block_inject.weight.detach()
+        up = module.input_mix_weight_up.weight.detach()
+        module.register_buffer("_hcx_down", pack_down(down, ll.rank), persistent=False)
+        module.register_buffer("_hcx_up", pack_up(up, ll.rank), persistent=False)
+        module._sm70_hcx_name = name
+        static[name] = module
+        count += 1
+    if not count:
+        return
+    ll.hcx = Sm70HcxRuntime(get_tp_group().cpu_group, ll.device, ll.rank)
+    config.kernel_config.sm70_hcx_active = True
+    logger.info_once(
+        "SM70 HCX prepared %d attention seams (uniform FULL, M=1..8); "
+        "runtime use requires graph replay.",
+        count,
+    )
+
+
 class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
     """Expose Qwen4Exp routed experts through vLLM's EPLB protocol."""
 
@@ -1040,6 +1083,8 @@ class Qwen4ExpModel(nn.Module, EagleModelMixin):
             weights,
             mapper=self.hf_to_vllm_mapper,
         )
+        if self.vllm_config.kernel_config.sm70_hcx:
+            _prepare_sm70_hcx(self.vllm_config, self.layers)
         return loaded
 
 

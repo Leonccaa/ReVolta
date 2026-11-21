@@ -27,8 +27,11 @@ from typing import NamedTuple
 import torch
 from torch import nn
 
+from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
+from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.distributed.device_communicators.sm70_hc_ll import MAX_ROWS, get_tp_hc_ll
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
@@ -51,6 +54,8 @@ from .ops.hc import (
     hc_silu,
 )
 from .sm70_fp16_hc import maybe_apply_qwen38_sm70_fp16_fused_hc
+from .sm70_hcx import HD, INJ
+from .sm70_hcx import MAX_ROWS as HCX_MAX_ROWS
 
 
 class HCTensorParallelPartial(NamedTuple):
@@ -95,6 +100,54 @@ direct_register_custom_op(
 )
 
 
+def _hc_hcx_combine_and_mix(
+    partial: torch.Tensor,
+    residual: torch.Tensor,
+    injection: torch.Tensor,
+    name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ctx = get_forward_context()
+    module = ctx.no_compile_layers[name]
+    norm = module.hc_norm.weight
+    eps = module.config.rms_norm_eps
+    ll = get_tp_hc_ll()
+    runtime = ll.hcx if ll is not None else None
+    if (
+        runtime is not None
+        and ctx.is_uniform_decode
+        and ctx.cudagraph_runtime_mode == CUDAGraphMode.NONE
+        and 1 <= residual.shape[0] <= HCX_MAX_ROWS
+        # MRV2 uses CUDAGraphMode.NONE inside both eager warmup and the actual
+        # capture. Leave the eager runs on HC LL: the peer kernel is first
+        # executed only at coordinated graph replay, not during rank-local JIT.
+        and torch.cuda.is_current_stream_capturing()
+    ):
+        return runtime.run(
+            partial, residual, injection, norm, eps, module._hcx_down, module._hcx_up
+        )
+    # The partial is still unreduced at all M. Preserve both baseline stages,
+    # including explicit TP AR when HC LL declines (e.g. M > 64).
+    hidden, xn = _hc_ll_combine_norm(partial, residual, injection, norm, eps, 4)
+    block, inject = module._project(xn)
+    assert inject is not None
+    return hidden.contiguous(), block.contiguous(), inject.contiguous()
+
+
+def _hc_hcx_combine_and_mix_fake(partial, residual, injection, name):
+    return (
+        torch.empty_like(residual, memory_format=torch.contiguous_format),
+        partial.new_empty((residual.shape[0], HD)),
+        injection.new_empty((residual.shape[0], INJ)),
+    )
+
+
+direct_register_custom_op(
+    op_name="qwen4exp_sm70_hcx_combine_and_mix",
+    op_func=_hc_hcx_combine_and_mix,
+    fake_impl=_hc_hcx_combine_and_mix_fake,
+)
+
+
 # ---------------------------------------------------------------------------
 # Gated-residual variant
 # ---------------------------------------------------------------------------
@@ -112,6 +165,8 @@ class GatedResidual(nn.Module):
     GEMM dispatch (e.g. the low-latency skinny GEMM) applies through the
     standard quant_method mechanism.
     """
+
+    _sm70_hcx_name: str | None = None
 
     def __init__(
         self,
@@ -239,6 +294,15 @@ class GatedResidual(nn.Module):
         module's input RMSNorm.
         """
         if isinstance(prev_block_output, HCTensorParallelPartial):
+            hcx_name = self._sm70_hcx_name
+            if (
+                hcx_name is not None
+                and use_sm70_decode_graph_semantics()
+                and is_forward_context_available()
+            ):
+                return torch.ops.vllm.qwen4exp_sm70_hcx_combine_and_mix(
+                    prev_block_output.value, hidden_states, prev_injection, hcx_name
+                )
             hidden_states, xn = torch.ops.vllm.qwen4exp_sm70_hc_ll_combine_norm(
                 prev_block_output.value,
                 hidden_states,

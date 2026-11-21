@@ -714,6 +714,13 @@ class KernelConfig:
     sm70_hc_ll_async: bool = False
     """Allow the usual SM70 NVLink HC LL admission under async scheduling."""
 
+    sm70_hcx: bool = False
+    """Try local-schedule HCX at Flash-Next attention-to-MLP boundaries in
+    uniform decode graphs of at most eight rows. Requires admitted NVLink HC LL
+    and resident FP16 HC weights. This is a non-bitwise research path."""
+    sm70_hcx_active: bool = Field(default=False, init=False)
+    """HCX operator/weight preparation changed the target compiler graph."""
+
     ple_result_transport: Literal["auto", "cuda", "mapped"] = "auto"
     """Select CPU PLE result transport by local operator/resource capability."""
     ple_result_transports: dict[str, Any] = Field(
@@ -774,6 +781,9 @@ class KernelConfig:
             ignored_factors.add("sm70_dflash2_fp16_m8")
         if not self.sm70_nvlink_hc_active:
             ignored_factors.add("sm70_nvlink_hc_active")
+        ignored_factors.add("sm70_hcx")  # Only resolved preparation changes the graph.
+        if not self.sm70_hcx_active:
+            ignored_factors.add("sm70_hcx_active")
         if not self.fused_fp16_aux_gemv_applicable:
             ignored_factors.add("fused_fp16_aux_gemv")
         if not self.qsa_auto_e4m3_active:

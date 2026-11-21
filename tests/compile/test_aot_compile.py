@@ -12,7 +12,9 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
+import vllm
 import vllm.envs as envs
+from vllm.compilation import caching, decorators
 from vllm.compilation.backends import VllmBackend
 from vllm.compilation.caching import (
     StandaloneCompiledArtifacts,
@@ -90,6 +92,95 @@ def make_vllm_config() -> VllmConfig:
 def use_vllm_config(vllm_config: VllmConfig):
     with set_forward_context({}, vllm_config), set_current_vllm_config(vllm_config):
         yield
+
+
+@pytest.mark.parametrize(
+    "profile",
+    [
+        pytest.param({}, id="F1"),
+        pytest.param({"kv": "host"}, id="F2"),
+        pytest.param({"speculation": "mtp", "dtype": "auto"}, id="F3"),
+        pytest.param({"speculation": "mtp", "dtype": "auto", "kv": "host"}, id="F4"),
+        pytest.param({"dtype": "fp8_per_token_head"}, id="F5-fp8"),
+        pytest.param({"dtype": "int8"}, id="F5-int8-planar"),
+        pytest.param({"speculation": "mtp", "quantization": "nvfp4"}, id="F6-mtp"),
+        pytest.param({"quantization": "nvfp4"}, id="F6-dflash"),
+        pytest.param({"speculation": "mtp", "async_scheduling": True}, id="F7"),
+        pytest.param({"input": "image"}, id="F8"),
+        pytest.param({"link": "nvlink"}, id="F9"),
+        pytest.param(
+            {"model": "hy4", "speculation": "none", "dtype": "fp8_ds_mla"}, id="F10"
+        ),
+    ],
+)
+def test_compile_cache_paths_follow_installed_python(
+    monkeypatch: pytest.MonkeyPatch,
+    vllm_tmp_cache: Path,
+    profile: dict[str, object],
+) -> None:
+    # Exercise both real cache lookups. Stub the deployment-specific state and
+    # stop at the cache boundary, before loading models or compiling any graph.
+    monkeypatch.setattr(vllm, "__version__", "0.2.0rc15")
+    monkeypatch.setattr(envs, "VLLM_USE_AOT_COMPILE", True)
+    monkeypatch.setattr(envs, "VLLM_USE_MEGA_AOT_ARTIFACT", False)
+    monkeypatch.setattr(envs, "VLLM_DISABLE_COMPILE_CACHE", False)
+    monkeypatch.setattr(envs, "VLLM_CACHE_ROOT", str(vllm_tmp_cache / "vllm_cache"))
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(vllm_tmp_cache))
+    load = Mock(return_value=lambda module, x: x)
+    monkeypatch.setattr(decorators, "_try_load_aot_compiled_fn", load)
+
+    class CachePathObserved(Exception):
+        pass
+
+    def cache_paths(installation: str, schema: str) -> tuple[str, str, str]:
+        package = vllm_tmp_cache / installation / "vllm"
+        registration = package / "ops" / "registry.py"
+        registration.parent.mkdir(parents=True, exist_ok=True)
+        registration.write_text(f"SCHEMA = {schema!r}\n")
+        monkeypatch.setattr(
+            caching, "__file__", str(package / "compilation/caching.py")
+        )
+
+        config = make_vllm_config()
+        config.additional_config = (
+            dict(
+                model="flash-next",
+                speculation="dflash",
+                kv="gpu",
+                dtype="fp8_e4m3",
+                quantization="awq",
+                link="pcie",
+                async_scheduling=False,
+                input="text",
+            )
+            | profile
+        )
+        x = torch.ones(1)
+        with use_vllm_config(config):
+            assert CompiledMod(vllm_config=config)(x) is x
+        aot_path = load.call_args.args[1]
+        inductor_path = os.environ["TORCHINDUCTOR_CACHE_DIR"]
+
+        backend = VllmBackend(config)
+        monkeypatch.setattr(backend, "_log_compilation_config", lambda: None)
+        initialize = Mock(side_effect=CachePathObserved)
+        monkeypatch.setattr(backend.compiler_manager, "initialize_cache", initialize)
+        with pytest.raises(CachePathObserved):
+            backend(torch.fx.symbolic_trace(torch.nn.Identity()), [])
+        backend_path = initialize.call_args.args[0]
+        return aot_path, inductor_path, backend_path
+
+    old = cache_paths("old", "hc(a,b,c,d,e,f,g)")
+    assert old == cache_paths("old", "hc(a,b,c,d,e,f,g)")
+    assert old == cache_paths("same-source", "hc(a,b,c,d,e,f,g)")
+    new = cache_paths("new", "hc(a,b,c,d,e,f,g,h)")
+    layers = ("AOT artifact", "AOT Inductor", "vLLM backend")
+    changed = tuple(
+        layer
+        for layer, before, after in zip(layers, old, new, strict=True)
+        if before != after
+    )
+    assert changed == layers
 
 
 @pytest.mark.skipif(not is_torch_equal_or_newer("2.10.0"), reason="requires torch 2.10")

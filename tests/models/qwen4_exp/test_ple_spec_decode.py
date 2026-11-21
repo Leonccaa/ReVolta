@@ -323,5 +323,8 @@ def test_mrv2_gate_norm_native_buffers(monkeypatch):
     with step.context(step.metadata([4] * 4, [1] * 4)):
         gated, normed = torch.ops.vllm.qwen4_exp_ple_gate_norm(*args, "ple")
     assert calls == [1]
-    for actual, expected in zip((gated, normed), step.layer._gate_norm(*args)):
+    reference_gated, reference_normed = step.layer._gate_norm(*args)
+    for actual, expected in zip(
+        (gated, normed), (reference_gated.flatten(-2), reference_normed)
+    ):
         torch.testing.assert_close(actual, expected, rtol=5e-3, atol=5e-3)

@@ -3020,7 +3020,10 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         gate = torch.sigmoid(gate.sign() * gate.abs().clamp_min(1e-6).sqrt())
         gated_value = gate * value.unsqueeze(-2)
         normalized = self._apply_norm(self.norm_conv, gated_value).flatten(-2)
-        return gated_value.flatten(-2), normalized
+        # Return the [tokens, streams, hidden] product unflattened. The caller
+        # flattens it in the final sum, after the short-conv split, which keeps
+        # the compiled default graph and its FP16 results as before.
+        return gated_value, normalized
 
     def forward(
         self,
@@ -3064,6 +3067,8 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             conv_output,
             self.prefix,
         )
+        if gated_value.ndim == 3:
+            gated_value = gated_value.flatten(-2)
         return gated_value + conv_output
 
 
@@ -3116,7 +3121,7 @@ def qwen4_exp_ple_gate_norm(
         )
         return gated_value, normalized
     gated_value, normalized = layer._gate_norm(hidden_states, key, value)
-    return gated_value.contiguous(), normalized.contiguous()
+    return gated_value.flatten(-2).contiguous(), normalized.contiguous()
 
 
 def qwen4_exp_ple_gate_norm_fake(

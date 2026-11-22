@@ -728,9 +728,9 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         )
         if (
             grouped_rows == 0
-            and getattr(layer, "sm70_qsa_paged_fp16_h12", False)
-            and 0 < query.shape[0] <= H12_MAX_ROWS
-            and 0 < local_width <= H12_MAX_WIDTH
+            and layer.sm70_qsa_paged_fp16_h12
+            and query.shape[0] <= H12_MAX_ROWS
+            and local_width <= H12_MAX_WIDTH
             and get_forward_context().is_uniform_decode
         ):
             qsa_paged_fp16_h12(
@@ -1142,7 +1142,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 self.cp_kv_cache_interleave_size,
                 self.dcp_local_indices_buffer.shape[1],
             )
-            if 0 < width <= H12_MAX_WIDTH:
+            if width <= H12_MAX_WIDTH:
                 qsa_paged_fp16_h12_workspace(min(partial.shape[0], H12_MAX_ROWS), width)
         if getattr(self.impl, "dcp_combine", None) is not dcp_a2a_lse_reduce:
             return

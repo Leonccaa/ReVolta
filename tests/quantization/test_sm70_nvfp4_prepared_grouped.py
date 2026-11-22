@@ -118,21 +118,15 @@ def test_apply_prepared_grouped(method, monkeypatch, tp, m, q, split, legacy):
     assert out is b[0] and out.shape == x.shape
 
 
-@pytest.mark.parametrize(
-    "reason", ["flag", "native", "raw", "limit", "ep", "ubatch", "shape"]
-)
+@pytest.mark.parametrize("reason", ["flag", "raw", "limit", "ubatch", "shape"])
 def test_loader_rejects_v154(method, monkeypatch, reason):
     layer = make_layer(1)
     if reason == "flag":
         monkeypatch.setenv("VLLM_SM70_NVFP4_MOE_GROUPED_DECODE", "0")
-    elif reason == "native":
-        monkeypatch.setattr(ops, "has_nvfp4_grouped_decode_sm70_v154", lambda: False)
     elif reason == "raw":
         layer.sm70_nvfp4_qwen38_raw_scale = True
     elif reason == "limit":
         layer.swiglu_limit = 7.0
-    elif reason == "ep":
-        layer.moe_config.moe_parallel_config.use_ep = True
     elif reason == "ubatch":
         monkeypatch.setattr(
             moe,

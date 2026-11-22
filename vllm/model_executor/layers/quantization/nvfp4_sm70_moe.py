@@ -380,7 +380,6 @@ def _use_grouped_decode_v154(
         and topk_ids.dtype == torch.int32
         and topk_ids.is_contiguous()
         and topk_weights.is_contiguous()
-        and x.device == topk_ids.device == topk_weights.device
         and is_forward_context_available()
         and get_forward_context().additional_kwargs.get("sm70_nvfp4_decode_only")
     )
@@ -1367,9 +1366,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             and tp_size in _SUPPORTED_TP_SIZES
             and not raw_scale
             and layer.swiglu_limit is None
-            and not layer.moe_config.moe_parallel_config.use_ep
             and (config is None or not config.parallel_config.use_ubatching)
-            and ops.has_nvfp4_grouped_decode_sm70_v154()
         )
         if grouped_requested or grouped_mtp5 or layer.sm70_nvfp4_grouped_decode_v154:
             device = layer.w13_tm_weight.device

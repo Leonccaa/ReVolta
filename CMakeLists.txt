@@ -422,8 +422,6 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/dflash2_fp16_m8_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/gdn_verify_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/hc_ll_shard_sm70.cu"
-      "${VLLM_SM70_TURBOMIND_ROOT}/ops/mtp_local_top1_sm70.cu"
-      "${VLLM_SM70_TURBOMIND_ROOT}/ops/mtp_q8_moe_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/top1x_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/qwen38_gdn_input_batch_sm70_v154.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/qwen38_ple_spec_sm70_v154.cu"

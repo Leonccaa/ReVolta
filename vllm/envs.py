@@ -386,6 +386,7 @@ if TYPE_CHECKING:
     VLLM_SM70_MTP_ROUTER_TOP16: bool = True
     VLLM_SM70_MTP_ROUTER_BATCH: bool = True
     VLLM_SM70_MTP_SHARED_BATCH: bool = True
+    VLLM_SM70_MTP_Q8_PREFILL_MMQ: bool = False
     VLLM_SM70_MTP_PLE_CONV: bool = True
     VLLM_SM70_QWEN38_FUSED_HC_FP16: bool = False
     VLLM_SM70_QWEN38_BATCH_FASTPATH: bool = True
@@ -5148,6 +5149,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         automatic_conditions=(),
         acceleration_paths=("MTP verifier", "Flash-Next qualified batch"),
+        user_visible=True,
+    ),
+    "VLLM_SM70_MTP_Q8_PREFILL_MMQ": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_Q8_PREFILL_MMQ", "0"))),
+        description="Use grouped GGUF MMQ for Q8_0 MTP prefill above 64 rows.",
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("Flash-Next MTP draft",),
         user_visible=True,
     ),
     # Fuse the MTP4 PLE rollback, depthwise convolution, SiLU and state commit.
@@ -20371,6 +20382,8 @@ def compile_factors(speculative_config: Any = None) -> dict[str, object]:
         # moe_forward_shared custom op at run time, so the traced graph does not
         # depend on it, and registering it must not recompile any deployment.
         "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_DFLASH_MAX_TOKENS",
+        # The Q8 MTP expert route is selected inside the opaque MoE op.
+        "VLLM_SM70_MTP_Q8_PREFILL_MMQ",
         # QSA scorer route for multi-request batches. It is chosen inside the
         # qwen4_exp_qsa_with_output custom op at run time, so the traced graph
         # does not depend on it, and registering it must not recompile any

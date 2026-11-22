@@ -182,9 +182,23 @@ def test_expert_format_selection_and_compile_identity(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "rows,expected", [(0, []), (33, [33]), (64, [64]), (65, [64, 1])]
+    "mmq,rows,expected",
+    [
+        (False, 0, []),
+        (False, 33, [33]),
+        (False, 64, [64]),
+        (False, 65, [64, 1]),
+        (True, 64, [64]),
+        (True, 65, [65]),
+        (True, 2048, [2048]),
+        (True, 2049, [2048, 1]),
+    ],
 )
-def test_dispatch_boundary_and_workspace(monkeypatch, rows, expected):
+def test_dispatch_boundary_and_workspace(monkeypatch, mmq, rows, expected):
+    if mmq:
+        monkeypatch.setenv("VLLM_SM70_MTP_Q8_PREFILL_MMQ", "1")
+    else:
+        monkeypatch.delenv("VLLM_SM70_MTP_Q8_PREFILL_MMQ", raising=False)
     layer, method = make_layer(rank=0, tp=4)
     workspace = WorkspaceManager(torch.device("cpu"))
     monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
@@ -223,10 +237,12 @@ def test_dispatch_boundary_and_workspace(monkeypatch, rows, expected):
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0),
     reason="Requires SM70 native operators",
 )
-def test_q8_method_cuda_graph_replays_high_expert_ids(monkeypatch):
+@pytest.mark.parametrize("mmq", [False, True])
+def test_q8_method_cuda_graph_replays_high_expert_ids(monkeypatch, mmq):
     from vllm.model_executor.layers.quantization.gguf import fused_moe_gguf
 
     workspace = WorkspaceManager(torch.device("cuda"))
+    monkeypatch.setenv("VLLM_SM70_MTP_Q8_PREFILL_MMQ", str(int(mmq)))
     monkeypatch.setattr(q8, "current_workspace_manager", lambda: workspace)
     torch.manual_seed(8)
     with torch.device("cuda"):
@@ -273,7 +289,53 @@ def test_q8_method_cuda_graph_replays_high_expert_ids(monkeypatch):
                 ]
             )
             assert ref.float().norm() > 0
-            if rows > 64:
+            if rows > 64 and not mmq:
                 torch.testing.assert_close(actual, ref, rtol=0, atol=0)
             else:
                 assert (actual.float() - ref.float()).norm() / ref.float().norm() < 2e-3
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_gguf_q8_moe_reads_last_expert_partial_k_tile():
+    from vllm.model_executor.layers.quantization.gguf import (
+        GGUFConfig,
+        GGUFMoEMethod,
+        fused_moe_gguf,
+    )
+
+    torch.manual_seed(17)
+    with torch.device("cuda"):
+        layer, _ = make_layer(rank=0, tp=4, experts=512, hidden=160)
+        experts = torch.tensor([255, 256, 511], dtype=torch.int32)
+        for bank in (layer.w13_weight, layer.w2_weight):
+            selected = torch.randn(3, bank.shape[1], 160, dtype=torch.half) * 0.2
+            bank[experts.long()] = q8.quantize_q8_0(selected)
+            assert bank.untyped_storage().nbytes() == bank.numel()
+        regular = SimpleNamespace(
+            w13_qweight=layer.w13_weight,
+            w2_qweight=layer.w2_weight,
+            w13_qweight_type=SimpleNamespace(weight_type=8),
+            w2_qweight_type=SimpleNamespace(weight_type=8),
+            apply_router_weight_on_input=False,
+            activation=MoEActivation.SILU,
+        )
+        x = torch.randn(65, 160, dtype=torch.half) * 0.2
+        ids = experts.repeat(22)[-65:, None].contiguous()
+        weights = torch.ones_like(ids, dtype=torch.float32)
+        method = GGUFMoEMethod(GGUFConfig(), layer.moe_config)
+        output = method.apply(regular, x, weights, ids, None, None)
+        reference = torch.cat(
+            [
+                fused_moe_gguf(t, layer.w13_weight, layer.w2_weight, w, i, 8, 8, "silu")
+                for t, w, i in zip(
+                    x.split(64), weights.split(64), ids.split(64), strict=True
+                )
+            ]
+        )
+        assert ids[-1].item() == 511
+        for expert in experts:
+            actual = output[ids[:, 0] == expert].float()
+            expected = reference[ids[:, 0] == expert].float()
+            assert (actual - expected).norm() < expected.norm() * 2e-3
+        torch.testing.assert_close(output[-1], reference[-1], rtol=0.02, atol=4e-4)

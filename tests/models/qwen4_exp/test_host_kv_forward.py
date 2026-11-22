@@ -86,7 +86,8 @@ def _cpu_kernels(monkeypatch):
 
     group = SimpleNamespace(
         # A fixed "remote rank": the other half of the heads, deterministic.
-        all_gather=lambda q, dim: torch.cat([q, (q * 0.5).flip(0)], dim=dim)
+        all_gather=lambda q, dim: torch.cat([q, (q * 0.5).flip(0)], dim=dim),
+        device_communicator=SimpleNamespace(sm70_dcp2=None),
     )
     monkeypatch.setattr(ops, "qsa_sparse_paged_attention", sparse)
     monkeypatch.setattr(
@@ -153,6 +154,8 @@ class Arms:
             dcp_partial_output_buffer=torch.empty((tokens, gathered_heads, dim)),
             dcp_partial_lse_buffer=torch.empty((tokens, gathered_heads)),
             indexer=SimpleNamespace(token_topk=topk, compress_ratio=4),
+            sm70_qsa_paged_fp16_h12=False,
+            sm70_qsa_device_history=False,
         )
         self.blocks = {0: [1, 5, 9], 1: [3, 7, 11]}
         self.length = {0: 0, 1: 0}

@@ -160,7 +160,10 @@ def _rank_forward(inputs, rank, monkeypatch, interleave):
     impl.sliding_window = (-1, -1)
     impl.dcp_world_size, impl.dcp_rank = 2, rank
     impl.dcp_combine = lambda out, lse, group, is_lse_base_on_e: out[:, :6]
-    group = SimpleNamespace(all_gather=lambda query, dim: q)
+    group = SimpleNamespace(
+        all_gather=lambda query, dim: q,
+        device_communicator=SimpleNamespace(sm70_dcp2=None),
+    )
     monkeypatch.setattr(vllm.distributed, "get_dcp_group", lambda: group)
     metadata = SimpleNamespace(num_actual_tokens=q.shape[0], block_table=table)
     cfg = VllmConfig()

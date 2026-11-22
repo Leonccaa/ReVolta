@@ -72,6 +72,16 @@ NOTES: dict[str, dict[str, str]] = {
         "FP16 results.",
         metrics="",
     ),
+    "VLLM_1CAT_ADAPTIVE_MTP": dict(
+        section="deployment",
+        since="0.2.0rc15",
+        range="off/0/false/no, on/1/true/yes, auto",
+        tradeoff="Opt in to adaptive depth for synchronous Flash-Next MRv2 "
+        "MTP with a dynamic speculative decoding schedule. Explicit auto "
+        "also requires SM70 and a configured maximum depth of at least five. "
+        "Single-request decode may trade fewer draft steps for more target steps.",
+        metrics="",
+    ),
     "VLLM_SM70_IDLE_CLOCK_SECONDS": dict(
         section="deployment",
         since="0.2.0rc14",

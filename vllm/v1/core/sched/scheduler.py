@@ -71,6 +71,10 @@ from vllm.v1.metrics.store import CPU_SAMPLE_STRIDE, StoreMetrics
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.ddtree_payload import DDTreeDraftPayload
+from vllm.v1.spec_decode.dynamic.adaptive_mtp import (
+    MIN_ADAPTIVE_MTP_DEPTH,
+    AdaptiveMTPDepth,
+)
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
@@ -311,6 +315,12 @@ class Scheduler(SchedulerInterface):
             and self.cache_config.enable_prefix_caching
             else None
         )
+        self._adaptive_mtp_cap = (
+            self.dynamic_sd_lookup[1]
+            if self.dynamic_sd_lookup is not None and vllm_config.adaptive_mtp_enabled
+            else 0
+        )
+        self._adaptive_mtp_depths: dict[str, AdaptiveMTPDepth] = {}
         # Last running total of rejection fallbacks seen from the workers.
         self._rejection_fallbacks_total = 0
         self.num_lookahead_tokens = vllm_config.num_lookahead_tokens
@@ -1779,6 +1789,14 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
                 len(num_scheduled_tokens)
             ]
+        if self._adaptive_mtp_depths and len(num_scheduled_tokens) == 1:
+            req_id = next(iter(num_scheduled_tokens))
+            depth = self._adaptive_mtp_depths.get(req_id)
+            if req_id in resident_tokens and depth is not None:
+                # The current target inputs already contain the previous proposal.
+                num_spec_tokens_to_schedule = min(
+                    num_spec_tokens_to_schedule, depth.depth
+                )
         if self.exact_end_draft_threshold is not None:
             # Only now is the DSD width for the final batch known.
             next_threshold = min(
@@ -2870,6 +2888,24 @@ class Scheduler(SchedulerInterface):
 
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
+            elif (
+                self._adaptive_mtp_cap > MIN_ADAPTIVE_MTP_DEPTH
+                and scheduled_spec_token_ids
+                and new_token_ids
+                and not (scheduler_output.num_invalid_spec_tokens or {}).get(req_id)
+                # Widths at the output boundary can be clipped by exact-end.
+                and len(scheduled_spec_token_ids)
+                < request.max_tokens - num_output_tokens_before - 1
+            ):
+                depth = self._adaptive_mtp_depths.get(req_id)
+                if depth is None:
+                    depth = AdaptiveMTPDepth(self._adaptive_mtp_cap)
+                    self._adaptive_mtp_depths[req_id] = depth
+                depth.observe(
+                    len(scheduled_spec_token_ids),
+                    len(new_token_ids) - 1,
+                    self._adaptive_mtp_cap,
+                )
 
             # Extract sample logprobs if needed.
             if (
@@ -3038,6 +3074,7 @@ class Scheduler(SchedulerInterface):
         sampled token (which the next input chunk discards), and the outputs
         of the in-flight steps are dropped when they return.
         """
+        self._adaptive_mtp_depths.pop(request.request_id, None)
         request.num_stale_in_flight_tokens = request.num_in_flight_tokens
         request.num_output_placeholders = 0
         request.spec_token_ids = []
@@ -3424,6 +3461,7 @@ class Scheduler(SchedulerInterface):
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
+        self._adaptive_mtp_depths.pop(request_id, None)
         if getattr(self, "host_kv_ssd", None) is not None:
             self.host_kv_ssd.cancel(request_id)
         self.finished_req_ids.add(request_id)

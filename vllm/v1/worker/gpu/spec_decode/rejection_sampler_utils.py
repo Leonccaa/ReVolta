@@ -1139,6 +1139,143 @@ def dflash2_sparse_topk_rejection_sample(
     return sampled, num_sampled
 
 
+@triton.jit
+def _greedy_draft_sparse_topk_rejection_kernel(
+    sampled_ptr,
+    sampled_stride,
+    num_sampled_ptr,
+    target_ids_ptr,
+    target_logits_ptr,
+    target_stride,
+    draft_sampled_ptr,
+    cu_num_logits_ptr,
+    idx_mapping_ptr,
+    top_p_ptr,
+    seed_ptr,
+    pos_ptr,
+    STEPS: tl.constexpr,
+    TOP_K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    USE_FP64: tl.constexpr,
+):
+    req = tl.program_id(0)
+    slot = tl.load(idx_mapping_ptr + req)
+    start = tl.load(cu_num_logits_ptr + req)
+    end = tl.load(cu_num_logits_ptr + req + 1)
+    top_p = tl.load(top_p_ptr + slot)
+    seed = tl.load(seed_ptr + slot)
+    accepted = tl.full((), True, tl.int1)
+    count = tl.full((), 0, tl.int32)
+    for step in range(STEPS):
+        if accepted and start + step < end - 1:
+            row = start + step
+            ids, logits, keep, _ = _dflash2_compact_target_row(
+                target_ids_ptr,
+                target_logits_ptr,
+                target_stride,
+                row,
+                top_p,
+                TOP_K=TOP_K,
+                BLOCK_K=BLOCK_K,
+                LIMIT_K=TOP_K,
+            )
+            proposed = tl.load(draft_sampled_ptr + row + 1)
+            proposed_logit = tl.max(
+                tl.where(keep & (ids == proposed), logits, float("-inf")), axis=0
+            )
+            # Same stable log(p) formula as dense, without log(q) for q=1.
+            row_max, sum_excl = _compute_block_max_and_sumexp_excl(logits, BLOCK_K)
+            log_p = _log_softmax(proposed_logit, row_max, tldevice.log1p(sum_excl))
+            pos = tl.load(pos_ptr + row)
+            uniform = tl_rand32(seed, pos, includes_zero=False)
+            accepted = log_p > tl.log(uniform)
+            tl.store(sampled_ptr + req * sampled_stride + step, proposed)
+            count += accepted.to(tl.int32)
+
+    row = start + count
+    ids, logits, _, _ = _dflash2_compact_target_row(
+        target_ids_ptr,
+        target_logits_ptr,
+        target_stride,
+        row,
+        top_p,
+        TOP_K=TOP_K,
+        BLOCK_K=BLOCK_K,
+        LIMIT_K=TOP_K,
+    )
+    if row < end - 1:
+        # Residual for a one-hot draft: remove the rejected token, but keep
+        # the original (not normalized) target scores, as in dense.
+        proposed = tl.load(draft_sampled_ptr + row + 1)
+        logits = tl.where(ids == proposed, float("-inf"), logits)
+    # Dense argmax resolves equal noised scores by the lowest token ID.
+    # Nucleus selection above used score order; restore ID order only here.
+    offsets = tl.arange(0, BLOCK_K)
+    order = tl.sort(ids.to(tl.int32) * BLOCK_K + offsets, descending=False) % BLOCK_K
+    ids = tl.gather(ids, order, axis=0)
+    logits = tl.gather(logits, order, axis=0)
+    pos = tl.load(pos_ptr + row)
+    _, selected = gumbel_noised_argmax(
+        logits,
+        ids,
+        logits > float("-inf"),
+        seed,
+        pos,
+        1.0,
+        IS_DRAFTING=False,
+        USE_FP64=USE_FP64,
+        APPLY_TEMPERATURE=False,
+    )
+    token = tl.sum(tl.where(offsets == selected, ids, 0), axis=0)
+    tl.store(sampled_ptr + req * sampled_stride + count, token)
+    tl.store(num_sampled_ptr + req, count + 1)
+
+
+def greedy_draft_sparse_topk_rejection_sample(
+    target_topk_ids: torch.Tensor,
+    target_topk_logits: torch.Tensor,
+    draft_sampled: torch.Tensor,
+    cu_num_logits: torch.Tensor,
+    pos: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    top_p: torch.Tensor,
+    seed: torch.Tensor,
+    num_speculative_steps: int,
+    use_fp64: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample a guarded exact-k, FP32 T=1 shortlist with score/ID tie order.
+
+    The caller supplies the retained prefix of contiguous, equally strided
+    ID/score rows from the sorted probe, and original verifier rows/slots.
+    """
+    num_reqs = cu_num_logits.shape[0] - 1
+    top_k = target_topk_ids.shape[1]
+    sampled = draft_sampled.new_empty(
+        num_reqs, num_speculative_steps + 1, dtype=torch.int64
+    )
+    num_sampled = sampled.new_empty(num_reqs, dtype=torch.int32)
+    _greedy_draft_sparse_topk_rejection_kernel[(num_reqs,)](
+        sampled,
+        sampled.stride(0),
+        num_sampled,
+        target_topk_ids,
+        target_topk_logits,
+        target_topk_ids.stride(0),
+        draft_sampled,
+        cu_num_logits,
+        idx_mapping,
+        top_p,
+        seed,
+        pos,
+        STEPS=num_speculative_steps,
+        TOP_K=top_k,
+        BLOCK_K=triton.next_power_of_2(top_k),
+        USE_FP64=use_fp64,
+        num_warps=1,
+    )
+    return sampled, num_sampled
+
+
 def rejection_sample(
     # [num_logits, V]
     target_logits: torch.Tensor,

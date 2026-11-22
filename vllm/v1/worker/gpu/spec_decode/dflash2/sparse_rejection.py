@@ -94,6 +94,8 @@ def _compact_target_reference_rows_gpu(
     probe: torch.Tensor,
     top_ps: torch.Tensor,
     row_to_request: torch.Tensor,
+    *,
+    strict_top_k: bool = False,
 ) -> np.ndarray:
     """Check FP32 temperature-scaled probes using the request-slot mapping."""
     rows, width = probe.shape
@@ -109,6 +111,10 @@ def _compact_target_reference_rows_gpu(
         triton.next_power_of_2(width),
         num_warps=1,
     )
+    if strict_top_k:
+        # The dense combined filter can let a tie spanning the k cutoff back
+        # in during its final top-p mask, even if all ties fit in the probe.
+        result |= probe[:, _TARGET_TOP_K] == probe[:, _TARGET_TOP_K - 1]
     return result.cpu().numpy()
 
 
@@ -180,7 +186,7 @@ def _sample_reference_requests(
     reference_reqs: np.ndarray,
     input_batch: InputBatch,
     rejection_sampler: RejectionSampler,
-    draft_logits: torch.Tensor,
+    draft_logits: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run the unchanged dense contract for whole ambiguous requests.
 

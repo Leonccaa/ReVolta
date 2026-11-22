@@ -714,6 +714,17 @@ class KernelConfig:
     sm70_hc_ll_async: bool = False
     """Allow the usual SM70 NVLink HC LL admission under async scheduling."""
 
+    sm70_hcx: bool = False
+    """Use local-schedule HCX at Flash-Next attention-to-MLP and MoE-to-next-
+    attention HyperConnection boundaries in uniform decode graphs of at most
+    eight rows. Requires admitted NVLink HC LL. Changes FP16 rounding."""
+    sm70_top1x: bool = False
+    """Exchange TP4 greedy top-1 candidates over the admitted NVLink HC LL peers
+    in two hops instead of an all-gather (1CatAI v1.5.4). Selects the same token
+    as the all-gather for finite logits."""
+    sm70_hcx_active: bool = Field(default=False, init=False)
+    """HCX operator/weight preparation changed the target compiler graph."""
+
     ple_result_transport: Literal["auto", "cuda", "mapped"] = "auto"
     """Select CPU PLE result transport by local operator/resource capability."""
     ple_result_transports: dict[str, Any] = Field(
@@ -763,6 +774,7 @@ class KernelConfig:
             "qsa_auto_e4m3_reason",
             # Sampler-only switches; they do not change the compiled model.
             "sm70_greedy_verify",
+            "sm70_top1x",
             "sm70_sparse_target_sampling",
             "sm70_hc_ll_async",  # Compiled model uses sm70_nvlink_hc_active.
             # Scheduler-only prefix-hit check; no compiled graph changes.
@@ -774,6 +786,9 @@ class KernelConfig:
             ignored_factors.add("sm70_dflash2_fp16_m8")
         if not self.sm70_nvlink_hc_active:
             ignored_factors.add("sm70_nvlink_hc_active")
+        ignored_factors.add("sm70_hcx")  # Only resolved preparation changes the graph.
+        if not self.sm70_hcx_active:
+            ignored_factors.add("sm70_hcx_active")
         if not self.fused_fp16_aux_gemv_applicable:
             ignored_factors.add("fused_fp16_aux_gemv")
         if not self.qsa_auto_e4m3_active:

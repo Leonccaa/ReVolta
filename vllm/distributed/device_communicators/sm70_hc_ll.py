@@ -3,6 +3,7 @@
 """Flash-Next LL scratch and SM70 physical NVLink admission (1Cat #992/#1521)."""
 
 from itertools import combinations
+from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
@@ -16,6 +17,9 @@ from vllm.distributed.parallel_state import (
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import import_pynvml
+
+if TYPE_CHECKING:
+    from vllm.models.qwen4_exp.nvidia.sm70_hcx import Sm70HcxRuntime
 
 logger = init_logger(__name__)
 
@@ -70,6 +74,7 @@ class Sm70HcLLCommunicator:
 
         self.rank = rank
         self.device = device
+        self.hcx: Sm70HcxRuntime | None = None
         with torch.accelerator.device_index(device.index):
             self.pointers = CustomAllreduce.create_shared_buffer(
                 _DOWN_BYTES + _UP_BYTES + _AR_BYTES, group=group
@@ -148,6 +153,9 @@ class Sm70HcLLCommunicator:
     def close(self) -> None:
         from .custom_all_reduce import CustomAllreduce
 
+        if self.hcx is not None:
+            self.hcx.close()
+            self.hcx = None
         with torch.accelerator.device_index(self.device.index):
             for rank, pointer in enumerate(self.pointers):
                 if rank != self.rank:

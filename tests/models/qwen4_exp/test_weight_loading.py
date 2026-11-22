@@ -7,6 +7,7 @@ import pytest
 import torch
 from torch import nn
 
+from vllm.config.kernel import KernelConfig
 from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm.model_executor.models.qwen3_next import Qwen3NextSparseMoeBlock
 from vllm.models.qwen4_exp.nvidia import model as qwen4_exp_model
@@ -351,6 +352,7 @@ def test_qsa_model_loader_defers_gate_until_all_weight_groups_are_consumed(
     model = Qwen4ExpModel.__new__(Qwen4ExpModel)
     nn.Module.__init__(model)
     model.config = SimpleNamespace(num_experts=0)
+    model.vllm_config = SimpleNamespace(kernel_config=KernelConfig())
     model._qsa_layer_ids = frozenset({0})
     model._kv_cache_dtype = "fp8_e4m3"
     decoder = nn.Module()
@@ -445,6 +447,7 @@ def test_loader_skips_final_mixer_on_non_last_pp_rank(monkeypatch) -> None:
     self_stub = SimpleNamespace(
         _qsa_layer_ids=frozenset(),
         config=SimpleNamespace(num_experts=0),
+        vllm_config=SimpleNamespace(kernel_config=KernelConfig()),
         hf_to_vllm_mapper=None,
     )
 

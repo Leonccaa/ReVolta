@@ -518,8 +518,28 @@ class LongContextKVConfig:
 
 
 @config
+class TopologyAllReduceConfig:
+    """Experimental measured single-node CUDA IPC all-reduce selection."""
+
+    enabled: bool = False
+    """Qualify and select routes before first model compilation and capture."""
+
+    precision: Literal["fp16", "fp32"] = "fp16"
+    """Use FP16 sums/transfers by default; opt into FP32 sums and partial
+    transfers for accuracy at higher latency. Input and output stay FP16."""
+
+    cache_dir: str | None = None
+    """Selection cache directory; None uses PyTorch's default extension root."""
+
+
+@config
 class KernelConfig:
     """Configuration for kernel selection and warmup behavior."""
+
+    topology_all_reduce: TopologyAllReduceConfig = Field(
+        default_factory=TopologyAllReduceConfig
+    )
+    """Opt-in topology-aware peer reduction with startup measured selection."""
 
     ir_op_priority: IrOpPriorityConfig = Field(default_factory=IrOpPriorityConfig)
     """
@@ -766,6 +786,7 @@ class KernelConfig:
         Any future fields that don't affect compilation should be excluded.
         """
         ignored_factors = {
+            "topology_all_reduce",  # Include enabled math policy below, not cache path.
             "enable_flashinfer_autotune",
             "ir_op_priority",  # handled separately below
             "linear_kernel_selections",
@@ -820,6 +841,10 @@ class KernelConfig:
             # An unused mode must not perturb existing graph caches.
             ignored_factors.add("long_context_kv")
         factors = get_hash_factors(self, ignored_factors)
+        if self.topology_all_reduce.enabled:
+            factors["topology_all_reduce"] = dict(
+                enabled=True, precision=self.topology_all_reduce.precision
+            )
         if "long_context_kv" in factors:
             # Scheduler-only arbitration knobs keep the previous identity.
             lc_factor = factors["long_context_kv"]

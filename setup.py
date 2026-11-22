@@ -1502,6 +1502,7 @@ package_data = {
         "entrypoints/serve/dashboard/static/*.css",
         "entrypoints/serve/dashboard/static/*.mjs",
         "distributed/kv_transfer/kv_connector/v1/hf3fs/utils/*.cpp",
+        "distributed/device_communicators/topology_all_reduce/*.cpp",
         # DeepGEMM JIT include headers (vendored via cmake)
         "third_party/deep_gemm/include/**/*.cuh",
         "third_party/deep_gemm/include/**/*.h",

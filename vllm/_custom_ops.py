@@ -2245,6 +2245,20 @@ def ggml_moe_a8(
     )
 
 
+def sm70_mtp_q8_0_moe_out(
+    out: torch.Tensor,
+    workspace: torch.Tensor,
+    x: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> None:
+    torch.ops._C.sm70_mtp_q8_0_moe_out(
+        out, workspace, x, w13, w2, topk_weights, topk_ids
+    )
+
+
 def ggml_moe_a8_vec(
     X: torch.Tensor,
     W: torch.Tensor,

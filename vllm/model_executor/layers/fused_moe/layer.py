@@ -878,6 +878,10 @@ class FusedMoE(PluggableLayer):
             # Failed to load this param since it's not local to this rank
             return False if return_success else None
         # Hereafter, `expert_id` is local physical id
+        packed_loader = getattr(param, "packed_expert_loader", None)
+        if packed_loader is not None:
+            packed_loader(self, param, loaded_weight, shard_id, expert_id)
+            return True if return_success else None
 
         # is_transposed: if the dim to shard the weight
         # should be flipped. Required by GPTQ, compressed-tensors

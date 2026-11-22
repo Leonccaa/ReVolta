@@ -210,7 +210,7 @@ def test_online_mixed_mtp_can_be_unquantized_by_absence_from_metadata():
         ModelOptMixedPrecisionConfig,
     )
     from vllm.models.qwen4_exp.nvidia.mtp_fp8_experts import (
-        MTPExpertFp8Config,
+        MTPExpertQuantConfig,
         MTPFp8SM70MoEMethod,
     )
 
@@ -230,7 +230,7 @@ def test_online_mixed_mtp_can_be_unquantized_by_absence_from_metadata():
     layer = MagicMock(spec=RoutedExperts)
     layer.moe_config = SimpleNamespace(has_bias=False)
     assert isinstance(
-        MTPExpertFp8Config(fallback).get_quant_method(
+        MTPExpertQuantConfig(fallback).get_quant_method(
             layer, "mtp.layers.48.mlp.experts"
         ),
         MTPFp8SM70MoEMethod,

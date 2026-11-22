@@ -235,23 +235,53 @@ def _make_draft_vllm_config(
         is_exact_sm70_cuda_platform,
     )
 
-    from .mtp_fp8_experts import MTPExpertFp8Config, checkpoint_fp8_prefixes
+    from .mtp_fp8_experts import MTPExpertQuantConfig, checkpoint_fp8_prefixes
 
-    online_fp8 = getattr(speculative_config, "mtp_expert_quantization", None) == "fp8"
+    expert_format = getattr(speculative_config, "mtp_expert_quantization", None)
+    online_fp8 = expert_format == "fp8"
+    exact_sm70 = is_exact_sm70_cuda_platform()
     checkpoint_prefixes = set()
-    if draft_quant_config is not None and is_exact_sm70_cuda_platform():
+    if draft_quant_config is not None and exact_sm70:
         config = draft_vllm_config.model_config.hf_text_config
         prefixes = {
             f"mtp.layers.{mtp_start_layer_idx + index}.mlp.experts"
             for index in range(getattr(config, "mtp_num_hidden_layers", 1))
         }
         checkpoint_prefixes = checkpoint_fp8_prefixes(draft_quant_config, prefixes)
-    if online_fp8 or checkpoint_prefixes:
+    if expert_format == "q8_0":
+        parallel = draft_vllm_config.parallel_config
+        if (
+            not exact_sm70
+            or draft_vllm_config.model_config.dtype != torch.float16
+            or parallel.pipeline_parallel_size != 1
+            or parallel.enable_expert_parallel
+            or parallel.data_parallel_size != 1
+            or parallel.prefill_context_parallel_size != 1
+        ):
+            raise ValueError(
+                "Q8_0 MTP requires SM70 FP16 with PP/DP/PCP size 1 and no EP"
+            )
+        if checkpoint_prefixes:
+            raise ValueError(
+                "Q8_0 MTP requires BF16 or FP16 checkpoint experts. Use the "
+                "checkpoint's original block-FP8 experts with fp8 or no override."
+            )
+        if not (
+            hasattr(torch.ops._C, "sm70_mtp_q8_0_moe_out")
+            and hasattr(torch.ops._C, "ggml_moe_a8_vec")
+        ):
+            raise ValueError(
+                "Q8_0 MTP requires the SM70 grouped and GGUF vector operators"
+            )
+        draft_quant_config = MTPExpertQuantConfig(
+            draft_quant_config, expert_format="q8_0"
+        )
+    elif online_fp8 or checkpoint_prefixes:
         if draft_quant_config is None or not _mtp_fp8_experts_supported(
             draft_vllm_config,
             draft_quant_config,
             speculative_config,
-            is_exact_sm70_cuda_platform(),
+            exact_sm70,
             online_fp8,
         ):
             raise ValueError(
@@ -259,7 +289,7 @@ def _make_draft_vllm_config(
                 "checkpoint, no expert parallelism, standard rejection sampling, "
                 "and pipeline-parallel size 1 for online conversion"
             )
-        draft_quant_config = MTPExpertFp8Config(
+        draft_quant_config = MTPExpertQuantConfig(
             draft_quant_config,
             checkpoint_prefixes,
             quantize_unquantized=online_fp8,

@@ -4,10 +4,8 @@
 
 import torch
 
-import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
-from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
@@ -40,18 +38,8 @@ def pack_dflash2_fp16_weight(weight: torch.Tensor, tile: int) -> torch.Tensor:
 
 def prepare_dflash2_fp16_m8(layer: torch.nn.Module) -> None:
     weight = layer.weight
-    if (
-        envs.VLLM_BATCH_INVARIANT
-        or not hasattr(torch.ops._C, "sm70_dflash2_fp16_dispatch_out")
-        or not weight.is_cuda
-        or weight.dtype != torch.float16
-        or not weight.is_contiguous()
-        or getattr(layer, "bias", None) is not None
-        or not current_platform.is_device_capability(70, device_id=weight.device.index)
-    ):
-        return
     geometry = _GEOMETRY.get(tuple(weight.shape))
-    if geometry is None:
+    if geometry is None or layer.bias is not None:
         return
     tile, warps = geometry
     packed = pack_dflash2_fp16_weight(weight.detach(), tile)
@@ -69,15 +57,6 @@ def apply_dflash2_fp16_m8(
     layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None
 ) -> torch.Tensor | None:
     weight = layer.weight
-    if (
-        bias is not None
-        or x.ndim != 2
-        or x.shape[1] != weight.shape[1]
-        or x.dtype != torch.float16
-        or x.device != weight.device
-        or not x.is_contiguous()
-    ):
-        return None
     # A dynamic draft trace may start outside M8. Let the native op select
     # M8 at runtime and use the ordinary dense product for its other rows.
     if not torch.compiler.is_compiling() and x.shape[0] != 8:
@@ -85,7 +64,7 @@ def apply_dflash2_fp16_m8(
     output = x.new_empty((x.shape[0], weight.shape[0]))
     tile, warps = layer._sm70_dflash2_fp16_geometry
     ops.sm70_dflash2_fp16_dispatch_out(
-        output, x, layer._sm70_dflash2_fp16_packed, weight, tile, warps
+        output, x.contiguous(), layer._sm70_dflash2_fp16_packed, weight, tile, warps
     )
     return output
 

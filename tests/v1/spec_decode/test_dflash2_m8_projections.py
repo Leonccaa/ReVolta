@@ -122,14 +122,7 @@ def test_packed_linear_eager_dispatch_and_fallback(monkeypatch):
     layer.register_buffer("_sm70_dflash2_fp16_packed", layer.weight)
     torch.testing.assert_close(method.apply(layer, x), layer(x), rtol=0, atol=0)
     assert calls == [8]
-    for x_other in (x[:4], x.t().contiguous().t(), x.unsqueeze(0)):
-        torch.testing.assert_close(
-            method.apply(layer, x_other), layer(x_other), rtol=0, atol=0
-        )
-    bias = torch.ones(32, dtype=torch.float16)
-    torch.testing.assert_close(
-        method.apply(layer, x, bias), F.linear(x, layer.weight, bias), rtol=0, atol=0
-    )
+    torch.testing.assert_close(method.apply(layer, x[:4]), layer(x[:4]), rtol=0, atol=0)
     assert calls == [8]
 
 

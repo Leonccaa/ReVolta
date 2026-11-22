@@ -62,6 +62,7 @@ class HCTensorParallelPartial(NamedTuple):
     """A block output whose one remaining TP sum is owned by HC."""
 
     value: torch.Tensor
+    secondary: torch.Tensor | None = None
 
 
 def _hc_ll_combine_norm(
@@ -71,11 +72,14 @@ def _hc_ll_combine_norm(
     weight: torch.Tensor,
     eps: float,
     hc_count: int,
+    secondary: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # Layers hand over partials only after the HC LL geometry admission.
     ll = get_tp_hc_ll()
     if ll is not None and 1 <= residual.shape[0] <= MAX_ROWS:
-        return ll.combine_norm(partial, residual, injection, weight, eps)
+        return ll.combine_norm(partial, residual, injection, weight, eps, secondary)
+    if secondary is not None:
+        partial = partial + secondary
     return hc_combine_norm(
         residual,
         tensor_model_parallel_all_reduce(partial),
@@ -86,7 +90,9 @@ def _hc_ll_combine_norm(
     )
 
 
-def _hc_ll_combine_norm_fake(partial, residual, injection, weight, eps, hc_count):
+def _hc_ll_combine_norm_fake(
+    partial, residual, injection, weight, eps, hc_count, secondary=None
+):
     return (
         torch.empty_like(residual, memory_format=torch.contiguous_format),
         torch.empty_like(residual, memory_format=torch.contiguous_format),
@@ -105,6 +111,7 @@ def _hc_hcx_combine_and_mix(
     residual: torch.Tensor,
     injection: torch.Tensor,
     name: str,
+    secondary: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     ctx = get_forward_context()
     module = ctx.no_compile_layers[name]
@@ -123,17 +130,26 @@ def _hc_hcx_combine_and_mix(
         and torch.cuda.is_current_stream_capturing()
     ):
         return runtime.run(
-            partial, residual, injection, norm, eps, module._hcx_down, module._hcx_up
+            partial,
+            residual,
+            injection,
+            norm,
+            eps,
+            module._hcx_down,
+            module._hcx_up,
+            secondary,
         )
     # The partial is still unreduced at all M. Preserve both baseline stages,
     # including explicit TP AR when HC LL declines (e.g. M > 64).
-    hidden, xn = _hc_ll_combine_norm(partial, residual, injection, norm, eps, 4)
+    hidden, xn = _hc_ll_combine_norm(
+        partial, residual, injection, norm, eps, 4, secondary
+    )
     block, inject = module._project(xn)
     assert inject is not None
     return hidden.contiguous(), block.contiguous(), inject.contiguous()
 
 
-def _hc_hcx_combine_and_mix_fake(partial, residual, injection, name):
+def _hc_hcx_combine_and_mix_fake(partial, residual, injection, name, secondary=None):
     return (
         torch.empty_like(residual, memory_format=torch.contiguous_format),
         partial.new_empty((residual.shape[0], HD)),
@@ -301,7 +317,11 @@ class GatedResidual(nn.Module):
                 and is_forward_context_available()
             ):
                 return torch.ops.vllm.qwen4exp_sm70_hcx_combine_and_mix(
-                    prev_block_output.value, hidden_states, prev_injection, hcx_name
+                    prev_block_output.value,
+                    hidden_states,
+                    prev_injection,
+                    hcx_name,
+                    prev_block_output.secondary,
                 )
             hidden_states, xn = torch.ops.vllm.qwen4exp_sm70_hc_ll_combine_norm(
                 prev_block_output.value,
@@ -310,6 +330,7 @@ class GatedResidual(nn.Module):
                 self.hc_norm.weight,
                 self.config.rms_norm_eps,
                 self.hc_count,
+                prev_block_output.secondary,
             )
         else:
             hidden_states, xn = hc_combine_norm(
@@ -334,7 +355,10 @@ class GatedResidual(nn.Module):
         injection: torch.Tensor,
     ) -> torch.Tensor:
         if isinstance(block_output, HCTensorParallelPartial):
-            block_output = tensor_model_parallel_all_reduce(block_output.value)
+            partial = block_output.value
+            if block_output.secondary is not None:
+                partial = partial + block_output.secondary
+            block_output = tensor_model_parallel_all_reduce(partial)
         return hc_combine(hidden_states, block_output, injection, self.hc_count)
 
     @property

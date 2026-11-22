@@ -714,6 +714,12 @@ class KernelConfig:
     sm70_hc_ll_async: bool = False
     """Allow the usual SM70 NVLink HC LL admission under async scheduling."""
 
+    sm70_hc_moe_dual_partial: bool = False
+    """Pass separate routed and shared expert outputs into NVLink HC on
+    Flash-Next decode. Independent of HCX admission. HCX accumulates both
+    partials in FP32, so its dual-input path can change numerical results.
+    """
+
     sm70_hcx: bool = False
     """Use local-schedule HCX at Flash-Next attention-to-MLP and MoE-to-next-
     attention HyperConnection boundaries in uniform decode graphs of at most
@@ -786,6 +792,8 @@ class KernelConfig:
             ignored_factors.add("sm70_dflash2_fp16_m8")
         if not self.sm70_nvlink_hc_active:
             ignored_factors.add("sm70_nvlink_hc_active")
+        if not self.sm70_hc_moe_dual_partial:
+            ignored_factors.add("sm70_hc_moe_dual_partial")
         ignored_factors.add("sm70_hcx")  # Only resolved preparation changes the graph.
         if not self.sm70_hcx_active:
             ignored_factors.add("sm70_hcx_active")

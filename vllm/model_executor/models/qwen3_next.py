@@ -426,6 +426,27 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             else None,
         )
 
+    def _prepare_expert_inputs(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden_states = _sm70_dump_qwen_layer_tensor(
+            "moe_input",
+            self.layer_idx,
+            "moe",
+            hidden_states,
+        )
+        if self.experts.is_internal_router:
+            # The gate/router runs inside FusedMoE.
+            return hidden_states, hidden_states
+        router_logits, _ = self.gate(hidden_states)
+        router_logits = _sm70_dump_qwen_layer_tensor(
+            "moe_router_logits",
+            self.layer_idx,
+            "moe",
+            router_logits,
+        )
+        return hidden_states, router_logits
+
     def forward(
         self, hidden_states: torch.Tensor, *, reduce_results: bool = True
     ) -> torch.Tensor:
@@ -437,34 +458,13 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
 
-        hidden_states = _sm70_dump_qwen_layer_tensor(
-            "moe_input",
-            self.layer_idx,
-            "moe",
-            hidden_states,
-        )
+        hidden_states, router_logits = self._prepare_expert_inputs(hidden_states)
         expert_kwargs = {} if reduce_results else {"reduce_results": False}
-        if self.experts.is_internal_router:
-            # In this case, the gate/router runs inside the FusedMoE class
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states,
-                router_logits=hidden_states,
-                **expert_kwargs,
-            )
-        else:
-            # router_logits: (num_tokens, n_experts)
-            router_logits, _ = self.gate(hidden_states)
-            router_logits = _sm70_dump_qwen_layer_tensor(
-                "moe_router_logits",
-                self.layer_idx,
-                "moe",
-                router_logits,
-            )
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                **expert_kwargs,
-            )
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            **expert_kwargs,
+        )
         final_hidden_states = _sm70_dump_qwen_layer_tensor(
             "moe_output",
             self.layer_idx,

@@ -107,6 +107,7 @@ class Sm70HcxRuntime:
         eps: float,
         down: torch.Tensor,
         up: torch.Tensor,
+        secondary: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         rows = partial.shape[0]
         assert 1 <= rows <= MAX_ROWS
@@ -116,7 +117,7 @@ class Sm70HcxRuntime:
         # Use ReVolta's shipped ABI: no deferred projection or gated GDN args.
         ops.sm70_hcx_out(
             partial.contiguous(),
-            None,
+            None if secondary is None else secondary.contiguous(),
             residual.contiguous(),
             injection.contiguous(),
             norm.contiguous(),

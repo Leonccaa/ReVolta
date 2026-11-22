@@ -1473,6 +1473,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cu_num_logits=cu_num_logits,
             cu_num_logits_np=cu_num_logits_np,
             has_structured_output_reqs=scheduler_output.has_structured_output_requests,
+            structured_output_req_ids=scheduler_output.structured_output_req_ids,
             prefix_anchor_lens=prefix_anchor_lens,
             is_incomplete_prefilling_np=is_incomplete_prefilling_np,
         )

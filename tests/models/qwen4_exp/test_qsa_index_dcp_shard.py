@@ -869,6 +869,39 @@ def test_paged_scorer_local_columns_match_global(world: int) -> None:
                 torch.testing.assert_close(local_row, global_row, rtol=1e-5, atol=1e-6)
 
 
+@pytest.mark.parametrize("rows", range(1, 18))
+@pytest.mark.parametrize(("world", "k"), [(4, 512), (5, 512), (3, 768), (5, 461)])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_shard_merge_topk_dispatch(rows, world, k, enabled, monkeypatch):
+    from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
+
+    calls = []
+
+    def select(*args):
+        calls.append(len(args) == 5 and args[4] is True)
+        args[2].fill_(-1)
+
+    monkeypatch.setattr(qsa_ops, "_SM70_QSA_MTP_TOPK", enabled)
+    monkeypatch.setattr(qsa_ops, "_use_sm70_qsa_lexicographic_topk", lambda _: True)
+    monkeypatch.setattr(qsa_ops, "_sm70_qsa_lexicographic_topk_op", lambda: select)
+    monkeypatch.setattr(torch.ops._C, "qsa_lexicographic_topk", select, raising=False)
+    blocks = torch.full((rows, k), -1, dtype=torch.int32)
+    logits = torch.zeros((rows, 1), dtype=torch.float32)
+    qsa_ops._merge_sharded_index_blocks(
+        blocks,
+        logits,
+        torch.zeros(rows, dtype=torch.int32),
+        world,
+        0,
+        k,
+        all_gather=lambda packed: packed.expand(world, -1, -1),
+        use_triton=False,
+    )
+    assert calls == [
+        enabled and (rows in (5, 10) or (rows <= 16 and world * k <= 2304))
+    ]
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs the SM70 top-k op")
 @pytest.mark.parametrize("world", [2, 3])
 @pytest.mark.parametrize("kind", ["normal", "ties", "specials"])

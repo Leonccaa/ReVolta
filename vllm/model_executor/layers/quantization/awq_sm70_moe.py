@@ -1688,12 +1688,21 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         indexed_w13 = _use_qwen38_indexed_prefill(layer, x, topk_ids)
         buffers = self._get_buffers(layer, total_slots, num_tokens, indexed_w13)
         output = buffers["output"]
-        output.zero_()
         if total_slots == 0:
-            return output
+            return output.zero_()
 
         topk_ids_i32 = buffers["topk_ids"]
-        topk_ids_i32.copy_(topk_ids, non_blocking=True)
+        if (
+            topk_ids.dtype == torch.int32
+            and topk_ids.shape == topk_ids_i32.shape
+            and topk_ids.is_cuda
+            and topk_ids.device == topk_ids_i32.device == x.device
+            and topk_ids.is_contiguous()
+            and topk_ids.data_ptr() % 4 == 0
+        ):
+            topk_ids_i32 = topk_ids
+        else:
+            topk_ids_i32.copy_(topk_ids, non_blocking=True)
         x = _dump_awq_moe_buffer(layer, x, "input")
         topk_weights = _dump_awq_moe_buffer(layer, topk_weights, "topk_weights")
         topk_ids_i32 = _dump_awq_moe_buffer(layer, topk_ids_i32, "topk_ids_i32")
@@ -1703,6 +1712,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             and _legacy_single_token_compact_enabled()
             and layer.sm70_awq_moe_legacy_single_token_compact
         ):
+            output.zero_()
             return self._apply_legacy_single_token_compact(
                 layer, x, topk_weights, topk_ids_i32, buffers, top_k, output
             )
@@ -1727,6 +1737,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 or use_batched_single_token_indexed
             )
         ):
+            output.zero_()
             use_compact_w13 = _single_token_compact_w13_enabled()
             use_indexed_w13 = (
                 not use_compact_w13
@@ -1902,6 +1913,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             else _qwen38_grouped_qpn_chunks(layer, x, topk_weights, topk_ids_i32)
         )
         if grouped_chunks is not None:
+            # Grouped W2 writes every column of each output row.
             _log_runtime_route_once(
                 "SM70 Qwen3.8 AWQ grouped QPN decode (tokens=%d, routes=%d, calls=%d).",
                 num_tokens,
@@ -1926,6 +1938,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                     int(getattr(layer, "sm70_awq_qwen38_grouped_qpn_pack_rows", 0)),
                 )
             return _dump_awq_moe_buffer(layer, output, "grouped_qpn_output")
+        output.zero_()
         if indexed_w13:
             torch.ops._moe_C.moe_permute_metadata_with_scratch(
                 x,

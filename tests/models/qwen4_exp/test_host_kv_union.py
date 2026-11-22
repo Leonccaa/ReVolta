@@ -994,3 +994,11 @@ def test_union_windows_feed_the_p4_shadow_once_per_fill():
     fills = result.windows + sum(e - s for s, e, k in result.spans if k == "rows")
     assert int(counters[HOT_GATHERS] - before[HOT_GATHERS]) == fills
     assert int(counters[HOT_MISSES] - before[HOT_MISSES]) > 0
+
+
+def test_prefill_gather_defaults_to_union():
+    from vllm.config.kernel import LongContextKVConfig
+    from vllm.models.qwen4_exp.nvidia.host_kv.history import HostHistoryShape
+
+    assert LongContextKVConfig().prefill_gather == "union"
+    assert HostHistoryShape.__dataclass_fields__["prefill_gather"].default == "union"

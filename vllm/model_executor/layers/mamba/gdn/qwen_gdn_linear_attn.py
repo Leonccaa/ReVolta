@@ -24,7 +24,11 @@ from vllm.config.sm70_dflash2 import (
 from vllm.distributed import (
     divide,
 )
-from vllm.forward_context import ForwardContext, get_forward_context
+from vllm.forward_context import (
+    ForwardContext,
+    get_forward_context,
+    is_forward_context_available,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp, PluggableLayer
 from vllm.model_executor.layers.fla.ops import (
@@ -686,6 +690,18 @@ def _sm70_qwen_gdn_metadata_has_active_spec(
         attn_metadata is not None
         and attn_metadata.spec_sequence_masks is not None
         and attn_metadata.num_spec_decodes > 0
+    )
+
+
+def _qwen_gdn_has_prefill(layer_name: LayerNameType) -> bool:
+    if not is_forward_context_available():
+        return False
+    metadata = get_forward_context().attn_metadata
+    if not isinstance(metadata, dict):
+        return False
+    layer_metadata = metadata.get(_resolve_layer_name(layer_name))
+    return isinstance(layer_metadata, GDNAttentionMetadata) and (
+        layer_metadata.num_prefills > 0
     )
 
 
@@ -2447,6 +2463,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             activation=output_gate_type,
             device=self.dt_bias.device,
         )
+        self._sm70_mtp_prefill_norm = (
+            _sm70_qwen_gdn_spec_method(vllm_config) == "mtp" and not self.norm.enabled()
+        )
 
         self.out_proj = RowParallelLinear(
             self.value_dim,
@@ -4067,6 +4086,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 -1,
                 True,
                 self.norm.activation,
+            )
+        elif (
+            not torch.compiler.is_compiling()
+            and self._sm70_mtp_prefill_norm
+            and _qwen_gdn_has_prefill(layer_name)
+            and self.norm._can_use_sm70_exact(core_attn_out, z, prefill=True)
+        ):
+            # The eager projection can use the exact kernel beyond the normal
+            # row cap. Keep the traced projection on its existing norm path.
+            core_attn_out = torch.ops.vllm.sm70_rmsnorm_gated_exact(
+                core_attn_out,
+                z,
+                self.norm.weight,
+                self.norm.eps,
+                self.norm.activation != "sigmoid",
             )
         else:
             core_attn_out = self.norm(core_attn_out, z)

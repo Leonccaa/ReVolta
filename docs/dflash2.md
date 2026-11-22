@@ -162,13 +162,12 @@ Use `--no-async-scheduling` for the recommended GDN replay setup. Omitting
 When enabling it, `policy`, `nmin` and
 `nmax` must be explicit; no lookup recipe is selected automatically.
 
-- A batch of one to `max_requests` eligible decode requests attempts lookup.
-  `max_requests` defaults to 3 and accepts integers from 1 to 3; set it to 1 to
-  restore single-request admission without rebuilding the image. Mixed prefill,
-  grammar constraints, any row without a sampled token or sufficient sequence
-  space, and batches whose current scheduler K is below seven
-  bypass lookup for the whole batch. Eligibility is recalculated every round.
-  Padding rows do not count; returning to an eligible batch resumes immediately.
+- For batches of one to `max_requests` live requests at scheduler K=7,
+  each eligible decode row attempts lookup independently. Prefill, structured
+  output, padding, and rows without a sampled token or usable history do not
+  attempt lookup. Eligibility is recalculated every round. `max_requests`
+  defaults to 3 and accepts integers from 1 to 3; set it to 1 to limit lookup to
+  single-request batches. Padding does not count toward this batch limit.
 - The configured proposal/resource width remains seven; it does not expand to
   fifteen or allocate per-request q16 graphs. The DSD schedule
   can still reduce the published width: with the example above,

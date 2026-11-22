@@ -423,34 +423,33 @@ class DecodeChain:
         spec._apply_lookup(n)
         native = spec._native_lookup
         limit = self.config.speculative_config.dflash2_lookup.max_requests
-        eligible = (
-            1 <= n <= limit
-            and width == 7
-            and not batch.has_structured_output_reqs
-            and not batch.is_prefilling_np[:n].any()
-            and all(
-                int(counts[row]) > 0
+        structured = batch.structured_output_req_ids or set()
+        eligible = [
+            int(
+                1 <= n <= limit
+                and width == 7
+                and not batch.is_prefilling_np[row]
+                and name not in structured
+                and int(counts[row]) > 0
                 and 6 <= int(states.total_len.gpu[batch.idx_mapping[row]]) < 512
-                for row in range(n)
             )
-        )
+            for row, name in enumerate(batch.req_ids)
+        ]
         if native is not None:
-            assert native.eligible[:n].tolist() == [int(eligible)] * n, (
-                "SCHEDULER_BATCH_ADMISSION"
-            )
-            if not eligible:
-                assert not native.use[:n].any()
-                assert not native.match[:n].any()
-                assert not native.valid[:n].any()
-                for value, before in zip(
-                    (spec.draft_tokens, spec.draft_logits, spec._cached_candidate_ids),
-                    original,
-                ):
-                    assert torch.equal(value, before)
-                if scores is not None:
-                    assert torch.equal(scores, original_scores)
-            else:
-                for row in range(n):
+            assert native.eligible[:n].tolist() == eligible, "SCHEDULER_ROW_ADMISSION"
+            for row in range(n):
+                slot = int(batch.idx_mapping[row])
+                if not eligible[row]:
+                    assert not native.use[row].any()
+                    assert native.match[row] == native.valid[row] == 0
+                    assert torch.equal(spec.draft_tokens[row], original[0][row])
+                    assert torch.equal(spec.draft_logits[slot], original[1][slot])
+                    assert torch.equal(
+                        spec._cached_candidate_ids[slot], original[2][slot]
+                    )
+                    if original_scores is not None:
+                        assert torch.equal(scores[slot], original_scores[slot])
+                else:
                     candidate, match, valid = candidates[row]
                     assert int(native.match[row]) == match
                     assert int(native.valid[row]) == valid
@@ -461,7 +460,6 @@ class DecodeChain:
                         assert (
                             spec.draft_tokens[row, :valid].tolist() == candidate[:valid]
                         )
-                    slot = int(batch.idx_mapping[row])
                     assert torch.equal(spec.draft_logits[slot, 0], original[1][slot, 0])
                     for col in range(1, int(native.valid[row])):
                         token = int(spec.draft_tokens[row, col])
@@ -692,6 +690,23 @@ def test_chunked_prefill_and_grammar_are_real_scheduler_metadata(chain_factory):
     assert chain.spec._native_lookup.eligible[0] == 0
     assert grammar.structured_output_request.grammar.accept_tokens.called
     assert chain.runner.draft_tokens_handler.draft_tokens_np is not None
+
+
+def test_structured_decode_and_short_prefill_do_not_block_other_decode(chain_factory):
+    chain = chain_factory(max_requests=3)
+    chain.add("plain", prompt_length=56)
+    chain.add("grammar", prompt_length=56, grammar=True)
+    chain.step()
+    chain.step()
+    chain.add("prefill", prompt_length=8)
+    record = chain.step()
+    rows = {name: row for row, name in enumerate(record.batch.req_ids)}
+    assert record.batch.structured_output_req_ids == {"grammar"}
+    assert not record.batch.is_prefilling_np[rows["grammar"]]
+    assert record.batch.is_prefilling_np[rows["prefill"]]
+    native = chain.spec._native_lookup
+    assert native.use[rows["plain"], 1:].any()
+    assert not native.eligible[[rows["grammar"], rows["prefill"]]].any()
 
 
 @pytest.mark.parametrize("reason", ["no_sample", "no_space"])
@@ -964,10 +979,7 @@ def test_multi_request_scheduler_switches_and_counts(chain_factory, sparse):
     def step(expected, **kwargs):
         before = int(native.stats.counters[0])
         record = chain.step(**kwargs)
-        assert (
-            native.eligible[: record.batch.num_reqs].tolist()
-            == [int(expected > 0)] * record.batch.num_reqs
-        )
+        assert int(native.eligible[: record.batch.num_reqs].sum()) == expected
         assert int(native.stats.counters[0]) - before == expected, (
             "SCHEDULER_ROW_COUNTS"
         )
@@ -977,11 +989,11 @@ def test_multi_request_scheduler_switches_and_counts(chain_factory, sparse):
     step(0)
     step(1)
     chain.add("b")
-    step(0)  # mixed prefill invalidates the whole batch immediately
+    step(1)  # Only the existing decode row attempts lookup.
     two = step(2, accepted=1)
     assert two.batch.num_reqs == 2
     chain.add("c")
-    step(0)
+    step(2)
     three = step(3, accepted=1)
     assert three.batch.num_reqs == 3
     chain.add("d")
@@ -997,7 +1009,7 @@ def test_multi_request_scheduler_switches_and_counts(chain_factory, sparse):
     chain.scheduler.finish_requests("b", RequestStatus.FINISHED_ABORTED)
     step(2)
     chain.add("replacement", prompt_length=24)
-    step(0)
+    step(2)
     step(3)
     chain.scheduler.finish_requests(
         ["c", "replacement"], RequestStatus.FINISHED_ABORTED

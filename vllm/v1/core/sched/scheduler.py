@@ -2203,10 +2203,12 @@ class Scheduler(SchedulerInterface):
             request.is_prefill_chunk = request.num_computed_tokens < (
                 request.num_tokens + request.num_output_placeholders
             )
-            scheduler_output.has_structured_output_requests |= (
-                request.use_structured_output and not request.is_prefill_chunk
-            )
             if not request.is_prefill_chunk:
+                if request.use_structured_output:
+                    scheduler_output.has_structured_output_requests = True
+                    if scheduler_output.structured_output_req_ids is None:
+                        scheduler_output.structured_output_req_ids = set()
+                    scheduler_output.structured_output_req_ids.add(req_id)
                 self._inflight_prefills.discard(request)
 
         # Snapshot block IDs for routed experts before forward starts.

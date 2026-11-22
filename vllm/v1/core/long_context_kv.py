@@ -684,7 +684,7 @@ def plan_long_context_capacity(
     host_bytes = host_blocks * geometry.host_bytes_per_block
 
     staging = int(settings.prefill_staging_gib * GiB)
-    if not main_kv_on_gpu and getattr(settings, "prefill_gather", "passes") == "union":
+    if not main_kv_on_gpu and getattr(settings, "prefill_gather", "union") == "union":
         # selection-union gather union windows: page-size-4 table, window output copies
         # and the
         # grouped workspace growth are prefill transients next to staging.

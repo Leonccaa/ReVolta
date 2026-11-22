@@ -7,6 +7,8 @@
 #include <torch/library.h>
 #include <torch/types.h>
 
+#include <limits>
+
 namespace {
 template <bool Silu>
 __global__ void rmsnorm_gated_exact_kernel(const half* x, const half* z,
@@ -47,10 +49,9 @@ __global__ void rmsnorm_gated_exact_kernel(const half* x, const half* z,
   }
 }
 
-// One warp per row and no shared memory, so the row count is only an
-// admission bound: 192 = 16 tokens x 12 local heads by default, 576 = 48
-// tokens with VLLM_SM70_QWEN38_WIDE_M_GATED_NORM (checked in Python).
-constexpr int64_t kMaxRows = 576;
+// One warp per row and no shared memory. Keep the last element's linear
+// index within int, independent of the Python dispatch limits.
+constexpr int64_t kMaxRows = std::numeric_limits<int>::max() / 128 + 1;
 
 void rmsnorm_gated_exact(torch::Tensor out, torch::Tensor x, torch::Tensor z,
                          torch::Tensor weight, double eps, bool silu) {

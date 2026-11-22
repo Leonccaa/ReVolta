@@ -2058,6 +2058,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 batch_descriptor=batch_descriptor,
                 slot_mapping=slot_mappings_by_layer,
                 skip_compiled=skip_compiled,
+                # Shared PIECEWISE graphs also replay equal-shaped prefill.
+                is_uniform_decode=(
+                    not dummy_run
+                    and batch_desc.cg_mode == CUDAGraphMode.NONE
+                    and uniform_tok_count is not None
+                ),
             ):
                 self.kv_connector.pre_forward(scheduler_output)
                 model_output = self.model(**model_inputs)

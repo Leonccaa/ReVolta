@@ -821,6 +821,10 @@ class ModelCudaGraphManager(CudaGraphManager):
                         num_tokens_across_dp=num_tokens_across_dp,
                         slot_mapping=slot_mappings,
                         batch_descriptor=batch_descriptor,
+                        is_uniform_decode=(
+                            desc.cg_mode == CUDAGraphMode.FULL
+                            and desc.uniform_token_count is not None
+                        ),
                     ),
                 ):
                     model_output = model(**model_inputs)

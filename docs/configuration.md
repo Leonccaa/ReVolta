@@ -254,12 +254,6 @@ type and default as registered in `vllm/envs.py`; *Since* is the first
 release with the variable (1Cat = inherited from 1Cat-vLLM); *Category*
 is configuration, tuning, experimental, debug or deprecated.
 
-### Pregraph preparation research switches
-
-| Name | Type | Default | Range | Category | Since | Effect and trade-off |
-|---|---|---|---|---|---|---|
-| `VLLM_SM70_MTP_Q8_PREFILL_MMQ` | bool | `False` | 0, 1 | experimental | 0.2.0rc15 | Use grouped GGUF MMQ for Q8_0 MTP batches above 64 rows in chunks of up to 2048. MMQ changes accumulation order and increases temporary GPU memory usage. |
-
 ### Promoted research switches
 
 | Name | Type | Default | Range | Category | Since | Effect and trade-off |
@@ -313,6 +307,7 @@ The ReVolta profile (`vllm/revolta_profile.py`) sets these on SM70 + TP4 + FP16 
 | `VLLM_SM70_CAR_VMM_SAFE` | bool | `False` | `1` (P2P/NVLink) | 0, 1 | experimental | 0.2.0 | Copies non-exportable (VMM) inputs into graph allocations while capturing custom all-reduce graphs, so expandable segments can stay on. Only with P2P or NVLink. |
 | `VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS` | bool | `True` | `0` (DFlash2) | 0, 1 | configuration | 1Cat | Single-request DFlash2 verifier tail graphs. The DFlash2 profile sets 0 to keep the graph memory for the KV cache. |
 | `VLLM_SM70_GREEDY_VERIFY` | bool | `False` | `1` | 0, 1 | experimental | 0.2.0 | Greedy MTP verification from TP-local argmax pairs instead of full-vocabulary logits; only when every request is plain greedy. |
+| `VLLM_SM70_MTP_Q8_PREFILL_MMQ` | bool | `False` | `1` (NVFP4) | 0, 1 | configuration | 0.2.0rc15 | Use grouped GGUF MMQ for Q8_0 MTP batches above 64 rows in chunks of up to 2048. MMQ changes accumulation order and increases temporary GPU memory usage. Set 0 to use the 64-row vector path. |
 | `VLLM_SM70_NVFP4_MOE_GROUPED_DECODE` | bool | `False` | `0` (NVFP4) | 0, 1 | experimental | 1Cat | Grouped native-NVFP4 decode; the profile keeps it off pending quality admission. |
 | `VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL` | bool | `True` | `1` (NVFP4) | 0, 1 | configuration | 1Cat | One grouped TurboMind call for all routed experts in prefill. |
 | `VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE` | bool | `False` | `1` (NVFP4) | 0, 1 | experimental | 1Cat | QPN for every live width 2..16 (NVFP4). |

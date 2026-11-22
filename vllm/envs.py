@@ -5154,10 +5154,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_MTP_Q8_PREFILL_MMQ": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_MTP_Q8_PREFILL_MMQ", "0"))),
         description="Use grouped GGUF MMQ for Q8_0 MTP prefill above 64 rows.",
-        category="experimental",
+        category="configuration",
         declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
+        effective_default=(
+            "False by default. The NVFP4 FP16 QSA SM70 TP4 profile enables it."
+        ),
+        automatic_conditions=(
+            "Only ModelOpt NVFP4 checkpoints (including mixed NVFP4 layers). "
+            "vllm/revolta_profile.py:apply_revolta_profile sets '1' for unset "
+            "values on FP16 QSA SM70 TP4. Only Q8_0 MTP experts use it.",
+        ),
         acceleration_paths=("Flash-Next MTP draft",),
         user_visible=True,
     ),

@@ -266,10 +266,9 @@ def _apply_sm70_qwen38_decode_defaults(
 def _resolve_gdn_spec_state_replay(vllm_config: "VllmConfig") -> bool:
     """Whether GDN layers replay accepted tokens instead of keeping per-draft states.
 
-    Supported for linear DFlash/MTP verification on SM70 with Model Runner V2, align
-    prefix caching and synchronous scheduling: the verifier route that records
-    its inputs and the replay after sampling are wired there. Elsewhere the
-    per-position state blocks remain.
+    Linear DFlash/MTP verification uses Model Runner V2 and align prefix
+    caching on SM70. Post-sampling replay requires synchronous scheduling.
+    Native next-round MTP uses completed worker-side counts in either scheduler.
     """
     from vllm.platforms import current_platform
 
@@ -277,6 +276,7 @@ def _resolve_gdn_spec_state_replay(vllm_config: "VllmConfig") -> bool:
     if spec is None or spec.use_dflash_ddtree():
         return False
     is_mtp = spec.method == "mtp"
+    deferred = spec.gdn_deferred_commit_metadata
     if not is_mtp and not spec.use_dflash():
         return False
     policy = spec.sm70_dflash2
@@ -298,7 +298,7 @@ def _resolve_gdn_spec_state_replay(vllm_config: "VllmConfig") -> bool:
                 "explicitly configured. GDN keeps a state block per draft "
                 "position and capacity includes those speculative state blocks."
             )
-    replay = spec.gdn_state_replay if is_mtp else policy.spec_state_replay
+    replay = (deferred or spec.gdn_state_replay) if is_mtp else policy.spec_state_replay
     if replay is False:
         return False
     if replay is None and not SM70_DFLASH2_SPEC_STATE_REPLAY_DEFAULT:
@@ -345,15 +345,36 @@ def _resolve_gdn_spec_state_replay(vllm_config: "VllmConfig") -> bool:
         reasons.append("Model Runner V1")
     if vllm_config.cache_config.mamba_cache_mode != "align":
         reasons.append("mamba_cache_mode is not align")
-    if vllm_config.scheduler_config.async_scheduling:
+    if vllm_config.scheduler_config.async_scheduling and not deferred:
         reasons.append("async scheduling")
+    if deferred and (
+        vllm_config.kv_transfer_config is not None
+        and vllm_config.kv_transfer_config.kv_connector is not None
+    ):
+        reasons.append("a KV connector can release request slots before exact-end")
     if vllm_config.parallel_config.pipeline_parallel_size != 1:
         reasons.append("pipeline parallelism")
     if envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP:
         reasons.append("VLLM_SM70_QWEN_GDN_SPEC_CORE_OP")
     if not envs.VLLM_SM70_FUSED_SIGMOID_MIXED_QKV:
         reasons.append("VLLM_SM70_FUSED_SIGMOID_MIXED_QKV is off")
+    if deferred and (
+        not is_mtp
+        or not spec.use_qwen4_exp_mtp()
+        or not 0 < spec.num_speculative_state_tokens() < 8
+        or model is None
+        or model.dtype != torch.float16
+        or vllm_config.cache_config.mamba_ssm_cache_dtype not in ("auto", "float32")
+        or vllm_config.parallel_config.tensor_parallel_size != 4
+    ):
+        reasons.append(
+            "native deferred replay requires FP16 TP4 Qwen4Exp MTP with FP32 SSM"
+        )
     if reasons:
+        if deferred:
+            raise ValueError(
+                "gdn_deferred_commit_metadata requires " + ", ".join(reasons)
+            )
         if replay:
             logger.warning_once(
                 "%s is not supported here (%s); "
@@ -362,6 +383,9 @@ def _resolve_gdn_spec_state_replay(vllm_config: "VllmConfig") -> bool:
                 ", ".join(reasons),
             )
         return False
+    if deferred:
+        logger.info_once("GDN recurrent state commits in the next native forward.")
+        return True
     logger.info_once(
         "GDN speculative state replay: recurrent layers keep 2 state blocks per "
         "running request and replay accepted tokens after sampling."

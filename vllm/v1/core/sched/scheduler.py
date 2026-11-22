@@ -348,6 +348,11 @@ class Scheduler(SchedulerInterface):
             prefix_cache_retention_interval=self.cache_config.prefix_cache_retention_interval,
             cross_group_hit_check=cross_group_hit_check_enabled(vllm_config),
         )
+        self.kv_cache_manager.coordinator.exact_end.native_gdn_replay = bool(
+            speculative_config
+            and speculative_config.gdn_spec_state_replay
+            and speculative_config.gdn_deferred_commit_metadata
+        )
         # Adapted from vLLM #44560, #57104 and #59880. Mamba managers already
         # include their speculative states. Fixed ring/tail and cross-attention
         # allocations do not grow during decode. Other attention groups need

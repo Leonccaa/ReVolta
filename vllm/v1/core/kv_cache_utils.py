@@ -72,6 +72,7 @@ class MambaStateGather(NamedTuple):
 
     column: int
     dst_block_ids: list[int]
+    request_id: str | None = None
 
 
 # ExternalBlockHash is used for reproducible prefix-cache block hashing.

@@ -274,6 +274,21 @@ def warmup_kernels(
         greedy_profile_idx = len(profiles)
         profiles.append((default_prompt_len, 1))
 
+    # Use a serving-shaped prefill before capture locks the workspace. The
+    # unpadded batch still goes through the regular runner admission check.
+    hc_sp_profile_idx = -1
+    hc_sp_min_tokens = getattr(model_runner, "hc_sp_min_tokens", None)
+    if hc_sp_min_tokens is not None:
+        max_tokens = model_runner.scheduler_config.max_num_batched_tokens
+        prompt_len = min(max_tokens, model_runner.max_model_len - 1 - num_spec_steps)
+        if prompt_len > 0:
+            profile_reqs = min(
+                max_tokens // prompt_len, model_runner.scheduler_config.max_num_seqs
+            )
+            if prompt_len * profile_reqs >= hc_sp_min_tokens:
+                hc_sp_profile_idx = len(profiles)
+                profiles.append((prompt_len, profile_reqs))
+
     kv_cache_groups = model_runner.kv_cache_config.kv_cache_groups
     num_kv_cache_groups = len(kv_cache_groups)
 
@@ -341,6 +356,13 @@ def warmup_kernels(
             )
             if profile_idx:
                 num_reqs = min(num_reqs, profile_reqs)
+            if profile_idx == hc_sp_profile_idx:
+                assert hc_sp_min_tokens is not None
+                if prompt_len * num_reqs < hc_sp_min_tokens or any(
+                    num_reqs * per_req >= blocks
+                    for blocks, per_req in zip(space_blocks, space_blocks_per_req)
+                ):
+                    continue
             if num_reqs <= 0:
                 continue
 

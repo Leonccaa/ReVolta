@@ -684,6 +684,8 @@ def maybe_apply_qwen38_sm70_fp16_fused_hc(
     up_layer: nn.Module,
     x: torch.Tensor,
     enabled: bool,
+    *,
+    allow_tp_ll: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     if not enabled or not use_sm70_decode_graph_semantics():
         return None
@@ -715,7 +717,7 @@ def maybe_apply_qwen38_sm70_fp16_fused_hc(
         getattr(up_layer, "_sm70_qwen38_hc_batch_packed", None),
         getattr(down_layer, "_sm70_qwen38_hc_batch_concurrent", False),
         getattr(down_layer, "_sm70_fp16_gemv_silu_ranges", False),
-        getattr(down_layer, "_sm70_hc_ll_enabled", False),
+        allow_tp_ll and getattr(down_layer, "_sm70_hc_ll_enabled", False),
     )
 
 

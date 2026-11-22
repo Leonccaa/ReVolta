@@ -1384,6 +1384,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         positions: torch.Tensor,
         output: torch.Tensor | None,
         hidden_states: torch.Tensor,
+        *,
+        reduce_results: bool | None = None,
     ) -> torch.Tensor:
         indexer_input = hidden_states
         index_proj = self.indexer.index_qk_proj
@@ -1433,7 +1435,12 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 encoded_layer_name,
             )
         flat_output = attn_output.view(num_tokens, -1)
-        projected_output, _ = self.o_proj(flat_output)
+        if reduce_results is None:
+            projected_output, _ = self.o_proj(flat_output)
+        else:
+            projected_output, _ = self.o_proj(
+                flat_output, reduce_results=reduce_results
+            )
         if output is not None:
             output.copy_(projected_output)
         return projected_output

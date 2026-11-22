@@ -13,7 +13,7 @@ from transformers.models.qwen3_vl import Qwen3VLProcessor
 from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.compilation.sm70_decode_graph import is_sm70_decode_graph_compiling
-from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.config.speculative_kv import dflash_draft_cache_dtype
 from vllm.distributed import get_pp_group
 from vllm.distributed.device_communicators.sm70_hc_ll import get_tp_hc_ll
@@ -75,6 +75,11 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_fuse_shared_experts,
     maybe_prefix,
+)
+from vllm.models.common.ops.sequence_parallel import (
+    sp_all_gather,
+    sp_reduce_scatter,
+    sp_shard,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFeatureSpec
@@ -324,6 +329,13 @@ def compact_aux_hidden_state(
     return value
 
 
+def _gather_aux_hidden_state(state: torch.Tensor, num_tokens: int) -> torch.Tensor:
+    if state.element_size() == 1:
+        # NCCL on SM70 can gather bytes without interpreting FP8 payloads.
+        return sp_all_gather(state.view(torch.uint8))[:num_tokens].view(state.dtype)
+    return sp_all_gather(state)[:num_tokens]
+
+
 def hc_stream_mean(hidden_states: torch.Tensor, hc_count: int) -> torch.Tensor:
     """Reduce a multi-stream ``[T, hc_count * H]`` state to ``[T, H]``.
 
@@ -509,8 +521,10 @@ class Qwen4ExpDecoderLayer(nn.Module):
         query_start_loc: torch.Tensor | None,
         ngram_context: torch.Tensor | None,
         aux_hidden_states: list[torch.Tensor] | None = None,
+        hc_sp: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | HCTensorParallelPartial, torch.Tensor]:
         attn_hc = self.attn_hyper_connection
+        hc_kwargs = {"hc_sp": True} if hc_sp else {}
         tap = aux_hidden_states is not None and self.aux_hidden_state_tap
         if self.ple is not None:
             # PLE adds directly to the multi-stream state, so pending HC state
@@ -533,20 +547,26 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 input_ids,
                 query_start_loc,
                 ngram_context,
+                **hc_kwargs,
             )
 
         # Fuse a pending combine with this HC module's mix when possible.
         if prev_block_output is not None and prev_injection is not None:
             hidden_states, block_input, injection = attn_hc.combine_and_mix(
-                hidden_states, prev_block_output, prev_injection
+                hidden_states, prev_block_output, prev_injection, **hc_kwargs
             )
         else:
-            hidden_states, block_input, injection = attn_hc.mix(hidden_states)
+            hidden_states, block_input, injection = attn_hc.mix(
+                hidden_states, **hc_kwargs
+            )
         if tap:
             # combine_and_mix returns the materialized multi-stream state of the
             # previous layer; reading it adds no work to the target path.
             assert aux_hidden_states is not None
             aux_hidden_states.append(hc_stream_mean(hidden_states, self.hc_count))
+
+        if hc_sp:
+            block_input = sp_all_gather(block_input)[: positions.shape[-1]]
 
         if self.layer_type == "linear_attention":
             use_direct_attention_output = (
@@ -559,6 +579,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
             projected_attn_out = self.linear_attn(
                 hidden_states=block_input,
                 output=attn_buffer,
+                **({"defer_tp_reduce": True} if hc_sp else {}),
             )
             if use_direct_attention_output:
                 if projected_attn_out is None:
@@ -574,24 +595,42 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 hidden_states=block_input,
                 positions=positions,
                 output=None,
+                **({"reduce_results": False} if hc_sp else {}),
             )
         else:
             raise ValueError("Invalid layer_type")
 
         mlp_hc = self.mlp_hyper_connection
         pending_attn: torch.Tensor | HCTensorParallelPartial = attn_out
-        if self._sm70_hc_ll_attn_partial:
+        if hc_sp:
+            pending_attn = sp_reduce_scatter(attn_out, dynamic_pad=True)
+        elif self._sm70_hc_ll_attn_partial:
             pending_attn = HCTensorParallelPartial(attn_out)
         hidden_states, block_input, injection = mlp_hc.combine_and_mix(
-            hidden_states, pending_attn, injection
+            hidden_states, pending_attn, injection, **hc_kwargs
         )
-        if self._sm70_hc_ll and isinstance(self.mlp, Qwen4ExpSparseMoeBlock):
+        if hc_sp:
+            block_input = sp_all_gather(block_input)[: positions.shape[-1]]
+        mlp_out = self._forward_mlp(
+            block_input, defer_tp_reduce=hc_sp or self._sm70_hc_ll
+        )
+        if hc_sp:
+            if isinstance(mlp_out, HCTensorParallelPartial):
+                mlp_out = sp_reduce_scatter(mlp_out.value, dynamic_pad=True)
+            else:
+                mlp_out = sp_shard(mlp_out, dynamic_pad=True)
+        return hidden_states, mlp_out, injection
+
+    def _forward_mlp(
+        self, block_input: torch.Tensor, *, defer_tp_reduce: bool
+    ) -> torch.Tensor | HCTensorParallelPartial:
+        if defer_tp_reduce and isinstance(self.mlp, Qwen4ExpSparseMoeBlock):
             runner = self.mlp.experts.runner
             if isinstance(runner, MoERunner) and runner.can_defer_tp_reduce():
-                partial = self.mlp(block_input, reduce_results=False)
-                return hidden_states, HCTensorParallelPartial(partial), injection
-        mlp_out = self.mlp(block_input)
-        return hidden_states, mlp_out, injection
+                return HCTensorParallelPartial(
+                    self.mlp(block_input, reduce_results=False)
+                )
+        return self.mlp(block_input)
 
 
 class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
@@ -644,17 +683,18 @@ class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
             moe.experts.update_expert_map()
 
 
-@support_torch_compile(
-    dynamic_arg_dims={
-        "input_ids": 0,
-        "positions": -1,
-        "intermediate_tensors": 0,
-        "inputs_embeds": 0,
-        "query_start_loc": 0,
-        "ngram_context": 0,
-        "deepstack_input_embeds": 0,
-    }
-)
+_QWEN4EXP_DYNAMIC_ARG_DIMS: dict[str, int | list[int] | dict[int, str]] = {
+    "input_ids": 0,
+    "positions": -1,
+    "intermediate_tensors": 0,
+    "inputs_embeds": 0,
+    "query_start_loc": 0,
+    "ngram_context": 0,
+    "deepstack_input_embeds": 0,
+}
+
+
+@support_torch_compile(dynamic_arg_dims=_QWEN4EXP_DYNAMIC_ARG_DIMS)
 class Qwen4ExpModel(nn.Module, EagleModelMixin):
     hf_to_vllm_mapper = _QWEN3_5_WEIGHTS_MAPPER | _HC_WEIGHTS_MAPPER
 
@@ -820,6 +860,33 @@ class Qwen4ExpModel(nn.Module, EagleModelMixin):
         ngram_context: torch.Tensor | None = None,
         deepstack_input_embeds: IntermediateTensors | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        # Keep the compiled signature unchanged: AOT compilation binds
+        # keyword-only parameters without their defaults.
+        return self._forward_layout(
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
+            query_start_loc,
+            ngram_context,
+            deepstack_input_embeds,
+            hc_sp=False,
+        )
+
+    def _forward_layout(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        query_start_loc: torch.Tensor | None = None,
+        ngram_context: torch.Tensor | None = None,
+        deepstack_input_embeds: IntermediateTensors | None = None,
+        *,
+        hc_sp: bool,
+    ) -> torch.Tensor | IntermediateTensors:
+        num_tokens = positions.shape[-1]
+        hc_kwargs = {"hc_sp": True} if hc_sp else {}
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -827,6 +894,8 @@ class Qwen4ExpModel(nn.Module, EagleModelMixin):
                 if input_ids is None:
                     raise ValueError("input_ids or inputs_embeds is required")
                 hidden_states = self.embed_input_ids(input_ids)
+            if hc_sp:
+                hidden_states = sp_shard(hidden_states, dynamic_pad=True)
             hidden_states = hidden_states.repeat(1, self.config.hc_count)
         else:
             if intermediate_tensors is None:
@@ -856,6 +925,7 @@ class Qwen4ExpModel(nn.Module, EagleModelMixin):
                 query_start_loc=query_start_loc,
                 ngram_context=ngram_context,
                 **aux_kwargs,
+                **hc_kwargs,
             )
             if deepstack_input_embeds is not None and layer_idx < len(
                 deepstack_input_embeds
@@ -863,6 +933,8 @@ class Qwen4ExpModel(nn.Module, EagleModelMixin):
                 deepstack_embed = deepstack_input_embeds[
                     f"deepstack_input_embeds_{layer_idx}"
                 ]
+                if hc_sp:
+                    deepstack_embed = sp_shard(deepstack_embed, dynamic_pad=True)
                 deepstack_embed = (
                     deepstack_embed.unsqueeze(-2)
                     .expand(
@@ -895,19 +967,26 @@ class Qwen4ExpModel(nn.Module, EagleModelMixin):
         final_mixer = self.hyper_connection_mixer
         assert final_mixer is not None
         multi_hidden, sample_hidden_states, _ = final_mixer.combine_and_mix(
-            hidden_states, block_output, injection
+            hidden_states, block_output, injection, **hc_kwargs
         )
+        if aux_hidden_states is not None and self._aux_hidden_state_final:
+            aux_hidden_states.append(hc_stream_mean(multi_hidden, self.config.hc_count))
         if self._mtp_hidden_buffer is not None:
             # Capture the pre-final-mixer multi-stream hidden state
             # [T, hc_count*H] for the MTP drafter (zero extra compute:
             # this tensor is needed by the final mixer regardless).
-            num_tokens = multi_hidden.shape[0]
-            self._mtp_hidden_buffer[:num_tokens].copy_(multi_hidden)
-        if aux_hidden_states is not None:
-            if self._aux_hidden_state_final:
-                aux_hidden_states.append(
-                    hc_stream_mean(multi_hidden, self.config.hc_count)
+            if hc_sp:
+                packed = sp_all_gather(
+                    torch.cat((sample_hidden_states, multi_hidden), dim=-1)
+                )[:num_tokens]
+                sample_hidden_states, multi_hidden = packed.split(
+                    (sample_hidden_states.shape[-1], multi_hidden.shape[-1]), dim=-1
                 )
+                sample_hidden_states = sample_hidden_states.contiguous()
+            self._mtp_hidden_buffer[:num_tokens].copy_(multi_hidden)
+        elif hc_sp:
+            sample_hidden_states = sp_all_gather(sample_hidden_states)[:num_tokens]
+        if aux_hidden_states is not None:
             if len(aux_hidden_states) != len(self.aux_hidden_state_layers):
                 raise RuntimeError(
                     f"Qwen4Exp captured {len(aux_hidden_states)} aux hidden states "
@@ -916,6 +995,11 @@ class Qwen4ExpModel(nn.Module, EagleModelMixin):
             if self.aux_hidden_state_dtype is not None:
                 aux_hidden_states = [
                     compact_aux_hidden_state(state, self.aux_hidden_state_dtype)
+                    for state in aux_hidden_states
+                ]
+            if hc_sp:
+                aux_hidden_states = [
+                    _gather_aux_hidden_state(state, num_tokens)
                     for state in aux_hidden_states
                 ]
             return sample_hidden_states, aux_hidden_states
@@ -959,17 +1043,7 @@ class Qwen4ExpModel(nn.Module, EagleModelMixin):
         return loaded
 
 
-@support_torch_compile(
-    dynamic_arg_dims={
-        "input_ids": 0,
-        "positions": -1,
-        "intermediate_tensors": 0,
-        "inputs_embeds": 0,
-        "query_start_loc": 0,
-        "ngram_context": 0,
-        "deepstack_input_embeds": 0,
-    }
-)
+@support_torch_compile(dynamic_arg_dims=_QWEN4EXP_DYNAMIC_ARG_DIMS)
 class _Qwen4ExpDecodeGraphModel(nn.Module):
     """Second compiled view of a Qwen4Exp backbone with shared parameters."""
 
@@ -1002,6 +1076,45 @@ class _Qwen4ExpDecodeGraphModel(nn.Module):
             query_start_loc,
             ngram_context,
             deepstack_input_embeds,
+        )
+
+
+@support_torch_compile(
+    dynamic_arg_dims=_QWEN4EXP_DYNAMIC_ARG_DIMS, compile_prefix="qwen4exp_hc_sp"
+)
+class _Qwen4ExpHcSpModel(nn.Module):
+    """Shared-weight prefill view with sequence-parallel HC and PLE."""
+
+    def __init__(
+        self,
+        *,
+        target_model: Qwen4ExpModel,
+        vllm_config: VllmConfig,
+    ) -> None:
+        super().__init__()
+        # This is a non-owning view. Registering the target as a child would
+        # duplicate every checkpoint key and runtime-state traversal.
+        object.__setattr__(self, "_target_model", target_model)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        query_start_loc: torch.Tensor | None = None,
+        ngram_context: torch.Tensor | None = None,
+        deepstack_input_embeds: IntermediateTensors | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
+        return self._target_model._forward_layout(
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
+            query_start_loc,
+            ngram_context,
+            deepstack_input_embeds,
+            hc_sp=True,
         )
 
 
@@ -1048,6 +1161,7 @@ class Qwen4ExpForCausalLM(
         orig_to_new_prefix={"model.language_model.": "model."}
     )
     requires_raw_input_tokens = True
+    _hc_sp_model: _Qwen4ExpHcSpModel
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -1085,6 +1199,24 @@ class Qwen4ExpForCausalLM(
         )
         object.__setattr__(self, "_sm70_decode_graph_model", None)
 
+    def prepare_hc_sp_model(self) -> None:
+        config = copy.copy(self.vllm_config)
+        config.compilation_config = copy.copy(config.compilation_config)
+        compilation = config.compilation_config
+        compilation.cudagraph_mode = CUDAGraphMode.NONE
+        compilation.cudagraph_capture_sizes = []
+        compilation.max_cudagraph_capture_size = 0
+        compilation.compile_ranges_endpoints = [
+            self.scheduler_config.max_num_batched_tokens
+        ]
+        compilation.compile_sizes = []
+        compilation.cache_dir = ""
+        compilation.local_cache_dir = ""
+        compilation.traced_files = set()
+        with set_current_vllm_config(config):
+            backbone = _Qwen4ExpHcSpModel(target_model=self.model, vllm_config=config)
+        object.__setattr__(self, "_hc_sp_model", backbone)
+
     def prepare_sm70_decode_graph_model(self) -> bool:
         """Create the shared-weight decode compiler just before graph capture."""
         if not envs.VLLM_SM70_QWEN38_DUAL_COMPILE:
@@ -1116,12 +1248,16 @@ class Qwen4ExpForCausalLM(
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        *,
+        hc_sp: bool = False,
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors:
         # Forward kwargs unchanged so the runner's _maybe_add_ngram_kwargs
         # path (query_start_loc / ngram_context) reaches Qwen4ExpModel.
-        backbone = self.model
-        if envs.VLLM_SM70_QWEN38_DUAL_COMPILE and is_sm70_decode_graph_compiling():
+        backbone: Qwen4ExpModel | _Qwen4ExpHcSpModel = self.model
+        if hc_sp:
+            backbone = self._hc_sp_model
+        elif envs.VLLM_SM70_QWEN38_DUAL_COMPILE and is_sm70_decode_graph_compiling():
             decode_backbone = self._sm70_decode_graph_model
             if decode_backbone is None:
                 raise RuntimeError(
@@ -1560,6 +1696,9 @@ class Qwen4ExpForConditionalGeneration(
             hidden_states, top_k
         )
 
+    def prepare_hc_sp_model(self) -> None:
+        self.language_model.prepare_hc_sp_model()
+
     def prepare_sm70_decode_graph_model(self) -> bool:
         """Forward decode compiler setup to the wrapped language model."""
         return self.language_model.prepare_sm70_decode_graph_model()
@@ -1589,6 +1728,7 @@ class Qwen4ExpForConditionalGeneration(
             query_start_loc=kwargs.get("query_start_loc"),
             ngram_context=kwargs.get("ngram_context"),
             deepstack_input_embeds=deepstack_input_embeds,
+            hc_sp=kwargs.get("hc_sp") is True,
         )
         if inputs_embeds is not None and get_pp_group().is_first_rank:
             self._clear_deepstack_input_embeds(inputs_embeds.size(0))

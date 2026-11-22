@@ -3994,6 +3994,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self,
         hidden_states: torch.Tensor,
         output: torch.Tensor | None,
+        *,
+        defer_tp_reduce: bool = False,
     ):
         if self.maybe_sm70_qwen_gdn_full_forward:
             layer_name = _encode_layer_name(self.prefix)
@@ -4013,6 +4015,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                         conv_state_cache,
                         ssm_state_cache,
                         layer_name,
+                        defer_tp_reduce,
                     )
                 torch.ops.vllm.qwen_gdn_full_forward(
                     hidden_states,
@@ -4020,15 +4023,23 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     conv_state_cache,
                     ssm_state_cache,
                     layer_name,
+                    defer_tp_reduce,
                 )
                 return
+        if defer_tp_reduce:
+            return self.forward_cuda(hidden_states, output, defer_tp_reduce=True)
         return self._forward_method(hidden_states, output)
 
     def _full_forward(
         self,
         hidden_states: torch.Tensor,
         output: torch.Tensor | None,
+        *,
+        defer_tp_reduce: bool = False,
     ):
+        if defer_tp_reduce:
+            # HC sequence parallelism is an SM70 CUDA target path.
+            return self.forward_cuda(hidden_states, output, defer_tp_reduce=True)
         return self._forward_method(hidden_states, output)
 
     def _compute_output_projection(
@@ -4036,6 +4047,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out: torch.Tensor,
         z: torch.Tensor,
         num_tokens: int,
+        defer_tp_reduce: bool = False,
     ) -> torch.Tensor:
         """Part 3: RMSNormGated + output linear projection.
 
@@ -4117,7 +4129,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.flatten(-2)  # ... h d -> ... (h d)
         profile_start = _sm70_gdn_prefill_profile_start()
-        proj_out, _ = self.out_proj(core_attn_out)
+        if defer_tp_reduce:
+            proj_out, _ = self.out_proj(core_attn_out, reduce_results=False)
+        else:
+            proj_out, _ = self.out_proj(core_attn_out)
         _sm70_gdn_prefill_profile_end(
             layer_name,
             "projection_out_proj",
@@ -4139,9 +4154,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         z: torch.Tensor,
         output: torch.Tensor | None,
         num_tokens: int,
+        defer_tp_reduce: bool = False,
     ) -> torch.Tensor:
         layer_name = _encode_layer_name(self.prefix)
-        proj_out = self._compute_output_projection(core_attn_out, z, num_tokens)
+        proj_out = self._compute_output_projection(
+            core_attn_out, z, num_tokens, defer_tp_reduce
+        )
         if output is not None:
             output[:num_tokens] = proj_out
             _sm70_gdn_graph_buffer_copy(
@@ -4151,6 +4169,24 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 "proj",
             )
         return proj_out
+
+    def _dispatch_output_projection(
+        self,
+        core_attn_out: torch.Tensor,
+        z: torch.Tensor,
+        output: torch.Tensor | None,
+        num_tokens: int,
+        layer_name: LayerNameType,
+        defer_tp_reduce: bool,
+    ) -> torch.Tensor | None:
+        if envs.VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP and output is not None:
+            torch.ops.vllm.qwen_gdn_output_projection(
+                core_attn_out, z, output, num_tokens, layer_name, defer_tp_reduce
+            )
+            return None
+        return self._output_projection(
+            core_attn_out, z, output, num_tokens, defer_tp_reduce
+        )
 
     def forward_hip(
         self,
@@ -4209,6 +4245,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self,
         hidden_states: torch.Tensor,
         output: torch.Tensor | None,
+        *,
+        defer_tp_reduce: bool = False,
     ):
         """
         Forward pass with three parts:
@@ -4243,17 +4281,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 ssm_state_cache,
                 layer_name,
             )
-            if envs.VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP:
-                torch.ops.vllm.qwen_gdn_output_projection(
-                    core_attn_out,
-                    z,
-                    output,
-                    num_tokens,
-                    layer_name,
-                )
-            else:
-                return self._output_projection(core_attn_out, z, output, num_tokens)
-            return None
+            return self._dispatch_output_projection(
+                core_attn_out, z, output, num_tokens, layer_name, defer_tp_reduce
+            )
 
         if envs.VLLM_SM70_QWEN_GDN_INPUT_PROJECTION_OP:
             mixed_qkv = torch.empty(
@@ -4297,17 +4327,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 conv_state_cache=conv_state_cache,
                 ssm_state_cache=ssm_state_cache,
             )
-            if envs.VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP:
-                torch.ops.vllm.qwen_gdn_output_projection(
-                    core_attn_out,
-                    z,
-                    output,
-                    num_tokens,
-                    layer_name,
-                )
-            else:
-                return self._output_projection(core_attn_out, z, output, num_tokens)
-            return None
+            return self._dispatch_output_projection(
+                core_attn_out, z, output, num_tokens, layer_name, defer_tp_reduce
+            )
 
         # ============================================================
         # Part 1: Input Projection
@@ -4437,17 +4459,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ============================================================
         # Part 3: Output Projection
         # ============================================================
-        if envs.VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP:
-            torch.ops.vllm.qwen_gdn_output_projection(
-                core_attn_out,
-                z,
-                output,
-                num_tokens,
-                layer_name,
-            )
-        else:
-            return self._output_projection(core_attn_out, z, output, num_tokens)
-        return None
+        return self._dispatch_output_projection(
+            core_attn_out, z, output, num_tokens, layer_name, defer_tp_reduce
+        )
 
     def forward_xpu(
         self,
@@ -7724,6 +7738,7 @@ def qwen_gdn_full_forward(
     conv_state_cache: torch.Tensor,
     ssm_state_cache: torch.Tensor,
     layer_name: LayerNameType,
+    defer_tp_reduce: bool = False,
 ) -> None:
     """Run the full Qwen GDN attention forward outside Inductor.
 
@@ -7739,7 +7754,7 @@ def qwen_gdn_full_forward(
     # dependency tracking can see the recurrent GDN state side effects.
     _ = conv_state_cache, ssm_state_cache
     _log_runtime_route_once("SM70 Qwen GDN full-forward route enabled.")
-    self._full_forward(hidden_states, output)
+    self._full_forward(hidden_states, output, defer_tp_reduce=defer_tp_reduce)
 
 
 def qwen_gdn_full_forward_fake(
@@ -7748,6 +7763,7 @@ def qwen_gdn_full_forward_fake(
     conv_state_cache: torch.Tensor,
     ssm_state_cache: torch.Tensor,
     layer_name: LayerNameType,
+    defer_tp_reduce: bool = False,
 ) -> None:
     """Fake implementation for torch.compile."""
 
@@ -7757,6 +7773,7 @@ def qwen_gdn_full_forward_direct(
     conv_state_cache: torch.Tensor,
     ssm_state_cache: torch.Tensor,
     layer_name: LayerNameType,
+    defer_tp_reduce: bool = False,
 ) -> torch.Tensor:
     """Keep the full-forward order while returning its projection allocation."""
     layer_name = _resolve_layer_name(layer_name)
@@ -7764,7 +7781,7 @@ def qwen_gdn_full_forward_direct(
     # Match the original opaque op's explicit recurrent-state dependencies.
     # Its eager body accesses these same caches through the layer object.
     _ = conv_state_cache, ssm_state_cache
-    output = layer._full_forward(hidden_states, None)
+    output = layer._full_forward(hidden_states, None, defer_tp_reduce=defer_tp_reduce)
     if output is None:
         raise RuntimeError("Direct GDN full-forward did not return a projection")
     _log_runtime_route_once("SM70 Qwen GDN direct full-forward output route hit.")
@@ -7776,6 +7793,7 @@ def qwen_gdn_full_forward_direct_fake(
     conv_state_cache: torch.Tensor,
     ssm_state_cache: torch.Tensor,
     layer_name: LayerNameType,
+    defer_tp_reduce: bool = False,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
@@ -7786,12 +7804,13 @@ def qwen_gdn_output_projection(
     output: torch.Tensor,
     num_tokens: int,
     layer_name: LayerNameType,
+    defer_tp_reduce: bool = False,
 ) -> None:
     """Run only the Qwen GDN RMSNorm/out-projection segment outside Inductor."""
     layer_name = _resolve_layer_name(layer_name)
     forward_context: ForwardContext = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
-    self._output_projection(core_attn_out, z, output, num_tokens)
+    self._output_projection(core_attn_out, z, output, num_tokens, defer_tp_reduce)
 
 
 def qwen_gdn_output_projection_fake(
@@ -7800,6 +7819,7 @@ def qwen_gdn_output_projection_fake(
     output: torch.Tensor,
     num_tokens: int,
     layer_name: LayerNameType,
+    defer_tp_reduce: bool = False,
 ) -> None:
     """Fake implementation for torch.compile."""
 

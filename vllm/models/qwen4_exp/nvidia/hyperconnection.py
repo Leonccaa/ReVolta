@@ -175,13 +175,16 @@ class GatedResidual(nn.Module):
             return_bias=False,
         )
 
-    def _project(self, xn: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+    def _project(
+        self, xn: torch.Tensor, *, hc_sp: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if self.use_combine:
             fused_fp16 = maybe_apply_qwen38_sm70_fp16_fused_hc(
                 self.input_mix_weight_down_block_inject,
                 self.input_mix_weight_up,
                 xn,
                 getattr(self, "_sm70_qwen38_fp16_fused_hc", False),
+                allow_tp_ll=not hc_sp,
             )
             if fused_fp16 is not None:
                 return fused_fp16
@@ -206,7 +209,7 @@ class GatedResidual(nn.Module):
         return hc_gate_mix(xn, gate, self.hc_count), injection
 
     def mix(
-        self, hidden_states: torch.Tensor
+        self, hidden_states: torch.Tensor, *, hc_sp: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         xn = grouped_gemma_rmsnorm(
             hidden_states,
@@ -215,7 +218,9 @@ class GatedResidual(nn.Module):
             self.hc_count,
         )
 
-        block_input, injection = self._project(xn)
+        block_input, injection = (
+            self._project(xn, hc_sp=True) if hc_sp else self._project(xn)
+        )
 
         return hidden_states, block_input, injection
 
@@ -224,6 +229,8 @@ class GatedResidual(nn.Module):
         hidden_states: torch.Tensor,
         prev_block_output: torch.Tensor | HCTensorParallelPartial,
         prev_injection: torch.Tensor,
+        *,
+        hc_sp: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Consume a pending combine, then prepare the next block input.
 
@@ -250,7 +257,9 @@ class GatedResidual(nn.Module):
                 self.hc_count,
             )
 
-        block_input, injection = self._project(xn)
+        block_input, injection = (
+            self._project(xn, hc_sp=True) if hc_sp else self._project(xn)
+        )
 
         return hidden_states, block_input, injection
 

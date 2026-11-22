@@ -27,11 +27,12 @@ def sp_all_gather(x: torch.Tensor) -> torch.Tensor:
     return tensor_model_parallel_all_gather(x, 0)
 
 
-def sp_reduce_scatter(x: torch.Tensor) -> torch.Tensor:
+def sp_reduce_scatter(x: torch.Tensor, *, dynamic_pad: bool = False) -> torch.Tensor:
     assert x.ndim == 2
     tp_size = get_tensor_model_parallel_world_size()
     sp_pad = (-x.shape[0]) % tp_size
-    if sp_pad > 0:
+    # Compiled callers reuse one graph across divisible and non-divisible batches.
+    if dynamic_pad or sp_pad > 0:
         x = torch.nn.functional.pad(x, (0, 0, 0, sp_pad))
     output = _custom_collective("custom_reduce_scatter", x)
     if output is not None:
@@ -39,11 +40,12 @@ def sp_reduce_scatter(x: torch.Tensor) -> torch.Tensor:
     return tensor_model_parallel_reduce_scatter(x, 0)
 
 
-def sp_shard(x: torch.Tensor) -> torch.Tensor:
+def sp_shard(x: torch.Tensor, *, dynamic_pad: bool = False) -> torch.Tensor:
     tp_size = get_tensor_model_parallel_world_size()
     tp_rank = get_tensor_model_parallel_rank()
     sp_pad = (-x.shape[0]) % tp_size
-    if sp_pad > 0:
+    # Compiled callers reuse one graph across divisible and non-divisible batches.
+    if dynamic_pad or sp_pad > 0:
         pad = (0, 0) * (x.ndim - 1) + (0, sp_pad)
         x = torch.nn.functional.pad(x, pad)
     chunk = x.shape[0] // tp_size

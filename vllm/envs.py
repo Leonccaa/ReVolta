@@ -13138,7 +13138,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=("MTP verifier",),
         user_visible=False,
     ),
-    # Opt-in exact FP16 Flash-Next TP4 draft projections; retains the tuned
+    # Default-on exact FP16 Flash-Next TP4 draft projections retain the tuned
     # BM2 Triton accumulation order, original weights, and FP16 boundaries.
     "VLLM_SM70_MTP_MOE_FP16_EXACT": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_MTP_MOE_FP16_EXACT", "1"))),

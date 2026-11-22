@@ -398,6 +398,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       "${VLLM_SM70_TURBOMIND_LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/kernel/sm70_884_16.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/tm_registry_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/fp8_qpn8_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/mtp_local_top1_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/mxfp4_qpn_m1_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/awq_qpn_m1_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/awq_grouped_decode_sm70.cu"

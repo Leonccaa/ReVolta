@@ -241,6 +241,13 @@ class SpeculativeConfig:
     warn users when they mistakenly provide the wrong argument."""
 
     # Draft model configuration
+    draft_qpn8_head: bool = False
+    """Use a channel-QPN8 vocabulary projection for greedy Flash-Next MTP
+    drafting on SM70 TP4. This quantizes the draft projection and retains
+    the original shared FP16 head. Unsupported configurations use the
+    existing draft projection.
+    """
+
     mtp_expert_quantization: Literal["fp8", "q8_0"] | None = None
     """Select the routed-expert format for Qwen4Exp MTP on SM70. The default
     follows the draft checkpoint, including serialized block-FP8 drafts.

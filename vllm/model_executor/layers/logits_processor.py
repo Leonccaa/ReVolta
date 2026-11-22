@@ -335,6 +335,16 @@ class LogitsProcessor(PluggableLayer):
 
         return local_max_vals, global_indices
 
+    def _get_local_top1_pair(
+        self,
+        lm_head: VocabParallelEmbedding,
+        hidden_states: torch.Tensor,
+        embedding_bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        values, indices = self.get_local_top1(lm_head, hidden_states, embedding_bias)
+        # Use float32 to avoid bf16 precision loss on vocabulary indices.
+        return torch.stack([values.float(), indices.float()], dim=-1)
+
     def get_top_tokens(
         self,
         lm_head: VocabParallelEmbedding,
@@ -348,20 +358,17 @@ class LogitsProcessor(PluggableLayer):
                 "non-positive logit scaling factors."
             )
         tp_size = get_tensor_model_parallel_world_size()
-        local_max_vals, global_indices = self.get_local_top1(
-            lm_head, hidden_states, embedding_bias
-        )
         if tp_size == 1:
+            _, global_indices = self.get_local_top1(
+                lm_head, hidden_states, embedding_bias
+            )
             self._maybe_dump_top_token_margin(
                 lm_head, hidden_states, embedding_bias, global_indices
             )
             return global_indices
 
         # All-gather (value, index) pairs, then reduce to global argmax.
-        # Use float32 to avoid bf16 precision loss on large vocab indices.
-        local_pair = torch.stack(
-            [local_max_vals.float(), global_indices.float()], dim=-1
-        )
+        local_pair = self._get_local_top1_pair(lm_head, hidden_states, embedding_bias)
         _maybe_sync_top1_all_gather(self, local_pair)
         custom_top_tokens = self._maybe_custom_top1_argmax(local_pair)
         if custom_top_tokens is not None:

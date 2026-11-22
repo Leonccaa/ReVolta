@@ -119,6 +119,22 @@ def _hc_workspace(weight: torch.Tensor) -> torch.Tensor:
     return partials
 
 
+def prepare_channel_qpn8_weight(
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack a row-major dense weight with one E4M3 scale per output."""
+    weight_f32 = weight.float()
+    channel_scales = weight_f32.abs().amax(dim=1, keepdim=True).div_(448.0)
+    channel_scales = torch.where(
+        channel_scales == 0, torch.ones_like(channel_scales), channel_scales
+    )
+    qweight = (weight_f32 / channel_scales).to(torch.float8_e4m3fn)
+    codes, scales = sm70_ops.fp8_qpn8_prepare_sm70(
+        qweight.contiguous(), channel_scales.contiguous()
+    )
+    return codes, scales
+
+
 def maybe_prepare_online_qpn8(layer: nn.Module) -> bool:
     """Quantize one admitted FP16 weight and retain only its QPN8 layout."""
     if getattr(layer, _STATE_ATTR, False):
@@ -154,15 +170,7 @@ def maybe_prepare_online_qpn8(layer: nn.Module) -> bool:
     else:
         weight_for_quant = weight
 
-    weight_f32 = weight_for_quant.float()
-    channel_scales = weight_f32.abs().amax(dim=1, keepdim=True).div_(448.0)
-    channel_scales = torch.where(
-        channel_scales == 0, torch.ones_like(channel_scales), channel_scales
-    )
-    qweight = (weight_f32 / channel_scales).to(torch.float8_e4m3fn)
-    codes, scales = sm70_ops.fp8_qpn8_prepare_sm70(
-        qweight.contiguous(), channel_scales.contiguous()
-    )
+    codes, scales = prepare_channel_qpn8_weight(weight_for_quant)
     workspace = _workspace(weight)
 
     replace_parameter(layer, "weight", codes)

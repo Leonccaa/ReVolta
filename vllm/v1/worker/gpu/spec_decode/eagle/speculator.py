@@ -220,6 +220,12 @@ class EagleSpeculator:
         self.model = load_eagle_model(target_model, self.vllm_config)
         self._maybe_initialize_static_draft_vocab()
         self._validate_local_argmax_reduction()
+        if self.speculative_config.draft_qpn8_head and self._static_draft_vocab is None:
+            prepare_draft_head = getattr(
+                self.model, "prepare_sm70_mtp_draft_head", None
+            )
+            if prepare_draft_head is not None:
+                prepare_draft_head()
 
         draft_hf_config = self.draft_model_config.hf_config
         self.share_mtp_topk_indices = (

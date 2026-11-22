@@ -102,11 +102,18 @@ class PromptTokenUsageInfo(OpenAIBaseModel):
     cached_tokens: int | None = None
 
 
+class CompletionTokenUsageInfo(OpenAIBaseModel):
+    reasoning_tokens: int | None = None
+
+
 class UsageInfo(OpenAIBaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
     completion_tokens: int | None = 0
     prompt_tokens_details: PromptTokenUsageInfo | None = None
+    completion_tokens_details: CompletionTokenUsageInfo | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class RequestResponseMetadata(BaseModel):

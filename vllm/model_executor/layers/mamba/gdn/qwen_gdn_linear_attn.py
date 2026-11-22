@@ -78,6 +78,7 @@ from vllm.utils.torch_utils import (
 )
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadata,
+    _sm70_flashqla_original_prefill_enabled,
     gdn_spec_metadata_tensors,
     get_registered_gdn_spec_metadata_tensors,
 )
@@ -394,15 +395,6 @@ def _sm70_gdn_prefill_profile_enabled() -> bool:
 
 def _sm70_profile_trace_enabled() -> bool:
     return envs.VLLM_SM70_PROFILE_TRACE and not torch.compiler.is_compiling()
-
-
-def _sm70_flashqla_original_prefill_enabled() -> bool:
-    raw = os.getenv("VLLM_SM70_FLASHQLA_ORIGINAL_PREFILL")
-    if raw is None:
-        raw = os.getenv("FLASH_QLA_SM70_USE_ORIGINAL_TILELANG")
-    if raw is None:
-        return True
-    return raw.strip().lower() not in ("0", "false", "no", "off", "")
 
 
 # VLLM_SM70_QWEN38_WIDE_M_GDN: token bound of the widened verify admissions
@@ -4702,13 +4694,17 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         qkv_row_stride = qkv_or_qkvz.stride(0) if qkv_or_qkvz.dim() >= 2 else qkv_dim
         self._sm70_gdn_prefill_qkv_row_stride = max(qkv_dim, int(qkv_row_stride))
         prefill_token_counts = (FLA_CHUNK_SIZE, max(1, FLA_CHUNK_SIZE - 1))
+        use_original_flashqla_prefill = (
+            self.gdn_prefill_backend == "flashqla_sm70"
+            and _sm70_flashqla_original_prefill_enabled()
+        )
         warmup_key = (
             qkv_or_qkvz.device.type,
             qkv_or_qkvz.device.index,
             dtype,
             state_dtype,
             self.gdn_prefill_backend,
-            _sm70_flashqla_original_prefill_enabled(),
+            use_original_flashqla_prefill,
             _sm70_flashqla_direct_output_enabled(),
             _sm70_flashqla_indexed_prefill_enabled(),
             num_k_heads,
@@ -4922,11 +4918,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             dtype=state_dtype,
         )
         dummy_prefill_core_attn_out = None
-        if (
-            self.gdn_prefill_backend == "flashqla_sm70"
-            and _sm70_flashqla_original_prefill_enabled()
-            and _sm70_flashqla_direct_output_enabled()
-        ):
+        if use_original_flashqla_prefill and _sm70_flashqla_direct_output_enabled():
             dummy_prefill_core_attn_out = torch.empty(
                 T,
                 num_v_heads,
@@ -4945,9 +4937,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             chunk_indices, chunk_offsets = prepare_metadata_cutedsl(cu_seqlens, T)
 
         trace_prefill_warmup = (
-            _sm70_profile_trace_enabled()
-            and self.gdn_prefill_backend == "flashqla_sm70"
-            and _sm70_flashqla_original_prefill_enabled()
+            use_original_flashqla_prefill and _sm70_profile_trace_enabled()
         )
         prefill_warmup_start = time.perf_counter()
         if trace_prefill_warmup:
@@ -5000,8 +4990,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 self.prefix,
             )
             if (
-                self.gdn_prefill_backend == "flashqla_sm70"
-                and _sm70_flashqla_original_prefill_enabled()
+                use_original_flashqla_prefill
                 and _sm70_flashqla_indexed_prefill_enabled()
             ):
                 indexed_state = torch.zeros(
@@ -5970,7 +5959,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
         prefill_l2norm_in_kernel = False
-        use_original_flashqla_prefill = _sm70_flashqla_original_prefill_enabled()
+        use_original_flashqla_prefill = (
+            attn_metadata.num_prefills > 0
+            and self.gdn_prefill_backend == "flashqla_sm70"
+            and _sm70_flashqla_original_prefill_enabled()
+        )
         prefill_gate_is_exp = False
         if attn_metadata.num_prefills > 0:
             profile_start = _sm70_gdn_prefill_profile_start()
@@ -6236,8 +6229,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             assert non_spec_state_indices_tensor is not None
             assert has_initial_state is not None
             use_indexed_original_prefill = (
-                self.gdn_prefill_backend == "flashqla_sm70"
-                and use_original_flashqla_prefill
+                use_original_flashqla_prefill
                 and _sm70_flashqla_indexed_prefill_enabled()
                 and non_spec_state_indices_tensor.ndim == 1
             )

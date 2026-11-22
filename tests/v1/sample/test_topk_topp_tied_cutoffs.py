@@ -97,6 +97,58 @@ def test_monolithic_cutoff_after_grammar_or_min_p(pivot_device, rows, top_k):
     _assert_pivot_support(x, actual, expected)
 
 
+@pytest.mark.parametrize(
+    "rows,pattern,top_k,top_p,kept_per_row",
+    [
+        (1, "tied", 20, 0.8, 19),
+        (1, "tied", None, 0.8, 19),
+        (1, "tied", 20, None, 23),
+        (1, "grammar", 20, 0.8, 19),
+        (1, "grammar", None, 0.8, 19),
+        (1, "grammar", 50, 0.8, 19),
+        (1, "unique", 20, 0.8, None),
+        (8, "unique", 20, 0.8, None),
+    ],
+)
+def test_v2_filter_matches_pytorch_support(
+    pivot_device, rows, pattern, top_k, top_p, kept_per_row
+):
+    vocab_size = 32768
+    logits = torch.full(
+        (rows, vocab_size),
+        -float("inf") if pattern == "grammar" else -20.0,
+        device=pivot_device,
+    )
+    if pattern == "unique":
+        logits[:, :32] = torch.arange(32, 0, -1, device=pivot_device) / 8
+    elif pattern == "grammar":
+        logits[:, : 23 * 7 : 7] = 1.0
+    else:
+        logits[:, :23] = 1.0
+
+    state = object.__new__(SamplingStates)
+    state.vocab_size = vocab_size
+    kn = np.full(rows, vocab_size if top_k is None else top_k, dtype=np.int32)
+    pn = np.full(rows, 1.0 if top_p is None else top_p, dtype=np.float32)
+    state.top_k = SimpleNamespace(np=kn, gpu=torch.tensor(kn, device=pivot_device))
+    state.top_p = SimpleNamespace(np=pn, gpu=torch.tensor(pn, device=pivot_device))
+    expected = apply_top_k_top_p_pytorch(
+        logits.clone(),
+        None if top_k is None else state.top_k.gpu,
+        None if top_p is None else state.top_p.gpu,
+    )
+    actual = state.apply_top_k_top_p(
+        logits.clone(), torch.arange(rows, device=pivot_device), np.arange(rows)
+    )
+    assert torch.equal(torch.isfinite(actual), torch.isfinite(expected)), (
+        f"kept per row: actual={torch.isfinite(actual).sum(-1).tolist()}, "
+        f"expected={torch.isfinite(expected).sum(-1).tolist()}"
+    )
+    assert torch.equal(actual, expected)
+    if kept_per_row is not None:
+        assert torch.isfinite(actual).sum(-1).tolist() == [kept_per_row] * rows
+
+
 def test_compact_guard_only_rejects_ambiguous_cutoffs():
     unique = torch.arange(21, 0, -1, dtype=torch.float32)[None] / 8
     assert not _compact_target_requires_reference(unique, 1.0, 0.95)

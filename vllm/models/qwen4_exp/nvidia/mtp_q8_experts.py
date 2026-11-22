@@ -61,6 +61,8 @@ class MTPQ80MoEMethod(FusedMoEMethodBase):
         params_dtype,
         **extra_weight_attrs,
     ):
+        if self.moe.use_ep:
+            raise ValueError("Q8_0 MTP cannot use expert-sharded weights")
         local_width = intermediate_size_per_partition
         top_k = self.moe.experts_per_token
         self.workspace_bytes = (

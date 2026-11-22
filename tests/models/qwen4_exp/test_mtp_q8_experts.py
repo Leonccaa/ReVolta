@@ -26,13 +26,14 @@ def should_do_global_cleanup_after_test():
     return False
 
 
-def make_layer(rank, tp, experts=2, hidden=256, width=160):
+def make_layer(rank, tp, experts=2, hidden=256, width=160, *, use_ep=False):
     layer = RoutedExperts.__new__(RoutedExperts)
     torch.nn.Module.__init__(layer)
     parallel = SimpleNamespace(tp_size=tp, tp_rank=rank)
     layer.moe_parallel_config = parallel
     layer.moe_config = SimpleNamespace(
         moe_parallel_config=parallel,
+        use_ep=use_ep,
         experts_per_token=10,
         is_act_and_mul=True,
         has_bias=False,
@@ -502,3 +503,75 @@ def _auto_expert_format_config():
             enable_expert_parallel=False,
         ),
     )
+
+
+@pytest.fixture
+def routed_expert_layout(monkeypatch):
+    from vllm.model_executor.layers.fused_moe import config as moe_config
+
+    group = SimpleNamespace(rank_in_group=0)
+    monkeypatch.setattr(moe_config, "get_dp_group", lambda: group)
+    monkeypatch.setattr(moe_config, "get_pcp_group", lambda: group)
+    monkeypatch.setattr(moe_config, "get_tensor_model_parallel_rank", lambda: 0)
+
+    def make(parallel):
+        parallel.all2all_backend = "allgather_reducescatter"
+        parallel.enable_eplb = False
+        return moe_config.FusedMoEParallelConfig.make(
+            parallel.tensor_parallel_size,
+            parallel.prefill_context_parallel_size,
+            parallel.data_parallel_size,
+            1,
+            parallel,
+        )
+
+    return make
+
+
+@pytest.mark.parametrize(
+    "tp,dp,pcp,ep,local_width,expected",
+    [
+        (4, 1, 1, False, 160, "q8_0"),
+        (4, 2, 1, False, 80, None),
+        (2, 2, 1, False, 160, "q8_0"),
+        (4, 1, 2, False, 80, None),
+        (4, 1, 1, True, 640, None),
+        (1, 1, 1, True, 640, "q8_0"),
+    ],
+)
+def test_auto_q8_uses_routed_expert_layout(
+    monkeypatch, routed_expert_layout, tp, dp, pcp, ep, local_width, expected
+):
+    from vllm.models.qwen4_exp.nvidia import mtp
+
+    cfg = _auto_expert_format_config()
+    parallel = cfg.parallel_config
+    parallel.tensor_parallel_size = tp
+    parallel.data_parallel_size = dp
+    parallel.prefill_context_parallel_size = pcp
+    parallel.enable_expert_parallel = ep
+    layout = routed_expert_layout(parallel)
+    draft = cfg.speculative_config.draft_model_config
+    assert draft.hf_text_config.moe_intermediate_size // layout.tp_size == local_width
+    monkeypatch.setattr(mtp, "get_draft_quant_config", lambda _: None)
+
+    mtp.resolve_mtp_expert_default(cfg)
+
+    assert cfg.speculative_config.mtp_expert_quantization == expected
+
+
+@pytest.mark.parametrize("tp,sharded", [(1, False), (4, True)])
+def test_explicit_q8_requires_unsharded_experts(routed_expert_layout, tp, sharded):
+    parallel = _auto_expert_format_config().parallel_config
+    parallel.tensor_parallel_size = tp
+    parallel.enable_expert_parallel = True
+    layout = routed_expert_layout(parallel)
+    assert layout.use_ep == sharded
+
+    if sharded:
+        with pytest.raises(
+            ValueError, match="Q8_0 MTP cannot use expert-sharded weights"
+        ):
+            make_layer(0, layout.tp_size, width=640, use_ep=layout.use_ep)
+    else:
+        make_layer(0, layout.tp_size, width=640, use_ep=layout.use_ep)

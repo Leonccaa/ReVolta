@@ -248,12 +248,21 @@ def resolve_mtp_expert_default(vllm_config: VllmConfig) -> None:
     spec = vllm_config.speculative_config
     assert spec is not None and spec.draft_model_config is not None
     draft = spec.draft_model_config
-    if draft.dtype != torch.float16 or spec.rejection_sample_method != "standard":
+    parallel = vllm_config.parallel_config
+    # RoutedExperts shards the expert intermediate size across TP, DP and PCP.
+    expert_tp = (
+        parallel.tensor_parallel_size
+        * parallel.data_parallel_size
+        * parallel.prefill_context_parallel_size
+    )
+    if (
+        draft.dtype != torch.float16
+        or spec.rejection_sample_method != "standard"
+        or (parallel.enable_expert_parallel and expert_tp > 1)
+    ):
         return
     config = draft.hf_text_config
-    local_width, remainder = divmod(
-        config.moe_intermediate_size, vllm_config.parallel_config.tensor_parallel_size
-    )
+    local_width, remainder = divmod(config.moe_intermediate_size, expert_tp)
     if remainder or not supports_q8_0_expert_shape(
         config.hidden_size, local_width, config.num_experts_per_tok
     ):

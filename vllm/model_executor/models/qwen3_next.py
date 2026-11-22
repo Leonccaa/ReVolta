@@ -426,7 +426,9 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             else None,
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor, *, reduce_results: bool = True
+    ) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
         orig_shape = hidden_states.shape
         num_tokens, hidden_dim = hidden_states.shape
@@ -441,10 +443,13 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             "moe",
             hidden_states,
         )
+        expert_kwargs = {} if reduce_results else {"reduce_results": False}
         if self.experts.is_internal_router:
             # In this case, the gate/router runs inside the FusedMoE class
             final_hidden_states = self.experts(
-                hidden_states=hidden_states, router_logits=hidden_states
+                hidden_states=hidden_states,
+                router_logits=hidden_states,
+                **expert_kwargs,
             )
         else:
             # router_logits: (num_tokens, n_experts)
@@ -456,7 +461,9 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 router_logits,
             )
             final_hidden_states = self.experts(
-                hidden_states=hidden_states, router_logits=router_logits
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                **expert_kwargs,
             )
         final_hidden_states = _sm70_dump_qwen_layer_tensor(
             "moe_output",

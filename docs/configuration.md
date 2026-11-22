@@ -29,6 +29,12 @@ output sum (sum2) uses its own push kernel at the sizes that have one and otherw
 locally before the ordinary all-reduce. Override with `VLLM_SM70_INTERCONNECT=auto|pex|nccl|nvlink`
 or disable custom all-reduce with `--disable-custom-all-reduce`.
 
+`VLLM_SM70_NVLINK_HC=1` opts into experimental Flash-Next HC sharding and fused
+all-reduce/HC for synchronous Model Runner V2. It defaults to `0`. All six SM70
+TP4 GPU pairs must have direct NVLink and native peer atomics.
+An interconnect override cannot satisfy these checks. This path can change
+floating-point rounding and is subject to model quality validation.
+
 ## Launch options
 
 `--kv-cache-dtype` selects the storage format:

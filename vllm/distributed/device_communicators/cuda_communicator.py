@@ -134,6 +134,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 register_nccl_symmetric_ops(self.pynccl_comm)
 
         self.ca_comm: CustomAllreduce | None = None
+        self.sm70_hc_ll = None
         self.qr_comm: QuickAllReduce | None = None
         self.symm_mem_comm: SymmMemCommunicator | None = None
         self.fi_ar_comm: FlashInferAllReduce | None = None
@@ -198,6 +199,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
                     self.unique_name or "<unnamed>",
                     scope="global",
                 )
+
+        if self.ca_comm is not None and self.ca_comm.sm70_hc_ll_requested:
+            from vllm.config import get_current_vllm_config
+
+            from .sm70_hc_ll import Sm70HcLLCommunicator
+
+            self.sm70_hc_ll = Sm70HcLLCommunicator.create(
+                self.cpu_group, self.device, self.rank_in_group
+            )
+            get_current_vllm_config().kernel_config.sm70_nvlink_hc_active = (
+                self.sm70_hc_ll is not None
+            )
 
         if (
             "tp" in unique_name
@@ -666,6 +679,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # teardown. A no-op retry must not erase a partial close failure.
             self._destroy_errors = cleanup.errors
             for name, method in (
+                ("sm70_hc_ll", "close"),
                 ("pynccl_comm", "destroy"),
                 ("ca_comm", "close"),
                 ("fi_ar_comm", "destroy"),

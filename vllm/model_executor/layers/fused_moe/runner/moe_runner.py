@@ -845,11 +845,23 @@ class MoERunner(MoERunnerInterface):
             result = result + zero_expert_output
         return result
 
+    def can_defer_tp_reduce(self) -> bool:
+        return (
+            self.moe_config.tp_size == 4
+            and self.moe_config.ep_size == 1
+            and self.moe_config.pcp_size == 1
+            and not self.moe_config.is_sequence_parallel
+            and not self._fused_output_is_reduced
+            and not isinstance(self.router, ZeroExpertRouter)
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
+        *,
+        reduce_results: bool = True,
     ) -> torch.Tensor:
         """Invoke the fused moe layer.
 
@@ -946,9 +958,11 @@ class MoERunner(MoERunnerInterface):
             self.layer_name,
         )
 
-        result = self._maybe_sm70_moe_sum2_allreduce(
-            shared_output, fused_output, og_hidden_dim
-        )
+        result = None
+        if reduce_results:
+            result = self._maybe_sm70_moe_sum2_allreduce(
+                shared_output, fused_output, og_hidden_dim
+            )
         if result is not None:
             result = _sm70_dump_moe_runner_tensor(
                 result,
@@ -967,6 +981,8 @@ class MoERunner(MoERunnerInterface):
             self.layer_name,
         )
 
+        if not reduce_results:
+            return result[..., :og_hidden_dim]
         result = self._maybe_reduce_final_output(result, og_hidden_dim)
         result = _sm70_dump_moe_runner_tensor(
             result,

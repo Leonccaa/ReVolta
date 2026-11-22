@@ -500,6 +500,7 @@ if TYPE_CHECKING:
     VLLM_SM70_CAR_VMM_SAFE: bool = False
     VLLM_SM70_CAR_VMM_SAFE_PREALLOC: bool = True
     VLLM_SM70_INTERCONNECT: str = "auto"
+    VLLM_SM70_NVLINK_HC: bool = False
     VLLM_SM70_PCIE_SWITCH_CUSTOM_AR: str = "auto"
     VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES: int = 204800
     VLLM_SM70_PCIE_SWITCH_CAR_GRAPH_ONLY: bool = True
@@ -7775,6 +7776,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="experimental",
         declared_default="True",
         effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 collectives",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_NVLINK_HC": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_NVLINK_HC", "0"))),
+        description=(
+            "Opt in to Flash-Next HC LL sharding and fused all-reduce/HC on "
+            "physically fully connected NVLink SM70 TP4."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 collectives",),
         user_visible=False,
@@ -20364,6 +20378,8 @@ def compile_factors(speculative_config: Any = None) -> dict[str, object]:
         "MAX_JOBS",
         # Engine idle policy does not change compiled code.
         "VLLM_SM70_IDLE_CLOCK_SECONDS",
+        # Only the resolved physical mesh changes the traced HC graph.
+        "VLLM_SM70_NVLINK_HC",
         # Scheduler/KV planning only; never changes compiled code.
         "VLLM_SM70_HOST_KV_STATIC_HOT_POOL",
         # Runtime branches inside opaque QSA ops; no traced graph change.

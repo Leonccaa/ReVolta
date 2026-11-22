@@ -16,10 +16,12 @@ from vllm.compilation.sm70_decode_graph import is_sm70_decode_graph_compiling
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.speculative_kv import dflash_draft_cache_dtype
 from vllm.distributed import get_pp_group
+from vllm.distributed.device_communicators.sm70_hc_ll import get_tp_hc_ll
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
+from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
@@ -87,7 +89,11 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, get_kv_quant_mode
 
 from ..config import Qwen4ExpConfig
-from .hyperconnection import GatedResidual, HyperConnectionConfig
+from .hyperconnection import (
+    GatedResidual,
+    HCTensorParallelPartial,
+    HyperConnectionConfig,
+)
 from .sm70_fp16_gemv import enable_qwen38_sm70_fp16_gemv
 from .sm70_fp16_hc import enable_qwen38_sm70_fp16_fused_hc
 
@@ -360,6 +366,9 @@ class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
 
 
 class Qwen4ExpDecoderLayer(nn.Module):
+    _sm70_hc_ll = False
+    _sm70_hc_ll_attn_partial = False
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -467,6 +476,24 @@ class Qwen4ExpDecoderLayer(nn.Module):
             prefix=maybe_prefix(prefix, "mlp_hyper_connection"),
         )
         self.hc_count = config.hc_count
+        self._sm70_hc_ll = (
+            config.hc_count == 4
+            and config.hidden_size == 2560
+            and config.hc_lowrank == 320
+            and model_config.dtype == torch.float16
+            and get_tp_hc_ll() is not None
+        )
+        # Reuse the row-parallel projection's local-output contract. QSA's
+        # earlier DCP collectives and GDN's opaque forward are unchanged.
+        self._sm70_hc_ll_attn_partial = False
+        if self._sm70_hc_ll:
+            if layer_type == "linear_attention":
+                projection = self.linear_attn.out_proj
+            else:
+                projection = self.self_attn.o_proj
+            if projection.reduce_results:
+                projection.reduce_results = False
+                self._sm70_hc_ll_attn_partial = True
         # Set by Qwen4ExpModel when a drafter conditions on the state entering
         # this layer, i.e. the completed output of the previous layer.
         self.aux_hidden_state_tap = False
@@ -474,7 +501,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        prev_block_output: torch.Tensor | None,
+        prev_block_output: torch.Tensor | HCTensorParallelPartial | None,
         prev_injection: torch.Tensor | None,
         positions: torch.Tensor,
         *,
@@ -482,7 +509,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         query_start_loc: torch.Tensor | None,
         ngram_context: torch.Tensor | None,
         aux_hidden_states: list[torch.Tensor] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor | HCTensorParallelPartial, torch.Tensor]:
         attn_hc = self.attn_hyper_connection
         tap = aux_hidden_states is not None and self.aux_hidden_state_tap
         if self.ple is not None:
@@ -552,9 +579,17 @@ class Qwen4ExpDecoderLayer(nn.Module):
             raise ValueError("Invalid layer_type")
 
         mlp_hc = self.mlp_hyper_connection
+        pending_attn: torch.Tensor | HCTensorParallelPartial = attn_out
+        if self._sm70_hc_ll_attn_partial:
+            pending_attn = HCTensorParallelPartial(attn_out)
         hidden_states, block_input, injection = mlp_hc.combine_and_mix(
-            hidden_states, attn_out, injection
+            hidden_states, pending_attn, injection
         )
+        if self._sm70_hc_ll and isinstance(self.mlp, Qwen4ExpSparseMoeBlock):
+            runner = self.mlp.experts.runner
+            if isinstance(runner, MoERunner) and runner.can_defer_tp_reduce():
+                partial = self.mlp(block_input, reduce_results=False)
+                return hidden_states, HCTensorParallelPartial(partial), injection
         mlp_out = self.mlp(block_input)
         return hidden_states, mlp_out, injection
 

@@ -23,6 +23,7 @@ from vllm.config.speculative import (
 from vllm.distributed.parallel_state import (
     GraphCaptureContext,
     get_pp_group,
+    get_tp_group,
     graph_capture,
     is_global_first_rank,
 )
@@ -552,6 +553,9 @@ class CudaGraphManager:
         captured_attn_states: dict[
             BatchExecutionDescriptor, CapturedAttentionState
         ] = {}
+        from vllm.distributed.device_communicators.sm70_hc_ll import get_tp_hc_ll
+
+        hc_ll_active = get_tp_hc_ll() is not None
         with graph_capture(device=self.device, context=self.get_capture_context()):
             # Capture in order: PIECEWISE first, then FULL. PIECEWISE has larger
             # activations so FULL activations should fit in already allocated
@@ -567,6 +571,13 @@ class CudaGraphManager:
                     for desc in descs:
                         # Prepare inputs and get forward function
                         forward_fn, attn_state = create_forward_fn(desc)
+
+                        # The NVLink HC LL kernels spin on peer data with a
+                        # device watchdog. Ranks finish per-rank compilation at
+                        # different times, so align them before each eager run.
+                        if hc_ll_active:
+                            torch.accelerator.synchronize()
+                            get_tp_group().barrier()
 
                         # Warmup
                         forward_fn(CUDAGraphMode.NONE)
@@ -599,6 +610,9 @@ class CudaGraphManager:
                                     "pre-capture warmup for stable replay."
                                 )
                                 get_offloader().sync_prev_onload()
+                                if hc_ll_active:
+                                    torch.accelerator.synchronize()
+                                    get_tp_group().barrier()
                                 forward_fn(CUDAGraphMode.NONE)
                                 get_offloader().join_after_forward()
                                 torch.accelerator.synchronize()

@@ -682,7 +682,7 @@ class KernelConfig:
     gathering full-vocabulary logits for the rejection sampler."""
 
     sm70_sparse_target_sampling: bool = False
-    """Guarded compact target sampling for SM70 MRv2 MTP5
+    """Guarded compact target sampling for SM70 MRv2 with uniform MTP3-5,
     with greedy drafts and target temperature=1, top_k=20, top_p=0.95.
     Unsupported batches and ambiguous cutoffs keep the dense reference.
     """

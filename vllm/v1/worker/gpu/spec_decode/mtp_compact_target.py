@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Guarded compact sampling for fixed-width SM70 MTP verification."""
+"""Guarded compact sampling for uniform-width SM70 MTP verification."""
 
 from __future__ import annotations
 
@@ -33,9 +33,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-_STEPS = 5
-_VOCAB_SIZE = 248320
-
 
 def _is_sm70(device: torch.device) -> bool:
     return device.type == "cuda" and current_platform.is_device_capability(
@@ -65,8 +62,6 @@ def try_mtp_compact_target_rejection(
         )
         return None
 
-    if spec_config.method != "mtp":
-        return dense("not_mtp")
     if spec_config.draft_sample_method != "greedy" or draft_logits is not None:
         return dense("not_greedy_draft")
     if grammar_output is not None or input_batch.has_structured_output_reqs:
@@ -78,23 +73,20 @@ def try_mtp_compact_target_rejection(
     probe = getattr(model, "get_mtp_target_topk_with_fallback", None)
     sampler = rejection_sampler.sampler
     states = sampler.sampling_states
-    if probe is None or states.vocab_size != _VOCAB_SIZE:
+    if probe is None:
         return dense("unsupported_target")
     if input_batch.is_dummy_batch:
         return dense("dummy_batch")
-    if np.any(input_batch.is_prefilling_np):
-        return dense("prefill_or_mixed_batch")
-    if (
-        not 1 <= input_batch.num_reqs <= 8
-        or rejection_sampler.num_speculative_steps != _STEPS
-        or not np.all(np.diff(input_batch.cu_num_logits_np) == _STEPS + 1)
-    ):
-        return dense("not_uniform_k5")
+    max_steps = rejection_sampler.num_speculative_steps
+    if not 1 <= input_batch.num_reqs <= 8 or not 3 <= max_steps <= 5:
+        return dense("unsupported_width")
+    row_counts = np.diff(input_batch.cu_num_logits_np)
+    steps = int(row_counts[0]) - 1
+    if not 3 <= steps <= max_steps or not np.all(row_counts == steps + 1):
+        return dense("unsupported_or_mixed_width")
     idx = input_batch.idx_mapping_np
     if np.any(states.temperature.np[idx] != np.float32(1.0)):
         return dense("temperature")
-    if np.any(states.top_k.np[idx] != _TARGET_TOP_K):
-        return dense("top_k")
     if np.any(states.top_p.np[idx] != np.float32(0.95)):
         return dense("top_p")
     if not _supports_sparse_sampling_contract(rejection_sampler, input_batch):
@@ -105,11 +97,9 @@ def try_mtp_compact_target_rejection(
     ids, logits, fallback = probe(sample_hidden_states, _TARGET_PROBE_K)
     if fallback is None:
         return dense("projection_has_no_reference")
-    logits = torch.empty_like(logits, dtype=torch.float32).copy_(logits)
     expanded = input_batch.expanded_idx_mapping
-    states.apply_temperature(logits, expanded, idx)
     logits, ids = sort_topk_with_vocab_ties(
-        logits, ids, vocab_size=states.vocab_size, descending=True
+        logits.float(), ids, vocab_size=states.vocab_size, descending=True
     )
     reference_rows = _compact_target_reference_rows_gpu(
         logits, states.top_p.gpu, expanded, strict_top_k=True
@@ -143,7 +133,9 @@ def try_mtp_compact_target_rejection(
         input_batch.idx_mapping,
         states.top_p.gpu,
         states.seeds.gpu,
-        _STEPS,
+        # Keep the configured output stride shared with the dense fallback.
+        # Verification and bonus are bounded by each request's actual row end.
+        max_steps,
         sampler.use_fp64_gumbel,
     )
     if reference_logits is not None:
@@ -153,13 +145,13 @@ def try_mtp_compact_target_rejection(
         sampled.index_copy_(0, reqs, dense_ids)
         num_sampled.index_copy_(0, reqs, dense_counts)
     compact_reqs = idx.size - reference_reqs.size
-    logger.info_once("Using SM70 MTP compact target sampling (guarded K5).")
+    logger.info_once("Using SM70 MTP compact target sampling (guarded K%d).", steps)
     logger.debug(
         "SM70 MTP compact target route=%s compact_requests=%d compact_rows=%d "
         "reference_requests=%d",
         "mixed" if reference_reqs.size else "compact",
         compact_reqs,
-        compact_reqs * (_STEPS + 1),
+        compact_reqs * (steps + 1),
         reference_reqs.size,
     )
     return SamplerOutput(

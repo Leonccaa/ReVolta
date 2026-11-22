@@ -567,14 +567,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.speculator is not None:
                 prepare_communication_buffer_for_model(self.speculator.model)
 
+        self._hc_sp_enabled = False
         if (
             self.parallel_config.enable_hc_sp
             and self.parallel_config.tensor_parallel_size > 1
             and not self.use_pp
-            and self.dp_size == 1
-            and self.lora_config is None
             and self.compilation_config.mode == CompilationMode.VLLM_COMPILE
-            and current_platform.is_device_capability(70)
         ):
             prepare_hc_sp = getattr(self.model, "prepare_hc_sp_model", None)
             if prepare_hc_sp is not None:
@@ -929,7 +927,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     @property
     def hc_sp_min_tokens(self) -> int | None:
-        if not getattr(self, "_hc_sp_enabled", False):
+        if not self._hc_sp_enabled:
             return None
         cmax = (
             self.cudagraph_manager.max_captured_tokens
@@ -2128,7 +2126,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if _should_use_hc_sp(
                 input_batch,
                 batch_desc.cg_mode,
-                getattr(self, "hc_sp_min_tokens", None),
+                self.hc_sp_min_tokens,
                 skip_compiled=skip_compiled,
                 profile_hc_sp=profile_hc_sp and dummy_run and is_profile,
             ):

@@ -144,9 +144,9 @@ def test_native_router_rejects_unsupported_storage(failure):
         torch.ops.vllm_sm70_router.top10(*out, logits)
 
 
-@pytest.mark.parametrize("m", [17, 18, 19, 20])
+@pytest.mark.parametrize("m", [17, 18, 19, 20, 24, 48])
 def test_fused_topk_native_route_for_verifier_rows(m, monkeypatch):
-    """VLLM_SM70_QWEN38_NATIVE_ROUTER_TOPK routes M17..20 through #1147."""
+    """VLLM_SM70_QWEN38_NATIVE_ROUTER_TOPK routes M17..20, M24 and M48 natively."""
     from vllm.model_executor.layers.fused_moe.router.fused_topk_router import (
         fused_topk,
     )

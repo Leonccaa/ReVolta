@@ -19,7 +19,10 @@ import torch
 from torch import nn
 
 import vllm.envs as envs
-from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
+from vllm.compilation.sm70_decode_graph import (
+    is_sm70_decode_graph_compiling,
+    use_sm70_decode_graph_semantics,
+)
 from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
@@ -574,14 +577,28 @@ def _qwen38_sm70_fp16_gdn_input(
     ba_weight: torch.Tensor,
     packed_qkvz: torch.Tensor | None = None,
     packed_ba: torch.Tensor | None = None,
+    use_v154_m3_m4: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if _can_use_packed_gdn_input(x, packed_qkvz, packed_ba):
-        qkv, z, b, a = (x.new_empty((x.shape[0], n)) for n in (2560, 1536, 12, 12))
-        torch.ops._C.qwen38_gdn_input_batch_sm70_out(
-            qkv, z, b, a, x, packed_qkvz, packed_ba
+        use_v154 = (
+            use_v154_m3_m4 and x.shape[0] in (3, 4) and is_sm70_decode_graph_compiling()
         )
-        logger.info_once("SM70 Qwen3.8 checkpoint-FP16 batched GDN input enabled.")
-        return qkv, z, b, a
+        # With NO_PACK=1 the new packed weights are only for the FULL trial.
+        if use_v154 or not envs.VLLM_SM70_QWEN38_GDN_NO_PACK:
+            op = (
+                torch.ops._C.qwen38_gdn_input_mtp_batch_sm70_out
+                if use_v154
+                else torch.ops._C.qwen38_gdn_input_batch_sm70_out
+            )
+            qkv, z, b, a = (x.new_empty((x.shape[0], n)) for n in (2560, 1536, 12, 12))
+            op(qkv, z, b, a, x, packed_qkvz, packed_ba)
+            if use_v154:
+                logger.info_once("SM70 v154 packed target GDN input enabled for M3/M4.")
+            else:
+                logger.info_once(
+                    "SM70 Qwen3.8 checkpoint-FP16 batched GDN input enabled."
+                )
+            return qkv, z, b, a
     if not (
         qkvz_weight.shape == (4096, 2560)
         and ba_weight.shape == (24, 2560)
@@ -632,8 +649,9 @@ def _qwen38_sm70_fp16_gdn_input_fake(
     ba_weight: torch.Tensor,
     packed_qkvz: torch.Tensor | None = None,
     packed_ba: torch.Tensor | None = None,
+    use_v154_m3_m4: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    del qkvz_weight, ba_weight, packed_qkvz, packed_ba
+    del qkvz_weight, ba_weight, packed_qkvz, packed_ba, use_v154_m3_m4
     batch_shape = x.shape[:-1]
     return (
         x.new_empty((*batch_shape, 2560)),
@@ -732,7 +750,8 @@ class Qwen38SM70FP16LinearMethod(UnquantizedLinearMethod):
         weight = layer.weight
         if not weight.is_cuda or weight.dtype != torch.float16:
             return  # The PLE-only/meta loader never executes this GPU route.
-        if envs.VLLM_SM70_QWEN38_GDN_NO_PACK:
+        use_v154 = getattr(layer, "_sm70_qwen38_gdn_input_v154", False)
+        if envs.VLLM_SM70_QWEN38_GDN_NO_PACK and not use_v154:
             # 2..48 rows read the original weights (skinny dual GEMM).
             logger.info_once("SM70 Qwen3.8 GDN input: packed copy disabled.")
             return
@@ -952,6 +971,13 @@ def enable_qwen38_sm70_fp16_gemv(
                 assert qkvz is not None and ba is not None
                 qkvz._sm70_qwen38_prepare_gdn_batch = True
                 ba._sm70_qwen38_prepare_gdn_batch = True
+                if (
+                    batch_qualified
+                    and vllm_config.kernel_config.sm70_gdn_input_v154
+                    and not vllm_config.is_speculative_draft
+                ):
+                    qkvz._sm70_qwen38_gdn_input_v154 = True
+                    ba._sm70_qwen38_gdn_input_v154 = True
             fused_gdn_inputs += 1
 
     if replaced:

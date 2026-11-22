@@ -1,14 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import hashlib
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Mapping, Sequence
+from array import array
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from concurrent.futures import Executor, ThreadPoolExecutor
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import replace
 from functools import cached_property
+from threading import Lock
 from typing import TYPE_CHECKING, Any, Generic, overload
 
 from typing_extensions import TypeVar
@@ -46,6 +49,7 @@ from vllm.utils.async_utils import (
     AsyncMicrobatchTokenizer,
     make_async,
 )
+from vllm.utils.cache import LRUCache
 from vllm.utils.counter import AtomicCounter
 from vllm.utils.torch_utils import set_default_torch_num_threads
 from vllm.v1.metrics.stats import MultiModalCacheStats
@@ -75,6 +79,155 @@ logger = init_logger(__name__)
 _T = TypeVar("_T", bound=TokenizerLike, default=TokenizerLike)
 
 
+class _PrefixTokenizeCache:
+    """Bounded LRU cache of BPE token IDs up to ``<|im_start|>`` boundaries.
+
+    When ``<|im_start|>`` is verified at startup to be an atomic special token
+    that never merges across its left boundary, ``encode(text[:pos] +
+    text[pos:], add_special_tokens=False)`` equals ``encode(text[:pos],
+    add_special_tokens=False) + encode(text[pos:], add_special_tokens=False)``.
+    Multi-turn agent sessions therefore encode only newly appended turns instead
+    of re-tokenizing 40K-100K historical tokens on every turn.
+    """
+
+    _DELIM = "<|im_start|>"
+    _MIN_CHARS = 2048
+    _MAX_TOKENS = 4 * 1024 * 1024  # 16 MiB of packed token IDs per renderer.
+
+    def __init__(self, tokenizer: TokenizerLike | None, max_entries: int = 96) -> None:
+        self._max_entries = max_entries
+        self._entries = LRUCache[bytes, array[int]](self._MAX_TOKENS, getsizeof=len)
+        self._lock = Lock()
+        self._im_start_id: int | None = None
+        if tokenizer is None or not tokenizer.is_fast:
+            return
+        try:
+            tok_id = tokenizer.get_added_vocab().get(self._DELIM)
+            token = getattr(tokenizer, "added_tokens_decoder", {}).get(tok_id)
+            if (
+                tok_id is None
+                or token is None
+                or not token.special
+                or token.normalized
+                or token.single_word
+                or token.lstrip
+                or token.rstrip
+            ):
+                return
+            probe_l = "hello\n"
+            probe_r = f"{self._DELIM}user\nworld"
+            full = list(tokenizer.encode(probe_l + probe_r, add_special_tokens=False))
+            left = list(tokenizer.encode(probe_l, add_special_tokens=False))
+            right = list(tokenizer.encode(probe_r, add_special_tokens=False))
+            alone = list(tokenizer.encode(self._DELIM, add_special_tokens=False))
+            if (
+                alone == [tok_id]
+                and right
+                and right[0] == tok_id
+                and full == left + right
+            ):
+                self._im_start_id = tok_id
+        except Exception:
+            self._im_start_id = None
+
+    @property
+    def enabled(self) -> bool:
+        return self._im_start_id is not None
+
+    def _put(self, digest: bytes, tokens: Sequence[int]) -> None:
+        if not tokens or len(tokens) > self._MAX_TOKENS:
+            return
+        entry = array("I", tokens)
+        with self._lock:
+            self._entries[digest] = entry
+            while len(self._entries) > self._max_entries:
+                self._entries.popitem()
+
+    def plan(
+        self, text: str, encode_kwargs: Mapping[str, Any]
+    ) -> tuple[list[int], list[tuple[int, int, bytes]], int, list[int]] | None:
+        if (
+            self._im_start_id is None
+            or len(text) < self._MIN_CHARS
+            or encode_kwargs.get("add_special_tokens", True)
+        ):
+            return None
+        delim = self._DELIM
+        dlen = len(delim)
+        starts: list[int] = []
+        pos = text.find(delim, 0)
+        while pos != -1:
+            starts.append(pos)
+            pos = text.find(delim, pos + dlen)
+        if not starts or starts[-1] == 0:
+            return None
+        checkpoints: list[tuple[int, int, bytes]] = []
+        h = hashlib.blake2b(digest_size=16)
+        prev = 0
+        for s_idx, s_pos in enumerate(starts):
+            if s_pos > 0:
+                h.update(text[prev:s_pos].encode("utf-8"))
+                prev = s_pos
+                checkpoints.append((s_idx, s_pos, h.digest()))
+        hit_ckpt_idx = -1
+        prefix = None
+        # Keep a reference to the selected entry through concurrent eviction.
+        # Published arrays are never mutated, so unpack outside the lock.
+        with self._lock:
+            for idx in range(len(checkpoints) - 1, -1, -1):
+                digest = checkpoints[idx][2]
+                if digest in self._entries:
+                    prefix = self._entries[digest]
+                    hit_ckpt_idx = idx
+                    break
+        return starts, checkpoints, hit_ckpt_idx, prefix.tolist() if prefix else []
+
+    def encode_chat_fragment(
+        self, encode: Callable[..., list[int]], text: str, *args: Any, **kwargs: Any
+    ) -> list[int]:
+        # Transformers may route marked text through encode with different
+        # options. Only its ordinary, untruncated fragment calls can reuse IDs.
+        if not isinstance(text, str) or args or kwargs != {"add_special_tokens": False}:
+            return encode(text, *args, **kwargs)
+        plan = self.plan(text, kwargs)
+        if plan is None:
+            return encode(text, **kwargs)
+        starts, checkpoints, hit_idx, prefix_ids = plan
+        pos = checkpoints[hit_idx][1] if hit_idx >= 0 else 0
+        ids = encode(text[pos:], **kwargs)
+        if hit_idx >= 0:
+            ids = prefix_ids + ids
+        self.record_full(starts, checkpoints, ids, hit_idx)
+        return ids
+
+    def record_full(
+        self,
+        starts: list[int],
+        checkpoints: list[tuple[int, int, bytes]],
+        full_ids: Sequence[int],
+        hit_ckpt_idx: int = -1,
+    ) -> None:
+        im_start_id = self._im_start_id
+        if im_start_id is None:
+            return
+        delim_locs = [i for i, tid in enumerate(full_ids) if tid == im_start_id]
+        if len(delim_locs) != len(starts):
+            return
+        n_ckpts = len(checkpoints)
+        save_indices: set[int] = {n_ckpts - 1}
+        if n_ckpts >= 2:
+            save_indices.add(0)
+            save_indices.add(n_ckpts - 2)
+        for idx in range(7, n_ckpts, 8):
+            save_indices.add(idx)
+        for ckpt_idx in sorted(save_indices):
+            if ckpt_idx <= hit_ckpt_idx:
+                continue
+            s_idx, _, digest = checkpoints[ckpt_idx]
+            if 0 < s_idx < len(delim_locs):
+                self._put(digest, full_ids[: delim_locs[s_idx]])
+
+
 class BaseRenderer(ABC, Generic[_T]):
     def __init__(self, config: "VllmConfig", tokenizer: _T | None) -> None:
         super().__init__()
@@ -101,6 +254,7 @@ class BaseRenderer(ABC, Generic[_T]):
 
         # Lazy initialization since offline LLM doesn't use async
         self._async_tokenizer: AsyncMicrobatchTokenizer | None = None
+        self._prefix_tok_cache = _PrefixTokenizeCache(self.tokenizer)
 
         self.mm_processor: BaseMultiModalProcessor | None = None
         self._readonly_mm_processor: BaseMultiModalProcessor | None = None
@@ -455,10 +609,30 @@ class BaseRenderer(ABC, Generic[_T]):
         params: TokenizeParams,
     ) -> TokensPrompt:
         tokenizer = self.get_tokenizer()
-        prompt_token_ids = tokenizer.encode(
-            prompt["prompt"],
-            **params.get_encode_kwargs(),
+        encode_kwargs = params.get_encode_kwargs()
+        text = prompt["prompt"]
+        cache = getattr(self, "_prefix_tok_cache", None)
+        plan = (
+            cache.plan(text, encode_kwargs)
+            if cache is not None and params.truncate_prompt_tokens is None
+            else None
         )
+        if plan is not None and cache is not None:
+            starts, checkpoints, hit_idx, prefix_ids = plan
+            if hit_idx >= 0:
+                _, hit_pos, _ = checkpoints[hit_idx]
+                tail_ids = tokenizer.encode(text[hit_pos:], **encode_kwargs)
+                prompt_token_ids = prefix_ids + tail_ids
+            else:
+                prompt_token_ids = tokenizer.encode(text, **encode_kwargs)
+            max_len = encode_kwargs.get("max_length")
+            if max_len is None or len(prompt_token_ids) < max_len:
+                cache.record_full(starts, checkpoints, prompt_token_ids, hit_idx)
+            elif hit_idx >= 0:
+                # Keep the tokenizer's truncation side and never cache a truncated row.
+                prompt_token_ids = tokenizer.encode(text, **encode_kwargs)
+        else:
+            prompt_token_ids = tokenizer.encode(text, **encode_kwargs)
 
         return TokensPrompt(prompt_token_ids=prompt_token_ids, **prompt)
 
@@ -468,10 +642,29 @@ class BaseRenderer(ABC, Generic[_T]):
         params: TokenizeParams,
     ) -> TokensPrompt:
         tokenizer = self.get_async_tokenizer()
-        prompt_token_ids = await tokenizer.encode(
-            prompt["prompt"],
-            **params.get_encode_kwargs(),
+        encode_kwargs = params.get_encode_kwargs()
+        text = prompt["prompt"]
+        cache = getattr(self, "_prefix_tok_cache", None)
+        plan = (
+            cache.plan(text, encode_kwargs)
+            if cache is not None and params.truncate_prompt_tokens is None
+            else None
         )
+        if plan is not None and cache is not None:
+            starts, checkpoints, hit_idx, prefix_ids = plan
+            if hit_idx >= 0:
+                _, hit_pos, _ = checkpoints[hit_idx]
+                tail_ids = await tokenizer.encode(text[hit_pos:], **encode_kwargs)
+                prompt_token_ids = prefix_ids + tail_ids
+            else:
+                prompt_token_ids = await tokenizer.encode(text, **encode_kwargs)
+            max_len = encode_kwargs.get("max_length")
+            if max_len is None or len(prompt_token_ids) < max_len:
+                cache.record_full(starts, checkpoints, prompt_token_ids, hit_idx)
+            elif hit_idx >= 0:
+                prompt_token_ids = await tokenizer.encode(text, **encode_kwargs)
+        else:
+            prompt_token_ids = await tokenizer.encode(text, **encode_kwargs)
 
         return TokensPrompt(prompt_token_ids=prompt_token_ids, **prompt)
 

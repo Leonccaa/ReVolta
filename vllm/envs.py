@@ -837,6 +837,7 @@ if TYPE_CHECKING:
     VLLM_SM70_GDN_DECODE_FLASHQLA_ROUTE_DEBUG: bool = False
     VLLM_SM70_FLASHQLA_DECODE_WARMUP: bool = True
     VLLM_SM70_FUSED_SIGMOID_MIXED_QKV: bool = True
+    VLLM_SM70_MTP_GDN_NATIVE_VERIFY: bool = False
     VLLM_SM70_FUSED_SIGMOID_MIXED_QKV_COMPARE: bool = False
     VLLM_SM70_GDN_EMPTY_CORE_OUT: bool = False
     VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP: bool = False
@@ -13024,6 +13025,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy", "Flash-Next qualified batch"),
+        user_visible=True,
+    ),
+    "VLLM_SM70_MTP_GDN_NATIVE_VERIFY": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_GDN_NATIVE_VERIFY", "0"))),
+        description="Opt in to SM70 MTP native GDN verify and accepted-state replay.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
         user_visible=True,
     ),
     "VLLM_SM70_FUSED_SIGMOID_MIXED_QKV_COMPARE": env_var(

@@ -47,6 +47,23 @@ def test_shape_admission(m, down):
     assert not _sm70_mtp_moe_fp16_shape_supported(x, w, y, None, *args[4:])
 
 
+@pytest.mark.parametrize("m", [16, 20, 24, 32, 40, 48, 56, 64, 80, 81])
+@pytest.mark.parametrize("down", [False, True])
+def test_concurrent_shape_admission(m, down):
+    n, k = (2560, 160) if down else (320, 2560)
+    x = torch.empty(m * 10 if down else m, k, device="meta", dtype=torch.float16)
+    w = torch.empty(512, n, k, device="meta", dtype=torch.float16)
+    y = torch.empty(m, 10, n, device="meta", dtype=torch.float16)
+    ids = torch.empty(m * 10, device="meta", dtype=torch.int32)
+    weights = torch.empty(m, 10, device="meta", dtype=torch.float32)
+    assert _sm70_mtp_moe_fp16_shape_supported(
+        x, w, y, weights, ids, 1 if down else 10, down, batched=True
+    ) == (m <= 80)
+    assert not _sm70_mtp_moe_fp16_shape_supported(
+        x, w, y, weights, ids, 1 if down else 10, down
+    )
+
+
 @pytest.fixture(scope="module")
 def cuda_weights():
     if not current_platform.is_device_capability(70):

@@ -46,6 +46,7 @@ class GDNSpecReplayLayer:
     # The verifier's running blocks ([num_reqs]) and cu_seqlens ([num_reqs + 1]).
     base_state_ids: torch.Tensor
     cu_seqlens: torch.Tensor
+    native_width: int = 0
 
 
 @dataclass
@@ -400,7 +401,12 @@ def _replay_launches(
                 )
                 launch = (table, entry.cu_seqlens)
             launches[key] = launch
-        layer.replay_spec_states(launch[0], launch[1], step.num_tokens)
+        if entry.native_width:
+            layer.replay_spec_states(
+                launch[0], launch[1], step.num_tokens, native_width=entry.native_width
+            )
+        else:
+            layer.replay_spec_states(launch[0], launch[1], step.num_tokens)
 
 
 def replay_gdn_spec_states(
@@ -447,6 +453,7 @@ def replay_graph_key(
                 e.base_state_ids.data_ptr(),
                 e.base_state_ids.stride(0),
                 e.cu_seqlens.data_ptr(),
+                e.native_width,
             )
             for e in step.layers
         ),

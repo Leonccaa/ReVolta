@@ -12,6 +12,7 @@ import torch
 from einops import rearrange
 from torch import nn
 
+from vllm import _custom_ops as ops
 from vllm import _sm70_ops as sm70_ops
 from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
@@ -5389,6 +5390,70 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self._replay_selectors = torch.full(
             (2 * max_reqs,), self._replay_slots + 1, dtype=torch.int32, device=device
         )
+        self._native_gdn_verify = (
+            envs.VLLM_SM70_MTP_GDN_NATIVE_VERIFY
+            and spec_config.use_qwen4_exp_mtp()
+            and not envs.VLLM_BATCH_INVARIANT
+            and dtype == torch.float16
+            and self.tp_size == 4
+            and self.num_k_heads == 16
+            and self.num_v_heads == 48
+            and self.head_k_dim == self.head_v_dim == 128
+            and hasattr(torch.ops._C, "sm70_gdn_verify_out")
+        )
+
+    def native_gdn_verify_width(
+        self, metadata: GDNAttentionMetadata, num_reqs: int, num_tokens: int
+    ) -> int:
+        """Use the same launch admission in verify and MRv2 postprocessing."""
+        if (
+            not self._native_gdn_verify
+            or not 1 <= num_reqs <= 8
+            or not 1 <= self._replay_slots <= 8
+            or metadata.num_prefills
+            or metadata.num_decodes
+            or num_tokens % num_reqs
+            or num_tokens // num_reqs not in (4, 5, 8)
+            or num_tokens > num_reqs * self._replay_slots
+        ):
+            return 0
+        state = self.kv_cache[1]
+        if state.dtype != torch.float32 or state.stride()[-3:] != (128 * 128, 128, 1):
+            return 0
+        # Table capacity bounds each sequence, including short rows inside
+        # this launch. The same bound also covers the accepted-prefix replay.
+        return self._replay_slots
+
+    def _launch_native_gdn_verify(
+        self,
+        out: torch.Tensor,
+        state: torch.Tensor,
+        state_indices: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        selectors: torch.Tensor,
+        width: int,
+    ) -> None:
+        num_tokens = out.shape[0]
+        ops.sm70_gdn_verify_out(
+            self._replay_qkv[:num_tokens],
+            self._replay_a[:num_tokens],
+            self._replay_b[:num_tokens],
+            self.A_log,
+            self.dt_bias,
+            state,
+            out,
+            cu_seqlens,
+            state_indices,
+            selectors,
+            4,
+            12,
+            128**-0.5,
+            1,
+            None,
+            None,
+            None,
+            width,
+        )
 
     def _mixed_qkv_verify_admits(self, num_tokens: int) -> bool:
         """Token counts the mixed-QKV verifier takes for this layer.
@@ -5458,6 +5523,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         state_indices: torch.Tensor,
         cu_seqlens: torch.Tensor,
         num_tokens: int,
+        *,
+        native_width: int = 0,
     ) -> None:
         """Commit accepted recurrent states by repeating the verifier's launch.
 
@@ -5474,6 +5541,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         """
         num_reqs = state_indices.shape[0]
         assert num_reqs <= self._replay_selectors.numel()
+        if native_width:
+            self._launch_native_gdn_verify(
+                self._replay_out[0, :num_tokens],
+                self.kv_cache[1],
+                state_indices,
+                cu_seqlens,
+                self._replay_selectors[:num_reqs],
+                native_width,
+            )
+            return
         fused_sigmoid_gating_delta_rule_update_mixed_qkv(
             A_log=self.A_log,
             a=self._replay_a[:num_tokens],
@@ -6221,6 +6298,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 )
                 verify_state_indices = spec_state_indices_tensor
                 verify_selectors = spec_state_slot_selectors
+                native_width = 0
+                num_spec_reqs = attn_metadata.num_spec_decodes
                 if self.spec_state_replay:
                     assert spec_state_indices_tensor is not None
                     verify_state_indices, verify_selectors = (
@@ -6229,38 +6308,56 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                             a_spec,
                             b_spec,
                             spec_state_indices_tensor,
-                            attn_metadata.num_spec_decodes,
+                            num_spec_reqs,
                         )
                     )
-                core_attn_out_spec, last_recurrent_state = (
-                    fused_sigmoid_gating_delta_rule_update_mixed_qkv(
-                        A_log=self.A_log,
-                        a=a_spec,
-                        b=b_spec,
-                        dt_bias=self.dt_bias,
-                        mixed_qkv=mixed_qkv_spec,
-                        num_q_heads=self.num_k_heads // self.tp_size,
-                        num_v_heads=self.num_v_heads // self.tp_size,
-                        head_k_dim=self.head_k_dim,
-                        head_v_dim=self.head_v_dim,
-                        initial_state=ssm_state,
-                        inplace_final_state=True,
-                        cu_seqlens=spec_query_start_loc[
-                            : attn_metadata.num_spec_decodes + 1
-                        ],
-                        ssm_state_indices=verify_state_indices,
-                        num_accepted_tokens=verify_selectors,
-                        use_qk_l2norm_in_kernel=True,
-                        out=(
-                            core_attn_out[:num_actual_tokens].unsqueeze(0)
-                            if fuse_conv_zero or direct_verify_out
-                            else None
-                        ),
+                    native_width = self.native_gdn_verify_width(
+                        attn_metadata, num_spec_reqs, mixed_qkv_spec.shape[0]
                     )
-                )
-                _log_runtime_route_once(
-                    "SM70 mixed-QKV fused GDN target-verification route hit."
-                )
+                verify_cu = spec_query_start_loc[: num_spec_reqs + 1]
+                if native_width:
+                    assert verify_state_indices is not None
+                    assert verify_selectors is not None
+                    spec_out = core_attn_out[:num_actual_tokens]
+                    self._launch_native_gdn_verify(
+                        spec_out,
+                        ssm_state,
+                        verify_state_indices,
+                        verify_cu,
+                        verify_selectors,
+                        native_width,
+                    )
+                    core_attn_out_spec = spec_out.unsqueeze(0)
+                    last_recurrent_state = ssm_state
+                    _log_runtime_route_once("SM70 native MTP GDN verifier hit.")
+                else:
+                    core_attn_out_spec, last_recurrent_state = (
+                        fused_sigmoid_gating_delta_rule_update_mixed_qkv(
+                            A_log=self.A_log,
+                            a=a_spec,
+                            b=b_spec,
+                            dt_bias=self.dt_bias,
+                            mixed_qkv=mixed_qkv_spec,
+                            num_q_heads=self.num_k_heads // self.tp_size,
+                            num_v_heads=self.num_v_heads // self.tp_size,
+                            head_k_dim=self.head_k_dim,
+                            head_v_dim=self.head_v_dim,
+                            initial_state=ssm_state,
+                            inplace_final_state=True,
+                            cu_seqlens=verify_cu,
+                            ssm_state_indices=verify_state_indices,
+                            num_accepted_tokens=verify_selectors,
+                            use_qk_l2norm_in_kernel=True,
+                            out=(
+                                core_attn_out[:num_actual_tokens].unsqueeze(0)
+                                if fuse_conv_zero or direct_verify_out
+                                else None
+                            ),
+                        )
+                    )
+                    _log_runtime_route_once(
+                        "SM70 mixed-QKV fused GDN target-verification route hit."
+                    )
             else:
                 if self.spec_state_replay:
                     raise RuntimeError(

@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch.nn import Module
 
 import vllm.envs as envs
+from vllm.config import get_current_vllm_config_or_none
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.fused_moe.config import (
@@ -54,6 +55,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         super().__init__(moe)
         self.unquantized_backend, self.experts_cls = select_unquantized_moe_backend(
             moe_config=self.moe,
+        )
+        config = get_current_vllm_config_or_none()
+        self._sm70_mtp_fp16_batch = bool(
+            config is not None
+            and config.is_speculative_draft
+            and config.speculative_config is not None
+            and config.speculative_config.use_qwen4_exp_mtp()
+            and moe.tp_size == 4
         )
 
     @property
@@ -197,6 +206,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 experts_cls=self.experts_cls,
                 routing_tables=layer._expert_routing_tables(),
             )
+            if self._sm70_mtp_fp16_batch:
+                from vllm.model_executor.layers.fused_moe.experts.triton_moe import (
+                    TritonExperts,
+                )
+
+                experts = self.moe_kernel.fused_experts
+                if type(experts) is TritonExperts:
+                    experts.sm70_mtp_fp16_batch = True
             if envs.VLLM_SM70_DISABLE_UNQUANTIZED_MOE_INPLACE:
                 logger.info_once(
                     "VLLM_SM70_DISABLE_UNQUANTIZED_MOE_INPLACE is "

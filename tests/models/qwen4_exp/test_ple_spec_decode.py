@@ -252,6 +252,15 @@ def test_gate_norm_compilation_selection(enabled, decode, monkeypatch):
         seen.extend(str(node.target) for node in graph.graph.nodes)
         return graph.forward
 
+    def native(gated, normalized, hidden, key, value, *_):
+        # Stand-in for the CUDA kernel: the PyTorch gate and norm.
+        reference = step.layer._gate_norm(hidden, key, value)
+        gated.copy_(reference[0].flatten(-2))
+        normalized.copy_(reference[1])
+
+    monkeypatch.setattr(
+        torch.ops._C, "qwen38_ple_gate_norm_sm70_out", native, raising=False
+    )
     monkeypatch.setattr(envs, "VLLM_SM70_QWEN38_DUAL_COMPILE", True)
     monkeypatch.setattr(envs, "VLLM_SM70_PLE_GATE_NORM", False)
     with step.context(meta):

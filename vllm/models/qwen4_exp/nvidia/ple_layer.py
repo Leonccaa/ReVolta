@@ -2704,17 +2704,6 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             )
             if (
                 (legacy or (allow_batched_native and x_spec.size(0) >= 2 * num_reqs))
-                and all(
-                    t.device == x_spec.device
-                    and t.dtype == torch.int32
-                    and t.ndim == 1
-                    and t.is_contiguous()
-                    for t in metadata
-                )
-                and spec_query_start_loc.numel() >= num_reqs + 1
-                and num_accepted_tokens.numel() >= num_reqs
-                and conv_weights.device == conv_state.device == x_spec.device
-                and conv_state.size(0) > 0
                 and (
                     conv_state.stride(2) == 1
                     and conv_state.stride(1) >= conv_state.size(2)
@@ -2724,10 +2713,11 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 and conv_state.stride(0)
                 > (hidden_size - 1) * conv_state.stride(1)
                 + (conv_state.size(2) - 1) * conv_state.stride(2)
-                and (op := getattr(torch.ops._C, op_name, None)) is not None
             ):
                 output = torch.empty_like(x_spec)
-                op(output, conv_state, x_spec, conv_weights, *metadata)
+                getattr(torch.ops._C, op_name)(
+                    output, conv_state, x_spec, conv_weights, *metadata
+                )
                 logger.info_once(
                     "SM70 PLE speculative convolution enabled (%s).", op_name
                 )
@@ -3051,9 +3041,6 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         if (
             envs.VLLM_SM70_PLE_GATE_NORM
             and envs.VLLM_SM70_QWEN38_DUAL_COMPILE
-            and not envs.VLLM_BATCH_INVARIANT
-            and hidden_states.ndim == 2
-            and hidden_states.dtype == key.dtype == value.dtype == torch.float16
             and is_sm70_decode_graph_compiling()
         ):
             gated_value, normalized = torch.ops.vllm.qwen4_exp_ple_gate_norm(
@@ -3080,31 +3067,16 @@ def qwen4_exp_ple_gate_norm(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     context = get_forward_context()
     layer = context.no_compile_layers[layer_name]
-    metadata = context.attn_metadata
     norm_key, norm_query, norm_conv = layer.norm_key, layer.norm_query, layer.norm_conv
     weights = (norm_key.weight, norm_query.weight, norm_conv.weight)
+    metadata = context.attn_metadata
     rows = hidden_states.size(0)
     if (
-        hidden_states.is_cuda
-        and 1 <= rows <= 64
+        1 <= rows <= 64
         and (layer.hc_count, layer.hidden_size) == (4, 2560)
-        and hidden_states.shape == key.shape == (rows, 10240)
-        and value.shape == (rows, 2560)
         and isinstance(metadata, dict)
         and isinstance(meta := metadata.get(layer_name), PleShortConvAttentionMetadata)
         and meta.num_prefills == 0
-        and norm_key.eps == norm_query.eps == norm_conv.eps
-        and all(norm.group_size == 2560 for norm in (norm_key, norm_query, norm_conv))
-        and all(weight.shape == (10240,) for weight in weights)
-        and all(
-            t.device == hidden_states.device
-            and t.dtype == torch.float16
-            and t.is_contiguous()
-            and t.data_ptr() % 16 == 0
-            for t in (hidden_states, key, value, *weights)
-        )
-        and current_platform.is_device_capability((7, 0))
-        and hasattr(torch.ops._C, "qwen38_ple_gate_norm_sm70_out")
     ):
         gated_value = torch.empty_like(hidden_states)
         normalized = torch.empty_like(hidden_states)

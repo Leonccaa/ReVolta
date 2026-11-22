@@ -442,6 +442,58 @@ direct_register_custom_op(
 )
 
 
+def _pack_qsa_input_weight(weight: torch.Tensor) -> torch.Tensor:
+    return (
+        weight.detach().reshape(-1, 32, 160, 2, 8).permute(0, 2, 3, 1, 4).contiguous()
+    )
+
+
+def _qwen38_sm70_fp16_qsa_input(
+    x: torch.Tensor,
+    qkv_weight: torch.Tensor,
+    index_weight: torch.Tensor,
+    packed_qkv: torch.Tensor,
+    packed_index: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if (
+        x.ndim == 2
+        and 2 <= x.shape[0] <= 64
+        and x.shape[1] == 2560
+        and x.is_cuda
+        and x.dtype == torch.float16
+        and _is_packed_row_major(x)
+        and x.data_ptr() % 16 == 0
+    ):
+        qkv = x.new_empty((x.shape[0], 3584))
+        index = x.new_empty((x.shape[0], 640))
+        torch.ops._C.qwen38_qsa_input_mtp_batch_sm70_out(
+            qkv, index, x, packed_qkv, packed_index
+        )
+        logger.info_once("SM70 packed target QSA input projections enabled.")
+        return qkv, index
+    return (
+        _qwen38_sm70_fp16_gemv(x, qkv_weight, _QSA_QKV_SUFFIX),
+        _qwen38_sm70_fp16_gemv(x, index_weight, _QSA_INDEX_SUFFIX),
+    )
+
+
+def _qwen38_sm70_fp16_qsa_input_fake(
+    x: torch.Tensor,
+    qkv_weight: torch.Tensor,
+    index_weight: torch.Tensor,
+    packed_qkv: torch.Tensor,
+    packed_index: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return x.new_empty((*x.shape[:-1], 3584)), x.new_empty((*x.shape[:-1], 640))
+
+
+direct_register_custom_op(
+    op_name="qwen38_sm70_fp16_qsa_input",
+    op_func=_qwen38_sm70_fp16_qsa_input,
+    fake_impl=_qwen38_sm70_fp16_qsa_input_fake,
+)
+
+
 def _dense_batch_rows(role: str, shape: tuple[int, ...]) -> tuple[int, ...]:
     if role.endswith(_ROUTER_SUFFIX) and shape == (512, 2560):
         return (2, 3, 4)
@@ -628,6 +680,14 @@ class Qwen38SM70FP16LinearMethod(UnquantizedLinearMethod):
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         super().process_weights_after_loading(layer)
+        if getattr(layer, "_sm70_prepare_qsa_input_batch", False):
+            weight = layer.weight
+            if weight.is_cuda and weight.dtype == torch.float16:
+                layer.register_buffer(
+                    "_sm70_qsa_input_packed",
+                    _pack_qsa_input_weight(weight),
+                    persistent=False,
+                )
         if (
             getattr(layer, "_sm70_qwen38_dense_batch", False)
             and layer.weight.is_cuda
@@ -740,7 +800,11 @@ def _batch_runtime_contract(vllm_config=None) -> bool:
 
 
 def enable_qwen38_sm70_fp16_gemv(
-    module: nn.Module, dtype: torch.dtype, vllm_config=None
+    module: nn.Module,
+    dtype: torch.dtype,
+    vllm_config=None,
+    *,
+    target_qsa: bool = False,
 ) -> None:
     """Replace admitted unquantized methods before checkpoint loading."""
     capability_ok = current_platform.is_device_capability((7, 0))
@@ -821,6 +885,35 @@ def enable_qwen38_sm70_fp16_gemv(
             if _mtp_batch_runtime_contract(vllm_config):
                 child._sm70_mtp_prepare_router_batch = True
         replaced += 1
+
+    if (
+        target_qsa
+        and vllm_config.kernel_config.sm70_qsa_input_batch
+        and batch_allowed
+        and envs.VLLM_SM70_QWEN38_DUAL_COMPILE
+        and vllm_config.parallel_config.tensor_parallel_size == 4
+        and vllm_config.model_config.quantization == "modelopt_fp4"
+        and vllm_config.speculative_config is not None
+        and vllm_config.speculative_config.use_qwen4_exp_mtp()
+        and not torch.backends.cuda.matmul.allow_fp16_accumulation
+        and not torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
+    ):
+        from .qsa import Qwen4ExpQSAAttention
+
+        for child in module.modules():
+            if not isinstance(child, Qwen4ExpQSAAttention):
+                continue
+            qkv, index = child.qkv_proj, child.indexer.index_qk_proj
+            if (
+                isinstance(qkv.quant_method, Qwen38SM70FP16LinearMethod)
+                and isinstance(index.quant_method, Qwen38SM70FP16LinearMethod)
+                and qkv.bias is None
+                and index.bias is None
+                and qkv.weight.shape == (3584, 2560)
+                and index.weight.shape == (640, 2560)
+            ):
+                qkv._sm70_prepare_qsa_input_batch = True
+                index._sm70_prepare_qsa_input_batch = True
 
     fused_gdn_inputs = 0
     if envs.VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16:

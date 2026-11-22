@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, ClassVar, cast
 import torch
 from torch import nn
 
+from vllm.compilation.sm70_decode_graph import is_sm70_decode_graph_compiling
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
@@ -1384,7 +1385,24 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         output: torch.Tensor | None,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        indexer_input = hidden_states
+        index_proj = self.indexer.index_qk_proj
+        packed_qkv = getattr(self.qkv_proj, "_sm70_qsa_input_packed", None)
+        packed_index = getattr(index_proj, "_sm70_qsa_input_packed", None)
+        if (
+            packed_qkv is not None
+            and packed_index is not None
+            and is_sm70_decode_graph_compiling()
+        ):
+            qkv, indexer_input = torch.ops.vllm.qwen38_sm70_fp16_qsa_input(
+                hidden_states,
+                self.qkv_proj.weight,
+                index_proj.weight,
+                packed_qkv,
+                packed_index,
+            )
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
         q, k, v, gate = self._project_qkv_gate(qkv, positions)
         num_tokens = hidden_states.shape[0]
         query = q.view(num_tokens, self.num_heads, self.head_dim)
@@ -1394,7 +1412,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         encoded_layer_name = _encode_layer_name(self.layer_name)
         if current_platform.opaque_attention_op():
             torch.ops.vllm.qwen4_exp_qsa_with_output(
-                hidden_states,
+                indexer_input,
                 positions,
                 query,
                 key,
@@ -1405,7 +1423,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             )
         else:
             qwen4_exp_qsa_with_output(
-                hidden_states,
+                indexer_input,
                 positions,
                 query,
                 key,

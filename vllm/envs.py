@@ -7783,7 +7783,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_NVLINK_HC": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_NVLINK_HC", "0"))),
         description=(
-            "Opt in to Flash-Next HC LL sharding and fused all-reduce/HC on "
+            "Opt in to Flash-Next HC LL and QSA DCP2 peer exchange on "
             "physically fully connected NVLink SM70 TP4."
         ),
         category="configuration",

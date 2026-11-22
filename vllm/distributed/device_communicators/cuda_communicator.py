@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+from typing import TYPE_CHECKING
+
 import torch
 from torch.distributed import ProcessGroup
 
@@ -19,6 +21,9 @@ from vllm.platforms import current_platform
 
 from ..utils import StatelessProcessGroup
 from .base_device_communicator import DeviceCommunicatorBase
+
+if TYPE_CHECKING:
+    from vllm.models.qwen4_exp.nvidia.ops.sm70_dcp2 import Sm70Dcp2Runtime
 
 logger = init_logger(__name__)
 _SM70_TP4_LONG_PREFILL_BUFFER_BYTES = 8192 * 5120 * 2
@@ -59,6 +64,8 @@ def _trace_all_reduce_path(
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
+    sm70_dcp2: "Sm70Dcp2Runtime | None"
+
     def __init__(
         self,
         cpu_group: ProcessGroup,
@@ -135,6 +142,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         self.ca_comm: CustomAllreduce | None = None
         self.sm70_hc_ll = None
+        self.sm70_dcp2 = None
         self.qr_comm: QuickAllReduce | None = None
         self.symm_mem_comm: SymmMemCommunicator | None = None
         self.fi_ar_comm: FlashInferAllReduce | None = None
@@ -210,6 +218,23 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
             get_current_vllm_config().kernel_config.sm70_nvlink_hc_active = (
                 self.sm70_hc_ll is not None
+            )
+
+        # Model parallel initialization creates TP before its DCP subgroups.
+        if (
+            unique_name.startswith("dcp:")
+            and self.world_size == 2
+            and envs.VLLM_SM70_NVLINK_HC
+        ):
+            from vllm.distributed.parallel_state import get_tp_group
+            from vllm.models.qwen4_exp.nvidia.ops.sm70_dcp2 import Sm70Dcp2Runtime
+
+            self.sm70_dcp2 = Sm70Dcp2Runtime.create(
+                get_tp_group(),
+                self.cpu_group,
+                self.ranks,
+                self.device,
+                self.rank_in_group,
             )
 
         if (
@@ -680,6 +705,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self._destroy_errors = cleanup.errors
             for name, method in (
                 ("sm70_hc_ll", "close"),
+                ("sm70_dcp2", "close"),
                 ("pynccl_comm", "destroy"),
                 ("ca_comm", "close"),
                 ("fi_ar_comm", "destroy"),

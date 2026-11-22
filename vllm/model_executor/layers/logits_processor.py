@@ -176,8 +176,22 @@ def _maybe_sync_top1_all_gather(
         torch.cuda.current_stream(local_pair.device).synchronize()
 
 
-# --8<-- [start:logits_processor]
+class CachedLogitsFallback:
+    """Retained TP-local projection, gathered whole or by rows on demand."""
+
+    def __init__(self, processor: "LogitsProcessor", logits: torch.Tensor):
+        self.processor = processor
+        self.logits = logits
+
+    def __call__(self) -> torch.Tensor | None:
+        return self.processor._gather_cached_logits(self.logits)
+
+    def gather_rows(self, rows: torch.Tensor) -> torch.Tensor | None:
+        return self.processor._gather_cached_logits(self.logits.index_select(0, rows))
+
+
 @PluggableLayer.register("logits_processor")
+# --8<-- [start:logits_processor]
 class LogitsProcessor(PluggableLayer):
     """Process logits and apply logits processors from sampling metadata.
 
@@ -705,7 +719,7 @@ class LogitsProcessor(PluggableLayer):
             )
         fallback = None
         if local_logits is not None:
-            fallback = lambda: self._gather_cached_logits(local_logits)
+            fallback = CachedLogitsFallback(self, local_logits)
         return top_indices.to(torch.int64), top_vals.float(), fallback
 
     def _maybe_dump_top_token_margin(

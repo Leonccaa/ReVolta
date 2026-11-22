@@ -181,19 +181,10 @@ def _compact_target_requires_reference(
     return bool(_compact_target_reference_rows(probe_logits, temperature, top_p).any())
 
 
-def _sample_reference_requests(
-    logits: torch.Tensor,
-    reference_reqs: np.ndarray,
+def _pack_reference_requests(
     input_batch: InputBatch,
-    rejection_sampler: RejectionSampler,
-    draft_logits: torch.Tensor | None,
+    reference_reqs: np.ndarray,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run the dense contract for whole requests requiring reference logits.
-
-    Compact sampling admits no penalties, logprobs, grammar or synthetic
-    rejection. Keep original request-slot IDs, positions and local draft-step
-    indices here: packing a subset must never renumber its random streams.
-    """
     cu = input_batch.cu_num_logits_np
     row_indices = np.concatenate([np.arange(cu[i], cu[i + 1]) for i in reference_reqs])
     sub_cu = np.zeros(len(reference_reqs) + 1, dtype=np.int32)
@@ -201,10 +192,36 @@ def _sample_reference_requests(
     # Pack metadata into a single CPU-to-GPU transfer.
     # The rejection kernels accept either int32 or int64 cumulative offsets.
     packed = np.concatenate((row_indices, reference_reqs, sub_cu)).astype(np.int64)
-    metadata = torch.from_numpy(packed).to(device=logits.device, non_blocking=True)
+    metadata = torch.from_numpy(packed).to(
+        device=input_batch.logits_indices.device, non_blocking=True
+    )
     rows, reqs, cu_num_logits = metadata.split(
         [row_indices.size, reference_reqs.size, sub_cu.size]
     )
+    return rows, reqs, cu_num_logits
+
+
+def _sample_reference_requests(
+    logits: torch.Tensor,
+    reference_reqs: np.ndarray,
+    input_batch: InputBatch,
+    rejection_sampler: RejectionSampler,
+    draft_logits: torch.Tensor | None,
+    *,
+    packed_metadata: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run the dense contract for whole requests requiring reference logits.
+
+    With packed metadata the logits already contain only those requests.
+    Original request-slot IDs, positions and draft indices still drive sampling.
+    """
+    if packed_metadata is None:
+        rows, reqs, cu_num_logits = _pack_reference_requests(
+            input_batch, reference_reqs
+        )
+        logits = logits[rows]
+    else:
+        rows, reqs, cu_num_logits = packed_metadata
     indices = input_batch.logits_indices[rows]
     draft_sampled = input_batch.input_ids[indices]
     pos = input_batch.positions[indices]
@@ -212,7 +229,7 @@ def _sample_reference_requests(
     expanded_local_pos = input_batch.expanded_local_pos[rows]
     sampler = rejection_sampler.sampler
     processed = sampler.apply_sampling_params(
-        logits[rows],
+        logits,
         expanded_idx_mapping,
         input_batch.idx_mapping_np[reference_reqs],
         pos,

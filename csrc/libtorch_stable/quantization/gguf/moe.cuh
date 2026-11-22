@@ -1,18 +1,23 @@
 #include <cstdint>
 
+using load_partial_tiles_cuda_t = void (*)(const void*, int*, half2*, int*,
+                                           int*, const int&, const int&,
+                                           const int&, const int&, int);
+
 /* Adapted from ./csrc/quantization/gguf/mmq.cuh
    based on ./vllm/model_executor/layers/fused_moe/experts/triton_moe.py */
 template <typename scalar_t, int qk, int qr, int qi, bool need_sum,
           typename block_q_t, int mmq_x, int mmq_y, int nwarps,
           allocate_tiles_cuda_t allocate_tiles, load_tiles_cuda_t load_tiles,
-          int vdr, vec_dot_q_mul_mat_cuda_t vec_dot>
+          int vdr, vec_dot_q_mul_mat_cuda_t vec_dot,
+          load_partial_tiles_cuda_t load_partial_tiles = nullptr>
 static __device__ __forceinline__ void moe_q(
     const void* __restrict__ vx, const void* __restrict__ vy,
     scalar_t* __restrict__ dst, const int* __restrict__ sorted_token_ids,
     const int* __restrict__ expert_ids,
-    const int* __restrict__ num_tokens_post_padded, const int exp_stride,
+    const int* __restrict__ num_tokens_post_padded, const int64_t exp_stride,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y,
-    const int nrows_dst, const int top_k) {
+    const int nrows_dst, const int top_k, const int num_experts = 256) {
   const int blocks_per_row_x = ncols_x / qk;
   const int blocks_per_col_y = nrows_y / QK8_1;
   const int blocks_per_warp = WARP_SIZE_GGUF / qi;
@@ -30,7 +35,7 @@ static __device__ __forceinline__ void moe_q(
   }
 
   const int exp_idx = expert_ids[blockIdx.y];
-  if (exp_idx > 255 || exp_idx < 0) return;
+  if (exp_idx >= num_experts || exp_idx < 0) return;
   if (blockIdx.y * mmq_x > num_tokens_post_padded[0]) return;
 
   const block_q_t* x = (const block_q_t*)((char*)vx + exp_idx * exp_stride);
@@ -49,9 +54,19 @@ static __device__ __forceinline__ void moe_q(
   float sum[mmq_y / WARP_SIZE_GGUF][mmq_x / nwarps] = {{0.0f}};
 
   for (int ib0 = 0; ib0 < blocks_per_row_x; ib0 += blocks_per_warp) {
-    load_tiles(x + row_x_0 * blocks_per_row_x + ib0, tile_x_ql, tile_x_dm,
-               tile_x_qh, tile_x_sc, threadIdx.y, nrows_x - row_x_0 - 1,
-               threadIdx.x, blocks_per_row_x);
+    const auto* tile_x = x + row_x_0 * blocks_per_row_x + ib0;
+    const int remaining_blocks = blocks_per_row_x - ib0;
+    if (load_partial_tiles != nullptr && remaining_blocks < blocks_per_warp) {
+      // Q8_0 rows use their logical K stride. Zero invalid weight blocks
+      // without reading the next row or past the final expert allocation.
+      load_partial_tiles(tile_x, tile_x_ql, tile_x_dm, tile_x_qh, tile_x_sc,
+                         threadIdx.y, nrows_x - row_x_0 - 1, threadIdx.x,
+                         blocks_per_row_x, remaining_blocks);
+    } else {
+      load_tiles(tile_x, tile_x_ql, tile_x_dm, tile_x_qh, tile_x_sc,
+                 threadIdx.y, nrows_x - row_x_0 - 1, threadIdx.x,
+                 blocks_per_row_x);
+    }
 
     const int n_per_r = ((qk * blocks_per_warp) / qr);
 #pragma unroll
@@ -390,27 +405,29 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q8_0, 2)
     moe_q8_0(const void* __restrict__ vx, const void* __restrict__ vy,
              scalar_t* __restrict__ dst, const int* sorted_token_ids,
              const int* expert_ids, const int* num_tokens_post_padded,
-             const int exp_stride, const int ncols_x, const int nrows_x,
+             const int64_t exp_stride, const int ncols_x, const int nrows_x,
              const int ncols_y, const int nrows_y, const int nrows_dst,
-             const int top_k) {
+             const int top_k, const int num_experts) {
   const int mmq_x = MOE_X_Q8_0;
   const int mmq_y = MOE_Y_Q8_0;
   const int nwarps = NWARPS_Q8_0;
 
   moe_q<scalar_t, QK8_0, QR8_0, QI8_0, false, block_q8_0, mmq_x, mmq_y, nwarps,
         allocate_tiles_q8_0<mmq_y>, load_tiles_q8_0<mmq_y, nwarps, need_check>,
-        VDR_Q8_0_Q8_1_MMQ, vec_dot_q8_0_q8_1_mul_mat>(
+        VDR_Q8_0_Q8_1_MMQ, vec_dot_q8_0_q8_1_mul_mat,
+        load_tiles_q8_0_bounded<mmq_y, nwarps, need_check>>(
       vx, vy, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-      exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+      exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k,
+      num_experts);
 }
 
 template <typename scalar_t>
 static void ggml_moe_q8_0_q8_1_cuda(
     const void* inp, const void* w, scalar_t* dst, const int* sorted_token_ids,
     const int* expert_ids, const int* num_tokens_post_padded,
-    const int exp_stride, const int ncols_x, const int nrows_x,
+    const int64_t exp_stride, const int ncols_x, const int nrows_x,
     const int ncols_y, const int nrows_y, const int nrows_dst, const int top_k,
-    const int tokens_post_padded, cudaStream_t stream) {
+    const int tokens_post_padded, const int num_experts, cudaStream_t stream) {
   const int mmq_x = MOE_X_Q8_0;
   const int mmq_y = MOE_Y_Q8_0;
   const int nwarps = NWARPS_Q8_0;
@@ -424,12 +441,14 @@ static void ggml_moe_q8_0_q8_1_cuda(
     constexpr bool need_check = false;
     moe_q8_0<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>(
         w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k,
+        num_experts);
   } else {
     constexpr bool need_check = true;
     moe_q8_0<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>(
         w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k,
+        num_experts);
   }
 }
 

@@ -36,6 +36,15 @@ _LOOKUP = (
 )
 
 NOTES: dict[str, dict[str, str]] = {
+    "VLLM_SM70_MTP_Q8_PREFILL_MMQ": dict(
+        section="research",
+        since="0.2.0rc15",
+        range="0, 1",
+        tradeoff="Use grouped GGUF MMQ for Q8_0 MTP batches above 64 rows in "
+        "chunks of up to 2048. MMQ changes accumulation order and increases "
+        "temporary GPU memory usage.",
+        metrics="",
+    ),
     "VLLM_SM70_IDLE_CLOCK_SECONDS": dict(
         section="deployment",
         since="0.2.0rc14",

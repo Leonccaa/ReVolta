@@ -346,7 +346,8 @@ torch::stable::Tensor ggml_moe_a8(torch::stable::Tensor X,  // input
             (scalar_t*)Y.data_ptr(), (int*)sorted_token_ids.data_ptr(),
             (int*)expert_ids.data_ptr(),
             (int*)num_tokens_post_padded.data_ptr(), W.stride(0), col, row,
-            tokens, padded, row, top_k, sorted_token_ids.sizes()[0], stream);
+            tokens, padded, row, top_k, sorted_token_ids.sizes()[0],
+            W.sizes()[0], stream);
         break;
       case 10:
         ggml_moe_q2_K_q8_1_cuda(

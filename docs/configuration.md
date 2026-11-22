@@ -254,6 +254,12 @@ type and default as registered in `vllm/envs.py`; *Since* is the first
 release with the variable (1Cat = inherited from 1Cat-vLLM); *Category*
 is configuration, tuning, experimental, debug or deprecated.
 
+### Pregraph preparation research switches
+
+| Name | Type | Default | Range | Category | Since | Effect and trade-off |
+|---|---|---|---|---|---|---|
+| `VLLM_SM70_MTP_Q8_PREFILL_MMQ` | bool | `False` | 0, 1 | experimental | 0.2.0rc15 | Use grouped GGUF MMQ for Q8_0 MTP batches above 64 rows in chunks of up to 2048. MMQ changes accumulation order and increases temporary GPU memory usage. |
+
 ### Promoted research switches
 
 | Name | Type | Default | Range | Category | Since | Effect and trade-off |

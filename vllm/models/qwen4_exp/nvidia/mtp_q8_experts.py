@@ -9,6 +9,7 @@ import torch
 from torch import nn
 
 from vllm import _custom_ops as ops
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase
 from vllm.model_executor.utils import set_weight_attrs
@@ -22,6 +23,7 @@ _BLOCK_BYTES = 34
 _Q8_1_BYTES = 36
 # The SM70 grouped ABI and GGUF vector route both accept up to 64 rows.
 _SMALL_M_MAX_ROWS = 64
+_MMQ_MAX_ROWS = 2048
 
 
 def quantize_q8_0(weight: torch.Tensor) -> torch.Tensor:
@@ -68,6 +70,7 @@ class MTPQ80MoEMethod(FusedMoEMethodBase):
         self.hidden = hidden_size
         self.local_width = local_width
         self.num_experts = num_experts
+        self.prefill_mmq = envs.VLLM_SM70_MTP_Q8_PREFILL_MMQ
         self.loaded_experts: dict[str, set[int]] = {
             s: set() for s in ("w1", "w3", "w2")
         }
@@ -151,11 +154,23 @@ class MTPQ80MoEMethod(FusedMoEMethodBase):
 
         from vllm.model_executor.layers.quantization.gguf import fused_moe_gguf
 
-        # The legacy GGUF MMQ skips expert IDs >255. Its vector kernel accepts
-        # the full expert bank, and fused_moe_gguf selects it for M <= 64.
+        # Retain the vector route unless explicitly opting into MMQ. Cap its
+        # intermediate storage, which grows with rows * top_k * hidden size.
+        chunk_rows = _MMQ_MAX_ROWS if self.prefill_mmq else _SMALL_M_MAX_ROWS
+        if rows <= chunk_rows:
+            return fused_moe_gguf(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights,
+                topk_ids,
+                GGML_Q8_0,
+                GGML_Q8_0,
+                "silu",
+            )
         out = torch.empty_like(x)
-        for start in range(0, rows, _SMALL_M_MAX_ROWS):
-            chunk = slice(start, start + _SMALL_M_MAX_ROWS)
+        for start in range(0, rows, chunk_rows):
+            chunk = slice(start, start + chunk_rows)
             out[chunk] = fused_moe_gguf(
                 x[chunk],
                 layer.w13_weight,

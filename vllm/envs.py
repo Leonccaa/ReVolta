@@ -422,6 +422,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W2: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE: bool = False
     VLLM_SM70_NVFP4_QWEN38_MOE_RAW_GROUPED_DECODE: bool = False
+    VLLM_SM70_NVFP4_RAW_GROUPED_M48_V154: bool = False
     VLLM_SM70_NVFP4_QWEN38_MOE_W2_DIRECT_REDUCE: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_INDEXED_PREFILL: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_FUSED_SWIGLU_PREFILL: bool = True
@@ -6159,6 +6160,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "for unset values on FP16 QSA SM70 TP4."
             ),
         ),
+        acceleration_paths=("TurboMind NVFP4",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_NVFP4_RAW_GROUPED_M48_V154": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_RAW_GROUPED_M48_V154", "0"))),
+        description=(
+            "Use native v154 raw grouped NVFP4 MoE for 48-row target decode "
+            "on SM70 TP4 Qwen3.8 with equal interleaved gate/up global scales. "
+            "Requires raw grouped decode and the V2 model runner."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
         acceleration_paths=("TurboMind NVFP4",),
         user_visible=False,
     ),

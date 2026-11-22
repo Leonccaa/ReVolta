@@ -2092,7 +2092,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ):
                 # Piecewise graphs can replay the same shape for prefill.
                 if (
-                    envs.VLLM_SM70_NVFP4_MOE_GROUPED_DECODE
+                    (
+                        envs.VLLM_SM70_NVFP4_MOE_GROUPED_DECODE
+                        or envs.VLLM_SM70_NVFP4_RAW_GROUPED_M48_V154
+                    )
                     and batch_desc.cg_mode == CUDAGraphMode.NONE
                     and not dummy_run
                     and not input_batch.is_prefilling_np.any()

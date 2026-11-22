@@ -470,6 +470,15 @@ NOTES: dict[str, dict[str, str]] = {
         "copy: less memory, decode reconstructs exact values.",
         metrics="",
     ),
+    "VLLM_SM70_NVFP4_RAW_GROUPED_M48_V154": dict(
+        section="research",
+        since="0.2.0rc15",
+        range="0, 1",
+        tradeoff="Native raw-E4M3 grouped MoE for 48-row target decode on "
+        "SM70 TP4 Qwen3.8 with equal interleaved gate/up global scales. "
+        "Requires raw grouped decode and the V2 model runner.",
+        metrics="",
+    ),
     "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES": dict(
         section="profile",
         since="1Cat",

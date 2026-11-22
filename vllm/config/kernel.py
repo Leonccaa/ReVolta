@@ -681,10 +681,17 @@ class KernelConfig:
     """Verify greedy MTP drafts from TP-local target argmax pairs instead of
     gathering full-vocabulary logits for the rejection sampler."""
 
-    sm70_sparse_target_sampling: bool = False
-    """Guarded compact target sampling for SM70 MRv2 with uniform MTP3-5,
-    with greedy drafts and target temperature=1, top_k=20, top_p=0.95.
-    Unsupported batches and ambiguous cutoffs keep the dense reference.
+    sm70_sparse_target_sampling: bool | Literal["device_top64"] = False
+    """Compact target sampling for SM70 MRv2 with uniform MTP3-5,
+    greedy drafts and target temperature=1, top_k=20, top_p=0.95.
+    False keeps the existing fallback; True uses guarded compact sampling
+    with dense reference sampling for ambiguous cutoffs. "device_top64"
+    applies the rank-20 score cutoff, including ties, within the existing
+    FP32 Top64 on device, then applies top-p. Support is deliberately bounded
+    at 64 even if unseen vocabulary entries tie at the cutoff. FP32 top-p
+    CDF rounding near the cutoff can change the retained boundary token
+    versus dense sampling; this mode does not fall back for these cutoffs.
+    Unsupported batches keep the existing fallback in either compact mode.
     """
 
     ple_result_transport: Literal["auto", "cuda", "mapped"] = "auto"

@@ -23,7 +23,7 @@ import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.compilation.sm70_decode_graph import is_sm70_decode_graph_compiling
 from vllm.config import SpeculativeConfig, VllmConfig, replace, set_current_vllm_config
-from vllm.distributed import get_pp_group
+from vllm.distributed import get_pp_group, tensor_model_parallel_all_gather
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ColumnParallelLinear
@@ -349,7 +349,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             self.fc_embedding = ColumnParallelLinear(
                 self.hidden_size,
                 self.hidden_size,
-                gather_output=True,
+                gather_output=False,
                 bias=False,
                 return_bias=False,
                 quant_config=draft_vllm_config.quant_config,
@@ -358,7 +358,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             self.fc_hidden = ColumnParallelLinear(
                 self.hidden_size,
                 self.hidden_size,
-                gather_output=True,
+                gather_output=False,
                 bias=False,
                 return_bias=False,
                 quant_config=draft_vllm_config.quant_config,
@@ -487,7 +487,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         if inputs_embeds is None:
             assert input_ids is not None
             inputs_embeds = self.embed_input_ids(input_ids)
-        # Embedding branch: pre-norm -> fc_embedding -> [T, H].
+        # Embedding branch: pre-norm -> rank-local fc_embedding.
         inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
         inputs_embeds = self.fc_embedding(inputs_embeds)
 
@@ -501,10 +501,11 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             num_tokens, hc_count, hidden_size
         )
         hidden_states = self.fc_hidden(hidden_states)
-        # Add the embedding residual to every branch, then fold back
-        # to [T, hc_count*H] (HC outer, HS inner) for the HC decoder.
-        hidden_states = inputs_embeds.unsqueeze(-2) + hidden_states
-        hidden_states = hidden_states.flatten(-2)
+        # Both projections produce the same feature shard. Add the embedding
+        # residual locally before gathering the full features for the HC decoder.
+        hidden_states = tensor_model_parallel_all_gather(
+            inputs_embeds.unsqueeze(-2) + hidden_states
+        ).flatten(-2)
 
         current_step_idx = spec_step_idx % self.num_mtp_layers
         layer = self.layers[current_step_idx]

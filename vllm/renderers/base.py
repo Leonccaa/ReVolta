@@ -5,12 +5,13 @@ import hashlib
 import time
 from abc import ABC, abstractmethod
 from array import array
-from collections.abc import Awaitable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from concurrent.futures import Executor, ThreadPoolExecutor
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import replace
 from functools import cached_property
+from threading import Lock
 from typing import TYPE_CHECKING, Any, Generic, overload
 
 from typing_extensions import TypeVar
@@ -96,6 +97,7 @@ class _PrefixTokenizeCache:
     def __init__(self, tokenizer: TokenizerLike | None, max_entries: int = 96) -> None:
         self._max_entries = max_entries
         self._entries = LRUCache[bytes, array[int]](self._MAX_TOKENS, getsizeof=len)
+        self._lock = Lock()
         self._im_start_id: int | None = None
         if tokenizer is None or not tokenizer.is_fast:
             return
@@ -135,13 +137,15 @@ class _PrefixTokenizeCache:
     def _put(self, digest: bytes, tokens: Sequence[int]) -> None:
         if not tokens or len(tokens) > self._MAX_TOKENS:
             return
-        self._entries[digest] = array("I", tokens)
-        while len(self._entries) > self._max_entries:
-            self._entries.popitem()
+        entry = array("I", tokens)
+        with self._lock:
+            self._entries[digest] = entry
+            while len(self._entries) > self._max_entries:
+                self._entries.popitem()
 
     def plan(
         self, text: str, encode_kwargs: Mapping[str, Any]
-    ) -> tuple[list[int], list[tuple[int, int, bytes]], int] | None:
+    ) -> tuple[list[int], list[tuple[int, int, bytes]], int, list[int]] | None:
         if (
             self._im_start_id is None
             or len(text) < self._MIN_CHARS
@@ -166,14 +170,35 @@ class _PrefixTokenizeCache:
                 prev = s_pos
                 checkpoints.append((s_idx, s_pos, h.digest()))
         hit_ckpt_idx = -1
-        for idx in range(len(checkpoints) - 1, -1, -1):
-            if checkpoints[idx][2] in self._entries:
-                hit_ckpt_idx = idx
-                break
-        return starts, checkpoints, hit_ckpt_idx
+        prefix = None
+        # Keep a reference to the selected entry through concurrent eviction.
+        # Published arrays are never mutated, so unpack outside the lock.
+        with self._lock:
+            for idx in range(len(checkpoints) - 1, -1, -1):
+                digest = checkpoints[idx][2]
+                if digest in self._entries:
+                    prefix = self._entries[digest]
+                    hit_ckpt_idx = idx
+                    break
+        return starts, checkpoints, hit_ckpt_idx, prefix.tolist() if prefix else []
 
-    def lookup(self, digest: bytes) -> list[int]:
-        return self._entries[digest].tolist()
+    def encode_chat_fragment(
+        self, encode: Callable[..., list[int]], text: str, *args: Any, **kwargs: Any
+    ) -> list[int]:
+        # Transformers may route marked text through encode with different
+        # options. Only its ordinary, untruncated fragment calls can reuse IDs.
+        if not isinstance(text, str) or args or kwargs != {"add_special_tokens": False}:
+            return encode(text, *args, **kwargs)
+        plan = self.plan(text, kwargs)
+        if plan is None:
+            return encode(text, **kwargs)
+        starts, checkpoints, hit_idx, prefix_ids = plan
+        pos = checkpoints[hit_idx][1] if hit_idx >= 0 else 0
+        ids = encode(text[pos:], **kwargs)
+        if hit_idx >= 0:
+            ids = prefix_ids + ids
+        self.record_full(starts, checkpoints, ids, hit_idx)
+        return ids
 
     def record_full(
         self,
@@ -593,10 +618,9 @@ class BaseRenderer(ABC, Generic[_T]):
             else None
         )
         if plan is not None and cache is not None:
-            starts, checkpoints, hit_idx = plan
+            starts, checkpoints, hit_idx, prefix_ids = plan
             if hit_idx >= 0:
-                _, hit_pos, hit_digest = checkpoints[hit_idx]
-                prefix_ids = cache.lookup(hit_digest)
+                _, hit_pos, _ = checkpoints[hit_idx]
                 tail_ids = tokenizer.encode(text[hit_pos:], **encode_kwargs)
                 prompt_token_ids = prefix_ids + tail_ids
             else:
@@ -627,10 +651,9 @@ class BaseRenderer(ABC, Generic[_T]):
             else None
         )
         if plan is not None and cache is not None:
-            starts, checkpoints, hit_idx = plan
+            starts, checkpoints, hit_idx, prefix_ids = plan
             if hit_idx >= 0:
-                _, hit_pos, hit_digest = checkpoints[hit_idx]
-                prefix_ids = cache.lookup(hit_digest)
+                _, hit_pos, _ = checkpoints[hit_idx]
                 tail_ids = await tokenizer.encode(text[hit_pos:], **encode_kwargs)
                 prompt_token_ids = prefix_ids + tail_ids
             else:

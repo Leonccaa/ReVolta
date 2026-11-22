@@ -962,8 +962,17 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
         )
 
         if self.tokenizer is not None:
+            mm_config = getattr(self.model_config, "multimodal_config", None)
             maybe_make_thread_pool(
-                self.tokenizer, config.model_config.renderer_num_workers + 1
+                self.tokenizer,
+                config.model_config.renderer_num_workers + 1,
+                encode_chat_fragment=(
+                    self._prefix_tok_cache.encode_chat_fragment
+                    if self._prefix_tok_cache.enabled
+                    and (mm_config is None or mm_config.language_model_only)
+                    and not getattr(self.model_config, "enable_prompt_embeds", False)
+                    else None
+                ),
             )
 
     def _prepare_developer_messages(

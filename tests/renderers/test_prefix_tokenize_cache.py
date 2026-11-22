@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -57,24 +59,23 @@ def test_renderer_reuses_prefix_and_preserves_token_ids(async_path):
 
     async def run():
         cache = renderer._prefix_tok_cache
-        with patch.object(cache, "lookup", wraps=cache.lookup) as lookup:
-            for text, options, expected_hits in (
-                (first_turn, params, 0),
-                (next_turn, params, 1),
-                (rewritten, params, 2),
-                (next_turn, limited, 3),
-                (next_turn, truncated, 3),
-            ):
-                if async_path:
-                    result = await renderer._tokenize_prompt_async(
-                        {"prompt": text}, options
-                    )
-                else:
-                    result = renderer._tokenize_prompt({"prompt": text}, options)
-                assert result["prompt_token_ids"] == tokenizer.encode(
-                    text, **options.get_encode_kwargs()
+        for text, options, expected_hits in (
+            (first_turn, params, 0),
+            (next_turn, params, 1),
+            (rewritten, params, 2),
+            (next_turn, limited, 3),
+            (next_turn, truncated, 3),
+        ):
+            if async_path:
+                result = await renderer._tokenize_prompt_async(
+                    {"prompt": text}, options
                 )
-                assert lookup.call_count == expected_hits
+            else:
+                result = renderer._tokenize_prompt({"prompt": text}, options)
+            assert result["prompt_token_ids"] == tokenizer.encode(
+                text, **options.get_encode_kwargs()
+            )
+            assert cache._entries.stat().hits == expected_hits
 
     try:
         asyncio.run(run())
@@ -94,4 +95,47 @@ def test_prefix_cache_evicts_by_token_budget(monkeypatch):
     cache._put(b"second", [3, 4])
     cache._put(b"too_large", [0, 1, 2, 3])
     assert list(cache._entries) == [b"second"]
-    assert cache.lookup(b"second") == [3, 4]
+    assert cache._entries[b"second"].tolist() == [3, 4]
+
+
+def test_chat_prefix_survives_eviction_during_tail_encode():
+    tokenizer = make_tokenizer()
+    other_tokenizer = make_tokenizer()
+    cache = _PrefixTokenizeCache(tokenizer, max_entries=1)
+    text = f"{DELIMITER}user\n" + "history " * 300 + f"{DELIMITER}assistant\n"
+    other = text.replace("history", "rewrite")
+    opts = {"add_special_tokens": False}
+    cache.encode_chat_fragment(tokenizer.encode, text, **opts)
+    [stored] = cache._entries
+    tail_started, evicted = Event(), Event()
+
+    def encode_tail(tail, **kwargs):
+        assert tail == f"{DELIMITER}assistant\nnext"
+        tail_started.set()
+        assert evicted.wait(timeout=5)
+        return tokenizer.encode(tail, **kwargs)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        live = executor.submit(
+            cache.encode_chat_fragment, encode_tail, text + "next", **opts
+        )
+        try:
+            assert tail_started.wait(timeout=5)
+            cache.encode_chat_fragment(other_tokenizer.encode, other, **opts)
+            assert stored not in cache._entries
+        finally:
+            evicted.set()
+        assert live.result() == tokenizer.encode(text + "next", **opts)
+
+
+def test_chat_prefix_delegates_marked_encode_options():
+    tokenizer = make_tokenizer()
+    cache = _PrefixTokenizeCache(tokenizer)
+    text = f"{DELIMITER}user\n" + "history " * 300 + f"{DELIMITER}assistant\n"
+    cache.encode_chat_fragment(tokenizer.encode, text, add_special_tokens=False)
+    marked = {"add_special_tokens": False, "split_special_tokens": True}
+    expected = tokenizer.encode(text, **marked)
+    with patch.object(tokenizer, "encode", wraps=tokenizer.encode) as encode:
+        assert cache.encode_chat_fragment(encode, text, **marked) == expected
+        encode.assert_called_once_with(text, **marked)
+    assert cache._entries.stat().hits == 0

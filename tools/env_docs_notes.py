@@ -54,6 +54,24 @@ NOTES: dict[str, dict[str, str]] = {
         "sampling when compact DFlash2 verification would truncate logits.",
         metrics="",
     ),
+    "VLLM_SM70_MTP_PLE_CONV": dict(
+        section="deployment",
+        since="1Cat",
+        range="0, 1",
+        tradeoff="Fuses SM70 PLE speculative rollback, convolution, SiLU and "
+        "state update for eligible MTP and DFlash2 batches. Set 0 to use the "
+        "separate operations.",
+        metrics="",
+    ),
+    "VLLM_SM70_PLE_GATE_NORM": dict(
+        section="deployment",
+        since="0.2.0rc15",
+        range="0, 1",
+        tradeoff="Opt-in FP16 PLE gate and norm fusion in SM70 Flash-Next full "
+        "decode graphs with dual compilation. The fused reduction can change "
+        "FP16 results.",
+        metrics="",
+    ),
     "VLLM_SM70_IDLE_CLOCK_SECONDS": dict(
         section="deployment",
         since="0.2.0rc14",

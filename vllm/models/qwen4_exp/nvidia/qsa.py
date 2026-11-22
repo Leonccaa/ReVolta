@@ -68,6 +68,13 @@ from ..common.qsa_cache import (
     qsa_draft_dcp_sharded,
 )
 from .indexer_qsa import QSAIndexer
+from .ops.qsa_paged_fp16_h12 import (
+    H12_MAX_ROWS,
+    H12_MAX_WIDTH,
+    load_qsa_paged_fp16_h12,
+    qsa_paged_fp16_h12,
+    qsa_paged_fp16_h12_workspace,
+)
 
 if TYPE_CHECKING:
     from .host_kv.history import HostHistoryLayer
@@ -719,6 +726,24 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             layer._v_scale_float,
             **scale_kwargs,
         )
+        if (
+            grouped_rows == 0
+            and getattr(layer, "sm70_qsa_paged_fp16_h12", False)
+            and 0 < query.shape[0] <= H12_MAX_ROWS
+            and 0 < local_width <= H12_MAX_WIDTH
+            and get_forward_context().is_uniform_decode
+        ):
+            qsa_paged_fp16_h12(
+                gathered_query,
+                key_cache,
+                value_cache,
+                local_indices[:, :local_width],
+                block_table,
+                token_to_req,
+                partial_output,
+                partial_lse,
+            )
+            grouped_rows = query.shape[0]
         if grouped_rows < query.shape[0]:
             qsa_sparse_paged_attention(
                 gathered_query[grouped_rows:],
@@ -928,6 +953,22 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.dcp_partial_lse_buffer = dcp_partial_lse_buffer
         self.attn_type = AttentionType.DECODER
         self.kv_cache_dtype = cache_config.cache_dtype
+        host_kv = vllm_config.kernel_config.long_context_kv
+        self.sm70_qsa_paged_fp16_h12 = (
+            vllm_config.kernel_config.sm70_qsa_paged_fp16_h12
+            and vllm_config.use_v2_model_runner
+            and not vllm_config.is_speculative_draft
+            and self.qsa_dcp_sharded
+            and parallel_config.decode_context_parallel_size == 2
+            and tp_size == 4
+            and (self.num_heads, self.num_kv_heads, self.head_dim) == (6, 1, 256)
+            and model_config.dtype == torch.float16
+            and self.kv_cache_dtype in ("auto", "float16")
+            and (not host_kv.enabled or host_kv.main_kv_placement == "gpu")
+            and current_platform.is_device_capability(70)
+        )
+        if self.sm70_qsa_paged_fp16_h12:
+            load_qsa_paged_fp16_h12()
         if self.kv_cache_dtype in ("fp8", "fp8_e4m3") and (
             cache_config.calculate_kv_scales
         ):
@@ -1081,23 +1122,29 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self._qsa_kv_scales_finalized = True
 
     def reserve_capture_workspace(self) -> None:
-        """Size the shared workspace for this layer's largest DCP combine.
-
-        The all-to-all combine takes its send/receive buffers from the shared
-        workspace, sized by the step's token count; reserve the largest step
-        (the partial-output buffer's rows) before CUDA graph capture.
-        """
+        """Reserve the largest DCP read and combine workspace before capture."""
         from vllm.v1.attention.ops.dcp_alltoall import (
             dcp_a2a_lse_reduce,
             reserve_dcp_a2a_workspace,
         )
 
         partial = self.dcp_partial_output_buffer
-        if (
-            not self.qsa_dcp_sharded
-            or partial is None
-            or getattr(self.impl, "dcp_combine", None) is not dcp_a2a_lse_reduce
-        ):
+        if not self.qsa_dcp_sharded or partial is None:
+            return
+        if self.sm70_qsa_paged_fp16_h12:
+            from .ops.qsa_dcp import qsa_dcp_local_selection_width
+
+            assert self.dcp_local_indices_buffer is not None
+            width = qsa_dcp_local_selection_width(
+                self.indexer.token_topk,
+                self.indexer.compress_ratio,
+                self.impl.dcp_world_size,
+                self.cp_kv_cache_interleave_size,
+                self.dcp_local_indices_buffer.shape[1],
+            )
+            if 0 < width <= H12_MAX_WIDTH:
+                qsa_paged_fp16_h12_workspace(min(partial.shape[0], H12_MAX_ROWS), width)
+        if getattr(self.impl, "dcp_combine", None) is not dcp_a2a_lse_reduce:
             return
         max_tokens, num_heads, head_dim = partial.shape
         reserve_dcp_a2a_workspace(

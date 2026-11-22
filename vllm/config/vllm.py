@@ -1809,6 +1809,10 @@ class VllmConfig:
 
         # Also cover direct VllmConfig users. This is intentionally before
         # upstream overlap, hybrid-PLE and compilation automatic defaults.
+        allow_shared_expert_overlap = not (
+            self.parallel_config.enable_expert_parallel
+            or self.parallel_config.enable_dbo
+        )
         revolta_profile_enabled = apply_revolta_profile(
             self.model_config,
             self.parallel_config.tensor_parallel_size,
@@ -1817,6 +1821,7 @@ class VllmConfig:
                 disable_custom_all_reduce=self.parallel_config.disable_custom_all_reduce
             ),
             speculative_method=getattr(self.speculative_config, "method", None),
+            allow_shared_expert_overlap=allow_shared_expert_overlap,
         )
         apply_revolta_kernel_profile(
             self.kernel_config, enabled=revolta_profile_enabled
@@ -1862,6 +1867,7 @@ class VllmConfig:
                     )
                 ),
                 speculative_method=getattr(self.speculative_config, "method", None),
+                allow_shared_expert_overlap=allow_shared_expert_overlap,
                 kv_cache_dtype=self.cache_config.cache_dtype,
                 num_speculative_tokens_per_batch_size=getattr(
                     self.speculative_config,

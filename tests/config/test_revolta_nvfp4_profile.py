@@ -133,6 +133,7 @@ def test_nvfp4_dflash_reserves_the_dflash_graph_pool(profile, algo):
     )
     assert os.environ["VLLM_V2_CUDAGRAPH_MEM_MIB"] == "1200"
     assert os.environ["VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS"] == "0"
+    assert os.environ["VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP"] == "0"
     for name, value in NVFP4.items():
         if name != "VLLM_V2_CUDAGRAPH_MEM_MIB":
             assert os.environ[name] == value

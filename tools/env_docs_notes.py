@@ -316,8 +316,9 @@ NOTES: dict[str, dict[str, str]] = {
         section="profile",
         since="1Cat",
         range="0, 1",
-        tradeoff="Shared-expert stream overlap. The profile sets 0 on TP4 SM70, "
-        "where the second stream does not pay off.",
+        tradeoff="Allows shared and routed experts to run on separate CUDA streams. "
+        "The native g32 AWQ profile enables it for DFlash2 with expert parallelism "
+        "and dual batch overlap disabled. An explicit 0 or 1 takes precedence.",
         metrics="",
     ),
     "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN": dict(

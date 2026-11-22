@@ -14,11 +14,11 @@ logger = init_logger(__name__)
 
 
 @lru_cache(maxsize=1)
-def load_operator():
+def _load_operators():
     try:
         importlib.import_module("vllm._sm70_qsa_indexer_C")
     except ImportError:
-        return False
+        return False, None
 
     @torch.library.register_fake("vllm_sm70_qsa_indexer::run")
     def fake(
@@ -35,7 +35,14 @@ def load_operator():
     ):
         return None
 
-    return True
+    batched = getattr(torch.ops.vllm_sm70_qsa_indexer, "run_batched_decode", None)
+    if batched is not None:
+        torch.library.register_fake("vllm_sm70_qsa_indexer::run_batched_decode")(fake)
+    return True, batched
+
+
+def load_operator():
+    return _load_operators()[0]
 
 
 def shared_key_reason(q, cache, table, requests, positions, lengths):
@@ -80,4 +87,32 @@ def maybe_shared_key_scores(
         compress,
     )
     logger.info_once("Using SM70 QSA shared-key indexer for M=%d.", q.shape[0])
+    return scores, visible
+
+
+def maybe_batched_decode_scores(q, cache, table, starts, positions, lengths, compress):
+    """Use MRv2 request offsets after request-segments admission."""
+    rows, nreq = q.shape[0], table.shape[0]
+    if (
+        rows > min(64, 8 * nreq)
+        or starts.shape != (nreq + 1,)
+        or starts.dtype != torch.int32
+        or not all(x.is_contiguous() for x in (starts, positions, lengths))
+        or q.stride(-1) != 1
+        or cache.stride(-1) != 1
+        or any(i % 8 for x in (q, cache) for i in (*x.stride()[:2], x.storage_offset()))
+    ):
+        return None
+    _, batched = _load_operators()
+    if batched is None:
+        return None
+
+    scores = torch.empty(
+        (rows, table.shape[1] * cache.shape[1]), device=q.device, dtype=torch.float32
+    )
+    visible = torch.empty(rows, device=q.device, dtype=torch.int32)
+    batched(
+        scores, visible, q, cache, table, starts, positions, lengths, 128**0.5, compress
+    )
+    logger.info_once("Using SM70 QSA batched shared-key decode scorer.")
     return scores, visible

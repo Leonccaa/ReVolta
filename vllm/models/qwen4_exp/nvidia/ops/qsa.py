@@ -1808,6 +1808,7 @@ def qsa_select_paged_tokens(
     seq_lens_cpu_upper_bound: torch.Tensor | None = None,
     index_dcp_world_size: int = 1,
     index_dcp_rank: int = 0,
+    batch_query_starts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Score and select QSA indices, using a host bound when available.
 
@@ -1945,16 +1946,36 @@ def qsa_select_paged_tokens(
             query_positions[row_slice],
             sequence_lengths,
         ):
-            logits, visible_blocks = qsa_mqa_request_segments_paged(
-                q[row_slice],
-                k_cache,
-                page_table,
-                token_to_req[row_slice],
-                query_positions[row_slice],
-                sequence_lengths,
-                compress_ratio,
-                **shard_kwargs,
-            )
+            scores = None
+            if (
+                world == 1
+                and rows == chunk_rows
+                and shared_key_scoring
+                and batch_query_starts is not None
+            ):
+                from .qsa_shared_key import maybe_batched_decode_scores
+
+                scores = maybe_batched_decode_scores(
+                    q,
+                    k_cache,
+                    page_table,
+                    batch_query_starts,
+                    query_positions,
+                    sequence_lengths,
+                    compress_ratio,
+                )
+            if scores is None:
+                scores = qsa_mqa_request_segments_paged(
+                    q[row_slice],
+                    k_cache,
+                    page_table,
+                    token_to_req[row_slice],
+                    query_positions[row_slice],
+                    sequence_lengths,
+                    compress_ratio,
+                    **shard_kwargs,
+                )
+            logits, visible_blocks = scores
         else:
             logits, visible_blocks = qsa_mqa_paged(
                 q[row_slice],

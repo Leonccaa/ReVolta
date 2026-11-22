@@ -101,6 +101,7 @@ def test_named_floating_checkpoint_uses_the_standalone_mtp_loader():
     model.model.config = SimpleNamespace(num_experts=1)
     model.model.fp8_mtp_checkpoint_prefixes = set()
     model.model.fp8_mtp_tp_size = 4
+    model.model.mtp_expert_format = "q8_0"
     model.model._kv_cache_dtype = "auto"
     torch.manual_seed(18)
     gate = torch.randn(640, 256).bfloat16()
@@ -339,3 +340,165 @@ def test_gguf_q8_moe_reads_last_expert_partial_k_tile():
             expected = reference[ids[:, 0] == expert].float()
             assert (actual - expected).norm() < expected.norm() * 2e-3
         torch.testing.assert_close(output[-1], reference[-1], rtol=0.02, atol=4e-4)
+
+
+def test_block_fp8_conversion_preserves_unpadded_tp_offsets(monkeypatch):
+    from vllm.models.qwen4_exp.nvidia import mtp
+
+    prefix = "model.layers.0.mlp.experts"
+    layer, method = make_layer(rank=3, tp=4, experts=1)
+    projections = {"gate_proj": "w1", "up_proj": "w3", "down_proj": "w2"}
+    layer.expert_mapping = [
+        (
+            "experts.w2_" if shard == "w2" else "experts.w13_",
+            f"experts.0.{projection}.",
+            0,
+            shard,
+        )
+        for projection, shard in projections.items()
+    ]
+    model = mtp.Qwen4ExpMTP.__new__(mtp.Qwen4ExpMTP)
+    torch.nn.Module.__init__(model)
+    model.model = torch.nn.Module()
+    model.model.layers = torch.nn.ModuleList([torch.nn.Module()])
+    model.model.layers[0].mlp = torch.nn.Module()
+    model.model.layers[0].mlp.experts = layer
+    model.model.config = SimpleNamespace(num_experts=1)
+    model.model.fp8_mtp_checkpoint_prefixes = {prefix}
+    model.model.fp8_mtp_tp_size = 4
+    model.model.mtp_expert_format = "q8_0"
+    model.model._kv_cache_dtype = "auto"
+    log = Mock()
+    monkeypatch.setattr(mtp.logger, "info_once", log)
+    states = {}
+    torch.manual_seed(18)
+    for projection, shard in projections.items():
+        down = shard == "w2"
+        shape = (256, 640) if down else (640, 256)
+        weight = torch.randint(-8, 9, shape).to(torch.float8_e4m3fn)
+        scale_shape = tuple(dim // 128 for dim in shape)
+        scale = (torch.arange(1.0, 11.0).reshape(scale_shape) / 128).bfloat16()
+        base = f"mtp.layers.0.mlp.experts.0.{projection}"
+        states[f"{base}.weight_scale_inv"] = scale
+        states[f"{base}.weight"] = weight
+    assert model.load_weights(states.items()) == {
+        f"{prefix}.w13_weight",
+        f"{prefix}.w2_weight",
+    }
+    assert "secondary quantization" in log.call_args.args[0]
+    for projection, shard in projections.items():
+        base = f"mtp.layers.0.mlp.experts.0.{projection}"
+        weight, scale = states[base + ".weight"], states[base + ".weight_scale_inv"]
+        scales = scale.float().repeat_interleave(128, 0).repeat_interleave(128, 1)
+        dequantized = weight.float() * scales
+        param_name = "w2_weight" if shard == "w2" else "w13_weight"
+        param = getattr(layer, param_name)
+        if shard == "w2":
+            assert torch.equal(param[0], q8.quantize_q8_0(dequantized[:, 480:]))
+        else:
+            offset = 160 if shard == "w3" else 0
+            assert torch.equal(
+                param[0, offset : offset + 160], q8.quantize_q8_0(dequantized[480:])
+            )
+    method.process_weights_after_loading(layer)
+
+
+@pytest.mark.parametrize(
+    "source,expected",
+    [
+        ("float", "q8_0"),
+        ("mixed_fp8", "q8_0"),
+        ("mixed_nvfp4", None),
+        ("awq_excluded", "q8_0"),
+        ("awq_packed", None),
+    ],
+)
+def test_auto_expert_format_uses_draft_checkpoint_source(monkeypatch, source, expected):
+    from vllm.model_executor.layers.quantization.awq import AWQConfig
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptMixedPrecisionConfig,
+    )
+    from vllm.models.qwen4_exp.nvidia import mtp
+
+    quant_config = None
+    if source.startswith("mixed"):
+        quant_config = ModelOptMixedPrecisionConfig.from_config(
+            {
+                "quantization": {
+                    "quant_algo": "MIXED_PRECISION",
+                    "quantized_layers": {
+                        "mtp.layers.0.mlp.experts": {
+                            "quant_algo": (
+                                "FP8_BLOCK_SCALES" if source == "mixed_fp8" else "NVFP4"
+                            ),
+                            "group_size": 128 if source == "mixed_fp8" else 16,
+                        }
+                    },
+                }
+            }
+        )
+    elif source.startswith("awq"):
+        quant_config = AWQConfig(
+            4, 32, True, ["mtp"] if source == "awq_excluded" else []
+        )
+    cfg = _auto_expert_format_config()
+    monkeypatch.setattr(mtp, "get_draft_quant_config", lambda _: quant_config)
+    mtp.resolve_mtp_expert_default(cfg)
+    assert cfg.speculative_config.mtp_expert_quantization == expected
+
+
+@pytest.mark.parametrize("exclude_mtp", [True, False])
+def test_auto_q8_respects_nvfp4_checkpoint_exclusions(monkeypatch, exclude_mtp):
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
+    from vllm.models.qwen4_exp.nvidia import mtp
+
+    # Match the HF ModelOpt metadata used by the NVFP4 checkpoint. Only
+    # the excluded MTP experts are floating-point source tensors.
+    quant_config = ModelOptNvFp4Config.from_config(
+        {
+            "producer": {"name": "modelopt", "version": "0.46.0"},
+            "quant_method": "modelopt",
+            "quant_algo": "NVFP4",
+            "ignore": ["mtp.*", "model.mtp.*"] if exclude_mtp else [],
+        }
+    )
+    cfg = _auto_expert_format_config()
+    monkeypatch.setattr(mtp, "get_draft_quant_config", lambda _: quant_config)
+
+    mtp.resolve_mtp_expert_default(cfg)
+    assert cfg.speculative_config.mtp_expert_quantization == (
+        "q8_0" if exclude_mtp else None
+    )
+    if exclude_mtp:
+        layer = Mock(spec=RoutedExperts)
+        layer.moe_config = SimpleNamespace(has_bias=False)
+        quant_method = MTPExpertQuantConfig(
+            quant_config, expert_format="q8_0"
+        ).get_quant_method(layer, "mtp.layers.48.mlp.experts")
+        assert isinstance(quant_method, q8.MTPQ80MoEMethod)
+
+
+def _auto_expert_format_config():
+    draft = SimpleNamespace(
+        dtype=torch.float16,
+        hf_text_config=SimpleNamespace(
+            hidden_size=2560,
+            moe_intermediate_size=640,
+            num_experts_per_tok=10,
+            num_hidden_layers=48,
+        ),
+    )
+    return SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            draft_model_config=draft,
+            mtp_expert_quantization=None,
+            rejection_sample_method="standard",
+        ),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+            prefill_context_parallel_size=1,
+            tensor_parallel_size=4,
+            enable_expert_parallel=False,
+        ),
+    )

@@ -380,8 +380,10 @@ def test_mtp_replay_worker_transport_and_graph_policy(engine_config, graph):
     ).speculative_config
     assert spec.gdn_spec_state_replay
     assert spec.gdn_replay_graph_enabled() is (graph is not False)
+    payload = spec.to_worker_payload()
+    assert "mtp_expert_quantization" not in payload["input"]
     rebuilt = SpeculativeConfig.from_worker_payload(
-        json.loads(json.dumps(spec.to_worker_payload())),
+        json.loads(json.dumps(payload)),
         target_model_config=spec.target_model_config,
         target_parallel_config=spec.target_parallel_config,
     )
@@ -389,6 +391,7 @@ def test_mtp_replay_worker_transport_and_graph_policy(engine_config, graph):
     assert rebuilt.gdn_spec_state_replay
     assert rebuilt.gdn_replay_graph_enabled() is (graph is not False)
     assert rebuilt.compute_hash() == spec.compute_hash()
+    assert rebuilt.to_worker_payload() == payload
     from vllm.config import replace
 
     copied = replace(spec, gdn_state_replay_graph=graph)

@@ -76,8 +76,9 @@ def prepare_mtp_fp8_checkpoint(
     *,
     tp_size: int,
     num_experts: int,
+    dequantize: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """Pair checkpoint weights/scales and retain their FP8 representation.
+    """Pair checkpoint weights/scales for native FP8 or conversion.
 
     Other model tensors pass through unchanged. Check completeness per expert,
     not just per fused runtime parameter, before accepting the checkpoint.
@@ -108,13 +109,24 @@ def prepare_mtp_fp8_checkpoint(
         pair = pending.setdefault(base, {})
         pair[suffix] = tensor
         if len(pair) == 2:
+            del pending[base]
+            if dequantize:
+                weight = pair["weight"]
+                scale = pair["weight_scale_inv"]
+                scale = (
+                    scale.float().repeat_interleave(128, 0).repeat_interleave(128, 1)
+                )
+                yield (
+                    base + ".weight",
+                    weight.float() * scale[: weight.shape[0], : weight.shape[1]],
+                )
+                continue
             weight, scale = pad_mtp_fp8_checkpoint_matrix(
                 pair["weight"],
                 pair["weight_scale_inv"],
                 down_projection=base.endswith(".down_proj"),
                 tp_size=tp_size,
             )
-            del pending[base]
             yield base + ".weight", weight
             yield base + ".weight_scale_inv", scale
     missing = expected - seen

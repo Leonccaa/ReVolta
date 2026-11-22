@@ -52,6 +52,14 @@ the same explicit format; mixing planar target and scalar MTP is rejected.
 SM70 DFlash/DFlash2 still defaults to FP16 draft KV. See the
 [KV dtype comparison](configuration.md#launch-options) for eligibility and ABI.
 
+On V100, Flash-Next MTP uses Q8_0 for supported floating-point or block-FP8 routed
+expert weights. The runtime packs the experts once at load time. Packed
+NVFP4 draft experts keep their checkpoint format. To keep FP8 draft expert
+storage, add `"mtp_expert_quantization":"fp8"` to the speculative config.
+For the supported draft sources, `"mtp_expert_quantization":"fp16"` selects
+the FP16 reference. These settings affect only the draft's routed expert
+weights. The draft KV dtype is configured separately.
+
 When target E4M3 scales are unavailable, FP16 KV needs no calibration but
 holds roughly half as many KV tokens at the same memory budget. INT8 KV
 computes per-token, per-head scales at runtime; in the supported speculative

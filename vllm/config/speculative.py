@@ -248,11 +248,11 @@ class SpeculativeConfig:
     existing draft projection.
     """
 
-    mtp_expert_quantization: Literal["fp8", "q8_0"] | None = None
+    mtp_expert_quantization: Literal["fp8", "q8_0", "fp16"] | None = None
     """Select the routed-expert format for Qwen4Exp MTP on SM70. The default
-    follows the draft checkpoint, including serialized block-FP8 drafts.
-    Use fp8 for online FP8 or q8_0 to pack BF16/FP16 draft expert weights.
-    Target weights are unchanged.
+    packs floating-point or block-FP8 draft experts into Q8_0 and otherwise
+    follows the checkpoint. Use fp8 for FP8 experts or fp16 for the FP16
+    reference. Target weights are unchanged.
     """
     quantization: me_quant.QuantizationMethods | str | None = None
     """Quantization method that was used to quantize the draft model weights.
@@ -650,16 +650,23 @@ class SpeculativeConfig:
             raw["sm70_dflash2"] = TypeAdapter(Sm70DFlash2Config).dump_python(
                 raw["sm70_dflash2"], include=user_fields
             )
+        derived = {
+            "gdn_spec_state_replay": self.gdn_spec_state_replay,
+            "sm70_dflash2": TypeAdapter(Sm70DFlash2Config).dump_python(
+                self.sm70_dflash2, mode="json"
+            ),
+        }
+        # The engine resolves the MTP expert default after input validation.
+        if (
+            self.mtp_expert_quantization is not None
+            and raw.get("mtp_expert_quantization") is None
+        ):
+            derived["mtp_expert_quantization"] = self.mtp_expert_quantization
         return {
             "schema_version": 1,
             "input": TypeAdapter(dict[str, Any]).dump_python(raw, mode="json"),
             "lookup": self.resolved_dflash2_lookup.model_dump(mode="json"),
-            "derived": {
-                "gdn_spec_state_replay": self.gdn_spec_state_replay,
-                "sm70_dflash2": TypeAdapter(Sm70DFlash2Config).dump_python(
-                    self.sm70_dflash2, mode="json"
-                ),
-            },
+            "derived": derived,
         }
 
     @classmethod
@@ -734,11 +741,17 @@ class SpeculativeConfig:
         return result
 
     def _restore_worker_derived(self, derived: dict[str, Any]) -> None:
-        if derived.keys() != {"gdn_spec_state_replay", "sm70_dflash2"}:
+        required = {"gdn_spec_state_replay", "sm70_dflash2"}
+        if not required <= derived.keys() <= required | {"mtp_expert_quantization"}:
             raise ValueError("Invalid speculative worker derived fields")
         self.gdn_spec_state_replay = TypeAdapter(bool).validate_python(
             derived["gdn_spec_state_replay"], strict=True
         )
+        if "mtp_expert_quantization" in derived:
+            expert_format = get_type_hints(SpeculativeConfig)["mtp_expert_quantization"]
+            self.mtp_expert_quantization = TypeAdapter(expert_format).validate_python(
+                derived["mtp_expert_quantization"], strict=True
+            )
         # These policy fields use init=False and cannot go through a user input
         # constructor. Rebuild the validated policy, then restore its decisions.
         policy = dict(derived["sm70_dflash2"])
@@ -2061,8 +2074,7 @@ class SpeculativeConfig:
             raise ValueError("mtp_expert_quantization currently requires Qwen4Exp MTP")
         if self.rejection_sample_method != "standard":
             raise ValueError(
-                f"{self.mtp_expert_quantization.upper()} MTP requires standard "
-                "rejection sampling"
+                "mtp_expert_quantization requires standard rejection sampling"
             )
 
     def verify_equal_vocab_size_if_draft_model(self):

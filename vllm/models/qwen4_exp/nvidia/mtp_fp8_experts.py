@@ -200,7 +200,7 @@ class MTPExpertQuantConfig(QuantizationConfig):
         checkpoint_prefixes: set[str] | None = None,
         quantize_unquantized: bool = True,
         *,
-        expert_format: Literal["fp8", "q8_0"] = "fp8",
+        expert_format: Literal["fp8", "q8_0", "fp16"] = "fp8",
     ):
         super().__init__()
         self.fallback = fallback
@@ -235,9 +235,12 @@ class MTPExpertQuantConfig(QuantizationConfig):
 
     def get_quant_method(self, layer, prefix):
         routed = isinstance(layer, RoutedExperts)
-        if routed and prefix in self.checkpoint_prefixes:
+        from_checkpoint_fp8 = routed and prefix in self.checkpoint_prefixes
+        if from_checkpoint_fp8 and self.expert_format == "fp8":
             return MTPCheckpointFp8SM70MoEMethod(layer)
-        if self.fallback is not None:
+        if from_checkpoint_fp8:
+            method = None
+        elif self.fallback is not None:
             method = self.fallback.get_quant_method(layer, prefix)
         else:
             method = (
@@ -257,11 +260,19 @@ class MTPExpertQuantConfig(QuantizationConfig):
             )
             if not isinstance(method, UnquantizedFusedMoEMethod) and not (
                 method is None
-                and (self.fallback is None or excluded(prefix) or absent_from_mixed)
+                and (
+                    from_checkpoint_fp8
+                    or self.fallback is None
+                    or excluded(prefix)
+                    or absent_from_mixed
+                )
             ):
                 raise ValueError(
                     f"MTP {self.expert_format} requires unquantized checkpoint experts"
+                    " or supported block-FP8 experts"
                 )
+            if self.expert_format == "fp16":
+                return method  # RoutedExperts supplies the unquantized method if None.
             if self.expert_format == "q8_0":
                 from .mtp_q8_experts import MTPQ80MoEMethod
 

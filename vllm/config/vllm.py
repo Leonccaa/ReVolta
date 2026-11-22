@@ -1978,6 +1978,18 @@ class VllmConfig:
                 self.model_config, self.load_config
             )
 
+        spec = self.speculative_config
+        if (
+            not self.is_speculative_draft
+            and spec is not None
+            and spec.mtp_expert_quantization is None
+            and spec.use_qwen4_exp_mtp()
+            and all_visible_devices_sm70()
+        ):
+            from vllm.models.qwen4_exp.nvidia.mtp import resolve_mtp_expert_default
+
+            resolve_mtp_expert_default(self)
+
         from vllm.config.mm_encoder_tp import resolve_mm_encoder_tp_mode
 
         resolve_mm_encoder_tp_mode(self)

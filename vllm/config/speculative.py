@@ -491,6 +491,12 @@ class SpeculativeConfig:
     Only effective when GDN state replay resolves on.
     """
 
+    exact_end_draft_threshold: int | None = Field(default=None, ge=1)
+    """Finish within this many remaining output tokens without verification,
+    capped by the draft width. Also limit verification to the output budget.
+    Applies to DSD with GDN state replay and prefix caching. None keeps the
+    existing scheduling policy."""
+
     gdn_spec_state_replay: bool = Field(default=False, init=False)
     """Resolved by VllmConfig: GDN layers replay accepted tokens rather than
     keeping one state block per speculative position (gdn_state_replay for MTP,
@@ -624,6 +630,8 @@ class SpeculativeConfig:
             result.pop("gdn_state_replay", None)
         if self.gdn_state_replay_graph is None:
             result.pop("gdn_state_replay_graph", None)
+        if self.exact_end_draft_threshold is None:
+            result.pop("exact_end_draft_threshold", None)
         return result
 
     def to_worker_payload(self) -> dict[str, Any]:

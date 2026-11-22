@@ -303,6 +303,14 @@ class Scheduler(SchedulerInterface):
                 vllm_max_batch_size=self.scheduler_config.max_num_seqs,
                 vllm_num_speculative_tokens=self.num_spec_tokens,
             )
+        self.exact_end_draft_threshold = (
+            speculative_config.exact_end_draft_threshold
+            if speculative_config is not None
+            and speculative_config.gdn_spec_state_replay
+            and self.dynamic_sd_lookup is not None
+            and self.cache_config.enable_prefix_caching
+            else None
+        )
         # Last running total of rejection fallbacks seen from the workers.
         self._rejection_fallbacks_total = 0
         self.num_lookahead_tokens = vllm_config.num_lookahead_tokens
@@ -562,19 +570,39 @@ class Scheduler(SchedulerInterface):
             - request.num_output_placeholders,
         )
 
+    def _num_new_tokens_with_spec(self, request: Request) -> int:
+        num_new_tokens = (
+            request.num_tokens_with_spec
+            + request.num_output_placeholders
+            - request.num_computed_tokens
+        )
+        threshold = self.exact_end_draft_threshold
+        if threshold is not None and (drafts := len(request.spec_token_ids)):
+            remaining = self._remaining_output_tokens(request)
+            kept = (
+                0 if remaining <= min(threshold, drafts) else min(drafts, remaining - 1)
+            )
+            num_new_tokens -= drafts - kept
+        return num_new_tokens
+
     def _drafts_unused(
-        self, request: Request, num_computed_tokens: int, num_new_tokens: int
+        self,
+        request: Request,
+        num_computed_tokens: int,
+        num_new_tokens: int,
+        next_draft_threshold: int = 0,
     ) -> bool:
         """Whether the drafts proposed for `request` after this step are sure to
         go unused.
 
         Drafts proposed after a step are verified in the request's next decode
-        step. They go unused when no such step follows, in two cases:
+        step. They go unused in these cases:
 
         1. This step is a non-final prefill chunk. It samples no token, and the
            scheduler drops drafts proposed after a prefill chunk.
         2. This step samples the request's last output token: even if every
            draft is rejected, the request reaches `max_tokens` and finishes.
+        3. Synchronous exact-end scheduling will verify no drafts next step.
 
         Stop tokens and stop strings also end requests, but they cannot be known
         in advance. This returns True only when it is sure.
@@ -587,12 +615,18 @@ class Scheduler(SchedulerInterface):
             num_computed_tokens: Tokens computed before this step, including
                 prefix-cache and KV-connector hits for a newly admitted request.
             num_new_tokens: Tokens scheduled for this step.
+            next_draft_threshold: Single-token tail threshold for the next step.
 
         """
         # Case 1: a non-final prefill chunk stops before the request's last
         # known token, so this step samples nothing.
         if num_computed_tokens + num_new_tokens < request.num_tokens:
             return True
+
+        if next_draft_threshold:
+            return max(0, self._remaining_output_tokens(request) - 1) <= (
+                next_draft_threshold
+            )
 
         # Case 2: this step samples the request's last output token. Drafts may
         # all be rejected, so count only the output tokens the request is sure
@@ -769,12 +803,7 @@ class Scheduler(SchedulerInterface):
             for r in self.running
         }
         resident_tokens = {
-            r.request_id: max(
-                0,
-                r.num_tokens_with_spec
-                + r.num_output_placeholders
-                - r.num_computed_tokens,
-            )
+            r.request_id: max(0, self._num_new_tokens_with_spec(r))
             for r in self.running
             if prefill_remaining[r.request_id] == 0
             and r.num_output_tokens > 0
@@ -818,7 +847,9 @@ class Scheduler(SchedulerInterface):
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
         # Stays set if a request is preempted later in this step.
-        drafts_needed = not self.can_skip_drafts
+        drafts_needed = (
+            not self.can_skip_drafts or self.exact_end_draft_threshold is not None
+        )
         scheduled_ddtree_payloads: dict[str, DDTreeDraftPayload] = {}
 
         # For logging.
@@ -870,11 +901,7 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
-            num_new_tokens = (
-                request.num_tokens_with_spec
-                + request.num_output_placeholders
-                - request.num_computed_tokens
-            )
+            num_new_tokens = self._num_new_tokens_with_spec(request)
             ddtree_payload_for_tree_schedule = self._ddtree_payload_for_tree_schedule(
                 request
             )
@@ -1752,6 +1779,20 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
                 len(num_scheduled_tokens)
             ]
+        if self.exact_end_draft_threshold is not None:
+            # Only now is the DSD width for the final batch known.
+            next_threshold = min(
+                self.exact_end_draft_threshold, num_spec_tokens_to_schedule
+            )
+            drafts_needed = any(
+                not self._drafts_unused(
+                    self.requests[rid],
+                    self.requests[rid].num_computed_tokens,
+                    num_new_tokens,
+                    next_threshold,
+                )
+                for rid, num_new_tokens in num_scheduled_tokens.items()
+            )
 
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,

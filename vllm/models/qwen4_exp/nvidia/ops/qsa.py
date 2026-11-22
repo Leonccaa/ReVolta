@@ -12,6 +12,8 @@ from typing import Any
 
 import regex as re
 import torch
+import torch.distributed as dist
+import torch.nn.functional as F
 
 import vllm._custom_ops as ops
 import vllm.envs as envs
@@ -20,6 +22,7 @@ from vllm.logger import init_logger
 from vllm.models.deepseek_v4.common.ops.fp8_software import (
     fp8_e4m3fn_bits_to_fp32_bitcast as fp8_e4m3fn_bits_to_fp32,
 )
+from vllm.models.qwen4_exp.common.qsa_cache import QSA_PREFILL_MIN_ROWS_PER_OWNER
 from vllm.models.qwen4_exp.nvidia.ops.sm70_qsa_tuning import (
     SM70_QSA_TUNING,
     legacy_qsa_tuning,
@@ -1725,6 +1728,7 @@ def _qsa_select_by_request(
     *,
     index_dcp_world_size: int = 1,
     index_dcp_rank: int = 0,
+    prefill_ranges: tuple[tuple[int, int], ...] = (),
 ) -> bool:
     """Select a multi-request batch one long request at a time.
 
@@ -1765,6 +1769,12 @@ def _qsa_select_by_request(
         if index_dcp_world_size > 1:
             bound_args["index_dcp_world_size"] = index_dcp_world_size
             bound_args["index_dcp_rank"] = index_dcp_rank
+        if prefill_ranges:
+            bound_args["prefill_ranges"] = tuple(
+                (max(a, start) - start, min(b, end) - start)
+                for a, b in prefill_ranges
+                if a < end and start < b
+            )
         if request is None:
             qsa_select_paged_tokens(
                 q[start:end],
@@ -1810,6 +1820,8 @@ def qsa_select_paged_tokens(
     seq_lens_cpu_upper_bound: torch.Tensor | None = None,
     index_dcp_world_size: int = 1,
     index_dcp_rank: int = 0,
+    *,
+    prefill_ranges: tuple[tuple[int, int], ...] = (),
     batch_query_starts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Score and select QSA indices, using a host bound when available.
@@ -1858,6 +1870,7 @@ def qsa_select_paged_tokens(
         query_start_loc_cpu,
         max_seq_len,
         seq_lens_cpu_upper_bound,
+        prefill_ranges=prefill_ranges,
         **shard_kwargs,
     ):
         return out
@@ -2055,6 +2068,10 @@ def qsa_select_paged_tokens(
                 index_dcp_rank,
                 block_topk,
                 row_keys=(token_to_req[row_slice], query_positions[row_slice]),
+                owner_merge=(
+                    row_end - row_start >= QSA_PREFILL_MIN_ROWS_PER_OWNER * world
+                    and any(a <= row_start and row_end <= b for a, b in prefill_ranges)
+                ),
             )
         expand_qsa_block_indices_cuda(
             blocks,
@@ -2267,12 +2284,13 @@ def _check_index_shard_plan(
     world: int,
     row_keys: tuple[torch.Tensor, torch.Tensor] | None,
     all_gather: Callable[[torch.Tensor], torch.Tensor],
+    owner_merge: bool,
 ) -> None:
-    """Debug: fail if DCP ranks are not merging the same rows in step.
+    """Debug: fail if TP ranks are not merging the same rows in step.
 
-    All-gathers a fixed [1, 6] int64 descriptor (per-process call index, rows,
-    top-k, world, request and position checksums) right before the candidate
-    all-gather. Host-synchronizing; skipped during CUDA graph capture.
+    All-gathers a fixed [1, 7] int64 descriptor (per-process call index, rows,
+    top-k, world, request and position checksums, and owner mode) before the
+    candidate exchange. Host-synchronizing; skipped during CUDA graph capture.
     """
     global _index_shard_merge_calls
     _index_shard_merge_calls += 1
@@ -2280,7 +2298,7 @@ def _check_index_shard_plan(
         return
     device = row_keys[0].device if row_keys is not None else None
     desc = torch.tensor(
-        [_index_shard_merge_calls, rows, block_topk, world, 0, 0],
+        [_index_shard_merge_calls, rows, block_topk, world, 0, 0, int(owner_merge)],
         dtype=torch.int64,
         device=device,
     )
@@ -2289,11 +2307,11 @@ def _check_index_shard_plan(
         for slot, key in ((4, row_keys[0]), (5, row_keys[1])):
             desc[slot] = (key[:rows].to(torch.int64) * weights).sum()
     seen = all_gather(desc.unsqueeze(0))
-    if seen.shape != (world, 6) or not bool((seen == seen[:1]).all()):
+    if seen.shape != (world, 7) or not bool((seen == seen[:1]).all()):
         raise RuntimeError(
             "QSA indexer DCP shard ranks disagree before the candidate "
-            "all-gather (call, rows, top-k, world, request sum, position "
-            f"sum per rank): {seen.tolist()}"
+            "exchange (call, rows, top-k, world, request sum, position "
+            f"sum, owner mode per rank): {seen.tolist()}"
         )
 
 
@@ -2325,6 +2343,7 @@ def _merge_sharded_index_blocks(
     block_topk: int,
     *,
     row_keys: tuple[torch.Tensor, torch.Tensor] | None = None,
+    owner_merge: bool = False,
     all_gather: Callable[[torch.Tensor], torch.Tensor] | None = None,
     select: Callable[[torch.Tensor, torch.Tensor, torch.Tensor, int], None]
     | None = None,
@@ -2339,7 +2358,9 @@ def _merge_sharded_index_blocks(
     rerun the same lexicographic top-k: its "lower position wins ties, emit
     positions ascending" rule then equals "lower global group wins, emit
     groups ascending". Every rank calls this with the same shapes, so the
-    collective sequence stays aligned across the DCP group.
+    collective sequence stays aligned across the TP group. On large prefill
+    chunks each TP rank instead receives a contiguous range of query rows
+    from every rank, then all-gathers the selected int32 groups.
 
     The exact local selector emits increasing columns, hence each rank's
     global groups are already sorted. For candidate (rank r, offset j), its
@@ -2392,8 +2413,24 @@ def _merge_sharded_index_blocks(
 
         all_gather = lambda t: get_tp_group().all_gather(t, dim=0)  # noqa: E731
     if envs.VLLM_QSA_INDEX_SHARD_DEBUG:
-        _check_index_shard_plan(rows, block_topk, world, row_keys, all_gather)
-    gathered = all_gather(packed.unsqueeze(0))
+        _check_index_shard_plan(
+            rows, block_topk, world, row_keys, all_gather, owner_merge
+        )
+    total_rows = rows
+    if owner_merge:
+        from vllm.distributed import get_tp_group
+
+        rows = triton.cdiv(total_rows, world)
+        padding = rows * world - total_rows
+        if padding:
+            # Pad with empty rows. Score words at pad IDs are never selected.
+            packed = F.pad(packed, (0, 0, 0, padding), value=_INDEX_SHARD_PAD_ID)
+        send = packed.view(world, rows, 2 * block_topk)
+        gathered = torch.empty_like(send)
+        # Equal splits by destination on send, source rank order on receive.
+        dist.all_to_all_single(gathered, send, group=get_tp_group().device_group)
+    else:
+        gathered = all_gather(packed.unsqueeze(0))
     if gathered.shape != (world, rows, 2 * block_topk):
         # Catches a local world/wrapper mismatch only: all_gather sizes its
         # output from this rank's input. Cross-rank row layout is checked by
@@ -2443,9 +2480,11 @@ def _merge_sharded_index_blocks(
     else:
         select(sorted_scores, lengths, positions, block_topk)
     if use_triton:
-        return _map_index_shard_positions(positions, sorted_groups)
-    merged = torch.gather(sorted_groups, 1, positions.clamp_min(0).long())
-    return torch.where(positions >= 0, merged, torch.full_like(merged, -1))
+        merged = _map_index_shard_positions(positions, sorted_groups)
+    else:
+        merged = torch.gather(sorted_groups, 1, positions.clamp_min(0).long())
+        merged = torch.where(positions >= 0, merged, torch.full_like(merged, -1))
+    return all_gather(merged)[:total_rows] if owner_merge else merged
 
 
 def _qsa_xqa_page4_shape_supported(

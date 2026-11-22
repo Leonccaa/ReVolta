@@ -4678,10 +4678,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         lambda: bool(int(os.getenv("VLLM_QSA_INDEX_SHARD_DEBUG", "0"))),
         description=(
             "Debug check for kernel_config.qsa_dcp_index_shard: before each "
-            "QSA indexer candidate all-gather, all-gather a fixed-size row "
-            "descriptor (call index, rows, top-k, request/position checksums) "
-            "and fail if DCP ranks disagree. Synchronizes the host; skipped "
-            "during CUDA graph capture."
+            "QSA indexer candidate exchange, all-gather a fixed-size row "
+            "descriptor (call index, rows, top-k, request/position checksums, "
+            "and owner mode) and fail if TP ranks disagree. Synchronizes the "
+            "host; skipped during CUDA graph capture."
         ),
         category="experimental",
         declared_default="False",

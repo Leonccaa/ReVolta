@@ -692,13 +692,13 @@ def test_shard_merge_debug_plan_check(monkeypatch: pytest.MonkeyPatch) -> None:
     pos = torch.tensor([7, 8, 3], dtype=torch.int64)
     calls = []
 
-    def gather_with(other_rows_keys):
+    def gather_with(mismatch_slot):
         def gather(t):
             calls.append(t.shape)
             if t.dtype == torch.int64:  # the plan descriptor
                 other = t.clone()
-                if other_rows_keys is not None:
-                    other[0, 5] += 1  # peer saw a different position layout
+                if mismatch_slot is not None:
+                    other[0, mismatch_slot] += 1
                 return torch.cat((t, other), dim=0)
             return torch.cat((t, t), dim=0)
 
@@ -716,19 +716,21 @@ def test_shard_merge_debug_plan_check(monkeypatch: pytest.MonkeyPatch) -> None:
         select=_reference_select,
     )
     assert merged.shape == (rows, k)
-    assert calls[0] == (1, 6) and len(calls) == 2
-    with pytest.raises(RuntimeError, match="disagree"):
-        qsa_ops._merge_sharded_index_blocks(
-            blocks,
-            logits,
-            None,
-            2,
-            0,
-            k,
-            row_keys=(req, pos),
-            all_gather=gather_with(True),
-            select=_reference_select,
-        )
+    assert calls[0] == (1, 7) and len(calls) == 2
+    for mismatch_slot in (5, 6):  # position layout or collective choice
+        with pytest.raises(RuntimeError, match="disagree"):
+            qsa_ops._merge_sharded_index_blocks(
+                blocks,
+                logits,
+                None,
+                2,
+                0,
+                k,
+                row_keys=(req, pos),
+                all_gather=gather_with(mismatch_slot),
+                select=_reference_select,
+            )
+    assert len(calls) == 4  # only descriptors were gathered on mismatches
 
 
 def test_runtime_validator_rejects_unsupported(monkeypatch: pytest.MonkeyPatch) -> None:

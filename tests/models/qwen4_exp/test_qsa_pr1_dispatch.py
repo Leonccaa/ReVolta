@@ -105,10 +105,11 @@ def test_paged_topk_changes_only_local_selection(
         qsa_lexicographic_topk=local, qsa_lexicographic_topk_v154=select
     )
 
-    def merge(blocks, scores, lengths, world, rank, k, *, row_keys):
+    def merge(blocks, scores, lengths, world, rank, k, *, row_keys, owner_merge):
         assert scores is logits and lengths is visible
         assert (world, rank, k) == (2, 1, 512)
         assert all(key.shape == (rows,) for key in row_keys)
+        assert not owner_merge
         events.append("merge")
         return blocks
 

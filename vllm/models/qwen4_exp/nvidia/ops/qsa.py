@@ -698,6 +698,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     BLOCK_N: tl.constexpr,
     KV_E4M3: tl.constexpr,
     RESOLVED_INDICES: tl.constexpr = False,
+    SKIP_EMPTY_SPLITS: tl.constexpr = False,
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -731,6 +732,13 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     # Dynamic bounds avoid padded main-loop iterations for uneven splits.
     split_tile_start = split_id * NUM_TILES // NUM_SPLITS
     split_tile_end = (split_id + 1) * NUM_TILES // NUM_SPLITS
+    if SKIP_EMPTY_SPLITS:
+        # DCP localization packs each row's owned tokens before the -1 tail.
+        first = tl.load(
+            indices_ptr + row * stride_indices_row + split_tile_start * BLOCK_N
+        )
+        if first < 0:
+            split_tile_end = split_tile_start
     for tile in range(split_tile_start, split_tile_end):
         columns = tile * BLOCK_N + column_offsets
         logical_token = tl.load(
@@ -3395,11 +3403,13 @@ def qsa_sparse_paged_attention(
     lse: torch.Tensor | None = None,
     k_scale_cache: torch.Tensor | None = None,
     v_scale_cache: torch.Tensor | None = None,
+    compacted_indices: bool = False,
 ) -> torch.Tensor:
     """Run sparse GQA, optionally returning base-2 LSE for a cross-rank merge.
 
     LSE callers may supply FP32 output to avoid rounding each rank's partial
     result. Apply output gating after the cross-rank merge, not per rank.
+    Compacted rows hold selected indices at the front, followed by -1 padding.
     """
 
     codec = resolve_kv_codec(kv_cache_dtype)
@@ -3621,6 +3631,12 @@ def qsa_sparse_paged_attention(
         BLOCK_N=block_n,
         KV_E4M3=kv_e4m3,
         RESOLVED_INDICES=resolved_indices,
+        # Measured on V100 through eight K5 requests (48 query rows).
+        SKIP_EMPTY_SPLITS=(
+            compacted_indices
+            and q.shape[0] <= 48
+            and current_platform.is_device_capability(70)
+        ),
         num_warps=partial_warps,
         num_stages=2,
     )

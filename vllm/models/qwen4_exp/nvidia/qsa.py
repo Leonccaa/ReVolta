@@ -788,6 +788,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 k_scale=layer._k_scale_float,
                 v_scale=layer._v_scale_float,
                 lse=partial_lse[grouped_rows:],
+                compacted_indices=True,
                 **scale_kwargs,
             )
         merged = cast(

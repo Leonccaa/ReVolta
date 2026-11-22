@@ -516,7 +516,7 @@ def _qsa_xqa_page4_table_kernel(
     num_requests,
     PAGE_SIZE: tl.constexpr,
     PAGE_TABLE_WIDTH: tl.constexpr,
-    COMPLETE_PAGES: tl.constexpr,
+    INDEX_WIDTH: tl.constexpr,
     OUTPUT_PAGES: tl.constexpr,
     BLOCK_PAGES: tl.constexpr,
     PHYSICAL_PAGE_STRIDE: tl.constexpr,
@@ -538,30 +538,13 @@ def _qsa_xqa_page4_table_kernel(
         tl.maximum(query_position + 1, 0),
         sequence_length,
     )
-    complete_pages = tl.minimum(
-        tl.minimum(visible_tokens // 4, sequence_length // 4),
-        COMPLETE_PAGES,
-    )
-    tail_count = visible_tokens - (visible_tokens // 4) * 4
-    is_complete = slots < complete_pages
-    selected_token = tl.load(
-        indices_ptr + row * stride_indices_row + slots * 4,
-        mask=(row < rows) & is_complete,
+    columns = slots * 4
+    index_ptr = indices_ptr + row * stride_indices_row + columns
+    logical_token = tl.load(
+        index_ptr,
+        mask=(row < rows) & request_is_valid & (columns < INDEX_WIDTH),
         other=-1,
     )
-    tail_token = (visible_tokens // 4) * 4
-    selected_tail_token = tl.load(
-        indices_ptr + row * stride_indices_row + complete_pages * 4,
-        mask=(row < rows) & (tail_count > 0),
-        other=-1,
-    )
-    tail_is_valid = (
-        (tail_count > 0)
-        & (selected_tail_token == tail_token)
-        & (selected_tail_token < sequence_length)
-    )
-    is_tail = (slots == complete_pages) & tail_is_valid
-    logical_token = tl.where(is_tail, selected_tail_token, selected_token)
     safe_token = tl.maximum(logical_token, 0)
     logical_page = safe_token // PAGE_SIZE
     page_offset = safe_token - logical_page * PAGE_SIZE
@@ -569,9 +552,8 @@ def _qsa_xqa_page4_table_kernel(
         (row < rows)
         & request_is_valid
         & (logical_token >= 0)
-        & (logical_token < sequence_length)
+        & (logical_token < visible_tokens)
         & (logical_page < PAGE_TABLE_WIDTH)
-        & (is_complete | is_tail)
     )
     physical_page = tl.load(
         block_table_ptr
@@ -581,6 +563,20 @@ def _qsa_xqa_page4_table_kernel(
         other=-1,
     )
     valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
+    # Draft steps can reuse a selection made before the current position.
+    # Count the selected tokens, including a retained partial page, so the
+    # native reader only visits pages represented in the sorted plan.
+    page_tokens = valid.to(tl.int32)
+    for offset in tl.static_range(1, 4):
+        next_valid = (
+            (page_tokens == offset)
+            & (columns + offset < INDEX_WIDTH)
+            & (logical_token + offset < visible_tokens)
+        )
+        next_token = tl.load(index_ptr + offset, mask=next_valid, other=-1)
+        page_tokens += (next_valid & (next_token == logical_token + offset)).to(
+            tl.int32
+        )
     physical_microblock = (
         tl.maximum(physical_page, 0) * PHYSICAL_PAGE_STRIDE + page_offset // 4
     )
@@ -588,10 +584,10 @@ def _qsa_xqa_page4_table_kernel(
     # the partial causal page after all complete pages and invalid slots last.
     logical_key = safe_token.to(tl.int64) << 31
     encoded = tl.where(
-        valid & is_complete,
+        page_tokens == 4,
         logical_key | physical_microblock.to(tl.int64),
         tl.where(
-            valid & is_tail,
+            page_tokens > 0,
             (1 << 62) | logical_key | physical_microblock.to(tl.int64),
             9223372036854775807,
         ),
@@ -603,7 +599,7 @@ def _qsa_xqa_page4_table_kernel(
     )
     tl.store(
         xqa_sequence_lengths_ptr + row,
-        complete_pages * 4 + tl.where(tail_is_valid, tail_count, 0),
+        tl.sum(page_tokens, axis=0),
         mask=row < rows,
     )
 
@@ -2529,7 +2525,7 @@ def _qsa_xqa_page4_block_table(
         block_table.shape[0],
         PAGE_SIZE=page_size,
         PAGE_TABLE_WIDTH=block_table.shape[1],
-        COMPLETE_PAGES=2048 // 4,
+        INDEX_WIDTH=logical_indices.shape[1],
         OUTPUT_PAGES=_SM70_QSA_XQA_PAGE4_PAGES,
         BLOCK_PAGES=1024,
         PHYSICAL_PAGE_STRIDE=physical_page_stride,

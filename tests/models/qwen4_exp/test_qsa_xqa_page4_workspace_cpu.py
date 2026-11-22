@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -77,6 +78,54 @@ def test_workspace_partition_count_is_part_of_the_cache_key():
     assert second[0].shape == (3, 6, 16, 256)
     assert second[0].data_ptr() != first[0].data_ptr()
     assert second[3].tolist() == [16]
+
+
+@pytest.mark.skipif(
+    os.environ.get("TRITON_INTERPRET") != "1", reason="CPU Triton interpreter required"
+)
+@pytest.mark.parametrize("owner_tokens", [4, 64, 784])
+def test_xqa_page4_plan_matches_selected_tokens_during_mtp(owner_tokens):
+    # Fresh selections and later steps reusing them, including both sides
+    # of a four-token boundary and rows that fill the selector budget.
+    prefixes = [(1, 1), (4, 4), (7, 7), (7, 8), (8, 12), (2051, 2051), (4103, 4107)]
+    rows = len(prefixes)
+    num_blocks = math.ceil(max(current for _, current in prefixes) / owner_tokens)
+    table = torch.arange(num_blocks - 1, -1, -1, dtype=torch.int32).expand(rows, -1)
+    requests = torch.arange(rows, dtype=torch.int32)
+    lengths = torch.tensor([current for _, current in prefixes], dtype=torch.int32)
+    indices = torch.full((rows, 2051), -1, dtype=torch.int32)
+    selections = []
+    for row, (selected, _) in enumerate(prefixes):
+        complete, tail = divmod(selected, 4)
+        complete_pages = torch.arange(min(complete, 512), dtype=torch.int32)
+        if complete > 512:
+            # A normal top-k selection can omit pages and be out of order.
+            complete_pages = (complete_pages * 2).flip(0)
+        tokens = (complete_pages[:, None] * 4 + torch.arange(4)).flatten()
+        tail_tokens = torch.arange(complete * 4, complete * 4 + tail)
+        selection = torch.cat((tokens, tail_tokens))
+        indices[row, : selection.numel()] = selection
+        selections.append(selection.sort().values)
+
+    pages, selected_lengths = ops._qsa_xqa_page4_block_table(
+        indices,
+        table,
+        requests,
+        lengths.to(torch.int64) - 1,
+        lengths,
+        num_blocks,
+        owner_tokens,
+    )
+    for row, selection in enumerate(selections):
+        selected_count = selected_lengths[row].item()
+        assert selected_count == selection.numel()
+        page_ids = pages[row, : math.ceil(selected_count / 4)]
+        physical_tokens = (page_ids[:, None] * 4 + torch.arange(4)).flatten()
+        expected = (
+            table[row, selection // owner_tokens] * owner_tokens
+            + selection % owner_tokens
+        )
+        torch.testing.assert_close(physical_tokens[:selected_count], expected)
 
 
 @pytest.mark.parametrize("block,route,rows", [(4, "decode", 3), (64, "grouped", 9)])

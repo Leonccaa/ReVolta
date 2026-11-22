@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.compilation.sm70_decode_graph import sm70_decode_graph_compilation
 from vllm.models.qwen4_exp.common import qsa_cache
 from vllm.models.qwen4_exp.common.qsa_cache import (
     PAD_SLOT_ID,
@@ -691,13 +692,13 @@ def test_shard_merge_debug_plan_check(monkeypatch: pytest.MonkeyPatch) -> None:
     pos = torch.tensor([7, 8, 3], dtype=torch.int64)
     calls = []
 
-    def gather_with(other_rows_keys):
+    def gather_with(mismatch_slot):
         def gather(t):
             calls.append(t.shape)
             if t.dtype == torch.int64:  # the plan descriptor
                 other = t.clone()
-                if other_rows_keys is not None:
-                    other[0, 5] += 1  # peer saw a different position layout
+                if mismatch_slot is not None:
+                    other[0, mismatch_slot] += 1
                 return torch.cat((t, other), dim=0)
             return torch.cat((t, t), dim=0)
 
@@ -715,19 +716,21 @@ def test_shard_merge_debug_plan_check(monkeypatch: pytest.MonkeyPatch) -> None:
         select=_reference_select,
     )
     assert merged.shape == (rows, k)
-    assert calls[0] == (1, 6) and len(calls) == 2
-    with pytest.raises(RuntimeError, match="disagree"):
-        qsa_ops._merge_sharded_index_blocks(
-            blocks,
-            logits,
-            None,
-            2,
-            0,
-            k,
-            row_keys=(req, pos),
-            all_gather=gather_with(True),
-            select=_reference_select,
-        )
+    assert calls[0] == (1, 7) and len(calls) == 2
+    for mismatch_slot in (5, 6):  # position layout or collective choice
+        with pytest.raises(RuntimeError, match="disagree"):
+            qsa_ops._merge_sharded_index_blocks(
+                blocks,
+                logits,
+                None,
+                2,
+                0,
+                k,
+                row_keys=(req, pos),
+                all_gather=gather_with(mismatch_slot),
+                select=_reference_select,
+            )
+    assert len(calls) == 4  # only descriptors were gathered on mismatches
 
 
 def test_runtime_validator_rejects_unsupported(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -902,6 +905,79 @@ def test_shard_merge_topk_dispatch(rows, world, k, enabled, monkeypatch):
     ]
 
 
+@pytest.mark.parametrize(
+    ("rows", "world", "graph", "mode", "expected"),
+    [
+        (16, 4, True, "wheel", "p4"),
+        (17, 2, True, "wheel", "v154"),
+        (24, 4, True, "wheel", "v154"),
+        (40, 4, True, "wheel", "v154"),
+        (64, 4, True, "wheel", "v154"),
+        (65, 4, True, "wheel", "generic"),
+        (24, 4, False, "wheel", "generic"),
+        (24, 4, True, "sidecar", "generic"),
+        (24, 4, True, "disabled", "generic"),
+        (24, 8, True, "wheel", "generic"),
+    ],
+)
+def test_d1_merge_dispatch(rows, world, graph, mode, expected, monkeypatch) -> None:
+    from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
+
+    calls = []
+
+    def generic(scores, lengths, out, k, decode_batch=False):
+        calls.append("p4" if decode_batch else "generic")
+        _reference_select(scores, lengths, out, k)
+
+    def v154(scores, lengths, out, k, decode_batch=False):
+        assert decode_batch
+        assert scores.shape == (rows, world * 512) and scores.stride(1) == 1
+        assert lengths.shape == (rows,) and lengths.dtype == torch.int32
+        assert out.shape == (rows, 512) and k == 512
+        calls.append("v154")
+        _reference_select(scores, lengths, out, k)
+
+    wheel = SimpleNamespace(
+        qsa_lexicographic_topk=generic, qsa_lexicographic_topk_v154=v154
+    )
+    monkeypatch.setattr(torch.ops, "_C", wheel)
+    monkeypatch.setattr(qsa_ops, "_SM70_QSA_MTP_TOPK", mode != "disabled")
+    monkeypatch.setattr(
+        qsa_ops, "_SM70_QSA_TOPK_LIBRARY", "sidecar" if mode == "sidecar" else None
+    )
+    monkeypatch.setattr(qsa_ops, "_use_sm70_qsa_lexicographic_topk", lambda _: True)
+    monkeypatch.setattr(qsa_ops, "_sm70_qsa_lexicographic_topk_op", lambda: generic)
+    blocks = torch.arange(512, dtype=torch.int32).repeat(rows, 1)
+    blocks[1, 1:] = -1
+    blocks[2].fill_(-1)
+    scores = torch.zeros((rows, 512), dtype=torch.float32)
+    ranks = torch.arange(world, dtype=torch.int32).view(-1, 1, 1)
+    groups = torch.where(
+        blocks >= 0, blocks * world + ranks, torch.iinfo(torch.int32).max
+    )
+
+    def all_gather(packed):
+        score_bits = packed[..., :512].expand(world, -1, -1)
+        return torch.cat((score_bits, groups), dim=-1)
+
+    use_triton = graph and rows == 17 and os.environ.get("TRITON_INTERPRET") == "1"
+    with sm70_decode_graph_compilation(graph):
+        merged = qsa_ops._merge_sharded_index_blocks(
+            blocks,
+            scores,
+            torch.full((rows,), 512, dtype=torch.int32),
+            world,
+            0,
+            512,
+            all_gather=all_gather,
+            use_triton=use_triton,
+        )
+    assert calls == [expected]
+    assert torch.equal(merged[0], torch.arange(512, dtype=torch.int32))
+    assert torch.equal(merged[1, :world], torch.arange(world, dtype=torch.int32))
+    assert (merged[1, world:] == -1).all() and (merged[2] == -1).all()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs the SM70 top-k op")
 @pytest.mark.parametrize("world", [2, 3])
 @pytest.mark.parametrize("kind", ["normal", "ties", "specials"])
@@ -1024,13 +1100,27 @@ def test_shard_merge_decode_topk_equals_generic(rows: int) -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA graph and SM70")
-@pytest.mark.parametrize("world", [2, 3])
-@pytest.mark.parametrize("rows", [1, 5, 10, 16])
-def test_fused_merge_graph_replays_changed_candidates(world: int, rows: int) -> None:
+@pytest.mark.parametrize(
+    ("world", "rows", "decode"),
+    [(world, rows, False) for world in (2, 3) for rows in (1, 5, 10, 16)]
+    + [
+        pytest.param(world, rows, True, id=f"d1_merge-tp{world}-m{rows}")
+        for world, rows in ((2, 17), (4, 24), (4, 40), (4, 64))
+    ],
+)
+def test_fused_merge_graph_replays_changed_candidates(
+    world: int, rows: int, decode: bool
+) -> None:
     from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
 
     if not qsa_ops._use_sm70_qsa_lexicographic_topk(512):
         pytest.skip("exact SM70 top-k not selected on this device")
+    if decode and (
+        not qsa_ops._SM70_QSA_MTP_TOPK
+        or qsa_ops._SM70_QSA_TOPK_LIBRARY is not None
+        or not hasattr(torch.ops._C, "qsa_lexicographic_topk_v154")
+    ):
+        pytest.skip("D1 decode selector is not enabled in this build")
     k, columns = 512, 2051
     op = qsa_ops._sm70_qsa_lexicographic_topk_op()
     scores = torch.randn(rows, columns, device="cuda")
@@ -1070,11 +1160,11 @@ def test_fused_merge_graph_replays_changed_candidates(world: int, rows: int) -> 
 
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
+    with torch.cuda.stream(stream), sm70_decode_graph_compilation(decode):
         step()  # compile and warm up outside capture
     torch.cuda.current_stream().wait_stream(stream)
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
+    with sm70_decode_graph_compilation(decode), torch.cuda.graph(graph, stream=stream):
         merged = step()
     expected = torch.empty(rows, k, dtype=torch.int32, device="cuda")
     for length in (0, 1, k - 1, k, k + 1, columns):

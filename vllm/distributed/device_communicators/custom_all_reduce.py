@@ -929,6 +929,30 @@ class CustomAllreduce:
         ops.all_reduce_sum2(self._ptr, inp_a, inp_b, out)
         return out
 
+    def _can_sm70_tp4_push_allgather(self, inp: torch.Tensor) -> bool:
+        return (
+            not self.disabled
+            and self.world_size == 4
+            and self.sm70_tp4_push_buffer_ptrs is not None
+            and 0 < inp.nbytes <= 320 * 1024
+            and torch.cuda.is_current_stream_capturing()
+        )
+
+    def try_sm70_tp4_push_allgather(self, inp: torch.Tensor) -> torch.Tensor | None:
+        if not self._can_sm70_tp4_push_allgather(inp):
+            return None
+        out = torch.empty((4, *inp.shape), dtype=inp.dtype, device=inp.device)
+        ops.sm70_tp4_push_allgather(
+            self._ptr, inp.view(torch.uint8), out.view(torch.uint8)
+        )
+        return out
+
+    def try_sm70_qsa_shard_merge(self, packed: torch.Tensor, out: torch.Tensor) -> bool:
+        if not self._can_sm70_tp4_push_allgather(packed):
+            return False
+        ops.sm70_qsa_shard_merge(packed, out, self._ptr)
+        return True
+
     def can_sm70_qwen38_hc_batch(self, branches: torch.Tensor) -> bool:
         return bool(
             not self.disabled

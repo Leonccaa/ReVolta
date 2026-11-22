@@ -16,6 +16,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from functools import cache
+from itertools import pairwise
 from typing import ClassVar
 
 import torch
@@ -48,6 +49,9 @@ logger = init_logger(__name__)
 # A key ring may widen to this many times its minimal size to divide the
 # attention block; beyond that the block size is the thing to change.
 QSA_RING_MAX_WIDENING = 4
+# Keep owner batches above the small decode-selector shapes and amortize the
+# extra collective. This is a per-owner minimum for each scoring chunk.
+QSA_PREFILL_MIN_ROWS_PER_OWNER = 32
 
 
 def canonical_qsa_rope_positions(positions: torch.Tensor) -> torch.Tensor:
@@ -653,6 +657,8 @@ class QSAForwardMetadata(AttentionMetadata):
     # g % index_dcp_world_size == index_dcp_rank at columns g // world.
     index_dcp_world_size: int = 1
     index_dcp_rank: int = 0
+    # Contiguous runs of real prefill rows, in query row order.
+    prefill_ranges: tuple[tuple[int, int], ...] = ()
 
 
 class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
@@ -851,6 +857,22 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             self.is_circular_buffer or self.compress_ratio != 1
         ):
             slot_mapping.fill_(PAD_SLOT_ID)
+        prefill_ranges: list[tuple[int, int]] = []
+        is_prefilling = common_attn_metadata.is_prefilling
+        if (
+            self.index_dcp_world_size > 1
+            and num_tokens >= QSA_PREFILL_MIN_ROWS_PER_OWNER * self.index_dcp_world_size
+            and not common_attn_metadata.is_dummy_batch
+            and is_prefilling is not None
+        ):
+            for (start, end), is_prefill in zip(
+                pairwise(common_attn_metadata.query_start_loc_cpu.tolist()),
+                is_prefilling.tolist(),
+            ):
+                if is_prefill and end > start:
+                    if prefill_ranges and prefill_ranges[-1][1] == start:
+                        start = prefill_ranges.pop()[0]
+                    prefill_ranges.append((start, end))
         return QSAForwardMetadata(
             block_table=block_table,
             slot_mapping=slot_mapping,
@@ -869,6 +891,7 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             ),
             index_dcp_world_size=self.index_dcp_world_size,
             index_dcp_rank=self.index_dcp_rank,
+            prefill_ranges=tuple(prefill_ranges),
         )
 
 

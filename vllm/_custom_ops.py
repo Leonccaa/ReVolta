@@ -3347,6 +3347,14 @@ def sm70_tp4_push_allreduce_buffer_size() -> int:
     return _custom_ar_op("sm70_tp4_push_allreduce_buffer_size")()
 
 
+def sm70_tp4_push_allgather(fa: int, inp: torch.Tensor, out: torch.Tensor) -> None:
+    _custom_ar_owner_namespace().sm70_tp4_push_allgather(fa, inp, out)
+
+
+def sm70_qsa_shard_merge(inp: torch.Tensor, out: torch.Tensor, fa: int = 0) -> None:
+    _custom_ar_owner_namespace().sm70_qsa_shard_merge(fa, inp, out)
+
+
 def sm70_tp8_hierarchical_push_allreduce_buffer_size() -> int:
     return (
         _custom_ar_owner_namespace().sm70_tp8_hierarchical_push_allreduce_buffer_size()
@@ -4545,6 +4553,32 @@ def qsa_lexicographic_topk_v154(
     decode_batch: bool = False,
 ) -> None:
     torch.ops._C.qsa_lexicographic_topk_v154(logits, lengths, output, k, decode_batch)
+
+
+def qsa_lexicographic_topk_pack(
+    logits: torch.Tensor,
+    lengths: torch.Tensor,
+    packed: torch.Tensor,
+    rank: int,
+    v154: bool,
+    decode_batch: bool,
+) -> None:
+    torch.ops._C.qsa_lexicographic_topk_pack(
+        logits, lengths, packed, rank, v154, decode_batch
+    )
+
+
+if hasattr(torch.ops._C, "qsa_lexicographic_topk_v154"):
+
+    @register_fake("_C::qsa_lexicographic_topk_v154")
+    def _qsa_lexicographic_topk_v154_fake(
+        logits: torch.Tensor,
+        lengths: torch.Tensor,
+        output: torch.Tensor,
+        k: int,
+        decode_batch: bool = False,
+    ) -> None:
+        return None
 
 
 def qwen38_gdn_input_batch_sm70_v154_out(

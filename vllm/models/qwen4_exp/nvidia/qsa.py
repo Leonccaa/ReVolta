@@ -68,6 +68,17 @@ from ..common.qsa_cache import (
     qsa_draft_dcp_sharded,
 )
 from .indexer_qsa import QSAIndexer
+from .ops.qsa_device_history import (
+    MAX_ROWS as DEVICE_HISTORY_MAX_ROWS,
+)
+from .ops.qsa_device_history import (
+    MAX_SELECTION_WIDTH as DEVICE_HISTORY_MAX_WIDTH,
+)
+from .ops.qsa_device_history import (
+    load_qsa_device_history,
+    qsa_device_history,
+    qsa_device_history_workspace,
+)
 from .ops.qsa_paged_fp16_h12 import (
     H12_MAX_ROWS,
     H12_MAX_WIDTH,
@@ -710,8 +721,8 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 "k_scale_cache": k_scale_cache,
                 "v_scale_cache": v_scale_cache,
             }
-        # Prefill-sized batches use the grouped page4 route for their leading
-        # multiple of eight rows; decode batches and the rest stay on Triton.
+        # Prefill-sized batches use grouped page4 for their leading multiple
+        # of eight rows. Small uniform decode batches may use the native reader.
         grouped_rows = qsa_dcp_sparse_paged_attention_sm70_grouped_page4(
             gathered_query,
             key_cache,
@@ -744,6 +755,26 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 partial_lse,
             )
             grouped_rows = query.shape[0]
+        elif (
+            grouped_rows == 0
+            and layer.sm70_qsa_device_history
+            and query.shape[0] <= DEVICE_HISTORY_MAX_ROWS
+            and local_width <= DEVICE_HISTORY_MAX_WIDTH
+            and get_forward_context().is_uniform_decode
+        ):
+            qsa_device_history(
+                gathered_query,
+                key_cache,
+                value_cache,
+                local_indices[:, :local_width],
+                block_table,
+                token_to_req,
+                partial_output,
+                partial_lse,
+                layer._k_scale_float,
+                layer._v_scale_float,
+            )
+            grouped_rows = query.shape[0]
         if grouped_rows < query.shape[0]:
             qsa_sparse_paged_attention(
                 gathered_query[grouped_rows:],
@@ -757,6 +788,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 k_scale=layer._k_scale_float,
                 v_scale=layer._v_scale_float,
                 lse=partial_lse[grouped_rows:],
+                compacted_indices=True,
                 **scale_kwargs,
             )
         merged = cast(
@@ -953,9 +985,25 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.dcp_partial_lse_buffer = dcp_partial_lse_buffer
         self.attn_type = AttentionType.DECODER
         self.kv_cache_dtype = cache_config.cache_dtype
-        host_kv = vllm_config.kernel_config.long_context_kv
+        kernel_config = vllm_config.kernel_config
+        host_kv = kernel_config.long_context_kv
+        self.sm70_qsa_device_history = (
+            kernel_config.sm70_qsa_device_history
+            and vllm_config.use_v2_model_runner
+            and not vllm_config.is_speculative_draft
+            and not host_kv.enabled
+            and self.qsa_dcp_sharded
+            and parallel_config.decode_context_parallel_size == 2
+            and tp_size == 4
+            and (self.num_heads, self.num_kv_heads, self.head_dim) == (6, 1, 256)
+            and model_config.dtype == torch.float16
+            and self.kv_cache_dtype == "fp8_e4m3"
+            and current_platform.is_device_capability(70)
+        )
+        if self.sm70_qsa_device_history:
+            load_qsa_device_history()
         self.sm70_qsa_paged_fp16_h12 = (
-            vllm_config.kernel_config.sm70_qsa_paged_fp16_h12
+            kernel_config.sm70_qsa_paged_fp16_h12
             and vllm_config.use_v2_model_runner
             and not vllm_config.is_speculative_draft
             and self.qsa_dcp_sharded
@@ -1131,7 +1179,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         partial = self.dcp_partial_output_buffer
         if not self.qsa_dcp_sharded or partial is None:
             return
-        if self.sm70_qsa_paged_fp16_h12:
+        if self.sm70_qsa_paged_fp16_h12 or self.sm70_qsa_device_history:
             from .ops.qsa_dcp import qsa_dcp_local_selection_width
 
             assert self.dcp_local_indices_buffer is not None
@@ -1142,8 +1190,12 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 self.cp_kv_cache_interleave_size,
                 self.dcp_local_indices_buffer.shape[1],
             )
-            if width <= H12_MAX_WIDTH:
+            if self.sm70_qsa_paged_fp16_h12 and width <= H12_MAX_WIDTH:
                 qsa_paged_fp16_h12_workspace(min(partial.shape[0], H12_MAX_ROWS), width)
+            if self.sm70_qsa_device_history and width <= DEVICE_HISTORY_MAX_WIDTH:
+                qsa_device_history_workspace(
+                    min(partial.shape[0], DEVICE_HISTORY_MAX_ROWS), width
+                )
         if getattr(self.impl, "dcp_combine", None) is not dcp_a2a_lse_reduce:
             return
         max_tokens, num_heads, head_dim = partial.shape

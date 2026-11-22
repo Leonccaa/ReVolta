@@ -150,10 +150,21 @@ constexpr int kSm70Qwen38HcBatchFusedBlocks = 160;
 constexpr size_t kSm70Qwen38HcBatchFusedOffset =
     kSm70Qwen38HcBatchOutputOffset + kSm70Qwen38HcBatchCounterBytes +
     kSm70Tp4PushAllreduceEpochs * 4 * 16 * 640 * sizeof(uint32_t);
-constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
+constexpr size_t kSm70Tp4PushAllreduceAndHcBytes =
     kSm70Qwen38HcBatchFusedOffset +
     kSm70Qwen38HcBatchFusedBlocks * sizeof(uint32_t) +
     kSm70Tp4PushAllreduceEpochs * 4 * 16 * 640 * sizeof(uint32_t);
+constexpr int kSm70Tp4GatherTileBytes = 4096;
+constexpr int kSm70Tp4GatherTiles = 80;
+struct alignas(16) Sm70Tp4GatherMailbox {
+  uint32_t sequence[kSm70Tp4GatherTiles];
+  uint32_t arrived[2][4][kSm70Tp4GatherTiles];
+  uint8_t payload[2][4][kSm70Tp4GatherTiles][kSm70Tp4GatherTileBytes];
+};
+static_assert(kSm70Tp4PushAllreduceAndHcBytes % alignof(Sm70Tp4GatherMailbox) ==
+              0);
+constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
+    kSm70Tp4PushAllreduceAndHcBytes + sizeof(Sm70Tp4GatherMailbox);
 static_assert(kSm70Qwen38HcGateEpochIndexBase + kSm70Qwen38HcGatePushBlocks <=
               kSm70Qwen38HcPushSignalBytes / sizeof(uint32_t));
 
@@ -1877,7 +1888,8 @@ class CustomAllreduce {
         static_cast<char*>(ptrs[rank_]) + kSm70Qwen38HcUpFusedEpochOffset;
     CUDACHECK(cudaMemset(
         hc_up, 0,
-        kSm70Tp4PushAllreduceBufferBytes - kSm70Qwen38HcUpFusedEpochOffset));
+        kSm70Tp4PushAllreduceAndHcBytes - kSm70Qwen38HcUpFusedEpochOffset));
+    // The shared allocation is zeroed before IPC handles are exchanged.
     sm70_tp4_push_buffers_registered_ = true;
   }
 

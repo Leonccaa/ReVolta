@@ -10,6 +10,7 @@
 #include "custom_all_reduce.cuh"
 #if !defined(USE_ROCM)
   #include "sm70_qwen38_hc_batch.cuh"
+  #include "qsa_shard_merge.cuh"
 #endif
 
 // Fake pointer type, must match fptr_t type in ops.h.
@@ -1376,6 +1377,69 @@ int64_t meta_size() { return sizeof(vllm::Signal); }
 
 int64_t sm70_tp4_push_allreduce_buffer_size() {
   return vllm::kSm70Tp4PushAllreduceBufferBytes;
+}
+
+void sm70_tp4_push_allgather(fptr_t _fa, torch::Tensor& input,
+                             torch::Tensor& output) {
+#if defined(USE_ROCM)
+  TORCH_CHECK(false, "SM70 TP4 push all-gather is unavailable on ROCm");
+#else
+  const at::cuda::OptionalCUDAGuard guard(device_of(input));
+  auto* fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  TORCH_CHECK(fa->sm70_tp4_push_buffers_registered_);
+  const auto bytes = input.numel();
+  TORCH_CHECK(bytes > 0 && bytes <= vllm::kSm70Tp4GatherTiles *
+                                        vllm::kSm70Tp4GatherTileBytes);
+  TORCH_CHECK(input.scalar_type() == torch::kUInt8 &&
+              output.scalar_type() == torch::kUInt8 && input.is_contiguous() &&
+              output.is_contiguous() && input.device() == output.device() &&
+              output.numel() == 4 * bytes);
+  const int tiles = (bytes + vllm::kSm70Tp4GatherTileBytes - 1) /
+                    vllm::kSm70Tp4GatherTileBytes;
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  const auto peers = fa->sm70_tp4_push_buffers_;
+  vllm::sm70_tp4_gather_send<<<tiles, 128, 0, stream>>>(
+      peers, input.data_ptr<uint8_t>(), fa->rank_, bytes);
+  vllm::sm70_tp4_gather_receive<<<dim3(tiles, 4), 128, 0, stream>>>(
+      peers, output.data_ptr<uint8_t>(), fa->rank_, bytes);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+#endif
+}
+
+void sm70_qsa_shard_merge(fptr_t _fa, const torch::Tensor& input,
+                          torch::Tensor& output) {
+#if defined(USE_ROCM)
+  TORCH_CHECK(false, "SM70 QSA shard merge is unavailable on ROCm");
+#else
+  using namespace vllm::qsa;
+  const at::cuda::OptionalCUDAGuard guard(device_of(input));
+  TORCH_CHECK(input.scalar_type() == torch::kInt32 &&
+              output.scalar_type() == torch::kInt32 && input.is_contiguous() &&
+              output.is_contiguous() && input.device() == output.device());
+  TORCH_CHECK(output.dim() == 2 && output.size(1) == kShardTopK);
+  const auto rows = output.size(0);
+  TORCH_CHECK(rows > 0);
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  vllm::Sm70Tp4GatherMailbox* mailbox = nullptr;
+  const auto* words = input.data_ptr<int32_t>();
+  if (_fa != 0) {
+    auto* fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+    TORCH_CHECK(fa->sm70_tp4_push_buffers_registered_ &&
+                rows <= vllm::kSm70Tp4GatherTiles &&
+                input.sizes() == at::IntArrayRef({rows, kShardPackWords}));
+    const auto peers = fa->sm70_tp4_push_buffers_;
+    mailbox = vllm::sm70_tp4_gather_mailbox(peers, fa->rank_);
+    vllm::sm70_tp4_gather_send<<<rows, 128, 0, stream>>>(
+        peers, reinterpret_cast<const uint8_t*>(words), fa->rank_,
+        rows * vllm::kSm70Tp4GatherTileBytes);
+  } else {
+    TORCH_CHECK(input.sizes() ==
+                at::IntArrayRef({kShardWorld, rows, kShardPackWords}));
+  }
+  qsa_shard_merge_topk<<<rows, kLexicographicTopKThreads, 0, stream>>>(
+      words, mailbox, output.data_ptr<int32_t>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+#endif
 }
 
 int64_t sm70_tp8_hierarchical_push_allreduce_buffer_size() {

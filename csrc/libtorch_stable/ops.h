@@ -270,6 +270,11 @@ void qsa_lexicographic_topk_v154(const torch::stable::Tensor& logits,
                                  torch::stable::Tensor& output, int64_t k,
                                  bool decode_batch);
 
+void qsa_lexicographic_topk_pack(const torch::stable::Tensor& logits,
+                                 const torch::stable::Tensor& lengths,
+                                 torch::stable::Tensor& packed, int64_t rank,
+                                 bool v154, bool decode_batch);
+
 void selective_scan_fwd(
     const torch::stable::Tensor& u, const torch::stable::Tensor& delta,
     const torch::stable::Tensor& A, const torch::stable::Tensor& B,

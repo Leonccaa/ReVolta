@@ -367,6 +367,7 @@ class QSAIndexer(nn.Module):
             seq_lens_cpu_upper_bound=compressed_metadata.seq_lens_cpu_upper_bound,
             index_dcp_world_size=compressed_metadata.index_dcp_world_size,
             index_dcp_rank=compressed_metadata.index_dcp_rank,
+            prefill_ranges=compressed_metadata.prefill_ranges,
             batch_query_starts=(
                 compressed_metadata.query_start_loc
                 if get_forward_context().is_uniform_decode

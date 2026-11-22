@@ -47,6 +47,7 @@ class PrefillEagleCudaGraphManager(CudaGraphManager):
                 slot_mappings,
                 num_tokens_across_dp,
                 cg_mode,
+                is_uniform_decode=desc.uniform_token_count is not None,
             )
             return fwd, attn_state
 

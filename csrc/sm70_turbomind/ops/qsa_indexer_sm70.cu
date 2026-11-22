@@ -132,16 +132,16 @@ __global__ void mqa_batched_decode(
     float* __restrict__ scores, int* __restrict__ visible, int rows,
     int columns, int pages, int page_size, int table_width, int sq0, int sq1,
     int sc0, int sc1, int st0, int st1, float divisor, int compress) {
-  const int req = blockIdx.y, first = starts[req],
-            count = starts[req + 1] - first;
+  const int req = blockIdx.y, first = starts[req], last = starts[req + 1];
+  // The direct Torch operator takes caller-owned device offsets.
+  if (first < 0 || last < first || last > rows || last - first > 8) return;
+  const int count = last - first;
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   const int quad = (lane >> 2) & 3, r = (lane & 3) + ((lane & 16) ? 4 : 0);
-  if (first < 0 || count < 0 || count > 8 || first + count > rows) return;
-  if (req + 1 == gridDim.y && blockIdx.x == 0) {
-    // FULL graphs may retain padding at the end of the offsets.
-    for (int i = first + count + threadIdx.x; i < rows; i += blockDim.x)
-      visible[i] = 0;
-  }
+  // M <= 64, so one 128-thread block covers all trailing padding.
+  const int padding_row = last + threadIdx.x;
+  if (req + 1 == gridDim.y && blockIdx.x == 0 && padding_row < rows)
+    visible[padding_row] = 0;
   if (!count) return;
   __shared__ int limits[8], end;
   __shared__ __align__(16) half s_q[32][136];
@@ -172,10 +172,10 @@ __global__ void mqa_batched_decode(
 
   table += static_cast<int64_t>(req) * st0;
   const int key_sub = lane >> 2, vec_sub = lane & 3;
+  const int64_t table_columns = static_cast<int64_t>(table_width) * page_size;
+  const int readable = table_columns < end ? table_columns : end;
   auto page_at = [&](int col) {
-    return col < end && col / page_size < table_width
-               ? __ldg(table + (col / page_size) * st1)
-               : -1;
+    return col < readable ? __ldg(table + (col / page_size) * st1) : -1;
   };
   auto load_keys = [&](int tile, uint4(&key)[4]) {
     const int col = tile * 32 + warp * 8 + key_sub;

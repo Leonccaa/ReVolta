@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from vllm import envs
+from vllm.forward_context import ForwardContext, override_forward_context
 from vllm.model_executor.layers.quantization import nvfp4_sm70_moe as moe
 
 ref = pytest.importorskip(
@@ -31,6 +32,125 @@ def test_default_off(monkeypatch):
     monkeypatch.delenv("VLLM_SM70_NVFP4_QWEN38_MOE_RAW_GROUPED_DECODE", raising=False)
     envs.disable_envs_cache()
     assert not envs.VLLM_SM70_NVFP4_QWEN38_MOE_RAW_GROUPED_DECODE
+
+
+@pytest.fixture
+def m48_layer(monkeypatch):
+    monkeypatch.setenv("VLLM_SM70_NVFP4_QWEN38_MOE_RAW_GROUPED_DECODE", "1")
+    monkeypatch.setenv("VLLM_SM70_NVFP4_RAW_GROUPED_M48_V154", "1")
+    envs.disable_envs_cache()
+    monkeypatch.setattr(
+        moe.sm70_ops, "has_nvfp4_raw_grouped_decode_dispatch", lambda: True
+    )
+    layer = layer_contract()
+    layer.moe_config = NS(tp_size=4, dp_size=1, pcp_size=1)
+    layer.sm70_nvfp4_qwen38_fused_swiglu_prefill = True
+    layer.w13_raw_global_scales = torch.ones(512, 2)
+    for name in (
+        "w13_tm_weight",
+        "w13_raw_scale_codes",
+        "w2_tm_weight",
+        "w2_raw_scale_codes",
+        "w2_raw_global_scales",
+    ):
+        setattr(layer, name, torch.empty(0))
+    return layer
+
+
+@pytest.mark.parametrize(
+    "blocked_by", [None, "default", "global", "layout", "tp", "dp"]
+)
+def test_m48_v154_prepare(monkeypatch, m48_layer, blocked_by):
+    layer = m48_layer
+    if blocked_by == "default":
+        monkeypatch.delenv("VLLM_SM70_NVFP4_RAW_GROUPED_M48_V154")
+    elif blocked_by == "global":
+        layer.w13_raw_global_scales[-1, 1] = 1.25
+    elif blocked_by == "layout":
+        layer.sm70_nvfp4_qwen38_fused_swiglu_prefill = False
+    elif blocked_by == "tp":
+        layer.moe_config.tp_size = 2
+    elif blocked_by == "dp":
+        layer.moe_config.dp_size = 2
+
+    moe.ModelOptNvFp4SM70MoEMethod._prepare_raw_grouped_decode(layer)
+    plan = layer._nvfp4_raw_grouped_m48_plan
+    if blocked_by == "tp":
+        assert not layer.sm70_nvfp4_raw_grouped_decode
+        assert plan is None
+        return
+    assert layer.sm70_nvfp4_raw_grouped_decode
+    rows = 48 if blocked_by is None else 40
+    assert layer._nvfp4_raw_grouped_output.shape == (rows, 2560)
+    assert layer._nvfp4_raw_grouped_intermediate.shape == (rows * 10, 160)
+    assert layer._nvfp4_raw_grouped_plan.numel() == ref.PLAN_INTS
+    if blocked_by is None:
+        assert plan is not None
+        assert [tuple(t.shape) for t in plan] == [(480, 8), (480,), (480,), (1,)]
+    else:
+        assert plan is None
+
+
+@pytest.mark.parametrize(
+    "rows,decode,offset",
+    [(48, True, 0), (48, False, 0), (48, True, 1), (47, True, 0), (49, True, 0)],
+)
+def test_m48_v154_apply(monkeypatch, m48_layer, rows, decode, offset):
+    layer = m48_layer
+    method = object.__new__(moe.ModelOptNvFp4SM70MoEMethod)
+    method._prepare_raw_grouped_decode(layer)
+    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
+    monkeypatch.setattr(moe, "is_exact_sm70_cuda", lambda *a, **kw: True)
+    x = torch.zeros(rows * 2560 + offset, dtype=torch.float16)[offset:].view(rows, 2560)
+    weights = torch.ones(rows, 10, dtype=torch.float32)
+    ids = torch.zeros(rows, 10, dtype=torch.int32)
+    calls = []
+
+    def w13(mid, x_arg, w, codes, globals_, ids_arg, *plan_and_options):
+        assert mid is layer._nvfp4_raw_grouped_intermediate
+        assert x_arg is x and ids_arg is ids
+        assert globals_ is layer.w13_raw_global_scales
+        assert plan_and_options[:4] == layer._nvfp4_raw_grouped_m48_plan
+        assert plan_and_options[4:] == (4, True)
+        calls.append("w13")
+
+    def w2(out, routed, mid, w, codes, globals_, weights_arg, *plan):
+        assert out is layer._nvfp4_raw_grouped_output
+        assert routed.numel() == 0
+        assert mid is layer._nvfp4_raw_grouped_intermediate
+        assert weights_arg is weights
+        assert plan == layer._nvfp4_raw_grouped_m48_plan
+        calls.append("w2")
+
+    def legacy(*_):
+        raise RuntimeError("ordinary dispatch")
+
+    monkeypatch.setattr(moe, "_use_grouped_mtp5", legacy)
+    monkeypatch.setattr(
+        torch.ops._C, "nvfp4_grouped_w13_raw_sm70_v154_out", w13, raising=False
+    )
+    monkeypatch.setattr(
+        torch.ops._C,
+        "nvfp4_grouped_w2_batch_reduce_raw_sm70_v154_out",
+        w2,
+        raising=False,
+    )
+    context = ForwardContext(
+        no_compile_layers={},
+        attn_metadata=None,
+        slot_mapping={},
+        additional_kwargs={"sm70_nvfp4_decode_only": True} if decode else {},
+    )
+    with override_forward_context(context):
+        if (rows, decode, offset) == (48, True, 0):
+            assert method.apply(layer, x, weights, ids, None, None) is (
+                layer._nvfp4_raw_grouped_output
+            )
+            assert calls == ["w13", "w2"]
+        else:
+            with pytest.raises(RuntimeError, match="ordinary dispatch"):
+                method.apply(layer, x, weights, ids, None, None)
+            assert not calls
 
 
 @pytest.mark.parametrize("m", [0, 1, *range(2, 41), 41, 48, 128])

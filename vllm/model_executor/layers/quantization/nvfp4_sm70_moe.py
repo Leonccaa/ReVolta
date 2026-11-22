@@ -67,6 +67,7 @@ _SUPPORTED_CONTRACTS: Final = {
 _SUPPORTED_TP_SIZES: Final = (1, 2, 4)
 _GRAPH_SAFE_MAX_TOKENS: Final = 18
 _GROUPED_DECODE_MAX_TOKENS: Final = 40
+_RAW_GROUPED_M48_TOKENS: Final = 48
 _COMPACT_GROUPED_MAX_SLOTS: Final = 80
 # V100 real-shape M=1 tuning favors 16 warps. This retains checkpoint NVFP4,
 # FP32 MMA accumulation, and the FP16 W13 output boundary; only the order in
@@ -1247,35 +1248,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         layer.sm70_nvfp4_graph_safe_max_tokens = _GRAPH_SAFE_MAX_TOKENS
         layer.sm70_nvfp4_compact_grouped_max_slots = _COMPACT_GROUPED_MAX_SLOTS
         self._prepare_grouped_decode(layer)
-        raw_grouped = bool(
-            envs.VLLM_SM70_NVFP4_QWEN38_MOE_RAW_GROUPED_DECODE
-            and raw_scale
-            and int(layer.moe_config.tp_size) == 4
-            and (num_experts, hidden, intermediate, layer.sm70_nvfp4_top_k)
-            == (512, 2560, 160, 10)
-            and layer.swiglu_limit is None
-        )
-        if raw_grouped and not sm70_ops.has_nvfp4_raw_grouped_decode_dispatch():
-            raise RuntimeError(
-                "SM70 raw grouped NVFP4 decode requires a matching native build."
-            )
-        layer.sm70_nvfp4_raw_grouped_decode = raw_grouped
-        if raw_grouped:
-            # Raw grouped decode owns separate M<=40 buffers.
-            device = layer.w13_tm_weight.device
-            layer._nvfp4_raw_grouped_output = torch.empty(
-                40, hidden, dtype=torch.float16, device=device
-            )
-            layer._nvfp4_raw_grouped_intermediate = torch.empty(
-                400, intermediate, dtype=torch.float16, device=device
-            )
-            layer._nvfp4_raw_grouped_plan = torch.empty(
-                sm70_ops.NVFP4_RAW_GROUPED_PLAN_INTS, dtype=torch.int32, device=device
-            )
-            logger.info_once(
-                "Experimental SM70 raw-E4M3 grouped NVFP4 enabled "
-                "(TP4/E512/H2560/I160/K10, M2-M40, split4, graph-safe)."
-            )
+        self._prepare_raw_grouped_decode(layer)
         self._allocate_graph_safe_decode_buffers(layer)
 
         del layer.w13_weight
@@ -1326,6 +1299,67 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 "SM70 GLM-5.3 exact fused q8 MoE permute enabled "
                 "(M8/K8/E288 stable sort and materialized expert rows)."
             )
+
+    @staticmethod
+    def _prepare_raw_grouped_decode(layer: RoutedExperts) -> None:
+        hidden = layer.sm70_nvfp4_hidden_size
+        intermediate = layer.sm70_nvfp4_intermediate_size
+        top_k = layer.sm70_nvfp4_top_k
+        raw_grouped = bool(
+            envs.VLLM_SM70_NVFP4_QWEN38_MOE_RAW_GROUPED_DECODE
+            and layer.sm70_nvfp4_qwen38_raw_scale
+            and int(layer.moe_config.tp_size) == 4
+            and (layer.sm70_nvfp4_num_experts, hidden, intermediate, top_k)
+            == (512, 2560, 160, 10)
+            and layer.swiglu_limit is None
+        )
+        layer.sm70_nvfp4_raw_grouped_decode = raw_grouped
+        layer._nvfp4_raw_grouped_m48_plan = None
+        if not raw_grouped:
+            return
+        if not sm70_ops.has_nvfp4_raw_grouped_decode_dispatch():
+            raise RuntimeError(
+                "SM70 raw grouped NVFP4 decode requires a matching native build."
+            )
+
+        use_m48 = False
+        if (
+            envs.VLLM_SM70_NVFP4_RAW_GROUPED_M48_V154
+            and layer.sm70_nvfp4_qwen38_fused_swiglu_prefill
+            # MoE TP can include ranks from DP and prefill context parallelism.
+            and layer.moe_config.dp_size == layer.moe_config.pcp_size == 1
+        ):
+            # v154 loads one global per projection warp. The interleaved
+            # bank can be reused only if gate/up global scales match bitwise.
+            bits = layer.w13_raw_global_scales.view(torch.int32)
+            use_m48 = torch.equal(bits[:, 0], bits[:, 1])
+
+        device = layer.w13_tm_weight.device
+        rows = _RAW_GROUPED_M48_TOKENS if use_m48 else 40
+        routes = rows * top_k
+        layer._nvfp4_raw_grouped_output = torch.empty(
+            rows, hidden, dtype=torch.float16, device=device
+        )
+        layer._nvfp4_raw_grouped_intermediate = torch.empty(
+            routes, intermediate, dtype=torch.float16, device=device
+        )
+        layer._nvfp4_raw_grouped_plan = torch.empty(
+            sm70_ops.NVFP4_RAW_GROUPED_PLAN_INTS, dtype=torch.int32, device=device
+        )
+        if use_m48:
+            layer._nvfp4_raw_grouped_m48_plan = (
+                torch.empty((routes, 8), dtype=torch.int32, device=device),
+                torch.empty(routes, dtype=torch.int32, device=device),
+                torch.empty(routes, dtype=torch.int32, device=device),
+                torch.empty(1, dtype=torch.int32, device=device),
+            )
+            logger.info_once(
+                "Prepared SM70 raw grouped M48 v154 decode with equal gate/up globals."
+            )
+        logger.info_once(
+            "Experimental SM70 raw-E4M3 grouped NVFP4 enabled "
+            "(TP4/E512/H2560/I160/K10, M2-M40, split4, graph-safe)."
+        )
 
     @staticmethod
     def _prepare_grouped_decode(layer: RoutedExperts) -> None:
@@ -1675,6 +1709,49 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         num_tokens = x.shape[0]
         if num_tokens == 0:
             return x.new_empty((0, hidden))
+        if (
+            num_tokens == _RAW_GROUPED_M48_TOKENS
+            and (plan := layer._nvfp4_raw_grouped_m48_plan) is not None
+            and x.is_contiguous()
+            and x.storage_offset() % 8 == 0
+            and topk_ids.dtype == torch.int32
+            and topk_ids.is_contiguous()
+            and topk_weights.is_contiguous()
+            and is_forward_context_available()
+            and get_forward_context().additional_kwargs.get("sm70_nvfp4_decode_only")
+        ):
+            rows, experts, sizes, total = plan
+            output = layer._nvfp4_raw_grouped_output
+            intermediate = layer._nvfp4_raw_grouped_intermediate
+            ops.nvfp4_grouped_w13_raw_sm70_v154_out(
+                intermediate,
+                x,
+                layer.w13_tm_weight,
+                layer.w13_raw_scale_codes,
+                layer.w13_raw_global_scales,
+                topk_ids,
+                rows,
+                experts,
+                sizes,
+                total,
+                4,
+                True,
+            )
+            # Batch reduction uses shared memory for its routed values.
+            ops.nvfp4_grouped_w2_batch_reduce_raw_sm70_v154_out(
+                output,
+                intermediate[:0],
+                intermediate,
+                layer.w2_tm_weight,
+                layer.w2_raw_scale_codes,
+                layer.w2_raw_global_scales,
+                topk_weights,
+                rows,
+                experts,
+                sizes,
+                total,
+            )
+            return output
         if (
             _use_qwen38_raw_grouped_decode(layer, x, topk_ids)
             and topk_weights.is_contiguous()

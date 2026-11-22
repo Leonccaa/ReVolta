@@ -174,7 +174,9 @@ def test_mrv2_mtp_decoder_load_and_dispatch(monkeypatch, seam, enabled):
     layer.self_attn = lambda hidden_states, **kwargs: hidden_states.contiguous()
     layer.mlp = nn.Identity()
     seam.owner.combine_norm = Mock(
-        side_effect=lambda p, r, i, w, e: hc.hc_combine_norm(r, p * 4, i, w, e, 4)
+        side_effect=lambda p, r, i, w, e, s=None: hc.hc_combine_norm(
+            r, p * 4, i, w, e, 4
+        )
     )
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
 
@@ -247,7 +249,7 @@ def test_attention_partial_dispatch_and_dynamic_compile(monkeypatch, seam):
     capture = Mock(return_value=False)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", capture)
 
-    def base(partial, residual, injection, weight, eps):
+    def base(partial, residual, injection, weight, eps, secondary=None):
         return hc.hc_combine_norm(residual, partial * 4, injection, weight, eps, 4)
 
     seam.owner.combine_norm = Mock(side_effect=base)
@@ -393,3 +395,44 @@ def test_top1x_uses_the_hcx_peer_mailbox(monkeypatch, seam):
 
 def test_top1x_switch_does_not_change_compile_hash():
     assert KernelConfig().compute_hash() == KernelConfig(sm70_top1x=True).compute_hash()
+
+
+def test_dual_moe_partials_reach_hc_or_are_summed(monkeypatch, seam):
+    routed = torch.randn(3, 2560, dtype=torch.float16)
+    shared = torch.randn(3, 2560, dtype=torch.float16)
+    calls = []
+
+    class Runner(model.MoERunner):
+        shared_experts = object()
+
+        def __init__(self):
+            pass
+
+        def can_defer_tp_reduce(self):
+            return True
+
+        def forward_tp_partials(self, hidden_states, router_logits):
+            calls.append(router_logits)
+            return shared, routed
+
+    moe = model.Qwen4ExpSparseMoeBlock.__new__(model.Qwen4ExpSparseMoeBlock)
+    nn.Module.__init__(moe)
+    moe.experts = SimpleNamespace(runner=Runner())
+    moe._prepare_expert_inputs = lambda x: (x, "logits")
+    layer = seam.layer
+    layer.mlp = moe
+    out = layer._forward_mlp(routed, defer_tp_reduce=True, dual_moe_partials=True)
+    assert isinstance(out, hc.HCTensorParallelPartial)
+    assert out.value is shared and out.secondary is routed and calls == ["logits"]
+
+    # Without an HC LL owner the pair is summed before the TP all-reduce.
+    monkeypatch.setattr(hc, "get_tp_hc_ll", lambda: None)
+    monkeypatch.setattr(hc, "tensor_model_parallel_all_reduce", lambda x: x)
+    residual = torch.randn(3, 10240, dtype=torch.float16)
+    injection = torch.randn(3, 4, dtype=torch.float16)
+    weight = torch.ones(10240, dtype=torch.float16)
+    pair = hc._hc_ll_combine_norm(shared, residual, injection, weight, 1e-6, 4, routed)
+    single = hc._hc_ll_combine_norm(
+        shared + routed, residual, injection, weight, 1e-6, 4
+    )
+    assert all(torch.equal(a, b) for a, b in zip(pair, single))

@@ -130,6 +130,7 @@ class Sm70HcLLCommunicator:
         injection: torch.Tensor,
         weight: torch.Tensor,
         eps: float,
+        secondary: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         out = torch.empty_like(residual, memory_format=torch.contiguous_format)
         norm = torch.empty_like(out)
@@ -137,7 +138,7 @@ class Sm70HcLLCommunicator:
             out,
             norm,
             _aligned(partial),
-            self.empty,
+            self.empty if secondary is None else _aligned(secondary),
             _aligned(residual),
             injection.contiguous(),
             _aligned(weight),

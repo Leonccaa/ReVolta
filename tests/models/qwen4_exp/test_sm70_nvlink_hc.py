@@ -225,7 +225,7 @@ def test_partial_is_reduced_once_with_legacy_fallback(monkeypatch, rows, use_ll)
     weight = torch.zeros(10240, dtype=torch.float16)
     eps = 1e-6
 
-    def baseline(block, res, inject, w, eps):
+    def baseline(block, res, inject, w, eps, secondary=None):
         return hc.hc_combine_norm(res, (block * 4).half(), inject, w, eps, 4)
 
     reduce = Mock(side_effect=lambda block: block * 4)
@@ -291,7 +291,7 @@ def test_mrv2_capture_rows_reach_partial_hc(monkeypatch, method, widths, expecte
         num_computed_prefill_tokens=np.full(8, 800),
         prefill_len=SimpleNamespace(np=np.full(8, 800)),
     )
-    use_ll = Mock(side_effect=lambda p, r, i, w, e: (r, r))
+    use_ll = Mock(side_effect=lambda p, r, i, w, e, s=None: (r, r))
     monkeypatch.setattr(
         hc,
         "get_tp_hc_ll",
@@ -379,6 +379,9 @@ def test_moe_tail_passes_one_rank_local_half_sum(monkeypatch):
     runner.apply_routed_output_transform.return_value = routed
     runner._maybe_sm70_moe_sum2_allreduce.return_value = shared * 4
     runner._maybe_add_zero_expert_output.side_effect = lambda x: x
+    runner._compute_expert_outputs.side_effect = (
+        lambda *args: moe_runner.MoERunner._compute_expert_outputs(runner, *args)
+    )
     monkeypatch.setattr(moe_runner, "_sm70_dump_moe_runner_tensor", lambda x, *_: x)
 
     partial = moe_runner.MoERunner.forward(runner, routed, routed, reduce_results=False)

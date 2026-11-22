@@ -12,7 +12,10 @@ from transformers.models.qwen3_vl import Qwen3VLProcessor
 
 from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
-from vllm.compilation.sm70_decode_graph import is_sm70_decode_graph_compiling
+from vllm.compilation.sm70_decode_graph import (
+    is_sm70_decode_graph_compiling,
+    use_sm70_decode_graph_semantics,
+)
 from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.config.speculative_kv import dflash_draft_cache_dtype
 from vllm.distributed import get_pp_group, get_tp_group
@@ -522,6 +525,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         ngram_context: torch.Tensor | None,
         aux_hidden_states: list[torch.Tensor] | None = None,
         hc_sp: bool = False,
+        dual_moe_partials: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | HCTensorParallelPartial, torch.Tensor]:
         attn_hc = self.attn_hyper_connection
         hc_kwargs = {"hc_sp": True} if hc_sp else {}
@@ -612,7 +616,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
         if hc_sp:
             block_input = sp_all_gather(block_input)[: positions.shape[-1]]
         mlp_out = self._forward_mlp(
-            block_input, defer_tp_reduce=hc_sp or self._sm70_hc_ll
+            block_input,
+            defer_tp_reduce=hc_sp or self._sm70_hc_ll,
+            dual_moe_partials=dual_moe_partials and not hc_sp,
         )
         if hc_sp:
             if isinstance(mlp_out, HCTensorParallelPartial):
@@ -622,15 +628,27 @@ class Qwen4ExpDecoderLayer(nn.Module):
         return hidden_states, mlp_out, injection
 
     def _forward_mlp(
-        self, block_input: torch.Tensor, *, defer_tp_reduce: bool
+        self,
+        block_input: torch.Tensor,
+        *,
+        defer_tp_reduce: bool,
+        dual_moe_partials: bool = False,
     ) -> torch.Tensor | HCTensorParallelPartial:
-        if defer_tp_reduce and isinstance(self.mlp, Qwen4ExpSparseMoeBlock):
-            runner = self.mlp.experts.runner
+        mlp = self.mlp
+        if defer_tp_reduce and isinstance(mlp, Qwen4ExpSparseMoeBlock):
+            runner = mlp.experts.runner
             if isinstance(runner, MoERunner) and runner.can_defer_tp_reduce():
-                return HCTensorParallelPartial(
-                    self.mlp(block_input, reduce_results=False)
-                )
-        return self.mlp(block_input)
+                if dual_moe_partials and runner.shared_experts is not None:
+                    # Hand routed and shared outputs to HC separately; its
+                    # native reduction sums both partials.
+                    hidden_states, router_logits = mlp._prepare_expert_inputs(
+                        block_input
+                    )
+                    return HCTensorParallelPartial(
+                        *runner.forward_tp_partials(hidden_states, router_logits)
+                    )
+                return HCTensorParallelPartial(mlp(block_input, reduce_results=False))
+        return mlp(block_input)
 
 
 def _prepare_sm70_hcx(config: VllmConfig, layers: Iterable[nn.Module]) -> None:
@@ -755,6 +773,7 @@ _QWEN4EXP_DYNAMIC_ARG_DIMS: dict[str, int | list[int] | dict[int, str]] = {
 @support_torch_compile(dynamic_arg_dims=_QWEN4EXP_DYNAMIC_ARG_DIMS)
 class Qwen4ExpModel(nn.Module, EagleModelMixin):
     hf_to_vllm_mapper = _QWEN3_5_WEIGHTS_MAPPER | _HC_WEIGHTS_MAPPER
+    _sm70_hc_moe_dual_partial = False
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -823,6 +842,9 @@ class Qwen4ExpModel(nn.Module, EagleModelMixin):
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
+        )
+        self._sm70_hc_moe_dual_partial = (
+            vllm_config.kernel_config.sm70_hc_moe_dual_partial
         )
         intermediate_size = config.hidden_size * config.hc_count
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
@@ -970,6 +992,13 @@ class Qwen4ExpModel(nn.Module, EagleModelMixin):
             # no-speculation call is unchanged.
             aux_hidden_states = []
             aux_kwargs["aux_hidden_states"] = aux_hidden_states
+        moe_kwargs = (
+            {"dual_moe_partials": True}
+            if self._sm70_hc_moe_dual_partial
+            and not hc_sp
+            and use_sm70_decode_graph_semantics()
+            else {}
+        )
         for layer_idx, layer in islice(
             enumerate(self.layers), self.start_layer, self.end_layer
         ):
@@ -984,6 +1013,7 @@ class Qwen4ExpModel(nn.Module, EagleModelMixin):
                 ngram_context=ngram_context,
                 **aux_kwargs,
                 **hc_kwargs,
+                **moe_kwargs,
             )
             if deepstack_input_embeds is not None and layer_idx < len(
                 deepstack_input_embeds

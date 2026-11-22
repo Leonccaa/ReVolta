@@ -249,6 +249,25 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
         self.mlp_conv = DFlashGroupedConv(
             **conv_args, prefix=maybe_prefix(prefix, "mlp_conv")
         )
+        # Flat DFlash runs in Model Runner V2. Only its eight-row query block
+        # uses these projections; the context path reads the original QKV.
+        if (
+            vllm_config.kernel_config.sm70_dflash2_fp16_m8
+            and self.use_sm70_bf16_emulation
+            and speculative_config.use_dflash()
+            and not vllm_config.scheduler_config.async_scheduling
+            and vllm_config.parallel_config.tensor_parallel_size == 4
+            and conv_args["block_size"] == 8
+        ):
+            for projection in (
+                self.self_attn.qkv_proj,
+                self.self_attn.o_proj,
+                self.mlp.gate_up_proj,
+                self.mlp.down_proj,
+                self.attention_conv.kernel_projection,
+                self.mlp_conv.kernel_projection,
+            ):
+                projection._sm70_dflash2_fp16_m8 = True
 
     def forward(
         self,

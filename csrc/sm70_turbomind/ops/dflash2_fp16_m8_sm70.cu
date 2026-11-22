@@ -11,6 +11,7 @@
 #include <ATen/ops/where.h>
 #include <limits>
 #include <climits>
+#include <cstdint>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_fp16.h>
 
@@ -270,7 +271,10 @@ void sm70_dflash2_fp16_dispatch_out(torch::Tensor output, torch::Tensor input,
   TORCH_CHECK(input.size(1) == weight.size(1) &&
               output.size(0) == input.size(0) &&
               output.size(1) == weight.size(0));
-  if (input.size(0) == 8) {
+  // The M8 kernel loads activations as uint4. A contiguous slice can start
+  // at a non-vector-aligned address, in which case keep the dense projection.
+  if (input.size(0) == 8 &&
+      reinterpret_cast<uintptr_t>(input.data_ptr()) % alignof(uint4) == 0) {
     sm70_dflash2_fp16_m8_out(output, input, packed, tile, warps);
     return;
   }

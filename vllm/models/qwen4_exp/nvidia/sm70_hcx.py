@@ -18,6 +18,8 @@ MAX_ROWS = 8
 _AR_BYTES = 4 * 80 * 256 * 8
 _LORA_BYTES = 8 * 336 * 8
 _HB_BYTES = 8 * HD * 4
+TOP1_ROWS = 64
+_TOP1_BYTES = 2 * 2 * TOP1_ROWS * 16
 _LANE_R = [(L & 3) + (4 if L & 16 else 0) for L in range(32)]
 _LANE_Q = [(L >> 2) & 3 for L in range(32)]
 
@@ -67,6 +69,8 @@ def pack_up(w: torch.Tensor, rank: int) -> torch.Tensor:
 class Sm70HcxRuntime:
     """Graph-stable scratch for the admitted HC LL owner's single stream."""
 
+    top1_enabled = False
+
     def __init__(self, group: ProcessGroup, device: torch.device, rank: int) -> None:
         from vllm.distributed.device_communicators.custom_all_reduce import (
             CustomAllreduce,
@@ -75,11 +79,15 @@ class Sm70HcxRuntime:
         self.device, self.rank = device, rank
         with torch.accelerator.device_index(device.index):
             self.pointers = CustomAllreduce.create_shared_buffer(
-                _AR_BYTES + _LORA_BYTES + _HB_BYTES, group=group
+                _AR_BYTES + _LORA_BYTES + _HB_BYTES + _TOP1_BYTES, group=group
             )
             self.ar = self.pointers
             self.lora = [p + _AR_BYTES for p in self.pointers]
             self.hb = [p + _AR_BYTES + _LORA_BYTES for p in self.pointers]
+            self.top1_buffers = [
+                p + _AR_BYTES + _LORA_BYTES + _HB_BYTES for p in self.pointers
+            ]
+            self.top1_seq = torch.zeros(1, dtype=torch.int32, device=device)
             self.xn = torch.empty((MAX_ROWS, KD), dtype=torch.float16, device=device)
             self.sq = torch.empty(80 * 8 * 4, dtype=torch.float32, device=device)
             self.dpart = torch.empty(
@@ -132,6 +140,18 @@ class Sm70HcxRuntime:
             True,
         )
         return hidden, block, inject
+
+    def top1(self, pairs: torch.Tensor) -> torch.Tensor:
+        """Global argmax ids from TP-local FP32 (value, id) pairs.
+
+        HC LL admits only a full NVLink mesh, so the logical rank order is the
+        TP rank order, as in 1CatAI v1.5.4.
+        """
+        out = torch.empty(pairs.shape[0], dtype=torch.int64, device=pairs.device)
+        ops.sm70_top1x_out(
+            out, pairs.contiguous(), self.top1_buffers, self.top1_seq, self.rank
+        )
+        return out
 
     def close(self) -> None:
         from vllm.distributed.device_communicators.custom_all_reduce import (

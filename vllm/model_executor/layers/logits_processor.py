@@ -359,6 +359,22 @@ class LogitsProcessor(PluggableLayer):
         # Use float32 to avoid bf16 precision loss on vocabulary indices.
         return torch.stack([values.float(), indices.float()], dim=-1)
 
+    def _maybe_sm70_top1x(self, local_pair: torch.Tensor) -> torch.Tensor | None:
+        """Two-hop NVLink top-1 exchange when kernel_config.sm70_top1x is set."""
+        from vllm.distributed.device_communicators.sm70_hc_ll import get_tp_hc_ll
+
+        ll = get_tp_hc_ll()
+        runtime = ll.hcx if ll is not None else None
+        if (
+            runtime is None
+            or not runtime.top1_enabled
+            or not 1 <= local_pair.shape[0] <= 64
+            or torch.compiler.is_compiling()
+        ):
+            return None
+        logger.info_once("SM70 two-hop top1 exchange enabled.")
+        return runtime.top1(local_pair)
+
     def get_top_tokens(
         self,
         lm_head: VocabParallelEmbedding,
@@ -383,6 +399,12 @@ class LogitsProcessor(PluggableLayer):
 
         # All-gather (value, index) pairs, then reduce to global argmax.
         local_pair = self._get_local_top1_pair(lm_head, hidden_states, embedding_bias)
+        exchanged = self._maybe_sm70_top1x(local_pair)
+        if exchanged is not None:
+            self._maybe_dump_top_token_margin(
+                lm_head, hidden_states, embedding_bias, exchanged
+            )
+            return exchanged
         _maybe_sync_top1_all_gather(self, local_pair)
         custom_top_tokens = self._maybe_custom_top1_argmax(local_pair)
         if custom_top_tokens is not None:

@@ -634,7 +634,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
 
 
 def _prepare_sm70_hcx(config: VllmConfig, layers: Iterable[nn.Module]) -> None:
-    """Pack the target attention seams only, after checkpoint weights load."""
+    """Pack HCX seams and the top-1 exchange after checkpoint weights load."""
     ll = get_tp_hc_ll()
     compilation = config.compilation_config
     mode = compilation.cudagraph_mode
@@ -650,29 +650,44 @@ def _prepare_sm70_hcx(config: VllmConfig, layers: Iterable[nn.Module]) -> None:
     from .sm70_hcx import Sm70HcxRuntime, pack_down, pack_up
 
     static = compilation.static_forward_context
-    count = 0
-    for layer in layers:
-        if not (
-            isinstance(layer, Qwen4ExpDecoderLayer) and layer._sm70_hc_ll_attn_partial
+    decoder = [layer for layer in layers if isinstance(layer, Qwen4ExpDecoderLayer)]
+    by_index = {layer.layer_idx: layer for layer in decoder}
+    seams = []
+    for layer in decoder if config.kernel_config.sm70_hcx else ():
+        # Attention partial entering this layer's MLP HC.
+        if layer._sm70_hc_ll_attn_partial:
+            seams.append(
+                (f"qwen4exp.hcx.attn.{layer.layer_idx}", layer.mlp_hyper_connection)
+            )
+        # Previous layer's MoE partial entering this layer's attention HC. A PLE
+        # consumer materializes the pending combine before its attention HC.
+        producer = by_index.get(layer.layer_idx - 1)
+        if (
+            producer is not None
+            and producer._sm70_hc_ll
+            and layer.ple is None
+            and isinstance(producer.mlp, Qwen4ExpSparseMoeBlock)
+            and producer.mlp.experts.runner.can_defer_tp_reduce()
         ):
-            continue
-        module = layer.mlp_hyper_connection
-        name = f"qwen4exp.hcx.attn.{layer.layer_idx}"
+            seams.append(
+                (f"qwen4exp.hcx.moe.{producer.layer_idx}", layer.attn_hyper_connection)
+            )
+    for name, module in seams:
         down = module.input_mix_weight_down_block_inject.weight.detach()
         up = module.input_mix_weight_up.weight.detach()
         module.register_buffer("_hcx_down", pack_down(down, ll.rank), persistent=False)
         module.register_buffer("_hcx_up", pack_up(up, ll.rank), persistent=False)
         module._sm70_hcx_name = name
         static[name] = module
-        count += 1
-    if not count:
+    if not seams and not config.kernel_config.sm70_top1x:
         return
     ll.hcx = Sm70HcxRuntime(get_tp_group().cpu_group, ll.device, ll.rank)
-    config.kernel_config.sm70_hcx_active = True
+    ll.hcx.top1_enabled = config.kernel_config.sm70_top1x
+    config.kernel_config.sm70_hcx_active = bool(seams)
     logger.info_once(
-        "SM70 HCX prepared %d attention seams (uniform FULL, M=1..8); "
-        "runtime use requires graph replay.",
-        count,
+        "SM70 HCX prepared %d HC seams (uniform FULL, M=1..8); top1x=%s.",
+        len(seams),
+        config.kernel_config.sm70_top1x,
     )
 
 
@@ -1083,7 +1098,8 @@ class Qwen4ExpModel(nn.Module, EagleModelMixin):
             weights,
             mapper=self.hf_to_vllm_mapper,
         )
-        if self.vllm_config.kernel_config.sm70_hcx:
+        kernel_config = self.vllm_config.kernel_config
+        if kernel_config.sm70_hcx or kernel_config.sm70_top1x:
             _prepare_sm70_hcx(self.vllm_config, self.layers)
         return loaded
 

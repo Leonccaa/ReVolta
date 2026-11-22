@@ -715,9 +715,13 @@ class KernelConfig:
     """Allow the usual SM70 NVLink HC LL admission under async scheduling."""
 
     sm70_hcx: bool = False
-    """Try local-schedule HCX at Flash-Next attention-to-MLP boundaries in
-    uniform decode graphs of at most eight rows. Requires admitted NVLink HC LL
-    and resident FP16 HC weights. This is a non-bitwise research path."""
+    """Use local-schedule HCX at Flash-Next attention-to-MLP and MoE-to-next-
+    attention HyperConnection boundaries in uniform decode graphs of at most
+    eight rows. Requires admitted NVLink HC LL. Changes FP16 rounding."""
+    sm70_top1x: bool = False
+    """Exchange TP4 greedy top-1 candidates over the admitted NVLink HC LL peers
+    in two hops instead of an all-gather (1CatAI v1.5.4). Selects the same token
+    as the all-gather for finite logits."""
     sm70_hcx_active: bool = Field(default=False, init=False)
     """HCX operator/weight preparation changed the target compiler graph."""
 
@@ -770,6 +774,7 @@ class KernelConfig:
             "qsa_auto_e4m3_reason",
             # Sampler-only switches; they do not change the compiled model.
             "sm70_greedy_verify",
+            "sm70_top1x",
             "sm70_sparse_target_sampling",
             "sm70_hc_ll_async",  # Compiled model uses sm70_nvlink_hc_active.
             # Scheduler-only prefix-hit check; no compiled graph changes.

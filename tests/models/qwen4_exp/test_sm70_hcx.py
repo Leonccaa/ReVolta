@@ -336,3 +336,60 @@ def test_attention_partial_dispatch_and_dynamic_compile(monkeypatch, seam):
     assert seam.native.call_count == 3
     assert seam.owner.combine_norm.call_count == 4
     assert ar.call_count == 1
+
+
+def test_moe_partial_seam_on_next_attention(monkeypatch, seam):
+    producer = model.Qwen4ExpDecoderLayer.__new__(model.Qwen4ExpDecoderLayer)
+    nn.Module.__init__(producer)
+    producer.layer_idx = 1
+    producer._sm70_hc_ll = True
+    producer._sm70_hc_ll_attn_partial = False
+    moe = model.Qwen4ExpSparseMoeBlock.__new__(model.Qwen4ExpSparseMoeBlock)
+    nn.Module.__init__(moe)
+    moe.experts = SimpleNamespace(
+        runner=SimpleNamespace(can_defer_tp_reduce=lambda: True)
+    )
+    producer.mlp = moe
+    consumer = seam.layer
+    consumer.layer_idx = 2
+    consumer._sm70_hc_ll_attn_partial = False
+    consumer.ple = None
+    consumer.attn_hyper_connection = seam.module
+
+    model._prepare_sm70_hcx(seam.config, [producer, consumer])
+
+    assert seam.module._sm70_hcx_name == "qwen4exp.hcx.moe.1"
+    assert seam.owner.hcx is not None and not seam.owner.hcx.top1_enabled
+    assert seam.config.kernel_config.sm70_hcx_active
+
+
+def test_top1x_uses_the_hcx_peer_mailbox(monkeypatch, seam):
+    from vllm.model_executor.layers import logits_processor as lp
+
+    seam.config.kernel_config = KernelConfig(sm70_top1x=True)
+    model._prepare_sm70_hcx(seam.config, [seam.layer])
+    runtime = seam.owner.hcx
+    assert runtime.top1_enabled and not seam.config.kernel_config.sm70_hcx_active
+
+    calls = []
+
+    def top1x(out, pairs, buffers, seq, rank):
+        calls.append((buffers, rank))
+        out.fill_(7)
+
+    monkeypatch.setattr(torch.ops._C, "sm70_top1x_out", top1x, raising=False)
+    monkeypatch.setattr(
+        "vllm.distributed.device_communicators.sm70_hc_ll.get_tp_hc_ll",
+        lambda: seam.owner,
+    )
+    processor = lp.LogitsProcessor(248320)
+    tokens = processor._maybe_sm70_top1x(torch.zeros(3, 2))
+    assert tokens.tolist() == [7, 7, 7]
+    assert calls[0][1] == 1 and len(calls[0][0]) == 4
+    assert processor._maybe_sm70_top1x(torch.zeros(65, 2)) is None
+    runtime.top1_enabled = False
+    assert processor._maybe_sm70_top1x(torch.zeros(3, 2)) is None
+
+
+def test_top1x_switch_does_not_change_compile_hash():
+    assert KernelConfig().compute_hash() == KernelConfig(sm70_top1x=True).compute_hash()

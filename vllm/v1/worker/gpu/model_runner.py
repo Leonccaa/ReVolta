@@ -2095,6 +2095,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     (
                         envs.VLLM_SM70_NVFP4_MOE_GROUPED_DECODE
                         or envs.VLLM_SM70_NVFP4_RAW_GROUPED_M48_V154
+                        or envs.VLLM_SM70_NVFP4_RAW_GROUPED_NARROW_V154
                     )
                     and batch_desc.cg_mode == CUDAGraphMode.NONE
                     and not dummy_run

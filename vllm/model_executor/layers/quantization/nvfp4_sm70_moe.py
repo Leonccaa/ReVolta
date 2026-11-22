@@ -68,6 +68,7 @@ _SUPPORTED_TP_SIZES: Final = (1, 2, 4)
 _GRAPH_SAFE_MAX_TOKENS: Final = 18
 _GROUPED_DECODE_MAX_TOKENS: Final = 40
 _RAW_GROUPED_M48_TOKENS: Final = 48
+_RAW_GROUPED_NARROW_MAX_TOKENS: Final = 5
 _COMPACT_GROUPED_MAX_SLOTS: Final = 80
 # V100 real-shape M=1 tuning favors 16 warps. This retains checkpoint NVFP4,
 # FP32 MMA accumulation, and the FP16 W13 output boundary; only the order in
@@ -1315,6 +1316,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         )
         layer.sm70_nvfp4_raw_grouped_decode = raw_grouped
         layer._nvfp4_raw_grouped_m48_plan = None
+        layer._nvfp4_raw_grouped_narrow_plan = None
         if not raw_grouped:
             return
         if not sm70_ops.has_nvfp4_raw_grouped_decode_dispatch():
@@ -1322,9 +1324,11 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 "SM70 raw grouped NVFP4 decode requires a matching native build."
             )
 
-        use_m48 = False
+        m48_requested = envs.VLLM_SM70_NVFP4_RAW_GROUPED_M48_V154
+        narrow_requested = envs.VLLM_SM70_NVFP4_RAW_GROUPED_NARROW_V154
+        use_v154 = False
         if (
-            envs.VLLM_SM70_NVFP4_RAW_GROUPED_M48_V154
+            (m48_requested or narrow_requested)
             and layer.sm70_nvfp4_qwen38_fused_swiglu_prefill
             # MoE TP can include ranks from DP and prefill context parallelism.
             and layer.moe_config.dp_size == layer.moe_config.pcp_size == 1
@@ -1332,8 +1336,9 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             # v154 loads one global per projection warp. The interleaved
             # bank can be reused only if gate/up global scales match bitwise.
             bits = layer.w13_raw_global_scales.view(torch.int32)
-            use_m48 = torch.equal(bits[:, 0], bits[:, 1])
+            use_v154 = torch.equal(bits[:, 0], bits[:, 1])
 
+        use_m48 = m48_requested and use_v154
         device = layer.w13_tm_weight.device
         rows = _RAW_GROUPED_M48_TOKENS if use_m48 else 40
         routes = rows * top_k
@@ -1346,6 +1351,19 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         layer._nvfp4_raw_grouped_plan = torch.empty(
             sm70_ops.NVFP4_RAW_GROUPED_PLAN_INTS, dtype=torch.int32, device=device
         )
+        if narrow_requested and use_v154:
+            # The two dispatches use this layer's plan buffer serially.
+            narrow_routes = _RAW_GROUPED_NARROW_MAX_TOKENS * top_k
+            plan_sizes = (8 * narrow_routes, narrow_routes, narrow_routes, 1)
+            row_plan, experts, sizes, total = layer._nvfp4_raw_grouped_plan[
+                : sum(plan_sizes)
+            ].split(plan_sizes)
+            layer._nvfp4_raw_grouped_narrow_plan = (
+                row_plan.view(narrow_routes, 8),
+                experts,
+                sizes,
+                total,
+            )
         if use_m48:
             layer._nvfp4_raw_grouped_m48_plan = (
                 torch.empty((routes, 8), dtype=torch.int32, device=device),
@@ -1709,9 +1727,13 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         num_tokens = x.shape[0]
         if num_tokens == 0:
             return x.new_empty((0, hidden))
+        plan = None
+        if num_tokens == _RAW_GROUPED_M48_TOKENS:
+            plan = layer._nvfp4_raw_grouped_m48_plan
+        elif 3 <= num_tokens <= _RAW_GROUPED_NARROW_MAX_TOKENS:
+            plan = layer._nvfp4_raw_grouped_narrow_plan
         if (
-            num_tokens == _RAW_GROUPED_M48_TOKENS
-            and (plan := layer._nvfp4_raw_grouped_m48_plan) is not None
+            plan is not None
             and x.is_contiguous()
             and x.storage_offset() % 8 == 0
             and topk_ids.dtype == torch.int32
@@ -1721,8 +1743,8 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             and get_forward_context().additional_kwargs.get("sm70_nvfp4_decode_only")
         ):
             rows, experts, sizes, total = plan
-            output = layer._nvfp4_raw_grouped_output
-            intermediate = layer._nvfp4_raw_grouped_intermediate
+            output = layer._nvfp4_raw_grouped_output[:num_tokens]
+            intermediate = layer._nvfp4_raw_grouped_intermediate[: num_tokens * top_k]
             ops.nvfp4_grouped_w13_raw_sm70_v154_out(
                 intermediate,
                 x,

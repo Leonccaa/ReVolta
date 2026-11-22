@@ -872,6 +872,7 @@ class ModelCudaGraphManager(CudaGraphManager):
                         (
                             envs.VLLM_SM70_NVFP4_MOE_GROUPED_DECODE
                             or envs.VLLM_SM70_NVFP4_RAW_GROUPED_M48_V154
+                            or envs.VLLM_SM70_NVFP4_RAW_GROUPED_NARROW_V154
                         )
                         and desc.cg_mode == CUDAGraphMode.FULL
                         and desc.uniform_token_count is not None

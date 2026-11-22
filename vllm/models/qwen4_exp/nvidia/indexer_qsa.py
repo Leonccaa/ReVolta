@@ -237,8 +237,13 @@ class QSAIndexer(nn.Module):
         hidden_states = hidden_states[:num_tokens]
         positions = positions[..., :num_tokens]
 
-        # Q/K projection
-        projected_qk, _ = self.index_qk_proj(hidden_states)
+        if (
+            hasattr(self.index_qk_proj, "_sm70_qsa_input_packed")
+            and hidden_states.shape[-1] == self.index_qk_proj.output_size
+        ):
+            projected_qk = hidden_states
+        else:
+            projected_qk, _ = self.index_qk_proj(hidden_states)
         projected_q, raw_keys = projected_qk.split(
             (
                 self.index_n_heads * self.index_head_dim,

@@ -649,6 +649,10 @@ class KernelConfig:
     """Use native SM70 QSA GPU-cache reads for eligible TP4/DCP2 decode
     and verification batches. This changes the local attention arithmetic."""
 
+    sm70_qsa_input_batch: bool = False
+    """Pack and fuse the two checkpoint-FP16 QSA input projections in the
+    SM70 TP4 NVFP4 target MTP decode graph."""
+
     qsa_dcp_index_shard: bool = False
     """Shard the target QSA compressed indexer keys over the DCP group.
 

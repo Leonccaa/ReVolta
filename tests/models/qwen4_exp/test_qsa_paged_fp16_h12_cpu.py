@@ -49,7 +49,10 @@ def test_qsa_h12_dcp_reader(monkeypatch, enabled, phase, rows, topk, native):
         _k_scale_float=1.0,
         _v_scale_float=1.0,
     )
-    group = SimpleNamespace(all_gather=lambda q, dim: torch.cat((q, q), dim=dim))
+    group = SimpleNamespace(
+        all_gather=lambda q, dim: torch.cat((q, q), dim=dim),
+        device_communicator=SimpleNamespace(sm70_dcp2=None),
+    )
     monkeypatch.setattr(distributed, "get_dcp_group", lambda: group)
     monkeypatch.setattr(
         qsa_dcp, "qsa_localize_dcp_indices", lambda src, dst, **kwargs: dst.copy_(src)

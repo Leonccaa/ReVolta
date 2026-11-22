@@ -10,6 +10,7 @@ from torch import nn
 import vllm.envs as envs
 from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
 from vllm.config import get_current_vllm_config
+from vllm.distributed.device_communicators.sm70_hc_ll import MAX_ROWS, get_tp_hc_ll
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear.fp16_gemv_silu import Sm70Fp16GemvSiluKernel
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
@@ -86,7 +87,7 @@ def _prepare_hc_batch_weight(layer: nn.Module) -> None:
     # VLLM_SM70_QWEN38_HC_PREFER_REPLICATED selects the replicated packs even
     # when custom all-reduce is (force-)enabled as fully connected.
     # 1CatAI #900 is opt-in on this branch (VLLM_SM70_QWEN38_HC_REPLICATED=1).
-    if (
+    if get_tp_hc_ll() is None and (
         (
             envs.VLLM_SM70_QWEN38_HC_PREFER_REPLICATED
             or (
@@ -428,7 +429,18 @@ def _qwen38_sm70_fp16_fused_hc(
     packed_up: torch.Tensor | None = None,
     concurrent_batch: bool = False,
     reassociated_down: bool = False,
+    ll_enabled: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    ll = get_tp_hc_ll() if ll_enabled else None
+    if (
+        ll is not None
+        and x.ndim == 2
+        and 1 <= x.shape[0] <= MAX_ROWS
+        and packed_down is not None
+        and packed_up is not None
+    ):
+        return ll.project(x.contiguous(), packed_down, packed_up)
+
     if _replicated_runtime_ok(x, packed_down, packed_up, concurrent_batch):
         from vllm import _custom_ops as ops
 
@@ -651,6 +663,7 @@ def _qwen38_sm70_fp16_fused_hc_fake(
     packed_up: torch.Tensor | None = None,
     concurrent_batch: bool = False,
     reassociated_down: bool = False,
+    ll_enabled: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     del down_weight, up_weight, packed_down, packed_up
     return (
@@ -702,6 +715,7 @@ def maybe_apply_qwen38_sm70_fp16_fused_hc(
         getattr(up_layer, "_sm70_qwen38_hc_batch_packed", None),
         getattr(down_layer, "_sm70_qwen38_hc_batch_concurrent", False),
         getattr(down_layer, "_sm70_fp16_gemv_silu_ranges", False),
+        getattr(down_layer, "_sm70_hc_ll_enabled", False),
     )
 
 
@@ -709,8 +723,9 @@ def enable_qwen38_sm70_fp16_fused_hc(
     module: nn.Module, dtype: torch.dtype, vllm_config=None
 ) -> None:
     """Mark exact base-model HC modules for the fused M=1 route."""
+    ll_enabled = get_tp_hc_ll() is not None
     if (
-        not envs.VLLM_SM70_QWEN38_FUSED_HC_FP16
+        not (ll_enabled or envs.VLLM_SM70_QWEN38_FUSED_HC_FP16)
         or envs.VLLM_SM70_QWEN4_EXP_ONLINE_QPN8
         or dtype != torch.float16
         or not current_platform.is_device_capability((7, 0))
@@ -733,6 +748,8 @@ def enable_qwen38_sm70_fp16_fused_hc(
         ):
             continue
         child._sm70_qwen38_fp16_fused_hc = True
+        if ll_enabled:
+            child.input_mix_weight_down_block_inject._sm70_hc_ll_enabled = True
         # The generic operator changes FP32 reduction association. Enable it
         # for the quality-equivalent no-speculative policy; verifier/draft and
         # batch-invariant execution retain their existing reductions.
@@ -759,7 +776,8 @@ def enable_qwen38_sm70_fp16_fused_hc(
         # Only HC's packed collective owns exactly four TP shards. Local router
         # and shared-expert kernels use the independent MTP admission above.
         if tp4 and (
-            concurrent_batch
+            ll_enabled
+            or concurrent_batch
             or (
                 envs.VLLM_SM70_MTP_HC_BATCH and _mtp_batch_runtime_contract(vllm_config)
             )

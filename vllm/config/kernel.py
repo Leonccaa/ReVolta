@@ -704,6 +704,11 @@ class KernelConfig:
     versus dense sampling; this mode does not fall back for these cutoffs.
     Unsupported batches keep the existing fallback in either compact mode.
     """
+    sm70_nvlink_hc_active: bool = Field(default=False, init=False)
+    """Resolved TP hardware admission, which changes the compiled HC graph."""
+
+    sm70_hc_ll_async: bool = False
+    """Allow the usual SM70 NVLink HC LL admission under async scheduling."""
 
     ple_result_transport: Literal["auto", "cuda", "mapped"] = "auto"
     """Select CPU PLE result transport by local operator/resource capability."""
@@ -755,6 +760,7 @@ class KernelConfig:
             # Sampler-only switches; they do not change the compiled model.
             "sm70_greedy_verify",
             "sm70_sparse_target_sampling",
+            "sm70_hc_ll_async",  # Compiled model uses sm70_nvlink_hc_active.
             # Scheduler-only prefix-hit check; no compiled graph changes.
             "qsa_cross_group_hit_check",
         }
@@ -762,6 +768,8 @@ class KernelConfig:
             ignored_factors.add("sm70_skinny_moe")
         if not self.sm70_dflash2_fp16_m8:
             ignored_factors.add("sm70_dflash2_fp16_m8")
+        if not self.sm70_nvlink_hc_active:
+            ignored_factors.add("sm70_nvlink_hc_active")
         if not self.fused_fp16_aux_gemv_applicable:
             ignored_factors.add("fused_fp16_aux_gemv")
         if not self.qsa_auto_e4m3_active:

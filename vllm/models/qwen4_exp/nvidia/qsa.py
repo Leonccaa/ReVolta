@@ -86,6 +86,7 @@ from .ops.qsa_paged_fp16_h12 import (
     qsa_paged_fp16_h12,
     qsa_paged_fp16_h12_workspace,
 )
+from .ops.sm70_dcp2 import get_sm70_dcp2_for_batch
 
 if TYPE_CHECKING:
     from .host_kv.history import HostHistoryLayer
@@ -536,10 +537,21 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             local_block_size=host.kernel_block_tokens,
         )
         group = get_dcp_group()
-        if gathered_query is None:
-            gathered_query = group.all_gather(query[:num_tokens].contiguous(), dim=1)
         partial_output = layer.dcp_partial_output_buffer[:num_tokens]
         partial_lse = layer.dcp_partial_lse_buffer[:num_tokens]
+        out = output[:num_tokens]
+        gate = output_gate[:num_tokens].view_as(out)
+        dcp2 = None
+        if gathered_query is None:
+            query = query[:num_tokens]
+            dcp2 = get_sm70_dcp2_for_batch(
+                group, query, partial_output, partial_lse, gate, out
+            )
+            gathered_query = (
+                dcp2.gather_query(query)
+                if dcp2 is not None
+                else group.all_gather(query.contiguous(), dim=1)
+            )
         if partial_output.shape != gathered_query.shape:
             raise RuntimeError("QSA DCP partial output has wrong head geometry")
         local_width = qsa_dcp_local_selection_width(
@@ -641,15 +653,17 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 attend_dcp,
                 single_pass=attn_metadata.max_query_len <= decode_rows,
             )
+        if dcp2 is not None:
+            dcp2.combine_gate(partial_output, partial_lse, gate, out)
+            return output
         merged = cast(
             torch.Tensor,
             self.dcp_combine(
                 partial_output, partial_lse, group, is_lse_base_on_e=False
             ),
         )
-        out = output[:num_tokens]
         out.copy_(merged)
-        _qsa_output_gate(out, output_gate[:num_tokens].view_as(out))
+        _qsa_output_gate(out, gate)
         return output
 
     def _forward_qsa_dcp(
@@ -699,9 +713,17 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             local_block_size=key_cache.shape[1],
         )
         group = get_dcp_group()
-        gathered_query = group.all_gather(query.contiguous(), dim=1)
         partial_output = partial_output_buffer[: query.shape[0]]
         partial_lse = partial_lse_buffer[: query.shape[0]]
+        gate = output_gate.view_as(output)
+        dcp2 = get_sm70_dcp2_for_batch(
+            group, query, partial_output, partial_lse, gate, output
+        )
+        gathered_query = (
+            dcp2.gather_query(query)
+            if dcp2 is not None
+            else group.all_gather(query.contiguous(), dim=1)
+        )
         if partial_output.shape != gathered_query.shape:
             raise RuntimeError("QSA DCP partial output has wrong head geometry")
         # Only this prefix of the compacted columns can hold an owned token.
@@ -791,6 +813,9 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 compacted_indices=True,
                 **scale_kwargs,
             )
+        if dcp2 is not None:
+            dcp2.combine_gate(partial_output, partial_lse, gate, output)
+            return
         merged = cast(
             torch.Tensor,
             self.dcp_combine(
@@ -804,7 +829,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         # apply the Triton gate DCP1's page4 route uses. This replaces a chain
         # of five elementwise kernels (12.2 us per decode layer on V100).
         output.copy_(merged)
-        _qsa_output_gate(output, output_gate.view_as(output))
+        _qsa_output_gate(output, gate)
 
 
 def _verify_e4m3_kv_requirements(

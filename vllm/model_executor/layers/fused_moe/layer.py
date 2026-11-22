@@ -1321,7 +1321,13 @@ class FusedMoE(PluggableLayer):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
+        *,
+        reduce_results: bool = True,
     ) -> torch.Tensor:
+        if not reduce_results:
+            return self.runner.forward(
+                hidden_states, router_logits, input_ids, reduce_results=False
+            )
         return self.runner.forward(
             hidden_states,
             router_logits,

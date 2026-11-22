@@ -29,6 +29,14 @@ output sum (sum2) uses its own push kernel at the sizes that have one and otherw
 locally before the ordinary all-reduce. Override with `VLLM_SM70_INTERCONNECT=auto|pex|nccl|nvlink`
 or disable custom all-reduce with `--disable-custom-all-reduce`.
 
+`VLLM_SM70_NVLINK_HC=1` opts into experimental Flash-Next HC sharding, fused
+all-reduce/HC, and the QSA DCP2 query exchange and output merge for synchronous
+Model Runner V2. It defaults to `0`. All six SM70 TP4 GPU pairs must have direct
+NVLink and native peer atomics. An interconnect override cannot
+satisfy these checks. The QSA route supports FP16 queries with six 256-element
+heads per rank and up to 64 rows. These paths can change floating-point rounding
+and are subject to model quality validation.
+
 ## Launch options
 
 `--kv-cache-dtype` selects the storage format:

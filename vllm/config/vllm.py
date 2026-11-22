@@ -3284,6 +3284,18 @@ class VllmConfig:
         self.compilation_config.pass_config.log_enabled_passes()
 
         if not self.is_speculative_draft:
+            if (
+                self.scheduler_config.async_scheduling
+                and envs.VLLM_SM70_NVLINK_HC
+                and not self.kernel_config.sm70_hc_ll_async
+            ):
+                logger.warning_once(
+                    "SM70 NVLink HC LL is disabled because asynchronous scheduling "
+                    "is enabled (VLLM_SM70_NVLINK_HC=1). Use --no-async-scheduling "
+                    "to allow HC LL on supported configurations.",
+                    scope="global",
+                )
+
             from vllm.revolta_profile import profile_audit
 
             logger.info_once(

@@ -22,9 +22,13 @@ Typical usage inside a transformer decoder layer::
     )
 """
 
+from typing import NamedTuple
+
 import torch
 from torch import nn
 
+from vllm.distributed import tensor_model_parallel_all_reduce
+from vllm.distributed.device_communicators.sm70_hc_ll import MAX_ROWS, get_tp_hc_ll
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
@@ -33,6 +37,7 @@ from vllm.model_executor.layers.quantization.sm70_online_qpn8 import (
     maybe_apply_fused_hc,
 )
 from vllm.model_executor.models.utils import maybe_prefix
+from vllm.utils.torch_utils import direct_register_custom_op
 
 from ..common.hyperconnection import (
     GroupedGemmaRMSNorm,
@@ -46,6 +51,48 @@ from .ops.hc import (
     hc_silu,
 )
 from .sm70_fp16_hc import maybe_apply_qwen38_sm70_fp16_fused_hc
+
+
+class HCTensorParallelPartial(NamedTuple):
+    """A block output whose one remaining TP sum is owned by HC."""
+
+    value: torch.Tensor
+
+
+def _hc_ll_combine_norm(
+    partial: torch.Tensor,
+    residual: torch.Tensor,
+    injection: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    hc_count: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Layers hand over partials only after the HC LL geometry admission.
+    ll = get_tp_hc_ll()
+    if ll is not None and 1 <= residual.shape[0] <= MAX_ROWS:
+        return ll.combine_norm(partial, residual, injection, weight, eps)
+    return hc_combine_norm(
+        residual,
+        tensor_model_parallel_all_reduce(partial),
+        injection,
+        weight,
+        eps,
+        hc_count,
+    )
+
+
+def _hc_ll_combine_norm_fake(partial, residual, injection, weight, eps, hc_count):
+    return (
+        torch.empty_like(residual, memory_format=torch.contiguous_format),
+        torch.empty_like(residual, memory_format=torch.contiguous_format),
+    )
+
+
+direct_register_custom_op(
+    op_name="qwen4exp_sm70_hc_ll_combine_norm",
+    op_func=_hc_ll_combine_norm,
+    fake_impl=_hc_ll_combine_norm_fake,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +222,7 @@ class GatedResidual(nn.Module):
     def combine_and_mix(
         self,
         hidden_states: torch.Tensor,
-        prev_block_output: torch.Tensor,
+        prev_block_output: torch.Tensor | HCTensorParallelPartial,
         prev_injection: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Consume a pending combine, then prepare the next block input.
@@ -184,14 +231,24 @@ class GatedResidual(nn.Module):
         block's mix. Its combine with ``block_output`` is fused with this
         module's input RMSNorm.
         """
-        hidden_states, xn = hc_combine_norm(
-            hidden_states,
-            prev_block_output,
-            prev_injection,
-            self.hc_norm.weight,
-            self.config.rms_norm_eps,
-            self.hc_count,
-        )
+        if isinstance(prev_block_output, HCTensorParallelPartial):
+            hidden_states, xn = torch.ops.vllm.qwen4exp_sm70_hc_ll_combine_norm(
+                prev_block_output.value,
+                hidden_states,
+                prev_injection,
+                self.hc_norm.weight,
+                self.config.rms_norm_eps,
+                self.hc_count,
+            )
+        else:
+            hidden_states, xn = hc_combine_norm(
+                hidden_states,
+                prev_block_output,
+                prev_injection,
+                self.hc_norm.weight,
+                self.config.rms_norm_eps,
+                self.hc_count,
+            )
 
         block_input, injection = self._project(xn)
 
@@ -200,9 +257,11 @@ class GatedResidual(nn.Module):
     def combine(
         self,
         hidden_states: torch.Tensor,
-        block_output: torch.Tensor,
+        block_output: torch.Tensor | HCTensorParallelPartial,
         injection: torch.Tensor,
     ) -> torch.Tensor:
+        if isinstance(block_output, HCTensorParallelPartial):
+            block_output = tensor_model_parallel_all_reduce(block_output.value)
         return hc_combine(hidden_states, block_output, injection, self.hc_count)
 
     @property

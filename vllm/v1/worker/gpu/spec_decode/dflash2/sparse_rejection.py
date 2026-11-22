@@ -188,7 +188,7 @@ def _sample_reference_requests(
     rejection_sampler: RejectionSampler,
     draft_logits: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run the unchanged dense contract for whole ambiguous requests.
+    """Run the dense contract for whole requests requiring reference logits.
 
     Compact sampling admits no penalties, logprobs, grammar or synthetic
     rejection. Keep original request-slot IDs, positions and local draft-step
@@ -424,6 +424,17 @@ def try_dflash2_sparse_target_rejection(
     if not _supports_sparse_sampling_contract(rejection_sampler, input_batch):
         return None
 
+    reasoning_eos = rejection_sampler.sampler.reasoning_eos
+    guarded = (
+        reasoning_eos.active_requests(input_batch.idx_mapping_np)
+        if reasoning_eos is not None
+        else []
+    )
+    # A selector that has already truncated the vocabulary cannot replace
+    # masked EOS candidates reliably. Use the existing dense reference route.
+    if len(guarded) == input_batch.num_reqs:
+        return None
+
     sparse_draft_logits = speculator.get_sparse_draft_logits()
     if sparse_draft_logits is None:
         return None
@@ -476,6 +487,8 @@ def try_dflash2_sparse_target_rejection(
     reference_reqs = np.flatnonzero(
         np.logical_or.reduceat(reference_rows, input_batch.cu_num_logits_np[:-1])
     )
+    if guarded:
+        reference_reqs = np.union1d(reference_reqs, list(guarded))
     reference_logits = None
     if reference_reqs.size:
         logger.info_once(

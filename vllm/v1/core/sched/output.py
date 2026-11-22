@@ -130,6 +130,8 @@ class CachedRequestData:
     new_block_ids: list[tuple[list[int], ...] | None]
     num_computed_tokens: list[int]
     num_output_tokens: list[int]
+    # A common dispatch hint for all TP ranks, including non-reply async ranks.
+    qwen_reasoning_eos_ended_req_ids: set[str] | None = None
 
     # Version of dataclass repr with token IDs obfuscated.
     def anon_repr(self) -> str:

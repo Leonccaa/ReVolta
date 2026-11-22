@@ -45,6 +45,15 @@ NOTES: dict[str, dict[str, str]] = {
         "temporary GPU memory usage. Set 0 to use the 64-row vector path.",
         metrics="",
     ),
+    "VLLM_QWEN_REASONING_EOS_MASK": dict(
+        section="deployment",
+        since="0.2.0rc15",
+        range="0, 1",
+        tradeoff="Suppresses model EOS during visible Qwen chat reasoning in "
+        "Model Runner V2. Requests still in reasoning use full-vocabulary "
+        "sampling when compact DFlash2 verification would truncate logits.",
+        metrics="",
+    ),
     "VLLM_SM70_IDLE_CLOCK_SECONDS": dict(
         section="deployment",
         since="0.2.0rc14",

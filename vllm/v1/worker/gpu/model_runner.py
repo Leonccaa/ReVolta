@@ -1177,6 +1177,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         req_idx = self.req_states.remove_request(req_id)
         if req_idx is None:
             return False
+        if self.sampler is not None and self.sampler.reasoning_eos is not None:
+            self.sampler.reasoning_eos.requests.discard(req_idx)
         if self.pp_handler is not None:
             self.pp_handler.on_req_idx_freed(req_idx)
         if self.encoder_cache is not None:
@@ -1262,7 +1264,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.is_last_pp_rank and new_req_data.sampling_params is not None:
                 assert self.sampler is not None
                 self.sampler.add_request(
-                    req_index, prompt_len, new_req_data.sampling_params
+                    req_index,
+                    prompt_len,
+                    new_req_data.sampling_params,
+                    new_req_data.prefill_token_ids,
                 )
                 assert self.prompt_logprobs_worker is not None
                 self.prompt_logprobs_worker.add_request(
@@ -1280,6 +1285,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.model_state.run_state_gathers(scheduler_output.mamba_state_gathers)
         # Add new blocks and update num_computed_tokens for the existing requests.
         reqs = scheduler_output.scheduled_cached_reqs
+        if (
+            reqs.qwen_reasoning_eos_ended_req_ids
+            and self.sampler is not None
+            and (reasoning_eos := self.sampler.reasoning_eos) is not None
+        ):
+            reasoning_eos.requests.difference_update(
+                self.req_states.req_id_to_index[req_id]
+                for req_id in reqs.qwen_reasoning_eos_ended_req_ids
+            )
         num_computed_tokens_np = self.req_states.num_computed_tokens_np
         for req_id, num_computed_tokens, req_new_block_ids in zip(
             reqs.req_ids, reqs.num_computed_tokens, reqs.new_block_ids
@@ -1722,6 +1736,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_sampled: torch.Tensor,
         num_rejected: torch.Tensor,
         query_start_loc: torch.Tensor | None = None,
+        reasoning_eos: torch.Tensor | None = None,
     ) -> None:
         # Update the number of computed tokens.
         if self.is_last_pp_rank:
@@ -1740,6 +1755,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             query_start_loc,
             self.req_states.all_token_ids.gpu,
             self.req_states.total_len.gpu,
+            reasoning_eos,
         )
 
         self.model_state.postprocess_state(
@@ -2231,12 +2247,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # This sequencing may slightly reduce latency as async D2H copy does not
         # need to wait for the postprocess to finish.
         mtp_state_update_start = self._sm70_v2_mtp_profile_start(mtp_profile_ctx)
+        assert self.sampler is not None
+        reasoning_eos = self.sampler.reasoning_eos
         self.postprocess_sampled(
             input_batch.idx_mapping,
             sampler_output.sampled_token_ids,
             num_sampled,
             num_rejected,
             input_batch.query_start_loc,
+            reasoning_eos.slots.gpu
+            if reasoning_eos is not None
+            and reasoning_eos.active_requests(input_batch.idx_mapping_np)
+            else None,
         )
         self._sm70_v2_mtp_profile_finish(
             mtp_profile_ctx, "target_state_update", mtp_state_update_start

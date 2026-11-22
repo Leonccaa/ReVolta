@@ -226,6 +226,12 @@ def _compute_block_stats_kernel(
             )
 
 
+@triton.jit
+def _accept_draft(target_log_prob, log_uniform_times_draft):
+    # Strict comparison also rejects a zero target probability when u is zero.
+    return target_log_prob > log_uniform_times_draft
+
+
 @triton.jit(
     do_not_specialize=[
         "rejected_logsumexp_plane_stride",
@@ -271,6 +277,7 @@ def _rejection_kernel(
     pos_ptr,
     # [num_speculative_steps]
     synthetic_conditional_rates_ptr,
+    reasoning_eos_rows_ptr,
     vocab_num_blocks,
     PADDED_VOCAB_NUM_BLOCKS: tl.constexpr,
     HAS_DRAFT_LOGITS: tl.constexpr,
@@ -337,6 +344,14 @@ def _rejection_kernel(
                     u = tl_rand32(seed, pos, includes_zero=False)
                     rate = tl.load(synthetic_conditional_rates_ptr + i)
                     accepted &= u < rate
+                    if reasoning_eos_rows_ptr is not None:  # noqa: SIM102
+                        if tl.load(reasoning_eos_rows_ptr + logit_idx):
+                            target_logit = tl.load(
+                                target_logits_ptr
+                                + logit_idx * target_logits_stride
+                                + draft_sampled
+                            )
+                            accepted &= target_logit > -float("inf")
                 else:
                     accepted &= target_argmax == draft_sampled
                 tl.store(
@@ -387,10 +402,15 @@ def _rejection_kernel(
                 if SYNTHETIC_MODE:
                     rate = tl.load(synthetic_conditional_rates_ptr + i)
                     accepted &= u < rate
+                    if reasoning_eos_rows_ptr is not None:  # noqa: SIM102
+                        if tl.load(reasoning_eos_rows_ptr + logit_idx):
+                            accepted &= target_log_prob > -float("inf")
                 else:
                     # Probability ratio test: p(x) > u * q(x)
                     # Equivalent log form: log_p(x) > log(u) + log_q(x)
-                    accepted &= target_log_prob > tl.log(u) + draft_log_prob
+                    accepted &= _accept_draft(
+                        target_log_prob, tl.log(u) + draft_log_prob
+                    )
                 tl.store(sampled_ptr + req_idx * sampled_stride + i, draft_sampled)
             rejected_step += accepted
     tl.store(rejected_steps_ptr + req_idx, rejected_step)
@@ -962,8 +982,9 @@ def _dflash2_sparse_topk_rejection_kernel(
 
             pos = tl.load(pos_ptr + row)
             uniform = tl_rand32(seed, pos, includes_zero=False)
-            accepted &= (target_proposed_logit - target_lse) > (
-                tl.log(uniform) + draft_proposed_logit - draft_lse
+            accepted &= _accept_draft(
+                target_proposed_logit - target_lse,
+                tl.log(uniform) + draft_proposed_logit - draft_lse,
             )
             tl.store(
                 sampled_ptr + req_idx * sampled_stride + step,
@@ -1316,6 +1337,7 @@ def rejection_sample(
     # that were redrawn from [0] the single-logsumexp residual or [1] the
     # target distribution.
     fallback_count: torch.Tensor | None = None,
+    reasoning_eos_rows: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     num_reqs = cu_num_logits.shape[0] - 1
     num_logits, vocab_size = target_logits.shape
@@ -1391,6 +1413,7 @@ def rejection_sample(
         seed,
         pos,
         synthetic_conditional_rates,
+        reasoning_eos_rows,
         vocab_num_blocks,
         PADDED_VOCAB_NUM_BLOCKS=padded_vocab_num_blocks,
         HAS_DRAFT_LOGITS=has_draft_logits,

@@ -1015,6 +1015,7 @@ if TYPE_CHECKING:
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
+    VLLM_QWEN_REASONING_EOS_MASK: bool = False
     VLLM_PLE_CPU_OFFLOAD: bool = False
     VLLM_PLE_DISK_OFFLOAD: bool = False
     VLLM_PLE_DISK_OFFLOAD_NUM_THREADS: int = 0
@@ -15987,6 +15988,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="configuration",
         declared_default="'binary'",
         effective_default="'binary'",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_QWEN_REASONING_EOS_MASK": env_var(
+        lambda: os.getenv("VLLM_QWEN_REASONING_EOS_MASK", "0") == "1",
+        description="Mask model EOS during visible Qwen chat reasoning in MRv2.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=True,

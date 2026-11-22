@@ -9,6 +9,7 @@ from typing import Any
 
 from fastapi import Request
 
+from vllm import envs
 from vllm.entrypoints.chat_utils import ConversationMessage
 from vllm.entrypoints.openai.chat_completion.protocol import (
     BatchChatCompletionRequest,
@@ -167,6 +168,13 @@ class OpenAIServingChatBatch(OpenAIServingChat):
             sampling_params = single_request.to_sampling_params(
                 max_tokens, self.default_sampling_params
             )
+            if envs.VLLM_QWEN_REASONING_EOS_MASK:
+                self._set_reasoning_eos_mask(
+                    single_request,
+                    sampling_params,
+                    reasoning_parser,
+                    self._extract_prompt_components(engine_prompt).token_ids,
+                )
             self._log_inputs(
                 sub_request_id,
                 engine_prompt,

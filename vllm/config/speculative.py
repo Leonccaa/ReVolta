@@ -241,10 +241,10 @@ class SpeculativeConfig:
     warn users when they mistakenly provide the wrong argument."""
 
     # Draft model configuration
-    mtp_expert_quantization: Literal["fp8"] | None = None
-    """Opt in to FP8-resident Qwen4Exp MTP experts on SM70 with an AWQ or
-    ModelOpt checkpoint whose MTP experts are unquantized. Serialized block-FP8
-    MTP experts use their checkpoint scales without this online-conversion flag.
+    mtp_expert_quantization: Literal["fp8", "q8_0"] | None = None
+    """Select the routed-expert format for Qwen4Exp MTP on SM70. The default
+    follows the draft checkpoint, including serialized block-FP8 drafts.
+    Use fp8 for online FP8 or q8_0 to pack BF16/FP16 draft expert weights.
     Target weights are unchanged.
     """
     quantization: me_quant.QuantizationMethods | str | None = None
@@ -814,7 +814,7 @@ class SpeculativeConfig:
         )
         factors.append(uses_aux_hidden_states)
 
-        # Online FP8 changes the draft expert kernels and padded weight layout.
+        # Draft expert formats change the expert kernels and weight layout.
         # Include None too: old MTP artifacts may have been compiled with FP8
         # under the same key as FP16, before this field was hashed.
         if self.method == "mtp":
@@ -2045,7 +2045,10 @@ class SpeculativeConfig:
         ]:
             raise ValueError("mtp_expert_quantization currently requires Qwen4Exp MTP")
         if self.rejection_sample_method != "standard":
-            raise ValueError("FP8 MTP requires standard rejection sampling")
+            raise ValueError(
+                f"{self.mtp_expert_quantization.upper()} MTP requires standard "
+                "rejection sampling"
+            )
 
     def verify_equal_vocab_size_if_draft_model(self):
         if (

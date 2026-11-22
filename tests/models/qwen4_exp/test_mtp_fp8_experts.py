@@ -80,6 +80,9 @@ def test_online_fp8_has_a_distinct_compilation_hash():
         method="mtp",
         mtp_expert_quantization=None,
         draft_model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+        use_local_argmax_reduction=False,
+        sm70_dflash2=SimpleNamespace(resolved=False),
+        gdn_spec_state_replay=False,
         use_dflash_family=lambda: False,
         use_dspark=lambda: False,
         use_dflash_ddtree=lambda: False,
@@ -150,7 +153,7 @@ def test_only_unquantized_draft_experts_are_overridden(monkeypatch):
     fallback = SimpleNamespace(
         packed_modules_mapping={}, get_quant_method=lambda layer, prefix: unquantized
     )
-    wrapped = impl.MTPExpertFp8Config(fallback)
+    wrapped = impl.MTPExpertQuantConfig(fallback)
     expert = Mock(spec=impl.RoutedExperts)
     fp8 = object()
     monkeypatch.setattr(impl, "MTPFp8SM70MoEMethod", lambda layer: fp8)

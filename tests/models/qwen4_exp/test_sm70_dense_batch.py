@@ -28,7 +28,7 @@ def full_precision_sm70():
 
 
 @pytest.mark.parametrize("n,k", ((512, 2560), (2560, 1536)))
-@pytest.mark.parametrize("m", (2, 3, 4, 7, 8, 9, 15, 16))
+@pytest.mark.parametrize("m", (2, 3, 4, 7, 8, 9, 12, 15, 16))
 def test_dense_batch_graph_bits_and_canaries(m, n, k):
     torch.manual_seed(20927)
     weight = torch.randn(n, k, dtype=torch.float16, device="cuda") * 0.02
@@ -67,7 +67,7 @@ def test_dense_batch_unaligned_input_rejected():
         torch.ops._C.qwen38_dense_batch_sm70_out(out, x, w)
 
 
-@pytest.mark.parametrize("m", (1, 2, 4, 8, 16))
+@pytest.mark.parametrize("m", (1, 2, 4, 8, 12, 16))
 @pytest.mark.parametrize(
     "role,n,k,limit",
     (
@@ -97,6 +97,6 @@ def test_dense_runtime_route_and_fallback_bits(m, role, n, k, limit, monkeypatch
 
     monkeypatch.setattr(torch.ops._C, "qwen38_dense_batch_sm70_out", tracked)
     actual = torch.ops.vllm.qwen38_sm70_fp16_gemv(x, w, role, dense_batch=True)
-    assert len(calls) == int(2 <= m <= limit)
+    assert len(calls) == int(2 <= m <= limit or (m == 12 and limit == 8))
     assert torch.equal(actual.view(torch.int16), reference.view(torch.int16))
     envs.disable_envs_cache()

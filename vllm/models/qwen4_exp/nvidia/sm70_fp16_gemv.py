@@ -442,14 +442,12 @@ direct_register_custom_op(
 )
 
 
-def _dense_batch_limit(role: str, shape: tuple[int, ...]) -> int:
-    # Reject measured regressions: router M8/M16 and output M16. The C1
-    # reduction is a different tree and must keep its existing route.
+def _dense_batch_rows(role: str, shape: tuple[int, ...]) -> tuple[int, ...]:
     if role.endswith(_ROUTER_SUFFIX) and shape == (512, 2560):
-        return 4
+        return (2, 3, 4)
     if role.endswith((_GDN_OUT_SUFFIX, _QSA_OUT_SUFFIX)) and shape == (2560, 1536):
-        return 8
-    return 0
+        return (2, 3, 4, 5, 6, 7, 8, 12)
+    return ()
 
 
 def _can_use_dense_batch(x: torch.Tensor, weight: torch.Tensor, role: str) -> bool:
@@ -458,16 +456,16 @@ def _can_use_dense_batch(x: torch.Tensor, weight: torch.Tensor, role: str) -> bo
         and not envs.VLLM_BATCH_INVARIANT
         and not torch.backends.cuda.matmul.allow_fp16_accumulation
         # With reduced-precision reductions allowed, cuBLAS uses FP16 partials
-        # for the small output projections. Retain that baseline schedule;
-        # the native FP32 kernel differs at M2/M4/M5 in the operator oracle.
+        # for the small output projections. The M12 comparison also uses FP32
+        # reductions, so keep cuBLAS for the reduced-precision setting.
         and not (
             torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
             and tuple(weight.shape) == (2560, 1536)
-            and x.shape[0] < 8
+            and (x.shape[0] < 8 or x.shape[0] == 12)
         )
         and _is_packed_row_major(x)
         and _is_packed_row_major(weight)
-        and 2 <= x.shape[0] <= _dense_batch_limit(role, tuple(weight.shape))
+        and x.shape[0] in _dense_batch_rows(role, tuple(weight.shape))
         and x.shape[1] == weight.shape[1]
         and x.is_cuda
         and weight.is_cuda
@@ -806,7 +804,7 @@ def enable_qwen38_sm70_fp16_gemv(
             continue
         child.quant_method = Qwen38SM70FP16LinearMethod()
         child._sm70_qwen38_dense_batch = bool(
-            batch_allowed and _dense_batch_limit(prefix, shape)
+            batch_allowed and _dense_batch_rows(prefix, shape)
         )
         if shared_batch:
             child._sm70_mtp_prepare_shared_batch = True

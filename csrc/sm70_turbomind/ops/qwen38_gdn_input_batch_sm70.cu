@@ -339,7 +339,7 @@ void dense_batch(torch::Tensor output, torch::Tensor x, torch::Tensor weight) {
   if (router)
     dense_batch_kernel<2560><<<grid, 32, 0, at::cuda::getCurrentCUDAStream()>>>(
         input, w, out, m, n);
-  else if (m == 3 || m == 4)
+  else if (m >= 3 && m <= 8)
     dense_batch_out_kernel<1>
         <<<80, 128, 0, at::cuda::getCurrentCUDAStream()>>>(input, w, out, m);
   else if (m == 12)

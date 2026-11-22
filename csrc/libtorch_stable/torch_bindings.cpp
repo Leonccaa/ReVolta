@@ -368,6 +368,10 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "output, "
       "int k, bool decode_batch=False) -> ()");
 
+  ops.def(
+      "qsa_lexicographic_topk_pack(Tensor logits, Tensor lengths, Tensor! "
+      "packed, int rank, bool v154, bool decode_batch) -> ()");
+
   // Activation ops
   // Activation function used in SwiGLU.
   ops.def("silu_and_mul(Tensor! result, Tensor input) -> ()");
@@ -596,6 +600,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   ops.impl("qsa_lexicographic_topk", TORCH_BOX(&qsa_lexicographic_topk));
   ops.impl("qsa_lexicographic_topk_v154",
            TORCH_BOX(&qsa_lexicographic_topk_v154));
+  ops.impl("qsa_lexicographic_topk_pack",
+           TORCH_BOX(&qsa_lexicographic_topk_pack));
 
   // Activation kernels (shared CUDA/ROCm)
   ops.impl("silu_and_mul", TORCH_BOX(&silu_and_mul));

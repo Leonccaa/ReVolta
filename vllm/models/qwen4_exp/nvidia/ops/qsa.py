@@ -18,6 +18,7 @@ import torch.nn.functional as F
 import vllm._custom_ops as ops
 import vllm.envs as envs
 from vllm.compilation.sm70_decode_graph import is_sm70_decode_graph_compiling
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.models.deepseek_v4.common.ops.fp8_software import (
     fp8_e4m3fn_bits_to_fp32_bitcast as fp8_e4m3fn_bits_to_fp32,
@@ -1944,6 +1945,7 @@ def qsa_select_paged_tokens(
         (chunk_rows, block_topk), dtype=torch.int32, device=q.device
     )
     exact_topk = _use_sm70_qsa_lexicographic_topk(block_topk)
+    fuse_shard_decode = exact_topk and _use_qsa_shard_decode_fusion(q, world)
     compact_batch_topk = (
         exact_topk
         and 2 <= rows <= 64
@@ -2026,7 +2028,22 @@ def qsa_select_paged_tokens(
             and current_platform.has_device_capability(90)
             and not current_platform.is_device_capability_family(120)
         )
-        if exact_topk:
+        owner_merge = (
+            world > 1
+            and row_end - row_start >= QSA_PREFILL_MIN_ROWS_PER_OWNER * world
+            and any(a <= row_start and row_end <= b for a, b in prefill_ranges)
+        )
+        if fuse_shard_decode and not owner_merge:
+            _select_and_merge_qsa_shard_decode(
+                logits,
+                visible_blocks,
+                blocks,
+                index_dcp_rank,
+                compact_batch_topk,
+                _SM70_QSA_MTP_TOPK
+                and (compact_batch_topk or blocks.shape[0] in (5, 10)),
+            )
+        elif exact_topk:
             logger.info_once(
                 "Using exact SM70 QSA lexicographic top-k "
                 "(score descending, block index ascending)."
@@ -2058,7 +2075,7 @@ def qsa_select_paged_tokens(
                 block_topk,
                 topk_columns,
             )
-        if world > 1:
+        if world > 1 and (not fuse_shard_decode or owner_merge):
             # Local columns -> global groups, merged across the DCP group.
             blocks = _merge_sharded_index_blocks(
                 blocks,
@@ -2068,10 +2085,7 @@ def qsa_select_paged_tokens(
                 index_dcp_rank,
                 block_topk,
                 row_keys=(token_to_req[row_slice], query_positions[row_slice]),
-                owner_merge=(
-                    row_end - row_start >= QSA_PREFILL_MIN_ROWS_PER_OWNER * world
-                    and any(a <= row_start and row_end <= b for a, b in prefill_ranges)
-                ),
+                owner_merge=owner_merge,
             )
         expand_qsa_block_indices_cuda(
             blocks,
@@ -2083,6 +2097,39 @@ def qsa_select_paged_tokens(
             out[row_slice],
         )
     return out
+
+
+def _use_qsa_shard_decode_fusion(q: torch.Tensor, world: int) -> bool:
+    return (
+        world == 4
+        and envs.VLLM_QSA_INDEX_SHARD_FUSED_MERGE
+        and not envs.VLLM_QSA_INDEX_SHARD_DEBUG
+        and _SM70_QSA_TOPK_LIBRARY is None
+        and is_forward_context_available()
+        and get_forward_context().is_uniform_decode
+        and torch.cuda.is_current_stream_capturing()
+    )
+
+
+def _select_and_merge_qsa_shard_decode(
+    logits: torch.Tensor,
+    lengths: torch.Tensor,
+    blocks: torch.Tensor,
+    rank: int,
+    v154: bool,
+    decode_batch: bool,
+) -> None:
+    from vllm.distributed import get_tp_group
+
+    packed = torch.empty(
+        (blocks.shape[0], 2 * blocks.shape[1]), dtype=torch.int32, device=logits.device
+    )
+    ops.qsa_lexicographic_topk_pack(logits, lengths, packed, rank, v154, decode_batch)
+    tp_group = get_tp_group()
+    ca = getattr(tp_group.device_communicator, "ca_comm", None)
+    if ca is None or not ca.try_sm70_qsa_shard_merge(packed, blocks):
+        gathered = tp_group.all_gather(packed.unsqueeze(0), dim=0)
+        ops.sm70_qsa_shard_merge(gathered, blocks)
 
 
 _INDEX_SHARD_PAD_ID = torch.iinfo(torch.int32).max
@@ -2408,10 +2455,12 @@ def _merge_sharded_index_blocks(
             valid, blocks * world + rank, torch.full_like(blocks, _INDEX_SHARD_PAD_ID)
         )
         packed = torch.cat((score_bits, groups), dim=1)
+    tp_group = None
     if all_gather is None:
         from vllm.distributed import get_tp_group
 
-        all_gather = lambda t: get_tp_group().all_gather(t, dim=0)  # noqa: E731
+        tp_group = get_tp_group()
+        all_gather = lambda t: tp_group.all_gather(t, dim=0)  # noqa: E731
     if envs.VLLM_QSA_INDEX_SHARD_DEBUG:
         _check_index_shard_plan(
             rows, block_topk, world, row_keys, all_gather, owner_merge
@@ -2430,7 +2479,19 @@ def _merge_sharded_index_blocks(
         # Equal splits by destination on send, source rank order on receive.
         dist.all_to_all_single(gathered, send, group=get_tp_group().device_group)
     else:
-        gathered = all_gather(packed.unsqueeze(0))
+        gathered = None
+        if (
+            tp_group is not None
+            and world == 4
+            and block_topk == 512
+            and is_forward_context_available()
+            and get_forward_context().is_uniform_decode
+        ):
+            ca = getattr(tp_group.device_communicator, "ca_comm", None)
+            if ca is not None:
+                gathered = ca.try_sm70_tp4_push_allgather(packed)
+        if gathered is None:
+            gathered = all_gather(packed.unsqueeze(0))
     if gathered.shape != (world, rows, 2 * block_topk):
         # Catches a local world/wrapper mismatch only: all_gather sizes its
         # output from this rank's input. Cross-rank row layout is checked by

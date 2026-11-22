@@ -1291,6 +1291,13 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
   custom_ar.def("meta_size", &meta_size);
   custom_ar.def("sm70_tp4_push_allreduce_buffer_size",
                 &sm70_tp4_push_allreduce_buffer_size);
+  custom_ar.def(
+      "sm70_tp4_push_allgather(int fa, Tensor input, Tensor(a!) output) -> ()");
+  custom_ar.impl("sm70_tp4_push_allgather", torch::kCUDA,
+                 &sm70_tp4_push_allgather);
+  custom_ar.def(
+      "sm70_qsa_shard_merge(int fa, Tensor input, Tensor(a!) output) -> ()");
+  custom_ar.impl("sm70_qsa_shard_merge", torch::kCUDA, &sm70_qsa_shard_merge);
   custom_ar.def("sm70_tp8_hierarchical_push_allreduce_buffer_size",
                 &sm70_tp8_hierarchical_push_allreduce_buffer_size);
 

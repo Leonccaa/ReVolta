@@ -429,6 +429,8 @@ class EagleSpeculator:
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+        *,
+        is_uniform_decode: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
         with set_forward_context(
@@ -439,6 +441,7 @@ class EagleSpeculator:
             num_tokens_across_dp=num_tokens_across_dp,
             slot_mapping=slot_mappings,
             batch_descriptor=batch_descriptor,
+            is_uniform_decode=is_uniform_decode,
         ):
             inputs_embeds = None
             if self.supports_mm_inputs:
@@ -590,6 +593,8 @@ class EagleSpeculator:
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         skip_sample: bool = False,
+        *,
+        is_uniform_decode: bool = False,
     ) -> None:
         last_hidden_states, hidden_states = self.run_model(
             num_tokens,
@@ -598,6 +603,7 @@ class EagleSpeculator:
             num_tokens_across_dp=num_tokens_across_dp,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
             mm_inputs=mm_inputs,
+            is_uniform_decode=is_uniform_decode,
         )
         if skip_sample:
             # This pass only keeps the drafter KV in sync.

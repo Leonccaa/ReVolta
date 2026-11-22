@@ -862,6 +862,11 @@ void tile_runtime_wait_reduce(fptr_t _fa, torch::Tensor& staging,
 void dispose(fptr_t _fa);
 int64_t meta_size();
 int64_t sm70_tp4_push_allreduce_buffer_size();
+
+void sm70_tp4_push_allgather(fptr_t _fa, torch::Tensor& input,
+                             torch::Tensor& output);
+void sm70_qsa_shard_merge(fptr_t _fa, const torch::Tensor& input,
+                          torch::Tensor& output);
 int64_t sm70_tp8_hierarchical_push_allreduce_buffer_size();
 void register_buffer(fptr_t _fa, const std::vector<int64_t>& fake_ipc_ptrs);
 void register_sm70_tp4_push_allreduce_buffer(

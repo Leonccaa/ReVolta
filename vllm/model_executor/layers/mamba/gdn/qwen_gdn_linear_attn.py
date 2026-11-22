@@ -4217,13 +4217,19 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         """
         num_tokens = hidden_states.size(0)
         layer_name = _encode_layer_name(self.prefix)
+        # Replay is restricted to the MRv2 SM70 mixed-QKV verifier. Its core
+        # initializes this buffer after checking the per-batch metadata.
+        allocate_core_out = torch.empty if self.spec_state_replay else torch.zeros
+        core_shape = (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim)
         if _sm70_qwen_gdn_input_core_boundary_enabled():
             z = torch.empty(
                 (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
                 dtype=hidden_states.dtype,
                 device=hidden_states.device,
             )
-            core_attn_out = torch.zeros_like(z)
+            core_attn_out = allocate_core_out(
+                core_shape, dtype=z.dtype, device=z.device
+            )
             conv_state_cache, ssm_state_cache = _resolve_qwen_gdn_kv_cache_args(
                 layer_name,
                 core_attn_out,
@@ -4273,7 +4279,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 a,
                 layer_name,
             )
-            core_attn_out = torch.zeros_like(z)
+            core_attn_out = allocate_core_out(
+                core_shape, dtype=z.dtype, device=z.device
+            )
             conv_state_cache, ssm_state_cache = _resolve_qwen_gdn_kv_cache_args(
                 layer_name,
                 core_attn_out,
@@ -4404,10 +4412,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ============================================================
         # Part 2: Core Attention (Custom Op)
         # ============================================================
-        # Note: we should not use torch.empty here like other attention backends,
-        # see discussions in https://github.com/vllm-project/vllm/pull/28182
-        core_attn_out = torch.zeros(
-            (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
+        # The recurrent kernel can skip output rows, see vLLM #28182.
+        core_attn_out = allocate_core_out(
+            core_shape,
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
@@ -5595,6 +5602,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         attn_metadata_raw = forward_context.attn_metadata
 
         if attn_metadata_raw is None:
+            if self.spec_state_replay:
+                core_attn_out.zero_()
             self._warmup_prefill_kernels(mixed_qkv, 0)
             return
 
@@ -5706,6 +5715,35 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
         )
 
+        query_len = attn_metadata.max_query_len
+        num_spec_reqs = attn_metadata.num_spec_decodes
+        num_k_heads = self.num_k_heads // self.tp_size
+        num_v_heads = self.num_v_heads // self.tp_size
+        fuse_conv_zero = (
+            self.spec_state_replay
+            and spec_sequence_masks is not None
+            and attn_metadata.num_prefills == attn_metadata.num_decodes == 0
+            and ddtree_parent_ids is None
+            and 1 <= num_spec_reqs <= 8
+            and query_len in (4, 5, 8)
+            and attn_metadata.num_spec_decode_tokens == num_spec_reqs * query_len
+            and self.conv1d.bias is None
+            and conv_weights.size(1) == 4
+            and self.activation == "silu"
+            and mixed_qkv.dtype
+            == conv_state.dtype
+            == core_attn_out.dtype
+            == torch.float16
+            and ssm_state.dtype == torch.float32
+            and self._replay_reads_strided_qkv(mixed_qkv)
+            and core_attn_out.is_contiguous()
+            and num_v_heads == 3 * num_k_heads
+            and self.head_k_dim == self.head_v_dim == 128
+            and self._mixed_qkv_verify_geometry_supported()
+        )
+        if self.spec_state_replay and not fuse_conv_zero:
+            core_attn_out.zero_()
+
         if spec_sequence_masks is not None:
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
                 mixed_qkv_spec = mixed_qkv
@@ -5750,8 +5788,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 ],
                 num_accepted_tokens=spec_state_slot_selectors,
                 query_start_loc=spec_query_start_loc,
-                max_query_len=spec_state_indices_tensor.size(-1),
+                max_query_len=query_len
+                if fuse_conv_zero
+                else spec_state_indices_tensor.size(-1),
                 validate_data=False,
+                zero_core_out=core_attn_out if fuse_conv_zero else None,
             )
 
         # 1.2: Process the remaining part
@@ -6212,7 +6253,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                         use_qk_l2norm_in_kernel=True,
                         out=(
                             core_attn_out[:num_actual_tokens].unsqueeze(0)
-                            if direct_verify_out
+                            if fuse_conv_zero or direct_verify_out
                             else None
                         ),
                     )
@@ -6554,6 +6595,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         """
         Packed non-spec decode with explicit CUDA graph tensor dependencies.
         """
+        if self.spec_state_replay:
+            core_attn_out.zero_()
         # conv_state must be (..., dim, width-1) for the conv kernels.
         # DS layout stores it that way directly; SD layout needs a transpose.
         conv_state = (

@@ -496,6 +496,10 @@ class GDNAttentionMetadata:
     # every GDN cache group on every verification round.
     _prepared_spec_metadata_tensors: GDN_SPEC_METADATA_TENSORS | None = None
 
+    # Set by the target builder. Runtime FULL replay updates the buffers above
+    # while keeping the query width from the graph's capture metadata.
+    max_query_len: int = 0
+
 
 @dataclass
 class GDNSpecDecodeStateContract:
@@ -2085,6 +2089,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             num_spec_decodes=num_spec_decodes,
             num_spec_decode_tokens=num_spec_decode_tokens,
             num_actual_tokens=m.num_actual_tokens,
+            max_query_len=m.max_query_len,
             has_initial_state=has_initial_state,
             chunk_indices=chunk_indices,
             chunk_offsets=chunk_offsets,

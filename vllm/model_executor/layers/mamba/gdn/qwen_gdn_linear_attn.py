@@ -5418,16 +5418,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         ):
             return 0
         state = self.kv_cache[1]
-        if (
-            state.dtype != torch.float32
-            or state.stride()[-3:] != (128 * 128, 128, 1)
-            or state.stride(0) % 4
-            or state.data_ptr() % 16
-            or self.A_log.dtype not in (torch.float16, torch.float32)
-            or self.dt_bias.dtype not in (torch.float16, self.A_log.dtype)
-            or not self.A_log.is_contiguous()
-            or not self.dt_bias.is_contiguous()
-        ):
+        if state.dtype != torch.float32 or state.stride()[-3:] != (128 * 128, 128, 1):
             return 0
         # Table capacity bounds each sequence, including short rows inside
         # this launch. The same bound also covers the accepted-prefix replay.

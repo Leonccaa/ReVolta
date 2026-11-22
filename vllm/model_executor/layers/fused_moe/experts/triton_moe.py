@@ -254,10 +254,7 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             and self.w2_bias is None
             and a1q_scale is None
             and a2_scale is None
-            and hidden_states.is_cuda
-            and current_platform.is_device_capability(70)
             and topk_ids.is_contiguous()
-            and hasattr(torch.ops._C, "sm70_mtp_moe_fp16_v154_out")
         ):
             ids = topk_ids.view(-1)
             if (

@@ -26,6 +26,7 @@ def make_layer(tp):
         sm70_nvfp4_intermediate_size=640 // tp,
         sm70_nvfp4_top_k=10,
         sm70_nvfp4_qwen38_raw_scale=False,
+        _nvfp4_raw_grouped_narrow_plan=None,
         w13_tm_weight=torch.empty(0),
         w13_tm_scales=torch.empty(0),
         w2_tm_weight=torch.empty(0),

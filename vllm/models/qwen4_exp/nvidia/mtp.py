@@ -31,7 +31,6 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
-    UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.utils import configure_quant_config
@@ -44,7 +43,6 @@ from vllm.model_executor.models.utils import (
     maybe_fuse_shared_experts,
     maybe_prefix,
 )
-from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
@@ -252,29 +250,12 @@ def _make_draft_vllm_config(
         }
         checkpoint_prefixes = checkpoint_fp8_prefixes(draft_quant_config, prefixes)
     if expert_format == "q8_0":
-        parallel = draft_vllm_config.parallel_config
-        if (
-            not exact_sm70
-            or draft_vllm_config.model_config.dtype != torch.float16
-            or parallel.pipeline_parallel_size != 1
-            or parallel.enable_expert_parallel
-            or parallel.data_parallel_size != 1
-            or parallel.prefill_context_parallel_size != 1
-        ):
-            raise ValueError(
-                "Q8_0 MTP requires SM70 FP16 with PP/DP/PCP size 1 and no EP"
-            )
+        if not exact_sm70 or draft_vllm_config.model_config.dtype != torch.float16:
+            raise ValueError("Q8_0 MTP requires SM70 with FP16 activations")
         if checkpoint_prefixes:
             raise ValueError(
                 "Q8_0 MTP requires BF16 or FP16 checkpoint experts. Use the "
                 "checkpoint's original block-FP8 experts with fp8 or no override."
-            )
-        if not (
-            hasattr(torch.ops._C, "sm70_mtp_q8_0_moe_out")
-            and hasattr(torch.ops._C, "ggml_moe_a8_vec")
-        ):
-            raise ValueError(
-                "Q8_0 MTP requires the SM70 grouped and GGUF vector operators"
             )
         draft_quant_config = MTPExpertQuantConfig(
             draft_quant_config, expert_format="q8_0"
@@ -665,50 +646,12 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         object.__setattr__(self, "_sm70_decode_graph_model", None)
 
     def prepare_sm70_mtp_draft_head(self) -> None:
-        config = self.vllm_config
-        spec = config.speculative_config
-        head = self.lm_head
-        if (
-            spec is None
-            or not spec.draft_qpn8_head
-            or spec.method != "mtp"
-            or spec.num_speculative_tokens not in (4, 5)
-            or spec.draft_sample_method != "greedy"
-            or spec.rejection_sample_method != "standard"
-            or not spec.use_local_argmax_reduction
-            or spec.parallel_drafting
-            or config.parallel_config.tensor_parallel_size != 4
-            or config.parallel_config.pipeline_parallel_size != 1
-            or config.model_config.quantization != "modelopt_fp4"
-            or config.model_config.enable_cumem_allocator
-            or config.weight_transfer_config is not None
-            or config.lora_config is not None
-            or envs.VLLM_BATCH_INVARIANT
-            or not current_platform.is_device_capability((7, 0))
-            or not isinstance(head, VocabParallelEmbedding)
-            or type(head.quant_method) is not UnquantizedEmbeddingMethod
-            or head.num_embeddings != head.org_vocab_size
-            or head.weight.shape != (62080, 2560)
-            or not head.weight.is_cuda
-            or head.weight.dtype != torch.float16
-            or not all(
-                hasattr(torch.ops._C, name)
-                for name in (
-                    "fp8_qpn8_prepare_sm70",
-                    "fp8_qpn8_gemm_sm70_out",
-                    "qwen38_mtp_local_top1_sm70_out",
-                )
-            )
-        ):
-            return
-
+        # The draft-only pack only replaces greedy top-1 selection; full
+        # logits still use the shared FP16 head.
         self.logits_processor = MTPQPN8LogitsProcessor(
-            self.config.vocab_size, head.weight
+            self.config.vocab_size, self.lm_head.weight
         )
-
-    def reload_sm70_mtp_draft_head(self) -> None:
-        if isinstance(self.logits_processor, MTPQPN8LogitsProcessor):
-            self.logits_processor.reload_pack(self.lm_head.weight)
+        logger.info_once("SM70 greedy MTP draft QPN8 head enabled.")
 
     def prepare_sm70_decode_graph_model(self) -> bool:
         if not envs.VLLM_SM70_QWEN38_DUAL_COMPILE:

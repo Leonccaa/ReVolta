@@ -39,17 +39,7 @@ def _make_admitted_draft():
         use_local_argmax_reduction=True,
         parallel_drafting=False,
     )
-    config = SimpleNamespace(
-        speculative_config=spec,
-        parallel_config=SimpleNamespace(
-            tensor_parallel_size=4, pipeline_parallel_size=1
-        ),
-        model_config=SimpleNamespace(
-            quantization="modelopt_fp4", enable_cumem_allocator=False
-        ),
-        weight_transfer_config=None,
-        lora_config=None,
-    )
+    config = SimpleNamespace(speculative_config=spec)
     head = VocabParallelEmbedding.__new__(VocabParallelEmbedding)
     nn.Module.__init__(head)
     head.quant_method = UnquantizedEmbeddingMethod()
@@ -75,9 +65,6 @@ def _make_admitted_draft():
 
 @pytest.fixture
 def native(monkeypatch):
-    monkeypatch.setattr(mtp.current_platform, "is_device_capability", lambda *a: True)
-    monkeypatch.setattr(mtp.envs, "VLLM_BATCH_INVARIANT", False)
-
     def prepare(weight):
         assert weight.shape == (62080, 2560)
         return torch.empty(1, dtype=torch.uint8), torch.ones(1, dtype=torch.float16)
@@ -95,8 +82,6 @@ def native(monkeypatch):
         pairs[:, 1] = start + 7
         calls.append(pairs)
 
-    for name in ("fp8_qpn8_prepare_sm70", "fp8_qpn8_gemm_sm70_out"):
-        monkeypatch.setattr(torch.ops._C, name, object(), raising=False)
     monkeypatch.setattr(
         torch.ops._C, "qwen38_mtp_local_top1_sm70_out", top1, raising=False
     )
@@ -152,46 +137,10 @@ def test_mrv2_load_and_greedy_draft_send_the_native_pair(monkeypatch, native, ro
     assert len(native) == 1
 
 
-@pytest.mark.parametrize(
-    ("group", "field", "value"),
-    [
-        ("speculative_config", "draft_qpn8_head", False),
-        ("speculative_config", "draft_sample_method", "probabilistic"),
-        ("speculative_config", "num_speculative_tokens", 3),
-        ("model_config", "enable_cumem_allocator", True),
-        ("parallel_config", "tensor_parallel_size", 2),
-    ],
-)
-def test_unsupported_admission_retains_original_processor(native, group, field, value):
-    draft = _make_admitted_draft()
-    original = draft.logits_processor
-    setattr(getattr(draft.vllm_config, group), field, value)
-    draft.prepare_sm70_mtp_draft_head()
-    assert draft.logits_processor is original and not native
-
-
-def test_missing_cuda_op_retains_original_processor(monkeypatch, native):
-    draft = _make_admitted_draft()
-    original = draft.logits_processor
-    monkeypatch.delattr(torch.ops._C, "qwen38_mtp_local_top1_sm70_out")
-    draft.prepare_sm70_mtp_draft_head()
-    assert draft.logits_processor is original and not native
-
-
-def test_reload_preserves_packed_storage_and_m9_falls_back(monkeypatch, native):
+def test_more_than_eight_rows_use_the_fp16_head(monkeypatch, native):
     draft = _make_admitted_draft()
     draft.prepare_sm70_mtp_draft_head()
     processor = draft.logits_processor
-    codes, scales = processor.codes, processor.scales
-    monkeypatch.setattr(
-        sm70_mtp_head,
-        "prepare_channel_qpn8_weight",
-        lambda weight: (torch.full_like(codes, 3), torch.full_like(scales, 4)),
-    )
-    draft.reload_sm70_mtp_draft_head()
-    assert processor.codes is codes and codes.tolist() == [3]
-    assert processor.scales is scales and scales.tolist() == [4]
-
     hidden = torch.zeros((9, 2560), dtype=torch.float16)
     monkeypatch.setattr(draft.lm_head, "maybe_get_sm70_lm_head_top1", lambda *a: None)
     monkeypatch.setattr(

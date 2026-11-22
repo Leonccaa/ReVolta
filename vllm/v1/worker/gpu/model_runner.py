@@ -579,12 +579,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         from vllm.v1.worker.gpu_model_runner import GPUModelRunner as GPUModelRunnerV1
 
         GPUModelRunnerV1.reload_weights(self, *args, **kwargs)  # type: ignore[arg-type]
-        if self.speculator is not None:
-            reload_draft_head = getattr(
-                self.speculator.model, "reload_sm70_mtp_draft_head", None
-            )
-            if reload_draft_head is not None:
-                reload_draft_head()
         self.reset_encoder_cache()
         self.reset_mm_cache()
 

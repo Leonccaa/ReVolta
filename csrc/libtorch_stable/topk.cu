@@ -276,10 +276,11 @@ void persistent_topk(const torch::stable::Tensor& logits,
 #endif
 }
 
-void qsa_lexicographic_topk(const torch::stable::Tensor& logits,
-                            const torch::stable::Tensor& lengths,
-                            torch::stable::Tensor& output, int64_t k,
-                            bool decode_batch) {
+template <bool V154>
+static void qsa_lexicographic_topk_impl(const torch::stable::Tensor& logits,
+                                        const torch::stable::Tensor& lengths,
+                                        torch::stable::Tensor& output,
+                                        int64_t k, bool decode_batch) {
 #ifndef USE_ROCM
   STD_TORCH_CHECK(logits.is_cuda(), "logits must be CUDA tensor");
   STD_TORCH_CHECK(lengths.is_cuda(), "lengths must be CUDA tensor");
@@ -315,16 +316,31 @@ void qsa_lexicographic_topk(const torch::stable::Tensor& logits,
                   "logits row stride exceeds uint32 range");
   if (num_rows == 0) return;
 
-  vllm::qsa::launch_qsa_lexicographic_topk<512>(
-      logits.const_data_ptr<float>(), lengths.const_data_ptr<int32_t>(),
-      output.mutable_data_ptr<int32_t>(), static_cast<uint32_t>(num_rows),
-      static_cast<uint32_t>(logits.size(1)),
-      static_cast<uint32_t>(logits.stride(0)), get_current_cuda_stream(),
-      decode_batch);
+  const auto launch = V154 ? vllm::qsa::launch_qsa_lexicographic_topk_v154<512>
+                           : vllm::qsa::launch_qsa_lexicographic_topk<512>;
+  launch(logits.const_data_ptr<float>(), lengths.const_data_ptr<int32_t>(),
+         output.mutable_data_ptr<int32_t>(), static_cast<uint32_t>(num_rows),
+         static_cast<uint32_t>(logits.size(1)),
+         static_cast<uint32_t>(logits.stride(0)), get_current_cuda_stream(),
+         decode_batch);
   const cudaError_t err = cudaGetLastError();
   STD_TORCH_CHECK(err == cudaSuccess,
                   "qsa_lexicographic_topk failed: ", cudaGetErrorString(err));
 #else
   STD_TORCH_CHECK(false, "qsa_lexicographic_topk is not supported on ROCm");
 #endif
+}
+
+void qsa_lexicographic_topk(const torch::stable::Tensor& logits,
+                            const torch::stable::Tensor& lengths,
+                            torch::stable::Tensor& output, int64_t k,
+                            bool decode_batch) {
+  qsa_lexicographic_topk_impl<false>(logits, lengths, output, k, decode_batch);
+}
+
+void qsa_lexicographic_topk_v154(const torch::stable::Tensor& logits,
+                                 const torch::stable::Tensor& lengths,
+                                 torch::stable::Tensor& output, int64_t k,
+                                 bool decode_batch) {
+  qsa_lexicographic_topk_impl<true>(logits, lengths, output, k, decode_batch);
 }

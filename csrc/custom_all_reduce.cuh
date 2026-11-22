@@ -93,6 +93,8 @@ constexpr size_t kSm70Tp4PushAllreduceM16Bytes =
     16 * kSm70GemmaRmsNormHiddenSize * sizeof(half);
 constexpr size_t kSm70Tp4PushAllreduceM32Bytes =
     32 * kSm70GemmaRmsNormHiddenSize * sizeof(half);
+constexpr size_t kSm70Tp4PushAllreduceM64Bytes =
+    2 * kSm70Tp4PushAllreduceM32Bytes;
 constexpr size_t kSm70Tp4PushAllreduceMaxBytes = kSm70Tp4PushAllreduceM32Bytes;
 constexpr size_t kSm70Tp4PushAllreduce8KiBBytes = 4096 * sizeof(half);
 constexpr size_t kSm70Tp4PushAllreduceQwen4ExpBytes = 2560 * sizeof(half);
@@ -737,14 +739,29 @@ DINLINE void sm70_push_store_volatile_16b(const P& value, void* address,
                  "l"(destination));
 }
 
-template <typename P, int ngpus, typename A>
+template <typename P, int ngpus, typename A, int StartRank = 0>
 DINLINE P sm70_push_reduce(P (&values)[ngpus]) {
-  A accumulator = upcast(values[0]);
+  A accumulator = upcast(values[StartRank]);
 #pragma unroll
   for (int rank = 1; rank < ngpus; ++rank) {
-    packed_assign_add(accumulator, upcast(values[rank]));
+    packed_assign_add(accumulator, upcast(values[(StartRank + rank) % ngpus]));
   }
   return downcast<P>(accumulator);
+}
+
+// Match the per-partition accumulation order of the TP4 two-stage reduction.
+template <typename P, typename A>
+DINLINE P sm70_push_reduce_partition(P (&values)[4], int owner) {
+  switch (owner) {
+    case 1:
+      return sm70_push_reduce<P, 4, A, 1>(values);
+    case 2:
+      return sm70_push_reduce<P, 4, A, 2>(values);
+    case 3:
+      return sm70_push_reduce<P, 4, A, 3>(values);
+    default:
+      return sm70_push_reduce<P, 4, A>(values);
+  }
 }
 
 template <typename P, int ngpus, typename A>
@@ -797,7 +814,8 @@ __global__ void __launch_bounds__(512, 1)
   sm70_pack32_barrier_at_end<ngpus>(sg, self_sg, rank);
 }
 
-template <int ngpus>
+template <int ngpus, size_t MaxBytes = kSm70Tp4PushAllreduceMaxBytes,
+          bool RotatedOrder = false>
 __global__ void __launch_bounds__(1024, 1)
     sm70_cross_device_reduce_1stage_push(RankData push_buffers,
                                          const half* __restrict__ input,
@@ -811,7 +829,7 @@ __global__ void __launch_bounds__(1024, 1)
       const_cast<char*>(reinterpret_cast<const char*>(push_buffers.ptrs[rank]));
   auto* local_epochs = reinterpret_cast<uint32_t*>(local_storage);
   const uint32_t epoch = local_epochs[blockIdx.x];
-  constexpr int packed_stride = kSm70Tp4PushAllreduceMaxBytes / sizeof(P);
+  constexpr int packed_stride = MaxBytes / sizeof(P);
   const int epoch_offset = epoch * ngpus * packed_stride;
   const int first_offset = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -851,8 +869,18 @@ __global__ void __launch_bounds__(1024, 1)
       if (!has_empty_slot) break;
     }
 
-    reinterpret_cast<P*>(output)[offset] =
-        sm70_push_reduce<P, ngpus, A>(peer_values);
+    P reduced;
+    if constexpr (RotatedOrder) {
+      // The old two-stage path starts each output partition at its owner rank.
+      // Match that FP32 addition order, including cancellation and signed zero.
+      const int partition = offset / (packed_size / ngpus);
+      const int owner = partition < ngpus ? partition : ngpus - 1;
+      static_assert(ngpus == 4);
+      reduced = sm70_push_reduce_partition<P, A>(peer_values, owner);
+    } else {
+      reduced = sm70_push_reduce<P, ngpus, A>(peer_values);
+    }
+    reinterpret_cast<P*>(output)[offset] = reduced;
 
     P empty;
 #pragma unroll

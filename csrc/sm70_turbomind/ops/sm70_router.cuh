@@ -100,6 +100,88 @@ __global__ void select_kernel(const half* logits, float* weights, int* ids,
              source + row * 10, m, row);
 }
 
+__device__ __forceinline__ void select_batch_row(const half* logits,
+                                                 float* weights, int* ids,
+                                                 int* source, int m, int row) {
+  const int lane = threadIdx.x & 31;
+  unsigned keys[16];
+  bool invalid = false, finite_max = false;
+#pragma unroll
+  for (int i = 0; i < 16; ++i) {
+    const half h = logits[i * 32 + lane];
+    unsigned b = __half_as_ushort(h);
+    invalid |= (b & 0x7fff) > 0x7c00 || b == 0x7c00;
+    finite_max |= b != 0xfc00;
+    keys[i] = key(h, i * 32 + lane);
+  }
+  invalid =
+      __any_sync(0xffffffff, invalid) || !__any_sync(0xffffffff, finite_max);
+  if (invalid) {
+    if (lane < 10) {
+      weights[lane] = 0;
+      ids[lane] = lane;
+      source[lane] = lane * m + row;
+    }
+    return;
+  }
+  // Sort only each lane's sixteen keys, then merge the 32 list heads.
+#pragma unroll
+  for (int width = 2; width <= 16; width *= 2) {
+#pragma unroll
+    for (int distance = width / 2; distance; distance /= 2) {
+#pragma unroll
+      for (int j = 0; j < 16; ++j) {
+        const int other = j ^ distance;
+        if (other > j) {
+          const unsigned a = keys[j], b = keys[other];
+          const bool descending = (j & width) == 0;
+          keys[j] = descending ? max(a, b) : min(a, b);
+          keys[other] = descending ? min(a, b) : max(a, b);
+        }
+      }
+    }
+  }
+  unsigned own_winner = 0;
+  float largest = 0;
+#pragma unroll
+  for (int rank = 0; rank < 10; ++rank) {
+    unsigned head = keys[0];
+    const unsigned winner = warp_max(head);
+    if (rank == 0) largest = unpack(winner);
+    if (lane == rank) own_winner = winner;
+    const bool pop = head == winner;
+#pragma unroll
+    for (int j = 0; j < 15; ++j) keys[j] = pop ? keys[j + 1] : keys[j];
+    keys[15] = pop ? 0 : keys[15];
+  }
+  float exponential = 0.0f;
+  if (lane < 10) {
+    const float scaled = (unpack(own_winner) - largest) * 1.4426950408889634f;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(exponential) : "f"(scaled));
+  }
+  const float e_even = __shfl_sync(0xffffffff, exponential, (lane * 2) & 31);
+  const float e_odd = __shfl_sync(0xffffffff, exponential, (lane * 2 + 1) & 31);
+  const float pair_sum = (lane < 5) ? (e_even + e_odd) : 0.0f;
+  float denominator = warp_sum(pair_sum);
+  denominator = __shfl_sync(0xffffffff, denominator, 0);
+  if (lane < 10) {
+    float norm_w;
+    asm("div.full.f32 %0, %1, %2;"
+        : "=f"(norm_w)
+        : "f"(exponential), "f"(denominator));
+    weights[lane] = norm_w;
+    ids[lane] = 511 - (own_winner & 511);
+    source[lane] = lane * m + row;
+  }
+}
+__global__ void select_batch_kernel(const half* logits, float* weights,
+                                    int* ids, int* source, int m) {
+  const int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  if (row < m)
+    select_batch_row(logits + row * 512, weights + row * 10, ids + row * 10,
+                     source + row * 10, m, row);
+}
+
 // Preserve the quantizer's independent 256-column blocks. In the first
 // block of each row, one warp also produces routing results. Both outputs
 // become ready at the same kernel boundary; no cross-CTA handoff is needed.

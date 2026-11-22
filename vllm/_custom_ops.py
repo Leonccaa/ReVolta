@@ -4335,3 +4335,1330 @@ if hasattr(torch.ops._C, "minimax_allreduce_rms_qk"):
             torch.empty([token_num, q_size], dtype=qkv.dtype, device=qkv.device),
             torch.empty([token_num, kv_size], dtype=qkv.dtype, device=qkv.device),
         )
+
+
+# 1Cat v1.5.4 SM70 native operators. Callers supply the packed inputs and
+# workspaces required by each operator.
+
+
+def fp8_qpn8_block_native_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    codes: torch.Tensor,
+    group_scales: torch.Tensor,
+    split_k: int,
+    k_unroll: int = 0,
+    packed_input: bool = False,
+    gated: bool = False,
+) -> None:
+    torch.ops._C.fp8_qpn8_block_native_sm70_out(
+        out, input, codes, group_scales, split_k, k_unroll, packed_input, gated
+    )
+
+
+def fp8_qpn8_gemm_v154_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    codes: torch.Tensor,
+    group_scales: torch.Tensor,
+    split_k: int,
+    accumulator_chains: int,
+    fast_decoder: bool,
+    prefetch_codes: bool,
+) -> None:
+    torch.ops._C.fp8_qpn8_gemm_v154_sm70_out(
+        out,
+        input,
+        codes,
+        group_scales,
+        split_k,
+        accumulator_chains,
+        fast_decoder,
+        prefetch_codes,
+    )
+
+
+def nvfp4_grouped_w13_raw_sm70_v154_out(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    w: torch.Tensor,
+    scale_codes: torch.Tensor,
+    global_scales: torch.Tensor,
+    ids: torch.Tensor,
+    rows: torch.Tensor,
+    experts: torch.Tensor,
+    sizes: torch.Tensor,
+    total: torch.Tensor,
+    split: int,
+    interleaved: bool,
+) -> None:
+    torch.ops._C.nvfp4_grouped_w13_raw_sm70_v154_out(
+        out,
+        x,
+        w,
+        scale_codes,
+        global_scales,
+        ids,
+        rows,
+        experts,
+        sizes,
+        total,
+        split,
+        interleaved,
+    )
+
+
+def nvfp4_grouped_w13_sm70_v154_out(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    w: torch.Tensor,
+    s: torch.Tensor,
+    ids: torch.Tensor,
+    rows: torch.Tensor,
+    experts: torch.Tensor,
+    sizes: torch.Tensor,
+    total: torch.Tensor,
+    split: int,
+    interleaved: bool,
+) -> None:
+    torch.ops._C.nvfp4_grouped_w13_sm70_v154_out(
+        out, x, w, s, ids, rows, experts, sizes, total, split, interleaved
+    )
+
+
+def nvfp4_grouped_w2_batch_reduce_raw_sm70_v154_out(
+    out: torch.Tensor,
+    routed: torch.Tensor,
+    x: torch.Tensor,
+    w: torch.Tensor,
+    scale_codes: torch.Tensor,
+    global_scales: torch.Tensor,
+    topk: torch.Tensor,
+    rows: torch.Tensor,
+    experts: torch.Tensor,
+    sizes: torch.Tensor,
+    total: torch.Tensor,
+) -> None:
+    torch.ops._C.nvfp4_grouped_w2_batch_reduce_raw_sm70_v154_out(
+        out, routed, x, w, scale_codes, global_scales, topk, rows, experts, sizes, total
+    )
+
+
+def nvfp4_grouped_w2_batch_reduce_sm70_v154_out(
+    out: torch.Tensor,
+    routed: torch.Tensor,
+    x: torch.Tensor,
+    w: torch.Tensor,
+    s: torch.Tensor,
+    topk: torch.Tensor,
+    rows: torch.Tensor,
+    experts: torch.Tensor,
+    sizes: torch.Tensor,
+    total: torch.Tensor,
+) -> None:
+    torch.ops._C.nvfp4_grouped_w2_batch_reduce_sm70_v154_out(
+        out, routed, x, w, s, topk, rows, experts, sizes, total
+    )
+
+
+def nvfp4_grouped_w2_raw_sm70_v154_out(
+    out: torch.Tensor,
+    routed: torch.Tensor,
+    x: torch.Tensor,
+    w: torch.Tensor,
+    scale_codes: torch.Tensor,
+    global_scales: torch.Tensor,
+    topk: torch.Tensor,
+    rows: torch.Tensor,
+    experts: torch.Tensor,
+    sizes: torch.Tensor,
+    total: torch.Tensor,
+) -> None:
+    torch.ops._C.nvfp4_grouped_w2_raw_sm70_v154_out(
+        out, routed, x, w, scale_codes, global_scales, topk, rows, experts, sizes, total
+    )
+
+
+def nvfp4_grouped_w2_sm70_v154_out(
+    out: torch.Tensor,
+    routed: torch.Tensor,
+    x: torch.Tensor,
+    w: torch.Tensor,
+    s: torch.Tensor,
+    topk: torch.Tensor,
+    rows: torch.Tensor,
+    experts: torch.Tensor,
+    sizes: torch.Tensor,
+    total: torch.Tensor,
+) -> None:
+    torch.ops._C.nvfp4_grouped_w2_sm70_v154_out(
+        out, routed, x, w, s, topk, rows, experts, sizes, total
+    )
+
+
+def nvfp4_qpn2_batch_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+    global_scale: float,
+    gated: bool,
+    turbomind_layout: bool = False,
+) -> None:
+    torch.ops._C.nvfp4_qpn2_batch_sm70_out(
+        out, input, codes, scales, global_scale, gated, turbomind_layout
+    )
+
+
+def qsa_lexicographic_topk_v154(
+    logits: torch.Tensor,
+    lengths: torch.Tensor,
+    output: torch.Tensor,
+    k: int,
+    decode_batch: bool = False,
+) -> None:
+    torch.ops._C.qsa_lexicographic_topk_v154(logits, lengths, output, k, decode_batch)
+
+
+def qwen38_gdn_input_batch_sm70_v154_out(
+    qkv: torch.Tensor,
+    z: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    x: torch.Tensor,
+    qw: torch.Tensor,
+    bw: torch.Tensor,
+) -> None:
+    torch.ops._C.qwen38_gdn_input_batch_sm70_v154_out(qkv, z, b, a, x, qw, bw)
+
+
+def qwen38_gdn_input_mtp_batch_sm70_out(
+    qkv: torch.Tensor,
+    z: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    x: torch.Tensor,
+    qw: torch.Tensor,
+    bw: torch.Tensor,
+) -> None:
+    torch.ops._C.qwen38_gdn_input_mtp_batch_sm70_out(qkv, z, b, a, x, qw, bw)
+
+
+def qwen38_mtp_local_top1_sm70_out(
+    pairs: torch.Tensor,
+    partial: torch.Tensor,
+    logits: torch.Tensor,
+    valid: int,
+    start: int,
+) -> None:
+    torch.ops._C.qwen38_mtp_local_top1_sm70_out(pairs, partial, logits, valid, start)
+
+
+def qwen38_ple_gate_norm_sm70_out(
+    gated_value_out: torch.Tensor,
+    normalized_out: torch.Tensor,
+    hidden_states: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    ll_ple_ptr: int,
+    ple_seq: torch.Tensor,
+    norm_key_w: torch.Tensor,
+    norm_query_w: torch.Tensor,
+    norm_conv_w: torch.Tensor,
+    eps: float,
+) -> None:
+    torch.ops._C.qwen38_ple_gate_norm_sm70_out(
+        gated_value_out,
+        normalized_out,
+        hidden_states,
+        key,
+        value,
+        ll_ple_ptr,
+        ple_seq,
+        norm_key_w,
+        norm_query_w,
+        norm_conv_w,
+        eps,
+    )
+
+
+def qwen38_ple_kv_proj_local_sm70_out(
+    key_out: torch.Tensor,
+    val_out: torch.Tensor,
+    embeddings: torch.Tensor,
+    scale: torch.Tensor,
+    key_w: torch.Tensor,
+    val_w: torch.Tensor,
+) -> None:
+    torch.ops._C.qwen38_ple_kv_proj_local_sm70_out(
+        key_out, val_out, embeddings, scale, key_w, val_w
+    )
+
+
+def qwen38_ple_kv_proj_tp4_sm70_out(
+    embeddings: torch.Tensor,
+    scale: torch.Tensor,
+    packed_kv: torch.Tensor,
+    cnt: torch.Tensor,
+    dirty_m: torch.Tensor,
+    ll_ptrs: list[int],
+    seq: torch.Tensor,
+    logical_rank: int,
+) -> None:
+    torch.ops._C.qwen38_ple_kv_proj_tp4_sm70_out(
+        embeddings, scale, packed_kv, cnt, dirty_m, ll_ptrs, seq, logical_rank
+    )
+
+
+def qwen38_ple_spec_add_sm70_out(
+    residual_inout: torch.Tensor,
+    state: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    ids: torch.Tensor,
+    starts: torch.Tensor,
+    accepted: torch.Tensor,
+) -> None:
+    torch.ops._C.qwen38_ple_spec_add_sm70_out(
+        residual_inout, state, x, weight, ids, starts, accepted
+    )
+
+
+def qwen38_ple_spec_sm70_v154_out(
+    output: torch.Tensor,
+    state: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    ids: torch.Tensor,
+    starts: torch.Tensor,
+    accepted: torch.Tensor,
+) -> None:
+    torch.ops._C.qwen38_ple_spec_sm70_v154_out(
+        output, state, x, weight, ids, starts, accepted
+    )
+
+
+def qwen38_qsa_input_batch_sm70_out(
+    qkv: torch.Tensor,
+    idx_qk: torch.Tensor,
+    x: torch.Tensor,
+    qw: torch.Tensor,
+    iw: torch.Tensor,
+) -> None:
+    torch.ops._C.qwen38_qsa_input_batch_sm70_out(qkv, idx_qk, x, qw, iw)
+
+
+def qwen38_qsa_input_mtp_batch_sm70_out(
+    qkv: torch.Tensor,
+    idx_qk: torch.Tensor,
+    x: torch.Tensor,
+    qw: torch.Tensor,
+    iw: torch.Tensor,
+) -> None:
+    torch.ops._C.qwen38_qsa_input_mtp_batch_sm70_out(qkv, idx_qk, x, qw, iw)
+
+
+def qwen38_router_batch_sm70_v154_out(
+    out: torch.Tensor, x: torch.Tensor, packed: torch.Tensor
+) -> None:
+    torch.ops._C.qwen38_router_batch_sm70_v154_out(out, x, packed)
+
+
+def qwen38_shared_down_gated_sm70_out(
+    out: torch.Tensor,
+    hidden_x: torch.Tensor,
+    act_out: torch.Tensor,
+    down_w: torch.Tensor,
+    gate_w: torch.Tensor,
+) -> None:
+    torch.ops._C.qwen38_shared_down_gated_sm70_out(
+        out, hidden_x, act_out, down_w, gate_w
+    )
+
+
+def qwen38_shared_gate_dot_mul_sm70_out(
+    inout: torch.Tensor, x: torch.Tensor, gate_w: torch.Tensor
+) -> None:
+    torch.ops._C.qwen38_shared_gate_dot_mul_sm70_out(inout, x, gate_w)
+
+
+def qwen38_shared_up_batch_fp32_sm70_out(
+    out: torch.Tensor, partial: torch.Tensor, x: torch.Tensor, packed: torch.Tensor
+) -> None:
+    torch.ops._C.qwen38_shared_up_batch_fp32_sm70_out(out, partial, x, packed)
+
+
+def qwen38_shared_up_batch_sm70_v154_out(
+    out: torch.Tensor, partial: torch.Tensor, x: torch.Tensor, packed: torch.Tensor
+) -> None:
+    torch.ops._C.qwen38_shared_up_batch_sm70_v154_out(out, partial, x, packed)
+
+
+def sm70_compact_half_topk_ids_out(
+    x: torch.Tensor, partial: torch.Tensor, ids: torch.Tensor, k: int
+) -> None:
+    torch.ops._C.sm70_compact_half_topk_ids_out(x, partial, ids, k)
+
+
+def sm70_compact_half_topk_out(
+    x: torch.Tensor,
+    partial: torch.Tensor,
+    values: torch.Tensor,
+    ids: torch.Tensor,
+    k: int,
+) -> None:
+    torch.ops._C.sm70_compact_half_topk_out(x, partial, values, ids, k)
+
+
+def sm70_compact_half_topk_wide_revision() -> int:
+    return torch.ops._C.sm70_compact_half_topk_wide_revision()
+
+
+def sm70_dflash2_fp16_dispatch_out(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    packed: torch.Tensor,
+    weight: torch.Tensor,
+    tile: int,
+    warps: int,
+) -> None:
+    torch.ops._C.sm70_dflash2_fp16_dispatch_out(
+        output, input, packed, weight, tile, warps
+    )
+
+
+def sm70_dflash2_fp16_m8_out(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    packed: torch.Tensor,
+    tile: int,
+    warps: int,
+) -> None:
+    torch.ops._C.sm70_dflash2_fp16_m8_out(output, input, packed, tile, warps)
+
+
+def sm70_fp16_candidate_scores_out(
+    scores: torch.Tensor,
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    ids: torch.Tensor,
+    tiled_multirow: bool = False,
+) -> None:
+    torch.ops._C.sm70_fp16_candidate_scores_out(
+        scores, input, weight, ids, tiled_multirow
+    )
+
+
+def sm70_fp16_head_vocab_revision() -> int:
+    return torch.ops._C.sm70_fp16_head_vocab_revision()
+
+
+def sm70_fp16_masked_head_out(
+    scores: torch.Tensor,
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    certified: torch.Tensor,
+    tiled_multirow: bool = False,
+) -> None:
+    torch.ops._C.sm70_fp16_masked_head_out(
+        scores, input, weight, certified, tiled_multirow
+    )
+
+
+def sm70_gdn_verify_out(
+    qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state: torch.Tensor,
+    o: torch.Tensor,
+    cu: torch.Tensor,
+    idx: torch.Tensor,
+    nacc: torch.Tensor | None,
+    H: int,
+    HV: int,
+    scale: float,
+    cfg: int,
+    rbuf: torch.Tensor | None,
+    rn: torch.Tensor | None,
+    ctr: torch.Tensor | None,
+    tmax: int,
+    rmap: torch.Tensor | None = None,
+    ckt: torch.Tensor | None = None,
+    cks: torch.Tensor | None = None,
+) -> None:
+    torch.ops._C.sm70_gdn_verify_out(
+        qkv,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        state,
+        o,
+        cu,
+        idx,
+        nacc,
+        H,
+        HV,
+        scale,
+        cfg,
+        rbuf,
+        rn,
+        ctr,
+        tmax,
+        rmap,
+        ckt,
+        cks,
+    )
+
+
+def sm70_hc_ll_add_all_gather_fc_out(
+    out: torch.Tensor,
+    el: torch.Tensor,
+    hl: torch.Tensor,
+    cnt: torch.Tensor,
+    dirty_m: torch.Tensor,
+    ll_ptrs: list[int],
+    seq: torch.Tensor,
+    logical_rank: int,
+    phys_order: list[int],
+) -> None:
+    torch.ops._C.sm70_hc_ll_add_all_gather_fc_out(
+        out, el, hl, cnt, dirty_m, ll_ptrs, seq, logical_rank, phys_order
+    )
+
+
+def sm70_hc_ll_allreduce_combine_norm_out(
+    res_out: torch.Tensor,
+    norm_out: torch.Tensor,
+    p0: torch.Tensor,
+    p1: torch.Tensor,
+    res: torch.Tensor,
+    inj: torch.Tensor,
+    nw: torch.Tensor,
+    eps: float,
+    cnt: torch.Tensor,
+    dirty_m: torch.Tensor,
+    seq: torch.Tensor,
+    ar_ptrs: list[int],
+    logical_rank: int,
+) -> None:
+    torch.ops._C.sm70_hc_ll_allreduce_combine_norm_out(
+        res_out,
+        norm_out,
+        p0,
+        p1,
+        res,
+        inj,
+        nw,
+        eps,
+        cnt,
+        dirty_m,
+        seq,
+        ar_ptrs,
+        logical_rank,
+    )
+
+
+def sm70_hc_ll_down_out(
+    x: torch.Tensor,
+    wd: torch.Tensor,
+    part: torch.Tensor,
+    cnt: torch.Tensor,
+    ll: list[int],
+    seq: torch.Tensor,
+    rank: int,
+    variant: int,
+    optimized_loads: bool = True,
+) -> None:
+    torch.ops._C.sm70_hc_ll_down_out(
+        x, wd, part, cnt, ll, seq, rank, variant, optimized_loads
+    )
+
+
+def sm70_hc_ll_fused_down_up_out(
+    x: torch.Tensor,
+    wd: torch.Tensor,
+    wu: torch.Tensor,
+    part: torch.Tensor,
+    down_cnt: torch.Tensor,
+    up_cnt: torch.Tensor,
+    down_ll: list[int],
+    up_ll: list[int],
+    down_seq: torch.Tensor,
+    up_seq: torch.Tensor,
+    logical_rank: int,
+    out: torch.Tensor,
+    lora_out: torch.Tensor,
+    inj_out: torch.Tensor,
+) -> None:
+    torch.ops._C.sm70_hc_ll_fused_down_up_out(
+        x,
+        wd,
+        wu,
+        part,
+        down_cnt,
+        up_cnt,
+        down_ll,
+        up_ll,
+        down_seq,
+        up_seq,
+        logical_rank,
+        out,
+        lora_out,
+        inj_out,
+    )
+
+
+def sm70_hc_ll_up_out(
+    ll_lora: int,
+    wu: torch.Tensor,
+    x: torch.Tensor,
+    cnt: torch.Tensor,
+    ll: list[int],
+    seq: torch.Tensor,
+    down_seq: torch.Tensor,
+    rank: int,
+    out: torch.Tensor,
+    lora_out: torch.Tensor,
+    inj_out: torch.Tensor,
+    warps: int,
+    optimized_loads: bool = True,
+) -> None:
+    torch.ops._C.sm70_hc_ll_up_out(
+        ll_lora,
+        wu,
+        x,
+        cnt,
+        ll,
+        seq,
+        down_seq,
+        rank,
+        out,
+        lora_out,
+        inj_out,
+        warps,
+        optimized_loads,
+    )
+
+
+def sm70_hcx_out(
+    p0: torch.Tensor,
+    p1: torch.Tensor | None,
+    res: torch.Tensor,
+    inj: torch.Tensor,
+    nw: torch.Tensor,
+    eps: float,
+    wd: torch.Tensor,
+    wu: torch.Tensor,
+    res_out: torch.Tensor,
+    blk_out: torch.Tensor,
+    inj_out: torch.Tensor,
+    xn: torch.Tensor,
+    sq: torch.Tensor,
+    dpart: torch.Tensor,
+    bar: torch.Tensor,
+    seq: torch.Tensor,
+    ar: list[int],
+    lora: list[int],
+    hb: list[int],
+    rank: int,
+    dbg: torch.Tensor | None,
+    full: int,
+    local_schedule: bool = False,
+) -> None:
+    torch.ops._C.sm70_hcx_out(
+        p0,
+        p1,
+        res,
+        inj,
+        nw,
+        eps,
+        wd,
+        wu,
+        res_out,
+        blk_out,
+        inj_out,
+        xn,
+        sq,
+        dpart,
+        bar,
+        seq,
+        ar,
+        lora,
+        hb,
+        rank,
+        dbg,
+        full,
+        local_schedule,
+    )
+
+
+def sm70_mtp_moe_bf16_out(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    w: torch.Tensor,
+    ids: torch.Tensor,
+    weights: torch.Tensor,
+    padded: torch.Tensor,
+    down: bool,
+) -> None:
+    torch.ops._C.sm70_mtp_moe_bf16_out(out, x, w, ids, weights, padded, down)
+
+
+def sm70_mtp_moe_fp16_v154_out(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    w: torch.Tensor,
+    ids: torch.Tensor,
+    weights: torch.Tensor,
+    padded: torch.Tensor,
+    down: bool,
+) -> None:
+    torch.ops._C.sm70_mtp_moe_fp16_v154_out(out, x, w, ids, weights, padded, down)
+
+
+def sm70_mtp_moe_u13_out(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    w: torch.Tensor,
+    ids: torch.Tensor,
+    weights: torch.Tensor,
+    padded: torch.Tensor,
+    down: bool,
+) -> None:
+    torch.ops._C.sm70_mtp_moe_u13_out(out, x, w, ids, weights, padded, down)
+
+
+def sm70_qwen38_hc_batch_cta8(
+    fa: int,
+    input: torch.Tensor,
+    packed_down: torch.Tensor,
+    packed_up: torch.Tensor,
+    partials: torch.Tensor,
+    lora: torch.Tensor,
+    local_output: torch.Tensor,
+    output: torch.Tensor,
+    injection: torch.Tensor,
+) -> None:
+    torch.ops._C.sm70_qwen38_hc_batch_cta8(
+        fa,
+        input,
+        packed_down,
+        packed_up,
+        partials,
+        lora,
+        local_output,
+        output,
+        injection,
+    )
+
+
+def sm70_ring_atomic_allreduce_out(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    addresses: torch.Tensor,
+    counters: torch.Tensor,
+    rank_order: list[int],
+    rank: int,
+    capacity: int,
+    block_packets: bool = False,
+) -> None:
+    torch.ops._C.sm70_ring_atomic_allreduce_out(
+        output, input, addresses, counters, rank_order, rank, capacity, block_packets
+    )
+
+
+def sm70_ring_close_mem_handle(pointer: int) -> None:
+    torch.ops._C.sm70_ring_close_mem_handle(pointer)
+
+
+def sm70_ring_native_peer_atomics(source: int, destination: int) -> bool:
+    return torch.ops._C.sm70_ring_native_peer_atomics(source, destination)
+
+
+def sm70_sampler_graph_attach_branch(
+    flags: torch.Tensor,
+    parent_handle: int,
+    reference_handle: int,
+    compact_handle: int,
+    counters: torch.Tensor | None = None,
+) -> int:
+    from vllm._sm70_ops import _maybe_load_sm70_sampler_library
+
+    _maybe_load_sm70_sampler_library()
+    return torch.ops._C.sm70_sampler_graph_attach_branch(
+        flags, parent_handle, reference_handle, compact_handle, counters
+    )
+
+
+def sm70_sampler_graph_prepare_collective(
+    flags: torch.Tensor, graph_handle: int
+) -> int:
+    from vllm._sm70_ops import _maybe_load_sm70_sampler_library
+
+    _maybe_load_sm70_sampler_library()
+    return torch.ops._C.sm70_sampler_graph_prepare_collective(flags, graph_handle)
+
+
+def sm70_top1x_out(
+    out: torch.Tensor,
+    pairs: torch.Tensor,
+    buffers: list[int],
+    seq: torch.Tensor,
+    rank: int,
+) -> None:
+    torch.ops._C.sm70_top1x_out(out, pairs, buffers, seq, rank)
+
+
+def sm70_tp4_push_m64_buffer_size() -> int:
+    return torch.ops._C.sm70_tp4_push_m64_buffer_size()
+
+
+def sm70_tp4_push_m64_out(
+    out: torch.Tensor, input: torch.Tensor, ipc_ptrs: list[int], rank: int
+) -> None:
+    torch.ops._C.sm70_tp4_push_m64_out(out, input, ipc_ptrs, rank)
+
+
+def sm70_qsa_device_dcp2_combine_gate(
+    partial_out: torch.Tensor,
+    partial_lse: torch.Tensor,
+    gate: torch.Tensor,
+    out: torch.Tensor,
+    my_buf_ptr: int,
+    peer_buf_ptr: int,
+    seq_state: torch.Tensor,
+    dcp_rank: int,
+) -> None:
+    from importlib import import_module
+
+    import_module("vllm._sm70_qsa_device_C")
+    torch.ops.vllm_sm70_qsa_device.dcp2_combine_gate(
+        partial_out,
+        partial_lse,
+        gate,
+        out,
+        my_buf_ptr,
+        peer_buf_ptr,
+        seq_state,
+        dcp_rank,
+    )
+
+
+def sm70_qsa_device_dcp2_q_prep(
+    query: torch.Tensor,
+    gathered_q: torch.Tensor,
+    positions: torch.Tensor,
+    lengths: torch.Tensor,
+    local_positions: torch.Tensor,
+    local_lengths: torch.Tensor,
+    my_buf_ptr: int,
+    peer_buf_ptr: int,
+    seq_state: torch.Tensor,
+    dcp_rank: int,
+    interleave: int,
+) -> None:
+    from importlib import import_module
+
+    import_module("vllm._sm70_qsa_device_C")
+    torch.ops.vllm_sm70_qsa_device.dcp2_q_prep(
+        query,
+        gathered_q,
+        positions,
+        lengths,
+        local_positions,
+        local_lengths,
+        my_buf_ptr,
+        peer_buf_ptr,
+        seq_state,
+        dcp_rank,
+        interleave,
+    )
+
+
+def sm70_qsa_device_prep_write(
+    qkv: torch.Tensor,
+    pos: torch.Tensor,
+    cos_sin: torch.Tensor,
+    qw: torch.Tensor,
+    kw: torch.Tensor,
+    eps: float,
+    query_out: torch.Tensor,
+    key_out: torch.Tensor,
+    slots: torch.Tensor,
+    history: torch.Tensor,
+    scales: torch.Tensor,
+    tags: torch.Tensor,
+    page_slots: torch.Tensor,
+    hot: torch.Tensor,
+    hot_scales: torch.Tensor | None,
+    epoch: torch.Tensor,
+) -> None:
+    from importlib import import_module
+
+    import_module("vllm._sm70_qsa_device_C")
+    torch.ops.vllm_sm70_qsa_device.prep_write(
+        qkv,
+        pos,
+        cos_sin,
+        qw,
+        kw,
+        eps,
+        query_out,
+        key_out,
+        slots,
+        history,
+        scales,
+        tags,
+        page_slots,
+        hot,
+        hot_scales,
+        epoch,
+    )
+
+
+def sm70_qsa_device_resolve_hot(
+    history: torch.Tensor,
+    scales: torch.Tensor,
+    hot: torch.Tensor,
+    hot_scales: torch.Tensor | None,
+    tags: torch.Tensor,
+    stamps: torch.Tensor,
+    epoch: torch.Tensor,
+    hands: torch.Tensor,
+    page_slots: torch.Tensor,
+    stats: torch.Tensor,
+    miss_queue: torch.Tensor,
+    indices: torch.Tensor,
+    table: torch.Tensor,
+    requests: torch.Tensor,
+    positions: torch.Tensor,
+    lengths: torch.Tensor,
+    virtual_positions: torch.Tensor,
+    virtual_lengths: torch.Tensor,
+    resolved: torch.Tensor,
+) -> None:
+    from importlib import import_module
+
+    import_module("vllm._sm70_qsa_device_C")
+    torch.ops.vllm_sm70_qsa_device.resolve_hot(
+        history,
+        scales,
+        hot,
+        hot_scales,
+        tags,
+        stamps,
+        epoch,
+        hands,
+        page_slots,
+        stats,
+        miss_queue,
+        indices,
+        table,
+        requests,
+        positions,
+        lengths,
+        virtual_positions,
+        virtual_lengths,
+        resolved,
+    )
+
+
+def sm70_qsa_device_run(
+    q: torch.Tensor,
+    history: torch.Tensor,
+    scales: torch.Tensor,
+    indices: torch.Tensor,
+    table: torch.Tensor,
+    requests: torch.Tensor,
+    positions: torch.Tensor,
+    lengths: torch.Tensor,
+    out: torch.Tensor,
+    gate: torch.Tensor | None,
+    partial: torch.Tensor,
+    state: torch.Tensor,
+    lse: torch.Tensor | None = None,
+) -> None:
+    from importlib import import_module
+
+    import_module("vllm._sm70_qsa_device_C")
+    torch.ops.vllm_sm70_qsa_device.run(
+        q,
+        history,
+        scales,
+        indices,
+        table,
+        requests,
+        positions,
+        lengths,
+        out,
+        gate,
+        partial,
+        state,
+        lse,
+    )
+
+
+def sm70_qsa_device_run_hot(
+    q: torch.Tensor,
+    history: torch.Tensor,
+    scales: torch.Tensor,
+    indices: torch.Tensor,
+    table: torch.Tensor,
+    requests: torch.Tensor,
+    positions: torch.Tensor,
+    lengths: torch.Tensor,
+    out: torch.Tensor,
+    gate: torch.Tensor | None,
+    partial: torch.Tensor,
+    state: torch.Tensor,
+    hot: torch.Tensor,
+    resolved: torch.Tensor,
+    tiles: int = 1,
+    page_slots: torch.Tensor | None = None,
+    tags: torch.Tensor | None = None,
+    lse: torch.Tensor | None = None,
+) -> None:
+    from importlib import import_module
+
+    import_module("vllm._sm70_qsa_device_C")
+    torch.ops.vllm_sm70_qsa_device.run_hot(
+        q,
+        history,
+        scales,
+        indices,
+        table,
+        requests,
+        positions,
+        lengths,
+        out,
+        gate,
+        partial,
+        state,
+        hot,
+        resolved,
+        tiles,
+        page_slots,
+        tags,
+        lse,
+    )
+
+
+def sm70_qsa_device_run_hot_fp8(
+    q: torch.Tensor,
+    history: torch.Tensor,
+    scales: torch.Tensor,
+    indices: torch.Tensor,
+    table: torch.Tensor,
+    requests: torch.Tensor,
+    positions: torch.Tensor,
+    lengths: torch.Tensor,
+    out: torch.Tensor,
+    gate: torch.Tensor | None,
+    partial: torch.Tensor,
+    state: torch.Tensor,
+    hot: torch.Tensor,
+    resolved: torch.Tensor,
+    hot_scales: torch.Tensor,
+    tiles: int = 1,
+    page_slots: torch.Tensor | None = None,
+    tags: torch.Tensor | None = None,
+    lse: torch.Tensor | None = None,
+) -> None:
+    from importlib import import_module
+
+    import_module("vllm._sm70_qsa_device_C")
+    torch.ops.vllm_sm70_qsa_device.run_hot_fp8(
+        q,
+        history,
+        scales,
+        indices,
+        table,
+        requests,
+        positions,
+        lengths,
+        out,
+        gate,
+        partial,
+        state,
+        hot,
+        resolved,
+        hot_scales,
+        tiles,
+        page_slots,
+        tags,
+        lse,
+    )
+
+
+def sm70_qsa_device_run_rows(
+    q: torch.Tensor,
+    history: torch.Tensor,
+    scales: torch.Tensor,
+    indices: torch.Tensor,
+    table: torch.Tensor,
+    requests: torch.Tensor,
+    positions: torch.Tensor,
+    lengths: torch.Tensor,
+    out: torch.Tensor,
+    gate: torch.Tensor | None,
+    occupancy: int = 3,
+    lse: torch.Tensor | None = None,
+) -> None:
+    from importlib import import_module
+
+    import_module("vllm._sm70_qsa_device_C")
+    torch.ops.vllm_sm70_qsa_device.run_rows(
+        q,
+        history,
+        scales,
+        indices,
+        table,
+        requests,
+        positions,
+        lengths,
+        out,
+        gate,
+        occupancy,
+        lse,
+    )
+
+
+def sm70_qsa_device_run_rows_window(
+    q: torch.Tensor,
+    history: torch.Tensor,
+    scales: torch.Tensor,
+    indices: torch.Tensor,
+    table: torch.Tensor,
+    requests: torch.Tensor,
+    positions: torch.Tensor,
+    lengths: torch.Tensor,
+    partial: torch.Tensor,
+    state: torch.Tensor,
+    occupancy: int = 12,
+) -> None:
+    from importlib import import_module
+
+    import_module("vllm._sm70_qsa_device_C")
+    torch.ops.vllm_sm70_qsa_device.run_rows_window(
+        q,
+        history,
+        scales,
+        indices,
+        table,
+        requests,
+        positions,
+        lengths,
+        partial,
+        state,
+        occupancy,
+    )
+
+
+def sm70_qsa_device_run_tiled(
+    q: torch.Tensor,
+    history: torch.Tensor,
+    scales: torch.Tensor,
+    indices: torch.Tensor,
+    table: torch.Tensor,
+    requests: torch.Tensor,
+    positions: torch.Tensor,
+    lengths: torch.Tensor,
+    out: torch.Tensor,
+    gate: torch.Tensor | None,
+    partial: torch.Tensor,
+    state: torch.Tensor,
+    step: int,
+    tiles: int = 1,
+    lse: torch.Tensor | None = None,
+) -> None:
+    from importlib import import_module
+
+    import_module("vllm._sm70_qsa_device_C")
+    torch.ops.vllm_sm70_qsa_device.run_tiled(
+        q,
+        history,
+        scales,
+        indices,
+        table,
+        requests,
+        positions,
+        lengths,
+        out,
+        gate,
+        partial,
+        state,
+        step,
+        tiles,
+        lse,
+    )
+
+
+def sm70_qsa_device_run_tiled_window(
+    q: torch.Tensor,
+    history: torch.Tensor,
+    scales: torch.Tensor,
+    indices: torch.Tensor,
+    table: torch.Tensor,
+    requests: torch.Tensor,
+    positions: torch.Tensor,
+    lengths: torch.Tensor,
+    partial: torch.Tensor,
+    state: torch.Tensor,
+    window_out: torch.Tensor,
+    window_state: torch.Tensor,
+    step: int,
+    tiles: int = 1,
+) -> None:
+    from importlib import import_module
+
+    import_module("vllm._sm70_qsa_device_C")
+    torch.ops.vllm_sm70_qsa_device.run_tiled_window(
+        q,
+        history,
+        scales,
+        indices,
+        table,
+        requests,
+        positions,
+        lengths,
+        partial,
+        state,
+        window_out,
+        window_state,
+        step,
+        tiles,
+    )
+
+
+def sm70_qsa_device_stage_host_run(
+    history: torch.Tensor,
+    scales: torch.Tensor,
+    out: torch.Tensor,
+    out_scales: torch.Tensor,
+    source_page: int,
+    target_page: int,
+    pages: int,
+) -> bool:
+    from importlib import import_module
+
+    import_module("vllm._sm70_qsa_device_C")
+    return torch.ops.vllm_sm70_qsa_device.stage_host_run(
+        history, scales, out, out_scales, source_page, target_page, pages
+    )
+
+
+def sm70_qsa_device_warm_hot_staged(
+    staged_history: torch.Tensor,
+    staged_scales: torch.Tensor,
+    hot: torch.Tensor,
+    hot_scales: torch.Tensor | None,
+    tags: torch.Tensor,
+    stamps: torch.Tensor,
+    epoch: torch.Tensor,
+    hands: torch.Tensor,
+    page_slots: torch.Tensor,
+    table: torch.Tensor,
+    staged_table: torch.Tensor,
+    lengths: torch.Tensor,
+    num_blocks: int,
+) -> None:
+    from importlib import import_module
+
+    import_module("vllm._sm70_qsa_device_C")
+    torch.ops.vllm_sm70_qsa_device.warm_hot_staged(
+        staged_history,
+        staged_scales,
+        hot,
+        hot_scales,
+        tags,
+        stamps,
+        epoch,
+        hands,
+        page_slots,
+        table,
+        staged_table,
+        lengths,
+        num_blocks,
+    )
+
+
+def sm70_qsa_indexer_run_batch(
+    scores: torch.Tensor,
+    visible: torch.Tensor,
+    q: torch.Tensor,
+    cache: torch.Tensor,
+    table: torch.Tensor,
+    requests: torch.Tensor,
+    positions: torch.Tensor,
+    lengths: torch.Tensor,
+    divisor: float,
+    compress: int,
+) -> None:
+    from importlib import import_module
+
+    import_module("vllm._sm70_qsa_indexer_C")
+    torch.ops.vllm_sm70_qsa_indexer.run_batch(
+        scores,
+        visible,
+        q,
+        cache,
+        table,
+        requests,
+        positions,
+        lengths,
+        divisor,
+        compress,
+    )
+
+
+def sm70_qsa_indexer_run_topk(
+    output: torch.Tensor,
+    scores: torch.Tensor,
+    visible: torch.Tensor,
+    ws_hist: torch.Tensor,
+    ws_greater: torch.Tensor,
+    ws_tie_keys: torch.Tensor,
+    ws_tie_idx: torch.Tensor,
+    ws_meta: torch.Tensor,
+    q: torch.Tensor,
+    cache: torch.Tensor,
+    table: torch.Tensor,
+    requests: torch.Tensor,
+    positions: torch.Tensor,
+    lengths: torch.Tensor,
+    divisor: float,
+    compress: int,
+) -> None:
+    from importlib import import_module
+
+    import_module("vllm._sm70_qsa_indexer_C")
+    torch.ops.vllm_sm70_qsa_indexer.run_topk(
+        output,
+        scores,
+        visible,
+        ws_hist,
+        ws_greater,
+        ws_tie_keys,
+        ws_tie_idx,
+        ws_meta,
+        q,
+        cache,
+        table,
+        requests,
+        positions,
+        lengths,
+        divisor,
+        compress,
+    )
+
+
+def sm70_router_top10_batch(
+    weights: torch.Tensor, ids: torch.Tensor, source: torch.Tensor, logits: torch.Tensor
+) -> None:
+    from importlib import import_module
+
+    import_module("vllm._sm70_router_C")
+    torch.ops.vllm_sm70_router.top10_batch(weights, ids, source, logits)

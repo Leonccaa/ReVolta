@@ -399,6 +399,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/tm_registry_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/fp8_qpn8_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/mtp_local_top1_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/fp8_qpn8_sm70_v154.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/mxfp4_qpn_m1_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/awq_qpn_m1_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/awq_grouped_decode_sm70.cu"
@@ -413,9 +414,23 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/nvfp4_qpn4_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/qwen38_prefill_cutlass.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/nvfp4_qpn2_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/nvfp4_qpn2_batch_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/skinny_moe_qpn_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/glm53_fp16_gemv_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/glm53_cublaslt_sm70.cpp"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/compact_half_topk_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/dflash2_fp16_m8_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gdn_verify_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/hc_ll_shard_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/mtp_local_top1_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/mtp_q8_moe_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/top1x_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/qwen38_gdn_input_batch_sm70_v154.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/qwen38_ple_spec_sm70_v154.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/nvfp4_grouped_decode_sm70_v154.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/mtp_moe_fp16_sm70_v154.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/hcx_sm70.cu"
+      "csrc/sm70_ring_collectives.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/awq_sm70_gemm.cu")
     list(APPEND VLLM_SM70_TURBOMIND_SRCS
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_dequant_sm70.cu"
@@ -738,7 +753,8 @@ endif()
 if(VLLM_GPU_LANG STREQUAL "CUDA" AND SM70_TURBOMIND_ARCHS)
   set(VLLM_SM70_SAMPLER_FRAGMENT_SRCS
     "csrc/sm70_turbomind/ops/sm70_top20_philox_fragment.cpp"
-    "csrc/sm70_turbomind/ops/sm70_top20_philox_sampler.cu")
+    "csrc/sm70_turbomind/ops/sm70_top20_philox_sampler.cu"
+    "csrc/sm70_turbomind/ops/sm70_sampler_graph_branch.cu")
   set_gencode_flags_for_srcs(
     SRCS "${VLLM_SM70_SAMPLER_FRAGMENT_SRCS}"
     CUDA_ARCHS "${SM70_TURBOMIND_ARCHS}")
@@ -758,6 +774,12 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" AND SM70_TURBOMIND_ARCHS)
     CUDA_STANDARD 17
     CUDA_STANDARD_REQUIRED ON
     CUDA_EXTENSIONS OFF)
+  if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.8")
+    set_target_properties(_sm70_sampler_C PROPERTIES
+      CUDA_ARCHITECTURES 70
+      CUDA_SEPARABLE_COMPILATION ON
+      CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+  endif()
   target_compile_definitions(_sm70_sampler_C PRIVATE
     TORCH_API_INCLUDE_EXTENSION_H
     $<$<COMPILE_LANGUAGE:CUDA>:__CUDA_NO_HALF_OPERATORS__>
@@ -811,6 +833,14 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" AND SM70_TURBOMIND_ARCHS)
     _sm70_qsa_indexer_C DESTINATION vllm LANGUAGE CUDA
     SOURCES "csrc/sm70_turbomind/ops/qsa_indexer_sm70.cu"
             "csrc/sm70_turbomind/ops/qsa_paged_fp16_h12.cu"
+            "csrc/sm70_turbomind/ops/qsa_indexer_sm70_v154.cu"
+    COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+    ARCHITECTURES "70"
+    LIBRARIES "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so"
+    WITH_SOABI)
+  define_extension_target(
+    _sm70_qsa_device_C DESTINATION vllm LANGUAGE CUDA
+    SOURCES "csrc/sm70_turbomind/ops/qsa_device_history_sm70.cu"
     COMPILE_FLAGS ${VLLM_GPU_FLAGS}
     ARCHITECTURES "70"
     LIBRARIES "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so"

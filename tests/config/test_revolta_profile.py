@@ -15,6 +15,8 @@ import torch
 
 from vllm import envs
 
+SHARED_EXPERT_OVERLAP = "VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP"
+
 # Independent contract: do not derive expected values from implementation tables.
 COMMON = {
     "VLLM_SM70_QWEN38_WIDE_M": "1",
@@ -767,29 +769,55 @@ def test_dflash_leaves_every_other_default_alone(profile):
         model(), 4, is_sm70=True, speculative_method="dflash"
     )
     dflash = dict(os.environ)
+    assert dflash[SHARED_EXPERT_OVERLAP] == "1"
     os.environ.clear()
     assert profile.apply_revolta_profile(
         model(), 4, is_sm70=True, speculative_method="mtp"
     )
+    assert os.environ[SHARED_EXPERT_OVERLAP] == "0"
     changed = {
         k
         for k in set(dflash) | set(os.environ)
         if k not in ("PYTEST_CURRENT_TEST", "VLLM_REVOLTA_PROFILE_PROVENANCE")
         and dflash.get(k) != os.environ.get(k)
     }
-    assert changed == {GRAPH_RESERVE, TAIL_GRAPHS}
+    assert changed == {GRAPH_RESERVE, TAIL_GRAPHS, SHARED_EXPERT_OVERLAP}
 
 
 def test_later_call_refines_only_the_profile_value(profile, monkeypatch):
     # EngineArgs without the method, then VllmConfig with the resolved one.
     assert profile.apply_revolta_profile(model(), 4, is_sm70=True)
     assert os.environ[GRAPH_RESERVE] == "700"
+    assert os.environ[SHARED_EXPERT_OVERLAP] == "0"
     assert profile.apply_revolta_profile(
         model(), 4, is_sm70=True, speculative_method="dflash"
     )
     assert os.environ[GRAPH_RESERVE] == "1200"
+    assert os.environ[SHARED_EXPERT_OVERLAP] == "1"
     row = json.loads(profile.profile_audit(enabled=True))["values"][GRAPH_RESERVE]
     assert row == {"value": "1200", "source": "profile"}
+
+
+@pytest.mark.parametrize(
+    ("allowed", "override"), [(False, None), (True, "0"), (False, "1")]
+)
+def test_awq_dflash_shared_expert_overlap_gate(profile, monkeypatch, allowed, override):
+    if override is not None:
+        monkeypatch.setenv(SHARED_EXPERT_OVERLAP, override)
+    assert profile.apply_revolta_profile(
+        model(),
+        4,
+        is_sm70=True,
+        speculative_method="dflash",
+        allow_shared_expert_overlap=allowed,
+    )
+    row = json.loads(profile.profile_audit(enabled=True))["values"][
+        SHARED_EXPERT_OVERLAP
+    ]
+    assert row == {
+        "value": override or "0",
+        "source": "environment" if override is not None else "profile",
+    }
 
 
 def test_explicit_graph_reserve_wins_over_dflash(profile, monkeypatch):

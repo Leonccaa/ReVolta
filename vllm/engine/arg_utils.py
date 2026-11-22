@@ -2068,6 +2068,9 @@ class EngineArgs:
                 disable_custom_all_reduce=self.disable_custom_all_reduce
             ),
             speculative_method=(self.speculative_config or {}).get("method"),
+            allow_shared_expert_overlap=not (
+                self.enable_expert_parallel or self.enable_dbo
+            ),
         )
         self._maybe_apply_sm70_mtp_defaults(usage_context, model_config)
         self._set_default_chunked_prefill_and_prefix_caching_args(model_config)

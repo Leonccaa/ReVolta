@@ -13037,30 +13037,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP": env_var(
         lambda: bool(int(os.getenv("VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP", "0"))),
         description=(
-            "Allows shared-expert stream overlap on eligible "
-            "Qwen3Next/Qwen4Exp layers. Default enabled by the Qwen4Exp "
-            "policy, otherwise the standalone getter is off. Set 0 to diagnose "
-            "stream ordering; placement and DBO guards still decide "
-            "eligibility."
+            "Allows eligible Qwen3Next/Qwen4Exp layers to run shared experts "
+            "on a separate CUDA stream."
         ),
         category="configuration",
         declared_default="False",
         effective_default=(
-            "False; configuration may replace the unset default under the "
-            "automatic conditions below.; ReVolta FP16 QSA SM70 TP4 profile sets "
-            "'0' under automatic_conditions."
+            "False. The FP16 QSA SM70 TP4 profile enables overlap for native g32 AWQ "
+            "with DFlash2, expert parallelism off, and dual batch overlap off. "
+            "An explicit environment value takes precedence."
         ),
         automatic_conditions=(
-            (
-                "vllm/config/vllm.py:_apply_sm70_qwen38_decode_defaults sets '1' when "
-                "name not in os.environ; automatic defaults apply only when the "
-                "environment override is absent."
-            ),
-            (
-                "vllm/revolta_profile.py:apply_revolta_profile sets '0' when all "
-                "visible CUDA devices are SM70, selector metadata describes QSA, "
-                "activation dtype is FP16 and TP=4; explicit environment values win."
-            ),
+            "vllm/revolta_profile.py:apply_revolta_profile enables the AWQ+DFlash2 "
+            "profile setting under the conditions above. Other TP4 profile "
+            "configurations receive '0'.",
+            "vllm/config/vllm.py:_apply_sm70_qwen38_decode_defaults can enable "
+            "overlap for eligible decode with expert parallelism and DBO disabled "
+            "when the environment value is still unset.",
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
         user_visible=True,

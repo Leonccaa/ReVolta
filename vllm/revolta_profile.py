@@ -64,6 +64,7 @@ DFLASH_DEFAULTS = {
     "VLLM_V2_CUDAGRAPH_MEM_MIB": "1200",
     "VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS": "0",
 }
+AWQ_DFLASH_DEFAULTS = {"VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP": "1"}
 # With a planar KV cache (fp8_per_token_head, the QSA auto choice, or int8) the
 # graphs are smaller than with the scalar FP8 cache. Measured per GPU on TP4:
 # DFlash2 0.92 GiB (AWQ; 1.13 GiB with fp8_e4m3) and 0.95 GiB (NVFP4); MTP4
@@ -330,6 +331,7 @@ def apply_revolta_profile(
     is_sm70: bool,
     interconnect_mode: InterconnectMode = "pex_p2p",
     speculative_method: str | None = None,
+    allow_shared_expert_overlap: bool = True,
     kv_cache_dtype: str | None = None,
     num_speculative_tokens_per_batch_size: list[tuple[int, int, int]] | None = None,
 ) -> bool:
@@ -363,6 +365,8 @@ def apply_revolta_profile(
             defaults.update(AWQ_DEFAULTS)
             if speculative_method == "dflash":
                 defaults.update(DFLASH_DEFAULTS)
+                if allow_shared_expert_overlap:
+                    defaults.update(AWQ_DFLASH_DEFAULTS)
                 if kv_cache_dtype in PLANAR_KV_DTYPES:
                     defaults.update(AWQ_DFLASH_PLANAR_KV_DEFAULTS)
             elif speculative_method == "mtp" and kv_cache_dtype in PLANAR_KV_DTYPES:

@@ -26,6 +26,15 @@ _SMALL_M_MAX_ROWS = 64
 _MMQ_MAX_ROWS = 2048
 
 
+def supports_q8_0_expert_shape(hidden_size: int, local_width: int, top_k: int) -> bool:
+    return (
+        hidden_size % _BLOCK == 0
+        and local_width % _BLOCK == 0
+        and 1 <= top_k <= 16
+        and max(hidden_size, top_k * local_width) // _BLOCK * _Q8_1_BYTES <= 44 * 1024
+    )
+
+
 def quantize_q8_0(weight: torch.Tensor) -> torch.Tensor:
     """Pack one FP16/BF16 expert shard into Q8_0 blocks."""
     blocks = weight.float().reshape(-1, _BLOCK)
@@ -60,12 +69,7 @@ class MTPQ80MoEMethod(FusedMoEMethodBase):
             // _BLOCK
             * _Q8_1_BYTES
         )
-        if (
-            hidden_size % _BLOCK
-            or local_width % _BLOCK
-            or not 1 <= top_k <= 16
-            or max(hidden_size, top_k * local_width) // _BLOCK * _Q8_1_BYTES > 44 * 1024
-        ):
+        if not supports_q8_0_expert_shape(hidden_size, local_width, top_k):
             raise ValueError("Unsupported Q8_0 MTP expert shape or top-k")
         self.hidden = hidden_size
         self.local_width = local_width
@@ -94,13 +98,8 @@ class MTPQ80MoEMethod(FusedMoEMethodBase):
         full_width = local_width * layer.tp_size
         is_down = shard_id == "w2"
         expected = (self.hidden, full_width) if is_down else (full_width, self.hidden)
-        if weight.shape != expected or weight.dtype not in (
-            torch.bfloat16,
-            torch.float16,
-        ):
-            raise ValueError(
-                "Q8_0 MTP requires BF16 or FP16 checkpoint expert projections"
-            )
+        if weight.shape != expected or not weight.is_floating_point():
+            raise ValueError("Q8_0 MTP requires floating-point checkpoint experts")
         start = layer.tp_rank * local_width
         local = weight.narrow(1 if is_down else 0, start, local_width)
         target = param[expert_id]

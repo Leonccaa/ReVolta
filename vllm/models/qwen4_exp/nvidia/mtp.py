@@ -189,15 +189,9 @@ def _mtp_fp8_experts_supported(
     )
 
 
-def _make_draft_vllm_config(
-    vllm_config: VllmConfig,
-    mtp_start_layer_idx: int,
-) -> VllmConfig:
-    """Ensure that the draft model config is set in the vLLM config."""
-    speculative_config = vllm_config.speculative_config
-    if speculative_config is None or speculative_config.draft_model_config is None:
-        raise ValueError("speculative_config.draft_model_config must be set")
-
+def _get_mtp_quant_config(
+    vllm_config: VllmConfig, mtp_start_layer_idx: int
+) -> QuantizationConfig | None:
     draft_quant_config = get_draft_quant_config(vllm_config)
 
     # inject packed and ignored modules to the quantization config of draft model
@@ -225,6 +219,85 @@ def _make_draft_vllm_config(
                 _remap_quantized_layers(quantized_layers, mtp_start_layer_idx),
             )
 
+    return draft_quant_config
+
+
+def _mtp_expert_prefixes(config, mtp_start_layer_idx: int) -> set[str]:
+    return {
+        f"mtp.layers.{mtp_start_layer_idx + index}.mlp.experts"
+        for index in range(getattr(config, "mtp_num_hidden_layers", 1))
+    }
+
+
+def resolve_mtp_expert_default(vllm_config: VllmConfig) -> None:
+    """Default SM70 Qwen4Exp MTP routed experts to Q8_0 when the draft
+    checkpoint stores them as floating-point or block-FP8 tensors."""
+    from vllm.model_executor.layers.quantization.awq import AWQConfig
+    from vllm.model_executor.layers.quantization.awq_marlin import AWQMarlinConfig
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptMixedPrecisionConfig,
+        ModelOptQuantConfigBase,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        is_layer_skipped,
+    )
+
+    from .mtp_fp8_experts import checkpoint_fp8_prefixes
+    from .mtp_q8_experts import supports_q8_0_expert_shape
+
+    spec = vllm_config.speculative_config
+    assert spec is not None and spec.draft_model_config is not None
+    draft = spec.draft_model_config
+    if draft.dtype != torch.float16 or spec.rejection_sample_method != "standard":
+        return
+    config = draft.hf_text_config
+    local_width, remainder = divmod(
+        config.moe_intermediate_size, vllm_config.parallel_config.tensor_parallel_size
+    )
+    if remainder or not supports_q8_0_expert_shape(
+        config.hidden_size, local_width, config.num_experts_per_tok
+    ):
+        return
+
+    start = config.num_hidden_layers
+    quant = _get_mtp_quant_config(vllm_config, start)
+    prefixes = _mtp_expert_prefixes(config, start)
+    if quant is not None:
+        remaining = prefixes - checkpoint_fp8_prefixes(quant, prefixes)
+        if isinstance(quant, ModelOptQuantConfigBase):
+            remaining = {
+                prefix for prefix in remaining if not quant.is_layer_excluded(prefix)
+            }
+            if isinstance(quant, ModelOptMixedPrecisionConfig):
+                remaining = {
+                    prefix
+                    for prefix in remaining
+                    if quant._resolve_quant_algo(prefix) is not None
+                }
+        elif isinstance(quant, (AWQConfig, AWQMarlinConfig)):
+            remaining = {
+                prefix
+                for prefix in remaining
+                if not is_layer_skipped(
+                    prefix, quant.modules_to_not_convert, skip_with_substr=True
+                )
+            }
+        if remaining:
+            return
+    spec.mtp_expert_quantization = "q8_0"
+    logger.info_once("Defaulting SM70 Qwen4Exp MTP routed experts to Q8_0.")
+
+
+def _make_draft_vllm_config(
+    vllm_config: VllmConfig,
+    mtp_start_layer_idx: int,
+) -> VllmConfig:
+    """Ensure that the draft model config is set in the vLLM config."""
+    speculative_config = vllm_config.speculative_config
+    if speculative_config is None or speculative_config.draft_model_config is None:
+        raise ValueError("speculative_config.draft_model_config must be set")
+
+    draft_quant_config = _get_mtp_quant_config(vllm_config, mtp_start_layer_idx)
     draft_vllm_config = replace(
         vllm_config,
         model_config=speculative_config.draft_model_config,
@@ -244,21 +317,14 @@ def _make_draft_vllm_config(
     checkpoint_prefixes = set()
     if draft_quant_config is not None and exact_sm70:
         config = draft_vllm_config.model_config.hf_text_config
-        prefixes = {
-            f"mtp.layers.{mtp_start_layer_idx + index}.mlp.experts"
-            for index in range(getattr(config, "mtp_num_hidden_layers", 1))
-        }
+        prefixes = _mtp_expert_prefixes(config, mtp_start_layer_idx)
         checkpoint_prefixes = checkpoint_fp8_prefixes(draft_quant_config, prefixes)
-    if expert_format == "q8_0":
+    if expert_format in ("q8_0", "fp16"):
         if not exact_sm70 or draft_vllm_config.model_config.dtype != torch.float16:
-            raise ValueError("Q8_0 MTP requires SM70 with FP16 activations")
-        if checkpoint_prefixes:
-            raise ValueError(
-                "Q8_0 MTP requires BF16 or FP16 checkpoint experts. Use the "
-                "checkpoint's original block-FP8 experts with fp8 or no override."
-            )
+            raise ValueError(f"MTP {expert_format} requires SM70 with FP16 activations")
+        # Block-FP8 checkpoint experts are dequantized in load_weights.
         draft_quant_config = MTPExpertQuantConfig(
-            draft_quant_config, expert_format="q8_0"
+            draft_quant_config, checkpoint_prefixes, expert_format=expert_format
         )
     elif online_fp8 or checkpoint_prefixes:
         if draft_quant_config is None or not _mtp_fp8_experts_supported(
@@ -322,6 +388,9 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             )
         }
         self.fp8_mtp_tp_size = draft_vllm_config.parallel_config.tensor_parallel_size
+        self.mtp_expert_format = getattr(
+            draft_vllm_config.quant_config, "expert_format", None
+        )
         # Phase 2: the drafter shares the target cache_config; remember the main
         # KV cache dtype so load_weights can finalize the draft QSA E4M3 scales.
         self._kv_cache_dtype = draft_vllm_config.cache_config.cache_dtype
@@ -725,12 +794,19 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         )
         from .mtp_fp8_checkpoint import prepare_mtp_fp8_checkpoint
 
+        expert_format = self.model.mtp_expert_format
+        if expert_format == "q8_0" and self.model.fp8_mtp_checkpoint_prefixes:
+            logger.info_once(
+                "Q8_0 MTP expert secondary quantization: dequantizing checkpoint "
+                "block-FP8 experts before packing Q8_0. Prefer a BF16/FP16 source."
+            )
         loaded_weights = loader.load_weights(
             prepare_mtp_fp8_checkpoint(
                 remap_weight_names(),
                 self.model.fp8_mtp_checkpoint_prefixes,
                 tp_size=self.model.fp8_mtp_tp_size,
                 num_experts=self.model.config.num_experts,
+                dequantize=expert_format in ("q8_0", "fp16"),
             )
         )
         _validate_mtp_expert_weights_loaded(self, loaded_weights)

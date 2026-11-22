@@ -342,6 +342,9 @@ void dense_batch(torch::Tensor output, torch::Tensor x, torch::Tensor weight) {
   else if (m == 3 || m == 4)
     dense_batch_out_kernel<1>
         <<<80, 128, 0, at::cuda::getCurrentCUDAStream()>>>(input, w, out, m);
+  else if (m == 12)
+    dense_batch_out_kernel<2>
+        <<<80, 128, 0, at::cuda::getCurrentCUDAStream()>>>(input, w, out, m);
   else
     dense_batch_kernel<1536><<<grid, 32, 0, at::cuda::getCurrentCUDAStream()>>>(
         input, w, out, m, n);

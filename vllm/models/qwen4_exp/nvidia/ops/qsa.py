@@ -15,6 +15,7 @@ import torch
 
 import vllm._custom_ops as ops
 import vllm.envs as envs
+from vllm.compilation.sm70_decode_graph import is_sm70_decode_graph_compiling
 from vllm.logger import init_logger
 from vllm.models.deepseek_v4.common.ops.fp8_software import (
     fp8_e4m3fn_bits_to_fp32_bitcast as fp8_e4m3fn_bits_to_fp32,
@@ -2419,7 +2420,17 @@ def _merge_sharded_index_blocks(
     if select is None:
         if not _use_sm70_qsa_lexicographic_topk(block_topk):
             raise RuntimeError("QSA indexer DCP sharding needs the exact SM70 top-k")
-        if _SM70_QSA_MTP_TOPK and (
+        if (
+            _SM70_QSA_MTP_TOPK
+            and 17 <= rows <= 64
+            and world * block_topk <= 2304
+            and _SM70_QSA_TOPK_LIBRARY is None
+            and is_sm70_decode_graph_compiling()
+        ):
+            ops.qsa_lexicographic_topk_v154(
+                sorted_scores, lengths, positions, block_topk, True
+            )
+        elif _SM70_QSA_MTP_TOPK and (
             rows in (5, 10) or (1 <= rows <= 16 and world * block_topk <= 2304)
         ):
             torch.ops._C.qsa_lexicographic_topk(

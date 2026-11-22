@@ -808,6 +808,7 @@ def _dflash2_compact_target_row(
     TOP_K: tl.constexpr,
     BLOCK_K: tl.constexpr,
     LIMIT_K: tl.constexpr,
+    KEEP_CUTOFF_TIES: tl.constexpr = False,
 ):
     offsets = tl.arange(0, BLOCK_K)
     mask = offsets < TOP_K
@@ -822,13 +823,16 @@ def _dflash2_compact_target_row(
         other=float("-inf"),
     ).to(tl.float32)
     # Candidates are score-descending, with ascending vocabulary IDs at ties.
-    # Match upstream dense top-k by retaining only the first LIMIT_K entries.
-    mask &= offsets < LIMIT_K
+    # Cutoff-tie policy follows 1Cat v1.5.4 (1fa9c438bc). DFlash2 keeps
+    # its existing exact-prefix contract via the default control value.
+    if KEEP_CUTOFF_TIES and LIMIT_K < TOP_K:
+        cutoff = tl.load(target_logits_ptr + row * target_stride + LIMIT_K - 1)
+        mask &= logits >= cutoff
+    else:
+        mask &= offsets < LIMIT_K
     logits = tl.where(mask, logits, float("-inf"))
 
-    # get_topk_tokens_and_logits returns scores in descending order. Apply
-    # nucleus filtering only within that exact top-k support, matching the
-    # target's top-k-first sampling contract without materializing V columns.
+    # Apply nucleus filtering within the retained top-k support.
     row_max = tl.max(logits, axis=0)
     unnormalized = tl.where(mask, tl.exp(logits - row_max), 0.0)
     normalizer = tl.sum(unnormalized, axis=0)
@@ -1156,6 +1160,7 @@ def _greedy_draft_sparse_topk_rejection_kernel(
     STEPS: tl.constexpr,
     TOP_K: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    LIMIT_K: tl.constexpr,
     USE_FP64: tl.constexpr,
 ):
     req = tl.program_id(0)
@@ -1177,7 +1182,8 @@ def _greedy_draft_sparse_topk_rejection_kernel(
                 top_p,
                 TOP_K=TOP_K,
                 BLOCK_K=BLOCK_K,
-                LIMIT_K=TOP_K,
+                LIMIT_K=LIMIT_K,
+                KEEP_CUTOFF_TIES=True,
             )
             proposed = tl.load(draft_sampled_ptr + row + 1)
             proposed_logit = tl.max(
@@ -1201,7 +1207,8 @@ def _greedy_draft_sparse_topk_rejection_kernel(
         top_p,
         TOP_K=TOP_K,
         BLOCK_K=BLOCK_K,
-        LIMIT_K=TOP_K,
+        LIMIT_K=LIMIT_K,
+        KEEP_CUTOFF_TIES=True,
     )
     if row < end - 1:
         # Residual for a one-hot draft: remove the rejected token, but keep
@@ -1242,11 +1249,14 @@ def greedy_draft_sparse_topk_rejection_sample(
     seed: torch.Tensor,
     num_speculative_steps: int,
     use_fp64: bool,
+    *,
+    target_top_k: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Sample a guarded exact-k, FP32 T=1 shortlist with score/ID tie order.
+    """Sample an FP32 T=1 shortlist with score/ID tie order.
 
-    The caller supplies the retained prefix of contiguous, equally strided
-    ID/score rows from the sorted probe, and original verifier rows/slots.
+    With target_top_k, include cutoff ties within the supplied shortlist
+    before applying top-p. Otherwise the shortlist is already truncated.
+    ID and score rows must share a stride and follow the verifier row order.
     """
     num_reqs = cu_num_logits.shape[0] - 1
     top_k = target_topk_ids.shape[1]
@@ -1270,6 +1280,7 @@ def greedy_draft_sparse_topk_rejection_sample(
         STEPS=num_speculative_steps,
         TOP_K=top_k,
         BLOCK_K=triton.next_power_of_2(top_k),
+        LIMIT_K=top_k if target_top_k is None else target_top_k,
         USE_FP64=use_fp64,
         num_warps=1,
     )

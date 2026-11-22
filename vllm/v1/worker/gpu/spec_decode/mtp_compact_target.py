@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Guarded compact sampling for uniform-width SM70 MTP verification."""
+"""Compact sampling for uniform-width SM70 MTP verification."""
 
 from __future__ import annotations
 
@@ -50,6 +50,7 @@ def try_mtp_compact_target_rejection(
     grammar_output: GrammarOutput | None,
     *,
     has_lora: bool,
+    device_only: bool = False,
 ) -> SamplerOutput | DFlash2LogitsFallback | None:
     """Attempt compact sampling; None leaves the runner's normal route intact."""
 
@@ -101,12 +102,15 @@ def try_mtp_compact_target_rejection(
     logits, ids = sort_topk_with_vocab_ties(
         logits.float(), ids, vocab_size=states.vocab_size, descending=True
     )
-    reference_rows = _compact_target_reference_rows_gpu(
-        logits, states.top_p.gpu, expanded, strict_top_k=True
-    )
-    reference_reqs = np.flatnonzero(
-        np.logical_or.reduceat(reference_rows, input_batch.cu_num_logits_np[:-1])
-    )
+    if device_only:
+        reference_reqs = np.empty(0, dtype=np.int64)
+    else:
+        reference_rows = _compact_target_reference_rows_gpu(
+            logits, states.top_p.gpu, expanded, strict_top_k=True
+        )
+        reference_reqs = np.flatnonzero(
+            np.logical_or.reduceat(reference_rows, input_batch.cu_num_logits_np[:-1])
+        )
     reference_logits = None
     if reference_reqs.size:
         reference_logits = fallback()
@@ -123,10 +127,13 @@ def try_mtp_compact_target_rejection(
             )
             return DFlash2LogitsFallback(reference_logits)
 
+    if not device_only:
+        ids = ids[:, :_TARGET_TOP_K]
+        logits = logits[:, :_TARGET_TOP_K]
     indices = input_batch.logits_indices
     sampled, num_sampled = greedy_draft_sparse_topk_rejection_sample(
-        ids[:, :_TARGET_TOP_K],
-        logits[:, :_TARGET_TOP_K],
+        ids,
+        logits,
         input_batch.input_ids[indices],
         input_batch.cu_num_logits,
         input_batch.positions[indices],
@@ -137,6 +144,7 @@ def try_mtp_compact_target_rejection(
         # Verification and bonus are bounded by each request's actual row end.
         max_steps,
         sampler.use_fp64_gumbel,
+        target_top_k=_TARGET_TOP_K if device_only else None,
     )
     if reference_logits is not None:
         reqs, dense_ids, dense_counts = _sample_reference_requests(
@@ -145,7 +153,11 @@ def try_mtp_compact_target_rejection(
         sampled.index_copy_(0, reqs, dense_ids)
         num_sampled.index_copy_(0, reqs, dense_counts)
     compact_reqs = idx.size - reference_reqs.size
-    logger.info_once("Using SM70 MTP compact target sampling (guarded K%d).", steps)
+    logger.info_once(
+        "Using SM70 MTP compact target sampling (%s K%d).",
+        "device_top64" if device_only else "guarded",
+        steps,
+    )
     logger.debug(
         "SM70 MTP compact target route=%s compact_requests=%d compact_rows=%d "
         "reference_requests=%d",

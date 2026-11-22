@@ -1566,6 +1566,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     input_batch,
                     grammar_output,
                     has_lora=self.lora_config is not None,
+                    device_only=(
+                        self.vllm_config.kernel_config.sm70_sparse_target_sampling
+                        == "device_top64"
+                    ),
                 )
             if isinstance(sparse_result, DFlash2LogitsFallback):
                 cached_logits = sparse_result

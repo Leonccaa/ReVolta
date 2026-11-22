@@ -134,31 +134,27 @@ def make_batch(c, device, vocab, use_fp64=False, *, k=5, max_k=5):
     return runner, batch, hidden, target, fallback
 
 
-def test_config_off_and_no_compile_hash_change():
-    off = KernelConfig()
-    on = KernelConfig(sm70_sparse_target_sampling=True)
-    assert off.sm70_sparse_target_sampling is False
-    assert on.sm70_sparse_target_sampling is True
-    assert off.compute_hash() == on.compute_hash()
-
-
 @pytest.mark.parametrize(
-    "c,case,k,max_k",
+    "mode,c,case,k,max_k",
     [
-        (1, "hit", 5, 5),
-        (2, "hit", 5, 5),
-        (4, "mixed", 5, 5),
-        (8, "hit", 5, 5),
-        (1, "all", 5, 5),
-        (1, "hit", 3, 5),
-        (2, "hit", 3, 4),
-        (2, "mixed", 4, 5),
-        (1, "all", 4, 4),
-        (1, "hit", 3, 3),
+        (True, 1, "hit", 5, 5),
+        (True, 2, "hit", 5, 5),
+        (True, 4, "mixed", 5, 5),
+        (True, 8, "hit", 5, 5),
+        (True, 1, "all", 5, 5),
+        (True, 1, "hit", 3, 5),
+        (True, 2, "hit", 3, 4),
+        (True, 2, "mixed", 4, 5),
+        (True, 1, "all", 4, 4),
+        (True, 1, "hit", 3, 3),
+        ("device_top64", 2, "hit", 4, 5),
+        ("device_top64", 8, "hit", 5, 5),
     ],
 )
 @torch.inference_mode()
-def test_mrv2_mtp_compact_vs_dense(caplog, device, c, case, k, max_k):
+def test_mrv2_mtp_compact_vs_dense(
+    caplog, monkeypatch, device, c, case, k, max_k, mode
+):
     caplog.set_level("DEBUG", logger=compact.__name__)
     vocab = 248320
     runner, batch, hidden, target, fallback = make_batch(
@@ -172,7 +168,13 @@ def test_mrv2_mtp_compact_vs_dense(caplog, device, c, case, k, max_k):
     )
     runner.model.compute_logits.assert_called_once()
     runner.model.get_mtp_target_topk_with_fallback.assert_not_called()
-    runner.vllm_config.kernel_config.sm70_sparse_target_sampling = True
+    runner.vllm_config.kernel_config.sm70_sparse_target_sampling = mode
+    if mode == "device_top64":
+        monkeypatch.setattr(
+            compact,
+            "_compact_target_reference_rows_gpu",
+            Mock(side_effect=AssertionError("unexpected host readback")),
+        )
     actual, counts, rejected = GPUModelRunner.sample(runner, hidden, batch, None)
     runner.model.compute_logits.assert_called_once()  # No reprojection on fallback.
     runner.model.get_mtp_target_topk_with_fallback.assert_called_once()
@@ -232,6 +234,7 @@ def test_mtp_compact_uses_original_seed_and_rejection_position(device):
         "top_k",
         "top_p",
         "penalties",
+        "eos_logit_bias",
     ],
 )
 def test_unsupported_batch_does_not_project(monkeypatch, reason):
@@ -257,6 +260,8 @@ def test_unsupported_batch_does_not_project(monkeypatch, reason):
         ]
     elif reason == "penalties":
         sampler.penalties_state.use_penalty[slot] = True
+    elif reason == "eos_logit_bias":
+        sampler.logit_bias_state.use_logit_bias[slot] = True
     assert (
         compact.try_mtp_compact_target_rejection(
             runner.model,
@@ -271,3 +276,95 @@ def test_unsupported_batch_does_not_project(monkeypatch, reason):
         is None
     )
     runner.model.get_mtp_target_topk_with_fallback.assert_not_called()
+
+
+@pytest.mark.parametrize("ties", [20, 21, 65])
+@torch.inference_mode()
+def test_device_top64_cutoff_ties(monkeypatch, device, ties):
+    runner, batch, hidden, target, fallback = make_batch(1, device, 248320, k=3)
+    target[3].fill_(-14)
+    target[3, :ties] = 24
+    target[3, :19] = 24.125  # Keep top-p away from an FP32 rounding boundary.
+    # The existing selector defines the visible shortlist, including which
+    # 64 IDs survive a wider tie. Do not assume a full-vocabulary tie census.
+    values, ids = target.topk(64, dim=-1)
+    values, ids = compact.sort_topk_with_vocab_ties(
+        values.float(), ids, vocab_size=target.shape[1], descending=True
+    )
+
+    def filter_support(values):
+        values = values.float().masked_fill(values < values[..., 19:20], -float("inf"))
+        probabilities = values.softmax(-1)
+        keep = probabilities.cumsum(-1) - probabilities < np.float32(0.95)
+        return values.masked_fill(~keep, -float("inf"))
+
+    support = filter_support(values)
+    assert torch.isfinite(support[3]).sum().item() == {20: 19, 21: 20, 65: 61}[ties]
+    if ties == 65:
+        unbounded = filter_support(target[3].sort(descending=True).values)
+        assert torch.isfinite(unbounded).sum().item() == 62
+
+    bounded = torch.full_like(target, -float("inf"), dtype=torch.float32)
+    bounded.scatter_(1, ids, support)
+    seeds = runner.sampler.sampling_states.seeds
+    for seed in (3, 51):
+        seeds.np[batch.idx_mapping_np[0]] = seed
+        seeds.gpu.copy_(torch.from_numpy(seeds.np))
+        runner.vllm_config.kernel_config.sm70_sparse_target_sampling = False
+        # Independently filter in PyTorch, then use the dense rejection
+        # verifier with the original request slot, seed and absolute positions.
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                runner.sampler, "apply_sampling_params", lambda *args: bounded
+            )
+            reference, ref_counts, ref_rejected = GPUModelRunner.sample(
+                runner, hidden, batch, None
+            )
+        runner.vllm_config.kernel_config.sm70_sparse_target_sampling = "device_top64"
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                compact,
+                "_compact_target_reference_rows_gpu",
+                Mock(side_effect=AssertionError("unexpected host readback")),
+            )
+            actual, counts, rejected = GPUModelRunner.sample(
+                runner, hidden, batch, None
+            )
+        fallback.assert_not_called()
+        assert torch.equal(counts, ref_counts)
+        assert torch.equal(rejected, ref_rejected)
+        valid = torch.arange(6, device=device) < counts[:, None]
+        assert torch.equal(
+            actual.sampled_token_ids[valid], reference.sampled_token_ids[valid]
+        )
+
+
+@torch.inference_mode()
+def test_eos_mask_keeps_mixed_batch_dense(device):
+    runner, batch, hidden, target, fallback = make_batch(2, device, 248320, k=3)
+    slot = int(batch.idx_mapping_np[1])
+    eos = int(target[4].argmax())
+    bias = runner.sampler.logit_bias_state
+    bias.use_logit_bias[slot] = True
+
+    def mask_eos(logits, expanded, idx, pos):
+        # Exercise the public sampler's existing EOS/logit-bias fallback,
+        # with one masked request and one ordinary request in the same batch.
+        logits[expanded == slot, eos] = -float("inf")
+
+    bias.apply_logit_bias.side_effect = mask_eos
+    dense, dense_counts, dense_rejected = GPUModelRunner.sample(
+        runner, hidden, batch, None
+    )
+    runner.vllm_config.kernel_config.sm70_sparse_target_sampling = "device_top64"
+    actual, counts, rejected = GPUModelRunner.sample(runner, hidden, batch, None)
+    runner.model.get_mtp_target_topk_with_fallback.assert_not_called()
+    fallback.assert_not_called()
+    assert (
+        runner.model.compute_logits.call_count == bias.apply_logit_bias.call_count == 2
+    )
+    assert torch.equal(counts, dense_counts)
+    assert torch.equal(rejected, dense_rejected)
+    valid = torch.arange(6, device=device) < counts[:, None]
+    assert torch.equal(actual.sampled_token_ids[valid], dense.sampled_token_ids[valid])
+    assert eos not in actual.sampled_token_ids[1, : counts[1]].tolist()

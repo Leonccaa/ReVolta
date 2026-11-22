@@ -681,6 +681,12 @@ class KernelConfig:
     """Verify greedy MTP drafts from TP-local target argmax pairs instead of
     gathering full-vocabulary logits for the rejection sampler."""
 
+    sm70_sparse_target_sampling: bool = False
+    """Guarded compact target sampling for SM70 MRv2 with uniform MTP3-5,
+    with greedy drafts and target temperature=1, top_k=20, top_p=0.95.
+    Unsupported batches and ambiguous cutoffs keep the dense reference.
+    """
+
     ple_result_transport: Literal["auto", "cuda", "mapped"] = "auto"
     """Select CPU PLE result transport by local operator/resource capability."""
     ple_result_transports: dict[str, Any] = Field(
@@ -728,8 +734,9 @@ class KernelConfig:
             "ple_input_prepare",  # Input staging is outside the compiled model.
             "ple_input_preparations",
             "qsa_auto_e4m3_reason",
-            # Sampler-only switch; it does not change any compiled graph.
+            # Sampler-only switches; they do not change the compiled model.
             "sm70_greedy_verify",
+            "sm70_sparse_target_sampling",
             # Scheduler-only prefix-hit check; no compiled graph changes.
             "qsa_cross_group_hit_check",
         }

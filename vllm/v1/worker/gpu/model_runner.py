@@ -1547,6 +1547,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_batch,
                 grammar_output,
             )
+            if (
+                sparse_result is None
+                and self.vllm_config.kernel_config.sm70_sparse_target_sampling
+                and self.speculative_config is not None
+                and self.speculative_config.method == "mtp"
+            ):
+                from vllm.v1.worker.gpu.spec_decode.mtp_compact_target import (
+                    try_mtp_compact_target_rejection,
+                )
+
+                sparse_result = try_mtp_compact_target_rejection(
+                    self.model,
+                    self.speculative_config,
+                    self.speculator.draft_logits,
+                    self.rejection_sampler,
+                    sample_hidden_states,
+                    input_batch,
+                    grammar_output,
+                    has_lora=self.lora_config is not None,
+                )
             if isinstance(sparse_result, DFlash2LogitsFallback):
                 cached_logits = sparse_result
             else:

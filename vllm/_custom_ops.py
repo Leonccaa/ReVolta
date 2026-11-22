@@ -4496,6 +4496,33 @@ def nvfp4_grouped_w2_sm70_v154_out(
     )
 
 
+def has_nvfp4_grouped_decode_sm70_v154() -> bool:
+    return all(
+        hasattr(torch.ops._C, name)
+        for name in (
+            "nvfp4_grouped_w13_sm70_v154_out",
+            "nvfp4_grouped_w2_sm70_v154_out",
+            "nvfp4_grouped_w2_batch_reduce_sm70_v154_out",
+        )
+    )
+
+
+if has_nvfp4_grouped_decode_sm70_v154():
+
+    @register_fake("_C::nvfp4_grouped_w13_sm70_v154_out")
+    def _nvfp4_grouped_w13_sm70_v154_fake(
+        out, x, w, s, ids, rows, experts, sizes, total, split, interleaved
+    ):
+        return None
+
+    @register_fake("_C::nvfp4_grouped_w2_batch_reduce_sm70_v154_out")
+    @register_fake("_C::nvfp4_grouped_w2_sm70_v154_out")
+    def _nvfp4_grouped_w2_sm70_v154_fake(
+        out, routed, x, w, s, topk, rows, experts, sizes, total
+    ):
+        return None
+
+
 def nvfp4_qpn2_batch_sm70_out(
     out: torch.Tensor,
     input: torch.Tensor,

@@ -40,7 +40,11 @@ from vllm.distributed.parallel_state import (
     is_last_pp_first_tp_rank,
     prepare_communication_buffer_for_model,
 )
-from vllm.forward_context import BatchDescriptor, set_forward_context
+from vllm.forward_context import (
+    BatchDescriptor,
+    get_forward_context,
+    set_forward_context,
+)
 from vllm.logger import init_logger
 from vllm.lora.layers import LoRAMapping
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
@@ -2086,6 +2090,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     and uniform_tok_count is not None
                 ),
             ):
+                # Piecewise graphs can replay the same shape for prefill.
+                if (
+                    envs.VLLM_SM70_NVFP4_MOE_GROUPED_DECODE
+                    and batch_desc.cg_mode == CUDAGraphMode.NONE
+                    and not dummy_run
+                    and not input_batch.is_prefilling_np.any()
+                ):
+                    get_forward_context().additional_kwargs[
+                        "sm70_nvfp4_decode_only"
+                    ] = True
                 self.kv_connector.pre_forward(scheduler_output)
                 model_output = self.model(**model_inputs)
 

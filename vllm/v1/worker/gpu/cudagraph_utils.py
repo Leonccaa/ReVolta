@@ -26,7 +26,11 @@ from vllm.distributed.parallel_state import (
     graph_capture,
     is_global_first_rank,
 )
-from vllm.forward_context import BatchDescriptor, set_forward_context
+from vllm.forward_context import (
+    BatchDescriptor,
+    get_forward_context,
+    set_forward_context,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
@@ -827,6 +831,16 @@ class ModelCudaGraphManager(CudaGraphManager):
                         ),
                     ),
                 ):
+                    # Only uniform decode graphs are phase-specialized. The
+                    # same decision applies to their warmup and capture.
+                    if (
+                        envs.VLLM_SM70_NVFP4_MOE_GROUPED_DECODE
+                        and desc.cg_mode == CUDAGraphMode.FULL
+                        and desc.uniform_token_count is not None
+                    ):
+                        get_forward_context().additional_kwargs[
+                            "sm70_nvfp4_decode_only"
+                        ] = True
                     model_output = model(**model_inputs)
 
                 if cg_mode == CUDAGraphMode.PIECEWISE:

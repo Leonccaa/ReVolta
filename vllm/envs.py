@@ -5990,16 +5990,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=("TurboMind NVFP4",),
         user_visible=False,
     ),
-    # Experimental grouped native-NVFP4 W13/W2 decode. Local weight shapes and
-    # attention metadata gates preserve M1, prefill and multi-token verify.
-    # Default off pending endpoint and model-quality admission.
+    # Experimental grouped native-NVFP4 W13/W2 decode and verify.
     "VLLM_SM70_NVFP4_MOE_GROUPED_DECODE": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_MOE_GROUPED_DECODE", "0"))),
         description=(
-            "Experimental grouped native-NVFP4 W13/W2 decode. Local weight "
-            "shapes and attention metadata gates preserve M1, prefill and "
-            "multi-token verify. Default off pending endpoint and "
-            "model-quality admission."
+            "Experimental grouped native-NVFP4 W13/W2 decode and verify. "
+            "Extends prepared Flash-Next TP1/TP2/TP4 shards to M2-M40 in "
+            "Model Runner V2 decode-only forwards with matching kernels. "
+            "Default off pending model-quality admission."
         ),
         category="experimental",
         declared_default="False",

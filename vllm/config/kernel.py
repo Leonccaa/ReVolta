@@ -669,9 +669,10 @@ class KernelConfig:
     """Use the native FP16 paged QSA reader for eligible TP4/DCP2 target
     decode on SM70. Its reduction and probability rounding differ."""
 
-    sm70_qsa_paged_fp16_h6: bool = False
+    sm70_qsa_paged_fp16_h6: bool | None = None
     """Use the native FP16 paged QSA reader in replicated MTP decode graphs
-    on SM70. Its reduction and probability rounding differ."""
+    on SM70. When unset, enable it in the SM70 TP4/DCP2 NVFP4 profile with
+    async MTP and FP16 GPU KV. Its reduction and probability rounding differ."""
 
     sm70_qsa_device_history: bool = False
     """Use native SM70 QSA GPU-cache reads for eligible TP4/DCP2 decode

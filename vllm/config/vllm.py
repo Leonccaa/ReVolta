@@ -1855,6 +1855,7 @@ class VllmConfig:
             apply_revolta_kernel_profile,
             apply_revolta_profile,
             frontend_interconnect_mode,
+            has_nvfp4_weights,
         )
 
         # Also cover direct VllmConfig users. This is intentionally before
@@ -2155,6 +2156,18 @@ class VllmConfig:
                 self.scheduler_config.async_scheduling = False
             else:
                 self.scheduler_config.async_scheduling = True
+
+        if self.kernel_config.sm70_qsa_paged_fp16_h6 is None:
+            self.kernel_config.sm70_qsa_paged_fp16_h6 = (
+                revolta_profile_enabled
+                and self.scheduler_config.async_scheduling
+                and self.speculative_config is not None
+                and self.speculative_config.method == "mtp"
+                and self.parallel_config.decode_context_parallel_size == 2
+                and self.cache_config.cache_dtype in ("auto", "float16")
+                and not self.kernel_config.long_context_kv.enabled
+                and has_nvfp4_weights(self.model_config)
+            )
 
         logger.info_once(
             "Asynchronous scheduling is %s.",

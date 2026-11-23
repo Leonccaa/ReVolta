@@ -16,6 +16,7 @@ from vllm.config.sm70_dflash2 import (
     sm70_dflash2_enabled,
 )
 from vllm.logger import init_logger
+from vllm.model_executor.layers.logits_processor import CachedLogitsFallback
 from vllm.triton_utils import tl, triton
 from vllm.v1.sample.ops.topk_topp_triton import sort_topk_with_vocab_ties
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
@@ -507,13 +508,24 @@ def try_dflash2_sparse_target_rejection(
     if guarded:
         reference_reqs = np.union1d(reference_reqs, list(guarded))
     reference_logits = None
+    packed_metadata = None
     if reference_reqs.size:
         logger.info_once(
             "DFlash2 target cutoff requires full-vocabulary reference sampling."
         )
         if fallback is None:
             return None
-        reference_logits = fallback()
+        # On SM70 the shared target probe selects the same requests on all
+        # ranks. Use the packed gather without a reasoning EOS mask.
+        if (
+            reference_reqs.size < idx.size
+            and reasoning_eos is None
+            and isinstance(fallback, CachedLogitsFallback)
+        ):
+            packed_metadata = _pack_reference_requests(input_batch, reference_reqs)
+            reference_logits = fallback.gather_rows(packed_metadata[0])
+        else:
+            reference_logits = fallback()
         if reference_reqs.size == idx.size or reference_logits is None:
             return DFlash2LogitsFallback(reference_logits)
     if not retain_ties:
@@ -551,6 +563,7 @@ def try_dflash2_sparse_target_rejection(
             input_batch,
             rejection_sampler,
             speculator.draft_logits,
+            packed_metadata=packed_metadata,
         )
         sampled.index_copy_(0, reqs, dense_sampled)
         num_sampled.index_copy_(0, reqs, dense_num_sampled)

@@ -152,6 +152,7 @@ def _manager(monkeypatch, schedule, tails=True, sizes=None):
     )
     sizes = sizes or [8, 16, 24, 32, 40, 48, 56, 64]
     config = SimpleNamespace(
+        adaptive_dflash2_enabled=False,
         scheduler_config=SimpleNamespace(max_num_seqs=8),
         parallel_config=SimpleNamespace(tensor_parallel_size=4, data_parallel_size=1),
         compilation_config=CompilationConfig(

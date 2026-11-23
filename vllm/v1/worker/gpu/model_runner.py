@@ -72,6 +72,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+from vllm.v1.spec_decode.dynamic.adaptive_dflash2 import limit_dflash2_drafts
 from vllm.v1.spec_decode.lookup_quarantine import isolated, require_reusable_context
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
@@ -2446,6 +2447,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self._sm70_v2_mtp_profile_finish(
                 mtp_profile_ctx, "draft_total", mtp_draft_start
             )
+            if (
+                isinstance(speculator, DFlashSpeculator)
+                and self.vllm_config.adaptive_dflash2_enabled
+            ):
+                # Contract the trained draft block after lookup has chosen
+                # whether to extend it. Keep an already selected expansion.
+                if num_draft_tokens is None and hasattr(
+                    speculator, "next_num_draft_tokens"
+                ):
+                    num_draft_tokens = speculator.next_num_draft_tokens()
+                num_draft_tokens = limit_dflash2_drafts(
+                    execute_model_state.num_spec_tokens_to_schedule,
+                    num_draft_tokens,
+                )
             if (
                 num_draft_tokens is not None
                 and num_draft_tokens < self.num_speculative_steps

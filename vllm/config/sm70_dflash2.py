@@ -157,6 +157,15 @@ class Sm70DFlash2Config:
     codebook and draft step. On by default; set False to keep full codebooks
     on every rank. Configuration only, no environment alias."""
 
+    adaptive_width: bool = False
+    """Opt-in acceptance-driven target width contraction (q=4..8) for AWQ on
+    SM70 with synchronous MRv2 DFlash2 and full decode CUDA graphs. Lookup
+    expansions wider than the checkpoint's q8 block retain their width."""
+
+    adaptive_width_max_grouped_rows: int = Field(default=48, ge=0, le=48)
+    """Row budget for multi-request adaptive width contraction (0 disables the
+    grouped sweet-spot cap; 48 matches the SM70 AWQ grouped kernel limit)."""
+
     qualified: bool = Field(default=False, init=False, repr=False)
     """Whether the retained complete-model validation boundary matches."""
 
@@ -207,6 +216,11 @@ class Sm70DFlash2Config:
         # Listed only when on, so turning it off keeps the earlier compile keys.
         if self.sharded_selector_codebook:
             options["sharded_selector_codebook"] = True
+        if self.adaptive_width:
+            options["adaptive_width"] = True
+            options["adaptive_width_max_grouped_rows"] = (
+                self.adaptive_width_max_grouped_rows
+            )
         return options
 
 

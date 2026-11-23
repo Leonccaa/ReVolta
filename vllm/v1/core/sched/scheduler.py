@@ -71,6 +71,12 @@ from vllm.v1.metrics.store import CPU_SAMPLE_STRIDE, StoreMetrics
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.ddtree_payload import DDTreeDraftPayload
+from vllm.v1.spec_decode.dynamic.adaptive_dflash2 import (
+    MAX_ADAPTIVE_DFLASH2_DRAFTS,
+    MIN_ADAPTIVE_DFLASH2_DRAFTS,
+    AdaptiveDFlash2Depth,
+    choose_batch_dflash2_drafts,
+)
 from vllm.v1.spec_decode.dynamic.adaptive_mtp import (
     MIN_ADAPTIVE_MTP_DEPTH,
     AdaptiveMTPDepth,
@@ -321,6 +327,22 @@ class Scheduler(SchedulerInterface):
             else 0
         )
         self._adaptive_mtp_depths: dict[str, AdaptiveMTPDepth] = {}
+        self._adaptive_dflash2_cap = (
+            min(
+                self.dynamic_sd_lookup[1]
+                if self.dynamic_sd_lookup is not None
+                else self.num_spec_tokens,
+                MAX_ADAPTIVE_DFLASH2_DRAFTS,
+            )
+            if vllm_config.adaptive_dflash2_enabled
+            else 0
+        )
+        self._adaptive_dflash2_max_grouped_rows = (
+            speculative_config.sm70_dflash2.adaptive_width_max_grouped_rows
+            if speculative_config is not None and vllm_config.adaptive_dflash2_enabled
+            else 0
+        )
+        self._adaptive_dflash2_depths: dict[str, AdaptiveDFlash2Depth] = {}
         # Last running total of rejection fallbacks seen from the workers.
         self._rejection_fallbacks_total = 0
         self.num_lookahead_tokens = vllm_config.num_lookahead_tokens
@@ -1802,6 +1824,21 @@ class Scheduler(SchedulerInterface):
                 num_spec_tokens_to_schedule = min(
                     num_spec_tokens_to_schedule, depth.depth
                 )
+        elif self._adaptive_dflash2_cap > MIN_ADAPTIVE_DFLASH2_DRAFTS and (
+            num_scheduled_tokens
+        ):
+            resident_depths = [
+                self._adaptive_dflash2_depths[rid]
+                for rid in num_scheduled_tokens
+                if rid in resident_tokens and rid in self._adaptive_dflash2_depths
+            ]
+            if len(resident_depths) == len(num_scheduled_tokens):
+                num_spec_tokens_to_schedule = choose_batch_dflash2_drafts(
+                    len(num_scheduled_tokens),
+                    num_spec_tokens_to_schedule,
+                    resident_depths,
+                    max_grouped_rows=self._adaptive_dflash2_max_grouped_rows,
+                )
         if self.exact_end_draft_threshold is not None:
             # Only now is the DSD width for the final batch known.
             next_threshold = min(
@@ -2223,6 +2260,7 @@ class Scheduler(SchedulerInterface):
             )
             assert request.num_in_flight_tokens == 0
         self._pending_preempted_req_ids.add(request.request_id)
+        self._adaptive_dflash2_depths.pop(request.request_id, None)
         offload = getattr(self.connector, "connector_scheduler", None)
         preempt_unified = getattr(offload, "preempt_unified_request", None)
         if preempt_unified is not None:
@@ -2911,6 +2949,24 @@ class Scheduler(SchedulerInterface):
                     len(new_token_ids) - 1,
                     self._adaptive_mtp_cap,
                 )
+            elif (
+                self._adaptive_dflash2_cap > MIN_ADAPTIVE_DFLASH2_DRAFTS
+                and scheduled_spec_token_ids
+                and new_token_ids
+                and not (scheduler_output.num_invalid_spec_tokens or {}).get(req_id)
+                and len(scheduled_spec_token_ids) <= MAX_ADAPTIVE_DFLASH2_DRAFTS
+                and len(scheduled_spec_token_ids)
+                < request.max_tokens - num_output_tokens_before - 1
+            ):
+                df_depth = self._adaptive_dflash2_depths.get(req_id)
+                if df_depth is None:
+                    df_depth = AdaptiveDFlash2Depth(self._adaptive_dflash2_cap)
+                    self._adaptive_dflash2_depths[req_id] = df_depth
+                df_depth.observe(
+                    len(scheduled_spec_token_ids),
+                    len(new_token_ids) - 1,
+                    self._adaptive_dflash2_cap,
+                )
 
             # Extract sample logprobs if needed.
             if (
@@ -3080,6 +3136,7 @@ class Scheduler(SchedulerInterface):
         of the in-flight steps are dropped when they return.
         """
         self._adaptive_mtp_depths.pop(request.request_id, None)
+        self._adaptive_dflash2_depths.pop(request.request_id, None)
         request.num_stale_in_flight_tokens = request.num_in_flight_tokens
         request.num_output_placeholders = 0
         request.spec_token_ids = []
@@ -3467,6 +3524,7 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
         self._adaptive_mtp_depths.pop(request_id, None)
+        self._adaptive_dflash2_depths.pop(request_id, None)
         if getattr(self, "host_kv_ssd", None) is not None:
             self.host_kv_ssd.cancel(request_id)
         self.finished_req_ids.add(request_id)

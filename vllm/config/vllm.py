@@ -55,6 +55,8 @@ from .speculative import (
     EagleModelTypes,
     NgramGPUTypes,
     SpeculativeConfig,
+    _get_dflash2_checkpoint_draft_tokens,
+    get_dflash_model_draft_tokens,
     uses_adaptive_dflash_lookup,
 )
 from .structured_outputs import StructuredOutputsConfig
@@ -1401,6 +1403,37 @@ class VllmConfig:
 
         return (
             self.num_speculative_tokens >= 5
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability((7, 0))
+        )
+
+    @property
+    def adaptive_dflash2_enabled(self) -> bool:
+        """Whether synchronous MRv2 can contract DFlash2 verification width."""
+        spec = self.speculative_config
+        model = self.model_config
+        if (
+            spec is None
+            or not spec.use_dflash()
+            or not spec.sm70_dflash2.adaptive_width
+            or model is None
+            or model.quantization != "awq"
+            or get_dflash_model_draft_tokens(spec) != 7
+            or _get_dflash2_checkpoint_draft_tokens(
+                getattr(spec.draft_model_config, "hf_config", None)
+            )
+            != 7
+            or self.scheduler_config.async_scheduling
+            or not self.use_v2_model_runner
+        ):
+            return False
+
+        from vllm.platforms import current_platform
+
+        mode = self.compilation_config.cudagraph_mode
+        return (
+            mode is not None
+            and mode.decode_mode() == CUDAGraphMode.FULL
             and current_platform.is_cuda()
             and current_platform.is_device_capability((7, 0))
         )

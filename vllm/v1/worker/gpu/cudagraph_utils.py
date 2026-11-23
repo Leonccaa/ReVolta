@@ -37,6 +37,11 @@ from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.spec_decode.dynamic.adaptive_dflash2 import (
+    MAX_ADAPTIVE_DFLASH2_BATCH,
+    MAX_ADAPTIVE_DFLASH2_DRAFTS,
+    MIN_ADAPTIVE_DFLASH2_DRAFTS,
+)
 from vllm.v1.spec_decode.dynamic.adaptive_mtp import MIN_ADAPTIVE_MTP_DEPTH
 from vllm.v1.spec_decode.dynamic.utils import (
     DynamicSDSchedule,
@@ -386,6 +391,18 @@ class CudaGraphManager:
             self._add_dynamic_sd_candidates(
                 schedule, adaptive_mtp=vllm_config.adaptive_mtp_enabled
             )
+        if (
+            isinstance(self, ModelCudaGraphManager)
+            and speculative_config is not None
+            and speculative_config.method == "dflash"
+            and vllm_config.adaptive_dflash2_enabled
+            and cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+        ):
+            self._add_adaptive_dflash2_candidates(
+                max_grouped_rows=(
+                    speculative_config.sm70_dflash2.adaptive_width_max_grouped_rows
+                )
+            )
 
     @property
     def max_captured_tokens(self) -> int:
@@ -523,6 +540,48 @@ class CudaGraphManager:
         if narrow_descs:
             self._capture_descs[CUDAGraphMode.FULL] = sorted(
                 [*full_descs, *narrow_descs], key=lambda d: d.num_tokens, reverse=True
+            )
+
+    def _add_adaptive_dflash2_candidates(self, *, max_grouped_rows: int) -> None:
+        """Capture narrow FULL descriptors for adaptive DFlash2 widths."""
+        full_descs = self._capture_descs.get(CUDAGraphMode.FULL, [])
+        if not full_descs:
+            return
+        max_q = min(self.decode_query_len, MAX_ADAPTIVE_DFLASH2_DRAFTS + 1)
+        max_tokens = len(self._candidates) - 1
+        added: list[BatchExecutionDescriptor] = []
+        for query_len in range(MIN_ADAPTIVE_DFLASH2_DRAFTS + 1, max_q):
+            limit = min(
+                self.max_num_reqs,
+                MAX_ADAPTIVE_DFLASH2_BATCH,
+                max_tokens // query_len,
+            )
+            if max_grouped_rows > 0:
+                limit = min(limit, max(1, max_grouped_rows // query_len))
+            if limit < 1:
+                continue
+            capacities = {n for n in (1, 2, 4, 8) if n <= limit} | {limit}
+            first = 1
+            for capacity in sorted(capacities):
+                desc = BatchExecutionDescriptor(
+                    cg_mode=CUDAGraphMode.FULL,
+                    num_tokens=capacity * query_len,
+                    num_reqs=capacity,
+                    uniform_token_count=query_len,
+                )
+                if desc not in full_descs:
+                    added.append(desc)
+                # Dispatch uses exact token-count buckets. A smaller batch
+                # can pad to this capacity without exceeding the AWQ budget.
+                for num_reqs in range(first, capacity + 1):
+                    size = num_reqs * query_len
+                    if desc not in self._candidates[size]:
+                        self._candidates[size] = [desc, *self._candidates[size]]
+                first = capacity + 1
+
+        if added:
+            self._capture_descs[CUDAGraphMode.FULL] = sorted(
+                [*full_descs, *added], key=lambda d: d.num_tokens, reverse=True
             )
 
     def needs_capture(self) -> bool:

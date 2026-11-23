@@ -8,6 +8,7 @@ Extracted from Qwen3XMLToolParser (1CatAI/1Cat-vLLM#653).
 
 import json
 from logging import Logger
+from typing import Any
 
 from xgrammar import Grammar
 from xgrammar.structural_tag import (
@@ -32,6 +33,74 @@ from vllm.tool_parsers.structural_tag_registry import (
     get_model_structural_tag,
 )
 
+_JSON_OBJECT_NO_TOOL_HINT = (
+    "If no tool call is required to answer the user, reply directly with a raw "
+    "JSON object without markdown code fences."
+)
+_JSON_SCHEMA_NO_TOOL_HINT = (
+    "If no tool call is required to answer the user, reply directly with a raw "
+    "JSON value matching the requested schema without markdown code fences."
+)
+
+
+def _qwen_xml_json_answer(
+    request: ChatCompletionRequest,
+) -> tuple[dict[str, Any], str] | None:
+    # An omitted tool choice is normalized to "auto" when tools are present.
+    if not request.tools or request.tool_choice != "auto":
+        return None
+    # Explicit structured outputs keep their existing precedence.
+    if (
+        request.structured_outputs is not None
+        and not request.structured_outputs.all_constraints_none()
+    ):
+        return None
+    response_format = request.response_format
+    if response_format is None:
+        return None
+    if response_format.type == "json_object":
+        return {"type": "object"}, _JSON_OBJECT_NO_TOOL_HINT
+    if response_format.type == "json_schema":
+        json_schema = response_format.json_schema
+        if json_schema is not None and json_schema.json_schema is not None:
+            return json_schema.json_schema, _JSON_SCHEMA_NO_TOOL_HINT
+    return None
+
+
+def maybe_inject_qwen_xml_response_format_hint(
+    request: Any,
+    messages: list[Any],
+    tool_parser: Any,
+) -> list[Any]:
+    """Tell the model how to answer directly in the Qwen XML tool/JSON union."""
+    if not isinstance(request, ChatCompletionRequest) or not getattr(
+        tool_parser, "_uses_qwen_xml_tool_grammar", False
+    ):
+        return messages
+    answer = _qwen_xml_json_answer(request)
+    if answer is None or not messages:
+        return messages
+    _, hint = answer
+
+    first = messages[0]
+    if isinstance(first, dict) and first.get("role") in ("system", "developer"):
+        content = first.get("content")
+        if isinstance(content, str):
+            if hint in content:
+                return messages
+            updated_first = {
+                **first,
+                "content": f"{content}\n\n{hint}" if content else hint,
+            }
+            return [updated_first, *messages[1:]]
+        if isinstance(content, list):
+            updated_first = {
+                **first,
+                "content": [*content, {"type": "text", "text": f"\n\n{hint}"}],
+            }
+            return [updated_first, *messages[1:]]
+    return [{"role": "system", "content": hint}, *messages]
+
 
 def adjust_qwen_xml_tool_request(
     request: ChatCompletionRequest | ResponsesRequest,
@@ -42,54 +111,14 @@ def adjust_qwen_xml_tool_request(
     A False result leaves the request untouched. Keep the construction order,
     serialization and fallback policy identical for both XML parsers.
     """
-    # Narrowly target the one combination the base class mishandles: tools
-    # present, tool_choice "auto", AND a response_format set. There,
-    # to_sampling_params turns response_format into a grammar over the WHOLE
-    # output while get_json_schema_from_tools() returns None for "auto" (no
-    # tool grammar is built), so the answer-schema grammar leaves the literal
-    # "<tool_call>" prefix outside the allowed token set and tool calls are
-    # silently dropped.
-    if not isinstance(request, ChatCompletionRequest) or not request.tools:
+    if not isinstance(request, ChatCompletionRequest):
         return False
-
-    # Handle "auto" only. An ABSENT tool_choice is already normalized to
-    # "auto" upstream when tools are present, so nothing is lost; explicit
-    # None / "none" / "required" / named must keep base behaviour (serving
-    # treats a falsy tool_choice as "none" and would otherwise surface the
-    # raw XML branch as message content).
-    if request.tool_choice != "auto":
+    answer = _qwen_xml_json_answer(request)
+    if answer is None:
         return False
-
-    # If a native structured-outputs constraint is already set, adding a
-    # structural_tag would stack a second constraint and trip
-    # StructuredOutputsParams' single-constraint check. Leave those to the
-    # base path (response_format wins there, as it does today).
-    if (
-        request.structured_outputs is not None
-        and not request.structured_outputs.all_constraints_none()
-    ):
-        return False
-
-    # Derive the answer-side format from response_format the way
-    # to_sampling_params reads it.
-    answer_format = None
-    response_format = request.response_format
-    if response_format is not None:
-        if response_format.type == "json_object":
-            answer_format = JSONSchemaFormat(json_schema={"type": "object"})
-        elif response_format.type == "json_schema":
-            json_schema = response_format.json_schema
-            schema = json_schema.json_schema if json_schema is not None else None
-            if schema is not None:
-                answer_format = JSONSchemaFormat(json_schema=schema)
-        # "text" -> no constraint; "structural_tag" -> caller composed its
-        # own tag. Both leave answer_format=None.
-
-    # No answer constraint => nothing to union with; preserve today's
-    # free-generation "auto" tool calling (tool text is parsed post-hoc).
-    if answer_format is None:
-        return False
-
+    assert request.tools is not None
+    schema, _ = answer
+    answer_format = JSONSchemaFormat(json_schema=schema)
     reasoning = get_enable_structured_outputs_in_reasoning()
 
     def build_tag_json(tools):

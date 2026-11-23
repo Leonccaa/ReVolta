@@ -3,16 +3,19 @@
 
 """Request shaping for the XML tool/JSON answer union, without model downloads."""
 
+import asyncio
 import copy
 import json
 from typing import Any
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from xgrammar import Grammar
 
+from tests.entrypoints.openai.chat_completion.test_chat_error import MockModelConfig
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
+from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 from vllm.sampling_params import StructuredOutputsParams
 from vllm.tool_parsers.abstract_tool_parser import ToolParser
 from vllm.tool_parsers.qwen3coder_tool_parser import Qwen3CoderToolParser
@@ -87,6 +90,74 @@ def make_parser(parser_cls):
     tokenizer = Mock()
     tokenizer.get_vocab.return_value = {"<tool_call>": 0, "</tool_call>": 1}
     return parser_cls(tokenizer)
+
+
+@pytest.mark.parametrize(
+    ("parser_name", "tool_choice", "response_format", "hint"),
+    [
+        (
+            "qwen3_coder",
+            "auto",
+            JSON_OBJECT,
+            "If no tool call is required to answer the user, reply directly with a raw "
+            "JSON object without markdown code fences.",
+        ),
+        (
+            "qwen3_xml",
+            "auto",
+            JSON_SCHEMA,
+            "If no tool call is required to answer the user, reply directly with a raw "
+            "JSON value matching the requested schema without markdown code fences.",
+        ),
+        ("qwen3_coder", NAMED, JSON_OBJECT, None),
+        ("qwen3_coder", "required", JSON_SCHEMA, None),
+        ("qwen3_coder", "none", JSON_OBJECT, None),
+        ("qwen3_coder", "auto", None, None),
+    ],
+)
+def test_qwen_xml_json_hint_reaches_chat_template(
+    parser_name, tool_choice, response_format, hint
+):
+    tokenizer = Mock()
+    tokenizer.get_vocab.return_value = {"<tool_call>": 0, "</tool_call>": 1}
+    renderer = Mock(tokenizer=tokenizer)
+    renderer.get_tokenizer.return_value = tokenizer
+    renderer.render_chat_async = AsyncMock(return_value=([[]], [{}]))
+    serving = OpenAIServingRender(
+        model_config=MockModelConfig(),
+        renderer=renderer,
+        model_registry=Mock(),
+        request_logger=None,
+        chat_template=None,
+        chat_template_content_format="auto",
+        enable_auto_tools=True,
+        tool_parser=parser_name,
+    )
+    messages = [{"role": "user", "content": "What is 2 + 2?"}]
+    if parser_name == "qwen3_xml":
+        messages.insert(0, {"role": "system", "content": "Be concise."})
+    request = make_request(
+        {
+            "messages": messages,
+            "tool_choice": tool_choice,
+            "response_format": response_format,
+        }
+    )
+    original = copy.deepcopy(request.messages)
+
+    asyncio.run(serving.render_chat(request))
+
+    (render_messages,), _, _ = renderer.render_chat_async.call_args.args
+    if hint is None:
+        assert render_messages == original
+    elif parser_name == "qwen3_xml":
+        assert render_messages == [
+            {"role": "system", "content": f"Be concise.\n\n{hint}"},
+            original[1],
+        ]
+    else:
+        assert render_messages == [{"role": "system", "content": hint}, *original]
+    assert request.messages == original
 
 
 @pytest.mark.parametrize("parser_cls", [Qwen3CoderToolParser, Qwen3XMLToolParser])

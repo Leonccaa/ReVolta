@@ -549,6 +549,10 @@ class OpenAIServingRender:
         skip_mm_cache: bool = False,
     ) -> tuple[list[ConversationMessage], list[EngineInput]]:
         """Copied from OpenAIServing._preprocess_chat."""
+        from vllm.tool_parsers.qwen_xml_tool_grammar import (
+            maybe_inject_qwen_xml_response_format_hint,
+        )
+
         validate_request_mm_kwargs(
             mm_processor_kwargs=getattr(request, "mm_processor_kwargs", None),
             media_io_kwargs=getattr(request, "media_io_kwargs", None),
@@ -556,6 +560,9 @@ class OpenAIServingRender:
         )
         renderer = self.renderer
         mm_config = self.model_config.multimodal_config
+        messages = maybe_inject_qwen_xml_response_format_hint(
+            request, messages, tool_parser
+        )
 
         default_template_kwargs = merge_kwargs(
             default_template_kwargs,

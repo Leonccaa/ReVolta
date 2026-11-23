@@ -52,7 +52,16 @@ from vllm.v1.worker.gpu.spec_decode import uses_dflash_selector_engine
 logger = init_logger(__name__)
 
 
-@triton.jit
+# The counts change every step. Do not specialize on them, or a new count class
+# compiles a new variant during serving.
+@triton.jit(
+    do_not_specialize=[
+        "num_reqs",
+        "num_query_tokens",
+        "real_num_query_tokens",
+        "block_cols",
+    ]
+)
 def _sm70_prepare_smallq_decode_metadata_kernel(
     out_block_table_ptr,
     out_seq_lens_ptr,

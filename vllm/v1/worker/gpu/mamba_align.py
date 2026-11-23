@@ -152,7 +152,9 @@ def preprocess_mamba_align_fused_kernel(
     )
 
 
-@triton.jit
+# The request count changes every step. Do not specialize on it, or a new count
+# class compiles a new variant during serving.
+@triton.jit(do_not_specialize=["num_reqs"])
 def _precopy_mamba_align_kernel(
     state_idx_ptr,
     src_col_ptr,

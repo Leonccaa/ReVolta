@@ -370,3 +370,14 @@ def test_sm70_gdn_verify_deferred_q8_matches_reference_and_graph(num_reqs):
             .item()
         )
         assert max_o2 < 5e-3, f"round2 out max_err={max_o2}"
+
+
+def test_replay_row_kernel_does_not_specialize_on_row_counts():
+    # A new decode/prefill mix must not compile a new variant during serving.
+    from vllm.model_executor.layers.mamba.gdn import spec_replay
+
+    kernel = spec_replay._prepare_replay_rows_kernel
+    if not hasattr(kernel, "do_not_specialize"):
+        pytest.skip("Triton interpreter does not specialize")
+    names = [kernel.arg_names[i] for i in kernel.do_not_specialize]
+    assert {"num_spec", "num_plain"} <= set(names)

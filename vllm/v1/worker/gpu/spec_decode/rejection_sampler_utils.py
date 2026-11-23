@@ -994,7 +994,7 @@ def _dflash2_sparse_topk_rejection_kernel(
 
     resample_step = accepted_steps
     resample_row = start_idx + resample_step
-    target_ids, target_logits, target_keep, target_lse = _dflash2_compact_target_row(
+    target_ids, target_logits, target_keep, _ = _dflash2_compact_target_row(
         target_ids_ptr,
         target_logits_ptr,
         target_stride,
@@ -1027,9 +1027,6 @@ def _dflash2_sparse_topk_rejection_kernel(
             mask=draft_mask,
             other=float("-inf"),
         ).to(tl.float32)
-        draft_max, draft_sumexp = _compute_block_max_and_sumexp(draft_logits)
-        draft_lse = draft_max + tl.log(draft_sumexp)
-
         id_match = target_ids[:, None] == draft_ids[None, :]
         draft_logits_at_target = tl.max(
             tl.where(
@@ -1039,14 +1036,33 @@ def _dflash2_sparse_topk_rejection_kernel(
             ),
             axis=1,
         )
-        target_log_probs = target_logits - target_lse
-        draft_log_probs = draft_logits_at_target - draft_lse
-        ratio = tl.exp(draft_log_probs - target_log_probs)
-        residual_logits = tl.where(
-            target_keep & (ratio < 1.0),
-            target_log_probs + tldevice.log1p(-ratio),
-            float("-inf"),
+        target_max, target_excl = _compute_block_max_and_sumexp_excl(
+            target_logits, TARGET_BLOCK_K
         )
+        draft_max, draft_excl = _compute_block_max_and_sumexp_excl(
+            draft_logits, DRAFT_BLOCK_K
+        )
+        residual_logits = _stable_residual_logits(
+            target_logits,
+            draft_logits_at_target,
+            target_max,
+            tldevice.log1p(target_excl),
+            draft_max,
+            tldevice.log1p(draft_excl),
+        )
+        # Match dense recovery when FP32 rounds the entire residual to zero.
+        if tl.sum((tl.abs(residual_logits) < float("inf")).to(tl.int32), axis=0) == 0:
+            residual_logits = _single_lse_residual_logits(
+                target_logits,
+                draft_logits_at_target,
+                target_max + tl.log(1.0 + target_excl),
+                draft_max + tl.log(1.0 + draft_excl),
+            )
+            if (
+                tl.sum((tl.abs(residual_logits) < float("inf")).to(tl.int32), axis=0)
+                == 0
+            ):
+                residual_logits = target_logits
 
     pos = tl.load(pos_ptr + resample_row)
     _, selected_offset = gumbel_noised_argmax(

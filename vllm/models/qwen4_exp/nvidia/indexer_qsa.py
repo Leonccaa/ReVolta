@@ -135,6 +135,7 @@ class QSAIndexer(nn.Module):
             vllm_config.kernel_config.sm70_qsa_shared_key
             or envs.VLLM_SM70_QSA_SHARED_KEY
         )
+        self.fused_topk = vllm_config.kernel_config.sm70_qsa_fused_topk
 
         self.index_qk_proj = ReplicatedLinear(
             int(config.hidden_size),
@@ -356,6 +357,7 @@ class QSAIndexer(nn.Module):
             return out
 
         # Score compressed keys, select blocks, then expand them to token indices.
+        uniform_decode = get_forward_context().is_uniform_decode
         return qsa_select_paged_tokens(
             q,
             compressed_key_cache,
@@ -374,10 +376,9 @@ class QSAIndexer(nn.Module):
             index_dcp_rank=compressed_metadata.index_dcp_rank,
             prefill_ranges=compressed_metadata.prefill_ranges,
             batch_query_starts=(
-                compressed_metadata.query_start_loc
-                if get_forward_context().is_uniform_decode
-                else None
+                compressed_metadata.query_start_loc if uniform_decode else None
             ),
+            fused_topk=self.fused_topk and uniform_decode,
         )
 
 

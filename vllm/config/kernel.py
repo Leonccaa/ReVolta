@@ -661,6 +661,10 @@ class KernelConfig:
     """Share FP16 indexer keys across M2..8 queries of one request on SM70
     (1CatAI #1127; opt-in here, also VLLM_SM70_QSA_SHARED_KEY=1)."""
 
+    sm70_qsa_fused_topk: bool = False
+    """Use native fused scoring and exact Top-512 for replicated SM70 QSA
+    decode and verification batches."""
+
     sm70_qsa_paged_fp16_h12: bool = False
     """Use the native FP16 paged QSA reader for eligible TP4/DCP2 target
     decode on SM70. Its reduction and probability rounding differ."""
@@ -815,6 +819,8 @@ class KernelConfig:
             # Scheduler-only prefix-hit check; no compiled graph changes.
             "qsa_cross_group_hit_check",
         }
+        if not self.sm70_qsa_fused_topk:
+            ignored_factors.add("sm70_qsa_fused_topk")
         if not self.sm70_qsa_paged_fp16_h6:
             ignored_factors.add("sm70_qsa_paged_fp16_h6")
         if not self.sm70_skinny_moe_applicable:

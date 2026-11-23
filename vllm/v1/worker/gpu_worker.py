@@ -1057,9 +1057,13 @@ class Worker(WorkerBase):
                 continue
             seen.add(spec)
             dtype = self.model_config.dtype
-            qk = torch.zeros((2, 4, heads, head_dim), dtype=dtype, device=device)
-            cos = torch.ones((4, head_dim // 2), dtype=dtype, device=device)
-            rotary(qk, cos, torch.zeros_like(cos))
+            # Triton specializes both sequence extents on 16-row alignment.
+            for seq_len in (4, 16):
+                qk = torch.zeros(
+                    (2, seq_len, heads, head_dim), dtype=dtype, device=device
+                )
+                cos = torch.ones((seq_len, head_dim // 2), dtype=dtype, device=device)
+                rotary(qk, cos, torch.zeros_like(cos))
 
     @staticmethod
     def _freeze_gc_after_warmup() -> None:

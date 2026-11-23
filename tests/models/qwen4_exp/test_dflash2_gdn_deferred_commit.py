@@ -379,5 +379,5 @@ def test_replay_row_kernel_does_not_specialize_on_row_counts():
     kernel = spec_replay._prepare_replay_rows_kernel
     if not hasattr(kernel, "do_not_specialize"):
         pytest.skip("Triton interpreter does not specialize")
-    names = [kernel.arg_names[i] for i in kernel.do_not_specialize]
-    assert {"num_spec", "num_plain"} <= set(names)
+    names = {param.name for param in kernel.params if param.do_not_specialize}
+    assert {"num_spec", "num_plain"} <= names

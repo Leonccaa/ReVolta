@@ -43,7 +43,7 @@ _JSON_SCHEMA_NO_TOOL_HINT = (
 )
 
 
-def _qwen_xml_json_answer(
+def qwen_xml_json_answer(
     request: ChatCompletionRequest,
 ) -> tuple[dict[str, Any], str] | None:
     # An omitted tool choice is normalized to "auto" when tools are present.
@@ -67,20 +67,10 @@ def _qwen_xml_json_answer(
     return None
 
 
-def maybe_inject_qwen_xml_response_format_hint(
-    request: Any,
-    messages: list[Any],
-    tool_parser: Any,
-) -> list[Any]:
+def inject_qwen_xml_response_format_hint(messages: list[Any], hint: str) -> list[Any]:
     """Tell the model how to answer directly in the Qwen XML tool/JSON union."""
-    if not isinstance(request, ChatCompletionRequest) or not getattr(
-        tool_parser, "_uses_qwen_xml_tool_grammar", False
-    ):
+    if not messages:
         return messages
-    answer = _qwen_xml_json_answer(request)
-    if answer is None or not messages:
-        return messages
-    _, hint = answer
 
     first = messages[0]
     if isinstance(first, dict) and first.get("role") in ("system", "developer"):
@@ -105,19 +95,18 @@ def maybe_inject_qwen_xml_response_format_hint(
 def adjust_qwen_xml_tool_request(
     request: ChatCompletionRequest | ResponsesRequest,
     logger: Logger,
-) -> bool:
-    """Install a tool/answer union, or return False for the caller's base path.
+) -> str | None:
+    """Install a tool/answer union and return its raw JSON rendering hint.
 
-    A False result leaves the request untouched. Keep the construction order,
-    serialization and fallback policy identical for both XML parsers.
+    A None result leaves the request untouched for the caller's base path.
     """
     if not isinstance(request, ChatCompletionRequest):
-        return False
-    answer = _qwen_xml_json_answer(request)
+        return None
+    answer = qwen_xml_json_answer(request)
     if answer is None:
-        return False
+        return None
     assert request.tools is not None
-    schema, _ = answer
+    schema, hint = answer
     answer_format = JSONSchemaFormat(json_schema=schema)
     reasoning = get_enable_structured_outputs_in_reasoning()
 
@@ -196,7 +185,7 @@ def adjust_qwen_xml_tool_request(
                 "falling back to default tool calling.",
                 outcome,
             )
-            return False
+            return None
 
     # Match AbstractToolParser.adjust_request's structural-tag style.
     if request.structured_outputs is None:
@@ -208,4 +197,4 @@ def adjust_qwen_xml_tool_request(
     # Mandatory: otherwise to_sampling_params derives a second constraint
     # from response_format and the single-constraint validation raises.
     request.response_format = None
-    return True
+    return hint

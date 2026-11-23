@@ -13,10 +13,12 @@ import pytest
 from xgrammar import Grammar
 
 from tests.entrypoints.openai.chat_completion.test_chat_error import MockModelConfig
+from vllm.config.structured_outputs import StructuredOutputsConfig
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 from vllm.sampling_params import StructuredOutputsParams
+from vllm.tool_parsers import qwen_xml_tool_grammar
 from vllm.tool_parsers.abstract_tool_parser import ToolParser
 from vllm.tool_parsers.qwen3coder_tool_parser import Qwen3CoderToolParser
 from vllm.tool_parsers.qwen3xml_tool_parser import Qwen3XMLToolParser
@@ -47,6 +49,19 @@ JSON_SCHEMA = {
 }
 JSON_OBJECT = {"type": "json_object"}
 NAMED = {"type": "function", "function": {"name": "get_weather"}}
+JSON_SCHEMA_WITH_DISABLED_DEBUG = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "answer",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {"answer": {"type": "integer"}, "debug": False},
+            "required": ["answer"],
+            "additionalProperties": False,
+        },
+    },
+}
 
 # Seven formerly broken requests and eight controls.
 CASES = [
@@ -93,7 +108,7 @@ def make_parser(parser_cls):
 
 
 @pytest.mark.parametrize(
-    ("parser_name", "tool_choice", "response_format", "hint"),
+    ("parser_name", "tool_choice", "response_format", "hint", "beam", "attempts"),
     [
         (
             "qwen3_coder",
@@ -101,6 +116,8 @@ def make_parser(parser_cls):
             JSON_OBJECT,
             "If no tool call is required to answer the user, reply directly with a raw "
             "JSON object without markdown code fences.",
+            False,
+            1,
         ),
         (
             "qwen3_xml",
@@ -108,18 +125,43 @@ def make_parser(parser_cls):
             JSON_SCHEMA,
             "If no tool call is required to answer the user, reply directly with a raw "
             "JSON value matching the requested schema without markdown code fences.",
+            False,
+            1,
         ),
-        ("qwen3_coder", NAMED, JSON_OBJECT, None),
-        ("qwen3_coder", "required", JSON_SCHEMA, None),
-        ("qwen3_coder", "none", JSON_OBJECT, None),
-        ("qwen3_coder", "auto", None, None),
+        ("qwen3_coder", NAMED, JSON_OBJECT, None, False, 0),
+        ("qwen3_coder", "required", JSON_SCHEMA, None, False, 0),
+        ("qwen3_coder", "none", JSON_OBJECT, None, False, 0),
+        ("qwen3_coder", "auto", None, None, False, 0),
+        pytest.param(
+            "qwen3_coder",
+            "auto",
+            JSON_SCHEMA_WITH_DISABLED_DEBUG,
+            None,
+            False,
+            2,
+            id="union-compile-fallback",
+        ),
+        pytest.param(
+            "qwen3_coder",
+            "auto",
+            JSON_OBJECT,
+            None,
+            True,
+            1,
+            id="beam-search",
+        ),
     ],
 )
 def test_qwen_xml_json_hint_reaches_chat_template(
-    parser_name, tool_choice, response_format, hint
+    monkeypatch, parser_name, tool_choice, response_format, hint, beam, attempts
 ):
     tokenizer = Mock()
-    tokenizer.get_vocab.return_value = {"<tool_call>": 0, "</tool_call>": 1}
+    tokenizer.get_vocab.return_value = {
+        "<tool_call>": 0,
+        "</tool_call>": 1,
+        "<think>": 2,
+        "</think>": 3,
+    }
     renderer = Mock(tokenizer=tokenizer)
     renderer.get_tokenizer.return_value = tokenizer
     renderer.render_chat_async = AsyncMock(return_value=([[]], [{}]))
@@ -132,6 +174,7 @@ def test_qwen_xml_json_hint_reaches_chat_template(
         chat_template_content_format="auto",
         enable_auto_tools=True,
         tool_parser=parser_name,
+        reasoning_parser="qwen3",
     )
     messages = [{"role": "user", "content": "What is 2 + 2?"}]
     if parser_name == "qwen3_xml":
@@ -141,12 +184,18 @@ def test_qwen_xml_json_hint_reaches_chat_template(
             "messages": messages,
             "tool_choice": tool_choice,
             "response_format": response_format,
+            "use_beam_search": beam,
+            "n": 2 if beam else 1,
         }
     )
     original = copy.deepcopy(request.messages)
+    original_format = request.response_format
+    grammar = Mock(wraps=Grammar)
+    monkeypatch.setattr(qwen_xml_tool_grammar, "Grammar", grammar)
 
     asyncio.run(serving.render_chat(request))
 
+    assert grammar.from_structural_tag.call_count == attempts
     (render_messages,), _, _ = renderer.render_chat_async.call_args.args
     if hint is None:
         assert render_messages == original
@@ -158,6 +207,18 @@ def test_qwen_xml_json_hint_reaches_chat_template(
     else:
         assert render_messages == [{"role": "system", "content": hint}, *original]
     assert request.messages == original
+    if response_format is JSON_SCHEMA_WITH_DISABLED_DEBUG:
+        assert request.response_format == original_format
+        params = request.to_sampling_params(32, {})
+        assert (
+            params.structured_outputs.json == response_format["json_schema"]["schema"]
+        )
+        params._validate_structured_outputs(
+            StructuredOutputsConfig(backend="auto"), tokenizer
+        )
+        assert params.structured_outputs._backend == "guidance"
+    if beam:
+        assert request.to_beam_search_params(32, {}).beam_width == 2
 
 
 @pytest.mark.parametrize("parser_cls", [Qwen3CoderToolParser, Qwen3XMLToolParser])

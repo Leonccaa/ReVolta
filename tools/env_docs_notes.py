@@ -275,6 +275,15 @@ NOTES: dict[str, dict[str, str]] = {
         "kernels.",
         metrics="",
     ),
+    "VLLM_SM70_DFLASH2_DRAFT_QPN8_TOPK": dict(
+        section="deployment",
+        since="0.2.0",
+        range="0, 1",
+        tradeoff="Opts into channel-QPN8 draft candidate selection at up to 16 "
+        "rows. May change draft candidates. Explicit "
+        "speculative_config.sm70_dflash2.draft_qpn8_topk overrides it.",
+        metrics="",
+    ),
     "VLLM_SM70_DFLASH2_FUSED_QKV_PACK": dict(
         section="deployment",
         since="1Cat",

@@ -100,15 +100,15 @@ __global__ void select_compact_half_wide_keys(
   }
 }
 
-int64_t sm70_compact_half_topk_wide_revision() { return 1; }
+int64_t sm70_compact_half_topk_wide_revision() { return 2; }
 
 void sm70_compact_half_topk_out(const at::Tensor& x, at::Tensor partial,
                                 at::Tensor values, at::Tensor ids, int64_t k) {
   c10::cuda::CUDAGuard guard(x.device());
   TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kHalf && x.dim() == 2 &&
               x.stride(1) == 1);
-  TORCH_CHECK(x.size(1) <= 524288 && x.size(1) >= k && k == 64);
-  TORCH_CHECK(x.size(0) >= 1 && x.size(0) <= 64);
+  TORCH_CHECK(x.size(1) <= 524288 && x.size(1) >= k && k >= 1 && k <= 64);
+  TORCH_CHECK(x.size(0) >= 1 && x.size(0) <= 256);
   TORCH_CHECK(partial.is_cuda() && values.is_cuda() && ids.is_cuda());
   TORCH_CHECK(partial.device() == x.device() && values.device() == x.device() &&
               ids.device() == x.device());
@@ -133,6 +133,10 @@ void sm70_compact_half_topk_out(const at::Tensor& x, at::Tensor partial,
             x.stride(0), k, width);
     if (width <= 1024)
       select_compact_half_keys<4, true><<<x.size(0), 256, 0, stream>>>(
+          data, partial.data_ptr<uint32_t>(), values.data_ptr<float>(),
+          ids.data_ptr<int64_t>(), x.size(1), x.stride(0), k, width);
+    else if (width <= 2048)
+      select_compact_half_keys<8, true><<<x.size(0), 256, 0, stream>>>(
           data, partial.data_ptr<uint32_t>(), values.data_ptr<float>(),
           ids.data_ptr<int64_t>(), x.size(1), x.stride(0), k, width);
     else
@@ -173,7 +177,7 @@ void sm70_compact_half_topk_ids_out(const at::Tensor& x, at::Tensor partial,
   TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kHalf && x.dim() == 2 &&
               x.stride(1) == 1);
   TORCH_CHECK(x.size(1) <= 524288 && x.size(1) >= k && (k == 32 || k == 64));
-  TORCH_CHECK(x.size(0) >= 1 && x.size(0) <= 64);
+  TORCH_CHECK(x.size(0) >= 1 && x.size(0) <= 256);
   TORCH_CHECK(partial.is_cuda() && ids.is_cuda());
   TORCH_CHECK(partial.device() == x.device() && ids.device() == x.device());
   TORCH_CHECK(ids.scalar_type() == at::kInt);

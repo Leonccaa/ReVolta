@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter, UninitializedParameter
 
 import vllm.envs as envs
+from vllm import _custom_ops as ops
 from vllm import _sm70_ops as sm70_ops
 from vllm.config.sm70_dflash2 import (
     capture_sm70_dflash2_config,
@@ -48,9 +49,11 @@ logger = init_logger(__name__)
 
 _SM70_DFLASH2_QPN8_VOCAB_CHUNK = 62080
 _SM70_DFLASH2_QPN8_MAX_ROWS = 8
+_SM70_DFLASH2_DRAFT_QPN8_MAX_ROWS = 16
 _SM70_DFLASH2_QPN8_CANDIDATES = 64
 _SM70_DFLASH2_QPN8_SPLIT_K = 8
 _SM70_DFLASH2_QPN8_ACCUMULATOR_CHAINS = 1
+_SM70_DFLASH2_DRAFT_QPN8_ACCUMULATOR_CHAINS = 2
 _SM70_DFLASH2_RERANK_CTA_N = 128
 _SM70_DFLASH2_RERANK_SPLIT_K = 10
 
@@ -82,6 +85,13 @@ def _sm70_dflash2_qpn8_rerank_requested(layer=None) -> bool:
         _sm70_dflash2_qpn8_rerank_enabled(layer=layer)
         or envs.VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW
     )
+
+
+def _sm70_dflash2_draft_qpn8_enabled(layer=None) -> bool:
+    policy = getattr(layer, "_sm70_dflash2_policy", None)
+    if policy is None:
+        policy = capture_sm70_dflash2_config()
+    return policy is not None and policy.draft_qpn8_topk
 
 
 def _sm70_lm_head_packed_layout_requested(
@@ -121,6 +131,7 @@ def _is_sm70_lm_head_fastpath_eligible(layer: torch.nn.Module) -> bool:
         or _sm70_env_bool("VLLM_SM70_LM_HEAD_TOP1_TC", False)
         or _sm70_dflash2_option("fp32_logits", layer)
         or _sm70_dflash2_qpn8_rerank_requested(layer=layer)
+        or _sm70_dflash2_draft_qpn8_enabled(layer=layer)
     ):
         _trace_sm70_lm_head_skip("disabled")
         return False
@@ -317,6 +328,31 @@ def _prepare_sm70_dflash2_qpn8_rerank(layer: torch.nn.Module) -> bool:
             torch.empty((max_rows, selector_k), dtype=torch.int64, device=device),
             persistent=False,
         )
+    if hasattr(torch.ops._C, "sm70_compact_half_topk_ids_out"):
+        from vllm.model_executor.layers.sm70_compact_topk import (
+            sm70_compact_half_topk_ids_partial_spec,
+        )
+
+        max_chunk = max(end - begin for begin, end in groups)
+        partial_shape, partial_dtype = sm70_compact_half_topk_ids_partial_spec(
+            max_rows, max_chunk, _SM70_DFLASH2_QPN8_CANDIDATES
+        )
+        layer.register_buffer(
+            "_sm70_dflash2_qpn8_topk_partial",
+            torch.empty(
+                partial_shape[0] * partial_shape[1], dtype=partial_dtype, device=device
+            ),
+            persistent=False,
+        )
+        layer.register_buffer(
+            "_sm70_dflash2_qpn8_topk_ids_i32",
+            torch.empty(
+                (max_rows, _SM70_DFLASH2_QPN8_CANDIDATES),
+                dtype=torch.int32,
+                device=device,
+            ),
+            persistent=False,
+        )
     layer._sm70_dflash2_qpn8_rerank_prepared = True
     logger.info_once(
         "SM70 DFlash2 QPN8 rerank layout prepared: %d vocabulary chunks, "
@@ -324,6 +360,102 @@ def _prepare_sm70_dflash2_qpn8_rerank(layer: torch.nn.Module) -> bool:
         len(groups),
         candidates,
         "FP32" if fp32_logits else "FP16",
+    )
+    return True
+
+
+def _is_sm70_dflash2_draft_qpn8_eligible(layer: torch.nn.Module) -> bool:
+    if not _sm70_dflash2_draft_qpn8_enabled(layer=layer):
+        return False
+    rows, hidden = layer.weight.shape
+    if (
+        rows < 64
+        or rows > 524288
+        or rows % 32
+        or hidden <= 0
+        or hidden % 128
+        or (hidden // 16) % _SM70_DFLASH2_QPN8_SPLIT_K
+    ):
+        logger.warning_once(
+            "SM70 DFlash2 draft QPN8 requires 64<=N<=524288, N%%32=0, K%%128=0; "
+            "got %s. Falling back to the existing draft LM head.",
+            tuple(layer.weight.shape),
+        )
+        return False
+    required_ops = ("fp8_qpn8_prepare_sm70", "fp8_qpn8_gemm_sm70_out")
+    missing = [name for name in required_ops if not hasattr(torch.ops._C, name)]
+    if missing:
+        logger.warning_once(
+            "SM70 DFlash2 draft QPN8 operators are unavailable (%s); "
+            "falling back to the existing draft LM head.",
+            ", ".join(missing),
+        )
+        return False
+    return True
+
+
+@torch.inference_mode()
+def _prepare_sm70_dflash2_draft_qpn8(layer: torch.nn.Module) -> bool:
+    if getattr(layer, "_sm70_dflash2_draft_qpn8_prepared", False):
+        return True
+    if not _is_sm70_dflash2_draft_qpn8_eligible(layer):
+        return False
+
+    weight = layer.weight
+    rows, _hidden = weight.shape
+    device = weight.device
+    if not getattr(layer, "_sm70_dflash2_qpn8_rerank_prepared", False):
+        qweight = torch.empty_like(weight, dtype=torch.float8_e4m3fn)
+        channel_scales = torch.empty((rows, 1), dtype=torch.float32, device=device)
+        chunk_rows = 4096
+        for begin in range(0, rows, chunk_rows):
+            end = min(begin + chunk_rows, rows)
+            weight_f32 = weight[begin:end].float()
+            scales = weight_f32.abs().amax(dim=1, keepdim=True).div_(448.0)
+            scales.clamp_(min=torch.finfo(torch.float32).tiny)
+            channel_scales[begin:end].copy_(scales)
+            qweight[begin:end].copy_(
+                weight_f32.div_(scales).clamp_(-448.0, 448.0).to(torch.float8_e4m3fn)
+            )
+        codes, packed_scales = sm70_ops.fp8_qpn8_prepare_sm70(qweight, channel_scales)
+        del qweight, channel_scales, weight_f32, scales
+        torch.accelerator.empty_cache()
+        layer.register_buffer("_sm70_dflash2_qpn8_codes", codes, persistent=False)
+        layer.register_buffer(
+            "_sm70_dflash2_qpn8_scales", packed_scales, persistent=False
+        )
+
+    max_rows = _SM70_DFLASH2_DRAFT_QPN8_MAX_ROWS
+    layer.register_buffer(
+        "_sm70_dflash2_draft_qpn8_logits",
+        torch.empty((max_rows, rows), dtype=torch.float16, device=device),
+        persistent=False,
+    )
+    from vllm.model_executor.layers.sm70_compact_topk import (
+        sm70_compact_half_topk_partial_spec,
+        sm70_compact_half_topk_revision,
+    )
+
+    if sm70_compact_half_topk_revision() >= 2:
+        valid_vocab = rows - int(layer.shard_indices.num_org_vocab_padding)
+        partial_shape, partial_dtype = sm70_compact_half_topk_partial_spec(
+            max_rows, valid_vocab, 64
+        )
+        layer.register_buffer(
+            "_sm70_dflash2_draft_qpn8_topk_partial",
+            torch.empty(
+                partial_shape[0] * partial_shape[1],
+                dtype=partial_dtype,
+                device=device,
+            ),
+            persistent=False,
+        )
+    layer._sm70_dflash2_draft_qpn8_prepared = True
+    logger.info_once(
+        "SM70 DFlash2 draft pure-QPN8 head prepared: N=%d, K=%d, max_rows=%d.",
+        rows,
+        weight.shape[1],
+        max_rows,
     )
     return True
 
@@ -420,19 +552,24 @@ def maybe_prepare_sm70_lm_head_top1(layer: torch.nn.Module) -> bool:
 
     if not packed_layout_requested:
         _prepare_sm70_dflash2_qpn8_rerank(layer)
+        _prepare_sm70_dflash2_draft_qpn8(layer)
         logger.info_once("SM70 original-weight LM head path prepared.")
         return True
 
     if not hasattr(torch.ops._C, "sm70_f16_prepare"):
+        _prepare_sm70_dflash2_draft_qpn8(layer)
         _trace_sm70_lm_head_skip("missing_sm70_f16_prepare_op")
         return raw_top1_requested
     if getattr(layer, "_sm70_f16_prepared", False):
+        _prepare_sm70_dflash2_draft_qpn8(layer)
         return True
     prepared = sm70_ops.sm70_f16_prepare(layer.weight)
     layer._sm70_f16_tm_weight = prepared[0]
     layer._sm70_f16_k_ld = int(prepared[1][0].item())
     layer._sm70_f16_prepared = True
-    if _prepare_sm70_dflash2_qpn8_rerank(layer):
+    rerank_ok = _prepare_sm70_dflash2_qpn8_rerank(layer)
+    _prepare_sm70_dflash2_draft_qpn8(layer)
+    if rerank_ok:
         pass
     elif envs.VLLM_SM70_ENABLE_LM_HEAD_FASTPATH:
         logger.info_once("SM70 dense fp16 fast path enabled for LM head.")
@@ -616,18 +753,40 @@ def _maybe_sm70_dflash2_qpn8_rerank(
     # support, so skip the unnecessary 64-element result sort. This keeps the
     # official PyTorch multiblock selector while avoiding its final bitonic
     # kernel and leaves candidate quality unchanged.
+    use_compact_ids = (
+        hasattr(torch.ops._C, "sm70_compact_half_topk_ids_out")
+        and getattr(layer, "_sm70_dflash2_qpn8_topk_ids_i32", None) is not None
+    )
+    if use_compact_ids:
+        from vllm.model_executor.layers.sm70_compact_topk import (
+            sm70_compact_half_topk_ids_partial_spec,
+        )
     candidate_offset = 0
     for begin, end in layer._sm70_dflash2_qpn8_vocab_groups:
         count = min(_SM70_DFLASH2_QPN8_CANDIDATES, end - begin)
-        group_values = qpn8_values[:, candidate_offset : candidate_offset + count]
         group_ids = qpn8_ids[:, candidate_offset : candidate_offset + count]
-        torch.topk(
-            qpn8_logits[:, begin:end],
-            count,
-            dim=-1,
-            sorted=False,
-            out=(group_values, group_ids),
-        )
+        if use_compact_ids and count == 64:
+            chunk_width = end - begin
+            p_shape, _ = sm70_compact_half_topk_ids_partial_spec(
+                num_rows, chunk_width, 64
+            )
+            partial = layer._sm70_dflash2_qpn8_topk_partial[
+                : p_shape[0] * p_shape[1]
+            ].view(p_shape)
+            ids_i32 = layer._sm70_dflash2_qpn8_topk_ids_i32[:num_rows]
+            ops.sm70_compact_half_topk_ids_out(
+                qpn8_logits[:, begin:end], partial, ids_i32, 64
+            )
+            group_ids.copy_(ids_i32)
+        else:
+            group_values = qpn8_values[:, candidate_offset : candidate_offset + count]
+            torch.topk(
+                qpn8_logits[:, begin:end],
+                count,
+                dim=-1,
+                sorted=False,
+                out=(group_values, group_ids),
+            )
         if begin:
             group_ids.add_(begin)
         candidate_offset += count
@@ -735,6 +894,89 @@ def _maybe_sm70_dflash2_lm_head_top20(
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """Return selector candidates from the opt-in QPN8 plus FP16 rerank."""
     return _maybe_sm70_dflash2_qpn8_rerank(layer, x, selector_k, bias)
+
+
+def _maybe_sm70_dflash2_draft_qpn8_topk(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    selector_k: int,
+    bias: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Return draft-only shard-local top-k directly from channel-QPN8 logits."""
+    if not _sm70_dflash2_draft_qpn8_enabled(layer=layer):
+        return None
+    if not getattr(layer, "_sm70_dflash2_draft_qpn8_prepared", False):
+        return None
+    if bias is not None or not 1 <= selector_k <= 64:
+        return None
+    if x.dtype != torch.float16 or not x.is_cuda:
+        return None
+    if torch.cuda.get_device_capability(x.device) != (7, 0):
+        return None
+
+    x_2d = x.reshape(-1, x.shape[-1])
+    num_rows = x_2d.size(0)
+    if not 1 <= num_rows <= _SM70_DFLASH2_DRAFT_QPN8_MAX_ROWS:
+        return None
+    k_blocks = int(x_2d.shape[1]) // 16
+    if num_rows <= 16:
+        split_k = _SM70_DFLASH2_QPN8_SPLIT_K
+    elif k_blocks % 16 == 0:
+        split_k = 16
+    elif k_blocks % 12 == 0:
+        split_k = 12
+    else:
+        return None
+    if not x_2d.is_contiguous():
+        x_2d = x_2d.contiguous()
+
+    qpn8_logits = layer._sm70_dflash2_draft_qpn8_logits[:num_rows]
+    sm70_ops.fp8_qpn8_gemm_sm70_out(
+        qpn8_logits,
+        x_2d,
+        layer._sm70_dflash2_qpn8_codes,
+        layer._sm70_dflash2_qpn8_scales,
+        split_k,
+        _SM70_DFLASH2_DRAFT_QPN8_ACCUMULATOR_CHAINS,
+        True,
+        False,
+    )
+    num_pad = int(layer.shard_indices.num_org_vocab_padding)
+    valid_vocab = int(qpn8_logits.shape[1]) - num_pad
+    valid_logits = qpn8_logits[:, :valid_vocab] if num_pad > 0 else qpn8_logits
+
+    from vllm.model_executor.layers.sm70_compact_topk import (
+        maybe_sm70_compact_half_topk,
+        sm70_compact_half_topk_partial_spec,
+    )
+
+    partial_buf = getattr(layer, "_sm70_dflash2_draft_qpn8_topk_partial", None)
+    partial = None
+    if partial_buf is not None:
+        p_shape, _ = sm70_compact_half_topk_partial_spec(
+            num_rows, valid_vocab, selector_k
+        )
+        need = p_shape[0] * p_shape[1]
+        if partial_buf.numel() >= need:
+            partial = partial_buf[:need].view(p_shape)
+
+    native = maybe_sm70_compact_half_topk(valid_logits, selector_k, partial=partial)
+    if native is not None:
+        values, ids = native
+    else:
+        values, ids = torch.topk(valid_logits, selector_k, dim=-1, sorted=True)
+        ids = ids.to(torch.int64)
+
+    vocab_start = int(layer.shard_indices.org_vocab_start_index)
+    if vocab_start:
+        ids = ids + vocab_start
+    logger.info_once(
+        "SM70 DFlash2 draft pure-QPN8 top-%d enabled (native_topk=%s).",
+        selector_k,
+        native is not None,
+    )
+    output_shape = (*x.shape[:-1], selector_k)
+    return values.reshape(output_shape), ids.reshape(output_shape)
 
 
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
@@ -1246,6 +1488,16 @@ class VocabParallelEmbedding(PluggableLayer):
         bias: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         return _maybe_sm70_dflash2_lm_head_top20(self, hidden_states, selector_k, bias)
+
+    def maybe_get_sm70_dflash2_draft_topk(
+        self,
+        hidden_states: torch.Tensor,
+        selector_k: int,
+        bias: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        return _maybe_sm70_dflash2_draft_qpn8_topk(
+            self, hidden_states, selector_k, bias
+        )
 
     def extra_repr(self) -> str:
         s = f"num_embeddings={self.num_embeddings_per_partition}"

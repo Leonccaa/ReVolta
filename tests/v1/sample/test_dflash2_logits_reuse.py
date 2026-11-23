@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from vllm.model_executor.layers import logits_processor as logits_module
+from vllm.model_executor.layers import sm70_compact_topk
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.v1.worker.gpu.sample.states import SamplingStates
 from vllm.v1.worker.gpu.spec_decode.dflash2 import sparse_rejection
@@ -77,6 +78,42 @@ def test_fused_candidates_do_not_require_dense_logits(monkeypatch):
     )
     assert result[2] is None
     assert torch.equal(result[0], ids)
+
+
+def test_native_target_topk_timing(monkeypatch):
+    logits = torch.arange(64, dtype=torch.float16).view(1, -1)
+    head = SimpleNamespace(
+        maybe_get_sm70_dflash2_top20=lambda *args: None,
+        quant_method=SimpleNamespace(apply=lambda *args, **kwargs: logits),
+        shard_indices=SimpleNamespace(num_org_vocab_padding=0, org_vocab_start_index=0),
+    )
+    clock = 0.0
+    stage_times = []
+
+    def stage_ms(enabled, start):
+        elapsed = clock - start
+        stage_times.append(elapsed)
+        return elapsed
+
+    def native_topk(scores, k):
+        nonlocal clock
+        clock += 7.0
+        return scores.float().topk(k)
+
+    monkeypatch.setattr(logits_module, "_cuda_profile_enabled", lambda _: True)
+    monkeypatch.setattr(logits_module, "_cuda_sync_breakdown_ms", lambda _: (0, 0))
+    monkeypatch.setattr(logits_module, "_cuda_stage_start", lambda enabled: clock)
+    monkeypatch.setattr(logits_module, "_cuda_stage_ms", stage_ms)
+    monkeypatch.setattr(
+        logits_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(sm70_compact_topk, "maybe_sm70_compact_half_topk", native_topk)
+
+    ids, values = LogitsProcessor(64).get_topk_tokens_and_logits(
+        head, torch.empty(1, 4), 21
+    )
+    assert torch.equal(ids, values.long())
+    assert stage_times == [0.0, 0.0, 7.0, 0.0]
 
 
 @pytest.mark.skipif(

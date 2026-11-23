@@ -157,6 +157,13 @@ class Sm70DFlash2Config:
     codebook and draft step. On by default; set False to keep full codebooks
     on every rank. Configuration only, no environment alias."""
 
+    draft_qpn8_topk: bool = Field(
+        default_factory=lambda: envs.VLLM_SM70_DFLASH2_DRAFT_QPN8_TOPK
+    )
+    """Use channel-QPN8 GEMM + native FP16 top-k without FP16 rerank for
+    DFlash2 draft candidate selection. Off by default. Explicit configuration
+    overrides VLLM_SM70_DFLASH2_DRAFT_QPN8_TOPK."""
+
     qualified: bool = Field(default=False, init=False, repr=False)
     """Whether the retained complete-model validation boundary matches."""
 
@@ -207,6 +214,8 @@ class Sm70DFlash2Config:
         # Listed only when on, so turning it off keeps the earlier compile keys.
         if self.sharded_selector_codebook:
             options["sharded_selector_codebook"] = True
+        if self.draft_qpn8_topk:
+            options["draft_qpn8_topk"] = True
         return options
 
 

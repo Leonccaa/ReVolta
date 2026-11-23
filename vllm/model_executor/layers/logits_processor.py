@@ -651,23 +651,24 @@ class LogitsProcessor(PluggableLayer):
                     logits = logits.clone()
                 logits[..., -num_pad:] = -float("inf")
 
-            logits_float = logits.float()
-            postprocess_ms = _cuda_stage_ms(profile_enabled, stage_start)
-
-            local_k = min(top_k, logits_float.shape[-1])
-            stage_start = _cuda_stage_start(profile_enabled)
-            local_vals, local_indices = torch.topk(
-                logits_float,
-                k=local_k,
-                dim=-1,
+            local_k = min(top_k, int(logits.shape[-1]))
+            local_vocab_size = int(logits.shape[-1])
+            from vllm.model_executor.layers.sm70_compact_topk import (
+                maybe_sm70_compact_half_topk,
             )
+
+            postprocess_ms = _cuda_stage_ms(profile_enabled, stage_start)
+            stage_start = _cuda_stage_start(profile_enabled)
+            native_topk = maybe_sm70_compact_half_topk(logits, local_k)
+            if native_topk is None:
+                native_topk = torch.topk(logits.float(), k=local_k, dim=-1)
+            local_vals, local_indices = native_topk
             local_topk_ms = _cuda_stage_ms(profile_enabled, stage_start)
 
             stage_start = _cuda_stage_start(profile_enabled)
             vocab_start = lm_head.shard_indices.org_vocab_start_index
             local_global_indices = local_indices + vocab_start
             local_indices_ms = _cuda_stage_ms(profile_enabled, stage_start)
-            local_vocab_size = int(logits_float.shape[-1])
         else:
             local_vals, local_global_indices = local_candidates
             local_lm_head_ms = _cuda_stage_ms(profile_enabled, stage_start)

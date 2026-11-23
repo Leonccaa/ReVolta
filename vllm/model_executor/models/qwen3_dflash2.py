@@ -107,6 +107,19 @@ def _flashinfer_topk() -> Callable[..., tuple[torch.Tensor, torch.Tensor]] | Non
 def _topk(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
     impl = _flashinfer_topk()
     if impl is None or not scores.is_cuda:
+        if (
+            scores.is_cuda
+            and scores.dtype == torch.float16
+            and scores.ndim == 2
+            and scores.shape[0] <= 16
+        ):
+            from vllm.model_executor.layers.sm70_compact_topk import (
+                maybe_sm70_compact_half_topk,
+            )
+
+            native = maybe_sm70_compact_half_topk(scores, k)
+            if native is not None:
+                return native
         return torch.topk(scores, k, dim=-1)
     return impl(scores, k, sorted=True, deterministic=True)
 
@@ -581,11 +594,17 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
             )
 
         selector = self.model.candidate_selector
-        local_candidates = (
-            self.lm_head.maybe_get_sm70_dflash2_top20(hidden_states, selector.top_k)
-            if unquantized_head
-            else None
-        )
+        local_candidates = None
+        if unquantized_head:
+            draft_topk_fn = getattr(
+                self.lm_head, "maybe_get_sm70_dflash2_draft_topk", None
+            )
+            if draft_topk_fn is not None:
+                local_candidates = draft_topk_fn(hidden_states, selector.top_k)
+            if local_candidates is None:
+                local_candidates = self.lm_head.maybe_get_sm70_dflash2_top20(
+                    hidden_states, selector.top_k
+                )
         if local_candidates is None:
             logits = self.lm_head.quant_method.apply(
                 self.lm_head, hidden_states, bias=None

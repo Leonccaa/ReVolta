@@ -123,6 +123,27 @@ class TestJitHook:
         assert "Triton kernel JIT compilation during inference" in msg
         assert "test_kernel" in msg
 
+    def test_hook_warns_for_each_new_variant(self):
+        fake = _make_fake_knobs()
+        with _patch_triton_knobs(fake):
+            jit_monitor.activate()
+
+        hook = fake.runtime.jit_post_compile_hook
+        mock_fn = SimpleNamespace(name="variant_kernel")
+        with mock.patch.object(jit_monitor.logger, "warning") as m:
+            for key in ("key_one", "key_two", "key_two"):
+                hook(
+                    key=key,
+                    repr="r",
+                    fn=mock_fn,
+                    compile=lambda: None,
+                    is_manual_warmup=False,
+                    already_compiled=False,
+                )
+
+        # A second specialization of the same kernel is a second compile.
+        assert m.call_count == 2
+
     def test_hook_chains_existing_hook(self):
         existing = mock.MagicMock(return_value="existing_result")
         fake = _make_fake_knobs(jit_hook=existing)

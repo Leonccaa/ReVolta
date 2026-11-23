@@ -85,6 +85,7 @@ LOGPROB = "vllm/v1/worker/gpu/sample/logprob.py"
 REJECT = "vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py"
 GREEDY = "vllm/v1/worker/gpu/spec_decode/sm70_greedy_verify.py"
 DFLASH = "vllm/v1/worker/gpu/spec_decode/dflash/speculator.py"
+MAMBA_ALIGN = "vllm/v1/worker/gpu/mamba_align.py"
 
 I32 = MockTensor(torch.int32)
 I64 = MockTensor(torch.int64)
@@ -336,10 +337,24 @@ CASES = {
 }
 
 
-@pytest.mark.parametrize("target", sorted(CASES))
+# Kernels fixed after the branch point above. Their signatures differ from the
+# baseline, so they only take part in the candidate check.
+LATER_CASES = {
+    (FLASH, "_sm70_prepare_smallq_decode_metadata_kernel"): lambda n: (
+        (I32, I32, I32, I32, I32, I32, 8, 8, n, n, max(n - 1, 1), n),
+        {"REQ_BLOCK": 64, "BLOCK_COLS": 8},
+    ),
+    (MAMBA_ALIGN, "_precopy_mamba_align_kernel"): lambda n: (
+        (I32, I32, I32, U64, 8, I64, I64, I64, I64, I32, I32, I32, I32, None, n),
+        {"COPY_BLOCK_SIZE": 1024, "TEMPORAL_TILES": 4, "SPEC_STATE_REPLAY": True},
+    ),
+}
+
+
+@pytest.mark.parametrize("target", sorted(CASES | LATER_CASES))
 def test_row_count_does_not_change_the_specialization_key(target):
     rel, name = target
-    build = CASES[target]
+    build = (CASES | LATER_CASES)[target]
     candidate = getattr(_module(rel), name)
     found = keys(candidate, build)
     assert len(found) == 1, f"{name} still recompiles per row count: {found}"

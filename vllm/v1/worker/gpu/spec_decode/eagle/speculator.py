@@ -12,7 +12,11 @@ from vllm import envs
 from vllm.config import SpeculativeConfig, VllmConfig, get_layers_from_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import GraphCaptureContext
-from vllm.forward_context import BatchDescriptor, set_forward_context
+from vllm.forward_context import (
+    BatchDescriptor,
+    get_forward_context,
+    set_forward_context,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -431,6 +435,7 @@ class EagleSpeculator:
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         *,
         is_uniform_decode: bool = False,
+        is_eagle_draft_step: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
         with set_forward_context(
@@ -443,6 +448,12 @@ class EagleSpeculator:
             batch_descriptor=batch_descriptor,
             is_uniform_decode=is_uniform_decode,
         ):
+            if self.vllm_config.kernel_config.sm70_qsa_paged_fp16_h6 and (
+                is_uniform_decode or is_eagle_draft_step
+            ):
+                # The active MRv2 runner identifies draft decode even when the
+                # draft architecture would not choose MRv2 on its own.
+                get_forward_context().additional_kwargs["sm70_qsa_draft_decode"] = True
             inputs_embeds = None
             if self.supports_mm_inputs:
                 # Merge multimodal embeddings with input ids.
@@ -696,6 +707,7 @@ class EagleSpeculator:
             slot_mappings,
             num_tokens_across_dp,
             cudagraph_runtime_mode,
+            is_eagle_draft_step=True,
         )
         last_hidden_states = last_hidden_states[:num_reqs]
 

@@ -268,15 +268,21 @@ def _resolve_gdn_spec_state_replay(vllm_config: "VllmConfig") -> bool:
 
     Linear DFlash/MTP verification uses Model Runner V2 and align prefix
     caching on SM70. Post-sampling replay requires synchronous scheduling.
-    Native next-round MTP uses completed worker-side counts in either scheduler.
+    Native next-round replay uses completed worker-side counts in either scheduler.
     """
     from vllm.platforms import current_platform
 
     spec = vllm_config.speculative_config
-    if spec is None or spec.use_dflash_ddtree():
+    if spec is None:
+        return False
+    deferred = spec.gdn_deferred_commit_metadata
+    if spec.use_dflash_ddtree():
+        if deferred:
+            raise ValueError(
+                "gdn_deferred_commit_metadata=True requires linear verification."
+            )
         return False
     is_mtp = spec.method == "mtp"
-    deferred = spec.gdn_deferred_commit_metadata
     if not is_mtp and not spec.use_dflash():
         return False
     policy = spec.sm70_dflash2
@@ -298,7 +304,16 @@ def _resolve_gdn_spec_state_replay(vllm_config: "VllmConfig") -> bool:
                 "explicitly configured. GDN keeps a state block per draft "
                 "position and capacity includes those speculative state blocks."
             )
-    replay = (deferred or spec.gdn_state_replay) if is_mtp else policy.spec_state_replay
+    if not is_mtp and deferred and policy.spec_state_replay is False:
+        raise ValueError(
+            "gdn_deferred_commit_metadata=True conflicts with "
+            "sm70_dflash2.spec_state_replay=False."
+        )
+    replay = (
+        (deferred or spec.gdn_state_replay)
+        if is_mtp
+        else (deferred or policy.spec_state_replay)
+    )
     if replay is False:
         return False
     if replay is None and not SM70_DFLASH2_SPEC_STATE_REPLAY_DEFAULT:
@@ -310,20 +325,25 @@ def _resolve_gdn_spec_state_replay(vllm_config: "VllmConfig") -> bool:
             "GDN state replay is enabled for MTP."
         )
     if policy.fused_gdn_verify:
-        if policy.spec_state_replay is True:
+        if deferred or policy.spec_state_replay is True:
+            switch = (
+                "gdn_deferred_commit_metadata"
+                if deferred
+                else "sm70_dflash2.spec_state_replay"
+            )
             if "fused_gdn_verify" in policy.explicit_fields:
                 raise ValueError(
-                    "sm70_dflash2.spec_state_replay=True and "
-                    "sm70_dflash2.fused_gdn_verify=True cannot be enabled "
-                    "together. Disable one of these settings."
+                    f"{switch}=True and sm70_dflash2.fused_gdn_verify=True "
+                    "cannot be enabled together. Disable one of these settings."
                 )
             policy.fused_gdn_verify = False
+            reason = f"{switch}=True was explicitly requested"
+            if replay_defaulted and not deferred:
+                reason = "long-context KV mode enables state replay by default"
             logger.info_once(
                 "Disabling the automatic sm70_dflash2.fused_gdn_verify "
                 "default because %s.",
-                "long-context KV mode enables state replay by default"
-                if replay_defaulted
-                else "sm70_dflash2.spec_state_replay=True was explicitly requested",
+                reason,
             )
         else:
             logger.info_once(
@@ -358,9 +378,28 @@ def _resolve_gdn_spec_state_replay(vllm_config: "VllmConfig") -> bool:
         reasons.append("VLLM_SM70_QWEN_GDN_SPEC_CORE_OP")
     if not envs.VLLM_SM70_FUSED_SIGMOID_MIXED_QKV:
         reasons.append("VLLM_SM70_FUSED_SIGMOID_MIXED_QKV is off")
+    valid_deferred_spec = spec.use_qwen4_exp_mtp() if is_mtp else spec.use_dflash()
+    if deferred and spec.use_dflash() and model is not None:
+        # The worker binds replay only to Qwen GDN layers. The native verifier
+        # reads a 128 by 128 state for each value head.
+        text_config = model.hf_text_config
+        if (
+            model.architecture
+            not in (
+                "Qwen3NextForCausalLM",
+                "Qwen3_5ForCausalLM",
+                "Qwen3_5MoeForCausalLM",
+                "Qwen3_5ForConditionalGeneration",
+                "Qwen3_5MoeForConditionalGeneration",
+                "Qwen4ExpForCausalLM",
+                "Qwen4ExpForConditionalGeneration",
+            )
+            or getattr(text_config, "linear_key_head_dim", None) != 128
+            or getattr(text_config, "linear_value_head_dim", None) != 128
+        ):
+            reasons.append("linear DFlash requires Qwen GDN with 128 by 128 state")
     if deferred and (
-        not is_mtp
-        or not spec.use_qwen4_exp_mtp()
+        not valid_deferred_spec
         or not 0 < spec.num_speculative_state_tokens() < 8
         or model is None
         or model.dtype != torch.float16
@@ -368,7 +407,8 @@ def _resolve_gdn_spec_state_replay(vllm_config: "VllmConfig") -> bool:
         or vllm_config.parallel_config.tensor_parallel_size != 4
     ):
         reasons.append(
-            "native deferred replay requires FP16 TP4 Qwen4Exp MTP with FP32 SSM"
+            "native deferred replay requires FP16 TP4 Qwen4Exp MTP or linear "
+            "DFlash with <=7 speculative state tokens and FP32 SSM"
         )
     if reasons:
         if deferred:

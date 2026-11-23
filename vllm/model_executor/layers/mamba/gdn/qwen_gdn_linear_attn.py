@@ -5505,7 +5505,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         self._native_gdn_verify = (
             envs.VLLM_SM70_MTP_GDN_NATIVE_VERIFY
-            and spec_config.use_qwen4_exp_mtp()
+            and (spec_config.use_qwen4_exp_mtp() or spec_config.use_dflash())
             and not envs.VLLM_BATCH_INVARIANT
             and dtype == torch.float16
             and self.tp_size == 4

@@ -194,6 +194,7 @@ def test_qsa_forward_splits_local_flash_cache_layout(monkeypatch) -> None:
     result = impl.forward_qsa(
         SimpleNamespace(
             topk_indices_buffer=logical_indices,
+            qsa_draft_native_scales=None,
             _k_scale_float=1.0,
             _v_scale_float=1.0,
         ),

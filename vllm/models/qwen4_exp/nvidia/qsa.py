@@ -70,15 +70,18 @@ from ..common.qsa_cache import (
 )
 from .indexer_qsa import QSAIndexer
 from .ops.qsa_device_history import (
+    H6_MAX_ROWS,
+    load_qsa_device_history,
+    load_qsa_paged_fp16_h6,
+    qsa_device_history,
+    qsa_device_history_workspace,
+    try_qsa_paged_fp16_h6,
+)
+from .ops.qsa_device_history import (
     MAX_ROWS as DEVICE_HISTORY_MAX_ROWS,
 )
 from .ops.qsa_device_history import (
     MAX_SELECTION_WIDTH as DEVICE_HISTORY_MAX_WIDTH,
-)
-from .ops.qsa_device_history import (
-    load_qsa_device_history,
-    qsa_device_history,
-    qsa_device_history_workspace,
 )
 from .ops.qsa_paged_fp16_h12 import (
     H12_MAX_ROWS,
@@ -352,6 +355,27 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 **view.scale_kwargs,
             )
             return output
+
+        draft_scales = layer.qsa_draft_native_scales
+        if (
+            draft_scales is not None
+            and is_sm70_decode_graph_compiling()
+            and get_forward_context().additional_kwargs.get("sm70_qsa_draft_decode")
+        ):
+            assert query_positions is not None and sequence_lengths is not None
+            if try_qsa_paged_fp16_h6(
+                query[:num_tokens],
+                kv_cache,
+                draft_scales,
+                logical_indices,
+                attn_metadata.block_table,
+                token_to_req,
+                query_positions[:num_tokens],
+                sequence_lengths,
+                output[:num_tokens],
+                output_gate[:num_tokens] if output_gate is not None else None,
+            ):
+                return output
 
         qsa_metadata: dict[str, torch.Tensor] = {}
         if query_positions is not None:
@@ -1013,6 +1037,23 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.kv_cache_dtype = cache_config.cache_dtype
         kernel_config = vllm_config.kernel_config
         host_kv = kernel_config.long_context_kv
+        native_draft = (
+            kernel_config.sm70_qsa_paged_fp16_h6
+            and vllm_config.is_speculative_draft
+            and not self.qsa_dcp_sharded
+            and not host_kv.enabled
+            and self.kv_cache_dtype in ("auto", "float16")
+            and model_config.dtype == torch.float16
+            and (self.num_heads, self.num_kv_heads, self.head_dim) == (6, 1, 256)
+            and current_platform.is_device_capability(70)
+        )
+        if native_draft:
+            load_qsa_paged_fp16_h6()
+        self.register_buffer(
+            "qsa_draft_native_scales",
+            torch.ones(2, dtype=torch.float32) if native_draft else None,
+            persistent=False,
+        )
         self.sm70_qsa_device_history = (
             kernel_config.sm70_qsa_device_history
             and vllm_config.use_v2_model_runner
@@ -1196,14 +1237,24 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self._qsa_kv_scales_finalized = True
 
     def reserve_capture_workspace(self) -> None:
-        """Reserve the largest DCP read and combine workspace before capture."""
+        """Reserve reader and DCP combine workspaces before capture."""
+        if not self.qsa_dcp_sharded:
+            if self.qsa_draft_native_scales is not None:
+                width = self.indexer.output_width
+                if (
+                    0 < width <= DEVICE_HISTORY_MAX_WIDTH
+                    and self.kv_cache.is_contiguous()
+                ):
+                    qsa_device_history_workspace(H6_MAX_ROWS, width)
+            return
+
         from vllm.v1.attention.ops.dcp_alltoall import (
             dcp_a2a_lse_reduce,
             reserve_dcp_a2a_workspace,
         )
 
         partial = self.dcp_partial_output_buffer
-        if not self.qsa_dcp_sharded or partial is None:
+        if partial is None:
             return
         if self.sm70_qsa_paged_fp16_h12 or self.sm70_qsa_device_history:
             from .ops.qsa_dcp import qsa_dcp_local_selection_width

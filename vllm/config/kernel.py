@@ -665,6 +665,10 @@ class KernelConfig:
     """Use the native FP16 paged QSA reader for eligible TP4/DCP2 target
     decode on SM70. Its reduction and probability rounding differ."""
 
+    sm70_qsa_paged_fp16_h6: bool = False
+    """Use the native FP16 paged QSA reader in replicated MTP decode graphs
+    on SM70. Its reduction and probability rounding differ."""
+
     sm70_qsa_device_history: bool = False
     """Use native SM70 QSA GPU-cache reads for eligible TP4/DCP2 decode
     and verification batches. This changes the local attention arithmetic."""
@@ -811,6 +815,8 @@ class KernelConfig:
             # Scheduler-only prefix-hit check; no compiled graph changes.
             "qsa_cross_group_hit_check",
         }
+        if not self.sm70_qsa_paged_fp16_h6:
+            ignored_factors.add("sm70_qsa_paged_fp16_h6")
         if not self.sm70_skinny_moe_applicable:
             ignored_factors.add("sm70_skinny_moe")
         if not self.sm70_dflash2_fp16_m8:

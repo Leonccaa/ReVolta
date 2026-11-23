@@ -742,7 +742,9 @@ def causal_conv1d_fn(
     return out.to(original_x_dtype)
 
 
-@triton.jit()
+# The batch changes every step. Do not specialize on it, or a new batch class
+# compiles a new variant during serving.
+@triton.jit(do_not_specialize=["batch"])
 def _causal_conv1d_update_kernel(
     # Pointers to matrices
     x_ptr,  # (batch, dim, seqlen)

@@ -174,7 +174,9 @@ def _sm70_prepare_smallq_decode_metadata(
         num_query_tokens,
         real_num_query_tokens,
         block_cols,
-        REQ_BLOCK=triton.next_power_of_2(num_reqs + 1),
+        # Size the request tile from the persistent buffer, not this step's
+        # count, so a new request count does not compile a new variant.
+        REQ_BLOCK=triton.next_power_of_2(out_query_start_loc.numel()),
         BLOCK_COLS=triton.next_power_of_2(block_cols),
         num_warps=1,
     )
@@ -438,7 +440,9 @@ def _sm70_prepare_grouped_smallq_decode_metadata(
         query_start_loc,
         num_reqs,
         real_num_query_tokens,
-        REQ_BLOCK=triton.next_power_of_2(num_reqs + 1),
+        # Size the request tile from the persistent buffers, not this step's
+        # count, so a new request count does not compile a new variant.
+        REQ_BLOCK=triton.next_power_of_2(max(t.numel() for t in out_query_start_locs)),
         BLOCK_COLS=triton.next_power_of_2(max_block_cols),
         num_warps=1,
     )

@@ -1531,12 +1531,24 @@ class Qwen4ExpForCausalLM(
     def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
 
-    def get_mtp_target_topk_with_fallback(
+    def get_topk_tokens_and_logits(
+        self, hidden_states: torch.Tensor, top_k: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.logits_processor.get_topk_tokens_and_logits(
+            self.lm_head, hidden_states, top_k
+        )
+
+    def get_topk_tokens_and_logits_with_fallback(
         self, hidden_states: torch.Tensor, top_k: int
     ) -> tuple[torch.Tensor, torch.Tensor, Callable[[], torch.Tensor | None] | None]:
         return self.logits_processor.get_topk_tokens_and_logits_with_fallback(
             self.lm_head, hidden_states, top_k
         )
+
+    def get_mtp_target_topk_with_fallback(
+        self, hidden_states: torch.Tensor, top_k: int
+    ) -> tuple[torch.Tensor, torch.Tensor, Callable[[], torch.Tensor | None] | None]:
+        return self.get_topk_tokens_and_logits_with_fallback(hidden_states, top_k)
 
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
         return self.model._mtp_hidden_buffer

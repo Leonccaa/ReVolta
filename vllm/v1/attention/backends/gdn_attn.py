@@ -2515,9 +2515,10 @@ def prepare_dflash2_gdn_group_metadata(
             ),
         )
 
-    block = triton.next_power_of_2(
-        max(num_actual_tokens * width, num_actual_tokens + 1)
-    )
+    # Size the tile for the largest graph batch, not this step's, so a new
+    # batch size does not compile a new variant.
+    max_bs = first_builder.decode_cudagraph_max_bs
+    block = triton.next_power_of_2(max(max_bs * width, max_bs + 1))
     _dflash2_gdn_group_metadata_kernel[(len(input_tables),)](
         descriptor.block_table_ptrs,
         descriptor.state_output_ptrs,

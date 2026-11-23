@@ -471,3 +471,13 @@ def test_kernels_without_a_batch_shape_argument_stay_that_way(target):
         if param.name.endswith("_ptr") or param.is_constexpr:
             continue
         assert not param.name.startswith(("rows", "batch_", "len_")), param.name
+
+
+def test_conv1d_update_does_not_specialize_on_the_batch():
+    # The DFlash2 GDN replay path reaches this kernel with batch 1 and with
+    # larger batches; each class used to compile a new variant while serving.
+    from vllm.model_executor.layers.mamba.ops import causal_conv1d
+
+    kernel = causal_conv1d._causal_conv1d_update_kernel
+    flags = {p.name: p.do_not_specialize for p in kernel.params}
+    assert flags["batch"]

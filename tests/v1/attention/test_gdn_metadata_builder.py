@@ -1027,6 +1027,21 @@ def test_dflash2_fused_gdn_group_metadata_replay(
     for builder in builders:
         builder.spec_state_indices_tensor.fill_(777)
 
+    # Record the tile size: it must not follow the batch, or each new batch
+    # size compiles a new variant during serving.
+    kernel = gdn_attn._dflash2_gdn_group_metadata_kernel
+    tile_sizes: list[int] = []
+
+    class _RecordTile:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                tile_sizes.append(kwargs["BLOCK"])
+                return kernel[grid](*args, **kwargs)
+
+            return launch
+
+    monkeypatch.setattr(gdn_attn, "_dflash2_gdn_group_metadata_kernel", _RecordTile())
+
     first_result = prepare_dflash2_gdn_group_metadata(
         builders_by_group=[(0, builders[0]), (1, builders[1])],
         block_tables=block_tables,
@@ -1124,6 +1139,7 @@ def test_dflash2_fused_gdn_group_metadata_replay(
     assert single.spec_query_start_loc.tolist() == [0, 8] + [8] * 7
     assert single.num_accepted_tokens is not None
     assert single.num_accepted_tokens.tolist() == [7] + [1] * 7
+    assert len(tile_sizes) == 3 and len(set(tile_sizes)) == 1
 
 
 def test_dflash2_fused_gdn_group_metadata_align_replay(

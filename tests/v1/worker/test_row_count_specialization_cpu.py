@@ -263,3 +263,66 @@ def test_greedy_rejection_matches_torch(num_reqs):
         got = sampled[req, : int(num_sampled[req])].tolist()
         assert got == want + [int(target_argmax[base + accepted])]
         assert int(num_sampled[req]) == accepted + 1
+
+
+@interpreter
+def test_smallq_request_tile_follows_the_buffer_not_the_count(monkeypatch):
+    """The request tile is a constexpr; it must not change with num_reqs."""
+    from vllm.v1.attention.backends import flash_attn_v100 as backend
+
+    capacity = 16
+    tiles: dict[str, set[int]] = {"single": set(), "grouped": set()}
+
+    def record(name):
+        kernel = getattr(backend, name)
+        label = "grouped" if "grouped" in name else "single"
+
+        class _Record:
+            def __getitem__(self, grid):
+                def launch(*args, **kwargs):
+                    tiles[label].add(kwargs["REQ_BLOCK"])
+                    return kernel[grid](*args, **kwargs)
+
+                return launch
+
+        monkeypatch.setattr(backend, name, _Record())
+
+    record("_sm70_prepare_smallq_decode_metadata_kernel")
+    record("_sm70_prepare_grouped_smallq_decode_metadata_kernel")
+    for num_reqs in (1, 2, 3, 5, 9):
+        query_start_loc = torch.arange(num_reqs + 1, dtype=torch.int32)
+        seq_lens = torch.full((num_reqs,), 7, dtype=torch.int32)
+        table = torch.arange(num_reqs * 4, dtype=torch.int32).view(num_reqs, 4)
+        outs = [
+            (
+                torch.zeros((capacity, 4), dtype=torch.int32),
+                torch.zeros(capacity, dtype=torch.int32),
+                torch.zeros(capacity + 1, dtype=torch.int32),
+            )
+            for _ in range(2)
+        ]
+        _sm70_prepare_smallq_decode_metadata(
+            *outs[0],
+            table,
+            seq_lens,
+            query_start_loc,
+            num_reqs=num_reqs,
+            num_query_tokens=num_reqs,
+            real_num_query_tokens=num_reqs,
+        )
+        _sm70_prepare_grouped_smallq_decode_metadata(
+            [outs[1][0]],
+            [outs[1][1]],
+            [outs[1][2]],
+            [table],
+            seq_lens,
+            query_start_loc,
+            num_reqs=num_reqs,
+            num_query_tokens=num_reqs,
+            real_num_query_tokens=num_reqs,
+        )
+        for out_table, out_seq, out_query in outs:
+            assert torch.equal(out_query[: num_reqs + 1], query_start_loc)
+            assert torch.equal(out_table[:num_reqs], table)
+            assert torch.equal(out_seq[:num_reqs], torch.full((num_reqs,), 7))
+    assert tiles == {"single": {32}, "grouped": {32}}

@@ -31,7 +31,11 @@ from vllm.sampling_params import (
     StructuredOutputsParams,
 )
 from vllm.tokenizers import TokenizerLike
-from vllm.tool_parsers.utils import Tool, get_json_schema_from_tools
+from vllm.tool_parsers.utils import (
+    EMPTY_TOOL_PARAMETERS,
+    Tool,
+    get_json_schema_from_tools,
+)
 from vllm.utils.collection_utils import is_list_of
 from vllm.utils.import_utils import import_from_path
 
@@ -124,6 +128,15 @@ class ToolParser:
             tools=request.tools,
             parallel_tool_calls=request.parallel_tool_calls,
         )
+        if json_schema_from_tool == EMPTY_TOOL_PARAMETERS:
+            # Constrain the complete arguments to {} even with a grammar
+            # backend that permits arbitrary whitespace in JSON schemas.
+            request.structured_outputs = StructuredOutputsParams(regex=r"\{\}")
+            if isinstance(request, ChatCompletionRequest):
+                request.response_format = None
+            elif request.text is not None:
+                request.text = request.text.model_copy(update={"format": None})
+            return request
         # Set structured output params for tool calling
         if json_schema_from_tool is not None:
             if isinstance(request, ChatCompletionRequest):

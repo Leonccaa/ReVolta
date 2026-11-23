@@ -175,6 +175,37 @@ def _params_or_empty_object(params: dict[str, Any] | None) -> dict[str, Any]:
     return params if params else {"type": "object", "properties": {}}
 
 
+EMPTY_TOOL_PARAMETERS = {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": False,
+}
+
+
+def _named_tool_parameters(params: dict[str, Any] | None) -> dict[str, Any]:
+    schema = _params_or_empty_object(params)
+    # An explicit additional-properties rule or a composed schema can
+    # declare arguments without listing them in "properties".
+    if (
+        schema.get("type") == "object"
+        and schema.keys()
+        <= {
+            "type",
+            "properties",
+            "required",
+            "additionalProperties",
+            "title",
+            "description",
+        }
+        and ("properties" in schema or schema.get("additionalProperties") is False)
+        and schema.get("properties", {}) == {}
+        and schema.get("required", []) == []
+        and schema.get("additionalProperties", False) is False
+    ):
+        return EMPTY_TOOL_PARAMETERS.copy()
+    return schema
+
+
 def _get_tool_schema_from_tool(tool: Tool) -> dict:
     name, params = _extract_tool_info(tool)
     return {
@@ -243,7 +274,7 @@ def get_json_schema_from_tools(
         tool_map = {tool.name: tool for tool in tools if isinstance(tool, FunctionTool)}
         if tool_name not in tool_map:
             raise ValueError(f"Tool '{tool_name}' has not been passed in `tools`.")
-        return _params_or_empty_object(tool_map[tool_name].parameters)
+        return _named_tool_parameters(tool_map[tool_name].parameters)
     # tool_choice: Forced Function (ChatCompletion)
     if (not isinstance(tool_choice, str)) and isinstance(
         tool_choice, ChatCompletionNamedToolChoiceParam
@@ -256,7 +287,7 @@ def get_json_schema_from_tools(
         }
         if tool_name not in tool_map:
             raise ValueError(f"Tool '{tool_name}' has not been passed in `tools`.")
-        return _params_or_empty_object(tool_map[tool_name].function.parameters)
+        return _named_tool_parameters(tool_map[tool_name].function.parameters)
     # tool_choice: "required"
     if tool_choice == "required":
         return _get_json_schema_from_tools(tools, parallel_tool_calls)

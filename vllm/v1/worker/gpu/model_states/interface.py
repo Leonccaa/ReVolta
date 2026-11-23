@@ -64,7 +64,9 @@ class ModelState(ABC):
     def apply_staged_writes(self) -> None:
         return None
 
-    def run_state_gathers(self, gathers: list[MambaStateGather]) -> None:
+    def run_state_gathers(
+        self, gathers: list[MambaStateGather], request_slots: dict[str, int]
+    ) -> None:
         return None
 
     def preprocess_state(

@@ -53,6 +53,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
+from vllm.model_executor.layers.mamba.gdn.spec_replay import TMAX, SpecReplayState
 from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
@@ -2525,7 +2526,22 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and not vllm_config.speculative_config.use_dflash()
         )
         if self.spec_state_replay:
-            self._init_spec_state_replay(vllm_config)
+            speculative = vllm_config.speculative_config
+            assert speculative is not None
+            if speculative.gdn_deferred_commit_metadata:
+                self._replay_slots = speculative.num_speculative_state_tokens() + 1
+                k_heads = self.num_k_heads // self.tp_size
+                v_heads = self.num_v_heads // self.tp_size
+                seq = TMAX * (
+                    k_heads * self.head_k_dim + v_heads * (self.head_v_dim + 2)
+                )
+                # Include persistent payloads in normal model memory profiling.
+                self._native_replay_buffer = self.A_log.new_empty(
+                    2 * vllm_config.scheduler_config.max_num_seqs * seq,
+                    dtype=torch.float32,
+                )
+            else:
+                self._init_spec_state_replay(vllm_config)
         self.enable_sm70_dflash2_fused_gdn_verify = bool(
             sm70_dflash2_enabled(
                 "fused_gdn_verify", capture_sm70_dflash2_config(vllm_config)
@@ -5368,6 +5384,88 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             kv_cache=kv_cache,
         )
 
+    _native_spec_replay: SpecReplayState | None = None
+
+    def bind_deferred_replay(self, replay: SpecReplayState, group: int) -> None:
+        self._native_spec_replay = replay
+        self._native_checkpoint_slots = replay.spec_ckpt_slot[group]
+
+    def _deferred_replay_out(
+        self,
+        qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        state: torch.Tensor,
+        out: torch.Tensor,
+        cu: torch.Tensor,
+        indices: torch.Tensor,
+        counts: torch.Tensor,
+        rmap: torch.Tensor,
+        ckt: torch.Tensor | None = None,
+        cks: torch.Tensor | None = None,
+    ) -> None:
+        ops.sm70_gdn_verify_out(
+            qkv,
+            a,
+            b,
+            self.A_log,
+            self.dt_bias,
+            state,
+            out,
+            cu,
+            indices,
+            None,
+            self.num_k_heads // self.tp_size,
+            self.num_v_heads // self.tp_size,
+            self.head_k_dim**-0.5,
+            1,
+            self._native_replay_buffer,
+            counts,
+            None,
+            self._replay_slots,
+            rmap,
+            ckt,
+            cks,
+        )
+
+    def commit_deferred_replay(
+        self,
+        state: torch.Tensor,
+        indices: torch.Tensor,
+        counts: torch.Tensor,
+        rmap: torch.Tensor,
+    ) -> None:
+        replay = self._native_spec_replay
+        assert replay is not None
+        heads = self.num_v_heads // self.tp_size
+        kv_width = (2 * self.key_dim + self.value_dim) // self.tp_size
+        empty = state.new_empty((0, kv_width), dtype=torch.float16)
+        gates = state.new_empty((0, heads), dtype=torch.float16)
+        out = state.new_empty((0, heads, self.head_v_dim), dtype=torch.float16)
+        self._deferred_replay_out(
+            empty,
+            gates,
+            gates,
+            state,
+            out,
+            replay.empty_starts[: indices.shape[0] + 1],
+            # A column view can have a non-unit row stride. The native
+            # verifier reads the stride only for two-dimensional indices.
+            indices.unsqueeze(1),
+            counts,
+            rmap,
+        )
+
+    def _flush_plain_deferred_replay(
+        self, state: torch.Tensor, indices: torch.Tensor
+    ) -> None:
+        replay = self._native_spec_replay
+        if replay is not None:
+            rows = indices.shape[0]
+            self.commit_deferred_replay(
+                state, indices, replay.plain_replay[:rows], replay.plain_map[:rows]
+            )
+
     def _init_spec_state_replay(self, vllm_config: VllmConfig) -> None:
         """Buffers that let the verifier skip per-position states (see below)."""
         spec_config = vllm_config.speculative_config
@@ -5750,6 +5848,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             kv_cache[0] if is_conv_state_dim_first() else kv_cache[0].transpose(-1, -2)
         )
         ssm_state = kv_cache[1]
+        plain_rows = attn_metadata.num_decodes + attn_metadata.num_prefills
+        if self._native_spec_replay is not None and plain_rows:
+            assert non_spec_state_indices_tensor is not None
+            self._flush_plain_deferred_replay(
+                ssm_state, non_spec_state_indices_tensor[:plain_rows]
+            )
         num_actual_tokens = attn_metadata.num_actual_tokens
         num_non_spec_tokens = num_actual_tokens
         if (
@@ -6121,7 +6225,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
             and self._mixed_qkv_verify_admits(mixed_qkv_spec.shape[0])
         )
-        if use_dflash2_packed_gdn_verify or use_sm70_mixed_qkv_verify:
+        replay = self._native_spec_replay
+        if (
+            replay is not None
+            or use_dflash2_packed_gdn_verify
+            or use_sm70_mixed_qkv_verify
+        ):
             query_spec, key_spec, value_spec = None, None, None
         else:
             query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
@@ -6232,7 +6341,33 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 2.1: Process the multi-query part
         if spec_sequence_masks is not None:
-            if use_dflash2_packed_gdn_verify:
+            if replay is not None:
+                assert mixed_qkv_spec is not None and spec_query_start_loc is not None
+                assert spec_state_indices_tensor is not None
+                rows = attn_metadata.num_spec_decodes
+                tokens = mixed_qkv_spec.shape[0]
+                spec_out = (
+                    core_attn_out[:tokens]
+                    if spec_rows_are_batch
+                    else core_attn_out.new_empty((tokens, *core_attn_out.shape[1:]))
+                )
+                self._deferred_replay_out(
+                    mixed_qkv_spec,
+                    a_spec,
+                    b_spec,
+                    ssm_state,
+                    spec_out,
+                    spec_query_start_loc[: rows + 1],
+                    spec_state_indices_tensor[:rows],
+                    replay.spec_replay[:rows],
+                    replay.spec_map[:rows],
+                    replay.spec_ckpt_token[:rows],
+                    self._native_checkpoint_slots[:rows],
+                )
+                core_attn_out_spec = spec_out.unsqueeze(0)
+                last_recurrent_state = ssm_state
+                _log_runtime_route_once("SM70 native next-round GDN verifier hit.")
+            elif use_dflash2_packed_gdn_verify:
                 assert mixed_qkv_spec is not None
                 assert spec_query_start_loc is not None
                 assert spec_state_indices_tensor is not None
@@ -6720,6 +6855,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         b = b[:num_decode_tokens]
         a = a[:num_decode_tokens]
         state_indices = non_spec_state_indices_tensor[:num_decode_tokens]
+        self._flush_plain_deferred_replay(ssm_state, state_indices)
         _sm70_gdn_graph_buffer_copy("state_indices", layer_name, state_indices, "state")
         _sm70_gdn_graph_buffer_copy_state_slice(
             "pre_conv_state",

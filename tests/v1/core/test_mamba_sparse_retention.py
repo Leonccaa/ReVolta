@@ -893,7 +893,14 @@ def _exact_end_entries(index):
 
 
 def _r1_scheduler(
-    monkeypatch, d, threshold, *, replay=True, async_scheduling=False, batch_drafts=None
+    monkeypatch,
+    d,
+    threshold,
+    *,
+    replay=True,
+    async_scheduling=False,
+    batch_drafts=None,
+    native_replay=False,
 ):
     from tests.v1.core import test_long_context_admission as fixture
     from tests.v1.core.long_context_kv_utils import mtp_specs, production_specs
@@ -907,6 +914,7 @@ def _r1_scheduler(
         monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
         spec = config.speculative_config
         spec.gdn_spec_state_replay = replay
+        spec.gdn_deferred_commit_metadata = native_replay
         spec.exact_end_draft_threshold = threshold
         spec.num_speculative_tokens_per_batch_size = [
             (1, 1, d),
@@ -972,6 +980,57 @@ def _r1_sample(scheduler, output, acceptance="all"):
         drafts = handler.get_draft_tokens()
         assert isinstance(drafts, DraftTokenIds)
         scheduler.update_draft_token_ids(drafts)
+
+
+@pytest.mark.parametrize(("acceptance", "count"), [("none", 1), ("some", 2)])
+def test_exact_end_native_replay_includes_terminal_slot_when_no_tokens_follow(
+    monkeypatch, acceptance, count
+):
+    from tests.v1.core.test_long_context_admission import make_requests
+    from vllm.v1.request import RequestStatus
+
+    scheduler = _r1_scheduler(monkeypatch, 4, None, native_replay=True)
+    [request] = make_requests(1, STATE_BLOCK - 16, count + 1)
+    scheduler.add_request(request)
+    _r1_sample(scheduler, scheduler.schedule())
+    decode = scheduler.schedule()
+    assert decode.scheduled_spec_decode_tokens[request.request_id] == [-1] * 4
+    _r1_sample(scheduler, decode, acceptance)
+    assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+    assert request.state_end > request.num_computed_tokens == request.num_tokens - 1
+    tail = scheduler.schedule()
+    assert tail.total_num_scheduled_tokens == 0
+    assert request.request_id in tail.finished_req_ids
+    (gather,) = tail.mamba_state_gathers
+    assert gather.request_id == request.request_id
+    assert gather.column == count - 1
+
+
+def test_async_gdn_replay_observes_unsettled_drafts_at_normal_stop(monkeypatch):
+    from tests.v1.core.test_long_context_admission import make_requests
+    from vllm.v1.request import RequestStatus
+
+    scheduler = _r1_scheduler(
+        monkeypatch, 4, None, async_scheduling=True, native_replay=True
+    )
+    [request] = make_requests(1, STATE_BLOCK - 8, 16)
+    scheduler.add_request(request)
+    _r1_sample(scheduler, scheduler.schedule())
+    request.sampling_params.stop_token_ids = [100]
+    older = scheduler.schedule()
+    newer = scheduler.schedule()
+    assert older.scheduled_spec_decode_tokens[request.request_id] == [-1] * 4
+    assert newer.scheduled_spec_decode_tokens[request.request_id] == [-1] * 4
+    (upper,) = newer.scheduled_cached_reqs.num_computed_tokens
+    (older_base,) = older.scheduled_cached_reqs.num_computed_tokens
+    live_after_one_accepted = older_base + 1
+    assert upper - live_after_one_accepted == 4
+    _r1_sample(scheduler, older, "none")
+    assert request.status == RequestStatus.FINISHED_STOPPED
+    assert request.num_in_flight_tokens == newer.total_num_scheduled_tokens
+    index = scheduler.kv_cache_manager.coordinator.exact_end
+    assert index.events == {"skip_not_final": 1}
+    assert not index.pending_gathers
 
 
 @pytest.mark.parametrize("d", [4, 7], ids=["mtp4", "dflash2"])

@@ -483,6 +483,9 @@ class SpeculativeConfig:
     DFlash continues to use sm70_dflash2.spec_state_replay.
     """
 
+    gdn_deferred_commit_metadata: bool = False
+    """Research opt-in for next-round native GDN commit in SM70 MTP align mode."""
+
     gdn_state_replay_graph: bool | None = None
     """Capture accepted-state replay for FULL verify shapes; mixed steps are eager.
 
@@ -829,6 +832,8 @@ class SpeculativeConfig:
             factors.append(("gdn_spec_state_replay", True))
             if self.gdn_state_replay_graph is not None:
                 factors.append(("gdn_state_replay_graph", self.gdn_state_replay_graph))
+        if self.gdn_deferred_commit_metadata:
+            factors.append(("gdn_deferred_commit_metadata", True))
         # Eagle3 and extract_hidden_states affect the computation graph because
         # they return intermediate hidden states in addition to the final hidden state.
         uses_aux_hidden_states = (

@@ -1241,6 +1241,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return True
 
     def finish_requests(self, scheduler_output: SchedulerOutput) -> None:
+        gathers = [
+            gather
+            for gather in (scheduler_output.mamba_state_gathers or ())
+            if gather.request_id is not None
+        ]
+        if gathers:
+            # A terminal GDN replay uses the old runtime slot. The cache
+            # checkpoint may be read by a new request in this very step.
+            self.model_state.run_state_gathers(gathers, self.req_states.req_id_to_index)
         finished_req_ids = scheduler_output.finished_req_ids
         preempted_req_ids = scheduler_output.preempted_req_ids
         if preempted_req_ids:
@@ -1333,8 +1342,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.sampler.apply_staged_writes()
 
     def update_requests(self, scheduler_output: SchedulerOutput) -> None:
-        if scheduler_output.mamba_state_gathers:
-            self.model_state.run_state_gathers(scheduler_output.mamba_state_gathers)
+        gathers = [
+            gather
+            for gather in (scheduler_output.mamba_state_gathers or ())
+            if gather.request_id is None
+        ]
+        if gathers:
+            self.model_state.run_state_gathers(gathers, self.req_states.req_id_to_index)
         # Add new blocks and update num_computed_tokens for the existing requests.
         reqs = scheduler_output.scheduled_cached_reqs
         if (

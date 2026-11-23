@@ -10,16 +10,16 @@ import pytest
 
 from tests.v1.core import test_long_context_admission as hybrid
 from tests.v1.core.test_mamba_sparse_retention import _r1_sample
-from vllm.config import CUDAGraphMode
+from vllm.config import CUDAGraphMode, SpeculativeConfig
 from vllm.config.sm70_dflash2 import Sm70DFlash2Config
 from vllm.config.vllm import VllmConfig
+from vllm.platforms import current_platform
 from vllm.v1.spec_decode.dynamic.adaptive_dflash2 import (
     AWQ_GROUPED_SWEET_SPOT_ROWS,
     MAX_ADAPTIVE_DFLASH2_DRAFTS,
     MIN_ADAPTIVE_DFLASH2_DRAFTS,
     AdaptiveDFlash2Depth,
     choose_batch_dflash2_drafts,
-    limit_dflash2_drafts,
 )
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
@@ -27,12 +27,12 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 )
 
 pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
+pytest_plugins = ("tests.v1.spec_decode.test_dflash2_native_lookup",)
 
 
 def test_sm70_dflash2_adaptive_width_policy_default_and_graph_options():
     default_cfg = Sm70DFlash2Config()
     assert default_cfg.adaptive_width is False
-    assert default_cfg.adaptive_width_max_grouped_rows == 48
     assert "adaptive_width" not in default_cfg.graph_options()
 
     opt_in = Sm70DFlash2Config(adaptive_width=True)
@@ -71,39 +71,21 @@ def test_choose_batch_dflash2_drafts_c1_and_c8_awq_sweet_spot():
     depths_mod = [
         AdaptiveDFlash2Depth(depth=6, successes=7.8, trials=10.0) for _ in range(8)
     ]
-    assert (
-        choose_batch_dflash2_drafts(
-            8, 7, depths_mod, max_grouped_rows=AWQ_GROUPED_SWEET_SPOT_ROWS
-        )
-        == 5
-    )
+    assert choose_batch_dflash2_drafts(8, 7, depths_mod) == 5
 
     # A C8 batch with low acceptance uses 40 rows.
     depths_low = [
         AdaptiveDFlash2Depth(depth=4, successes=6.2, trials=10.0) for _ in range(8)
     ]
-    assert (
-        choose_batch_dflash2_drafts(
-            8, 7, depths_low, max_grouped_rows=AWQ_GROUPED_SWEET_SPOT_ROWS
-        )
-        == 4
-    )
+    assert choose_batch_dflash2_drafts(8, 7, depths_low) == 4
 
     # High acceptance restores full width even before depths have caught up.
     depths_high = [
         AdaptiveDFlash2Depth(depth=4, successes=9.2, trials=10.0) for _ in range(8)
     ]
-    assert (
-        choose_batch_dflash2_drafts(
-            8, 7, depths_high, max_grouped_rows=AWQ_GROUPED_SWEET_SPOT_ROWS
-        )
-        == 7
-    )
-
-    # Disabling grouped row cap (max_grouped_rows=0) keeps depth=6 at C8
-    assert choose_batch_dflash2_drafts(8, 7, depths_mod, max_grouped_rows=0) == 6
-    assert choose_batch_dflash2_drafts(8, 7, depths_mod[:7]) == 7
-    assert choose_batch_dflash2_drafts(8, 7, depths_mod, max_grouped_rows=31) == 7
+    assert choose_batch_dflash2_drafts(8, 7, depths_high) == 7
+    # A configured concurrency width below the adaptive floor stays in force.
+    assert choose_batch_dflash2_drafts(8, 2, depths_mod) == 2
 
 
 def test_cudagraph_manager_registers_adaptive_dflash2_sweet_spot_descriptors():
@@ -123,7 +105,7 @@ def test_cudagraph_manager_registers_adaptive_dflash2_sweet_spot_descriptors():
         _candidates=[[] for _ in range(65)],
         _graphs_captured=True,
     )
-    CudaGraphManager._add_adaptive_dflash2_candidates(mgr, max_grouped_rows=48)
+    CudaGraphManager._add_adaptive_dflash2_candidates(mgr)
     descs = set(mgr._capture_descs[CUDAGraphMode.FULL])
     # C1 widths q=4, 5, 6, 7
     for q in (4, 5, 6, 7):
@@ -147,7 +129,7 @@ def test_cudagraph_manager_registers_adaptive_dflash2_sweet_spot_descriptors():
             )
             in descs
         )
-    # C8 q=7 (M=56 > 48) should NOT be added under max_grouped_rows=48
+    # C8 q=7 exceeds the grouped budget.
     assert (
         BatchExecutionDescriptor(
             cg_mode=CUDAGraphMode.FULL,
@@ -159,28 +141,49 @@ def test_cudagraph_manager_registers_adaptive_dflash2_sweet_spot_descriptors():
     )
     for requests in range(1, 9):
         for q in range(4, 8):
-            if requests * q > 48:
+            if requests * q > AWQ_GROUPED_SWEET_SPOT_ROWS:
                 continue
             desc = CudaGraphManager.dispatch(mgr, requests, requests * q, q)
             assert desc.cg_mode == CUDAGraphMode.FULL
             assert desc.uniform_token_count == q
-            assert requests <= desc.num_reqs and desc.num_tokens <= 48
+            assert requests <= desc.num_reqs
+            assert desc.num_tokens <= AWQ_GROUPED_SWEET_SPOT_ROWS
 
 
-def test_adaptive_width_admission(monkeypatch):
-    import vllm.platforms
-
-    device = NS(is_cuda=lambda: True, is_device_capability=lambda cap: cap == (7, 0))
-    monkeypatch.setattr(vllm.platforms, "_current_platform", device)
-    spec = NS(
+def _spec(base, **options):
+    return SpeculativeConfig(
         method="dflash",
-        use_dflash=lambda: True,
-        num_speculative_tokens=7,
-        sm70_dflash2=Sm70DFlash2Config(adaptive_width=True),
-        draft_model_config=NS(
-            hf_config=NS(dflash_config={"selector_top_k": 20, "block_size": 8})
-        ),
+        model=base.model,
+        target_model_config=base.target_model_config,
+        target_parallel_config=base.target_parallel_config,
+        sm70_dflash2={"adaptive_width": True},
+        **({"num_speculative_tokens": 7} | options),
     )
+
+
+@pytest.mark.parametrize(
+    "mode,options",
+    [
+        ("off", {}),
+        (
+            "gpu_head",
+            {
+                "dflash2_lookup": {
+                    "enabled": True,
+                    "policy": "longest",
+                    "nmin": 2,
+                    "nmax": 4,
+                }
+            },
+        ),
+        ("legacy_host", {"ngram_assist": True}),
+        ("legacy_gpu", {"ngram_assist": True, "num_speculative_tokens": 15}),
+    ],
+)
+def test_adaptive_width_admission(native_allocation_config, monkeypatch, mode, options):
+    monkeypatch.setattr(current_platform, "is_device_capability", lambda c: c == (7, 0))
+    spec = _spec(native_allocation_config.speculative_config, **options)
+    assert spec.resolved_dflash2_lookup.mode == mode
     cfg = NS(
         speculative_config=spec,
         model_config=NS(quantization="awq"),
@@ -189,61 +192,100 @@ def test_adaptive_width_admission(monkeypatch):
         compilation_config=NS(cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE),
     )
     enabled = VllmConfig.adaptive_dflash2_enabled.fget
-    assert enabled(cfg)
+    assert enabled(cfg) is (mode == "off")
     cfg.scheduler_config.async_scheduling = True
     assert not enabled(cfg)
     cfg.scheduler_config.async_scheduling = False
     cfg.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
     assert not enabled(cfg)
     cfg.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
-    spec.num_speculative_tokens = 15
-    spec.ngram_assist = True
-    assert enabled(cfg)
-    spec.ngram_assist = False
-    assert not enabled(cfg)
     cfg.model_config.quantization = "modelopt"
-    spec.num_speculative_tokens = 7
     assert not enabled(cfg)
 
 
-def test_limit_only_the_native_dflash2_width():
-    assert limit_dflash2_drafts(5, None) == 5
-    assert limit_dflash2_drafts(5, 7) == 5
-    assert limit_dflash2_drafts(5, 15) == 15
-    assert limit_dflash2_drafts(0, 0) == 0
-
-
-def test_sync_scheduler_uses_next_proposal_width_and_cleans_up(monkeypatch):
+def _build_scheduler(native_allocation_config, monkeypatch, **options):
     make_config = hybrid.make_config
+    production_specs = hybrid.production_specs
+    replay = options.get("exact_end_draft_threshold") is not None
 
     def configure(**kwargs):
         config = make_config(**kwargs)
         monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+        monkeypatch.setattr(
+            current_platform, "is_device_capability", lambda c: c == (7, 0)
+        )
+        config.speculative_config = _spec(
+            native_allocation_config.speculative_config, **options
+        )
+        config.speculative_config.gdn_spec_state_replay = replay
+        config.model_config.quantization = "awq"
+        config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
         return config
 
     monkeypatch.setattr(hybrid, "make_config", configure)
-    monkeypatch.setattr(
-        VllmConfig, "adaptive_dflash2_enabled", property(lambda self: True)
-    )
+    if replay:
+        monkeypatch.setattr(
+            hybrid,
+            "production_specs",
+            lambda **kwargs: production_specs(**(kwargs | {"speculative_blocks": 0})),
+        )
     scheduler = hybrid.build(None, speculative_tokens=7)
+    assert scheduler.vllm_config.adaptive_dflash2_enabled
+    return scheduler
+
+
+@pytest.mark.parametrize("dsd", [None, [(1, 7, 7), (8, 8, 2)]])
+def test_sync_scheduler_uses_next_proposal_width_and_cleans_up(
+    native_allocation_config, monkeypatch, dsd
+):
+    scheduler = _build_scheduler(
+        native_allocation_config, monkeypatch, num_speculative_tokens_per_batch_size=dsd
+    )
     requests = hybrid.make_requests(8, 10, 128)
     for req in requests:
         scheduler.add_request(req)
     prefill = scheduler.schedule()
-    assert prefill.num_spec_tokens_to_schedule == 7
+    initial, narrowed = (7, 5) if dsd is None else (2, 2)
+    assert prefill.num_spec_tokens_to_schedule == initial
     _r1_sample(scheduler, prefill)
     first = scheduler.schedule()
     assert len(first.scheduled_spec_decode_tokens) == 8
-    assert {len(ids) for ids in first.scheduled_spec_decode_tokens.values()} == {7}
+    assert {len(ids) for ids in first.scheduled_spec_decode_tokens.values()} == {
+        initial
+    }
     _r1_sample(scheduler, first, "none")
     second = scheduler.schedule()
-    assert second.num_spec_tokens_to_schedule == 5
-    assert {len(ids) for ids in second.scheduled_spec_decode_tokens.values()} == {7}
+    assert second.num_spec_tokens_to_schedule == narrowed
+    assert {len(ids) for ids in second.scheduled_spec_decode_tokens.values()} == {
+        initial
+    }
     _r1_sample(scheduler, second, "none")
     third = scheduler.schedule()
-    assert {len(ids) for ids in third.scheduled_spec_decode_tokens.values()} == {5}
+    assert {len(ids) for ids in third.scheduled_spec_decode_tokens.values()} == {
+        narrowed
+    }
     _r1_sample(scheduler, third, "none")
     preempted = requests[0]
     scheduler.running.remove(preempted)
     scheduler._preempt_request(preempted, 0.0)
     assert preempted.request_id not in scheduler._adaptive_dflash2_depths
+
+
+def test_clipped_terminal_round_does_not_train_width(
+    native_allocation_config, monkeypatch
+):
+    scheduler = _build_scheduler(
+        native_allocation_config,
+        monkeypatch,
+        exact_end_draft_threshold=3,
+        num_speculative_tokens_per_batch_size=[(1, 8, 7)],
+    )
+    assert scheduler.exact_end_draft_threshold == 3
+    (request,) = hybrid.make_requests(1, 10, 6)
+    scheduler.add_request(request)
+    _r1_sample(scheduler, scheduler.schedule())
+    clipped = scheduler.schedule()
+    assert len(clipped.scheduled_spec_decode_tokens[request.request_id]) == 4
+    _r1_sample(scheduler, clipped, "none")
+    assert request.num_output_tokens == 2
+    assert request.request_id not in scheduler._adaptive_dflash2_depths

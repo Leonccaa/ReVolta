@@ -55,8 +55,6 @@ from .speculative import (
     EagleModelTypes,
     NgramGPUTypes,
     SpeculativeConfig,
-    _get_dflash2_checkpoint_draft_tokens,
-    get_dflash_model_draft_tokens,
     uses_adaptive_dflash_lookup,
 )
 from .structured_outputs import StructuredOutputsConfig
@@ -1418,14 +1416,13 @@ class VllmConfig:
             or not spec.sm70_dflash2.adaptive_width
             or model is None
             or model.quantization != "awq"
-            or get_dflash_model_draft_tokens(spec) != 7
-            or _get_dflash2_checkpoint_draft_tokens(
-                getattr(spec.draft_model_config, "hf_config", None)
-            )
-            != 7
             or self.scheduler_config.async_scheduling
             or not self.use_v2_model_runner
         ):
+            return False
+
+        lookup = spec.resolved_dflash2_lookup
+        if (lookup.mode, lookup.draft_tokens, lookup.verify_tokens) != ("off", 7, 7):
             return False
 
         from vllm.platforms import current_platform

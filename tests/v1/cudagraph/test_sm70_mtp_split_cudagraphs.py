@@ -23,6 +23,8 @@ def _make_config(max_num_seqs: int, verifier_sizes: list[int]):
         num_speculative_state_tokens=lambda: 4,
     )
     return SimpleNamespace(
+        adaptive_mtp_enabled=False,
+        adaptive_dflash2_enabled=False,
         scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
         parallel_config=SimpleNamespace(
             tensor_parallel_size=4,

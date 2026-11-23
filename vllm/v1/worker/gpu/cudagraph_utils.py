@@ -38,6 +38,7 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.spec_decode.dynamic.adaptive_dflash2 import (
+    AWQ_GROUPED_SWEET_SPOT_ROWS,
     MAX_ADAPTIVE_DFLASH2_BATCH,
     MAX_ADAPTIVE_DFLASH2_DRAFTS,
     MIN_ADAPTIVE_DFLASH2_DRAFTS,
@@ -393,16 +394,10 @@ class CudaGraphManager:
             )
         if (
             isinstance(self, ModelCudaGraphManager)
-            and speculative_config is not None
-            and speculative_config.method == "dflash"
-            and vllm_config.adaptive_dflash2_enabled
             and cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+            and vllm_config.adaptive_dflash2_enabled
         ):
-            self._add_adaptive_dflash2_candidates(
-                max_grouped_rows=(
-                    speculative_config.sm70_dflash2.adaptive_width_max_grouped_rows
-                )
-            )
+            self._add_adaptive_dflash2_candidates()
 
     @property
     def max_captured_tokens(self) -> int:
@@ -542,7 +537,7 @@ class CudaGraphManager:
                 [*full_descs, *narrow_descs], key=lambda d: d.num_tokens, reverse=True
             )
 
-    def _add_adaptive_dflash2_candidates(self, *, max_grouped_rows: int) -> None:
+    def _add_adaptive_dflash2_candidates(self) -> None:
         """Capture narrow FULL descriptors for adaptive DFlash2 widths."""
         full_descs = self._capture_descs.get(CUDAGraphMode.FULL, [])
         if not full_descs:
@@ -555,9 +550,8 @@ class CudaGraphManager:
                 self.max_num_reqs,
                 MAX_ADAPTIVE_DFLASH2_BATCH,
                 max_tokens // query_len,
+                AWQ_GROUPED_SWEET_SPOT_ROWS // query_len,
             )
-            if max_grouped_rows > 0:
-                limit = min(limit, max(1, max_grouped_rows // query_len))
             if limit < 1:
                 continue
             capacities = {n for n in (1, 2, 4, 8) if n <= limit} | {limit}

@@ -337,11 +337,6 @@ class Scheduler(SchedulerInterface):
             if vllm_config.adaptive_dflash2_enabled
             else 0
         )
-        self._adaptive_dflash2_max_grouped_rows = (
-            speculative_config.sm70_dflash2.adaptive_width_max_grouped_rows
-            if speculative_config is not None and vllm_config.adaptive_dflash2_enabled
-            else 0
-        )
         self._adaptive_dflash2_depths: dict[str, AdaptiveDFlash2Depth] = {}
         # Last running total of rejection fallbacks seen from the workers.
         self._rejection_fallbacks_total = 0
@@ -1837,7 +1832,6 @@ class Scheduler(SchedulerInterface):
                     len(num_scheduled_tokens),
                     num_spec_tokens_to_schedule,
                     resident_depths,
-                    max_grouped_rows=self._adaptive_dflash2_max_grouped_rows,
                 )
         if self.exact_end_draft_threshold is not None:
             # Only now is the DSD width for the final batch known.

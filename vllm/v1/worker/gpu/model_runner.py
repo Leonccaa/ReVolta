@@ -72,7 +72,6 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
-from vllm.v1.spec_decode.dynamic.adaptive_dflash2 import limit_dflash2_drafts
 from vllm.v1.spec_decode.lookup_quarantine import isolated, require_reusable_context
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
@@ -721,6 +720,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_cache_config,
             self.max_num_reqs,
         )
+        self._adaptive_dflash2_enabled = self.vllm_config.adaptive_dflash2_enabled
         self.cudagraph_manager = ModelCudaGraphManager(
             self.vllm_config,
             self.device,
@@ -2406,8 +2406,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 or speculator.method == "mtp"
             ) or (
                 isinstance(speculator, DFlashSpeculator)
-                and speculator.speculative_config.num_speculative_tokens_per_batch_size
-                is not None
+                and (
+                    speculator.speculative_config.num_speculative_tokens_per_batch_size
+                    is not None
+                    or self._adaptive_dflash2_enabled
+                )
             ):
                 num_draft_tokens = execute_model_state.num_spec_tokens_to_schedule
                 proposal_kwargs["num_speculative_tokens"] = num_draft_tokens
@@ -2448,29 +2451,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 mtp_profile_ctx, "draft_total", mtp_draft_start
             )
             if (
-                isinstance(speculator, DFlashSpeculator)
-                and self.vllm_config.adaptive_dflash2_enabled
-            ):
-                # Contract the trained draft block after lookup has chosen
-                # whether to extend it. Keep an already selected expansion.
-                if num_draft_tokens is None and hasattr(
-                    speculator, "next_num_draft_tokens"
-                ):
-                    num_draft_tokens = speculator.next_num_draft_tokens()
-                num_draft_tokens = limit_dflash2_drafts(
-                    execute_model_state.num_spec_tokens_to_schedule,
-                    num_draft_tokens,
-                )
-            if (
                 num_draft_tokens is not None
                 and num_draft_tokens < self.num_speculative_steps
             ):
                 draft_tokens[:, num_draft_tokens:] = -1
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
-            if num_draft_tokens is None and hasattr(
-                self.speculator, "next_num_draft_tokens"
-            ):
-                num_draft_tokens = self.speculator.next_num_draft_tokens()
+            if num_draft_tokens is None and isinstance(speculator, DFlash2Speculator):
+                num_draft_tokens = speculator.next_num_draft_tokens()
             self.draft_tokens_handler.set_draft_tokens(
                 input_batch,
                 draft_tokens,

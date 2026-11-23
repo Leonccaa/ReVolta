@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 import torch
 
+from vllm.model_executor.layers.logits_processor import CachedLogitsFallback
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.worker.gpu.sample.gumbel import apply_temperature
 from vllm.v1.worker.gpu.sample.states import SamplingStates
@@ -21,6 +22,135 @@ def test_reference_mask_keeps_safe_rows():
     probe[2, -1] = probe[2, -2]
     mask = sparse_rejection._compact_target_reference_rows(probe, 0.7, 0.8)
     np.testing.assert_array_equal(mask, [False, False, True, False])
+
+
+@pytest.mark.parametrize("fallback_kind", ["partial", "all", "callable", "reasoning"])
+def test_cached_fallback_gathers_only_reference_rows(monkeypatch, fallback_kind):
+    # Three ragged requests, with permuted slot and input-buffer mappings.
+    slots = torch.tensor([7, 2, 5])
+    cu = torch.tensor([0, 1, 4, 6])
+    indices = torch.arange(6) * 2
+    expanded = torch.tensor([7, 2, 2, 2, 5, 5])
+    local_pos = torch.tensor([0, 0, 1, 2, 0, 1])
+    local_logits = torch.arange(6 * 24).reshape(6, 24).float()
+    gather = Mock(side_effect=lambda rows: torch.cat((rows, rows + 144), dim=1))
+    processor = SimpleNamespace(_gather_cached_logits=gather)
+    fallback = CachedLogitsFallback(processor, local_logits)
+    if fallback_kind == "callable":
+        fallback = Mock(side_effect=fallback)
+
+    model = SimpleNamespace(
+        get_topk_tokens_and_logits=Mock(),
+        get_topk_tokens_and_logits_with_fallback=Mock(
+            return_value=(local_logits.long()[:, :21], local_logits[:, :21], fallback)
+        ),
+    )
+    batch = SimpleNamespace(
+        has_structured_output_reqs=False,
+        num_reqs=3,
+        num_tokens=12,
+        idx_mapping=slots,
+        idx_mapping_np=slots.numpy(),
+        cu_num_logits=cu,
+        cu_num_logits_np=cu.numpy(),
+        expanded_idx_mapping=expanded,
+        expanded_local_pos=local_pos,
+        logits_indices=indices,
+        input_ids=torch.arange(12) + 40,
+        positions=torch.arange(12) + 100,
+    )
+    process = Mock(side_effect=lambda logits, *_: logits)
+    states = SimpleNamespace(
+        vocab_size=24,
+        temperature=SimpleNamespace(gpu=torch.ones(8)),
+        top_p=SimpleNamespace(np=np.ones(8), gpu=torch.ones(8)),
+        seeds=SimpleNamespace(gpu=torch.arange(8)),
+        apply_temperature=Mock(),
+    )
+    reasoning_eos = (
+        SimpleNamespace(active_requests=lambda _: [])
+        if fallback_kind == "reasoning"
+        else None
+    )
+    sampler = SimpleNamespace(
+        reasoning_eos=reasoning_eos,
+        sampling_states=states,
+        use_fp64_gumbel=False,
+        apply_sampling_params=process,
+    )
+    rejection = SimpleNamespace(
+        sampler=sampler, num_speculative_steps=2, fallback_count=None
+    )
+    speculator = SimpleNamespace(
+        draft_logits=torch.zeros(8, 2, 48),
+        get_sparse_draft_logits=lambda: (None, None),
+    )
+    dense_sample = Mock(return_value=(torch.full((1, 3), 99), torch.tensor([2])))
+    monkeypatch.setattr(sparse_rejection, "DFlash2Speculator", SimpleNamespace)
+    monkeypatch.setattr(sparse_rejection, "sm70_dflash2_enabled", lambda *_: True)
+    monkeypatch.setattr(
+        sparse_rejection, "_supports_sparse_sampling_contract", lambda *_: True
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (7, 0))
+    monkeypatch.setattr(sparse_rejection.envs, "VLLM_SPEC_DUMP_ALIGNMENT", False)
+    monkeypatch.setattr(
+        sparse_rejection,
+        "_compact_target_reference_rows",
+        lambda *_: np.array(
+            [True, True, True, True, True, True]
+            if fallback_kind == "all"
+            else [False, False, True, False, False, False]
+        ),
+    )
+    monkeypatch.setattr(sparse_rejection, "rejection_sample", dense_sample)
+    monkeypatch.setattr(
+        sparse_rejection,
+        "dflash2_sparse_topk_rejection_sample",
+        lambda *args, **kwargs: (
+            torch.zeros(3, 3, dtype=torch.long),
+            torch.ones(3, dtype=torch.long),
+        ),
+    )
+
+    out = sparse_rejection.try_dflash2_sparse_target_rejection(
+        model,
+        speculator,
+        rejection,
+        SimpleNamespace(device=torch.device("cuda")),
+        batch,
+        None,
+    )
+    gather.assert_called_once()
+    if fallback_kind == "all":
+        assert isinstance(out, sparse_rejection.DFlash2LogitsFallback)
+        torch.testing.assert_close(
+            out.logits, torch.cat((local_logits, local_logits + 144), dim=1)
+        )
+        dense_sample.assert_not_called()
+        return
+    rows = slice(1, 4)
+    sent = local_logits[rows] if fallback_kind == "partial" else local_logits
+    torch.testing.assert_close(gather.call_args.args[0], sent)
+    expected = torch.cat((local_logits[rows], local_logits[rows] + 144), dim=1)
+    logits, reqs, reqs_np, pos, draft, local = process.call_args.args
+    for actual, expected_arg in (
+        (logits, expected),
+        (reqs, expanded[rows]),
+        (pos, batch.positions[indices[rows]]),
+        (draft, batch.input_ids[indices[rows]]),
+        (local, local_pos[rows]),
+    ):
+        torch.testing.assert_close(actual, expected_arg)
+    np.testing.assert_array_equal(reqs_np, [2])
+    args = dense_sample.call_args.args
+    torch.testing.assert_close(args[2], draft)
+    assert args[3].tolist() == [0, 3]
+    torch.testing.assert_close(args[4], pos)
+    assert args[5].tolist() == [2]
+    torch.testing.assert_close(args[6], reqs)
+    torch.testing.assert_close(args[7], local)
+    assert out.sampled_token_ids.tolist() == [[0, 0, 0], [99, 99, 99], [0, 0, 0]]
+    assert out.num_sampled.tolist() == [1, 2, 1]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -73,6 +203,9 @@ def test_partial_fallback_matches_dense_with_request_slot_permutation(
     position_buffer[indices] = positions
     temp_np = np.resize(np.array([0.7, 1.0, 1.3], dtype=np.float32), slots)
     p_np = np.resize(np.array([0.8, 0.95, 1.0], dtype=np.float32), slots)
+    if wide_probe:
+        # Keep the full tie away from the top-p guard's CDF boundary.
+        p_np[mapping_np[0]] = 0.93
     temperatures = torch.tensor(temp_np, device=device)
     top_ps = torch.tensor(p_np, device=device)
     seeds = torch.arange(slots, device=device, dtype=torch.int64) + 20260926
@@ -98,11 +231,17 @@ def test_partial_fallback_matches_dense_with_request_slot_permutation(
         states, x, mapping, idx
     )
     sampler = SimpleNamespace(
-        sampling_states=states, use_fp64_gumbel=use_fp64, apply_sampling_params=process
+        reasoning_eos=None,
+        sampling_states=states,
+        use_fp64_gumbel=use_fp64,
+        apply_sampling_params=process,
     )
-    rejection = SimpleNamespace(sampler=sampler, num_speculative_steps=steps)
+    rejection = SimpleNamespace(
+        sampler=sampler, num_speculative_steps=steps, fallback_count=None
+    )
     batch = SimpleNamespace(
         has_structured_output_reqs=False,
+        num_reqs=batch_size,
         idx_mapping_np=mapping_np,
         idx_mapping=mapping,
         cu_num_logits_np=cu_np,
@@ -130,12 +269,15 @@ def test_partial_fallback_matches_dense_with_request_slot_permutation(
         sparse_rejection, "_supports_sparse_sampling_contract", lambda *args: True
     )
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args: (7, 0))
-    fallback = Mock(return_value=target)
+    gather = Mock(side_effect=lambda logits: logits)
+    processor = SimpleNamespace(_gather_cached_logits=gather)
+    fallback = CachedLogitsFallback(processor, target)
     model = SimpleNamespace(
         get_topk_tokens_and_logits=lambda *args: (ids, values),
         get_topk_tokens_and_logits_with_fallback=lambda *args: (ids, values, fallback),
     )
-    for iteration in range(8):
+    fallback_rows = int(counts[ambiguous].sum())
+    for _ in range(8):
         seeds.add_(17)
         processed = process(target, expanded, mapping_np, positions, inputs, local)
         expected, num_expected = rejection_sample(
@@ -161,12 +303,13 @@ def test_partial_fallback_matches_dense_with_request_slot_permutation(
             batch,
             None,
         )
-        assert calls[0][0] == int(counts[ambiguous].sum())
+        assert calls[0][0] == fallback_rows
         np.testing.assert_array_equal(calls[0][1], mapping_np[ambiguous])
         assert torch.equal(actual.num_sampled, num_expected)
         valid = torch.arange(8, device=device)[None] < num_expected[:, None]
         assert torch.equal(actual.sampled_token_ids[valid], expected[valid])
-    assert fallback.call_count == 8
+    assert gather.call_count == 8
+    assert all(call.args[0].shape[0] == fallback_rows for call in gather.call_args_list)
 
 
 def test_wide_reference_guard_retains_truncation_and_rounding_fallbacks():

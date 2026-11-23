@@ -15,8 +15,10 @@ Requirement: the candidate yields one key for every count; the baseline yields
 more than one, which is what this change removes.
 """
 
+import ast
 import importlib
 import inspect
+import linecache
 import os
 import subprocess
 from pathlib import Path
@@ -31,7 +33,7 @@ from vllm.triton_utils import triton  # noqa: E402
 
 pytestmark = pytest.mark.skip_global_cleanup
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 # Branch point of this change: the "before" side of the comparison, so the gate
 # keeps measuring the removal instead of comparing a commit with itself.
 BASELINE = "4859f64df5"
@@ -54,13 +56,20 @@ def _module(rel):
     return importlib.import_module(rel.removesuffix(".py").replace("/", "."))
 
 
-def head_kernel(rel, name):
-    """The same kernel as of HEAD: the behaviour before this change."""
-    source = subprocess.check_output(
-        ["git", "show", f"{BASELINE}:{rel}"], cwd=ROOT, text=True
+def baseline_kernel(rel, name):
+    """Load the original definition without executing its historical imports."""
+    ref = f"{BASELINE}:{rel}"
+    source = subprocess.check_output(["git", "show", ref], cwd=ROOT, text=True)
+    definition = next(
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef) and node.name == name
     )
+    # Triton uses inspect to recover the decorated function's source.
+    linecache.cache[ref] = (len(source), None, source.splitlines(keepends=True), ref)
     namespace = dict(vars(_module(rel)))
-    exec(compile(source, str(ROOT / rel), "exec"), namespace)
+    module = ast.Module(body=[definition], type_ignores=[])
+    exec(compile(module, ref, "exec"), namespace)
     return namespace[name]
 
 
@@ -83,6 +92,7 @@ FLASH = "vllm/v1/attention/backends/flash_attn_v100.py"
 GDN = "vllm/v1/attention/backends/gdn_attn.py"
 LOGPROB = "vllm/v1/worker/gpu/sample/logprob.py"
 REJECT = "vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py"
+REJECTION_CASE = (REJECT, "_rejection_kernel")
 GREEDY = "vllm/v1/worker/gpu/spec_decode/sm70_greedy_verify.py"
 DFLASH = "vllm/v1/worker/gpu/spec_decode/dflash/speculator.py"
 MAMBA_ALIGN = "vllm/v1/worker/gpu/mamba_align.py"
@@ -302,7 +312,7 @@ CASES = {
             "KV_E4M3": False,
         },
     ),
-    (REJECT, "_rejection_kernel"): lambda n: (
+    REJECTION_CASE: lambda n: (
         (
             I64,  # sampled_ptr
             5,  # sampled_stride
@@ -337,9 +347,14 @@ CASES = {
 }
 
 
-# Kernels fixed after the branch point above. Their signatures differ from the
-# baseline, so they only take part in the candidate check.
-LATER_CASES = {
+def rejection_with_reasoning_mask(n):
+    args, kwargs = CASES[REJECTION_CASE](n)
+    return (*args[:-1], None, args[-1]), kwargs
+
+
+CURRENT_CASES = CASES | {
+    REJECTION_CASE: rejection_with_reasoning_mask,
+    # These two kernels were fixed after the original comparison was added.
     (FLASH, "_sm70_prepare_smallq_decode_metadata_kernel"): lambda n: (
         (I32, I32, I32, I32, I32, I32, 8, 8, n, n, max(n - 1, 1), n),
         {"REQ_BLOCK": 64, "BLOCK_COLS": 8},
@@ -351,10 +366,10 @@ LATER_CASES = {
 }
 
 
-@pytest.mark.parametrize("target", sorted(CASES | LATER_CASES))
+@pytest.mark.parametrize("target", sorted(CURRENT_CASES))
 def test_row_count_does_not_change_the_specialization_key(target):
     rel, name = target
-    build = (CASES | LATER_CASES)[target]
+    build = CURRENT_CASES[target]
     candidate = getattr(_module(rel), name)
     found = keys(candidate, build)
     assert len(found) == 1, f"{name} still recompiles per row count: {found}"
@@ -363,10 +378,10 @@ def test_row_count_does_not_change_the_specialization_key(target):
 @pytest.mark.parametrize("target", sorted(CASES))
 def test_the_baseline_kernel_did_specialize_on_the_row_count(target):
     rel, name = target
-    build = CASES[target]
-    before = head_kernel(rel, name)
+    before = baseline_kernel(rel, name)
     after = getattr(_module(rel), name)
-    before_keys, after_keys = keys(before, build), keys(after, build)
+    before_keys = keys(before, CASES[target])
+    after_keys = keys(after, CURRENT_CASES[target])
     assert len(after_keys) == 1
     assert len(before_keys) >= len(after_keys), (
         f"{name}: {BASELINE} had {len(before_keys)} variant(s), candidate "

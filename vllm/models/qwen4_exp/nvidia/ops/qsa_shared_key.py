@@ -7,6 +7,7 @@ from functools import lru_cache
 
 import torch
 
+from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
@@ -118,3 +119,37 @@ def maybe_batched_decode_scores(q, cache, table, starts, positions, lengths, com
     )
     logger.info_once("Using SM70 QSA batched shared-key decode scorer.")
     return scores, visible
+
+
+def shared_key_topk(
+    q, cache, table, requests, positions, lengths, compress, columns, divisor, blocks
+) -> None:
+    rows = q.shape[0]
+    scores = q.new_empty((rows, columns), dtype=torch.float32)
+    visible = q.new_empty((rows,), dtype=torch.int32)
+    # Both the histograms and the counters use atomic accumulation.
+    hist, meta = q.new_zeros((rows * (512 + 8),), dtype=torch.int32).split(
+        (rows * 512, rows * 8)
+    )
+    greater = torch.empty_like(blocks)
+    tie_keys = q.new_empty((rows, 8192), dtype=torch.int32)
+    tie_indices = torch.empty_like(tie_keys)
+    ops.sm70_qsa_indexer_run_topk(
+        blocks,
+        scores,
+        visible,
+        hist,
+        greater,
+        tie_keys,
+        tie_indices,
+        meta,
+        q,
+        cache,
+        table,
+        requests,
+        positions,
+        lengths,
+        divisor,
+        compress,
+    )
+    logger.info_once("Using SM70 QSA fused exact Top-512.")

@@ -1832,6 +1832,7 @@ def qsa_select_paged_tokens(
     *,
     prefill_ranges: tuple[tuple[int, int], ...] = (),
     batch_query_starts: torch.Tensor | None = None,
+    fused_topk: bool = False,
 ) -> torch.Tensor:
     """Score and select QSA indices, using a host bound when available.
 
@@ -1953,6 +1954,42 @@ def qsa_select_paged_tokens(
         (chunk_rows, block_topk), dtype=torch.int32, device=q.device
     )
     exact_topk = _use_sm70_qsa_lexicographic_topk(block_topk)
+    if (
+        fused_topk
+        and world == 1
+        and not prefill_ranges
+        and exact_topk
+        and _SM70_QSA_TOPK_LIBRARY is None
+        and rows == chunk_rows <= 64
+        and q.dtype == k_cache.dtype == torch.float16
+        and q.shape[1:] == (4, 128)
+        and k_cache.shape[2:] == (1, 128)
+        and contiguous_keys is None
+        and 0 < paged_columns <= capacity_columns
+    ):
+        from .qsa_shared_key import shared_key_topk
+
+        shared_key_topk(
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            sequence_lengths,
+            compress_ratio,
+            paged_columns,
+            math.sqrt(q.shape[2]),
+            blocks_buffer,
+        )
+        return expand_qsa_block_indices_cuda(
+            blocks_buffer,
+            query_positions,
+            sequence_lengths,
+            token_to_req,
+            compress_ratio,
+            token_topk,
+            out,
+        )
     fuse_shard_decode = exact_topk and _use_qsa_shard_decode_fusion(q, world)
     compact_batch_topk = (
         exact_topk

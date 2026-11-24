@@ -316,7 +316,7 @@ candidates into the same selection an unsplit indexer would make. With TP4/DCP2
 this halves the GPU bytes of every history ID's index again, so the same budget
 holds about twice as many contexts. Cached pages written with a narrower split
 are not read back. `kernel_config.long_context_kv.draft_main_placement` chooses
-where such a sharded draft's main K/V lives (default `host`); the draft index
+where a matching draft's main K/V lives (default `host`); the draft index
 and raw-key ring always stay in GPU history.
 
 - `"host"` (default): the draft's main K/V is one more layer of the host
@@ -337,10 +337,11 @@ long context, where the number of history IDs limits throughput. Set `"gpu"`
 explicitly when single-request speed matters more than context concurrency,
 when pinned host memory is tight, or when output must stay bitwise comparable
 with releases that defaulted to `"gpu"`. `"host"` needs
-`main_kv_placement="host"` and a draft that shares the target's sharded
-geometry (`qsa_dcp_index_shard` with DCP); if either is missing, the draft
-stays on the GPU and a warning is logged. Changing the value changes the host
-row layout, so an SSD tier written with the other value is not read back.
+`main_kv_placement="host"` and matching target/draft storage formats and page
+geometry. DCP2 also requires `qsa_dcp_index_shard`. A draft with a different
+format or geometry stays on the GPU and logs a warning. Changing the value
+changes the host row layout, so an SSD tier written with the other value is not
+read back.
 
 `speculative_config.gdn_state_replay=true` replays the accepted target GDN
 inputs for MTP, so recurrent layers keep two state blocks per request instead

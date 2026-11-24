@@ -2736,8 +2736,6 @@ def reshape_and_cache_flash(
     if kv_cache_dtype == "int8":
         if k_scale_cache is None or v_scale_cache is None:
             raise ValueError("INT8 v1 writer requires both FP32 scale planes")
-        if not hasattr(torch.ops._C_cache_ops, "reshape_and_cache_flash_int8"):
-            raise RuntimeError("Installed native wheel lacks the INT8 v1 writer ABI")
         torch.ops._C_cache_ops.reshape_and_cache_flash_int8(
             key,
             value,

@@ -91,7 +91,6 @@ def test_planar_union_prefill_uses_scalar_workspace_bound(codec, monkeypatch):
 
             return launch
 
-    monkeypatch.setattr(reader, "require_int8_abi", lambda: None)
     monkeypatch.setattr(reader, "_int8_sparse_kernel", Kernel())
     result = qsa.qsa_sparse_paged_attention(
         query,
@@ -286,11 +285,10 @@ def test_fail_closed_native_abi(monkeypatch):
 
 
 @pytest.mark.parametrize("rows", [1, 5, 8, 17, 20, 40])
-def test_interpreted_dense_draft(rows, monkeypatch):
+def test_interpreted_dense_draft(rows):
     from vllm.v1.attention.backend import AttentionType
     from vllm.v1.attention.ops import int8_dense
 
-    monkeypatch.setattr(int8_dense, "require_int8_abi", lambda: None)
     torch.manual_seed(35)
     _, carrier, view = cache()
     view.key.random_(-128, 128)
@@ -333,7 +331,6 @@ def test_dense_writer_uses_borrowed_planar_scales(monkeypatch):
     from vllm import _custom_ops as ops
     from vllm.v1.attention.ops import int8_dense
 
-    monkeypatch.setattr(int8_dense, "require_int8_abi", lambda: None)
     received = []
     monkeypatch.setattr(
         ops, "reshape_and_cache_flash", lambda *a, **kw: received.append((a, kw))
@@ -425,3 +422,45 @@ def test_late_scale_preserves_tiny_fp32_value_residual():
     # Early Half KV or one Half P*sV both cancel this exact residual to zero.
     expected = torch.full_like(out, 2.0**-33)
     torch.testing.assert_close(out, expected, atol=0, rtol=1e-5)
+
+
+@pytest.mark.parametrize("codec", [INT8, FP8_E4M3_PER_TOKEN_HEAD])
+def test_compacted_empty_splits_are_bitwise(codec, monkeypatch):
+    from vllm.models.qwen4_exp.nvidia.ops import qsa
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(
+        current_platform, "is_device_capability", lambda capability: capability == 70
+    )
+    _, _, view = cache(codec=codec)
+    view.key.fill_(1)
+    view.value.fill_(2)
+    view.key_scale.fill_(0.5)
+    view.value_scale.fill_(0.125)
+    query = torch.zeros((2, 12, 256), dtype=torch.float16)
+    indices = torch.full((2, 83), -1, dtype=torch.int32)
+    indices[0, :17] = torch.arange(17, dtype=torch.int32)
+    table = torch.arange(view.key.shape[0], dtype=torch.int32)[None, :]
+    requests = torch.zeros(2, dtype=torch.int32)
+    results = []
+    for compacted in (False, True):
+        out = torch.empty_like(query, dtype=torch.float32)
+        lse = torch.empty_like(query[..., 0], dtype=torch.float32)
+        qsa.qsa_sparse_paged_attention(
+            query,
+            view.key,
+            view.value,
+            indices,
+            table,
+            requests,
+            out,
+            kv_cache_dtype=codec.name,
+            lse=lse,
+            k_scale_cache=view.key_scale,
+            v_scale_cache=view.value_scale,
+            compacted_indices=compacted,
+        )
+        results.append((out, lse))
+    assert all(torch.equal(a, b) for a, b in zip(*results))
+    assert not results[1][0][1].count_nonzero()
+    assert torch.isneginf(results[1][1][1]).all()

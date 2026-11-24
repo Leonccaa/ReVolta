@@ -93,6 +93,76 @@ def test_descriptor_rejects_layout_outside_registered_frame():
         transfer_layout(c, 32, 16)
 
 
+def test_dflash_tp1_host_rows_fit_all_transfer_tensors():
+    from dataclasses import replace
+
+    from tests.v1.core.long_context_kv_utils import production_config, production_specs
+    from tests.v1.core.test_long_context_host_main_kv import host_settings
+    from vllm.v1.core.kv_cache_utils import (
+        generate_scheduler_kv_cache_config,
+        get_kv_cache_configs,
+    )
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVQuantMode,
+        SlidingWindowSpec,
+    )
+    from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
+    from vllm.v1.kv_offload.host.region import host_region_layout
+
+    block_size = 3328
+    config = production_config(
+        max_model_len=block_size,
+        max_num_seqs=1,
+        long_context=host_settings(host_pool_gib=1.0, hot_pool_gib=0.01),
+    )
+    config.model_config.original_max_model_len = block_size
+    config.instance_id = "dflash-tp1-host-frame"
+    config.parallel_config.tensor_parallel_size = 1
+    config.parallel_config.decode_context_parallel_size = 1
+    config.parallel_config.world_size = 1
+    config.cache_config.block_size = block_size
+    config.cache_config.hash_block_size = 16
+    config.cache_config.enable_prefix_caching = True
+    config.cache_config.prefix_cache_retention_interval = 0
+    config.kv_transfer_config.kv_connector_extra_config = {}
+
+    specs = {}
+    for name, layer in production_specs(speculative_blocks=0).items():
+        if type(layer) is FullAttentionSpec and name.startswith("model.layers.3."):
+            specs[name] = replace(
+                layer,
+                block_size=block_size,
+                dtype=torch.int8,
+                kv_quant_mode=KVQuantMode.INT8_PLANAR,
+            )
+        elif name.startswith("model.layers.3."):
+            specs[name] = (
+                layer
+                if name.endswith("compressor_state")
+                else replace(
+                    layer,
+                    block_size=block_size,
+                )
+            )
+        elif isinstance(layer, SlidingWindowSpec):
+            specs[name] = replace(layer, block_size=block_size, num_kv_heads=4)
+        elif name.startswith(("model.layers.0.", "model.layers.1.", "model.layers.2.")):
+            specs[name] = replace(layer, block_size=block_size)
+
+    (worker,) = get_kv_cache_configs(config, [specs], [5 << 30])
+    scheduler = generate_scheduler_kv_cache_config([worker])
+    for cache in (worker, scheduler):
+        spec = CPUOffloadingSpec(config, cache)
+        frame = host_region_layout(cache, config.instance_id)
+        plan = cache.long_context_plan
+        assert plan is not None
+        assert spec.cpu_page_size_per_worker > frame.main_bytes + sum(frame.index_bytes)
+        assert spec.cpu_page_size_per_worker == frame.worker_bytes
+        assert frame.num_pages == plan.host_history_blocks == spec.num_blocks
+        assert frame.num_pages * frame.worker_bytes <= 1 << 30
+
+
 def test_worker_rank_bytes_split_by_kind_and_duplicate_aggregate(monkeypatch):
     from types import SimpleNamespace
 

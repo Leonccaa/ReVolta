@@ -141,13 +141,15 @@ class LongContextGeometry:
     dcp_interleave: int = 1
     hot_read_rows: int | None = 256
     logical_index_bytes_per_block: int = 0
+    """Host ABI index bytes, excluding GPU page padding (host placement only)."""
+    host_component_bytes_per_block: int = 0
+    """Per-worker frame bytes needed by unified state and draft transfers."""
     index_page_strides: tuple[int, ...] = ()
     """Physical GPU index page stride per layer (P_pad), host placement only."""
     state_inflight_blocks: int = 0
     """Extra state IDs one request holds while an asynchronous frame is in
     flight (one per aligned recurrent group). A segment for one request
     needs them, or that request preempts itself forever."""
-    """Host ABI index bytes, excluding GPU page padding (host placement only)."""
     hot_layout_cache_dtype: str | None = None
     """Resolved planar main-owner format; legacy formats retain their old bill."""
 
@@ -201,8 +203,12 @@ class LongContextGeometry:
     def host_bytes_per_block(self) -> int:
         """Host bytes of one history block summed over all workers."""
         return (
-            self.main_kv_bytes_per_block + self.logical_index_bytes_per_block
-        ) * self.num_workers
+            max(
+                self.main_kv_bytes_per_block + self.logical_index_bytes_per_block,
+                self.host_component_bytes_per_block,
+            )
+            * self.num_workers
+        )
 
     @property
     def hot_tail_groups(self) -> int:

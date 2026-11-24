@@ -11,6 +11,7 @@ from typing_extensions import override
 
 from vllm import envs
 from vllm.config import VllmConfig, get_layers_from_vllm_config
+from vllm.config.speculative_kv import dflash_draft_cache_dtype
 from vllm.config.utils import replace
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
@@ -58,12 +59,8 @@ class DFlashProposer(SpecDecodeBaseProposer):
     @override
     def _create_draft_vllm_config(self) -> VllmConfig:
         base = super()._create_draft_vllm_config()
-        if (
-            self.speculative_config.kv_cache_dtype is None
-            and str(base.cache_config.cache_dtype).startswith("fp8")
-            and current_platform.is_cuda()
-            and current_platform.is_device_capability(70)
-        ):
+        draft_cache_dtype = dflash_draft_cache_dtype(self.vllm_config)
+        if draft_cache_dtype != base.cache_config.cache_dtype:
             logger.info_once(
                 "Using FP16 draft KV cache for SM70 DFlash DDTree while the "
                 "target uses %s.",
@@ -71,7 +68,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
             )
             base = replace(
                 base,
-                cache_config=replace(base.cache_config, cache_dtype="auto"),
+                cache_config=replace(base.cache_config, cache_dtype=draft_cache_dtype),
             )
         return replace(
             base,

@@ -14,8 +14,8 @@ if TYPE_CHECKING:
 def dflash_draft_cache_dtype(config: "VllmConfig") -> "CacheDType":
     """The cache dtype a DFlash drafter is loaded with (``load_dflash_model``).
 
-    An explicit draft ``kv_cache_dtype`` wins; on SM70 an FP8/INT8 target keeps an
-    FP16 drafter cache; otherwise the drafter inherits the target dtype.
+    An explicit draft ``kv_cache_dtype`` wins. On SM70 DFlash uses FP16 by
+    default in both GPU and Host KV mode. Elsewhere it inherits the target.
     """
     from vllm.platforms import current_platform
 
@@ -23,14 +23,25 @@ def dflash_draft_cache_dtype(config: "VllmConfig") -> "CacheDType":
     assert spec is not None
     if spec.kv_cache_dtype is not None:
         return spec.kv_cache_dtype
-    target = config.cache_config.cache_dtype
-    if (
-        (str(target).startswith("fp8") or target == "int8")
+    if current_platform.is_cuda() and current_platform.is_device_capability(70):
+        return "float16"
+    return config.cache_config.cache_dtype
+
+
+def _mtp_uses_fp16_draft_default(config: "VllmConfig") -> bool:
+    """Check whether this MTP configuration should try an FP16 draft."""
+    from vllm.platforms import current_platform
+    from vllm.revolta_profile import has_qsa_capability
+
+    return (
+        config.cache_config.cache_dtype
+        in ("int8", "fp8_per_token_head", "fp8_e4m3", "fp8")
+        and has_qsa_capability(config.model_config)
         and current_platform.is_cuda()
         and current_platform.is_device_capability(70)
-    ):
-        return "auto"
-    return target
+        and config.use_v2_model_runner
+        and not config.kernel_config.long_context_kv.enabled
+    )
 
 
 def validate_speculative_kv_cache_dtype(config: "VllmConfig") -> None:
@@ -68,16 +79,24 @@ def validate_speculative_kv_cache_dtype(config: "VllmConfig") -> None:
                     "speculative_config.kv_cache_dtype. "
                     "Use method='mtp' for MTP speculative decoding with INT8 KV."
                 )
-    if spec.method not in ("eagle", "eagle3", "mtp") or spec.kv_cache_dtype is None:
+    if spec.method not in ("eagle", "eagle3", "mtp"):
+        return
+    draft_storage = spec.kv_cache_dtype
+    if (
+        draft_storage is None
+        and spec.method == "mtp"
+        and _mtp_uses_fp16_draft_default(config)
+    ):
+        draft_storage = "float16"
+    if draft_storage is None:
         return
     target = config.model_config
     draft = spec.draft_model_config
     if target is None or draft is None:
         return
     target_dtype = kv_cache_dtype_str_to_dtype(config.cache_config.cache_dtype, target)
-    draft_dtype = kv_cache_dtype_str_to_dtype(spec.kv_cache_dtype, draft)
+    draft_dtype = kv_cache_dtype_str_to_dtype(draft_storage, draft)
     target_storage = config.cache_config.cache_dtype
-    draft_storage = spec.kv_cache_dtype
     same_format = target_storage == draft_storage or {
         target_storage,
         draft_storage,
@@ -109,7 +128,7 @@ def validate_speculative_kv_cache_dtype(config: "VllmConfig") -> None:
         "fp8_e4m3",
     ):
         reason = "the target KV layout does not support an independent draft dtype"
-    elif spec.kv_cache_dtype not in ("auto", "float16", "bfloat16"):
+    elif draft_storage not in ("auto", "float16", "bfloat16"):
         reason = "a quantized draft with a different target dtype is not supported"
     elif draft_dtype != draft.dtype:
         reason = "the unquantized draft cache must match the draft activation dtype"
@@ -144,7 +163,9 @@ def validate_speculative_kv_cache_dtype(config: "VllmConfig") -> None:
         reason = (
             "mixed-dtype KV supports only the built-in OffloadingConnector (kv_both)"
         )
-    if reason is not None:
+    if reason is None:
+        spec.kv_cache_dtype = draft_storage
+    elif spec.kv_cache_dtype is not None:
         raise ValueError(
             f"speculative_config.kv_cache_dtype={spec.kv_cache_dtype!r} with "
             f"target cache_dtype={config.cache_config.cache_dtype!r}: {reason}. "

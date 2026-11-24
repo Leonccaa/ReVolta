@@ -45,18 +45,20 @@ and are subject to model quality validation.
 | --- | --- |
 | `fp8` / `fp8_e4m3` | Existing E4M3 with calibrated per-layer K/V scalar scales |
 | `fp8_per_token_head` | L1 planar E4M3FN with dynamic FP32 scales per token and head; no KV scale overlay needed |
-| `auto` (CLI default) | Planar E4M3 for eligible QSA requests, with or without checkpoint KV scales and speculation |
+| `auto` (CLI default) | Planar INT8 for eligible SM70 QSA, planar E4M3 for eligible QSA on other CUDA devices |
 | `int8_per_token_head` / `int8` | On Qwen4Exp QSA, both use planar INT8 with round-to-nearest-even and dynamic FP32 scales per token and head |
 | `float16` / `bfloat16` | Explicit model-precision storage, subject to existing hardware and backend support |
 
-QSA auto selection requires the existing `qsa_auto_e4m3` policy, QSA selector
+QSA auto selection uses the existing `qsa_auto_e4m3` policy and requires QSA selector
 metadata, a supported operator dtype/device, no runtime scale calculation and
 prefill context parallelism of one. Otherwise the existing auto/model-dtype
 rules apply. Explicit values take precedence and retain their backend admission
-requirements. MTP inherits the target format unless specified. Qwen4Exp QSA
-MTP accepts an explicit `float16` draft with `int8` (alias
-`int8_per_token_head`) or `fp8_per_token_head` target KV. On SM70,
-DFlash/DFlash2 defaults to an FP16 draft for FP8 and planar INT8 target KV.
+requirements. On SM70 Model Runner V2, eligible QSA MTP configurations with an 8-bit
+target default to FP16 draft KV in GPU mode and to the target format in active Host KV mode
+(`long_context_kv`). With matching formats the draft history can share the
+Host KV pool. DFlash/DFlash2 on SM70 defaults to FP16 draft KV in both modes.
+Set `speculative_config.kv_cache_dtype` to override these defaults with a
+supported format.
 
 The QSA INT8 spellings also work in `speculative_config.kv_cache_dtype`
 when the target uses the same INT8 format. Generic Triton attention uses

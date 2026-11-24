@@ -30,7 +30,7 @@ def resolve_qsa_int8_aliases(cfg) -> None:
         spec.kv_cache_dtype = INT8.name
 
 
-def resolve_qsa_auto_e4m3(cfg) -> bool:
+def resolve_qsa_auto_cache_dtype(cfg) -> bool:
     # A drafter keeps the dtype its loader chose and shares the target policy.
     if getattr(cfg, "is_speculative_draft", False):
         return False
@@ -53,8 +53,16 @@ def resolve_qsa_auto_e4m3(cfg) -> bool:
 
         reason = qsa_e4m3_capability_reason(model.dtype)
     policy.qsa_auto_e4m3_reason = reason
-    policy.qsa_auto_e4m3_active = reason is None
-    if reason is None:
+    if reason is not None:
+        return False
+
+    from vllm.platforms import current_platform
+
+    if current_platform.is_device_capability(70):
+        cfg.cache_config.cache_dtype = INT8.name
+        policy.qsa_auto_e4m3_reason = "SM70 defaults to INT8"
+    else:
         cfg.cache_config.cache_dtype = FP8_E4M3_PER_TOKEN_HEAD.name
-        cfg.cache_config.cache_dtype_from_checkpoint = False
-    return policy.qsa_auto_e4m3_active
+        policy.qsa_auto_e4m3_active = True
+    cfg.cache_config.cache_dtype_from_checkpoint = False
+    return True

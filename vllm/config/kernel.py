@@ -652,7 +652,7 @@ class KernelConfig:
     """Observed selector decisions for loaded local layouts; diagnostic only."""
 
     qsa_auto_e4m3: bool = True
-    """Default eligible QSA auto caches to planar per-token-head E4M3."""
+    """Resolve eligible QSA auto caches to planar INT8 on SM70 and E4M3 elsewhere."""
     qsa_auto_e4m3_active: bool = Field(default=False, init=False)
     """Whether automatic QSA E4M3 storage was selected."""
     qsa_auto_e4m3_reason: str | None = Field(default=None, init=False)

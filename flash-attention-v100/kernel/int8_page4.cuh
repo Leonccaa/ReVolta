@@ -1224,21 +1224,11 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
     grouped_verify_qk<COMPENSATE_P>(shared_q, shared_kv, shared_scores,
                                     qk_scale, active_m_tiles);
     __syncthreads();
-    if constexpr (kRowScales) {
-      if constexpr (TWO_PASS) {
-        int8_kv::scale_attention_tile<KV_DTYPE>(
-            shared_scores, kGroupedVerifyRows, valid_k_rows,
-            kGroupedVerifyScoreStride, scales.key, page_ids, tile_page_offset,
-            page_block_size, 0);
-      } else {
-        for (int idx = tid; idx < kGroupedVerifyRows * valid_k_rows;
-             idx += kGroupedVerifyThreads) {
-          const int row = idx / valid_k_rows;
-          const int col = idx % valid_k_rows;
-          shared_scores[row * kGroupedVerifyScoreStride + col] *=
-              smem.key_scales[col];
-        }
-      }
+    if constexpr (kRowScales && TWO_PASS) {
+      int8_kv::scale_attention_tile<KV_DTYPE>(
+          shared_scores, kGroupedVerifyRows, valid_k_rows,
+          kGroupedVerifyScoreStride, scales.key, page_ids, tile_page_offset,
+          page_block_size, 0);
       __syncthreads();
     }
 
@@ -1296,9 +1286,14 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
             grouped_verify_key_visible<SPARSE_PAGE4, ROW_SEQLENS>(
                 smem.sparse_token_masks, token_idx, query_len, head_idx, kv_idx,
                 valid_k_rows, lane_id, prefix_kv_len, row_lengths);
-        const float score =
-            visible ? shared_scores[row * kGroupedVerifyScoreStride + lane_id]
-                    : kXQANegInf;
+        float score = kXQANegInf;
+        if (visible) {
+          score = shared_scores[row * kGroupedVerifyScoreStride + lane_id];
+          if constexpr (kRowScales) {
+            // Keep scale rounding separate from the softmax subtraction.
+            score = __fmul_rn(score, smem.key_scales[lane_id]);
+          }
+        }
         const float tile_max_lane = warp_reduce_max(score);
         const float tile_max = __shfl_sync(0xffffffffu, tile_max_lane, 0);
         const float old_max = smem.row_max[row];

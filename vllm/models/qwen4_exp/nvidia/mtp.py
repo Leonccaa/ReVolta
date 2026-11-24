@@ -43,6 +43,7 @@ from vllm.model_executor.models.utils import (
     maybe_fuse_shared_experts,
     maybe_prefix,
 )
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
@@ -699,6 +700,12 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "mtp"),
         )
+        if vllm_config.kernel_config.sm70_mtp_draft_qpn8:
+            from vllm.model_executor.layers.quantization.sm70_mtp_draft_qpn8 import (
+                mark_mtp_draft_qpn8,
+            )
+
+            mark_mtp_draft_qpn8(self.model)
 
         if get_pp_group().is_last_rank:
             if config.tie_word_embeddings:
@@ -724,11 +731,31 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         object.__setattr__(self, "_sm70_decode_graph_model", None)
 
     def prepare_sm70_mtp_draft_head(self) -> None:
+        weight = getattr(self.lm_head, "weight", None)
+        if (
+            envs.VLLM_BATCH_INVARIANT
+            or not current_platform.is_cuda()
+            or not current_platform.is_device_capability(70)
+            or weight is None
+            or not weight.is_cuda
+            or weight.dtype != torch.float16
+            or weight.ndim != 2
+            or weight.shape[1] != 2560
+            or weight.shape[0] < 32
+            or weight.shape[0] % 32 != 0
+            or any(
+                not hasattr(torch.ops._C, name)
+                for name in (
+                    "fp8_qpn8_prepare_sm70",
+                    "fp8_qpn8_gemm_sm70_out",
+                    "qwen38_mtp_local_top1_sm70_out",
+                )
+            )
+        ):
+            return
         # The draft-only pack only replaces greedy top-1 selection; full
         # logits still use the shared FP16 head.
-        self.logits_processor = MTPQPN8LogitsProcessor(
-            self.config.vocab_size, self.lm_head.weight
-        )
+        self.logits_processor = MTPQPN8LogitsProcessor(self.config.vocab_size, weight)
         logger.info_once("SM70 greedy MTP draft QPN8 head enabled.")
 
     def prepare_sm70_decode_graph_model(self) -> bool:

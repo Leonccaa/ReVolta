@@ -682,6 +682,11 @@ class KernelConfig:
     """Pack and fuse the two checkpoint-FP16 QSA input projections in the
     SM70 TP4 NVFP4 target MTP decode graph."""
 
+    sm70_mtp_draft_qpn8: bool = True
+    """Requantize the Qwen4Exp native MTP drafter's decoder projections to
+    channel-QPN8 on SM70. Only draft proposals change; verification uses the
+    target's own weights."""
+
     sm70_gdn_input_v154: bool = False
     """Use the v154 packed GDN inputs for physical M3/M4 during SM70 target
     FULL graph capture. Other rows keep their existing path."""

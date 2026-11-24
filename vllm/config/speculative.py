@@ -241,11 +241,11 @@ class SpeculativeConfig:
     warn users when they mistakenly provide the wrong argument."""
 
     # Draft model configuration
-    draft_qpn8_head: bool = False
-    """Use a channel-QPN8 vocabulary projection for greedy Flash-Next MTP
-    drafting on SM70 TP4. This quantizes the draft projection and retains
-    the original shared FP16 head. Unsupported configurations use the
-    existing draft projection.
+    draft_qpn8_head: bool = True
+    """By default, use a channel-QPN8 vocabulary projection for eligible
+    greedy Flash-Next MTP drafts on SM70. The original shared head remains
+    unchanged for verification and full logits. Set to False to use the
+    original draft projection; unsupported heads already fall back to it.
     """
 
     mtp_expert_quantization: Literal["fp8", "q8_0", "fp16"] | None = None

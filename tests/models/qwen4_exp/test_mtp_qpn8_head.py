@@ -18,14 +18,14 @@ from vllm.v1.worker.gpu.spec_decode.eagle import speculator as eagle
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_qpn8_draft_head_config_defaults_off(enabled):
+def test_qpn8_draft_head_config_defaults_on(enabled):
     config = SpeculativeConfig(
         method="ngram", num_speculative_tokens=4, draft_qpn8_head=enabled
     )
     assert config.draft_qpn8_head is enabled
     assert (
         SpeculativeConfig(method="ngram", num_speculative_tokens=4).draft_qpn8_head
-        is False
+        is True
     )
 
 
@@ -46,7 +46,7 @@ def _make_admitted_draft():
     head.num_embeddings = head.org_vocab_size = 248320
     # Simulate the CUDA allocation at the admission boundary only.
     head.weight = SimpleNamespace(
-        shape=(62080, 2560), is_cuda=True, dtype=torch.float16
+        shape=(62080, 2560), is_cuda=True, dtype=torch.float16, ndim=2
     )
     head.shard_indices = SimpleNamespace(
         num_org_elements=62080,
@@ -65,6 +65,16 @@ def _make_admitted_draft():
 
 @pytest.fixture
 def native(monkeypatch):
+    monkeypatch.setattr(
+        mtp,
+        "current_platform",
+        SimpleNamespace(
+            is_cuda=lambda: True, is_device_capability=lambda cap: cap == 70
+        ),
+    )
+    for name in ("fp8_qpn8_prepare_sm70", "fp8_qpn8_gemm_sm70_out"):
+        monkeypatch.setattr(torch.ops._C, name, object(), raising=False)
+
     def prepare(weight):
         assert weight.shape == (62080, 2560)
         return torch.empty(1, dtype=torch.uint8), torch.ones(1, dtype=torch.float16)
@@ -135,6 +145,14 @@ def test_mrv2_load_and_greedy_draft_send_the_native_pair(monkeypatch, native, ro
     )
     assert actual.dtype == torch.int64 and actual.tolist() == [62087] * rows
     assert len(native) == 1
+
+
+def test_unsupported_head_is_not_repacked(monkeypatch, native):
+    draft = _make_admitted_draft()
+    original = draft.logits_processor
+    monkeypatch.setattr(torch.ops, "_C", SimpleNamespace())
+    draft.prepare_sm70_mtp_draft_head()
+    assert draft.logits_processor is original
 
 
 def test_more_than_eight_rows_use_the_fp16_head(monkeypatch, native):

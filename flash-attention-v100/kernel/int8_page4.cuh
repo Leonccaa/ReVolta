@@ -1639,8 +1639,8 @@ at::Tensor decode_row_scaled_page4(const at::Tensor& q, const at::Tensor& k,
                            2 * kXQATCBlockN * sizeof(float);
   auto kernel =
       int8_page4::flash_attention_decode_xqa_tc_partition_kernel_256_wide<
-          256, 6, true, threads, 1, 4, false, false, KV_DTYPE,
-          kXQARouteAllSeqLens, false, true, true, false, float>;
+          kXQAG6Page4PartitionTokens, 6, true, threads, 1, 4, false, false,
+          KV_DTYPE, kXQARouteAllSeqLens, false, true, true, false, float>;
   C10_CUDA_CHECK(cudaFuncSetAttribute(
       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
   auto stream = at::cuda::getCurrentCUDAStream().stream();

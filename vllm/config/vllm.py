@@ -270,12 +270,13 @@ def _resolve_gdn_spec_state_replay(vllm_config: "VllmConfig") -> bool:
     caching on SM70. Post-sampling replay requires synchronous scheduling.
     Native next-round replay uses completed worker-side counts in either scheduler.
     """
-    from vllm.platforms import current_platform
-
     spec = vllm_config.speculative_config
     if spec is None:
         return False
-    deferred = spec.gdn_deferred_commit_metadata
+    requested_deferred = spec.gdn_deferred_commit_metadata
+    deferred = requested_deferred is True
+    if requested_deferred is None:
+        spec.gdn_deferred_commit_metadata = False
     if spec.use_dflash_ddtree():
         if deferred:
             raise ValueError(
@@ -289,6 +290,23 @@ def _resolve_gdn_spec_state_replay(vllm_config: "VllmConfig") -> bool:
     long_context = getattr(
         getattr(vllm_config, "kernel_config", None), "long_context_kv", None
     )
+    model = vllm_config.model_config
+    auto_deferred = (
+        requested_deferred is None
+        and not is_mtp
+        and model is not None
+        and model.quantization == "awq"
+        and vllm_config.scheduler_config.async_scheduling
+        and (long_context is None or not long_context.enabled)
+        and policy.spec_state_replay is not False
+        and not (
+            policy.fused_gdn_verify and "fused_gdn_verify" in policy.explicit_fields
+        )
+        and not _gdn_spec_state_replay_reasons(vllm_config, spec, deferred=True)
+    )
+    if auto_deferred:
+        deferred = spec.gdn_deferred_commit_metadata = True
+
     replay_defaulted = False
     if not is_mtp and long_context is not None and long_context.enabled:
         if policy.spec_state_replay is None:
@@ -337,14 +355,15 @@ def _resolve_gdn_spec_state_replay(vllm_config: "VllmConfig") -> bool:
                     "cannot be enabled together. Disable one of these settings."
                 )
             policy.fused_gdn_verify = False
-            reason = f"{switch}=True was explicitly requested"
-            if replay_defaulted and not deferred:
-                reason = "long-context KV mode enables state replay by default"
-            logger.info_once(
-                "Disabling the automatic sm70_dflash2.fused_gdn_verify "
-                "default because %s.",
-                reason,
-            )
+            if not auto_deferred:
+                reason = f"{switch}=True was explicitly requested"
+                if replay_defaulted and not deferred:
+                    reason = "long-context KV mode enables state replay by default"
+                logger.info_once(
+                    "Disabling the automatic sm70_dflash2.fused_gdn_verify "
+                    "default because %s.",
+                    reason,
+                )
         else:
             logger.info_once(
                 "GDN speculative state replay is disabled: "
@@ -352,6 +371,45 @@ def _resolve_gdn_spec_state_replay(vllm_config: "VllmConfig") -> bool:
                 "the enabled sm70_dflash2.fused_gdn_verify packed verifier."
             )
             return False
+    reasons = (
+        []
+        if auto_deferred
+        else _gdn_spec_state_replay_reasons(vllm_config, spec, deferred=deferred)
+    )
+    if reasons:
+        if deferred:
+            raise ValueError(
+                "gdn_deferred_commit_metadata requires " + ", ".join(reasons)
+            )
+        if replay:
+            logger.warning_once(
+                "%s is not supported here (%s); "
+                "GDN layers keep one state block per speculative position.",
+                "gdn_state_replay" if is_mtp else "sm70_dflash2.spec_state_replay",
+                ", ".join(reasons),
+            )
+        return False
+    if deferred:
+        if auto_deferred:
+            logger.info_once(
+                "Automatically enabling next-round native GDN commit "
+                "for asynchronous SM70 AWQ linear DFlash."
+            )
+        else:
+            logger.info_once("GDN recurrent state commits in the next native forward.")
+        return True
+    logger.info_once(
+        "GDN speculative state replay: recurrent layers keep 2 state blocks per "
+        "running request and replay accepted tokens after sampling."
+    )
+    return True
+
+
+def _gdn_spec_state_replay_reasons(
+    vllm_config: "VllmConfig", spec: SpeculativeConfig, *, deferred: bool
+) -> list[str]:
+    from vllm.platforms import current_platform
+
     reasons = []
     model = vllm_config.model_config
     if model is None or not model.is_hybrid:
@@ -378,7 +436,9 @@ def _resolve_gdn_spec_state_replay(vllm_config: "VllmConfig") -> bool:
         reasons.append("VLLM_SM70_QWEN_GDN_SPEC_CORE_OP")
     if not envs.VLLM_SM70_FUSED_SIGMOID_MIXED_QKV:
         reasons.append("VLLM_SM70_FUSED_SIGMOID_MIXED_QKV is off")
-    valid_deferred_spec = spec.use_qwen4_exp_mtp() if is_mtp else spec.use_dflash()
+    valid_deferred_spec = (
+        spec.use_qwen4_exp_mtp() if spec.method == "mtp" else spec.use_dflash()
+    )
     if deferred and spec.use_dflash() and model is not None:
         # The worker binds replay only to Qwen GDN layers. The native verifier
         # reads a 128 by 128 state for each value head.
@@ -410,27 +470,7 @@ def _resolve_gdn_spec_state_replay(vllm_config: "VllmConfig") -> bool:
             "native deferred replay requires FP16 TP4 Qwen4Exp MTP or linear "
             "DFlash with <=7 speculative state tokens and FP32 SSM"
         )
-    if reasons:
-        if deferred:
-            raise ValueError(
-                "gdn_deferred_commit_metadata requires " + ", ".join(reasons)
-            )
-        if replay:
-            logger.warning_once(
-                "%s is not supported here (%s); "
-                "GDN layers keep one state block per speculative position.",
-                "gdn_state_replay" if is_mtp else "sm70_dflash2.spec_state_replay",
-                ", ".join(reasons),
-            )
-        return False
-    if deferred:
-        logger.info_once("GDN recurrent state commits in the next native forward.")
-        return True
-    logger.info_once(
-        "GDN speculative state replay: recurrent layers keep 2 state blocks per "
-        "running request and replay accepted tokens after sampling."
-    )
-    return True
+    return reasons
 
 
 def _any_participating_device_is_capability(

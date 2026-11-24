@@ -483,10 +483,12 @@ class SpeculativeConfig:
     DFlash continues to use sm70_dflash2.spec_state_replay.
     """
 
-    gdn_deferred_commit_metadata: bool = False
-    """Research opt-in for next-round native GDN commit in SM70 align mode
-    (Qwen4Exp MTP and linear DFlash with Qwen GDN, 128 by 128 state,
-    and up to 7 speculative state tokens)."""
+    gdn_deferred_commit_metadata: bool | None = None
+    """Next-round native GDN commit. None enables it automatically for supported
+    SM70 AWQ linear DFlash with asynchronous scheduling and GPU-only KV
+    (no long-context KV or KV connector), unless state replay is explicitly
+    disabled or fused GDN verification explicitly enabled. True explicitly
+    enables it and raises for unsupported configurations. False disables it."""
 
     gdn_state_replay_graph: bool | None = None
     """Capture accepted-state replay for FULL verify shapes; mixed steps are eager.

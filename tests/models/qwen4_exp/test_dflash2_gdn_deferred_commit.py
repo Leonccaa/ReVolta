@@ -22,7 +22,7 @@ def _make_vllm_config(
     *,
     method: str = "dflash",
     num_spec_tokens: int = 7,
-    deferred: bool = True,
+    deferred: bool | None = True,
     async_scheduling: bool = True,
     fused_gdn_verify: bool | None = True,
     explicit_fused: bool = False,
@@ -30,6 +30,9 @@ def _make_vllm_config(
     tp_size: int = 4,
     dtype: torch.dtype = torch.float16,
     ssm_dtype: str = "float32",
+    quantization: str = "awq",
+    long_context: bool = False,
+    kv_connector: str | None = None,
 ):
     policy = Sm70DFlash2Config(
         fused_gdn_verify=fused_gdn_verify,
@@ -43,7 +46,7 @@ def _make_vllm_config(
         gdn_state_replay=None,
         sm70_dflash2=policy,
         num_speculative_tokens=num_spec_tokens,
-        use_qwen4_exp_mtp=lambda: False,
+        use_qwen4_exp_mtp=lambda: method == "mtp",
     )
     spec.use_dflash = MethodType(SpeculativeConfig.use_dflash, spec)
     spec.use_dflash_ddtree = MethodType(SpeculativeConfig.use_dflash_ddtree, spec)
@@ -55,6 +58,7 @@ def _make_vllm_config(
         model_config=NS(
             is_hybrid=True,
             dtype=dtype,
+            quantization=quantization,
             architecture="Qwen4ExpForConditionalGeneration",
             hf_text_config=NS(linear_key_head_dim=128, linear_value_head_dim=128),
         ),
@@ -63,9 +67,9 @@ def _make_vllm_config(
             mamba_ssm_cache_dtype=ssm_dtype,
         ),
         scheduler_config=NS(async_scheduling=async_scheduling),
-        kv_transfer_config=None,
+        kv_transfer_config=NS(kv_connector=kv_connector) if kv_connector else None,
         parallel_config=NS(pipeline_parallel_size=1, tensor_parallel_size=tp_size),
-        kernel_config=None,
+        kernel_config=NS(long_context_kv=NS(enabled=long_context)),
         use_v2_model_runner=True,
     )
 
@@ -76,6 +80,40 @@ def _patch_sm70(monkeypatch):
         "vllm.config.vllm._any_participating_device_is_capability",
         lambda _cfg, cap: cap == (7, 0),
     )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        pytest.param({}, True, id="async-awq"),
+        pytest.param({"quantization": "modelopt_fp4"}, False, id="nvfp4"),
+        pytest.param({"method": "mtp"}, False, id="mtp"),
+        pytest.param({"method": "dflash_ddtree"}, False, id="ddtree"),
+        pytest.param({"async_scheduling": False}, False, id="sync"),
+        pytest.param({"long_context": True}, False, id="host-kv"),
+        pytest.param({"kv_connector": "NixlConnector"}, False, id="kv-connector"),
+        pytest.param({"explicit_fused": True}, False, id="explicit-fused-verify"),
+        pytest.param({"spec_state_replay": False}, False, id="replay-disabled"),
+        pytest.param({"num_spec_tokens": 15}, False, id="unsupported-width"),
+    ],
+)
+def test_gdn_deferred_commit_automatic_policy(monkeypatch, overrides, expected):
+    _patch_sm70(monkeypatch)
+    cfg = _make_vllm_config(deferred=None, **overrides)
+    spec = cfg.speculative_config
+    assert _resolve_gdn_spec_state_replay(cfg) is expected
+    assert spec.gdn_deferred_commit_metadata is expected
+    if expected:
+        assert spec.sm70_dflash2.fused_gdn_verify is False
+
+
+def test_gdn_deferred_commit_explicit_false_overrides_auto(monkeypatch):
+    _patch_sm70(monkeypatch)
+    cfg = _make_vllm_config(deferred=False)
+    spec = cfg.speculative_config
+    assert not _resolve_gdn_spec_state_replay(cfg)
+    assert spec.gdn_deferred_commit_metadata is False
+    assert spec.sm70_dflash2.fused_gdn_verify is True
 
 
 @pytest.mark.parametrize("async_scheduling", [False, True])

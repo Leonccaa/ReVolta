@@ -249,7 +249,7 @@ class MambaHybridModelState(DefaultModelState):
         self._native_replay_requested = (
             self._spec_state_replay
             and speculative_config is not None
-            and speculative_config.gdn_deferred_commit_metadata
+            and speculative_config.gdn_deferred_commit_metadata is True
         )
         if self._native_replay_requested and self.scheduler_config.async_scheduling:
             assert speculative_config is not None

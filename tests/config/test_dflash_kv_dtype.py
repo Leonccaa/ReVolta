@@ -244,11 +244,10 @@ def test_engine_args_validates_kv_before_model_loading(
 
 
 @pytest.mark.parametrize("feature", [None, "sliding_window", "sinks"])
-def test_dense_int8_reader_boundary_without_gpu(monkeypatch, feature):
+def test_dense_int8_reader_boundary_without_gpu(feature):
     from vllm.v1.attention.backend import AttentionType
     from vllm.v1.attention.ops import int8_dense
 
-    monkeypatch.setattr(int8_dense, "require_int8_abi", lambda: None)
     impl = SimpleNamespace(
         attn_type=AttentionType.DECODER,
         alibi_slopes=None,

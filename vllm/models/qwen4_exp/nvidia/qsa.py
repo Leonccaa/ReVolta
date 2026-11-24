@@ -273,10 +273,10 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             raise NotImplementedError(
                 "Qwen4Exp QSA requires FP16/BF16 or E4M3 main KV cache"
             )
-        if self.kv_cache_dtype == "int8":
-            from .ops.qsa_int8 import require_int8_abi
+        if self.kv_cache_dtype in ("int8", FP8_E4M3_PER_TOKEN_HEAD.name):
+            from .ops.qsa_int8 import require_row_scaled_page4_abi
 
-            require_int8_abi()
+            require_row_scaled_page4_abi()
         self.supports_quant_query_input = False
 
     def forward_qsa(
@@ -864,11 +864,8 @@ def _verify_e4m3_kv_requirements(
 ) -> None:
     """Admit calibrated E4M3 from kernel capabilities, independent of TP/MTP."""
     if cache_config.cache_dtype == "int8":
-        from .ops.qsa_int8 import require_int8_abi
-
         if model_config.dtype != torch.float16:
             raise NotImplementedError("QSA INT8 requires FP16 activations on SM70")
-        require_int8_abi()
         return
     from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD
 

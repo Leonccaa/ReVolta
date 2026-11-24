@@ -15,7 +15,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 
 
 def fixture(rows, member=1, padding=0, codec=INT8, block=16):
-    reader.require_int8_abi()
+    reader.require_row_scaled_page4_abi()
     torch.manual_seed(42)
     tokens = 832 if block == 64 else 816
     page = tokens * 520 + padding

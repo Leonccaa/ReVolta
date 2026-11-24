@@ -98,8 +98,11 @@ _SM70_QSA_GROUPED_PAGE4_OUTPUT_PAGES = (
     _SM70_QSA_XQA_PAGE4_PAGES * _SM70_QSA_GROUPED_PAGE4_QUERIES + 56
 )
 _SM70_QSA_XQA_PAGE4_WORKSPACES: dict[
-    tuple[int, int, int, int, int, bool],
+    tuple[int, int, int, int, int, torch.dtype],
     tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+] = {}
+_SM70_QSA_GROUPED_PAGE4_SCRATCH: dict[
+    tuple[torch.device, int, torch.dtype], tuple[torch.Tensor, torch.Tensor]
 ] = {}
 _SM70_QSA_GROUPED_PAGE4_WORKSPACES: dict[
     tuple[int, int],
@@ -2742,18 +2745,17 @@ def _qsa_xqa_page4_block_table(
 def _qsa_xqa_page4_workspace(
     q: torch.Tensor,
     num_partitions: int,
-    kv_cache_dtype: str,
+    partial_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     device_index = q.device.index if q.device.index is not None else -1
     stream_id = int(torch.cuda.current_stream(q.device).cuda_stream)
-    e4m3_output = kv_cache_dtype == "fp8_e4m3"
     key = (
         device_index,
         stream_id,
         q.shape[1],
         q.shape[2],
         num_partitions,
-        e4m3_output,
+        partial_dtype,
     )
     workspace = _SM70_QSA_XQA_PAGE4_WORKSPACES.get(key)
     rows = q.shape[0]
@@ -2761,7 +2763,7 @@ def _qsa_xqa_page4_workspace(
         capacity = 1 << (rows - 1).bit_length()
         temporary_output = torch.empty(
             (capacity, q.shape[1], num_partitions, q.shape[2]),
-            dtype=torch.float32 if e4m3_output else torch.float16,
+            dtype=partial_dtype,
             device=q.device,
         )
         max_logits = torch.empty(
@@ -2838,6 +2840,29 @@ def _qsa_grouped_page4_workspace(
         grouped_sequence_lengths[:groups],
         lse[: q.shape[0]],
     )
+
+
+def _qsa_grouped_page4_scratch(
+    q: torch.Tensor, rows: int, output_dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # During capture, let the graph pool own these addresses. A later warmup
+    # on the shared capture stream can grow and replace the eager allocation.
+    if torch.cuda.is_current_stream_capturing():
+        shape = (rows, 6, q.shape[2])
+        return q.new_empty(shape), q.new_empty(shape, dtype=output_dtype)
+    stream = int(torch.cuda.current_stream(q.device).cuda_stream)
+    key = (q.device, stream, output_dtype)
+    scratch = _SM70_QSA_GROUPED_PAGE4_SCRATCH.get(key)
+    if scratch is None or scratch[0].shape[0] < rows:
+        capacity = 1 << (rows - 1).bit_length()
+        shape = (capacity, 6, q.shape[2])
+        scratch = (
+            torch.empty(shape, device=q.device, dtype=q.dtype),
+            torch.empty(shape, device=q.device, dtype=output_dtype),
+        )
+        _SM70_QSA_GROUPED_PAGE4_SCRATCH[key] = scratch
+    query, output = scratch
+    return query[:rows], output[:rows]
 
 
 def _qsa_xqa_page4_physical_kv(
@@ -3237,8 +3262,9 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4_batch(
         256 if kv_cache_dtype == "fp8_e4m3" else _SM70_QSA_XQA_PAGE4_PARTITION
     )
     num_partitions = math.ceil(logical_indices.shape[1] / partition_size)
+    partial_dtype = torch.float32 if kv_cache_dtype == "fp8_e4m3" else torch.float16
     temporary_output, max_logits, exp_sums, active_num_partitions = (
-        _qsa_xqa_page4_workspace(q, num_partitions, kv_cache_dtype)
+        _qsa_xqa_page4_workspace(q, num_partitions, partial_dtype)
     )
     physical_k_cache, physical_v_cache = _qsa_xqa_page4_physical_kv(q, k_cache, v_cache)
     flash_attn_v100_cuda.decode_paged_xqa_fwd(
@@ -3468,6 +3494,7 @@ def qsa_sparse_paged_attention(
             v_scale_cache,
             lse,
             codec=codec,
+            compacted_indices=compacted_indices,
         )
 
     if not q.is_cuda or not HAS_TRITON:

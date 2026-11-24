@@ -62,6 +62,55 @@ def test_interpreted_e4m3_reader_against_float64():
 
 
 @pytest.mark.parametrize("codec", [INT8, FP8_E4M3_PER_TOKEN_HEAD])
+@pytest.mark.parametrize(
+    "rows,heads,draft,expected",
+    [
+        (7, 6, False, "decode"),
+        (8, 6, False, "grouped"),
+        (8, 6, True, "decode"),
+        (48, 6, True, "decode"),
+        (8, 12, True, "grouped"),
+    ],
+)
+def test_per_vector_draft_decode_uses_h6_reader(
+    rows, heads, draft, expected, codec, monkeypatch
+):
+    from vllm.forward_context import ForwardContext, override_forward_context
+    from vllm.models.qwen4_exp.nvidia.ops import qsa
+
+    _, _, view = cache(codec=codec)
+    q = torch.empty((rows, heads, 256), dtype=torch.float16)
+    indices = torch.empty((rows, 2051), dtype=torch.int32)
+    requests = torch.zeros(rows, dtype=torch.int32)
+    positions = torch.arange(rows)
+    table = torch.zeros((1, 1), dtype=torch.int32)
+    lengths = torch.tensor([rows], dtype=torch.int32)
+    calls = []
+    monkeypatch.setattr(reader, "native_decode", lambda *a, **k: calls.append("decode"))
+    monkeypatch.setattr(
+        reader, "native_grouped", lambda *a, **k: calls.append("grouped")
+    )
+
+    context = ForwardContext({}, None, {})
+    if draft:
+        context.additional_kwargs["sm70_qsa_draft_decode"] = True
+    with override_forward_context(context):
+        qsa.qsa_sparse_paged_attention(
+            q,
+            view.key,
+            view.value,
+            indices,
+            table,
+            requests,
+            query_positions=positions,
+            sequence_lengths=lengths,
+            kv_cache_dtype=codec.name,
+            **view.scale_kwargs,
+        )
+    assert calls == [expected]
+
+
+@pytest.mark.parametrize("codec", [INT8, FP8_E4M3_PER_TOKEN_HEAD])
 def test_planar_union_prefill_uses_scalar_workspace_bound(codec, monkeypatch):
     from vllm.models.qwen4_exp.nvidia.ops import qsa
 

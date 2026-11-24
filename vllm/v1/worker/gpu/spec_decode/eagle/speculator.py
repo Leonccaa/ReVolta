@@ -454,9 +454,7 @@ class EagleSpeculator:
             batch_descriptor=batch_descriptor,
             is_uniform_decode=is_uniform_decode,
         ):
-            if self.vllm_config.kernel_config.sm70_qsa_paged_fp16_h6 and (
-                is_uniform_decode or is_eagle_draft_step
-            ):
+            if is_uniform_decode or is_eagle_draft_step:
                 # The active MRv2 runner identifies draft decode even when the
                 # draft architecture would not choose MRv2 on its own.
                 get_forward_context().additional_kwargs["sm70_qsa_draft_decode"] = True
@@ -941,6 +939,7 @@ class EagleSpeculator:
                 cudagraph_runtime_mode=prefill_batch_desc.cg_mode,
                 mm_inputs=mm_inputs,
                 skip_sample=num_speculative_tokens == 0,
+                is_uniform_decode=uniform_token_count is not None,
             )
         self._mtp_prefill_end(num_reqs)
 

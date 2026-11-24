@@ -36,13 +36,10 @@ class Build:
     gen: int
     handles: dict[OffloadKey, PageHandle]
     new: set[OffloadKey]
-    cost: int
     pending: set[OffloadKey]
     dispatched: set[OffloadKey] = field(default_factory=set)
     failed: bool = False
     failure_reason: str | None = None
-    newly_protected: tuple[PageHandle, ...] = ()
-    already_owned: tuple[PageHandle, ...] = ()
 
 
 class ComponentTransferSpec(CPULoadStoreSpec):
@@ -60,8 +57,8 @@ class UnifiedStoreManager(OffloadingManager):
         self.ledger: HostReservationLedger
         self.value: UnitValuePolicy
         self.attached = False
-        self.build_frames_per_request = 0
-        self.rejected_step: set[OffloadKey] = set()
+        # Requests sharing a key can offer different sources in the same step.
+        self.rejected_step: set[tuple[str, OffloadKey]] = set()
         self._receipts: dict[int, tuple[int, int]] = {}
         self.ssd: Any = None
         self.retention: Any = None
@@ -167,7 +164,6 @@ class UnifiedStoreManager(OffloadingManager):
         self.value.on_seal_retired = self._on_seal_retired
         reclaim = pool._reclaim_cached_page if pool.elastic else lambda: False
         self.ledger = HostReservationLedger(self.table, reclaim)
-        self.ledger.build_frames_per_request = self.build_frames_per_request
         self.attached = True
         if self.latest_only:
             from vllm.v1.kv_offload.unified.retention import LatestCheckpoints
@@ -199,9 +195,6 @@ class UnifiedStoreManager(OffloadingManager):
                     self.retention.observe(unit)
         elif self.superseded_keep_ssd:
             raise ValueError("superseded_keep_ssd requires an enabled unified SSD")
-
-    def admit_build(self, req_id: str, frames: int) -> bool:
-        return self.ledger.admit(req_id, frames)
 
     def kind(self, key: OffloadKey) -> PageKind:
         group = get_offload_group_idx(key)
@@ -279,16 +272,16 @@ class UnifiedStoreManager(OffloadingManager):
         }
         already_owned = {h for h in handles.values() if h is not None} - protected
         cost = len(new) + len(protected)
-        if not self.ledger.consume(req_id, cost):
+        if self.table.net_headroom() < cost:
+            self.ledger.events["reserve_rejected_build"] += 1
             return None
         marker = id(handles)
         for h in (*protected, *already_owned):
             self.table.pin(h, marker)
-        fresh = self.ledger.reserve_frames(len(new), "build", reserved=True)
+        fresh = self.ledger.reserve_frames(len(new), "build")
         if fresh is None:
             for h in (*protected, *already_owned):
                 self.table.release(h, marker)
-            self.ledger.retire(req_id, cost)
             return None
         for k, h in zip(new, fresh):
             handles[k] = h
@@ -304,11 +297,8 @@ class UnifiedStoreManager(OffloadingManager):
             unit.gen,
             concrete,
             set(new),
-            cost,
             set(new) | shared,
             dispatched=shared.copy(),
-            newly_protected=tuple(protected),
-            already_owned=tuple(already_owned),
         )
         self.builds[uid, unit.gen] = build
         for k, h in concrete.items():
@@ -317,7 +307,6 @@ class UnifiedStoreManager(OffloadingManager):
                 self.pending[k] = (h, build)
             if k in build.pending:
                 self.dependents.setdefault(k, set()).add((uid, unit.gen))
-        self.ledger.charge(req_id, [*protected, *fresh])
         # Owners exist before the temporary reservations leave.
         self.ledger.release_temporary(fresh)
         for h in (*protected, *already_owned):
@@ -506,8 +495,7 @@ class UnifiedStoreManager(OffloadingManager):
         return RequestOffloadingContext()
 
     def on_request_finished(self, req_context: ReqContext) -> None:
-        # Normal end: accepted stores are allowed to publish after completion.
-        # Only unused credit is returned now; accepted DMA moves to DRAINING.
+        # Accepted stores are allowed to publish after normal request completion.
         req_id = req_context.req_id
         # Retain only offers whose remaining inputs have already been accepted.
         # Seal tickets name exact physical incarnations, without retaining GPU IDs.
@@ -525,7 +513,6 @@ class UnifiedStoreManager(OffloadingManager):
         self._latest_variant_offers.pop(req_context.req_id, None)
         self.release_lookup(req_context.req_id)
         self.end_step()
-        self.ledger.finish(req_context.req_id)
         if self.ssd is not None:
             self.ssd.cancel(req_context.req_id)
 
@@ -537,7 +524,6 @@ class UnifiedStoreManager(OffloadingManager):
             if b.req_id == req_id:
                 self._fail_build(b, reason)
         self.end_step()
-        self.ledger.finish(req_id)
         if self.ssd is not None:
             self.ssd.cancel(req_id)
 
@@ -651,12 +637,13 @@ class UnifiedStoreManager(OffloadingManager):
     ) -> PrepareStoreOutput | None:
         ordered = tuple(sorted(dict.fromkeys(keys), key=get_offload_group_idx))
         ordered = tuple(
-            k for k in ordered if k not in self.rejected_step or k in self.pending
+            k
+            for k in ordered
+            if (req_context.req_id, k) not in self.rejected_step or k in self.pending
         )
         missing = tuple(k for k in ordered if not self.is_ready_resident(k))
         if any(k not in self.pending for k in missing):
-            # Window/all-policy extras may be cached opportunistically, but
-            # never spend build reservations belonging to another boundary.
+            # Window/all-policy extras can use the remaining net surplus.
             extra = [k for k in missing if k not in self.pending]
             fresh = self.ledger.reserve_frames(len(extra), "optional_store")
             if fresh is None:
@@ -917,7 +904,6 @@ class UnifiedStoreManager(OffloadingManager):
             "foreground_lookup_leases": sum(
                 len(h) for h in self._lookup_holds.values()
             ),
-            "physical_charges": len(self.ledger.charges),
             "variant_registration_draining_requests": len(self._draining_variants),
             "variant_registration_draining_offers": sum(
                 len(self.waiting.get(req_id, ())) for req_id in self._draining_variants

@@ -300,10 +300,6 @@ class HostPageTable:
                 heapify(heap)
                 self.heap_compactions += 1
         # The revision above invalidates old heap entries for every event.
-        # Payment retirement and heap insertion only become possible once
-        # the physical owners have actually retired.
-        if reclaimable and self.reservation_ledger is not None:
-            self.reservation_ledger.owner_changed(page.handle)
         if reclaimable and self.value_policy is not None:
             self.value_policy.refresh(page)
 

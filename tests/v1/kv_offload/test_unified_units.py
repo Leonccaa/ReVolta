@@ -69,7 +69,6 @@ def store(m, keys, req="r", job=20, success=True):
 
 
 def complete_boundary(m, n, keys, req="r", job=20):
-    assert m.admit_build(req, 11)
     b = m.begin_boundary(req, sha256(n), keys)
     assert b is not None
     store(m, keys, req, job)
@@ -89,11 +88,6 @@ def assert_conserved(m):
             assert unit.missing[tier] == sum(
                 not u._resident(k, tier) for k in unit.keys
             )
-    credits = [*m.ledger.requests.values(), *m.ledger.draining.values()]
-    assert len(m.ledger.charges) == sum(c.owned for c in credits)
-    for credit in credits:
-        assert 0 <= credit.unused + credit.owned <= credit.limit
-        assert not credit.draining or credit.unused == 0
     assert m.table.available() == m.table.num_free() + sum(
         p.state.value != "free" and m.table.reclaimable(p) for p in m.table.pages[1:]
     )
@@ -154,26 +148,22 @@ def test_cpu_ssd_union_and_gpu_unknown():
     assert_conserved(m)
 
 
-def test_b2_three_inventories_and_draining_do_not_double_charge():
+def test_cancelled_boundary_keeps_existing_and_fresh_frames_until_receipt():
     m = manager(pages=13)
     m.kind_by_group = {g: PageKind.STATE for g in range(1, 8)} | {8: PageKind.DRAFT}
     old = [key(1, g) for g in range(1, 8)]
     for k in old:
         publish(m.table, k, PageKind.STATE)
-    assert m.admit_build("r", 11)
     b = m.begin_boundary("r", sha256(1), old + [key(i, 8) for i in range(4)])
-    assert b.cost == 11
-    assert len(b.newly_protected) == 7 and not b.already_owned
-    assert m.ledger.snapshot()["build_reserved"] == 0
-    assert m.table.available() == 1  # 7 existing + 4 fresh, each charged once.
+    assert len(b.new) == 4
+    assert m.table.available() == 1  # 7 existing + 4 fresh, pinned until receipt.
     out = m.prepare_store(b.new, ReqContext("r"))
     m.bind_job(1, "r", out.store_spec, True)
     m.cancel_request("r")
-    assert m.ledger.snapshot()["build_draining"] == 11
-    assert not m.admit_build("r", 11)
-    assert not m.admit_build("other", 2)
+    assert m.table.available() == 1
+    assert m.ledger.reserve_frames(2, "background") is None
     m.receipt(1, out.store_spec.gen, 15, 0)
-    assert "r" not in m.ledger.requests
+    assert m.table.available() == 12
     assert b.uid not in m.units.units
     assert_conserved(m)
 
@@ -182,30 +172,51 @@ def test_existing_owner_cost_zero_and_foreground_reserve_protected():
     m = manager(pages=15)
     h = publish(m.table, key(1, 1), PageKind.STATE)
     m.table.pin(h, 999)
-    assert m.admit_build("r", 11)
     b = m.begin_boundary("r", sha256(1), [key(1, 1), key(1, 2)])
-    assert b.cost == 1
-    assert m.ledger.requests["r"].unused == 10
-    m.table.committed_reserve = lambda: m.ledger.committed() + 2
+    assert m.table.available() == 12
+    m.table.committed_reserve = lambda: 12
     assert m.ledger.reserve_frames(1, "background") is None
     m.end_step()
     assert b.uid not in m.units.units
-    assert m.ledger.requests["r"].unused == 11
+    assert m.table.get(h).leases == {999}
     m.table.release(h, 999)
+    assert_conserved(m)
+
+
+def test_boundary_build_releases_pins_on_capacity_failure(monkeypatch):
+    m = manager(pages=4)
+    keys = [key(1, 1), key(1, 2)]
+    resident = publish(m.table, keys[0], PageKind.STATE)
+    m.table.committed_reserve = lambda: 2
+    assert m.table.net_headroom() == 1
+    assert m.begin_boundary("r", sha256(1), keys) is None
+    assert m.ledger.events["reserve_rejected_build"] == 1
+    assert m.table.reclaimable(m.table.get(resident))
+    assert not m.pending and not m.builds and not m.units.units
+
+    m.table.committed_reserve = lambda: 1
+    with monkeypatch.context() as patch:
+        patch.setattr(m.table, "reserve", lambda **kwargs: None)
+        assert m.begin_boundary("r", sha256(1), keys) is None
+    assert m.table.reclaimable(m.table.get(resident))
+    assert not m.pending and not m.builds and not m.units.units
+
+    b = complete_boundary(m, 1, keys)
+    assert b.handles[keys[0]] == resident
+    assert m.table.net_headroom() == 2
     assert_conserved(m)
 
 
 def test_missing_group_source_does_not_survive_step_and_rebuild_new_gen():
     m = manager()
     ks = [key(1, 1), key(1, 2)]
-    assert m.admit_build("r", 11)
     b = m.begin_boundary("r", sha256(1), ks)
     out = m.prepare_store([ks[0]], ReqContext("r"))
     m.bind_job(3, "r", out.store_spec, True)
     m.end_step()
     assert b.uid not in m.units.units
     assert m.begin_boundary("r", sha256(1), ks) is None
-    assert m.ledger.snapshot()["build_owned"] == 2
+    assert m.table.get(b.handles[ks[0]]).io
     m.receipt(3, out.store_spec.gen, 15, 0)
     fresh = m.begin_boundary("r", sha256(1), ks)
     assert fresh.gen > b.gen
@@ -218,7 +229,6 @@ def test_missing_group_source_does_not_survive_step_and_rebuild_new_gen():
 @pytest.mark.parametrize("reset", [False, True])
 def test_rank_masks_duplicate_stale_generation_failure_and_cancel(reset):
     m = manager()
-    assert m.admit_build("r", 11)
     ks = [key(1, 1)]
     b = m.begin_boundary("r", sha256(1), ks)
     out = m.prepare_store(ks, ReqContext("r"))
@@ -308,8 +318,6 @@ def test_eviction_class_order_and_finite_shared_leaf_exit():
     m = manager(pages=8)
     orphan_main = publish(m.table, key(0))
     orphan_component = publish(m.table, key(9, 1), PageKind.STATE)
-    # Credit quota exceeds this tiny pool, so explicitly use a smaller quota.
-    assert m.admit_build("r", 2)
     b = m.begin_boundary("r", sha256(1), [key(1, 1), key(1, 2)])
     store(m, b.handles)
     while m.table.num_free():
@@ -338,18 +346,18 @@ def test_ledger_failure_is_atomic_and_cached_reclaim_shared_channel():
         return True
 
     ledger = HostReservationLedger(table, reclaim)
-    assert ledger.admit("r", 2)
-    assert len(calls) == 2
+    table.committed_reserve = lambda: 2
     assert ledger.reserve_frames(2, "background") is None
-    assert ledger.consume("r", 2)
-    fresh = ledger.reserve_frames(2, "build", reserved=True)
+    assert len(calls) == 3 and table.available() == 3
+    table.committed_reserve = lambda: 1
+    fresh = ledger.reserve_frames(2, "background")
     assert fresh is not None and len(fresh) == 2
     assert len({h.page_id for h in fresh}) == 2
     # Each fresh page has a physical owner before another reserve can run.
     assert all(not table.reclaimable(table.get(h)) for h in fresh)
+    assert table.net_headroom() == 0
     ledger.release_temporary(fresh)
-    ledger.retire("r", 2)
-    assert ledger.snapshot()["build_reserved"] == 2
+    assert table.net_headroom() == 2
 
 
 def test_request_waiting_does_not_protect_components_and_finishes_cleanly():
@@ -360,7 +368,7 @@ def test_request_waiting_does_not_protect_components_and_finishes_cleanly():
     h = m.table.lookup(key(1, 1))
     assert m.table.reclaimable(m.table.get(h))
     m.on_request_finished(ReqContext("r"))
-    assert not m.waiting and not m.ledger.requests
+    assert not m.waiting
     assert_conserved(m)
 
 
@@ -383,23 +391,21 @@ def test_receive_component_inventory_and_out_of_order_jobs():
 
 def test_normal_finish_keeps_accepted_dma_in_draining_until_success():
     m = manager()
-    assert m.admit_build("r", 11)
     ks = [key(1, 1)]
     b = m.begin_boundary("r", sha256(1), ks)
     out = m.prepare_store(ks, ReqContext("r"))
     m.bind_job(1, "r", out.store_spec, True)
     m.on_request_finished(ReqContext("r"))
-    assert m.ledger.snapshot()["build_draining"] == 1
+    assert m.table.get(b.handles[ks[0]]).io
     assert b.uid in m.units.units and not m.units.units[b.uid].complete
     m.receipt(1, out.store_spec.gen, 15, 0)
     assert m.units.units[b.uid].complete
-    assert not m.ledger.requests
+    assert not m.jobs and not m.builds
     assert_conserved(m)
 
 
 def test_optional_extras_cannot_refuse_an_already_accepted_boundary():
     m = manager(pages=5)
-    assert m.admit_build("r", 2)
     b = m.begin_boundary("r", sha256(1), [key(1, 1), key(1, 2)])
     for i in range(2):
         h = publish(m.table, key(i))
@@ -416,7 +422,7 @@ def test_optional_extras_cannot_refuse_an_already_accepted_boundary():
 def test_foreground_lookup_lease_handoff_and_background_surplus():
     m = manager(pages=6)
     h = publish(m.table, key(1, 1), PageKind.STATE)
-    assert m.admit_build("r", 4)
+    m.table.committed_reserve = lambda: 4
     assert m.hold_lookup("r", [key(1, 1)])
     assert m.table.net_headroom() == 0
     assert m.ledger.reserve_frames(1, "background") is None
@@ -430,30 +436,28 @@ def test_foreground_lookup_lease_handoff_and_background_surplus():
     assert_conserved(m)
 
 
-def test_shared_inflight_draft_has_one_dma_and_one_payment_until_last_owner():
+def test_shared_inflight_draft_has_one_dma_and_one_frame_until_last_owner():
     m = manager()
     shared = key(1, 2)
-    assert m.admit_build("a", 11) and m.admit_build("b", 11)
     a = m.begin_boundary("a", sha256(1), [key(1, 1), shared])
     first = m.prepare_store([shared], ReqContext("a"))
     m.bind_job(1, "a", first.store_spec, True)
     b = m.begin_boundary("b", sha256(2), [key(2, 1), shared])
-    assert a.cost == 2 and b.cost == 1
     # A and B share the original physical handle, never a second allocation.
     assert a.handles[shared] == b.handles[shared]
     m.receipt(1, first.store_spec.gen, 15, 0)
     store(m, [key(1, 1)], "a", job=2)
     assert m.units.units[a.uid].complete
-    assert m.ledger.requests["a"].owned == 1  # Shared B owner still uses it.
+    shared_page = m.table.get(b.handles[shared])
+    assert shared_page.leases == {id(b)}
     second = m.prepare_store([key(2, 1), shared], ReqContext("b"))
     m.bind_job(3, "b", second.store_spec, True)
     m.on_request_finished(ReqContext("a"))
-    assert m.ledger.snapshot()["build_draining"] == 1
+    assert not m.table.reclaimable(shared_page)
     m.receipt(3, second.store_spec.gen, 15, 0)
     assert m.units.units[b.uid].complete
-    assert "a" not in m.ledger.requests
-    assert m.ledger.requests["b"].unused == 11
-    assert not m.ledger.charges and not m.dependents
+    assert m.table.reclaimable(shared_page)
+    assert not m.dependents
     assert m.num_stored_blocks == 3
     assert_conserved(m)
 
@@ -461,7 +465,6 @@ def test_shared_inflight_draft_has_one_dma_and_one_payment_until_last_owner():
 def test_failed_boundary_does_not_discard_healthy_siblings_shared_dma():
     m = manager()
     shared = key(1, 2)
-    assert m.admit_build("a", 11) and m.admit_build("b", 11)
     a = m.begin_boundary("a", sha256(1), [key(1, 1), shared])
     b = m.begin_boundary("b", sha256(2), [key(2, 1), shared])
     out = m.prepare_store([shared, key(2, 1)], ReqContext("b"))
@@ -574,10 +577,8 @@ def test_randomized_presence_and_reference_conservation():
 
 def test_leaf_page_spill_retains_union_until_unit_files_are_complete():
     m = manager(pages=4)
-    assert m.admit_build("r", 2)
     b = m.begin_boundary("r", sha256(1), [key(1, 1), key(1, 2)])
     store(m, b.handles)
-    m.ledger.finish("r")
     h = m.table.lookup(key(1, 1))
     m.table.mark_persisted(h)
     other = publish(m.table, key(0))
@@ -678,7 +679,6 @@ def test_build_can_share_optional_inflight_component_without_second_dma():
     extra = m.prepare_store([draft], ReqContext("extra"))
     assert extra is not None
     m.bind_job(1, "extra", extra.store_spec, True)
-    assert m.admit_build("r", 11)
     b = m.begin_boundary("r", sha256(1), [key(1, 1), draft])
     assert b is not None
     state = m.prepare_store([key(1, 1), draft], ReqContext("r"))
@@ -722,23 +722,21 @@ def test_partial_state_demotion_refreshes_chain_only_on_value_class_change():
     assert_conserved(m)
 
 
-def test_readmission_credit_is_independent_of_old_draining_owner():
+def test_new_boundary_is_independent_of_cancelled_requests_dma():
     m = manager()
-    assert m.admit_build("r", 11)
-    old = m.ledger.requests["r"]
-    b = m.begin_boundary("r", sha256(1), [key(1, 1), key(1, 2)])
-    out = m.prepare_store(b.handles, ReqContext("r"))
+    old = m.begin_boundary("r", sha256(1), [key(1, 1), key(1, 2)])
+    out = m.prepare_store(old.handles, ReqContext("r"))
     m.bind_job(1, "r", out.store_spec, True)
     m.cancel_request("r")
-    assert old.draining and old.unused == 0 and old.owned == 2
-    assert m.admit_build("r", 11)
-    fresh = m.ledger.requests["r"]
-    assert fresh.generation > old.generation and fresh.unused == 11
-    assert_conserved(m)
+    fresh = m.begin_boundary("r", sha256(2), [key(2, 1), key(2, 2)])
+    assert set(old.handles.values()).isdisjoint(fresh.handles.values())
+    assert all(m.table.get(h).io for h in old.handles.values())
     m.receipt(1, out.store_spec.gen, m.table.all_ranks, 0)
-    assert old.owned == 0 and not m.ledger.draining and not m.ledger.charges
-    assert m.ledger.requests["r"] is fresh and fresh.unused == 11
-    assert not m.units.units
+    assert all(id(fresh) in m.table.get(h).leases for h in fresh.handles.values())
+    store(m, fresh.handles, job=2)
+    assert m.units.units[fresh.uid].complete
+    assert old.uid not in m.units.units
+    assert_conserved(m)
 
 
 def test_ready_event_rechecks_inventory_lost_while_waiting():
@@ -759,7 +757,6 @@ def test_ready_event_rechecks_inventory_lost_while_waiting():
 
 def test_boundary_completion_wakes_other_request_without_step_retry():
     m = manager()
-    assert m.admit_build("producer", 11)
     keys = [key(1, 1), key(1, 2)]
     b = m.begin_boundary("producer", sha256(1), keys)
     for k in (key(0), key(1)):

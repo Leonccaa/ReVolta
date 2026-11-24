@@ -478,7 +478,6 @@ def test_host_placement_preserves_r2_streaming_progress(
             scheduler.connector = None  # Scheduler-only fixture has no I/O worker.
             table = scheduler.host_history_pool.host_pages
             if table.reservation_ledger is not None:
-                table.committed_reserve = table.reservation_ledger._external
                 table.reservation_ledger = None
                 table.value_policy = None
         return scheduler

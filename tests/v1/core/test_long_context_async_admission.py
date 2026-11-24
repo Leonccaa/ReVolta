@@ -60,7 +60,7 @@ def scheduler(
     pool = s.host_history_pool
     if pool is not None and pool.host_pages.reservation_ledger is not None:
         table = pool.host_pages
-        table.committed_reserve = table.reservation_ledger._external
+
         table.reservation_ledger = None
         table.value_policy = None
     return s
@@ -127,7 +127,7 @@ def test_dflash_load_fits_minimal_state_pool(full_isl):
     pool = s.host_history_pool
     if pool is not None and pool.host_pages.reservation_ledger is not None:
         table = pool.host_pages
-        table.committed_reserve = table.reservation_ledger._external
+
         table.reservation_ledger = None
         table.value_policy = None
     assert not s.kv_cache_manager.admission_ledger.plan.startup_problems()

@@ -101,11 +101,10 @@ def test_turbomind_expansion_bitwise_and_graph(banks, monkeypatch, k, n, indexed
         (s0, "1", None),
         (s1, "1", None),
     ]
-    if not indexed:
-        workspace = torch.empty(
-            (num * (k // 32 * n * 3 + 16),), dtype=torch.uint8, device="cuda"
-        )
-        cases.append((s1, "1", workspace))
+    workspace = torch.empty(
+        (num * (k // 32 * n * 3 + 16),), dtype=torch.uint8, device="cuda"
+    )
+    cases.append((s1, "1", workspace))
     for metadata, enabled, workspace in cases:
         monkeypatch.setenv("VLLM_SM70_AWQ_MOE_INT4_ZERO", enabled)
         pw, ps = ops.awq_moe_build_strided_ptrs(w, metadata, k * 32, -n, 512)
@@ -114,7 +113,7 @@ def test_turbomind_expansion_bitwise_and_graph(banks, monkeypatch, k, n, indexed
         def run(out=out, pw=pw, ps=ps, workspace=workspace):
             if indexed:
                 ops.awq_moe_single_token_indexed_dense_stage_sm70_out(
-                    out, x, offsets, ids, pw, ps, num, k, n, 32
+                    out, x, offsets, ids, pw, ps, num, k, n, 32, workspace
                 )
             else:
                 ops.awq_moe_gemm_sm70_per_expert_dispatch_out(

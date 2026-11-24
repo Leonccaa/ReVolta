@@ -3664,6 +3664,7 @@ def awq_moe_dense_stage_sm70_out(
     k: int,
     n: int,
     group_size: int,
+    int4_zero_workspace: torch.Tensor | None = None,
 ) -> None:
     _op("awq_moe_dense_stage_sm70_out")(
         out,
@@ -3676,6 +3677,7 @@ def awq_moe_dense_stage_sm70_out(
         k,
         n,
         group_size,
+        int4_zero_workspace,
     )
 
 
@@ -3693,6 +3695,7 @@ if hasattr(torch.ops._C, "awq_moe_dense_stage_sm70_out"):
         k: int,
         n: int,
         group_size: int,
+        int4_zero_workspace: torch.Tensor | None = None,
     ) -> None:
         return None
 
@@ -3759,6 +3762,7 @@ def awq_moe_active_dense_stage_sm70_out(
     k: int,
     n: int,
     group_size: int,
+    int4_zero_workspace: torch.Tensor | None = None,
 ) -> None:
     _op("awq_moe_active_dense_stage_sm70_out")(
         out,
@@ -3772,6 +3776,7 @@ def awq_moe_active_dense_stage_sm70_out(
         k,
         n,
         group_size,
+        int4_zero_workspace,
     )
 
 
@@ -3790,6 +3795,7 @@ if hasattr(torch.ops._C, "awq_moe_active_dense_stage_sm70_out"):
         k: int,
         n: int,
         group_size: int,
+        int4_zero_workspace: torch.Tensor | None = None,
     ) -> None:
         return None
 
@@ -3885,6 +3891,7 @@ def awq_moe_single_token_dense_stage_sm70_out(
     k: int,
     n: int,
     group_size: int,
+    int4_zero_workspace: torch.Tensor | None = None,
 ) -> None:
     _op("awq_moe_single_token_dense_stage_sm70_out")(
         out,
@@ -3897,6 +3904,7 @@ def awq_moe_single_token_dense_stage_sm70_out(
         k,
         n,
         group_size,
+        int4_zero_workspace,
     )
 
 
@@ -3914,6 +3922,7 @@ if hasattr(torch.ops._C, "awq_moe_single_token_dense_stage_sm70_out"):
         k: int,
         n: int,
         group_size: int,
+        int4_zero_workspace: torch.Tensor | None = None,
     ) -> None:
         return None
 
@@ -3929,6 +3938,7 @@ def awq_moe_single_token_indexed_dense_stage_sm70_out(
     k: int,
     n: int,
     group_size: int,
+    int4_zero_workspace: torch.Tensor | None = None,
 ) -> None:
     _op("awq_moe_single_token_indexed_dense_stage_sm70_out")(
         out,
@@ -3941,6 +3951,7 @@ def awq_moe_single_token_indexed_dense_stage_sm70_out(
         k,
         n,
         group_size,
+        int4_zero_workspace,
     )
 
 
@@ -3958,6 +3969,7 @@ if hasattr(torch.ops._C, "awq_moe_single_token_indexed_dense_stage_sm70_out"):
         k: int,
         n: int,
         group_size: int,
+        int4_zero_workspace: torch.Tensor | None = None,
     ) -> None:
         return None
 
@@ -3977,6 +3989,7 @@ def awq_moe_single_token_dense_w13_sm70_out(
     w13_n: int,
     group_size: int,
     hidden_logical_size: int,
+    int4_zero_workspace: torch.Tensor | None = None,
 ) -> None:
     _op("awq_moe_single_token_dense_w13_sm70_out")(
         gate_up,
@@ -3993,6 +4006,7 @@ def awq_moe_single_token_dense_w13_sm70_out(
         w13_n,
         group_size,
         hidden_logical_size,
+        int4_zero_workspace,
     )
 
 
@@ -4014,6 +4028,7 @@ if hasattr(torch.ops._C, "awq_moe_single_token_dense_w13_sm70_out"):
         w13_n: int,
         group_size: int,
         hidden_logical_size: int,
+        int4_zero_workspace: torch.Tensor | None = None,
     ) -> None:
         return None
 
@@ -4033,6 +4048,7 @@ def awq_moe_single_token_indexed_dense_w13_sm70_out(
     w13_n: int,
     group_size: int,
     hidden_logical_size: int,
+    int4_zero_workspace: torch.Tensor | None = None,
 ) -> None:
     _op("awq_moe_single_token_indexed_dense_w13_sm70_out")(
         gate_up,
@@ -4049,6 +4065,7 @@ def awq_moe_single_token_indexed_dense_w13_sm70_out(
         w13_n,
         group_size,
         hidden_logical_size,
+        int4_zero_workspace,
     )
 
 
@@ -4070,6 +4087,7 @@ if hasattr(torch.ops._C, "awq_moe_single_token_indexed_dense_w13_sm70_out"):
         w13_n: int,
         group_size: int,
         hidden_logical_size: int,
+        int4_zero_workspace: torch.Tensor | None = None,
     ) -> None:
         return None
 
@@ -4091,6 +4109,7 @@ def awq_moe_single_token_compact_dense_w13_sm70_out(
     w13_n: int,
     group_size: int,
     hidden_logical_size: int,
+    int4_zero_workspace: torch.Tensor | None = None,
 ) -> None:
     _op("awq_moe_single_token_compact_dense_w13_sm70_out")(
         gate_up,
@@ -4109,6 +4128,7 @@ def awq_moe_single_token_compact_dense_w13_sm70_out(
         w13_n,
         group_size,
         hidden_logical_size,
+        int4_zero_workspace,
     )
 
 
@@ -4132,6 +4152,7 @@ if hasattr(torch.ops._C, "awq_moe_single_token_compact_dense_w13_sm70_out"):
         w13_n: int,
         group_size: int,
         hidden_logical_size: int,
+        int4_zero_workspace: torch.Tensor | None = None,
     ) -> None:
         return None
 
@@ -4397,6 +4418,7 @@ def awq_moe_single_token_sm70_out(
     w2_n: int,
     group_size: int,
     hidden_logical_size: int,
+    int4_zero_workspace: torch.Tensor | None = None,
 ) -> None:
     _op("awq_moe_single_token_sm70_out")(
         out,
@@ -4423,6 +4445,7 @@ def awq_moe_single_token_sm70_out(
         w2_n,
         group_size,
         hidden_logical_size,
+        int4_zero_workspace,
     )
 
 
@@ -4454,6 +4477,7 @@ if hasattr(torch.ops._C, "awq_moe_single_token_sm70_out"):
         w2_n: int,
         group_size: int,
         hidden_logical_size: int,
+        int4_zero_workspace: torch.Tensor | None = None,
     ) -> None:
         del (
             out,

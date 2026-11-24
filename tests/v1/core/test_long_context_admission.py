@@ -107,7 +107,6 @@ def build(
         scheduler.connector = None
         table = scheduler.host_history_pool.host_pages
         if table.reservation_ledger is not None:
-            table.committed_reserve = table.reservation_ledger._external
             table.reservation_ledger = None
             table.value_policy = None
     return scheduler

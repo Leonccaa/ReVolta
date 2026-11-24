@@ -566,14 +566,6 @@ class OffloadingConnectorScheduler:
             plan = spec.kv_cache_config.long_context_plan
             assert plan is not None
             span = plan.geometry.block_tokens
-            groups = self.config.kv_group_configs
-            components = sum(g.requires_exact_boundary_source for g in groups)
-            components += sum(
-                g.sliding_window_size_in_blocks or 0
-                for g in groups
-                if g.draft_window_tokens is not None
-            )
-            self.unified.build_frames_per_request = (cdiv(batch, span) + 1) * components
             self.unified.max_pending_variants = cdiv(batch, span) + 1
 
         full_attention_groups: list[int] = []
@@ -2389,7 +2381,10 @@ class OffloadingConnectorScheduler:
                 if offload_block_idx >= len(group_state.offload_keys):
                     continue
                 offload_key = group_state.offload_keys[offload_block_idx]
-                if unified is not None and offload_key in unified.rejected_step:
+                if (
+                    unified is not None
+                    and (req_id, offload_key) in unified.rejected_step
+                ):
                     rejected.append(boundary_tokens)
                     continue
                 store_output = self._prepare_store([offload_key], req_status)
@@ -2586,11 +2581,11 @@ class OffloadingConnectorScheduler:
                             unified.events["boundary_reject_state"] += 1
                         if any(k not in state_components for k in missing):
                             unified.events["boundary_reject_draft"] += 1
-                        unified.rejected_step.update(components)
+                        unified.rejected_step.update((req_id, k) for k in components)
                         continue
                     build = unified.begin_boundary(req_id, h_b, components)
                     if build is None:
-                        unified.rejected_step.update(components)
+                        unified.rejected_step.update((req_id, k) for k in components)
                         continue
                     gen = build.gen
                 else:

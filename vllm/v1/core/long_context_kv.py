@@ -993,9 +993,6 @@ class LongContextAdmissionLedger:
                 # every step; most decode steps need no fresh page).
                 fresh = demand[domain] - pool.host_kept_free()
                 free_frames = pool.host_pages.num_free()
-                unified = pool.host_pages.reservation_ledger
-                if unified is not None:
-                    free_frames -= sum(c.unused for c in unified.requests.values())
                 if (
                     fresh > 0
                     and fresh > free_frames

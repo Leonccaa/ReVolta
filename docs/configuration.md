@@ -58,8 +58,8 @@ unless `speculative_config.kv_cache_dtype` overrides it with a supported format.
 The MTP draft can share the Host KV pool when main and draft are placed on the
 host and their format and page geometry match. At DCP2, this also requires
 `qsa_dcp_index_shard=true`. An explicit FP16 draft with an 8-bit target keeps its
-history on the GPU. On SM70, DFlash/DFlash2 defaults to the draft model precision
-(FP16 for QSA DFlash2) in both modes.
+history on the GPU. With an SM70 QSA target, DFlash/DFlash2 defaults to FP16
+draft KV in both modes.
 
 The QSA INT8 spellings also work in `speculative_config.kv_cache_dtype`
 when the target uses the same INT8 format. Generic Triton attention uses

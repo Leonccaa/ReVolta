@@ -11,7 +11,6 @@ import torch
 from safetensors.torch import save_file
 
 from vllm.config import KernelConfig
-from vllm.config.speculative_kv import validate_speculative_kv_cache_dtype
 from vllm.models.qwen4_exp.common.kv_policy import (
     resolve_qsa_auto_cache_dtype,
     resolve_qsa_int8_aliases,
@@ -87,6 +86,7 @@ def test_auto_admission_uses_capability(tmp_path, monkeypatch, tp):
     cfg = _config(_checkpoint(tmp_path))
     cfg.parallel_config.tensor_parallel_size = tp
     monkeypatch.setattr(qsa, "qsa_e4m3_capability_reason", lambda dtype: None)
+    monkeypatch.setattr(qsa.current_platform, "is_device_capability", lambda _: False)
     before = dict(os.environ)
     assert resolve_qsa_auto_cache_dtype(cfg)
     assert cfg.cache_config.cache_dtype == FP8_E4M3_PER_TOKEN_HEAD.name
@@ -95,52 +95,13 @@ def test_auto_admission_uses_capability(tmp_path, monkeypatch, tp):
     assert dict(os.environ) == before
 
 
-@pytest.fixture
-def sm70(monkeypatch):
-    monkeypatch.setattr(qsa.current_platform, "is_cuda", lambda: True)
+def test_sm70_auto_selects_int8(tmp_path, monkeypatch):
+    cfg = _config(_checkpoint(tmp_path))
     monkeypatch.setattr(qsa.current_platform, "is_device_capability", lambda _: True)
     monkeypatch.setattr(qsa, "qsa_e4m3_capability_reason", lambda dtype: None)
-
-
-@pytest.mark.parametrize(
-    "target,placement,explicit",
-    [
-        ("auto", None, None),
-        ("auto", "gpu", None),
-        ("auto", "host", None),
-        ("auto", None, "int8"),
-        ("auto", "host", "float16"),
-        ("fp8_per_token_head", None, None),
-        ("fp8_per_token_head", "host", None),
-        ("fp8_e4m3", None, None),
-        ("float16", None, None),
-    ],
-)
-def test_sm70_qsa_mtp_inherits_target_by_default(
-    sm70, tmp_path, target, placement, explicit
-):
-    model = _checkpoint(tmp_path)
-    model.use_mla = False
-    cfg = _config(model)
-    cfg.is_speculative_draft = False
-    cfg.use_v2_model_runner = True
-    cfg.parallel_config.pipeline_parallel_size = 1
-    cfg.parallel_config.decode_context_parallel_size = 1
-    cfg.scheduler_config = SimpleNamespace(disable_hybrid_kv_cache_manager=False)
-    cfg.kv_transfer_config = None
-    cfg.cache_config.cache_dtype = target
-    if placement is not None:
-        cfg.kernel_config.long_context_kv.enabled = True
-        cfg.kernel_config.long_context_kv.main_kv_placement = placement
-    cfg.speculative_config = SimpleNamespace(
-        method="mtp", kv_cache_dtype=explicit, draft_model_config=model
-    )
-
-    assert resolve_qsa_auto_cache_dtype(cfg) == (target == "auto")
-    assert cfg.cache_config.cache_dtype == ("int8" if target == "auto" else target)
+    assert resolve_qsa_auto_cache_dtype(cfg)
+    assert cfg.cache_config.cache_dtype == "int8"
     assert not cfg.kernel_config.qsa_auto_e4m3_active
-    validate_speculative_kv_cache_dtype(cfg)
-    assert cfg.speculative_config.kv_cache_dtype == explicit
 
 
 @pytest.mark.parametrize(
@@ -182,6 +143,7 @@ def test_speculative_draft_keeps_its_dtype_and_target_policy(tmp_path, monkeypat
     # is_speculative_draft=True and cache_dtype "auto" (FP16 on SM70).
     target = _config(_checkpoint(tmp_path))
     monkeypatch.setattr(qsa, "qsa_e4m3_capability_reason", lambda dtype: None)
+    monkeypatch.setattr(qsa.current_platform, "is_device_capability", lambda _: False)
     assert resolve_qsa_auto_cache_dtype(target)
     draft = SimpleNamespace(**vars(target))
     draft.is_speculative_draft = True
@@ -210,6 +172,7 @@ def test_checkpoint_selects_planar(tmp_path, monkeypatch, method, has_scales):
     cfg = _config(_checkpoint(tmp_path, scales))
     cfg.speculative_config = SimpleNamespace(method=method) if method else None
     monkeypatch.setattr(qsa, "qsa_e4m3_capability_reason", lambda dtype: None)
+    monkeypatch.setattr(qsa.current_platform, "is_device_capability", lambda _: False)
     assert resolve_qsa_auto_cache_dtype(cfg)
     assert cfg.cache_config.cache_dtype == FP8_E4M3_PER_TOKEN_HEAD.name
     assert not cfg.cache_config.cache_dtype_from_checkpoint

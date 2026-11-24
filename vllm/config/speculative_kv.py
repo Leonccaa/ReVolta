@@ -14,16 +14,20 @@ if TYPE_CHECKING:
 def dflash_draft_cache_dtype(config: "VllmConfig") -> "CacheDType":
     """The cache dtype a DFlash drafter is loaded with (``load_dflash_model``).
 
-    An explicit draft ``kv_cache_dtype`` wins. On SM70 the draft uses its model
-    precision (FP16 for QSA DFlash2). Elsewhere it inherits the target dtype.
+    An explicit draft ``kv_cache_dtype`` wins. With an SM70 QSA target the
+    draft uses its model precision (FP16 for QSA DFlash2). Elsewhere it
+    inherits the target dtype.
     """
     from vllm.platforms import current_platform
+    from vllm.revolta_profile import has_qsa_capability
 
     spec = config.speculative_config
     assert spec is not None
     if spec.kv_cache_dtype is not None:
         return spec.kv_cache_dtype
-    if current_platform.is_device_capability(70):
+    if current_platform.is_device_capability(70) and has_qsa_capability(
+        config.model_config
+    ):
         return "auto"
     return config.cache_config.cache_dtype
 
@@ -140,8 +144,20 @@ def validate_speculative_kv_cache_dtype(config: "VllmConfig") -> None:
             "mixed-dtype KV supports only the built-in OffloadingConnector (kv_both)"
         )
     if reason is not None:
+        remedy = (
+            "Use matching target/draft KV dtypes or remove the incompatible option."
+        )
+        if (
+            spec.method == "mtp"
+            and qsa
+            and target_storage == "int8"
+            and draft_storage == "fp8_per_token_head"
+        ):
+            remedy = (
+                "Set --kv-cache-dtype fp8_per_token_head to keep the draft format, "
+                "or remove speculative_config.kv_cache_dtype to inherit INT8."
+            )
         raise ValueError(
             f"speculative_config.kv_cache_dtype={spec.kv_cache_dtype!r} with "
-            f"target cache_dtype={config.cache_config.cache_dtype!r}: {reason}. "
-            "Use matching target/draft KV dtypes or remove the incompatible option."
+            f"target cache_dtype={target_storage!r}: {reason}. {remedy}"
         )

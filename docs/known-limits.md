@@ -9,11 +9,9 @@ all GPUs under one PCIe switch with P2P, are the recommended and tested intercon
 The reference system uses four V100 32 GB PCIe cards behind one PCIe switch
 (PIX/PXB in `nvidia-smi topo -m`), with P2P enabled and a 128 GiB container memory limit.
 
-The release results below use the documented scalar E4M3 recipes. The L1
-`fp8_per_token_head` name now means dynamic planar E4M3; eligible QSA `auto`
-requests select it regardless of checkpoint scales or speculation. This naming
-change does not establish planar GPU, quality, performance or SSD acceptance.
-See the [dtype comparison](configuration.md#launch-options).
+The release results below use the documented scalar E4M3 recipes. On V100,
+eligible QSA `auto` selects planar INT8. Use `fp8_per_token_head` to select
+dynamic planar E4M3 explicitly. See the [dtype comparison](configuration.md#launch-options).
 
 ## Support matrix
 

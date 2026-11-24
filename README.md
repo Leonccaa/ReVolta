@@ -91,7 +91,7 @@ For another checkpoint, use its [preparation guide](docs/checkpoints.md) before 
 - Greedy outputs at C2–C8 can change between runs; fresh compiler autotuning can also change outputs.
 - The AWQ PLE table needs about 48 GiB of host memory by default. An experimental option keeps the whole table on a local SSD instead: in 0.1.4 it served under 64 GiB and 32 GiB memory limits, also with a 32 GiB CPU KV pool under 64 GiB, and greedy output matched the default path. Single-request decoding is about 23–25% slower, and a cold first token takes 1.6–2.3 times as long. See [Support and known limits](docs/known-limits.md).
 - PLE cascade (spilling part of the table to disk, `ple_disk_cascade=true`) is not supported yet and is off by default in the ReVolta profile; full support is planned for 0.2.
-- INT8 KV cannot be combined with DFlash2; the disk tier does not support INT8 yet.
+- DFlash2 supports INT8 target KV with an FP16 draft. For planar INT8 persistence, use the verified disk tier `revolta_fs`, which stores the scale planes with each page. [KV offload](docs/kv-offload.md)
 
 See [Support and known limits](docs/known-limits.md) for the complete list and test boundaries.
 

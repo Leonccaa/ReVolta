@@ -24,7 +24,18 @@ def _config(target_dtype="int8", draft_dtype=None, method="dflash"):
         dflash_config={"selector_top_k": 16, "use_swa": True, "swa_window_size": 256},
         layer_types=None,
     )
-    model = SimpleNamespace(dtype=torch.float16, hf_config=hf_config)
+    model = SimpleNamespace(
+        dtype=torch.float16,
+        hf_config=hf_config,
+        hf_text_config=SimpleNamespace(
+            indexer_n_heads=3,
+            indexer_kv_heads=1,
+            indexer_head_dim=128,
+            indexer_budget=512,
+            indexer_compress_ratio=4,
+            layer_types=["full_attention"],
+        ),
+    )
     return SimpleNamespace(
         is_speculative_draft=False,
         cache_config=CacheConfig(cache_dtype=target_dtype),
@@ -163,18 +174,28 @@ def test_explicit_sink_setting_overrides_top_level_default():
     validate_speculative_kv_cache_dtype(config)
 
 
+def test_sm70_qsa_dflash_defaults_to_model_precision(sm70):
+    assert dflash_draft_cache_dtype(_config("int8")) == "auto"
+
+
 @pytest.mark.parametrize(
-    "target_dtype",
-    ["auto", "float16", "int8", "fp8_e4m3", FP8_E4M3_PER_TOKEN_HEAD.name],
+    "target_dtype,activation_dtype",
+    [("int8_per_token_head", torch.float16), ("float16", torch.float32)],
 )
-def test_sm70_dflash_defaults_to_model_precision(sm70, target_dtype):
-    assert dflash_draft_cache_dtype(_config(target_dtype)) == "auto"
+def test_sm70_non_qsa_dflash_inherits_target_dtype(
+    sm70, target_dtype, activation_dtype
+):
+    config = _config(target_dtype)
+    config.model_config.hf_text_config = SimpleNamespace()
+    config.model_config.dtype = activation_dtype
+    config.speculative_config.attention_backend = AttentionBackendEnum.TRITON_ATTN
+    assert dflash_draft_cache_dtype(config) == target_dtype
 
 
 @pytest.mark.parametrize(
     "method,target_dtype,draft_dtype,reject",
     [
-        ("dflash", "int8", None, False),
+        ("dflash", "int8", None, True),
         ("dflash", "fp8_e4m3", None, False),
         ("dflash", "float16", None, False),
         ("dflash", "auto", None, False),

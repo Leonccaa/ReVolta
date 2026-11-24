@@ -50,7 +50,7 @@ planar `fp8_per_token_head` on other supported CUDA devices. Both compute scales
 at runtime. MTP inherits the target format when draft dtype is omitted. On
 supported QSA Model Runner V2 configurations, an explicit FP16 draft can also
 be used with an 8-bit target.
-SM70 DFlash/DFlash2 still defaults to FP16 draft KV. See the
+SM70 QSA DFlash/DFlash2 defaults to FP16 draft KV. See the
 [KV dtype comparison](configuration.md#launch-options) for eligibility and ABI.
 
 On V100, Flash-Next MTP uses Q8_0 for supported floating-point or block-FP8 routed
@@ -63,9 +63,10 @@ weights. The draft KV dtype is configured separately.
 
 When target E4M3 scales are unavailable, FP16 KV needs no calibration but
 holds roughly half as many KV tokens at the same memory budget. INT8 KV
-computes per-token, per-head scales at runtime; in the supported speculative
-configuration use MTP with both target and draft set to `int8`. INT8 KV
-cannot be combined with DFlash2 ([#25](https://github.com/Leonccaa/ReVolta/issues/25)).
+computes per-token, per-head scales at runtime. MTP inherits an INT8 target
+format by default. DFlash2 supports an INT8 target with an FP16 draft. On
+Flash-V100, DFlash2 draft attention with sliding windows or attention sinks
+requires FP16 draft KV for this combination.
 
 The following steps pin every download. Retain the downloaded base and pack:
 the materialized checkpoints and 512K YaRN views link to their files. Use a
@@ -328,7 +329,8 @@ vllm serve /data/revolta/views/nvfp4-qad/target-512k \
 
 V100 stores compressed weights and KV, then converts them to FP16 for computation.
 The documented reference recipe is AWQ g32 with explicit scalar E4M3 KV.
-The CLI default `auto` instead selects dynamic planar E4M3 for eligible QSA.
+The CLI default `auto` selects planar INT8 for eligible QSA models on V100.
+Use `fp8_per_token_head` for dynamic planar E4M3.
 
 ## Quantization comparison
 

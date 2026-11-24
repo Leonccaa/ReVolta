@@ -428,7 +428,7 @@ void reshape_and_cache_flash(
     torch::stable::Tensor& slot_mapping, const std::string& kv_cache_dtype,
     torch::stable::Tensor& k_scale, torch::stable::Tensor& v_scale);
 
-// Version 1 planar RNE INT8 writer. Legacy writer ABI is unchanged.
+// Per-token-head INT8 and E4M3 writer with independent FP32 scale planes.
 void reshape_and_cache_flash_planar(torch::stable::Tensor& key,
                                     torch::stable::Tensor& value,
                                     torch::stable::Tensor& key_cache,

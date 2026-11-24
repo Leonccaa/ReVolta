@@ -802,36 +802,34 @@ def test_e4m3_reference_zero_and_rounding_boundaries():
         assert torch.equal(payload[row], expected)
 
 
-def test_e4m3_writer_dispatch_preserves_legacy_calls(monkeypatch):
+def test_planar_writer_dispatch_preserves_legacy_calls(monkeypatch):
     from unittest.mock import Mock
 
     from vllm import _custom_ops as ops
-    from vllm.v1.attention.ops import triton_reshape_and_cache_flash as writer
 
-    software = Mock()
+    planar = Mock()
     legacy = Mock()
     monkeypatch.setattr(
-        writer, "triton_reshape_and_cache_flash_per_token_head_quant", software
+        torch.ops._C_cache_ops, "reshape_and_cache_flash_planar", planar, raising=False
     )
     monkeypatch.setattr(
         torch.ops._C_cache_ops, "reshape_and_cache_flash", legacy, raising=False
     )
-    raw = torch.full((3 * 848640,), 77, dtype=torch.uint8)
-    view = KVCacheView.bind(
-        packed(raw, codec=FP8_E4M3_PER_TOKEN_HEAD), FP8_E4M3_PER_TOKEN_HEAD, 256
-    )
     k = torch.zeros(1, 1, 256)
     slots = torch.tensor([0])
     scalar = torch.tensor(7.0)
-    args = (k, k, view.key, view.value, slots)
-    ops.reshape_and_cache_flash(
-        *args, FP8_E4M3_PER_TOKEN_HEAD.name, scalar, scalar, **view.scale_kwargs
-    )
-    software.assert_called_once_with(
-        k, k, view.key, view.value, view.key_scale, view.value_scale, slots
-    )
+    for codec in (INT8, FP8_E4M3_PER_TOKEN_HEAD):
+        raw = torch.full((3 * 848640,), 77, dtype=codec.storage_dtype)
+        view = KVCacheView.bind(packed(raw, codec=codec), codec, 256)
+        args = (k, k, view.key, view.value, slots)
+        ops.reshape_and_cache_flash(
+            *args, codec.name, scalar, scalar, **view.scale_kwargs
+        )
+        planar.assert_called_once_with(*args, view.key_scale, view.value_scale)
+        planar.reset_mock()
+
     legacy.assert_not_called()
     for dtype in ("auto", "fp8", "fp8_e4m3"):
-        ops.reshape_and_cache_flash(*args, dtype, scalar, scalar)
-        legacy.assert_called_with(*args, dtype, scalar, scalar)
-    assert software.call_count == 1
+        ops.reshape_and_cache_flash(k, k, k, k, slots, dtype, scalar, scalar)
+        legacy.assert_called_with(k, k, k, k, slots, dtype, scalar, scalar)
+    planar.assert_not_called()

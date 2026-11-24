@@ -20,9 +20,9 @@ template <typename T, bool E4M3>
 __global__ void cache_planar_kernel(const T* key, const T* value, uint8_t* kc,
                                     uint8_t* vc, float* ks, float* vs,
                                     const int64_t* slots, int64_t rows,
-                                    int64_t pages, int key_dim, int value_dim,
-                                    int tokens, RowLayout ki, RowLayout vi,
-                                    RowLayout ko, RowLayout vo, RowLayout kso,
+                                    int64_t pages, int dim, int tokens,
+                                    RowLayout ki, RowLayout vi, RowLayout ko,
+                                    RowLayout vo, RowLayout kso,
                                     RowLayout vso) {
   const int64_t row = blockIdx.x;
   const int head = blockIdx.y;
@@ -32,33 +32,31 @@ __global__ void cache_planar_kernel(const T* key, const T* value, uint8_t* kc,
   const int64_t page = slot / tokens, token = slot % tokens;
   const bool is_key = blockIdx.z == 0;
   const T* src = is_key ? key : value;
-  const int dim = is_key ? key_dim : value_dim;
   RowLayout input = is_key ? ki : vi;
   const int64_t in = input.offset(row, 0, head);
   float maximum = 0.f;
   int invalid = 0;
   for (int d = threadIdx.x; d < dim; d += blockDim.x) {
     float x = static_cast<float>(src[in + d]);
-    if constexpr (!E4M3) invalid |= !isfinite(x);
+    invalid |= !isfinite(x);
     maximum = fmaxf(maximum, fabsf(x));
   }
   __shared__ float maxima[128];
   __shared__ int bad[128];
   maxima[threadIdx.x] = maximum;
-  if constexpr (!E4M3) bad[threadIdx.x] = invalid;
+  bad[threadIdx.x] = invalid;
   __syncthreads();
   for (int s = 64; s; s >>= 1) {
     if (threadIdx.x < s) {
       maxima[threadIdx.x] = fmaxf(maxima[threadIdx.x], maxima[threadIdx.x + s]);
-      if constexpr (!E4M3) bad[threadIdx.x] |= bad[threadIdx.x + s];
+      bad[threadIdx.x] |= bad[threadIdx.x + s];
     }
     __syncthreads();
   }
   constexpr float divisor = E4M3 ? 448.f : 127.f;
   constexpr float min_scale = E4M3 ? 0x1p-126f : 1e-6f;
-  const float scale = !E4M3 && bad[0]
-                          ? __int_as_float(0x7fc00000)
-                          : fmaxf(__fdiv_rn(maxima[0], divisor), min_scale);
+  const float scale = bad[0] ? __int_as_float(0x7fc00000)
+                             : fmaxf(__fdiv_rn(maxima[0], divisor), min_scale);
   uint8_t* dst = is_key ? kc : vc;
   RowLayout output = is_key ? ko : vo;
   RowLayout scales = is_key ? kso : vso;
@@ -67,13 +65,10 @@ __global__ void cache_planar_kernel(const T* key, const T* value, uint8_t* kc,
   const int64_t out = output.offset(page, token, head);
   for (int d = threadIdx.x; d < dim; d += blockDim.x) {
     const float x = static_cast<float>(src[in + d]);
+    const float q = bad[0] ? 0.f : __fdiv_rn(x, scale);
     if constexpr (E4M3) {
-      const float q = __fdiv_rn(x, scale);
-      // Use the same finite saturation and sign as the software E4M3 writer.
-      const float clamped = copysignf(fminf(fabsf(q), 448.f), q);
-      dst[out + d] = c10::Float8_e4m3fn(clamped).x;
+      dst[out + d] = c10::Float8_e4m3fn(q).x;
     } else {
-      const float q = bad[0] ? 0.f : __fdiv_rn(x, scale);
       dst[out + d] =
           static_cast<int8_t>(__float2int_rn(fminf(fmaxf(q, -128.f), 127.f)));
     }
@@ -93,10 +88,10 @@ void reshape_and_cache_flash_planar(torch::stable::Tensor& key,
                                     torch::stable::Tensor& k_scale_cache,
                                     torch::stable::Tensor& v_scale_cache) {
   using ST = torch::headeronly::ScalarType;
-  STD_TORCH_CHECK(key.dim() == 3 && value.dim() == 3 &&
-                  value.size(0) == key.size(0) && value.size(1) == key.size(1));
+  STD_TORCH_CHECK(key.dim() == 3 && value.sizes().equals(key.sizes()));
   STD_TORCH_CHECK(key.scalar_type() == value.scalar_type());
-  STD_TORCH_CHECK(key_cache.dim() == 4 && value_cache.dim() == 4);
+  STD_TORCH_CHECK(key_cache.dim() == 4 &&
+                  value_cache.sizes().equals(key_cache.sizes()));
   const bool e4m3 = key_cache.scalar_type() == ST::Byte;
   STD_TORCH_CHECK((e4m3 || key_cache.scalar_type() == ST::Char) &&
                   value_cache.scalar_type() == key_cache.scalar_type());
@@ -105,14 +100,11 @@ void reshape_and_cache_flash_planar(torch::stable::Tensor& key,
   STD_TORCH_CHECK(k_scale_cache.dim() == 3 &&
                   v_scale_cache.sizes().equals(k_scale_cache.sizes()));
   for (int i = 0; i < 3; ++i) {
-    STD_TORCH_CHECK(k_scale_cache.size(i) == key_cache.size(i) &&
-                    k_scale_cache.size(i) == value_cache.size(i));
+    STD_TORCH_CHECK(k_scale_cache.size(i) == key_cache.size(i));
   }
   STD_TORCH_CHECK(key.size(1) == key_cache.size(2) &&
-                  key.size(2) == key_cache.size(3) &&
-                  value.size(2) == value_cache.size(3));
-  STD_TORCH_CHECK(key.size(2) > 0 && value.size(2) > 0 && key.size(1) > 0 &&
-                  key_cache.size(1) > 0);
+                  key.size(2) == key_cache.size(3));
+  STD_TORCH_CHECK(key.size(2) > 0 && key.size(1) > 0 && key_cache.size(1) > 0);
   STD_TORCH_CHECK(key.stride(2) == 1 && value.stride(2) == 1 &&
                   key_cache.stride(3) == 1 && value_cache.stride(3) == 1);
   STD_TORCH_CHECK(slot_mapping.dim() == 1 && slot_mapping.stride(0) == 1 &&
@@ -138,7 +130,7 @@ void reshape_and_cache_flash_planar(torch::stable::Tensor& key,
               reinterpret_cast<float*>(k_scale_cache.data_ptr()),
               reinterpret_cast<float*>(v_scale_cache.data_ptr()),
               slot_mapping.const_data_ptr<int64_t>(), slot_mapping.size(0),
-              key_cache.size(0), key.size(2), value.size(2), key_cache.size(1),
+              key_cache.size(0), key.size(2), key_cache.size(1),
               RowLayout{key.stride(0), 0, key.stride(1)},
               RowLayout{value.stride(0), 0, value.stride(1)}, layout(key_cache),
               layout(value_cache), layout(k_scale_cache),

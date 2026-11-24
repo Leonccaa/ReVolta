@@ -1662,7 +1662,7 @@ at::Tensor grouped_row_scaled_page4(const at::Tensor& q, const at::Tensor& k,
     auto kernel =
         int8_page4::flash_attention_grouped_verify_e5m2_partial_kernel<
             8, false, 4, false, false, false, KV_DTYPE, true, Output, false,
-            true>;
+            true, true>;
     C10_CUDA_CHECK(cudaFuncSetAttribute(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
     kernel<<<dim3(1, 1, groups), kGroupedVerifyThreads, bytes,

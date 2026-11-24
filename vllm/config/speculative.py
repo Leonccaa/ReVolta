@@ -484,7 +484,9 @@ class SpeculativeConfig:
     """
 
     gdn_deferred_commit_metadata: bool = False
-    """Research opt-in for next-round native GDN commit in SM70 MTP align mode."""
+    """Research opt-in for next-round native GDN commit in SM70 align mode
+    (Qwen4Exp MTP and linear DFlash with Qwen GDN, 128 by 128 state,
+    and up to 7 speculative state tokens)."""
 
     gdn_state_replay_graph: bool | None = None
     """Capture accepted-state replay for FULL verify shapes; mixed steps are eager.

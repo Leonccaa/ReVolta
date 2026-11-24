@@ -127,7 +127,9 @@ class SpecReplayState:
             self.accepted.index_copy_(0, index, accepted.index_select(0, index))
 
 
-@triton.jit
+# The row counts change with each mix of decode and prefill requests. Do not
+# specialize on them, or the first step with a new mix compiles a new variant.
+@triton.jit(do_not_specialize=["num_spec", "num_plain"])
 def _prepare_replay_rows_kernel(
     rows_ptr,
     idx_mapping_ptr,

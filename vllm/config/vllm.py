@@ -1938,25 +1938,29 @@ class VllmConfig:
             has_nvfp4_weights,
         )
 
-        # Also cover direct VllmConfig users. This is intentionally before
-        # upstream overlap, hybrid-PLE and compilation automatic defaults.
+        # Apply engine defaults before overlap, hybrid-PLE and compilation.
+        # Derived draft configs inherit the target's process-wide defaults.
         allow_shared_expert_overlap = not (
             self.parallel_config.enable_expert_parallel
             or self.parallel_config.enable_dbo
         )
-        revolta_profile_enabled = apply_revolta_profile(
-            self.model_config,
-            self.parallel_config.tensor_parallel_size,
-            is_sm70=all_visible_devices_sm70(),
-            interconnect_mode=frontend_interconnect_mode(
-                disable_custom_all_reduce=self.parallel_config.disable_custom_all_reduce
-            ),
-            speculative_method=getattr(self.speculative_config, "method", None),
-            allow_shared_expert_overlap=allow_shared_expert_overlap,
-        )
-        apply_revolta_kernel_profile(
-            self.kernel_config, enabled=revolta_profile_enabled
-        )
+        revolta_profile_enabled = False
+        if not self.is_speculative_draft:
+            revolta_profile_enabled = apply_revolta_profile(
+                self.model_config,
+                self.parallel_config.tensor_parallel_size,
+                is_sm70=all_visible_devices_sm70(),
+                interconnect_mode=frontend_interconnect_mode(
+                    disable_custom_all_reduce=(
+                        self.parallel_config.disable_custom_all_reduce
+                    )
+                ),
+                speculative_method=getattr(self.speculative_config, "method", None),
+                allow_shared_expert_overlap=allow_shared_expert_overlap,
+            )
+            apply_revolta_kernel_profile(
+                self.kernel_config, enabled=revolta_profile_enabled
+            )
 
         # To give each torch profile run a unique instance name.
         self.instance_id = f"{time.time_ns()}"

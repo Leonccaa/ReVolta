@@ -5,7 +5,6 @@
 from typing import TYPE_CHECKING
 
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
-from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD, INT8
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -100,18 +99,14 @@ def validate_speculative_kv_cache_dtype(config: "VllmConfig") -> None:
     planar_target_with_fp16_mtp = (
         spec.method == "mtp"
         and draft_storage == "float16"
-        and target_storage in (INT8.name, FP8_E4M3_PER_TOKEN_HEAD.name)
+        and target_storage in ("int8", "fp8_per_token_head")
     )
-    if (
-        target_storage
-        not in (
-            "auto",
-            "float16",
-            "bfloat16",
-            "fp8",
-            "fp8_e4m3",
-        )
-        and not planar_target_with_fp16_mtp
+    if not planar_target_with_fp16_mtp and target_storage not in (
+        "auto",
+        "float16",
+        "bfloat16",
+        "fp8",
+        "fp8_e4m3",
     ):
         reason = "the target KV layout does not support an independent draft dtype"
     elif spec.kv_cache_dtype not in ("auto", "float16", "bfloat16"):

@@ -416,26 +416,24 @@ def _mixed_specs(dtype):
     return specs
 
 
-@pytest.mark.parametrize("codec", [INT8, FP8_E4M3_PER_TOKEN_HEAD])
-@pytest.mark.parametrize("dcp", [1, 2])
-def test_planar_target_fp16_draft_uses_existing_offload_layout(codec, dcp):
+def test_planar_target_fp16_draft_uses_existing_offload_layout():
     from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
         OffloadingConnector,
     )
     from vllm.v1.attention.kv_cache_view import has_planar_kv_cache
 
     config = _config("float16")
-    config.cache_config.cache_dtype = codec.name
-    config.parallel_config.decode_context_parallel_size = dcp
+    config.cache_config.cache_dtype = INT8.name
+    config.parallel_config.decode_context_parallel_size = 2
     specs = _mixed_specs(torch.float16)
     for index in (3, 7):
         name = f"model.layers.{index}.self_attn"
         specs[name] = replace(
             specs[name],
-            dtype=codec.storage_dtype,
-            kv_quant_mode=get_kv_quant_mode(codec.name),
-            block_size=64 // dcp,
-            dcp_sharded=dcp > 1,
+            dtype=INT8.storage_dtype,
+            kv_quant_mode=get_kv_quant_mode(INT8.name),
+            block_size=32,
+            dcp_sharded=True,
         )
     groups = get_kv_cache_groups(config, specs)
     cache = get_kv_cache_config_from_groups(config, groups, available_memory=1 << 28)

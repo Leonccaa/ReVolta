@@ -54,9 +54,9 @@ metadata, a supported operator dtype/device, no runtime scale calculation and
 prefill context parallelism of one. Otherwise the existing auto/model-dtype
 rules apply. Explicit values take precedence and retain their backend admission
 requirements. MTP inherits the target format unless specified. Qwen4Exp QSA
-MTP accepts an explicit `float16` draft with `int8_per_token_head` or
-`fp8_per_token_head` target KV. On SM70, DFlash/DFlash2 defaults to an FP16
-draft for FP8 and planar INT8 target KV.
+MTP accepts an explicit `float16` draft with `int8` (alias
+`int8_per_token_head`) or `fp8_per_token_head` target KV. On SM70,
+DFlash/DFlash2 defaults to an FP16 draft for FP8 and planar INT8 target KV.
 
 The QSA INT8 spellings also work in `speculative_config.kv_cache_dtype`
 when the target uses the same INT8 format. Generic Triton attention uses

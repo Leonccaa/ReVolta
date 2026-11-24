@@ -202,6 +202,8 @@ class ForwardContext:
     # True for MRv2 uniform target decode and its specialized FULL graphs.
     is_uniform_decode: bool = False
 
+    max_cudagraph_capture_size: int = 0
+
     def __post_init__(self):
         assert self.cudagraph_runtime_mode.is_valid_runtime_mode(), (
             f"Invalid cudagraph runtime mode: {self.cudagraph_runtime_mode}"
@@ -254,6 +256,9 @@ def create_forward_context(
         skip_compiled=skip_compiled,
         is_dummy_run=is_dummy_run,
         is_uniform_decode=is_uniform_decode,
+        max_cudagraph_capture_size=(
+            vllm_config.compilation_config.max_cudagraph_capture_size or 0
+        ),
         additional_kwargs=additional_kwargs or {},
     )
 

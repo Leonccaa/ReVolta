@@ -2758,9 +2758,13 @@ def _qsa_xqa_page4_workspace(
         partial_dtype,
     )
     workspace = _SM70_QSA_XQA_PAGE4_WORKSPACES.get(key)
+    first_use = workspace is None
     rows = q.shape[0]
     if workspace is None or workspace[0] < rows:
-        capacity = 1 << (rows - 1).bit_length()
+        capture_rows = 0
+        if first_use and is_forward_context_available():
+            capture_rows = get_forward_context().max_cudagraph_capture_size
+        capacity = max(rows, capture_rows)
         temporary_output = torch.empty(
             (capacity, q.shape[1], num_partitions, q.shape[2]),
             dtype=partial_dtype,
@@ -2772,11 +2776,7 @@ def _qsa_xqa_page4_workspace(
             device=q.device,
         )
         exp_sums = torch.empty_like(max_logits)
-        # torch.tensor([...], device=cuda) does a host->device copy, which is
-        # illegal during CUDA graph capture. The workspace cache is keyed by the
-        # active stream, so an E4M3 >16-row verify batch captured on the graph's
-        # side stream rebuilds here; torch.full fills on-device (scalar kernel
-        # arg, no host copy) and stays capture-safe.
+        # Fill on-device so allocation is valid during capture.
         active_num_partitions = torch.full(
             (1,), num_partitions, dtype=torch.int32, device=q.device
         )
@@ -2787,7 +2787,10 @@ def _qsa_xqa_page4_workspace(
             exp_sums,
             active_num_partitions,
         )
-        _SM70_QSA_XQA_PAGE4_WORKSPACES[key] = workspace
+        # Target and draft capture on the same stream. Reserve the full graph
+        # range on first use and keep its addresses when an eager batch is larger.
+        if first_use:
+            _SM70_QSA_XQA_PAGE4_WORKSPACES[key] = workspace
     _, temporary_output, max_logits, exp_sums, active_num_partitions = workspace
     return (
         temporary_output[:rows],

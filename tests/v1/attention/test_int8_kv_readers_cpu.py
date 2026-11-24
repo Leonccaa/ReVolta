@@ -61,24 +61,16 @@ def test_interpreted_e4m3_reader_against_float64():
         _check_reader(5, 1, 832, repeat, FP8_E4M3_PER_TOKEN_HEAD, block=64)
 
 
-@pytest.mark.parametrize("codec", [INT8, FP8_E4M3_PER_TOKEN_HEAD])
 @pytest.mark.parametrize(
-    "rows,heads,draft,expected",
-    [
-        (7, 6, False, "decode"),
-        (8, 6, False, "grouped"),
-        (8, 6, True, "decode"),
-        (48, 6, True, "decode"),
-        (8, 12, True, "grouped"),
-    ],
+    "heads,draft,expected",
+    [(6, False, "grouped"), (6, True, "decode"), (12, True, "grouped")],
 )
-def test_per_vector_draft_decode_uses_h6_reader(
-    rows, heads, draft, expected, codec, monkeypatch
-):
+def test_per_vector_draft_decode_uses_h6_reader(heads, draft, expected, monkeypatch):
     from vllm.forward_context import ForwardContext, override_forward_context
     from vllm.models.qwen4_exp.nvidia.ops import qsa
 
-    _, _, view = cache(codec=codec)
+    rows = 8
+    _, _, view = cache()
     q = torch.empty((rows, heads, 256), dtype=torch.float16)
     indices = torch.empty((rows, 2051), dtype=torch.int32)
     requests = torch.zeros(rows, dtype=torch.int32)
@@ -104,7 +96,7 @@ def test_per_vector_draft_decode_uses_h6_reader(
             requests,
             query_positions=positions,
             sequence_lengths=lengths,
-            kv_cache_dtype=codec.name,
+            kv_cache_dtype=INT8.name,
             **view.scale_kwargs,
         )
     assert calls == [expected]

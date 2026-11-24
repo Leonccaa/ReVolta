@@ -159,6 +159,8 @@ def test_e4m3_writer_exact_bytes_and_graph_replay():
     k[1].fill_(448)
     k[1, :, :5] = torch.tensor([0.0, -0.0, 1.0625, 1.1875, 2**-10], device="cuda")
     v[2].fill_(-65504)
+    k[3, 0, 0] = float("inf")
+    v[4, 1, 0] = float("nan")
     slots = torch.tensor([15, 16, 815, 816, 1631, 1632, -1, 17], device="cuda")
 
     def oracle():

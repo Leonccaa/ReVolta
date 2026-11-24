@@ -107,29 +107,26 @@ class KVCodec:
     def encode(self, values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Reference dynamic encoder; not used by the execution hot path.
 
-        The existing INT8 path gives a non-finite row a NaN scale, propagating
-        invalid inputs to its readers rather than making them finite.
+        Planar INT8 and E4M3 give a non-finite row a NaN scale and zero payload.
         Legacy truncation retains its original multiplication order.
         """
-        if self is FP8_E4M3_PER_TOKEN_HEAD:
-            x = values.float()
-            # R4: RN division for both the scale and the normalized values.
-            scale = (x.abs().amax(dim=-1).double() / 448.0).float()
-            scale = scale.clamp_min(2.0**-126)
-            q = (x.double() / scale[..., None].double()).float()
-            return q.to(torch.float8_e4m3fn).view(torch.uint8), scale
-        if self.element_dtype != torch.int8 or not self.per_token_head:
-            raise ValueError(f"{self.name} has no dynamic INT8 reference encoder")
+        e4m3 = self is FP8_E4M3_PER_TOKEN_HEAD
+        if not e4m3 and (self.element_dtype != torch.int8 or not self.per_token_head):
+            raise ValueError(f"{self.name} has no dynamic reference encoder")
         x = values.float()
         absmax = x.abs().amax(dim=-1)
         if self.rounding == "nearest_even":
             # Match CUDA/Triton RN FP32 division. Torch may strength-reduce a
             # scalar division to multiplication by a rounded reciprocal.
-            scale = (absmax.double() / 127.0).float().clamp_min(1e-6)
+            divisor, floor = (448.0, 2.0**-126) if e4m3 else (127.0, 1e-6)
+            scale = (absmax.double() / divisor).float().clamp_min(floor)
             finite = torch.isfinite(x).all(dim=-1)
             scale = torch.where(finite, scale, float("nan"))
-            q = (x.double() / scale[..., None].double()).float().round()
+            q = (x.double() / scale[..., None].double()).float()
             q = torch.where(finite[..., None], q, 0.0)
+            if e4m3:
+                return q.to(torch.float8_e4m3fn).view(torch.uint8), scale
+            q = q.round()
         else:
             scale = (absmax / 127.0).clamp_min(1e-6)
             q = (x * scale.reciprocal()[..., None]).trunc()

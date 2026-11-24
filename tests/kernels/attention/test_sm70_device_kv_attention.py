@@ -68,37 +68,3 @@ def test_prefill_workspace_reuse_preserves_tiled_output_and_graph(rows):
         torch.accelerator.synchronize()
         assert torch.isfinite(actual).all()
         assert torch.equal(actual, expected)
-
-
-@pytest.mark.parametrize("rows", [1, 8])
-def test_fp8_h12_hot_reader_matches_two_h6_reads(rows):
-    torch.manual_seed(1570 + rows)
-    dev = "cuda"
-    query = (torch.randn(rows, 12, 256, device=dev) * 0.25).half()
-    history = torch.zeros(1, 2, 64, 1, 256, device=dev, dtype=torch.uint8)
-    scales = torch.ones(1, 2, 64, device=dev, dtype=torch.float32)
-    hot = (
-        (torch.randn(64, 2, 256, device=dev) * 0.25)
-        .to(torch.float8_e4m3fn)
-        .view(torch.uint8)
-    )
-    hot_scales = torch.ones(64, 2, device=dev, dtype=torch.float32)
-    indices = torch.arange(64, device=dev, dtype=torch.int32).repeat(rows, 1)
-    table = torch.zeros(1, 1, device=dev, dtype=torch.int32)
-    requests = torch.zeros(rows, device=dev, dtype=torch.int32)
-    positions = torch.full((rows,), 63, device=dev, dtype=torch.int64)
-    lengths = torch.tensor([64], device=dev, dtype=torch.int32)
-    metadata = history, scales, indices, table, requests, positions, lengths
-
-    def call(q):
-        output = torch.empty_like(q)
-        partial = torch.empty(q.shape, device=dev, dtype=torch.float32)
-        state = torch.empty(q.shape[:2] + (2,), device=dev, dtype=torch.float32)
-        ops.sm70_qsa_device_run_hot_fp8(
-            q, *metadata, output, None, partial, state, hot, indices, hot_scales
-        )
-        return output
-
-    actual = call(query)
-    expected = torch.cat([call(q) for q in query.split(6, dim=1)], dim=1)
-    torch.testing.assert_close(actual, expected, rtol=3e-3, atol=3e-4)

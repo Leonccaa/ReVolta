@@ -227,6 +227,17 @@ __device__ __forceinline__ void load_xqa_tc_kv_panel_and_zero(
     shared_vec[row * kv_smem_stride_uint4 + vec_col] = make_uint4(0, 0, 0, 0);
   }
 }
+template <int GROUP_SIZE>
+__device__ __forceinline__ void scale_xqa_tile(float* tile, int valid_columns,
+                                               const float* column_scales) {
+  for (int i = threadIdx.x; i < GROUP_SIZE * kXQATCBlockN; i += blockDim.x) {
+    const int col = i % kXQATCBlockN;
+    if (col < valid_columns) {
+      tile[i] = __fmul_rn(tile[i], column_scales[col]);
+    }
+  }
+}
+
 template <int PARTITION_SIZE, int GROUP_SIZE, bool PADDED_SMEM, int NUM_THREADS,
           int MIN_BLOCKS_PER_SM, int BLOCK_SIZE, bool CONTIGUOUS_HKV1_LAYOUT,
           bool ALIGNED_PADDED_SMEM, int KV_DTYPE,
@@ -351,6 +362,9 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
 
   extern __shared__ char smem_raw[];
   auto& smem = *reinterpret_cast<SmemLayout*>(smem_raw);
+  // Planar launches append one K and one V scale per tile column.
+  float* key_scales = reinterpret_cast<float*>(smem_raw + sizeof(SmemLayout));
+  float* value_scales = key_scales + kXQATCBlockN;
   uint16_t* e4m3_lut = nullptr;
   if constexpr (E4M3_SHARED_LUT) {
     e4m3_lut = reinterpret_cast<uint16_t*>(smem_raw + sizeof(SmemLayout));
@@ -451,6 +465,17 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
         smem.page_ids[idx] = __ldg(&block_table_seq[start_page + idx]);
       }
       __syncthreads();
+    }
+
+    if constexpr (int8_kv::KVCodecTraits<KV_DTYPE>::per_token_head) {
+      // The existing QK barriers publish the valid scales before either use.
+      if (tid < valid_k_rows) {
+        const int token = tile_page_offset + tid;
+        const int page = smem.page_ids[token / block_size];
+        const int slot = token % block_size;
+        key_scales[tid] = scales.key.load(page, slot, kv_head_idx);
+        value_scales[tid] = scales.value.load(page, slot, kv_head_idx);
+      }
     }
 
     for (int kv_tile_start = 0; kv_tile_start < valid_k_rows;
@@ -575,9 +600,7 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
     }
 
     if constexpr (int8_kv::KVCodecTraits<KV_DTYPE>::per_token_head) {
-      int8_kv::scale_attention_tile<KV_DTYPE>(
-          sS, GROUP_SIZE, valid_k_rows, kXQATCBlockN, scales.key, smem.page_ids,
-          tile_page_offset, block_size, kv_head_idx);
+      scale_xqa_tile<GROUP_SIZE>(sS, valid_k_rows, key_scales);
       __syncthreads();
     }
 
@@ -680,9 +703,7 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
     // Scale PV weights only after the unscaled softmax sum is recorded.
     // The same FP32 P tile is reused by every V panel.
     if constexpr (int8_kv::KVCodecTraits<KV_DTYPE>::per_token_head) {
-      int8_kv::scale_attention_tile<KV_DTYPE>(
-          sS, GROUP_SIZE, valid_k_rows, kXQATCBlockN, scales.value,
-          smem.page_ids, tile_page_offset, block_size, kv_head_idx);
+      scale_xqa_tile<GROUP_SIZE>(sS, valid_k_rows, value_scales);
       __syncthreads();
     }
 
@@ -1614,7 +1635,8 @@ at::Tensor decode_row_scaled_page4(const at::Tensor& q, const at::Tensor& k,
   const auto* prop = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(prop->major == 7 && prop->minor == 0, "INT8 page4 requires SM70");
   constexpr int threads = 256;
-  constexpr size_t bytes = sizeof(XQATCSmem256WideLayout<true, false>);
+  constexpr size_t bytes = sizeof(XQATCSmem256WideLayout<true, false>) +
+                           2 * kXQATCBlockN * sizeof(float);
   auto kernel =
       int8_page4::flash_attention_decode_xqa_tc_partition_kernel_256_wide<
           256, 6, true, threads, 1, 4, false, false, KV_DTYPE,

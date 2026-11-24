@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm.config import CacheConfig, KernelConfig
+from vllm.config import CacheConfig
 from vllm.config.speculative_kv import (
     dflash_draft_cache_dtype,
     validate_speculative_kv_cache_dtype,
@@ -105,7 +105,7 @@ def test_int8_target_dflash_uses_independent_draft_dtype(
             validate_speculative_kv_cache_dtype(config)
     else:
         validate_speculative_kv_cache_dtype(config)
-    assert dflash_draft_cache_dtype(config) == (draft_dtype or "float16")
+    assert dflash_draft_cache_dtype(config) == (draft_dtype or "auto")
 
 
 @pytest.mark.parametrize(
@@ -167,12 +167,8 @@ def test_explicit_sink_setting_overrides_top_level_default():
     "target_dtype",
     ["auto", "float16", "int8", "fp8_e4m3", FP8_E4M3_PER_TOKEN_HEAD.name],
 )
-@pytest.mark.parametrize("host", [False, True])
-def test_sm70_dflash_defaults_to_fp16_in_gpu_and_host_modes(sm70, target_dtype, host):
-    config = _config(target_dtype)
-    config.kernel_config = KernelConfig()
-    config.kernel_config.long_context_kv.enabled = host
-    assert dflash_draft_cache_dtype(config) == "float16"
+def test_sm70_dflash_defaults_to_model_precision(sm70, target_dtype):
+    assert dflash_draft_cache_dtype(_config(target_dtype)) == "auto"
 
 
 @pytest.mark.parametrize(

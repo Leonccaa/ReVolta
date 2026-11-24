@@ -103,21 +103,21 @@ def sm70(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "target,host,hybrid,explicit,expected",
+    "target,placement,explicit",
     [
-        ("auto", False, True, None, "float16"),
-        ("auto", True, True, None, None),
-        ("auto", False, True, "int8", "int8"),
-        ("auto", True, True, "float16", "float16"),
-        ("fp8_per_token_head", False, True, None, "float16"),
-        ("fp8_per_token_head", True, True, None, None),
-        ("fp8_e4m3", False, True, None, "float16"),
-        ("float16", False, True, None, None),
-        ("auto", False, False, None, None),
+        ("auto", None, None),
+        ("auto", "gpu", None),
+        ("auto", "host", None),
+        ("auto", None, "int8"),
+        ("auto", "host", "float16"),
+        ("fp8_per_token_head", None, None),
+        ("fp8_per_token_head", "host", None),
+        ("fp8_e4m3", None, None),
+        ("float16", None, None),
     ],
 )
-def test_sm70_qsa_mtp_defaults(
-    sm70, tmp_path, target, host, hybrid, explicit, expected
+def test_sm70_qsa_mtp_inherits_target_by_default(
+    sm70, tmp_path, target, placement, explicit
 ):
     model = _checkpoint(tmp_path)
     model.use_mla = False
@@ -126,10 +126,12 @@ def test_sm70_qsa_mtp_defaults(
     cfg.use_v2_model_runner = True
     cfg.parallel_config.pipeline_parallel_size = 1
     cfg.parallel_config.decode_context_parallel_size = 1
-    cfg.scheduler_config = SimpleNamespace(disable_hybrid_kv_cache_manager=not hybrid)
+    cfg.scheduler_config = SimpleNamespace(disable_hybrid_kv_cache_manager=False)
     cfg.kv_transfer_config = None
     cfg.cache_config.cache_dtype = target
-    cfg.kernel_config.long_context_kv.enabled = host
+    if placement is not None:
+        cfg.kernel_config.long_context_kv.enabled = True
+        cfg.kernel_config.long_context_kv.main_kv_placement = placement
     cfg.speculative_config = SimpleNamespace(
         method="mtp", kv_cache_dtype=explicit, draft_model_config=model
     )
@@ -138,7 +140,7 @@ def test_sm70_qsa_mtp_defaults(
     assert cfg.cache_config.cache_dtype == ("int8" if target == "auto" else target)
     assert not cfg.kernel_config.qsa_auto_e4m3_active
     validate_speculative_kv_cache_dtype(cfg)
-    assert cfg.speculative_config.kv_cache_dtype == expected
+    assert cfg.speculative_config.kv_cache_dtype == explicit
 
 
 @pytest.mark.parametrize(

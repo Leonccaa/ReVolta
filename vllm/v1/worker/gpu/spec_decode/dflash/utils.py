@@ -70,9 +70,12 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
     draft_model_config = speculative_config.draft_model_config
-    draft_cache_dtype = dflash_draft_cache_dtype(vllm_config)
-    independent_kv = draft_cache_dtype != vllm_config.cache_config.cache_dtype
-    if speculative_config.kv_cache_dtype is None and independent_kv:
+    draft_cache_dtype = speculative_config.kv_cache_dtype
+    if draft_cache_dtype is None and (
+        dflash_draft_cache_dtype(vllm_config)
+        != str(vllm_config.cache_config.cache_dtype)
+    ):
+        draft_cache_dtype = dflash_draft_cache_dtype(vllm_config)
         logger.info_once(
             "Using FP16 draft KV cache for SM70 DFlash while the target uses %s.",
             vllm_config.cache_config.cache_dtype,
@@ -92,7 +95,7 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
                 vllm_config.cache_config,
                 cache_dtype=draft_cache_dtype,
             )
-            if independent_kv or speculative_config.kv_cache_dtype is not None
+            if draft_cache_dtype is not None
             else vllm_config.cache_config
         ),
     )

@@ -62,7 +62,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
         draft_cache_dtype = dflash_draft_cache_dtype(self.vllm_config)
         if draft_cache_dtype != base.cache_config.cache_dtype:
             logger.info_once(
-                "Using FP16 draft KV cache for SM70 DFlash DDTree while the "
+                "Using model precision for SM70 DFlash DDTree draft KV while the "
                 "target uses %s.",
                 base.cache_config.cache_dtype,
             )

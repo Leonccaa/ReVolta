@@ -53,12 +53,13 @@ QSA auto selection uses the existing `qsa_auto_e4m3` policy and requires QSA sel
 metadata, a supported operator dtype/device, no runtime scale calculation and
 prefill context parallelism of one. Otherwise the existing auto/model-dtype
 rules apply. Explicit values take precedence and retain their backend admission
-requirements. On SM70 Model Runner V2, eligible QSA MTP configurations with an 8-bit
-target default to FP16 draft KV in GPU mode and to the target format in active Host KV mode
-(`long_context_kv`). With matching formats the draft history can share the
-Host KV pool. DFlash/DFlash2 on SM70 defaults to FP16 draft KV in both modes.
-Set `speculative_config.kv_cache_dtype` to override these defaults with a
-supported format.
+requirements. MTP inherits the target KV format in both GPU and Host KV mode
+unless `speculative_config.kv_cache_dtype` overrides it with a supported format.
+The MTP draft can share the Host KV pool when main and draft are placed on the
+host and their format and page geometry match. At DCP2, this also requires
+`qsa_dcp_index_shard=true`. An explicit FP16 draft with an 8-bit target keeps its
+history on the GPU. On SM70, DFlash/DFlash2 defaults to the draft model precision
+(FP16 for QSA DFlash2) in both modes.
 
 The QSA INT8 spellings also work in `speculative_config.kv_cache_dtype`
 when the target uses the same INT8 format. Generic Triton attention uses

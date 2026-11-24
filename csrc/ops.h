@@ -214,12 +214,10 @@ void fp8_qpn8_dispatch_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
                                 int64_t accumulator_chains, bool prefetch_codes,
                                 bool gated_silu);
 
-void fp8_qpn8_draft_dispatch_sm70_out(torch::Tensor out, torch::Tensor input,
-                                      torch::Tensor codes,
-                                      torch::Tensor group_scales,
-                                      int64_t split_k,
-                                      int64_t accumulator_chains,
-                                      bool prefetch_codes, bool gated_silu);
+void fp8_qpn8_draft_dispatch_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor codes,
+    torch::Tensor group_scales, int64_t split_k, int64_t accumulator_chains,
+    bool prefetch_codes, bool gated_silu, int64_t max_native_rows);
 
 void fp8_qpn8_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
                             torch::Tensor codes, torch::Tensor group_scales,

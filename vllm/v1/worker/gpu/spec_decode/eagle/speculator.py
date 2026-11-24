@@ -19,9 +19,6 @@ from vllm.forward_context import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-from vllm.model_executor.layers.quantization.sm70_mtp_draft_qpn8 import (
-    mtp_draft_qpn8_capture_limit,
-)
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -178,17 +175,12 @@ class EagleSpeculator:
         capture_context: GraphCaptureContext | None = None,
     ) -> None:
         cudagraph_mode = self.vllm_config.compilation_config.cudagraph_mode
-        # Larger QPN8 draft inputs use an eager, call-local FP16 workspace.
-        max_capture_tokens = (
-            mtp_draft_qpn8_capture_limit(self.model) if self.method == "mtp" else None
-        )
         # Initialize cudagraph manager for draft prefill (draft position 0).
         self.prefill_cudagraph_manager = PrefillEagleCudaGraphManager(
             self.vllm_config,
             self.device,
             cudagraph_mode,
             self.num_speculative_steps + 1,
-            max_capture_tokens=max_capture_tokens,
         )
 
         # PIECEWISE cudagraphs are not supported for eagle draft decodes.
@@ -206,7 +198,6 @@ class EagleSpeculator:
             self.device,
             cudagraph_mode,
             decode_query_len=1,
-            max_capture_tokens=max_capture_tokens,
         )
 
         # These routines execute serially in the runner. Share the capture

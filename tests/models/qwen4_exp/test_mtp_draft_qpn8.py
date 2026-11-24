@@ -1,10 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import shutil
-import subprocess
-from importlib import import_module
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -67,10 +63,15 @@ def test_mark_only_unquantized_bias_free_draft_projections():
 
 
 @pytest.mark.parametrize("enabled", [True, False])
-def test_draft_constructor_respects_switch_and_fp16_gemv(monkeypatch, enabled):
+@pytest.mark.parametrize("capture_tokens", [0, 40, 48, 160])
+def test_draft_constructor_respects_switch_and_fp16_gemv(
+    monkeypatch, enabled, capture_tokens
+):
     projection = _linear("mtp.layers.0.self_attn.qkv_proj")
+    fc_hidden = _linear("mtp.fc_hidden")
     predictor = nn.Module()
     predictor.layers = nn.ModuleList([projection])
+    predictor.fc_hidden = fc_hidden
     predictor.embed_tokens = nn.Identity()
     predictor.make_empty_intermediate_tensors = lambda *a: {}
     monkeypatch.setattr(mtp, "Qwen4ExpMultiTokenPredictor", lambda **kw: predictor)
@@ -89,20 +90,26 @@ def test_draft_constructor_respects_switch_and_fp16_gemv(monkeypatch, enabled):
     monkeypatch.setattr(sm70_fp16_gemv.envs, "VLLM_SM70_QWEN4_EXP_ONLINE_QPN8", False)
     config = SimpleNamespace(
         model_config=SimpleNamespace(
-            hf_text_config=SimpleNamespace(tie_word_embeddings=True, vocab_size=256),
+            hf_text_config=SimpleNamespace(
+                tie_word_embeddings=True, vocab_size=256, hc_count=4
+            ),
             dtype=torch.float16,
         ),
         cache_config=SimpleNamespace(mamba_cache_mode="align"),
         quant_config=None,
         speculative_config=object(),
-        compilation_config=SimpleNamespace(mode=CompilationMode.NONE),
+        compilation_config=SimpleNamespace(
+            mode=CompilationMode.NONE, max_cudagraph_capture_size=capture_tokens
+        ),
         kernel_config=KernelConfig()
         if enabled
         else KernelConfig(sm70_mtp_draft_qpn8=False),
     )
 
     assert mtp.Qwen4ExpMTP(vllm_config=config).model is predictor
-    assert getattr(projection, draft_qpn8._MARK, False) is enabled
+    expected_rows = max(128, 4 * capture_tokens) if enabled else 0
+    assert getattr(projection, draft_qpn8._MARK, 0) == expected_rows
+    assert getattr(fc_hidden, draft_qpn8._MARK, 0) == expected_rows
     assert type(projection.quant_method) is (
         UnquantizedLinearMethod
         if enabled
@@ -129,8 +136,7 @@ def test_prepare_falls_back_to_fp16_on_non_sm70(monkeypatch):
     torch.testing.assert_close(layer(x)[0], torch.full((1, 64), 128, dtype=x.dtype))
 
 
-@pytest.mark.parametrize("native_chunks", [True, False])
-def test_prepare_and_dispatch_draft_gate_up(monkeypatch, native_chunks):
+def test_prepare_and_dispatch_draft_gate_up(monkeypatch):
     # Adapted from the 1Cat QPN8 dispatch and fused gate-up tests.
     layer = MergedColumnParallelLinear(
         128,
@@ -153,9 +159,6 @@ def test_prepare_and_dispatch_draft_gate_up(monkeypatch, native_chunks):
         online_qpn8, "prepare_channel_qpn8_weight", lambda _: (codes, scales)
     )
     monkeypatch.setattr(online_qpn8.envs, "VLLM_SM70_QWEN4_EXP_ONLINE_QPN8", False)
-    monkeypatch.setattr(
-        draft_qpn8.envs, "VLLM_SM70_FP8_QPN8_M32_CHUNKED", native_chunks
-    )
     workspace_requests: list[torch.Tensor] = []
     monkeypatch.setattr(
         sm70_fp8,
@@ -164,65 +167,30 @@ def test_prepare_and_dispatch_draft_gate_up(monkeypatch, native_chunks):
     )
     calls = []
 
-    def dispatch(out, x, weight, packed_scales, split_k, nacc, prefetch, gated):
+    def dispatch(
+        out, x, weight, packed_scales, split_k, nacc, prefetch, gated, max_native_rows
+    ):
         assert x.shape == (6, 128) and x.is_contiguous()
         assert weight is layer.weight and packed_scales is scales
+        assert max_native_rows == 128
         calls.append((split_k, nacc, prefetch, gated))
         out.fill_(2)
 
-    # Register the legacy op before replacing it for the rollback case.
-    import_module(
-        "vllm.model_executor.layers.quantization.compressed_tensors.schemes."
-        "compressed_tensors_w8a16_fp8"
-    )
-    monkeypatch.setattr(
-        torch.ops.vllm,
-        "sm70_ct_fp8_qpn8_dispatch",
-        pytest.fail if native_chunks else dispatch,
-    )
     monkeypatch.setattr(
         draft_qpn8._sm70_ops,
         "fp8_qpn8_draft_dispatch_sm70_out",
-        dispatch if native_chunks else pytest.fail,
+        dispatch,
     )
     assert online_qpn8.maybe_prepare_online_qpn8(layer)
     assert layer.weight.dtype == torch.uint8 and layer.weight is not original
     assert layer._sm70_mtp_draft_qpn8_scales is scales
-    assert len(workspace_requests) == (0 if native_chunks else 1)
-    if workspace_requests:
-        assert workspace_requests[0] is codes
-    assert draft_qpn8.mtp_draft_qpn8_capture_limit(layer) == (
-        128 if native_chunks else None
-    )
+    assert not workspace_requests
     x = torch.ones((2, 3, 128), dtype=torch.float16)
     torch.testing.assert_close(layer(x)[0], torch.full((2, 3, 64), 2, dtype=x.dtype))
     torch.testing.assert_close(
         layer.forward_fused_silu_and_mul(x), torch.full((2, 3, 32), 2, dtype=x.dtype)
     )
     assert calls == [(8, 2, False, False), (8, 2, False, True)]
-
-
-def test_native_draft_row_dispatch_cpu(tmp_path):
-    compiler = shutil.which("c++")
-    if compiler is None:
-        pytest.skip("host C++ compiler required for the native row dispatcher")
-        return
-    include = Path(__file__).resolve().parents[3] / "csrc/sm70_turbomind/ops"
-    source = Path(__file__).with_name("mtp_qpn8_draft_rows_cpu.cpp")
-    executable = tmp_path / "draft_rows"
-    subprocess.run(
-        [
-            compiler,
-            "-std=c++17",
-            "-I",
-            str(include),
-            str(source),
-            "-o",
-            str(executable),
-        ],
-        check=True,
-    )
-    subprocess.run([str(executable)], check=True)
 
 
 def test_chunked_channel_qpn8_quantization_matches_whole_weight(monkeypatch):

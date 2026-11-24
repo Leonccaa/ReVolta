@@ -240,8 +240,6 @@ class CudaGraphManager:
         device: torch.device,
         cudagraph_mode: CUDAGraphMode,
         decode_query_len: int,
-        *,
-        max_capture_tokens: int | None = None,
     ):
         self.vllm_config = vllm_config
         self.device = device
@@ -374,10 +372,6 @@ class CudaGraphManager:
                     if size <= max_size and size not in self._capture_sizes:
                         self._capture_sizes.append(size)
             self._capture_sizes.sort()
-        if max_capture_tokens is not None:
-            self._capture_sizes = [
-                size for size in self._capture_sizes if size <= max_capture_tokens
-            ]
         self._init_candidates()
         schedule = (
             speculative_config.num_speculative_tokens_per_batch_size

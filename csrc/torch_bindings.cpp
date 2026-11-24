@@ -415,7 +415,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def(
       "fp8_qpn8_draft_dispatch_sm70_out(Tensor(a!) out, Tensor input, "
       "Tensor codes, Tensor group_scales, int split_k, int accumulator_chains, "
-      "bool prefetch_codes, bool gated_silu) -> ()");
+      "bool prefetch_codes, bool gated_silu, int max_native_rows) -> ()");
   ops.impl("fp8_qpn8_draft_dispatch_sm70_out", torch::kCUDA,
            &fp8_qpn8_draft_dispatch_sm70_out);
 

@@ -1061,6 +1061,7 @@ def fp8_qpn8_draft_dispatch_sm70_out(
     accumulator_chains: int,
     prefetch_codes: bool,
     gated_silu: bool,
+    max_native_rows: int,
 ) -> None:
     _qwen38_qpn8_op("fp8_qpn8_draft_dispatch_sm70_out")(
         out,
@@ -1071,6 +1072,7 @@ def fp8_qpn8_draft_dispatch_sm70_out(
         accumulator_chains,
         prefetch_codes,
         gated_silu,
+        max_native_rows,
     )
 
 
@@ -1086,6 +1088,7 @@ if hasattr(torch.ops._C, "fp8_qpn8_draft_dispatch_sm70_out"):
         accumulator_chains: int,
         prefetch_codes: bool,
         gated_silu: bool,
+        max_native_rows: int,
     ) -> None:
         return None
 

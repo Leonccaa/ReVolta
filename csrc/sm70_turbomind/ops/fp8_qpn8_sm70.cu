@@ -22,7 +22,6 @@
 #include <mutex>
 
 #include "activation_pack_sm70.cuh"
-#include "fp8_qpn8_draft_rows.h"
 #include "qpn_pair_sm70.cuh"
 
 namespace {
@@ -2045,10 +2044,11 @@ static bool try_fp8_qpn8_native_sm70_out(
       k > 0 && split_k > 0 && k % (16 * split_k) == 0 && packed_n > 0;
   const bool dense_shape = !gated_silu && aligned_shape && packed_n % 32 == 0;
   const bool gated_shape = gated_silu && aligned_shape && packed_n % 64 == 0;
+  const bool native_gated_m32 =
+      gated_shape && split_k == 8 && k >= 4096 && packed_n >= 4096;
   const bool native_two_phase =
       qpn8_m32_native_enabled && m > 16 && m <= native_rows &&
-      (dense_shape || gated_shape) &&
-      vllm::sm70::supports_qpn8_two_phase(k, packed_n, split_k, gated_silu) &&
+      ((dense_shape && (split_k == 12 || split_k == 16)) || native_gated_m32) &&
       accumulator_chains == 2 && !prefetch_codes;
   const bool admitted_m = (qpn8_m16_enabled && m <= 16) ||
                           (qpn8_m32_chunked_enabled && m <= 32) ||
@@ -2057,11 +2057,10 @@ static bool try_fp8_qpn8_native_sm70_out(
       (dense_shape || gated_shape)) {
     if (native_two_phase) {
       static std::once_flag qpn8_m32_native_log_once;
-      std::call_once(qpn8_m32_native_log_once, [native_rows]() {
+      std::call_once(qpn8_m32_native_log_once, []() {
         std::fprintf(stderr,
-                     "INFO SM70 channel-FP8 QPN8 native M=17..%d "
-                     "two-phase dense/gated candidate enabled.\n",
-                     static_cast<int>(native_rows));
+                     "INFO SM70 channel-FP8 QPN8 native "
+                     "two-phase dense/gated candidate enabled.\n");
       });
       if (gated_shape) {
         fp8_qpn8_gated_pair_sm70_out(out, input, codes, group_scales, split_k,
@@ -2105,42 +2104,41 @@ void fp8_qpn8_dispatch_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
                                 torch::Tensor group_scales, int64_t split_k,
                                 int64_t accumulator_chains, bool prefetch_codes,
                                 bool gated_silu) {
-  if (!try_fp8_qpn8_native_sm70_out(
-          out, input, codes, group_scales, split_k, accumulator_chains,
-          prefetch_codes, gated_silu, vllm::sm70::kQpn8DraftRowBlock)) {
+  if (!try_fp8_qpn8_native_sm70_out(out, input, codes, group_scales, split_k,
+                                    accumulator_chains, prefetch_codes,
+                                    gated_silu, 32)) {
     fp8_qpn8_prefill_sm70_out(out, dense_weight_ptr, input, codes, group_scales,
                               gated_silu);
   }
 }
 
-void fp8_qpn8_draft_dispatch_sm70_out(torch::Tensor out, torch::Tensor input,
-                                      torch::Tensor codes,
-                                      torch::Tensor group_scales,
-                                      int64_t split_k,
-                                      int64_t accumulator_chains,
-                                      bool prefetch_codes, bool gated_silu) {
-  vllm::sm70::dispatch_qpn8_draft_rows(
-      input.size(0),
-      [&](int64_t) {
-        return try_fp8_qpn8_native_sm70_out(
-            out, input, codes, group_scales, split_k, accumulator_chains,
-            prefetch_codes, gated_silu, vllm::sm70::kQpn8DraftNativeRows);
-      },
-      [&](int64_t begin, int64_t rows) {
-        TORCH_CHECK(
-            try_fp8_qpn8_native_sm70_out(
-                out.narrow(0, begin, rows), input.narrow(0, begin, rows), codes,
-                group_scales, split_k, accumulator_chains, prefetch_codes,
-                gated_silu, vllm::sm70::kQpn8DraftRowBlock),
-            "MTP draft requires the channel-QPN8 small-row route");
-      },
-      [&]() {
-        const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-        auto dense_weight = torch::empty(codes.sizes(), input.options());
-        fp8_qpn8_prefill_sm70_out(
-            out, reinterpret_cast<int64_t>(dense_weight.data_ptr()), input,
-            codes, group_scales, gated_silu);
-      });
+void fp8_qpn8_draft_dispatch_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor codes,
+    torch::Tensor group_scales, int64_t split_k, int64_t accumulator_chains,
+    bool prefetch_codes, bool gated_silu, int64_t max_native_rows) {
+  const int64_t rows = input.size(0);
+  if (rows > max_native_rows) {
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+    auto dense_weight = torch::empty(codes.sizes(), input.options());
+    fp8_qpn8_prefill_sm70_out(
+        out, reinterpret_cast<int64_t>(dense_weight.data_ptr()), input, codes,
+        group_scales, gated_silu);
+    return;
+  }
+  if (rows > 32 && rows <= 40 &&
+      try_fp8_qpn8_native_sm70_out(out, input, codes, group_scales, split_k,
+                                   accumulator_chains, prefetch_codes,
+                                   gated_silu, 40)) {
+    return;
+  }
+  for (int64_t begin = 0; begin < rows; begin += 32) {
+    const int64_t count = std::min<int64_t>(32, rows - begin);
+    TORCH_CHECK(try_fp8_qpn8_native_sm70_out(
+                    out.narrow(0, begin, count), input.narrow(0, begin, count),
+                    codes, group_scales, split_k, accumulator_chains,
+                    prefetch_codes, gated_silu, 32),
+                "MTP draft requires the channel-QPN8 small-row route");
+  }
 }
 
 void fp8_qpn8_hc_dispatch_sm70_out(
@@ -2248,7 +2246,7 @@ TORCH_LIBRARY_FRAGMENT(_C, ops) {
   ops.def(
       "fp8_qpn8_draft_dispatch_sm70_out(Tensor(a!) out, Tensor input, "
       "Tensor codes, Tensor group_scales, int split_k, int accumulator_chains, "
-      "bool prefetch_codes, bool gated_silu) -> ()");
+      "bool prefetch_codes, bool gated_silu, int max_native_rows) -> ()");
   ops.impl("fp8_qpn8_draft_dispatch_sm70_out", torch::kCUDA,
            &fp8_qpn8_draft_dispatch_sm70_out);
 

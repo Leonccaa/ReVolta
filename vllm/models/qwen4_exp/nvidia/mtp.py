@@ -705,7 +705,13 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
                 mark_mtp_draft_qpn8,
             )
 
-            mark_mtp_draft_qpn8(self.model)
+            # fc_hidden projects each HC branch separately for every token.
+            max_capture_tokens = (
+                vllm_config.compilation_config.max_cudagraph_capture_size or 0
+            )
+            mark_mtp_draft_qpn8(
+                self.model, max_capture_rows=max_capture_tokens * config.hc_count
+            )
 
         if get_pp_group().is_last_rank:
             if config.tie_word_embeddings:

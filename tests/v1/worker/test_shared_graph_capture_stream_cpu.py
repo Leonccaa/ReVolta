@@ -15,7 +15,6 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
-import torch
 
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import parallel_state as ps
@@ -87,8 +86,6 @@ def _make_speculator(monkeypatch, mode):
     monkeypatch.setattr(eagle, "DecodeEagleCudaGraphManager", _Manager)
     speculator = eagle.EagleSpeculator.__new__(eagle.EagleSpeculator)
     speculator.device = "cpu"
-    speculator.method = "mtp"
-    speculator.model = torch.nn.Identity()
     speculator.num_speculative_steps = 4
     speculator.vllm_config = SimpleNamespace(
         compilation_config=SimpleNamespace(cudagraph_mode=mode)

@@ -5,8 +5,7 @@
 
 The drafter's BF16 checkpoint layer runs as FP16 TurboMind GEMMs, re-reading
 every weight byte at each of its draft steps. Its decoder projections are
-requantized once to channel FP8 and use the target's QPN8 dispatch. Only
-drafts change; verification is untouched.
+requantized once to channel FP8 and run with native QPN8 kernels.
 """
 
 from __future__ import annotations
@@ -14,7 +13,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from vllm import _sm70_ops, envs
+from vllm import _sm70_ops
 from vllm.logger import init_logger
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
@@ -23,8 +22,6 @@ logger = init_logger(__name__)
 
 _MARK = "_sm70_mtp_draft_qpn8"
 _READY = "_sm70_mtp_draft_qpn8_ready"
-# Larger inputs take the dense prefill path with a call-local workspace.
-MTP_DRAFT_QPN8_MAX_CAPTURE_ROWS = 128
 _SUFFIXES = frozenset(
     {
         "fc",
@@ -38,10 +35,12 @@ _SUFFIXES = frozenset(
 )
 
 
-def mark_mtp_draft_qpn8(model: nn.Module) -> int:
+def mark_mtp_draft_qpn8(model: nn.Module, *, max_capture_rows: int = 0) -> int:
     """Admit the drafter's unquantized decoder projections before loading."""
     from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 
+    # Medium prefills and every graph shape use the native row chunks.
+    max_native_rows = max(128, max_capture_rows)
     count = 0
     for module in model.modules():
         if (
@@ -50,7 +49,7 @@ def mark_mtp_draft_qpn8(model: nn.Module) -> int:
             and getattr(module, "prefix", "").rsplit(".", 1)[-1] in _SUFFIXES
             and getattr(module, "bias", None) is None
         ):
-            setattr(module, _MARK, True)
+            setattr(module, _MARK, max_native_rows)
             count += 1
     return count
 
@@ -73,16 +72,6 @@ def prepare_mtp_draft_qpn8(layer: nn.Module) -> bool:
     )
 
     codes, scales = prepare_channel_qpn8_weight(weight)
-    if not envs.VLLM_SM70_FP8_QPN8_M32_CHUNKED:
-        # Keep the existing rollback for engines that disable native chunks.
-        from vllm.model_executor.kernels.linear.scaled_mm.sm70_fp8 import (
-            _get_sm70_fp8_prefill_exact_dense_workspace,
-        )
-
-        _get_sm70_fp8_prefill_exact_dense_workspace(codes)
-        dispatch = torch.ops.vllm.sm70_ct_fp8_qpn8_dispatch
-    else:
-        dispatch = _sm70_ops.fp8_qpn8_draft_dispatch_sm70_out
     split_k, nacc, prefetch = _SM70_CHANNEL_FP8_QPN8_CONFIGS.get(
         (k, n), (8 if k % 256 else 16, 2, False)
     )
@@ -90,23 +79,12 @@ def prepare_mtp_draft_qpn8(layer: nn.Module) -> bool:
     layer.register_buffer("_sm70_mtp_draft_qpn8_scales", scales, persistent=False)
     layer._sm70_mtp_draft_qpn8_shape = (n, k)
     layer._sm70_mtp_draft_qpn8_config = (split_k, nacc, prefetch)
-    layer._sm70_mtp_draft_qpn8_dispatch = dispatch
     layer._unquantized_fused_silu_and_mul = apply_mtp_draft_qpn8_fused_silu
     setattr(layer, _READY, True)
     logger.info_once(
         "SM70 MTP drafter projections use channel-QPN8 (FP16 weights released)."
     )
     return True
-
-
-def mtp_draft_qpn8_capture_limit(model: nn.Module) -> int | None:
-    if any(
-        getattr(layer, "_sm70_mtp_draft_qpn8_dispatch", None)
-        is _sm70_ops.fp8_qpn8_draft_dispatch_sm70_out
-        for layer in model.modules()
-    ):
-        return MTP_DRAFT_QPN8_MAX_CAPTURE_ROWS
-    return None
 
 
 def apply_mtp_draft_qpn8(layer: nn.Module, x: torch.Tensor) -> torch.Tensor | None:
@@ -116,7 +94,7 @@ def apply_mtp_draft_qpn8(layer: nn.Module, x: torch.Tensor) -> torch.Tensor | No
     split_k, nacc, prefetch = layer._sm70_mtp_draft_qpn8_config
     x_2d = x.reshape(-1, k).contiguous()
     out = x_2d.new_empty((x_2d.shape[0], n))
-    layer._sm70_mtp_draft_qpn8_dispatch(
+    _sm70_ops.fp8_qpn8_draft_dispatch_sm70_out(
         out,
         x_2d,
         layer.weight,
@@ -125,6 +103,7 @@ def apply_mtp_draft_qpn8(layer: nn.Module, x: torch.Tensor) -> torch.Tensor | No
         nacc,
         prefetch,
         False,
+        layer._sm70_mtp_draft_qpn8,
     )
     return out.reshape(*x.shape[:-1], n)
 
@@ -139,15 +118,19 @@ def apply_mtp_draft_qpn8_fused_silu(
     n, k = layer._sm70_mtp_draft_qpn8_shape
     if n % 64:
         return None
+    split_k, nacc, prefetch = _SM70_CHANNEL_FP8_QPN8_GATED_CONFIG
     x_2d = x.reshape(-1, k).contiguous()
     out_features = n // 2
     out = x_2d.new_empty((x_2d.shape[0], out_features))
-    layer._sm70_mtp_draft_qpn8_dispatch(
+    _sm70_ops.fp8_qpn8_draft_dispatch_sm70_out(
         out,
         x_2d,
         layer.weight,
         layer._sm70_mtp_draft_qpn8_scales,
-        *_SM70_CHANNEL_FP8_QPN8_GATED_CONFIG,
+        split_k,
+        nacc,
+        prefetch,
         True,
+        layer._sm70_mtp_draft_qpn8,
     )
     return out.reshape(*x.shape[:-1], out_features)

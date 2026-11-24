@@ -2725,7 +2725,8 @@ def _get_csa_linear_tensor_layout(
     if host_mtp and mtp_tensors and not host_tuples:
         logger.warning(
             "draft_main_placement='host' needs a draft whose main K/V has the "
-            "target's sharded geometry; the MTP draft stays on the GPU."
+            "target's sharded geometry and storage dtype/codec; the MTP draft "
+            "stays on the GPU."
         )
     owner_page_sizes = list(main_kv_page_sizes)
     compressed_page_sizes = [

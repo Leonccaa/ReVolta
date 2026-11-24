@@ -891,3 +891,40 @@ def test_vllmconfig_profile_receives_the_speculative_method():
         f"getattr(self.speculative_config, '{schedule_field}', None)"
     )
     assert "kv_cache_dtype" not in {k.arg for k in first.keywords}
+
+
+def test_speculative_draft_keeps_target_graph_reserve(profile, monkeypatch, tmp_path):
+    from transformers import Qwen3Config
+
+    from vllm import revolta_profile
+    from vllm.config import CacheConfig, ModelConfig, VllmConfig, replace
+
+    def apply(_model, _tp, **kwargs):
+        return profile.apply_revolta_profile(
+            model(),
+            4,
+            is_sm70=True,
+            speculative_method="mtp",
+            kv_cache_dtype=kwargs.get("kv_cache_dtype"),
+        )
+
+    monkeypatch.setattr(revolta_profile, "apply_revolta_profile", apply)
+    apply_kernel = Mock(wraps=revolta_profile.apply_revolta_kernel_profile)
+    monkeypatch.setattr(revolta_profile, "apply_revolta_kernel_profile", apply_kernel)
+    Qwen3Config(architectures=["Qwen3ForCausalLM"]).save_pretrained(tmp_path)
+    target = VllmConfig(
+        model_config=ModelConfig(
+            model=str(tmp_path), dtype="float16", skip_tokenizer_init=True
+        ),
+        cache_config=CacheConfig(cache_dtype="int8"),
+    )
+    assert os.environ[GRAPH_RESERVE] == "600"
+
+    draft = replace(
+        target,
+        is_speculative_draft=True,
+        cache_config=replace(target.cache_config, cache_dtype="float16"),
+    )
+    assert draft.cache_config.cache_dtype == "float16"
+    assert os.environ[GRAPH_RESERVE] == "600"
+    apply_kernel.assert_called_once()

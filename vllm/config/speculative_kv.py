@@ -96,7 +96,12 @@ def validate_speculative_kv_cache_dtype(config: "VllmConfig") -> None:
         and getattr(draft.hf_text_config, "indexer_n_heads", 0)
     )
     # QSA's FP16/BF16 reader requires storage to match the query dtype.
-    if config.cache_config.cache_dtype not in (
+    planar_target_with_fp16_mtp = (
+        spec.method == "mtp"
+        and draft_storage == "float16"
+        and target_storage in ("int8", "fp8_per_token_head")
+    )
+    if not planar_target_with_fp16_mtp and target_storage not in (
         "auto",
         "float16",
         "bfloat16",

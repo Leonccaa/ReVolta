@@ -31,16 +31,15 @@ def resolve_qsa_int8_aliases(cfg) -> None:
 
 
 def resolve_qsa_auto_e4m3(cfg) -> bool:
+    # A drafter keeps the dtype its loader chose and shares the target policy.
+    if getattr(cfg, "is_speculative_draft", False):
+        return False
     policy = cfg.kernel_config
     policy.qsa_auto_e4m3_active = False
     model = cfg.model_config
     reason = None
     if not policy.qsa_auto_e4m3:
         reason = "disabled by KernelConfig"
-    elif getattr(cfg, "is_speculative_draft", False):
-        # A drafter's config copies the target model config; the drafter keeps
-        # the KV dtype its loader chose (e.g. FP16 for SM70 DFlash).
-        reason = "speculative draft keeps its own KV dtype"
     elif model is None or not getattr(model.hf_text_config, "indexer_n_heads", None):
         reason = "no QSA selector metadata"
     elif cfg.cache_config.cache_dtype != "auto":

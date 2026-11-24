@@ -128,14 +128,20 @@ def test_without_qsa_metadata_keeps_auto(tmp_path, monkeypatch):
     assert not resolve_qsa_auto_e4m3(cfg)
 
 
-def test_speculative_draft_config_keeps_its_dtype(tmp_path, monkeypatch):
+def test_speculative_draft_keeps_its_dtype_and_target_policy(tmp_path, monkeypatch):
     # DFlash builds its drafter from the target VllmConfig with
     # is_speculative_draft=True and cache_dtype "auto" (FP16 on SM70).
-    cfg = _config(_checkpoint(tmp_path))
-    cfg.is_speculative_draft = True
+    target = _config(_checkpoint(tmp_path))
     monkeypatch.setattr(qsa, "qsa_e4m3_capability_reason", lambda dtype: None)
-    assert not resolve_qsa_auto_e4m3(cfg)
-    assert cfg.cache_config.cache_dtype == "auto"
+    assert resolve_qsa_auto_e4m3(target)
+    draft = SimpleNamespace(**vars(target))
+    draft.is_speculative_draft = True
+    draft.cache_config = SimpleNamespace(**vars(target.cache_config))
+    draft.cache_config.cache_dtype = "auto"
+    assert not resolve_qsa_auto_e4m3(draft)
+    assert draft.cache_config.cache_dtype == "auto"
+    assert target.kernel_config.qsa_auto_e4m3_active
+    assert target.kernel_config.qsa_auto_e4m3_reason is None
 
 
 def test_diagnostics_do_not_change_inactive_kernel_hash():

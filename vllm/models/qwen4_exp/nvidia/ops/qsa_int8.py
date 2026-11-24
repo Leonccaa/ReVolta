@@ -661,11 +661,15 @@ def sparse_attention(
         and seq_lens is not None
     )
     if native_shape and lse is None:
-        if q.shape[1] == 6 and (
+        use_decode = q.shape[1] == 6 and (
             q.shape[0] < 8
             or get_forward_context().additional_kwargs.get("sm70_qsa_draft_decode")
+        )
+        if use_decode or not get_forward_context().additional_kwargs.get(
+            "qsa_reuses_mtp_selection"
         ):
-            native_decode(
+            read = native_decode if use_decode else native_grouped
+            read(
                 q,
                 k,
                 v,
@@ -679,24 +683,9 @@ def sparse_attention(
                 sv,
                 codec=codec,
             )
-        else:
-            native_grouped(
-                q,
-                k,
-                v,
-                indices,
-                table,
-                requests,
-                positions,
-                seq_lens,
-                out,
-                sk,
-                sv,
-                codec=codec,
-            )
-        if gate is not None:
-            _qsa_output_gate(out, gate.view_as(q))
-        return out
+            if gate is not None:
+                _qsa_output_gate(out, gate.view_as(q))
+            return out
     return triton_attention(
         q,
         k,

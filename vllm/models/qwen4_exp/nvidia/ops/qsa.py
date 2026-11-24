@@ -3331,7 +3331,21 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4(
     grouped_enabled = _SM70_QSA_GROUPED_PAGE4 and _qsa_grouped_page4_supported(
         flash_attn_v100_cuda, kv_cache_dtype
     )
-    if grouped_enabled:
+    # The grouped planner derives its tail mask from the current position.
+    # Later MTP steps can carry the first step's shorter selection.
+    reuses_selection = (
+        is_forward_context_available()
+        and get_forward_context().additional_kwargs.get("qsa_reuses_mtp_selection")
+    )
+    if (
+        reuses_selection
+        and kv_cache_dtype == "fp8_e4m3"
+        and q.shape[0] > 1
+        and not envs.VLLM_FLASH_V100_E4M3_BATCH_XQA
+    ):
+        # Scalar XQA only accepts one row. Triton reads the retained indices.
+        return None
+    if grouped_enabled and not reuses_selection:
         grouped_rows = (
             q.shape[0] // _SM70_QSA_GROUPED_PAGE4_QUERIES
         ) * _SM70_QSA_GROUPED_PAGE4_QUERIES

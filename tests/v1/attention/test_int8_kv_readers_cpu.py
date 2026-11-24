@@ -3,6 +3,7 @@
 """Execute the production Triton reader on CPU with TRITON_INTERPRET=1."""
 
 import os
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -62,10 +63,17 @@ def test_interpreted_e4m3_reader_against_float64():
 
 
 @pytest.mark.parametrize(
-    "heads,draft,expected",
-    [(6, False, "grouped"), (6, True, "decode"), (12, True, "grouped")],
+    "heads,draft,reuse,expected",
+    [
+        (6, False, False, "grouped"),
+        (6, True, True, "decode"),
+        (12, True, False, "grouped"),
+        (12, True, True, "triton"),
+    ],
 )
-def test_per_vector_draft_decode_uses_h6_reader(heads, draft, expected, monkeypatch):
+def test_per_vector_draft_decode_uses_h6_reader(
+    heads, draft, reuse, expected, monkeypatch
+):
     from vllm.forward_context import ForwardContext, override_forward_context
     from vllm.models.qwen4_exp.nvidia.ops import qsa
 
@@ -83,9 +91,15 @@ def test_per_vector_draft_decode_uses_h6_reader(heads, draft, expected, monkeypa
         reader, "native_grouped", lambda *a, **k: calls.append("grouped")
     )
 
+    monkeypatch.setattr(
+        reader, "triton_attention", lambda *a, **k: calls.append("triton")
+    )
+
     context = ForwardContext({}, None, {})
     if draft:
         context.additional_kwargs["sm70_qsa_draft_decode"] = True
+    if reuse:
+        context.additional_kwargs["qsa_reuses_mtp_selection"] = True
     with override_forward_context(context):
         qsa.qsa_sparse_paged_attention(
             q,
@@ -100,6 +114,56 @@ def test_per_vector_draft_decode_uses_h6_reader(heads, draft, expected, monkeypa
             **view.scale_kwargs,
         )
     assert calls == [expected]
+
+
+def test_reused_scalar_e4m3_selection_falls_back_without_batch_xqa(monkeypatch):
+    from vllm.forward_context import ForwardContext, override_forward_context
+    from vllm.models.qwen4_exp.nvidia.ops import qsa
+
+    def unexpected_xqa(*args):
+        pytest.fail("Batch XQA was launched with VLLM_FLASH_V100_E4M3_BATCH_XQA=0")
+
+    native = SimpleNamespace(decode_paged_xqa_fwd=unexpected_xqa)
+    monkeypatch.setitem(
+        sys.modules,
+        "flash_attn_v100.flash_attn_interface",
+        SimpleNamespace(flash_attn_v100_cuda=native),
+    )
+    monkeypatch.setenv("VLLM_FLASH_V100_E4M3_BATCH_XQA", "0")
+    monkeypatch.setattr(qsa, "_SM70_QSA_GROUPED_PAGE4", True)
+    monkeypatch.setattr(qsa, "_qsa_grouped_page4_supported", lambda *args: True)
+    monkeypatch.setattr(
+        qsa, "_qsa_sparse_paged_attention_sm70_xqa_page4_batch", unexpected_xqa
+    )
+
+    rows = 24
+    query = torch.empty((rows, 6, 256), dtype=torch.float16)
+    kv = torch.empty((1, 16, 1, 256), dtype=torch.uint8)
+    indices = torch.empty((rows, 2051), dtype=torch.int32)
+    table = torch.zeros((1, 1), dtype=torch.int32)
+    requests = torch.zeros(rows, dtype=torch.int32)
+    positions = torch.arange(rows)
+    lengths = torch.tensor([rows], dtype=torch.int32)
+    context = ForwardContext({}, None, {})
+    context.additional_kwargs["qsa_reuses_mtp_selection"] = True
+    with override_forward_context(context):
+        assert (
+            qsa._qsa_sparse_paged_attention_sm70_xqa_page4(
+                query,
+                kv,
+                kv,
+                indices,
+                table,
+                requests,
+                positions,
+                lengths,
+                torch.empty_like(query),
+                "fp8_e4m3",
+                1.0,
+                1.0,
+            )
+            is None
+        )  # The caller falls through to the Triton reader.
 
 
 @pytest.mark.parametrize("codec", [INT8, FP8_E4M3_PER_TOKEN_HEAD])
@@ -315,8 +379,6 @@ def test_reject_invalid_scale_planes(kind):
 
 @pytest.mark.parametrize("cache_dtype", ["int8", "fp8_per_token_head"])
 def test_qsa_per_vector_requires_native_page4_abi(cache_dtype, monkeypatch):
-    import sys
-
     from vllm.models.qwen4_exp.nvidia import qsa
 
     def init(self):

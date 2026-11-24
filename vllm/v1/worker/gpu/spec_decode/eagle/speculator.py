@@ -457,7 +457,10 @@ class EagleSpeculator:
             if is_uniform_decode or is_eagle_draft_step:
                 # The active MRv2 runner identifies draft decode even when the
                 # draft architecture would not choose MRv2 on its own.
-                get_forward_context().additional_kwargs["sm70_qsa_draft_decode"] = True
+                kwargs = get_forward_context().additional_kwargs
+                kwargs["sm70_qsa_draft_decode"] = True
+                if is_eagle_draft_step and self.share_mtp_topk_indices:
+                    kwargs["qsa_reuses_mtp_selection"] = True
             inputs_embeds = None
             if self.supports_mm_inputs:
                 # Merge multimodal embeddings with input ids.

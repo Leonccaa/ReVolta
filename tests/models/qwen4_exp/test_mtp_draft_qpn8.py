@@ -106,21 +106,16 @@ def test_draft_constructor_respects_switch_and_fp16_gemv(monkeypatch, enabled):
     )
 
 
-@pytest.mark.parametrize("sm70", [False, True], ids=["non-sm70", "missing-op"])
-def test_prepare_falls_back_to_fp16(monkeypatch, sm70):
+def test_prepare_falls_back_to_fp16_on_non_sm70(monkeypatch):
     layer = _linear("mtp.fc")
     original = layer.weight
     with torch.no_grad():
         original.fill_(1)
     draft_qpn8.mark_mtp_draft_qpn8(layer)
-    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda t: t is original))
     monkeypatch.setattr(
         draft_qpn8,
         "current_platform",
-        SimpleNamespace(is_device_capability=lambda cap: sm70),
-    )
-    monkeypatch.setattr(
-        torch.ops, "_C", SimpleNamespace(fp8_qpn8_prepare_sm70=object())
+        SimpleNamespace(is_device_capability=lambda cap: False),
     )
     monkeypatch.setattr(online_qpn8.envs, "VLLM_SM70_QWEN4_EXP_ONLINE_QPN8", False)
     assert not online_qpn8.maybe_prepare_online_qpn8(layer)
@@ -144,14 +139,10 @@ def test_prepare_and_dispatch_draft_gate_up(monkeypatch):
     draft_qpn8.mark_mtp_draft_qpn8(layer)
     codes = torch.zeros((128, 64), dtype=torch.uint8)
     scales = torch.ones((1, 64), dtype=torch.float16)
-    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda t: t is original))
     monkeypatch.setattr(
         draft_qpn8,
         "current_platform",
         SimpleNamespace(is_device_capability=lambda cap: cap == 70),
-    )
-    monkeypatch.setattr(
-        torch.ops, "_C", SimpleNamespace(**dict.fromkeys(draft_qpn8._REQUIRED_OPS))
     )
     monkeypatch.setattr(
         sm70_fp8,
@@ -181,3 +172,25 @@ def test_prepare_and_dispatch_draft_gate_up(monkeypatch):
         layer.forward_fused_silu_and_mul(x), torch.full((2, 3, 32), 2, dtype=x.dtype)
     )
     assert calls == [(8, 2, False, False), (8, 2, False, True)]
+
+
+def test_chunked_channel_qpn8_quantization_matches_whole_weight(monkeypatch):
+    weight = torch.randn((4096 + 32, 128), dtype=torch.float16)
+    weight[0].zero_()
+    weight[4096].zero_()
+    monkeypatch.setattr(
+        online_qpn8.sm70_ops,
+        "fp8_qpn8_prepare_sm70",
+        lambda qweight, scales: (
+            qweight,
+            scales,
+        ),
+    )
+    codes, scales = online_qpn8.prepare_channel_qpn8_weight(weight)
+
+    values = weight.float()
+    expected_scales = values.abs().amax(dim=1, keepdim=True).div_(448.0)
+    expected_scales[expected_scales == 0] = 1
+    expected_codes = (values / expected_scales).to(torch.float8_e4m3fn)
+    torch.testing.assert_close(scales, expected_scales, rtol=0, atol=0)
+    assert torch.equal(codes.view(torch.uint8), expected_codes.view(torch.uint8))

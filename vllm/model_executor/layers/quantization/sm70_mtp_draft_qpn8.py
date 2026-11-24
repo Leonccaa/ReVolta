@@ -33,7 +33,6 @@ _SUFFIXES = frozenset(
         "down_proj",
     }
 )
-_REQUIRED_OPS = ("fp8_qpn8_prepare_sm70", "fp8_qpn8_dispatch_sm70_out")
 
 
 def mark_mtp_draft_qpn8(model: nn.Module) -> int:
@@ -55,22 +54,12 @@ def mark_mtp_draft_qpn8(model: nn.Module) -> int:
 
 @torch.no_grad()
 def prepare_mtp_draft_qpn8(layer: nn.Module) -> bool:
-    if getattr(layer, _READY, False):
-        return True
     if not getattr(layer, _MARK, False):
         return False
-    weight = getattr(layer, "weight", None)
-    if (
-        weight is None
-        or weight.dtype != torch.float16
-        or not weight.is_cuda
-        or weight.ndim != 2
-        or not current_platform.is_device_capability(70)
-    ):
+    weight = layer.weight
+    if weight.dtype != torch.float16 or not current_platform.is_device_capability(70):
         return False
-    if any(not hasattr(torch.ops._C, name) for name in _REQUIRED_OPS):
-        return False
-    n, k = (int(dim) for dim in weight.shape)
+    n, k = weight.shape
     if n % 32 or k % 128:
         return False
     from vllm.model_executor.kernels.linear.scaled_mm.sm70_fp8 import (
@@ -84,8 +73,7 @@ def prepare_mtp_draft_qpn8(layer: nn.Module) -> bool:
     )
 
     codes, scales = prepare_channel_qpn8_weight(weight)
-    if _get_sm70_fp8_prefill_exact_dense_workspace(codes) is None:
-        return False
+    _get_sm70_fp8_prefill_exact_dense_workspace(codes)
     split_k, nacc, prefetch = _SM70_CHANNEL_FP8_QPN8_CONFIGS.get(
         (k, n), (8 if k % 256 else 16, 2, False)
     )
@@ -101,16 +89,12 @@ def prepare_mtp_draft_qpn8(layer: nn.Module) -> bool:
     return True
 
 
-def apply_mtp_draft_qpn8(
-    layer: nn.Module, x: torch.Tensor, bias: torch.Tensor | None
-) -> torch.Tensor | None:
+def apply_mtp_draft_qpn8(layer: nn.Module, x: torch.Tensor) -> torch.Tensor | None:
     if not getattr(layer, _READY, False):
         return None
     n, k = layer._sm70_mtp_draft_qpn8_shape
     split_k, nacc, prefetch = layer._sm70_mtp_draft_qpn8_config
-    x_2d = x.reshape(-1, k)
-    if not x_2d.is_contiguous():
-        x_2d = x_2d.contiguous()
+    x_2d = x.reshape(-1, k).contiguous()
     out = x_2d.new_empty((x_2d.shape[0], n))
     torch.ops.vllm.sm70_ct_fp8_qpn8_dispatch(
         out,
@@ -122,38 +106,28 @@ def apply_mtp_draft_qpn8(
         prefetch,
         False,
     )
-    if bias is not None:
-        out.add_(bias)
     return out.reshape(*x.shape[:-1], n)
 
 
 def apply_mtp_draft_qpn8_fused_silu(
     layer: nn.Module, x: torch.Tensor
 ) -> torch.Tensor | None:
-    if not getattr(layer, _READY, False):
-        return None
-    if not getattr(layer, "prefix", "").endswith(".gate_up_proj"):
-        return None
-    if x.dtype != torch.float16:
-        return None
+    from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a16_fp8 import (  # noqa: E501
+        _SM70_CHANNEL_FP8_QPN8_GATED_CONFIG,
+    )
+
     n, k = layer._sm70_mtp_draft_qpn8_shape
-    if n % 64 != 0 or k % 128 != 0:
+    if n % 64:
         return None
-    x_2d = x.reshape(-1, k)
-    if not x_2d.is_contiguous():
-        x_2d = x_2d.contiguous()
+    x_2d = x.reshape(-1, k).contiguous()
     out_features = n // 2
     out = x_2d.new_empty((x_2d.shape[0], out_features))
-    if x_2d.shape[0] == 0:
-        return out.reshape(*x.shape[:-1], out_features)
     torch.ops.vllm.sm70_ct_fp8_qpn8_dispatch(
         out,
         x_2d,
         layer.weight,
         layer._sm70_mtp_draft_qpn8_scales,
-        8,
-        2,
-        False,
+        *_SM70_CHANNEL_FP8_QPN8_GATED_CONFIG,
         True,
     )
     return out.reshape(*x.shape[:-1], out_features)

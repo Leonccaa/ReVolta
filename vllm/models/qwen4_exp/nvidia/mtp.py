@@ -731,26 +731,13 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         object.__setattr__(self, "_sm70_decode_graph_model", None)
 
     def prepare_sm70_mtp_draft_head(self) -> None:
-        weight = getattr(self.lm_head, "weight", None)
+        weight = self.lm_head.weight
+        n, k = weight.shape
         if (
-            envs.VLLM_BATCH_INVARIANT
-            or not current_platform.is_cuda()
-            or not current_platform.is_device_capability(70)
-            or weight is None
-            or not weight.is_cuda
+            not current_platform.is_device_capability(70)
             or weight.dtype != torch.float16
-            or weight.ndim != 2
-            or weight.shape[1] != 2560
-            or weight.shape[0] < 32
-            or weight.shape[0] % 32 != 0
-            or any(
-                not hasattr(torch.ops._C, name)
-                for name in (
-                    "fp8_qpn8_prepare_sm70",
-                    "fp8_qpn8_gemm_sm70_out",
-                    "qwen38_mtp_local_top1_sm70_out",
-                )
-            )
+            or n % 32
+            or k % 128
         ):
             return
         # The draft-only pack only replaces greedy top-1 selection; full

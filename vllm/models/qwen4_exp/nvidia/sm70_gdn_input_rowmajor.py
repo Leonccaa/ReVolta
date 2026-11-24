@@ -12,8 +12,8 @@ contiguous qkv/z/b/a (no split copy).
 
 The kernel reads each weight once per call for all rows, accumulates in FP32
 and rounds to FP16 once; every reduction is fixed order (no atomics). The K
-partition depends only on ``(warps_k, splits)``, and the plan below is the same
-for every M, so each row's result is independent of the batch width.
+partition depends only on ``(warps_k, splits)`` and stays fixed across widths
+within each mode, so each row's result is independent of the batch width.
 """
 
 from __future__ import annotations
@@ -58,12 +58,15 @@ PLAN = SkinnyConfig(1, 1, 2, 1)
 # M <= 8 (kept at PLAN) and slower for M = 25..32 (kept at PLAN).
 _SKINNY_MPLAN = envs.VLLM_SM70_GDN_SKINNY_MPLAN
 _PLAN_NG2 = SkinnyConfig(2, 1, 2, 1)
+_PLAN_K4 = SkinnyConfig(1, 1, 4, 1)
+_PLAN_K4_NG2 = SkinnyConfig(2, 1, 4, 1)
 
 
-def plan_for(m: int) -> SkinnyConfig:
-    if _SKINNY_MPLAN and (9 <= m <= 24 or 33 <= m <= MAX_ROWS):
-        return _PLAN_NG2
-    return PLAN
+def plan_for(m: int, *, use_k4: bool = False) -> SkinnyConfig:
+    ng2 = _SKINNY_MPLAN and (9 <= m <= 24 or 33 <= m <= MAX_ROWS)
+    if use_k4:
+        return _PLAN_K4_NG2 if ng2 or m in (4, 8) else _PLAN_K4
+    return _PLAN_NG2 if ng2 else PLAN
 
 
 @lru_cache(maxsize=1)
@@ -141,7 +144,11 @@ def _workspace(x2d: torch.Tensor, config: SkinnyConfig, n: int) -> torch.Tensor:
 
 
 def gdn_input_rowmajor(
-    x: torch.Tensor, qkvz_weight: torch.Tensor, ba_weight: torch.Tensor
+    x: torch.Tensor,
+    qkvz_weight: torch.Tensor,
+    ba_weight: torch.Tensor,
+    *,
+    use_k4: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
     """Contiguous ``(qkv, z, b, a)`` of ``x @ qkvz.T`` / ``x @ ba.T``.
 
@@ -156,12 +163,12 @@ def gdn_input_rowmajor(
         x2d.new_empty((m, cols))
         for cols in (QKV_COLS, n0 - QKV_COLS, B_COLS, n1 - B_COLS)
     )
-    plan = plan_for(m)
+    plan = plan_for(m, use_k4=use_k4)
     _launch2(outs, x2d, qkvz_weight, ba_weight, _workspace(x2d, plan, n0 + n1), plan)
     logger.info_once(
         "SM70 Qwen3.8 GDN input: row-major skinny dual GEMM for 2..48 rows "
-        "(plan=%s, per-M ng=2 plan=%s).",
-        tuple(PLAN),
+        "(K4=%s, per-M ng=2 plan=%s).",
+        use_k4,
         _SKINNY_MPLAN,
     )
     return outs  # type: ignore[return-value]

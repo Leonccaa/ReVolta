@@ -578,6 +578,7 @@ def _qwen38_sm70_fp16_gdn_input(
     packed_qkvz: torch.Tensor | None = None,
     packed_ba: torch.Tensor | None = None,
     use_v154_m3_m4: bool = False,
+    use_skinny_k4: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if _can_use_packed_gdn_input(x, packed_qkvz, packed_ba):
         use_v154 = (
@@ -608,7 +609,7 @@ def _qwen38_sm70_fp16_gdn_input(
         if envs.VLLM_SM70_QWEN38_GDN_NO_PACK:
             # Opt-in: no packed copy; 2..48 rows read the original row-major
             # weights in one skinny dual GEMM launch (contiguous qkv/z/b/a).
-            fused = gdn_input_rowmajor(x, qkvz_weight, ba_weight)
+            fused = gdn_input_rowmajor(x, qkvz_weight, ba_weight, use_k4=use_skinny_k4)
             if fused is not None:
                 return fused
         qkvz = torch.nn.functional.linear(x, qkvz_weight)
@@ -650,8 +651,9 @@ def _qwen38_sm70_fp16_gdn_input_fake(
     packed_qkvz: torch.Tensor | None = None,
     packed_ba: torch.Tensor | None = None,
     use_v154_m3_m4: bool = False,
+    use_skinny_k4: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    del qkvz_weight, ba_weight, packed_qkvz, packed_ba, use_v154_m3_m4
+    del qkvz_weight, ba_weight, packed_qkvz, packed_ba, use_v154_m3_m4, use_skinny_k4
     batch_shape = x.shape[:-1]
     return (
         x.new_empty((*batch_shape, 2560)),

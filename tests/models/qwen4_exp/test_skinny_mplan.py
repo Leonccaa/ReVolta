@@ -7,6 +7,7 @@ produce byte-identical outputs."""
 import pytest
 import torch
 
+from vllm.config import KernelConfig
 from vllm.models.qwen4_exp.nvidia import sm70_gdn_input_rowmajor as rm
 
 
@@ -19,6 +20,19 @@ def test_plan_table(monkeypatch):
         assert (plan.warps_k, plan.splits) == (rm.PLAN.warps_k, rm.PLAN.splits)
         expect_ng2 = 9 <= m <= 24 or 33 <= m <= 48
         assert plan.ng == (2 if expect_ng2 else rm.PLAN.ng)
+
+
+@pytest.mark.parametrize("mplan", (False, True))
+def test_skinny_k4_plan(monkeypatch, mplan):
+    monkeypatch.setattr(rm, "_SKINNY_MPLAN", mplan)
+    base = KernelConfig()
+    enabled = KernelConfig(sm70_gdn_input_skinny_k4=True)
+    assert base.sm70_gdn_input_skinny_k4 is False
+    assert enabled.compute_hash() != base.compute_hash()
+    for m in range(rm.MIN_ROWS, rm.MAX_ROWS + 1):
+        plan = rm.plan_for(m, use_k4=enabled.sm70_gdn_input_skinny_k4)
+        assert (plan.warps_n, plan.warps_k, plan.splits) == (1, 4, 1)
+        assert plan.ng == (2 if m in (4, 8) else rm.plan_for(m).ng)
 
 
 @pytest.mark.skipif(

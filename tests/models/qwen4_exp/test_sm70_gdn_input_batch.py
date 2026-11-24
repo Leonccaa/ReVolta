@@ -72,6 +72,22 @@ def test_fake_shapes(m):
     assert [tuple(o.shape) for o in outputs] == [(m, n) for n in (2560, 1536, 12, 12)]
 
 
+@pytest.mark.parametrize("enabled", (False, True))
+def test_skinny_k4_reaches_row_major(monkeypatch, enabled):
+    from vllm.models.qwen4_exp.nvidia import sm70_fp16_gemv as gemv
+
+    x = torch.empty(4, 2560)
+    outputs = tuple(x.new_empty((4, n)) for n in (2560, 1536, 12, 12))
+
+    def rowmajor(_, _qkvz, _ba, *, use_k4):
+        assert use_k4 is enabled
+        return outputs
+
+    monkeypatch.setenv("VLLM_SM70_QWEN38_GDN_NO_PACK", "1")
+    monkeypatch.setattr(gemv, "gdn_input_rowmajor", rowmajor)
+    assert gemv._qwen38_sm70_fp16_gdn_input(x, x, x, use_skinny_k4=enabled) is outputs
+
+
 @pytest.fixture(scope="module")
 def cuda_weights():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
@@ -247,5 +263,5 @@ def test_v154_packed_input_only_for_full_m3_m4(monkeypatch, m, compiling, expect
         )
     x = torch.zeros(m, 2560, dtype=torch.float16)
     w = torch.zeros(1)
-    _qwen38_sm70_fp16_gdn_input(x, w, w, w, w, True)
+    _qwen38_sm70_fp16_gdn_input(x, w, w, w, w, True, use_skinny_k4=True)
     assert calls == [expected]

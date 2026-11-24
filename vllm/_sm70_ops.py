@@ -1052,6 +1052,47 @@ if hasattr(torch.ops._C, "fp8_qpn8_dispatch_sm70_out"):
         return None
 
 
+def fp8_qpn8_draft_dispatch_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    codes: torch.Tensor,
+    group_scales: torch.Tensor,
+    split_k: int,
+    accumulator_chains: int,
+    prefetch_codes: bool,
+    gated_silu: bool,
+    max_native_rows: int,
+) -> None:
+    _qwen38_qpn8_op("fp8_qpn8_draft_dispatch_sm70_out")(
+        out,
+        input,
+        codes,
+        group_scales,
+        split_k,
+        accumulator_chains,
+        prefetch_codes,
+        gated_silu,
+        max_native_rows,
+    )
+
+
+if hasattr(torch.ops._C, "fp8_qpn8_draft_dispatch_sm70_out"):
+
+    @register_fake("_C::fp8_qpn8_draft_dispatch_sm70_out")
+    def _fp8_qpn8_draft_dispatch_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        codes: torch.Tensor,
+        group_scales: torch.Tensor,
+        split_k: int,
+        accumulator_chains: int,
+        prefetch_codes: bool,
+        gated_silu: bool,
+        max_native_rows: int,
+    ) -> None:
+        return None
+
+
 def fp8_qpn8_gemm_sm70_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -1303,6 +1344,7 @@ def _register_qwen38_qpn8_out_fakes() -> None:
         "fp8_qpn8_dequantize_sm70_out",
         "fp8_qpn8_prefill_sm70_out",
         "fp8_qpn8_dispatch_sm70_out",
+        "fp8_qpn8_draft_dispatch_sm70_out",
         "fp8_qpn8_gemm_sm70_out",
         "fp8_qpn8_gemm_ba_split_sm70_out",
         "fp8_qpn8_dispatch_ba_split_sm70_out",

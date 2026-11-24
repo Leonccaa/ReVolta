@@ -63,10 +63,15 @@ def test_mark_only_unquantized_bias_free_draft_projections():
 
 
 @pytest.mark.parametrize("enabled", [True, False])
-def test_draft_constructor_respects_switch_and_fp16_gemv(monkeypatch, enabled):
+@pytest.mark.parametrize("capture_tokens", [0, 40, 48, 160])
+def test_draft_constructor_respects_switch_and_fp16_gemv(
+    monkeypatch, enabled, capture_tokens
+):
     projection = _linear("mtp.layers.0.self_attn.qkv_proj")
+    fc_hidden = _linear("mtp.fc_hidden")
     predictor = nn.Module()
     predictor.layers = nn.ModuleList([projection])
+    predictor.fc_hidden = fc_hidden
     predictor.embed_tokens = nn.Identity()
     predictor.make_empty_intermediate_tensors = lambda *a: {}
     monkeypatch.setattr(mtp, "Qwen4ExpMultiTokenPredictor", lambda **kw: predictor)
@@ -85,20 +90,26 @@ def test_draft_constructor_respects_switch_and_fp16_gemv(monkeypatch, enabled):
     monkeypatch.setattr(sm70_fp16_gemv.envs, "VLLM_SM70_QWEN4_EXP_ONLINE_QPN8", False)
     config = SimpleNamespace(
         model_config=SimpleNamespace(
-            hf_text_config=SimpleNamespace(tie_word_embeddings=True, vocab_size=256),
+            hf_text_config=SimpleNamespace(
+                tie_word_embeddings=True, vocab_size=256, hc_count=4
+            ),
             dtype=torch.float16,
         ),
         cache_config=SimpleNamespace(mamba_cache_mode="align"),
         quant_config=None,
         speculative_config=object(),
-        compilation_config=SimpleNamespace(mode=CompilationMode.NONE),
+        compilation_config=SimpleNamespace(
+            mode=CompilationMode.NONE, max_cudagraph_capture_size=capture_tokens
+        ),
         kernel_config=KernelConfig()
         if enabled
         else KernelConfig(sm70_mtp_draft_qpn8=False),
     )
 
     assert mtp.Qwen4ExpMTP(vllm_config=config).model is predictor
-    assert getattr(projection, draft_qpn8._MARK, False) is enabled
+    expected_rows = max(128, 4 * capture_tokens) if enabled else 0
+    assert getattr(projection, draft_qpn8._MARK, 0) == expected_rows
+    assert getattr(fc_hidden, draft_qpn8._MARK, 0) == expected_rows
     assert type(projection.quant_method) is (
         UnquantizedLinearMethod
         if enabled
@@ -145,27 +156,35 @@ def test_prepare_and_dispatch_draft_gate_up(monkeypatch):
         SimpleNamespace(is_device_capability=lambda cap: cap == 70),
     )
     monkeypatch.setattr(
-        sm70_fp8,
-        "_get_sm70_fp8_prefill_exact_dense_workspace",
-        lambda _: torch.empty(1),
-    )
-    monkeypatch.setattr(
         online_qpn8, "prepare_channel_qpn8_weight", lambda _: (codes, scales)
     )
     monkeypatch.setattr(online_qpn8.envs, "VLLM_SM70_QWEN4_EXP_ONLINE_QPN8", False)
-
-    assert online_qpn8.maybe_prepare_online_qpn8(layer)
-    assert layer.weight.dtype == torch.uint8 and layer.weight is not original
-    assert layer._sm70_mtp_draft_qpn8_scales is scales
+    workspace_requests: list[torch.Tensor] = []
+    monkeypatch.setattr(
+        sm70_fp8,
+        "_get_sm70_fp8_prefill_exact_dense_workspace",
+        workspace_requests.append,
+    )
     calls = []
 
-    def dispatch(out, x, weight, packed_scales, split_k, nacc, prefetch, gated):
+    def dispatch(
+        out, x, weight, packed_scales, split_k, nacc, prefetch, gated, max_native_rows
+    ):
         assert x.shape == (6, 128) and x.is_contiguous()
         assert weight is layer.weight and packed_scales is scales
+        assert max_native_rows == 128
         calls.append((split_k, nacc, prefetch, gated))
         out.fill_(2)
 
-    monkeypatch.setattr(torch.ops.vllm, "sm70_ct_fp8_qpn8_dispatch", dispatch)
+    monkeypatch.setattr(
+        draft_qpn8._sm70_ops,
+        "fp8_qpn8_draft_dispatch_sm70_out",
+        dispatch,
+    )
+    assert online_qpn8.maybe_prepare_online_qpn8(layer)
+    assert layer.weight.dtype == torch.uint8 and layer.weight is not original
+    assert layer._sm70_mtp_draft_qpn8_scales is scales
+    assert not workspace_requests
     x = torch.ones((2, 3, 128), dtype=torch.float16)
     torch.testing.assert_close(layer(x)[0], torch.full((2, 3, 64), 2, dtype=x.dtype))
     torch.testing.assert_close(

@@ -1864,6 +1864,19 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         split_fused_indexed_w13 = fused_indexed_w13 and bool(
             getattr(layer, "sm70_nvfp4_qwen38_fast_prefill", False)
         )
+        raw_scale = bool(getattr(layer, "sm70_nvfp4_qwen38_raw_scale", False))
+        use_m64_w13 = (
+            split_fused_indexed_w13
+            and raw_scale
+            and num_tokens >= 1536
+            and layer.expert_map is None
+            and not (
+                is_forward_context_available()
+                and get_forward_context().additional_kwargs.get(
+                    "sm70_nvfp4_decode_only"
+                )
+            )
+        )
         glm53_fused_permute_q8 = _use_glm53_fused_permute_q8(layer, x, topk_ids)
         glm53_qpn_w13_q8 = _use_glm53_qpn_w13_q8(
             layer, x, topk_ids, fused_permute=glm53_fused_permute_q8
@@ -1874,7 +1887,6 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         direct_qpn_m1 = _use_qwen38_qpn_m1_decode(layer, x, topk_ids)
         direct_qpn_batch = _use_qwen38_qpn_batch_decode(layer, x, topk_ids)
         direct_qpn_mtp5 = _use_qwen38_qpn_mtp5_decode(layer, x, topk_ids)
-        raw_scale = bool(getattr(layer, "sm70_nvfp4_qwen38_raw_scale", False))
         if os.getenv("VLLM_SM70_QWEN38_QPN_ROUTE_DEBUG") == "1" and num_tokens <= 16:
             logger.warning_once(
                 "SM70 Qwen3.8 QPN route debug: tokens=%d x_shape=%s "
@@ -2086,7 +2098,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             stage_offsets = buffers["compact_offsets"]
             stage_expert_ids = buffers["active_expert_ids"]
             stage_experts = slots
-        else:
+        elif not use_m64_w13:
             output.zero_()
             topk_ids_i32 = buffers["topk_ids"]
             topk_ids_i32.copy_(topk_ids, non_blocking=True)
@@ -2134,6 +2146,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         if (
             not direct_single_token
             and not glm53_fused_permute_q8
+            and not use_m64_w13
             and _use_compact_grouped(num_tokens, top_k)
         ):
             prepare_groups = (
@@ -2154,7 +2167,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             stage_expert_ids = buffers["dense_expert_ids"]
             stage_experts = int(layer.sm70_nvfp4_num_experts)
 
-        if raw_scale:
+        if raw_scale and not use_m64_w13:
             sm70_ops.nvfp4_expand_raw_scales_sm70_out(
                 layer.w13_tm_scales,
                 layer.w13_raw_scale_codes,
@@ -2162,7 +2175,22 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 interleaved_w13,
             )
 
-        if split_fused_indexed_w13:
+        if use_m64_w13:
+            torch.ops._C.nvfp4_prefill_m64_w13_sm70_out(
+                buffers["intermediate"],
+                buffers["expert_offsets"],
+                buffers["inv_permuted_idx"],
+                buffers["input_row_indices"],
+                x,
+                topk_ids,
+                layer.w13_tm_weight,
+                layer.w13_raw_scale_codes,
+                layer.w13_raw_global_scales,
+            )
+            buffers["expert_offsets64"].copy_(
+                buffers["expert_offsets"], non_blocking=True
+            )
+        elif split_fused_indexed_w13:
             logger.info_once(
                 "SM70 Qwen3.8 NVFP4 indexed-A fused-SwiGLU split-W13 "
                 "prefill route enabled (N256+N64)."

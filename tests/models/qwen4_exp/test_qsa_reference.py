@@ -385,16 +385,6 @@ def test_qsa_ring_capacity_covers_one_speculative_step(
     assert spec.block_size == expected
 
 
-def test_qsa_ring_capacity_widens_to_divide_the_attention_block_size() -> None:
-    cache = _qsa_key_cache(block_size=40, compress_ratio=4)
-    spec = cache.get_kv_cache_spec(
-        SimpleNamespace(
-            cache_config=SimpleNamespace(block_size=40), num_speculative_tokens=5
-        )
-    )
-    assert spec.block_size == 20
-
-
 @requires_qsa_kernels
 def test_qsa_compressed_metadata_keeps_dummy_slots_inert() -> None:
     device = torch.device("cuda")

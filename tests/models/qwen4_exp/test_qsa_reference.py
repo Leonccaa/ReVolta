@@ -377,15 +377,12 @@ def test_qsa_ring_capacity_covers_one_speculative_step(
     """Capacity spans the open group plus one speculative step, in whole groups."""
     spec = _qsa_key_cache(
         block_size=48, compress_ratio=compress_ratio
-    ).get_kv_cache_spec(SimpleNamespace(num_speculative_tokens=num_spec))
+    ).get_kv_cache_spec(
+        SimpleNamespace(
+            cache_config=SimpleNamespace(block_size=48), num_speculative_tokens=num_spec
+        )
+    )
     assert spec.block_size == expected
-
-
-def test_qsa_ring_capacity_must_divide_the_attention_block_size() -> None:
-    """A ring that does not divide the block size inflates the scheduler's LCM."""
-    cache = _qsa_key_cache(block_size=40, compress_ratio=4)
-    with pytest.raises(AssertionError, match="must divide the attention block size"):
-        cache.get_kv_cache_spec(SimpleNamespace(num_speculative_tokens=5))
 
 
 @requires_qsa_kernels

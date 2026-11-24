@@ -244,7 +244,7 @@ def test_qsa_e4m3_forward_cannot_bypass_scale_finalization() -> None:
     [
         (1632, 4, 8),  # native MTP4: the minimal ring, unchanged
         (1632, 3, 8),
-        (1632, 7, 12),  # 1632 = 12 * 136
+        (1632, 5, 12),  # DCP2 MTP5: 12 divides the final span, but not 16
         (1600, 7, 16),  # 12 does not divide 1600; widen by whole groups
         (1600, 0, 4),
     ],
@@ -256,14 +256,17 @@ def test_qsa_ring_capacity_divides_the_attention_block(
         head_size=128,
         dtype=torch.float16,
         prefix="model.layers.0.self_attn.raw_key_cache",
-        cache_config=SimpleNamespace(block_size=block_size),
+        cache_config=SimpleNamespace(block_size=16),
         compress_ratio=4,
         vllm_config=SimpleNamespace(
             compilation_config=SimpleNamespace(static_forward_context={})
         ),
     )
     spec = layer.get_kv_cache_spec(
-        SimpleNamespace(num_speculative_tokens=num_speculative_tokens)
+        SimpleNamespace(
+            cache_config=SimpleNamespace(block_size=block_size),
+            num_speculative_tokens=num_speculative_tokens,
+        )
     )
     assert spec.block_size == capacity
     assert block_size % spec.block_size == 0
@@ -284,4 +287,8 @@ def test_qsa_ring_widening_is_capped() -> None:
         ),
     )
     with pytest.raises(ValueError, match="multiple of 32"):
-        layer.get_kv_cache_spec(SimpleNamespace(num_speculative_tokens=4))
+        layer.get_kv_cache_spec(
+            SimpleNamespace(
+                cache_config=SimpleNamespace(block_size=1616), num_speculative_tokens=4
+            )
+        )

@@ -179,23 +179,28 @@ def test_sm70_qsa_dflash_defaults_to_model_precision(sm70):
 
 
 @pytest.mark.parametrize(
-    "target_dtype,activation_dtype",
-    [("int8_per_token_head", torch.float16), ("float16", torch.float32)],
+    "target_dtype,activation_dtype,expected",
+    [
+        ("int8_per_token_head", torch.float16, "int8_per_token_head"),
+        ("float16", torch.float32, "float16"),
+        ("fp8_e4m3", torch.float16, "auto"),
+        ("int8", torch.float16, "auto"),
+    ],
 )
-def test_sm70_non_qsa_dflash_inherits_target_dtype(
-    sm70, target_dtype, activation_dtype
+def test_sm70_non_qsa_dflash_keeps_legacy_dtype_policy(
+    sm70, target_dtype, activation_dtype, expected
 ):
     config = _config(target_dtype)
     config.model_config.hf_text_config = SimpleNamespace()
     config.model_config.dtype = activation_dtype
     config.speculative_config.attention_backend = AttentionBackendEnum.TRITON_ATTN
-    assert dflash_draft_cache_dtype(config) == target_dtype
+    assert dflash_draft_cache_dtype(config) == expected
 
 
 @pytest.mark.parametrize(
     "method,target_dtype,draft_dtype,reject",
     [
-        ("dflash", "int8", None, True),
+        ("dflash", "int8", None, False),
         ("dflash", "fp8_e4m3", None, False),
         ("dflash", "float16", None, False),
         ("dflash", "auto", None, False),

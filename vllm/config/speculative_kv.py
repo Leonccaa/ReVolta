@@ -15,8 +15,9 @@ def dflash_draft_cache_dtype(config: "VllmConfig") -> "CacheDType":
     """The cache dtype a DFlash drafter is loaded with (``load_dflash_model``).
 
     An explicit draft ``kv_cache_dtype`` wins. With an SM70 QSA target the
-    draft uses its model precision (FP16 for QSA DFlash2). Elsewhere it
-    inherits the target dtype.
+    draft uses its model precision (FP16 for QSA DFlash2). Other targets use
+    the existing dtype policy, including model precision for SM70 FP8 and
+    planar INT8 targets.
     """
     from vllm.platforms import current_platform
     from vllm.revolta_profile import has_qsa_capability
@@ -25,11 +26,18 @@ def dflash_draft_cache_dtype(config: "VllmConfig") -> "CacheDType":
     assert spec is not None
     if spec.kv_cache_dtype is not None:
         return spec.kv_cache_dtype
-    if current_platform.is_device_capability(70) and has_qsa_capability(
+    if has_qsa_capability(
         config.model_config
+    ) and current_platform.is_device_capability(70):
+        return "auto"
+    target = config.cache_config.cache_dtype
+    if (
+        (str(target).startswith("fp8") or target == "int8")
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability(70)
     ):
         return "auto"
-    return config.cache_config.cache_dtype
+    return target
 
 
 def validate_speculative_kv_cache_dtype(config: "VllmConfig") -> None:

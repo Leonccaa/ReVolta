@@ -62,10 +62,17 @@ def test_interpreted_e4m3_reader_against_float64():
 
 
 @pytest.mark.parametrize(
-    "heads,draft,expected",
-    [(6, False, "grouped"), (6, True, "decode"), (12, True, "grouped")],
+    "heads,draft,reuse,expected",
+    [
+        (6, False, False, "grouped"),
+        (6, True, True, "decode"),
+        (12, True, False, "grouped"),
+        (12, True, True, "triton"),
+    ],
 )
-def test_per_vector_draft_decode_uses_h6_reader(heads, draft, expected, monkeypatch):
+def test_per_vector_draft_decode_uses_h6_reader(
+    heads, draft, reuse, expected, monkeypatch
+):
     from vllm.forward_context import ForwardContext, override_forward_context
     from vllm.models.qwen4_exp.nvidia.ops import qsa
 
@@ -83,9 +90,15 @@ def test_per_vector_draft_decode_uses_h6_reader(heads, draft, expected, monkeypa
         reader, "native_grouped", lambda *a, **k: calls.append("grouped")
     )
 
+    monkeypatch.setattr(
+        reader, "triton_attention", lambda *a, **k: calls.append("triton")
+    )
+
     context = ForwardContext({}, None, {})
     if draft:
         context.additional_kwargs["sm70_qsa_draft_decode"] = True
+    if reuse:
+        context.additional_kwargs["qsa_reuses_mtp_selection"] = True
     with override_forward_context(context):
         qsa.qsa_sparse_paged_attention(
             q,

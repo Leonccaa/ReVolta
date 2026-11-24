@@ -1292,6 +1292,18 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         block_size, _, dcp_sharded = qsa_dcp_block_geometry(
             vllm_config, self.layer_name
         )
+        if (
+            not dcp_sharded
+            and vllm_config.parallel_config.decode_context_parallel_size == 1
+        ):
+            # On one rank the MTP page has the same DCP geometry as the target.
+            # Mark it consistently so matching pages can share the host store.
+            host = vllm_config.kernel_config.long_context_kv
+            dcp_sharded = (
+                host.enabled
+                and host.main_kv_placement == "host"
+                and host.draft_main_placement == "host"
+            )
         return FullAttentionSpec(
             block_size=block_size,
             num_kv_heads=self.num_kv_heads,

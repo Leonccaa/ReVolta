@@ -193,6 +193,52 @@ def test_sharded_draft_main_is_one_more_host_layer():
     assert 0 < gpu < layer_page
 
 
+@pytest.mark.parametrize(
+    ("target", "draft", "placement", "draft_on_host"),
+    [
+        ("float16", "float16", "host", True),
+        ("int8", "int8", "host", True),
+        ("fp8_per_token_head", "fp8_per_token_head", "host", True),
+        ("int8", "float16", "host", False),
+        ("int8", "int8", "gpu", False),
+    ],
+)
+def test_dcp1_draft_main_joins_host_only_with_matching_storage(
+    target, draft, placement, draft_on_host
+):
+    from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAAttention
+    from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+
+    config = mtp_config(
+        max_model_len=512 * 1024,
+        long_context=settings(draft_main_placement=placement),
+    )
+    config.model_config.original_max_model_len = config.model_config.max_model_len
+    config.parallel_config.decode_context_parallel_size = 1
+    config.cache_config.block_size = SPAN
+    specs = mtp_specs()
+    for name in [*TARGET_MAIN, DRAFT]:
+        dtype = draft if name == DRAFT else target
+        layer = SimpleNamespace(
+            layer_name=name,
+            num_kv_heads=1,
+            head_dim=256,
+            kv_cache_torch_dtype=STR_DTYPE_TO_TORCH_DTYPE[dtype],
+            kv_cache_dtype=dtype,
+        )
+        specs[name] = Qwen4ExpQSAAttention.get_kv_cache_spec(layer, config)
+
+    cfg, *_ = get_kv_cache_configs(config, [specs] * WORKERS, [GPU_BUDGET] * WORKERS)
+    expected = [*TARGET_MAIN, DRAFT] if draft_on_host else TARGET_MAIN
+    assert cfg.host_kv_layers == expected
+    assert any(DRAFT in tensor.shared_by for tensor in cfg.kv_cache_tensors) == (
+        not draft_on_host
+    )
+    assert host_region_layout(cfg, "dcp1").main_bytes == sum(
+        specs[name].page_size_bytes for name in expected
+    )
+
+
 @pytest.mark.parametrize("placement", ["gpu", "host"])
 def test_planar_mtp_main_carries_scales_in_existing_component(placement):
     specs = {

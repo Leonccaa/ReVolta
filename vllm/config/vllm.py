@@ -1983,12 +1983,12 @@ class VllmConfig:
             self.cache_config.cache_dtype_from_checkpoint = False
 
         from vllm.models.qwen4_exp.common.kv_policy import (
-            resolve_qsa_auto_e4m3,
+            resolve_qsa_auto_cache_dtype,
             resolve_qsa_int8_aliases,
         )
 
         resolve_qsa_int8_aliases(self)
-        if resolve_qsa_auto_e4m3(self):
+        if resolve_qsa_auto_cache_dtype(self):
             logger.info_once(
                 "Defaulting QSA main KV storage to %s; "
                 "activations and recurrent states retain their precision.",

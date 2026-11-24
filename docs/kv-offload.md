@@ -179,8 +179,7 @@ use a larger CPU pool and set `max_size_bytes` to your disk budget.
   2 GiB with MTP4 and about 5 GB with DFlash2). Otherwise the request is computed
   again. The quick-start 48 GiB pool holds about 2.4M tokens with MTP4; with DFlash2 the
   same pool holds about 1M tokens, an estimate from the same about 50 KB per token.
-- The SSD tier is **not supported with INT8 KV** yet. That combination is
-  rejected at configuration time.
+- For planar INT8, use the `revolta_fs` tier described below.
 
 Validation scope: the full release gate passed with the SSD tier on a network file
 system (8 GiB CPU pool, 40 GiB disk budget), including a 99K-token prefix restored from
@@ -198,12 +197,11 @@ slow the restart. See [Coming back to a document](performance.md#coming-back-to-
 filesystem tier meant to keep conversations reusable across engine restarts. Use
 `"type": "revolta_fs"` instead of `"fs"`; every `fs` key above still applies.
 
-L1 planar E4M3 is now named `fp8_per_token_head`; eligible QSA `auto` requests
-also select it. Its codec name and page layout isolate its SSD namespace from
-the old planar name and scalar E4M3, so those files miss rather than migrate.
-Explicit `fp8` / `fp8_e4m3` scalar identities remain unchanged. The readback
-measurements above describe the original scalar format; CPU checks of planar
-storage do not establish GPU/SSD release acceptance.
+Eligible QSA `auto` selects planar INT8 on SM70 and `fp8_per_token_head` on other
+supported CUDA devices. The `revolta_fs` tier persists the planar INT8 K/V scale
+planes with each page. Planar INT8, planar E4M3 and calibrated scalar E4M3 use
+separate SSD namespaces. Existing files under a different codec or page layout
+miss and are recomputed. The readback measurements above used scalar E4M3.
 
 The tier adds:
 

@@ -282,6 +282,21 @@ def test_planar_target_retains_other_mixed_dtype_rejections(method, draft_dtype)
         validate_speculative_kv_cache_dtype(config)
 
 
+def test_int8_target_with_planar_fp8_draft_explains_override():
+    from vllm.config.speculative_kv import validate_speculative_kv_cache_dtype
+
+    config = _config(FP8_E4M3_PER_TOKEN_HEAD.name)
+    config.cache_config.cache_dtype = "int8"
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"--kv-cache-dtype fp8_per_token_head.*"
+            r"remove speculative_config\.kv_cache_dtype"
+        ),
+    ):
+        validate_speculative_kv_cache_dtype(config)
+
+
 @pytest.mark.parametrize(
     "owner,field,value,reason",
     [

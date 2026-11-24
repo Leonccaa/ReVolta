@@ -784,14 +784,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def(
       "awq_moe_gemm_sm70_out(Tensor(a!) out, Tensor sorted_input, "
       "Tensor expert_offsets, Tensor strided_ptrs_w, Tensor strided_ptrs_s, "
-      "int num_experts, int k, int n, int group_size, bool gated_silu) -> ()");
+      "int num_experts, int k, int n, int group_size, bool gated_silu, "
+      "Tensor(b!)? int4_zero_workspace=None) -> ()");
   ops.impl("awq_moe_gemm_sm70_out", torch::kCUDA, &awq_moe_gemm_sm70_out);
 
   ops.def(
       "awq_moe_gemm_sm70_per_expert_dispatch_out("
       "Tensor(a!) out, Tensor sorted_input, Tensor expert_offsets, "
       "Tensor strided_ptrs_w, Tensor strided_ptrs_s, int num_experts, "
-      "int k, int n, int group_size, bool gated_silu) -> ()");
+      "int k, int n, int group_size, bool gated_silu, "
+      "Tensor(b!)? int4_zero_workspace=None) -> ()");
   ops.impl("awq_moe_gemm_sm70_per_expert_dispatch_out", torch::kCUDA,
            &awq_moe_gemm_sm70_per_expert_dispatch_out);
 
@@ -799,7 +801,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "awq_moe_dense_stage_sm70_out("
       "Tensor(a!) out, Tensor input, Tensor expert_offsets, "
       "Tensor dense_expert_ids, Tensor ptrs_w, Tensor ptrs_s, "
-      "int num_experts, int k, int n, int group_size) -> ()");
+      "int num_experts, int k, int n, int group_size, "
+      "Tensor(b!)? int4_zero_workspace=None) -> ()");
   ops.impl("awq_moe_dense_stage_sm70_out", torch::kCUDA,
            &awq_moe_dense_stage_sm70_out);
 
@@ -807,7 +810,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "awq_moe_indexed_dense_w13_sm70_out("
       "Tensor(a!) out, Tensor input, Tensor input_row_indices, "
       "Tensor expert_offsets, Tensor dense_expert_ids, Tensor ptrs_w, "
-      "Tensor ptrs_s, int num_experts, int k, int n, int group_size) -> ()");
+      "Tensor ptrs_s, int num_experts, int k, int n, int group_size, "
+      "Tensor(b!)? int4_zero_workspace=None) -> ()");
   ops.impl("awq_moe_indexed_dense_w13_sm70_out", torch::kCUDA,
            &awq_moe_indexed_dense_w13_sm70_out);
 
@@ -816,7 +820,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor(a!) out, Tensor input, Tensor permuted_experts_id, "
       "Tensor(b!) active_expert_offsets, Tensor(c!) active_expert_ids, Tensor "
       "ptrs_w, "
-      "Tensor ptrs_s, int total_slots, int k, int n, int group_size) -> ()");
+      "Tensor ptrs_s, int total_slots, int k, int n, int group_size, "
+      "Tensor(d!)? int4_zero_workspace=None) -> ()");
   ops.impl("awq_moe_active_dense_stage_sm70_out", torch::kCUDA,
            &awq_moe_active_dense_stage_sm70_out);
 
@@ -828,7 +833,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor(e!) chunk_range_end, Tensor(f!) chunk_a_indices, "
       "Tensor(g!) chunk_inv_permuted_idx, Tensor ptrs_w, Tensor ptrs_s, "
       "int num_tokens, int top_k, int num_experts, int k, int n, "
-      "int hidden_logical_size, int group_size, int chunk_tokens) -> ()");
+      "int hidden_logical_size, int group_size, int chunk_tokens, "
+      "Tensor(h!)? int4_zero_workspace=None) -> ()");
   ops.impl("awq_moe_chunked_w2_sm70_out", torch::kCUDA,
            &awq_moe_chunked_w2_sm70_out);
 
@@ -836,7 +842,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "awq_moe_single_token_dense_stage_sm70_out("
       "Tensor(a!) out, Tensor input, Tensor expert_offsets, "
       "Tensor sorted_expert_ids, Tensor ptrs_w, Tensor ptrs_s, int top_k, "
-      "int k, int n, int group_size) -> ()");
+      "int k, int n, int group_size, "
+      "Tensor(b!)? int4_zero_workspace=None) -> ()");
   ops.impl("awq_moe_single_token_dense_stage_sm70_out", torch::kCUDA,
            &awq_moe_single_token_dense_stage_sm70_out);
 
@@ -844,7 +851,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "awq_moe_single_token_indexed_dense_stage_sm70_out("
       "Tensor(a!) out, Tensor input, Tensor expert_offsets, "
       "Tensor sorted_expert_ids, Tensor ptrs_w, Tensor ptrs_s, int top_k, "
-      "int k, int n, int group_size) -> ()");
+      "int k, int n, int group_size, "
+      "Tensor(b!)? int4_zero_workspace=None) -> ()");
   ops.impl("awq_moe_single_token_indexed_dense_stage_sm70_out", torch::kCUDA,
            &awq_moe_single_token_indexed_dense_stage_sm70_out);
 
@@ -854,7 +862,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor topk_ids, Tensor w13_ptrs_w, Tensor w13_ptrs_s, "
       "Tensor(c!) expert_offsets, Tensor(d!) expert_offsets64, "
       "Tensor(e!) inv_permuted_idx, Tensor(f!) sorted_expert_ids, "
-      "int w13_k, int w13_n, int group_size, int hidden_logical_size) -> ()");
+      "int w13_k, int w13_n, int group_size, int hidden_logical_size, "
+      "Tensor(g!)? int4_zero_workspace=None) -> ()");
   ops.impl("awq_moe_single_token_dense_w13_sm70_out", torch::kCUDA,
            &awq_moe_single_token_dense_w13_sm70_out);
 
@@ -864,7 +873,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor topk_ids, Tensor w13_ptrs_w, Tensor w13_ptrs_s, "
       "Tensor(c!) expert_offsets, Tensor(d!) expert_offsets64, "
       "Tensor(e!) inv_permuted_idx, Tensor(f!) sorted_expert_ids, "
-      "int w13_k, int w13_n, int group_size, int hidden_logical_size) -> ()");
+      "int w13_k, int w13_n, int group_size, int hidden_logical_size, "
+      "Tensor(g!)? int4_zero_workspace=None) -> ()");
   ops.impl("awq_moe_single_token_indexed_dense_w13_sm70_out", torch::kCUDA,
            &awq_moe_single_token_indexed_dense_w13_sm70_out);
 
@@ -875,7 +885,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor(c!) compact_w13_ptrs_w, Tensor(d!) compact_w13_ptrs_s, "
       "Tensor(e!) expert_offsets, Tensor(f!) expert_offsets64, "
       "Tensor(g!) inv_permuted_idx, Tensor(h!) sorted_expert_ids, "
-      "int w13_k, int w13_n, int group_size, int hidden_logical_size) -> ()");
+      "int w13_k, int w13_n, int group_size, int hidden_logical_size, "
+      "Tensor(i!)? int4_zero_workspace=None) -> ()");
   ops.impl("awq_moe_single_token_compact_dense_w13_sm70_out", torch::kCUDA,
            &awq_moe_single_token_compact_dense_w13_sm70_out);
 
@@ -905,7 +916,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor(h!) dst_w2_ptrs_w_rows, Tensor(i!) dst_w2_ptrs_s_rows, "
       "Tensor(j!) expert_offsets, Tensor(k!) inv_permuted_idx, "
       "int w13_k, int w13_n, int w2_k, int w2_n, int group_size, "
-      "int hidden_logical_size) -> ()");
+      "int hidden_logical_size, "
+      "Tensor(l!)? int4_zero_workspace=None) -> ()");
   ops.impl("awq_moe_single_token_sm70_out", torch::kCUDA,
            &awq_moe_single_token_sm70_out);
 

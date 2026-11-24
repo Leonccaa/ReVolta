@@ -507,37 +507,37 @@ std::vector<torch::Tensor> awq_moe_build_strided_ptrs(torch::Tensor tm_weights,
                                                       int64_t q_ld,
                                                       int64_t num_experts);
 
-void awq_moe_gemm_sm70_out(torch::Tensor out, torch::Tensor sorted_input,
-                           torch::Tensor expert_offsets,
-                           torch::Tensor strided_ptrs_w,
-                           torch::Tensor strided_ptrs_s, int64_t num_experts,
-                           int64_t k, int64_t n, int64_t group_size,
-                           bool gated_silu);
+void awq_moe_gemm_sm70_out(
+    torch::Tensor out, torch::Tensor sorted_input, torch::Tensor expert_offsets,
+    torch::Tensor strided_ptrs_w, torch::Tensor strided_ptrs_s,
+    int64_t num_experts, int64_t k, int64_t n, int64_t group_size,
+    bool gated_silu, const std::optional<torch::Tensor>& int4_zero_workspace);
 
 void awq_moe_gemm_sm70_per_expert_dispatch_out(
     torch::Tensor out, torch::Tensor sorted_input, torch::Tensor expert_offsets,
     torch::Tensor strided_ptrs_w, torch::Tensor strided_ptrs_s,
     int64_t num_experts, int64_t k, int64_t n, int64_t group_size,
-    bool gated_silu);
+    bool gated_silu, const std::optional<torch::Tensor>& int4_zero_workspace);
 
-void awq_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
-                                  torch::Tensor expert_offsets,
-                                  torch::Tensor dense_expert_ids,
-                                  torch::Tensor ptrs_w, torch::Tensor ptrs_s,
-                                  int64_t num_experts, int64_t k, int64_t n,
-                                  int64_t group_size);
+void awq_moe_dense_stage_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor expert_offsets,
+    torch::Tensor dense_expert_ids, torch::Tensor ptrs_w, torch::Tensor ptrs_s,
+    int64_t num_experts, int64_t k, int64_t n, int64_t group_size,
+    const std::optional<torch::Tensor>& int4_zero_workspace);
 
 void awq_moe_indexed_dense_w13_sm70_out(
     torch::Tensor out, torch::Tensor input, torch::Tensor input_row_indices,
     torch::Tensor expert_offsets, torch::Tensor dense_expert_ids,
     torch::Tensor ptrs_w, torch::Tensor ptrs_s, int64_t num_experts, int64_t k,
-    int64_t n, int64_t group_size);
+    int64_t n, int64_t group_size,
+    const std::optional<torch::Tensor>& int4_zero_workspace);
 
 void awq_moe_active_dense_stage_sm70_out(
     torch::Tensor out, torch::Tensor input, torch::Tensor permuted_experts_id,
     torch::Tensor active_expert_offsets, torch::Tensor active_expert_ids,
     torch::Tensor ptrs_w, torch::Tensor ptrs_s, int64_t total_slots, int64_t k,
-    int64_t n, int64_t group_size);
+    int64_t n, int64_t group_size,
+    const std::optional<torch::Tensor>& int4_zero_workspace);
 
 void awq_moe_chunked_w2_sm70_out(
     torch::Tensor out, torch::Tensor chunk_output, torch::Tensor input,
@@ -547,17 +547,20 @@ void awq_moe_chunked_w2_sm70_out(
     torch::Tensor chunk_a_indices, torch::Tensor chunk_inv_permuted_idx,
     torch::Tensor ptrs_w, torch::Tensor ptrs_s, int64_t num_tokens,
     int64_t top_k, int64_t num_experts, int64_t k, int64_t n,
-    int64_t hidden_logical_size, int64_t group_size, int64_t chunk_tokens);
+    int64_t hidden_logical_size, int64_t group_size, int64_t chunk_tokens,
+    const std::optional<torch::Tensor>& int4_zero_workspace);
 
 void awq_moe_single_token_dense_stage_sm70_out(
     torch::Tensor out, torch::Tensor input, torch::Tensor expert_offsets,
     torch::Tensor sorted_expert_ids, torch::Tensor ptrs_w, torch::Tensor ptrs_s,
-    int64_t top_k, int64_t k, int64_t n, int64_t group_size);
+    int64_t top_k, int64_t k, int64_t n, int64_t group_size,
+    const std::optional<torch::Tensor>& int4_zero_workspace);
 
 void awq_moe_single_token_indexed_dense_stage_sm70_out(
     torch::Tensor out, torch::Tensor input, torch::Tensor expert_offsets,
     torch::Tensor sorted_expert_ids, torch::Tensor ptrs_w, torch::Tensor ptrs_s,
-    int64_t top_k, int64_t k, int64_t n, int64_t group_size);
+    int64_t top_k, int64_t k, int64_t n, int64_t group_size,
+    const std::optional<torch::Tensor>& int4_zero_workspace);
 
 void awq_moe_single_token_dense_w13_sm70_out(
     torch::Tensor gate_up, torch::Tensor compact_input, torch::Tensor x,
@@ -565,7 +568,8 @@ void awq_moe_single_token_dense_w13_sm70_out(
     torch::Tensor expert_offsets, torch::Tensor expert_offsets64,
     torch::Tensor inv_permuted_idx, torch::Tensor sorted_expert_ids,
     int64_t w13_k, int64_t w13_n, int64_t group_size,
-    int64_t hidden_logical_size);
+    int64_t hidden_logical_size,
+    const std::optional<torch::Tensor>& int4_zero_workspace);
 
 void awq_moe_single_token_indexed_dense_w13_sm70_out(
     torch::Tensor gate_up, torch::Tensor compact_input, torch::Tensor x,
@@ -573,7 +577,8 @@ void awq_moe_single_token_indexed_dense_w13_sm70_out(
     torch::Tensor expert_offsets, torch::Tensor expert_offsets64,
     torch::Tensor inv_permuted_idx, torch::Tensor sorted_expert_ids,
     int64_t w13_k, int64_t w13_n, int64_t group_size,
-    int64_t hidden_logical_size);
+    int64_t hidden_logical_size,
+    const std::optional<torch::Tensor>& int4_zero_workspace);
 
 void awq_moe_single_token_compact_dense_w13_sm70_out(
     torch::Tensor gate_up, torch::Tensor compact_input, torch::Tensor x,
@@ -582,7 +587,8 @@ void awq_moe_single_token_compact_dense_w13_sm70_out(
     torch::Tensor expert_offsets, torch::Tensor expert_offsets64,
     torch::Tensor inv_permuted_idx, torch::Tensor sorted_expert_ids,
     int64_t w13_k, int64_t w13_n, int64_t group_size,
-    int64_t hidden_logical_size);
+    int64_t hidden_logical_size,
+    const std::optional<torch::Tensor>& int4_zero_workspace);
 
 void awq_moe_single_token_exact_layout_prepare(
     torch::Tensor topk_ids, torch::Tensor x, torch::Tensor compact_input,
@@ -605,7 +611,8 @@ void awq_moe_single_token_sm70_out(
     torch::Tensor dst_w13_ptrs_s_rows, torch::Tensor dst_w2_ptrs_w_rows,
     torch::Tensor dst_w2_ptrs_s_rows, torch::Tensor expert_offsets,
     torch::Tensor inv_permuted_idx, int64_t w13_k, int64_t w13_n, int64_t w2_k,
-    int64_t w2_n, int64_t group_size, int64_t hidden_logical_size);
+    int64_t w2_n, int64_t group_size, int64_t hidden_logical_size,
+    const std::optional<torch::Tensor>& int4_zero_workspace);
 
 void awq_moe_qpn_m1_sm70_out(torch::Tensor out, torch::Tensor intermediate,
                              const torch::Tensor& input,

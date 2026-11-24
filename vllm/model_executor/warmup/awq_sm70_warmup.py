@@ -20,6 +20,7 @@ from vllm.model_executor.layers.quantization.awq_sm70_moe import (
     _QWEN38_GROUPED_DECODE20_MIN_TOKENS,
     _QWEN38_GROUPED_QPN_MAX_TOKENS,
     _QWEN38_GROUPED_QPN_MIN_TOKENS,
+    _get_int4_zero_workspace,
     _use_qwen38_active_grouped_decode,
     _use_qwen38_grouped_decode20,
 )
@@ -728,6 +729,7 @@ def _warmup_moe_dense_stage_layers(
 
     calls = 0
     for layer in moe_layers:
+        expansion_workspace = _get_int4_zero_workspace(layer)
         device = layer.w13_tm_scales.device
         top_k = int(layer._awq_moe_buf_top_k)
         num_experts = int(layer.sm70_num_experts)
@@ -822,6 +824,7 @@ def _warmup_moe_dense_stage_layers(
                         n,
                         group_size,
                         False,
+                        expansion_workspace,
                     )
                 calls += 2
                 continue
@@ -835,6 +838,7 @@ def _warmup_moe_dense_stage_layers(
                 int(layer.sm70_w13_k_dim),
                 int(layer.sm70_w13_n_dim),
                 group_size,
+                expansion_workspace,
             )
             _silu_and_mul_w13(layer, intermediate, gate_up)
             stage_op(
@@ -847,6 +851,7 @@ def _warmup_moe_dense_stage_layers(
                 int(layer.sm70_w2_k_dim),
                 int(layer.sm70_w2_n_dim),
                 group_size,
+                expansion_workspace,
             )
             calls += 2
     calls += _warmup_moe_grouped_qpn(moe_layers)
@@ -1124,6 +1129,7 @@ def _warmup_moe_single_token_layers(moe_layers: list[torch.nn.Module]) -> int:
 
     calls = 0
     for layer in moe_layers:
+        expansion_workspace = _get_int4_zero_workspace(layer)
         device = layer.w13_tm_scales.device
         top_k = int(layer._awq_moe_buf_top_k)
         num_experts = int(layer.sm70_num_experts)
@@ -1177,6 +1183,7 @@ def _warmup_moe_single_token_layers(moe_layers: list[torch.nn.Module]) -> int:
             int(layer.sm70_w13_n_dim),
             group_size,
             hidden_size,
+            expansion_workspace,
         )
         _silu_and_mul_w13(layer, intermediate, gate_up)
         sm70_ops.awq_moe_single_token_dense_stage_sm70_out(
@@ -1190,6 +1197,7 @@ def _warmup_moe_single_token_layers(moe_layers: list[torch.nn.Module]) -> int:
             int(layer.sm70_w2_k_dim),
             int(layer.sm70_w2_n_dim),
             group_size,
+            expansion_workspace,
         )
         calls += 2
 
@@ -1245,6 +1253,7 @@ def _warmup_moe_single_token_layers(moe_layers: list[torch.nn.Module]) -> int:
                 int(layer.sm70_w2_n_dim),
                 group_size,
                 hidden_size,
+                expansion_workspace,
             )
             calls += 1
     return calls

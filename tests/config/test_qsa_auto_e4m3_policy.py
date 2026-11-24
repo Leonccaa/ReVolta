@@ -11,7 +11,10 @@ import torch
 from safetensors.torch import save_file
 
 from vllm.config import KernelConfig
-from vllm.models.qwen4_exp.common.kv_policy import resolve_qsa_auto_e4m3
+from vllm.models.qwen4_exp.common.kv_policy import (
+    resolve_qsa_auto_e4m3,
+    resolve_qsa_int8_aliases,
+)
 from vllm.models.qwen4_exp.nvidia.ops import qsa
 from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD
 
@@ -32,6 +35,10 @@ def _checkpoint(tmp_path, scales=None):
         dtype=torch.float16,
         hf_text_config=SimpleNamespace(
             indexer_n_heads=3,
+            indexer_kv_heads=1,
+            indexer_head_dim=128,
+            indexer_budget=512,
+            indexer_compress_ratio=4,
             layer_types=["full_attention", "linear_attention", "full_attention"],
         ),
     )
@@ -51,6 +58,27 @@ def _config(model):
             prefill_context_parallel_size=1, tensor_parallel_size=1
         ),
     )
+
+
+@pytest.mark.parametrize("target_dtype", ["int8", "int8_per_token_head"])
+@pytest.mark.parametrize("draft_dtype", [None, "int8", "int8_per_token_head"])
+def test_qsa_int8_spellings_share_the_internal_format(
+    tmp_path, target_dtype, draft_dtype
+):
+    cfg = _config(_checkpoint(tmp_path))
+    cfg.cache_config.cache_dtype = target_dtype
+    cfg.speculative_config = SimpleNamespace(method="mtp", kv_cache_dtype=draft_dtype)
+    resolve_qsa_int8_aliases(cfg)
+    assert cfg.cache_config.cache_dtype == "int8"
+    assert cfg.speculative_config.kv_cache_dtype == (draft_dtype and "int8")
+
+
+def test_non_qsa_int8_per_token_head_retains_its_format(tmp_path):
+    cfg = _config(_checkpoint(tmp_path))
+    cfg.model_config.hf_text_config = SimpleNamespace()
+    cfg.cache_config.cache_dtype = "int8_per_token_head"
+    resolve_qsa_int8_aliases(cfg)
+    assert cfg.cache_config.cache_dtype == "int8_per_token_head"
 
 
 @pytest.mark.parametrize("tp", [1, 2, 4, 8])

@@ -270,7 +270,10 @@ class SpeculativeConfig:
     kv_cache_dtype: CacheDType | None = None
     """KV cache dtype for the draft model. When ``None``, the draft inherits
     the target cache dtype, except for SM70 DFlash with a quantized target,
-    which is resolved to ``auto`` during draft model loading."""
+    which is resolved to ``auto`` during draft model loading. Qwen4Exp QSA
+    MTP accepts ``int8_per_token_head`` and ``int8`` for the same planar
+    INT8 cache with round-to-nearest-even and FP32 scales per token and head.
+    """
     max_model_len: int | None = Field(default=None, ge=1)
     """The maximum model length of the draft model. Used when testing the
     ability to skip speculation for some sequences."""

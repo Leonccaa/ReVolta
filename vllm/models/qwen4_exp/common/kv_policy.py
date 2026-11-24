@@ -2,7 +2,32 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """QSA cache format selection without loading model weights."""
 
-from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD
+from vllm.revolta_profile import has_qsa_capability
+from vllm.v1.attention.kv_codecs import (
+    FP8_E4M3_PER_TOKEN_HEAD,
+    INT8,
+    INT8_PER_TOKEN_HEAD,
+)
+
+
+def resolve_qsa_int8_aliases(cfg) -> None:
+    """QSA uses the same planar RNE codec for int8_per_token_head and int8.
+
+    Normalize before cache planning so both spellings share the existing INT8
+    page layout, kernels and cache identity. Other backends resolve their own
+    per-token-head layout.
+    """
+    if not has_qsa_capability(cfg.model_config):
+        return
+    if cfg.cache_config.cache_dtype == INT8_PER_TOKEN_HEAD.name:
+        cfg.cache_config.cache_dtype = INT8.name
+    spec = cfg.speculative_config
+    if (
+        spec is not None
+        and spec.method == "mtp"
+        and spec.kv_cache_dtype == INT8_PER_TOKEN_HEAD.name
+    ):
+        spec.kv_cache_dtype = INT8.name
 
 
 def resolve_qsa_auto_e4m3(cfg) -> bool:

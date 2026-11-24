@@ -36,7 +36,6 @@ def test_junction_without_state_handoff_is_not_admitted():
     request.shared_prefix_boundary = 4 * SPAN
     status = connector._req_status[request.request_id]
     assert not status.pending_boundary_offloads
-
     out = SchedulerOutput(
         scheduled_new_reqs=[],
         scheduled_cached_reqs=CachedRequestData.make_empty(),
@@ -131,7 +130,6 @@ def test_inventory_matches_current_dispatch_sources(source):
         ],
         scheduled_cached_reqs=CachedRequestData.make_empty(),
     )
-
     connector._prepare_unified_boundaries(out)
     expected = source in ("ready", "exact", "draft", "draft_shared")
     assert bool(m.units.units) == expected

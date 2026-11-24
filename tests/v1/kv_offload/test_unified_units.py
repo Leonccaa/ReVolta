@@ -183,7 +183,7 @@ def test_existing_owner_cost_zero_and_foreground_reserve_protected():
     assert_conserved(m)
 
 
-def test_boundary_build_releases_pins_on_capacity_failure(monkeypatch):
+def test_boundary_build_releases_pins_on_capacity_failure():
     m = manager(pages=4)
     keys = [key(1, 1), key(1, 2)]
     resident = publish(m.table, keys[0], PageKind.STATE)
@@ -195,12 +195,6 @@ def test_boundary_build_releases_pins_on_capacity_failure(monkeypatch):
     assert not m.pending and not m.builds and not m.units.units
 
     m.table.committed_reserve = lambda: 1
-    with monkeypatch.context() as patch:
-        patch.setattr(m.table, "reserve", lambda **kwargs: None)
-        assert m.begin_boundary("r", sha256(1), keys) is None
-    assert m.table.reclaimable(m.table.get(resident))
-    assert not m.pending and not m.builds and not m.units.units
-
     b = complete_boundary(m, 1, keys)
     assert b.handles[keys[0]] == resident
     assert m.table.net_headroom() == 2
@@ -719,23 +713,6 @@ def test_partial_state_demotion_refreshes_chain_only_on_value_class_change():
     m.units.demote([states[1]], False)
     assert m.table.get(h).revision == revision
     m.table.release(h, 99)
-    assert_conserved(m)
-
-
-def test_new_boundary_is_independent_of_cancelled_requests_dma():
-    m = manager()
-    old = m.begin_boundary("r", sha256(1), [key(1, 1), key(1, 2)])
-    out = m.prepare_store(old.handles, ReqContext("r"))
-    m.bind_job(1, "r", out.store_spec, True)
-    m.cancel_request("r")
-    fresh = m.begin_boundary("r", sha256(2), [key(2, 1), key(2, 2)])
-    assert set(old.handles.values()).isdisjoint(fresh.handles.values())
-    assert all(m.table.get(h).io for h in old.handles.values())
-    m.receipt(1, out.store_spec.gen, m.table.all_ranks, 0)
-    assert all(id(fresh) in m.table.get(h).leases for h in fresh.handles.values())
-    store(m, fresh.handles, job=2)
-    assert m.units.units[fresh.uid].complete
-    assert old.uid not in m.units.units
     assert_conserved(m)
 
 

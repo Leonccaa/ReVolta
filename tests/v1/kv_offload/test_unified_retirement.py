@@ -50,7 +50,6 @@ def test_inflight_cpu_receive_is_excluded_from_writable_wait(tmp_path):
 
 def pending_variant(m, *, ahead=1):
     keys = [key(1, g) for g in m.kind_by_group if g != 8]
-
     b = m.begin_boundary("r", sha256(1), keys)
     assert b is not None
     publish(m.table, key(1))
@@ -132,7 +131,6 @@ def test_build_failure_reason_counted_once(reason):
     elif reason == "source_not_dispatched":
         # One additional component was accepted but never handed to a job.
         extra = [key(2, g) for g in m.kind_by_group]
-
         other = m.begin_boundary("other", sha256(2), extra)
         m.end_step()
         assert other is not None
@@ -250,7 +248,6 @@ def test_draining_registration_metadata_stays_bounded():
     m = manager(pages=512)
     for n in range(40):
         keys = [key(n, g) for g in m.kind_by_group]
-
         b = m.begin_boundary("r", sha256(n), keys)
         publish(m.table, key(n))
         m.offer_variant("r", VariantOffer(b.uid, b.gen, sha256(n), (key(n),)))

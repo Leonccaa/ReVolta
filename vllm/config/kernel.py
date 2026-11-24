@@ -410,8 +410,9 @@ class LongContextKVConfig:
     """Archive superseded checkpoints on SSD before releasing their RAM."""
     host_store_gib: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     """Unified host budget across MAIN, STATE and DRAFT, summed over workers.
-    Includes ZERO_PAGE and build reservations. Mutually exclusive with the
-    legacy host_pool_gib/host_pool_tokens and connector cpu_bytes_to_use."""
+    Includes ZERO_PAGE and frames held by active checkpoint builds. Mutually
+    exclusive with legacy host_pool_gib/host_pool_tokens and connector
+    cpu_bytes_to_use."""
     host_pool_gib: float | None = Field(default=None, gt=0)
     """Host history pool for the main QSA K/V, in GiB summed over all workers
     (like ``kv_offloading_size``). Exactly one of this and

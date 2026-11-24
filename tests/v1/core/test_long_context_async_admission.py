@@ -56,11 +56,10 @@ def scheduler(
         kv_connector_extra_config={"matched_tokens": matched, "is_async": matched > 0},
     )
     s.connector = HybridMockConnector(cfg, KVConnectorRole.SCHEDULER, s.kv_cache_config)
-    # Replacing the real connector also removes its host build reservation.
+    # Detach the real connector's host allocator and value policy.
     pool = s.host_history_pool
     if pool is not None and pool.host_pages.reservation_ledger is not None:
         table = pool.host_pages
-
         table.reservation_ledger = None
         table.value_policy = None
     return s
@@ -123,11 +122,10 @@ def test_dflash_load_fits_minimal_state_pool(full_isl):
         kv_connector_extra_config={"matched_tokens": 5 * SPAN, "is_async": True},
     )
     s.connector = HybridMockConnector(cfg, KVConnectorRole.SCHEDULER, s.kv_cache_config)
-    # Replacing the real connector also removes its host build reservation.
+    # Detach the real connector's host allocator and value policy.
     pool = s.host_history_pool
     if pool is not None and pool.host_pages.reservation_ledger is not None:
         table = pool.host_pages
-
         table.reservation_ledger = None
         table.value_policy = None
     assert not s.kv_cache_manager.admission_ledger.plan.startup_problems()

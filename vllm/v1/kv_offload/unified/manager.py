@@ -271,10 +271,6 @@ class UnifiedStoreManager(OffloadingManager):
             if h is not None and self.table.reclaimable(self.table.get(h))
         }
         already_owned = {h for h in handles.values() if h is not None} - protected
-        cost = len(new) + len(protected)
-        if self.table.net_headroom() < cost:
-            self.ledger.events["reserve_rejected_build"] += 1
-            return None
         marker = id(handles)
         for h in (*protected, *already_owned):
             self.table.pin(h, marker)

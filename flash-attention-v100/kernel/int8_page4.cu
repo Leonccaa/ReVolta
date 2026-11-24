@@ -21,9 +21,9 @@ constexpr int kThreadsPerBlock = 256;
 constexpr int kWarpsPerBlock = kThreadsPerBlock / kWarpSize;
 constexpr int kXQATCBlockN = 128;
 constexpr int kXQATCStride = 128;
-// QSA exposes selected four-token microblocks as virtual paged KV. Keep enough
-// page slots for one full XQA tile at that minimum supported granularity.
-constexpr int kXQATCPageIdsCapacity = kXQATCBlockN / 4;
+// The page4 decoder stages the entire partition before processing its tiles.
+constexpr int kXQAG6Page4PartitionTokens = 256;
+constexpr int kXQATCPageIdsCapacity = kXQAG6Page4PartitionTokens / 4;
 constexpr int kXQATC256WideWarpCount = 8;
 constexpr int kXQATC256WideThreads = kXQATC256WideWarpCount * kWarpSize;
 constexpr int kXQATC256WideBlockM = 8;

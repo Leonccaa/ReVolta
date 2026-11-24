@@ -31,6 +31,12 @@ class AsyncScheduler(Scheduler):
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         super()._update_after_schedule(scheduler_output)
         spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
+        # With DP, the worker skips drafting only if every rank agrees.
+        if (
+            scheduler_output.skip_drafts
+            and self.parallel_config.data_parallel_size == 1
+        ):
+            scheduler_output.num_spec_tokens_to_schedule = 0
         next_num_spec_tokens = scheduler_output.num_spec_tokens_to_schedule
         spec_token_placeholders = self._spec_token_placeholders[:next_num_spec_tokens]
         for req_id in scheduler_output.num_scheduled_tokens:

@@ -1034,6 +1034,37 @@ def test_async_gdn_replay_observes_unsettled_drafts_at_normal_stop(monkeypatch):
 
 
 @pytest.mark.parametrize("d", [4, 7], ids=["mtp4", "dflash2"])
+def test_async_r1_does_not_verify_drafts_from_a_skipped_proposal(monkeypatch, d):
+    from tests.v1.core.test_long_context_admission import make_requests
+
+    scheduler = _r1_scheduler(
+        monkeypatch, d, 2, async_scheduling=True, native_replay=True
+    )
+    [request] = make_requests(1, STATE_BLOCK - 16, d + 4)
+    req_id = request.request_id
+    scheduler.add_request(request)
+    _r1_sample(scheduler, scheduler.schedule())
+
+    older = scheduler.schedule()
+    assert len(older.scheduled_spec_decode_tokens[req_id]) == d
+    assert not older.skip_drafts
+    # The older frame's output placeholders leave only two output tokens.
+    skipped = scheduler.schedule()
+    assert skipped.num_scheduled_tokens == {req_id: 1}
+    assert skipped.skip_drafts
+
+    # Rejecting all older drafts restores budget, but the skipped proposal was
+    # empty. Only the target token needs to be verified in the next frame.
+    _r1_sample(scheduler, older, "none")
+    following = scheduler.schedule()
+    assert len(following.scheduled_spec_decode_tokens.get(req_id, ())) == 0
+    assert following.num_scheduled_tokens == {req_id: 1}
+    assert skipped.num_spec_tokens_to_schedule == 0
+    assert following.num_spec_tokens_to_schedule == d
+    assert not following.skip_drafts
+
+
+@pytest.mark.parametrize("d", [4, 7], ids=["mtp4", "dflash2"])
 @pytest.mark.parametrize("remaining", [1, 2, "K", "K+1", "d", "d+1"])
 @pytest.mark.parametrize("acceptance", ["all", "some", "none"])
 def test_r1_caps_verification_and_consumes_exact_end(

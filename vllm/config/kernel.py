@@ -691,6 +691,16 @@ class KernelConfig:
     """Use the v154 packed GDN inputs for physical M3/M4 during SM70 target
     FULL graph capture. Other rows keep their existing path."""
 
+    sm70_gdn_input_skinny_k4: bool = False
+    """Use four K warps in the SM70 row-major FP16 GDN input projection.
+
+    Uses the original weights without a workspace. The changed FP32
+    accumulation order is not bitwise equivalent to the default. On four
+    PCIe V100s at fixed K3, warm 32K C1 took 1.23% less time per round and
+    short C2 saved 0.096 ms at the paired median. The packed path retains
+    its existing precedence.
+    """
+
     qsa_dcp_index_shard: bool = False
     """Shard the target QSA compressed indexer keys over the DCP group.
 
@@ -829,6 +839,8 @@ class KernelConfig:
             ignored_factors.add("sm70_qsa_fused_topk")
         if not self.sm70_qsa_paged_fp16_h6:
             ignored_factors.add("sm70_qsa_paged_fp16_h6")
+        if not self.sm70_gdn_input_skinny_k4:
+            ignored_factors.add("sm70_gdn_input_skinny_k4")
         if not self.sm70_skinny_moe_applicable:
             ignored_factors.add("sm70_skinny_moe")
         if not self.sm70_dflash2_fp16_m8:

@@ -2373,6 +2373,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.key_dim = self.head_k_dim * self.num_k_heads
         self.value_dim = self.head_v_dim * self.num_v_heads
         self.gqa_interleaved_layout = gqa_interleaved_layout
+        self.sm70_gdn_input_skinny_k4 = (
+            vllm_config.kernel_config.sm70_gdn_input_skinny_k4
+        )
         if current_platform.is_xpu():
             self._forward_method = self.forward_xpu
         elif current_platform.is_cpu():
@@ -4379,6 +4382,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 getattr(self.in_proj_qkvz, "_sm70_qwen38_gdn_packed", None),
                 getattr(self.in_proj_ba, "_sm70_qwen38_gdn_packed", None),
                 getattr(self.in_proj_qkvz, "_sm70_qwen38_gdn_input_v154", False),
+                self.sm70_gdn_input_skinny_k4,
             )
             z = z.reshape(z.size(0), -1, self.head_v_dim)
         else:

@@ -5021,10 +5021,6 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         )
         super().__init__(*args, **kwargs)
         self.kv_cache_dtype = _normalize_flash_v100_kv_cache_dtype(self.kv_cache_dtype)
-        if self.kv_cache_dtype == "int8":
-            from vllm.models.qwen4_exp.nvidia.ops.qsa_int8 import require_int8_abi
-
-            require_int8_abi()
         _log_kv_dtype_contract(self.kv_cache_dtype)
         (
             self.flash_attn_func,

@@ -273,10 +273,10 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             raise NotImplementedError(
                 "Qwen4Exp QSA requires FP16/BF16 or E4M3 main KV cache"
             )
-        if self.kv_cache_dtype == "int8":
-            from .ops.qsa_int8 import require_int8_abi
+        if self.kv_cache_dtype in ("int8", FP8_E4M3_PER_TOKEN_HEAD.name):
+            from .ops.qsa_int8 import require_row_scaled_page4_abi
 
-            require_int8_abi()
+            require_row_scaled_page4_abi()
         self.supports_quant_query_input = False
 
     def forward_qsa(

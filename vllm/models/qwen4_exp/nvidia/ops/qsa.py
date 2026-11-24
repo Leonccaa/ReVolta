@@ -102,8 +102,7 @@ _SM70_QSA_XQA_PAGE4_WORKSPACES: dict[
     tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
 ] = {}
 _SM70_QSA_GROUPED_PAGE4_SCRATCH: dict[
-    tuple[torch.device, int, int, torch.dtype, torch.dtype],
-    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    tuple[torch.device, int, torch.dtype], tuple[torch.Tensor, torch.Tensor]
 ] = {}
 _SM70_QSA_GROUPED_PAGE4_WORKSPACES: dict[
     tuple[int, int],
@@ -2845,9 +2844,14 @@ def _qsa_grouped_page4_workspace(
 
 def _qsa_grouped_page4_scratch(
     q: torch.Tensor, rows: int, output_dtype: torch.dtype
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # During capture, let the graph pool own these addresses. A later warmup
+    # on the shared capture stream can grow and replace the eager allocation.
+    if torch.cuda.is_current_stream_capturing():
+        shape = (rows, 6, q.shape[2])
+        return q.new_empty(shape), q.new_empty(shape, dtype=output_dtype)
     stream = int(torch.cuda.current_stream(q.device).cuda_stream)
-    key = (q.device, stream, q.shape[2], q.dtype, output_dtype)
+    key = (q.device, stream, output_dtype)
     scratch = _SM70_QSA_GROUPED_PAGE4_SCRATCH.get(key)
     if scratch is None or scratch[0].shape[0] < rows:
         capacity = 1 << (rows - 1).bit_length()
@@ -2855,19 +2859,10 @@ def _qsa_grouped_page4_scratch(
         scratch = (
             torch.empty(shape, device=q.device, dtype=q.dtype),
             torch.empty(shape, device=q.device, dtype=output_dtype),
-            torch.empty((capacity, 2051), device=q.device, dtype=torch.int32),
-            torch.empty((capacity,), device=q.device, dtype=torch.int32),
-            torch.empty((capacity,), device=q.device, dtype=torch.int64),
         )
         _SM70_QSA_GROUPED_PAGE4_SCRATCH[key] = scratch
-    query, output, indices, requests, positions = scratch
-    return (
-        query[:rows],
-        output[:rows],
-        indices[:rows],
-        requests[:rows],
-        positions[:rows],
-    )
+    query, output = scratch
+    return query[:rows], output[:rows]
 
 
 def _qsa_xqa_page4_physical_kv(

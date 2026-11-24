@@ -272,16 +272,28 @@ def test_reject_invalid_scale_planes(kind):
         reader.validate_planes(q, v.key, v.value, sk, v.value_scale)
 
 
-def test_fail_closed_native_abi(monkeypatch):
+@pytest.mark.parametrize("cache_dtype", ["int8", "fp8_per_token_head"])
+def test_qsa_per_vector_requires_native_page4_abi(cache_dtype, monkeypatch):
     import sys
 
+    from vllm.models.qwen4_exp.nvidia import qsa
+
+    def init(self):
+        self.kv_cache_dtype = cache_dtype
+        self.dcp_world_size = 1
+
+    monkeypatch.setattr(qsa.FlashAttentionImpl, "__init__", init)
+    monkeypatch.setattr(qsa, "is_flash_attn_varlen_func_available", lambda: True)
+    native = SimpleNamespace(int8_page4_abi_version=lambda: 1)
     monkeypatch.setitem(
         sys.modules,
         "flash_attn_v100.flash_attn_interface",
-        SimpleNamespace(flash_attn_v100_cuda=SimpleNamespace()),
+        SimpleNamespace(flash_attn_v100_cuda=native),
     )
     with pytest.raises(RuntimeError, match="ABI v2"):
-        reader.require_int8_abi()
+        qsa.Qwen4ExpQSAFlashAttentionImpl()
+    native.int8_page4_abi_version = lambda: 2
+    qsa.Qwen4ExpQSAFlashAttentionImpl()
 
 
 @pytest.mark.parametrize("rows", [1, 5, 8, 17, 20, 40])

@@ -337,25 +337,14 @@ def _int8_merge_kernel(
     )
 
 
-def require_int8_abi():
-    """Reject an incomplete installation before admitting a serving backend."""
+def require_row_scaled_page4_abi() -> None:
+    """Require the Flash-V100 page4 ABI for both per-vector KV payloads."""
     from flash_attn_v100.flash_attn_interface import flash_attn_v100_cuda as native
 
-    version = getattr(native, "int8_page4_abi_version", None)
-    if not callable(version) or version() != 2:
+    if native.int8_page4_abi_version() != 2:
         raise RuntimeError(
-            "INT8 KV requires Flash-V100 page4 ABI v2; rebuild the wheel"
+            "Per-vector QSA KV requires Flash-V100 page4 ABI v2; rebuild the wheel"
         )
-    for name in (
-        "decode_int8_page4_fwd",
-        "grouped_sparse_int8_page4_fwd",
-        "grouped_sparse_page4_plan_fwd",
-    ):
-        if not callable(getattr(native, name, None)):
-            raise RuntimeError(f"INT8 KV native reader missing: {name}")
-    if not hasattr(torch.ops._C_cache_ops, "reshape_and_cache_flash_int8"):
-        raise RuntimeError("INT8 KV native writer ABI missing; rebuild the vLLM wheel")
-    return native
 
 
 def validate_planes(q, k, v, sk, sv, codec=INT8):
@@ -490,7 +479,6 @@ def triton_attention(
         CAUSAL=causal,
         SKIP_EMPTY_SPLITS=(
             compacted_indices
-            and not dense
             and rows <= 48
             and current_platform.is_device_capability(70)
         ),
@@ -582,15 +570,16 @@ def native_grouped(
     mapping = validate_planes(q, k, v, sk, sv, codec)
     rows = q.shape[0]
     padded = triton.cdiv(rows, 8) * 8
-    slice_query, slice_out, ip, rp, pp = _qsa_grouped_page4_scratch(
-        q, padded, out.dtype
-    )
+    slice_query, slice_out = _qsa_grouped_page4_scratch(q, padded, out.dtype)
     if padded != rows:
         slice_query[rows:].zero_()
+        ip = indices.new_empty((padded, indices.shape[1]))
         ip[rows:].fill_(-1)
         ip[:rows].copy_(indices)
+        rp = requests.new_empty((padded,))
         rp[rows:].fill_(-1)
         rp[:rows].copy_(requests)
+        pp = positions.new_empty((padded,))
         pp[rows:].fill_(-1)
         pp[:rows].copy_(positions)
     else:
@@ -657,7 +646,6 @@ def sparse_attention(
 ):
     from .qsa import _qsa_output_gate
 
-    validate_planes(q, k, v, sk, sv, codec)
     if out is None:
         out = torch.empty_like(q)
     if q.shape[0] == 0:

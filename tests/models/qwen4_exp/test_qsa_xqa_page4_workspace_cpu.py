@@ -21,6 +21,7 @@ def workspace_cache(monkeypatch):
     monkeypatch.setattr(
         torch.cuda, "current_stream", lambda device: SimpleNamespace(cuda_stream=123)
     )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(ops, "_SM70_QSA_GROUPED_PAGE4_SCRATCH", {})
     yield
     ops._SM70_QSA_XQA_PAGE4_WORKSPACES.clear()
@@ -83,7 +84,7 @@ def test_grouped_scratch_reuses_buffers_and_separates_output_dtypes():
     query = _query(16)
     first = ops._qsa_grouped_page4_scratch(query, 16, torch.float32)
     second = ops._qsa_grouped_page4_scratch(query, 8, torch.float32)
-    assert [t.shape[0] for t in second] == [8] * 5
+    assert [t.shape[0] for t in second] == [8, 8]
     assert [t.data_ptr() for t in first] == [t.data_ptr() for t in second]
     different = ops._qsa_grouped_page4_scratch(query, 8, torch.float16)
     assert different[1].dtype == torch.float16

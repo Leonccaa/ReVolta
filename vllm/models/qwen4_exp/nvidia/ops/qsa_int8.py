@@ -6,6 +6,7 @@ import math
 
 import torch
 
+from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.common.ops.fp8_software import (
     fp8_e4m3fn_bits_to_fp32_bitcast,
 )
@@ -660,7 +661,10 @@ def sparse_attention(
         and seq_lens is not None
     )
     if native_shape and lse is None:
-        if q.shape[0] < 8 and q.shape[1] == 6:
+        if q.shape[1] == 6 and (
+            q.shape[0] < 8
+            or get_forward_context().additional_kwargs.get("sm70_qsa_draft_decode")
+        ):
             native_decode(
                 q,
                 k,

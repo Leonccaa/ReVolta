@@ -63,13 +63,19 @@ def test_workspace_cache_separates_streams(monkeypatch):
     assert first.data_ptr() != second.data_ptr()
 
 
-def test_workspace_grows_without_reusing_an_undersized_allocation():
-    small = ops._qsa_xqa_page4_workspace(_query(), 8, torch.float32)[0]
-    large = ops._qsa_xqa_page4_workspace(_query(7), 8, torch.float32)[0]
-    assert large.shape == (7, 6, 8, 256)
-    assert large.data_ptr() != small.data_ptr()
-    again = ops._qsa_xqa_page4_workspace(_query(5), 8, torch.float32)[0]
-    assert again.data_ptr() == large.data_ptr()
+def test_workspace_reserves_capture_width_and_keeps_its_address():
+    from vllm.forward_context import ForwardContext, override_forward_context
+
+    context = ForwardContext({}, {}, {}, max_cudagraph_capture_size=40)
+    with override_forward_context(context):
+        target = ops._qsa_xqa_page4_workspace(_query(5), 9, torch.float32)[0]
+        draft = ops._qsa_xqa_page4_workspace(_query(40), 9, torch.float32)[0]
+        eager = ops._qsa_xqa_page4_workspace(_query(48), 9, torch.float32)[0]
+        replay = ops._qsa_xqa_page4_workspace(_query(5), 9, torch.float32)[0]
+    assert draft.shape == (40, 6, 9, 256)
+    assert eager.shape == (48, 6, 9, 256)
+    assert target.data_ptr() == draft.data_ptr() == replay.data_ptr()
+    assert eager.data_ptr() != target.data_ptr()
 
 
 def test_workspace_partition_count_is_part_of_the_cache_key():

@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import shutil
+import subprocess
+from importlib import import_module
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -125,7 +129,8 @@ def test_prepare_falls_back_to_fp16_on_non_sm70(monkeypatch):
     torch.testing.assert_close(layer(x)[0], torch.full((1, 64), 128, dtype=x.dtype))
 
 
-def test_prepare_and_dispatch_draft_gate_up(monkeypatch):
+@pytest.mark.parametrize("native_chunks", [True, False])
+def test_prepare_and_dispatch_draft_gate_up(monkeypatch, native_chunks):
     # Adapted from the 1Cat QPN8 dispatch and fused gate-up tests.
     layer = MergedColumnParallelLinear(
         128,
@@ -145,18 +150,18 @@ def test_prepare_and_dispatch_draft_gate_up(monkeypatch):
         SimpleNamespace(is_device_capability=lambda cap: cap == 70),
     )
     monkeypatch.setattr(
-        sm70_fp8,
-        "_get_sm70_fp8_prefill_exact_dense_workspace",
-        lambda _: torch.empty(1),
-    )
-    monkeypatch.setattr(
         online_qpn8, "prepare_channel_qpn8_weight", lambda _: (codes, scales)
     )
     monkeypatch.setattr(online_qpn8.envs, "VLLM_SM70_QWEN4_EXP_ONLINE_QPN8", False)
-
-    assert online_qpn8.maybe_prepare_online_qpn8(layer)
-    assert layer.weight.dtype == torch.uint8 and layer.weight is not original
-    assert layer._sm70_mtp_draft_qpn8_scales is scales
+    monkeypatch.setattr(
+        draft_qpn8.envs, "VLLM_SM70_FP8_QPN8_M32_CHUNKED", native_chunks
+    )
+    workspace_requests: list[torch.Tensor] = []
+    monkeypatch.setattr(
+        sm70_fp8,
+        "_get_sm70_fp8_prefill_exact_dense_workspace",
+        workspace_requests.append,
+    )
     calls = []
 
     def dispatch(out, x, weight, packed_scales, split_k, nacc, prefetch, gated):
@@ -165,13 +170,59 @@ def test_prepare_and_dispatch_draft_gate_up(monkeypatch):
         calls.append((split_k, nacc, prefetch, gated))
         out.fill_(2)
 
-    monkeypatch.setattr(torch.ops.vllm, "sm70_ct_fp8_qpn8_dispatch", dispatch)
+    # Register the legacy op before replacing it for the rollback case.
+    import_module(
+        "vllm.model_executor.layers.quantization.compressed_tensors.schemes."
+        "compressed_tensors_w8a16_fp8"
+    )
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "sm70_ct_fp8_qpn8_dispatch",
+        pytest.fail if native_chunks else dispatch,
+    )
+    monkeypatch.setattr(
+        draft_qpn8._sm70_ops,
+        "fp8_qpn8_draft_dispatch_sm70_out",
+        dispatch if native_chunks else pytest.fail,
+    )
+    assert online_qpn8.maybe_prepare_online_qpn8(layer)
+    assert layer.weight.dtype == torch.uint8 and layer.weight is not original
+    assert layer._sm70_mtp_draft_qpn8_scales is scales
+    assert len(workspace_requests) == (0 if native_chunks else 1)
+    if workspace_requests:
+        assert workspace_requests[0] is codes
+    assert draft_qpn8.mtp_draft_qpn8_capture_limit(layer) == (
+        128 if native_chunks else None
+    )
     x = torch.ones((2, 3, 128), dtype=torch.float16)
     torch.testing.assert_close(layer(x)[0], torch.full((2, 3, 64), 2, dtype=x.dtype))
     torch.testing.assert_close(
         layer.forward_fused_silu_and_mul(x), torch.full((2, 3, 32), 2, dtype=x.dtype)
     )
     assert calls == [(8, 2, False, False), (8, 2, False, True)]
+
+
+def test_native_draft_row_dispatch_cpu(tmp_path):
+    compiler = shutil.which("c++")
+    if compiler is None:
+        pytest.skip("host C++ compiler required for the native row dispatcher")
+        return
+    include = Path(__file__).resolve().parents[3] / "csrc/sm70_turbomind/ops"
+    source = Path(__file__).with_name("mtp_qpn8_draft_rows_cpu.cpp")
+    executable = tmp_path / "draft_rows"
+    subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            "-I",
+            str(include),
+            str(source),
+            "-o",
+            str(executable),
+        ],
+        check=True,
+    )
+    subprocess.run([str(executable)], check=True)
 
 
 def test_chunked_channel_qpn8_quantization_matches_whole_weight(monkeypatch):

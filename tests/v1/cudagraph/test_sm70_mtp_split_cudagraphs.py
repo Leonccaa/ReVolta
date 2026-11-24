@@ -34,6 +34,7 @@ def _make_config(max_num_seqs: int, verifier_sizes: list[int]):
             max_cudagraph_capture_size=max(verifier_sizes),
         ),
         speculative_config=speculative_config,
+        adaptive_mtp_enabled=False,
     )
 
 
@@ -122,6 +123,37 @@ def test_split_managers_keep_exact_full_graph_shapes(
         assert draft_desc.num_reqs == batch_size
 
 
+def test_qpn8_draft_prefill_above_128_rows_is_eager(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS", "0")
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu.cudagraph_utils.current_platform.get_global_graph_pool",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu.cudagraph_utils.get_pp_group",
+        lambda: MagicMock(is_first_rank=True, is_last_rank=True),
+    )
+    device = torch.device("cpu")
+    mode = CUDAGraphMode.FULL_DECODE_ONLY
+    config = _make_config(160, [40, 80, 120, 160])
+    target = CudaGraphManager(config, device, mode, decode_query_len=5)
+    prefill = PrefillEagleCudaGraphManager(
+        config, device, mode, decode_query_len=5, max_capture_tokens=128
+    )
+    decode = DecodeEagleCudaGraphManager(
+        config, device, mode, decode_query_len=1, max_capture_tokens=128
+    )
+    for manager in (target, prefill, decode):
+        manager._graphs_captured = True
+
+    assert target.dispatch(32, 160, 5).cg_mode == CUDAGraphMode.FULL
+    assert prefill.dispatch(24, 120, 5).cg_mode == CUDAGraphMode.FULL
+    assert prefill.dispatch(26, 130, 5).cg_mode == CUDAGraphMode.NONE
+    assert decode.dispatch(120, 120, 1).cg_mode == CUDAGraphMode.FULL
+    assert decode.dispatch(129, 129, 1).cg_mode == CUDAGraphMode.NONE
+    assert config.compilation_config.cudagraph_capture_sizes == [40, 80, 120, 160]
+
+
 def test_dflash_lookup_captures_b1_q8_and_q16(monkeypatch) -> None:
     monkeypatch.setattr(
         "vllm.v1.worker.gpu.cudagraph_utils.current_platform.get_global_graph_pool",
@@ -179,6 +211,10 @@ def test_dynamic_mtp_full_graph_shapes(monkeypatch, split):
     monkeypatch.setattr(cg, "_use_split_sm70_mtp_cudagraphs", lambda cfg: split)
     monkeypatch.setattr(cg.current_platform, "get_global_graph_pool", lambda: None)
     monkeypatch.setattr(cg, "get_pp_group", lambda: MagicMock())
+    monkeypatch.setattr(
+        "vllm.v1.attention.ops.sm70_e4m3_long.long_attention_enabled",
+        lambda: False,
+    )
     config = _make_config(8, [5, 10, 20, 40])
     config.speculative_config.num_speculative_tokens_per_batch_size = [
         (1, 3, 4),

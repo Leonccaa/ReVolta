@@ -14,6 +14,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from vllm import _sm70_ops, envs
 from vllm.logger import init_logger
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
@@ -22,6 +23,8 @@ logger = init_logger(__name__)
 
 _MARK = "_sm70_mtp_draft_qpn8"
 _READY = "_sm70_mtp_draft_qpn8_ready"
+# Larger inputs take the dense prefill path with a call-local workspace.
+MTP_DRAFT_QPN8_MAX_CAPTURE_ROWS = 128
 _SUFFIXES = frozenset(
     {
         "fc",
@@ -62,9 +65,6 @@ def prepare_mtp_draft_qpn8(layer: nn.Module) -> bool:
     n, k = weight.shape
     if n % 32 or k % 128:
         return False
-    from vllm.model_executor.kernels.linear.scaled_mm.sm70_fp8 import (
-        _get_sm70_fp8_prefill_exact_dense_workspace,
-    )
     from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a16_fp8 import (  # noqa: E501
         _SM70_CHANNEL_FP8_QPN8_CONFIGS,
     )
@@ -73,7 +73,16 @@ def prepare_mtp_draft_qpn8(layer: nn.Module) -> bool:
     )
 
     codes, scales = prepare_channel_qpn8_weight(weight)
-    _get_sm70_fp8_prefill_exact_dense_workspace(codes)
+    if not envs.VLLM_SM70_FP8_QPN8_M32_CHUNKED:
+        # Keep the existing rollback for engines that disable native chunks.
+        from vllm.model_executor.kernels.linear.scaled_mm.sm70_fp8 import (
+            _get_sm70_fp8_prefill_exact_dense_workspace,
+        )
+
+        _get_sm70_fp8_prefill_exact_dense_workspace(codes)
+        dispatch = torch.ops.vllm.sm70_ct_fp8_qpn8_dispatch
+    else:
+        dispatch = _sm70_ops.fp8_qpn8_draft_dispatch_sm70_out
     split_k, nacc, prefetch = _SM70_CHANNEL_FP8_QPN8_CONFIGS.get(
         (k, n), (8 if k % 256 else 16, 2, False)
     )
@@ -81,12 +90,23 @@ def prepare_mtp_draft_qpn8(layer: nn.Module) -> bool:
     layer.register_buffer("_sm70_mtp_draft_qpn8_scales", scales, persistent=False)
     layer._sm70_mtp_draft_qpn8_shape = (n, k)
     layer._sm70_mtp_draft_qpn8_config = (split_k, nacc, prefetch)
+    layer._sm70_mtp_draft_qpn8_dispatch = dispatch
     layer._unquantized_fused_silu_and_mul = apply_mtp_draft_qpn8_fused_silu
     setattr(layer, _READY, True)
     logger.info_once(
         "SM70 MTP drafter projections use channel-QPN8 (FP16 weights released)."
     )
     return True
+
+
+def mtp_draft_qpn8_capture_limit(model: nn.Module) -> int | None:
+    if any(
+        getattr(layer, "_sm70_mtp_draft_qpn8_dispatch", None)
+        is _sm70_ops.fp8_qpn8_draft_dispatch_sm70_out
+        for layer in model.modules()
+    ):
+        return MTP_DRAFT_QPN8_MAX_CAPTURE_ROWS
+    return None
 
 
 def apply_mtp_draft_qpn8(layer: nn.Module, x: torch.Tensor) -> torch.Tensor | None:
@@ -96,7 +116,7 @@ def apply_mtp_draft_qpn8(layer: nn.Module, x: torch.Tensor) -> torch.Tensor | No
     split_k, nacc, prefetch = layer._sm70_mtp_draft_qpn8_config
     x_2d = x.reshape(-1, k).contiguous()
     out = x_2d.new_empty((x_2d.shape[0], n))
-    torch.ops.vllm.sm70_ct_fp8_qpn8_dispatch(
+    layer._sm70_mtp_draft_qpn8_dispatch(
         out,
         x_2d,
         layer.weight,
@@ -122,7 +142,7 @@ def apply_mtp_draft_qpn8_fused_silu(
     x_2d = x.reshape(-1, k).contiguous()
     out_features = n // 2
     out = x_2d.new_empty((x_2d.shape[0], out_features))
-    torch.ops.vllm.sm70_ct_fp8_qpn8_dispatch(
+    layer._sm70_mtp_draft_qpn8_dispatch(
         out,
         x_2d,
         layer.weight,

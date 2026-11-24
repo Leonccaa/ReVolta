@@ -31,6 +31,7 @@ from vllm.model_executor.layers.quantization.sm70_moe_router import (
     select_sm70_quantized_moe_route,
 )
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
 
@@ -2026,6 +2027,27 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         if num_tokens <= 8 and use_batched_moe_gemm:
             compare_dense_step = _compare_dense_decode_step(layer)
 
+        expansion_workspace = None
+        batched_routes = (
+            Sm70MoeStageRoute.BATCHED,
+            Sm70MoeStageRoute.PER_EXPERT_DISPATCH,
+        )
+        if envs.VLLM_SM70_AWQ_MOE_INT4_ZERO and (
+            indexed_w13
+            or route_plan.w13 in batched_routes
+            or route_plan.w2 in batched_routes
+        ):
+            # The startup profile reaches the same banks before KV sizing.
+            # W13 and W2 expand and consume their metadata on the same stream.
+            records = max(
+                layer.sm70_w13_k_dim // self.group_size * layer.sm70_w13_n_dim,
+                layer.sm70_w2_k_dim // self.group_size * layer.sm70_w2_n_dim,
+            )
+            expansion_bytes = layer.sm70_num_experts * (3 * records + 16)
+            (expansion_workspace,) = current_workspace_manager().get_simultaneous(
+                ((expansion_bytes,), torch.uint8),
+            )
+
         if indexed_w13:
             _log_runtime_route_once(
                 "SM70 Qwen3.8 AWQ indexed-A W13 prefill route enabled "
@@ -2045,6 +2067,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 layer.sm70_w13_k_dim,
                 layer.sm70_w13_n_dim,
                 self.group_size,
+                expansion_workspace,
             )
         elif use_active_exact_small_batched_moe:
             _log_runtime_route_once(
@@ -2097,6 +2120,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 layer.sm70_w13_n_dim,
                 self.group_size,
                 False,
+                expansion_workspace,
             )
         elif route_plan.w13 == Sm70MoeStageRoute.PER_EXPERT_DISPATCH:
             _log_runtime_route_once(
@@ -2115,6 +2139,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 layer.sm70_w13_n_dim,
                 self.group_size,
                 False,
+                expansion_workspace,
             )
             buffers["gate_up"] = _dump_awq_moe_buffer(
                 layer, buffers["gate_up"], "w13_batched_out"
@@ -2195,6 +2220,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 layer.sm70_hidden_logical_size,
                 self.group_size,
                 w2_chunk_tokens,
+                expansion_workspace,
             )
             return _dump_awq_moe_buffer(layer, output, "chunked_w2_output")
         if use_active_exact_small_batched_moe or use_batched_active_exact_w2:
@@ -2299,6 +2325,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 layer.sm70_w2_n_dim,
                 self.group_size,
                 False,
+                expansion_workspace,
             )
         elif route_plan.w2 == Sm70MoeStageRoute.PER_EXPERT_DISPATCH:
             _log_runtime_route_once(
@@ -2317,6 +2344,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 layer.sm70_w2_n_dim,
                 self.group_size,
                 False,
+                expansion_workspace,
             )
             buffers["sorted_output"] = _dump_awq_moe_buffer(
                 layer, buffers["sorted_output"], "w2_batched_out"

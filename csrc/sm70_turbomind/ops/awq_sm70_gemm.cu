@@ -7853,18 +7853,19 @@ void awq_moe_single_token_exact_layout_prepare(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void awq_moe_gemm_sm70_out(torch::Tensor out, torch::Tensor sorted_input,
-                           torch::Tensor expert_offsets,
-                           torch::Tensor strided_ptrs_w,
-                           torch::Tensor strided_ptrs_s, int64_t num_experts,
-                           int64_t k, int64_t n, int64_t group_size,
-                           bool gated_silu);
+void awq_moe_gemm_sm70_out(
+    torch::Tensor out, torch::Tensor sorted_input, torch::Tensor expert_offsets,
+    torch::Tensor strided_ptrs_w, torch::Tensor strided_ptrs_s,
+    int64_t num_experts, int64_t k, int64_t n, int64_t group_size,
+    bool gated_silu,
+    const std::optional<torch::Tensor>& int4_zero_workspace = std::nullopt);
 
 void awq_moe_gemm_sm70_per_expert_dispatch_out(
     torch::Tensor out, torch::Tensor sorted_input, torch::Tensor expert_offsets,
     torch::Tensor strided_ptrs_w, torch::Tensor strided_ptrs_s,
     int64_t num_experts, int64_t k, int64_t n, int64_t group_size,
-    bool gated_silu);
+    bool gated_silu,
+    const std::optional<torch::Tensor>& int4_zero_workspace = std::nullopt);
 
 void awq_moe_gemm_sm70_out_impl(
     torch::Tensor out, torch::Tensor sorted_input, torch::Tensor expert_offsets,
@@ -7872,8 +7873,8 @@ void awq_moe_gemm_sm70_out_impl(
     int64_t num_experts, int64_t k, int64_t n, int64_t group_size,
     bool gated_silu, torch::Tensor b_group_indices, bool per_expert_dispatch,
     torch::Tensor reduce_out, torch::Tensor sorted_weights,
-    bool weighted_reduce, int64_t logical_total_tokens,
-    torch::Tensor a_indices);
+    bool weighted_reduce, int64_t logical_total_tokens, torch::Tensor a_indices,
+    const torch::Tensor& int4_zero_workspace);
 
 template <typename index_t>
 __global__ void awq_moe_single_token_prepare_kernel(
@@ -8693,7 +8694,8 @@ void awq_moe_gemm_sm70_out_impl(
     torch::Tensor reduce_out = torch::Tensor(),
     torch::Tensor sorted_weights = torch::Tensor(),
     bool weighted_reduce = false, int64_t logical_total_tokens = -1,
-    torch::Tensor a_indices = torch::Tensor()) {
+    torch::Tensor a_indices = torch::Tensor(),
+    const torch::Tensor& int4_zero_workspace = torch::Tensor()) {
   TORCH_CHECK(
       sorted_input.is_cuda() && sorted_input.scalar_type() == torch::kFloat16,
       "awq_moe_gemm_sm70: input must be CUDA float16.");
@@ -8866,9 +8868,21 @@ void awq_moe_gemm_sm70_out_impl(
   if (int4_zero && std::atoi(int4_zero) != 0) {
     TORCH_CHECK(n % 2 == 0 && (n * num_groups_raw * 3) % 4 == 0,
                 "int4 zero expansion requires aligned even-N AWQ banks");
-    expanded_stats = torch::empty({num_experts, num_groups_raw, n, 3},
-                                  strided_ptrs_s.options());
-    expanded_ptrs = torch::empty({num_experts * 16}, strided_ptrs_s.options());
+    const int64_t stats_bytes = num_experts * num_groups_raw * n * 3;
+    const int64_t ptr_bytes = num_experts * sizeof(turbomind::gemm::StridedPtr);
+    if (int4_zero_workspace.defined()) {
+      TORCH_CHECK(int4_zero_workspace.device() == sorted_input.device() &&
+                      int4_zero_workspace.scalar_type() == torch::kUInt8 &&
+                      int4_zero_workspace.dim() == 1 &&
+                      int4_zero_workspace.is_contiguous() &&
+                      int4_zero_workspace.numel() >= stats_bytes + ptr_bytes,
+                  "Invalid AWQ MoE INT4 zero expansion workspace.");
+      expanded_ptrs = int4_zero_workspace.narrow(0, 0, ptr_bytes);
+      expanded_stats = int4_zero_workspace.narrow(0, ptr_bytes, stats_bytes);
+    } else {
+      expanded_stats = torch::empty({stats_bytes}, strided_ptrs_s.options());
+      expanded_ptrs = torch::empty({ptr_bytes}, strided_ptrs_s.options());
+    }
     const int records = static_cast<int>(num_groups_raw * n);
     const dim3 grid((records + 255) / 256, num_experts);
     awq_moe_expand_int4_zero_kernel<<<grid, 256, 0, stream>>>(
@@ -8935,32 +8949,36 @@ void awq_moe_gemm_sm70_out_impl(
               ").");
 }
 
-void awq_moe_gemm_sm70_out(torch::Tensor out, torch::Tensor sorted_input,
-                           torch::Tensor expert_offsets,
-                           torch::Tensor strided_ptrs_w,
-                           torch::Tensor strided_ptrs_s, int64_t num_experts,
-                           int64_t k, int64_t n, int64_t group_size,
-                           bool gated_silu) {
-  awq_moe_gemm_sm70_out_impl(out, sorted_input, expert_offsets, strided_ptrs_w,
-                             strided_ptrs_s, num_experts, k, n, group_size,
-                             gated_silu);
+void awq_moe_gemm_sm70_out(
+    torch::Tensor out, torch::Tensor sorted_input, torch::Tensor expert_offsets,
+    torch::Tensor strided_ptrs_w, torch::Tensor strided_ptrs_s,
+    int64_t num_experts, int64_t k, int64_t n, int64_t group_size,
+    bool gated_silu, const std::optional<torch::Tensor>& int4_zero_workspace) {
+  awq_moe_gemm_sm70_out_impl(
+      out, sorted_input, expert_offsets, strided_ptrs_w, strided_ptrs_s,
+      num_experts, k, n, group_size, gated_silu, torch::Tensor(), false,
+      torch::Tensor(), torch::Tensor(), false, -1, torch::Tensor(),
+      int4_zero_workspace.value_or(torch::Tensor()));
 }
 
 void awq_moe_gemm_sm70_per_expert_dispatch_out(
     torch::Tensor out, torch::Tensor sorted_input, torch::Tensor expert_offsets,
     torch::Tensor strided_ptrs_w, torch::Tensor strided_ptrs_s,
     int64_t num_experts, int64_t k, int64_t n, int64_t group_size,
-    bool gated_silu) {
+    bool gated_silu, const std::optional<torch::Tensor>& int4_zero_workspace) {
   awq_moe_gemm_sm70_out_impl(out, sorted_input, expert_offsets, strided_ptrs_w,
                              strided_ptrs_s, num_experts, k, n, group_size,
-                             gated_silu, torch::Tensor(), true);
+                             gated_silu, torch::Tensor(), true, torch::Tensor(),
+                             torch::Tensor(), false, -1, torch::Tensor(),
+                             int4_zero_workspace.value_or(torch::Tensor()));
 }
 
 void awq_moe_indexed_dense_w13_sm70_out(
     torch::Tensor out, torch::Tensor input, torch::Tensor input_row_indices,
     torch::Tensor expert_offsets, torch::Tensor dense_expert_ids,
     torch::Tensor ptrs_w, torch::Tensor ptrs_s, int64_t num_experts, int64_t k,
-    int64_t n, int64_t group_size) {
+    int64_t n, int64_t group_size,
+    const std::optional<torch::Tensor>& int4_zero_workspace) {
   constexpr int kQwen38TopK = 10;
   TORCH_CHECK(input.dim() == 2 && input.size(0) > 0 && input.size(1) == 2560 &&
                   input.scalar_type() == torch::kFloat16 && input.is_cuda() &&
@@ -9000,7 +9018,8 @@ void awq_moe_indexed_dense_w13_sm70_out(
   awq_moe_gemm_sm70_out_impl(
       out, input, expert_offsets, ptrs_w, ptrs_s, num_experts, k, n, group_size,
       false, dense_expert_ids, true, torch::Tensor(), torch::Tensor(), false,
-      input_row_indices.numel(), input_row_indices);
+      input_row_indices.numel(), input_row_indices,
+      int4_zero_workspace.value_or(torch::Tensor()));
 }
 
 torch::Tensor awq_moe_gemm_sm70(torch::Tensor sorted_input,
@@ -9505,7 +9524,8 @@ void awq_moe_chunked_w2_sm70_out(
     torch::Tensor chunk_a_indices, torch::Tensor chunk_inv_permuted_idx,
     torch::Tensor ptrs_w, torch::Tensor ptrs_s, int64_t num_tokens,
     int64_t top_k, int64_t num_experts, int64_t k, int64_t n,
-    int64_t hidden_logical_size, int64_t group_size, int64_t chunk_tokens) {
+    int64_t hidden_logical_size, int64_t group_size, int64_t chunk_tokens,
+    const std::optional<torch::Tensor>& int4_zero_workspace) {
   TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kFloat16 &&
                   out.is_contiguous(),
               "awq_moe_chunked_w2_sm70_out: out must be contiguous CUDA "
@@ -9651,7 +9671,7 @@ void awq_moe_chunked_w2_sm70_out(
         chunk_output.narrow(0, 0, current_slots), input, chunk_expert_offsets,
         ptrs_w, ptrs_s, num_experts, k, n, group_size, false, torch::Tensor(),
         false, torch::Tensor(), torch::Tensor(), false, current_slots,
-        chunk_a_indices);
+        chunk_a_indices, int4_zero_workspace.value_or(torch::Tensor()));
 
     awq_moe_chunk_weighted_reduce_kernel<<<current_tokens, kThreads, 0,
                                            stream>>>(

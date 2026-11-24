@@ -96,19 +96,29 @@ def test_turbomind_expansion_bitwise_and_graph(banks, monkeypatch, k, n, indexed
     original_x = x.clone()
     changed_x = (x.float() + 0.125).half()
     results = []
-    for metadata, enabled in ((s0, "0"), (s0, "1"), (s1, "1")):
+    cases: list[tuple[torch.Tensor, str, torch.Tensor | None]] = [
+        (s0, "0", None),
+        (s0, "1", None),
+        (s1, "1", None),
+    ]
+    if not indexed:
+        workspace = torch.empty(
+            (num * (k // 32 * n * 3 + 16),), dtype=torch.uint8, device="cuda"
+        )
+        cases.append((s1, "1", workspace))
+    for metadata, enabled, workspace in cases:
         monkeypatch.setenv("VLLM_SM70_AWQ_MOE_INT4_ZERO", enabled)
         pw, ps = ops.awq_moe_build_strided_ptrs(w, metadata, k * 32, -n, 512)
         out = torch.empty((num, n), dtype=torch.float16, device="cuda")
 
-        def run(out=out, pw=pw, ps=ps):
+        def run(out=out, pw=pw, ps=ps, workspace=workspace):
             if indexed:
                 ops.awq_moe_single_token_indexed_dense_stage_sm70_out(
                     out, x, offsets, ids, pw, ps, num, k, n, 32
                 )
             else:
                 ops.awq_moe_gemm_sm70_per_expert_dispatch_out(
-                    out, x, offsets, pw, ps, num, k, n, 32, False
+                    out, x, offsets, pw, ps, num, k, n, 32, False, workspace
                 )
 
         for _ in range(3):
@@ -123,8 +133,8 @@ def test_turbomind_expansion_bitwise_and_graph(banks, monkeypatch, k, n, indexed
         _bits_equal(eager, out)
         results.append(out.clone())
         x.copy_(original_x)
-    _bits_equal(results[0], results[1])
-    _bits_equal(results[0], results[2])
+    for result in results[1:]:
+        _bits_equal(results[0], result)
 
 
 def test_grouped_changed_routing_graph(banks):

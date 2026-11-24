@@ -784,14 +784,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def(
       "awq_moe_gemm_sm70_out(Tensor(a!) out, Tensor sorted_input, "
       "Tensor expert_offsets, Tensor strided_ptrs_w, Tensor strided_ptrs_s, "
-      "int num_experts, int k, int n, int group_size, bool gated_silu) -> ()");
+      "int num_experts, int k, int n, int group_size, bool gated_silu, "
+      "Tensor(b!)? int4_zero_workspace=None) -> ()");
   ops.impl("awq_moe_gemm_sm70_out", torch::kCUDA, &awq_moe_gemm_sm70_out);
 
   ops.def(
       "awq_moe_gemm_sm70_per_expert_dispatch_out("
       "Tensor(a!) out, Tensor sorted_input, Tensor expert_offsets, "
       "Tensor strided_ptrs_w, Tensor strided_ptrs_s, int num_experts, "
-      "int k, int n, int group_size, bool gated_silu) -> ()");
+      "int k, int n, int group_size, bool gated_silu, "
+      "Tensor(b!)? int4_zero_workspace=None) -> ()");
   ops.impl("awq_moe_gemm_sm70_per_expert_dispatch_out", torch::kCUDA,
            &awq_moe_gemm_sm70_per_expert_dispatch_out);
 
@@ -807,7 +809,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "awq_moe_indexed_dense_w13_sm70_out("
       "Tensor(a!) out, Tensor input, Tensor input_row_indices, "
       "Tensor expert_offsets, Tensor dense_expert_ids, Tensor ptrs_w, "
-      "Tensor ptrs_s, int num_experts, int k, int n, int group_size) -> ()");
+      "Tensor ptrs_s, int num_experts, int k, int n, int group_size, "
+      "Tensor(b!)? int4_zero_workspace=None) -> ()");
   ops.impl("awq_moe_indexed_dense_w13_sm70_out", torch::kCUDA,
            &awq_moe_indexed_dense_w13_sm70_out);
 
@@ -828,7 +831,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor(e!) chunk_range_end, Tensor(f!) chunk_a_indices, "
       "Tensor(g!) chunk_inv_permuted_idx, Tensor ptrs_w, Tensor ptrs_s, "
       "int num_tokens, int top_k, int num_experts, int k, int n, "
-      "int hidden_logical_size, int group_size, int chunk_tokens) -> ()");
+      "int hidden_logical_size, int group_size, int chunk_tokens, "
+      "Tensor(h!)? int4_zero_workspace=None) -> ()");
   ops.impl("awq_moe_chunked_w2_sm70_out", torch::kCUDA,
            &awq_moe_chunked_w2_sm70_out);
 

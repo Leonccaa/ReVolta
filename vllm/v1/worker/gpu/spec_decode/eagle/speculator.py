@@ -224,7 +224,13 @@ class EagleSpeculator:
         self.model = load_eagle_model(target_model, self.vllm_config)
         self._maybe_initialize_static_draft_vocab()
         self._validate_local_argmax_reduction()
-        if self.speculative_config.draft_qpn8_head and self._static_draft_vocab is None:
+        if (
+            self.speculative_config.draft_qpn8_head
+            and self._static_draft_vocab is None
+            and self.speculative_config.draft_sample_method == "greedy"
+            and self.use_local_argmax_reduction
+            and self.vllm_config.parallel_config.tensor_parallel_size > 1
+        ):
             prepare_draft_head = getattr(
                 self.model, "prepare_sm70_mtp_draft_head", None
             )

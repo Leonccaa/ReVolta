@@ -119,24 +119,35 @@ def _hc_workspace(weight: torch.Tensor) -> torch.Tensor:
     return partials
 
 
+@torch.inference_mode()
 def prepare_channel_qpn8_weight(
     weight: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pack a row-major dense weight with one E4M3 scale per output."""
-    weight_f32 = weight.float()
-    channel_scales = weight_f32.abs().amax(dim=1, keepdim=True).div_(448.0)
-    channel_scales = torch.where(
-        channel_scales == 0, torch.ones_like(channel_scales), channel_scales
+    """Reuse the channel-QPN8 layout with bounded FP32 startup scratch."""
+    rows, _ = weight.shape
+    qweight = torch.empty_like(weight, dtype=torch.float8_e4m3fn)
+    scales = torch.empty((rows, 1), dtype=torch.float32, device=weight.device)
+    for begin in range(0, rows, 4096):
+        end = min(begin + 4096, rows)
+        values = weight[begin:end].float()
+        scale = values.abs().amax(dim=1, keepdim=True) / 448
+        scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+        qweight[begin:end].copy_((values / scale).to(torch.float8_e4m3fn))
+        scales[begin:end].copy_(scale)
+    codes, packed_scales = sm70_ops.fp8_qpn8_prepare_sm70(
+        qweight.contiguous(), scales.contiguous()
     )
-    qweight = (weight_f32 / channel_scales).to(torch.float8_e4m3fn)
-    codes, scales = sm70_ops.fp8_qpn8_prepare_sm70(
-        qweight.contiguous(), channel_scales.contiguous()
-    )
-    return codes, scales
+    return codes, packed_scales
 
 
 def maybe_prepare_online_qpn8(layer: nn.Module) -> bool:
     """Quantize one admitted FP16 weight and retain only its QPN8 layout."""
+    from vllm.model_executor.layers.quantization.sm70_mtp_draft_qpn8 import (
+        prepare_mtp_draft_qpn8,
+    )
+
+    if prepare_mtp_draft_qpn8(layer):
+        return True
     if getattr(layer, _STATE_ATTR, False):
         return True
     if not envs.VLLM_SM70_QWEN4_EXP_ONLINE_QPN8 or not _exact_runtime_contract():
@@ -212,6 +223,13 @@ def maybe_apply_online_qpn8(
     bias: torch.Tensor | None,
 ) -> torch.Tensor | None:
     """Run a prepared channel-QPN8 projection, or return ``None``."""
+    from vllm.model_executor.layers.quantization.sm70_mtp_draft_qpn8 import (
+        apply_mtp_draft_qpn8,
+    )
+
+    draft_output = apply_mtp_draft_qpn8(layer, x)
+    if draft_output is not None:
+        return draft_output
     if not getattr(layer, _STATE_ATTR, False):
         return None
     k = int(layer._sm70_qwen4_exp_online_qpn8_k)

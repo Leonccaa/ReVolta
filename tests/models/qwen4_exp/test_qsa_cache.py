@@ -263,7 +263,10 @@ def test_qsa_ring_capacity_divides_the_attention_block(
         ),
     )
     spec = layer.get_kv_cache_spec(
-        SimpleNamespace(num_speculative_tokens=num_speculative_tokens)
+        SimpleNamespace(
+            cache_config=SimpleNamespace(block_size=block_size),
+            num_speculative_tokens=num_speculative_tokens,
+        )
     )
     assert spec.block_size == capacity
     assert block_size % spec.block_size == 0
@@ -284,4 +287,8 @@ def test_qsa_ring_widening_is_capped() -> None:
         ),
     )
     with pytest.raises(ValueError, match="multiple of 32"):
-        layer.get_kv_cache_spec(SimpleNamespace(num_speculative_tokens=4))
+        layer.get_kv_cache_spec(
+            SimpleNamespace(
+                cache_config=SimpleNamespace(block_size=1616), num_speculative_tokens=4
+            )
+        )

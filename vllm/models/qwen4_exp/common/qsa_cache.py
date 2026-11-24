@@ -1073,7 +1073,6 @@ class _QSAStateCache(nn.Module, AttentionLayerBase):
             )
         self.head_size = head_size
         self.dtype = dtype
-        self.cache_config = cache_config
         self.prefix = prefix
         self.compress_ratio = compress_ratio
         self.kv_cache = torch.tensor([])
@@ -1134,7 +1133,9 @@ class QSAKeyStateCache(_QSAStateCache):
         # for this ring. Widen the ring by whole groups until it divides the
         # block; the minimal ring is kept whenever it already does (e.g. 8 for
         # four draft tokens), and consumers read the size from this spec.
-        block_size = self.cache_config.block_size
+        # A mixed-dtype draft is loaded with a copy of the cache config.
+        # Use the runner's final block size, as main K/V and the indexer do.
+        block_size = vllm_config.cache_config.block_size
         minimal = capacity
         limit = QSA_RING_MAX_WIDENING * minimal
         while block_size % capacity != 0 and capacity < limit:

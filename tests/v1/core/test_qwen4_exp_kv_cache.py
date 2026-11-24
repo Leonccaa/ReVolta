@@ -8,9 +8,13 @@ import pytest
 import torch
 
 from vllm.models.qwen4_exp.common.qsa_cache import (
+    QSACompressedKeyCache,
+    QSAKeyStateCache,
     QSAStateBackend,
     qsa_dcp_block_geometry,
 )
+from vllm.models.qwen4_exp.nvidia.model import Qwen4ExpForCausalLM
+from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAAttention
 from vllm.utils.hashing import sha256
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
@@ -19,6 +23,7 @@ from vllm.v1.core.kv_cache_utils import (
     _get_csa_linear_tensor_layout,
     generate_scheduler_kv_cache_config,
     get_kv_cache_config_from_groups,
+    get_kv_cache_configs,
     get_kv_cache_groups,
     get_max_concurrency_for_kv_cache_config,
     init_none_hash,
@@ -213,6 +218,102 @@ def test_qwen4_exp_real_dcp_cache_geometry() -> None:
         1600,
         True,
     )
+
+
+@pytest.mark.parametrize(
+    "cache_dtype, dtype",
+    [
+        ("int8", torch.int8),
+        ("fp8_per_token_head", torch.uint8),
+    ],
+)
+def test_qwen4_exp_mixed_mtp_rings_use_final_dcp_block_size(cache_dtype, dtype):
+    config = _vllm_config()
+    config.model_config.max_model_len = 40_960
+    config.model_config.original_max_model_len = 40_960
+    config.model_config.dtype = torch.float16
+    config.model_config.hf_text_config = SimpleNamespace(
+        linear_num_key_heads=16,
+        linear_num_value_heads=48,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+        ple_conv_kernel_size=4,
+        ngram_size=3,
+        hc_count=4,
+        hidden_size=2560,
+    )
+    config.parallel_config.tensor_parallel_size = 4
+    config.parallel_config.decode_context_parallel_size = 2
+    config.speculative_config = SimpleNamespace(method="mtp", num_speculative_tokens=5)
+    config.num_speculative_tokens = 5
+    config.cache_config.block_size = 16
+    config.cache_config.mamba_cache_dtype = "auto"
+    config.cache_config.mamba_ssm_cache_dtype = "float32"
+    config.cache_config.mamba_cache_mode = "align"
+    config.compilation_config = SimpleNamespace(static_forward_context={})
+    draft_cache = SimpleNamespace(**vars(config.cache_config))
+
+    target_layers = range(3, 48, 4)
+    rings = {}
+    indexers = {}
+    for prefix in [
+        *(f"model.layers.{layer}.self_attn" for layer in target_layers),
+        "mtp.layers.48.self_attn",
+    ]:
+        is_draft = prefix.startswith("mtp.")
+        kwargs = dict(
+            head_size=128,
+            dtype=torch.float16,
+            cache_config=draft_cache if is_draft else config.cache_config,
+            compress_ratio=4,
+            vllm_config=config,
+        )
+        rings[prefix] = QSAKeyStateCache(
+            prefix=f"{prefix}.indexer.raw_key_cache",
+            cache_rope_positions=True,
+            **kwargs,
+        )
+        indexers[prefix] = QSACompressedKeyCache(
+            prefix=f"{prefix}.indexer.compressed_key_cache", **kwargs
+        )
+
+    # The target platform aligns its block after both models have been loaded.
+    config.cache_config.block_size = 1632
+    specs = {}
+    for prefix, ring in rings.items():
+        is_draft = prefix.startswith("mtp.")
+        attention = SimpleNamespace(
+            layer_name=prefix,
+            num_kv_heads=1,
+            head_dim=256,
+            kv_cache_torch_dtype=torch.float16 if is_draft else dtype,
+            kv_cache_dtype="float16" if is_draft else cache_dtype,
+        )
+        specs[prefix] = Qwen4ExpQSAAttention.get_kv_cache_spec(attention, config)
+        indexer = indexers[prefix]
+        specs[indexer.prefix] = indexer.get_kv_cache_spec(config)
+        specs[ring.prefix] = ring.get_kv_cache_spec(config)
+    gdn, ple = Qwen4ExpForCausalLM.get_mamba_specs_from_config(config)
+    for layer in range(48):
+        if layer in target_layers:
+            continue
+        specs[f"model.layers.{layer}.linear_attn"] = replace(
+            gdn, block_size=1632, mamba_cache_mode="align", num_speculative_blocks=5
+        )
+    specs["model.layers.2.ple"] = replace(
+        ple, block_size=1632, mamba_cache_mode="align"
+    )
+
+    worker_configs = get_kv_cache_configs(config, [specs] * 4, [5 << 30] * 4)
+    scheduler = generate_scheduler_kv_cache_config(worker_configs)
+    assert {
+        spec.block_size for spec in specs.values() if type(spec) is CircularBufferSpec
+    } == {12}
+    assert specs["model.layers.3.self_attn"].block_size == 816
+    assert specs["mtp.layers.48.self_attn"].block_size == 1632
+    assert scheduler.num_blocks > 0
+    assert scheduler.kv_cache_groups[0].kv_cache_spec.global_block_size(2) == 1632
 
 
 def test_qwen4_exp_worker_block_table_respects_replicated_dcp_owner(

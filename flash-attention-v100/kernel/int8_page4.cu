@@ -280,6 +280,8 @@ struct alignas(256) GroupedVerifySmem {
   alignas(16) float row_scale[kGroupedVerifyRows];
   alignas(16) int page_ids[kGroupedVerifyPageIdsCapacity];
   alignas(16) uint32_t sparse_token_masks[kGroupedVerifyBlockN / 4];
+  float key_scales[kGroupedVerifyBlockN];
+  float value_scales[kGroupedVerifyBlockN];
 };
 
 static_assert(sizeof(GroupedVerifySmem) <= 64 * 1024,

@@ -1163,6 +1163,16 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
         kSharedStrideVec, tile_page_offset, page_block_size, k_block_stride,
         k_token_stride, k_head_stride, aligned_pair,
         SPARSE_PAGE4 ? scales.pages : int8_kv::KVPageMapping{});
+    if constexpr (kRowScales && !TWO_PASS) {
+      // Publish one scale per key/value column with the K panel.
+      if (tid < valid_k_rows) {
+        const int token = tile_page_offset + tid;
+        const int page = page_ids[token / page_block_size];
+        const int slot = token % page_block_size;
+        smem.key_scales[tid] = scales.key.load(page, slot, 0);
+        smem.value_scales[tid] = scales.value.load(page, slot, 0);
+      }
+    }
     for (int idx = tid + valid_k_rows * kSharedStrideVec;
          idx < kGroupedVerifyBlockN * kSharedStrideVec;
          idx += kGroupedVerifyThreads) {
@@ -1215,10 +1225,20 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
                                     qk_scale, active_m_tiles);
     __syncthreads();
     if constexpr (kRowScales) {
-      int8_kv::scale_attention_tile<KV_DTYPE>(
-          shared_scores, kGroupedVerifyRows, valid_k_rows,
-          kGroupedVerifyScoreStride, scales.key, page_ids, tile_page_offset,
-          page_block_size, 0);
+      if constexpr (TWO_PASS) {
+        int8_kv::scale_attention_tile<KV_DTYPE>(
+            shared_scores, kGroupedVerifyRows, valid_k_rows,
+            kGroupedVerifyScoreStride, scales.key, page_ids, tile_page_offset,
+            page_block_size, 0);
+      } else {
+        for (int idx = tid; idx < kGroupedVerifyRows * valid_k_rows;
+             idx += kGroupedVerifyThreads) {
+          const int row = idx / valid_k_rows;
+          const int col = idx % valid_k_rows;
+          shared_scores[row * kGroupedVerifyScoreStride + col] *=
+              smem.key_scales[col];
+        }
+      }
       __syncthreads();
     }
 
@@ -1293,13 +1313,9 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
             active_sum ? __expf(fmaxf(old_max - new_max, -80.0f)) : 1.0f;
         float pv_weight = probability;
         if constexpr (kRowScales) {
-          // Mask before loading/applying a scale: an invalid future token
-          // must not contaminate an earlier causal row through 0 * NaN.
+          // Mask before applying a scale to avoid 0 * NaN on invisible columns.
           if (visible) {
-            const int token = tile_page_offset + lane_id;
-            pv_weight = int8_kv::KVCodecTraits<KV_DTYPE>::value_weight(
-                probability, scales.value, page_ids[token / page_block_size],
-                token % page_block_size, 0);
+            pv_weight *= smem.value_scales[lane_id];
           }
         }
         shared_probs[row * kGroupedVerifyProbStride + lane_id] =

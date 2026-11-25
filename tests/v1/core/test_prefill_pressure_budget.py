@@ -264,3 +264,57 @@ def test_long_prefill_threshold_combines_with_pressure_budget(
     output = scheduler.schedule()
 
     assert output.num_scheduled_tokens == expected
+
+
+def _complete_pressure_step(scheduler, output, sampled):
+    req_ids = list(output.num_scheduled_tokens)
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
+            sampled_token_ids=[sampled.get(req_id, []) for req_id in req_ids],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+
+@pytest.mark.parametrize("short_ids", [(), ("first",), ("first", "second")])
+def test_cached_short_prefill_gets_pressure_budget_before_running_long_prefill(
+    short_ids,
+):
+    scheduler = create_scheduler(
+        max_num_batched_tokens=96,
+        prefill_pressure_token_budget=32,
+        max_model_len=512,
+        enable_prefix_caching=True,
+    )
+    primer = create_requests(1, 65, max_tokens=1, req_ids=["primer"])[0]
+    scheduler.add_request(primer)
+    _complete_pressure_step(scheduler, scheduler.schedule(), {"primer": [1]})
+    _start_decode_request(scheduler)
+
+    long, older_waiting = create_requests(2, 200, req_ids=["long", "older"])
+    scheduler.add_request(long)
+    _complete_pressure_step(scheduler, scheduler.schedule(), {"decode": [2]})
+    scheduler.add_request(older_waiting)
+    for name in short_ids:
+        scheduler.add_request(create_requests(1, 80, req_ids=[name])[0])
+
+    output = scheduler.schedule()
+
+    expected = {"decode": 1, **dict.fromkeys(short_ids, 16)}
+    if len(short_ids) < 2:
+        expected["long"] = 32 - 16 * len(short_ids)
+    assert output.num_scheduled_tokens == expected
+    assert [r.req_id for r in output.scheduled_new_reqs] == list(short_ids)
+    assert all(r.num_computed_tokens == 64 for r in output.scheduled_new_reqs)
+
+    _complete_pressure_step(
+        scheduler, output, {"decode": [3], **dict.fromkeys(short_ids, [1])}
+    )
+    next_output = scheduler.schedule()
+    assert next_output.num_scheduled_tokens["long"] == 32
+    assert "older" not in next_output.num_scheduled_tokens

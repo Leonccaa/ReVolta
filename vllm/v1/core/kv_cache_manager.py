@@ -399,6 +399,25 @@ class KVCacheManager:
         )
         return self.create_kv_cache_blocks(extended), hit
 
+    def get_ready_prefill_tokens(self, request: Request) -> int:
+        """Count compute rows before admission, without acquiring a cache hit."""
+        if request.num_computed_tokens >= request.num_prompt_tokens:
+            return 0
+        if (
+            request.num_computed_tokens
+            or not self.enable_caching
+            or request.skip_reading_prefix_cache
+            or self.hit_contract is not None
+        ):
+            return request.num_tokens - request.num_computed_tokens
+        blocks, hit = self.coordinator.find_longest_cache_hit(
+            request.block_hashes, request.num_tokens - 1
+        )
+        _, hit = self.coordinator.exact_end.extend(
+            request, blocks, hit, None, remember_hit=False
+        )
+        return request.num_tokens - hit if hit < request.num_prompt_tokens else 0
+
     def allocate_slots(
         self,
         request: Request,

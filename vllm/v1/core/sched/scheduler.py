@@ -4,8 +4,9 @@ import itertools
 import os
 import time
 from collections import defaultdict, deque
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import replace
+from functools import partial
 from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
@@ -770,6 +771,44 @@ class Scheduler(SchedulerInterface):
             budget = budget // block_size * block_size
         return budget
 
+    def _reserve_short_prefills(
+        self, budget: int, long_prefill_threshold: int
+    ) -> tuple[deque[tuple[RequestQueue, Request, int]], int]:
+        """Keep room for FIFO, locally ready prefills before charging long ones."""
+        selected: deque[tuple[RequestQueue, Request, int]] = deque()
+        slots = (
+            self.max_num_running_reqs
+            - len(self.running)
+            - sum(
+                request.status != RequestStatus.RUNNING
+                for request in self._inflight_prefills
+            )
+        )
+        if slots <= 0 or not budget:
+            return selected, 0
+
+        reserved = 0
+        for queue, request in sorted(
+            (
+                (waiting_queue, request)
+                for waiting_queue in (self.skipped_waiting, self.waiting)
+                for request in waiting_queue
+                if not self._is_blocked_waiting_status(request.status)
+            ),
+            key=lambda item: item[1].arrival_time,
+        ):
+            uncached = self.kv_cache_manager.get_ready_prefill_tokens(request)
+            if not 0 < uncached <= budget:
+                continue
+            rows = min(uncached, long_prefill_threshold or uncached)
+            if reserved + rows > budget:
+                break
+            selected.append((queue, request, uncached))
+            reserved += rows
+            if reserved == budget or len(selected) == slots:
+                break
+        return selected, reserved
+
     def schedule(self) -> SchedulerOutput:
         self.current_step += 1
         store_cpu_start = (
@@ -891,6 +930,25 @@ class Scheduler(SchedulerInterface):
                 self.max_num_scheduled_tokens // num_eligible_reqs,
             )
 
+        short_prefills: deque[tuple[RequestQueue, Request, int]] = deque()
+        reserved_prefill = 0
+        if (
+            prefill_token_budget
+            and self._pause_state == PauseState.UNPAUSED
+            and (self.waiting or self.skipped_waiting)
+        ):
+            budget = min(
+                prefill_token_budget,
+                max(0, token_budget - sum(resident_tokens.values())),
+            )
+            if control_mixed_prefill:
+                budget = min(budget, self.mixed_prefill_budget.tokens)
+            short_prefills, reserved_prefill = self._reserve_short_prefills(
+                budget, long_prefill_token_threshold
+            )
+            if reserved_prefill:
+                prefill_token_budget = budget
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -968,10 +1026,11 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens = long_prefill_token_threshold
             is_prefill = request.num_computed_tokens < request.num_prompt_tokens
             if is_prefill and prefill_token_budget is not None:
-                if prefill_token_budget == 0:
+                running_prefill_budget = prefill_token_budget - reserved_prefill
+                if running_prefill_budget == 0:
                     req_index += 1
                     continue
-                num_new_tokens = min(num_new_tokens, prefill_token_budget)
+                num_new_tokens = min(num_new_tokens, running_prefill_budget)
             num_new_tokens = min(num_new_tokens, token_budget)
 
             num_new_tokens = limit_prefill(request.request_id, num_new_tokens)
@@ -1214,19 +1273,27 @@ class Scheduler(SchedulerInterface):
             # waiting requests that already hold KV (completed async loads,
             # re-queued sessions) go first, so they finish and release it.
             holders_only = False
+            pop_waiting_request: Callable[[], Request | None]
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
 
-                request_queue = self._select_waiting_queue_for_scheduling()
-                assert request_queue is not None
-
-                request = request_queue.peek_request()
+                short_prefill = bool(short_prefills)
+                if short_prefill:
+                    request_queue, request, planned_uncached = short_prefills.popleft()
+                    pop_waiting_request = partial(request_queue.remove_request, request)
+                else:
+                    selected_queue = self._select_waiting_queue_for_scheduling()
+                    assert selected_queue is not None
+                    request_queue = selected_queue
+                    request = request_queue.peek_request()
+                    planned_uncached = 0
+                    pop_waiting_request = request_queue.pop_request
                 request_id = request.request_id
 
                 if holders_only and not self._is_waiting_kv_holder(request):
-                    request_queue.pop_request()
+                    pop_waiting_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
 
@@ -1239,7 +1306,7 @@ class Scheduler(SchedulerInterface):
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
                             request_id,
                         )
-                    request_queue.pop_request()
+                    pop_waiting_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
 
@@ -1254,7 +1321,7 @@ class Scheduler(SchedulerInterface):
                     )
                     >= self.max_num_running_reqs
                 ):
-                    request_queue.pop_request()
+                    pop_waiting_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
 
@@ -1269,7 +1336,7 @@ class Scheduler(SchedulerInterface):
                     )
                 ):
                     # Scheduling would exceed max_loras, skip.
-                    request_queue.pop_request()
+                    pop_waiting_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
 
@@ -1346,7 +1413,7 @@ class Scheduler(SchedulerInterface):
                             # The request cannot be scheduled because
                             # the KVConnector couldn't determine
                             # the number of matched tokens.
-                            request_queue.pop_request()
+                            pop_waiting_request()
                             step_skipped_waiting.prepend_request(request)
                             continue
 
@@ -1417,6 +1484,10 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
+                    # The tentative prefix may have been evicted while charging
+                    # running requests. Leave it in the normal queue in that case.
+                    if short_prefill and num_new_tokens > planned_uncached:
+                        continue
                     if 0 < long_prefill_token_threshold < num_new_tokens:
                         num_new_tokens = long_prefill_token_threshold
 
@@ -1437,7 +1508,7 @@ class Scheduler(SchedulerInterface):
                         num_new_tokens = min(num_new_tokens, prefill_token_budget)
                         if num_new_tokens == 0:
                             self._store_retry(request, "budget", scheduled_timestamp)
-                            request_queue.pop_request()
+                            pop_waiting_request()
                             step_skipped_waiting.prepend_request(request)
                             continue
                     assert num_new_tokens > 0
@@ -1583,7 +1654,7 @@ class Scheduler(SchedulerInterface):
                         continue
                     if holders_only or self._has_waiting_kv_holder(request):
                         holders_only = True
-                        request_queue.pop_request()
+                        pop_waiting_request()
                         step_skipped_waiting.prepend_request(request)
                         continue
                     if self._reclaim_idle_sessions(request, scheduled_timestamp):
@@ -1606,7 +1677,7 @@ class Scheduler(SchedulerInterface):
                         load_abandoned = request_id in abandoned
                         abandoned.discard(request_id)
                         self._void_failed_loads(abandoned)
-                request = request_queue.pop_request()
+                pop_waiting_request()
                 if load_abandoned:
                     self._store_retry(request, "connector", scheduled_timestamp)
                     # The connector could not restore a complete prefix after

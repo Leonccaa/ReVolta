@@ -209,7 +209,7 @@ def test_sources_after_upstream_auto_defaults(profile, monkeypatch):
     monkeypatch.setenv("NCCL_GRAPH_REGISTER", "0")  # env_override
     audit = json.loads(module.profile_audit(enabled=True))
     assert audit["enabled"]
-    assert len(audit["values"]) == 46
+    assert len(audit["values"]) == 49
     assert audit["values"][FP16[0]]["source"] == "upstream_default"
     assert audit["values"]["NCCL_GRAPH_REGISTER"]["source"] == "upstream_default"
     assert audit["values"]["VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT"] == {
@@ -488,6 +488,8 @@ def run_engineargs_early_policy(profile, monkeypatch, apply, **engine_kwargs):
     )
     target = model()
     target.hf_text_config.mtp_num_hidden_layers = 1
+    target.is_hybrid = True
+    target.runner_type = "generate"
     args._check_feature_supported = Mock()
     exec(
         compile(
@@ -510,6 +512,39 @@ def test_engineargs_profile_precedes_actual_mtp_defaults(profile, monkeypatch):
     )
     assert args.compilation_config.fast_moe_cold_start is None
     assert args.compilation_config.cudagraph_capture_sizes is None
+
+
+@pytest.mark.parametrize("allocator", ["PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"])
+def test_hybrid_serving_environment_overrides(profile, monkeypatch, allocator):
+    overrides = {
+        allocator: "expandable_segments:False",
+        "VLLM_SM70_QSA_GROUPED_LPT": "0",
+        "REVOLTA_SKINNY_MPLAN": "0",
+        "VLLM_SM70_DFLASH2_FUSED_QKV_PACK": "0",
+        "VLLM_SM70_AWQ_MOE_INT4_ZERO": "0",
+    }
+    for name, value in overrides.items():
+        monkeypatch.setenv(name, value)
+    assert profile.apply_revolta_profile(
+        model(), 4, is_sm70=True, hybrid_serving=True, speculative_method="dflash"
+    )
+    assert all(os.environ.get(name) == value for name, value in overrides.items())
+    assert "VLLM_SM70_GDN_SKINNY_MPLAN" not in os.environ
+    assert "NCCL_GRAPH_REGISTER" not in os.environ
+    assert {
+        name
+        for name in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF")
+        if name in os.environ
+    } == {allocator}
+
+
+def test_hybrid_serving_allocator_leaves_initialized_cuda_alone(profile, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+    assert profile.apply_revolta_profile(
+        model(), 4, is_sm70=True, hybrid_serving=True, speculative_method="dflash"
+    )
+    assert "PYTORCH_ALLOC_CONF" not in os.environ
+    assert "PYTORCH_CUDA_ALLOC_CONF" not in os.environ
 
 
 @pytest.mark.skip_global_cleanup
@@ -543,7 +578,38 @@ def test_engineargs_profile_precedes_actual_mtp_defaults(profile, monkeypatch):
             {"num_speculative_tokens_per_batch_size": [[1, 4, 2]]},
         ),
         ("mtp", True, True, False, [], {"num_speculative_tokens": 3}),
+        ("mtp", True, True, False, ["--async-scheduling"], {}),
+        ("mtp", True, True, False, [], {"gdn_state_replay": False}),
         ("dflash", True, True, False, [], {}),
+        (
+            "dflash",
+            True,
+            True,
+            False,
+            [
+                "--long-prefill-token-threshold",
+                "0",
+                "--kernel-config",
+                '{"qsa_dcp_index_shard":false}',
+            ],
+            {"sm70_dflash2": {"spec_state_replay": False}},
+        ),
+        (
+            "dflash",
+            True,
+            True,
+            False,
+            [],
+            {"sm70_dflash2": {"fused_gdn_verify": True}},
+        ),
+        (
+            "dflash",
+            True,
+            True,
+            False,
+            ["--decode-context-parallel-size", "1"],
+            {},
+        ),
         (
             "dflash",
             True,
@@ -702,6 +768,7 @@ def test_engineargs_revolta_hybrid_serving_defaults(
     )
     target = args.create_model_config()
     target.quantization = "awq"
+    target.hf_config.quantization_config = model().hf_config.quantization_config
     assert target.is_hybrid
     if "all" in flags:
         # Exercise an explicit mode supported by the model validator.
@@ -719,6 +786,22 @@ def test_engineargs_revolta_hybrid_serving_defaults(
         assert "draft_sample_method" not in args.speculative_config
         assert "attention_backend" not in args.speculative_config
     enabled = active and serving
+    dcp = 1 if "--decode-context-parallel-size" in flags else 2
+    assert config.kernel_config.qsa_dcp_index_shard is (
+        enabled and method == "dflash" and dcp == 2 and "--kernel-config" not in flags
+    )
+    for name in (
+        "VLLM_SM70_QSA_GROUPED_LPT",
+        "VLLM_SM70_GDN_SKINNY_MPLAN",
+        "VLLM_SM70_AWQ_MOE_INT4_ZERO",
+    ):
+        assert os.environ.get(name) == ("1" if enabled else None)
+    assert os.environ.get("VLLM_SM70_DFLASH2_FUSED_QKV_PACK") == (
+        "1" if enabled and method == "dflash" else None
+    )
+    for name in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"):
+        assert os.environ.get(name) == ("expandable_segments:True" if enabled else None)
+    assert os.environ.get("NCCL_GRAPH_REGISTER") == ("0" if enabled else None)
     prefix = (serving or target.is_prefix_caching_supported) and (
         "--no-enable-prefix-caching" not in flags
     )
@@ -727,6 +810,9 @@ def test_engineargs_revolta_hybrid_serving_defaults(
         "all" if "all" in flags else "align" if prefix else "none"
     )
     scheduler = config.scheduler_config
+    assert scheduler.long_prefill_token_threshold == (
+        4896 if enabled and "--long-prefill-token-threshold" not in flags else 0
+    )
     if enabled:
         assert (scheduler.max_num_seqs, scheduler.max_num_batched_tokens) == (
             (4, 4096) if "--max-num-seqs" in flags else (8, 8192)
@@ -735,11 +821,12 @@ def test_engineargs_revolta_hybrid_serving_defaults(
         assert (
             config.parallel_config.tensor_parallel_size,
             config.parallel_config.decode_context_parallel_size,
-        ) == (4, 2)
+        ) == (4, dcp)
         assert config.use_v2_model_runner
         assert config.model_config.max_model_len == 524288
         assert config.cache_config.gpu_memory_utilization == 0.956
         assert config.cache_config.prefix_cache_retention_interval == 0
+        assert scheduler.enable_chunked_prefill
     else:
         assert scheduler.max_num_seqs == 256
         assert scheduler.max_num_batched_tokens == (2048 if serving else 8192)
@@ -755,13 +842,27 @@ def test_engineargs_revolta_hybrid_serving_defaults(
     assert getattr(spec, "num_speculative_tokens_per_batch_size", None) == (
         [tuple(row) for row in dsd] if dsd is not None else None
     )
+    mtp_replay = spec_options.get(
+        "gdn_state_replay", True if enabled and prefix and "all" not in flags else None
+    )
+    default_sync = (method == "dflash" and dsd is not None) or (
+        method == "mtp" and mtp_replay is True
+    )
     assert scheduler.async_scheduling is (
-        "--no-async-scheduling" not in flags
-        and (method != "dflash" or dsd is None or "--async-scheduling" in flags)
+        "--async-scheduling" in flags
+        or ("--no-async-scheduling" not in flags and not default_sync)
     )
     if method == "dflash":
         assert dflash_draft_cache_dtype(config) == "auto"
         assert spec.draft_model_config.dtype == torch.float16
+        policy_options = spec_options.get("sm70_dflash2", {})
+        assert spec.sm70_dflash2.spec_state_replay is policy_options.get(
+            "spec_state_replay",
+            True if enabled and not policy_options.get("fused_gdn_verify") else None,
+        )
+        if policy_options.get("fused_gdn_verify"):
+            assert spec.sm70_dflash2.fused_gdn_verify
+            assert not spec.gdn_spec_state_replay
         lookup = spec.resolved_dflash2_lookup
         if (spec_options.get("dflash2_lookup") or {}).get("enabled", False):
             assert (lookup.mode, lookup.nmax, lookup.max_requests) == (
@@ -788,12 +889,25 @@ def test_engineargs_revolta_hybrid_serving_defaults(
             assert lookup.mode == "off"
     elif method == "mtp":
         assert spec.kv_cache_dtype is None  # Inherits target INT8.
+        assert spec.gdn_state_replay is mtp_replay
+        assert spec.gdn_spec_state_replay is (
+            mtp_replay is True and not scheduler.async_scheduling
+        )
     if enabled and not flags and not spec_options:
+        assert config.compilation_config.compile_ranges_endpoints == [8193]
         if method == "mtp":
+            assert scheduler.prefill_pressure_token_budget == 448
+            assert scheduler.mixed_prefill_step_latency_ms == 0
+            assert os.environ[GRAPH_RESERVE] == "705"
             assert config.compilation_config.cudagraph_capture_sizes == list(
                 range(5, 41, 5)
             )
         elif method == "dflash":
+            assert scheduler.prefill_pressure_token_budget == 448
+            assert scheduler.mixed_prefill_step_latency_ms == 0
+            assert os.environ[GRAPH_RESERVE] == "1000"
+            assert spec.gdn_spec_state_replay
+            assert spec.gdn_deferred_commit_metadata is False
             assert config.compilation_config.cudagraph_capture_sizes == [
                 1,
                 2,
@@ -1001,7 +1115,7 @@ def test_frontend_interconnect_mode_and_audit(
     # policy must not read "pex_p2p" while the workers log nvlink.
     assert audit["interconnect_mode"] == logged
     assert audit["interconnect_policy"] == ("auto" if requested is None else requested)
-    assert len(audit["values"]) == 46
+    assert len(audit["values"]) == 49
 
 
 def _applied_profile(profile, monkeypatch, requested, disabled):

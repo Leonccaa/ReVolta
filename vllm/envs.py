@@ -4007,7 +4007,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="experimental",
         declared_default="False",
         effective_default="False",
-        automatic_conditions=(),
+        automatic_conditions=(
+            "vllm/revolta_profile.py:apply_revolta_profile sets '1'. "
+            "Only AWQ checkpoints with the qualified shape in hybrid serving.",
+        ),
         acceleration_paths=("MoE AWQ",),
         user_visible=False,
     ),
@@ -4780,7 +4783,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default=(
             "False; REVOLTA_QSA_GROUPED_LPT=1 also enables it until 0.2.0rc6."
         ),
-        automatic_conditions=(),
+        automatic_conditions=(
+            "vllm/revolta_profile.py:apply_revolta_profile sets '1' for hybrid "
+            "serving if neither spelling is supplied.",
+        ),
         acceleration_paths=("SM70 QSA grouped page4 decode",),
         user_visible=True,
     ),
@@ -4832,7 +4838,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default=(
             "False; REVOLTA_SKINNY_MPLAN=1 also enables it until 0.2.0rc6."
         ),
-        automatic_conditions=(),
+        automatic_conditions=(
+            "vllm/revolta_profile.py:apply_revolta_profile sets '1' for hybrid "
+            "serving if neither spelling is supplied.",
+        ),
         acceleration_paths=("SM70 Qwen3.8 GDN input projection",),
         user_visible=True,
     ),
@@ -7157,7 +7166,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="configuration",
         declared_default="False",
         effective_default="False",
-        automatic_conditions=(),
+        automatic_conditions=(
+            "vllm/revolta_profile.py:apply_revolta_profile sets '1' for hybrid "
+            "DFlash2 serving.",
+        ),
         acceleration_paths=("DFlash2 verifier",),
         user_visible=False,
     ),

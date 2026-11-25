@@ -154,14 +154,24 @@ take precedence.
 | `--enable-prefix-caching` | `true` | Reuses cached prompt prefixes. The hybrid model validator selects the Mamba state cache mode. |
 | `--max-num-seqs` | `8` | Sets the maximum number of scheduled sequences. |
 | `--max-num-batched-tokens` | `8192` | Sets the total token budget per scheduler step. |
+| `--long-prefill-token-threshold` | `4896`, capped at the model context length | Caps one long prefill when other requests may need the step. |
+| `qsa_dcp_index_shard` (DFlash2 with DCP > 1) | `true` | Shards target QSA indexer keys. MTP and DCP1 keep the replicated default. |
 | `num_speculative_tokens_per_batch_size` (DFlash2 K=7) | `[[1,3,7],[4,4,3],[5,8,4]]` | Selects the number of drafts by batch size. |
 | `num_speculative_tokens_per_batch_size` (MTP K=4 with aligned Mamba caching) | `[[1,3,4],[4,8,3]]` | Selects the number of drafts by batch size. |
 | `dflash2_lookup` (native seven-token DFlash2 selector) | Longest match, suffix 5–16, 65,536-token window, `first_token` gate, statistics enabled, one live request | Uses committed token history to supplement the neural proposal. |
+| `sm70_dflash2.spec_state_replay` | `true` for DFlash2 | Replays accepted GDN tokens on eligible paths. An explicit packed verifier retains precedence. |
+| `gdn_state_replay` | `true` for MTP with aligned Mamba caching | Replays accepted GDN tokens on eligible synchronous paths. |
+| `VLLM_SM70_QSA_GROUPED_LPT`, `VLLM_SM70_GDN_SKINNY_MPLAN` | `1` | Use longest-first grouped QSA work and row-count-based GDN input plans. |
+| `VLLM_SM70_DFLASH2_FUSED_QKV_PACK` | `1` for DFlash2 | Fuses eligible post-convolution QKV packing. |
+| `VLLM_SM70_AWQ_MOE_INT4_ZERO` | `1` for qualified AWQ with compact metadata | Stores AWQ MoE zeros as nibbles. |
+| `PYTORCH_ALLOC_CONF`, `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True` if neither is set | Sets the allocator policy before local GPU workers start. |
 
 The engine still resolves omitted `--async-scheduling` from the executor and
-speculative decoding settings. A DFlash2 schedule selects synchronous scheduling
-by default. The MTP schedule supports asynchronous scheduling. Nonstandard K
-values keep fixed-width drafting when no schedule is supplied.
+speculative decoding settings. The DFlash2 schedule and MTP's post-sampling
+GDN state replay select synchronous scheduling by default. Explicit
+`--async-scheduling` retains the existing compatibility checks and skips
+post-sampling replay. Nonstandard K values keep fixed-width drafting when no
+schedule is supplied.
 
 ### Mixed prefill scheduling
 

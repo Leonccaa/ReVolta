@@ -562,7 +562,7 @@ class EngineArgs:
     max_num_batched_tokens: int | None = None
     max_num_partial_prefills: int = SchedulerConfig.max_num_partial_prefills
     max_long_partial_prefills: int = SchedulerConfig.max_long_partial_prefills
-    long_prefill_token_threshold: int = SchedulerConfig.long_prefill_token_threshold
+    long_prefill_token_threshold: int | None = None
     mixed_prefill_step_latency_ms: float | None = None
     long_prefill_token_threshold_adaptive: bool = (
         SchedulerConfig.long_prefill_token_threshold_adaptive
@@ -1455,7 +1455,7 @@ class EngineArgs:
         )
         scheduler_group.add_argument(
             "--long-prefill-token-threshold",
-            **scheduler_kwargs["long_prefill_token_threshold"],
+            **(scheduler_kwargs["long_prefill_token_threshold"] | {"default": None}),
         )
         scheduler_group.add_argument(
             "--long-prefill-token-threshold-adaptive",
@@ -1828,6 +1828,16 @@ class EngineArgs:
         defaults: dict[str, Any] = {}
         k = spec.num_speculative_tokens
         dflash2_k7 = k == spec.resolved_dflash2_lookup.draft_tokens == 7
+        mtp_aligned_cache = (
+            spec.method == "mtp"
+            and self.enable_prefix_caching
+            and not (
+                self.mamba_cache_mode == "all"
+                and target_model_config.supports_mamba_prefix_caching
+            )
+        )
+        if mtp_aligned_cache and "gdn_state_replay" not in self.speculative_config:
+            defaults["gdn_state_replay"] = True
         if (
             "num_speculative_tokens_per_batch_size" not in self.speculative_config
             and "dflash_concurrency_drafts" not in self.speculative_config
@@ -1842,15 +1852,7 @@ class EngineArgs:
                 ]
             # Dynamic MTP needs align mode. Preserve an explicit opt-out of
             # prefix caching or an explicitly selected, supported 'all' mode.
-            elif (
-                spec.method == "mtp"
-                and k == 4
-                and self.enable_prefix_caching
-                and not (
-                    self.mamba_cache_mode == "all"
-                    and target_model_config.supports_mamba_prefix_caching
-                )
-            ):
+            elif k == 4 and mtp_aligned_cache:
                 defaults["num_speculative_tokens_per_batch_size"] = [
                     (1, 3, 4),
                     (4, 8, 3),
@@ -2086,6 +2088,11 @@ class EngineArgs:
             has_nvfp4_weights,
         )
 
+        hybrid_serving = (
+            getattr(usage_context, "name", None) == "OPENAI_API_SERVER"
+            and model_config.is_hybrid
+            and model_config.runner_type == "generate"
+        )
         # The profile controls whether the 1Cat MTP defaults apply.
         revolta_profile_enabled = apply_revolta_profile(
             model_config,
@@ -2094,7 +2101,9 @@ class EngineArgs:
             interconnect_mode=frontend_interconnect_mode(
                 disable_custom_all_reduce=self.disable_custom_all_reduce
             ),
-            speculative_method=(self.speculative_config or {}).get("method"),
+            speculative_method=(self.spec_method if hybrid_serving else None)
+            or (self.speculative_config or {}).get("method"),
+            hybrid_serving=hybrid_serving,
             allow_shared_expert_overlap=not (
                 self.enable_expert_parallel or self.enable_dbo
             ),
@@ -2102,12 +2111,7 @@ class EngineArgs:
         use_sm70_mtp_graph_defaults = self._maybe_apply_sm70_mtp_defaults(
             usage_context, model_config
         )
-        revolta_hybrid_serving = (
-            revolta_profile_enabled
-            and getattr(usage_context, "name", None) == "OPENAI_API_SERVER"
-            and model_config.is_hybrid
-            and model_config.runner_type == "generate"
-        )
+        revolta_hybrid_serving = revolta_profile_enabled and hybrid_serving
         if revolta_hybrid_serving:
             if self.max_num_seqs is None:
                 self.max_num_seqs = 8
@@ -2439,6 +2443,12 @@ class EngineArgs:
         assert model_config.max_model_len is not None, (
             "max_model_len must be set by this point"
         )
+        if self.long_prefill_token_threshold is None:
+            self.long_prefill_token_threshold = (
+                min(4896, model_config.max_model_len)
+                if revolta_hybrid_serving
+                else SchedulerConfig.long_prefill_token_threshold
+            )
         scheduler_config = SchedulerConfig(
             runner_type=model_config.runner_type,
             max_num_batched_tokens=self.max_num_batched_tokens,
@@ -2666,6 +2676,7 @@ class EngineArgs:
             additional_config=self.additional_config,
             optimization_level=self.optimization_level,
             performance_mode=self.performance_mode,
+            revolta_hybrid_serving=revolta_hybrid_serving,
             weight_transfer_config=self.weight_transfer_config,
             shutdown_timeout=self.shutdown_timeout,
             shutdown_reap_timeout=self.shutdown_reap_timeout,

@@ -11,6 +11,8 @@ import json
 import os
 from typing import Any, Literal
 
+from vllm import envs
+
 InterconnectMode = Literal["pex_p2p", "no_p2p", "nvlink"]
 
 COMMON_DEFAULTS = {
@@ -39,6 +41,7 @@ AWQ_DEFAULTS = {
     "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT": "8",
     "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_PACK_ROWS": "24",
     "VLLM_SM70_AWQ_TUNE_SMALL_SHAPES": "1",
+    "VLLM_SM70_AWQ_MOE_INT4_ZERO": "1",
     # Measured for the AWQ TP4 graph pool.
     "VLLM_V2_CUDAGRAPH_MEM_MIB": "700",
 }
@@ -64,6 +67,11 @@ DFLASH_DEFAULTS = {
     "VLLM_V2_CUDAGRAPH_MEM_MIB": "1200",
     "VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS": "0",
 }
+HYBRID_SERVING_DEFAULTS = {
+    "VLLM_SM70_QSA_GROUPED_LPT": "1",
+    "VLLM_SM70_GDN_SKINNY_MPLAN": "1",
+}
+DFLASH_SERVING_DEFAULTS = {"VLLM_SM70_DFLASH2_FUSED_QKV_PACK": "1"}
 AWQ_DFLASH_DEFAULTS = {"VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP": "1"}
 # With a planar KV cache (fp8_per_token_head, the QSA auto choice, or int8) the
 # graphs are smaller than with the scalar FP8 cache. Measured per GPU on TP4:
@@ -114,11 +122,12 @@ AUDITED_NAMES = tuple(
         set(COMMON_DEFAULTS)
         | set(AWQ_DEFAULTS)
         | set(CUSTOM_AR_DEFAULTS)
+        | set(HYBRID_SERVING_DEFAULTS)
+        | set(DFLASH_SERVING_DEFAULTS)
         | set(UPSTREAM_AND_DEPLOYMENT)
     )
 )
-# Keep the AWQ audit inventory byte-compatible. Format-specific entries are
-# included in NVFP4 audits and provenance transport only.
+# Include NVFP4-only entries in NVFP4 audits and provenance transport.
 # VLLM_SM70_FP8_TURBOMIND is no longer written (its unset default is already 1;
 # kernel_config.sm70_fp8.enabled replaces it for FP8 linear layers) but stays
 # audited for NVFP4 mixed checkpoints, whose MoE consumers still read it.
@@ -244,8 +253,8 @@ def all_visible_devices_sm70() -> bool:
     """Conservative early check, before EngineArgs applies its MTP defaults.
 
     Unknown/mixed visible devices retain upstream defaults; worker topology
-    discovery belongs to the interconnect resolver. Allocator configuration must
-    already be present before querying platform capabilities.
+    discovery belongs to the interconnect resolver. The supported NVIDIA
+    platform uses NVML for capability queries before CUDA initialization.
     """
     from vllm.platforms import current_platform
 
@@ -331,6 +340,7 @@ def apply_revolta_profile(
     is_sm70: bool,
     interconnect_mode: InterconnectMode = "pex_p2p",
     speculative_method: str | None = None,
+    hybrid_serving: bool = False,
     allow_shared_expert_overlap: bool = True,
     kv_cache_dtype: str | None = None,
     num_speculative_tokens_per_batch_size: list[tuple[int, int, int]] | None = None,
@@ -381,6 +391,26 @@ def apply_revolta_profile(
             defaults.update(mtp_planar_kv_defaults)
     if interconnect_mode != "no_p2p":
         defaults.update(CUSTOM_AR_DEFAULTS)
+    if not hybrid_serving or not envs.VLLM_SM70_AWQ_MOE_COMPACT_METADATA:
+        defaults.pop("VLLM_SM70_AWQ_MOE_INT4_ZERO", None)
+    if hybrid_serving:
+        from vllm.env_override import _default_nccl_graph_register
+
+        defaults.update(HYBRID_SERVING_DEFAULTS)
+        if speculative_method == "dflash":
+            defaults.update(DFLASH_SERVING_DEFAULTS)
+        for alias, name in envs.PROMOTED_RESEARCH_ENVS.items():
+            if alias in os.environ:
+                defaults.pop(name, None)
+
+        # The API process configures the allocator before spawning the engine
+        # and GPU workers. Both PyTorch spellings honor either user setting.
+        if not torch.cuda.is_initialized() and not (
+            "PYTORCH_ALLOC_CONF" in os.environ
+            or "PYTORCH_CUDA_ALLOC_CONF" in os.environ
+        ):
+            defaults["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+            defaults["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     for name, value in defaults.items():
         if name not in os.environ or _PROFILE_VALUES.get(name) == os.environ[name]:
             os.environ[name] = value
@@ -389,6 +419,8 @@ def apply_revolta_profile(
             # Also recognize programmatic overrides supplied after import vllm
             # but before EngineArgs/VllmConfig construction.
             _INITIAL_ENV.setdefault(name, os.environ[name])
+    if hybrid_serving:
+        _default_nccl_graph_register(os.environ)
     _export_provenance()
     return True
 

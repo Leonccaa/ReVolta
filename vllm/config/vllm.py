@@ -10,7 +10,7 @@ import threading
 import time
 from collections.abc import Iterable
 from contextlib import contextmanager
-from dataclasses import is_dataclass
+from dataclasses import InitVar, is_dataclass
 from datetime import datetime
 from enum import IntEnum
 from functools import lru_cache
@@ -1307,6 +1307,9 @@ class VllmConfig:
     outside compute_hash() so enabling diagnostics reuses the same graphs.
     """
 
+    revolta_hybrid_serving: InitVar[bool] = False
+    """Resolve serving-only ReVolta defaults for this EngineArgs invocation."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -1924,7 +1927,7 @@ class VllmConfig:
         except (ValueError, AttributeError, ImportError, TypeError):
             return False
 
-    def __post_init__(self):
+    def __post_init__(self, revolta_hybrid_serving: bool = False):
         """Verify configs are valid & consistent with each other."""
 
         if self.speculative_config is not None:
@@ -1957,9 +1960,17 @@ class VllmConfig:
                 ),
                 speculative_method=getattr(self.speculative_config, "method", None),
                 allow_shared_expert_overlap=allow_shared_expert_overlap,
+                hybrid_serving=revolta_hybrid_serving,
             )
             apply_revolta_kernel_profile(
                 self.kernel_config, enabled=revolta_profile_enabled
+            )
+        if self.kernel_config.qsa_dcp_index_shard is None:
+            self.kernel_config.qsa_dcp_index_shard = (
+                revolta_hybrid_serving
+                and self.parallel_config.decode_context_parallel_size > 1
+                and self.speculative_config is not None
+                and self.speculative_config.use_dflash()
             )
 
         # To give each torch profile run a unique instance name.
@@ -2205,6 +2216,18 @@ class VllmConfig:
             ):
                 logger.info_once(
                     "Using synchronous scheduling by default for dynamic DFlash."
+                )
+                self.scheduler_config.async_scheduling = False
+            elif (
+                revolta_hybrid_serving
+                and self.speculative_config is not None
+                and self.speculative_config.method == "mtp"
+                and self.speculative_config.gdn_state_replay
+                and self.speculative_config.gdn_deferred_commit_metadata is not True
+                and self.cache_config.mamba_cache_mode == "align"
+            ):
+                logger.info_once(
+                    "Using synchronous scheduling by default for MTP GDN state replay."
                 )
                 self.scheduler_config.async_scheduling = False
             elif dflash_ddtree_tree_verify:
@@ -2623,6 +2646,16 @@ class VllmConfig:
                     )
                 )
             )
+            if (
+                revolta_hybrid_serving
+                and self.speculative_config.use_dflash()
+                and policy.spec_state_replay is None
+                and not (
+                    policy.fused_gdn_verify
+                    and "fused_gdn_verify" in policy.explicit_fields
+                )
+            ):
+                policy.spec_state_replay = True
             if (
                 self.model_config is not None
                 and self.model_config.quantization == "fp8"

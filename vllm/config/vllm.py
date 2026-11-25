@@ -2657,22 +2657,21 @@ class VllmConfig:
                 from vllm.v1.worker.gpu.spec_decode import uses_dflash_selector_engine
 
                 if uses_dflash_selector_engine(self):
-                    verifier_defaults: tuple[str, ...] = (
+                    for name in (
                         "context_kv_graph",
                         "verify_fastpath",
                         "fused_gdn_metadata",
                         "fused_smallq_metadata",
                         "grouped_smallq_metadata",
-                    )
+                    ):
+                        if name not in policy.explicit_fields:
+                            setattr(policy, name, True)
                     # Either context switch can trigger full KV graph capture.
                     if (
                         policy.context_kv_graph
-                        or "context_kv_graph" not in policy.explicit_fields
+                        and "context_pipeline" not in policy.explicit_fields
                     ):
-                        verifier_defaults += ("context_pipeline",)
-                    for name in verifier_defaults:
-                        if name not in policy.explicit_fields:
-                            setattr(policy, name, True)
+                        policy.context_pipeline = True
                 if policy.spec_state_replay is None and not (
                     policy.fused_gdn_verify
                     and "fused_gdn_verify" in policy.explicit_fields

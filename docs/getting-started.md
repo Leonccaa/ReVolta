@@ -9,7 +9,7 @@ concurrent requests in testing, and a 48 GiB CPU KV pool.
 
 ## 1. Install
 
-The distribution name is `revolta` (version `0.1.4`). The Python import name and the
+This recipe uses the `revolta` distribution (version `0.2.0rc15`). The Python import name and the
 CLI are still **`vllm`** (`import vllm`, `vllm serve`); this is intentional. Only
 compute capability 7.0 is built, with CUDA 12.8, Python 3.12 and PyTorch 2.10.
 
@@ -18,26 +18,23 @@ From PyPI (Linux x86-64 with glibc 2.34 or newer, Python 3.12):
 ```bash
 python3.12 -m venv /data/revolta/venv
 . /data/revolta/venv/bin/activate
-pip install revolta==0.1.4
-vllm --version          # 0.1.4
+pip install --pre revolta==0.2.0rc15
+vllm --version          # 0.2.0rc15
 ```
 
 The wheel pins `torch==2.10.0`, `torchaudio==2.10.0` and `torchvision==0.25.0`,
 and pip installs them from PyPI. PyPI's `torch==2.10.0` is the CUDA 12.8 build.
 Install the NVIDIA driver for CUDA 12.8 on the host.
 
-For a PyPI installation, install the CUDA 12.8 Toolkit on the serving host as
-well. The engine can compile kernels on first startup. Make sure
-`nvcc --version` reports CUDA 12.8 in the environment that runs `vllm serve`.
-For a toolkit outside the default search path, add its `bin` directory to
-`PATH` and set `CUDA_HOME` to the toolkit root.
+Install the CUDA 12.8 Toolkit on the serving host for first-start kernel
+compilation. Check that `nvcc` is on `PATH` and `nvcc --version` reports CUDA 12.8.
 
 The wheel attached to the GitHub release contains the same files. Only its metadata
 differs: it pins the same versions to the CUDA 12.8 builds on `download.pytorch.org`
 and has the generic `linux_x86_64` tag.
 
 ```bash
-pip install "https://github.com/Leonccaa/ReVolta/releases/download/v0.1.4/revolta-0.1.4-cp312-cp312-linux_x86_64.whl"
+pip install "https://github.com/Leonccaa/ReVolta/releases/download/v0.2.0rc15/revolta-0.2.0rc15-cp312-cp312-linux_x86_64.whl"
 ```
 
 ReVolta does not report to the upstream vLLM statistics server. It sends its own
@@ -47,7 +44,7 @@ contains and how to turn it off.
 Or use the Docker image:
 
 ```bash
-docker pull ghcr.io/leonccaa/revolta:0.1.4
+docker pull ghcr.io/leonccaa/revolta:0.2.0rc15
 ```
 
 ## 2. Download the checkpoint and make 512K views
@@ -240,7 +237,7 @@ docker run --rm --gpus all \
   -e VLLM_PLE_OFFLOAD_READY_TIMEOUT=1200 \
   -e VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES=1 \
   -e TILELANG_CACHE_DIR=/data/revolta/cache/tilelang \
-  ghcr.io/leonccaa/revolta:0.1.4 \
+  ghcr.io/leonccaa/revolta:0.2.0rc15 \
   /data/revolta/views/target-512k --served-model-name Qwen3.8-Flash-Next ...
 ```
 

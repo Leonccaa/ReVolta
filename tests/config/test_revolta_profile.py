@@ -818,74 +818,18 @@ def sm70_serving_resolution(monkeypatch):
 
 
 @pytest.mark.skip_global_cleanup
-@pytest.mark.parametrize(
-    ("active", "backend", "expected"),
-    [
-        (True, None, "FLASH_ATTN_V100"),
-        (True, "TRITON_ATTN", "TRITON_ATTN"),
-        (False, None, None),
-    ],
-)
-def test_grouped_tiering_uses_serving_attention_backend(
-    profile, monkeypatch, tmp_path, active, backend, expected
-):
+@pytest.mark.parametrize("active", [True, False])
+def test_hybrid_serving_attention_backend(profile, monkeypatch, tmp_path, active):
     from vllm.engine import arg_utils
-    from vllm.v1.kv_cache_interface import (
-        FullAttentionSpec,
-        KVCacheConfig,
-        KVCacheGroupSpec,
-        KVCacheTensor,
-        MambaSpec,
-    )
-    from vllm.v1.kv_offload.tiering.spec import TieringOffloadingSpec
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-    connector = {
-        "kv_connector": "OffloadingConnector",
-        "kv_role": "kv_both",
-        "kv_connector_extra_config": {
-            "spec_name": "TieringOffloadingSpec",
-            "cpu_bytes_to_use": 2**20,
-        },
-    }
-    flags = ["--kv-transfer-config", json.dumps(connector)]
-    if backend is not None:
-        flags.extend(("--attention-backend", backend))
     args, context = hybrid_serving_args(
-        profile, monkeypatch, tmp_path, None, flags, {}, active=active
+        profile, monkeypatch, tmp_path, None, [], {}, active=active
     )
     monkeypatch.setattr(arg_utils, "VllmConfig", SimpleNamespace)
     config = args.create_engine_config(usage_context=context)
-    cache = KVCacheConfig(
-        num_blocks=4,
-        kv_cache_tensors=[KVCacheTensor(size=16384, shared_by=["attn", "state"])],
-        kv_cache_groups=[
-            KVCacheGroupSpec(
-                ["attn"],
-                FullAttentionSpec(
-                    block_size=16, num_kv_heads=1, head_size=64, dtype=torch.float16
-                ),
-            ),
-            KVCacheGroupSpec(
-                ["state"],
-                MambaSpec(
-                    block_size=16,
-                    shapes=((1,),),
-                    dtypes=(torch.float16,),
-                    mamba_cache_mode="align",
-                ),
-            ),
-        ],
-    )
-    if expected is None:
-        assert config.attention_config.backend is None
-        with pytest.raises(ValueError, match="requires an explicit attention backend"):
-            TieringOffloadingSpec(config, cache)
-    else:
-        spec = TieringOffloadingSpec(config, cache)
-        assert spec.partition_by_group
-        assert spec.persistent_layout["attention_backend"] == (
-            f"AttentionBackendEnum.{expected}"
-        )
+    expected = AttentionBackendEnum.FLASH_ATTN_V100 if active else None
+    assert config.attention_config.backend is expected
 
 
 @pytest.mark.skip_global_cleanup

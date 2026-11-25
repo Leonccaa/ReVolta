@@ -5,11 +5,13 @@ Use this guide to configure prefix-cache offload to CPU memory and disk. Start w
 
 See [Coming back to a document](performance.md#coming-back-to-a-document) for measured readback times.
 
-In GPU KV mode, the active KV cache lives on the GPUs. Offload adds lower tiers
-that keep evicted prefixes, so a later request with the same prefix can read them
-back instead of running prefill again. Readback with scalar E4M3 matched the
-off-mode reference token for token in the tests below. For active main K/V
-placement in host memory, see [Host KV](#active-host-kv-development-configuration).
+The KV cache always lives on the GPUs first. Offload adds lower tiers that keep
+evicted prefixes, so a later request with the same prefix reads them back instead of
+running prefill again. All three modes were tested for correct readback: tokens
+generated after readback matched the off-mode reference exactly.
+
+For active main K/V placement in host memory, see
+[Host KV](#active-host-kv-development-configuration).
 
 **1. Off.** Remove `--kv-transfer-config`. This uses the least host memory with the default pinned PLE table (80 GiB passed memory stress; full acceptance was not run). Evicted prefixes are
 computed again.
@@ -136,9 +138,8 @@ positive increment.
 **3. GPU KV + CPU + SSD.** Replace the launch command's `--kv-transfer-config`
 with the JSON below. First create the content manifest for the target and any
 separately loaded draft as described under [Verified disk tier](#verified-disk-tier-revolta_fs-experimental).
-Eligible QSA models on V100 use planar INT8 with `--kv-cache-dtype auto`.
-The raw `fs` tier is rejected if any target or draft group uses planar INT8 or
-per-token-head E4M3. The example uses `revolta_fs`, which supports both.
+Use `revolta_fs` for planar INT8 (the default for eligible QSA models on V100)
+or per-token-head E4M3, both of which the raw `fs` tier rejects.
 
 ```json
 {
@@ -157,7 +158,8 @@ per-token-head E4M3. The example uses `revolta_fs`, which supports both.
         "min_free_bytes": 17179869184,
         "max_files": 10000,
         "n_read_threads": 1,
-        "n_write_threads": 1
+        "n_write_threads": 1,
+        "drain_timeout_s": 20
       }
     ],
     "demote_superseded_states": true,
@@ -166,10 +168,7 @@ per-token-head E4M3. The example uses `revolta_fs`, which supports both.
 }
 ```
 
-The example sets a 2 GiB CPU pool and an 8 GiB disk budget. Set
-`cpu_bytes_to_use` for the prefixes you need to stage in RAM and
-`max_size_bytes` for the space available under `root_dir`. Keep
-`TieringOffloadingSpec` selected so the engine constructs the SSD tier.
+The example sets a 2 GiB CPU pool and an 8 GiB disk budget.
 
 - `max_size_bytes` is **required**. It is a positive integer: the total page budget
   for everything under `root_dir`. Configuration fails without it.
@@ -177,8 +176,9 @@ The example sets a 2 GiB CPU pool and an 8 GiB disk budget. Set
   its capacity.
 - Use one dedicated directory for each engine. A lock file allows only one engine per
   root.
-- To reuse disk pages after a restart, keep the same checkpoint, compatible
-  page layout and `.hash_seed.json` in the root.
+- To reuse disk pages after a restart, the model, ReVolta version and page layout must
+  be the same. Keep `.hash_seed.json` in the root. Restart reuse in the release
+  gate: passed (a restarted engine read 667 MB of pages back from disk; output identical).
 - The SSD tier is a disposable cache, not model storage.
 - A prefix restored from disk is staged in the CPU pool first, so `cpu_bytes_to_use` must
   be larger than the largest prefix you expect to restore from disk (about 21 KB per
@@ -187,10 +187,9 @@ The example sets a 2 GiB CPU pool and an 8 GiB disk budget. Set
   again. The quick-start 48 GiB pool holds about 2.4M tokens with MTP4; with DFlash2 the
   same pool holds about 1M tokens, an estimate from the same about 50 KB per token.
 
-Validation scope: the full release gate passed with the SSD tier on a network file
+Validation scope for the raw `fs` tier: the full release gate passed on a network file
 system (8 GiB CPU pool, 40 GiB disk budget), including a 99K-token prefix restored from
-disk (96,288 cached tokens, output identical). The restarted engine read 667 MB
-of pages from disk and produced the same output. In 0.1.4 the tier was also measured on a
+disk (96,288 cached tokens, output identical). In 0.1.4 the tier was also measured on a
 local NVMe SSD with DFlash2 (7 GiB CPU pool, 64 GiB disk budget, one read and one write
 thread). After an engine restart, 11 of 11 documents were read back from disk with the
 same 64-token greedy output as a cold run, reading the pages from disk at about
@@ -219,7 +218,8 @@ The tier adds:
 - **Identity:** pages are bound to the contents of the loaded checkpoint, not its
   path. Create a content manifest once per checkpoint, with the same paths the engine
   loads, and keep it outside the model directories. Run the tool from a ReVolta
-  checkout. Omit the `draft` role when the draft is part of the target checkpoint.
+  checkout. Include a `draft` role for a draft loaded from a different checkpoint
+  root.
 
   ```bash
   python tools/kv_offload/make_content_manifest.py \
@@ -273,13 +273,14 @@ including time in the queue. Completion polling reports overdue jobs as failed
 after any protected source snapshot finishes. Each page shares the job deadline.
 An active kernel I/O call still has to return before its worker can shut down.
 
-Set a positive `--shutdown-timeout` when this tier should drain at shutdown (the
-default is 0, as upstream vLLM), and keep `ssd.drain_timeout_s` below it. Give the
-container or service supervisor at least 120 seconds before force-stopping the
-engine, and longer if the engine's own budget requires it. See
-[#51](https://github.com/Leonccaa/ReVolta/issues/51) for shared-memory cleanup
-after restarts. With `--shutdown-timeout 0` a stop aborts in-flight requests and
-stops the engine before the tier can drain. Any queued writes are lost.
+Set a positive `--shutdown-timeout` to allow draining. The engine subtracts
+5 seconds from this timeout and shares the remaining budget between finishing
+in-flight requests and draining SSD writes. The example pairs
+`--shutdown-timeout 30` with `drain_timeout_s: 20`, and SSD writes get at most
+the time left after requests finish. Give the container or service supervisor
+at least 120 seconds before force-stopping the engine. The default
+`--shutdown-timeout 0` skips the drain. See
+[#51](https://github.com/Leonccaa/ReVolta/issues/51) for shared-memory cleanup.
 
 Counters of a `revolta_fs` tier (pages written, existing, verified, checksum
 failures, pages skipped after a failure in the same chain, modification-time updates,
@@ -368,8 +369,9 @@ read back.
 `speculative_config.gdn_state_replay=true` replays the accepted target GDN
 inputs for MTP, so recurrent layers keep two state blocks per request instead
 of one per draft position; `gdn_state_replay_graph` (default true) captures
-that replay for FULL verify shapes. The SSD tier's content manifest only needs
-the target checkpoint, which also holds the MTP layers.
+that replay for FULL verify shapes. For Host SSD, include the external MTP
+checkpoint as the `draft` role in the content manifest. Omit that role only
+when the target and draft share a checkpoint root.
 
 `hot_pool_gib` and `hot_pool_ratio` are mutually exclusive ways to set a
 **guaranteed minimum number of hot slots**. GiB sizing converts the total

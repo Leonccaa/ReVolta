@@ -75,28 +75,18 @@ class SharedOffloadRegion:
         except BaseException as exc:
             # A parent HostRegionOwner tracks scheduler-only names even if
             # this constructor never returns to its caller.
-            try:
-                # A full tmpfs can surface as EFAULT while prefaulting pages.
-                if isinstance(exc, OSError) and exc.errno in (
-                    errno.ENOSPC,
-                    errno.EFAULT,
-                ):
-                    free = shutil.disk_usage("/dev/shm").free
-                    allocated = (
-                        os.fstat(self.fd).st_blocks * 512 if self.fd is not None else 0
-                    )
-                    if exc.errno == errno.ENOSPC or free + allocated < total_size_bytes:
-                        raise OSError(
-                            exc.errno,
-                            f"CPU KV offload needs {total_size_bytes:,} bytes in "
-                            f"/dev/shm. {free:,} bytes free "
-                            f"({allocated:,} bytes already allocated to this mapping). "
-                            "Remove stale vllm_offload_*.mmap files that no process "
-                            "has open and set a positive --shutdown-timeout.",
-                            self.mmap_path,
-                        ) from exc
-            finally:
-                self.cleanup()
+            self.cleanup()
+            # A full tmpfs can surface as EFAULT while prefaulting pages.
+            if isinstance(exc, OSError) and exc.errno in (errno.ENOSPC, errno.EFAULT):
+                free = shutil.disk_usage("/dev/shm").free
+                raise OSError(
+                    exc.errno,
+                    f"CPU KV offload needs {total_size_bytes:,} bytes in "
+                    f"/dev/shm. {free:,} bytes free. "
+                    "Remove stale vllm_offload_*.mmap files that no process "
+                    "has open and set a positive --shutdown-timeout.",
+                    self.mmap_path,
+                ) from exc
             raise
 
     def _open_mapping(self, rank: int | None, num_blocks: int, cpu_page_size: int):

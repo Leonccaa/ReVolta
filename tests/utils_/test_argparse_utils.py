@@ -154,27 +154,35 @@ def test_yaml_false_uses_registered_negative_option(tmp_path, subcommand):
     assert parser.parse_args([*argv, "--enable-prefix-caching"]).enable_prefix_caching
 
 
-def test_yaml_optional_boolean_null_is_unset(tmp_path):
+def test_yaml_top_level_null_is_unset(tmp_path):
     parser = FlexibleArgumentParser()
     serve = parser.add_subparsers().add_parser("serve")
-    serve.add_argument("model")
+    serve.add_argument("model_tag", nargs="?")
+    serve.add_argument("--model")
     serve.add_argument("--enable-prefix-caching", action=BooleanOptionalAction)
     serve.add_argument("--async-scheduling", action=BooleanOptionalAction)
-    serve.add_argument("--speculative-config", type=json.loads)
+    serve.add_argument("--grpc", action="store_true")
+    serve.add_argument("--headless", action="store_true")
+    serve.add_argument("--tokenizer")
     config = tmp_path / "config.yaml"
     config.write_text(
+        "model: target\n"
         "enable-prefix-caching: null\n"
         "async_scheduling: null\n"
-        "speculative-config:\n"
-        "  enforce_eager: null\n"
+        "grpc: null\n"
+        "headless: null\n"
+        "tokenizer: null\n"
     )
     args = parser.parse_args(
-        ["serve", "target", "--config", str(config), "--no-async-scheduling"]
+        ["serve", "--config", str(config), "--no-async-scheduling"]
     )
     assert args.model == "target"
+    assert args.model_tag is None
     assert args.enable_prefix_caching is None
     assert args.async_scheduling is False
-    assert args.speculative_config == {"enforce_eager": None}
+    assert args.grpc is False
+    assert args.headless is False
+    assert args.tokenizer is None
 
 
 def test_config_file(parser_with_config):

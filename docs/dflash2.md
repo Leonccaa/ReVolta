@@ -91,7 +91,10 @@ rule. `"greedy"` still works. MTP must stay `"greedy"`; see
 
 ## Settings
 
-- **Enable the six `sm70_dflash2` options above.** They are off unless set.
+- **The six `sm70_dflash2` options above default to on** for the qualifying
+  Flash-Next serving profile with a DFlash2 selector in RC15. On older
+  releases, enable them as shown above. With the RC15 startup patch, explicitly
+  setting `context_kv_graph: false` also leaves an unset `context_pipeline` off.
 - **Do not enable** `fused_gdn_verify`, `fused_gdn_norm`, `fused_gdn_split` or
   `fused_gdn_combined_split`. They change the numerics and lowered sampled acceptance
   in our tests.

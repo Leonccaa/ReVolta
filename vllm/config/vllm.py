@@ -574,6 +574,8 @@ def _qwen4exp_ple_cascade_requested(cfg: "VllmConfig") -> bool:
         reason = "disabled by KernelConfig"
     elif model is None or not layers:
         reason = "no PLE layers"
+    elif policy.ple_disk_cascade_source != "explicit":
+        reason = "disk cascade requires an explicit setting"
     elif not _ple_disk_cascade_cuda_supported():
         reason = "requires CUDA resident tiers"
     elif model.dtype != torch.float16:

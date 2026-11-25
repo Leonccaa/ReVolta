@@ -273,10 +273,11 @@ with the 512K views.
 **128 GiB RAM is recommended** for the default 48 GiB CPU KV pool. The AWQ PLE
 embedding table uses about 47.7 GiB of pinned host memory even with KV offload disabled.
 
-Automatic PLE placement in the ReVolta serving profile uses a startup memory
-snapshot. It does not reserve host memory across independent server launches.
-Start instances sharing the same host memory limit one at a time, or specify
-their PLE and KV budgets explicitly.
+With automatic PLE placement, the table fills pinned host memory first and
+keeps any remaining rows on the GPU. The budget accounts for the cgroup
+limit, host reserve and CPU or Host KV pools. This startup snapshot does not
+reserve memory across independent launches. Start servers sharing a memory
+limit one at a time or set their PLE and KV budgets explicitly.
 
 | Container memory limit | KV offload | Result |
 | --- | --- | --- |

@@ -834,23 +834,25 @@ def test_hybrid_serving_attention_backend(profile, monkeypatch, tmp_path, active
 
 @pytest.mark.skip_global_cleanup
 @pytest.mark.parametrize(
-    ("active", "host_available", "explicit_host", "host_rows"),
+    ("serving", "host_available", "explicit_host", "cascade", "rows"),
     [
-        (True, 64, None, 10),
-        (True, 34, None, 6),
-        (True, 64, "3", 3),
-        (False, 64, None, 4),
+        (True, 64, None, False, (0, 10, 0)),
+        (False, 64, None, False, (0, 10, 0)),
+        (True, 34, None, False, (4, 6, 0)),
+        (True, 64, "3", False, (7, 3, 0)),
+        (True, 34, None, True, (6, 2, 2)),
     ],
 )
-def test_revolta_serving_ple_placement(
+def test_ple_placement_defaults(
     profile,
     monkeypatch,
     tmp_path,
     sm70_serving_resolution,
-    active,
+    serving,
     host_available,
     explicit_host,
-    host_rows,
+    cascade,
+    rows,
 ):
     from vllm.config import set_current_vllm_config
     from vllm.models.qwen4_exp.common import ple
@@ -858,6 +860,9 @@ def test_revolta_serving_ple_placement(
     from vllm.models.qwen4_exp.nvidia.ple_layer import Qwen4ExpPinnedHostEmbedding
 
     gib = 2**30
+    monkeypatch.setattr(
+        "vllm.config.vllm._ple_disk_cascade_cuda_supported", lambda: True
+    )
     monkeypatch.setattr(
         ple, "preflight_host_memory", lambda: (64 * gib, host_available * gib, "test")
     )
@@ -868,30 +873,37 @@ def test_revolta_serving_ple_placement(
         "kv_role": "kv_both",
         "kv_connector_extra_config": {"cpu_bytes_to_use": 2 * gib},
     }
+    flags = ["--kv-transfer-config", json.dumps(connector)]
+    if cascade:
+        flags.extend(("--kernel-config", '{"ple_disk_cascade":true}'))
     args, context = hybrid_serving_args(
         profile,
         monkeypatch,
         tmp_path,
         None,
-        ["--kv-transfer-config", json.dumps(connector)],
+        flags,
         {},
-        active=active,
+        active=False,
+        serving=serving,
     )
-    args.create_model_config().hf_text_config.ple_layer_ids = [2]
+    text = args.create_model_config().hf_text_config
+    text.ple_layer_ids = [2]
+    text.ple_embedding_dtype = "float8_e4m3fn"
     config = args.create_engine_config(usage_context=context)
+    assert config.kernel_config.ple_disk_cascade_active is cascade
     spill = Mock(return_value=4 * gib)
     table = SimpleNamespace(
         embedding_dim=gib,
         _meta_weight_shape=(10, gib),
         _device_spill_bytes=spill,
-        _cap_derived_host_budget=lambda budget: budget,
+        _cap_derived_host_budget=lambda budget: min(2 * gib, budget),
     )
     with set_current_vllm_config(config):
         placement = Qwen4ExpPinnedHostEmbedding._plan_placement(
             table, torch.device("cuda")
         )
-    assert placement == PLEPlacement(10 - host_rows, host_rows, 0)
-    assert spill.call_count == (0 if active else 1)
+    assert placement == PLEPlacement(*rows)
+    assert spill.call_count == int(cascade)
 
 
 @pytest.mark.skip_global_cleanup

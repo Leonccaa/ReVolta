@@ -3,7 +3,7 @@
 """Common Qwen4Exp PLE helpers."""
 
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from itertools import pairwise
 from pathlib import Path
@@ -18,6 +18,7 @@ from vllm.utils.mem_utils import format_gib
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.v1.kv_cache_interface import KVCacheSpec
 
 logger = init_logger(__name__)
 
@@ -588,6 +589,70 @@ def cpu_kv_offload_bytes(config: Any) -> int:
         return legacy_host_bytes + max(0, int(extra.get("cpu_bytes_to_use", 0)))
     size = getattr(getattr(config, "cache_config", None), "kv_offloading_size", None)
     return legacy_host_bytes + max(0, int((size or 0) * 2**30))
+
+
+def defer_ple_for_token_host_pool(config: "VllmConfig") -> bool:
+    settings = config.kernel_config.long_context_kv
+    return (
+        config.kernel_config.ple_auto_host_budget_bytes is not None
+        and settings.enabled
+        and settings.main_kv_placement == "host"
+        and settings.host_pool_tokens is not None
+    )
+
+
+def finalize_ple_after_model_load(
+    config: "VllmConfig", get_specs: Callable[[], dict[str, "KVCacheSpec"]]
+) -> None:
+    """Charge the token-sized host pool using the final target and draft layout."""
+    if not defer_ple_for_token_host_pool(config):
+        return
+
+    from vllm.config import get_layers_from_vllm_config
+    from vllm.models.qwen4_exp.nvidia.ple_layer import Qwen4ExpPinnedHostEmbedding
+    from vllm.platforms import current_platform
+    from vllm.utils.math_utils import cdiv
+    from vllm.v1.core.kv_cache_utils import (
+        get_kv_cache_groups,
+        get_long_context_geometry,
+    )
+    from vllm.v1.core.long_context_kv import token_host_pool_blocks
+
+    layers = [
+        layer
+        for layer in get_layers_from_vllm_config(
+            config, Qwen4ExpPinnedHostEmbedding
+        ).values()
+        if layer._deferred_shards is not None
+    ]
+    if not layers:
+        return
+    current_platform.update_block_size_for_backend(config)
+    geometry = get_long_context_geometry(
+        config, get_kv_cache_groups(config, get_specs())
+    )
+    tokens = config.kernel_config.long_context_kv.host_pool_tokens
+    budget = config.kernel_config.ple_auto_host_budget_bytes
+    assert tokens is not None and budget is not None
+    host_bytes = (
+        token_host_pool_blocks(tokens, geometry) * geometry.host_bytes_per_block
+    )
+    parallel = config.parallel_config
+    shares = (
+        min(parallel.tensor_parallel_size, parallel.local_world_size)
+        * parallel.data_parallel_size_local
+        * len(config.model_config.hf_text_config.ple_layer_ids)
+    )
+    budget = max(0, budget - cdiv(host_bytes, shares))
+    config.kernel_config.ple_auto_host_budget_bytes = budget
+    logger.info(
+        "Qwen4Exp PLE auto: token-sized Host KV pool %s GiB total, "
+        "remaining PLE cap %s GiB per rank per table.",
+        format_gib(host_bytes),
+        format_gib(budget),
+    )
+    for layer in layers:
+        layer.finish_deferred_load()
 
 
 def check_ple_host_share(

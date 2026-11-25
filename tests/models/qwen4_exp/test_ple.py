@@ -155,7 +155,7 @@ def test_pinned_host_ple_splits_the_shard_by_host_budget(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA pinned memory")
-def test_pinned_host_ple_without_budget_keeps_everything_on_device(
+def test_pinned_host_ple_with_zero_budget_keeps_everything_on_device(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_tp(monkeypatch, rank=0, world_size=1)
@@ -490,6 +490,7 @@ def test_pinned_host_ple_decides_on_the_worker_device(
     assert ple_module._should_use_pinned_host_ple(config) is expected
     # The worker's own device, not device 0 of the visible list.
     assert seen == [3]
+    assert ple_module._should_use_pinned_host_ple(config, fp8_checkpoint=True)
     # An explicit config choice wins over the capability.
     assert ple_module._should_use_pinned_host_ple(
         SimpleNamespace(ple_offload_embedding=not expected)

@@ -553,6 +553,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 eplb_models_added = self.eplb.maybe_register_speculator(
                     self.speculator, self.speculative_config, load_dummy_weights
                 )
+            from vllm.models.qwen4_exp.common.ple import finalize_ple_after_model_load
+
+            finalize_ple_after_model_load(self.vllm_config, self.get_kv_cache_spec)
         time_after_load = time.perf_counter()
 
         self.model_memory_usage = m.consumed_memory

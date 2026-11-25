@@ -730,8 +730,7 @@ class KernelConfig:
     ple_disk_cascade: bool | None = None
     """Allow resident FP8 PLE tiers to spill to mapped checkpoint storage.
 
-    Unset resolves to True upstream, or False in the ReVolta SM70 QSA TP4
-    profile. Explicit True/False always wins over the profile.
+    Only an explicit True enables admission of the cascade.
     """
     ple_disk_cascade_source: str = Field(default="explicit", init=False)
     """Diagnostic origin of the resolved cascade choice; excluded from hashes."""
@@ -742,7 +741,7 @@ class KernelConfig:
     ple_disk_cascade_reason: str | None = Field(default=None, init=False)
     """Startup reason when the disk cascade cannot serve this configuration."""
     ple_auto_host_budget_bytes: int | None = Field(default=None, init=False)
-    """Host-first PLE budget per rank and table resolved by serving preflight."""
+    """Host-first PLE budget per rank and table resolved by startup preflight."""
 
     sm70_greedy_verify: bool = False
     """Verify greedy MTP drafts from TP-local target argmax pairs instead of

@@ -10532,6 +10532,11 @@ class GPUModelRunner(
                         )
                         eplb_models += 1
 
+                from vllm.models.qwen4_exp.common.ple import (
+                    finalize_ple_after_model_load,
+                )
+
+                finalize_ple_after_model_load(self.vllm_config, self.get_kv_cache_spec)
                 self._setup_eagle3_aux_hidden_state_outputs()
 
                 # Resolve the MoE model, unwrapping VLM wrappers if needed.

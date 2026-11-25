@@ -99,6 +99,7 @@ from ..common.ple import (
     cap_host_budget_bytes,
     copy_ple_embedding_shard_,
     copy_ple_embedding_shard_tiers_,
+    defer_ple_for_token_host_pool,
     kv_cache_bytes_for_max_model_len,
     plan_ple_disk_segments,
     plan_ple_placement,
@@ -532,6 +533,11 @@ class Qwen4ExpPLEFp8EmbeddingMethod(QuantizeMethodBase):
         return F.embedding(input_, weight)
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
+        if (
+            isinstance(layer, Qwen4ExpPinnedHostEmbedding)
+            and layer._deferred_shards is not None
+        ):
+            return
         _validate_fp8_checkpoint(layer)
         prepare_accelerator_weight = getattr(layer, "prepare_accelerator_weight", None)
         if prepare_accelerator_weight is not None:
@@ -580,7 +586,9 @@ def _get_ple_embedding_quant_method(
     return Qwen4ExpPLEFp8EmbeddingMethod()
 
 
-def _should_use_pinned_host_ple(config: Qwen4ExpTextConfig) -> bool:
+def _should_use_pinned_host_ple(
+    config: Qwen4ExpTextConfig, *, fp8_checkpoint: bool = False
+) -> bool:
     # The dedicated CPU-offload process owns and executes the embedding table
     # directly. The UVA pinned-host implementation is only for GPU execution.
     if is_offload_process():
@@ -592,6 +600,8 @@ def _should_use_pinned_host_ple(config: Qwen4ExpTextConfig) -> bool:
         return bool(explicit)
     if not current_platform.is_cuda():
         return False
+    if fp8_checkpoint:
+        return True
     # Decide on THIS worker's device: on a heterogeneous pipeline the PLE
     # stage is not necessarily device 0 of the visible list. Every
     # pre-Ampere card takes the split placement, not only exact Volta: the
@@ -667,7 +677,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
     budget can measure the real headroom: rows that fit beside the weights,
     the KV cache of the requested context and a reserve stay in device
     memory, only the remainder goes to pinned host memory and is gathered
-    through a stable UVA view. The ReVolta serving profile fills pinned host
+    through a stable UVA view. Automatic placement fills pinned host
     memory first. ``VLLM_QWEN4EXP_PLE_HOST_GIB`` fixes the host share instead.
     With the overflow cascade the rows beyond both tiers stay
     unallocated here and arrive from the PLE offload worker. Gathers always
@@ -750,6 +760,10 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self.ple_device_table: torch.Tensor | None = None
         self.ple_host_storage: torch.Tensor | None = None
         self._checkpoint_shard_loaded = False
+        # Keep the checkpoint views until the target and draft KV specs exist.
+        self._deferred_shards: list[tuple[torch.Tensor, int, int, int]] | None = (
+            [] if defer_ple_for_token_host_pool(get_current_vllm_config()) else None
+        )
 
     @property
     def local_rows(self) -> int:
@@ -839,32 +853,23 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         table_bytes = total_rows * row_bytes
         explicit_host = ple_host_budget_bytes()
         cascade = ple_cascade_configured()
-        auto_host = get_current_vllm_config().kernel_config.ple_auto_host_budget_bytes
-        # Host-first serving and long-context host KV leave device room for KV.
-        hybrid = envs.VLLM_SM70_QWEN38_HYBRID_PLE or (
-            explicit_host is None
-            and (auto_host is not None or _long_context_host_placement())
+        runtime = get_current_vllm_config_or_none()
+        auto_host = (
+            runtime.kernel_config.ple_auto_host_budget_bytes
+            if runtime is not None
+            else None
         )
-        spill = None
-        if cascade or (explicit_host is None and not hybrid):
-            spill = self._device_spill_bytes(device, table_bytes)
+        spill = self._device_spill_bytes(device, table_bytes) if cascade else None
         if explicit_host is not None:
             host_budget = explicit_host
         elif auto_host is not None:
             host_budget = auto_host
-        elif hybrid:
+        elif spill is None or _long_context_host_placement():
             host_budget = self._cap_derived_host_budget(table_bytes)
-            logger.info(
-                "Qwen4Exp PLE auto placement: %s of the table go to host "
-                "memory (hybrid or long-context host KV placement)",
-                format_gib(host_budget),
-            )
         else:
-            assert spill is not None
             host_budget = self._cap_derived_host_budget(spill)
         vram_budget = None
-        if cascade:
-            assert spill is not None
+        if spill is not None:
             # A partial row of the spill still fits beside the rest on the
             # device, as it does without the cascade.
             vram_budget = table_bytes - (spill // row_bytes) * row_bytes
@@ -956,6 +961,11 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 "PLE resident shard dtype mismatch: expected "
                 f"torch.float8_e4m3fn, got {loaded_weight.dtype}"
             )
+        if self._deferred_shards is not None:
+            self._deferred_shards.append(
+                (loaded_weight, checkpoint_start, tp_start, tp_end)
+            )
+            return 0
         self.materialize_tables()
         assert self.ple_device_table is not None
         assert self.ple_host_storage is not None
@@ -977,6 +987,17 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             checkpoint_start, checkpoint_start + loaded_weight.shape[0]
         )
         return copied
+
+    def finish_deferred_load(self) -> None:
+        shards = self._deferred_shards
+        if shards is None:
+            return
+        self._deferred_shards = None
+        for weight, start, tp_start, tp_end in shards:
+            self.load_shard(
+                weight, checkpoint_start=start, tp_start=tp_start, tp_end=tp_end
+            )
+        self.prepare_accelerator_weight()
 
     def get_accelerator_weight(self, device: torch.device) -> torch.Tensor:
         if device.type != "cuda":
@@ -1303,7 +1324,9 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 self.split_ngram_parts,
                 num_threads,
             )
-        elif _should_use_pinned_host_ple(config):
+        elif _should_use_pinned_host_ple(
+            config, fp8_checkpoint=quant_method is not None
+        ):
             if quant_method is None:
                 raise NotImplementedError(
                     "Qwen4Exp pinned-host PLE requires FP8 checkpoint storage"

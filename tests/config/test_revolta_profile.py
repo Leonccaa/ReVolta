@@ -868,6 +868,74 @@ def test_hybrid_serving_mtp_pp2_keeps_fixed_width(
     assert spec.num_speculative_tokens_per_batch_size is None
 
 
+# I1 supplied these values explicitly in its speculative configuration.
+I1_DFLASH2_POLICY = {
+    "context_kv_graph": True,
+    "context_pipeline": True,
+    "verify_fastpath": True,
+    "fused_gdn_metadata": True,
+    "fused_smallq_metadata": True,
+    "grouped_smallq_metadata": True,
+    "spec_state_replay": True,
+}
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize(
+    ("active", "serving", "overrides", "environment", "expected"),
+    [
+        (True, True, {}, {}, I1_DFLASH2_POLICY),
+        (
+            True,
+            True,
+            {"context_pipeline": False},
+            {
+                "VLLM_SM70_DFLASH2_CONTEXT_KV_GRAPH": "0",
+                "VLLM_SM70_DFLASH2_FP32_LOGITS": "1",
+            },
+            I1_DFLASH2_POLICY | {"context_pipeline": False, "context_kv_graph": False},
+        ),
+        (True, False, {}, {}, {}),
+        (False, True, {}, {}, {}),
+    ],
+)
+def test_dflash2_serving_verifier_defaults_match_i1(
+    profile,
+    monkeypatch,
+    tmp_path,
+    sm70_serving_resolution,
+    active,
+    serving,
+    overrides,
+    environment,
+    expected,
+):
+    from vllm.config.sm70_dflash2 import Sm70DFlash2Config
+
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    args, context = hybrid_serving_args(
+        profile,
+        monkeypatch,
+        tmp_path,
+        "dflash",
+        [],
+        {"sm70_dflash2": overrides} if overrides else {},
+        active=active,
+        serving=serving,
+    )
+    spec = args.create_engine_config(usage_context=context).speculative_config
+    policy = spec.sm70_dflash2
+
+    reference = Sm70DFlash2Config(**expected)
+    reference.resolve(qualified=False)
+    assert policy.qualified is False
+    assert policy.graph_options() == reference.graph_options()
+    assert policy.spec_state_replay is reference.spec_state_replay
+    worker_policy = spec.to_worker_payload()["derived"]["sm70_dflash2"]
+    assert all(worker_policy[name] == value for name, value in expected.items())
+
+
 @pytest.mark.skip_global_cleanup
 @pytest.mark.parametrize(
     ("connector", "override", "expected"),

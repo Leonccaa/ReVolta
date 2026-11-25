@@ -104,15 +104,14 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 export NCCL_GRAPH_REGISTER=0                    # required with expandable segments
 export VLLM_SM70_AWQ_MOE_INT4_ZERO=1             # pack AWQ zero points to 4 bits in GPU memory
+# Optional per-rank PLE cap. The full FP8 table is pinned on host by default.
+# export VLLM_QWEN4EXP_PLE_HOST_GIB=12
 export VLLM_PLE_OFFLOAD_READY_TIMEOUT=1200       # seconds; PLE loading takes a while
 export VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES=1    # refuse to start without calibrated E4M3 KV scales
 export TILELANG_CACHE_DIR=/data/revolta/cache/tilelang  # persistent TileLang kernel cache
 ```
 
-PLE tables use pinned host memory by default, with any rows that do not fit
-placed in GPU memory. On a shared host or for a fixed memory budget, optionally
-set `VLLM_QWEN4EXP_PLE_HOST_GIB` in GiB per TP rank. The reference fixed
-budget is 12 GiB. For Docker, pass it with `-e`.
+Continue with the launch command below.
 
 ## 4. Launch
 

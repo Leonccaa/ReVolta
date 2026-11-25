@@ -253,9 +253,9 @@ NOTES: dict[str, dict[str, str]] = {
         section="deployment",
         since="1Cat",
         range="GiB per TP rank; unset = automatic",
-        tradeoff="Caps pinned host memory for the PLE table. Lower values leave "
-        "host RAM for CPU KV offload but move more PLE rows to disk; the "
-        "reference deployment uses 12.",
+        tradeoff="Caps pinned host memory for FP8 PLE. Automatic placement pins "
+        "the full table when the disk cascade is inactive. An explicit cap "
+        "leaves remaining rows on the GPU in this mode.",
         metrics="",
     ),
     "VLLM_PLE_OFFLOAD_READY_TIMEOUT": dict(

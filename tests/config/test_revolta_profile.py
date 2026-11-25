@@ -853,6 +853,22 @@ def test_hybrid_serving_index_sharding_and_replay(
 
 
 @pytest.mark.skip_global_cleanup
+def test_hybrid_serving_mtp_pp2_keeps_fixed_width(
+    profile, monkeypatch, tmp_path, sm70_serving_resolution
+):
+    from vllm.model_executor.models.registry import ModelRegistry
+
+    # The local metadata fixture stands in for a PP-capable target and draft.
+    monkeypatch.setattr(ModelRegistry, "is_pp_supported_model", lambda *_: True)
+    args, context = hybrid_serving_args(
+        profile, monkeypatch, tmp_path, "mtp", ["--pipeline-parallel-size", "2"], {}
+    )
+    spec = args.create_engine_config(usage_context=context).speculative_config
+    assert spec.num_speculative_tokens == 4
+    assert spec.num_speculative_tokens_per_batch_size is None
+
+
+@pytest.mark.skip_global_cleanup
 @pytest.mark.parametrize(
     ("connector", "override", "expected"),
     [

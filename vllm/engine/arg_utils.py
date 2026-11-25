@@ -1837,6 +1837,7 @@ class EngineArgs:
         if (
             "num_speculative_tokens_per_batch_size" not in self.speculative_config
             and "dflash_concurrency_drafts" not in self.speculative_config
+            and target_parallel_config.pipeline_parallel_size == 1
         ):
             if dflash2_k7:
                 defaults["num_speculative_tokens_per_batch_size"] = [

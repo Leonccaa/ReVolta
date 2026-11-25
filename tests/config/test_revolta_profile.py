@@ -834,13 +834,12 @@ def test_hybrid_serving_attention_backend(profile, monkeypatch, tmp_path, active
 
 @pytest.mark.skip_global_cleanup
 @pytest.mark.parametrize(
-    ("active", "serving", "host_available", "explicit_host", "host_rows"),
+    ("active", "host_available", "explicit_host", "host_rows"),
     [
-        (True, True, 64, None, 10),
-        (True, True, 34, None, 6),
-        (True, True, 64, "3", 3),
-        (False, True, 64, None, 4),
-        (True, False, 64, None, 4),
+        (True, 64, None, 10),
+        (True, 34, None, 6),
+        (True, 64, "3", 3),
+        (False, 64, None, 4),
     ],
 )
 def test_revolta_serving_ple_placement(
@@ -849,7 +848,6 @@ def test_revolta_serving_ple_placement(
     tmp_path,
     sm70_serving_resolution,
     active,
-    serving,
     host_available,
     explicit_host,
     host_rows,
@@ -878,7 +876,6 @@ def test_revolta_serving_ple_placement(
         ["--kv-transfer-config", json.dumps(connector)],
         {},
         active=active,
-        serving=serving,
     )
     args.create_model_config().hf_text_config.ple_layer_ids = [2]
     config = args.create_engine_config(usage_context=context)
@@ -894,7 +891,7 @@ def test_revolta_serving_ple_placement(
             table, torch.device("cuda")
         )
     assert placement == PLEPlacement(10 - host_rows, host_rows, 0)
-    assert spill.call_count == (0 if active and serving else 1)
+    assert spill.call_count == (0 if active else 1)
 
 
 @pytest.mark.skip_global_cleanup

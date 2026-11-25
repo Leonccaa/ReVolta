@@ -664,12 +664,12 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
     allocated up front. The real tables are built lazily on the first
     checkpoint shard (or when the accelerator view is prepared), when every
     other weight of this pipeline stage is already placed and the automatic
-    budget can measure the real headroom. The ReVolta serving profile fills
-    pinned host memory first. The device-first policy keeps rows beside the
-    weights, KV cache and a reserve, spilling the remainder to pinned host
-    memory for gathering through a stable UVA view.
-    ``VLLM_QWEN4EXP_PLE_HOST_GIB`` fixes the host
-    share instead. With the overflow cascade the rows beyond both tiers stay
+    budget can measure the real headroom: rows that fit beside the weights,
+    the KV cache of the requested context and a reserve stay in device
+    memory, only the remainder goes to pinned host memory and is gathered
+    through a stable UVA view. The ReVolta serving profile fills pinned host
+    memory first. ``VLLM_QWEN4EXP_PLE_HOST_GIB`` fixes the host share instead.
+    With the overflow cascade the rows beyond both tiers stay
     unallocated here and arrive from the PLE offload worker. Gathers always
     read both halves (an unused half reads row 0), because branching on the
     ids would need a device-to-host sync on every decode step.
@@ -839,11 +839,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         table_bytes = total_rows * row_bytes
         explicit_host = ple_host_budget_bytes()
         cascade = ple_cascade_configured()
-        auto_host = (
-            get_current_vllm_config().kernel_config.ple_auto_host_budget_bytes
-            if explicit_host is None
-            else None
-        )
+        auto_host = get_current_vllm_config().kernel_config.ple_auto_host_budget_bytes
         # Host-first serving and long-context host KV leave device room for KV.
         hybrid = envs.VLLM_SM70_QWEN38_HYBRID_PLE or (
             explicit_host is None
@@ -854,17 +850,13 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             spill = self._device_spill_bytes(device, table_bytes)
         if explicit_host is not None:
             host_budget = explicit_host
+        elif auto_host is not None:
+            host_budget = auto_host
         elif hybrid:
-            # Cache pages are resolved after model loading. Use the host budget
-            # without estimating the provisional device KV layout.
-            host_budget = (
-                self._cap_derived_host_budget(table_bytes)
-                if auto_host is None
-                else min(auto_host, table_bytes)
-            )
+            host_budget = self._cap_derived_host_budget(table_bytes)
             logger.info(
                 "Qwen4Exp PLE auto placement: %s of the table go to host "
-                "memory (host-first placement)",
+                "memory (hybrid or long-context host KV placement)",
                 format_gib(host_budget),
             )
         else:
@@ -891,6 +883,15 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 placement.vram_rows,
                 format_gib(placement.vram_rows * row_bytes),
                 placement.host_rows,
+            )
+        elif auto_host is not None and placement.vram_rows:
+            logger.warning(
+                "Qwen4Exp PLE auto host headroom is limited: %s GiB on host and "
+                "%s GiB in device memory on this rank. Device placement reduces KV "
+                "capacity. Set a VLLM_QWEN4EXP_PLE_HOST_GIB budget that fits the "
+                "host or reduce the CPU/Host KV pools.",
+                format_gib(placement.host_rows * row_bytes),
+                format_gib(placement.vram_rows * row_bytes),
             )
         if placement.disk_rows and not placement.local_rows:
             # The gathers of both resident tiers always run and read row 0.

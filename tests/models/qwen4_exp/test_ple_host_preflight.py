@@ -6,29 +6,55 @@ import pytest
 
 import vllm.models.qwen4_exp.common.ple as ple
 from tests.utils import set_lazy_env
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.models.qwen4_exp.nvidia.ple_layer import Qwen4ExpPinnedHostEmbedding
 
 GIB = 1 << 30
 
 
-def test_cgroup_limit_and_current_include_tighter_parent(tmp_path):
+@pytest.mark.parametrize("controller", ["v2", "v1", "v1-private-mount"])
+def test_cgroup_limit_and_current_include_tighter_parent(
+    monkeypatch, tmp_path, controller
+):
     root = tmp_path / "cgroup"
-    child = root / "worker"
+    mount = root / "memory" if controller == "v1" else root
+    child = mount / "worker"
     child.mkdir(parents=True)
     membership = tmp_path / "membership"
-    membership.write_text("0::/worker\n")
-    for directory, limit, current in [(root, 128, 32), (child, 200, 10)]:
-        (directory / "memory.max").write_text(str(limit * GIB))
-        (directory / "memory.current").write_text(str(current * GIB))
+    if controller == "v2":
+        membership.write_text("0::/worker\n")
+        limit_name, usage_name = "memory.max", "memory.current"
+    else:
+        membership.write_text("5:memory:/worker\n")
+        limit_name, usage_name = "memory.limit_in_bytes", "memory.usage_in_bytes"
+    for directory, limit, current in [(mount, 128, 32), (child, 200, 10)]:
+        (directory / limit_name).write_text(str(limit * GIB))
+        (directory / usage_name).write_text(str(current * GIB))
     assert ple.cgroup_host_memory(root, membership) == (128 * GIB, 96 * GIB)
+    read_cgroup = ple.cgroup_host_memory
+    monkeypatch.setattr(
+        ple, "cgroup_host_memory", lambda: read_cgroup(root, membership)
+    )
+    monkeypatch.setattr(ple, "available_host_bytes", lambda: 64 * GIB)
+    assert ple.preflight_host_memory()[:2] == (128 * GIB, 64 * GIB)
 
 
-@pytest.mark.parametrize("limit", ["max", "invalid", None])
-def test_unavailable_cgroup_limit_falls_back_to_meminfo(monkeypatch, tmp_path, limit):
+@pytest.mark.parametrize(
+    ("membership_line", "limit_name", "limit"),
+    [
+        ("0::/\n", "memory.max", "max"),
+        ("0::/\n", "memory.max", "invalid"),
+        ("0::/\n", "memory.max", None),
+        ("5:memory:/\n", "memory.limit_in_bytes", str((1 << 63) - 4096)),
+    ],
+)
+def test_unavailable_cgroup_limit_falls_back_to_meminfo(
+    monkeypatch, tmp_path, membership_line, limit_name, limit
+):
     if limit is not None:
-        (tmp_path / "memory.max").write_text(limit)
+        (tmp_path / limit_name).write_text(limit)
     membership = tmp_path / "membership"
-    membership.write_text("0::/\n")
+    membership.write_text(membership_line)
     assert ple.cgroup_host_memory(tmp_path, membership) == (None, None)
     monkeypatch.setattr(ple, "cgroup_host_memory", lambda: (None, None))
     monkeypatch.setattr(ple, "total_host_bytes", lambda: 256 * GIB)
@@ -110,6 +136,22 @@ def test_unified_host_store_replaces_legacy_pool_once(enabled, expected):
     assert ple.cpu_kv_offload_bytes(config) == expected * GIB
 
 
+@pytest.mark.parametrize("placement,expected", [("host", 100), ("gpu", 2)])
+def test_legacy_main_host_pool_adds_to_cpu_pool(placement, expected):
+    config = NS(
+        kernel_config=NS(
+            long_context_kv=NS(
+                enabled=True, main_kv_placement=placement, host_pool_gib=98
+            )
+        ),
+        kv_transfer_config=NS(
+            kv_connector="OffloadingConnector",
+            kv_connector_extra_config={"cpu_bytes_to_use": 2 * GIB},
+        ),
+    )
+    assert ple.cpu_kv_offload_bytes(config) == expected * GIB
+
+
 def test_production_sized_budget_logs_shared_98_gib_and_8_gib_reserve(monkeypatch):
     set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_GIB", "12")
     set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", None)
@@ -141,7 +183,8 @@ def test_explicit_partial_host_placement_warns_and_keeps_existing_split(monkeypa
     monkeypatch.setattr(
         ple_layer.logger, "warning", lambda msg, *args: warnings.append(msg % args)
     )
-    placement = layer._plan_placement(None)
+    with set_current_vllm_config(VllmConfig()):
+        placement = layer._plan_placement(None)
     assert (placement.vram_rows, placement.host_rows, placement.disk_rows) == (11, 5, 0)
     assert any("11" in msg and "device memory" in msg for msg in warnings)
 

@@ -16237,9 +16237,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=True,
     ),
     # Qwen4Exp pinned-host PLE: host memory in GiB, per tensor-parallel rank,
-    # for the part of the FP8 n-gram table that does not stay in device
-    # memory. Unset or "auto": derived from the device headroom left beside
-    # the weights and the KV cache of the requested context.
+    # for the FP8 n-gram table. Unset or "auto" pins the whole table on host
+    # when the disk cascade is inactive.
     "VLLM_QWEN4EXP_PLE_HOST_GIB": env_var(
         lambda: (
             None
@@ -16248,10 +16247,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
             else float(os.getenv("VLLM_QWEN4EXP_PLE_HOST_GIB", "0"))
         ),
         description=(
-            "Sets pinned-host PLE memory in GiB per TP rank. Default automatic "
-            "from actual table size and available host memory, avoiding a "
-            "checkpoint-specific manual budget. Set an explicit limit when "
-            "sharing host RAM or reproducing a fixed-memory deployment."
+            "Caps pinned-host FP8 PLE memory in GiB per TP rank. Automatic "
+            "placement pins the entire table when the disk cascade is inactive."
         ),
         category="configuration",
         declared_default="None",

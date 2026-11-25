@@ -577,9 +577,13 @@ def cpu_kv_offload_bytes(config: Any) -> int:
 
 
 def check_ple_host_share(
-    text_config: Any, ranks_sharing_host: int, *, cpu_kv_bytes: int = 0
+    text_config: Any,
+    ranks_sharing_host: int,
+    *,
+    cpu_kv_bytes: int = 0,
+    config: "VllmConfig | None" = None,
 ) -> None:
-    """Warn when configured PLE caps plus the CPU KV pool exceed headroom.
+    """Check full automatic PLE placement and warn for configured caps.
 
     Runs once before any rank starts. The ranks place their tables at the same
     time, so a rank that reads the host memory while a sibling already pins its
@@ -596,9 +600,24 @@ def check_ple_host_share(
     total, available, source = preflight_host_memory()
     if available is None or total is None:
         return
+    reserve = ple_host_reserve_bytes(total)
+    if budget is None and config is not None:
+        from ..nvidia.ple_layer import full_fp8_ple_bytes_per_rank
+
+        full_table = full_fp8_ple_bytes_per_rank(config) * ranks_sharing_host
+        if full_table:
+            required = full_table + reserve
+            if available < required:
+                raise RuntimeError(
+                    "Automatic Qwen4Exp FP8 PLE placement needs "
+                    f"{format_gib(required)} GiB of host memory including reserve; "
+                    f"{format_gib(available)} GiB available ({source}). "
+                    "Free host memory or set a smaller VLLM_QWEN4EXP_PLE_HOST_GIB "
+                    "to keep the remaining PLE rows on the GPU."
+                )
+            return
     if budget is None and not cpu_kv_bytes:
         return
-    reserve = ple_host_reserve_bytes(total)
     ple_bytes = (budget or 0) * ranks_sharing_host * len(text_config.ple_layer_ids)
     log = (
         logger.warning

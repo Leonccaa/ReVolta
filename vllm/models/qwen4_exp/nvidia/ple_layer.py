@@ -62,6 +62,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
     get_masked_input_and_mask,
+    pad_vocab_size,
 )
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.model_executor.parameter import (
@@ -421,6 +422,12 @@ def _nth_prime_after(start: int, count: int) -> int:
     return prime
 
 
+def _ngram_vocab_sizes(base: int, heads: int, layer: int) -> list[int]:
+    return [
+        _nth_prime_after(base - 1, layer * heads + head + 1) for head in range(heads)
+    ]
+
+
 class Qwen4ExpPLEGroupedNorm(nn.Module):
     def __init__(
         self,
@@ -580,7 +587,9 @@ def _get_ple_embedding_quant_method(
     return Qwen4ExpPLEFp8EmbeddingMethod()
 
 
-def _should_use_pinned_host_ple(config: Qwen4ExpTextConfig) -> bool:
+def _should_use_pinned_host_ple(
+    config: Qwen4ExpTextConfig, *, device_id: int | None = None
+) -> bool:
     # The dedicated CPU-offload process owns and executes the embedding table
     # directly. The UVA pinned-host implementation is only for GPU execution.
     if is_offload_process():
@@ -598,10 +607,35 @@ def _should_use_pinned_host_ple(config: Qwen4ExpTextConfig) -> bool:
     # generic path dequantizes the whole FP8 table to fp16 inside the
     # compiled graph (47.7 GiB for Qwen3.8 Flash Next), which none of them
     # can hold.
-    capability = current_platform.get_device_capability(
-        device_id=torch.accelerator.current_device_index()
-    )
+    if device_id is None:
+        device_id = torch.accelerator.current_device_index()
+    capability = current_platform.get_device_capability(device_id=device_id)
     return capability is not None and capability.major < 8
+
+
+def full_fp8_ple_bytes_per_rank(config: VllmConfig) -> int:
+    """Return the unallocated FP8 table bytes on one PLE worker."""
+    text = config.model_config.hf_text_config
+    if (
+        ple_offload_enabled(config)
+        or envs.VLLM_PLE_DISK_OFFLOAD
+        or getattr(text, "ple_embedding_dtype", None) == "nvfp4"
+        or not _should_use_pinned_host_ple(text, device_id=0)
+    ):
+        return 0
+    heads = (text.ngram_size - 1) * text.heads_per_ngram
+    rows = sum(
+        pad_vocab_size(
+            sum(_ngram_vocab_sizes(text.ngram_vocab_size_base, heads, layer)),
+            text.make_ngram_vocab_size_divisible_by,
+        )
+        for layer in range(len(set(text.ple_layer_ids)))
+    )
+    return (
+        rows
+        * (text.ple_embed_dim // heads)
+        // config.parallel_config.tensor_parallel_size
+    )
 
 
 # cudaHostRegisterPortable | cudaHostRegisterMapped. On a UVA system this is
@@ -662,13 +696,10 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
 
     The base embedding is constructed on the meta device, so nothing is
     allocated up front. The real tables are built lazily on the first
-    checkpoint shard (or when the accelerator view is prepared), when every
-    other weight of this pipeline stage is already placed and the automatic
-    budget can measure the real headroom: rows that fit beside the weights,
-    the KV cache of the requested context and a reserve stay in device
-    memory, only the remainder goes to pinned host memory and is gathered
-    through a stable UVA view. ``VLLM_QWEN4EXP_PLE_HOST_GIB`` fixes the host
-    share instead. With the overflow cascade the rows beyond both tiers stay
+    checkpoint shard (or when the accelerator view is prepared). By default
+    the whole table is pinned on host and gathered through a stable UVA view.
+    ``VLLM_QWEN4EXP_PLE_HOST_GIB`` caps the host share. With the overflow
+    cascade the rows beyond both resident tiers stay
     unallocated here and arrive from the PLE offload worker. Gathers always
     read both halves (an unused half reads row 0), because branching on the
     ids would need a device-to-host sync on every decode step.
@@ -838,13 +869,14 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         table_bytes = total_rows * row_bytes
         explicit_host = ple_host_budget_bytes()
         cascade = ple_cascade_configured()
-        # Long-context host KV spends every spare device byte on history IDs, so
-        # an unset budget keeps the whole table on host, as hybrid placement does.
+        if explicit_host is None and not cascade:
+            explicit_host = table_bytes
+        # Preserve the cascade's host budget in hybrid and long-context modes.
         hybrid = envs.VLLM_SM70_QWEN38_HYBRID_PLE or (
             explicit_host is None and _long_context_host_placement()
         )
         spill = None
-        if cascade or (explicit_host is None and not hybrid):
+        if cascade:
             spill = self._device_spill_bytes(device, table_bytes)
         if explicit_host is not None:
             host_budget = explicit_host
@@ -1180,14 +1212,12 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             persistent=True,
         )
 
-        ngram_vocab_size_base = int(config.ngram_vocab_size_base)
-        sizes: list[int] = []
+        sizes = _ngram_vocab_sizes(
+            int(config.ngram_vocab_size_base), self.ngram_heads, ple_dense_layer_id
+        )
         offsets: list[int] = []
         offset = 0
-        for local_head in range(self.ngram_heads):
-            global_head = ple_dense_layer_id * self.ngram_heads + local_head
-            size = _nth_prime_after(ngram_vocab_size_base - 1, global_head + 1)
-            sizes.append(size)
+        for size in sizes:
             offsets.append(offset)
             offset += size
         self.register_buffer(
@@ -1201,7 +1231,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             persistent=True,
         )
         divisor = int(config.make_ngram_vocab_size_divisible_by)
-        padded_vocab_size = ((offset + divisor - 1) // divisor) * divisor
+        padded_vocab_size = pad_vocab_size(offset, divisor)
         embedding_prefix = f"{prefix}.ngram_embedding"
         ple_storage_dtype = str(
             getattr(config, "ple_embedding_dtype", "")

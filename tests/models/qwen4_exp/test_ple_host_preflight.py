@@ -52,6 +52,42 @@ def test_cgroup_shortage_counts_cpu_kv_pool_once(monkeypatch):
     assert "100.0" in message and "reserve 8.0" in message
 
 
+@pytest.mark.parametrize(
+    ("cap", "cascade", "available", "fails"),
+    [
+        (None, False, 55, True),
+        (None, False, 56, False),
+        ("12", False, 55, False),
+        (None, True, 55, False),
+    ],
+)
+def test_full_fp8_host_preflight(monkeypatch, cap, cascade, available, fails):
+    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_GIB", cap)
+    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", None)
+    monkeypatch.setattr(
+        ple, "preflight_host_memory", lambda: (128 * GIB, available * GIB, "test")
+    )
+    text = NS(
+        ple_layer_ids=[1],
+        ple_offload_embedding=True,
+        ngram_size=3,
+        heads_per_ngram=8,
+        ngram_vocab_size_base=20_000_000,
+        make_ngram_vocab_size_divisible_by=128,
+        ple_embed_dim=2560,
+    )
+    config = NS(
+        model_config=NS(hf_text_config=text),
+        parallel_config=NS(tensor_parallel_size=4),
+        kernel_config=NS(ple_disk_cascade_active=cascade),
+    )
+    if fails:
+        with pytest.raises(RuntimeError, match=r"55\.68 GiB.*55\.0 GiB.*PLE_HOST_GIB"):
+            ple.check_ple_host_share(text, 4, cpu_kv_bytes=48 * GIB, config=config)
+    else:
+        ple.check_ple_host_share(text, 4, cpu_kv_bytes=48 * GIB, config=config)
+
+
 def test_existing_preflight_cannot_pass_on_host_ram_above_container_limit(monkeypatch):
     set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_GIB", "32")
     set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", None)

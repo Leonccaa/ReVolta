@@ -2694,6 +2694,7 @@ class EngineArgs:
             * parallel_config.data_parallel_size_local,
             cpu_kv_bytes=cpu_kv_offload_bytes(config)
             * parallel_config.data_parallel_size_local,
+            config=config if current_platform.is_cuda() else None,
         )
 
         return config

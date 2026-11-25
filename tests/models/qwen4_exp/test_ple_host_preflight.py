@@ -13,7 +13,7 @@ GIB = 1 << 30
 
 
 @pytest.mark.parametrize("controller", ["v2", "v1", "v1-combined"])
-def test_cgroup_limit_and_current_include_tighter_parent(
+def test_cgroup_budget_includes_parent_and_excludes_inactive_file(
     monkeypatch, tmp_path, controller
 ):
     root = tmp_path / "cgroup"
@@ -26,6 +26,7 @@ def test_cgroup_limit_and_current_include_tighter_parent(
     if controller == "v2":
         membership.write_text("0::/worker\n")
         limit_name, usage_name = "memory.max", "memory.current"
+        stat_prefix = ""
     else:
         controllers = "memory,blkio" if controller == "v1-combined" else "memory"
         mount_root = "/containers/parent" if controller == "v1-combined" else "/"
@@ -36,16 +37,33 @@ def test_cgroup_limit_and_current_include_tighter_parent(
             f"- cgroup cgroup rw,{controllers}\n"
         )
         limit_name, usage_name = "memory.limit_in_bytes", "memory.usage_in_bytes"
-    for directory, limit, current in [(mount, 128, 32), (child, 200, 10)]:
+        stat_prefix = "total_"
+    groups = [(mount, 128, 6), (child, 140, 2)]
+    for directory, limit, current in groups:
         (directory / limit_name).write_text(str(limit * GIB))
         (directory / usage_name).write_text(str(current * GIB))
-    assert ple.cgroup_host_memory(root, membership, mountinfo) == (128 * GIB, 96 * GIB)
+    assert ple.cgroup_host_memory(root, membership, mountinfo) == (128 * GIB, 122 * GIB)
     read_cgroup = ple.cgroup_host_memory
     monkeypatch.setattr(
         ple, "cgroup_host_memory", lambda: read_cgroup(root, membership, mountinfo)
     )
     monkeypatch.setattr(ple, "available_host_bytes", lambda: 64 * GIB)
     assert ple.preflight_host_memory()[:2] == (128 * GIB, 64 * GIB)
+
+    # The parent includes the child's 70 GiB file cache. Active pages remain
+    # in the working set.
+    for directory, _, current in groups:
+        (directory / usage_name).write_text(str((current + 70) * GIB))
+        (directory / "memory.stat").write_text(
+            f"{stat_prefix}active_file {GIB}\n{stat_prefix}inactive_file {70 * GIB}\n"
+        )
+    monkeypatch.setattr(ple, "available_host_bytes", lambda: 192 * GIB)
+    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_GIB", None)
+    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", None)
+    cap = ple.check_ple_host_share(
+        NS(ple_layer_ids=[1]), 4, cpu_kv_bytes=48 * GIB, prefer_host=True
+    )
+    assert cap == 16 * GIB + GIB // 2
 
 
 @pytest.mark.parametrize(

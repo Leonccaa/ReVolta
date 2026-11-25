@@ -273,9 +273,12 @@ with the 512K views.
 **128 GiB RAM is recommended** for the default 48 GiB CPU KV pool. The AWQ PLE
 embedding table uses about 47.7 GiB of pinned host memory even with KV offload disabled.
 
-With automatic PLE placement, the table fills pinned host memory first and
-keeps any remaining rows on the GPU. The budget accounts for the cgroup
-limit, host reserve, CPU or Host KV pools, and UVA weight offload.
+With automatic FP8 PLE placement and disk cascade disabled, the table fills
+pinned host memory first and keeps any remaining rows on the GPU. The budget
+accounts for cgroup headroom, host reserve, CPU or Host KV pools, and UVA
+weight offload. Cgroup headroom excludes inactive file cache from memory used.
+FP4-Local requires pinned host memory for its entire NVFP4 PLE table, about
+26.8 GiB across four ranks.
 Independent launches can see the same available memory. Start servers
 sharing a memory limit one at a time or set their PLE and KV budgets explicitly.
 Legacy `host_pool_tokens` retains its original PLE placement. Use

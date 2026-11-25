@@ -523,12 +523,27 @@ def _cgroup_v1_memory_mounts(mountinfo: Path) -> Iterator[tuple[Path, Path]]:
             yield group_root, mountpoint
 
 
+def _cgroup_working_set(node: Path, usage_file: str, inactive_file_key: str) -> int:
+    try:
+        used = int((node / usage_file).read_text())
+    except (OSError, ValueError):
+        return 0
+    try:
+        for line in (node / "memory.stat").read_text().splitlines():
+            key, _, value = line.partition(" ")
+            if key == inactive_file_key:
+                return max(0, used - int(value))
+    except (OSError, ValueError):
+        pass
+    return used
+
+
 def cgroup_host_memory(
     root: Path = Path("/sys/fs/cgroup"),
     membership: Path = Path("/proc/self/cgroup"),
     mountinfo: Path = Path("/proc/self/mountinfo"),
 ) -> tuple[int | None, int | None]:
-    """Visible cgroup memory limit and headroom, including tighter parents.
+    """Visible cgroup limit and working-set headroom, including tighter parents.
 
     A container may mount only its own cgroup at root. Always inspect that
     root too; membership paths need not exist in the container's namespace.
@@ -555,6 +570,7 @@ def cgroup_host_memory(
     )
     limits, remaining = [], []
     for group_root, mount, controller, limit_file, usage_file in mounts:
+        inactive_file_key = "total_inactive_file" if controller else "inactive_file"
         mount = mount.resolve()
         entry = next(
             (path for _, names, path in entries if controller in names.split(",")),
@@ -573,12 +589,11 @@ def cgroup_host_memory(
                 limit = int((node / limit_file).read_text())
                 # v1 represents an unlimited limit with a near-LONG_MAX value.
                 if limit >= 0 and (not controller or limit < 1 << 60):
-                    try:
-                        used = int((node / usage_file).read_text())
-                    except (OSError, ValueError):
-                        used = 0
+                    working_set = _cgroup_working_set(
+                        node, usage_file, inactive_file_key
+                    )
                     limits.append(limit)
-                    remaining.append(max(0, limit - used))
+                    remaining.append(max(0, limit - working_set))
             except (OSError, ValueError):
                 pass
             if node == mount:

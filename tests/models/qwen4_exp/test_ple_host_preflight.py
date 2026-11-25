@@ -30,7 +30,7 @@ def test_unavailable_cgroup_limit_falls_back_to_meminfo(monkeypatch, tmp_path, l
     membership = tmp_path / "membership"
     membership.write_text("0::/\n")
     assert ple.cgroup_host_memory(tmp_path, membership) == (None, None)
-    monkeypatch.setattr(ple, "cgroup_host_memory", lambda: (None, None))
+    monkeypatch.setattr(ple, "cgroup_host_memory", lambda **_: (None, None))
     monkeypatch.setattr(ple, "total_host_bytes", lambda: 256 * GIB)
     monkeypatch.setattr(ple, "available_host_bytes", lambda: 200 * GIB)
     assert ple.preflight_host_memory() == (256 * GIB, 200 * GIB, "/proc/meminfo")
@@ -39,7 +39,7 @@ def test_unavailable_cgroup_limit_falls_back_to_meminfo(monkeypatch, tmp_path, l
 def test_cgroup_shortage_counts_cpu_kv_pool_once(monkeypatch):
     set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_GIB", "12")
     set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", None)
-    monkeypatch.setattr(ple, "cgroup_host_memory", lambda: (128 * GIB, 100 * GIB))
+    monkeypatch.setattr(ple, "cgroup_host_memory", lambda **_: (128 * GIB, 100 * GIB))
     monkeypatch.setattr(ple, "available_host_bytes", lambda: 400 * GIB)
     warnings = []
     monkeypatch.setattr(
@@ -53,20 +53,32 @@ def test_cgroup_shortage_counts_cpu_kv_pool_once(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("cap", "cascade", "available", "fails"),
+    ("cap", "cascade", "available", "inactive_file", "fails"),
     [
-        (None, False, 55, True),
-        (None, False, 56, False),
-        ("12", False, 55, False),
-        (None, True, 55, False),
+        (None, False, 55, 0, True),
+        (None, False, 56, 0, False),
+        ("12", False, 55, 0, False),
+        (None, True, 55, 0, False),
+        pytest.param(None, False, 52, 70, False, id="warm-cgroup"),
     ],
 )
-def test_full_fp8_host_preflight(monkeypatch, cap, cascade, available, fails):
+def test_full_fp8_host_preflight(
+    monkeypatch, tmp_path, caplog, cap, cascade, available, inactive_file, fails
+):
     set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_GIB", cap)
     set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", None)
+    (tmp_path / "memory.max").write_text(str(128 * GIB))
+    (tmp_path / "memory.current").write_text(str((128 - available) * GIB))
+    (tmp_path / "memory.stat").write_text(f"inactive_file {inactive_file * GIB}\n")
+    membership = tmp_path / "membership"
+    membership.write_text("0::/\n")
+    read_cgroup = ple.cgroup_host_memory
     monkeypatch.setattr(
-        ple, "preflight_host_memory", lambda: (128 * GIB, available * GIB, "test")
+        ple,
+        "cgroup_host_memory",
+        lambda **kwargs: read_cgroup(tmp_path, membership, **kwargs),
     )
+    monkeypatch.setattr(ple, "available_host_bytes", lambda: 200 * GIB)
     text = NS(
         ple_layer_ids=[1],
         ple_offload_embedding=True,
@@ -83,9 +95,10 @@ def test_full_fp8_host_preflight(monkeypatch, cap, cascade, available, fails):
     )
     if fails:
         with pytest.raises(RuntimeError, match=r"55\.68 GiB.*55\.0 GiB.*PLE_HOST_GIB"):
-            ple.check_ple_host_share(text, 4, cpu_kv_bytes=48 * GIB, config=config)
+            ple.check_ple_host_share(text, 4, cpu_kv_bytes=98 * GIB, config=config)
     else:
-        ple.check_ple_host_share(text, 4, cpu_kv_bytes=48 * GIB, config=config)
+        ple.check_ple_host_share(text, 4, cpu_kv_bytes=98 * GIB, config=config)
+        assert "CPU KV pool 98.0 GiB" in caplog.text
 
 
 def test_existing_preflight_cannot_pass_on_host_ram_above_container_limit(monkeypatch):
@@ -94,7 +107,7 @@ def test_existing_preflight_cannot_pass_on_host_ram_above_container_limit(monkey
     monkeypatch.setattr(ple, "total_host_bytes", lambda: 512 * GIB)
     monkeypatch.setattr(ple, "available_host_bytes", lambda: 400 * GIB)
     monkeypatch.setattr(
-        ple, "cgroup_host_memory", lambda: (128 * GIB, 120 * GIB), raising=False
+        ple, "cgroup_host_memory", lambda **_: (128 * GIB, 120 * GIB), raising=False
     )
     warnings = []
     monkeypatch.setattr(

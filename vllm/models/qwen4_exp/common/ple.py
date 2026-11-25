@@ -506,6 +506,8 @@ def ple_cascade_configured() -> bool:
 def cgroup_host_memory(
     root: Path = Path("/sys/fs/cgroup"),
     membership: Path = Path("/proc/self/cgroup"),
+    *,
+    exclude_inactive_file: bool = False,
 ) -> tuple[int | None, int | None]:
     """Visible cgroup-v2 hard limit and headroom, including tighter parents.
 
@@ -534,6 +536,15 @@ def cgroup_host_memory(
                     used = int((node / "memory.current").read_text())
                 except (OSError, ValueError):
                     used = 0
+                if exclude_inactive_file:
+                    try:
+                        for line in (node / "memory.stat").read_text().splitlines():
+                            key, _, value = line.partition(" ")
+                            if key == "inactive_file":
+                                used = max(0, used - int(value))
+                                break
+                    except (OSError, ValueError):
+                        pass
                 limits.append(limit)
                 remaining.append(max(0, limit - used))
         except (OSError, ValueError):
@@ -544,8 +555,10 @@ def cgroup_host_memory(
     return (min(limits), min(remaining)) if limits else (None, None)
 
 
-def preflight_host_memory() -> tuple[int | None, int | None, str]:
-    total, available = cgroup_host_memory()
+def preflight_host_memory(
+    *, exclude_inactive_file: bool = False
+) -> tuple[int | None, int | None, str]:
+    total, available = cgroup_host_memory(exclude_inactive_file=exclude_inactive_file)
     host_available = available_host_bytes()
     if total is not None:
         if host_available is not None and available is not None:
@@ -605,17 +618,22 @@ def check_ple_host_share(
         from ..nvidia.ple_layer import full_fp8_ple_bytes_per_rank
 
         full_table = full_fp8_ple_bytes_per_rank(config) * ranks_sharing_host
-        if full_table:
-            required = full_table + reserve
-            if available < required:
+        required = full_table + reserve
+        if full_table and available < required:
+            # A warm restart can reclaim inactive file pages before pinning PLE.
+            _, headroom, headroom_source = preflight_host_memory(
+                exclude_inactive_file=True
+            )
+            if headroom is None:
+                headroom, headroom_source = available, source
+            if headroom < required:
                 raise RuntimeError(
                     "Automatic Qwen4Exp FP8 PLE placement needs "
                     f"{format_gib(required)} GiB of host memory including reserve; "
-                    f"{format_gib(available)} GiB available ({source}). "
+                    f"{format_gib(headroom)} GiB available ({headroom_source}). "
                     "Free host memory or set a smaller VLLM_QWEN4EXP_PLE_HOST_GIB "
                     "to keep the remaining PLE rows on the GPU."
                 )
-            return
     if budget is None and not cpu_kv_bytes:
         return
     ple_bytes = (budget or 0) * ranks_sharing_host * len(text_config.ple_layer_ids)

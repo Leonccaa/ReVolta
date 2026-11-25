@@ -2686,29 +2686,14 @@ class EngineArgs:
         from vllm.models.qwen4_exp.common.ple import (
             check_ple_host_share,
             cpu_kv_offload_bytes,
-            uses_token_host_pool,
         )
 
-        weight_offload_bytes = 0
-        if offload_config.offload_backend == "uva" or (
-            offload_config.offload_backend == "auto"
-            and offload_config.prefetch.offload_group_size == 0
-        ):
-            weight_offload_bytes = (
-                int(offload_config.uva.cpu_offload_gb * 2**30)
-                * parallel_config.local_world_size
-                * parallel_config.data_parallel_size_local
-            )
-        config.kernel_config.ple_auto_host_budget_bytes = check_ple_host_share(
+        check_ple_host_share(
             model_config.hf_text_config,
             min(parallel_config.tensor_parallel_size, parallel_config.local_world_size)
             * parallel_config.data_parallel_size_local,
             cpu_kv_bytes=cpu_kv_offload_bytes(config)
             * parallel_config.data_parallel_size_local,
-            cpu_weight_bytes=weight_offload_bytes,
-            # Cascade and token-sized Host KV keep their existing placement.
-            prefer_host=not config.kernel_config.ple_disk_cascade_active
-            and not uses_token_host_pool(config),
         )
 
         return config

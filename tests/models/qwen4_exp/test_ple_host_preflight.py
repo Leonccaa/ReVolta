@@ -6,85 +6,30 @@ import pytest
 
 import vllm.models.qwen4_exp.common.ple as ple
 from tests.utils import set_lazy_env
-from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.models.qwen4_exp.nvidia.ple_layer import Qwen4ExpPinnedHostEmbedding
 
 GIB = 1 << 30
 
 
-@pytest.mark.parametrize("controller", ["v2", "v1", "v1-combined"])
-def test_cgroup_budget_includes_parent_and_excludes_inactive_file(
-    monkeypatch, tmp_path, controller
-):
+def test_cgroup_limit_and_current_include_tighter_parent(tmp_path):
     root = tmp_path / "cgroup"
-    mount = tmp_path / "combined mount" if controller == "v1-combined" else root
-    child = mount / "worker"
+    child = root / "worker"
     child.mkdir(parents=True)
     membership = tmp_path / "membership"
-    mountinfo = tmp_path / "mountinfo"
-    mountinfo.write_text("")
-    if controller == "v2":
-        membership.write_text("0::/worker\n")
-        limit_name, usage_name = "memory.max", "memory.current"
-        stat_prefix = ""
-    else:
-        controllers = "memory,blkio" if controller == "v1-combined" else "memory"
-        mount_root = "/containers/parent" if controller == "v1-combined" else "/"
-        membership.write_text(f"5:{controllers}:{mount_root.rstrip('/')}/worker\n")
-        escaped_mount = str(mount).replace(" ", "\\040")
-        mountinfo.write_text(
-            f"1 0 0:1 {mount_root} {escaped_mount} rw "
-            f"- cgroup cgroup rw,{controllers}\n"
-        )
-        limit_name, usage_name = "memory.limit_in_bytes", "memory.usage_in_bytes"
-        stat_prefix = "total_"
-    groups = [(mount, 128, 6), (child, 140, 2)]
-    for directory, limit, current in groups:
-        (directory / limit_name).write_text(str(limit * GIB))
-        (directory / usage_name).write_text(str(current * GIB))
-    assert ple.cgroup_host_memory(root, membership, mountinfo) == (128 * GIB, 122 * GIB)
-    read_cgroup = ple.cgroup_host_memory
-    monkeypatch.setattr(
-        ple, "cgroup_host_memory", lambda: read_cgroup(root, membership, mountinfo)
-    )
-    monkeypatch.setattr(ple, "available_host_bytes", lambda: 64 * GIB)
-    assert ple.preflight_host_memory()[:2] == (128 * GIB, 64 * GIB)
-
-    # The parent includes the child's 70 GiB file cache. Active pages remain
-    # in the working set.
-    for directory, _, current in groups:
-        (directory / usage_name).write_text(str((current + 70) * GIB))
-        (directory / "memory.stat").write_text(
-            f"{stat_prefix}active_file {GIB}\n{stat_prefix}inactive_file {70 * GIB}\n"
-        )
-    monkeypatch.setattr(ple, "available_host_bytes", lambda: 192 * GIB)
-    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_GIB", None)
-    set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", None)
-    cap = ple.check_ple_host_share(
-        NS(ple_layer_ids=[1]), 4, cpu_kv_bytes=48 * GIB, prefer_host=True
-    )
-    assert cap == 16 * GIB + GIB // 2
+    membership.write_text("0::/worker\n")
+    for directory, limit, current in [(root, 128, 32), (child, 200, 10)]:
+        (directory / "memory.max").write_text(str(limit * GIB))
+        (directory / "memory.current").write_text(str(current * GIB))
+    assert ple.cgroup_host_memory(root, membership) == (128 * GIB, 96 * GIB)
 
 
-@pytest.mark.parametrize(
-    ("membership_line", "limit_name", "limit"),
-    [
-        ("0::/\n", "memory.max", "max"),
-        ("0::/\n", "memory.max", "invalid"),
-        ("0::/\n", "memory.max", None),
-        ("5:memory:/\n", "memory.limit_in_bytes", str((1 << 63) - 4096)),
-    ],
-)
-def test_unavailable_cgroup_limit_falls_back_to_meminfo(
-    monkeypatch, tmp_path, membership_line, limit_name, limit
-):
+@pytest.mark.parametrize("limit", ["max", "invalid", None])
+def test_unavailable_cgroup_limit_falls_back_to_meminfo(monkeypatch, tmp_path, limit):
     if limit is not None:
-        (tmp_path / limit_name).write_text(limit)
+        (tmp_path / "memory.max").write_text(limit)
     membership = tmp_path / "membership"
-    membership.write_text(membership_line)
-    mountinfo = tmp_path / "mountinfo"
-    mountinfo.write_text(f"1 0 0:1 / {tmp_path} rw - cgroup cgroup rw,memory\n")
-    assert ple.cgroup_host_memory(tmp_path, membership, mountinfo) == (None, None)
+    membership.write_text("0::/\n")
+    assert ple.cgroup_host_memory(tmp_path, membership) == (None, None)
     monkeypatch.setattr(ple, "cgroup_host_memory", lambda: (None, None))
     monkeypatch.setattr(ple, "total_host_bytes", lambda: 256 * GIB)
     monkeypatch.setattr(ple, "available_host_bytes", lambda: 200 * GIB)
@@ -152,38 +97,15 @@ def test_default_host_reserve_is_capped(monkeypatch, total, expected):
     assert ple.ple_host_reserve_bytes(total * GIB) == 49 * GIB
 
 
-@pytest.mark.parametrize(
-    "enabled,placement,expected",
-    [(True, "host", 98), (False, "host", 48), (True, "gpu", 48)],
-)
-def test_unified_host_store_replaces_legacy_pool_once(enabled, placement, expected):
+@pytest.mark.parametrize("enabled,expected", [(True, 98), (False, 48)])
+def test_unified_host_store_replaces_legacy_pool_once(enabled, expected):
     config = NS(
-        kernel_config=NS(
-            long_context_kv=NS(
-                enabled=enabled, host_store_gib=98, main_kv_placement=placement
-            )
-        ),
+        kernel_config=NS(long_context_kv=NS(enabled=enabled, host_store_gib=98)),
         kv_transfer_config=NS(
             kv_connector="OffloadingConnector",
             kv_connector_extra_config={"cpu_bytes_to_use": 48 * GIB},
         ),
         cache_config=NS(kv_offloading_size=48),
-    )
-    assert ple.cpu_kv_offload_bytes(config) == expected * GIB
-
-
-@pytest.mark.parametrize("placement,expected", [("host", 100), ("gpu", 2)])
-def test_legacy_main_host_pool_adds_to_cpu_pool(placement, expected):
-    config = NS(
-        kernel_config=NS(
-            long_context_kv=NS(
-                enabled=True, main_kv_placement=placement, host_pool_gib=98
-            )
-        ),
-        kv_transfer_config=NS(
-            kv_connector="OffloadingConnector",
-            kv_connector_extra_config={"cpu_bytes_to_use": 2 * GIB},
-        ),
     )
     assert ple.cpu_kv_offload_bytes(config) == expected * GIB
 
@@ -219,8 +141,7 @@ def test_explicit_partial_host_placement_warns_and_keeps_existing_split(monkeypa
     monkeypatch.setattr(
         ple_layer.logger, "warning", lambda msg, *args: warnings.append(msg % args)
     )
-    with set_current_vllm_config(VllmConfig()):
-        placement = layer._plan_placement(None)
+    placement = layer._plan_placement(None)
     assert (placement.vram_rows, placement.host_rows, placement.disk_rows) == (11, 5, 0)
     assert any("11" in msg and "device memory" in msg for msg in warnings)
 

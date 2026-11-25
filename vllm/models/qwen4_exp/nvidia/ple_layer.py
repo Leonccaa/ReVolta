@@ -108,7 +108,6 @@ from ..common.ple import (
     ple_host_reserve_bytes,
     ple_vram_reserve_bytes,
     total_host_bytes,
-    uses_token_host_pool,
 )
 
 _MASK64 = (1 << 64) - 1
@@ -581,9 +580,7 @@ def _get_ple_embedding_quant_method(
     return Qwen4ExpPLEFp8EmbeddingMethod()
 
 
-def _should_use_pinned_host_ple(
-    config: Qwen4ExpTextConfig, *, fp8_checkpoint: bool = False
-) -> bool:
+def _should_use_pinned_host_ple(config: Qwen4ExpTextConfig) -> bool:
     # The dedicated CPU-offload process owns and executes the embedding table
     # directly. The UVA pinned-host implementation is only for GPU execution.
     if is_offload_process():
@@ -595,11 +592,6 @@ def _should_use_pinned_host_ple(
         return bool(explicit)
     if not current_platform.is_cuda():
         return False
-    if fp8_checkpoint and not (
-        uses_token_host_pool(get_current_vllm_config())
-        and ple_host_budget_bytes() is None
-    ):
-        return True
     # Decide on THIS worker's device: on a heterogeneous pipeline the PLE
     # stage is not necessarily device 0 of the visible list. Every
     # pre-Ampere card takes the split placement, not only exact Volta: the
@@ -672,10 +664,11 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
     allocated up front. The real tables are built lazily on the first
     checkpoint shard (or when the accelerator view is prepared), when every
     other weight of this pipeline stage is already placed and the automatic
-    budget fills pinned host memory first and keeps any remaining rows on
-    the device. Host rows are gathered through a stable UVA view.
-    ``VLLM_QWEN4EXP_PLE_HOST_GIB`` fixes the host share. With the overflow
-    cascade the rows beyond both tiers stay
+    budget can measure the real headroom: rows that fit beside the weights,
+    the KV cache of the requested context and a reserve stay in device
+    memory, only the remainder goes to pinned host memory and is gathered
+    through a stable UVA view. ``VLLM_QWEN4EXP_PLE_HOST_GIB`` fixes the host
+    share instead. With the overflow cascade the rows beyond both tiers stay
     unallocated here and arrive from the PLE offload worker. Gathers always
     read both halves (an unused half reads row 0), because branching on the
     ids would need a device-to-host sync on every decode step.
@@ -845,19 +838,26 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         table_bytes = total_rows * row_bytes
         explicit_host = ple_host_budget_bytes()
         cascade = ple_cascade_configured()
-        auto_host = get_current_vllm_config().kernel_config.ple_auto_host_budget_bytes
+        # Long-context host KV spends every spare device byte on history IDs, so
+        # an unset budget keeps the whole table on host, as hybrid placement does.
         hybrid = envs.VLLM_SM70_QWEN38_HYBRID_PLE or (
             explicit_host is None and _long_context_host_placement()
         )
         spill = None
-        if cascade or (explicit_host is None and auto_host is None and not hybrid):
+        if cascade or (explicit_host is None and not hybrid):
             spill = self._device_spill_bytes(device, table_bytes)
         if explicit_host is not None:
             host_budget = explicit_host
-        elif auto_host is not None:
-            host_budget = auto_host
         elif hybrid:
+            # Cache pages are resolved after model loading. Hybrid placement
+            # keeps the entire table on host and does not need a provisional
+            # device/KV estimate, which can reject not-yet-padded CSA pages.
             host_budget = self._cap_derived_host_budget(table_bytes)
+            logger.info(
+                "Qwen4Exp PLE auto placement: %s of the table go to host "
+                "memory (hybrid or long-context host KV placement)",
+                format_gib(host_budget),
+            )
         else:
             assert spill is not None
             host_budget = self._cap_derived_host_budget(spill)
@@ -882,15 +882,6 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 placement.vram_rows,
                 format_gib(placement.vram_rows * row_bytes),
                 placement.host_rows,
-            )
-        elif auto_host is not None and placement.vram_rows:
-            logger.warning(
-                "Qwen4Exp PLE auto host headroom is limited: %s GiB on host and "
-                "%s GiB in device memory on this rank. Device placement reduces KV "
-                "capacity. Set a VLLM_QWEN4EXP_PLE_HOST_GIB budget that fits the "
-                "host or reduce the CPU/Host KV pools.",
-                format_gib(placement.host_rows * row_bytes),
-                format_gib(placement.vram_rows * row_bytes),
             )
         if placement.disk_rows and not placement.local_rows:
             # The gathers of both resident tiers always run and read row 0.
@@ -1302,9 +1293,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 self.split_ngram_parts,
                 num_threads,
             )
-        elif _should_use_pinned_host_ple(
-            config, fp8_checkpoint=quant_method is not None
-        ):
+        elif _should_use_pinned_host_ple(config):
             if quant_method is None:
                 raise NotImplementedError(
                     "Qwen4Exp pinned-host PLE requires FP8 checkpoint storage"

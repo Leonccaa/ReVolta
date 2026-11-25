@@ -43,6 +43,7 @@ def test_auto_hybrid_placement_leaves_headroom_and_caps_all_local_ranks(
         ple,
         "get_current_vllm_config",
         lambda: SimpleNamespace(
+            kernel_config=SimpleNamespace(ple_auto_host_budget_bytes=None),
             model_config=SimpleNamespace(max_model_len=8192),
             cache_config=SimpleNamespace(gpu_memory_utilization=0.9),
             parallel_config=SimpleNamespace(
@@ -63,7 +64,7 @@ def test_auto_hybrid_placement_leaves_headroom_and_caps_all_local_ranks(
     envs.disable_envs_cache()
 
 
-def test_explicit_host_budget_is_preserved(monkeypatch):
+def test_explicit_host_budget_is_preserved(monkeypatch, default_vllm_config):
     monkeypatch.setattr(ple, "ple_host_budget_bytes", lambda: 123)
     monkeypatch.setattr(ple, "ple_cascade_configured", lambda: False)
     table = SimpleNamespace(
@@ -80,7 +81,13 @@ def test_hybrid_host_budget_does_not_group_provisional_cache_pages(monkeypatch):
     monkeypatch.setattr(ple, "ple_cascade_configured", lambda: False)
     monkeypatch.setattr(ple, "available_host_bytes", lambda: None)
     monkeypatch.setattr(ple, "total_host_bytes", lambda: None)
-    monkeypatch.setattr(ple, "get_current_vllm_config", lambda: SimpleNamespace())
+    monkeypatch.setattr(
+        ple,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(
+            kernel_config=SimpleNamespace(ple_auto_host_budget_bytes=None)
+        ),
+    )
 
     def unresolved_layout(*_args):
         raise ValueError("CSA+linear layer 3 violates cache geometry.")
@@ -100,9 +107,10 @@ def _long_context_config(enabled: bool, placement: str) -> SimpleNamespace:
             tensor_parallel_size=4, local_world_size=4, data_parallel_size_local=1
         ),
         kernel_config=SimpleNamespace(
+            ple_auto_host_budget_bytes=None,
             long_context_kv=SimpleNamespace(
                 enabled=enabled, main_kv_placement=placement
-            )
+            ),
         ),
     )
 

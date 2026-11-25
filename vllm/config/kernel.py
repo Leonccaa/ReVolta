@@ -741,6 +741,8 @@ class KernelConfig:
     """Resolved FP8 storage, dtype and pipeline capability admission."""
     ple_disk_cascade_reason: str | None = Field(default=None, init=False)
     """Startup reason when the disk cascade cannot serve this configuration."""
+    ple_auto_host_budget_bytes: int | None = Field(default=None, init=False)
+    """Host-first PLE budget per rank and table resolved by startup preflight."""
 
     sm70_greedy_verify: bool = False
     """Verify greedy MTP drafts from TP-local target argmax pairs instead of
@@ -825,6 +827,7 @@ class KernelConfig:
             "fused_fp16_aux_gemv_applicable",
             "ple_disk_cascade_reason",
             "ple_disk_cascade_source",
+            "ple_auto_host_budget_bytes",
             "ple_result_transports",
             "ple_input_prepare",  # Input staging is outside the compiled model.
             "ple_input_preparations",

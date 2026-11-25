@@ -3,12 +3,13 @@
 """Common Qwen4Exp PLE helpers."""
 
 import math
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from itertools import pairwise
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import regex as re
 import torch
 
 import vllm.envs as envs
@@ -503,44 +504,101 @@ def ple_cascade_configured() -> bool:
     return bool(getattr(kernel, "ple_disk_cascade_active", False))
 
 
+def _cgroup_v1_memory_mounts(mountinfo: Path) -> Iterator[tuple[Path, Path]]:
+    """Find the hierarchy root and mount point for the v1 memory controller."""
+    try:
+        lines = mountinfo.read_text().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        mount, _, filesystem = line.partition(" - ")
+        fields = filesystem.split()
+        if len(fields) < 3 or fields[0] != "cgroup":
+            continue
+        if "memory" in fields[2].split(","):
+            group_root, mountpoint = (
+                Path(re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), field))
+                for field in mount.split()[3:5]
+            )
+            yield group_root, mountpoint
+
+
+def _cgroup_working_set(node: Path, usage_file: str, inactive_file_key: str) -> int:
+    try:
+        used = int((node / usage_file).read_text())
+    except (OSError, ValueError):
+        return 0
+    try:
+        for line in (node / "memory.stat").read_text().splitlines():
+            key, _, value = line.partition(" ")
+            if key == inactive_file_key:
+                return max(0, used - int(value))
+    except (OSError, ValueError):
+        pass
+    return used
+
+
 def cgroup_host_memory(
     root: Path = Path("/sys/fs/cgroup"),
     membership: Path = Path("/proc/self/cgroup"),
+    mountinfo: Path = Path("/proc/self/mountinfo"),
 ) -> tuple[int | None, int | None]:
-    """Visible cgroup-v2 hard limit and headroom, including tighter parents.
+    """Visible cgroup limit and working-set headroom, including tighter parents.
 
     A container may mount only its own cgroup at root. Always inspect that
     root too; membership paths need not exist in the container's namespace.
     """
-    root = root.resolve()
-    node = root
     try:
-        entry = next(
-            line[3:]
+        entries = [
+            line.split(":", 2)
             for line in membership.read_text().splitlines()
-            if line.startswith("0::")
+            if line.count(":") >= 2
+        ]
+    except OSError:
+        entries = []
+
+    mounts = [(Path("/"), root, "", "memory.max", "memory.current")]
+    mounts.extend(
+        (
+            group_root,
+            mountpoint,
+            "memory",
+            "memory.limit_in_bytes",
+            "memory.usage_in_bytes",
         )
-        candidate = (root / entry.lstrip("/")).resolve()
-        if candidate.is_relative_to(root):
-            node = candidate
-    except (OSError, StopIteration):
-        pass
+        for group_root, mountpoint in _cgroup_v1_memory_mounts(mountinfo)
+    )
     limits, remaining = [], []
-    while True:
-        try:
-            limit = int((node / "memory.max").read_text())
-            if limit >= 0:
-                try:
-                    used = int((node / "memory.current").read_text())
-                except (OSError, ValueError):
-                    used = 0
-                limits.append(limit)
-                remaining.append(max(0, limit - used))
-        except (OSError, ValueError):
-            pass
-        if node == root:
-            break
-        node = node.parent
+    for group_root, mount, controller, limit_file, usage_file in mounts:
+        inactive_file_key = "total_inactive_file" if controller else "inactive_file"
+        mount = mount.resolve()
+        entry = next(
+            (path for _, names, path in entries if controller in names.split(",")),
+            "",
+        )
+        path = Path(entry)
+        relative = (
+            path.relative_to(group_root)
+            if path.is_relative_to(group_root)
+            else Path(entry.lstrip("/"))
+        )
+        candidate = (mount / relative).resolve()
+        node = candidate if candidate.is_relative_to(mount) else mount
+        while True:
+            try:
+                limit = int((node / limit_file).read_text())
+                # v1 represents an unlimited limit with a near-LONG_MAX value.
+                if limit >= 0 and (not controller or limit < 1 << 60):
+                    working_set = _cgroup_working_set(
+                        node, usage_file, inactive_file_key
+                    )
+                    limits.append(limit)
+                    remaining.append(max(0, limit - working_set))
+            except (OSError, ValueError):
+                pass
+            if node == mount:
+                break
+            node = node.parent
     return (min(limits), min(remaining)) if limits else (None, None)
 
 
@@ -550,36 +608,56 @@ def preflight_host_memory() -> tuple[int | None, int | None, str]:
     if total is not None:
         if host_available is not None and available is not None:
             available = min(available, host_available)
-        return total, available, "cgroup v2 memory.max/memory.current"
+        return total, available, "cgroup memory controller"
     return total_host_bytes(), host_available, "/proc/meminfo"
 
 
 def cpu_kv_offload_bytes(config: Any) -> int:
-    """Resolved CPU pool size, summed across TP ranks (not multiplied by TP)."""
+    """Configured CPU and Host KV pool bytes, summed across TP ranks."""
     long_context = getattr(
         getattr(config, "kernel_config", None), "long_context_kv", None
     )
-    if getattr(long_context, "enabled", False):
+    legacy_host_bytes = 0
+    if (
+        long_context is not None
+        and long_context.enabled
+        and long_context.main_kv_placement == "host"
+    ):
         # Unified MAIN/STATE/DRAFT storage replaces the connector pool and is
         # one shared allocation, not one allocation per rank or group.
         host_store_gib = getattr(long_context, "host_store_gib", None)
         if host_store_gib is not None:
             return max(0, int(host_store_gib * 2**30))
+        legacy_host_bytes = int((long_context.host_pool_gib or 0) * 2**30)
     transfer = getattr(config, "kv_transfer_config", None)
     extra = getattr(transfer, "kv_connector_extra_config", {})
     if getattr(transfer, "kv_connector", None) in (
         "OffloadingConnector",
         "SimpleCPUOffloadConnector",
     ):
-        return max(0, int(extra.get("cpu_bytes_to_use", 0)))
+        return legacy_host_bytes + max(0, int(extra.get("cpu_bytes_to_use", 0)))
     size = getattr(getattr(config, "cache_config", None), "kv_offloading_size", None)
-    return max(0, int(size * 2**30)) if size is not None else 0
+    return legacy_host_bytes + max(0, int((size or 0) * 2**30))
+
+
+def uses_token_host_pool(config: "VllmConfig") -> bool:
+    settings = config.kernel_config.long_context_kv
+    return (
+        settings.enabled
+        and settings.main_kv_placement == "host"
+        and settings.host_pool_tokens is not None
+    )
 
 
 def check_ple_host_share(
-    text_config: Any, ranks_sharing_host: int, *, cpu_kv_bytes: int = 0
-) -> None:
-    """Warn when configured PLE caps plus the CPU KV pool exceed headroom.
+    text_config: Any,
+    ranks_sharing_host: int,
+    *,
+    cpu_kv_bytes: int = 0,
+    cpu_weight_bytes: int = 0,
+    prefer_host: bool = False,
+) -> int | None:
+    """Resolve a host-first automatic budget or check the configured PLE caps.
 
     Runs once before any rank starts. The ranks place their tables at the same
     time, so a rank that reads the host memory while a sibling already pins its
@@ -591,24 +669,47 @@ def check_ple_host_share(
     """
 
     if not getattr(text_config, "ple_layer_ids", None):
-        return
+        return None
     budget = ple_host_budget_bytes()
     total, available, source = preflight_host_memory()
     if available is None or total is None:
-        return
-    if budget is None and not cpu_kv_bytes:
-        return
+        return None
     reserve = ple_host_reserve_bytes(total)
+    if prefer_host and budget is None:
+        auto_budget = cap_host_budget_bytes(
+            budget_bytes=available,
+            available_bytes=available,
+            reserve_bytes=reserve + cpu_kv_bytes + cpu_weight_bytes,
+            ranks_sharing_host=ranks_sharing_host * len(text_config.ple_layer_ids),
+        )
+        logger.info(
+            "Qwen4Exp PLE auto host preflight (%s): limit %s GiB, %s GiB available. "
+            "Reserve %s GiB, CPU/Host KV pools %s GiB total, "
+            "CPU weight offload %s GiB total, PLE cap %s GiB per rank per table "
+            "across %d ranks.",
+            source,
+            format_gib(total),
+            format_gib(available),
+            format_gib(reserve),
+            format_gib(cpu_kv_bytes),
+            format_gib(cpu_weight_bytes),
+            format_gib(auto_budget),
+            ranks_sharing_host,
+        )
+        return auto_budget
+    if budget is None and not cpu_kv_bytes and not cpu_weight_bytes:
+        return None
     ple_bytes = (budget or 0) * ranks_sharing_host * len(text_config.ple_layer_ids)
     log = (
         logger.warning
-        if ple_bytes + cpu_kv_bytes + reserve > available
+        if ple_bytes + cpu_kv_bytes + cpu_weight_bytes + reserve > available
         else logger.info
     )
     log(
         "Qwen4Exp PLE host preflight (%s): limit %s GiB, %s GiB available; "
         "PLE configured upper bound %s GiB across %d ranks, CPU KV pool %s GiB "
-        "total, reserve %s GiB. HOST_GIB caps each table; a larger cap does "
+        "total, reserve %s GiB, CPU weight offload %s GiB total. "
+        "HOST_GIB caps each table; a larger cap does "
         "not allocate extra rows. Automatic PLE placement is not estimated. "
         "If these allocations exceed headroom, reduce the CPU KV pool or "
         "PLE host share to avoid host OOM; placement is unchanged.",
@@ -619,4 +720,6 @@ def check_ple_host_share(
         ranks_sharing_host,
         format_gib(cpu_kv_bytes),
         format_gib(reserve),
+        format_gib(cpu_weight_bytes),
     )
+    return None

@@ -435,7 +435,7 @@ def test_hardware_detection_without_cuda_context(profile, monkeypatch, caps):
 def run_engineargs_early_policy(profile, monkeypatch, apply, **engine_kwargs):
     """Execute EngineArgs' real sequence from the profile import to MTP defaults."""
     import vllm.revolta_profile as installed
-    from vllm.config.compilation import CompilationConfig
+    from vllm.config import CompilationConfig
     from vllm.engine.arg_utils import EngineArgs
 
     monkeypatch.setattr(installed, "apply_revolta_profile", apply)
@@ -473,7 +473,7 @@ def run_engineargs_early_policy(profile, monkeypatch, apply, **engine_kwargs):
     end = next(
         i
         for i, n in enumerate(fn.body)
-        if isinstance(n, ast.Expr)
+        if isinstance(n, ast.Assign)
         and isinstance(n.value, ast.Call)
         and isinstance(n.value.func, ast.Attribute)
         and n.value.func.attr == "_maybe_apply_sm70_mtp_defaults"
@@ -510,6 +510,136 @@ def test_engineargs_profile_precedes_actual_mtp_defaults(profile, monkeypatch):
     )
     assert args.compilation_config.fast_moe_cold_start is None
     assert args.compilation_config.cudagraph_capture_sizes is None
+
+
+@pytest.mark.parametrize(
+    ("quantization", "method", "source", "overrides", "expected"),
+    [
+        ("awq", "dflash", "cli", {}, (448, 1, 0)),
+        ("modelopt_fp4", "mtp", "yaml", {}, (448, 1, 0)),
+        ("awq", "qwen4_exp_mtp", "json", {}, (448, 1, 0)),
+        ("awq", None, "json", {}, (0, 1, 250)),
+        ("awq", "mtp", "json", {"enable_chunked_prefill": False}, (0, 1, 0)),
+        (
+            "awq",
+            "dflash",
+            "json",
+            {
+                "prefill_pressure_token_budget": 0,
+                "prefill_pressure_threshold": 2,
+                "mixed_prefill_step_latency_ms": 250,
+            },
+            (0, 2, 250),
+        ),
+    ],
+)
+def test_engineargs_prefill_pressure_profile(
+    profile,
+    monkeypatch,
+    tmp_path,
+    quantization,
+    method,
+    source,
+    overrides,
+    expected,
+):
+    import yaml
+    from transformers import Qwen3Config
+
+    from vllm import revolta_profile
+    from vllm.config import speculative
+    from vllm.engine import arg_utils
+    from vllm.platforms.cpu import CpuPlatform
+    from vllm.platforms.interface import DeviceCapability
+    from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+    model_dir = tmp_path / "target"
+    Qwen3NextConfig(architectures=["Qwen3NextForCausalLM"]).save_pretrained(model_dir)
+    raw = {"method": method, "num_speculative_tokens": 4}
+    if method == "dflash":
+        draft = tmp_path / "draft"
+        Qwen3Config(
+            architectures=["DFlash2DraftModel"],
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            dflash_config={"selector_top_k": 16, "block_size": 5},
+        ).save_pretrained(draft)
+        raw["model"] = str(draft)
+
+    argv = [
+        "--model",
+        str(model_dir),
+        "--dtype",
+        "float16",
+        "--tensor-parallel-size",
+        "4",
+        "--distributed-executor-backend",
+        "mp",
+    ]
+    if source == "yaml":
+        config = tmp_path / "serve.yaml"
+        config.write_text(yaml.safe_dump({"spec-method": method, "spec-tokens": 4}))
+        argv.extend(["--config", str(config)])
+    elif source == "cli":
+        argv.extend(
+            [
+                "--spec-method",
+                method,
+                "--spec-tokens",
+                "4",
+                "--spec-model",
+                raw["model"],
+            ]
+        )
+    elif method is not None:
+        argv.extend(["--speculative-config", json.dumps(raw)])
+
+    monkeypatch.setattr(arg_utils, "current_platform", CpuPlatform())
+    monkeypatch.setattr(revolta_profile, "all_visible_devices_sm70", lambda: True)
+    monkeypatch.setattr(
+        revolta_profile, "apply_revolta_profile", profile.apply_revolta_profile
+    )
+    # Keep real speculative argument resolution and scheduler construction.
+    # The local checkpoint configs stand in for quantized weights.
+    monkeypatch.setattr(
+        speculative,
+        "ModelConfig",
+        lambda **kwargs: arg_utils.ModelConfig(**(kwargs | {"quantization": None})),
+    )
+    parser = arg_utils.EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = arg_utils.EngineArgs.from_cli_args(parser.parse_args(argv))
+    for name, value in overrides.items():
+        setattr(args, name, value)
+    target = args.create_model_config()
+    target.quantization = quantization
+    target.hf_text_config.update(vars(model(quantization).hf_text_config))
+    legacy_mtp_graphs = method == "mtp" and source == "json"
+    if legacy_mtp_graphs:
+        monkeypatch.setenv("VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS", "0")
+        monkeypatch.setattr(arg_utils.current_platform, "is_cuda_alike", lambda: True)
+        monkeypatch.setattr(
+            arg_utils.current_platform,
+            "get_device_capability",
+            lambda: DeviceCapability(7, 0),
+        )
+        args.max_num_seqs = 8
+    monkeypatch.setattr(args, "create_model_config", lambda: target)
+    monkeypatch.setattr(arg_utils, "VllmConfig", SimpleNamespace)
+
+    config = args.create_engine_config()
+    assert getattr(config.speculative_config, "method", None) == (
+        "mtp" if method == "qwen4_exp_mtp" else method
+    )
+    scheduler = config.scheduler_config
+    assert (
+        scheduler.prefill_pressure_token_budget,
+        scheduler.prefill_pressure_threshold,
+        scheduler.mixed_prefill_step_latency_ms,
+    ) == expected
+    if legacy_mtp_graphs:
+        sizes = config.compilation_config.cudagraph_capture_sizes
+        assert sizes is not None and max(sizes) == 40
 
 
 @pytest.mark.parametrize(

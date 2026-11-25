@@ -756,6 +756,46 @@ def test_worker_env_cannot_change_legacy_async_admission(
         )
 
 
+@pytest.mark.parametrize("max_capture_size", [None, 256])
+def test_sm70_dflash2_capture_sizes_with_f4(checkpoint, monkeypatch, max_capture_size):
+    from vllm.config import CompilationConfig, DeviceConfig, SchedulerConfig
+
+    monkeypatch.setattr(os, "environ", os.environ.copy())
+    monkeypatch.setenv("VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH", "1")
+    monkeypatch.setenv("VLLM_SM70_FLASH_ATTN_V100", "1")
+    monkeypatch.setenv("VLLM_SM70_DENSE_CUDAGRAPH_CAPTURE", "0")
+    monkeypatch.setattr(
+        "vllm.config.vllm._any_participating_device_is_capability",
+        lambda _, cap: cap == (7, 0),
+    )
+    monkeypatch.setattr("vllm.config.vllm.HAS_TRITON", True)
+    monkeypatch.setattr(current_platform, "support_static_graph_mode", lambda: True)
+    monkeypatch.setattr(current_platform, "check_and_update_config", lambda _: None)
+    config = VllmConfig(
+        model_config=checkpoint["target_model_config"],
+        parallel_config=checkpoint["target_parallel_config"],
+        speculative_config=build(checkpoint),
+        device_config=DeviceConfig(device="cpu"),
+        scheduler_config=SchedulerConfig(
+            max_model_len=512,
+            max_num_seqs=8,
+            max_num_batched_tokens=2048,
+            is_encoder_decoder=False,
+            prefill_pressure_token_budget=448,
+            mixed_prefill_step_latency_ms=0,
+        ),
+        compilation_config=CompilationConfig(
+            max_cudagraph_capture_size=max_capture_size
+        ),
+    )
+    compilation = config.compilation_config
+    expected_max = max_capture_size or 64
+    assert compilation.max_cudagraph_capture_size == expected_max
+    assert compilation.cudagraph_capture_sizes[-1] == expected_max
+    if max_capture_size is not None:
+        assert compilation.cudagraph_capture_sizes == [1, 2, 4, *range(8, 257, 8)]
+
+
 @pytest.mark.parametrize("legacy,width", [(False, 7), (True, 7), (True, 15)])
 @pytest.mark.parametrize(
     "new_options",

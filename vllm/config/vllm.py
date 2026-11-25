@@ -2666,15 +2666,11 @@ class VllmConfig:
                         CUDAGraphMode.FULL_AND_PIECEWISE
                     )
                 if self.compilation_config.cudagraph_capture_sizes is None:
-                    cudagraph_capture_sizes = _sm70_nomtp_cudagraph_capture_sizes(
-                        self.scheduler_config.max_num_seqs
-                    )
-                    if (
-                        self.speculative_config is not None
-                        and self.speculative_config.num_speculative_tokens
-                    ):
+                    spec_config = self.speculative_config
+                    decode_query_len = 1
+                    if spec_config is not None and spec_config.num_speculative_tokens:
                         decode_query_len = (
-                            self.speculative_config.num_speculative_state_tokens() + 1
+                            spec_config.num_speculative_state_tokens() + 1
                         )
                         smallq_env = "VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q"
                         if (
@@ -2690,9 +2686,25 @@ class VllmConfig:
                                 smallq_env,
                                 decode_query_len,
                             )
-                        if (
-                            envs.VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS
-                            and self.speculative_config.method == "mtp"
+                    # With an explicit cap, the generic graph sizer builds
+                    # the capture list up to that limit.
+                    if self.compilation_config.max_cudagraph_capture_size is None:
+                        if decode_query_len == 1:
+                            cudagraph_capture_sizes = (
+                                _sm70_nomtp_cudagraph_capture_sizes(
+                                    self.scheduler_config.max_num_seqs
+                                )
+                            )
+                            if cudagraph_capture_sizes != [1, 2]:
+                                logger.info_once(
+                                    "Using SM70 no-MTP decode cudagraph "
+                                    "request shapes %s.",
+                                    tuple(cudagraph_capture_sizes),
+                                )
+                        elif (
+                            spec_config is not None
+                            and spec_config.method == "mtp"
+                            and envs.VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS
                         ):
                             cudagraph_capture_sizes = _sm70_mtp_cudagraph_capture_sizes(
                                 self.scheduler_config.max_num_seqs,
@@ -2723,14 +2735,9 @@ class VllmConfig:
                                 "shapes %s for Flash-V100 compile graph.",
                                 tuple(cudagraph_capture_sizes),
                             )
-                    elif cudagraph_capture_sizes != [1, 2]:
-                        logger.info_once(
-                            "Using SM70 no-MTP decode cudagraph request shapes %s.",
-                            tuple(cudagraph_capture_sizes),
+                        self.compilation_config.cudagraph_capture_sizes = (
+                            cudagraph_capture_sizes
                         )
-                    self.compilation_config.cudagraph_capture_sizes = (
-                        cudagraph_capture_sizes
-                    )
                 if self.compilation_config.max_cudagraph_capture_size is None:
                     self.compilation_config.max_cudagraph_capture_size = (
                         _sm70_max_cudagraph_capture_size(
@@ -2819,13 +2826,14 @@ class VllmConfig:
                     "Using combo_kernels=True and benchmark_combo_kernel=True "
                     "for SM70 Flash-V100 0.0.3 compile graph quality parity."
                 )
+                capture_sizes = self.compilation_config.cudagraph_capture_sizes
                 logger.info_once(
                     "Using SM70 Flash-V100 0.0.3 compile CUDA graph policy: "
                     "mode=%s, cudagraph_mode=%s, "
                     "capture_sizes=%s.",
                     self.compilation_config.mode.name,
                     self.compilation_config.cudagraph_mode.name,
-                    tuple(self.compilation_config.cudagraph_capture_sizes),
+                    "auto" if capture_sizes is None else tuple(capture_sizes),
                 )
             else:
                 logger.warning_once(

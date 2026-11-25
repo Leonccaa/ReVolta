@@ -2688,12 +2688,17 @@ class EngineArgs:
             cpu_kv_offload_bytes,
         )
 
-        check_ple_host_share(
+        config.kernel_config.ple_auto_host_budget_bytes = check_ple_host_share(
             model_config.hf_text_config,
             min(parallel_config.tensor_parallel_size, parallel_config.local_world_size)
             * parallel_config.data_parallel_size_local,
             cpu_kv_bytes=cpu_kv_offload_bytes(config)
             * parallel_config.data_parallel_size_local,
+            # An admitted disk cascade has its own device-first tier policy.
+            prefer_host=(
+                revolta_hybrid_serving
+                and not config.kernel_config.ple_disk_cascade_active
+            ),
         )
 
         return config

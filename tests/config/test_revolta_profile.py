@@ -833,6 +833,71 @@ def test_hybrid_serving_attention_backend(profile, monkeypatch, tmp_path, active
 
 
 @pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize(
+    ("active", "serving", "host_available", "explicit_host", "host_rows"),
+    [
+        (True, True, 64, None, 10),
+        (True, True, 34, None, 6),
+        (True, True, 64, "3", 3),
+        (False, True, 64, None, 4),
+        (True, False, 64, None, 4),
+    ],
+)
+def test_revolta_serving_ple_placement(
+    profile,
+    monkeypatch,
+    tmp_path,
+    sm70_serving_resolution,
+    active,
+    serving,
+    host_available,
+    explicit_host,
+    host_rows,
+):
+    from vllm.config import set_current_vllm_config
+    from vllm.models.qwen4_exp.common import ple
+    from vllm.models.qwen4_exp.common.ple import PLEPlacement
+    from vllm.models.qwen4_exp.nvidia.ple_layer import Qwen4ExpPinnedHostEmbedding
+
+    gib = 2**30
+    monkeypatch.setattr(
+        ple, "preflight_host_memory", lambda: (64 * gib, host_available * gib, "test")
+    )
+    if explicit_host is not None:
+        monkeypatch.setenv("VLLM_QWEN4EXP_PLE_HOST_GIB", explicit_host)
+    connector = {
+        "kv_connector": "OffloadingConnector",
+        "kv_role": "kv_both",
+        "kv_connector_extra_config": {"cpu_bytes_to_use": 2 * gib},
+    }
+    args, context = hybrid_serving_args(
+        profile,
+        monkeypatch,
+        tmp_path,
+        None,
+        ["--kv-transfer-config", json.dumps(connector)],
+        {},
+        active=active,
+        serving=serving,
+    )
+    args.create_model_config().hf_text_config.ple_layer_ids = [2]
+    config = args.create_engine_config(usage_context=context)
+    spill = Mock(return_value=4 * gib)
+    table = SimpleNamespace(
+        embedding_dim=gib,
+        _meta_weight_shape=(10, gib),
+        _device_spill_bytes=spill,
+        _cap_derived_host_budget=lambda budget: budget,
+    )
+    with set_current_vllm_config(config):
+        placement = Qwen4ExpPinnedHostEmbedding._plan_placement(
+            table, torch.device("cuda")
+        )
+    assert placement == PLEPlacement(10 - host_rows, host_rows, 0)
+    assert spill.call_count == (0 if active and serving else 1)
+
+
+@pytest.mark.skip_global_cleanup
 def test_dflash2_shorthand_matches_json(
     profile, monkeypatch, tmp_path, sm70_serving_resolution
 ):

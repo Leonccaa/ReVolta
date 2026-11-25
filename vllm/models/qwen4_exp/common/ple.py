@@ -577,9 +577,13 @@ def cpu_kv_offload_bytes(config: Any) -> int:
 
 
 def check_ple_host_share(
-    text_config: Any, ranks_sharing_host: int, *, cpu_kv_bytes: int = 0
-) -> None:
-    """Warn when configured PLE caps plus the CPU KV pool exceed headroom.
+    text_config: Any,
+    ranks_sharing_host: int,
+    *,
+    cpu_kv_bytes: int = 0,
+    prefer_host: bool = False,
+) -> int | None:
+    """Resolve a host-first automatic budget or check the configured PLE caps.
 
     Runs once before any rank starts. The ranks place their tables at the same
     time, so a rank that reads the host memory while a sibling already pins its
@@ -590,16 +594,24 @@ def check_ple_host_share(
     The reserve covers engines and checkpoint loading, separately from KV.
     """
 
-    if not getattr(text_config, "ple_layer_ids", None):
-        return
+    layers = getattr(text_config, "ple_layer_ids", None)
+    if not layers:
+        return None
     budget = ple_host_budget_bytes()
     total, available, source = preflight_host_memory()
     if available is None or total is None:
-        return
-    if budget is None and not cpu_kv_bytes:
-        return
+        return None
+    if budget is None and not cpu_kv_bytes and not prefer_host:
+        return None
     reserve = ple_host_reserve_bytes(total)
-    ple_bytes = (budget or 0) * ranks_sharing_host * len(text_config.ple_layer_ids)
+    if prefer_host and budget is None:
+        return cap_host_budget_bytes(
+            budget_bytes=available,
+            available_bytes=available,
+            reserve_bytes=reserve + cpu_kv_bytes,
+            ranks_sharing_host=ranks_sharing_host * len(layers),
+        )
+    ple_bytes = (budget or 0) * ranks_sharing_host * len(layers)
     log = (
         logger.warning
         if ple_bytes + cpu_kv_bytes + reserve > available
@@ -620,3 +632,4 @@ def check_ple_host_share(
         format_gib(cpu_kv_bytes),
         format_gib(reserve),
     )
+    return None

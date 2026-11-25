@@ -120,9 +120,7 @@ measurements remain unchanged; planar GPU acceptance is still pending.
 - **`--gpu-memory-utilization 0.95`** passed the full gate, including the multimodal
   stress test with 8 concurrent requests. Higher values ran out of memory in earlier
   multimodal stress tests. If you change concurrency or media limits, measure again.
-- The scheduler settings (`--prefill-pressure-*`, `--long-prefill-token-threshold`,
-  `--mixed-prefill-step-latency-ms`) and `ple_disk_cascade: false` are the tested
-  values for this machine. They are deployment settings, not universal defaults.
+- The reference scheduler settings and `ple_disk_cascade: false` are explicit deployment overrides. See [Mixed prefill scheduling](#mixed-prefill-scheduling) for the launch defaults.
 - `cpu_bytes_to_use` is the total for all four workers (48 GiB = 12 GiB per worker).
 - **Keep `--limit-mm-per-prompt` on V100.** With FlashAttention-V100, the engine allows
   1 image and no video per request without it, and a value that leaves out `"video"`
@@ -144,6 +142,18 @@ measurements remain unchanged; planar GPU acceptance is still pending.
   Without persistent cache storage, a recreated container compiles them again.
 - Media limits and request budgets: see
   [multimodal input limits](../.github/MULTIMODAL_INPUTS.md).
+
+### Mixed prefill scheduling
+
+The SM70 ReVolta profile for FP16-activation, TP4 QSA Flash-Next with AWQ or NVFP4 weights and either MTP or DFlash2 applies these defaults.
+
+| Option | Profile default | Effect |
+| --- | ---: | --- |
+| `--prefill-pressure-token-budget` | `448` | Caps the total prefill tokens in a step when decoding is runnable and the prefill threshold is met. Zero disables the cap. This default requires chunked prefill. |
+| `--prefill-pressure-threshold` | `1` | Applies the cap once at least one prefill request is running or waiting. |
+| `--mixed-prefill-step-latency-ms` | `0` | Disables adaptive GPU step latency control and keeps the standard CUDA Graph capture sizes. |
+
+Pure prefill retains the normal token budget. Explicit values take precedence for each option. A positive latency target enables adaptive control and can add mixed-prefill capture sizes when the graph policy supports them.
 
 ## Optional MTP draft vocabulary in model runner V2
 

@@ -10,7 +10,13 @@ from typing import Annotated, Literal
 import pytest
 from pydantic import Field
 
-from vllm.config import AttentionConfig, CompilationConfig, ModelConfig, config
+from vllm.config import (
+    AttentionConfig,
+    CompilationConfig,
+    ModelConfig,
+    SchedulerConfig,
+    config,
+)
 from vllm.engine.arg_utils import (
     EngineArgs,
     _expand_json_human_readable_numbers,
@@ -291,6 +297,7 @@ def _apply_sm70_defaults(
     args._maybe_apply_sm70_mtp_defaults(
         UsageContext.OPENAI_API_SERVER,
         _fake_qwen_hybrid_model_config(),
+        mixed_prefill_step_latency_ms=SchedulerConfig.mixed_prefill_step_latency_ms,
     )
     return args
 
@@ -461,14 +468,15 @@ def test_sm70_dflash_defaults_ignore_legacy_mtp_disable(monkeypatch):
     assert args.max_num_batched_tokens is None
 
 
-def test_sm70_speculative_defaults_do_not_apply_to_sm75(monkeypatch):
+def test_sm70_speculative_defaults_do_not_apply_to_sm75(monkeypatch, tmp_path):
     monkeypatch.setattr("vllm.engine.arg_utils.current_platform", _FakeSM75Platform())
-    args = EngineArgs(model="dummy", tensor_parallel_size=4)
+    args = EngineArgs(model=str(tmp_path), tensor_parallel_size=4)
     args.speculative_config = {"method": "dflash", "num_speculative_tokens": 7}
 
     args._maybe_apply_sm70_mtp_defaults(
         UsageContext.OPENAI_API_SERVER,
         _fake_qwen_hybrid_model_config(),
+        mixed_prefill_step_latency_ms=SchedulerConfig.mixed_prefill_step_latency_ms,
     )
 
     assert args.speculative_config == {
@@ -510,20 +518,32 @@ def test_hf_token_cli_arg(cli_args, expected):
     assert args.hf_token == expected
 
 
-def test_prefill_pressure_cli_args():
+@pytest.mark.parametrize(
+    ("cli_args", "expected"),
+    [
+        ([], (None, 1, None)),
+        (
+            [
+                "--prefill-pressure-token-budget",
+                "0",
+                "--prefill-pressure-threshold",
+                "2",
+                "--mixed-prefill-step-latency-ms",
+                "250",
+            ],
+            (0, 2, 250.0),
+        ),
+    ],
+)
+def test_prefill_pressure_cli_args(cli_args, expected):
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
-    args = parser.parse_args(
-        [
-            "--prefill-pressure-token-budget",
-            "768",
-            "--prefill-pressure-threshold",
-            "2",
-        ]
-    )
-    engine_args = EngineArgs.from_cli_args(args)
+    engine_args = EngineArgs.from_cli_args(parser.parse_args(cli_args))
 
-    assert engine_args.prefill_pressure_token_budget == 768
-    assert engine_args.prefill_pressure_threshold == 2
+    assert (
+        engine_args.prefill_pressure_token_budget,
+        engine_args.prefill_pressure_threshold,
+        engine_args.mixed_prefill_step_latency_ms,
+    ) == expected
 
 
 @pytest.mark.parametrize(

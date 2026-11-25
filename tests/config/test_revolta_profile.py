@@ -435,7 +435,7 @@ def test_hardware_detection_without_cuda_context(profile, monkeypatch, caps):
 def run_engineargs_early_policy(profile, monkeypatch, apply, **engine_kwargs):
     """Execute EngineArgs' real sequence from the profile import to MTP defaults."""
     import vllm.revolta_profile as installed
-    from vllm.config.compilation import CompilationConfig
+    from vllm.config import CompilationConfig, SchedulerConfig
     from vllm.engine.arg_utils import EngineArgs
 
     monkeypatch.setattr(installed, "apply_revolta_profile", apply)
@@ -498,6 +498,7 @@ def run_engineargs_early_policy(profile, monkeypatch, apply, **engine_kwargs):
         {
             "self": args,
             "model_config": target,
+            "SchedulerConfig": SchedulerConfig,
             "usage_context": SimpleNamespace(name="OPENAI_API_SERVER"),
         },
     )
@@ -510,6 +511,82 @@ def test_engineargs_profile_precedes_actual_mtp_defaults(profile, monkeypatch):
     )
     assert args.compilation_config.fast_moe_cold_start is None
     assert args.compilation_config.cudagraph_capture_sizes is None
+
+
+@pytest.mark.parametrize(
+    ("quantization", "method", "is_sm70", "is_qsa", "overrides", "expected"),
+    [
+        ("awq", "dflash", True, True, {}, (448, 1, 0)),
+        ("awq", "mtp", True, True, {}, (448, 1, 0)),
+        ("modelopt_fp4", "dflash", True, True, {}, (448, 1, 0)),
+        ("modelopt_fp4", "mtp", True, True, {}, (448, 1, 0)),
+        ("awq", "dflash", False, True, {}, (0, 1, 250)),
+        ("awq", "mtp", True, False, {}, (0, 1, 250)),
+        ("awq", None, True, True, {}, (0, 1, 250)),
+        ("awq", "mtp", True, True, {"enable_chunked_prefill": False}, (0, 1, 0)),
+        (
+            "awq",
+            "dflash",
+            True,
+            True,
+            {
+                "prefill_pressure_token_budget": 0,
+                "prefill_pressure_threshold": 2,
+                "mixed_prefill_step_latency_ms": 250,
+            },
+            (0, 2, 250),
+        ),
+    ],
+)
+def test_engineargs_prefill_pressure_profile(
+    profile,
+    monkeypatch,
+    tmp_path,
+    quantization,
+    method,
+    is_sm70,
+    is_qsa,
+    overrides,
+    expected,
+):
+    from transformers import OPTConfig
+
+    from vllm import revolta_profile
+    from vllm.engine import arg_utils
+    from vllm.platforms.cpu import CpuPlatform
+
+    OPTConfig(architectures=["OPTForCausalLM"]).save_pretrained(tmp_path)
+    monkeypatch.setattr(arg_utils, "current_platform", CpuPlatform())
+    monkeypatch.setattr(revolta_profile, "all_visible_devices_sm70", lambda: is_sm70)
+    monkeypatch.setattr(
+        revolta_profile, "apply_revolta_profile", profile.apply_revolta_profile
+    )
+    # Exercise EngineArgs through its real SchedulerConfig construction without
+    # loading checkpoint quantization or speculative model files.
+    monkeypatch.setattr(arg_utils, "VllmConfig", SimpleNamespace)
+    args = arg_utils.EngineArgs(
+        model=str(tmp_path),
+        dtype="float16",
+        tensor_parallel_size=4,
+        distributed_executor_backend="mp",
+        speculative_config={"method": method, "num_speculative_tokens": 4}
+        if method
+        else None,
+        **overrides,
+    )
+    target = args.create_model_config()
+    target.quantization = quantization
+    if is_qsa:
+        target.hf_text_config.update(vars(model(quantization).hf_text_config))
+    monkeypatch.setattr(args, "create_model_config", lambda: target)
+    monkeypatch.setattr(args, "create_speculative_config", lambda *a, **kw: None)
+
+    scheduler = args.create_engine_config().scheduler_config
+    assert (
+        scheduler.prefill_pressure_token_budget,
+        scheduler.prefill_pressure_threshold,
+        scheduler.mixed_prefill_step_latency_ms,
+    ) == expected
 
 
 @pytest.mark.parametrize(

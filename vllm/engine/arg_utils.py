@@ -563,11 +563,11 @@ class EngineArgs:
     max_num_partial_prefills: int = SchedulerConfig.max_num_partial_prefills
     max_long_partial_prefills: int = SchedulerConfig.max_long_partial_prefills
     long_prefill_token_threshold: int = SchedulerConfig.long_prefill_token_threshold
-    mixed_prefill_step_latency_ms: float = SchedulerConfig.mixed_prefill_step_latency_ms
+    mixed_prefill_step_latency_ms: float | None = None
     long_prefill_token_threshold_adaptive: bool = (
         SchedulerConfig.long_prefill_token_threshold_adaptive
     )
-    prefill_pressure_token_budget: int = SchedulerConfig.prefill_pressure_token_budget
+    prefill_pressure_token_budget: int | None = None
     prefill_pressure_threshold: int = SchedulerConfig.prefill_pressure_threshold
     max_num_seqs: int | None = None
     max_logprobs: int = ModelConfig.max_logprobs
@@ -1463,7 +1463,7 @@ class EngineArgs:
         )
         scheduler_group.add_argument(
             "--prefill-pressure-token-budget",
-            **scheduler_kwargs["prefill_pressure_token_budget"],
+            **(scheduler_kwargs["prefill_pressure_token_budget"] | {"default": None}),
         )
         scheduler_group.add_argument(
             "--prefill-pressure-threshold",
@@ -1472,7 +1472,7 @@ class EngineArgs:
         # multi-step scheduling has been removed; corresponding arguments
         scheduler_group.add_argument(
             "--mixed-prefill-step-latency-ms",
-            **scheduler_kwargs["mixed_prefill_step_latency_ms"],
+            **(scheduler_kwargs["mixed_prefill_step_latency_ms"] | {"default": None}),
         )
         # are no longer supported.
         scheduler_group.add_argument(
@@ -1825,6 +1825,8 @@ class EngineArgs:
         self,
         usage_context: UsageContext | None,
         model_config: ModelConfig,
+        *,
+        mixed_prefill_step_latency_ms: float,
     ) -> None:
         """Apply the 1Cat SM70 speculative serving defaults."""
         mtp_defaults_disabled = (
@@ -1980,7 +1982,7 @@ class EngineArgs:
                     self.max_num_seqs,
                     decode_query_len,
                     include_mixed_prefill=(
-                        self.mixed_prefill_step_latency_ms > 0
+                        mixed_prefill_step_latency_ms > 0
                         and (
                             graph_mode is None or graph_mode.has_piecewise_cudagraphs()
                         )
@@ -2058,23 +2060,41 @@ class EngineArgs:
             all_visible_devices_sm70,
             apply_revolta_profile,
             frontend_interconnect_mode,
+            has_nvfp4_weights,
         )
 
         # Must precede the MTP defaults: those pre-fill capture sizes and change
         # fast_moe_cold_start before VllmConfig gets a chance to choose policy.
-        apply_revolta_profile(
+        speculative_method = (self.speculative_config or {}).get("method")
+        revolta_profile_enabled = apply_revolta_profile(
             model_config,
             self.tensor_parallel_size,
             is_sm70=all_visible_devices_sm70(),
             interconnect_mode=frontend_interconnect_mode(
                 disable_custom_all_reduce=self.disable_custom_all_reduce
             ),
-            speculative_method=(self.speculative_config or {}).get("method"),
+            speculative_method=speculative_method,
             allow_shared_expert_overlap=not (
                 self.enable_expert_parallel or self.enable_dbo
             ),
         )
-        self._maybe_apply_sm70_mtp_defaults(usage_context, model_config)
+        use_fixed_prefill_profile = (
+            revolta_profile_enabled
+            and speculative_method in ("mtp", "dflash")
+            and (model_config.quantization == "awq" or has_nvfp4_weights(model_config))
+        )
+        mixed_prefill_step_latency_ms = self.mixed_prefill_step_latency_ms
+        if mixed_prefill_step_latency_ms is None:
+            mixed_prefill_step_latency_ms = (
+                0.0
+                if use_fixed_prefill_profile
+                else SchedulerConfig.mixed_prefill_step_latency_ms
+            )
+        self._maybe_apply_sm70_mtp_defaults(
+            usage_context,
+            model_config,
+            mixed_prefill_step_latency_ms=mixed_prefill_step_latency_ms,
+        )
         self._set_default_chunked_prefill_and_prefix_caching_args(model_config)
         self._set_default_reasoning_config_args()
         sliding_window: int | None = None
@@ -2377,6 +2397,13 @@ class EngineArgs:
         assert model_config.max_model_len is not None, (
             "max_model_len must be set by this point"
         )
+        prefill_pressure_token_budget = self.prefill_pressure_token_budget
+        if prefill_pressure_token_budget is None:
+            prefill_pressure_token_budget = (
+                448
+                if use_fixed_prefill_profile and self.enable_chunked_prefill
+                else SchedulerConfig.prefill_pressure_token_budget
+            )
         scheduler_config = SchedulerConfig(
             runner_type=model_config.runner_type,
             max_num_batched_tokens=self.max_num_batched_tokens,
@@ -2391,11 +2418,11 @@ class EngineArgs:
             max_num_partial_prefills=self.max_num_partial_prefills,
             max_long_partial_prefills=self.max_long_partial_prefills,
             long_prefill_token_threshold=self.long_prefill_token_threshold,
-            mixed_prefill_step_latency_ms=self.mixed_prefill_step_latency_ms,
+            mixed_prefill_step_latency_ms=mixed_prefill_step_latency_ms,
             long_prefill_token_threshold_adaptive=(
                 self.long_prefill_token_threshold_adaptive
             ),
-            prefill_pressure_token_budget=self.prefill_pressure_token_budget,
+            prefill_pressure_token_budget=prefill_pressure_token_budget,
             prefill_pressure_threshold=self.prefill_pressure_threshold,
             scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,

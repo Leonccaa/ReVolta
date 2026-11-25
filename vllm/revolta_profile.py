@@ -41,7 +41,6 @@ AWQ_DEFAULTS = {
     "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT": "8",
     "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_PACK_ROWS": "24",
     "VLLM_SM70_AWQ_TUNE_SMALL_SHAPES": "1",
-    "VLLM_SM70_AWQ_MOE_INT4_ZERO": "1",
     # Measured for the AWQ TP4 graph pool.
     "VLLM_V2_CUDAGRAPH_MEM_MIB": "700",
 }
@@ -373,6 +372,8 @@ def apply_revolta_profile(
     if getattr(model_config, "quantization", None) == "awq":
         if _has_awq_qpn_shape(model_config, tensor_parallel_size):
             defaults.update(AWQ_DEFAULTS)
+            if hybrid_serving and envs.VLLM_SM70_AWQ_MOE_COMPACT_METADATA:
+                defaults["VLLM_SM70_AWQ_MOE_INT4_ZERO"] = "1"
             if speculative_method == "dflash":
                 defaults.update(DFLASH_DEFAULTS)
                 if allow_shared_expert_overlap:
@@ -391,11 +392,7 @@ def apply_revolta_profile(
             defaults.update(mtp_planar_kv_defaults)
     if interconnect_mode != "no_p2p":
         defaults.update(CUSTOM_AR_DEFAULTS)
-    if not hybrid_serving or not envs.VLLM_SM70_AWQ_MOE_COMPACT_METADATA:
-        defaults.pop("VLLM_SM70_AWQ_MOE_INT4_ZERO", None)
     if hybrid_serving:
-        from vllm.env_override import _default_nccl_graph_register
-
         defaults.update(HYBRID_SERVING_DEFAULTS)
         if speculative_method == "dflash":
             defaults.update(DFLASH_SERVING_DEFAULTS)
@@ -403,14 +400,6 @@ def apply_revolta_profile(
             if alias in os.environ:
                 defaults.pop(name, None)
 
-        # The API process configures the allocator before spawning the engine
-        # and GPU workers. Both PyTorch spellings honor either user setting.
-        if not torch.cuda.is_initialized() and not (
-            "PYTORCH_ALLOC_CONF" in os.environ
-            or "PYTORCH_CUDA_ALLOC_CONF" in os.environ
-        ):
-            defaults["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
-            defaults["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     for name, value in defaults.items():
         if name not in os.environ or _PROFILE_VALUES.get(name) == os.environ[name]:
             os.environ[name] = value
@@ -419,10 +408,21 @@ def apply_revolta_profile(
             # Also recognize programmatic overrides supplied after import vllm
             # but before EngineArgs/VllmConfig construction.
             _INITIAL_ENV.setdefault(name, os.environ[name])
-    if hybrid_serving:
-        _default_nccl_graph_register(os.environ)
     _export_provenance()
     return True
+
+
+def apply_revolta_allocator_default() -> None:
+    """Set the allocator after connector selection and before worker startup."""
+    from vllm.env_override import _default_nccl_graph_register
+
+    names = ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF")
+    if any(name in os.environ for name in names):
+        return
+    for name in names:
+        os.environ[name] = _PROFILE_VALUES[name] = "expandable_segments:True"
+    _default_nccl_graph_register(os.environ)
+    _export_provenance()
 
 
 def apply_revolta_kernel_profile(kernel_config: Any, *, enabled: bool) -> None:

@@ -24,6 +24,7 @@ from vllm.models.deepseek_v4.common.ops.fp8_software import (
     fp8_e4m3fn_bits_to_fp32_bitcast as fp8_e4m3fn_bits_to_fp32,
 )
 from vllm.models.qwen4_exp.common.qsa_cache import QSA_PREFILL_MIN_ROWS_PER_OWNER
+from vllm.models.qwen4_exp.config import QSA_INDEX_DCP_SHARD_TOPK
 from vllm.models.qwen4_exp.nvidia.ops.sm70_qsa_tuning import (
     SM70_QSA_TUNING,
     legacy_qsa_tuning,
@@ -1521,7 +1522,7 @@ def validate_qsa_index_dcp_shard_runtime(block_topk: int) -> None:
             "QSA indexer DCP sharding needs NVIDIA SM70 GPUs: its candidate "
             "merge uses the exact SM70 lexicographic top-k"
         )
-    if block_topk != 512:
+    if block_topk != QSA_INDEX_DCP_SHARD_TOPK:
         raise ValueError(
             "QSA indexer DCP sharding needs 512 selected groups per row "
             f"(indexer budget / compress ratio), got {block_topk}"

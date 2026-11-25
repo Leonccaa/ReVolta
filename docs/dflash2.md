@@ -129,9 +129,9 @@ rule. `"greedy"` still works. MTP must stay `"greedy"`; see
 
 ## Native history lookup (optional)
 
-The ReVolta serving profile enables native lookup for eligible K=7 DFlash2
-configurations without explicit lookup settings, using the C64 recipe below
-with `max_requests=1`. Lookup searches committed token history for a
+For the profile's lookup defaults and opt-out, see [Native DFlash2 lookup](configuration.md#native-dflash2-lookup).
+
+Lookup searches committed token history for a
 continuation and fuses it into the seven-token DFlash2 proposal when the first
 lookup token agrees with the neural proposal. The original first token and its
 proposal distribution are preserved. Short continuations replace only the
@@ -159,10 +159,7 @@ into the DFlash2 speculative config above, retaining its model and other setting
 }
 ```
 
-Use `--no-async-scheduling` for the recommended GDN replay setup. Set
-`"dflash2_lookup": {"enabled": false}` to disable lookup. Outside the eligible
-serving profile, lookup requires an explicit config with `policy`, `nmin` and
-`nmax`.
+Use `--no-async-scheduling` for the recommended GDN replay setup.
 
 - For batches of one to `max_requests` live requests at scheduler K=7,
   each eligible decode row attempts lookup independently. Prefill, structured

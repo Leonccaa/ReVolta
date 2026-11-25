@@ -4009,7 +4009,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default="False",
         automatic_conditions=(
             "vllm/revolta_profile.py:apply_revolta_profile sets '1'. "
-            "Only AWQ checkpoints with the qualified shape in hybrid serving.",
+            "Only AWQ checkpoints with the qualified shape and compact metadata "
+            "in hybrid serving.",
         ),
         acceleration_paths=("MoE AWQ",),
         user_visible=False,

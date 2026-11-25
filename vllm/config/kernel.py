@@ -708,8 +708,8 @@ class KernelConfig:
     Group g is owned by DCP rank ``g % dcp`` at local column ``g // dcp``. Each
     rank scores only its own groups; local top-k candidates are merged across
     the group into the unchanged global selection. Unset enables sharding only
-    for DFlash2 under the ReVolta hybrid serving profile with DCP > 1. GPU MTP
-    keeps the replicated default.
+    for DFlash2 with 512 selected groups under the ReVolta hybrid serving profile.
+    Sharding takes effect with DCP > 1. GPU MTP keeps the replicated default.
     """
 
     long_context_kv: LongContextKVConfig = Field(default_factory=LongContextKVConfig)

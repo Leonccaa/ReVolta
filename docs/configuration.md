@@ -153,9 +153,9 @@ take precedence.
 | --- | ---: | --- |
 | `--enable-prefix-caching` | `true` | Reuses cached prompt prefixes. The hybrid model validator selects the Mamba state cache mode. |
 | `--max-num-seqs` | `8` | Sets the maximum number of scheduled sequences. |
-| `--max-num-batched-tokens` | `8192` | Sets the total token budget per scheduler step. |
+| `--max-num-batched-tokens` | `8192` unless chunked prefill is explicitly disabled | Sets the total token budget per scheduler step. |
 | `--long-prefill-token-threshold` | `4896`, capped at the model context length | Caps one long prefill when other requests may need the step. |
-| `qsa_dcp_index_shard` (DFlash2 with DCP > 1) | `true` | Shards target QSA indexer keys. MTP and DCP1 keep the replicated default. |
+| `qsa_dcp_index_shard` (DFlash2 with 512 selected groups) | `true` | Shards target QSA indexer keys with DCP > 1. MTP and DCP1 keep the replicated layout. |
 | `num_speculative_tokens_per_batch_size` (DFlash2 K=7) | `[[1,3,7],[4,4,3],[5,8,4]]` | Selects the number of drafts by batch size. |
 | `num_speculative_tokens_per_batch_size` (MTP K=4 with aligned Mamba caching) | `[[1,3,4],[4,8,3]]` | Selects the number of drafts by batch size. |
 | `dflash2_lookup` (native seven-token DFlash2 selector) | Longest match, suffix 5–16, 65,536-token window, `first_token` gate, statistics enabled, one live request | Uses committed token history to supplement the neural proposal. |
@@ -164,7 +164,7 @@ take precedence.
 | `VLLM_SM70_QSA_GROUPED_LPT`, `VLLM_SM70_GDN_SKINNY_MPLAN` | `1` | Use longest-first grouped QSA work and row-count-based GDN input plans. |
 | `VLLM_SM70_DFLASH2_FUSED_QKV_PACK` | `1` for DFlash2 | Fuses eligible post-convolution QKV packing. |
 | `VLLM_SM70_AWQ_MOE_INT4_ZERO` | `1` for qualified AWQ with compact metadata | Stores AWQ MoE zeros as nibbles. |
-| `PYTORCH_ALLOC_CONF`, `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True` if neither is set | Sets the allocator policy before local GPU workers start. |
+| `PYTORCH_ALLOC_CONF`, `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True` if neither is set | Sets the policy before local GPU workers start when KV connector setup is absent or VMM-safe. |
 
 The engine still resolves omitted `--async-scheduling` from the executor and
 speculative decoding settings. The DFlash2 schedule and MTP's post-sampling

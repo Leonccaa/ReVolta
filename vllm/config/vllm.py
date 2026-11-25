@@ -1935,6 +1935,7 @@ class VllmConfig:
 
         from vllm.revolta_profile import (
             all_visible_devices_sm70,
+            apply_revolta_allocator_default,
             apply_revolta_kernel_profile,
             apply_revolta_profile,
             frontend_interconnect_mode,
@@ -1966,12 +1967,19 @@ class VllmConfig:
                 self.kernel_config, enabled=revolta_profile_enabled
             )
         if self.kernel_config.qsa_dcp_index_shard is None:
-            self.kernel_config.qsa_dcp_index_shard = (
+            self.kernel_config.qsa_dcp_index_shard = False
+            if (
                 revolta_hybrid_serving
-                and self.parallel_config.decode_context_parallel_size > 1
                 and self.speculative_config is not None
                 and self.speculative_config.use_dflash()
-            )
+            ):
+                from vllm.models.qwen4_exp.config import QSA_INDEX_DCP_SHARD_TOPK
+
+                text = self.model_config.hf_text_config
+                self.kernel_config.qsa_dcp_index_shard = (
+                    text.indexer_budget // text.indexer_compress_ratio
+                    == QSA_INDEX_DCP_SHARD_TOPK
+                )
 
         # To give each torch profile run a unique instance name.
         self.instance_id = f"{time.time_ns()}"
@@ -2223,7 +2231,6 @@ class VllmConfig:
                 and self.speculative_config is not None
                 and self.speculative_config.method == "mtp"
                 and self.speculative_config.gdn_state_replay
-                and self.speculative_config.gdn_deferred_commit_metadata is not True
                 and self.cache_config.mamba_cache_mode == "align"
             ):
                 logger.info_once(
@@ -3353,6 +3360,12 @@ class VllmConfig:
         # Resolve kv_offloading-derived connector name into kv_transfer_config
         # before the HMA check below, which inspects the connector class.
         self._post_init_kv_transfer_config()
+        if revolta_hybrid_serving and (
+            self.kv_transfer_config is None
+            or self.kv_transfer_config.kv_connector is None
+            or self._connector_supports_vmm_safe_transfers()
+        ):
+            apply_revolta_allocator_default()
 
         # Hybrid KV cache manager (HMA) runtime rules:
         # - Explicit enable (--no-disable-kv-cache-manager): error if runtime

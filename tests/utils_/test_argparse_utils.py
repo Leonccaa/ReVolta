@@ -4,6 +4,7 @@
 
 import json
 import os
+from argparse import BooleanOptionalAction
 
 import pytest
 import yaml
@@ -124,6 +125,33 @@ def test_config_args(parser_with_config, cli_config_file):
     )
     assert args.tensor_parallel_size == 2
     assert args.trust_remote_code
+
+
+@pytest.mark.parametrize("subcommand", [False, True])
+def test_yaml_false_uses_registered_negative_option(tmp_path, subcommand):
+    parser = FlexibleArgumentParser()
+    if subcommand:
+        options = parser.add_subparsers().add_parser("serve")
+        options.add_argument("model")
+        argv = ["serve", "model"]
+    else:
+        options = parser
+        argv = []
+    options.add_argument("--enable-prefix-caching", action=BooleanOptionalAction)
+    options.add_argument("--async-scheduling", action=BooleanOptionalAction)
+    options.add_argument("--trust-remote-code", action="store_true")
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "enable-prefix-caching: false\n"
+        "async_scheduling: false\n"
+        "trust-remote-code: false\n"
+    )
+    argv.extend(("--config", str(config)))
+    args = parser.parse_args(argv)
+    assert args.enable_prefix_caching is False
+    assert args.async_scheduling is False
+    assert args.trust_remote_code is False
+    assert parser.parse_args([*argv, "--enable-prefix-caching"]).enable_prefix_caching
 
 
 def test_config_file(parser_with_config):

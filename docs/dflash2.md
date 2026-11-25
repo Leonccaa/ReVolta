@@ -129,7 +129,9 @@ rule. `"greedy"` still works. MTP must stay `"greedy"`; see
 
 ## Native history lookup (optional)
 
-Native lookup is **off by default**. It searches committed token history for a
+For the profile's lookup defaults and opt-out, see [Native DFlash2 lookup](configuration.md#native-dflash2-lookup).
+
+Lookup searches committed token history for a
 continuation and fuses it into the seven-token DFlash2 proposal when the first
 lookup token agrees with the neural proposal. The original first token and its
 proposal distribution are preserved. Short continuations replace only the
@@ -157,10 +159,7 @@ into the DFlash2 speculative config above, retaining its model and other setting
 }
 ```
 
-Use `--no-async-scheduling` for the recommended GDN replay setup. Omitting
-`dflash2_lookup` or setting `"enabled": false` leaves lookup disabled.
-When enabling it, `policy`, `nmin` and
-`nmax` must be explicit; no lookup recipe is selected automatically.
+Use `--no-async-scheduling` for the recommended GDN replay setup.
 
 - For batches of one to `max_requests` live requests at scheduler K=7,
   each eligible decode row attempts lookup independently. Prefill, structured

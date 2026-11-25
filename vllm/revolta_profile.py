@@ -11,6 +11,8 @@ import json
 import os
 from typing import Any, Literal
 
+from vllm import envs
+
 InterconnectMode = Literal["pex_p2p", "no_p2p", "nvlink"]
 
 COMMON_DEFAULTS = {
@@ -64,6 +66,11 @@ DFLASH_DEFAULTS = {
     "VLLM_V2_CUDAGRAPH_MEM_MIB": "1200",
     "VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS": "0",
 }
+HYBRID_SERVING_DEFAULTS = {
+    "VLLM_SM70_QSA_GROUPED_LPT": "1",
+    "VLLM_SM70_GDN_SKINNY_MPLAN": "1",
+}
+DFLASH_SERVING_DEFAULTS = {"VLLM_SM70_DFLASH2_FUSED_QKV_PACK": "1"}
 AWQ_DFLASH_DEFAULTS = {"VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP": "1"}
 # With a planar KV cache (fp8_per_token_head, the QSA auto choice, or int8) the
 # graphs are smaller than with the scalar FP8 cache. Measured per GPU on TP4:
@@ -114,11 +121,12 @@ AUDITED_NAMES = tuple(
         set(COMMON_DEFAULTS)
         | set(AWQ_DEFAULTS)
         | set(CUSTOM_AR_DEFAULTS)
+        | set(HYBRID_SERVING_DEFAULTS)
+        | set(DFLASH_SERVING_DEFAULTS)
         | set(UPSTREAM_AND_DEPLOYMENT)
     )
 )
-# Keep the AWQ audit inventory byte-compatible. Format-specific entries are
-# included in NVFP4 audits and provenance transport only.
+# Include NVFP4-only entries in NVFP4 audits and provenance transport.
 # VLLM_SM70_FP8_TURBOMIND is no longer written (its unset default is already 1;
 # kernel_config.sm70_fp8.enabled replaces it for FP8 linear layers) but stays
 # audited for NVFP4 mixed checkpoints, whose MoE consumers still read it.
@@ -244,8 +252,8 @@ def all_visible_devices_sm70() -> bool:
     """Conservative early check, before EngineArgs applies its MTP defaults.
 
     Unknown/mixed visible devices retain upstream defaults; worker topology
-    discovery belongs to the interconnect resolver. Allocator configuration must
-    already be present before querying platform capabilities.
+    discovery belongs to the interconnect resolver. The supported NVIDIA
+    platform uses NVML for capability queries before CUDA initialization.
     """
     from vllm.platforms import current_platform
 
@@ -331,6 +339,7 @@ def apply_revolta_profile(
     is_sm70: bool,
     interconnect_mode: InterconnectMode = "pex_p2p",
     speculative_method: str | None = None,
+    hybrid_serving: bool = False,
     allow_shared_expert_overlap: bool = True,
     kv_cache_dtype: str | None = None,
     num_speculative_tokens_per_batch_size: list[tuple[int, int, int]] | None = None,
@@ -363,6 +372,8 @@ def apply_revolta_profile(
     if getattr(model_config, "quantization", None) == "awq":
         if _has_awq_qpn_shape(model_config, tensor_parallel_size):
             defaults.update(AWQ_DEFAULTS)
+            if hybrid_serving and envs.VLLM_SM70_AWQ_MOE_COMPACT_METADATA:
+                defaults["VLLM_SM70_AWQ_MOE_INT4_ZERO"] = "1"
             if speculative_method == "dflash":
                 defaults.update(DFLASH_DEFAULTS)
                 if allow_shared_expert_overlap:
@@ -381,6 +392,14 @@ def apply_revolta_profile(
             defaults.update(mtp_planar_kv_defaults)
     if interconnect_mode != "no_p2p":
         defaults.update(CUSTOM_AR_DEFAULTS)
+    if hybrid_serving:
+        defaults.update(HYBRID_SERVING_DEFAULTS)
+        if speculative_method == "dflash":
+            defaults.update(DFLASH_SERVING_DEFAULTS)
+        for alias, name in envs.PROMOTED_RESEARCH_ENVS.items():
+            if alias in os.environ:
+                defaults.pop(name, None)
+
     for name, value in defaults.items():
         if name not in os.environ or _PROFILE_VALUES.get(name) == os.environ[name]:
             os.environ[name] = value
@@ -391,6 +410,19 @@ def apply_revolta_profile(
             _INITIAL_ENV.setdefault(name, os.environ[name])
     _export_provenance()
     return True
+
+
+def apply_revolta_allocator_default() -> None:
+    """Set the allocator after connector selection and before worker startup."""
+    from vllm.env_override import _default_nccl_graph_register
+
+    names = ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF")
+    if any(name in os.environ for name in names):
+        return
+    for name in names:
+        os.environ[name] = _PROFILE_VALUES[name] = "expandable_segments:True"
+    _default_nccl_graph_register(os.environ)
+    _export_provenance()
 
 
 def apply_revolta_kernel_profile(kernel_config: Any, *, enabled: bool) -> None:

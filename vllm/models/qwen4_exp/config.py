@@ -11,6 +11,8 @@ from transformers.models.qwen3_vl.configuration_qwen3_vl import (
 
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
 
+QSA_INDEX_DCP_SHARD_TOPK = 512
+
 _QSA_CONFIG_FIELDS = (
     "indexer_n_heads",
     "indexer_kv_heads",

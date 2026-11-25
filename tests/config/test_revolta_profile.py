@@ -209,7 +209,7 @@ def test_sources_after_upstream_auto_defaults(profile, monkeypatch):
     monkeypatch.setenv("NCCL_GRAPH_REGISTER", "0")  # env_override
     audit = json.loads(module.profile_audit(enabled=True))
     assert audit["enabled"]
-    assert len(audit["values"]) == 46
+    assert len(audit["values"]) == 49
     assert audit["values"][FP16[0]]["source"] == "upstream_default"
     assert audit["values"]["NCCL_GRAPH_REGISTER"]["source"] == "upstream_default"
     assert audit["values"]["VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT"] == {
@@ -488,6 +488,8 @@ def run_engineargs_early_policy(profile, monkeypatch, apply, **engine_kwargs):
     )
     target = model()
     target.hf_text_config.mtp_num_hidden_layers = 1
+    target.is_hybrid = True
+    target.runner_type = "generate"
     args._check_feature_supported = Mock()
     exec(
         compile(
@@ -510,6 +512,394 @@ def test_engineargs_profile_precedes_actual_mtp_defaults(profile, monkeypatch):
     )
     assert args.compilation_config.fast_moe_cold_start is None
     assert args.compilation_config.cudagraph_capture_sizes is None
+
+
+def test_hybrid_serving_environment_overrides(profile, monkeypatch):
+    overrides = {
+        "VLLM_SM70_QSA_GROUPED_LPT": "0",
+        "REVOLTA_SKINNY_MPLAN": "0",
+        "VLLM_SM70_DFLASH2_FUSED_QKV_PACK": "0",
+        "VLLM_SM70_AWQ_MOE_INT4_ZERO": "0",
+    }
+    for name, value in overrides.items():
+        monkeypatch.setenv(name, value)
+    assert profile.apply_revolta_profile(
+        model(), 4, is_sm70=True, hybrid_serving=True, speculative_method="dflash"
+    )
+    assert all(os.environ.get(name) == value for name, value in overrides.items())
+    assert "VLLM_SM70_GDN_SKINNY_MPLAN" not in os.environ
+
+
+@pytest.mark.parametrize(("method", "qkv_pack"), [("dflash", "1"), ("mtp", None)])
+def test_hybrid_serving_environment_defaults(profile, method, qkv_pack):
+    assert profile.apply_revolta_profile(
+        model(), 4, is_sm70=True, hybrid_serving=True, speculative_method=method
+    )
+    assert os.environ["VLLM_SM70_QSA_GROUPED_LPT"] == "1"
+    assert os.environ["VLLM_SM70_GDN_SKINNY_MPLAN"] == "1"
+    assert os.environ["VLLM_SM70_AWQ_MOE_INT4_ZERO"] == "1"
+    assert os.environ.get("VLLM_SM70_DFLASH2_FUSED_QKV_PACK") == qkv_pack
+
+
+def hybrid_serving_args(
+    profile,
+    monkeypatch,
+    tmp_path,
+    method,
+    flags,
+    spec_options,
+    *,
+    active=True,
+    serving=True,
+    indexer_budget=2048,
+):
+    from transformers import Qwen3Config
+
+    from vllm import revolta_profile
+    from vllm.config import speculative
+    from vllm.engine import arg_utils
+    from vllm.platforms import current_platform
+    from vllm.platforms.cpu import CpuPlatform
+    from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
+    from vllm.usage.usage_lib import UsageContext
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+    Qwen3NextConfig(
+        architectures=["Qwen3NextForCausalLM"], num_key_value_heads=2
+    ).save_pretrained(tmp_path / "target")
+    argv = [
+        "--model",
+        str(tmp_path / "target"),
+        "--dtype",
+        "half",
+        "--tensor-parallel-size",
+        "4",
+        "--distributed-executor-backend",
+        "mp",
+        *flags,
+    ]
+    if method is not None:
+        raw = {
+            "method": method,
+            "num_speculative_tokens": 7 if method == "dflash" else 4,
+            **spec_options,
+        }
+        if method == "dflash":
+            Qwen3Config(
+                architectures=["DFlash2DraftModel"],
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                dflash_config={"selector_top_k": 16, "block_size": 8},
+            ).save_pretrained(tmp_path / "draft")
+            raw["model"] = str(tmp_path / "draft")
+        argv.extend(("--speculative-config", json.dumps(raw)))
+
+    monkeypatch.setattr(arg_utils, "current_platform", CpuPlatform())
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(revolta_profile, "all_visible_devices_sm70", lambda: active)
+    monkeypatch.setattr(
+        revolta_profile, "apply_revolta_profile", profile.apply_revolta_profile
+    )
+    monkeypatch.setattr(
+        speculative,
+        "ModelConfig",
+        lambda **kwargs: arg_utils.ModelConfig(**(kwargs | {"quantization": None})),
+    )
+    parser = arg_utils.EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = arg_utils.EngineArgs.from_cli_args(parser.parse_args(argv))
+    target = args.create_model_config()
+    target.quantization = "awq"
+    target.hf_text_config.update(vars(model().hf_text_config))
+    target.hf_text_config.indexer_budget = indexer_budget
+    target.hf_config.quantization_config = model().hf_config.quantization_config
+    monkeypatch.setattr(args, "create_model_config", lambda: target)
+
+    context = UsageContext.OPENAI_API_SERVER if serving else UsageContext.LLM_CLASS
+    return args, context
+
+
+MTP_DSD = [(1, 3, 4), (4, 8, 3)]
+DFLASH_DSD = [(1, 3, 7), (4, 4, 3), (5, 8, 4)]
+DFLASH_LOOKUP = (5, 16, 65536, 1)
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize(
+    ("method", "flags", "spec_options", "active", "serving", "expected"),
+    [
+        # Expected: sequences, tokens, prefix cache, DSD, lookup, long threshold.
+        ("mtp", [], {}, True, True, (8, 8192, True, MTP_DSD, None, 4896)),
+        (None, [], {}, True, True, (8, 8192, True, None, None, 4896)),
+        (
+            "mtp",
+            ["--no-enable-prefix-caching"],
+            {},
+            True,
+            True,
+            (8, 8192, False, None, None, 4896),
+        ),
+        (
+            "mtp",
+            [
+                "--max-num-seqs",
+                "4",
+                "--max-num-batched-tokens",
+                "4096",
+                "--long-prefill-token-threshold",
+                "0",
+            ],
+            {"num_speculative_tokens_per_batch_size": [[1, 4, 2]]},
+            True,
+            True,
+            (4, 4096, True, [(1, 4, 2)], None, 0),
+        ),
+        (
+            "mtp",
+            [],
+            {"num_speculative_tokens": 3},
+            True,
+            True,
+            (8, 8192, True, None, None, 4896),
+        ),
+        (
+            "dflash",
+            [],
+            {},
+            True,
+            True,
+            (8, 8192, True, DFLASH_DSD, DFLASH_LOOKUP, 4896),
+        ),
+        (
+            "dflash",
+            [],
+            {"dflash2_lookup": {"enabled": False}},
+            True,
+            True,
+            (8, 8192, True, DFLASH_DSD, None, 4896),
+        ),
+        (
+            "dflash",
+            [],
+            {
+                "num_speculative_tokens_per_batch_size": None,
+                "dflash2_lookup": {
+                    "enabled": True,
+                    "policy": "longest",
+                    "nmin": 5,
+                    "nmax": 10,
+                    "max_requests": 2,
+                },
+            },
+            True,
+            True,
+            (8, 8192, True, None, (5, 10, 65536, 2), 4896),
+        ),
+        (
+            "dflash",
+            [],
+            {"num_speculative_tokens": 4},
+            True,
+            True,
+            (8, 8192, True, None, None, 4896),
+        ),
+        ("mtp", [], {}, True, False, (1024, 16384, False, None, None, 0)),
+        ("mtp", [], {}, False, True, (512, 8192, False, None, None, 0)),
+    ],
+)
+def test_engineargs_revolta_hybrid_serving_defaults(
+    profile,
+    monkeypatch,
+    tmp_path,
+    method,
+    flags,
+    spec_options,
+    active,
+    serving,
+    expected,
+):
+    from vllm.engine import arg_utils
+
+    args, context = hybrid_serving_args(
+        profile,
+        monkeypatch,
+        tmp_path,
+        method,
+        flags,
+        spec_options,
+        active=active,
+        serving=serving,
+    )
+    monkeypatch.setattr(arg_utils, "VllmConfig", SimpleNamespace)
+    config = args.create_engine_config(usage_context=context)
+    scheduler = config.scheduler_config
+    spec = config.speculative_config
+    lookup = getattr(spec, "dflash2_lookup", None)
+    assert (
+        scheduler.max_num_seqs,
+        scheduler.max_num_batched_tokens,
+        config.cache_config.enable_prefix_caching,
+        getattr(spec, "num_speculative_tokens_per_batch_size", None),
+        (lookup.nmin, lookup.nmax, lookup.search_window, lookup.max_requests)
+        if lookup is not None and lookup.enabled
+        else None,
+        scheduler.long_prefill_token_threshold,
+    ) == expected
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("source", ["cli", "yaml"])
+def test_hybrid_serving_preserves_disabled_prefill(
+    profile, monkeypatch, tmp_path, source
+):
+    from vllm.engine import arg_utils
+
+    flags = ["--max-model-len", "16384"]
+    if source == "yaml":
+        config_file = tmp_path / "serve.yaml"
+        config_file.write_text(
+            "enable-prefix-caching: false\n"
+            "enable-chunked-prefill: false\n"
+            "async-scheduling: false\n"
+        )
+        flags.extend(("--config", str(config_file)))
+    else:
+        flags.extend(
+            (
+                "--no-enable-prefix-caching",
+                "--no-enable-chunked-prefill",
+                "--no-async-scheduling",
+            )
+        )
+    args, context = hybrid_serving_args(
+        profile, monkeypatch, tmp_path, "mtp", flags, {}
+    )
+    monkeypatch.setattr(arg_utils, "VllmConfig", SimpleNamespace)
+    config = args.create_engine_config(usage_context=context)
+    scheduler = config.scheduler_config
+    assert scheduler.max_num_batched_tokens == 16384
+    assert scheduler.enable_chunked_prefill is False
+    assert scheduler.async_scheduling is False
+    assert config.cache_config.enable_prefix_caching is False
+
+
+@pytest.fixture
+def sm70_serving_resolution(monkeypatch):
+    from vllm.config import VllmConfig
+    from vllm.platforms import current_platform
+
+    # Run real config resolution with the GPU capability checks stubbed.
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setattr("vllm.config.vllm.HAS_TRITON", True)
+    monkeypatch.setattr(VllmConfig, "_get_quantization_config", lambda *_: None)
+    monkeypatch.setattr(current_platform, "check_and_update_config", lambda _: None)
+    monkeypatch.setattr(
+        "vllm.config.vllm._any_participating_device_is_capability",
+        lambda _, capability: capability == (7, 0),
+    )
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize(
+    ("method", "flags", "spec_options", "budget", "expected"),
+    [
+        ("mtp", [], {}, 2048, (False, False, True)),
+        ("mtp", ["--async-scheduling"], {}, 2048, (False, True, False)),
+        ("mtp", [], {"gdn_state_replay": False}, 2048, (False, True, False)),
+        ("dflash", [], {}, 2048, (True, False, True)),
+        ("dflash", [], {}, 8192, (False, False, True)),
+        (
+            "dflash",
+            ["--kernel-config", '{"qsa_dcp_index_shard":false}'],
+            {"sm70_dflash2": {"spec_state_replay": False}},
+            2048,
+            (False, False, False),
+        ),
+        (
+            "dflash",
+            [],
+            {"sm70_dflash2": {"fused_gdn_verify": True}},
+            2048,
+            (True, False, False),
+        ),
+    ],
+)
+def test_hybrid_serving_index_sharding_and_replay(
+    profile,
+    monkeypatch,
+    tmp_path,
+    sm70_serving_resolution,
+    method,
+    flags,
+    spec_options,
+    budget,
+    expected,
+):
+    args, context = hybrid_serving_args(
+        profile,
+        monkeypatch,
+        tmp_path,
+        method,
+        ["--decode-context-parallel-size", "2", *flags],
+        spec_options,
+        indexer_budget=budget,
+    )
+    config = args.create_engine_config(usage_context=context)
+    assert (
+        config.kernel_config.qsa_dcp_index_shard,
+        config.scheduler_config.async_scheduling,
+        config.speculative_config.gdn_spec_state_replay,
+    ) == expected
+    assert config.cache_config.mamba_cache_mode == "align"
+
+
+@pytest.mark.skip_global_cleanup
+def test_hybrid_serving_mtp_pp2_keeps_fixed_width(
+    profile, monkeypatch, tmp_path, sm70_serving_resolution
+):
+    from vllm.model_executor.models.registry import ModelRegistry
+
+    # The local metadata fixture stands in for a PP-capable target and draft.
+    monkeypatch.setattr(ModelRegistry, "is_pp_supported_model", lambda *_: True)
+    args, context = hybrid_serving_args(
+        profile, monkeypatch, tmp_path, "mtp", ["--pipeline-parallel-size", "2"], {}
+    )
+    spec = args.create_engine_config(usage_context=context).speculative_config
+    assert spec.num_speculative_tokens == 4
+    assert spec.num_speculative_tokens_per_batch_size is None
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize(
+    ("connector", "override", "expected"),
+    [
+        ("NixlConnector", None, (None, None)),
+        ("OffloadingConnector", None, ("expandable_segments:True",) * 2),
+        (None, "expandable_segments:False", (None, "expandable_segments:False")),
+    ],
+)
+def test_hybrid_serving_allocator_with_connector(
+    profile,
+    monkeypatch,
+    tmp_path,
+    sm70_serving_resolution,
+    connector,
+    override,
+    expected,
+):
+    flags: list[str] = []
+    if connector:
+        config = {"kv_connector": connector, "kv_role": "kv_both"}
+        flags.extend(("--kv-transfer-config", json.dumps(config)))
+    if override:
+        monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", override)
+    args, context = hybrid_serving_args(
+        profile, monkeypatch, tmp_path, "mtp", flags, {}
+    )
+    args.create_engine_config(usage_context=context)
+    assert (
+        os.environ.get("PYTORCH_ALLOC_CONF"),
+        os.environ.get("PYTORCH_CUDA_ALLOC_CONF"),
+    ) == expected
 
 
 @pytest.mark.parametrize(
@@ -702,7 +1092,7 @@ def test_frontend_interconnect_mode_and_audit(
     # policy must not read "pex_p2p" while the workers log nvlink.
     assert audit["interconnect_mode"] == logged
     assert audit["interconnect_policy"] == ("auto" if requested is None else requested)
-    assert len(audit["values"]) == 46
+    assert len(audit["values"]) == 49
 
 
 def _applied_profile(profile, monkeypatch, requested, disabled):

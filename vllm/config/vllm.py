@@ -2653,16 +2653,23 @@ class VllmConfig:
                     )
                 )
             )
-            if (
-                revolta_hybrid_serving
-                and self.speculative_config.use_dflash()
-                and policy.spec_state_replay is None
-                and not (
+            if revolta_hybrid_serving and self.speculative_config.use_dflash():
+                # Use the verifier settings from the Flash-Next serving recipe.
+                for name in (
+                    "context_kv_graph",
+                    "context_pipeline",
+                    "verify_fastpath",
+                    "fused_gdn_metadata",
+                    "fused_smallq_metadata",
+                    "grouped_smallq_metadata",
+                ):
+                    if name not in policy.explicit_fields:
+                        setattr(policy, name, True)
+                if policy.spec_state_replay is None and not (
                     policy.fused_gdn_verify
                     and "fused_gdn_verify" in policy.explicit_fields
-                )
-            ):
-                policy.spec_state_replay = True
+                ):
+                    policy.spec_state_replay = True
             if (
                 self.model_config is not None
                 and self.model_config.quantization == "fp8"

@@ -154,6 +154,37 @@ def test_yaml_false_uses_registered_negative_option(tmp_path, subcommand):
     assert parser.parse_args([*argv, "--enable-prefix-caching"]).enable_prefix_caching
 
 
+def test_yaml_null_uses_serve_option_semantics(tmp_path):
+    from vllm.entrypoints.cli.serve import ServeSubcommand
+
+    parser = FlexibleArgumentParser()
+    serve = ServeSubcommand().subparser_init(parser.add_subparsers())
+    serve.set_defaults(log_config_file="default-log-config.json")
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "model: target\n"
+        "enable-prefix-caching: null\n"
+        "async_scheduling: null\n"
+        "grpc: null\n"
+        "headless: null\n"
+        "tokenizer: null\n"
+        "prefix-cache-retention-interval: null\n"
+        "log-config-file: null\n"
+    )
+    args = parser.parse_args(
+        ["serve", "--config", str(config), "--no-async-scheduling"]
+    )
+    assert args.model == "target"
+    assert args.model_tag is None
+    assert args.enable_prefix_caching is None
+    assert args.async_scheduling is False
+    assert args.grpc is False
+    assert args.headless is False
+    assert args.tokenizer == "None"
+    assert args.prefix_cache_retention_interval is None
+    assert args.log_config_file is None
+
+
 def test_config_file(parser_with_config):
     with pytest.raises(FileNotFoundError):
         parser_with_config.parse_args(

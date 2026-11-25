@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Construction failures close descriptors and unlink locally owned mappings."""
 
+import errno
 from pathlib import Path
 from uuid import uuid4
 
@@ -38,3 +39,27 @@ def test_failed_mapping_constructor_rolls_back(monkeypatch, phase):
         assert not path.exists()
     finally:
         path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("error", [errno.ENOSPC, errno.EFAULT])
+def test_mapping_failure_reports_dev_shm_capacity(monkeypatch, error):
+    name = "capacity-" + uuid4().hex
+    path = Path(f"/dev/shm/vllm_offload_{name}.mmap")
+
+    def fail(*args):
+        raise OSError(error, "injected prefault failure")
+
+    class Mapping:
+        madvise = staticmethod(fail)
+        close = staticmethod(lambda: None)
+
+    monkeypatch.setattr(shared.mmap, "mmap", lambda *args, **kwargs: Mapping())
+    with pytest.raises(OSError) as exc_info:
+        shared.SharedOffloadRegion(name, 4096, 1, None, 1, 4096)
+    assert exc_info.value.errno == error
+    assert not path.exists()
+    message = str(exc_info.value)
+    assert "needs 4,096 bytes in /dev/shm" in message
+    assert "bytes free" in message
+    assert "vllm_offload_*.mmap" in message
+    assert "positive --shutdown-timeout" in message

@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import errno
 import mmap
 import os
+import shutil
 import time
 
 import torch
@@ -70,10 +72,21 @@ class SharedOffloadRegion:
         self.is_pinned = False
         try:
             self._open_mapping(rank, num_blocks, cpu_page_size)
-        except BaseException:
+        except BaseException as exc:
             # A parent HostRegionOwner tracks scheduler-only names even if
             # this constructor never returns to its caller.
             self.cleanup()
+            # A full tmpfs can surface as EFAULT while prefaulting pages.
+            if isinstance(exc, OSError) and exc.errno in (errno.ENOSPC, errno.EFAULT):
+                free = shutil.disk_usage("/dev/shm").free
+                raise OSError(
+                    exc.errno,
+                    f"CPU KV offload needs {total_size_bytes:,} bytes in "
+                    f"/dev/shm. {free:,} bytes free. "
+                    "Remove stale vllm_offload_*.mmap files that no process "
+                    "has open and set a positive --shutdown-timeout.",
+                    self.mmap_path,
+                ) from exc
             raise
 
     def _open_mapping(self, rank: int | None, num_blocks: int, cpu_page_size: int):

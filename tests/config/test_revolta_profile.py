@@ -552,6 +552,8 @@ def hybrid_serving_args(
     active=True,
     serving=True,
     indexer_budget=2048,
+    dflash_selector=True,
+    shorthand=False,
 ):
     from transformers import Qwen3Config
 
@@ -585,14 +587,31 @@ def hybrid_serving_args(
             **spec_options,
         }
         if method == "dflash":
+            dflash_config = {"block_size": 8}
+            draft_arch = "DFlashDraftModel"
+            if dflash_selector:
+                dflash_config["selector_top_k"] = 16
+                draft_arch = "DFlash2DraftModel"
             Qwen3Config(
-                architectures=["DFlash2DraftModel"],
+                architectures=[draft_arch],
                 num_attention_heads=4,
                 num_key_value_heads=2,
-                dflash_config={"selector_top_k": 16, "block_size": 8},
+                dflash_config=dflash_config,
             ).save_pretrained(tmp_path / "draft")
             raw["model"] = str(tmp_path / "draft")
-        argv.extend(("--speculative-config", json.dumps(raw)))
+        if shorthand:
+            argv.extend(
+                (
+                    "--spec-method",
+                    raw.pop("method"),
+                    "--spec-model",
+                    raw.pop("model"),
+                    "--spec-tokens",
+                    str(raw.pop("num_speculative_tokens")),
+                )
+            )
+        if raw:
+            argv.extend(("--speculative-config", json.dumps(raw)))
 
     monkeypatch.setattr(arg_utils, "current_platform", CpuPlatform())
     monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
@@ -799,6 +818,47 @@ def sm70_serving_resolution(monkeypatch):
 
 
 @pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("active", [True, False])
+def test_hybrid_serving_attention_backend(profile, monkeypatch, tmp_path, active):
+    from vllm.engine import arg_utils
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    args, context = hybrid_serving_args(
+        profile, monkeypatch, tmp_path, None, [], {}, active=active
+    )
+    monkeypatch.setattr(arg_utils, "VllmConfig", SimpleNamespace)
+    config = args.create_engine_config(usage_context=context)
+    expected = AttentionBackendEnum.FLASH_ATTN_V100 if active else None
+    assert config.attention_config.backend is expected
+
+
+@pytest.mark.skip_global_cleanup
+def test_dflash2_shorthand_matches_json(
+    profile, monkeypatch, tmp_path, sm70_serving_resolution
+):
+    from vllm.engine import arg_utils
+    from vllm.platforms.interface import DeviceCapability
+
+    resolved = []
+    for shorthand in (False, True):
+        args, context = hybrid_serving_args(
+            profile, monkeypatch, tmp_path, "dflash", [], {}, shorthand=shorthand
+        )
+        platform = arg_utils.current_platform
+        monkeypatch.setattr(platform, "is_cuda_alike", lambda: True)
+        monkeypatch.setattr(
+            platform,
+            "get_device_capability",
+            lambda device_id=0: DeviceCapability(7, 0),
+        )
+        spec = args.create_engine_config(usage_context=context).speculative_config
+        assert spec.draft_sample_method == "probabilistic"
+        assert spec.attention_backend.name == "FLASH_ATTN_V100"
+        resolved.append(spec.to_worker_payload())
+    assert resolved[0] == resolved[1]
+
+
+@pytest.mark.skip_global_cleanup
 @pytest.mark.parametrize(
     ("method", "flags", "spec_options", "budget", "expected"),
     [
@@ -882,10 +942,11 @@ I1_DFLASH2_POLICY = {
 
 @pytest.mark.skip_global_cleanup
 @pytest.mark.parametrize(
-    ("active", "serving", "overrides", "environment", "expected"),
+    ("active", "serving", "selector", "overrides", "environment", "expected"),
     [
-        (True, True, {}, {}, I1_DFLASH2_POLICY),
+        (True, True, True, {}, {}, I1_DFLASH2_POLICY),
         (
+            True,
             True,
             True,
             {"context_pipeline": False},
@@ -895,8 +956,33 @@ I1_DFLASH2_POLICY = {
             },
             I1_DFLASH2_POLICY | {"context_pipeline": False, "context_kv_graph": False},
         ),
-        (True, False, {}, {}, {}),
-        (False, True, {}, {}, {}),
+        (
+            True,
+            True,
+            True,
+            {"context_kv_graph": False},
+            {},
+            I1_DFLASH2_POLICY | {"context_kv_graph": False, "context_pipeline": False},
+        ),
+        (
+            True,
+            True,
+            True,
+            {},
+            {"VLLM_SM70_DFLASH2_CONTEXT_KV_GRAPH": "0"},
+            I1_DFLASH2_POLICY | {"context_kv_graph": False, "context_pipeline": False},
+        ),
+        (
+            True,
+            True,
+            True,
+            {"context_kv_graph": False, "context_pipeline": True},
+            {},
+            I1_DFLASH2_POLICY | {"context_kv_graph": False},
+        ),
+        (True, True, False, {}, {}, {"spec_state_replay": True}),
+        (True, False, True, {}, {}, {}),
+        (False, True, True, {}, {}, {}),
     ],
 )
 def test_dflash2_serving_verifier_defaults_match_i1(
@@ -906,6 +992,7 @@ def test_dflash2_serving_verifier_defaults_match_i1(
     sm70_serving_resolution,
     active,
     serving,
+    selector,
     overrides,
     environment,
     expected,
@@ -923,6 +1010,7 @@ def test_dflash2_serving_verifier_defaults_match_i1(
         {"sm70_dflash2": overrides} if overrides else {},
         active=active,
         serving=serving,
+        dflash_selector=selector,
     )
     spec = args.create_engine_config(usage_context=context).speculative_config
     policy = spec.sm70_dflash2

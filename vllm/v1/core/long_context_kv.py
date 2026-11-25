@@ -657,11 +657,6 @@ def union_gather_bytes(geometry: LongContextGeometry, max_num_seqs: int) -> int:
     )
 
 
-def token_host_pool_blocks(tokens: int, geometry: LongContextGeometry) -> int:
-    """Whole host frames requested by a legacy token-sized pool."""
-    return tokens // geometry.block_tokens
-
-
 def plan_long_context_capacity(
     settings: LongContextKVConfig,
     geometry: LongContextGeometry,
@@ -687,7 +682,7 @@ def plan_long_context_capacity(
         # allocates the host reader scratch.
         geometry = replace(geometry, hot_read_rows=None)
     if settings.host_pool_tokens is not None:
-        host_blocks = token_host_pool_blocks(settings.host_pool_tokens, geometry)
+        host_blocks = settings.host_pool_tokens // geometry.block_tokens
     else:
         host_gib = settings.host_store_gib or settings.host_pool_gib
         assert host_gib is not None

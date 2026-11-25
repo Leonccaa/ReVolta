@@ -30,7 +30,6 @@ from vllm.v1.core.long_context_kv import (
     LongContextCapacityPlan,
     LongContextGeometry,
     plan_long_context_capacity,
-    token_host_pool_blocks,
     validate_long_context_plan,
 )
 from vllm.v1.kv_cache_interface import (
@@ -3616,7 +3615,7 @@ def _plan_long_context_kv(
             legacy_host = (
                 int(settings.host_pool_gib * (1 << 30))
                 if settings.host_pool_gib is not None
-                else token_host_pool_blocks(settings.host_pool_tokens or 0, geometry)
+                else ((settings.host_pool_tokens or 0) // geometry.block_tokens)
                 * geometry.host_bytes_per_block
             )
             settings = replace(

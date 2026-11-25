@@ -28,8 +28,6 @@ def config(monkeypatch):
         monkeypatch.delenv(name, raising=False)
     envs.disable_envs_cache()
     cfg = VllmConfig()
-    cfg.kernel_config.ple_disk_cascade = True
-    cfg.kernel_config.ple_disk_cascade_source = "explicit"
     cfg.model_config = NS(
         dtype=torch.float16,
         hf_text_config=NS(
@@ -45,7 +43,7 @@ def config(monkeypatch):
     envs.disable_envs_cache()
 
 
-def test_explicit_admission_and_engine_local_activation(config):
+def test_default_admission_and_engine_local_activation(config):
     before = dict(os.environ)
     assert config_module._qwen4exp_ple_cascade_requested(config)
     config_module._apply_qwen4exp_ple_cascade_defaults(config.parallel_config)
@@ -55,11 +53,6 @@ def test_explicit_admission_and_engine_local_activation(config):
         assert ple_cascade_configured()
         assert ple_offload_enabled()
     assert not ple_offload_enabled()
-
-
-def test_implicit_cascade_does_not_take_over_automatic_placement(config):
-    config.kernel_config.ple_disk_cascade_source = "upstream_default"
-    assert not config_module._qwen4exp_ple_cascade_requested(config)
 
 
 @pytest.mark.parametrize(

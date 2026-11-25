@@ -45,6 +45,8 @@ from vllm.models.qwen4_exp.nvidia.ple_layer import (
     _get_ple_embedding_quant_method,
 )
 
+pytestmark = pytest.mark.usefixtures("default_vllm_config")
+
 
 def _patch_tp(monkeypatch: pytest.MonkeyPatch, rank: int, world_size: int) -> None:
     monkeypatch.setattr(ple_module, "is_pin_memory_available", lambda: True)

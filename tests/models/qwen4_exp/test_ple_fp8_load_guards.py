@@ -40,7 +40,6 @@ def module(request, monkeypatch):
         layer.ple_host_storage = torch.full((3, 2), -1.0).to(torch.float8_e4m3fn)
         layer._device_rows, layer._host_rows, layer._disk_rows = 1, 3, 0
         layer._checkpoint_shard_loaded = False
-        layer._deferred_shards = None
         layer._accelerator_weight_views = {}
         monkeypatch.setattr(layer, "materialize_tables", lambda: None)
         monkeypatch.setattr(layer, "get_accelerator_weight", lambda device: None)
@@ -115,63 +114,6 @@ def test_complete_checkpoint_split_across_calls_preserves_bytes(module):
     )
     assert torch.equal(actual, expected)
     assert torch.equal(layer.weight_scale, SCALE[1])
-
-
-@pytest.mark.parametrize("module", ["pinned"], indirect=True)
-def test_token_host_pool_is_charged_before_copying_ple(module, monkeypatch):
-    from tests.v1.core.long_context_kv_utils import (
-        SPAN,
-        production_config,
-        production_specs,
-    )
-    from vllm.config.kernel import LongContextKVConfig
-    from vllm.models.qwen4_exp.common.ple import finalize_ple_after_model_load
-    from vllm.platforms import current_platform
-    from vllm.v1.core.kv_cache_utils import (
-        get_kv_cache_groups,
-        get_long_context_geometry,
-    )
-    from vllm.v1.core.long_context_kv import GiB
-
-    layer = module.ngram_embedding
-    layer._deferred_shards = []
-    module.load_weights([shard(0), shard(1), SCALE])
-    finalize(module)
-    assert not layer._checkpoint_shard_loaded
-    assert len(layer._deferred_shards) == 2
-
-    config = production_config(
-        long_context=LongContextKVConfig(enabled=True, host_pool_tokens=21 * SPAN - 1)
-    )
-    config.kernel_config.ple_auto_host_budget_bytes = 10 * GiB
-    config.model_config.hf_text_config = SimpleNamespace(
-        indexer_budget=2048, ple_layer_ids=[1]
-    )
-    config.parallel_config.local_world_size = 4
-    config.parallel_config.data_parallel_size_local = 1
-    config.compilation_config = SimpleNamespace(static_forward_context={"ple": layer})
-    monkeypatch.setattr(
-        current_platform, "update_block_size_for_backend", lambda _: None
-    )
-    geometry = get_long_context_geometry(
-        config, get_kv_cache_groups(config, production_specs())
-    )
-    expected = 10 * GiB - 20 * geometry.host_bytes_per_block // 4
-
-    with set_current_vllm_config(config):
-        finalize_ple_after_model_load(config, production_specs)
-        finalize_ple_after_model_load(config, production_specs)
-    assert config.kernel_config.ple_auto_host_budget_bytes == expected
-    assert layer._deferred_shards is None
-    assert layer._checkpoint_shard_loaded
-    actual = torch.cat(
-        [
-            layer.ple_device_table.view(torch.uint8),
-            layer.ple_host_storage.view(torch.uint8),
-        ]
-    )
-    expected_rows = torch.arange(4, 12).reshape(4, 2).to(torch.float8_e4m3fn)
-    assert torch.equal(actual, expected_rows.view(torch.uint8))
 
 
 def test_padding_is_not_a_checkpoint_hole(module):

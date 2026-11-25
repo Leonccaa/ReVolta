@@ -730,7 +730,8 @@ class KernelConfig:
     ple_disk_cascade: bool | None = None
     """Allow resident FP8 PLE tiers to spill to mapped checkpoint storage.
 
-    Only an explicit True enables admission of the cascade.
+    Unset resolves to True upstream, or False in the ReVolta SM70 QSA TP4
+    profile. Explicit True/False always wins over the profile.
     """
     ple_disk_cascade_source: str = Field(default="explicit", init=False)
     """Diagnostic origin of the resolved cascade choice; excluded from hashes."""

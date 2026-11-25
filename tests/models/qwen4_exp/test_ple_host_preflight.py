@@ -12,28 +12,37 @@ from vllm.models.qwen4_exp.nvidia.ple_layer import Qwen4ExpPinnedHostEmbedding
 GIB = 1 << 30
 
 
-@pytest.mark.parametrize("controller", ["v2", "v1", "v1-private-mount"])
+@pytest.mark.parametrize("controller", ["v2", "v1", "v1-combined"])
 def test_cgroup_limit_and_current_include_tighter_parent(
     monkeypatch, tmp_path, controller
 ):
     root = tmp_path / "cgroup"
-    mount = root / "memory" if controller == "v1" else root
+    mount = tmp_path / "combined mount" if controller == "v1-combined" else root
     child = mount / "worker"
     child.mkdir(parents=True)
     membership = tmp_path / "membership"
+    mountinfo = tmp_path / "mountinfo"
+    mountinfo.write_text("")
     if controller == "v2":
         membership.write_text("0::/worker\n")
         limit_name, usage_name = "memory.max", "memory.current"
     else:
-        membership.write_text("5:memory:/worker\n")
+        controllers = "memory,blkio" if controller == "v1-combined" else "memory"
+        mount_root = "/containers/parent" if controller == "v1-combined" else "/"
+        membership.write_text(f"5:{controllers}:{mount_root.rstrip('/')}/worker\n")
+        escaped_mount = str(mount).replace(" ", "\\040")
+        mountinfo.write_text(
+            f"1 0 0:1 {mount_root} {escaped_mount} rw "
+            f"- cgroup cgroup rw,{controllers}\n"
+        )
         limit_name, usage_name = "memory.limit_in_bytes", "memory.usage_in_bytes"
     for directory, limit, current in [(mount, 128, 32), (child, 200, 10)]:
         (directory / limit_name).write_text(str(limit * GIB))
         (directory / usage_name).write_text(str(current * GIB))
-    assert ple.cgroup_host_memory(root, membership) == (128 * GIB, 96 * GIB)
+    assert ple.cgroup_host_memory(root, membership, mountinfo) == (128 * GIB, 96 * GIB)
     read_cgroup = ple.cgroup_host_memory
     monkeypatch.setattr(
-        ple, "cgroup_host_memory", lambda: read_cgroup(root, membership)
+        ple, "cgroup_host_memory", lambda: read_cgroup(root, membership, mountinfo)
     )
     monkeypatch.setattr(ple, "available_host_bytes", lambda: 64 * GIB)
     assert ple.preflight_host_memory()[:2] == (128 * GIB, 64 * GIB)
@@ -55,7 +64,9 @@ def test_unavailable_cgroup_limit_falls_back_to_meminfo(
         (tmp_path / limit_name).write_text(limit)
     membership = tmp_path / "membership"
     membership.write_text(membership_line)
-    assert ple.cgroup_host_memory(tmp_path, membership) == (None, None)
+    mountinfo = tmp_path / "mountinfo"
+    mountinfo.write_text(f"1 0 0:1 / {tmp_path} rw - cgroup cgroup rw,memory\n")
+    assert ple.cgroup_host_memory(tmp_path, membership, mountinfo) == (None, None)
     monkeypatch.setattr(ple, "cgroup_host_memory", lambda: (None, None))
     monkeypatch.setattr(ple, "total_host_bytes", lambda: 256 * GIB)
     monkeypatch.setattr(ple, "available_host_bytes", lambda: 200 * GIB)
@@ -123,10 +134,17 @@ def test_default_host_reserve_is_capped(monkeypatch, total, expected):
     assert ple.ple_host_reserve_bytes(total * GIB) == 49 * GIB
 
 
-@pytest.mark.parametrize("enabled,expected", [(True, 98), (False, 48)])
-def test_unified_host_store_replaces_legacy_pool_once(enabled, expected):
+@pytest.mark.parametrize(
+    "enabled,placement,expected",
+    [(True, "host", 98), (False, "host", 48), (True, "gpu", 48)],
+)
+def test_unified_host_store_replaces_legacy_pool_once(enabled, placement, expected):
     config = NS(
-        kernel_config=NS(long_context_kv=NS(enabled=enabled, host_store_gib=98)),
+        kernel_config=NS(
+            long_context_kv=NS(
+                enabled=enabled, host_store_gib=98, main_kv_placement=placement
+            )
+        ),
         kv_transfer_config=NS(
             kv_connector="OffloadingConnector",
             kv_connector_extra_config={"cpu_bytes_to_use": 48 * GIB},

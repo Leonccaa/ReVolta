@@ -3,12 +3,13 @@
 """Common Qwen4Exp PLE helpers."""
 
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from itertools import pairwise
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import regex as re
 import torch
 
 import vllm.envs as envs
@@ -18,7 +19,6 @@ from vllm.utils.mem_utils import format_gib
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-    from vllm.v1.kv_cache_interface import KVCacheSpec
 
 logger = init_logger(__name__)
 
@@ -504,16 +504,35 @@ def ple_cascade_configured() -> bool:
     return bool(getattr(kernel, "ple_disk_cascade_active", False))
 
 
+def _cgroup_v1_memory_mounts(mountinfo: Path) -> Iterator[tuple[Path, Path]]:
+    """Find the hierarchy root and mount point for the v1 memory controller."""
+    try:
+        lines = mountinfo.read_text().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        mount, _, filesystem = line.partition(" - ")
+        fields = filesystem.split()
+        if len(fields) < 3 or fields[0] != "cgroup":
+            continue
+        if "memory" in fields[2].split(","):
+            group_root, mountpoint = (
+                Path(re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), field))
+                for field in mount.split()[3:5]
+            )
+            yield group_root, mountpoint
+
+
 def cgroup_host_memory(
     root: Path = Path("/sys/fs/cgroup"),
     membership: Path = Path("/proc/self/cgroup"),
+    mountinfo: Path = Path("/proc/self/mountinfo"),
 ) -> tuple[int | None, int | None]:
     """Visible cgroup memory limit and headroom, including tighter parents.
 
     A container may mount only its own cgroup at root. Always inspect that
     root too; membership paths need not exist in the container's namespace.
     """
-    root = root.resolve()
     try:
         entries = [
             line.split(":", 2)
@@ -523,19 +542,31 @@ def cgroup_host_memory(
     except OSError:
         entries = []
 
-    memory_root = (root / "memory").resolve()
-    if not memory_root.is_dir():
-        memory_root = root
+    mounts = [(Path("/"), root, "", "memory.max", "memory.current")]
+    mounts.extend(
+        (
+            group_root,
+            mountpoint,
+            "memory",
+            "memory.limit_in_bytes",
+            "memory.usage_in_bytes",
+        )
+        for group_root, mountpoint in _cgroup_v1_memory_mounts(mountinfo)
+    )
     limits, remaining = [], []
-    for mount, controller, limit_file, usage_file in (
-        (root, "", "memory.max", "memory.current"),
-        (memory_root, "memory", "memory.limit_in_bytes", "memory.usage_in_bytes"),
-    ):
+    for group_root, mount, controller, limit_file, usage_file in mounts:
+        mount = mount.resolve()
         entry = next(
             (path for _, names, path in entries if controller in names.split(",")),
             "",
         )
-        candidate = (mount / entry.lstrip("/")).resolve()
+        path = Path(entry)
+        relative = (
+            path.relative_to(group_root)
+            if path.is_relative_to(group_root)
+            else Path(entry.lstrip("/"))
+        )
+        candidate = (mount / relative).resolve()
         node = candidate if candidate.is_relative_to(mount) else mount
         while True:
             try:
@@ -572,14 +603,17 @@ def cpu_kv_offload_bytes(config: Any) -> int:
         getattr(config, "kernel_config", None), "long_context_kv", None
     )
     legacy_host_bytes = 0
-    if long_context is not None and long_context.enabled:
+    if (
+        long_context is not None
+        and long_context.enabled
+        and long_context.main_kv_placement == "host"
+    ):
         # Unified MAIN/STATE/DRAFT storage replaces the connector pool and is
         # one shared allocation, not one allocation per rank or group.
         host_store_gib = getattr(long_context, "host_store_gib", None)
         if host_store_gib is not None:
             return max(0, int(host_store_gib * 2**30))
-        if long_context.main_kv_placement == "host":
-            legacy_host_bytes = int((long_context.host_pool_gib or 0) * 2**30)
+        legacy_host_bytes = int((long_context.host_pool_gib or 0) * 2**30)
     transfer = getattr(config, "kv_transfer_config", None)
     extra = getattr(transfer, "kv_connector_extra_config", {})
     if getattr(transfer, "kv_connector", None) in (
@@ -591,68 +625,13 @@ def cpu_kv_offload_bytes(config: Any) -> int:
     return legacy_host_bytes + max(0, int((size or 0) * 2**30))
 
 
-def defer_ple_for_token_host_pool(config: "VllmConfig") -> bool:
+def uses_token_host_pool(config: "VllmConfig") -> bool:
     settings = config.kernel_config.long_context_kv
     return (
-        config.kernel_config.ple_auto_host_budget_bytes is not None
-        and settings.enabled
+        settings.enabled
         and settings.main_kv_placement == "host"
         and settings.host_pool_tokens is not None
     )
-
-
-def finalize_ple_after_model_load(
-    config: "VllmConfig", get_specs: Callable[[], dict[str, "KVCacheSpec"]]
-) -> None:
-    """Charge the token-sized host pool using the final target and draft layout."""
-    if not defer_ple_for_token_host_pool(config):
-        return
-
-    from vllm.config import get_layers_from_vllm_config
-    from vllm.models.qwen4_exp.nvidia.ple_layer import Qwen4ExpPinnedHostEmbedding
-    from vllm.platforms import current_platform
-    from vllm.utils.math_utils import cdiv
-    from vllm.v1.core.kv_cache_utils import (
-        get_kv_cache_groups,
-        get_long_context_geometry,
-    )
-    from vllm.v1.core.long_context_kv import token_host_pool_blocks
-
-    layers = [
-        layer
-        for layer in get_layers_from_vllm_config(
-            config, Qwen4ExpPinnedHostEmbedding
-        ).values()
-        if layer._deferred_shards is not None
-    ]
-    if not layers:
-        return
-    current_platform.update_block_size_for_backend(config)
-    geometry = get_long_context_geometry(
-        config, get_kv_cache_groups(config, get_specs())
-    )
-    tokens = config.kernel_config.long_context_kv.host_pool_tokens
-    budget = config.kernel_config.ple_auto_host_budget_bytes
-    assert tokens is not None and budget is not None
-    host_bytes = (
-        token_host_pool_blocks(tokens, geometry) * geometry.host_bytes_per_block
-    )
-    parallel = config.parallel_config
-    shares = (
-        min(parallel.tensor_parallel_size, parallel.local_world_size)
-        * parallel.data_parallel_size_local
-        * len(config.model_config.hf_text_config.ple_layer_ids)
-    )
-    budget = max(0, budget - cdiv(host_bytes, shares))
-    config.kernel_config.ple_auto_host_budget_bytes = budget
-    logger.info(
-        "Qwen4Exp PLE auto: token-sized Host KV pool %s GiB total, "
-        "remaining PLE cap %s GiB per rank per table.",
-        format_gib(host_bytes),
-        format_gib(budget),
-    )
-    for layer in layers:
-        layer.finish_deferred_load()
 
 
 def check_ple_host_share(
@@ -660,6 +639,7 @@ def check_ple_host_share(
     ranks_sharing_host: int,
     *,
     cpu_kv_bytes: int = 0,
+    cpu_weight_bytes: int = 0,
     prefer_host: bool = False,
 ) -> int | None:
     """Resolve a host-first automatic budget or check the configured PLE caps.
@@ -684,35 +664,37 @@ def check_ple_host_share(
         auto_budget = cap_host_budget_bytes(
             budget_bytes=available,
             available_bytes=available,
-            reserve_bytes=reserve + cpu_kv_bytes,
+            reserve_bytes=reserve + cpu_kv_bytes + cpu_weight_bytes,
             ranks_sharing_host=ranks_sharing_host * len(text_config.ple_layer_ids),
         )
         logger.info(
             "Qwen4Exp PLE auto host preflight (%s): limit %s GiB, %s GiB available. "
             "Reserve %s GiB, CPU/Host KV pools %s GiB total, "
-            "PLE cap %s GiB per rank per table across %d ranks. "
-            "This snapshot reserves no memory for concurrent startups.",
+            "CPU weight offload %s GiB total, PLE cap %s GiB per rank per table "
+            "across %d ranks.",
             source,
             format_gib(total),
             format_gib(available),
             format_gib(reserve),
             format_gib(cpu_kv_bytes),
+            format_gib(cpu_weight_bytes),
             format_gib(auto_budget),
             ranks_sharing_host,
         )
         return auto_budget
-    if budget is None and not cpu_kv_bytes:
+    if budget is None and not cpu_kv_bytes and not cpu_weight_bytes:
         return None
     ple_bytes = (budget or 0) * ranks_sharing_host * len(text_config.ple_layer_ids)
     log = (
         logger.warning
-        if ple_bytes + cpu_kv_bytes + reserve > available
+        if ple_bytes + cpu_kv_bytes + cpu_weight_bytes + reserve > available
         else logger.info
     )
     log(
         "Qwen4Exp PLE host preflight (%s): limit %s GiB, %s GiB available; "
         "PLE configured upper bound %s GiB across %d ranks, CPU KV pool %s GiB "
-        "total, reserve %s GiB. HOST_GIB caps each table; a larger cap does "
+        "total, reserve %s GiB, CPU weight offload %s GiB total. "
+        "HOST_GIB caps each table; a larger cap does "
         "not allocate extra rows. Automatic PLE placement is not estimated. "
         "If these allocations exceed headroom, reduce the CPU KV pool or "
         "PLE host share to avoid host OOM; placement is unchanged.",
@@ -723,5 +705,6 @@ def check_ple_host_share(
         ranks_sharing_host,
         format_gib(cpu_kv_bytes),
         format_gib(reserve),
+        format_gib(cpu_weight_bytes),
     )
     return None

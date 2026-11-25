@@ -275,9 +275,12 @@ embedding table uses about 47.7 GiB of pinned host memory even with KV offload d
 
 With automatic PLE placement, the table fills pinned host memory first and
 keeps any remaining rows on the GPU. The budget accounts for the cgroup
-limit, host reserve and CPU or Host KV pools. This startup snapshot does not
-reserve memory across independent launches. Start servers sharing a memory
-limit one at a time or set their PLE and KV budgets explicitly.
+limit, host reserve, CPU or Host KV pools, and UVA weight offload.
+Independent launches can see the same available memory. Start servers
+sharing a memory limit one at a time or set their PLE and KV budgets explicitly.
+Legacy `host_pool_tokens` retains its original PLE placement. Use
+`host_pool_gib`, `host_store_gib`, or an explicit `VLLM_QWEN4EXP_PLE_HOST_GIB`
+when you need a fixed host budget.
 
 | Container memory limit | KV offload | Result |
 | --- | --- | --- |

@@ -834,13 +834,27 @@ def test_hybrid_serving_attention_backend(profile, monkeypatch, tmp_path, active
 
 @pytest.mark.skip_global_cleanup
 @pytest.mark.parametrize(
-    ("serving", "host_available", "explicit_host", "cascade", "rows"),
+    ("serving", "host_available", "explicit_host", "cascade", "extra", "rows"),
     [
-        (True, 64, None, False, (0, 10, 0)),
-        (False, 64, None, False, (0, 10, 0)),
-        (True, 34, None, False, (4, 6, 0)),
-        (True, 64, "3", False, (7, 3, 0)),
-        (True, 34, None, True, (6, 2, 2)),
+        (True, 64, None, False, [], (0, 10, 0)),
+        (False, 64, None, False, [], (0, 10, 0)),
+        (True, 34, None, False, [], (4, 6, 0)),
+        (False, 48, None, False, ["--cpu-offload-gb", "4"], (5, 5, 0)),
+        (True, 64, "3", False, [], (7, 3, 0)),
+        (True, 34, None, True, [], (6, 2, 2)),
+        (True, 34, "3", None, [], (6, 3, 1)),
+        (
+            True,
+            64,
+            None,
+            False,
+            [
+                "--kernel-config",
+                '{"ple_disk_cascade":false,"long_context_kv":'
+                '{"enabled":true,"host_pool_tokens":32768}}',
+            ],
+            (8, 2, 0),
+        ),
     ],
 )
 def test_ple_placement_defaults(
@@ -852,6 +866,7 @@ def test_ple_placement_defaults(
     host_available,
     explicit_host,
     cascade,
+    extra,
     rows,
 ):
     from vllm.config import set_current_vllm_config
@@ -873,9 +888,9 @@ def test_ple_placement_defaults(
         "kv_role": "kv_both",
         "kv_connector_extra_config": {"cpu_bytes_to_use": 2 * gib},
     }
-    flags = ["--kv-transfer-config", json.dumps(connector)]
-    if cascade:
-        flags.extend(("--kernel-config", '{"ple_disk_cascade":true}'))
+    flags = ["--kv-transfer-config", json.dumps(connector), *extra]
+    if cascade is not None and "--kernel-config" not in extra:
+        flags.extend(("--kernel-config", json.dumps({"ple_disk_cascade": cascade})))
     args, context = hybrid_serving_args(
         profile,
         monkeypatch,
@@ -890,7 +905,7 @@ def test_ple_placement_defaults(
     text.ple_layer_ids = [2]
     text.ple_embedding_dtype = "float8_e4m3fn"
     config = args.create_engine_config(usage_context=context)
-    assert config.kernel_config.ple_disk_cascade_active is cascade
+    assert config.kernel_config.ple_disk_cascade_active is (cascade is not False)
     spill = Mock(return_value=4 * gib)
     table = SimpleNamespace(
         embedding_dim=gib,
@@ -903,7 +918,7 @@ def test_ple_placement_defaults(
             table, torch.device("cuda")
         )
     assert placement == PLEPlacement(*rows)
-    assert spill.call_count == int(cascade)
+    assert spill.call_count == int(cascade is not False)
 
 
 @pytest.mark.skip_global_cleanup

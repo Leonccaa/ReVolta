@@ -244,6 +244,8 @@ class StructuredOutputManager:
         requests: dict[str, "Request"],
         structured_output_request_ids: list[str],
         scheduled_spec_decode_tokens: dict[str, list[int]],
+        *,
+        retain_invalid_draft: bool = False,
     ) -> "npt.NDArray[np.int32] | None":
         # Prepare the structured output bitmask for this batch.
         if not structured_output_request_ids:
@@ -360,21 +362,21 @@ class StructuredOutputManager:
                                 advance_grammar = False
                                 post_reasoning_end_in_window = True
                         if advance_grammar and not grammar.is_terminated():
-                            if post_reasoning_end_in_window:
-                                # These drafts were produced before their grammar
-                                # masks existed. Validate them without logging an
-                                # expected FSM error, then advance only valid rows.
-                                accepted = bool(grammar.validate_tokens([token]))
-                                if accepted:
-                                    accepted = grammar.accept_tokens(req_id, [token])
-                            else:
+                            validate_before_advance = post_reasoning_end_in_window or (
+                                retain_invalid_draft and i == len(req_tokens) - 1
+                            )
+                            # Leave the grammar at the valid prefix when this
+                            # row contains a draft the mask will reject.
+                            if not validate_before_advance or grammar.validate_tokens(
+                                [token]
+                            ):
                                 accepted = grammar.accept_tokens(req_id, [token])
-                            if accepted:
-                                state_advancements += 1
-                            elif not post_reasoning_end_in_window:
-                                raise AssertionError(
-                                    (token, req_id, scheduled_spec_decode_tokens)
-                                )
+                                if accepted:
+                                    state_advancements += 1
+                                elif not post_reasoning_end_in_window:
+                                    raise AssertionError(
+                                        (token, req_id, scheduled_spec_decode_tokens)
+                                    )
                         cumulative_index += 1
 
                     # Diffusion models do not sample a bonus position after their

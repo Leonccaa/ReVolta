@@ -259,6 +259,7 @@ if TYPE_CHECKING:
     VLLM_FORCE_AOT_LOAD: bool = False
     VLLM_USE_MEGA_AOT_ARTIFACT: bool = False
     VLLM_USE_TRITON_AWQ: bool = False
+    VLLM_1CAT_ADAPTIVE_MTP: str = "off"
     VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS: bool = False
     VLLM_1CAT_ENABLE_QWEN35_MTP_DEFAULTS: bool = False
     VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS: bool = False
@@ -386,7 +387,9 @@ if TYPE_CHECKING:
     VLLM_SM70_MTP_ROUTER_TOP16: bool = True
     VLLM_SM70_MTP_ROUTER_BATCH: bool = True
     VLLM_SM70_MTP_SHARED_BATCH: bool = True
+    VLLM_SM70_MTP_Q8_PREFILL_MMQ: bool = False
     VLLM_SM70_MTP_PLE_CONV: bool = True
+    VLLM_SM70_PLE_GATE_NORM: bool = False
     VLLM_SM70_QWEN38_FUSED_HC_FP16: bool = False
     VLLM_SM70_QWEN38_BATCH_FASTPATH: bool = True
     VLLM_SM70_QWEN38_DUAL_COMPILE: bool = False
@@ -419,6 +422,8 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W2: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE: bool = False
     VLLM_SM70_NVFP4_QWEN38_MOE_RAW_GROUPED_DECODE: bool = False
+    VLLM_SM70_NVFP4_RAW_GROUPED_M48_V154: bool = False
+    VLLM_SM70_NVFP4_RAW_GROUPED_NARROW_V154: bool = False
     VLLM_SM70_NVFP4_QWEN38_MOE_W2_DIRECT_REDUCE: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_INDEXED_PREFILL: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_FUSED_SWIGLU_PREFILL: bool = True
@@ -497,6 +502,7 @@ if TYPE_CHECKING:
     VLLM_SM70_CAR_VMM_SAFE: bool = False
     VLLM_SM70_CAR_VMM_SAFE_PREALLOC: bool = True
     VLLM_SM70_INTERCONNECT: str = "auto"
+    VLLM_SM70_NVLINK_HC: bool = False
     VLLM_SM70_PCIE_SWITCH_CUSTOM_AR: str = "auto"
     VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES: int = 204800
     VLLM_SM70_PCIE_SWITCH_CAR_GRAPH_ONLY: bool = True
@@ -834,6 +840,7 @@ if TYPE_CHECKING:
     VLLM_SM70_GDN_DECODE_FLASHQLA_ROUTE_DEBUG: bool = False
     VLLM_SM70_FLASHQLA_DECODE_WARMUP: bool = True
     VLLM_SM70_FUSED_SIGMOID_MIXED_QKV: bool = True
+    VLLM_SM70_MTP_GDN_NATIVE_VERIFY: bool = False
     VLLM_SM70_FUSED_SIGMOID_MIXED_QKV_COMPARE: bool = False
     VLLM_SM70_GDN_EMPTY_CORE_OUT: bool = False
     VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP: bool = False
@@ -1014,6 +1021,7 @@ if TYPE_CHECKING:
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
+    VLLM_QWEN_REASONING_EOS_MASK: bool = False
     VLLM_PLE_CPU_OFFLOAD: bool = False
     VLLM_PLE_DISK_OFFLOAD: bool = False
     VLLM_PLE_DISK_OFFLOAD_NUM_THREADS: int = 0
@@ -3356,6 +3364,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=(),
         user_visible=True,
     ),
+    "VLLM_1CAT_ADAPTIVE_MTP": env_var(
+        lambda: os.getenv("VLLM_1CAT_ADAPTIVE_MTP", "off").strip().lower(),
+        description="Adjust single-request Flash-Next MTP depth using acceptance.",
+        category="experimental",
+        declared_default="off",
+        effective_default="off",
+        automatic_conditions=("Explicit auto on SM70 with max K >= 5",),
+        acceleration_paths=("MTP proposal and verifier",),
+        user_visible=True,
+    ),
     # 1Cat SM70 public-profile MTP opt-ins/opt-outs. These are consumed while
     # building EngineArgs and must be registered so environment validation does
     # not warn users that our own documented knobs are unknown.
@@ -3989,7 +4007,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="experimental",
         declared_default="False",
         effective_default="False",
-        automatic_conditions=(),
+        automatic_conditions=(
+            "vllm/revolta_profile.py:apply_revolta_profile sets '1'. "
+            "Only AWQ checkpoints with the qualified shape and compact metadata "
+            "in hybrid serving.",
+        ),
         acceleration_paths=("MoE AWQ",),
         user_visible=False,
     ),
@@ -4663,10 +4685,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         lambda: bool(int(os.getenv("VLLM_QSA_INDEX_SHARD_DEBUG", "0"))),
         description=(
             "Debug check for kernel_config.qsa_dcp_index_shard: before each "
-            "QSA indexer candidate all-gather, all-gather a fixed-size row "
-            "descriptor (call index, rows, top-k, request/position checksums) "
-            "and fail if DCP ranks disagree. Synchronizes the host; skipped "
-            "during CUDA graph capture."
+            "QSA indexer candidate exchange, all-gather a fixed-size row "
+            "descriptor (call index, rows, top-k, request/position checksums, "
+            "and owner mode) and fail if TP ranks disagree. Synchronizes the "
+            "host; skipped during CUDA graph capture."
         ),
         category="experimental",
         declared_default="False",
@@ -4762,7 +4784,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default=(
             "False; REVOLTA_QSA_GROUPED_LPT=1 also enables it until 0.2.0rc6."
         ),
-        automatic_conditions=(),
+        automatic_conditions=(
+            "vllm/revolta_profile.py:apply_revolta_profile sets '1' for hybrid "
+            "serving if neither spelling is supplied.",
+        ),
         acceleration_paths=("SM70 QSA grouped page4 decode",),
         user_visible=True,
     ),
@@ -4814,7 +4839,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default=(
             "False; REVOLTA_SKINNY_MPLAN=1 also enables it until 0.2.0rc6."
         ),
-        automatic_conditions=(),
+        automatic_conditions=(
+            "vllm/revolta_profile.py:apply_revolta_profile sets '1' for hybrid "
+            "serving if neither spelling is supplied.",
+        ),
         acceleration_paths=("SM70 Qwen3.8 GDN input projection",),
         user_visible=True,
     ),
@@ -5150,14 +5178,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=("MTP verifier", "Flash-Next qualified batch"),
         user_visible=True,
     ),
-    # Fuse the MTP4 PLE rollback, depthwise convolution, SiLU and state commit.
+    "VLLM_SM70_MTP_Q8_PREFILL_MMQ": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_Q8_PREFILL_MMQ", "0"))),
+        description="Use grouped GGUF MMQ for Q8_0 MTP prefill above 64 rows.",
+        category="configuration",
+        declared_default="False",
+        effective_default=(
+            "False by default. The NVFP4 FP16 QSA SM70 TP4 profile enables it."
+        ),
+        automatic_conditions=(
+            "Only ModelOpt NVFP4 checkpoints (including mixed NVFP4 layers). "
+            "vllm/revolta_profile.py:apply_revolta_profile sets '1' for unset "
+            "values on FP16 QSA SM70 TP4. Only Q8_0 MTP experts use it.",
+        ),
+        acceleration_paths=("Flash-Next MTP draft",),
+        user_visible=True,
+    ),
+    # Fuse PLE rollback, depthwise convolution, SiLU and state commit.
     "VLLM_SM70_MTP_PLE_CONV": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_MTP_PLE_CONV", "1"))),
         description=(
-            "Fuses qualified MTP4 PLE rollback, ordered convolution taps, SiLU "
-            "and state commit. Default on after #703 exact state and model "
-            "qualification. Set 0 to diagnose PLE state updates with the "
-            "separate operations."
+            "Fuses eligible SM70 PLE speculative rollback, convolution, SiLU "
+            "and state commit for MTP and DFlash2. Set 0 to use the separate "
+            "operations."
         ),
         category="configuration",
         declared_default="True",
@@ -5166,7 +5209,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "availability checks still apply."
         ),
         automatic_conditions=(),
-        acceleration_paths=("MTP verifier", "Flash-Next qualified batch"),
+        acceleration_paths=("MTP verifier", "DFlash2 verifier"),
+        user_visible=True,
+    ),
+    "VLLM_SM70_PLE_GATE_NORM": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_PLE_GATE_NORM", "0"))),
+        description=(
+            "Opt in to SM70 Flash-Next FP16 PLE gate and norm fusion in full "
+            "decode graphs with dual compilation. The fused reduction can "
+            "change FP16 results."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("Flash-Next FULL decode graph",),
         user_visible=True,
     ),
     # Fuse the exact Qwen3.8 M=1 HyperConnection down/SiLU and up/gate-mix
@@ -5972,16 +6029,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=("TurboMind NVFP4",),
         user_visible=False,
     ),
-    # Experimental grouped native-NVFP4 W13/W2 decode. Local weight shapes and
-    # attention metadata gates preserve M1, prefill and multi-token verify.
-    # Default off pending endpoint and model-quality admission.
+    # Experimental grouped native-NVFP4 W13/W2 decode and verify.
     "VLLM_SM70_NVFP4_MOE_GROUPED_DECODE": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_MOE_GROUPED_DECODE", "0"))),
         description=(
-            "Experimental grouped native-NVFP4 W13/W2 decode. Local weight "
-            "shapes and attention metadata gates preserve M1, prefill and "
-            "multi-token verify. Default off pending endpoint and "
-            "model-quality admission."
+            "Experimental grouped native-NVFP4 W13/W2 decode and verify. "
+            "Extends prepared Flash-Next TP1/TP2/TP4 shards to M2-M40 in "
+            "Model Runner V2 decode-only forwards with matching kernels. "
+            "Default off pending model-quality admission."
         ),
         category="experimental",
         declared_default="False",
@@ -6116,6 +6171,34 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "for unset values on FP16 QSA SM70 TP4."
             ),
         ),
+        acceleration_paths=("TurboMind NVFP4",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_NVFP4_RAW_GROUPED_M48_V154": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_RAW_GROUPED_M48_V154", "0"))),
+        description=(
+            "Use native v154 raw grouped NVFP4 MoE for 48-row target decode "
+            "on SM70 TP4 Qwen3.8 with equal interleaved gate/up global scales. "
+            "Requires raw grouped decode and the V2 model runner."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind NVFP4",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_NVFP4_RAW_GROUPED_NARROW_V154": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_RAW_GROUPED_NARROW_V154", "0"))),
+        description=(
+            "Use native v154 raw grouped NVFP4 MoE for 3-5 row target decode "
+            "on SM70 TP4 Qwen3.8 with equal interleaved gate/up global scales. "
+            "Requires raw grouped decode and the V2 model runner."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
         acceleration_paths=("TurboMind NVFP4",),
         user_visible=False,
     ),
@@ -7084,7 +7167,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="configuration",
         declared_default="False",
         effective_default="False",
-        automatic_conditions=(),
+        automatic_conditions=(
+            "vllm/revolta_profile.py:apply_revolta_profile sets '1' for hybrid "
+            "DFlash2 serving.",
+        ),
         acceleration_paths=("DFlash2 verifier",),
         user_visible=False,
     ),
@@ -7733,6 +7819,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="experimental",
         declared_default="True",
         effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 collectives",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_NVLINK_HC": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_NVLINK_HC", "0"))),
+        description=(
+            "Opt in to Flash-Next HC LL and QSA DCP2 peer exchange on "
+            "physically fully connected NVLink SM70 TP4."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("SM70 collectives",),
         user_visible=False,
@@ -12985,6 +13084,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=("SM70 runtime/kernel policy", "Flash-Next qualified batch"),
         user_visible=True,
     ),
+    "VLLM_SM70_MTP_GDN_NATIVE_VERIFY": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_GDN_NATIVE_VERIFY", "0"))),
+        description="Opt in to SM70 MTP native GDN verify and accepted-state replay.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("MTP verifier",),
+        user_visible=True,
+    ),
     "VLLM_SM70_FUSED_SIGMOID_MIXED_QKV_COMPARE": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_FUSED_SIGMOID_MIXED_QKV_COMPARE", "0"))),
         description=(
@@ -13020,30 +13129,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP": env_var(
         lambda: bool(int(os.getenv("VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP", "0"))),
         description=(
-            "Allows shared-expert stream overlap on eligible "
-            "Qwen3Next/Qwen4Exp layers. Default enabled by the Qwen4Exp "
-            "policy, otherwise the standalone getter is off. Set 0 to diagnose "
-            "stream ordering; placement and DBO guards still decide "
-            "eligibility."
+            "Allows eligible Qwen3Next/Qwen4Exp layers to run shared experts "
+            "on a separate CUDA stream."
         ),
         category="configuration",
         declared_default="False",
         effective_default=(
-            "False; configuration may replace the unset default under the "
-            "automatic conditions below.; ReVolta FP16 QSA SM70 TP4 profile sets "
-            "'0' under automatic_conditions."
+            "False. The FP16 QSA SM70 TP4 profile enables overlap for native g32 AWQ "
+            "with DFlash2, expert parallelism off, and dual batch overlap off. "
+            "An explicit environment value takes precedence."
         ),
         automatic_conditions=(
-            (
-                "vllm/config/vllm.py:_apply_sm70_qwen38_decode_defaults sets '1' when "
-                "name not in os.environ; automatic defaults apply only when the "
-                "environment override is absent."
-            ),
-            (
-                "vllm/revolta_profile.py:apply_revolta_profile sets '0' when all "
-                "visible CUDA devices are SM70, selector metadata describes QSA, "
-                "activation dtype is FP16 and TP=4; explicit environment values win."
-            ),
+            "vllm/revolta_profile.py:apply_revolta_profile enables the AWQ+DFlash2 "
+            "profile setting under the conditions above. Other TP4 profile "
+            "configurations receive '0'.",
+            "vllm/config/vllm.py:_apply_sm70_qwen38_decode_defaults can enable "
+            "overlap for eligible decode with expert parallelism and DBO disabled "
+            "when the environment value is still unset.",
         ),
         acceleration_paths=("SM70 runtime/kernel policy",),
         user_visible=True,
@@ -13093,7 +13195,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=("MTP verifier",),
         user_visible=False,
     ),
-    # Opt-in exact FP16 Flash-Next TP4 draft projections; retains the tuned
+    # Default-on exact FP16 Flash-Next TP4 draft projections retain the tuned
     # BM2 Triton accumulation order, original weights, and FP16 boundaries.
     "VLLM_SM70_MTP_MOE_FP16_EXACT": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_MTP_MOE_FP16_EXACT", "1"))),
@@ -15981,6 +16083,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=(),
         user_visible=True,
     ),
+    "VLLM_QWEN_REASONING_EOS_MASK": env_var(
+        lambda: os.getenv("VLLM_QWEN_REASONING_EOS_MASK", "0") == "1",
+        description="Mask model EOS during visible Qwen chat reasoning in MRv2.",
+        category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
     # Flag to control the v2 model runner. If unset, use config defaults.
     "VLLM_USE_V2_MODEL_RUNNER": env_var(
         lambda: maybe_convert_bool(os.getenv("VLLM_USE_V2_MODEL_RUNNER", None)),
@@ -18624,17 +18736,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_FLASHQLA_ORIGINAL_PREFILL": env_var(
         lambda: os.getenv("VLLM_SM70_FLASHQLA_ORIGINAL_PREFILL"),
         description=(
-            "SM70: flashqla original prefill. The consumer locations and unset"
-            " defaults are listed below."
+            "Select original SM70 FlashQLA prefill. If unset, use the legacy"
+            " FLASH_QLA_SM70_USE_ORIGINAL_TILELANG value, then detect nvcc."
         ),
         category="configuration",
         declared_default="None",
-        effective_default=("None"),
+        effective_default="None",
         automatic_conditions=(
-            (
-                "None at vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn"
-                ".py:_sm70_flashqla_original_prefill_enabled"
-            ),
             (
                 "None at vllm/v1/attention/backends/gdn_attn.py:_sm70_flashqla_ori"
                 "ginal_prefill_enabled"
@@ -20313,6 +20421,8 @@ def compile_factors(speculative_config: Any = None) -> dict[str, object]:
         "MAX_JOBS",
         # Engine idle policy does not change compiled code.
         "VLLM_SM70_IDLE_CLOCK_SECONDS",
+        # Only the resolved physical mesh changes the traced HC graph.
+        "VLLM_SM70_NVLINK_HC",
         # Scheduler/KV planning only; never changes compiled code.
         "VLLM_SM70_HOST_KV_STATIC_HOT_POOL",
         # Runtime branches inside opaque QSA ops; no traced graph change.
@@ -20371,6 +20481,8 @@ def compile_factors(speculative_config: Any = None) -> dict[str, object]:
         # moe_forward_shared custom op at run time, so the traced graph does not
         # depend on it, and registering it must not recompile any deployment.
         "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_DFLASH_MAX_TOKENS",
+        # The Q8 MTP expert route is selected inside the opaque MoE op.
+        "VLLM_SM70_MTP_Q8_PREFILL_MMQ",
         # QSA scorer route for multi-request batches. It is chosen inside the
         # qwen4_exp_qsa_with_output custom op at run time, so the traced graph
         # does not depend on it, and registering it must not recompile any

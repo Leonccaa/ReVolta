@@ -135,6 +135,7 @@ class QSAIndexer(nn.Module):
             vllm_config.kernel_config.sm70_qsa_shared_key
             or envs.VLLM_SM70_QSA_SHARED_KEY
         )
+        self.fused_topk = vllm_config.kernel_config.sm70_qsa_fused_topk
 
         self.index_qk_proj = ReplicatedLinear(
             int(config.hidden_size),
@@ -237,8 +238,13 @@ class QSAIndexer(nn.Module):
         hidden_states = hidden_states[:num_tokens]
         positions = positions[..., :num_tokens]
 
-        # Q/K projection
-        projected_qk, _ = self.index_qk_proj(hidden_states)
+        if (
+            hasattr(self.index_qk_proj, "_sm70_qsa_input_packed")
+            and hidden_states.shape[-1] == self.index_qk_proj.output_size
+        ):
+            projected_qk = hidden_states
+        else:
+            projected_qk, _ = self.index_qk_proj(hidden_states)
         projected_q, raw_keys = projected_qk.split(
             (
                 self.index_n_heads * self.index_head_dim,
@@ -351,6 +357,7 @@ class QSAIndexer(nn.Module):
             return out
 
         # Score compressed keys, select blocks, then expand them to token indices.
+        uniform_decode = get_forward_context().is_uniform_decode
         return qsa_select_paged_tokens(
             q,
             compressed_key_cache,
@@ -367,6 +374,11 @@ class QSAIndexer(nn.Module):
             seq_lens_cpu_upper_bound=compressed_metadata.seq_lens_cpu_upper_bound,
             index_dcp_world_size=compressed_metadata.index_dcp_world_size,
             index_dcp_rank=compressed_metadata.index_dcp_rank,
+            prefill_ranges=compressed_metadata.prefill_ranges,
+            batch_query_starts=(
+                compressed_metadata.query_start_loc if uniform_decode else None
+            ),
+            fused_topk=self.fused_topk and uniform_decode,
         )
 
 

@@ -52,7 +52,16 @@ from vllm.v1.worker.gpu.spec_decode import uses_dflash_selector_engine
 logger = init_logger(__name__)
 
 
-@triton.jit
+# The counts change every step. Do not specialize on them, or a new count class
+# compiles a new variant during serving.
+@triton.jit(
+    do_not_specialize=[
+        "num_reqs",
+        "num_query_tokens",
+        "real_num_query_tokens",
+        "block_cols",
+    ]
+)
 def _sm70_prepare_smallq_decode_metadata_kernel(
     out_block_table_ptr,
     out_seq_lens_ptr,
@@ -165,7 +174,9 @@ def _sm70_prepare_smallq_decode_metadata(
         num_query_tokens,
         real_num_query_tokens,
         block_cols,
-        REQ_BLOCK=triton.next_power_of_2(num_reqs + 1),
+        # Size the request tile from the persistent buffer, not this step's
+        # count, so a new request count does not compile a new variant.
+        REQ_BLOCK=triton.next_power_of_2(out_query_start_loc.numel()),
         BLOCK_COLS=triton.next_power_of_2(block_cols),
         num_warps=1,
     )
@@ -429,7 +440,9 @@ def _sm70_prepare_grouped_smallq_decode_metadata(
         query_start_loc,
         num_reqs,
         real_num_query_tokens,
-        REQ_BLOCK=triton.next_power_of_2(num_reqs + 1),
+        # Size the request tile from the persistent buffers, not this step's
+        # count, so a new request count does not compile a new variant.
+        REQ_BLOCK=triton.next_power_of_2(max(t.numel() for t in out_query_start_locs)),
         BLOCK_COLS=triton.next_power_of_2(max_block_cols),
         num_warps=1,
     )
@@ -5008,10 +5021,6 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         )
         super().__init__(*args, **kwargs)
         self.kv_cache_dtype = _normalize_flash_v100_kv_cache_dtype(self.kv_cache_dtype)
-        if self.kv_cache_dtype == "int8":
-            from vllm.models.qwen4_exp.nvidia.ops.qsa_int8 import require_int8_abi
-
-            require_int8_abi()
         _log_kv_dtype_contract(self.kv_cache_dtype)
         (
             self.flash_attn_func,

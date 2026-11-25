@@ -186,6 +186,28 @@ def test_dynamic_mtp_explicit_empty_schedule_is_invalid(engine_config):
         engine_config(2560, method="mtp", dynamic_schedule=[])
 
 
+def test_r1_threshold_worker_transport(engine_config):
+    from pydantic import TypeAdapter
+
+    from vllm.config import replace
+
+    default = engine_config(
+        2560, method="mtp", dynamic_schedule=[[1, 8, 4]]
+    ).speculative_config
+    assert default.exact_end_draft_threshold is None
+    assert "exact_end_draft_threshold" not in TypeAdapter(
+        SpeculativeConfig
+    ).dump_python(default)
+    spec = replace(default, exact_end_draft_threshold=2)
+    rebuilt = SpeculativeConfig.from_worker_payload(
+        json.loads(json.dumps(spec.to_worker_payload())),
+        target_model_config=spec.target_model_config,
+        target_parallel_config=spec.target_parallel_config,
+    )
+    assert rebuilt.exact_end_draft_threshold == 2
+    assert rebuilt.compute_hash() == default.compute_hash()
+
+
 def test_explicit_replay_overrides_qualified_packed_default(engine_config):
     config = engine_config(replay=True)
     spec = config.speculative_config
@@ -358,8 +380,10 @@ def test_mtp_replay_worker_transport_and_graph_policy(engine_config, graph):
     ).speculative_config
     assert spec.gdn_spec_state_replay
     assert spec.gdn_replay_graph_enabled() is (graph is not False)
+    payload = spec.to_worker_payload()
+    assert "mtp_expert_quantization" not in payload["input"]
     rebuilt = SpeculativeConfig.from_worker_payload(
-        json.loads(json.dumps(spec.to_worker_payload())),
+        json.loads(json.dumps(payload)),
         target_model_config=spec.target_model_config,
         target_parallel_config=spec.target_parallel_config,
     )
@@ -367,6 +391,7 @@ def test_mtp_replay_worker_transport_and_graph_policy(engine_config, graph):
     assert rebuilt.gdn_spec_state_replay
     assert rebuilt.gdn_replay_graph_enabled() is (graph is not False)
     assert rebuilt.compute_hash() == spec.compute_hash()
+    assert rebuilt.to_worker_payload() == payload
     from vllm.config import replace
 
     copied = replace(spec, gdn_state_replay_graph=graph)

@@ -12,6 +12,7 @@ from tests.v1.core.test_long_context_host_main_kv import host_settings
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingWorkerMetadata,
 )
+from vllm.v1.core.long_context_kv import HOST
 from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 
 pytestmark = pytest.mark.cpu_test
@@ -27,7 +28,7 @@ def scheduler_with_connector():
     return scheduler
 
 
-def advance(scheduler, *, complete_stores=True, complete_main=True):
+def advance(scheduler, *, complete_stores=True, complete_main=True, sample=False):
     out = scheduler.schedule()
     ids = list(out.num_scheduled_tokens)
     meta = host_step_receipts(scheduler, out) or OffloadingWorkerMetadata()
@@ -46,7 +47,14 @@ def advance(scheduler, *, complete_stores=True, complete_main=True):
         ModelRunnerOutput(
             req_ids=ids,
             req_id_to_index={rid: i for i, rid in enumerate(ids)},
-            sampled_token_ids=[[] for _ in ids],
+            sampled_token_ids=[
+                [1]
+                if sample
+                and scheduler.requests[rid].num_computed_tokens
+                >= scheduler.requests[rid].num_prompt_tokens
+                else []
+                for rid in ids
+            ],
             logprobs=None,
             prompt_logprobs_dict={},
             pooler_output=[],
@@ -54,6 +62,83 @@ def advance(scheduler, *, complete_stores=True, complete_main=True):
         ),
     )
     return out
+
+
+@pytest.mark.parametrize("available_main_frames", [193, 0])
+def test_short_host_requests_only_need_main_frames(available_main_frames):
+    scheduler = build(
+        host_settings(host_pool_tokens=194 * SPAN),
+        speculative_tokens=7,
+        with_connector=True,
+    )
+    pool = scheduler.host_history_pool
+    table = pool.host_pages
+    assert table.available() == 193
+    manager = scheduler.connector.connector_scheduler.unified
+    held = manager.ledger.reserve_frames(193 - available_main_frames, "unit_prefetch")
+    assert held is not None
+    requests = make_requests(8, 1024, 256)
+    for request in requests:
+        scheduler.add_request(request)
+    out = scheduler.schedule()
+    if available_main_frames:
+        assert set(out.num_scheduled_tokens) == {r.request_id for r in requests}
+        assert len(scheduler.running) == 8
+        assert len(pool.bindings) == 8
+    else:
+        assert not out.num_scheduled_tokens and not scheduler.running
+        assert scheduler.kv_cache_manager.admission_ledger.blocked[HOST] > 0
+    assert not manager.builds
+    manager.ledger.release_temporary(held)
+
+
+def test_decode_crosses_host_page_after_boundary_dma_retires():
+    scheduler = build(
+        host_settings(host_pool_tokens=24 * SPAN),
+        max_num_seqs=1,
+        speculative_tokens=1,
+        with_connector=True,
+    )
+    [request] = make_requests(1, 3 * SPAN - 2, 9)
+    scheduler.add_request(request)
+    pool = scheduler.host_history_pool
+    connector = scheduler.connector.connector_scheduler
+    manager = connector.unified
+    for _ in range(3):
+        advance(scheduler, complete_stores=False, sample=True)
+    assert len(request.output_token_ids) == 1
+    assert manager.builds and connector._jobs
+    assert pool.host_reclaimable_after() == 1
+    held = manager.ledger.reserve_frames(1, "unit_prefetch")
+    assert held is not None and len(held) == 1
+    assert pool.host_reclaimable_after() == 0
+
+    mask = pool.host_pages.all_ranks
+    connector.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                job_results={
+                    (job_id, job.generation): (mask & ~1, 0)
+                    for job_id, job in connector._jobs.items()
+                }
+            )
+        )
+    )
+    blocked = advance(scheduler, complete_stores=False, sample=True)
+    assert not blocked.num_scheduled_tokens
+    assert request.num_preemptions == 1 and connector._jobs
+    # An empty scheduler step can still receive the final rank's completions.
+    advance(scheduler, sample=True)
+    assert not connector._jobs
+
+    for _ in range(12):
+        advance(scheduler, sample=True)
+        if request.is_finished():
+            break
+    assert request.is_finished() and len(request.output_token_ids) == 9
+    assert request.num_computed_tokens > 3 * SPAN
+    assert request.num_preemptions == 1
+    manager.ledger.release_temporary(held)
 
 
 def start_with_inflight_boundary():
@@ -69,21 +154,15 @@ def start_with_inflight_boundary():
     return scheduler, connector, req
 
 
-def test_preemption_without_resume_releases_unused_and_drains_dma():
+def test_preemption_without_resume_drains_accepted_dma():
     scheduler, connector, req = start_with_inflight_boundary()
     m = connector.unified
-    credit = m.ledger.requests[req.request_id]
-    assert credit.unused > 0 and credit.owned > 0
+    handles = [h for _, _, _, hs, _ in m.jobs.values() for h in hs]
+    assert handles
     scheduler.running.remove(req)
     scheduler._preempt_request(req, time.monotonic())
-    assert credit.draining and credit.unused == 0
-    assert m.ledger.snapshot()["build_reserved"] == 0
     assert all(b.failed for b in m.builds.values())
-    # No resumption, no scheduler step and no worker receipt for a long wait.
-    for _ in range(100):
-        assert m.ledger.snapshot()["build_reserved"] == 0
-        assert m.ledger.snapshot()["build_draining"] == credit.owned > 0
-        assert all(m.table.get(h).io for _, _, _, hs, _ in m.jobs.values() for h in hs)
+    assert all(m.table.get(h).io for h in handles)
     mask = m.table.all_ranks
     connector.update_connector_output(
         KVConnectorOutput(
@@ -95,8 +174,7 @@ def test_preemption_without_resume_releases_unused_and_drains_dma():
             ),
         )
     )
-    assert not m.jobs and not m.builds and not m.ledger.charges
-    assert req.request_id not in m.ledger.requests
+    assert not m.jobs and not m.builds
     assert not m.units.units
 
 
@@ -109,7 +187,6 @@ def test_resume_first_step_boundary_survives_delayed_preemption(monkeypatch):
     advance(scheduler)
     connector = scheduler.connector.connector_scheduler
     m = connector.unified
-    old_generation = m.ledger.requests[req.request_id].generation
     scheduler.running.remove(req)
     scheduler._preempt_request(req, time.monotonic())
     handoffs = Mock(wraps=connector._queue_boundary_state_offloads)
@@ -121,8 +198,6 @@ def test_resume_first_step_boundary_survives_delayed_preemption(monkeypatch):
     assert req.request_id in out.num_scheduled_tokens
     assert req.request_id in out.preempted_req_ids
     assert handoffs.called
-    assert m.ledger.requests[req.request_id].generation > old_generation
-    assert not m.ledger.requests[req.request_id].draining
     assert m.builds and all(not b.failed for b in m.builds.values())
     assert m.jobs
 
@@ -204,7 +279,6 @@ def test_another_request_registers_distinct_eagle_ahead_branch():
         end = boundary // group.offloaded_block_size
         low = end - (group.sliding_window_size_in_blocks or end)
         components.extend(state.group_states[group.group_idx].offload_keys[low:end])
-    assert m.admit_build(original.request_id, len(components))
     b = m.begin_boundary(original.request_id, h_b, components)
     assert b is not None
     store(m, components, req=original.request_id)
@@ -262,7 +336,6 @@ def test_delayed_preemption_keeps_fresh_resumed_load():
     m = connector.unified
     for _ in range(4):
         advance(scheduler)
-    old_generation = m.ledger.requests[req.request_id].generation
     assert m.units.units and not m.jobs
     scheduler.running.remove(req)
     scheduler._preempt_request(req, time.monotonic())
@@ -280,8 +353,6 @@ def test_delayed_preemption_keeps_fresh_resumed_load():
     out = scheduler.schedule()
     assert req.request_id in out.preempted_req_ids
     assert out.kv_connector_metadata.load_jobs
-    assert m.ledger.requests[req.request_id].generation > old_generation
-    assert not m.ledger.requests[req.request_id].draining
     assert m._loads[req.request_id]
     assert all(not b.failed for b in m.builds.values())
 

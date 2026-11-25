@@ -421,6 +421,17 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
             prepare_sm70_dsv4_fp13_gemv(layer)
 
+        self._prepare_sm70_dense(layer)
+        if getattr(layer, "_sm70_dflash2_fp16_m8", False) and not getattr(
+            layer, "_sm70_f16_prepared", False
+        ):
+            from vllm.model_executor.layers.quantization.sm70_dflash2_fp16 import (
+                prepare_dflash2_fp16_m8,
+            )
+
+            prepare_dflash2_fp16_m8(layer)
+
+    def _prepare_sm70_dense(self, layer: torch.nn.Module) -> None:
         force_enable = getattr(layer, "_sm70_f16_force_enable", False)
         if not envs.VLLM_SM70_ENABLE_DENSE_F16_FASTPATH and not force_enable:
             return
@@ -489,6 +500,14 @@ class UnquantizedLinearMethod(LinearMethodBase):
             return sm70_out
         if envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda_alike():
             return linear_batch_invariant(x, layer.weight, bias)
+        if hasattr(layer, "_sm70_dflash2_fp16_packed"):
+            from vllm.model_executor.layers.quantization.sm70_dflash2_fp16 import (
+                apply_dflash2_fp16_m8,
+            )
+
+            packed_out = apply_dflash2_fp16_m8(layer, x, bias)
+            if packed_out is not None:
+                return packed_out
         if envs.VLLM_SM70_UNQUANT_DEBUG and x.dim() >= 2:
             x_2d = x.reshape(-1, x.shape[-1])
             log_fn = (
@@ -506,6 +525,16 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 envs.VLLM_BATCH_INVARIANT,
             )
         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
+
+    def apply_fused_silu_and_mul(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+    ) -> torch.Tensor | None:
+        hook = getattr(layer, "_unquantized_fused_silu_and_mul", None)
+        if hook is None:
+            return None
+        return hook(layer, x)
 
 
 class LinearBase(PluggableLayer):
@@ -1928,7 +1957,11 @@ class RowParallelLinear(LinearBase):
     def forward(
         self,
         input_,
+        *,
+        reduce_results: bool | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        if reduce_results is None:
+            reduce_results = self.reduce_results
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1942,7 +1975,7 @@ class RowParallelLinear(LinearBase):
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
         output = None
-        if self.reduce_results and self.tp_size > 1:
+        if reduce_results and self.tp_size > 1:
             output = _maybe_sm70_awq_mlp_down_tile_gemm_reduce(
                 self, input_parallel, bias_
             )
@@ -1951,7 +1984,7 @@ class RowParallelLinear(LinearBase):
             if output_parallel is None:
                 output_parallel = self.quant_method.apply(self, input_parallel, bias_)
 
-            if self.reduce_results and self.tp_size > 1:
+            if reduce_results and self.tp_size > 1:
                 output = _maybe_sm70_awq_mlp_down_tile_all_reduce(self, output_parallel)
                 if output is None:
                     output = tensor_model_parallel_all_reduce(output_parallel)

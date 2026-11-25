@@ -969,7 +969,7 @@ class precompiled_wheel_utils:
                 )
                 sm70_ext_regex = re.compile(
                     r"vllm/_sm70_(?:sampler|exact_reduce|sparse_attention|router"
-                    r"|qsa_indexer)_C"
+                    r"|qsa_indexer|qsa_device)_C"
                     r"(?:\.[^/]+)?\.so$"
                 )
                 h3_ext_regex = re.compile(
@@ -1395,6 +1395,9 @@ if _is_cuda():
             CMakeExtension(name="vllm._sm70_qsa_indexer_C", py_limited_api=False)
         )
         ext_modules.append(
+            CMakeExtension(name="vllm._sm70_qsa_device_C", py_limited_api=False)
+        )
+        ext_modules.append(
             CMakeExtension(name="vllm._sm70_exact_reduce_C", py_limited_api=False)
         )
         ext_modules.append(
@@ -1499,6 +1502,7 @@ package_data = {
         "entrypoints/serve/dashboard/static/*.css",
         "entrypoints/serve/dashboard/static/*.mjs",
         "distributed/kv_transfer/kv_connector/v1/hf3fs/utils/*.cpp",
+        "distributed/device_communicators/topology_all_reduce/*.cpp",
         # DeepGEMM JIT include headers (vendored via cmake)
         "third_party/deep_gemm/include/**/*.cuh",
         "third_party/deep_gemm/include/**/*.h",

@@ -24,7 +24,18 @@ def _config(target_dtype="int8", draft_dtype=None, method="dflash"):
         dflash_config={"selector_top_k": 16, "use_swa": True, "swa_window_size": 256},
         layer_types=None,
     )
-    model = SimpleNamespace(dtype=torch.float16, hf_config=hf_config)
+    model = SimpleNamespace(
+        dtype=torch.float16,
+        hf_config=hf_config,
+        hf_text_config=SimpleNamespace(
+            indexer_n_heads=3,
+            indexer_kv_heads=1,
+            indexer_head_dim=128,
+            indexer_budget=512,
+            indexer_compress_ratio=4,
+            layer_types=["full_attention"],
+        ),
+    )
     return SimpleNamespace(
         is_speculative_draft=False,
         cache_config=CacheConfig(cache_dtype=target_dtype),
@@ -163,12 +174,27 @@ def test_explicit_sink_setting_overrides_top_level_default():
     validate_speculative_kv_cache_dtype(config)
 
 
+def test_sm70_qsa_dflash_defaults_to_model_precision(sm70):
+    assert dflash_draft_cache_dtype(_config("int8")) == "auto"
+
+
 @pytest.mark.parametrize(
-    "target_dtype,expected",
-    [("int8", "auto"), ("fp8_e4m3", "auto"), (FP8_E4M3_PER_TOKEN_HEAD.name, "auto")],
+    "target_dtype,activation_dtype,expected",
+    [
+        ("int8_per_token_head", torch.float16, "int8_per_token_head"),
+        ("float16", torch.float32, "float16"),
+        ("fp8_e4m3", torch.float16, "auto"),
+        ("int8", torch.float16, "auto"),
+    ],
 )
-def test_dflash_resolves_the_same_dtype_as_its_loader(sm70, target_dtype, expected):
-    assert dflash_draft_cache_dtype(_config(target_dtype)) == expected
+def test_sm70_non_qsa_dflash_keeps_legacy_dtype_policy(
+    sm70, target_dtype, activation_dtype, expected
+):
+    config = _config(target_dtype)
+    config.model_config.hf_text_config = SimpleNamespace()
+    config.model_config.dtype = activation_dtype
+    config.speculative_config.attention_backend = AttentionBackendEnum.TRITON_ATTN
+    assert dflash_draft_cache_dtype(config) == expected
 
 
 @pytest.mark.parametrize(
@@ -244,11 +270,10 @@ def test_engine_args_validates_kv_before_model_loading(
 
 
 @pytest.mark.parametrize("feature", [None, "sliding_window", "sinks"])
-def test_dense_int8_reader_boundary_without_gpu(monkeypatch, feature):
+def test_dense_int8_reader_boundary_without_gpu(feature):
     from vllm.v1.attention.backend import AttentionType
     from vllm.v1.attention.ops import int8_dense
 
-    monkeypatch.setattr(int8_dense, "require_int8_abi", lambda: None)
     impl = SimpleNamespace(
         attn_type=AttentionType.DECODER,
         alibi_slopes=None,

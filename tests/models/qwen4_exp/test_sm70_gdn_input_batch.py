@@ -72,6 +72,22 @@ def test_fake_shapes(m):
     assert [tuple(o.shape) for o in outputs] == [(m, n) for n in (2560, 1536, 12, 12)]
 
 
+@pytest.mark.parametrize("enabled", (False, True))
+def test_skinny_k4_reaches_row_major(monkeypatch, enabled):
+    from vllm.models.qwen4_exp.nvidia import sm70_fp16_gemv as gemv
+
+    x = torch.empty(4, 2560)
+    outputs = tuple(x.new_empty((4, n)) for n in (2560, 1536, 12, 12))
+
+    def rowmajor(_, _qkvz, _ba, *, use_k4):
+        assert use_k4 is enabled
+        return outputs
+
+    monkeypatch.setenv("VLLM_SM70_QWEN38_GDN_NO_PACK", "1")
+    monkeypatch.setattr(gemv, "gdn_input_rowmajor", rowmajor)
+    assert gemv._qwen38_sm70_fp16_gdn_input(x, x, x, use_skinny_k4=enabled) is outputs
+
+
 @pytest.fixture(scope="module")
 def cuda_weights():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
@@ -220,3 +236,32 @@ def test_disabled_and_batch_invariant_fall_back(cuda_weights, monkeypatch):
             _qwen38_sm70_fp16_gdn_input(x, q, b),
         ):
             assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
+
+@pytest.mark.parametrize(
+    ("m", "compiling", "expected"),
+    [(3, True, "mtp"), (4, True, "mtp"), (4, False, "batch"), (5, True, "batch")],
+)
+def test_v154_packed_input_only_for_full_m3_m4(monkeypatch, m, compiling, expected):
+    from vllm.models.qwen4_exp.nvidia import sm70_fp16_gemv as gemv
+
+    calls = []
+
+    def op(name):
+        return lambda *args: calls.append(name)
+
+    monkeypatch.setattr(gemv, "_can_use_packed_gdn_input", lambda *a: True)
+    monkeypatch.setattr(gemv, "is_sm70_decode_graph_compiling", lambda: compiling)
+    monkeypatch.setenv("VLLM_SM70_QWEN38_GDN_NO_PACK", "0")
+    envs.disable_envs_cache()
+    for name in ("mtp", "batch"):
+        monkeypatch.setattr(
+            torch.ops._C,
+            f"qwen38_gdn_input_{'mtp_' if name == 'mtp' else ''}batch_sm70_out",
+            op(name),
+            raising=False,
+        )
+    x = torch.zeros(m, 2560, dtype=torch.float16)
+    w = torch.zeros(1)
+    _qwen38_sm70_fp16_gdn_input(x, w, w, w, w, True, use_skinny_k4=True)
+    assert calls == [expected]

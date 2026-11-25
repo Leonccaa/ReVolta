@@ -3,6 +3,8 @@
 import contextlib
 import copy
 import queue
+from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 from typing import TypeAlias, TypeVar
 
@@ -22,7 +24,12 @@ class ThreadSafeHFTokenizerMixin:
     pass
 
 
-def maybe_make_thread_pool(tokenizer: _T, copies: int = 1):
+def maybe_make_thread_pool(
+    tokenizer: _T,
+    copies: int = 1,
+    *,
+    encode_chat_fragment: Callable[..., list[int]] | None = None,
+):
     """
     If `tokenizer` is a `PreTrainedTokenizerFast`, modify the tokenizer
     in-place to make the public interface thread-safe by routing calls
@@ -59,7 +66,23 @@ def maybe_make_thread_pool(tokenizer: _T, copies: int = 1):
     class TokenizerPool(tokenizer.__class__, ThreadSafeHFTokenizerMixin):  # type: ignore
         def apply_chat_template(self, *args, **kwargs):
             with _borrow_from_pool() as tok:
-                return tok.apply_chat_template(*args, **kwargs)
+                if (
+                    encode_chat_fragment is None
+                    or kwargs.get("sanitize_control_tokens") is not True
+                ):
+                    return tok.apply_chat_template(*args, **kwargs)
+                # Only a borrowed instance sees this adapter, and only while
+                # the original Transformers sanitizer runs on that instance.
+                attributes = vars(tok)
+                previous = attributes.get("encode")
+                attributes["encode"] = partial(encode_chat_fragment, tok.encode)
+                try:
+                    return tok.apply_chat_template(*args, **kwargs)
+                finally:
+                    if previous is None:
+                        del attributes["encode"]
+                    else:
+                        attributes["encode"] = previous
 
         def batch_decode(self, *args, **kwargs):
             with _borrow_from_pool() as tok:

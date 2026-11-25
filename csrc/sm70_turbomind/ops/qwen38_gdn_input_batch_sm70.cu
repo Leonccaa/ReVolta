@@ -150,6 +150,61 @@ __global__ __launch_bounds__(32, 8) void dense_batch_kernel(const half* x,
     }
   }
 }
+// Output projection from 1Cat-vLLM 1fa9c438bc. Four warps cover 32 output
+// columns while preserving the ordered four-partition FP32 reduction.
+template <int Groups>
+__global__ __launch_bounds__(128, 4) void dense_batch_out_kernel(
+    const half* __restrict__ x, const half* __restrict__ weight,
+    half* __restrict__ output, int m) {
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int split = (lane >> 2) & 3;
+  const int col_tile = blockIdx.x * 4 + warp;
+  const int col = col_tile * 8 + r;
+  const int row_offset = blockIdx.y * 32;
+  float acc[Groups][8] = {};
+#pragma unroll 6
+  for (int g = split * 24; g < (split + 1) * 24; ++g) {
+    const half* w = weight + static_cast<size_t>(col) * 1536 + g * 16;
+    const uint4 lo = __ldcs(reinterpret_cast<const uint4*>(w));
+    const uint4 hi = __ldcs(reinterpret_cast<const uint4*>(w + 8));
+#pragma unroll
+    for (int p = 0; p < Groups; ++p) {
+      const int row = row_offset + p * 8 + r;
+      uint4 a = make_uint4(0, 0, 0, 0), b = a;
+      if (row < m) {
+        const half* input = x + static_cast<size_t>(row) * 1536 + g * 16;
+        a = __ldg(reinterpret_cast<const uint4*>(input));
+        b = __ldg(reinterpret_cast<const uint4*>(input + 8));
+      }
+      GDN_MMA(acc[p], a.x, a.y, lo.x, lo.y);
+      GDN_MMA(acc[p], a.z, a.w, lo.z, lo.w);
+      GDN_MMA(acc[p], b.x, b.y, hi.x, hi.y);
+      GDN_MMA(acc[p], b.z, b.w, hi.z, hi.w);
+    }
+  }
+  const int base = lane & ~12;
+#pragma unroll
+  for (int p = 0; p < Groups; ++p) {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int rr =
+          row_offset + p * 8 + ((i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1));
+      const int cc =
+          col_tile * 8 + ((i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2));
+      float value = __shfl_sync(0xffffffff, acc[p][i], base);
+#pragma unroll
+      for (int s = 1; s < 4; ++s) {
+        value = __fadd_rn(value,
+                          __shfl_sync(0xffffffff, acc[p][i], base | (s << 2)));
+      }
+      if (split == 0 && rr < m) {
+        output[static_cast<size_t>(rr) * 2560 + cc] = __float2half_rn(value);
+      }
+    }
+  }
+}
+
 template <int Unroll>
 __global__ __launch_bounds__(32, 8) void router_split_quad_kernel(const half* x,
                                                                   const half* w,
@@ -284,6 +339,12 @@ void dense_batch(torch::Tensor output, torch::Tensor x, torch::Tensor weight) {
   if (router)
     dense_batch_kernel<2560><<<grid, 32, 0, at::cuda::getCurrentCUDAStream()>>>(
         input, w, out, m, n);
+  else if (m >= 3 && m <= 8)
+    dense_batch_out_kernel<1>
+        <<<80, 128, 0, at::cuda::getCurrentCUDAStream()>>>(input, w, out, m);
+  else if (m == 12)
+    dense_batch_out_kernel<2>
+        <<<80, 128, 0, at::cuda::getCurrentCUDAStream()>>>(input, w, out, m);
   else
     dense_batch_kernel<1536><<<grid, 32, 0, at::cuda::getCurrentCUDAStream()>>>(
         input, w, out, m, n);

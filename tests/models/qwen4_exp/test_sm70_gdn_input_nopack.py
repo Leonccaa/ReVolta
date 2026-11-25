@@ -184,9 +184,10 @@ def test_route_serves_2_to_48_rows_when_set(fake_native, weights, monkeypatch):
 
 
 def test_packed_route_keeps_priority(fake_native, weights, monkeypatch):
-    """A layer that still holds packs keeps the packed 2..16-row kernel."""
+    """A layer holding packs keeps the packed 2..16-row kernel unless
+    NO_PACK reserves them for the v154 FULL M3/M4 path."""
     wq, wb = weights
-    monkeypatch.setenv(ENV, "1")
+    monkeypatch.setenv(ENV, "0")
     packed_calls = []
 
     def packed_op(qkv, z, b, a, x, pq, pb):

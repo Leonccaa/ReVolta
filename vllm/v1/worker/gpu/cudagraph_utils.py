@@ -23,15 +23,21 @@ from vllm.config.speculative import (
 from vllm.distributed.parallel_state import (
     GraphCaptureContext,
     get_pp_group,
+    get_tp_group,
     graph_capture,
     is_global_first_rank,
 )
-from vllm.forward_context import BatchDescriptor, set_forward_context
+from vllm.forward_context import (
+    BatchDescriptor,
+    get_forward_context,
+    set_forward_context,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.spec_decode.dynamic.adaptive_mtp import MIN_ADAPTIVE_MTP_DEPTH
 from vllm.v1.spec_decode.dynamic.utils import (
     DynamicSDSchedule,
     build_dynamic_sd_schedule_lookup,
@@ -377,7 +383,9 @@ class CudaGraphManager:
             and decode_query_len > 1
             and cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
         ):
-            self._add_dynamic_sd_candidates(schedule)
+            self._add_dynamic_sd_candidates(
+                schedule, adaptive_mtp=vllm_config.adaptive_mtp_enabled
+            )
 
     @property
     def max_captured_tokens(self) -> int:
@@ -465,7 +473,9 @@ class CudaGraphManager:
             descs.sort(key=lambda d: d.num_tokens, reverse=True)
             self._capture_descs[mode] = descs
 
-    def _add_dynamic_sd_candidates(self, schedule: DynamicSDSchedule) -> None:
+    def _add_dynamic_sd_candidates(
+        self, schedule: DynamicSDSchedule, *, adaptive_mtp: bool
+    ) -> None:
         lookup = build_dynamic_sd_schedule_lookup(
             schedule, self.max_num_reqs, self.decode_query_len - 1
         )
@@ -493,6 +503,22 @@ class CudaGraphManager:
                 for size in range(range_starts[query_len], num_tokens + 1):
                     self._candidates[size] = [desc, *self._candidates[size]]
                 range_starts[query_len] = num_tokens + 1
+
+        if adaptive_mtp:
+            # Both the target and draft position 0 capture these descriptors.
+            # Later draft positions already use one query token per request.
+            for query_len in range(MIN_ADAPTIVE_MTP_DEPTH + 1, lookup[1] + 1):
+                if query_len >= len(self._candidates):
+                    break
+                desc = BatchExecutionDescriptor(
+                    cg_mode=CUDAGraphMode.FULL,
+                    num_tokens=query_len,
+                    num_reqs=1,
+                    uniform_token_count=query_len,
+                )
+                if desc not in self._candidates[query_len]:
+                    narrow_descs.append(desc)
+                    self._candidates[query_len] = [desc, *self._candidates[query_len]]
 
         if narrow_descs:
             self._capture_descs[CUDAGraphMode.FULL] = sorted(
@@ -527,6 +553,9 @@ class CudaGraphManager:
         captured_attn_states: dict[
             BatchExecutionDescriptor, CapturedAttentionState
         ] = {}
+        from vllm.distributed.device_communicators.sm70_hc_ll import get_tp_hc_ll
+
+        hc_ll_active = get_tp_hc_ll() is not None
         with graph_capture(device=self.device, context=self.get_capture_context()):
             # Capture in order: PIECEWISE first, then FULL. PIECEWISE has larger
             # activations so FULL activations should fit in already allocated
@@ -542,6 +571,13 @@ class CudaGraphManager:
                     for desc in descs:
                         # Prepare inputs and get forward function
                         forward_fn, attn_state = create_forward_fn(desc)
+
+                        # The NVLink HC LL kernels spin on peer data with a
+                        # device watchdog. Ranks finish per-rank compilation at
+                        # different times, so align them before each eager run.
+                        if hc_ll_active:
+                            torch.accelerator.synchronize()
+                            get_tp_group().barrier()
 
                         # Warmup
                         forward_fn(CUDAGraphMode.NONE)
@@ -574,6 +610,9 @@ class CudaGraphManager:
                                     "pre-capture warmup for stable replay."
                                 )
                                 get_offloader().sync_prev_onload()
+                                if hc_ll_active:
+                                    torch.accelerator.synchronize()
+                                    get_tp_group().barrier()
                                 forward_fn(CUDAGraphMode.NONE)
                                 get_offloader().join_after_forward()
                                 torch.accelerator.synchronize()
@@ -821,8 +860,26 @@ class ModelCudaGraphManager(CudaGraphManager):
                         num_tokens_across_dp=num_tokens_across_dp,
                         slot_mapping=slot_mappings,
                         batch_descriptor=batch_descriptor,
+                        is_uniform_decode=(
+                            desc.cg_mode == CUDAGraphMode.FULL
+                            and desc.uniform_token_count is not None
+                        ),
                     ),
                 ):
+                    # Only uniform decode graphs are phase-specialized. The
+                    # same decision applies to their warmup and capture.
+                    if (
+                        (
+                            envs.VLLM_SM70_NVFP4_MOE_GROUPED_DECODE
+                            or envs.VLLM_SM70_NVFP4_RAW_GROUPED_M48_V154
+                            or envs.VLLM_SM70_NVFP4_RAW_GROUPED_NARROW_V154
+                        )
+                        and desc.cg_mode == CUDAGraphMode.FULL
+                        and desc.uniform_token_count is not None
+                    ):
+                        get_forward_context().additional_kwargs[
+                            "sm70_nvfp4_decode_only"
+                        ] = True
                     model_output = model(**model_inputs)
 
                 if cg_mode == CUDAGraphMode.PIECEWISE:

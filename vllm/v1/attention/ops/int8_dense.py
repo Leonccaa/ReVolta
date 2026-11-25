@@ -4,10 +4,7 @@
 
 import torch
 
-from vllm.models.qwen4_exp.nvidia.ops.qsa_int8 import (
-    require_int8_abi,
-    triton_attention,
-)
+from vllm.models.qwen4_exp.nvidia.ops.qsa_int8 import triton_attention
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.kv_cache_view import KVCacheView
 from vllm.v1.attention.kv_codecs import INT8
@@ -31,7 +28,6 @@ def forward_int8_dense(
     from vllm.logger import init_logger
     from vllm.v1.attention.backend import AttentionType
 
-    require_int8_abi()
     if (
         impl.attn_type != AttentionType.DECODER
         or impl.alibi_slopes is not None
@@ -98,7 +94,6 @@ def forward_int8_dense(
 def write_int8_dense(impl, layer, key, value, kv_cache, slots):
     from vllm import _custom_ops as ops
 
-    require_int8_abi()
     view = KVCacheView.bind(kv_cache, INT8, impl.head_size)
     ops.reshape_and_cache_flash(
         key,

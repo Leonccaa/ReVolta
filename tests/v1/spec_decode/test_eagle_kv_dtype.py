@@ -5,7 +5,7 @@
 import json
 import os
 from contextlib import nullcontext
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -19,7 +19,7 @@ from vllm.models.qwen4_exp.common.qsa_cache import QSAStateBackend
 from vllm.models.qwen4_exp.nvidia.model import _finalize_qsa_e4m3_scale_load
 from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAAttention
 from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
-from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD
+from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD, INT8
 from vllm.v1.core.kv_cache_utils import (
     _get_csa_linear_tensor_layout,
     generate_scheduler_kv_cache_config,
@@ -257,6 +257,46 @@ def test_mixed_dtype_admission(connector, method):
     validate(config)
 
 
+@pytest.mark.parametrize("target_dtype", ["int8", FP8_E4M3_PER_TOKEN_HEAD.name])
+@pytest.mark.parametrize("dcp", [1, 2])
+def test_planar_target_allows_explicit_fp16_mtp_draft(target_dtype, dcp):
+    from vllm.config.speculative_kv import validate_speculative_kv_cache_dtype
+
+    config = _config("float16")
+    config.cache_config.cache_dtype = target_dtype
+    config.parallel_config.decode_context_parallel_size = dcp
+    validate_speculative_kv_cache_dtype(config)
+
+
+@pytest.mark.parametrize(
+    "method,draft_dtype", [("mtp", "auto"), ("mtp", "int8"), ("eagle", "float16")]
+)
+def test_planar_target_retains_other_mixed_dtype_rejections(method, draft_dtype):
+    from vllm.config.speculative_kv import validate_speculative_kv_cache_dtype
+
+    config = _config(draft_dtype)
+    config.cache_config.cache_dtype = FP8_E4M3_PER_TOKEN_HEAD.name
+    config.speculative_config.method = method
+    config.parallel_config.decode_context_parallel_size = 1
+    with pytest.raises(ValueError, match="target KV layout"):
+        validate_speculative_kv_cache_dtype(config)
+
+
+def test_int8_target_with_planar_fp8_draft_explains_override():
+    from vllm.config.speculative_kv import validate_speculative_kv_cache_dtype
+
+    config = _config(FP8_E4M3_PER_TOKEN_HEAD.name)
+    config.cache_config.cache_dtype = "int8"
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"--kv-cache-dtype fp8_per_token_head.*"
+            r"remove speculative_config\.kv_cache_dtype"
+        ),
+    ):
+        validate_speculative_kv_cache_dtype(config)
+
+
 @pytest.mark.parametrize(
     "owner,field,value,reason",
     [
@@ -270,7 +310,6 @@ def test_mixed_dtype_admission(connector, method):
         ("speculative_config", "kv_cache_dtype", "bfloat16", "activation dtype"),
         ("cache_config", "cache_dtype", "nvfp4", "target KV layout"),
         ("cache_config", "cache_dtype", "fp8_e5m2", "target KV layout"),
-        ("cache_config", "cache_dtype", "int8", "target KV layout"),
         ("speculative_config", "method", "eagle", "native QSA MTP"),
         ("speculative_config", "method", "eagle3", "native QSA MTP"),
     ],
@@ -390,6 +429,38 @@ def _mixed_specs(dtype):
             dcp_sharded=False,
         )
     return specs
+
+
+def test_planar_target_fp16_draft_uses_existing_offload_layout():
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
+        OffloadingConnector,
+    )
+    from vllm.v1.attention.kv_cache_view import has_planar_kv_cache
+
+    config = _config("float16")
+    config.cache_config.cache_dtype = INT8.name
+    config.parallel_config.decode_context_parallel_size = 2
+    specs = _mixed_specs(torch.float16)
+    for index in (3, 7):
+        name = f"model.layers.{index}.self_attn"
+        specs[name] = replace(
+            specs[name],
+            dtype=INT8.storage_dtype,
+            kv_quant_mode=get_kv_quant_mode(INT8.name),
+            block_size=32,
+            dcp_sharded=True,
+        )
+    groups = get_kv_cache_groups(config, specs)
+    cache = get_kv_cache_config_from_groups(config, groups, available_memory=1 << 28)
+    draft = next(
+        tensor
+        for tensor in cache.kv_cache_tensors
+        if "model.layers.48.self_attn" in tensor.shared_by
+    )
+    assert draft.packed_members is None
+    assert draft.size == cache.num_blocks * 64 * 1024
+    assert OffloadingConnector.get_required_kvcache_layout(config) is None
+    assert has_planar_kv_cache(generate_scheduler_kv_cache_config([cache]))
 
 
 @pytest.mark.parametrize("draft_dtype", [torch.uint8, torch.float16])

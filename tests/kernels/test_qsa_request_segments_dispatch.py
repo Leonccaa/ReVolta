@@ -2,11 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU checks of when the multi-request QSA scorer is used (no GPU, no launch)."""
 
+from types import SimpleNamespace as NS
+
 import pytest
 import torch
 
 import vllm.envs as envs
-from vllm.models.qwen4_exp.nvidia.ops import qsa
+from vllm.forward_context import set_forward_context
+from vllm.models.qwen4_exp.nvidia import indexer_qsa
+from vllm.models.qwen4_exp.nvidia.ops import qsa, qsa_shared_key
 from vllm.models.qwen4_exp.nvidia.ops.qsa_request_segments import (
     request_segments_unsupported,
 )
@@ -99,6 +103,99 @@ def test_flag_and_device_gate(monkeypatch):
     assert qsa._use_sm70_qsa_request_segments(*single) is False
     monkeypatch.setattr(qsa, "_on_sm70_cuda", lambda q: False)
     assert qsa._use_sm70_qsa_request_segments(*x) is False
+
+
+@pytest.mark.parametrize(
+    "uniform,world,expected",
+    [(True, 1, "batched"), (False, 1, "segment"), (True, 2, "segment")],
+)
+def test_indexer_decode_score_routing(monkeypatch, uniform, world, expected):
+    # Exercise the actual indexer -> selection -> batched admission path. Only
+    # projection, cache update, CUDA launches, and the DCP merge are substitutes.
+    rows, requests = 48, 8
+    starts = torch.tensor(
+        list(range(0, 49, 6)) if uniform else [0, 4, 12, 18, 24, 30, 36, 42, 48],
+        dtype=torch.int32,
+    )
+    counts = starts[1:] - starts[:-1]
+    token_to_req = torch.arange(requests, dtype=torch.int32).repeat_interleave(counts)
+    positions = torch.cat([torch.arange(n, dtype=torch.int64) + 1000 for n in counts])
+    table = torch.arange(requests * 2, dtype=torch.int32).reshape(requests, 2)
+    metadata = NS(
+        num_actual_tokens=rows,
+        slot_mapping=torch.arange(rows),
+        block_table=table,
+        query_start_loc=starts,
+        query_start_loc_cpu=None,
+        logical_positions=positions,
+        token_to_req=token_to_req,
+        seq_lens=torch.full((requests,), 2000, dtype=torch.int32),
+        k_work_metadata=None,
+        max_seq_len=None,
+        seq_lens_cpu_upper_bound=None,
+        index_dcp_world_size=world,
+        index_dcp_rank=0,
+    )
+    indexer = NS(
+        _metadata=lambda: (metadata, metadata),
+        index_qk_proj=lambda hidden: (
+            torch.zeros(rows, 5 * 128, dtype=torch.float16),
+            None,
+        ),
+        index_n_heads=4,
+        index_kv_heads=1,
+        index_head_dim=128,
+        raw_key_cache=NS(kv_cache=torch.empty(0), rope_position_cache=None),
+        compressed_key_cache=NS(
+            kv_cache=torch.empty(requests * 2, 208, 1, 128, dtype=torch.float16)
+        ),
+        use_fused_pre_indexer=True,
+        rotary_emb=NS(cos_sin_cache=torch.empty(0)),
+        q_layernorm=NS(weight=torch.ones(128), variance_epsilon=1e-6),
+        k_layernorm=NS(weight=torch.ones(128)),
+        compress_ratio=4,
+        token_topk=2048,
+        skip_topk=False,
+        shared_key_scoring=True,
+    )
+    calls = []
+
+    def batched(scores, visible, q, cache, page_table, offsets, pos, lengths, *args):
+        calls.append("batched")
+        assert offsets is starts and page_table is table and pos is positions
+        assert lengths is metadata.seq_lens
+        visible.zero_()
+
+    def segment(q, cache, page_table, req, pos, lengths, compress, **kwargs):
+        calls.append("segment")
+        assert torch.equal(req, token_to_req) and torch.equal(pos, positions)
+        assert kwargs.get("index_dcp_world_size", 1) == world
+        return torch.empty(rows, 416), torch.zeros(rows, dtype=torch.int32)
+
+    monkeypatch.setattr(indexer_qsa, "qsa_pre_indexer", lambda *a, **kw: None)
+    monkeypatch.setattr(qsa, "_on_sm70_cuda", lambda q: True)
+    monkeypatch.setattr(envs, "VLLM_SM70_QSA_REQUEST_SEGMENTS", True, raising=False)
+    monkeypatch.setattr(qsa, "_use_sm70_qsa_indexer_cublas", lambda *a: False)
+    monkeypatch.setattr(
+        qsa_shared_key, "_load_operators", lambda: (True, batched), raising=False
+    )
+    monkeypatch.setattr(qsa, "qsa_mqa_request_segments_paged", segment)
+    monkeypatch.setattr(qsa, "_use_sm70_qsa_lexicographic_topk", lambda k: True)
+    monkeypatch.setattr(qsa, "_sm70_qsa_lexicographic_topk_op", lambda: lambda *a: None)
+    monkeypatch.setattr(
+        qsa, "_merge_sharded_index_blocks", lambda blocks, *a, **kw: blocks
+    )
+    monkeypatch.setattr(qsa, "expand_qsa_block_indices_cuda", lambda *a: a[-1])
+    config = NS(
+        parallel_config=NS(data_parallel_size=1),
+        compilation_config=NS(fast_moe_cold_start=False, static_forward_context={}),
+    )
+    with set_forward_context(None, config, is_uniform_decode=uniform):
+        result = indexer_qsa.QSAIndexer.forward(
+            indexer, torch.empty(rows, 1), positions
+        )
+    assert result.shape == (rows, 2051)
+    assert calls == [expected]
 
 
 def test_flag_default_off(monkeypatch):

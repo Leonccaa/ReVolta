@@ -8,6 +8,8 @@ import inspect
 import os
 import pickle
 from collections.abc import Callable, Iterator, Sequence
+from functools import cache
+from pathlib import Path
 from typing import Any, Literal
 from unittest.mock import patch
 
@@ -664,6 +666,23 @@ def reconstruct_serializable_fn_from_mega_artifact(
         vllm_backend=None,
     )
     return fn
+
+
+@cache
+def _compute_package_source_hash(package_root: Path) -> str:
+    return hash_factors(
+        {
+            path.relative_to(package_root).as_posix(): hashlib.sha256(
+                path.read_bytes()
+            ).hexdigest()
+            for path in package_root.rglob("*.py")
+        }
+    )
+
+
+def vllm_source_hash() -> str:
+    """Identify the installed Python code, including code outside the trace."""
+    return _compute_package_source_hash(Path(__file__).resolve().parents[1])
 
 
 def aot_compile_hash_factors(vllm_config: VllmConfig) -> list[str]:

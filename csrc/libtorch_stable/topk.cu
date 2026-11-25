@@ -276,10 +276,12 @@ void persistent_topk(const torch::stable::Tensor& logits,
 #endif
 }
 
-void qsa_lexicographic_topk(const torch::stable::Tensor& logits,
-                            const torch::stable::Tensor& lengths,
-                            torch::stable::Tensor& output, int64_t k,
-                            bool decode_batch) {
+template <bool V154, bool Pack = false>
+static void qsa_lexicographic_topk_impl(const torch::stable::Tensor& logits,
+                                        const torch::stable::Tensor& lengths,
+                                        torch::stable::Tensor& output,
+                                        int64_t k, bool decode_batch,
+                                        int rank = 0) {
 #ifndef USE_ROCM
   STD_TORCH_CHECK(logits.is_cuda(), "logits must be CUDA tensor");
   STD_TORCH_CHECK(lengths.is_cuda(), "lengths must be CUDA tensor");
@@ -305,8 +307,9 @@ void qsa_lexicographic_topk(const torch::stable::Tensor& logits,
       num_rows <= static_cast<int64_t>(std::numeric_limits<uint32_t>::max()),
       "logits row count exceeds uint32 range");
   STD_TORCH_CHECK(lengths.numel() == num_rows, "lengths size mismatch");
-  STD_TORCH_CHECK(output.size(0) == num_rows && output.size(1) == k,
-                  "output size mismatch");
+  STD_TORCH_CHECK(
+      output.size(0) == num_rows && output.size(1) == (Pack ? 2 * k : k),
+      "output size mismatch");
   STD_TORCH_CHECK(logits.size(1) <= static_cast<int64_t>(
                                         std::numeric_limits<uint32_t>::max()),
                   "logits width exceeds uint32 range");
@@ -315,16 +318,46 @@ void qsa_lexicographic_topk(const torch::stable::Tensor& logits,
                   "logits row stride exceeds uint32 range");
   if (num_rows == 0) return;
 
-  vllm::qsa::launch_qsa_lexicographic_topk<512>(
-      logits.const_data_ptr<float>(), lengths.const_data_ptr<int32_t>(),
-      output.mutable_data_ptr<int32_t>(), static_cast<uint32_t>(num_rows),
-      static_cast<uint32_t>(logits.size(1)),
-      static_cast<uint32_t>(logits.stride(0)), get_current_cuda_stream(),
-      decode_batch);
+  const auto launch =
+      V154 ? vllm::qsa::launch_qsa_lexicographic_topk_v154<512, Pack>
+           : vllm::qsa::launch_qsa_lexicographic_topk<512, Pack>;
+  launch(logits.const_data_ptr<float>(), lengths.const_data_ptr<int32_t>(),
+         output.mutable_data_ptr<int32_t>(), static_cast<uint32_t>(num_rows),
+         static_cast<uint32_t>(logits.size(1)),
+         static_cast<uint32_t>(logits.stride(0)), get_current_cuda_stream(),
+         decode_batch, rank);
   const cudaError_t err = cudaGetLastError();
   STD_TORCH_CHECK(err == cudaSuccess,
                   "qsa_lexicographic_topk failed: ", cudaGetErrorString(err));
 #else
   STD_TORCH_CHECK(false, "qsa_lexicographic_topk is not supported on ROCm");
 #endif
+}
+
+void qsa_lexicographic_topk(const torch::stable::Tensor& logits,
+                            const torch::stable::Tensor& lengths,
+                            torch::stable::Tensor& output, int64_t k,
+                            bool decode_batch) {
+  qsa_lexicographic_topk_impl<false>(logits, lengths, output, k, decode_batch);
+}
+
+void qsa_lexicographic_topk_v154(const torch::stable::Tensor& logits,
+                                 const torch::stable::Tensor& lengths,
+                                 torch::stable::Tensor& output, int64_t k,
+                                 bool decode_batch) {
+  qsa_lexicographic_topk_impl<true>(logits, lengths, output, k, decode_batch);
+}
+
+void qsa_lexicographic_topk_pack(const torch::stable::Tensor& logits,
+                                 const torch::stable::Tensor& lengths,
+                                 torch::stable::Tensor& packed, int64_t rank,
+                                 bool v154, bool decode_batch) {
+  STD_TORCH_CHECK(rank >= 0 && rank < 4, "QSA pack requires a TP4 rank");
+  if (v154) {
+    qsa_lexicographic_topk_impl<true, true>(logits, lengths, packed, 512,
+                                            decode_batch, rank);
+  } else {
+    qsa_lexicographic_topk_impl<false, true>(logits, lengths, packed, 512,
+                                             decode_batch, rank);
+  }
 }

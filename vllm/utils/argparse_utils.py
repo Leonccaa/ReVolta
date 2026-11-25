@@ -484,7 +484,17 @@ class FlexibleArgumentParser(ArgumentParser):
 
         file_path = args[index + 1]
 
-        config_args = self.load_config_file(file_path)
+        # The root CLI expands YAML before argparse selects the command parser.
+        parser = next(
+            (
+                action.choices[args[0]]
+                for action in self._actions
+                if isinstance(action, argparse._SubParsersAction)
+                and args[0] in action.choices
+            ),
+            self,
+        )
+        config_args = parser.load_config_file(file_path)
 
         # 0th index might be the sub command {serve,chat,complete,...}
         # optionally followed by model_tag (only for serve)
@@ -573,6 +583,10 @@ class FlexibleArgumentParser(ArgumentParser):
             if isinstance(value, bool):
                 if value:
                     processed_args.append("--" + key)
+                elif (
+                    no_key := "--no-" + key.replace("_", "-")
+                ) in self._option_string_actions:
+                    processed_args.append(no_key)
             elif isinstance(value, list):
                 if value:
                     processed_args.append("--" + key)

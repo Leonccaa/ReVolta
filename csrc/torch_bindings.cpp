@@ -167,6 +167,74 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
   #ifdef ENABLE_SM70_TURBOMIND
   ops.def(
+      "sm70_hc_ll_down_out(Tensor x, Tensor wd, Tensor(a!) part, Tensor(b!) "
+      "cnt, "
+      "int[] ll, Tensor(c!) seq, int rank, int variant, bool "
+      "optimized_loads=True) -> ()");
+  ops.impl("sm70_hc_ll_down_out", torch::kCUDA, &sm70_hc_ll_down_out);
+  ops.def(
+      "sm70_hc_ll_up_out(int ll_lora, Tensor wu, Tensor x, Tensor(a!) cnt, "
+      "int[] ll, Tensor(b!) seq, Tensor down_seq, int rank, Tensor(c!) out, "
+      "Tensor(d!) lora_out, Tensor(e!) inj_out, int warps, bool "
+      "optimized_loads=True) -> ()");
+  ops.impl("sm70_hc_ll_up_out", torch::kCUDA, &sm70_hc_ll_up_out);
+
+  ops.def(
+      "sm70_qwen38_hc_batch_cta8(int fa, Tensor input, Tensor packed_down, "
+      "Tensor packed_up, Tensor(a!) partials, Tensor(b!) lora, "
+      "Tensor(c!) local_output, Tensor(d!) output, Tensor(e!) injection) -> "
+      "()");
+  ops.impl("sm70_qwen38_hc_batch_cta8", torch::kCUDA,
+           &sm70_qwen38_hc_batch_cta8);
+  ops.def("sm70_tp4_push_m64_buffer_size() -> int",
+          &sm70_tp4_push_m64_buffer_size);
+  ops.def(
+      "sm70_tp4_push_m64_out(Tensor(a!) out, Tensor input, int[] ipc_ptrs, "
+      "int rank) -> ()");
+  ops.impl("sm70_tp4_push_m64_out", torch::kCUDA, &sm70_tp4_push_m64_out);
+
+  ops.def(
+      "sm70_top1x_out(Tensor(a!) out, Tensor pairs, int[] buffers, "
+      "Tensor(b!) seq, int rank) -> ()");
+  ops.impl("sm70_top1x_out", torch::kCUDA, &sm70_top1x_out);
+  ops.def(
+      "sm70_gdn_verify_out(Tensor qkv, Tensor a, Tensor b, Tensor A_log, "
+      "Tensor dt_bias, Tensor(a!) state, Tensor(b!) o, Tensor cu, Tensor idx, "
+      "Tensor? nacc, int H, int HV, float scale, int cfg, Tensor? rbuf, "
+      "Tensor? rn, Tensor? ctr, int tmax, Tensor? rmap=None, "
+      "Tensor? ckt=None, Tensor? cks=None) -> ()");
+  ops.impl("sm70_gdn_verify_out", torch::kCUDA, &sm70_gdn_verify_out);
+  ops.def(
+      "sm70_dflash2_fp16_m8_out(Tensor(a!) output, Tensor input, Tensor "
+      "packed, int tile, int warps) -> ()");
+  ops.impl("sm70_dflash2_fp16_m8_out", torch::kCUDA, &sm70_dflash2_fp16_m8_out);
+  ops.def(
+      "sm70_dflash2_fp16_dispatch_out(Tensor(a!) output, Tensor input, Tensor "
+      "packed, Tensor weight, int tile, int warps) -> ()");
+  ops.impl("sm70_dflash2_fp16_dispatch_out", torch::kCUDA,
+           &sm70_dflash2_fp16_dispatch_out);
+  ops.def(
+      "sm70_fp16_candidate_scores_out(Tensor(a!) scores, Tensor input, "
+      "Tensor weight, Tensor ids, bool tiled_multirow=False) -> ()");
+  ops.impl("sm70_fp16_candidate_scores_out", torch::kCUDA,
+           &sm70_fp16_candidate_scores_out);
+  ops.def(
+      "sm70_fp16_masked_head_out(Tensor(a!) scores, Tensor input, "
+      "Tensor weight, Tensor certified, bool tiled_multirow=False) -> ()");
+  ops.impl("sm70_fp16_masked_head_out", torch::kCUDA,
+           &sm70_fp16_masked_head_out);
+  ops.def("sm70_fp16_head_vocab_revision() -> int",
+          []() -> int64_t { return 2; });
+  ops.def(
+      "sm70_hcx_out(Tensor p0, Tensor? p1, Tensor res, Tensor inj, Tensor nw, "
+      "float eps, Tensor wd, Tensor wu, Tensor(a!) res_out, Tensor(b!) "
+      "blk_out, "
+      "Tensor(c!) inj_out, Tensor(d!) xn, Tensor(e!) sq, Tensor(f!) dpart, "
+      "Tensor(g!) bar, Tensor(h!) seq, int[] ar, int[] lora, int[] hb, int "
+      "rank, Tensor? dbg, int full, bool local_schedule=False) -> ()");
+  ops.impl("sm70_hcx_out", torch::kCUDA, &sm70_hcx_out);
+
+  ops.def(
       "gguf_affine_sm70_prepare(Tensor codes, Tensor scales, Tensor mins, "
       "int bits, int group_size=32) -> Tensor[]");
   ops.impl("gguf_affine_sm70_prepare", torch::kCUDA, &gguf_affine_sm70_prepare);
@@ -343,6 +411,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int accumulator_chains, bool prefetch_codes, bool gated_silu) -> ()");
   ops.impl("fp8_qpn8_dispatch_sm70_out", torch::kCUDA,
            &fp8_qpn8_dispatch_sm70_out);
+
+  ops.def(
+      "fp8_qpn8_draft_dispatch_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor codes, Tensor group_scales, int split_k, int accumulator_chains, "
+      "bool prefetch_codes, bool gated_silu, int max_native_rows) -> ()");
+  ops.impl("fp8_qpn8_draft_dispatch_sm70_out", torch::kCUDA,
+           &fp8_qpn8_draft_dispatch_sm70_out);
 
   ops.def(
       "fp8_qpn8_gemm_sm70_out(Tensor(a!) out, Tensor input, Tensor codes, "
@@ -709,14 +784,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def(
       "awq_moe_gemm_sm70_out(Tensor(a!) out, Tensor sorted_input, "
       "Tensor expert_offsets, Tensor strided_ptrs_w, Tensor strided_ptrs_s, "
-      "int num_experts, int k, int n, int group_size, bool gated_silu) -> ()");
+      "int num_experts, int k, int n, int group_size, bool gated_silu, "
+      "Tensor(b!)? int4_zero_workspace=None) -> ()");
   ops.impl("awq_moe_gemm_sm70_out", torch::kCUDA, &awq_moe_gemm_sm70_out);
 
   ops.def(
       "awq_moe_gemm_sm70_per_expert_dispatch_out("
       "Tensor(a!) out, Tensor sorted_input, Tensor expert_offsets, "
       "Tensor strided_ptrs_w, Tensor strided_ptrs_s, int num_experts, "
-      "int k, int n, int group_size, bool gated_silu) -> ()");
+      "int k, int n, int group_size, bool gated_silu, "
+      "Tensor(b!)? int4_zero_workspace=None) -> ()");
   ops.impl("awq_moe_gemm_sm70_per_expert_dispatch_out", torch::kCUDA,
            &awq_moe_gemm_sm70_per_expert_dispatch_out);
 
@@ -724,7 +801,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "awq_moe_dense_stage_sm70_out("
       "Tensor(a!) out, Tensor input, Tensor expert_offsets, "
       "Tensor dense_expert_ids, Tensor ptrs_w, Tensor ptrs_s, "
-      "int num_experts, int k, int n, int group_size) -> ()");
+      "int num_experts, int k, int n, int group_size, "
+      "Tensor(b!)? int4_zero_workspace=None) -> ()");
   ops.impl("awq_moe_dense_stage_sm70_out", torch::kCUDA,
            &awq_moe_dense_stage_sm70_out);
 
@@ -732,7 +810,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "awq_moe_indexed_dense_w13_sm70_out("
       "Tensor(a!) out, Tensor input, Tensor input_row_indices, "
       "Tensor expert_offsets, Tensor dense_expert_ids, Tensor ptrs_w, "
-      "Tensor ptrs_s, int num_experts, int k, int n, int group_size) -> ()");
+      "Tensor ptrs_s, int num_experts, int k, int n, int group_size, "
+      "Tensor(b!)? int4_zero_workspace=None) -> ()");
   ops.impl("awq_moe_indexed_dense_w13_sm70_out", torch::kCUDA,
            &awq_moe_indexed_dense_w13_sm70_out);
 
@@ -741,7 +820,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor(a!) out, Tensor input, Tensor permuted_experts_id, "
       "Tensor(b!) active_expert_offsets, Tensor(c!) active_expert_ids, Tensor "
       "ptrs_w, "
-      "Tensor ptrs_s, int total_slots, int k, int n, int group_size) -> ()");
+      "Tensor ptrs_s, int total_slots, int k, int n, int group_size, "
+      "Tensor(d!)? int4_zero_workspace=None) -> ()");
   ops.impl("awq_moe_active_dense_stage_sm70_out", torch::kCUDA,
            &awq_moe_active_dense_stage_sm70_out);
 
@@ -753,7 +833,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor(e!) chunk_range_end, Tensor(f!) chunk_a_indices, "
       "Tensor(g!) chunk_inv_permuted_idx, Tensor ptrs_w, Tensor ptrs_s, "
       "int num_tokens, int top_k, int num_experts, int k, int n, "
-      "int hidden_logical_size, int group_size, int chunk_tokens) -> ()");
+      "int hidden_logical_size, int group_size, int chunk_tokens, "
+      "Tensor(h!)? int4_zero_workspace=None) -> ()");
   ops.impl("awq_moe_chunked_w2_sm70_out", torch::kCUDA,
            &awq_moe_chunked_w2_sm70_out);
 
@@ -761,7 +842,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "awq_moe_single_token_dense_stage_sm70_out("
       "Tensor(a!) out, Tensor input, Tensor expert_offsets, "
       "Tensor sorted_expert_ids, Tensor ptrs_w, Tensor ptrs_s, int top_k, "
-      "int k, int n, int group_size) -> ()");
+      "int k, int n, int group_size, "
+      "Tensor(b!)? int4_zero_workspace=None) -> ()");
   ops.impl("awq_moe_single_token_dense_stage_sm70_out", torch::kCUDA,
            &awq_moe_single_token_dense_stage_sm70_out);
 
@@ -769,7 +851,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "awq_moe_single_token_indexed_dense_stage_sm70_out("
       "Tensor(a!) out, Tensor input, Tensor expert_offsets, "
       "Tensor sorted_expert_ids, Tensor ptrs_w, Tensor ptrs_s, int top_k, "
-      "int k, int n, int group_size) -> ()");
+      "int k, int n, int group_size, "
+      "Tensor(b!)? int4_zero_workspace=None) -> ()");
   ops.impl("awq_moe_single_token_indexed_dense_stage_sm70_out", torch::kCUDA,
            &awq_moe_single_token_indexed_dense_stage_sm70_out);
 
@@ -779,7 +862,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor topk_ids, Tensor w13_ptrs_w, Tensor w13_ptrs_s, "
       "Tensor(c!) expert_offsets, Tensor(d!) expert_offsets64, "
       "Tensor(e!) inv_permuted_idx, Tensor(f!) sorted_expert_ids, "
-      "int w13_k, int w13_n, int group_size, int hidden_logical_size) -> ()");
+      "int w13_k, int w13_n, int group_size, int hidden_logical_size, "
+      "Tensor(g!)? int4_zero_workspace=None) -> ()");
   ops.impl("awq_moe_single_token_dense_w13_sm70_out", torch::kCUDA,
            &awq_moe_single_token_dense_w13_sm70_out);
 
@@ -789,7 +873,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor topk_ids, Tensor w13_ptrs_w, Tensor w13_ptrs_s, "
       "Tensor(c!) expert_offsets, Tensor(d!) expert_offsets64, "
       "Tensor(e!) inv_permuted_idx, Tensor(f!) sorted_expert_ids, "
-      "int w13_k, int w13_n, int group_size, int hidden_logical_size) -> ()");
+      "int w13_k, int w13_n, int group_size, int hidden_logical_size, "
+      "Tensor(g!)? int4_zero_workspace=None) -> ()");
   ops.impl("awq_moe_single_token_indexed_dense_w13_sm70_out", torch::kCUDA,
            &awq_moe_single_token_indexed_dense_w13_sm70_out);
 
@@ -800,7 +885,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor(c!) compact_w13_ptrs_w, Tensor(d!) compact_w13_ptrs_s, "
       "Tensor(e!) expert_offsets, Tensor(f!) expert_offsets64, "
       "Tensor(g!) inv_permuted_idx, Tensor(h!) sorted_expert_ids, "
-      "int w13_k, int w13_n, int group_size, int hidden_logical_size) -> ()");
+      "int w13_k, int w13_n, int group_size, int hidden_logical_size, "
+      "Tensor(i!)? int4_zero_workspace=None) -> ()");
   ops.impl("awq_moe_single_token_compact_dense_w13_sm70_out", torch::kCUDA,
            &awq_moe_single_token_compact_dense_w13_sm70_out);
 
@@ -830,7 +916,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor(h!) dst_w2_ptrs_w_rows, Tensor(i!) dst_w2_ptrs_s_rows, "
       "Tensor(j!) expert_offsets, Tensor(k!) inv_permuted_idx, "
       "int w13_k, int w13_n, int w2_k, int w2_n, int group_size, "
-      "int hidden_logical_size) -> ()");
+      "int hidden_logical_size, "
+      "Tensor(l!)? int4_zero_workspace=None) -> ()");
   ops.impl("awq_moe_single_token_sm70_out", torch::kCUDA,
            &awq_moe_single_token_sm70_out);
 
@@ -1223,6 +1310,13 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
   custom_ar.def("meta_size", &meta_size);
   custom_ar.def("sm70_tp4_push_allreduce_buffer_size",
                 &sm70_tp4_push_allreduce_buffer_size);
+  custom_ar.def(
+      "sm70_tp4_push_allgather(int fa, Tensor input, Tensor(a!) output) -> ()");
+  custom_ar.impl("sm70_tp4_push_allgather", torch::kCUDA,
+                 &sm70_tp4_push_allgather);
+  custom_ar.def(
+      "sm70_qsa_shard_merge(int fa, Tensor input, Tensor(a!) output) -> ()");
+  custom_ar.impl("sm70_qsa_shard_merge", torch::kCUDA, &sm70_qsa_shard_merge);
   custom_ar.def("sm70_tp8_hierarchical_push_allreduce_buffer_size",
                 &sm70_tp8_hierarchical_push_allreduce_buffer_size);
 

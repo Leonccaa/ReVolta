@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from torch import nn
 
 import vllm.envs as envs
+from vllm.compilation.sm70_decode_graph import is_sm70_decode_graph_compiling
 from vllm.config import (
     CacheConfig,
     ModelConfig,
@@ -67,6 +68,7 @@ from vllm.model_executor.parameter import (
     ModelWeightParameter,
     PerTensorScaleParameter,
 )
+from vllm.models.common.ops.sequence_parallel import sp_all_gather, sp_shard
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
@@ -2419,7 +2421,6 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             )
         if num_prefills == 0 or x_p.numel() == 0:
             return torch.empty_like(x_p)
-        lengths = q_starts[1:] - q_starts[:-1]
         # Use the CPU-computed packing width from the metadata builder instead
         # of synchronizing on lengths.max().
         max_len = metadata.max_prefill_query_len
@@ -2428,6 +2429,46 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
 
         hidden_size = x_p.shape[1]
         state_len = self.conv_state_len
+        if (
+            envs.VLLM_SM70_PLE_PREFILL_CONV_CHUNK
+            and x_p.is_cuda
+            and x_p.dtype == torch.float16
+            and x_p.stride(1) == 1
+            and hidden_size == 10240
+            and state_len == 9
+            and self.short_conv_dilation == 3
+            and conv_weights.shape == (hidden_size, 4)
+            and conv_state.ndim == 3
+            and conv_state.shape[0] > 0
+            and conv_state.shape[1] == hidden_size
+            and conv_state.shape[2] >= state_len
+            and all(
+                t.device == x_p.device and t.dtype == x_p.dtype
+                for t in (conv_state, conv_weights)
+            )
+            and all(
+                t.device == x_p.device
+                for t in (q_starts, state_indices_tensor_p, has_initial_states_p)
+            )
+            and current_platform.is_device_capability((7, 0))
+        ):
+            from vllm.model_executor.kernels.ple.short_conv import (
+                dilated_prefill_short_conv,
+            )
+
+            return dilated_prefill_short_conv(
+                x_p,
+                conv_state,
+                conv_weights,
+                q_starts,
+                state_indices_tensor_p[:num_prefills],
+                has_initial_states_p[:num_prefills],
+                max_len,
+                self.short_conv_dilation,
+                NULL_BLOCK_ID,
+            )
+
+        lengths = q_starts[1:] - q_starts[:-1]
         positions = torch.arange(
             num_prefill_tokens, device=x_p.device, dtype=torch.int64
         )
@@ -2614,8 +2655,10 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         spec_query_start_loc: torch.Tensor,
         num_accepted_tokens: torch.Tensor,
         spec_query_len: int,
+        *,
+        allow_batched_native: bool = True,
     ) -> torch.Tensor:
-        """Dilated short-conv for speculative-decode (MTP) requests.
+        """Dilated short-conv for speculative-decode requests.
 
         Each spec request feeds multiple (draft + 1) query tokens. The conv
         outputs are computed causally after rolling back the previous draft
@@ -2623,50 +2666,63 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         in the extended cache for the next forward, matching
         ``causal_conv1d_update``.
 
-        ``spec_query_len`` (== num_speculative_tokens + 1) is the maximum query
-        length and is a Python int, so no host synchronization is needed; this
-        keeps the path safe for full CUDA-graph capture/replay where the buffers
-        are padded at the request level.
+        ``spec_query_len`` is the configured packing and rollback capacity.
+        Actual query lengths come from the device-side request starts.
         """
         num_reqs = spec_state_indices_tensor.numel()
         hidden_size = x_spec.size(-1)
+        # The native rollback clamp comes from the physical state width. DSD
+        # narrows the segments in spec_query_start_loc, not that clamp.
         if (
             envs.VLLM_SM70_MTP_PLE_CONV
-            and num_reqs == 1
-            and spec_query_len == 5
+            and 1 <= num_reqs <= 8
+            and 5 <= spec_query_len <= 8
             and self.conv_state_len == 9
             and self.short_conv_dilation == 3
-            and x_spec.shape in ((5, 10240), (10, 10240))
+            and x_spec.ndim == 2
+            and hidden_size == 10240
+            and 1 <= x_spec.size(0) <= 64
+            and conv_state.shape[1:] == (10240, 8 + spec_query_len)
             and x_spec.is_cuda
             and x_spec.dtype == torch.float16
             and x_spec.is_contiguous()
             and conv_weights.shape == (10240, 4)
             and conv_weights.dtype == torch.float16
             and conv_weights.is_contiguous()
-            and conv_state.shape[1:] == (10240, 13)
             and conv_state.dtype in (torch.float16, torch.float32)
-            and all(
-                t.dtype == torch.int32 and t.is_cuda and t.is_contiguous()
-                for t in (
-                    spec_state_indices_tensor,
-                    spec_query_start_loc,
-                    num_accepted_tokens,
-                )
-            )
             and current_platform.is_device_capability((7, 0))
         ):
-            output = torch.empty_like(x_spec)
-            torch.ops._C.qwen38_ple_spec_sm70_out(
-                output,
-                conv_state,
-                x_spec,
-                conv_weights,
+            metadata = (
                 spec_state_indices_tensor,
                 spec_query_start_loc,
                 num_accepted_tokens,
             )
-            logger.info_once("SM70 MTP4 PLE rollback/conv/SiLU/state fusion enabled.")
-            return output
+            legacy = num_reqs == 1 and spec_query_len == 5 and x_spec.size(0) in (5, 10)
+            op_name = (
+                "qwen38_ple_spec_sm70_out"
+                if legacy
+                else "qwen38_ple_spec_sm70_v154_out"
+            )
+            if (
+                (legacy or (allow_batched_native and x_spec.size(0) >= 2 * num_reqs))
+                and (
+                    conv_state.stride(2) == 1
+                    and conv_state.stride(1) >= conv_state.size(2)
+                    or conv_state.stride(1) == 1
+                    and conv_state.stride(2) >= hidden_size
+                )
+                and conv_state.stride(0)
+                > (hidden_size - 1) * conv_state.stride(1)
+                + (conv_state.size(2) - 1) * conv_state.stride(2)
+            ):
+                output = torch.empty_like(x_spec)
+                getattr(torch.ops._C, op_name)(
+                    output, conv_state, x_spec, conv_weights, *metadata
+                )
+                logger.info_once(
+                    "SM70 PLE speculative convolution enabled (%s).", op_name
+                )
+                return output
         # Use a fixed packing width instead of synchronizing on lengths.max().
         max_len = spec_query_len
         # Full CUDA graphs can pad these buffers. Only the first num_reqs
@@ -2824,6 +2880,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 spec_query_start_loc=metadata.spec_query_start_loc,
                 num_accepted_tokens=metadata.num_accepted_tokens,
                 spec_query_len=metadata.spec_query_len,
+                allow_batched_native=not (has_prefill or has_decode),
             )
 
         # 2. Run regular decode and prefill requests.
@@ -2942,15 +2999,34 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             conv_weights.to(dtype=inputs.dtype),
         )
 
+    def _gate_norm(
+        self, hidden_states: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        token_count = hidden_states.shape[0]
+        key = key.reshape(token_count, self.hc_count, self.hidden_size)
+        query = hidden_states.reshape(token_count, self.hc_count, self.hidden_size)
+        key = self._apply_norm(self.norm_key, key)
+        query = self._apply_norm(self.norm_query, query)
+        gate = (key * query).sum(dim=-1, keepdim=True) / math.sqrt(self.hidden_size)
+        gate = torch.sigmoid(gate.sign() * gate.abs().clamp_min(1e-6).sqrt())
+        gated_value = gate * value.unsqueeze(-2)
+        normalized = self._apply_norm(self.norm_conv, gated_value).flatten(-2)
+        # Return the [tokens, streams, hidden] product unflattened. The caller
+        # flattens it in the final sum, after the short-conv split, which keeps
+        # the compiled default graph and its FP16 results as before.
+        return gated_value, normalized
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
+        *,
+        hc_sp: bool = False,
     ) -> torch.Tensor:
         input_ids = input_ids.reshape(-1)
-        if input_ids.shape[0] != hidden_states.shape[0]:
+        if not hc_sp and input_ids.shape[0] != hidden_states.shape[0]:
             raise ValueError(
                 "PLE expects input_ids and hidden_states to have the same "
                 f"token length, got {input_ids.shape[0]} and "
@@ -2963,24 +3039,84 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             ngram_context,
         )
         embeddings = self._dequantize_embeddings(embeddings, hidden_states.dtype)
+        if hc_sp:
+            # The embedding boundary returns complete rows in every placement.
+            # Resident and cascade lookups retain their existing TP reduction.
+            embeddings = sp_shard(embeddings, dynamic_pad=True)
         key, _ = self.key_proj(embeddings)
         value, _ = self.value_proj(embeddings)
-        token_count = hidden_states.shape[0]
-        key = key.reshape(token_count, self.hc_count, self.hidden_size)
-        query = hidden_states.reshape(token_count, self.hc_count, self.hidden_size)
-        key = self._apply_norm(self.norm_key, key)
-        query = self._apply_norm(self.norm_query, query)
-        gate = (key * query).sum(dim=-1, keepdim=True) / math.sqrt(self.hidden_size)
-        gate = torch.sigmoid(gate.sign() * gate.abs().clamp_min(1e-6).sqrt())
-        gated_value = gate * value.unsqueeze(-2)
-        normalized = self._apply_norm(self.norm_conv, gated_value).flatten(-2)
+        if (
+            envs.VLLM_SM70_PLE_GATE_NORM
+            and envs.VLLM_SM70_QWEN38_DUAL_COMPILE
+            and is_sm70_decode_graph_compiling()
+        ):
+            gated_value, normalized = torch.ops.vllm.qwen4_exp_ple_gate_norm(
+                hidden_states, key, value, self.prefix
+            )
+        else:
+            gated_value, normalized = self._gate_norm(hidden_states, key, value)
+        if hc_sp:
+            normalized = sp_all_gather(normalized)[: input_ids.shape[0]]
         conv_output = torch.zeros_like(normalized)
         torch.ops.vllm.qwen4_exp_ple_short_conv(
             normalized,
             conv_output,
             self.prefix,
         )
-        return gated_value.flatten(-2) + conv_output
+        if hc_sp:
+            conv_output = sp_shard(conv_output, dynamic_pad=True)
+        if gated_value.ndim == 3:
+            gated_value = gated_value.flatten(-2)
+        return gated_value + conv_output
+
+
+def qwen4_exp_ple_gate_norm(
+    hidden_states: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    context = get_forward_context()
+    layer = context.no_compile_layers[layer_name]
+    norm_key, norm_query, norm_conv = layer.norm_key, layer.norm_query, layer.norm_conv
+    weights = (norm_key.weight, norm_query.weight, norm_conv.weight)
+    metadata = context.attn_metadata
+    rows = hidden_states.size(0)
+    if (
+        1 <= rows <= 64
+        and (layer.hc_count, layer.hidden_size) == (4, 2560)
+        and isinstance(metadata, dict)
+        and isinstance(meta := metadata.get(layer_name), PleShortConvAttentionMetadata)
+        and meta.num_prefills == 0
+    ):
+        gated_value = torch.empty_like(hidden_states)
+        normalized = torch.empty_like(hidden_states)
+        torch.ops._C.qwen38_ple_gate_norm_sm70_out(
+            gated_value,
+            normalized,
+            hidden_states,
+            key,
+            value,
+            0,
+            hidden_states,
+            *weights,
+            norm_key.eps,
+        )
+        return gated_value, normalized
+    gated_value, normalized = layer._gate_norm(hidden_states, key, value)
+    return gated_value.flatten(-2).contiguous(), normalized.contiguous()
+
+
+def qwen4_exp_ple_gate_norm_fake(
+    hidden_states: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        hidden_states.new_empty(hidden_states.shape),
+        hidden_states.new_empty(hidden_states.shape),
+    )
 
 
 def qwen4_exp_ple_short_conv(
@@ -3124,6 +3260,13 @@ direct_register_custom_op(
     op_func=qwen4_exp_ple_fp8_bytes_dequant,
     mutates_args=["output"],
     fake_impl=qwen4_exp_ple_fp8_bytes_dequant_fake,
+)
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_ple_gate_norm",
+    op_func=qwen4_exp_ple_gate_norm,
+    fake_impl=qwen4_exp_ple_gate_norm_fake,
 )
 
 

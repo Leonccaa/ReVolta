@@ -22,9 +22,16 @@ Typical usage inside a transformer decoder layer::
     )
 """
 
+from typing import NamedTuple
+
 import torch
 from torch import nn
 
+from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
+from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed import tensor_model_parallel_all_reduce
+from vllm.distributed.device_communicators.sm70_hc_ll import MAX_ROWS, get_tp_hc_ll
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
@@ -33,6 +40,7 @@ from vllm.model_executor.layers.quantization.sm70_online_qpn8 import (
     maybe_apply_fused_hc,
 )
 from vllm.model_executor.models.utils import maybe_prefix
+from vllm.utils.torch_utils import direct_register_custom_op
 
 from ..common.hyperconnection import (
     GroupedGemmaRMSNorm,
@@ -46,6 +54,114 @@ from .ops.hc import (
     hc_silu,
 )
 from .sm70_fp16_hc import maybe_apply_qwen38_sm70_fp16_fused_hc
+from .sm70_hcx import HD, INJ
+from .sm70_hcx import MAX_ROWS as HCX_MAX_ROWS
+
+
+class HCTensorParallelPartial(NamedTuple):
+    """A block output whose one remaining TP sum is owned by HC."""
+
+    value: torch.Tensor
+    secondary: torch.Tensor | None = None
+
+
+def _hc_ll_combine_norm(
+    partial: torch.Tensor,
+    residual: torch.Tensor,
+    injection: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    hc_count: int,
+    secondary: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Layers hand over partials only after the HC LL geometry admission.
+    ll = get_tp_hc_ll()
+    if ll is not None and 1 <= residual.shape[0] <= MAX_ROWS:
+        return ll.combine_norm(partial, residual, injection, weight, eps, secondary)
+    if secondary is not None:
+        partial = partial + secondary
+    return hc_combine_norm(
+        residual,
+        tensor_model_parallel_all_reduce(partial),
+        injection,
+        weight,
+        eps,
+        hc_count,
+    )
+
+
+def _hc_ll_combine_norm_fake(
+    partial, residual, injection, weight, eps, hc_count, secondary=None
+):
+    return (
+        torch.empty_like(residual, memory_format=torch.contiguous_format),
+        torch.empty_like(residual, memory_format=torch.contiguous_format),
+    )
+
+
+direct_register_custom_op(
+    op_name="qwen4exp_sm70_hc_ll_combine_norm",
+    op_func=_hc_ll_combine_norm,
+    fake_impl=_hc_ll_combine_norm_fake,
+)
+
+
+def _hc_hcx_combine_and_mix(
+    partial: torch.Tensor,
+    residual: torch.Tensor,
+    injection: torch.Tensor,
+    name: str,
+    secondary: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ctx = get_forward_context()
+    module = ctx.no_compile_layers[name]
+    norm = module.hc_norm.weight
+    eps = module.config.rms_norm_eps
+    ll = get_tp_hc_ll()
+    runtime = ll.hcx if ll is not None else None
+    if (
+        runtime is not None
+        and ctx.is_uniform_decode
+        and ctx.cudagraph_runtime_mode == CUDAGraphMode.NONE
+        and 1 <= residual.shape[0] <= HCX_MAX_ROWS
+        # MRV2 uses CUDAGraphMode.NONE inside both eager warmup and the actual
+        # capture. Leave the eager runs on HC LL: the peer kernel is first
+        # executed only at coordinated graph replay, not during rank-local JIT.
+        and torch.cuda.is_current_stream_capturing()
+    ):
+        return runtime.run(
+            partial,
+            residual,
+            injection,
+            norm,
+            eps,
+            module._hcx_down,
+            module._hcx_up,
+            secondary,
+        )
+    # The partial is still unreduced at all M. Preserve both baseline stages,
+    # including explicit TP AR when HC LL declines (e.g. M > 64).
+    hidden, xn = _hc_ll_combine_norm(
+        partial, residual, injection, norm, eps, 4, secondary
+    )
+    block, inject = module._project(xn)
+    assert inject is not None
+    return hidden.contiguous(), block.contiguous(), inject.contiguous()
+
+
+def _hc_hcx_combine_and_mix_fake(partial, residual, injection, name, secondary=None):
+    return (
+        torch.empty_like(residual, memory_format=torch.contiguous_format),
+        partial.new_empty((residual.shape[0], HD)),
+        injection.new_empty((residual.shape[0], INJ)),
+    )
+
+
+direct_register_custom_op(
+    op_name="qwen4exp_sm70_hcx_combine_and_mix",
+    op_func=_hc_hcx_combine_and_mix,
+    fake_impl=_hc_hcx_combine_and_mix_fake,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +181,8 @@ class GatedResidual(nn.Module):
     GEMM dispatch (e.g. the low-latency skinny GEMM) applies through the
     standard quant_method mechanism.
     """
+
+    _sm70_hcx_name: str | None = None
 
     def __init__(
         self,
@@ -128,13 +246,16 @@ class GatedResidual(nn.Module):
             return_bias=False,
         )
 
-    def _project(self, xn: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+    def _project(
+        self, xn: torch.Tensor, *, hc_sp: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if self.use_combine:
             fused_fp16 = maybe_apply_qwen38_sm70_fp16_fused_hc(
                 self.input_mix_weight_down_block_inject,
                 self.input_mix_weight_up,
                 xn,
                 getattr(self, "_sm70_qwen38_fp16_fused_hc", False),
+                allow_tp_ll=not hc_sp,
             )
             if fused_fp16 is not None:
                 return fused_fp16
@@ -159,7 +280,7 @@ class GatedResidual(nn.Module):
         return hc_gate_mix(xn, gate, self.hc_count), injection
 
     def mix(
-        self, hidden_states: torch.Tensor
+        self, hidden_states: torch.Tensor, *, hc_sp: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         xn = grouped_gemma_rmsnorm(
             hidden_states,
@@ -168,15 +289,19 @@ class GatedResidual(nn.Module):
             self.hc_count,
         )
 
-        block_input, injection = self._project(xn)
+        block_input, injection = (
+            self._project(xn, hc_sp=True) if hc_sp else self._project(xn)
+        )
 
         return hidden_states, block_input, injection
 
     def combine_and_mix(
         self,
         hidden_states: torch.Tensor,
-        prev_block_output: torch.Tensor,
+        prev_block_output: torch.Tensor | HCTensorParallelPartial,
         prev_injection: torch.Tensor,
+        *,
+        hc_sp: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Consume a pending combine, then prepare the next block input.
 
@@ -184,25 +309,56 @@ class GatedResidual(nn.Module):
         block's mix. Its combine with ``block_output`` is fused with this
         module's input RMSNorm.
         """
-        hidden_states, xn = hc_combine_norm(
-            hidden_states,
-            prev_block_output,
-            prev_injection,
-            self.hc_norm.weight,
-            self.config.rms_norm_eps,
-            self.hc_count,
-        )
+        if isinstance(prev_block_output, HCTensorParallelPartial):
+            hcx_name = self._sm70_hcx_name
+            if (
+                hcx_name is not None
+                and use_sm70_decode_graph_semantics()
+                and is_forward_context_available()
+            ):
+                return torch.ops.vllm.qwen4exp_sm70_hcx_combine_and_mix(
+                    prev_block_output.value,
+                    hidden_states,
+                    prev_injection,
+                    hcx_name,
+                    prev_block_output.secondary,
+                )
+            hidden_states, xn = torch.ops.vllm.qwen4exp_sm70_hc_ll_combine_norm(
+                prev_block_output.value,
+                hidden_states,
+                prev_injection,
+                self.hc_norm.weight,
+                self.config.rms_norm_eps,
+                self.hc_count,
+                prev_block_output.secondary,
+            )
+        else:
+            hidden_states, xn = hc_combine_norm(
+                hidden_states,
+                prev_block_output,
+                prev_injection,
+                self.hc_norm.weight,
+                self.config.rms_norm_eps,
+                self.hc_count,
+            )
 
-        block_input, injection = self._project(xn)
+        block_input, injection = (
+            self._project(xn, hc_sp=True) if hc_sp else self._project(xn)
+        )
 
         return hidden_states, block_input, injection
 
     def combine(
         self,
         hidden_states: torch.Tensor,
-        block_output: torch.Tensor,
+        block_output: torch.Tensor | HCTensorParallelPartial,
         injection: torch.Tensor,
     ) -> torch.Tensor:
+        if isinstance(block_output, HCTensorParallelPartial):
+            partial = block_output.value
+            if block_output.secondary is not None:
+                partial = partial + block_output.secondary
+            block_output = tensor_model_parallel_all_reduce(partial)
         return hc_combine(hidden_states, block_output, injection, self.hc_count)
 
     @property

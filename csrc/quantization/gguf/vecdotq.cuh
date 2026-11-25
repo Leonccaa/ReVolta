@@ -874,9 +874,10 @@ template <int mmq_y> static __device__ __forceinline__ void allocate_tiles_q8_0(
     *x_dm = (half2 *) tile_x_d;
 }
 
-template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_q8_0(
+template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_q8_0_bounded(
     const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
-    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row,
+    const int valid_blocks) {
     const int kbx  = k / QI8_0;
     const int kqsx = k % QI8_0;
     float * x_dmf = (float *) x_dm;
@@ -890,8 +891,8 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
         if (need_check) {
             i = min(i, i_max);
         }
-        const block_q8_0 * bxi = bx0 + i*blocks_per_row + kbx;
-        x_ql[i * (WARP_SIZE_GGUF + 1) + k] = get_int_from_int8(bxi->qs, kqsx);
+        x_ql[i * (WARP_SIZE_GGUF + 1) + k] = kbx < valid_blocks
+            ? get_int_from_int8(bx0[i*blocks_per_row + kbx].qs, kqsx) : 0;
     }
 
     const int blocks_per_tile_x_row = WARP_SIZE_GGUF / QI8_0;
@@ -904,9 +905,16 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
         if (need_check) {
             i = min(i, i_max);
         }
-        const block_q8_0 * bxi = bx0 + i*blocks_per_row + kbxd;
-        x_dmf[i * (WARP_SIZE_GGUF/QI8_0) + i / QI8_0 + kbxd] = __half2float(bxi->d);
+        x_dmf[i * (WARP_SIZE_GGUF/QI8_0) + i / QI8_0 + kbxd] = kbxd < valid_blocks
+            ? __half2float(bx0[i*blocks_per_row + kbxd].d) : 0.0f;
     }
+}
+
+template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_q8_0(
+    const void * __restrict__ vx, int * __restrict__ x_ql, half2 * __restrict__ x_dm, int * __restrict__ x_qh,
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k, const int & blocks_per_row) {
+    load_tiles_q8_0_bounded<mmq_y, nwarps, need_check>(vx, x_ql, x_dm, x_qh, x_sc, i_offset, i_max, k,
+                                                    blocks_per_row, WARP_SIZE_GGUF / QI8_0);
 }
 
 static __device__ __forceinline__ float vec_dot_q8_0_q8_1_mul_mat(

@@ -12,6 +12,7 @@ import torch
 from einops import rearrange
 from torch import nn
 
+from vllm import _custom_ops as ops
 from vllm import _sm70_ops as sm70_ops
 from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
@@ -24,7 +25,11 @@ from vllm.config.sm70_dflash2 import (
 from vllm.distributed import (
     divide,
 )
-from vllm.forward_context import ForwardContext, get_forward_context
+from vllm.forward_context import (
+    ForwardContext,
+    get_forward_context,
+    is_forward_context_available,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp, PluggableLayer
 from vllm.model_executor.layers.fla.ops import (
@@ -48,6 +53,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
+from vllm.model_executor.layers.mamba.gdn.spec_replay import TMAX, SpecReplayState
 from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
@@ -78,6 +84,7 @@ from vllm.utils.torch_utils import (
 )
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadata,
+    _sm70_flashqla_original_prefill_enabled,
     gdn_spec_metadata_tensors,
     get_registered_gdn_spec_metadata_tensors,
 )
@@ -396,15 +403,6 @@ def _sm70_profile_trace_enabled() -> bool:
     return envs.VLLM_SM70_PROFILE_TRACE and not torch.compiler.is_compiling()
 
 
-def _sm70_flashqla_original_prefill_enabled() -> bool:
-    raw = os.getenv("VLLM_SM70_FLASHQLA_ORIGINAL_PREFILL")
-    if raw is None:
-        raw = os.getenv("FLASH_QLA_SM70_USE_ORIGINAL_TILELANG")
-    if raw is None:
-        return True
-    return raw.strip().lower() not in ("0", "false", "no", "off", "")
-
-
 # VLLM_SM70_QWEN38_WIDE_M_GDN: token bound of the widened verify admissions
 # (max_num_seqs 8 x MTP4 = 40 tokens; the Triton/copy kernels are M-generic).
 _SM70_GDN_WIDE_M_MAX_TOKENS = 48
@@ -694,6 +692,18 @@ def _sm70_qwen_gdn_metadata_has_active_spec(
         attn_metadata is not None
         and attn_metadata.spec_sequence_masks is not None
         and attn_metadata.num_spec_decodes > 0
+    )
+
+
+def _qwen_gdn_has_prefill(layer_name: LayerNameType) -> bool:
+    if not is_forward_context_available():
+        return False
+    metadata = get_forward_context().attn_metadata
+    if not isinstance(metadata, dict):
+        return False
+    layer_metadata = metadata.get(_resolve_layer_name(layer_name))
+    return isinstance(layer_metadata, GDNAttentionMetadata) and (
+        layer_metadata.num_prefills > 0
     )
 
 
@@ -2363,6 +2373,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.key_dim = self.head_k_dim * self.num_k_heads
         self.value_dim = self.head_v_dim * self.num_v_heads
         self.gqa_interleaved_layout = gqa_interleaved_layout
+        self.sm70_gdn_input_skinny_k4 = (
+            vllm_config.kernel_config.sm70_gdn_input_skinny_k4
+        )
         if current_platform.is_xpu():
             self._forward_method = self.forward_xpu
         elif current_platform.is_cpu():
@@ -2455,6 +2468,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             activation=output_gate_type,
             device=self.dt_bias.device,
         )
+        self._sm70_mtp_prefill_norm = (
+            _sm70_qwen_gdn_spec_method(vllm_config) == "mtp" and not self.norm.enabled()
+        )
 
         self.out_proj = RowParallelLinear(
             self.value_dim,
@@ -2513,7 +2529,22 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and not vllm_config.speculative_config.use_dflash()
         )
         if self.spec_state_replay:
-            self._init_spec_state_replay(vllm_config)
+            speculative = vllm_config.speculative_config
+            assert speculative is not None
+            if speculative.gdn_deferred_commit_metadata:
+                self._replay_slots = speculative.num_speculative_state_tokens() + 1
+                k_heads = self.num_k_heads // self.tp_size
+                v_heads = self.num_v_heads // self.tp_size
+                seq = TMAX * (
+                    k_heads * self.head_k_dim + v_heads * (self.head_v_dim + 2)
+                )
+                # Include persistent payloads in normal model memory profiling.
+                self._native_replay_buffer = self.A_log.new_empty(
+                    2 * vllm_config.scheduler_config.max_num_seqs * seq,
+                    dtype=torch.float32,
+                )
+            else:
+                self._init_spec_state_replay(vllm_config)
         self.enable_sm70_dflash2_fused_gdn_verify = bool(
             sm70_dflash2_enabled(
                 "fused_gdn_verify", capture_sm70_dflash2_config(vllm_config)
@@ -3982,6 +4013,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self,
         hidden_states: torch.Tensor,
         output: torch.Tensor | None,
+        *,
+        defer_tp_reduce: bool = False,
     ):
         if self.maybe_sm70_qwen_gdn_full_forward:
             layer_name = _encode_layer_name(self.prefix)
@@ -4001,6 +4034,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                         conv_state_cache,
                         ssm_state_cache,
                         layer_name,
+                        defer_tp_reduce,
                     )
                 torch.ops.vllm.qwen_gdn_full_forward(
                     hidden_states,
@@ -4008,15 +4042,23 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     conv_state_cache,
                     ssm_state_cache,
                     layer_name,
+                    defer_tp_reduce,
                 )
                 return
+        if defer_tp_reduce:
+            return self.forward_cuda(hidden_states, output, defer_tp_reduce=True)
         return self._forward_method(hidden_states, output)
 
     def _full_forward(
         self,
         hidden_states: torch.Tensor,
         output: torch.Tensor | None,
+        *,
+        defer_tp_reduce: bool = False,
     ):
+        if defer_tp_reduce:
+            # HC sequence parallelism is an SM70 CUDA target path.
+            return self.forward_cuda(hidden_states, output, defer_tp_reduce=True)
         return self._forward_method(hidden_states, output)
 
     def _compute_output_projection(
@@ -4024,6 +4066,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out: torch.Tensor,
         z: torch.Tensor,
         num_tokens: int,
+        defer_tp_reduce: bool = False,
     ) -> torch.Tensor:
         """Part 3: RMSNormGated + output linear projection.
 
@@ -4076,6 +4119,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 True,
                 self.norm.activation,
             )
+        elif (
+            not torch.compiler.is_compiling()
+            and self._sm70_mtp_prefill_norm
+            and _qwen_gdn_has_prefill(layer_name)
+            and self.norm._can_use_sm70_exact(core_attn_out, z, prefill=True)
+        ):
+            # The eager projection can use the exact kernel beyond the normal
+            # row cap. Keep the traced projection on its existing norm path.
+            core_attn_out = torch.ops.vllm.sm70_rmsnorm_gated_exact(
+                core_attn_out,
+                z,
+                self.norm.weight,
+                self.norm.eps,
+                self.norm.activation != "sigmoid",
+            )
         else:
             core_attn_out = self.norm(core_attn_out, z)
         _sm70_gdn_prefill_profile_end(
@@ -4090,7 +4148,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.flatten(-2)  # ... h d -> ... (h d)
         profile_start = _sm70_gdn_prefill_profile_start()
-        proj_out, _ = self.out_proj(core_attn_out)
+        if defer_tp_reduce:
+            proj_out, _ = self.out_proj(core_attn_out, reduce_results=False)
+        else:
+            proj_out, _ = self.out_proj(core_attn_out)
         _sm70_gdn_prefill_profile_end(
             layer_name,
             "projection_out_proj",
@@ -4112,9 +4173,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         z: torch.Tensor,
         output: torch.Tensor | None,
         num_tokens: int,
+        defer_tp_reduce: bool = False,
     ) -> torch.Tensor:
         layer_name = _encode_layer_name(self.prefix)
-        proj_out = self._compute_output_projection(core_attn_out, z, num_tokens)
+        proj_out = self._compute_output_projection(
+            core_attn_out, z, num_tokens, defer_tp_reduce
+        )
         if output is not None:
             output[:num_tokens] = proj_out
             _sm70_gdn_graph_buffer_copy(
@@ -4124,6 +4188,24 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 "proj",
             )
         return proj_out
+
+    def _dispatch_output_projection(
+        self,
+        core_attn_out: torch.Tensor,
+        z: torch.Tensor,
+        output: torch.Tensor | None,
+        num_tokens: int,
+        layer_name: LayerNameType,
+        defer_tp_reduce: bool,
+    ) -> torch.Tensor | None:
+        if envs.VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP and output is not None:
+            torch.ops.vllm.qwen_gdn_output_projection(
+                core_attn_out, z, output, num_tokens, layer_name, defer_tp_reduce
+            )
+            return None
+        return self._output_projection(
+            core_attn_out, z, output, num_tokens, defer_tp_reduce
+        )
 
     def forward_hip(
         self,
@@ -4182,6 +4264,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self,
         hidden_states: torch.Tensor,
         output: torch.Tensor | None,
+        *,
+        defer_tp_reduce: bool = False,
     ):
         """
         Forward pass with three parts:
@@ -4191,13 +4275,19 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         """
         num_tokens = hidden_states.size(0)
         layer_name = _encode_layer_name(self.prefix)
+        # Replay is restricted to the MRv2 SM70 mixed-QKV verifier. Its core
+        # initializes this buffer after checking the per-batch metadata.
+        allocate_core_out = torch.empty if self.spec_state_replay else torch.zeros
+        core_shape = (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim)
         if _sm70_qwen_gdn_input_core_boundary_enabled():
             z = torch.empty(
                 (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
                 dtype=hidden_states.dtype,
                 device=hidden_states.device,
             )
-            core_attn_out = torch.zeros_like(z)
+            core_attn_out = allocate_core_out(
+                core_shape, dtype=z.dtype, device=z.device
+            )
             conv_state_cache, ssm_state_cache = _resolve_qwen_gdn_kv_cache_args(
                 layer_name,
                 core_attn_out,
@@ -4210,17 +4300,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 ssm_state_cache,
                 layer_name,
             )
-            if envs.VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP:
-                torch.ops.vllm.qwen_gdn_output_projection(
-                    core_attn_out,
-                    z,
-                    output,
-                    num_tokens,
-                    layer_name,
-                )
-            else:
-                return self._output_projection(core_attn_out, z, output, num_tokens)
-            return None
+            return self._dispatch_output_projection(
+                core_attn_out, z, output, num_tokens, layer_name, defer_tp_reduce
+            )
 
         if envs.VLLM_SM70_QWEN_GDN_INPUT_PROJECTION_OP:
             mixed_qkv = torch.empty(
@@ -4247,7 +4329,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 a,
                 layer_name,
             )
-            core_attn_out = torch.zeros_like(z)
+            core_attn_out = allocate_core_out(
+                core_shape, dtype=z.dtype, device=z.device
+            )
             conv_state_cache, ssm_state_cache = _resolve_qwen_gdn_kv_cache_args(
                 layer_name,
                 core_attn_out,
@@ -4262,17 +4346,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 conv_state_cache=conv_state_cache,
                 ssm_state_cache=ssm_state_cache,
             )
-            if envs.VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP:
-                torch.ops.vllm.qwen_gdn_output_projection(
-                    core_attn_out,
-                    z,
-                    output,
-                    num_tokens,
-                    layer_name,
-                )
-            else:
-                return self._output_projection(core_attn_out, z, output, num_tokens)
-            return None
+            return self._dispatch_output_projection(
+                core_attn_out, z, output, num_tokens, layer_name, defer_tp_reduce
+            )
 
         # ============================================================
         # Part 1: Input Projection
@@ -4305,6 +4381,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 self.in_proj_ba.weight,
                 getattr(self.in_proj_qkvz, "_sm70_qwen38_gdn_packed", None),
                 getattr(self.in_proj_ba, "_sm70_qwen38_gdn_packed", None),
+                getattr(self.in_proj_qkvz, "_sm70_qwen38_gdn_input_v154", False),
+                self.sm70_gdn_input_skinny_k4,
             )
             z = z.reshape(z.size(0), -1, self.head_v_dim)
         else:
@@ -4378,10 +4456,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ============================================================
         # Part 2: Core Attention (Custom Op)
         # ============================================================
-        # Note: we should not use torch.empty here like other attention backends,
-        # see discussions in https://github.com/vllm-project/vllm/pull/28182
-        core_attn_out = torch.zeros(
-            (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
+        # The recurrent kernel can skip output rows, see vLLM #28182.
+        core_attn_out = allocate_core_out(
+            core_shape,
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
@@ -4403,17 +4480,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ============================================================
         # Part 3: Output Projection
         # ============================================================
-        if envs.VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP:
-            torch.ops.vllm.qwen_gdn_output_projection(
-                core_attn_out,
-                z,
-                output,
-                num_tokens,
-                layer_name,
-            )
-        else:
-            return self._output_projection(core_attn_out, z, output, num_tokens)
-        return None
+        return self._dispatch_output_projection(
+            core_attn_out, z, output, num_tokens, layer_name, defer_tp_reduce
+        )
 
     def forward_xpu(
         self,
@@ -4702,13 +4771,17 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         qkv_row_stride = qkv_or_qkvz.stride(0) if qkv_or_qkvz.dim() >= 2 else qkv_dim
         self._sm70_gdn_prefill_qkv_row_stride = max(qkv_dim, int(qkv_row_stride))
         prefill_token_counts = (FLA_CHUNK_SIZE, max(1, FLA_CHUNK_SIZE - 1))
+        use_original_flashqla_prefill = (
+            self.gdn_prefill_backend == "flashqla_sm70"
+            and _sm70_flashqla_original_prefill_enabled()
+        )
         warmup_key = (
             qkv_or_qkvz.device.type,
             qkv_or_qkvz.device.index,
             dtype,
             state_dtype,
             self.gdn_prefill_backend,
-            _sm70_flashqla_original_prefill_enabled(),
+            use_original_flashqla_prefill,
             _sm70_flashqla_direct_output_enabled(),
             _sm70_flashqla_indexed_prefill_enabled(),
             num_k_heads,
@@ -4922,11 +4995,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             dtype=state_dtype,
         )
         dummy_prefill_core_attn_out = None
-        if (
-            self.gdn_prefill_backend == "flashqla_sm70"
-            and _sm70_flashqla_original_prefill_enabled()
-            and _sm70_flashqla_direct_output_enabled()
-        ):
+        if use_original_flashqla_prefill and _sm70_flashqla_direct_output_enabled():
             dummy_prefill_core_attn_out = torch.empty(
                 T,
                 num_v_heads,
@@ -4945,9 +5014,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             chunk_indices, chunk_offsets = prepare_metadata_cutedsl(cu_seqlens, T)
 
         trace_prefill_warmup = (
-            _sm70_profile_trace_enabled()
-            and self.gdn_prefill_backend == "flashqla_sm70"
-            and _sm70_flashqla_original_prefill_enabled()
+            use_original_flashqla_prefill and _sm70_profile_trace_enabled()
         )
         prefill_warmup_start = time.perf_counter()
         if trace_prefill_warmup:
@@ -5000,8 +5067,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 self.prefix,
             )
             if (
-                self.gdn_prefill_backend == "flashqla_sm70"
-                and _sm70_flashqla_original_prefill_enabled()
+                use_original_flashqla_prefill
                 and _sm70_flashqla_indexed_prefill_enabled()
             ):
                 indexed_state = torch.zeros(
@@ -5322,6 +5388,88 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             kv_cache=kv_cache,
         )
 
+    _native_spec_replay: SpecReplayState | None = None
+
+    def bind_deferred_replay(self, replay: SpecReplayState, group: int) -> None:
+        self._native_spec_replay = replay
+        self._native_checkpoint_slots = replay.spec_ckpt_slot[group]
+
+    def _deferred_replay_out(
+        self,
+        qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        state: torch.Tensor,
+        out: torch.Tensor,
+        cu: torch.Tensor,
+        indices: torch.Tensor,
+        counts: torch.Tensor,
+        rmap: torch.Tensor,
+        ckt: torch.Tensor | None = None,
+        cks: torch.Tensor | None = None,
+    ) -> None:
+        ops.sm70_gdn_verify_out(
+            qkv,
+            a,
+            b,
+            self.A_log,
+            self.dt_bias,
+            state,
+            out,
+            cu,
+            indices,
+            None,
+            self.num_k_heads // self.tp_size,
+            self.num_v_heads // self.tp_size,
+            self.head_k_dim**-0.5,
+            1,
+            self._native_replay_buffer,
+            counts,
+            None,
+            self._replay_slots,
+            rmap,
+            ckt,
+            cks,
+        )
+
+    def commit_deferred_replay(
+        self,
+        state: torch.Tensor,
+        indices: torch.Tensor,
+        counts: torch.Tensor,
+        rmap: torch.Tensor,
+    ) -> None:
+        replay = self._native_spec_replay
+        assert replay is not None
+        heads = self.num_v_heads // self.tp_size
+        kv_width = (2 * self.key_dim + self.value_dim) // self.tp_size
+        empty = state.new_empty((0, kv_width), dtype=torch.float16)
+        gates = state.new_empty((0, heads), dtype=torch.float16)
+        out = state.new_empty((0, heads, self.head_v_dim), dtype=torch.float16)
+        self._deferred_replay_out(
+            empty,
+            gates,
+            gates,
+            state,
+            out,
+            replay.empty_starts[: indices.shape[0] + 1],
+            # A column view can have a non-unit row stride. The native
+            # verifier reads the stride only for two-dimensional indices.
+            indices.unsqueeze(1),
+            counts,
+            rmap,
+        )
+
+    def _flush_plain_deferred_replay(
+        self, state: torch.Tensor, indices: torch.Tensor
+    ) -> None:
+        replay = self._native_spec_replay
+        if replay is not None:
+            rows = indices.shape[0]
+            self.commit_deferred_replay(
+                state, indices, replay.plain_replay[:rows], replay.plain_map[:rows]
+            )
+
     def _init_spec_state_replay(self, vllm_config: VllmConfig) -> None:
         """Buffers that let the verifier skip per-position states (see below)."""
         spec_config = vllm_config.speculative_config
@@ -5358,6 +5506,70 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # into its accepted prefix and the rest, so it reads 2 x requests.
         self._replay_selectors = torch.full(
             (2 * max_reqs,), self._replay_slots + 1, dtype=torch.int32, device=device
+        )
+        self._native_gdn_verify = (
+            envs.VLLM_SM70_MTP_GDN_NATIVE_VERIFY
+            and (spec_config.use_qwen4_exp_mtp() or spec_config.use_dflash())
+            and not envs.VLLM_BATCH_INVARIANT
+            and dtype == torch.float16
+            and self.tp_size == 4
+            and self.num_k_heads == 16
+            and self.num_v_heads == 48
+            and self.head_k_dim == self.head_v_dim == 128
+            and hasattr(torch.ops._C, "sm70_gdn_verify_out")
+        )
+
+    def native_gdn_verify_width(
+        self, metadata: GDNAttentionMetadata, num_reqs: int, num_tokens: int
+    ) -> int:
+        """Use the same launch admission in verify and MRv2 postprocessing."""
+        if (
+            not self._native_gdn_verify
+            or not 1 <= num_reqs <= 8
+            or not 1 <= self._replay_slots <= 8
+            or metadata.num_prefills
+            or metadata.num_decodes
+            or num_tokens % num_reqs
+            or num_tokens // num_reqs not in (4, 5, 8)
+            or num_tokens > num_reqs * self._replay_slots
+        ):
+            return 0
+        state = self.kv_cache[1]
+        if state.dtype != torch.float32 or state.stride()[-3:] != (128 * 128, 128, 1):
+            return 0
+        # Table capacity bounds each sequence, including short rows inside
+        # this launch. The same bound also covers the accepted-prefix replay.
+        return self._replay_slots
+
+    def _launch_native_gdn_verify(
+        self,
+        out: torch.Tensor,
+        state: torch.Tensor,
+        state_indices: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        selectors: torch.Tensor,
+        width: int,
+    ) -> None:
+        num_tokens = out.shape[0]
+        ops.sm70_gdn_verify_out(
+            self._replay_qkv[:num_tokens],
+            self._replay_a[:num_tokens],
+            self._replay_b[:num_tokens],
+            self.A_log,
+            self.dt_bias,
+            state,
+            out,
+            cu_seqlens,
+            state_indices,
+            selectors,
+            4,
+            12,
+            128**-0.5,
+            1,
+            None,
+            None,
+            None,
+            width,
         )
 
     def _mixed_qkv_verify_admits(self, num_tokens: int) -> bool:
@@ -5428,6 +5640,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         state_indices: torch.Tensor,
         cu_seqlens: torch.Tensor,
         num_tokens: int,
+        *,
+        native_width: int = 0,
     ) -> None:
         """Commit accepted recurrent states by repeating the verifier's launch.
 
@@ -5444,6 +5658,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         """
         num_reqs = state_indices.shape[0]
         assert num_reqs <= self._replay_selectors.numel()
+        if native_width:
+            self._launch_native_gdn_verify(
+                self._replay_out[0, :num_tokens],
+                self.kv_cache[1],
+                state_indices,
+                cu_seqlens,
+                self._replay_selectors[:num_reqs],
+                native_width,
+            )
+            return
         fused_sigmoid_gating_delta_rule_update_mixed_qkv(
             A_log=self.A_log,
             a=self._replay_a[:num_tokens],
@@ -5572,6 +5796,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         attn_metadata_raw = forward_context.attn_metadata
 
         if attn_metadata_raw is None:
+            if self.spec_state_replay:
+                core_attn_out.zero_()
             self._warmup_prefill_kernels(mixed_qkv, 0)
             return
 
@@ -5626,6 +5852,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             kv_cache[0] if is_conv_state_dim_first() else kv_cache[0].transpose(-1, -2)
         )
         ssm_state = kv_cache[1]
+        plain_rows = attn_metadata.num_decodes + attn_metadata.num_prefills
+        if self._native_spec_replay is not None and plain_rows:
+            assert non_spec_state_indices_tensor is not None
+            self._flush_plain_deferred_replay(
+                ssm_state, non_spec_state_indices_tensor[:plain_rows]
+            )
         num_actual_tokens = attn_metadata.num_actual_tokens
         num_non_spec_tokens = num_actual_tokens
         if (
@@ -5683,6 +5915,35 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
         )
 
+        query_len = attn_metadata.max_query_len
+        num_spec_reqs = attn_metadata.num_spec_decodes
+        num_k_heads = self.num_k_heads // self.tp_size
+        num_v_heads = self.num_v_heads // self.tp_size
+        fuse_conv_zero = (
+            self.spec_state_replay
+            and spec_sequence_masks is not None
+            and attn_metadata.num_prefills == attn_metadata.num_decodes == 0
+            and ddtree_parent_ids is None
+            and 1 <= num_spec_reqs <= 8
+            and query_len in (4, 5, 8)
+            and attn_metadata.num_spec_decode_tokens == num_spec_reqs * query_len
+            and self.conv1d.bias is None
+            and conv_weights.size(1) == 4
+            and self.activation == "silu"
+            and mixed_qkv.dtype
+            == conv_state.dtype
+            == core_attn_out.dtype
+            == torch.float16
+            and ssm_state.dtype == torch.float32
+            and self._replay_reads_strided_qkv(mixed_qkv)
+            and core_attn_out.is_contiguous()
+            and num_v_heads == 3 * num_k_heads
+            and self.head_k_dim == self.head_v_dim == 128
+            and self._mixed_qkv_verify_geometry_supported()
+        )
+        if self.spec_state_replay and not fuse_conv_zero:
+            core_attn_out.zero_()
+
         if spec_sequence_masks is not None:
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
                 mixed_qkv_spec = mixed_qkv
@@ -5727,8 +5988,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 ],
                 num_accepted_tokens=spec_state_slot_selectors,
                 query_start_loc=spec_query_start_loc,
-                max_query_len=spec_state_indices_tensor.size(-1),
+                max_query_len=query_len
+                if fuse_conv_zero
+                else spec_state_indices_tensor.size(-1),
                 validate_data=False,
+                zero_core_out=core_attn_out if fuse_conv_zero else None,
             )
 
         # 1.2: Process the remaining part
@@ -5965,12 +6229,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
             and self._mixed_qkv_verify_admits(mixed_qkv_spec.shape[0])
         )
-        if use_dflash2_packed_gdn_verify or use_sm70_mixed_qkv_verify:
+        replay = self._native_spec_replay
+        if (
+            replay is not None
+            or use_dflash2_packed_gdn_verify
+            or use_sm70_mixed_qkv_verify
+        ):
             query_spec, key_spec, value_spec = None, None, None
         else:
             query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
         prefill_l2norm_in_kernel = False
-        use_original_flashqla_prefill = _sm70_flashqla_original_prefill_enabled()
+        use_original_flashqla_prefill = (
+            attn_metadata.num_prefills > 0
+            and self.gdn_prefill_backend == "flashqla_sm70"
+            and _sm70_flashqla_original_prefill_enabled()
+        )
         prefill_gate_is_exp = False
         if attn_metadata.num_prefills > 0:
             profile_start = _sm70_gdn_prefill_profile_start()
@@ -6072,7 +6345,33 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 2.1: Process the multi-query part
         if spec_sequence_masks is not None:
-            if use_dflash2_packed_gdn_verify:
+            if replay is not None:
+                assert mixed_qkv_spec is not None and spec_query_start_loc is not None
+                assert spec_state_indices_tensor is not None
+                rows = attn_metadata.num_spec_decodes
+                tokens = mixed_qkv_spec.shape[0]
+                spec_out = (
+                    core_attn_out[:tokens]
+                    if spec_rows_are_batch
+                    else core_attn_out.new_empty((tokens, *core_attn_out.shape[1:]))
+                )
+                self._deferred_replay_out(
+                    mixed_qkv_spec,
+                    a_spec,
+                    b_spec,
+                    ssm_state,
+                    spec_out,
+                    spec_query_start_loc[: rows + 1],
+                    spec_state_indices_tensor[:rows],
+                    replay.spec_replay[:rows],
+                    replay.spec_map[:rows],
+                    replay.spec_ckpt_token[:rows],
+                    self._native_checkpoint_slots[:rows],
+                )
+                core_attn_out_spec = spec_out.unsqueeze(0)
+                last_recurrent_state = ssm_state
+                _log_runtime_route_once("SM70 native next-round GDN verifier hit.")
+            elif use_dflash2_packed_gdn_verify:
                 assert mixed_qkv_spec is not None
                 assert spec_query_start_loc is not None
                 assert spec_state_indices_tensor is not None
@@ -6153,6 +6452,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 )
                 verify_state_indices = spec_state_indices_tensor
                 verify_selectors = spec_state_slot_selectors
+                native_width = 0
+                num_spec_reqs = attn_metadata.num_spec_decodes
                 if self.spec_state_replay:
                     assert spec_state_indices_tensor is not None
                     verify_state_indices, verify_selectors = (
@@ -6161,38 +6462,56 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                             a_spec,
                             b_spec,
                             spec_state_indices_tensor,
-                            attn_metadata.num_spec_decodes,
+                            num_spec_reqs,
                         )
                     )
-                core_attn_out_spec, last_recurrent_state = (
-                    fused_sigmoid_gating_delta_rule_update_mixed_qkv(
-                        A_log=self.A_log,
-                        a=a_spec,
-                        b=b_spec,
-                        dt_bias=self.dt_bias,
-                        mixed_qkv=mixed_qkv_spec,
-                        num_q_heads=self.num_k_heads // self.tp_size,
-                        num_v_heads=self.num_v_heads // self.tp_size,
-                        head_k_dim=self.head_k_dim,
-                        head_v_dim=self.head_v_dim,
-                        initial_state=ssm_state,
-                        inplace_final_state=True,
-                        cu_seqlens=spec_query_start_loc[
-                            : attn_metadata.num_spec_decodes + 1
-                        ],
-                        ssm_state_indices=verify_state_indices,
-                        num_accepted_tokens=verify_selectors,
-                        use_qk_l2norm_in_kernel=True,
-                        out=(
-                            core_attn_out[:num_actual_tokens].unsqueeze(0)
-                            if direct_verify_out
-                            else None
-                        ),
+                    native_width = self.native_gdn_verify_width(
+                        attn_metadata, num_spec_reqs, mixed_qkv_spec.shape[0]
                     )
-                )
-                _log_runtime_route_once(
-                    "SM70 mixed-QKV fused GDN target-verification route hit."
-                )
+                verify_cu = spec_query_start_loc[: num_spec_reqs + 1]
+                if native_width:
+                    assert verify_state_indices is not None
+                    assert verify_selectors is not None
+                    spec_out = core_attn_out[:num_actual_tokens]
+                    self._launch_native_gdn_verify(
+                        spec_out,
+                        ssm_state,
+                        verify_state_indices,
+                        verify_cu,
+                        verify_selectors,
+                        native_width,
+                    )
+                    core_attn_out_spec = spec_out.unsqueeze(0)
+                    last_recurrent_state = ssm_state
+                    _log_runtime_route_once("SM70 native MTP GDN verifier hit.")
+                else:
+                    core_attn_out_spec, last_recurrent_state = (
+                        fused_sigmoid_gating_delta_rule_update_mixed_qkv(
+                            A_log=self.A_log,
+                            a=a_spec,
+                            b=b_spec,
+                            dt_bias=self.dt_bias,
+                            mixed_qkv=mixed_qkv_spec,
+                            num_q_heads=self.num_k_heads // self.tp_size,
+                            num_v_heads=self.num_v_heads // self.tp_size,
+                            head_k_dim=self.head_k_dim,
+                            head_v_dim=self.head_v_dim,
+                            initial_state=ssm_state,
+                            inplace_final_state=True,
+                            cu_seqlens=verify_cu,
+                            ssm_state_indices=verify_state_indices,
+                            num_accepted_tokens=verify_selectors,
+                            use_qk_l2norm_in_kernel=True,
+                            out=(
+                                core_attn_out[:num_actual_tokens].unsqueeze(0)
+                                if fuse_conv_zero or direct_verify_out
+                                else None
+                            ),
+                        )
+                    )
+                    _log_runtime_route_once(
+                        "SM70 mixed-QKV fused GDN target-verification route hit."
+                    )
             else:
                 if self.spec_state_replay:
                     raise RuntimeError(
@@ -6236,8 +6555,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             assert non_spec_state_indices_tensor is not None
             assert has_initial_state is not None
             use_indexed_original_prefill = (
-                self.gdn_prefill_backend == "flashqla_sm70"
-                and use_original_flashqla_prefill
+                use_original_flashqla_prefill
                 and _sm70_flashqla_indexed_prefill_enabled()
                 and non_spec_state_indices_tensor.ndim == 1
             )
@@ -6528,6 +6846,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         """
         Packed non-spec decode with explicit CUDA graph tensor dependencies.
         """
+        if self.spec_state_replay:
+            core_attn_out.zero_()
         # conv_state must be (..., dim, width-1) for the conv kernels.
         # DS layout stores it that way directly; SD layout needs a transpose.
         conv_state = (
@@ -6539,6 +6859,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         b = b[:num_decode_tokens]
         a = a[:num_decode_tokens]
         state_indices = non_spec_state_indices_tensor[:num_decode_tokens]
+        self._flush_plain_deferred_replay(ssm_state, state_indices)
         _sm70_gdn_graph_buffer_copy("state_indices", layer_name, state_indices, "state")
         _sm70_gdn_graph_buffer_copy_state_slice(
             "pre_conv_state",
@@ -7558,6 +7879,7 @@ def qwen_gdn_full_forward(
     conv_state_cache: torch.Tensor,
     ssm_state_cache: torch.Tensor,
     layer_name: LayerNameType,
+    defer_tp_reduce: bool = False,
 ) -> None:
     """Run the full Qwen GDN attention forward outside Inductor.
 
@@ -7573,7 +7895,7 @@ def qwen_gdn_full_forward(
     # dependency tracking can see the recurrent GDN state side effects.
     _ = conv_state_cache, ssm_state_cache
     _log_runtime_route_once("SM70 Qwen GDN full-forward route enabled.")
-    self._full_forward(hidden_states, output)
+    self._full_forward(hidden_states, output, defer_tp_reduce=defer_tp_reduce)
 
 
 def qwen_gdn_full_forward_fake(
@@ -7582,6 +7904,7 @@ def qwen_gdn_full_forward_fake(
     conv_state_cache: torch.Tensor,
     ssm_state_cache: torch.Tensor,
     layer_name: LayerNameType,
+    defer_tp_reduce: bool = False,
 ) -> None:
     """Fake implementation for torch.compile."""
 
@@ -7591,6 +7914,7 @@ def qwen_gdn_full_forward_direct(
     conv_state_cache: torch.Tensor,
     ssm_state_cache: torch.Tensor,
     layer_name: LayerNameType,
+    defer_tp_reduce: bool = False,
 ) -> torch.Tensor:
     """Keep the full-forward order while returning its projection allocation."""
     layer_name = _resolve_layer_name(layer_name)
@@ -7598,7 +7922,7 @@ def qwen_gdn_full_forward_direct(
     # Match the original opaque op's explicit recurrent-state dependencies.
     # Its eager body accesses these same caches through the layer object.
     _ = conv_state_cache, ssm_state_cache
-    output = layer._full_forward(hidden_states, None)
+    output = layer._full_forward(hidden_states, None, defer_tp_reduce=defer_tp_reduce)
     if output is None:
         raise RuntimeError("Direct GDN full-forward did not return a projection")
     _log_runtime_route_once("SM70 Qwen GDN direct full-forward output route hit.")
@@ -7610,6 +7934,7 @@ def qwen_gdn_full_forward_direct_fake(
     conv_state_cache: torch.Tensor,
     ssm_state_cache: torch.Tensor,
     layer_name: LayerNameType,
+    defer_tp_reduce: bool = False,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
@@ -7620,12 +7945,13 @@ def qwen_gdn_output_projection(
     output: torch.Tensor,
     num_tokens: int,
     layer_name: LayerNameType,
+    defer_tp_reduce: bool = False,
 ) -> None:
     """Run only the Qwen GDN RMSNorm/out-projection segment outside Inductor."""
     layer_name = _resolve_layer_name(layer_name)
     forward_context: ForwardContext = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
-    self._output_projection(core_attn_out, z, output, num_tokens)
+    self._output_projection(core_attn_out, z, output, num_tokens, defer_tp_reduce)
 
 
 def qwen_gdn_output_projection_fake(
@@ -7634,6 +7960,7 @@ def qwen_gdn_output_projection_fake(
     output: torch.Tensor,
     num_tokens: int,
     layer_name: LayerNameType,
+    defer_tp_reduce: bool = False,
 ) -> None:
     """Fake implementation for torch.compile."""
 

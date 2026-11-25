@@ -65,12 +65,10 @@ def test_eviction_before_delay_writes_component_instead_of_discard(tmp_path):
     try:
         m = attach(env)
         ks = [key(1, 1)]
-        assert m.admit_build("r", 1)
         b = m.begin_boundary("r", sha256(1), ks)
         from tests.v1.kv_offload.test_unified_units import store
 
         store(m, ks)
-        m.ledger.finish("r")
         h = m.table.lookup(ks[0])
         a = h.page_id * ROW
         env.backing[a : a + ROW] = payload(11)

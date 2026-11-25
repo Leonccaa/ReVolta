@@ -45,18 +45,28 @@ DFlash2 drafts do not need these K/V scales. Their own configuration is in
 [DFlash2 speculative decoding](dflash2.md).
 The launch examples below explicitly select scalar `fp8_e4m3` for target and
 MTP; the strict-scale instructions apply to that recipe. Omitting the target
-CLI option selects `auto`, which now uses dynamic planar `fp8_per_token_head`
-for eligible QSA requests even when checkpoint scales exist. That format needs
-no KV scale overlay. MTP inherits it when draft dtype is omitted, or accepts
-the same explicit format; mixing planar target and scalar MTP is rejected.
-SM70 DFlash/DFlash2 still defaults to FP16 draft KV. See the
+CLI option selects `auto`. Eligible QSA models use planar INT8 on SM70 and
+planar `fp8_per_token_head` on other supported CUDA devices. Both compute scales
+at runtime. MTP inherits the target format when draft dtype is omitted. On
+supported QSA Model Runner V2 configurations, an explicit FP16 draft can also
+be used with an 8-bit target.
+SM70 QSA DFlash/DFlash2 defaults to FP16 draft KV. See the
 [KV dtype comparison](configuration.md#launch-options) for eligibility and ABI.
+
+On V100, Flash-Next MTP uses Q8_0 for supported floating-point or block-FP8 routed
+expert weights. The runtime packs the experts once at load time. Packed
+NVFP4 draft experts keep their checkpoint format. To keep FP8 draft expert
+storage, add `"mtp_expert_quantization":"fp8"` to the speculative config.
+For the supported draft sources, `"mtp_expert_quantization":"fp16"` selects
+the FP16 reference. These settings affect only the draft's routed expert
+weights. The draft KV dtype is configured separately.
 
 When target E4M3 scales are unavailable, FP16 KV needs no calibration but
 holds roughly half as many KV tokens at the same memory budget. INT8 KV
-computes per-token, per-head scales at runtime; in the supported speculative
-configuration use MTP with both target and draft set to `int8`. INT8 KV
-cannot be combined with DFlash2 ([#25](https://github.com/Leonccaa/ReVolta/issues/25)).
+computes per-token, per-head scales at runtime. MTP inherits an INT8 target
+format by default. DFlash2 supports an INT8 target with an FP16 draft. On
+Flash-V100, DFlash2 draft attention with sliding windows or attention sinks
+requires FP16 draft KV for this combination.
 
 The following steps pin every download. Retain the downloaded base and pack:
 the materialized checkpoints and 512K YaRN views link to their files. Use a
@@ -319,7 +329,8 @@ vllm serve /data/revolta/views/nvfp4-qad/target-512k \
 
 V100 stores compressed weights and KV, then converts them to FP16 for computation.
 The documented reference recipe is AWQ g32 with explicit scalar E4M3 KV.
-The CLI default `auto` instead selects dynamic planar E4M3 for eligible QSA.
+The CLI default `auto` selects planar INT8 for eligible QSA models on V100.
+Use `fp8_per_token_head` for dynamic planar E4M3.
 
 ## Quantization comparison
 
@@ -349,15 +360,16 @@ against the Uncensored checkpoint's own BF16 parent.
 
 ## INT8 KV
 
-With MTP4, set `--kv-cache-dtype int8` and `"kv_cache_dtype": "int8"` in the speculative
-configuration. Target and draft KV types must match. Scales are computed per token
-and head at runtime; no calibration is needed.
+With MTP4, set `--kv-cache-dtype int8` to select planar INT8 explicitly.
+The draft inherits INT8 unless `speculative_config.kv_cache_dtype` specifies
+another supported format, such as FP16. Scales are computed per token and head
+at runtime.
 
 On the measured sets, INT8 has slightly lower KL and similar top-1 agreement to
 E4M3. This has not established a difference in task-level answer quality.
 
-Capacity is 1.1–1.3% lower than E4M3. Prefill speed is within ±1.3%; decoding is
-about 5–8% slower. CPU offload works; the disk tier is not supported with INT8 yet.
+The built-in offloading connector supports CPU and SSD persistence of planar
+INT8, including its scale planes. See [KV offload](kv-offload.md).
 
 ## Standard NVFP4
 
@@ -411,13 +423,13 @@ add graphs: check the startup log after changing them.
 
 ### KV cache format
 
-For QSA models, `--kv-cache-dtype auto` selects `fp8_per_token_head`: planar
-E4M3 with a dynamic scale per token and head. It needs no calibrated KV scales,
-so the NVFP4 checkpoint works without the scale pack. `int8` also computes its
-scales at runtime. `fp8_e4m3` needs calibrated scales, which the
-[pack](#standard-nvfp4-checkpoint-setup) supplies; the launch example there
-selects it explicitly. With MTP, the draft must use the same KV format as the
-target. See [KV scales and draft selection](#kv-scales-and-draft-selection).
+On SM70, `--kv-cache-dtype auto` selects planar INT8 for eligible QSA models.
+It computes scales at runtime, so the NVFP4 checkpoint works without the
+scale pack. The explicit planar `fp8_per_token_head` option also computes
+scales at runtime. Calibrated `fp8_e4m3` uses the scales that the
+[pack](#standard-nvfp4-checkpoint-setup) supplies. MTP inherits the target format
+by default and supports an explicit FP16 draft on eligible configurations.
+See [KV scales and draft selection](#kv-scales-and-draft-selection).
 
 ### GPU memory per card
 

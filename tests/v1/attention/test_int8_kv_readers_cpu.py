@@ -3,6 +3,7 @@
 """Execute the production Triton reader on CPU with TRITON_INTERPRET=1."""
 
 import os
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -61,6 +62,110 @@ def test_interpreted_e4m3_reader_against_float64():
         _check_reader(5, 1, 832, repeat, FP8_E4M3_PER_TOKEN_HEAD, block=64)
 
 
+@pytest.mark.parametrize(
+    "heads,draft,reuse,expected",
+    [
+        (6, False, False, "grouped"),
+        (6, True, True, "decode"),
+        (12, True, False, "grouped"),
+        (12, True, True, "triton"),
+    ],
+)
+def test_per_vector_draft_decode_uses_h6_reader(
+    heads, draft, reuse, expected, monkeypatch
+):
+    from vllm.forward_context import ForwardContext, override_forward_context
+    from vllm.models.qwen4_exp.nvidia.ops import qsa
+
+    rows = 8
+    _, _, view = cache()
+    q = torch.empty((rows, heads, 256), dtype=torch.float16)
+    indices = torch.empty((rows, 2051), dtype=torch.int32)
+    requests = torch.zeros(rows, dtype=torch.int32)
+    positions = torch.arange(rows)
+    table = torch.zeros((1, 1), dtype=torch.int32)
+    lengths = torch.tensor([rows], dtype=torch.int32)
+    calls = []
+    monkeypatch.setattr(reader, "native_decode", lambda *a, **k: calls.append("decode"))
+    monkeypatch.setattr(
+        reader, "native_grouped", lambda *a, **k: calls.append("grouped")
+    )
+
+    monkeypatch.setattr(
+        reader, "triton_attention", lambda *a, **k: calls.append("triton")
+    )
+
+    context = ForwardContext({}, None, {})
+    if draft:
+        context.additional_kwargs["sm70_qsa_draft_decode"] = True
+    if reuse:
+        context.additional_kwargs["qsa_reuses_mtp_selection"] = True
+    with override_forward_context(context):
+        qsa.qsa_sparse_paged_attention(
+            q,
+            view.key,
+            view.value,
+            indices,
+            table,
+            requests,
+            query_positions=positions,
+            sequence_lengths=lengths,
+            kv_cache_dtype=INT8.name,
+            **view.scale_kwargs,
+        )
+    assert calls == [expected]
+
+
+def test_reused_scalar_e4m3_selection_falls_back_without_batch_xqa(monkeypatch):
+    from vllm.forward_context import ForwardContext, override_forward_context
+    from vllm.models.qwen4_exp.nvidia.ops import qsa
+
+    def unexpected_xqa(*args):
+        pytest.fail("Batch XQA was launched with VLLM_FLASH_V100_E4M3_BATCH_XQA=0")
+
+    native = SimpleNamespace(decode_paged_xqa_fwd=unexpected_xqa)
+    monkeypatch.setitem(
+        sys.modules,
+        "flash_attn_v100.flash_attn_interface",
+        SimpleNamespace(flash_attn_v100_cuda=native),
+    )
+    monkeypatch.setenv("VLLM_FLASH_V100_E4M3_BATCH_XQA", "0")
+    monkeypatch.setattr(qsa, "_SM70_QSA_GROUPED_PAGE4", True)
+    monkeypatch.setattr(qsa, "_qsa_grouped_page4_supported", lambda *args: True)
+    monkeypatch.setattr(
+        qsa, "_qsa_sparse_paged_attention_sm70_xqa_page4_batch", unexpected_xqa
+    )
+
+    rows = 24
+    query = torch.empty((rows, 6, 256), dtype=torch.float16)
+    kv = torch.empty((1, 16, 1, 256), dtype=torch.uint8)
+    indices = torch.empty((rows, 2051), dtype=torch.int32)
+    table = torch.zeros((1, 1), dtype=torch.int32)
+    requests = torch.zeros(rows, dtype=torch.int32)
+    positions = torch.arange(rows)
+    lengths = torch.tensor([rows], dtype=torch.int32)
+    context = ForwardContext({}, None, {})
+    context.additional_kwargs["qsa_reuses_mtp_selection"] = True
+    with override_forward_context(context):
+        assert (
+            qsa._qsa_sparse_paged_attention_sm70_xqa_page4(
+                query,
+                kv,
+                kv,
+                indices,
+                table,
+                requests,
+                positions,
+                lengths,
+                torch.empty_like(query),
+                "fp8_e4m3",
+                1.0,
+                1.0,
+            )
+            is None
+        )  # The caller falls through to the Triton reader.
+
+
 @pytest.mark.parametrize("codec", [INT8, FP8_E4M3_PER_TOKEN_HEAD])
 def test_planar_union_prefill_uses_scalar_workspace_bound(codec, monkeypatch):
     from vllm.models.qwen4_exp.nvidia.ops import qsa
@@ -91,7 +196,6 @@ def test_planar_union_prefill_uses_scalar_workspace_bound(codec, monkeypatch):
 
             return launch
 
-    monkeypatch.setattr(reader, "require_int8_abi", lambda: None)
     monkeypatch.setattr(reader, "_int8_sparse_kernel", Kernel())
     result = qsa.qsa_sparse_paged_attention(
         query,
@@ -124,6 +228,9 @@ def test_e4m3_forward_passes_planes_and_actual_rows(sharded, monkeypatch):
         qsa_dcp_sharded=sharded,
         _k_scale_float=1.0,
         _v_scale_float=1.0,
+        qsa_draft_native_scales=None,
+        sm70_qsa_paged_fp16_h12=False,
+        sm70_qsa_device_history=False,
         dcp_local_indices_buffer=torch.empty_like(ids),
         dcp_partial_output_buffer=torch.empty(5, 12, 256),
         dcp_partial_lse_buffer=torch.empty(5, 12),
@@ -142,7 +249,10 @@ def test_e4m3_forward_passes_planes_and_actual_rows(sharded, monkeypatch):
 
     monkeypatch.setattr(qsa, "qsa_sparse_paged_attention", attend)
     monkeypatch.setattr(qsa_dcp, "qsa_localize_dcp_indices", lambda src, dst, **kw: src)
-    group = SimpleNamespace(all_gather=lambda tensor, dim: tensor.repeat(1, 2, 1))
+    group = SimpleNamespace(
+        all_gather=lambda tensor, dim: tensor.repeat(1, 2, 1),
+        device_communicator=None,
+    )
     monkeypatch.setattr(distributed, "get_dcp_group", lambda: group)
 
     def combine(partial, lse, group, **kwargs):
@@ -267,24 +377,33 @@ def test_reject_invalid_scale_planes(kind):
         reader.validate_planes(q, v.key, v.value, sk, v.value_scale)
 
 
-def test_fail_closed_native_abi(monkeypatch):
-    import sys
+@pytest.mark.parametrize("cache_dtype", ["int8", "fp8_per_token_head"])
+def test_qsa_per_vector_requires_native_page4_abi(cache_dtype, monkeypatch):
+    from vllm.models.qwen4_exp.nvidia import qsa
 
+    def init(self):
+        self.kv_cache_dtype = cache_dtype
+        self.dcp_world_size = 1
+
+    monkeypatch.setattr(qsa.FlashAttentionImpl, "__init__", init)
+    monkeypatch.setattr(qsa, "is_flash_attn_varlen_func_available", lambda: True)
+    native = SimpleNamespace(int8_page4_abi_version=lambda: 1)
     monkeypatch.setitem(
         sys.modules,
         "flash_attn_v100.flash_attn_interface",
-        SimpleNamespace(flash_attn_v100_cuda=SimpleNamespace()),
+        SimpleNamespace(flash_attn_v100_cuda=native),
     )
     with pytest.raises(RuntimeError, match="ABI v2"):
-        reader.require_int8_abi()
+        qsa.Qwen4ExpQSAFlashAttentionImpl()
+    native.int8_page4_abi_version = lambda: 2
+    qsa.Qwen4ExpQSAFlashAttentionImpl()
 
 
 @pytest.mark.parametrize("rows", [1, 5, 8, 17, 20, 40])
-def test_interpreted_dense_draft(rows, monkeypatch):
+def test_interpreted_dense_draft(rows):
     from vllm.v1.attention.backend import AttentionType
     from vllm.v1.attention.ops import int8_dense
 
-    monkeypatch.setattr(int8_dense, "require_int8_abi", lambda: None)
     torch.manual_seed(35)
     _, carrier, view = cache()
     view.key.random_(-128, 128)
@@ -327,7 +446,6 @@ def test_dense_writer_uses_borrowed_planar_scales(monkeypatch):
     from vllm import _custom_ops as ops
     from vllm.v1.attention.ops import int8_dense
 
-    monkeypatch.setattr(int8_dense, "require_int8_abi", lambda: None)
     received = []
     monkeypatch.setattr(
         ops, "reshape_and_cache_flash", lambda *a, **kw: received.append((a, kw))
@@ -419,3 +537,45 @@ def test_late_scale_preserves_tiny_fp32_value_residual():
     # Early Half KV or one Half P*sV both cancel this exact residual to zero.
     expected = torch.full_like(out, 2.0**-33)
     torch.testing.assert_close(out, expected, atol=0, rtol=1e-5)
+
+
+@pytest.mark.parametrize("codec", [INT8, FP8_E4M3_PER_TOKEN_HEAD])
+def test_compacted_empty_splits_are_bitwise(codec, monkeypatch):
+    from vllm.models.qwen4_exp.nvidia.ops import qsa
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(
+        current_platform, "is_device_capability", lambda capability: capability == 70
+    )
+    _, _, view = cache(codec=codec)
+    view.key.fill_(1)
+    view.value.fill_(2)
+    view.key_scale.fill_(0.5)
+    view.value_scale.fill_(0.125)
+    query = torch.zeros((2, 12, 256), dtype=torch.float16)
+    indices = torch.full((2, 83), -1, dtype=torch.int32)
+    indices[0, :17] = torch.arange(17, dtype=torch.int32)
+    table = torch.arange(view.key.shape[0], dtype=torch.int32)[None, :]
+    requests = torch.zeros(2, dtype=torch.int32)
+    results = []
+    for compacted in (False, True):
+        out = torch.empty_like(query, dtype=torch.float32)
+        lse = torch.empty_like(query[..., 0], dtype=torch.float32)
+        qsa.qsa_sparse_paged_attention(
+            query,
+            view.key,
+            view.value,
+            indices,
+            table,
+            requests,
+            out,
+            kv_cache_dtype=codec.name,
+            lse=lse,
+            k_scale_cache=view.key_scale,
+            v_scale_cache=view.value_scale,
+            compacted_indices=compacted,
+        )
+        results.append((out, lse))
+    assert all(torch.equal(a, b) for a, b in zip(*results))
+    assert not results[1][0][1].count_nonzero()
+    assert torch.isneginf(results[1][1][1]).all()

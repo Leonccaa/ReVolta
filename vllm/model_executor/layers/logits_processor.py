@@ -176,8 +176,22 @@ def _maybe_sync_top1_all_gather(
         torch.cuda.current_stream(local_pair.device).synchronize()
 
 
-# --8<-- [start:logits_processor]
+class CachedLogitsFallback:
+    """Retained TP-local projection, gathered whole or by rows on demand."""
+
+    def __init__(self, processor: "LogitsProcessor", logits: torch.Tensor):
+        self.processor = processor
+        self.logits = logits
+
+    def __call__(self) -> torch.Tensor | None:
+        return self.processor._gather_cached_logits(self.logits)
+
+    def gather_rows(self, rows: torch.Tensor) -> torch.Tensor | None:
+        return self.processor._gather_cached_logits(self.logits.index_select(0, rows))
+
+
 @PluggableLayer.register("logits_processor")
+# --8<-- [start:logits_processor]
 class LogitsProcessor(PluggableLayer):
     """Process logits and apply logits processors from sampling metadata.
 
@@ -335,6 +349,32 @@ class LogitsProcessor(PluggableLayer):
 
         return local_max_vals, global_indices
 
+    def _get_local_top1_pair(
+        self,
+        lm_head: VocabParallelEmbedding,
+        hidden_states: torch.Tensor,
+        embedding_bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        values, indices = self.get_local_top1(lm_head, hidden_states, embedding_bias)
+        # Use float32 to avoid bf16 precision loss on vocabulary indices.
+        return torch.stack([values.float(), indices.float()], dim=-1)
+
+    def _maybe_sm70_top1x(self, local_pair: torch.Tensor) -> torch.Tensor | None:
+        """Two-hop NVLink top-1 exchange when kernel_config.sm70_top1x is set."""
+        from vllm.distributed.device_communicators.sm70_hc_ll import get_tp_hc_ll
+
+        ll = get_tp_hc_ll()
+        runtime = ll.hcx if ll is not None else None
+        if (
+            runtime is None
+            or not runtime.top1_enabled
+            or not 1 <= local_pair.shape[0] <= 64
+            or torch.compiler.is_compiling()
+        ):
+            return None
+        logger.info_once("SM70 two-hop top1 exchange enabled.")
+        return runtime.top1(local_pair)
+
     def get_top_tokens(
         self,
         lm_head: VocabParallelEmbedding,
@@ -348,20 +388,23 @@ class LogitsProcessor(PluggableLayer):
                 "non-positive logit scaling factors."
             )
         tp_size = get_tensor_model_parallel_world_size()
-        local_max_vals, global_indices = self.get_local_top1(
-            lm_head, hidden_states, embedding_bias
-        )
         if tp_size == 1:
+            _, global_indices = self.get_local_top1(
+                lm_head, hidden_states, embedding_bias
+            )
             self._maybe_dump_top_token_margin(
                 lm_head, hidden_states, embedding_bias, global_indices
             )
             return global_indices
 
         # All-gather (value, index) pairs, then reduce to global argmax.
-        # Use float32 to avoid bf16 precision loss on large vocab indices.
-        local_pair = torch.stack(
-            [local_max_vals.float(), global_indices.float()], dim=-1
-        )
+        local_pair = self._get_local_top1_pair(lm_head, hidden_states, embedding_bias)
+        exchanged = self._maybe_sm70_top1x(local_pair)
+        if exchanged is not None:
+            self._maybe_dump_top_token_margin(
+                lm_head, hidden_states, embedding_bias, exchanged
+            )
+            return exchanged
         _maybe_sync_top1_all_gather(self, local_pair)
         custom_top_tokens = self._maybe_custom_top1_argmax(local_pair)
         if custom_top_tokens is not None:
@@ -698,7 +741,7 @@ class LogitsProcessor(PluggableLayer):
             )
         fallback = None
         if local_logits is not None:
-            fallback = lambda: self._gather_cached_logits(local_logits)
+            fallback = CachedLogitsFallback(self, local_logits)
         return top_indices.to(torch.int64), top_vals.float(), fallback
 
     def _maybe_dump_top_token_margin(

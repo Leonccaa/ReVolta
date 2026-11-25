@@ -410,8 +410,9 @@ class LongContextKVConfig:
     """Archive superseded checkpoints on SSD before releasing their RAM."""
     host_store_gib: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     """Unified host budget across MAIN, STATE and DRAFT, summed over workers.
-    Includes ZERO_PAGE and build reservations. Mutually exclusive with the
-    legacy host_pool_gib/host_pool_tokens and connector cpu_bytes_to_use."""
+    Includes ZERO_PAGE and frames held by active checkpoint builds. Mutually
+    exclusive with legacy host_pool_gib/host_pool_tokens and connector
+    cpu_bytes_to_use."""
     host_pool_gib: float | None = Field(default=None, gt=0)
     """Host history pool for the main QSA K/V, in GiB summed over all workers
     (like ``kv_offloading_size``). Exactly one of this and
@@ -466,14 +467,14 @@ class LongContextKVConfig:
     """Stage eager prefill writes on device and submit merged same-stream D2H
     copies. Decode/capture uses word-vectorized UVA. False retains the legacy
     writer. Byte-preserving and excluded from compile and SSD identities."""
-    prefill_gather: Literal["passes", "union"] = "passes"
-    """Mixed steps with ``main_kv_placement="host"``. ``passes``: remap the
-    selection in query-row passes that fit the hot slots (R_cap rows each).
-    ``union`` (selection-union gather): fill the union of the step's selections into hot
-    slots
-    once per window of whole eight-row groups and run the GPU arm's attention
-    call unchanged on a page-size-4 table, so the result does not depend on
-    the window split. Decode steps are unaffected."""
+    prefill_gather: Literal["passes", "union"] = "union"
+    """Mixed steps with ``main_kv_placement="host"``. ``union`` (default,
+    selection-union gather): fill the union of the step's selections into
+    hot slots once per window of whole eight-row groups and run the GPU arm's
+    attention call unchanged on a page-size-4 table, so the result does not
+    depend on the window split. ``passes``: remap the selection in query-row
+    passes that fit the hot slots (R_cap rows each). Decode steps are
+    unaffected."""
     prefill_insert_age: Literal["old", "recent"] = "old"
     """``union`` only: hot groups that only prefill rows want are inserted
     as old (first evicted) or recent."""
@@ -518,8 +519,28 @@ class LongContextKVConfig:
 
 
 @config
+class TopologyAllReduceConfig:
+    """Experimental measured single-node CUDA IPC all-reduce selection."""
+
+    enabled: bool = False
+    """Qualify and select routes before first model compilation and capture."""
+
+    precision: Literal["fp16", "fp32"] = "fp16"
+    """Use FP16 sums/transfers by default; opt into FP32 sums and partial
+    transfers for accuracy at higher latency. Input and output stay FP16."""
+
+    cache_dir: str | None = None
+    """Selection cache directory; None uses PyTorch's default extension root."""
+
+
+@config
 class KernelConfig:
     """Configuration for kernel selection and warmup behavior."""
+
+    topology_all_reduce: TopologyAllReduceConfig = Field(
+        default_factory=TopologyAllReduceConfig
+    )
+    """Opt-in topology-aware peer reduction with startup measured selection."""
 
     ir_op_priority: IrOpPriorityConfig = Field(default_factory=IrOpPriorityConfig)
     """
@@ -576,6 +597,9 @@ class KernelConfig:
     sm70_rmsnorm_gated_exact: bool | None = None
     """Native gated norm; auto follows the Flash-Next model quality boundary."""
 
+    sm70_dflash2_fp16_m8: bool = False
+    """Opt in to packed FP16 M8 DFlash2 draft projections on SM70 TP4."""
+
     def resolve_sm70_rmsnorm_gated(self, *, qualified: bool) -> None:
         if self.sm70_rmsnorm_gated_exact is not None:
             return
@@ -628,7 +652,7 @@ class KernelConfig:
     """Observed selector decisions for loaded local layouts; diagnostic only."""
 
     qsa_auto_e4m3: bool = True
-    """Default eligible QSA auto caches to planar per-token-head E4M3."""
+    """Resolve eligible QSA auto caches to planar INT8 on SM70 and E4M3 elsewhere."""
     qsa_auto_e4m3_active: bool = Field(default=False, init=False)
     """Whether automatic QSA E4M3 storage was selected."""
     qsa_auto_e4m3_reason: str | None = Field(default=None, init=False)
@@ -638,13 +662,54 @@ class KernelConfig:
     """Share FP16 indexer keys across M2..8 queries of one request on SM70
     (1CatAI #1127; opt-in here, also VLLM_SM70_QSA_SHARED_KEY=1)."""
 
-    qsa_dcp_index_shard: bool = False
+    sm70_qsa_fused_topk: bool = False
+    """Use native fused scoring and exact Top-512 for replicated SM70 QSA
+    decode and verification batches."""
+
+    sm70_qsa_paged_fp16_h12: bool = False
+    """Use the native FP16 paged QSA reader for eligible TP4/DCP2 target
+    decode on SM70. Its reduction and probability rounding differ."""
+
+    sm70_qsa_paged_fp16_h6: bool | None = None
+    """Use the native FP16 paged QSA reader in replicated MTP decode graphs
+    on SM70. When unset, enable it in the SM70 TP4/DCP2 NVFP4 profile with
+    async MTP and FP16 GPU KV. Its reduction and probability rounding differ."""
+
+    sm70_qsa_device_history: bool = False
+    """Use native SM70 QSA GPU-cache reads for eligible TP4/DCP2 decode
+    and verification batches. This changes the local attention arithmetic."""
+
+    sm70_qsa_input_batch: bool = False
+    """Pack and fuse the two checkpoint-FP16 QSA input projections in the
+    SM70 TP4 NVFP4 target MTP decode graph."""
+
+    sm70_mtp_draft_qpn8: bool = True
+    """Requantize the Qwen4Exp native MTP drafter's decoder projections to
+    channel-QPN8 on SM70. Only draft proposals change; verification uses the
+    target's own weights."""
+
+    sm70_gdn_input_v154: bool = False
+    """Use the v154 packed GDN inputs for physical M3/M4 during SM70 target
+    FULL graph capture. Other rows keep their existing path."""
+
+    sm70_gdn_input_skinny_k4: bool = False
+    """Use four K warps in the SM70 row-major FP16 GDN input projection.
+
+    Uses the original weights without a workspace. The changed FP32
+    accumulation order is not bitwise equivalent to the default. On four
+    PCIe V100s at fixed K3, warm 32K C1 took 1.23% less time per round and
+    short C2 saved 0.096 ms at the paired median. The packed path retains
+    its existing precedence.
+    """
+
+    qsa_dcp_index_shard: bool | None = None
     """Shard the target QSA compressed indexer keys over the DCP group.
 
     Group g is owned by DCP rank ``g % dcp`` at local column ``g // dcp``. Each
     rank scores only its own groups; local top-k candidates are merged across
-    the group into the unchanged global selection. Requires DCP > 1; the MTP
-    draft indexer stays replicated.
+    the group into the unchanged global selection. Unset enables sharding only
+    for DFlash2 with 512 selected groups under the ReVolta hybrid serving profile.
+    Sharding takes effect with DCP > 1. GPU MTP keeps the replicated default.
     """
 
     long_context_kv: LongContextKVConfig = Field(default_factory=LongContextKVConfig)
@@ -681,6 +746,41 @@ class KernelConfig:
     """Verify greedy MTP drafts from TP-local target argmax pairs instead of
     gathering full-vocabulary logits for the rejection sampler."""
 
+    sm70_sparse_target_sampling: bool | Literal["device_top64"] = False
+    """Compact target sampling for SM70 MRv2 with uniform MTP3-5,
+    greedy drafts and target temperature=1, top_k=20, top_p=0.95.
+    False keeps the existing fallback; True uses guarded compact sampling
+    with dense reference sampling for ambiguous cutoffs. "device_top64"
+    applies the rank-20 score cutoff, including ties, within the existing
+    FP32 Top64 on device, then applies top-p. Support is deliberately bounded
+    at 64 even if unseen vocabulary entries tie at the cutoff. FP32 top-p
+    CDF rounding near the cutoff can change the retained boundary token
+    versus dense sampling; this mode does not fall back for these cutoffs.
+    Unsupported batches keep the existing fallback in either compact mode.
+    """
+    sm70_nvlink_hc_active: bool = Field(default=False, init=False)
+    """Resolved TP hardware admission, which changes the compiled HC graph."""
+
+    sm70_hc_ll_async: bool = False
+    """Allow the usual SM70 NVLink HC LL admission under async scheduling."""
+
+    sm70_hc_moe_dual_partial: bool = False
+    """Pass separate routed and shared expert outputs into NVLink HC on
+    Flash-Next decode. Independent of HCX admission. HCX accumulates both
+    partials in FP32, so its dual-input path can change numerical results.
+    """
+
+    sm70_hcx: bool = False
+    """Use local-schedule HCX at Flash-Next attention-to-MLP and MoE-to-next-
+    attention HyperConnection boundaries in uniform decode graphs of at most
+    eight rows. Requires admitted NVLink HC LL. Changes FP16 rounding."""
+    sm70_top1x: bool = False
+    """Exchange TP4 greedy top-1 candidates over the admitted NVLink HC LL peers
+    in two hops instead of an all-gather (1CatAI v1.5.4). Selects the same token
+    as the all-gather for finite logits."""
+    sm70_hcx_active: bool = Field(default=False, init=False)
+    """HCX operator/weight preparation changed the target compiler graph."""
+
     ple_result_transport: Literal["auto", "cuda", "mapped"] = "auto"
     """Select CPU PLE result transport by local operator/resource capability."""
     ple_result_transports: dict[str, Any] = Field(
@@ -716,6 +816,7 @@ class KernelConfig:
         Any future fields that don't affect compilation should be excluded.
         """
         ignored_factors = {
+            "topology_all_reduce",  # Include enabled math policy below, not cache path.
             "enable_flashinfer_autotune",
             "ir_op_priority",  # handled separately below
             "linear_kernel_selections",
@@ -728,13 +829,31 @@ class KernelConfig:
             "ple_input_prepare",  # Input staging is outside the compiled model.
             "ple_input_preparations",
             "qsa_auto_e4m3_reason",
-            # Sampler-only switch; it does not change any compiled graph.
+            # Sampler-only switches; they do not change the compiled model.
             "sm70_greedy_verify",
+            "sm70_top1x",
+            "sm70_sparse_target_sampling",
+            "sm70_hc_ll_async",  # Compiled model uses sm70_nvlink_hc_active.
             # Scheduler-only prefix-hit check; no compiled graph changes.
             "qsa_cross_group_hit_check",
         }
+        if not self.sm70_qsa_fused_topk:
+            ignored_factors.add("sm70_qsa_fused_topk")
+        if not self.sm70_qsa_paged_fp16_h6:
+            ignored_factors.add("sm70_qsa_paged_fp16_h6")
+        if not self.sm70_gdn_input_skinny_k4:
+            ignored_factors.add("sm70_gdn_input_skinny_k4")
         if not self.sm70_skinny_moe_applicable:
             ignored_factors.add("sm70_skinny_moe")
+        if not self.sm70_dflash2_fp16_m8:
+            ignored_factors.add("sm70_dflash2_fp16_m8")
+        if not self.sm70_nvlink_hc_active:
+            ignored_factors.add("sm70_nvlink_hc_active")
+        if not self.sm70_hc_moe_dual_partial:
+            ignored_factors.add("sm70_hc_moe_dual_partial")
+        ignored_factors.add("sm70_hcx")  # Only resolved preparation changes the graph.
+        if not self.sm70_hcx_active:
+            ignored_factors.add("sm70_hcx_active")
         if not self.fused_fp16_aux_gemv_applicable:
             ignored_factors.add("fused_fp16_aux_gemv")
         if not self.qsa_auto_e4m3_active:
@@ -758,6 +877,10 @@ class KernelConfig:
             # An unused mode must not perturb existing graph caches.
             ignored_factors.add("long_context_kv")
         factors = get_hash_factors(self, ignored_factors)
+        if self.topology_all_reduce.enabled:
+            factors["topology_all_reduce"] = dict(
+                enabled=True, precision=self.topology_all_reduce.precision
+            )
         if "long_context_kv" in factors:
             # Scheduler-only arbitration knobs keep the previous identity.
             lc_factor = factors["long_context_kv"]

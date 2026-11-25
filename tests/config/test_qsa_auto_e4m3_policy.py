@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Automatic QSA storage selects dynamic planar E4M3 scales."""
+"""Automatic QSA cache selection and SM70 MTP draft defaults."""
 
 import json
 import os
@@ -11,7 +11,10 @@ import torch
 from safetensors.torch import save_file
 
 from vllm.config import KernelConfig
-from vllm.models.qwen4_exp.common.kv_policy import resolve_qsa_auto_e4m3
+from vllm.models.qwen4_exp.common.kv_policy import (
+    resolve_qsa_auto_cache_dtype,
+    resolve_qsa_int8_aliases,
+)
 from vllm.models.qwen4_exp.nvidia.ops import qsa
 from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD
 
@@ -32,6 +35,10 @@ def _checkpoint(tmp_path, scales=None):
         dtype=torch.float16,
         hf_text_config=SimpleNamespace(
             indexer_n_heads=3,
+            indexer_kv_heads=1,
+            indexer_head_dim=128,
+            indexer_budget=512,
+            indexer_compress_ratio=4,
             layer_types=["full_attention", "linear_attention", "full_attention"],
         ),
     )
@@ -53,17 +60,48 @@ def _config(model):
     )
 
 
+@pytest.mark.parametrize("target_dtype", ["int8", "int8_per_token_head"])
+@pytest.mark.parametrize("draft_dtype", [None, "int8", "int8_per_token_head"])
+def test_qsa_int8_spellings_share_the_internal_format(
+    tmp_path, target_dtype, draft_dtype
+):
+    cfg = _config(_checkpoint(tmp_path))
+    cfg.cache_config.cache_dtype = target_dtype
+    cfg.speculative_config = SimpleNamespace(method="mtp", kv_cache_dtype=draft_dtype)
+    resolve_qsa_int8_aliases(cfg)
+    assert cfg.cache_config.cache_dtype == "int8"
+    assert cfg.speculative_config.kv_cache_dtype == (draft_dtype and "int8")
+
+
+def test_non_qsa_int8_per_token_head_retains_its_format(tmp_path):
+    cfg = _config(_checkpoint(tmp_path))
+    cfg.model_config.hf_text_config = SimpleNamespace()
+    cfg.cache_config.cache_dtype = "int8_per_token_head"
+    resolve_qsa_int8_aliases(cfg)
+    assert cfg.cache_config.cache_dtype == "int8_per_token_head"
+
+
 @pytest.mark.parametrize("tp", [1, 2, 4, 8])
 def test_auto_admission_uses_capability(tmp_path, monkeypatch, tp):
     cfg = _config(_checkpoint(tmp_path))
     cfg.parallel_config.tensor_parallel_size = tp
     monkeypatch.setattr(qsa, "qsa_e4m3_capability_reason", lambda dtype: None)
+    monkeypatch.setattr(qsa.current_platform, "is_device_capability", lambda _: False)
     before = dict(os.environ)
-    assert resolve_qsa_auto_e4m3(cfg)
+    assert resolve_qsa_auto_cache_dtype(cfg)
     assert cfg.cache_config.cache_dtype == FP8_E4M3_PER_TOKEN_HEAD.name
     assert cfg.kernel_config.qsa_auto_e4m3_active
     assert cfg.kernel_config.qsa_auto_e4m3_reason is None
     assert dict(os.environ) == before
+
+
+def test_sm70_auto_selects_int8(tmp_path, monkeypatch):
+    cfg = _config(_checkpoint(tmp_path))
+    monkeypatch.setattr(qsa.current_platform, "is_device_capability", lambda _: True)
+    monkeypatch.setattr(qsa, "qsa_e4m3_capability_reason", lambda dtype: None)
+    assert resolve_qsa_auto_cache_dtype(cfg)
+    assert cfg.cache_config.cache_dtype == "int8"
+    assert not cfg.kernel_config.qsa_auto_e4m3_active
 
 
 @pytest.mark.parametrize(
@@ -86,7 +124,7 @@ def test_unqualified_route_retains_cache_dtype(tmp_path, monkeypatch, mode):
     if mode == "pcp":
         cfg.parallel_config.prefill_context_parallel_size = 2
     previous = cfg.cache_config.cache_dtype
-    assert not resolve_qsa_auto_e4m3(cfg)
+    assert not resolve_qsa_auto_cache_dtype(cfg)
     assert cfg.cache_config.cache_dtype == previous
     assert cfg.kernel_config.qsa_auto_e4m3_reason
 
@@ -95,19 +133,26 @@ def test_without_qsa_metadata_keeps_auto(tmp_path, monkeypatch):
     cfg = _config(_checkpoint(tmp_path))
     monkeypatch.setattr(qsa, "qsa_e4m3_capability_reason", lambda dtype: None)
     cfg.model_config.hf_text_config.indexer_n_heads = 0
-    assert not resolve_qsa_auto_e4m3(cfg)
+    assert not resolve_qsa_auto_cache_dtype(cfg)
     cfg.model_config = None
-    assert not resolve_qsa_auto_e4m3(cfg)
+    assert not resolve_qsa_auto_cache_dtype(cfg)
 
 
-def test_speculative_draft_config_keeps_its_dtype(tmp_path, monkeypatch):
+def test_speculative_draft_keeps_its_dtype_and_target_policy(tmp_path, monkeypatch):
     # DFlash builds its drafter from the target VllmConfig with
     # is_speculative_draft=True and cache_dtype "auto" (FP16 on SM70).
-    cfg = _config(_checkpoint(tmp_path))
-    cfg.is_speculative_draft = True
+    target = _config(_checkpoint(tmp_path))
     monkeypatch.setattr(qsa, "qsa_e4m3_capability_reason", lambda dtype: None)
-    assert not resolve_qsa_auto_e4m3(cfg)
-    assert cfg.cache_config.cache_dtype == "auto"
+    monkeypatch.setattr(qsa.current_platform, "is_device_capability", lambda _: False)
+    assert resolve_qsa_auto_cache_dtype(target)
+    draft = SimpleNamespace(**vars(target))
+    draft.is_speculative_draft = True
+    draft.cache_config = SimpleNamespace(**vars(target.cache_config))
+    draft.cache_config.cache_dtype = "auto"
+    assert not resolve_qsa_auto_cache_dtype(draft)
+    assert draft.cache_config.cache_dtype == "auto"
+    assert target.kernel_config.qsa_auto_e4m3_active
+    assert target.kernel_config.qsa_auto_e4m3_reason is None
 
 
 def test_diagnostics_do_not_change_inactive_kernel_hash():
@@ -127,7 +172,8 @@ def test_checkpoint_selects_planar(tmp_path, monkeypatch, method, has_scales):
     cfg = _config(_checkpoint(tmp_path, scales))
     cfg.speculative_config = SimpleNamespace(method=method) if method else None
     monkeypatch.setattr(qsa, "qsa_e4m3_capability_reason", lambda dtype: None)
-    assert resolve_qsa_auto_e4m3(cfg)
+    monkeypatch.setattr(qsa.current_platform, "is_device_capability", lambda _: False)
+    assert resolve_qsa_auto_cache_dtype(cfg)
     assert cfg.cache_config.cache_dtype == FP8_E4M3_PER_TOKEN_HEAD.name
     assert not cfg.cache_config.cache_dtype_from_checkpoint
     assert cfg.kernel_config.qsa_auto_e4m3_active

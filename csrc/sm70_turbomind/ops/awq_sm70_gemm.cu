@@ -7853,27 +7853,17 @@ void awq_moe_single_token_exact_layout_prepare(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void awq_moe_gemm_sm70_out(torch::Tensor out, torch::Tensor sorted_input,
-                           torch::Tensor expert_offsets,
-                           torch::Tensor strided_ptrs_w,
-                           torch::Tensor strided_ptrs_s, int64_t num_experts,
-                           int64_t k, int64_t n, int64_t group_size,
-                           bool gated_silu);
+void awq_moe_gemm_sm70_out(
+    torch::Tensor out, torch::Tensor sorted_input, torch::Tensor expert_offsets,
+    torch::Tensor strided_ptrs_w, torch::Tensor strided_ptrs_s,
+    int64_t num_experts, int64_t k, int64_t n, int64_t group_size,
+    bool gated_silu, const std::optional<torch::Tensor>& int4_zero_workspace);
 
 void awq_moe_gemm_sm70_per_expert_dispatch_out(
     torch::Tensor out, torch::Tensor sorted_input, torch::Tensor expert_offsets,
     torch::Tensor strided_ptrs_w, torch::Tensor strided_ptrs_s,
     int64_t num_experts, int64_t k, int64_t n, int64_t group_size,
-    bool gated_silu);
-
-void awq_moe_gemm_sm70_out_impl(
-    torch::Tensor out, torch::Tensor sorted_input, torch::Tensor expert_offsets,
-    torch::Tensor strided_ptrs_w, torch::Tensor strided_ptrs_s,
-    int64_t num_experts, int64_t k, int64_t n, int64_t group_size,
-    bool gated_silu, torch::Tensor b_group_indices, bool per_expert_dispatch,
-    torch::Tensor reduce_out, torch::Tensor sorted_weights,
-    bool weighted_reduce, int64_t logical_total_tokens,
-    torch::Tensor a_indices);
+    bool gated_silu, const std::optional<torch::Tensor>& int4_zero_workspace);
 
 template <typename index_t>
 __global__ void awq_moe_single_token_prepare_kernel(
@@ -8508,7 +8498,8 @@ void awq_moe_single_token_sm70_out(
     torch::Tensor dst_w13_ptrs_s_rows, torch::Tensor dst_w2_ptrs_w_rows,
     torch::Tensor dst_w2_ptrs_s_rows, torch::Tensor expert_offsets,
     torch::Tensor inv_permuted_idx, int64_t w13_k, int64_t w13_n, int64_t w2_k,
-    int64_t w2_n, int64_t group_size, int64_t hidden_logical_size) {
+    int64_t w2_n, int64_t group_size, int64_t hidden_logical_size,
+    const std::optional<torch::Tensor>& int4_zero_workspace) {
   TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kFloat16,
               "awq_moe_single_token_sm70_out: out must be CUDA float16.");
   TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kFloat16,
@@ -8642,7 +8633,8 @@ void awq_moe_single_token_sm70_out(
 
   awq_moe_gemm_sm70_per_expert_dispatch_out(
       intermediate, compact_input, expert_offsets, dst_w13_ptrs_w_rows,
-      dst_w13_ptrs_s_rows, top_k, w13_k, w13_n, group_size, true);
+      dst_w13_ptrs_s_rows, top_k, w13_k, w13_n, group_size, true,
+      int4_zero_workspace);
   // The weighted-reduce GEMM epilogue accumulates expert CTAs into the same
   // FP16 output with atomicAdd. CTA arrival order is not deterministic, so
   // repeated greedy requests can drift even with identical inputs. Materialize
@@ -8650,7 +8642,8 @@ void awq_moe_single_token_sm70_out(
   // FP32 FMA accumulation.
   awq_moe_gemm_sm70_per_expert_dispatch_out(
       sorted_output, intermediate, expert_offsets, dst_w2_ptrs_w_rows,
-      dst_w2_ptrs_s_rows, top_k, w2_k, w2_n, group_size, false);
+      dst_w2_ptrs_s_rows, top_k, w2_k, w2_n, group_size, false,
+      int4_zero_workspace);
 
   const int hidden_logical_size_i = static_cast<int>(hidden_logical_size);
   const int sorted_output_row_stride =
@@ -8688,7 +8681,8 @@ void awq_moe_gemm_sm70_out_impl(
     torch::Tensor
         strided_ptrs_s,  // [num_experts * 16] uint8 (StridedPtr array)
     int64_t num_experts, int64_t k, int64_t n, int64_t group_size,
-    bool gated_silu, torch::Tensor b_group_indices = torch::Tensor(),
+    bool gated_silu, const std::optional<torch::Tensor>& int4_zero_workspace,
+    torch::Tensor b_group_indices = torch::Tensor(),
     bool per_expert_dispatch = false,
     torch::Tensor reduce_out = torch::Tensor(),
     torch::Tensor sorted_weights = torch::Tensor(),
@@ -8866,9 +8860,15 @@ void awq_moe_gemm_sm70_out_impl(
   if (int4_zero && std::atoi(int4_zero) != 0) {
     TORCH_CHECK(n % 2 == 0 && (n * num_groups_raw * 3) % 4 == 0,
                 "int4 zero expansion requires aligned even-N AWQ banks");
-    expanded_stats = torch::empty({num_experts, num_groups_raw, n, 3},
-                                  strided_ptrs_s.options());
-    expanded_ptrs = torch::empty({num_experts * 16}, strided_ptrs_s.options());
+    const int64_t stats_bytes = num_experts * num_groups_raw * n * 3;
+    const int64_t ptr_bytes = num_experts * sizeof(turbomind::gemm::StridedPtr);
+    if (int4_zero_workspace) {
+      expanded_ptrs = int4_zero_workspace->narrow(0, 0, ptr_bytes);
+      expanded_stats = int4_zero_workspace->narrow(0, ptr_bytes, stats_bytes);
+    } else {
+      expanded_stats = torch::empty({stats_bytes}, strided_ptrs_s.options());
+      expanded_ptrs = torch::empty({ptr_bytes}, strided_ptrs_s.options());
+    }
     const int records = static_cast<int>(num_groups_raw * n);
     const dim3 grid((records + 255) / 256, num_experts);
     awq_moe_expand_int4_zero_kernel<<<grid, 256, 0, stream>>>(
@@ -8935,32 +8935,33 @@ void awq_moe_gemm_sm70_out_impl(
               ").");
 }
 
-void awq_moe_gemm_sm70_out(torch::Tensor out, torch::Tensor sorted_input,
-                           torch::Tensor expert_offsets,
-                           torch::Tensor strided_ptrs_w,
-                           torch::Tensor strided_ptrs_s, int64_t num_experts,
-                           int64_t k, int64_t n, int64_t group_size,
-                           bool gated_silu) {
+void awq_moe_gemm_sm70_out(
+    torch::Tensor out, torch::Tensor sorted_input, torch::Tensor expert_offsets,
+    torch::Tensor strided_ptrs_w, torch::Tensor strided_ptrs_s,
+    int64_t num_experts, int64_t k, int64_t n, int64_t group_size,
+    bool gated_silu, const std::optional<torch::Tensor>& int4_zero_workspace) {
   awq_moe_gemm_sm70_out_impl(out, sorted_input, expert_offsets, strided_ptrs_w,
                              strided_ptrs_s, num_experts, k, n, group_size,
-                             gated_silu);
+                             gated_silu, int4_zero_workspace);
 }
 
 void awq_moe_gemm_sm70_per_expert_dispatch_out(
     torch::Tensor out, torch::Tensor sorted_input, torch::Tensor expert_offsets,
     torch::Tensor strided_ptrs_w, torch::Tensor strided_ptrs_s,
     int64_t num_experts, int64_t k, int64_t n, int64_t group_size,
-    bool gated_silu) {
+    bool gated_silu, const std::optional<torch::Tensor>& int4_zero_workspace) {
   awq_moe_gemm_sm70_out_impl(out, sorted_input, expert_offsets, strided_ptrs_w,
                              strided_ptrs_s, num_experts, k, n, group_size,
-                             gated_silu, torch::Tensor(), true);
+                             gated_silu, int4_zero_workspace, torch::Tensor(),
+                             true);
 }
 
 void awq_moe_indexed_dense_w13_sm70_out(
     torch::Tensor out, torch::Tensor input, torch::Tensor input_row_indices,
     torch::Tensor expert_offsets, torch::Tensor dense_expert_ids,
     torch::Tensor ptrs_w, torch::Tensor ptrs_s, int64_t num_experts, int64_t k,
-    int64_t n, int64_t group_size) {
+    int64_t n, int64_t group_size,
+    const std::optional<torch::Tensor>& int4_zero_workspace) {
   constexpr int kQwen38TopK = 10;
   TORCH_CHECK(input.dim() == 2 && input.size(0) > 0 && input.size(1) == 2560 &&
                   input.scalar_type() == torch::kFloat16 && input.is_cuda() &&
@@ -8999,31 +9000,15 @@ void awq_moe_indexed_dense_w13_sm70_out(
       input, input_row_indices.numel(), num_experts);
   awq_moe_gemm_sm70_out_impl(
       out, input, expert_offsets, ptrs_w, ptrs_s, num_experts, k, n, group_size,
-      false, dense_expert_ids, true, torch::Tensor(), torch::Tensor(), false,
-      input_row_indices.numel(), input_row_indices);
+      false, int4_zero_workspace, dense_expert_ids, true, torch::Tensor(),
+      torch::Tensor(), false, input_row_indices.numel(), input_row_indices);
 }
 
-torch::Tensor awq_moe_gemm_sm70(torch::Tensor sorted_input,
-                                torch::Tensor expert_offsets,
-                                torch::Tensor strided_ptrs_w,
-                                torch::Tensor strided_ptrs_s,
-                                int64_t num_experts, int64_t k, int64_t n,
-                                int64_t group_size) {
-  auto out = torch::empty({sorted_input.size(0), n},
-                          torch::TensorOptions()
-                              .dtype(sorted_input.dtype())
-                              .device(sorted_input.device()));
-  awq_moe_gemm_sm70_out(out, sorted_input, expert_offsets, strided_ptrs_w,
-                        strided_ptrs_s, num_experts, k, n, group_size, false);
-  return out;
-}
-
-void awq_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
-                                  torch::Tensor expert_offsets,
-                                  torch::Tensor dense_expert_ids,
-                                  torch::Tensor ptrs_w, torch::Tensor ptrs_s,
-                                  int64_t num_experts, int64_t k, int64_t n,
-                                  int64_t group_size) {
+void awq_moe_dense_stage_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor expert_offsets,
+    torch::Tensor dense_expert_ids, torch::Tensor ptrs_w, torch::Tensor ptrs_s,
+    int64_t num_experts, int64_t k, int64_t n, int64_t group_size,
+    const std::optional<torch::Tensor>& int4_zero_workspace) {
   TORCH_CHECK(input.is_cuda() && input.scalar_type() == torch::kFloat16,
               "awq_moe_dense_stage_sm70_out: input must be CUDA float16.");
   TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kFloat16,
@@ -9065,7 +9050,8 @@ void awq_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
     torch::Tensor offsets = expert_offsets.narrow(0, expert, 2);
     torch::Tensor expert_idx = dense_expert_ids.narrow(0, expert, 1);
     awq_moe_gemm_sm70_out_impl(out, input, offsets, ptrs_w, ptrs_s, 1, k, n,
-                               group_size, false, expert_idx);
+                               group_size, false, int4_zero_workspace,
+                               expert_idx);
   }
 }
 
@@ -9328,7 +9314,8 @@ void awq_moe_active_dense_stage_sm70_out(
     torch::Tensor out, torch::Tensor input, torch::Tensor permuted_experts_id,
     torch::Tensor active_expert_offsets, torch::Tensor active_expert_ids,
     torch::Tensor ptrs_w, torch::Tensor ptrs_s, int64_t total_slots, int64_t k,
-    int64_t n, int64_t group_size) {
+    int64_t n, int64_t group_size,
+    const std::optional<torch::Tensor>& int4_zero_workspace) {
   TORCH_CHECK(
       input.is_cuda() && input.scalar_type() == torch::kFloat16,
       "awq_moe_active_dense_stage_sm70_out: input must be CUDA float16.");
@@ -9390,7 +9377,7 @@ void awq_moe_active_dense_stage_sm70_out(
       ((k == 2560 && n == 320) || (k == 160 && n == 2560))) {
     awq_moe_gemm_sm70_out_impl(out, input, active_expert_offsets, ptrs_w,
                                ptrs_s, total_slots, k, n, group_size, false,
-                               active_expert_ids, true);
+                               int4_zero_workspace, active_expert_ids, true);
     return;
   }
 
@@ -9398,7 +9385,8 @@ void awq_moe_active_dense_stage_sm70_out(
     torch::Tensor offsets = active_expert_offsets.narrow(0, segment, 2);
     torch::Tensor expert_idx = active_expert_ids.narrow(0, segment, 1);
     awq_moe_gemm_sm70_out_impl(out, input, offsets, ptrs_w, ptrs_s, 1, k, n,
-                               group_size, false, expert_idx);
+                               group_size, false, int4_zero_workspace,
+                               expert_idx);
   }
 }
 
@@ -9505,7 +9493,8 @@ void awq_moe_chunked_w2_sm70_out(
     torch::Tensor chunk_a_indices, torch::Tensor chunk_inv_permuted_idx,
     torch::Tensor ptrs_w, torch::Tensor ptrs_s, int64_t num_tokens,
     int64_t top_k, int64_t num_experts, int64_t k, int64_t n,
-    int64_t hidden_logical_size, int64_t group_size, int64_t chunk_tokens) {
+    int64_t hidden_logical_size, int64_t group_size, int64_t chunk_tokens,
+    const std::optional<torch::Tensor>& int4_zero_workspace) {
   TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kFloat16 &&
                   out.is_contiguous(),
               "awq_moe_chunked_w2_sm70_out: out must be contiguous CUDA "
@@ -9649,9 +9638,9 @@ void awq_moe_chunked_w2_sm70_out(
 
     awq_moe_gemm_sm70_out_impl(
         chunk_output.narrow(0, 0, current_slots), input, chunk_expert_offsets,
-        ptrs_w, ptrs_s, num_experts, k, n, group_size, false, torch::Tensor(),
-        false, torch::Tensor(), torch::Tensor(), false, current_slots,
-        chunk_a_indices);
+        ptrs_w, ptrs_s, num_experts, k, n, group_size, false,
+        int4_zero_workspace, torch::Tensor(), false, torch::Tensor(),
+        torch::Tensor(), false, current_slots, chunk_a_indices);
 
     awq_moe_chunk_weighted_reduce_kernel<<<current_tokens, kThreads, 0,
                                            stream>>>(
@@ -9670,7 +9659,8 @@ void awq_moe_chunked_w2_sm70_out(
 void awq_moe_single_token_dense_stage_sm70_out(
     torch::Tensor out, torch::Tensor input, torch::Tensor expert_offsets,
     torch::Tensor sorted_expert_ids, torch::Tensor ptrs_w, torch::Tensor ptrs_s,
-    int64_t top_k, int64_t k, int64_t n, int64_t group_size) {
+    int64_t top_k, int64_t k, int64_t n, int64_t group_size,
+    const std::optional<torch::Tensor>& int4_zero_workspace) {
   TORCH_CHECK(
       input.is_cuda() && input.scalar_type() == torch::kFloat16,
       "awq_moe_single_token_dense_stage_sm70_out: input must be CUDA float16.");
@@ -9708,14 +9698,16 @@ void awq_moe_single_token_dense_stage_sm70_out(
     torch::Tensor offsets = expert_offsets.narrow(0, route, 2);
     torch::Tensor expert_idx = sorted_expert_ids.narrow(0, route, 1);
     awq_moe_gemm_sm70_out_impl(out, input, offsets, ptrs_w, ptrs_s, 1, k, n,
-                               group_size, false, expert_idx);
+                               group_size, false, int4_zero_workspace,
+                               expert_idx);
   }
 }
 
 void awq_moe_single_token_indexed_dense_stage_sm70_out(
     torch::Tensor out, torch::Tensor input, torch::Tensor expert_offsets,
     torch::Tensor sorted_expert_ids, torch::Tensor ptrs_w, torch::Tensor ptrs_s,
-    int64_t top_k, int64_t k, int64_t n, int64_t group_size) {
+    int64_t top_k, int64_t k, int64_t n, int64_t group_size,
+    const std::optional<torch::Tensor>& int4_zero_workspace) {
   TORCH_CHECK(input.is_cuda() && input.scalar_type() == torch::kFloat16,
               "awq_moe_single_token_indexed_dense_stage_sm70_out: input must "
               "be CUDA float16.");
@@ -9752,7 +9744,8 @@ void awq_moe_single_token_indexed_dense_stage_sm70_out(
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
   awq_moe_gemm_sm70_out_impl(out, input, expert_offsets, ptrs_w, ptrs_s, top_k,
-                             k, n, group_size, false, sorted_expert_ids, true);
+                             k, n, group_size, false, int4_zero_workspace,
+                             sorted_expert_ids, true);
 }
 
 void awq_moe_single_token_dense_w13_sm70_out(
@@ -9761,7 +9754,8 @@ void awq_moe_single_token_dense_w13_sm70_out(
     torch::Tensor expert_offsets, torch::Tensor expert_offsets64,
     torch::Tensor inv_permuted_idx, torch::Tensor sorted_expert_ids,
     int64_t w13_k, int64_t w13_n, int64_t group_size,
-    int64_t hidden_logical_size) {
+    int64_t hidden_logical_size,
+    const std::optional<torch::Tensor>& int4_zero_workspace) {
   TORCH_CHECK(
       x.is_cuda() && x.scalar_type() == torch::kFloat16,
       "awq_moe_single_token_dense_w13_sm70_out: x must be CUDA float16.");
@@ -9849,7 +9843,7 @@ void awq_moe_single_token_dense_w13_sm70_out(
 
   awq_moe_single_token_dense_stage_sm70_out(
       gate_up, compact_input, expert_offsets, sorted_expert_ids, w13_ptrs_w,
-      w13_ptrs_s, top_k, w13_k, w13_n, group_size);
+      w13_ptrs_s, top_k, w13_k, w13_n, group_size, int4_zero_workspace);
 }
 
 void awq_moe_single_token_indexed_dense_w13_sm70_out(
@@ -9858,7 +9852,8 @@ void awq_moe_single_token_indexed_dense_w13_sm70_out(
     torch::Tensor expert_offsets, torch::Tensor expert_offsets64,
     torch::Tensor inv_permuted_idx, torch::Tensor sorted_expert_ids,
     int64_t w13_k, int64_t w13_n, int64_t group_size,
-    int64_t hidden_logical_size) {
+    int64_t hidden_logical_size,
+    const std::optional<torch::Tensor>& int4_zero_workspace) {
   TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kFloat16,
               "awq_moe_single_token_indexed_dense_w13_sm70_out: x must be CUDA "
               "float16.");
@@ -9947,7 +9942,7 @@ void awq_moe_single_token_indexed_dense_w13_sm70_out(
 
   awq_moe_single_token_indexed_dense_stage_sm70_out(
       gate_up, compact_input, expert_offsets, sorted_expert_ids, w13_ptrs_w,
-      w13_ptrs_s, top_k, w13_k, w13_n, group_size);
+      w13_ptrs_s, top_k, w13_k, w13_n, group_size, int4_zero_workspace);
 }
 
 void awq_moe_single_token_compact_dense_w13_sm70_out(
@@ -9957,7 +9952,8 @@ void awq_moe_single_token_compact_dense_w13_sm70_out(
     torch::Tensor expert_offsets, torch::Tensor expert_offsets64,
     torch::Tensor inv_permuted_idx, torch::Tensor sorted_expert_ids,
     int64_t w13_k, int64_t w13_n, int64_t group_size,
-    int64_t hidden_logical_size) {
+    int64_t hidden_logical_size,
+    const std::optional<torch::Tensor>& int4_zero_workspace) {
   TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kFloat16,
               "awq_moe_single_token_compact_dense_w13_sm70_out: x must be CUDA "
               "float16.");
@@ -10058,7 +10054,8 @@ void awq_moe_single_token_compact_dense_w13_sm70_out(
 
   awq_moe_gemm_sm70_per_expert_dispatch_out(
       gate_up, compact_input, expert_offsets, compact_w13_ptrs_w,
-      compact_w13_ptrs_s, top_k, w13_k, w13_n, group_size, false);
+      compact_w13_ptrs_s, top_k, w13_k, w13_n, group_size, false,
+      int4_zero_workspace);
 }
 
 void fp8_moe_gemm_sm70_out_impl(

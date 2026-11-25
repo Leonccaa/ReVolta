@@ -293,6 +293,36 @@ class _InterconnectDecision:
     reason: str = ""
     max_bytes: int = 0
     graph_only: bool = False
+    hc_ll_requested: bool = False
+
+
+def _sm70_hc_ll_requested() -> bool:
+    if (
+        not envs.VLLM_SM70_NVLINK_HC
+        or envs.VLLM_BATCH_INVARIANT
+        or envs.VLLM_SM70_QWEN4_EXP_ONLINE_QPN8
+    ):
+        return False
+    from vllm.config import get_current_vllm_config_or_none
+    from vllm.config.vllm import _is_sm70_qwen38_decode_compile_contract
+    from vllm.model_executor.models.config import sm70_flash_next_batch_qualified
+
+    config = get_current_vllm_config_or_none()
+    if config is None:
+        return False
+    parallel = config.parallel_config
+    return (
+        config.use_v2_model_runner
+        and (
+            not config.scheduler_config.async_scheduling
+            or config.kernel_config.sm70_hc_ll_async
+        )
+        and parallel.pipeline_parallel_size == 1
+        and _is_sm70_qwen38_decode_compile_contract(
+            config.model_config, config.speculative_config, parallel
+        )
+        and sm70_flash_next_batch_qualified(config)
+    )
 
 
 def _select_interconnect(
@@ -401,6 +431,13 @@ def _resolve_interconnect(
             candidate,
             p2p="driver" if envs.VLLM_SKIP_P2P_CHECK else "cached IPC",
         )
+    if (
+        candidate.mode == "nvlink"
+        and world_size == 4
+        and capability == DeviceCapability(7, 0)
+        and current_platform.is_cuda()
+    ):
+        candidate = replace(candidate, hc_ll_requested=_sm70_hc_ll_requested())
     candidates = [candidate] * world_size
     dist.all_gather_object(candidates, candidate, group=group)
     # Compare dispatch limits as well as mode: different graph/size admission
@@ -521,6 +558,7 @@ class CustomAllreduce:
     # the push-or-local-sum route. The class default keeps every other mode, and
     # instances made without __init__ (tests), on the unchanged path.
     sm70_nvlink_tp4 = False
+    sm70_hc_ll_requested = False
 
     # max_size: max supported allreduce size
     def __init__(
@@ -637,6 +675,7 @@ class CustomAllreduce:
             disable_custom_all_reduce,
         )
         self.interconnect_mode = decision.mode
+        self.sm70_hc_ll_requested = decision.hc_ll_requested
         logger.info(
             "SM70 interconnect=%s source=%s; NVML: %s; P2P: %s; %s",
             decision.mode,
@@ -928,6 +967,30 @@ class CustomAllreduce:
             out = torch.empty_like(inp_a)
         ops.all_reduce_sum2(self._ptr, inp_a, inp_b, out)
         return out
+
+    def _can_sm70_tp4_push_allgather(self, inp: torch.Tensor) -> bool:
+        return (
+            not self.disabled
+            and self.world_size == 4
+            and self.sm70_tp4_push_buffer_ptrs is not None
+            and 0 < inp.nbytes <= 320 * 1024
+            and torch.cuda.is_current_stream_capturing()
+        )
+
+    def try_sm70_tp4_push_allgather(self, inp: torch.Tensor) -> torch.Tensor | None:
+        if not self._can_sm70_tp4_push_allgather(inp):
+            return None
+        out = torch.empty((4, *inp.shape), dtype=inp.dtype, device=inp.device)
+        ops.sm70_tp4_push_allgather(
+            self._ptr, inp.view(torch.uint8), out.view(torch.uint8)
+        )
+        return out
+
+    def try_sm70_qsa_shard_merge(self, packed: torch.Tensor, out: torch.Tensor) -> bool:
+        if not self._can_sm70_tp4_push_allgather(packed):
+            return False
+        ops.sm70_qsa_shard_merge(packed, out, self._ptr)
+        return True
 
     def can_sm70_qwen38_hc_batch(self, branches: torch.Tensor) -> bool:
         return bool(

@@ -103,7 +103,10 @@ def test_topk_cutoff_subset_count_and_value_bits(rows, top_k, pattern):
     active_k = k if top_k is not None else None
     actual = sampler.apply_top_k_top_p(logits.clone(), active_k, None)
     reference = sampler.apply_top_k_top_p_pytorch(logits.clone(), active_k, None)
-    _assert_topk_contract(logits, actual, reference, k)
+    if rows == 1:
+        assert torch.equal(actual, reference)
+    else:
+        _assert_topk_contract(logits, actual, reference, k)
 
 
 @GPU
@@ -355,5 +358,9 @@ def test_joint_cutoff_support_and_value_bits(rows, top_k, top_p, pattern):
         _add_small_joint_ties(logits, k, p)
     active_k = k if top_k is not None else None
     actual = sampler.apply_top_k_top_p(logits.clone(), active_k, p)
-    candidates, reference = _upstream_joint_reference(logits, k, p)
-    _assert_joint_contract(logits, actual, candidates, reference, p)
+    if rows == 1:
+        reference = sampler.apply_top_k_top_p_pytorch(logits.clone(), active_k, p)
+        assert torch.equal(actual, reference)
+    else:
+        candidates, reference = _upstream_joint_reference(logits, k, p)
+        _assert_joint_contract(logits, actual, candidates, reference, p)

@@ -71,6 +71,10 @@ from vllm.v1.metrics.store import CPU_SAMPLE_STRIDE, StoreMetrics
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.ddtree_payload import DDTreeDraftPayload
+from vllm.v1.spec_decode.dynamic.adaptive_mtp import (
+    MIN_ADAPTIVE_MTP_DEPTH,
+    AdaptiveMTPDepth,
+)
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
@@ -303,6 +307,20 @@ class Scheduler(SchedulerInterface):
                 vllm_max_batch_size=self.scheduler_config.max_num_seqs,
                 vllm_num_speculative_tokens=self.num_spec_tokens,
             )
+        self.exact_end_draft_threshold = (
+            speculative_config.exact_end_draft_threshold
+            if speculative_config is not None
+            and speculative_config.gdn_spec_state_replay
+            and self.dynamic_sd_lookup is not None
+            and self.cache_config.enable_prefix_caching
+            else None
+        )
+        self._adaptive_mtp_cap = (
+            self.dynamic_sd_lookup[1]
+            if self.dynamic_sd_lookup is not None and vllm_config.adaptive_mtp_enabled
+            else 0
+        )
+        self._adaptive_mtp_depths: dict[str, AdaptiveMTPDepth] = {}
         # Last running total of rejection fallbacks seen from the workers.
         self._rejection_fallbacks_total = 0
         self.num_lookahead_tokens = vllm_config.num_lookahead_tokens
@@ -329,6 +347,11 @@ class Scheduler(SchedulerInterface):
             metrics_collector=self.kv_metrics_collector,
             prefix_cache_retention_interval=self.cache_config.prefix_cache_retention_interval,
             cross_group_hit_check=cross_group_hit_check_enabled(vllm_config),
+        )
+        self.kv_cache_manager.coordinator.exact_end.native_gdn_replay = bool(
+            speculative_config
+            and speculative_config.gdn_spec_state_replay
+            and speculative_config.gdn_deferred_commit_metadata
         )
         # Adapted from vLLM #44560, #57104 and #59880. Mamba managers already
         # include their speculative states. Fixed ring/tail and cross-attention
@@ -562,19 +585,39 @@ class Scheduler(SchedulerInterface):
             - request.num_output_placeholders,
         )
 
+    def _num_new_tokens_with_spec(self, request: Request) -> int:
+        num_new_tokens = (
+            request.num_tokens_with_spec
+            + request.num_output_placeholders
+            - request.num_computed_tokens
+        )
+        threshold = self.exact_end_draft_threshold
+        if threshold is not None and (drafts := len(request.spec_token_ids)):
+            remaining = self._remaining_output_tokens(request)
+            kept = (
+                0 if remaining <= min(threshold, drafts) else min(drafts, remaining - 1)
+            )
+            num_new_tokens -= drafts - kept
+        return num_new_tokens
+
     def _drafts_unused(
-        self, request: Request, num_computed_tokens: int, num_new_tokens: int
+        self,
+        request: Request,
+        num_computed_tokens: int,
+        num_new_tokens: int,
+        next_draft_threshold: int = 0,
     ) -> bool:
         """Whether the drafts proposed for `request` after this step are sure to
         go unused.
 
         Drafts proposed after a step are verified in the request's next decode
-        step. They go unused when no such step follows, in two cases:
+        step. They go unused in these cases:
 
         1. This step is a non-final prefill chunk. It samples no token, and the
            scheduler drops drafts proposed after a prefill chunk.
         2. This step samples the request's last output token: even if every
            draft is rejected, the request reaches `max_tokens` and finishes.
+        3. Synchronous exact-end scheduling will verify no drafts next step.
 
         Stop tokens and stop strings also end requests, but they cannot be known
         in advance. This returns True only when it is sure.
@@ -587,12 +630,18 @@ class Scheduler(SchedulerInterface):
             num_computed_tokens: Tokens computed before this step, including
                 prefix-cache and KV-connector hits for a newly admitted request.
             num_new_tokens: Tokens scheduled for this step.
+            next_draft_threshold: Single-token tail threshold for the next step.
 
         """
         # Case 1: a non-final prefill chunk stops before the request's last
         # known token, so this step samples nothing.
         if num_computed_tokens + num_new_tokens < request.num_tokens:
             return True
+
+        if next_draft_threshold:
+            return max(0, self._remaining_output_tokens(request) - 1) <= (
+                next_draft_threshold
+            )
 
         # Case 2: this step samples the request's last output token. Drafts may
         # all be rejected, so count only the output tokens the request is sure
@@ -769,12 +818,7 @@ class Scheduler(SchedulerInterface):
             for r in self.running
         }
         resident_tokens = {
-            r.request_id: max(
-                0,
-                r.num_tokens_with_spec
-                + r.num_output_placeholders
-                - r.num_computed_tokens,
-            )
+            r.request_id: max(0, self._num_new_tokens_with_spec(r))
             for r in self.running
             if prefill_remaining[r.request_id] == 0
             and r.num_output_tokens > 0
@@ -818,7 +862,9 @@ class Scheduler(SchedulerInterface):
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
         # Stays set if a request is preempted later in this step.
-        drafts_needed = not self.can_skip_drafts
+        drafts_needed = (
+            not self.can_skip_drafts or self.exact_end_draft_threshold is not None
+        )
         scheduled_ddtree_payloads: dict[str, DDTreeDraftPayload] = {}
 
         # For logging.
@@ -870,11 +916,7 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
-            num_new_tokens = (
-                request.num_tokens_with_spec
-                + request.num_output_placeholders
-                - request.num_computed_tokens
-            )
+            num_new_tokens = self._num_new_tokens_with_spec(request)
             ddtree_payload_for_tree_schedule = self._ddtree_payload_for_tree_schedule(
                 request
             )
@@ -1752,6 +1794,28 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
                 len(num_scheduled_tokens)
             ]
+        if self._adaptive_mtp_depths and len(num_scheduled_tokens) == 1:
+            req_id = next(iter(num_scheduled_tokens))
+            depth = self._adaptive_mtp_depths.get(req_id)
+            if req_id in resident_tokens and depth is not None:
+                # The current target inputs already contain the previous proposal.
+                num_spec_tokens_to_schedule = min(
+                    num_spec_tokens_to_schedule, depth.depth
+                )
+        if self.exact_end_draft_threshold is not None:
+            # Only now is the DSD width for the final batch known.
+            next_threshold = min(
+                self.exact_end_draft_threshold, num_spec_tokens_to_schedule
+            )
+            drafts_needed = any(
+                not self._drafts_unused(
+                    self.requests[rid],
+                    self.requests[rid].num_computed_tokens,
+                    num_new_tokens,
+                    next_threshold,
+                )
+                for rid, num_new_tokens in num_scheduled_tokens.items()
+            )
 
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
@@ -2203,10 +2267,12 @@ class Scheduler(SchedulerInterface):
             request.is_prefill_chunk = request.num_computed_tokens < (
                 request.num_tokens + request.num_output_placeholders
             )
-            scheduler_output.has_structured_output_requests |= (
-                request.use_structured_output and not request.is_prefill_chunk
-            )
             if not request.is_prefill_chunk:
+                if request.use_structured_output:
+                    scheduler_output.has_structured_output_requests = True
+                    if scheduler_output.structured_output_req_ids is None:
+                        scheduler_output.structured_output_req_ids = set()
+                    scheduler_output.structured_output_req_ids.add(req_id)
                 self._inflight_prefills.discard(request)
 
         # Snapshot block IDs for routed experts before forward starts.
@@ -2305,11 +2371,16 @@ class Scheduler(SchedulerInterface):
         num_computed_tokens: list[int] = []
         num_output_tokens: list[int] = []
         resumed_req_ids = set()
+        qwen_reasoning_eos_ended_req_ids: set[str] | None = None
 
         num_running_reqs = len(running_reqs)
         for idx, req in enumerate(itertools.chain(running_reqs, resumed_reqs)):
             req_id = req.request_id
             req_ids.append(req_id)
+            if req.qwen_reasoning_eos_ended:
+                if qwen_reasoning_eos_ended_req_ids is None:
+                    qwen_reasoning_eos_ended_req_ids = set()
+                qwen_reasoning_eos_ended_req_ids.add(req_id)
             # NOTE: In PP+async scheduling, we consume token ids via a direct GPU
             # broadcast path (`input_batch.prev_sampled_token_ids`), so we can
             # omit this payload.
@@ -2349,6 +2420,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids=new_block_ids,
             num_computed_tokens=num_computed_tokens,
             num_output_tokens=num_output_tokens,
+            qwen_reasoning_eos_ended_req_ids=qwen_reasoning_eos_ended_req_ids,
         )
 
     @staticmethod
@@ -2555,6 +2627,7 @@ class Scheduler(SchedulerInterface):
             self.requests,
             structured_output_request_ids,
             scheduler_output.scheduled_spec_decode_tokens,
+            retain_invalid_draft=self._retains_invalid_grammar_draft,
         )
         return GrammarOutput(structured_output_request_ids, bitmask)
 
@@ -2820,6 +2893,24 @@ class Scheduler(SchedulerInterface):
 
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
+            elif (
+                self._adaptive_mtp_cap > MIN_ADAPTIVE_MTP_DEPTH
+                and scheduled_spec_token_ids
+                and new_token_ids
+                and not (scheduler_output.num_invalid_spec_tokens or {}).get(req_id)
+                # Widths at the output boundary can be clipped by exact-end.
+                and len(scheduled_spec_token_ids)
+                < request.max_tokens - num_output_tokens_before - 1
+            ):
+                depth = self._adaptive_mtp_depths.get(req_id)
+                if depth is None:
+                    depth = AdaptiveMTPDepth(self._adaptive_mtp_cap)
+                    self._adaptive_mtp_depths[req_id] = depth
+                depth.observe(
+                    len(scheduled_spec_token_ids),
+                    len(new_token_ids) - 1,
+                    self._adaptive_mtp_cap,
+                )
 
             # Extract sample logprobs if needed.
             if (
@@ -2988,6 +3079,7 @@ class Scheduler(SchedulerInterface):
         sampled token (which the next input chunk discards), and the outputs
         of the in-flight steps are dropped when they return.
         """
+        self._adaptive_mtp_depths.pop(request.request_id, None)
         request.num_stale_in_flight_tokens = request.num_in_flight_tokens
         request.num_output_placeholders = 0
         request.spec_token_ids = []
@@ -3042,6 +3134,13 @@ class Scheduler(SchedulerInterface):
         if not cached_encoder_input_ids:
             return
 
+        # Steps scheduled ahead (async scheduling) may still be rejected and roll
+        # num_computed_tokens back, and their drafts re-gather embeddings from
+        # the confirmed position. Only confirmed tokens may release an input,
+        # or another request's admission evicts it first (#1485).
+        num_confirmed_tokens = (
+            request.num_computed_tokens - request.num_in_flight_tokens
+        )
         # Here, we use list(set) to avoid modifying the set while iterating
         # over it.
         for input_id in list(cached_encoder_input_ids):
@@ -3053,13 +3152,28 @@ class Scheduler(SchedulerInterface):
                 # we know we're done with the encoder input. Cross Attention
                 # KVs have been calculated and cached already.
                 self.encoder_cache_manager.free_encoder_input(request, input_id)
-            elif start_pos + num_tokens <= request.num_computed_tokens:
+            elif start_pos + num_tokens <= num_confirmed_tokens:
                 # The encoder output is already processed and stored
                 # in the decoder's KV cache.
                 self.encoder_cache_manager.free_encoder_input(request, input_id)
 
+    @property
+    def _retains_invalid_grammar_draft(self) -> bool:
+        spec_config = self.vllm_config.speculative_config
+        return (
+            self.use_v2_model_runner
+            and not self.scheduler_config.async_scheduling
+            and spec_config is not None
+            and spec_config.rejection_sample_method == "standard"
+            and spec_config.draft_sample_method == "probabilistic"
+        )
+
     def _validate_grammar_draft_tokens(
-        self, request: Request, spec_token_ids: list[int]
+        self,
+        request: Request,
+        spec_token_ids: list[int],
+        *,
+        retain_invalid_draft: bool = False,
     ) -> list[int]:
         try:
             metadata = request.structured_output_request
@@ -3070,7 +3184,24 @@ class Scheduler(SchedulerInterface):
                 assert metadata is not None
                 grammar = metadata.grammar
                 assert isinstance(grammar, StructuredOutputGrammar)
-                return grammar.validate_tokens(spec_token_ids)
+                valid_tokens = grammar.validate_tokens(spec_token_ids)
+                params = request.sampling_params
+                if (
+                    retain_invalid_draft
+                    and params is not None
+                    and params.temperature > 0
+                    and len(valid_tokens) < len(spec_token_ids)
+                    and spec_token_ids[len(valid_tokens)] >= 0
+                    and not grammar.is_terminated()
+                    and (
+                        not valid_tokens
+                        or valid_tokens[-1] not in params.all_stop_token_ids
+                    )
+                ):
+                    # The original proposal must reach rejection sampling at this
+                    # position so it draws from the residual instead of a bonus row.
+                    return spec_token_ids[: len(valid_tokens) + 1]
+                return valid_tokens
         except Exception as exc:
             if request.structured_output_request is None:
                 raise
@@ -3080,6 +3211,7 @@ class Scheduler(SchedulerInterface):
         return spec_token_ids
 
     def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
+        retain_invalid_draft = self._retains_invalid_grammar_draft
         for req_id, spec_token_ids in zip(
             draft_token_ids.req_ids,
             draft_token_ids.draft_token_ids,
@@ -3098,7 +3230,7 @@ class Scheduler(SchedulerInterface):
 
             # Add newly generated spec token ids to the request.
             spec_token_ids = self._validate_grammar_draft_tokens(
-                request, spec_token_ids
+                request, spec_token_ids, retain_invalid_draft=retain_invalid_draft
             )
             request.spec_token_ids = list(spec_token_ids)
 
@@ -3334,6 +3466,7 @@ class Scheduler(SchedulerInterface):
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
+        self._adaptive_mtp_depths.pop(request_id, None)
         if getattr(self, "host_kv_ssd", None) is not None:
             self.host_kv_ssd.cancel(request_id)
         self.finished_req_ids.add(request_id)

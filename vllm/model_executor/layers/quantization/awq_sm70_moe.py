@@ -31,12 +31,24 @@ from vllm.model_executor.layers.quantization.sm70_moe_router import (
     select_sm70_quantized_moe_route,
 )
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
 
 _DEFAULT_PERSISTENT_MAX_TOKENS = 32
 _QWEN38_INDEXED_PREFILL_MIN_TOKENS: Final = 128
 _QWEN38_CHUNKED_W2_SUPPORTED_TOKENS: Final = (4096, 6144)
+
+
+def _get_int4_zero_workspace(layer: torch.nn.Module) -> torch.Tensor | None:
+    if not envs.VLLM_SM70_AWQ_MOE_INT4_ZERO:
+        return None
+    # The initial model profile reserves the full bank before dispatch selects
+    # a kernel. Later calls take a view of the same worker workspace.
+    (workspace,) = current_workspace_manager().get_simultaneous(
+        ((int(layer.sm70_int4_zero_workspace_bytes),), torch.uint8),
+    )
+    return workspace
 
 
 def _resolve_persistent_max_tokens(
@@ -1107,6 +1119,11 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         )
         layer.sm70_awq_checkpoint_group_size = checkpoint_group_size
         layer.sm70_awq_group_size = self.group_size
+        records = max(
+            layer.sm70_w13_k_dim // self.group_size * layer.sm70_w13_n_dim,
+            layer.sm70_w2_k_dim // self.group_size * layer.sm70_w2_n_dim,
+        )
+        layer.sm70_int4_zero_workspace_bytes = num_experts * (3 * records + 16)
         layer.sm70_awq_moe_layer_id = _get_layer_id(layer)
         layer.sm70_awq_moe_w13_interleaved = w13_interleaved
         layer.sm70_awq_moe_legacy_single_token_compact = build_legacy_w13
@@ -1611,6 +1628,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         buffers: dict[str, torch.Tensor],
         top_k: int,
         output: torch.Tensor,
+        expansion_workspace: torch.Tensor | None,
     ) -> torch.Tensor:
         if use_qpn_m1(layer, x, topk_weights, topk_ids_i32):
             _log_runtime_route_once(
@@ -1660,6 +1678,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             layer.sm70_w2_n_dim,
             self.group_size,
             layer.sm70_hidden_logical_size,
+            expansion_workspace,
         )
         return output
 
@@ -1682,18 +1701,28 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 "SM70 AWQ MoE does not support apply_router_weight_on_input yet."
             )
 
+        expansion_workspace = _get_int4_zero_workspace(layer)
         num_tokens = x.shape[0]
         top_k = topk_ids.shape[1]
         total_slots = num_tokens * top_k
         indexed_w13 = _use_qwen38_indexed_prefill(layer, x, topk_ids)
         buffers = self._get_buffers(layer, total_slots, num_tokens, indexed_w13)
         output = buffers["output"]
-        output.zero_()
         if total_slots == 0:
-            return output
+            return output.zero_()
 
         topk_ids_i32 = buffers["topk_ids"]
-        topk_ids_i32.copy_(topk_ids, non_blocking=True)
+        if (
+            topk_ids.dtype == torch.int32
+            and topk_ids.shape == topk_ids_i32.shape
+            and topk_ids.is_cuda
+            and topk_ids.device == topk_ids_i32.device == x.device
+            and topk_ids.is_contiguous()
+            and topk_ids.data_ptr() % 4 == 0
+        ):
+            topk_ids_i32 = topk_ids
+        else:
+            topk_ids_i32.copy_(topk_ids, non_blocking=True)
         x = _dump_awq_moe_buffer(layer, x, "input")
         topk_weights = _dump_awq_moe_buffer(layer, topk_weights, "topk_weights")
         topk_ids_i32 = _dump_awq_moe_buffer(layer, topk_ids_i32, "topk_ids_i32")
@@ -1703,8 +1732,16 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             and _legacy_single_token_compact_enabled()
             and layer.sm70_awq_moe_legacy_single_token_compact
         ):
+            output.zero_()
             return self._apply_legacy_single_token_compact(
-                layer, x, topk_weights, topk_ids_i32, buffers, top_k, output
+                layer,
+                x,
+                topk_weights,
+                topk_ids_i32,
+                buffers,
+                top_k,
+                output,
+                expansion_workspace,
             )
         use_batched_single_token_strict = (
             num_tokens == 1
@@ -1727,6 +1764,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 or use_batched_single_token_indexed
             )
         ):
+            output.zero_()
             use_compact_w13 = _single_token_compact_w13_enabled()
             use_indexed_w13 = (
                 not use_compact_w13
@@ -1788,6 +1826,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                     layer.sm70_w13_n_dim,
                     self.group_size,
                     layer.sm70_hidden_logical_size,
+                    expansion_workspace,
                 )
             elif use_indexed_w13:
                 sm70_ops.awq_moe_single_token_indexed_dense_w13_sm70_out(
@@ -1805,6 +1844,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                     layer.sm70_w13_n_dim,
                     self.group_size,
                     layer.sm70_hidden_logical_size,
+                    expansion_workspace,
                 )
             else:
                 sm70_ops.awq_moe_single_token_dense_w13_sm70_out(
@@ -1822,6 +1862,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                     layer.sm70_w13_n_dim,
                     self.group_size,
                     layer.sm70_hidden_logical_size,
+                    expansion_workspace,
                 )
             buffers["expert_offsets"] = _dump_awq_moe_buffer(
                 layer, buffers["expert_offsets"], "st_expert_offsets"
@@ -1851,6 +1892,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                     layer.sm70_w2_k_dim,
                     layer.sm70_w2_n_dim,
                     self.group_size,
+                    expansion_workspace,
                 )
             else:
                 sm70_ops.awq_moe_single_token_dense_stage_sm70_out(
@@ -1864,6 +1906,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                     layer.sm70_w2_k_dim,
                     layer.sm70_w2_n_dim,
                     self.group_size,
+                    expansion_workspace,
                 )
             buffers["sorted_output"] = _dump_awq_moe_buffer(
                 layer, buffers["sorted_output"], "st_w2_out"
@@ -1902,6 +1945,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             else _qwen38_grouped_qpn_chunks(layer, x, topk_weights, topk_ids_i32)
         )
         if grouped_chunks is not None:
+            # Grouped W2 writes every column of each output row.
             _log_runtime_route_once(
                 "SM70 Qwen3.8 AWQ grouped QPN decode (tokens=%d, routes=%d, calls=%d).",
                 num_tokens,
@@ -1926,6 +1970,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                     int(getattr(layer, "sm70_awq_qwen38_grouped_qpn_pack_rows", 0)),
                 )
             return _dump_awq_moe_buffer(layer, output, "grouped_qpn_output")
+        output.zero_()
         if indexed_w13:
             torch.ops._moe_C.moe_permute_metadata_with_scratch(
                 x,
@@ -2032,6 +2077,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 layer.sm70_w13_k_dim,
                 layer.sm70_w13_n_dim,
                 self.group_size,
+                expansion_workspace,
             )
         elif use_active_exact_small_batched_moe:
             _log_runtime_route_once(
@@ -2051,6 +2097,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 layer.sm70_w13_k_dim,
                 layer.sm70_w13_n_dim,
                 self.group_size,
+                expansion_workspace,
             )
             if compare_dense_step is not None:
                 dense_gate_up = torch.empty_like(buffers["gate_up"])
@@ -2065,6 +2112,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                     layer.sm70_w13_k_dim,
                     layer.sm70_w13_n_dim,
                     self.group_size,
+                    expansion_workspace,
                 )
                 compare_dense_w13_stats = _diff_stats(buffers["gate_up"], dense_gate_up)
         elif route_plan.w13 == Sm70MoeStageRoute.BATCHED:
@@ -2084,6 +2132,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 layer.sm70_w13_n_dim,
                 self.group_size,
                 False,
+                expansion_workspace,
             )
         elif route_plan.w13 == Sm70MoeStageRoute.PER_EXPERT_DISPATCH:
             _log_runtime_route_once(
@@ -2102,6 +2151,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 layer.sm70_w13_n_dim,
                 self.group_size,
                 False,
+                expansion_workspace,
             )
             buffers["gate_up"] = _dump_awq_moe_buffer(
                 layer, buffers["gate_up"], "w13_batched_out"
@@ -2119,6 +2169,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                     layer.sm70_w13_k_dim,
                     layer.sm70_w13_n_dim,
                     self.group_size,
+                    expansion_workspace,
                 )
                 compare_dense_w13_stats = _diff_stats(buffers["gate_up"], dense_gate_up)
         else:
@@ -2143,6 +2194,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 layer.sm70_w13_k_dim,
                 layer.sm70_w13_n_dim,
                 self.group_size,
+                expansion_workspace,
             )
             buffers["gate_up"] = _dump_awq_moe_buffer(
                 layer, buffers["gate_up"], "w13_dense_out"
@@ -2182,6 +2234,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 layer.sm70_hidden_logical_size,
                 self.group_size,
                 w2_chunk_tokens,
+                expansion_workspace,
             )
             return _dump_awq_moe_buffer(layer, output, "chunked_w2_output")
         if use_active_exact_small_batched_moe or use_batched_active_exact_w2:
@@ -2201,6 +2254,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 layer.sm70_w2_k_dim,
                 layer.sm70_w2_n_dim,
                 self.group_size,
+                expansion_workspace,
             )
             if compare_dense_step is not None:
                 dense_sorted_output = torch.empty_like(buffers["sorted_output"])
@@ -2215,6 +2269,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                     layer.sm70_w2_k_dim,
                     layer.sm70_w2_n_dim,
                     self.group_size,
+                    expansion_workspace,
                 )
                 compare_dense_w2_stats = _diff_stats(
                     buffers["sorted_output"], dense_sorted_output
@@ -2239,6 +2294,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                         layer.sm70_w2_k_dim,
                         layer.sm70_w2_n_dim,
                         self.group_size,
+                        expansion_workspace,
                     )
                     compare_dense_full_w2_stats = _diff_stats(
                         buffers["sorted_output"], dense_full_sorted_output
@@ -2286,6 +2342,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 layer.sm70_w2_n_dim,
                 self.group_size,
                 False,
+                expansion_workspace,
             )
         elif route_plan.w2 == Sm70MoeStageRoute.PER_EXPERT_DISPATCH:
             _log_runtime_route_once(
@@ -2304,6 +2361,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 layer.sm70_w2_n_dim,
                 self.group_size,
                 False,
+                expansion_workspace,
             )
             buffers["sorted_output"] = _dump_awq_moe_buffer(
                 layer, buffers["sorted_output"], "w2_batched_out"
@@ -2321,6 +2379,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                     layer.sm70_w2_k_dim,
                     layer.sm70_w2_n_dim,
                     self.group_size,
+                    expansion_workspace,
                 )
                 compare_dense_w2_stats = _diff_stats(
                     buffers["sorted_output"], dense_sorted_output
@@ -2341,6 +2400,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                     layer.sm70_w2_k_dim,
                     layer.sm70_w2_n_dim,
                     self.group_size,
+                    expansion_workspace,
                 )
                 compare_dense_full_w2_stats = _diff_stats(
                     buffers["sorted_output"], dense_full_sorted_output
@@ -2388,6 +2448,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                         layer.sm70_w13_n_dim,
                         self.group_size,
                         layer.sm70_hidden_logical_size,
+                        expansion_workspace,
                     )
                     _silu_and_mul_w13(layer, strict_intermediate, strict_gate_up)
                     sm70_ops.awq_moe_single_token_dense_stage_sm70_out(
@@ -2401,6 +2462,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                         layer.sm70_w2_k_dim,
                         layer.sm70_w2_n_dim,
                         self.group_size,
+                        expansion_workspace,
                     )
                     strict_sorted_output_logical = strict_sorted_output[
                         :, : layer.sm70_hidden_logical_size
@@ -2468,6 +2530,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 layer.sm70_w2_k_dim,
                 layer.sm70_w2_n_dim,
                 self.group_size,
+                expansion_workspace,
             )
             buffers["sorted_output"] = _dump_awq_moe_buffer(
                 layer, buffers["sorted_output"], "w2_dense_out"

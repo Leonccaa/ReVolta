@@ -12,7 +12,11 @@ from vllm import envs
 from vllm.config import SpeculativeConfig, VllmConfig, get_layers_from_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import GraphCaptureContext
-from vllm.forward_context import BatchDescriptor, set_forward_context
+from vllm.forward_context import (
+    BatchDescriptor,
+    get_forward_context,
+    set_forward_context,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -220,6 +224,18 @@ class EagleSpeculator:
         self.model = load_eagle_model(target_model, self.vllm_config)
         self._maybe_initialize_static_draft_vocab()
         self._validate_local_argmax_reduction()
+        if (
+            self.speculative_config.draft_qpn8_head
+            and self._static_draft_vocab is None
+            and self.speculative_config.draft_sample_method == "greedy"
+            and self.use_local_argmax_reduction
+            and self.vllm_config.parallel_config.tensor_parallel_size > 1
+        ):
+            prepare_draft_head = getattr(
+                self.model, "prepare_sm70_mtp_draft_head", None
+            )
+            if prepare_draft_head is not None:
+                prepare_draft_head()
 
         draft_hf_config = self.draft_model_config.hf_config
         self.share_mtp_topk_indices = (
@@ -423,6 +439,9 @@ class EagleSpeculator:
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+        *,
+        is_uniform_decode: bool = False,
+        is_eagle_draft_step: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
         with set_forward_context(
@@ -433,7 +452,15 @@ class EagleSpeculator:
             num_tokens_across_dp=num_tokens_across_dp,
             slot_mapping=slot_mappings,
             batch_descriptor=batch_descriptor,
+            is_uniform_decode=is_uniform_decode,
         ):
+            if is_uniform_decode or is_eagle_draft_step:
+                # The active MRv2 runner identifies draft decode even when the
+                # draft architecture would not choose MRv2 on its own.
+                kwargs = get_forward_context().additional_kwargs
+                kwargs["sm70_qsa_draft_decode"] = True
+                if is_eagle_draft_step and self.share_mtp_topk_indices:
+                    kwargs["qsa_reuses_mtp_selection"] = True
             inputs_embeds = None
             if self.supports_mm_inputs:
                 # Merge multimodal embeddings with input ids.
@@ -584,6 +611,8 @@ class EagleSpeculator:
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         skip_sample: bool = False,
+        *,
+        is_uniform_decode: bool = False,
     ) -> None:
         last_hidden_states, hidden_states = self.run_model(
             num_tokens,
@@ -592,6 +621,7 @@ class EagleSpeculator:
             num_tokens_across_dp=num_tokens_across_dp,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
             mm_inputs=mm_inputs,
+            is_uniform_decode=is_uniform_decode,
         )
         if skip_sample:
             # This pass only keeps the drafter KV in sync.
@@ -684,6 +714,7 @@ class EagleSpeculator:
             slot_mappings,
             num_tokens_across_dp,
             cudagraph_runtime_mode,
+            is_eagle_draft_step=True,
         )
         last_hidden_states = last_hidden_states[:num_reqs]
 
@@ -911,6 +942,7 @@ class EagleSpeculator:
                 cudagraph_runtime_mode=prefill_batch_desc.cg_mode,
                 mm_inputs=mm_inputs,
                 skip_sample=num_speculative_tokens == 0,
+                is_uniform_decode=uniform_token_count is not None,
             )
         self._mtp_prefill_end(num_reqs)
 

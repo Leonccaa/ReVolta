@@ -18,11 +18,14 @@ from vllm.v1.worker.gpu.sample.logprob import (
 )
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
+from vllm.v1.worker.gpu.sample.reasoning_eos import ReasoningEOSState
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS, SamplingStates
 from vllm.v1.worker.gpu.states import RequestState
 
 
 class Sampler:
+    reasoning_eos: ReasoningEOSState | None = None
+
     def __init__(
         self,
         max_num_reqs: int,
@@ -45,15 +48,29 @@ class Sampler:
         self.bad_words_state = BadWordsState(req_states)
         self.logprob_token_ids_state = LogprobTokenIdsState(max_num_reqs, device)
         self.num_speculative_tokens = num_speculative_tokens
+        if envs.VLLM_QWEN_REASONING_EOS_MASK:
+            self.reasoning_eos = ReasoningEOSState(max_num_reqs, device)
 
     def add_request(
-        self, req_idx: int, prompt_len: int, sampling_params: SamplingParams
+        self,
+        req_idx: int,
+        prompt_len: int,
+        sampling_params: SamplingParams,
+        prefill_token_ids: list[int] | None = None,
     ) -> None:
         self.sampling_states.add_request(req_idx, sampling_params)
         self.penalties_state.add_request(req_idx, sampling_params)
         self.logit_bias_state.add_request(req_idx, prompt_len, sampling_params)
         self.bad_words_state.add_request(req_idx, sampling_params)
         self.logprob_token_ids_state.add_request(req_idx, sampling_params)
+        if self.reasoning_eos is not None:
+            self.reasoning_eos.add_request(
+                req_idx,
+                sampling_params._qwen_reasoning_eos,
+                prefill_token_ids[prompt_len:]
+                if prefill_token_ids is not None and sampling_params._qwen_reasoning_eos
+                else [],
+            )
 
     def apply_staged_writes(self) -> None:
         self.sampling_states.apply_staged_writes()
@@ -61,6 +78,8 @@ class Sampler:
         self.logit_bias_state.apply_staged_writes()
         self.bad_words_state.apply_staged_writes()
         self.logprob_token_ids_state.apply_staged_writes()
+        if self.reasoning_eos is not None:
+            self.reasoning_eos.slots.apply_write()
 
     def can_use_sm70_greedy_token_fastpath(self, input_batch: InputBatch) -> bool:
         """Whether TP-local argmax is equivalent to the full MRv2 sampler."""
@@ -68,6 +87,10 @@ class Sampler:
             return False
 
         req_indices = input_batch.idx_mapping_np
+        if self.reasoning_eos is not None and self.reasoning_eos.active_requests(
+            req_indices
+        ):
+            return False
         if not np.all(self.sampling_states.temperature.np[req_indices] == 0.0):
             return False
         if self.sampling_states.max_num_logprobs(req_indices) != NO_LOGPROBS:
@@ -146,6 +169,7 @@ class Sampler:
         pos: torch.Tensor,
         input_ids: torch.Tensor,
         expanded_local_pos: torch.Tensor,
+        reasoning_eos_rows: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Copy logits to a new FP32 tensor.
         logits = torch.empty_like(logits, dtype=torch.float32).copy_(logits)
@@ -172,6 +196,18 @@ class Sampler:
             input_ids,
             expanded_local_pos,
         )
+
+        if self.reasoning_eos is not None and (
+            reasoning_eos_rows is not None
+            or self.reasoning_eos.active_requests(idx_mapping_np)
+        ):
+            self.reasoning_eos.mask(
+                logits,
+                expanded_idx_mapping,
+                input_ids,
+                expanded_local_pos,
+                reasoning_eos_rows,
+            )
 
         # Apply temperature in place.
         self.sampling_states.apply_temperature(

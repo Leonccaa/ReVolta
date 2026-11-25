@@ -10,7 +10,13 @@ from typing import Annotated, Literal
 import pytest
 from pydantic import Field
 
-from vllm.config import AttentionConfig, CompilationConfig, ModelConfig, config
+from vllm.config import (
+    AttentionConfig,
+    CompilationConfig,
+    ModelConfig,
+    SchedulerConfig,
+    config,
+)
 from vllm.engine.arg_utils import (
     EngineArgs,
     _expand_json_human_readable_numbers,
@@ -285,13 +291,15 @@ def _apply_sm70_defaults(
         enable_prefix_caching=enable_prefix_caching,
         max_num_seqs=max_num_seqs,
         max_num_batched_tokens=max_num_batched_tokens,
+        mixed_prefill_step_latency_ms=SchedulerConfig.mixed_prefill_step_latency_ms,
         performance_mode=performance_mode,
     )
     args.speculative_config = speculative_config
-    args._maybe_apply_sm70_mtp_defaults(
+    if args._maybe_apply_sm70_mtp_defaults(
         UsageContext.OPENAI_API_SERVER,
         _fake_qwen_hybrid_model_config(),
-    )
+    ):
+        args._set_sm70_mtp_cudagraph_defaults()
     return args
 
 
@@ -515,15 +523,20 @@ def test_prefill_pressure_cli_args():
     args = parser.parse_args(
         [
             "--prefill-pressure-token-budget",
-            "768",
+            "0",
             "--prefill-pressure-threshold",
             "2",
+            "--mixed-prefill-step-latency-ms",
+            "250",
         ]
     )
     engine_args = EngineArgs.from_cli_args(args)
 
-    assert engine_args.prefill_pressure_token_budget == 768
-    assert engine_args.prefill_pressure_threshold == 2
+    assert (
+        engine_args.prefill_pressure_token_budget,
+        engine_args.prefill_pressure_threshold,
+        engine_args.mixed_prefill_step_latency_ms,
+    ) == (0, 2, 250.0)
 
 
 @pytest.mark.parametrize(

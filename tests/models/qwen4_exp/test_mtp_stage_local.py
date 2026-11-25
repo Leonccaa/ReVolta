@@ -18,6 +18,7 @@ import pytest
 import torch
 from torch import nn
 
+from vllm.models.qwen4_exp.nvidia import mtp as mtp_module
 from vllm.models.qwen4_exp.nvidia.mtp import Qwen4ExpMultiTokenPredictor
 
 HC_COUNT = 2
@@ -61,11 +62,15 @@ def _predictor() -> Qwen4ExpMultiTokenPredictor:
 @pytest.fixture
 def last_pp_rank(monkeypatch):
     """A pipeline group whose final rank is the one running the drafter."""
-    from vllm.models.qwen4_exp.nvidia import mtp as mtp_module
-
     group = SimpleNamespace(is_first_rank=False, is_last_rank=True)
     monkeypatch.setattr(mtp_module, "get_pp_group", lambda: group)
     return group
+
+
+@pytest.fixture(autouse=True)
+def single_tp_rank(monkeypatch):
+    # This fixture exercises pipeline locality without distributed processes.
+    monkeypatch.setattr(mtp_module, "tensor_model_parallel_all_gather", lambda x: x)
 
 
 def test_drafter_embeds_on_the_last_pipeline_rank(last_pp_rank) -> None:
@@ -88,8 +93,6 @@ def test_drafter_embeds_on_the_last_pipeline_rank(last_pp_rank) -> None:
 def test_drafter_does_not_hand_off_to_a_next_stage(monkeypatch) -> None:
     """Even with a pipeline group that reports a following stage, the drafter
     finalizes locally: it is replicated, not partitioned."""
-    from vllm.models.qwen4_exp.nvidia import mtp as mtp_module
-
     group = SimpleNamespace(is_first_rank=False, is_last_rank=False)
     monkeypatch.setattr(mtp_module, "get_pp_group", lambda: group)
     predictor = _predictor()

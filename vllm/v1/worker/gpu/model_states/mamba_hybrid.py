@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -15,6 +15,7 @@ from vllm.config.sm70_dflash2 import (
     sm70_dflash2_enabled,
 )
 from vllm.logger import init_logger
+from vllm.model_executor.layers.mamba.gdn.spec_replay import SpecReplayState
 from vllm.model_executor.layers.mamba.mamba_utils import (
     get_conv_copy_spec,
     is_conv_state_dim_first,
@@ -69,6 +70,11 @@ from vllm.v1.worker.mamba_utils import (
     get_mamba_types,
 )
 from vllm.v1.worker.utils import AttentionGroup
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+        QwenGatedDeltaNetAttention,
+    )
 
 logger = init_logger(__name__)
 
@@ -138,6 +144,13 @@ class MambaHybridModelState(DefaultModelState):
     # GDN speculative state replay (set in __init__ from the speculative config).
     _spec_state_replay = False
     _spec_replay_step: GDNSpecReplayStep | None = None
+    _native_replay_requested = False
+    _max_unsettled_draft_tokens = 0
+    _native_replay: SpecReplayState | None = None
+    _native_layers: tuple[tuple[int, "QwenGatedDeltaNetAttention"], ...] = ()
+    _end_checkpoints: (
+        tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, ...]] | None
+    ) = None
     # Disabled default for states built without __init__ (tests); never captures.
     _spec_replay_graphs = GDNSpecReplayGraphs(enabled=False)
 
@@ -233,9 +246,20 @@ class MambaHybridModelState(DefaultModelState):
             speculative_config is not None and speculative_config.gdn_spec_state_replay
         )
         assert self._align_mode or not self._spec_state_replay
+        self._native_replay_requested = (
+            self._spec_state_replay
+            and speculative_config is not None
+            and speculative_config.gdn_deferred_commit_metadata is True
+        )
+        if self._native_replay_requested and self.scheduler_config.async_scheduling:
+            assert speculative_config is not None
+            self._max_unsettled_draft_tokens = (
+                self.vllm_config.max_concurrent_batches - 1
+            ) * speculative_config.num_speculative_state_tokens()
         self._spec_replay_step: GDNSpecReplayStep | None = None
         self._spec_replay_graphs = GDNSpecReplayGraphs(
             enabled=self._spec_state_replay
+            and not self._native_replay_requested
             and speculative_config is not None
             and speculative_config.gdn_replay_graph_enabled()
         )
@@ -245,6 +269,8 @@ class MambaHybridModelState(DefaultModelState):
         # A recycled request slot may contain the previous request's accepted
         # count. The neutral value is required in both align and non-align mode.
         self.num_accepted_tokens_gpu[req_index].fill_(1)
+        if self._native_replay is not None:
+            self._native_replay.reset_request(req_index)
         if self._align_mode:
             # Delay state-column seeding until preprocess_state has the
             # resolved MambaSpec block size. -2 is distinct from -1 (fresh
@@ -257,6 +283,26 @@ class MambaHybridModelState(DefaultModelState):
         if self._mamba_spec is None:
             self._mamba_group_ids, self._mamba_spec = get_mamba_groups(kv_cache_config)
         return self._mamba_group_ids, self._mamba_spec
+
+    def _bind_native_replay(self, kv_cache_config: KVCacheConfig) -> None:
+        if not self._native_replay_requested or self._native_replay is not None:
+            return
+        from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+            QwenGatedDeltaNetAttention,
+        )
+
+        groups, _ = self._get_mamba_group_info(kv_cache_config)
+        replay = SpecReplayState(self.max_num_reqs, len(groups), self.device)
+        forward_context = self.vllm_config.compilation_config.static_forward_context
+        layers: list[tuple[int, QwenGatedDeltaNetAttention]] = []
+        for group, group_id in enumerate(groups):
+            for name in kv_cache_config.kv_cache_groups[group_id].layer_names:
+                layer = forward_context.get(name)
+                if isinstance(layer, QwenGatedDeltaNetAttention):
+                    layer.bind_deferred_replay(replay, group)
+                    layers.append((group, layer))
+        self._native_layers = tuple(layers)
+        self._native_replay = replay
 
     def _ensure_align_ctx(
         self,
@@ -307,9 +353,41 @@ class MambaHybridModelState(DefaultModelState):
             )
         return ctx
 
-    def run_state_gathers(self, gathers: list[MambaStateGather]) -> None:
+    def run_state_gathers(
+        self, gathers: list[MambaStateGather], request_slots: dict[str, int]
+    ) -> None:
         assert self._mamba_ctx is not None
-        run_state_gathers(self._mamba_ctx, gathers, self.device)
+        terminal = [
+            (request_slots[g.request_id], g)
+            for g in gathers
+            if g.request_id is not None
+        ]
+        if terminal:
+            replay = self._native_replay
+            assert replay is not None
+            reqs = torch.tensor(
+                [slot for slot, _ in terminal],
+                dtype=torch.long,
+                device=self.device,
+            )
+            counts = torch.tensor(
+                [g.column + 1 for _, g in terminal],
+                dtype=torch.int32,
+                device=self.device,
+            )
+            slots = torch.tensor(
+                [g.dst_block_ids for _, g in terminal],
+                dtype=torch.int32,
+                device=self.device,
+            ).T.contiguous()
+            rmap = (2 * reqs + (replay.side.index_select(0, reqs) ^ 1)).int()
+            for group, layer in self._native_layers:
+                layer.commit_deferred_replay(
+                    layer.kv_cache[1], slots[group], counts, rmap
+                )
+        conv = [g for g in gathers if g.request_id is None or g.column > 0]
+        if conv:
+            run_state_gathers(self._mamba_ctx, conv, self.device)
 
     def preprocess_state(
         self,
@@ -339,6 +417,27 @@ class MambaHybridModelState(DefaultModelState):
             BLOCK_SIZE=block,
             MAMBA_BLOCK_SIZE=mamba_spec.block_size,
         )
+        self._bind_native_replay(kv_cache_config)
+        if self._native_replay is not None:
+            spec_rows = self._native_replay.prepare(
+                input_batch.idx_mapping,
+                input_batch.query_start_loc,
+                num_computed_tokens,
+                input_batch.num_draft_tokens_per_req,
+                input_batch.is_prefilling_np,
+                input_batch.num_reqs,
+                ctx.block_table_ptrs,
+                ctx.block_table_stride_req,
+                mamba_spec.block_size,
+            )
+            self._prepare_end_checkpoints(
+                input_batch,
+                spec_rows,
+                block_tables,
+                mamba_group_ids,
+                mamba_spec.block_size,
+                num_computed_tokens,
+            )
         run_mamba_align_precopy(
             ctx,
             input_batch.num_reqs,
@@ -348,7 +447,57 @@ class MambaHybridModelState(DefaultModelState):
             input_batch.idx_mapping,
             input_batch.query_start_loc,
             spec_state_replay=self._spec_state_replay,
+            plain_pending=(
+                self._native_replay.plain_pending
+                if self._native_replay is not None
+                else None
+            ),
         )
+
+    def _prepare_end_checkpoints(
+        self,
+        batch: InputBatch,
+        spec_rows: np.ndarray,
+        block_tables: tuple[torch.Tensor, ...],
+        group_ids: list[int],
+        block_size: int,
+        num_computed_tokens: torch.Tensor,
+    ) -> None:
+        # The scheduler position includes outstanding proposals. Only rows
+        # that could end exactly at a boundary need a post-sampling launch.
+        ends = batch.num_computed_tokens_np[spec_rows]
+        ends = ends + batch.num_scheduled_tokens[spec_rows]
+        reaches_boundary = (ends >= block_size) & (
+            ends % block_size <= self._max_unsettled_draft_tokens
+        )
+        rows = spec_rows[reaches_boundary]
+        self._end_checkpoints = None
+        if not len(rows):
+            return
+        device_rows = torch.from_numpy(rows).to(self.device, non_blocking=True)
+        reqs = batch.idx_mapping.index_select(0, device_rows).long()
+        starts = batch.query_start_loc.index_select(0, device_rows)
+        widths = batch.query_start_loc.index_select(0, device_rows + 1) - starts
+        # The same live device counter drove align and the verifier. A host
+        # candidate that misses the exact endpoint keeps its pending prefix.
+        after = num_computed_tokens.index_select(0, reqs) + widths
+        cols = ((after - 1) // block_size).long()
+        widths = torch.where(after % block_size == 0, widths, 0)
+        slots = tuple(block_tables[g][device_rows, cols] for g in group_ids)
+        self._end_checkpoints = reqs, widths, slots
+
+    def _publish_end_checkpoints(self, replay: SpecReplayState) -> None:
+        plan, self._end_checkpoints = self._end_checkpoints, None
+        if plan is None:
+            return
+        reqs, widths, slots = plan
+        accepted = replay.accepted.index_select(0, reqs)
+        complete = (widths > 0) & (accepted == widths)
+        counts = torch.where(complete, accepted, 0)
+        rmap = (2 * reqs + (replay.side.index_select(0, reqs) ^ 1)).int()
+        for group, layer in self._native_layers:
+            layer.commit_deferred_replay(layer.kv_cache[1], slots[group], counts, rmap)
+        replay.verified.index_copy_(0, reqs, (~complete).int())
 
     def _get_dflash2_gdn_builders(
         self,
@@ -388,6 +537,7 @@ class MambaHybridModelState(DefaultModelState):
         kv_cache_config: KVCacheConfig,
         for_capture: bool = False,
     ) -> dict[str, Any]:
+        self._bind_native_replay(kv_cache_config)
         if cudagraph_mode == CUDAGraphMode.FULL:
             num_reqs = input_batch.num_reqs_after_padding
             num_tokens = input_batch.num_tokens_after_padding
@@ -562,7 +712,7 @@ class MambaHybridModelState(DefaultModelState):
                     == common_gdn_metadata.num_spec_decode_tokens
                 )
         self._spec_replay_step = None
-        if self._spec_state_replay and not for_capture:
+        if self._spec_state_replay and self._native_replay is None and not for_capture:
             assert num_decode_draft_tokens_cpu is not None
             self._spec_replay_step = self._make_spec_replay_step(
                 attn_metadata,
@@ -597,8 +747,10 @@ class MambaHybridModelState(DefaultModelState):
             for layer_name in group.layer_names:
                 layer = forward_context.get(layer_name)
                 metadata = attn_metadata.get(layer_name)
-                if not getattr(layer, "spec_state_replay", False) or not isinstance(
-                    metadata, GDNAttentionMetadata
+                if (
+                    layer is None
+                    or not getattr(layer, "spec_state_replay", False)
+                    or not isinstance(metadata, GDNAttentionMetadata)
                 ):
                     continue
                 if metadata.num_spec_decodes <= 0:
@@ -627,6 +779,9 @@ class MambaHybridModelState(DefaultModelState):
                         group_id=group_id,
                         base_state_ids=base_state_ids,
                         cu_seqlens=cu_seqlens,
+                        native_width=layer.native_gdn_verify_width(
+                            metadata, *layer_launch
+                        ),
                     )
                 )
         if launch is None:
@@ -662,6 +817,11 @@ class MambaHybridModelState(DefaultModelState):
                 _scatter_num_accepted_kernel[(num_reqs,)](
                     idx_mapping, num_sampled, self.num_accepted_tokens_gpu
                 )
+        if self._native_replay is not None:
+            self._native_replay.record_accepted(
+                idx_mapping, self.num_accepted_tokens_gpu
+            )
+            self._publish_end_checkpoints(self._native_replay)
         step, self._spec_replay_step = self._spec_replay_step, None
         if step is not None and isinstance(num_sampled, torch.Tensor):
             assert num_computed_tokens is not None and self._mamba_spec is not None
@@ -686,6 +846,7 @@ class MambaHybridModelState(DefaultModelState):
                 num_computed_tokens,
                 idx_mapping,
                 spec_state_replay=self._spec_state_replay,
+                deferred_replay=self._native_replay is not None,
             )
 
 

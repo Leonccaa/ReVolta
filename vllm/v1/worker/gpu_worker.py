@@ -846,6 +846,16 @@ class Worker(WorkerBase):
 
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
+        if self.vllm_config.kernel_config.topology_all_reduce.enabled and not getattr(
+            self, "_topology_all_reduce_installed", False
+        ):
+            from vllm.distributed.device_communicators.topology_all_reduce import (
+                startup,
+            )
+
+            self._topology_all_reduce_routes = startup.install(self)
+            self._topology_all_reduce_installed = True
+
         warmup_sizes: list[int] = []
 
         if self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:
@@ -1005,6 +1015,8 @@ class Worker(WorkerBase):
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
 
+        self._warmup_multimodal_rotary()
+
         # All warmup is done — start monitoring for unexpected JIT
         # compilations that would cause latency spikes during inference.
         from vllm.triton_utils.jit_monitor import (
@@ -1018,6 +1030,40 @@ class Worker(WorkerBase):
             language_model=self.compilation_config.compilation_time,
             encoder=self.compilation_config.encoder_compilation_time,
         )
+
+    @torch.inference_mode()
+    def _warmup_multimodal_rotary(self) -> None:
+        """Warm encoder rotary specializations before starting JIT monitoring."""
+        mm_config = self.model_config.multimodal_config
+        device = self.device
+        if mm_config is None or mm_config.language_model_only:
+            return
+        if device is None or device.type != "cuda":
+            return
+
+        from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
+
+        seen: set[tuple[int, int, bool, bool]] = set()
+        for module in self.get_model().modules():
+            rotary = getattr(module, "apply_rotary_emb", None)
+            if not isinstance(rotary, ApplyRotaryEmb):
+                continue
+            heads = getattr(module, "num_attention_heads_per_partition", None)
+            head_dim = getattr(module, "hidden_size_per_attention_head", None)
+            if heads is None or head_dim is None:
+                continue
+            spec = (heads, head_dim, rotary.is_neox_style, rotary.enable_fp32_compute)
+            if spec in seen:
+                continue
+            seen.add(spec)
+            dtype = self.model_config.dtype
+            # Triton specializes both sequence extents on 16-row alignment.
+            for seq_len in (4, 16):
+                qk = torch.zeros(
+                    (2, seq_len, heads, head_dim), dtype=dtype, device=device
+                )
+                cos = torch.ones((seq_len, head_dim // 2), dtype=dtype, device=device)
+                rotary(qk, cos, torch.zeros_like(cos))
 
     @staticmethod
     def _freeze_gc_after_warmup() -> None:

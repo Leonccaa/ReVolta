@@ -129,7 +129,9 @@ rule. `"greedy"` still works. MTP must stay `"greedy"`; see
 
 ## Native history lookup (optional)
 
-Native lookup is **off by default**. It searches committed token history for a
+For the profile's lookup defaults and opt-out, see [Native DFlash2 lookup](configuration.md#native-dflash2-lookup).
+
+Lookup searches committed token history for a
 continuation and fuses it into the seven-token DFlash2 proposal when the first
 lookup token agrees with the neural proposal. The original first token and its
 proposal distribution are preserved. Short continuations replace only the
@@ -157,18 +159,14 @@ into the DFlash2 speculative config above, retaining its model and other setting
 }
 ```
 
-Use `--no-async-scheduling` for the recommended GDN replay setup. Omitting
-`dflash2_lookup` or setting `"enabled": false` leaves lookup disabled.
-When enabling it, `policy`, `nmin` and
-`nmax` must be explicit; no lookup recipe is selected automatically.
+Use `--no-async-scheduling` for the recommended GDN replay setup.
 
-- A batch of one to `max_requests` eligible decode requests attempts lookup.
-  `max_requests` defaults to 3 and accepts integers from 1 to 3; set it to 1 to
-  restore single-request admission without rebuilding the image. Mixed prefill,
-  grammar constraints, any row without a sampled token or sufficient sequence
-  space, and batches whose current scheduler K is below seven
-  bypass lookup for the whole batch. Eligibility is recalculated every round.
-  Padding rows do not count; returning to an eligible batch resumes immediately.
+- For batches of one to `max_requests` live requests at scheduler K=7,
+  each eligible decode row attempts lookup independently. Prefill, structured
+  output, padding, and rows without a sampled token or usable history do not
+  attempt lookup. Eligibility is recalculated every round. `max_requests`
+  defaults to 3 and accepts integers from 1 to 3; set it to 1 to limit lookup to
+  single-request batches. Padding does not count toward this batch limit.
 - The configured proposal/resource width remains seven; it does not expand to
   fifteen or allocate per-request q16 graphs. The DSD schedule
   can still reduce the published width: with the example above,

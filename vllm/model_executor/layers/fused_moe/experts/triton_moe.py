@@ -6,6 +6,7 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
+from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -17,6 +18,8 @@ from vllm.model_executor.layers.fused_moe.experts.lora_experts_mixin import (
 )
 from vllm.model_executor.layers.fused_moe.fused_moe import (
     _prepare_expert_assignment,
+    _sm70_mtp_moe_fp16_exact_enabled,
+    _sm70_mtp_moe_fp16_shape_supported,
     dispatch_fused_moe_kernel,
     invoke_fused_moe_wna16_triton_kernel,
     try_get_optimal_moe_config,
@@ -62,6 +65,7 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         # Whether quantized MOE runs natively, or through
         # higher-precision + activation QDQ.
         self.quantization_emulation = False
+        self.sm70_mtp_fp16_batch = False
         super().__init__(moe_config, quant_config)
 
     @staticmethod
@@ -233,6 +237,75 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             workspace13, (num_tokens * top_k_num, cache2_dim)
         )
         intermediate_cache3 = _resize_cache(workspace2, (num_tokens, top_k_num, K))
+
+        if (
+            self.sm70_mtp_fp16_batch
+            and 2 <= num_tokens <= 80
+            and num_tokens != 5
+            and _sm70_mtp_moe_fp16_exact_enabled()
+            and use_sm70_decode_graph_semantics()
+            and self._lora_context is None
+            and activation == MoEActivation.SILU
+            and global_num_experts == 512
+            and expert_map is None
+            and expert_tokens_meta is None
+            and not apply_router_weight_on_input
+            and self.w1_bias is None
+            and self.w2_bias is None
+            and a1q_scale is None
+            and a2_scale is None
+            and topk_ids.is_contiguous()
+        ):
+            ids = topk_ids.view(-1)
+            if (
+                _sm70_mtp_moe_fp16_shape_supported(
+                    hidden_states,
+                    w1,
+                    intermediate_cache1,
+                    topk_weights,
+                    ids,
+                    top_k_num,
+                    False,
+                    batched=True,
+                )
+                and _sm70_mtp_moe_fp16_shape_supported(
+                    intermediate_cache2,
+                    w2,
+                    intermediate_cache3,
+                    topk_weights,
+                    ids,
+                    1,
+                    True,
+                    batched=True,
+                )
+                and w1.data_ptr() % 16 == w2.data_ptr() % 16 == 0
+            ):
+                # The native BM2 projections consume one block per route.
+                # The grouped Triton assignment uses a different padded count.
+                padded = ids.new_full((1,), 2 * ids.numel())
+                ops.sm70_mtp_moe_fp16_v154_out(
+                    intermediate_cache1,
+                    hidden_states,
+                    w1,
+                    ids,
+                    topk_weights,
+                    padded,
+                    False,
+                )
+                self.activation(
+                    activation, intermediate_cache2, intermediate_cache1.view(-1, N)
+                )
+                ops.sm70_mtp_moe_fp16_v154_out(
+                    intermediate_cache3,
+                    intermediate_cache2,
+                    w2,
+                    ids,
+                    topk_weights,
+                    padded,
+                    True,
+                )
+                self.moe_sum(intermediate_cache3, output)
+                return
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = (
             _prepare_expert_assignment(

@@ -92,7 +92,7 @@ def test_components_join_attempt_without_revoking_shared_g0(
 
 
 def test_seal_only_failure_exit_reclaims_keyless_cached_pages():
-    scheduler, connector, request, bindings = setup_receive(page_state="private")
+    scheduler, connector, _, bindings = setup_receive(page_state="private")
     pool = scheduler.host_history_pool
     m = UnifiedStoreManager(
         SimpleNamespace(
@@ -105,7 +105,7 @@ def test_seal_only_failure_exit_reclaims_keyless_cached_pages():
     assert pool.elastic
     assert all(pool.host_pages.get(h).key is None for _, h in bindings.values())
     assert any(pool._cached_page_reclaimable([hid]) for hid in bindings)
-    # Exhaust all unbound capacity so unified admission must revoke a cached
+    # Exhaust all unbound capacity so the physical reservation must revoke a cached
     # binding left by successful computation / failed seal / producer exit.
     table = pool.host_pages
     spare = []
@@ -114,10 +114,10 @@ def test_seal_only_failure_exit_reclaims_keyless_cached_pages():
         assert h is not None
         table.pin(h, 9876)
         spare.append(h)
-    assert m.admit_build(request.request_id, 1)
+    frames = m.ledger.reserve_frames(1, "optional_store")
+    assert frames is not None
     assert pool.stats["cached_evicted_for_host"] > 0
-    assert m.ledger.requests[request.request_id].unused == 1
-    m.cancel_request(request.request_id)
+    m.ledger.release_temporary(frames)
     for h in spare:
         table.release(h, 9876)
 

@@ -179,8 +179,7 @@ use a larger CPU pool and set `max_size_bytes` to your disk budget.
   2 GiB with MTP4 and about 5 GB with DFlash2). Otherwise the request is computed
   again. The quick-start 48 GiB pool holds about 2.4M tokens with MTP4; with DFlash2 the
   same pool holds about 1M tokens, an estimate from the same about 50 KB per token.
-- The SSD tier is **not supported with INT8 KV** yet. That combination is
-  rejected at configuration time.
+- For planar INT8, use the `revolta_fs` tier described below.
 
 Validation scope: the full release gate passed with the SSD tier on a network file
 system (8 GiB CPU pool, 40 GiB disk budget), including a 99K-token prefix restored from
@@ -198,12 +197,11 @@ slow the restart. See [Coming back to a document](performance.md#coming-back-to-
 filesystem tier meant to keep conversations reusable across engine restarts. Use
 `"type": "revolta_fs"` instead of `"fs"`; every `fs` key above still applies.
 
-L1 planar E4M3 is now named `fp8_per_token_head`; eligible QSA `auto` requests
-also select it. Its codec name and page layout isolate its SSD namespace from
-the old planar name and scalar E4M3, so those files miss rather than migrate.
-Explicit `fp8` / `fp8_e4m3` scalar identities remain unchanged. The readback
-measurements above describe the original scalar format; CPU checks of planar
-storage do not establish GPU/SSD release acceptance.
+Eligible QSA `auto` selects planar INT8 on SM70 and `fp8_per_token_head` on other
+supported CUDA devices. The `revolta_fs` tier persists the planar INT8 K/V scale
+planes with each page. Planar INT8, planar E4M3 and calibrated scalar E4M3 use
+separate SSD namespaces. Existing files under a different codec or page layout
+miss and are recomputed. The readback measurements above used scalar E4M3.
 
 The tier adds:
 
@@ -316,7 +314,7 @@ candidates into the same selection an unsplit indexer would make. With TP4/DCP2
 this halves the GPU bytes of every history ID's index again, so the same budget
 holds about twice as many contexts. Cached pages written with a narrower split
 are not read back. `kernel_config.long_context_kv.draft_main_placement` chooses
-where such a sharded draft's main K/V lives (default `host`); the draft index
+where a matching draft's main K/V lives (default `host`); the draft index
 and raw-key ring always stay in GPU history.
 
 - `"host"` (default): the draft's main K/V is one more layer of the host
@@ -337,10 +335,11 @@ long context, where the number of history IDs limits throughput. Set `"gpu"`
 explicitly when single-request speed matters more than context concurrency,
 when pinned host memory is tight, or when output must stay bitwise comparable
 with releases that defaulted to `"gpu"`. `"host"` needs
-`main_kv_placement="host"` and a draft that shares the target's sharded
-geometry (`qsa_dcp_index_shard` with DCP); if either is missing, the draft
-stays on the GPU and a warning is logged. Changing the value changes the host
-row layout, so an SSD tier written with the other value is not read back.
+`main_kv_placement="host"` and matching target/draft storage formats and page
+geometry. DCP2 also requires `qsa_dcp_index_shard`. A draft with a different
+format or geometry stays on the GPU and logs a warning. Changing the value
+changes the host row layout, so an SSD tier written with the other value is not
+read back.
 
 `speculative_config.gdn_state_replay=true` replays the accepted target GDN
 inputs for MTP, so recurrent layers keep two state blocks per request instead
@@ -377,6 +376,61 @@ evicts cached prefix indexes beyond their share, then shrinks the hot region to
 the floor, and only then preempts. Every worker uses one common plan, so pass
 plans match across ranks. `VLLM_SM70_HOST_KV_STATIC_HOT_POOL=1` restores the
 separate static pool.
+
+## KV capacity in long-context Host KV mode
+
+These RC15 sizing examples use Qwen3.8 Flash-Next AWQ, four 32 GiB V100s,
+TP4/DCP2, TP-wide compressed-index sharding, `max_num_seqs=8` and
+`--gpu-memory-utilization 0.956`. Startup measurements use PCIe V100s.
+DFlash2 planner rows reuse its measured per-GPU budget. MTP4 rows use an
+estimated budget. Apply the planner rows to SXM2 with the same cache
+geometry and per-GPU budget.
+
+The host row uses **13,248 bytes per logical token for DFlash2 with planar
+INT8**. The same row uses 13,056 bytes with calibrated E4M3. A local token in
+one QSA layer stores 512 bytes of INT8 K/V payload and two 4-byte FP32 scales.
+Summed over the DCP shards and 12 target layers, the scale planes add 192
+bytes per logical token. The row also includes the compressed target index.
+DFlash2 keeps its sliding-window FP16 draft KV on the GPU. With MTP4 the
+host row also carries the draft layer's K/V and compressed index. It uses
+**14,352 bytes per logical token with planar INT8** (14,144 with calibrated
+E4M3) for either draft placement. The additional 208 bytes cover both FP32
+scale planes across all 13 QSA layers. [RC11 E4M3 table](https://github.com/Leonccaa/ReVolta/releases/tag/v0.2.0rc11#kv-capacity-in-long-context-host-kv-mode)
+
+| Configuration | Context per request | Host pool | Full-context requests (planner bound) | Usable Host KV tokens | SSD payload estimate (350 GiB) | GPU-indexable history tokens | Capacity basis |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | --- |
+| DFlash2 | 524,288 | 98 GiB | 8 (GPU state, max sequences) | 7,940,608 | 28,366,208 | 26,625,664 | Startup |
+| DFlash2 | 524,288 | 192 GiB | 8 (GPU state, max sequences) | 15,558,400 | 28,366,208 | 26,625,664 | Planner |
+| DFlash2 | 1,048,576 | 98 GiB | 7 (host pool) | 7,940,608 | 28,366,208 | 26,614,016 | Planner |
+| DFlash2 | 1,048,576 | 192 GiB | 8 (GPU state, max sequences) | 15,558,400 | 28,366,208 | 26,614,016 | Planner |
+| MTP4, draft K/V on GPU | 524,288 | 98 GiB | 8 (GPU state, max sequences) | 7,329,312 | 26,183,808 | 11.9 M | Planner |
+| MTP4, draft K/V on GPU | 524,288 | 192 GiB | 8 (GPU state, max sequences) | 14,361,600 | 26,183,808 | 11.9 M | Planner |
+| MTP4, draft K/V on GPU | 1,048,576 | 98 GiB | 6 (host pool) | 7,329,312 | 26,183,808 | 11.9 M | Planner |
+| MTP4, draft K/V on GPU | 1,048,576 | 192 GiB | 8 (GPU state, hot pages, max sequences) | 14,361,600 | 26,183,808 | 11.9 M | Planner |
+| MTP4, draft K/V on host | 524,288 | 98 GiB | 8 (GPU state, max sequences) | 7,329,312 | 26,183,808 | 25.6 M | Planner |
+| MTP4, draft K/V on host | 524,288 | 192 GiB | 8 (GPU state, max sequences) | 14,361,600 | 26,183,808 | 25.6 M | Planner |
+| MTP4, draft K/V on host | 1,048,576 | 98 GiB | 6 (host pool) | 7,329,312 | 26,183,808 | 25.6 M | Planner |
+| MTP4, draft K/V on host | 1,048,576 | 192 GiB | 8 (GPU state, max sequences) | 14,361,600 | 26,183,808 | 25.6 M | Planner |
+
+The DFlash2 startup allocated a 98 GiB host pool of 4,773 pages with 1,664
+tokens per page. One reserved page leaves 7,940,608 usable tokens. Its
+per-GPU planner budget was 6.34 GiB after weights, activations and CUDA
+graphs. For MTP4 the engine planner uses a 1,632-token history block and
+about 6.05 GiB per GPU. The estimate starts with the DFlash2 Host KV
+planner's 6.34 GiB budget and subtracts the 0.29 GiB difference between the
+GPU KV startup profiles at 0.956 (6.35 GiB for DFlash2 and 6.06 GiB for MTP4).
+Use the budget in your startup log when sizing your deployment.
+
+The engine's `plan_long_context_capacity` takes the minimum of GPU state,
+GPU history, Host KV, GPU hot-page and configured request limits. Each bound
+assumes all requests are at the listed context length. Startup measures page
+allocation. Full-context concurrency and SSD payload are arithmetic estimates.
+The SSD column rounds the byte budget down to whole pages before file
+overhead. GPU-indexable history is an address limit for shared history IDs.
+
+**GPU KV mode:** use the engine log's `GPU KV cache size` in tokens at the
+configured `max_model_len`. The Host KV table uses the allocated host pages
+and the corresponding GPU history and hot pools.
 
 ## GDN state replay
 

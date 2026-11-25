@@ -40,7 +40,7 @@ def tensor_descriptor(m, k):
     )
 
 
-@pytest.mark.parametrize("rows", (1, 2, 3, 4, 7, 8, 9, 16, 32))
+@pytest.mark.parametrize("rows", (1, 2, 3, 4, 7, 8, 9, 12, 16, 24, 32))
 @pytest.mark.parametrize(
     "role,n,k,limit",
     (
@@ -53,7 +53,7 @@ def tensor_descriptor(m, k):
 def test_only_winning_batch_shapes_are_admitted(rows, role, n, k, limit):
     x, w = tensor_descriptor(rows, k), tensor_descriptor(n, k)
     assert gemv._can_use_dense_batch(x, w, "model.layers.0." + role) == (
-        2 <= rows <= limit
+        2 <= rows <= limit or (rows == 12 and limit == 8)
     )
 
 
@@ -103,7 +103,7 @@ def test_dense_permission_survives_fake_export():
     assert len(calls) == 1 and calls[0].args[-1] is True
 
 
-@pytest.mark.parametrize("rows", (2, 4, 5, 8))
+@pytest.mark.parametrize("rows", (2, 4, 5, 8, 12))
 def test_reduced_precision_output_keeps_baseline_schedule(rows):
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
     assert gemv._can_use_dense_batch(

@@ -16,10 +16,11 @@ class HostRegionLayout:
     num_workers: int
     main_bytes: int
     index_bytes: tuple[int, ...]
+    component_bytes: int = 0
 
     @property
     def worker_bytes(self) -> int:
-        return self.main_bytes + sum(self.index_bytes)
+        return max(self.main_bytes + sum(self.index_bytes), self.component_bytes)
 
     def open(self, rank: int | None) -> SharedOffloadRegion:
         return SharedOffloadRegion(
@@ -71,7 +72,8 @@ def host_region_layout(config: KVCacheConfig, instance_id: str) -> HostRegionLay
         for name in group.layer_names
         if name not in names
     )
-    worker_bytes = config.host_kv_page_size_bytes + sum(sizes)
+    component_bytes = plan.geometry.host_component_bytes_per_block
+    worker_bytes = max(config.host_kv_page_size_bytes + sum(sizes), component_bytes)
     num_pages = plan.host_pool_bytes // (worker_bytes * plan.geometry.num_workers)
     if num_pages < 2:
         raise ValueError("Host pool needs ZERO_PAGE and at least one data page")
@@ -81,4 +83,5 @@ def host_region_layout(config: KVCacheConfig, instance_id: str) -> HostRegionLay
         plan.geometry.num_workers,
         config.host_kv_page_size_bytes,
         sizes,
+        component_bytes,
     )

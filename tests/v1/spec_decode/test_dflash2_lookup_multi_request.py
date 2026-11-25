@@ -62,7 +62,8 @@ def multi_fixture(n=3, limit=3, padded=4):
     scores = logits.clone()
     batch = SimpleNamespace(
         num_reqs=n,
-        has_structured_output_reqs=False,
+        req_ids=[f"req-{row}" for row in range(n)],
+        structured_output_req_ids=None,
         is_prefilling_np=np.zeros(n, dtype=bool),
     )
     sampled = torch.ones(padded, dtype=torch.int32, device=DEVICE)
@@ -132,19 +133,26 @@ def test_multi_row_history_q_and_exact_counts(n, sparse):
         "no_space",
         "short",
         "invalid_slot",
+        "all_prefill",
+        "all_unsampled",
         "width",
         "limit",
         "profile",
     ],
 )
-def test_mixed_batch_is_all_or_none_and_recovers(reason):
+def test_row_admission_isolated_and_recovers(reason):
     parts = multi_fixture(n=3)
     native, states, mapping, draft, logits, ids, scores, batch, sampled = parts
     original = [x.clone() for x in (draft, logits, ids, scores)]
     if reason == "prefill":
         batch.is_prefilling_np[1] = True
+        states.total_len.gpu[[5, 7]] = 56
+        for slot in (5, 7):
+            history = states.all_token_ids.gpu[slot]
+            history[54:56] = history[4:6]
+            history[4:54] = 15
     elif reason == "grammar":
-        batch.has_structured_output_reqs = True
+        batch.structured_output_req_ids = {batch.req_ids[1]}
     elif reason == "no_sample":
         sampled[1] = 0
     elif reason == "no_space":
@@ -153,21 +161,35 @@ def test_mixed_batch_is_all_or_none_and_recovers(reason):
         states.total_len.gpu[1] = 2
     elif reason == "invalid_slot":
         mapping[7:14] = -1
+    elif reason == "all_prefill":
+        batch.is_prefilling_np[:] = True
+    elif reason == "all_unsampled":
+        sampled.zero_()
     elif reason == "limit":
         batch.num_reqs = 4
         batch.is_prefilling_np = np.zeros(4, dtype=bool)
     apply_fixture(parts, width=3 if reason == "width" else 7, real=reason != "profile")
-    assert native.eligible.tolist() == [0] * 4, "MIXED_BATCH_BYPASS"
-    assert not native.use.any()
-    assert not native.tokens.any()
-    assert native.stats.counters.tolist() == [0] * 18
-    for actual, expected in zip((draft, logits, ids, scores), original):
-        assert torch.equal(actual, expected)
+    if reason in ("all_prefill", "all_unsampled", "limit", "width", "profile"):
+        assert native.eligible.tolist() == [0] * 4
+        assert not native.use.any()
+        assert not native.tokens.any()
+        assert native.stats.counters.tolist() == [0] * 18
+        for actual, expected in zip((draft, logits, ids, scores), original):
+            assert torch.equal(actual, expected)
+    else:
+        assert native.eligible.tolist() == [1, 0, 1, 0]
+        assert native.use[[0, 2], 1:].any(dim=1).all()
+        assert not native.use[[1, 3]].any()
+        assert not native.tokens[[1, 3]].any()
+        assert native.stats.counters.tolist()[:4] == [2] * 4
+        assert torch.equal(draft[[1, 3]], original[0][[1, 3]])
+        for actual, expected in zip((logits, ids, scores), original[1:]):
+            assert torch.equal(actual[1], expected[1])
     # Restore a clean batch without recreating the instance or a cooldown.
     fresh = multi_fixture(n=3)
     batch.num_reqs = 3
     batch.is_prefilling_np = np.zeros(3, dtype=bool)
-    batch.has_structured_output_reqs = False
+    batch.structured_output_req_ids = None
     mapping.copy_(fresh[2])
     states.total_len.gpu.copy_(fresh[1].total_len.gpu)
     sampled.fill_(1)
@@ -342,13 +364,21 @@ def test_multi_request_real_capture_replay(limit):
     torch.accelerator.synchronize()
     assert native.eligible.tolist() == [1] * batch.num_reqs + [0] * (4 - batch.num_reqs)
     assert native.stats.counters.cpu().tolist()[:4] == [batch.num_reqs] * 4
-    # Invalidate one live row, then restore; no recapture and no stale admission.
-    sampled[0] = 0
+    # Update the row mask and restore it without recapturing the graph.
+    batch.is_prefilling_np[0] = True
     native.prepare(batch, sampled, real_run=True)
     graph.replay()
     torch.accelerator.synchronize()
-    assert not native.eligible.any()
-    assert native.stats.counters.cpu().tolist()[:4] == [batch.num_reqs] * 4
+    assert native.eligible.tolist() == [0] + [1] * (batch.num_reqs - 1) + [0] * (
+        4 - batch.num_reqs
+    )
+    assert not native.use[0].any()
+    assert int(native.stats.counters[0]) == 2 * batch.num_reqs - 1
+    batch.is_prefilling_np[0] = False
+    native.prepare(batch, sampled, real_run=True)
+    graph.replay()
+    torch.accelerator.synchronize()
+    assert native.eligible.tolist() == [1] * batch.num_reqs + [0] * (4 - batch.num_reqs)
 
 
 @pytest.mark.parametrize("n", [2, 3])

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
+import os
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +21,8 @@ def workspace_cache(monkeypatch):
     monkeypatch.setattr(
         torch.cuda, "current_stream", lambda device: SimpleNamespace(cuda_stream=123)
     )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(ops, "_SM70_QSA_GROUPED_PAGE4_SCRATCH", {})
     yield
     ops._SM70_QSA_XQA_PAGE4_WORKSPACES.clear()
     ops._SM70_QSA_XQA_PAGE4_WORKSPACES.update(saved)
@@ -28,15 +32,12 @@ def _query(rows=3):
     return torch.zeros(rows, 6, 256, dtype=torch.float16)
 
 
-@pytest.mark.parametrize(
-    "kv_dtype,expected",
-    [("fp8_e4m3", torch.float32), ("auto", torch.float16), ("float16", torch.float16)],
-)
-def test_workspace_matches_native_output_contract_on_cpu(kv_dtype, expected):
+@pytest.mark.parametrize("partial_dtype", [torch.float16, torch.float32])
+def test_workspace_matches_native_output_contract_on_cpu(partial_dtype):
     temporary, maximum, sums, active = ops._qsa_xqa_page4_workspace(
-        _query(), 8, kv_dtype
+        _query(), 8, partial_dtype
     )
-    assert temporary.dtype == expected
+    assert temporary.dtype == partial_dtype
     assert temporary.shape == (3, 6, 8, 256)
     assert maximum.dtype == sums.dtype == torch.float32
     assert active.dtype == torch.int32 and active.tolist() == [8]
@@ -44,39 +45,104 @@ def test_workspace_matches_native_output_contract_on_cpu(kv_dtype, expected):
 
 def test_workspace_cache_separates_incompatible_dtypes():
     query = _query()
-    e4m3 = ops._qsa_xqa_page4_workspace(query, 8, "fp8_e4m3")[0]
-    fp16 = ops._qsa_xqa_page4_workspace(query, 8, "auto")[0]
+    e4m3 = ops._qsa_xqa_page4_workspace(query, 8, torch.float32)[0]
+    fp16 = ops._qsa_xqa_page4_workspace(query, 8, torch.float16)[0]
     assert e4m3.data_ptr() != fp16.data_ptr()
-    cached_e4m3 = ops._qsa_xqa_page4_workspace(query, 8, "fp8_e4m3")[0]
-    cached_fp16 = ops._qsa_xqa_page4_workspace(query, 8, "float16")[0]
+    cached_e4m3 = ops._qsa_xqa_page4_workspace(query, 8, torch.float32)[0]
+    cached_fp16 = ops._qsa_xqa_page4_workspace(query, 8, torch.float16)[0]
     assert cached_e4m3.data_ptr() == e4m3.data_ptr()
     assert cached_fp16.data_ptr() == fp16.data_ptr()
 
 
 def test_workspace_cache_separates_streams(monkeypatch):
-    first = ops._qsa_xqa_page4_workspace(_query(), 8, "fp8_e4m3")[0]
+    first = ops._qsa_xqa_page4_workspace(_query(), 8, torch.float32)[0]
     monkeypatch.setattr(
         torch.cuda, "current_stream", lambda device: SimpleNamespace(cuda_stream=124)
     )
-    second = ops._qsa_xqa_page4_workspace(_query(), 8, "fp8_e4m3")[0]
+    second = ops._qsa_xqa_page4_workspace(_query(), 8, torch.float32)[0]
     assert first.data_ptr() != second.data_ptr()
 
 
-def test_workspace_grows_without_reusing_an_undersized_allocation():
-    small = ops._qsa_xqa_page4_workspace(_query(), 8, "fp8_e4m3")[0]
-    large = ops._qsa_xqa_page4_workspace(_query(7), 8, "fp8_e4m3")[0]
-    assert large.shape == (7, 6, 8, 256)
-    assert large.data_ptr() != small.data_ptr()
-    again = ops._qsa_xqa_page4_workspace(_query(5), 8, "fp8_e4m3")[0]
-    assert again.data_ptr() == large.data_ptr()
+def test_workspace_reserves_capture_width_and_keeps_its_address():
+    from vllm.forward_context import ForwardContext, override_forward_context
+
+    context = ForwardContext({}, {}, {}, max_cudagraph_capture_size=40)
+    with override_forward_context(context):
+        target = ops._qsa_xqa_page4_workspace(_query(5), 9, torch.float32)[0]
+        draft = ops._qsa_xqa_page4_workspace(_query(40), 9, torch.float32)[0]
+        eager = ops._qsa_xqa_page4_workspace(_query(48), 9, torch.float32)[0]
+        replay = ops._qsa_xqa_page4_workspace(_query(5), 9, torch.float32)[0]
+    assert draft.shape == (40, 6, 9, 256)
+    assert eager.shape == (48, 6, 9, 256)
+    assert target.data_ptr() == draft.data_ptr() == replay.data_ptr()
+    assert eager.data_ptr() != target.data_ptr()
 
 
 def test_workspace_partition_count_is_part_of_the_cache_key():
-    first = ops._qsa_xqa_page4_workspace(_query(), 8, "fp8_e4m3")
-    second = ops._qsa_xqa_page4_workspace(_query(), 16, "fp8_e4m3")
+    first = ops._qsa_xqa_page4_workspace(_query(), 8, torch.float32)
+    second = ops._qsa_xqa_page4_workspace(_query(), 16, torch.float32)
     assert second[0].shape == (3, 6, 16, 256)
     assert second[0].data_ptr() != first[0].data_ptr()
     assert second[3].tolist() == [16]
+
+
+def test_grouped_scratch_reuses_buffers_and_separates_output_dtypes():
+    query = _query(16)
+    first = ops._qsa_grouped_page4_scratch(query, 16, torch.float32)
+    second = ops._qsa_grouped_page4_scratch(query, 8, torch.float32)
+    assert [t.shape[0] for t in second] == [8, 8]
+    assert [t.data_ptr() for t in first] == [t.data_ptr() for t in second]
+    different = ops._qsa_grouped_page4_scratch(query, 8, torch.float16)
+    assert different[1].dtype == torch.float16
+    assert different[1].data_ptr() != first[1].data_ptr()
+
+
+@pytest.mark.skipif(
+    os.environ.get("TRITON_INTERPRET") != "1", reason="CPU Triton interpreter required"
+)
+@pytest.mark.parametrize("owner_tokens", [4, 64, 784])
+def test_xqa_page4_plan_matches_selected_tokens_during_mtp(owner_tokens):
+    # Fresh selections and later steps reusing them, including both sides
+    # of a four-token boundary and rows that fill the selector budget.
+    prefixes = [(1, 1), (4, 4), (7, 7), (7, 8), (8, 12), (2051, 2051), (4103, 4107)]
+    rows = len(prefixes)
+    num_blocks = math.ceil(max(current for _, current in prefixes) / owner_tokens)
+    table = torch.arange(num_blocks - 1, -1, -1, dtype=torch.int32).expand(rows, -1)
+    requests = torch.arange(rows, dtype=torch.int32)
+    lengths = torch.tensor([current for _, current in prefixes], dtype=torch.int32)
+    indices = torch.full((rows, 2051), -1, dtype=torch.int32)
+    selections = []
+    for row, (selected, _) in enumerate(prefixes):
+        complete, tail = divmod(selected, 4)
+        complete_pages = torch.arange(min(complete, 512), dtype=torch.int32)
+        if complete > 512:
+            # A normal top-k selection can omit pages and be out of order.
+            complete_pages = (complete_pages * 2).flip(0)
+        tokens = (complete_pages[:, None] * 4 + torch.arange(4)).flatten()
+        tail_tokens = torch.arange(complete * 4, complete * 4 + tail)
+        selection = torch.cat((tokens, tail_tokens))
+        indices[row, : selection.numel()] = selection
+        selections.append(selection.sort().values)
+
+    pages, selected_lengths = ops._qsa_xqa_page4_block_table(
+        indices,
+        table,
+        requests,
+        lengths.to(torch.int64) - 1,
+        lengths,
+        num_blocks,
+        owner_tokens,
+    )
+    for row, selection in enumerate(selections):
+        selected_count = selected_lengths[row].item()
+        assert selected_count == selection.numel()
+        page_ids = pages[row, : math.ceil(selected_count / 4)]
+        physical_tokens = (page_ids[:, None] * 4 + torch.arange(4)).flatten()
+        expected = (
+            table[row, selection // owner_tokens] * owner_tokens
+            + selection % owner_tokens
+        )
+        torch.testing.assert_close(physical_tokens[:selected_count], expected)
 
 
 @pytest.mark.parametrize("block,route,rows", [(4, "decode", 3), (64, "grouped", 9)])
@@ -134,7 +200,11 @@ def test_planar_int8_native_mapping_and_workspace(block, route, rows, monkeypatc
         grouped_sparse_int8_page4_fwd=forward,
         grouped_sparse_page4_plan_fwd=grouped_plan,
     )
-    monkeypatch.setattr(reader, "require_int8_abi", lambda: native)
+    monkeypatch.setitem(
+        sys.modules,
+        "flash_attn_v100.flash_attn_interface",
+        SimpleNamespace(flash_attn_v100_cuda=native),
+    )
     monkeypatch.setattr(ops, "_qsa_xqa_page4_block_table", decode_plan)
     monkeypatch.setattr(
         ops,
@@ -188,7 +258,6 @@ def test_planar_int8_native_mapping_and_workspace(block, route, rows, monkeypatc
 
 
 def test_planar_e4m3_dcp_keeps_remainder_on_triton(monkeypatch):
-    monkeypatch.setattr(reader, "require_int8_abi", lambda: None)
     monkeypatch.setattr(ops, "_SM70_QSA_DCP_GROUPED_PAGE4_MIN_ROWS", 64)
     calls = []
 

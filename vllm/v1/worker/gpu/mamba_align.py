@@ -152,7 +152,9 @@ def preprocess_mamba_align_fused_kernel(
     )
 
 
-@triton.jit
+# The request count changes every step. Do not specialize on it, or a new count
+# class compiles a new variant during serving.
+@triton.jit(do_not_specialize=["num_reqs"])
 def _precopy_mamba_align_kernel(
     state_idx_ptr,
     src_col_ptr,
@@ -167,6 +169,7 @@ def _precopy_mamba_align_kernel(
     state_group_indices_ptr,
     idx_mapping_ptr,
     query_start_loc_ptr,
+    plain_pending_ptr,
     num_reqs,
     COPY_BLOCK_SIZE: tl.constexpr,
     TEMPORAL_TILES: tl.constexpr,
@@ -186,8 +189,12 @@ def _precopy_mamba_align_kernel(
     token_bias = tl.load(token_bias_ptr + req_idx)
     query_start = tl.load(query_start_loc_ptr + batch_idx)
     query_end = tl.load(query_start_loc_ptr + batch_idx + 1)
-    single_token_tail = query_end - query_start == 1 and token_bias > 0
-    if src_col < 0 or (src_col == dst_col and not single_token_tail):
+    fold_history = query_end - query_start == 1 and token_bias > 0
+    if plain_pending_ptr is not None:
+        # A plain prefill does not select the speculative conv history offset.
+        pending = tl.load(plain_pending_ptr + batch_idx) != 0
+        fold_history |= pending and token_bias > 0
+    if src_col < 0 or (src_col == dst_col and not fold_history):
         return
     _copy_mamba_state_block(
         state_idx,
@@ -230,6 +237,7 @@ def _postprocess_mamba_align_kernel(
     COPY_BLOCK_SIZE: tl.constexpr,
     TEMPORAL_TILES: tl.constexpr,
     SPEC_STATE_REPLAY: tl.constexpr,
+    DEFERRED_REPLAY: tl.constexpr,
 ):
     batch_idx = tl.program_id(0)
     state_meta_idx = tl.program_id(1)
@@ -258,7 +266,7 @@ def _postprocess_mamba_align_kernel(
         # The replay stored a boundary passed before the last accepted token;
         # only a boundary at that token is copied, from the running block.
         is_temporal = tl.load(state_conv_widths_ptr + state_meta_idx) <= 0
-        if is_temporal and token_bias != num_accepted - 1:
+        if is_temporal and (DEFERRED_REPLAY or token_bias != num_accepted - 1):
             return
 
     _copy_mamba_state_block(
@@ -323,6 +331,7 @@ def run_state_gathers(
         ctx.state_group_indices,
         rows,
         query,
+        None,
         count,
         COPY_BLOCK_SIZE=1024,
         TEMPORAL_TILES=_TEMPORAL_TILES,
@@ -339,6 +348,7 @@ def run_mamba_align_precopy(
     idx_mapping: torch.Tensor,
     query_start_loc: torch.Tensor,
     spec_state_replay: bool = False,
+    plain_pending: torch.Tensor | None = None,
 ) -> None:
     if num_reqs == 0 or not ctx.is_initialized:
         return
@@ -357,6 +367,7 @@ def run_mamba_align_precopy(
         ctx.state_group_indices,
         idx_mapping,
         query_start_loc,
+        plain_pending,
         num_reqs,
         COPY_BLOCK_SIZE=1024,
         TEMPORAL_TILES=_TEMPORAL_TILES,
@@ -372,6 +383,7 @@ def run_mamba_align_postprocess(
     new_num_computed_tokens: torch.Tensor,
     idx_mapping: torch.Tensor,
     spec_state_replay: bool = False,
+    deferred_replay: bool = False,
 ) -> None:
     if num_reqs == 0 or not ctx.is_initialized:
         return
@@ -399,4 +411,5 @@ def run_mamba_align_postprocess(
         COPY_BLOCK_SIZE=1024,
         TEMPORAL_TILES=_TEMPORAL_TILES,
         SPEC_STATE_REPLAY=spec_state_replay,
+        DEFERRED_REPLAY=deferred_replay,
     )

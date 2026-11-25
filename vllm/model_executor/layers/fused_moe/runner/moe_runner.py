@@ -845,11 +845,34 @@ class MoERunner(MoERunnerInterface):
             result = result + zero_expert_output
         return result
 
+    def can_defer_tp_reduce(self) -> bool:
+        """Whether the HC consumer can perform this MoE's remaining TP sum."""
+        return (
+            self.moe_config.tp_size == 4
+            and self.moe_config.ep_size == 1
+            and self.moe_config.pcp_size == 1
+            and not self.moe_config.is_sequence_parallel
+            and not self._fused_output_is_reduced
+            and not isinstance(self.router, ZeroExpertRouter)
+        )
+
+    def forward_tp_partials(
+        self, hidden_states: torch.Tensor, router_logits: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the local shared and routed outputs to their HC consumer."""
+        shared, routed, output_dim = self._compute_expert_outputs(
+            hidden_states, router_logits, None
+        )
+        assert shared is not None
+        return shared[..., :output_dim], routed[..., :output_dim]
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
+        *,
+        reduce_results: bool = True,
     ) -> torch.Tensor:
         """Invoke the fused moe layer.
 
@@ -871,6 +894,49 @@ class MoERunner(MoERunnerInterface):
            _moe_forward and _moe_forward_shared must be split.
         """
 
+        shared_output, fused_output, og_hidden_dim = self._compute_expert_outputs(
+            hidden_states, router_logits, input_ids
+        )
+        result = None
+        if reduce_results:
+            result = self._maybe_sm70_moe_sum2_allreduce(
+                shared_output, fused_output, og_hidden_dim
+            )
+        if result is not None:
+            result = _sm70_dump_moe_runner_tensor(
+                result,
+                "moe_sum2_output",
+                self.layer_name,
+            )
+            return self._maybe_add_zero_expert_output(result)
+
+        if shared_output is not None:
+            result = shared_output + fused_output
+        else:
+            result = fused_output
+        result = _sm70_dump_moe_runner_tensor(
+            result,
+            "moe_added_output",
+            self.layer_name,
+        )
+
+        if not reduce_results:
+            return result[..., :og_hidden_dim]
+        result = self._maybe_reduce_final_output(result, og_hidden_dim)
+        result = _sm70_dump_moe_runner_tensor(
+            result,
+            "moe_final_output",
+            self.layer_name,
+        )
+
+        return self._maybe_add_zero_expert_output(result)
+
+    def _compute_expert_outputs(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor, int]:
         # Apply transform for routed experts (e.g., latent projection
         # for latent MoE)
         hidden_states, shared_experts_input = self.apply_routed_input_transform(
@@ -946,35 +1012,7 @@ class MoERunner(MoERunnerInterface):
             self.layer_name,
         )
 
-        result = self._maybe_sm70_moe_sum2_allreduce(
-            shared_output, fused_output, og_hidden_dim
-        )
-        if result is not None:
-            result = _sm70_dump_moe_runner_tensor(
-                result,
-                "moe_sum2_output",
-                self.layer_name,
-            )
-            return self._maybe_add_zero_expert_output(result)
-
-        if shared_output is not None:
-            result = shared_output + fused_output
-        else:
-            result = fused_output
-        result = _sm70_dump_moe_runner_tensor(
-            result,
-            "moe_added_output",
-            self.layer_name,
-        )
-
-        result = self._maybe_reduce_final_output(result, og_hidden_dim)
-        result = _sm70_dump_moe_runner_tensor(
-            result,
-            "moe_final_output",
-            self.layer_name,
-        )
-
-        return self._maybe_add_zero_expert_output(result)
+        return shared_output, fused_output, og_hidden_dim
 
     @property
     def do_naive_dispatch_combine(self) -> bool:

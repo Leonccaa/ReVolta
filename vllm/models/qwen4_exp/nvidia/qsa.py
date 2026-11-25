@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, ClassVar, cast
 import torch
 from torch import nn
 
+from vllm.compilation.sm70_decode_graph import is_sm70_decode_graph_compiling
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
@@ -68,6 +69,28 @@ from ..common.qsa_cache import (
     qsa_draft_dcp_sharded,
 )
 from .indexer_qsa import QSAIndexer
+from .ops.qsa_device_history import (
+    H6_MAX_ROWS,
+    load_qsa_device_history,
+    load_qsa_paged_fp16_h6,
+    qsa_device_history,
+    qsa_device_history_workspace,
+    try_qsa_paged_fp16_h6,
+)
+from .ops.qsa_device_history import (
+    MAX_ROWS as DEVICE_HISTORY_MAX_ROWS,
+)
+from .ops.qsa_device_history import (
+    MAX_SELECTION_WIDTH as DEVICE_HISTORY_MAX_WIDTH,
+)
+from .ops.qsa_paged_fp16_h12 import (
+    H12_MAX_ROWS,
+    H12_MAX_WIDTH,
+    load_qsa_paged_fp16_h12,
+    qsa_paged_fp16_h12,
+    qsa_paged_fp16_h12_workspace,
+)
+from .ops.sm70_dcp2 import get_sm70_dcp2_for_batch
 
 if TYPE_CHECKING:
     from .host_kv.history import HostHistoryLayer
@@ -250,10 +273,10 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             raise NotImplementedError(
                 "Qwen4Exp QSA requires FP16/BF16 or E4M3 main KV cache"
             )
-        if self.kv_cache_dtype == "int8":
-            from .ops.qsa_int8 import require_int8_abi
+        if self.kv_cache_dtype in ("int8", FP8_E4M3_PER_TOKEN_HEAD.name):
+            from .ops.qsa_int8 import require_row_scaled_page4_abi
 
-            require_int8_abi()
+            require_row_scaled_page4_abi()
         self.supports_quant_query_input = False
 
     def forward_qsa(
@@ -332,6 +355,27 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 **view.scale_kwargs,
             )
             return output
+
+        draft_scales = layer.qsa_draft_native_scales
+        if (
+            draft_scales is not None
+            and is_sm70_decode_graph_compiling()
+            and get_forward_context().additional_kwargs.get("sm70_qsa_draft_decode")
+        ):
+            assert query_positions is not None and sequence_lengths is not None
+            if try_qsa_paged_fp16_h6(
+                query[:num_tokens],
+                kv_cache,
+                draft_scales,
+                logical_indices,
+                attn_metadata.block_table,
+                token_to_req,
+                query_positions[:num_tokens],
+                sequence_lengths,
+                output[:num_tokens],
+                output_gate[:num_tokens] if output_gate is not None else None,
+            ):
+                return output
 
         qsa_metadata: dict[str, torch.Tensor] = {}
         if query_positions is not None:
@@ -518,10 +562,21 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             local_block_size=host.kernel_block_tokens,
         )
         group = get_dcp_group()
-        if gathered_query is None:
-            gathered_query = group.all_gather(query[:num_tokens].contiguous(), dim=1)
         partial_output = layer.dcp_partial_output_buffer[:num_tokens]
         partial_lse = layer.dcp_partial_lse_buffer[:num_tokens]
+        out = output[:num_tokens]
+        gate = output_gate[:num_tokens].view_as(out)
+        dcp2 = None
+        if gathered_query is None:
+            query = query[:num_tokens]
+            dcp2 = get_sm70_dcp2_for_batch(
+                group, query, partial_output, partial_lse, gate, out
+            )
+            gathered_query = (
+                dcp2.gather_query(query)
+                if dcp2 is not None
+                else group.all_gather(query.contiguous(), dim=1)
+            )
         if partial_output.shape != gathered_query.shape:
             raise RuntimeError("QSA DCP partial output has wrong head geometry")
         local_width = qsa_dcp_local_selection_width(
@@ -623,15 +678,17 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 attend_dcp,
                 single_pass=attn_metadata.max_query_len <= decode_rows,
             )
+        if dcp2 is not None:
+            dcp2.combine_gate(partial_output, partial_lse, gate, out)
+            return output
         merged = cast(
             torch.Tensor,
             self.dcp_combine(
                 partial_output, partial_lse, group, is_lse_base_on_e=False
             ),
         )
-        out = output[:num_tokens]
         out.copy_(merged)
-        _qsa_output_gate(out, output_gate[:num_tokens].view_as(out))
+        _qsa_output_gate(out, gate)
         return output
 
     def _forward_qsa_dcp(
@@ -681,9 +738,17 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             local_block_size=key_cache.shape[1],
         )
         group = get_dcp_group()
-        gathered_query = group.all_gather(query.contiguous(), dim=1)
         partial_output = partial_output_buffer[: query.shape[0]]
         partial_lse = partial_lse_buffer[: query.shape[0]]
+        gate = output_gate.view_as(output)
+        dcp2 = get_sm70_dcp2_for_batch(
+            group, query, partial_output, partial_lse, gate, output
+        )
+        gathered_query = (
+            dcp2.gather_query(query)
+            if dcp2 is not None
+            else group.all_gather(query.contiguous(), dim=1)
+        )
         if partial_output.shape != gathered_query.shape:
             raise RuntimeError("QSA DCP partial output has wrong head geometry")
         # Only this prefix of the compacted columns can hold an owned token.
@@ -703,8 +768,8 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 "k_scale_cache": k_scale_cache,
                 "v_scale_cache": v_scale_cache,
             }
-        # Prefill-sized batches use the grouped page4 route for their leading
-        # multiple of eight rows; decode batches and the rest stay on Triton.
+        # Prefill-sized batches use grouped page4 for their leading multiple
+        # of eight rows. Small uniform decode batches may use the native reader.
         grouped_rows = qsa_dcp_sparse_paged_attention_sm70_grouped_page4(
             gathered_query,
             key_cache,
@@ -719,6 +784,44 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             layer._v_scale_float,
             **scale_kwargs,
         )
+        if (
+            grouped_rows == 0
+            and layer.sm70_qsa_paged_fp16_h12
+            and query.shape[0] <= H12_MAX_ROWS
+            and local_width <= H12_MAX_WIDTH
+            and get_forward_context().is_uniform_decode
+        ):
+            qsa_paged_fp16_h12(
+                gathered_query,
+                key_cache,
+                value_cache,
+                local_indices[:, :local_width],
+                block_table,
+                token_to_req,
+                partial_output,
+                partial_lse,
+            )
+            grouped_rows = query.shape[0]
+        elif (
+            grouped_rows == 0
+            and layer.sm70_qsa_device_history
+            and query.shape[0] <= DEVICE_HISTORY_MAX_ROWS
+            and local_width <= DEVICE_HISTORY_MAX_WIDTH
+            and get_forward_context().is_uniform_decode
+        ):
+            qsa_device_history(
+                gathered_query,
+                key_cache,
+                value_cache,
+                local_indices[:, :local_width],
+                block_table,
+                token_to_req,
+                partial_output,
+                partial_lse,
+                layer._k_scale_float,
+                layer._v_scale_float,
+            )
+            grouped_rows = query.shape[0]
         if grouped_rows < query.shape[0]:
             qsa_sparse_paged_attention(
                 gathered_query[grouped_rows:],
@@ -732,8 +835,12 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 k_scale=layer._k_scale_float,
                 v_scale=layer._v_scale_float,
                 lse=partial_lse[grouped_rows:],
+                compacted_indices=True,
                 **scale_kwargs,
             )
+        if dcp2 is not None:
+            dcp2.combine_gate(partial_output, partial_lse, gate, output)
+            return
         merged = cast(
             torch.Tensor,
             self.dcp_combine(
@@ -747,7 +854,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         # apply the Triton gate DCP1's page4 route uses. This replaces a chain
         # of five elementwise kernels (12.2 us per decode layer on V100).
         output.copy_(merged)
-        _qsa_output_gate(output, output_gate.view_as(output))
+        _qsa_output_gate(output, gate)
 
 
 def _verify_e4m3_kv_requirements(
@@ -757,11 +864,8 @@ def _verify_e4m3_kv_requirements(
 ) -> None:
     """Admit calibrated E4M3 from kernel capabilities, independent of TP/MTP."""
     if cache_config.cache_dtype == "int8":
-        from .ops.qsa_int8 import require_int8_abi
-
         if model_config.dtype != torch.float16:
             raise NotImplementedError("QSA INT8 requires FP16 activations on SM70")
-        require_int8_abi()
         return
     from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD
 
@@ -928,6 +1032,55 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.dcp_partial_lse_buffer = dcp_partial_lse_buffer
         self.attn_type = AttentionType.DECODER
         self.kv_cache_dtype = cache_config.cache_dtype
+        kernel_config = vllm_config.kernel_config
+        host_kv = kernel_config.long_context_kv
+        native_draft = (
+            kernel_config.sm70_qsa_paged_fp16_h6
+            and vllm_config.is_speculative_draft
+            and not self.qsa_dcp_sharded
+            and not host_kv.enabled
+            and self.kv_cache_dtype in ("auto", "float16")
+            and model_config.dtype == torch.float16
+            and (self.num_heads, self.num_kv_heads, self.head_dim) == (6, 1, 256)
+            and current_platform.is_device_capability(70)
+        )
+        if native_draft:
+            load_qsa_paged_fp16_h6()
+        self.register_buffer(
+            "qsa_draft_native_scales",
+            torch.ones(2, dtype=torch.float32) if native_draft else None,
+            persistent=False,
+        )
+        self.sm70_qsa_device_history = (
+            kernel_config.sm70_qsa_device_history
+            and vllm_config.use_v2_model_runner
+            and not vllm_config.is_speculative_draft
+            and not host_kv.enabled
+            and self.qsa_dcp_sharded
+            and parallel_config.decode_context_parallel_size == 2
+            and tp_size == 4
+            and (self.num_heads, self.num_kv_heads, self.head_dim) == (6, 1, 256)
+            and model_config.dtype == torch.float16
+            and self.kv_cache_dtype == "fp8_e4m3"
+            and current_platform.is_device_capability(70)
+        )
+        if self.sm70_qsa_device_history:
+            load_qsa_device_history()
+        self.sm70_qsa_paged_fp16_h12 = (
+            kernel_config.sm70_qsa_paged_fp16_h12
+            and vllm_config.use_v2_model_runner
+            and not vllm_config.is_speculative_draft
+            and self.qsa_dcp_sharded
+            and parallel_config.decode_context_parallel_size == 2
+            and tp_size == 4
+            and (self.num_heads, self.num_kv_heads, self.head_dim) == (6, 1, 256)
+            and model_config.dtype == torch.float16
+            and self.kv_cache_dtype in ("auto", "float16")
+            and (not host_kv.enabled or host_kv.main_kv_placement == "gpu")
+            and current_platform.is_device_capability(70)
+        )
+        if self.sm70_qsa_paged_fp16_h12:
+            load_qsa_paged_fp16_h12()
         if self.kv_cache_dtype in ("fp8", "fp8_e4m3") and (
             cache_config.calculate_kv_scales
         ):
@@ -1081,23 +1234,43 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self._qsa_kv_scales_finalized = True
 
     def reserve_capture_workspace(self) -> None:
-        """Size the shared workspace for this layer's largest DCP combine.
+        """Reserve reader and DCP combine workspaces before capture."""
+        if not self.qsa_dcp_sharded:
+            if self.qsa_draft_native_scales is not None:
+                width = self.indexer.output_width
+                if (
+                    0 < width <= DEVICE_HISTORY_MAX_WIDTH
+                    and self.kv_cache.is_contiguous()
+                ):
+                    qsa_device_history_workspace(H6_MAX_ROWS, width)
+            return
 
-        The all-to-all combine takes its send/receive buffers from the shared
-        workspace, sized by the step's token count; reserve the largest step
-        (the partial-output buffer's rows) before CUDA graph capture.
-        """
         from vllm.v1.attention.ops.dcp_alltoall import (
             dcp_a2a_lse_reduce,
             reserve_dcp_a2a_workspace,
         )
 
         partial = self.dcp_partial_output_buffer
-        if (
-            not self.qsa_dcp_sharded
-            or partial is None
-            or getattr(self.impl, "dcp_combine", None) is not dcp_a2a_lse_reduce
-        ):
+        if partial is None:
+            return
+        if self.sm70_qsa_paged_fp16_h12 or self.sm70_qsa_device_history:
+            from .ops.qsa_dcp import qsa_dcp_local_selection_width
+
+            assert self.dcp_local_indices_buffer is not None
+            width = qsa_dcp_local_selection_width(
+                self.indexer.token_topk,
+                self.indexer.compress_ratio,
+                self.impl.dcp_world_size,
+                self.cp_kv_cache_interleave_size,
+                self.dcp_local_indices_buffer.shape[1],
+            )
+            if self.sm70_qsa_paged_fp16_h12 and width <= H12_MAX_WIDTH:
+                qsa_paged_fp16_h12_workspace(min(partial.shape[0], H12_MAX_ROWS), width)
+            if self.sm70_qsa_device_history and width <= DEVICE_HISTORY_MAX_WIDTH:
+                qsa_device_history_workspace(
+                    min(partial.shape[0], DEVICE_HISTORY_MAX_ROWS), width
+                )
+        if getattr(self.impl, "dcp_combine", None) is not dcp_a2a_lse_reduce:
             return
         max_tokens, num_heads, head_dim = partial.shape
         reserve_dcp_a2a_workspace(
@@ -1116,6 +1289,18 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         block_size, _, dcp_sharded = qsa_dcp_block_geometry(
             vllm_config, self.layer_name
         )
+        if (
+            not dcp_sharded
+            and vllm_config.parallel_config.decode_context_parallel_size == 1
+        ):
+            # On one rank the MTP page has the same DCP geometry as the target.
+            # Mark it consistently so matching pages can share the host store.
+            host = vllm_config.kernel_config.long_context_kv
+            dcp_sharded = (
+                host.enabled
+                and host.main_kv_placement == "host"
+                and host.draft_main_placement == "host"
+            )
         return FullAttentionSpec(
             block_size=block_size,
             num_kv_heads=self.num_kv_heads,
@@ -1259,8 +1444,27 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         positions: torch.Tensor,
         output: torch.Tensor | None,
         hidden_states: torch.Tensor,
+        *,
+        reduce_results: bool | None = None,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        indexer_input = hidden_states
+        index_proj = self.indexer.index_qk_proj
+        packed_qkv = getattr(self.qkv_proj, "_sm70_qsa_input_packed", None)
+        packed_index = getattr(index_proj, "_sm70_qsa_input_packed", None)
+        if (
+            packed_qkv is not None
+            and packed_index is not None
+            and is_sm70_decode_graph_compiling()
+        ):
+            qkv, indexer_input = torch.ops.vllm.qwen38_sm70_fp16_qsa_input(
+                hidden_states,
+                self.qkv_proj.weight,
+                index_proj.weight,
+                packed_qkv,
+                packed_index,
+            )
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
         q, k, v, gate = self._project_qkv_gate(qkv, positions)
         num_tokens = hidden_states.shape[0]
         query = q.view(num_tokens, self.num_heads, self.head_dim)
@@ -1270,7 +1474,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         encoded_layer_name = _encode_layer_name(self.layer_name)
         if current_platform.opaque_attention_op():
             torch.ops.vllm.qwen4_exp_qsa_with_output(
-                hidden_states,
+                indexer_input,
                 positions,
                 query,
                 key,
@@ -1281,7 +1485,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             )
         else:
             qwen4_exp_qsa_with_output(
-                hidden_states,
+                indexer_input,
                 positions,
                 query,
                 key,
@@ -1291,7 +1495,12 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 encoded_layer_name,
             )
         flat_output = attn_output.view(num_tokens, -1)
-        projected_output, _ = self.o_proj(flat_output)
+        if reduce_results is None:
+            projected_output, _ = self.o_proj(flat_output)
+        else:
+            projected_output, _ = self.o_proj(
+                flat_output, reduce_results=reduce_results
+            )
         if output is not None:
             output.copy_(projected_output)
         return projected_output

@@ -1033,6 +1033,7 @@ class VllmBackend:
     def __call__(self, graph: fx.GraphModule, example_inputs: Sequence[Any]) -> Any:
         from .caching import (
             VllmSerializableFunction,
+            vllm_source_hash,
         )
 
         vllm_config = self.vllm_config
@@ -1060,7 +1061,13 @@ class VllmBackend:
             # that affects the compilation. if none of the factors change,
             # the cache dir will be the same so that we can reuse the compiled
             # graph.
-            factors = [env_hash, config_hash, code_hash, compiler_hash]
+            factors = [
+                env_hash,
+                config_hash,
+                code_hash,
+                compiler_hash,
+                vllm_source_hash(),
+            ]
             # Use SHA-256 for cache key hashing to be consistent across
             # compute_hash functions. Truncate for a short cache dir name.
             hash_key = hashlib.sha256(str(factors).encode()).hexdigest()[:10]

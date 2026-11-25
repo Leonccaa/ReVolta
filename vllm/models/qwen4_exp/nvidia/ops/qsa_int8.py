@@ -6,6 +6,7 @@ import math
 
 import torch
 
+from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.common.ops.fp8_software import (
     fp8_e4m3fn_bits_to_fp32_bitcast,
 )
@@ -71,6 +72,7 @@ def _int8_sparse_kernel(
     POSITIONS=None,
     SEQLENS=None,
     CAUSAL: tl.constexpr = True,
+    SKIP_EMPTY_SPLITS: tl.constexpr = False,
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -104,6 +106,13 @@ def _int8_sparse_kernel(
     else:
         split_tile_start = split_id * NUM_TILES // NUM_SPLITS
         split_tile_end = (split_id + 1) * NUM_TILES // NUM_SPLITS
+    if SKIP_EMPTY_SPLITS:
+        # DCP localization packs this rank's tokens before the -1 tail.
+        first = tl.load(
+            indices_ptr + row * stride_indices_row + split_tile_start * BLOCK_N
+        )
+        if first < 0:
+            split_tile_end = split_tile_start
     for tile in range(split_tile_start, split_tile_end):
         columns = tile * BLOCK_N + column_offsets
         if DENSE:
@@ -329,25 +338,14 @@ def _int8_merge_kernel(
     )
 
 
-def require_int8_abi():
-    """Reject an incomplete installation before admitting a serving backend."""
+def require_row_scaled_page4_abi() -> None:
+    """Require the Flash-V100 page4 ABI for both per-vector KV payloads."""
     from flash_attn_v100.flash_attn_interface import flash_attn_v100_cuda as native
 
-    version = getattr(native, "int8_page4_abi_version", None)
-    if not callable(version) or version() != 2:
+    if native.int8_page4_abi_version() != 2:
         raise RuntimeError(
-            "INT8 KV requires Flash-V100 page4 ABI v2; rebuild the wheel"
+            "Per-vector QSA KV requires Flash-V100 page4 ABI v2; rebuild the wheel"
         )
-    for name in (
-        "decode_int8_page4_fwd",
-        "grouped_sparse_int8_page4_fwd",
-        "grouped_sparse_page4_plan_fwd",
-    ):
-        if not callable(getattr(native, name, None)):
-            raise RuntimeError(f"INT8 KV native reader missing: {name}")
-    if not hasattr(torch.ops._C_cache_ops, "reshape_and_cache_flash_int8"):
-        raise RuntimeError("INT8 KV native writer ABI missing; rebuild the vLLM wheel")
-    return native
 
 
 def validate_planes(q, k, v, sk, sv, codec=INT8):
@@ -397,6 +395,7 @@ def triton_attention(
     causal=True,
     softmax_scale=None,
     codec=INT8,
+    compacted_indices=False,
 ):
     """FP32 late-scale reference/fallback; never expands the KV cache to Half."""
     validate_planes(q, k, v, sk, sv, codec)
@@ -479,6 +478,11 @@ def triton_attention(
         POSITIONS=positions,
         SEQLENS=seq_lens,
         CAUSAL=causal,
+        SKIP_EMPTY_SPLITS=(
+            compacted_indices
+            and rows <= 48
+            and current_platform.is_device_capability(70)
+        ),
         num_warps=warps,
     )
     if splits == 1:
@@ -508,9 +512,10 @@ def triton_attention(
 def native_decode(
     q, k, v, indices, table, requests, positions, seq_lens, out, sk, sv, *, codec=INT8
 ):
+    from flash_attn_v100.flash_attn_interface import flash_attn_v100_cuda as native
+
     from .qsa import _qsa_xqa_page4_block_table, _qsa_xqa_page4_workspace
 
-    native = require_int8_abi()
     mapping = validate_planes(q, k, v, sk, sv, codec)
     pages, lengths = _qsa_xqa_page4_block_table(
         indices,
@@ -523,7 +528,7 @@ def native_decode(
         mapping.owner_page_span,
     )
     parts = triton.cdiv(2051, 256)
-    partial, maxima, sums, active = _qsa_xqa_page4_workspace(q, parts, "fp8_e4m3")
+    partial, maxima, sums, active = _qsa_xqa_page4_workspace(q, parts, torch.float32)
     native.decode_int8_page4_fwd(
         q.contiguous(),
         k,
@@ -559,24 +564,28 @@ def native_grouped(
     *,
     codec=INT8,
 ):
-    from .qsa import _qsa_grouped_page4_workspace
+    from flash_attn_v100.flash_attn_interface import flash_attn_v100_cuda as native
 
-    native = require_int8_abi()
+    from .qsa import _qsa_grouped_page4_scratch, _qsa_grouped_page4_workspace
+
     mapping = validate_planes(q, k, v, sk, sv, codec)
     rows = q.shape[0]
     padded = triton.cdiv(rows, 8) * 8
+    slice_query, slice_out = _qsa_grouped_page4_scratch(q, padded, out.dtype)
     if padded != rows:
-        qp = torch.zeros((padded, *q.shape[1:]), device=q.device, dtype=q.dtype)
-        qp[:rows].copy_(q)
-        ip = torch.full((padded, 2051), -1, device=q.device, dtype=torch.int32)
+        slice_query[rows:].zero_()
+        ip = indices.new_empty((padded, indices.shape[1]))
+        ip[rows:].fill_(-1)
         ip[:rows].copy_(indices)
-        rp = torch.full((padded,), -1, device=q.device, dtype=torch.int32)
+        rp = requests.new_empty((padded,))
+        rp[rows:].fill_(-1)
         rp[:rows].copy_(requests)
-        pp = torch.full((padded,), -1, device=q.device, dtype=torch.int64)
+        pp = positions.new_empty((padded,))
+        pp[rows:].fill_(-1)
         pp[:rows].copy_(positions)
     else:
-        qp, ip, rp, pp = q, indices, requests, positions
-    pages, masks, lengths, slice_lse = _qsa_grouped_page4_workspace(qp[:, :6])
+        ip, rp, pp = indices, requests, positions
+    pages, masks, lengths, slice_lse = _qsa_grouped_page4_workspace(slice_query)
     native.grouped_sparse_page4_plan_fwd(
         ip,
         table,
@@ -590,10 +599,13 @@ def native_grouped(
         mapping.owner_page_span,
         k.shape[0],
     )
-    slice_out = torch.empty((padded, 6, q.shape[2]), device=q.device, dtype=out.dtype)
     for head in range(0, q.shape[1], 6):
+        head_query = q[:, head : head + 6]
+        if padded != rows or not head_query.is_contiguous():
+            slice_query[:rows].copy_(head_query)
+            head_query = slice_query
         native.grouped_sparse_int8_page4_fwd(
-            qp[:, head : head + 6].contiguous(),
+            head_query,
             k,
             v,
             slice_out,
@@ -631,12 +643,10 @@ def sparse_attention(
     lse=None,
     *,
     codec=INT8,
+    compacted_indices=False,
 ):
     from .qsa import _qsa_output_gate
 
-    if codec is INT8:
-        require_int8_abi()
-    validate_planes(q, k, v, sk, sv, codec)
     if out is None:
         out = torch.empty_like(q)
     if q.shape[0] == 0:
@@ -651,8 +661,15 @@ def sparse_attention(
         and seq_lens is not None
     )
     if native_shape and lse is None:
-        if q.shape[0] < 8 and q.shape[1] == 6:
-            native_decode(
+        use_decode = q.shape[1] == 6 and (
+            q.shape[0] < 8
+            or get_forward_context().additional_kwargs.get("sm70_qsa_draft_decode")
+        )
+        if use_decode or not get_forward_context().additional_kwargs.get(
+            "qsa_reuses_mtp_selection"
+        ):
+            read = native_decode if use_decode else native_grouped
+            read(
                 q,
                 k,
                 v,
@@ -666,24 +683,9 @@ def sparse_attention(
                 sv,
                 codec=codec,
             )
-        else:
-            native_grouped(
-                q,
-                k,
-                v,
-                indices,
-                table,
-                requests,
-                positions,
-                seq_lens,
-                out,
-                sk,
-                sv,
-                codec=codec,
-            )
-        if gate is not None:
-            _qsa_output_gate(out, gate.view_as(q))
-        return out
+            if gate is not None:
+                _qsa_output_gate(out, gate.view_as(q))
+            return out
     return triton_attention(
         q,
         k,
@@ -697,6 +699,7 @@ def sparse_attention(
         lse,
         gate.view_as(q) if gate is not None else None,
         codec=codec,
+        compacted_indices=compacted_indices,
     )
 
 
@@ -710,8 +713,6 @@ def dcp_grouped(q, k, v, indices, table, requests, out, lse, sk, sv, *, codec=IN
     if q.dtype != torch.float16 or rows < _SM70_QSA_DCP_GROUPED_PAGE4_MIN_ROWS:
         return 0
     rows = rows // 8 * 8
-    if codec is INT8:
-        require_int8_abi()
     if rows < 8 or q.shape[1] % 6 or indices.shape[1] != 2051:
         return 0
     capacity = table.shape[1] * k.shape[1]

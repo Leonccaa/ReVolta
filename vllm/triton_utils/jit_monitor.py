@@ -100,11 +100,14 @@ def _setup_triton_jit_hook() -> None:
         # pre-existing hook unchanged.
         fn = kwargs.get("fn")
         fn_name = getattr(fn, "name", "<unknown>")
+        # Warn once per compiled variant, not once per kernel: a kernel that
+        # specializes on a runtime count compiles again for each new value class.
         logger.warning_once(
-            "Triton kernel JIT compilation during inference: %s. "
+            "Triton kernel JIT compilation during inference: %s (key %s). "
             "This causes a latency spike; consider extending warmup "
             "to cover this shape/config.",
             fn_name,
+            kwargs.get("key"),
         )
         if existing_hook is not None:
             return existing_hook(**kwargs)

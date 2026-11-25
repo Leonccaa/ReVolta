@@ -36,6 +36,52 @@ _LOOKUP = (
 )
 
 NOTES: dict[str, dict[str, str]] = {
+    "VLLM_SM70_MTP_Q8_PREFILL_MMQ": dict(
+        section="profile",
+        since="0.2.0rc15",
+        range="0, 1",
+        tradeoff="Use grouped GGUF MMQ for Q8_0 MTP batches above 64 rows in "
+        "chunks of up to 2048. MMQ changes accumulation order and increases "
+        "temporary GPU memory usage. Set 0 to use the 64-row vector path.",
+        metrics="",
+    ),
+    "VLLM_QWEN_REASONING_EOS_MASK": dict(
+        section="deployment",
+        since="0.2.0rc15",
+        range="0, 1",
+        tradeoff="Suppresses model EOS during visible Qwen chat reasoning in "
+        "Model Runner V2. Requests still in reasoning use full-vocabulary "
+        "sampling when compact DFlash2 verification would truncate logits.",
+        metrics="",
+    ),
+    "VLLM_SM70_MTP_PLE_CONV": dict(
+        section="deployment",
+        since="1Cat",
+        range="0, 1",
+        tradeoff="Fuses SM70 PLE speculative rollback, convolution, SiLU and "
+        "state update for eligible MTP and DFlash2 batches. Set 0 to use the "
+        "separate operations.",
+        metrics="",
+    ),
+    "VLLM_SM70_PLE_GATE_NORM": dict(
+        section="deployment",
+        since="0.2.0rc15",
+        range="0, 1",
+        tradeoff="Opt-in FP16 PLE gate and norm fusion in SM70 Flash-Next full "
+        "decode graphs with dual compilation. The fused reduction can change "
+        "FP16 results.",
+        metrics="",
+    ),
+    "VLLM_1CAT_ADAPTIVE_MTP": dict(
+        section="deployment",
+        since="0.2.0rc15",
+        range="off/0/false/no, on/1/true/yes, auto",
+        tradeoff="Opt in to adaptive depth for synchronous Flash-Next MRv2 "
+        "MTP with a dynamic speculative decoding schedule. Explicit auto "
+        "also requires SM70 and a configured maximum depth of at least five. "
+        "Single-request decode may trade fewer draft steps for more target steps.",
+        metrics="",
+    ),
     "VLLM_SM70_IDLE_CLOCK_SECONDS": dict(
         section="deployment",
         since="0.2.0rc14",
@@ -307,8 +353,9 @@ NOTES: dict[str, dict[str, str]] = {
         section="profile",
         since="1Cat",
         range="0, 1",
-        tradeoff="Shared-expert stream overlap. The profile sets 0 on TP4 SM70, "
-        "where the second stream does not pay off.",
+        tradeoff="Allows shared and routed experts to run on separate CUDA streams. "
+        "The native g32 AWQ profile enables it for DFlash2 with expert parallelism "
+        "and dual batch overlap disabled. An explicit 0 or 1 takes precedence.",
         metrics="",
     ),
     "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN": dict(
@@ -421,6 +468,24 @@ NOTES: dict[str, dict[str, str]] = {
         range="0, 1",
         tradeoff="Keeps E4M3 block-scale codes resident instead of a second FP16 "
         "copy: less memory, decode reconstructs exact values.",
+        metrics="",
+    ),
+    "VLLM_SM70_NVFP4_RAW_GROUPED_M48_V154": dict(
+        section="research",
+        since="0.2.0rc15",
+        range="0, 1",
+        tradeoff="Native raw-E4M3 grouped MoE for 48-row target decode on "
+        "SM70 TP4 Qwen3.8 with equal interleaved gate/up global scales. "
+        "Requires raw grouped decode and the V2 model runner.",
+        metrics="",
+    ),
+    "VLLM_SM70_NVFP4_RAW_GROUPED_NARROW_V154": dict(
+        section="research",
+        since="0.2.0rc15",
+        range="0, 1",
+        tradeoff="Native raw-E4M3 grouped MoE for 3-5 row target decode on "
+        "SM70 TP4 Qwen3.8 with equal interleaved gate/up global scales. "
+        "Requires raw grouped decode and the V2 model runner.",
         metrics="",
     ),
     "VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES": dict(

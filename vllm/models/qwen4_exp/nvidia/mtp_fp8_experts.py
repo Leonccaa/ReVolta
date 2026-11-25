@@ -3,6 +3,7 @@
 """Checkpoint and online weight-only FP8 for standalone SM70 MTP experts."""
 
 from types import SimpleNamespace
+from typing import Literal
 
 import torch
 from torch import nn
@@ -11,6 +12,7 @@ from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod,
 )
+from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.quantization.fp8_sm70_moe import Fp8SM70MoEMethod
 from vllm.model_executor.utils import set_weight_attrs
@@ -189,23 +191,27 @@ def pad_expert_matrix(weight: torch.Tensor, gate_up: bool) -> torch.Tensor:
     return result
 
 
-class MTPExpertFp8Config(QuantizationConfig):
-    """Override only excluded, unquantized MTP experts in a draft config."""
+class MTPExpertQuantConfig(QuantizationConfig):
+    """Override routed MTP experts in an otherwise unchanged draft config."""
 
     def __init__(
         self,
-        fallback: QuantizationConfig,
+        fallback: QuantizationConfig | None,
         checkpoint_prefixes: set[str] | None = None,
         quantize_unquantized: bool = True,
+        *,
+        expert_format: Literal["fp8", "q8_0", "fp16"] = "fp8",
     ):
         super().__init__()
         self.fallback = fallback
-        self.packed_modules_mapping = fallback.packed_modules_mapping
+        if fallback is not None:
+            self.packed_modules_mapping = fallback.packed_modules_mapping
         self.checkpoint_prefixes = checkpoint_prefixes or set()
         self.quantize_unquantized = quantize_unquantized
+        self.expert_format = expert_format
 
     def get_name(self):
-        return self.fallback.get_name()
+        return self.fallback.get_name() if self.fallback is not None else "mtp_experts"
 
     def get_supported_act_dtypes(self):
         return [torch.float16]
@@ -223,17 +229,24 @@ class MTPExpertFp8Config(QuantizationConfig):
         raise NotImplementedError("Construct from the resolved MTP draft config")
 
     def get_cache_scale(self, name):
-        return self.fallback.get_cache_scale(name)
+        return (
+            self.fallback.get_cache_scale(name) if self.fallback is not None else None
+        )
 
     def get_quant_method(self, layer, prefix):
-        if isinstance(layer, RoutedExperts) and prefix in self.checkpoint_prefixes:
+        routed = isinstance(layer, RoutedExperts)
+        from_checkpoint_fp8 = routed and prefix in self.checkpoint_prefixes
+        if from_checkpoint_fp8 and self.expert_format == "fp8":
             return MTPCheckpointFp8SM70MoEMethod(layer)
-        method = self.fallback.get_quant_method(layer, prefix)
-        if (
-            self.quantize_unquantized
-            and isinstance(layer, RoutedExperts)
-            and prefix.startswith("mtp.layers.")
-        ):
+        if from_checkpoint_fp8:
+            method = None
+        elif self.fallback is not None:
+            method = self.fallback.get_quant_method(layer, prefix)
+        else:
+            method = (
+                UnquantizedLinearMethod() if isinstance(layer, LinearBase) else None
+            )
+        if self.quantize_unquantized and routed and prefix.startswith("mtp.layers."):
             from vllm.model_executor.layers.quantization.modelopt import (
                 ModelOptMixedPrecisionConfig,
             )
@@ -246,10 +259,23 @@ class MTPExpertFp8Config(QuantizationConfig):
                 and self.fallback._resolve_quant_algo(prefix) is None
             )
             if not isinstance(method, UnquantizedFusedMoEMethod) and not (
-                method is None and (excluded(prefix) or absent_from_mixed)
+                method is None
+                and (
+                    from_checkpoint_fp8
+                    or self.fallback is None
+                    or excluded(prefix)
+                    or absent_from_mixed
+                )
             ):
                 raise ValueError(
-                    "Online MTP FP8 requires unquantized checkpoint experts"
+                    f"MTP {self.expert_format} requires unquantized checkpoint experts"
+                    " or supported block-FP8 experts"
                 )
+            if self.expert_format == "fp16":
+                return method  # RoutedExperts supplies the unquantized method if None.
+            if self.expert_format == "q8_0":
+                from .mtp_q8_experts import MTPQ80MoEMethod
+
+                return MTPQ80MoEMethod(layer.moe_config)
             return MTPFp8SM70MoEMethod(layer)
         return method

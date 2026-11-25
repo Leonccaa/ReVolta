@@ -88,7 +88,10 @@ def fixture_components(sequence, *, nmin=2, nmax=4, window=64):
     logits[:, :, :4] = torch.tensor([0.1, 0.2, 0.3, 0.4], device=device).log()
     scores = logits[:, :, :4].clone()
     batch = SimpleNamespace(
-        num_reqs=1, has_structured_output_reqs=False, is_prefilling_np=np.array([False])
+        num_reqs=1,
+        req_ids=["a"],
+        structured_output_req_ids=None,
+        is_prefilling_np=np.array([False]),
     )
     sampled = torch.ones(2, dtype=torch.int32, device=device)
     return native, states, mapping, draft, logits, ids, scores, batch, sampled
@@ -147,7 +150,7 @@ def test_admission_bypasses_each_ineligible_step_and_recovers(reason):
     elif reason == "prefill":
         batch.is_prefilling_np[0] = True
     elif reason == "grammar":
-        batch.has_structured_output_reqs = True
+        batch.structured_output_req_ids = {"a"}
     elif reason == "no_sample":
         sampled.zero_()
     elif reason == "negative":
@@ -167,7 +170,7 @@ def test_admission_bypasses_each_ineligible_step_and_recovers(reason):
     assert not native.valid.any()
     batch.num_reqs = 1
     batch.is_prefilling_np[0] = False
-    batch.has_structured_output_reqs = False
+    batch.structured_output_req_ids = None
     sampled.fill_(1)
     mapping[:7] = 2
     states.total_len.gpu[2] = 6
@@ -371,6 +374,16 @@ def test_exact_joint_and_conditional_distribution(valid, sparse):
                 max(abs(actual[t] / normalizer - target_p(prefix)[t]) for t in range(2))
                 <= 1e-9
             )
+
+
+@pytest.mark.parametrize("sparse", [False, True])
+def test_first_token_distribution_matches_neural_only(sparse):
+    neural, _, _ = exact_distribution(0, sparse=sparse)
+    fused, _, _ = exact_distribution(4, sparse=sparse)
+    for token in range(2):
+        neural_mass = sum(p for ids, p in neural.items() if ids[0] == token)
+        fused_mass = sum(p for ids, p in fused.items() if ids[0] == token)
+        assert fused_mass == pytest.approx(neural_mass, abs=1e-12, rel=0)
 
 
 @pytest.mark.parametrize("defect", ["first_mass", "conditional_suffix"])
@@ -954,7 +967,7 @@ def c64_components(scenario):
     logits.scatter_(-1, ids, scores)
     batch = SimpleNamespace(
         num_reqs=1,
-        has_structured_output_reqs=False,
+        structured_output_req_ids=None,
         is_prefilling_np=np.array([False, False]),
     )
     sampled = torch.ones(2, dtype=torch.int32, device=DEVICE)

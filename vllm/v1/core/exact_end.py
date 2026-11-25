@@ -68,6 +68,7 @@ class ExactEndIndex:
         self.index: dict[BlockHash | None, ExactEndBucket] = {}
         self._by_block: dict[BlockIdentity, set[ExactEnd]] = {}
         self.pending_gathers: list[MambaStateGather] = []
+        self.native_gdn_replay = False
         self.hits: dict[str, ExactEnd] = {}
         # Publish outcomes, exported with the store stats as exact_end_<name>.
         self.events: Counter[str] = Counter()
@@ -220,9 +221,18 @@ class ExactEndIndex:
         for block_key in self._block_identities(entry):
             self._by_block.setdefault(block_key, set()).add(entry)
         self.events["published"] += 1
-        if request.last_accepted > 1:
+        # Rejected drafts leave state_end ahead of the computed prefix. This
+        # also identifies a verification that accepted only its first input.
+        deferred = self.native_gdn_replay and (
+            request.last_accepted > 1 or request.state_end > c
+        )
+        if request.last_accepted > 1 or deferred:
             self.pending_gathers.append(
-                MambaStateGather(request.last_accepted - 1, dst)
+                MambaStateGather(
+                    request.last_accepted - 1,
+                    dst,
+                    request.request_id if deferred else None,
+                )
             )
 
     def _candidates(

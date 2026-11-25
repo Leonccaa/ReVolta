@@ -89,6 +89,7 @@ class InputBatch:
 
     # Whether any requests in batch use structured output.
     has_structured_output_reqs: bool
+    structured_output_req_ids: set[str] | None = None
 
     # [num_reqs_after_padding] per-request prompt length for prefix-anchored
     # sliding-window attention (optional).
@@ -456,6 +457,7 @@ def _post_update_kernel(
     all_token_ids_ptr,
     all_token_ids_stride,
     total_len_ptr,
+    reasoning_eos_ptr,
 ):
     req_id = tl.program_id(0)
     req_state_idx = tl.load(idx_mapping_ptr + req_id)
@@ -471,12 +473,22 @@ def _post_update_kernel(
         tl.store(last_sampled_tokens_ptr + req_state_idx, token_id)
         tl.store(total_len_ptr + req_state_idx, total_len + num_sampled)
 
+    if reasoning_eos_ptr is not None:
+        reasoning_slot = reasoning_eos_ptr + 4 * req_state_idx
+        reasoning_active = tl.load(reasoning_slot) > 0
+        end = tl.load(reasoning_slot + 2)
+        tool = tl.load(reasoning_slot + 3)
     for i in range(num_sampled):
         token_id = tl.load(sampled_tokens_ptr + req_id * sampled_tokens_stride + i)
         tl.store(
             all_token_ids_ptr + req_state_idx * all_token_ids_stride + total_len + i,
             token_id,
         )
+        if reasoning_eos_ptr is not None:  # noqa: SIM102 (Triton specialization)
+            if reasoning_active:
+                reasoning_active = (token_id != end) & (token_id != tool)
+                if not reasoning_active:
+                    tl.store(reasoning_slot, 0)
 
         if output_bin_counts_ptr is not None:
             token_ptr = (
@@ -522,6 +534,7 @@ def post_update(
     all_token_ids: torch.Tensor,
     # [max_num_reqs]
     total_len: torch.Tensor,
+    reasoning_eos: torch.Tensor | None = None,
 ) -> None:
     num_reqs = idx_mapping.shape[0]
     _post_update_kernel[(num_reqs,)](
@@ -538,6 +551,7 @@ def post_update(
         all_token_ids,
         all_token_ids.stride(0),
         total_len,
+        reasoning_eos,
         num_warps=1,
     )
 

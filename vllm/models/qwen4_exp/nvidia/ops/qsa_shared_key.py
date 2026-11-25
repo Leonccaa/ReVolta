@@ -7,6 +7,7 @@ from functools import lru_cache
 
 import torch
 
+from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
@@ -14,11 +15,11 @@ logger = init_logger(__name__)
 
 
 @lru_cache(maxsize=1)
-def load_operator():
+def _load_operators():
     try:
         importlib.import_module("vllm._sm70_qsa_indexer_C")
     except ImportError:
-        return False
+        return False, None
 
     @torch.library.register_fake("vllm_sm70_qsa_indexer::run")
     def fake(
@@ -35,7 +36,15 @@ def load_operator():
     ):
         return None
 
-    return True
+    torch.library.register_fake("vllm_sm70_qsa_indexer::run_batch")(fake)
+    batched = getattr(torch.ops.vllm_sm70_qsa_indexer, "run_batched_decode", None)
+    if batched is not None:
+        torch.library.register_fake("vllm_sm70_qsa_indexer::run_batched_decode")(fake)
+    return True, batched
+
+
+def load_operator():
+    return _load_operators()[0]
 
 
 def shared_key_reason(q, cache, table, requests, positions, lengths):
@@ -67,7 +76,8 @@ def maybe_shared_key_scores(
         return None
     scores = torch.empty((q.shape[0], columns), dtype=torch.float32, device=q.device)
     visible = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
-    torch.ops.vllm_sm70_qsa_indexer.run(
+    # One request's rows form a contiguous span in the QSA metadata.
+    torch.ops.vllm_sm70_qsa_indexer.run_batch(
         scores,
         visible,
         q,
@@ -81,3 +91,65 @@ def maybe_shared_key_scores(
     )
     logger.info_once("Using SM70 QSA shared-key indexer for M=%d.", q.shape[0])
     return scores, visible
+
+
+def maybe_batched_decode_scores(q, cache, table, starts, positions, lengths, compress):
+    """Use MRv2 request offsets after request-segments admission."""
+    rows, nreq = q.shape[0], table.shape[0]
+    if (
+        rows > min(64, 8 * nreq)
+        or starts.shape != (nreq + 1,)
+        or starts.dtype != torch.int32
+        or not all(x.is_contiguous() for x in (starts, positions, lengths))
+        or q.stride(-1) != 1
+        or cache.stride(-1) != 1
+        or any(i % 8 for x in (q, cache) for i in (*x.stride()[:2], x.storage_offset()))
+    ):
+        return None
+    _, batched = _load_operators()
+    if batched is None:
+        return None
+
+    scores = torch.empty(
+        (rows, table.shape[1] * cache.shape[1]), device=q.device, dtype=torch.float32
+    )
+    visible = torch.empty(rows, device=q.device, dtype=torch.int32)
+    batched(
+        scores, visible, q, cache, table, starts, positions, lengths, 128**0.5, compress
+    )
+    logger.info_once("Using SM70 QSA batched shared-key decode scorer.")
+    return scores, visible
+
+
+def shared_key_topk(
+    q, cache, table, requests, positions, lengths, compress, columns, divisor, blocks
+) -> None:
+    rows = q.shape[0]
+    scores = q.new_empty((rows, columns), dtype=torch.float32)
+    visible = q.new_empty((rows,), dtype=torch.int32)
+    # Both the histograms and the counters use atomic accumulation.
+    hist, meta = q.new_zeros((rows * (512 + 8),), dtype=torch.int32).split(
+        (rows * 512, rows * 8)
+    )
+    greater = torch.empty_like(blocks)
+    tie_keys = q.new_empty((rows, 8192), dtype=torch.int32)
+    tie_indices = torch.empty_like(tie_keys)
+    ops.sm70_qsa_indexer_run_topk(
+        blocks,
+        scores,
+        visible,
+        hist,
+        greater,
+        tie_keys,
+        tie_indices,
+        meta,
+        q,
+        cache,
+        table,
+        requests,
+        positions,
+        lengths,
+        divisor,
+        compress,
+    )
+    logger.info_once("Using SM70 QSA fused exact Top-512.")

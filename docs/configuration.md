@@ -14,6 +14,11 @@ The complete reference exports are in [step 3 of the tutorial](getting-started.m
 Use only the documented `VLLM_SM70_*` settings unless you are troubleshooting. Explicit
 values override the profile.
 
+`VLLM_SM70_MTP_GDN_NATIVE_VERIFY=1` enables experimental native GDN verification
+and accepted-state replay for eligible Flash-Next MTP batches on SM70 TP4.
+The default is `0`. Validate target outputs and committed states against Triton
+before enabling it for service.
+
 ## Interconnect
 
 The engine selects the interconnect automatically and logs `SM70 interconnect=<mode>`.
@@ -24,6 +29,14 @@ output sum (sum2) uses its own push kernel at the sizes that have one and otherw
 locally before the ordinary all-reduce. Override with `VLLM_SM70_INTERCONNECT=auto|pex|nccl|nvlink`
 or disable custom all-reduce with `--disable-custom-all-reduce`.
 
+`VLLM_SM70_NVLINK_HC=1` opts into experimental Flash-Next HC sharding, fused
+all-reduce/HC, and the QSA DCP2 query exchange and output merge for synchronous
+Model Runner V2. It defaults to `0`. All six SM70 TP4 GPU pairs must have direct
+NVLink and native peer atomics. An interconnect override cannot
+satisfy these checks. The QSA route supports FP16 queries with six 256-element
+heads per rank and up to 64 rows. These paths can change floating-point rounding
+and are subject to model quality validation.
+
 ## Launch options
 
 `--kv-cache-dtype` selects the storage format:
@@ -32,17 +45,25 @@ or disable custom all-reduce with `--disable-custom-all-reduce`.
 | --- | --- |
 | `fp8` / `fp8_e4m3` | Existing E4M3 with calibrated per-layer K/V scalar scales |
 | `fp8_per_token_head` | L1 planar E4M3FN with dynamic FP32 scales per token and head; no KV scale overlay needed |
-| `auto` (CLI default) | Planar E4M3 for eligible QSA requests, with or without checkpoint KV scales and speculation |
-| `int8` / `int8_per_token_head` | Existing planar RNE INT8 / inline truncating INT8, unchanged |
+| `auto` (CLI default) | Planar INT8 for eligible SM70 QSA, planar E4M3 for eligible QSA on other CUDA devices |
+| `int8_per_token_head` / `int8` | On Qwen4Exp QSA, both use planar INT8 with round-to-nearest-even and dynamic FP32 scales per token and head |
 | `float16` / `bfloat16` | Explicit model-precision storage, subject to existing hardware and backend support |
 
-QSA auto selection requires the existing `qsa_auto_e4m3` policy, QSA selector
+QSA auto selection uses the existing `qsa_auto_e4m3` policy and requires QSA selector
 metadata, a supported operator dtype/device, no runtime scale calculation and
 prefill context parallelism of one. Otherwise the existing auto/model-dtype
 rules apply. Explicit values take precedence and retain their backend admission
-requirements. MTP inherits the target format
-unless specified; a planar target with an explicit scalar MTP draft remains
-unsupported. On SM70, DFlash/DFlash2 still defaults to an FP16 draft.
+requirements. MTP inherits the target KV format in both GPU and Host KV mode
+unless `speculative_config.kv_cache_dtype` overrides it with a supported format.
+The MTP draft can share the Host KV pool when main and draft are placed on the
+host and their format and page geometry match. At DCP2, this also requires
+`qsa_dcp_index_shard=true`. An explicit FP16 draft with an 8-bit target keeps its
+history on the GPU. With an SM70 QSA target, DFlash/DFlash2 defaults to FP16
+draft KV in both modes.
+
+The QSA INT8 spellings also work in `speculative_config.kv_cache_dtype`
+when the target uses the same INT8 format. Generic Triton attention uses
+its existing inline layout for `int8_per_token_head`.
 
 `fp8_per_token_head` uses four page regions `[K | V | sK | sV]`, not upstream
 vLLM's inline FP8 page ABI. The old `fp8_e4m3_per_token_head` name is removed
@@ -99,9 +120,7 @@ measurements remain unchanged; planar GPU acceptance is still pending.
 - **`--gpu-memory-utilization 0.95`** passed the full gate, including the multimodal
   stress test with 8 concurrent requests. Higher values ran out of memory in earlier
   multimodal stress tests. If you change concurrency or media limits, measure again.
-- The scheduler settings (`--prefill-pressure-*`, `--long-prefill-token-threshold`,
-  `--mixed-prefill-step-latency-ms`) and `ple_disk_cascade: false` are the tested
-  values for this machine. They are deployment settings, not universal defaults.
+- The reference scheduler settings are explicit deployment overrides. See [Mixed prefill scheduling](#mixed-prefill-scheduling) for the launch defaults.
 - `cpu_bytes_to_use` is the total for all four workers (48 GiB = 12 GiB per worker).
 - **Keep `--limit-mm-per-prompt` on V100.** With FlashAttention-V100, the engine allows
   1 image and no video per request without it, and a value that leaves out `"video"`
@@ -124,6 +143,45 @@ measurements remain unchanged; planar GPU acceptance is still pending.
 - Media limits and request budgets: see
   [multimodal input limits](../.github/MULTIMODAL_INPUTS.md).
 
+### ReVolta serving defaults
+
+The SM70 ReVolta profile applies these defaults to FP16 TP4 QSA hybrid
+generation servers, with or without speculative decoding. Explicit values
+take precedence.
+
+| Option | Profile default | Effect |
+| --- | ---: | --- |
+| `--enable-prefix-caching` | `true` | Reuses cached prompt prefixes. The hybrid model validator selects the Mamba state cache mode. |
+| `--max-num-seqs` | `8` | Sets the maximum number of scheduled sequences. |
+| `--max-num-batched-tokens` | `8192` unless chunked prefill is explicitly disabled | Sets the total token budget per scheduler step. |
+| `--long-prefill-token-threshold` | `4896`, capped at the model context length | Caps one long prefill when other requests may need the step. |
+| `qsa_dcp_index_shard` (DFlash2 with 512 selected groups) | `true` | Shards target QSA indexer keys with DCP > 1. MTP and DCP1 keep the replicated layout. |
+| `num_speculative_tokens_per_batch_size` (DFlash2 K=7) | `[[1,3,7],[4,4,3],[5,8,4]]` | Selects the number of drafts by batch size. |
+| `num_speculative_tokens_per_batch_size` (MTP K=4 with aligned Mamba caching) | `[[1,3,4],[4,8,3]]` | Selects the number of drafts by batch size. |
+| `dflash2_lookup` (native seven-token DFlash2 selector) | Longest match, suffix 5–16, 65,536-token window, `first_token` gate, statistics enabled, one live request | Uses committed token history to supplement the neural proposal. |
+| `sm70_dflash2.spec_state_replay` | `true` for DFlash2 | Replays accepted GDN tokens on eligible paths. An explicit packed verifier retains precedence. |
+| `gdn_state_replay` | `true` for MTP with aligned Mamba caching | Replays accepted GDN tokens on eligible synchronous paths. |
+| `VLLM_SM70_QSA_GROUPED_LPT`, `VLLM_SM70_GDN_SKINNY_MPLAN` | `1` | Use longest-first grouped QSA work and row-count-based GDN input plans. |
+| `VLLM_SM70_DFLASH2_FUSED_QKV_PACK` | `1` for DFlash2 | Fuses eligible post-convolution QKV packing. |
+| `VLLM_SM70_AWQ_MOE_INT4_ZERO` | `1` for qualified AWQ with compact metadata | Stores AWQ MoE zeros as nibbles. |
+| `PYTORCH_ALLOC_CONF`, `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True` if neither is set | Sets the policy before local GPU workers start when KV connector setup is absent or VMM-safe. |
+
+The engine still resolves omitted `--async-scheduling` from the executor and
+speculative decoding settings. The DFlash2 schedule and MTP's post-sampling
+GDN state replay select synchronous scheduling by default. Explicit
+`--async-scheduling` retains the existing compatibility checks and skips
+post-sampling replay. Nonstandard K values keep fixed-width drafting when no
+schedule is supplied.
+
+### Mixed prefill scheduling
+
+The SM70 ReVolta profile for FP16-activation, TP4 QSA Flash-Next with AWQ or NVFP4 weights and either MTP or DFlash2 applies these defaults. Explicit values take precedence.
+
+| Option | Profile default | Effect |
+| --- | ---: | --- |
+| `--prefill-pressure-token-budget` | `448` | With chunked prefill enabled, caps the total prefill tokens in a step when decoding is runnable and at least one prefill is running or waiting (the default `--prefill-pressure-threshold` is `1`). |
+| `--mixed-prefill-step-latency-ms` | `0` | Disables adaptive GPU step latency control and keeps the standard CUDA Graph capture sizes. |
+
 ## Optional MTP draft vocabulary in model runner V2
 
 Enable a static shortlist with `VLLM_SM70_MTP_STATIC_DRAFT_VOCAB_RANKING=<ranking.pt>` and `VLLM_SM70_MTP_STATIC_DRAFT_VOCAB_SIZE=65536`. The ranking artifact must match the model vocabulary and TP size. Static drafting maps both greedy and probabilistic proposals back to full vocabulary token IDs.
@@ -138,15 +196,18 @@ Each rank reserves T physical FP16 weight rows, even though the global effective
 
 Before requests, confirm the existing `Enabled static MTP draft vocabulary` message and one `Enabled global MTP draft vocabulary tail: base=%d tail=%d tp=%d sink=%d draft_sample=%s` message on each TP rank, with the configured tail size. For TP4 all four ranks must report the configured value. This confirms activation; output correctness and performance require separate GPU acceptance.
 
-## Optional native DFlash2 lookup
+## Native DFlash2 lookup
 
-The `dflash2_lookup` object inside `--speculative-config` is disabled by default.
+The ReVolta serving profile enables native lookup for eligible DFlash2 K=7
+configurations without an explicit lookup setting. Outside this profile, lookup
+requires an explicit configuration. Set `"dflash2_lookup": {"enabled": false}`
+to turn it off.
 See [native history lookup](dflash2.md#native-history-lookup-optional) for the C64
 recipe, scheduling limits, measurements and statistics.
 
 | Field | Default | Accepted settings |
 | --- | --- | --- |
-| `enabled` | `false` | Boolean; enable explicitly |
+| `enabled` | `false` in an explicit object | Boolean |
 | `policy` | unset | `longest`; required when enabled |
 | `nmin`, `nmax` | unset | Positive integers with `nmin <= nmax`; required when enabled |
 | `search_window` | `65536` | Positive token distance in committed history |
@@ -159,9 +220,9 @@ Native lookup requires a seven-token DFlash2 selector drafter and seven configur
 speculative tokens. It attempts lookup only when every live row is an eligible
 decode request, the batch contains at most `max_requests` requests, and the
 existing concurrency ladder selects width seven. Otherwise the entire batch
-bypasses lookup. Four or more requests always bypass lookup. Fixed seven without a ladder permits
-async subject to existing constraints; a nonempty ladder rejects explicit async
-and otherwise selects synchronous scheduling.
+bypasses lookup. Four or more requests always bypass lookup. Native lookup
+supports explicit asynchronous scheduling, subject to existing constraints.
+A DFlash2 schedule selects synchronous scheduling when the flag is omitted.
 
 Raw input provenance is captured before normalization and preserved through worker
 reconstruction. Worker environment changes do not reinterpret resolved lookup
@@ -254,6 +315,13 @@ type and default as registered in `vllm/envs.py`; *Since* is the first
 release with the variable (1Cat = inherited from 1Cat-vLLM); *Category*
 is configuration, tuning, experimental, debug or deprecated.
 
+### Pregraph preparation research switches
+
+| Name | Type | Default | Range | Category | Since | Effect and trade-off |
+|---|---|---|---|---|---|---|
+| `VLLM_SM70_NVFP4_RAW_GROUPED_M48_V154` | bool | `False` | 0, 1 | experimental | 0.2.0rc15 | Native raw-E4M3 grouped MoE for 48-row target decode on SM70 TP4 Qwen3.8 with equal interleaved gate/up global scales. Requires raw grouped decode and the V2 model runner. |
+| `VLLM_SM70_NVFP4_RAW_GROUPED_NARROW_V154` | bool | `False` | 0, 1 | experimental | 0.2.0rc15 | Native raw-E4M3 grouped MoE for 3-5 row target decode on SM70 TP4 Qwen3.8 with equal interleaved gate/up global scales. Requires raw grouped decode and the V2 model runner. |
+
 ### Promoted research switches
 
 | Name | Type | Default | Range | Category | Since | Effect and trade-off |
@@ -275,15 +343,19 @@ is configuration, tuning, experimental, debug or deprecated.
 
 | Name | Type | Default | Range | Category | Since | Effect and trade-off |
 |---|---|---|---|---|---|---|
+| `VLLM_1CAT_ADAPTIVE_MTP` | str | `off` | off/0/false/no, on/1/true/yes, auto | experimental | 0.2.0rc15 | Opt in to adaptive depth for synchronous Flash-Next MRv2 MTP with a dynamic speculative decoding schedule. Explicit auto also requires SM70 and a configured maximum depth of at least five. Single-request decode may trade fewer draft steps for more target steps. |
 | `VLLM_PLE_OFFLOAD_READY_TIMEOUT` | float | `600.0` | seconds | configuration | 1Cat | How long startup waits for the PLE offload worker. Raise it on slow storage; the reference deployment uses 1200. |
 | `VLLM_QWEN4EXP_PLE_HOST_GIB` | float \| None | `None` | GiB per TP rank; unset = automatic | configuration | 1Cat | Caps pinned host memory for the PLE table. Lower values leave host RAM for CPU KV offload but move more PLE rows to disk; the reference deployment uses 12. |
 | `VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB` | float \| None | `None` | non-negative GiB or unset | configuration | 1Cat | Unset reserves min(host limit / 4, 8 GiB), preserving the small-host margin without scaling it to tens of GiB. Explicit values override the cap. The warning-only preflight counts shared CPU KV storage separately; automatic placement also uses this reserve. |
+| `VLLM_QWEN_REASONING_EOS_MASK` | bool | `False` | 0, 1 | configuration | 0.2.0rc15 | Suppresses model EOS during visible Qwen chat reasoning in Model Runner V2. Requests still in reasoning use full-vocabulary sampling when compact DFlash2 verification would truncate logits. |
 | `VLLM_SM70_AWQ_MOE_INT4_ZERO` | bool | `False` | 0, 1 | experimental | 0.2.0 | Packs AWQ zero points into nibbles: less resident metadata, lossless. Needs compact metadata and a native build with the packed kernels. |
 | `VLLM_SM70_DFLASH2_FUSED_QKV_PACK` | bool | `False` | 0, 1 | configuration | 1Cat | One Triton launch instead of three copies and a concat in the DFlash2 verifier. Outputs are bitwise identical either way. |
 | `VLLM_SM70_FLASH_ATTN_V100` | bool | `True` | 0, 1 | configuration | 1Cat | Default on (set in the image). 0 only to diagnose backend selection; prefer --attention-backend to choose a backend. |
 | `VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH` | bool | `False` | 0, 1 | configuration | 1Cat | Set in the image: VLLM_COMPILE + FULL_AND_PIECEWISE with small decode captures (the 0.0.3 graph policy). |
 | `VLLM_SM70_HOST_KV_STATIC_HOT_POOL` | bool | `False` | 0, 1 | configuration | 0.2.0 | Long-context host placement only. 1 restores the separate static hot-page pool (history IDs capped by host pages); the default shares free history-ID index pages with the hot slots. |
 | `VLLM_SM70_IDLE_CLOCK_SECONDS` | int | `0` | non-negative integer seconds | configuration | 0.2.0rc14 | Zero disables clock control. A positive value opts in for a single-host EngineCore process with exclusive V100 TP1 or TP4 GPUs. Requires NVML clock permissions and host-side reset by GPU UUID on abnormal exit before the GPUs can be reused. |
+| `VLLM_SM70_MTP_PLE_CONV` | bool | `True` | 0, 1 | configuration | 1Cat | Fuses SM70 PLE speculative rollback, convolution, SiLU and state update for eligible MTP and DFlash2 batches. Set 0 to use the separate operations. |
+| `VLLM_SM70_PLE_GATE_NORM` | bool | `False` | 0, 1 | experimental | 0.2.0rc15 | Opt-in FP16 PLE gate and norm fusion in SM70 Flash-Next full decode graphs with dual compilation. The fused reduction can change FP16 results. |
 | `VLLM_SM70_QWEN_GDN_DISABLE_FULL_FORWARD` | bool | `False` | 0, 1 | configuration | 1Cat | Diagnostic: compare the split GDN compile boundary with the full-forward guard. The image sets 0. |
 | `VLLM_SM70_QWEN_GDN_FULL_FORWARD` | bool | `False` | 0, 1 | configuration | 1Cat | Diagnostic force-on of the opaque GDN full-forward boundary. The image sets 0; the automatic default arms it only for active MTP batches. |
 | `VLLM_SM70_QWEN_GDN_SPEC_CORE_OP` | bool | `False` | 0, 1 | experimental | 1Cat | Experimental narrower MTP boundary (only the recurrent core is opaque). The image sets 0 until it passes long-output quality. |
@@ -297,7 +369,7 @@ The ReVolta profile (`vllm/revolta_profile.py`) sets these on SM70 + TP4 + FP16 
 | `VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS` | bool | `False` | `1` | 0, 1 | configuration | 1Cat | Opts out of the 1Cat SM70 MTP launch defaults; the ReVolta profile supplies its own. |
 | `VLLM_EARLY_MODEL_INPUTS` | bool | `False` | `1` | 0, 1 | experimental | 0.2.0 | Prepares model-state inputs before attention metadata in FULL graph steps, overlapping host work. |
 | `VLLM_PLE_ASYNC_REQUEST_INDICES` | bool | `False` | `1` | 0, 1 | experimental | 0.2.0 | Non-blocking PLE request-index transfers; removes a host wait per step. |
-| `VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP` | bool | `False` | `0` | 0, 1 | configuration | 1Cat | Shared-expert stream overlap. The profile sets 0 on TP4 SM70, where the second stream does not pay off. |
+| `VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP` | bool | `False` | `0`, `1` (AWQ+DFlash2) | 0, 1 | configuration | 1Cat | Allows shared and routed experts to run on separate CUDA streams. The native g32 AWQ profile enables it for DFlash2 with expert parallelism and dual batch overlap disabled. An explicit 0 or 1 takes precedence. |
 | `VLLM_SM70_AWQ_QWEN38_GROUPED_QPN` | bool | `False` | `1` (AWQ) | 0, 1 | experimental | 0.2.0 | Grouped AWQ MoE decode reads each active expert once for all its rows (2..48). Faster at 2..8 requests; reduction order differs from the TurboMind route. |
 | `VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS` | int | `20` | `40` (AWQ) | 2..48 | tuning | 0.2.0 | Largest row count sent to the grouped route; above it rows use TurboMind. The profile uses 40 (8 requests x 5 tokens). |
 | `VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_PACK_ROWS` | int | `0` | `24` (AWQ) | 0 or 8..48 step 8 | tuning | 0.2.0 | Caps rows per expert pack: fewer registers per CTA but hot experts are read more than once. Result unchanged. |
@@ -307,6 +379,7 @@ The ReVolta profile (`vllm/revolta_profile.py`) sets these on SM70 + TP4 + FP16 
 | `VLLM_SM70_CAR_VMM_SAFE` | bool | `False` | `1` (P2P/NVLink) | 0, 1 | experimental | 0.2.0 | Copies non-exportable (VMM) inputs into graph allocations while capturing custom all-reduce graphs, so expandable segments can stay on. Only with P2P or NVLink. |
 | `VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS` | bool | `True` | `0` (DFlash2) | 0, 1 | configuration | 1Cat | Single-request DFlash2 verifier tail graphs. The DFlash2 profile sets 0 to keep the graph memory for the KV cache. |
 | `VLLM_SM70_GREEDY_VERIFY` | bool | `False` | `1` | 0, 1 | experimental | 0.2.0 | Greedy MTP verification from TP-local argmax pairs instead of full-vocabulary logits; only when every request is plain greedy. |
+| `VLLM_SM70_MTP_Q8_PREFILL_MMQ` | bool | `False` | `1` (NVFP4) | 0, 1 | configuration | 0.2.0rc15 | Use grouped GGUF MMQ for Q8_0 MTP batches above 64 rows in chunks of up to 2048. MMQ changes accumulation order and increases temporary GPU memory usage. Set 0 to use the 64-row vector path. |
 | `VLLM_SM70_NVFP4_MOE_GROUPED_DECODE` | bool | `False` | `0` (NVFP4) | 0, 1 | experimental | 1Cat | Grouped native-NVFP4 decode; the profile keeps it off pending quality admission. |
 | `VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL` | bool | `True` | `1` (NVFP4) | 0, 1 | configuration | 1Cat | One grouped TurboMind call for all routed experts in prefill. |
 | `VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE` | bool | `False` | `1` (NVFP4) | 0, 1 | experimental | 1Cat | QPN for every live width 2..16 (NVFP4). |

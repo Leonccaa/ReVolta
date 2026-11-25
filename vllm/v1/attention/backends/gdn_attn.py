@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Backend for GatedDeltaNet attention."""
 
+import functools
 import json
 import os
+import shutil
 import time
 from dataclasses import dataclass
 from typing import Literal
@@ -338,12 +340,29 @@ def _write_ddtree_trace_event(event: str, payload: dict[str, object]) -> None:
         logger.exception("Failed to write DDTree trace event to %s", trace_path)
 
 
+@functools.cache
+def _sm70_flashqla_default_original_prefill() -> bool:
+    # TileLang compiles with bin/nvcc under its resolved CUDA home. A
+    # runtime-only install can have that home without the compiler.
+    try:
+        from tilelang.env import CUDA_HOME as cuda_home
+    except ImportError:
+        cuda_home = ""
+    if cuda_home and shutil.which(os.path.join(cuda_home, "bin", "nvcc")):
+        return True
+    logger.warning_once(
+        "TileLang nvcc unavailable; SM70 FlashQLA GDN prefill uses the "
+        "prebuilt VLK kernel."
+    )
+    return False
+
+
 def _sm70_flashqla_original_prefill_enabled() -> bool:
     raw = os.getenv("VLLM_SM70_FLASHQLA_ORIGINAL_PREFILL")
     if raw is None:
         raw = os.getenv("FLASH_QLA_SM70_USE_ORIGINAL_TILELANG")
     if raw is None:
-        return True
+        return _sm70_flashqla_default_original_prefill()
     return raw.strip().lower() not in ("0", "false", "no", "off", "")
 
 
@@ -476,6 +495,10 @@ class GDNAttentionMetadata:
     # does not allocate two empty CUDA tensors and rebuild the same tuple for
     # every GDN cache group on every verification round.
     _prepared_spec_metadata_tensors: GDN_SPEC_METADATA_TENSORS | None = None
+
+    # Set by the target builder. Runtime FULL replay updates the buffers above
+    # while keeping the query width from the graph's capture metadata.
+    max_query_len: int = 0
 
 
 @dataclass
@@ -1877,12 +1900,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
         chunk_indices: torch.Tensor | None = None
         chunk_offsets: torch.Tensor | None = None
-        flashqla_original_prefill = (
-            self.gdn_prefill_backend == "flashqla_sm70"
-            and _sm70_flashqla_original_prefill_enabled()
-        )
         if num_prefills > 0 and (
-            self.gdn_prefill_backend != "flashqla_sm70" or flashqla_original_prefill
+            self.gdn_prefill_backend != "flashqla_sm70"
+            or _sm70_flashqla_original_prefill_enabled()
         ):
             from vllm.model_executor.layers.fla.ops.utils import FLA_CHUNK_SIZE
 
@@ -2069,6 +2089,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             num_spec_decodes=num_spec_decodes,
             num_spec_decode_tokens=num_spec_decode_tokens,
             num_actual_tokens=m.num_actual_tokens,
+            max_query_len=m.max_query_len,
             has_initial_state=has_initial_state,
             chunk_indices=chunk_indices,
             chunk_offsets=chunk_offsets,
@@ -2494,9 +2515,10 @@ def prepare_dflash2_gdn_group_metadata(
             ),
         )
 
-    block = triton.next_power_of_2(
-        max(num_actual_tokens * width, num_actual_tokens + 1)
-    )
+    # Size the tile for the largest graph batch, not this step's, so a new
+    # batch size does not compile a new variant.
+    max_bs = first_builder.decode_cudagraph_max_bs
+    block = triton.next_power_of_2(max(max_bs * width, max_bs + 1))
     _dflash2_gdn_group_metadata_kernel[(len(input_tables),)](
         descriptor.block_table_ptrs,
         descriptor.state_output_ptrs,

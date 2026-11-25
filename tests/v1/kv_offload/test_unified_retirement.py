@@ -50,7 +50,6 @@ def test_inflight_cpu_receive_is_excluded_from_writable_wait(tmp_path):
 
 def pending_variant(m, *, ahead=1):
     keys = [key(1, g) for g in m.kind_by_group if g != 8]
-    assert m.admit_build("r", len(keys) + 2)
     b = m.begin_boundary("r", sha256(1), keys)
     assert b is not None
     publish(m.table, key(1))
@@ -86,7 +85,7 @@ def test_normal_finish_before_dma_registers_and_commits_manifest(tmp_path):
         assert env.settle(lambda: env.store.manifest_ok(variant))
         assert env.store.manifest_ok(variant)
         assert_waiters_released(m)
-        assert not m.builds and not m.jobs and not m.ledger.charges
+        assert not m.builds and not m.jobs
     finally:
         env.ssd.close(io_grace_s=2)
 
@@ -132,7 +131,6 @@ def test_build_failure_reason_counted_once(reason):
     elif reason == "source_not_dispatched":
         # One additional component was accepted but never handed to a job.
         extra = [key(2, g) for g in m.kind_by_group]
-        assert m.admit_build("other", 11)
         other = m.begin_boundary("other", sha256(2), extra)
         m.end_step()
         assert other is not None
@@ -250,7 +248,6 @@ def test_draining_registration_metadata_stays_bounded():
     m = manager(pages=512)
     for n in range(40):
         keys = [key(n, g) for g in m.kind_by_group]
-        assert m.admit_build("r", 11)
         b = m.begin_boundary("r", sha256(n), keys)
         publish(m.table, key(n))
         m.offer_variant("r", VariantOffer(b.uid, b.gen, sha256(n), (key(n),)))
@@ -261,7 +258,7 @@ def test_draining_registration_metadata_stays_bounded():
         m.receipt(n, out.store_spec.gen, m.table.all_ranks, 0)
         assert m.units.units[b.uid].variants
         assert_waiters_released(m)
-        assert not m._latest_variant_offers and not m.ledger.charges
+        assert not m._latest_variant_offers
 
 
 def test_variant_wait_and_terminal_absence_are_distinct():

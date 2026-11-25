@@ -226,6 +226,12 @@ def _compute_block_stats_kernel(
             )
 
 
+@triton.jit
+def _accept_draft(target_log_prob, log_uniform_times_draft):
+    # Strict comparison also rejects a zero target probability when u is zero.
+    return target_log_prob > log_uniform_times_draft
+
+
 @triton.jit(
     do_not_specialize=[
         "rejected_logsumexp_plane_stride",
@@ -271,6 +277,7 @@ def _rejection_kernel(
     pos_ptr,
     # [num_speculative_steps]
     synthetic_conditional_rates_ptr,
+    reasoning_eos_rows_ptr,
     vocab_num_blocks,
     PADDED_VOCAB_NUM_BLOCKS: tl.constexpr,
     HAS_DRAFT_LOGITS: tl.constexpr,
@@ -337,6 +344,14 @@ def _rejection_kernel(
                     u = tl_rand32(seed, pos, includes_zero=False)
                     rate = tl.load(synthetic_conditional_rates_ptr + i)
                     accepted &= u < rate
+                    if reasoning_eos_rows_ptr is not None:  # noqa: SIM102
+                        if tl.load(reasoning_eos_rows_ptr + logit_idx):
+                            target_logit = tl.load(
+                                target_logits_ptr
+                                + logit_idx * target_logits_stride
+                                + draft_sampled
+                            )
+                            accepted &= target_logit > -float("inf")
                 else:
                     accepted &= target_argmax == draft_sampled
                 tl.store(
@@ -387,10 +402,15 @@ def _rejection_kernel(
                 if SYNTHETIC_MODE:
                     rate = tl.load(synthetic_conditional_rates_ptr + i)
                     accepted &= u < rate
+                    if reasoning_eos_rows_ptr is not None:  # noqa: SIM102
+                        if tl.load(reasoning_eos_rows_ptr + logit_idx):
+                            accepted &= target_log_prob > -float("inf")
                 else:
                     # Probability ratio test: p(x) > u * q(x)
                     # Equivalent log form: log_p(x) > log(u) + log_q(x)
-                    accepted &= target_log_prob > tl.log(u) + draft_log_prob
+                    accepted &= _accept_draft(
+                        target_log_prob, tl.log(u) + draft_log_prob
+                    )
                 tl.store(sampled_ptr + req_idx * sampled_stride + i, draft_sampled)
             rejected_step += accepted
     tl.store(rejected_steps_ptr + req_idx, rejected_step)
@@ -808,6 +828,7 @@ def _dflash2_compact_target_row(
     TOP_K: tl.constexpr,
     BLOCK_K: tl.constexpr,
     LIMIT_K: tl.constexpr,
+    KEEP_CUTOFF_TIES: tl.constexpr = False,
 ):
     offsets = tl.arange(0, BLOCK_K)
     mask = offsets < TOP_K
@@ -822,13 +843,16 @@ def _dflash2_compact_target_row(
         other=float("-inf"),
     ).to(tl.float32)
     # Candidates are score-descending, with ascending vocabulary IDs at ties.
-    # Match upstream dense top-k by retaining only the first LIMIT_K entries.
-    mask &= offsets < LIMIT_K
+    # Cutoff-tie policy follows 1Cat v1.5.4 (1fa9c438bc). DFlash2 keeps
+    # its existing exact-prefix contract via the default control value.
+    if KEEP_CUTOFF_TIES and LIMIT_K < TOP_K:
+        cutoff = tl.load(target_logits_ptr + row * target_stride + LIMIT_K - 1)
+        mask &= logits >= cutoff
+    else:
+        mask &= offsets < LIMIT_K
     logits = tl.where(mask, logits, float("-inf"))
 
-    # get_topk_tokens_and_logits returns scores in descending order. Apply
-    # nucleus filtering only within that exact top-k support, matching the
-    # target's top-k-first sampling contract without materializing V columns.
+    # Apply nucleus filtering within the retained top-k support.
     row_max = tl.max(logits, axis=0)
     unnormalized = tl.where(mask, tl.exp(logits - row_max), 0.0)
     normalizer = tl.sum(unnormalized, axis=0)
@@ -958,8 +982,9 @@ def _dflash2_sparse_topk_rejection_kernel(
 
             pos = tl.load(pos_ptr + row)
             uniform = tl_rand32(seed, pos, includes_zero=False)
-            accepted &= (target_proposed_logit - target_lse) > (
-                tl.log(uniform) + draft_proposed_logit - draft_lse
+            accepted &= _accept_draft(
+                target_proposed_logit - target_lse,
+                tl.log(uniform) + draft_proposed_logit - draft_lse,
             )
             tl.store(
                 sampled_ptr + req_idx * sampled_stride + step,
@@ -969,7 +994,7 @@ def _dflash2_sparse_topk_rejection_kernel(
 
     resample_step = accepted_steps
     resample_row = start_idx + resample_step
-    target_ids, target_logits, target_keep, target_lse = _dflash2_compact_target_row(
+    target_ids, target_logits, target_keep, _ = _dflash2_compact_target_row(
         target_ids_ptr,
         target_logits_ptr,
         target_stride,
@@ -1002,9 +1027,6 @@ def _dflash2_sparse_topk_rejection_kernel(
             mask=draft_mask,
             other=float("-inf"),
         ).to(tl.float32)
-        draft_max, draft_sumexp = _compute_block_max_and_sumexp(draft_logits)
-        draft_lse = draft_max + tl.log(draft_sumexp)
-
         id_match = target_ids[:, None] == draft_ids[None, :]
         draft_logits_at_target = tl.max(
             tl.where(
@@ -1014,14 +1036,30 @@ def _dflash2_sparse_topk_rejection_kernel(
             ),
             axis=1,
         )
-        target_log_probs = target_logits - target_lse
-        draft_log_probs = draft_logits_at_target - draft_lse
-        ratio = tl.exp(draft_log_probs - target_log_probs)
-        residual_logits = tl.where(
-            target_keep & (ratio < 1.0),
-            target_log_probs + tldevice.log1p(-ratio),
-            float("-inf"),
+        target_max, target_excl = _compute_block_max_and_sumexp_excl(
+            target_logits, TARGET_BLOCK_K
         )
+        draft_max, draft_excl = _compute_block_max_and_sumexp_excl(
+            draft_logits, DRAFT_BLOCK_K
+        )
+        residual_logits = _stable_residual_logits(
+            target_logits,
+            draft_logits_at_target,
+            target_max,
+            tldevice.log1p(target_excl),
+            draft_max,
+            tldevice.log1p(draft_excl),
+        )
+        # Match dense recovery when FP32 rounds the entire residual to zero.
+        if tl.max(residual_logits, axis=0) == -float("inf"):
+            residual_logits = _single_lse_residual_logits(
+                target_logits,
+                draft_logits_at_target,
+                target_max + tl.log(1.0 + target_excl),
+                draft_max + tl.log(1.0 + draft_excl),
+            )
+            if tl.max(residual_logits, axis=0) == -float("inf"):
+                residual_logits = target_logits
 
     pos = tl.load(pos_ptr + resample_row)
     _, selected_offset = gumbel_noised_argmax(
@@ -1139,6 +1177,150 @@ def dflash2_sparse_topk_rejection_sample(
     return sampled, num_sampled
 
 
+@triton.jit
+def _greedy_draft_sparse_topk_rejection_kernel(
+    sampled_ptr,
+    sampled_stride,
+    num_sampled_ptr,
+    target_ids_ptr,
+    target_logits_ptr,
+    target_stride,
+    draft_sampled_ptr,
+    cu_num_logits_ptr,
+    idx_mapping_ptr,
+    top_p_ptr,
+    seed_ptr,
+    pos_ptr,
+    STEPS: tl.constexpr,
+    TOP_K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    LIMIT_K: tl.constexpr,
+    USE_FP64: tl.constexpr,
+):
+    req = tl.program_id(0)
+    slot = tl.load(idx_mapping_ptr + req)
+    start = tl.load(cu_num_logits_ptr + req)
+    end = tl.load(cu_num_logits_ptr + req + 1)
+    top_p = tl.load(top_p_ptr + slot)
+    seed = tl.load(seed_ptr + slot)
+    accepted = tl.full((), True, tl.int1)
+    count = tl.full((), 0, tl.int32)
+    for step in range(STEPS):
+        if accepted and start + step < end - 1:
+            row = start + step
+            ids, logits, keep, _ = _dflash2_compact_target_row(
+                target_ids_ptr,
+                target_logits_ptr,
+                target_stride,
+                row,
+                top_p,
+                TOP_K=TOP_K,
+                BLOCK_K=BLOCK_K,
+                LIMIT_K=LIMIT_K,
+                KEEP_CUTOFF_TIES=True,
+            )
+            proposed = tl.load(draft_sampled_ptr + row + 1)
+            proposed_logit = tl.max(
+                tl.where(keep & (ids == proposed), logits, float("-inf")), axis=0
+            )
+            # Same stable log(p) formula as dense, without log(q) for q=1.
+            row_max, sum_excl = _compute_block_max_and_sumexp_excl(logits, BLOCK_K)
+            log_p = _log_softmax(proposed_logit, row_max, tldevice.log1p(sum_excl))
+            pos = tl.load(pos_ptr + row)
+            uniform = tl_rand32(seed, pos, includes_zero=False)
+            accepted = log_p > tl.log(uniform)
+            tl.store(sampled_ptr + req * sampled_stride + step, proposed)
+            count += accepted.to(tl.int32)
+
+    row = start + count
+    ids, logits, _, _ = _dflash2_compact_target_row(
+        target_ids_ptr,
+        target_logits_ptr,
+        target_stride,
+        row,
+        top_p,
+        TOP_K=TOP_K,
+        BLOCK_K=BLOCK_K,
+        LIMIT_K=LIMIT_K,
+        KEEP_CUTOFF_TIES=True,
+    )
+    if row < end - 1:
+        # Residual for a one-hot draft: remove the rejected token, but keep
+        # the original (not normalized) target scores, as in dense.
+        proposed = tl.load(draft_sampled_ptr + row + 1)
+        logits = tl.where(ids == proposed, float("-inf"), logits)
+    # Dense argmax resolves equal noised scores by the lowest token ID.
+    # Nucleus selection above used score order; restore ID order only here.
+    offsets = tl.arange(0, BLOCK_K)
+    order = tl.sort(ids.to(tl.int32) * BLOCK_K + offsets, descending=False) % BLOCK_K
+    ids = tl.gather(ids, order, axis=0)
+    logits = tl.gather(logits, order, axis=0)
+    pos = tl.load(pos_ptr + row)
+    _, selected = gumbel_noised_argmax(
+        logits,
+        ids,
+        logits > float("-inf"),
+        seed,
+        pos,
+        1.0,
+        IS_DRAFTING=False,
+        USE_FP64=USE_FP64,
+        APPLY_TEMPERATURE=False,
+    )
+    token = tl.sum(tl.where(offsets == selected, ids, 0), axis=0)
+    tl.store(sampled_ptr + req * sampled_stride + count, token)
+    tl.store(num_sampled_ptr + req, count + 1)
+
+
+def greedy_draft_sparse_topk_rejection_sample(
+    target_topk_ids: torch.Tensor,
+    target_topk_logits: torch.Tensor,
+    draft_sampled: torch.Tensor,
+    cu_num_logits: torch.Tensor,
+    pos: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    top_p: torch.Tensor,
+    seed: torch.Tensor,
+    num_speculative_steps: int,
+    use_fp64: bool,
+    *,
+    target_top_k: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample an FP32 T=1 shortlist with score/ID tie order.
+
+    With target_top_k, include cutoff ties within the supplied shortlist
+    before applying top-p. Otherwise the shortlist is already truncated.
+    ID and score rows must share a stride and follow the verifier row order.
+    """
+    num_reqs = cu_num_logits.shape[0] - 1
+    top_k = target_topk_ids.shape[1]
+    sampled = draft_sampled.new_empty(
+        num_reqs, num_speculative_steps + 1, dtype=torch.int64
+    )
+    num_sampled = sampled.new_empty(num_reqs, dtype=torch.int32)
+    _greedy_draft_sparse_topk_rejection_kernel[(num_reqs,)](
+        sampled,
+        sampled.stride(0),
+        num_sampled,
+        target_topk_ids,
+        target_topk_logits,
+        target_topk_ids.stride(0),
+        draft_sampled,
+        cu_num_logits,
+        idx_mapping,
+        top_p,
+        seed,
+        pos,
+        STEPS=num_speculative_steps,
+        TOP_K=top_k,
+        BLOCK_K=triton.next_power_of_2(top_k),
+        LIMIT_K=top_k if target_top_k is None else target_top_k,
+        USE_FP64=use_fp64,
+        num_warps=1,
+    )
+    return sampled, num_sampled
+
+
 def rejection_sample(
     # [num_logits, V]
     target_logits: torch.Tensor,
@@ -1168,6 +1350,7 @@ def rejection_sample(
     # that were redrawn from [0] the single-logsumexp residual or [1] the
     # target distribution.
     fallback_count: torch.Tensor | None = None,
+    reasoning_eos_rows: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     num_reqs = cu_num_logits.shape[0] - 1
     num_logits, vocab_size = target_logits.shape
@@ -1243,6 +1426,7 @@ def rejection_sample(
         seed,
         pos,
         synthetic_conditional_rates,
+        reasoning_eos_rows,
         vocab_num_blocks,
         PADDED_VOCAB_NUM_BLOCKS=padded_vocab_num_blocks,
         HAS_DRAFT_LOGITS=has_draft_logits,

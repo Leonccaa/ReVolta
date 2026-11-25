@@ -549,6 +549,12 @@ class OpenAIServingRender:
         skip_mm_cache: bool = False,
     ) -> tuple[list[ConversationMessage], list[EngineInput]]:
         """Copied from OpenAIServing._preprocess_chat."""
+        from vllm.tool_parsers.qwen_xml_tool_grammar import (
+            adjust_qwen_xml_tool_request,
+            inject_qwen_xml_response_format_hint,
+            qwen_xml_json_answer,
+        )
+
         validate_request_mm_kwargs(
             mm_processor_kwargs=getattr(request, "mm_processor_kwargs", None),
             media_io_kwargs=getattr(request, "media_io_kwargs", None),
@@ -577,6 +583,33 @@ class OpenAIServingRender:
             default_mm_processor_kwargs=getattr(request, "mm_processor_kwargs", None),
         )
 
+        def adjust_reasoning_request(request: Any) -> Any:
+            if reasoning_parser is None:
+                return request
+            return reasoning_parser(
+                renderer.get_tokenizer(),
+                model_config=self.model_config,
+                chat_template_kwargs=chat_params.chat_template_kwargs,
+            ).adjust_request(request=request)
+
+        qwen_xml_adjusted = False
+        if (
+            isinstance(request, ChatCompletionRequest)
+            and not request.use_beam_search
+            and tool_parser is not None
+            and getattr(tool_parser, "_uses_qwen_xml_tool_grammar", False)
+            and qwen_xml_json_answer(request) is not None
+        ):
+            # This path needs the actual union before the template, with the
+            # same reasoning-then-tool adjustment order.
+            request = adjust_reasoning_request(request)
+            if hint := adjust_qwen_xml_tool_request(request, logger):
+                messages = inject_qwen_xml_response_format_hint(messages, hint)
+            else:
+                parser = tool_parser(renderer.get_tokenizer(), request.tools)
+                request = ToolParser.adjust_request(parser, request=request)
+            qwen_xml_adjusted = True
+
         (conversation,), (engine_input,) = await renderer.render_chat_async(
             [messages],
             chat_params,
@@ -589,13 +622,10 @@ class OpenAIServingRender:
             skip_mm_cache=skip_mm_cache,
         )
 
-        if reasoning_parser is not None:
-            tokenizer = renderer.get_tokenizer()
-            request = reasoning_parser(
-                tokenizer,
-                model_config=self.model_config,
-                chat_template_kwargs=chat_params.chat_template_kwargs,
-            ).adjust_request(request=request)
+        if qwen_xml_adjusted:
+            return conversation, [engine_input]
+
+        request = adjust_reasoning_request(request)
 
         # tool parsing is done only if a tool_parser has been set and if
         # tool_choice is not "none" (if tool_choice is "none" but a tool_parser

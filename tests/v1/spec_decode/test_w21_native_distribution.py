@@ -90,13 +90,13 @@ def _interpreter_compact_full_support(
     target_logits_ptr,
     target_stride,
     row,
-    temperature,
     top_p,
     TOP_K: tl.constexpr,
     BLOCK_K: tl.constexpr,
     LIMIT_K: tl.constexpr,
 ):
-    # The smoke uses temperature=top_p=1 and the complete target shortlist.
+    # Same signature as _dflash2_compact_target_row, which no longer takes the
+    # temperature. The smoke uses top_p=1 and the complete target shortlist.
     # Avoid the interpreter's float/bool broadcasting bug in nucleus filtering.
     offsets = tl.arange(0, BLOCK_K)
     mask = offsets < TOP_K
@@ -417,6 +417,76 @@ def test_full_accept_and_bonus(sparse, valid):
         assert counts.tolist() == [8] * 4
         assert torch.equal(out[:, :7], spec.draft_tokens)
         assert out[:, 7].tolist() == [31] * 4
+
+
+@pytest.mark.parametrize(
+    ("target_scores", "draft_tokens", "draft_scores", "expected_support"),
+    [
+        pytest.param(
+            {3: math.log(0.8), 4: math.log(0.2)},
+            [3, 4, 7],
+            [math.log(0.9), math.log(0.05), math.log(0.05)],
+            {4},
+            id="positive-residual-only",
+        ),
+        pytest.param(
+            {4: 50.0, 5: 50.0, **dict(zip(range(8, 26), range(23, 5, -1)))},
+            [4, 5, 7, *range(8, 21)],
+            [50.0, 50.0, 36.0] + [10.0] * 13,
+            {4, 5},
+            id="stable",
+        ),
+        pytest.param(
+            {3: 0.0, 4: 0.0},
+            [3, 4, 7],
+            [10.0, 10.0, -10.0],
+            {3, 4},
+            id="single-lse",
+        ),
+        pytest.param(
+            {3: math.log(0.5), 9: math.log(0.3), 14: math.log(0.2)},
+            [3, 9, 14, 7],
+            [math.log(0.5), math.log(0.3), math.log(0.2), math.log(0.5) - 40.0],
+            {3, 9, 14},
+            id="target",
+        ),
+    ],
+)
+def test_compact_rejection_preserves_resampling_support(
+    target_scores, draft_tokens, draft_scores, expected_support
+):
+    device = torch.device(os.environ.get("W21_TEST_DEVICE", "cpu"))
+    num_reqs = 64
+    target_ids = torch.tensor(list(target_scores), device=device)
+    target = torch.tensor(list(target_scores.values()), device=device)
+    draft_ids = torch.tensor(draft_tokens, device=device)
+    draft = torch.tensor(draft_scores, device=device)
+    if device.type == "cpu":
+        # The interpreter substitutes the target filter. Apply its top-p
+        # cutoff here, keeping the real rejection and resampling kernels.
+        probs = target.softmax(0)
+        target.masked_fill_(probs.cumsum(0) - probs >= 0.95, -float("inf"))
+    positions = torch.tensor([100, 101], device=device).repeat(num_reqs)
+    idx = torch.arange(num_reqs, dtype=torch.int32, device=device)
+    with interpreter_math(device):
+        output, counts = dflash2_sparse_topk_rejection_sample(
+            target_ids.repeat(2 * num_reqs, 1),
+            target.repeat(2 * num_reqs, 1),
+            draft_ids.repeat(num_reqs, 1, 1),
+            draft.repeat(num_reqs, 1, 1),
+            torch.tensor([0, 7], device=device).repeat(num_reqs),
+            torch.arange(num_reqs + 1, dtype=torch.int32, device=device) * 2,
+            positions,
+            idx,
+            torch.ones(num_reqs, device=device),
+            torch.full((num_reqs,), 0.95, device=device),
+            idx.to(torch.int64) + 19,
+            1,
+        )
+    assert counts.tolist() == [1] * num_reqs
+    observed = output[:, 0].tolist()
+    # Proposal 7 has positive q and zero p in each case.
+    assert set(observed) == expected_support, observed
 
 
 def test_three_token_metric_pools_rare_cells():

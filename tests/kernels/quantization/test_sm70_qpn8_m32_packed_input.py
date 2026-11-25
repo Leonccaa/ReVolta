@@ -5,6 +5,42 @@
 import pytest
 import torch
 
+from vllm import _sm70_ops
+
+
+@pytest.mark.parametrize("tokens", [40, 48, 160])
+def test_qpn8_draft_fc_hidden_graph_uses_no_dense_workspace(tokens):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("requires SM70")
+    # Use a synthetic shape that needs no packed activation temporary.
+    k, n = 256, 1024
+    rows = tokens * 4
+    weight = torch.ones(n, k, device="cuda").to(torch.float8_e4m3fn)
+    scales = torch.ones(n, 1, device="cuda", dtype=torch.float32)
+    codes, packed_scales = _sm70_ops.fp8_qpn8_prepare_sm70(weight, scales)
+    x = torch.ones((tokens, 4, k), device="cuda", dtype=torch.float16)
+    out = torch.empty((tokens, 4, n), device="cuda", dtype=x.dtype)
+    flat_x = x.view(rows, k)
+    flat_out = out.view(rows, n)
+
+    def dispatch():
+        _sm70_ops.fp8_qpn8_draft_dispatch_sm70_out(
+            flat_out, flat_x, codes, packed_scales, 16, 2, False, False, rows
+        )
+
+    dispatch()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        before = torch.accelerator.memory_allocated()
+        torch.accelerator.reset_peak_memory_stats()
+        dispatch()
+        extra_bytes = torch.accelerator.max_memory_allocated() - before
+
+    assert extra_bytes < codes.numel() * x.element_size()
+    x.fill_(2)
+    graph.replay()
+    torch.testing.assert_close(out, torch.full_like(out, 2 * k), rtol=0, atol=0)
+
 
 @pytest.mark.parametrize("rows", [9, 15, 16, 17, 24, 31, 32])
 @pytest.mark.parametrize(

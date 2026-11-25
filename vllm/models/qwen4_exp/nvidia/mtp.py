@@ -23,7 +23,7 @@ import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.compilation.sm70_decode_graph import is_sm70_decode_graph_compiling
 from vllm.config import SpeculativeConfig, VllmConfig, replace, set_current_vllm_config
-from vllm.distributed import get_pp_group
+from vllm.distributed import get_pp_group, tensor_model_parallel_all_gather
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ColumnParallelLinear
@@ -43,6 +43,7 @@ from vllm.model_executor.models.utils import (
     maybe_fuse_shared_experts,
     maybe_prefix,
 )
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
@@ -74,6 +75,7 @@ from .model import (
 )
 from .sm70_fp16_gemv import enable_qwen38_sm70_fp16_gemv
 from .sm70_fp16_hc import enable_qwen38_sm70_fp16_fused_hc
+from .sm70_mtp_head import MTPQPN8LogitsProcessor
 
 logger = init_logger(__name__)
 
@@ -188,15 +190,9 @@ def _mtp_fp8_experts_supported(
     )
 
 
-def _make_draft_vllm_config(
-    vllm_config: VllmConfig,
-    mtp_start_layer_idx: int,
-) -> VllmConfig:
-    """Ensure that the draft model config is set in the vLLM config."""
-    speculative_config = vllm_config.speculative_config
-    if speculative_config is None or speculative_config.draft_model_config is None:
-        raise ValueError("speculative_config.draft_model_config must be set")
-
+def _get_mtp_quant_config(
+    vllm_config: VllmConfig, mtp_start_layer_idx: int
+) -> QuantizationConfig | None:
     draft_quant_config = get_draft_quant_config(vllm_config)
 
     # inject packed and ignored modules to the quantization config of draft model
@@ -224,6 +220,94 @@ def _make_draft_vllm_config(
                 _remap_quantized_layers(quantized_layers, mtp_start_layer_idx),
             )
 
+    return draft_quant_config
+
+
+def _mtp_expert_prefixes(config, mtp_start_layer_idx: int) -> set[str]:
+    return {
+        f"mtp.layers.{mtp_start_layer_idx + index}.mlp.experts"
+        for index in range(getattr(config, "mtp_num_hidden_layers", 1))
+    }
+
+
+def resolve_mtp_expert_default(vllm_config: VllmConfig) -> None:
+    """Default SM70 Qwen4Exp MTP routed experts to Q8_0 when the draft
+    checkpoint stores them as floating-point or block-FP8 tensors."""
+    from vllm.model_executor.layers.quantization.awq import AWQConfig
+    from vllm.model_executor.layers.quantization.awq_marlin import AWQMarlinConfig
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptMixedPrecisionConfig,
+        ModelOptQuantConfigBase,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        is_layer_skipped,
+    )
+
+    from .mtp_fp8_experts import checkpoint_fp8_prefixes
+    from .mtp_q8_experts import supports_q8_0_expert_shape
+
+    spec = vllm_config.speculative_config
+    assert spec is not None and spec.draft_model_config is not None
+    draft = spec.draft_model_config
+    parallel = vllm_config.parallel_config
+    # RoutedExperts shards the expert intermediate size across TP, DP and PCP.
+    expert_tp = (
+        parallel.tensor_parallel_size
+        * parallel.data_parallel_size
+        * parallel.prefill_context_parallel_size
+    )
+    if (
+        draft.dtype != torch.float16
+        or spec.rejection_sample_method != "standard"
+        or (parallel.enable_expert_parallel and expert_tp > 1)
+    ):
+        return
+    config = draft.hf_text_config
+    local_width, remainder = divmod(config.moe_intermediate_size, expert_tp)
+    if remainder or not supports_q8_0_expert_shape(
+        config.hidden_size, local_width, config.num_experts_per_tok
+    ):
+        return
+
+    start = config.num_hidden_layers
+    quant = _get_mtp_quant_config(vllm_config, start)
+    prefixes = _mtp_expert_prefixes(config, start)
+    if quant is not None:
+        remaining = prefixes - checkpoint_fp8_prefixes(quant, prefixes)
+        if isinstance(quant, ModelOptQuantConfigBase):
+            remaining = {
+                prefix for prefix in remaining if not quant.is_layer_excluded(prefix)
+            }
+            if isinstance(quant, ModelOptMixedPrecisionConfig):
+                remaining = {
+                    prefix
+                    for prefix in remaining
+                    if quant._resolve_quant_algo(prefix) is not None
+                }
+        elif isinstance(quant, (AWQConfig, AWQMarlinConfig)):
+            remaining = {
+                prefix
+                for prefix in remaining
+                if not is_layer_skipped(
+                    prefix, quant.modules_to_not_convert, skip_with_substr=True
+                )
+            }
+        if remaining:
+            return
+    spec.mtp_expert_quantization = "q8_0"
+    logger.info_once("Defaulting SM70 Qwen4Exp MTP routed experts to Q8_0.")
+
+
+def _make_draft_vllm_config(
+    vllm_config: VllmConfig,
+    mtp_start_layer_idx: int,
+) -> VllmConfig:
+    """Ensure that the draft model config is set in the vLLM config."""
+    speculative_config = vllm_config.speculative_config
+    if speculative_config is None or speculative_config.draft_model_config is None:
+        raise ValueError("speculative_config.draft_model_config must be set")
+
+    draft_quant_config = _get_mtp_quant_config(vllm_config, mtp_start_layer_idx)
     draft_vllm_config = replace(
         vllm_config,
         model_config=speculative_config.draft_model_config,
@@ -235,23 +319,29 @@ def _make_draft_vllm_config(
         is_exact_sm70_cuda_platform,
     )
 
-    from .mtp_fp8_experts import MTPExpertFp8Config, checkpoint_fp8_prefixes
+    from .mtp_fp8_experts import MTPExpertQuantConfig, checkpoint_fp8_prefixes
 
-    online_fp8 = getattr(speculative_config, "mtp_expert_quantization", None) == "fp8"
+    expert_format = getattr(speculative_config, "mtp_expert_quantization", None)
+    online_fp8 = expert_format == "fp8"
+    exact_sm70 = is_exact_sm70_cuda_platform()
     checkpoint_prefixes = set()
-    if draft_quant_config is not None and is_exact_sm70_cuda_platform():
+    if draft_quant_config is not None and exact_sm70:
         config = draft_vllm_config.model_config.hf_text_config
-        prefixes = {
-            f"mtp.layers.{mtp_start_layer_idx + index}.mlp.experts"
-            for index in range(getattr(config, "mtp_num_hidden_layers", 1))
-        }
+        prefixes = _mtp_expert_prefixes(config, mtp_start_layer_idx)
         checkpoint_prefixes = checkpoint_fp8_prefixes(draft_quant_config, prefixes)
-    if online_fp8 or checkpoint_prefixes:
+    if expert_format in ("q8_0", "fp16"):
+        if not exact_sm70 or draft_vllm_config.model_config.dtype != torch.float16:
+            raise ValueError(f"MTP {expert_format} requires SM70 with FP16 activations")
+        # Block-FP8 checkpoint experts are dequantized in load_weights.
+        draft_quant_config = MTPExpertQuantConfig(
+            draft_quant_config, checkpoint_prefixes, expert_format=expert_format
+        )
+    elif online_fp8 or checkpoint_prefixes:
         if draft_quant_config is None or not _mtp_fp8_experts_supported(
             draft_vllm_config,
             draft_quant_config,
             speculative_config,
-            is_exact_sm70_cuda_platform(),
+            exact_sm70,
             online_fp8,
         ):
             raise ValueError(
@@ -259,7 +349,7 @@ def _make_draft_vllm_config(
                 "checkpoint, no expert parallelism, standard rejection sampling, "
                 "and pipeline-parallel size 1 for online conversion"
             )
-        draft_quant_config = MTPExpertFp8Config(
+        draft_quant_config = MTPExpertQuantConfig(
             draft_quant_config,
             checkpoint_prefixes,
             quantize_unquantized=online_fp8,
@@ -308,6 +398,9 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             )
         }
         self.fp8_mtp_tp_size = draft_vllm_config.parallel_config.tensor_parallel_size
+        self.mtp_expert_format = getattr(
+            draft_vllm_config.quant_config, "expert_format", None
+        )
         # Phase 2: the drafter shares the target cache_config; remember the main
         # KV cache dtype so load_weights can finalize the draft QSA E4M3 scales.
         self._kv_cache_dtype = draft_vllm_config.cache_config.cache_dtype
@@ -319,7 +412,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             self.fc_embedding = ColumnParallelLinear(
                 self.hidden_size,
                 self.hidden_size,
-                gather_output=True,
+                gather_output=False,
                 bias=False,
                 return_bias=False,
                 quant_config=draft_vllm_config.quant_config,
@@ -328,7 +421,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             self.fc_hidden = ColumnParallelLinear(
                 self.hidden_size,
                 self.hidden_size,
-                gather_output=True,
+                gather_output=False,
                 bias=False,
                 return_bias=False,
                 quant_config=draft_vllm_config.quant_config,
@@ -457,7 +550,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         if inputs_embeds is None:
             assert input_ids is not None
             inputs_embeds = self.embed_input_ids(input_ids)
-        # Embedding branch: pre-norm -> fc_embedding -> [T, H].
+        # Embedding branch: pre-norm -> rank-local fc_embedding.
         inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
         inputs_embeds = self.fc_embedding(inputs_embeds)
 
@@ -471,10 +564,11 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             num_tokens, hc_count, hidden_size
         )
         hidden_states = self.fc_hidden(hidden_states)
-        # Add the embedding residual to every branch, then fold back
-        # to [T, hc_count*H] (HC outer, HS inner) for the HC decoder.
-        hidden_states = inputs_embeds.unsqueeze(-2) + hidden_states
-        hidden_states = hidden_states.flatten(-2)
+        # Both projections produce the same feature shard. Add the embedding
+        # residual locally before gathering the full features for the HC decoder.
+        hidden_states = tensor_model_parallel_all_gather(
+            inputs_embeds.unsqueeze(-2) + hidden_states
+        ).flatten(-2)
 
         current_step_idx = spec_step_idx % self.num_mtp_layers
         layer = self.layers[current_step_idx]
@@ -606,6 +700,18 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "mtp"),
         )
+        if vllm_config.kernel_config.sm70_mtp_draft_qpn8:
+            from vllm.model_executor.layers.quantization.sm70_mtp_draft_qpn8 import (
+                mark_mtp_draft_qpn8,
+            )
+
+            # fc_hidden projects each HC branch separately for every token.
+            max_capture_tokens = (
+                vllm_config.compilation_config.max_cudagraph_capture_size or 0
+            )
+            mark_mtp_draft_qpn8(
+                self.model, max_capture_rows=max_capture_tokens * config.hc_count
+            )
 
         if get_pp_group().is_last_rank:
             if config.tie_word_embeddings:
@@ -629,6 +735,21 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         enable_qwen38_sm70_fp16_gemv(self, config_dtype, vllm_config)
         enable_qwen38_sm70_fp16_fused_hc(self, config_dtype, vllm_config)
         object.__setattr__(self, "_sm70_decode_graph_model", None)
+
+    def prepare_sm70_mtp_draft_head(self) -> None:
+        weight = self.lm_head.weight
+        n, k = weight.shape
+        if (
+            not current_platform.is_device_capability(70)
+            or weight.dtype != torch.float16
+            or n % 32
+            or k % 128
+        ):
+            return
+        # The draft-only pack only replaces greedy top-1 selection; full
+        # logits still use the shared FP16 head.
+        self.logits_processor = MTPQPN8LogitsProcessor(self.config.vocab_size, weight)
+        logger.info_once("SM70 greedy MTP draft QPN8 head enabled.")
 
     def prepare_sm70_decode_graph_model(self) -> bool:
         if not envs.VLLM_SM70_QWEN38_DUAL_COMPILE:
@@ -702,12 +823,19 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         )
         from .mtp_fp8_checkpoint import prepare_mtp_fp8_checkpoint
 
+        expert_format = self.model.mtp_expert_format
+        if expert_format == "q8_0" and self.model.fp8_mtp_checkpoint_prefixes:
+            logger.info_once(
+                "Q8_0 MTP expert secondary quantization: dequantizing checkpoint "
+                "block-FP8 experts before packing Q8_0. Prefer a BF16/FP16 source."
+            )
         loaded_weights = loader.load_weights(
             prepare_mtp_fp8_checkpoint(
                 remap_weight_names(),
                 self.model.fp8_mtp_checkpoint_prefixes,
                 tp_size=self.model.fp8_mtp_tp_size,
                 num_experts=self.model.config.num_experts,
+                dequantize=expert_format in ("q8_0", "fp16"),
             )
         )
         _validate_mtp_expert_weights_loaded(self, loaded_weights)

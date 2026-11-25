@@ -88,6 +88,7 @@ class Request:
         self.client_index = client_index
         self.priority = priority
         self.sampling_params = sampling_params
+        self.qwen_reasoning_eos_ended = False
         self.pooling_params = pooling_params
         self.lora_request = lora_request
         self.structured_output_request = StructuredOutputRequest.from_sampling_params(
@@ -248,6 +249,17 @@ class Request:
             self._output_token_ids.extend(token_ids)
             self._all_token_ids.extend(token_ids)
 
+        if (
+            not self.qwen_reasoning_eos_ended
+            and self.sampling_params is not None
+            and (config := self.sampling_params._qwen_reasoning_eos) is not None
+        ):
+            _, end, tool = config
+            self.qwen_reasoning_eos_ended = (
+                token_ids in (end, tool)
+                if isinstance(token_ids, int)
+                else end in token_ids or tool in token_ids
+            )
         self.update_block_hashes()
 
     def update_block_hashes(self) -> None:

@@ -72,6 +72,7 @@ class MambaStateGather(NamedTuple):
 
     column: int
     dst_block_ids: list[int]
+    request_id: str | None = None
 
 
 # ExternalBlockHash is used for reproducible prefix-cache block hashing.
@@ -2724,7 +2725,8 @@ def _get_csa_linear_tensor_layout(
     if host_mtp and mtp_tensors and not host_tuples:
         logger.warning(
             "draft_main_placement='host' needs a draft whose main K/V has the "
-            "target's sharded geometry; the MTP draft stays on the GPU."
+            "target's sharded geometry and storage dtype/codec; the MTP draft "
+            "stays on the GPU."
         )
     owner_page_sizes = list(main_kv_page_sizes)
     compressed_page_sizes = [
@@ -3538,6 +3540,9 @@ def get_long_context_geometry(
             index_bytes_per_block=sum(strides) + mtp_bytes,
             hot_staged_writethrough=settings.staged_writethrough,
             logical_index_bytes_per_block=sum(layout.compressed_page_sizes) + mtp_bytes,
+            # Component pages reuse the same pool, with one transport view per
+            # state-segment tensor. A rank frame must fit either layout.
+            host_component_bytes_per_block=geometry.state_bytes_per_block,
             index_page_strides=tuple(strides),
         )
     return geometry

@@ -52,7 +52,8 @@ def test_warmup_freezes_after_last_warmup_step():
     calls = _calls(_method("compile_or_warm_up_model"))
     assert "_freeze_gc_after_warmup" in calls
     freeze = calls.index("_freeze_gc_after_warmup")
-    assert calls.index("activate_triton_jit_monitor") < freeze
+    monitor = calls.index("activate_triton_jit_monitor")
+    assert calls.index("_warmup_multimodal_rotary") < monitor < freeze
     # Nothing but building the return value comes after the freeze.
     assert set(calls[freeze + 1 :]) <= {"CompilationTimes"}
 

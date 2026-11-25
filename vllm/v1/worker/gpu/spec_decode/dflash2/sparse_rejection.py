@@ -16,6 +16,7 @@ from vllm.config.sm70_dflash2 import (
     sm70_dflash2_enabled,
 )
 from vllm.logger import init_logger
+from vllm.model_executor.layers.logits_processor import CachedLogitsFallback
 from vllm.triton_utils import tl, triton
 from vllm.v1.sample.ops.topk_topp_triton import sort_topk_with_vocab_ties
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
@@ -94,6 +95,8 @@ def _compact_target_reference_rows_gpu(
     probe: torch.Tensor,
     top_ps: torch.Tensor,
     row_to_request: torch.Tensor,
+    *,
+    strict_top_k: bool = False,
 ) -> np.ndarray:
     """Check FP32 temperature-scaled probes using the request-slot mapping."""
     rows, width = probe.shape
@@ -109,6 +112,10 @@ def _compact_target_reference_rows_gpu(
         triton.next_power_of_2(width),
         num_warps=1,
     )
+    if strict_top_k:
+        # The dense combined filter can let a tie spanning the k cutoff back
+        # in during its final top-p mask, even if all ties fit in the probe.
+        result |= probe[:, _TARGET_TOP_K] == probe[:, _TARGET_TOP_K - 1]
     return result.cpu().numpy()
 
 
@@ -175,19 +182,10 @@ def _compact_target_requires_reference(
     return bool(_compact_target_reference_rows(probe_logits, temperature, top_p).any())
 
 
-def _sample_reference_requests(
-    logits: torch.Tensor,
-    reference_reqs: np.ndarray,
+def _pack_reference_requests(
     input_batch: InputBatch,
-    rejection_sampler: RejectionSampler,
-    draft_logits: torch.Tensor,
+    reference_reqs: np.ndarray,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run the unchanged dense contract for whole ambiguous requests.
-
-    Compact sampling admits no penalties, logprobs, grammar or synthetic
-    rejection. Keep original request-slot IDs, positions and local draft-step
-    indices here: packing a subset must never renumber its random streams.
-    """
     cu = input_batch.cu_num_logits_np
     row_indices = np.concatenate([np.arange(cu[i], cu[i + 1]) for i in reference_reqs])
     sub_cu = np.zeros(len(reference_reqs) + 1, dtype=np.int32)
@@ -195,10 +193,36 @@ def _sample_reference_requests(
     # Pack metadata into a single CPU-to-GPU transfer.
     # The rejection kernels accept either int32 or int64 cumulative offsets.
     packed = np.concatenate((row_indices, reference_reqs, sub_cu)).astype(np.int64)
-    metadata = torch.from_numpy(packed).to(device=logits.device, non_blocking=True)
+    metadata = torch.from_numpy(packed).to(
+        device=input_batch.logits_indices.device, non_blocking=True
+    )
     rows, reqs, cu_num_logits = metadata.split(
         [row_indices.size, reference_reqs.size, sub_cu.size]
     )
+    return rows, reqs, cu_num_logits
+
+
+def _sample_reference_requests(
+    logits: torch.Tensor,
+    reference_reqs: np.ndarray,
+    input_batch: InputBatch,
+    rejection_sampler: RejectionSampler,
+    draft_logits: torch.Tensor | None,
+    *,
+    packed_metadata: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run the dense contract for whole requests requiring reference logits.
+
+    With packed metadata the logits already contain only those requests.
+    Original request-slot IDs, positions and draft indices still drive sampling.
+    """
+    if packed_metadata is None:
+        rows, reqs, cu_num_logits = _pack_reference_requests(
+            input_batch, reference_reqs
+        )
+        logits = logits[rows]
+    else:
+        rows, reqs, cu_num_logits = packed_metadata
     indices = input_batch.logits_indices[rows]
     draft_sampled = input_batch.input_ids[indices]
     pos = input_batch.positions[indices]
@@ -206,7 +230,7 @@ def _sample_reference_requests(
     expanded_local_pos = input_batch.expanded_local_pos[rows]
     sampler = rejection_sampler.sampler
     processed = sampler.apply_sampling_params(
-        logits[rows],
+        logits,
         expanded_idx_mapping,
         input_batch.idx_mapping_np[reference_reqs],
         pos,
@@ -418,6 +442,17 @@ def try_dflash2_sparse_target_rejection(
     if not _supports_sparse_sampling_contract(rejection_sampler, input_batch):
         return None
 
+    reasoning_eos = rejection_sampler.sampler.reasoning_eos
+    guarded = (
+        reasoning_eos.active_requests(input_batch.idx_mapping_np)
+        if reasoning_eos is not None
+        else []
+    )
+    # A selector that has already truncated the vocabulary cannot replace
+    # masked EOS candidates reliably. Use the existing dense reference route.
+    if len(guarded) == input_batch.num_reqs:
+        return None
+
     sparse_draft_logits = speculator.get_sparse_draft_logits()
     if sparse_draft_logits is None:
         return None
@@ -470,14 +505,27 @@ def try_dflash2_sparse_target_rejection(
     reference_reqs = np.flatnonzero(
         np.logical_or.reduceat(reference_rows, input_batch.cu_num_logits_np[:-1])
     )
+    if guarded:
+        reference_reqs = np.union1d(reference_reqs, list(guarded))
     reference_logits = None
+    packed_metadata = None
     if reference_reqs.size:
         logger.info_once(
             "DFlash2 target cutoff requires full-vocabulary reference sampling."
         )
         if fallback is None:
             return None
-        reference_logits = fallback()
+        # On SM70 the shared target probe selects the same requests on all
+        # ranks. Use the packed gather without a reasoning EOS mask.
+        if (
+            reference_reqs.size < idx.size
+            and reasoning_eos is None
+            and isinstance(fallback, CachedLogitsFallback)
+        ):
+            packed_metadata = _pack_reference_requests(input_batch, reference_reqs)
+            reference_logits = fallback.gather_rows(packed_metadata[0])
+        else:
+            reference_logits = fallback()
         if reference_reqs.size == idx.size or reference_logits is None:
             return DFlash2LogitsFallback(reference_logits)
     if not retain_ties:
@@ -515,6 +563,7 @@ def try_dflash2_sparse_target_rejection(
             input_batch,
             rejection_sampler,
             speculator.draft_logits,
+            packed_metadata=packed_metadata,
         )
         sampled.index_copy_(0, reqs, dense_sampled)
         num_sampled.index_copy_(0, reqs, dense_num_sampled)

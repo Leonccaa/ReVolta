@@ -86,7 +86,8 @@ def _cpu_kernels(monkeypatch):
 
     group = SimpleNamespace(
         # A fixed "remote rank": the other half of the heads, deterministic.
-        all_gather=lambda q, dim: torch.cat([q, (q * 0.5).flip(0)], dim=dim)
+        all_gather=lambda q, dim: torch.cat([q, (q * 0.5).flip(0)], dim=dim),
+        device_communicator=SimpleNamespace(sm70_dcp2=None),
     )
     monkeypatch.setattr(ops, "qsa_sparse_paged_attention", sparse)
     monkeypatch.setattr(
@@ -97,10 +98,13 @@ def _cpu_kernels(monkeypatch):
 
 
 class Arms:
-    def __init__(self, *, e4m3, topk, rows_per_pass, dcp=(1, 0), seed=5):
+    def __init__(
+        self, *, e4m3, topk, rows_per_pass, dcp=(1, 0), seed=5, dim=DIM, heads=QHEADS
+    ):
         from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAFlashAttentionImpl
 
         self.world, self.rank = dcp
+        self.dim, self.heads = dim, heads
         self.topk, self.width = topk, topk + 3
         row_groups = topk // 4 + 1
         dtype = torch.uint8 if e4m3 else torch.float16
@@ -110,7 +114,7 @@ class Arms:
             kernel_block_tokens=KBS,
             num_layers=1,
             kv_heads=1,
-            head_dim=DIM,
+            head_dim=dim,
             dtype=dtype,
             hot_slots=rows_per_pass * row_groups + REQS * 9,
             max_requests=REQS,
@@ -123,11 +127,11 @@ class Arms:
         self.store = HostHistoryStore(shape, ["attn"], device="cpu")
         self.store.bind_pages([(hid, 17 - hid) for hid in range(1, 17)])
         self.host = self.store.layer("attn")
-        self.paged = torch.zeros((17, 2, KBS, 1, DIM), dtype=dtype)
+        self.paged = torch.zeros((17, 2, KBS, 1, dim), dtype=dtype)
         self.kv_dtype = "fp8_e4m3" if e4m3 else "auto"
         impl = object.__new__(Qwen4ExpQSAFlashAttentionImpl)
         impl.kv_cache_dtype = self.kv_dtype
-        impl.head_size = DIM
+        impl.head_size = dim
         impl.dcp_world_size, impl.dcp_rank = self.world, self.rank
         impl.sliding_window, impl.alibi_slopes, impl.sinks = (-1, -1), None, None
         impl.dcp_combine = lambda out, lse, group, is_lse_base_on_e: out[
@@ -135,7 +139,7 @@ class Arms:
         ]
         self.impl = impl
         tokens = 64
-        heads = QHEADS * self.world
+        gathered_heads = heads * self.world
         self.layer = SimpleNamespace(
             topk_indices_buffer=torch.full((tokens, self.width), -1, dtype=torch.int32),
             _k_scale_float=SCALES.key,
@@ -147,9 +151,11 @@ class Arms:
             dcp_local_indices_buffer=torch.empty(
                 (tokens, self.width), dtype=torch.int32
             ),
-            dcp_partial_output_buffer=torch.empty((tokens, heads, DIM)),
-            dcp_partial_lse_buffer=torch.empty((tokens, heads)),
+            dcp_partial_output_buffer=torch.empty((tokens, gathered_heads, dim)),
+            dcp_partial_lse_buffer=torch.empty((tokens, gathered_heads)),
             indexer=SimpleNamespace(token_topk=topk, compress_ratio=4),
+            sm70_qsa_paged_fp16_h12=False,
+            sm70_qsa_device_history=False,
         )
         self.blocks = {0: [1, 5, 9], 1: [3, 7, 11]}
         self.length = {0: 0, 1: 0}
@@ -157,7 +163,7 @@ class Arms:
         self.rng = random.Random(seed)
 
     def write(self, req, positions):
-        key = torch.randn((len(positions), 1, DIM), generator=self.gen).half()
+        key = torch.randn((len(positions), 1, self.dim), generator=self.gen).half()
         value = torch.randn(key.shape, generator=self.gen).half()
         span = KBS * self.world
         slots = []
@@ -194,14 +200,16 @@ class Arms:
         self.layer.topk_indices_buffer[:n] = torch.tensor(
             [self.selection(q) for _, q in rows], dtype=torch.int32
         )
-        query = (torch.randn((n, QHEADS, DIM), generator=self.gen) * 0.5).half()
-        gate = torch.randn((n, QHEADS * DIM), generator=self.gen).half()
+        query = (
+            torch.randn((n, self.heads, self.dim), generator=self.gen) * 0.5
+        ).half()
+        gate = torch.randn((n, self.heads * self.dim), generator=self.gen).half()
         meta = SimpleNamespace(
             num_actual_tokens=n,
             block_table=table,
             max_query_len=max(reqs.count(r) for r in range(REQS)),
         )
-        out_gpu = torch.empty((n, QHEADS, DIM), dtype=torch.float16)
+        out_gpu = torch.empty_like(query)
         self.impl.forward_qsa(
             self.layer, query, None, None, self.paged, meta, out_gpu,
             token_to_req, output_gate=gate, sequence_lengths=seq_lens,
@@ -220,6 +228,7 @@ class Arms:
             lse = self.layer.dcp_partial_lse_buffer[:n]
             assert torch.equal(partial_gpu.view(torch.uint8), partial.view(torch.uint8))
             assert torch.equal(lse_gpu.view(torch.uint8), lse.view(torch.uint8))
+        return out_gpu
 
 
 def _trace(arms):

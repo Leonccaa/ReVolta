@@ -23,10 +23,10 @@ CONFIG = dict(
 )
 
 
-def test_default_off(monkeypatch):
+def test_default_on(monkeypatch):
     monkeypatch.delenv("VLLM_SM70_MTP_MOE_FP16_EXACT", raising=False)
     envs.disable_envs_cache()
-    assert not envs.VLLM_SM70_MTP_MOE_FP16_EXACT
+    assert envs.VLLM_SM70_MTP_MOE_FP16_EXACT
 
 
 @pytest.mark.parametrize("m", [1, 2, 5, 10])
@@ -45,6 +45,23 @@ def test_shape_admission(m, down):
         x, w, y, weights, ids.long(), *args[5:]
     )
     assert not _sm70_mtp_moe_fp16_shape_supported(x, w, y, None, *args[4:])
+
+
+@pytest.mark.parametrize("m", [16, 20, 24, 32, 40, 48, 56, 64, 80, 81])
+@pytest.mark.parametrize("down", [False, True])
+def test_concurrent_shape_admission(m, down):
+    n, k = (2560, 160) if down else (320, 2560)
+    x = torch.empty(m * 10 if down else m, k, device="meta", dtype=torch.float16)
+    w = torch.empty(512, n, k, device="meta", dtype=torch.float16)
+    y = torch.empty(m, 10, n, device="meta", dtype=torch.float16)
+    ids = torch.empty(m * 10, device="meta", dtype=torch.int32)
+    weights = torch.empty(m, 10, device="meta", dtype=torch.float32)
+    assert _sm70_mtp_moe_fp16_shape_supported(
+        x, w, y, weights, ids, 1 if down else 10, down, batched=True
+    ) == (m <= 80)
+    assert not _sm70_mtp_moe_fp16_shape_supported(
+        x, w, y, weights, ids, 1 if down else 10, down
+    )
 
 
 @pytest.fixture(scope="module")

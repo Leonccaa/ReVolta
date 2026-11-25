@@ -296,9 +296,6 @@ class HistoryBlockPool(BlockPool):
         """
         table = self.host_pages
         count = table.available()
-        ledger = table.reservation_ledger
-        if ledger is not None:
-            count -= sum(c.unused for c in ledger.requests.values())
         pages: dict[int, list[int]] = {}
         block = self.free_block_queue.fake_free_list_head.next_free_block
         tail = self.free_block_queue.fake_free_list_tail
@@ -462,9 +459,6 @@ class HistoryBlockPool(BlockPool):
         # with
         # its source-aware four-domain admission contract.
         available = self.host_pages.available()
-        ledger = self.host_pages.reservation_ledger
-        if ledger is not None:
-            available -= sum(c.unused for c in ledger.requests.values())
         count = 0
         block = self.free_block_queue.fake_free_list_head.next_free_block
         tail = self.free_block_queue.fake_free_list_tail

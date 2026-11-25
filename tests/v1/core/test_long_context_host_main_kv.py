@@ -175,7 +175,7 @@ def test_history_segment_holds_index_and_ring_only():
         + history
         + num_history * HOST_META_BYTES
         + plan.gpu_hot_pool_bytes
-        + int(0.25 * GiB)
+        + plan.staging_bytes
     )
     assert plan.gpu_hot_pool_bytes == plan.geometry.hot_bytes_for_groups(
         plan.hot_pool_groups, plan.max_num_seqs
@@ -478,7 +478,6 @@ def test_host_placement_preserves_r2_streaming_progress(
             scheduler.connector = None  # Scheduler-only fixture has no I/O worker.
             table = scheduler.host_history_pool.host_pages
             if table.reservation_ledger is not None:
-                table.committed_reserve = table.reservation_ledger._external
                 table.reservation_ledger = None
                 table.value_policy = None
         return scheduler

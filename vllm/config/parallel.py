@@ -321,6 +321,9 @@ class ParallelConfig:
     _ple_offload_ipc_path: str = ""
     """Node-local ZMQ IPC address for the PLE offload worker."""
 
+    enable_hc_sp: bool = False
+    """Shard Flash-Next HC and PLE rows in large compiled prefill batches."""
+
     decode_context_parallel_size: int = 1
     """Number of decode context parallel groups, because the world size does
     not change by dcp, it simply reuse the GPUs of TP group, and tp_size

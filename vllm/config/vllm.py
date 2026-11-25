@@ -10,7 +10,7 @@ import threading
 import time
 from collections.abc import Iterable
 from contextlib import contextmanager
-from dataclasses import is_dataclass
+from dataclasses import InitVar, is_dataclass
 from datetime import datetime
 from enum import IntEnum
 from functools import lru_cache
@@ -266,15 +266,22 @@ def _apply_sm70_qwen38_decode_defaults(
 def _resolve_gdn_spec_state_replay(vllm_config: "VllmConfig") -> bool:
     """Whether GDN layers replay accepted tokens instead of keeping per-draft states.
 
-    Supported for linear DFlash/MTP verification on SM70 with Model Runner V2, align
-    prefix caching and synchronous scheduling: the verifier route that records
-    its inputs and the replay after sampling are wired there. Elsewhere the
-    per-position state blocks remain.
+    Linear DFlash/MTP verification uses Model Runner V2 and align prefix
+    caching on SM70. Post-sampling replay requires synchronous scheduling.
+    Native next-round replay uses completed worker-side counts in either scheduler.
     """
-    from vllm.platforms import current_platform
-
     spec = vllm_config.speculative_config
-    if spec is None or spec.use_dflash_ddtree():
+    if spec is None:
+        return False
+    requested_deferred = spec.gdn_deferred_commit_metadata
+    deferred = requested_deferred is True
+    if requested_deferred is None:
+        spec.gdn_deferred_commit_metadata = False
+    if spec.use_dflash_ddtree():
+        if deferred:
+            raise ValueError(
+                "gdn_deferred_commit_metadata=True requires linear verification."
+            )
         return False
     is_mtp = spec.method == "mtp"
     if not is_mtp and not spec.use_dflash():
@@ -283,6 +290,23 @@ def _resolve_gdn_spec_state_replay(vllm_config: "VllmConfig") -> bool:
     long_context = getattr(
         getattr(vllm_config, "kernel_config", None), "long_context_kv", None
     )
+    model = vllm_config.model_config
+    auto_deferred = (
+        requested_deferred is None
+        and not is_mtp
+        and model is not None
+        and model.quantization == "awq"
+        and vllm_config.scheduler_config.async_scheduling
+        and (long_context is None or not long_context.enabled)
+        and policy.spec_state_replay is not False
+        and not (
+            policy.fused_gdn_verify and "fused_gdn_verify" in policy.explicit_fields
+        )
+        and not _gdn_spec_state_replay_reasons(vllm_config, spec, deferred=True)
+    )
+    if auto_deferred:
+        deferred = spec.gdn_deferred_commit_metadata = True
+
     replay_defaulted = False
     if not is_mtp and long_context is not None and long_context.enabled:
         if policy.spec_state_replay is None:
@@ -298,7 +322,16 @@ def _resolve_gdn_spec_state_replay(vllm_config: "VllmConfig") -> bool:
                 "explicitly configured. GDN keeps a state block per draft "
                 "position and capacity includes those speculative state blocks."
             )
-    replay = spec.gdn_state_replay if is_mtp else policy.spec_state_replay
+    if not is_mtp and deferred and policy.spec_state_replay is False:
+        raise ValueError(
+            "gdn_deferred_commit_metadata=True conflicts with "
+            "sm70_dflash2.spec_state_replay=False."
+        )
+    replay = (
+        (deferred or spec.gdn_state_replay)
+        if is_mtp
+        else (deferred or policy.spec_state_replay)
+    )
     if replay is False:
         return False
     if replay is None and not SM70_DFLASH2_SPEC_STATE_REPLAY_DEFAULT:
@@ -310,21 +343,27 @@ def _resolve_gdn_spec_state_replay(vllm_config: "VllmConfig") -> bool:
             "GDN state replay is enabled for MTP."
         )
     if policy.fused_gdn_verify:
-        if policy.spec_state_replay is True:
+        if deferred or policy.spec_state_replay is True:
+            switch = (
+                "gdn_deferred_commit_metadata"
+                if deferred
+                else "sm70_dflash2.spec_state_replay"
+            )
             if "fused_gdn_verify" in policy.explicit_fields:
                 raise ValueError(
-                    "sm70_dflash2.spec_state_replay=True and "
-                    "sm70_dflash2.fused_gdn_verify=True cannot be enabled "
-                    "together. Disable one of these settings."
+                    f"{switch}=True and sm70_dflash2.fused_gdn_verify=True "
+                    "cannot be enabled together. Disable one of these settings."
                 )
             policy.fused_gdn_verify = False
-            logger.info_once(
-                "Disabling the automatic sm70_dflash2.fused_gdn_verify "
-                "default because %s.",
-                "long-context KV mode enables state replay by default"
-                if replay_defaulted
-                else "sm70_dflash2.spec_state_replay=True was explicitly requested",
-            )
+            if not auto_deferred:
+                reason = f"{switch}=True was explicitly requested"
+                if replay_defaulted and not deferred:
+                    reason = "long-context KV mode enables state replay by default"
+                logger.info_once(
+                    "Disabling the automatic sm70_dflash2.fused_gdn_verify "
+                    "default because %s.",
+                    reason,
+                )
         else:
             logger.info_once(
                 "GDN speculative state replay is disabled: "
@@ -332,6 +371,45 @@ def _resolve_gdn_spec_state_replay(vllm_config: "VllmConfig") -> bool:
                 "the enabled sm70_dflash2.fused_gdn_verify packed verifier."
             )
             return False
+    reasons = (
+        []
+        if auto_deferred
+        else _gdn_spec_state_replay_reasons(vllm_config, spec, deferred=deferred)
+    )
+    if reasons:
+        if deferred:
+            raise ValueError(
+                "gdn_deferred_commit_metadata requires " + ", ".join(reasons)
+            )
+        if replay:
+            logger.warning_once(
+                "%s is not supported here (%s); "
+                "GDN layers keep one state block per speculative position.",
+                "gdn_state_replay" if is_mtp else "sm70_dflash2.spec_state_replay",
+                ", ".join(reasons),
+            )
+        return False
+    if deferred:
+        if auto_deferred:
+            logger.info_once(
+                "Automatically enabling next-round native GDN commit "
+                "for asynchronous SM70 AWQ linear DFlash."
+            )
+        else:
+            logger.info_once("GDN recurrent state commits in the next native forward.")
+        return True
+    logger.info_once(
+        "GDN speculative state replay: recurrent layers keep 2 state blocks per "
+        "running request and replay accepted tokens after sampling."
+    )
+    return True
+
+
+def _gdn_spec_state_replay_reasons(
+    vllm_config: "VllmConfig", spec: SpeculativeConfig, *, deferred: bool
+) -> list[str]:
+    from vllm.platforms import current_platform
+
     reasons = []
     model = vllm_config.model_config
     if model is None or not model.is_hybrid:
@@ -345,28 +423,54 @@ def _resolve_gdn_spec_state_replay(vllm_config: "VllmConfig") -> bool:
         reasons.append("Model Runner V1")
     if vllm_config.cache_config.mamba_cache_mode != "align":
         reasons.append("mamba_cache_mode is not align")
-    if vllm_config.scheduler_config.async_scheduling:
+    if vllm_config.scheduler_config.async_scheduling and not deferred:
         reasons.append("async scheduling")
+    if deferred and (
+        vllm_config.kv_transfer_config is not None
+        and vllm_config.kv_transfer_config.kv_connector is not None
+    ):
+        reasons.append("a KV connector can release request slots before exact-end")
     if vllm_config.parallel_config.pipeline_parallel_size != 1:
         reasons.append("pipeline parallelism")
     if envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP:
         reasons.append("VLLM_SM70_QWEN_GDN_SPEC_CORE_OP")
     if not envs.VLLM_SM70_FUSED_SIGMOID_MIXED_QKV:
         reasons.append("VLLM_SM70_FUSED_SIGMOID_MIXED_QKV is off")
-    if reasons:
-        if replay:
-            logger.warning_once(
-                "%s is not supported here (%s); "
-                "GDN layers keep one state block per speculative position.",
-                "gdn_state_replay" if is_mtp else "sm70_dflash2.spec_state_replay",
-                ", ".join(reasons),
-            )
-        return False
-    logger.info_once(
-        "GDN speculative state replay: recurrent layers keep 2 state blocks per "
-        "running request and replay accepted tokens after sampling."
+    valid_deferred_spec = (
+        spec.use_qwen4_exp_mtp() if spec.method == "mtp" else spec.use_dflash()
     )
-    return True
+    if deferred and spec.use_dflash() and model is not None:
+        # The worker binds replay only to Qwen GDN layers. The native verifier
+        # reads a 128 by 128 state for each value head.
+        text_config = model.hf_text_config
+        if (
+            model.architecture
+            not in (
+                "Qwen3NextForCausalLM",
+                "Qwen3_5ForCausalLM",
+                "Qwen3_5MoeForCausalLM",
+                "Qwen3_5ForConditionalGeneration",
+                "Qwen3_5MoeForConditionalGeneration",
+                "Qwen4ExpForCausalLM",
+                "Qwen4ExpForConditionalGeneration",
+            )
+            or getattr(text_config, "linear_key_head_dim", None) != 128
+            or getattr(text_config, "linear_value_head_dim", None) != 128
+        ):
+            reasons.append("linear DFlash requires Qwen GDN with 128 by 128 state")
+    if deferred and (
+        not valid_deferred_spec
+        or not 0 < spec.num_speculative_state_tokens() < 8
+        or model is None
+        or model.dtype != torch.float16
+        or vllm_config.cache_config.mamba_ssm_cache_dtype not in ("auto", "float32")
+        or vllm_config.parallel_config.tensor_parallel_size != 4
+    ):
+        reasons.append(
+            "native deferred replay requires FP16 TP4 Qwen4Exp MTP or linear "
+            "DFlash with <=7 speculative state tokens and FP32 SSM"
+        )
+    return reasons
 
 
 def _any_participating_device_is_capability(
@@ -1203,6 +1307,9 @@ class VllmConfig:
     outside compute_hash() so enabling diagnostics reuses the same graphs.
     """
 
+    revolta_hybrid_serving: InitVar[bool] = False
+    """Resolve serving-only ReVolta defaults for this EngineArgs invocation."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -1354,6 +1461,32 @@ class VllmConfig:
         if speculative_config.use_eagle() or speculative_config.uses_draft_model():
             return self.num_speculative_tokens
         return 0
+
+    @property
+    def adaptive_mtp_enabled(self) -> bool:
+        """Whether synchronous MRv2 can adapt the single-request DSD width."""
+        mode = envs.VLLM_1CAT_ADAPTIVE_MTP
+        spec = self.speculative_config
+        if (
+            mode not in ("1", "true", "yes", "on", "auto")
+            or spec is None
+            or not spec.use_qwen4_exp_mtp()
+            or self.num_speculative_tokens < 3
+            or spec.num_speculative_tokens_per_batch_size is None
+            or self.scheduler_config.async_scheduling
+            or not self.use_v2_model_runner
+        ):
+            return False
+        if mode != "auto":
+            return True
+
+        from vllm.platforms import current_platform
+
+        return (
+            self.num_speculative_tokens >= 5
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability((7, 0))
+        )
 
     @property
     def use_v2_model_runner(self) -> bool:
@@ -1794,7 +1927,7 @@ class VllmConfig:
         except (ValueError, AttributeError, ImportError, TypeError):
             return False
 
-    def __post_init__(self):
+    def __post_init__(self, revolta_hybrid_serving: bool = False):
         """Verify configs are valid & consistent with each other."""
 
         if self.speculative_config is not None:
@@ -1802,25 +1935,51 @@ class VllmConfig:
 
         from vllm.revolta_profile import (
             all_visible_devices_sm70,
+            apply_revolta_allocator_default,
             apply_revolta_kernel_profile,
             apply_revolta_profile,
             frontend_interconnect_mode,
+            has_nvfp4_weights,
         )
 
-        # Also cover direct VllmConfig users. This is intentionally before
-        # upstream overlap, hybrid-PLE and compilation automatic defaults.
-        revolta_profile_enabled = apply_revolta_profile(
-            self.model_config,
-            self.parallel_config.tensor_parallel_size,
-            is_sm70=all_visible_devices_sm70(),
-            interconnect_mode=frontend_interconnect_mode(
-                disable_custom_all_reduce=self.parallel_config.disable_custom_all_reduce
-            ),
-            speculative_method=getattr(self.speculative_config, "method", None),
+        # Apply engine defaults before overlap, hybrid-PLE and compilation.
+        # Derived draft configs inherit the target's process-wide defaults.
+        allow_shared_expert_overlap = not (
+            self.parallel_config.enable_expert_parallel
+            or self.parallel_config.enable_dbo
         )
-        apply_revolta_kernel_profile(
-            self.kernel_config, enabled=revolta_profile_enabled
-        )
+        revolta_profile_enabled = False
+        if not self.is_speculative_draft:
+            revolta_profile_enabled = apply_revolta_profile(
+                self.model_config,
+                self.parallel_config.tensor_parallel_size,
+                is_sm70=all_visible_devices_sm70(),
+                interconnect_mode=frontend_interconnect_mode(
+                    disable_custom_all_reduce=(
+                        self.parallel_config.disable_custom_all_reduce
+                    )
+                ),
+                speculative_method=getattr(self.speculative_config, "method", None),
+                allow_shared_expert_overlap=allow_shared_expert_overlap,
+                hybrid_serving=revolta_hybrid_serving,
+            )
+            apply_revolta_kernel_profile(
+                self.kernel_config, enabled=revolta_profile_enabled
+            )
+        if self.kernel_config.qsa_dcp_index_shard is None:
+            self.kernel_config.qsa_dcp_index_shard = False
+            if (
+                revolta_hybrid_serving
+                and self.speculative_config is not None
+                and self.speculative_config.use_dflash()
+            ):
+                from vllm.models.qwen4_exp.config import QSA_INDEX_DCP_SHARD_TOPK
+
+                text = self.model_config.hf_text_config
+                self.kernel_config.qsa_dcp_index_shard = (
+                    text.indexer_budget // text.indexer_compress_ratio
+                    == QSA_INDEX_DCP_SHARD_TOPK
+                )
 
         # To give each torch profile run a unique instance name.
         self.instance_id = f"{time.time_ns()}"
@@ -1842,9 +2001,13 @@ class VllmConfig:
             self.cache_config.cache_dtype = "auto"
             self.cache_config.cache_dtype_from_checkpoint = False
 
-        from vllm.models.qwen4_exp.common.kv_policy import resolve_qsa_auto_e4m3
+        from vllm.models.qwen4_exp.common.kv_policy import (
+            resolve_qsa_auto_cache_dtype,
+            resolve_qsa_int8_aliases,
+        )
 
-        if resolve_qsa_auto_e4m3(self):
+        resolve_qsa_int8_aliases(self)
+        if resolve_qsa_auto_cache_dtype(self):
             logger.info_once(
                 "Defaulting QSA main KV storage to %s; "
                 "activations and recurrent states retain their precision.",
@@ -1862,6 +2025,7 @@ class VllmConfig:
                     )
                 ),
                 speculative_method=getattr(self.speculative_config, "method", None),
+                allow_shared_expert_overlap=allow_shared_expert_overlap,
                 kv_cache_dtype=self.cache_config.cache_dtype,
                 num_speculative_tokens_per_batch_size=getattr(
                     self.speculative_config,
@@ -1945,6 +2109,18 @@ class VllmConfig:
             self.quant_config = VllmConfig._get_quantization_config(
                 self.model_config, self.load_config
             )
+
+        spec = self.speculative_config
+        if (
+            not self.is_speculative_draft
+            and spec is not None
+            and spec.mtp_expert_quantization is None
+            and spec.use_qwen4_exp_mtp()
+            and all_visible_devices_sm70()
+        ):
+            from vllm.models.qwen4_exp.nvidia.mtp import resolve_mtp_expert_default
+
+            resolve_mtp_expert_default(self)
 
         from vllm.config.mm_encoder_tp import resolve_mm_encoder_tp_mode
 
@@ -2050,6 +2226,17 @@ class VllmConfig:
                     "Using synchronous scheduling by default for dynamic DFlash."
                 )
                 self.scheduler_config.async_scheduling = False
+            elif (
+                revolta_hybrid_serving
+                and self.speculative_config is not None
+                and self.speculative_config.method == "mtp"
+                and self.speculative_config.gdn_state_replay
+                and self.cache_config.mamba_cache_mode == "align"
+            ):
+                logger.info_once(
+                    "Using synchronous scheduling by default for MTP GDN state replay."
+                )
+                self.scheduler_config.async_scheduling = False
             elif dflash_ddtree_tree_verify:
                 logger.warning_once(
                     "Async scheduling is not compatible with dflash_ddtree tree "
@@ -2087,6 +2274,18 @@ class VllmConfig:
                 self.scheduler_config.async_scheduling = False
             else:
                 self.scheduler_config.async_scheduling = True
+
+        if self.kernel_config.sm70_qsa_paged_fp16_h6 is None:
+            self.kernel_config.sm70_qsa_paged_fp16_h6 = (
+                revolta_profile_enabled
+                and self.scheduler_config.async_scheduling
+                and self.speculative_config is not None
+                and self.speculative_config.method == "mtp"
+                and self.parallel_config.decode_context_parallel_size == 2
+                and self.cache_config.cache_dtype in ("auto", "float16")
+                and not self.kernel_config.long_context_kv.enabled
+                and has_nvfp4_weights(self.model_config)
+            )
 
         logger.info_once(
             "Asynchronous scheduling is %s.",
@@ -2454,6 +2653,23 @@ class VllmConfig:
                     )
                 )
             )
+            if revolta_hybrid_serving and self.speculative_config.use_dflash():
+                # Use the verifier settings from the Flash-Next serving recipe.
+                for name in (
+                    "context_kv_graph",
+                    "context_pipeline",
+                    "verify_fastpath",
+                    "fused_gdn_metadata",
+                    "fused_smallq_metadata",
+                    "grouped_smallq_metadata",
+                ):
+                    if name not in policy.explicit_fields:
+                        setattr(policy, name, True)
+                if policy.spec_state_replay is None and not (
+                    policy.fused_gdn_verify
+                    and "fused_gdn_verify" in policy.explicit_fields
+                ):
+                    policy.spec_state_replay = True
             if (
                 self.model_config is not None
                 and self.model_config.quantization == "fp8"
@@ -2497,15 +2713,11 @@ class VllmConfig:
                         CUDAGraphMode.FULL_AND_PIECEWISE
                     )
                 if self.compilation_config.cudagraph_capture_sizes is None:
-                    cudagraph_capture_sizes = _sm70_nomtp_cudagraph_capture_sizes(
-                        self.scheduler_config.max_num_seqs
-                    )
-                    if (
-                        self.speculative_config is not None
-                        and self.speculative_config.num_speculative_tokens
-                    ):
+                    spec_config = self.speculative_config
+                    decode_query_len = 1
+                    if spec_config is not None and spec_config.num_speculative_tokens:
                         decode_query_len = (
-                            self.speculative_config.num_speculative_state_tokens() + 1
+                            spec_config.num_speculative_state_tokens() + 1
                         )
                         smallq_env = "VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q"
                         if (
@@ -2521,9 +2733,25 @@ class VllmConfig:
                                 smallq_env,
                                 decode_query_len,
                             )
-                        if (
-                            envs.VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS
-                            and self.speculative_config.method == "mtp"
+                    # With an explicit cap, the generic graph sizer builds
+                    # the capture list up to that limit.
+                    if self.compilation_config.max_cudagraph_capture_size is None:
+                        if decode_query_len == 1:
+                            cudagraph_capture_sizes = (
+                                _sm70_nomtp_cudagraph_capture_sizes(
+                                    self.scheduler_config.max_num_seqs
+                                )
+                            )
+                            if cudagraph_capture_sizes != [1, 2]:
+                                logger.info_once(
+                                    "Using SM70 no-MTP decode cudagraph "
+                                    "request shapes %s.",
+                                    tuple(cudagraph_capture_sizes),
+                                )
+                        elif (
+                            spec_config is not None
+                            and spec_config.method == "mtp"
+                            and envs.VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS
                         ):
                             cudagraph_capture_sizes = _sm70_mtp_cudagraph_capture_sizes(
                                 self.scheduler_config.max_num_seqs,
@@ -2554,14 +2782,9 @@ class VllmConfig:
                                 "shapes %s for Flash-V100 compile graph.",
                                 tuple(cudagraph_capture_sizes),
                             )
-                    elif cudagraph_capture_sizes != [1, 2]:
-                        logger.info_once(
-                            "Using SM70 no-MTP decode cudagraph request shapes %s.",
-                            tuple(cudagraph_capture_sizes),
+                        self.compilation_config.cudagraph_capture_sizes = (
+                            cudagraph_capture_sizes
                         )
-                    self.compilation_config.cudagraph_capture_sizes = (
-                        cudagraph_capture_sizes
-                    )
                 if self.compilation_config.max_cudagraph_capture_size is None:
                     self.compilation_config.max_cudagraph_capture_size = (
                         _sm70_max_cudagraph_capture_size(
@@ -2650,13 +2873,14 @@ class VllmConfig:
                     "Using combo_kernels=True and benchmark_combo_kernel=True "
                     "for SM70 Flash-V100 0.0.3 compile graph quality parity."
                 )
+                capture_sizes = self.compilation_config.cudagraph_capture_sizes
                 logger.info_once(
                     "Using SM70 Flash-V100 0.0.3 compile CUDA graph policy: "
                     "mode=%s, cudagraph_mode=%s, "
                     "capture_sizes=%s.",
                     self.compilation_config.mode.name,
                     self.compilation_config.cudagraph_mode.name,
-                    tuple(self.compilation_config.cudagraph_capture_sizes),
+                    "auto" if capture_sizes is None else tuple(capture_sizes),
                 )
             else:
                 logger.warning_once(
@@ -3143,6 +3367,12 @@ class VllmConfig:
         # Resolve kv_offloading-derived connector name into kv_transfer_config
         # before the HMA check below, which inspects the connector class.
         self._post_init_kv_transfer_config()
+        if revolta_hybrid_serving and (
+            self.kv_transfer_config is None
+            or self.kv_transfer_config.kv_connector is None
+            or self._connector_supports_vmm_safe_transfers()
+        ):
+            apply_revolta_allocator_default()
 
         # Hybrid KV cache manager (HMA) runtime rules:
         # - Explicit enable (--no-disable-kv-cache-manager): error if runtime
@@ -3240,6 +3470,18 @@ class VllmConfig:
         self.compilation_config.pass_config.log_enabled_passes()
 
         if not self.is_speculative_draft:
+            if (
+                self.scheduler_config.async_scheduling
+                and envs.VLLM_SM70_NVLINK_HC
+                and not self.kernel_config.sm70_hc_ll_async
+            ):
+                logger.warning_once(
+                    "SM70 NVLink HC LL is disabled because asynchronous scheduling "
+                    "is enabled (VLLM_SM70_NVLINK_HC=1). Use --no-async-scheduling "
+                    "to allow HC LL on supported configurations.",
+                    scope="global",
+                )
+
             from vllm.revolta_profile import profile_audit
 
             logger.info_once(

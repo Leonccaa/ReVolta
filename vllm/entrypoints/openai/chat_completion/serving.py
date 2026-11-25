@@ -5,7 +5,7 @@ import asyncio
 import io
 import json
 import time
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Iterable
 from collections.abc import Sequence as GenericSequence
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Final
@@ -14,6 +14,7 @@ import numpy as np
 import pybase64 as base64
 from fastapi import Request
 
+from vllm import envs
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.chat_utils import (
     ChatTemplateContentFormatOption,
@@ -40,6 +41,7 @@ from vllm.entrypoints.openai.chat_completion.stream_harmony import (
     extract_harmony_streaming_delta,
 )
 from vllm.entrypoints.openai.engine.protocol import (
+    CompletionTokenUsageInfo,
     DeltaFunctionCall,
     DeltaMessage,
     DeltaToolCall,
@@ -71,6 +73,7 @@ from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.parser import ParserManager
 from vllm.parser.abstract_parser import Parser
 from vllm.reasoning import ReasoningParser
+from vllm.reasoning.qwen3_reasoning_parser import Qwen3ReasoningParser
 from vllm.renderers import ChatParams
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.tokenizers import TokenizerLike
@@ -81,6 +84,20 @@ if TYPE_CHECKING:
     from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 
 logger = init_logger(__name__)
+
+
+def _reasoning_usage_details(
+    reasoning_parser: ReasoningParser | None,
+    token_ids_per_choice: Iterable[GenericSequence[int]],
+) -> CompletionTokenUsageInfo | None:
+    if reasoning_parser is None:
+        return None
+    counts = [
+        reasoning_parser.count_reasoning_tokens(ids)
+        for ids in token_ids_per_choice
+        if ids
+    ]
+    return CompletionTokenUsageInfo(reasoning_tokens=sum(counts)) if counts else None
 
 
 class OpenAIServingChat(OpenAIServing):
@@ -199,6 +216,25 @@ class OpenAIServingChat(OpenAIServing):
             .chat_template_kwargs
         )
 
+    def _set_reasoning_eos_mask(
+        self,
+        request: ChatCompletionRequest,
+        sampling_params: SamplingParams,
+        reasoning_parser: ReasoningParser | None,
+        prompt_token_ids: list[int] | None,
+    ) -> None:
+        if (
+            envs.VLLM_QWEN_REASONING_EOS_MASK
+            and request.include_reasoning
+            and not sampling_params.ignore_eos
+            and prompt_token_ids
+            and isinstance(reasoning_parser, Qwen3ReasoningParser)
+            and self.engine_client.vllm_config.use_v2_model_runner
+        ):
+            sampling_params._qwen_reasoning_eos = reasoning_parser.reasoning_eos_mask(
+                prompt_token_ids
+            )
+
     async def render_chat_request(
         self,
         request: ChatCompletionRequest,
@@ -311,6 +347,9 @@ class OpenAIServingChat(OpenAIServing):
                     max_tokens,
                     self.default_sampling_params,
                 )
+                self._set_reasoning_eos_mask(
+                    request, sampling_params, reasoning_parser, prompt_token_ids
+                )
 
             self._log_inputs(
                 sub_request_id,
@@ -418,6 +457,10 @@ class OpenAIServingChat(OpenAIServing):
         num_choices = 1 if request.n is None else request.n
         previous_num_tokens = [0] * num_choices
         finish_reason_sent = [False] * num_choices
+        # Track raw IDs separately from the parser's mutable streaming state.
+        generated_ids_per_choice: list[list[int]] | None = (
+            [[] for _ in range(num_choices)] if reasoning_parser is not None else None
+        )
         num_prompt_tokens = 0
         num_cached_tokens = None
         if self.use_harmony:
@@ -766,6 +809,8 @@ class OpenAIServingChat(OpenAIServing):
 
                     # set the previous values for the next iteration
                     previous_num_tokens[i] += len(output.token_ids)
+                    if generated_ids_per_choice is not None:
+                        generated_ids_per_choice[i].extend(output.token_ids)
 
                     # if the message delta is None (e.g. because it was a
                     # "control token" for tool calls or the parser otherwise
@@ -972,14 +1017,18 @@ class OpenAIServingChat(OpenAIServing):
                     data = chunk.model_dump_json(exclude_unset=True)
                     yield f"data: {data}\n\n"
 
+            num_completion_tokens = sum(previous_num_tokens)
+            reasoning_details = _reasoning_usage_details(
+                reasoning_parser, generated_ids_per_choice or ()
+            )
             # once the final token is handled, if stream_options.include_usage
             # is sent, send the usage
             if include_usage:
-                completion_tokens = sum(previous_num_tokens)
                 final_usage = UsageInfo(
                     prompt_tokens=num_prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    total_tokens=num_prompt_tokens + completion_tokens,
+                    completion_tokens=num_completion_tokens,
+                    total_tokens=num_prompt_tokens + num_completion_tokens,
+                    completion_tokens_details=reasoning_details,
                 )
                 if self.enable_prompt_tokens_details and num_cached_tokens:
                     final_usage.prompt_tokens_details = PromptTokenUsageInfo(
@@ -1001,11 +1050,11 @@ class OpenAIServingChat(OpenAIServing):
                 yield f"data: {final_usage_data}\n\n"
 
             # report to FastAPI middleware aggregate usage across all choices
-            num_completion_tokens = sum(previous_num_tokens)
             request_metadata.final_usage_info = UsageInfo(
                 prompt_tokens=num_prompt_tokens,
                 completion_tokens=num_completion_tokens,
                 total_tokens=num_prompt_tokens + num_completion_tokens,
+                completion_tokens_details=reasoning_details,
             )
 
             # Log complete streaming response if output logging is enabled
@@ -1414,6 +1463,9 @@ class OpenAIServingChat(OpenAIServing):
             prompt_tokens=num_prompt_tokens,
             completion_tokens=num_generated_tokens,
             total_tokens=num_prompt_tokens + num_generated_tokens,
+            completion_tokens_details=_reasoning_usage_details(
+                reasoning_parser, (output.token_ids for output in final_res.outputs)
+            ),
         )
         if self.enable_prompt_tokens_details and final_res.num_cached_tokens:
             usage.prompt_tokens_details = PromptTokenUsageInfo(

@@ -130,6 +130,8 @@ class CachedRequestData:
     new_block_ids: list[tuple[list[int], ...] | None]
     num_computed_tokens: list[int]
     num_output_tokens: list[int]
+    # A common dispatch hint for all TP ranks, including non-reply async ranks.
+    qwen_reasoning_eos_ended_req_ids: set[str] | None = None
 
     # Version of dataclass repr with token IDs obfuscated.
     def anon_repr(self) -> str:
@@ -230,9 +232,10 @@ class SchedulerOutput:
     # Only used for v2 model runner.
     preempted_req_ids: set[str] | None = None
 
-    # Whether any of the scheduled requests use structured output.
-    # Set only in async scheduling case.
+    # Whether any scheduled non-chunked rows use structured output.
     has_structured_output_requests: bool = False
+    # Scheduled rows counted by the flag above, captured at schedule time.
+    structured_output_req_ids: set[str] | None = None
 
     # Whether the scheduled requests have all the output tokens they
     # need to perform grammar bitmask computation.

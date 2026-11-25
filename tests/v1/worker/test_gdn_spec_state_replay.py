@@ -196,6 +196,7 @@ def _replay_config(**overrides):
     spec = SimpleNamespace(
         method="dflash",
         gdn_state_replay=None,
+        gdn_deferred_commit_metadata=False,
         use_dflash=lambda: True,
         use_dflash_ddtree=lambda: False,
         sm70_dflash2=policy,
@@ -264,6 +265,25 @@ def test_replay_never_applies_to_other_methods(sm70):
     assert sm70(config) is False
     config.speculative_config = None
     assert sm70(config) is False
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+def test_async_mtp_admits_only_the_native_next_round_path(sm70, deferred):
+    config = _replay_config(
+        **{
+            "speculative_config.method": "mtp",
+            "speculative_config.gdn_state_replay": True,
+            "speculative_config.gdn_deferred_commit_metadata": deferred,
+            "speculative_config.use_qwen4_exp_mtp": lambda: True,
+            "speculative_config.num_speculative_state_tokens": lambda: 5,
+            "cache_config.mamba_ssm_cache_dtype": "float32",
+            "scheduler_config.async_scheduling": True,
+            "parallel_config.tensor_parallel_size": 4,
+            "model_config.dtype": torch.float16,
+            "kv_transfer_config": None,
+        }
+    )
+    assert sm70(config) is deferred
 
 
 class _GDNLayer:

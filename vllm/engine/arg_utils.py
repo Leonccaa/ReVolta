@@ -770,6 +770,22 @@ class EngineArgs:
     ) = None
 
     def __post_init__(self):
+        # Resolve CLI aliases before method-dependent defaults inspect the config.
+        for flag, key, value in (
+            ("--spec-method", "method", self.spec_method),
+            ("--spec-model", "model", self.spec_model),
+            ("--spec-tokens", "num_speculative_tokens", self.spec_tokens),
+        ):
+            if value is None:
+                continue
+            if self.speculative_config is None:
+                self.speculative_config = {}
+            if key in self.speculative_config:
+                raise ValueError(
+                    f"{flag} and --speculative-config['{key}'] are mutually exclusive"
+                )
+            self.speculative_config[key] = value
+
         if isinstance(self.watchdog_config, dict):
             self.watchdog_config = WatchdogConfig(**self.watchdog_config)
         # support `EngineArgs(compilation_config={...})`
@@ -1772,21 +1788,6 @@ class EngineArgs:
         """Initializes and returns a SpeculativeConfig object based on
         `speculative_config`.
         """
-        for flag, key, value in (
-            ("--spec-method", "method", self.spec_method),
-            ("--spec-model", "model", self.spec_model),
-            ("--spec-tokens", "num_speculative_tokens", self.spec_tokens),
-        ):
-            if value is None:
-                continue
-            if self.speculative_config is None:
-                self.speculative_config = {}
-            if key in self.speculative_config:
-                raise ValueError(
-                    f"{flag} and --speculative-config['{key}'] are mutually exclusive"
-                )
-            self.speculative_config[key] = value
-
         if self.speculative_config is None:
             return None
 
@@ -2524,6 +2525,8 @@ class EngineArgs:
             attention_config.backend = AttentionConfig.validate_backend_before(
                 self.attention_backend
             )
+        if revolta_hybrid_serving and attention_config.backend is None:
+            attention_config.backend = AttentionBackendEnum.FLASH_ATTN_V100
 
         # TurboQuant requires FlashAttention 2 — FA3 boundary layers assert
         # FlashAttentionImpl which fails with TurboQuantAttentionImpl.
@@ -2691,6 +2694,7 @@ class EngineArgs:
             * parallel_config.data_parallel_size_local,
             cpu_kv_bytes=cpu_kv_offload_bytes(config)
             * parallel_config.data_parallel_size_local,
+            config=config if current_platform.is_cuda() else None,
         )
 
         return config

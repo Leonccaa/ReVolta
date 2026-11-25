@@ -9,7 +9,7 @@ concurrent requests in testing, and a 48 GiB CPU KV pool.
 
 ## 1. Install
 
-The distribution name is `revolta` (version `0.1.4`). The Python import name and the
+This recipe uses the `revolta` distribution (version `0.2.0rc15`). The Python import name and the
 CLI are still **`vllm`** (`import vllm`, `vllm serve`); this is intentional. Only
 compute capability 7.0 is built, with CUDA 12.8, Python 3.12 and PyTorch 2.10.
 
@@ -18,20 +18,23 @@ From PyPI (Linux x86-64 with glibc 2.34 or newer, Python 3.12):
 ```bash
 python3.12 -m venv /data/revolta/venv
 . /data/revolta/venv/bin/activate
-pip install revolta==0.1.4
-vllm --version          # 0.1.4
+pip install --pre revolta==0.2.0rc15
+vllm --version          # 0.2.0rc15
 ```
 
 The wheel pins `torch==2.10.0`, `torchaudio==2.10.0` and `torchvision==0.25.0`,
 and pip installs them from PyPI. PyPI's `torch==2.10.0` is the CUDA 12.8 build.
 Install the NVIDIA driver for CUDA 12.8 on the host.
 
+Install the CUDA 12.8 Toolkit on the serving host for first-start kernel
+compilation. Check that `nvcc` is on `PATH` and `nvcc --version` reports CUDA 12.8.
+
 The wheel attached to the GitHub release contains the same files. Only its metadata
 differs: it pins the same versions to the CUDA 12.8 builds on `download.pytorch.org`
 and has the generic `linux_x86_64` tag.
 
 ```bash
-pip install "https://github.com/Leonccaa/ReVolta/releases/download/v0.1.4/revolta-0.1.4-cp312-cp312-linux_x86_64.whl"
+pip install "https://github.com/Leonccaa/ReVolta/releases/download/v0.2.0rc15/revolta-0.2.0rc15-cp312-cp312-linux_x86_64.whl"
 ```
 
 ReVolta does not report to the upstream vLLM statistics server. It sends its own
@@ -41,7 +44,7 @@ contains and how to turn it off.
 Or use the Docker image:
 
 ```bash
-docker pull ghcr.io/leonccaa/revolta:0.1.4
+docker pull ghcr.io/leonccaa/revolta:0.2.0rc15
 ```
 
 ## 2. Download the checkpoint and make 512K views
@@ -101,7 +104,8 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 export NCCL_GRAPH_REGISTER=0                    # required with expandable segments
 export VLLM_SM70_AWQ_MOE_INT4_ZERO=1             # pack AWQ zero points to 4 bits in GPU memory
-export VLLM_QWEN4EXP_PLE_HOST_GIB=12             # pinned host memory for the PLE table, GiB per TP rank
+# Optional per-rank PLE cap. The full FP8 table is pinned on host by default.
+# export VLLM_QWEN4EXP_PLE_HOST_GIB=12
 export VLLM_PLE_OFFLOAD_READY_TIMEOUT=1200       # seconds; PLE loading takes a while
 export VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES=1    # refuse to start without calibrated E4M3 KV scales
 export TILELANG_CACHE_DIR=/data/revolta/cache/tilelang  # persistent TileLang kernel cache
@@ -110,6 +114,10 @@ export TILELANG_CACHE_DIR=/data/revolta/cache/tilelang  # persistent TileLang ke
 Continue with the launch command below.
 
 ## 4. Launch
+
+Use the 512K YaRN target view and matching draft from step 2 with
+`--max-model-len 524288`. With unmodified checkpoints, use a length supported
+by both the target and the draft.
 
 ```bash
 vllm serve /data/revolta/views/target-512k \
@@ -155,6 +163,7 @@ vllm serve /data/revolta/views/target-512k \
         "secondary_tiers": [],
         "demote_superseded_states": true,
         "mamba_state_slots_reference_tokens": 65536}}' \
+  --shutdown-timeout 30 \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder \
   --reasoning-parser qwen3 \
@@ -216,6 +225,7 @@ same path inside the container, so that the view symlinks resolve.
 ```bash
 docker run --rm --gpus all \
   --shm-size 128g \
+  --stop-timeout 120 \
   --cap-add SYS_PTRACE \
   --security-opt seccomp=unconfined \
   -p 8000:8000 \
@@ -224,11 +234,10 @@ docker run --rm --gpus all \
   -e PYTORCH_ALLOC_CONF=expandable_segments:True \
   -e NCCL_GRAPH_REGISTER=0 \
   -e VLLM_SM70_AWQ_MOE_INT4_ZERO=1 \
-  -e VLLM_QWEN4EXP_PLE_HOST_GIB=12 \
   -e VLLM_PLE_OFFLOAD_READY_TIMEOUT=1200 \
   -e VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES=1 \
   -e TILELANG_CACHE_DIR=/data/revolta/cache/tilelang \
-  ghcr.io/leonccaa/revolta:0.1.4 \
+  ghcr.io/leonccaa/revolta:0.2.0rc15 \
   /data/revolta/views/target-512k --served-model-name Qwen3.8-Flash-Next ...
 ```
 

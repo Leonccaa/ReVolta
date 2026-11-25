@@ -273,6 +273,13 @@ with the 512K views.
 **128 GiB RAM is recommended** for the default 48 GiB CPU KV pool. The AWQ PLE
 embedding table uses about 47.7 GiB of pinned host memory even with KV offload disabled.
 
+Automatic FP8 PLE placement pins the entire table in host memory when the disk
+cascade is inactive. Startup reports an error if available host memory cannot fit
+the table across local ranks plus the host reserve. Free host memory or set
+`VLLM_QWEN4EXP_PLE_HOST_GIB` to a smaller per-rank cap to keep the remaining rows
+on the GPU. FP4-Local keeps its full NVFP4 PLE table in host memory, about
+26.8 GiB across four ranks.
+
 | Container memory limit | KV offload | Result |
 | --- | --- | --- |
 | 128 GiB | Off, or 48 GiB CPU pool | Full acceptance passed |
@@ -345,7 +352,7 @@ is configuration, tuning, experimental, debug or deprecated.
 |---|---|---|---|---|---|---|
 | `VLLM_1CAT_ADAPTIVE_MTP` | str | `off` | off/0/false/no, on/1/true/yes, auto | experimental | 0.2.0rc15 | Opt in to adaptive depth for synchronous Flash-Next MRv2 MTP with a dynamic speculative decoding schedule. Explicit auto also requires SM70 and a configured maximum depth of at least five. Single-request decode may trade fewer draft steps for more target steps. |
 | `VLLM_PLE_OFFLOAD_READY_TIMEOUT` | float | `600.0` | seconds | configuration | 1Cat | How long startup waits for the PLE offload worker. Raise it on slow storage; the reference deployment uses 1200. |
-| `VLLM_QWEN4EXP_PLE_HOST_GIB` | float \| None | `None` | GiB per TP rank; unset = automatic | configuration | 1Cat | Caps pinned host memory for the PLE table. Lower values leave host RAM for CPU KV offload but move more PLE rows to disk; the reference deployment uses 12. |
+| `VLLM_QWEN4EXP_PLE_HOST_GIB` | float \| None | `None` | GiB per TP rank; unset = automatic | configuration | 1Cat | Caps pinned host memory for FP8 PLE. Automatic placement pins the full table when the disk cascade is inactive. An explicit cap leaves remaining rows on the GPU in this mode. |
 | `VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB` | float \| None | `None` | non-negative GiB or unset | configuration | 1Cat | Unset reserves min(host limit / 4, 8 GiB), preserving the small-host margin without scaling it to tens of GiB. Explicit values override the cap. The warning-only preflight counts shared CPU KV storage separately; automatic placement also uses this reserve. |
 | `VLLM_QWEN_REASONING_EOS_MASK` | bool | `False` | 0, 1 | configuration | 0.2.0rc15 | Suppresses model EOS during visible Qwen chat reasoning in Model Runner V2. Requests still in reasoning use full-vocabulary sampling when compact DFlash2 verification would truncate logits. |
 | `VLLM_SM70_AWQ_MOE_INT4_ZERO` | bool | `False` | 0, 1 | experimental | 0.2.0 | Packs AWQ zero points into nibbles: less resident metadata, lossless. Needs compact metadata and a native build with the packed kernels. |

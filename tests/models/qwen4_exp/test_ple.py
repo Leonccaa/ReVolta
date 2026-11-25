@@ -321,7 +321,7 @@ def test_configured_host_share_is_checked_once_before_the_ranks_start(
     set_lazy_env(monkeypatch, "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", None)
     monkeypatch.setattr(ple_common, "total_host_bytes", lambda: 30 * gib)
     monkeypatch.setattr(
-        ple_common, "cgroup_host_memory", lambda: (None, None), raising=False
+        ple_common, "cgroup_host_memory", lambda **_: (None, None), raising=False
     )
     # 30 GiB host, 7.5 GiB reserve: two ranks of 6 GiB need 19.5 GiB available.
     monkeypatch.setattr(ple_common, "available_host_bytes", lambda: int(19.5 * gib))

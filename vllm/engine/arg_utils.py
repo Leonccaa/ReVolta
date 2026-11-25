@@ -93,8 +93,7 @@ from vllm.config.parallel import (
     ExpertPlacementStrategy,
 )
 from vllm.config.scheduler import SchedulerPolicy
-from vllm.config.speculative import MTPModelTypes
-from vllm.config.utils import get_field
+from vllm.config.utils import get_field, replace
 from vllm.config.vllm import (
     OptimizationLevel,
     PerformanceMode,
@@ -1767,6 +1766,8 @@ class EngineArgs:
         self,
         target_model_config: ModelConfig,
         target_parallel_config: ParallelConfig,
+        *,
+        revolta_hybrid_serving: bool = False,
     ) -> SpeculativeConfig | None:
         """Initializes and returns a SpeculativeConfig object based on
         `speculative_config`.
@@ -1818,9 +1819,59 @@ class EngineArgs:
                 "target_parallel_config": target_parallel_config,
             }
         )
-        return SpeculativeConfig.from_engine_args(
+        spec = SpeculativeConfig.from_engine_args(
             self.speculative_config, lookup_source
         )
+        if not revolta_hybrid_serving:
+            return spec
+
+        defaults: dict[str, Any] = {}
+        k = spec.num_speculative_tokens
+        dflash2_k7 = k == spec.resolved_dflash2_lookup.draft_tokens == 7
+        if (
+            "num_speculative_tokens_per_batch_size" not in self.speculative_config
+            and "dflash_concurrency_drafts" not in self.speculative_config
+            and not spec.ngram_assist
+            and target_parallel_config.pipeline_parallel_size == 1
+        ):
+            if dflash2_k7:
+                defaults["num_speculative_tokens_per_batch_size"] = [
+                    (1, 3, 7),
+                    (4, 4, 3),
+                    (5, 8, 4),
+                ]
+            # Dynamic MTP needs align mode. Preserve an explicit opt-out of
+            # prefix caching or an explicitly selected, supported 'all' mode.
+            elif (
+                spec.method == "mtp"
+                and k == 4
+                and self.enable_prefix_caching
+                and not (
+                    self.mamba_cache_mode == "all"
+                    and target_model_config.supports_mamba_prefix_caching
+                )
+            ):
+                defaults["num_speculative_tokens_per_batch_size"] = [
+                    (1, 3, 4),
+                    (4, 8, 3),
+                ]
+        if (
+            dflash2_k7
+            and lookup_source.root == "absent"
+            and lookup_source.ngram_assist is None
+            and not (lookup_source.prompt_fields or lookup_source.environment)
+        ):
+            defaults["dflash2_lookup"] = {
+                "enabled": True,
+                "policy": "longest",
+                "nmin": 5,
+                "nmax": 16,
+                "search_window": 65536,
+                "gate": "first_token",
+                "collect_stats": True,
+                "max_requests": 1,
+            }
+        return replace(spec, **defaults) if defaults else spec
 
     def _maybe_apply_sm70_mtp_defaults(
         self,
@@ -2051,16 +2102,19 @@ class EngineArgs:
         use_sm70_mtp_graph_defaults = self._maybe_apply_sm70_mtp_defaults(
             usage_context, model_config
         )
-        requested_spec_method = self.spec_method or (self.speculative_config or {}).get(
-            "method"
+        revolta_hybrid_serving = (
+            revolta_profile_enabled
+            and getattr(usage_context, "name", None) == "OPENAI_API_SERVER"
+            and model_config.is_hybrid
+            and model_config.runner_type == "generate"
         )
+        if revolta_hybrid_serving:
+            if self.max_num_seqs is None:
+                self.max_num_seqs = 8
+            if self.max_num_batched_tokens is None:
+                self.max_num_batched_tokens = 8192
         self._set_default_chunked_prefill_and_prefix_caching_args(
-            model_config,
-            revolta_mtp_serving=(
-                revolta_profile_enabled
-                and getattr(usage_context, "name", None) == "OPENAI_API_SERVER"
-                and requested_spec_method in get_args(MTPModelTypes)
-            ),
+            model_config, revolta_hybrid_serving=revolta_hybrid_serving
         )
         self._set_default_reasoning_config_args()
         sliding_window: int | None = None
@@ -2345,6 +2399,7 @@ class EngineArgs:
         speculative_config = self.create_speculative_config(
             target_model_config=model_config,
             target_parallel_config=parallel_config,
+            revolta_hybrid_serving=revolta_hybrid_serving,
         )
         # Resolve the scheduling defaults before selecting graph capture sizes.
         use_fixed_prefill_profile = (
@@ -2747,13 +2802,11 @@ class EngineArgs:
         return default_max_num_batched_tokens, default_max_num_seqs
 
     def _set_default_chunked_prefill_and_prefix_caching_args(
-        self, model_config: ModelConfig, *, revolta_mtp_serving: bool = False
+        self, model_config: ModelConfig, *, revolta_hybrid_serving: bool = False
     ) -> None:
         default_chunked_prefill = model_config.is_chunked_prefill_supported
-        default_prefix_caching = model_config.is_prefix_caching_supported or (
-            revolta_mtp_serving
-            and model_config.is_hybrid
-            and model_config.runner_type == "generate"
+        default_prefix_caching = (
+            model_config.is_prefix_caching_supported or revolta_hybrid_serving
         )
 
         if self.enable_chunked_prefill is None:

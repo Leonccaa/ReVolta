@@ -143,6 +143,26 @@ measurements remain unchanged; planar GPU acceptance is still pending.
 - Media limits and request budgets: see
   [multimodal input limits](../.github/MULTIMODAL_INPUTS.md).
 
+### ReVolta serving defaults
+
+The SM70 ReVolta profile applies these defaults to FP16 TP4 QSA hybrid
+generation servers, with or without speculative decoding. Explicit values
+take precedence.
+
+| Option | Profile default | Effect |
+| --- | ---: | --- |
+| `--enable-prefix-caching` | `true` | Reuses cached prompt prefixes. The hybrid model validator selects the Mamba state cache mode. |
+| `--max-num-seqs` | `8` | Sets the maximum number of scheduled sequences. |
+| `--max-num-batched-tokens` | `8192` | Sets the total token budget per scheduler step. |
+| `num_speculative_tokens_per_batch_size` (DFlash2 K=7) | `[[1,3,7],[4,4,3],[5,8,4]]` | Selects the number of drafts by batch size. |
+| `num_speculative_tokens_per_batch_size` (MTP K=4 with aligned Mamba caching) | `[[1,3,4],[4,8,3]]` | Selects the number of drafts by batch size. |
+| `dflash2_lookup` (native seven-token DFlash2 selector) | Longest match, suffix 5–16, 65,536-token window, `first_token` gate, statistics enabled, one live request | Uses committed token history to supplement the neural proposal. |
+
+The engine still resolves omitted `--async-scheduling` from the executor and
+speculative decoding settings. A DFlash2 schedule selects synchronous scheduling
+by default. The MTP schedule supports asynchronous scheduling. Nonstandard K
+values keep fixed-width drafting when no schedule is supplied.
+
 ### Mixed prefill scheduling
 
 The SM70 ReVolta profile for FP16-activation, TP4 QSA Flash-Next with AWQ or NVFP4 weights and either MTP or DFlash2 applies these defaults. Explicit values take precedence.
@@ -166,15 +186,18 @@ Each rank reserves T physical FP16 weight rows, even though the global effective
 
 Before requests, confirm the existing `Enabled static MTP draft vocabulary` message and one `Enabled global MTP draft vocabulary tail: base=%d tail=%d tp=%d sink=%d draft_sample=%s` message on each TP rank, with the configured tail size. For TP4 all four ranks must report the configured value. This confirms activation; output correctness and performance require separate GPU acceptance.
 
-## Optional native DFlash2 lookup
+## Native DFlash2 lookup
 
-The `dflash2_lookup` object inside `--speculative-config` is disabled by default.
+The ReVolta serving profile enables native lookup for eligible DFlash2 K=7
+configurations without an explicit lookup setting. Outside this profile, lookup
+requires an explicit configuration. Set `"dflash2_lookup": {"enabled": false}`
+to turn it off.
 See [native history lookup](dflash2.md#native-history-lookup-optional) for the C64
 recipe, scheduling limits, measurements and statistics.
 
 | Field | Default | Accepted settings |
 | --- | --- | --- |
-| `enabled` | `false` | Boolean; enable explicitly |
+| `enabled` | `false` in an explicit object | Boolean |
 | `policy` | unset | `longest`; required when enabled |
 | `nmin`, `nmax` | unset | Positive integers with `nmin <= nmax`; required when enabled |
 | `search_window` | `65536` | Positive token distance in committed history |
@@ -187,9 +210,9 @@ Native lookup requires a seven-token DFlash2 selector drafter and seven configur
 speculative tokens. It attempts lookup only when every live row is an eligible
 decode request, the batch contains at most `max_requests` requests, and the
 existing concurrency ladder selects width seven. Otherwise the entire batch
-bypasses lookup. Four or more requests always bypass lookup. Fixed seven without a ladder permits
-async subject to existing constraints; a nonempty ladder rejects explicit async
-and otherwise selects synchronous scheduling.
+bypasses lookup. Four or more requests always bypass lookup. Native lookup
+supports explicit asynchronous scheduling, subject to existing constraints.
+A DFlash2 schedule selects synchronous scheduling when the flag is omitted.
 
 Raw input provenance is captured before normalization and preserved through worker
 reconstruction. Worker environment changes do not reinterpret resolved lookup

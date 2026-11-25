@@ -514,57 +514,157 @@ def test_engineargs_profile_precedes_actual_mtp_defaults(profile, monkeypatch):
 
 @pytest.mark.skip_global_cleanup
 @pytest.mark.parametrize(
-    ("method", "serving", "shortcut", "cache_flags", "expected"),
+    ("method", "active", "serving", "shortcut", "flags", "spec_options"),
     [
-        ("mtp", True, False, [], (True, "align")),
-        ("mtp", True, True, [], (True, "align")),
-        ("mtp", True, False, ["--no-enable-prefix-caching"], (False, "none")),
+        ("mtp", True, True, False, [], {}),
+        ("mtp", True, True, True, [], {}),
+        (None, True, True, False, [], {}),
+        ("mtp", True, True, False, ["--no-enable-prefix-caching"], {}),
         (
             "mtp",
             True,
+            True,
             False,
             ["--enable-prefix-caching", "--mamba-cache-mode", "all"],
-            (True, "all"),
+            {},
         ),
-        ("dflash", True, False, [], (True, "align")),
-        ("mtp", False, False, [], (False, "none")),
+        (
+            "mtp",
+            True,
+            True,
+            False,
+            [
+                "--max-num-seqs",
+                "4",
+                "--max-num-batched-tokens",
+                "4096",
+                "--no-async-scheduling",
+            ],
+            {"num_speculative_tokens_per_batch_size": [[1, 4, 2]]},
+        ),
+        ("mtp", True, True, False, [], {"num_speculative_tokens": 3}),
+        ("dflash", True, True, False, [], {}),
+        (
+            "dflash",
+            True,
+            True,
+            False,
+            ["--async-scheduling"],
+            {"dflash2_lookup": {"enabled": False}},
+        ),
+        ("dflash", True, True, False, [], {"dflash2_lookup": None}),
+        (
+            "dflash",
+            True,
+            True,
+            False,
+            [],
+            {
+                "num_speculative_tokens_per_batch_size": None,
+                "dflash2_lookup": {
+                    "enabled": True,
+                    "policy": "longest",
+                    "nmin": 5,
+                    "nmax": 10,
+                    "max_requests": 2,
+                },
+            },
+        ),
+        ("dflash", True, True, False, [], {"num_speculative_tokens": 4}),
+        ("mtp", True, False, False, [], {}),
+        ("mtp", False, True, False, [], {}),
     ],
 )
-def test_engineargs_prefix_caching_for_hybrid_serving(
-    profile, monkeypatch, tmp_path, method, serving, shortcut, cache_flags, expected
+def test_engineargs_revolta_hybrid_serving_defaults(
+    profile,
+    monkeypatch,
+    tmp_path,
+    method,
+    active,
+    serving,
+    shortcut,
+    flags,
+    spec_options,
 ):
     from transformers import Qwen3Config
 
     from vllm import revolta_profile
     from vllm.config import speculative
+    from vllm.config.speculative_kv import dflash_draft_cache_dtype
     from vllm.engine import arg_utils
-    from vllm.model_executor.models.config import HybridAttentionMambaModelConfig
+    from vllm.models.qwen4_exp.config import Qwen4ExpConfig
+    from vllm.models.qwen4_exp.nvidia.ops import qsa
+    from vllm.platforms import current_platform
     from vllm.platforms.cpu import CpuPlatform
     from vllm.platforms.interface import DeviceCapability
-    from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
     from vllm.usage.usage_lib import UsageContext
     from vllm.utils.argparse_utils import FlexibleArgumentParser
+    from vllm.v1.attention.backends import fa_utils
 
     model_dir = tmp_path / "target"
-    Qwen3NextConfig(architectures=["Qwen3NextForCausalLM"]).save_pretrained(model_dir)
-    raw = {"method": method, "num_speculative_tokens": 4}
+    Qwen4ExpConfig(
+        architectures=["Qwen4ExpForCausalLM"],
+        text_config={
+            **vars(model().hf_text_config),
+            "num_hidden_layers": 2,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 2,
+            "mtp_num_hidden_layers": 1,
+            "max_position_embeddings": 524288,
+        },
+    ).save_pretrained(model_dir)
+    raw = {
+        "method": method,
+        "num_speculative_tokens": 7 if method == "dflash" else 4,
+        **spec_options,
+    }
     if method == "dflash":
         draft = tmp_path / "draft"
         Qwen3Config(
             architectures=["DFlash2DraftModel"],
             num_attention_heads=4,
-            num_key_value_heads=4,
-            dflash_config={"selector_top_k": 16, "block_size": 5},
+            num_key_value_heads=2,
+            max_position_embeddings=524288,
+            dflash_config={
+                "selector_top_k": 16,
+                "block_size": raw["num_speculative_tokens"] + 1,
+                "target_feature_reduction": "hc_mean",
+            },
         ).save_pretrained(draft)
         raw["model"] = str(draft)
 
     platform = CpuPlatform()
+    monkeypatch.setattr(platform, "is_cpu", lambda: False)
     monkeypatch.setattr(platform, "is_cuda_alike", lambda: True)
+    monkeypatch.setattr(platform, "get_device_total_memory", lambda: 32 * 1024**3)
     monkeypatch.setattr(
         platform, "get_device_capability", lambda: DeviceCapability(7, 0)
     )
     monkeypatch.setattr(arg_utils, "current_platform", platform)
-    monkeypatch.setattr(revolta_profile, "all_visible_devices_sm70", lambda: True)
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        current_platform,
+        "get_device_capability",
+        lambda *args, **kwargs: DeviceCapability(7, 0),
+    )
+    monkeypatch.setattr(
+        current_platform,
+        "is_device_capability",
+        lambda cap, **kwargs: cap in (70, (7, 0)),
+    )
+    monkeypatch.setattr(current_platform, "support_static_graph_mode", lambda: True)
+    monkeypatch.setattr(current_platform, "check_and_update_config", lambda _: None)
+    monkeypatch.setattr(
+        "vllm.config.vllm._any_participating_device_is_capability",
+        lambda _, cap: cap == (7, 0),
+    )
+    monkeypatch.setattr("vllm.config.vllm.HAS_TRITON", True)
+    monkeypatch.setattr(
+        arg_utils.VllmConfig, "_get_quantization_config", lambda *_: None
+    )
+    monkeypatch.setattr(qsa, "qsa_e4m3_capability_reason", lambda _: None)
+    monkeypatch.setattr(fa_utils, "is_flash_attn_varlen_func_available", lambda: False)
+    monkeypatch.setattr(revolta_profile, "all_visible_devices_sm70", lambda: active)
     monkeypatch.setattr(
         revolta_profile, "apply_revolta_profile", profile.apply_revolta_profile
     )
@@ -575,11 +675,11 @@ def test_engineargs_prefix_caching_for_hybrid_serving(
         lambda **kwargs: arg_utils.ModelConfig(**(kwargs | {"quantization": None})),
     )
     parser = arg_utils.EngineArgs.add_cli_args(FlexibleArgumentParser())
-    spec_flags = (
-        ["--spec-method", method, "--spec-tokens", "4"]
-        if shortcut
-        else ["--speculative-config", json.dumps(raw)]
-    )
+    spec_flags = []
+    if shortcut:
+        spec_flags = ["--spec-method", method, "--spec-tokens", "4"]
+    elif method is not None:
+        spec_flags = ["--speculative-config", json.dumps(raw)]
     args = arg_utils.EngineArgs.from_cli_args(
         parser.parse_args(
             [
@@ -589,37 +689,126 @@ def test_engineargs_prefix_caching_for_hybrid_serving(
                 "float16",
                 "--tensor-parallel-size",
                 "4",
+                "--decode-context-parallel-size",
+                "2",
+                "--gpu-memory-utilization",
+                "0.956",
                 "--distributed-executor-backend",
                 "mp",
                 *spec_flags,
-                *cache_flags,
+                *flags,
             ]
         )
     )
     target = args.create_model_config()
     target.quantization = "awq"
-    target.hf_text_config.update(vars(model().hf_text_config))
-    assert target.is_hybrid and not target.is_prefix_caching_supported
-    if "all" in cache_flags:
+    assert target.is_hybrid
+    if "all" in flags:
         # Exercise an explicit mode supported by the model validator.
         monkeypatch.setattr(
             type(target), "supports_mamba_prefix_caching", property(lambda self: True)
         )
     monkeypatch.setattr(args, "create_model_config", lambda: target)
-    monkeypatch.setattr(arg_utils, "VllmConfig", SimpleNamespace)
 
     context = UsageContext.OPENAI_API_SERVER if serving else UsageContext.LLM_CLASS
     config = args.create_engine_config(usage_context=context)
-    assert envs.VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS
-    if method == "mtp":
-        assert config.compilation_config.cudagraph_capture_sizes is None
+    assert envs.VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS is active
+    spec = config.speculative_config
+    assert getattr(spec, "method", None) == method
+    if method == "mtp" and active:
         assert "draft_sample_method" not in args.speculative_config
         assert "attention_backend" not in args.speculative_config
-    HybridAttentionMambaModelConfig.verify_and_update_config(config)
-    assert (
-        config.cache_config.enable_prefix_caching,
-        config.cache_config.mamba_cache_mode,
-    ) == expected
+    enabled = active and serving
+    prefix = (serving or target.is_prefix_caching_supported) and (
+        "--no-enable-prefix-caching" not in flags
+    )
+    assert config.cache_config.enable_prefix_caching is prefix
+    assert config.cache_config.mamba_cache_mode == (
+        "all" if "all" in flags else "align" if prefix else "none"
+    )
+    scheduler = config.scheduler_config
+    if enabled:
+        assert (scheduler.max_num_seqs, scheduler.max_num_batched_tokens) == (
+            (4, 4096) if "--max-num-seqs" in flags else (8, 8192)
+        )
+        assert config.cache_config.cache_dtype == "int8"
+        assert (
+            config.parallel_config.tensor_parallel_size,
+            config.parallel_config.decode_context_parallel_size,
+        ) == (4, 2)
+        assert config.use_v2_model_runner
+        assert config.model_config.max_model_len == 524288
+        assert config.cache_config.gpu_memory_utilization == 0.956
+        assert config.cache_config.prefix_cache_retention_interval == 0
+    else:
+        assert scheduler.max_num_seqs == 256
+        assert scheduler.max_num_batched_tokens == (2048 if serving else 8192)
+    dsd = spec_options.get("num_speculative_tokens_per_batch_size")
+    if enabled and not (
+        spec_options.keys()
+        & {"num_speculative_tokens", "num_speculative_tokens_per_batch_size"}
+    ):
+        if method == "dflash":
+            dsd = [(1, 3, 7), (4, 4, 3), (5, 8, 4)]
+        elif method == "mtp" and prefix and "all" not in flags:
+            dsd = [(1, 3, 4), (4, 8, 3)]
+    assert getattr(spec, "num_speculative_tokens_per_batch_size", None) == (
+        [tuple(row) for row in dsd] if dsd is not None else None
+    )
+    assert scheduler.async_scheduling is (
+        "--no-async-scheduling" not in flags
+        and (method != "dflash" or dsd is None or "--async-scheduling" in flags)
+    )
+    if method == "dflash":
+        assert dflash_draft_cache_dtype(config) == "auto"
+        assert spec.draft_model_config.dtype == torch.float16
+        lookup = spec.resolved_dflash2_lookup
+        if (spec_options.get("dflash2_lookup") or {}).get("enabled", False):
+            assert (lookup.mode, lookup.nmax, lookup.max_requests) == (
+                "gpu_head",
+                10,
+                2,
+            )
+        elif (
+            "dflash2_lookup" not in spec_options and raw["num_speculative_tokens"] == 7
+        ):
+            assert (lookup.mode, lookup.policy, lookup.nmin, lookup.nmax) == (
+                "gpu_head",
+                "longest",
+                5,
+                16,
+            )
+            assert (
+                lookup.search_window,
+                lookup.gate,
+                lookup.collect_stats,
+                lookup.max_requests,
+            ) == (65536, "first_token", True, 1)
+        else:
+            assert lookup.mode == "off"
+    elif method == "mtp":
+        assert spec.kv_cache_dtype is None  # Inherits target INT8.
+    if enabled and not flags and not spec_options:
+        if method == "mtp":
+            assert config.compilation_config.cudagraph_capture_sizes == list(
+                range(5, 41, 5)
+            )
+        elif method == "dflash":
+            assert config.compilation_config.cudagraph_capture_sizes == [
+                1,
+                2,
+                4,
+                8,
+                9,
+                16,
+                18,
+                24,
+                32,
+                40,
+                48,
+                56,
+                64,
+            ]
 
 
 @pytest.mark.parametrize(

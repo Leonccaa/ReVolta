@@ -580,6 +580,11 @@ class FlexibleArgumentParser(ArgumentParser):
             raise ex
 
         for key, value in config.items():
+            if value is None and isinstance(
+                self._option_string_actions.get("--" + key.replace("_", "-")),
+                argparse.BooleanOptionalAction,
+            ):
+                continue
             if isinstance(value, bool):
                 if value:
                     processed_args.append("--" + key)

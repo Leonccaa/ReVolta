@@ -26,6 +26,12 @@ The wheel pins `torch==2.10.0`, `torchaudio==2.10.0` and `torchvision==0.25.0`,
 and pip installs them from PyPI. PyPI's `torch==2.10.0` is the CUDA 12.8 build.
 Install the NVIDIA driver for CUDA 12.8 on the host.
 
+For a PyPI installation, install the CUDA 12.8 Toolkit on the serving host as
+well. The engine can compile kernels on first startup. Make sure
+`nvcc --version` reports CUDA 12.8 in the environment that runs `vllm serve`.
+For a toolkit outside the default search path, add its `bin` directory to
+`PATH` and set `CUDA_HOME` to the toolkit root.
+
 The wheel attached to the GitHub release contains the same files. Only its metadata
 differs: it pins the same versions to the CUDA 12.8 builds on `download.pytorch.org`
 and has the generic `linux_x86_64` tag.
@@ -111,6 +117,10 @@ Continue with the launch command below.
 
 ## 4. Launch
 
+Use the 512K YaRN target view and matching draft from step 2 with
+`--max-model-len 524288`. With unmodified checkpoints, use a length supported
+by both the target and the draft.
+
 ```bash
 vllm serve /data/revolta/views/target-512k \
   --served-model-name Qwen3.8-Flash-Next \
@@ -155,6 +165,7 @@ vllm serve /data/revolta/views/target-512k \
         "secondary_tiers": [],
         "demote_superseded_states": true,
         "mamba_state_slots_reference_tokens": 65536}}' \
+  --shutdown-timeout 30 \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder \
   --reasoning-parser qwen3 \
@@ -216,6 +227,7 @@ same path inside the container, so that the view symlinks resolve.
 ```bash
 docker run --rm --gpus all \
   --shm-size 128g \
+  --stop-timeout 120 \
   --cap-add SYS_PTRACE \
   --security-opt seccomp=unconfined \
   -p 8000:8000 \

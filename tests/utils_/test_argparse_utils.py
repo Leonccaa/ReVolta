@@ -154,6 +154,29 @@ def test_yaml_false_uses_registered_negative_option(tmp_path, subcommand):
     assert parser.parse_args([*argv, "--enable-prefix-caching"]).enable_prefix_caching
 
 
+def test_yaml_optional_boolean_null_is_unset(tmp_path):
+    parser = FlexibleArgumentParser()
+    serve = parser.add_subparsers().add_parser("serve")
+    serve.add_argument("model")
+    serve.add_argument("--enable-prefix-caching", action=BooleanOptionalAction)
+    serve.add_argument("--async-scheduling", action=BooleanOptionalAction)
+    serve.add_argument("--speculative-config", type=json.loads)
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "enable-prefix-caching: null\n"
+        "async_scheduling: null\n"
+        "speculative-config:\n"
+        "  enforce_eager: null\n"
+    )
+    args = parser.parse_args(
+        ["serve", "target", "--config", str(config), "--no-async-scheduling"]
+    )
+    assert args.model == "target"
+    assert args.enable_prefix_caching is None
+    assert args.async_scheduling is False
+    assert args.speculative_config == {"enforce_eager": None}
+
+
 def test_config_file(parser_with_config):
     with pytest.raises(FileNotFoundError):
         parser_with_config.parse_args(

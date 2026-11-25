@@ -553,6 +553,7 @@ def hybrid_serving_args(
     serving=True,
     indexer_budget=2048,
     dflash_selector=True,
+    shorthand=False,
 ):
     from transformers import Qwen3Config
 
@@ -598,7 +599,19 @@ def hybrid_serving_args(
                 dflash_config=dflash_config,
             ).save_pretrained(tmp_path / "draft")
             raw["model"] = str(tmp_path / "draft")
-        argv.extend(("--speculative-config", json.dumps(raw)))
+        if shorthand:
+            argv.extend(
+                (
+                    "--spec-method",
+                    raw.pop("method"),
+                    "--spec-model",
+                    raw.pop("model"),
+                    "--spec-tokens",
+                    str(raw.pop("num_speculative_tokens")),
+                )
+            )
+        if raw:
+            argv.extend(("--speculative-config", json.dumps(raw)))
 
     monkeypatch.setattr(arg_utils, "current_platform", CpuPlatform())
     monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
@@ -802,6 +815,103 @@ def sm70_serving_resolution(monkeypatch):
         "vllm.config.vllm._any_participating_device_is_capability",
         lambda _, capability: capability == (7, 0),
     )
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize(
+    ("active", "backend", "expected"),
+    [
+        (True, None, "FLASH_ATTN_V100"),
+        (True, "TRITON_ATTN", "TRITON_ATTN"),
+        (False, None, None),
+    ],
+)
+def test_grouped_tiering_uses_serving_attention_backend(
+    profile, monkeypatch, tmp_path, active, backend, expected
+):
+    from vllm.engine import arg_utils
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        KVCacheTensor,
+        MambaSpec,
+    )
+    from vllm.v1.kv_offload.tiering.spec import TieringOffloadingSpec
+
+    connector = {
+        "kv_connector": "OffloadingConnector",
+        "kv_role": "kv_both",
+        "kv_connector_extra_config": {
+            "spec_name": "TieringOffloadingSpec",
+            "cpu_bytes_to_use": 2**20,
+        },
+    }
+    flags = ["--kv-transfer-config", json.dumps(connector)]
+    if backend is not None:
+        flags.extend(("--attention-backend", backend))
+    args, context = hybrid_serving_args(
+        profile, monkeypatch, tmp_path, None, flags, {}, active=active
+    )
+    monkeypatch.setattr(arg_utils, "VllmConfig", SimpleNamespace)
+    config = args.create_engine_config(usage_context=context)
+    cache = KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[KVCacheTensor(size=16384, shared_by=["attn", "state"])],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["attn"],
+                FullAttentionSpec(
+                    block_size=16, num_kv_heads=1, head_size=64, dtype=torch.float16
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["state"],
+                MambaSpec(
+                    block_size=16,
+                    shapes=((1,),),
+                    dtypes=(torch.float16,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+    if expected is None:
+        assert config.attention_config.backend is None
+        with pytest.raises(ValueError, match="requires an explicit attention backend"):
+            TieringOffloadingSpec(config, cache)
+    else:
+        spec = TieringOffloadingSpec(config, cache)
+        assert spec.partition_by_group
+        assert spec.persistent_layout["attention_backend"] == (
+            f"AttentionBackendEnum.{expected}"
+        )
+
+
+@pytest.mark.skip_global_cleanup
+def test_dflash2_shorthand_matches_json(
+    profile, monkeypatch, tmp_path, sm70_serving_resolution
+):
+    from vllm.engine import arg_utils
+    from vllm.platforms.interface import DeviceCapability
+
+    resolved = []
+    for shorthand in (False, True):
+        args, context = hybrid_serving_args(
+            profile, monkeypatch, tmp_path, "dflash", [], {}, shorthand=shorthand
+        )
+        platform = arg_utils.current_platform
+        monkeypatch.setattr(platform, "is_cuda_alike", lambda: True)
+        monkeypatch.setattr(
+            platform,
+            "get_device_capability",
+            lambda device_id=0: DeviceCapability(7, 0),
+        )
+        spec = args.create_engine_config(usage_context=context).speculative_config
+        assert spec.draft_sample_method == "probabilistic"
+        assert spec.attention_backend.name == "FLASH_ATTN_V100"
+        resolved.append(spec.to_worker_payload())
+    assert resolved[0] == resolved[1]
 
 
 @pytest.mark.skip_global_cleanup

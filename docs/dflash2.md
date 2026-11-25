@@ -63,6 +63,8 @@ EOF
 **2. Set one more environment variable and replace the MTP speculative config** in [step 4](getting-started.md#4-launch).
 Keep every other argument, including `--no-async-scheduling`. With Docker, pass
 `-e VLLM_SM70_DFLASH2_FUSED_QKV_PACK=1`.
+Use a 512K YaRN target view with the matching draft view above at
+`--max-model-len 524288`, or use the native length supported by both models.
 
 ```bash
 export VLLM_SM70_DFLASH2_FUSED_QKV_PACK=1

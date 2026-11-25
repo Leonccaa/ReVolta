@@ -512,6 +512,116 @@ def test_engineargs_profile_precedes_actual_mtp_defaults(profile, monkeypatch):
     assert args.compilation_config.cudagraph_capture_sizes is None
 
 
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize(
+    ("method", "serving", "shortcut", "cache_flags", "expected"),
+    [
+        ("mtp", True, False, [], (True, "align")),
+        ("mtp", True, True, [], (True, "align")),
+        ("mtp", True, False, ["--no-enable-prefix-caching"], (False, "none")),
+        (
+            "mtp",
+            True,
+            False,
+            ["--enable-prefix-caching", "--mamba-cache-mode", "all"],
+            (True, "all"),
+        ),
+        ("dflash", True, False, [], (True, "align")),
+        ("mtp", False, False, [], (False, "none")),
+    ],
+)
+def test_engineargs_prefix_caching_for_hybrid_serving(
+    profile, monkeypatch, tmp_path, method, serving, shortcut, cache_flags, expected
+):
+    from transformers import Qwen3Config
+
+    from vllm import revolta_profile
+    from vllm.config import speculative
+    from vllm.engine import arg_utils
+    from vllm.model_executor.models.config import HybridAttentionMambaModelConfig
+    from vllm.platforms.cpu import CpuPlatform
+    from vllm.platforms.interface import DeviceCapability
+    from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
+    from vllm.usage.usage_lib import UsageContext
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+    model_dir = tmp_path / "target"
+    Qwen3NextConfig(architectures=["Qwen3NextForCausalLM"]).save_pretrained(model_dir)
+    raw = {"method": method, "num_speculative_tokens": 4}
+    if method == "dflash":
+        draft = tmp_path / "draft"
+        Qwen3Config(
+            architectures=["DFlash2DraftModel"],
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            dflash_config={"selector_top_k": 16, "block_size": 5},
+        ).save_pretrained(draft)
+        raw["model"] = str(draft)
+
+    platform = CpuPlatform()
+    monkeypatch.setattr(platform, "is_cuda_alike", lambda: True)
+    monkeypatch.setattr(
+        platform, "get_device_capability", lambda: DeviceCapability(7, 0)
+    )
+    monkeypatch.setattr(arg_utils, "current_platform", platform)
+    monkeypatch.setattr(revolta_profile, "all_visible_devices_sm70", lambda: True)
+    monkeypatch.setattr(
+        revolta_profile, "apply_revolta_profile", profile.apply_revolta_profile
+    )
+    # Local checkpoint configs stand in for the quantized target and draft.
+    monkeypatch.setattr(
+        speculative,
+        "ModelConfig",
+        lambda **kwargs: arg_utils.ModelConfig(**(kwargs | {"quantization": None})),
+    )
+    parser = arg_utils.EngineArgs.add_cli_args(FlexibleArgumentParser())
+    spec_flags = (
+        ["--spec-method", method, "--spec-tokens", "4"]
+        if shortcut
+        else ["--speculative-config", json.dumps(raw)]
+    )
+    args = arg_utils.EngineArgs.from_cli_args(
+        parser.parse_args(
+            [
+                "--model",
+                str(model_dir),
+                "--dtype",
+                "float16",
+                "--tensor-parallel-size",
+                "4",
+                "--distributed-executor-backend",
+                "mp",
+                *spec_flags,
+                *cache_flags,
+            ]
+        )
+    )
+    target = args.create_model_config()
+    target.quantization = "awq"
+    target.hf_text_config.update(vars(model().hf_text_config))
+    assert target.is_hybrid and not target.is_prefix_caching_supported
+    if "all" in cache_flags:
+        # Exercise an explicit mode supported by the model validator.
+        monkeypatch.setattr(
+            type(target), "supports_mamba_prefix_caching", property(lambda self: True)
+        )
+    monkeypatch.setattr(args, "create_model_config", lambda: target)
+    monkeypatch.setattr(arg_utils, "VllmConfig", SimpleNamespace)
+
+    context = UsageContext.OPENAI_API_SERVER if serving else UsageContext.LLM_CLASS
+    config = args.create_engine_config(usage_context=context)
+    assert envs.VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS
+    if method == "mtp":
+        assert config.compilation_config.cudagraph_capture_sizes is None
+        assert "draft_sample_method" not in args.speculative_config
+        assert "attention_backend" not in args.speculative_config
+    HybridAttentionMambaModelConfig.verify_and_update_config(config)
+    assert (
+        config.cache_config.enable_prefix_caching,
+        config.cache_config.mamba_cache_mode,
+    ) == expected
+
+
 @pytest.mark.parametrize(
     ("quantization", "method", "source", "overrides", "expected"),
     [

@@ -93,6 +93,7 @@ from vllm.config.parallel import (
     ExpertPlacementStrategy,
 )
 from vllm.config.scheduler import SchedulerPolicy
+from vllm.config.speculative import MTPModelTypes
 from vllm.config.utils import get_field
 from vllm.config.vllm import (
     OptimizationLevel,
@@ -2050,7 +2051,17 @@ class EngineArgs:
         use_sm70_mtp_graph_defaults = self._maybe_apply_sm70_mtp_defaults(
             usage_context, model_config
         )
-        self._set_default_chunked_prefill_and_prefix_caching_args(model_config)
+        requested_spec_method = self.spec_method or (self.speculative_config or {}).get(
+            "method"
+        )
+        self._set_default_chunked_prefill_and_prefix_caching_args(
+            model_config,
+            revolta_mtp_serving=(
+                revolta_profile_enabled
+                and getattr(usage_context, "name", None) == "OPENAI_API_SERVER"
+                and requested_spec_method in get_args(MTPModelTypes)
+            ),
+        )
         self._set_default_reasoning_config_args()
         sliding_window: int | None = None
         if not is_interleaved(model_config.hf_text_config):
@@ -2736,10 +2747,14 @@ class EngineArgs:
         return default_max_num_batched_tokens, default_max_num_seqs
 
     def _set_default_chunked_prefill_and_prefix_caching_args(
-        self, model_config: ModelConfig
+        self, model_config: ModelConfig, *, revolta_mtp_serving: bool = False
     ) -> None:
         default_chunked_prefill = model_config.is_chunked_prefill_supported
-        default_prefix_caching = model_config.is_prefix_caching_supported
+        default_prefix_caching = model_config.is_prefix_caching_supported or (
+            revolta_mtp_serving
+            and model_config.is_hybrid
+            and model_config.runner_type == "generate"
+        )
 
         if self.enable_chunked_prefill is None:
             self.enable_chunked_prefill = default_chunked_prefill

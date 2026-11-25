@@ -552,6 +552,7 @@ def hybrid_serving_args(
     active=True,
     serving=True,
     indexer_budget=2048,
+    dflash_selector=True,
 ):
     from transformers import Qwen3Config
 
@@ -585,11 +586,16 @@ def hybrid_serving_args(
             **spec_options,
         }
         if method == "dflash":
+            dflash_config = {"block_size": 8}
+            draft_arch = "DFlashDraftModel"
+            if dflash_selector:
+                dflash_config["selector_top_k"] = 16
+                draft_arch = "DFlash2DraftModel"
             Qwen3Config(
-                architectures=["DFlash2DraftModel"],
+                architectures=[draft_arch],
                 num_attention_heads=4,
                 num_key_value_heads=2,
-                dflash_config={"selector_top_k": 16, "block_size": 8},
+                dflash_config=dflash_config,
             ).save_pretrained(tmp_path / "draft")
             raw["model"] = str(tmp_path / "draft")
         argv.extend(("--speculative-config", json.dumps(raw)))
@@ -882,10 +888,11 @@ I1_DFLASH2_POLICY = {
 
 @pytest.mark.skip_global_cleanup
 @pytest.mark.parametrize(
-    ("active", "serving", "overrides", "environment", "expected"),
+    ("active", "serving", "selector", "overrides", "environment", "expected"),
     [
-        (True, True, {}, {}, I1_DFLASH2_POLICY),
+        (True, True, True, {}, {}, I1_DFLASH2_POLICY),
         (
+            True,
             True,
             True,
             {"context_pipeline": False},
@@ -895,8 +902,33 @@ I1_DFLASH2_POLICY = {
             },
             I1_DFLASH2_POLICY | {"context_pipeline": False, "context_kv_graph": False},
         ),
-        (True, False, {}, {}, {}),
-        (False, True, {}, {}, {}),
+        (
+            True,
+            True,
+            True,
+            {"context_kv_graph": False},
+            {},
+            I1_DFLASH2_POLICY | {"context_kv_graph": False, "context_pipeline": False},
+        ),
+        (
+            True,
+            True,
+            True,
+            {},
+            {"VLLM_SM70_DFLASH2_CONTEXT_KV_GRAPH": "0"},
+            I1_DFLASH2_POLICY | {"context_kv_graph": False, "context_pipeline": False},
+        ),
+        (
+            True,
+            True,
+            True,
+            {"context_kv_graph": False, "context_pipeline": True},
+            {},
+            I1_DFLASH2_POLICY | {"context_kv_graph": False},
+        ),
+        (True, True, False, {}, {}, {"spec_state_replay": True}),
+        (True, False, True, {}, {}, {}),
+        (False, True, True, {}, {}, {}),
     ],
 )
 def test_dflash2_serving_verifier_defaults_match_i1(
@@ -906,6 +938,7 @@ def test_dflash2_serving_verifier_defaults_match_i1(
     sm70_serving_resolution,
     active,
     serving,
+    selector,
     overrides,
     environment,
     expected,
@@ -923,6 +956,7 @@ def test_dflash2_serving_verifier_defaults_match_i1(
         {"sm70_dflash2": overrides} if overrides else {},
         active=active,
         serving=serving,
+        dflash_selector=selector,
     )
     spec = args.create_engine_config(usage_context=context).speculative_config
     policy = spec.sm70_dflash2

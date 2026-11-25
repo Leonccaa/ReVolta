@@ -1825,10 +1825,8 @@ class EngineArgs:
         self,
         usage_context: UsageContext | None,
         model_config: ModelConfig,
-        *,
-        mixed_prefill_step_latency_ms: float,
-    ) -> None:
-        """Apply the 1Cat SM70 speculative serving defaults."""
+    ) -> bool:
+        """Apply the 1Cat defaults and report whether MTP needs graph defaults."""
         mtp_defaults_disabled = (
             envs.VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS
             or envs.VLLM_1CAT_DISABLE_QWEN35_MTP_DEFAULTS
@@ -1837,15 +1835,15 @@ class EngineArgs:
             self.speculative_config.get("method") == "dflash"
         )
         if mtp_defaults_disabled and not explicit_dflash:
-            return
+            return False
         if not current_platform.is_cuda_alike():
-            return
+            return False
         try:
             cap = current_platform.get_device_capability()
         except Exception:
-            return
+            return False
         if cap is None or (cap.major, cap.minor) != (7, 0):
-            return
+            return False
 
         text_config = model_config.hf_text_config
         has_native_mtp = bool(getattr(text_config, "mtp_num_hidden_layers", 0))
@@ -1896,13 +1894,13 @@ class EngineArgs:
                         "into automatic MTP4.",
                         ", ".join(profile_updates),
                     )
-                return
+                return False
 
         if not isinstance(self.speculative_config, dict):
-            return
+            return False
         spec_method = self.speculative_config.get("method")
         if spec_method not in ("mtp", "dflash"):
-            return
+            return False
 
         if "draft_sample_method" not in self.speculative_config:
             # MTP can use the vocab-parallel local-argmax fast path only in
@@ -1928,7 +1926,7 @@ class EngineArgs:
                     "Applied SM70 speculative defaults: %s",
                     ", ".join(profile_updates),
                 )
-            return
+            return False
 
         if "use_local_argmax_reduction" not in self.speculative_config:
             self.speculative_config["use_local_argmax_reduction"] = True
@@ -1940,74 +1938,6 @@ class EngineArgs:
             self.compilation_config.fast_moe_cold_start = True
             profile_updates.append("fast_moe_cold_start=True")
 
-        if (
-            self.cudagraph_capture_sizes is None
-            and self.max_cudagraph_capture_size is None
-            and self.compilation_config.cudagraph_capture_sizes is None
-            and self.compilation_config.max_cudagraph_capture_size is None
-        ):
-            num_speculative_tokens = int(
-                self.speculative_config.get("num_speculative_tokens") or 0
-            )
-            num_speculative_state_tokens = num_speculative_tokens
-            if self.speculative_config.get(
-                "method"
-            ) == "dflash_ddtree" and not self.speculative_config.get(
-                "ddtree_disable_tree_verify", False
-            ):
-                ddtree_budget = int(
-                    self.speculative_config.get("ddtree_budget")
-                    or num_speculative_tokens
-                )
-                num_speculative_state_tokens = max(
-                    num_speculative_tokens, ddtree_budget
-                )
-            decode_query_len = num_speculative_state_tokens + 1
-            if self.max_num_seqs is None:
-                # Scheduler defaults are resolved later in VllmConfig. Leave
-                # graph sizing to that stage instead of turning a graph policy
-                # into a service-capacity limit.
-                profile_updates.append("mtp_cudagraph_shapes=deferred_to_scheduler")
-            elif envs.VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS and spec_method == "mtp":
-                cudagraph_capture_sizes = _sm70_mtp_cudagraph_capture_sizes(
-                    self.max_num_seqs,
-                    decode_query_len,
-                )
-                profile_updates.append(
-                    f"mtp_split_verifier_cudagraph_shapes={cudagraph_capture_sizes}"
-                )
-            else:
-                graph_mode = self.compilation_config.cudagraph_mode
-                cudagraph_capture_sizes = _sm70_speculative_cudagraph_capture_sizes(
-                    self.max_num_seqs,
-                    decode_query_len,
-                    include_mixed_prefill=(
-                        mixed_prefill_step_latency_ms > 0
-                        and (
-                            graph_mode is None or graph_mode.has_piecewise_cudagraphs()
-                        )
-                    ),
-                )
-                profile_updates.append(
-                    f"mtp_cudagraph_shapes={cudagraph_capture_sizes}"
-                )
-            if self.max_num_seqs is not None:
-                self.compilation_config.cudagraph_capture_sizes = (
-                    cudagraph_capture_sizes
-                )
-                max_tokens = self.max_num_batched_tokens
-                self.compilation_config.max_cudagraph_capture_size = (
-                    max(cudagraph_capture_sizes)
-                    if max_tokens is None
-                    else _sm70_max_cudagraph_capture_size(
-                        cudagraph_capture_sizes, max_tokens
-                    )
-                )
-                profile_updates.append(
-                    "cudagraph_capture_sizes="
-                    f"{self.compilation_config.cudagraph_capture_sizes}"
-                )
-
         if profile_updates:
             logger.info_once(
                 "Applied 1Cat SM70 MTP defaults: %s. "
@@ -2016,6 +1946,47 @@ class EngineArgs:
                 "automatic MTP.",
                 ", ".join(profile_updates),
             )
+        return True
+
+    def _set_sm70_mtp_cudagraph_defaults(self) -> None:
+        # With no explicit sequence limit, VllmConfig sizes the graphs from
+        # the resolved scheduler capacity.
+        if (
+            self.max_num_seqs is None
+            or self.cudagraph_capture_sizes is not None
+            or self.max_cudagraph_capture_size is not None
+            or self.compilation_config.cudagraph_capture_sizes is not None
+            or self.compilation_config.max_cudagraph_capture_size is not None
+        ):
+            return
+
+        assert self.speculative_config is not None
+        assert self.mixed_prefill_step_latency_ms is not None
+        decode_query_len = (
+            int(self.speculative_config.get("num_speculative_tokens") or 0) + 1
+        )
+        if envs.VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS:
+            sizes = _sm70_mtp_cudagraph_capture_sizes(
+                self.max_num_seqs, decode_query_len
+            )
+        else:
+            graph_mode = self.compilation_config.cudagraph_mode
+            sizes = _sm70_speculative_cudagraph_capture_sizes(
+                self.max_num_seqs,
+                decode_query_len,
+                include_mixed_prefill=(
+                    self.mixed_prefill_step_latency_ms > 0
+                    and (graph_mode is None or graph_mode.has_piecewise_cudagraphs())
+                ),
+            )
+        self.compilation_config.cudagraph_capture_sizes = sizes
+        max_tokens = self.max_num_batched_tokens
+        self.compilation_config.max_cudagraph_capture_size = (
+            max(sizes)
+            if max_tokens is None
+            else _sm70_max_cudagraph_capture_size(sizes, max_tokens)
+        )
+        logger.info_once("Applied SM70 MTP CUDA Graph capture sizes: %s", tuple(sizes))
 
     def create_engine_config(
         self,
@@ -2063,9 +2034,7 @@ class EngineArgs:
             has_nvfp4_weights,
         )
 
-        # Must precede the MTP defaults: those pre-fill capture sizes and change
-        # fast_moe_cold_start before VllmConfig gets a chance to choose policy.
-        speculative_method = (self.speculative_config or {}).get("method")
+        # The profile controls whether the 1Cat MTP defaults apply.
         revolta_profile_enabled = apply_revolta_profile(
             model_config,
             self.tensor_parallel_size,
@@ -2073,27 +2042,13 @@ class EngineArgs:
             interconnect_mode=frontend_interconnect_mode(
                 disable_custom_all_reduce=self.disable_custom_all_reduce
             ),
-            speculative_method=speculative_method,
+            speculative_method=(self.speculative_config or {}).get("method"),
             allow_shared_expert_overlap=not (
                 self.enable_expert_parallel or self.enable_dbo
             ),
         )
-        use_fixed_prefill_profile = (
-            revolta_profile_enabled
-            and speculative_method in ("mtp", "dflash")
-            and (model_config.quantization == "awq" or has_nvfp4_weights(model_config))
-        )
-        mixed_prefill_step_latency_ms = self.mixed_prefill_step_latency_ms
-        if mixed_prefill_step_latency_ms is None:
-            mixed_prefill_step_latency_ms = (
-                0.0
-                if use_fixed_prefill_profile
-                else SchedulerConfig.mixed_prefill_step_latency_ms
-            )
-        self._maybe_apply_sm70_mtp_defaults(
-            usage_context,
-            model_config,
-            mixed_prefill_step_latency_ms=mixed_prefill_step_latency_ms,
+        use_sm70_mtp_graph_defaults = self._maybe_apply_sm70_mtp_defaults(
+            usage_context, model_config
         )
         self._set_default_chunked_prefill_and_prefix_caching_args(model_config)
         self._set_default_reasoning_config_args()
@@ -2380,6 +2335,27 @@ class EngineArgs:
             target_model_config=model_config,
             target_parallel_config=parallel_config,
         )
+        # Resolve the scheduling defaults before selecting graph capture sizes.
+        use_fixed_prefill_profile = (
+            revolta_profile_enabled
+            and speculative_config is not None
+            and speculative_config.method in ("mtp", "dflash")
+            and (model_config.quantization == "awq" or has_nvfp4_weights(model_config))
+        )
+        if self.mixed_prefill_step_latency_ms is None:
+            self.mixed_prefill_step_latency_ms = (
+                0.0
+                if use_fixed_prefill_profile
+                else SchedulerConfig.mixed_prefill_step_latency_ms
+            )
+        if self.prefill_pressure_token_budget is None:
+            self.prefill_pressure_token_budget = (
+                448
+                if use_fixed_prefill_profile and self.enable_chunked_prefill
+                else SchedulerConfig.prefill_pressure_token_budget
+            )
+        if use_sm70_mtp_graph_defaults:
+            self._set_sm70_mtp_cudagraph_defaults()
 
         self._set_default_max_num_seqs_and_batched_tokens_args(
             usage_context,
@@ -2397,13 +2373,6 @@ class EngineArgs:
         assert model_config.max_model_len is not None, (
             "max_model_len must be set by this point"
         )
-        prefill_pressure_token_budget = self.prefill_pressure_token_budget
-        if prefill_pressure_token_budget is None:
-            prefill_pressure_token_budget = (
-                448
-                if use_fixed_prefill_profile and self.enable_chunked_prefill
-                else SchedulerConfig.prefill_pressure_token_budget
-            )
         scheduler_config = SchedulerConfig(
             runner_type=model_config.runner_type,
             max_num_batched_tokens=self.max_num_batched_tokens,
@@ -2418,11 +2387,11 @@ class EngineArgs:
             max_num_partial_prefills=self.max_num_partial_prefills,
             max_long_partial_prefills=self.max_long_partial_prefills,
             long_prefill_token_threshold=self.long_prefill_token_threshold,
-            mixed_prefill_step_latency_ms=mixed_prefill_step_latency_ms,
+            mixed_prefill_step_latency_ms=self.mixed_prefill_step_latency_ms,
             long_prefill_token_threshold_adaptive=(
                 self.long_prefill_token_threshold_adaptive
             ),
-            prefill_pressure_token_budget=prefill_pressure_token_budget,
+            prefill_pressure_token_budget=self.prefill_pressure_token_budget,
             prefill_pressure_threshold=self.prefill_pressure_threshold,
             scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,

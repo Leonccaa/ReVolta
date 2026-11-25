@@ -581,7 +581,9 @@ class FlexibleArgumentParser(ArgumentParser):
 
         for key, value in config.items():
             if value is None:
-                continue
+                action = self._option_string_actions.get("--" + key.replace("_", "-"))
+                if action is not None and action.nargs == 0:
+                    continue
             if isinstance(value, bool):
                 if value:
                     processed_args.append("--" + key)

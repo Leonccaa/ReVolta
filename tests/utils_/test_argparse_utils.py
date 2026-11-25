@@ -154,16 +154,12 @@ def test_yaml_false_uses_registered_negative_option(tmp_path, subcommand):
     assert parser.parse_args([*argv, "--enable-prefix-caching"]).enable_prefix_caching
 
 
-def test_yaml_top_level_null_is_unset(tmp_path):
+def test_yaml_null_uses_serve_option_semantics(tmp_path):
+    from vllm.entrypoints.cli.serve import ServeSubcommand
+
     parser = FlexibleArgumentParser()
-    serve = parser.add_subparsers().add_parser("serve")
-    serve.add_argument("model_tag", nargs="?")
-    serve.add_argument("--model")
-    serve.add_argument("--enable-prefix-caching", action=BooleanOptionalAction)
-    serve.add_argument("--async-scheduling", action=BooleanOptionalAction)
-    serve.add_argument("--grpc", action="store_true")
-    serve.add_argument("--headless", action="store_true")
-    serve.add_argument("--tokenizer")
+    serve = ServeSubcommand().subparser_init(parser.add_subparsers())
+    serve.set_defaults(log_config_file="default-log-config.json")
     config = tmp_path / "config.yaml"
     config.write_text(
         "model: target\n"
@@ -172,6 +168,8 @@ def test_yaml_top_level_null_is_unset(tmp_path):
         "grpc: null\n"
         "headless: null\n"
         "tokenizer: null\n"
+        "prefix-cache-retention-interval: null\n"
+        "log-config-file: null\n"
     )
     args = parser.parse_args(
         ["serve", "--config", str(config), "--no-async-scheduling"]
@@ -182,7 +180,9 @@ def test_yaml_top_level_null_is_unset(tmp_path):
     assert args.async_scheduling is False
     assert args.grpc is False
     assert args.headless is False
-    assert args.tokenizer is None
+    assert args.tokenizer == "None"
+    assert args.prefix_cache_retention_interval is None
+    assert args.log_config_file is None
 
 
 def test_config_file(parser_with_config):

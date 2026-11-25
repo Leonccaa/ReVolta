@@ -176,9 +176,10 @@ The example sets a 2 GiB CPU pool and an 8 GiB disk budget.
   its capacity.
 - Use one dedicated directory for each engine. A lock file allows only one engine per
   root.
-- To reuse disk pages after a restart, the model, ReVolta version and page layout must
-  be the same. Keep `.hash_seed.json` in the root. Restart reuse in the release
-  gate: passed (a restarted engine read 667 MB of pages back from disk; output identical).
+- To reuse `revolta_fs` pages after a restart, the persistent KV identity, including
+  the compatibility epoch (`KV_COMPAT_EPOCH`), must match. Keep `.hash_seed.json`
+  in the root. In the raw `fs` release gate, a restarted engine read 667 MB of
+  pages from disk and produced identical output.
 - The SSD tier is a disposable cache, not model storage.
 - A prefix restored from disk is staged in the CPU pool first, so `cpu_bytes_to_use` must
   be larger than the largest prefix you expect to restore from disk (about 21 KB per

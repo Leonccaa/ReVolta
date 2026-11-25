@@ -257,11 +257,8 @@ class ExactEndIndex:
         blocks: tuple[Sequence[KVCacheBlock], ...],
         hit: int,
         host_hits: "HostKVHitManager | None",
-        *,
-        remember_hit: bool = True,
     ) -> tuple[tuple[Sequence[KVCacheBlock], ...], int]:
-        if remember_hit:
-            self.discard_hit(request.request_id)
+        self.discard_hit(request.request_id)
         if not self.state_groups:
             return blocks, hit
         managers = self.coordinator.single_type_managers
@@ -324,9 +321,8 @@ class ExactEndIndex:
                             break
                     result.append(prefix + [b for b, _ in held])
                 if len(result) == len(managers):
-                    if remember_hit:
-                        self.hits[request.request_id] = entry
-                        entry.hit_requests.add(request.request_id)
+                    self.hits[request.request_id] = entry
+                    entry.hit_requests.add(request.request_id)
                     return tuple(result), n - 1
         return blocks, hit
 

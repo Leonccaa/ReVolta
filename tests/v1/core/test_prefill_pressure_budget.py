@@ -4,12 +4,18 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
+from vllm.config import LoRAConfig
+from vllm.lora.request import LoRARequest
 from vllm.v1.core.kv_cache_coordinator import KVCacheCoordinator
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, MambaSpec
 from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.request import RequestStatus
+from vllm.v1.structured_output import StructuredOutputManager
 
-from .utils import create_requests, create_scheduler
+from .utils import create_requests, create_scheduler, mock_kv
 
 pytestmark = pytest.mark.cpu_test
 
@@ -318,3 +324,351 @@ def test_cached_short_prefill_gets_pressure_budget_before_running_long_prefill(
     next_output = scheduler.schedule()
     assert next_output.num_scheduled_tokens["long"] == 32
     assert "older" not in next_output.num_scheduled_tokens
+
+
+def test_rejected_short_prefill_leaves_full_budget_for_running_long_prefill():
+    scheduler = create_scheduler(
+        max_num_batched_tokens=96,
+        prefill_pressure_token_budget=32,
+        max_model_len=512,
+        enable_prefix_caching=True,
+    )
+    scheduler.lora_config = LoRAConfig(max_loras=1)
+    resident_adapter = LoRARequest("resident", 1, "/unused")
+    waiting_adapter = LoRARequest("waiting", 2, "/unused")
+    (primer,) = create_requests(1, 65, max_tokens=1, req_ids=["primer"])
+    (decode,) = create_requests(1, 8, req_ids=["decode"])
+    (long,) = create_requests(1, 200, req_ids=["long"])
+    (short,) = create_requests(1, 80, req_ids=["short"])
+    for request, adapter in (
+        (primer, waiting_adapter),
+        (decode, resident_adapter),
+        (long, resident_adapter),
+        (short, waiting_adapter),
+    ):
+        request.lora_request = adapter
+        request.block_hashes.clear()
+        request.update_block_hashes()
+
+    scheduler.add_request(primer)
+    _complete_pressure_step(scheduler, scheduler.schedule(), {"primer": [1]})
+    scheduler.add_request(decode)
+    _complete_pressure_step(scheduler, scheduler.schedule(), {"decode": [1]})
+    scheduler.add_request(long)
+    _complete_pressure_step(scheduler, scheduler.schedule(), {"decode": [2]})
+    assert scheduler.kv_cache_manager.get_computed_blocks(short)[1] == 64
+    scheduler.add_request(short)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {"decode": 1, "long": 32}
+    assert not output.scheduled_new_reqs
+
+
+def test_short_prefill_does_not_admit_waiting_long_on_alignment_remainder():
+    block = MAMBA_BLOCK_SIZE
+    spec = MambaSpec(
+        block_size=block,
+        shapes=((1,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+    initial = create_scheduler(
+        max_num_batched_tokens=3 * block,
+        prefill_pressure_token_budget=2 * block,
+        max_model_len=8 * block,
+        enable_prefix_caching=True,
+        block_size=block,
+        kv_cache_spec=spec,
+    )
+    config = initial.vllm_config
+    config.cache_config.mamba_cache_mode = "align"
+    config.model_config.max_model_len = 8 * block
+    scheduler = Scheduler(
+        vllm_config=config,
+        kv_cache_config=KVCacheConfig(64, [], [KVCacheGroupSpec(["mamba"], spec)]),
+        structured_output_manager=StructuredOutputManager(config),
+        block_size=block,
+        hash_block_size=block,
+    )
+    (primer,) = create_requests(
+        1, block + 1, max_tokens=1, block_size=block, req_ids=["primer"]
+    )
+    scheduler.add_request(primer)
+    _complete_pressure_step(scheduler, scheduler.schedule(), {})
+    _complete_pressure_step(scheduler, scheduler.schedule(), {"primer": [1]})
+    _start_decode_request(scheduler)
+
+    _, long, older = create_requests(
+        3, 7 * block, block_size=block, req_ids=["unused", "long", "older"]
+    )
+    scheduler.add_request(long)
+    first = scheduler.schedule()
+    assert first.num_scheduled_tokens == {"decode": 1, "long": 2 * block}
+    _complete_pressure_step(scheduler, first, {"decode": [2]})
+    scheduler.add_request(older)
+    (short,) = create_requests(1, block + 16, block_size=block, req_ids=["short"])
+    scheduler.add_request(short)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {"decode": 1, "long": block, "short": 16}
+    assert [r.req_id for r in output.scheduled_new_reqs] == ["short"]
+    assert output.scheduled_new_reqs[0].num_computed_tokens == block
+
+
+def test_async_first_output_placeholders_leave_room_for_short_prefill():
+    scheduler = create_scheduler(
+        max_num_batched_tokens=33,
+        prefill_pressure_token_budget=32,
+        max_model_len=512,
+        enable_prefix_caching=True,
+        async_scheduling=True,
+    )
+    (primer,) = create_requests(1, 33, max_tokens=1, req_ids=["primer"])
+    scheduler.add_request(primer)
+    _complete_pressure_step(scheduler, scheduler.schedule(), {"primer": [1]})
+    _start_decode_request(scheduler)
+
+    _, long = create_requests(2, 200, req_ids=["unused", "long"])
+    scheduler.add_request(long)
+    (pending,) = create_requests(1, 3, req_ids=["pending"])
+    scheduler.add_request(pending)
+    started = scheduler.schedule()
+    assert started.num_scheduled_tokens == {"decode": 1, "long": 29, "pending": 3}
+    assert pending.num_output_tokens == 0
+    assert pending.num_output_placeholders == 1
+
+    (short,) = create_requests(1, 48, req_ids=["short"])
+    scheduler.add_request(short)
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {
+        "decode": 1,
+        "pending": 1,
+        "long": 15,
+        "short": 16,
+    }
+    assert output.scheduled_new_reqs[0].num_computed_tokens == 32
+
+
+def test_host_kv_short_prefill_uses_admitted_prefix():
+    from .long_context_kv_utils import SPAN
+    from .test_long_context_admission import build, make_requests, run, settings
+    from .test_scheduler_kv_capacity import step
+
+    scheduler = build(settings(main_kv_placement="host"))
+    scheduler.scheduler_config.prefill_pressure_token_budget = SPAN
+    assert scheduler.host_history_pool is not None
+    assert scheduler.kv_cache_manager.hit_contract is not None
+
+    (primer,) = make_requests(1, 2 * SPAN + 1, 1, same_prompt=True, tag="primer")
+    run(scheduler, [primer])
+    (decode,) = make_requests(1, 8, 8, tag="decode")
+    scheduler.add_request(decode)
+    step(scheduler)
+    (long,) = make_requests(1, 7 * SPAN, 8, tag="long")
+    scheduler.add_request(long)
+    started = step(scheduler)
+    assert started.num_scheduled_tokens == {decode.request_id: 1, long.request_id: SPAN}
+    (short,) = make_requests(1, 2 * SPAN + 16, 8, same_prompt=True, tag="short")
+    scheduler.add_request(short)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {
+        decode.request_id: 1,
+        long.request_id: SPAN - 16,
+        short.request_id: 16,
+    }
+    assert [req.req_id for req in output.scheduled_new_reqs] == [short.request_id]
+    assert output.scheduled_new_reqs[0].num_computed_tokens == 2 * SPAN
+
+
+def test_finished_remote_short_prefill_uses_its_reserved_slot(monkeypatch):
+    from .test_async_kv_admission import complete
+
+    scheduler = create_scheduler(
+        max_num_seqs=3,
+        max_num_batched_tokens=96,
+        prefill_pressure_token_budget=32,
+        max_model_len=512,
+        enable_prefix_caching=True,
+        use_kv_connector=mock_kv(64, True),
+    )
+    monkeypatch.setattr(
+        scheduler.connector,
+        "get_num_new_matched_tokens",
+        lambda req, _: (64, True) if req.request_id == "short" else (0, False),
+    )
+    _start_decode_request(scheduler)
+    _, long = create_requests(2, 200, req_ids=["unused", "long"])
+    scheduler.add_request(long)
+    complete(scheduler, scheduler.schedule())
+    (short,) = create_requests(1, 80, req_ids=["short"])
+    scheduler.add_request(short)
+    load = scheduler.schedule()
+    assert load.num_scheduled_tokens == {"decode": 1, "long": 32}
+    assert short.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert short.num_computed_tokens == 64
+    assert short in scheduler._inflight_prefills
+    assert len(scheduler.running) + 1 == scheduler.max_num_running_reqs
+    complete(scheduler, load, received={"short"})
+    assert "short" in scheduler.finished_recving_kv_req_ids
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {"decode": 1, "long": 16, "short": 16}
+    assert [req.req_id for req in output.scheduled_new_reqs] == ["short"]
+    assert output.scheduled_new_reqs[0].num_computed_tokens == 64
+
+
+def test_short_prefill_kv_allocation_refusal_leaves_full_pressure_budget(
+    monkeypatch,
+):
+    scheduler = create_scheduler(
+        max_num_batched_tokens=96,
+        prefill_pressure_token_budget=32,
+        max_model_len=512,
+        enable_prefix_caching=True,
+        num_blocks=9,
+    )
+    (primer,) = create_requests(1, 65, max_tokens=1, req_ids=["primer"])
+    scheduler.add_request(primer)
+    _complete_pressure_step(scheduler, scheduler.schedule(), {"primer": [1]})
+    _start_decode_request(scheduler)
+    _, long = create_requests(2, 88, req_ids=["unused", "long"])
+    scheduler.add_request(long)
+    _complete_pressure_step(scheduler, scheduler.schedule(), {"decode": [2]})
+    assert long.num_computed_tokens == 32
+    (short,) = create_requests(1, 96, req_ids=["short"])
+    manager = scheduler.kv_cache_manager
+    assert manager.get_computed_blocks(short)[1] == 64
+    scheduler.add_request(short)
+
+    # Five free blocks can hold the long chunk, but the short request needs
+    # four cached and two new blocks.
+    allocate_slots = manager.allocate_slots
+    refusals = []
+
+    def observe_allocation(request, *args, **kwargs):
+        allocated = allocate_slots(request, *args, **kwargs)
+        if allocated is None:
+            refusals.append(request.request_id)
+        return allocated
+
+    monkeypatch.setattr(manager, "allocate_slots", observe_allocation)
+    output = scheduler.schedule()
+
+    assert refusals == ["short"]
+    assert not output.scheduled_new_reqs
+    assert output.num_scheduled_tokens == {"decode": 1, "long": 32}
+
+
+@pytest.mark.parametrize(
+    ("connector_reply", "status"),
+    [
+        ((None, False), RequestStatus.WAITING),
+        ((16, True), RequestStatus.WAITING_FOR_REMOTE_KVS),
+    ],
+)
+def test_unready_connector_does_not_consume_pressure_budget(
+    monkeypatch, connector_reply, status
+):
+    from .test_async_kv_admission import complete
+
+    scheduler = create_scheduler(
+        max_num_batched_tokens=96,
+        prefill_pressure_token_budget=32,
+        max_model_len=512,
+        use_kv_connector=mock_kv(16, True),
+    )
+    monkeypatch.setattr(
+        scheduler.connector,
+        "get_num_new_matched_tokens",
+        lambda req, _: connector_reply if req.request_id == "short" else (0, False),
+    )
+    _start_decode_request(scheduler)
+    _, long = create_requests(2, 200, req_ids=["unused", "long"])
+    scheduler.add_request(long)
+    complete(scheduler, scheduler.schedule())
+    (short,) = create_requests(1, 32, req_ids=["short"])
+    scheduler.add_request(short)
+
+    for _ in range(2):
+        output = scheduler.schedule()
+        assert short.status == status
+        assert output.num_scheduled_tokens == {"decode": 1, "long": 32}
+        complete(scheduler, output)
+
+
+@pytest.mark.parametrize(
+    ("policy", "expected"),
+    [
+        ("fcfs", {"decode": 1, "long": 16, "short": 16}),
+        ("priority", {"decode": 1, "long": 32}),
+    ],
+)
+def test_cold_short_prefill_is_prioritized_only_under_fcfs(policy, expected):
+    initial = create_scheduler(
+        max_num_batched_tokens=96,
+        prefill_pressure_token_budget=32,
+        max_model_len=512,
+    )
+    config = initial.vllm_config
+    config.scheduler_config.policy = policy
+    scheduler = Scheduler(
+        vllm_config=config,
+        kv_cache_config=initial.kv_cache_config,
+        structured_output_manager=StructuredOutputManager(config),
+        block_size=16,
+    )
+    _start_decode_request(scheduler)
+    long, older = create_requests(2, 200, req_ids=["long", "older"])
+    scheduler.add_request(long)
+    _complete_pressure_step(scheduler, scheduler.schedule(), {"decode": [2]})
+    (short,) = create_requests(1, 16, req_ids=["short"])
+    short.priority = 1
+    scheduler.add_request(older)
+    scheduler.add_request(short)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == expected
+    if "short" in expected:
+        (admitted,) = output.scheduled_new_reqs
+        assert admitted.req_id == "short"
+        assert admitted.num_computed_tokens == 0
+    else:
+        assert not output.scheduled_new_reqs
+
+
+def test_no_short_prefill_preserves_running_batches_across_steps():
+    scheduler = create_scheduler(
+        max_num_batched_tokens=96,
+        prefill_pressure_token_budget=32,
+        long_prefill_token_threshold=48,
+        max_model_len=512,
+    )
+    (long,) = create_requests(1, 350, req_ids=["long"])
+    (decode,) = create_requests(1, 8, req_ids=["decode"])
+    scheduler.add_request(long)
+    scheduler.add_request(decode)
+    started = scheduler.schedule()
+    assert started.num_scheduled_tokens == {"long": 48, "decode": 8}
+    _complete_pressure_step(scheduler, started, {"decode": [1]})
+    (older,) = create_requests(1, 200, req_ids=["older"])
+    scheduler.add_request(older)
+
+    for step in range(3):
+        output = scheduler.schedule()
+
+        assert output.num_scheduled_tokens == {"long": 32, "decode": 1}
+        assert list(output.num_scheduled_tokens) == ["long", "decode"]
+        assert not output.scheduled_new_reqs
+        assert output.scheduled_cached_reqs.req_ids == ["long", "decode"]
+        assert output.scheduled_cached_reqs.num_computed_tokens == [
+            48 + 32 * step,
+            8 + step,
+        ]
+        _complete_pressure_step(scheduler, output, {"decode": [2 + step]})

@@ -771,44 +771,6 @@ class Scheduler(SchedulerInterface):
             budget = budget // block_size * block_size
         return budget
 
-    def _reserve_short_prefills(
-        self, budget: int, long_prefill_threshold: int
-    ) -> tuple[deque[tuple[RequestQueue, Request, int]], int]:
-        """Keep room for FIFO, locally ready prefills before charging long ones."""
-        selected: deque[tuple[RequestQueue, Request, int]] = deque()
-        slots = (
-            self.max_num_running_reqs
-            - len(self.running)
-            - sum(
-                request.status != RequestStatus.RUNNING
-                for request in self._inflight_prefills
-            )
-        )
-        if slots <= 0 or not budget:
-            return selected, 0
-
-        reserved = 0
-        for queue, request in sorted(
-            (
-                (waiting_queue, request)
-                for waiting_queue in (self.skipped_waiting, self.waiting)
-                for request in waiting_queue
-                if not self._is_blocked_waiting_status(request.status)
-            ),
-            key=lambda item: item[1].arrival_time,
-        ):
-            uncached = self.kv_cache_manager.get_ready_prefill_tokens(request)
-            if not 0 < uncached <= budget:
-                continue
-            rows = min(uncached, long_prefill_threshold or uncached)
-            if reserved + rows > budget:
-                break
-            selected.append((queue, request, uncached))
-            reserved += rows
-            if reserved == budget or len(selected) == slots:
-                break
-        return selected, reserved
-
     def schedule(self) -> SchedulerOutput:
         self.current_step += 1
         store_cpu_start = (
@@ -930,212 +892,211 @@ class Scheduler(SchedulerInterface):
                 self.max_num_scheduled_tokens // num_eligible_reqs,
             )
 
-        short_prefills: deque[tuple[RequestQueue, Request, int]] = deque()
-        reserved_prefill = 0
-        if (
-            prefill_token_budget
-            and self._pause_state == PauseState.UNPAUSED
-            and (self.waiting or self.skipped_waiting)
-        ):
-            budget = min(
-                prefill_token_budget,
-                max(0, token_budget - sum(resident_tokens.values())),
-            )
-            if control_mixed_prefill:
-                budget = min(budget, self.mixed_prefill_budget.tokens)
-            short_prefills, reserved_prefill = self._reserve_short_prefills(
-                budget, long_prefill_token_threshold
-            )
-            if reserved_prefill:
-                prefill_token_budget = budget
-
-        # First, schedule the RUNNING requests.
-        req_index = 0
-        while req_index < len(self.running) and token_budget > 0:
-            request = self.running[req_index]
-
-            if self.current_step < request.next_decode_eligible_step:
-                req_index += 1
-                continue
-
-            if (
-                request.num_output_placeholders > 0
-                # This is (num_computed_tokens + 1) - (num_output_placeholders - 1).
-                # Since output placeholders are also included in the computed tokens
-                # count, we subtract (num_output_placeholders - 1) to remove any draft
-                # tokens, so that we can be sure no further steps are needed even if
-                # they are all rejected.
-                and request.num_computed_tokens + 2 - request.num_output_placeholders
-                >= request.num_prompt_tokens + request.max_tokens
-            ):
-                # Async scheduling: Avoid scheduling an extra step when we are sure that
-                # the previous step has reached request.max_tokens. We don't schedule
-                # partial draft tokens since this prevents uniform decode optimizations.
-                req_index += 1
-                continue
-
-            num_new_tokens = self._num_new_tokens_with_spec(request)
-            ddtree_payload_for_tree_schedule = self._ddtree_payload_for_tree_schedule(
-                request
-            )
-            ddtree_payload_fits_output_budget = True
-            if ddtree_payload_for_tree_schedule is not None:
-                flat_len = len(request.spec_token_ids)
-                tree_len = len(
-                    getattr(ddtree_payload_for_tree_schedule, "tree_token_ids", ())
-                )
-                tree_num_new_tokens = num_new_tokens + max(0, tree_len - flat_len)
-                tree_max_output_tokens = self._ddtree_payload_max_output_tokens(
-                    ddtree_payload_for_tree_schedule
-                )
-                remaining_output_tokens = self._remaining_output_tokens(request)
-                threshold = long_prefill_token_threshold
-                max_len_tokens = self.max_model_len - 1 - request.num_computed_tokens
-                _ddtree_debug_log(
-                    "schedule candidate req=%s base_new=%d tree_new=%d "
-                    "flat_len=%d tree_len=%d token_budget=%d threshold=%d "
-                    "max_len_tokens=%d remaining_output=%d tree_max_output=%d",
-                    request.request_id,
-                    num_new_tokens,
-                    tree_num_new_tokens,
-                    flat_len,
-                    tree_len,
-                    token_budget,
-                    threshold,
-                    max_len_tokens,
-                    remaining_output_tokens,
-                    tree_max_output_tokens,
-                )
-                ddtree_payload_fits_output_budget = (
-                    tree_max_output_tokens <= remaining_output_tokens
-                )
-                if (
-                    tree_len > flat_len
-                    and ddtree_payload_fits_output_budget
-                    and (threshold <= 0 or tree_num_new_tokens <= threshold)
-                    and tree_num_new_tokens <= token_budget
-                    and tree_num_new_tokens <= max_len_tokens
+        def schedule_running(*, decode_only: bool = False) -> None:
+            nonlocal token_budget, prefill_token_budget
+            nonlocal drafts_needed, encoder_compute_budget
+            req_index = 0
+            while req_index < len(self.running) and token_budget > 0:
+                request = self.running[req_index]
+                if request.request_id in num_scheduled_tokens or (
+                    decode_only
+                    and request.num_computed_tokens < request.num_prompt_tokens
                 ):
-                    num_new_tokens = tree_num_new_tokens
-                    _ddtree_debug_log(
-                        "schedule expanded req=%s num_new=%d",
-                        request.request_id,
-                        num_new_tokens,
-                    )
-            if 0 < long_prefill_token_threshold < num_new_tokens:
-                num_new_tokens = long_prefill_token_threshold
-            is_prefill = request.num_computed_tokens < request.num_prompt_tokens
-            if is_prefill and prefill_token_budget is not None:
-                running_prefill_budget = prefill_token_budget - reserved_prefill
-                if running_prefill_budget == 0:
                     req_index += 1
                     continue
-                num_new_tokens = min(num_new_tokens, running_prefill_budget)
-            num_new_tokens = min(num_new_tokens, token_budget)
 
-            num_new_tokens = limit_prefill(request.request_id, num_new_tokens)
+                if self.current_step < request.next_decode_eligible_step:
+                    req_index += 1
+                    continue
 
-            # Make sure the input position does not exceed the max model len.
-            # This is necessary when using spec decoding.
-            num_new_tokens = min(
-                num_new_tokens, self.max_model_len - 1 - request.num_computed_tokens
-            )
-
-            # Schedule encoder inputs.
-            encoder_inputs_to_schedule = None
-            external_load_encoder_input: list[int] = []
-            new_encoder_compute_budget = encoder_compute_budget
-            if request.has_encoder_inputs:
-                (
-                    encoder_inputs_to_schedule,
-                    num_new_tokens,
-                    new_encoder_compute_budget,
-                    external_load_encoder_input,
-                ) = self._try_schedule_encoder_inputs(
-                    request,
-                    request.num_computed_tokens,
-                    num_new_tokens,
-                    encoder_compute_budget,
-                    shift_computed_tokens=1 if self.use_eagle else 0,
-                )
-
-            if self.need_mamba_block_aligned_split:
-                num_new_tokens = self._mamba_block_aligned_split(
-                    request, num_new_tokens
-                )
-            if ddtree_payload_for_tree_schedule is not None:
-                flat_len = len(request.spec_token_ids)
-                tree_len = len(
-                    getattr(ddtree_payload_for_tree_schedule, "tree_token_ids", ())
-                )
-                num_scheduled_spec_tokens = (
-                    num_new_tokens
-                    + request.num_computed_tokens
-                    - request.num_tokens
+                if (
+                    request.num_output_placeholders > 0
+                    # This is (num_computed_tokens + 1) - (num_output_placeholders - 1).
+                    # Subtract the draft placeholders so the check can stop
+                    # even when none of the previously drafted tokens survive.
+                    and request.num_computed_tokens
+                    + 2
                     - request.num_output_placeholders
+                    >= request.num_prompt_tokens + request.max_tokens
+                ):
+                    # The previous step has reached max_tokens. Avoid an extra
+                    # step and keep the uniform draft width.
+                    req_index += 1
+                    continue
+
+                num_new_tokens = self._num_new_tokens_with_spec(request)
+                ddtree_payload_for_tree_schedule = (
+                    self._ddtree_payload_for_tree_schedule(request)
                 )
-                if num_scheduled_spec_tokens not in (flat_len, tree_len):
+                ddtree_payload_fits_output_budget = True
+                if ddtree_payload_for_tree_schedule is not None:
+                    flat_len = len(request.spec_token_ids)
+                    tree_len = len(
+                        getattr(ddtree_payload_for_tree_schedule, "tree_token_ids", ())
+                    )
+                    tree_num_new_tokens = num_new_tokens + max(0, tree_len - flat_len)
+                    tree_max_output_tokens = self._ddtree_payload_max_output_tokens(
+                        ddtree_payload_for_tree_schedule
+                    )
+                    remaining_output_tokens = self._remaining_output_tokens(request)
+                    threshold = long_prefill_token_threshold
+                    max_len_tokens = (
+                        self.max_model_len - 1 - request.num_computed_tokens
+                    )
                     _ddtree_debug_log(
-                        "schedule restoring flat req=%s scheduled_spec=%d "
-                        "flat_len=%d tree_len=%d num_new_before=%d",
+                        "schedule candidate req=%s base_new=%d tree_new=%d "
+                        "flat_len=%d tree_len=%d token_budget=%d threshold=%d "
+                        "max_len_tokens=%d remaining_output=%d tree_max_output=%d",
                         request.request_id,
-                        num_scheduled_spec_tokens,
+                        num_new_tokens,
+                        tree_num_new_tokens,
                         flat_len,
                         tree_len,
-                        num_new_tokens,
+                        token_budget,
+                        threshold,
+                        max_len_tokens,
+                        remaining_output_tokens,
+                        tree_max_output_tokens,
                     )
-                    num_new_tokens -= num_scheduled_spec_tokens - flat_len
-
-            if num_new_tokens == 0:
-                # The request cannot be scheduled because one of the following
-                # reasons:
-                # 1. No new tokens to schedule. This may happen when
-                #    (1) PP>1 and we have already scheduled all prompt tokens
-                #    but they are not finished yet.
-                #    (2) Async scheduling and the request has reached to either
-                #    its max_total_tokens or max_model_len.
-                # 2. The encoder budget is exhausted.
-                # 3. The encoder cache is exhausted.
-                # 4. Insufficient budget for a block-aligned chunk in hybrid
-                #    models with mamba cache mode \"align\".
-                # NOTE(woosuk): Here, by doing `continue` instead of `break`,
-                # we do not strictly follow the FCFS scheduling policy and
-                # allow the lower-priority requests to be scheduled.
-                req_index += 1
-                continue
-
-            # Schedule newly needed KV blocks for the request.
-            with record_function_or_nullcontext("schedule: allocate_slots"):
-                while True:
-                    new_blocks = self.kv_cache_manager.allocate_slots(
-                        request,
-                        num_new_tokens,
-                        num_lookahead_tokens=self.num_lookahead_tokens,
+                    ddtree_payload_fits_output_budget = (
+                        tree_max_output_tokens <= remaining_output_tokens
                     )
-
-                    if new_blocks is not None:
-                        # The request can be scheduled.
-                        break
-
-                    # The request cannot be scheduled.
-                    victim = (
-                        max(self.running, key=lambda r: (r.priority, r.arrival_time))
-                        if self.policy == SchedulingPolicy.PRIORITY
-                        else self.running[-1]
-                    )
-                    if victim is request and self._reclaim_idle_sessions(
-                        request, scheduled_timestamp, holders=True, beside=request
+                    if (
+                        tree_len > flat_len
+                        and ddtree_payload_fits_output_budget
+                        and (threshold <= 0 or tree_num_new_tokens <= threshold)
+                        and tree_num_new_tokens <= token_budget
+                        and tree_num_new_tokens <= max_len_tokens
                     ):
-                        # Long-context: rather than preempting itself, the
-                        # last runnable request recomputes an idle KV holder.
-                        continue
-                    # Preempt the lowest-priority request.
-                    if self.policy == SchedulingPolicy.PRIORITY:
-                        preempted_req = max(
-                            self.running,
-                            key=lambda r: (r.priority, r.arrival_time),
+                        num_new_tokens = tree_num_new_tokens
+                        _ddtree_debug_log(
+                            "schedule expanded req=%s num_new=%d",
+                            request.request_id,
+                            num_new_tokens,
                         )
-                        self.running.remove(preempted_req)
+                if 0 < long_prefill_token_threshold < num_new_tokens:
+                    num_new_tokens = long_prefill_token_threshold
+                is_prefill = request.num_computed_tokens < request.num_prompt_tokens
+                if is_prefill and prefill_token_budget is not None:
+                    if prefill_token_budget == 0:
+                        req_index += 1
+                        continue
+                    num_new_tokens = min(num_new_tokens, prefill_token_budget)
+                num_new_tokens = min(num_new_tokens, token_budget)
+
+                num_new_tokens = limit_prefill(request.request_id, num_new_tokens)
+
+                # Make sure the input position does not exceed the max model len.
+                # This is necessary when using spec decoding.
+                num_new_tokens = min(
+                    num_new_tokens, self.max_model_len - 1 - request.num_computed_tokens
+                )
+
+                # Schedule encoder inputs.
+                encoder_inputs_to_schedule = None
+                external_load_encoder_input: list[int] = []
+                new_encoder_compute_budget = encoder_compute_budget
+                if request.has_encoder_inputs:
+                    (
+                        encoder_inputs_to_schedule,
+                        num_new_tokens,
+                        new_encoder_compute_budget,
+                        external_load_encoder_input,
+                    ) = self._try_schedule_encoder_inputs(
+                        request,
+                        request.num_computed_tokens,
+                        num_new_tokens,
+                        encoder_compute_budget,
+                        shift_computed_tokens=1 if self.use_eagle else 0,
+                    )
+
+                if self.need_mamba_block_aligned_split:
+                    num_new_tokens = self._mamba_block_aligned_split(
+                        request, num_new_tokens
+                    )
+                if ddtree_payload_for_tree_schedule is not None:
+                    flat_len = len(request.spec_token_ids)
+                    tree_len = len(
+                        getattr(ddtree_payload_for_tree_schedule, "tree_token_ids", ())
+                    )
+                    num_scheduled_spec_tokens = (
+                        num_new_tokens
+                        + request.num_computed_tokens
+                        - request.num_tokens
+                        - request.num_output_placeholders
+                    )
+                    if num_scheduled_spec_tokens not in (flat_len, tree_len):
+                        _ddtree_debug_log(
+                            "schedule restoring flat req=%s scheduled_spec=%d "
+                            "flat_len=%d tree_len=%d num_new_before=%d",
+                            request.request_id,
+                            num_scheduled_spec_tokens,
+                            flat_len,
+                            tree_len,
+                            num_new_tokens,
+                        )
+                        num_new_tokens -= num_scheduled_spec_tokens - flat_len
+
+                if num_new_tokens == 0:
+                    # The request cannot be scheduled because one of the following
+                    # reasons:
+                    # 1. No new tokens to schedule. This may happen when
+                    #    (1) PP>1 and we have already scheduled all prompt tokens
+                    #    but they are not finished yet.
+                    #    (2) Async scheduling and the request has reached to either
+                    #    its max_total_tokens or max_model_len.
+                    # 2. The encoder budget is exhausted.
+                    # 3. The encoder cache is exhausted.
+                    # 4. Insufficient budget for a block-aligned chunk in hybrid
+                    #    models with mamba cache mode \"align\".
+                    # NOTE(woosuk): Here, by doing `continue` instead of `break`,
+                    # we do not strictly follow the FCFS scheduling policy and
+                    # allow the lower-priority requests to be scheduled.
+                    req_index += 1
+                    continue
+
+                # Schedule newly needed KV blocks for the request.
+                with record_function_or_nullcontext("schedule: allocate_slots"):
+                    while True:
+                        new_blocks = self.kv_cache_manager.allocate_slots(
+                            request,
+                            num_new_tokens,
+                            num_lookahead_tokens=self.num_lookahead_tokens,
+                        )
+
+                        if new_blocks is not None:
+                            # The request can be scheduled.
+                            break
+                        if scheduled_new_reqs or scheduled_resumed_reqs:
+                            # A short prefill already acquired its blocks this step.
+                            break
+
+                        # The request cannot be scheduled.
+                        victim = (
+                            max(
+                                self.running, key=lambda r: (r.priority, r.arrival_time)
+                            )
+                            if self.policy == SchedulingPolicy.PRIORITY
+                            else self.running[-1]
+                        )
+                        if victim is request and self._reclaim_idle_sessions(
+                            request, scheduled_timestamp, holders=True, beside=request
+                        ):
+                            # Long-context: rather than preempting itself, the
+                            # last runnable request recomputes an idle KV holder.
+                            continue
+                        # Preempt the lowest-priority request. A victim
+                        # may already have been scheduled in the decode pass.
+                        victim_index = len(self.running) - 1
+                        if self.policy == SchedulingPolicy.PRIORITY:
+                            preempted_req = max(
+                                self.running,
+                                key=lambda r: (r.priority, r.arrival_time),
+                            )
+                            victim_index = self.running.index(preempted_req)
+                            self.running.pop(victim_index)
+                        else:
+                            preempted_req = self.running.pop()
                         if preempted_req in scheduled_running_reqs:
                             preempted_req_id = preempted_req.request_id
                             scheduled_running_reqs.remove(preempted_req)
@@ -1163,138 +1124,185 @@ class Scheduler(SchedulerInterface):
                                     for i in preempted_encoder_inputs
                                 )
                                 encoder_compute_budget += num_embeds_to_restore
-                            req_index -= 1
-                    else:
-                        preempted_req = self.running.pop()
+                            if victim_index < req_index:
+                                req_index -= 1
+                        self._preempt_request(preempted_req, scheduled_timestamp)
+                        preempted_reqs.append(preempted_req)
+                        if preempted_req == request:
+                            # No more request to preempt. Cannot schedule this request.
+                            break
 
-                    self._preempt_request(preempted_req, scheduled_timestamp)
-                    preempted_reqs.append(preempted_req)
-                    if preempted_req == request:
-                        # No more request to preempt. Cannot schedule this request.
-                        break
+                if new_blocks is None:
+                    # Cannot schedule this request.
+                    break
 
-            if new_blocks is None:
-                # Cannot schedule this request.
-                break
-
-            # Schedule the request.
-            scheduled_running_reqs.append(request)
-            request_id = request.request_id
-            req_to_new_blocks[request_id] = new_blocks
-            num_scheduled_tokens[request_id] = num_new_tokens
-            token_budget -= num_new_tokens
-            if is_prefill and prefill_token_budget is not None:
-                prefill_token_budget -= num_new_tokens
-            req_index += 1
-            drafts_needed = drafts_needed or not self._drafts_unused(
-                request, request.num_computed_tokens, num_new_tokens
-            )
-
-            # Speculative decode related.
-            if request.spec_token_ids:
-                num_scheduled_spec_tokens = (
-                    num_new_tokens
-                    + request.num_computed_tokens
-                    - request.num_tokens
-                    - request.num_output_placeholders
+                # Schedule the request.
+                scheduled_running_reqs.append(request)
+                request_id = request.request_id
+                req_to_new_blocks[request_id] = new_blocks
+                num_scheduled_tokens[request_id] = num_new_tokens
+                token_budget -= num_new_tokens
+                if is_prefill and prefill_token_budget is not None:
+                    prefill_token_budget -= num_new_tokens
+                req_index += 1
+                drafts_needed = drafts_needed or not self._drafts_unused(
+                    request, request.num_computed_tokens, num_new_tokens
                 )
-                if num_scheduled_spec_tokens > 0:
-                    ddtree_payload = self._ddtree_payload_for_tree_schedule(request)
-                    ddtree_tree_token_ids = (
-                        getattr(ddtree_payload, "tree_token_ids", ())
-                        if ddtree_payload is not None
-                        else ()
+
+                # Speculative decode related.
+                if request.spec_token_ids:
+                    num_scheduled_spec_tokens = (
+                        num_new_tokens
+                        + request.num_computed_tokens
+                        - request.num_tokens
+                        - request.num_output_placeholders
                     )
-                    if (
-                        ddtree_payload is not None
-                        and ddtree_payload_fits_output_budget
-                        and num_scheduled_spec_tokens == len(ddtree_tree_token_ids)
-                    ):
-                        spec_token_ids = list(ddtree_tree_token_ids)
-                        scheduled_ddtree_payloads[request_id] = ddtree_payload
-                        _ddtree_debug_log(
-                            "scheduled tree req=%s spec_len=%d",
-                            request_id,
-                            len(spec_token_ids),
+                    if num_scheduled_spec_tokens > 0:
+                        ddtree_payload = self._ddtree_payload_for_tree_schedule(request)
+                        ddtree_tree_token_ids = (
+                            getattr(ddtree_payload, "tree_token_ids", ())
+                            if ddtree_payload is not None
+                            else ()
                         )
-                    else:
-                        spec_token_ids = list(
-                            request.spec_token_ids[:num_scheduled_spec_tokens]
+                        if (
+                            ddtree_payload is not None
+                            and ddtree_payload_fits_output_budget
+                            and num_scheduled_spec_tokens == len(ddtree_tree_token_ids)
+                        ):
+                            spec_token_ids = list(ddtree_tree_token_ids)
+                            scheduled_ddtree_payloads[request_id] = ddtree_payload
+                            _ddtree_debug_log(
+                                "scheduled tree req=%s spec_len=%d",
+                                request_id,
+                                len(spec_token_ids),
+                            )
+                        else:
+                            spec_token_ids = list(
+                                request.spec_token_ids[:num_scheduled_spec_tokens]
+                            )
+                            _ddtree_debug_log(
+                                "scheduled flat req=%s spec_len=%d tree_len=%d",
+                                request_id,
+                                len(spec_token_ids),
+                                len(ddtree_tree_token_ids),
+                            )
+                        scheduled_spec_decode_tokens[request.request_id] = (
+                            spec_token_ids
                         )
-                        _ddtree_debug_log(
-                            "scheduled flat req=%s spec_len=%d tree_len=%d",
-                            request_id,
-                            len(spec_token_ids),
-                            len(ddtree_tree_token_ids),
-                        )
-                    scheduled_spec_decode_tokens[request.request_id] = spec_token_ids
-                    if (
-                        ddtree_payload is not None
-                        and ddtree_payload_fits_output_budget
-                        and tuple(spec_token_ids)
-                        == getattr(ddtree_payload, "flat_draft_token_ids", ())
-                    ):
-                        scheduled_ddtree_payloads[request_id] = ddtree_payload
+                        if (
+                            ddtree_payload is not None
+                            and ddtree_payload_fits_output_budget
+                            and tuple(spec_token_ids)
+                            == getattr(ddtree_payload, "flat_draft_token_ids", ())
+                        ):
+                            scheduled_ddtree_payloads[request_id] = ddtree_payload
 
-                # New spec tokens will be set in `update_draft_token_ids` before the
-                # next step when applicable.
-                request.spec_token_ids = []
-                self.ddtree_payloads_by_req_id.pop(request_id, None)
+                    # New spec tokens will be set in `update_draft_token_ids` before the
+                    # next step when applicable.
+                    request.spec_token_ids = []
+                    self.ddtree_payloads_by_req_id.pop(request_id, None)
 
-            # Encoder-related.
-            if encoder_inputs_to_schedule:
-                scheduled_encoder_inputs[request_id] = encoder_inputs_to_schedule
-                # Allocate the encoder cache.
-                for i in encoder_inputs_to_schedule:
-                    self.encoder_cache_manager.allocate(request, i)
-                    if self.ec_connector is not None:
-                        self.ec_connector.update_state_after_alloc(request, i)
-                encoder_compute_budget = new_encoder_compute_budget
-            if external_load_encoder_input:
-                for i in external_load_encoder_input:
-                    self.encoder_cache_manager.allocate(request, i)
-                    if self.ec_connector is not None:
-                        self.ec_connector.update_state_after_alloc(request, i)
+                # Encoder-related.
+                if encoder_inputs_to_schedule:
+                    scheduled_encoder_inputs[request_id] = encoder_inputs_to_schedule
+                    # Allocate the encoder cache.
+                    for i in encoder_inputs_to_schedule:
+                        self.encoder_cache_manager.allocate(request, i)
+                        if self.ec_connector is not None:
+                            self.ec_connector.update_state_after_alloc(request, i)
+                    encoder_compute_budget = new_encoder_compute_budget
+                if external_load_encoder_input:
+                    for i in external_load_encoder_input:
+                        self.encoder_cache_manager.allocate(request, i)
+                        if self.ec_connector is not None:
+                            self.ec_connector.update_state_after_alloc(request, i)
 
-        # Record the LoRAs in scheduled_running_reqs
-        scheduled_loras: set[int] = set()
-        if self.lora_config:
-            scheduled_loras = set(
-                req.lora_request.lora_int_id
-                for req in scheduled_running_reqs
-                if req.lora_request and req.lora_request.lora_int_id > 0
-            )
-            assert len(scheduled_loras) <= self.lora_config.max_loras
+        short_lookups: set[str] = set()
+        unavailable_connectors: set[str] = set()
 
-        # Next, schedule the WAITING requests.
-        if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
+        def schedule_waiting(
+            *, short_only: bool = False, allow_prefill: bool = True
+        ) -> None:
+            nonlocal token_budget, prefill_token_budget
+            nonlocal drafts_needed, encoder_compute_budget
+            if preempted_reqs or self._pause_state != PauseState.UNPAUSED:
+                return
+            scheduled_loras: set[int] = set()
+            if self.lora_config:
+                batch = (
+                    self.running
+                    if short_only
+                    else itertools.chain(
+                        scheduled_running_reqs,
+                        scheduled_new_reqs,
+                        scheduled_resumed_reqs,
+                    )
+                )
+                scheduled_loras = {
+                    req.lora_request.lora_int_id
+                    for req in batch
+                    if req.lora_request and req.lora_request.lora_int_id > 0
+                }
+                if not short_only:
+                    assert len(scheduled_loras) <= self.lora_config.max_loras
             step_skipped_waiting = create_request_queue(self.policy)
             # Wait exits : once the queue head cannot allocate,
             # waiting requests that already hold KV (completed async loads,
             # re-queued sessions) go first, so they finish and release it.
             holders_only = False
-            pop_waiting_request: Callable[[], Request | None]
+            short_waiters = iter(
+                [
+                    (queue, request)
+                    for queue in (self.skipped_waiting, self.waiting)
+                    for request in queue
+                ]
+                if short_only
+                else ()
+            )
+
+            def defer_waiting(
+                request: Request, remove: Callable[[], Request | None]
+            ) -> None:
+                if not short_only:
+                    remove()
+                    step_skipped_waiting.prepend_request(request)
+
+            def discard_waiting_lookup(request_id: str) -> None:
+                self.kv_cache_manager.coordinator.exact_end.discard_hit(request_id)
+                if (host_hits := self.kv_cache_manager.host_kv_hits) is not None:
+                    host_hits.release_lookup(request_id)
+                offload = getattr(self.connector, "connector_scheduler", None)
+                if (store := getattr(offload, "unified", None)) is not None:
+                    store.release_lookup(request_id)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
 
-                short_prefill = bool(short_prefills)
-                if short_prefill:
-                    request_queue, request, planned_uncached = short_prefills.popleft()
+                pop_waiting_request: Callable[[], Request | None]
+                if short_only:
+                    assert prefill_token_budget is not None
+                    if not prefill_token_budget:
+                        break
+                    candidate = next(short_waiters, None)
+                    if candidate is None:
+                        break
+                    request_queue, request = candidate
                     pop_waiting_request = partial(request_queue.remove_request, request)
                 else:
                     selected_queue = self._select_waiting_queue_for_scheduling()
                     assert selected_queue is not None
                     request_queue = selected_queue
                     request = request_queue.peek_request()
-                    planned_uncached = 0
                     pop_waiting_request = request_queue.pop_request
                 request_id = request.request_id
 
+                if not short_only and request_id in unavailable_connectors:
+                    defer_waiting(request, pop_waiting_request)
+                    continue
+
                 if holders_only and not self._is_waiting_kv_holder(request):
-                    pop_waiting_request()
-                    step_skipped_waiting.prepend_request(request)
+                    defer_waiting(request, pop_waiting_request)
                     continue
 
                 # try to promote blocked statuses while traversing skipped queue.
@@ -1306,8 +1314,7 @@ class Scheduler(SchedulerInterface):
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
                             request_id,
                         )
-                    pop_waiting_request()
-                    step_skipped_waiting.prepend_request(request)
+                    defer_waiting(request, pop_waiting_request)
                     continue
 
                 # A parked KV load already holds blocks and a future runner
@@ -1321,8 +1328,7 @@ class Scheduler(SchedulerInterface):
                     )
                     >= self.max_num_running_reqs
                 ):
-                    pop_waiting_request()
-                    step_skipped_waiting.prepend_request(request)
+                    defer_waiting(request, pop_waiting_request)
                     continue
 
                 # Check that adding the request still respects the max_loras
@@ -1331,13 +1337,12 @@ class Scheduler(SchedulerInterface):
                     self.lora_config
                     and request.lora_request
                     and (
-                        len(scheduled_loras) == self.lora_config.max_loras
+                        len(scheduled_loras) >= self.lora_config.max_loras
                         and request.lora_request.lora_int_id not in scheduled_loras
                     )
                 ):
                     # Scheduling would exceed max_loras, skip.
-                    pop_waiting_request()
-                    step_skipped_waiting.prepend_request(request)
+                    defer_waiting(request, pop_waiting_request)
                     continue
 
                 num_external_computed_tokens = 0
@@ -1346,10 +1351,15 @@ class Scheduler(SchedulerInterface):
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
-                    if self.store_metrics is not None:
-                        self.store_metrics.begin_lookup(request)
-                    elif self.log_stats:
-                        request.prefix_cache_attempt += 1
+                    if request_id not in short_lookups:
+                        if self.store_metrics is not None:
+                            self.store_metrics.begin_lookup(request)
+                        elif self.log_stats:
+                            request.prefix_cache_attempt += 1
+                    if short_only:
+                        short_lookups.add(request_id)
+                    else:
+                        short_lookups.discard(request_id)
                     # Get locally-cached tokens.
                     new_computed_blocks, num_new_local_computed_tokens = (
                         self.kv_cache_manager.get_computed_blocks(request)
@@ -1396,6 +1406,9 @@ class Scheduler(SchedulerInterface):
                             ext_tokens, load_kv_async = 0, False
 
                         if ext_tokens is None:
+                            if short_only:
+                                unavailable_connectors.add(request_id)
+                                discard_waiting_lookup(request_id)
                             if self.store_metrics is not None:
                                 self.store_metrics.lookup(
                                     request,
@@ -1413,8 +1426,7 @@ class Scheduler(SchedulerInterface):
                             # The request cannot be scheduled because
                             # the KVConnector couldn't determine
                             # the number of matched tokens.
-                            pop_waiting_request()
-                            step_skipped_waiting.prepend_request(request)
+                            defer_waiting(request, pop_waiting_request)
                             continue
 
                         num_external_computed_tokens = ext_tokens
@@ -1470,8 +1482,26 @@ class Scheduler(SchedulerInterface):
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
 
+                prefill_remaining[request_id] = max(
+                    0,
+                    max(request.num_prompt_tokens, request.num_tokens - 1)
+                    - num_computed_tokens,
+                )
+                if short_only:
+                    assert prefill_token_budget is not None
+                    available = limit_prefill(
+                        request_id, min(prefill_token_budget, token_budget)
+                    )
+                    if (
+                        load_kv_async
+                        or num_computed_tokens >= request.num_prompt_tokens
+                        or request.num_tokens - num_computed_tokens > available
+                    ):
+                        discard_waiting_lookup(request_id)
+                        continue
+
                 encoder_inputs_to_schedule = None
-                external_load_encoder_input = []
+                external_load_encoder_input: list[int] = []
                 new_encoder_compute_budget = encoder_compute_budget
 
                 if load_kv_async:
@@ -1484,10 +1514,6 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
-                    # The tentative prefix may have been evicted while charging
-                    # running requests. Leave it in the normal queue in that case.
-                    if short_prefill and num_new_tokens > planned_uncached:
-                        continue
                     if 0 < long_prefill_token_threshold < num_new_tokens:
                         num_new_tokens = long_prefill_token_threshold
 
@@ -1505,21 +1531,19 @@ class Scheduler(SchedulerInterface):
                     num_new_tokens = min(num_new_tokens, token_budget)
                     is_prefill = num_computed_tokens < request.num_prompt_tokens
                     if is_prefill and prefill_token_budget is not None:
-                        num_new_tokens = min(num_new_tokens, prefill_token_budget)
+                        budget = prefill_token_budget if allow_prefill else 0
+                        num_new_tokens = min(num_new_tokens, budget)
                         if num_new_tokens == 0:
                             self._store_retry(request, "budget", scheduled_timestamp)
-                            pop_waiting_request()
-                            step_skipped_waiting.prepend_request(request)
+                            defer_waiting(request, pop_waiting_request)
                             continue
                     assert num_new_tokens > 0
-                    prefill_remaining[request.request_id] = max(
-                        0,
-                        max(request.num_prompt_tokens, request.num_tokens - 1)
-                        - num_computed_tokens,
-                    )
                     num_new_tokens = limit_prefill(request.request_id, num_new_tokens)
                     if num_new_tokens == 0:
                         self._store_retry(request, "budget", scheduled_timestamp)
+                        if short_only:
+                            discard_waiting_lookup(request_id)
+                            continue
                         break
 
                     # Schedule encoder inputs.
@@ -1539,6 +1563,9 @@ class Scheduler(SchedulerInterface):
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
                             self._store_retry(request, "budget", scheduled_timestamp)
+                            if short_only:
+                                discard_waiting_lookup(request_id)
+                                continue
                             break
 
                 # Skip block alignment when setting up async receive (no local work).
@@ -1551,6 +1578,9 @@ class Scheduler(SchedulerInterface):
                     )
                     if num_new_tokens == 0:
                         self._store_retry(request, "budget", scheduled_timestamp)
+                        if short_only:
+                            discard_waiting_lookup(request_id)
+                            continue
                         break
 
                 # Handles an edge case when P/D Disaggregation
@@ -1648,6 +1678,9 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
+                    if short_only:
+                        discard_waiting_lookup(request_id)
+                        continue
                     if self._reclaim_waiting_hot_reservations(
                         request, scheduled_timestamp
                     ):
@@ -1790,6 +1823,36 @@ class Scheduler(SchedulerInterface):
                 # Every KV holder was refused too and nothing runs: recompute
                 # one holder so the next step can make progress .
                 self._reclaim_idle_sessions(None, scheduled_timestamp, holders=True)
+
+        # In FCFS under fixed pressure, charge decode before admitting short
+        # prefills. Charge only rows actually admitted, including alignment.
+        short_first = bool(
+            prefill_token_budget
+            and self.policy == SchedulingPolicy.FCFS
+            and self._pause_state == PauseState.UNPAUSED
+            and (self.waiting or self.skipped_waiting)
+        )
+        running_prefill = short_first and any(
+            req.num_computed_tokens < req.num_prompt_tokens for req in self.running
+        )
+        if short_first:
+            schedule_running(decode_only=True)
+            schedule_waiting(short_only=True)
+        schedule_running()
+        schedule_waiting(
+            allow_prefill=not (
+                running_prefill and (scheduled_new_reqs or scheduled_resumed_reqs)
+            )
+        )
+        if short_first:
+            # The order of allocation need not change the worker's row order.
+            running_order = {req: index for index, req in enumerate(self.running)}
+            scheduled_running_reqs.sort(key=running_order.__getitem__)
+            num_scheduled_tokens = {
+                req.request_id: num_scheduled_tokens[req.request_id]
+                for req in self.running
+                if req.request_id in num_scheduled_tokens
+            }
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())

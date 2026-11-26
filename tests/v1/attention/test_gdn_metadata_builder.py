@@ -510,6 +510,56 @@ def test_sm70_flashqla_prefill_route(
     assert torch.all(kv_cache[1][metadata.non_spec_state_indices_tensor] == 1)
 
 
+@pytest.mark.parametrize("method", ["dflash", "mtp"])
+@pytest.mark.parametrize("cache_mode", ["none", "align"])
+def test_sm70_original_prefill_mixed_varlen_chunk_metadata(
+    monkeypatch, local_gdn_model, method, cache_mode
+):
+    monkeypatch.setenv("VLLM_SM70_FLASHQLA_ORIGINAL_PREFILL", "1")
+    builder = _create_gdn_builder(
+        local_gdn_model,
+        num_speculative_tokens=4,
+        speculative_method=method,
+        mamba_cache_mode=cache_mode,
+    )
+    builder.gdn_prefill_backend = "flashqla_sm70"
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[192, 40, 48, 72, 64], query_lens=[192, 1, 8, 72, 4]),
+        BLOCK_SIZE,
+        DEVICE,
+    )
+    # Align mode reserves additional state slots for speculative tokens.
+    common.block_table_tensor = torch.nn.functional.pad(
+        common.block_table_tensor, (0, builder.num_spec_state_tokens)
+    )
+    draft_counts = torch.tensor([-1, -1, -1, -1, 3], dtype=torch.int32)
+    metadata = builder.build(
+        common_prefix_len=0,
+        common_attn_metadata=common,
+        num_decode_draft_tokens_cpu=draft_counts,
+        num_accepted_tokens=torch.ones(5, dtype=torch.int32),
+        common_gdn_metadata=compute_common_gdn_attn_metadata(
+            num_decode_draft_tokens_cpu=draft_counts,
+            query_start_loc=common.query_start_loc,
+            query_start_loc_cpu=common.query_start_loc_cpu,
+            num_spec_state_tokens=builder.num_spec_state_tokens,
+            legacy_mixed_decode_routing=False,
+        ),
+    )
+    assert metadata.non_spec_query_start_loc.tolist() == [0, 192, 193, 201, 273]
+    assert metadata.chunk_offsets.tolist() == [0, 3, 4, 5, 7]
+    assert metadata.chunk_indices.tolist() == [
+        [0, 0],
+        [0, 1],
+        [0, 2],
+        [1, 0],
+        [2, 0],
+        [3, 0],
+        [3, 1],
+    ]
+    assert metadata.spec_query_start_loc.tolist() == [0, 4]
+
+
 def _assert_gdn_metadata_equal(
     actual: GDNAttentionMetadata,
     expected: GDNAttentionMetadata,

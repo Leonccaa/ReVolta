@@ -813,6 +813,7 @@ if TYPE_CHECKING:
     VLLM_SM70_GDN_CHUNK_O_WARPS: str | None = None
     VLLM_SM70_GDN_CHUNK_O_STAGES: str | None = None
     VLLM_SM70_GDN_LEGACY_PREFILL_PREP: bool = False
+    VLLM_SM70_GDN_NATIVE_PREFILL: bool = False
     VLLM_SM70_GDN_Z_CONTIGUOUS: bool = False
     VLLM_SM70_QWEN_GDN_CONTEXT_CORE: bool = False
     VLLM_SM70_QWEN_GDN_FULL_FORWARD: bool = False
@@ -12566,6 +12567,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="tuning",
         declared_default="None",
         effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_GDN_NATIVE_PREFILL": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_GDN_NATIVE_PREFILL", "0"))),
+        description="Reserved switch for the experimental SM70 GDN prefill kernel.",
+        category="tuning",
+        declared_default="False",
+        effective_default="False",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
         user_visible=False,

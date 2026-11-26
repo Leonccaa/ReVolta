@@ -36,6 +36,14 @@ _LOOKUP = (
 )
 
 NOTES: dict[str, dict[str, str]] = {
+    "VLLM_SM70_GDN_NATIVE_PREFILL": dict(
+        section="research",
+        since="0.2.0rc16",
+        range="0, 1",
+        tradeoff="Reserved for the native GDN prefill candidate. The kernel is "
+        "not connected or validated, so this setting currently has no effect.",
+        metrics="",
+    ),
     "VLLM_SM70_MTP_Q8_PREFILL_MMQ": dict(
         section="profile",
         since="0.2.0rc15",

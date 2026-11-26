@@ -1440,6 +1440,123 @@ def test_mtp_dynamic_schedule_refines_the_planar_kv_reserve(
     assert os.environ[GRAPH_RESERVE] == (override or "705")
 
 
+@pytest.mark.parametrize(
+    ("quantization", "num_drafts", "schedule", "expected"),
+    [
+        ("awq", 4, [(1, 3, 4), (4, 8, 3)], "705"),
+        ("awq", 5, [(1, 3, 5), (4, 8, 4)], "800"),
+        # The verify graphs reach the global draft count whatever the
+        # schedule lists, so a K5 model with a K4 schedule still needs 800.
+        ("awq", 5, [(1, 8, 4)], "800"),
+        ("modelopt_fp4", 4, [(1, 3, 4), (4, 8, 3)], "705"),
+        ("modelopt_fp4", 5, [(1, 3, 5), (4, 8, 4)], "800"),
+    ],
+)
+def test_mtp_dynamic_schedule_widens_the_reserve_at_five_drafts(
+    profile, quantization, num_drafts, schedule, expected
+):
+    # NVFP4 + MTP5 planar DSD measured 0.73 GiB per rank on TP4.
+    assert profile.apply_revolta_profile(
+        model(quantization),
+        4,
+        is_sm70=True,
+        speculative_method="mtp",
+        kv_cache_dtype="fp8_per_token_head",
+        num_speculative_tokens_per_batch_size=schedule,
+        num_speculative_tokens=num_drafts,
+    )
+    assert os.environ[GRAPH_RESERVE] == expected
+
+
+def test_wide_mtp_schedule_keeps_the_explicit_reserve(profile, monkeypatch):
+    monkeypatch.setenv(GRAPH_RESERVE, "750")
+    assert profile.apply_revolta_profile(
+        model(),
+        4,
+        is_sm70=True,
+        speculative_method="mtp",
+        kv_cache_dtype="fp8_per_token_head",
+        num_speculative_tokens_per_batch_size=[(1, 3, 5), (4, 8, 4)],
+        num_speculative_tokens=5,
+    )
+    assert os.environ[GRAPH_RESERVE] == "750"
+
+
+@pytest.mark.parametrize(
+    ("quantization", "latency_ms", "expected"),
+    [
+        ("awq", 0, "1000"),
+        ("awq", 250, "1150"),
+        ("awq", 500, "1150"),
+        # The target adds prefill-width graphs only to the AWQ DFlash planar
+        # pool we measured (1094/1094/1074/1094 MiB); every other tier is
+        # unchanged until measured.
+        ("modelopt_fp4", 0, "1024"),
+        ("modelopt_fp4", 250, "1024"),
+    ],
+)
+def test_graph_reserve_follows_the_mixed_prefill_latency_target(
+    profile, quantization, latency_ms, expected
+):
+    assert profile.apply_revolta_profile(
+        model(quantization),
+        4,
+        is_sm70=True,
+        speculative_method="dflash",
+        kv_cache_dtype="fp8_per_token_head",
+        mixed_prefill_step_latency_ms=latency_ms,
+    )
+    assert os.environ[GRAPH_RESERVE] == expected
+
+
+def test_mixed_prefill_target_only_applies_to_planar_dflash(profile):
+    # Non-planar AWQ DFlash keeps 1200 (measured pool about 1.13 GiB), and
+    # MTP's planar tier ignores the target.
+    assert profile.apply_revolta_profile(
+        model(),
+        4,
+        is_sm70=True,
+        speculative_method="dflash",
+        kv_cache_dtype="fp8_e4m3",
+        mixed_prefill_step_latency_ms=250,
+    )
+    assert os.environ[GRAPH_RESERVE] == "1200"
+    os.environ.pop(GRAPH_RESERVE)
+    assert profile.apply_revolta_profile(
+        model(),
+        4,
+        is_sm70=True,
+        speculative_method="mtp",
+        kv_cache_dtype="int8",
+        mixed_prefill_step_latency_ms=250,
+    )
+    assert os.environ[GRAPH_RESERVE] == "600"
+
+
+def test_mixed_prefill_target_refines_the_awq_dflash_planar_reserve(profile):
+    # EngineArgs and the first VllmConfig call run before the scheduler target
+    # is passed; the second VllmConfig call raises only the profile value.
+    assert profile.apply_revolta_profile(
+        model(),
+        4,
+        is_sm70=True,
+        speculative_method="dflash",
+        kv_cache_dtype="int8",
+    )
+    assert os.environ[GRAPH_RESERVE] == "1000"
+    assert profile.apply_revolta_profile(
+        model(),
+        4,
+        is_sm70=True,
+        speculative_method="dflash",
+        kv_cache_dtype="int8",
+        mixed_prefill_step_latency_ms=250,
+    )
+    assert os.environ[GRAPH_RESERVE] == "1150"
+    row = json.loads(profile.profile_audit(enabled=True))["values"][GRAPH_RESERVE]
+    assert row == {"value": "1150", "source": "profile"}
+
+
 def test_dflash_leaves_every_other_default_alone(profile):
     assert profile.apply_revolta_profile(
         model(), 4, is_sm70=True, speculative_method="dflash"
@@ -1566,7 +1683,11 @@ def test_vllmconfig_profile_receives_the_speculative_method():
     assert refined[schedule_field] == (
         f"getattr(self.speculative_config, '{schedule_field}', None)"
     )
+    assert refined["mixed_prefill_step_latency_ms"] == (
+        "self.scheduler_config.mixed_prefill_step_latency_ms"
+    )
     assert "kv_cache_dtype" not in {k.arg for k in first.keywords}
+    assert "mixed_prefill_step_latency_ms" not in {k.arg for k in first.keywords}
 
 
 def test_speculative_draft_keeps_target_graph_reserve(profile, monkeypatch, tmp_path):

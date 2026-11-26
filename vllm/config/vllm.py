@@ -2032,6 +2032,12 @@ class VllmConfig:
                     "num_speculative_tokens_per_batch_size",
                     None,
                 ),
+                num_speculative_tokens=getattr(
+                    self.speculative_config, "num_speculative_tokens", None
+                ),
+                mixed_prefill_step_latency_ms=(
+                    self.scheduler_config.mixed_prefill_step_latency_ms
+                ),
             )
 
         self.try_verify_and_update_config()

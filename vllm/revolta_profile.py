@@ -79,10 +79,20 @@ AWQ_DFLASH_DEFAULTS = {"VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP": "1"}
 # headroom; GPU memory is the limit, so they stay tight. Other KV dtypes keep
 # the values above.
 AWQ_DFLASH_PLANAR_KV_DEFAULTS = {"VLLM_V2_CUDAGRAPH_MEM_MIB": "1000"}
+# The same AWQ profile with the mixed-prefill latency target enabled measured
+# 1094/1094/1074/1094 MiB per GPU, above that reserve (800 MiB when the target
+# is 0). The serving profile resolves the target to 0, so this tier applies
+# only when a positive target is set explicitly.
+AWQ_DFLASH_PLANAR_KV_MIXED_PREFILL_DEFAULTS = {"VLLM_V2_CUDAGRAPH_MEM_MIB": "1150"}
 NVFP4_DFLASH_PLANAR_KV_DEFAULTS = {"VLLM_V2_CUDAGRAPH_MEM_MIB": "1024"}
 MTP_PLANAR_KV_DEFAULTS = {"VLLM_V2_CUDAGRAPH_MEM_MIB": "600"}
 # Dynamic MTP captured 0.64 GiB per rank on AWQ TP4 with planar KV.
 MTP_DSD_PLANAR_KV_DEFAULTS = {"VLLM_V2_CUDAGRAPH_MEM_MIB": "705"}
+# NVFP4 + MTP5 planar DSD captured 0.73 GiB per rank on TP4, above that
+# reserve; the width-5 verify graphs need 800 MiB. Widths below 5 measured
+# within 705, so only a schedule whose widest captured graph reaches 5 moves.
+MTP_DSD_PLANAR_KV_WIDE_DEFAULTS = {"VLLM_V2_CUDAGRAPH_MEM_MIB": "800"}
+MTP_DSD_WIDE_MIN_K = 5
 PLANAR_KV_DTYPES = ("fp8_per_token_head", "int8")
 CUSTOM_AR_DEFAULTS = {"VLLM_SM70_CAR_VMM_SAFE": "1"}
 
@@ -343,6 +353,8 @@ def apply_revolta_profile(
     allow_shared_expert_overlap: bool = True,
     kv_cache_dtype: str | None = None,
     num_speculative_tokens_per_batch_size: list[tuple[int, int, int]] | None = None,
+    num_speculative_tokens: int | None = None,
+    mixed_prefill_step_latency_ms: float = 0,
 ) -> bool:
     """Apply before config defaults and before model/native module imports.
 
@@ -350,6 +362,9 @@ def apply_revolta_profile(
     Explicit environment overrides always win, including in no_p2p. A later
     call may refine a value this profile wrote (EngineArgs may not know the
     speculative method or the KV dtype that VllmConfig resolves).
+    Pass the resolved scheduler mixed-prefill step latency target only when it
+    is actually resolved; the default 0 selects the target-disabled graph tier
+    until the refining call.
     """
     import torch
 
@@ -364,11 +379,15 @@ def apply_revolta_profile(
     if not enabled:
         return False
     defaults = dict(COMMON_DEFAULTS)
-    mtp_planar_kv_defaults = (
-        MTP_DSD_PLANAR_KV_DEFAULTS
-        if num_speculative_tokens_per_batch_size is not None
-        else MTP_PLANAR_KV_DEFAULTS
-    )
+    mtp_planar_kv_defaults = MTP_PLANAR_KV_DEFAULTS
+    if num_speculative_tokens_per_batch_size is not None:
+        # The verify graphs are captured up to the global draft count; schedule
+        # entries only add narrower widths, so the global count sets the tier.
+        mtp_planar_kv_defaults = (
+            MTP_DSD_PLANAR_KV_WIDE_DEFAULTS
+            if (num_speculative_tokens or 0) >= MTP_DSD_WIDE_MIN_K
+            else MTP_DSD_PLANAR_KV_DEFAULTS
+        )
     if getattr(model_config, "quantization", None) == "awq":
         if _has_awq_qpn_shape(model_config, tensor_parallel_size):
             defaults.update(AWQ_DEFAULTS)
@@ -380,6 +399,8 @@ def apply_revolta_profile(
                     defaults.update(AWQ_DFLASH_DEFAULTS)
                 if kv_cache_dtype in PLANAR_KV_DTYPES:
                     defaults.update(AWQ_DFLASH_PLANAR_KV_DEFAULTS)
+                    if mixed_prefill_step_latency_ms > 0:
+                        defaults.update(AWQ_DFLASH_PLANAR_KV_MIXED_PREFILL_DEFAULTS)
             elif speculative_method == "mtp" and kv_cache_dtype in PLANAR_KV_DTYPES:
                 defaults.update(mtp_planar_kv_defaults)
     elif has_nvfp4_weights(model_config):

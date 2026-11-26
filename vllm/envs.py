@@ -13309,7 +13309,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "(envs.VLLM_SM70_QWEN38_FP16_GEMV or "
                 "envs.VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16 or "
                 "envs.VLLM_SM70_QWEN38_FUSED_HC_FP16) and "
-                "('VLLM_SM70_QWEN38_DUAL_COMPILE' not in os.environ); automatic "
+                "('VLLM_SM70_QWEN38_DUAL_COMPILE' not in os.environ); with "
+                "no speculative config it is skipped when the largest FULL "
+                "decode capture is a single token; automatic "
                 "defaults apply only when the environment override is absent."
             ),
         ),

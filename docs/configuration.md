@@ -179,7 +179,7 @@ The SM70 ReVolta profile for FP16-activation, TP4 QSA Flash-Next with AWQ or NVF
 
 | Option | Profile default | Effect |
 | --- | ---: | --- |
-| `--prefill-pressure-token-budget` | `448` | With chunked prefill enabled, caps the total prefill tokens in a step when decoding is runnable and at least one prefill is running or waiting (the default `--prefill-pressure-threshold` is `1`). |
+| `--prefill-pressure-token-budget` | `1024` | With chunked prefill enabled, caps the total prefill tokens in a step when decoding is runnable and at least one prefill is running or waiting (the default `--prefill-pressure-threshold` is `1`). |
 | `--mixed-prefill-step-latency-ms` | `0` | Disables adaptive GPU step latency control and keeps the standard CUDA Graph capture sizes. |
 
 ## Optional MTP draft vocabulary in model runner V2

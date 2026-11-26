@@ -1061,9 +1061,9 @@ def test_hybrid_serving_allocator_with_connector(
 @pytest.mark.parametrize(
     ("quantization", "method", "source", "overrides", "expected"),
     [
-        ("awq", "dflash", "cli", {}, (448, 1, 0)),
-        ("modelopt_fp4", "mtp", "yaml", {}, (448, 1, 0)),
-        ("awq", "qwen4_exp_mtp", "json", {}, (448, 1, 0)),
+        ("awq", "dflash", "cli", {}, (1024, 1, 0)),
+        ("modelopt_fp4", "mtp", "yaml", {}, (1024, 1, 0)),
+        ("awq", "qwen4_exp_mtp", "json", {}, (1024, 1, 0)),
         ("awq", None, "json", {}, (0, 1, 250)),
         ("awq", "mtp", "json", {"enable_chunked_prefill": False}, (0, 1, 0)),
         (

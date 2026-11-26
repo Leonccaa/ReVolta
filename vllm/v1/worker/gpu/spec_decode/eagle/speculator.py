@@ -490,6 +490,34 @@ class EagleSpeculator:
             hidden_states = ret_hidden_states
         return last_hidden_states, hidden_states
 
+    @torch.inference_mode()
+    def run_kv_only_prefill(
+        self,
+        num_tokens: int,
+        attn_metadata: dict[str, Any],
+        slot_mappings: dict[str, torch.Tensor],
+        num_tokens_across_dp: torch.Tensor | None,
+    ) -> bool:
+        fn = getattr(self.model, "forward_kv_only", None)
+        if fn is None:
+            return False
+        with set_forward_context(
+            attn_metadata,
+            self.vllm_config,
+            num_tokens=num_tokens,
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            num_tokens_across_dp=num_tokens_across_dp,
+            slot_mapping=slot_mappings,
+            batch_descriptor=BatchDescriptor(num_tokens=num_tokens),
+        ):
+            return bool(
+                fn(
+                    input_ids=self.input_buffers.input_ids[:num_tokens],
+                    positions=self.input_buffers.positions[:num_tokens],
+                    hidden_states=self.hidden_states[:num_tokens],
+                )
+            )
+
     def _validate_local_argmax_reduction(self) -> None:
         if not self.use_local_argmax_reduction:
             return
@@ -925,6 +953,27 @@ class EagleSpeculator:
         )
 
         self._mtp_prefill_begin()
+        if (
+            envs.VLLM_SM70_MTP_KV_ONLY_PREFILL
+            and self.method == "mtp"
+            and not dummy_run
+            and not is_profile
+            and not input_batch.is_dummy_batch
+            and input_batch.num_draft_tokens == 0
+            and mm_inputs is None
+            and prefill_batch_desc.cg_mode == CUDAGraphMode.NONE
+            and (incomplete_prefill := input_batch.is_incomplete_prefilling_np)
+            is not None
+            and incomplete_prefill.size == num_reqs
+            and np.all(incomplete_prefill)
+            and self.run_kv_only_prefill(
+                prefill_batch_desc.num_tokens,
+                attn_metadata,
+                slot_mappings,
+                num_tokens_across_dp,
+            )
+        ):
+            return self.draft_tokens[:num_reqs]
         if prefill_batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Replay the full graph for draft prefill.
             assert self.prefill_cudagraph_manager is not None

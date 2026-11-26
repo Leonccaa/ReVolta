@@ -388,6 +388,7 @@ if TYPE_CHECKING:
     VLLM_SM70_MTP_ROUTER_BATCH: bool = True
     VLLM_SM70_MTP_SHARED_BATCH: bool = True
     VLLM_SM70_MTP_Q8_PREFILL_MMQ: bool = False
+    VLLM_SM70_MTP_KV_ONLY_PREFILL: bool = False
     VLLM_SM70_MTP_PLE_CONV: bool = True
     VLLM_SM70_PLE_GATE_NORM: bool = False
     VLLM_SM70_QWEN38_FUSED_HC_FP16: bool = False
@@ -5190,6 +5191,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "Only ModelOpt NVFP4 checkpoints (including mixed NVFP4 layers). "
             "vllm/revolta_profile.py:apply_revolta_profile sets '1' for unset "
             "values on FP16 QSA SM70 TP4. Only Q8_0 MTP experts use it.",
+        ),
+        acceleration_paths=("Flash-Next MTP draft",),
+        user_visible=True,
+    ),
+    "VLLM_SM70_MTP_KV_ONLY_PREFILL": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_KV_ONLY_PREFILL", "0"))),
+        description="Use KV-only MTP draft prefill for eligible incomplete chunks.",
+        category="experimental",
+        declared_default="False",
+        effective_default="False; opt in explicitly.",
+        automatic_conditions=(
+            "Single-layer Flash-Next MTP with GPU draft KV, no PLE, and "
+            "incomplete eager prefill without draft tokens or multimodal inputs.",
         ),
         acceleration_paths=("Flash-Next MTP draft",),
         user_visible=True,

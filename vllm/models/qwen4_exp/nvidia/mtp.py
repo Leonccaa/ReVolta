@@ -524,6 +524,39 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    def forward_kv_only(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> bool:
+        if self.num_mtp_layers != 1:
+            return False
+        layer = self.layers[0]
+        if (
+            layer.ple is not None
+            or layer.layer_type != "full_attention"
+            or not hasattr(layer.self_attn, "forward_kv_only")
+            or getattr(layer.self_attn, "host_history", None) is not None
+        ):
+            return False
+
+        inputs_embeds = self.pre_fc_norm_embedding(self.embed_input_ids(input_ids))
+        inputs_embeds = self.fc_embedding(inputs_embeds)
+        num_tokens = hidden_states.shape[0]
+        # Match the full MTP path and vLLM reference: normalize the whole row,
+        # not each HC group as in the upstream shortcut.
+        hidden_states = self.pre_fc_norm_hidden(hidden_states).view(
+            num_tokens, self.hc_count, self.hidden_size
+        )
+        hidden_states = self.fc_hidden(hidden_states)
+        hidden_states = tensor_model_parallel_all_gather(
+            inputs_embeds.unsqueeze(-2) + hidden_states
+        ).flatten(-2)
+        _, block_input, _ = layer.attn_hyper_connection.mix(hidden_states)
+        layer.self_attn.forward_kv_only(positions, block_input)
+        return True
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -769,6 +802,14 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
+
+    def forward_kv_only(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> bool:
+        return self.model.forward_kv_only(input_ids, positions, hidden_states)
 
     def forward(  # type: ignore[override]
         self,

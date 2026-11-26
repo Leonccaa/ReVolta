@@ -36,6 +36,15 @@ _LOOKUP = (
 )
 
 NOTES: dict[str, dict[str, str]] = {
+    "VLLM_SM70_MTP_KV_ONLY_PREFILL": dict(
+        section="deployment",
+        since="0.2.0rc16",
+        range="0, 1",
+        tradeoff="Opt in to eager KV-only MTP prefill for incomplete chunks "
+        "with GPU draft KV. This skips attention, MLP and sampling; floating "
+        "point results may differ from the compiled full draft path.",
+        metrics="",
+    ),
     "VLLM_SM70_MTP_Q8_PREFILL_MMQ": dict(
         section="profile",
         since="0.2.0rc15",

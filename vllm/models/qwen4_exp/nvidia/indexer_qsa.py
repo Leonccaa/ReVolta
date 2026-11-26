@@ -208,8 +208,9 @@ class QSAIndexer(nn.Module):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         out: torch.Tensor | None = None,
+        select: bool = True,
     ) -> torch.Tensor:
-        """Return fixed-width request-relative token indices padded with ``-1``."""
+        """Write key caches and optionally select request-relative token indices."""
 
         metadata = self._metadata()
         if metadata is None:
@@ -351,7 +352,7 @@ class QSAIndexer(nn.Module):
                     position_rows,
                 )
 
-        if self.skip_topk:
+        if self.skip_topk or not select:
             if out is None:
                 raise RuntimeError("QSA top-k reuse requires an output buffer")
             return out

@@ -1439,6 +1439,32 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             output[:num_tokens],
         )
 
+    def forward_kv_only(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> None:
+        """Write GPU main and indexer caches without sparse attention."""
+        metadata = get_forward_context().attn_metadata
+        if isinstance(metadata, list):
+            metadata = metadata[0]
+        main_metadata = cast(FlashAttentionMetadata, metadata[self.layer_name])
+        num_tokens = main_metadata.num_actual_tokens
+        qkv, _ = self.qkv_proj(hidden_states)
+        self.indexer(
+            hidden_states,
+            positions,
+            self.topk_indices_buffer[:num_tokens],
+            select=False,
+        )
+        _, k, v, _ = self._project_qkv_gate(qkv, positions)
+        key = k.view(hidden_states.shape[0], self.num_kv_heads, self.head_dim)
+        value = v.view(hidden_states.shape[0], self.num_kv_heads, self.head_dim)
+        impl = cast(Qwen4ExpQSAFlashAttentionImpl, self.impl)
+        impl.do_kv_cache_update(
+            self, key, value, self.kv_cache, main_metadata.slot_mapping
+        )
+
     def forward(
         self,
         positions: torch.Tensor,

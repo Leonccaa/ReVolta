@@ -50,6 +50,13 @@ def _layer(device="cpu"):
         (3, 24, 0, 0, True, 8),
         (4, 16, 0, 0, True, 8),
         (8, 40, 0, 0, True, 8),
+        (8, 8, 0, 0, True, 8),
+        (8, 16, 0, 0, True, 8),
+        (8, 24, 0, 0, True, 8),
+        (8, 48, 0, 0, True, 8),
+        (8, 56, 0, 0, True, 8),
+        (8, 64, 0, 0, True, 8),
+        (8, 0, 0, 0, True, 0),
         (9, 45, 0, 0, True, 0),
         (8, 72, 0, 0, True, 0),
         (8, 39, 0, 0, True, 0),
@@ -130,7 +137,7 @@ def test_mrv2_passes_captured_width_to_accepted_prefix_replay(monkeypatch):
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0),
     reason="requires an SM70 CUDA device",
 )
-@pytest.mark.parametrize("requests,width", [(1, 8), (2, 5), (4, 4), (8, 5)])
+@pytest.mark.parametrize("requests,width", [(1, 8), (2, 5), (4, 4), (8, 5), (8, 6)])
 def test_cuda_native_prefix_matches_full_replay(requests, width):
     from vllm.v1.worker.gpu.gdn_spec_replay import split_replay_launch
 

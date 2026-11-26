@@ -65,8 +65,8 @@ _SUPPORTED_CONTRACTS: Final = {
 }
 _SUPPORTED_TP_SIZES: Final = (1, 2, 4)
 _GRAPH_SAFE_MAX_TOKENS: Final = 18
-_GROUPED_DECODE_MAX_TOKENS: Final = 40
-_RAW_GROUPED_M48_TOKENS: Final = 48
+_GROUPED_DECODE_MAX_TOKENS: Final = 64
+_RAW_GROUPED_WIDE_MIN_TOKENS: Final = 41
 _RAW_GROUPED_NARROW_MAX_TOKENS: Final = 5
 _COMPACT_GROUPED_MAX_SLOTS: Final = 80
 # V100 real-shape M=1 tuning favors 16 warps. This retains checkpoint NVFP4,
@@ -1387,7 +1387,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
 
         use_m48 = m48_requested and use_v154
         device = layer.w13_tm_weight.device
-        rows = _RAW_GROUPED_M48_TOKENS if use_m48 else 40
+        rows = _GROUPED_DECODE_MAX_TOKENS if use_m48 else 40
         routes = rows * top_k
         layer._nvfp4_raw_grouped_output = torch.empty(
             rows, hidden, dtype=torch.float16, device=device
@@ -1419,7 +1419,8 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 torch.empty(1, dtype=torch.int32, device=device),
             )
             logger.info_once(
-                "Prepared SM70 raw grouped M48 v154 decode with equal gate/up globals."
+                "Prepared SM70 raw grouped M41-M64 v154 decode with equal "
+                "gate/up globals."
             )
         logger.info_once(
             "Experimental SM70 raw-E4M3 grouped NVFP4 enabled "
@@ -1775,7 +1776,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         if num_tokens == 0:
             return x.new_empty((0, hidden))
         plan = None
-        if num_tokens == _RAW_GROUPED_M48_TOKENS:
+        if _RAW_GROUPED_WIDE_MIN_TOKENS <= num_tokens <= _GROUPED_DECODE_MAX_TOKENS:
             plan = layer._nvfp4_raw_grouped_m48_plan
         elif 3 <= num_tokens <= _RAW_GROUPED_NARROW_MAX_TOKENS:
             plan = layer._nvfp4_raw_grouped_narrow_plan

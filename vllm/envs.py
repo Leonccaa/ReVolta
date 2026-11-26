@@ -6177,7 +6177,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_NVFP4_RAW_GROUPED_M48_V154": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_RAW_GROUPED_M48_V154", "0"))),
         description=(
-            "Use native v154 raw grouped NVFP4 MoE for 48-row target decode "
+            "Use native v154 raw grouped NVFP4 MoE for 41-64 row target decode "
             "on SM70 TP4 Qwen3.8 with equal interleaved gate/up global scales. "
             "Requires raw grouped decode and the V2 model runner."
         ),

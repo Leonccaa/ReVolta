@@ -91,13 +91,13 @@ def test_raw_v154_prepare(monkeypatch, m48_layer, blocked_by, narrow):
         assert plan is None
         return
     assert layer.sm70_nvfp4_raw_grouped_decode
-    rows = 48 if blocked_by is None and not narrow else 40
+    rows = 64 if blocked_by is None and not narrow else 40
     assert layer._nvfp4_raw_grouped_output.shape == (rows, 2560)
     assert layer._nvfp4_raw_grouped_intermediate.shape == (rows * 10, 160)
     assert layer._nvfp4_raw_grouped_plan.numel() == ref.PLAN_INTS
     if blocked_by is None:
         assert plan is not None
-        routes = 50 if narrow else 480
+        routes = 50 if narrow else 640
         assert [tuple(t.shape) for t in plan] == [
             (routes, 8),
             (routes,),
@@ -111,14 +111,52 @@ def test_raw_v154_prepare(monkeypatch, m48_layer, blocked_by, narrow):
         assert plan is None
 
 
+@pytest.mark.parametrize("rows", [41, 48, 64])
+def test_wide_raw_v154_disabled_keeps_ordinary_route(monkeypatch, m48_layer, rows):
+    monkeypatch.delenv("VLLM_SM70_NVFP4_RAW_GROUPED_M48_V154")
+    layer = m48_layer
+    method = object.__new__(moe.ModelOptNvFp4SM70MoEMethod)
+    method._prepare_raw_grouped_decode(layer)
+    assert layer._nvfp4_raw_grouped_m48_plan is None
+    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
+    monkeypatch.setattr(moe, "is_exact_sm70_cuda", lambda *a, **kw: True)
+
+    def ordinary(*_):
+        raise RuntimeError("ordinary dispatch")
+
+    monkeypatch.setattr(moe, "_use_grouped_mtp5", ordinary)
+    context = ForwardContext(
+        no_compile_layers={},
+        attn_metadata=None,
+        slot_mapping={},
+        additional_kwargs={"sm70_nvfp4_decode_only": True},
+    )
+    with (
+        override_forward_context(context),
+        pytest.raises(RuntimeError, match="ordinary dispatch"),
+    ):
+        method.apply(
+            layer,
+            torch.empty(rows, 2560, dtype=torch.float16),
+            torch.empty(rows, 10, dtype=torch.float32),
+            torch.empty(rows, 10, dtype=torch.int32),
+            None,
+            None,
+        )
+
+
 @pytest.mark.parametrize(
     "rows,decode,offset",
     [
         (48, True, 0),
         (48, False, 0),
         (48, True, 1),
+        (40, True, 0),
+        (41, True, 0),
         (47, True, 0),
         (49, True, 0),
+        (64, True, 0),
+        (65, True, 0),
         (2, True, 0),
         (3, True, 0),
         (4, True, 0),
@@ -141,7 +179,7 @@ def test_raw_v154_apply(monkeypatch, m48_layer, rows, decode, offset):
     calls = []
     expected_plan = (
         layer._nvfp4_raw_grouped_m48_plan
-        if rows == 48
+        if 41 <= rows <= 64
         else layer._nvfp4_raw_grouped_narrow_plan
     )
     mid_ptr = layer._nvfp4_raw_grouped_intermediate.data_ptr()
@@ -184,7 +222,7 @@ def test_raw_v154_apply(monkeypatch, m48_layer, rows, decode, offset):
         additional_kwargs={"sm70_nvfp4_decode_only": True} if decode else {},
     )
     with override_forward_context(context):
-        if rows in (3, 4, 5, 48) and decode and offset == 0:
+        if (rows in (3, 4, 5) or 41 <= rows <= 64) and decode and offset == 0:
             result = method.apply(layer, x, weights, ids, None, None)
             assert result.shape == (rows, 2560) and result.data_ptr() == out_ptr
             assert calls == ["w13", "w2"]

@@ -147,7 +147,7 @@ or per-token-head E4M3, both of which the raw `fs` tier rejects.
   "kv_role": "kv_both",
   "kv_connector_extra_config": {
     "spec_name": "TieringOffloadingSpec",
-    "cpu_bytes_to_use": 2147483648,
+    "cpu_bytes_to_use": 17179869184,
     "eviction_policy": "lru",
     "secondary_tiers": [
       {
@@ -168,7 +168,7 @@ or per-token-head E4M3, both of which the raw `fs` tier rejects.
 }
 ```
 
-The example sets a 2 GiB CPU pool and an 8 GiB disk budget.
+The example sets a 16 GiB CPU pool and an 8 GiB disk budget.
 
 - `max_size_bytes` is **required**. It is a positive integer: the total page budget
   for everything under `root_dir`. Configuration fails without it.
@@ -187,6 +187,18 @@ The example sets a 2 GiB CPU pool and an 8 GiB disk budget.
   2 GiB with MTP4 and about 5 GB with DFlash2). Otherwise the request is computed
   again. The quick-start 48 GiB pool holds about 2.4M tokens with MTP4; with DFlash2 the
   same pool holds about 1M tokens, an estimate from the same about 50 KB per token.
+- With a grouped CPU pool (a hybrid model with a recurrent-state group, for example
+  the default MTP4), each state pool is sized from `mamba_state_slots_reference_tokens`
+  alone, without counting requests restoring from disk at the same time. With MTP4
+  the pool holds roughly 0.73 requests' worth of recurrent states per GiB (measured:
+  4 state slots per group at 2 GiB, 72 at 48 GiB, two slots per request), so if more
+  requests restore from disk at once than the pool has state slots for, the extra
+  requests are treated as cache misses and fully recomputed; their output is not
+  affected. Size the pool so that 0.73 × pool GiB covers the number of requests that
+  may restore concurrently (about 11 GiB for 8, the default `--max-num-seqs`, hence
+  the 16 GiB in this example), or lower `mamba_state_slots_reference_tokens` (for
+  example 16384, which by the sizing formula gives each state pool about four times
+  more slots from the same budget, at the cost of fewer token slots; not measured).
 
 Validation scope for the raw `fs` tier: the full release gate passed on a network file
 system (8 GiB CPU pool, 40 GiB disk budget), including a 99K-token prefix restored from

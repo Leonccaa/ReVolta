@@ -40,8 +40,9 @@ NOTES: dict[str, dict[str, str]] = {
         section="research",
         since="0.2.0rc16",
         range="0, 1",
-        tradeoff="Reserved for the native GDN prefill candidate. The kernel is "
-        "not connected or validated, so this setting currently has no effect.",
+        tradeoff="Opt in to the native SM70 GDN prefill kernel for eligible "
+        "original TileLang batches. It can change floating-point results and "
+        "uses temporary GPU memory; set 0 to retain the original path.",
         metrics="",
     ),
     "VLLM_SM70_MTP_Q8_PREFILL_MMQ": dict(

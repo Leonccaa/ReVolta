@@ -12,6 +12,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pytest
@@ -558,6 +559,306 @@ def test_sm70_original_prefill_mixed_varlen_chunk_metadata(
         [3, 1],
     ]
     assert metadata.spec_query_start_loc.tolist() == [0, 4]
+
+
+@pytest.mark.parametrize("method", ["dflash", "mtp"])
+@pytest.mark.parametrize("cache_mode", ["none", "align"])
+@pytest.mark.parametrize("indexed", [False, True])
+@pytest.mark.parametrize("with_spec", [False, True])
+def test_native_gdn_prefill_mrv2_mixed_batch(
+    monkeypatch, local_gdn_model, method, cache_mode, indexed, with_spec
+):
+    monkeypatch.setenv("VLLM_SM70_FLASHQLA_ORIGINAL_PREFILL", "1")
+    monkeypatch.setenv("VLLM_SM70_GDN_NATIVE_PREFILL", "1")
+    monkeypatch.setenv("VLLM_SM70_FLASHQLA_INDEXED_PREFILL", str(int(indexed)))
+    monkeypatch.setenv("VLLM_SM70_FLASHQLA_DIRECT_OUTPUT", "1")
+    monkeypatch.setattr(
+        qwen_gdn.current_platform, "is_device_capability", lambda x: True
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        qwen_gdn.flashnext_prefill_ops, "has_sm70_flashnext_prefill_ops", lambda: True
+    )
+    monkeypatch.setattr(qwen_gdn, "_sm70_profile_trace_enabled", lambda: False)
+    monkeypatch.setitem(
+        sys.modules,
+        "flash_qla.utils",
+        SimpleNamespace(prepare_chunk_indices=lambda *_args: None),
+    )
+
+    def unexpected_tilelang(**kwargs):
+        raise AssertionError("eligible prefill did not use the native kernel")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "flash_qla.ops.gated_delta_rule.chunk",
+        SimpleNamespace(chunk_gated_delta_rule_fwd_sm70_tilelang=unexpected_tilelang),
+    )
+    calls = []
+
+    def fake_native(*args):
+        calls.append(args)
+        args[13].fill_(1)
+        if args[18]:
+            args[8][args[11].long()] = 1
+        else:
+            args[14].fill_(1)
+
+    monkeypatch.setattr(
+        torch.ops.vllm_sm70_fn_prefill,
+        "gdn_chunk_fwd_fused_sm70",
+        fake_native,
+        raising=False,
+    )
+    builder = _create_gdn_builder(
+        local_gdn_model,
+        num_speculative_tokens=4,
+        speculative_method=method,
+        mamba_cache_mode=cache_mode,
+    )
+    builder.gdn_prefill_backend = "flashqla_sm70"
+    lengths = [220, *range(1, 9)] + ([4] if with_spec else [])
+    rows = len(lengths)
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[220, *([16] * (rows - 1))], query_lens=lengths),
+        BLOCK_SIZE,
+        DEVICE,
+    )
+    common = common.replace(
+        is_prefilling=torch.ones(rows, dtype=torch.bool),
+        block_table_tensor=torch.arange(rows, dtype=torch.int32)
+        .unsqueeze(1)
+        .expand(-1, 20),
+    )
+    kwargs = {}
+    if with_spec:
+        drafts = torch.tensor([-1] * 9 + [3], dtype=torch.int32)
+        kwargs = {
+            "num_decode_draft_tokens_cpu": drafts,
+            "num_accepted_tokens": torch.ones(rows, dtype=torch.int32),
+            "common_gdn_metadata": compute_common_gdn_attn_metadata(
+                num_decode_draft_tokens_cpu=drafts,
+                query_start_loc=common.query_start_loc,
+                query_start_loc_cpu=common.query_start_loc_cpu,
+                num_spec_state_tokens=builder.num_spec_state_tokens,
+                legacy_mixed_decode_routing=False,
+            ),
+        }
+    metadata = builder.build(common_prefix_len=0, common_attn_metadata=common, **kwargs)
+    assert metadata.non_spec_query_start_loc.tolist() == [
+        0,
+        220,
+        221,
+        223,
+        226,
+        230,
+        235,
+        241,
+        248,
+        256,
+    ]
+    assert metadata.chunk_offsets is not None
+
+    def fake_post_conv(**kwargs):
+        tokens = kwargs["a"].shape[0]
+        q = torch.ones((tokens, 4, 128), dtype=torch.float16)
+        v = torch.ones((tokens, 12, 128), dtype=torch.float16)
+        gate = torch.zeros((tokens, 12), dtype=torch.float32)
+        return q, q, v, gate, gate
+
+    monkeypatch.setattr(qwen_gdn, "causal_conv1d_fn", lambda x, *_a, **_kw: x)
+    monkeypatch.setattr(qwen_gdn, "causal_conv1d_update", lambda x, *_a, **_kw: x)
+    monkeypatch.setattr(qwen_gdn, "fused_post_conv_prep", fake_post_conv)
+    monkeypatch.setattr(
+        qwen_gdn,
+        "fused_sigmoid_gating_delta_rule_update",
+        lambda **kwargs: (torch.full_like(kwargs["v"], 3), kwargs["initial_state"]),
+    )
+    layer = qwen_gdn.QwenGatedDeltaNetAttention.__new__(
+        qwen_gdn.QwenGatedDeltaNetAttention
+    )
+    torch.nn.Module.__init__(layer)
+    layer.prefix = "linear_attn"
+    layer.gdn_prefill_backend = "flashqla_sm70"
+    layer.num_k_heads, layer.num_v_heads, layer.tp_size = 4, 12, 1
+    layer.key_dim, layer.value_dim = 512, 1536
+    layer.head_k_dim = layer.head_v_dim = 128
+    layer.A_log = layer.dt_bias = torch.zeros(12)
+    layer.activation = "silu"
+    layer.conv1d = torch.nn.Conv1d(2560, 2560, 2, groups=2560, bias=False)
+    layer._can_use_flashqla_decode = lambda *_a, **_kw: False
+    layer._can_use_dflash2_packed_gdn_verify = lambda **_kw: False
+    layer._replay_reads_strided_qkv = lambda _qkv: False
+    layer.spec_state_replay = False
+    layer.enable_sm70_fused_sigmoid_mixed_qkv = True
+    layer.enable_packed_recurrent_decode = True
+    layer.enable_sm70_legacy_prefill_prep = False
+    layer.enable_sm70_dflash2_fused_qkv_pack = False
+    chunk_op = qwen_gdn.ChunkGatedDeltaRule.__new__(qwen_gdn.ChunkGatedDeltaRule)
+    torch.nn.Module.__init__(chunk_op)
+    chunk_op._forward_method = chunk_op.forward_flashqla_sm70
+    layer.chunk_gated_delta_rule = chunk_op
+    monkeypatch.setattr(
+        qwen_gdn,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata={layer.prefix: metadata}),
+    )
+    tokens = sum(lengths)
+    out = torch.zeros((tokens, 12, 128), dtype=torch.float16)
+    kv_cache = (torch.zeros(rows, 1, 2560), torch.zeros(rows, 12, 128, 128))
+    layer._forward_core(
+        torch.zeros(tokens, 2560, dtype=torch.float16),
+        torch.zeros(tokens, 12, dtype=torch.float16),
+        torch.zeros(tokens, 12, dtype=torch.float16),
+        out,
+        kv_cache,
+    )
+    assert len(calls) == 1
+    assert torch.equal(calls[0][9], metadata.non_spec_query_start_loc)
+    assert torch.equal(calls[0][10], metadata.chunk_indices)
+    assert calls[0][18] is indexed
+    assert torch.all(out[:256] == 1)
+    if with_spec:
+        assert torch.all(out[256:] == 3)
+    assert torch.all(kv_cache[1][metadata.non_spec_state_indices_tensor] == 1)
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        ("enabled", "native"),
+        ("beta_fp16", "native"),
+        ("disabled", "tilelang"),
+        ("short", "tilelang"),
+        ("q_shape", "tilelang"),
+        ("q_dtype", "fla"),
+        ("k_shape", "tilelang"),
+        ("v_shape", "tilelang"),
+        ("gate_dtype", "tilelang"),
+        ("beta_dtype", "tilelang"),
+        ("state_dtype", "tilelang"),
+        ("capture", "tilelang"),
+        ("other_gpu", "tilelang"),
+        ("missing_extension", "tilelang"),
+        ("vlk", "vlk"),
+        ("no_chunk_indices", "native"),
+    ],
+)
+def test_native_gdn_prefill_dispatch(monkeypatch, case, expected):
+    if case == "disabled":
+        monkeypatch.delenv("VLLM_SM70_GDN_NATIVE_PREFILL", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_SM70_GDN_NATIVE_PREFILL", "1")
+    monkeypatch.setattr(
+        qwen_gdn, "_sm70_flashqla_original_prefill_enabled", lambda: case != "vlk"
+    )
+    monkeypatch.setattr(
+        qwen_gdn.current_platform, "is_device_capability", lambda x: case != "other_gpu"
+    )
+    monkeypatch.setattr(
+        torch.cuda, "is_current_stream_capturing", lambda: case == "capture"
+    )
+    monkeypatch.setattr(
+        qwen_gdn.flashnext_prefill_ops,
+        "has_sm70_flashnext_prefill_ops",
+        lambda: case != "missing_extension",
+    )
+    calls: list[tuple[str, Any]] = []
+    indices = torch.tensor([[0, 0], [0, 1], [0, 2], [0, 3]], dtype=torch.int32)
+    monkeypatch.setitem(
+        sys.modules,
+        "flash_qla.utils",
+        SimpleNamespace(prepare_chunk_indices=lambda cu, size: indices),
+    )
+
+    def fake_tilelang(**kwargs):
+        calls.append(("tilelang", kwargs))
+        return None, None, kwargs["v"], None, kwargs["initial_state"]
+
+    def fake_vlk(**kwargs):
+        calls.append(("vlk", kwargs))
+        return kwargs["v"], kwargs["initial_state"]
+
+    monkeypatch.setitem(
+        sys.modules,
+        "flash_qla.ops.gated_delta_rule.chunk",
+        SimpleNamespace(chunk_gated_delta_rule_fwd_sm70_tilelang=fake_tilelang),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "flash_qla.ops.gated_delta_rule.chunk.sm70",
+        SimpleNamespace(chunk_gated_delta_rule_fwd_sm70_vlk_varlen=fake_vlk),
+    )
+
+    def fake_native(*args):
+        calls.append(("native", args))
+        args[13].fill_(1)
+        args[14].fill_(2)
+
+    monkeypatch.setattr(
+        torch.ops.vllm_sm70_fn_prefill,
+        "gdn_chunk_fwd_fused_sm70",
+        fake_native,
+        raising=False,
+    )
+    tokens = 255 if case == "short" else 256
+    q = torch.zeros(
+        (1, tokens, 3 if case == "q_shape" else 4, 128),
+        dtype=torch.float32 if case == "q_dtype" else torch.float16,
+    )
+    k = torch.zeros(
+        (1, tokens, 3 if case == "k_shape" else 4, 128), dtype=torch.float16
+    )
+    v = torch.zeros(
+        (1, tokens, 11 if case == "v_shape" else 12, 128), dtype=torch.float16
+    )
+    g = torch.zeros(
+        (1, tokens, 12), dtype=torch.float16 if case == "gate_dtype" else torch.float32
+    )
+    beta_dtype = (
+        torch.bfloat16
+        if case == "beta_dtype"
+        else torch.float16
+        if case == "beta_fp16"
+        else torch.float32
+    )
+    beta = torch.zeros((1, tokens, 12), dtype=beta_dtype)
+    state = torch.zeros(
+        (1, 12, 128, 128),
+        dtype=torch.float16 if case == "state_dtype" else torch.float32,
+    )
+    cu = torch.tensor([0, tokens], dtype=torch.int32)
+    offsets = torch.tensor([0, 4], dtype=torch.int32)
+    op = qwen_gdn.ChunkGatedDeltaRule.__new__(qwen_gdn.ChunkGatedDeltaRule)
+    torch.nn.Module.__init__(op)
+
+    def fake_fla(**kwargs):
+        calls.append(("fla", kwargs))
+        return kwargs["v"], kwargs["initial_state"]
+
+    op.forward_native = fake_fla
+    out, final_state = op.forward_flashqla_sm70(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=state,
+        output_final_state=True,
+        cu_seqlens=cu,
+        chunk_indices=None if case == "no_chunk_indices" else indices,
+        chunk_offsets=offsets,
+        use_qk_l2norm_in_kernel=False,
+    )
+    assert len(calls) == 1 and calls[0][0] == expected
+    if expected == "native":
+        assert torch.equal(calls[0][1][10], indices)
+        assert torch.all(out == 1) and torch.all(final_state == 2)
+    elif expected == "tilelang":
+        assert calls[0][1]["chunk_offsets"] is offsets
+        assert out is v and final_state is state
+    else:
+        assert out is v and final_state is state
 
 
 def _assert_gdn_metadata_equal(

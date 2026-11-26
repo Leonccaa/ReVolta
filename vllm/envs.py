@@ -12573,7 +12573,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_GDN_NATIVE_PREFILL": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_GDN_NATIVE_PREFILL", "0"))),
-        description="Reserved switch for the experimental SM70 GDN prefill kernel.",
+        description="Opt in to the experimental native SM70 GDN prefill kernel.",
         category="tuning",
         declared_default="False",
         effective_default="False",

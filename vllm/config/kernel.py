@@ -692,6 +692,10 @@ class KernelConfig:
     """Use the v154 packed GDN inputs for physical M3/M4 during SM70 target
     FULL graph capture. Other rows keep their existing path."""
 
+    sm70_gdn_input_v154_wide: bool = False
+    """Use v154 packed GDN inputs for M2..64 in target MTP FULL graphs.
+    This changes the projection reduction order and is disabled by default."""
+
     sm70_gdn_input_skinny_k4: bool = False
     """Use four K warps in the SM70 row-major FP16 GDN input projection.
 

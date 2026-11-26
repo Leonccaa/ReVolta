@@ -4383,6 +4383,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 getattr(self.in_proj_ba, "_sm70_qwen38_gdn_packed", None),
                 getattr(self.in_proj_qkvz, "_sm70_qwen38_gdn_input_v154", False),
                 self.sm70_gdn_input_skinny_k4,
+                getattr(self.in_proj_qkvz, "_sm70_qwen38_gdn_input_v154_wide", False),
             )
             z = z.reshape(z.size(0), -1, self.head_v_dim)
         else:

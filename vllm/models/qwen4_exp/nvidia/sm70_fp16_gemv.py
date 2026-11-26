@@ -542,7 +542,7 @@ def _pack_gdn_input_weight(weight: torch.Tensor) -> torch.Tensor:
     return weight.reshape(-1, 32, 160, 2, 8).permute(0, 2, 3, 1, 4).contiguous()
 
 
-def _can_use_packed_gdn_input(x, packed_qkvz, packed_ba) -> bool:
+def _can_use_packed_gdn_input(x, packed_qkvz, packed_ba, max_rows=16) -> bool:
     return bool(
         (envs.VLLM_SM70_QWEN38_GDN_INPUT_BATCH or envs.VLLM_SM70_QWEN38_BATCH_FASTPATH)
         and not envs.VLLM_BATCH_INVARIANT
@@ -550,7 +550,7 @@ def _can_use_packed_gdn_input(x, packed_qkvz, packed_ba) -> bool:
         # Let cuBLAS honor an explicit request for FP16 accumulation.
         and not torch.backends.cuda.matmul.allow_fp16_accumulation
         and x.ndim == 2
-        and 2 <= x.shape[0] <= 16
+        and 2 <= x.shape[0] <= max_rows
         and x.shape[1] == 2560
         and x.is_cuda
         and x.dtype == torch.float16
@@ -579,9 +579,16 @@ def _qwen38_sm70_fp16_gdn_input(
     packed_ba: torch.Tensor | None = None,
     use_v154_m3_m4: bool = False,
     use_skinny_k4: bool = False,
+    use_v154_wide: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    if _can_use_packed_gdn_input(x, packed_qkvz, packed_ba):
-        use_v154 = (
+    wide = use_v154_wide and is_sm70_decode_graph_compiling()
+    packed = (
+        _can_use_packed_gdn_input(x, packed_qkvz, packed_ba, 64)
+        if wide
+        else _can_use_packed_gdn_input(x, packed_qkvz, packed_ba)
+    )
+    if packed:
+        use_v154 = wide or (
             use_v154_m3_m4 and x.shape[0] in (3, 4) and is_sm70_decode_graph_compiling()
         )
         # With NO_PACK=1 the new packed weights are only for the FULL trial.
@@ -594,7 +601,7 @@ def _qwen38_sm70_fp16_gdn_input(
             qkv, z, b, a = (x.new_empty((x.shape[0], n)) for n in (2560, 1536, 12, 12))
             op(qkv, z, b, a, x, packed_qkvz, packed_ba)
             if use_v154:
-                logger.info_once("SM70 v154 packed target GDN input enabled for M3/M4.")
+                logger.info_once("SM70 v154 packed target GDN input enabled.")
             else:
                 logger.info_once(
                     "SM70 Qwen3.8 checkpoint-FP16 batched GDN input enabled."
@@ -652,8 +659,10 @@ def _qwen38_sm70_fp16_gdn_input_fake(
     packed_ba: torch.Tensor | None = None,
     use_v154_m3_m4: bool = False,
     use_skinny_k4: bool = False,
+    use_v154_wide: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     del qkvz_weight, ba_weight, packed_qkvz, packed_ba, use_v154_m3_m4, use_skinny_k4
+    del use_v154_wide
     batch_shape = x.shape[:-1]
     return (
         x.new_empty((*batch_shape, 2560)),
@@ -753,7 +762,8 @@ class Qwen38SM70FP16LinearMethod(UnquantizedLinearMethod):
         if not weight.is_cuda or weight.dtype != torch.float16:
             return  # The PLE-only/meta loader never executes this GPU route.
         use_v154 = getattr(layer, "_sm70_qwen38_gdn_input_v154", False)
-        if envs.VLLM_SM70_QWEN38_GDN_NO_PACK and not use_v154:
+        use_v154_wide = getattr(layer, "_sm70_qwen38_gdn_input_v154_wide", False)
+        if envs.VLLM_SM70_QWEN38_GDN_NO_PACK and not (use_v154 or use_v154_wide):
             # 2..48 rows read the original weights (skinny dual GEMM).
             logger.info_once("SM70 Qwen3.8 GDN input: packed copy disabled.")
             return
@@ -981,6 +991,15 @@ def enable_qwen38_sm70_fp16_gemv(
                 ):
                     qkvz._sm70_qwen38_gdn_input_v154 = True
                     ba._sm70_qwen38_gdn_input_v154 = True
+                if (
+                    batch_qualified
+                    and vllm_config.kernel_config.sm70_gdn_input_v154_wide
+                    and not vllm_config.is_speculative_draft
+                    and vllm_config.speculative_config is not None
+                    and vllm_config.speculative_config.use_qwen4_exp_mtp()
+                ):
+                    qkvz._sm70_qwen38_gdn_input_v154_wide = True
+                    ba._sm70_qwen38_gdn_input_v154_wide = True
             fused_gdn_inputs += 1
 
     if replaced:

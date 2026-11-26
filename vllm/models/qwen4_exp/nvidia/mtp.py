@@ -537,7 +537,6 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             layer.ple is not None
             or layer.layer_type != "full_attention"
             or not hasattr(layer.self_attn, "forward_kv_only")
-            or getattr(layer.self_attn, "host_history", None) is not None
         ):
             return False
 

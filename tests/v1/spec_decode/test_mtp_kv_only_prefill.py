@@ -174,8 +174,10 @@ class FinalMix(nn.Module):
         return hidden, output, injection
 
 
-def test_gpu_draft_cache_writes_match_full_path(
-    monkeypatch, mtp_module, default_vllm_config
+@pytest.mark.parametrize("host_draft", [False, True])
+@torch.inference_mode()
+def test_draft_cache_writes_match_full_path(
+    monkeypatch, mtp_module, default_vllm_config, host_draft
 ):
     torch.manual_seed(16)
     monkeypatch.setattr(mtp_module, "tensor_model_parallel_all_gather", lambda x: x)
@@ -285,10 +287,23 @@ def test_gpu_draft_cache_writes_match_full_path(
         def attend(layer, query, key, value, cache, metadata, output, **kwargs):
             output.zero_()
 
-        attention.impl = SimpleNamespace(do_kv_cache_update=write, forward_qsa=attend)
+        def attend_host(layer, host, query, metadata, output, **kwargs):
+            output.zero_()
+
+        attention.impl = SimpleNamespace(
+            do_kv_cache_update=write, forward_qsa=attend, forward_qsa_host=attend_host
+        )
         attention.cp_kv_cache_interleave_size = 1
         attention.kv_cache_dtype = "auto"
+        attention._k_scale = torch.tensor(1.0)
+        attention._v_scale = torch.tensor(1.0)
         attention.indexer.layer_id = 0
+        if host_draft:
+
+            def host_write(key, value, slots, dtype, k_scale, v_scale):
+                write(attention, key, value, attention.kv_cache, slots)
+
+            attention.host_history = SimpleNamespace(write=host_write)
 
         draft = object.__new__(mtp_module.Qwen4ExpMultiTokenPredictor)
         nn.Module.__init__(draft)
@@ -319,7 +334,8 @@ def test_gpu_draft_cache_writes_match_full_path(
         cslots = torch.tensor(
             [-1 if i % 2 == 0 else i // 2 for i in range(start, start + count)]
         )
-        meta = SimpleNamespace(num_actual_tokens=count, slot_mapping=slots)
+        main_slots = slots
+        meta = SimpleNamespace(num_actual_tokens=count, slot_mapping=main_slots)
         side = SimpleNamespace(
             num_actual_tokens=count,
             slot_mapping=slots,
@@ -358,11 +374,13 @@ def test_gpu_draft_cache_writes_match_full_path(
         )
         spec.hidden_states = hidden[start : start + padded]
         assert spec.run_kv_only_prefill(padded, state.context.attn_metadata, {}, None)
-        assert torch.equal(fast_attn.written_slots[-1], slots)
-        assert torch.equal(full_attn.written_slots[-1], slots)
+        assert torch.equal(fast_attn.written_slots[-1], main_slots)
+        assert torch.equal(full_attn.written_slots[-1], main_slots)
         assert len(fast_attn.written_slots[-1]) == count
+        fast_main = fast_attn.kv_cache
+        full_main = full_attn.kv_cache
         for actual, expected in [
-            (fast_attn.kv_cache, full_attn.kv_cache),
+            (fast_main, full_main),
             (
                 fast_attn.indexer.raw_key_cache.kv_cache,
                 full_attn.indexer.raw_key_cache.kv_cache,
@@ -374,10 +392,9 @@ def test_gpu_draft_cache_writes_match_full_path(
         ]:
             assert (actual.float() - expected.float()).abs().max().item() == 0.0
     assert select.call_count == 2  # Full path only; no index scoring on shortcut.
-    assert torch.count_nonzero(fast_attn.kv_cache[:, raw_slots]) > 0
+    assert torch.count_nonzero(fast_main) > 0
     assert torch.count_nonzero(fast_attn.indexer.raw_key_cache.kv_cache[raw_slots]) > 0
     assert torch.count_nonzero(fast_attn.indexer.compressed_key_cache.kv_cache[:2]) > 0
-    assert torch.count_nonzero(fast_attn.kv_cache[:, 3]) == 0
+    if not host_draft:
+        assert torch.count_nonzero(fast_attn.kv_cache[:, 3]) == 0
     assert torch.count_nonzero(fast_attn.indexer.compressed_key_cache.kv_cache[2]) == 0
-    fast_attn.host_history = object()
-    assert not fast.forward_kv_only(inputs[:2], torch.arange(2), hidden[:2])

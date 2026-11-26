@@ -1444,7 +1444,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> None:
-        """Write GPU main and indexer caches without sparse attention."""
+        """Write main and indexer caches without sparse attention."""
         metadata = get_forward_context().attn_metadata
         if isinstance(metadata, list):
             metadata = metadata[0]
@@ -1460,10 +1460,21 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         _, k, v, _ = self._project_qkv_gate(qkv, positions)
         key = k.view(hidden_states.shape[0], self.num_kv_heads, self.head_dim)
         value = v.view(hidden_states.shape[0], self.num_kv_heads, self.head_dim)
-        impl = cast(Qwen4ExpQSAFlashAttentionImpl, self.impl)
-        impl.do_kv_cache_update(
-            self, key, value, self.kv_cache, main_metadata.slot_mapping
-        )
+        host = self.host_history
+        if host is not None:
+            host.write(
+                key,
+                value,
+                main_metadata.slot_mapping,
+                self.kv_cache_dtype,
+                self._k_scale,
+                self._v_scale,
+            )
+        else:
+            impl = cast(Qwen4ExpQSAFlashAttentionImpl, self.impl)
+            impl.do_kv_cache_update(
+                self, key, value, self.kv_cache, main_metadata.slot_mapping
+            )
 
     def forward(
         self,

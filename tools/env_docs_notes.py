@@ -41,7 +41,7 @@ NOTES: dict[str, dict[str, str]] = {
         since="0.2.0rc16",
         range="0, 1",
         tradeoff="Opt in to eager KV-only MTP prefill for incomplete chunks "
-        "with GPU draft KV. This skips attention, MLP and sampling; floating "
+        "with GPU or Host draft KV. This skips attention, MLP and sampling; floating "
         "point results may differ from the compiled full draft path.",
         metrics="",
     ),

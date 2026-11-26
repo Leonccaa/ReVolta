@@ -175,7 +175,6 @@ class FinalMix(nn.Module):
 
 
 @pytest.mark.parametrize("host_draft", [False, True])
-@torch.inference_mode()
 def test_draft_cache_writes_match_full_path(
     monkeypatch, mtp_module, default_vllm_config, host_draft
 ):
@@ -299,9 +298,10 @@ def test_draft_cache_writes_match_full_path(
         attention._v_scale = torch.tensor(1.0)
         attention.indexer.layer_id = 0
         if host_draft:
+            attention.host_cache = torch.zeros_like(attention.kv_cache)
 
             def host_write(key, value, slots, dtype, k_scale, v_scale):
-                write(attention, key, value, attention.kv_cache, slots)
+                write(attention, key, value, attention.host_cache, slots)
 
             attention.host_history = SimpleNamespace(write=host_write)
 
@@ -334,8 +334,7 @@ def test_draft_cache_writes_match_full_path(
         cslots = torch.tensor(
             [-1 if i % 2 == 0 else i // 2 for i in range(start, start + count)]
         )
-        main_slots = slots
-        meta = SimpleNamespace(num_actual_tokens=count, slot_mapping=main_slots)
+        meta = SimpleNamespace(num_actual_tokens=count, slot_mapping=slots)
         side = SimpleNamespace(
             num_actual_tokens=count,
             slot_mapping=slots,
@@ -374,11 +373,12 @@ def test_draft_cache_writes_match_full_path(
         )
         spec.hidden_states = hidden[start : start + padded]
         assert spec.run_kv_only_prefill(padded, state.context.attn_metadata, {}, None)
-        assert torch.equal(fast_attn.written_slots[-1], main_slots)
-        assert torch.equal(full_attn.written_slots[-1], main_slots)
+        assert torch.equal(fast_attn.written_slots[-1], slots)
+        assert torch.equal(full_attn.written_slots[-1], slots)
         assert len(fast_attn.written_slots[-1]) == count
-        fast_main = fast_attn.kv_cache
-        full_main = full_attn.kv_cache
+        cache = "host_cache" if host_draft else "kv_cache"
+        fast_main = getattr(fast_attn, cache)
+        full_main = getattr(full_attn, cache)
         for actual, expected in [
             (fast_main, full_main),
             (
@@ -392,9 +392,10 @@ def test_draft_cache_writes_match_full_path(
         ]:
             assert (actual.float() - expected.float()).abs().max().item() == 0.0
     assert select.call_count == 2  # Full path only; no index scoring on shortcut.
-    assert torch.count_nonzero(fast_main) > 0
+    assert torch.count_nonzero(fast_main[:, raw_slots]) > 0
     assert torch.count_nonzero(fast_attn.indexer.raw_key_cache.kv_cache[raw_slots]) > 0
     assert torch.count_nonzero(fast_attn.indexer.compressed_key_cache.kv_cache[:2]) > 0
-    if not host_draft:
-        assert torch.count_nonzero(fast_attn.kv_cache[:, 3]) == 0
+    assert torch.count_nonzero(fast_main[:, 3]) == 0
+    if host_draft:
+        assert torch.count_nonzero(fast_attn.kv_cache) == 0
     assert torch.count_nonzero(fast_attn.indexer.compressed_key_cache.kv_cache[2]) == 0

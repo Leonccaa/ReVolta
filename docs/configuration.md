@@ -43,7 +43,7 @@ and are subject to model quality validation.
 
 | Value | Storage format / QSA auto selection |
 | --- | --- |
-| `fp8` / `fp8_e4m3` | Existing E4M3 with calibrated per-layer K/V scalar scales |
+| `fp8` / `fp8_e4m3` | Frozen. E4M3 with calibrated per-layer K/V scalar scales |
 | `fp8_per_token_head` | L1 planar E4M3FN with dynamic FP32 scales per token and head; no KV scale overlay needed |
 | `auto` (CLI default) | Planar INT8 for eligible SM70 QSA, planar E4M3 for eligible QSA on other CUDA devices |
 | `int8_per_token_head` / `int8` | On Qwen4Exp QSA, both use planar INT8 with round-to-nearest-even and dynamic FP32 scales per token and head |

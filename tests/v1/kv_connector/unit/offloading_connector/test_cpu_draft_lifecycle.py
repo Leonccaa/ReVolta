@@ -164,7 +164,7 @@ def test_periodic_history_is_bounded_by_held_blocks(geometry, pages, grouped):
             src = job.transfer_spec[0]
             if count := src.group_sizes[h.DRAFT]:
                 assert set(src.block_ids.tolist()[-count:]) <= owned
-        first_held = off._first_held_draft_block(state, gc)
+        first_held = off._first_held_block(state, gc)
         tracked = state.draft_reofferable[h.DRAFT]
         assert all(b >= first_held for b in tracked)
         # The current batch may accept two more blocks before its output.

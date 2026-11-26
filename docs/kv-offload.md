@@ -298,6 +298,52 @@ Prometheus endpoint or a prompt-token hit rate. The delayed queue's `written` an
 `written_bytes_24h` count submitted rows and page bytes, which may still fail or be
 skipped by the disk tier; they do not prove successful physical writes.
 
+## Setting the SSD write delay
+
+`write_delay_s` delays the write of a page to disk. It appears in two places,
+both with a default of 300 s: the `write_delay_s` key of a `revolta_fs` tier
+entry in `secondary_tiers`, and the `write_delay_s` option of the host SSD
+persistence under `host_kv.ssd`. A unified host deployment sets
+`host_kv.ssd.write_delay_s`; when legacy `secondary_tiers` entries are kept as
+well, the engine rejects a mismatch between the two at startup.
+
+The delay saves disk bandwidth: a page that is superseded shortly after it was
+written never reaches the disk. The cost is that a page evicted during the
+delay is not written. The host SSD persistence attempts a write-back before it
+evicts a page, so an evicted page usually reaches the disk; the attempt is
+skipped when the write queue is full, the disk budget has no headroom, or the
+page cannot be written. The `revolta_fs` tier path has no pre-eviction write at
+all: a page evicted or demoted before its deadline is dropped.
+
+Size the delay against the turnover of the pool that feeds the disk: the delay
+should stay well below the turnover time. Estimate the turnover from the pool
+capacity and the actual byte rate entering the pool, and the SSD throughput
+from the actual byte rate that still has to be written.
+
+```text
+turnover ≈ pool capacity ÷ new KV write rate
+new KV write rate ≈ KV bytes per token × actual prefill tokens per second
+```
+
+The numbers below are estimates for Flash-Next with one KV dtype, not
+measurements of your deployment: about 13.8 KB per token and, with four-way
+prefill, about 40 MB/s. A 98 GiB pool then turns over in about 40 minutes, so
+300 s is safe there. A 7 GiB pool turns over in about 3 minutes, so 300 s
+would evict most pages before they reach the disk; use about 20 to 60 s there.
+The SSD must sustain a write rate above the average new KV write rate.
+
+Check the result in the field. With Host SSD persistence, the store counters
+`host_ssd_evict_unwritten` and `host_ssd_evicted_persisted` appear in the
+`Store stats` log line and as Prometheus counters, for example
+`vllm:store_events_total{event="host_ssd_evict_unwritten"}`. A rising
+`host_ssd_evict_unwritten` means pages left the pool before they were written:
+the delay is too long for the pool size, or the write queue and the disk
+budget could not keep up. These two counters apply to Host SSD only. For a
+plain `revolta_fs` tier, read the `Delayed writes` log line instead:
+`dropped_evicted` counts pages dropped because they were evicted before their
+deadline, and `dropped_superseded` counts pages dropped because a newer
+version replaced them.
+
 ## Active Host KV development configuration
 
 `kernel_config.long_context_kv` is an experimental, opt-in configuration for

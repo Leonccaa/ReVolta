@@ -143,6 +143,30 @@ measurements remain unchanged; planar GPU acceptance is still pending.
 - Media limits and request budgets: see
   [multimodal input limits](../.github/MULTIMODAL_INPUTS.md).
 
+### Chat control tokens and the reasoning end-of-turn mask
+
+`--sanitize-control-tokens` (boolean, default `false`) encodes control tokens
+that appear inside chat messages, tool results or documents as plain text: the
+special tokens and the added tokens the chat template uses. Only the chat
+template can then emit them, so a user cannot inject a control token by
+writing it literally. It applies to the Hugging Face chat template path, where
+the rendered template is tokenized with the sanitizer enabled; a tokenizer that
+does not forward the option (for example the Mistral tokenizer) ignores it. The
+server-side setting cannot be turned off per request. Sanitising happens while
+the rendered chat template is tokenized, so a request with multimodal input and
+the `string` chat template content format is rejected with a validation error.
+See [#157](https://github.com/Leonccaa/ReVolta/issues/157).
+
+`VLLM_QWEN_REASONING_EOS_MASK` (default `0`; set `1` to enable) suppresses the
+model's end-of-turn token while a request is still inside its reasoning block,
+so a Qwen chat model that writes the end-of-turn marker literally in its
+reasoning does not end the turn with reasoning only and no answer. It needs a
+request that asks for the reasoning content, uses the Qwen3 reasoning parser
+with thinking enabled, runs on Model Runner V2 and whose prompt already
+contains an unclosed thinking start tag; a template that lets the model write
+the thinking start tag itself is not masked at the start of the request. See
+[#157](https://github.com/Leonccaa/ReVolta/issues/157).
+
 ### ReVolta serving defaults
 
 The SM70 ReVolta profile applies these defaults to FP16 TP4 QSA hybrid
@@ -169,9 +193,10 @@ take precedence.
 The engine still resolves omitted `--async-scheduling` from the executor and
 speculative decoding settings. The DFlash2 schedule and MTP's post-sampling
 GDN state replay select synchronous scheduling by default. Explicit
-`--async-scheduling` retains the existing compatibility checks and skips
-post-sampling replay. Nonstandard K values keep fixed-width drafting when no
-schedule is supplied.
+`--async-scheduling` retains the existing compatibility checks. Nonstandard K
+values keep fixed-width drafting when no schedule is supplied. What async
+scheduling does to the GDN state depends on the deployment; see the
+[DFlash2 settings](dflash2.md#settings).
 
 ### Mixed prefill scheduling
 

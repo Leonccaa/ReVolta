@@ -406,12 +406,26 @@ explicitly when single-request speed matters more than context concurrency,
 when pinned host memory is tight, or when output must stay bitwise comparable
 with releases that defaulted to `"gpu"`. `"host"` needs
 `main_kv_placement="host"` and matching target/draft storage formats and page
-geometry. With DCP2, explicitly set `"qsa_dcp_index_shard": true` at the top
-level of `--kernel-config` for Host MTP. Use the unsharded index for GPU MTP.
-Without the index shard in DCP2, the draft stays on GPU. A draft with a different
-format or geometry stays on the GPU and logs a warning. Changing the value
-changes the host row layout, so an SSD tier written with the other value is not
-read back.
+geometry.
+
+**MTP at DCP2.** `qsa_dcp_index_shard` is unset by default and only the DFlash2
+hybrid serving profile turns it on, so a Host MTP run at DCP2 keeps the
+replicated index by default. The draft then does not have the target's sharded
+geometry, does not become a layer of the host row, and stays in GPU history;
+the engine logs a warning that the draft stays on the GPU. Every history ID
+then costs the `"gpu"` amount of GPU bytes (about 1.13 MB) instead of about
+0.71 MB, so the same GPU budget holds fewer long contexts than the host
+recipe. To place the draft on the host, set `"qsa_dcp_index_shard": true` at
+the top level of `--kernel-config` and keep the defaults
+`main_kv_placement="host"` and `draft_main_placement="host"`. The target and
+the draft must then use the same storage format (the MTP draft inherits the
+target's KV format unless `speculative_config.kv_cache_dtype` overrides it)
+and the same page geometry. DCP1 needs no extra setting. Do not copy that
+flag into a GPU MTP run: outside the long-context mode the model rejects
+index sharding with MTP, and inside it, with `main_kv_placement="gpu"`, the
+flag still leaves the draft on the GPU. A draft with a different format or
+geometry stays on the GPU and logs a warning. Changing the value changes the
+host row layout, so an SSD tier written with the other value is not read back.
 
 `speculative_config.gdn_state_replay=true` replays the accepted target GDN
 inputs for MTP, so recurrent layers keep two state blocks per request instead

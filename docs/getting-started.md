@@ -149,7 +149,7 @@ vllm serve /data/revolta/views/target-512k \
       "attention_backend": "FLASH_ATTN_V100",
       "kv_cache_dtype": "fp8_e4m3"}' \
   --attention-backend FLASH_ATTN_V100 \
-  --prefill-pressure-token-budget 1632 \
+  --prefill-pressure-token-budget 1024 \
   --prefill-pressure-threshold 1 \
   --long-prefill-token-threshold 4896 \
   --mixed-prefill-step-latency-ms 0 \

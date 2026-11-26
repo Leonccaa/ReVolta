@@ -2415,7 +2415,7 @@ class EngineArgs:
             )
         if self.prefill_pressure_token_budget is None:
             self.prefill_pressure_token_budget = (
-                448
+                1024
                 if use_fixed_prefill_profile and self.enable_chunked_prefill
                 else SchedulerConfig.prefill_pressure_token_budget
             )

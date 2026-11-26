@@ -9,9 +9,29 @@ import prometheus_client
 
 from vllm.config import SpeculativeConfig
 from vllm.logger import init_logger
+from vllm.sampling_params import SamplingParams
 from vllm.v1.metrics.utils import create_metric_per_engine
 
 logger = init_logger(__name__)
+
+
+def has_hard_token_mask(
+    sampling_params: SamplingParams | None, num_output_tokens: int
+) -> bool:
+    """Whether sampling params hard-mask target tokens right now.
+
+    The draft path (MTP / DFlash2 argmax over the draft logits) never sees
+    the target-side masks, so bad words, an allowed-token allowlist, or an
+    unmet min_tokens (EOS/stop still masked) make rejection of a masked
+    draft token certain. Penalties only lower acceptance probability and
+    are not counted here. Evaluated per verification round from the
+    request's current sampling params and its output length so far.
+    """
+    if sampling_params is None:
+        return False
+    if sampling_params.bad_words_token_ids or sampling_params.allowed_token_ids:
+        return True
+    return sampling_params.min_tokens > num_output_tokens
 
 
 @dataclass
@@ -31,6 +51,10 @@ class SpecDecodingStats:
     # Rejected positions whose stable FP32 residual max(p - q, 0) was empty
     # and were redrawn from a fallback tier.
     num_rejection_fallbacks: int = 0
+    # Subset of the token totals above, for verification rounds whose
+    # sampling params hard-mask target tokens (see has_hard_token_mask).
+    num_hard_constrained_draft_tokens: int = 0
+    num_hard_constrained_accepted_tokens: int = 0
 
     @classmethod
     def new(cls, num_spec_tokens: int) -> "SpecDecodingStats":
@@ -39,10 +63,18 @@ class SpecDecodingStats:
             num_accepted_tokens_per_pos=[0] * num_spec_tokens,
         )
 
-    def observe_draft(self, num_draft_tokens: int, num_accepted_tokens: int):
+    def observe_draft(
+        self,
+        num_draft_tokens: int,
+        num_accepted_tokens: int,
+        hard_constrained: bool = False,
+    ):
         self.num_drafts += 1
         self.num_draft_tokens += num_draft_tokens
         self.num_accepted_tokens += num_accepted_tokens
+        if hard_constrained:
+            self.num_hard_constrained_draft_tokens += num_draft_tokens
+            self.num_hard_constrained_accepted_tokens += num_accepted_tokens
         assert num_accepted_tokens <= self.num_spec_tokens
         for i in range(num_accepted_tokens):
             self.num_accepted_tokens_per_pos[i] += 1
@@ -193,6 +225,26 @@ class SpecDecodingProm:
             counter_rejection_fallbacks, per_engine_labelvalues
         )
 
+        counter_hard_draft_tokens = self._counter_cls(
+            name="vllm:spec_decode_hard_constrained_draft_tokens",
+            documentation="Number of draft tokens for hard-constrained requests.",
+            labelnames=labelnames,
+        )
+        self.counter_spec_decode_hard_constrained_draft_tokens = (
+            create_metric_per_engine(counter_hard_draft_tokens, per_engine_labelvalues)
+        )
+
+        counter_hard_accepted_tokens = self._counter_cls(
+            name="vllm:spec_decode_hard_constrained_accepted_tokens",
+            documentation="Number of accepted tokens for hard-constrained requests.",
+            labelnames=labelnames,
+        )
+        self.counter_spec_decode_hard_constrained_accepted_tokens = (
+            create_metric_per_engine(
+                counter_hard_accepted_tokens, per_engine_labelvalues
+            )
+        )
+
         assert speculative_config is not None
         num_spec_tokens = (
             speculative_config.num_speculative_tokens
@@ -228,6 +280,12 @@ class SpecDecodingProm:
             self.counter_spec_decode_num_rejection_fallbacks[engine_idx].inc(
                 spec_decoding_stats.num_rejection_fallbacks
             )
+        self.counter_spec_decode_hard_constrained_draft_tokens[engine_idx].inc(
+            spec_decoding_stats.num_hard_constrained_draft_tokens
+        )
+        self.counter_spec_decode_hard_constrained_accepted_tokens[engine_idx].inc(
+            spec_decoding_stats.num_hard_constrained_accepted_tokens
+        )
         for pos, counter in enumerate(
             self.counter_spec_decode_num_accepted_tokens_per_pos[engine_idx]
         ):

@@ -37,6 +37,12 @@ satisfy these checks. The QSA route supports FP16 queries with six 256-element
 heads per rank and up to 64 rows. These paths can change floating-point rounding
 and are subject to model quality validation.
 
+`VLLM_SM70_DCP2_P2P=1` opts into Flash-Next QSA DCP2 query and packed output/LSE
+exchange on an SM70 TP4 PCIe-switch group with registered push buffers. It defaults
+to `0`. The path uses FP16 queries and the DCP A2A backend in uniform decode,
+including dedicated FULL decode graphs. The two transfers are admitted together
+up to `min(max_num_seqs * (1 + num_speculative_tokens), 53)` rows.
+
 ## Launch options
 
 `--kv-cache-dtype` selects the storage format:

@@ -3327,6 +3327,23 @@ def sm70_tp4_push_allreduce_buffer_size() -> int:
     return _custom_ar_op("sm70_tp4_push_allreduce_buffer_size")()
 
 
+def sm70_dcp2_p2p_buffer_size() -> int:
+    return _custom_ar_owner_namespace().sm70_dcp2_p2p_buffer_size()
+
+
+def sm70_dcp2_p2p(
+    fa: int,
+    peer: int,
+    local_input: torch.Tensor,
+    peer_input: torch.Tensor,
+    local_out: torch.Tensor,
+    peer_out: torch.Tensor,
+) -> None:
+    _custom_ar_owner_namespace().sm70_dcp2_p2p(
+        fa, peer, local_input, peer_input, local_out, peer_out
+    )
+
+
 def sm70_tp4_push_allgather(fa: int, inp: torch.Tensor, out: torch.Tensor) -> None:
     _custom_ar_owner_namespace().sm70_tp4_push_allgather(fa, inp, out)
 

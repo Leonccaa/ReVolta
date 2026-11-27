@@ -37,4 +37,4 @@ The view contains the merged index, both scale files, `kvscales-provenance.json`
 
 - [Checkpoints, KV scales and MTP drafts](../../docs/checkpoints.md)
 - [FP4-Local scale pack](../kv-scales/fp4-local/README.md)
-- [Configuration reference](../../docs/configuration.md#launch-options): KV cache formats.
+- [Configuration reference](../../docs/configuration.md#kv-cache-format): KV cache formats.

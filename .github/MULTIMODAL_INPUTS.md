@@ -81,5 +81,5 @@ The budgets above limit admitted and retained media data. They are not a hard ce
 ## See also
 
 - [Getting started](../docs/getting-started.md): the reference multimodal launch options
-- [Launch options](../docs/configuration.md#launch-options)
+- [Multimodal launch options](../docs/configuration.md#multimodal-input)
 - [Support and known limits](../docs/known-limits.md)

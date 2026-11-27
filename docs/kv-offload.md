@@ -158,7 +158,7 @@ The example sets a 16 GiB CPU pool and an 8 GiB disk budget. Notes:
 
 ### 3. Allow time to drain at shutdown
 
-Pending page writes are written at shutdown only if the engine gets time for it. The API server stops the engine `--shutdown-timeout` seconds after a stop request; with the default `0` it stops at once and pending writes are lost. The reference launch sets `--shutdown-timeout 30`: in-flight requests finish first, then pending writes get up to `drain_timeout_s` (20 s in the example) within what is left of the 30 s. Give the container or service supervisor more time than that before it force-stops the engine (the reference container uses `--stop-timeout 120`); see `--shutdown-timeout` in [Launch options](configuration.md#launch-options).
+Pending page writes are written at shutdown only if the engine gets time for it. The API server stops the engine `--shutdown-timeout` seconds after a stop request; with the default `0` it stops at once and pending writes are lost. The reference launch sets `--shutdown-timeout 30`: in-flight requests finish first, then pending writes get up to `drain_timeout_s` (20 s in the example) within what is left of the 30 s. Give the container or service supervisor more time than that before it force-stops the engine (the reference container uses `--stop-timeout 120`); see `--shutdown-timeout` in [Shutdown and diagnostics](configuration.md#shutdown-and-diagnostics).
 
 ### 4. Check that it works
 

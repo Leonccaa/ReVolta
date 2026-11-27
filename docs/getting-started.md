@@ -272,7 +272,7 @@ Container notes:
 - **Shared memory.** The CPU KV pool is a file in `/dev/shm`, and so is the host store of [Host KV](kv-offload.md#host-kv-long-context). Make `--shm-size` larger than `cpu_bytes_to_use` (or `host_store_gib` with Host KV); the validated container used `128g`. The engine removes the file names once every process has mapped them, so a normal or forced stop releases the memory. Only a crash during startup can leave `vllm_offload_*.mmap` files behind; recreating the container removes them.
 - **Caches.** The compile cache lives under `VLLM_CACHE_ROOT` (default `/root/.cache/vllm` inside the container) and the TileLang cache under `TILELANG_CACHE_DIR`. Point both at the mounted volume, as above; otherwise a container started with `--rm` compiles everything again on each start.
 - **Privileges.** `--cap-add SYS_PTRACE` was required in the validated container: the workers share memory with each other through `pidfd_getfd`. The validated container also used `--security-opt seccomp=unconfined`; it has not been tested without it.
-- **Stopping.** Keep `--stop-timeout` above `--shutdown-timeout` plus the process-exit wait, which defaults to the same value (30 + 30 seconds here). See [Launch options](configuration.md#launch-options).
+- **Stopping.** Keep `--stop-timeout` above `--shutdown-timeout` plus the process-exit wait, which defaults to the same value (30 + 30 seconds here). See [Shutdown and diagnostics](configuration.md#shutdown-and-diagnostics).
 - **Derived images.** Do not bake `VLLM_SM70_*` switches into derived images: values from the environment override the profile.
 
 ## See also

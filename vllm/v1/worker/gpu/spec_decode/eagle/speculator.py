@@ -673,7 +673,6 @@ class EagleSpeculator:
         idx_mapping = self.idx_mapping[:num_reqs]
         if row_indices is None:
             last_hidden_states = last_hidden_states[last_token_indices]
-            hidden_states = hidden_states[last_token_indices]
 
         self.draft_tokens[:num_reqs, 0] = self._sample_draft(
             last_hidden_states,
@@ -682,6 +681,8 @@ class EagleSpeculator:
             self.current_draft_step,
             self.draft_logits,
         )
+        if row_indices is None:
+            hidden_states = hidden_states[last_token_indices]
         self.hidden_states[:num_reqs] = hidden_states
         self.input_buffers.positions[:num_reqs] = pos
 
@@ -978,10 +979,10 @@ class EagleSpeculator:
             and input_batch.num_draft_tokens == 0
             and mm_inputs is None
             and prefill_batch_desc.cg_mode != CUDAGraphMode.FULL
-            and attn_metadata is not None
         ):
             incomplete = input_batch.is_incomplete_prefilling_np
-            if incomplete is not None and incomplete.all():
+            assert incomplete is not None
+            if incomplete.all():
                 if (
                     prefill_batch_desc.cg_mode == CUDAGraphMode.NONE
                     and self.run_kv_only_prefill(
@@ -993,14 +994,12 @@ class EagleSpeculator:
                 ):
                     return self.draft_tokens[:num_reqs]
             # DP MoE collectives are coordinated using the full-row counts.
-            elif self.dp_size == 1 and getattr(
-                self.model, "supports_last_row_prefill", False
+            elif (
+                self.dp_size == 1
+                and getattr(self.model, "supports_last_row_prefill", False)
+                and (input_batch.is_prefilling_np & ~incomplete).any()
             ):
-                completing = input_batch.is_prefilling_np
-                if incomplete is not None:
-                    completing = completing & ~incomplete
-                if completing.any():
-                    row_indices = self.last_token_indices[:num_reqs]
+                row_indices = self.last_token_indices[:num_reqs]
         if prefill_batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Replay the full graph for draft prefill.
             assert self.prefill_cudagraph_manager is not None

@@ -372,7 +372,6 @@ class QSAIndexer(nn.Module):
             # The original request segments refer to the cache-write rows.
             query_start_loc_cpu = None
             prefill_ranges = ()
-            uniform_decode = False
         return qsa_select_paged_tokens(
             q,
             compressed_key_cache,

@@ -1513,6 +1513,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         query = q.view(num_tokens, self.num_heads, self.head_dim)
         key = k.view(num_tokens, self.num_kv_heads, self.head_dim)
         value = v.view(num_tokens, self.num_kv_heads, self.head_dim)
+        encoded_layer_name = _encode_layer_name(self.layer_name)
         if row_indices is not None:
             attn_output = query.new_empty(
                 (row_indices.numel(), self.num_heads, self.head_dim)
@@ -1537,7 +1538,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 value,
                 attn_output,
                 gate,
-                _encode_layer_name(self.layer_name),
+                encoded_layer_name,
             )
         else:
             attn_output = torch.empty_like(query)
@@ -1549,7 +1550,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 value,
                 attn_output,
                 gate,
-                _encode_layer_name(self.layer_name),
+                encoded_layer_name,
             )
         flat_output = attn_output.flatten(1)
         if reduce_results is None:

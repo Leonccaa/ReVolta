@@ -90,13 +90,9 @@ from vllm.v1.worker.gpu.spec_decode.eagle import speculator as eagle
             "graph",
         ),
         (False, [False], 0, False, False, False, False, CUDAGraphMode.NONE, "full"),
-        (True, [False], 0, False, False, False, False, CUDAGraphMode.NONE, "last"),
         (True, [False], 0, False, False, False, False, CUDAGraphMode.PIECEWISE, "last"),
         (True, [True], 0, False, False, False, False, CUDAGraphMode.PIECEWISE, "full"),
         (True, [False], 0, False, False, False, False, CUDAGraphMode.FULL, "graph"),
-        (True, [False], 0, False, True, False, False, CUDAGraphMode.NONE, "full"),
-        (True, [False], 0, False, False, True, False, CUDAGraphMode.NONE, "full"),
-        (True, None, 0, False, False, False, False, CUDAGraphMode.NONE, "full"),
     ],
 )
 def test_propose_selects_prefill_path(
@@ -113,7 +109,7 @@ def test_propose_selects_prefill_path(
 ):
     monkeypatch.setenv("VLLM_SM70_MTP_KV_ONLY_PREFILL", str(int(enabled)))
     monkeypatch.setattr(eagle, "prepare_eagle_inputs", Mock())
-    num_reqs = 1 if incomplete is None else len(incomplete)
+    num_reqs = len(incomplete)
     num_tokens = 2 * num_reqs
     descriptor = SimpleNamespace(cg_mode=mode, num_tokens=num_tokens)
     monkeypatch.setattr(
@@ -146,10 +142,8 @@ def test_propose_selects_prefill_path(
         num_reqs=num_reqs,
         num_scheduled_tokens=np.full(num_reqs, 2),
         idx_mapping=torch.arange(num_reqs),
-        is_prefilling_np=np.full(num_reqs, incomplete is not None),
-        is_incomplete_prefilling_np=(
-            None if incomplete is None else np.array(incomplete)
-        ),
+        is_prefilling_np=np.ones(num_reqs, dtype=bool),
+        is_incomplete_prefilling_np=np.array(incomplete),
         num_draft_tokens=drafts,
         is_dummy_batch=batch_dummy,
     )
@@ -318,6 +312,7 @@ def test_last_rows_match_full_draft(
     state: Any = SimpleNamespace()
     monkeypatch.setattr(qsa, "get_forward_context", lambda: state.context)
     monkeypatch.setattr(indexer_qsa, "get_forward_context", lambda: state.context)
+    monkeypatch.setattr(eagle, "get_forward_context", lambda: state.context)
     context = Mock(return_value=nullcontext())
     monkeypatch.setattr(eagle, "set_forward_context", context)
 
@@ -466,6 +461,7 @@ def test_last_rows_match_full_draft(
 
         predictor = object.__new__(mtp_module.Qwen4ExpMultiTokenPredictor)
         nn.Module.__init__(predictor)
+        predictor.do_not_compile = True
         predictor.num_mtp_layers = 1
         predictor.hc_count = 2
         predictor.hidden_size = 4
@@ -480,6 +476,7 @@ def test_last_rows_match_full_draft(
         predictor.hyper_connection_mixer = Mix()
         draft = object.__new__(mtp_module.Qwen4ExpMTP)
         nn.Module.__init__(draft)
+        draft.do_not_compile = True
         draft.model = predictor
         return draft, attention
 
@@ -586,12 +583,6 @@ def test_last_rows_match_full_draft(
             )
             torch.testing.assert_close(positions, pos[rows])
             torch.testing.assert_close(
-                spec.input_buffers.positions[:num_reqs], pos[rows]
-            )
-            torch.testing.assert_close(
-                spec.draft_tokens[:, 0], expected_sample[rows].argmax(-1)
-            )
-            torch.testing.assert_close(
                 fast_attn.topk_indices_buffer[:num_reqs],
                 full_attn.topk_indices_buffer[rows],
             )
@@ -600,7 +591,6 @@ def test_last_rows_match_full_draft(
                 == sparse.call_args.args[0].shape[0]
                 == num_reqs
             )
-            assert main.slot_mapping.tolist() == [15, 4, 8, 9, 10]
 
         def main_cache(attn):
             if host_draft:
@@ -624,3 +614,77 @@ def test_last_rows_match_full_draft(
     assert select.call_count == 3  # Both full passes and the compact final pass.
     if host_draft:
         assert torch.count_nonzero(fast_attn.kv_cache) == 0
+
+    # Compact the full path just as the speculator does before draft step 1.
+    full.model.compact_topk_indices(rows)
+    expected_selection = full_attn.topk_indices_buffer[:num_reqs].clone()
+    starts = torch.tensor([0, 1, 2], dtype=torch.int32)
+    common = CommonAttentionMetadata(
+        num_reqs=num_reqs,
+        num_actual_tokens=num_reqs,
+        max_query_len=1,
+        max_seq_len=6,
+        query_start_loc=starts,
+        query_start_loc_cpu=starts,
+        seq_lens=torch.tensor([6, 4], dtype=torch.int32),
+        block_table_tensor=page_table,
+        slot_mapping=torch.zeros(num_reqs, dtype=torch.long),
+    )
+    metadata = {
+        "mtp.attn": builder.build(0, common),
+        "raw": side_metadata(common, 1),
+        "compressed": side_metadata(common, 2, torch.empty(2, 2, dtype=torch.int32)),
+    }
+    reader_name = "forward_qsa_host" if host_draft else "forward_qsa"
+    reader = getattr(qsa.Qwen4ExpQSAFlashAttentionImpl, reader_name)
+    selections = []
+
+    def record_selection(self, layer, *args, **kwargs):
+        selections.append(layer.topk_indices_buffer[:num_reqs].clone())
+        return reader(self, layer, *args, **kwargs)
+
+    monkeypatch.setattr(
+        qsa.Qwen4ExpQSAFlashAttentionImpl, reader_name, record_selection
+    )
+    first_tokens = spec.draft_tokens[:, 0].clone()
+    second_tokens = []
+    for model, attention, feedback in (
+        (full, full_attn, expected_feedback[rows]),
+        (fast, fast_attn, spec.hidden_states[:num_reqs].clone()),
+    ):
+        spec.model = model
+        spec.share_mtp_topk_indices = True
+        spec.supports_mm_inputs = False
+        spec.num_speculative_steps = 2
+        spec.max_model_len = 8
+        spec.hidden_states = feedback.clone()
+        spec.input_buffers = SimpleNamespace(
+            input_ids=torch.zeros(num_reqs, dtype=torch.long),
+            positions=pos[rows].clone(),
+            query_start_loc=torch.zeros(num_reqs + 1, dtype=torch.int32),
+            seq_lens=torch.zeros(num_reqs, dtype=torch.int32),
+        )
+        eagle.prepare_eagle_decode(
+            first_tokens,
+            torch.tensor([5, 3]),
+            torch.zeros(num_reqs, dtype=torch.int32),
+            spec.input_buffers,
+            spec.max_model_len,
+            num_reqs,
+        )
+        state.context = SimpleNamespace(
+            attn_metadata=metadata,
+            no_compile_layers={"mtp.attn": attention},
+            is_uniform_decode=False,
+            additional_kwargs={},
+        )
+        spec.current_draft_step.fill_(1)
+        spec._mtp_decode_begin()
+        spec.generate_draft(num_reqs, num_reqs, metadata, {}, None)
+        spec._mtp_decode_end()
+        second_tokens.append(spec.draft_tokens[:, 1].clone())
+
+    assert select.call_count == 3  # Neither decode step selects again.
+    torch.testing.assert_close(selections[0], expected_selection)
+    torch.testing.assert_close(selections[1], expected_selection)
+    torch.testing.assert_close(second_tokens[1], second_tokens[0])

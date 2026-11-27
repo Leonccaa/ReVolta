@@ -64,12 +64,14 @@ def engine_config(monkeypatch, tmp_path):
         packed=None,
         long_context=False,
         gdn_replay=None,
+        gdn_deferred_commit_metadata=None,
         replay_graph=None,
         legacy_graph=True,
         dynamic_schedule=None,
         dp_size=1,
         awq=False,
         gdn_input_v154=None,
+        async_scheduling=False,
     ):
         target = tmp_path / "target"
         target.mkdir(exist_ok=True)
@@ -166,6 +168,7 @@ def engine_config(monkeypatch, tmp_path):
                 num_speculative_tokens_per_batch_size=dynamic_schedule,
                 draft_sample_method="greedy",
                 gdn_state_replay=gdn_replay,
+                gdn_deferred_commit_metadata=gdn_deferred_commit_metadata,
                 gdn_state_replay_graph=replay_graph,
                 # Keep this config-only test independent of the drafter loader.
                 mtp_expert_quantization="fp16" if awq and method == "mtp" else None,
@@ -193,7 +196,7 @@ def engine_config(monkeypatch, tmp_path):
                 max_num_batched_tokens=8192,
                 max_model_len=524288,
                 is_encoder_decoder=model.is_encoder_decoder,
-                async_scheduling=False,
+                async_scheduling=async_scheduling,
             ),
         )
 
@@ -202,7 +205,8 @@ def engine_config(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize(
-    "case", ["mtp", "dflash", "explicit_off", "nvlink", "dp2", "auto_nccl"]
+    "case",
+    ["mtp", "dflash", "explicit_off", "nvlink", "dp2", "auto_nccl", "async_deferred"],
 )
 def test_awq_mtp_wide_verify_defaults(engine_config, monkeypatch, case):
     from vllm import revolta_profile
@@ -228,6 +232,10 @@ def test_awq_mtp_wide_verify_defaults(engine_config, monkeypatch, case):
     )
     method = "dflash" if case == "dflash" else "mtp"
     explicit_off = case == "explicit_off"
+    async_deferred = case == "async_deferred"
+    if async_deferred:
+        # The CPU platform hook would reset the resolved scheduler to synchronous.
+        monkeypatch.setattr(current_platform, "check_and_update_config", lambda _: None)
     if case == "auto_nccl":
         monkeypatch.setenv("VLLM_SM70_INTERCONNECT", "auto")
         monkeypatch.setenv("VLLM_SM70_PCIE_SWITCH_CUSTOM_AR", "0")
@@ -239,10 +247,15 @@ def test_awq_mtp_wide_verify_defaults(engine_config, monkeypatch, case):
         2560,
         method=method,
         awq=True,
-        gdn_replay=True,
+        gdn_replay=not async_deferred,
+        gdn_deferred_commit_metadata=True if async_deferred else None,
         dp_size=2 if case == "dp2" else 1,
         gdn_input_v154=False if explicit_off else None,
+        async_scheduling=async_deferred,
     )
+    if async_deferred:
+        assert config.scheduler_config.async_scheduling is True
+        assert config.speculative_config.gdn_spec_state_replay
     enabled = case == "mtp"
     assert config.kernel_config.sm70_gdn_input_v154 is enabled
     assert envs.VLLM_SM70_MTP_GDN_NATIVE_VERIFY is enabled

@@ -13,6 +13,7 @@ from vllm.config import (
     CacheConfig,
     DeviceConfig,
     KernelConfig,
+    KVTransferConfig,
     ModelConfig,
     ParallelConfig,
     SchedulerConfig,
@@ -72,6 +73,7 @@ def engine_config(monkeypatch, tmp_path):
         awq=False,
         gdn_input_v154=None,
         async_scheduling=False,
+        kv_transfer_config=None,
     ):
         target = tmp_path / "target"
         target.mkdir(exist_ok=True)
@@ -187,6 +189,7 @@ def engine_config(monkeypatch, tmp_path):
             model_config=model,
             speculative_config=spec,
             parallel_config=parallel,
+            kv_transfer_config=kv_transfer_config,
             device_config=DeviceConfig(device="cpu"),
             cache_config=CacheConfig(
                 enable_prefix_caching=True, mamba_cache_mode="align"
@@ -206,7 +209,16 @@ def engine_config(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize(
     "case",
-    ["mtp", "dflash", "explicit_off", "nvlink", "dp2", "auto_nccl", "async_deferred"],
+    [
+        "mtp",
+        "mtp_cpu_offload",
+        "dflash",
+        "explicit_off",
+        "nvlink",
+        "dp2",
+        "auto_nccl",
+        "async_deferred",
+    ],
 )
 def test_awq_mtp_wide_verify_defaults(engine_config, monkeypatch, case):
     from vllm import revolta_profile
@@ -252,11 +264,22 @@ def test_awq_mtp_wide_verify_defaults(engine_config, monkeypatch, case):
         dp_size=2 if case == "dp2" else 1,
         gdn_input_v154=False if explicit_off else None,
         async_scheduling=async_deferred,
+        # The reference configuration keeps a CPU KV pool behind this connector.
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="OffloadingConnector",
+            kv_role="kv_both",
+            kv_connector_extra_config={
+                "spec_name": "TieringOffloadingSpec",
+                "cpu_bytes_to_use": 51539607552,
+            },
+        )
+        if case == "mtp_cpu_offload"
+        else None,
     )
     if async_deferred:
         assert config.scheduler_config.async_scheduling is True
         assert config.speculative_config.gdn_spec_state_replay
-    enabled = case == "mtp"
+    enabled = case in ("mtp", "mtp_cpu_offload")
     assert config.kernel_config.sm70_gdn_input_v154 is enabled
     assert envs.VLLM_SM70_MTP_GDN_NATIVE_VERIFY is enabled
     assert envs.VLLM_SM70_QWEN38_NATIVE_ROUTER_TOPK is enabled

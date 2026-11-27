@@ -67,7 +67,7 @@ def _add_requests_and_schedule(
     return scheduler.schedule()
 
 
-def test_mtp_zero_drafts_preserves_prefill_forward():
+def test_mtp_zero_drafts_preserves_prefill_forward(monkeypatch):
     from unittest.mock import Mock
 
     import numpy as np
@@ -78,6 +78,7 @@ def test_mtp_zero_drafts_preserves_prefill_forward():
     from vllm.v1.worker.gpu.input_batch import InputBuffers
     from vllm.v1.worker.gpu.spec_decode.eagle import speculator as eagle
 
+    monkeypatch.setenv("VLLM_SM70_MTP_KV_ONLY_PREFILL", "0")
     spec = object.__new__(eagle.EagleSpeculator)
     spec.method = "mtp"
     spec.num_speculative_steps = 2

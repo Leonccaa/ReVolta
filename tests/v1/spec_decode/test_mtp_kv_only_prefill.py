@@ -61,9 +61,20 @@ from vllm.v1.worker.gpu.spec_decode.eagle import speculator as eagle
             CUDAGraphMode.NONE,
             "full",
         ),
+        (
+            None,
+            [True, True],
+            0,
+            False,
+            False,
+            False,
+            False,
+            CUDAGraphMode.NONE,
+            "kv",
+        ),
         (True, [True, True], 0, False, False, False, False, CUDAGraphMode.NONE, "kv"),
         (
-            True,
+            None,
             [True, False],
             0,
             False,
@@ -107,7 +118,10 @@ def test_propose_selects_prefill_path(
     mode,
     path,
 ):
-    monkeypatch.setenv("VLLM_SM70_MTP_KV_ONLY_PREFILL", str(int(enabled)))
+    if enabled is None:
+        monkeypatch.delenv("VLLM_SM70_MTP_KV_ONLY_PREFILL", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_SM70_MTP_KV_ONLY_PREFILL", str(int(enabled)))
     monkeypatch.setattr(eagle, "prepare_eagle_inputs", Mock())
     num_reqs = len(incomplete)
     num_tokens = 2 * num_reqs

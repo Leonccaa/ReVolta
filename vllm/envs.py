@@ -388,7 +388,7 @@ if TYPE_CHECKING:
     VLLM_SM70_MTP_ROUTER_BATCH: bool = True
     VLLM_SM70_MTP_SHARED_BATCH: bool = True
     VLLM_SM70_MTP_Q8_PREFILL_MMQ: bool = False
-    VLLM_SM70_MTP_KV_ONLY_PREFILL: bool = False
+    VLLM_SM70_MTP_KV_ONLY_PREFILL: bool = True
     VLLM_SM70_MTP_PLE_CONV: bool = True
     VLLM_SM70_PLE_GATE_NORM: bool = False
     VLLM_SM70_QWEN38_FUSED_HC_FP16: bool = False
@@ -5196,14 +5196,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=True,
     ),
     "VLLM_SM70_MTP_KV_ONLY_PREFILL": env_var(
-        lambda: bool(int(os.getenv("VLLM_SM70_MTP_KV_ONLY_PREFILL", "0"))),
-        description="Use KV-only MTP draft prefill for eligible incomplete chunks.",
-        category="experimental",
-        declared_default="False",
-        effective_default="False; opt in explicitly.",
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_KV_ONLY_PREFILL", "1"))),
+        description=(
+            "Write only KV for eligible incomplete MTP draft prefills and "
+            "compute only sampled rows for eligible completed prefills. "
+            "Enabled by default; set 0 to use full-row draft prefill."
+        ),
+        category="tuning",
+        declared_default="True",
+        effective_default="True for eligible batches; set 0 to disable both paths.",
         automatic_conditions=(
-            "Single-layer Flash-Next MTP with GPU draft KV, no PLE, and "
-            "incomplete eager prefill without draft tokens or multimodal inputs.",
+            "Single-layer Flash-Next MTP with GPU or Host draft KV, no PLE, "
+            "draft tokens or multimodal inputs. KV-only requires an eager batch "
+            "of incomplete prefills; sampled rows require at least one completed "
+            "prefill, DP=1 and no FULL CUDA graph replay.",
         ),
         acceleration_paths=("Flash-Next MTP draft",),
         user_visible=True,

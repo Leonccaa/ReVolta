@@ -673,7 +673,7 @@ class KernelConfig:
 
     sm70_qsa_paged_int8_h12: bool = False
     """Use the native planar INT8 paged QSA reader for eligible TP4/DCP2
-    target decode on SM70."""
+    target decode on SM70, including the hot pool of host main K/V."""
 
     sm70_qsa_paged_fp16_h6: bool | None = None
     """Use the native FP16 paged QSA reader in replicated MTP decode graphs

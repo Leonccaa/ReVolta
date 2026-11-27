@@ -431,7 +431,9 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         passes that fit the hot pool. Positions and sequence lengths are not
         passed to the sparse kernel: the remapped IDs are not positions, and
         the selection is already causal (the remap also drops columns at or
-        past each request's length).
+        past each request's length). Under DCP2, small uniform decode steps
+        read the planar INT8 hot pool with the native H12 reader when the
+        layer admits it, like the GPU arm.
 
         With ``prefill_gather="union"`` a mixed step (more query rows than a
         decode step) instead fills the union of its selections into the hot
@@ -616,6 +618,26 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 v_scale,
                 **scale_kwargs,
             )
+            if (
+                grouped == 0
+                and layer.sm70_qsa_paged_h12
+                and end - start <= H12_MAX_ROWS
+                and 0 < local_width <= H12_MAX_WIDTH
+                and get_forward_context().is_uniform_decode
+            ):
+                # The gather filled this pass's groups on the current stream.
+                qsa_paged_h12(
+                    rows_q,
+                    key_cache,
+                    value_cache,
+                    hot_ids[:, :local_width],
+                    hot_table,
+                    rows_req,
+                    rows_out,
+                    rows_lse,
+                    **scale_kwargs,
+                )
+                grouped = end - start
             if grouped < end - start:
                 qsa_sparse_paged_attention(
                     rows_q[grouped:],
@@ -925,6 +947,44 @@ def _warmup_sm70_qsa_segments(
     return False
 
 
+def _sm70_qsa_paged_h12_admitted(
+    vllm_config: VllmConfig,
+    kv_cache_dtype: str,
+    dcp_sharded: bool,
+    tp_size: int,
+    geometry: tuple[int, int, int],
+) -> bool:
+    """Admit the native H12 reader for a TP4/DCP2 SM70 target layer.
+
+    Host main K/V uses the INT8 instance on the planar hot pool; FP16 host
+    history keeps the Triton reader."""
+    kernel_config = vllm_config.kernel_config
+    host_kv = kernel_config.long_context_kv
+    if kv_cache_dtype == "int8":
+        enabled = kernel_config.sm70_qsa_paged_int8_h12
+    else:
+        enabled = kernel_config.sm70_qsa_paged_fp16_h12 and kv_cache_dtype in (
+            "auto",
+            "float16",
+        )
+    return (
+        enabled
+        and vllm_config.use_v2_model_runner
+        and not vllm_config.is_speculative_draft
+        and dcp_sharded
+        and vllm_config.parallel_config.decode_context_parallel_size == 2
+        and tp_size == 4
+        and geometry == (6, 1, 256)
+        and vllm_config.model_config.dtype == torch.float16
+        and (
+            not host_kv.enabled
+            or host_kv.main_kv_placement == "gpu"
+            or kv_cache_dtype == "int8"
+        )
+        and current_platform.is_device_capability(70)
+    )
+
+
 class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
     """Merged Qwen full-attention owner with a QSA index side branch."""
 
@@ -1110,23 +1170,12 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         )
         if self.sm70_qsa_device_history:
             load_qsa_device_history()
-        paged_h12_enabled = (
-            kernel_config.sm70_qsa_paged_int8_h12
-            if self.kv_cache_dtype == "int8"
-            else kernel_config.sm70_qsa_paged_fp16_h12
-            and self.kv_cache_dtype in ("auto", "float16")
-        )
-        self.sm70_qsa_paged_h12 = (
-            paged_h12_enabled
-            and vllm_config.use_v2_model_runner
-            and not vllm_config.is_speculative_draft
-            and self.qsa_dcp_sharded
-            and parallel_config.decode_context_parallel_size == 2
-            and tp_size == 4
-            and (self.num_heads, self.num_kv_heads, self.head_dim) == (6, 1, 256)
-            and model_config.dtype == torch.float16
-            and (not host_kv.enabled or host_kv.main_kv_placement == "gpu")
-            and current_platform.is_device_capability(70)
+        self.sm70_qsa_paged_h12 = _sm70_qsa_paged_h12_admitted(
+            vllm_config,
+            self.kv_cache_dtype,
+            self.qsa_dcp_sharded,
+            tp_size,
+            (self.num_heads, self.num_kv_heads, self.head_dim),
         )
         if self.sm70_qsa_paged_h12:
             load_qsa_paged_h12(self.kv_cache_dtype)

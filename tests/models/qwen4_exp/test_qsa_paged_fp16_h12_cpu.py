@@ -11,6 +11,7 @@ from vllm import distributed
 from vllm.config import CUDAGraphMode, KernelConfig
 from vllm.forward_context import get_forward_context, set_forward_context
 from vllm.models.qwen4_exp.nvidia import qsa
+from vllm.models.qwen4_exp.nvidia.host_kv import history
 from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
 from vllm.models.qwen4_exp.nvidia.ops import qsa_dcp, qsa_paged_fp16_h12
 from vllm.v1.attention.kv_cache_view import KVCacheView, bind_planar_kv_cache
@@ -50,7 +51,10 @@ def _planar_cache():
     return raw, carrier, KVCacheView.bind(carrier, INT8, 256)
 
 
-@pytest.mark.parametrize("dtype", ["float16", "int8"])
+# Host main K/V admits only the INT8 instance (see the admission test).
+@pytest.mark.parametrize(
+    "dtype,host", [("float16", False), ("int8", False), ("int8", True)]
+)
 @pytest.mark.parametrize(
     "enabled,phase,rows,topk,native",
     [
@@ -61,7 +65,9 @@ def _planar_cache():
         (True, True, 48, 8192, False),
     ],
 )
-def test_qsa_h12_dcp_reader(monkeypatch, dtype, enabled, phase, rows, topk, native):
+def test_qsa_h12_dcp_reader(
+    monkeypatch, dtype, host, enabled, phase, rows, topk, native
+):
     layer = SimpleNamespace(
         sm70_qsa_paged_h12=enabled,
         qsa_dcp_sharded=True,
@@ -145,10 +151,11 @@ def test_qsa_h12_dcp_reader(monkeypatch, dtype, enabled, phase, rows, topk, nati
         kv_cache_dtype,
         k_scale,
         v_scale,
-        compacted_indices,
+        compacted_indices=False,
         **scales,
     ):
-        assert kv_cache_dtype == dtype and compacted_indices
+        # The host arm's Triton call is unchanged: hot IDs are not compacted.
+        assert kv_cache_dtype == dtype and compacted_indices is not host
         reader(q, k, v, ids, block_table, token_to_req, out, lse, paged=False, **scales)
 
     monkeypatch.setattr(qsa, "qsa_paged_h12", native_reader)
@@ -162,18 +169,130 @@ def test_qsa_h12_dcp_reader(monkeypatch, dtype, enabled, phase, rows, topk, nati
     impl.head_size, impl.sliding_window = 256, (-1, -1)
     impl.alibi_slopes = impl.sinks = None
     with set_forward_context(None, _forward_config(), is_uniform_decode=phase):
-        impl.forward_qsa(
-            layer,
-            query,
-            query,
-            query,
-            cache,
-            SimpleNamespace(num_actual_tokens=rows, block_table=table),
-            output,
-            token_to_req=requests,
-            output_gate=torch.ones_like(query),
-        )
+        if not host:
+            impl.forward_qsa(
+                layer,
+                query,
+                query,
+                query,
+                cache,
+                SimpleNamespace(num_actual_tokens=rows, block_table=table),
+                output,
+                token_to_req=requests,
+                output_gate=torch.ones_like(query),
+            )
+        else:
+            # The planar view stands in for the hot pool and the localized
+            # selection for its remapped IDs (one remap pass, same columns).
+            def one_pass(store, ids, reqs, blocks, lengths, attend, *, single_pass):
+                assert single_pass
+                attend(0, ids.shape[0], ids)
+
+            monkeypatch.setattr(history, "for_each_pass", one_pass)
+            shape = SimpleNamespace(
+                decode_rows=1, prefill_gather="union", planar_scales=True
+            )
+            hot = SimpleNamespace(
+                store=SimpleNamespace(shape=shape, hot_block_table=table),
+                key_cache=view.key,
+                value_cache=view.value,
+                hot_cache=view,
+                kernel_block_tokens=832,
+            )
+            impl.forward_qsa_host(
+                layer,
+                hot,
+                query,
+                SimpleNamespace(
+                    num_actual_tokens=rows, block_table=None, max_query_len=1
+                ),
+                output,
+                requests,
+                torch.ones(1, dtype=torch.int32),
+                output_gate=torch.ones_like(query),
+            )
     assert torch.all(output == 3)
+
+
+def _h12_config(placement, *, int8, fp16, v2=True, draft=False, dcp=2):
+    return SimpleNamespace(
+        kernel_config=SimpleNamespace(
+            sm70_qsa_paged_int8_h12=int8,
+            sm70_qsa_paged_fp16_h12=fp16,
+            long_context_kv=SimpleNamespace(
+                enabled=placement is not None, main_kv_placement=placement or "host"
+            ),
+        ),
+        use_v2_model_runner=v2,
+        is_speculative_draft=draft,
+        parallel_config=SimpleNamespace(decode_context_parallel_size=dcp),
+        model_config=SimpleNamespace(dtype=torch.float16),
+    )
+
+
+@pytest.mark.parametrize("placement", [None, "gpu", "host"])
+@pytest.mark.parametrize("dtype", ["int8", "float16", "auto", "fp8_e4m3"])
+def test_qsa_h12_admission(monkeypatch, placement, dtype):
+    monkeypatch.setattr(
+        qsa, "current_platform", SimpleNamespace(is_device_capability=(70).__eq__)
+    )
+
+    def admitted(dtype=dtype, sharded=True, tp=4, geometry=(6, 1, 256), **kw):
+        flags = {"int8": dtype == "int8", "fp16": dtype != "int8", **kw}
+        config = _h12_config(placement, **flags)
+        return qsa._sm70_qsa_paged_h12_admitted(config, dtype, sharded, tp, geometry)
+
+    # GPU main K/V keeps K2's admission; host main K/V admits INT8 only.
+    fp16 = dtype in ("float16", "auto")
+    assert admitted() == (dtype == "int8" or (fp16 and placement != "host"))
+    # Each instance has its own switch, default off.
+    assert not admitted(int8=False, fp16=False)
+    assert not admitted(int8=dtype != "int8", fp16=dtype == "int8")
+    assert not any(
+        admitted(**kw) for kw in ({"v2": False}, {"draft": True}, {"dcp": 1})
+    )
+    assert not admitted(sharded=False)
+    assert not admitted(tp=2)
+    assert not admitted(geometry=(12, 1, 256))
+    monkeypatch.setattr(
+        qsa, "current_platform", SimpleNamespace(is_device_capability=(75).__eq__)
+    )
+    assert not admitted()
+
+
+def h12_late_scale(q, k, v, sk, sv, valid):
+    """Python model of the INT8 H12 partials and their FP32 merge.
+
+    ``k``/``v`` hold the integer codes of each selected column
+    ``[rows, width, D]``, ``sk``/``sv`` their scales and ``valid`` the
+    selected columns ``[rows, width]``. Returns FP32 attention and base-2 LSE.
+    """
+    width, splits = k.shape[1], -(-k.shape[1] // 64)
+
+    # Mirror the 64-token partials and their FP32 numerator/max/sum merge.
+    def tiles(x, fill):
+        padded = torch.nn.functional.pad(x, (0, splits * 64 - width), value=fill)
+        return padded.unflatten(-1, (splits, 64))
+
+    logits = ((q.float() @ k.transpose(1, 2)) * sk[:, None, :]) * (
+        math.log2(math.e) / math.sqrt(q.shape[-1])
+    )
+    scores = tiles(logits.masked_fill(~valid[:, None], -torch.inf), -torch.inf)
+    split_max = scores.amax(-1)
+    safe_max = torch.where(split_max.isfinite(), split_max, 0)
+    probabilities = torch.exp2(scores - safe_max[..., None])
+    numerators = torch.einsum(
+        "mhst,mstd->mhsd",
+        probabilities * tiles(sv, 0)[:, None],
+        tiles(v.transpose(1, 2), 0).permute(0, 2, 3, 1),
+    )
+    maximum = split_max.amax(-1, keepdim=True)
+    weights = torch.exp2(split_max - torch.where(maximum.isfinite(), maximum, 0))
+    denominator = (probabilities.sum(-1) * weights).sum(-1)
+    out = (numerators * weights[..., None]).sum(-2) / denominator.clamp_min(1)[
+        ..., None
+    ]
+    return out, maximum.squeeze(-1) + denominator.log2()
 
 
 def test_int8_h12_late_scale_split_merge():
@@ -201,30 +320,7 @@ def test_int8_h12_late_scale_split_merge():
     dense_lse = torch.logsumexp(dense_logits, dim=-1) / math.log(2)
     dense_probs = torch.where(valid, dense_logits.softmax(-1), 0)
     dense_out = dense_probs @ (v * sv[..., None])
-
-    # Mirror the 64-token partials and their FP32 numerator/max/sum merge.
-    def tiles(x, fill):
-        return torch.nn.functional.pad(x, (0, 62), value=fill).unflatten(-1, (17, 64))
-
-    logits = ((q.float() @ k.transpose(1, 2)) * sk[:, None, :]) * (
-        math.log2(math.e) / 16
-    )
-    scores = tiles(logits.masked_fill(~valid, -torch.inf), -torch.inf)
-    split_max = scores.amax(-1)
-    safe_max = torch.where(split_max.isfinite(), split_max, 0)
-    probabilities = torch.exp2(scores - safe_max[..., None])
-    numerators = torch.einsum(
-        "mhst,mstd->mhsd",
-        probabilities * tiles(sv, 0)[:, None],
-        tiles(v.transpose(1, 2), 0).permute(0, 2, 3, 1),
-    )
-    maximum = split_max.amax(-1, keepdim=True)
-    weights = torch.exp2(split_max - torch.where(maximum.isfinite(), maximum, 0))
-    denominator = (probabilities.sum(-1) * weights).sum(-1)
-    h12_out = (numerators * weights[..., None]).sum(-2) / denominator.clamp_min(1)[
-        ..., None
-    ]
-    h12_lse = maximum.squeeze(-1) + denominator.log2()
+    h12_out, h12_lse = h12_late_scale(q, k, v, sk, sv, valid[:, 0])
 
     # Isolate the Triton PV rounding from the different split reduction order.
     weighted = dense_probs * sv[:, None]

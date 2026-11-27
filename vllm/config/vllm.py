@@ -2701,6 +2701,7 @@ class VllmConfig:
                         "fused_gdn_metadata",
                         "fused_smallq_metadata",
                         "grouped_smallq_metadata",
+                        "sparse_target_rejection",
                     ):
                         if name not in policy.explicit_fields:
                             setattr(policy, name, True)

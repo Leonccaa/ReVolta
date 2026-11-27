@@ -7262,8 +7262,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Avoid materializing/gathering full-vocabulary target logits when the
     # DFlash2 proposal and target sampling distributions both have compact
-    # top-k support. Default-off until paired output/acceptance and end-to-end
-    # V100 gates pass; unsupported sampling features fall back to dense logits.
+    # top-k support. The qualifying Flash-Next DFlash2 serving profile enables
+    # it per engine; unsupported sampling still falls back to dense logits.
     "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION", "0"))),
         description=(
@@ -7277,10 +7277,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="deprecated",
         declared_default="False",
         effective_default=(
-            "False at the standalone compatibility getter. Determined once "
-            "by speculative_config.sm70_dflash2.sparse_target_rejection; "
-            "the standalone compatibility getter retains its declared "
-            "default."
+            "False at the standalone compatibility getter. Enabled by the "
+            "qualified DFlash2 verifier policy or qualifying Flash-Next "
+            "DFlash2 serving profile unless explicitly overridden."
         ),
         automatic_conditions=(
             (

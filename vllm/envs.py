@@ -143,6 +143,7 @@ if TYPE_CHECKING:
     VLLM_SM70_QSA_INDEXER_CUBLAS_MIN_SCORE_ELEMENTS: str | None = None
     VLLM_SM70_QSA_INDEXER_SCORE_TILE_MB: str | None = None
     VLLM_SM70_QSA_MTP_TOPK: bool = True
+    VLLM_SM70_QSA_SHORT_APPEND: bool = True
     VLLM_SM70_QSA_TOPK_LIBRARY: str | None = None
     VLLM_SM70_QSA_XQA_PAGE4: str | None = None
     VLLM_SM70_QSA_XQA_PAGE4_MIN_ROWS: str | None = None
@@ -388,6 +389,7 @@ if TYPE_CHECKING:
     VLLM_SM70_MTP_ROUTER_BATCH: bool = True
     VLLM_SM70_MTP_SHARED_BATCH: bool = True
     VLLM_SM70_MTP_Q8_PREFILL_MMQ: bool = False
+    VLLM_SM70_MTP_KV_ONLY_PREFILL: bool = True
     VLLM_SM70_MTP_PLE_CONV: bool = True
     VLLM_SM70_PLE_GATE_NORM: bool = False
     VLLM_SM70_QWEN38_FUSED_HC_FP16: bool = False
@@ -503,8 +505,9 @@ if TYPE_CHECKING:
     VLLM_SM70_CAR_VMM_SAFE_PREALLOC: bool = True
     VLLM_SM70_INTERCONNECT: str = "auto"
     VLLM_SM70_NVLINK_HC: bool = False
+    VLLM_SM70_DCP2_P2P: bool = False
     VLLM_SM70_PCIE_SWITCH_CUSTOM_AR: str = "auto"
-    VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES: int = 204800
+    VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES: int = 327680
     VLLM_SM70_PCIE_SWITCH_CAR_GRAPH_ONLY: bool = True
     VLLM_SM70_QWEN38_CONTRACT_MULTIMODAL: bool = True
     VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES: bool = False
@@ -813,6 +816,7 @@ if TYPE_CHECKING:
     VLLM_SM70_GDN_CHUNK_O_WARPS: str | None = None
     VLLM_SM70_GDN_CHUNK_O_STAGES: str | None = None
     VLLM_SM70_GDN_LEGACY_PREFILL_PREP: bool = False
+    VLLM_SM70_GDN_NATIVE_PREFILL: bool = True
     VLLM_SM70_GDN_Z_CONTIGUOUS: bool = False
     VLLM_SM70_QWEN_GDN_CONTEXT_CORE: bool = False
     VLLM_SM70_QWEN_GDN_FULL_FORWARD: bool = False
@@ -3700,8 +3704,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="tuning",
         declared_default="20",
         effective_default=(
-            "20; ReVolta FP16 QSA SM70 TP4 profile sets '40' under "
-            "automatic_conditions."
+            "20; the ReVolta AWQ profile sets 40, or 48 in the AWQ MTP4 wide "
+            "verifier profile."
         ),
         automatic_conditions=(
             (
@@ -3711,6 +3715,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "Only AWQ checkpoints; NVFP4 retains the upstream default for this "
                 "item."
             ),
+            "vllm/revolta_profile.py:apply_awq_mtp_wide_verify_defaults sets 48 "
+            "in the qualified AWQ MTP4 profile with DCP2, PCIe, GPU KV, "
+            "synchronous scheduling and GDN state replay.",
         ),
         acceleration_paths=("TurboMindAwqLinearKernel",),
         user_visible=False,
@@ -5194,6 +5201,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=("Flash-Next MTP draft",),
         user_visible=True,
     ),
+    "VLLM_SM70_MTP_KV_ONLY_PREFILL": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_KV_ONLY_PREFILL", "1"))),
+        description=(
+            "Write only KV for eligible incomplete MTP draft prefills and "
+            "compute only sampled rows for eligible completed prefills. "
+            "Enabled by default; set 0 to use full-row draft prefill."
+        ),
+        category="tuning",
+        declared_default="True",
+        effective_default="True for eligible batches; set 0 to disable both paths.",
+        automatic_conditions=(
+            "Single-layer Flash-Next MTP with DP=1, GPU or Host draft KV, no PLE, "
+            "draft tokens or multimodal inputs. KV-only requires an eager batch "
+            "of incomplete prefills; sampled rows require at least one completed "
+            "prefill and no FULL CUDA graph replay.",
+        ),
+        acceleration_paths=("Flash-Next MTP draft",),
+        user_visible=True,
+    ),
     # Fuse PLE rollback, depthwise convolution, SiLU and state commit.
     "VLLM_SM70_MTP_PLE_CONV": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_MTP_PLE_CONV", "1"))),
@@ -6177,7 +6203,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_NVFP4_RAW_GROUPED_M48_V154": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_RAW_GROUPED_M48_V154", "0"))),
         description=(
-            "Use native v154 raw grouped NVFP4 MoE for 48-row target decode "
+            "Use native v154 raw grouped NVFP4 MoE for 41-64 row target decode "
             "on SM70 TP4 Qwen3.8 with equal interleaved gate/up global scales. "
             "Requires raw grouped decode and the V2 model runner."
         ),
@@ -6326,11 +6352,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     # 1CatAI #1147 native E512/K10 router (vllm._sm70_router_C) for the
-    # M=17..20 verifier rows that the Triton router above does not admit.
+    # M=17..64 rows that the Triton router above does not admit.
     "VLLM_SM70_QWEN38_NATIVE_ROUTER_TOPK": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_QWEN38_NATIVE_ROUTER_TOPK", "0"))),
         description=(
-            "Route Qwen3.8 E=512, K=10 renormalized softmax top-k for 17..20 "
+            "Route Qwen3.8 E=512, K=10 renormalized softmax top-k for 17..64 "
             "FP16 router rows through the native SM70 router extension "
             "(#1147) instead of the generic topk_softmax op. Selection follows "
             "stable raw-logit order; weights are the FP32 softmax of the "
@@ -6338,8 +6364,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         category="experimental",
         declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
+        effective_default="False; the AWQ MTP4 wide verifier profile enables it.",
+        automatic_conditions=(
+            "vllm/revolta_profile.py:apply_awq_mtp_wide_verify_defaults enables "
+            "this for the qualified AWQ MTP4 profile with DCP2, PCIe, GPU KV, "
+            "synchronous scheduling and GDN state replay. Explicit values win.",
+        ),
         acceleration_paths=("SM70 runtime/kernel policy",),
         user_visible=False,
     ),
@@ -7836,6 +7866,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=("SM70 collectives",),
         user_visible=False,
     ),
+    "VLLM_SM70_DCP2_P2P": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DCP2_P2P", "0"))),
+        description=(
+            "Use the SM70 TP4 PCIe push buffers for Flash-Next QSA DCP2 "
+            "query and packed output/LSE exchange on uniform decode."
+        ),
+        category="experimental",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 collectives",),
+        user_visible=False,
+    ),
     # One scoped policy selector; explicit modes override the legacy PEX knob.
     "VLLM_SM70_INTERCONNECT": env_var(
         lambda: os.getenv("VLLM_SM70_INTERCONNECT", "auto").strip().lower(),
@@ -7882,16 +7925,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=("SM70 collectives",),
         user_visible=False,
     ),
-    # Include the selected FP16 graph push payloads through 200 KiB.
+    # Include the selected FP16 graph push payloads through 320 KiB.
     "VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES": env_var(
-        lambda: int(os.getenv("VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES", "204800")),
+        lambda: int(os.getenv("VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES", "327680")),
         description=(
             "Largest payload in bytes that the SM70 PCIe-switch custom "
-            "all-reduce mode handles; larger payloads use NCCL."
+            "all-reduce mode handles; larger payloads use NCCL. A value of "
+            "0 removes this cap but keeps the other custom all-reduce limits."
         ),
         category="tuning",
-        declared_default="204800",
-        effective_default="204800",
+        declared_default="327680",
+        effective_default="327680",
         automatic_conditions=(),
         acceleration_paths=("SM70 collectives",),
         user_visible=False,
@@ -12570,6 +12614,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=("Gated DeltaNet",),
         user_visible=False,
     ),
+    "VLLM_SM70_GDN_NATIVE_PREFILL": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_GDN_NATIVE_PREFILL", "1"))),
+        description=(
+            "Use the native SM70 GDN prefill kernel for eligible chunks by "
+            "default on Model Runner V2 only. Set 0 to use the original "
+            "TileLang kernel instead. Model Runner V1 is unaffected."
+        ),
+        category="tuning",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
+    ),
     # Diagnostic-only correctness gate: compare latest prefill prep against
     # the 0.0.3-style q/k/v split plus fused_gdn_gating path.
     "VLLM_SM70_GDN_LEGACY_PREFILL_PREP": env_var(
@@ -13086,11 +13144,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_MTP_GDN_NATIVE_VERIFY": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_MTP_GDN_NATIVE_VERIFY", "0"))),
-        description="Opt in to SM70 MTP native GDN verify and accepted-state replay.",
+        description="Use native SM70 GDN verification and accepted-state replay.",
         category="configuration",
         declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
+        effective_default="False; the AWQ MTP4 wide verifier profile enables it.",
+        automatic_conditions=(
+            "vllm/revolta_profile.py:apply_awq_mtp_wide_verify_defaults enables "
+            "this for the qualified AWQ MTP4 profile with DCP2, PCIe, GPU KV, "
+            "synchronous scheduling and GDN state replay. Explicit values win.",
+        ),
         acceleration_paths=("MTP verifier",),
         user_visible=True,
     ),
@@ -13309,7 +13371,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "(envs.VLLM_SM70_QWEN38_FP16_GEMV or "
                 "envs.VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16 or "
                 "envs.VLLM_SM70_QWEN38_FUSED_HC_FP16) and "
-                "('VLLM_SM70_QWEN38_DUAL_COMPILE' not in os.environ); automatic "
+                "('VLLM_SM70_QWEN38_DUAL_COMPILE' not in os.environ); with "
+                "no speculative config it is skipped when the largest FULL "
+                "decode capture is a single token; automatic "
                 "defaults apply only when the environment override is absent."
             ),
         ),
@@ -19170,6 +19234,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         user_visible=True,
     ),
+    "VLLM_SM70_QSA_SHORT_APPEND": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_QSA_SHORT_APPEND", "1"))),
+        description=(
+            "Lowers the SM70 QSA single-request cuBLAS row floor to 128 "
+            "at 4096 or more routing columns (after alignment), and the "
+            "mixed-batch request split floor to 128 at 16384 tokens or more. "
+            "The score work threshold still applies. Selected blocks may "
+            "differ from the paged scorer on near-tied scores. Set 0 to "
+            "restore the original routing."
+        ),
+        category="tuning",
+        declared_default="True",
+        effective_default="True; the existing cuBLAS eligibility gates still apply.",
+        automatic_conditions=(),
+        acceleration_paths=("QSA sparse attention/indexer",),
+        user_visible=True,
+    ),
     "VLLM_SM70_QSA_TOPK_LIBRARY": env_var(
         lambda: os.getenv("VLLM_SM70_QSA_TOPK_LIBRARY"),
         description=(
@@ -20423,6 +20504,7 @@ def compile_factors(speculative_config: Any = None) -> dict[str, object]:
         # Scheduler/KV planning only; never changes compiled code.
         "VLLM_SM70_HOST_KV_STATIC_HOT_POOL",
         # Runtime branches inside opaque QSA ops; no traced graph change.
+        "VLLM_SM70_DCP2_P2P",
         "VLLM_SM70_HOST_DECODE_FAST",
         "VLLM_SM70_QSA_LOCAL_INPUTS_FUSED",
         "REVOLTA_RESEARCH_HOST_DECODE_FAST",

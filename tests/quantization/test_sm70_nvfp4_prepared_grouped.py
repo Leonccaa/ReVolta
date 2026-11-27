@@ -27,6 +27,7 @@ def make_layer(tp):
         sm70_nvfp4_top_k=10,
         sm70_nvfp4_qwen38_raw_scale=False,
         _nvfp4_raw_grouped_narrow_plan=None,
+        _nvfp4_raw_grouped_m48_plan=None,
         w13_tm_weight=torch.empty(0),
         w13_tm_scales=torch.empty(0),
         w2_tm_weight=torch.empty(0),
@@ -63,6 +64,9 @@ def method(monkeypatch):
         (2, 24, 8, 4, False),
         (1, 40, 5, 4, False),
         (4, 40, 5, 4, False),
+        (4, 41, 6, 4, False),
+        (4, 48, 6, 4, False),
+        (4, 64, 8, 4, False),
         (4, 5, 5, 4, True),
         (4, 8, 1, 4, True),
         (4, 16, 1, 8, True),
@@ -73,12 +77,12 @@ def test_apply_prepared_grouped(method, monkeypatch, tp, m, q, split, legacy):
     layer = make_layer(tp)
     method._prepare_grouped_decode(layer)
     method._allocate_graph_safe_decode_buffers(layer)
-    assert layer._nvfp4_grouped_rows.shape == (400, 8)
+    assert layer._nvfp4_grouped_rows.shape == (640, 8)
     assert layer._nvfp4_sm70_permuted_input.shape == (180, 2560)
-    assert layer._nvfp4_sm70_intermediate.shape == (400, 640 // tp)
-    routed_capacity = 180 if tp == 4 else 400
+    assert layer._nvfp4_sm70_intermediate.shape == (640, 640 // tp)
+    routed_capacity = 180 if tp == 4 else 640
     assert layer._nvfp4_sm70_sorted_output.shape == (routed_capacity, 2560)
-    assert layer._nvfp4_sm70_output.shape == (40, 2560)
+    assert layer._nvfp4_sm70_output.shape == (64, 2560)
 
     monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
     monkeypatch.setattr(moe, "is_exact_sm70_cuda", lambda *a, **k: True)
@@ -142,12 +146,12 @@ def test_loader_rejects_v154(method, monkeypatch, reason):
 
 
 @pytest.mark.parametrize(
-    "reason", ["m1", "m41", "x", "ids", "weights", "prefill", "no-context"]
+    "reason", ["m1", "m65", "x", "ids", "weights", "prefill", "no-context"]
 )
 def test_runtime_rejects_v154(method, reason):
     layer = make_layer(2)
     method._prepare_grouped_decode(layer)
-    m = {"m1": 1, "m41": 41}.get(reason, 8)
+    m = {"m1": 1, "m65": 65}.get(reason, 8)
     x = torch.empty(2560, m, dtype=torch.float16).T.contiguous()
     ids = torch.empty(m, 10, dtype=torch.int32)
     weights = torch.empty(m, 10, dtype=torch.float32)

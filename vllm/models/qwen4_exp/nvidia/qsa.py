@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import math
 import os
+from dataclasses import replace
 from typing import TYPE_CHECKING, ClassVar, cast
 
 import torch
@@ -43,6 +44,7 @@ from vllm.utils.torch_utils import (
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
+    AttentionMetadata,
     AttentionType,
     CommonAttentionMetadata,
 )
@@ -687,8 +689,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 partial_output, partial_lse, group, is_lse_base_on_e=False
             ),
         )
-        out.copy_(merged)
-        _qsa_output_gate(out, gate)
+        _qsa_output_gate(out, gate, merged=merged)
         return output
 
     def _forward_qsa_dcp(
@@ -850,11 +851,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 is_lse_base_on_e=False,
             ),
         )
-        # Round to the output dtype first, as DCP1's attention output is, then
-        # apply the Triton gate DCP1's page4 route uses. This replaces a chain
-        # of five elementwise kernels (12.2 us per decode layer on V100).
-        output.copy_(merged)
-        _qsa_output_gate(output, gate)
+        _qsa_output_gate(output, gate, merged=merged)
 
 
 def _verify_e4m3_kv_requirements(
@@ -1339,6 +1336,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         value: torch.Tensor,
         output: torch.Tensor,
         output_gate: torch.Tensor | None = None,
+        *,
+        row_indices: torch.Tensor | None = None,
     ) -> None:
         if not self._qsa_kv_scales_finalized:
             raise RuntimeError(
@@ -1372,14 +1371,15 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 key[:num_tokens],
                 value[:num_tokens],
             )
-        # Keep the disabled call signature and all original kernels unchanged.
+        num_queries = num_tokens if row_indices is None else row_indices.numel()
         selected = self.indexer(
             hidden_states,
             positions,
-            self.topk_indices_buffer[:num_tokens],
+            self.topk_indices_buffer[:num_queries],
+            row_indices=row_indices,
         )
         if selected.shape != (
-            num_tokens,
+            num_queries,
             self.indexer.output_width,
         ):
             raise RuntimeError("QSA indexer returned an invalid selection shape")
@@ -1389,36 +1389,34 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             "qsa",
             selected,
         )
+        self._write_main_kv(key, value, main_metadata.slot_mapping)
+        token_to_req = side_metadata.token_to_req
+        logical_positions = side_metadata.logical_positions
+        if row_indices is not None:
+            # Readers use one query per request against the original history.
+            # Keep the full block table (including replicated DCP draft pages).
+            main_metadata = replace(
+                main_metadata, num_actual_tokens=num_queries, max_query_len=1
+            )
+            query = query.index_select(0, row_indices)
+            token_to_req = token_to_req.index_select(0, row_indices)
+            logical_positions = logical_positions.index_select(0, row_indices)
+            if output_gate is not None:
+                output_gate = output_gate.index_select(0, row_indices)
         impl = cast(Qwen4ExpQSAFlashAttentionImpl, self.impl)
         if host is not None:
-            # Write before reading: a prefill row attends to its own chunk.
-            host.write(
-                key,
-                value,
-                main_metadata.slot_mapping,
-                self.kv_cache_dtype,
-                self._k_scale,
-                self._v_scale,
-            )
             impl.forward_qsa_host(
                 self,
                 host,
                 query,
                 main_metadata,
                 output,
-                token_to_req=side_metadata.token_to_req,
+                token_to_req=token_to_req,
                 sequence_lengths=side_metadata.seq_lens,
                 output_gate=output_gate,
-                query_positions=side_metadata.logical_positions,
+                query_positions=logical_positions,
             )
         else:
-            impl.do_kv_cache_update(
-                self,
-                key,
-                value,
-                self.kv_cache,
-                main_metadata.slot_mapping,
-            )
             impl.forward_qsa(
                 self,
                 query,
@@ -1427,17 +1425,57 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 self.kv_cache,
                 main_metadata,
                 output,
-                token_to_req=side_metadata.token_to_req,
+                token_to_req=token_to_req,
                 output_gate=output_gate,
-                query_positions=side_metadata.logical_positions,
+                query_positions=logical_positions,
                 sequence_lengths=side_metadata.seq_lens,
             )
         _sm70_dump_qwen_layer_tensor(
             "qsa_core_out",
             self.indexer.layer_id,
             "qsa",
-            output[:num_tokens],
+            output[:num_queries],
         )
+
+    def _write_main_kv(
+        self, key: torch.Tensor, value: torch.Tensor, slot_mapping: torch.Tensor
+    ) -> None:
+        host = self.host_history
+        if host is not None:
+            host.write(
+                key,
+                value,
+                slot_mapping,
+                self.kv_cache_dtype,
+                self._k_scale,
+                self._v_scale,
+            )
+        else:
+            impl = cast(Qwen4ExpQSAFlashAttentionImpl, self.impl)
+            impl.do_kv_cache_update(self, key, value, self.kv_cache, slot_mapping)
+
+    def forward_kv_only(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> None:
+        """Write main and indexer caches without sparse attention."""
+        metadata = cast(
+            dict[str, AttentionMetadata], get_forward_context().attn_metadata
+        )
+        main_metadata = cast(FlashAttentionMetadata, metadata[self.layer_name])
+        num_tokens = main_metadata.num_actual_tokens
+        qkv, _ = self.qkv_proj(hidden_states)
+        self.indexer(
+            hidden_states,
+            positions,
+            self.topk_indices_buffer[:num_tokens],
+            select=False,
+        )
+        _, k, v, _ = self._project_qkv_gate(qkv, positions)
+        key = k.view(hidden_states.shape[0], self.num_kv_heads, self.head_dim)
+        value = v.view(hidden_states.shape[0], self.num_kv_heads, self.head_dim)
+        self._write_main_kv(key, value, main_metadata.slot_mapping)
 
     def forward(
         self,
@@ -1446,6 +1484,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         hidden_states: torch.Tensor,
         *,
         reduce_results: bool | None = None,
+        row_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         indexer_input = hidden_states
         index_proj = self.indexer.index_qk_proj
@@ -1470,9 +1509,23 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         query = q.view(num_tokens, self.num_heads, self.head_dim)
         key = k.view(num_tokens, self.num_kv_heads, self.head_dim)
         value = v.view(num_tokens, self.num_kv_heads, self.head_dim)
-        attn_output = torch.empty_like(query)
         encoded_layer_name = _encode_layer_name(self.layer_name)
-        if current_platform.opaque_attention_op():
+        if row_indices is not None:
+            attn_output = query.new_empty(
+                (row_indices.numel(), self.num_heads, self.head_dim)
+            )
+            self._run_qsa(
+                indexer_input,
+                positions,
+                query,
+                key,
+                value,
+                attn_output,
+                gate,
+                row_indices=row_indices,
+            )
+        elif current_platform.opaque_attention_op():
+            attn_output = torch.empty_like(query)
             torch.ops.vllm.qwen4_exp_qsa_with_output(
                 indexer_input,
                 positions,
@@ -1484,6 +1537,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 encoded_layer_name,
             )
         else:
+            attn_output = torch.empty_like(query)
             qwen4_exp_qsa_with_output(
                 indexer_input,
                 positions,
@@ -1494,7 +1548,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 gate,
                 encoded_layer_name,
             )
-        flat_output = attn_output.view(num_tokens, -1)
+        flat_output = attn_output.flatten(1)
         if reduce_results is None:
             projected_output, _ = self.o_proj(flat_output)
         else:

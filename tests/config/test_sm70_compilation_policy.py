@@ -15,6 +15,7 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import torch
 
 ROOT = Path(__file__).resolve().parents[2]
 COMPILE_POLICY = "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH"
@@ -91,6 +92,7 @@ def policy_module():
         "_is_sm70_dflash2_verifier_contract",
         "_is_sm70_qwen38_decode_compile_contract",
         "_apply_sm70_qwen38_decode_defaults",
+        "_apply_sm70_qwen38_hybrid_ple_defaults",
         "_sm70_nomtp_cudagraph_capture_sizes",
         "_sm70_max_cudagraph_capture_size",
         "_configure_sm70_dflash2_graph_cache",
@@ -115,6 +117,7 @@ def policy_module():
         os=os,
         envs=envs,
         logger=Mock(),
+        torch=torch,
         sm70_glm5_dflash_tp8_pp1_verifier=False,
     )
     future = ast.parse("from __future__ import annotations").body
@@ -342,3 +345,68 @@ def test_policy_infers_cap_from_explicit_capture_sizes(
     policy.apply_policy(config)
     assert config.compilation_config.cudagraph_capture_sizes == [2, 4, 8]
     assert config.compilation_config.max_cudagraph_capture_size == expected
+
+
+DUAL_COMPILE = "VLLM_SM70_QWEN38_DUAL_COMPILE"
+
+
+def _qwen38_fp16_config(max_num_seqs: int) -> SimpleNamespace:
+    config = _config()
+    config.model_config = SimpleNamespace(
+        architectures=("Qwen4ExpForCausalLM",),
+        dtype=torch.float16,
+        enforce_eager=False,
+        hf_text_config=SimpleNamespace(),
+        multimodal_config=None,
+        quantization=None,
+    )
+    config.parallel_config = SimpleNamespace(
+        tensor_parallel_size=1,
+        enable_expert_parallel=False,
+        enable_dbo=False,
+        pipeline_parallel_size=1,
+        data_parallel_backend="mp",
+        data_parallel_size=1,
+        data_parallel_size_local=1,
+        ensure_ple_offload_ipc_path=lambda: None,
+    )
+    config.scheduler_config.max_num_seqs = max_num_seqs
+    return config
+
+
+def test_dual_compile_skipped_for_single_token_full_capture(policy):
+    config = _qwen38_fp16_config(1)
+    policy.apply_policy(config)
+
+    assert DUAL_COMPILE not in os.environ
+
+
+def test_dual_compile_skipped_for_capped_single_token_full_capture(policy):
+    config = _qwen38_fp16_config(2)
+    config.compilation_config.max_cudagraph_capture_size = 1
+    policy.apply_policy(config)
+
+    assert DUAL_COMPILE not in os.environ
+
+
+def test_dual_compile_auto_enabled_for_multi_token_full_capture(policy):
+    config = _qwen38_fp16_config(2)
+    policy.apply_policy(config)
+
+    assert os.environ[DUAL_COMPILE] == "1"
+
+
+def test_dual_compile_auto_enabled_for_single_seq_explicit_capture_sizes(policy):
+    config = _qwen38_fp16_config(1)
+    config.compilation_config.cudagraph_capture_sizes = [2]
+    policy.apply_policy(config)
+
+    assert os.environ[DUAL_COMPILE] == "1"
+
+
+def test_dual_compile_auto_enabled_for_single_seq_without_full_graphs(policy):
+    config = _qwen38_fp16_config(1)
+    config.compilation_config.cudagraph_mode = policy.CUDAGraphMode.PIECEWISE
+    policy.apply_policy(config)
+
+    assert os.environ[DUAL_COMPILE] == "1"

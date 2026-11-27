@@ -27,9 +27,12 @@ ENV = "VLLM_SM70_QWEN38_GDN_NO_PACK"
 def clean_env(monkeypatch):
     monkeypatch.delenv(ENV, raising=False)
     monkeypatch.delenv("VLLM_BATCH_INVARIANT", raising=False)
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_fp16_accumulation", False)
+    matmul = torch.backends.cuda.matmul
+    previous = matmul.allow_fp16_accumulation
+    matmul.allow_fp16_accumulation = False
     envs.disable_envs_cache()
     yield
+    matmul.allow_fp16_accumulation = previous
     envs.disable_envs_cache()
 
 
@@ -137,9 +140,9 @@ def test_helper_rejections(fake_native, weights, monkeypatch):
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
     assert rowmajor.gdn_input_rowmajor(x, wq, wb) is None
     monkeypatch.delenv("VLLM_BATCH_INVARIANT")
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_fp16_accumulation", True)
+    torch.backends.cuda.matmul.allow_fp16_accumulation = True
     assert rowmajor.gdn_input_rowmajor(x, wq, wb) is None
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_fp16_accumulation", False)
+    torch.backends.cuda.matmul.allow_fp16_accumulation = False
     monkeypatch.setattr(rowmajor, "_is_sm70", lambda: False)
     assert rowmajor.gdn_input_rowmajor(x, wq, wb) is None
     monkeypatch.setattr(rowmajor, "_is_sm70", lambda: True)
@@ -195,7 +198,9 @@ def test_packed_route_keeps_priority(fake_native, weights, monkeypatch):
         for out, ref in zip((qkv, z, b, a), _reference(x, wq, wb)):
             out.copy_(ref)
 
-    monkeypatch.setattr(gemv, "_can_use_packed_gdn_input", lambda x, pq, pb: True)
+    monkeypatch.setattr(
+        gemv, "_can_use_packed_gdn_input", lambda x, pq, pb, max_rows=16: True
+    )
     monkeypatch.setattr(
         torch.ops._C, "qwen38_gdn_input_batch_sm70_out", packed_op, raising=False
     )

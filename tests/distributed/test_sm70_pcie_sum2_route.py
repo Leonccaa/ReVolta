@@ -202,8 +202,8 @@ def test_ordinary_all_reduce_keeps_its_policy(monkeypatch, tokens):
         comm.pynccl_comm.all_reduce.assert_called_once_with(inp)
 
 
-@pytest.mark.parametrize("tokens", [20, 24, 25, 30, 32, 35, 40])
-def test_pex_mid_size_dispatches_ordinary_and_sum2_to_push(monkeypatch, tokens):
+@pytest.mark.parametrize("tokens", [20, 24, 25, 30, 32, 35, 40, 48, 56, 64])
+def test_pex_default_dispatches_ordinary_and_sum2_to_push(monkeypatch, tokens):
     monkeypatch.delenv("VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES", raising=False)
     custom = _custom(monkeypatch)
     custom.sm70_pcie_switch_max_bytes = envs.VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES
@@ -222,9 +222,9 @@ def test_pex_mid_size_dispatches_ordinary_and_sum2_to_push(monkeypatch, tokens):
 
 @pytest.mark.parametrize(
     "tokens,capturing,push_registered",
-    [(21, True, True), (40, False, True), (40, True, False), (48, True, True)],
+    [(21, True, True), (40, False, True), (40, True, False), (65, True, True)],
 )
-def test_pex_mid_size_outside_push_admission_uses_nccl(
+def test_pex_outside_default_admission_uses_nccl(
     monkeypatch, tokens, capturing, push_registered
 ):
     monkeypatch.delenv("VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES", raising=False)
@@ -277,3 +277,39 @@ def test_sum2_pynccl_fallback_retains_torch_fallback(
     fallback.assert_called_once()
     assert torch.equal(result, inp + inp)
     comm.all_reduce.assert_called_once()
+
+
+_WIDE_ROWS = {18, 28, 36, *range(42, 65)}
+_BASE_ROWS = {20, 24, 25, 30, 32, 35, 40}
+
+
+@pytest.mark.parametrize("override,max_bytes", [(None, 327680), ("204800", 204800)])
+def test_pex_push_selection_all_widths(monkeypatch, override, max_bytes):
+    """M1-M64: retain generic AR admission and honor the explicit old cap."""
+    if override is None:
+        monkeypatch.delenv("VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES", override)
+    custom = _custom(monkeypatch)
+    custom.sm70_pcie_switch_max_bytes = envs.VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES
+    assert custom.sm70_pcie_switch_max_bytes == max_bytes
+    for tokens in range(1, 65):
+        inp = torch.ones(tokens, 2560, dtype=torch.float16)
+        nbytes = tokens * 5120
+        expect_push = tokens in _BASE_ROWS or (
+            max_bytes > 204800 and tokens in _WIDE_ROWS
+        )
+        if nbytes <= 80 * 1024:
+            assert custom.should_custom_ar(inp)
+        else:
+            expect_ar = nbytes <= max_bytes and (nbytes > 204800 or expect_push)
+            assert custom.should_custom_ar(inp) is expect_ar, tokens
+            assert custom.can_sm70_tp4_push_sum2(inp) is expect_push, tokens
+
+
+def test_pex_explicit_zero_retains_uncapped_ordinary_ar(monkeypatch):
+    monkeypatch.setenv("VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES", "0")
+    custom = _custom(monkeypatch)
+    custom.sm70_pcie_switch_max_bytes = envs.VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES
+    assert custom.should_custom_ar(torch.empty(65, 2560, dtype=torch.float16))
+    assert not custom.can_sm70_tp4_push_sum2(torch.empty(48, 2560, dtype=torch.float16))

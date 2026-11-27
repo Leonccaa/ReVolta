@@ -76,7 +76,10 @@ from vllm.v1.spec_decode.dynamic.adaptive_mtp import (
     AdaptiveMTPDepth,
 )
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
-from vllm.v1.spec_decode.metrics import SpecDecodingStats
+from vllm.v1.spec_decode.metrics import (
+    SpecDecodingStats,
+    has_hard_token_mask,
+)
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
@@ -2764,7 +2767,7 @@ class Scheduler(SchedulerInterface):
                     num_draft_tokens=num_draft_tokens,
                     num_accepted_tokens=num_accepted,
                     num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
-                    request_id=req_id,
+                    request=request,
                 )
 
             # Free encoder inputs only after the step has actually executed.
@@ -3717,16 +3720,25 @@ class Scheduler(SchedulerInterface):
         num_draft_tokens: int,
         num_accepted_tokens: int,
         num_invalid_spec_tokens: dict[str, int] | None,
-        request_id: str,
+        request: Request,
     ) -> SpecDecodingStats | None:
         if not self.log_stats or not num_draft_tokens:
             return None
         if spec_decoding_stats is None:
             spec_decoding_stats = SpecDecodingStats.new(self.num_spec_tokens)
         if num_invalid_spec_tokens:
-            num_draft_tokens -= num_invalid_spec_tokens.get(request_id, 0)
+            num_draft_tokens -= num_invalid_spec_tokens.get(request.request_id, 0)
+        # Evaluate the mask against the request's current sampling params
+        # and its output length before this verification round (output
+        # tokens of the current round are appended further below), so
+        # expired min_tokens and streaming-input param changes are
+        # classified per round.
         spec_decoding_stats.observe_draft(
-            num_draft_tokens=num_draft_tokens, num_accepted_tokens=num_accepted_tokens
+            num_draft_tokens=num_draft_tokens,
+            num_accepted_tokens=num_accepted_tokens,
+            hard_constrained=has_hard_token_mask(
+                request.sampling_params, len(request.output_token_ids)
+            ),
         )
         return spec_decoding_stats
 

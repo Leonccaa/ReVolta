@@ -689,12 +689,10 @@ class KernelConfig:
     target's own weights."""
 
     sm70_gdn_input_v154: bool = False
-    """Use the v154 packed GDN inputs for physical M3/M4 during SM70 target
-    FULL graph capture. Other rows keep their existing path."""
-
-    sm70_gdn_input_v154_wide: bool = False
-    """Use v154 packed GDN inputs for M2..64 in target MTP FULL graphs.
-    This changes the projection reduction order and is disabled by default."""
+    """Use v154 packed FP16 GDN inputs for M2..64 in target FULL verify
+    graphs (query length > 1). Applies to AWQ g32 and standard NVFP4 FP16
+    projections, not FP4-Local or QAD MXFP8 projections. Changes reduction
+    order and is disabled by default."""
 
     sm70_gdn_input_skinny_k4: bool = False
     """Use four K warps in the SM70 row-major FP16 GDN input projection.

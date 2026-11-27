@@ -436,8 +436,9 @@ NOTES: dict[str, dict[str, str]] = {
         section="profile",
         since="1Cat",
         range="0, 1",
-        tradeoff="Grouped native-NVFP4 decode; the profile keeps it off pending "
-        "quality admission.",
+        tradeoff="Prepared-scale native-NVFP4 decode for M = 2..64; set "
+        "VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE=0 (the profile defaults to 1). "
+        "The profile keeps grouped decode off pending quality admission.",
         metrics="",
     ),
     "VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL": dict(
@@ -474,7 +475,7 @@ NOTES: dict[str, dict[str, str]] = {
         section="research",
         since="0.2.0rc15",
         range="0, 1",
-        tradeoff="Native raw-E4M3 grouped MoE for 48-row target decode on "
+        tradeoff="Native raw-E4M3 grouped MoE for 41..64-row target decode on "
         "SM70 TP4 Qwen3.8 with equal interleaved gate/up global scales. "
         "Requires raw grouped decode and the V2 model runner.",
         metrics="",

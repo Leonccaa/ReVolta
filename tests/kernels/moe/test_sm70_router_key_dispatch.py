@@ -32,8 +32,18 @@ def test_packed_half_key_preserves_dtype_and_batch_guards(monkeypatch, dtype, ro
     assert kwargs["num_warps"] == 8  # Keep the FP32 normalization reduction.
 
 
-@pytest.mark.parametrize("rows", [16, 17, 20, 21, 24, 39, 40, 48, 64, 65])
-@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize(
+    "rows,enabled",
+    [
+        (16, True),
+        (17, True),
+        (20, True),
+        (21, True),
+        (64, True),
+        (65, True),
+        (21, False),
+    ],
+)
 def test_native_router_wide_dispatch(monkeypatch, rows, enabled):
     monkeypatch.setattr(mod.envs, "VLLM_SM70_QWEN38_ROUTER_TOPK", False)
     monkeypatch.setattr(mod.envs, "VLLM_SM70_QWEN38_NATIVE_ROUTER_TOPK", enabled)

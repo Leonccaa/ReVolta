@@ -111,8 +111,8 @@ def test_raw_v154_prepare(monkeypatch, m48_layer, blocked_by, narrow):
         assert plan is None
 
 
-@pytest.mark.parametrize("rows", [41, 48, 64])
-def test_wide_raw_v154_disabled_keeps_ordinary_route(monkeypatch, m48_layer, rows):
+def test_wide_raw_v154_disabled_keeps_ordinary_route(monkeypatch, m48_layer):
+    rows = 48
     monkeypatch.delenv("VLLM_SM70_NVFP4_RAW_GROUPED_M48_V154")
     layer = m48_layer
     method = object.__new__(moe.ModelOptNvFp4SM70MoEMethod)

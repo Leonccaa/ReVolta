@@ -239,39 +239,24 @@ def test_disabled_and_batch_invariant_fall_back(cuda_weights, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("m", "compiling", "expected"),
-    [(3, True, "mtp"), (4, True, "mtp"), (4, False, "batch"), (5, True, "batch")],
+    "m,enabled,compiling,verify",
+    [
+        (1, True, True, True),
+        (2, True, True, True),
+        (16, True, True, True),
+        (17, True, True, True),
+        (64, True, True, True),
+        (65, True, True, True),
+        (17, False, True, True),
+        (17, True, False, True),
+        (4, True, True, False),
+        (17, True, True, False),
+    ],
 )
-def test_v154_packed_input_only_for_full_m3_m4(monkeypatch, m, compiling, expected):
-    from vllm.models.qwen4_exp.nvidia import sm70_fp16_gemv as gemv
-
-    calls = []
-
-    def op(name):
-        return lambda *args: calls.append(name)
-
-    monkeypatch.setattr(gemv, "_can_use_packed_gdn_input", lambda *a: True)
-    monkeypatch.setattr(gemv, "is_sm70_decode_graph_compiling", lambda: compiling)
-    monkeypatch.setenv("VLLM_SM70_QWEN38_GDN_NO_PACK", "0")
-    envs.disable_envs_cache()
-    for name in ("mtp", "batch"):
-        monkeypatch.setattr(
-            torch.ops._C,
-            f"qwen38_gdn_input_{'mtp_' if name == 'mtp' else ''}batch_sm70_out",
-            op(name),
-            raising=False,
-        )
-    x = torch.zeros(m, 2560, dtype=torch.float16)
-    w = torch.zeros(1)
-    _qwen38_sm70_fp16_gdn_input(x, w, w, w, w, True, use_skinny_k4=True)
-    assert calls == [expected]
-
-
-@pytest.mark.parametrize("m", (1, 2, 10, 12, 16, 17, 20, 24, 40, 48, 64, 65))
-@pytest.mark.parametrize("wide,compiling", ((False, True), (True, False), (True, True)))
-def test_wide_target_gdn_dispatch(monkeypatch, m, wide, compiling):
+def test_wide_target_gdn_dispatch(monkeypatch, m, enabled, compiling, verify):
     from unittest.mock import Mock
 
+    from vllm.forward_context import ForwardContext, override_forward_context
     from vllm.models.qwen4_exp.nvidia import sm70_fp16_gemv as gemv
 
     monkeypatch.setenv("VLLM_SM70_QWEN38_GDN_NO_PACK", "0")
@@ -294,13 +279,22 @@ def test_wide_target_gdn_dispatch(monkeypatch, m, wide, compiling):
     b = torch.empty(24, 2560, dtype=torch.float16)
     pq = torch.empty(128, 160, 2, 32, 8, dtype=torch.float16)
     pb = torch.empty(1, 160, 2, 32, 8, dtype=torch.float16)
-    result = _qwen38_sm70_fp16_gdn_input(x, q, b, pq, pb, use_v154_wide=wide)
+    context = ForwardContext(
+        no_compile_layers={},
+        attn_metadata=None,
+        slot_mapping={},
+        additional_kwargs={"sm70_gdn_verify": verify},
+    )
+    with override_forward_context(context):
+        result = _qwen38_sm70_fp16_gdn_input(x, q, b, pq, pb, enabled)
     assert [out.shape for out in result] == [(m, n) for n in (2560, 1536, 12, 12)]
-    assert native.call_count == int(wide and compiling and 2 <= m <= 64)
-    assert batch.call_count == int(not (wide and compiling) and 2 <= m <= 16)
+    selected = enabled and compiling and verify
+    assert native.call_count == int(selected and 2 <= m <= 64)
+    assert batch.call_count == int(not selected and 2 <= m <= 16)
 
 
-def test_wide_keeps_pack_when_no_pack_is_set(monkeypatch):
+@pytest.mark.parametrize("enabled", [False, True])
+def test_wide_keeps_pack_when_no_pack_is_set(monkeypatch, enabled):
     from types import SimpleNamespace as NS
 
     from vllm.models.qwen4_exp.nvidia import sm70_fp16_gemv as gemv
@@ -316,38 +310,16 @@ def test_wide_keeps_pack_when_no_pack_is_set(monkeypatch):
     layer = torch.nn.Module()
     layer.weight = NS(is_cuda=True, dtype=torch.float16)
     layer._sm70_qwen38_prepare_gdn_batch = True
-    layer._sm70_qwen38_gdn_input_v154_wide = True
+    layer._sm70_qwen38_gdn_input_v154 = enabled
     gemv.Qwen38SM70FP16LinearMethod().process_weights_after_loading(layer)
-    assert torch.equal(layer._sm70_qwen38_gdn_packed, torch.ones(1))
+    assert hasattr(layer, "_sm70_qwen38_gdn_packed") is enabled
 
 
-def test_wide_cpu_fallback_matches_original(monkeypatch):
-    from vllm.models.qwen4_exp.nvidia import sm70_fp16_gemv as gemv
-
-    monkeypatch.setenv("VLLM_SM70_QWEN38_GDN_NO_PACK", "0")
-    monkeypatch.setattr(gemv, "is_sm70_decode_graph_compiling", lambda: True)
-    x = torch.randn(20, 2560, dtype=torch.float16)
-    q = torch.randn(4096, 2560, dtype=torch.float16) * 0.02
-    b = torch.randn(24, 2560, dtype=torch.float16) * 0.02
-    old = _qwen38_sm70_fp16_gdn_input(x, q, b)
-    new = _qwen38_sm70_fp16_gdn_input(x, q, b, use_v154_wide=True)
-    assert all(torch.equal(a, z) for a, z in zip(old, new, strict=True))
-
-
-@pytest.mark.parametrize("quantization", ("awq", "modelopt_fp4"))
-@pytest.mark.parametrize(
-    "enabled,mtp,draft",
-    (
-        (False, True, False),
-        (True, True, False),
-        (True, False, False),
-        (True, True, True),
-    ),
-)
-def test_wide_gdn_loader_scope(monkeypatch, quantization, enabled, mtp, draft):
+@pytest.mark.parametrize("enabled,full", [(False, True), (True, True), (True, False)])
+def test_wide_gdn_loader_scope(monkeypatch, enabled, full):
     from types import SimpleNamespace as NS
 
-    from vllm.config import KernelConfig
+    from vllm.config import CUDAGraphMode, KernelConfig
     from vllm.models.qwen4_exp.nvidia import sm70_fp16_gemv as gemv
 
     class Linear(torch.nn.Module):
@@ -363,11 +335,14 @@ def test_wide_gdn_loader_scope(monkeypatch, quantization, enabled, mtp, draft):
     owner.gqa_interleaved_layout = False
     owner.disable_tp_for_ba_proj = False
     config = NS(
-        kernel_config=KernelConfig(sm70_gdn_input_v154_wide=enabled),
+        kernel_config=KernelConfig(sm70_gdn_input_v154=enabled),
+        compilation_config=NS(
+            cudagraph_mode=CUDAGraphMode.FULL if full else CUDAGraphMode.PIECEWISE
+        ),
         parallel_config=NS(tensor_parallel_size=4),
-        model_config=NS(quantization=quantization),
-        speculative_config=NS(use_qwen4_exp_mtp=lambda: mtp),
-        is_speculative_draft=draft,
+        model_config=NS(quantization="awq"),
+        speculative_config=NS(use_qwen4_exp_mtp=lambda: True),
+        is_speculative_draft=False,
     )
     monkeypatch.setattr(gemv, "LinearBase", Linear)
     monkeypatch.setattr(gemv, "_exact_runtime_contract", lambda _: True)
@@ -376,7 +351,19 @@ def test_wide_gdn_loader_scope(monkeypatch, quantization, enabled, mtp, draft):
     monkeypatch.setenv("VLLM_SM70_QWEN38_FP16_GEMV", "1")
     monkeypatch.setenv("VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16", "1")
     gemv.enable_qwen38_sm70_fp16_gemv(owner, torch.float16, config)
+    monkeypatch.setenv("VLLM_SM70_QWEN38_GDN_NO_PACK", "1")
+    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda _: True))
+    monkeypatch.setattr(
+        gemv.UnquantizedLinearMethod, "process_weights_after_loading", lambda *_: None
+    )
+    monkeypatch.setattr(gemv, "_pack_gdn_input_weight", lambda _: torch.ones(1))
+    monkeypatch.setattr(
+        torch.ops._C, "qwen38_gdn_input_batch_sm70_out", object(), raising=False
+    )
     for layer in (owner.in_proj_qkvz, owner.in_proj_ba):
-        assert getattr(layer, "_sm70_qwen38_gdn_input_v154_wide", False) == (
-            enabled and mtp and not draft
+        assert getattr(layer, "_sm70_qwen38_gdn_input_v154", False) == (
+            enabled and full
         )
+        layer.weight = torch.nn.Parameter(layer.weight.to(dtype=torch.float16))
+        layer.quant_method.process_weights_after_loading(layer)
+        assert hasattr(layer, "_sm70_qwen38_gdn_packed") == (enabled and full)

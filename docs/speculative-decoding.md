@@ -74,7 +74,7 @@ The ReVolta profile applies these defaults to `vllm serve` on four SM70 GPUs wit
 - **`draft_sample_method`.** Keep the default, `"greedy"`. The fast MTP draft paths (local argmax and the QPN8 draft head) need greedy drafting, and probabilistic MTP drafting corrupted output at temperature above 0 with more than two concurrent requests upstream ([1CatAI/1Cat-vLLM#656](https://github.com/1CatAI/1Cat-vLLM/issues/656)). This setting only affects drafting; clients can still use any sampling parameters.
 - **`"gdn_state_replay": false`** keeps one recurrent state block per draft position. See [GDN state replay](#gdn-state-replay).
 - **`VLLM_1CAT_ADAPTIVE_MTP`** (experimental, default `off`). Adapts the draft width of a single decoding request to its recent acceptance, up to the schedule's width for one request. It needs a draft-width schedule, synchronous scheduling and Model Runner V2. `on` needs at least 3 draft tokens; `auto` turns it on only on SM70 with at least 5. It has no effect while more than one request is decoding.
-- **Draft experts and vocabulary.** `mtp_expert_quantization` selects the draft's routed-expert format; see [Checkpoints](checkpoints.md). An optional static draft vocabulary is described in [Configuration](configuration.md#optional-mtp-draft-vocabulary-experimental).
+- **Draft experts.** `mtp_expert_quantization` selects the draft's routed-expert format; see [MTP drafts](checkpoints.md#mtp-drafts).
 
 ## GDN state replay
 

@@ -174,20 +174,6 @@ The engine selects the interconnect automatically and each worker logs `SM70 int
 | `VLLM_SM70_NVLINK_HC` | boolean | `0` | `0`, `1` | 0.2.0 | experimental | Flash-Next HC sharding, fused all-reduce and HC, and the QSA DCP2 query exchange and output merge over NVLink. All six GPU pairs must have direct NVLink and native peer atomics; `VLLM_SM70_INTERCONNECT=nvlink` does not bypass this check. Asynchronous scheduling turns it off. The QSA route takes FP16 queries with six 256-element heads per rank and up to 64 rows. It can change floating-point rounding. |
 | `VLLM_SM70_DCP2_P2P` | boolean | `0` | `0`, `1` | 0.2.0 | experimental | QSA DCP2 query and packed output/LSE exchange through the registered PCIe switch push buffers, with the A2A DCP backend (the Flash-Next default). It covers eager uniform decode and dedicated FULL decode graphs up to 53 rows; PIECEWISE graphs keep NCCL. In 0.2.0 tests with four GPUs and AWQ, it gave no stable gain in cold time to first token or decode, and fixed-prompt outputs matched the NCCL path token for token. Needs the native extension from the same build. |
 
-## Optional MTP draft vocabulary (experimental)
-
-Model Runner V2 can restrict MTP drafting to a static vocabulary shortlist, optionally with a global tail of recently used tokens. It is off by default and outside release acceptance. It needs a ranking file that matches the model vocabulary and TP size; this repository does not include a ranking file or a tool that builds one. All settings are deployment scope.
-
-| Name | Type | Default | Range | Since | Status | Effect and trade-offs |
-| --- | --- | --- | --- | --- | --- | --- |
-| `VLLM_SM70_MTP_STATIC_DRAFT_VOCAB_RANKING` | path | unset (off) | ranking file (`.pt`) | 1Cat | experimental | Enables the static shortlist. Greedy and probabilistic proposals are mapped back to full-vocabulary token IDs. |
-| `VLLM_SM70_MTP_STATIC_DRAFT_VOCAB_SIZE` | integer | `0` | > 0 when enabled, for example `65536` | 1Cat | experimental | Shortlist size. |
-| `VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_TAIL_SIZE` | integer | `0` (off) | 1–2048; 512 or 1024 to start | 1Cat | experimental | Model Runner V2 support since 0.2.0. Adds a global LRU tail T shared by all concurrent requests in the worker group, updated from accepted, recovered and bonus output tokens. Each rank holds T FP16 weight rows: `2*T*H` bytes, 2.5 MiB at T=512 and 5 MiB at T=1024 with H=2560. Probabilistic drafting adds `4*max_num_seqs*K*(B+TP*T)` bytes for processed logits, where B is the shortlist size. |
-
-The tail requires `"method": "mtp"`, an enabled static shortlist, an FP16 LM head, no logits soft cap, scale 1, at least T eligible seed tokens after the shortlist and a model padding token outside the shortlist. Unsupported configurations raise `ValueError` at startup. `VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_GPU_LRU`, `VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_FUSED_PROPOSAL`, `VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_FULL_REFRESH_INTERVAL` and `VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_PREFILL_TOPK` apply to Model Runner V1 only; setting any of them with Model Runner V2 is an error, even to zero.
-
-To confirm activation, look for `Enabled static MTP draft vocabulary` and, with a tail, `Enabled global MTP draft vocabulary tail: base=... tail=... tp=... sink=... draft_sample=...` on every TP rank, with the configured sizes. Measure acceptance length, round time and throughput on your workload before choosing a size.
-
 ## Sampling parameters
 
 These are request-scope settings. The server takes default sampling values from the checkpoint's `generation_config.json` (`temperature` 1.0, `top_p` 0.95, `top_k` 20), but only for fields that a request leaves out. Many chat clients send their own `temperature` and `top_p`, so check the client settings. Qwen recommends:
@@ -242,40 +228,37 @@ Allow extra disk space for compilation caches and the optional disk KV tier. Str
 
 ## Environment variable reference
 
-Every variable below is read once per process (deployment scope). Columns: type and default as registered in `vllm/envs.py`; *Since* is the first release with the variable (1Cat = inherited from 1Cat-vLLM); *Category* is configuration, tuning, experimental, debug or deprecated.
+Every variable below is read once per process (deployment scope). Columns: type and default as registered in `vllm/envs.py`; *Since* is the first release with the variable (1Cat = inherited from 1Cat-vLLM); *Category* is configuration, tuning or experimental. Developer and deprecated variables are listed by name at the end.
 
 ### Kernel and path switches
 
 | Name | Type | Default | Range | Category | Since | Effect and trade-off |
 |---|---|---|---|---|---|---|
-| `VLLM_SM70_CHECKPOINT_CACHE_DROP` | bool | `True` | 0, 1 | configuration | 0.2.0 | Default on; engine startup only. 1 requests clean checkpoint cache eviction before host KV allocation, after a world load barrier. Skips live mappings and PLE disk/cascade modes. May slow later reloads or other engines reading the same checkpoint. See startup logs for advised files/bytes and cgroup usage; no metric. |
-| `VLLM_SM70_GDN_CPU_SPEC_QSL` | bool | `False` | 0, 1 | tuning | 0.2.0 | Removes two host synchronizations per step in mixed prefill + speculative batches; costs a host-side offset computation. Outputs are bitwise identical either way. |
-| `VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE` | str | `''` | path | debug | 0.2.0 | Validation only: adds the synchronizations back while the file exists. Never set for timing runs. |
-| `VLLM_SM70_GDN_NATIVE_PREFILL` | bool | `True` | 0, 1 | tuning | 0.2.0 | Use the native SM70 GDN kernel by default for eligible original TileLang chunks on Model Runner V2 only. It can change floating-point results and reserves shared GPU scratch space. Set 0 to use TileLang instead. Model Runner V1 is unaffected. |
-| `VLLM_SM70_HOST_DECODE_FAST` | bool | `True` | 0, 1 | tuning | 0.2.0 | Default on. Long-context host KV decode only: fuses three pairs of host-history decode kernels. Set 0 and restart to restore the original kernels; ordinary GPU KV paths are unaffected. |
-| `VLLM_SM70_MTP_KV_ONLY_PREFILL` | bool | `True` | 0, 1 | tuning | 0.2.0 | For eligible Flash-Next MTP batches with DP=1 and GPU or Host draft KV, eager incomplete prefills only write KV. If a prefill completes, the sampled-row path writes KV for all rows and computes outputs only for sampled rows outside FULL CUDA graph replay. Floating-point results can differ from the full-row path. Set 0 to use full-row draft prefill. |
-| `VLLM_SM70_QSA_LOCAL_INPUTS_FUSED` | bool | `True` | 0, 1 | tuning | 0.2.0 | Default on. DCP-sharded shared-key scorer: one fused integer metadata conversion instead of the torch reference. Set 0 and restart to restore the torch reference. |
-| `VLLM_SM70_QSA_SHORT_APPEND` | bool | `True` | 0, 1 | tuning | 0.2.0 | Short warm appends can use SM70 QSA cuBLAS scoring. The single-request row floor drops from 512 to 128 at 4096 aligned routing columns, and mixed batches can split requests with at least 128 rows at 16384 tokens or more. The score work threshold still applies. Near-tied block selection may differ from the paged scorer. Set 0 and restart to restore the original routing. |
+| `VLLM_DFLASH_COMPACT_AUX_HIDDEN` | bool | `True` | 0, 1 | configuration | 1Cat | Builds the DFlash and DFlash2 draft inputs from the target's hidden states without an extra full-precision copy. Leave on. |
+| `VLLM_SM70_CHECKPOINT_CACHE_DROP` | bool | `True` | 0, 1 | configuration | 0.2.0 | At startup, after every rank has loaded the model, drops the checkpoint files from the page cache before the host KV pools are allocated. Files still mapped and the PLE disk modes are skipped. Set 0 if other processes read the same checkpoint and need it cached. |
+| `VLLM_SM70_GDN_CPU_SPEC_QSL` | bool | `False` | 0, 1 | tuning | 0.2.0 | Set 1 to remove two host synchronizations per step in batches that mix prefill and speculative decoding; output is unchanged. |
+| `VLLM_SM70_GDN_NATIVE_PREFILL` | bool | `True` | 0, 1 | tuning | 0.2.0 | Runs eligible GDN prefill chunks with the native SM70 kernel (Model Runner V2). It can change floating-point rounding. Set 0 to use the TileLang kernel. |
+| `VLLM_SM70_HOST_DECODE_FAST` | bool | `True` | 0, 1 | tuning | 0.2.0 | Host KV only: fused decode kernels for the history in host memory. Set 0 to use the original kernels. |
+| `VLLM_SM70_MTP_KV_ONLY_PREFILL` | bool | `True` | 0, 1 | tuning | 0.2.0 | Lets the MTP draft skip work during chunked prefill; see [What the profile turns on for MTP](speculative-decoding.md#what-the-profile-turns-on-for-mtp). It can change floating-point rounding. Set 0 for full draft prefill. |
+| `VLLM_SM70_QSA_LOCAL_INPUTS_FUSED` | bool | `True` | 0, 1 | tuning | 0.2.0 | One fused kernel for the index metadata of the DCP-sharded QSA scorer. Set 0 to use the reference implementation. |
+| `VLLM_SM70_QSA_SHORT_APPEND` | bool | `True` | 0, 1 | tuning | 0.2.0 | Lets short prompt continuations on a long cached context use the faster cuBLAS QSA scorer. Near-tied block selection can differ from the paged scorer. Set 0 to keep the paged scorer. |
 
 ### Deployment settings
 
 | Name | Type | Default | Range | Category | Since | Effect and trade-off |
 |---|---|---|---|---|---|---|
-| `VLLM_1CAT_ADAPTIVE_MTP` | str | `off` | off/0/false/no, on/1/true/yes, auto | experimental | 0.2.0 | Opt in to adaptive depth for synchronous Flash-Next MRv2 MTP with a dynamic speculative decoding schedule. Explicit auto also requires SM70 and a configured maximum depth of at least five. Single-request decode may trade fewer draft steps for more target steps. |
+| `VLLM_1CAT_ADAPTIVE_MTP` | str | `off` | off/0/false/no, on/1/true/yes, auto | experimental | 0.2.0 | Adapts the draft width of a single decoding request to its recent acceptance. Needs a draft-width schedule and synchronous scheduling; `auto` acts only on SM70 with at least 5 draft tokens. See [Adaptive MTP depth](dynamic-speculative-decoding.md#adaptive-mtp-depth). |
 | `VLLM_PLE_OFFLOAD_READY_TIMEOUT` | float | `600.0` | seconds | configuration | 1Cat | How long startup waits for the PLE offload worker. Raise it on slow storage; the reference deployment uses 1200. |
-| `VLLM_QWEN4EXP_PLE_HOST_GIB` | float \| None | `None` | GiB per TP rank; unset = automatic | configuration | 1Cat | Caps pinned host memory for FP8 PLE. Automatic placement pins the full table when the disk cascade is inactive. An explicit cap leaves remaining rows on the GPU in this mode. |
-| `VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB` | float \| None | `None` | non-negative GiB or unset | configuration | 1Cat | Unset reserves min(host limit / 4, 8 GiB), preserving the small-host margin without scaling it to tens of GiB. Explicit values override the cap. The warning-only preflight counts shared CPU KV storage separately; automatic placement also uses this reserve. |
-| `VLLM_QWEN_REASONING_EOS_MASK` | bool | `False` | 0, 1 | configuration | 0.2.0 | Suppresses model EOS during visible Qwen chat reasoning in Model Runner V2. Requests still in reasoning use full-vocabulary sampling when compact DFlash2 verification would truncate logits. |
-| `VLLM_SM70_AWQ_MOE_INT4_ZERO` | bool | `False` | 0, 1 | experimental | 0.1.0 | Packs AWQ zero points into nibbles: less resident metadata, lossless. Needs compact metadata and a native build with the packed kernels. Under vllm serve the ReVolta profile sets 1 for AWQ g32 checkpoints with compact metadata (on by default). |
-| `VLLM_SM70_FLASH_ATTN_V100` | bool | `True` | 0, 1 | configuration | 1Cat | Default on (set in the image). 0 only to diagnose backend selection; prefer --attention-backend to choose a backend. |
-| `VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH` | bool | `False` | 0, 1 | configuration | 1Cat | Set in the image: VLLM_COMPILE + FULL_AND_PIECEWISE with small decode captures (the 0.0.3 graph policy). |
-| `VLLM_SM70_HOST_KV_STATIC_HOT_POOL` | bool | `False` | 0, 1 | configuration | 0.2.0 | Long-context host placement only. 1 restores the separate static hot-page pool (history IDs capped by host pages); the default shares free history-ID index pages with the hot slots. |
-| `VLLM_SM70_IDLE_CLOCK_SECONDS` | int | `0` | non-negative integer seconds | configuration | 0.2.0 | Zero disables clock control. A positive value opts in for a single-host EngineCore process with exclusive V100 TP1 or TP4 GPUs. Requires NVML clock permissions and host-side reset by GPU UUID on abnormal exit before the GPUs can be reused. |
-| `VLLM_SM70_MTP_PLE_CONV` | bool | `True` | 0, 1 | configuration | 1Cat | Fuses SM70 PLE speculative rollback, convolution, SiLU and state update for eligible MTP and DFlash2 batches. Set 0 to use the separate operations. |
-| `VLLM_SM70_PLE_GATE_NORM` | bool | `False` | 0, 1 | experimental | 0.2.0 | Opt-in FP16 PLE gate and norm fusion in SM70 Flash-Next full decode graphs with dual compilation. The fused reduction can change FP16 results. |
-| `VLLM_SM70_QWEN_GDN_DISABLE_FULL_FORWARD` | bool | `False` | 0, 1 | configuration | 1Cat | Diagnostic: compare the split GDN compile boundary with the full-forward guard. The image sets 0. |
-| `VLLM_SM70_QWEN_GDN_FULL_FORWARD` | bool | `False` | 0, 1 | configuration | 1Cat | Diagnostic force-on of the opaque GDN full-forward boundary. The image sets 0; the automatic default arms it only for active MTP batches. |
-| `VLLM_SM70_QWEN_GDN_SPEC_CORE_OP` | bool | `False` | 0, 1 | experimental | 1Cat | Experimental narrower MTP boundary (only the recurrent core is opaque). The image sets 0 until it passes long-output quality. |
+| `VLLM_QWEN4EXP_PLE_HOST_GIB` | float \| None | `None` | GiB per TP rank; unset = automatic | configuration | 1Cat | Per-rank cap on pinned host memory for the FP8 PLE table. Unset pins the whole table; with a cap, the remaining rows stay on the GPU. |
+| `VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB` | float \| None | `None` | non-negative GiB or unset | configuration | 1Cat | Host memory that PLE placement keeps free. Unset reserves the smaller of a quarter of the host limit and 8 GiB. |
+| `VLLM_QWEN_REASONING_EOS_MASK` | bool | `False` | 0, 1 | configuration | 0.2.0 | 1 keeps a request from ending its turn while it is still inside its reasoning block; see [the reasoning end-of-turn mask](#chat-control-tokens-and-the-reasoning-end-of-turn-mask). |
+| `VLLM_SM70_AWQ_MOE_INT4_ZERO` | bool | `False` | 0, 1 | experimental | 0.1.0 | Stores AWQ zero points as 4-bit values: less GPU memory, same results. Under `vllm serve` the profile sets 1 for AWQ g32 checkpoints with compact metadata. |
+| `VLLM_SM70_FLASH_ATTN_V100` | bool | `True` | 0, 1 | configuration | 1Cat | The V100 FlashAttention path; set in the image. Set 0 only to diagnose backend selection; use `--attention-backend` to choose a backend. |
+| `VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH` | bool | `False` | 0, 1 | configuration | 1Cat | Set to 1 in the image: torch.compile with FULL_AND_PIECEWISE CUDA graphs and small decode capture sizes. Leave as is. |
+| `VLLM_SM70_HOST_KV_STATIC_HOT_POOL` | bool | `False` | 0, 1 | configuration | 0.2.0 | Host KV only: 1 restores the separate static hot-page pool; the default lets hot pages share GPU memory with unused index pages. |
+| `VLLM_SM70_IDLE_CLOCK_SECONDS` | int | `0` | non-negative integer seconds | configuration | 0.2.0 | Locks exclusively assigned V100 GPUs at 405 MHz after this many idle seconds; 0 disables it. Needs NVML clock permission and one engine with TP1 or TP4 on one host. After an abnormal exit, reset the GPU clocks before reusing the GPUs. |
+| `VLLM_SM70_MTP_PLE_CONV` | bool | `True` | 0, 1 | configuration | 1Cat | Fused PLE state update for MTP and DFlash2 batches. Set 0 only to diagnose a suspected kernel problem. |
+| `VLLM_SM70_PLE_GATE_NORM` | bool | `False` | 0, 1 | experimental | 0.2.0 | Opt-in fusion of the PLE gate and norm in decode graphs. It can change FP16 rounding. |
 
 ### Values applied by the ReVolta profile
 
@@ -283,51 +266,51 @@ The ReVolta profile (`vllm/revolta_profile.py`) sets these on SM70 + TP4 + FP16 
 
 | Name | Type | Default | Profile | Range | Category | Since | Effect and trade-off |
 |---|---|---|---|---|---|---|---|
-| `VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS` | bool | `False` | `1` | 0, 1 | configuration | 1Cat | Opts out of the 1Cat SM70 MTP launch defaults; the ReVolta profile supplies its own. |
-| `VLLM_EARLY_MODEL_INPUTS` | bool | `False` | `1` | 0, 1 | experimental | 0.1.0 | Prepares model-state inputs before attention metadata in FULL graph steps, overlapping host work. |
-| `VLLM_PLE_ASYNC_REQUEST_INDICES` | bool | `False` | `1` | 0, 1 | experimental | 0.1.0 | Non-blocking PLE request-index transfers; removes a host wait per step. |
-| `VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP` | bool | `False` | `0`, `1` (AWQ+DFlash2) | 0, 1 | configuration | 1Cat | Allows shared and routed experts to run on separate CUDA streams. The native g32 AWQ profile enables it for DFlash2 with expert parallelism and dual batch overlap disabled. An explicit 0 or 1 takes precedence. |
-| `VLLM_SM70_AWQ_QWEN38_GROUPED_QPN` | bool | `False` | `1` (AWQ) | 0, 1 | experimental | 0.1.0 | Grouped AWQ MoE decode reads each active expert once for all its rows (2..48). Faster at 2..8 requests; reduction order differs from the TurboMind route. |
-| `VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS` | int | `20` | `40` (AWQ), `48` (AWQ MTP4 wide verifier) | 2..48 | tuning | 0.1.0 | Largest row count sent to the grouped route; above it rows use TurboMind. The wide verifier profile raises the AWQ cap from 40 to 48. DFlash2 uses its dedicated row cap. |
-| `VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_PACK_ROWS` | int | `0` | `24` (AWQ) | 0 or 8..48 step 8 | tuning | 0.1.0 | Caps rows per expert pack: fewer registers per CTA but hot experts are read more than once. Result unchanged. |
-| `VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT` | int | `16` | `8` (AWQ) | 4, 8, 16 | tuning | 0.1.0 | W13 split-K warps per CTA. 16 matches the M1 arithmetic; 8 (profile) uses fewer threads and a different FP32 split association. |
-| `VLLM_SM70_AWQ_QWEN38_QPN_M1` | bool | `True` | `1` (AWQ) | 0, 1 | configuration | 1Cat | Single-token W13/W2 QPN route; 0 restores the legacy route. Changes reduction order. |
-| `VLLM_SM70_AWQ_TUNE_SMALL_SHAPES` | bool | `False` | `1` (AWQ) | 0, 1 | configuration | 1Cat | Tunes TurboMind small-M AWQ shapes at startup: longer warmup, faster small batches. |
-| `VLLM_SM70_CAR_VMM_SAFE` | bool | `False` | `1` (P2P/NVLink) | 0, 1 | experimental | 0.1.0 | Copies non-exportable (VMM) inputs into graph allocations while capturing custom all-reduce graphs, so expandable segments can stay on. Only with P2P or NVLink. |
-| `VLLM_SM70_DFLASH2_FUSED_QKV_PACK` | bool | `False` | `1` (DFlash2, vllm serve) | 0, 1 | configuration | 1Cat | One Triton launch instead of three copies and a concat in the DFlash2 verifier. Outputs are bitwise identical either way. |
-| `VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS` | bool | `True` | `0` (DFlash2) | 0, 1 | configuration | 1Cat | Single-request DFlash2 verifier tail graphs. The DFlash2 profile sets 0 to keep the graph memory for the KV cache. |
-| `VLLM_SM70_GDN_SKINNY_MPLAN` | bool | `False` | `1` (vllm serve) | 0, 1 | tuning | 0.2.0 | ng=2 tiling is 8-26% faster at M = 9..24 and 33..48 on V100; other M keep the fixed plan. Only with VLLM_SM70_QWEN38_GDN_NO_PACK. Outputs are bitwise identical either way. |
-| `VLLM_SM70_GREEDY_VERIFY` | bool | `False` | `1` | 0, 1 | experimental | 0.1.0 | Greedy MTP verification from TP-local argmax pairs instead of full-vocabulary logits; only when every request is plain greedy. |
-| `VLLM_SM70_MTP_GDN_NATIVE_VERIFY` | bool | `False` | `1` (AWQ MTP4 wide verifier) | 0, 1 | configuration | 0.2.0 | Uses the native recurrent verifier and accepted-state replay in the AWQ MTP4 wide verifier profile. Set 0 to disable. |
-| `VLLM_SM70_MTP_Q8_PREFILL_MMQ` | bool | `False` | `1` (NVFP4) | 0, 1 | configuration | 0.2.0 | Use grouped GGUF MMQ for Q8_0 MTP batches above 64 rows in chunks of up to 2048. MMQ changes accumulation order and increases temporary GPU memory usage. Set 0 to use the 64-row vector path. |
-| `VLLM_SM70_NVFP4_MOE_GROUPED_DECODE` | bool | `False` | `0` (NVFP4) | 0, 1 | experimental | 1Cat | Prepared-scale native-NVFP4 decode for M = 2..64; set VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE=0 (the profile defaults to 1). The profile keeps grouped decode off pending quality admission. |
-| `VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL` | bool | `True` | `1` (NVFP4) | 0, 1 | configuration | 1Cat | One grouped TurboMind call for all routed experts in prefill. |
-| `VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE` | bool | `False` | `1` (NVFP4) | 0, 1 | experimental | 1Cat | QPN for every live width 2..16 (NVFP4). |
-| `VLLM_SM70_NVFP4_QWEN38_MOE_RAW_GROUPED_DECODE` | bool | `False` | `1` (NVFP4) | 0, 1 | experimental | 0.1.0 | Graph-safe raw-E4M3 grouped NVFP4 MoE for M = 2..40; needs RAW_SCALE storage. |
-| `VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE` | bool | `False` | `1` (NVFP4) | 0, 1 | experimental | 1Cat | Keeps E4M3 block-scale codes resident instead of a second FP16 copy: less memory, decode reconstructs exact values. |
+| `VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS` | bool | `False` | `1` | 0, 1 | configuration | 1Cat | Turns off the inherited 1Cat MTP launch defaults; the ReVolta profile supplies its own. |
+| `VLLM_EARLY_MODEL_INPUTS` | bool | `False` | `1` | 0, 1 | experimental | 0.1.0 | Prepares model inputs earlier in CUDA graph steps, overlapping host work. |
+| `VLLM_PLE_ASYNC_REQUEST_INDICES` | bool | `False` | `1` | 0, 1 | experimental | 0.1.0 | Removes a host wait per step for the PLE inputs. |
+| `VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP` | bool | `False` | `0`, `1` (AWQ+DFlash2) | 0, 1 | configuration | 1Cat | Runs shared and routed experts on separate CUDA streams. The profile sets 1 for AWQ g32 with DFlash2 when expert parallelism and dual-batch overlap are off. |
+| `VLLM_SM70_AWQ_QWEN38_GROUPED_QPN` | bool | `False` | `1` (AWQ) | 0, 1 | experimental | 0.1.0 | Grouped AWQ MoE decode kernel for small batches: each active expert is read once per step. |
+| `VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS` | int | `20` | `40` (AWQ), `48` (AWQ MTP4 wide verifier) | 2..48 | tuning | 0.1.0 | Largest batch, in rows, for the grouped AWQ MoE kernel; larger batches use TurboMind. DFlash2 uses its own row cap. |
+| `VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_PACK_ROWS` | int | `0` | `24` (AWQ) | 0 or 8..48 step 8 | tuning | 0.1.0 | Tuning of the grouped AWQ kernel (rows per expert pack). Keep the profile value. |
+| `VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT` | int | `16` | `8` (AWQ) | 4, 8, 16 | tuning | 0.1.0 | Tuning of the grouped AWQ kernel (warps per expert). Keep the profile value. |
+| `VLLM_SM70_AWQ_QWEN38_QPN_M1` | bool | `True` | `1` (AWQ) | 0, 1 | configuration | 1Cat | Single-request AWQ MoE kernel. Set 0 for the older route. |
+| `VLLM_SM70_AWQ_TUNE_SMALL_SHAPES` | bool | `False` | `1` (AWQ) | 0, 1 | configuration | 1Cat | Tunes small AWQ batch shapes at startup: longer warm-up, faster small batches. |
+| `VLLM_SM70_CAR_VMM_SAFE` | bool | `False` | `1` (P2P/NVLink) | 0, 1 | experimental | 0.1.0 | Lets custom all-reduce CUDA graphs work with expandable segments (P2P or NVLink only). |
+| `VLLM_SM70_DFLASH2_FUSED_QKV_PACK` | bool | `False` | `1` (DFlash2, vllm serve) | 0, 1 | configuration | 1Cat | One kernel for the Q/K/V packing of the DFlash2 verifier. |
+| `VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS` | bool | `True` | `0` (DFlash2) | 0, 1 | configuration | 1Cat | Single-request DFlash2 verifier tail graphs. The profile sets 0 for DFlash2 so that their memory goes to the KV cache; with 1, also raise `VLLM_V2_CUDAGRAPH_MEM_MIB`. |
+| `VLLM_SM70_GDN_SKINNY_MPLAN` | bool | `False` | `1` (vllm serve) | 0, 1 | tuning | 0.2.0 | Faster GDN projection plans for some batch sizes; needs `VLLM_SM70_QWEN38_GDN_NO_PACK`. |
+| `VLLM_SM70_GREEDY_VERIFY` | bool | `False` | `1` | 0, 1 | experimental | 0.1.0 | Faster MTP verification when every request in the batch is greedy. |
+| `VLLM_SM70_MTP_GDN_NATIVE_VERIFY` | bool | `False` | `1` (AWQ MTP4 wide verifier) | 0, 1 | configuration | 0.2.0 | Native GDN verification for the [AWQ MTP4 wide verifier](#awq-mtp4-wide-verifier). Set 0 to disable. |
+| `VLLM_SM70_MTP_Q8_PREFILL_MMQ` | bool | `False` | `1` (NVFP4) | 0, 1 | configuration | 0.2.0 | Grouped kernel for large MTP draft prefill batches (above 64 rows). It uses more temporary GPU memory and can change rounding. Set 0 for the smaller per-row kernel. |
+| `VLLM_SM70_NVFP4_MOE_GROUPED_DECODE` | bool | `False` | `0` (NVFP4) | 0, 1 | experimental | 1Cat | Alternative NVFP4 MoE decode kernel; needs `VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE=0`. The profile keeps it off because its quality is not validated. |
+| `VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL` | bool | `True` | `1` (NVFP4) | 0, 1 | configuration | 1Cat | One grouped call for all routed experts in NVFP4 prefill. |
+| `VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE` | bool | `False` | `1` (NVFP4) | 0, 1 | experimental | 1Cat | NVFP4 MoE decode kernel for 2–16 rows. |
+| `VLLM_SM70_NVFP4_QWEN38_MOE_RAW_GROUPED_DECODE` | bool | `False` | `1` (NVFP4) | 0, 1 | experimental | 0.1.0 | Grouped NVFP4 MoE decode for 2–40 rows; needs raw scales (`VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE=1`). |
+| `VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE` | bool | `False` | `1` (NVFP4) | 0, 1 | experimental | 1Cat | Keeps NVFP4 block scales in their compact E4M3 form instead of a second FP16 copy, which saves GPU memory. Set 0 for FP16 scales, for example to use dual-batch overlap or microbatching, which raw scales do not support. |
 | `VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES` | bool | `True` | `1` (NVFP4) | 0, 1 | configuration | 1Cat | Tunes small NVFP4 shapes at startup. |
-| `VLLM_SM70_NVFP4_TURBOMIND` | bool | `True` | `1` (NVFP4) | 0, 1 | configuration | 1Cat | TurboMind route for NVFP4/MXFP4 dense layers; 0 only for diagnosis. |
-| `VLLM_SM70_PLE_INPUT_PREPARE` | bool | `False` | `1` | 0, 1 | experimental | 0.1.0 | One fused launch for PLE n-gram context gathering (<=4 requests). |
-| `VLLM_SM70_PLE_NGRAM_BATCH` | bool | `False` | `1` | 0, 1 | experimental | 0.1.0 | Fused PLE n-gram id preprocessing for 2..32 rows. |
-| `VLLM_SM70_PLE_PREFILL_CONV_CHUNK` | bool | `False` | `1` | 0, 1 | experimental | 0.1.0 | Bounds PLE short-conv prefill buffers when several prefills share a step; needed at max_num_seqs=8. Outputs are bitwise identical either way. |
-| `VLLM_SM70_QSA_COMPACT_TOPK` | bool | `False` | `1` | 0, 1 | experimental | 0.1.0 | Coarse FP16 pre-selection before the exact QSA top-k for <=32 rows and long contexts; same indices. |
-| `VLLM_SM70_QSA_GROUPED_LPT` | bool | `False` | `1` (vllm serve) | 0, 1 | tuning | 0.2.0 | Longest grouped page4 CTAs start first, which shortens the tail of uneven decode batches. Outputs are bitwise identical either way. |
-| `VLLM_SM70_QSA_REQUEST_SEGMENTS` | bool | `False` | `1` | 0, 1 | experimental | 0.2.0 | Reads each 64-key tile once per request segment in multi-request decode. Outputs are bitwise identical either way. |
-| `VLLM_SM70_QSA_SHARED_KEY` | bool | `False` | `1` | 0, 1 | experimental | 0.1.0 | Shared-key FP16 indexer for M2..8 verification queries of one request. |
-| `VLLM_SM70_QWEN38_GDN_NO_PACK` | bool | `False` | `1` | 0, 1 | experimental | 0.1.0 | Skips the packed GDN weight copy (725.6 MiB per TP4 rank) and serves 2..48 rows with the skinny dual GEMM; frees memory for KV. |
-| `VLLM_SM70_QWEN38_HYBRID_PLE` | bool | `False` | `0` | 0, 1 | configuration | 1Cat | Local pinned PLE shards for decode. The profile sets 0 (single PLE placement) on the reference deployment. |
-| `VLLM_SM70_QWEN38_NATIVE_ROUTER_TOPK` | bool | `False` | `1` (AWQ MTP4 wide verifier) | 0, 1 | experimental | 0.1.0 | Uses the native router for eligible 17–64 row FP16 logits in the AWQ MTP4 wide verifier profile. Set 0 to disable. |
-| `VLLM_SM70_QWEN38_WIDE_M` | bool | `False` | `1` | 0, 1 | experimental | 0.1.0 | Widens Qwen3.8 decode/verify routes from 4 to 8 requests (M up to 40); each VLLM_SM70_QWEN38_WIDE_M_* item can override it. |
-| `VLLM_SM70_SKIP_REJECTED_BATCH_PACKS` | bool | `False` | `1` | 0, 1 | experimental | 0.1.0 | Skips batch packs the precision policy never admits; saves about 199 MiB per rank. |
-| `VLLM_USE_AOT_COMPILE` | bool | `False` | `0` | 0, 1 | configuration | 1Cat | AOT compile reuse. The profile sets 0 on the reference deployment. |
-| `VLLM_V2_CUDAGRAPH_MEM_MIB` | float | `0.0` | `700` (AWQ), `700` (NVFP4), `1200` (DFlash2), `1000` (AWQ+DFlash2, planar KV), `1150` (AWQ+DFlash2, planar KV, positive mixed-prefill target), `1024` (NVFP4+DFlash2, planar KV), `600` (fixed MTP, planar KV), `705` (dynamic MTP, planar KV), `800` (dynamic MTP with 5+ drafts, planar KV) | MiB | configuration | 1Cat | CUDA graph memory reserved before sizing the KV cache (MRv2 does not profile it). Too low risks OOM at capture; too high wastes KV. Profile: 700 (AWQ, NVFP4), 1200 (DFlash2); with fp8_per_token_head or int8 KV, 600 (fixed MTP), 705 (dynamic MTP), 800 (dynamic MTP with 5 or more drafts), 1000 (AWQ + DFlash2; 1150 with a positive --mixed-prefill-step-latency-ms) and 1024 (NVFP4 + DFlash2). See [CUDA graph reserve](checkpoints.md#cuda-graph-reserve). |
+| `VLLM_SM70_NVFP4_TURBOMIND` | bool | `True` | `1` (NVFP4) | 0, 1 | configuration | 1Cat | TurboMind kernels for NVFP4 and MXFP4 dense layers. Set 0 only to diagnose. |
+| `VLLM_SM70_PLE_INPUT_PREPARE` | bool | `False` | `1` | 0, 1 | experimental | 0.1.0 | Fused PLE input preparation for up to 4 requests. |
+| `VLLM_SM70_PLE_NGRAM_BATCH` | bool | `False` | `1` | 0, 1 | experimental | 0.1.0 | Fused PLE n-gram preprocessing for 2–32 rows. |
+| `VLLM_SM70_PLE_PREFILL_CONV_CHUNK` | bool | `False` | `1` | 0, 1 | experimental | 0.1.0 | Bounds the PLE prefill buffers when several prefills share a step; needed at `--max-num-seqs 8`. |
+| `VLLM_SM70_QSA_COMPACT_TOPK` | bool | `False` | `1` | 0, 1 | experimental | 0.1.0 | Faster QSA block selection for up to 32 rows at long contexts; it selects the same blocks. |
+| `VLLM_SM70_QSA_GROUPED_LPT` | bool | `False` | `1` (vllm serve) | 0, 1 | tuning | 0.2.0 | Starts the longest QSA work first, which shortens uneven decode batches. |
+| `VLLM_SM70_QSA_REQUEST_SEGMENTS` | bool | `False` | `1` | 0, 1 | experimental | 0.2.0 | Reads the QSA keys once per request in multi-request decode. |
+| `VLLM_SM70_QSA_SHARED_KEY` | bool | `False` | `1` | 0, 1 | experimental | 0.1.0 | Faster QSA indexer for the 2–8 verification queries of one request. |
+| `VLLM_SM70_QWEN38_GDN_NO_PACK` | bool | `False` | `1` | 0, 1 | experimental | 0.1.0 | Skips a packed copy of the GDN weights (about 0.7 GiB per GPU), which frees memory for the KV cache. |
+| `VLLM_SM70_QWEN38_HYBRID_PLE` | bool | `False` | `0` | 0, 1 | configuration | 1Cat | Per-rank pinned PLE shards for decode. The profile sets 0 (one shared PLE placement). |
+| `VLLM_SM70_QWEN38_NATIVE_ROUTER_TOPK` | bool | `False` | `1` (AWQ MTP4 wide verifier) | 0, 1 | experimental | 0.1.0 | Native MoE router for 17–64 rows in the [AWQ MTP4 wide verifier](#awq-mtp4-wide-verifier). Set 0 to disable. |
+| `VLLM_SM70_QWEN38_WIDE_M` | bool | `False` | `1` | 0, 1 | experimental | 0.1.0 | Extends the fast Qwen3.8 decode and verify kernels from 4 to 8 requests. |
+| `VLLM_SM70_SKIP_REJECTED_BATCH_PACKS` | bool | `False` | `1` | 0, 1 | experimental | 0.1.0 | Skips weight packs that are never used, about 199 MiB per GPU. |
+| `VLLM_USE_AOT_COMPILE` | bool | `False` | `0` | 0, 1 | configuration | 1Cat | Ahead-of-time compile reuse. The profile sets 0. |
+| `VLLM_V2_CUDAGRAPH_MEM_MIB` | float | `0.0` | `700` (AWQ), `700` (NVFP4), `1200` (DFlash2), `1000` (AWQ+DFlash2, planar KV), `1150` (AWQ+DFlash2, planar KV, positive mixed-prefill target), `1024` (NVFP4+DFlash2, planar KV), `600` (fixed MTP, planar KV), `705` (dynamic MTP, planar KV), `800` (dynamic MTP with 5+ drafts, planar KV) | MiB | configuration | 1Cat | CUDA graph memory reserved per GPU before the KV cache is sized. The profile picks the value by method, checkpoint and KV format; see [CUDA graph reserve](checkpoints.md#cuda-graph-reserve). Raise it if the startup log warns that the graphs took more than the reserve. |
 
 ### Experimental switches (off by default)
 
 | Name | Type | Default | Range | Category | Since | Effect and trade-off |
 |---|---|---|---|---|---|---|
-| `VLLM_SM70_NVFP4_RAW_GROUPED_M48_V154` | bool | `False` | 0, 1 | experimental | 0.2.0 | Native raw-E4M3 grouped MoE for 41..64-row target decode on SM70 TP4 Qwen3.8 with equal interleaved gate/up global scales. Requires raw grouped decode and the V2 model runner. |
-| `VLLM_SM70_NVFP4_RAW_GROUPED_NARROW_V154` | bool | `False` | 0, 1 | experimental | 0.2.0 | Native raw-E4M3 grouped MoE for 3-5 row target decode on SM70 TP4 Qwen3.8 with equal interleaved gate/up global scales. Requires raw grouped decode and the V2 model runner. |
+| `VLLM_SM70_NVFP4_RAW_GROUPED_M48_V154` | bool | `False` | 0, 1 | experimental | 0.2.0 | Opt-in NVFP4 MoE decode kernel for 41–64 rows. Needs raw grouped decode, Model Runner V2 and equal gate/up global scales. |
+| `VLLM_SM70_NVFP4_RAW_GROUPED_NARROW_V154` | bool | `False` | 0, 1 | experimental | 0.2.0 | Opt-in NVFP4 MoE decode kernel for 3–5 rows. Needs raw grouped decode, Model Runner V2 and equal gate/up global scales. |
 
 ### Anonymous usage statistics
 
@@ -335,88 +318,48 @@ The ReVolta profile (`vllm/revolta_profile.py`) sets these on SM70 + TP4 + FP16 
 |---|---|---|---|---|---|---|
 | `VLLM_DO_NOT_TRACK` | bool | `False` | 0, 1 | configuration | 1Cat | Honours the cross-project Do Not Track convention (DO_NOT_TRACK counts too): 1 turns the usage report off. |
 | `VLLM_NO_USAGE_STATS` | bool | `False` | 0, 1 | configuration | 1Cat | Upstream opt-out, honoured as-is: 1 turns the usage report off. The Do Not Track variables and the do_not_track file have the same effect. |
-| `VLLM_USAGE_SOURCE` | str | `'production'` | short label | configuration | 1Cat | Deployment label reported with the anonymous report (production by default). A value that looks like a path or a URL is reported as custom instead. |
+| `VLLM_USAGE_SOURCE` | str | `'production'` | short label | configuration | 1Cat | Deployment label sent as `source` (`production` by default). A value with `/`, `\`, `:`, a space or more than 64 characters is sent as `custom`. Do not put identifying text in it. |
 | `VLLM_USAGE_STATS_SERVER` | str | `'https://usage.19b.net/api/'` | URL, empty to disable sending | configuration | 1Cat | Where the report goes. ReVolta defaults to its own collector; an empty string keeps the local log file but sends nothing. |
 
-### DFlash2 legacy lookup and debug settings
+### DFlash2 legacy lookup
 
-| Name | Type | Default | Range | Category | Since | Effect and trade-off |
-|---|---|---|---|---|---|---|
-| `VLLM_DFLASH2_LOOKUP_ADAPTIVE` | bool | `True` | 0, 1 | experimental | 1Cat | Legacy ngram_assist only (default off). Kept for compatibility with no removal version set. New configurations use explicit dflash2_lookup settings; see the native history lookup guide. Legacy values and cache factors are fixed at configuration resolution. Adaptive q8/q16 lookup width. |
-| `VLLM_DFLASH2_LOOKUP_AGREE` | int | `Computed when unset: max(0, int('0'))` | integer >= 0 | experimental | 1Cat | Legacy ngram_assist only (default off). Kept for compatibility with no removal version set. New configurations use explicit dflash2_lookup settings; see the native history lookup guide. Legacy values and cache factors are fixed at configuration resolution. Leading tokens the lookup and the draft must agree on (0 = none). |
-| `VLLM_DFLASH2_LOOKUP_CHEAP_CONTEXT` | int | `Computed when unset: max(0, int('0'))` | integer >= 0 | experimental | 1Cat | Legacy ngram_assist only (default off). Kept for compatibility with no removal version set. New configurations use explicit dflash2_lookup settings; see the native history lookup guide. Legacy values and cache factors are fixed at configuration resolution. Context length below which lookup is always tried (0 = off). |
-| `VLLM_DFLASH2_LOOKUP_ENTRY_STREAK` | int | `Computed when unset: max(1, int('2'))` | integer >= 1 | experimental | 1Cat | Legacy ngram_assist only (default off). Kept for compatibility with no removal version set. New configurations use explicit dflash2_lookup settings; see the native history lookup guide. Legacy values and cache factors are fixed at configuration resolution. Consecutive hits before lookup mode starts. |
-| `VLLM_DFLASH2_LOOKUP_LONG_MIN` | int | `Computed when unset: max(1, int('6'))` | integer >= 1 | experimental | 1Cat | Legacy ngram_assist only (default off). Kept for compatibility with no removal version set. New configurations use explicit dflash2_lookup settings; see the native history lookup guide. Legacy values and cache factors are fixed at configuration resolution. Minimum length of a long match. |
-| `VLLM_DFLASH2_LOOKUP_NMIN_TAIL` | int | `Computed when unset: max(1, int('4'))` | integer >= 1 | experimental | 1Cat | Legacy ngram_assist only (default off). Kept for compatibility with no removal version set. New configurations use explicit dflash2_lookup settings; see the native history lookup guide. Legacy values and cache factors are fixed at configuration resolution. Smallest n-gram accepted for the lookup tail. |
-| `VLLM_DFLASH2_LOOKUP_NSTRONG` | int | `Computed when unset: max(1, int('6'))` | integer >= 1 | experimental | 1Cat | Legacy ngram_assist only (default off). Kept for compatibility with no removal version set. New configurations use explicit dflash2_lookup settings; see the native history lookup guide. Legacy values and cache factors are fixed at configuration resolution. n-gram length that counts as a strong prompt match. |
-| `VLLM_DFLASH2_LOOKUP_SEARCH` | int | `Computed when unset: max(1, int(str(1 << 30)))` | integer >= 1 | experimental | 1Cat | Legacy ngram_assist only (default off). Kept for compatibility with no removal version set. New configurations use explicit dflash2_lookup settings; see the native history lookup guide. Legacy values and cache factors are fixed at configuration resolution. Context searched for matches (default unbounded). |
-| `VLLM_DFLASH2_LOOKUP_STICKY` | int | `Computed when unset: max(0, int('3'))` | integer >= 0 | experimental | 1Cat | Legacy ngram_assist only (default off). Kept for compatibility with no removal version set. New configurations use explicit dflash2_lookup settings; see the native history lookup guide. Legacy values and cache factors are fixed at configuration resolution. Steps lookup mode stays on after a hit. |
-| `VLLM_DFLASH_COMPACT_AUX_HIDDEN` | bool | `True` | 0, 1 | configuration | 1Cat | Concatenates the target auxiliary hidden states directly in the draft projection dtype (DFlash and DFlash2 drafts); avoids an extra full-precision copy. |
-| `VLLM_DFLASH_DEBUG_CONTEXT_KV` | bool | `False` | 0, 1 | debug | 1Cat | Debug: log the draft context KV. |
-| `VLLM_DFLASH_DEBUG_CORRUPTION` | bool | `False` | 0, 1 | debug | 1Cat | Debug, MRv1 only: draft corruption diagnostics. |
-| `VLLM_DFLASH_DEBUG_PROPOSAL_STAGES` | str \| None | `None` | 0, 1 | debug | 1Cat | Debug: DFlash v1 speculator (MRv2) proposal stages. |
-| `VLLM_DFLASH_DEBUG_STATE_TABLE` | bool | `False` | 0, 1 | debug | 1Cat | Debug: log the GDN speculative state table. |
-| `VLLM_DFLASH_DEBUG_TARGET_LAYER_TRACE` | str \| None | `None` | 0, 1 | debug | 1Cat | Debug: target layer trace (NVFP4 MoE). |
-| `VLLM_DFLASH_DEBUG_TARGET_LOGITS` | str \| None | `None` | 0, 1 | debug | 1Cat | Debug: log target logits (MRv2). |
-| `VLLM_DFLASH_DEBUG_TARGET_TRACE_MIN_POSITION` | str \| None | `None` | position | debug | 1Cat | Debug: first position of the target layer trace. |
-| `VLLM_DFLASH_DEBUG_TENSOR_DUMP_DIR` | str \| None | `None` | path | debug | 1Cat | Debug: DFlash v1 speculator (MRv2) tensor dump directory. |
-| `VLLM_DFLASH_DEBUG_TENSOR_DUMP_LIMIT` | str \| None | `None` | count | debug | 1Cat | Debug: maximum tensor dumps. |
-| `VLLM_DFLASH_DISABLE_AUX_OUTPUTS` | bool | `False` | 0, 1 | debug | 1Cat | Debug, MRv1 only: disable the auxiliary outputs for the draft. |
-| `VLLM_DFLASH_DUMP_DRAFT_LOGITS` | bool | `False` | 0, 1 | debug | 1Cat | Debug, MRv1 only: dump draft logits. |
-| `VLLM_DFLASH_DUMP_FIRST_PASS` | bool | `False` | 0, 1 | debug | 1Cat | Debug, MRv1 DFlash (v1) only: dump the first draft pass. |
-| `VLLM_DFLASH_PROFILE` | bool | `False` | 0, 1 | debug | 1Cat | Debug: DFlash/DFlash2 proposal timing log. |
-| `VLLM_DFLASH_PROFILE_LOG_INTERVAL` | int | `32` | steps | debug | 1Cat | Debug: interval of the timing log. |
+The legacy `ngram_assist` lookup for DFlash2 (off by default). These variables still work, with no removal release set, and setting any of them turns off the profile's default native lookup. New setups use `dflash2_lookup`; see [Native history lookup](dflash2.md#native-history-lookup).
+
+| Name | Default | Effect |
+|---|---|---|
+| `VLLM_DFLASH2_LOOKUP_ADAPTIVE` | `True` | Adaptive q8/q16 lookup width. |
+| `VLLM_DFLASH2_LOOKUP_AGREE` | `0` | Leading tokens the lookup and the draft must agree on (0 = none). |
+| `VLLM_DFLASH2_LOOKUP_CHEAP_CONTEXT` | `0` | Context length below which lookup is always tried (0 = off). |
+| `VLLM_DFLASH2_LOOKUP_ENTRY_STREAK` | `2` | Consecutive hits before lookup mode starts. |
+| `VLLM_DFLASH2_LOOKUP_LONG_MIN` | `6` | Minimum length of a long match. |
+| `VLLM_DFLASH2_LOOKUP_NMIN_TAIL` | `4` | Smallest n-gram accepted for the lookup tail. |
+| `VLLM_DFLASH2_LOOKUP_NSTRONG` | `6` | n-gram length that counts as a strong prompt match. |
+| `VLLM_DFLASH2_LOOKUP_SEARCH` | `1073741824` | Context searched for matches (default unbounded). |
+| `VLLM_DFLASH2_LOOKUP_STICKY` | `3` | Steps lookup mode stays on after a hit. |
+
+### Developer diagnostics
+
+These variables log, dump or switch internal paths for development. Leave them unset when serving.
+
+- `VLLM_DFLASH_DEBUG_CONTEXT_KV`, `VLLM_DFLASH_DEBUG_PROPOSAL_STAGES`, `VLLM_DFLASH_DEBUG_STATE_TABLE`, `VLLM_DFLASH_DEBUG_TARGET_LAYER_TRACE`, `VLLM_DFLASH_DEBUG_TARGET_LOGITS`, `VLLM_DFLASH_DEBUG_TARGET_TRACE_MIN_POSITION`, `VLLM_DFLASH_DEBUG_TENSOR_DUMP_DIR`, `VLLM_DFLASH_DEBUG_TENSOR_DUMP_LIMIT`: DFlash debug logs, traces and tensor dumps
+- `VLLM_DFLASH_DEBUG_CORRUPTION`, `VLLM_DFLASH_DISABLE_AUX_OUTPUTS`, `VLLM_DFLASH_DUMP_DRAFT_LOGITS`, `VLLM_DFLASH_DUMP_FIRST_PASS`: DFlash diagnostics for Model Runner V1 only; no effect on Qwen3.8 Flash-Next, which runs Model Runner V2
+- `VLLM_DFLASH_PROFILE`, `VLLM_DFLASH_PROFILE_LOG_INTERVAL`: DFlash and DFlash2 proposal timing log and its interval
+- `VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE`: validation file for `VLLM_SM70_GDN_CPU_SPEC_QSL`; do not set it for timing runs
+- `VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_FULL_REFRESH_INTERVAL`, `VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_FUSED_PROPOSAL`, `VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_GPU_LRU`, `VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_PREFILL_TOPK`: Model Runner V1 only; setting one with Model Runner V2 is an error
+- `VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_TAIL_SIZE`, `VLLM_SM70_MTP_STATIC_DRAFT_VOCAB_RANKING`, `VLLM_SM70_MTP_STATIC_DRAFT_VOCAB_SIZE`: experimental MTP draft vocabulary shortlist, outside release acceptance; it needs a ranking file that ReVolta does not provide
+- `VLLM_SM70_QWEN_GDN_DISABLE_FULL_FORWARD`, `VLLM_SM70_QWEN_GDN_FULL_FORWARD`, `VLLM_SM70_QWEN_GDN_SPEC_CORE_OP`: GDN compile-boundary diagnostics; the image sets 0
 
 ### Deprecated variables
 
-| Name | Type | Default | Range | Category | Since | Effect and trade-off |
-|---|---|---|---|---|---|---|
-| `REVOLTA_QSA_GROUPED_LPT` | bool | `False` | 0, 1 | deprecated | 0.2.0 | Deprecated alias of VLLM_SM70_QSA_GROUPED_LPT from the 0.2.0 pre-releases. Still accepted with a FutureWarning; the new name wins when both are set. It will be removed in a later release. |
-| `REVOLTA_RESEARCH_CHECKPOINT_CACHE_DROP` | bool | `False` | 0, 1 | deprecated | 0.2.0 | Deprecated alias of VLLM_SM70_CHECKPOINT_CACHE_DROP from the 0.2.0 pre-releases. Still accepted with a FutureWarning; the new name wins when both are set. It will be removed in a later release. |
-| `REVOLTA_RESEARCH_HOST_DECODE_FAST` | bool | `False` | 0, 1 | deprecated | 0.2.0 | Deprecated alias of VLLM_SM70_HOST_DECODE_FAST from the 0.2.0 pre-releases. Still accepted with a FutureWarning; the new name wins when both are set. It will be removed in a later release. |
-| `REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED` | bool | `False` | 0, 1 | deprecated | 0.2.0 | Deprecated alias of VLLM_SM70_QSA_LOCAL_INPUTS_FUSED from the 0.2.0 pre-releases. Still accepted with a FutureWarning; the new name wins when both are set. It will be removed in a later release. |
-| `REVOLTA_SKINNY_MPLAN` | bool | `False` | 0, 1 | deprecated | 0.2.0 | Deprecated alias of VLLM_SM70_GDN_SKINNY_MPLAN from the 0.2.0 pre-releases. Still accepted with a FutureWarning; the new name wins when both are set. It will be removed in a later release. |
-| `VLLM_DFLASH_DDTREE_ATTN_COMPACT_BATCH` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree (speculative method dflash_ddtree) is retired. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DDTREE_COMPACT_DRAFTER_CONTEXT` | bool | `True` | - | deprecated | 1Cat | Deprecated: DDTree (speculative method dflash_ddtree) is retired. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DDTREE_CONV_KERNEL` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree (speculative method dflash_ddtree) is retired. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DDTREE_DEBUG` | bool | `False` | - | deprecated | 1Cat | Deprecated: DDTree (speculative method dflash_ddtree) is retired. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DDTREE_DISABLE_GDN_FAST_BUILD` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree (speculative method dflash_ddtree) is retired. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DDTREE_DISABLE_GDN_FAST_BUILD_CACHE` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree (speculative method dflash_ddtree) is retired. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DDTREE_ENABLE_GDN_FAST_BUILD` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree (speculative method dflash_ddtree) is retired. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DDTREE_ENABLE_GDN_FAST_BUILD_CACHE` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree (speculative method dflash_ddtree) is retired. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DDTREE_ENABLE_HYBRID_TREE_STATE` | bool | `False` | - | deprecated | 1Cat | Deprecated: DDTree (speculative method dflash_ddtree) is retired. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DDTREE_ENGINE_PROFILE` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree (speculative method dflash_ddtree) is retired. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DDTREE_FAST_BUILD_DEBUG` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree (speculative method dflash_ddtree) is retired. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DDTREE_FORCE_MAMBA_COMPACT` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree (speculative method dflash_ddtree) is retired. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DDTREE_FUSED_GDN` | bool | `True` | - | deprecated | 1Cat | Deprecated: DDTree (speculative method dflash_ddtree) is retired. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DDTREE_GDN_FAST_BUILD_TRITON` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree (speculative method dflash_ddtree) is retired. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DDTREE_GDN_SHARED_COMMON` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree (speculative method dflash_ddtree) is retired. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DDTREE_GPU_SAMPLER` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree (speculative method dflash_ddtree) is retired. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DDTREE_LINEAR_GDN` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree (speculative method dflash_ddtree) is retired. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DDTREE_MAMBA_COMPACT_BATCH` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree (speculative method dflash_ddtree) is retired. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DDTREE_METADATA_PROFILE` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree (speculative method dflash_ddtree) is retired. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DDTREE_PATH_PROBE` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree (speculative method dflash_ddtree) is retired. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DDTREE_PATH_PROBE_LAYER` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree (speculative method dflash_ddtree) is retired. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DDTREE_PATH_PROBE_MAX_REPORTS` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree (speculative method dflash_ddtree) is retired. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DDTREE_PATH_PROBE_NODE_LIMIT` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree (speculative method dflash_ddtree) is retired. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DDTREE_PROFILE` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree (speculative method dflash_ddtree) is retired. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DDTREE_QLA_GDN` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree (speculative method dflash_ddtree) is retired. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DDTREE_SERIAL_GDN` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree (speculative method dflash_ddtree) is retired. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DDTREE_SKIP_MAMBA_COMPACT` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree (speculative method dflash_ddtree) is retired. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DDTREE_STOCHASTIC_TOPK_LOGITS` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree (speculative method dflash_ddtree) is retired. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DDTREE_TARGET_FORWARD_NVTX` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree (speculative method dflash_ddtree) is retired. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DDTREE_TARGET_FORWARD_PROFILER_STEP` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree (speculative method dflash_ddtree) is retired. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DDTREE_TRACE_JSONL` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree (speculative method dflash_ddtree) is retired. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DDTREE_TRACE_KV_CACHE_DIFF` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree (speculative method dflash_ddtree) is retired. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN` | bool | `True` | - | deprecated | 1Cat | Deprecated: DDTree (speculative method dflash_ddtree) is retired. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN_STRICT` | bool | `False` | - | deprecated | 1Cat | Deprecated: DDTree (speculative method dflash_ddtree) is retired. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DDTREE_TRITON_SAMPLER` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree (speculative method dflash_ddtree) is retired. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree (speculative method dflash_ddtree) is retired. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE_CONTEXT` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree (speculative method dflash_ddtree) is retired. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE_TOPK` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree (speculative method dflash_ddtree) is retired. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DDTREE_WORKER_PROFILE` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: DDTree (speculative method dflash_ddtree) is retired. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DEBUG_COORD_TRACE` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: glm5next is outside the supported models. Setting it logs a deprecation warning. |
-| `VLLM_DFLASH_DEBUG_PP_AUX_DUMP_LIMIT` | str \| None | `None` | - | deprecated | 1Cat | Deprecated: glm5next is outside the supported models. Setting it logs a deprecation warning. |
+Still accepted in 0.2.0; setting one logs a deprecation warning. For a renamed variable the new name wins when both are set.
+
+- `REVOLTA_QSA_GROUPED_LPT` → `VLLM_SM70_QSA_GROUPED_LPT`
+- `REVOLTA_RESEARCH_CHECKPOINT_CACHE_DROP` → `VLLM_SM70_CHECKPOINT_CACHE_DROP`
+- `REVOLTA_RESEARCH_HOST_DECODE_FAST` → `VLLM_SM70_HOST_DECODE_FAST`
+- `REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED` → `VLLM_SM70_QSA_LOCAL_INPUTS_FUSED`
+- `REVOLTA_SKINNY_MPLAN` → `VLLM_SM70_GDN_SKINNY_MPLAN`
+- `VLLM_DFLASH_DDTREE_ATTN_COMPACT_BATCH`, `VLLM_DFLASH_DDTREE_COMPACT_DRAFTER_CONTEXT`, `VLLM_DFLASH_DDTREE_CONV_KERNEL`, `VLLM_DFLASH_DDTREE_DEBUG`, `VLLM_DFLASH_DDTREE_DISABLE_GDN_FAST_BUILD`, `VLLM_DFLASH_DDTREE_DISABLE_GDN_FAST_BUILD_CACHE`, `VLLM_DFLASH_DDTREE_ENABLE_GDN_FAST_BUILD`, `VLLM_DFLASH_DDTREE_ENABLE_GDN_FAST_BUILD_CACHE`, `VLLM_DFLASH_DDTREE_ENABLE_HYBRID_TREE_STATE`, `VLLM_DFLASH_DDTREE_ENGINE_PROFILE`, `VLLM_DFLASH_DDTREE_FAST_BUILD_DEBUG`, `VLLM_DFLASH_DDTREE_FORCE_MAMBA_COMPACT`, `VLLM_DFLASH_DDTREE_FUSED_GDN`, `VLLM_DFLASH_DDTREE_GDN_FAST_BUILD_TRITON`, `VLLM_DFLASH_DDTREE_GDN_SHARED_COMMON`, `VLLM_DFLASH_DDTREE_GPU_SAMPLER`, `VLLM_DFLASH_DDTREE_LINEAR_GDN`, `VLLM_DFLASH_DDTREE_MAMBA_COMPACT_BATCH`, `VLLM_DFLASH_DDTREE_METADATA_PROFILE`, `VLLM_DFLASH_DDTREE_PATH_PROBE`, `VLLM_DFLASH_DDTREE_PATH_PROBE_LAYER`, `VLLM_DFLASH_DDTREE_PATH_PROBE_MAX_REPORTS`, `VLLM_DFLASH_DDTREE_PATH_PROBE_NODE_LIMIT`, `VLLM_DFLASH_DDTREE_PROFILE`, `VLLM_DFLASH_DDTREE_QLA_GDN`, `VLLM_DFLASH_DDTREE_SERIAL_GDN`, `VLLM_DFLASH_DDTREE_SKIP_MAMBA_COMPACT`, `VLLM_DFLASH_DDTREE_STOCHASTIC_TOPK_LOGITS`, `VLLM_DFLASH_DDTREE_TARGET_FORWARD_NVTX`, `VLLM_DFLASH_DDTREE_TARGET_FORWARD_PROFILER_STEP`, `VLLM_DFLASH_DDTREE_TRACE_JSONL`, `VLLM_DFLASH_DDTREE_TRACE_KV_CACHE_DIFF`, `VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN`, `VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN_STRICT`, `VLLM_DFLASH_DDTREE_TRITON_SAMPLER`, `VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE`, `VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE_CONTEXT`, `VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE_TOPK`, `VLLM_DFLASH_DDTREE_WORKER_PROFILE` → no replacement: DDTree (the `dflash_ddtree` speculative method) is retired
+- `VLLM_DFLASH_DEBUG_COORD_TRACE`, `VLLM_DFLASH_DEBUG_PP_AUX_DUMP_LIMIT` → no replacement: glm5next is outside the supported models
 
 ### speculative_config.sm70_dflash2 keys
 

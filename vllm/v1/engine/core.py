@@ -90,6 +90,17 @@ from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
 
+
+@contextmanager
+def _shutdown_step(name: str):
+    """Time one shutdown step so a stop log shows which stage dominates."""
+    t0 = time.monotonic()
+    try:
+        yield
+    finally:
+        logger.info("Shutdown step=%s elapsed=%.3fs", name, time.monotonic() - t0)
+
+
 if TYPE_CHECKING:
     from vllm.v1.core.history_block_pool import HistoryBlockPool
     from vllm.v1.kv_offload.host.region import HostRegionOwner
@@ -1002,7 +1013,8 @@ class EngineCore:
                 and not getattr(self, "_host_kv_drained", False)
             ):
                 assert deadline is not None
-                self._drain_host_kv(host_scheduler, host_pool, deadline)
+                with _shutdown_step("drain-host-kv"):
+                    self._drain_host_kv(host_scheduler, host_pool, deadline)
             host_ssd = getattr(host_scheduler, "host_kv_ssd", None)
             if host_ssd is not None:
                 from vllm.v1.kv_offload.host.persist import plan_final_flush
@@ -1021,17 +1033,21 @@ class EngineCore:
                     return
             self.structured_output_manager.clear_backend()
             if self.model_executor:
-                if deadline is None:
-                    self.model_executor.shutdown()
-                else:
-                    from vllm.v1.kv_offload.host.shutdown import wait_until
+                with _shutdown_step("model-executor-shutdown"):
+                    if deadline is None:
+                        self.model_executor.shutdown()
+                    else:
+                        from vllm.v1.kv_offload.host.shutdown import wait_until
 
-                    wait_until(self.model_executor.shutdown, deadline, "executor-stop")
+                        wait_until(
+                            self.model_executor.shutdown, deadline, "executor-stop"
+                        )
             if self.scheduler:
-                if deadline is None:
-                    self.scheduler.shutdown()
-                else:
-                    self.scheduler.shutdown(deadline=deadline)
+                with _shutdown_step("scheduler-shutdown"):
+                    if deadline is None:
+                        self.scheduler.shutdown()
+                    else:
+                        self.scheduler.shutdown(deadline=deadline)
         except TimeoutError:
             if host_pool is None:
                 raise
@@ -1056,7 +1072,8 @@ class EngineCore:
         gc.unfreeze()
         # Tear down distributed state initialized in this EngineCore process
         # before it exits and release cached memory.
-        cleanup_dist_env_and_memory()
+        with _shutdown_step("dist-env-cleanup"):
+            cleanup_dist_env_and_memory()
         if host_pool is not None:
             self._host_kv_shutdown_complete = True
         self._resources_shutdown_complete = True

@@ -1935,6 +1935,7 @@ class VllmConfig:
 
         from vllm.revolta_profile import (
             all_visible_devices_sm70,
+            apply_awq_mtp_wide_verify_defaults,
             apply_revolta_allocator_default,
             apply_revolta_kernel_profile,
             apply_revolta_profile,
@@ -3411,6 +3412,11 @@ class VllmConfig:
         # Resolve kv_offloading-derived connector name into kv_transfer_config
         # before the HMA check below, which inspects the connector class.
         self._post_init_kv_transfer_config()
+        wide_verify = revolta_profile_enabled and apply_awq_mtp_wide_verify_defaults(
+            self, _participating_cuda_device_ids(self)
+        )
+        if self.kernel_config.sm70_gdn_input_v154 is None:
+            self.kernel_config.sm70_gdn_input_v154 = wide_verify
         if revolta_hybrid_serving and (
             self.kv_transfer_config is None
             or self.kv_transfer_config.kv_connector is None

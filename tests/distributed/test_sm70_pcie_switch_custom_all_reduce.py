@@ -13,6 +13,7 @@ import torch
 import vllm.platforms.cuda as cuda_platform
 from vllm.distributed.device_communicators import custom_all_reduce as car
 from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
+from vllm.platforms import sm70_interconnect
 from vllm.platforms.interface import DeviceCapability
 
 PIX, PXB, PHB, NODE, SYS = 10, 20, 30, 40, 50
@@ -112,7 +113,7 @@ def _mode(monkeypatch, *, mode=None, world_size=4, capability=(7, 0), switch=Tru
         raising=False,
     )
     cap = None if capability is None else DeviceCapability(*capability)
-    result = car._sm70_pcie_switch_tp4_mode(world_size, cap, [0, 1, 2, 3])
+    result = sm70_interconnect._sm70_pcie_switch_tp4_mode(world_size, cap, [0, 1, 2, 3])
     return result, calls
 
 

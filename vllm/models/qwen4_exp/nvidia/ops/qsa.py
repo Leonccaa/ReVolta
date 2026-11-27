@@ -82,9 +82,9 @@ _SM70_INDEXER_CUBLAS_MIN_SCORE_ELEMENTS = legacy_qsa_tuning(
     "VLLM_SM70_QSA_INDEXER_CUBLAS_MIN_SCORE_ELEMENTS",
     SM70_QSA_TUNING.cublas_min_score_elements,
 )
-# Opt-in (default off): lower the single-request cuBLAS row floor for short
-# warm appends to 128 rows (1Cat #1601). Selection may differ from the paged
-# scorer on near-tied blocks; the score-work gate is unchanged.
+# Lower the single-request cuBLAS row floor for short warm appends to 128
+# rows (1Cat #1601). Set the flag to 0 to restore the original routing.
+# Near-tied blocks may differ from paged; the score-work gate is unchanged.
 _SM70_QSA_SHORT_APPEND = envs.VLLM_SM70_QSA_SHORT_APPEND
 _SM70_QSA_SHORT_APPEND_MIN_ROWS = 128
 _SM70_QSA_SHORT_APPEND_MIN_COLUMNS = 4096

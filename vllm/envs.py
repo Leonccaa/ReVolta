@@ -143,7 +143,7 @@ if TYPE_CHECKING:
     VLLM_SM70_QSA_INDEXER_CUBLAS_MIN_SCORE_ELEMENTS: str | None = None
     VLLM_SM70_QSA_INDEXER_SCORE_TILE_MB: str | None = None
     VLLM_SM70_QSA_MTP_TOPK: bool = True
-    VLLM_SM70_QSA_SHORT_APPEND: bool = False
+    VLLM_SM70_QSA_SHORT_APPEND: bool = True
     VLLM_SM70_QSA_TOPK_LIBRARY: str | None = None
     VLLM_SM70_QSA_XQA_PAGE4: str | None = None
     VLLM_SM70_QSA_XQA_PAGE4_MIN_ROWS: str | None = None
@@ -19220,17 +19220,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=True,
     ),
     "VLLM_SM70_QSA_SHORT_APPEND": env_var(
-        lambda: bool(int(os.getenv("VLLM_SM70_QSA_SHORT_APPEND", "0"))),
+        lambda: bool(int(os.getenv("VLLM_SM70_QSA_SHORT_APPEND", "1"))),
         description=(
-            "Opt-in. Lowers the QSA single-request cuBLAS row floor from 512 "
-            "to 128 rows for contexts of at least 4096 score columns, and the "
-            "per-request segment floor to 128 rows at 16384 tokens or more, so "
-            "short warm appends use cuBLAS scoring. Selected blocks may differ "
-            "from the paged scorer on near-tied scores. Default off."
+            "Lowers the SM70 QSA single-request cuBLAS row floor to 128 "
+            "at 4096 or more routing columns (after alignment), and the "
+            "mixed-batch request split floor to 128 at 16384 tokens or more. "
+            "The score work threshold still applies. Selected blocks may "
+            "differ from the paged scorer on near-tied scores. Set 0 to "
+            "restore the original routing."
         ),
-        category="configuration",
-        declared_default="False",
-        effective_default="False; the 512-row floor applies.",
+        category="tuning",
+        declared_default="True",
+        effective_default="True; the existing cuBLAS eligibility gates still apply.",
         automatic_conditions=(),
         acceleration_paths=("QSA sparse attention/indexer",),
         user_visible=True,

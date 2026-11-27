@@ -4,6 +4,7 @@
 import pytest
 import torch
 
+from vllm import envs
 from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
 
 pytestmark = pytest.mark.skip_global_cleanup
@@ -41,14 +42,84 @@ def test_single_request_row_floor(monkeypatch, enabled, rows, columns, expected)
     assert qsa_ops._use_sm70_qsa_indexer_cublas(*_single(rows), columns) is expected
 
 
-def test_tp4_warm_append_row_gate_uses_route_columns(monkeypatch):
-    # 32K prefix + 400 rows, ratio 4, TP4: 2073 local columns, but the route
-    # width is the DCP2 split (4146), which is what the row floor is judged on.
-    _setup(monkeypatch, True)
-    route = qsa_ops._qsa_cublas_route_columns(2073, 33168, 4, 4, 512, 1 << 20)
-    assert route == 4146
-    assert qsa_ops._use_sm70_qsa_indexer_cublas(*_single(400), route)
-    assert not qsa_ops._use_sm70_qsa_indexer_cublas(*_single(400), 2073)
+@pytest.mark.parametrize("override", [None, "0"], ids=["default", "disabled"])
+def test_tp4_mixed_warm_append_selects_scorer(monkeypatch, override):
+    name = "VLLM_SM70_QSA_SHORT_APPEND"
+    if override is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, override)
+    # The QSA module reads the registered value at import time.
+    _setup(monkeypatch, envs.environment_variables[name]())
+    monkeypatch.setattr(
+        qsa_ops.torch.cuda, "is_current_stream_capturing", lambda: False
+    )
+    monkeypatch.setattr(
+        qsa_ops, "_qsa_visible_blocks", lambda req, pos, *a, **kw: torch.empty_like(pos)
+    )
+    monkeypatch.setattr(qsa_ops.ops, "qsa_lexicographic_topk_v154", lambda *a: None)
+    monkeypatch.setattr(
+        qsa_ops, "_sm70_qsa_lexicographic_topk_op", lambda: lambda *a: None
+    )
+    monkeypatch.setattr(
+        qsa_ops, "_merge_sharded_index_blocks", lambda blocks, *a, **kw: blocks
+    )
+    monkeypatch.setattr(qsa_ops, "expand_qsa_block_indices_cuda", lambda *a: None)
+
+    # Eight verification rows and a 400-row append to a 32K prefix. A 2048-token
+    # page holds 128 local keys at compression 4 / TP4. Decode is longer than
+    # the append, so cuBLAS must gather for the append's own host length.
+    q = torch.empty(408, 4, 128, dtype=torch.float16)
+    cache = torch.empty(35, 128, 1, 128, dtype=torch.float16)
+    table = torch.arange(36, dtype=torch.int32).view(2, 18)
+    table[1, -1] = -1
+    lens = torch.tensor([36864, 33168], dtype=torch.int32)
+    pos = torch.cat((torch.arange(36856, 36864), torch.arange(32768, 33168))).int()
+    req = torch.repeat_interleave(
+        torch.arange(2, dtype=torch.int32), torch.tensor([8, 400])
+    )
+    calls: list[tuple[str | int, ...]] = []
+
+    def gather(k_cache, page_table, columns):
+        torch.testing.assert_close(page_table, table[1:])
+        calls.append(("gather", columns))
+        return k_cache.new_empty((columns, 128)), torch.empty(
+            columns, dtype=torch.uint8
+        )
+
+    def cublas(query, keys, key_valid, visible):
+        calls.append(("cublas", query.shape[0], keys.shape[0]))
+        return torch.empty(query.shape[0], keys.shape[0]), visible
+
+    def paged(query, k_cache, page_table, *args, num_columns, **kwargs):
+        calls.append(("paged", query.shape[0], page_table.shape[0], num_columns))
+        return torch.empty(query.shape[0], num_columns), torch.empty(
+            query.shape[0], dtype=torch.int32
+        )
+
+    monkeypatch.setattr(qsa_ops, "_qsa_gather_single_request_keys", gather)
+    monkeypatch.setattr(qsa_ops, "_qsa_mqa_cublas", cublas)
+    monkeypatch.setattr(qsa_ops, "qsa_mqa_paged", paged)
+    qsa_ops.qsa_select_paged_tokens(
+        q,
+        cache,
+        table,
+        req,
+        pos,
+        lens,
+        2048,
+        4,
+        query_start_loc_cpu=torch.tensor([0, 8, 408]),
+        max_seq_len=36864,
+        seq_lens_cpu_upper_bound=lens,
+        index_dcp_world_size=4,
+        prefill_ranges=((8, 408),),
+    )
+    if override is None:
+        # The row floor uses DCP2's 4146 route columns, not TP4's 2073 local keys.
+        assert calls == [("paged", 8, 2, 2304), ("gather", 2073), ("cublas", 400, 2073)]
+    else:
+        assert calls == [("paged", 408, 2, 2304)]
 
 
 @pytest.mark.parametrize("enabled", [False, True])

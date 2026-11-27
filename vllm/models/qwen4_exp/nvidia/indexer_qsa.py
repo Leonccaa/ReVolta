@@ -136,6 +136,28 @@ class QSAIndexer(nn.Module):
             or envs.VLLM_SM70_QSA_SHARED_KEY
         )
         self.fused_topk = vllm_config.kernel_config.sm70_qsa_fused_topk
+        # ModelOpt mixed checkpoints can contain FP8 as well as NVFP4.
+        quant = getattr(quant_config, "fallback", quant_config)
+        quant_name = quant.get_name() if quant is not None else None
+        nvfp4 = quant_name == "modelopt_fp4" or (
+            quant_name == "modelopt_mixed"
+            and any(
+                ".mlp.experts" in name and info.get("quant_algo", "").upper() == "NVFP4"
+                for name, info in getattr(quant, "quantized_layers", {}).items()
+            )
+        )
+        parallel = vllm_config.parallel_config
+        self.prefill_tp_group = None
+        if (
+            nvfp4
+            and parallel.tensor_parallel_size == 4
+            and parallel.pipeline_parallel_size == 1
+            and parallel.decode_context_parallel_size in (1, 2)
+            and parallel.prefill_context_parallel_size == 1
+        ):
+            from vllm.distributed.parallel_state import get_tp_group
+
+            self.prefill_tp_group = get_tp_group()
 
         self.index_qk_proj = ReplicatedLinear(
             int(config.hidden_size),
@@ -393,6 +415,7 @@ class QSAIndexer(nn.Module):
                 compressed_metadata.query_start_loc if uniform_decode else None
             ),
             fused_topk=self.fused_topk and uniform_decode,
+            tp_group=self.prefill_tp_group,
         )
 
 

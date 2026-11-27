@@ -99,10 +99,8 @@ Release retrieval was tested at 211K tokens, and the production build retrieved 
 
 ### Multimodal input
 
-- On V100 with FlashAttention-V100, a launch without `--limit-mm-per-prompt` allows 1 image and no video per request, and a value that leaves out `"video"` disables video. Set the option and include `"video"`, as in the [reference launch](getting-started.md#4-launch); see [Multimodal input](configuration.md#multimodal-input). The model has no audio input.
-- Images in earlier chat messages count toward the image limit.
-- Large images are resized to at most 1,048,576 pixels with Hugging Face's resize logic. Small text can become blurry, and alignment near the area boundary can also change images whose source area is slightly below the limit. An empty `--mm-processor-kwargs '{}'` selects this default. To restore the checkpoint image budget, use `--mm-processor-kwargs '{"images_kwargs": {"size": {"longest_edge": 16777216, "shortest_edge": 65536}}}'`.
-- Video sampling defaults to 16 frames. Download and decode ceilings are separate; see [multimodal input limits](../.github/MULTIMODAL_INPUTS.md).
+- On V100 with FlashAttention-V100, a launch without `--limit-mm-per-prompt` allows 1 image and no video per request; set the option and include `"video"`, as in the [reference launch](getting-started.md#4-launch). The model has no audio input.
+- Large images are resized to at most 1,048,576 pixels, so small text can become blurry; video sampling defaults to 16 frames. Limits, budgets and how to change them are in [Multimodal input limits](multimodal.md).
 
 ## See also
 

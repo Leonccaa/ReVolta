@@ -274,4 +274,4 @@ Container notes:
 - [Configuration reference](configuration.md): launch options, profile defaults and memory budgets
 - [Speculative decoding](speculative-decoding.md): MTP and DFlash2
 - [KV offload](kv-offload.md): CPU, SSD and Host KV modes
-- [Multimodal input limits](../.github/MULTIMODAL_INPUTS.md)
+- [Multimodal input limits](multimodal.md)

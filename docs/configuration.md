@@ -145,9 +145,9 @@ If the startup log shows `CUDA graphs took … more than the reserve the KV cach
 
 | Option | Type | Reference value | Default on V100 | Since | Status | Effect and trade-offs |
 | --- | --- | --- | --- | --- | --- | --- |
-| `--limit-mm-per-prompt` | JSON | `{"image": 16, "video": 1}` | 1 image, no video | upstream | stable | Media items per request. With FlashAttention-V100, the engine allows 1 image and no video when the option is omitted, and a value without `"video"` disables video. Qwen3.8 Flash-Next takes images and video, not audio, so no audio limit is set. `{"image": 8, "video": 1}` matches the generic vLLM image count; a lower image count leaves more host memory for bursts of large images. |
+| `--limit-mm-per-prompt` | JSON | `{"image": 16, "video": 1}` | 1 image, no video | upstream | stable | Media items per request. With FlashAttention-V100, the engine allows 1 image and no video when the option is omitted, and a value without `"video"` disables video. A lower image count leaves more host memory for bursts of large images. |
 
-Large images are resized either way; see [Support and known limits](known-limits.md#multimodal-input). Media limits and request budgets are in [multimodal input limits](../.github/MULTIMODAL_INPUTS.md).
+Image resizing, video frames and per-request media budgets are in [Multimodal input limits](multimodal.md).
 
 ### API server
 

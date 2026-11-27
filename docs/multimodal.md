@@ -1,5 +1,7 @@
 # Multimodal input limits
 
+<a id="defaults-and-overrides"></a><a id="allocation-boundaries"></a>
+
 This page lists the limits that apply to image and video input and how an operator changes them: how many items a request may contain, how large images are resized, how many video frames are sampled, and the per-request byte and pixel budgets. It applies to Qwen3.8 Flash-Next, which takes images and video but not audio.
 
 ## Item counts per request
@@ -8,14 +10,14 @@ On V100 the engine allows only **1 image and no video** per request unless you s
 
 So always set `--limit-mm-per-prompt` on V100, and include `"video"`: a value that leaves out `"video"` sets video to 0 (disabled).
 
-- The [reference launch](../docs/getting-started.md#4-launch) uses `--limit-mm-per-prompt '{"image": 16, "video": 1}'`.
+- The [reference launch](getting-started.md#4-launch) uses `--limit-mm-per-prompt '{"image": 16, "video": 1}'`.
 - `--limit-mm-per-prompt '{"image": 8, "video": 1}'` gives the generic vLLM counts. A lower image count leaves more host memory for bursts of large images.
 
 Other rules:
 
 - The count covers the **whole request**, including images in earlier chat messages, not only the latest message.
 - A count of zero disables that modality.
-- Modalities that the option leaves out default to 8 images and 1 audio item, and to 1 video except on V100 (where video becomes 0); other modalities default to 999. For example, `'{"video": 1}'` allows 8 images.
+- Images left out of the option default to 8, and video to 1 except on V100, where it becomes 0. For example, `'{"video": 1}'` allows 8 images.
 - These counts are separate from the request-wide item ceiling `VLLM_MAX_MEDIA_REQUEST_ITEMS` (below). Count overrides cannot bypass the byte, pixel or frame ceilings.
 - Embedding-only and UUID-only cache references do not fetch raw media and are outside the raw-media byte accounting. The count limits still apply to them, except for precomputed embeddings with `--enable-mm-embeds` when that modality's count is 0.
 
@@ -68,18 +70,12 @@ Requests that carry a non-empty `mm_processor_kwargs` or `media_io_kwargs` are r
 - EXIF orientation is applied when encoded images are loaded.
 - Transparent images (RGBA, LA, palette transparency and PNG tRNS) are composited onto white before RGB conversion. This matches the Qwen example workflow's [`qwen_vl_utils.to_rgb`](https://github.com/QwenLM/Qwen3-VL/blob/main/qwen-vl-utils/src/qwen_vl_utils/vision_process.py); the generic Transformers RGB converter does not composite alpha. `rgba_background_color` in the image `--media-io-kwargs` selects another RGB color.
 
-## Memory boundaries
+## Memory use
 
-The budgets above limit admitted and retained media data. They are not a hard ceiling on process memory.
-
-- Remote bodies are streamed in 64 KiB chunks. `Content-Length` is checked before reading; missing lengths and gzip or deflate responses are counted while reading, and decompression output is bounded. Files and cached responses are also read incrementally, and a data URL's size is checked before base64 decoding.
-- Images are charged before EXIF processing or raster loading. The common OpenCV and PyAV video loader checks the selected frame count and frame size before allocating frame arrays. JPEG frame sequences charge each image before loading and check the frame count before stacking.
-- Video codecs can allocate internal reference frames and scratch buffers, and inaccurate container dimensions are detected only after decoding. Image conversion, frame stacking and joining encoded chunks also make temporary copies.
-- Each concurrent request has its own budget. Image and video preprocessing runs in the API server process; see [System memory and storage](../docs/configuration.md#system-memory-and-storage) for a measured burst. Also bound HTTP request bodies, concurrent requests and process or container memory.
-- Encoded audio bytes are counted, but audio decoding is outside these image and video limits.
+The budgets limit admitted and retained media data; they are not a hard ceiling on process memory. Decoders and image conversion make temporary copies, and each concurrent request has its own budget. Image and video preprocessing runs in the API server process; see [System memory and storage](configuration.md#system-memory-and-storage) for a measured burst. Also bound HTTP request bodies, concurrent requests and process or container memory.
 
 ## See also
 
-- [Getting started](../docs/getting-started.md): the reference multimodal launch options
-- [Multimodal launch options](../docs/configuration.md#multimodal-input)
-- [Support and known limits](../docs/known-limits.md)
+- [Getting started](getting-started.md): the reference multimodal launch options
+- [Multimodal launch options](configuration.md#multimodal-input)
+- [Support and known limits](known-limits.md#multimodal-input)

@@ -94,6 +94,7 @@ from vllm.v1.attention.backends.utils import (
     compute_causal_conv1d_metadata,
 )
 from vllm.v1.worker.gpu.spec_decode import uses_dflash_selector_engine
+from vllm.v1.worker.workspace import current_workspace_manager
 
 # Optional ROCm AITER Triton kernels for the GDN decode fast-path.
 # Availability is checked centrally via rocm_aiter_ops; the actual function
@@ -1925,6 +1926,15 @@ def fi_chunk_gated_delta_rule(
         return result.unsqueeze(0), None
 
 
+def _sm70_native_gdn_prefill_workspace(tokens: int) -> list[torch.Tensor]:
+    scratch_shape = (1, tokens, 12, 64)
+    return current_workspace_manager().get_simultaneous(
+        (scratch_shape, torch.float16),
+        (scratch_shape, torch.float16),
+        ((1, tokens, 12), torch.float32),
+    )
+
+
 def flashqla_sm70_chunk_gated_delta_rule(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2046,12 +2056,11 @@ def flashqla_sm70_chunk_gated_delta_rule(
                 if chunk_indices is None
                 else chunk_indices.to(cu_arg.dtype).contiguous()
             )
-            t_len = int(q_arg.shape[1])
-            a_bar_buf = torch.empty(
-                (1, t_len, 12, 64), dtype=torch.float16, device=q_arg.device
+            # Both native launches use the current model stream and neither
+            # scratch nor its views escape this call. Capture uses TileLang.
+            a_bar_buf, p_buf, g_cs_buf = _sm70_native_gdn_prefill_workspace(
+                q_arg.shape[1]
             )
-            p_buf = torch.empty_like(a_bar_buf)
-            g_cs_buf = torch.empty_like(g_arg)
             out = torch.empty_like(v_arg) if output is None else output
             need_store = bool(output_final_state or inplace_final_state)
             final_state = (
@@ -2564,6 +2573,23 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self._prefill_kernels_warmed_up = False
         builds_on_accelerator = self.dt_bias.device.type not in ("cpu", "meta")
         is_sm70 = builds_on_accelerator and current_platform.is_device_capability(70)
+        if (
+            is_sm70
+            and envs.VLLM_SM70_GDN_NATIVE_PREFILL
+            and self.gdn_prefill_backend == "flashqla_sm70"
+            and _sm70_flashqla_original_prefill_enabled()
+            and flashnext_prefill_ops.has_sm70_flashnext_prefill_ops()
+            and self.num_k_heads // self.tp_size == 4
+            and self.num_v_heads // self.tp_size == 12
+            and self.head_k_dim == self.head_v_dim == 128
+            and self.model_config.dtype == torch.float16
+            and self.get_state_dtype()[-1] == torch.float32
+        ):
+            # Reserve before memory profiling and graph capture. Each layer
+            # requests the same capacity from the worker's shared workspace.
+            _sm70_native_gdn_prefill_workspace(
+                vllm_config.scheduler_config.max_num_batched_tokens
+            )
         self._sm70_spec_cache_stride = 1
         if vllm_config.speculative_config is not None:
             self._sm70_spec_cache_stride = max(

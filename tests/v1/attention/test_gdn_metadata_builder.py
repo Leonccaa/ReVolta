@@ -45,12 +45,23 @@ from vllm.v1.attention.backends.gdn_attn import (
 )
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.worker import workspace
 from vllm.v1.worker.gpu.attn_utils import compute_common_gdn_attn_metadata
 from vllm.v1.worker.gpu.model_states import mamba_hybrid
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 
 BLOCK_SIZE = 16
 DEVICE = torch.device("cpu")
+
+
+@pytest.fixture
+def native_gdn_workspace(monkeypatch):
+    manager = workspace.WorkspaceManager(DEVICE)
+    monkeypatch.setattr(workspace, "_manager", manager)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    buffers = qwen_gdn._sm70_native_gdn_prefill_workspace(512)
+    manager.lock()
+    return buffers
 
 
 def test_sm70_qwen_gdn_warmup_uses_bound_forward_context(monkeypatch):
@@ -566,7 +577,13 @@ def test_sm70_original_prefill_mixed_varlen_chunk_metadata(
 @pytest.mark.parametrize("indexed", [False, True])
 @pytest.mark.parametrize("with_spec", [False, True])
 def test_native_gdn_prefill_mrv2_mixed_batch(
-    monkeypatch, local_gdn_model, method, cache_mode, indexed, with_spec
+    monkeypatch,
+    local_gdn_model,
+    native_gdn_workspace,
+    method,
+    cache_mode,
+    indexed,
+    with_spec,
 ):
     monkeypatch.setenv("VLLM_SM70_FLASHQLA_ORIGINAL_PREFILL", "1")
     monkeypatch.setenv("VLLM_SM70_GDN_NATIVE_PREFILL", "1")
@@ -598,6 +615,8 @@ def test_native_gdn_prefill_mrv2_mixed_batch(
 
     def fake_native(*args):
         calls.append(args)
+        storage = native_gdn_workspace[0].untyped_storage().data_ptr()
+        assert all(buf.untyped_storage().data_ptr() == storage for buf in args[3:6])
         args[13].fill_(1)
         if args[18]:
             args[8][args[11].long()] = 1
@@ -729,7 +748,10 @@ def test_native_gdn_prefill_mrv2_mixed_batch(
         ("enabled", "native"),
         ("beta_fp16", "native"),
         ("disabled", "tilelang"),
-        ("short", "tilelang"),
+        ("1", "tilelang"),
+        ("63", "tilelang"),
+        ("64", "tilelang"),
+        ("255", "tilelang"),
         ("q_shape", "tilelang"),
         ("q_dtype", "fla"),
         ("k_shape", "tilelang"),
@@ -744,6 +766,7 @@ def test_native_gdn_prefill_mrv2_mixed_batch(
         ("no_chunk_indices", "native"),
     ],
 )
+@pytest.mark.usefixtures("native_gdn_workspace")
 def test_native_gdn_prefill_dispatch(monkeypatch, case, expected):
     if case == "disabled":
         monkeypatch.delenv("VLLM_SM70_GDN_NATIVE_PREFILL", raising=False)
@@ -764,7 +787,9 @@ def test_native_gdn_prefill_dispatch(monkeypatch, case, expected):
         lambda: case != "missing_extension",
     )
     calls: list[tuple[str, Any]] = []
-    indices = torch.tensor([[0, 0], [0, 1], [0, 2], [0, 3]], dtype=torch.int32)
+    tokens = int(case) if case.isdecimal() else 256
+    chunks = (tokens + 63) // 64
+    indices = torch.tensor([[0, i] for i in range(chunks)], dtype=torch.int32)
     monkeypatch.setitem(
         sys.modules,
         "flash_qla.utils",
@@ -801,7 +826,6 @@ def test_native_gdn_prefill_dispatch(monkeypatch, case, expected):
         fake_native,
         raising=False,
     )
-    tokens = 255 if case == "short" else 256
     q = torch.zeros(
         (1, tokens, 3 if case == "q_shape" else 4, 128),
         dtype=torch.float32 if case == "q_dtype" else torch.float16,
@@ -828,7 +852,7 @@ def test_native_gdn_prefill_dispatch(monkeypatch, case, expected):
         dtype=torch.float16 if case == "state_dtype" else torch.float32,
     )
     cu = torch.tensor([0, tokens], dtype=torch.int32)
-    offsets = torch.tensor([0, 4], dtype=torch.int32)
+    offsets = torch.tensor([0, chunks], dtype=torch.int32)
     op = qwen_gdn.ChunkGatedDeltaRule.__new__(qwen_gdn.ChunkGatedDeltaRule)
     torch.nn.Module.__init__(op)
 
@@ -859,6 +883,21 @@ def test_native_gdn_prefill_dispatch(monkeypatch, case, expected):
         assert out is v and final_state is state
     else:
         assert out is v and final_state is state
+
+
+def test_native_gdn_prefill_workspace_reuse(native_gdn_workspace):
+    storage = native_gdn_workspace[0].untyped_storage().data_ptr()
+    for tokens in (256, 257, 512):
+        a_bar, p, g_cs = qwen_gdn._sm70_native_gdn_prefill_workspace(tokens)
+        assert a_bar.shape == p.shape == (1, tokens, 12, 64)
+        assert g_cs.shape == (1, tokens, 12)
+        assert a_bar.dtype == p.dtype == torch.float16
+        assert g_cs.dtype == torch.float32
+        for buf in (a_bar, p, g_cs):
+            assert buf.is_contiguous()
+            assert buf.untyped_storage().data_ptr() == storage
+        assert p.data_ptr() >= a_bar.data_ptr() + a_bar.nbytes
+        assert g_cs.data_ptr() >= p.data_ptr() + p.nbytes
 
 
 def _assert_gdn_metadata_equal(
@@ -1071,16 +1110,27 @@ def test_common_gdn_metadata_matches_per_group_builder(
     _assert_gdn_metadata_equal(actual, expected)
 
 
-def test_mixed_decode_stays_decode_fastpath(local_gdn_model):
-    """A non-spec query_len=1 row should stay on the decode fastpath even
-    when another row is doing speculative verification."""
+@pytest.mark.parametrize("legacy_routing", [True, False])
+def test_mixed_decode_routing(local_gdn_model, monkeypatch, legacy_routing):
+    monkeypatch.setenv(
+        "VLLM_SM70_MTP_LEGACY_GDN_MIXED_DECODE_ROUTING", str(int(legacy_routing))
+    )
     builder = _create_gdn_builder(local_gdn_model, num_speculative_tokens=2)
     batch = BatchSpec(seq_lens=[65, 20], query_lens=[1, 3])
-    meta = _build(builder, batch, num_decode_draft_tokens=[-1, 2])
+    meta = _build(
+        builder,
+        batch,
+        num_decode_draft_tokens=[-1, 2],
+        is_prefilling=[False, False],
+        use_common_metadata=True,
+    )
 
-    assert meta.num_decodes == 1
-    assert meta.num_prefills == 0
-    assert meta.has_initial_state is None
+    # With legacy routing disabled the singleton decode uses the chunk path,
+    # even though neither row is actually prefilling.
+    assert meta.num_decodes == int(legacy_routing)
+    assert meta.num_prefills == int(not legacy_routing)
+    assert meta.num_spec_decodes == 1
+    assert (meta.has_initial_state is None) is legacy_routing
 
 
 def test_full_cuda_graph_decode_padding_uses_pad_slot(local_gdn_model):

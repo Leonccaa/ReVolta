@@ -95,6 +95,12 @@ rule. `"greedy"` still works. MTP must stay `"greedy"`; see
   Flash-Next serving profile with a DFlash2 selector in RC15. On older
   releases, enable them as shown above. With the RC15 startup patch, explicitly
   setting `context_kv_graph: false` also leaves an unset `context_pipeline` off.
+- **Sparse target verification defaults to on in current development** for
+  the qualifying Flash-Next serving profile with a DFlash2 selector, with AWQ
+  or NVFP4 weights. It avoids gathering full-vocabulary target logits on
+  eligible sampled rounds. Greedy and unsupported sampling still use dense
+  verification. Set `"sparse_target_rejection": false` in `sm70_dflash2` to
+  keep all rounds dense.
 - **Do not enable** `fused_gdn_verify`, `fused_gdn_norm`, `fused_gdn_split` or
   `fused_gdn_combined_split`. They change the numerics and lowered sampled acceptance
   in our tests. Enabling `fused_gdn_verify` together with `spec_state_replay: true`

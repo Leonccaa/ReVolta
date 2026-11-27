@@ -985,7 +985,7 @@ I1_DFLASH2_POLICY = {
         (False, True, True, {}, {}, {}),
     ],
 )
-def test_dflash2_serving_verifier_defaults_match_i1(
+def test_dflash2_serving_verifier_defaults(
     profile,
     monkeypatch,
     tmp_path,
@@ -1015,6 +1015,7 @@ def test_dflash2_serving_verifier_defaults_match_i1(
     spec = args.create_engine_config(usage_context=context).speculative_config
     policy = spec.sm70_dflash2
 
+    expected = expected | {"sparse_target_rejection": active and serving and selector}
     reference = Sm70DFlash2Config(**expected)
     reference.resolve(qualified=False)
     assert policy.qualified is False

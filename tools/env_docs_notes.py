@@ -1125,6 +1125,12 @@ DFLASH2_NOTES: dict[str, str] = {
     "batches.",
     "grouped_smallq_metadata": "Grouped small-query Flash-V100 metadata across "
     "requests.",
+    "sparse_target_rejection": "Avoid gathering full-vocabulary target logits for "
+    "eligible sampled DFlash2 rounds. On by default for the qualifying Flash-Next "
+    "serving profile with a DFlash2 selector (AWQ and NVFP4). Greedy and unsupported "
+    "sampling stay dense. Set false to use dense verification for all requests; "
+    "the legacy VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION alias is used only when "
+    "the config value is unset.",
     "spec_state_replay": "Replay the accepted prefix to rebuild recurrent state "
     "instead of storing every speculative state: more GPU KV capacity at a "
     "small per-step cost. On by default in current development for supported "

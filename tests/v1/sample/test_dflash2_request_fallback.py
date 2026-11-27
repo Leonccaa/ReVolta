@@ -185,10 +185,6 @@ def test_partial_fallback_matches_dense_with_request_slot_permutation(
     ambiguous = np.array([1] if batch_size < 8 else [1, 5])
     for request in ambiguous:
         target[int(cu_np[request]), : (80 if wide_probe else 24)] = 2.0
-    if wide_probe:
-        # A complete top-k tie in a safe request now remains compact; the
-        # wider tie above still exercises dense request packing.
-        target[0, :24] = 2.0
     values, ids = target.topk(64 if wide_probe else 21, dim=-1)
     draft_ids = torch.arange(16, device=device).expand(slots, steps, 16).contiguous()
     draft_scores = torch.randn(slots, steps, 16, device=device) * 0.5
@@ -203,9 +199,6 @@ def test_partial_fallback_matches_dense_with_request_slot_permutation(
     position_buffer[indices] = positions
     temp_np = np.resize(np.array([0.7, 1.0, 1.3], dtype=np.float32), slots)
     p_np = np.resize(np.array([0.8, 0.95, 1.0], dtype=np.float32), slots)
-    if wide_probe:
-        # Keep the full tie away from the top-p guard's CDF boundary.
-        p_np[mapping_np[0]] = 0.93
     temperatures = torch.tensor(temp_np, device=device)
     top_ps = torch.tensor(p_np, device=device)
     seeds = torch.arange(slots, device=device, dtype=torch.int64) + 20260926

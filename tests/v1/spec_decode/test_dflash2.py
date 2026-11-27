@@ -33,7 +33,10 @@ from vllm.config.vllm import (
     _is_sm70_dflash2_verifier_contract,
 )
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.logits_processor import (
+    CachedLogitsFallback,
+    LogitsProcessor,
+)
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     _is_dflash2_spec_config,
 )
@@ -69,9 +72,10 @@ from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
 from vllm.v1.core.kv_cache_utils import unify_kv_cache_spec_page_size
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, SlidingWindowSpec
-from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+from vllm.v1.worker.gpu.sample.gumbel import apply_temperature, gumbel_sample
 from vllm.v1.worker.gpu.spec_decode import init_speculator
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+from vllm.v1.worker.gpu.spec_decode.dflash2 import sparse_rejection
 from vllm.v1.worker.gpu.spec_decode.dflash2.sparse_rejection import (
     _parse_alignment_steps,
     _supports_sparse_sampling_contract,
@@ -1381,6 +1385,90 @@ def test_sparse_target_rejection_falls_back_for_unsupported_sampling(
         sampler.compute_nans = value
 
     assert not _supports_sparse_sampling_contract(rejection_sampler, input_batch)
+
+
+@pytest.mark.skipif(
+    os.environ.get("TRITON_INTERPRET") != "1", reason="CPU Triton interpreter required"
+)
+@pytest.mark.parametrize("single_row", [False, True], ids=["top20-tie", "single-row"])
+def test_sparse_target_rejection_preserves_dense_filter_input(monkeypatch, single_row):
+    rejection, batch = _sparse_sampling_contract_fixture(2)
+    rejection.sampler.reasoning_eos = None
+    states = rejection.sampler.sampling_states
+    states.vocab_size = 32768
+    if single_row:
+        # At temperature 1.34 the top-20 nucleus boundary is close enough to
+        # 0.95 to trigger the existing reference check, even without strict k.
+        states.temperature.np[0] = 1.34
+        batch.cu_num_logits_np = np.array([0, 1, 3])
+        logits = torch.full((3, states.vocab_size), -20.0)
+        ids = torch.randperm(
+            states.vocab_size, generator=torch.Generator().manual_seed(425)
+        )[:24]
+        logits[0, ids[:18]] = 2.0
+        logits[0, ids[18:]] = 1.0
+        logits[1:, :64] = torch.linspace(4.0, -8.0, 64)
+    else:
+        # All ties fit in the top-64 probe. The dense full-vocabulary search
+        # can retain 24 tokens at p=0.99, not just the first 20.
+        states.top_p.np[:] = 0.99
+        batch.cu_num_logits_np = np.array([0, 2, 4])
+        logits = torch.arange(states.vocab_size).remainder(257) / 16 - 16
+        logits = logits.repeat(4, 1)
+        logits[:, :18] = torch.tensor(1.4, dtype=torch.float16).float()
+        logits[:, 18:24] = 1.0
+    batch.has_structured_output_reqs = False
+    batch.logits_indices = torch.arange(logits.shape[0])
+    batch.expanded_idx_mapping = torch.from_numpy(
+        np.repeat(batch.idx_mapping_np, np.diff(batch.cu_num_logits_np))
+    )
+    states.top_p.gpu = torch.from_numpy(states.top_p.np)
+    states.apply_temperature = lambda x, mapping, _: apply_temperature(
+        x, mapping, torch.from_numpy(states.temperature.np)
+    )
+    gather = Mock(side_effect=lambda rows: rows)
+    fallback = CachedLogitsFallback(
+        SimpleNamespace(_gather_cached_logits=gather), logits
+    )
+
+    def probe(_, width):
+        values, ids = logits.topk(width, dim=-1)
+        return ids, values, fallback
+
+    model = SimpleNamespace(
+        get_topk_tokens_and_logits=Mock(),
+        get_topk_tokens_and_logits_with_fallback=probe,
+    )
+    speculator = SimpleNamespace(get_sparse_draft_logits=lambda: (None, None))
+    monkeypatch.setattr(sparse_rejection, "DFlash2Speculator", SimpleNamespace)
+    monkeypatch.setattr(sparse_rejection, "sm70_dflash2_enabled", lambda *_: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (7, 0))
+    compact = Mock(side_effect=AssertionError("expected full-batch dense sampling"))
+    monkeypatch.setattr(
+        sparse_rejection, "dflash2_sparse_topk_rejection_sample", compact
+    )
+    batch.num_tokens = logits.shape[0]
+    batch.input_ids = batch.positions = batch.logits_indices
+    batch.cu_num_logits = torch.from_numpy(batch.cu_num_logits_np)
+    batch.idx_mapping = torch.from_numpy(batch.idx_mapping_np)
+    states.temperature.gpu = torch.from_numpy(states.temperature.np)
+    states.seeds = SimpleNamespace(gpu=torch.arange(2))
+    rejection.num_speculative_steps = 1
+    rejection.sampler.use_fp64_gumbel = False
+
+    out = sparse_rejection.try_dflash2_sparse_target_rejection(
+        model,
+        speculator,
+        rejection,
+        SimpleNamespace(device=torch.device("cuda")),
+        batch,
+        None,
+    )
+    compact.assert_not_called()
+    gather.assert_called_once()
+    assert isinstance(out, sparse_rejection.DFlash2LogitsFallback)
+    # The runner filters these same logits with the original batch metadata.
+    torch.testing.assert_close(out.logits, logits, rtol=0, atol=0)
 
 
 def test_probabilistic_selector_caches_temperature_applied_scores():

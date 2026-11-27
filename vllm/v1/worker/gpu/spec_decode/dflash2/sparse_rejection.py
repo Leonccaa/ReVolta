@@ -494,6 +494,7 @@ def try_dflash2_sparse_target_rejection(
             target_topk_logits,
             states.top_p.gpu,
             input_batch.expanded_idx_mapping,
+            strict_top_k=True,
         )
     else:
         num_logits = np.diff(input_batch.cu_num_logits_np)
@@ -515,18 +516,20 @@ def try_dflash2_sparse_target_rejection(
         )
         if fallback is None:
             return None
+        # A one-row slice would switch from Triton to the PyTorch filter.
+        if (
+            reference_reqs.size == idx.size
+            or np.diff(input_batch.cu_num_logits_np)[reference_reqs].sum() == 1
+        ):
+            return DFlash2LogitsFallback(fallback())
         # On SM70 the shared target probe selects the same requests on all
         # ranks. Use the packed gather without a reasoning EOS mask.
-        if (
-            reference_reqs.size < idx.size
-            and reasoning_eos is None
-            and isinstance(fallback, CachedLogitsFallback)
-        ):
+        if reasoning_eos is None and isinstance(fallback, CachedLogitsFallback):
             packed_metadata = _pack_reference_requests(input_batch, reference_reqs)
             reference_logits = fallback.gather_rows(packed_metadata[0])
         else:
             reference_logits = fallback()
-        if reference_reqs.size == idx.size or reference_logits is None:
+        if reference_logits is None:
             return DFlash2LogitsFallback(reference_logits)
     if not retain_ties:
         target_topk_ids = target_topk_ids[:, :_TARGET_TOP_K]

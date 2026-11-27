@@ -351,7 +351,7 @@ is configuration, tuning, experimental, debug or deprecated.
 
 | Name | Type | Default | Range | Category | Since | Effect and trade-off |
 |---|---|---|---|---|---|---|
-| `VLLM_SM70_GDN_NATIVE_PREFILL` | bool | `False` | 0, 1 | tuning | 0.2.0rc16 | Opt in to the native SM70 GDN prefill kernel for eligible original TileLang batches. It can change floating-point results and uses temporary GPU memory; set 0 to retain the original path. |
+| `VLLM_SM70_GDN_NATIVE_PREFILL` | bool | `True` | 0, 1 | tuning | 0.2.0rc16 | Use the native SM70 GDN kernel by default for eligible original TileLang chunks. It can change floating-point results and reserves shared GPU scratch space. Set 0 to use TileLang instead. |
 | `VLLM_SM70_NVFP4_RAW_GROUPED_M48_V154` | bool | `False` | 0, 1 | experimental | 0.2.0rc15 | Native raw-E4M3 grouped MoE for 48-row target decode on SM70 TP4 Qwen3.8 with equal interleaved gate/up global scales. Requires raw grouped decode and the V2 model runner. |
 | `VLLM_SM70_NVFP4_RAW_GROUPED_NARROW_V154` | bool | `False` | 0, 1 | experimental | 0.2.0rc15 | Native raw-E4M3 grouped MoE for 3-5 row target decode on SM70 TP4 Qwen3.8 with equal interleaved gate/up global scales. Requires raw grouped decode and the V2 model runner. |
 

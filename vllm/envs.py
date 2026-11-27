@@ -813,7 +813,7 @@ if TYPE_CHECKING:
     VLLM_SM70_GDN_CHUNK_O_WARPS: str | None = None
     VLLM_SM70_GDN_CHUNK_O_STAGES: str | None = None
     VLLM_SM70_GDN_LEGACY_PREFILL_PREP: bool = False
-    VLLM_SM70_GDN_NATIVE_PREFILL: bool = False
+    VLLM_SM70_GDN_NATIVE_PREFILL: bool = True
     VLLM_SM70_GDN_Z_CONTIGUOUS: bool = False
     VLLM_SM70_QWEN_GDN_CONTEXT_CORE: bool = False
     VLLM_SM70_QWEN_GDN_FULL_FORWARD: bool = False
@@ -12572,11 +12572,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_SM70_GDN_NATIVE_PREFILL": env_var(
-        lambda: bool(int(os.getenv("VLLM_SM70_GDN_NATIVE_PREFILL", "0"))),
-        description="Opt in to the experimental native SM70 GDN prefill kernel.",
+        lambda: bool(int(os.getenv("VLLM_SM70_GDN_NATIVE_PREFILL", "1"))),
+        description=(
+            "Use the native SM70 GDN prefill kernel for eligible chunks by "
+            "default. Set 0 to use the original TileLang kernel instead."
+        ),
         category="tuning",
-        declared_default="False",
-        effective_default="False",
+        declared_default="True",
+        effective_default="True",
         automatic_conditions=(),
         acceleration_paths=("Gated DeltaNet",),
         user_visible=False,

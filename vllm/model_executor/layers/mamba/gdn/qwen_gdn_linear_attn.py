@@ -2033,12 +2033,12 @@ def flashqla_sm70_chunk_gated_delta_rule(
             g_arg = torch.log(g_arg)
         # The native kernel consumes chunk_indices but not chunk_offsets; this
         # call requests only the final state, not intermediate chunk states.
+        # This also covers single-token rows already routed through the chunk path.
         use_native = (
             envs.VLLM_SM70_GDN_NATIVE_PREFILL
             and flashnext_prefill_ops.has_sm70_flashnext_prefill_ops()
             and current_platform.is_device_capability(70)
             and q_arg.shape[0] == 1
-            and q_arg.shape[1] >= 1
             and q_arg.shape[2:] == (4, 128)
             and k_arg.shape == q_arg.shape
             and v_arg.shape == (1, q_arg.shape[1], 12, 128)
@@ -2576,14 +2576,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if (
             is_sm70
             and envs.VLLM_SM70_GDN_NATIVE_PREFILL
-            and self.gdn_prefill_backend == "flashqla_sm70"
-            and _sm70_flashqla_original_prefill_enabled()
             and flashnext_prefill_ops.has_sm70_flashnext_prefill_ops()
-            and self.num_k_heads // self.tp_size == 4
-            and self.num_v_heads // self.tp_size == 12
-            and self.head_k_dim == self.head_v_dim == 128
-            and self.model_config.dtype == torch.float16
-            and self.get_state_dtype()[-1] == torch.float32
         ):
             # Reserve before memory profiling and graph capture. Each layer
             # requests the same capacity from the worker's shared workspace.
@@ -6655,7 +6648,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             core_attn_out_spec, last_recurrent_state = None, None
 
-        # 2.2: Process the remaining part
+        # 2.2: A prefill sends the whole non-spec group through the chunk
+        # path, including any ordinary decode rows sharing the batch.
         if attn_metadata.num_prefills > 0:
             assert non_spec_state_indices_tensor is not None
             assert has_initial_state is not None

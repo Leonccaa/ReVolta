@@ -34,11 +34,12 @@ Every pull request into `main`, `prod` or a `release/` branch runs four checks, 
 | `pre-commit (changed files)` | The repository's pre-commit hooks pass on the files the pull request changes. |
 | `mypy (3.12)` | mypy for Python 3.12 passes on all files, with the same hook and configuration as upstream vLLM. |
 
-Changes to the dashboard also run a `dashboard CPU` workflow. To run the first two checks locally before you push, install `regex` and run the scripts with `BASE` set to the `main` commit your branch starts from:
+Changes to the dashboard also run a `dashboard CPU` workflow. To run the first two checks locally before you push, install `regex`, fetch this repository's `main` (below, the remote `upstream` points to `Leonccaa/ReVolta`) and run:
 
 ```bash
-BASE=main HEAD=HEAD python tools/ci/check_public_text.py
-BASE=main HEAD=HEAD python tools/ci/check_commits.py
+git fetch upstream main
+BASE=upstream/main HEAD=HEAD python tools/ci/check_public_text.py
+BASE=upstream/main HEAD=HEAD python tools/ci/check_commits.py
 ```
 
 A local public-text run checks only the generic patterns; the project-internal names come from a repository secret.

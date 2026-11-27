@@ -585,7 +585,7 @@ class CustomAllreduce:
         self._vmm_safe = _sm70_car_vmm_safe_enabled()
         self.long_prefill_output_ptrs: list[int] | None = None
         self.sm70_tp4_push_buffer_ptrs: list[int] | None = None
-        self.sm70_dcp2_pex_max_rows = 0
+        self.sm70_dcp2_pex_enabled = False
         self.sm70_tp8_hierarchical_push_buffer_ptrs: list[int] | None = None
 
         if not custom_ar:
@@ -782,13 +782,15 @@ class CustomAllreduce:
         ):
             push_buffer_size = ops.sm70_tp4_push_allreduce_buffer_size()
             if self.sm70_pcie_switch and envs.VLLM_SM70_DCP2_P2P:
-                from vllm.models.qwen4_exp.nvidia.ops.sm70_dcp2 import (
-                    sm70_dcp2_pex_max_rows,
-                )
+                from vllm.config import get_current_vllm_config_or_none
 
-                self.sm70_dcp2_pex_max_rows = sm70_dcp2_pex_max_rows()
-                if self.sm70_dcp2_pex_max_rows:
+                config = get_current_vllm_config_or_none()
+                if (
+                    config is not None
+                    and config.parallel_config.dcp_comm_backend == "a2a"
+                ):
                     push_buffer_size += ops.sm70_dcp2_p2p_buffer_size()
+                    self.sm70_dcp2_pex_enabled = True
             self.sm70_tp4_push_buffer_ptrs = self.create_shared_buffer(
                 push_buffer_size,
                 group=group,

@@ -8,7 +8,9 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+import vllm.config
 import vllm.distributed
+from vllm.config import CUDAGraphMode
 from vllm.distributed.device_communicators import custom_all_reduce as car
 from vllm.models.qwen4_exp.nvidia.ops import sm70_dcp2
 from vllm.models.qwen4_exp.nvidia.ops.qsa import _qsa_output_gate
@@ -19,14 +21,19 @@ pytestmark = pytest.mark.skip_global_cleanup
 
 
 @pytest.mark.parametrize(
-    "switch,mode,extra",
-    [(None, "pex_p2p", 0), ("1", "pex_p2p", 200), ("1", "nvlink", 0)],
+    "switch,mode,backend,extra",
+    [
+        ("0", "pex_p2p", "a2a", 0),
+        ("1", "pex_p2p", "a2a", 200),
+        ("1", "pex_p2p", "ag_rs", 0),
+        ("1", "nvlink", "a2a", 0),
+    ],
 )
-def test_pex_extends_existing_push_allocation(monkeypatch, switch, mode, extra):
-    monkeypatch.delenv("VLLM_SM70_DCP2_P2P", raising=False)
+def test_pex_extends_existing_push_allocation(
+    monkeypatch, switch, mode, backend, extra
+):
+    monkeypatch.setenv("VLLM_SM70_DCP2_P2P", switch)
     monkeypatch.setenv("VLLM_SM70_TP4_PUSH_ALLREDUCE", "1")
-    if switch:
-        monkeypatch.setenv("VLLM_SM70_DCP2_P2P", switch)
     monkeypatch.setattr(car, "custom_ar", True)
     monkeypatch.setattr(car, "in_the_same_node_as", lambda *a, **kw: [True] * 4)
     monkeypatch.setattr(
@@ -48,7 +55,13 @@ def test_pex_extends_existing_push_allocation(monkeypatch, switch, mode, extra):
     monkeypatch.setattr(car.dist, "get_rank", lambda **kw: 0)
     monkeypatch.setattr(car.dist, "get_world_size", lambda **kw: 4)
     monkeypatch.setattr(car.dist, "all_gather", Mock())
-    monkeypatch.setattr(sm70_dcp2, "sm70_dcp2_pex_max_rows", lambda: 40)
+    monkeypatch.setattr(
+        vllm.config,
+        "get_current_vllm_config_or_none",
+        lambda: SimpleNamespace(
+            parallel_config=SimpleNamespace(dcp_comm_backend=backend)
+        ),
+    )
     allocate = Mock(return_value=[100, 200, 300, 400])
     monkeypatch.setattr(car.CustomAllreduce, "create_shared_buffer", allocate)
     monkeypatch.setattr(car.CustomAllreduce, "close", Mock())
@@ -65,66 +78,43 @@ def test_pex_extends_existing_push_allocation(monkeypatch, switch, mode, extra):
     assert allocate.call_count == 3
     assert allocate.call_args.args[0] == 100 + extra
     register.assert_called_once_with(123, allocate.return_value)
-    assert comm.sm70_dcp2_pex_max_rows == (40 if extra else 0)
+    assert comm.sm70_dcp2_pex_enabled is bool(extra)
 
 
 @pytest.mark.parametrize(
-    "dcp_size,backend,sequences,k,expected",
+    "rows,mode,decode,use_pex",
     [
-        (2, "a2a", 4, 0, 4),
-        (2, "a2a", 16, 4, 53),
-        (1, "a2a", 8, 4, 0),
-        (2, "ag_rs", 8, 4, 0),
+        (0, CUDAGraphMode.NONE, True, False),
+        (5, CUDAGraphMode.NONE, False, False),
+        (53, CUDAGraphMode.NONE, True, True),
+        (54, CUDAGraphMode.NONE, True, False),
+        (5, CUDAGraphMode.FULL, True, True),
+        (5, CUDAGraphMode.PIECEWISE, True, False),  # First MTP draft forward.
     ],
 )
-def test_pex_capacity(monkeypatch, dcp_size, backend, sequences, k, expected):
-    config = SimpleNamespace(
-        parallel_config=SimpleNamespace(
-            decode_context_parallel_size=dcp_size, dcp_comm_backend=backend
-        ),
-        scheduler_config=SimpleNamespace(max_num_seqs=sequences),
-        speculative_config=SimpleNamespace(num_speculative_tokens=k) if k else None,
-    )
-    monkeypatch.setattr(sm70_dcp2, "get_current_vllm_config_or_none", lambda: config)
-    assert sm70_dcp2.sm70_dcp2_pex_max_rows() == expected
-    assert 53 * sm70_dcp2.PACKED_ROW_BYTES <= sm70_dcp2.PEX_SLOT_BYTES
-    assert 54 * sm70_dcp2.PACKED_ROW_BYTES > sm70_dcp2.PEX_SLOT_BYTES
-
-
-@pytest.mark.parametrize(
-    "rows,max_rows,decode",
-    [
-        (0, 53, True),
-        (5, 40, False),
-        (40, 40, True),
-        (41, 40, True),
-        (53, 53, True),
-        (54, 53, True),
-    ],
-)
-def test_pex_batch_route(monkeypatch, rows, max_rows, decode):
-    pex = sm70_dcp2.Sm70Dcp2Pex(handle=123, peer=1, rank=0, max_rows=max_rows)
+def test_pex_batch_route(monkeypatch, rows, mode, decode, use_pex):
+    pex = sm70_dcp2.Sm70Dcp2Pex(handle=123, peer=1, rank=0)
     group = SimpleNamespace(device_communicator=SimpleNamespace(sm70_dcp2_pex=pex))
     monkeypatch.setattr(
         sm70_dcp2,
         "get_forward_context",
-        lambda: SimpleNamespace(is_uniform_decode=decode),
+        lambda: SimpleNamespace(is_uniform_decode=decode, cudagraph_runtime_mode=mode),
     )
     query = torch.empty((rows, 6, 256), dtype=torch.float16)
     selected = sm70_dcp2.get_sm70_dcp2_for_batch(
         group, query, torch.empty(rows, 12, 256), torch.empty(rows, 12), query, query
     )
-    assert selected is (pex if decode and 0 < rows <= max_rows else None)
+    assert selected is (pex if use_pex else None)
 
 
 @pytest.mark.parametrize("dcp_ranks,rank,peer", [([8, 9], 1, 0), ([10, 11], 0, 3)])
 def test_pex_query_rank_mapping_and_layout(monkeypatch, dcp_ranks, rank, peer):
-    ca = SimpleNamespace(_ptr=123, sm70_dcp2_pex_max_rows=40)
+    ca = SimpleNamespace(_ptr=123, sm70_dcp2_pex_enabled=True)
     tp = SimpleNamespace(
         ranks=[8, 9, 10, 11], device_communicator=SimpleNamespace(ca_comm=ca)
     )
     runtime = sm70_dcp2.Sm70Dcp2Pex.create(tp, dcp_ranks, rank)
-    assert runtime is not None and runtime.max_rows == 40
+    assert runtime is not None
     fragments = torch.arange(2 * 5 * 6 * 256, dtype=torch.int16).reshape(2, 5, 6, 256)
 
     def exchange(handle, peer_rank, local, outbound, local_out, peer_out):
@@ -146,7 +136,7 @@ def test_pex_packed_a2a_matches_nccl_layout(monkeypatch, rows, rank):
     peer = 1 - rank
     group = SimpleNamespace(world_size=2, device_group=object())
     monkeypatch.setattr(vllm.distributed, "get_dcp_group", lambda: group)
-    runtime = sm70_dcp2.Sm70Dcp2Pex(handle=123, peer=peer, rank=rank, max_rows=53)
+    runtime = sm70_dcp2.Sm70Dcp2Pex(handle=123, peer=peer, rank=rank)
     partial = (
         torch.arange(2 * rows * 12 * 256, dtype=torch.float32).reshape(2, rows, 12, 256)
         / 16384

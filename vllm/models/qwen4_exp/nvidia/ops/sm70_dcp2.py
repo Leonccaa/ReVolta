@@ -9,7 +9,7 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from vllm import _custom_ops as ops
-from vllm.config import get_current_vllm_config_or_none
+from vllm.config import CUDAGraphMode
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 
@@ -31,21 +31,7 @@ O_BYTES = 2 * MAX_ROWS * LOCAL_HEADS * (HEAD_DIM + 1) * 8
 # smaller and uses the same mailbox, with one tile per row.
 PEX_SLOT_BYTES = 320 * 1024
 PACKED_ROW_BYTES = LOCAL_HEADS * (HEAD_DIM + 1) * torch.float32.itemsize
-
-
-def sm70_dcp2_pex_max_rows() -> int:
-    config = get_current_vllm_config_or_none()
-    if (
-        config is None
-        or config.parallel_config.decode_context_parallel_size != 2
-        or config.parallel_config.dcp_comm_backend != "a2a"
-    ):
-        return 0
-    spec = config.speculative_config
-    max_rows = config.scheduler_config.max_num_seqs * (
-        1 + (spec.num_speculative_tokens if spec is not None else 0)
-    )
-    return min(max_rows, PEX_SLOT_BYTES // PACKED_ROW_BYTES)
+MAX_PEX_ROWS = PEX_SLOT_BYTES // PACKED_ROW_BYTES
 
 
 class Sm70Dcp2Runtime:
@@ -156,17 +142,16 @@ class Sm70Dcp2Pex:
         cls, tp: "GroupCoordinator", ranks: list[int], rank: int
     ) -> "Sm70Dcp2Pex | None":
         communicator = cast("CudaCommunicator", tp.device_communicator).ca_comm
-        if communicator is None or not communicator.sm70_dcp2_pex_max_rows:
+        if communicator is None or not communicator.sm70_dcp2_pex_enabled:
             return None
         # DCP ranks index tensor slices, while the IPC pointers use TP ranks.
         peer = tp.ranks.index(ranks[1 - rank])
-        return cls(communicator._ptr, peer, rank, communicator.sm70_dcp2_pex_max_rows)
+        return cls(communicator._ptr, peer, rank)
 
-    def __init__(self, handle: int, peer: int, rank: int, max_rows: int) -> None:
+    def __init__(self, handle: int, peer: int, rank: int) -> None:
         self.handle = handle
         self.peer = peer
         self.rank = rank
-        self.max_rows = max_rows
 
     def gather_query(self, query: torch.Tensor) -> torch.Tensor:
         query = query.contiguous()
@@ -245,12 +230,13 @@ def get_sm70_dcp2_for_batch(
     ):
         if runtime is not None and rows <= MAX_ROWS:
             return runtime
-        # Only eager uniform decode and phase-specific FULL graphs
-        # set this flag. Shared PIECEWISE graphs can replay prefill.
-        if (
-            pex is not None
-            and rows <= pex.max_rows
-            and get_forward_context().is_uniform_decode
-        ):
-            return pex
+        if pex is not None and rows <= MAX_PEX_ROWS:
+            # The MTP drafter can mark a PIECEWISE batch as uniform decode,
+            # but its shared graph can also replay prefill.
+            ctx = get_forward_context()
+            if (
+                ctx.is_uniform_decode
+                and ctx.cudagraph_runtime_mode != CUDAGraphMode.PIECEWISE
+            ):
+                return pex
     return None

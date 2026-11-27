@@ -39,9 +39,10 @@ and are subject to model quality validation.
 
 `VLLM_SM70_DCP2_P2P=1` opts into Flash-Next QSA DCP2 query and packed output/LSE
 exchange on an SM70 TP4 PCIe-switch group with registered push buffers. It defaults
-to `0`. The path uses FP16 queries and the DCP A2A backend in uniform decode,
-including dedicated FULL decode graphs. The two transfers are admitted together
-up to `min(max_num_seqs * (1 + num_speculative_tokens), 53)` rows.
+to `0`. The path uses FP16 queries and the DCP A2A backend for eager uniform
+decode and dedicated FULL decode graphs, up to 53 rows. PIECEWISE graphs keep
+using NCCL. Enabling this option requires `_C` built from the same commit, or a
+Custom AR sidecar that exports both `sm70_dcp2_p2p_buffer_size` and `sm70_dcp2_p2p`.
 
 ## Launch options
 

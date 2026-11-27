@@ -2,8 +2,6 @@
 
 The dashboard is an optional web page that shows live aggregate metrics of one ReVolta API server: requests, decode and prefill speed, cache use, speculative decoding and latency. It reads the same Prometheus metrics as `/metrics` and does all calculations in the browser. It is off by default.
 
-The page describes one running service. It is not a status site: it has no deployment announcements, maintenance schedule, hardware claims or changelog.
-
 Prerequisites: an OpenAI-compatible server started with `vllm serve` or the Docker image, with engine statistics on (the default).
 
 ## Turn it on
@@ -117,28 +115,7 @@ The record is tied to the browser origin, the dashboard path, the schema and the
 
 The server keeps no history: there is no background task, timer, database or engine change. Each open, visible tab requests `/dashboard/metrics` every 2 seconds, which costs API server CPU time to collect and serialize the metrics. Close the page, or leave the option off, during benchmarks.
 
-The dashboard was tested with CPU-only suites (Python, JavaScript and a headless browser). Its cost while a model serves requests on GPUs has not been measured.
-
-## Testing without a GPU
-
-These checks need no model, GPU or PyTorch:
-
-```sh
-python3 -m venv .venv
-.venv/bin/pip install 'fastapi>=0.141.1,<0.142.0' httpx prometheus-client prometheus-fastapi-instrumentator regex uvicorn
-.venv/bin/python -m unittest discover -s tests/entrypoints/serve/dashboard -p 'test_*.py' -v
-node --test tests/entrypoints/serve/dashboard/test_metrics.mjs
-```
-
-The Python suite tests the routes, authentication, the API server's error handling, disabled routes, shared worker identity, proxy paths, assets and metric responses. The JavaScript suite (Node 22 or later) tests parsing, counter math, windows, store snapshot freshness, prefill matching, histogram bounds, reset detection and browser history.
-
-To repeat the browser check with an installed Chromium or Chrome:
-
-```sh
-node tests/entrypoints/serve/dashboard/browser_check.mjs --chrome /usr/bin/chromium --output dashboard-browser-results
-```
-
-It starts and stops its own CPU fixture service and browser, and writes screenshots and a report to the output directory. It covers mobile dialogs, reload, offline and stale store values, missing metrics and authentication. The fixture is not part of the installed package.
+The dashboard was tested with CPU-only suites (Python, JavaScript and a headless browser); its cost while a model serves requests on GPUs has not been measured. The CPU test commands are in [CONTRIBUTING.md](../CONTRIBUTING.md#dashboard-checks).<a id="cpu-verification"></a><a id="testing-without-a-gpu"></a>
 
 ## See also
 

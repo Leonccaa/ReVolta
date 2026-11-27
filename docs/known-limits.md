@@ -58,6 +58,7 @@ A single greedy request is reproducible bit for bit with a fixed configuration. 
 - **PLE cascade.** Cascade (`"ple_disk_cascade": true` in `--kernel-config`) spills the part of the PLE table that does not fit in host memory to the checkpoint files. It is not supported in 0.2.0, and the ReVolta profile keeps it off.
 - **Sleep level 2.** Not supported on the reference system (128 GiB host, PLE tables in host memory): it needs more free host memory for the model buffers than is left. Sleep level 1 works.
 - **Small KV pools.** Startup rejects a KV pool that cannot hold one maximum-length request.
+- **First start.** With an empty compile cache, the reported GPU KV capacity can be one allocation unit lower than on later starts.
 
 #### Whole PLE table on disk (experimental)
 

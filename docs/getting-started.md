@@ -14,7 +14,7 @@ The reference configuration is Uncensored AWQ g32 with tensor parallelism of fou
 
 ## 1. Install
 
-The distribution is `revolta` (version `0.2.0`). The Python import name and the CLI stay **`vllm`** (`import vllm`, `vllm serve`); this is intentional. The build contains only compute capability 7.0 (V100), with CUDA 12.8, Python 3.12 and PyTorch 2.10.
+The distribution is `revolta` (version `0.2.0`). The Python import name and the CLI stay **`vllm`** (`import vllm`, `vllm serve`). The build contains only compute capability 7.0 (V100), with CUDA 12.8, Python 3.12 and PyTorch 2.10.
 
 From PyPI:
 
@@ -25,15 +25,7 @@ pip install revolta==0.2.0
 vllm --version          # 0.2.0
 ```
 
-The wheel pins `torch==2.10.0`, `torchaudio==2.10.0` and `torchvision==0.25.0`, and pip installs them from PyPI. PyPI's `torch==2.10.0` is the CUDA 12.8 build.
-
-The first start compiles kernels, so a pip install needs the CUDA 12.8 Toolkit on the serving host. Check that `nvcc` is on `PATH` and that `nvcc --version` reports CUDA 12.8.
-
-The wheel attached to the GitHub release contains the same files. Only its metadata differs: it pins the same versions to the CUDA 12.8 builds on `download.pytorch.org` and has the generic `linux_x86_64` tag.
-
-```bash
-pip install "https://github.com/Leonccaa/ReVolta/releases/download/v0.2.0/revolta-0.2.0-cp312-cp312-linux_x86_64.whl"
-```
+The wheel pins `torch==2.10.0` (the CUDA 12.8 build on PyPI) with the matching `torchaudio` and `torchvision`. The first start compiles kernels, so a pip install needs the CUDA 12.8 Toolkit on the serving host: check that `nvcc --version` reports CUDA 12.8. The wheel attached to the [GitHub release](https://github.com/Leonccaa/ReVolta/releases/tag/v0.2.0) has the same files and installs the same PyTorch versions from `download.pytorch.org`.
 
 Or use the Docker image, which includes the compiler tools for the first start:
 
@@ -171,7 +163,7 @@ Notes:
 - **Draft width.** The profile lowers the number of draft tokens when more requests run; see [Dynamic speculative decoding](dynamic-speculative-decoding.md). To compare MTP with DFlash2, see [Speculative decoding](speculative-decoding.md).
 - **CPU KV pool.** `cpu_bytes_to_use` is the total for all four workers: 48 GiB, 12 GiB per worker. See [KV offload](kv-offload.md) for SSD tiers and other pool sizes.
 - **Wide verifier.** On a system whose GPUs share one PCIe switch with P2P, the profile also turns on the [AWQ MTP4 wide verifier](configuration.md#awq-mtp4-wide-verifier) for this configuration; the CPU KV pool does not prevent it. NVLink systems keep the standard verifier.
-- **Startup** takes roughly 10–15 minutes: weight and PLE loading, `torch.compile` and CUDA graph capture. <!-- TODO(0.2.0-acceptance): cold and warm startup time, D+E1 --> Later starts reuse the compile cache. The first start after an upgrade recompiles. On a first start with an empty compile cache, the reported GPU KV capacity can be one allocation unit lower than on later starts.
+- **Startup** takes roughly 10–15 minutes: weight and PLE loading, `torch.compile` and CUDA graph capture. <!-- TODO(0.2.0-acceptance): cold and warm startup time, D+E1 --> Later starts reuse the compile cache. The first start after an upgrade recompiles.
 
 See [Launch options](configuration.md#launch-options) for the meaning of each option.
 
@@ -193,7 +185,7 @@ In the startup log, look for:
 - `Defaulting QSA main KV storage to int8`: the target KV cache is INT8.
 - `SM70 interconnect=pex_p2p` (or `no_p2p` / `nvlink`) from each worker.
 
-The server also provides the Anthropic-compatible `/v1/messages` (including streaming) and `/v1/messages/count_tokens`. An overlong prompt returns HTTP 400 with `invalid_request_error`, an unknown model returns HTTP 404 with `not_found_error`, and internal errors return HTTP 500.
+The server also provides the Anthropic-compatible `/v1/messages` (including streaming) and `/v1/messages/count_tokens`; their limits are in [API behaviour](known-limits.md#api-behaviour).
 
 For request defaults and the model vendor's sampling recommendations, see [Sampling parameters](configuration.md#sampling-parameters).
 

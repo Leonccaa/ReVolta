@@ -44,6 +44,27 @@ BASE=upstream/main HEAD=HEAD python tools/ci/check_commits.py
 
 A local public-text run checks only the generic patterns. The project-internal names come from a repository secret, which pull requests from forks do not receive, so their `public text` check also uses only the generic patterns.
 
+### Dashboard checks
+
+The dashboard tests need no model, GPU or PyTorch:
+
+```sh
+python3 -m venv .venv
+.venv/bin/pip install 'fastapi>=0.141.1,<0.142.0' httpx prometheus-client prometheus-fastapi-instrumentator regex uvicorn
+.venv/bin/python -m unittest discover -s tests/entrypoints/serve/dashboard -p 'test_*.py' -v
+node --test tests/entrypoints/serve/dashboard/test_metrics.mjs
+```
+
+The Python suite tests the routes, authentication, the API server's error handling, disabled routes, shared worker identity, proxy paths, assets and metric responses. The JavaScript suite (Node 22 or later) tests parsing, counter math, windows, store snapshot freshness, prefill matching, histogram bounds, reset detection and browser history.
+
+To repeat the browser check with an installed Chromium or Chrome:
+
+```sh
+node tests/entrypoints/serve/dashboard/browser_check.mjs --chrome /usr/bin/chromium --output dashboard-browser-results
+```
+
+It starts and stops its own CPU fixture service and browser, and writes screenshots and a report to the output directory. It covers mobile dialogs, reload, offline and stale store values, missing metrics and authentication. The fixture is not part of the installed package.
+
 ## AI-assisted contributions
 
 Disclose AI assistance. The submitting human must review every changed line, understand the change, run the relevant checks and be able to explain the result. See [AGENTS.md](AGENTS.md).
@@ -55,3 +76,9 @@ Contributions are subject to the [Code of Conduct](CODE_OF_CONDUCT.md).
 By contributing, you certify the [Developer Certificate of Origin 1.1](https://developercertificate.org/). Sign off every commit with `git commit -s`, using your own name and email. `pre-commit install` also installs a commit-msg hook that adds the sign-off. Add a `Co-authored-by:` trailer when AI tools assisted the work.
 
 Contributions are licensed under Apache-2.0 unless an existing component's license applies.
+
+## See also
+
+- [Building ReVolta](BUILDING.md)
+- [Support and known limits](docs/known-limits.md)
+- [SECURITY.md](SECURITY.md)

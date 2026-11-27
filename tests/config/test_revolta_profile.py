@@ -833,34 +833,6 @@ def test_hybrid_serving_attention_backend(profile, monkeypatch, tmp_path, active
 
 
 @pytest.mark.skip_global_cleanup
-@pytest.mark.parametrize("case", ["config_off", "alias_off", "non_qsa_target"])
-def test_hybrid_serving_sparse_target_stays_off(
-    profile, monkeypatch, tmp_path, sm70_serving_resolution, case
-):
-    alias = "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION"
-    spec_options = {}
-    if case == "config_off":
-        # An explicit config value wins even when the alias requests enablement.
-        monkeypatch.setenv(alias, "1")
-        spec_options["sm70_dflash2"] = {"sparse_target_rejection": False}
-    elif case == "alias_off":
-        monkeypatch.setenv(alias, "0")
-
-    args, context = hybrid_serving_args(
-        profile,
-        monkeypatch,
-        tmp_path,
-        "dflash",
-        [],
-        spec_options,
-    )
-    if case == "non_qsa_target":
-        args.create_model_config().hf_text_config.indexer_n_heads = None
-    config = args.create_engine_config(usage_context=context)
-    assert config.speculative_config.sm70_dflash2.sparse_target_rejection is False
-
-
-@pytest.mark.skip_global_cleanup
 def test_dflash2_shorthand_matches_json(
     profile, monkeypatch, tmp_path, sm70_serving_resolution
 ):

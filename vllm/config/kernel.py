@@ -688,12 +688,12 @@ class KernelConfig:
     channel-QPN8 on SM70. Only draft proposals change; verification uses the
     target's own weights."""
 
-    sm70_gdn_input_v154: bool = False
+    sm70_gdn_input_v154: bool | None = None
     """Use v154 packed FP16 GDN inputs for M2..64 in target FULL verify
     graphs (query length > 1), and retain M3/M4 FULL decode with speculative
     decoding. Applies to AWQ g32 and standard NVFP4 FP16 projections, not
-    FP4-Local or QAD MXFP8 projections. Changes reduction order and is disabled
-    by default."""
+    FP4-Local or QAD MXFP8 projections. Changes reduction order. When unset,
+    enable only for the validated ReVolta AWQ MTP4 profile."""
 
     sm70_gdn_input_skinny_k4: bool = False
     """Use four K warps in the SM70 row-major FP16 GDN input projection.

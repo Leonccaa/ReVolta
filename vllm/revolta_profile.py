@@ -9,9 +9,13 @@ available here before CUDA initialization. Operator admission remains upstream.
 
 import json
 import os
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from vllm import envs
+
+if TYPE_CHECKING:
+    from vllm.config.vllm import VllmConfig
+    from vllm.platforms.cuda import CudaPlatformBase
 
 InterconnectMode = Literal["pex_p2p", "no_p2p", "nvlink"]
 
@@ -43,6 +47,11 @@ AWQ_DEFAULTS = {
     "VLLM_SM70_AWQ_TUNE_SMALL_SHAPES": "1",
     # Measured for the AWQ TP4 graph pool.
     "VLLM_V2_CUDAGRAPH_MEM_MIB": "700",
+}
+AWQ_MTP_WIDE_VERIFY_DEFAULTS = {
+    "VLLM_SM70_MTP_GDN_NATIVE_VERIFY": "1",
+    "VLLM_SM70_QWEN38_NATIVE_ROUTER_TOPK": "1",
+    "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS": "48",
 }
 NVFP4_DEFAULTS = {
     "VLLM_SM70_MTP_Q8_PREFILL_MMQ": "1",
@@ -400,6 +409,51 @@ def apply_revolta_profile(
             if alias in os.environ:
                 defaults.pop(name, None)
 
+    _apply_profile_defaults(defaults)
+    return True
+
+
+def apply_awq_mtp_wide_verify_defaults(
+    config: "VllmConfig", device_ids: tuple[int, ...]
+) -> bool:
+    """Apply the wide verifier settings within the qualified ReVolta profile."""
+    from vllm.platforms import current_platform
+
+    model = config.model_config
+    spec = config.speculative_config
+    parallel = config.parallel_config
+    if (
+        model is None
+        or model.quantization != "awq"
+        or spec is None
+        or not spec.use_qwen4_exp_mtp()
+        or spec.num_speculative_tokens != 4
+        or not spec.gdn_spec_state_replay
+        or parallel.decode_context_parallel_size != 2
+        or config.scheduler_config.async_scheduling
+        or config.kernel_config.long_context_kv.enabled
+        or (config.kv_transfer_config and config.kv_transfer_config.kv_connector)
+        or len(device_ids) != 4
+        or not _has_awq_qpn_shape(model, parallel.tensor_parallel_size)
+        or frontend_interconnect_mode(
+            disable_custom_all_reduce=parallel.disable_custom_all_reduce
+        )
+        != "pex_p2p"
+    ):
+        return False
+
+    platform = cast("CudaPlatformBase", current_platform)
+    physical_ids = [platform.device_id_to_physical_device_id(i) for i in device_ids]
+    if not platform.is_pcie_switch_connected(
+        physical_ids
+    ) or platform.is_fully_connected(physical_ids):
+        return False
+
+    _apply_profile_defaults(AWQ_MTP_WIDE_VERIFY_DEFAULTS)
+    return True
+
+
+def _apply_profile_defaults(defaults: dict[str, str]) -> None:
     for name, value in defaults.items():
         if name not in os.environ or _PROFILE_VALUES.get(name) == os.environ[name]:
             os.environ[name] = value
@@ -409,7 +463,6 @@ def apply_revolta_profile(
             # but before EngineArgs/VllmConfig construction.
             _INITIAL_ENV.setdefault(name, os.environ[name])
     _export_provenance()
-    return True
 
 
 def apply_revolta_allocator_default() -> None:

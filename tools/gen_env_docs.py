@@ -51,6 +51,7 @@ def profile_values(source: str) -> dict[str, list[str]]:
     labels = {
         "COMMON_DEFAULTS": "",
         "AWQ_DEFAULTS": "AWQ",
+        "AWQ_MTP_WIDE_VERIFY_DEFAULTS": "AWQ MTP4 wide verifier",
         "NVFP4_DEFAULTS": "NVFP4",
         "DFLASH_DEFAULTS": "DFlash2",
         "AWQ_DFLASH_DEFAULTS": "AWQ+DFlash2",

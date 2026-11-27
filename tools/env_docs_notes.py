@@ -183,6 +183,18 @@ NOTES: dict[str, dict[str, str]] = {
         "and restart to restore the torch reference.",
         metrics="",
     ),
+    "VLLM_SM70_QSA_SHORT_APPEND": dict(
+        section="promoted",
+        since="0.2.0",
+        range="0, 1",
+        tradeoff="Short warm appends can use SM70 QSA cuBLAS scoring. The "
+        "single-request row floor drops from 512 to 128 at 4096 aligned routing "
+        "columns, and mixed batches can split requests with at least 128 rows "
+        "at 16384 tokens or more. The score work threshold still applies. "
+        "Near-tied block selection may differ from the paged scorer. "
+        "Set 0 and restart to restore the original routing.",
+        metrics="",
+    ),
     "VLLM_SM70_CHECKPOINT_CACHE_DROP": dict(
         section="promoted",
         since="0.2.0",

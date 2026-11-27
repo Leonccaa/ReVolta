@@ -391,6 +391,7 @@ is configuration, tuning, experimental, debug or deprecated.
 | `VLLM_SM70_MTP_KV_ONLY_PREFILL` | bool | `True` | 0, 1 | tuning | 0.2.0rc16 | For eligible Flash-Next MTP batches with DP=1 and GPU or Host draft KV, eager incomplete prefills only write KV. If a prefill completes, the sampled-row path writes KV for all rows and computes outputs only for sampled rows outside FULL CUDA graph replay. Floating-point results can differ from the full-row path. Set 0 to use full-row draft prefill. |
 | `VLLM_SM70_QSA_GROUPED_LPT` | bool | `False` | 0, 1 | tuning | 0.2.0 | Longest grouped page4 CTAs start first, which shortens the tail of uneven decode batches. Outputs are bitwise identical either way. |
 | `VLLM_SM70_QSA_LOCAL_INPUTS_FUSED` | bool | `True` | 0, 1 | tuning | 0.2.0 | Default on. DCP-sharded shared-key scorer: one fused integer metadata conversion instead of the torch reference. Set 0 and restart to restore the torch reference. |
+| `VLLM_SM70_QSA_SHORT_APPEND` | bool | `True` | 0, 1 | tuning | 0.2.0 | Short warm appends can use SM70 QSA cuBLAS scoring. The single-request row floor drops from 512 to 128 at 4096 aligned routing columns, and mixed batches can split requests with at least 128 rows at 16384 tokens or more. The score work threshold still applies. Near-tied block selection may differ from the paged scorer. Set 0 and restart to restore the original routing. |
 
 ### Settings used by the reference deployment
 

@@ -1448,6 +1448,8 @@ def test_mtp_dynamic_schedule_refines_the_planar_kv_reserve(
         # The verify graphs reach the global draft count whatever the
         # schedule lists, so a K5 model with a K4 schedule still needs 800.
         ("awq", 5, [(1, 8, 4)], "800"),
+        # A schedule wider than global K is clipped before capture.
+        ("awq", 4, [(1, 8, 5)], "705"),
         ("modelopt_fp4", 4, [(1, 3, 4), (4, 8, 3)], "705"),
         ("modelopt_fp4", 5, [(1, 3, 5), (4, 8, 4)], "800"),
     ],

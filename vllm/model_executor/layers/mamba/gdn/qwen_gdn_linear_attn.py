@@ -2038,7 +2038,7 @@ def flashqla_sm70_chunk_gated_delta_rule(
             and flashnext_prefill_ops.has_sm70_flashnext_prefill_ops()
             and current_platform.is_device_capability(70)
             and q_arg.shape[0] == 1
-            and q_arg.shape[1] >= 256
+            and q_arg.shape[1] >= 1
             and q_arg.shape[2:] == (4, 128)
             and k_arg.shape == q_arg.shape
             and v_arg.shape == (1, q_arg.shape[1], 12, 128)

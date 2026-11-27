@@ -10,6 +10,7 @@ the slower prefill path during active MTP.
 
 import sys
 from dataclasses import dataclass
+from itertools import product
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -572,10 +573,20 @@ def test_sm70_original_prefill_mixed_varlen_chunk_metadata(
     assert metadata.spec_query_start_loc.tolist() == [0, 4]
 
 
-@pytest.mark.parametrize("method", ["dflash", "mtp"])
-@pytest.mark.parametrize("cache_mode", ["none", "align"])
-@pytest.mark.parametrize("indexed", [False, True])
-@pytest.mark.parametrize("with_spec", [False, True])
+@pytest.mark.parametrize(
+    ("method", "cache_mode", "indexed", "with_spec", "batch_kind"),
+    [
+        *product(
+            ("dflash", "mtp"),
+            ("none", "align"),
+            (False, True),
+            (False, True),
+            ("prefill",),
+        ),
+        ("mtp", "none", True, True, "default_decode"),
+        ("mtp", "none", True, True, "chunk_decode"),
+    ],
+)
 def test_native_gdn_prefill_mrv2_mixed_batch(
     monkeypatch,
     local_gdn_model,
@@ -584,7 +595,13 @@ def test_native_gdn_prefill_mrv2_mixed_batch(
     cache_mode,
     indexed,
     with_spec,
+    batch_kind,
 ):
+    routing_env = "VLLM_SM70_MTP_LEGACY_GDN_MIXED_DECODE_ROUTING"
+    if batch_kind == "default_decode":
+        monkeypatch.delenv(routing_env, raising=False)
+    else:
+        monkeypatch.setenv(routing_env, "0")
     monkeypatch.setenv("VLLM_SM70_FLASHQLA_ORIGINAL_PREFILL", "1")
     monkeypatch.setenv("VLLM_SM70_GDN_NATIVE_PREFILL", "1")
     monkeypatch.setenv("VLLM_SM70_FLASHQLA_INDEXED_PREFILL", str(int(indexed)))
@@ -636,22 +653,26 @@ def test_native_gdn_prefill_mrv2_mixed_batch(
         mamba_cache_mode=cache_mode,
     )
     builder.gdn_prefill_backend = "flashqla_sm70"
-    lengths = [220, *range(1, 9)] + ([4] if with_spec else [])
+    is_prefill = batch_kind == "prefill"
+    lengths = ([220, *range(1, 9)] if is_prefill else [1]) + ([4] if with_spec else [])
     rows = len(lengths)
     common = create_common_attn_metadata(
-        BatchSpec(seq_lens=[220, *([16] * (rows - 1))], query_lens=lengths),
+        BatchSpec(
+            seq_lens=[220 if is_prefill else 65, *([16] * (rows - 1))],
+            query_lens=lengths,
+        ),
         BLOCK_SIZE,
         DEVICE,
     )
     common = common.replace(
-        is_prefilling=torch.ones(rows, dtype=torch.bool),
+        is_prefilling=torch.full((rows,), is_prefill, dtype=torch.bool),
         block_table_tensor=torch.arange(rows, dtype=torch.int32)
         .unsqueeze(1)
         .expand(-1, 20),
     )
     kwargs = {}
     if with_spec:
-        drafts = torch.tensor([-1] * 9 + [3], dtype=torch.int32)
+        drafts = torch.tensor([-1] * (rows - 1) + [3], dtype=torch.int32)
         kwargs = {
             "num_decode_draft_tokens_cpu": drafts,
             "num_accepted_tokens": torch.ones(rows, dtype=torch.int32),
@@ -660,23 +681,18 @@ def test_native_gdn_prefill_mrv2_mixed_batch(
                 query_start_loc=common.query_start_loc,
                 query_start_loc_cpu=common.query_start_loc_cpu,
                 num_spec_state_tokens=builder.num_spec_state_tokens,
-                legacy_mixed_decode_routing=False,
+                legacy_mixed_decode_routing=(
+                    qwen_gdn.envs.VLLM_SM70_MTP_LEGACY_GDN_MIXED_DECODE_ROUTING
+                ),
             ),
         }
     metadata = builder.build(common_prefix_len=0, common_attn_metadata=common, **kwargs)
-    assert metadata.non_spec_query_start_loc.tolist() == [
-        0,
-        220,
-        221,
-        223,
-        226,
-        230,
-        235,
-        241,
-        248,
-        256,
-    ]
-    assert metadata.chunk_offsets is not None
+    expected_cu = [0, 220, 221, 223, 226, 230, 235, 241, 248, 256]
+    if not is_prefill:
+        expected_cu = [0, 1]
+    assert metadata.non_spec_query_start_loc.tolist() == expected_cu
+    expect_native = batch_kind != "default_decode"
+    assert (metadata.chunk_offsets is not None) is expect_native
 
     def fake_post_conv(**kwargs):
         tokens = kwargs["a"].shape[0]
@@ -691,7 +707,10 @@ def test_native_gdn_prefill_mrv2_mixed_batch(
     monkeypatch.setattr(
         qwen_gdn,
         "fused_sigmoid_gating_delta_rule_update",
-        lambda **kwargs: (torch.full_like(kwargs["v"], 3), kwargs["initial_state"]),
+        lambda **kwargs: (
+            torch.full_like(kwargs["v"], 3 if "num_accepted_tokens" in kwargs else 2),
+            kwargs["initial_state"],
+        ),
     )
     layer = qwen_gdn.QwenGatedDeltaNetAttention.__new__(
         qwen_gdn.QwenGatedDeltaNetAttention
@@ -732,26 +751,30 @@ def test_native_gdn_prefill_mrv2_mixed_batch(
         out,
         kv_cache,
     )
-    assert len(calls) == 1
-    assert torch.equal(calls[0][9], metadata.non_spec_query_start_loc)
-    assert torch.equal(calls[0][10], metadata.chunk_indices)
-    assert calls[0][18] is indexed
-    assert torch.all(out[:256] == 1)
+    assert len(calls) == int(expect_native)
+    non_spec_tokens = expected_cu[-1]
+    if expect_native:
+        assert torch.equal(calls[0][9], metadata.non_spec_query_start_loc)
+        assert torch.equal(calls[0][10], metadata.chunk_indices)
+        assert calls[0][18] is indexed
+        assert torch.all(out[:non_spec_tokens] == 1)
+        assert torch.all(kv_cache[1][metadata.non_spec_state_indices_tensor] == 1)
+    else:
+        assert torch.all(out[:non_spec_tokens] == 2)
     if with_spec:
-        assert torch.all(out[256:] == 3)
-    assert torch.all(kv_cache[1][metadata.non_spec_state_indices_tensor] == 1)
+        assert torch.all(out[non_spec_tokens:] == 3)
 
 
 @pytest.mark.parametrize(
     ("case", "expected"),
     [
-        ("enabled", "native"),
+        ("256", "native"),
         ("beta_fp16", "native"),
         ("disabled", "tilelang"),
-        ("1", "tilelang"),
-        ("63", "tilelang"),
-        ("64", "tilelang"),
-        ("255", "tilelang"),
+        ("1", "native"),
+        ("63", "native"),
+        ("64", "native"),
+        ("255", "native"),
         ("q_shape", "tilelang"),
         ("q_dtype", "fla"),
         ("k_shape", "tilelang"),
@@ -887,7 +910,7 @@ def test_native_gdn_prefill_dispatch(monkeypatch, case, expected):
 
 def test_native_gdn_prefill_workspace_reuse(native_gdn_workspace):
     storage = native_gdn_workspace[0].untyped_storage().data_ptr()
-    for tokens in (256, 257, 512):
+    for tokens in (1, 256, 257, 512):
         a_bar, p, g_cs = qwen_gdn._sm70_native_gdn_prefill_workspace(tokens)
         assert a_bar.shape == p.shape == (1, tokens, 12, 64)
         assert g_cs.shape == (1, tokens, 12)

@@ -1919,8 +1919,8 @@ def qsa_select_paged_tokens(
         if max_seq_len is not None
         else None
     )
-    # The row floor and the work gate share one width: the route columns,
-    # rounded up to 4 as in 1Cat #1601.
+    # Both gates use the route columns. The row floor checks them rounded up
+    # to 4 as in 1Cat #1601; the work gate below uses the unrounded width.
     route_columns = (
         _qsa_cublas_route_columns(
             host_columns,

@@ -32,6 +32,53 @@ def test_packed_half_key_preserves_dtype_and_batch_guards(monkeypatch, dtype, ro
     assert kwargs["num_warps"] == 8  # Keep the FP32 normalization reduction.
 
 
+@pytest.mark.parametrize(
+    "rows,enabled",
+    [
+        (16, True),
+        (17, True),
+        (20, True),
+        (21, True),
+        (64, True),
+        (65, True),
+        (21, False),
+    ],
+)
+def test_native_router_wide_dispatch(monkeypatch, rows, enabled):
+    monkeypatch.setattr(mod.envs, "VLLM_SM70_QWEN38_ROUTER_TOPK", False)
+    monkeypatch.setattr(mod.envs, "VLLM_SM70_QWEN38_NATIVE_ROUTER_TOPK", enabled)
+    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
+    monkeypatch.setattr(mod.current_platform, "is_device_capability", lambda _: True)
+    monkeypatch.setattr(mod, "_sm70_native_router_available", lambda: True)
+    calls = []
+
+    def native(name):
+        def run(*args):
+            calls.append(name)
+
+        return run
+
+    monkeypatch.setattr(
+        torch.ops.vllm_sm70_router, "top10", native("top10"), raising=False
+    )
+    monkeypatch.setattr(
+        torch.ops.vllm_sm70_router, "top10_batch", native("top10_batch"), raising=False
+    )
+
+    def generic(weights, ids, source, logits, renormalize):
+        calls.append("generic")
+        return weights, ids
+
+    monkeypatch.setattr(mod, "dispatch_topk_softmax_func", lambda **_: generic)
+    mod.fused_topk(
+        torch.empty(rows, 2560), torch.empty(rows, 512, dtype=torch.float16), 10, True
+    )
+    expected = "generic"
+    if enabled and 17 <= rows <= 64:
+        expected = "top10" if rows <= 20 else "top10_batch"
+    assert calls == [expected]
+
+
 @pytest.mark.parametrize("rows", [5, 10])
 @pytest.mark.parametrize("select_top16", [False, True])
 def test_mtp_public_route_preserves_graph_weights_ids_and_source_rows(

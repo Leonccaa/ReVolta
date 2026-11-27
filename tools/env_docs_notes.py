@@ -36,6 +36,16 @@ _LOOKUP = (
 )
 
 NOTES: dict[str, dict[str, str]] = {
+    "VLLM_SM70_GDN_NATIVE_PREFILL": dict(
+        section="promoted",
+        since="0.2.0rc16",
+        range="0, 1",
+        tradeoff="Use the native SM70 GDN kernel by default for eligible "
+        "original TileLang chunks on Model Runner V2 only. It can change "
+        "floating-point results and reserves shared GPU scratch space. "
+        "Set 0 to use TileLang instead. Model Runner V1 is unaffected.",
+        metrics="",
+    ),
     "VLLM_SM70_MTP_Q8_PREFILL_MMQ": dict(
         section="profile",
         since="0.2.0rc15",
@@ -111,6 +121,17 @@ NOTES: dict[str, dict[str, str]] = {
         metrics="",
     ),
     # ---- promoted research switches -------------------------------------
+    "VLLM_SM70_MTP_KV_ONLY_PREFILL": dict(
+        section="promoted",
+        since="0.2.0rc16",
+        range="0, 1",
+        tradeoff="For eligible Flash-Next MTP batches with DP=1 and GPU or Host "
+        "draft KV, eager incomplete prefills only write KV. If a prefill completes, "
+        "the sampled-row path writes KV for all rows and computes outputs only for "
+        "sampled rows outside FULL CUDA graph replay. Floating-point results can "
+        "differ from the full-row path. Set 0 to use full-row draft prefill.",
+        metrics="",
+    ),
     "VLLM_SM70_GDN_CPU_SPEC_QSL": dict(
         section="promoted",
         since="0.2.0",
@@ -372,7 +393,24 @@ NOTES: dict[str, dict[str, str]] = {
         since="0.2.0",
         range="2..48",
         tradeoff="Largest row count sent to the grouped route; above it rows use "
-        "TurboMind. The profile uses 40 (8 requests x 5 tokens).",
+        "TurboMind. The wide verifier profile raises the AWQ cap from 40 to 48. "
+        "DFlash2 uses its dedicated row cap.",
+        metrics="",
+    ),
+    "VLLM_SM70_MTP_GDN_NATIVE_VERIFY": dict(
+        section="profile",
+        since="1Cat",
+        range="0, 1",
+        tradeoff="Uses the native recurrent verifier and accepted-state replay "
+        "in the AWQ MTP4 wide verifier profile. Set 0 to disable.",
+        metrics="",
+    ),
+    "VLLM_SM70_QWEN38_NATIVE_ROUTER_TOPK": dict(
+        section="profile",
+        since="1Cat",
+        range="0, 1",
+        tradeoff="Uses the native router for eligible 17–64 row FP16 logits "
+        "in the AWQ MTP4 wide verifier profile. Set 0 to disable.",
         metrics="",
     ),
     "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_PACK_ROWS": dict(
@@ -436,8 +474,9 @@ NOTES: dict[str, dict[str, str]] = {
         section="profile",
         since="1Cat",
         range="0, 1",
-        tradeoff="Grouped native-NVFP4 decode; the profile keeps it off pending "
-        "quality admission.",
+        tradeoff="Prepared-scale native-NVFP4 decode for M = 2..64; set "
+        "VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE=0 (the profile defaults to 1). "
+        "The profile keeps grouped decode off pending quality admission.",
         metrics="",
     ),
     "VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL": dict(
@@ -474,7 +513,7 @@ NOTES: dict[str, dict[str, str]] = {
         section="research",
         since="0.2.0rc15",
         range="0, 1",
-        tradeoff="Native raw-E4M3 grouped MoE for 48-row target decode on "
+        tradeoff="Native raw-E4M3 grouped MoE for 41..64-row target decode on "
         "SM70 TP4 Qwen3.8 with equal interleaved gate/up global scales. "
         "Requires raw grouped decode and the V2 model runner.",
         metrics="",

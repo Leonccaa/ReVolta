@@ -249,7 +249,10 @@ def test_disabled_and_batch_invariant_fall_back(cuda_weights, monkeypatch):
         (65, True, True, True),
         (17, False, True, True),
         (17, True, False, True),
+        (2, True, True, False),
+        (3, True, True, False),
         (4, True, True, False),
+        (5, True, True, False),
         (17, True, True, False),
     ],
 )
@@ -259,7 +262,8 @@ def test_wide_target_gdn_dispatch(monkeypatch, m, enabled, compiling, verify):
     from vllm.forward_context import ForwardContext, override_forward_context
     from vllm.models.qwen4_exp.nvidia import sm70_fp16_gemv as gemv
 
-    monkeypatch.setenv("VLLM_SM70_QWEN38_GDN_NO_PACK", "0")
+    no_pack = m == 3 and enabled and compiling and not verify
+    monkeypatch.setenv("VLLM_SM70_QWEN38_GDN_NO_PACK", "1" if no_pack else "0")
     monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda _: True))
     monkeypatch.setattr(gemv.current_platform, "is_device_capability", lambda *_: True)
     monkeypatch.setattr(gemv, "is_sm70_decode_graph_compiling", lambda: compiling)
@@ -288,7 +292,7 @@ def test_wide_target_gdn_dispatch(monkeypatch, m, enabled, compiling, verify):
     with override_forward_context(context):
         result = _qwen38_sm70_fp16_gdn_input(x, q, b, pq, pb, enabled)
     assert [out.shape for out in result] == [(m, n) for n in (2560, 1536, 12, 12)]
-    selected = enabled and compiling and verify
+    selected = enabled and compiling and (verify or m in (3, 4))
     assert native.call_count == int(selected and 2 <= m <= 64)
     assert batch.call_count == int(not selected and 2 <= m <= 16)
 
@@ -315,8 +319,11 @@ def test_wide_keeps_pack_when_no_pack_is_set(monkeypatch, enabled):
     assert hasattr(layer, "_sm70_qwen38_gdn_packed") is enabled
 
 
-@pytest.mark.parametrize("enabled,full", [(False, True), (True, True), (True, False)])
-def test_wide_gdn_loader_scope(monkeypatch, enabled, full):
+@pytest.mark.parametrize(
+    "enabled,full,speculative",
+    [(False, True, True), (True, True, True), (True, False, True), (True, True, False)],
+)
+def test_wide_gdn_loader_scope(monkeypatch, enabled, full, speculative):
     from types import SimpleNamespace as NS
 
     from vllm.config import CUDAGraphMode, KernelConfig
@@ -341,7 +348,7 @@ def test_wide_gdn_loader_scope(monkeypatch, enabled, full):
         ),
         parallel_config=NS(tensor_parallel_size=4),
         model_config=NS(quantization="awq"),
-        speculative_config=NS(use_qwen4_exp_mtp=lambda: True),
+        speculative_config=NS(use_qwen4_exp_mtp=lambda: True) if speculative else None,
         is_speculative_draft=False,
     )
     monkeypatch.setattr(gemv, "LinearBase", Linear)
@@ -362,8 +369,10 @@ def test_wide_gdn_loader_scope(monkeypatch, enabled, full):
     )
     for layer in (owner.in_proj_qkvz, owner.in_proj_ba):
         assert getattr(layer, "_sm70_qwen38_gdn_input_v154", False) == (
-            enabled and full
+            enabled and full and speculative
         )
         layer.weight = torch.nn.Parameter(layer.weight.to(dtype=torch.float16))
         layer.quant_method.process_weights_after_loading(layer)
-        assert hasattr(layer, "_sm70_qwen38_gdn_packed") == (enabled and full)
+        assert hasattr(layer, "_sm70_qwen38_gdn_packed") == (
+            enabled and full and speculative
+        )

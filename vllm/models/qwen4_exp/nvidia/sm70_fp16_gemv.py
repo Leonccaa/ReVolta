@@ -584,7 +584,10 @@ def _qwen38_sm70_fp16_gdn_input(
     use_v154 = (
         use_v154_m3_m4
         and is_sm70_decode_graph_compiling()
-        and get_forward_context().additional_kwargs.get("sm70_gdn_verify", False)
+        and (
+            x.shape[0] in (3, 4)
+            or get_forward_context().additional_kwargs.get("sm70_gdn_verify", False)
+        )
     )
     # With NO_PACK=1 the packed weights are only for the FULL trial.
     if (use_v154 or not envs.VLLM_SM70_QWEN38_GDN_NO_PACK) and (
@@ -979,6 +982,7 @@ def enable_qwen38_sm70_fp16_gemv(
                 if (
                     batch_qualified
                     and vllm_config.kernel_config.sm70_gdn_input_v154
+                    and vllm_config.speculative_config is not None
                     and (
                         vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs()
                     )

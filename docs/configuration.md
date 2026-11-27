@@ -21,8 +21,10 @@ before enabling it for service.
 
 `--kernel-config '{"sm70_gdn_input_v154":true}'` enables packed FP16 GDN input
 projections for 2–64 rows in FULL verification graphs with query length greater
-than 1. It applies to AWQ g32 and standard NVFP4 checkpoints with unquantized
-FP16 projections; FP4-Local and QAD MXFP8 projections are not eligible. This
+than 1. With speculative decoding, the original 3–4 row FULL decode route is
+also retained for query length 1. It applies to AWQ g32 and standard NVFP4
+checkpoints with unquantized FP16 projections; FP4-Local and QAD MXFP8
+projections are not eligible. This
 route changes reduction order and requires quality validation.
 
 `VLLM_SM70_QWEN38_NATIVE_ROUTER_TOPK=1` enables the native router for 17–64

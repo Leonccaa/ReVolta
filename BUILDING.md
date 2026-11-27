@@ -30,6 +30,8 @@ In the Docker build, `--build-arg SETUPTOOLS_SCM_PRETEND_VERSION=<version>` sets
 
 ## Build the wheel and the image
 
+<a id="sm70-source-build"></a>
+
 Build from a clean checkout. The build reads no Git metadata when the version and commit are passed as below, so a linked worktree or an exported source tree also works; the `build` stage still bind-mounts `.git`, so a `.git` entry must exist in the build context. In an exported tree, which has no Git history, set `commit` to the known commit ID instead of running `git rev-parse`.
 
 ```bash
@@ -67,6 +69,8 @@ Flash-V100 and FlashQLA are bundled into the ReVolta wheel. DeepEP is skipped on
 GGUF is unsupported. The CMake option `VLLM_BUILD_GGUF` is `OFF` by default, so `_C_gguf` is not built and release wheels cannot run GGUF dense or MoE models or dequantize through `_C_gguf`. For development only, set `VLLM_BUILD_GGUF=ON` or pass `CMAKE_ARGS=-DVLLM_BUILD_GGUF=ON`. GGUF modules load that extension lazily; normal imports, AWQ and NVFP4 do not need it.
 
 ## Debug symbols
+
+<a id="debug-symbols-and-verification"></a>
 
 The `build` stage saves the unstripped wheel, then runs `tools/wheel_debug.py strip`. For each shared library, the tool runs `objcopy --only-keep-debug`, `strip --strip-debug` and `objcopy --add-gnu-debuglink`, and keeps `.symtab`. Before it replaces the wheel, it checks that `.text`, `.nv_fatbin`, `.rodata`, `.dynsym` and `.dynstr` are unchanged, and it regenerates the wheel's `RECORD` hashes. The JSON manifest records each library's section hashes, with `null` for a section the library does not have (host-only libraries can lack `.nv_fatbin`).
 

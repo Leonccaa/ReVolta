@@ -19,6 +19,8 @@ The Engram tables stay in pinned host memory: about 60 GiB in total, split acros
 
 ## Launch
 
+<a id="default-configuration"></a>
+
 The default setup is the AWQ g32 checkpoint with an FP8 attention KV cache, decode context parallelism over the four GPUs (DCP4, up to 512K tokens) and thinking on.
 
 ```bash
@@ -46,6 +48,8 @@ vllm serve /data/revolta/models/hy4-flash-awq-g32 --served-model-name hy4-flash 
 - **NVFP4 checkpoint.** Also set `export VLLM_SM70_NVFP4_TURBOMIND=1`.
 
 ## Measurements
+
+<a id="measured-on-four-v100-32-gb-gpus"></a>
 
 0.2.0rc13 release image, AWQ checkpoint, four V100 32 GB GPUs, TP4, 200 W per GPU, FP8 KV cache, CUDA graphs for decode, `expandable_segments` on. The 122K-token rows and the needle checks come from development builds of the same code without `expandable_segments`.
 

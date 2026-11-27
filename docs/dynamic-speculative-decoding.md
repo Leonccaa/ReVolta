@@ -17,6 +17,8 @@ Other widths get no default and run with a fixed K unless you set a schedule. Fo
 
 ## Schedule format
 
+<a id="configuration"></a>
+
 Set the schedule in `--speculative-config`:
 
 ```bash

@@ -1,5 +1,7 @@
 # DFlash2 speculative decoding
 
+<a id="dflash2-speculative-decoding-optional"></a>
+
 This guide replaces MTP with DFlash2 and explains its settings. DFlash2 uses the [incoai DFlash2 drafter](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2) (tested revision `a22a1744`): five sliding-window layers, an 8-token block and a 2,048-token window. It is off unless you select it; the reference launch uses MTP. To decide between the two methods, see [Choosing a method](speculative-decoding.md#choosing-a-method).<a id="what-to-expect"></a>
 
 Prerequisites: a working [reference launch](getting-started.md) and its 512K target view from [step 2](getting-started.md#2-download-the-checkpoint-and-make-512k-views). DFlash2 works with AWQ and NVFP4 checkpoints and with GPU KV and Host KV; the 0.2.0 release tests cover it with GPU KV.
@@ -148,6 +150,8 @@ Lookup runs only in batches with at most `max_requests` requests where the sched
 Lookup needs the DFlash2 drafter with seven draft tokens. Other policies, gates and expansion are rejected at startup. The legacy `ngram_assist` lookup and its `VLLM_DFLASH2_LOOKUP_*` variables still work, with no removal version set; use `dflash2_lookup` for new setups. Enabled native lookup together with legacy lookup inputs is rejected at startup.
 
 ### Lookup statistics
+
+<a id="lookup-measurements-and-limits"></a>
 
 Statistics are collected when native lookup, `collect_stats` and the engine's statistics logging are all on. With collection off, no counters are created. The setting takes effect at startup only.
 

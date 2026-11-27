@@ -1,5 +1,7 @@
 # Performance and measurements
 
+<a id="performance"></a><a id="measurements"></a>
+
 This page lists what ReVolta 0.2.0 measured: output speed, time to first token, KV cache capacity, prefix reuse and answer quality, for each tested configuration. It also explains how the values were measured and keeps a few earlier results that are still useful for comparison. Every value carries its version and test conditions; do not compare values across tables unless the conditions match.
 
 For the supported hardware and configurations, see [Support and known limits](known-limits.md). To reproduce a configuration, start from [Getting started](getting-started.md).
@@ -54,6 +56,8 @@ All values in this section were measured with ReVolta 0.2.0 on the test system a
 
 ### Output speed
 
+<a id="speed"></a>
+
 Output speed in tokens/s.
 
 | Configuration | C1 | C4 | C8 |
@@ -77,6 +81,8 @@ One request at a time, cold prefix cache.
 | E3a: NVFP4, MTP5 | <!-- TODO(0.2.0-acceptance): cold TTFT at 8K, E3a --> | <!-- TODO(0.2.0-acceptance): cold TTFT at 32K, E3a --> | <!-- TODO(0.2.0-acceptance): second-token latency at 32K, E3a --> |
 
 ### GPU KV capacity
+
+<a id="gpu-kv-capacity-by-method"></a>
 
 KV capacity at `--max-model-len 524288`, read from the startup log.
 
@@ -121,6 +127,8 @@ To compare the two speculative methods in 0.2.0, read C against D+E1 for AWQ (DF
 
 ## Quality measurements
 
+<a id="quantization-quality"></a>
+
 These measurements show how closely each quantized checkpoint follows a BF16 reference. They were published with 0.1.0 (the exact build was not recorded) and have not been repeated with 0.2.0. All use scalar E4M3 KV unless the KV column says otherwise.
 
 Two BF16 references are used:
@@ -153,6 +161,8 @@ Compare results from other datasets or estimators separately.
 
 ## Earlier results
 
+<a id="reference-system-mtp4"></a>
+
 These results were measured with earlier releases and are kept because 0.2.0 has no comparable measurement. 0.2.0 changed the default KV format to INT8, the serving defaults and both speculative methods, so these values do not describe 0.2.0.
 
 ### Standard NVFP4 against AWQ (0.2.0rc12)
@@ -160,6 +170,8 @@ These results were measured with earlier releases and are kept because 0.2.0 has
 Paired measurements on 0.2.0rc12 development builds (same configuration and time window, 4 × V100 PCIe, 250 W per GPU, TP4 + DCP2): NVFP4 and Uncensored AWQ ran at similar speed with MTP4 at one to eight requests and with DFlash2 at four and eight requests. With DFlash2 at one request, NVFP4 was slower (90.4 against 97.8 tok/s). NVFP4 weights took 21.48 GiB per GPU and Uncensored AWQ weights 22.01 GiB; the raw NVFP4 scales (the profile default) saved about 1.69 GiB per GPU compared with FP16 scales. <!-- TODO(0.2.0-acceptance): C1/C4/C8 tok/s, E3a NVFP4+MTP5 and E3b NVFP4+DFlash2 against D+E1 AWQ+MTP4 -->
 
 ### NVLink community result (0.1.2)
+
+<a id="nvlink-community-result"></a><a id="cold-prefill"></a>
 
 [@jttdev](https://github.com/jttdev) measured **0.1.2 at a 200 W cap per GPU** on 2026-10-24 ([report in #2](https://github.com/Leonccaa/ReVolta/issues/2#issuecomment-6384639530)): 4 × V100-SXM2 32 GB with an NV2 NVLink mesh, Uncensored AWQ `5d0ef929`, 512K views, `--gpu-memory-utilization 0.95`, `--max-num-seqs 8` and a 16 GiB CPU KV pool. DFlash2 used the 0.1.2 recommended settings, including the explicit 1500 MiB graph reserve. It is the only NVLink measurement so far.
 
@@ -187,6 +199,8 @@ Cold prefill used MTP4, one request at a time, token-ID prompts from Python stan
 On the PCIe reference system, 0.1.2 with MTP4 at 250 W per GPU measured 3,382 tok/s at 8K and 3,016 tok/s at 131K (512K views, one request at a time, cold prefix cache). The NVLink values are about 1.38× and 1.34× these; the machines and power caps differ. PCIe decode speeds for the same release are in the next table.
 
 ### DFlash2 against MTP4 on PCIe (0.1.2)
+
+<a id="dflash2-against-mtp4"></a>
 
 The PCIe reference system (four V100 32 GB PCIe GPUs under one PCIe switch) with 0.1.2: Uncensored AWQ g32, E4M3 KV, TP4 + DCP2, the 0.1.2 recommended DFlash2 settings, greedy decoding, thinking off, 512-token responses. One request: decode speed after the first token. Four and eight requests with mixed prompts: total output. With one prompt per category, the per-category values are indicative.
 

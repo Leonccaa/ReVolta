@@ -4,6 +4,8 @@ This page explains how to report a problem and how to get a change merged. ReVol
 
 ## Report a problem
 
+<a id="issues"></a>
+
 Search existing issues and pull requests first. Use the bug report form for a problem and the report template for test results or field experience. Include a minimal reproduction, expected and actual behavior, GPU model and count, interconnect, host memory, checkpoint and revision, the complete launch command, the ReVolta version and the relevant logs. Remove credentials and private data.
 
 Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).

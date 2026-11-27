@@ -10,6 +10,8 @@ Terms used in the tables:
 
 ## Environment settings
 
+<a id="settings-used-by-the-reference-deployment"></a>
+
 The engine turns on the ReVolta profile when all of these hold: every visible GPU is SM70 (V100), `--tensor-parallel-size 4`, the model has QSA selector metadata (Qwen3.8 Flash-Next) and `--dtype half`. The profile then sets tuned kernel switches and serving defaults for that server. A value you set yourself, as an environment variable or a launch option, always takes precedence.
 
 To check it, look for `ReVolta profile {"enabled": true, ...}` in the startup log. The line lists the audited settings with their values and sources (`profile`, `environment` or `upstream_default`); not every setting the profile applies is in that list.
@@ -238,6 +240,8 @@ The AWQ checkpoint is 137 GB at the pinned revision:
 | Optional MTP draft (`mtp-fp8/`) | FP8 | 5.3 GB | GPU |
 
 Allow extra disk space for compilation caches and the optional disk KV tier. Structured long-context Host KV settings (`kernel_config.long_context_kv.*`) are in [KV offload](kv-offload.md).
+
+<a id="promoted-research-switches"></a><a id="pregraph-preparation-research-switches"></a><a id="host-decode-fast-path"></a><a id="dflash2-and-dflash-draft-settings"></a><a id="optional-mtp-draft-vocabulary-in-model-runner-v2"></a><a id="optional-mtp-draft-vocabulary-experimental"></a><a id="deprecated-removed-in-020rc6"></a>
 
 <!-- BEGIN GENERATED: tools/gen_env_docs.py -->
 <!-- Edit tools/env_docs_notes.py, then run python tools/gen_env_docs.py -->

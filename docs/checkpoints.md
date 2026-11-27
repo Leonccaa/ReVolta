@@ -1,8 +1,12 @@
 # Checkpoints and KV formats
 
+<a id="checkpoints-kv-scales-and-mtp-drafts"></a>
+
 Use this guide to choose a Qwen3.8 Flash-Next checkpoint, prepare it with its MTP draft and 512K views, and choose the KV cache format. It assumes that ReVolta is [installed](getting-started.md#1-install) and that you have read the [reference launch](getting-started.md#4-launch); this page lists only what changes for each checkpoint. Speculative decoding settings are in [DFlash2](dflash2.md) and [Dynamic speculative decoding](dynamic-speculative-decoding.md).
 
 ## Choose a checkpoint
+
+<a id="models"></a><a id="uncensored-or-base-awq"></a>
 
 | Checkpoint | Weights | MTP draft | Test status |
 | --- | --- | --- | --- |
@@ -51,6 +55,8 @@ If prompt and output together stay within 262,144 tokens, you can serve the chec
 
 ### Launch
 
+<a id="gpu-memory-per-card"></a><a id="--gpu-memory-utilization"></a>
+
 Use the [reference command](getting-started.md#4-launch) and change only the paths and the draft (`<views>` is the directory you set in the script):
 
 | Checkpoint | Model path | `--speculative-config` |
@@ -70,12 +76,16 @@ NVFP4-QAD was validated in 0.2.0rc12 with `--kv-cache-dtype fp8_per_token_head`.
 
 ### MTP drafts
 
+<a id="kv-scales-and-draft-selection"></a>
+
 - Use the draft that belongs to the target: an AWQ checkpoint's own `mtp-fp8/`, the scale pack's `mtp-fp8/` for Standard NVFP4, or the built-in layer of FP4-Local and NVFP4-QAD. The AWQ drafts also contain calibrated draft K/V scales, which only scalar E4M3 KV uses.
 - The Standard NVFP4 draft is copied from Uncensored AWQ revision `1fd7ab705731c9dacc3bcd5b5d15783c60706d64`, including its license and provenance. With Standard NVFP4 it reached 62.5% acceptance in a 0.1.0 serving test; this is not an answer-quality measurement.
 - On V100, the engine packs floating-point and block-FP8 MTP routed experts into Q8_0 once at load time and logs `Defaulting SM70 Qwen4Exp MTP routed experts to Q8_0`. Packed NVFP4 draft experts keep their checkpoint format. Add `"mtp_expert_quantization": "fp8"` to the speculative config to keep FP8 draft experts, or `"fp16"` for the FP16 reference. This affects only the draft's routed expert weights, not the draft KV.
 - DFlash2 drafts need no K/V scales; see [DFlash2](dflash2.md).
 
 ## Weight and KV formats
+
+<a id="kv-cache-format"></a><a id="int8-kv"></a>
 
 V100 stores compressed weights and KV and converts them to FP16 for computation. The weight format is fixed by the checkpoint. The KV format is chosen with `--kv-cache-dtype`:
 
@@ -93,6 +103,8 @@ V100 stores compressed weights and KV and converts them to FP16 for computation.
 - **Capacity.** For measured GPU KV capacity by format, see [GPU KV capacity](performance.md#gpu-kv-capacity).
 
 ### Scalar E4M3 KV (frozen)
+
+<a id="e4m3-kv"></a>
 
 Use scalar E4M3 only to reproduce earlier measurements. It needs calibrated K/V scales that belong to a specific checkpoint revision:
 
@@ -131,6 +143,8 @@ An MTP draft without calibrated scales is always rejected with E4M3 draft KV, ev
 
 ### Standard NVFP4
 
+<a id="standard-nvfp4-checkpoint-setup"></a><a id="speed-compared-with-awq"></a>
+
 The checkpoint is about 126 GiB. The engine reads `quant_algo: NVFP4` from the checkpoint and selects `modelopt_fp4`.
 
 <a id="automatic-configuration"></a><a id="settings-you-may-change"></a>
@@ -141,6 +155,8 @@ In 0.2.0rc12 development measurements, NVFP4 weights took about 0.5 GiB less GPU
 
 ### NVIDIA FP4-Local
 
+<a id="nvidia-fp4-local-checkpoint-setup"></a>
+
 The checkpoint is about 95 GiB. ReVolta runs its experts as W4A16 (activations stay FP16) and expands its MXFP8 layers to FP16. The engine detects the format (`modelopt_mixed`) from the checkpoint, and the same automatic NVFP4 profile applies.
 
 The vision tower uses tensor parallelism by default. ReVolta expands 27 affected vision `fc2` weights to FP16 so that they can be sharded correctly; this configuration passed the large-image and video stress tests in 0.1.0 testing.
@@ -148,6 +164,8 @@ The vision tower uses tensor parallelism by default. ReVolta expands 27 affected
 The NVFP4 PLE table uses about 26.8 GiB of pinned host memory across the four ranks.
 
 ### NVIDIA NVFP4-QAD
+
+<a id="nvidia-nvfp4-qad-checkpoint-setup"></a>
 
 `nvidia/Qwen3.8-Flash-Next-NVFP4-QAD` is a mixed-precision ModelOpt checkpoint: NVFP4 routed and shared experts, MXFP8 GDN and QSA projections (expanded to FP16 at load), an FP8 PLE table, and a built-in MTP layer whose experts use FP8 block scales. It ships no QSA K/V scales, so scalar E4M3 KV is not available.
 

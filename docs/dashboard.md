@@ -6,6 +6,8 @@ Prerequisites: an OpenAI-compatible server started with `vllm serve` or the Dock
 
 ## Turn it on
 
+<a id="enable-and-open"></a>
+
 Add `--enable-dashboard` to your `vllm serve` command, or `enable-dashboard: true` to the YAML file you pass with `--config`. Then open `http://<host>:<port>/dashboard/` (port 8000 by default); `/dashboard` redirects there.
 
 | Option | Type | Default | Effect |
@@ -41,6 +43,8 @@ When the server has an API key (`--api-key`, or `VLLM_API_KEY` if `--api-key` is
 The page has six cards: Requests, Decode, Prefill, Cache, Speculative decoding and Latency. **View details** opens a dialog with more values, the window values next to the totals since engine start, and an explanation of each calculation. On a narrow screen the dialog becomes a scrollable bottom sheet.
 
 ### Time scopes
+
+<a id="metric-scopes"></a>
 
 Each value belongs to one of three scopes:
 
@@ -93,6 +97,8 @@ All names carry the `vllm:` prefix in `/metrics`.
 | Latency | `time_to_first_token_seconds`, `e2e_request_latency_seconds`, `request_queue_time_seconds` |
 
 ## Browser history
+
+<a id="browser-history-and-caching"></a>
 
 **Remember history** is off by default. Until you turn it on, the page writes no observations to browser storage and keeps them in memory only.
 

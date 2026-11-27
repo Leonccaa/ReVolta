@@ -22,7 +22,9 @@ def _forward_config():
     return SimpleNamespace(
         parallel_config=SimpleNamespace(data_parallel_size=1),
         compilation_config=SimpleNamespace(
-            fast_moe_cold_start=False, static_forward_context={}
+            fast_moe_cold_start=False,
+            static_forward_context={},
+            max_cudagraph_capture_size=0,
         ),
     )
 
@@ -139,6 +141,7 @@ def test_qsa_h12_workspace_survives_capture_lock(monkeypatch):
     "mode,uniform_token_count,expected",
     [
         (CUDAGraphMode.FULL, 6, True),
+        (CUDAGraphMode.FULL, 1, True),
         (CUDAGraphMode.FULL, None, False),
         (CUDAGraphMode.PIECEWISE, None, False),
     ],
@@ -158,9 +161,12 @@ def test_qsa_h12_capture_phase(monkeypatch, mode, uniform_token_count, expected)
         return {}
 
     seen = []
+    verify = []
 
     def model(**kwargs):
-        seen.append(get_forward_context().is_uniform_decode)
+        context = get_forward_context()
+        seen.append(context.is_uniform_decode)
+        verify.append(context.additional_kwargs.get("sm70_gdn_verify", False))
         return torch.empty(48, 1)
 
     monkeypatch.setattr(cudagraph_utils.CudaGraphManager, "capture", capture)
@@ -177,3 +183,4 @@ def test_qsa_h12_capture_phase(monkeypatch, mode, uniform_token_count, expected)
         None,
     )
     assert seen == [expected, expected]
+    assert verify == [mode == CUDAGraphMode.FULL and uniform_token_count == 6] * 2

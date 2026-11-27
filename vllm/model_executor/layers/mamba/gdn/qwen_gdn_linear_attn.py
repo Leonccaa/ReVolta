@@ -5631,8 +5631,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             or not 1 <= self._replay_slots <= 8
             or metadata.num_prefills
             or metadata.num_decodes
+            or num_tokens <= 0
             or num_tokens % num_reqs
-            or num_tokens // num_reqs not in (4, 5, 8)
             or num_tokens > num_reqs * self._replay_slots
         ):
             return 0

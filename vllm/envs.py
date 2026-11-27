@@ -3702,8 +3702,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="tuning",
         declared_default="20",
         effective_default=(
-            "20; ReVolta FP16 QSA SM70 TP4 profile sets '40' under "
-            "automatic_conditions."
+            "20; the ReVolta AWQ profile sets 40, or 48 in the AWQ MTP4 wide "
+            "verifier profile."
         ),
         automatic_conditions=(
             (
@@ -3713,6 +3713,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "Only AWQ checkpoints; NVFP4 retains the upstream default for this "
                 "item."
             ),
+            "vllm/revolta_profile.py:apply_awq_mtp_wide_verify_defaults sets 48 "
+            "in the qualified AWQ MTP4 profile with DCP2, PCIe, GPU KV, "
+            "synchronous scheduling and GDN state replay.",
         ),
         acceleration_paths=("TurboMindAwqLinearKernel",),
         user_visible=False,
@@ -6198,7 +6201,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_NVFP4_RAW_GROUPED_M48_V154": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_RAW_GROUPED_M48_V154", "0"))),
         description=(
-            "Use native v154 raw grouped NVFP4 MoE for 48-row target decode "
+            "Use native v154 raw grouped NVFP4 MoE for 41-64 row target decode "
             "on SM70 TP4 Qwen3.8 with equal interleaved gate/up global scales. "
             "Requires raw grouped decode and the V2 model runner."
         ),
@@ -6347,11 +6350,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     # 1CatAI #1147 native E512/K10 router (vllm._sm70_router_C) for the
-    # M=17..20 verifier rows that the Triton router above does not admit.
+    # M=17..64 rows that the Triton router above does not admit.
     "VLLM_SM70_QWEN38_NATIVE_ROUTER_TOPK": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_QWEN38_NATIVE_ROUTER_TOPK", "0"))),
         description=(
-            "Route Qwen3.8 E=512, K=10 renormalized softmax top-k for 17..20 "
+            "Route Qwen3.8 E=512, K=10 renormalized softmax top-k for 17..64 "
             "FP16 router rows through the native SM70 router extension "
             "(#1147) instead of the generic topk_softmax op. Selection follows "
             "stable raw-logit order; weights are the FP32 softmax of the "
@@ -6359,8 +6362,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         category="experimental",
         declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
+        effective_default="False; the AWQ MTP4 wide verifier profile enables it.",
+        automatic_conditions=(
+            "vllm/revolta_profile.py:apply_awq_mtp_wide_verify_defaults enables "
+            "this for the qualified AWQ MTP4 profile with DCP2, PCIe, GPU KV, "
+            "synchronous scheduling and GDN state replay. Explicit values win.",
+        ),
         acceleration_paths=("SM70 runtime/kernel policy",),
         user_visible=False,
     ),
@@ -13121,11 +13128,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_MTP_GDN_NATIVE_VERIFY": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_MTP_GDN_NATIVE_VERIFY", "0"))),
-        description="Opt in to SM70 MTP native GDN verify and accepted-state replay.",
+        description="Use native SM70 GDN verification and accepted-state replay.",
         category="configuration",
         declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
+        effective_default="False; the AWQ MTP4 wide verifier profile enables it.",
+        automatic_conditions=(
+            "vllm/revolta_profile.py:apply_awq_mtp_wide_verify_defaults enables "
+            "this for the qualified AWQ MTP4 profile with DCP2, PCIe, GPU KV, "
+            "synchronous scheduling and GDN state replay. Explicit values win.",
+        ),
         acceleration_paths=("MTP verifier",),
         user_visible=True,
     ),

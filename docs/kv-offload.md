@@ -1,22 +1,51 @@
-# KV offload modes
+# KV cache tiers and offload
 
-Use this guide to configure prefix-cache offload to CPU memory and disk. Start with
-[a working reference launch](getting-started.md) and check its [host memory budget](configuration.md#system-memory-and-storage).
+This page explains where ReVolta keeps the KV cache and how to set up each tier: GPU only, CPU offload, a disk tier, and Host KV for long contexts. The first sections are step-by-step guides; the [settings reference](#settings-reference) and [metrics and log lines](#metrics-and-log-lines) at the end list every key and counter.
 
-See [Coming back to a document](performance.md#coming-back-to-a-document) for measured readback times.
+Before you start, have a working [reference launch](getting-started.md) and check the [host memory budget](configuration.md#system-memory-and-storage).
 
-The KV cache always lives on the GPUs first. Offload adds lower tiers that keep
-evicted prefixes, so a later request with the same prefix reads them back instead of
-running prefill again. All three modes were tested for correct readback: tokens
-generated after readback matched the off-mode reference exactly.
+Terms used on this page:
 
-For active main K/V placement in host memory, see
-[Host KV](#active-host-kv-development-configuration).
+- **KV cache**: the attention keys and values of tokens already processed. The GPU always holds the KV cache of running requests; the **prefix cache** keeps it after a request finishes, so a later request with the same prompt start skips that part of prefill.
+- **Offload**: when the GPU prefix cache evicts blocks, a lower **tier** (CPU memory, then disk) keeps a copy. A later request with the same prefix reads it back instead of computing it again.
+- **Host KV**: a long-context mode in which the main K/V history lives in host memory. The GPU keeps the compressed index, the recurrent state and a working set of hot pages.
 
-**1. Off.** Remove `--kv-transfer-config`. This uses the least host memory with the default pinned PLE table (80 GiB passed memory stress; full acceptance was not run). Evicted prefixes are
-computed again.
+## Choose a mode
 
-**2. CPU.** The quick start configuration:
+| Mode | Status in 0.2.0 | Where evicted prefixes go | Extra host memory | Choose it when |
+| --- | --- | --- | --- | --- |
+| [GPU KV only](#gpu-kv-only) | Stable | Nowhere: they are computed again | None | Host memory is tight |
+| [GPU KV + CPU offload](#cpu-offload-reference-configuration) | Stable; used by the reference launch | A CPU pool in `/dev/shm` | `cpu_bytes_to_use` (48 GiB in the reference) | Most deployments |
+| [GPU KV + CPU + disk](#disk-tier-revolta_fs-experimental) | Experimental | The CPU pool, then a local SSD | The CPU pool, plus SSD space | Cached documents should survive a restart |
+| [Host KV](#host-kv-long-context) | Supported; validated with MTP (acceptance configuration E2) | Main K/V lives in host memory; optional SSD | `host_store_gib` | Long contexts or many long requests do not fit in GPU KV |
+
+All modes use the same model, KV format (INT8 by default) and speculative decoding settings. Only `--kv-transfer-config` and, for Host KV, `--kernel-config` change.
+
+## GPU KV only
+
+Remove `--kv-transfer-config` from the launch command. Evicted prefixes are computed again. Host memory then holds only the PLE table and the usual process memory; see [System memory and storage](configuration.md#system-memory-and-storage) for the tested limits.
+
+To check the GPU pool, read the startup log:
+
+- `GPU KV cache size: N tokens`: the tokens the GPU pool can hold.
+- `Maximum concurrency for L tokens per request: X`: how many requests of the full `--max-model-len` fit at once.
+
+For measured pool sizes by speculative method, see [GPU KV capacity by method](performance.md#gpu-kv-capacity-by-method).
+
+### Recurrent-state replay
+
+The model's GDN layers carry a recurrent state. During speculative decoding, MTP and DFlash2 keep that state with replay: after sampling, the accepted tokens are replayed into the request's state. Each running request then needs two state blocks per GDN cache group, whatever the draft length, instead of one per draft position. The saved GPU memory goes to KV history.
+
+Replay is on by default on the supported route: SM70, Model Runner V2, `--mamba-cache-mode align`, synchronous scheduling (`--no-async-scheduling`) and no pipeline parallelism. The reference launch meets all of these. The startup log confirms replay with `recurrent layers keep 2 state blocks per running request`.
+
+- **Cost and gain (0.2.0rc11, four V100, TP4 + DCP2, MTP4 with sampling):** about 0.6 ms (2%) longer per decode round at one request. With eight concurrent long-context requests, turning replay off used about 0.87 GiB more GPU memory per GPU.
+- **Output:** replay and per-draft state storage are different computation paths. Output is not guaranteed to be bitwise identical with replay on and off; near-tied token scores can lead to different continuations.
+- **MTP settings** (in `--speculative-config`): `"gdn_state_replay": false` turns replay off. `gdn_state_replay_graph` (default on for MTP) runs the replay as a CUDA graph for full verify shapes; mixed steps replay without a graph.
+- **DFlash2 settings:** see [DFlash2 state replay](dflash2.md#state-replay-optional).
+
+## CPU offload (reference configuration)
+
+The reference launch uses this `--kv-transfer-config`:
 
 ```json
 {
@@ -33,113 +62,71 @@ computed again.
 }
 ```
 
-`cpu_bytes_to_use` sets the pool size (total for all workers). With MTP4, a 48 GiB pool
-holds about 2.4M tokens. With DFlash2, the drafter uses a different cache block size, so
-every cache group takes pages of the full block size and a prefix needs about 50 KB per
-token in the CPU pool and on disk (measured in 0.1.4: 1.84 GB for a 32K-token prefix,
-6.36 GB for 131K), about 2.4 times MTP4's about 21 KB per token. `mamba_state_slots_reference_tokens` sets how many
-recurrent-state slots each layer group gets. A smaller reference gives more slots,
-which helps when many short sessions share the pool.
+`cpu_bytes_to_use` is the pool size in bytes, summed over all workers (51539607552 bytes = 48 GiB). The other keys are explained in the [settings reference](#connector-and-cpu-pool-keys).
 
-`demote_superseded_states` (default `true`) moves recurrent states that a finished request made obsolete to the front of the CPU pool's eviction order, so they are evicted before other conversations' reusable prefixes. Nothing is deleted. `superseded_state_rule` selects which states count as obsolete:
+**Host memory.** The pool is a shared-memory file in `/dev/shm`. It is allocated and touched at startup, so the whole pool is resident from the start. In a container, make `--shm-size` larger than `cpu_bytes_to_use` (the reference container uses `--shm-size 128g`). 128 GiB of RAM is recommended for the 48 GiB pool; with less, make the pool smaller or turn offload off ([System memory and storage](configuration.md#system-memory-and-storage)). At startup, the line `Qwen4Exp PLE host preflight (...)` lists the PLE share, the CPU KV pool and the available memory; if it is logged as a warning, the two together may not fit.
+
+**Capacity.** With MTP4, a 48 GiB pool held about 2.4 million tokens, about 21 KB per token (0.1.0, E4M3 KV). <!-- TODO(0.2.0-acceptance): CPU pool token capacity at 48 GiB with INT8 KV, D+E1 --> With DFlash2, the drafter uses a different cache block size, so every cache group takes pages of the full block size: a prefix needs about 50 KB per token in the CPU pool and on disk (measured in 0.1.4 with E4M3 KV: 1.84 GB for a 32K-token prefix, 6.36 GB for 131K). The same 48 GiB pool then holds about 1 million tokens (an estimate from the same 50 KB per token). <!-- TODO(0.2.0-acceptance): CPU pool bytes per token with DFlash2 and INT8 KV, C -->
+
+**Check that it works.** At startup, look for:
+
+- `Creating offloading spec with name: TieringOffloadingSpec`.
+- With MTP4: `Grouped CPU offload pool: N token slots, M state slots per Mamba group; ...`. With DFlash2: `Created TieringOffloadingManager with primary tier (lru, N blocks) and 0 secondary tier(s)`.
+- `Created mmap file /dev/shm/vllm_offload_<id>.mmap (X GB)` (with MTP4, one `vllm_offload_<id>_g<group>.mmap` file per cache group), each followed shortly by `Removed mmap file ...`. The name is removed on purpose; the memory stays mapped.
+
+While serving, the periodic stats line shows `External prefix cache hit rate: X%`. Prometheus has the same data as `vllm:external_prefix_cache_hits_total` and `vllm:external_prefix_cache_queries_total` (in tokens), and the transferred bytes as `vllm:kv_offload_total_bytes_total{transfer_type="GPU_to_CPU"}` and `{transfer_type="CPU_to_GPU"}`.
+
+**Stopping and restarting.** The engine removes the pool's file name from `/dev/shm` as soon as every process has mapped it, so the kernel frees the memory when the last process exits, even after a kill (fixed in 0.2.0, #51). Only a crash during startup, before that point, can leave a `vllm_offload_*.mmap` file behind. Remove such files when no engine is running, or recreate the container.
+
+### Superseded recurrent states
+
+Each conversation turn stores a new recurrent state at its end. With `demote_superseded_states` (default `true`), when a request finishes, the states it made obsolete move to the front of the CPU pool's eviction order, so they are evicted before other conversations' reusable prefixes. Nothing is deleted, and a demoted state can still serve a hit while it is in the pool.
+
+`superseded_state_rule` selects which states count as obsolete:
 
 - `request` (default): the request's own states between its prefix hit and its last three blocks. The last block is counted including generated output.
-- `request_fixed`: the same, but the last block is counted from the prompt. Recurrent states are only offloaded for prompt tokens, so counting output could demote the prompt-end states the next turn of the conversation resumes from (with outputs longer than about three blocks).
-- `extend`: `request_fixed`, plus the state at the request's prefix hit once the request has stored a newer state past it. In a continued conversation this is the previous turn's end state, which the new turn has extended. A request that regenerates or edits the previous turn would need that state; it is only moved forward in the eviction order, so it is still used while it remains in the CPU pool or on the GPU.
+- `request_fixed`: the same, but the last block is counted from the prompt. With the default `offload_prompt_only`, states are offloaded only for prompt tokens, so counting output could demote the prompt-end state the next turn resumes from (when the output is longer than about three blocks).
+- `extend`: `request_fixed`, plus the state at the request's prefix hit once the request has stored a newer state past it. In a continued conversation this is the previous turn's end state. A request that regenerates or edits the previous turn would need it; it is only moved forward in the eviction order, so it is still used while it remains in the pool.
 
-States at a shared-prefix junction are never demoted. Under `request_fixed` and `extend`, the prefix-hit state of any other active request is not demoted either, and `extend` never demotes the request's own resend checkpoint (the state an identical resend, capped at the prompt length minus one, resumes from; with an EAGLE/MTP shift, the one before it as well). The scheduler logs `Offload counters: demoted_states=... cpu_stored_blocks=... cpu_evicted_blocks=... rejected_boundary_offers=... rule=... cpu_draft_blocks_skipped=... cpu.draft_offload=... stored_blocks_by_kind=target:...,draft:...,state:... lookup_shrink_tokens=draft_window:...,recurrent_state:...,sliding_window:...,page_align:... hit_draft_window_needed=true:...,false:...` every 60 seconds (cumulative totals; the last three are the store and lookup counters below). `rejected_boundary_offers` counts recurrent states the CPU pool could not take when they were offered because all its state slots were in use by transfers; those states are not offloaded and are computed again on a later hit.
+States at a shared-prefix junction are never demoted. Under `request_fixed` and `extend`, the prefix-hit state of any other active request is not demoted either, and `extend` never demotes the state an identical resend would resume from.
 
-`cpu.draft_offload` selects which blocks of the speculative drafter's sliding-window KV cache the CPU tier stores. It is experimental, introduced in 0.2 (0.2.0rc5 and later), and set per deployment in `kv_connector_extra_config`.
+### DFlash2 drafter blocks
 
-- Type: string. Default: `"all"`. Allowed values: `"all"`, `"window"`, `"none"`. Any other value is rejected at startup.
-- Scope: deployment. It applies only to a KV cache group recognised as a draft model's sliding window: speculative decoding is configured, the group uses a plain sliding window longer than one offloaded block, and the group is flagged as a draft group or its layers are numbered after the target model's (as with the DFlash2 drafter). Full-attention groups, recurrent-state groups and a target model's own sliding-window groups are not affected. If no group is recognised, the scheduler logs a warning and the setting has no effect.
-- `all`: store every draft block, as before this option existed.
-- `window`: store only the draft blocks inside the window before each boundary whose recurrent state the request stores, and before its shared-prefix junction. A prefix hit needs the recurrent state at the hit point anyway, so hits normally land on these boundaries. The other draft blocks are not stored, leaving CPU pool slots for other prefixes. With independent grouped pools, each group's budget is fixed: unused draft slots cannot become target or recurrent-state slots. If a needed window is incomplete, the hit falls back to an earlier boundary whose window is complete, and the target model computes the rest again. A window may be evicted after storage, or may never be stored completely: a late state hand-off can arrive after its GPU window was freed, the CPU pool can reject a window store, and conservative in-flight token accounting can exclude blocks still held by the core. A CPU cache reset reconsiders still-held window blocks, including a prefix loaded on re-admission after preemption; it cannot recover freed GPU blocks. Accepted block records and past boundary records are retired as the processed-token window advances. Pending steps do not advance this retirement boundary, so speculative rollback preserves records for blocks still held. These records cover the retained window and in-flight or scheduled work rather than the whole request history.
-- `none`: store no draft blocks. The drafter cannot compute its cache again (it is projected from target hidden states), and a hit needs the draft window before the hit point, so a fresh CPU tier with a draft group cannot serve prefix hits. This setting controls writes; old draft keys already present in a backend can still serve hits. Use it only to measure the cost of the draft blocks.
-- Counters: `vllm:kv_offload_cpu_draft_blocks_skipped_total` counts settled draft block skips because of this setting, and the `Offload counters` log line reports the same total as `cpu_draft_blocks_skipped`. For non-null scanned blocks, reconcile **accepted offers + settled skipped + still deferred = scanned**. Blocks not yet needed stay deferred until offered, freed, preempted or finished. A rejected store or retry keeps the same deferred obligation. After a CPU cache reset, previously offered or loaded blocks still held by the request can start new scan obligations and be offered again; existing deferred blocks retain their obligation, and previously settled skips are not counted again. A new admission after preemption starts a new scan. Offers include keys already resident or filtered by the store threshold, so they are not counts of new writes. The skipped counter measures neither saved resident slots nor bytes, and cannot generally be added to the all-group `cpu_stored_blocks` counter. With `all` its internal value stays at 0; the Prometheus series may be absent until a positive increment creates its labels.
+The DFlash2 drafter has its own sliding-window KV cache. `cpu.draft_offload` selects which of its blocks the CPU pool stores. It has no effect with MTP, whose draft layer uses full attention; if it is set to another value than `all` with MTP, the scheduler logs that it has no effect.
 
-`cpu.enable_dependency_eviction` removes provably unusable CPU blocks after a
-capacity eviction. `cpu.residency_stats` enables residency statistics independently.
-Both are experimental deployment settings in `kv_connector_extra_config`.
-With `kernel_config.long_context_kv` enabled (the host KV tier) neither key
-has an effect; the scheduler logs a warning and ignores them.
+- `all` (default): store every drafter block.
+- `window`: store only the drafter blocks inside the window before each point where the request stores a recurrent state, and before its shared-prefix junction. Hits normally land on those points, because a hit also needs the recurrent state there. The skipped blocks leave room for other prefixes. If a needed window is incomplete, the hit falls back to an earlier point whose window is complete, and the rest is computed again.
+- `none`: store no drafter blocks. The drafter cannot recompute its cache (it is projected from target hidden states), so a fresh CPU tier then serves no prefix hits for DFlash2. Use it only to measure the cost of the drafter blocks.
 
-- Type: boolean for both keys. Default: `false`. Non-boolean values are rejected
-  at startup. With both keys absent or false, no dependency index or residency
-  scan runs, and store selection, lookups and eviction order are unchanged.
-- Scope: dependency removal supports CPU-only LRU tiers, including unified
-  shared-row pools and independent grouped pools. It requires full-attention and
-  Mamba `align` groups on the same offloaded page size, with any recognised draft
-  sliding-window block size dividing that size. All recurrent groups participate
-  in a checkpoint. EAGLE/MTP is treated conservatively; target sliding-window
-  groups and other geometries retain their existing behaviour. With **any
-  secondary tier**, including a filesystem tier, dependency removal is disabled:
-  a missing CPU page may still be reachable through that tier. Residency is then
-  reported as `unknown`. ARC and unsupported geometries also report `unknown`.
-- Removal is a closure over resident dependencies: a state needs every recurrent
-  group, the final target page in every full-attention group, and a mandatory
-  suffix of each draft window. Target pages with no reachable resident state and
-  draft pages outside every potentially usable state's window can then be freed.
-  Admission is unchanged; the remaining pages keep their relative LRU order.
-  Freed slots return to their original pool, so grouped pools cannot exchange
-  capacity. `cpu.draft_offload=all|window|none` still controls writes only.
-- Safety limits: CPU absence alone cannot prove an earlier prefix is broken,
-  because lookup can start after a GPU prefix hit, including a partial prefix
-  entry. Missing window heads may similarly be supplied by a GPU prefix. These
-  cases are retained. Transfer pins, active requests' known hashes (including
-  prefix hits and possible later state stores), and known junction dependencies
-  are retained. Demotion under `superseded_state_rule=extend` is never evidence
-  of unusability. Unknown annotations retain all rows. The index owns one record
-  per resident CPU block, with bounded parent/group/window references, and drops
-  it on every removal, failed store and reset. This does not promise idealised
-  dependency collection, a particular capacity gain, or GPU performance.
-- Metric: `vllm:kv_offload_cpu_resident_blocks{kind,status}` is a gauge, enabled
-  by either setting, sampled by the scheduler at most once every 60 seconds.
-  `kind` uses the same KV spec classifier as completed stores: recognised draft
-  windows are `draft`, all `MambaSpec` modes are `state`, and other groups are
-  `target`. Non-align recurrent modes remain unsupported for deletion and
-  report `unknown`. Statuses are `potentially_servable`
-  (a conservative upper bound, including GPU-assisted hits), `chain_broken`
-  (a state's mandatory final target page is missing), `missing_dependency`
-  (a required recurrent peer or mandatory draft suffix is missing), `no_state`
-  (target page participates in no possible resident state hit), `outside_window`
-  (draft page lies in no potentially usable state's window), and `unknown`
-  (protected, incomplete metadata, secondary tiers or unsupported geometry).
-  There is no `demoted_unservable` classification: a demoted state can still hit.
-  The full state of the GPU prefix cache is not available to this index, so
-  `potentially_servable` is not an exact count of cold CPU hits. Protected rows
-  are counted as `unknown` even when their current dependencies are incomplete.
-- Reconciliation: the gauge's sum over all labels equals occupied CPU slots
-  **at sampling time**, including in-flight stores and loads. It counts blocks,
-  not bytes, and must not be summed over time. All zero-valued labels are sent
-  on later samples, including after reset. The existing `Offload counters` line
-  adds `cpu_resident_blocks` and `cpu_residency` only when enabled. Additional
-  removals use `vllm:kv_offload_cpu_evicted_blocks_total{reason="dependency"}`;
-  `capacity + superseded + dependency = cpu_evicted_blocks` in the log, excluding
-  `reset`. Dependency removal events carry exactly the freed keys. Resets and
-  failed reservations are separate from successful writes, so stored minus
-  evicted alone need not equal residency. Draft skips count write selection,
-  not dependency removals or saved resident bytes.
-`cpu.offload_counters` enables three store and lookup counters (experimental,
-0.2). Type: boolean. Default: `false`; non-boolean values are rejected at
-startup. Set it in `kv_connector_extra_config`, independently of
-`cpu.enable_dependency_eviction` and `cpu.residency_stats`. With this key absent
-or false, no counter object, group classification log, counting work, log suffix
-or metric registration/samples are added. When true, these counters are read-only
-bookkeeping: no store, load, lookup or eviction depends on them. Each also appears
-in the single `Offload counters` log line as a cumulative total per label,
-alongside residency if enabled. A Prometheus series appears with its first
-positive increment.
+## Disk tier (`revolta_fs`, experimental)
 
-- `vllm:kv_offload_cpu_stored_blocks_total{kind}` counts offloaded blocks whose store to the CPU tier completed (all workers reported the job done), by KV cache group. `kind="draft"`: a group `cpu.draft_offload` recognises as a speculative drafter's sliding window (the same test, whatever the option's value). `kind="state"`: recurrent-state (Mamba, GDN) groups; each recurrent state is one block. `kind="target"`: every other group, including a target model's own sliding window and EAGLE/MTP groups that are not such a sliding window (an MTP layer with full attention is stored and looked up like the target's full attention). The classification is by group, so it is the same with one shared pool and with per-group pools; the scheduler logs it at startup (`Offload counter kinds by KV cache group`). Reconciliation: `cpu_stored_blocks` in the log line counts prepared reservations, while C1 counts completed store jobs. They can differ because of in-flight or failed stores, reset-discarded jobs, grouped reservations rolled back when another pool rejects the store, and disk-to-CPU staging. Keys already resident are not stored again and do not increment C1. Draft scans reconcile as **accepted offers + settled skips + deferred = scanned**. Completed `C1{kind="draft"}` cannot replace accepted offers: an accepted offer may include already-resident keys or keys filtered by admission `store_threshold`, even after all work drains. A rejected store, including grouped rollback, keeps the deferred obligation until retry or settlement; failed stores do not undo accepted offers. Reset can start new scan obligations for held blocks as described above. These counts measure scan obligations, not unique resident blocks or saved bytes. The byte counter `vllm:kv_offload_total_bytes_total` is recorded by the workers when a transfer finishes, so unlike this counter it can include stores whose completion a reset discarded.
-- `vllm:kv_offload_lookup_shrink_tokens_total{cause}` counts tokens by which the sliding-window and recurrent-state groups lowered a CPU-tier lookup below its full-attention reach. The reach is the hit the full-attention groups alone allow: their consecutive offloaded blocks after the local GPU hit, capped at the request length minus one and kept on the Mamba page grid. The served length is the local hit plus the lookup's external hit. For each lookup, the causes add up to reach minus served. `cause="recurrent_state"`: the recurrent state is not stored at the reach, so the hit moves back to the previous stored state. `cause="draft_window"`: the drafter's window before the hit is incomplete. `cause="sliding_window"`: another sliding window (for example a target model's own). `cause="page_align"`: rounding a sliding-window group's hit down to the Mamba page grid, and with EAGLE/MTP the one-page shift of the restored state before the reach (every such lookup adds one page here). A lookup that ends without an external hit is served at the local hit; the rest of the reduction goes to the group examined last. A lookup counts once, when the core admits the request (as the external prefix cache query counters do); a lookup the backend defers, or repeated because the request could not be allocated, counts only in the attempt that is admitted. A lookup whose full-attention reach is less than one block beyond the local hit, and a model without both a full-attention group and a sliding-window or recurrent-state group, count nothing. The served length is the lookup's result: a partial prefix-cache hit resolved afterwards in favour of the GPU hit does not change it. Shrinks to no external hit at all are counted as well.
-- `vllm:kv_offload_hit_draft_window_needed_total{needed}` counts admitted requests with an external (CPU-tier) hit on a model with a draft group. `needed="true"` when fewer tokens than the draft window remain to be prefilled after the hit (request length minus local hit minus external hit): the drafter's window at the first decode step then reaches back into the loaded draft blocks. With `needed="false"` that window lies inside the tokens prefilled after the hit. The counter compares lengths only; it does not observe what the drafter reads. The two labels add up to the external hits of such a model. With several draft groups the largest window applies.
+The disk tier keeps evicted prefixes on a local SSD below the CPU pool. Pages survive an engine restart, so a returning document is read from disk instead of computed again; see [Coming back to a document](performance.md#coming-back-to-a-document) for readback times. Use the `revolta_fs` tier type: it stores the INT8 scale planes with each page and verifies every page before use. The upstream `fs` tier type rejects the default planar INT8 KV (and per-token-head E4M3) at startup and has no integrity check.
 
-**3. GPU KV + CPU + SSD.** Replace the launch command's `--kv-transfer-config`
-with the JSON below. First create the content manifest for the target and any
-separately loaded draft as described under [Verified disk tier](#verified-disk-tier-revolta_fs-experimental).
-Use `revolta_fs` for planar INT8 (the default for eligible QSA models on V100)
-or per-token-head E4M3, both of which the raw `fs` tier rejects.
+The disk tier is a disposable cache, not model storage. Losing it only means prefixes are computed again.
+
+### 1. Create a content manifest
+
+The tier binds its pages to the contents of the loaded checkpoint, not to its path. A content manifest records every file of the target and of a separately loaded draft. Create it once per checkpoint, with the same paths the engine loads, and keep it outside the model directories. The tool is in the repository, not in the container image; run it with the image's Python, for example:
+
+```bash
+mkdir -p /data/revolta/manifests
+docker run --rm --entrypoint python3 \
+  -v /data/revolta:/data/revolta \
+  -v "$PWD/tools/kv_offload:/tools:ro" \
+  ghcr.io/leonccaa/revolta:0.2.0 \
+  /tools/make_content_manifest.py \
+    --role target=/data/revolta/views/target-512k \
+    --role draft=/data/revolta/views/draft-512k \
+    --out /data/revolta/manifests/target-512k.json
+```
+
+Run it from a checkout of the ReVolta repository at the release you serve. Omit the `draft` role only when the draft is loaded from the target's own directory. Symbolic links (as in the 512K views) are followed. Hashing reads every file once.
+
+Create a new manifest whenever the checkpoint changes. If a listed file changes, a file is added to a model directory, or the manifest is missing, the tier disables itself and the CPU tier keeps working.
+
+### 2. Configure the tier
+
+Replace the launch command's `--kv-transfer-config` with:
 
 ```json
 {
@@ -152,8 +139,8 @@ or per-token-head E4M3, both of which the raw `fs` tier rejects.
     "secondary_tiers": [
       {
         "type": "revolta_fs",
-        "content_manifest_path": "/path/to/manifests/model.json",
-        "root_dir": "/path/to/nvme/revolta-kv",
+        "content_manifest_path": "/data/revolta/manifests/target-512k.json",
+        "root_dir": "/data/revolta/kv-cache",
         "max_size_bytes": 8589934592,
         "min_free_bytes": 17179869184,
         "max_files": 10000,
@@ -168,335 +155,163 @@ or per-token-head E4M3, both of which the raw `fs` tier rejects.
 }
 ```
 
-The example sets a 16 GiB CPU pool and an 8 GiB disk budget.
+The example sets a 16 GiB CPU pool and an 8 GiB disk budget. Notes:
 
-- `max_size_bytes` is **required**. It is a positive integer: the total page budget
-  for everything under `root_dir`. Configuration fails without it.
-- `min_free_bytes` is the free-space floor of the file system. The default is 5% of
-  its capacity.
-- Use one dedicated directory for each engine. A lock file allows only one engine per
-  root.
-- To reuse `revolta_fs` pages after a restart, the persistent KV identity, including
-  the compatibility epoch (`KV_COMPAT_EPOCH`), must match. Keep `.hash_seed.json`
-  in the root. In the raw `fs` release gate, a restarted engine read 667 MB of
-  pages from disk and produced identical output.
-- The SSD tier is a disposable cache, not model storage.
-- A prefix restored from disk is staged in the CPU pool first, so `cpu_bytes_to_use` must
-  be larger than the largest prefix you expect to restore from disk (about 21 KB per
-  token with MTP4 and about 50 KB with DFlash2; a 100K-token prefix needs more than
-  2 GiB with MTP4 and about 5 GB with DFlash2). Otherwise the request is computed
-  again. The quick-start 48 GiB pool holds about 2.4M tokens with MTP4; with DFlash2 the
-  same pool holds about 1M tokens, an estimate from the same about 50 KB per token.
-- With a grouped CPU pool (a hybrid model with a recurrent-state group, for example
-  the default MTP4), each state pool is sized from `mamba_state_slots_reference_tokens`
-  alone, without counting requests restoring from disk at the same time. With MTP4
-  the pool holds roughly 0.73 requests' worth of recurrent states per GiB (measured:
-  4 state slots per group at 2 GiB, 72 at 48 GiB, two slots per request), so if more
-  requests restore from disk at once than the pool has state slots for, the extra
-  requests are treated as cache misses and fully recomputed; their output is not
-  affected. Size the pool so that 0.73 × pool GiB covers the number of requests that
-  may restore concurrently (about 11 GiB for 8, the default `--max-num-seqs`, hence
-  the 16 GiB in this example), or lower `mamba_state_slots_reference_tokens` (for
-  example 16384, which by the sizing formula gives each state pool about four times
-  more slots from the same budget, at the cost of fewer token slots; not measured).
+- `max_size_bytes` is required: the total page budget for everything under `root_dir`.
+- `min_free_bytes` is the free-space floor of the file system. The default is 5% of its capacity.
+- Use one dedicated directory per engine on a local SSD. A lock file allows only one engine per directory.
+- The file system must support user extended attributes (ext4 and XFS do); each page's checksum is stored there.
+- Keep `.hash_seed.json` in the directory. Pages are reused after a restart only with the same seed, the same manifest content and the same configuration identity (see [When pages are not reused](#when-pages-are-not-reused)).
 
-Validation scope for the raw `fs` tier: the full release gate passed on a network file
-system (8 GiB CPU pool, 40 GiB disk budget), including a 99K-token prefix restored from
-disk (96,288 cached tokens, output identical). In 0.1.4 the tier was also measured on a
-local NVMe SSD with DFlash2 (7 GiB CPU pool, 64 GiB disk budget, one read and one write
-thread). After an engine restart, 11 of 11 documents were read back from disk with the
-same 64-token greedy output as a cold run, reading the pages from disk at about
-2.2–2.4 GB/s inside the restore. That rate covers the disk read on its own: it is not the
-stored bytes divided by the time to the first token, and that quotient is the lower of
-the two. A 32K / 99K / 131K-token prefix came back in 1.47 / 2.93 / 3.77 s instead of
-10.12 / 31.88 / 42.43 s when recomputed. A root holding 27.8 GB in 1,088 files did not
-slow the restart. See [Coming back to a document](performance.md#coming-back-to-a-document).
+### 3. Allow time to drain at shutdown
 
-## Verified disk tier (`revolta_fs`, experimental)
+Pending page writes are written at shutdown only if the engine gets time for it. The API server stops the engine `--shutdown-timeout` seconds after a stop request; with the default `0` it stops at once and pending writes are lost. The reference launch sets `--shutdown-timeout 30`: in-flight requests finish first, then pending writes get up to `drain_timeout_s` (20 s in the example) within what is left of the 30 s. Give the container or service supervisor more time than that before it force-stops the engine (the reference container uses `--stop-timeout 120`); see `--shutdown-timeout` in [Launch options](configuration.md#launch-options).
 
-Eligible QSA `auto` selects planar INT8 on SM70 and `fp8_per_token_head` on other
-supported CUDA devices. The `revolta_fs` tier persists the planar INT8 K/V scale
-planes with each page. Planar INT8, planar E4M3 and calibrated scalar E4M3 use
-separate SSD namespaces. Existing files under a different codec or page layout
-miss and are recomputed. The readback measurements above used scalar E4M3.
+### 4. Check that it works
 
-The tier adds:
+- At startup: `revolta_fs enabled at <directory> (content <digest>)`. If the tier cannot start, the log shows `revolta_fs disabled: <reason>` instead, and serving continues with the CPU tier only.
+- While serving, at most once a minute: `Delayed writes (revolta_fs): {...}` and `SSD tier stats (revolta_fs): verified_load_pages=N verified_load_bytes=B ...`. `verified_load_pages` counts pages read back from disk after their checksum and identity were verified.
+- At shutdown: `revolta_fs stats: {...}` with pages written, pages already present, pages verified, checksum failures, retries and write jobs skipped because the disk was behind.
 
-- **Integrity:** each page carries a CRC32C of its contents in a user extended
-  attribute, bound to the page's prefix and the tier's identity. A corrupted page, or
-  an intact page that belongs to another prefix or layout, is deleted and computed
-  again; it is never loaded. Pages are written to a temporary file, synced and then
-  renamed. The file system under `root_dir` must support user extended attributes
-  (ext4 and XFS do); otherwise this tier disables itself and CPU serving continues.
-- **Identity:** pages are bound to the contents of the loaded checkpoint, not its
-  path. Create a content manifest once per checkpoint, with the same paths the engine
-  loads, and keep it outside the model directories. Run the tool from a ReVolta
-  checkout. Include a `draft` role for a draft loaded from a different checkpoint
-  root.
+The external prefix-cache hit counters combine CPU and disk hits, so they cannot give the disk's share of prompt tokens. The disk counters are log lines, not Prometheus series.
 
-  ```bash
-  python tools/kv_offload/make_content_manifest.py \
-      --role target=/path/to/model --role draft=/path/to/draft \
-      --out /path/to/manifests/model.json
-  ```
+### Size the CPU pool for disk restores
 
-  If a listed file changes, a file is added to a model directory, or the manifest is
-  missing, the tier disables itself: nothing is read from or written to disk, and the
-  CPU tier works as before. Create a new manifest after changing the checkpoint.
-  The target and effective draft must resolve to local checkpoints covered by the
-  manifest. Only the default `auto` and `safetensors` loaders are accepted; extra
-  loader options, secondary weights, `model_weights`, LoRA, multimodal sources and
-  runtime KV scale calibration disable this tier. Keep checkpoint generations
-  immutable from manifest creation through model loading and serving. `stat`
-  verification depends on that contract; `full` also rehashes the files.
-  A dedicated full SHA-256 identity covers loader selection, target and effective
-  draft settings (including quantization, dtype and RoPE), KV dtype/layout and page
-  format. Each page records its complete key and namespace digest separately from
-  its payload CRC32C and compares both exactly before accepting a load.
-- **Recency:** prefixes used from the GPU or CPU pool also refresh their disk pages,
-  with the start of a prefix kept most recent, so a shared system prompt is not the
-  first page evicted.
+A prefix restored from disk is first staged in the CPU pool. Two limits follow:
 
-Options of a `revolta_fs` tier entry, listed under the `ssd.` namespace (the key in the
-tier entry is the part after `ssd.`):
+- The pool must be larger than the largest prefix you expect to restore from disk, or the request is computed again. At the per-token sizes [above](#cpu-offload-reference-configuration) (about 21 KB with MTP4 and about 50 KB with DFlash2, E4M3 KV), a 100K-token prefix needs more than 2 GiB with MTP4 and about 5 GB with DFlash2.
+- With MTP4 the pool is grouped: each recurrent-state group gets its own slots, sized from `mamba_state_slots_reference_tokens`. If more requests restore from disk at the same time than there are state slots, the extra requests are treated as cache misses and computed again; their output is not affected. With the reference launch, the pool held about 0.73 requests' worth of states per GiB (measured during 0.2.0 development: 4 state slots per group at 2 GiB, 72 at 48 GiB, two slots per request). Size the pool so that 0.73 × pool GiB covers the requests that may restore at once: about 11 GiB for the default 8 sequences, hence 16 GiB in the example. Or lower `mamba_state_slots_reference_tokens`: 16384 gives each state group about four times as many slots from the same budget, at the cost of fewer token slots (not measured).
 
-| Option | Type | Default | Values | Scope | Effect and trade-off | Since | Status |
-|---|---|---|---|---|---|---|---|
-| `ssd.content_manifest_path` | string | none | path | deployment | Content manifest of the loaded checkpoint. Without it the tier is disabled. | 0.2 | experimental |
-| `ssd.content_verify` | enum | `stat` | `stat`, `full` | deployment | `stat` checks size, modification time and inode of every listed file at startup (milliseconds). `full` also recomputes every content hash (about a minute per 100 GB) and catches a rewrite that restored the modification time. | 0.2 | experimental |
-| `ssd.mtime_update_interval_s` | float | `60` | `>= 0` | deployment | Minimum time between refreshes unless another page in the touched chain is due; then the whole chain is stamped tail to head. The times order eviction after a restart; shorter is more precise and writes more metadata. | 0.2 | experimental |
-| `ssd.store_timeout_s` | float | `30` | `>= 0`, `0` = never | deployment | A store job is reported failed when completion polling observes this deadline, including queue time, so the CPU pool is not held by a stuck disk. Safe because each page's checksum is taken from memory before the write starts. | 0.2 | experimental |
-| `ssd.drain_timeout_s` | float | `30` | `>= 0` | deployment | At shutdown, queued page writes keep running for up to this time; the rest are dropped. Must fit in the engine's shutdown time. | 0.2 | experimental |
-| `ssd.max_io_retries` | int | `2` | `>= 0` | deployment | Retries of a page read or write after a transient error (`EAGAIN`, `EINTR`, `EBUSY`, `ESTALE`, `ETIMEDOUT`, `EIO`), with interruptible backoff capped at one second and the remaining job budget. Checksum failures are not retried. | 0.2 | experimental |
-| `ssd.max_inflight_store_blocks` | int | `0` (auto) | `>= 0` | deployment | Admission counts physical queued and active pages even after timed-out jobs release CPU pins. New jobs are skipped when they would exceed this limit. A single job may exceed the limit when the tier is empty. Auto is a quarter of the CPU pool's blocks, at least 64. | 0.2 | experimental |
-| `ssd.write_delay_s` | float | `300` | `>= 0` | deployment | Wait before cascading CPU rows to disk. Only keys are queued; CPU rows remain evictable. At the deadline, write only rows still resident, ready and not demoted, resolving CPU slots again by key. `0` keeps immediate cascading. A longer delay can avoid superseded writes but leaves fewer rows durable before a crash. | 0.2 | experimental |
-| `ssd.write_warn_bytes_24h` | int | `1000000000000` (1 TB) | `>= 0`, `0` disables warnings | deployment | Warn at most hourly when the rolling 24-hour submitted page-byte estimate exceeds this threshold. Grouped pools sharing a root share the persisted count. This is a log-only warning: writes continue. It is not a physical SSD write or endurance counter. Applies to delayed writes. | 0.2 | experimental |
-| `ssd.state_latest_only` | bool | `false` | `true`, `false` | deployment | With delayed writes, discard a finished request's older recurrent-state keys from pending writes, keeping its newest state, shared junction and states other active requests resume from. CPU residency is unchanged. Leave disabled to retain the normal pending-state selection. | 0.2 | experimental |
+### Set the SSD write delay
 
-Delayed queues are serviced on engine steps and while the engine is idle, with an
-idle polling interval of up to one second. At shutdown, still-live pending rows are
-submitted newest first within the tier's existing bounded drain. Rows evicted or
-demoted before their deadline are skipped; no CPU slot is pinned during the delay.
-These options belong in the `revolta_fs` tier entry without the `ssd.` prefix, for
-example `"write_delay_s": 300`, `"write_warn_bytes_24h": 1000000000000` and
-`"state_latest_only": false`.
+`write_delay_s` (default 300 s) delays writing a page to disk. A page that is replaced during the delay never reaches the disk, which saves SSD bandwidth and wear. The cost: with `revolta_fs`, a page that is evicted from the CPU pool or demoted before its deadline is not written at all. (The Host KV SSD tier tries one write before it evicts an unwritten page; see [Host KV with an SSD](#add-an-ssd-to-host-kv).)
 
-When store timeouts are configured, the deadline covers the entire store job,
-including time in the queue. Completion polling reports overdue jobs as failed
-after any protected source snapshot finishes. Each page shares the job deadline.
-An active kernel I/O call still has to return before its worker can shut down.
-
-Set a positive `--shutdown-timeout` to allow draining. The engine subtracts
-5 seconds from this timeout and shares the remaining budget between finishing
-in-flight requests and draining SSD writes. The example pairs
-`--shutdown-timeout 30` with `drain_timeout_s: 20`, and SSD writes get at most
-the time left after requests finish. Give the container or service supervisor
-at least 120 seconds before force-stopping the engine. The default
-`--shutdown-timeout 0` skips the drain. See
-[#51](https://github.com/Leonccaa/ReVolta/issues/51) for shared-memory cleanup.
-
-Counters of a `revolta_fs` tier (pages written, existing, verified, checksum
-failures, pages skipped after a failure in the same chain, modification-time updates,
-retries, write jobs skipped because the disk was behind, timed-out writes)
-are logged when the engine shuts down. With delayed writes enabled, the manager
-also logs `Delayed writes (...)` and `SSD tier stats (...)` at most once every
-60 seconds when it services persistence. The latter reports cumulative
-`verified_load_pages` and `verified_load_bytes`: pages successfully read back from
-the SSD tier after CRC32C and identity verification, and their full page bytes.
-Grouped pools report their own tier counters; these are not unique prompt tokens.
-The external prefix-hit counters combine CPU and SSD hits, so they cannot provide
-an exact SSD share of prompt tokens. These SSD counters are log output, not a
-Prometheus endpoint or a prompt-token hit rate. The delayed queue's `written` and
-`written_bytes_24h` count submitted rows and page bytes, which may still fail or be
-skipped by the disk tier; they do not prove successful physical writes.
-
-## Setting the SSD write delay
-
-`write_delay_s` delays the write of a page to disk. It appears in two places,
-both with a default of 300 s: the `write_delay_s` key of a `revolta_fs` tier
-entry in `secondary_tiers`, and the `write_delay_s` option of the host SSD
-persistence under `host_kv.ssd`. A unified host deployment sets
-`host_kv.ssd.write_delay_s`; when legacy `secondary_tiers` entries are kept as
-well, the engine rejects a mismatch between the two at startup.
-
-The delay saves disk bandwidth: a page that is superseded shortly after it was
-written never reaches the disk. The cost is that a page evicted during the
-delay is not written. The host SSD persistence attempts a write-back before it
-evicts a page, so an evicted page usually reaches the disk; the attempt is
-skipped when the write queue is full, the disk budget has no headroom, or the
-page cannot be written. The `revolta_fs` tier path has no pre-eviction write at
-all: a page evicted or demoted before its deadline is dropped.
-
-Size the delay against the turnover of the pool that feeds the disk: the delay
-should stay well below the turnover time. Estimate the turnover from the pool
-capacity and the actual byte rate entering the pool, and the SSD throughput
-from the actual byte rate that still has to be written.
+Keep the delay well below the time the CPU pool takes to turn over:
 
 ```text
 turnover ≈ pool capacity ÷ new KV write rate
-new KV write rate ≈ KV bytes per token × actual prefill tokens per second
+new KV write rate ≈ KV bytes per token × prefill tokens per second
 ```
 
-The numbers below are estimates for Flash-Next with one KV dtype, not
-measurements of your deployment: about 13.8 KB per token and, with four-way
-prefill, about 40 MB/s. A 98 GiB pool then turns over in about 40 minutes, so
-300 s is safe there. A 7 GiB pool turns over in about 3 minutes, so 300 s
-would evict most pages before they reach the disk; use about 20 to 60 s there.
-The SSD must sustain a write rate above the average new KV write rate.
+A rough example, not a measurement of any deployment: at about 13.8 KB per token and about 40 MB/s of new KV with four-way prefill, a 98 GiB pool turns over in about 40 minutes, so 300 s is safe there. A 7 GiB pool turns over in about 3 minutes; 300 s would evict most pages before they are written, so use about 20–60 s there. The SSD must sustain more than the average new KV write rate.
 
-Check the result in the field. With Host SSD persistence, the store counters
-`host_ssd_evict_unwritten` and `host_ssd_evicted_persisted` appear in the
-`Store stats` log line and as Prometheus counters, for example
-`vllm:store_events_total{event="host_ssd_evict_unwritten"}`. A rising
-`host_ssd_evict_unwritten` means pages left the pool before they were written:
-the delay is too long for the pool size, or the write queue and the disk
-budget could not keep up. These two counters apply to Host SSD only. For a
-plain `revolta_fs` tier, read the `Delayed writes` log line instead:
-`dropped_evicted` counts pages dropped because they were evicted before their
-deadline, and `dropped_superseded` counts pages dropped because a newer
-version replaced them.
+Check the result in the `Delayed writes (revolta_fs)` log line: `dropped_evicted` counts pages dropped because they were evicted before their deadline, and `dropped_superseded` counts pages dropped because a newer version replaced them. A rising `dropped_evicted` means the delay is too long for the pool. The same drops appear as `vllm:store_events_total{event="delayed_revolta_fs_dropped_evicted"}` and `...dropped_superseded`. `written` and `written_bytes_24h` count submitted pages, which can still fail or be skipped; they are not proof of physical writes.
 
-## Active Host KV development configuration
+`write_warn_bytes_24h` (default 1 TB) logs a warning at most once an hour when the rolling 24-hour estimate of submitted page bytes exceeds it; writes continue. It is not an SSD wear counter. `state_latest_only` (default `false`) drops a finished request's older recurrent states from the pending writes, keeping its newest state, its shared junction and states other active requests resume from.
 
-`kernel_config.long_context_kv` is an experimental, opt-in configuration for
-QSA main K/V in host memory. Host placement requires the built-in
-`OffloadingConnector`; state and draft prefix transfers still use that connector.
-This development interface does not extend the project's supported deployment
-scope.
+At shutdown, pending pages that are still in the pool are submitted newest first, within the drain time.
 
-For a minimal RAM-only Host KV setup, replace the launch command's kernel and
-KV transfer settings with these flags. Size `host_store_gib` to the machine's
-available memory, including its shared-memory budget.
+### When the tier disables itself
+
+The tier then reads and writes nothing, logs `revolta_fs disabled: <reason>`, and the CPU tier works as before. Causes:
+
+- `content_manifest_path` is missing or unreadable, a listed file changed (size, modification time or inode; with `content_verify: "full"`, also its contents), or a file was added to a model directory.
+- The target or draft is not a local checkpoint covered by the manifest.
+- An unsupported loading setup: a load format other than `auto` or `safetensors`, extra loader options or secondary weights, LoRA, `--calculate-kv-scales`, a custom callable `hf_overrides`, or FP8 multimodal encoder attention without a scale file.
+- The Python package `google-crc32c` is not installed (the reason reads `No module named 'google_crc32c'`). Install it in the serving environment.
+- The directory's file system does not support user extended attributes.
+
+### When pages are not reused
+
+Pages are bound to a full identity: the manifest content, the KV format and page layout, the target and draft settings (including quantization, dtype and RoPE), block size, tensor and decode context parallel sizes, the attention backend, the index sharding (`qsa_dcp_index_shard`) and the release's compatibility epoch. Planar INT8, planar E4M3 and scalar E4M3 use separate namespaces. If any of these changes, existing files simply miss and the prefixes are computed again. Old files still count against `max_size_bytes` and are evicted oldest first.
+
+Each page carries a CRC32C of its contents bound to its prefix and the tier identity. A corrupted page, or an intact page that belongs to another prefix or layout, is deleted and computed again; it is never loaded. Pages are written to a temporary file, synced and then renamed.
+
+Prefixes served from the GPU or CPU also refresh their disk pages, with the start of a prefix kept most recent, so a shared system prompt is not the first page evicted.
+
+## Host KV (long context)
+
+In Host KV mode, the main K/V history of the QSA layers lives in a host memory store. The GPU keeps the compressed index, recurrent states, drafter windows and a pool of hot pages that the sparse attention reads. Long contexts and many concurrent long requests then fit even when their K/V does not fit in GPU memory. Prefix reuse works through the same host store, and an optional SSD tier keeps pages across restarts.
+
+**Status:** supported in 0.2.0 and off by default. The 0.2.0 acceptance covers Host KV with MTP (configuration E2). <!-- TODO(0.2.0-acceptance): Host KV functional and speed results, E2 -->
+
+### Requirements
+
+- A QSA model with linear attention (Qwen3.8 Flash-Next), tensor parallelism with decode context parallelism of 1 or 2. No pipeline or data parallelism.
+- MTP, DFlash2 or no speculative decoding.
+- `--kv-transfer-config` with the built-in `OffloadingConnector`: it moves recurrent states and drafter pages. Do not set `cpu_bytes_to_use` or `secondary_tiers` in this mode.
+- Main K/V in INT8 (the default), E4M3 or FP16.
+- CUDA graph mode for mixed batches must not be `FULL`. The reference `FULL_AND_PIECEWISE` works.
+- The decode batch must fit the host reader's 256 rows: `--max-num-seqs` times the verify width (draft tokens + 1), and the largest CUDA graph capture size. The reference values (8 sequences, MTP4) are well inside.
+- Host memory for `host_store_gib` in `/dev/shm`, in addition to the PLE table. In a container, make `--shm-size` larger than the store.
+
+At startup, the engine checks that every pool can hold one request of `--max-model-len`. If not, it refuses to start, names the pool that is short and the settings to change, and gives the largest `--max-model-len` that fits. A request that does not fit at run time waits (or is preempted under the usual rules); it is never rejected for lack of pool memory.
+
+### Configure Host KV
+
+Start from the reference launch and replace `--kernel-config` and `--kv-transfer-config`:
 
 ```bash
---kernel-config '{"long_context_kv":{"enabled":true,"main_kv_placement":"host","host_store_gib":48}}'
---kv-transfer-config '{"kv_connector":"OffloadingConnector","kv_role":"kv_both"}'
+--kernel-config '{"ple_disk_cascade": false,
+    "qsa_dcp_index_shard": true,
+    "long_context_kv": {"enabled": true, "host_store_gib": 48}}' \
+--kv-transfer-config '{"kv_connector": "OffloadingConnector", "kv_role": "kv_both"}' \
 ```
 
-For an SSD tier in this mode, set `host_kv.ssd` in
-`kv_connector_extra_config`, with `enabled: true`, `content_manifest_path`,
-`root_dir` and a positive `max_size_bytes`. The keys `cpu_bytes_to_use` and
-`secondary_tiers` belong to the GPU KV example above.
+- `host_store_gib` is the host store in GiB, summed over all workers. It holds the main K/V pages, recurrent states and drafter pages. Size it to the memory left after the PLE table (about 48 GiB for AWQ), other processes and the page cache. The example uses the same 48 GiB as the reference CPU pool, which fits the 128 GiB reference host; the [capacity table](#host-kv-capacity) shows 98 and 192 GiB stores.
+- `qsa_dcp_index_shard: true` is needed for MTP at DCP2 (the reference launch). It splits the compressed index over all tensor-parallel ranks and lets the MTP draft's main K/V move to the host store; see [MTP draft placement](#mtp-draft-placement). DFlash2 turns it on automatically under the ReVolta profile, and DCP1 does not need it. Do not set it for MTP with GPU KV: outside Host KV mode the model rejects index sharding with MTP.
+- `main_kv_placement` and `draft_main_placement` default to `"host"`; there is no need to set them.
 
-An MTP drafter (`speculative_config.method="mtp"`) shares the target's KV cache
-groups, block table and block hashes in this mode. Its main K/V, compressed
-index and raw-key ring stay in GPU history tensors, charged for every history
-ID, and a host row carries the draft's pages next to the target's index pages.
-CPU and SSD prefix hits therefore restore the draft together with the target
-and its recurrent state, through the same host rows, SSD files and shutdown
-path as without a drafter. As with any EAGLE-style drafter, a hit stops one
-block early: a prompt of L tokens reuses at most floor((L-1-S)/S)*S tokens for
-a block of S tokens. With `kernel_config.qsa_dcp_index_shard` and DCP2 the
-draft's main K/V and index are sharded like the target's (the raw-key ring
-stays replicated); index sharding with MTP is not supported outside this mode.
-`qsa_dcp_index_shard` splits each compressed indexer over every tensor-parallel
-rank (four ranks with TP4 and DCP2), not only over the DCP pair: rank `r` holds
-the groups `g` with `g % TP == r`, scores only those, and the ranks merge their
-candidates into the same selection an unsplit indexer would make. With TP4/DCP2
-this halves the GPU bytes of every history ID's index again, so the same budget
-holds about twice as many contexts. Cached pages written with a narrower split
-are not read back. `kernel_config.long_context_kv.draft_main_placement` chooses
-where a matching draft's main K/V lives (default `host`); the draft index
-and raw-key ring always stay in GPU history.
+### Add an SSD to Host KV
 
-- `"host"` (default): the draft's main K/V is one more layer of the host
-  store, reached through the hot pool like the target's. Each history ID then
-  costs about 0.71 MB (about 1.13 MB with `"gpu"`), so the same GPU budget
-  holds many more contexts at 1M tokens. Measured on four V100 GPUs with
-  sampling and a single request, a decode round takes about 0.2 ms (under 1%)
-  longer than with `"gpu"`. The setting is a different configuration of the
-  same build: with `"host"` the output is not guaranteed to be bitwise equal
-  to `"gpu"`, because the draft's proposals, and with them the shapes of the
-  verified batches, can differ.
-- `"gpu"`: the draft's main K/V is a GPU history tensor, charged for
-  every history ID (about 1.13 MB per ID per GPU with DCP2 and the index split
-  over two ranks). Draft forwards read only GPU memory, so decode is fastest.
+Add `host_kv.ssd` to `kv_connector_extra_config`. Create a [content manifest](#1-create-a-content-manifest) first; include the MTP draft as the `draft` role unless it is loaded from the target's directory.
 
-The default suits deployments with many long sessions or high concurrency at
-long context, where the number of history IDs limits throughput. Set `"gpu"`
-explicitly when single-request speed matters more than context concurrency,
-when pinned host memory is tight, or when output must stay bitwise comparable
-with releases that defaulted to `"gpu"`. `"host"` needs
-`main_kv_placement="host"` and matching target/draft storage formats and page
-geometry.
+```json
+{
+  "kv_connector": "OffloadingConnector",
+  "kv_role": "kv_both",
+  "kv_connector_extra_config": {
+    "host_kv.ssd": {
+      "enabled": true,
+      "root_dir": "/data/revolta/kv-cache-host",
+      "max_size_bytes": 375809638400,
+      "content_manifest_path": "/data/revolta/manifests/target-512k.json"
+    }
+  }
+}
+```
 
-**MTP at DCP2.** `qsa_dcp_index_shard` is unset by default and only the DFlash2
-hybrid serving profile turns it on, so a Host MTP run at DCP2 keeps the
-replicated index by default. The draft then does not have the target's sharded
-geometry, does not become a layer of the host row, and stays in GPU history;
-the engine logs a warning that the draft stays on the GPU. Every history ID
-then costs the `"gpu"` amount of GPU bytes (about 1.13 MB) instead of about
-0.71 MB, so the same GPU budget holds fewer long contexts than the host
-recipe. To place the draft on the host, set `"qsa_dcp_index_shard": true` at
-the top level of `--kernel-config` and keep the defaults
-`main_kv_placement="host"` and `draft_main_placement="host"`. The target and
-the draft must then use the same storage format (the MTP draft inherits the
-target's KV format unless `speculative_config.kv_cache_dtype` overrides it)
-and the same page geometry. DCP1 needs no extra setting. Do not copy that
-flag into a GPU MTP run: outside the long-context mode the model rejects
-index sharding with MTP, and inside it, with `main_kv_placement="gpu"`, the
-flag still leaves the draft on the GPU. A draft with a different format or
-geometry stays on the GPU and logs a warning. Changing the value changes the
-host row layout, so an SSD tier written with the other value is not read back.
+The example sets a 350 GiB disk budget. The directory, file system and identity rules are those of the [disk tier](#disk-tier-revolta_fs-experimental). Unknown keys inside `host_kv.ssd` are rejected at startup; all keys are listed in the [settings reference](#host_kvssd-keys).
 
-`speculative_config.gdn_state_replay=true` replays the accepted target GDN
-inputs for MTP, so recurrent layers keep two state blocks per request instead
-of one per draft position; `gdn_state_replay_graph` (default true) captures
-that replay for FULL verify shapes. For Host SSD, include the external MTP
-checkpoint as the `draft` role in the content manifest. Omit that role only
-when the target and draft share a checkpoint root.
+- **Writes.** A published host page is queued for a delayed write (`write_delay_s`, default 300 s; see [Set the SSD write delay](#set-the-ssd-write-delay)). Writes are rate-limited to `write_bytes_per_second` (default 64 MiB/s). Before the store evicts a page that is not yet on disk, it tries one immediate write; it skips that write when the write queue is full, the disk budget has no room, or the page cannot be written. Watch `host_ssd_evict_unwritten` and `host_ssd_evicted_persisted` in the `Store stats` log line, or `vllm:store_events_total{event="host_ssd_evict_unwritten"}`: a rising `host_ssd_evict_unwritten` means pages leave the store before they reach the disk.
+- **Reads.** Pages needed for a prefix hit are read back from disk and verified before use; reads are bounded per request and in total (`prefetch_max_per_request`, `prefetch_max_inflight`, `prefetch_timeout_s`). A failed or corrupt read counts as a miss and the prefix is computed again.
+- **Shutdown.** With a positive `--shutdown-timeout`, in-flight requests get that time minus 5 s, and what is left is used for a final flush of unwritten pages, newest first, for at most `shutdown_flush_timeout_s` (default 10 s). Pages not written are misses on the next start. With the default `--shutdown-timeout 0` the final flush is skipped. The log reports `Host KV SSD final flush: candidates=... completed=... failed=... dropped_unsubmitted=...`.
 
-`hot_pool_gib` and `hot_pool_ratio` are mutually exclusive ways to set a
-**guaranteed minimum number of hot slots**. GiB sizing converts the total
-per-worker budget, including payload, metadata and shared scratch, into whole
-slots. Ratio sizing retains the conversion from a fraction of the host pool's
-rank-local tokens. Neither setting imposes an upper limit on the actual pool.
-The static pool (see the shared hot region below) may be raised to fit the
-minimum active working set. A requested minimum that cannot coexist with that
-working set causes a startup configuration error; it is never silently reduced.
+### MTP draft placement
 
-With neither setting supplied, or with `hot_pool_gib="auto"`, the hot pool uses
-the KV budget remaining after state, demand-sized history and prefill staging.
-Auto guarantees the configured verify working set, capped by each request's
-maximum local history. **Omitting both settings now selects auto, replacing the
-older implicit ratio sizing.** The host pool must still be sized explicitly.
+In Host KV mode the MTP draft shares the target's KV cache groups, block table and block hashes. CPU and SSD prefix hits restore the draft together with the target and its recurrent state.
 
-The host reader reserves a fixed `R_cap=256` rows of indices scratch. Startup
-checks the resolved decode capture sizes and `max_num_seqs` times the verify
-width against that limit. Uniform decode uses one pass; mixed batches require
-`mixed_mode != FULL`.
+`draft_main_placement` chooses where the draft's main K/V lives; the draft's index stays on the GPU in both cases.
 
-**Shared hot region.** When every QSA layer's padded index page holds a whole
-number of hot slots, the hot slots alias the index pages of free history IDs
-that carry no cached prefix. The KV budget then goes to history IDs; the hot
-region grows and shrinks with them, above a floor that keeps the admitted
-requests' verify working sets (and any manual minimum) resident. Growth first
-evicts cached prefix indexes beyond their share, then shrinks the hot region to
-the floor, and only then preempts. Every worker uses one common plan, so pass
-plans match across ranks. `VLLM_SM70_HOST_KV_STATIC_HOT_POOL=1` restores the
-separate static pool.
+- `"host"` (default): the draft's main K/V is one more layer of the host store, read through the hot pages like the target's. Each history block takes fewer GPU bytes, so the same GPU budget holds more long contexts. Cost (0.2.0rc11, four V100, sampling, one request): about 0.2 ms longer per decode round.
+- `"gpu"`: the draft's main K/V stays in GPU memory. Draft forwards read only GPU memory, so single-request decoding is fastest, but fewer long contexts fit.
 
-## KV capacity in long-context Host KV mode
+`"host"` takes effect only with `main_kv_placement: "host"`, a target and draft with the same KV format and page geometry, and, at DCP2, `qsa_dcp_index_shard: true`. Otherwise the draft stays on the GPU, the engine logs a warning, and the GPU holds fewer long contexts (compare the "draft K/V on GPU" and "draft K/V on host" rows in the [capacity table](#host-kv-capacity)). The two placements are different configurations of the same build; their outputs are not guaranteed to be bitwise equal, because the draft's proposals and the shapes of the verified batches can differ. Changing `qsa_dcp_index_shard` changes the host page layout: an SSD tier written with the other value is not read back.
 
-These RC15 sizing examples use Qwen3.8 Flash-Next AWQ, four 32 GiB V100s,
-TP4/DCP2, TP-wide compressed-index sharding, `max_num_seqs=8` and
-`--gpu-memory-utilization 0.956`. Startup measurements use PCIe V100s.
-DFlash2 planner rows reuse its measured per-GPU budget. MTP4 rows use an
-estimated budget. Apply the planner rows to SXM2 with the same cache
-geometry and per-GPU budget.
+With MTP, in any KV mode, a prefix hit stops one block early, as with any EAGLE-style drafter: a prompt of L tokens reuses at most floor((L − 1 − S) / S) × S tokens, for a block of S tokens.
 
-The host row uses **13,248 bytes per logical token for DFlash2 with planar
-INT8**. The same row uses 13,056 bytes with calibrated E4M3. A local token in
-one QSA layer stores 512 bytes of INT8 K/V payload and two 4-byte FP32 scales.
-Summed over the DCP shards and 12 target layers, the scale planes add 192
-bytes per logical token. The row also includes the compressed target index.
-DFlash2 keeps its sliding-window FP16 draft KV on the GPU. With MTP4 the
-host row also carries the draft layer's K/V and compressed index. It uses
-**14,352 bytes per logical token with planar INT8** (14,144 with calibrated
-E4M3) for either draft placement. The additional 208 bytes cover both FP32
-scale planes across all 13 QSA layers. [RC11 E4M3 table](https://github.com/Leonccaa/ReVolta/releases/tag/v0.2.0rc11#kv-capacity-in-long-context-host-kv-mode)
+### Hot pages
 
-| Configuration | Context per request | Host pool | Full-context requests (planner bound) | Usable Host KV tokens | SSD payload estimate (350 GiB) | GPU-indexable history tokens | Capacity basis |
+The hot-page pool is GPU memory that holds the host pages the sparse attention needs for the current step. By default it is sized automatically from the GPU KV budget left after the recurrent states, the history index and prefill staging, and it guarantees each admitted request's verify working set. When every QSA layer's index page holds a whole number of hot slots, the hot pages share GPU memory with the index pages of unused history blocks: the region grows and shrinks with demand, above a floor that keeps the admitted requests' working sets resident.
+
+`hot_pool_gib` (per GPU) or `hot_pool_ratio` (a fraction of the host pool's tokens on each rank) set a guaranteed minimum instead; set at most one. Neither is an upper limit. A minimum that cannot coexist with the active working set is a startup error; it is never reduced silently. [`VLLM_SM70_HOST_KV_STATIC_HOT_POOL=1`](configuration.md#environment-variable-reference) restores a separate static hot pool.
+
+### Checkpoint retention
+
+A recurrent-state checkpoint lets a later request resume from the end of an earlier turn. With `latest_only` (default `true`), the host store keeps, for each conversation chain it has seen, the latest checkpoint, the point an identical resend would resume from, and branch points. Older checkpoints are released. A later request that needs an older state recomputes from the nearest remaining checkpoint, which can span much of the prompt. Main K/V pages and their SSD files are not deleted by this policy. Set `latest_only: false` to keep every checkpoint, at the cost of host memory.
+
+- `enable_junction_evidence` (default `true`): keep a branch point only when a different continuation of the same prefix has been seen. Confirmed branch points survive eviction of their children and a clean restart. `false` restores the earlier latest-only policy. It has no effect with `latest_only: false` and does not change the SSD namespace or the compile cache.
+- `superseded_keep_ssd` (default `false`): write superseded checkpoints to the SSD before releasing their host memory. It requires an enabled `host_kv.ssd`.
+
+The `Store stats` log line reports the policy state as `unified_branch_points`, `unified_chain_latest_units`, `unified_resend_points`, `unified_superseded_pending`, `unified_superseded_revoked` and `unified_superseded_freed_bytes`.
+
+### Host KV capacity
+
+These sizing examples are from 0.2.0rc15: Qwen3.8 Flash-Next AWQ, four 32 GB V100s, TP4 + DCP2, the compressed index split over all TP ranks, `max_num_seqs=8`, `--gpu-memory-utilization 0.956` and planar INT8 KV. "Startup" rows were measured at engine start on PCIe V100s; "Planner" rows are the engine planner's arithmetic with that measured per-GPU budget (DFlash2) or an estimated one (MTP4). <!-- TODO(0.2.0-acceptance): Host KV startup capacity (host pool tokens, GPU history), E2 -->
+
+A host page row takes 13,248 bytes per token for DFlash2 and 14,352 bytes per token for MTP4 (which also stores the draft layer's K/V and index), with planar INT8 (0.2.0rc15). Divide the host store by these sizes for a first estimate of the tokens it holds. DFlash2 keeps its FP16 sliding-window drafter KV on the GPU.
+
+| Configuration | Context per request | Host store | Full-context requests (limit) | Usable Host KV tokens | SSD payload estimate (350 GiB) | GPU-indexable history tokens | Basis |
 | --- | ---: | ---: | --- | ---: | ---: | ---: | --- |
 | DFlash2 | 524,288 | 98 GiB | 8 (GPU state, max sequences) | 7,940,608 | 28,366,208 | 26,625,664 | Startup |
 | DFlash2 | 524,288 | 192 GiB | 8 (GPU state, max sequences) | 15,558,400 | 28,366,208 | 26,625,664 | Planner |
@@ -511,80 +326,153 @@ scale planes across all 13 QSA layers. [RC11 E4M3 table](https://github.com/Leon
 | MTP4, draft K/V on host | 1,048,576 | 98 GiB | 6 (host pool) | 7,329,312 | 26,183,808 | 25.6 M | Planner |
 | MTP4, draft K/V on host | 1,048,576 | 192 GiB | 8 (GPU state, max sequences) | 14,361,600 | 26,183,808 | 25.6 M | Planner |
 
-The DFlash2 startup allocated a 98 GiB host pool of 4,773 pages with 1,664
-tokens per page. One reserved page leaves 7,940,608 usable tokens. Its
-per-GPU planner budget was 6.34 GiB after weights, activations and CUDA
-graphs. For MTP4 the engine planner uses a 1,632-token history block and
-about 6.05 GiB per GPU. The estimate starts with the DFlash2 Host KV
-planner's 6.34 GiB budget and subtracts the 0.29 GiB difference between the
-GPU KV startup profiles at 0.956 (6.35 GiB for DFlash2 and 6.06 GiB for MTP4).
-Use the budget in your startup log when sizing your deployment.
+How to read the table:
 
-The engine's `plan_long_context_capacity` takes the minimum of GPU state,
-GPU history, Host KV, GPU hot-page and configured request limits. Each bound
-assumes all requests are at the listed context length. Startup measures page
-allocation. Full-context concurrency and SSD payload are arithmetic estimates.
-The SSD column rounds the byte budget down to whole pages before file
-overhead. GPU-indexable history is an address limit for shared history IDs.
+- The full-context limit is the smallest of the GPU state, GPU history, host store, hot-page and `max_num_seqs` limits, assuming every request is at the listed length.
+- The DFlash2 startup row allocated a 98 GiB store of 4,773 pages of 1,664 tokens; one reserved page leaves 7,940,608 usable tokens. Its per-GPU budget after weights, activations and CUDA graphs was 6.34 GiB. The MTP4 rows assume about 6.05 GiB per GPU (the DFlash2 budget minus the 0.29 GiB difference between the two methods' GPU KV startup profiles).
+- The SSD column rounds the 350 GiB budget down to whole pages, before file overhead. GPU-indexable history is the address limit of history blocks shared by all requests.
+- Use the budget in your own startup log when sizing a deployment.
 
-**GPU KV mode:** use the engine log's `GPU KV cache size` in tokens at the
-configured `max_model_len`. The Host KV table uses the allocated host pages
-and the corresponding GPU history and hot pools.
+### Check that Host KV works
 
-## GDN state replay
+- At startup, each worker logs `long-context KV worker=N long-context KV plan (main K/V in the host pool): GPU KV budget ...`. The line gives the GPU budget split (state, hot pool, staging, history), the host pool in blocks, tokens and GiB, and the request limits per pool at `--max-model-len`.
+- With MTP at DCP2 without `qsa_dcp_index_shard`, a warning says the draft stays on the GPU.
+- With `host_kv.ssd`, the disk tier logs `revolta_fs enabled at ...` or `revolta_fs disabled: <reason>`.
+- While serving, the `Store stats: counters=... gauges=...` line (at most once a minute; `--no-enable-store-metrics` turns it off) and the Prometheus series `vllm:store_events_total{event=...}` and `vllm:store_state{...}` report host store and SSD activity. `host_ssd_verified_load_pages` and `host_ssd_verified_load_bytes` count pages read back from disk after verification.
+- At shutdown: `Host KV SSD final flush: ...` and `Host KV SSD stats: ...`.
 
-During speculative decoding, DFlash2 and MTP can maintain GDN recurrent state by replaying the accepted tokens after sampling instead of saving a state for every draft position. Each running request then needs a fixed two state blocks per GDN cache group, regardless of draft length. The startup log confirms this with `recurrent layers keep 2 state blocks per running request`.
+`cpu.enable_dependency_eviction` and `cpu.residency_stats` have no effect in this mode; the scheduler logs a warning and ignores them.
 
-Keep replay enabled, especially for long contexts and concurrent requests: the saved GPU memory leaves more room for KV history. MTP and DFlash2 enable replay by default on their supported ordinary routes.
+## Settings reference
 
-In a four-GPU TP4/DCP2 measurement with MTP4 and sampling, replay added about **0.6 ms per decode round (2%)** at one concurrent request. With eight concurrent long-context requests, disabling replay used about **0.87 GiB more GPU memory per GPU**. These measurements describe that configuration, not a general overhead guarantee.
+All keys below are per deployment and read at startup. Top-level keys of `kv_connector_extra_config` are not checked for spelling: a misspelled key is ignored. Unknown keys inside a disk tier entry or `host_kv.ssd` fail startup.
 
-Replay and per-draft state storage use different computation paths. Outputs are not guaranteed to be bitwise identical with replay enabled and disabled; near-tied token scores can lead to different continuations.
+### Connector and CPU pool keys
 
-Set these fields in `--speculative-config` for the supported SM70 route with Model Runner V2, `--mamba-cache-mode align`, synchronous scheduling and no pipeline parallelism:
+Keys of `kv_connector_extra_config`:
 
-- **MTP:** `"gdn_state_replay"` defaults to `null` (`None` in Python), selecting replay on the supported route. Set it to `false` to disable replay, or `true` to request it explicitly. `gdn_state_replay_graph` also defaults to `null`, resolving to `true` for MTP; set it to `true` explicitly to retain CUDA graph replay for FULL verify shapes. Mixed steps replay eagerly.
-- **DFlash2:** set `"sm70_dflash2": {"spec_state_replay": true}`. The omitted replay field defaults to `null`, selecting replay on the ordinary supported route while yielding to an enabled packed verifier. Its `spec_state_replay_graph` defaults to `true`; a non-null top-level `gdn_state_replay_graph` overrides that graph setting. See [DFlash2 state replay](dflash2.md#state-replay-optional) for route details.
+| Key | Type | Default | Values | Effect and trade-off | Since | Status |
+| --- | --- | --- | --- | --- | --- | --- |
+| `spec_name` | string | `CPUOffloadingSpec` | `TieringOffloadingSpec`, `CPUOffloadingSpec` | Offloading implementation. `TieringOffloadingSpec` is required for a disk tier and is what the reference launch uses. | vLLM | stable |
+| `cpu_bytes_to_use` | int, bytes | none | > 0 | CPU pool size, summed over all workers. Required with GPU KV; rejected together with `host_store_gib`. | vLLM | stable |
+| `eviction_policy` | string | `lru` | `lru`, `arc` | Eviction order of the CPU pool. Host KV requires `lru`. | vLLM | stable |
+| `secondary_tiers` | list | `[]` | tier entries | Tiers below the CPU pool; see [Disk tier entry](#disk-tier-entry). Not used with Host KV. | vLLM; `revolta_fs` 0.2.0 | experimental |
+| `offload_prompt_only` | bool | `true` | | Offload only prompt blocks, not blocks generated while decoding. Suits reasoning models whose thinking is dropped before the next turn. | vLLM | stable |
+| `demote_superseded_states` | bool | `true` | | See [Superseded recurrent states](#superseded-recurrent-states). | 0.1.0 | stable |
+| `superseded_state_rule` | string | `request` | `request`, `request_fixed`, `extend` | Which states count as superseded. Other values are rejected at startup. | 0.2.0 | experimental |
+| `mamba_state_slots_reference_tokens` | int | `--max-model-len` | > 0 | Request length used to size the recurrent-state slots of a grouped pool (MTP4). Smaller gives more state slots and fewer token slots, which helps many short sessions. The reference uses 65536. | 0.1.0 | stable |
+| `cpu.draft_offload` | string | `all` | `all`, `window`, `none` | Which DFlash2 drafter blocks the CPU pool stores; see [DFlash2 drafter blocks](#dflash2-drafter-blocks). Other values are rejected at startup. | 0.2.0 | experimental |
+| `cpu.enable_dependency_eviction` | bool | `false` | | After a capacity eviction, also free CPU blocks that can no longer serve a hit. See below. | 0.2.0 | experimental |
+| `cpu.residency_stats` | bool | `false` | | Publish the `vllm:kv_offload_cpu_resident_blocks` gauge. | 0.2.0 | experimental |
+| `cpu.offload_counters` | bool | `false` | | Publish three diagnostic counters; see [Diagnostic counters](#diagnostic-counters). Read-only: nothing depends on them. | 0.2.0 | experimental |
+| `host_kv.ssd` | object | disabled | | SSD for Host KV; see [`host_kv.ssd` keys](#host_kvssd-keys). | 0.2.0 | experimental |
+
+The `cpu.*` booleans must be JSON booleans; other types are rejected at startup. Upstream keys not used by the reference configuration (`block_size`, `store_threshold`, `max_tracker_size`) keep their vLLM meaning; `TieringOffloadingSpec` and Host KV reject `store_threshold` of 2 or more.
+
+**`cpu.enable_dependency_eviction`.** After a capacity eviction, it frees CPU blocks that provably cannot serve a hit any more: target pages with no reachable recurrent state, and drafter pages outside every usable state's window. Admission and the order of the remaining blocks are unchanged; freed slots return to their own group's pool. It works only with a CPU-only LRU pool and a supported cache layout; elsewhere nothing is freed and residency reports `unknown`. With any secondary tier, including a disk tier, it is disabled, because a page missing from the CPU pool may still be on disk. It keeps anything it cannot prove unusable: blocks in transfer, blocks known to active requests, and junction dependencies. Freed blocks are counted as `vllm:kv_offload_cpu_evicted_blocks_total{reason="dependency"}`. It does not promise a particular capacity gain.
+
+### Disk tier entry
+
+Keys of a `secondary_tiers` entry with `"type": "revolta_fs"`. An unknown key fails startup.
+
+| Key | Type | Default | Values | Effect and trade-off | Since | Status |
+| --- | --- | --- | --- | --- | --- | --- |
+| `type` | string | required | `revolta_fs` | `fs` is the upstream tier without verification; it rejects planar INT8 and per-token-head E4M3. | 0.2.0 | experimental |
+| `root_dir` | string | required | path | Dedicated directory for one engine, on a file system with user extended attributes. | vLLM | experimental |
+| `max_size_bytes` | int | required | > 0 | Total page budget under `root_dir`. | vLLM | experimental |
+| `min_free_bytes` | int | 5% of the file system | ≥ 0; 0 disables | Free space kept on the file system. | vLLM | experimental |
+| `max_files` | int | 1,000,000 | > 0 | Page count limit; bounds the in-memory index. | vLLM | experimental |
+| `n_read_threads`, `n_write_threads` | int | 16, 16 | > 0 | I/O threads. The 0.1.4 readback measurement on a local NVMe SSD used one each. | vLLM | experimental |
+| `content_manifest_path` | string | none | path | Content manifest of the loaded checkpoint. Without it the tier is disabled. | 0.2.0 | experimental |
+| `content_verify` | string | `stat` | `stat`, `full` | `stat` checks size, modification time and inode of every listed file at startup (milliseconds). `full` also rehashes every file (about a minute per 100 GB) and catches a rewrite that restored the modification time. | 0.2.0 | experimental |
+| `mtime_update_interval_s` | float | `60` | ≥ 0; 0 = every use | Minimum time between modification-time refreshes of a used page; a due page refreshes its whole chain. The times order eviction after a restart: shorter is more precise and writes more metadata. | 0.2.0 | experimental |
+| `store_timeout_s` | float | `30` | ≥ 0; 0 = never | A store job, including its time in the queue, is reported failed after this time, so a stuck disk does not hold the CPU pool. | 0.2.0 | experimental |
+| `drain_timeout_s` | float | `30` | ≥ 0 | At shutdown, pending writes run for up to this time; the rest are dropped. Must fit in `--shutdown-timeout`. | 0.2.0 | experimental |
+| `max_io_retries` | int | `2` | ≥ 0 | Retries of a page read or write after a transient error (`EAGAIN`, `EINTR`, `EBUSY`, `ESTALE`, `ETIMEDOUT`, `EIO`). Checksum failures are not retried. | 0.2.0 | experimental |
+| `max_inflight_store_blocks` | int | `0` (auto) | ≥ 0 | Pages queued or being written above which new store jobs are skipped, so a slow disk does not hold the CPU pool. Auto is a quarter of the CPU pool's blocks, at least 64. | 0.2.0 | experimental |
+| `write_delay_s` | float | `300` | ≥ 0; 0 = write at once | See [Set the SSD write delay](#set-the-ssd-write-delay). | 0.2.0 | experimental |
+| `write_warn_bytes_24h` | int | `1000000000000` | ≥ 0; 0 = no warning | Log-only warning threshold for submitted page bytes in 24 hours. | 0.2.0 | experimental |
+| `state_latest_only` | bool | `false` | | With delayed writes, write only a finished request's newest recurrent state (plus its junction and states other requests resume from). | 0.2.0 | experimental |
+
+### `host_kv.ssd` keys
+
+Keys of the `host_kv.ssd` object in `kv_connector_extra_config` (Host KV only). Unknown keys fail startup.
+
+| Key | Type | Default | Values | Effect and trade-off | Since | Status |
+| --- | --- | --- | --- | --- | --- | --- |
+| `enabled` | bool | `false` | | Turns the SSD on. Without it, nothing is created on disk. | 0.2.0 | experimental |
+| `root_dir` | string | required | path | As for the disk tier. | 0.2.0 | experimental |
+| `max_size_bytes` | int | required | > 0 | As for the disk tier. | 0.2.0 | experimental |
+| `min_free_bytes` | int | 5% of the file system | ≥ 0; 0 disables | As for the disk tier. | 0.2.0 | experimental |
+| `max_files` | int | 1,000,000 | > 0 | As for the disk tier. | 0.2.0 | experimental |
+| `content_manifest_path` | string | none | path | As for the disk tier; without it, SSD reuse is disabled. | 0.2.0 | experimental |
+| `content_verify` | string | `stat` | `stat`, `full` | As for the disk tier. | 0.2.0 | experimental |
+| `write_delay_s` | float | `300` | ≥ 0 | Delay before a published page is written. | 0.2.0 | experimental |
+| `write_bytes_per_second` | int | `67108864` (64 MiB/s) | > 0 | Rate limit for page writes, shared by the write threads. | 0.2.0 | experimental |
+| `write_threads` | int | `4` | > 0 | Concurrent page writes. | 0.2.0 | experimental |
+| `max_pending_blocks` | int | `64` | > 0 | Write jobs queued or running at once. | 0.2.0 | experimental |
+| `write_warn_bytes_24h` | int | `1000000000000` | ≥ 0 | As for the disk tier. | 0.2.0 | experimental |
+| `prefetch_max_inflight` | int | `16` | > 0 | Page reads from disk in flight, in total. | 0.2.0 | experimental |
+| `prefetch_max_per_request` | int | `8` | > 0 | Page reads from disk in flight per request. | 0.2.0 | experimental |
+| `prefetch_timeout_s` | float | `5` | ≥ 0 | Time budget per read window; a restore that needs several windows gets that many times this value. | 0.2.0 | experimental |
+| `shutdown_flush_timeout_s` | float | `10` | ≥ 0 | Upper limit of the final flush at shutdown, within `--shutdown-timeout` minus 5 s. | 0.2.0 | experimental |
+| `shutdown_io_grace_s` | float | `2` | ≥ 0 | Time for writes already started to finish at the end of the final flush. | 0.2.0 | experimental |
+| `drain_timeout_s` | float | `30` | ≥ 0 | Accepted but has no effect in 0.2.0; the final flush uses `shutdown_flush_timeout_s`. | 0.2.0 | experimental |
+
+### Host KV keys
+
+Keys of `long_context_kv` in `--kernel-config` (all inert while `enabled` is `false`), plus related settings:
+
+| Key | Type | Default | Values | Effect and trade-off | Since | Status |
+| --- | --- | --- | --- | --- | --- | --- |
+| `enabled` | bool | `false` | | Turns Host KV mode on. | 0.2.0 | stable |
+| `host_store_gib` | float | none | > 0 | Host store in GiB, summed over workers: main K/V, recurrent states and drafter pages. Set exactly one of `host_store_gib`, `host_pool_gib` and `host_pool_tokens`. | 0.2.0 | stable |
+| `host_pool_gib`, `host_pool_tokens` | float, int | none | > 0 | Older sizing of the main K/V pool only; with `cpu_bytes_to_use` the two are added into one store. Use `host_store_gib` instead. | 0.2.0 | experimental |
+| `main_kv_placement` | string | `host` | `host`, `gpu` | `gpu` keeps the main K/V on the GPU; the host and hot pools then only budget admission. A comparison setting. | 0.2.0 | experimental |
+| `draft_main_placement` | string | `host` | `host`, `gpu` | See [MTP draft placement](#mtp-draft-placement). | 0.2.0 | experimental |
+| `hot_pool_gib` | float or `"auto"` | unset (auto) | > 0 | Guaranteed minimum of hot slots, from a per-GPU GiB budget. | 0.2.0 | experimental |
+| `hot_pool_ratio` | float | unset | (0, 1] | Guaranteed minimum of hot slots as a fraction of the host pool's tokens per rank. Not together with `hot_pool_gib`. | 0.2.0 | experimental |
+| `prefill_staging_gib` | float | `0` | ≥ 0 | GPU memory per GPU reserved for staging history during appended prefill. | 0.2.0 | experimental |
+| `state_blocks` | int | unset | > 0 | GPU state blocks (recurrent states, drafter windows, checkpoints). Unset reserves the worst case for `--max-num-seqs` requests. | 0.2.0 | experimental |
+| `latest_only` | bool | `true` | | See [Checkpoint retention](#checkpoint-retention). | 0.2.0 | experimental |
+| `enable_junction_evidence` | bool | `true` | | See [Checkpoint retention](#checkpoint-retention). | 0.2.0 | experimental |
+| `superseded_keep_ssd` | bool | `false` | | See [Checkpoint retention](#checkpoint-retention). | 0.2.0 | experimental |
+| `prewarm_hot_pool`, `staged_writethrough`, `value_arbitration` | bool | `true` | | Tuning switches; keep the defaults. | 0.2.0 | experimental |
+| `prefill_gather`, `prefill_insert_age`, `value_arbiter_settings` | string, string, object | `union`, `old`, `{}` | | Tuning settings for measurements; keep the defaults. | 0.2.0 | experimental |
+| `kernel_config.qsa_dcp_index_shard` | bool | unset | `true`, `false` | Split the compressed index over all TP ranks. Unset turns it on only for DFlash2 under the ReVolta profile. Needed for MTP draft placement on the host at DCP2. | 0.2.0 | stable |
+| `speculative_config.gdn_state_replay` | bool | unset (on) | `true`, `false` | MTP recurrent-state replay; see [Recurrent-state replay](#recurrent-state-replay). | 0.2.0 | stable |
+| `speculative_config.gdn_state_replay_graph` | bool | unset (on for MTP) | `true`, `false` | Run the replay as a CUDA graph for full verify shapes. | 0.2.0 | stable |
+
+## Metrics and log lines
+
+| Name | Kind | Enabled by | Meaning |
+| --- | --- | --- | --- |
+| `vllm:external_prefix_cache_queries_total`, `vllm:external_prefix_cache_hits_total` | Prometheus counters | any connector | Prompt tokens looked up in, and served from, the offload tiers (CPU and disk together). |
+| `vllm:kv_offload_total_bytes_total{transfer_type}`, `vllm:kv_offload_total_time_total{transfer_type}`, `vllm:kv_offload_size` | Prometheus | CPU offload | Bytes, time and transfer sizes for `GPU_to_CPU` and `CPU_to_GPU`. |
+| `vllm:kv_offload_cpu_evicted_blocks_total{reason}` | Prometheus counter | CPU offload | CPU blocks evicted: `capacity`, `superseded` (after demotion), `reset`, `dependency`. |
+| `vllm:kv_offload_cpu_draft_blocks_skipped_total` | Prometheus counter | `cpu.draft_offload` | DFlash2 drafter blocks not stored because of the setting. The series appears with the first skip. |
+| `vllm:kv_offload_cpu_resident_blocks{kind,status}` | Prometheus gauge | `cpu.residency_stats` or `cpu.enable_dependency_eviction` | Occupied CPU slots by kind and usability, sampled at most once a minute. |
+| `vllm:kv_offload_cpu_stored_blocks_total{kind}`, `vllm:kv_offload_lookup_shrink_tokens_total{cause}`, `vllm:kv_offload_hit_draft_window_needed_total{needed}` | Prometheus counters | `cpu.offload_counters` | See [Diagnostic counters](#diagnostic-counters). |
+| `vllm:store_events_total{event}`, `vllm:store_state` | Prometheus | store metrics (on by default; `--no-enable-store-metrics` turns them off) | Scheduler store counters and gauges. With Host KV, host store and SSD events such as `host_ssd_evict_unwritten`; with a disk tier, `delayed_revolta_fs_dropped_evicted` and `delayed_revolta_fs_dropped_superseded`. |
+| `Offload counters: demoted_states=... cpu_stored_blocks=... cpu_evicted_blocks=... rejected_boundary_offers=... rule=... cpu_draft_blocks_skipped=... cpu.draft_offload=...` | log, at most once a minute | CPU offload | Cumulative totals. `rejected_boundary_offers` counts recurrent states the pool could not take because all its state slots were in transfer; they are computed again on a later hit. The diagnostic and residency counters are appended when enabled. |
+| `Delayed writes (revolta_fs)`, `SSD tier stats (revolta_fs)` | log, at most once a minute | disk tier with delayed writes | See [Set the SSD write delay](#set-the-ssd-write-delay) and [Check that it works](#4-check-that-it-works). |
+| `long-context KV worker=N ...` | log, startup | Host KV | The Host KV capacity plan. |
+| `Store stats: counters=... gauges=...` | log, at most once a minute | store metrics (on by default) | The same counters and gauges as `vllm:store_events_total` and `vllm:store_state`. |
+
+### Diagnostic counters
+
+These three counters are enabled by `cpu.offload_counters`. They are read-only bookkeeping, appear as cumulative totals per label in the `Offload counters` line, and each Prometheus series appears with its first increment.
+
+- `vllm:kv_offload_cpu_stored_blocks_total{kind}` counts blocks whose store to the CPU pool completed on all workers, by KV cache group. `kind="draft"`: a group recognised as a speculative drafter's sliding window (the same test as `cpu.draft_offload`). `kind="state"`: recurrent-state groups; each state is one block. `kind="target"`: every other group, including an MTP layer with full attention. The startup line `Offload counter kinds by KV cache group: ...` shows the classification. Keys already resident are not stored again and are not counted. This counts completed jobs, while `cpu_stored_blocks` in the log line counts reservations; the two can differ because of in-flight or failed stores, resets and disk-to-CPU staging.
+- `vllm:kv_offload_lookup_shrink_tokens_total{cause}` counts tokens by which the sliding-window and recurrent-state groups lowered a CPU lookup below what the full-attention groups alone would allow. `recurrent_state`: no state stored at that point, so the hit moves back to the previous stored state. `draft_window`: the drafter's window before the hit is incomplete. `sliding_window`: another sliding window. `page_align`: rounding to the recurrent-state page grid, including the one-page shift of EAGLE-style drafters. A lookup counts once, when the request is admitted.
+- `vllm:kv_offload_hit_draft_window_needed_total{needed}` counts admitted requests with a CPU hit on a model with a drafter group. `needed="true"` when fewer tokens than the draft window remain to be prefilled after the hit, so the drafter's first decode step reads loaded drafter blocks. It compares lengths only.
+
+The residency gauge `vllm:kv_offload_cpu_resident_blocks{kind,status}` uses the same `kind` labels. Its `status` values are `potentially_servable` (a conservative upper bound, including hits assisted by the GPU prefix cache), `chain_broken` (a state's final target page is missing), `missing_dependency` (a required recurrent group or drafter suffix is missing), `no_state` (a target page that no resident state can use), `outside_window` (a drafter page outside every usable state's window) and `unknown` (protected, incomplete metadata, a secondary tier, ARC or an unsupported layout). The sum over all labels equals the occupied CPU slots at sampling time, in blocks, not bytes.
 
 ## See also
 
 - [Reference launch tutorial](getting-started.md)
+- [Configuration reference](configuration.md)
 - [Measured readback times](performance.md#coming-back-to-a-document)
-- [Known limits](known-limits.md)
-
-### Checkpoint retention evidence
-
-With long-context `latest_only` enabled, `enable_junction_evidence` (boolean,
-default `true`, deployment scope, introduced in 0.2, experimental) keeps each
-observed leaf's latest checkpoint and exact resend point. A capture records
-where recurrent state is needed; it does not by itself prove a branch.
-
-A captured point is retained when a registered continuation differs from the
-request's own next page. If the request has no complete next page, an existing
-continuation grants conservative `short_tail_junction` retention. The consumer
-also recognizes distinct registered successors arriving later. Confirmed reasons
-carry a version and exact content binding in optional manifest metadata and
-survive child eviction and clean restart. Ordinary value eviction still applies.
-Prompt identity is used only for equality; a second identity never confirms a
-branch.
-
-On startup, both legacy `junction` and `branch` booleans are treated as hints.
-The complete validated manifest graph determines effective retention. Old flags
-are preserved without bulk metadata rewrites. Only newly confirmed reasons need
-normal manifest updates. Missing legacy request metadata retains the existing
-predecessor fallback. A checkpoint without a complete newer witness is kept.
-
-This policy adds no grace timer or watch queue. MAIN tails not covered by a
-registered checkpoint remain unknown; an older state may be superseded. A later
-request can recompute from the remaining shallower state and capture a new
-checkpoint. Recompute may span much of the prompt. MAIN pages and files are not
-deleted by this policy.
-
-Set `enable_junction_evidence=false` to replay the previous latest-only producer,
-consumer and metadata behavior. The switch has no effect with `latest_only=false`.
-It changes neither SSD namespace nor compilation hash. Turning it off cannot
-restore already deleted state. `superseded_keep_ssd=true` retains committed cold
-checkpoints and releases only safe RAM copies. Existing `branch_points`,
-`chain_latest_units`, `resend_points`, `superseded_pending`, `superseded_revoked`,
-`superseded_freed_bytes` and `superseded_ssd_deleted_bytes` report effective policy
-state; no additional statistics are emitted with the switch off.
+- [DFlash2 state replay](dflash2.md#state-replay-optional)
+- [Support and known limits](known-limits.md)

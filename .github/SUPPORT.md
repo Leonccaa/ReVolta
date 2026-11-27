@@ -6,7 +6,7 @@ This page says what the maintainers support in ReVolta and where to ask for help
 | --- | --- |
 | Version | 0.2.0. 0.1.x gets no further releases; reproduce a problem on 0.2.0 before reporting it. <!-- doc020: proposed 0.1.x policy, awaiting the maintainer's decision --> |
 | GPUs | Four or more NVIDIA V100 32 GB (PCIe or SXM2); validated on four |
-| Interconnect | Recommended and tested: NVLink, or all GPUs under one PCIe switch with P2P. PCIe without P2P gives correct output at about 30–55% of the P2P speed (tested by disabling P2P on P2P-capable hardware) |
+| Interconnect | Recommended and tested: NVLink, or all GPUs under one PCIe switch with P2P. PCIe without P2P gave correct output at about 30–55% of the P2P throughput in the 0.1.0 release test, which disabled P2P on the reference machine |
 | Parallelism | Tensor parallel 4 with decode context parallel 2 (TP4 + DCP2) |
 | Host memory | 128 GiB recommended; 80 GiB is the smallest tested limit with the default PLE table in host memory and KV offload off; 32 GiB was tested in 0.1.4 with the experimental whole-table PLE disk option |
 | Model | Qwen3.8 Flash-Next: text, images and video |

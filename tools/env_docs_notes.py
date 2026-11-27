@@ -548,6 +548,15 @@ NOTES: dict[str, dict[str, str]] = {
         "request.",
         metrics="",
     ),
+    "VLLM_SM70_QSA_SHORT_APPEND": dict(
+        section="research",
+        since="0.2.0",
+        range="0, 1",
+        tradeoff="Lowers the QSA single-request cuBLAS row floor from 512 to 128 "
+        "rows on long contexts so short warm appends use cuBLAS scoring. "
+        "Near-tied block selection may differ from the paged scorer.",
+        metrics="",
+    ),
     "VLLM_SM70_QWEN38_GDN_NO_PACK": dict(
         section="profile",
         since="0.2.0",

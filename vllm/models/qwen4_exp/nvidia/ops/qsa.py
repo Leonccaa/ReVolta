@@ -82,6 +82,12 @@ _SM70_INDEXER_CUBLAS_MIN_SCORE_ELEMENTS = legacy_qsa_tuning(
     "VLLM_SM70_QSA_INDEXER_CUBLAS_MIN_SCORE_ELEMENTS",
     SM70_QSA_TUNING.cublas_min_score_elements,
 )
+# Opt-in (default off): lower the single-request cuBLAS row floor for short
+# warm appends to 128 rows (1Cat #1601). Selection may differ from the paged
+# scorer on near-tied blocks; the score-work gate is unchanged.
+_SM70_QSA_SHORT_APPEND = envs.VLLM_SM70_QSA_SHORT_APPEND
+_SM70_QSA_SHORT_APPEND_MIN_ROWS = 128
+_SM70_QSA_SHORT_APPEND_MIN_COLUMNS = 4096
 _SM70_QSA_XQA_PAGE4 = os.getenv("VLLM_SM70_QSA_XQA_PAGE4", "1") == "1"
 _SM70_QSA_XQA_PAGE4_MIN_ROWS = legacy_qsa_tuning(
     "VLLM_SM70_QSA_XQA_PAGE4_MIN_ROWS", SM70_QSA_TUNING.xqa_page4_min_rows
@@ -1342,11 +1348,19 @@ def _use_sm70_qsa_indexer_cublas(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     page_table: torch.Tensor,
+    bounded_columns: int | None = None,
 ) -> bool:
+    min_rows = _SM70_INDEXER_CUBLAS_MIN_ROWS
+    if (
+        _SM70_QSA_SHORT_APPEND
+        and bounded_columns is not None
+        and bounded_columns >= _SM70_QSA_SHORT_APPEND_MIN_COLUMNS
+    ):
+        min_rows = min(min_rows, _SM70_QSA_SHORT_APPEND_MIN_ROWS)
     return (
         _SM70_INDEXER_CUBLAS
         and current_platform.is_device_capability(70)
-        and q.shape[0] >= _SM70_INDEXER_CUBLAS_MIN_ROWS
+        and q.shape[0] >= min_rows
         and _qsa_indexer_cublas_shape_supported(q, k_cache, page_table)
     )
 
@@ -1767,9 +1781,10 @@ def _qsa_select_by_request(
     # batches (decode graphs) on the batched path.
     if query_start_loc[0] != 0 or query_start_loc[-1] != rows:
         return False
-    segments = _qsa_indexer_request_segments(
-        query_start_loc, _SM70_INDEXER_CUBLAS_MIN_ROWS
-    )
+    segment_min_rows = _SM70_INDEXER_CUBLAS_MIN_ROWS
+    if _SM70_QSA_SHORT_APPEND and (max_seq_len or 0) >= 16384:
+        segment_min_rows = min(segment_min_rows, _SM70_QSA_SHORT_APPEND_MIN_ROWS)
+    segments = _qsa_indexer_request_segments(query_start_loc, segment_min_rows)
     if all(request is None for _, _, request in segments):
         return False
     for start, end, request in segments:
@@ -1895,7 +1910,15 @@ def qsa_select_paged_tokens(
     contiguous_keys: torch.Tensor | None = None
     key_valid: torch.Tensor | None = None
     all_visible: torch.Tensor | None = None
-    if _use_sm70_qsa_indexer_cublas(q, k_cache, page_table) and (
+    bounded_columns = (
+        min(
+            capacity_columns,
+            max(block_topk, -(-(max_seq_len // compress_ratio) // world)),
+        )
+        if max_seq_len is not None
+        else None
+    )
+    if _use_sm70_qsa_indexer_cublas(q, k_cache, page_table, bounded_columns) and (
         world == 1 or max_seq_len is not None
     ):
         # Sharded ranks need a host bound: a device max of their local

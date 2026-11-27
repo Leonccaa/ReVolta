@@ -16,7 +16,7 @@ Terms used on this page:
 | --- | --- | --- | --- | --- |
 | [GPU KV only](#gpu-kv-only) | Stable | Nowhere: they are computed again | None | Host memory is tight |
 | [GPU KV + CPU offload](#cpu-offload-reference-configuration) | Stable; used by the reference launch | The CPU KV pool in `/dev/shm` | `cpu_bytes_to_use` (48 GiB in the reference) | Most deployments |
-| [GPU KV + CPU + disk](#disk-tier-revolta_fs-experimental) | Experimental | The CPU KV pool, then the `revolta_fs` disk tier on a local SSD | The CPU pool, plus SSD space | Cached documents should survive a restart |
+| [GPU KV + CPU + disk](#disk-tier-revolta_fs) | Supported; used by the production form in the 0.2.0 acceptance (configuration C) | The CPU KV pool, then the `revolta_fs` disk tier on a local SSD | The CPU pool, plus SSD space | Cached documents should survive a restart |
 | [Host KV](#host-kv-long-context) | Supported; validated with MTP (acceptance configuration E2) | Main K/V lives in host memory; optional SSD | `host_store_gib` | Long contexts or many long requests do not fit in GPU KV |
 
 All modes use the same model, KV format (INT8 by default) and speculative decoding settings. Only `--kv-transfer-config` and, for Host KV, `--kernel-config` change.
@@ -91,11 +91,20 @@ The DFlash2 drafter has its own sliding-window KV cache. `cpu.draft_offload` sel
 - `window`: store only the drafter blocks inside the window before each point where the request stores a recurrent state, and before its shared-prefix junction. Hits normally land on those points, because a hit also needs the recurrent state there. The skipped blocks leave room for other prefixes. If a needed window is incomplete, the hit falls back to an earlier point whose window is complete, and the rest is computed again.
 - `none`: store no drafter blocks. The drafter cannot recompute its cache (it is projected from target hidden states), so a fresh CPU tier then serves no prefix hits for DFlash2. Use it only to measure the cost of the drafter blocks.
 
-## Disk tier (`revolta_fs`, experimental)
+<a id="disk-tier-revolta_fs-experimental"></a><a id="verified-disk-tier-revolta_fs-experimental"></a>
+
+## Disk tier (`revolta_fs`)
 
 The disk tier keeps evicted prefixes on a local SSD below the CPU pool. Pages survive an engine restart, so a returning document is read from disk instead of computed again; see [Coming back to a document](performance.md#coming-back-to-a-document) for readback times. Use the `revolta_fs` tier type: it stores the INT8 scale planes with each page and verifies every page before use. The upstream `fs` tier type rejects the default planar INT8 KV (and per-token-head E4M3) at startup and has no integrity check.
 
 The disk tier is a disposable cache, not model storage. Losing it only means prefixes are computed again.
+
+The disk tier is supported in 0.2.0, with two limits on reuse:
+
+- **The on-disk format can change between releases.** A later release may start with an empty tier and ignore pages written by 0.2.0.
+- **Pages are reused only by the same configuration.** Changing the checkpoint, KV format, parallel layout or another setting listed in [When pages are not reused](#when-pages-are-not-reused) also starts from an empty tier.
+
+In both cases nothing breaks: the old pages miss, the prefixes are computed again, and the old files are evicted as the tier fills.
 
 ### 1. Create a content manifest
 
@@ -264,7 +273,7 @@ Add `host_kv.ssd` to `kv_connector_extra_config`. Create a [content manifest](#1
 }
 ```
 
-The example sets a 350 GiB disk budget. The directory, file system and identity rules are those of the [disk tier](#disk-tier-revolta_fs-experimental). Unknown keys inside `host_kv.ssd` are rejected at startup; all keys are listed in the [settings reference](#host_kvssd-keys).
+The example sets a 350 GiB disk budget. The directory, file system and identity rules are those of the [disk tier](#disk-tier-revolta_fs). Unknown keys inside `host_kv.ssd` are rejected at startup; all keys are listed in the [settings reference](#host_kvssd-keys).
 
 - **Writes.** A published host page is queued for a delayed write (`write_delay_s`, default 300 s; see [Set the SSD write delay](#set-the-ssd-write-delay)). Writes are rate-limited to `write_bytes_per_second` (default 64 MiB/s). Before the store evicts a page that is not yet on disk, it tries one immediate write; it skips that write when the write queue is full, the disk budget has no room, or the page cannot be written. Watch `host_ssd_evict_unwritten` and `host_ssd_evicted_persisted` in the `Store stats` log line, or `vllm:store_events_total{event="host_ssd_evict_unwritten"}`: a rising `host_ssd_evict_unwritten` means pages leave the store before they reach the disk.
 - **Reads.** Pages needed for a prefix hit are read back from disk and verified before use; reads are bounded per request and in total (`prefetch_max_per_request`, `prefetch_max_inflight`, `prefetch_timeout_s`). A failed or corrupt read counts as a miss and the prefix is computed again.
@@ -349,7 +358,7 @@ Keys of `kv_connector_extra_config`:
 | `spec_name` | string | `CPUOffloadingSpec` | `TieringOffloadingSpec`, `CPUOffloadingSpec` | Offloading implementation. `TieringOffloadingSpec` is required for a disk tier and is what the reference launch uses. | vLLM | stable |
 | `cpu_bytes_to_use` | int, bytes | none | > 0 | CPU pool size, summed over all workers. Required with GPU KV; rejected together with `host_store_gib`. | vLLM | stable |
 | `eviction_policy` | string | `lru` | `lru`, `arc` | Eviction order of the CPU pool. Host KV requires `lru`. | vLLM | stable |
-| `secondary_tiers` | list | `[]` | tier entries | Tiers below the CPU pool; see [Disk tier entry](#disk-tier-entry). Not used with Host KV. | vLLM; `revolta_fs` 0.2.0 | experimental |
+| `secondary_tiers` | list | `[]` | tier entries | Tiers below the CPU pool; see [Disk tier entry](#disk-tier-entry). Not used with Host KV. | vLLM; `revolta_fs` 0.2.0 | stable |
 | `offload_prompt_only` | bool | `true` | | Offload only prompt blocks, not blocks generated while decoding. Suits reasoning models whose thinking is dropped before the next turn. | vLLM | stable |
 | `demote_superseded_states` | bool | `true` | | See [Superseded recurrent states](#superseded-recurrent-states). | 0.1.0 | stable |
 | `superseded_state_rule` | string | `request` | `request`, `request_fixed`, `extend` | Which states count as superseded. Other values are rejected at startup. | 0.2.0 | experimental |
@@ -358,7 +367,7 @@ Keys of `kv_connector_extra_config`:
 | `cpu.enable_dependency_eviction` | bool | `false` | | After a capacity eviction, also free CPU blocks that can no longer serve a hit. See below. | 0.2.0 | experimental |
 | `cpu.residency_stats` | bool | `false` | | Publish the `vllm:kv_offload_cpu_resident_blocks` gauge. | 0.2.0 | experimental |
 | `cpu.offload_counters` | bool | `false` | | Publish three diagnostic counters; see [Diagnostic counters](#diagnostic-counters). Read-only: nothing depends on them. | 0.2.0 | experimental |
-| `host_kv.ssd` | object | disabled | | SSD for Host KV; see [`host_kv.ssd` keys](#host_kvssd-keys). | 0.2.0 | experimental |
+| `host_kv.ssd` | object | disabled | | SSD for Host KV; see [`host_kv.ssd` keys](#host_kvssd-keys). | 0.2.0 | stable |
 
 The `cpu.*` booleans must be JSON booleans; other types are rejected at startup. Upstream keys not used by the reference configuration (`block_size`, `store_threshold`, `max_tracker_size`) keep their vLLM meaning; `TieringOffloadingSpec` and Host KV reject `store_threshold` of 2 or more.
 
@@ -370,22 +379,22 @@ Keys of a `secondary_tiers` entry with `"type": "revolta_fs"`. An unknown key fa
 
 | Key | Type | Default | Values | Effect and trade-off | Since | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| `type` | string | required | `revolta_fs` | `fs` is the upstream tier without verification; it rejects planar INT8 and per-token-head E4M3. | 0.2.0 | experimental |
-| `root_dir` | string | required | path | Dedicated directory for one engine, on a file system with user extended attributes. | vLLM | experimental |
-| `max_size_bytes` | int | required | > 0 | Total page budget under `root_dir`. | vLLM | experimental |
-| `min_free_bytes` | int | 5% of the file system | ≥ 0; 0 disables | Free space kept on the file system. | vLLM | experimental |
-| `max_files` | int | 1,000,000 | > 0 | Page count limit; bounds the in-memory index. | vLLM | experimental |
-| `n_read_threads`, `n_write_threads` | int | 16, 16 | > 0 | I/O threads. The 0.1.4 readback measurement on a local NVMe SSD used one each. | vLLM | experimental |
-| `content_manifest_path` | string | none | path | Content manifest of the loaded checkpoint. Without it the tier is disabled. | 0.2.0 | experimental |
-| `content_verify` | string | `stat` | `stat`, `full` | `stat` checks size, modification time and inode of every listed file at startup (milliseconds). `full` also rehashes every file (about a minute per 100 GB) and catches a rewrite that restored the modification time. | 0.2.0 | experimental |
-| `mtime_update_interval_s` | float | `60` | ≥ 0; 0 = every use | Minimum time between modification-time refreshes of a used page; a due page refreshes its whole chain. The times order eviction after a restart: shorter is more precise and writes more metadata. | 0.2.0 | experimental |
-| `store_timeout_s` | float | `30` | ≥ 0; 0 = never | A store job, including its time in the queue, is reported failed after this time, so a stuck disk does not hold the CPU pool. | 0.2.0 | experimental |
-| `drain_timeout_s` | float | `30` | ≥ 0 | At shutdown, pending writes run for up to this time; the rest are dropped. Must fit in `--shutdown-timeout`. | 0.2.0 | experimental |
-| `max_io_retries` | int | `2` | ≥ 0 | Retries of a page read or write after a transient error (`EAGAIN`, `EINTR`, `EBUSY`, `ESTALE`, `ETIMEDOUT`, `EIO`). Checksum failures are not retried. | 0.2.0 | experimental |
-| `max_inflight_store_blocks` | int | `0` (auto) | ≥ 0 | Pages queued or being written above which new store jobs are skipped, so a slow disk does not hold the CPU pool. Auto is a quarter of the CPU pool's blocks, at least 64. | 0.2.0 | experimental |
-| `write_delay_s` | float | `300` | ≥ 0; 0 = write at once | See [Set the SSD write delay](#set-the-ssd-write-delay). | 0.2.0 | experimental |
-| `write_warn_bytes_24h` | int | `1000000000000` | ≥ 0; 0 = no warning | Log-only warning threshold for submitted page bytes in 24 hours. | 0.2.0 | experimental |
-| `state_latest_only` | bool | `false` | | With delayed writes, write only a finished request's newest recurrent state (plus its junction and states other requests resume from). | 0.2.0 | experimental |
+| `type` | string | required | `revolta_fs` | `fs` is the upstream tier without verification; it rejects planar INT8 and per-token-head E4M3. | 0.2.0 | stable |
+| `root_dir` | string | required | path | Dedicated directory for one engine, on a file system with user extended attributes. | vLLM | stable |
+| `max_size_bytes` | int | required | > 0 | Total page budget under `root_dir`. | vLLM | stable |
+| `min_free_bytes` | int | 5% of the file system | ≥ 0; 0 disables | Free space kept on the file system. | vLLM | stable |
+| `max_files` | int | 1,000,000 | > 0 | Page count limit; bounds the in-memory index. | vLLM | stable |
+| `n_read_threads`, `n_write_threads` | int | 16, 16 | > 0 | I/O threads. The 0.1.4 readback measurement on a local NVMe SSD used one each. | vLLM | stable |
+| `content_manifest_path` | string | none | path | Content manifest of the loaded checkpoint. Without it the tier is disabled. | 0.2.0 | stable |
+| `content_verify` | string | `stat` | `stat`, `full` | `stat` checks size, modification time and inode of every listed file at startup (milliseconds). `full` also rehashes every file (about a minute per 100 GB) and catches a rewrite that restored the modification time. | 0.2.0 | stable |
+| `mtime_update_interval_s` | float | `60` | ≥ 0; 0 = every use | Minimum time between modification-time refreshes of a used page; a due page refreshes its whole chain. The times order eviction after a restart: shorter is more precise and writes more metadata. | 0.2.0 | stable |
+| `store_timeout_s` | float | `30` | ≥ 0; 0 = never | A store job, including its time in the queue, is reported failed after this time, so a stuck disk does not hold the CPU pool. | 0.2.0 | stable |
+| `drain_timeout_s` | float | `30` | ≥ 0 | At shutdown, pending writes run for up to this time; the rest are dropped. Must fit in `--shutdown-timeout`. | 0.2.0 | stable |
+| `max_io_retries` | int | `2` | ≥ 0 | Retries of a page read or write after a transient error (`EAGAIN`, `EINTR`, `EBUSY`, `ESTALE`, `ETIMEDOUT`, `EIO`). Checksum failures are not retried. | 0.2.0 | stable |
+| `max_inflight_store_blocks` | int | `0` (auto) | ≥ 0 | Pages queued or being written above which new store jobs are skipped, so a slow disk does not hold the CPU pool. Auto is a quarter of the CPU pool's blocks, at least 64. | 0.2.0 | stable |
+| `write_delay_s` | float | `300` | ≥ 0; 0 = write at once | See [Set the SSD write delay](#set-the-ssd-write-delay). | 0.2.0 | stable |
+| `write_warn_bytes_24h` | int | `1000000000000` | ≥ 0; 0 = no warning | Log-only warning threshold for submitted page bytes in 24 hours. | 0.2.0 | stable |
+| `state_latest_only` | bool | `false` | | With delayed writes, write only a finished request's newest recurrent state (plus its junction and states other requests resume from). | 0.2.0 | stable |
 
 ### `host_kv.ssd` keys
 
@@ -393,24 +402,24 @@ Keys of the `host_kv.ssd` object in `kv_connector_extra_config` (Host KV only). 
 
 | Key | Type | Default | Values | Effect and trade-off | Since | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| `enabled` | bool | `false` | | Turns the SSD on. Without it, nothing is created on disk. | 0.2.0 | experimental |
-| `root_dir` | string | required | path | As for the disk tier. | 0.2.0 | experimental |
-| `max_size_bytes` | int | required | > 0 | As for the disk tier. | 0.2.0 | experimental |
-| `min_free_bytes` | int | 5% of the file system | ≥ 0; 0 disables | As for the disk tier. | 0.2.0 | experimental |
-| `max_files` | int | 1,000,000 | > 0 | As for the disk tier. | 0.2.0 | experimental |
-| `content_manifest_path` | string | none | path | As for the disk tier; without it, SSD reuse is disabled. | 0.2.0 | experimental |
-| `content_verify` | string | `stat` | `stat`, `full` | As for the disk tier. | 0.2.0 | experimental |
-| `write_delay_s` | float | `300` | ≥ 0 | Delay before a published page is written. | 0.2.0 | experimental |
-| `write_bytes_per_second` | int | `67108864` (64 MiB/s) | > 0 | Rate limit for page writes, shared by the write threads. | 0.2.0 | experimental |
-| `write_threads` | int | `4` | > 0 | Concurrent page writes. | 0.2.0 | experimental |
-| `max_pending_blocks` | int | `64` | > 0 | Write jobs queued or running at once. | 0.2.0 | experimental |
-| `write_warn_bytes_24h` | int | `1000000000000` | ≥ 0 | As for the disk tier. | 0.2.0 | experimental |
-| `prefetch_max_inflight` | int | `16` | > 0 | Page reads from disk in flight, in total. | 0.2.0 | experimental |
-| `prefetch_max_per_request` | int | `8` | > 0 | Page reads from disk in flight per request. | 0.2.0 | experimental |
-| `prefetch_timeout_s` | float | `5` | ≥ 0 | Time budget per read window; a restore that needs several windows gets that many times this value. | 0.2.0 | experimental |
-| `shutdown_flush_timeout_s` | float | `10` | ≥ 0 | Upper limit of the final flush at shutdown, within `--shutdown-timeout` minus 5 s. | 0.2.0 | experimental |
-| `shutdown_io_grace_s` | float | `2` | ≥ 0 | Time for writes already started to finish at the end of the final flush. | 0.2.0 | experimental |
-| `drain_timeout_s` | float | `30` | ≥ 0 | Accepted but has no effect in 0.2.0; the final flush uses `shutdown_flush_timeout_s`. | 0.2.0 | experimental |
+| `enabled` | bool | `false` | | Turns the SSD on. Without it, nothing is created on disk. | 0.2.0 | stable |
+| `root_dir` | string | required | path | As for the disk tier. | 0.2.0 | stable |
+| `max_size_bytes` | int | required | > 0 | As for the disk tier. | 0.2.0 | stable |
+| `min_free_bytes` | int | 5% of the file system | ≥ 0; 0 disables | As for the disk tier. | 0.2.0 | stable |
+| `max_files` | int | 1,000,000 | > 0 | As for the disk tier. | 0.2.0 | stable |
+| `content_manifest_path` | string | none | path | As for the disk tier; without it, SSD reuse is disabled. | 0.2.0 | stable |
+| `content_verify` | string | `stat` | `stat`, `full` | As for the disk tier. | 0.2.0 | stable |
+| `write_delay_s` | float | `300` | ≥ 0 | Delay before a published page is written. | 0.2.0 | stable |
+| `write_bytes_per_second` | int | `67108864` (64 MiB/s) | > 0 | Rate limit for page writes, shared by the write threads. | 0.2.0 | stable |
+| `write_threads` | int | `4` | > 0 | Concurrent page writes. | 0.2.0 | stable |
+| `max_pending_blocks` | int | `64` | > 0 | Write jobs queued or running at once. | 0.2.0 | stable |
+| `write_warn_bytes_24h` | int | `1000000000000` | ≥ 0 | As for the disk tier. | 0.2.0 | stable |
+| `prefetch_max_inflight` | int | `16` | > 0 | Page reads from disk in flight, in total. | 0.2.0 | stable |
+| `prefetch_max_per_request` | int | `8` | > 0 | Page reads from disk in flight per request. | 0.2.0 | stable |
+| `prefetch_timeout_s` | float | `5` | ≥ 0 | Time budget per read window; a restore that needs several windows gets that many times this value. | 0.2.0 | stable |
+| `shutdown_flush_timeout_s` | float | `10` | ≥ 0 | Upper limit of the final flush at shutdown, within `--shutdown-timeout` minus 5 s. | 0.2.0 | stable |
+| `shutdown_io_grace_s` | float | `2` | ≥ 0 | Time for writes already started to finish at the end of the final flush. | 0.2.0 | stable |
+| `drain_timeout_s` | float | `30` | ≥ 0 | Accepted but has no effect in 0.2.0; the final flush uses `shutdown_flush_timeout_s`. | 0.2.0 | stable |
 
 ### Host KV keys
 

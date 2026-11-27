@@ -26,7 +26,7 @@ The supported model is Qwen3.8 Flash-Next. Checkpoints and their test status are
 | KV mode | Status in 0.2.0 |
 | --- | --- |
 | GPU KV with the CPU KV pool | Stable; the [reference launch](getting-started.md#4-launch) uses a 48 GiB pool |
-| `revolta_fs` disk tier below the CPU KV pool | Experimental; the production form in the acceptance table below runs it |
+| `revolta_fs` disk tier below the CPU KV pool | Supported; the production form in the acceptance table below runs it. The on-disk format can change between releases, and pages are reused only by the same configuration; see [Disk tier](kv-offload.md#disk-tier-revolta_fs) |
 | Host KV (Active Host KV) with MTP | Supported, off by default; in the 0.2.0 release acceptance (configuration E2 below) <!-- TODO(0.2.0-acceptance): acceptance result, E2 Host KV + MTP --> |
 | Host KV with DFlash2 | Supported combination; not tested separately in the 0.2.0 release acceptance |
 

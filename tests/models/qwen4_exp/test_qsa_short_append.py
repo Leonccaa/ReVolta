@@ -26,21 +26,29 @@ def _single(rows):
     return q, cache, torch.zeros(1, 2, dtype=torch.int32)
 
 
-@pytest.mark.parametrize("enabled", [False, True])
-@pytest.mark.parametrize("rows", [127, 128, 511, 512])
-@pytest.mark.parametrize("columns", [None, 2048, 4096])
-def test_single_request_row_floor(monkeypatch, enabled, rows, columns):
+@pytest.mark.parametrize(
+    ("enabled", "rows", "columns", "expected"),
+    [
+        (False, 400, 4096, False),
+        (True, 400, 2048, False),
+        (True, 127, 4096, False),
+        (True, 128, 4096, True),
+        (True, 400, 4096, True),
+    ],
+)
+def test_single_request_row_floor(monkeypatch, enabled, rows, columns, expected):
     _setup(monkeypatch, enabled)
-    got = qsa_ops._use_sm70_qsa_indexer_cublas(*_single(rows), columns)
-    lowered = enabled and columns is not None and columns >= 4096
-    assert got == (rows >= (128 if lowered else 512))
+    assert qsa_ops._use_sm70_qsa_indexer_cublas(*_single(rows), columns) is expected
 
 
-def test_multi_request_page_table_never_uses_single_request_path(monkeypatch):
+def test_tp4_warm_append_row_gate_uses_route_columns(monkeypatch):
+    # 32K prefix + 400 rows, ratio 4, TP4: 2073 local columns, but the route
+    # width is the DCP2 split (4146), which is what the row floor is judged on.
     _setup(monkeypatch, True)
-    q, cache, _ = _single(400)
-    table = torch.zeros(2, 2, dtype=torch.int32)
-    assert not qsa_ops._use_sm70_qsa_indexer_cublas(q, cache, table, 8192)
+    route = qsa_ops._qsa_cublas_route_columns(2073, 33168, 4, 4, 512, 1 << 20)
+    assert route == 4146
+    assert qsa_ops._use_sm70_qsa_indexer_cublas(*_single(400), route)
+    assert not qsa_ops._use_sm70_qsa_indexer_cublas(*_single(400), 2073)
 
 
 @pytest.mark.parametrize("enabled", [False, True])

@@ -553,8 +553,10 @@ NOTES: dict[str, dict[str, str]] = {
         since="0.2.0",
         range="0, 1",
         tradeoff="Lowers the QSA single-request cuBLAS row floor from 512 to 128 "
-        "rows on long contexts so short warm appends use cuBLAS scoring. "
-        "Near-tied block selection may differ from the paged scorer.",
+        "rows on long contexts, so short warm appends are eligible for cuBLAS "
+        "scoring; they still need the single-request column count (mixed "
+        "batches are first split per request from 16384 tokens) and the score "
+        "work threshold. Near-tied block selection may differ from the paged scorer.",
         metrics="",
     ),
     "VLLM_SM70_QWEN38_GDN_NO_PACK": dict(

@@ -353,7 +353,7 @@ is configuration, tuning, experimental, debug or deprecated.
 |---|---|---|---|---|---|---|
 | `VLLM_SM70_NVFP4_RAW_GROUPED_M48_V154` | bool | `False` | 0, 1 | experimental | 0.2.0rc15 | Native raw-E4M3 grouped MoE for 48-row target decode on SM70 TP4 Qwen3.8 with equal interleaved gate/up global scales. Requires raw grouped decode and the V2 model runner. |
 | `VLLM_SM70_NVFP4_RAW_GROUPED_NARROW_V154` | bool | `False` | 0, 1 | experimental | 0.2.0rc15 | Native raw-E4M3 grouped MoE for 3-5 row target decode on SM70 TP4 Qwen3.8 with equal interleaved gate/up global scales. Requires raw grouped decode and the V2 model runner. |
-| `VLLM_SM70_QSA_SHORT_APPEND` | bool | `False` | 0, 1 | configuration | 0.2.0 | Lowers the QSA single-request cuBLAS row floor from 512 to 128 rows on long contexts so short warm appends use cuBLAS scoring. Near-tied block selection may differ from the paged scorer. |
+| `VLLM_SM70_QSA_SHORT_APPEND` | bool | `False` | 0, 1 | configuration | 0.2.0 | Lowers the QSA single-request cuBLAS row floor from 512 to 128 rows on long contexts, so short warm appends are eligible for cuBLAS scoring; they still need the single-request column count (mixed batches are first split per request from 16384 tokens) and the score work threshold. Near-tied block selection may differ from the paged scorer. |
 
 ### Promoted research switches
 

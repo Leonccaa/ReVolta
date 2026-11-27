@@ -1910,13 +1910,31 @@ def qsa_select_paged_tokens(
     contiguous_keys: torch.Tensor | None = None
     key_valid: torch.Tensor | None = None
     all_visible: torch.Tensor | None = None
-    bounded_columns = (
+    # The same local upper bound on every rank (ceil over ranks).
+    host_columns = (
         min(
             capacity_columns,
             max(block_topk, -(-(max_seq_len // compress_ratio) // world)),
         )
         if max_seq_len is not None
         else None
+    )
+    # The row floor and the work gate share one width: the route columns,
+    # rounded up to 4 as in 1Cat #1601.
+    route_columns = (
+        _qsa_cublas_route_columns(
+            host_columns,
+            max_seq_len,
+            compress_ratio,
+            world,
+            block_topk,
+            capacity_columns,
+        )
+        if host_columns is not None
+        else None
+    )
+    bounded_columns = (
+        triton.cdiv(route_columns, 4) * 4 if route_columns is not None else None
     )
     if _use_sm70_qsa_indexer_cublas(q, k_cache, page_table, bounded_columns) and (
         world == 1 or max_seq_len is not None
@@ -1935,24 +1953,15 @@ def qsa_select_paged_tokens(
         # prefix so early-context prefill does not multiply the unused 140K
         # model-capacity tail. The host upper bound removes the scalar sync;
         # device visibility masks any extra columns before top-k selection.
-        live_blocks = (
-            # The same local upper bound on every rank (ceil over ranks).
-            -(-(max_seq_len // compress_ratio) // world)
-            if max_seq_len is not None
-            else int(all_visible.max().item())
-        )
-        score_columns = min(capacity_columns, max(block_topk, live_blocks))
-        if _qsa_indexer_cublas_work_supported(
-            rows,
-            _qsa_cublas_route_columns(
-                score_columns,
-                max_seq_len,
-                compress_ratio,
-                world,
-                block_topk,
-                capacity_columns,
-            ),
-        ):
+        if host_columns is not None:
+            score_columns = host_columns
+        else:
+            score_columns = min(
+                capacity_columns, max(block_topk, int(all_visible.max().item()))
+            )
+            route_columns = score_columns
+        assert route_columns is not None
+        if _qsa_indexer_cublas_work_supported(rows, route_columns):
             logger.info_once(
                 "Using SM70 QSA indexer prefill cuBLAS path "
                 "(single-request FP16, rows=%d, score_tile_mib=%d).",

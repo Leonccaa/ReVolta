@@ -2,7 +2,7 @@
 
 This directory holds offline tools that calibrate per-layer K/V scales for the scalar E4M3 KV cache (`--kv-cache-dtype fp8` or `fp8_e4m3`) of Qwen4Exp-architecture checkpoints, such as Qwen3.8 Flash-Next, and build checkpoint overlays from them. You need them only to produce scales for a checkpoint that has no published scale pack.
 
-Scalar E4M3 KV is a frozen format: it keeps working, but it is no longer optimized or covered by release acceptance. The default on V100, `--kv-cache-dtype auto` (planar INT8), and `fp8_per_token_head` compute their scales at run time and need no calibration. Published scale packs for the supported checkpoints are listed in [KV scales and draft selection](../../docs/checkpoints.md#kv-scales-and-draft-selection).
+Scalar E4M3 KV is a frozen format: it keeps working, but it is no longer optimized, and release acceptance gives it only a functional check. The default on V100, `--kv-cache-dtype auto` (planar INT8), and `fp8_per_token_head` compute their scales at run time and need no calibration. Published scale packs for the supported checkpoints are listed in [Scalar E4M3 KV](../../docs/checkpoints.md#scalar-e4m3-kv-frozen).
 
 ## Calibration contract
 

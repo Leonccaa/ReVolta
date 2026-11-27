@@ -39,6 +39,21 @@ _SM70_TP8_HIERARCHICAL_SCRATCH_BYTES = 4 * 8 * 4096 * torch.float16.itemsize
 _SM70_PEX_TP4_PUSH_BYTES = frozenset(
     rows * 2560 * 2 for rows in (20, 24, 25, 30, 32, 35, 40)
 )
+# Additional widths for the wide cap. Keep the original set at caps up to
+# 200 KiB and for the zero-cap sum2 policy.
+_SM70_PEX_TP4_PUSH_WIDE_BYTES = frozenset(
+    rows * 2560 * 2 for rows in (18, 28, 36, *range(42, 65))
+)
+_SM70_PEX_TP4_PUSH_MID_MAX_BYTES = 200 * 1024
+
+
+def _sm70_pex_tp4_push_size(nbytes: int, max_bytes: int) -> bool:
+    return nbytes in _SM70_PEX_TP4_PUSH_BYTES or (
+        max_bytes > _SM70_PEX_TP4_PUSH_MID_MAX_BYTES
+        and nbytes in _SM70_PEX_TP4_PUSH_WIDE_BYTES
+    )
+
+
 _EXPANDABLE_SEGMENTS_TRUE_PATTERN = re.compile(
     r"((?:^|,)\s*expandable_segments\s*:\s*)True(?=\s*(?:,|$))"
 )
@@ -799,8 +814,7 @@ class CustomAllreduce:
                 and inp_size > self.sm70_pcie_switch_max_bytes
             ):
                 return False
-            # Within the expanded cap, only admit the added graph push sizes.
-            mid_size = 80 * 1024 < inp_size <= 200 * 1024
+            mid_size = 80 * 1024 < inp_size <= _SM70_PEX_TP4_PUSH_MID_MAX_BYTES
             if (
                 self.sm70_pcie_switch_graph_only or mid_size
             ) and not torch.cuda.is_current_stream_capturing():
@@ -808,7 +822,9 @@ class CustomAllreduce:
             if mid_size and (
                 inp.dtype != torch.float16
                 or self.sm70_tp4_push_buffer_ptrs is None
-                or inp_size not in _SM70_PEX_TP4_PUSH_BYTES
+                or not _sm70_pex_tp4_push_size(
+                    inp_size, self.sm70_pcie_switch_max_bytes
+                )
             ):
                 return False
         if inp.dtype not in (torch.float32, torch.float16, torch.bfloat16):
@@ -1440,7 +1456,10 @@ class CustomAllreduce:
             and self._IS_CAPTURING
             and torch.cuda.is_current_stream_capturing()
             and (
-                (self.sm70_pcie_switch and nbytes in _SM70_PEX_TP4_PUSH_BYTES)
+                (
+                    self.sm70_pcie_switch
+                    and _sm70_pex_tp4_push_size(nbytes, self.sm70_pcie_switch_max_bytes)
+                )
                 or _sm70_tp4_push_sum2_size(nbytes)
             )
         )

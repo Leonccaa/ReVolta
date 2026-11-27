@@ -210,5 +210,5 @@ def test_env_defaults_match_pcie_switch_settings(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
     assert envs.environment_variables["VLLM_SM70_PCIE_SWITCH_CUSTOM_AR"]() == "auto"
-    assert envs.environment_variables["VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES"]() == 204800
+    assert envs.environment_variables["VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES"]() == 327680
     assert envs.environment_variables["VLLM_SM70_PCIE_SWITCH_CAR_GRAPH_ONLY"]() is True

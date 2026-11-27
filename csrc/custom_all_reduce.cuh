@@ -169,23 +169,18 @@ static_assert(kSm70Qwen38HcGateEpochIndexBase + kSm70Qwen38HcGatePushBlocks <=
               kSm70Qwen38HcPushSignalBytes / sizeof(uint32_t));
 
 inline int sm70_pex_tp4_push_blocks(size_t bytes) {
-  // Keep these graph payloads in sync with _SM70_PEX_TP4_PUSH_BYTES.
-  switch (bytes) {
-    case 20 * kSm70Tp4PushAllreduceQwen4ExpBytes:
-    case 24 * kSm70Tp4PushAllreduceQwen4ExpBytes:
-    case 25 * kSm70Tp4PushAllreduceQwen4ExpBytes:
-    case 30 * kSm70Tp4PushAllreduceQwen4ExpBytes:
-    case 32 * kSm70Tp4PushAllreduceQwen4ExpBytes:
-    case 35 * kSm70Tp4PushAllreduceQwen4ExpBytes:
-    case 40 * kSm70Tp4PushAllreduceQwen4ExpBytes: {
-      constexpr int block_bytes = kSm70Tp4PushAllreduceThreads * 16;
-      return std::min(
-          kSm70Tp4PushAllreduceBlocks,
-          static_cast<int>((bytes + block_bytes - 1) / block_bytes));
-    }
-    default:
-      return 0;
-  }
+  // Keep these graph payloads in sync with _SM70_PEX_TP4_PUSH_BYTES and
+  // _SM70_PEX_TP4_PUSH_WIDE_BYTES.
+  constexpr size_t row_bytes = kSm70Tp4PushAllreduceQwen4ExpBytes;
+  if (bytes % row_bytes != 0) return 0;
+  const size_t rows = bytes / row_bytes;
+  if (!(rows == 18 || rows == 20 || rows == 24 || rows == 25 || rows == 28 ||
+        rows == 30 || rows == 32 || rows == 35 || rows == 36 || rows == 40 ||
+        (rows >= 42 && rows <= 64)))
+    return 0;
+  constexpr int block_bytes = kSm70Tp4PushAllreduceThreads * 16;
+  return std::min(kSm70Tp4PushAllreduceBlocks,
+                  static_cast<int>((bytes + block_bytes - 1) / block_bytes));
 }
 
 inline int sm70_tp4_push_allreduce_blocks(size_t bytes,

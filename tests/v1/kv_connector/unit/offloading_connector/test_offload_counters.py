@@ -259,11 +259,13 @@ def test_stored_blocks_count_completed_stores_only():
     meta = run.step(72)
     _complete(scheduler, meta.store_jobs)
     stored = _counters(scheduler).stored_blocks
-    # After the reset every block is offered again (stored now).
-    assert stored == {"target": 6, "draft": 12}
-    # Keys already resident are not stored again.
+    # After the reset only blocks the core still holds are stored again; the
+    # window has passed draft blocks 0..4.
+    assert stored == {"target": 6, "draft": 7}
+    # Resident keys are not stored again; a fresh request stores blocks 0..4.
     run2 = Run(scheduler, _request("r2", PROMPT))
-    assert not run2.step(200).store_jobs
+    meta2 = run2.step(200)
+    _complete(scheduler, meta2.store_jobs)
     assert stored == {"target": 6, "draft": 12}
 
 

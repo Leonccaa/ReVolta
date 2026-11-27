@@ -442,18 +442,29 @@ class EagleSpeculator:
         *,
         is_uniform_decode: bool = False,
         is_eagle_draft_step: bool = False,
+        row_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
         with set_forward_context(
             attn_metadata,
             self.vllm_config,
             num_tokens=num_tokens,
-            cudagraph_runtime_mode=cudagraph_runtime_mode,
+            # Last-row prefill runs outside the full-row compiled model.
+            cudagraph_runtime_mode=(
+                cudagraph_runtime_mode if row_indices is None else CUDAGraphMode.NONE
+            ),
             num_tokens_across_dp=num_tokens_across_dp,
             slot_mapping=slot_mappings,
             batch_descriptor=batch_descriptor,
             is_uniform_decode=is_uniform_decode,
         ):
+            if row_indices is not None:
+                return self.model.forward_last_rows(
+                    input_ids=self.input_buffers.input_ids[:num_tokens],
+                    positions=self.input_buffers.positions[:num_tokens],
+                    hidden_states=self.hidden_states[:num_tokens],
+                    row_indices=row_indices,
+                )
             if is_uniform_decode or is_eagle_draft_step:
                 # The active MRv2 runner identifies draft decode even when the
                 # draft architecture would not choose MRv2 on its own.
@@ -489,6 +500,29 @@ class EagleSpeculator:
             last_hidden_states = ret_hidden_states
             hidden_states = ret_hidden_states
         return last_hidden_states, hidden_states
+
+    @torch.inference_mode()
+    def run_kv_only_prefill(
+        self,
+        num_tokens: int,
+        attn_metadata: dict[str, Any],
+        slot_mappings: dict[str, torch.Tensor],
+        num_tokens_across_dp: torch.Tensor | None,
+    ) -> None:
+        with set_forward_context(
+            attn_metadata,
+            self.vllm_config,
+            num_tokens=num_tokens,
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            num_tokens_across_dp=num_tokens_across_dp,
+            slot_mapping=slot_mappings,
+            batch_descriptor=BatchDescriptor(num_tokens=num_tokens),
+        ):
+            self.model.forward_kv_only(
+                input_ids=self.input_buffers.input_ids[:num_tokens],
+                positions=self.input_buffers.positions[:num_tokens],
+                hidden_states=self.hidden_states[:num_tokens],
+            )
 
     def _validate_local_argmax_reduction(self) -> None:
         if not self.use_local_argmax_reduction:
@@ -613,6 +647,7 @@ class EagleSpeculator:
         skip_sample: bool = False,
         *,
         is_uniform_decode: bool = False,
+        row_indices: torch.Tensor | None = None,
     ) -> None:
         last_hidden_states, hidden_states = self.run_model(
             num_tokens,
@@ -622,6 +657,7 @@ class EagleSpeculator:
             cudagraph_runtime_mode=cudagraph_runtime_mode,
             mm_inputs=mm_inputs,
             is_uniform_decode=is_uniform_decode,
+            row_indices=row_indices,
         )
         if skip_sample:
             # This pass only keeps the drafter KV in sync.
@@ -630,16 +666,19 @@ class EagleSpeculator:
         last_token_indices = self.last_token_indices[:num_reqs]
         pos = self.input_buffers.positions[last_token_indices]
         idx_mapping = self.idx_mapping[:num_reqs]
-        sample_hidden_states = last_hidden_states[last_token_indices]
+        if row_indices is None:
+            last_hidden_states = last_hidden_states[last_token_indices]
 
         self.draft_tokens[:num_reqs, 0] = self._sample_draft(
-            sample_hidden_states,
+            last_hidden_states,
             idx_mapping,
             pos,
             self.current_draft_step,
             self.draft_logits,
         )
-        self.hidden_states[:num_reqs] = hidden_states[last_token_indices]
+        if row_indices is None:
+            hidden_states = hidden_states[last_token_indices]
+        self.hidden_states[:num_reqs] = hidden_states
         self.input_buffers.positions[:num_reqs] = pos
 
     def multi_step_decode(
@@ -925,6 +964,29 @@ class EagleSpeculator:
         )
 
         self._mtp_prefill_begin()
+        row_indices = None
+        # DP MoE collectives are coordinated using the full-row counts.
+        if (
+            envs.VLLM_SM70_MTP_KV_ONLY_PREFILL
+            and not dummy_run
+            and input_batch.num_draft_tokens == 0
+            and prefill_batch_desc.cg_mode != CUDAGraphMode.FULL
+            and self.dp_size == 1
+            and getattr(self.model, "supports_last_row_prefill", False)
+        ):
+            incomplete = input_batch.is_incomplete_prefilling_np
+            assert incomplete is not None
+            if incomplete.all():
+                if prefill_batch_desc.cg_mode == CUDAGraphMode.NONE:
+                    self.run_kv_only_prefill(
+                        prefill_batch_desc.num_tokens,
+                        attn_metadata,
+                        slot_mappings,
+                        num_tokens_across_dp,
+                    )
+                    return self.draft_tokens[:num_reqs]
+            elif (input_batch.is_prefilling_np & ~incomplete).any():
+                row_indices = self.last_token_indices[:num_reqs]
         if prefill_batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Replay the full graph for draft prefill.
             assert self.prefill_cudagraph_manager is not None
@@ -943,8 +1005,10 @@ class EagleSpeculator:
                 mm_inputs=mm_inputs,
                 skip_sample=num_speculative_tokens == 0,
                 is_uniform_decode=uniform_token_count is not None,
+                row_indices=row_indices,
             )
-        self._mtp_prefill_end(num_reqs)
+        if row_indices is None:
+            self._mtp_prefill_end(num_reqs)
 
         if num_speculative_tokens <= 1:
             # The first forward still synchronizes draft KV at K=0.

@@ -37,7 +37,6 @@ from vllm.model_executor.layers.quantization.modelopt import (
 from vllm.model_executor.layers.quantization.sm70_turbomind import (
     NVFP4_GROUP_SIZE,
     is_exact_sm70_cuda,
-    unpack_mxfp4_weight,
 )
 from vllm.model_executor.layers.quantization.utils.sm70_layer_workspaces import (
     workspace_pool,
@@ -66,8 +65,8 @@ _SUPPORTED_CONTRACTS: Final = {
 }
 _SUPPORTED_TP_SIZES: Final = (1, 2, 4)
 _GRAPH_SAFE_MAX_TOKENS: Final = 18
-_GROUPED_DECODE_MAX_TOKENS: Final = 40
-_RAW_GROUPED_M48_TOKENS: Final = 48
+_GROUPED_DECODE_MAX_TOKENS: Final = 64
+_RAW_GROUPED_WIDE_MIN_TOKENS: Final = 41
 _RAW_GROUPED_NARROW_MAX_TOKENS: Final = 5
 _COMPACT_GROUPED_MAX_SLOTS: Final = 80
 # V100 real-shape M=1 tuning favors 16 warps. This retains checkpoint NVFP4,
@@ -1055,61 +1054,84 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
 
         w13_tm_weights: list[torch.Tensor] = []
         w13_tm_scales: list[torch.Tensor] = []
-        w13_raw_scale_codes: list[torch.Tensor] = []
-        w13_raw_global_scales: list[torch.Tensor] = []
         w13_meta: list[torch.Tensor] = []
         w2_tm_weights: list[torch.Tensor] = []
         w2_tm_scales: list[torch.Tensor] = []
-        w2_raw_scale_codes: list[torch.Tensor] = []
-        w2_raw_global_scales: list[torch.Tensor] = []
         w2_meta: list[torch.Tensor] = []
-        for expert_id in range(num_experts):
-            w13_packed = unpack_mxfp4_weight(layer.w13_weight[expert_id].data)
-            w13_scales = layer.w13_weight_scale[expert_id].float().clone()
-            w13_global = layer.w13_weight_scale_2[expert_id].float()
-            w13_scales[:intermediate].mul_(w13_global[0])
-            w13_scales[intermediate:].mul_(w13_global[1])
-            prepared_w13 = sm70_ops.nvfp4_sm70_prepare(
-                w13_packed,
-                w13_scales.half().t().contiguous(),
-                NVFP4_GROUP_SIZE,
-                interleave_gated_silu=fused_swiglu_prefill,
-            )
-            w13_tm_weights.append(prepared_w13[0])
-            w13_tm_scales.append(prepared_w13[1])
-            if raw_scale:
-                if fused_swiglu_prefill:
-                    physical_global = w13_global.repeat(intermediate)
-                else:
-                    physical_global = w13_global.repeat_interleave(intermediate)
-                w13_raw_scale_codes.append(
-                    (prepared_w13[1].float() / physical_global[None, :].float())
-                    .to(torch.float8_e4m3fn)
-                    .view(torch.uint8)
-                    .contiguous()
-                )
-                w13_raw_global_scales.append(w13_global.contiguous())
-            w13_meta.append(prepared_w13[2])
 
-            w2_packed = unpack_mxfp4_weight(layer.w2_weight[expert_id].data)
-            w2_global = layer.w2_weight_scale_2[expert_id].float().reshape(())
-            w2_scales = layer.w2_weight_scale[expert_id].float() * w2_global
-            prepared_w2 = sm70_ops.nvfp4_sm70_prepare(
-                w2_packed,
-                w2_scales.half().t().contiguous(),
-                NVFP4_GROUP_SIZE,
-            )
-            w2_tm_weights.append(prepared_w2[0])
-            w2_tm_scales.append(prepared_w2[1])
-            if raw_scale:
-                w2_raw_scale_codes.append(
-                    (prepared_w2[1].float() / w2_global)
-                    .to(torch.float8_e4m3fn)
-                    .view(torch.uint8)
-                    .contiguous()
+        # Batch the 4-bit unpack and scale multiplication across expert
+        # chunks to avoid launching one tiny op per expert per layer during
+        # load, while keeping temporary device memory bounded. The
+        # per-expert TurboMind repack below is elementwise on identical
+        # inputs, so the prepared tensors stay bitwise equal to the
+        # per-expert loop this replaces.
+        chunk_size = 64
+        for start in range(0, num_experts, chunk_size):
+            end = min(start + chunk_size, num_experts)
+
+            w13_chunk = layer.w13_weight[start:end].data
+            w13_unpacked = (
+                torch.stack(
+                    (
+                        (w13_chunk & 15).to(torch.uint8),
+                        ((w13_chunk >> 4) & 15).to(torch.uint8),
+                    ),
+                    dim=-1,
                 )
-                w2_raw_global_scales.append(w2_global.reshape(1))
-            w2_meta.append(prepared_w2[2])
+                .flatten(-2)
+                .transpose(-1, -2)
+                .contiguous()
+            )
+            w13_scales_chunk = layer.w13_weight_scale[start:end].float().clone()
+            w13_global_chunk = layer.w13_weight_scale_2[start:end].float()
+            w13_scales_chunk[:, :intermediate].mul_(w13_global_chunk[:, 0:1, None])
+            w13_scales_chunk[:, intermediate:].mul_(w13_global_chunk[:, 1:2, None])
+            w13_scales_half = w13_scales_chunk.half().transpose(-1, -2).contiguous()
+
+            w2_chunk = layer.w2_weight[start:end].data
+            w2_unpacked = (
+                torch.stack(
+                    (
+                        (w2_chunk & 15).to(torch.uint8),
+                        ((w2_chunk >> 4) & 15).to(torch.uint8),
+                    ),
+                    dim=-1,
+                )
+                .flatten(-2)
+                .transpose(-1, -2)
+                .contiguous()
+            )
+            w2_global_chunk = (
+                layer.w2_weight_scale_2[start:end].float().reshape(end - start, 1, 1)
+            )
+            w2_scales_half = (
+                (layer.w2_weight_scale[start:end].float() * w2_global_chunk)
+                .half()
+                .transpose(-1, -2)
+                .contiguous()
+            )
+
+            for i in range(end - start):
+                prepared_w13 = sm70_ops.nvfp4_sm70_prepare(
+                    w13_unpacked[i],
+                    w13_scales_half[i],
+                    NVFP4_GROUP_SIZE,
+                    interleave_gated_silu=fused_swiglu_prefill,
+                )
+                w13_tm_weights.append(prepared_w13[0])
+                w13_tm_scales.append(prepared_w13[1])
+                if not w13_meta:
+                    w13_meta.append(prepared_w13[2])
+
+                prepared_w2 = sm70_ops.nvfp4_sm70_prepare(
+                    w2_unpacked[i],
+                    w2_scales_half[i],
+                    NVFP4_GROUP_SIZE,
+                )
+                w2_tm_weights.append(prepared_w2[0])
+                w2_tm_scales.append(prepared_w2[1])
+                if not w2_meta:
+                    w2_meta.append(prepared_w2[2])
 
         layer.w13_tm_weight = Parameter(
             torch.stack(w13_tm_weights), requires_grad=False
@@ -1118,10 +1140,30 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         prepared_w13_scales = torch.stack(w13_tm_scales)
         prepared_w2_scales = torch.stack(w2_tm_scales)
         if raw_scale:
-            raw_w13_codes = torch.stack(w13_raw_scale_codes)
-            raw_w13_globals = torch.stack(w13_raw_global_scales).float()
-            raw_w2_codes = torch.stack(w2_raw_scale_codes)
-            raw_w2_globals = torch.stack(w2_raw_global_scales).float()
+            # Extract the raw E4M3 scale codes once per layer from the
+            # stacked prepared scales instead of once per expert.
+            raw_w13_globals = layer.w13_weight_scale_2.data.float().contiguous()
+            if fused_swiglu_prefill:
+                physical_global = raw_w13_globals.repeat(1, intermediate)
+            else:
+                physical_global = raw_w13_globals.repeat_interleave(intermediate, dim=1)
+            raw_w13_codes = (
+                (prepared_w13_scales.float() / physical_global[:, None, :])
+                .to(torch.float8_e4m3fn)
+                .view(torch.uint8)
+                .contiguous()
+            )
+            raw_w2_globals = (
+                layer.w2_weight_scale_2.data.float()
+                .reshape(num_experts, 1)
+                .contiguous()
+            )
+            raw_w2_codes = (
+                (prepared_w2_scales.float() / raw_w2_globals[:, :, None])
+                .to(torch.float8_e4m3fn)
+                .view(torch.uint8)
+                .contiguous()
+            )
             scale_workspace = _get_qwen38_raw_scale_workspace(
                 layer.w13_tm_weight.device
             )
@@ -1260,10 +1302,15 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         del layer.w2_weight_scale
         del layer.w2_weight_scale_2
         del layer.w2_input_scale
-        # Release unused conversion blocks between layers instead of retaining
-        # their high-water mark throughout model loading. Live prepared weights
-        # and inference buffers are unaffected; this is not an inference hook.
-        torch.accelerator.empty_cache()
+        # Release unused conversion blocks when allocator slack grows large
+        # instead of synchronizing the device on every layer.
+        if layer.w13_tm_weight.is_cuda:
+            mem_stats = torch.accelerator.memory_stats(layer.w13_tm_weight.device)
+            slack = mem_stats.get("reserved_bytes.all.current", 0) - mem_stats.get(
+                "allocated_bytes.all.current", 0
+            )
+            if slack > 512 * 1024 * 1024:
+                torch.accelerator.empty_cache()
         logger.info_once(
             "SM70 ModelOpt NVFP4 TurboMind MoE path enabled "
             "(hidden=%d, local_intermediate=%d, local_experts=%d, top_k=%d, "
@@ -1340,7 +1387,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
 
         use_m48 = m48_requested and use_v154
         device = layer.w13_tm_weight.device
-        rows = _RAW_GROUPED_M48_TOKENS if use_m48 else 40
+        rows = _GROUPED_DECODE_MAX_TOKENS if use_m48 else 40
         routes = rows * top_k
         layer._nvfp4_raw_grouped_output = torch.empty(
             rows, hidden, dtype=torch.float16, device=device
@@ -1372,7 +1419,8 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 torch.empty(1, dtype=torch.int32, device=device),
             )
             logger.info_once(
-                "Prepared SM70 raw grouped M48 v154 decode with equal gate/up globals."
+                "Prepared SM70 raw grouped M41-M64 v154 decode with equal "
+                "gate/up globals."
             )
         logger.info_once(
             "Experimental SM70 raw-E4M3 grouped NVFP4 enabled "
@@ -1728,7 +1776,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         if num_tokens == 0:
             return x.new_empty((0, hidden))
         plan = None
-        if num_tokens == _RAW_GROUPED_M48_TOKENS:
+        if _RAW_GROUPED_WIDE_MIN_TOKENS <= num_tokens <= _GROUPED_DECODE_MAX_TOKENS:
             plan = layer._nvfp4_raw_grouped_m48_plan
         elif 3 <= num_tokens <= _RAW_GROUPED_NARROW_MAX_TOKENS:
             plan = layer._nvfp4_raw_grouped_narrow_plan

@@ -64,10 +64,14 @@ def engine_config(monkeypatch, tmp_path):
         packed=None,
         long_context=False,
         gdn_replay=None,
+        gdn_deferred_commit_metadata=None,
         replay_graph=None,
         legacy_graph=True,
         dynamic_schedule=None,
         dp_size=1,
+        awq=False,
+        gdn_input_v154=None,
+        async_scheduling=False,
     ):
         target = tmp_path / "target"
         target.mkdir(exist_ok=True)
@@ -80,6 +84,19 @@ def engine_config(monkeypatch, tmp_path):
                         else "Qwen3_5ForConditionalGeneration"
                     ],
                     "model_type": "qwen4_exp" if hidden_size == 2560 else "qwen3_5",
+                    **(
+                        {
+                            "quantization_config": {
+                                "quant_method": "awq",
+                                "bits": 4,
+                                "group_size": 32,
+                                "zero_point": True,
+                                "version": "gemm",
+                            }
+                        }
+                        if awq
+                        else {}
+                    ),
                     "text_config": {
                         "model_type": "qwen4_exp_text"
                         if hidden_size == 2560
@@ -93,6 +110,20 @@ def engine_config(monkeypatch, tmp_path):
                         "vocab_size": 128,
                         "mtp_num_hidden_layers": 1,
                         "layer_types": ["linear_attention"] * 3 + ["full_attention"],
+                        **(
+                            {
+                                "moe_intermediate_size": 640,
+                                "num_experts": 512,
+                                "num_experts_per_tok": 10,
+                                "indexer_n_heads": 4,
+                                "indexer_kv_heads": 1,
+                                "indexer_head_dim": 128,
+                                "indexer_budget": 2048,
+                                "indexer_compress_ratio": 4,
+                            }
+                            if awq
+                            else {}
+                        ),
                     },
                 }
             )
@@ -137,7 +168,10 @@ def engine_config(monkeypatch, tmp_path):
                 num_speculative_tokens_per_batch_size=dynamic_schedule,
                 draft_sample_method="greedy",
                 gdn_state_replay=gdn_replay,
+                gdn_deferred_commit_metadata=gdn_deferred_commit_metadata,
                 gdn_state_replay_graph=replay_graph,
+                # Keep this config-only test independent of the drafter loader.
+                mtp_expert_quantization="fp16" if awq and method == "mtp" else None,
                 sm70_dflash2=Sm70DFlash2Config(
                     spec_state_replay=replay,
                     spec_state_replay_graph=legacy_graph,
@@ -147,7 +181,8 @@ def engine_config(monkeypatch, tmp_path):
         )
         return VllmConfig(
             kernel_config=KernelConfig(
-                long_context_kv={"enabled": long_context, "host_pool_gib": 128}
+                long_context_kv={"enabled": long_context, "host_pool_gib": 128},
+                sm70_gdn_input_v154=gdn_input_v154,
             ),
             model_config=model,
             speculative_config=spec,
@@ -161,12 +196,71 @@ def engine_config(monkeypatch, tmp_path):
                 max_num_batched_tokens=8192,
                 max_model_len=524288,
                 is_encoder_decoder=model.is_encoder_decoder,
-                async_scheduling=False,
+                async_scheduling=async_scheduling,
             ),
         )
 
     yield build
     envs.disable_envs_cache()
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["mtp", "dflash", "explicit_off", "nvlink", "dp2", "auto_nccl", "async_deferred"],
+)
+def test_awq_mtp_wide_verify_defaults(engine_config, monkeypatch, case):
+    from vllm import revolta_profile
+    from vllm.model_executor.layers import quantization
+    from vllm.model_executor.layers.quantization.awq import AWQConfig
+    from vllm.model_executor.model_loader import weight_utils
+    from vllm.platforms import current_platform
+
+    # The CPU environment omits unrelated optional quantization backends.
+    monkeypatch.setattr(quantization, "get_quantization_config", lambda _: AWQConfig)
+    monkeypatch.setattr(weight_utils, "get_quantization_config", lambda _: AWQConfig)
+    monkeypatch.setattr(revolta_profile, "_PROFILE_VALUES", {})
+    monkeypatch.setattr(revolta_profile, "_INITIAL_ENV", {})
+    monkeypatch.setattr(current_platform, "use_custom_allreduce", lambda: True)
+    monkeypatch.setattr(
+        current_platform, "is_pcie_switch_connected", lambda ids: True, raising=False
+    )
+    monkeypatch.setattr(
+        current_platform,
+        "is_fully_connected",
+        lambda ids: case == "nvlink",
+        raising=False,
+    )
+    method = "dflash" if case == "dflash" else "mtp"
+    explicit_off = case == "explicit_off"
+    async_deferred = case == "async_deferred"
+    if async_deferred:
+        # The CPU platform hook would reset the resolved scheduler to synchronous.
+        monkeypatch.setattr(current_platform, "check_and_update_config", lambda _: None)
+    if case == "auto_nccl":
+        monkeypatch.setenv("VLLM_SM70_INTERCONNECT", "auto")
+        monkeypatch.setenv("VLLM_SM70_PCIE_SWITCH_CUSTOM_AR", "0")
+    if explicit_off:
+        monkeypatch.setenv("VLLM_SM70_MTP_GDN_NATIVE_VERIFY", "0")
+        monkeypatch.setenv("VLLM_SM70_QWEN38_NATIVE_ROUTER_TOPK", "0")
+        monkeypatch.setenv("VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS", "40")
+    config = engine_config(
+        2560,
+        method=method,
+        awq=True,
+        gdn_replay=not async_deferred,
+        gdn_deferred_commit_metadata=True if async_deferred else None,
+        dp_size=2 if case == "dp2" else 1,
+        gdn_input_v154=False if explicit_off else None,
+        async_scheduling=async_deferred,
+    )
+    if async_deferred:
+        assert config.scheduler_config.async_scheduling is True
+        assert config.speculative_config.gdn_spec_state_replay
+    enabled = case == "mtp"
+    assert config.kernel_config.sm70_gdn_input_v154 is enabled
+    assert envs.VLLM_SM70_MTP_GDN_NATIVE_VERIFY is enabled
+    assert envs.VLLM_SM70_QWEN38_NATIVE_ROUTER_TOPK is enabled
+    assert (48 if enabled else 40) == envs.VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS
 
 
 def test_dynamic_mtp_uses_fixed_k_with_data_parallelism(engine_config):

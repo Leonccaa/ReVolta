@@ -1379,6 +1379,54 @@ int64_t sm70_tp4_push_allreduce_buffer_size() {
   return vllm::kSm70Tp4PushAllreduceBufferBytes;
 }
 
+int64_t sm70_dcp2_p2p_buffer_size() {
+#if defined(USE_ROCM)
+  return 0;
+#else
+  return sizeof(vllm::Sm70Dcp2Mailbox);
+#endif
+}
+
+void sm70_dcp2_p2p(fptr_t _fa, int64_t peer, const torch::Tensor& local_input,
+                   const torch::Tensor& peer_input, torch::Tensor& local_out,
+                   torch::Tensor& peer_out) {
+#if defined(USE_ROCM)
+  TORCH_CHECK(false, "SM70 DCP2 P2P is unavailable on ROCm");
+#else
+  const at::cuda::OptionalCUDAGuard guard(device_of(local_input));
+  auto* fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  const auto& buffers = fa->sm70_tp4_push_buffers_;
+  auto* local = vllm::sm70_dcp2_mailbox(buffers.ptrs[fa->rank_]);
+  auto* remote = vllm::sm70_dcp2_mailbox(buffers.ptrs[peer]);
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+  const int bytes = local_input.numel() * local_input.element_size();
+  const auto* src = static_cast<const uint8_t*>(peer_input.const_data_ptr());
+  const auto* self = static_cast<const uint8_t*>(local_input.const_data_ptr());
+  auto* own = static_cast<uint8_t*>(local_out.mutable_data_ptr());
+  auto* other = static_cast<uint8_t*>(peer_out.mutable_data_ptr());
+  // As in TP4 push gather, each rank finishes sending before it waits.
+  if (local_input.scalar_type() == torch::kFloat16) {
+    // Q writes one head slice per row into [M, 12, 256].
+    const int row_bytes = bytes / local_input.size(0);
+    const int step = local_out.stride(0) * local_out.element_size();
+    const int rows = local_input.size(0);
+    vllm::sm70_dcp2_send<false>
+        <<<rows, 128, 0, stream>>>(local, remote, src, bytes, row_bytes);
+    vllm::sm70_dcp2_receive<false><<<rows, 128, 0, stream>>>(
+        local, self, own, other, bytes, row_bytes, step);
+  } else {
+    // A2A writes one contiguous [M, 6, 257] slice per source rank.
+    constexpr int tile_bytes = vllm::kSm70Tp4GatherTileBytes;
+    const int tiles = (bytes + tile_bytes - 1) / tile_bytes;
+    vllm::sm70_dcp2_send<true>
+        <<<tiles, 128, 0, stream>>>(local, remote, src, bytes, tile_bytes);
+    vllm::sm70_dcp2_receive<true><<<tiles, 128, 0, stream>>>(
+        local, self, own, other, bytes, tile_bytes, tile_bytes);
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+#endif
+}
+
 void sm70_tp4_push_allgather(fptr_t _fa, torch::Tensor& input,
                              torch::Tensor& output) {
 #if defined(USE_ROCM)

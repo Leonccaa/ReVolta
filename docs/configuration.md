@@ -14,19 +14,43 @@ The complete reference exports are in [step 3 of the tutorial](getting-started.m
 Use only the documented `VLLM_SM70_*` settings unless you are troubleshooting. Explicit
 values override the profile.
 
-`VLLM_SM70_MTP_GDN_NATIVE_VERIFY=1` enables experimental native GDN verification
-and accepted-state replay for eligible Flash-Next MTP batches on SM70 TP4.
-The default is `0`. Validate target outputs and committed states against Triton
-before enabling it for service.
+Flash-Next AWQ g32 MTP4 enables the wide verifier defaults below for a single
+SM70 TP4 replica with DCP2, GPU KV, synchronous scheduling and GDN state replay
+when the interconnect policy selects PCIe P2P. Automatic environment values
+apply to the entire process. Explicit settings take precedence. These kernels
+can change floating-point rounding and token choices.
+
+- `VLLM_SM70_MTP_GDN_NATIVE_VERIFY=1` uses native GDN verification and
+  accepted-state replay for eligible batches. Set `0` to disable it.
+- `sm70_gdn_input_v154=true` in `--kernel-config` enables packed FP16 GDN
+  input projections for 2–64 rows in FULL verification graphs with query length
+  greater than 1. With speculative decoding, it also keeps the 3–4 row FULL
+  decode route at query length 1. Set `false` to disable it.
+- `VLLM_SM70_QWEN38_NATIVE_ROUTER_TOPK=1` uses the native router for 17–64
+  eligible rows. Set `0` to disable it.
+- `VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS=48` raises the upper row
+  limit from 40 to 48. Set `40` to keep the previous limit, or set
+  `VLLM_SM70_AWQ_QWEN38_GROUPED_QPN=0` to disable the grouped route.
+
+The packed GDN projection accepts eligible unquantized FP16 projections on
+AWQ g32 and standard NVFP4 checkpoints. It excludes FP4-Local and QAD MXFP8
+projections. NVFP4 prepared-scale grouped decode covers 2–64 rows when enabled
+with `VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE=0`.
+The NVFP4 profile defaults that setting to `1`.
 
 ## Interconnect
 
 The engine selects the interconnect automatically and logs `SM70 interconnect=<mode>`.
-PCIe switch P2P uses custom all-reduce inside CUDA graphs for messages up to 80 KiB
-and for FP16 payloads of 100, 120, 125, 150, 160, 175 and 200 KiB. On an SM70 TP4 group
-(under one PCIe switch, or on NVLink) the MoE
-output sum (sum2) uses its own push kernel at the sizes that have one and otherwise adds
-locally before the ordinary all-reduce. Override with `VLLM_SM70_INTERCONNECT=auto|pex|nccl|nvlink`
+PCIe switch P2P uses custom all-reduce inside CUDA graphs. On SM70 TP4, the
+push kernel covers selected FP16 payloads, including 42–64 rows of width 2560
+(215040–327680 bytes). `VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES` defaults to
+`327680` (320 KiB). Larger payloads use NCCL by default. The same cap also
+applies to eager custom all-reduce when `VLLM_SM70_PCIE_SWITCH_CAR_GRAPH_ONLY=0`.
+Set `204800` to keep the previous cap and push sizes, or `0` to remove the byte
+cap without removing the other custom all-reduce limits. On SM70 TP4 (PCIe switch or NVLink), the MoE
+output sum (sum2) uses its own push kernel for eligible sizes and otherwise
+adds locally before the ordinary all-reduce. Override with
+`VLLM_SM70_INTERCONNECT=auto|pex|nccl|nvlink`
 or disable custom all-reduce with `--disable-custom-all-reduce`.
 
 `VLLM_SM70_NVLINK_HC=1` opts into experimental Flash-Next HC sharding, fused
@@ -37,13 +61,23 @@ satisfy these checks. The QSA route supports FP16 queries with six 256-element
 heads per rank and up to 64 rows. These paths can change floating-point rounding
 and are subject to model quality validation.
 
+`VLLM_SM70_DCP2_P2P=1` opts into experimental Flash-Next QSA DCP2 query and packed
+output/LSE exchange on an SM70 TP4 PCIe-switch group with registered push buffers.
+It defaults to `0`. The path uses FP16 queries and the DCP A2A backend for eager uniform
+decode and dedicated FULL decode graphs, up to 53 rows. PIECEWISE graphs keep
+using NCCL. Four-GPU AWQ tests showed no stable gain in cold time to first token or
+decode; fixed-prompt outputs matched the NCCL path token for token. Enabling this
+option requires `_C` built from
+the same commit, or a Custom AR sidecar that exports both
+`sm70_dcp2_p2p_buffer_size` and `sm70_dcp2_p2p`.
+
 ## Launch options
 
 `--kv-cache-dtype` selects the storage format:
 
 | Value | Storage format / QSA auto selection |
 | --- | --- |
-| `fp8` / `fp8_e4m3` | Existing E4M3 with calibrated per-layer K/V scalar scales |
+| `fp8` / `fp8_e4m3` | Frozen. E4M3 with calibrated per-layer K/V scalar scales |
 | `fp8_per_token_head` | L1 planar E4M3FN with dynamic FP32 scales per token and head; no KV scale overlay needed |
 | `auto` (CLI default) | Planar INT8 for eligible SM70 QSA, planar E4M3 for eligible QSA on other CUDA devices |
 | `int8_per_token_head` / `int8` | On Qwen4Exp QSA, both use planar INT8 with round-to-nearest-even and dynamic FP32 scales per token and head |
@@ -143,6 +177,30 @@ measurements remain unchanged; planar GPU acceptance is still pending.
 - Media limits and request budgets: see
   [multimodal input limits](../.github/MULTIMODAL_INPUTS.md).
 
+### Chat control tokens and the reasoning end-of-turn mask
+
+`--sanitize-control-tokens` (boolean, default `false`) encodes control tokens
+that appear inside chat messages, tool results or documents as plain text: the
+special tokens and the added tokens the chat template uses. Only the chat
+template can then emit them, so a user cannot inject a control token by
+writing it literally. It applies to the Hugging Face chat template path, where
+the rendered template is tokenized with the sanitizer enabled; a tokenizer that
+does not forward the option (for example the Mistral tokenizer) ignores it. The
+server-side setting cannot be turned off per request. Sanitising happens while
+the rendered chat template is tokenized, so a request with multimodal input and
+the `string` chat template content format is rejected with a validation error.
+See [#157](https://github.com/Leonccaa/ReVolta/issues/157).
+
+`VLLM_QWEN_REASONING_EOS_MASK` (default `0`; set `1` to enable) suppresses the
+model's end-of-turn token while a request is still inside its reasoning block,
+so a Qwen chat model that writes the end-of-turn marker literally in its
+reasoning does not end the turn with reasoning only and no answer. It needs a
+request that asks for the reasoning content, uses the Qwen3 reasoning parser
+with thinking enabled, runs on Model Runner V2 and whose prompt already
+contains an unclosed thinking start tag; a template that lets the model write
+the thinking start tag itself is not masked at the start of the request. See
+[#157](https://github.com/Leonccaa/ReVolta/issues/157).
+
 ### ReVolta serving defaults
 
 The SM70 ReVolta profile applies these defaults to FP16 TP4 QSA hybrid
@@ -169,9 +227,10 @@ take precedence.
 The engine still resolves omitted `--async-scheduling` from the executor and
 speculative decoding settings. The DFlash2 schedule and MTP's post-sampling
 GDN state replay select synchronous scheduling by default. Explicit
-`--async-scheduling` retains the existing compatibility checks and skips
-post-sampling replay. Nonstandard K values keep fixed-width drafting when no
-schedule is supplied.
+`--async-scheduling` retains the existing compatibility checks. Nonstandard K
+values keep fixed-width drafting when no schedule is supplied. What async
+scheduling does to the GDN state depends on the deployment; see the
+[DFlash2 settings](dflash2.md#settings).
 
 ### Mixed prefill scheduling
 
@@ -326,7 +385,7 @@ is configuration, tuning, experimental, debug or deprecated.
 
 | Name | Type | Default | Range | Category | Since | Effect and trade-off |
 |---|---|---|---|---|---|---|
-| `VLLM_SM70_NVFP4_RAW_GROUPED_M48_V154` | bool | `False` | 0, 1 | experimental | 0.2.0rc15 | Native raw-E4M3 grouped MoE for 48-row target decode on SM70 TP4 Qwen3.8 with equal interleaved gate/up global scales. Requires raw grouped decode and the V2 model runner. |
+| `VLLM_SM70_NVFP4_RAW_GROUPED_M48_V154` | bool | `False` | 0, 1 | experimental | 0.2.0rc15 | Native raw-E4M3 grouped MoE for 41..64-row target decode on SM70 TP4 Qwen3.8 with equal interleaved gate/up global scales. Requires raw grouped decode and the V2 model runner. |
 | `VLLM_SM70_NVFP4_RAW_GROUPED_NARROW_V154` | bool | `False` | 0, 1 | experimental | 0.2.0rc15 | Native raw-E4M3 grouped MoE for 3-5 row target decode on SM70 TP4 Qwen3.8 with equal interleaved gate/up global scales. Requires raw grouped decode and the V2 model runner. |
 
 ### Promoted research switches
@@ -341,10 +400,13 @@ is configuration, tuning, experimental, debug or deprecated.
 | `VLLM_SM70_CHECKPOINT_CACHE_DROP` | bool | `True` | 0, 1 | configuration | 0.2.0 | Default on; engine startup only. 1 requests clean checkpoint cache eviction before host KV allocation, after a world load barrier. Skips live mappings and PLE disk/cascade modes. May slow later reloads or other engines reading the same checkpoint. See startup logs for advised files/bytes and cgroup usage; no metric. |
 | `VLLM_SM70_GDN_CPU_SPEC_QSL` | bool | `False` | 0, 1 | tuning | 0.2.0 | Removes two host synchronizations per step in mixed prefill + speculative batches; costs a host-side offset computation. Outputs are bitwise identical either way. |
 | `VLLM_SM70_GDN_CPU_SPEC_QSL_CHECK_FILE` | str | `''` | path | debug | 0.2.0 | Validation only: adds the synchronizations back while the file exists. Never set for timing runs. |
+| `VLLM_SM70_GDN_NATIVE_PREFILL` | bool | `True` | 0, 1 | tuning | 0.2.0rc16 | Use the native SM70 GDN kernel by default for eligible original TileLang chunks on Model Runner V2 only. It can change floating-point results and reserves shared GPU scratch space. Set 0 to use TileLang instead. Model Runner V1 is unaffected. |
 | `VLLM_SM70_GDN_SKINNY_MPLAN` | bool | `False` | 0, 1 | tuning | 0.2.0 | ng=2 tiling is 8-26% faster at M = 9..24 and 33..48 on V100; other M keep the fixed plan. Only with VLLM_SM70_QWEN38_GDN_NO_PACK. Outputs are bitwise identical either way. |
 | `VLLM_SM70_HOST_DECODE_FAST` | bool | `True` | 0, 1 | tuning | 0.2.0 | Default on. Long-context host KV decode only: fuses three pairs of host-history decode kernels. Set 0 and restart to restore the original kernels; ordinary GPU KV paths are unaffected. |
+| `VLLM_SM70_MTP_KV_ONLY_PREFILL` | bool | `True` | 0, 1 | tuning | 0.2.0rc16 | For eligible Flash-Next MTP batches with DP=1 and GPU or Host draft KV, eager incomplete prefills only write KV. If a prefill completes, the sampled-row path writes KV for all rows and computes outputs only for sampled rows outside FULL CUDA graph replay. Floating-point results can differ from the full-row path. Set 0 to use full-row draft prefill. |
 | `VLLM_SM70_QSA_GROUPED_LPT` | bool | `False` | 0, 1 | tuning | 0.2.0 | Longest grouped page4 CTAs start first, which shortens the tail of uneven decode batches. Outputs are bitwise identical either way. |
 | `VLLM_SM70_QSA_LOCAL_INPUTS_FUSED` | bool | `True` | 0, 1 | tuning | 0.2.0 | Default on. DCP-sharded shared-key scorer: one fused integer metadata conversion instead of the torch reference. Set 0 and restart to restore the torch reference. |
+| `VLLM_SM70_QSA_SHORT_APPEND` | bool | `True` | 0, 1 | tuning | 0.2.0 | Short warm appends can use SM70 QSA cuBLAS scoring. The single-request row floor drops from 512 to 128 at 4096 aligned routing columns, and mixed batches can split requests with at least 128 rows at 16384 tokens or more. The score work threshold still applies. Near-tied block selection may differ from the paged scorer. Set 0 and restart to restore the original routing. |
 
 ### Settings used by the reference deployment
 
@@ -378,7 +440,7 @@ The ReVolta profile (`vllm/revolta_profile.py`) sets these on SM70 + TP4 + FP16 
 | `VLLM_PLE_ASYNC_REQUEST_INDICES` | bool | `False` | `1` | 0, 1 | experimental | 0.2.0 | Non-blocking PLE request-index transfers; removes a host wait per step. |
 | `VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP` | bool | `False` | `0`, `1` (AWQ+DFlash2) | 0, 1 | configuration | 1Cat | Allows shared and routed experts to run on separate CUDA streams. The native g32 AWQ profile enables it for DFlash2 with expert parallelism and dual batch overlap disabled. An explicit 0 or 1 takes precedence. |
 | `VLLM_SM70_AWQ_QWEN38_GROUPED_QPN` | bool | `False` | `1` (AWQ) | 0, 1 | experimental | 0.2.0 | Grouped AWQ MoE decode reads each active expert once for all its rows (2..48). Faster at 2..8 requests; reduction order differs from the TurboMind route. |
-| `VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS` | int | `20` | `40` (AWQ) | 2..48 | tuning | 0.2.0 | Largest row count sent to the grouped route; above it rows use TurboMind. The profile uses 40 (8 requests x 5 tokens). |
+| `VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS` | int | `20` | `40` (AWQ), `48` (AWQ MTP4 wide verifier) | 2..48 | tuning | 0.2.0 | Largest row count sent to the grouped route; above it rows use TurboMind. The wide verifier profile raises the AWQ cap from 40 to 48. DFlash2 uses its dedicated row cap. |
 | `VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_PACK_ROWS` | int | `0` | `24` (AWQ) | 0 or 8..48 step 8 | tuning | 0.2.0 | Caps rows per expert pack: fewer registers per CTA but hot experts are read more than once. Result unchanged. |
 | `VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT` | int | `16` | `8` (AWQ) | 4, 8, 16 | tuning | 0.2.0 | W13 split-K warps per CTA. 16 matches the M1 arithmetic; 8 (profile) uses fewer threads and a different FP32 split association. |
 | `VLLM_SM70_AWQ_QWEN38_QPN_M1` | bool | `True` | `1` (AWQ) | 0, 1 | configuration | 1Cat | Single-token W13/W2 QPN route; 0 restores the legacy route. Changes reduction order. |
@@ -386,8 +448,9 @@ The ReVolta profile (`vllm/revolta_profile.py`) sets these on SM70 + TP4 + FP16 
 | `VLLM_SM70_CAR_VMM_SAFE` | bool | `False` | `1` (P2P/NVLink) | 0, 1 | experimental | 0.2.0 | Copies non-exportable (VMM) inputs into graph allocations while capturing custom all-reduce graphs, so expandable segments can stay on. Only with P2P or NVLink. |
 | `VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS` | bool | `True` | `0` (DFlash2) | 0, 1 | configuration | 1Cat | Single-request DFlash2 verifier tail graphs. The DFlash2 profile sets 0 to keep the graph memory for the KV cache. |
 | `VLLM_SM70_GREEDY_VERIFY` | bool | `False` | `1` | 0, 1 | experimental | 0.2.0 | Greedy MTP verification from TP-local argmax pairs instead of full-vocabulary logits; only when every request is plain greedy. |
+| `VLLM_SM70_MTP_GDN_NATIVE_VERIFY` | bool | `False` | `1` (AWQ MTP4 wide verifier) | 0, 1 | configuration | 1Cat | Uses the native recurrent verifier and accepted-state replay in the AWQ MTP4 wide verifier profile. Set 0 to disable. |
 | `VLLM_SM70_MTP_Q8_PREFILL_MMQ` | bool | `False` | `1` (NVFP4) | 0, 1 | configuration | 0.2.0rc15 | Use grouped GGUF MMQ for Q8_0 MTP batches above 64 rows in chunks of up to 2048. MMQ changes accumulation order and increases temporary GPU memory usage. Set 0 to use the 64-row vector path. |
-| `VLLM_SM70_NVFP4_MOE_GROUPED_DECODE` | bool | `False` | `0` (NVFP4) | 0, 1 | experimental | 1Cat | Grouped native-NVFP4 decode; the profile keeps it off pending quality admission. |
+| `VLLM_SM70_NVFP4_MOE_GROUPED_DECODE` | bool | `False` | `0` (NVFP4) | 0, 1 | experimental | 1Cat | Prepared-scale native-NVFP4 decode for M = 2..64; set VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE=0 (the profile defaults to 1). The profile keeps grouped decode off pending quality admission. |
 | `VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL` | bool | `True` | `1` (NVFP4) | 0, 1 | configuration | 1Cat | One grouped TurboMind call for all routed experts in prefill. |
 | `VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE` | bool | `False` | `1` (NVFP4) | 0, 1 | experimental | 1Cat | QPN for every live width 2..16 (NVFP4). |
 | `VLLM_SM70_NVFP4_QWEN38_MOE_RAW_GROUPED_DECODE` | bool | `False` | `1` (NVFP4) | 0, 1 | experimental | 0.2.0 | Graph-safe raw-E4M3 grouped NVFP4 MoE for M = 2..40; needs RAW_SCALE storage. |
@@ -402,6 +465,7 @@ The ReVolta profile (`vllm/revolta_profile.py`) sets these on SM70 + TP4 + FP16 
 | `VLLM_SM70_QSA_SHARED_KEY` | bool | `False` | `1` | 0, 1 | experimental | 0.2.0 | Shared-key FP16 indexer for M2..8 verification queries of one request. |
 | `VLLM_SM70_QWEN38_GDN_NO_PACK` | bool | `False` | `1` | 0, 1 | experimental | 0.2.0 | Skips the packed GDN weight copy (725.6 MiB per TP4 rank) and serves 2..48 rows with the skinny dual GEMM; frees memory for KV. |
 | `VLLM_SM70_QWEN38_HYBRID_PLE` | bool | `False` | `0` | 0, 1 | configuration | 1Cat | Local pinned PLE shards for decode. The profile sets 0 (single PLE placement) on the reference deployment. |
+| `VLLM_SM70_QWEN38_NATIVE_ROUTER_TOPK` | bool | `False` | `1` (AWQ MTP4 wide verifier) | 0, 1 | experimental | 1Cat | Uses the native router for eligible 17–64 row FP16 logits in the AWQ MTP4 wide verifier profile. Set 0 to disable. |
 | `VLLM_SM70_QWEN38_WIDE_M` | bool | `False` | `1` | 0, 1 | experimental | 0.2.0 | Widens Qwen3.8 decode/verify routes from 4 to 8 requests (M up to 40); each VLLM_SM70_QWEN38_WIDE_M_* item can override it. |
 | `VLLM_SM70_SKIP_REJECTED_BATCH_PACKS` | bool | `False` | `1` | 0, 1 | experimental | 0.2.0 | Skips batch packs the precision policy never admits; saves about 199 MiB per rank. |
 | `VLLM_USE_AOT_COMPILE` | bool | `False` | `0` | 0, 1 | configuration | 1Cat | AOT compile reuse. The profile sets 0 on the reference deployment. |

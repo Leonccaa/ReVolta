@@ -15,6 +15,7 @@ from vllm.distributed.device_communicators.custom_all_reduce import CustomAllred
 from vllm.models.qwen4_exp.nvidia.ops import sm70_dcp2 as dcp2
 from vllm.models.qwen4_exp.nvidia.ops.qsa import _qsa_output_gate
 from vllm.v1.attention.ops.dcp_alltoall import (
+    _dcp_a2a_pack_send,
     _dcp_a2a_unpack_combine,
     _lse_weighted_combine,
 )
@@ -168,15 +169,21 @@ def test_base2_merge_empty_shards_and_half_rounding():
         [[0.0, 1.0], [-torch.inf, 0.0], [0.0, -torch.inf], [-torch.inf, -torch.inf]]
     )
     partial = torch.tensor([[0.125, 0.851], [0.0, 1.25], [1.75, 0.0], [0.0, 0.0]])
-    received = (
-        torch.stack([partial, lse], dim=-1).transpose(0, 1)[:, :, None].contiguous()
-    )
+    sent = torch.empty((2, 2, 4, 1, 2))  # [source, destination, row, head, D+1]
+    for rank in range(2):
+        rank_partial = torch.stack([partial[:, rank], -partial[:, rank]], dim=1)
+        rank_lse = lse[:, rank, None].expand(-1, 2).contiguous()
+        _dcp_a2a_pack_send(rank_partial[:, :, None], rank_lse, sent[rank], 2, 1, 1, 1)
+    received = sent[:, 0].contiguous()  # A2A routes the first head to rank 0.
     merged = _dcp_a2a_unpack_combine(received, 1, 1, False, False)
     expected = torch.tensor([(0.125 + 2 * 0.851) / 3, 1.25, 1.75, 0.0])
     torch.testing.assert_close(merged.flatten(), expected, rtol=1e-6, atol=1e-7)
     gate = torch.full((4, 1, 1), 0.5, dtype=torch.float16)
-    output = merged.half()
-    _qsa_output_gate(output, gate)
+    output = torch.empty_like(gate)
+    _qsa_output_gate(output, gate, merged=merged)
+    baseline = merged.half()
+    _qsa_output_gate(baseline, gate)
+    assert torch.equal(output, baseline)
     weights = gate.flatten().float().sigmoid()
     expected_gate = (expected.half().float() * weights).half()
     assert torch.equal(output.flatten(), expected_gate)

@@ -25,6 +25,10 @@ Use `--dtype half`: V100 has no BF16 support.
 
 ## KV scales and draft selection
 
+Tensor-scale calibrated E4M3 KV is frozen: it still works, but it is no longer
+optimized or tested in release acceptance. Eligible SM70 QSA models can use
+`--kv-cache-dtype auto` (INT8) or `fp8_per_token_head` for E4M3 storage.
+
 For explicit `fp8` / `fp8_e4m3`, calibrated scalar E4M3 KV scales belong to a
 specific checkpoint revision. Keep
 `VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES=1` enabled: missing target scales then
@@ -272,9 +276,8 @@ vllm serve /data/revolta/views/fp4-local/target-512k \
 `nvidia/Qwen3.8-Flash-Next-NVFP4-QAD` is a mixed-precision ModelOpt checkpoint:
 NVFP4 routed and shared experts, MXFP8 GDN and QSA projections (expanded to FP16
 at load), an FP8 PLE table, and a built-in MTP layer whose experts use FP8 block
-scales. It ships no QSA K/V scales, so it uses the per-token-head FP8 KV cache,
-which needs no calibration; with `--kv-cache-dtype auto` ReVolta selects it on
-its own. The built-in MTP layer follows the target's KV format.
+scales. It ships no QSA K/V scales, so this recipe uses `fp8_per_token_head`,
+which needs no calibration. The built-in MTP layer follows the target's KV format.
 
 Validated on four V100s (TP4/DCP2, MTP4, `fp8_per_token_head`, long-context host
 KV): every quantized path loads and serves, and greedy, sampled, tool-call, 32K
@@ -349,6 +352,8 @@ The E4M3 results below use the original scalar format, not planar E4M3.
 The first four rows use the same base BF16 reference; the Uncensored rows there include the effect of fine-tuning as well as quantization. The FP16 KV row is a separate comparison of FP16 and E4M3 KV against the Uncensored checkpoint's own BF16 parent (on short prompts: KL 0.0220 against 0.0214, top-1 97.08% for both; on the long-context set: 0.0239 against 0.0238).
 
 ## E4M3 KV
+
+Frozen; see [KV scales and draft selection](#kv-scales-and-draft-selection).
 
 For explicit scalar `fp8` / `fp8_e4m3`, use the calibrated per-layer K/V scales
 included in the checkpoint. Keep

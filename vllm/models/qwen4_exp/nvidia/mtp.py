@@ -529,11 +529,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         if self.num_mtp_layers != 1:
             return False
         layer = self.layers[0]
-        return (
-            layer.ple is None
-            and layer.layer_type == "full_attention"
-            and hasattr(layer.self_attn, "forward_kv_only")
-        )
+        return layer.ple is None and hasattr(layer.self_attn, "forward_kv_only")
 
     def forward_kv_only(
         self,

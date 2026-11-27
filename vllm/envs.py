@@ -5206,10 +5206,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         declared_default="True",
         effective_default="True for eligible batches; set 0 to disable both paths.",
         automatic_conditions=(
-            "Single-layer Flash-Next MTP with GPU or Host draft KV, no PLE, "
+            "Single-layer Flash-Next MTP with DP=1, GPU or Host draft KV, no PLE, "
             "draft tokens or multimodal inputs. KV-only requires an eager batch "
             "of incomplete prefills; sampled rows require at least one completed "
-            "prefill, DP=1 and no FULL CUDA graph replay.",
+            "prefill and no FULL CUDA graph replay.",
         ),
         acceleration_paths=("Flash-Next MTP draft",),
         user_visible=True,

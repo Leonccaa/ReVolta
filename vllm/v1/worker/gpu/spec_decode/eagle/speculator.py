@@ -970,9 +970,11 @@ class EagleSpeculator:
 
         self._mtp_prefill_begin()
         row_indices = None
+        # DP MoE collectives are coordinated using the full-row counts.
         if (
             envs.VLLM_SM70_MTP_KV_ONLY_PREFILL
             and self.method == "mtp"
+            and self.dp_size == 1
             and not dummy_run
             and not is_profile
             and not input_batch.is_dummy_batch
@@ -993,10 +995,8 @@ class EagleSpeculator:
                     )
                 ):
                     return self.draft_tokens[:num_reqs]
-            # DP MoE collectives are coordinated using the full-row counts.
             elif (
-                self.dp_size == 1
-                and getattr(self.model, "supports_last_row_prefill", False)
+                getattr(self.model, "supports_last_row_prefill", False)
                 and (input_batch.is_prefilling_np & ~incomplete).any()
             ):
                 row_indices = self.last_token_indices[:num_reqs]

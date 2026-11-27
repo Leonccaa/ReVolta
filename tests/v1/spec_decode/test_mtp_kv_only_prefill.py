@@ -47,6 +47,7 @@ from vllm.v1.worker.gpu.spec_decode.eagle import speculator as eagle
         "profile",
         "batch_dummy",
         "mode",
+        "dp_size",
         "path",
     ),
     [
@@ -59,6 +60,7 @@ from vllm.v1.worker.gpu.spec_decode.eagle import speculator as eagle
             False,
             False,
             CUDAGraphMode.NONE,
+            1,
             "full",
         ),
         (
@@ -70,9 +72,35 @@ from vllm.v1.worker.gpu.spec_decode.eagle import speculator as eagle
             False,
             False,
             CUDAGraphMode.NONE,
+            1,
             "kv",
         ),
-        (True, [True, True], 0, False, False, False, False, CUDAGraphMode.NONE, "kv"),
+        pytest.param(
+            None,
+            [True, True],
+            0,
+            False,
+            False,
+            False,
+            False,
+            CUDAGraphMode.NONE,
+            2,
+            "full",
+            id="dp2-incomplete",
+        ),
+        pytest.param(
+            None,
+            [True, False],
+            0,
+            False,
+            False,
+            False,
+            False,
+            CUDAGraphMode.NONE,
+            2,
+            "full",
+            id="dp2-completed",
+        ),
         (
             None,
             [True, False],
@@ -82,13 +110,69 @@ from vllm.v1.worker.gpu.spec_decode.eagle import speculator as eagle
             False,
             False,
             CUDAGraphMode.NONE,
+            1,
             "last",
         ),
-        (True, [True, True], 1, False, False, False, False, CUDAGraphMode.NONE, "full"),
-        (True, [True, True], 0, True, False, False, False, CUDAGraphMode.NONE, "full"),
-        (True, [True, True], 0, False, True, False, False, CUDAGraphMode.NONE, "full"),
-        (True, [True, True], 0, False, False, True, False, CUDAGraphMode.NONE, "full"),
-        (True, [True, True], 0, False, False, False, True, CUDAGraphMode.NONE, "full"),
+        (
+            True,
+            [True, True],
+            1,
+            False,
+            False,
+            False,
+            False,
+            CUDAGraphMode.NONE,
+            1,
+            "full",
+        ),
+        (
+            True,
+            [True, True],
+            0,
+            True,
+            False,
+            False,
+            False,
+            CUDAGraphMode.NONE,
+            1,
+            "full",
+        ),
+        (
+            True,
+            [True, True],
+            0,
+            False,
+            True,
+            False,
+            False,
+            CUDAGraphMode.NONE,
+            1,
+            "full",
+        ),
+        (
+            True,
+            [True, True],
+            0,
+            False,
+            False,
+            True,
+            False,
+            CUDAGraphMode.NONE,
+            1,
+            "full",
+        ),
+        (
+            True,
+            [True, True],
+            0,
+            False,
+            False,
+            False,
+            True,
+            CUDAGraphMode.NONE,
+            1,
+            "full",
+        ),
         (
             True,
             [True, True],
@@ -98,12 +182,35 @@ from vllm.v1.worker.gpu.spec_decode.eagle import speculator as eagle
             False,
             False,
             CUDAGraphMode.FULL,
+            1,
             "graph",
         ),
-        (False, [False], 0, False, False, False, False, CUDAGraphMode.NONE, "full"),
-        (True, [False], 0, False, False, False, False, CUDAGraphMode.PIECEWISE, "last"),
-        (True, [True], 0, False, False, False, False, CUDAGraphMode.PIECEWISE, "full"),
-        (True, [False], 0, False, False, False, False, CUDAGraphMode.FULL, "graph"),
+        (False, [False], 0, False, False, False, False, CUDAGraphMode.NONE, 1, "full"),
+        (
+            True,
+            [False],
+            0,
+            False,
+            False,
+            False,
+            False,
+            CUDAGraphMode.PIECEWISE,
+            1,
+            "last",
+        ),
+        (
+            True,
+            [True],
+            0,
+            False,
+            False,
+            False,
+            False,
+            CUDAGraphMode.PIECEWISE,
+            1,
+            "full",
+        ),
+        (True, [False], 0, False, False, False, False, CUDAGraphMode.FULL, 1, "graph"),
     ],
 )
 def test_propose_selects_prefill_path(
@@ -116,6 +223,7 @@ def test_propose_selects_prefill_path(
     profile,
     batch_dummy,
     mode,
+    dp_size,
     path,
 ):
     if enabled is None:
@@ -134,7 +242,7 @@ def test_propose_selects_prefill_path(
     spec.model = SimpleNamespace(supports_last_row_prefill=True)
     spec.num_speculative_steps = 2
     spec.max_num_reqs = 2
-    spec.dp_size = 1
+    spec.dp_size = dp_size
     spec.dp_rank = 0
     spec.hidden_states = torch.zeros(4, 4)
     spec.temperature = torch.zeros(2)
@@ -497,14 +605,26 @@ def test_last_rows_match_full_draft(
     full, full_attn = make_draft()
     fast, fast_attn = make_draft()
     assert fast.supports_last_row_prefill
-    spec = object.__new__(eagle.EagleSpeculator)
-    spec.model = fast
-    spec.vllm_config = SimpleNamespace()
-    spec.idx_mapping = torch.tensor([0, 1])
-    spec.current_draft_step = torch.tensor(0)
-    spec.draft_logits = None
-    spec.draft_tokens = torch.zeros(2, 2, dtype=torch.long)
-    spec._sample_draft = Mock(side_effect=lambda hidden, *args: hidden.argmax(-1))
+    rows = torch.tensor([1, 4])
+
+    def make_speculator(model):
+        spec = object.__new__(eagle.EagleSpeculator)
+        spec.model = model
+        spec.vllm_config = SimpleNamespace()
+        spec.idx_mapping = torch.tensor([0, 1])
+        spec.last_token_indices = rows
+        spec.current_draft_step = torch.tensor(0)
+        spec.draft_logits = None
+        spec.draft_tokens = torch.zeros(2, 2, dtype=torch.long)
+        spec._sample_draft = Mock(side_effect=lambda hidden, *args: hidden.argmax(-1))
+        spec.share_mtp_topk_indices = True
+        spec.supports_mm_inputs = False
+        spec.num_speculative_steps = 2
+        spec.max_model_len = 8
+        return spec
+
+    full_spec = make_speculator(full)
+    fast_spec = make_speculator(fast)
 
     def side_metadata(common, ratio, work=None):
         count = common.num_actual_tokens
@@ -563,17 +683,24 @@ def test_last_rows_match_full_draft(
         pos = torch.nn.functional.pad(raw.logical_positions, (0, padded - count))
         ids = torch.arange(padded)
         hidden = torch.randn(padded, 8, dtype=dtype)
-        expected_sample, expected_feedback = full.model.forward(ids, pos, hidden)
+        for spec in (full_spec, fast_spec):
+            spec.input_buffers = SimpleNamespace(
+                input_ids=ids.clone(),
+                positions=pos.clone(),
+                query_start_loc=torch.zeros(num_reqs + 1, dtype=torch.int32),
+                seq_lens=torch.zeros(num_reqs, dtype=torch.int32),
+            )
+            spec.hidden_states = hidden.clone()
+
+        full_spec.prefill(
+            num_reqs, padded, metadata, {}, None, skip_sample=num_reqs == 1
+        )
 
         state.context.no_compile_layers["mtp.attn"] = fast_attn
-        spec.input_buffers = SimpleNamespace(input_ids=ids, positions=pos.clone())
-        spec.hidden_states = hidden.clone()
         if num_reqs == 1:
-            assert spec.run_kv_only_prefill(padded, metadata, {}, None)
+            assert fast_spec.run_kv_only_prefill(padded, metadata, {}, None)
         else:
-            rows = torch.tensor([1, 4])
-            spec.last_token_indices = rows
-            spec.prefill(
+            fast_spec.prefill(
                 num_reqs,
                 padded,
                 metadata,
@@ -585,13 +712,12 @@ def test_last_rows_match_full_draft(
             assert (
                 context.call_args.kwargs["cudagraph_runtime_mode"] == CUDAGraphMode.NONE
             )
-            sample, _, positions, _, _ = spec._sample_draft.call_args.args
+            sample, _, positions, _, _ = fast_spec._sample_draft.call_args.args
+            expected_sample = full_spec._sample_draft.call_args.args[0]
+            torch.testing.assert_close(sample, expected_sample, rtol=1e-3, atol=2e-3)
             torch.testing.assert_close(
-                sample, expected_sample[rows], rtol=1e-3, atol=2e-3
-            )
-            torch.testing.assert_close(
-                spec.hidden_states[:num_reqs],
-                expected_feedback[rows],
+                fast_spec.hidden_states[:num_reqs],
+                full_spec.hidden_states[:num_reqs],
                 rtol=1e-3,
                 atol=2e-3,
             )
@@ -629,8 +755,7 @@ def test_last_rows_match_full_draft(
     if host_draft:
         assert torch.count_nonzero(fast_attn.kv_cache) == 0
 
-    # Compact the full path just as the speculator does before draft step 1.
-    full.model.compact_topk_indices(rows)
+    full_spec._mtp_prefill_end(num_reqs)
     expected_selection = full_attn.topk_indices_buffer[:num_reqs].clone()
     starts = torch.tensor([0, 1, 2], dtype=torch.int32)
     common = CommonAttentionMetadata(
@@ -660,26 +785,9 @@ def test_last_rows_match_full_draft(
     monkeypatch.setattr(
         qsa.Qwen4ExpQSAFlashAttentionImpl, reader_name, record_selection
     )
-    first_tokens = spec.draft_tokens[:, 0].clone()
-    second_tokens = []
-    for model, attention, feedback in (
-        (full, full_attn, expected_feedback[rows]),
-        (fast, fast_attn, spec.hidden_states[:num_reqs].clone()),
-    ):
-        spec.model = model
-        spec.share_mtp_topk_indices = True
-        spec.supports_mm_inputs = False
-        spec.num_speculative_steps = 2
-        spec.max_model_len = 8
-        spec.hidden_states = feedback.clone()
-        spec.input_buffers = SimpleNamespace(
-            input_ids=torch.zeros(num_reqs, dtype=torch.long),
-            positions=pos[rows].clone(),
-            query_start_loc=torch.zeros(num_reqs + 1, dtype=torch.int32),
-            seq_lens=torch.zeros(num_reqs, dtype=torch.int32),
-        )
+    for spec, attention in ((full_spec, full_attn), (fast_spec, fast_attn)):
         eagle.prepare_eagle_decode(
-            first_tokens,
+            spec.draft_tokens[:num_reqs, 0],
             torch.tensor([5, 3]),
             torch.zeros(num_reqs, dtype=torch.int32),
             spec.input_buffers,
@@ -696,9 +804,10 @@ def test_last_rows_match_full_draft(
         spec._mtp_decode_begin()
         spec.generate_draft(num_reqs, num_reqs, metadata, {}, None)
         spec._mtp_decode_end()
-        second_tokens.append(spec.draft_tokens[:, 1].clone())
 
     assert select.call_count == 3  # Neither decode step selects again.
     torch.testing.assert_close(selections[0], expected_selection)
     torch.testing.assert_close(selections[1], expected_selection)
-    torch.testing.assert_close(second_tokens[1], second_tokens[0])
+    torch.testing.assert_close(
+        fast_spec.draft_tokens[:, 1], full_spec.draft_tokens[:, 1]
+    )

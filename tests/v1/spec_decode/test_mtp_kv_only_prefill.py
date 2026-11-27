@@ -381,6 +381,7 @@ def test_last_rows_match_full_draft(
         idx.skip_topk = False
         idx.shared_key_scoring = False
         idx.fused_topk = False
+        idx.prefill_tp_group = None
         idx.q_layernorm = GemmaRMSNorm(4)
         idx.k_layernorm = GemmaRMSNorm(4)
         idx.rotary_emb = RotaryEmbedding(4, 2, 8, 10000, True, dtype)

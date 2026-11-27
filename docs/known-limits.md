@@ -9,9 +9,10 @@ all GPUs under one PCIe switch with P2P, are the recommended and tested intercon
 The reference system uses four V100 32 GB PCIe cards behind one PCIe switch
 (PIX/PXB in `nvidia-smi topo -m`), with P2P enabled and a 128 GiB container memory limit.
 
-The reference recipe uses planar INT8 target KV (`auto` on SM70) and FP16 MTP
-draft KV. Earlier release acceptance used scalar E4M3 KV, an optional, frozen
-format. See the [dtype comparison](configuration.md#launch-options).
+The reference recipe uses planar INT8 target KV (`auto` on SM70); the MTP draft
+KV inherits it. Earlier release acceptance used scalar E4M3 KV, an optional, frozen
+format, and the results below were measured with scalar E4M3 KV unless noted.
+See the [dtype comparison](configuration.md#launch-options).
 
 ## Support matrix
 

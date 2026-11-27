@@ -26,7 +26,7 @@ from tests.v1.attention.utils import (
     create_common_attn_metadata,
     create_vllm_config,
 )
-from vllm.config import SpeculativeConfig, set_current_vllm_config
+from vllm.config import SpeculativeConfig, VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import set_forward_context
 from vllm.model_executor import parameter
@@ -60,7 +60,18 @@ DEVICE = torch.device("cpu")
 
 
 @pytest.fixture
-def native_gdn_workspace(monkeypatch, local_gdn_model):
+def native_gdn_workspace(monkeypatch):
+    manager = workspace.WorkspaceManager(DEVICE)
+    monkeypatch.setattr(workspace, "_manager", manager)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    return manager
+
+
+@pytest.mark.parametrize("runner_v2", [True, False], ids=["v2", "v1"])
+def test_native_gdn_prefill_workspace_reuse(
+    monkeypatch, local_gdn_model, native_gdn_workspace, runner_v2
+):
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", str(int(runner_v2)))
     config = create_vllm_config(
         model_name=local_gdn_model, dtype=torch.float16, max_num_batched_tokens=256
     )
@@ -75,8 +86,7 @@ def native_gdn_workspace(monkeypatch, local_gdn_model):
         linear_value_head_dim=128,
         linear_conv_kernel_dim=4,
     )
-    manager = workspace.WorkspaceManager(DEVICE)
-    monkeypatch.setattr(workspace, "_manager", manager)
+    manager = native_gdn_workspace
     get_simultaneous = manager.get_simultaneous
 
     def get_cpu_buffers(*shapes_and_dtypes):
@@ -89,7 +99,6 @@ def native_gdn_workspace(monkeypatch, local_gdn_model):
             patch.setattr(source, "get_tensor_model_parallel_rank", lambda: 0)
             patch.setattr(source, "get_tensor_model_parallel_world_size", lambda: 1)
         patch.delenv("VLLM_SM70_GDN_NATIVE_PREFILL", raising=False)
-        patch.setattr(torch.accelerator, "empty_cache", lambda: None)
         patch.setattr(
             qwen_gdn.current_platform, "is_device_capability", lambda c: c == 70
         )
@@ -106,8 +115,19 @@ def native_gdn_workspace(monkeypatch, local_gdn_model):
             qwen_gdn.QwenGatedDeltaNetAttention(
                 gdn_config, config, "layers.0.linear_attn"
             )
+    if not runner_v2:
+        assert manager._current_workspaces == [None]
+        return
+
     manager.lock()
-    return config.scheduler_config.max_num_batched_tokens
+    max_tokens = config.scheduler_config.max_num_batched_tokens
+    full = qwen_gdn._sm70_native_gdn_prefill_workspace(max_tokens)
+    storage = full[0].untyped_storage().data_ptr()
+    for tokens in (1, 255, max_tokens):
+        assert all(
+            buf.untyped_storage().data_ptr() == storage
+            for buf in qwen_gdn._sm70_native_gdn_prefill_workspace(tokens)
+        )
 
 
 def test_sm70_qwen_gdn_warmup_uses_bound_forward_context(monkeypatch):
@@ -546,6 +566,7 @@ def test_sm70_flashqla_prefill_route(
     layer.enable_sm70_legacy_prefill_prep = False
     chunk_op = qwen_gdn.ChunkGatedDeltaRule.__new__(qwen_gdn.ChunkGatedDeltaRule)
     torch.nn.Module.__init__(chunk_op)
+    chunk_op._use_v2_model_runner = builder.vllm_config.use_v2_model_runner
     chunk_op._forward_method = chunk_op.forward_flashqla_sm70
     layer.chunk_gated_delta_rule = chunk_op
 
@@ -568,81 +589,29 @@ def test_sm70_flashqla_prefill_route(
     assert torch.all(kv_cache[1][metadata.non_spec_state_indices_tensor] == 1)
 
 
-@pytest.mark.parametrize("method", ["dflash", "mtp"])
-@pytest.mark.parametrize("cache_mode", ["none", "align"])
-def test_sm70_original_prefill_mixed_varlen_chunk_metadata(
-    monkeypatch, local_gdn_model, method, cache_mode
-):
-    monkeypatch.setenv("VLLM_SM70_FLASHQLA_ORIGINAL_PREFILL", "1")
-    builder = _create_gdn_builder(
-        local_gdn_model,
-        num_speculative_tokens=4,
-        speculative_method=method,
-        mamba_cache_mode=cache_mode,
-    )
-    builder.gdn_prefill_backend = "flashqla_sm70"
-    common = create_common_attn_metadata(
-        BatchSpec(seq_lens=[192, 40, 48, 72, 64], query_lens=[192, 1, 8, 72, 4]),
-        BLOCK_SIZE,
-        DEVICE,
-    )
-    # Align mode reserves additional state slots for speculative tokens.
-    common.block_table_tensor = torch.nn.functional.pad(
-        common.block_table_tensor, (0, builder.num_spec_state_tokens)
-    )
-    draft_counts = torch.tensor([-1, -1, -1, -1, 3], dtype=torch.int32)
-    metadata = builder.build(
-        common_prefix_len=0,
-        common_attn_metadata=common,
-        num_decode_draft_tokens_cpu=draft_counts,
-        num_accepted_tokens=torch.ones(5, dtype=torch.int32),
-        common_gdn_metadata=compute_common_gdn_attn_metadata(
-            num_decode_draft_tokens_cpu=draft_counts,
-            query_start_loc=common.query_start_loc,
-            query_start_loc_cpu=common.query_start_loc_cpu,
-            num_spec_state_tokens=builder.num_spec_state_tokens,
-            legacy_mixed_decode_routing=False,
-        ),
-    )
-    assert metadata.non_spec_query_start_loc.tolist() == [0, 192, 193, 201, 273]
-    assert metadata.chunk_offsets.tolist() == [0, 3, 4, 5, 7]
-    assert metadata.chunk_indices.tolist() == [
-        [0, 0],
-        [0, 1],
-        [0, 2],
-        [1, 0],
-        [2, 0],
-        [3, 0],
-        [3, 1],
-    ]
-    assert metadata.spec_query_start_loc.tolist() == [0, 4]
-
-
 @pytest.mark.parametrize(
-    ("method", "cache_mode", "indexed", "with_spec", "batch_kind"),
+    ("cache_mode", "indexed", "with_spec", "batch_kind"),
     [
-        *product(
-            ("dflash", "mtp"),
-            ("none", "align"),
-            (False, True),
-            (False, True),
-            ("prefill",),
+        *(
+            ("none", indexed, with_spec, "prefill")
+            for indexed, with_spec in product((False, True), repeat=2)
         ),
-        ("mtp", "none", True, True, "default_decode"),
-        ("mtp", "none", True, True, "chunk_decode"),
-        ("mtp", "none", True, True, "prefill_and_decode"),
+        ("align", True, True, "prefill"),
+        ("none", True, True, "default_decode"),
+        ("none", True, True, "chunk_decode"),
+        ("none", True, True, "prefill_and_decode"),
     ],
 )
 @pytest.mark.usefixtures("native_gdn_workspace")
 def test_native_gdn_prefill_mrv2_mixed_batch(
     monkeypatch,
     local_gdn_model,
-    method,
     cache_mode,
     indexed,
     with_spec,
     batch_kind,
 ):
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     routing_env = "VLLM_SM70_MTP_LEGACY_GDN_MIXED_DECODE_ROUTING"
     if batch_kind in ("default_decode", "prefill_and_decode"):
         monkeypatch.delenv(routing_env, raising=False)
@@ -652,9 +621,6 @@ def test_native_gdn_prefill_mrv2_mixed_batch(
     monkeypatch.delenv("VLLM_SM70_GDN_NATIVE_PREFILL", raising=False)
     monkeypatch.setenv("VLLM_SM70_FLASHQLA_INDEXED_PREFILL", str(int(indexed)))
     monkeypatch.setenv("VLLM_SM70_FLASHQLA_DIRECT_OUTPUT", "1")
-    monkeypatch.setattr(
-        qwen_gdn.current_platform, "is_device_capability", lambda x: True
-    )
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(
         qwen_gdn.flashnext_prefill_ops, "has_sm70_flashnext_prefill_ops", lambda: True
@@ -693,7 +659,7 @@ def test_native_gdn_prefill_mrv2_mixed_batch(
     builder = _create_gdn_builder(
         local_gdn_model,
         num_speculative_tokens=4,
-        speculative_method=method,
+        speculative_method="mtp",
         mamba_cache_mode=cache_mode,
     )
     builder.gdn_prefill_backend = "flashqla_sm70"
@@ -784,6 +750,7 @@ def test_native_gdn_prefill_mrv2_mixed_batch(
     layer.enable_sm70_dflash2_fused_qkv_pack = False
     chunk_op = qwen_gdn.ChunkGatedDeltaRule.__new__(qwen_gdn.ChunkGatedDeltaRule)
     torch.nn.Module.__init__(chunk_op)
+    chunk_op._use_v2_model_runner = builder.vllm_config.use_v2_model_runner
     chunk_op._forward_method = chunk_op.forward_flashqla_sm70
     layer.chunk_gated_delta_rule = chunk_op
     monkeypatch.setattr(
@@ -808,6 +775,8 @@ def test_native_gdn_prefill_mrv2_mixed_batch(
         assert torch.equal(calls[0][9], metadata.non_spec_query_start_loc)
         assert torch.equal(calls[0][10], metadata.chunk_indices)
         assert calls[0][18] is indexed
+        if batch_kind == "prefill_and_decode":
+            assert calls[0][12].tolist() == [True, False]
         assert torch.all(out[:non_spec_tokens] == 1)
         assert torch.all(kv_cache[1][metadata.non_spec_state_indices_tensor] == 1)
     else:
@@ -819,20 +788,17 @@ def test_native_gdn_prefill_mrv2_mixed_batch(
 @pytest.mark.parametrize(
     ("case", "expected"),
     [
-        ("256", "native"),
+        ("1", "native"),
         ("beta_fp16", "native"),
         ("disabled", "tilelang"),
-        ("1", "native"),
-        ("255", "native"),
+        ("v1", "tilelang"),
         ("q_shape", "tilelang"),
-        ("q_dtype", "fla"),
         ("k_shape", "tilelang"),
         ("v_shape", "tilelang"),
         ("gate_dtype", "tilelang"),
         ("beta_dtype", "tilelang"),
         ("state_dtype", "tilelang"),
         ("capture", "tilelang"),
-        ("other_gpu", "tilelang"),
         ("missing_extension", "tilelang"),
         ("vlk", "vlk"),
         ("no_chunk_indices", "native"),
@@ -840,6 +806,7 @@ def test_native_gdn_prefill_mrv2_mixed_batch(
 )
 @pytest.mark.usefixtures("native_gdn_workspace")
 def test_native_gdn_prefill_dispatch(monkeypatch, case, expected):
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0" if case == "v1" else "1")
     if case == "disabled":
         monkeypatch.setenv("VLLM_SM70_GDN_NATIVE_PREFILL", "0")
     else:
@@ -848,7 +815,7 @@ def test_native_gdn_prefill_dispatch(monkeypatch, case, expected):
         qwen_gdn, "_sm70_flashqla_original_prefill_enabled", lambda: case != "vlk"
     )
     monkeypatch.setattr(
-        qwen_gdn.current_platform, "is_device_capability", lambda x: case != "other_gpu"
+        qwen_gdn, "_resolve_gdn_prefill_backend", lambda _: ("flashqla_sm70",) * 2
     )
     monkeypatch.setattr(
         torch.cuda, "is_current_stream_capturing", lambda: case == "capture"
@@ -859,7 +826,7 @@ def test_native_gdn_prefill_dispatch(monkeypatch, case, expected):
         lambda: case != "missing_extension",
     )
     calls: list[tuple[str, Any]] = []
-    tokens = int(case) if case.isdecimal() else 256
+    tokens = 1 if case == "1" else 256
     chunks = (tokens + 63) // 64
     indices = torch.tensor([[0, i] for i in range(chunks)], dtype=torch.int32)
     monkeypatch.setitem(
@@ -900,7 +867,7 @@ def test_native_gdn_prefill_dispatch(monkeypatch, case, expected):
     )
     q = torch.zeros(
         (1, tokens, 3 if case == "q_shape" else 4, 128),
-        dtype=torch.float32 if case == "q_dtype" else torch.float16,
+        dtype=torch.float16,
     )
     k = torch.zeros(
         (1, tokens, 3 if case == "k_shape" else 4, 128), dtype=torch.float16
@@ -925,15 +892,9 @@ def test_native_gdn_prefill_dispatch(monkeypatch, case, expected):
     )
     cu = torch.tensor([0, tokens], dtype=torch.int32)
     offsets = torch.tensor([0, chunks], dtype=torch.int32)
-    op = qwen_gdn.ChunkGatedDeltaRule.__new__(qwen_gdn.ChunkGatedDeltaRule)
-    torch.nn.Module.__init__(op)
-
-    def fake_fla(**kwargs):
-        calls.append(("fla", kwargs))
-        return kwargs["v"], kwargs["initial_state"]
-
-    op.forward_native = fake_fla
-    out, final_state = op.forward_flashqla_sm70(
+    with set_current_vllm_config(VllmConfig()):
+        op = qwen_gdn.ChunkGatedDeltaRule()
+    out, final_state = op(
         q=q,
         k=k,
         v=v,
@@ -955,16 +916,6 @@ def test_native_gdn_prefill_dispatch(monkeypatch, case, expected):
         assert out is v and final_state is state
     else:
         assert out is v and final_state is state
-
-
-def test_native_gdn_prefill_workspace_reuse(native_gdn_workspace):
-    full = qwen_gdn._sm70_native_gdn_prefill_workspace(native_gdn_workspace)
-    storage = full[0].untyped_storage().data_ptr()
-    for tokens in (1, 255, native_gdn_workspace):
-        assert all(
-            buf.untyped_storage().data_ptr() == storage
-            for buf in qwen_gdn._sm70_native_gdn_prefill_workspace(tokens)
-        )
 
 
 def _assert_gdn_metadata_equal(

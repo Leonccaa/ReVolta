@@ -12575,7 +12575,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         lambda: bool(int(os.getenv("VLLM_SM70_GDN_NATIVE_PREFILL", "1"))),
         description=(
             "Use the native SM70 GDN prefill kernel for eligible chunks by "
-            "default. Set 0 to use the original TileLang kernel instead."
+            "default on Model Runner V2 only. Set 0 to use the original "
+            "TileLang kernel instead. Model Runner V1 is unaffected."
         ),
         category="tuning",
         declared_default="True",

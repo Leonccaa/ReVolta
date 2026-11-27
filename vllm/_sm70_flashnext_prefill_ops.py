@@ -5,8 +5,6 @@
 import importlib
 from functools import cache
 
-import torch
-
 
 @cache
 def has_sm70_flashnext_prefill_ops() -> bool:
@@ -14,9 +12,5 @@ def has_sm70_flashnext_prefill_ops() -> bool:
         importlib.import_module("vllm._sm70_flashnext_prefill_C")
     except ImportError:
         return False
-
-    @torch.library.register_fake("vllm_sm70_fn_prefill::gdn_chunk_fwd_fused_sm70")
-    def _gdn_chunk_fwd_fused_sm70_fake(*args, **kwargs):
-        return None
 
     return True

@@ -37,12 +37,13 @@ _LOOKUP = (
 
 NOTES: dict[str, dict[str, str]] = {
     "VLLM_SM70_GDN_NATIVE_PREFILL": dict(
-        section="research",
+        section="promoted",
         since="0.2.0rc16",
         range="0, 1",
         tradeoff="Use the native SM70 GDN kernel by default for eligible "
-        "original TileLang chunks. It can change floating-point results and "
-        "reserves shared GPU scratch space. Set 0 to use TileLang instead.",
+        "original TileLang chunks on Model Runner V2 only. It can change "
+        "floating-point results and reserves shared GPU scratch space. "
+        "Set 0 to use TileLang instead. Model Runner V1 is unaffected.",
         metrics="",
     ),
     "VLLM_SM70_MTP_Q8_PREFILL_MMQ": dict(

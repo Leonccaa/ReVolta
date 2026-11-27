@@ -37,7 +37,7 @@ Stay with MTP when:
 - Very long prompts or long reasoning dominate. In a 0.1.2 replay of real agent sessions (one request at a time, sampling), DFlash2 was ahead on tool calls, answers and contexts up to 64K tokens, and behind in reasoning and above 128K; over all sessions the two methods were on par.
 - You want the simplest deployment.
 
-Greedy output differs between the two methods at near-ties, because they verify different numbers of tokens and use different kernels for some batch sizes. The measurements behind these statements, with their versions and conditions, are in [Performance](performance.md#dflash2-against-mtp4).
+Greedy output differs between the two methods at near-ties, because they verify different numbers of tokens and use different kernels for some batch sizes. The measurements behind these statements, with their versions and conditions, are in [Performance](performance.md#dflash2-against-mtp4-on-pcie-012).
 
 ## What to expect in 0.2.0
 
@@ -65,7 +65,7 @@ The ReVolta profile applies these defaults to `vllm serve` on four SM70 GPUs wit
 - **GDN state replay** (`gdn_state_replay`) with prefix caching on. When `--async-scheduling` is not given, it also selects synchronous scheduling. See [GDN state replay](#gdn-state-replay).
 - **Draft KV format.** The draft inherits the target's KV format, which is planar INT8 with `--kv-cache-dtype auto`.
 - **KV-only draft prefill** (`VLLM_SM70_MTP_KV_ONLY_PREFILL`, default `1`). While a long prompt is still being prefilled in chunks, the draft only writes its KV for those chunks, which shortens the time to first token of long prompts. On the chunk that completes the prompt, the draft computes only the row that is sampled, which shortens the time to the second token. It applies with data parallelism 1, GPU or Host draft KV and no multimodal input in the batch. Set `0` for full draft prefill.
-- **Wide MTP verifier.** The profile turns it on only for AWQ g32 with MTP4 when all of these hold: data parallelism 1, DCP2, synchronous scheduling with GDN state replay, GPU KV without Host KV mode and without any KV connector, and an interconnect that the engine runs as PCIe-switch P2P (not NVLink and not NCCL only). It then enables `sm70_gdn_input_v154` in `--kernel-config`, `VLLM_SM70_MTP_GDN_NATIVE_VERIFY=1` and `VLLM_SM70_QWEN38_NATIVE_ROUTER_TOPK=1`, and raises `VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS` to 48. The CPU KV pool of the reference configuration uses the `OffloadingConnector`, which counts as a KV connector, so that configuration keeps the verifier off. These kernels change the accumulation order, so output can differ at near-ties. See [Environment settings](configuration.md#environment-settings).
+- **Wide MTP verifier.** The profile turns it on only for AWQ g32 with MTP4 when all of these hold: data parallelism 1, DCP2, synchronous scheduling with GDN state replay, GPU KV (not Host KV mode; a CPU KV pool or disk tier is fine), and an interconnect that the engine runs as PCIe-switch P2P (not NVLink and not NCCL only). The reference configuration, with its 48 GiB CPU KV pool, qualifies on a PCIe-switch P2P system. The profile then enables `sm70_gdn_input_v154` in `--kernel-config`, `VLLM_SM70_MTP_GDN_NATIVE_VERIFY=1` and `VLLM_SM70_QWEN38_NATIVE_ROUTER_TOPK=1`, and raises `VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS` to 48. These kernels change the accumulation order, so output can differ at near-ties. See [AWQ MTP4 wide verifier](configuration.md#awq-mtp4-wide-verifier).
 
 ### MTP settings you can change
 
@@ -74,7 +74,7 @@ The ReVolta profile applies these defaults to `vllm serve` on four SM70 GPUs wit
 - **`draft_sample_method`.** Keep the default, `"greedy"`. The fast MTP draft paths (local argmax and the QPN8 draft head) need greedy drafting, and probabilistic MTP drafting corrupted output at temperature above 0 with more than two concurrent requests upstream ([1CatAI/1Cat-vLLM#656](https://github.com/1CatAI/1Cat-vLLM/issues/656)). This setting only affects drafting; clients can still use any sampling parameters.
 - **`"gdn_state_replay": false`** keeps one recurrent state block per draft position. See [GDN state replay](#gdn-state-replay).
 - **`VLLM_1CAT_ADAPTIVE_MTP`** (experimental, default `off`). Adapts the draft width of a single decoding request to its recent acceptance, up to the schedule's width for one request. It needs a draft-width schedule, synchronous scheduling and Model Runner V2. `on` needs at least 3 draft tokens; `auto` turns it on only on SM70 with at least 5. It has no effect while more than one request is decoding.
-- **Draft experts and vocabulary.** `mtp_expert_quantization` selects the draft's routed-expert format; see [Checkpoints](checkpoints.md). An optional static draft vocabulary is described in [Configuration](configuration.md#optional-mtp-draft-vocabulary-in-model-runner-v2).
+- **Draft experts and vocabulary.** `mtp_expert_quantization` selects the draft's routed-expert format; see [Checkpoints](checkpoints.md). An optional static draft vocabulary is described in [Configuration](configuration.md#optional-mtp-draft-vocabulary-experimental).
 
 ## GDN state replay
 
@@ -82,7 +82,7 @@ Qwen3.8 Flash-Next mixes attention layers with recurrent GDN (gated delta networ
 
 Both methods turn replay on by default where it is supported: SM70, Model Runner V2, `--mamba-cache-mode align`, synchronous scheduling and no pipeline parallelism. Elsewhere it stays off with a log line. The startup log confirms it with `GDN speculative state replay: recurrent layers keep 2 state blocks per running request and replay accepted tokens after sampling.` With explicit `--async-scheduling`, MTP keeps one state block per draft position; for DFlash2 see [Scheduling](dflash2.md#scheduling).
 
-The replay for full verification batches runs as a CUDA graph, captured per batch shape. It adds a little GPU work per step. Output can differ from per-position state storage at near-ties because the two use different computation paths. Measured costs, with their versions, are in [Performance](performance.md#state-replay-in-014) for DFlash2 and in [KV offload](kv-offload.md#gdn-state-replay) for MTP4.
+The replay for full verification batches runs as a CUDA graph, captured per batch shape (`gdn_state_replay_graph` in `--speculative-config`, default on for MTP); mixed batches replay without a graph. It adds a little GPU work per step. Output can differ from per-position state storage at near-ties because the two use different computation paths. With MTP4 (0.2.0rc11, four V100, TP4 + DCP2, sampling), replay made a decode round about 0.6 ms (2%) longer at one request, and turning it off used about 0.87 GiB more GPU memory per GPU with eight concurrent long-context requests. DFlash2 measurements are in [DFlash2 state replay](dflash2.md#state-replay).
 
 To turn replay off, set `"gdn_state_replay": false` for MTP or `"sm70_dflash2": {"spec_state_replay": false}` for DFlash2. The DFlash2 specifics are in [DFlash2 state replay](dflash2.md#state-replay).
 

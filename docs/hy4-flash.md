@@ -4,7 +4,7 @@ This page shows how to serve [tencent/Hy4-flash](https://huggingface.co/tencent/
 
 **Status.** Hy4-flash has validation support: it was validated once, in 0.2.0rc13, and its model code ships unchanged in 0.2.0. The 0.2.0 release tests did not run it, and the engine and the shared quantized-MoE kernels changed after 0.2.0rc13. Later versions are not guaranteed to keep it working. All measurements on this page come from 0.2.0rc13.
 
-Not supported: image and video input, the checkpoint's DFly2 speculative decoding layers (they are skipped at load), pipeline parallelism, and GPU counts other than four.
+Not supported: image and video input, the checkpoint's DFly2 draft layers (skipped at load), pipeline parallelism, and GPU counts other than four.
 
 ## Checkpoints
 

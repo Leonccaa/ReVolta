@@ -39,10 +39,10 @@ Each configuration below states its other settings.
 
 The 0.2.0 acceptance tested six configurations. All use TP4 + DCP2 on the test system above.
 
-| Configuration | Weights | Speculative decoding | KV cache | CPU and SSD tiers | Other settings |
+| Configuration | Weights | Speculative decoding | KV cache | CPU KV pool and disk tier | Other settings |
 | --- | --- | --- | --- | --- | --- |
-| C: production form | Uncensored AWQ g32 | DFlash2, 7 draft tokens, dynamic draft width (profile default) | GPU KV; INT8 target, FP16 draft | 98 GiB CPU tier and 350 GiB SSD tier | `--gpu-memory-utilization 0.956` |
-| D+E1: public default | Uncensored AWQ g32 | MTP, 4 draft tokens, dynamic draft width (profile default), greedy drafting | GPU KV; INT8 target and draft (`--kv-cache-dtype auto`) | 48 GiB CPU tier | Reference configuration in [Getting started](getting-started.md); `--gpu-memory-utilization 0.956` |
+| C: production form | Uncensored AWQ g32 | DFlash2, 7 draft tokens, dynamic draft width (profile default) | GPU KV; INT8 target, FP16 draft | 98 GiB CPU KV pool and 350 GiB `revolta_fs` disk tier | `--gpu-memory-utilization 0.956` |
+| D+E1: public default | Uncensored AWQ g32 | MTP, 4 draft tokens, dynamic draft width (profile default), greedy drafting | GPU KV; INT8 target and draft (`--kv-cache-dtype auto`) | 48 GiB CPU KV pool | Reference configuration in [Getting started](getting-started.md); `--gpu-memory-utilization 0.956` |
 | E4M3 | As D+E1 | As D+E1 | GPU KV; calibrated E4M3 target and draft (`--kv-cache-dtype fp8_e4m3`) | As D+E1 | Functional check only: start, serve and answer quality |
 | E2: Host KV | <!-- TODO(0.2.0-acceptance): checkpoint, E2 --> | MTP <!-- TODO(0.2.0-acceptance): draft tokens, E2 --> | Host KV: main KV history in host memory <!-- TODO(0.2.0-acceptance): KV format and host pool size, E2 --> | <!-- TODO(0.2.0-acceptance): CPU and SSD tiers, E2 --> | <!-- TODO(0.2.0-acceptance): other non-default settings, E2 --> |
 | E3a: NVFP4 + MTP | <!-- TODO(0.2.0-acceptance): NVFP4 checkpoint name, E3a --> | MTP, 5 draft tokens | <!-- TODO(0.2.0-acceptance): KV placement and target / draft format, E3a --> | <!-- TODO(0.2.0-acceptance): CPU and SSD tiers, E3a --> | <!-- TODO(0.2.0-acceptance): other non-default settings, E3a --> |
@@ -99,7 +99,7 @@ When a new request starts with a prompt the engine has seen before, such as a fo
 | C: AWQ, DFlash2 | 131,072 | <!-- TODO(0.2.0-acceptance): cold TTFT at 128K, C --> | <!-- TODO(0.2.0-acceptance): TTFT with GPU prefix hit at 128K, C --> | <!-- TODO(0.2.0-acceptance): TTFT from CPU tier at 128K, C --> | <!-- TODO(0.2.0-acceptance): TTFT from SSD tier after restart at 128K, C --> | <!-- TODO(0.2.0-acceptance): prompt tokens hit at 128K, C --> |
 | E2: Host KV, MTP | 32,768 | <!-- TODO(0.2.0-acceptance): cold TTFT at 32K, E2 --> | <!-- TODO(0.2.0-acceptance): TTFT with Host KV hit at 32K, E2 --> | — | <!-- TODO(0.2.0-acceptance): TTFT from SSD after restart at 32K, E2 (or "not measured") --> | <!-- TODO(0.2.0-acceptance): prompt tokens hit at 32K, E2 --> |
 
-How the tiers work and how to size them: [KV offload modes](kv-offload.md) and [Host KV RAM prefixes and direct SSD persistence](host-kv-prefix.md).
+How the tiers work and how to size them: [KV offload modes](kv-offload.md).
 
 ### Task accuracy
 
@@ -117,9 +117,7 @@ For how closely each quantized checkpoint follows its BF16 parent, see [Quality 
 
 ### Speculative decoding comparison
 
-To compare the two speculative methods in 0.2.0, read C against D+E1 for AWQ (DFlash2 against MTP4) and E3b against E3a for NVFP4 (DFlash2 against MTP5). The AWQ pair also differs in draft KV format and CPU and SSD tiers; see [Configurations](#configurations). The gap depends strongly on the prompts: earlier releases measured the largest DFlash2 gains on English and code and a loss on Chinese; see [DFlash2 against MTP4 on PCIe (0.1.2)](#dflash2-against-mtp4-on-pcie-012).
-
-<!-- TODO(docs-merge): DFlash2 / MTP comparison numbers moved here from dflash2.md or dynamic-speculative-decoding.md go in this subsection, each labelled with its version and conditions. -->
+To compare the two speculative methods in 0.2.0, read C against D+E1 for AWQ (DFlash2 against MTP4) and E3b against E3a for NVFP4 (DFlash2 against MTP5). The AWQ pair also differs in draft KV format and in the CPU KV pool and disk tier; see [Configurations](#configurations). The gap depends strongly on the prompts: earlier releases measured the largest DFlash2 gains on English and code and a loss on Chinese; see [DFlash2 against MTP4 on PCIe (0.1.2)](#dflash2-against-mtp4-on-pcie-012).
 
 ## Quality measurements
 

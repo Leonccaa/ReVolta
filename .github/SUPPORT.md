@@ -17,7 +17,7 @@ This page says what the maintainers support in ReVolta and where to ask for help
 
 Best effort: TP2/TP8, V100 16 GB, other GPU counts, other models and other topologies are outside the release gate. Not built: GPU architectures other than SM70, ROCm, CPU, XPU and TPU serving, and GGUF.
 
-Hy4-flash (text only, exactly four V100 32 GB GPUs) has validation support that was added in 0.2.0rc13 and frozen there; 0.2.0 has not tested it again. See [Hy4-flash](../docs/hy4-flash.md).
+Hy4-flash (text only, exactly four V100 32 GB GPUs) has validation support: it was validated once, in 0.2.0rc13, and its model code ships unchanged in 0.2.0, but the 0.2.0 release tests did not run it. See [Hy4-flash](../docs/hy4-flash.md).
 
 ## Asking for help
 

@@ -167,8 +167,9 @@ Notes:
 
 - Many of these options repeat values that the ReVolta profile or the engine already chooses, for example the scheduler limits, prefix caching, the attention backend and the compilation mode. They are written out so that the command matches the tested configuration. See [ReVolta serving defaults](configuration.md#revolta-serving-defaults) before changing them.
 - **KV cache.** `--kv-cache-dtype auto` selects planar INT8 for this model on V100. INT8 computes its scales at runtime, so no KV scale pack is needed. The MTP draft has no `kv_cache_dtype` of its own and inherits the target's INT8. To keep the draft KV in FP16 instead, add `"kv_cache_dtype": "float16"` to `--speculative-config`. For other KV formats, see [Choose the KV format](checkpoints.md#weight-and-kv-formats).
-- **Draft width.** With MTP K=4 and prefix caching, the engine uses four draft tokens per round for 1–3 running requests and three for 4–8. See [Dynamic speculative decoding](dynamic-speculative-decoding.md).
-- **CPU KV pool.** `cpu_bytes_to_use` is the total for all four workers: 48 GiB, 12 GiB per worker. See [KV offload](kv-offload.md) for SSD tiers and other pool sizes. The AWQ MTP4 wide verifier defaults described in [Environment settings](configuration.md#environment-settings) apply only without a KV connector, so they stay off with this CPU pool.
+- **Draft width.** With MTP K=4 and prefix caching, the engine uses four draft tokens per round for 1–3 running requests and three for 4–8. See [Dynamic speculative decoding](dynamic-speculative-decoding.md). To compare MTP with DFlash2, see [Speculative decoding](speculative-decoding.md).
+- **CPU KV pool.** `cpu_bytes_to_use` is the total for all four workers: 48 GiB, 12 GiB per worker. See [KV offload](kv-offload.md) for SSD tiers and other pool sizes.
+- **Wide verifier.** On a system whose GPUs share one PCIe switch with P2P, the profile also turns on the [AWQ MTP4 wide verifier](configuration.md#awq-mtp4-wide-verifier) for this configuration; the CPU KV pool does not prevent it. NVLink systems keep the standard verifier.
 - **Startup** takes roughly 10–15 minutes: weight and PLE loading, `torch.compile` and CUDA graph capture. <!-- TODO(0.2.0-acceptance): cold and warm startup time, D+E1 --> Later starts reuse the compile cache. The first start after an upgrade recompiles. On a first start with an empty compile cache, the reported GPU KV capacity can be one allocation unit lower than on later starts.
 
 See [Launch options](configuration.md#launch-options) for the meaning of each option.
@@ -268,7 +269,7 @@ docker run --rm --gpus all \
 
 Container notes:
 
-- **Shared memory.** The CPU KV pool is a file in `/dev/shm`. Make `--shm-size` larger than `cpu_bytes_to_use`; the validated container used `128g`. After an abnormal exit, recreate the container to release leftover CPU offload files in its private `/dev/shm`.
+- **Shared memory.** The CPU KV pool is a file in `/dev/shm`, and so is the host store of [Host KV](kv-offload.md#host-kv-long-context). Make `--shm-size` larger than `cpu_bytes_to_use` (or `host_store_gib` with Host KV); the validated container used `128g`. The engine removes the file names once every process has mapped them, so a normal or forced stop releases the memory. Only a crash during startup can leave `vllm_offload_*.mmap` files behind; recreating the container removes them.
 - **Caches.** The compile cache lives under `VLLM_CACHE_ROOT` (default `/root/.cache/vllm` inside the container) and the TileLang cache under `TILELANG_CACHE_DIR`. Point both at the mounted volume, as above; otherwise a container started with `--rm` compiles everything again on each start.
 - **Privileges.** `--cap-add SYS_PTRACE` was required in the validated container: the workers share memory with each other through `pidfd_getfd`. The validated container also used `--security-opt seccomp=unconfined`; it has not been tested without it.
 - **Stopping.** Keep `--stop-timeout` above `--shutdown-timeout` plus the process-exit wait, which defaults to the same value (30 + 30 seconds here). See [Launch options](configuration.md#launch-options).
@@ -278,5 +279,6 @@ Container notes:
 
 - [Checkpoints and KV formats](checkpoints.md): other checkpoints, MTP drafts and KV formats
 - [Configuration reference](configuration.md): launch options, profile defaults and memory budgets
+- [Speculative decoding](speculative-decoding.md): MTP and DFlash2
 - [KV offload](kv-offload.md): CPU, SSD and Host KV modes
 - [Multimodal input limits](../.github/MULTIMODAL_INPUTS.md)

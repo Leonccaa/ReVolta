@@ -7,16 +7,16 @@ Before you start, have a working [reference launch](getting-started.md) and chec
 Terms used on this page:
 
 - **KV cache**: the attention keys and values of tokens already processed. The GPU always holds the KV cache of running requests; the **prefix cache** keeps it after a request finishes, so a later request with the same prompt start skips that part of prefill.
-- **Offload**: when the GPU prefix cache evicts blocks, a lower **tier** (CPU memory, then disk) keeps a copy. A later request with the same prefix reads it back instead of computing it again.
-- **Host KV**: a long-context mode in which the main K/V history lives in host memory. The GPU keeps the compressed index, the recurrent state and a working set of hot pages.
+- **Offload**: when the GPU prefix cache evicts blocks, a lower **tier** keeps a copy: the **CPU KV pool** in host memory (the "CPU pool" below), then optionally the **`revolta_fs` disk tier** on a local SSD. A later request with the same prefix reads it back instead of computing it again.
+- **Host KV** (Active Host KV): a long-context mode in which the main K/V history lives in host memory. The GPU keeps the compressed index, the recurrent state and a working set of hot pages.
 
 ## Choose a mode
 
 | Mode | Status in 0.2.0 | Where evicted prefixes go | Extra host memory | Choose it when |
 | --- | --- | --- | --- | --- |
 | [GPU KV only](#gpu-kv-only) | Stable | Nowhere: they are computed again | None | Host memory is tight |
-| [GPU KV + CPU offload](#cpu-offload-reference-configuration) | Stable; used by the reference launch | A CPU pool in `/dev/shm` | `cpu_bytes_to_use` (48 GiB in the reference) | Most deployments |
-| [GPU KV + CPU + disk](#disk-tier-revolta_fs-experimental) | Experimental | The CPU pool, then a local SSD | The CPU pool, plus SSD space | Cached documents should survive a restart |
+| [GPU KV + CPU offload](#cpu-offload-reference-configuration) | Stable; used by the reference launch | The CPU KV pool in `/dev/shm` | `cpu_bytes_to_use` (48 GiB in the reference) | Most deployments |
+| [GPU KV + CPU + disk](#disk-tier-revolta_fs-experimental) | Experimental | The CPU KV pool, then the `revolta_fs` disk tier on a local SSD | The CPU pool, plus SSD space | Cached documents should survive a restart |
 | [Host KV](#host-kv-long-context) | Supported; validated with MTP (acceptance configuration E2) | Main K/V lives in host memory; optional SSD | `host_store_gib` | Long contexts or many long requests do not fit in GPU KV |
 
 All modes use the same model, KV format (INT8 by default) and speculative decoding settings. Only `--kv-transfer-config` and, for Host KV, `--kernel-config` change.
@@ -30,18 +30,11 @@ To check the GPU pool, read the startup log:
 - `GPU KV cache size: N tokens`: the tokens the GPU pool can hold.
 - `Maximum concurrency for L tokens per request: X`: how many requests of the full `--max-model-len` fit at once.
 
-For measured pool sizes by speculative method, see [GPU KV capacity by method](performance.md#gpu-kv-capacity-by-method).
+For measured pool sizes by configuration, see [GPU KV capacity](performance.md#gpu-kv-capacity).
 
 ### Recurrent-state replay
 
-The model's GDN layers carry a recurrent state. During speculative decoding, MTP and DFlash2 keep that state with replay: after sampling, the accepted tokens are replayed into the request's state. Each running request then needs two state blocks per GDN cache group, whatever the draft length, instead of one per draft position. The saved GPU memory goes to KV history.
-
-Replay is on by default on the supported route: SM70, Model Runner V2, `--mamba-cache-mode align`, synchronous scheduling (`--no-async-scheduling`) and no pipeline parallelism. The reference launch meets all of these. The startup log confirms replay with `recurrent layers keep 2 state blocks per running request`.
-
-- **Cost and gain (0.2.0rc11, four V100, TP4 + DCP2, MTP4 with sampling):** about 0.6 ms (2%) longer per decode round at one request. With eight concurrent long-context requests, turning replay off used about 0.87 GiB more GPU memory per GPU.
-- **Output:** replay and per-draft state storage are different computation paths. Output is not guaranteed to be bitwise identical with replay on and off; near-tied token scores can lead to different continuations.
-- **MTP settings** (in `--speculative-config`): `"gdn_state_replay": false` turns replay off. `gdn_state_replay_graph` (default on for MTP) runs the replay as a CUDA graph for full verify shapes; mixed steps replay without a graph.
-- **DFlash2 settings:** see [DFlash2 state replay](dflash2.md#state-replay-optional).
+During speculative decoding, MTP and DFlash2 replay the accepted tokens into the GDN recurrent state, so each running request keeps two state blocks per GDN cache group instead of one per draft position. The saved GPU memory goes to the KV cache. Replay is on by default in the reference launch; requirements, settings and measured costs are in [GDN state replay](speculative-decoding.md#gdn-state-replay).
 
 ## CPU offload (reference configuration)
 
@@ -223,7 +216,7 @@ Prefixes served from the GPU or CPU also refresh their disk pages, with the star
 
 In Host KV mode, the main K/V history of the QSA layers lives in a host memory store. The GPU keeps the compressed index, recurrent states, drafter windows and a pool of hot pages that the sparse attention reads. Long contexts and many concurrent long requests then fit even when their K/V does not fit in GPU memory. Prefix reuse works through the same host store, and an optional SSD tier keeps pages across restarts.
 
-**Status:** supported in 0.2.0 and off by default. The 0.2.0 acceptance covers Host KV with MTP (configuration E2). <!-- TODO(0.2.0-acceptance): Host KV functional and speed results, E2 -->
+**Status:** supported in 0.2.0 and off by default. The 0.2.0 acceptance covers Host KV with MTP (configuration E2); Host KV with DFlash2 is supported but was not tested separately. <!-- TODO(0.2.0-acceptance): Host KV functional and speed results, E2 -->
 
 ### Requirements
 
@@ -243,13 +236,13 @@ Start from the reference launch and replace `--kernel-config` and `--kv-transfer
 
 ```bash
 --kernel-config '{"ple_disk_cascade": false,
-    "qsa_dcp_index_shard": true,
     "long_context_kv": {"enabled": true, "host_store_gib": 48}}' \
 --kv-transfer-config '{"kv_connector": "OffloadingConnector", "kv_role": "kv_both"}' \
 ```
 
 - `host_store_gib` is the host store in GiB, summed over all workers. It holds the main K/V pages, recurrent states and drafter pages. Size it to the memory left after the PLE table (about 48 GiB for AWQ), other processes and the page cache. The example uses the same 48 GiB as the reference CPU pool, which fits the 128 GiB reference host; the [capacity table](#host-kv-capacity) shows 98 and 192 GiB stores.
-- `qsa_dcp_index_shard: true` is needed for MTP at DCP2 (the reference launch). It splits the compressed index over all tensor-parallel ranks and lets the MTP draft's main K/V move to the host store; see [MTP draft placement](#mtp-draft-placement). DFlash2 turns it on automatically under the ReVolta profile, and DCP1 does not need it. Do not set it for MTP with GPU KV: outside Host KV mode the model rejects index sharding with MTP.
+- `qsa_dcp_index_shard` (in `--kernel-config`) splits the compressed index over all tensor-parallel ranks at DCP2 and lets the MTP draft's main K/V move to the host store; see [MTP draft placement](#mtp-draft-placement). When it is unset, the ReVolta profile turns it on for DFlash2 and, in Host KV mode, for MTP, so the example does not set it. An explicit value takes precedence. DCP1 does not use it. Do not set it for MTP with GPU KV: outside Host KV mode the model rejects index sharding with MTP.
+- The index layout is part of the SSD page identity. If an earlier Host KV MTP deployment ran without index sharding, it now gets it by default, so its existing Host KV SSD pages are not reused after the upgrade; the prefixes are computed again.
 - `main_kv_placement` and `draft_main_placement` default to `"host"`; there is no need to set them.
 
 ### Add an SSD to Host KV
@@ -286,7 +279,7 @@ In Host KV mode the MTP draft shares the target's KV cache groups, block table a
 - `"host"` (default): the draft's main K/V is one more layer of the host store, read through the hot pages like the target's. Each history block takes fewer GPU bytes, so the same GPU budget holds more long contexts. Cost (0.2.0rc11, four V100, sampling, one request): about 0.2 ms longer per decode round.
 - `"gpu"`: the draft's main K/V stays in GPU memory. Draft forwards read only GPU memory, so single-request decoding is fastest, but fewer long contexts fit.
 
-`"host"` takes effect only with `main_kv_placement: "host"`, a target and draft with the same KV format and page geometry, and, at DCP2, `qsa_dcp_index_shard: true`. Otherwise the draft stays on the GPU, the engine logs a warning, and the GPU holds fewer long contexts (compare the "draft K/V on GPU" and "draft K/V on host" rows in the [capacity table](#host-kv-capacity)). The two placements are different configurations of the same build; their outputs are not guaranteed to be bitwise equal, because the draft's proposals and the shapes of the verified batches can differ. Changing `qsa_dcp_index_shard` changes the host page layout: an SSD tier written with the other value is not read back.
+`"host"` takes effect only with `main_kv_placement: "host"`, a target and draft with the same KV format and page geometry, and, at DCP2, `qsa_dcp_index_shard` on (the Host KV default). Otherwise the draft stays on the GPU, the engine logs a warning, and the GPU holds fewer long contexts (compare the "draft K/V on GPU" and "draft K/V on host" rows in the [capacity table](#host-kv-capacity)). The two placements are different configurations of the same build; their outputs are not guaranteed to be bitwise equal, because the draft's proposals and the shapes of the verified batches can differ. Changing `qsa_dcp_index_shard` changes the host page layout: an SSD tier written with the other value is not read back.
 
 With MTP, in any KV mode, a prefix hit stops one block early, as with any EAGLE-style drafter: a prompt of L tokens reuses at most floor((L − 1 − S) / S) × S tokens, for a block of S tokens.
 
@@ -336,7 +329,7 @@ How to read the table:
 ### Check that Host KV works
 
 - At startup, each worker logs `long-context KV worker=N long-context KV plan (main K/V in the host pool): GPU KV budget ...`. The line gives the GPU budget split (state, hot pool, staging, history), the host pool in blocks, tokens and GiB, and the request limits per pool at `--max-model-len`.
-- With MTP at DCP2 without `qsa_dcp_index_shard`, a warning says the draft stays on the GPU.
+- With MTP at DCP2 and `"qsa_dcp_index_shard": false`, a warning says the draft stays on the GPU.
 - With `host_kv.ssd`, the disk tier logs `revolta_fs enabled at ...` or `revolta_fs disabled: <reason>`.
 - While serving, the `Store stats: counters=... gauges=...` line (at most once a minute; `--no-enable-store-metrics` turns it off) and the Prometheus series `vllm:store_events_total{event=...}` and `vllm:store_state{...}` report host store and SSD activity. `host_ssd_verified_load_pages` and `host_ssd_verified_load_bytes` count pages read back from disk after verification.
 - At shutdown: `Host KV SSD final flush: ...` and `Host KV SSD stats: ...`.
@@ -439,8 +432,8 @@ Keys of `long_context_kv` in `--kernel-config` (all inert while `enabled` is `fa
 | `superseded_keep_ssd` | bool | `false` | | See [Checkpoint retention](#checkpoint-retention). | 0.2.0 | experimental |
 | `prewarm_hot_pool`, `staged_writethrough`, `value_arbitration` | bool | `true` | | Tuning switches; keep the defaults. | 0.2.0 | experimental |
 | `prefill_gather`, `prefill_insert_age`, `value_arbiter_settings` | string, string, object | `union`, `old`, `{}` | | Tuning settings for measurements; keep the defaults. | 0.2.0 | experimental |
-| `kernel_config.qsa_dcp_index_shard` | bool | unset | `true`, `false` | Split the compressed index over all TP ranks. Unset turns it on only for DFlash2 under the ReVolta profile. Needed for MTP draft placement on the host at DCP2. | 0.2.0 | stable |
-| `speculative_config.gdn_state_replay` | bool | unset (on) | `true`, `false` | MTP recurrent-state replay; see [Recurrent-state replay](#recurrent-state-replay). | 0.2.0 | stable |
+| `kernel_config.qsa_dcp_index_shard` | bool | unset | `true`, `false` | Split the compressed index over all TP ranks at DCP2. Unset turns it on under the ReVolta profile for DFlash2, and for MTP in Host KV mode. Needed for MTP draft placement on the host at DCP2. Part of the SSD page identity. | 0.2.0 | stable |
+| `speculative_config.gdn_state_replay` | bool | unset (on) | `true`, `false` | MTP recurrent-state replay; see [GDN state replay](speculative-decoding.md#gdn-state-replay). | 0.2.0 | stable |
 | `speculative_config.gdn_state_replay_graph` | bool | unset (on for MTP) | `true`, `false` | Run the replay as a CUDA graph for full verify shapes. | 0.2.0 | stable |
 
 ## Metrics and log lines
@@ -474,5 +467,5 @@ The residency gauge `vllm:kv_offload_cpu_resident_blocks{kind,status}` uses the 
 - [Reference launch tutorial](getting-started.md)
 - [Configuration reference](configuration.md)
 - [Measured readback times](performance.md#coming-back-to-a-document)
-- [DFlash2 state replay](dflash2.md#state-replay-optional)
+- [GDN state replay](speculative-decoding.md#gdn-state-replay)
 - [Support and known limits](known-limits.md)

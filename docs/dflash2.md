@@ -2,7 +2,7 @@
 
 This guide replaces MTP with DFlash2 and explains its settings. DFlash2 uses the [incoai DFlash2 drafter](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2) (tested revision `a22a1744`): five sliding-window layers, an 8-token block and a 2,048-token window. It is off by default; MTP stays the default. To decide between the two methods, see [Speculative decoding](speculative-decoding.md).
 
-Prerequisites: a working [reference launch](getting-started.md) and its 512K target view from [step 2](getting-started.md#2-download-the-checkpoint-and-make-512k-views). DFlash2 works with AWQ and NVFP4 checkpoints and with GPU KV and Host KV.
+Prerequisites: a working [reference launch](getting-started.md) and its 512K target view from [step 2](getting-started.md#2-download-the-checkpoint-and-make-512k-views). DFlash2 works with AWQ and NVFP4 checkpoints and with GPU KV and Host KV; the 0.2.0 release tests cover it with GPU KV.
 
 ## Enable DFlash2
 
@@ -67,14 +67,14 @@ These defaults apply to `vllm serve` on four SM70 GPUs with TP4, FP16 activation
 | `sm70_dflash2`: `context_kv_graph`, `context_pipeline`, `verify_fastpath`, `fused_gdn_metadata`, `fused_smallq_metadata`, `grouped_smallq_metadata` | `true` | `false` per key. An explicit `context_kv_graph: false` also leaves an unset `context_pipeline` off |
 | `sm70_dflash2.sharded_selector_codebook` | `true`: each GPU keeps 1/4 of the selector codebooks | `false` keeps full codebooks on every GPU |
 | Drafter KV cache | FP16, whatever the target KV format | |
-| `qsa_dcp_index_shard` in `--kernel-config` | `true`: target QSA indexer keys are split across the DCP ranks | |
+| `qsa_dcp_index_shard` in `--kernel-config` | `true`: target QSA indexer keys are split over all tensor-parallel ranks at DCP2 | `false` |
 | `VLLM_SM70_DFLASH2_FUSED_QKV_PACK` | `1`: packs the verifier's Q/K/V rows with one kernel | `0` |
 | `VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP` | `1` with AWQ g32 weights, without expert parallelism or dual-batch overlap | `0` |
-| `VLLM_V2_CUDAGRAPH_MEM_MIB` | Sized for DFlash2 by the profile | Leave unset; values are in [Configuration](configuration.md#values-applied-by-the-revolta-profile) |
-| `VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS` | `0`: no single-request verifier tail graphs, which leaves their GPU memory to the KV cache | `1`; then also set `VLLM_V2_CUDAGRAPH_MEM_MIB=1500` |
+| `VLLM_V2_CUDAGRAPH_MEM_MIB` | Sized for DFlash2 by the profile | Leave unset; values are in [CUDA graph reserve](checkpoints.md#cuda-graph-reserve) |
+| `VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS` | `0`: no single-request verifier tail graphs, which leaves their GPU memory to the KV cache | `1`; then also raise `VLLM_V2_CUDAGRAPH_MEM_MIB` above the profile value, to at least the graph size the startup log reports (see [CUDA graph reserve](checkpoints.md#cuda-graph-reserve)) |
 | Scheduling | Synchronous | See [Scheduling](#scheduling) |
 
-All `sm70_dflash2` keys are listed in [Configuration](configuration.md#speculative_configsm70_dflash2-keys).
+Types and defaults of the main `sm70_dflash2` keys are in [Configuration](configuration.md#speculative_configsm70_dflash2-keys).
 
 ## Settings you can change
 
@@ -185,13 +185,13 @@ DFlash2 replays the accepted tokens into the GDN state instead of storing a stat
 - An unset `spec_state_replay` gives way to an enabled packed verifier (`fused_gdn_verify`), which is off for Flash-Next. An explicit `true` together with an explicit `fused_gdn_verify: true` is a configuration error.
 - `spec_state_replay_graph` (default `true`) captures the replay as a CUDA graph, once per full verification batch shape, the second time that shape runs. Mixed batches replay without a graph. Without the graph, the replay's launches cost several milliseconds per step after sampling. A top-level `gdn_state_replay_graph` value overrides this key.
 
-Measurements of the capacity gain and the per-step cost, from 0.1.3 and 0.1.4, are in [Performance](performance.md#state-replay-in-014).
+Earlier measurements, with Uncensored AWQ, scalar E4M3 KV and four V100 PCIe GPUs: in 0.1.3, turning replay on raised the GPU KV pool from 1,379,634 to 1,542,558 tokens (`--gpu-memory-utilization 0.95`, 512K context, 8 sequences). In 0.1.4, replay with its CUDA graph took 30.49 ms per step against 30.05 ms without replay (one request, sampling, 200 W), with identical outputs.
 
 ## What to expect
 
 - Greedy output is not bitwise identical to MTP. It differs at near-ties, because a different number of tokens is verified and DFlash2 uses a different MoE route for some batch sizes.
 - English code and reasoning gain the most. In 0.1.2 measurements, Chinese was slower than MTP4 in almost every case, because the drafter was trained on English, and very long prompts also favoured MTP4.
-- 0.2.0 speed and GPU KV capacity for both methods are in [What to expect in 0.2.0](speculative-decoding.md#what-to-expect-in-020). Results from earlier versions are in [Performance](performance.md#dflash2-against-mtp4).
+- 0.2.0 speed and GPU KV capacity for both methods are in [What to expect in 0.2.0](speculative-decoding.md#what-to-expect-in-020). Results from earlier versions are in [Performance](performance.md#dflash2-against-mtp4-on-pcie-012).
 
 ## See also
 

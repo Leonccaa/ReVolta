@@ -12,16 +12,25 @@ ReVolta is built for four or more V100 32 GB GPUs and validated on four. We reco
 | --- | --- |
 | 4 × V100 32 GB PCIe under one PCIe switch (PIX/PXB in `nvidia-smi topo -m`), P2P enabled | Reference system, with a 128 GiB container memory limit. Release acceptance runs here. |
 | 4 × V100-SXM2 32 GB, NVLink | Tested by the community: [@jttdev](https://github.com/jttdev) ([#2](https://github.com/Leonccaa/ReVolta/issues/2)): speed, retrieval to about 490K tokens, vision; also [#37](https://github.com/Leonccaa/ReVolta/issues/37) and [#38](https://github.com/Leonccaa/ReVolta/issues/38) |
-| The reference system with P2P disabled | Correct output; about 30–55% of P2P throughput (0.1.0) |
+| The reference system with P2P disabled | Correct output; about 30–55% of P2P throughput (0.1.0 release test) |
 | V100 16 GB, TP2, TP8, other GPU counts | Not tested |
 
 The release builds for SM70 only. Other GPU architectures, ROCm, CPU, XPU, TPU and GGUF are outside the build. There is no GPU CI: releases are checked on the reference system.
 
-The supported model is Qwen3.8 Flash-Next. Checkpoints and their test status are in [Checkpoints](checkpoints.md#models). Other models have not been tested. The supported serving forms run tensor parallel 4 with decode context parallel 2 (DCP2) and combine:
+The supported model is Qwen3.8 Flash-Next. Checkpoints and their test status are in [Checkpoints](checkpoints.md#choose-a-checkpoint). Other models have not been tested. The supported serving forms run tensor parallel 4 with decode context parallel 2 (DCP2) and combine:
 
 - **Weights:** AWQ g32 or NVFP4.
 - **Speculative decoding:** MTP with dynamic speculative decoding (DSD), or DFlash2.
 - **KV placement:** GPU KV, optionally with CPU and disk offload, or Host KV.
+
+| KV mode | Status in 0.2.0 |
+| --- | --- |
+| GPU KV with the CPU KV pool | Stable; the [reference launch](getting-started.md#4-launch) uses a 48 GiB pool |
+| `revolta_fs` disk tier below the CPU KV pool | Experimental; the production form in the acceptance table below runs it |
+| Host KV (Active Host KV) with MTP | Supported, off by default; in the 0.2.0 release acceptance (configuration E2 below) <!-- TODO(0.2.0-acceptance): acceptance result, E2 Host KV + MTP --> |
+| Host KV with DFlash2 | Supported combination; not tested separately in the 0.2.0 release acceptance |
+
+The modes are described in [KV offload](kv-offload.md).
 
 0.2.0 release acceptance covers these configurations:
 
@@ -34,7 +43,7 @@ The supported model is Qwen3.8 Flash-Next. Checkpoints and their test status are
 | NVFP4 | MTP, 5 drafts | GPU KV | Reduced core tests | <!-- TODO(0.2.0-acceptance): acceptance result, E3a NVFP4 + MTP5 --> |
 | NVFP4 | DFlash2 | GPU KV | Reduced core tests | <!-- TODO(0.2.0-acceptance): acceptance result, E3b NVFP4 + DFlash2 --> |
 
-Hy4-flash support is experimental and frozen: it was added in a 0.2.0 pre-release, and 0.2.0 acceptance does not cover it. It is text-only and needs exactly four V100 32 GB GPUs. Image and video input, the checkpoint's DFly2 speculative-decoding layers and pipeline parallelism are not supported. See [Hy4-flash](hy4-flash.md).
+Hy4-flash has validation support: it was validated once, in 0.2.0rc13, and its model code ships unchanged in 0.2.0, but 0.2.0 release acceptance does not cover it. It is text-only and needs exactly four V100 32 GB GPUs. Image and video input, the checkpoint's DFly2 draft layers (skipped at load) and pipeline parallelism are not supported. See [Hy4-flash](hy4-flash.md).
 
 ## Known limits
 
@@ -71,8 +80,8 @@ Release retrieval was tested at 211K tokens, and the production build retrieved 
 
 ### Speculative decoding
 
-- **DFlash2 CUDA graph reserve.** For DFlash2 the profile sets the graph reserve by itself: 1200 MiB with tail graphs off, or 1000 MiB (AWQ) and 1024 MiB (NVFP4) with the INT8 or `fp8_per_token_head` KV cache. If you set `VLLM_V2_CUDAGRAPH_MEM_MIB` yourself, keep it at or above the graph size the startup log reports; a smaller reserve can run out of GPU memory under concurrent long prompts. See [DFlash2 speculative decoding](dflash2.md).
-- **Standard NVFP4 draft.** Use the Uncensored FP8 MTP draft, which the NVFP4 scale pack includes, as in validation. See [Checkpoints](checkpoints.md#standard-nvfp4-checkpoint-setup).
+- **DFlash2 CUDA graph reserve.** For DFlash2 the profile sets the graph reserve by itself. With the default INT8 KV (or `fp8_per_token_head`) it is 1000 MiB for AWQ (1150 MiB with a positive `--mixed-prefill-step-latency-ms`) and 1024 MiB for NVFP4; with scalar E4M3 or FP16 KV it is 1200 MiB. All tiers are in [CUDA graph reserve](checkpoints.md#cuda-graph-reserve). If you set `VLLM_V2_CUDAGRAPH_MEM_MIB` yourself, keep it at or above the graph size the startup log reports; a smaller reserve can run out of GPU memory under concurrent long prompts.
+- **Standard NVFP4 draft.** Use the Uncensored FP8 MTP draft, which the NVFP4 scale pack includes, as in validation. See [MTP drafts](checkpoints.md#mtp-drafts).
 - **Structured output with MTP.** GPU tests produced 16/16 valid JSON and tool outputs (0.1.0). A later GPU test also reached the zero-draft step, where the grammar leaves no draft tokens (64 such steps): all outputs were valid, and repeated runs gave identical output.
 
 ### Checkpoints
@@ -89,6 +98,7 @@ Release retrieval was tested at 211K tokens, and the production build retrieved 
 - **Chat template.** The model's own chat template rejects a system message that is not the first message (`System message must be at the beginning.`). Agent stacks that send several system messages need to merge them.
 - **Image placeholder text.** Text that contains the literal image placeholder `<|image_pad|>` can take the place of a real image in the same request. Upstream vLLM and Hugging Face behave the same (vllm-project/vllm#57740), and ReVolta follows them. Remove such tokens from untrusted text.
 - **Prompt log-probabilities.** Long prompts are processed in chunks; `prompt_logprobs=20` took about 2.3 times the ordinary prefill time (0.1.0).
+- **Dashboard.** The [dashboard](dashboard.md) is optional and off by default (`--enable-dashboard`). It was tested with CPU-only suites; its cost while a model serves requests on GPUs has not been measured.
 
 ### Multimodal input
 

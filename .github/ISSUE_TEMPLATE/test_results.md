@@ -12,7 +12,7 @@ Instructions (for people and for coding agents):
 - Keep the keys in the Summary block; put units in the values.
 - Remove credentials, tokens and private paths from commands and logs.
 - For a problem or a crash, use the bug report form instead.
-- To compare with the release tables, see how they were measured in docs/performance.md. Any method is welcome; describe the one you used.
+- To compare with the release tables, see how they were measured in the "How we measure" section of docs/performance.md. Any method is welcome; describe the one you used.
 - If you open this issue through the API or `gh issue create`, the label may not be applied automatically; the maintainers add it.
 -->
 

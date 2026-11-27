@@ -46,7 +46,7 @@ The PLE tables are the model's n-gram embedding tables; they hold 51 billion of 
 
 The GPU KV pool is the startup log's capacity with MTP4, INT8 target and draft KV, 512K context, 8 sequences and `--gpu-memory-utilization 0.956` (0.2.0). The quality figures were measured with scalar E4M3 KV on 66 English, Chinese and code records, each checkpoint against its own BF16 parent; INT8 KV measured a slightly lower KL on the AWQ checkpoint. Method and other datasets: [Quality measurements](https://github.com/Leonccaa/ReVolta/blob/main/docs/performance.md#quality-measurements). Test status, pinned revisions and preparation steps: [Checkpoints](https://github.com/Leonccaa/ReVolta/blob/main/docs/checkpoints.md).
 
-Also supported: [NVIDIA NVFP4-QAD](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4-QAD) (loading and serving checks passed; quality against BF16 not yet measured). DFlash2 needs the separate [incoai DFlash2 drafter](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2). Text-only [Hy4-flash](https://huggingface.co/tencent/Hy4-flash) has validation support that was added in 0.2.0rc13 and frozen there; 0.2.0 has not tested it again. See [Hy4-flash](https://github.com/Leonccaa/ReVolta/blob/main/docs/hy4-flash.md).
+Also supported: [NVIDIA NVFP4-QAD](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4-QAD) (loading and serving checks passed; quality against BF16 not yet measured). DFlash2 needs the separate [incoai DFlash2 drafter](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2). Text-only [Hy4-flash](https://huggingface.co/tencent/Hy4-flash) has validation support: it was validated once, in 0.2.0rc13, and its model code ships unchanged in 0.2.0, but the 0.2.0 release tests did not run it. See [Hy4-flash](https://github.com/Leonccaa/ReVolta/blob/main/docs/hy4-flash.md).
 
 ## Quick start
 
@@ -82,19 +82,18 @@ With the pip package, pass the same options to `vllm serve`. The first start tak
 | I want to… | Read |
 | --- | --- |
 | Install and launch the reference configuration | [Getting started](https://github.com/Leonccaa/ReVolta/blob/main/docs/getting-started.md) |
-| Choose and prepare a checkpoint, its MTP draft and optional E4M3 KV scales | [Checkpoints](https://github.com/Leonccaa/ReVolta/blob/main/docs/checkpoints.md) |
-| Choose between MTP and DFlash2 | [Speculative decoding](https://github.com/Leonccaa/ReVolta/blob/main/docs/speculative-decoding.md) <!-- doc020: pending page from group C; drop this row if it is not added --> |
+| Choose and prepare a checkpoint and its MTP draft, and choose the KV format | [Checkpoints and KV formats](https://github.com/Leonccaa/ReVolta/blob/main/docs/checkpoints.md) |
+| Choose between MTP and DFlash2 | [Speculative decoding](https://github.com/Leonccaa/ReVolta/blob/main/docs/speculative-decoding.md) |
 | Enable DFlash2 and choose its settings | [DFlash2](https://github.com/Leonccaa/ReVolta/blob/main/docs/dflash2.md) |
 | Change the number of draft tokens with the batch size | [Dynamic speculative decoding](https://github.com/Leonccaa/ReVolta/blob/main/docs/dynamic-speculative-decoding.md) |
 | Keep evicted prefixes in CPU memory or on disk, or the KV cache in host memory | [KV offload](https://github.com/Leonccaa/ReVolta/blob/main/docs/kv-offload.md) |
-| Understand the Host KV prefix pool and its SSD persistence (developer reference) | [Host KV prefixes](https://github.com/Leonccaa/ReVolta/blob/main/docs/host-kv-prefix.md) |
 | Look up launch options, environment variables, sampling defaults and memory budgets | [Configuration](https://github.com/Leonccaa/ReVolta/blob/main/docs/configuration.md) |
 | Compare measured speed, KV capacity and quantization quality | [Performance](https://github.com/Leonccaa/ReVolta/blob/main/docs/performance.md) |
 | Check the support scope and known limitations | [Known limits](https://github.com/Leonccaa/ReVolta/blob/main/docs/known-limits.md) |
 | Set image and video input limits | [Multimodal input limits](https://github.com/Leonccaa/ReVolta/blob/main/.github/MULTIMODAL_INPUTS.md) |
 | Watch one running service in a browser | [Dashboard](https://github.com/Leonccaa/ReVolta/blob/main/docs/dashboard.md) |
 | See what the anonymous usage report contains, or turn it off | [Usage statistics](https://github.com/Leonccaa/ReVolta/blob/main/docs/usage-stats.md) |
-| Run Hy4-flash (validation support, frozen at 0.2.0rc13) | [Hy4-flash](https://github.com/Leonccaa/ReVolta/blob/main/docs/hy4-flash.md) |
+| Run Hy4-flash (validation support, not in the 0.2.0 release tests) | [Hy4-flash](https://github.com/Leonccaa/ReVolta/blob/main/docs/hy4-flash.md) |
 
 ## Known limits
 
@@ -102,7 +101,7 @@ With the pip package, pass the same options to `vllm serve`. The first start tak
 - **Reproducibility.** A single request is reproducible bit for bit. With 2–8 concurrent requests, greedy outputs can change between runs, because the tensor-parallel all-reduce sums in an order that depends on the batch. Fresh compiler autotuning can also change outputs.
 - **Host memory.** By default the whole PLE table is pinned in host memory: about 48 GiB for AWQ and standard NVFP4, 27 GiB for FP4-Local. If it does not fit, startup stops and reports the required and available memory; `VLLM_QWEN4EXP_PLE_HOST_GIB` keeps part of the table on the GPU instead. The experimental whole-table PLE disk option served under a 32 GiB memory limit in 0.1.4, with single-request decoding about 23–25% slower and a cold first token 1.6–2.3 times as long. PLE cascade (`ple_disk_cascade`) is not supported and stays off.
 - **Disk KV tier.** INT8 and per-token-head E4M3 KV need the `revolta_fs` disk tier; startup rejects the raw `fs` tier for them. Give the service at least 120 s to stop, so that the disk tier can finish its delayed writes.
-- **Calibrated E4M3 KV is frozen.** Scalar `fp8_e4m3` still works, but it is no longer optimized and gets only a functional check. Use the default INT8, or `fp8_per_token_head` for E4M3 storage without calibration.
+- **Scalar E4M3 KV is frozen.** Calibrated scalar `fp8_e4m3` still works, but it is no longer optimized and gets only a functional check. Use the default INT8, or `fp8_per_token_head` for E4M3 storage without calibration.
 - **DFlash2 depends on the workload.** In earlier measurements, English and code prompts gained the most, while Chinese text was often faster with MTP4. See [Performance](https://github.com/Leonccaa/ReVolta/blob/main/docs/performance.md).
 
 See [Support and known limits](https://github.com/Leonccaa/ReVolta/blob/main/docs/known-limits.md) for the complete list and test boundaries. There is no GPU CI; releases are checked on the reference machine.
@@ -139,11 +138,11 @@ These headings keep existing links to this page working; follow each link for th
 
 ### Measurements
 
-See [Performance and measurements](https://github.com/Leonccaa/ReVolta/blob/main/docs/performance.md#measurements).
+See [Performance and measurements](https://github.com/Leonccaa/ReVolta/blob/main/docs/performance.md#results).
 
 ### Checkpoints, KV scales and MTP drafts
 
-See [Checkpoints, KV scales and MTP drafts](https://github.com/Leonccaa/ReVolta/blob/main/docs/checkpoints.md).
+See [Checkpoints and KV formats](https://github.com/Leonccaa/ReVolta/blob/main/docs/checkpoints.md).
 
 ### DFlash2 speculative decoding (optional)
 
@@ -163,7 +162,7 @@ See [Standard NVFP4](https://github.com/Leonccaa/ReVolta/blob/main/docs/checkpoi
 
 ### Performance
 
-See [Performance](https://github.com/Leonccaa/ReVolta/blob/main/docs/performance.md#performance).
+See [Performance and measurements](https://github.com/Leonccaa/ReVolta/blob/main/docs/performance.md).
 
 ### Quality measurements
 

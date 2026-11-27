@@ -5,7 +5,7 @@ This page is the reference for ReVolta 0.2.0 settings: what the ReVolta profile 
 Terms used in the tables:
 
 - **Scope.** *Deployment* settings are fixed at launch for the whole server: environment variables, command-line options and the fields of their JSON configs. *Request* settings are chosen per API request.
-- **Status.** *Stable* settings are part of the supported forms. *Experimental* settings are off by default or outside release acceptance, and can change between releases. *Deprecated* settings still work and will be removed.
+- **Status.** *Stable* settings are part of the supported forms. *Experimental* settings are off by default or outside release acceptance, and can change between releases. *Optional* features are off by default and do not affect serving while off. *Deprecated* settings still work and will be removed.
 - **Since.** The first ReVolta release with the setting. *upstream* means inherited from vLLM; *1Cat* means inherited from 1Cat-vLLM.
 
 ## Environment settings
@@ -43,13 +43,13 @@ The profile applies these defaults to the OpenAI-compatible server (`vllm serve`
 | `--attention-backend` | `FLASH_ATTN_V100` | Selects the V100 FlashAttention backend for the target model. |
 | `gdn_state_replay` in `--speculative-config` | `true` for MTP with prefix caching | Replays accepted GDN tokens instead of storing one state per draft position. |
 | `num_speculative_tokens_per_batch_size` | `[[1,3,4],[4,8,3]]` for MTP with K=4 and prefix caching; `[[1,3,7],[4,4,3],[5,8,4]]` for DFlash2 with K=7 | Chooses the number of drafts from the number of scheduled requests. Each entry is `[first, last, drafts]`. See [Dynamic speculative decoding](dynamic-speculative-decoding.md). Other K values keep a fixed width. |
-| `dflash2_lookup` | Enabled for the seven-token DFlash2 selector: `longest`, suffix 5–16, 65,536-token window, `first_token` gate, statistics on, one live request | Uses committed token history to supplement the neural proposal. See [Native DFlash2 lookup](#native-dflash2-lookup). |
+| `dflash2_lookup` | Enabled for the seven-token DFlash2 selector: `longest`, suffix 5–16, 65,536-token window, `first_token` gate, statistics on, one live request | Uses committed token history to supplement the neural proposal. See [Native history lookup](dflash2.md#native-history-lookup). |
 | `sm70_dflash2` verifier options | `true` for the DFlash2 selector | Turns on `context_kv_graph`, `context_pipeline`, `verify_fastpath`, `fused_gdn_metadata`, `fused_smallq_metadata`, `grouped_smallq_metadata`, `sparse_target_rejection` and `spec_state_replay`. See [speculative_config.sm70_dflash2 keys](#speculative_configsm70_dflash2-keys). |
-| `qsa_dcp_index_shard` in `--kernel-config` | `true` for DFlash2 with 512 selected groups | Shards target QSA indexer keys across DCP ranks. MTP and DCP1 keep the replicated layout. |
+| `qsa_dcp_index_shard` in `--kernel-config` | `true` for DFlash2, and for MTP with Host KV (`long_context_kv.enabled`), when the model selects 512 index groups (Qwen3.8 Flash-Next) | Splits the target QSA indexer keys over all tensor-parallel ranks; it takes effect at DCP2. MTP with GPU KV keeps the replicated layout. It is part of the SSD page identity; see [Configure Host KV](kv-offload.md#configure-host-kv). |
 | `VLLM_SM70_QSA_GROUPED_LPT`, `VLLM_SM70_GDN_SKINNY_MPLAN` | `1` | Longest-first grouped QSA work and row-count-based GDN input plans. |
 | `VLLM_SM70_DFLASH2_FUSED_QKV_PACK` | `1` for DFlash2 | Fuses eligible post-convolution QKV packing. |
 
-Omitted `--async-scheduling` is still resolved from the executor and the speculative settings. A dynamic schedule and MTP's GDN state replay select synchronous scheduling, which is the recommended setting. An explicit `--async-scheduling` keeps the existing compatibility checks. What async scheduling does to the GDN state depends on the deployment; see [DFlash2 settings](dflash2.md#settings).
+Omitted `--async-scheduling` is still resolved from the executor and the speculative settings. A dynamic schedule and MTP's GDN state replay select synchronous scheduling, which is the recommended setting. An explicit `--async-scheduling` keeps the existing compatibility checks. What async scheduling does to the GDN state depends on the deployment; see [DFlash2 scheduling](dflash2.md#scheduling).
 
 ### Mixed prefill scheduling
 
@@ -67,7 +67,7 @@ The profile turns on a wider MTP verifier for one qualified form. All of these m
 - An AWQ g32 checkpoint with the Flash-Next shape (hidden size 2560, 512 experts, 10 experts per token, MoE intermediate size 640) on TP4.
 - MTP with `"num_speculative_tokens": 4` and GDN state replay (on by default with prefix caching).
 - DCP2, one data-parallel replica and synchronous scheduling.
-- GPU KV with no KV connector: long-context Host KV is off and `--kv-transfer-config` is not set. A CPU offload pool configured through `--kv-transfer-config` therefore keeps the standard verifier.
+- GPU KV: Host KV (`long_context_kv`) is off. A CPU KV pool or disk tier in `--kv-transfer-config` is allowed, so the [reference launch](getting-started.md#4-launch) qualifies.
 - The interconnect resolves to PCIe switch P2P (`SM70 interconnect=pex_p2p`). NVLink and NCCL-only systems keep the standard verifier.
 
 When all hold, it sets the following. Explicit values take precedence.
@@ -94,7 +94,7 @@ All options in this section are deployment scope.
 | `auto` (default) | stable | Planar INT8 for the QSA target on SM70 (the reference setting). Planar E4M3 for an eligible QSA target on other CUDA devices. |
 | `int8`, `int8_per_token_head` | stable | Planar INT8 with round-to-nearest-even and dynamic FP32 scales per token and head. For the QSA target, both names select the same format. |
 | `fp8_per_token_head` | experimental | Planar E4M3FN with dynamic FP32 scales per token and head. No KV scale pack is needed. |
-| `fp8`, `fp8_e4m3` | stable, frozen | Scalar E4M3 with calibrated per-layer K/V scales. It still works and is functionally tested, but it is no longer optimized (#348). On SM70 with FlashAttention-V100, `fp8` resolves to `fp8_e4m3`. Setup: [Checkpoints](checkpoints.md#e4m3-kv). |
+| `fp8`, `fp8_e4m3` | stable, frozen | Scalar E4M3 with calibrated per-layer K/V scales. It still works and is functionally tested, but it is no longer optimized (#348). On SM70 with FlashAttention-V100, `fp8` resolves to `fp8_e4m3`. Setup: [Scalar E4M3 KV](checkpoints.md#scalar-e4m3-kv-frozen). |
 | `float16` | stable | Model-precision storage. Uses the most GPU memory per token. |
 
 `auto` selects planar INT8 only when the model has QSA selector metadata, `--calculate-kv-scales` is not set and prefill context parallelism is 1. Otherwise the generic vLLM rules apply. Planar formats use four page regions `[K | V | sK | sV]`, not upstream vLLM's inline FP8 page layout. The old name `fp8_e4m3_per_token_head` is removed without an alias.
@@ -120,7 +120,7 @@ DFlash2 options are in [DFlash2 speculative decoding](dflash2.md) and [speculati
 
 | Option | Type | Reference value | Default | Since | Status | Effect and trade-offs |
 | --- | --- | --- | --- | --- | --- | --- |
-| `--gpu-memory-utilization` | float | `0.956` | `0.92` | upstream | stable | Share of each GPU's memory the engine may use; the rest of the reserve sizes the KV cache. Keep the GPUs free of other processes that use GPU memory. 0.2.0 acceptance runs at `0.956` without multimodal stress. The last 8-request multimodal stress test passed at `0.95` with scalar E4M3 KV (0.1.x); higher values ran out of memory then. Measure again if you raise concurrency or media limits. |
+| `--gpu-memory-utilization` | float | `0.956` | `0.92` | upstream | stable | Share of each GPU's memory the engine may use; the rest of the reserve sizes the KV cache. Keep the GPUs free of other processes that use GPU memory. 0.2.0 acceptance runs at `0.956` without multimodal stress. Measure again if you raise concurrency or media limits. |
 | `cpu_bytes_to_use` in `--kv-transfer-config` | integer bytes | `51539607552` (48 GiB) | none | upstream | stable | Size of the CPU KV pool, summed over all four workers (48 GiB = 12 GiB per worker). It needs host memory on top of the PLE table; see [System memory and storage](#system-memory-and-storage) and [KV offload](kv-offload.md). |
 
 ### Multimodal input
@@ -135,7 +135,7 @@ Large images are resized either way; see [Support and known limits](known-limits
 
 | Option | Type | Default | Since | Status | Effect and trade-offs |
 | --- | --- | --- | --- | --- | --- |
-| `--enable-dashboard` | boolean | `false` | 0.2.0 | experimental | Serves the built-in aggregate metrics page at `/dashboard/`. Rate and window calculations run in the browser, with optional local history; no engine background collector is added. Dashboard data follows the API-key configuration. See [Dashboard](dashboard.md). |
+| `--enable-dashboard` | boolean | `false` | 0.2.0 | optional | Serves the built-in aggregate metrics page at `/dashboard/`. Off by default. Rate and window calculations run in the browser, with optional local history; no engine background collector is added. Dashboard data follows the API-key configuration. Tested with CPU-only suites; its cost while serving on GPUs has not been measured. See [Dashboard](dashboard.md). |
 | `--structured-outputs-config` | JSON | `{"backend": "auto"}` | upstream | stable | `{"backend": "xgrammar"}` pins the structured-output backend. With `auto`, the engine keeps the backend it chose for the first structured-output request. |
 | `--sse-keep-alive-interval` | integer seconds, ≥ 0 | `0` (off) | 0.1.2 | stable | Sends an SSE comment line (`: keep-alive`) after this many idle seconds on streaming responses, so proxies with read timeouts keep the connection open during queueing and prefill. The reference launch uses `15`. |
 | `--sanitize-control-tokens` | boolean | `false` | 0.2.0 | stable | See [Chat control tokens](#chat-control-tokens-and-the-reasoning-end-of-turn-mask). |
@@ -188,23 +188,6 @@ The tail requires `"method": "mtp"`, an enabled static shortlist, an FP16 LM hea
 
 To confirm activation, look for `Enabled static MTP draft vocabulary` and, with a tail, `Enabled global MTP draft vocabulary tail: base=... tail=... tp=... sink=... draft_sample=...` on every TP rank, with the configured sizes. Measure acceptance length, round time and throughput on your workload before choosing a size.
 
-## Native DFlash2 lookup
-
-The profile enables native history lookup for the seven-token DFlash2 selector when no lookup setting is given (see [ReVolta serving defaults](#revolta-serving-defaults)). Outside the profile, lookup needs an explicit configuration. To turn it off, set `"dflash2_lookup": {"enabled": false}` in `--speculative-config`. How lookup works, the recommended recipe, its measurements and statistics are in [native history lookup](dflash2.md#native-history-lookup-optional).
-
-| Field | Type | Default in an explicit object | Range |
-| --- | --- | --- | --- |
-| `enabled` | boolean | `false` | `true`, `false` |
-| `policy` | string | unset | `longest`; required when enabled |
-| `nmin`, `nmax` | integer | unset | positive, `nmin <= nmax`; required when enabled |
-| `search_window` | integer tokens | `65536` | positive distance in committed history |
-| `gate` | string | `first_token` | `first_token` (strict agreement with the original first draft token) |
-| `collect_stats` | boolean | `true` | also needs the engine's statistics switch |
-| `max_requests` | integer | `3` | 1–3; the profile uses `1` |
-| `expand.enabled` | boolean | `false` | must stay `false` |
-
-Lookup needs a seven-token DFlash2 selector drafter and seven configured speculative tokens. A batch attempts lookup only when every live row is an eligible decode request, the batch has at most `max_requests` requests and the dynamic schedule selects width seven; otherwise the whole batch bypasses lookup. Batches of four or more requests always bypass it. Enabled lookup rejects conflicting legacy `ngram_assist`, prompt-lookup bounds and `VLLM_DFLASH2_LOOKUP_*` settings.
-
 ## Sampling parameters
 
 These are request-scope settings. The server takes default sampling values from the checkpoint's `generation_config.json` (`temperature` 1.0, `top_p` 0.95, `top_k` 20), but only for fields that a request leaves out. Many chat clients send their own `temperature` and `top_p`, so check the client settings. Qwen recommends:
@@ -217,7 +200,7 @@ These are request-scope settings. The server takes default sampling values from 
 - **Endless repetition:** Qwen suggests a `presence_penalty` between 0 and 2. Higher values can mix languages and slightly lower quality.
 - `presence_penalty` can only be set per request. `--override-generation-config` sets server defaults for `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty` and `max_new_tokens` only.
 - `top_k` and `min_p` are not standard OpenAI fields. With the OpenAI Python SDK, pass them in `extra_body`.
-- These are the model vendor's values. The [speed tests](performance.md) use `temperature=0`. The `draft_sample_method` in the launch command applies only to drafting and draft verification, not to these request settings.
+- These are the model vendor's values. The `draft_sample_method` in the launch command applies only to drafting and draft verification, not to these request settings.
 
 ## YaRN and native context
 

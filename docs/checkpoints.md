@@ -154,9 +154,9 @@ V100 stores compressed weights and KV and converts them to FP16 for computation.
 | `float16` | FP16 | None | Holds about half as many KV tokens as the 8-bit formats in the same memory |
 
 - **INT8 versus E4M3.** On the measured sets, INT8 has slightly lower KL and similar top-1 agreement to scalar E4M3 (see the [comparison](#quantization-comparison)). This does not establish a difference in task-level answer quality.
-- **Draft KV.** The MTP draft inherits the target format unless `speculative_config.kv_cache_dtype` sets another supported format. An FP16 draft (`"kv_cache_dtype": "float16"`) works with an INT8 or `fp8_per_token_head` target. DFlash2 drafts use FP16 KV by default. Eligibility and page layouts are in [Launch options](configuration.md#launch-options).
+- **Draft KV.** The MTP draft inherits the target format unless `speculative_config.kv_cache_dtype` sets another supported format. An FP16 draft (`"kv_cache_dtype": "float16"`) works with an INT8 or `fp8_per_token_head` target. DFlash2 drafts use FP16 KV by default; see [What the profile sets](dflash2.md#what-the-profile-sets). Eligibility and page layouts are in [KV cache format](configuration.md#kv-cache-format).
 - **Offload.** CPU KV offload and the `revolta_fs` SSD tier store planar INT8 together with its scale planes; the plain `fs` tier rejects planar formats. See [KV offload](kv-offload.md).
-- **Capacity.** For measured GPU KV capacity by format, see [GPU KV capacity by method](performance.md#gpu-kv-capacity-by-method).
+- **Capacity.** For measured GPU KV capacity by format, see [GPU KV capacity](performance.md#gpu-kv-capacity).
 
 ### Scalar E4M3 KV (frozen)
 

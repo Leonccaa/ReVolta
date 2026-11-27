@@ -168,37 +168,16 @@ constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
 static_assert(kSm70Qwen38HcGateEpochIndexBase + kSm70Qwen38HcGatePushBlocks <=
               kSm70Qwen38HcPushSignalBytes / sizeof(uint32_t));
 
-// Opt-in wider PEX push set: enabled when the PCIe-switch byte cap
-// VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES is raised above its 204800 default.
-inline bool sm70_pex_tp4_push_wide_enabled() {
-  const char* raw = std::getenv("VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES");
-  return raw != nullptr && std::atoll(raw) > 204800;
-}
-
 inline int sm70_pex_tp4_push_blocks(size_t bytes) {
   // Keep these graph payloads in sync with _SM70_PEX_TP4_PUSH_BYTES and
   // _SM70_PEX_TP4_PUSH_WIDE_BYTES.
   constexpr size_t row_bytes = kSm70Tp4PushAllreduceQwen4ExpBytes;
-  bool admit = false;
-  switch (bytes) {
-    case 20 * row_bytes:
-    case 24 * row_bytes:
-    case 25 * row_bytes:
-    case 30 * row_bytes:
-    case 32 * row_bytes:
-    case 35 * row_bytes:
-    case 40 * row_bytes:
-      admit = true;
-      break;
-    default:
-      break;
-  }
-  if (!admit && sm70_pex_tp4_push_wide_enabled() && bytes % row_bytes == 0) {
-    const size_t rows = bytes / row_bytes;
-    admit =
-        rows == 18 || rows == 28 || rows == 36 || (rows >= 42 && rows <= 64);
-  }
-  if (!admit) return 0;
+  if (bytes % row_bytes != 0) return 0;
+  const size_t rows = bytes / row_bytes;
+  if (!(rows == 18 || rows == 20 || rows == 24 || rows == 25 || rows == 28 ||
+        rows == 30 || rows == 32 || rows == 35 || rows == 36 || rows == 40 ||
+        (rows >= 42 && rows <= 64)))
+    return 0;
   constexpr int block_bytes = kSm70Tp4PushAllreduceThreads * 16;
   return std::min(kSm70Tp4PushAllreduceBlocks,
                   static_cast<int>((bytes + block_bytes - 1) / block_bytes));

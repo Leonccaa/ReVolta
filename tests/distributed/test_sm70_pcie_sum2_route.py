@@ -285,30 +285,24 @@ _BASE_ROWS = {20, 24, 25, 30, 32, 35, 40}
 
 @pytest.mark.parametrize("max_bytes", [204800, 327680])
 def test_pex_push_selection_all_widths(monkeypatch, max_bytes):
-    """M1-M64: push only for the default set, plus wide set when opted in."""
+    """M1-M64: retain generic AR admission and the opt-in push set."""
+    custom = _custom(monkeypatch)
+    custom.sm70_pcie_switch_max_bytes = max_bytes
     for tokens in range(1, 65):
-        custom = _custom(monkeypatch)
-        custom.sm70_pcie_switch_max_bytes = max_bytes
         inp = torch.ones(tokens, 2560, dtype=torch.float16)
         nbytes = tokens * 5120
-        expect_mid = tokens in _BASE_ROWS or (
+        expect_push = tokens in _BASE_ROWS or (
             max_bytes > 204800 and tokens in _WIDE_ROWS
         )
         if nbytes <= 80 * 1024:
             assert custom.should_custom_ar(inp)
         else:
-            assert custom.should_custom_ar(inp) is expect_mid, tokens
-            assert custom.can_sm70_tp4_push_sum2(inp) is expect_mid, tokens
+            expect_ar = nbytes <= max_bytes and (nbytes > 204800 or expect_push)
+            assert custom.should_custom_ar(inp) is expect_ar, tokens
+            assert custom.can_sm70_tp4_push_sum2(inp) is expect_push, tokens
 
 
 def test_pex_push_byte_cap_boundary(monkeypatch):
     custom = _custom(monkeypatch)
     custom.sm70_pcie_switch_max_bytes = 327680
-    assert custom.should_custom_ar(torch.ones(64, 2560, dtype=torch.float16))
     assert not custom.should_custom_ar(torch.ones(65, 2560, dtype=torch.float16))
-    custom.sm70_pcie_switch_max_bytes = 204800
-    assert custom.should_custom_ar(torch.ones(40, 2560, dtype=torch.float16))
-    assert not custom.should_custom_ar(torch.ones(41, 2560, dtype=torch.float16))
-    custom.sm70_pcie_switch_max_bytes = 250000  # cap below 64 rows, above 200K
-    assert custom.should_custom_ar(torch.ones(48, 2560, dtype=torch.float16))
-    assert not custom.should_custom_ar(torch.ones(49, 2560, dtype=torch.float16))

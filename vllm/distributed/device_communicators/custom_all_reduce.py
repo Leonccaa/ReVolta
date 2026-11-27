@@ -922,19 +922,7 @@ class CustomAllreduce:
                 and inp_size > self.sm70_pcie_switch_max_bytes
             ):
                 return False
-            # Within the expanded cap, only admit the added graph push sizes.
-            wide = (
-                self.sm70_pcie_switch_max_bytes > _SM70_PEX_TP4_PUSH_DEFAULT_MAX_BYTES
-            )
-            mid_size = (
-                80 * 1024
-                < inp_size
-                <= (
-                    self.sm70_pcie_switch_max_bytes
-                    if wide
-                    else _SM70_PEX_TP4_PUSH_DEFAULT_MAX_BYTES
-                )
-            )
+            mid_size = 80 * 1024 < inp_size <= _SM70_PEX_TP4_PUSH_DEFAULT_MAX_BYTES
             if (
                 self.sm70_pcie_switch_graph_only or mid_size
             ) and not torch.cuda.is_current_stream_capturing():

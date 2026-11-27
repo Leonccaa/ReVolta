@@ -25,16 +25,16 @@ Run the relevant tests and `pre-commit run --files <changed files>` in a Python 
 
 ### Required checks
 
-Every pull request into `main`, `prod` or a `release/` branch runs four checks, and all must pass before it can merge:
+Every pull request into `main`, `prod` or a `release/` branch runs four checks. Branch protection on `main` and `prod` requires all four to pass before a merge.
 
 | Check | What it verifies |
 | --- | --- |
 | `public text` | The PR title and body, commit messages, author and committer emails, and added lines contain no private IPv4 addresses, `.lan` host names, home-directory or `/mnt` paths, project-internal names, or credentials (GitHub, Hugging Face and PyPI tokens, API keys, AWS keys, private keys). |
 | `sign-off and added files` | Every non-merge commit has a `Signed-off-by:` line with its author's email. No added file is larger than 1 MiB unless its path is listed in `.github/large-files-allowed.txt`. |
-| `pre-commit (changed files)` | The repository's pre-commit hooks pass on the files the pull request changes. |
-| `mypy (3.12)` | mypy for Python 3.12 passes on all files, with the same hook and configuration as upstream vLLM. |
+| `pre-commit (changed files)` | The repository's pre-commit hooks pass on the files the pull request changes. It skips `mypy-local`, which needs the full development environment. |
+| `mypy (3.12)` | The upstream vLLM mypy hook for Python 3.12 passes over the repository, with that hook's own path exclusions. |
 
-Changes to the dashboard also run a `dashboard CPU` workflow. To run the first two checks locally before you push, install `regex`, fetch this repository's `main` (below, the remote `upstream` points to `Leonccaa/ReVolta`) and run:
+A pull request that changes the dashboard code or its tests also runs the `dashboard CPU` workflow; documentation-only changes do not trigger it. To run the first two checks locally before you push, install `regex`, fetch this repository's `main` (below, the remote `upstream` points to `Leonccaa/ReVolta`) and run:
 
 ```bash
 git fetch upstream main
@@ -42,7 +42,7 @@ BASE=upstream/main HEAD=HEAD python tools/ci/check_public_text.py
 BASE=upstream/main HEAD=HEAD python tools/ci/check_commits.py
 ```
 
-A local public-text run checks only the generic patterns; the project-internal names come from a repository secret.
+A local public-text run checks only the generic patterns. The project-internal names come from a repository secret, which pull requests from forks do not receive, so their `public text` check also uses only the generic patterns.
 
 ## AI-assisted contributions
 

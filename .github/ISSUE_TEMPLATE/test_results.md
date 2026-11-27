@@ -56,7 +56,7 @@ gpu_memory_utilization:
 
 ## Startup log lines
 
-<!-- The `ReVolta profile {...}` line, the `SM70 interconnect=` lines and the `GPU KV cache size` line. -->
+<!-- The `ReVolta profile {...}` line, the `SM70 interconnect=` lines and the `GPU KV cache size` line (with Host KV: the `long-context KV worker=0 ...` line instead). -->
 
 ```text
 

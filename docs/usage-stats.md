@@ -8,18 +8,18 @@ Sending is **on by default**. To turn it off, set `VLLM_NO_USAGE_STATS=1`; the o
 
 - **At engine start and every 10 minutes.** The engine sends one report when it starts. A heartbeat follows every 10 minutes; it repeats the startup report with a new `log_time` and the engine uptime in `uptime_s`, so a lost startup report does not lose the configuration.
 - **Once per engine.** Only the first GPU worker sends it, so a four-GPU tensor-parallel engine sends one report, not four.
-- **In the background, never in the way.** A background thread sends the report. Each attempt waits at most 5 seconds. A network error, an unreachable collector, a read-only configuration directory or any other failure is logged at debug level and dropped. A failed report is not retried; the next attempt is the next heartbeat.
+- **In the background, never in the way.** A background thread sends the report. Each attempt has a 5-second connect timeout and a 5-second read timeout. A network error, an unreachable collector, a read-only configuration directory or any other failure is logged at debug level and dropped. A failed report is not retried; the next attempt is the next heartbeat.
 - **Announced in the log.** When collection is on, each engine start logs one `INFO` line that says statistics are sent and where, what they contain, how to turn them off and where this page is.
 - **Kept in a local file.** Every report, startup and heartbeat, is also appended as one JSON line to `usage_stats.json` in the directory given by `VLLM_CONFIG_ROOT` (default `~/.config/vllm`, or `$XDG_CONFIG_HOME/vllm` when `XDG_CONFIG_HOME` is set). The file grows by one line per report and is not rotated. A write failure is ignored like a send failure.
 
 ## What is sent
 
-One flat JSON object. Fields that do not apply are sent as `null`.
+One flat JSON object. Fields that do not apply are sent as `null`; `gpu_topology` is left out when there is no topology to report.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `uuid` | string | Random identifier created when the engine process starts. It ties the heartbeats of one process together; a restart creates a new one. It is not derived from the machine. |
-| `provider` | string | Cloud provider: `AWS`, `AZURE`, `GCP` or `OCI` when the machine's DMI vendor strings name one, `RUNPOD` when `RUNPOD_DC_ID` is set, otherwise `UNKNOWN`. |
+| `provider` | string | Cloud provider: `AWS`, `AZURE`, `GCP` or `OCI` when the machine's DMI vendor strings name one, `RUNPOD` when no DMI vendor matched and `RUNPOD_DC_ID` is set to a non-empty value, otherwise `UNKNOWN`. |
 | `num_cpu` | number | Number of logical CPUs. |
 | `cpu_type` | string | CPU brand string. |
 | `cpu_family_model_stepping` | string | CPU family, model and stepping, separated by commas. |
@@ -36,8 +36,8 @@ One flat JSON object. Fields that do not apply are sent as `null`.
 | `vllm_version` | string | The same value under the inherited field name. |
 | `model_architecture` | string | Model class name the engine selected for the checkpoint. It is a class name, not a path or repository name. |
 | `context` | string | How the engine was started. Always `ENGINE_CONTEXT` in this release. |
-| `env_var_json` | string | A JSON object with a fixed allowlist of switches: `VLLM_USE_MODELSCOPE`, `VLLM_USE_FLASHINFER_SAMPLER`, `VLLM_USE_TRITON_AWQ` and `VLLM_ENABLE_V1_MULTIPROCESSING` (booleans, always present), plus `VLLM_PP_LAYER_PARTITION` only when it is set to a numeric partition such as `20,20`. |
-| `source` | string | Deployment label from `VLLM_USAGE_SOURCE`: `production` by default, `production-docker-image` in the published Docker image. An empty value, or one that looks like a path or URL (see [screening](#what-is-never-sent)), is reported as `custom`. |
+| `env_var_json` | string | A JSON object with a fixed allowlist of switches: `VLLM_USE_MODELSCOPE`, `VLLM_USE_FLASHINFER_SAMPLER`, `VLLM_USE_TRITON_AWQ` and `VLLM_ENABLE_V1_MULTIPROCESSING` (booleans, always present), plus `VLLM_PP_LAYER_PARTITION` only when it is set and consists of at most 64 letters, digits, `_`, `,`, `+` or `-`, such as `20,20`. |
+| `source` | string | Deployment label from `VLLM_USAGE_SOURCE`: `production` by default, `production-docker-image` in the published Docker image. Any other value of at most 64 characters without `/`, `\`, `:` or a space is sent as written; an empty value, or one that fails this [screening](#what-is-never-sent), is reported as `custom`. |
 | `log_time` | number | Report time in nanoseconds since the Unix epoch. |
 | `uptime_s` | number | Seconds since the startup report, on a monotonic clock; `0` in the startup report. |
 | `dtype` | string | Model dtype, for example `torch.float16`. |
@@ -67,9 +67,9 @@ One flat JSON object. Fields that do not apply are sent as `null`.
 
 - Prompts, outputs, and the token counts or timings of individual requests.
 - Model paths, repository names and served model names.
-- Host names, user names and IP addresses. The payload contains no address. Like any HTTPS request, the collector sees the network address the request comes from; it does not record it.
+- Host names, user names and IP addresses: the engine does not collect them. The one free-form value is `source`, copied from `VLLM_USAGE_SOURCE` after screening, so a short label such as a host name or an IPv4 address written there would be sent; do not put identifying text in it. Like any HTTPS request, the collector sees the network address the request comes from; it does not record it.
 - GPU UUIDs, serial numbers and PCI bus IDs.
-- Environment variables outside the allowlist in `env_var_json`. `RUNPOD_DC_ID` is only checked for presence to set `provider`; its value is not sent.
+- Environment variables outside the allowlist in `env_var_json`, except `VLLM_USAGE_SOURCE` as described above. `RUNPOD_DC_ID` is only checked to set `provider`; its value is not sent.
 - Free-form settings such as paths, URLs and file names. Every configuration value is screened before the report is built: a string longer than 64 characters, or one that contains `/`, `\`, `:` or a space, is replaced by `null`. Allowlisted environment values must be booleans, numbers or short switch-like strings. Hardware and platform fields (`cpu_type`, `platform`, `gpu_type`) are sent as the system reports them.
 
 ## Where it goes

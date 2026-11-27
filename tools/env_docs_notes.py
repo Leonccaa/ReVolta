@@ -1189,8 +1189,7 @@ DFLASH2_NOTES: dict[str, str] = {
     "the config value is unset.",
     "spec_state_replay": "Replay the accepted prefix to rebuild recurrent state "
     "instead of storing every speculative state: more GPU KV capacity at a "
-    "small per-step cost. On by default for supported ordinary DFlash2 "
-    "routes. "
-    "None retains an enabled packed verifier, and explicit false disables replay. See "
-    "[State replay](dflash2.md#state-replay).",
+    "small per-step cost. The serving profile turns it on for DFlash2 unless "
+    "fused_gdn_verify is set explicitly; Host KV mode also turns it on. "
+    "Explicit false disables replay. See [State replay](dflash2.md#state-replay).",
 }

@@ -12,7 +12,7 @@ Terms used in the tables:
 
 The engine turns on the ReVolta profile when all of these hold: every visible GPU is SM70 (V100), `--tensor-parallel-size 4`, the model has QSA selector metadata (Qwen3.8 Flash-Next) and `--dtype half`. The profile then sets tuned kernel switches and serving defaults for that server. A value you set yourself, as an environment variable or a launch option, always takes precedence.
 
-To check it, look for `ReVolta profile {"enabled": true, ...}` in the startup log. The line lists each audited switch with its value and its source: `profile`, `environment` or `upstream_default`.
+To check it, look for `ReVolta profile {"enabled": true, ...}` in the startup log. The line lists the audited settings with their values and sources (`profile`, `environment` or `upstream_default`); not every setting the profile applies is in that list.
 
 With the profile, the reference deployment needs only these environment settings. All are deployment scope.
 
@@ -420,7 +420,7 @@ The ReVolta profile (`vllm/revolta_profile.py`) sets these on SM70 + TP4 + FP16 
 
 ### speculative_config.sm70_dflash2 keys
 
-Pass these inside `--speculative-config '{..., "sm70_dflash2": {...}}'` (see [DFlash2](dflash2.md)). `None` selects the ReVolta profile default; operator shape, dtype and native checks still decide each dispatch.
+Pass these inside `--speculative-config '{..., "sm70_dflash2": {...}}'` (see [DFlash2](dflash2.md)). `None` (unset) takes the built-in default when the DFlash2 verifier qualifies (Flash-Next on SM70 under the ReVolta serving profile), otherwise the value of the matching legacy `VLLM_SM70_DFLASH2_*` environment variable; shape, dtype and native checks still decide each dispatch.
 
 | Key | Type | Default | Effect and trade-off |
 |---|---|---|---|
@@ -430,7 +430,7 @@ Pass these inside `--speculative-config '{..., "sm70_dflash2": {...}}'` (see [DF
 | `fused_smallq_metadata` | bool \| None | `None` | Fused Flash-V100 metadata for small-query verify batches. |
 | `grouped_smallq_metadata` | bool \| None | `None` | Grouped small-query Flash-V100 metadata across requests. |
 | `sparse_target_rejection` | bool \| None | `None` | Avoid gathering full-vocabulary target logits for eligible sampled DFlash2 rounds. On by default for the qualifying Flash-Next serving profile with a DFlash2 selector (AWQ and NVFP4). Greedy and unsupported sampling stay dense. Set false to use dense verification for all requests; the legacy VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION alias is used only when the config value is unset. |
-| `spec_state_replay` | bool \| None | `None` | Replay the accepted prefix to rebuild recurrent state instead of storing every speculative state: more GPU KV capacity at a small per-step cost. On by default for supported ordinary DFlash2 routes. None retains an enabled packed verifier, and explicit false disables replay. See [State replay](dflash2.md#state-replay). |
+| `spec_state_replay` | bool \| None | `None` | Replay the accepted prefix to rebuild recurrent state instead of storing every speculative state: more GPU KV capacity at a small per-step cost. The serving profile turns it on for DFlash2 unless fused_gdn_verify is set explicitly; Host KV mode also turns it on. Explicit false disables replay. See [State replay](dflash2.md#state-replay). |
 | `verify_fastpath` | bool \| None | `None` | Fast metadata path for verify steps in the hybrid (GDN + attention) model state. |
 
 <!-- END GENERATED: tools/gen_env_docs.py -->

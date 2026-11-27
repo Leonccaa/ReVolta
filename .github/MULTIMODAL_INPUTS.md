@@ -17,7 +17,7 @@ Other rules:
 - A count of zero disables that modality.
 - Modalities that the option leaves out default to 8 images and 1 audio item, and to 1 video except on V100 (where video becomes 0); other modalities default to 999. For example, `'{"video": 1}'` allows 8 images.
 - These counts are separate from the request-wide item ceiling `VLLM_MAX_MEDIA_REQUEST_ITEMS` (below). Count overrides cannot bypass the byte, pixel or frame ceilings.
-- Embedding-only and UUID-only cache references do not fetch raw media and are outside the raw-media byte accounting; the count limits still apply to them.
+- Embedding-only and UUID-only cache references do not fetch raw media and are outside the raw-media byte accounting. The count limits still apply to them, except for precomputed embeddings with `--enable-mm-embeds` when that modality's count is 0.
 
 ## Image size
 
@@ -36,7 +36,7 @@ Small text can become blurry when a large image is reduced. Crop the relevant re
 
 ## Video frames
 
-The video loader samples **16 frames** per video by default. The reference launch states this explicitly with `--media-io-kwargs '{"video": {"num_frames": 16}}'`. An operator can set `num_frames` or `fps` there instead. When a trusted request overrides one of them, the other inherited field is cleared. `num_frames=-1` loads all frames only when that count fits the frame ceiling and the decode budget; this is checked before the frames are allocated.
+The video loader samples **16 frames** per video by default. The reference launch states this explicitly with `--media-io-kwargs '{"video": {"num_frames": 16}}'`. An operator can also set `fps`; the loader then samples the smaller of `num_frames` and the frames that `fps` gives, and `num_frames` stays 16 unless you set it too. When a trusted request overrides one of them, the other inherited field is cleared. `num_frames=-1` loads all frames only when that count fits the frame ceiling and the decode budget; this is checked before the frames are allocated.
 
 The frame ceiling (`VLLM_MAX_VIDEO_FRAMES`, default 64) and the decode budget apply after these settings are merged. Video backends that cannot account for frames before decoding are rejected while the decode budget is enabled.
 
@@ -54,7 +54,7 @@ These server environment variables bound the media in one request. Set a variabl
 | `VLLM_MAX_VIDEO_FRAMES` | 64 | Sampled frames per video |
 
 - The single-response limit stops one large download; the request limits stop many smaller inputs.
-- Images are charged at their original size, before resizing. The default decode budget fits 16 frames of 3840 × 2160 (530,841,600 B) or several 12-megapixel images. With 16 images per request, each image can be at most 8,388,608 pixels (536,870,912 B / 16 / 4 B per pixel) before the request is rejected; raise `VLLM_MAX_MEDIA_REQUEST_DECODE_BYTES` if your clients send many large photos.
+- Images are charged at their original size, before resizing. The default decode budget fits 16 frames of 3840 × 2160 (530,841,600 B) or several 12-megapixel images. The budget is a request total: 16 images of the same size can each have at most 8,388,608 pixels (536,870,912 B / 16 / 4 B per pixel), while a single image may have up to the 16,777,216 pixels of `VLLM_MAX_IMAGE_PIXELS`; raise `VLLM_MAX_MEDIA_REQUEST_DECODE_BYTES` if your clients send many large photos.
 - The decode budget does not promise that a long source video fits the separate 256 MiB download limit.
 - Repeated URLs and cache hits are charged again. Failed attempts keep their charges for the current request; a new request starts with a fresh budget.
 - Size errors are validation failures: the server returns HTTP 400 and the client should not retry unchanged.

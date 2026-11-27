@@ -10,7 +10,7 @@ Use this guide to choose a Qwen3.8 Flash-Next checkpoint, prepare it with its MT
 | [Base AWQ g32](https://huggingface.co/leoncca/Qwen3.8-Flash-Next-AWQ-g32) | Same layout as Uncensored AWQ | Its own `mtp-fp8/`, converted and calibrated separately | Quantization quality measured; serving acceptance not run |
 | [Standard NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4) | ModelOpt NVFP4 routed experts; about 126 GiB | The Uncensored AWQ draft, shipped in the NVFP4 scale pack | Covered by the 0.2.0 release tests with MTP5 and DFlash2 <!-- TODO(0.2.0-acceptance): pass/fail summary, E3a, E3b -->; passed the 0.1.0 release gate |
 | [NVIDIA FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local) | NVFP4 experts, MXFP8 layers, NVFP4 PLE table; about 95 GiB | Built-in MTP layer | Passed the 0.1.0 release gate; not in the 0.2.0 release tests |
-| [NVIDIA NVFP4-QAD](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4-QAD) | NVFP4 routed and shared experts, MXFP8 GDN and QSA projections, FP8 PLE table | Built-in MTP layer | Loading and serving checks passed in 0.2.0rc12; quantization quality not measured |
+| [NVIDIA NVFP4-QAD](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4-QAD) | NVFP4 routed and shared experts, MXFP8 GDN and QSA projections, FP8 PLE table | Built-in MTP layer | Loading and serving checks passed in 0.2.0rc12; quantization quality not measured. The repository is not publicly downloadable at the time of writing |
 
 - Start with **Uncensored AWQ**: it is the default, the most tested, and has the best measured quality of the formats compared below.
 - Choose **Base AWQ** for the original, not fine-tuned model in the same format.
@@ -21,7 +21,7 @@ V100 has no BF16 support, so serve every checkpoint with `--dtype half`.
 
 ### Quantization comparison
 
-These quality measurements were taken before 0.2.0; their ReVolta version was not recorded. See [Quality measurements](performance.md#quality-measurements) for the datasets, reference and estimator. The E4M3 rows use the scalar E4M3 KV format.
+These quality measurements were published with 0.1.0; the exact build was not recorded. See [Quality measurements](performance.md#quality-measurements) for the datasets, reference and estimator. The E4M3 rows use the scalar E4M3 KV format.
 
 | Format | KL vs BF16 ↓ | Top-1 agreement ↑ |
 | --- | ---: | ---: |
@@ -72,7 +72,7 @@ CHECKPOINTS = {
         "repo": "nvidia/Qwen3.8-Flash-Next-FP4-Local",
         "revision": "b9ce18a6887e18c089fdea8509a33e63429a3300",
     },
-    "nvfp4-qad": {
+    "nvfp4-qad": {  # not publicly downloadable at the time of writing
         "repo": "nvidia/Qwen3.8-Flash-Next-NVFP4-QAD",
         "revision": "eec0322cb03229cae4cd8e2fa45547542e472eac",
     },
@@ -137,7 +137,7 @@ NVFP4-QAD was validated in 0.2.0rc12 with `--kv-cache-dtype fp8_per_token_head`.
 ### MTP drafts
 
 - Use the draft that belongs to the target: an AWQ checkpoint's own `mtp-fp8/`, the scale pack's `mtp-fp8/` for Standard NVFP4, or the built-in layer of FP4-Local and NVFP4-QAD. The AWQ drafts also contain calibrated draft K/V scales, which only scalar E4M3 KV uses.
-- The Standard NVFP4 draft is copied from Uncensored AWQ revision `1fd7ab705731c9dacc3bcd5b5d15783c60706d64`, including its license and provenance. With Standard NVFP4 it reached 62.5% acceptance in a 0.1.x serving test; this is not an answer-quality measurement.
+- The Standard NVFP4 draft is copied from Uncensored AWQ revision `1fd7ab705731c9dacc3bcd5b5d15783c60706d64`, including its license and provenance. With Standard NVFP4 it reached 62.5% acceptance in a 0.1.0 serving test; this is not an answer-quality measurement.
 - On V100, the engine packs floating-point and block-FP8 MTP routed experts into Q8_0 once at load time and logs `Defaulting SM70 Qwen4Exp MTP routed experts to Q8_0`. Packed NVFP4 draft experts keep their checkpoint format. Add `"mtp_expert_quantization": "fp8"` to the speculative config to keep FP8 draft experts, or `"fp16"` for the FP16 reference. This affects only the draft's routed expert weights, not the draft KV.
 - DFlash2 drafts need no K/V scales; see [DFlash2](dflash2.md).
 
@@ -154,7 +154,7 @@ V100 stores compressed weights and KV and converts them to FP16 for computation.
 | `float16` | FP16 | None | Holds about half as many KV tokens as the 8-bit formats in the same memory |
 
 - **INT8 versus E4M3.** On the measured sets, INT8 has slightly lower KL and similar top-1 agreement to scalar E4M3 (see the [comparison](#quantization-comparison)). This does not establish a difference in task-level answer quality.
-- **Draft KV.** The MTP draft inherits the target format unless `speculative_config.kv_cache_dtype` sets another supported format. An FP16 draft (`"kv_cache_dtype": "float16"`) works with an INT8 or `fp8_per_token_head` target. DFlash2 drafts use FP16 KV by default; see [What the profile sets](dflash2.md#what-the-profile-sets). Eligibility and page layouts are in [KV cache format](configuration.md#kv-cache-format).
+- **Draft KV.** The MTP draft inherits the target format unless `speculative_config.kv_cache_dtype` sets another supported format. An FP16 draft (`"kv_cache_dtype": "float16"`) works with an INT8, `fp8_per_token_head` or scalar `fp8_e4m3` target. DFlash2 drafts use FP16 KV by default; see [What the profile sets](dflash2.md#what-the-profile-sets). Eligibility and page layouts are in [KV cache format](configuration.md#kv-cache-format).
 - **Offload.** CPU KV offload and the `revolta_fs` SSD tier store planar INT8 together with its scale planes; the plain `fs` tier rejects planar formats. See [KV offload](kv-offload.md).
 - **Capacity.** For measured GPU KV capacity by format, see [GPU KV capacity](performance.md#gpu-kv-capacity).
 
@@ -205,8 +205,8 @@ Model Runner V2 cannot measure CUDA graph memory before it sizes the KV cache, s
 | Speculative method | KV format | Reserve per GPU |
 | --- | --- | ---: |
 | MTP, fixed draft count | Planar | 600 MiB |
-| MTP with a dynamic draft schedule, up to 4 drafts (the reference configuration) | Planar | 705 MiB |
-| MTP with a dynamic draft schedule, 5 or more drafts | Planar | 800 MiB |
+| MTP with a dynamic draft schedule, `num_speculative_tokens` up to 4 (the reference configuration) | Planar | 705 MiB |
+| MTP with a dynamic draft schedule, `num_speculative_tokens` 5 or more | Planar | 800 MiB |
 | MTP | Scalar E4M3 or FP16 | 700 MiB |
 | None | Any | 700 MiB |
 | DFlash2, AWQ | Planar | 1000 MiB (1150 MiB with a positive `--mixed-prefill-step-latency-ms`) |

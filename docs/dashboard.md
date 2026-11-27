@@ -19,7 +19,7 @@ The page becomes available once the model has loaded and the API server is liste
 What the data needs:
 
 - **Engine statistics.** They are on by default. With `--disable-log-stats` the token metrics are missing and the page says so.
-- **Store metrics for the Cache card.** The RAM, SSD and GPU Hot views use the store metrics (`--enable-store-metrics`, on by default, needs engine statistics). The engine publishes them at most once a minute, and only for KV modes that export them, such as Host KV or CPU/SSD offload. Without them those values show `—`.
+- **Store metrics for the Cache card.** The RAM, SSD and GPU Hot views use the store metrics (`--enable-store-metrics`, on by default, needs engine statistics), which the engine publishes at most once a minute. Their occupancy values come from Host KV's store gauges; with GPU KV and CPU or disk offload only some event counters are published, so most of those values show `—`.
 
 The page needs no JavaScript build step, chart library, CDN or external font. Its HTML, CSS and JavaScript files are part of the wheel and the Docker image. The page loads nothing from other origins.
 

@@ -25,7 +25,7 @@ The implementation uses `nvcuda::wmma` when compiled for `sm_70`, which emits Vo
 
 ## Non-causal attention kernel
 
-`noncausal_attention(..., backend="FLASHINFER_SM70")` in `vllm/model_executor/layers/sm70_attention.py` calls the kernel. It takes contiguous BSHD FP16 tensors with matching query and key lengths and head dimension 128. If the extension is not in the wheel, the wrapper compiles it with `torch.utils.cpp_extension`. The inherited MiniMax H3 video-generation code is its only caller; that model is outside the ReVolta support scope.
+`noncausal_attention(..., backend="FLASHINFER_SM70")` in `vllm/model_executor/layers/sm70_attention.py` calls the kernel. It takes contiguous BSHD FP16 tensors with matching query and key lengths and head dimension 128. If the extension is not in the wheel, the wrapper compiles it with `torch.utils.cpp_extension`; that needs a source checkout (the wheel does not contain the `.cu` and header files) and the CUDA toolkit. The inherited MiniMax H3 video-generation code is its only caller; that model is outside the ReVolta support scope.
 
 `tools/prepare-flashinfer-sm70.sh` clones the pinned FlashInfer `v0.6.13` source, applies any patches in `patches/` and copies `include/` over it. The ReVolta build does not run it.
 

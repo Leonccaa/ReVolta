@@ -8,7 +8,7 @@ You need:
 - 128 GiB of host memory for this configuration. See [System memory and storage](configuration.md#system-memory-and-storage).
 - An NVIDIA driver for CUDA 12.8.
 - For a pip install: Linux x86-64 with glibc 2.34 or newer, Python 3.12 and the CUDA 12.8 Toolkit. For Docker: Docker with the NVIDIA Container Toolkit.
-- Disk space for the 137 GB checkpoint, plus the compile caches.
+- About 142 GB of disk space for the checkpoint and its MTP draft, plus the compile caches.
 
 The reference configuration is Uncensored AWQ g32 with tensor parallelism of four and decode context parallelism of two (TP4 + DCP2), an MTP draft with up to four draft tokens per round, INT8 KV cache for the target and the draft, a 524,288-token (512K) context through YaRN, image and video input, up to 8 concurrent requests and a 48 GiB CPU KV pool.
 
@@ -45,7 +45,7 @@ ReVolta does not report to the upstream vLLM statistics server. It sends its own
 
 ## 2. Download the checkpoint and make 512K views
 
-The checkpoint's native context is 262,144 tokens. ReVolta reaches 524,288 tokens with YaRN (factor 2). The target model **and** the MTP draft must both see the YaRN settings, but `--hf-overrides` reaches only the target model. So the script below makes two "view" directories. Each view links to every file of the checkpoint (or of its `mtp-fp8/` draft) and contains an edited `config.json`. The validated setup used views of this kind.
+The checkpoint's native context is 262,144 tokens. ReVolta reaches 524,288 tokens with YaRN (factor 2). The script below gives the target model and the MTP draft each a "view" directory with the YaRN settings: the view links to every file of the checkpoint (or of its `mtp-fp8/` draft) and contains an edited `config.json`. The validated setup used views of this kind. (`--hf-overrides` reaches only the target; the engine also copies the target's YaRN scaling to an MTP draft that ships native RoPE with the same `rope_theta`, but the release tests used the two views.)
 
 Run the script in the ReVolta virtual environment, which already has `huggingface_hub`. With Docker only, install `huggingface_hub` on the host first (`pip install huggingface_hub`).
 
@@ -188,7 +188,7 @@ curl -s http://localhost:8000/v1/chat/completions \
 
 In the startup log, look for:
 
-- `ReVolta profile {"enabled": true, ...}`: the profile is active. The line lists each tuned switch with its value and source (`profile`, `environment` or `upstream_default`).
+- `ReVolta profile {"enabled": true, ...}`: the profile is active. The line lists the audited settings with their values and sources (`profile`, `environment` or `upstream_default`); some settings the profile applies, such as the wide verifier switches, are not in it.
 - `Defaulting QSA main KV storage to int8`: the target KV cache is INT8.
 - `SM70 interconnect=pex_p2p` (or `no_p2p` / `nvlink`) from each worker.
 

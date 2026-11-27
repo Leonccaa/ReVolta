@@ -6,13 +6,13 @@ ReVolta turns a server with V100 32 GB GPUs and plenty of system memory into a d
 
 ReVolta is built for four or more V100 32 GB GPUs and validated on four. We recommend, and test, the two interconnects that give the best speed: NVLink, or all GPUs under one PCIe switch with P2P. Every release passes the same fixed gate on our own server before it ships: 4 and 8 concurrent requests, KV cache readback from CPU memory, long context, GSM8K and MMLU quality subsets, and fixed prompts compared with the previous release (the output is identical, or each difference has an identified cause and no quality loss). Images, video and other areas are tested again when a release changes them. That server runs ReVolta every day.
 
-**You need:** four or more V100 32 GB GPUs (validated on four), on NVLink or with all GPUs under one PCIe switch with P2P; 128 GiB of system memory recommended, 80 GiB at least with the model's PLE embedding tables in host memory, which is the default (32 GiB was tested in 0.1.4 with the experimental whole-table PLE disk option, which made single-request decoding about 23–25% slower); Linux x86-64; an NVIDIA driver for CUDA 12.8; and Docker with GPU support, or Python 3.12 with glibc 2.34 or newer. Tested hardware and limits: [Support and known limits](https://github.com/Leonccaa/ReVolta/blob/main/docs/known-limits.md).
+**You need:** four or more V100 32 GB GPUs (validated on four), on NVLink or with all GPUs under one PCIe switch with P2P; 128 GiB of system memory recommended, 80 GiB at least (tested in 0.1.0 with KV offload off) with the model's PLE embedding tables in host memory, which is the default (32 GiB was tested in 0.1.4 with the experimental whole-table PLE disk option, which made single-request decoding about 23–25% slower); Linux x86-64; an NVIDIA driver for CUDA 12.8; and Docker with GPU support, or Python 3.12 with glibc 2.34 or newer. Tested hardware and limits: [Support and known limits](https://github.com/Leonccaa/ReVolta/blob/main/docs/known-limits.md).
 
 **Current release: [0.2.0](https://github.com/Leonccaa/ReVolta/releases/tag/v0.2.0).** INT8 KV cache by default, optional Host KV that keeps the KV cache in host memory, draft widths that follow the batch size, and serving defaults that make a short launch command run the validated setup. Upgrading from 0.1.5: read the [release notes](https://github.com/Leonccaa/ReVolta/releases/tag/v0.2.0).
 
 ## At a glance
 
-MTP4 drafts up to four tokens per step with the model's own multi-token-prediction (MTP) layer (three per step at four or more requests); it is the default. DFlash2 uses a separate drafter model; our own server uses it.
+MTP4 drafts up to four tokens per step with the model's own multi-token-prediction (MTP) layer (three per step at four or more requests); the reference launch uses it. DFlash2 uses a separate drafter model; our own server uses it.
 
 **Context and capacity** (0.2.0; Uncensored AWQ g32, INT8 target KV, 512K context, 8 sequences, `--gpu-memory-utilization 0.956`, our 4 × V100 32 GB PCIe server)
 
@@ -46,7 +46,7 @@ The PLE tables are the model's n-gram embedding tables; they hold 51 billion of 
 
 The GPU KV pool is the startup log's capacity in 0.2.0 with INT8 target and draft KV, 512K context, 8 sequences and `--gpu-memory-utilization 0.956`; the AWQ row uses MTP with 4 draft tokens and the NVFP4 rows use MTP with 5, as tested. The quality figures were measured with scalar E4M3 KV on 66 English, Chinese and code records, each checkpoint against its own BF16 parent; INT8 KV measured a slightly lower KL on the AWQ checkpoint. Method and other datasets: [Quality measurements](https://github.com/Leonccaa/ReVolta/blob/main/docs/performance.md#quality-measurements). Test status, pinned revisions and preparation steps: [Checkpoints](https://github.com/Leonccaa/ReVolta/blob/main/docs/checkpoints.md).
 
-Also supported: [NVIDIA NVFP4-QAD](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4-QAD) (loading and serving checks passed; quality against BF16 not yet measured). DFlash2 needs the separate [incoai DFlash2 drafter](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2). Text-only [Hy4-flash](https://huggingface.co/tencent/Hy4-flash) has validation support: it was validated once, in 0.2.0rc13, and its model code ships unchanged in 0.2.0, but the 0.2.0 release tests did not run it. See [Hy4-flash](https://github.com/Leonccaa/ReVolta/blob/main/docs/hy4-flash.md).
+Also supported: [NVIDIA NVFP4-QAD](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4-QAD) (loading and serving checks passed; quality against BF16 not yet measured; the repository is not publicly downloadable at the time of writing). DFlash2 needs the separate [incoai DFlash2 drafter](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2). Text-only [Hy4-flash](https://huggingface.co/tencent/Hy4-flash) has validation support: it was validated once, in 0.2.0rc13, and its model code ships unchanged in 0.2.0, but the 0.2.0 release tests did not run it. See [Hy4-flash](https://github.com/Leonccaa/ReVolta/blob/main/docs/hy4-flash.md).
 
 ## Quick start
 
@@ -58,7 +58,7 @@ docker pull ghcr.io/leonccaa/revolta:0.2.0
 pip install revolta==0.2.0   # the first start also needs the CUDA 12.8 Toolkit (nvcc)
 ```
 
-Download the checkpoint and make its 512K views with [step 2 of Getting started](https://github.com/Leonccaa/ReVolta/blob/main/docs/getting-started.md#2-download-the-checkpoint-and-make-512k-views). If your prompts stay within 262,144 tokens, skip the views: serve the checkpoint directory with `--max-model-len 262144` and use its `mtp-fp8/` directory as the draft.
+Download the checkpoint and make its 512K views with [step 2 of Getting started](https://github.com/Leonccaa/ReVolta/blob/main/docs/getting-started.md#2-download-the-checkpoint-and-make-512k-views). If prompt and output together stay within 262,144 tokens, skip the views: serve the checkpoint directory with `--max-model-len 262144` and use its `mtp-fp8/` directory as the draft.
 
 Then launch. The ReVolta profile sets the KV format, scheduler, draft widths and CUDA graph reserve for this setup, so the command only names the model, the GPU layout, the draft, the memory setting and the API options you use:
 
@@ -98,7 +98,7 @@ With the pip package, pass the same options to `vllm serve`. The first start tak
 ## Known limits
 
 - **Scope.** V100 16 GB, GPU counts other than four, TP2/TP8 and other models have not been tested. Only SM70 is built: other GPU architectures, ROCm, CPU, XPU, TPU and GGUF are outside the build.
-- **Reproducibility.** A single request is reproducible bit for bit. With 2–8 concurrent requests, greedy outputs can change between runs, because the tensor-parallel all-reduce sums in an order that depends on the batch. Fresh compiler autotuning can also change outputs.
+- **Reproducibility.** A single greedy request is reproducible bit for bit with a fixed configuration (sampled requests need a `seed`). With 2–8 concurrent requests, greedy outputs can change between runs, because the tensor-parallel all-reduce sums in an order that depends on the batch. Fresh compiler autotuning can also change outputs.
 - **Host memory.** By default the whole PLE table is pinned in host memory: about 48 GiB for AWQ and standard NVFP4, 27 GiB for FP4-Local. If it does not fit, startup stops and reports the required and available memory; `VLLM_QWEN4EXP_PLE_HOST_GIB` keeps part of the table on the GPU instead. The experimental whole-table PLE disk option served under a 32 GiB memory limit in 0.1.4, with single-request decoding about 23–25% slower and a cold first token 1.6–2.3 times as long. PLE cascade (`ple_disk_cascade`) is not supported and stays off.
 - **Disk KV tier.** INT8 and per-token-head E4M3 KV need the `revolta_fs` disk tier; startup rejects the raw `fs` tier for them. Give the service at least 120 s to stop, so that the disk tier can finish its delayed writes.
 - **Scalar E4M3 KV is frozen.** Calibrated scalar `fp8_e4m3` still works, but it is no longer optimized and gets only a functional check. Use the default INT8, or `fp8_per_token_head` for E4M3 storage without calibration.

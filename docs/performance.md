@@ -30,8 +30,8 @@ Each configuration below states its other settings.
 | Output speed | Generated tokens of all running requests divided by wall-clock time, in tokens/s. It includes the time to first token. At C4 and C8 it is the total over all requests, not the speed of one request. |
 | Cold TTFT | Time to first token for a prompt that is in no prefix cache. |
 | Second-token latency | Time from the first to the second output token of the same request. |
-| KV capacity | Tokens of context the KV cache can hold, from the startup log line `GPU KV cache size: N tokens`. For Host KV it is the host pool. |
-| Capacity ratio | KV capacity divided by 524,288, the `Maximum concurrency` value in the same startup log. It is a capacity ratio, not a request limit: at 2.5×, two full 512K requests fit, and many more shorter requests can run. |
+| KV capacity | Tokens of context the KV cache can hold. With GPU KV, from the startup log line `GPU KV cache size: N tokens`. With Host KV, which does not log that line, the host pool tokens from the `long-context KV worker=N ... plan` line, minus one reserved page. |
+| Capacity ratio | KV capacity divided by 524,288. With GPU KV it equals the `Maximum concurrency` value in the same startup log; with Host KV it is computed from the host pool tokens. It is a capacity ratio, not a request limit: at 2.5×, two full 512K requests fit, and many more shorter requests can run. With Host KV, the number of full-length requests is the smallest of the per-pool limits in the plan line. |
 | Prompt tokens hit | Prompt tokens served from a prefix cache instead of being computed. |
 | GSM8K, MMLU | Fixed subsets of the public GSM8K and MMLU sets, given as correct answers / questions. |
 
@@ -121,7 +121,7 @@ To compare the two speculative methods in 0.2.0, read C against D+E1 for AWQ (DF
 
 ## Quality measurements
 
-These measurements show how closely each AWQ checkpoint follows its BF16 parent. They were measured with E4M3 KV; no ReVolta version was recorded, and they have not been repeated with 0.2.0 or INT8 KV.
+These measurements show how closely each AWQ checkpoint follows its BF16 parent. They were measured with E4M3 KV and published with 0.1.0 (the exact build was not recorded); they have not been repeated with 0.2.0 or INT8 KV.
 
 | AWQ checkpoint | BF16 reference | KL ↓ | Top-1 agreement ↑ |
 | --- | --- | ---: | ---: |

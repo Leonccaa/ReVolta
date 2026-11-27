@@ -5,7 +5,7 @@ This page explains how to build the ReVolta wheel and Docker image from a source
 ## Requirements
 
 - Linux x86-64 with Docker BuildKit. No GPU is needed to compile.
-- Memory for the native compile. In an early 0.1 build, 10 parallel compile jobs used about 21 GB of RAM. Four jobs with one NVCC thread per job is a conservative start on a 32 GB host.
+- Memory for the native compile. In the 0.1.0 build, 10 parallel compile jobs used about 21 GB of RAM. Four jobs with one NVCC thread per job is a conservative start on a 32 GB host.
 
 `docker/Dockerfile` pins the toolchain: CUDA 12.8.1, Python 3.12, Ubuntu 22.04 and PyTorch 2.10.0 for CUDA 12.8. It builds for SM70 only (`torch_cuda_arch_list=7.0`, the default). CUDA 13 cannot compile SM70. The Dockerfile is the only tested build environment.
 
@@ -15,9 +15,14 @@ The distribution is `revolta`; the Python package and the CLI remain `vllm`.
 
 `get_vllm_version()` in `setup.py` sets the version from the first of these that is present:
 
-1. `VLLM_VERSION_OVERRIDE`, used exactly as given.
-2. `SETUPTOOLS_SCM_PRETEND_VERSION_FOR_REVOLTA` or `SETUPTOOLS_SCM_PRETEND_VERSION`. A CUDA build that compiles the extensions itself appends `+cu128` (or `.cu128` if the version already has a local part), because CUDA 12.8 differs from the main CUDA version `VLLM_MAIN_CUDA_VERSION` (13.0).
-3. The fallback version in `get_vllm_version()`.
+1. `VLLM_VERSION_OVERRIDE`, used exactly as given, with no suffix.
+2. `SETUPTOOLS_SCM_PRETEND_VERSION_FOR_REVOLTA` or `SETUPTOOLS_SCM_PRETEND_VERSION`.
+3. The fallback version in `get_vllm_version()` (`0.2.0`).
+
+Versions from 2 and 3 get a local suffix (`+…`, or `.…` if the version already has a local part):
+
+- A CUDA build that compiles the extensions itself appends `cu128`, because CUDA 12.8 differs from the main CUDA version `VLLM_MAIN_CUDA_VERSION` (13.0). An `sdist` build omits it.
+- A build with precompiled extensions appends `precompiled`, unless `VLLM_SKIP_PRECOMPILED_VERSION_SUFFIX=1`.
 
 Git tags are not used: the repository carries tags inherited from vLLM, so `setuptools-scm` never chooses the version. Always pass the version you want.
 
@@ -25,7 +30,7 @@ In the Docker build, `--build-arg SETUPTOOLS_SCM_PRETEND_VERSION=<version>` sets
 
 ## Build the wheel and the image
 
-Build from a clean checkout. The build reads no Git metadata when the version and commit are passed as below, so a linked worktree or an exported source tree also works; the `build` stage still bind-mounts `.git`, so a `.git` entry must exist in the build context.
+Build from a clean checkout. The build reads no Git metadata when the version and commit are passed as below, so a linked worktree or an exported source tree also works; the `build` stage still bind-mounts `.git`, so a `.git` entry must exist in the build context. In an exported tree, which has no Git history, set `commit` to the known commit ID instead of running `git rev-parse`.
 
 ```bash
 version=0.2.0

@@ -11,7 +11,7 @@ This page says what the maintainers support in ReVolta and where to ask for help
 | Host memory | 128 GiB recommended; 80 GiB is the smallest tested limit with the default PLE table in host memory and KV offload off; 32 GiB was tested in 0.1.4 with the experimental whole-table PLE disk option |
 | Model | Qwen3.8 Flash-Next: text, images and video |
 | Checkpoints | Uncensored AWQ g32 (recommended), Base AWQ g32, Standard NVFP4 (`RadixArk/Qwen3.8-Flash-Next-NVFP4`), `nvidia/Qwen3.8-Flash-Next-FP4-Local` and `nvidia/Qwen3.8-Flash-Next-NVFP4-QAD`; test status per checkpoint is in [Checkpoints](../docs/checkpoints.md) |
-| Speculative decoding | MTP (the default, with dynamic draft widths) or DFlash2 |
+| Speculative decoding | MTP with dynamic draft widths (the reference launch) or DFlash2 |
 | KV cache format | INT8 (the default, `--kv-cache-dtype auto`); FP16 and per-token-head E4M3 also work; calibrated scalar E4M3 is frozen and gets only a functional check |
 | KV placement | GPU KV, optionally with CPU and disk (`revolta_fs`) prefix offload; or Host KV, which keeps the main KV cache in host memory |
 

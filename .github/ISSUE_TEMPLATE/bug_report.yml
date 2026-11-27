@@ -154,7 +154,7 @@ body:
     id: startup
     attributes:
       label: Startup log lines
-      description: The `ReVolta profile {...}` line, the `SM70 interconnect=` line from each worker, and the `GPU KV cache size` line.
+      description: The `ReVolta profile {...}` line, the `SM70 interconnect=` line from each worker, and the `GPU KV cache size` line (with Host KV, the `long-context KV worker=0 ...` line instead).
       render: text
     validations:
       required: true

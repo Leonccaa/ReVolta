@@ -67,7 +67,7 @@ These defaults apply to `vllm serve` on four SM70 GPUs with TP4, FP16 activation
 | `sm70_dflash2`: `context_kv_graph`, `context_pipeline`, `verify_fastpath`, `fused_gdn_metadata`, `fused_smallq_metadata`, `grouped_smallq_metadata` | `true` | `false` per key. An explicit `context_kv_graph: false` also leaves an unset `context_pipeline` off |
 | `sm70_dflash2.sharded_selector_codebook` | `true`: each GPU keeps 1/4 of the selector codebooks | `false` keeps full codebooks on every GPU |
 | Drafter KV cache | FP16, whatever the target KV format | |
-| `qsa_dcp_index_shard` in `--kernel-config` | `true`: target QSA indexer keys are split over all tensor-parallel ranks at DCP2 | `false` |
+| `qsa_dcp_index_shard` in `--kernel-config` | `true` when unset and the model selects 512 index groups (Qwen3.8 Flash-Next): target QSA indexer keys are split over all tensor-parallel ranks; it takes effect at DCP2 | `false` |
 | `VLLM_SM70_DFLASH2_FUSED_QKV_PACK` | `1`: packs the verifier's Q/K/V rows with one kernel | `0` |
 | `VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP` | `1` with AWQ g32 weights, without expert parallelism or dual-batch overlap | `0` |
 | `VLLM_V2_CUDAGRAPH_MEM_MIB` | Sized for DFlash2 by the profile | Leave unset; values are in [CUDA graph reserve](checkpoints.md#cuda-graph-reserve) |
@@ -90,7 +90,7 @@ DFlash2 drafts probabilistically by default: the drafter samples its proposals a
 
 ### Draft-width schedule
 
-The default schedule publishes 7 draft tokens for one to three running requests, 3 at four and 4 from five onward. DFlash2 still drafts its full block each step and publishes only the first K tokens. Sweeps on 0.1.x found `[[1,2,7],[3,8,3]]` faster for mostly Chinese loads at three requests and `[[1,7,7],[8,8,4]]` best for mostly code at eight requests. Measure on your own workload before changing the default. The schedule format is in [Dynamic speculative decoding](dynamic-speculative-decoding.md).
+The default schedule publishes 7 draft tokens for one to three running requests, 3 at four and 4 from five onward. With K above 0, DFlash2 still drafts its full block each step and publishes only the first K tokens. The best schedule depends on the language and concurrency of your workload; measure on it before changing the default. The schedule format is in [Dynamic speculative decoding](dynamic-speculative-decoding.md).
 
 ### Settings to leave alone
 
@@ -136,7 +136,7 @@ To allow lookup in batches of up to three requests, set the whole object:
 
 ### When lookup runs
 
-Lookup is attempted only when every live row in the batch is an eligible decode request, the batch has at most `max_requests` requests and the schedule selects width 7. Otherwise the whole batch skips lookup, so four or more requests always skip it. Rows in prefill, rows with structured output, padding and rows without a sampled token or usable history do not attempt lookup. Eligibility is checked again every round. The proposal width stays 7; lookup never widens it.
+Lookup runs only in batches with at most `max_requests` requests where the schedule selects width 7, so four or more requests always skip it. Inside such a batch it is decided per row: rows in prefill, rows with structured output, padding and rows without a sampled token or usable history do not attempt lookup, while the other decode rows of the same batch still do. Eligibility is checked again every round. The proposal width stays 7; lookup never widens it.
 
 ### Fields
 
@@ -171,7 +171,7 @@ The metrics use the `vllm:dflash2_lookup_` prefix and the existing model and eng
 | `stats_covered` | Gauge | Producer watermark covered by the latest applied snapshot |
 | `stats_last_export_timestamp_seconds` | Gauge | Time of the latest applied snapshot |
 
-Each eligible row counts as one attempt, so a three-request batch can add three attempts in one round. The match-length histogram has the bucket bounds 1, 2, 3, 4, 5, 6, 8, 12, 16, 32, 64, 128 and +Inf; misses are not counted in it. The adoption rate is `rate(vllm:dflash2_lookup_adopted_rounds_total) / rate(vllm:dflash2_lookup_eligible_rounds_total)`; a zero denominator means no samples. Adoption counts replaced draft positions, not accepted tokens or saved rounds.
+Each eligible row counts as one attempt, so a three-request batch can add three attempts in one round. The match-length histogram has the bucket bounds 1, 2, 3, 4, 5, 6, 8, 12, 16, 32, 64, 128 and +Inf; misses are not counted in it. The adoption rate is `rate(vllm:dflash2_lookup_adopted_rounds_total[5m]) / rate(vllm:dflash2_lookup_eligible_rounds_total[5m])`; a zero denominator means no samples. Each request row that replaces at least one later draft position adds 1, however many positions it replaces; adoption does not count accepted tokens or saved rounds.
 
 Counters are exported with normal outputs while requests run. After the last request, the remaining counts wait until the next request or a normal shutdown; `stats_pending` and `stats_last_export_timestamp_seconds` show the lag. A restart can reset the counters, and an abnormal exit can lose the counts not yet exported.
 
@@ -182,7 +182,7 @@ Counters are exported with normal outputs while requests run. After the last req
 DFlash2 replays the accepted tokens into the GDN state instead of storing a state block for each draft position: each running request keeps 2 blocks per GDN cache group instead of 9. This is on by default where it is supported; the general behaviour and requirements are in [GDN state replay](speculative-decoding.md#gdn-state-replay).
 
 - `"sm70_dflash2": {"spec_state_replay": false}` keeps one state block per draft position. This trades GPU KV capacity for slightly less work per step. In Host KV mode, replay is also on by default, and an explicit `false` logs a warning.
-- An unset `spec_state_replay` gives way to an enabled packed verifier (`fused_gdn_verify`), which is off for Flash-Next. An explicit `true` together with an explicit `fused_gdn_verify: true` is a configuration error.
+- Replay and the packed verifier (`fused_gdn_verify`, off for Flash-Next) exclude each other. With GPU KV, an unset `spec_state_replay` gives way to an explicit `fused_gdn_verify: true`. In Host KV mode an unset `spec_state_replay` becomes `true`, so an explicit `fused_gdn_verify: true` is rejected unless you also set `spec_state_replay: false`. An explicit `true` for both is always a configuration error.
 - `spec_state_replay_graph` (default `true`) captures the replay as a CUDA graph, once per full verification batch shape, the second time that shape runs. Mixed batches replay without a graph. Without the graph, the replay's launches cost several milliseconds per step after sampling. A top-level `gdn_state_replay_graph` value overrides this key.
 
 Earlier measurements, with Uncensored AWQ, scalar E4M3 KV and four V100 PCIe GPUs: in 0.1.3, turning replay on raised the GPU KV pool from 1,379,634 to 1,542,558 tokens (`--gpu-memory-utilization 0.95`, 512K context, 8 sequences). In 0.1.4, replay with its CUDA graph took 30.49 ms per step against 30.05 ms without replay (one request, sampling, 200 W), with identical outputs.

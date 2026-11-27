@@ -164,8 +164,11 @@ def render() -> str:
         "### speculative_config.sm70_dflash2 keys",
         "",
         "Pass these inside `--speculative-config '{..., \"sm70_dflash2\": {...}}'` "
-        "(see [DFlash2](dflash2.md)). `None` selects the ReVolta profile default; "
-        "operator shape, dtype and native checks still decide each dispatch.",
+        "(see [DFlash2](dflash2.md)). `None` (unset) takes the built-in default "
+        "when the DFlash2 verifier qualifies (Flash-Next on SM70 under the ReVolta "
+        "serving profile), otherwise the value of the matching legacy "
+        "`VLLM_SM70_DFLASH2_*` environment variable; shape, dtype and native "
+        "checks still decide each dispatch.",
         "",
         "| Key | Type | Default | Effect and trade-off |",
         "|---|---|---|---|",

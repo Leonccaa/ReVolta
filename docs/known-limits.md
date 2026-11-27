@@ -11,13 +11,13 @@ ReVolta is built for four or more V100 32 GB GPUs and validated on four. We reco
 | Hardware | Status |
 | --- | --- |
 | 4 × V100 32 GB PCIe under one PCIe switch (PIX/PXB in `nvidia-smi topo -m`), P2P enabled | Reference system, with a 128 GiB container memory limit. Release acceptance runs here. |
-| 4 × V100-SXM2 32 GB, NVLink | Tested by the community: [@jttdev](https://github.com/jttdev) ([#2](https://github.com/Leonccaa/ReVolta/issues/2)): speed, retrieval to about 490K tokens, vision; also [#37](https://github.com/Leonccaa/ReVolta/issues/37) and [#38](https://github.com/Leonccaa/ReVolta/issues/38) |
+| 4 × V100-SXM2 32 GB, NVLink | Tested by the community: [@jttdev](https://github.com/jttdev) ([#2](https://github.com/Leonccaa/ReVolta/issues/2)): speed, retrieval to about 490K tokens, vision (0.1.2); also [#37](https://github.com/Leonccaa/ReVolta/issues/37) and [#38](https://github.com/Leonccaa/ReVolta/issues/38) |
 | The reference system with P2P disabled | Correct output; about 30–55% of P2P throughput (0.1.0 release test) |
 | V100 16 GB, TP2, TP8, other GPU counts | Not tested |
 
 The release builds for SM70 only. Other GPU architectures, ROCm, CPU, XPU, TPU and GGUF are outside the build. There is no GPU CI: releases are checked on the reference system.
 
-The supported model is Qwen3.8 Flash-Next. Checkpoints and their test status are in [Checkpoints](checkpoints.md#choose-a-checkpoint). Other models have not been tested. The supported serving forms run tensor parallel 4 with decode context parallel 2 (DCP2) and combine:
+The supported model is Qwen3.8 Flash-Next. Checkpoints and their test status are in [Checkpoints](checkpoints.md#choose-a-checkpoint). The 0.2.0 release acceptance covers only Qwen3.8 Flash-Next; Hy4-flash has validation support (below). The supported serving forms run tensor parallel 4 with decode context parallel 2 (DCP2) and combine:
 
 - **Weights:** AWQ g32 or NVFP4.
 - **Speculative decoding:** MTP with dynamic speculative decoding (DSD), or DFlash2.
@@ -49,13 +49,13 @@ Hy4-flash has validation support: it was validated once, in 0.2.0rc13, and its m
 
 ### Output reproducibility
 
-A single request is reproducible bit for bit. When several requests are prefilled together, the result can differ from the same request run alone, so greedy outputs at 2–8 concurrent requests can change between runs. The cause is the tensor-parallel all-reduce: the order in which it sums each value depends on where the request's tokens sit in the batch. Where expert routing or sparse-attention block selection is close to a tie, the rounding-level difference can grow. In 0.1.1 tests, the prompt NLL changed by less than 0.015 nat/token on most text, and by up to about 0.3 on highly repetitive or table-like text. Against a BF16 reference, a request run alone and the same request in a batch were equally close. Fresh compiler autotuning can also change outputs; restarts that reuse the compile cache do not.
+A single greedy request is reproducible bit for bit with a fixed configuration. Sampled requests are reproducible only with a request `seed`; without one, each request gets a random seed. When several requests are prefilled together, the result can differ from the same request run alone, so greedy outputs at 2–8 concurrent requests can change between runs. The cause is the tensor-parallel all-reduce: the order in which it sums each value depends on where the request's tokens sit in the batch. Where expert routing or sparse-attention block selection is close to a tie, the rounding-level difference can grow. In 0.1.1 tests, the prompt NLL changed by less than 0.015 nat/token on most text, and by up to about 0.3 on highly repetitive or table-like text. Against a BF16 reference, a request run alone and the same request in a batch were equally close. Fresh compiler autotuning can also change outputs; restarts that reuse the compile cache do not.
 
 ### Memory and host requirements
 
 - **GPU memory.** The reference launch uses `--gpu-memory-utilization 0.956`; see [Memory and capacity](configuration.md#memory-and-capacity). Retest memory use when you change concurrency or media limits.
 - **Host memory.** By default the AWQ PLE table needs about 48 GiB of pinned host memory. 80 GiB is the smallest tested container limit that passed memory stress on that path, with KV offload off (0.1.0). Budgets are in [System memory and storage](configuration.md#system-memory-and-storage).
-- **PLE cascade.** Cascade (`"ple_disk_cascade": true` in `--kernel-config`) spills the part of the PLE table that does not fit in host memory to the checkpoint files. It is not supported in 0.2.0, and the ReVolta profile keeps it off. In earlier profiling with it enabled, it used about 4 GiB more GPU memory per card, which left room for about 345K context tokens.
+- **PLE cascade.** Cascade (`"ple_disk_cascade": true` in `--kernel-config`) spills the part of the PLE table that does not fit in host memory to the checkpoint files. It is not supported in 0.2.0, and the ReVolta profile keeps it off.
 - **Sleep level 2.** Not supported on the reference system (128 GiB host, PLE tables in host memory): it needs about 87 GiB of free host memory for the model buffers, while about 63 GiB is available (0.1.2). Sleep level 1 works.
 - **Small KV pools.** Startup rejects a KV pool that cannot hold one maximum-length request.
 
@@ -82,7 +82,7 @@ Release retrieval was tested at 211K tokens, and the production build retrieved 
 
 - **DFlash2 CUDA graph reserve.** For DFlash2 the profile sets the graph reserve by itself. With the default INT8 KV (or `fp8_per_token_head`) it is 1000 MiB for AWQ (1150 MiB with a positive `--mixed-prefill-step-latency-ms`) and 1024 MiB for NVFP4; with scalar E4M3 or FP16 KV it is 1200 MiB. All tiers are in [CUDA graph reserve](checkpoints.md#cuda-graph-reserve). If you set `VLLM_V2_CUDAGRAPH_MEM_MIB` yourself, keep it at or above the graph size the startup log reports; a smaller reserve can run out of GPU memory under concurrent long prompts.
 - **Standard NVFP4 draft.** Use the Uncensored FP8 MTP draft, which the NVFP4 scale pack includes, as in validation. See [MTP drafts](checkpoints.md#mtp-drafts).
-- **Structured output with MTP.** GPU tests produced 16/16 valid JSON and tool outputs (0.1.0). A later GPU test also reached the zero-draft step, where the grammar leaves no draft tokens (64 such steps): all outputs were valid, and repeated runs gave identical output.
+- **Structured output with MTP.** GPU tests produced valid JSON and tool outputs, also at the zero-draft step, where the grammar leaves no draft tokens.
 
 ### Checkpoints
 

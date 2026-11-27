@@ -38,7 +38,7 @@ Set the schedule in `--speculative-config`:
 The scheduler looks up K for the current batch size. That K controls the proposal for the next step; the current step verifies the draft tokens each request already published, subject to the usual scheduling limits.
 
 - **MTP** runs K draft forwards. At K=0 it publishes no draft tokens but still updates the draft KV in its first forward.
-- **DFlash2** always drafts its full 7-token block, including the drafter's context KV update, and publishes only the first K tokens.
+- **DFlash2** with K above 0 drafts its full 7-token block, including the drafter's context KV update, and publishes only the first K tokens. At K=0 it only updates the drafter's context KV and skips the draft query.
 
 ## CUDA graphs
 

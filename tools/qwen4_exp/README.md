@@ -27,7 +27,7 @@ Do not promote a smoke-only or incomplete-corpus report into a production overla
 Builds a revision-checked view from a published scale pack (`--pack-dir`, which holds `kvscales-manifest.json` and the target scale file) and adds the two MTP draft scales. The tool refuses to run if the base `model.safetensors.index.json` or the scale file does not match the manifest, or if the base already contains scale tensors.
 
 - `--base-checkpoint`, `--output-dir`, `--pack-dir` (required).
-- `--mtp-report`: a report that contains the MTP layer (`--mtp-layer-id`, default 48); its two scales are written to `model-bf16-kvscales-mtp.safetensors`.
+- `--mtp-report`: a report that contains the MTP layer (`--mtp-layer-id`, default 48); its two scales are written to `model-bf16-kvscales-mtp.safetensors`. Required unless you pass `--mtp-unit-scale`; `--mtp-scale-from-layer` also reads it.
 - `--target-scale-source envelope --target-report <report>`: raise a published target scale where the report observed a larger maximum. The default, `published`, copies the published target scales.
 - `--mtp-scale-from-layer` and `--mtp-unit-scale` produce prototype draft scales and mark them as such in `kvscales-provenance.json`.
 

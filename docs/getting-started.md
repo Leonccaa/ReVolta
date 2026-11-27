@@ -9,7 +9,7 @@ YaRN, multimodal input, 8 concurrent requests in testing, and a 48 GiB CPU KV po
 
 ## 1. Install
 
-This recipe uses the `revolta` distribution (version `0.2.0rc15`). The Python import name and the
+This recipe uses the `revolta` distribution (version `0.2.0`). The Python import name and the
 CLI are still **`vllm`** (`import vllm`, `vllm serve`); this is intentional. Only
 compute capability 7.0 is built, with CUDA 12.8, Python 3.12 and PyTorch 2.10.
 
@@ -18,8 +18,8 @@ From PyPI (Linux x86-64 with glibc 2.34 or newer, Python 3.12):
 ```bash
 python3.12 -m venv /data/revolta/venv
 . /data/revolta/venv/bin/activate
-pip install --pre revolta==0.2.0rc15
-vllm --version          # 0.2.0rc15
+pip install revolta==0.2.0
+vllm --version          # 0.2.0
 ```
 
 The wheel pins `torch==2.10.0`, `torchaudio==2.10.0` and `torchvision==0.25.0`,
@@ -34,7 +34,7 @@ differs: it pins the same versions to the CUDA 12.8 builds on `download.pytorch.
 and has the generic `linux_x86_64` tag.
 
 ```bash
-pip install "https://github.com/Leonccaa/ReVolta/releases/download/v0.2.0rc15/revolta-0.2.0rc15-cp312-cp312-linux_x86_64.whl"
+pip install "https://github.com/Leonccaa/ReVolta/releases/download/v0.2.0/revolta-0.2.0-cp312-cp312-linux_x86_64.whl"
 ```
 
 ReVolta does not report to the upstream vLLM statistics server. It sends its own
@@ -44,7 +44,7 @@ contains and how to turn it off.
 Or use the Docker image:
 
 ```bash
-docker pull ghcr.io/leonccaa/revolta:0.2.0rc15
+docker pull ghcr.io/leonccaa/revolta:0.2.0
 ```
 
 ## 2. Download the checkpoint and make 512K views
@@ -236,7 +236,7 @@ docker run --rm --gpus all \
   -e VLLM_SM70_AWQ_MOE_INT4_ZERO=1 \
   -e VLLM_PLE_OFFLOAD_READY_TIMEOUT=1200 \
   -e TILELANG_CACHE_DIR=/data/revolta/cache/tilelang \
-  ghcr.io/leonccaa/revolta:0.2.0rc15 \
+  ghcr.io/leonccaa/revolta:0.2.0 \
   /data/revolta/views/target-512k --served-model-name Qwen3.8-Flash-Next \
   --gpu-memory-utilization 0.956 \
   --kv-cache-dtype auto \

@@ -8,7 +8,7 @@ It is built for four or more V100 32 GB GPUs and validated on four. We recommend
 
 **You need:** four or more V100 32 GB GPUs (validated on four), on NVLink or with all GPUs under one PCIe switch with P2P; at least 32 GiB of system memory with the experimental whole-table PLE disk option (about 23–25% slower single-request decoding), 80 GiB with the default pinned PLE table, 128 GiB recommended; Linux x86-64 with glibc 2.34 or newer; and an NVIDIA driver for CUDA 12.8. Tested hardware and limits: [Support and known limits](docs/known-limits.md).
 
-Current release: [0.1.5](https://github.com/Leonccaa/ReVolta/releases/tag/v0.1.5).
+Current release: [0.2.0](https://github.com/Leonccaa/ReVolta/releases/tag/v0.2.0).
 
 ## At a glance
 
@@ -55,14 +55,14 @@ The package is `revolta`; the Python import and CLI remain `vllm`.
 ```bash
 python3.12 -m venv /data/revolta/venv
 . /data/revolta/venv/bin/activate
-pip install revolta==0.1.5
-vllm --version          # 0.1.5
+pip install revolta==0.2.0
+vllm --version          # 0.2.0
 ```
 
 Or pull the Docker image:
 
 ```bash
-docker pull ghcr.io/leonccaa/revolta:0.1.5
+docker pull ghcr.io/leonccaa/revolta:0.2.0
 ```
 
 Follow [Getting started](docs/getting-started.md) to download the pinned checkpoint,

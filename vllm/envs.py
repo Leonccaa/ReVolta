@@ -388,6 +388,7 @@ if TYPE_CHECKING:
     VLLM_SM70_MTP_ROUTER_BATCH: bool = True
     VLLM_SM70_MTP_SHARED_BATCH: bool = True
     VLLM_SM70_MTP_Q8_PREFILL_MMQ: bool = False
+    VLLM_SM70_MTP_KV_ONLY_PREFILL: bool = True
     VLLM_SM70_MTP_PLE_CONV: bool = True
     VLLM_SM70_PLE_GATE_NORM: bool = False
     VLLM_SM70_QWEN38_FUSED_HC_FP16: bool = False
@@ -814,6 +815,7 @@ if TYPE_CHECKING:
     VLLM_SM70_GDN_CHUNK_O_WARPS: str | None = None
     VLLM_SM70_GDN_CHUNK_O_STAGES: str | None = None
     VLLM_SM70_GDN_LEGACY_PREFILL_PREP: bool = False
+    VLLM_SM70_GDN_NATIVE_PREFILL: bool = True
     VLLM_SM70_GDN_Z_CONTIGUOUS: bool = False
     VLLM_SM70_QWEN_GDN_CONTEXT_CORE: bool = False
     VLLM_SM70_QWEN_GDN_FULL_FORWARD: bool = False
@@ -3701,8 +3703,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         category="tuning",
         declared_default="20",
         effective_default=(
-            "20; ReVolta FP16 QSA SM70 TP4 profile sets '40' under "
-            "automatic_conditions."
+            "20; the ReVolta AWQ profile sets 40, or 48 in the AWQ MTP4 wide "
+            "verifier profile."
         ),
         automatic_conditions=(
             (
@@ -3712,6 +3714,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 "Only AWQ checkpoints; NVFP4 retains the upstream default for this "
                 "item."
             ),
+            "vllm/revolta_profile.py:apply_awq_mtp_wide_verify_defaults sets 48 "
+            "in the qualified AWQ MTP4 profile with DCP2, PCIe, GPU KV, "
+            "synchronous scheduling and GDN state replay.",
         ),
         acceleration_paths=("TurboMindAwqLinearKernel",),
         user_visible=False,
@@ -5195,6 +5200,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=("Flash-Next MTP draft",),
         user_visible=True,
     ),
+    "VLLM_SM70_MTP_KV_ONLY_PREFILL": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_KV_ONLY_PREFILL", "1"))),
+        description=(
+            "Write only KV for eligible incomplete MTP draft prefills and "
+            "compute only sampled rows for eligible completed prefills. "
+            "Enabled by default; set 0 to use full-row draft prefill."
+        ),
+        category="tuning",
+        declared_default="True",
+        effective_default="True for eligible batches; set 0 to disable both paths.",
+        automatic_conditions=(
+            "Single-layer Flash-Next MTP with DP=1, GPU or Host draft KV, no PLE, "
+            "draft tokens or multimodal inputs. KV-only requires an eager batch "
+            "of incomplete prefills; sampled rows require at least one completed "
+            "prefill and no FULL CUDA graph replay.",
+        ),
+        acceleration_paths=("Flash-Next MTP draft",),
+        user_visible=True,
+    ),
     # Fuse PLE rollback, depthwise convolution, SiLU and state commit.
     "VLLM_SM70_MTP_PLE_CONV": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_MTP_PLE_CONV", "1"))),
@@ -6178,7 +6202,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_NVFP4_RAW_GROUPED_M48_V154": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_RAW_GROUPED_M48_V154", "0"))),
         description=(
-            "Use native v154 raw grouped NVFP4 MoE for 48-row target decode "
+            "Use native v154 raw grouped NVFP4 MoE for 41-64 row target decode "
             "on SM70 TP4 Qwen3.8 with equal interleaved gate/up global scales. "
             "Requires raw grouped decode and the V2 model runner."
         ),
@@ -6327,11 +6351,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     # 1CatAI #1147 native E512/K10 router (vllm._sm70_router_C) for the
-    # M=17..20 verifier rows that the Triton router above does not admit.
+    # M=17..64 rows that the Triton router above does not admit.
     "VLLM_SM70_QWEN38_NATIVE_ROUTER_TOPK": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_QWEN38_NATIVE_ROUTER_TOPK", "0"))),
         description=(
-            "Route Qwen3.8 E=512, K=10 renormalized softmax top-k for 17..20 "
+            "Route Qwen3.8 E=512, K=10 renormalized softmax top-k for 17..64 "
             "FP16 router rows through the native SM70 router extension "
             "(#1147) instead of the generic topk_softmax op. Selection follows "
             "stable raw-logit order; weights are the FP32 softmax of the "
@@ -6339,8 +6363,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         category="experimental",
         declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
+        effective_default="False; the AWQ MTP4 wide verifier profile enables it.",
+        automatic_conditions=(
+            "vllm/revolta_profile.py:apply_awq_mtp_wide_verify_defaults enables "
+            "this for the qualified AWQ MTP4 profile with DCP2, PCIe, GPU KV, "
+            "synchronous scheduling and GDN state replay. Explicit values win.",
+        ),
         acceleration_paths=("SM70 runtime/kernel policy",),
         user_visible=False,
     ),
@@ -12584,6 +12612,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
         acceleration_paths=("Gated DeltaNet",),
         user_visible=False,
     ),
+    "VLLM_SM70_GDN_NATIVE_PREFILL": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_GDN_NATIVE_PREFILL", "1"))),
+        description=(
+            "Use the native SM70 GDN prefill kernel for eligible chunks by "
+            "default on Model Runner V2 only. Set 0 to use the original "
+            "TileLang kernel instead. Model Runner V1 is unaffected."
+        ),
+        category="tuning",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("Gated DeltaNet",),
+        user_visible=False,
+    ),
     # Diagnostic-only correctness gate: compare latest prefill prep against
     # the 0.0.3-style q/k/v split plus fused_gdn_gating path.
     "VLLM_SM70_GDN_LEGACY_PREFILL_PREP": env_var(
@@ -13100,11 +13142,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_MTP_GDN_NATIVE_VERIFY": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_MTP_GDN_NATIVE_VERIFY", "0"))),
-        description="Opt in to SM70 MTP native GDN verify and accepted-state replay.",
+        description="Use native SM70 GDN verification and accepted-state replay.",
         category="configuration",
         declared_default="False",
-        effective_default="False",
-        automatic_conditions=(),
+        effective_default="False; the AWQ MTP4 wide verifier profile enables it.",
+        automatic_conditions=(
+            "vllm/revolta_profile.py:apply_awq_mtp_wide_verify_defaults enables "
+            "this for the qualified AWQ MTP4 profile with DCP2, PCIe, GPU KV, "
+            "synchronous scheduling and GDN state replay. Explicit values win.",
+        ),
         acceleration_paths=("MTP verifier",),
         user_visible=True,
     ),

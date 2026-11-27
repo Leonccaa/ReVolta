@@ -4,7 +4,7 @@ This page says what the maintainers support in ReVolta and where to ask for help
 
 | Area | Supported |
 | --- | --- |
-| Version | 0.2.0. 0.1.x gets no further releases; reproduce a problem on 0.2.0 before reporting it. <!-- doc020: proposed 0.1.x policy, awaiting the maintainer's decision --> |
+| Version | 0.2.0. 0.1.x gets no further releases; reproduce a problem on 0.2.0 before reporting it. |
 | GPUs | Four or more NVIDIA V100 32 GB (PCIe or SXM2); validated on four |
 | Interconnect | Recommended and tested: NVLink, or all GPUs under one PCIe switch with P2P. PCIe without P2P gave correct output at about 30–55% of the P2P throughput in the 0.1.0 release test, which disabled P2P on the reference machine |
 | Parallelism | Tensor parallel 4 with decode context parallel 2 (TP4 + DCP2) |

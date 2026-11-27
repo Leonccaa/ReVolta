@@ -67,14 +67,14 @@ One flat JSON object. Fields that do not apply are sent as `null`.
 
 - Prompts, outputs, and the token counts or timings of individual requests.
 - Model paths, repository names and served model names.
-- Host names, user names and IP addresses. The payload contains no address. Like any HTTPS request, the collector sees the network address the request comes from.
+- Host names, user names and IP addresses. The payload contains no address. Like any HTTPS request, the collector sees the network address the request comes from; it does not record it.
 - GPU UUIDs, serial numbers and PCI bus IDs.
 - Environment variables outside the allowlist in `env_var_json`. `RUNPOD_DC_ID` is only checked for presence to set `provider`; its value is not sent.
 - Free-form settings such as paths, URLs and file names. Every configuration value is screened before the report is built: a string longer than 64 characters, or one that contains `/`, `\`, `:` or a space, is replaced by `null`. Allowlisted environment values must be booleans, numbers or short switch-like strings. Hardware and platform fields (`cpu_type`, `platform`, `gpu_type`) are sent as the system reports them.
 
 ## Where it goes
 
-Reports go to the ReVolta collector at `https://usage.19b.net/api/` as an HTTPS `POST` with a JSON body. If you filter outbound traffic, this is the only host the report contacts.
+Reports go to the ReVolta collector at `https://usage.19b.net/api/` as an HTTPS `POST` with a JSON body. The collector does not record the source IP address or any identifier of the machine; the only identifier in a report is the random per-start `uuid`. If you filter outbound traffic, this is the only host the report contacts.
 
 Set `VLLM_USAGE_STATS_SERVER` to send the report to another URL. Set it to an empty string to send nothing while still writing the local `usage_stats.json` file.
 

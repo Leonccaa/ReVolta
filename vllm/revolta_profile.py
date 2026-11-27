@@ -454,7 +454,6 @@ def apply_awq_mtp_wide_verify_defaults(
         or parallel.decode_context_parallel_size != 2
         or config.scheduler_config.async_scheduling
         or config.kernel_config.long_context_kv.enabled
-        or (config.kv_transfer_config and config.kv_transfer_config.kv_connector)
         or not _has_awq_qpn_shape(model, parallel.tensor_parallel_size)
     ):
         return False

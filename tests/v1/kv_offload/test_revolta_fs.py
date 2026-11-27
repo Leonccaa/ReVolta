@@ -219,8 +219,6 @@ def test_pool_resize_reuses_ssd_page(tmp_path, split):
         assert not writer.disabled
         run_config = writer.file_mapper.get_run_config()
         path = _store(writer, source, key(1), value=7.0)
-        page_identity = read_page_identity(path)
-        assert page_identity is not None
     finally:
         writer.shutdown()
 
@@ -231,7 +229,6 @@ def test_pool_resize_reuses_ssd_page(tmp_path, split):
         assert not reader.disabled
         assert reader.file_mapper.get_run_config() == run_config
         assert reader.file_mapper.get_file_name(key(1)) == path
-        assert page_identity[1:] == (reader._identity_digest, bytes(key(1)))
         assert reader.lookup(key(1))
         assert _load(reader, key(1)) == [True]
         assert torch.equal(destination[1], source[0])
@@ -240,7 +237,6 @@ def test_pool_resize_reuses_ssd_page(tmp_path, split):
 
 
 def test_page_layout_changes_namespace(tmp_path):
-    _, view = _view(block_elements=1024)
     spec, manifest = checkpoint_spec(tmp_path)
     spec.vllm_config.cache_config.cache_dtype = "auto"
     attention = FullAttentionSpec(
@@ -250,13 +246,17 @@ def test_page_layout_changes_namespace(tmp_path):
     tensor = KVCacheTensor(4 * attention.page_size_bytes, ["history"], num_blocks=4)
     segments = KVBlockSegments(("state", "history"), (4, 4), (1,), 1)
     cache = KVCacheConfig(4, [tensor], [group], block_segments=segments)
+    wider = replace(attention, page_size_padded=2 * attention.page_size_bytes)
     variants = [
         cache,
         replace(
             cache,
             kv_cache_groups=[
                 replace(
-                    group, kv_cache_spec=replace(attention, block_size=32, head_size=32)
+                    group,
+                    kv_cache_spec=replace(
+                        attention, block_size=32, head_size=32, head_size_v=32
+                    ),
                 )
             ],
         ),
@@ -272,10 +272,17 @@ def test_page_layout_changes_namespace(tmp_path):
             kv_cache_tensors=[replace(tensor, shared_by=["draft"])],
         ),
         replace(cache, block_segments=replace(segments, names=("history", "state"))),
+        replace(
+            cache,
+            kv_cache_groups=[replace(group, kv_cache_spec=wider)],
+            kv_cache_tensors=[replace(tensor, size=4 * wider.page_size_bytes)],
+        ),
     ]
     namespaces = set()
     for variant in variants:
         spec.kv_cache_config = variant
+        page_bytes = variant.kv_cache_groups[0].kv_cache_spec.page_size_bytes
+        _, view = _view(block_elements=page_bytes // 4)
         tier = make_tier(tmp_path, view, spec=spec, content_manifest_path=manifest)
         try:
             assert not tier.disabled

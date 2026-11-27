@@ -25,6 +25,15 @@ from tests.v1.kv_offload.test_revolta_fs import checkpoint_spec
 from vllm.config import KVTransferConfig
 from vllm.utils.hashing import sha256
 from vllm.v1.core import kv_cache_utils
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVBlockSegments,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    KVCacheTensor,
+    MambaSpec,
+    MLAAttentionSpec,
+)
 from vllm.v1.kv_offload.base import make_offload_key
 from vllm.v1.kv_offload.host import persist
 from vllm.v1.kv_offload.host import ssd as ssd_module
@@ -57,13 +66,7 @@ def test_planar_owner_revolta_fs_round_trip(tmp_path, monkeypatch):
         bind_planar_kv_cache,
     )
     from vllm.v1.attention.kv_codecs import INT8 as codec
-    from vllm.v1.kv_cache_interface import (
-        FullAttentionSpec,
-        KVCacheConfig,
-        KVCacheGroupSpec,
-        KVCacheTensor,
-        KVQuantMode,
-    )
+    from vllm.v1.kv_cache_interface import KVQuantMode
     from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
     from vllm.v1.kv_offload.tiering.fs.revolta import RevoltaFileSystemTierManager
     from vllm.v1.kv_offload.tiering.spec import TieringOffloadingSpec
@@ -213,11 +216,22 @@ def options(root, **overrides):
 
 
 class Env:
-    def __init__(self, root, pages=6, layout=LAYOUT, clock=None, **overrides):
+    def __init__(
+        self,
+        root,
+        pages=6,
+        layout=LAYOUT,
+        clock=None,
+        *,
+        kv_cache_config=None,
+        **overrides,
+    ):
         self.table = HostPageTable(pages, num_workers=1)
         self.backing = bytearray(pages * ROW)
         view = memoryview(self.backing).cast("B", shape=[pages, ROW])
         spec, opts = options(root, **overrides)
+        if kv_cache_config is not None:
+            spec.kv_cache_config = kv_cache_config
         self.clock = clock or time.monotonic
         self.ssd = HostPageSsd(self.table, view, spec, layout, opts, clock=self.clock)
         assert self.ssd.enabled
@@ -655,8 +669,44 @@ def test_truncated_or_corrupt_page_is_rejected_and_recycled(tmp_path, envs):
 
 
 def test_reset_epoch_and_layout_change_never_hit_old_files(tmp_path, envs):
+    main = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=4, dtype=torch.float16
+    )
+    index = MLAAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=1, dtype=torch.uint8, compress_ratio=16
+    )
+    state = MambaSpec(block_size=16, shapes=((64,),), dtypes=(torch.float32,))
+    groups = [
+        KVCacheGroupSpec(["state"], state),
+        KVCacheGroupSpec(["qsa.0"], main),
+        KVCacheGroupSpec(["qsa.0.index"], index),
+    ]
+
+    def split_cache(state_blocks, history_blocks):
+        return KVCacheConfig(
+            history_blocks,
+            [
+                KVCacheTensor(
+                    state.page_size_bytes * state_blocks,
+                    ["state"],
+                    num_blocks=state_blocks,
+                ),
+                KVCacheTensor(
+                    index.page_size_bytes * history_blocks,
+                    ["qsa.0.index"],
+                    num_blocks=history_blocks,
+                ),
+            ],
+            groups,
+            block_segments=KVBlockSegments(
+                ("state", "history"), (state_blocks, history_blocks), (0, 1, 1), 1
+            ),
+            host_kv_layers=["qsa.0"],
+        )
+
     root = tmp_path / "ssd"
-    writer = envs(root)
+    cache = split_cache(4, 12)
+    writer = envs(root, kv_cache_config=cache)
     handle = writer.publish(1)
     assert writer.settle(lambda: writer.table.is_persisted(writer.table.get(handle)))
     assert writer.ssd._tier.lookup(writer.ssd._tier_key(key(1))) is True
@@ -671,13 +721,16 @@ def test_reset_epoch_and_layout_change_never_hit_old_files(tmp_path, envs):
         layer_names=LAYOUT.layer_names,
         kv_scales=LAYOUT.kv_scales,
     )
-    changed = envs(root, layout=other)
+    changed = envs(root, layout=other, kv_cache_config=cache)
     assert changed.ssd.prefetch("r", [key(1)]) == []
     changed.ssd.close(io_grace_s=5)
-    same = envs(root, pages=8)  # The same row ABI survives a larger host pool.
+    same = envs(root, pages=8, kv_cache_config=split_cache(6, 16))
     assert same.ssd.prefetch("r", [key(1)]) == [key(1)]
     assert same.settle(lambda: not same.ssd._jobs)
-    assert same.table.is_ready(same.table.lookup(key(1)))
+    loaded = same.table.lookup(key(1))
+    assert same.table.is_ready(loaded)
+    row = loaded.page_id * ROW
+    assert bytes(same.backing[row : row + ROW]) == payload(1)
 
 
 def test_full_length_host_page_key_is_written_and_hits_after_restart(tmp_path, envs):

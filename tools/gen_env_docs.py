@@ -59,7 +59,13 @@ def profile_values(source: str) -> dict[str, list[str]]:
         "NVFP4_DFLASH_PLANAR_KV_DEFAULTS": "NVFP4+DFlash2, planar KV",
         "MTP_PLANAR_KV_DEFAULTS": "fixed MTP, planar KV",
         "MTP_DSD_PLANAR_KV_DEFAULTS": "dynamic MTP, planar KV",
+        "MTP_DSD_PLANAR_KV_WIDE_DEFAULTS": "dynamic MTP with 5+ drafts, planar KV",
+        "AWQ_DFLASH_PLANAR_KV_MIXED_PREFILL_DEFAULTS": (
+            "AWQ+DFlash2, planar KV, positive mixed-prefill target"
+        ),
         "CUSTOM_AR_DEFAULTS": "P2P/NVLink",
+        "HYBRID_SERVING_DEFAULTS": "vllm serve",
+        "DFLASH_SERVING_DEFAULTS": "DFlash2, vllm serve",
     }
     for node in ast.parse(source).body:
         if (
@@ -114,10 +120,10 @@ def render() -> str:
         "",
         "## Environment variable reference",
         "",
-        "Every variable below is read once per process (deployment scope). Columns:",
-        "type and default as registered in `vllm/envs.py`; *Since* is the first",
-        "release with the variable (1Cat = inherited from 1Cat-vLLM); *Category*",
-        "is configuration, tuning, experimental, debug or deprecated.",
+        "Every variable below is read once per process (deployment scope). "
+        "Columns: type and default as registered in `vllm/envs.py`; *Since* is "
+        "the first release with the variable (1Cat = inherited from 1Cat-vLLM); "
+        "*Category* is configuration, tuning, experimental, debug or deprecated.",
     ]
     for key, title in SECTIONS.items():
         names = [n for n, note in NOTES.items() if note["section"] == key]
@@ -157,8 +163,8 @@ def render() -> str:
         "",
         "### speculative_config.sm70_dflash2 keys",
         "",
-        "Pass these inside `--speculative-config '{..., \"sm70_dflash2\": {...}}'`",
-        "(see [DFlash2](dflash2.md)). `None` selects the model-qualified policy;",
+        "Pass these inside `--speculative-config '{..., \"sm70_dflash2\": {...}}'` "
+        "(see [DFlash2](dflash2.md)). `None` selects the ReVolta profile default; "
         "operator shape, dtype and native checks still decide each dispatch.",
         "",
         "| Key | Type | Default | Effect and trade-off |",

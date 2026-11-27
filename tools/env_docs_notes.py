@@ -11,13 +11,13 @@ Add a variable here to document it, then run `python tools/gen_env_docs.py`.
 """
 
 SECTIONS = {
-    "research": "Pregraph preparation research switches",
-    "promoted": "Promoted research switches",
-    "deployment": "Settings used by the reference deployment",
+    "promoted": "Kernel and path switches",
+    "deployment": "Deployment settings",
     "profile": "Values applied by the ReVolta profile",
+    "research": "Experimental switches (off by default)",
     "usage": "Anonymous usage statistics",
-    "dflash": "DFlash2 and DFlash draft settings",
-    "retiring": "Deprecated, removed in 0.2.0rc6",
+    "dflash": "DFlash2 legacy lookup and debug settings",
+    "retiring": "Deprecated variables",
 }
 
 PROFILE_NOTE = (
@@ -38,7 +38,7 @@ _LOOKUP = (
 NOTES: dict[str, dict[str, str]] = {
     "VLLM_SM70_GDN_NATIVE_PREFILL": dict(
         section="promoted",
-        since="0.2.0rc16",
+        since="0.2.0",
         range="0, 1",
         tradeoff="Use the native SM70 GDN kernel by default for eligible "
         "original TileLang chunks on Model Runner V2 only. It can change "
@@ -48,7 +48,7 @@ NOTES: dict[str, dict[str, str]] = {
     ),
     "VLLM_SM70_MTP_Q8_PREFILL_MMQ": dict(
         section="profile",
-        since="0.2.0rc15",
+        since="0.2.0",
         range="0, 1",
         tradeoff="Use grouped GGUF MMQ for Q8_0 MTP batches above 64 rows in "
         "chunks of up to 2048. MMQ changes accumulation order and increases "
@@ -57,7 +57,7 @@ NOTES: dict[str, dict[str, str]] = {
     ),
     "VLLM_QWEN_REASONING_EOS_MASK": dict(
         section="deployment",
-        since="0.2.0rc15",
+        since="0.2.0",
         range="0, 1",
         tradeoff="Suppresses model EOS during visible Qwen chat reasoning in "
         "Model Runner V2. Requests still in reasoning use full-vocabulary "
@@ -75,7 +75,7 @@ NOTES: dict[str, dict[str, str]] = {
     ),
     "VLLM_SM70_PLE_GATE_NORM": dict(
         section="deployment",
-        since="0.2.0rc15",
+        since="0.2.0",
         range="0, 1",
         tradeoff="Opt-in FP16 PLE gate and norm fusion in SM70 Flash-Next full "
         "decode graphs with dual compilation. The fused reduction can change "
@@ -84,7 +84,7 @@ NOTES: dict[str, dict[str, str]] = {
     ),
     "VLLM_1CAT_ADAPTIVE_MTP": dict(
         section="deployment",
-        since="0.2.0rc15",
+        since="0.2.0",
         range="off/0/false/no, on/1/true/yes, auto",
         tradeoff="Opt in to adaptive depth for synchronous Flash-Next MRv2 "
         "MTP with a dynamic speculative decoding schedule. Explicit auto "
@@ -94,7 +94,7 @@ NOTES: dict[str, dict[str, str]] = {
     ),
     "VLLM_SM70_IDLE_CLOCK_SECONDS": dict(
         section="deployment",
-        since="0.2.0rc14",
+        since="0.2.0",
         range="non-negative integer seconds",
         tradeoff="Zero disables clock control. A positive value opts in for a "
         "single-host EngineCore process with exclusive V100 TP1 or TP4 GPUs. "
@@ -103,11 +103,13 @@ NOTES: dict[str, dict[str, str]] = {
         metrics="",
     ),
     "REVOLTA_RESEARCH_CHECKPOINT_CACHE_DROP": dict(
-        section="promoted",
+        section="retiring",
         since="0.2.0",
         range="0, 1",
-        tradeoff="Deprecated alias of VLLM_SM70_CHECKPOINT_CACHE_DROP; "
-        "removed in 0.2.0rc13. The new name wins when both are set.",
+        tradeoff="Deprecated alias of VLLM_SM70_CHECKPOINT_CACHE_DROP "
+        "from the 0.2.0 pre-releases. "
+        "Still accepted with a FutureWarning; the new name wins when "
+        "both are set. It will be removed in a later release.",
         metrics="",
     ),
     "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB": dict(
@@ -120,10 +122,10 @@ NOTES: dict[str, dict[str, str]] = {
         "storage separately; automatic placement also uses this reserve.",
         metrics="",
     ),
-    # ---- promoted research switches -------------------------------------
+    # ---- kernel and path switches ---------------------------------------
     "VLLM_SM70_MTP_KV_ONLY_PREFILL": dict(
         section="promoted",
-        since="0.2.0rc16",
+        since="0.2.0",
         range="0, 1",
         tradeoff="For eligible Flash-Next MTP batches with DP=1 and GPU or Host "
         "draft KV, eager incomplete prefills only write KV. If a prefill completes, "
@@ -149,7 +151,7 @@ NOTES: dict[str, dict[str, str]] = {
         metrics="",
     ),
     "VLLM_SM70_QSA_GROUPED_LPT": dict(
-        section="promoted",
+        section="profile",
         since="0.2.0",
         range="0, 1",
         tradeoff="Longest grouped page4 CTAs start first, which shortens the "
@@ -157,7 +159,7 @@ NOTES: dict[str, dict[str, str]] = {
         metrics="",
     ),
     "VLLM_SM70_GDN_SKINNY_MPLAN": dict(
-        section="promoted",
+        section="profile",
         since="0.2.0",
         range="0, 1",
         tradeoff="ng=2 tiling is 8-26% faster at M = 9..24 and 33..48 on V100; "
@@ -207,33 +209,43 @@ NOTES: dict[str, dict[str, str]] = {
         metrics="",
     ),
     "REVOLTA_RESEARCH_HOST_DECODE_FAST": dict(
-        section="promoted",
+        section="retiring",
         since="0.2.0",
         range="0, 1",
-        tradeoff="Deprecated alias of VLLM_SM70_HOST_DECODE_FAST; removed in "
-        "0.2.0rc13. The new name wins when both are set.",
+        tradeoff="Deprecated alias of VLLM_SM70_HOST_DECODE_FAST "
+        "from the 0.2.0 pre-releases. "
+        "Still accepted with a FutureWarning; the new name wins when "
+        "both are set. It will be removed in a later release.",
         metrics="",
     ),
     "REVOLTA_RESEARCH_QSA_LOCAL_INPUTS_FUSED": dict(
-        section="promoted",
+        section="retiring",
         since="0.2.0",
         range="0, 1",
-        tradeoff="Deprecated alias of VLLM_SM70_QSA_LOCAL_INPUTS_FUSED; "
-        "removed in 0.2.0rc13. The new name wins when both are set.",
+        tradeoff="Deprecated alias of VLLM_SM70_QSA_LOCAL_INPUTS_FUSED "
+        "from the 0.2.0 pre-releases. "
+        "Still accepted with a FutureWarning; the new name wins when "
+        "both are set. It will be removed in a later release.",
         metrics="",
     ),
     "REVOLTA_QSA_GROUPED_LPT": dict(
-        section="promoted",
+        section="retiring",
         since="0.2.0",
         range="0, 1",
-        tradeoff="Deprecated alias of VLLM_SM70_QSA_GROUPED_LPT; removed in 0.2.0rc6.",
+        tradeoff="Deprecated alias of VLLM_SM70_QSA_GROUPED_LPT "
+        "from the 0.2.0 pre-releases. "
+        "Still accepted with a FutureWarning; the new name wins when "
+        "both are set. It will be removed in a later release.",
         metrics="",
     ),
     "REVOLTA_SKINNY_MPLAN": dict(
-        section="promoted",
+        section="retiring",
         since="0.2.0",
         range="0, 1",
-        tradeoff="Deprecated alias of VLLM_SM70_GDN_SKINNY_MPLAN; removed in 0.2.0rc6.",
+        tradeoff="Deprecated alias of VLLM_SM70_GDN_SKINNY_MPLAN "
+        "from the 0.2.0 pre-releases. "
+        "Still accepted with a FutureWarning; the new name wins when "
+        "both are set. It will be removed in a later release.",
         metrics="",
     ),
     # ---- anonymous usage statistics ---------------------------------------
@@ -301,15 +313,16 @@ NOTES: dict[str, dict[str, str]] = {
     ),
     "VLLM_SM70_AWQ_MOE_INT4_ZERO": dict(
         section="deployment",
-        since="0.2.0",
+        since="0.1.0",
         range="0, 1",
         tradeoff="Packs AWQ zero points into nibbles: less resident metadata, "
         "lossless. Needs compact metadata and a native build with the packed "
-        "kernels.",
+        "kernels. Under vllm serve the ReVolta profile sets 1 for AWQ g32 "
+        "checkpoints with compact metadata (on by default).",
         metrics="",
     ),
     "VLLM_SM70_DFLASH2_FUSED_QKV_PACK": dict(
-        section="deployment",
+        section="profile",
         since="1Cat",
         range="0, 1",
         tradeoff="One Triton launch instead of three copies and a concat in the "
@@ -368,7 +381,7 @@ NOTES: dict[str, dict[str, str]] = {
     ),
     "VLLM_EARLY_MODEL_INPUTS": dict(
         section="profile",
-        since="0.2.0",
+        since="0.1.0",
         range="0, 1",
         tradeoff="Prepares model-state inputs before attention metadata in FULL "
         "graph steps, overlapping host work.",
@@ -376,7 +389,7 @@ NOTES: dict[str, dict[str, str]] = {
     ),
     "VLLM_PLE_ASYNC_REQUEST_INDICES": dict(
         section="profile",
-        since="0.2.0",
+        since="0.1.0",
         range="0, 1",
         tradeoff="Non-blocking PLE request-index transfers; removes a host wait "
         "per step.",
@@ -393,7 +406,7 @@ NOTES: dict[str, dict[str, str]] = {
     ),
     "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN": dict(
         section="profile",
-        since="0.2.0",
+        since="0.1.0",
         range="0, 1",
         tradeoff="Grouped AWQ MoE decode reads each active expert once for all "
         "its rows (2..48). Faster at 2..8 requests; reduction order differs "
@@ -402,7 +415,7 @@ NOTES: dict[str, dict[str, str]] = {
     ),
     "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS": dict(
         section="profile",
-        since="0.2.0",
+        since="0.1.0",
         range="2..48",
         tradeoff="Largest row count sent to the grouped route; above it rows use "
         "TurboMind. The wide verifier profile raises the AWQ cap from 40 to 48. "
@@ -411,7 +424,7 @@ NOTES: dict[str, dict[str, str]] = {
     ),
     "VLLM_SM70_MTP_GDN_NATIVE_VERIFY": dict(
         section="profile",
-        since="1Cat",
+        since="0.2.0",
         range="0, 1",
         tradeoff="Uses the native recurrent verifier and accepted-state replay "
         "in the AWQ MTP4 wide verifier profile. Set 0 to disable.",
@@ -419,7 +432,7 @@ NOTES: dict[str, dict[str, str]] = {
     ),
     "VLLM_SM70_QWEN38_NATIVE_ROUTER_TOPK": dict(
         section="profile",
-        since="1Cat",
+        since="0.1.0",
         range="0, 1",
         tradeoff="Uses the native router for eligible 17–64 row FP16 logits "
         "in the AWQ MTP4 wide verifier profile. Set 0 to disable.",
@@ -427,7 +440,7 @@ NOTES: dict[str, dict[str, str]] = {
     ),
     "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_PACK_ROWS": dict(
         section="profile",
-        since="0.2.0",
+        since="0.1.0",
         range="0 or 8..48 step 8",
         tradeoff="Caps rows per expert pack: fewer registers per CTA but hot "
         "experts are read more than once. Result unchanged.",
@@ -435,7 +448,7 @@ NOTES: dict[str, dict[str, str]] = {
     ),
     "VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT": dict(
         section="profile",
-        since="0.2.0",
+        since="0.1.0",
         range="4, 8, 16",
         tradeoff="W13 split-K warps per CTA. 16 matches the M1 arithmetic; 8 "
         "(profile) uses fewer threads and a different FP32 split association.",
@@ -459,7 +472,7 @@ NOTES: dict[str, dict[str, str]] = {
     ),
     "VLLM_SM70_CAR_VMM_SAFE": dict(
         section="profile",
-        since="0.2.0",
+        since="0.1.0",
         range="0, 1",
         tradeoff="Copies non-exportable (VMM) inputs into graph allocations while "
         "capturing custom all-reduce graphs, so expandable segments can stay "
@@ -476,7 +489,7 @@ NOTES: dict[str, dict[str, str]] = {
     ),
     "VLLM_SM70_GREEDY_VERIFY": dict(
         section="profile",
-        since="0.2.0",
+        since="0.1.0",
         range="0, 1",
         tradeoff="Greedy MTP verification from TP-local argmax pairs instead of "
         "full-vocabulary logits; only when every request is plain greedy.",
@@ -507,7 +520,7 @@ NOTES: dict[str, dict[str, str]] = {
     ),
     "VLLM_SM70_NVFP4_QWEN38_MOE_RAW_GROUPED_DECODE": dict(
         section="profile",
-        since="0.2.0",
+        since="0.1.0",
         range="0, 1",
         tradeoff="Graph-safe raw-E4M3 grouped NVFP4 MoE for M = 2..40; needs "
         "RAW_SCALE storage.",
@@ -523,7 +536,7 @@ NOTES: dict[str, dict[str, str]] = {
     ),
     "VLLM_SM70_NVFP4_RAW_GROUPED_M48_V154": dict(
         section="research",
-        since="0.2.0rc15",
+        since="0.2.0",
         range="0, 1",
         tradeoff="Native raw-E4M3 grouped MoE for 41..64-row target decode on "
         "SM70 TP4 Qwen3.8 with equal interleaved gate/up global scales. "
@@ -532,7 +545,7 @@ NOTES: dict[str, dict[str, str]] = {
     ),
     "VLLM_SM70_NVFP4_RAW_GROUPED_NARROW_V154": dict(
         section="research",
-        since="0.2.0rc15",
+        since="0.2.0",
         range="0, 1",
         tradeoff="Native raw-E4M3 grouped MoE for 3-5 row target decode on "
         "SM70 TP4 Qwen3.8 with equal interleaved gate/up global scales. "
@@ -555,21 +568,21 @@ NOTES: dict[str, dict[str, str]] = {
     ),
     "VLLM_SM70_PLE_INPUT_PREPARE": dict(
         section="profile",
-        since="0.2.0",
+        since="0.1.0",
         range="0, 1",
         tradeoff="One fused launch for PLE n-gram context gathering (<=4 requests).",
         metrics="",
     ),
     "VLLM_SM70_PLE_NGRAM_BATCH": dict(
         section="profile",
-        since="0.2.0",
+        since="0.1.0",
         range="0, 1",
         tradeoff="Fused PLE n-gram id preprocessing for 2..32 rows.",
         metrics="",
     ),
     "VLLM_SM70_PLE_PREFILL_CONV_CHUNK": dict(
         section="profile",
-        since="0.2.0",
+        since="0.1.0",
         range="0, 1",
         tradeoff="Bounds PLE short-conv prefill buffers when several prefills "
         "share a step; needed at max_num_seqs=8. " + _BITWISE,
@@ -577,7 +590,7 @@ NOTES: dict[str, dict[str, str]] = {
     ),
     "VLLM_SM70_QSA_COMPACT_TOPK": dict(
         section="profile",
-        since="0.2.0",
+        since="0.1.0",
         range="0, 1",
         tradeoff="Coarse FP16 pre-selection before the exact QSA top-k for <=32 "
         "rows and long contexts; same indices.",
@@ -593,7 +606,7 @@ NOTES: dict[str, dict[str, str]] = {
     ),
     "VLLM_SM70_QSA_SHARED_KEY": dict(
         section="profile",
-        since="0.2.0",
+        since="0.1.0",
         range="0, 1",
         tradeoff="Shared-key FP16 indexer for M2..8 verification queries of one "
         "request.",
@@ -601,7 +614,7 @@ NOTES: dict[str, dict[str, str]] = {
     ),
     "VLLM_SM70_QWEN38_GDN_NO_PACK": dict(
         section="profile",
-        since="0.2.0",
+        since="0.1.0",
         range="0, 1",
         tradeoff="Skips the packed GDN weight copy (725.6 MiB per TP4 rank) and "
         "serves 2..48 rows with the skinny dual GEMM; frees memory for KV.",
@@ -617,7 +630,7 @@ NOTES: dict[str, dict[str, str]] = {
     ),
     "VLLM_SM70_QWEN38_WIDE_M": dict(
         section="profile",
-        since="0.2.0",
+        since="0.1.0",
         range="0, 1",
         tradeoff="Widens Qwen3.8 decode/verify routes from 4 to 8 requests (M up "
         "to 40); each VLLM_SM70_QWEN38_WIDE_M_* item can override it.",
@@ -625,7 +638,7 @@ NOTES: dict[str, dict[str, str]] = {
     ),
     "VLLM_SM70_SKIP_REJECTED_BATCH_PACKS": dict(
         section="profile",
-        since="0.2.0",
+        since="0.1.0",
         range="0, 1",
         tradeoff="Skips batch packs the precision policy never admits; saves "
         "about 199 MiB per rank.",
@@ -645,8 +658,10 @@ NOTES: dict[str, dict[str, str]] = {
         tradeoff="CUDA graph memory reserved before sizing the KV cache (MRv2 "
         "does not profile it). Too low risks OOM at capture; too high wastes "
         "KV. Profile: 700 (AWQ, NVFP4), 1200 (DFlash2); with fp8_per_token_head "
-        "or int8 KV, 600 (fixed MTP), 705 (dynamic MTP), 1000 (AWQ + DFlash2) "
-        "and 1024 (NVFP4 + DFlash2).",
+        "or int8 KV, 600 (fixed MTP), 705 (dynamic MTP), 800 (dynamic MTP with "
+        "5 or more drafts), 1000 (AWQ + DFlash2; 1150 with a positive "
+        "--mixed-prefill-step-latency-ms) and 1024 (NVFP4 + DFlash2). See "
+        "[CUDA graph reserve](checkpoints.md#cuda-graph-reserve).",
         metrics="",
     ),
     # ---- DFlash2 / DFlash draft ------------------------------------------
@@ -822,292 +837,333 @@ NOTES: dict[str, dict[str, str]] = {
         tradeoff="Debug, MRv1 DFlash (v1) only: dump the first draft pass.",
         metrics="",
     ),
-    # ---- retiring in 0.2.0rc6 ---------------------------------------------
+    # ---- deprecated -----------------------------------------------------
     "VLLM_DFLASH_DDTREE_ATTN_COMPACT_BATCH": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: DDTree is retired.",
+        tradeoff="Deprecated: DDTree (speculative method dflash_ddtree) is "
+        "retired. Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DDTREE_COMPACT_DRAFTER_CONTEXT": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: DDTree is retired.",
+        tradeoff="Deprecated: DDTree (speculative method dflash_ddtree) is "
+        "retired. Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DDTREE_CONV_KERNEL": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: DDTree is retired.",
+        tradeoff="Deprecated: DDTree (speculative method dflash_ddtree) is "
+        "retired. Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DDTREE_DEBUG": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: DDTree is retired.",
+        tradeoff="Deprecated: DDTree (speculative method dflash_ddtree) is "
+        "retired. Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DDTREE_DISABLE_GDN_FAST_BUILD": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: DDTree is retired.",
+        tradeoff="Deprecated: DDTree (speculative method dflash_ddtree) is "
+        "retired. Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DDTREE_DISABLE_GDN_FAST_BUILD_CACHE": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: DDTree is retired.",
+        tradeoff="Deprecated: DDTree (speculative method dflash_ddtree) is "
+        "retired. Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DDTREE_ENABLE_GDN_FAST_BUILD": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: DDTree is retired.",
+        tradeoff="Deprecated: DDTree (speculative method dflash_ddtree) is "
+        "retired. Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DDTREE_ENABLE_GDN_FAST_BUILD_CACHE": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: DDTree is retired.",
+        tradeoff="Deprecated: DDTree (speculative method dflash_ddtree) is "
+        "retired. Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DDTREE_ENABLE_HYBRID_TREE_STATE": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: DDTree is retired.",
+        tradeoff="Deprecated: DDTree (speculative method dflash_ddtree) is "
+        "retired. Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DDTREE_ENGINE_PROFILE": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: DDTree is retired.",
+        tradeoff="Deprecated: DDTree (speculative method dflash_ddtree) is "
+        "retired. Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DDTREE_FAST_BUILD_DEBUG": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: DDTree is retired.",
+        tradeoff="Deprecated: DDTree (speculative method dflash_ddtree) is "
+        "retired. Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DDTREE_FORCE_MAMBA_COMPACT": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: DDTree is retired.",
+        tradeoff="Deprecated: DDTree (speculative method dflash_ddtree) is "
+        "retired. Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DDTREE_FUSED_GDN": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: DDTree is retired.",
+        tradeoff="Deprecated: DDTree (speculative method dflash_ddtree) is "
+        "retired. Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DDTREE_GDN_FAST_BUILD_TRITON": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: DDTree is retired.",
+        tradeoff="Deprecated: DDTree (speculative method dflash_ddtree) is "
+        "retired. Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DDTREE_GDN_SHARED_COMMON": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: DDTree is retired.",
+        tradeoff="Deprecated: DDTree (speculative method dflash_ddtree) is "
+        "retired. Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DDTREE_GPU_SAMPLER": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: DDTree is retired.",
+        tradeoff="Deprecated: DDTree (speculative method dflash_ddtree) is "
+        "retired. Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DDTREE_LINEAR_GDN": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: DDTree is retired.",
+        tradeoff="Deprecated: DDTree (speculative method dflash_ddtree) is "
+        "retired. Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DDTREE_MAMBA_COMPACT_BATCH": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: DDTree is retired.",
+        tradeoff="Deprecated: DDTree (speculative method dflash_ddtree) is "
+        "retired. Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DDTREE_METADATA_PROFILE": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: DDTree is retired.",
+        tradeoff="Deprecated: DDTree (speculative method dflash_ddtree) is "
+        "retired. Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DDTREE_PATH_PROBE": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: DDTree is retired.",
+        tradeoff="Deprecated: DDTree (speculative method dflash_ddtree) is "
+        "retired. Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DDTREE_PATH_PROBE_LAYER": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: DDTree is retired.",
+        tradeoff="Deprecated: DDTree (speculative method dflash_ddtree) is "
+        "retired. Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DDTREE_PATH_PROBE_MAX_REPORTS": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: DDTree is retired.",
+        tradeoff="Deprecated: DDTree (speculative method dflash_ddtree) is "
+        "retired. Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DDTREE_PATH_PROBE_NODE_LIMIT": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: DDTree is retired.",
+        tradeoff="Deprecated: DDTree (speculative method dflash_ddtree) is "
+        "retired. Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DDTREE_PROFILE": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: DDTree is retired.",
+        tradeoff="Deprecated: DDTree (speculative method dflash_ddtree) is "
+        "retired. Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DDTREE_QLA_GDN": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: DDTree is retired.",
+        tradeoff="Deprecated: DDTree (speculative method dflash_ddtree) is "
+        "retired. Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DDTREE_SERIAL_GDN": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: DDTree is retired.",
+        tradeoff="Deprecated: DDTree (speculative method dflash_ddtree) is "
+        "retired. Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DDTREE_SKIP_MAMBA_COMPACT": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: DDTree is retired.",
+        tradeoff="Deprecated: DDTree (speculative method dflash_ddtree) is "
+        "retired. Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DDTREE_STOCHASTIC_TOPK_LOGITS": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: DDTree is retired.",
+        tradeoff="Deprecated: DDTree (speculative method dflash_ddtree) is "
+        "retired. Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DDTREE_TARGET_FORWARD_NVTX": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: DDTree is retired.",
+        tradeoff="Deprecated: DDTree (speculative method dflash_ddtree) is "
+        "retired. Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DDTREE_TARGET_FORWARD_PROFILER_STEP": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: DDTree is retired.",
+        tradeoff="Deprecated: DDTree (speculative method dflash_ddtree) is "
+        "retired. Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DDTREE_TRACE_JSONL": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: DDTree is retired.",
+        tradeoff="Deprecated: DDTree (speculative method dflash_ddtree) is "
+        "retired. Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DDTREE_TRACE_KV_CACHE_DIFF": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: DDTree is retired.",
+        tradeoff="Deprecated: DDTree (speculative method dflash_ddtree) is "
+        "retired. Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: DDTree is retired.",
+        tradeoff="Deprecated: DDTree (speculative method dflash_ddtree) is "
+        "retired. Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN_STRICT": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: DDTree is retired.",
+        tradeoff="Deprecated: DDTree (speculative method dflash_ddtree) is "
+        "retired. Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DDTREE_TRITON_SAMPLER": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: DDTree is retired.",
+        tradeoff="Deprecated: DDTree (speculative method dflash_ddtree) is "
+        "retired. Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: DDTree is retired.",
+        tradeoff="Deprecated: DDTree (speculative method dflash_ddtree) is "
+        "retired. Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE_CONTEXT": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: DDTree is retired.",
+        tradeoff="Deprecated: DDTree (speculative method dflash_ddtree) is "
+        "retired. Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DDTREE_VERIFY_ROW_TRACE_TOPK": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: DDTree is retired.",
+        tradeoff="Deprecated: DDTree (speculative method dflash_ddtree) is "
+        "retired. Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DDTREE_WORKER_PROFILE": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: DDTree is retired.",
+        tradeoff="Deprecated: DDTree (speculative method dflash_ddtree) is "
+        "retired. Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DEBUG_COORD_TRACE": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: glm5next is unsupported.",
+        tradeoff="Deprecated: glm5next is outside the supported models. "
+        "Setting it logs a deprecation warning.",
         metrics="",
     ),
     "VLLM_DFLASH_DEBUG_PP_AUX_DUMP_LIMIT": dict(
         section="retiring",
         since="1Cat",
         range="-",
-        tradeoff="Deprecated: glm5next is unsupported.",
+        tradeoff="Deprecated: glm5next is outside the supported models. "
+        "Setting it logs a deprecation warning.",
         metrics="",
     ),
 }
@@ -1133,8 +1189,8 @@ DFLASH2_NOTES: dict[str, str] = {
     "the config value is unset.",
     "spec_state_replay": "Replay the accepted prefix to rebuild recurrent state "
     "instead of storing every speculative state: more GPU KV capacity at a "
-    "small per-step cost. On by default in current development for supported "
-    "ordinary DFlash2 routes; released 0.1.4–0.1.5 require explicit true. "
+    "small per-step cost. On by default for supported ordinary DFlash2 "
+    "routes. "
     "None retains an enabled packed verifier, and explicit false disables replay. See "
-    "[State replay](dflash2.md#state-replay-optional).",
+    "[State replay](dflash2.md#state-replay).",
 }

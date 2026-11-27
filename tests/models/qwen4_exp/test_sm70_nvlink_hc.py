@@ -16,6 +16,7 @@ from vllm.distributed.device_communicators import custom_all_reduce as car
 from vllm.distributed.device_communicators import sm70_hc_ll as hc_ll
 from vllm.models.qwen4_exp.nvidia import hyperconnection as hc
 from vllm.models.qwen4_exp.nvidia import sm70_fp16_hc
+from vllm.platforms import sm70_interconnect
 from vllm.platforms.interface import DeviceCapability
 
 _UUIDS = ["GPU-0", "GPU-1", "GPU-2", "GPU-3"]
@@ -139,7 +140,9 @@ def test_physical_gate_and_policy(monkeypatch, settings, case):
     request = "auto" if case == "pex" else "nvlink"
     monkeypatch.setenv("VLLM_SM70_INTERCONNECT", request)
     if case == "pex":
-        monkeypatch.setattr(car, "_sm70_pcie_switch_tp4_mode", lambda *_: True)
+        monkeypatch.setattr(
+            sm70_interconnect, "_sm70_pcie_switch_tp4_mode", lambda *_: True
+        )
     if case == "default_off":
         monkeypatch.delenv("VLLM_SM70_NVLINK_HC")
     if case == "async":

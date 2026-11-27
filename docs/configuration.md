@@ -14,10 +14,11 @@ The complete reference exports are in [step 3 of the tutorial](getting-started.m
 Use only the documented `VLLM_SM70_*` settings unless you are troubleshooting. Explicit
 values override the profile.
 
-Flash-Next AWQ g32 MTP4 enables the wide verifier defaults below on SM70 TP4
-under one PCIe switch with DCP2, GPU KV, synchronous scheduling and GDN state
-replay. Explicit settings take precedence. These kernels can change
-floating-point rounding and token choices.
+Flash-Next AWQ g32 MTP4 enables the wide verifier defaults below for a single
+SM70 TP4 replica with DCP2, GPU KV, synchronous scheduling and GDN state replay
+when the interconnect policy selects PCIe P2P. Automatic environment values
+apply to the entire process. Explicit settings take precedence. These kernels
+can change floating-point rounding and token choices.
 
 - `VLLM_SM70_MTP_GDN_NATIVE_VERIFY=1` uses native GDN verification and
   accepted-state replay for eligible batches. Set `0` to disable it.

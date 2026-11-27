@@ -201,7 +201,9 @@ def engine_config(monkeypatch, tmp_path):
     envs.disable_envs_cache()
 
 
-@pytest.mark.parametrize("case", ["mtp", "dflash", "explicit_off", "nvlink"])
+@pytest.mark.parametrize(
+    "case", ["mtp", "dflash", "explicit_off", "nvlink", "dp2", "auto_nccl"]
+)
 def test_awq_mtp_wide_verify_defaults(engine_config, monkeypatch, case):
     from vllm import revolta_profile
     from vllm.model_executor.layers import quantization
@@ -226,6 +228,9 @@ def test_awq_mtp_wide_verify_defaults(engine_config, monkeypatch, case):
     )
     method = "dflash" if case == "dflash" else "mtp"
     explicit_off = case == "explicit_off"
+    if case == "auto_nccl":
+        monkeypatch.setenv("VLLM_SM70_INTERCONNECT", "auto")
+        monkeypatch.setenv("VLLM_SM70_PCIE_SWITCH_CUSTOM_AR", "0")
     if explicit_off:
         monkeypatch.setenv("VLLM_SM70_MTP_GDN_NATIVE_VERIFY", "0")
         monkeypatch.setenv("VLLM_SM70_QWEN38_NATIVE_ROUTER_TOPK", "0")
@@ -235,6 +240,7 @@ def test_awq_mtp_wide_verify_defaults(engine_config, monkeypatch, case):
         method=method,
         awq=True,
         gdn_replay=True,
+        dp_size=2 if case == "dp2" else 1,
         gdn_input_v154=False if explicit_off else None,
     )
     enabled = case == "mtp"

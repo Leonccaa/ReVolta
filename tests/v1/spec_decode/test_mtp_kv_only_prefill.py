@@ -42,49 +42,23 @@ from vllm.v1.worker.gpu.spec_decode.eagle import speculator as eagle
         "enabled",
         "incomplete",
         "drafts",
-        "mm",
         "dummy",
-        "profile",
-        "batch_dummy",
         "mode",
         "dp_size",
+        "supports_last_row_prefill",
         "path",
     ),
     [
-        (
-            False,
-            [True, True],
-            0,
-            False,
-            False,
-            False,
-            False,
-            CUDAGraphMode.NONE,
-            1,
-            "full",
-        ),
-        (
-            None,
-            [True, True],
-            0,
-            False,
-            False,
-            False,
-            False,
-            CUDAGraphMode.NONE,
-            1,
-            "kv",
-        ),
+        (False, [True, True], 0, False, CUDAGraphMode.NONE, 1, True, "full"),
+        (None, [True, True], 0, False, CUDAGraphMode.NONE, 1, True, "kv"),
         pytest.param(
             None,
             [True, True],
             0,
             False,
-            False,
-            False,
-            False,
             CUDAGraphMode.NONE,
             2,
+            True,
             "full",
             id="dp2-incomplete",
         ),
@@ -93,124 +67,42 @@ from vllm.v1.worker.gpu.spec_decode.eagle import speculator as eagle
             [True, False],
             0,
             False,
-            False,
-            False,
-            False,
             CUDAGraphMode.NONE,
             2,
+            True,
             "full",
             id="dp2-completed",
         ),
-        (
+        pytest.param(
+            None,
+            [True, True],
+            0,
+            False,
+            CUDAGraphMode.NONE,
+            1,
+            False,
+            "full",
+            id="unsupported-incomplete",
+        ),
+        pytest.param(
             None,
             [True, False],
             0,
             False,
-            False,
-            False,
-            False,
             CUDAGraphMode.NONE,
             1,
-            "last",
-        ),
-        (
-            True,
-            [True, True],
-            1,
             False,
-            False,
-            False,
-            False,
-            CUDAGraphMode.NONE,
-            1,
             "full",
+            id="unsupported-completed",
         ),
-        (
-            True,
-            [True, True],
-            0,
-            True,
-            False,
-            False,
-            False,
-            CUDAGraphMode.NONE,
-            1,
-            "full",
-        ),
-        (
-            True,
-            [True, True],
-            0,
-            False,
-            True,
-            False,
-            False,
-            CUDAGraphMode.NONE,
-            1,
-            "full",
-        ),
-        (
-            True,
-            [True, True],
-            0,
-            False,
-            False,
-            True,
-            False,
-            CUDAGraphMode.NONE,
-            1,
-            "full",
-        ),
-        (
-            True,
-            [True, True],
-            0,
-            False,
-            False,
-            False,
-            True,
-            CUDAGraphMode.NONE,
-            1,
-            "full",
-        ),
-        (
-            True,
-            [True, True],
-            0,
-            False,
-            False,
-            False,
-            False,
-            CUDAGraphMode.FULL,
-            1,
-            "graph",
-        ),
-        (False, [False], 0, False, False, False, False, CUDAGraphMode.NONE, 1, "full"),
-        (
-            True,
-            [False],
-            0,
-            False,
-            False,
-            False,
-            False,
-            CUDAGraphMode.PIECEWISE,
-            1,
-            "last",
-        ),
-        (
-            True,
-            [True],
-            0,
-            False,
-            False,
-            False,
-            False,
-            CUDAGraphMode.PIECEWISE,
-            1,
-            "full",
-        ),
-        (True, [False], 0, False, False, False, False, CUDAGraphMode.FULL, 1, "graph"),
+        (None, [True, False], 0, False, CUDAGraphMode.NONE, 1, True, "last"),
+        (True, [True, True], 1, False, CUDAGraphMode.NONE, 1, True, "full"),
+        (True, [False, False], 0, True, CUDAGraphMode.NONE, 1, True, "full"),
+        (True, [True, True], 0, False, CUDAGraphMode.FULL, 1, True, "graph"),
+        (False, [False], 0, False, CUDAGraphMode.NONE, 1, True, "full"),
+        (True, [False], 0, False, CUDAGraphMode.PIECEWISE, 1, True, "last"),
+        (True, [True], 0, False, CUDAGraphMode.PIECEWISE, 1, True, "full"),
+        (True, [False], 0, False, CUDAGraphMode.FULL, 1, True, "graph"),
     ],
 )
 def test_propose_selects_prefill_path(
@@ -218,12 +110,10 @@ def test_propose_selects_prefill_path(
     enabled,
     incomplete,
     drafts,
-    mm,
     dummy,
-    profile,
-    batch_dummy,
     mode,
     dp_size,
+    supports_last_row_prefill,
     path,
 ):
     if enabled is None:
@@ -239,7 +129,7 @@ def test_propose_selects_prefill_path(
     )
     spec = object.__new__(eagle.EagleSpeculator)
     spec.method = "mtp"
-    spec.model = SimpleNamespace(supports_last_row_prefill=True)
+    spec.model = SimpleNamespace(supports_last_row_prefill=supports_last_row_prefill)
     spec.num_speculative_steps = 2
     spec.max_num_reqs = 2
     spec.dp_size = dp_size
@@ -254,7 +144,7 @@ def test_propose_selects_prefill_path(
     spec.last_token_indices = torch.tensor([1, 3])
     spec.current_draft_step = torch.tensor(0)
     spec.prefill_cudagraph_manager = SimpleNamespace(run_fullgraph=Mock())
-    spec.run_kv_only_prefill = Mock(return_value=True)
+    spec.run_kv_only_prefill = Mock(return_value=None)
     spec.prefill = Mock()
     spec._mtp_prefill_begin = Mock()
     spec._mtp_prefill_end = Mock()
@@ -264,13 +154,10 @@ def test_propose_selects_prefill_path(
         num_reqs=num_reqs,
         num_scheduled_tokens=np.full(num_reqs, 2),
         idx_mapping=torch.arange(num_reqs),
-        is_prefilling_np=np.ones(num_reqs, dtype=bool),
-        is_incomplete_prefilling_np=np.array(incomplete),
+        is_prefilling_np=np.full(num_reqs, not dummy, dtype=bool),
+        is_incomplete_prefilling_np=None if dummy else np.array(incomplete),
         num_draft_tokens=drafts,
-        is_dummy_batch=batch_dummy,
-    )
-    mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = (
-        ([], torch.zeros(4, dtype=torch.bool)) if mm else None
+        is_dummy_batch=dummy,
     )
     spec.propose(
         batch,
@@ -285,8 +172,6 @@ def test_propose_selects_prefill_path(
         torch.zeros(2),
         torch.zeros(2),
         dummy_run=dummy,
-        is_profile=profile,
-        mm_inputs=mm_inputs,
         num_speculative_tokens=0,
     )
     assert spec.run_kv_only_prefill.called == (path == "kv")
@@ -698,7 +583,7 @@ def test_last_rows_match_full_draft(
 
         state.context.no_compile_layers["mtp.attn"] = fast_attn
         if num_reqs == 1:
-            assert fast_spec.run_kv_only_prefill(padded, metadata, {}, None)
+            fast_spec.run_kv_only_prefill(padded, metadata, {}, None)
         else:
             fast_spec.prefill(
                 num_reqs,

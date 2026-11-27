@@ -536,16 +536,13 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-    ) -> bool:
-        if not self.supports_kv_only_prefill:
-            return False
+    ) -> None:
         layer = self.layers[0]
         hidden_states = self._project_inputs(
             self.embed_input_ids(input_ids), hidden_states
         )
         _, block_input, _ = layer.attn_hyper_connection.mix(hidden_states)
         layer.self_attn.forward_kv_only(positions, block_input)
-        return True
 
     def _project_inputs(
         self, inputs_embeds: torch.Tensor, hidden_states: torch.Tensor
@@ -812,8 +809,8 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-    ) -> bool:
-        return self.model.forward_kv_only(input_ids, positions, hidden_states)
+    ) -> None:
+        self.model.forward_kv_only(input_ids, positions, hidden_states)
 
     def forward(  # type: ignore[override]
         self,

@@ -508,10 +508,7 @@ class EagleSpeculator:
         attn_metadata: dict[str, Any],
         slot_mappings: dict[str, torch.Tensor],
         num_tokens_across_dp: torch.Tensor | None,
-    ) -> bool:
-        fn = getattr(self.model, "forward_kv_only", None)
-        if fn is None:
-            return False
+    ) -> None:
         with set_forward_context(
             attn_metadata,
             self.vllm_config,
@@ -521,12 +518,10 @@ class EagleSpeculator:
             slot_mapping=slot_mappings,
             batch_descriptor=BatchDescriptor(num_tokens=num_tokens),
         ):
-            return bool(
-                fn(
-                    input_ids=self.input_buffers.input_ids[:num_tokens],
-                    positions=self.input_buffers.positions[:num_tokens],
-                    hidden_states=self.hidden_states[:num_tokens],
-                )
+            self.model.forward_kv_only(
+                input_ids=self.input_buffers.input_ids[:num_tokens],
+                positions=self.input_buffers.positions[:num_tokens],
+                hidden_states=self.hidden_states[:num_tokens],
             )
 
     def _validate_local_argmax_reduction(self) -> None:
@@ -973,32 +968,24 @@ class EagleSpeculator:
         # DP MoE collectives are coordinated using the full-row counts.
         if (
             envs.VLLM_SM70_MTP_KV_ONLY_PREFILL
-            and self.method == "mtp"
-            and self.dp_size == 1
             and not dummy_run
-            and not is_profile
-            and not input_batch.is_dummy_batch
             and input_batch.num_draft_tokens == 0
-            and mm_inputs is None
             and prefill_batch_desc.cg_mode != CUDAGraphMode.FULL
+            and self.dp_size == 1
+            and getattr(self.model, "supports_last_row_prefill", False)
         ):
             incomplete = input_batch.is_incomplete_prefilling_np
             assert incomplete is not None
             if incomplete.all():
-                if (
-                    prefill_batch_desc.cg_mode == CUDAGraphMode.NONE
-                    and self.run_kv_only_prefill(
+                if prefill_batch_desc.cg_mode == CUDAGraphMode.NONE:
+                    self.run_kv_only_prefill(
                         prefill_batch_desc.num_tokens,
                         attn_metadata,
                         slot_mappings,
                         num_tokens_across_dp,
                     )
-                ):
                     return self.draft_tokens[:num_reqs]
-            elif (
-                getattr(self.model, "supports_last_row_prefill", False)
-                and (input_batch.is_prefilling_np & ~incomplete).any()
-            ):
+            elif (input_batch.is_prefilling_np & ~incomplete).any():
                 row_indices = self.last_token_indices[:num_reqs]
         if prefill_batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Replay the full graph for draft prefill.

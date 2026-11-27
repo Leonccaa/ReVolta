@@ -44,6 +44,7 @@ from vllm.utils.torch_utils import (
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
+    AttentionMetadata,
     AttentionType,
     CommonAttentionMetadata,
 )
@@ -1464,9 +1465,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         hidden_states: torch.Tensor,
     ) -> None:
         """Write main and indexer caches without sparse attention."""
-        metadata = get_forward_context().attn_metadata
-        if isinstance(metadata, list):
-            metadata = metadata[0]
+        metadata = cast(
+            dict[str, AttentionMetadata], get_forward_context().attn_metadata
+        )
         main_metadata = cast(FlashAttentionMetadata, metadata[self.layer_name])
         num_tokens = main_metadata.num_actual_tokens
         qkv, _ = self.qkv_proj(hidden_states)

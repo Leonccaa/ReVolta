@@ -143,6 +143,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.ca_comm: CustomAllreduce | None = None
         self.sm70_hc_ll = None
         self.sm70_dcp2 = None
+        self.sm70_dcp2_pex = None
         self.qr_comm: QuickAllReduce | None = None
         self.symm_mem_comm: SymmMemCommunicator | None = None
         self.fi_ar_comm: FlashInferAllReduce | None = None
@@ -235,6 +236,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 self.ranks,
                 self.device,
                 self.rank_in_group,
+            )
+
+        if (
+            unique_name.startswith("dcp:")
+            and self.world_size == 2
+            and envs.VLLM_SM70_DCP2_P2P
+        ):
+            from vllm.distributed.parallel_state import get_tp_group
+            from vllm.models.qwen4_exp.nvidia.ops.sm70_dcp2 import Sm70Dcp2Pex
+
+            self.sm70_dcp2_pex = Sm70Dcp2Pex.create(
+                get_tp_group(), self.ranks, self.rank_in_group
             )
 
         if (

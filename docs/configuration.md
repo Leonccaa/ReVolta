@@ -56,6 +56,16 @@ satisfy these checks. The QSA route supports FP16 queries with six 256-element
 heads per rank and up to 64 rows. These paths can change floating-point rounding
 and are subject to model quality validation.
 
+`VLLM_SM70_DCP2_P2P=1` opts into experimental Flash-Next QSA DCP2 query and packed
+output/LSE exchange on an SM70 TP4 PCIe-switch group with registered push buffers.
+It defaults to `0`. The path uses FP16 queries and the DCP A2A backend for eager uniform
+decode and dedicated FULL decode graphs, up to 53 rows. PIECEWISE graphs keep
+using NCCL. Four-GPU AWQ tests showed no stable gain in cold time to first token or
+decode; fixed-prompt outputs matched the NCCL path token for token. Enabling this
+option requires `_C` built from
+the same commit, or a Custom AR sidecar that exports both
+`sm70_dcp2_p2p_buffer_size` and `sm70_dcp2_p2p`.
+
 ## Launch options
 
 `--kv-cache-dtype` selects the storage format:

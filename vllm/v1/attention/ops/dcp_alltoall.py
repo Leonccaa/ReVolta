@@ -32,6 +32,8 @@ from vllm.v1.worker.workspace import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from vllm.distributed.parallel_state import GroupCoordinator
     from vllm.v1.attention.ops.common import CPTritonContext
 
@@ -429,6 +431,8 @@ def dcp_a2a_lse_reduce(
     ctx: CPTritonContext | None = None,
     return_lse: bool = False,
     is_lse_base_on_e: bool = True,
+    *,
+    exchange: Callable[[torch.Tensor, torch.Tensor], None] | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Combine partial attention outputs across DCP ranks using All-to-All.
@@ -443,6 +447,7 @@ def dcp_a2a_lse_reduce(
         ctx: CPTritonContext (unused, for signature compatibility)
         return_lse: If True, also return the combined global LSE
         is_lse_base_on_e: If True, LSE is base e; if False, base 2
+        exchange: Optional transport for the existing send and receive buffers
 
     Returns:
         Combined output [B, H/N, D] (head-scattered)
@@ -477,13 +482,16 @@ def dcp_a2a_lse_reduce(
         lse_pack_dim,
     )
 
-    work = dist.all_to_all_single(
-        recv_buffer.view(-1),
-        send_buffer.view(-1),
-        group=cp_group.device_group,
-        async_op=True,
-    )
-    work.wait()
+    if exchange is None:
+        work = dist.all_to_all_single(
+            recv_buffer.view(-1),
+            send_buffer.view(-1),
+            group=cp_group.device_group,
+            async_op=True,
+        )
+        work.wait()
+    else:
+        exchange(send_buffer, recv_buffer)
 
     return _dcp_a2a_unpack_combine(
         recv_buffer, D, lse_pack_dim, return_lse, is_lse_base_on_e

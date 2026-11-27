@@ -689,8 +689,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 partial_output, partial_lse, group, is_lse_base_on_e=False
             ),
         )
-        out.copy_(merged)
-        _qsa_output_gate(out, gate)
+        _qsa_output_gate(out, gate, merged=merged)
         return output
 
     def _forward_qsa_dcp(
@@ -852,11 +851,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 is_lse_base_on_e=False,
             ),
         )
-        # Round to the output dtype first, as DCP1's attention output is, then
-        # apply the Triton gate DCP1's page4 route uses. This replaces a chain
-        # of five elementwise kernels (12.2 us per decode layer on V100).
-        output.copy_(merged)
-        _qsa_output_gate(output, gate)
+        _qsa_output_gate(output, gate, merged=merged)
 
 
 def _verify_e4m3_kv_requirements(

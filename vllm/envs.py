@@ -505,6 +505,7 @@ if TYPE_CHECKING:
     VLLM_SM70_CAR_VMM_SAFE_PREALLOC: bool = True
     VLLM_SM70_INTERCONNECT: str = "auto"
     VLLM_SM70_NVLINK_HC: bool = False
+    VLLM_SM70_DCP2_P2P: bool = False
     VLLM_SM70_PCIE_SWITCH_CUSTOM_AR: str = "auto"
     VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES: int = 204800
     VLLM_SM70_PCIE_SWITCH_CAR_GRAPH_ONLY: bool = True
@@ -7859,6 +7860,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "physically fully connected NVLink SM70 TP4."
         ),
         category="configuration",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=("SM70 collectives",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_DCP2_P2P": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_DCP2_P2P", "0"))),
+        description=(
+            "Use the SM70 TP4 PCIe push buffers for Flash-Next QSA DCP2 "
+            "query and packed output/LSE exchange on uniform decode."
+        ),
+        category="experimental",
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
@@ -20489,6 +20503,7 @@ def compile_factors(speculative_config: Any = None) -> dict[str, object]:
         # Scheduler/KV planning only; never changes compiled code.
         "VLLM_SM70_HOST_KV_STATIC_HOT_POOL",
         # Runtime branches inside opaque QSA ops; no traced graph change.
+        "VLLM_SM70_DCP2_P2P",
         "VLLM_SM70_HOST_DECODE_FAST",
         "VLLM_SM70_QSA_LOCAL_INPUTS_FUSED",
         "REVOLTA_RESEARCH_HOST_DECODE_FAST",

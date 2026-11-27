@@ -958,8 +958,12 @@ def _qsa_merge_splitk_kernel(
 
 @triton.jit
 def _qsa_output_gate_kernel(
+    input_ptr,
     output_ptr,
     output_gate_ptr,
+    stride_input_row,
+    stride_input_head,
+    stride_input_dim,
     stride_output_row,
     stride_output_head,
     stride_output_gate_row,
@@ -969,9 +973,17 @@ def _qsa_output_gate_kernel(
     row = tl.program_id(0)
     head = tl.program_id(1)
     dim_offsets = tl.arange(0, HEAD_DIM)
-    output = tl.load(
-        output_ptr + row * stride_output_row + head * stride_output_head + dim_offsets
-    ).to(tl.float32)
+    # Preserve the rounding of copying the FP32 DCP merge to output first.
+    value = (
+        tl.load(
+            input_ptr
+            + row * stride_input_row
+            + head * stride_input_head
+            + dim_offsets * stride_input_dim
+        )
+        .to(output_ptr.dtype.element_ty)
+        .to(tl.float32)
+    )
     gate = tl.load(
         output_gate_ptr
         + row * stride_output_gate_row
@@ -980,14 +992,24 @@ def _qsa_output_gate_kernel(
     ).to(tl.float32)
     tl.store(
         output_ptr + row * stride_output_row + head * stride_output_head + dim_offsets,
-        output * tl.sigmoid(gate),
+        value * tl.sigmoid(gate),
     )
 
 
-def _qsa_output_gate(output: torch.Tensor, output_gate: torch.Tensor) -> None:
+def _qsa_output_gate(
+    output: torch.Tensor,
+    output_gate: torch.Tensor,
+    *,
+    merged: torch.Tensor | None = None,
+) -> None:
+    source = output if merged is None else merged
     _qsa_output_gate_kernel[(output.shape[0], output.shape[1])](
+        source,
         output,
         output_gate,
+        source.stride(0),
+        source.stride(1),
+        source.stride(2),
         output.stride(0),
         output.stride(1),
         output_gate.stride(0),

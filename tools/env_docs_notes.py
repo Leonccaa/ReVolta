@@ -121,6 +121,17 @@ NOTES: dict[str, dict[str, str]] = {
         metrics="",
     ),
     # ---- promoted research switches -------------------------------------
+    "VLLM_SM70_MTP_KV_ONLY_PREFILL": dict(
+        section="promoted",
+        since="0.2.0rc16",
+        range="0, 1",
+        tradeoff="For eligible Flash-Next MTP batches with DP=1 and GPU or Host "
+        "draft KV, eager incomplete prefills only write KV. If a prefill completes, "
+        "the sampled-row path writes KV for all rows and computes outputs only for "
+        "sampled rows outside FULL CUDA graph replay. Floating-point results can "
+        "differ from the full-row path. Set 0 to use full-row draft prefill.",
+        metrics="",
+    ),
     "VLLM_SM70_GDN_CPU_SPEC_QSL": dict(
         section="promoted",
         since="0.2.0",

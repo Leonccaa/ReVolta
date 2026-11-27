@@ -524,6 +524,43 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    @property
+    def supports_kv_only_prefill(self) -> bool:
+        if self.num_mtp_layers != 1:
+            return False
+        layer = self.layers[0]
+        return layer.ple is None and hasattr(layer.self_attn, "forward_kv_only")
+
+    def forward_kv_only(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> None:
+        layer = self.layers[0]
+        hidden_states = self._project_inputs(
+            self.embed_input_ids(input_ids), hidden_states
+        )
+        _, block_input, _ = layer.attn_hyper_connection.mix(hidden_states)
+        layer.self_attn.forward_kv_only(positions, block_input)
+
+    def _project_inputs(
+        self, inputs_embeds: torch.Tensor, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        inputs_embeds = self.fc_embedding(self.pre_fc_norm_embedding(inputs_embeds))
+        # Normalize the whole pre-final-mixer row across all HC streams.
+        hidden_states = hidden_states.view(
+            hidden_states.shape[0], self.hc_count, self.hidden_size
+        )
+        hidden_states = self.pre_fc_norm_hidden(hidden_states.flatten(-2)).view_as(
+            hidden_states
+        )
+        hidden_states = self.fc_hidden(hidden_states)
+        # Add the embedding residual on the local feature shard before gather.
+        return tensor_model_parallel_all_gather(
+            inputs_embeds.unsqueeze(-2) + hidden_states
+        ).flatten(-2)
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -532,10 +569,9 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | IntermediateTensors:
-        hc_count = self.hc_count
-        hidden_size = self.hidden_size
-
+        *,
+        row_indices: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # The drafter is stage-local, so this module is always a complete
         # model: gpu_model_runner returns the IntermediateTensors on every
         # non-final pipeline rank before speculation is reached, and the
@@ -550,25 +586,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         if inputs_embeds is None:
             assert input_ids is not None
             inputs_embeds = self.embed_input_ids(input_ids)
-        # Embedding branch: pre-norm -> rank-local fc_embedding.
-        inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
-        inputs_embeds = self.fc_embedding(inputs_embeds)
-
-        # Backbone hidden is multi-stream [T, hc_count*H] (scheme A:
-        # the main model truly emits the pre-final-mixer multi stream
-        # on the first step; subsequent steps reuse the prior draft
-        # step's multi stream).
-        num_tokens = hidden_states.shape[0]
-        hidden_states = hidden_states.view(num_tokens, hc_count, hidden_size)
-        hidden_states = self.pre_fc_norm_hidden(hidden_states.flatten(-2)).view(
-            num_tokens, hc_count, hidden_size
-        )
-        hidden_states = self.fc_hidden(hidden_states)
-        # Both projections produce the same feature shard. Add the embedding
-        # residual locally before gathering the full features for the HC decoder.
-        hidden_states = tensor_model_parallel_all_gather(
-            inputs_embeds.unsqueeze(-2) + hidden_states
-        ).flatten(-2)
+        hidden_states = self._project_inputs(inputs_embeds, hidden_states)
 
         current_step_idx = spec_step_idx % self.num_mtp_layers
         layer = self.layers[current_step_idx]
@@ -580,6 +598,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             input_ids=None,
             query_start_loc=None,
             ngram_context=None,
+            row_indices=row_indices,
         )
         # Last PP rank finalize. Keep both:
         #   (A) sample_hidden_states [T, H]  -> single stream for the LM head
@@ -769,6 +788,29 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
+
+    @property
+    def supports_last_row_prefill(self) -> bool:
+        return self.model.supports_kv_only_prefill
+
+    def forward_last_rows(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        row_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.model.forward(
+            input_ids, positions, hidden_states, row_indices=row_indices
+        )
+
+    def forward_kv_only(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> None:
+        self.model.forward_kv_only(input_ids, positions, hidden_states)
 
     def forward(  # type: ignore[override]
         self,

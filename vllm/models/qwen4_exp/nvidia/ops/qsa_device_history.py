@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""SM70 QSA readers for replicated draft and sharded target GPU KV."""
+"""SM70 QSA readers for replicated draft and sharded target KV."""
 
 import importlib
 
@@ -26,6 +26,11 @@ def load_qsa_device_history() -> None:
 def load_qsa_paged_fp16_h6() -> None:
     importlib.import_module("vllm._sm70_qsa_device_C")
     _ = torch.ops.vllm_sm70_qsa_device.run
+
+
+def load_qsa_paged_int8_h6() -> None:
+    importlib.import_module("vllm._sm70_qsa_indexer_C")
+    _ = torch.ops.vllm_sm70_qsa_indexer.paged_int8_h6
 
 
 def qsa_device_history_workspace(rows: int, width: int) -> list[torch.Tensor]:
@@ -74,6 +79,50 @@ def try_qsa_paged_fp16_h6(
         q.shape[0],
         kv_cache.size(2),
         indices.shape[1],
+    )
+    return True
+
+
+def try_qsa_paged_int8_h6(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    indices: torch.Tensor,
+    table: torch.Tensor,
+    requests: torch.Tensor,
+    positions: torch.Tensor | None,
+    lengths: torch.Tensor | None,
+    out: torch.Tensor,
+    gate: torch.Tensor | None,
+    *,
+    k_scale_cache: torch.Tensor,
+    v_scale_cache: torch.Tensor,
+) -> bool:
+    rows, width = indices.shape
+    if not (0 < rows <= H6_MAX_ROWS and 0 < width <= MAX_SELECTION_WIDTH):
+        return False
+    partial, state = qsa_device_history_workspace(rows, width)
+    torch.ops.vllm_sm70_qsa_indexer.paged_int8_h6(
+        q,
+        k,
+        v,
+        k_scale_cache,
+        v_scale_cache,
+        indices,
+        table,
+        requests,
+        positions,
+        lengths,
+        out,
+        gate.view_as(q) if gate is not None else None,
+        partial,
+        state,
+    )
+    logger.info_once(
+        "Using SM70 native INT8 H6 MTP QSA reader (rows=%d, page=%d, width=%d).",
+        rows,
+        k.size(1),
+        width,
     )
     return True
 

@@ -154,6 +154,8 @@ class Arms:
             dcp_partial_output_buffer=torch.empty((tokens, gathered_heads, dim)),
             dcp_partial_lse_buffer=torch.empty((tokens, gathered_heads)),
             indexer=SimpleNamespace(token_topk=topk, compress_ratio=4),
+            qsa_draft_native_scales=None,
+            sm70_qsa_paged_int8_h6=False,
             sm70_qsa_paged_h12=False,
             sm70_qsa_device_history=False,
         )
@@ -213,6 +215,7 @@ class Arms:
         self.impl.forward_qsa(
             self.layer, query, None, None, self.paged, meta, out_gpu,
             token_to_req, output_gate=gate, sequence_lengths=seq_lens,
+            query_positions=torch.tensor([p for _, p in rows], dtype=torch.int64),
         )  # fmt: skip
         partial_gpu = self.layer.dcp_partial_output_buffer[:n].clone()
         lse_gpu = self.layer.dcp_partial_lse_buffer[:n].clone()
@@ -335,6 +338,58 @@ class PlanarInt8Arms(Arms):
                     page = getattr(self.view, name)
                     page[slot // KBS, slot % KBS] = getattr(stage, name)[row, 0]
         self.length[req] = max(self.length[req], positions[-1] + 1)
+
+
+@pytest.mark.usefixtures("_int1_compares")
+def test_planar_int8_h6_reads_the_hot_pool(monkeypatch):
+    from vllm.compilation.sm70_decode_graph import sm70_decode_graph_compilation
+    from vllm.forward_context import get_forward_context, set_forward_context
+    from vllm.v1.worker import workspace
+
+    from .test_qsa_paged_fp16_h12_cpu import _forward_config, h12_late_scale
+
+    arms = PlanarInt8Arms(h12=False, topk=8, rows_per_pass=4, dim=256, heads=6)
+    arms.layer.sm70_qsa_paged_int8_h6 = True
+    arms.write(0, list(range(33)))
+    arms.write(1, [0])
+    calls = []
+
+    def h6(q, k, v, sk, sv, ids, table, req, pos, lens, out, gate, *scratch):
+        hot = pos is None
+        assert hot == (lens is None)
+        cache = arms.host.hot_cache if hot else arms.view
+        for actual, name in zip(
+            (k, v, sk, sv), ("key", "value", "key_scale", "value_scale")
+        ):
+            expected = getattr(cache, name)
+            assert actual.data_ptr() == expected.data_ptr()
+            assert actual.stride() == expected.stride()
+        if hot:
+            assert table is arms.store.hot_block_table
+        calls.append(hot)
+        token = ids.long().clamp_min(0)
+        page = table[req.long()[:, None], token // k.size(1)].long()
+        offset = token % k.size(1)
+        codes_k, codes_v, scales_k, scales_v = (
+            plane[page, offset, 0].float() for plane in (k, v, sk, sv)
+        )
+        valid = ids >= 0
+        if not hot:
+            valid &= (ids <= pos[:, None]) & (ids < lens[req.long(), None])
+        result, _ = h12_late_scale(q, codes_k, codes_v, scales_k, scales_v, valid)
+        out.copy_(result.half().float() * gate.float().sigmoid())
+
+    monkeypatch.setattr(
+        workspace, "_manager", workspace.WorkspaceManager(torch.device("cpu"))
+    )
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        torch.ops.vllm_sm70_qsa_indexer, "paged_int8_h6", h6, raising=False
+    )
+    with set_forward_context(None, _forward_config()), sm70_decode_graph_compilation():
+        get_forward_context().additional_kwargs["sm70_qsa_draft_decode"] = True
+        arms.step([(0, 32), (1, 0)])
+    assert calls == [False, True]
 
 
 @pytest.mark.usefixtures("_int1_compares")

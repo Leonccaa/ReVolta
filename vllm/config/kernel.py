@@ -672,8 +672,9 @@ class KernelConfig:
     decode on SM70. Its reduction and probability rounding differ."""
 
     sm70_qsa_paged_int8_h12: bool = False
-    """Use the native planar INT8 paged QSA reader for eligible TP4/DCP2
-    target decode on SM70, including the hot pool of host main K/V."""
+    """Use native planar INT8 paged QSA on SM70 for eligible TP4/DCP2 target
+    decode (H12) and replicated MTP draft decode graphs (H6). Both readers
+    can use the hot pool when main K/V is placed on the host."""
 
     sm70_qsa_paged_fp16_h6: bool | None = None
     """Use the native FP16 paged QSA reader in replicated MTP decode graphs

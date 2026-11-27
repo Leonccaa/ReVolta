@@ -30,6 +30,11 @@ struct Args {
   const float* sk;
   const float* sv;
   int64_t skb, skt, svb, svt;
+  const int64_t* positions;
+  const int* lengths;
+  const half* gate;
+  half* draft_out;
+  int64_t gs0, gs1;
 };
 
 __device__ __forceinline__ float fast_exp2(float x) {
@@ -69,19 +74,20 @@ __device__ __forceinline__ uint4 unpack_kv(uint2 packed) {
 
 __device__ __forceinline__ uint4 unpack_kv(uint4 packed) { return packed; }
 
-template <bool INT8>
-__global__ __launch_bounds__(256, 2) void partial_paged_h12(Args a) {
+template <bool INT8, int GROUPS>
+__device__ __forceinline__ void partial_paged_qsa(const Args& a) {
+  constexpr int Heads = GROUPS * H;
   using Element = std::conditional_t<INT8, int8_t, half>;
   using Vector = std::conditional_t<INT8, uint2, uint4>;
   using Probability = std::conditional_t<INT8, float, half>;
   const int row = blockIdx.y, split = blockIdx.x;
   const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
-  __shared__ __align__(16) half query[2][8][PAD];
+  __shared__ __align__(16) half query[GROUPS][8][PAD];
   __shared__ __align__(16) half tile[C][PAD];
   // Score storage replaces the K tile after all warps have read K. The V
   // tile reuses the same memory after both groups have formed probabilities.
   auto& scores = *reinterpret_cast<float (*)[4][8][C]>(&tile);
-  __shared__ __align__(16) Probability probs[H12][C];
+  __shared__ __align__(16) Probability probs[Heads][C];
   __shared__ int64_t slots[C];
   __shared__ float k_scales[INT8 ? C : 1], v_scales[INT8 ? C : 1];
 
@@ -90,9 +96,15 @@ __global__ __launch_bounds__(256, 2) void partial_paged_h12(Args a) {
     const int req = a.requests[row], col = split * C + t;
     const int pos = col < a.width ? a.indices[row * a.is0 + col] : -1;
     int64_t slot = -1;
-    // The selector already applied causality before DCP localized the IDs.
-    if (req >= 0 && req < a.num_requests && pos >= 0 &&
-        pos / a.page < a.table_width) {
+    bool valid = req >= 0 && req < a.num_requests && pos >= 0 &&
+                 pos / a.page < a.table_width;
+    if constexpr (GROUPS == 1) {
+      // GPU draft IDs are global positions. Host hot IDs are already masked
+      // by the selector and remap, like the localized IDs in H12.
+      if (valid && a.positions)
+        valid = pos <= a.positions[row] && pos < a.lengths[req];
+    }
+    if (valid) {
       const int page = a.table[req * a.ts0 + pos / a.page];
       if (page >= 0 && page < a.blocks) {
         const int offset = pos % a.page;
@@ -107,13 +119,15 @@ __global__ __launch_bounds__(256, 2) void partial_paged_h12(Args a) {
     live = slot >= 0;
   }
 
-  float maxima[2] = {-CUDART_INF_F, -CUDART_INF_F};
-  float sums[2] = {};
-  float result[H12] = {};
+  float maxima[GROUPS];
+#pragma unroll
+  for (int hg = 0; hg < GROUPS; ++hg) maxima[hg] = -CUDART_INF_F;
+  float sums[GROUPS] = {};
+  float result[Heads] = {};
   if (__syncthreads_or(live)) {
     const int head = t / 32, d8 = (t % 32) * 8;
 #pragma unroll
-    for (int hg = 0; hg < 2; ++hg) {
+    for (int hg = 0; hg < GROUPS; ++hg) {
       const uint4 qv =
           head < H ? __ldg(reinterpret_cast<const uint4*>(
                          a.q + row * a.qs0 + (hg * H + head) * a.qs1 + d8))
@@ -147,14 +161,14 @@ __global__ __launch_bounds__(256, 2) void partial_paged_h12(Args a) {
     const int r8 = (lane & 3) + ((lane & 16) ? 4 : 0);
     const int nr =
         nt * 32 + ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) ? 4 : 0);
-    float acc[2][8] = {};
+    float acc[GROUPS][8] = {};
 #pragma unroll
     for (int s = 0; s < 4; ++s) {
       const int d = kw * 64 + s * 16;
       const uint4 k0 = *reinterpret_cast<const uint4*>(&tile[nr][d]);
       const uint4 k1 = *reinterpret_cast<const uint4*>(&tile[nr][d + 8]);
 #pragma unroll
-      for (int hg = 0; hg < 2; ++hg) {
+      for (int hg = 0; hg < GROUPS; ++hg) {
         const uint4 q0 = *reinterpret_cast<const uint4*>(&query[hg][r8][d]);
         const uint4 q1 = *reinterpret_cast<const uint4*>(&query[hg][r8][d + 8]);
         mma(acc[hg], q0.x, q0.y, k0.x, k0.y);
@@ -165,7 +179,7 @@ __global__ __launch_bounds__(256, 2) void partial_paged_h12(Args a) {
     }
     __syncthreads();
 #pragma unroll
-    for (int hg = 0; hg < 2; ++hg) {
+    for (int hg = 0; hg < GROUPS; ++hg) {
 #pragma unroll
       for (int e = 0; e < 8; ++e) {
         const int h = (e & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
@@ -225,7 +239,7 @@ __global__ __launch_bounds__(256, 2) void partial_paged_h12(Args a) {
     for (int k = 0; k < C; ++k) {
       const float value = __half2float(tile[k][t]);
 #pragma unroll
-      for (int h = 0; h < H12; ++h) {
+      for (int h = 0; h < Heads; ++h) {
         if constexpr (INT8)
           result[h] = __fmaf_rn(probs[h][k], value, result[h]);
         else
@@ -235,23 +249,33 @@ __global__ __launch_bounds__(256, 2) void partial_paged_h12(Args a) {
   }
   if (lane == 0 && warp < H) {
 #pragma unroll
-    for (int hg = 0; hg < 2; ++hg) {
-      const int state = ((row * H12 + hg * H + warp) * a.splits + split) * 2;
+    for (int hg = 0; hg < GROUPS; ++hg) {
+      const int state = ((row * Heads + hg * H + warp) * a.splits + split) * 2;
       a.state[state] = maxima[hg];
       a.state[state + 1] = sums[hg];
     }
   }
 #pragma unroll
-  for (int h = 0; h < H12; ++h)
-    a.partial[((row * H12 + h) * a.splits + split) * D + t] = result[h];
+  for (int h = 0; h < Heads; ++h)
+    a.partial[((row * Heads + h) * a.splits + split) * D + t] = result[h];
 }
 
-// Merge one (row, head) across the rank-local splits, emitting base-2 LSE
-// for the existing DCP combine.
-__global__ void merge_paged_fp16_h12(Args a) {
-  const int row = blockIdx.x / H12, head = blockIdx.x % H12, t = threadIdx.x;
+template <bool INT8>
+__global__ __launch_bounds__(256, 2) void partial_paged_h12(Args a) {
+  partial_paged_qsa<INT8, 2>(a);
+}
+
+__global__ __launch_bounds__(256, 2) void partial_paged_int8_h6(Args a) {
+  partial_paged_qsa<true, 1>(a);
+}
+
+// Merge one (row, head), then gate the draft or emit base-2 LSE for DCP.
+template <int Heads>
+__device__ __forceinline__ void merge_paged_qsa(const Args& a) {
+  const int row = blockIdx.x / Heads, head = blockIdx.x % Heads,
+            t = threadIdx.x;
   __shared__ float weights[64], denom_parts[64], scalars[2];
-  const int64_t state_base = int64_t(row * H12 + head) * a.splits * 2;
+  const int64_t state_base = int64_t(row * Heads + head) * a.splits * 2;
   if (t < 32) {
     const int s0 = t, s1 = t + 32;
     const float m0 = s0 < a.splits && a.state[state_base + s0 * 2 + 1] > 0
@@ -285,34 +309,49 @@ __global__ void merge_paged_fp16_h12(Args a) {
   float numerator = 0.f;
   for (int s = 0; s < a.splits; ++s)
     numerator = __fmaf_rn(
-        weights[s], a.partial[((row * H12 + head) * a.splits + s) * D + t],
+        weights[s], a.partial[((row * Heads + head) * a.splits + s) * D + t],
         numerator);
   const float denominator = scalars[1];
-  const float result =
-      denominator > 0 ? __fdiv_rn(numerator, denominator) : 0.f;
-  a.out[row * a.os0 + head * a.os1 + t] = result;
-  if (!t) {
-    a.lse[row * a.ls0 + head] =
-        denominator > 0.f ? (scalars[0] + log2f(denominator)) : -CUDART_INF_F;
+  float result = denominator > 0 ? __fdiv_rn(numerator, denominator) : 0.f;
+  if constexpr (Heads == H) {
+    if (a.gate) {
+      result = __half2float(__float2half_rn(result));
+      const float gate = __half2float(a.gate[row * a.gs0 + head * a.gs1 + t]);
+      result *= __fdiv_rn(1.f, 1.f + fast_exp2(-gate * 1.4426950408889634f));
+    }
+    a.draft_out[row * a.os0 + head * a.os1 + t] = __float2half_rn(result);
+  } else {
+    a.out[row * a.os0 + head * a.os1 + t] = result;
+    if (!t) {
+      a.lse[row * a.ls0 + head] =
+          denominator > 0.f ? (scalars[0] + log2f(denominator)) : -CUDART_INF_F;
+    }
   }
 }
 
-template <bool INT8>
-void launch_paged_h12(const torch::Tensor& q, const torch::Tensor& k,
-                      const torch::Tensor& v, const torch::Tensor& indices,
-                      const torch::Tensor& table, const torch::Tensor& requests,
-                      torch::Tensor& out, torch::Tensor& lse,
-                      torch::Tensor& partial, torch::Tensor& state,
-                      const torch::Tensor* sk = nullptr,
-                      const torch::Tensor* sv = nullptr) {
+__global__ void merge_paged_fp16_h12(Args a) { merge_paged_qsa<H12>(a); }
+
+__global__ void merge_paged_int8_h6(Args a) { merge_paged_qsa<H>(a); }
+
+template <bool INT8, int Heads = H12>
+void launch_paged_qsa(
+    const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v,
+    const torch::Tensor& indices, const torch::Tensor& table,
+    const torch::Tensor& requests, torch::Tensor& out, torch::Tensor* lse,
+    torch::Tensor& partial, torch::Tensor& state,
+    const torch::Tensor* sk = nullptr, const torch::Tensor* sv = nullptr,
+    const std::optional<torch::Tensor>& positions = std::nullopt,
+    const std::optional<torch::Tensor>& lengths = std::nullopt,
+    const std::optional<torch::Tensor>& gate = std::nullopt) {
   using Element = std::conditional_t<INT8, int8_t, at::Half>;
+  constexpr bool Draft = Heads == H;
   const c10::cuda::CUDAGuard guard(q.device());
   const int rows = q.size(0), width = indices.size(1);
   const int splits = (width + C - 1) / C;
-  TORCH_CHECK(rows > 0 && rows <= 48 && q.size(1) == H12 && q.size(2) == D &&
-              splits > 0 && splits <= 64);
-  TORCH_CHECK(partial.numel() >= rows * H12 * splits * D &&
-              state.numel() >= rows * H12 * splits * 2);
+  TORCH_CHECK(rows > 0 && rows <= (Draft ? 64 : 48) && q.size(1) == Heads &&
+              q.size(2) == D && splits > 0 && splits <= 64);
+  TORCH_CHECK(partial.numel() >= rows * Heads * splits * D &&
+              state.numel() >= rows * Heads * splits * 2);
   const Args a{
       reinterpret_cast<const half*>(q.data_ptr<at::Half>()),
       k.data_ptr<Element>(),
@@ -320,8 +359,8 @@ void launch_paged_h12(const torch::Tensor& q, const torch::Tensor& k,
       indices.data_ptr<int>(),
       table.data_ptr<int>(),
       requests.data_ptr<int>(),
-      out.data_ptr<float>(),
-      lse.data_ptr<float>(),
+      Draft ? nullptr : out.data_ptr<float>(),
+      Draft ? nullptr : lse->data_ptr<float>(),
       partial.data_ptr<float>(),
       state.data_ptr<float>(),
       static_cast<int>(k.size(0)),
@@ -340,25 +379,38 @@ void launch_paged_h12(const torch::Tensor& q, const torch::Tensor& k,
       table.stride(0),
       out.stride(0),
       out.stride(1),
-      lse.stride(0),
+      Draft ? 0 : lse->stride(0),
       INT8 ? sk->data_ptr<float>() : nullptr,
       INT8 ? sv->data_ptr<float>() : nullptr,
       INT8 ? sk->stride(0) : 0,
       INT8 ? sk->stride(1) : 0,
       INT8 ? sv->stride(0) : 0,
       INT8 ? sv->stride(1) : 0,
+      positions ? positions->data_ptr<int64_t>() : nullptr,
+      lengths ? lengths->data_ptr<int>() : nullptr,
+      gate ? reinterpret_cast<const half*>(gate->data_ptr<at::Half>())
+           : nullptr,
+      Draft ? reinterpret_cast<half*>(out.data_ptr<at::Half>()) : nullptr,
+      gate ? gate->stride(0) : 0,
+      gate ? gate->stride(1) : 0,
   };
 
   static thread_local int configured_device = -1;
   if (configured_device != q.get_device()) {
     C10_CUDA_CHECK(cudaFuncSetAttribute(
-        partial_paged_h12<INT8>, cudaFuncAttributePreferredSharedMemoryCarveout,
-        100));
+        Draft ? partial_paged_int8_h6 : partial_paged_h12<INT8>,
+        cudaFuncAttributePreferredSharedMemoryCarveout, 100));
     configured_device = q.get_device();
   }
   const auto stream = at::cuda::getCurrentCUDAStream();
-  partial_paged_h12<INT8><<<dim3(splits, rows), D, 0, stream>>>(a);
-  merge_paged_fp16_h12<<<rows * H12, D, 0, stream>>>(a);
+  const dim3 grid(splits, rows);
+  if constexpr (Draft) {
+    partial_paged_int8_h6<<<grid, D, 0, stream>>>(a);
+    merge_paged_int8_h6<<<rows * H, D, 0, stream>>>(a);
+  } else {
+    partial_paged_h12<INT8><<<grid, D, 0, stream>>>(a);
+    merge_paged_fp16_h12<<<rows * H12, D, 0, stream>>>(a);
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -368,7 +420,7 @@ void paged_fp16_h12_out(const torch::Tensor& q, const torch::Tensor& k,
                         const torch::Tensor& requests, torch::Tensor& out,
                         torch::Tensor& lse, torch::Tensor& partial,
                         torch::Tensor& state) {
-  launch_paged_h12<false>(q, k, v, indices, table, requests, out, lse, partial,
+  launch_paged_qsa<false>(q, k, v, indices, table, requests, out, &lse, partial,
                           state);
 }
 
@@ -379,8 +431,22 @@ void paged_int8_h12_out(const torch::Tensor& q, const torch::Tensor& k,
                         const torch::Tensor& requests, torch::Tensor& out,
                         torch::Tensor& lse, torch::Tensor& partial,
                         torch::Tensor& state) {
-  launch_paged_h12<true>(q, k, v, indices, table, requests, out, lse, partial,
+  launch_paged_qsa<true>(q, k, v, indices, table, requests, out, &lse, partial,
                          state, &sk, &sv);
+}
+
+void paged_int8_h6_out(const torch::Tensor& q, const torch::Tensor& k,
+                       const torch::Tensor& v, const torch::Tensor& sk,
+                       const torch::Tensor& sv, const torch::Tensor& indices,
+                       const torch::Tensor& table,
+                       const torch::Tensor& requests,
+                       const std::optional<torch::Tensor>& positions,
+                       const std::optional<torch::Tensor>& lengths,
+                       torch::Tensor& out,
+                       const std::optional<torch::Tensor>& gate,
+                       torch::Tensor& partial, torch::Tensor& state) {
+  launch_paged_qsa<true, H>(q, k, v, indices, table, requests, out, nullptr,
+                            partial, state, &sk, &sv, positions, lengths, gate);
 }
 }  // namespace
 
@@ -395,4 +461,10 @@ TORCH_LIBRARY_FRAGMENT(vllm_sm70_qsa_indexer, m) {
       "Tensor indices, Tensor table, Tensor requests, Tensor(a!) out, "
       "Tensor(b!) lse, Tensor(c!) partial, Tensor(d!) state) -> ()");
   m.impl("paged_int8_h12", torch::kCUDA, &paged_int8_h12_out);
+  m.def(
+      "paged_int8_h6(Tensor q, Tensor k, Tensor v, Tensor sk, Tensor sv, "
+      "Tensor indices, Tensor table, Tensor requests, Tensor? positions, "
+      "Tensor? lengths, Tensor(a!) out, Tensor? gate, Tensor(b!) partial, "
+      "Tensor(c!) state) -> ()");
+  m.impl("paged_int8_h6", torch::kCUDA, &paged_int8_h6_out);
 }

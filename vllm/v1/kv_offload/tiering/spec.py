@@ -176,6 +176,8 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             regions = self._create_group_regions(None)
             for region in regions.values():
                 cleanup.callback(region.cleanup)
+                # Same early unlink as in get_manager (#51).
+                region.unlink()
             managers: dict[int, OffloadingManager] = {}
             for group, region in regions.items():
                 primary = CPUPrimaryTierOffloadingManager(
@@ -239,6 +241,10 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
                 cpu_page_size=self.cpu_page_size_per_worker,
             )
             self._scheduler_mmap = scheduler_mmap
+            # Scheduler-side mapping is the last one (all workers mapped in
+            # initialize_from_config); removing the name here means even a
+            # SIGKILL leaves no region file behind (#51).
+            scheduler_mmap.unlink()
 
             # Create primary tier (CPU-based)
             # The unpartitioned tier stores a full worker KV row for each

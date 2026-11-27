@@ -22,6 +22,7 @@ from vllm.v1.core.long_context_kv import (
     STATE,
     GiB,
     plan_long_context_capacity,
+    union_gather_bytes,
     validate_long_context_plan,
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec
@@ -148,14 +149,16 @@ def expected(n, max_len, *, replay, shard, hot_gib, host_gib):
     """Hand-written capacity arithmetic for the table cases (main K/V in
     the host store: a history block costs index pages + store metadata, and
     the history IDs never outnumber the host pages, one of which backs the
-    null block)."""
+    null block). The default union prefill gather keeps its transient
+    workspace out of the history budget."""
     state_per_req = 6 * (2 if replay else 9) + 2 + 15
     state_blocks = n * state_per_req
     index_bytes = INDEX_BLOCK_BYTES // (2 if shard else 1) + HOST_META_BYTES
     geo = geometry(max_model_len=max_len, speculative_blocks=0 if replay else 7)
     hot_groups = geo.hot_groups_for_bytes(int(hot_gib * GiB), n)
     hot_bytes = geo.hot_bytes_for_groups(hot_groups, n)
-    left = GPU_BUDGET - (state_blocks + 1) * STATE_BLOCK_BYTES - hot_bytes
+    staging = union_gather_bytes(geo, n)
+    left = GPU_BUDGET - (state_blocks + 1) * STATE_BLOCK_BYTES - hot_bytes - staging
     host_blocks = int(host_gib * GiB) // HOST_BLOCK_BYTES
     gpu_history = min(max(left // index_bytes - 1, 0), host_blocks - 1)
     history = -(-max_len // SPAN)

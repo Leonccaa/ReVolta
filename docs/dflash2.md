@@ -97,7 +97,8 @@ rule. `"greedy"` still works. MTP must stay `"greedy"`; see
   setting `context_kv_graph: false` also leaves an unset `context_pipeline` off.
 - **Do not enable** `fused_gdn_verify`, `fused_gdn_norm`, `fused_gdn_split` or
   `fused_gdn_combined_split`. They change the numerics and lowered sampled acceptance
-  in our tests.
+  in our tests. Enabling `fused_gdn_verify` together with `spec_state_replay: true`
+  is rejected at startup.
 - **Leave `--block-size` unset.** The automatic block size fits the drafter cache into the
   main KV slots (1664 tokens with 7 drafts at DCP2). An explicit block can leave the
   drafter only small blocks; startup logs a warning then.
@@ -127,10 +128,17 @@ rule. `"greedy"` still works. MTP must stay `"greedy"`; see
   `{"3": 3}` sweep, which measured about 15% faster at three requests. For
   mostly code, `[[1,7,7],[8,8,4]]` matches the old `{"8": 4}`, which measured
   best at eight requests.
-- DFlash with a schedule defaults to synchronous scheduling. Keep
-  `--no-async-scheduling` for GDN state replay. Explicit `--async-scheduling`
-  uses per-position GDN state when the executor and model support async.
-  DFlash2 requires PP1.
+- DFlash with a schedule defaults to synchronous scheduling; an explicit
+  `--async-scheduling` is accepted when the executor and model support async.
+  DFlash2 requires PP1. What async does to the GDN state depends on the
+  deployment: with SM70, AWQ weights, linear DFlash (DFlash2), GPU KV and no KV
+  connector, async automatically switches to the next-round native GDN commit
+  and keeps the state replay; every other combination, NVFP4 weights included,
+  keeps one state block per draft position under async and therefore uses more
+  KV. `--no-async-scheduling` remains the recommended setting. With explicit
+  async, the legacy `ngram_assist` adaptive q8/q16 lookup and the DDTree tree
+  verification are rejected at startup, while the native seven-token lookup
+  works with async.
 
 ## Native history lookup (optional)
 
@@ -164,7 +172,8 @@ into the DFlash2 speculative config above, retaining its model and other setting
 }
 ```
 
-Use `--no-async-scheduling` for the recommended GDN replay setup.
+Use `--no-async-scheduling` for the recommended GDN replay setup (see
+[Settings](#settings) for what async changes).
 
 - For batches of one to `max_requests` live requests at scheduler K=7,
   each eligible decode row attempts lookup independently. Prefill, structured
@@ -178,8 +187,8 @@ Use `--no-async-scheduling` for the recommended GDN replay setup.
   one to three requests use W=7, four use W=3, and five or more use W=4. Lookup
   bypasses batches of four or more requests, even without a ladder.
 - Native lookup can run with explicit async scheduling at fixed or scheduled
-  widths, subject to the existing executor and model constraints. Async uses
-  per-position GDN state. A DFlash schedule defaults to synchronous scheduling.
+  widths, subject to the existing executor and model constraints. A DFlash
+  schedule defaults to synchronous scheduling.
 - This version supports only `longest` and `first_token`. `nearest` and expansion
   are rejected, including expansion enabled together with lookup disabled.
 - Legacy `ngram_assist` and lookup environment settings remain compatible; no
@@ -280,7 +289,10 @@ GDN speculative state replay keeps two recurrent-state blocks per running reques
 - **Cost (0.1.4, measured in the same session):** about +0.44 ms per decoding step with greedy drafting when the target samples (30.05 to 30.49 ms per step at one request, 30 replayed agent turns); with greedy decoding about 1–4% lower throughput at one to four requests and level at eight. Outputs were identical with replay on and off (24 of 24 greedy streams, 30 of 30 sampled turns). With probabilistic drafting, recommended from 0.1.4, the replay costs about 0.8 ms per step (six real agent sessions at one request, 250 W), with outputs identical to replay off.
 - **Trade-off:** the capacity gain helps long contexts or several long requests at once. Explicitly disabling replay trades away that capacity and avoids the replay's per-step work.
 - **CUDA graph:** with replay on, the replay after sampling runs as a CUDA graph (`"spec_state_replay_graph": true`, the default). Without it, the replay's launches cost about 5 ms per step with sampling, because sampling has already drained the GPU queue. One graph is captured per verify shape, the second time the shape runs; with the `{"4": 3, "5": 4}` width policy that is eight graphs (one to eight requests). Each capture takes 35–90 ms once, at the step that first meets the shape. The graphs added no measurable GPU memory (peak 31,564 MiB per GPU with them, 31,580 MiB without, in the same benchmark). With all eight captured, eight concurrent 96K-token requests completed without preemption at 27% peak KV use, and GPU memory peaked at 31,884 of 32,768 MiB per GPU.
-- Replay needs Model Runner V2, `--mamba-cache-mode align`, synchronous scheduling and no pipeline parallelism; elsewhere it stays off with a log line.
+- Replay needs Model Runner V2, `--mamba-cache-mode align` and no pipeline
+  parallelism. Post-sampling replay needs synchronous scheduling; the async
+  route that keeps the GDN state is described in [Settings](#settings).
+  Elsewhere it stays off with a log line.
 
 ## What to expect
 

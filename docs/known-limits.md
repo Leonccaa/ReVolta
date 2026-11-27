@@ -141,17 +141,6 @@ GGUF are outside the build.
   the first message (`System message must be at the beginning.`). Agent stacks that send
   several system messages need to merge them.
 - **Allocator.** Keep `NCCL_GRAPH_REGISTER=0` with expandable allocator segments.
-- **CPU KV offload and restarts.** With CPU KV offload on, a normal stop can leave the
-  shared offload file `/dev/shm/vllm_offload_<id>.mmap` behind
-  ([#51](https://github.com/Leonccaa/ReVolta/issues/51)). Each file is the size of the CPU
-  pool and every start creates a new one, so repeated restarts in the same `/dev/shm`
-  fill it until a start fails. `--shutdown-timeout 0` (the default) stops the engine
-  before its cleanup runs. Use a positive `--shutdown-timeout`, or remove stale
-  `vllm_offload_*.mmap` files that no process has open before starting. A container
-  with its own IPC namespace drops its `/dev/shm` when it is removed. The host KV
-  region (`long_context_kv`, files `vllm_offload_host_v2_*.mmap`) is not affected: its
-  name is removed as soon as every engine process has mapped it, so the memory returns
-  to the system when the last process exits, even after `SIGKILL`.
 - **Sleep level 2.** Not supported on the reference setup (128 GiB host, PLE tables in host
   memory): it needs about 87 GiB of free host memory for the model buffers while about
   63 GiB is available. Sleep level 1 works.

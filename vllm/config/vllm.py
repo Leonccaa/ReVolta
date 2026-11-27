@@ -2604,11 +2604,48 @@ class VllmConfig:
                 )
                 and "VLLM_SM70_QWEN38_DUAL_COMPILE" not in os.environ
             ):
-                os.environ["VLLM_SM70_QWEN38_DUAL_COMPILE"] = "1"
-                logger.info_once(
-                    "Auto-enabling the SM70 Qwen3.8 dual-compile lane: "
-                    "large prefill and FULL decode graphs share one model."
-                )
+                # Without speculation the decode lane cannot trace a
+                # single-token FULL capture dynamically (issue #343), so skip
+                # auto-enabling when that is the largest FULL decode batch.
+                cudagraph_mode = self.compilation_config.cudagraph_mode
+                single_token_full_decode = False
+                if (
+                    self.speculative_config is None
+                    and not self.model_config.enforce_eager
+                    and (
+                        cudagraph_mode is None
+                        or cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+                    )
+                ):
+                    max_num_seqs = self.scheduler_config.max_num_seqs
+                    capture_sizes = self.compilation_config.cudagraph_capture_sizes
+                    if capture_sizes is not None:
+                        capture_sizes = [
+                            size for size in capture_sizes if size <= max_num_seqs
+                        ]
+                        largest_full_decode = (
+                            max(capture_sizes) if capture_sizes else None
+                        )
+                    elif self.compilation_config.max_cudagraph_capture_size is None:
+                        largest_full_decode = max_num_seqs
+                    else:
+                        largest_full_decode = min(
+                            max_num_seqs,
+                            self.compilation_config.max_cudagraph_capture_size,
+                        )
+                    single_token_full_decode = largest_full_decode == 1
+                if single_token_full_decode:
+                    logger.info_once(
+                        "Not auto-enabling the SM70 Qwen3.8 dual-compile "
+                        "lane: the largest FULL decode capture is a single "
+                        "token."
+                    )
+                else:
+                    os.environ["VLLM_SM70_QWEN38_DUAL_COMPILE"] = "1"
+                    logger.info_once(
+                        "Auto-enabling the SM70 Qwen3.8 dual-compile lane: "
+                        "large prefill and FULL decode graphs share one model."
+                    )
             if (
                 _is_sm70_qwen38_decode_compile_contract(
                     self.model_config,

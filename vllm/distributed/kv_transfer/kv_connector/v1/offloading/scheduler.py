@@ -122,6 +122,9 @@ class GroupOffloadConfig(NamedTuple):
     # group spanning more than one offloaded block; None for every other group.
     # Such groups follow SchedulerOffloadConfig.cpu_draft_offload.
     draft_window_tokens: int | None = None
+    # Sliding window (tokens) of a SlidingWindowSpec group, the boundary
+    # SlidingWindowManager.remove_skipped_blocks() frees on; None otherwise.
+    sliding_window_tokens: int | None = None
 
 
 def get_sliding_window_size_in_blocks(
@@ -285,6 +288,12 @@ class SchedulerOffloadConfig(NamedTuple):
                 isinstance(kv_spec, MambaSpec) and kv_spec.mamba_cache_mode == "align"
             )
 
+        def _sliding_window_tokens(group_idx: int) -> int | None:
+            kv_spec = spec.kv_cache_config.kv_cache_groups[group_idx].kv_cache_spec
+            if isinstance(kv_spec, SlidingWindowSpec):
+                return kv_spec.sliding_window
+            return None
+
         def _draft_window_tokens(
             group_idx: int, sliding_window_size_in_blocks: int | None
         ) -> int | None:
@@ -348,6 +357,7 @@ class SchedulerOffloadConfig(NamedTuple):
                         _requires_exact_boundary_source(idx)
                     ),
                     draft_window_tokens=_draft_window_tokens(idx, sw),
+                    sliding_window_tokens=_sliding_window_tokens(idx),
                 )
                 for idx, gpu_block_size in enumerate(spec.gpu_block_size)
                 if spec.kv_cache_config.kv_cache_groups[
@@ -1953,6 +1963,11 @@ class OffloadingConnectorScheduler:
                         group_state.offload_keys[b] for b in selected
                     )
                     continue
+                # The append-only mirror still holds the old IDs of blocks the
+                # core freed from the sliding window; never store from them.
+                start_block_idx = max(
+                    start_block_idx, self._first_held_block(req_status, group_config)
+                )
                 if num_blocks <= start_block_idx:
                     continue
                 offload_keys = group_state.offload_keys[start_block_idx:num_blocks]
@@ -2185,7 +2200,7 @@ class OffloadingConnectorScheduler:
         deferred.update(passed)
         if not deferred:
             return []
-        first_held = self._first_held_draft_block(req_status, group_config)
+        first_held = self._first_held_block(req_status, group_config)
         wanted = self._draft_window_blocks(req_status, group_config)
         selected: list[int] = []
         for block_idx in sorted(deferred):
@@ -2208,7 +2223,7 @@ class OffloadingConnectorScheduler:
         for group_config in self.config.kv_group_configs:
             if group_config.draft_window_tokens is None:
                 continue
-            first_held = self._first_held_draft_block(
+            first_held = self._first_held_block(
                 req_status, group_config, num_computed_tokens=processed_tokens
             )
             offered = req_status.draft_reofferable.get(group_config.group_idx)
@@ -2225,7 +2240,7 @@ class OffloadingConnectorScheduler:
         # late store. Keep boundaries overlapping any draft group's window.
         req_status.draft_window_boundaries.intersection_update(live_boundaries)
 
-    def _first_held_draft_block(
+    def _first_held_block(
         self,
         req_status: RequestOffloadState,
         group_config: GroupOffloadConfig,
@@ -2235,8 +2250,11 @@ class OffloadingConnectorScheduler:
         # SlidingWindowManager.remove_skipped_blocks frees on processed tokens,
         # which never exceed num_computed_tokens here. The connector mirror can
         # still contain non-null IDs for those freed (and possibly reused) pages.
-        window_tokens = group_config.draft_window_tokens
-        assert window_tokens is not None
+        # Returns 0 for groups the core never frees this way (full attention,
+        # Mamba state), so callers can apply it unconditionally.
+        window_tokens = group_config.sliding_window_tokens
+        if window_tokens is None:
+            return 0
         if num_computed_tokens is None:
             num_computed_tokens = req_status.req.num_computed_tokens
         num_skipped_tokens = max(0, num_computed_tokens - window_tokens + 1)
@@ -2532,7 +2550,7 @@ class OffloadingConnectorScheduler:
                         if groups:
                             ids.extend(groups[group.group_idx])
                         factor = self.config.block_size_factor
-                        first_held = self._first_held_draft_block(status, group)
+                        first_held = self._first_held_block(status, group)
                         deferred = status.draft_deferred.get(group.group_idx, set())
                         frontier = max(
                             status.draft_frontier.get(group.group_idx, 0),
@@ -3354,7 +3372,7 @@ class OffloadingConnectorScheduler:
                     offered = status.draft_reofferable.get(group_idx)
                     if not offered:
                         continue
-                    first_held = self._first_held_draft_block(status, group_config)
+                    first_held = self._first_held_block(status, group_config)
                     status.draft_deferred.setdefault(group_idx, set()).update(
                         b for b in offered if b >= first_held
                     )

@@ -1,137 +1,85 @@
 # Multimodal input limits
 
-Media admission limits apply in the frontend. Qwen4Exp also defaults to a smaller
-image processing budget, as described below. EXIF orientation is applied when
-loading encoded images.
-Transparent images (RGBA, LA, palette transparency and PNG tRNS) are composited
-onto white before RGB conversion. White preserves the existing RGBA behavior
-and matches the Qwen HF example workflow's
-[`qwen_vl_utils.to_rgb`](https://github.com/QwenLM/Qwen3-VL/blob/main/qwen-vl-utils/src/qwen_vl_utils/vision_process.py).
-The generic Transformers RGB converter does not itself composite alpha.
-`rgba_background_color` in image media IO kwargs can select another RGB color.
+This page lists the limits that apply to image and video input and how an operator changes them: how many items a request may contain, how large images are resized, how many video frames are sampled, and the per-request byte and pixel budgets. It applies to Qwen3.8 Flash-Next, which takes images and video but not audio.
 
-## Defaults and overrides
+## Item counts per request
 
-Unspecified modality counts default to **8 images, 1 video and 1 audio item**
-(except on V100 with FlashAttention-V100, see below); other inherited modalities
-retain 999. `--limit-mm-per-prompt` overrides each
-specified modality; a zero count disables that modality. For example,
-`--limit-mm-per-prompt '{"video": 1}'` also limits images to 8 and audio to 1.
-The 8-image limit counts the **whole request**, including images in historical
-chat messages, rather than only the latest message.
-These limits remain independent of the aggregate raw-media item ceiling below.
-Embedding-only and UUID-only cache references do not fetch raw media and are
-outside the raw-media byte accounting; their existing frontend limits still apply.
+On V100 the engine allows only **1 image and no video** per request unless you set `--limit-mm-per-prompt`. This V100 default applies on pre-Ampere GPUs when the V100 attention path is active (`VLLM_SM70_FLASH_ATTN_V100=1`, the default) and the attention backend is unset, `FLASH_ATTN_V100` or `FLASHINFER_SM70`. The engine then logs `Using SM70 Flash-V100 multimodal default: image=1, video=0`, and a second image is rejected with `At most 1 image(s) may be provided in one prompt`.
 
-**V100 with FlashAttention-V100 (the ReVolta target).** On pre-Ampere GPUs with the
-V100 attention path (`VLLM_SM70_FLASH_ATTN_V100=1`, the default, and the attention
-backend unset, `FLASH_ATTN_V100` or `FLASHINFER_SM70`), the engine replaces the
-defaults above:
+So always set `--limit-mm-per-prompt` on V100, and include `"video"`: a value that leaves out `"video"` sets video to 0 (disabled).
 
-- Without `--limit-mm-per-prompt`, it allows **1 image and no video** per request and
-  logs `Using SM70 Flash-V100 multimodal default: image=1, video=0`. A second image is
-  rejected with `At most 1 image(s) may be provided in one prompt`.
-- With `--limit-mm-per-prompt` that leaves out `"video"`, video is set to 0 (disabled).
-  Other modalities the value leaves out keep the defaults above.
+- The [reference launch](../docs/getting-started.md#4-launch) uses `--limit-mm-per-prompt '{"image": 16, "video": 1}'`.
+- `--limit-mm-per-prompt '{"image": 8, "video": 1}'` gives the generic vLLM counts. A lower image count leaves more host memory for bursts of large images.
 
-This V100 behaviour is the same as in 0.1.0 and 0.1.1, and 0.1.2 through 0.1.4 keep it.
-Set `--limit-mm-per-prompt` explicitly and include `"video"`. To copy:
+Other rules:
 
-- the generic default counts (8 images, 1 video, 1 audio item):
-  `--limit-mm-per-prompt '{"image": 8, "video": 1, "audio": 1}'`. Qwen3.8 Flash-Next has
-  no audio input, so the shorter `--limit-mm-per-prompt '{"image": 8, "video": 1}'` — the
-  form used in [Configuration](../docs/configuration.md#launch-options) and
-  [Support and known limits](../docs/known-limits.md) — gives the same image and video
-  counts;
-- the reference deployment, as in the README launch command:
-  `--limit-mm-per-prompt '{"image": 16, "video": 1}'` (Qwen3.8 Flash-Next has no audio input).
+- The count covers the **whole request**, including images in earlier chat messages, not only the latest message.
+- A count of zero disables that modality.
+- Modalities that the option leaves out default to 8 images and 1 audio item, and to 1 video except on V100 (where video becomes 0); other modalities default to 999. For example, `'{"video": 1}'` allows 8 images.
+- These counts are separate from the request-wide item ceiling `VLLM_MAX_MEDIA_REQUEST_ITEMS` (below). Count overrides cannot bypass the byte, pixel or frame ceilings.
+- Embedding-only and UUID-only cache references do not fetch raw media and are outside the raw-media byte accounting; the count limits still apply to them.
 
-The image resizing below applies on V100 too.
+## Image size
 
-Qwen4Exp defaults to **1,048,576 pixels (1024 × 1024 in area) per image** at the
-HF image processor. Larger decoded images are resized, rather than rejected by
-this processing budget. HF's existing `smart_resize` preserves the aspect ratio
-subject to alignment to 32-pixel multiples. The checkpoint's existing
-preprocessing still applies, including alignment and minimum-size rules;
-for example, 800 × 600 still becomes 800 × 608. Small text can become blurry
-when a large image is reduced. Crop the relevant region or raise the processing
-budget when fine detail matters. Near the area boundary, even a source image
-below 1,048,576 pixels can change if HF's 32-pixel rounding would otherwise put
-it over the budget. For example, 977 × 1073 changes from 992 × 1088 under the
-checkpoint budget to 960 × 1056 under the new budget.
+The model's image processor resizes each image to at most **1,048,576 pixels (1024 × 1024 in area)**. Larger decoded images are resized, not rejected. HF's `smart_resize` keeps the aspect ratio and aligns both sides to multiples of 32 pixels, and the checkpoint's other preprocessing rules still apply; for example, 800 × 600 becomes 800 × 608. Near the limit, even a smaller image can change size because of the 32-pixel rounding: 977 × 1073 becomes 960 × 1056 under this budget, against 992 × 1088 under the checkpoint's own budget.
 
-An omitted or empty `--mm-processor-kwargs '{}'` selects this default. Explicit
-image size settings (`size`, `max_pixels`, `min_pixels`, or `do_resize`, including
-settings inside `images_kwargs`) retain operator precedence. To restore the
-checkpoint's 16,777,216-pixel image budget, use:
+Small text can become blurry when a large image is reduced. Crop the relevant region, or raise the budget when fine detail matters. To restore the checkpoint's 16,777,216-pixel budget:
 
 ```bash
 --mm-processor-kwargs '{"images_kwargs": {"size": {"longest_edge": 16777216, "shortest_edge": 65536}}}'
 ```
 
-The image default leaves the video processor's size unchanged. Generic top-level
-size overrides can also affect video processing through HF's existing routing;
-use `images_kwargs` for an image-only override. Startup logs report the effective
-image pixel budget and its source. The image dummy profile uses this same budget
-(1024 maximum image tokens by default instead of 16384 for the checkpoint).
-Encoder and KV memory capacity still depend on enabled video inputs and measured
-GPU allocations; a smaller image budget does not imply a fixed KV increase.
+- An omitted or empty `--mm-processor-kwargs` selects the 1,048,576-pixel default. Explicit `size`, `max_pixels`, `min_pixels` or `do_resize` settings, including those inside `images_kwargs`, take precedence.
+- The startup log reports the effective budget and its source: `Qwen4Exp image max_pixels=<value> source=<default|operator|request> do_resize=<value>`.
+- The default changes only the image processor. Top-level size settings can also reach the video processor through HF's routing; use `images_kwargs` for an image-only change.
+- Memory profiling uses the same budget: at most 1,024 image tokens per image by default, against 16,384 with the checkpoint's budget. A smaller image budget does not by itself guarantee a larger KV cache; encoder and KV memory also depend on video input and the measured GPU allocations.
 
-| Server environment variable | Default | Scope |
+## Video frames
+
+The video loader samples **16 frames** per video by default. The reference launch states this explicitly with `--media-io-kwargs '{"video": {"num_frames": 16}}'`. An operator can set `num_frames` or `fps` there instead. When a trusted request overrides one of them, the other inherited field is cleared. `num_frames=-1` loads all frames only when that count fits the frame ceiling and the decode budget; this is checked before the frames are allocated.
+
+The frame ceiling (`VLLM_MAX_VIDEO_FRAMES`, default 64) and the decode budget apply after these settings are merged. Video backends that cannot account for frames before decoding are rejected while the decode budget is enabled.
+
+## Request budgets
+
+These server environment variables bound the media in one request. Set a variable to zero to disable that ceiling. Requests cannot raise them.
+
+| Variable | Default | Scope |
 | --- | ---: | --- |
 | `VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB` | 256 MiB | One remote response, including decompressed HTTP content and cached response bytes |
-| `VLLM_MAX_MEDIA_REQUEST_BYTES` | 268435456 B (256 MiB) | Aggregate encoded bytes from HTTP, data URLs, files and download-cache hits |
-| `VLLM_MAX_MEDIA_REQUEST_DECODE_BYTES` | 536870912 B (512 MiB) | Aggregate image and sampled-video raster accounting |
-| `VLLM_MAX_MEDIA_REQUEST_ITEMS` | 32 | Aggregate fetched raw-media items across modalities |
-| `VLLM_MAX_IMAGE_PIXELS` | 16777216 | Pixels per image or video frame |
+| `VLLM_MAX_MEDIA_REQUEST_BYTES` | 268435456 B (256 MiB) | All encoded bytes in the request, from HTTP, data URLs, files and download-cache hits |
+| `VLLM_MAX_MEDIA_REQUEST_DECODE_BYTES` | 536870912 B (512 MiB) | All decoded image and sampled-video rasters in the request, counted at four bytes per pixel |
+| `VLLM_MAX_MEDIA_REQUEST_ITEMS` | 32 | All fetched raw-media items in the request, across modalities |
+| `VLLM_MAX_IMAGE_PIXELS` | 16777216 | Pixels per image or video frame, before resizing |
 | `VLLM_MAX_VIDEO_FRAMES` | 64 | Sampled frames per video |
 
-These environment values are operator settings. Set zero to disable a particular
-ceiling explicitly. Request `media_io_kwargs` cannot raise them. Count overrides
-also cannot bypass byte, pixel or frame ceilings. The single-response limit
-prevents one large download; the request limit prevents many smaller inputs.
-Repeated URLs and cache hits are charged again. Failed attempts conservatively
-retain their charges for the current request; a new request has a fresh budget.
-HTTP size errors are non-retryable validation failures and map to HTTP 400.
+- The single-response limit stops one large download; the request limits stop many smaller inputs.
+- Images are charged at their original size, before resizing. The default decode budget fits 16 frames of 3840 × 2160 (530,841,600 B) or several 12-megapixel images. With 16 images per request, each image can be at most 8,388,608 pixels (536,870,912 B / 16 / 4 B per pixel) before the request is rejected; raise `VLLM_MAX_MEDIA_REQUEST_DECODE_BYTES` if your clients send many large photos.
+- The decode budget does not promise that a long source video fits the separate 256 MiB download limit.
+- Repeated URLs and cache hits are charged again. Failed attempts keep their charges for the current request; a new request starts with a fresh budget.
+- Size errors are validation failures: the server returns HTTP 400 and the client should not retry unchanged.
 
-Non-empty per-request `mm_processor_kwargs` and `media_io_kwargs` are rejected
-with HTTP 400 by default. Only deployments with trusted API clients should enable
-`--trust-request-mm-kwargs` to allow these overrides. Omitted values, `null` and
-empty dictionaries retain their previous behavior. Server-level
-`--mm-processor-kwargs` and `--media-io-kwargs` remain operator settings.
-The same policy applies to render, tokenize, pooling and `run-batch` frontends;
-the local Python `LLM` API keeps accepting caller-controlled overrides.
+## Per-request overrides
 
-`--media-io-kwargs '{"video": {"num_frames": 16}}'` remains a default sampling
-setting. With `--trust-request-mm-kwargs`, requests can override `num_frames` or
-`fps` using the existing merge rules: overriding either clears the other
-inherited field. The loader's fallback
-is 16 frames when `num_frames` is omitted. The operator's 64-frame ceiling
-and raster budget apply after these merges. `num_frames=-1` can load all frames only when the actual selected count fits
-the frame ceiling and raster budget; this is checked before frame allocation.
-Backends without pre-decode accounting are rejected while the decoded budget is
-enabled. This does not add a support promise for inherited decoder backends.
+Requests that carry a non-empty `mm_processor_kwargs` or `media_io_kwargs` are rejected with HTTP 400 by default. Enable `--trust-request-mm-kwargs` only when all API clients are trusted. Omitted values, `null` and empty dictionaries are accepted. The server-level `--mm-processor-kwargs` and `--media-io-kwargs` remain operator settings. The same policy applies to the render, tokenize, pooling and `run-batch` frontends; the local Python `LLM` API keeps accepting caller-controlled overrides.
 
-## Allocation boundaries
+## Image decoding
 
-Remote bodies are streamed in 64 KiB chunks. Content-Length is checked before
-reading; missing lengths and gzip/deflate responses are counted incrementally.
-Decompression steps have bounded output. Files and cached responses are also
-read incrementally; data URL size is checked before base64 allocation.
+- EXIF orientation is applied when encoded images are loaded.
+- Transparent images (RGBA, LA, palette transparency and PNG tRNS) are composited onto white before RGB conversion. This matches the Qwen example workflow's [`qwen_vl_utils.to_rgb`](https://github.com/QwenLM/Qwen3-VL/blob/main/qwen-vl-utils/src/qwen_vl_utils/vision_process.py); the generic Transformers RGB converter does not composite alpha. `rgba_background_color` in the image `--media-io-kwargs` selects another RGB color.
 
-Images are charged at four bytes per pixel before EXIF processing or raster
-loading. The common OpenCV/PyAV video loader checks the selected frame count and
-frame dimensions before allocating output frame arrays. JPEG frame sequences
-charge each image before loading and check frame count before stacking.
-The default decoded budget accommodates 16 frames of 3840 x 2160 at four bytes
-per pixel (530841600 B), or several common 12-megapixel images. It does not
-promise that a long source video fits the separate 256 MiB download ceiling.
+## Memory boundaries
 
-These are admission and retained-data limits, not a hard process RSS ceiling.
-Video codecs can allocate internal reference frames and scratch buffers; inaccurate
-container dimensions can only be detected after decoding. Image conversion,
-frame stacking and joining encoded chunks also create temporary copies.
-Concurrent requests each have their own budget. Operators must additionally
-bound HTTP request bodies, concurrent requests and process/container memory.
-Audio encoded bytes are counted; inherited audio decode allocation is outside
-this image/video change. Cache identity and rejection recovery are unchanged.
+The budgets above limit admitted and retained media data. They are not a hard ceiling on process memory.
+
+- Remote bodies are streamed in 64 KiB chunks. `Content-Length` is checked before reading; missing lengths and gzip or deflate responses are counted while reading, and decompression output is bounded. Files and cached responses are also read incrementally, and a data URL's size is checked before base64 decoding.
+- Images are charged before EXIF processing or raster loading. The common OpenCV and PyAV video loader checks the selected frame count and frame size before allocating frame arrays. JPEG frame sequences charge each image before loading and check the frame count before stacking.
+- Video codecs can allocate internal reference frames and scratch buffers, and inaccurate container dimensions are detected only after decoding. Image conversion, frame stacking and joining encoded chunks also make temporary copies.
+- Each concurrent request has its own budget. Image and video preprocessing runs in the API server process; see [System memory and storage](../docs/configuration.md#system-memory-and-storage) for a measured burst. Also bound HTTP request bodies, concurrent requests and process or container memory.
+- Encoded audio bytes are counted, but audio decoding is outside these image and video limits.
+
+## See also
+
+- [Getting started](../docs/getting-started.md): the reference multimodal launch options
+- [Launch options](../docs/configuration.md#launch-options)
+- [Support and known limits](../docs/known-limits.md)

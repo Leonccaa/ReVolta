@@ -1,6 +1,6 @@
 # Speculative decoding
 
-ReVolta speeds up generation with speculative decoding. A small draft model proposes several tokens, and the target model checks them in one forward pass; each accepted draft token saves a full decoding step. ReVolta supports two draft methods: MTP, which the reference launch uses, and DFlash2. Without `--speculative-config`, speculative decoding stays off. This page helps you choose between them, lists what the ReVolta profile turns on for each, and is the reference for MTP settings.
+ReVolta speeds up generation with speculative decoding. A small draft model proposes several tokens, and the target model checks them in one forward pass; each accepted draft token saves a full decoding step. ReVolta supports two draft methods: MTP, which the reference launch uses, and DFlash2. Without `--speculative-config`, speculative decoding stays off. This page helps you choose between them and is the reference for MTP settings.
 
 Prerequisite: a working [reference launch](getting-started.md). It already uses MTP, so you need nothing else to start.
 
@@ -9,12 +9,9 @@ Prerequisite: a working [reference launch](getting-started.md). It already uses 
 | | MTP (reference launch) | DFlash2 (optional) |
 | --- | --- | --- |
 | Draft model | A multi-token prediction (MTP) layer trained with the model, such as the `mtp-fp8/` draft in the AWQ checkpoints; see [Checkpoints](checkpoints.md) for the draft that goes with each checkpoint | A separate drafter, [incoai/Qwen3.8-Flash-Next-DFlash2](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2): five sliding-window layers with a 2,048-token window |
-| Draft tokens per step | 4 in the reference configuration (MTP4); NVFP4 is also tested with 5 (MTP5) | 7, taken from the drafter's 8-token block |
+| Draft tokens per step | 4 in the reference configuration (MTP4), fewer when more requests run; NVFP4 is also tested with 5 (MTP5) | Up to 7, taken from the drafter's 8-token block, fewer when more requests run |
 | Drafting | Greedy | Probabilistic, set automatically |
 | Draft KV cache | One attention layer over the whole context, in the target's KV format (INT8 by default) | The 2,048-token window only, in FP16 |
-| Default draft-width schedule | `[[1,3,4],[4,8,3]]` for MTP4; none for other widths | `[[1,3,7],[4,4,3],[5,8,4]]` |
-| GDN state replay | On | On |
-| Other automatic settings | KV-only draft prefill; the wide verifier for AWQ MTP4 under the conditions [below](#what-the-profile-turns-on-for-mtp) | Sparse target rejection, native history lookup for single requests, verifier fast paths |
 | Weights and KV modes | AWQ and NVFP4; GPU KV and Host KV | AWQ and NVFP4; GPU KV and Host KV |
 | Extra setup | None | Download the drafter and make a draft view |
 
@@ -39,41 +36,22 @@ Stay with MTP when:
 
 Greedy output differs between the two methods at near-ties, because they verify different numbers of tokens and use different kernels for some batch sizes. The measurements behind these statements, with their versions and conditions, are in [Performance](performance.md#dflash2-against-mtp4-on-pcie-012).
 
-## What to expect in 0.2.0
-
-Measured with 0.2.0 on four V100 32 GB PCIe GPUs behind one PCIe switch, TP4 + DCP2, INT8 KV, `--gpu-memory-utilization 0.956` and `--max-model-len 524288`.
-<!-- TODO(0.2.0-acceptance): workload, power cap and sampling settings for this table -->
-
-| Configuration | Output tokens/s at 1 / 4 / 8 requests | GPU KV pool, tokens |
-| --- | --- | --- |
-| AWQ + MTP4, GPU KV (reference configuration) | <!-- TODO(0.2.0-acceptance): C1/C4/C8 output throughput, D+E1 --> | <!-- TODO(0.2.0-acceptance): GPU KV cache size in tokens, D+E1 --> |
-| AWQ + DFlash2, GPU KV (the maintainer's production form) | <!-- TODO(0.2.0-acceptance): C1/C4/C8 output throughput, C --> | <!-- TODO(0.2.0-acceptance): GPU KV cache size in tokens, C --> |
-| NVFP4 + MTP5, GPU KV | <!-- TODO(0.2.0-acceptance): C1/C4/C8 output throughput, E3a --> | <!-- TODO(0.2.0-acceptance): GPU KV cache size in tokens, E3a --> |
-| NVFP4 + DFlash2, GPU KV | <!-- TODO(0.2.0-acceptance): C1/C4/C8 output throughput, E3b --> | <!-- TODO(0.2.0-acceptance): GPU KV cache size in tokens, E3b --> |
-
-Results from earlier versions are in [Performance](performance.md).
-
 ## MTP settings
 
 The [reference launch](getting-started.md#4-launch) shows the complete MTP speculative config. The MTP draft and its views are described in [Checkpoints](checkpoints.md).
 
 ### What the profile turns on for MTP
 
-The ReVolta profile applies these defaults to `vllm serve` on four SM70 GPUs with TP4, FP16 activations and a Qwen3.8 Flash-Next checkpoint. Explicit values take precedence.
-
-- **Draft-width schedule.** With `num_speculative_tokens` 4, prefix caching on (the profile default) and no pipeline parallelism, the schedule `[[1,3,4],[4,8,3]]` is used unless you set one: four draft tokens for one to three running requests, three from four onward. Other widths get no schedule. See [Dynamic speculative decoding](dynamic-speculative-decoding.md#default-schedules).
-- **GDN state replay** (`gdn_state_replay`) with prefix caching on. When `--async-scheduling` is not given, it also selects synchronous scheduling. See [GDN state replay](#gdn-state-replay).
-- **Draft KV format.** The draft inherits the target's KV format, which is planar INT8 with `--kv-cache-dtype auto`.
-- **KV-only draft prefill** (`VLLM_SM70_MTP_KV_ONLY_PREFILL`, default `1`). In an eager step where every request is still in the middle of a chunked prefill and no draft tokens wait for verification, the draft only writes its KV for those chunks, which shortens the time to first token of long prompts. In a step where a prefill completes, the draft computes outputs only for the sampled rows (outside FULL CUDA graph replay), which shortens the time to the second token. Both need data parallelism 1. Set `0` for full draft prefill.
-- **Wide MTP verifier.** The profile turns it on only for AWQ g32 with MTP4 when all of these hold: data parallelism 1, DCP2, synchronous scheduling with GDN state replay, GPU KV (not Host KV mode; a CPU KV pool or disk tier is fine), and an interconnect that the engine runs as PCIe-switch P2P (not NVLink and not NCCL only). The reference configuration, with its 48 GiB CPU KV pool, qualifies on a PCIe-switch P2P system. The profile then enables `sm70_gdn_input_v154` in `--kernel-config`, `VLLM_SM70_MTP_GDN_NATIVE_VERIFY=1` and `VLLM_SM70_QWEN38_NATIVE_ROUTER_TOPK=1`, and raises `VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS` to 48. These kernels change the accumulation order, so output can differ at near-ties. See [AWQ MTP4 wide verifier](configuration.md#awq-mtp4-wide-verifier).
+For MTP the ReVolta profile adds the [default draft-width schedule](dynamic-speculative-decoding.md#default-schedules) for `num_speculative_tokens` 4, [GDN state replay](#gdn-state-replay), KV-only draft prefill (below) and, on PCIe switch P2P systems, the [AWQ MTP4 wide verifier](configuration.md#awq-mtp4-wide-verifier). The draft inherits the target's KV format, which is planar INT8 with `--kv-cache-dtype auto`. All profile values are in [ReVolta serving defaults](configuration.md#revolta-serving-defaults); explicit values take precedence.
 
 ### MTP settings you can change
 
-- **`num_speculative_tokens`.** 4 is the reference width. For another width, the profile adds no schedule, so either pass one or accept a fixed width. The 0.2.0 acceptance ran MTP5 with `"num_speculative_tokens_per_batch_size": [[1,3,5],[4,8,3]]`. With INT8 or `fp8_per_token_head` KV and a schedule, the profile raises the CUDA graph reserve when `num_speculative_tokens` is 5 or more, even if every schedule entry is smaller.
+- **`num_speculative_tokens`.** 4 is the reference width. For another width, the profile adds no schedule, so either pass one or accept a fixed width. The 0.2.0 acceptance ran MTP5 with `"num_speculative_tokens_per_batch_size": [[1,3,5],[4,8,3]]`. With 5 or more, the [CUDA graph reserve](configuration.md#cuda-graph-reserve) is larger.
 - **`kv_cache_dtype` in `--speculative-config`.** Set `"float16"` for an FP16 draft KV cache instead of the inherited format. FP16 draft KV takes more GPU memory per token, so the KV pool is smaller. It is accepted with an INT8, `fp8_per_token_head` or scalar `fp8_e4m3` target, on Model Runner V2 with DCP1 or DCP2, prefill context parallelism 1, no pipeline parallelism, the hybrid KV cache manager enabled, and no KV connector other than the built-in `OffloadingConnector` with `kv_role` `kv_both`. Other mixed formats fail at startup with the reason. In Host KV mode an FP16 draft keeps its history on the GPU; see [KV offload](kv-offload.md).
-- **`draft_sample_method`.** Keep the default, `"greedy"`. The fast MTP draft paths (local argmax and the QPN8 draft head) need greedy drafting, and probabilistic MTP drafting corrupted output at temperature above 0 with more than two concurrent requests upstream ([1CatAI/1Cat-vLLM#656](https://github.com/1CatAI/1Cat-vLLM/issues/656)). This setting only affects drafting; clients can still use any sampling parameters.
+- **`draft_sample_method`.** Keep the default, `"greedy"`: the fast MTP draft paths need it, and probabilistic MTP drafting can corrupt output ([details](configuration.md#speculative-decoding)). Clients can still use any sampling parameters.
 - **`"gdn_state_replay": false`** keeps one recurrent state block per draft position. See [GDN state replay](#gdn-state-replay).
-- **`VLLM_1CAT_ADAPTIVE_MTP`** (experimental, default `off`). Adapts the draft width of a single decoding request to its recent acceptance, up to the schedule's width for one request. It needs a draft-width schedule, synchronous scheduling and Model Runner V2. `on` needs at least 3 draft tokens; `auto` turns it on only on SM70 with at least 5. It has no effect while more than one request is decoding.
+- **KV-only draft prefill** (`VLLM_SM70_MTP_KV_ONLY_PREFILL`, default `1`). In an eager step where every request is still in the middle of a chunked prefill and no draft tokens wait for verification, the draft only writes its KV for those chunks, which shortens the time to first token of long prompts. In a step where a prefill completes, the draft computes outputs only for the sampled rows (outside FULL CUDA graph replay), which shortens the time to the second token. Both need data parallelism 1. Set `0` for full draft prefill.
+- **Adaptive depth** for a single request (`VLLM_1CAT_ADAPTIVE_MTP`, experimental, off by default): see [Adaptive MTP depth](dynamic-speculative-decoding.md#adaptive-mtp-depth).
 - **Draft experts.** `mtp_expert_quantization` selects the draft's routed-expert format; see [MTP drafts](checkpoints.md#mtp-drafts).
 
 ## GDN state replay
@@ -82,7 +60,7 @@ Qwen3.8 Flash-Next mixes attention layers with recurrent GDN (gated delta networ
 
 Both methods turn replay on by default where it is supported: SM70, Model Runner V2, `--mamba-cache-mode align`, synchronous scheduling and no pipeline parallelism. Elsewhere it stays off with a log line. The startup log confirms it with `GDN speculative state replay: recurrent layers keep 2 state blocks per running request and replay accepted tokens after sampling.` With explicit `--async-scheduling`, MTP keeps one state block per draft position; for DFlash2 see [Scheduling](dflash2.md#scheduling).
 
-The replay for full verification batches runs as a CUDA graph, captured per batch shape (`gdn_state_replay_graph` in `--speculative-config`, default on for MTP); mixed batches replay without a graph. It adds a little GPU work per step. Output can differ from per-position state storage at near-ties because the two use different computation paths. With MTP4 (0.2.0rc11, four V100, TP4 + DCP2, sampling), replay made a decode round about 0.6 ms (2%) longer at one request, and turning it off used about 0.87 GiB more GPU memory per GPU with eight concurrent long-context requests. DFlash2 measurements are in [DFlash2 state replay](dflash2.md#state-replay).
+The replay for full verification batches runs as a CUDA graph, captured per batch shape (`gdn_state_replay_graph` in `--speculative-config`, default on for MTP); mixed batches replay without a graph. It adds a little GPU work per step. Output can differ from per-position state storage at near-ties because the two use different computation paths. With MTP4 (0.2.0rc11, four V100, TP4 + DCP2, sampling), replay made a decode round about 0.6 ms (2%) longer at one request, and turning it off used about 0.87 GiB more GPU memory per GPU with eight concurrent long-context requests.
 
 To turn replay off, set `"gdn_state_replay": false` for MTP or `"sm70_dflash2": {"spec_state_replay": false}` for DFlash2. The DFlash2 specifics are in [DFlash2 state replay](dflash2.md#state-replay).
 

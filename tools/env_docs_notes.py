@@ -109,9 +109,8 @@ NOTES: dict[str, dict[str, str]] = {
         since="0.2.0",
         range="0, 1",
         tradeoff=(
-            "Lets the MTP draft skip work during chunked prefill; see [What the "
-            "profile turns on for "
-            "MTP](speculative-decoding.md#what-the-profile-turns-on-for-mtp). It "
+            "Lets the MTP draft skip work during chunked prefill; see [MTP "
+            "settings](speculative-decoding.md#mtp-settings-you-can-change). It "
             "can change floating-point rounding. Set 0 for full draft prefill."
         ),
         metrics="",
@@ -604,7 +603,7 @@ NOTES: dict[str, dict[str, str]] = {
         tradeoff=(
             "CUDA graph memory reserved per GPU before the KV cache is sized. The "
             "profile picks the value by method, checkpoint and KV format; see [CUDA"
-            " graph reserve](checkpoints.md#cuda-graph-reserve). Raise it if the "
+            " graph reserve](#cuda-graph-reserve). Raise it if the "
             "startup log warns that the graphs took more than the reserve."
         ),
         metrics="",

@@ -1,6 +1,6 @@
 # DFlash2 speculative decoding
 
-This guide replaces MTP with DFlash2 and explains its settings. DFlash2 uses the [incoai DFlash2 drafter](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2) (tested revision `a22a1744`): five sliding-window layers, an 8-token block and a 2,048-token window. It is off by default; MTP stays the default. To decide between the two methods, see [Speculative decoding](speculative-decoding.md).
+This guide replaces MTP with DFlash2 and explains its settings. DFlash2 uses the [incoai DFlash2 drafter](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2) (tested revision `a22a1744`): five sliding-window layers, an 8-token block and a 2,048-token window. It is off unless you select it; the reference launch uses MTP. To decide between the two methods, see [Choosing a method](speculative-decoding.md#choosing-a-method).<a id="what-to-expect"></a>
 
 Prerequisites: a working [reference launch](getting-started.md) and its 512K target view from [step 2](getting-started.md#2-download-the-checkpoint-and-make-512k-views). DFlash2 works with AWQ and NVFP4 checkpoints and with GPU KV and Host KV; the 0.2.0 release tests cover it with GPU KV.
 
@@ -60,7 +60,7 @@ These defaults apply to `vllm serve` on four SM70 GPUs with TP4, FP16 activation
 | `num_speculative_tokens` | `7`, from the drafter's block size | Keep 7: the default schedule and native history lookup need it |
 | `draft_sample_method` | `"probabilistic"` | `"greedy"` also works |
 | `attention_backend` (drafter) | `"FLASH_ATTN_V100"` | |
-| `num_speculative_tokens_per_batch_size` | `[[1,3,7],[4,4,3],[5,8,4]]` | Your own schedule, or `null` for a fixed 7; see [Dynamic speculative decoding](dynamic-speculative-decoding.md) |
+| `num_speculative_tokens_per_batch_size` | The DFlash2 [default schedule](dynamic-speculative-decoding.md#default-schedules) | Your own schedule, or `null` for a fixed 7 |
 | `dflash2_lookup` | Native history lookup for single-request batches | See [Native history lookup](#native-history-lookup) |
 | `sm70_dflash2.sparse_target_rejection` | `true` | `false`; see [Sparse target rejection](#sparse-target-rejection) |
 | `sm70_dflash2.spec_state_replay` | `true` | `false`; see [State replay](#state-replay) |
@@ -70,8 +70,8 @@ These defaults apply to `vllm serve` on four SM70 GPUs with TP4, FP16 activation
 | `qsa_dcp_index_shard` in `--kernel-config` | `true` when unset and the model selects 512 index groups (Qwen3.8 Flash-Next): target QSA indexer keys are split over all tensor-parallel ranks; it takes effect at DCP2 | `false` |
 | `VLLM_SM70_DFLASH2_FUSED_QKV_PACK` | `1`: packs the verifier's Q/K/V rows with one kernel | `0` |
 | `VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP` | `1` with AWQ g32 weights, without expert parallelism or dual-batch overlap | `0` |
-| `VLLM_V2_CUDAGRAPH_MEM_MIB` | Sized for DFlash2 by the profile | Leave unset; values are in [CUDA graph reserve](checkpoints.md#cuda-graph-reserve) |
-| `VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS` | `0`: no single-request verifier tail graphs, which leaves their GPU memory to the KV cache | `1`; then also raise `VLLM_V2_CUDAGRAPH_MEM_MIB` above the profile value, to at least the graph size the startup log reports (see [CUDA graph reserve](checkpoints.md#cuda-graph-reserve)) |
+| `VLLM_V2_CUDAGRAPH_MEM_MIB` | Sized for DFlash2 by the profile | Leave unset; values are in [CUDA graph reserve](configuration.md#cuda-graph-reserve) |
+| `VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS` | `0`: no single-request verifier tail graphs, which leaves their GPU memory to the KV cache | `1`; then also raise `VLLM_V2_CUDAGRAPH_MEM_MIB` above the profile value, to at least the graph size the startup log reports |
 | Scheduling | Synchronous | See [Scheduling](#scheduling) |
 
 Types and defaults of the main `sm70_dflash2` keys are in [Configuration](configuration.md#speculative_configsm70_dflash2-keys).
@@ -86,17 +86,11 @@ Sparse target rejection verifies drafts against the target's top-20 logits inste
 
 ### Drafting
 
-DFlash2 drafts probabilistically by default: the drafter samples its proposals and the target accepts them with the standard rejection rule. Probabilistic drafting passed the 0.1.4 release gate at one to eight concurrent requests, at temperature 1 with thinking, including tool calls and structured output. `"draft_sample_method": "greedy"` still works. Clients can use any sampling parameters either way.
+DFlash2 drafts probabilistically by default: the drafter samples its proposals and the target accepts them with the standard rejection rule. `"draft_sample_method": "greedy"` also works. Clients can use any sampling parameters either way.
 
 ### Draft-width schedule
 
-The default schedule publishes 7 draft tokens for one to three running requests, 3 at four and 4 from five onward. With K above 0, DFlash2 still drafts its full block each step and publishes only the first K tokens. The best schedule depends on the language and concurrency of your workload; measure on it before changing the default. The schedule format is in [Dynamic speculative decoding](dynamic-speculative-decoding.md).
-
-### Settings to leave alone
-
-- **`--block-size`.** Leave it unset. The automatic block size lets the drafter cache share the main KV slots. An explicit block size can leave the drafter only small blocks; startup then logs a warning.
-- **`fused_gdn_verify`, `fused_gdn_norm`, `fused_gdn_split`, `fused_gdn_combined_split`.** Leave them off, their default for Flash-Next. They change the numerics and lowered sampled acceptance in our tests. Startup rejects `fused_gdn_verify` together with an explicit `spec_state_replay: true`.
-- **AWQ MoE row cap.** With DFlash2, the AWQ MoE layers read `VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_DFLASH_MAX_TOKENS` (default 48, the kernel maximum). `VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_MAX_TOKENS` applies only to MTP and non-speculative runs.
+The [default schedule](dynamic-speculative-decoding.md#default-schedules) publishes fewer draft tokens as more requests run. With K above 0, DFlash2 still drafts its full block each step and publishes only the first K tokens. The best schedule depends on the language and concurrency of your workload; measure on it before changing the default. The schedule format is in [Dynamic speculative decoding](dynamic-speculative-decoding.md).
 
 ## Scheduling
 
@@ -166,14 +160,10 @@ The metrics use the `vllm:dflash2_lookup_` prefix and the existing model and eng
 | `gate_pass_rounds_total` | Counter | The candidate's first token agrees with the drafter's first token |
 | `adopted_rounds_total` | Counter | The gate passed and at least one later draft position was replaced |
 | `match_length` | Histogram | Suffix-match length of candidates; bucket, count and sum |
-| `stats_pending` | Gauge | The producer has data that is not exported yet |
-| `stats_producer` | Gauge | Producer submission watermark, not the number of eligible rounds |
-| `stats_covered` | Gauge | Producer watermark covered by the latest applied snapshot |
-| `stats_last_export_timestamp_seconds` | Gauge | Time of the latest applied snapshot |
 
 Each eligible row counts as one attempt, so a three-request batch can add three attempts in one round. The match-length histogram has the bucket bounds 1, 2, 3, 4, 5, 6, 8, 12, 16, 32, 64, 128 and +Inf; misses are not counted in it. The adoption rate is `rate(vllm:dflash2_lookup_adopted_rounds_total[5m]) / rate(vllm:dflash2_lookup_eligible_rounds_total[5m])`; a zero denominator means no samples. Each request row that replaces at least one later draft position adds 1, however many positions it replaces; adoption does not count accepted tokens or saved rounds.
 
-Counters are exported with normal outputs while requests run. After the last request, the remaining counts wait until the next request or a normal shutdown; `stats_pending` and `stats_last_export_timestamp_seconds` show the lag. A restart can reset the counters, and an abnormal exit can lose the counts not yet exported.
+Counters are exported with normal outputs while requests run; after the last request, the remaining counts wait until the next request or a normal shutdown. The `stats_*` gauges in the same family only track this export. A restart resets the counters.
 
 ## State replay
 
@@ -184,14 +174,6 @@ DFlash2 replays the accepted tokens into the GDN state instead of storing a stat
 - `"sm70_dflash2": {"spec_state_replay": false}` keeps one state block per draft position. This trades GPU KV capacity for slightly less work per step. In Host KV mode, replay is also on by default, and an explicit `false` logs a warning.
 - Replay and the packed verifier (`fused_gdn_verify`, off for Flash-Next) exclude each other. With GPU KV, an unset `spec_state_replay` gives way to an explicit `fused_gdn_verify: true`. In Host KV mode an unset `spec_state_replay` becomes `true`, so an explicit `fused_gdn_verify: true` is rejected unless you also set `spec_state_replay: false`. An explicit `true` for both is always a configuration error.
 - `spec_state_replay_graph` (default `true`) captures the replay as a CUDA graph, once per full verification batch shape, the second time that shape runs. Mixed batches replay without a graph. Without the graph, the replay's launches cost several milliseconds per step after sampling. A top-level `gdn_state_replay_graph` value overrides this key.
-
-Earlier measurements, with Uncensored AWQ, scalar E4M3 KV and four V100 PCIe GPUs: in 0.1.3, turning replay on raised the GPU KV pool from 1,379,634 to 1,542,558 tokens (`--gpu-memory-utilization 0.95`, 512K context, 8 sequences). In 0.1.4, replay with its CUDA graph took 30.49 ms per step against 30.05 ms without replay (one request, sampling, 200 W), with identical outputs.
-
-## What to expect
-
-- Greedy output is not bitwise identical to MTP. It differs at near-ties, because a different number of tokens is verified and DFlash2 uses a different MoE route for some batch sizes.
-- English code and reasoning gain the most. In 0.1.2 measurements, Chinese was slower than MTP4 in almost every case, because the drafter was trained on English, and very long prompts also favoured MTP4.
-- 0.2.0 speed and GPU KV capacity for both methods are in [What to expect in 0.2.0](speculative-decoding.md#what-to-expect-in-020). Results from earlier versions are in [Performance](performance.md#dflash2-against-mtp4-on-pcie-012).
 
 ## See also
 

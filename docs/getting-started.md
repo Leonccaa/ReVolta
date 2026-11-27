@@ -56,9 +56,10 @@ from pathlib import Path
 from huggingface_hub import snapshot_download
 
 repo = "leoncca/Qwen3.8-Flash-Next-Uncensored-AWQ-g32"
-ckpt = Path("/data/revolta/models/Qwen3.8-Flash-Next-Uncensored-AWQ-g32")
+revision = "1fd7ab705731c9dacc3bcd5b5d15783c60706d64"
+ckpt = Path("/data/revolta/models") / repo.split("/")[-1]
 views = Path("/data/revolta/views")
-snapshot_download(repo, local_dir=ckpt, revision="1fd7ab705731c9dacc3bcd5b5d15783c60706d64")
+snapshot_download(repo, local_dir=ckpt, revision=revision)
 
 YARN = {"rope_type": "yarn", "factor": 2, "original_max_position_embeddings": 262144}
 
@@ -85,7 +86,7 @@ make_view(ckpt / "mtp-fp8", views / "draft-512k")
 EOF
 ```
 
-Keep the downloaded checkpoint: the views link to its files. YaRN in vLLM scales every request, short or long. If your requests stay within 262,144 tokens, you can skip the views; see [YaRN and native context](configuration.md#yarn-and-native-context). For other checkpoints, see [Checkpoints and KV formats](checkpoints.md).
+Keep the downloaded checkpoint: the views link to its files. YaRN in vLLM scales every request, short or long. If prompt and output together stay within 262,144 tokens, you can skip the views; see [YaRN and native context](configuration.md#yarn-and-native-context). For another checkpoint, change `repo`, `revision`, `views` and the draft line as described in [Prepare the checkpoint](checkpoints.md#prepare-the-checkpoint).
 
 ## 3. Environment
 
@@ -167,7 +168,7 @@ Notes:
 
 - Many of these options repeat values that the ReVolta profile or the engine already chooses, for example the scheduler limits, prefix caching, the attention backend and the compilation mode. They are written out so that the command matches the tested configuration. See [ReVolta serving defaults](configuration.md#revolta-serving-defaults) before changing them.
 - **KV cache.** `--kv-cache-dtype auto` selects planar INT8 for this model on V100. INT8 computes its scales at runtime, so no KV scale pack is needed. The MTP draft has no `kv_cache_dtype` of its own and inherits the target's INT8. To keep the draft KV in FP16 instead, add `"kv_cache_dtype": "float16"` to `--speculative-config`. For other KV formats, see [Choose the KV format](checkpoints.md#weight-and-kv-formats).
-- **Draft width.** With MTP K=4 and prefix caching, the engine uses four draft tokens per round for 1–3 running requests and three for 4–8. See [Dynamic speculative decoding](dynamic-speculative-decoding.md). To compare MTP with DFlash2, see [Speculative decoding](speculative-decoding.md).
+- **Draft width.** The profile lowers the number of draft tokens when more requests run; see [Dynamic speculative decoding](dynamic-speculative-decoding.md). To compare MTP with DFlash2, see [Speculative decoding](speculative-decoding.md).
 - **CPU KV pool.** `cpu_bytes_to_use` is the total for all four workers: 48 GiB, 12 GiB per worker. See [KV offload](kv-offload.md) for SSD tiers and other pool sizes.
 - **Wide verifier.** On a system whose GPUs share one PCIe switch with P2P, the profile also turns on the [AWQ MTP4 wide verifier](configuration.md#awq-mtp4-wide-verifier) for this configuration; the CPU KV pool does not prevent it. NVLink systems keep the standard verifier.
 - **Startup** takes roughly 10–15 minutes: weight and PLE loading, `torch.compile` and CUDA graph capture. <!-- TODO(0.2.0-acceptance): cold and warm startup time, D+E1 --> Later starts reuse the compile cache. The first start after an upgrade recompiles. On a first start with an empty compile cache, the reported GPU KV capacity can be one allocation unit lower than on later starts.

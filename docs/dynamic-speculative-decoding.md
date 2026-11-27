@@ -1,6 +1,6 @@
 # Dynamic speculative decoding
 
-Dynamic speculative decoding (DSD) changes the number of draft tokens per request, K, with the number of running requests. A decode batch of `C` requests with `K` draft tokens each has `C × (K + 1)` verification rows. At higher concurrency a smaller K reduces verification work and, with MTP, skips draft forwards. This page is the reference for the schedule that sets K: its defaults, its format and how it interacts with scheduling and CUDA graphs. For choosing a speculative method, see [Speculative decoding](speculative-decoding.md).
+Dynamic speculative decoding (DSD) changes the number of draft tokens per request, K, with the number of running requests. A decode batch of `C` requests with `K` draft tokens each has `C × (K + 1)` verification rows. At higher concurrency a smaller K reduces verification work and, with MTP, skips draft forwards. This page is the reference for the schedule that sets K: its defaults, its format and how it interacts with scheduling. For choosing a speculative method, see [Speculative decoding](speculative-decoding.md).
 
 DSD works with MTP and DFlash2 on Model Runner V2 (the default for Qwen3.8 Flash-Next) with no pipeline parallelism. MTP on a hybrid model such as Qwen3.8 Flash-Next also needs `--mamba-cache-mode align`.
 
@@ -40,14 +40,7 @@ The scheduler looks up K for the current batch size. That K controls the proposa
 - **MTP** runs K draft forwards. At K=0 it publishes no draft tokens but still updates the draft KV in its first forward.
 - **DFlash2** with K above 0 drafts its full 7-token block, including the drafter's context KV update, and publishes only the first K tokens. At K=0 it only updates the drafter's context KV and skips the draft query.
 
-## CUDA graphs
-
-With FULL decode graphs, ReVolta also captures the narrower verification widths that the schedule can reach:
-
-- **MTP** captures them for target verification and the first draft forward, at the existing request capture sizes. Later draft forwards use the existing single-token graphs.
-- **DFlash2** captures narrower target widths only at the request counts the schedule assigns to them, and keeps its drafter graphs.
-
-Batch shapes outside the capture grid use the normal graph dispatch. The profile sizes the CUDA graph memory reserve for the widest captured width; see `VLLM_V2_CUDAGRAPH_MEM_MIB` in [Configuration](configuration.md#values-applied-by-the-revolta-profile).
+With FULL decode graphs, ReVolta also captures the narrower verification widths that the schedule can reach. The profile sizes the [CUDA graph reserve](configuration.md#cuda-graph-reserve) for the widest captured width.
 
 ## Adaptive MTP depth
 

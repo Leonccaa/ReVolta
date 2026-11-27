@@ -113,20 +113,31 @@ Correct answers / questions on fixed subsets of GSM8K and MMLU.
 | E3a: NVFP4, MTP5 | <!-- TODO(0.2.0-acceptance): GSM8K correct/total, E3a --> | <!-- TODO(0.2.0-acceptance): MMLU correct/total, E3a --> |
 | E3b: NVFP4, DFlash2 | <!-- TODO(0.2.0-acceptance): GSM8K correct/total, E3b --> | <!-- TODO(0.2.0-acceptance): MMLU correct/total, E3b --> |
 
-For how closely each quantized checkpoint follows its BF16 parent, see [Quality measurements](#quality-measurements).
+For how closely each quantized checkpoint follows a BF16 reference, see [Quality measurements](#quality-measurements).
 
 ### Speculative decoding comparison
 
-To compare the two speculative methods in 0.2.0, read C against D+E1 for AWQ (DFlash2 against MTP4) and E3b against E3a for NVFP4 (DFlash2 against MTP5). The AWQ pair also differs in draft KV format and in the CPU KV pool and disk tier; see [Configurations](#configurations). The gap depends strongly on the prompts: earlier releases measured the largest DFlash2 gains on English and code and a loss on Chinese; see [DFlash2 against MTP4 on PCIe (0.1.2)](#dflash2-against-mtp4-on-pcie-012).
+To compare the two speculative methods in 0.2.0, read C against D+E1 for AWQ (DFlash2 against MTP4) and E3b against E3a for NVFP4 (DFlash2 against MTP5). The AWQ pair also differs in draft KV format and in the CPU KV pool and disk tier; see [Configurations](#configurations). Earlier per-prompt results are in [DFlash2 against MTP4 on PCIe (0.1.2)](#dflash2-against-mtp4-on-pcie-012); which method to choose is in [Choosing a method](speculative-decoding.md#choosing-a-method).
 
 ## Quality measurements
 
-These measurements show how closely each AWQ checkpoint follows its BF16 parent. They were measured with E4M3 KV and published with 0.1.0 (the exact build was not recorded); they have not been repeated with 0.2.0 or INT8 KV.
+These measurements show how closely each quantized checkpoint follows a BF16 reference. They were published with 0.1.0 (the exact build was not recorded) and have not been repeated with 0.2.0. All use scalar E4M3 KV unless the KV column says otherwise.
 
-| AWQ checkpoint | BF16 reference | KL ↓ | Top-1 agreement ↑ |
-| --- | --- | ---: | ---: |
-| Uncensored AWQ g32 | Its own parent | 0.0214 | 97.08% |
-| Base AWQ g32 | Base model | 0.0207 | 97.06% |
+Two BF16 references are used:
+
+- **Its own BF16 parent:** the model the checkpoint was quantized from. For Uncensored AWQ that is the uncensored fine-tune; for the other checkpoints it is the base model. The [model table in the README](../README.md#models) uses these values.
+- **The base BF16 model** for every format. Against this reference, the Uncensored rows include the effect of fine-tuning as well as quantization.
+
+| Checkpoint | KV | BF16 reference | KL ↓ | Top-1 agreement ↑ |
+| --- | --- | --- | ---: | ---: |
+| Uncensored AWQ g32 | E4M3 | Its own parent | 0.0214 | 97.08% |
+| Uncensored AWQ g32 | E4M3 | Base model | 0.0273 | 96.63% |
+| Uncensored AWQ g32 | INT8 | Base model | 0.0267 | Within 0.1 percentage point of E4M3 |
+| Base AWQ g32 | E4M3 | Base model (its parent) | 0.0207 | 97.06% |
+| Standard NVFP4 | E4M3 | Base model (its parent) | 0.0303 | 96.36% |
+| NVIDIA FP4-Local | E4M3 | Base model (its parent) | 0.0380 | 95.91% |
+
+A separate comparison against the Uncensored checkpoint's own parent put FP16 KV within 0.001 KL of E4M3: on the short set KL 0.0220 against 0.0214 with top-1 97.08% for both, and on the long set 0.0239 against 0.0238. NVIDIA NVFP4-QAD has not been measured.
 
 KL measures how much the next-token probabilities change. Top-1 agreement counts how often the most likely next token is the same. Both are distribution measurements, not task accuracy or a percentage of model ability retained.
 
@@ -136,14 +147,17 @@ Method:
 - Short set: 66 English, Chinese and code records; 39,101 tokens; contexts up to 4K.
 - Long set: three natural documents (English 32K, Chinese 64K and SQLite source 128K) with 14,336 sampled positions.
 - KL uses the top-20 log-probabilities plus a tail bucket. In one checked quantization, this estimate was 7–10% below the full-vocabulary KL.
+- The BF16 reference also uses YaRN, so these values do not show the effect of YaRN on short texts; see [YaRN and native context](configuration.md#yarn-and-native-context).
 
-These KL values are lower than published KLD figures for other quantizations of this model, mainly because only the routed experts are 4-bit: the PLE tables are FP8 and all other weights stay 16-bit. For comparison, llama.cpp Q8_0 of this model measures about 0.02 against BF16 on English text. Only English, Chinese and code were measured.
-
-The table above compares each checkpoint with its own BF16 parent. The [format comparison](checkpoints.md#quantization-comparison) uses the base BF16 model for every format. Results from other datasets or estimators should be compared separately.
+Compare results from other datasets or estimators separately.
 
 ## Earlier results
 
 These results were measured with earlier releases and are kept because 0.2.0 has no comparable measurement. 0.2.0 changed the default KV format to INT8, the serving defaults and both speculative methods, so these values do not describe 0.2.0.
+
+### Standard NVFP4 against AWQ (0.2.0rc12)
+
+Paired measurements on 0.2.0rc12 development builds (same configuration and time window, 4 × V100 PCIe, 250 W per GPU, TP4 + DCP2): NVFP4 and Uncensored AWQ ran at similar speed with MTP4 at one to eight requests and with DFlash2 at four and eight requests. With DFlash2 at one request, NVFP4 was slower (90.4 against 97.8 tok/s). NVFP4 weights took 21.48 GiB per GPU and Uncensored AWQ weights 22.01 GiB; the raw NVFP4 scales (the profile default) saved about 1.69 GiB per GPU compared with FP16 scales. <!-- TODO(0.2.0-acceptance): C1/C4/C8 tok/s, E3a NVFP4+MTP5 and E3b NVFP4+DFlash2 against D+E1 AWQ+MTP4 -->
 
 ### NVLink community result (0.1.2)
 

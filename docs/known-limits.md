@@ -43,7 +43,7 @@ The modes are described in [KV offload](kv-offload.md).
 | NVFP4 | MTP, 5 drafts | GPU KV | Reduced core tests | <!-- TODO(0.2.0-acceptance): acceptance result, E3a NVFP4 + MTP5 --> |
 | NVFP4 | DFlash2 | GPU KV | Reduced core tests | <!-- TODO(0.2.0-acceptance): acceptance result, E3b NVFP4 + DFlash2 --> |
 
-Hy4-flash has validation support: it was validated once, in 0.2.0rc13, and its model code ships unchanged in 0.2.0, but 0.2.0 release acceptance does not cover it. It is text-only and needs exactly four V100 32 GB GPUs. Image and video input, the checkpoint's DFly2 draft layers (skipped at load) and pipeline parallelism are not supported. See [Hy4-flash](hy4-flash.md).
+Text-only Hy4-flash has validation support and is outside the 0.2.0 release acceptance; its status and limits are in [Hy4-flash](hy4-flash.md).
 
 ## Known limits
 
@@ -56,23 +56,19 @@ A single greedy request is reproducible bit for bit with a fixed configuration. 
 - **GPU memory.** The reference launch uses `--gpu-memory-utilization 0.956`; see [Memory and capacity](configuration.md#memory-and-capacity). Retest memory use when you change concurrency or media limits.
 - **Host memory.** By default the AWQ PLE table needs about 48 GiB of pinned host memory. 80 GiB is the smallest tested container limit that passed memory stress on that path, with KV offload off (0.1.0). Budgets are in [System memory and storage](configuration.md#system-memory-and-storage).
 - **PLE cascade.** Cascade (`"ple_disk_cascade": true` in `--kernel-config`) spills the part of the PLE table that does not fit in host memory to the checkpoint files. It is not supported in 0.2.0, and the ReVolta profile keeps it off.
-- **Sleep level 2.** Not supported on the reference system (128 GiB host, PLE tables in host memory): it needs about 87 GiB of free host memory for the model buffers, while about 63 GiB is available (0.1.2). Sleep level 1 works.
+- **Sleep level 2.** Not supported on the reference system (128 GiB host, PLE tables in host memory): it needs more free host memory for the model buffers than is left. Sleep level 1 works.
 - **Small KV pools.** Startup rejects a KV pool that cannot hold one maximum-length request.
 
 #### Whole PLE table on disk (experimental)
 
-Instead of pinned host memory, the whole PLE table can stay as file-backed mappings of the checkpoint's safetensors files, read by a separate PLE process. This is a different path from cascade and is off by default. It was first checked in 0.1.3 and measured in 0.1.4. To try it:
+Instead of pinned host memory, the whole PLE table can stay as file-backed mappings of the checkpoint's safetensors files on a local SSD, read by a separate PLE process. This is a different path from cascade and is off by default. To try it:
 
 - Set `VLLM_PLE_CPU_OFFLOAD=1`, `VLLM_PLE_DISK_OFFLOAD=1` and `VLLM_SM70_QWEN38_HYBRID_PLE=0`.
 - Add `--safetensors-load-strategy lazy`.
-- Keep `"ple_disk_cascade": false` in `--kernel-config` (the checks also set `"ple_disk_release_pages": true`).
-- CPU KV offload (`--kv-transfer-config`) can stay on; 0.1.4 measured it with a 32 GiB CPU pool.
+- Keep `"ple_disk_cascade": false` in `--kernel-config`.
+- CPU KV offload (`--kv-transfer-config`) can stay on, with a smaller pool.
 
-Results:
-
-- **0.1.3, Uncensored AWQ, E4M3 KV.** MTP4 served 131K-token prompts, 4 concurrent requests and images under both a 64 GiB and a 32 GiB container memory limit, and a 491K-token prompt under 64 GiB; DFlash2 also served under 64 GiB. Peak container memory was about 54 GiB under the 64 GiB limit; under 32 GiB, startup peaked at 16.5 GiB. The GPU KV pool was about 7% smaller (1,073,265 tokens with MTP4). Greedy outputs matched the pinned-memory path; one of eight sampled single-request outputs diverged at a near-tie, so the two paths are not bitwise identical. If the PLE process dies, the client gets an error after about 9 s and the engine exits after 11–13 s instead of hanging.
-- **0.1.4, DFlash2 (recommended settings), Uncensored AWQ, E4M3 KV, 250 W, table on a local NVMe or SATA SSD.** Under a 64 GiB limit (NVMe and SATA), a 32 GiB limit (NVMe), and a 64 GiB limit with a 32 GiB CPU KV pool (NVMe and SATA), the engine started and served without running out of memory, and three 64-token greedy outputs matched the pinned-memory path exactly. Single-request decoding was 101.5–104.9 tokens/s against 135.5 with the pinned table, about 23–25% slower. A cold first token took 5.4–5.9 / 16.8–17.9 / 65.6–69.8 s at 8K / 32K / 131K prompt tokens, against 2.61 / 9.66 / 40.40 s, so 1.6–2.3 times as long. Once the table pages for a prompt had been read, the first token was within 2–3% of the pinned path (5–8% with the 32 GiB CPU KV pool). NVMe and SATA, and the 32 and 64 GiB limits, differed little. Peak memory of the serving container was about 57 GiB under the 64 GiB limit (62 GiB with the CPU KV pool) and 30 GiB under 32 GiB.
-- **Not measured:** a machine with little physical RAM (the limits above were set on the container that runs the engine), and long-running stability on this path.
+Measured in 0.1.4 (Uncensored AWQ, DFlash2, E4M3 KV, 250 W, table on a local NVMe or SATA SSD): the engine started and served under 64 GiB and 32 GiB container memory limits, also with a 32 GiB CPU KV pool under 64 GiB, and greedy outputs matched the pinned-memory path. Single-request decoding was about 23–25% slower (101.5–104.9 against 135.5 tokens/s), and a cold first token took 1.6–2.3 times as long; once the table pages for a prompt had been read, the first token was within 2–8% of the pinned path. Peak memory of the serving container was about 57 GiB under the 64 GiB limit and 30 GiB under 32 GiB. Not measured: a machine with little physical RAM (the limits were set on the container) and long-running stability.
 
 ### Long context
 
@@ -80,7 +76,7 @@ Release retrieval was tested at 211K tokens, and the production build retrieved 
 
 ### Speculative decoding
 
-- **DFlash2 CUDA graph reserve.** For DFlash2 the profile sets the graph reserve by itself. With the default INT8 KV (or `fp8_per_token_head`) it is 1000 MiB for AWQ (1150 MiB with a positive `--mixed-prefill-step-latency-ms`) and 1024 MiB for NVFP4; with scalar E4M3 or FP16 KV it is 1200 MiB. All tiers are in [CUDA graph reserve](checkpoints.md#cuda-graph-reserve). If you set `VLLM_V2_CUDAGRAPH_MEM_MIB` yourself, keep it at or above the graph size the startup log reports; a smaller reserve can run out of GPU memory under concurrent long prompts.
+- **CUDA graph reserve.** The profile sizes the graph reserve for the speculative method by itself ([values](configuration.md#cuda-graph-reserve)). If you set `VLLM_V2_CUDAGRAPH_MEM_MIB` yourself, keep it at or above the graph size the startup log reports; a smaller reserve can run out of GPU memory under concurrent long prompts.
 - **Standard NVFP4 draft.** Use the Uncensored FP8 MTP draft, which the NVFP4 scale pack includes, as in validation. See [MTP drafts](checkpoints.md#mtp-drafts).
 - **Structured output with MTP.** GPU tests produced valid JSON and tool outputs, also at the zero-draft step, where the grammar leaves no draft tokens.
 

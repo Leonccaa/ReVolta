@@ -42,9 +42,8 @@ The profile applies these defaults to the OpenAI-compatible server (`vllm serve`
 | `--long-prefill-token-threshold` | `4896`, capped at `--max-model-len` | Caps one long prefill when other requests may need the step. |
 | `--attention-backend` | `FLASH_ATTN_V100` | Selects the V100 FlashAttention backend for the target model. |
 | `gdn_state_replay` in `--speculative-config` | `true` for MTP with prefix caching | Replays accepted GDN tokens instead of storing one state per draft position. |
-| `num_speculative_tokens_per_batch_size` | `[[1,3,4],[4,8,3]]` for MTP with K=4 and prefix caching; `[[1,3,7],[4,4,3],[5,8,4]]` for DFlash2 with K=7 | Chooses the number of drafts from the number of scheduled requests. Each entry is `[first, last, drafts]`. See [Dynamic speculative decoding](dynamic-speculative-decoding.md). Other K values keep a fixed width. |
-| `dflash2_lookup` | Enabled for the seven-token DFlash2 selector: `longest`, suffix 5–16, 65,536-token window, `first_token` gate, statistics on, one live request | Uses committed token history to supplement the neural proposal. See [Native history lookup](dflash2.md#native-history-lookup). |
-| `sm70_dflash2` verifier options | `true` for the DFlash2 selector | Turns on `context_kv_graph`, `context_pipeline`, `verify_fastpath`, `fused_gdn_metadata`, `fused_smallq_metadata`, `grouped_smallq_metadata`, `sparse_target_rejection` and `spec_state_replay`. See [speculative_config.sm70_dflash2 keys](#speculative_configsm70_dflash2-keys). |
+| `num_speculative_tokens_per_batch_size` | A schedule for MTP with K=4 (with prefix caching) and for DFlash2 with K=7; other K values keep a fixed width | Chooses the number of drafts from the number of scheduled requests. The schedules are in [Default schedules](dynamic-speculative-decoding.md#default-schedules). |
+| `dflash2_lookup` and the `sm70_dflash2` verifier options | Native history lookup for single requests and the verifier fast paths, for the DFlash2 selector | See [What the profile sets](dflash2.md#what-the-profile-sets). |
 | `qsa_dcp_index_shard` in `--kernel-config` | `true` for DFlash2, and for MTP with Host KV (`long_context_kv.enabled`), when the model selects 512 index groups (Qwen3.8 Flash-Next) | Splits the target QSA indexer keys over all tensor-parallel ranks; it takes effect at DCP2. MTP with GPU KV keeps the replicated layout. It is part of the SSD page identity; see [Configure Host KV](kv-offload.md#configure-host-kv). |
 | `VLLM_SM70_QSA_GROUPED_LPT`, `VLLM_SM70_GDN_SKINNY_MPLAN` | `1` | Longest-first grouped QSA work and row-count-based GDN input plans. |
 | `VLLM_SM70_DFLASH2_FUSED_QKV_PACK` | `1` for DFlash2 | Fuses eligible post-convolution QKV packing. |
@@ -111,7 +110,7 @@ These fields go in `--speculative-config`.
 | Field | Type | Default | Range | Since | Status | Effect and trade-offs |
 | --- | --- | --- | --- | --- | --- | --- |
 | `draft_sample_method` | string | `greedy` | `greedy`, `probabilistic` | 1Cat | stable | How the drafter picks proposals. MTP must stay `greedy`: a probabilistic MTP draft corrupts output above `max_num_seqs=2` at temperature above 0 (1CatAI/1Cat-vLLM#656). For DFlash2, `probabilistic` is recommended; it passed the 0.1.4 release gate at 1–8 concurrent requests, temperature 1 with thinking, tool calls and structured output. This setting affects drafting and draft verification only; clients can still use any sampling parameters. |
-| `num_speculative_tokens_per_batch_size` | list of `[first, last, drafts]` | profile default above | inclusive ranges of the scheduled request count | 0.2.0 | stable | Chooses the number of drafts from the number of scheduled requests. See [Dynamic speculative decoding](dynamic-speculative-decoding.md). |
+| `num_speculative_tokens_per_batch_size` | list of `[first, last, drafts]` | profile default ([Default schedules](dynamic-speculative-decoding.md#default-schedules)) | inclusive ranges of the scheduled request count | 0.2.0 | stable | Chooses the number of drafts from the number of scheduled requests. See [Dynamic speculative decoding](dynamic-speculative-decoding.md). |
 | `kv_cache_dtype` | string | unset (inherit) | see [KV cache format](#kv-cache-format) | upstream | stable | Draft KV format; see the draft KV notes above. |
 
 DFlash2 options are in [DFlash2 speculative decoding](dflash2.md) and [speculative_config.sm70_dflash2 keys](#speculative_configsm70_dflash2-keys).
@@ -122,6 +121,25 @@ DFlash2 options are in [DFlash2 speculative decoding](dflash2.md) and [speculati
 | --- | --- | --- | --- | --- | --- | --- |
 | `--gpu-memory-utilization` | float | `0.956` | `0.92` | upstream | stable | Share of each GPU's memory the engine may use; the rest of the reserve sizes the KV cache. Keep the GPUs free of other processes that use GPU memory. 0.2.0 acceptance runs at `0.956` without multimodal stress. Measure again if you raise concurrency or media limits. |
 | `cpu_bytes_to_use` in `--kv-transfer-config` | integer bytes | `51539607552` (48 GiB) | none | upstream | stable | Size of the CPU KV pool, summed over all four workers (48 GiB = 12 GiB per worker). It needs host memory on top of the PLE table; see [System memory and storage](#system-memory-and-storage) and [KV offload](kv-offload.md). |
+
+### CUDA graph reserve
+
+Model Runner V2 cannot measure CUDA graph memory before it sizes the KV cache, so the ReVolta profile reserves graph memory per GPU through `VLLM_V2_CUDAGRAPH_MEM_MIB`. The value depends on the speculative method, the draft schedule, the checkpoint and the KV format. Planar KV means `int8` (including `auto` on V100) or `fp8_per_token_head`.
+
+| Speculative method | KV format | Reserve per GPU |
+| --- | --- | ---: |
+| MTP, fixed draft count | Planar | 600 MiB |
+| MTP with a dynamic draft schedule, `num_speculative_tokens` up to 4 (the reference configuration) | Planar | 705 MiB |
+| MTP with a dynamic draft schedule, `num_speculative_tokens` 5 or more | Planar | 800 MiB |
+| MTP | Scalar E4M3 or FP16 | 700 MiB |
+| None | Any | 700 MiB |
+| DFlash2, AWQ | Planar | 1000 MiB (1150 MiB with a positive `--mixed-prefill-step-latency-ms`) |
+| DFlash2, NVFP4 | Planar | 1024 MiB |
+| DFlash2 | Scalar E4M3 or FP16 | 1200 MiB |
+
+With DFlash2 the profile also turns off the single-request verifier tail graphs. An explicit `VLLM_V2_CUDAGRAPH_MEM_MIB` takes precedence.
+
+If the startup log shows `CUDA graphs took … more than the reserve the KV cache was sized with`, set `VLLM_V2_CUDAGRAPH_MEM_MIB` to at least the value in the message, or lower `--gpu-memory-utilization`. Otherwise the KV cache uses memory that the graphs need, and a large mixed step can run out of GPU memory. A reserve that is too high wastes KV capacity.
 
 ### Multimodal input
 
@@ -135,7 +153,7 @@ Large images are resized either way; see [Support and known limits](known-limits
 
 | Option | Type | Default | Since | Status | Effect and trade-offs |
 | --- | --- | --- | --- | --- | --- |
-| `--enable-dashboard` | boolean | `false` | 0.2.0 | optional | Serves the built-in aggregate metrics page at `/dashboard/`. Off by default. Rate and window calculations run in the browser, with optional local history; no engine background collector is added. Dashboard data follows the API-key configuration. Tested with CPU-only suites; its cost while serving on GPUs has not been measured. See [Dashboard](dashboard.md). |
+| `--enable-dashboard` | boolean | `false` | 0.2.0 | optional | Serves the built-in aggregate metrics page at `/dashboard/`. Off by default. Calculations run in the browser; the data routes follow the API key. See [Dashboard](dashboard.md). |
 | `--structured-outputs-config` | JSON | `{"backend": "auto"}` | upstream | stable | `{"backend": "xgrammar"}` pins the structured-output backend. With `auto`, the engine keeps the backend it chose for the first structured-output request. |
 | `--sse-keep-alive-interval` | integer seconds, ≥ 0 | `0` (off) | 0.1.2 | stable | Sends an SSE comment line (`: keep-alive`) after this many idle seconds on streaming responses, so proxies with read timeouts keep the connection open during queueing and prefill. The reference launch uses `15`. |
 | `--sanitize-control-tokens` | boolean | `false` | 0.2.0 | stable | See [Chat control tokens](#chat-control-tokens-and-the-reasoning-end-of-turn-mask). |
@@ -205,10 +223,8 @@ Automatic FP8 PLE placement pins the whole table in host memory when the disk ca
 | 128 GiB | Off, or 48 GiB CPU pool | Full acceptance passed | 0.1.0 |
 | 80 GiB | Off | Memory stress passed; full acceptance not run | 0.1.0 |
 | 64 GiB | Off | Out of memory during startup | 0.1.0 |
-| 64 GiB, whole PLE table on disk (experimental) | Off, or 32 GiB CPU pool | Served; greedy output matched the pinned path | 0.1.4 |
-| 32 GiB, whole PLE table on disk (experimental) | Off | Served; greedy output matched the pinned path | 0.1.4 |
 
-With the default pinned PLE table, 80 GiB is the smallest tested limit that passed memory stress, with KV offload off and without full acceptance. With less than 128 GiB, reduce or disable the CPU KV pool. The experimental whole-table PLE disk option ([Support and known limits](known-limits.md#memory-and-host-requirements)) keeps the table on a local SSD instead and brings the tested minimum down to 32 GiB. In 0.1.4, single-request decoding was about 23–25% slower with it and a cold first token took 1.6–2.3 times as long.
+With the default pinned PLE table, 80 GiB is the smallest tested limit that passed memory stress, with KV offload off and without full acceptance. With less than 128 GiB, reduce or disable the CPU KV pool. For smaller hosts, the experimental option that keeps the whole PLE table on disk is described in [Whole PLE table on disk](known-limits.md#whole-ple-table-on-disk-experimental).
 
 Image and video preprocessing also uses host memory, in the API server process. In a 0.1.1 test, 8 concurrent requests with 8 different 2048-pixel images each used about 33 GB at peak. With a 32 GiB CPU KV pool on a 125 GiB host, the kernel then killed a worker. The same burst passed with a 16 GiB pool. If you expect bursts of large images or videos, use a smaller CPU KV pool or limit the image size and the number of concurrent requests.
 
@@ -239,7 +255,7 @@ Every variable below is read once per process (deployment scope). Columns: type 
 | `VLLM_SM70_GDN_CPU_SPEC_QSL` | bool | `False` | 0, 1 | tuning | 0.2.0 | Set 1 to remove two host synchronizations per step in batches that mix prefill and speculative decoding; output is unchanged. |
 | `VLLM_SM70_GDN_NATIVE_PREFILL` | bool | `True` | 0, 1 | tuning | 0.2.0 | Runs eligible GDN prefill chunks with the native SM70 kernel (Model Runner V2). It can change floating-point rounding. Set 0 to use the TileLang kernel. |
 | `VLLM_SM70_HOST_DECODE_FAST` | bool | `True` | 0, 1 | tuning | 0.2.0 | Host KV only: fused decode kernels for the history in host memory. Set 0 to use the original kernels. |
-| `VLLM_SM70_MTP_KV_ONLY_PREFILL` | bool | `True` | 0, 1 | tuning | 0.2.0 | Lets the MTP draft skip work during chunked prefill; see [What the profile turns on for MTP](speculative-decoding.md#what-the-profile-turns-on-for-mtp). It can change floating-point rounding. Set 0 for full draft prefill. |
+| `VLLM_SM70_MTP_KV_ONLY_PREFILL` | bool | `True` | 0, 1 | tuning | 0.2.0 | Lets the MTP draft skip work during chunked prefill; see [MTP settings](speculative-decoding.md#mtp-settings-you-can-change). It can change floating-point rounding. Set 0 for full draft prefill. |
 | `VLLM_SM70_QSA_LOCAL_INPUTS_FUSED` | bool | `True` | 0, 1 | tuning | 0.2.0 | One fused kernel for the index metadata of the DCP-sharded QSA scorer. Set 0 to use the reference implementation. |
 | `VLLM_SM70_QSA_SHORT_APPEND` | bool | `True` | 0, 1 | tuning | 0.2.0 | Lets short prompt continuations on a long cached context use the faster cuBLAS QSA scorer. Near-tied block selection can differ from the paged scorer. Set 0 to keep the paged scorer. |
 
@@ -303,7 +319,7 @@ The ReVolta profile (`vllm/revolta_profile.py`) sets these on SM70 + TP4 + FP16 
 | `VLLM_SM70_QWEN38_WIDE_M` | bool | `False` | `1` | 0, 1 | experimental | 0.1.0 | Extends the fast Qwen3.8 decode and verify kernels from 4 to 8 requests. |
 | `VLLM_SM70_SKIP_REJECTED_BATCH_PACKS` | bool | `False` | `1` | 0, 1 | experimental | 0.1.0 | Skips weight packs that are never used, about 199 MiB per GPU. |
 | `VLLM_USE_AOT_COMPILE` | bool | `False` | `0` | 0, 1 | configuration | 1Cat | Ahead-of-time compile reuse. The profile sets 0. |
-| `VLLM_V2_CUDAGRAPH_MEM_MIB` | float | `0.0` | `700` (AWQ), `700` (NVFP4), `1200` (DFlash2), `1000` (AWQ+DFlash2, planar KV), `1150` (AWQ+DFlash2, planar KV, positive mixed-prefill target), `1024` (NVFP4+DFlash2, planar KV), `600` (fixed MTP, planar KV), `705` (dynamic MTP, planar KV), `800` (dynamic MTP with 5+ drafts, planar KV) | MiB | configuration | 1Cat | CUDA graph memory reserved per GPU before the KV cache is sized. The profile picks the value by method, checkpoint and KV format; see [CUDA graph reserve](checkpoints.md#cuda-graph-reserve). Raise it if the startup log warns that the graphs took more than the reserve. |
+| `VLLM_V2_CUDAGRAPH_MEM_MIB` | float | `0.0` | `700` (AWQ), `700` (NVFP4), `1200` (DFlash2), `1000` (AWQ+DFlash2, planar KV), `1150` (AWQ+DFlash2, planar KV, positive mixed-prefill target), `1024` (NVFP4+DFlash2, planar KV), `600` (fixed MTP, planar KV), `705` (dynamic MTP, planar KV), `800` (dynamic MTP with 5+ drafts, planar KV) | MiB | configuration | 1Cat | CUDA graph memory reserved per GPU before the KV cache is sized. The profile picks the value by method, checkpoint and KV format; see [CUDA graph reserve](#cuda-graph-reserve). Raise it if the startup log warns that the graphs took more than the reserve. |
 
 ### Experimental switches (off by default)
 

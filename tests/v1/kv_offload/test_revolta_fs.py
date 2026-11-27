@@ -271,7 +271,7 @@ def test_page_layout_changes_namespace(tmp_path):
             kv_cache_groups=[replace(group, layer_names=["draft"])],
             kv_cache_tensors=[replace(tensor, shared_by=["draft"])],
         ),
-        replace(cache, block_segments=replace(segments, names=("history", "state"))),
+        replace(cache, block_segments=replace(segments, group_segments=(0,))),
         replace(
             cache,
             kv_cache_groups=[replace(group, kv_cache_spec=wider)],

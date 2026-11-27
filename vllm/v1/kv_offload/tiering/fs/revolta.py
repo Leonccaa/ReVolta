@@ -483,14 +483,9 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
                         "primary_format": primary_kv_view.format,
                         "block_size_factor": offloading_spec.block_size_factor,
                         "layout": getattr(offloading_spec, "persistent_layout", None),
-                        "block_segments": {
-                            "version": 1,
-                            "names": segments.names,
-                            "group_segments": segments.group_segments,
-                            "primary": segments.primary,
-                        }
-                        if segments is not None
-                        else None,
+                        "block_segments": (
+                            segments.group_segments if segments is not None else None
+                        ),
                     }
                 ),
             }

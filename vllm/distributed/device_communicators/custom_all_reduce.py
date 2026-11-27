@@ -39,17 +39,17 @@ _SM70_TP8_HIERARCHICAL_SCRATCH_BYTES = 4 * 8 * 4096 * torch.float16.itemsize
 _SM70_PEX_TP4_PUSH_BYTES = frozenset(
     rows * 2560 * 2 for rows in (20, 24, 25, 30, 32, 35, 40)
 )
-# Opt-in extra widths, admitted only when the byte cap is raised above 204800
-# (e.g. VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES=327680). Mirrors the native set.
+# Additional widths for the wide cap. Keep the original set at caps up to
+# 200 KiB and for the zero-cap sum2 policy.
 _SM70_PEX_TP4_PUSH_WIDE_BYTES = frozenset(
     rows * 2560 * 2 for rows in (18, 28, 36, *range(42, 65))
 )
-_SM70_PEX_TP4_PUSH_DEFAULT_MAX_BYTES = 204800
+_SM70_PEX_TP4_PUSH_MID_MAX_BYTES = 200 * 1024
 
 
 def _sm70_pex_tp4_push_size(nbytes: int, max_bytes: int) -> bool:
     return nbytes in _SM70_PEX_TP4_PUSH_BYTES or (
-        max_bytes > _SM70_PEX_TP4_PUSH_DEFAULT_MAX_BYTES
+        max_bytes > _SM70_PEX_TP4_PUSH_MID_MAX_BYTES
         and nbytes in _SM70_PEX_TP4_PUSH_WIDE_BYTES
     )
 
@@ -803,7 +803,7 @@ class CustomAllreduce:
                 and inp_size > self.sm70_pcie_switch_max_bytes
             ):
                 return False
-            mid_size = 80 * 1024 < inp_size <= _SM70_PEX_TP4_PUSH_DEFAULT_MAX_BYTES
+            mid_size = 80 * 1024 < inp_size <= _SM70_PEX_TP4_PUSH_MID_MAX_BYTES
             if (
                 self.sm70_pcie_switch_graph_only or mid_size
             ) and not torch.cuda.is_current_stream_capturing():

@@ -41,11 +41,15 @@ The NVFP4 profile defaults that setting to `1`.
 ## Interconnect
 
 The engine selects the interconnect automatically and logs `SM70 interconnect=<mode>`.
-PCIe switch P2P uses custom all-reduce inside CUDA graphs for messages up to 80 KiB
-and for FP16 payloads of 100, 120, 125, 150, 160, 175 and 200 KiB. On an SM70 TP4 group
-(under one PCIe switch, or on NVLink) the MoE
-output sum (sum2) uses its own push kernel at the sizes that have one and otherwise adds
-locally before the ordinary all-reduce. Override with `VLLM_SM70_INTERCONNECT=auto|pex|nccl|nvlink`
+PCIe switch P2P uses custom all-reduce inside CUDA graphs. On SM70 TP4, the
+push kernel covers selected FP16 payloads, including 42–64 rows of width 2560
+(215040–327680 bytes). `VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES` defaults to
+`327680` (320 KiB). Larger payloads use NCCL by default. Set `204800` to keep
+the previous cap and push sizes, or `0` to remove the byte cap without removing
+the other custom all-reduce limits. On SM70 TP4 (PCIe switch or NVLink), the MoE
+output sum (sum2) uses its own push kernel for eligible sizes and otherwise
+adds locally before the ordinary all-reduce. Override with
+`VLLM_SM70_INTERCONNECT=auto|pex|nccl|nvlink`
 or disable custom all-reduce with `--disable-custom-all-reduce`.
 
 `VLLM_SM70_NVLINK_HC=1` opts into experimental Flash-Next HC sharding, fused

@@ -1935,6 +1935,240 @@ def _sm70_native_gdn_prefill_workspace(tokens: int) -> list[torch.Tensor]:
     )
 
 
+def flashqla_sm70_chunk_gated_delta_rule(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor,
+    output_final_state: bool,
+    cu_seqlens: torch.Tensor | None = None,
+    chunk_indices: torch.Tensor | None = None,
+    chunk_offsets: torch.Tensor | None = None,
+    state_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
+    inplace_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = True,
+    core_attn_out: torch.Tensor | None = None,
+    gate_is_exp: bool = False,
+    *,
+    allow_native: bool = False,
+):
+    use_original_tilelang = _sm70_flashqla_original_prefill_enabled()
+    if use_original_tilelang:
+        from flash_qla.ops.gated_delta_rule.chunk import (
+            chunk_gated_delta_rule_fwd_sm70_tilelang,
+        )
+
+        _log_runtime_route_once(
+            "Using original FlashQLA-SM70 TileLang GDN prefill path "
+            "(indexed_state=%s, direct_output=%s).",
+            state_indices is not None,
+            core_attn_out is not None,
+        )
+    else:
+        from flash_qla.ops.gated_delta_rule.chunk.sm70 import (
+            chunk_gated_delta_rule_fwd_sm70_vlk_varlen,
+        )
+
+    if use_qk_l2norm_in_kernel:
+        profile_start = _sm70_gdn_prefill_profile_start()
+        q = l2norm_fwd(q)
+        k = l2norm_fwd(k)
+        _sm70_gdn_prefill_profile_end(
+            "flashqla",
+            "qk_l2norm",
+            profile_start,
+            tokens=q.shape[1],
+        )
+    if cu_seqlens is None:
+        cu_seqlens = torch.tensor([0, q.shape[1]], device=q.device, dtype=torch.int32)
+    if cu_seqlens.dtype != torch.int32:
+        cu_seqlens = cu_seqlens.to(torch.int32)
+
+    output = None
+    if core_attn_out is not None:
+        candidate = core_attn_out[: q.shape[1]].unsqueeze(0)
+        if (
+            candidate.shape == v.shape
+            and candidate.dtype == v.dtype
+            and candidate.is_contiguous()
+        ):
+            output = candidate
+
+    q_contiguous = q.is_contiguous()
+    k_contiguous = k.is_contiguous()
+    v_contiguous = v.is_contiguous()
+    g_contiguous = g.is_contiguous()
+    beta_contiguous = beta.is_contiguous()
+    state_contiguous = initial_state.is_contiguous()
+    profile_start = _sm70_gdn_prefill_profile_start()
+    q_arg = q if q_contiguous else q.contiguous()
+    k_arg = k if k_contiguous else k.contiguous()
+    v_arg = v if v_contiguous else v.contiguous()
+    g_arg = g if g_contiguous else g.contiguous()
+    beta_arg = beta if beta_contiguous else beta.contiguous()
+    state_arg = initial_state if state_contiguous else initial_state.contiguous()
+    cu_arg = cu_seqlens if cu_seqlens.is_contiguous() else cu_seqlens.contiguous()
+    _sm70_gdn_prefill_profile_end(
+        "flashqla",
+        "input_contiguous",
+        profile_start,
+        tokens=q.shape[1],
+        details=(
+            f"q={q_contiguous} k={k_contiguous} v={v_contiguous} "
+            f"g={g_contiguous} beta={beta_contiguous} "
+            f"state={state_contiguous} direct_output={output is not None} "
+            f"gate_is_exp={gate_is_exp}"
+        ),
+    )
+
+    profile_start = _sm70_gdn_prefill_profile_start()
+    if use_original_tilelang:
+        if gate_is_exp:
+            logger.warning_once(
+                "SM70 original TileLang FlashQLA prefill received exp(g); "
+                "converting back to log(g). Configure fused_post_conv_prep to "
+                "emit raw g for best performance."
+            )
+            g_arg = torch.log(g_arg)
+        # The native kernel consumes chunk_indices but not chunk_offsets; this
+        # call requests only the final state, not intermediate chunk states.
+        # This also covers single-token rows already routed through the chunk path.
+        use_native = (
+            allow_native
+            and envs.VLLM_SM70_GDN_NATIVE_PREFILL
+            and flashnext_prefill_ops.has_sm70_flashnext_prefill_ops()
+            and q_arg.shape[0] == 1
+            and q_arg.shape[2:] == (4, 128)
+            and k_arg.shape == q_arg.shape
+            and v_arg.shape == (1, q_arg.shape[1], 12, 128)
+            and g_arg.dtype == torch.float32
+            and beta_arg.dtype in (torch.float16, torch.float32)
+            and state_arg.dtype == torch.float32
+            and not torch.cuda.is_current_stream_capturing()
+        )
+        if use_native:
+            from flash_qla.utils import prepare_chunk_indices
+
+            ci_arg = (
+                prepare_chunk_indices(cu_arg, 64)
+                if chunk_indices is None
+                else chunk_indices.to(cu_arg.dtype).contiguous()
+            )
+            # Both native launches use the current model stream and neither
+            # scratch nor its views escape this call. Capture uses TileLang.
+            a_bar_buf, p_buf, g_cs_buf = _sm70_native_gdn_prefill_workspace(
+                q_arg.shape[1]
+            )
+            out = torch.empty_like(v_arg) if output is None else output
+            need_store = bool(output_final_state or inplace_final_state)
+            final_state = (
+                None
+                if (inplace_final_state or not output_final_state)
+                else torch.empty(
+                    (cu_arg.numel() - 1, 12, 128, 128),
+                    dtype=torch.float32,
+                    device=q_arg.device,
+                )
+            )
+            st_idx_arg = (
+                state_indices.to(torch.int32).contiguous()
+                if state_indices is not None
+                else None
+            )
+            has_init_arg = (
+                has_initial_state.to(torch.bool).contiguous()
+                if has_initial_state is not None
+                else None
+            )
+            torch.ops.vllm_sm70_fn_prefill.gdn_chunk_fwd_fused_sm70(
+                q_arg,
+                k_arg,
+                v_arg,
+                a_bar_buf,
+                p_buf,
+                g_cs_buf,
+                g_arg,
+                beta_arg,
+                state_arg,
+                cu_arg,
+                ci_arg,
+                st_idx_arg,
+                has_init_arg,
+                out,
+                final_state,
+                float(q.shape[-1] ** -0.5),
+                True,
+                True,
+                bool(inplace_final_state),
+                need_store,
+            )
+            _log_runtime_route_once(
+                "Using native SM70 80-CTA HMMA GDN chunk prefill path."
+            )
+        else:
+            _, _, out, _, final_state = chunk_gated_delta_rule_fwd_sm70_tilelang(
+                q=q_arg,
+                k=k_arg,
+                v=v_arg,
+                g=g_arg,
+                beta=beta_arg,
+                cu_seqlens=cu_arg,
+                chunk_indices=chunk_indices,
+                chunk_offsets=chunk_offsets,
+                state_indices=state_indices,
+                has_initial_state=has_initial_state,
+                initial_state=state_arg,
+                scale=q.shape[-1] ** -0.5,
+                output_final_state=output_final_state,
+                output_h=False,
+                auto_cp=False,
+                state_layout_vlk=True,
+                output=output,
+                inplace_final_state=inplace_final_state,
+            )
+    else:
+        out, final_state = chunk_gated_delta_rule_fwd_sm70_vlk_varlen(
+            q=q_arg,
+            k=k_arg,
+            v=v_arg,
+            g=g_arg,
+            beta=beta_arg,
+            cu_seqlens=cu_arg,
+            initial_state=state_arg,
+            scale=q.shape[-1] ** -0.5,
+            output_final_state=output_final_state,
+            validate_cu_seqlens=False,
+            output=output,
+            gate_is_exp=gate_is_exp,
+        )
+    _sm70_gdn_prefill_profile_end(
+        "flashqla",
+        "kernel",
+        profile_start,
+        tokens=q.shape[1],
+        details=(
+            f"direct_output={output is not None} gate_is_exp={gate_is_exp} "
+            f"original_tilelang={use_original_tilelang}"
+        ),
+    )
+    if core_attn_out is not None and output is None:
+        profile_start = _sm70_gdn_prefill_profile_start()
+        out_flat = out.squeeze(0).reshape(-1)
+        out_view = core_attn_out.reshape(-1)[: out_flat.numel()]
+        out_view.copy_(out_flat)
+        out = core_attn_out[: out.shape[1]].unsqueeze(0)
+        _sm70_gdn_prefill_profile_end(
+            "flashqla",
+            "output_copy",
+            profile_start,
+            tokens=q.shape[1],
+        )
+    return out, final_state
+
+
 def flashqla_sm70_chunk_gated_delta_rule_vllm_decode(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2088,220 +2322,26 @@ class ChunkGatedDeltaRule(CustomOp):
                 core_attn_out=core_attn_out,
                 gate_is_exp=gate_is_exp,
             )
-        use_original_tilelang = _sm70_flashqla_original_prefill_enabled()
-        if use_original_tilelang:
-            from flash_qla.ops.gated_delta_rule.chunk import (
-                chunk_gated_delta_rule_fwd_sm70_tilelang,
-            )
-
-            _log_runtime_route_once(
-                "Using original FlashQLA-SM70 TileLang GDN prefill path "
-                "(indexed_state=%s, direct_output=%s).",
-                state_indices is not None,
-                core_attn_out is not None,
-            )
-        else:
-            from flash_qla.ops.gated_delta_rule.chunk.sm70 import (
-                chunk_gated_delta_rule_fwd_sm70_vlk_varlen,
-            )
-
-        if use_qk_l2norm_in_kernel:
-            profile_start = _sm70_gdn_prefill_profile_start()
-            q = l2norm_fwd(q)
-            k = l2norm_fwd(k)
-            _sm70_gdn_prefill_profile_end(
-                "flashqla",
-                "qk_l2norm",
-                profile_start,
-                tokens=q.shape[1],
-            )
-        if cu_seqlens is None:
-            cu_seqlens = torch.tensor(
-                [0, q.shape[1]], device=q.device, dtype=torch.int32
-            )
-        if cu_seqlens.dtype != torch.int32:
-            cu_seqlens = cu_seqlens.to(torch.int32)
-
-        output = None
-        if core_attn_out is not None:
-            candidate = core_attn_out[: q.shape[1]].unsqueeze(0)
-            if (
-                candidate.shape == v.shape
-                and candidate.dtype == v.dtype
-                and candidate.is_contiguous()
-            ):
-                output = candidate
-
-        q_contiguous = q.is_contiguous()
-        k_contiguous = k.is_contiguous()
-        v_contiguous = v.is_contiguous()
-        g_contiguous = g.is_contiguous()
-        beta_contiguous = beta.is_contiguous()
-        state_contiguous = initial_state.is_contiguous()
-        profile_start = _sm70_gdn_prefill_profile_start()
-        q_arg = q if q_contiguous else q.contiguous()
-        k_arg = k if k_contiguous else k.contiguous()
-        v_arg = v if v_contiguous else v.contiguous()
-        g_arg = g if g_contiguous else g.contiguous()
-        beta_arg = beta if beta_contiguous else beta.contiguous()
-        state_arg = initial_state if state_contiguous else initial_state.contiguous()
-        cu_arg = cu_seqlens if cu_seqlens.is_contiguous() else cu_seqlens.contiguous()
-        _sm70_gdn_prefill_profile_end(
-            "flashqla",
-            "input_contiguous",
-            profile_start,
-            tokens=q.shape[1],
-            details=(
-                f"q={q_contiguous} k={k_contiguous} v={v_contiguous} "
-                f"g={g_contiguous} beta={beta_contiguous} "
-                f"state={state_contiguous} direct_output={output is not None} "
-                f"gate_is_exp={gate_is_exp}"
-            ),
+        o, final_state = flashqla_sm70_chunk_gated_delta_rule(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            chunk_offsets=chunk_offsets,
+            state_indices=state_indices,
+            has_initial_state=has_initial_state,
+            inplace_final_state=inplace_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            core_attn_out=core_attn_out,
+            gate_is_exp=gate_is_exp,
+            allow_native=self._use_v2_model_runner,
         )
-
-        profile_start = _sm70_gdn_prefill_profile_start()
-        if use_original_tilelang:
-            if gate_is_exp:
-                logger.warning_once(
-                    "SM70 original TileLang FlashQLA prefill received exp(g); "
-                    "converting back to log(g). Configure fused_post_conv_prep to "
-                    "emit raw g for best performance."
-                )
-                g_arg = torch.log(g_arg)
-            # The native kernel consumes chunk_indices but not chunk_offsets; this
-            # call requests only the final state, not intermediate chunk states.
-            # This also covers single-token rows already routed through the chunk path.
-            use_native = (
-                self._use_v2_model_runner
-                and envs.VLLM_SM70_GDN_NATIVE_PREFILL
-                and flashnext_prefill_ops.has_sm70_flashnext_prefill_ops()
-                and q_arg.shape[0] == 1
-                and q_arg.shape[2:] == (4, 128)
-                and k_arg.shape == q_arg.shape
-                and v_arg.shape == (1, q_arg.shape[1], 12, 128)
-                and g_arg.dtype == torch.float32
-                and beta_arg.dtype in (torch.float16, torch.float32)
-                and state_arg.dtype == torch.float32
-                and not torch.cuda.is_current_stream_capturing()
-            )
-            if use_native:
-                from flash_qla.utils import prepare_chunk_indices
-
-                ci_arg = (
-                    prepare_chunk_indices(cu_arg, 64)
-                    if chunk_indices is None
-                    else chunk_indices.to(cu_arg.dtype).contiguous()
-                )
-                # Both native launches use the current model stream and neither
-                # scratch nor its views escape this call. Capture uses TileLang.
-                a_bar_buf, p_buf, g_cs_buf = _sm70_native_gdn_prefill_workspace(
-                    q_arg.shape[1]
-                )
-                out = torch.empty_like(v_arg) if output is None else output
-                need_store = bool(output_final_state or inplace_final_state)
-                final_state = (
-                    None
-                    if (inplace_final_state or not output_final_state)
-                    else torch.empty(
-                        (cu_arg.numel() - 1, 12, 128, 128),
-                        dtype=torch.float32,
-                        device=q_arg.device,
-                    )
-                )
-                st_idx_arg = (
-                    state_indices.to(torch.int32).contiguous()
-                    if state_indices is not None
-                    else None
-                )
-                has_init_arg = (
-                    has_initial_state.to(torch.bool).contiguous()
-                    if has_initial_state is not None
-                    else None
-                )
-                torch.ops.vllm_sm70_fn_prefill.gdn_chunk_fwd_fused_sm70(
-                    q_arg,
-                    k_arg,
-                    v_arg,
-                    a_bar_buf,
-                    p_buf,
-                    g_cs_buf,
-                    g_arg,
-                    beta_arg,
-                    state_arg,
-                    cu_arg,
-                    ci_arg,
-                    st_idx_arg,
-                    has_init_arg,
-                    out,
-                    final_state,
-                    float(q.shape[-1] ** -0.5),
-                    True,
-                    True,
-                    bool(inplace_final_state),
-                    need_store,
-                )
-                _log_runtime_route_once(
-                    "Using native SM70 80-CTA HMMA GDN chunk prefill path."
-                )
-            else:
-                _, _, out, _, final_state = chunk_gated_delta_rule_fwd_sm70_tilelang(
-                    q=q_arg,
-                    k=k_arg,
-                    v=v_arg,
-                    g=g_arg,
-                    beta=beta_arg,
-                    cu_seqlens=cu_arg,
-                    chunk_indices=chunk_indices,
-                    chunk_offsets=chunk_offsets,
-                    state_indices=state_indices,
-                    has_initial_state=has_initial_state,
-                    initial_state=state_arg,
-                    scale=q.shape[-1] ** -0.5,
-                    output_final_state=output_final_state,
-                    output_h=False,
-                    auto_cp=False,
-                    state_layout_vlk=True,
-                    output=output,
-                    inplace_final_state=inplace_final_state,
-                )
-        else:
-            out, final_state = chunk_gated_delta_rule_fwd_sm70_vlk_varlen(
-                q=q_arg,
-                k=k_arg,
-                v=v_arg,
-                g=g_arg,
-                beta=beta_arg,
-                cu_seqlens=cu_arg,
-                initial_state=state_arg,
-                scale=q.shape[-1] ** -0.5,
-                output_final_state=output_final_state,
-                validate_cu_seqlens=False,
-                output=output,
-                gate_is_exp=gate_is_exp,
-            )
-        _sm70_gdn_prefill_profile_end(
-            "flashqla",
-            "kernel",
-            profile_start,
-            tokens=q.shape[1],
-            details=(
-                f"direct_output={output is not None} gate_is_exp={gate_is_exp} "
-                f"original_tilelang={use_original_tilelang}"
-            ),
-        )
-        if core_attn_out is not None and output is None:
-            profile_start = _sm70_gdn_prefill_profile_start()
-            out_flat = out.squeeze(0).reshape(-1)
-            out_view = core_attn_out.reshape(-1)[: out_flat.numel()]
-            out_view.copy_(out_flat)
-            out = core_attn_out[: out.shape[1]].unsqueeze(0)
-            _sm70_gdn_prefill_profile_end(
-                "flashqla",
-                "output_copy",
-                profile_start,
-                tokens=q.shape[1],
-            )
-        return out, final_state
+        return o, final_state
 
     def forward_native(
         self,

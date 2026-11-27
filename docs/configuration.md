@@ -60,8 +60,9 @@ and are subject to model quality validation.
 output/LSE exchange on an SM70 TP4 PCIe-switch group with registered push buffers.
 It defaults to `0`. The path uses FP16 queries and the DCP A2A backend for eager uniform
 decode and dedicated FULL decode graphs, up to 53 rows. PIECEWISE graphs keep
-using NCCL. In four-GPU AWQ tests, cold time to first token fell by 0.4–0.8%;
-decode gains were not established. Enabling this option requires `_C` built from
+using NCCL. Four-GPU AWQ tests showed no stable gain in cold time to first token or
+decode; fixed-prompt outputs matched the NCCL path token for token. Enabling this
+option requires `_C` built from
 the same commit, or a Custom AR sidecar that exports both
 `sm70_dcp2_p2p_buffer_size` and `sm70_dcp2_p2p`.
 

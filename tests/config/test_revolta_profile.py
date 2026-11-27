@@ -863,6 +863,13 @@ def test_dflash2_shorthand_matches_json(
     ("method", "flags", "spec_options", "budget", "expected"),
     [
         ("mtp", [], {}, 2048, (False, False, True)),
+        (
+            "mtp",
+            ["--kernel-config", '{"long_context_kv":{"enabled":true}}'],
+            {},
+            2048,
+            (True, False, True),
+        ),
         ("mtp", ["--async-scheduling"], {}, 2048, (False, True, False)),
         ("mtp", [], {"gdn_state_replay": False}, 2048, (False, True, False)),
         ("dflash", [], {}, 2048, (True, False, True)),

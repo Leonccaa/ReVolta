@@ -706,13 +706,15 @@ class KernelConfig:
     """
 
     qsa_dcp_index_shard: bool | None = None
-    """Shard the target QSA compressed indexer keys over the DCP group.
+    """Shard the QSA compressed indexer keys over the TP group.
 
-    Group g is owned by DCP rank ``g % dcp`` at local column ``g // dcp``. Each
+    Group g is owned by TP rank ``g % tp`` at local column ``g // tp``. Each
     rank scores only its own groups; local top-k candidates are merged across
-    the group into the unchanged global selection. Unset enables sharding only
-    for DFlash2 with 512 selected groups under the ReVolta hybrid serving profile.
-    Sharding takes effect with DCP > 1. GPU MTP keeps the replicated default.
+    the group into the unchanged global selection. Unset enables sharding, with
+    512 selected groups under the ReVolta hybrid serving profile, for DFlash2
+    and for MTP with Active Host KV (where it also moves the MTP draft's main
+    K/V to the host). Sharding takes effect with DCP > 1. GPU KV MTP keeps the
+    replicated default. An explicit value always wins.
     """
 
     long_context_kv: LongContextKVConfig = Field(default_factory=LongContextKVConfig)

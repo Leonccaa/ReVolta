@@ -674,7 +674,7 @@ def test_reset_epoch_and_layout_change_never_hit_old_files(tmp_path, envs):
     changed = envs(root, layout=other)
     assert changed.ssd.prefetch("r", [key(1)]) == []
     changed.ssd.close(io_grace_s=5)
-    same = envs(root)  # positive control: a restart with the same ABI hits
+    same = envs(root, pages=8)  # The same row ABI survives a larger host pool.
     assert same.ssd.prefetch("r", [key(1)]) == [key(1)]
     assert same.settle(lambda: not same.ssd._jobs)
     assert same.table.is_ready(same.table.lookup(key(1)))

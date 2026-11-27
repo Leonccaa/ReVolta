@@ -8,32 +8,31 @@ labels: ["report"]
 <!--
 Instructions (for people and for coding agents):
 - Fill in every section. Write "not measured" instead of deleting a section.
-- Measured results and experience from daily use are both welcome. For daily use,
-  describe the workload under "How you measured" and what happened under
-  "Stability and notes".
+- Measured results and experience from daily use are both welcome. For daily use, describe the workload under "How you measured" and what happened under "Stability and notes".
 - Keep the keys in the Summary block; put units in the values.
 - Remove credentials, tokens and private paths from commands and logs.
 - For a problem or a crash, use the bug report form instead.
-- To compare with the release tables, see the method in docs/performance.md
-  ("Reference system, MTP4"). Any method is welcome; describe the one you used.
-- If you open this issue through the API or `gh issue create`, the label may not be
-  applied automatically; the maintainers add it.
+- To compare with the release tables, see how they were measured in docs/performance.md. Any method is welcome; describe the one you used.
+- If you open this issue through the API or `gh issue create`, the label may not be applied automatically; the maintainers add it.
 -->
 
 ## Summary
 
 ```text
-revolta_version:
-install:                  # PyPI wheel, Docker image tag, or source
+revolta_version:          # output of `vllm --version`, e.g. 0.2.0
+install:                  # Docker image tag, PyPI wheel, or source build
 gpus:                     # model x count, memory per GPU
 power_limit_w:
-interconnect:             # PCIe switch with P2P, PCIe without P2P, NVLink, or other
+interconnect:             # NVLink, PCIe switch with P2P, PCIe without P2P, or other
 host_memory:              # host RAM, container limit, /dev/shm size
+weight_format:            # AWQ g32, standard NVFP4, FP4-Local, NVFP4-QAD, or other
 checkpoint:               # owner/repository @ revision
-drafter:                  # owner/repository @ revision, or none
+drafter:                  # owner/repository @ revision, built-in MTP, or none
 speculative_method:       # MTP, DFlash2, or none
+num_speculative_tokens:   # a number, or the num_speculative_tokens_per_batch_size table
 draft_sample_method:
-kv_cache_dtype:
+kv_placement:             # GPU KV or Host KV
+kv_cache_dtype:           # auto (INT8 on V100), fp8_per_token_head, fp8_e4m3, ...
 cpu_kv_offload_gib:
 max_model_len:
 gpu_memory_utilization:
@@ -49,8 +48,7 @@ gpu_memory_utilization:
 
 ## Launch command and environment
 
-<!-- The complete command, including --speculative-config and --kv-transfer-config,
-and every VLLM_*, NCCL_* and PYTORCH_* variable you set. -->
+<!-- The complete command, including --speculative-config, --kernel-config and --kv-transfer-config, and every VLLM_*, NCCL_* and PYTORCH_* variable you set. -->
 
 ```bash
 
@@ -58,8 +56,7 @@ and every VLLM_*, NCCL_* and PYTORCH_* variable you set. -->
 
 ## Startup log lines
 
-<!-- The `ReVolta profile {...}` line, the `SM70 interconnect=` lines and the
-`GPU KV cache size` line. -->
+<!-- The `ReVolta profile {...}` line, the `SM70 interconnect=` lines and the `GPU KV cache size` line. -->
 
 ```text
 
@@ -67,8 +64,7 @@ and every VLLM_*, NCCL_* and PYTORCH_* variable you set. -->
 
 ## How you measured
 
-<!-- Prompts or prompt types, response length, thinking on or off, temperature,
-concurrency levels, repetitions, and whether rates include the time to first token. -->
+<!-- Prompts or prompt types, response length, thinking on or off, temperature, concurrency levels, repetitions, and whether rates include the time to first token. -->
 
 ## Results
 

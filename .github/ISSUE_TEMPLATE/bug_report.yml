@@ -6,29 +6,19 @@ body:
   - type: markdown
     attributes:
       value: |
-        **Support scope** (see the support matrix in the README):
+        **Support scope.** ReVolta is built for four or more NVIDIA V100 32 GB GPUs and validated on four, with tensor parallel 4 and decode context parallel 2 (TP4 + DCP2). We recommend and test two interconnects: NVLink, or all GPUs under one PCIe switch with P2P. The supported forms are Qwen3.8 Flash-Next AWQ or NVFP4 checkpoints, with MTP (including dynamic speculative decoding) or DFlash2, and with the KV cache on the GPUs or in host memory (Host KV). The [support matrix](https://github.com/Leonccaa/ReVolta/blob/main/docs/known-limits.md#support-matrix) lists the tested configurations.
 
-        - **Validated:** 4 × V100 32 GB, TP4 + DCP2, Qwen3.8 Flash-Next
-          (multimodal) with the AWQ g32, standard NVFP4 or NVIDIA FP4-Local
-          checkpoints; E4M3 or INT8 KV cache; KV offload off, CPU, or CPU + SSD;
-          NVLink, or a PCIe switch with P2P (the recommended interconnects). PCIe
-          without P2P was validated by disabling P2P on P2P-capable hardware.
-        - **Unverified, best effort:** TP2/TP8, V100 16 GB, other GPU counts,
-          other models and other topologies.
-        - **Out of scope:** GPUs other than SM70, ROCm/CPU/XPU/TPU, GGUF.
-          INT8 KV with the SSD tier is not supported in 0.1.4 either.
+        Other GPU counts, V100 16 GB, other models and other topologies are handled on a best-effort basis. Other GPU architectures, ROCm, CPU, XPU, TPU and GGUF are not built.
 
-        Remove credentials, tokens and private paths from logs.
-        Report security vulnerabilities through GitHub private vulnerability
-        reporting, not in a public issue.
+        Remove credentials, tokens and private paths from logs. Report security vulnerabilities through private vulnerability reporting ([SECURITY.md](https://github.com/Leonccaa/ReVolta/blob/main/SECURITY.md)), not in a public issue. To share test results without a problem, use the Report template.
   - type: dropdown
     id: scope
     attributes:
       label: Support scope
-      description: Which part of the support matrix does your configuration match?
+      description: Does your configuration match the support matrix?
       options:
-        - Validated configuration
-        - Unverified configuration (best effort)
+        - Supported configuration
+        - Other configuration (best effort)
         - Not sure
     validations:
       required: true
@@ -40,10 +30,28 @@ body:
     validations:
       required: true
   - type: input
+    id: version
+    attributes:
+      label: ReVolta version
+      description: Output of `vllm --version`.
+      placeholder: "0.2.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: Installation
+      options:
+        - Docker image (ghcr.io/leonccaa/revolta)
+        - PyPI wheel (pip install revolta)
+        - Built from source
+    validations:
+      required: true
+  - type: input
     id: gpu
     attributes:
       label: GPU model, count and memory per GPU
-      placeholder: 4 x Tesla V100 PCIe, 32 GB each
+      placeholder: 4 x Tesla V100-PCIE-32GB
     validations:
       required: true
   - type: dropdown
@@ -51,9 +59,9 @@ body:
     attributes:
       label: GPU interconnect
       options:
-        - PCIe switch with P2P
-        - PCIe without P2P
         - NVLink
+        - All GPUs under one PCIe switch, P2P enabled
+        - PCIe without P2P, or P2P disabled
         - Other (describe in the reproduction)
     validations:
       required: true
@@ -71,6 +79,19 @@ body:
       placeholder: 128 GiB host, 128 GiB container limit, 128 GiB shm
     validations:
       required: true
+  - type: dropdown
+    id: weights
+    attributes:
+      label: Weight format
+      options:
+        - AWQ g32
+        - Standard NVFP4
+        - NVIDIA FP4-Local
+        - NVIDIA NVFP4-QAD
+        - Hy4-flash AWQ g32 (validation support)
+        - Other model or format (describe in the reproduction)
+    validations:
+      required: true
   - type: input
     id: checkpoint
     attributes:
@@ -79,13 +100,36 @@ body:
     validations:
       required: true
   - type: dropdown
+    id: speculative
+    attributes:
+      label: Speculative decoding
+      options:
+        - MTP with a fixed number of draft tokens
+        - MTP with dynamic speculative decoding (num_speculative_tokens_per_batch_size)
+        - DFlash2
+        - None
+    validations:
+      required: true
+  - type: dropdown
+    id: kv-placement
+    attributes:
+      label: KV cache placement
+      options:
+        - GPU KV (default)
+        - Host KV (--kernel-config long_context_kv enabled)
+    validations:
+      required: true
+  - type: dropdown
     id: kv-dtype
     attributes:
-      label: KV cache dtype
+      label: KV cache dtype (--kv-cache-dtype)
       options:
-        - fp8_e4m3
-        - int8
-        - auto / float16
+        - auto (default; INT8 on V100)
+        - int8 / int8_per_token_head
+        - fp8_per_token_head
+        - fp8 / fp8_e4m3 (calibrated scales)
+        - float16
+        - Other (describe in the reproduction)
     validations:
       required: true
   - type: dropdown
@@ -95,14 +139,14 @@ body:
       options:
         - "Off"
         - CPU
-        - CPU + SSD tier
+        - CPU + disk tier
     validations:
       required: true
   - type: textarea
     id: command
     attributes:
       label: Complete launch command and environment variables
-      description: Include --speculative-config and --kv-transfer-config, and every VLLM_*, NCCL_* and PYTORCH_* variable you set.
+      description: Include --speculative-config, --kernel-config and --kv-transfer-config, and every VLLM_*, NCCL_* and PYTORCH_* variable you set.
       render: shell
     validations:
       required: true
@@ -110,15 +154,16 @@ body:
     id: startup
     attributes:
       label: Startup log lines
-      description: The `ReVolta profile {...}` line and the `SM70 interconnect=` lines from each worker.
+      description: The `ReVolta profile {...}` line, the `SM70 interconnect=` line from each worker, and the `GPU KV cache size` line.
       render: text
     validations:
       required: true
   - type: textarea
-    id: versions
+    id: environment
     attributes:
-      label: ReVolta version and environment
-      description: Output of `vllm --version`, installation method (wheel or Docker image tag), OS, Python, torch, CUDA and NVIDIA driver versions.
+      label: Environment
+      description: Docker image tag or wheel file, OS, Python, torch, CUDA and NVIDIA driver versions.
+      placeholder: ghcr.io/leonccaa/revolta:0.2.0, Ubuntu 22.04, NVIDIA driver 570.x
     validations:
       required: true
   - type: textarea

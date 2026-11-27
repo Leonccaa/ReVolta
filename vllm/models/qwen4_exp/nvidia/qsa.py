@@ -95,9 +95,9 @@ from .ops.qsa_device_history import (
 from .ops.qsa_paged_fp16_h12 import (
     H12_MAX_ROWS,
     H12_MAX_WIDTH,
-    load_qsa_paged_fp16_h12,
-    qsa_paged_fp16_h12,
-    qsa_paged_fp16_h12_workspace,
+    load_qsa_paged_h12,
+    qsa_paged_h12,
+    qsa_paged_h12_workspace,
 )
 from .ops.qsa_request_segments import warmup_build_segments
 from .ops.sm70_dcp2 import get_sm70_dcp2_for_batch
@@ -795,12 +795,12 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         )
         if (
             grouped_rows == 0
-            and layer.sm70_qsa_paged_fp16_h12
-            and query.shape[0] <= H12_MAX_ROWS
-            and local_width <= H12_MAX_WIDTH
+            and layer.sm70_qsa_paged_h12
+            and 0 < query.shape[0] <= H12_MAX_ROWS
+            and 0 < local_width <= H12_MAX_WIDTH
             and get_forward_context().is_uniform_decode
         ):
-            qsa_paged_fp16_h12(
+            qsa_paged_h12(
                 gathered_query,
                 key_cache,
                 value_cache,
@@ -809,6 +809,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 token_to_req,
                 partial_output,
                 partial_lse,
+                **scale_kwargs,
             )
             grouped_rows = query.shape[0]
         elif (
@@ -1109,8 +1110,14 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         )
         if self.sm70_qsa_device_history:
             load_qsa_device_history()
-        self.sm70_qsa_paged_fp16_h12 = (
-            kernel_config.sm70_qsa_paged_fp16_h12
+        paged_h12_enabled = (
+            kernel_config.sm70_qsa_paged_int8_h12
+            if self.kv_cache_dtype == "int8"
+            else kernel_config.sm70_qsa_paged_fp16_h12
+            and self.kv_cache_dtype in ("auto", "float16")
+        )
+        self.sm70_qsa_paged_h12 = (
+            paged_h12_enabled
             and vllm_config.use_v2_model_runner
             and not vllm_config.is_speculative_draft
             and self.qsa_dcp_sharded
@@ -1118,12 +1125,11 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             and tp_size == 4
             and (self.num_heads, self.num_kv_heads, self.head_dim) == (6, 1, 256)
             and model_config.dtype == torch.float16
-            and self.kv_cache_dtype in ("auto", "float16")
             and (not host_kv.enabled or host_kv.main_kv_placement == "gpu")
             and current_platform.is_device_capability(70)
         )
-        if self.sm70_qsa_paged_fp16_h12:
-            load_qsa_paged_fp16_h12()
+        if self.sm70_qsa_paged_h12:
+            load_qsa_paged_h12(self.kv_cache_dtype)
         if self.kv_cache_dtype in ("fp8", "fp8_e4m3") and (
             cache_config.calculate_kv_scales
         ):
@@ -1332,7 +1338,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         partial = self.dcp_partial_output_buffer
         if partial is None:
             return
-        if self.sm70_qsa_paged_fp16_h12 or self.sm70_qsa_device_history:
+        if self.sm70_qsa_paged_h12 or self.sm70_qsa_device_history:
             from .ops.qsa_dcp import qsa_dcp_local_selection_width
 
             assert self.dcp_local_indices_buffer is not None
@@ -1343,8 +1349,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 self.cp_kv_cache_interleave_size,
                 self.dcp_local_indices_buffer.shape[1],
             )
-            if self.sm70_qsa_paged_fp16_h12 and width <= H12_MAX_WIDTH:
-                qsa_paged_fp16_h12_workspace(min(partial.shape[0], H12_MAX_ROWS), width)
+            if self.sm70_qsa_paged_h12 and width <= H12_MAX_WIDTH:
+                qsa_paged_h12_workspace(min(partial.shape[0], H12_MAX_ROWS), width)
             if self.sm70_qsa_device_history and width <= DEVICE_HISTORY_MAX_WIDTH:
                 qsa_device_history_workspace(
                     min(partial.shape[0], DEVICE_HISTORY_MAX_ROWS), width

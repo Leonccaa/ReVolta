@@ -154,7 +154,7 @@ class Arms:
             dcp_partial_output_buffer=torch.empty((tokens, gathered_heads, dim)),
             dcp_partial_lse_buffer=torch.empty((tokens, gathered_heads)),
             indexer=SimpleNamespace(token_topk=topk, compress_ratio=4),
-            sm70_qsa_paged_fp16_h12=False,
+            sm70_qsa_paged_h12=False,
             sm70_qsa_device_history=False,
         )
         self.blocks = {0: [1, 5, 9], 1: [3, 7, 11]}

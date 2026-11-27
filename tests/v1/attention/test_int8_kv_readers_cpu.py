@@ -229,7 +229,7 @@ def test_e4m3_forward_passes_planes_and_actual_rows(sharded, monkeypatch):
         _k_scale_float=1.0,
         _v_scale_float=1.0,
         qsa_draft_native_scales=None,
-        sm70_qsa_paged_fp16_h12=False,
+        sm70_qsa_paged_h12=False,
         sm70_qsa_device_history=False,
         dcp_local_indices_buffer=torch.empty_like(ids),
         dcp_partial_output_buffer=torch.empty(5, 12, 256),

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +13,8 @@ from vllm.forward_context import get_forward_context, set_forward_context
 from vllm.models.qwen4_exp.nvidia import qsa
 from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
 from vllm.models.qwen4_exp.nvidia.ops import qsa_dcp, qsa_paged_fp16_h12
+from vllm.v1.attention.kv_cache_view import KVCacheView, bind_planar_kv_cache
+from vllm.v1.attention.kv_codecs import FP16, INT8
 from vllm.v1.worker import workspace
 from vllm.v1.worker.gpu import cudagraph_utils
 
@@ -29,6 +32,25 @@ def _forward_config():
     )
 
 
+def _planar_cache():
+    # Padded pages with a second layer interleaved between successive pages.
+    page_bytes = 832 * 520 + 16
+    raw = torch.empty(3 * 2 * page_bytes, dtype=torch.int8)
+    carrier = bind_planar_kv_cache(
+        raw,
+        num_blocks=3,
+        scheduler_block_size=832,
+        kernel_block_size=832,
+        num_heads=1,
+        head_size=256,
+        page_size_bytes=page_bytes,
+        member_index=1,
+        member_count=2,
+    )
+    return raw, carrier, KVCacheView.bind(carrier, INT8, 256)
+
+
+@pytest.mark.parametrize("dtype", ["float16", "int8"])
 @pytest.mark.parametrize(
     "enabled,phase,rows,topk,native",
     [
@@ -39,9 +61,10 @@ def _forward_config():
         (True, True, 48, 8192, False),
     ],
 )
-def test_qsa_h12_dcp_reader(monkeypatch, enabled, phase, rows, topk, native):
+def test_qsa_h12_dcp_reader(monkeypatch, dtype, enabled, phase, rows, topk, native):
     layer = SimpleNamespace(
-        sm70_qsa_paged_fp16_h12=enabled,
+        sm70_qsa_paged_h12=enabled,
+        qsa_dcp_sharded=True,
         sm70_qsa_device_history=False,
         dcp_local_indices_buffer=torch.empty(rows, topk + 3, dtype=torch.int32),
         dcp_partial_output_buffer=torch.empty(rows, 12, 256),
@@ -64,21 +87,40 @@ def test_qsa_h12_dcp_reader(monkeypatch, enabled, phase, rows, topk, native):
         "qsa_dcp_sparse_paged_attention_sm70_grouped_page4",
         lambda *args, **kwargs: 0,
     )
-    logical = torch.zeros_like(layer.dcp_local_indices_buffer)
+    layer.topk_indices_buffer = torch.zeros_like(layer.dcp_local_indices_buffer)
     query = torch.zeros(rows, 6, 256, dtype=torch.float16)
     output = torch.empty_like(query)
-    cache = torch.empty(2, 2, 416, 1, 256, dtype=torch.float16)
-    key, value = cache.unbind(1)
-    table = torch.zeros(1, 2, dtype=torch.int32)
+    if dtype == "int8":
+        raw, cache, view = _planar_cache()
+    else:
+        cache = torch.empty(3, 2, 416, 1, 256, dtype=torch.float16)
+        view = KVCacheView.bind(cache, FP16, 256)
+    table = torch.tensor([[2, 0, 1]], dtype=torch.int32)
     requests = torch.zeros(rows, dtype=torch.int32)
 
-    def reader(q, k, v, ids, block_table, token_to_req, out, lse, *, paged):
+    def reader(q, k, v, ids, block_table, token_to_req, out, lse, *, paged, **scales):
         assert native is paged
         assert q.shape == (rows, 12, 256)
-        assert k is key and v is value
+        assert k.data_ptr() == view.key.data_ptr()
+        assert k.stride() == view.key.stride()
+        assert (
+            v.data_ptr() == view.value.data_ptr() and v.stride() == view.value.stride()
+        )
         assert block_table is table and token_to_req.shape == (rows,)
         assert ids.shape == (rows, topk // 2 + 2)
         assert ids.stride(0) == topk + 3
+        assert out.dtype == lse.dtype == torch.float32
+        if dtype == "int8":
+            planes = (k, v, scales["k_scale_cache"], scales["v_scale_cache"])
+            page_bytes = 832 * 520 + 16
+            for plane, offset, token_bytes in zip(
+                planes, (0, 832 * 256, 832 * 512, 832 * 516), (256, 256, 4, 4)
+            ):
+                assert plane.data_ptr() - raw.data_ptr() == page_bytes + offset
+                assert plane.stride(0) * plane.element_size() == 2 * page_bytes
+                assert plane.stride(1) * plane.element_size() == token_bytes
+        else:
+            assert not scales
         out.fill_(3)
         lse.fill_(-2)
 
@@ -87,34 +129,123 @@ def test_qsa_h12_dcp_reader(monkeypatch, enabled, phase, rows, topk, native):
         assert torch.all(out == 3) and torch.all(lse == -2)
         return out[:, :6]
 
-    monkeypatch.setattr(qsa, "qsa_paged_fp16_h12", lambda *a: reader(*a, paged=True))
+    def native_reader(q, k, v, ids, block_table, token_to_req, out, lse, **scales):
+        reader(q, k, v, ids, block_table, token_to_req, out, lse, paged=True, **scales)
 
-    def triton_reader(q, k, v, ids, block_table, token_to_req, out, *, lse, **kwargs):
-        reader(q, k, v, ids, block_table, token_to_req, out, lse, paged=False)
+    def triton_reader(
+        q,
+        k,
+        v,
+        ids,
+        block_table,
+        token_to_req,
+        out,
+        *,
+        lse,
+        kv_cache_dtype,
+        k_scale,
+        v_scale,
+        compacted_indices,
+        **scales,
+    ):
+        assert kv_cache_dtype == dtype and compacted_indices
+        reader(q, k, v, ids, block_table, token_to_req, out, lse, paged=False, **scales)
 
+    monkeypatch.setattr(qsa, "qsa_paged_h12", native_reader)
     monkeypatch.setattr(qsa_ops, "qsa_sparse_paged_attention", triton_reader)
-    monkeypatch.setattr(qsa_ops, "_qsa_output_gate", lambda out, gate: out.mul_(gate))
-    impl = SimpleNamespace(
-        dcp_world_size=2, dcp_rank=0, kv_cache_dtype="float16", dcp_combine=combine
+    monkeypatch.setattr(
+        qsa_ops, "_qsa_output_gate", lambda out, gate, *, merged: out.copy_(merged)
     )
+    impl = object.__new__(qsa.Qwen4ExpQSAFlashAttentionImpl)
+    impl.dcp_world_size, impl.dcp_rank = 2, 0
+    impl.kv_cache_dtype, impl.dcp_combine = dtype, combine
+    impl.head_size, impl.sliding_window = 256, (-1, -1)
+    impl.alibi_slopes = impl.sinks = None
     with set_forward_context(None, _forward_config(), is_uniform_decode=phase):
-        qsa.Qwen4ExpQSAFlashAttentionImpl._forward_qsa_dcp(
-            impl,
+        impl.forward_qsa(
             layer,
             query,
-            key,
-            value,
-            logical,
-            table,
-            requests,
+            query,
+            query,
+            cache,
+            SimpleNamespace(num_actual_tokens=rows, block_table=table),
             output,
-            torch.ones_like(query),
+            token_to_req=requests,
+            output_gate=torch.ones_like(query),
         )
     assert torch.all(output == 3)
 
 
+def test_int8_h12_late_scale_split_merge():
+    _, _, view = _planar_cache()
+    rng = torch.Generator().manual_seed(603)
+    view.key.random_(-127, 128, generator=rng)
+    view.value.random_(-127, 128, generator=rng)
+    view.key_scale.uniform_(0.002, 0.02, generator=rng)
+    view.value_scale.uniform_(0.001, 0.01, generator=rng)
+    q = torch.randn((3, 12, 256), generator=rng).half()
+    table = torch.tensor([[2, 0, 1]], dtype=torch.int32)
+    requests = torch.zeros(3, dtype=torch.int32)
+    indices = torch.full((3, 2051), -1, dtype=torch.int32)[:, :1026]
+    indices[0] = torch.arange(767, 1793)
+    indices[1, :3] = torch.tensor([831, 832, 1664])
+    positions = indices.clamp_min(0).long()
+    pages, offsets = table[requests[:, None], positions // 832].long(), positions % 832
+    k, v, sk, sv = (
+        plane[pages, offsets, 0].float()
+        for plane in (view.key, view.value, view.key_scale, view.value_scale)
+    )
+    valid = indices[:, None, :] >= 0
+    dense_logits = (q.float() @ (k * sk[..., None]).transpose(1, 2)) / 16
+    dense_logits = dense_logits.masked_fill(~valid, -torch.inf)
+    dense_lse = torch.logsumexp(dense_logits, dim=-1) / math.log(2)
+    dense_probs = torch.where(valid, dense_logits.softmax(-1), 0)
+    dense_out = dense_probs @ (v * sv[..., None])
+
+    # Mirror the 64-token partials and their FP32 numerator/max/sum merge.
+    def tiles(x, fill):
+        return torch.nn.functional.pad(x, (0, 62), value=fill).unflatten(-1, (17, 64))
+
+    logits = ((q.float() @ k.transpose(1, 2)) * sk[:, None, :]) * (
+        math.log2(math.e) / 16
+    )
+    scores = tiles(logits.masked_fill(~valid, -torch.inf), -torch.inf)
+    split_max = scores.amax(-1)
+    safe_max = torch.where(split_max.isfinite(), split_max, 0)
+    probabilities = torch.exp2(scores - safe_max[..., None])
+    numerators = torch.einsum(
+        "mhst,mstd->mhsd",
+        probabilities * tiles(sv, 0)[:, None],
+        tiles(v.transpose(1, 2), 0).permute(0, 2, 3, 1),
+    )
+    maximum = split_max.amax(-1, keepdim=True)
+    weights = torch.exp2(split_max - torch.where(maximum.isfinite(), maximum, 0))
+    denominator = (probabilities.sum(-1) * weights).sum(-1)
+    h12_out = (numerators * weights[..., None]).sum(-2) / denominator.clamp_min(1)[
+        ..., None
+    ]
+    h12_lse = maximum.squeeze(-1) + denominator.log2()
+
+    # Isolate the Triton PV rounding from the different split reduction order.
+    weighted = dense_probs * sv[:, None]
+    high = weighted.half().float()
+    low = ((weighted - high) * 2048).half().float() / 2048
+    triton_pv = high @ v + low @ v
+    torch.testing.assert_close(h12_out, dense_out, rtol=2e-5, atol=2e-6)
+    torch.testing.assert_close(h12_lse, dense_lse, rtol=2e-6, atol=2e-6)
+    torch.testing.assert_close(triton_pv, dense_out, rtol=2e-5, atol=2e-6)
+    assert torch.count_nonzero(h12_out[2]) == 0
+    assert torch.isneginf(h12_lse[2]).all()
+
+
 def test_qsa_h12_workspace_survives_capture_lock(monkeypatch):
     assert not KernelConfig().sm70_qsa_paged_fp16_h12
+    default = KernelConfig()
+    assert not default.sm70_qsa_paged_int8_h12
+    assert (
+        default.compute_hash()
+        != KernelConfig(sm70_qsa_paged_int8_h12=True).compute_hash()
+    )
     manager = workspace.WorkspaceManager(torch.device("cpu"))
     monkeypatch.setattr(workspace, "_manager", manager)
     monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
@@ -122,7 +253,7 @@ def test_qsa_h12_workspace_survives_capture_lock(monkeypatch):
         qsa_dcp_sharded=True,
         dcp_partial_output_buffer=torch.empty(128, 12, 256),
         dcp_local_indices_buffer=torch.empty(128, 2051, dtype=torch.int32),
-        sm70_qsa_paged_fp16_h12=True,
+        sm70_qsa_paged_h12=True,
         sm70_qsa_device_history=False,
         indexer=SimpleNamespace(token_topk=2048, compress_ratio=4),
         cp_kv_cache_interleave_size=1,
@@ -130,10 +261,10 @@ def test_qsa_h12_workspace_survives_capture_lock(monkeypatch):
     )
     qsa.Qwen4ExpQSAAttention.reserve_capture_workspace(layer)
     manager.lock()
-    partial, state = qsa_paged_fp16_h12.qsa_paged_fp16_h12_workspace(48, 1026)
+    partial, state = qsa_paged_fp16_h12.qsa_paged_h12_workspace(48, 1026)
     assert partial.shape == (48, 12, 17, 256)
     assert state.shape == (48, 12, 17, 2)
-    smaller, _ = qsa_paged_fp16_h12.qsa_paged_fp16_h12_workspace(6, 1026)
+    smaller, _ = qsa_paged_fp16_h12.qsa_paged_h12_workspace(6, 1026)
     assert smaller.data_ptr() == partial.data_ptr()
 
 

@@ -209,6 +209,8 @@ class QSAIndexer(nn.Module):
         positions: torch.Tensor,
         out: torch.Tensor | None = None,
         select: bool = True,
+        *,
+        row_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Write key caches and optionally select request-relative token indices."""
 
@@ -359,23 +361,35 @@ class QSAIndexer(nn.Module):
 
         # Score compressed keys, select blocks, then expand them to token indices.
         uniform_decode = get_forward_context().is_uniform_decode
+        token_to_req = compressed_metadata.token_to_req
+        logical_positions = compressed_metadata.logical_positions
+        query_start_loc_cpu = compressed_metadata.query_start_loc_cpu
+        prefill_ranges = compressed_metadata.prefill_ranges
+        if row_indices is not None:
+            q = q.index_select(0, row_indices)
+            token_to_req = token_to_req.index_select(0, row_indices)
+            logical_positions = logical_positions.index_select(0, row_indices)
+            # The original request segments refer to the cache-write rows.
+            query_start_loc_cpu = None
+            prefill_ranges = ()
+            uniform_decode = False
         return qsa_select_paged_tokens(
             q,
             compressed_key_cache,
             compressed_metadata.block_table,
-            compressed_metadata.token_to_req,
-            compressed_metadata.logical_positions,
+            token_to_req,
+            logical_positions,
             compressed_metadata.seq_lens,
             self.token_topk,
             self.compress_ratio,
             out,
-            query_start_loc_cpu=compressed_metadata.query_start_loc_cpu,
+            query_start_loc_cpu=query_start_loc_cpu,
             shared_key_scoring=self.shared_key_scoring,
             max_seq_len=compressed_metadata.max_seq_len,
             seq_lens_cpu_upper_bound=compressed_metadata.seq_lens_cpu_upper_bound,
             index_dcp_world_size=compressed_metadata.index_dcp_world_size,
             index_dcp_rank=compressed_metadata.index_dcp_rank,
-            prefill_ranges=compressed_metadata.prefill_ranges,
+            prefill_ranges=prefill_ranges,
             batch_query_starts=(
                 compressed_metadata.query_start_loc if uniform_decode else None
             ),

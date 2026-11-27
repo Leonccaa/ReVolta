@@ -526,6 +526,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         aux_hidden_states: list[torch.Tensor] | None = None,
         hc_sp: bool = False,
         dual_moe_partials: bool = False,
+        row_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | HCTensorParallelPartial, torch.Tensor]:
         attn_hc = self.attn_hyper_connection
         hc_kwargs = {"hc_sp": True} if hc_sp else {}
@@ -572,7 +573,19 @@ class Qwen4ExpDecoderLayer(nn.Module):
         if hc_sp:
             block_input = sp_all_gather(block_input)[: positions.shape[-1]]
 
-        if self.layer_type == "linear_attention":
+        if row_indices is not None:
+            # Single-layer MTP uses all rows for cache writes, then only
+            # the sampled rows need the attention residual and MLP.
+            attn_out = self.self_attn(
+                hidden_states=block_input,
+                positions=positions,
+                output=None,
+                row_indices=row_indices,
+            )
+            hidden_states = hidden_states.index_select(0, row_indices)
+            assert injection is not None
+            injection = injection.index_select(0, row_indices)
+        elif self.layer_type == "linear_attention":
             use_direct_attention_output = (
                 envs.VLLM_SM70_TP4_LONG_PREFILL_FUSED_NORM
                 and torch.compiler.is_compiling()

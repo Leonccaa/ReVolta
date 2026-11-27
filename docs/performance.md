@@ -108,7 +108,7 @@ The 0.1.3 AWQ DFlash2 measurements include sharded selector codebooks (#9) and t
 
 ### Reference system, MTP4
 
-Release configuration: Uncensored AWQ g32, E4M3 KV, TP4 + DCP2, MTP4, on the reference system.
+Historical measurement configuration: Uncensored AWQ g32, E4M3 KV, TP4 + DCP2, MTP4, on the reference system.
 The first table records 0.1.0; the release-to-release comparisons follow below.
 
 | Metric | 0.1.0 |

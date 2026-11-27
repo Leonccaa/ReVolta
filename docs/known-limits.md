@@ -9,9 +9,10 @@ all GPUs under one PCIe switch with P2P, are the recommended and tested intercon
 The reference system uses four V100 32 GB PCIe cards behind one PCIe switch
 (PIX/PXB in `nvidia-smi topo -m`), with P2P enabled and a 128 GiB container memory limit.
 
-The release results below use the documented scalar E4M3 recipes. On V100,
-eligible QSA `auto` selects planar INT8. Use `fp8_per_token_head` to select
-dynamic planar E4M3 explicitly. See the [dtype comparison](configuration.md#launch-options).
+The reference recipe uses planar INT8 target KV (`auto` on SM70); the MTP draft
+KV inherits it. Earlier release acceptance used scalar E4M3 KV, an optional, frozen
+format, and the results below were measured with scalar E4M3 KV unless noted.
+See the [dtype comparison](configuration.md#launch-options).
 
 ## Support matrix
 
@@ -59,11 +60,12 @@ GGUF are outside the build.
 - **Long context.** Release retrieval is tested at 211K. The previous production
   build retrieved 20/20 needles at 489K. At 512K, the test covers capacity and the
   input/output boundary.
-- **Memory.** The default GPU utilization of 0.95 passed multimodal stress. Retest
-  memory use when changing concurrency or media limits. By default the AWQ PLE table
-  needs about 48 GiB of pinned host memory, and 80 GiB is the smallest tested limit that
-  passed memory stress on that path with KV offload off. The experimental disk option
-  below served under a 32 GiB limit.
+- **Memory.** The earlier E4M3 recipe passed multimodal stress at GPU utilization
+  0.95. See [Launch options](configuration.md#launch-options) for the INT8 reference
+  setting. Retest memory use when changing concurrency or media limits. By default the
+  AWQ PLE table needs about 48 GiB of pinned host memory, and 80 GiB is the smallest
+  tested limit that passed memory stress on that path with KV offload off. The
+  experimental disk option below served under a 32 GiB limit.
 - **PLE cascade.** Cascade (`ple_disk_cascade=true`) spills the part of the PLE table
   that does not fit in host memory to the checkpoint files. It is not supported yet
   and is off by default in the ReVolta profile; full support is planned for 0.2.

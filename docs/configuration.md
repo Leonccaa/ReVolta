@@ -84,7 +84,7 @@ the same commit, or a Custom AR sidecar that exports both
 | `float16` / `bfloat16` | Explicit model-precision storage, subject to existing hardware and backend support |
 
 QSA auto selection uses the existing `qsa_auto_e4m3` policy and requires QSA selector
-metadata, a supported operator dtype/device, no runtime scale calculation and
+metadata, a supported operator dtype/device, `--calculate-kv-scales` unset and
 prefill context parallelism of one. Otherwise the existing auto/model-dtype
 rules apply. Explicit values take precedence and retain their backend admission
 requirements. MTP inherits the target KV format in both GPU and Host KV mode
@@ -102,8 +102,8 @@ its existing inline layout for `int8_per_token_head`.
 `fp8_per_token_head` uses four page regions `[K | V | sK | sV]`, not upstream
 vLLM's inline FP8 page ABI. The old `fp8_e4m3_per_token_head` name is removed
 without an alias. Ordinary Triton attention does not accept the planar format;
-QSA uses its own backend. The explicit scalar recipes and their historical
-measurements remain unchanged; planar GPU acceptance is still pending.
+QSA uses its own backend. The scalar E4M3 recipes and their historical
+measurements remain available; planar E4M3 GPU acceptance is still pending.
 
 - **`--enable-dashboard` (boolean, default `false`, experimental).** Enable the
   Python API server's built-in aggregate metrics page at `/dashboard/`. All rate
@@ -151,9 +151,10 @@ measurements remain unchanged; planar GPU acceptance is still pending.
   Request draining and SSD flush deadlines are unchanged. Terminal EngineCore
   shutdown completes scheduler persistence before waiting for retired workers.
   The container stop grace period must also cover this process-exit wait.
-- **`--gpu-memory-utilization 0.95`** passed the full gate, including the multimodal
-  stress test with 8 concurrent requests. Higher values ran out of memory in earlier
-  multimodal stress tests. If you change concurrency or media limits, measure again.
+- **`--gpu-memory-utilization 0.956`** is used by the INT8 reference recipe. Keep the
+  GPUs free of other processes that use GPU memory. The earlier scalar E4M3 recipe
+  passed 8-request multimodal stress at `0.95`; higher values ran out of memory in
+  earlier tests. If you change concurrency or media limits, measure again.
 - The reference scheduler settings are explicit deployment overrides. See [Mixed prefill scheduling](#mixed-prefill-scheduling) for the launch defaults.
 - `cpu_bytes_to_use` is the total for all four workers (48 GiB = 12 GiB per worker).
 - **Keep `--limit-mm-per-prompt` on V100.** With FlashAttention-V100, the engine allows

@@ -242,7 +242,7 @@ def test_dcp_column_shards_do_not_row_split(monkeypatch):
         qsa, "_qsa_mqa_cublas", lambda q, k, valid, v: (_ for _ in ()).throw(Scored(v))
     )
     with pytest.raises(Scored) as exc:
-        _select(2048, NS(world_size=4, rank_in_group=0), world=2)
+        _select(2048, NS(world_size=4, rank_in_group=0), world=4)
     assert exc.value.visible.numel() == 2048
 
 

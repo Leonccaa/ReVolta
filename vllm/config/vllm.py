@@ -1969,10 +1969,19 @@ class VllmConfig:
             )
         if self.kernel_config.qsa_dcp_index_shard is None:
             self.kernel_config.qsa_dcp_index_shard = False
+            spec = self.speculative_config
             if (
                 revolta_hybrid_serving
-                and self.speculative_config is not None
-                and self.speculative_config.use_dflash()
+                and spec is not None
+                and (
+                    spec.use_dflash()
+                    # Host KV MTP keeps the draft's main K/V on the host only
+                    # when the index is sharded.
+                    or (
+                        spec.method == "mtp"
+                        and self.kernel_config.long_context_kv.enabled
+                    )
+                )
             ):
                 from vllm.models.qwen4_exp.config import QSA_INDEX_DCP_SHARD_TOPK
 

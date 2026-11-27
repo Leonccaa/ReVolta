@@ -50,12 +50,12 @@ DFlash2 drafts do not need these K/V scales. Their own configuration is in
 The AWQ, Standard NVFP4 and NVIDIA FP4-Local examples below show the optional,
 frozen scalar `fp8_e4m3` setup for target and MTP. The strict-scale and scale-pack
 instructions apply to that format. The [reference launch](getting-started.md#4-launch)
-uses `auto` for the target and explicitly sets FP16 draft KV. Omitting the target
-option also selects `auto`: planar INT8 for eligible QSA models on SM70 and planar
-`fp8_per_token_head` on other supported CUDA devices. Both compute scales at
-runtime and need no KV scale overlay. MTP inherits the target format when the
-draft dtype is omitted. On supported QSA Model Runner V2 configurations, an
-explicit FP16 draft can also be used with an 8-bit target.
+uses `auto` for the target and lets the MTP draft inherit its INT8 KV. Omitting
+the target option also selects `auto`: planar INT8 for eligible QSA models on
+SM70 and planar `fp8_per_token_head` on other supported CUDA devices. Both compute
+scales at runtime and need no KV scale overlay. MTP inherits the target format
+when the draft dtype is omitted. On supported QSA Model Runner V2 configurations,
+an explicit FP16 draft can also be used with an 8-bit target.
 SM70 QSA DFlash/DFlash2 defaults to FP16 draft KV. See the
 [KV dtype comparison](configuration.md#launch-options) for eligibility and ABI.
 
@@ -333,8 +333,8 @@ vllm serve /data/revolta/views/nvfp4-qad/target-512k \
 ## Weight and KV formats
 
 V100 stores compressed weights and KV, then converts them to FP16 for computation.
-The reference recipe is AWQ g32 with planar INT8 target KV (`auto` on SM70)
-and FP16 MTP draft KV. Calibrated scalar E4M3 KV is optional and frozen.
+The reference recipe is AWQ g32 with planar INT8 target KV (`auto` on SM70),
+which the MTP draft inherits. Calibrated scalar E4M3 KV is optional and frozen.
 Use `fp8_per_token_head` for dynamic planar E4M3.
 
 ## Quantization comparison

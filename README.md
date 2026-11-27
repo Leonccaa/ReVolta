@@ -67,7 +67,7 @@ docker pull ghcr.io/leonccaa/revolta:0.1.5
 
 Follow [Getting started](docs/getting-started.md) to download the pinned checkpoint,
 make the target and draft views, apply the environment settings, launch and check the API.
-The reference configuration uses INT8 target KV and FP16 MTP draft KV.
+The reference configuration uses INT8 target KV, which the MTP draft inherits.
 
 For another checkpoint, use its [preparation guide](docs/checkpoints.md) before launching.
 

@@ -4,8 +4,8 @@ This tutorial installs and launches the reference configuration. Before starting
 [hardware scope](known-limits.md) and [host memory requirements](configuration.md#system-memory-and-storage).
 
 Reference configuration: Uncensored AWQ g32, TP4 + DCP2,
-MTP4 greedy draft, INT8 target KV and FP16 draft KV, 512K context through YaRN,
-multimodal input, 8 concurrent requests in testing, and a 48 GiB CPU KV pool.
+MTP4 greedy draft with KV inherited from the INT8 target, 512K context through
+YaRN, multimodal input, 8 concurrent requests in testing, and a 48 GiB CPU KV pool.
 
 ## 1. Install
 
@@ -146,8 +146,7 @@ vllm serve /data/revolta/views/target-512k \
       "quantization": "modelopt_mixed",
       "num_speculative_tokens": 4,
       "draft_sample_method": "greedy",
-      "attention_backend": "FLASH_ATTN_V100",
-      "kv_cache_dtype": "float16"}' \
+      "attention_backend": "FLASH_ATTN_V100"}' \
   --attention-backend FLASH_ATTN_V100 \
   --prefill-pressure-token-budget 1024 \
   --prefill-pressure-threshold 1 \
@@ -175,9 +174,10 @@ vllm serve /data/revolta/views/target-512k \
 Notes:
 
 - `--kv-cache-dtype auto` selects planar INT8 for this QSA target on SM70 (V100).
-  The MTP draft uses FP16 KV. INT8 computes scales at runtime, so no separate KV
-  scale pack or scale-enriched view is needed. For calibrated E4M3 KV (a frozen
-  format), see [Checkpoints](checkpoints.md#e4m3-kv).
+  The MTP draft inherits the target's INT8 KV. To use FP16 draft KV instead,
+  set `"kv_cache_dtype": "float16"` in `--speculative-config`. INT8 computes
+  scales at runtime, so no separate KV scale pack or scale-enriched view is
+  needed. For calibrated E4M3 KV (a frozen format), see [Checkpoints](checkpoints.md#e4m3-kv).
 - **Startup** takes roughly 10–15 minutes: weight and PLE loading, `torch.compile`
   and CUDA graph capture. Later starts reuse the compile cache. After an upgrade that
   cache can still be incomplete: keeping the 0.1.3 cache, MTP4 and DFlash2 each compiled
@@ -245,8 +245,7 @@ docker run --rm --gpus all \
       "quantization": "modelopt_mixed",
       "num_speculative_tokens": 4,
       "draft_sample_method": "greedy",
-      "attention_backend": "FLASH_ATTN_V100",
-      "kv_cache_dtype": "float16"}' \
+      "attention_backend": "FLASH_ATTN_V100"}' \
   ...
 ```
 

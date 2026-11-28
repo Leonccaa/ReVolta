@@ -57,9 +57,17 @@ Cold prefill uses one request and divides the actual prompt length by median pre
 
 ![Host KV: the GPU keeps the model, the attention index and hot pages; RAM keeps the full K/V history of every session; an optional SSD keeps pages across restarts](https://raw.githubusercontent.com/Leonccaa/ReVolta/main/docs/images/host-kv.svg)
 
-- **Why:** after the model, a 32 GB V100 has about 6.3 GiB left for KV, so four GPUs hold two or three 512K sessions. Flash-Next's sparse attention reads only the selected past tokens each step, so the rest of the history can wait in RAM, which V100 servers have plenty of.
-- **How much:** **1.31M → 7.33M tokens** with a 98 GiB store (5.6×), and eight 1M-token sessions with a 192 GiB store. The cost is **2–4 ms per decode round** (16.4 → 19.7 ms at one request on NVLink).
-- **For whom:** small and medium teams that share one server for coding agents, long documents and research sessions that stay open for hours and are revisited over days, on servers with plenty of RAM and an NVMe SSD.
+- **Why:** after the model, a 32 GB V100 has about 6.3 GiB left for KV. A request that is decoding needs all of its K/V on the GPU, so four GPUs run only two or three 512K sessions at a time and the rest queue; a CPU KV pool saves recomputation for waiting requests but does not let more of them run. Flash-Next's sparse attention reads only the selected past tokens each step, so the history can wait in RAM, which V100 servers have plenty of.
+- **Eight long sessions really run at once:**
+
+| Sessions running at once, each at full length | 256K | 512K | 1M |
+| --- | ---: | ---: | ---: |
+| GPU KV (1.19M / 1.85M-token pool, MTP4 / DFlash2) | 4 / 7 | 2 / 3 | 1 |
+| Host KV, 98 GiB store | **8** | **8** | 6–7 |
+| Host KV, 192 GiB store | **8** | **8** | **8** |
+
+- **Cost:** **2–4 ms per decode round** (16.4 → 19.7 ms at one request on NVLink); the KV that fits grows from 1.31M to **7.33M tokens** with 98 GiB (5.6×).
+- **For whom:** small and medium teams that share one server for coding agents, long documents and research sessions that stay open for hours and are revisited over days, on a server with plenty of RAM and an NVMe SSD.
 
 How it works, sizing and when GPU KV is the better choice: [Host KV](https://github.com/Leonccaa/ReVolta/blob/main/docs/host-kv.md).
 

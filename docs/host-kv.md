@@ -1,6 +1,6 @@
 # Host KV: how it works and when to use it
 
-Host KV keeps the attention history of every active session in system RAM instead of GPU memory. The GPU keeps the model, the attention index and a small pool of the pages it reads right now. On four V100 32 GB GPUs this raises the KV that fits from about 1.3 million tokens to **7.3 million tokens with a 98 GiB store**, at a cost of **2–4 ms per decode round**. An optional SSD keeps the pages across restarts.
+Host KV keeps the attention history of every active session in system RAM instead of GPU memory. The GPU keeps the model, the attention index and a small pool of the pages it reads right now. On four V100 32 GB GPUs this lets **eight 512K sessions run at the same time** with a 98 GiB store (eight 1M sessions with 192 GiB), where GPU KV runs two or three and queues the rest. It costs **2–4 ms per decode round**. An optional SSD keeps the pages across restarts.
 
 ![Host KV: the GPU keeps the model, the attention index and hot pages; RAM keeps the full K/V history of every session; an optional SSD keeps pages across restarts](images/host-kv.svg)
 
@@ -8,10 +8,27 @@ This page explains the idea, the numbers and the use cases. Settings, requiremen
 
 ## Why we built it
 
-- **GPU memory runs out first.** After the model and runtime buffers, a 32 GB V100 has about 6.3 GiB left for the KV cache. Across four GPUs that holds 1.2–1.9 million tokens: two or three full 512K sessions.
+- **GPU memory runs out first.** After the model and runtime buffers, a 32 GB V100 has about 6.3 GiB left for the KV cache. Across four GPUs that holds 1.2–1.9 million tokens: two or three full 512K sessions at a time. The other requests wait in the queue (see [below](#eight-long-sessions-at-once)).
 - **Teams keep long sessions open.** A small team working all day with coding agents and long documents keeps many long sessions open and comes back to them hours or days later. When the GPU pool is full, older sessions are evicted, and coming back to a 32K document then costs **8.5 s** of recomputation (33 s at 128K).
 - **The memory is already in the server.** V100 servers usually have far more system RAM and NVMe storage than VRAM.
 - **The model does not read the whole history.** Qwen3.8 Flash-Next uses sparse attention (QSA): a compressed index scores the past tokens, and each step reads only the selected groups. Most of the history can therefore stay off the GPU without being touched.
+
+## Eight long sessions at once
+
+A GPU KV pool of 1.2–1.8 million tokens does not mean that eight long sessions run at once. Every request that is decoding needs **all of its K/V in GPU memory**, and the scheduler admits a request only when its blocks fit. The number of long requests that run together is therefore at most the pool size divided by the context length, and in practice lower: the pool is allocated in whole blocks and has to absorb each request's growth while it decodes, so even eight requests of 150–230K each start to queue or get preempted before the pool is nominally full. A CPU KV pool does not change this limit: it keeps the K/V of evicted or preempted requests so that they do not have to be recomputed when they get their turn, but they still wait for that turn.
+
+With Host KV the full history is in RAM and the GPU only needs the index and the hot pages, so the limit becomes the host store:
+
+| Sessions running at once, each at full length | 256K | 512K | 1M |
+| --- | ---: | ---: | ---: |
+| GPU KV, AWQ + MTP4 (1,194,816-token pool) | 4 | 2 | 1 |
+| GPU KV, AWQ + DFlash2 (1,851,676-token pool) | 7 | 3 | 1 |
+| Host KV, 98 GiB store | **8** | **8** | 6–7 |
+| Host KV, 192 GiB store | **8** | **8** | **8** |
+
+- GPU KV rows: the pool size from the 0.2.0 startup log divided by the context (the startup log prints the same number as "Maximum concurrency"; 2.28× and 3.53× at 512K). A 1M context needs the 1M checkpoint view and `--max-model-len 1048576`.
+- Host KV rows: the engine's startup plan at 512K with 98 GiB (measured; eight is set by the GPU recurrent-state slots and `--max-num-seqs 8`) and the planner arithmetic of 0.2.0rc15 for 1M (seven with DFlash2 and six with MTP4 at 98 GiB, eight at 192 GiB). In this setup eight is the limit of those slots and of `--max-num-seqs`, not of the host store.
+- When a session does not fit, it waits in the queue. Host KV never rejects a request or returns an error for lack of memory; it waits like a full GPU pool does.
 
 ## How it works
 
@@ -49,7 +66,16 @@ The traffic per step is small. For example, if two verify rows select groups `[8
 | NVLink, NVFP4 + MTP5 (same launch) | 1,305,719 tokens | **7,330,944 tokens (5.6×)** |
 | PCIe, AWQ | 1,194,816 tokens (MTP4) | **7,329,312 tokens** (MTP5) |
 
-- **Per token,** the host store takes about 13.2 KB with DFlash2 and 14.4 KB with MTP4 (INT8, all four GPUs together). Divide the store size by this for a first estimate.
+- **Per token,** the host store takes about 13.2 KB with DFlash2 and 14.4 KB with MTP4 (INT8, all four GPUs together), so 1 GiB holds about 81,000 or 75,000 tokens. The main K/V of eight sessions needs:
+
+| Eight sessions of | DFlash2 | MTP4 |
+| ---: | ---: | ---: |
+| 256K | 26 GiB | 28 GiB |
+| 512K | 52 GiB | 56 GiB |
+| 1M | 104 GiB | 112 GiB |
+
+  The store also holds recurrent-state checkpoints and drafter pages, so leave headroom; the Host KV plan in the startup log gives the real limits for your settings.
+
 - **FP16 KV** holds about half as many tokens (3,832,192 in the same 98 GiB) and is slower; keep the INT8 default.
 - **Long contexts** (planner arithmetic in 0.2.0rc15, AWQ, INT8, 8 sequences):
 
@@ -60,6 +86,17 @@ The traffic per step is small. For example, if two verify rows select groups `[8
 | 1M | 192 GiB | 8 |
 
 Eight 1M-token sessions need 24.38 GiB of main K/V per GPU if kept in VRAM, against about 6.3 GiB available; in RAM they need 103.66 GiB ([#321](https://github.com/Leonccaa/ReVolta/pull/321)). A public report ran one request with **1,041,485 prompt tokens** in Host KV mode on four NVLink V100s with a 256 GiB store ([#199](https://github.com/Leonccaa/ReVolta/issues/199)).
+
+## Plan the server
+
+| Part | Size | Notes |
+| --- | --- | --- |
+| PLE embedding tables | about 48 GiB (AWQ), 27 GiB (FP4-Local) | In RAM in every KV mode. |
+| Host KV store | from the table above | `host_store_gib`; lives in `/dev/shm`, so give the container a larger `--shm-size`. |
+| Operating system, page cache, other processes | leave 16–32 GiB | |
+| SSD tier (optional) | about the same bytes per token as the store | For eight 1M sessions, about 110–120 GB of pages. Use a local NVMe drive. |
+
+As a rule of thumb: about 128 GiB of RAM for eight 256K sessions, 160 GiB for eight 512K and 256 GiB or more for eight 1M with AWQ. The reference 128 GiB host runs the 48 GiB example store from [KV offload](kv-offload.md#configure-host-kv).
 
 ## What it costs
 
@@ -79,7 +116,7 @@ Accepted draft length was the same in both modes. On PCIe with AWQ + DFlash2 (0.
 
 - A small or medium team shares one server for long-running work: coding agents, long documents and research sessions that stay open for hours and are revisited over days.
 - The active sessions together need more context than the GPU pool holds, for example eight 512K sessions (4.2 million tokens) against a 1.3 million-token GPU pool.
-- The server has plenty of RAM and an NVMe SSD. Plan for the PLE table (about 48 GiB for AWQ, 27 GiB for FP4-Local) plus the Host KV store plus the operating system: about 256 GB for a 98 GiB store, 384 GB or more for 192 GiB.
+- The server has plenty of RAM and an NVMe SSD. Plan the RAM as in [Plan the server](#plan-the-server).
 
 **Stay with GPU KV when:**
 

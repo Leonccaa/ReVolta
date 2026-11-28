@@ -57,7 +57,7 @@ Cold prefill uses one request and divides the actual prompt length by median pre
 
 ![Host KV: the GPU keeps the model, the attention index and hot pages; RAM keeps the full K/V history of every session; an optional SSD keeps pages across restarts](https://raw.githubusercontent.com/Leonccaa/ReVolta/main/docs/images/host-kv.svg)
 
-- **Why:** after the model, a 32 GB V100 has about 6.3 GiB left for KV. A request that is decoding needs all of its K/V on the GPU, so four GPUs run only two or three 512K sessions at a time and the rest queue; a CPU KV pool saves recomputation for waiting requests but does not let more of them run. Flash-Next's sparse attention reads only the selected past tokens each step, so the history can wait in RAM, which V100 servers have plenty of.
+- **Why:** after the model, a 32 GB V100 has about 6.3 GiB left for KV. A request that is decoding needs all of its K/V on the GPU, so four GPUs run only two or three 512K sessions at a time and the rest queue; a CPU KV pool saves recomputation for waiting requests but does not let more of them run. Two or three full-length sessions also push the cached K/V of the team's other sessions out to RAM, and each of those sessions waits for its prefix to be loaded back on its next turn. With Host KV every session's K/V stays in RAM and is read in place. Flash-Next's sparse attention reads only the selected past tokens each step, so the history can wait in RAM, which V100 servers have plenty of.
 - **Eight long sessions really run at once:**
 
 | Sessions running at once, each at full length | 256K | 512K | 1M |

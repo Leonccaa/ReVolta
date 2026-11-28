@@ -296,25 +296,7 @@ def _pack_router_batch_weight(weight: torch.Tensor) -> torch.Tensor:
     )
 
 
-def _shared_batch_runtime_ok(x: torch.Tensor) -> bool:
-    return bool(
-        envs.VLLM_SM70_MTP_SHARED_BATCH
-        and not envs.VLLM_BATCH_INVARIANT
-        and x.ndim == 2
-        and x.shape[0] in (5, 10)
-        and x.shape[1] == 2560
-        and x.is_cuda
-        and x.dtype == torch.float16
-        and x.is_contiguous()
-        and x.data_ptr() % 16 == 0
-        and torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
-        and not torch.backends.cuda.matmul.allow_fp16_accumulation
-    )
-
-
-def _shared_fp32_batch_runtime_ok(x: torch.Tensor) -> bool:
-    # 1Cat v1.5.4: MTP verify rows keep FP32 split partials when cuBLAS
-    # reduced-precision reduction is off.
+def _shared_batch_input_ok(x: torch.Tensor) -> bool:
     return bool(
         envs.VLLM_SM70_MTP_SHARED_BATCH
         and not envs.VLLM_BATCH_INVARIANT
@@ -325,21 +307,46 @@ def _shared_fp32_batch_runtime_ok(x: torch.Tensor) -> bool:
         and x.dtype == torch.float16
         and x.is_contiguous()
         and x.data_ptr() % 16 == 0
-        and not torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
         and not torch.backends.cuda.matmul.allow_fp16_accumulation
     )
+
+
+def _shared_batch_runtime_ok(x: torch.Tensor) -> bool:
+    return bool(
+        _shared_batch_input_ok(x)
+        and x.shape[0] in (5, 10)
+        and torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
+    )
+
+
+def _pack_shared_up_weight(weight: torch.Tensor) -> torch.Tensor:
+    return (
+        weight.detach().reshape(10, 32, 160, 2, 8).permute(0, 2, 3, 1, 4).contiguous()
+    )
+
+
+def _refresh_shared_up_pack(layer: nn.Module) -> None:
+    # Kernel-format weight updates write only the parameter; keep the pack
+    # address that captured graphs read.
+    layer._sm70_mtp_shared_packed.copy_(_pack_shared_up_weight(layer.weight))
 
 
 def _qwen38_sm70_shared_up(
     x: torch.Tensor, weight: torch.Tensor, packed: torch.Tensor | None
 ) -> torch.Tensor:
-    if _shared_batch_runtime_ok(x) and packed is not None:
+    if packed is not None and _shared_batch_runtime_ok(x):
         out = x.new_empty((x.shape[0], 160))
         partial = x.new_empty((8, x.shape[0], 320))
         torch.ops._C.qwen38_shared_up_batch_sm70_out(out, partial, x, packed)
         logger.info_once("SM70 MTP4 exact shared-expert batch projection enabled.")
         return out
-    if packed is not None and _shared_fp32_batch_runtime_ok(x):
+    if (
+        packed is not None
+        and _shared_batch_input_ok(x)
+        and not torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
+    ):
+        # 1Cat v1.5.4: MTP verify rows keep FP32 split partials when cuBLAS
+        # reduced-precision reduction is off.
         out = x.new_empty((x.shape[0], 160))
         partial = x.new_empty((0,), dtype=torch.float32)
         torch.ops._C.qwen38_shared_up_batch_fp32_sm70_out(out, partial, x, packed)
@@ -405,22 +412,6 @@ def _qwen38_sm70_shared_down_gated(
     out = torch.nn.functional.linear(act_out, down_weight)
     torch.ops._C.qwen38_shared_gate_dot_mul_sm70_out(out, x, gate_weight)
     return out
-
-
-def _qwen38_sm70_shared_down_gated_fake(
-    x: torch.Tensor,
-    act_out: torch.Tensor,
-    down_weight: torch.Tensor,
-    gate_weight: torch.Tensor,
-) -> torch.Tensor:
-    return x.new_empty((*x.shape[:-1], 2560))
-
-
-direct_register_custom_op(
-    op_name="qwen38_sm70_shared_down_gated",
-    op_func=_qwen38_sm70_shared_down_gated,
-    fake_impl=_qwen38_sm70_shared_down_gated_fake,
-)
 
 
 def _forward_shared_batch_silu(layer, x):
@@ -791,11 +782,11 @@ class Qwen38SM70FP16LinearMethod(UnquantizedLinearMethod):
                     raise RuntimeError("Rebuild the SM70 extension for shared expert")
                 layer.register_buffer(
                     "_sm70_mtp_shared_packed",
-                    weight.detach()
-                    .reshape(10, 32, 160, 2, 8)
-                    .permute(0, 2, 3, 1, 4)
-                    .contiguous(),
+                    _pack_shared_up_weight(weight),
                     persistent=False,
+                )
+                layer.refresh_derived_weights = MethodType(
+                    _refresh_shared_up_pack, layer
                 )
         if getattr(layer, "_sm70_qwen38_hc_batch_role", None) is not None:
             from .sm70_fp16_hc import _prepare_hc_batch_weight

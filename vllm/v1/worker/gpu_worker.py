@@ -1553,6 +1553,9 @@ class Worker(WorkerBase):
             )
 
         from vllm.model_executor.model_loader.reload import validate_weight_reload
+        from vllm.model_executor.model_loader.weight_utils import (
+            refresh_derived_weights,
+        )
 
         validate_weight_reload(self.model_runner.model)
 
@@ -1580,6 +1583,7 @@ class Worker(WorkerBase):
                     typed_update_info,
                     load_weights=load_weights_direct,
                 )
+                refresh_derived_weights(model)
 
         # NCCL broadcast/packed path are asynchronous.
         # Sync here so the next step uses the new weights.

@@ -52,6 +52,7 @@ from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -210,8 +211,6 @@ class Qwen2MoeMLP(nn.Module):
             gate_up = _sm70_dump_qwen_mlp_tensor("mlp_gate_up", self.layer_idx, gate_up)
             out = self.act_fn(gate_up)
         out = _sm70_dump_qwen_mlp_tensor("mlp_silu_out", self.layer_idx, out)
-        down_weight = getattr(self.down_proj, "weight", None)
-        gate_weight = getattr(self.expert_gate, "weight", None)
         if (
             self._sm70_batch_shared_expert_gate
             and getattr(self.gate_up_proj, "_sm70_mtp_prepare_shared_batch", False)
@@ -219,14 +218,22 @@ class Qwen2MoeMLP(nn.Module):
             and 2 <= x.shape[0] <= 64
             and x.is_contiguous()
             and out.is_contiguous()
-            and isinstance(down_weight, torch.Tensor)
-            and down_weight.dtype == torch.float16
-            and isinstance(gate_weight, torch.Tensor)
-            and gate_weight.dtype == torch.float16
+            # LoRA wrappers have no quant_method; their forward adds the delta.
+            and isinstance(
+                getattr(self.down_proj, "quant_method", None), UnquantizedLinearMethod
+            )
+            and isinstance(
+                getattr(self.expert_gate, "quant_method", None),
+                UnquantizedLinearMethod,
+            )
             and not torch.backends.cuda.matmul.allow_fp16_accumulation
         ):
-            out = torch.ops.vllm.qwen38_sm70_shared_down_gated(
-                x, out, down_weight, gate_weight
+            from vllm.models.qwen4_exp.nvidia.sm70_fp16_gemv import (
+                _qwen38_sm70_shared_down_gated,
+            )
+
+            out = _qwen38_sm70_shared_down_gated(
+                x, out, self.down_proj.weight, self.expert_gate.weight
             )
             return _sm70_dump_qwen_mlp_tensor(
                 "mlp_after_expert_gate", self.layer_idx, out

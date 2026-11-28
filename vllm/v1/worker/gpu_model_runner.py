@@ -79,6 +79,7 @@ from vllm.model_executor.model_loader.reload import (
     initialize_layerwise_reload,
     validate_weight_reload,
 )
+from vllm.model_executor.model_loader.weight_utils import refresh_derived_weights
 from vllm.model_executor.models.interfaces import (
     MixtureOfExperts,
     MultiModalEmbeddings,
@@ -10785,6 +10786,7 @@ class GPUModelRunner(
                     )
 
                     refresh_hc_batch_weight(layer)
+            refresh_derived_weights(model)
 
         # logging and validation
         counter_after_reloading = time.perf_counter()

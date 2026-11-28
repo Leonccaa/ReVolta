@@ -264,3 +264,64 @@ def test_shared_fp32_batch_routes_mtp_rows(rows, monkeypatch):
     assert native == ([x.shape] if 2 <= rows <= 64 else [])
     assert actual.shape == (rows, 160)
     torch.testing.assert_close(actual, fallback, atol=0, rtol=0)
+
+
+def _shared_model(monkeypatch):
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+    torch.backends.cuda.matmul.allow_fp16_accumulation = False
+    layer = make_layer("shared")
+    prepare_on_cpu(layer, monkeypatch)
+    model = torch.nn.Module()
+    model.gate_up_proj = layer
+    return model, layer
+
+
+def _assert_pack_refreshed(layer, packed, ptr):
+    assert layer._sm70_mtp_shared_packed is packed
+    assert packed.data_ptr() == ptr
+    expected = layer.weight.reshape(10, 32, 160, 2, 8).permute(0, 2, 3, 1, 4)
+    assert torch.equal(packed, expected)
+
+
+def test_kernel_format_reload_refreshes_shared_pack(monkeypatch):
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    model, layer = _shared_model(monkeypatch)
+    packed = layer._sm70_mtp_shared_packed
+    ptr = packed.data_ptr()
+    runner = SimpleNamespace(
+        get_model=lambda: model, model_config=SimpleNamespace(quantization=None)
+    )
+    new_weight = torch.flip(layer.weight.detach(), dims=(1,)).clone()
+    GPUModelRunner.reload_weights(
+        runner,
+        weights_iterator=[("gate_up_proj.weight", new_weight)],
+        is_checkpoint_format=False,
+    )
+    assert torch.equal(layer.weight, new_weight)
+    _assert_pack_refreshed(layer, packed, ptr)
+
+
+def test_kernel_format_weight_update_refreshes_shared_pack(monkeypatch):
+    from vllm.v1.worker.gpu_worker import Worker
+
+    model, layer = _shared_model(monkeypatch)
+    packed = layer._sm70_mtp_shared_packed
+    ptr = packed.data_ptr()
+    new_weight = torch.flip(layer.weight.detach(), dims=(1,)).clone()
+    engine = SimpleNamespace(
+        parse_update_info=lambda info: info,
+        receive_weights=lambda info, load_weights: load_weights(info),
+    )
+    worker = SimpleNamespace(
+        weight_transfer_engine=engine,
+        _check_weight_transfer_engine=lambda: None,
+        _weight_update_active=True,
+        _is_checkpoint_format=False,
+        model_runner=SimpleNamespace(model=model),
+        device="cpu",
+    )
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    Worker.update_weights(worker, [("gate_up_proj.weight", new_weight)])
+    assert torch.equal(layer.weight, new_weight)
+    _assert_pack_refreshed(layer, packed, ptr)

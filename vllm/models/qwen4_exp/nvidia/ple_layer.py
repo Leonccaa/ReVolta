@@ -204,21 +204,27 @@ def _gather_ple_fp8_from_pinned_kernel(
     embedding_dim: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    """Gather and dequantize one PLE row per program from pinned host memory."""
+    """Gather and dequantize one PLE row per program from pinned host memory.
+
+    A negative id marks a row this gather does not own; it is written as
+    zeros without touching the table. Pointing such rows at a real row
+    instead makes them all read the same address, which PCIe serializes.
+    """
 
     # int64 row offsets: row * embedding_dim overflows int32 past 2**31.
     row_idx = tl.program_id(0).to(tl.int64)
     local_idx = tl.load(ids_ptr + row_idx).to(tl.int64)
+    valid = local_idx >= 0
     offsets = tl.arange(0, BLOCK_D)
     mask = offsets < embedding_dim
     byte_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8))
     raw = tl.load(
         byte_ptr + local_idx * embedding_dim + offsets,
-        mask=mask,
+        mask=offsets < tl.where(valid, embedding_dim, 0),
         other=0,
     )
     scale = tl.load(scale_ptr).to(tl.float32)
-    values = _e4m3fn_byte_to_float(raw) * scale
+    values = tl.where(valid, _e4m3fn_byte_to_float(raw) * scale, 0.0)
     tl.store(output_ptr + row_idx * embedding_dim + offsets, values, mask=mask)
 
 
@@ -701,8 +707,9 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
     ``VLLM_QWEN4EXP_PLE_HOST_GIB`` caps the host share. With the overflow
     cascade the rows beyond both resident tiers stay
     unallocated here and arrive from the PLE offload worker. Gathers always
-    read both halves (an unused half reads row 0), because branching on the
-    ids would need a device-to-host sync on every decode step.
+    launch over both halves (an id the half does not own is written as zeros
+    without a read), because branching on the ids would need a device-to-host
+    sync on every decode step.
     """
 
     def __init__(
@@ -1047,13 +1054,12 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
     ) -> torch.Tensor:
         """Gather, merging the rows the PLE offload worker delivered.
 
-        Same masking and reduction as ``VocabParallelEmbedding.forward``. The
-        worker's rows are merged by rank-local id, so that has to happen
-        before the tensor-parallel reduce.
+        Same masking and reduction as ``VocabParallelEmbedding.forward``,
+        except that ids owned by another rank become -1, which the gather
+        writes as zeros without reading the table. The worker's rows are
+        merged by rank-local id, so that has to happen before the
+        tensor-parallel reduce.
         """
-        if remote_rows is None:
-            return super().forward(input_)
-        input_mask = None
         masked_input = input_
         if self.tp_size > 1:
             masked_input, input_mask = get_masked_input_and_mask(
@@ -1064,9 +1070,8 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 self.shard_indices.added_vocab_start_index,
                 self.shard_indices.added_vocab_end_index,
             )
+            masked_input = masked_input.masked_fill(input_mask, -1)
         output_parallel = self.embedding_lookup(masked_input.long(), remote_rows)
-        if input_mask is not None:
-            output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
         return tensor_model_parallel_all_reduce(output_parallel)
 
     def embedding_lookup(
@@ -1075,12 +1080,14 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         """Gather FP8 rows from the device/host split, emit scaled values.
 
         Both gathers always run: branching on whether any id falls into the
-        host half would need a device-to-host sync on every decode step. The
-        unused gather reads row 0 and coalesces.
+        host half would need a device-to-host sync on every decode step. Each
+        gather gets -1 for the ids it does not own and writes zeros for them
+        without reading its table; negative input ids (another rank's rows)
+        stay -1 in both.
 
         ``remote_rows`` are the raw FP8 bytes the PLE offload worker wrote for
         this batch, one row per id in ``input_`` order. Ids beyond the resident
-        rows read row 0 locally and take the worker's row in the final merge,
+        rows skip the local read and take the worker's row in the final merge,
         dequantized by the same kernel arithmetic as the resident gathers.
         """
 
@@ -1103,7 +1110,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         on_remote = None
         if remote_rows is not None:
             on_remote = flat_ids >= self._device_rows + self._host_rows
-            flat_ids = torch.where(on_remote, flat_ids.new_zeros(()), flat_ids)
+            flat_ids = torch.where(on_remote, flat_ids.new_full((), -1), flat_ids)
         output = torch.empty(
             (*input_.shape, self.embedding_dim),
             dtype=self._output_dtype,
@@ -1122,9 +1129,9 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         else:
             boundary = self._device_rows
             on_host = flat_ids >= boundary
-            zero = flat_ids.new_zeros(())
-            device_ids = torch.where(on_host, zero, flat_ids)
-            host_ids = torch.where(on_host, flat_ids - boundary, zero)
+            unowned = flat_ids.new_full((), -1)
+            device_ids = torch.where(on_host, unowned, flat_ids)
+            host_ids = torch.where(on_host, flat_ids - boundary, unowned)
             host_out = torch.empty_like(out_flat)
             torch.ops.vllm.qwen4_exp_ple_pinned_gather(
                 device_ids,

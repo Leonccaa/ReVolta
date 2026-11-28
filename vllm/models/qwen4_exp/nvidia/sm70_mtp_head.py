@@ -15,7 +15,9 @@ from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmb
 class MTPQPN8LogitsProcessor(LogitsProcessor):
     def __init__(self, vocab_size: int, weight: torch.Tensor) -> None:
         super().__init__(vocab_size)
-        codes, scales = prepare_channel_qpn8_weight(weight)
+        # Reuse the identical pack of the bounded target head when prepared.
+        shared = getattr(weight, "_sm70_shared_qpn8", None)
+        codes, scales = shared or prepare_channel_qpn8_weight(weight)
         self.register_buffer("codes", codes, persistent=False)
         self.register_buffer("scales", scales, persistent=False)
 

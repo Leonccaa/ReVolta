@@ -154,7 +154,9 @@ class Arms:
             dcp_partial_output_buffer=torch.empty((tokens, gathered_heads, dim)),
             dcp_partial_lse_buffer=torch.empty((tokens, gathered_heads)),
             indexer=SimpleNamespace(token_topk=topk, compress_ratio=4),
-            sm70_qsa_paged_fp16_h12=False,
+            qsa_draft_native_scales=None,
+            sm70_qsa_paged_int8_h6=False,
+            sm70_qsa_paged_h12=False,
             sm70_qsa_device_history=False,
         )
         self.blocks = {0: [1, 5, 9], 1: [3, 7, 11]}
@@ -213,6 +215,7 @@ class Arms:
         self.impl.forward_qsa(
             self.layer, query, None, None, self.paged, meta, out_gpu,
             token_to_req, output_gate=gate, sequence_lengths=seq_lens,
+            query_positions=torch.tensor([p for _, p in rows], dtype=torch.int64),
         )  # fmt: skip
         partial_gpu = self.layer.dcp_partial_output_buffer[:n].clone()
         lse_gpu = self.layer.dcp_partial_lse_buffer[:n].clone()
@@ -257,3 +260,234 @@ def test_one_pass_split_k_matches_gpu_forward(dcp):
     # top-k 32: 35 columns, three tiles, split-K + merge; one pass per step.
     arms = Arms(e4m3=True, topk=32, rows_per_pass=38, dcp=dcp)
     _trace(arms)
+
+
+@pytest.fixture
+def _int1_compares(monkeypatch):
+    # Some Triton interpreters type comparison results like their operands,
+    # so masks built from them fail in masked loads; compares yield int1.
+    from triton.runtime.interpreter import InterpreterBuilder, TensorHandle
+
+    from vllm.triton_utils import tl
+
+    for name in dir(InterpreterBuilder):
+        if name.startswith(("create_icmp", "create_fcmp")):
+            op = getattr(InterpreterBuilder, name)
+
+            def compare(builder, lhs, rhs, op=op):
+                return TensorHandle(op(builder, lhs, rhs).data, tl.int1)
+
+            monkeypatch.setattr(InterpreterBuilder, name, compare)
+
+
+class PlanarInt8Arms(Arms):
+    """Planar INT8 pages in both arms; DCP2 uniform verify (two rows/request)."""
+
+    def __init__(self, *, h12, **kwargs):
+        import dataclasses
+
+        from vllm.v1.attention.kv_cache_view import KVCacheView, bind_planar_kv_cache
+        from vllm.v1.attention.kv_codecs import INT8
+
+        super().__init__(e4m3=False, **kwargs)
+        shape = dataclasses.replace(
+            self.store.shape,
+            dtype=torch.int8,
+            layout_cache_dtype="int8",
+            decode_rows=2,
+        )
+        self.store = HostHistoryStore(shape, ["attn"], device="cpu")
+        self.store.bind_pages([(hid, 17 - hid) for hid in range(1, 17)])
+        self.host = self.store.layer("attn")
+        raw = torch.zeros(17 * shape.page_bytes, dtype=torch.int8)
+        self.paged = bind_planar_kv_cache(
+            raw,
+            num_blocks=17,
+            scheduler_block_size=KBS,
+            kernel_block_size=KBS,
+            num_heads=1,
+            head_size=self.dim,
+            page_size_bytes=shape.page_bytes,
+            dtype=torch.int8,
+        )
+        self.view = KVCacheView.bind(self.paged, INT8, self.dim)
+        self.kv_dtype = self.impl.kv_cache_dtype = "int8"
+        self.layer.sm70_qsa_paged_h12 = h12
+
+    def write(self, req, positions):
+        key = torch.randn((len(positions), 1, self.dim), generator=self.gen).half()
+        value = torch.randn(key.shape, generator=self.gen).half()
+        span = KBS * self.world
+        slots = torch.tensor(
+            [
+                self.blocks[req][p // span] * KBS + p // self.world % KBS
+                if p % self.world == self.rank
+                else -1
+                for p in positions
+            ],
+            dtype=torch.int64,
+        )
+        self.host.write(
+            key, value, slots, "int8", self.layer._k_scale, self.layer._v_scale
+        )
+        # The GPU arm holds the host writer's encoded bytes and scales.
+        stage = self.host.staging_cache
+        for row, slot in enumerate(slots.tolist()):
+            if slot >= 0:
+                for name in ("key", "value", "key_scale", "value_scale"):
+                    page = getattr(self.view, name)
+                    page[slot // KBS, slot % KBS] = getattr(stage, name)[row, 0]
+        self.length[req] = max(self.length[req], positions[-1] + 1)
+
+
+@pytest.mark.usefixtures("_int1_compares")
+def test_planar_int8_h6_reads_the_hot_pool(monkeypatch):
+    from vllm.compilation.sm70_decode_graph import sm70_decode_graph_compilation
+    from vllm.forward_context import get_forward_context, set_forward_context
+    from vllm.v1.worker import workspace
+
+    from .test_qsa_paged_fp16_h12_cpu import _forward_config, h12_late_scale
+
+    arms = PlanarInt8Arms(h12=False, topk=8, rows_per_pass=4, dim=256, heads=6)
+    arms.layer.sm70_qsa_paged_int8_h6 = True
+    arms.write(0, list(range(33)))
+    arms.write(1, [0])
+    calls = []
+
+    def h6(q, k, v, sk, sv, ids, table, req, pos, lens, out, gate, *scratch):
+        hot = pos is None
+        assert hot == (lens is None)
+        cache = arms.host.hot_cache if hot else arms.view
+        for actual, name in zip(
+            (k, v, sk, sv), ("key", "value", "key_scale", "value_scale")
+        ):
+            expected = getattr(cache, name)
+            assert actual.data_ptr() == expected.data_ptr()
+            assert actual.stride() == expected.stride()
+        if hot:
+            assert table is arms.store.hot_block_table
+        calls.append(hot)
+        token = ids.long().clamp_min(0)
+        page = table[req.long()[:, None], token // k.size(1)].long()
+        offset = token % k.size(1)
+        codes_k, codes_v, scales_k, scales_v = (
+            plane[page, offset, 0].float() for plane in (k, v, sk, sv)
+        )
+        valid = ids >= 0
+        if not hot:
+            valid &= (ids <= pos[:, None]) & (ids < lens[req.long(), None])
+        result, _ = h12_late_scale(q, codes_k, codes_v, scales_k, scales_v, valid)
+        out.copy_(result.half().float() * gate.float().sigmoid())
+
+    monkeypatch.setattr(
+        workspace, "_manager", workspace.WorkspaceManager(torch.device("cpu"))
+    )
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        torch.ops.vllm_sm70_qsa_indexer, "paged_int8_h6", h6, raising=False
+    )
+    with set_forward_context(None, _forward_config()), sm70_decode_graph_compilation():
+        get_forward_context().additional_kwargs["sm70_qsa_draft_decode"] = True
+        arms.step([(0, 32), (1, 0)])
+    assert calls == [False, True]
+
+
+@pytest.mark.usefixtures("_int1_compares")
+@pytest.mark.parametrize("rank", [0, 1])
+def test_planar_int8_h12_reads_the_hot_pool(monkeypatch, rank):
+    """Uniform decode/verify on host main K/V: the INT8 H12 reader gets the
+    hot pool views, its page table and the remapped IDs; the result equals
+    the GPU arm's H12 bit for bit and the Triton reader within rounding."""
+    from vllm.forward_context import set_forward_context
+    from vllm.models.qwen4_exp.nvidia import qsa
+    from vllm.models.qwen4_exp.nvidia.ops import qsa as ops
+    from vllm.models.qwen4_exp.nvidia.ops import qsa_int8
+    from vllm.v1.attention.kv_codecs import INT8
+
+    from .test_qsa_paged_fp16_h12_cpu import _forward_config, h12_late_scale
+
+    h12_reads: list[tuple] = []
+    triton_rows: list[int] = []
+
+    def h12(q, k, v, ids, table, req, out, lse, *, k_scale_cache, v_scale_cache):
+        # Python model of the CUDA kernel: page-table lookup, then late scales.
+        valid = ids >= 0
+        pos = ids.long().clamp_min(0)
+        page = table[req.long()[:, None], pos // k.shape[1]].long()
+        codes_k, codes_v, scales_k, scales_v = (
+            plane[page, pos % k.shape[1], 0].float()
+            for plane in (k, v, k_scale_cache, v_scale_cache)
+        )
+        planes = (codes_k, codes_v, scales_k, scales_v)
+        h12_reads.append((k, table, ids, valid, planes))
+        result, result_lse = h12_late_scale(
+            q, codes_k, codes_v, scales_k, scales_v, valid
+        )
+        out.copy_(result)
+        lse.copy_(result_lse)
+
+    def triton(q, k, v, idx, table, req, out, *, k_scale_cache, v_scale_cache,
+               lse=None, output_gate=None, kv_cache_dtype, **_):  # fmt: skip
+        assert kv_cache_dtype == "int8" and output_gate is None
+        triton_rows.append(q.shape[0])
+        return qsa_int8.triton_attention(
+            q, k, v, idx, table, req, out, k_scale_cache, v_scale_cache,
+            lse=lse, codec=INT8,
+        )  # fmt: skip
+
+    monkeypatch.setattr(qsa, "qsa_paged_h12", h12)
+    monkeypatch.setattr(ops, "qsa_sparse_paged_attention", triton)
+
+    def run(arms, rows):
+        with set_forward_context(None, _forward_config(), is_uniform_decode=True):
+            out = arms.step(rows)
+        layer, n = arms.layer, len(rows)
+        partial = layer.dcp_partial_output_buffer[:n].clone()
+        return out, partial, layer.dcp_partial_lse_buffer[:n].clone()
+
+    results = {}
+    for native in (True, False):
+        arms = PlanarInt8Arms(h12=native, topk=8, rows_per_pass=4, dcp=(2, rank))
+        h12_reads.clear()
+        triton_rows.clear()
+        # Request 1's first token lives on rank 0: rank 1 reads an empty shard.
+        arms.write(0, list(range(33)))
+        arms.write(1, [0])
+        steps = [run(arms, [(0, 32), (1, 0)])]
+        for _ in range(2):
+            for req in (0, 1):
+                arms.write(req, [arms.length[req]])
+            steps.append(run(arms, [(r, arms.length[r] - 1) for r in (0, 1)]))
+        for req in (0, 1):
+            arms.write(req, [arms.length[req], arms.length[req] + 1])
+        steps.append(
+            run(arms, [(r, arms.length[r] - d) for r in (0, 1) for d in (2, 1)])
+        )
+        results[native] = steps
+        if not native:
+            assert not h12_reads and triton_rows == [2] * 6 + [4] * 2
+            continue
+        # GPU arm then host arm per step; the host arm reads the hot pool.
+        assert not triton_rows and len(h12_reads) == 8
+        width = 6  # three groups of two rank-local positions
+        for gpu, host in zip(h12_reads[::2], h12_reads[1::2]):
+            assert gpu[0].data_ptr() == arms.view.key.data_ptr()
+            assert host[0].data_ptr() == arms.host.key_cache.data_ptr()
+            assert host[1] is arms.store.hot_block_table
+            assert host[2].data_ptr() == arms.store.indices.data_ptr()
+            assert gpu[2].shape[1] == host[2].shape[1] == width
+            valid = gpu[3]
+            assert torch.equal(valid, host[3])
+            for a, b in zip(gpu[4], host[4]):
+                assert torch.equal(a[valid], b[valid])
+        if rank == 1:
+            _, partial, lse = steps[0]
+            assert torch.isneginf(lse[1]).all() and not partial[1].any()
+
+    for (out, partial, lse), (t_out, t_partial, t_lse) in zip(
+        results[True], results[False]
+    ):
+        # Triton rounds the PV weights to two FP16 terms and splits by tiles.
+        torch.testing.assert_close(partial, t_partial, rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(lse, t_lse, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(out, t_out, rtol=2e-3, atol=2e-3)

@@ -592,6 +592,24 @@ def apply_revolta_kernel_profile(kernel_config: Any, *, enabled: bool) -> None:
         )
 
 
+def apply_revolta_int8_qsa_profile(
+    config: "VllmConfig", *, enabled: bool
+) -> dict[str, Any]:
+    """Resolve the shared PCIe and NVLink INT8 reader default."""
+    kernel = config.kernel_config
+    value = kernel.sm70_qsa_paged_int8_h12
+    if value is not None:
+        return {"value": value, "source": "explicit"}
+    value = (
+        enabled
+        and config.cache_config.cache_dtype == "int8"
+        and config.parallel_config.decode_context_parallel_size == 2
+        and config.use_v2_model_runner
+    )
+    kernel.sm70_qsa_paged_int8_h12 = value
+    return {"value": value, "source": "profile" if value else "upstream_default"}
+
+
 def apply_revolta_nvlink_kernel_profile(
     config: "VllmConfig",
 ) -> dict[str, dict[str, Any]]:

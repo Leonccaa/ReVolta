@@ -1940,6 +1940,7 @@ class VllmConfig:
             all_visible_devices_sm70,
             apply_awq_mtp_wide_verify_defaults,
             apply_revolta_allocator_default,
+            apply_revolta_int8_qsa_profile,
             apply_revolta_kernel_profile,
             apply_revolta_nvlink_kernel_profile,
             apply_revolta_profile,
@@ -2304,10 +2305,14 @@ class VllmConfig:
             else:
                 self.scheduler_config.async_scheduling = True
 
-        nvlink_config_values: dict[str, dict[str, Any]] = {}
+        config_values: dict[str, dict[str, Any]] = {}
+        if not self.is_speculative_draft:
+            config_values["sm70_qsa_paged_int8_h12"] = apply_revolta_int8_qsa_profile(
+                self, enabled=revolta_profile_enabled
+            )
         if nvlink_profile:
-            nvlink_config_values = apply_revolta_nvlink_kernel_profile(self)
-            nvlink_config_values["enable_hc_sp"] = {
+            config_values.update(apply_revolta_nvlink_kernel_profile(self))
+            config_values["enable_hc_sp"] = {
                 "value": self.parallel_config.enable_hc_sp,
                 "source": "explicit" if hc_sp_explicit else "profile",
             }
@@ -3589,7 +3594,7 @@ class VllmConfig:
                     interconnect_mode=interconnect_mode,
                     quantization=getattr(self.model_config, "quantization", None),
                     kernel_config=self.kernel_config,
-                    config_values=nvlink_config_values,
+                    config_values=config_values,
                 ),
             )
 

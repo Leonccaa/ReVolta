@@ -11,9 +11,10 @@ The ReVolta profile (`vllm serve` on four SM70 GPUs with TP4, FP16 activations a
 | Method | Condition | Default schedule | Draft tokens by running requests |
 | --- | --- | --- | --- |
 | DFlash2 | 7 draft tokens, no legacy `ngram_assist` | `[[1,3,7],[4,4,3],[5,8,4]]` | 7 for 1–3, 3 for 4, 4 for 5–8 |
-| MTP | 4 draft tokens, prefix caching on (the profile default) | `[[1,3,4],[4,8,3]]` | 4 for 1–3, 3 for 4–8 |
+| MTP | 4 or 5 draft tokens, prefix caching on, [NVLink TP4 profile](configuration.md#nvlink-tp4-auto-configuration) | `[[1,8,3]]` | 3 for 1–8 |
+| MTP | 4 draft tokens, prefix caching on (the profile default), outside the NVLink TP4 profile | `[[1,3,4],[4,8,3]]` | 4 for 1–3, 3 for 4–8 |
 
-Other widths get no default and run with a fixed K unless you set a schedule. For example, the 0.2.0 acceptance ran MTP5 with `[[1,3,5],[4,8,3]]`. To keep a fixed K under the profile, set the field to `null`.
+If none of these conditions apply, the engine uses a fixed K unless you set a schedule. For example, the 0.2.0 PCIe acceptance explicitly set `[[1,3,5],[4,8,3]]` for MTP5. NVLink acceptance used the profile's `[[1,8,3]]` (logged as `[(1, 8, 3)]`), leaving the configured maximum at 5. To keep a fixed K under the profile, set the field to `null`.
 
 ## Schedule format
 

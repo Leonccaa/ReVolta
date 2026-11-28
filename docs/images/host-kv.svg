@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="620" viewBox="0 0 960 620" font-family="system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" role="img" aria-labelledby="t d">
+  <title id="t">How Host KV works</title>
+  <desc id="d">The GPU keeps the model, the attention index, recurrent state and a small pool of hot pages. System RAM keeps the full key/value history of every active session. An optional SSD keeps pages across restarts. Each decode step, the index picks the past tokens that matter and only pages not already on the GPU are copied over PCIe. On four V100 32 GB GPUs with NVFP4 + MTP5 and INT8 KV, GPU KV alone holds 1.31 million tokens and a 98 GiB Host KV store holds 7.33 million, at a cost of 2 to 4 ms per decode round.</desc>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" markerWidth="8" markerHeight="8" refX="9" refY="5" orient="auto"><path d="M0 0L10 5L0 10z" fill="#3b4a45"/></marker>
+  </defs>
+  <rect x="1" y="1" width="958" height="618" rx="16" fill="#fbfcfb" stroke="#d5ddd8" stroke-width="2"/>
+  <text x="32" y="48" font-size="23" font-weight="700" fill="#16302a">Host KV: sessions live in RAM; the GPU reads only what each step needs</text>
+  <text x="32" y="76" font-size="15" fill="#55665f">Qwen3.8 Flash-Next · 4 × V100 32 GB · INT8 KV</text>
+
+  <!-- GPU tier -->
+  <rect x="32" y="100" width="576" height="166" rx="12" fill="#e5f2eb" stroke="#2f7a5b" stroke-width="2"/>
+  <text x="50" y="130" font-size="19" font-weight="700" fill="#1f5c43">GPU · 4 × V100 32 GB</text>
+  <g font-size="14.5" fill="#16302a">
+    <rect x="50" y="146" width="122" height="40" rx="8" fill="#ffffff" stroke="#9cc8b2"/><text x="111" y="171" text-anchor="middle">Model weights</text>
+    <rect x="184" y="146" width="122" height="40" rx="8" fill="#ffffff" stroke="#9cc8b2"/><text x="245" y="171" text-anchor="middle">Attention index</text>
+    <rect x="318" y="146" width="122" height="40" rx="8" fill="#fff6dc" stroke="#d9b54a"/><text x="379" y="171" text-anchor="middle" font-weight="700">Hot pages</text>
+    <rect x="452" y="146" width="138" height="40" rx="8" fill="#ffffff" stroke="#9cc8b2"/><text x="521" y="171" text-anchor="middle">Recurrent state</text>
+  </g>
+  <text x="50" y="216" font-size="15" fill="#2e403a">Each step, the index picks the past tokens that matter.</text>
+  <text x="50" y="240" font-size="15" fill="#2e403a">Attention reads them from the hot pages; misses come from RAM.</text>
+
+  <!-- GPU <-> RAM arrows -->
+  <line x1="150" y1="334" x2="150" y2="272" stroke="#3b4a45" stroke-width="2.5" marker-end="url(#a)"/>
+  <text x="162" y="300" font-size="14" fill="#2e403a">selected pages not yet on</text>
+  <text x="162" y="318" font-size="14" fill="#2e403a">the GPU, copied once (PCIe)</text>
+  <line x1="420" y1="272" x2="420" y2="334" stroke="#3b4a45" stroke-width="2.5" marker-end="url(#a)"/>
+  <text x="432" y="300" font-size="14" fill="#2e403a">new K/V, written</text>
+  <text x="432" y="318" font-size="14" fill="#2e403a">as it is generated</text>
+
+  <!-- RAM tier -->
+  <rect x="32" y="340" width="576" height="118" rx="12" fill="#e6edf8" stroke="#3a62a8" stroke-width="2"/>
+  <text x="50" y="370" font-size="19" font-weight="700" fill="#24467f">RAM · host memory</text>
+  <text x="50" y="398" font-size="15" fill="#2e403a">The full K/V history of every active session.</text>
+  <text x="50" y="424" font-size="15" fill="#2e403a"><tspan font-weight="700">98 GiB holds 7.33 million tokens</tspan> (eight 512K sessions need 4.2M).</text>
+  <text x="50" y="446" font-size="13.5" fill="#55665f">Size it as model PLE table (about 48 GiB for AWQ) + Host KV store + OS.</text>
+
+  <!-- RAM <-> SSD arrows -->
+  <line x1="150" y1="464" x2="150" y2="520" stroke="#3b4a45" stroke-width="2.5" marker-end="url(#a)"/>
+  <text x="162" y="490" font-size="14" fill="#2e403a">written after 300 s;</text>
+  <text x="162" y="508" font-size="14" fill="#2e403a">replaced pages are skipped</text>
+  <line x1="420" y1="520" x2="420" y2="464" stroke="#3b4a45" stroke-width="2.5" marker-end="url(#a)"/>
+  <text x="432" y="490" font-size="14" fill="#2e403a">read back after</text>
+  <text x="432" y="508" font-size="14" fill="#2e403a">a restart</text>
+
+  <!-- SSD tier -->
+  <rect x="32" y="526" width="576" height="66" rx="12" fill="#efefee" stroke="#7a7a76" stroke-width="2"/>
+  <text x="50" y="556" font-size="19" font-weight="700" fill="#3d3d3a">SSD · optional</text>
+  <text x="50" y="579" font-size="15" fill="#2e403a">Sessions survive restarts and can be picked up days later.</text>
+
+  <!-- Right panel -->
+  <rect x="636" y="100" width="292" height="492" rx="12" fill="#ffffff" stroke="#d5ddd8" stroke-width="2"/>
+  <text x="654" y="130" font-size="17" font-weight="700" fill="#16302a">KV tokens that fit</text>
+  <text x="654" y="166" font-size="14.5" fill="#2e403a">GPU KV only</text>
+  <rect x="654" y="174" width="44" height="24" rx="4" fill="#2f7a5b"/>
+  <text x="706" y="192" font-size="15" font-weight="700" fill="#16302a">1.31M</text>
+  <text x="654" y="226" font-size="14.5" fill="#2e403a">Host KV, 98 GiB of RAM</text>
+  <rect x="654" y="234" width="250" height="24" rx="4" fill="#3a62a8"/>
+  <text x="664" y="252" font-size="15" font-weight="700" fill="#ffffff">7.33M · 5.6×</text>
+
+  <text x="654" y="306" font-size="17" font-weight="700" fill="#16302a">Cost per decode round</text>
+  <g font-size="14.5" fill="#2e403a">
+    <text x="654" y="336">1 request</text><text x="910" y="336" text-anchor="end">16.4 → 19.7 ms</text>
+    <text x="654" y="362">4 requests</text><text x="910" y="362" text-anchor="end">23.5 → 27.6 ms</text>
+    <text x="654" y="388">8 requests</text><text x="910" y="388" text-anchor="end">32.8 → 35.1 ms</text>
+  </g>
+  <line x1="654" y1="412" x2="910" y2="412" stroke="#e1e7e3"/>
+  <g font-size="13" fill="#55665f">
+    <text x="654" y="436">Same launch, only the KV mode differs:</text>
+    <text x="654" y="456">NVFP4 + MTP5, INT8 KV, TP4 + DCP2,</text>
+    <text x="654" y="476">fully connected NVLink, 0.2.0.</text>
+    <text x="654" y="508">Planner arithmetic (0.2.0rc15):</text>
+    <text x="654" y="528">a 192 GiB store fits eight</text>
+    <text x="654" y="548">1M-token sessions at once.</text>
+  </g>
+</svg>

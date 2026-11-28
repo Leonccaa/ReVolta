@@ -26,7 +26,7 @@ Each configuration below states its other settings.
 
 **Cold TTFT.** The streaming chat requests use synthetic word sequences of the target length, greedy decoding, a four-token output cap and no thinking override. For each length, a short warm-up and one full-length warm-up are excluded; the table reports the median of three cold requests.
 
-**Acceptance and quality.** The AWQ GPU KV configurations also ran the fixed RevBench-Accept v1 suite in sampled mode (97 requests). Task accuracy below uses separate fixed GSM8K and MMLU subsets.
+**Acceptance and quality.** The PCIe AWQ GPU KV configurations and both NVLink GPU KV configurations also ran the fixed RevBench-Accept v1 suite in sampled mode (97 requests each). Task accuracy below uses separate fixed GSM8K and MMLU subsets.
 
 ### What the columns mean
 
@@ -43,16 +43,16 @@ Each configuration below states its other settings.
 
 ### Configurations
 
-The PCIe results below cover six configurations. All use TP4 + DCP2 on the system above and `--gpu-memory-utilization 0.956`. E4M3 was tested on an earlier 0.2.0 candidate build, not rerun on the final package.
+The PCIe results below cover six configurations. All use TP4 + DCP2 on the system above and `--gpu-memory-utilization 0.956`. Calibrated E4M3 was tested on an earlier 0.2.0 candidate build, not rerun on the final package.
 
 | Configuration | Weights | Speculative decoding | KV cache | CPU KV pool and disk tier | Other settings |
 | --- | --- | --- | --- | --- | --- |
-| C: production form | Uncensored AWQ g32 | DFlash2, 7 draft tokens, dynamic draft width (profile default) | GPU KV; INT8 target, FP16 draft | 98 GiB CPU KV pool and 350 GiB `revolta_fs` disk tier | `--gpu-memory-utilization 0.956` |
-| D+E1: public default | Uncensored AWQ g32 | MTP, 4 draft tokens, dynamic draft width, greedy drafting | GPU KV; INT8 target and draft (`--kv-cache-dtype auto`) | 48 GiB CPU KV pool and 350 GiB `revolta_fs` disk tier | AWQ + MTP4 from [Getting started](getting-started.md), with the disk tier enabled for acceptance |
-| E4M3 | As D+E1 | As D+E1 | GPU KV; calibrated E4M3 target and draft (`--kv-cache-dtype fp8_e4m3`) | 48 GiB CPU KV pool | Functional check only: start, serve and answer quality |
-| E2: Host KV | AWQ | MTP, 5 drafts at C1–C3 and 3 at C4–C8, greedy drafting | INT8 target and draft; 98 GiB Host KV pool | Host KV pool, no separate CPU KV pool; 350 GiB `host_kv.ssd` tier | QSA index sharding (`qsa_dcp_index_shard: true`), union prefill gather, PLE disk cascade off |
-| E3a: NVFP4 + MTP | Standard NVFP4 with the scale-pack MTP draft | MTP, 5 drafts at C1–C3 and 3 at C4–C8, greedy drafting | GPU KV; INT8 target and draft | 98 GiB CPU KV pool and 350 GiB `revolta_fs` disk tier | PLE disk cascade and QSA index sharding off |
-| E3b: NVFP4 + DFlash2 | Standard NVFP4 | DFlash2, 7 drafts at C1–C3, 3 at C4 and 4 at C5–C8 | GPU KV; INT8 target, FP16 draft | 98 GiB CPU KV pool and 350 GiB `revolta_fs` disk tier | Default sparse verification; PLE disk cascade and QSA index sharding off |
+| Production (our server) | Uncensored AWQ g32 | DFlash2, 7 draft tokens, dynamic draft width (profile default) | GPU KV; INT8 target, FP16 draft | 98 GiB CPU KV pool and 350 GiB `revolta_fs` disk tier | `--gpu-memory-utilization 0.956` |
+| Public default | Uncensored AWQ g32 | MTP, 4 draft tokens, dynamic draft width, greedy drafting | GPU KV; INT8 target and draft (`--kv-cache-dtype auto`) | 48 GiB CPU KV pool and 350 GiB `revolta_fs` disk tier | AWQ + MTP4 from [Getting started](getting-started.md), with the disk tier enabled for acceptance |
+| Calibrated E4M3 | As public default | As public default | GPU KV; calibrated E4M3 target and draft (`--kv-cache-dtype fp8_e4m3`) | 48 GiB CPU KV pool | Functional check only: start, serve and answer quality |
+| Host KV | AWQ | MTP, 5 drafts at C1–C3 and 3 at C4–C8, greedy drafting | INT8 target and draft; 98 GiB Host KV pool | Host KV pool, no separate CPU KV pool; 350 GiB `host_kv.ssd` tier | QSA index sharding (`qsa_dcp_index_shard: true`), union prefill gather, PLE disk cascade off |
+| NVFP4 + MTP5 | Standard NVFP4 with the scale-pack MTP draft | MTP, 5 drafts at C1–C3 and 3 at C4–C8, greedy drafting | GPU KV; INT8 target and draft | 98 GiB CPU KV pool and 350 GiB `revolta_fs` disk tier | PLE disk cascade and QSA index sharding off |
+| NVFP4 + DFlash2 | Standard NVFP4 | DFlash2, 7 drafts at C1–C3, 3 at C4 and 4 at C5–C8 | GPU KV; INT8 target, FP16 draft | 98 GiB CPU KV pool and 350 GiB `revolta_fs` disk tier | Default sparse verification; PLE disk cascade and QSA index sharding off |
 
 ## Results
 
@@ -66,11 +66,11 @@ Observed end-to-end output in tokens/s on the synthetic short-prompt workload.
 
 | Configuration | C1 | C4 | C8 |
 | --- | ---: | ---: | ---: |
-| C: AWQ, DFlash2, GPU KV | 97.4 | 283.0 | 360.1 |
-| D+E1: AWQ, MTP4, GPU KV | 114.4 | 260.7 | 378.1 |
-| E2: Host KV, MTP | 91.1 | 255.1 | 332.4 |
-| E3a: NVFP4, MTP5 | 97.6 | 264.5 | 396.6 |
-| E3b: NVFP4, DFlash2 | 103.7 | 280.7 | 372.7 |
+| AWQ, DFlash2, GPU KV (production) | 97.4 | 283.0 | 360.1 |
+| AWQ, MTP4, GPU KV (public default) | 114.4 | 260.7 | 378.1 |
+| AWQ, MTP5, Host KV | 91.1 | 255.1 | 332.4 |
+| NVFP4, MTP5, GPU KV | 97.6 | 264.5 | 396.6 |
+| NVFP4, DFlash2, GPU KV | 103.7 | 280.7 | 372.7 |
 
 The E4M3 configuration was a functional check; its speed was not measured.
 
@@ -80,9 +80,12 @@ One request at a time, cold prefix cache.
 
 | Configuration | Cold TTFT, 8K prompt | Cold TTFT, 32K prompt | Second-token latency, 32K prompt |
 | --- | ---: | ---: | ---: |
-| D+E1: AWQ, MTP4, GPU KV | 2.102 s | 8.228 s | Not measured |
-| E2: Host KV, MTP | 2.204 s | 8.442 s | Not measured |
-| E3a: NVFP4, MTP5 | 1.987 s | 7.747 s | Not measured |
+| AWQ, DFlash2, GPU KV (production) | — | 8.54 s | Not measured |
+| AWQ, MTP4, GPU KV (public default) | 2.102 s | 8.228 s | Not measured |
+| AWQ, MTP5, Host KV | 2.204 s | 8.442 s | Not measured |
+| NVFP4, MTP5, GPU KV | 1.987 s | 7.747 s | Not measured |
+
+PCIe AWQ + DFlash2 cold prefill measured 3,787 prompt tok/s at 32K and 3,898 at about 128K. These rates divide actual prompt tokens by median prefill time, not TTFT.
 
 ### GPU KV capacity
 
@@ -92,22 +95,22 @@ KV capacity at `--max-model-len 524288`, read from the startup log.
 
 | Configuration | Target / draft KV | Where | KV capacity, tokens | Capacity ratio |
 | --- | --- | --- | ---: | ---: |
-| C: AWQ, DFlash2 | INT8 / FP16 | GPU | 1,851,676 | 3.53× |
-| D+E1: AWQ, MTP4 | INT8 / INT8 | GPU | 1,194,816 | 2.28× |
-| E4M3: AWQ, MTP4 (earlier candidate) | E4M3 / E4M3 | GPU | 1,224,375 | 2.34× |
-| E2: Host KV, MTP | INT8 / INT8 | Host pool | 7,329,312 | 13.98× |
-| E3a: NVFP4, MTP5 | INT8 / INT8 | GPU | 1,488,853 | 2.84× |
-| E3b: NVFP4, DFlash2 | INT8 / FP16 | GPU | 1,700,147 | 3.24× |
+| AWQ, DFlash2, GPU KV (production) | INT8 / FP16 | GPU | 1,851,676 | 3.53× |
+| AWQ, MTP4, GPU KV (public default) | INT8 / INT8 | GPU | 1,194,816 | 2.28× |
+| AWQ, MTP4, calibrated E4M3 (earlier candidate) | E4M3 / E4M3 | GPU | 1,224,375 | 2.34× |
+| AWQ, MTP5, Host KV | INT8 / INT8 | Host pool | 7,329,312 | 13.98× |
+| NVFP4, MTP5, GPU KV | INT8 / INT8 | GPU | 1,488,853 | 2.84× |
+| NVFP4, DFlash2, GPU KV | INT8 / FP16 | GPU | 1,700,147 | 3.24× |
 
 ### Coming back to a document
 
-When a new request starts with a prompt the engine has seen before, such as a follow-up question about the same document, ReVolta reuses the stored KV instead of computing it again. The table gives the time to first token, one request at a time. "Second request" follows directly after the first; in C the cached prefix is served mostly from the GPU (the longer prompt also hits CPU pages), and in E2 the main KV history is in host memory. "From CPU memory" follows after the prefix was evicted from GPU memory. "From SSD after a restart" follows an engine restart.
+When a new request starts with a prompt the engine has seen before, such as a follow-up question about the same document, ReVolta reuses the stored KV instead of computing it again. The table gives the time to first token, one request at a time. "Second request" follows directly after the first; with the production configuration the cached prefix is served mostly from the GPU (the longer prompt also hits CPU pages), and with Host KV the main KV history is in host memory. "From CPU memory" follows after the prefix was evicted from GPU memory. "From SSD after a restart" follows an engine restart.
 
 | Configuration | Prompt tokens | Recomputed | Second request | From CPU memory | From SSD after a restart | Prompt tokens hit |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| C: AWQ, DFlash2 | 32,839 | 8.56 s | 0.535 s | 0.599 s | 1.011 s | 31,616 |
-| C: AWQ, DFlash2 | 130,402 | 33.42 s | 0.780 s | 0.893 s | 1.692 s | 129,792 |
-| E2: Host KV, MTP | ~32K | 8.442 s (separate cold test) | Not measured | — | Not measured | Not measured |
+| AWQ, DFlash2, GPU KV (production) | 32,839 | 8.56 s | 0.535 s | 0.599 s | 1.011 s | 31,616 |
+| AWQ, DFlash2, GPU KV (production) | 130,402 | 33.42 s | 0.780 s | 0.893 s | 1.692 s | 129,792 |
+| AWQ, MTP5, Host KV | ~32K | 8.442 s (separate cold test) | Not measured | — | Not measured | Not measured |
 
 How the tiers work and how to size them: [KV offload modes](kv-offload.md).
 
@@ -117,36 +120,79 @@ Correct answers / questions on fixed subsets of GSM8K and MMLU.
 
 | Configuration | GSM8K | MMLU |
 | --- | ---: | ---: |
-| C: AWQ, DFlash2, GPU KV | 180 / 200 | 263 / 300 |
-| D+E1: AWQ, MTP4, GPU KV | 177 / 200 (88.5%); rerun 176 / 200 (88.0%) | 264 / 300 |
-| E4M3: AWQ, MTP4, E4M3 KV (earlier candidate) | 184 / 200 | 262 / 300 |
-| E2: Host KV, MTP | 181 / 200 | 264 / 300 |
-| E3a: NVFP4, MTP5 | 180 / 200 | 267 / 300 |
-| E3b: NVFP4, DFlash2 | 181 / 200 | 266 / 300 |
+| AWQ, DFlash2, GPU KV (production) | 180 / 200 | 263 / 300 |
+| AWQ, MTP4, GPU KV (public default) | 177 / 200 (88.5%); rerun 176 / 200 (88.0%) | 264 / 300 |
+| AWQ, MTP4, calibrated E4M3 (earlier candidate) | 184 / 200 | 262 / 300 |
+| AWQ, MTP5, Host KV | 181 / 200 | 264 / 300 |
+| NVFP4, MTP5, GPU KV | 180 / 200 | 267 / 300 |
+| NVFP4, DFlash2, GPU KV | 181 / 200 | 266 / 300 |
 
-The lower D+E1 GSM8K scores came from long reasoning answers cut off at the 512-token limit; at a 1,024-token limit, a paired test of the same deployment across three seeds gave 94.7% on the final package versus 94.3% on the earlier candidate, with no significant difference (p = 0.80) and essentially the same output lengths.
+The lower GSM8K scores of the public default came from long reasoning answers cut off at the 512-token limit; at a 1,024-token limit, a paired test of the same deployment across three seeds gave 94.7% on the final package versus 94.3% on the earlier candidate, with no significant difference (p = 0.80) and essentially the same output lengths.
 
 For how closely each quantized checkpoint follows a BF16 reference, see [Quality measurements](#quality-measurements).
 
 ### Speculative decoding comparison
 
-To compare the two speculative methods in 0.2.0, read C against D+E1 for AWQ (DFlash2 against MTP4) and E3b against E3a for NVFP4 (DFlash2 against MTP5). The AWQ pair also differs in draft KV format and in the CPU KV pool and disk tier; see [Configurations](#configurations). Earlier per-prompt results are in [DFlash2 against MTP4 on PCIe (0.1.2)](#dflash2-against-mtp4-on-pcie-012); which method to choose is in [Choosing a method](speculative-decoding.md#choosing-a-method).
+To compare the two speculative methods in 0.2.0, compare the production configuration with the public default for AWQ (DFlash2 against MTP4), and NVFP4 + DFlash2 with NVFP4 + MTP5. The AWQ pair also differs in draft KV format and in the CPU KV pool and disk tier; see [Configurations](#configurations). Earlier per-prompt results are in [DFlash2 against MTP4 on PCIe (0.1.2)](#dflash2-against-mtp4-on-pcie-012); which method to choose is in [Choosing a method](speculative-decoding.md#choosing-a-method).
 
 ## NVLink TP4 acceptance
 
-The 0.2.0 release package ran on four V100-SXM2-32GB GPUs, with direct NVLink on all six pairs and a 300 W power limit per GPU. The public default NVFP4 + MTP5 configuration used TP4 + DCP2, INT8 GPU KV and a 512K context limit. We removed `--no-async-scheduling` so the [NVLink profile](configuration.md#nvlink-tp4-auto-configuration) could select the scheduling and draft-width defaults without manual NVLink settings.
+### NVLink test system
 
-The synthetic short-prompt test used the same English story template and sampling settings as the PCIe speed test. Each concurrency excludes one warm-up and reports the median of three measured passes without inference-time compilation. These are wall-clock milliseconds per decode round, not kernel timings or output throughput.
+The 0.2.0 release package ran on four V100-SXM2 32 GB GPUs, with two direct NVLink links on each of the six GPU pairs (NV2) and a 300 W power limit per GPU. The runs used TP4 + DCP2, a 512K context limit, up to eight sequences and `--gpu-memory-utilization 0.956`. The Xeon Gold 6130 differs from the PCIe test system's CPU; DFlash2 uses synchronous scheduling, so CPU time affects the measured round times.
 
-| Concurrent requests | Time per decode round |
-| ---: | ---: |
-| 1 | 16.43 ms |
-| 4 | 23.45 ms |
-| 8 | 32.81 ms |
+We omitted `--no-async-scheduling` and left draft-width and NVLink settings to the [NVLink profile](configuration.md#nvlink-tp4-auto-configuration). NVFP4 + MTP5 ran asynchronously, with three drafts at one to eight requests; AWQ + DFlash2 stayed synchronous.
 
-With one request and a cold prefix, TTFT was 1.130 s at 8K, 4.168 s at 32K and 8.254 s at 64K. GSM8K scored 90.5%, MMLU 88.0%, and all 97 sampled RevBench-Accept v1 requests completed without errors.
+### NVLink output speed
 
-In a separate NVFP4 + MTP5 run using Host KV, the 98 GiB INT8 host pool had 7,330,944 tokens before excluding the reserved page. On the same synthetic short-prompt workload, time per round was 19.68, 27.58 and 35.11 ms at C1, C4 and C8.
+Same synthetic short-story workload as on PCIe. The table gives aggregate output in tok/s and wall-clock milliseconds per decode round. Medians exclude the warm-up and any pass with inference-time compilation. Each cell summarises three clean passes, except AWQ + DFlash2 at C1, which has two.
+
+| Configuration | C1 tok/s | C4 tok/s | C8 tok/s | C1 ms/round | C4 ms/round | C8 ms/round |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| NVFP4 + MTP5, GPU KV | 136.1 | 370.9 | 532.4 | 16.43 | 23.45 | 32.81 |
+| AWQ + DFlash2, GPU KV | 109.9 | 301.0 | 441.8 | 23.53 | 33.07 | 45.37 |
+
+### NVLink time to first token
+
+One request at a time with a cold prefix. Prompt tok/s divides the actual input token count of the median-TTFT request by its TTFT (before rounding). It includes all time to the first token, unlike the PCIe prefill-only rate. The NVLink acceptance did not test 128K.
+
+| Configuration | Nominal prompt length | Actual prompt tokens | Cold TTFT | Prompt tok/s |
+| --- | ---: | ---: | ---: | ---: |
+| NVFP4 + MTP5, GPU KV | 8K | 8,174 | 1.130 s | 7,232 |
+| NVFP4 + MTP5, GPU KV | 32K | 32,894 | 4.168 s | 7,892 |
+| NVFP4 + MTP5, GPU KV | 64K | 65,647 | 8.254 s | 7,953 |
+| AWQ + DFlash2, GPU KV | 8K | 8,198 | 1.474 s | 5,560 |
+| AWQ + DFlash2, GPU KV | 32K | 32,848 | 5.094 s | 6,449 |
+| AWQ + DFlash2, GPU KV | 64K | 65,532 | 9.785 s | 6,697 |
+
+### NVLink KV capacity
+
+| Configuration | Target / draft KV | GPU KV tokens | Capacity ratio at 512K |
+| --- | --- | ---: | ---: |
+| NVFP4 + MTP5 | INT8 / INT8 | 1,305,719 | 2.49× |
+| AWQ + DFlash2 | INT8 / FP16 | 1,778,942 | 3.39× |
+
+For NVFP4 + MTP5 with a 98 GiB Host KV store, the same launch differed only in KV format. The table gives the startup host pool size before excluding the reserved page and the clean short-story round times. INT8 was faster at all three concurrencies and held about 1.9× as many tokens. FP16 main KV in host memory uses the Triton reader, not the native FP16 GPU reader. See [Host KV capacity](kv-offload.md#host-kv-capacity).
+
+| KV format | Host pool tokens | C1 ms/round | C4 ms/round | C8 ms/round |
+| --- | ---: | ---: | ---: | ---: |
+| INT8 | 7,330,944 | 19.68 | 27.58 | 35.11 |
+| FP16 | 3,832,192 | 20.50 | 29.23 | 37.98 |
+
+### NVLink task accuracy and acceptance
+
+| Configuration | GSM8K | MMLU | RevBench errors | Median accepted length | Median decode tok/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NVFP4 + MTP5, GPU KV | 181 / 200 (90.5%) | 264 / 300 (88.0%) | 0 / 97 | 3.094 | 194.0 |
+| AWQ + DFlash2, GPU KV | 185 / 200 (92.5%) | 264 / 300 (88.0%) | 0 / 97 | 4.088 | 183.0 |
+
+Host KV runs did not repeat the task accuracy or RevBench-Accept v1 tests.
+
+### NVLink auto-configuration comparison
+
+In a historical pre-release comparison on a separate 275 W NVLink system, we used the same NVFP4 + MTP5 launch recipe before and after applying automatic tuning, including letting the profile choose scheduling. Round times at C1/C4/C8 went from 26.51 / 35.52 / 46.28 ms to 16.33 / 23.95 / 33.36 ms (38% / 33% / 28% less time); 32K cold TTFT fell from 6.290 s to 4.222 s. Use the release-package tables above for the 300 W system, not for a before-and-after comparison.
+
+On the 300 W system with the release package, AWQ + DFlash2 round times were equivalent within run-to-run variation: 23.53 / 33.07 / 45.37 ms with automatic tuning versus 23.94 / 32.57 / 45.05 ms with the full manual NVLink tuning settings.
 
 ## Kernel changes during serving
 

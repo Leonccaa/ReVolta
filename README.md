@@ -2,9 +2,7 @@
 
 **Stable, fast inference on multi-GPU NVIDIA V100 servers.**
 
-ReVolta turns a server with V100 32 GB GPUs and plenty of system memory into a dependable daily AI service. It serves Qwen3.8 Flash-Next (text, images and video) behind an OpenAI-compatible API, with a 512K-token context and eight concurrent requests. Deployment is simple: pull the Docker image and launch. The ReVolta profile recognizes the setup and applies tuned settings by itself. ReVolta is built on [1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM), a V100-focused fork of vLLM, so the `vllm` command, its options and its OpenAI-compatible API work as usual.
-
-ReVolta is built for four or more V100 32 GB GPUs and validated on four. We recommend, and test, the two interconnects that give the best speed: NVLink, or all GPUs under one PCIe switch with P2P. Every release passes the same fixed gate on our own server, which runs ReVolta every day: concurrency, KV readback from CPU memory, long context, quality subsets and fixed prompts compared with the previous release; areas a release changes, such as images and video, are tested again.
+ReVolta turns a server with four or more V100 32 GB GPUs and plenty of system memory into a dependable daily AI service for Qwen3.8 Flash-Next (text, images and video): an OpenAI-compatible API with the usual `vllm` command, a 512K-token context and eight concurrent requests. Pull the Docker image and launch; the profile recognizes NVLink or a PCIe switch with P2P, the two interconnects we test, and applies tuned settings by itself. Every release passes the same fixed gate on our own server, which runs ReVolta every day.
 
 **You need:**
 
@@ -14,32 +12,38 @@ ReVolta is built for four or more V100 32 GB GPUs and validated on four. We reco
 - Docker with GPU support, or Python 3.12 with glibc 2.34 or newer.
 - About 142 GB of disk for the default checkpoint. Tested hardware and limits: [Support and known limits](https://github.com/Leonccaa/ReVolta/blob/main/docs/known-limits.md).
 
-**Current release: [0.2.0](https://github.com/Leonccaa/ReVolta/releases/tag/v0.2.0).** INT8 KV cache by default, optional Host KV that keeps the KV cache in host memory, draft widths that follow the batch size, and serving defaults that the profile applies by itself. Upgrading from 0.1.5: read the [release notes](https://github.com/Leonccaa/ReVolta/releases/tag/v0.2.0).
+**Current release: [0.2.0](https://github.com/Leonccaa/ReVolta/releases/tag/v0.2.0)**: INT8 KV by default, Host KV for many long sessions at once, and automatic NVLink tuning. Upgrading from 0.1.5: read the [release notes](https://github.com/Leonccaa/ReVolta/releases/tag/v0.2.0).
 
 ## At a glance
 
-MTP4 drafts up to four tokens per step with the model's own multi-token-prediction (MTP) layer (three per step at four or more requests); the reference launch uses it. DFlash2 uses a separate drafter model; our own server uses it.
-
-**Context and capacity** (0.2.0; Uncensored AWQ g32, INT8 target KV, 512K context, 8 sequences, `--gpu-memory-utilization 0.956`, our 4 × V100 32 GB PCIe server)
-
-| | MTP4 (reference launch; draft KV inherits INT8) | DFlash2 (our production setup; FP16 draft KV) |
+| ReVolta 0.2.0 | 4 × V100 32 GB PCIe, one switch with P2P, 200 W | 4 × V100-SXM2 32 GB NVLink, 300 W |
 | --- | ---: | ---: |
-| Context per request | 512K tokens | 512K tokens |
-| GPU KV pool | 1,194,816 tokens | 1,851,676 tokens |
-| GPU KV pool / 512K tokens (capacity ratio) | 2.28× | 3.53× |
-| Concurrent requests | 8 | 8 |
+| Output, 1 / 4 / 8 requests | 114 / 283 / 378 tok/s | **136 / 371 / 532 tok/s** |
+| Cold prefill, 32K prompt | 3,787 tok/s (8.5 s) | **7,892 tok/s (4.2 s)** |
+| GPU KV pool, MTP / DFlash2 | 1.19M / **1.85M** tokens | 1.31M / 1.78M tokens |
+| Host KV pool, 98 GiB of RAM | **7.33M tokens** | **7.33M tokens** |
+| 512K sessions running at once | 2–3 with GPU KV, **8** with Host KV | 2–3 with GPU KV, **8** with Host KV |
+| GSM8K / MMLU | 90.0% / 87.7% | 90.5% / 88.0% |
 
-With optional Host KV, the 98 GiB host pool held **7,329,312 usable tokens** with AWQ, MTP5 and INT8 KV. In the separate GPU KV test with DFlash2, one request revisiting a 32K-token document reached its first token in **0.599 s** from CPU memory or **1.011 s** from SSD after restart, versus **8.56 s** with cold recomputation. See [KV offload](https://github.com/Leonccaa/ReVolta/blob/main/docs/kv-offload.md).
+Output: short synthetic prompts with 512 output tokens, the better of the tested MTP and DFlash2 setups at each concurrency (AWQ on PCIe; NVFP4 for MTP and AWQ for DFlash2 on NVLink). Quality: AWQ + DFlash2 on PCIe, NVFP4 + MTP5 on NVLink. Conditions and every configuration: [Performance](https://github.com/Leonccaa/ReVolta/blob/main/docs/performance.md).
 
-**Speed** (0.2.0, 200 W per GPU): observed end-to-end output from short synthetic English story prompts, sampled without the chat template and fixed at 512 output tokens per request. Each concurrency shows the higher recorded total output rate of MTP4 and DFlash2 on this workload, not a ranking for real prompts.
+### Host KV: many long sessions at once
 
-| System | 1 request | 4 | 8 | Cold prefill, 32K / 128K prompt |
-| --- | ---: | ---: | ---: | ---: |
-| 4 × V100 32 GB PCIe, one PCIe switch with P2P (our server) | 114.4 tok/s | 283.0 tok/s | 378.1 tok/s | 3,787 / 3,898 prompt tok/s |
+![Host KV: the GPU keeps the model, the attention index and hot pages; RAM keeps the full K/V history of every session; an optional SSD keeps pages across restarts](https://raw.githubusercontent.com/Leonccaa/ReVolta/main/docs/images/host-kv.svg)
 
-Cold prefill uses DFlash2 with one request, dividing the actual synthetic prompt length by the median time to first token. For the separate 0.2.0 NVLink acceptance and test conditions, see [Performance](https://github.com/Leonccaa/ReVolta/blob/main/docs/performance.md#nvlink-tp4-acceptance).
+Host KV keeps every session's K/V history in RAM; the GPU keeps the model, the attention index and the pages it reads right now. Flash-Next's sparse attention reads only a selection of past tokens each step, so this costs just **2–4 ms per decode round**.
+
+| Sessions running at once, each at full length | 256K | 512K | 1M |
+| --- | ---: | ---: | ---: |
+| GPU KV | at most 4–7 | 2–3 | 1 |
+| Host KV, 98 GiB of RAM | **8** | **8** | 6–7 |
+| Host KV, 192 GiB of RAM | **8** | **8** | **8** |
+
+With GPU KV every decoding request needs all of its K/V on the GPU, so the rest wait in the queue, and a few full-length sessions push the cache of the others out. How it works, sizing and when to use it: [Host KV](https://github.com/Leonccaa/ReVolta/blob/main/docs/host-kv.md).
 
 ## Models
+
+**Any Qwen3.8 Flash-Next checkpoint in a supported weight format can be served: AWQ, ModelOpt NVFP4 and NVIDIA's NVFP4 / MXFP8 mixes.** The default INT8 KV cache computes a scale for every token and KV head at runtime, so no checkpoint-specific KV calibration pack is needed; it is also closer to FP16 than calibrated E4M3 (KL 0.024 vs. 0.061) and faster ([why](https://github.com/Leonccaa/ReVolta/blob/main/docs/checkpoints.md#weight-and-kv-formats)). Tested checkpoints:
 
 | Model | Weights (bits per weight: routed experts / whole model) | Download | PLE table in host memory | GPU KV pool (0.2.0) | Quality vs its BF16 parent: KL ↓ / top-1 ↑ | Notes |
 | --- | --- | ---: | ---: | ---: | ---: | --- |
@@ -48,11 +52,7 @@ Cold prefill uses DFlash2 with one request, dividing the actual synthetic prompt
 | [Standard NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4) | NVFP4 experts, FP8 PLE, BF16 rest (**4.50 / 5.86**) | 135 GB + 5 GB draft pack | 48 GiB | 1,488,853 tokens (MTP5) | 0.0303 / 96.4% | Widely used community format |
 | [NVIDIA FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local) | NVFP4 experts and PLE, MXFP8 attention and shared experts (**4.26 / 4.53**) | 102 GB, MTP layer built in | **27 GiB** | 1,518,412 tokens (MTP5 smoke test) | 0.0380 / 95.9% | NVIDIA's official checkpoint; least host memory |
 
-The PLE tables are the model's n-gram embedding tables; they hold 51 billion of its 177 billion stored parameters and stay in host memory by default. V100 has no BF16 units, so ReVolta runs BF16 weights in FP16, which `--dtype auto` selects on V100. Bits per weight include quantization scales and zero points and exclude the MTP draft; the whole-model figure covers all 177 billion stored parameters. The full weight layout of each checkpoint is in [Checkpoints](https://github.com/Leonccaa/ReVolta/blob/main/docs/checkpoints.md#choose-a-checkpoint).
-
-The GPU KV pool is the startup log's capacity in 0.2.0 with INT8 target and draft KV, 512K context, 8 sequences and `--gpu-memory-utilization 0.956`; the AWQ row uses MTP with 4 draft tokens and the NVFP4 rows use MTP with 5, as tested. Quality is measured against each checkpoint's own BF16 parent with scalar E4M3 KV (published with 0.1.0); method and the second reference are in [Quality measurements](https://github.com/Leonccaa/ReVolta/blob/main/docs/performance.md#quality-measurements). Test status, pinned revisions and preparation steps: [Checkpoints](https://github.com/Leonccaa/ReVolta/blob/main/docs/checkpoints.md).
-
-Also supported: [NVIDIA NVFP4-QAD](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4-QAD) (loading and serving checks passed; quality against BF16 not yet measured; the repository is not publicly downloadable at the time of writing). DFlash2 needs the separate [incoai DFlash2 drafter](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2). Text-only [Hy4-flash](https://huggingface.co/tencent/Hy4-flash) has validation support, outside the 0.2.0 release tests; see [Hy4-flash](https://github.com/Leonccaa/ReVolta/blob/main/docs/hy4-flash.md).
+The PLE tables (51 of the 177 billion stored parameters) stay in host memory by default. V100 has no BF16 units, so BF16 weights run in FP16. GPU KV pools are from the 0.2.0 PCIe startup logs (INT8, 512K, 8 sequences); quality is against each checkpoint's own BF16 parent ([method](https://github.com/Leonccaa/ReVolta/blob/main/docs/performance.md#quality-measurements)). Preparation and test status: [Checkpoints](https://github.com/Leonccaa/ReVolta/blob/main/docs/checkpoints.md). DFlash2 needs the separate [incoai DFlash2 drafter](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2). Also supported: [NVIDIA NVFP4-QAD](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4-QAD) (serving checks passed) and text-only [Hy4-flash](https://github.com/Leonccaa/ReVolta/blob/main/docs/hy4-flash.md) (validation support).
 
 ## Quick start
 
@@ -81,6 +81,7 @@ For another checkpoint, follow its [preparation guide](https://github.com/Leoncc
 | Choose between MTP and DFlash2 | [Speculative decoding](https://github.com/Leonccaa/ReVolta/blob/main/docs/speculative-decoding.md) |
 | Enable DFlash2 and choose its settings | [DFlash2](https://github.com/Leonccaa/ReVolta/blob/main/docs/dflash2.md) |
 | Change the number of draft tokens with the batch size | [Dynamic speculative decoding](https://github.com/Leonccaa/ReVolta/blob/main/docs/dynamic-speculative-decoding.md) |
+| Understand Host KV and decide whether it fits your team and server | [Host KV](https://github.com/Leonccaa/ReVolta/blob/main/docs/host-kv.md) |
 | Keep evicted prefixes in CPU memory or on disk, or the KV cache in host memory | [KV offload](https://github.com/Leonccaa/ReVolta/blob/main/docs/kv-offload.md); every key and metric: [KV offload reference](https://github.com/Leonccaa/ReVolta/blob/main/docs/kv-offload-reference.md) |
 | Look up launch options, environment variables, sampling defaults and memory budgets | [Configuration](https://github.com/Leonccaa/ReVolta/blob/main/docs/configuration.md) |
 | Compare measured speed, KV capacity and quantization quality | [Performance](https://github.com/Leonccaa/ReVolta/blob/main/docs/performance.md) |
@@ -121,6 +122,6 @@ See [BUILDING.md](https://github.com/Leonccaa/ReVolta/blob/main/BUILDING.md). Bu
 
 ReVolta's engine code and project changes are licensed under the [Apache License 2.0](https://github.com/Leonccaa/ReVolta/blob/main/LICENSE), except for third-party files that state another license. [NOTICE](https://github.com/Leonccaa/ReVolta/blob/main/NOTICE) lists component attributions and known source-history gaps. [LICENSES/](https://github.com/Leonccaa/ReVolta/blob/main/LICENSES/README.md) contains the upstream license texts with their source revisions. Model weights have their own licenses; see each model card.
 
-ReVolta is derived from [1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM), which is derived from [vLLM](https://github.com/vllm-project/vllm). Thanks to the vLLM and 1Cat-vLLM contributors, and to the authors of the attention, quantization, communication and GPU kernel components included here (see NOTICE).
+ReVolta is built on [1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM), a V100-focused fork of [vLLM](https://github.com/vllm-project/vllm), so the `vllm` command, its options and its OpenAI-compatible API work as usual. Thanks to the vLLM and 1Cat-vLLM contributors, and to the authors of the attention, quantization, communication and GPU kernel components included here (see NOTICE).
 
 NVIDIA, Volta and Tesla are trademarks of NVIDIA Corporation and are used here only to identify hardware. ReVolta is not affiliated with or endorsed by NVIDIA.

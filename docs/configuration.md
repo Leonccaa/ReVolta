@@ -43,8 +43,8 @@ The profile applies these defaults to the OpenAI-compatible server (`vllm serve`
 | `--max-num-batched-tokens` | `8192`, unless chunked prefill is disabled | Total token budget per scheduler step. |
 | `--long-prefill-token-threshold` | `4896`, capped at `--max-model-len` | Caps one long prefill when other requests may need the step. |
 | `--attention-backend` | `FLASH_ATTN_V100` | Selects the V100 FlashAttention backend for the target model. |
-| `gdn_state_replay` in `--speculative-config` | `true` for MTP with prefix caching | Replays accepted GDN tokens instead of storing one state per draft position. |
-| `num_speculative_tokens_per_batch_size` | A schedule for MTP with K=4 (with prefix caching) and for DFlash2 with K=7; other K values keep a fixed width | Chooses the number of drafts from the number of scheduled requests. The schedules are in [Default schedules](dynamic-speculative-decoding.md#default-schedules). |
+| `gdn_state_replay` in `--speculative-config` | `true` for MTP with prefix caching, except by default on NVLink with async scheduling | Replays accepted GDN tokens instead of storing one state per draft position. |
+| `num_speculative_tokens_per_batch_size` | A schedule for MTP with K=4 (also K=5 on fully connected NVLink TP4) with prefix caching, and for DFlash2 with K=7 | Chooses the number of drafts from the number of scheduled requests. The schedules are in [Default schedules](dynamic-speculative-decoding.md#default-schedules). |
 | `dflash2_lookup` and the `sm70_dflash2` verifier options | Native history lookup for single requests and the verifier fast paths, for the DFlash2 selector | See [What the profile sets](dflash2.md#what-the-profile-sets). |
 | `qsa_dcp_index_shard` in `--kernel-config` | `true` for DFlash2, and for MTP with Host KV (`long_context_kv.enabled`), when the model selects 512 index groups (Qwen3.8 Flash-Next) | Splits the target QSA indexer keys over all tensor-parallel ranks; it takes effect at DCP2. MTP with GPU KV keeps the replicated layout. It is part of the SSD page identity; see [Configure Host KV](kv-offload.md#configure-host-kv). |
 | `VLLM_SM70_QSA_GROUPED_LPT`, `VLLM_SM70_GDN_SKINNY_MPLAN` | `1` | Longest-first grouped QSA work and row-count-based GDN input plans. |
@@ -59,10 +59,12 @@ With `VLLM_SM70_INTERCONNECT=auto`, the SM70 profile selects NVLink defaults for
 | Default | What it enables |
 | --- | --- |
 | `VLLM_SM70_NVLINK_HC=1` and `sm70_hc_ll_async: true` | HyperConnection low-latency (HC LL) communication, including with async scheduling. Workers still require P2P access and peer atomics for HC LL. |
-| Asynchronous scheduling | Remove `--no-async-scheduling` from the launch command to use this default. |
+| Asynchronous scheduling for MTP | Remove `--no-async-scheduling` from the reference launch. DFlash2 with its default draft schedule stays synchronous. |
 | `--enable-hc-sp` | HyperConnection sequence parallelism for eligible prefill batches. |
-| FP16 paged QSA readers | H12 (`sm70_qsa_paged_fp16_h12`) for eligible DCP2 decode with FP16 GPU main KV; H6 (`sm70_qsa_paged_fp16_h6`) for eligible DCP2 MTP decode with FP16 draft KV. |
-| MTP sampling and draft schedule | `sm70_sparse_target_sampling: "device_top64"` and DSD `[[1, 8, 3]]` without changing the configured draft maximum. |
+| Paged QSA readers | The [INT8 readers](#kv-cache-format) also apply on NVLink. With FP16 KV at DCP2, H12 applies to eligible GPU main KV and H6 to an eligible FP16 MTP draft without Host KV. FP16 main KV in host memory uses the Triton reader. |
+| MTP sampling and draft schedule | `sm70_sparse_target_sampling: "device_top64"`; with prefix caching and a configured maximum of four or five drafts, the default is `[[1, 8, 3]]` without changing the maximum. |
+
+See [NVLink TP4 acceptance](performance.md#nvlink-tp4-acceptance) for the measured configurations and the automatic versus manual comparisons.
 
 If the selected GPUs do not form a six-pair direct mesh, startup warns that they are not fully connected and does not apply the NVLink profile. Check `nvidia-smi topo -m` and select a fully connected group in `CUDA_VISIBLE_DEVICES`.
 

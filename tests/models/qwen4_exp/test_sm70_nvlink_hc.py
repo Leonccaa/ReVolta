@@ -395,3 +395,61 @@ def test_moe_tail_passes_one_rank_local_half_sum(monkeypatch):
     old_output = moe_runner.MoERunner.forward(runner, routed, routed)
     assert torch.equal(old_output, shared * 4)
     runner._maybe_sm70_moe_sum2_allreduce.assert_called_once()
+
+
+def test_final_mixer_pack_pads_missing_injection_rows():
+    down = torch.randn((320, 10240)).half()
+    padded = torch.cat((down, down.new_zeros((16, 10240))))
+    for rank in range(4):
+        assert torch.equal(
+            sm70_fp16_hc._pack_hc_batch_weight(down, "down", rank),
+            sm70_fp16_hc._pack_hc_batch_weight(padded, "down", rank),
+        )
+
+
+class _Linear:
+    def __init__(self, weight, role, rank=0):
+        self.weight = weight
+        self._sm70_qwen38_hc_batch_packed = sm70_fp16_hc._pack_hc_batch_weight(
+            weight, role, rank
+        )
+
+    def __call__(self, x):
+        return torch.nn.functional.linear(x, self.weight)
+
+
+@pytest.mark.parametrize(
+    "rows,hc_sp,use_ll",
+    [(4, False, True), (64, False, True), (65, False, False), (4, True, False)],
+)
+def test_final_mixer_uses_ll_projection(monkeypatch, rows, hc_sp, use_ll):
+    x = torch.randn((rows, 10240)).half()
+    down = _Linear((torch.randn((320, 10240)) * 0.01).half(), "down")
+    up = _Linear((torch.randn((10240, 320)) * 0.01).half(), "up")
+    module = SimpleNamespace(
+        use_combine=False,
+        hc_count=4,
+        input_mix_weight_down=down,
+        input_mix_weight_up=up,
+        _sm70_qwen38_fp16_fused_hc_no_combine=True,
+    )
+    output = torch.ones((rows, 2560), dtype=torch.float16)
+    project = Mock(return_value=(output, torch.ones((rows, 4))))
+    monkeypatch.setattr(
+        sm70_fp16_hc, "get_tp_hc_ll", lambda: SimpleNamespace(project=project)
+    )
+    monkeypatch.setattr(sm70_fp16_hc, "use_sm70_decode_graph_semantics", lambda: True)
+
+    block, injection = hc.GatedResidual._project(module, x, hc_sp=hc_sp)
+    assert injection is None
+    if use_ll:
+        project.assert_called_once()
+        args = project.call_args.args
+        assert torch.equal(args[0], x)
+        assert args[1] is down._sm70_qwen38_hc_batch_packed
+        assert args[2] is up._sm70_qwen38_hc_batch_packed
+        assert torch.equal(block, output)
+        return
+    project.assert_not_called()
+    gate = up(hc.hc_silu(down(x), 4))
+    torch.testing.assert_close(block, hc.hc_gate_mix(x, gate, 4), rtol=0, atol=0)

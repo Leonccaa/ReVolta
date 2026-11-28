@@ -53,7 +53,10 @@ from .ops.hc import (
     hc_gate_mix,
     hc_silu,
 )
-from .sm70_fp16_hc import maybe_apply_qwen38_sm70_fp16_fused_hc
+from .sm70_fp16_hc import (
+    maybe_apply_qwen38_sm70_fp16_fused_hc,
+    maybe_apply_qwen38_sm70_fp16_fused_hc_no_combine,
+)
 from .sm70_hcx import HD, INJ
 from .sm70_hcx import MAX_ROWS as HCX_MAX_ROWS
 
@@ -272,6 +275,15 @@ class GatedResidual(nn.Module):
             down_and_injection = self.input_mix_weight_down_block_inject(xn)
             lora, injection, _ = down_and_injection.split(split_sizes, dim=-1)
         else:
+            if not hc_sp:
+                block = maybe_apply_qwen38_sm70_fp16_fused_hc_no_combine(
+                    self.input_mix_weight_down,
+                    self.input_mix_weight_up,
+                    xn,
+                    getattr(self, "_sm70_qwen38_fp16_fused_hc_no_combine", False),
+                )
+                if block is not None:
+                    return block, None
             lora = self.input_mix_weight_down(xn)
             injection = None
 

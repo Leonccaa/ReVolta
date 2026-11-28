@@ -59,12 +59,15 @@ class Sm70HcLLCommunicator:
             for i in range(torch.accelerator.device_count())
         }
         # All six pairs must be direct NVLink with native peer atomics.
-        if not _full_nvlink_mesh(uuids) or not all(
+        admitted = _full_nvlink_mesh(uuids) and all(
             ops.sm70_ring_native_peer_atomics(device.index, visible[uuid])
             for index, uuid in enumerate(uuids)
             if index != rank
-        ):
-            logger.info("SM70 HC LL disabled: physical NVLink mesh not confirmed.")
+        )
+        admissions = [None] * len(uuids)
+        dist.all_gather_object(admissions, admitted, group=group)
+        if not all(admissions):
+            logger.info("SM70 HC LL disabled: requires direct NVLink and peer atomics.")
             return None
         logger.info("SM70 HC LL enabled: six direct NVLink pairs and peer atomics.")
         return cls(group, device, rank)

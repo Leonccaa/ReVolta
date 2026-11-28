@@ -673,7 +673,7 @@ def _prepare_sm70_hcx(config: VllmConfig, layers: Iterable[nn.Module]) -> None:
         mode.separate_routine() and mode.decode_mode() == CUDAGraphMode.FULL
     ):
         logger.info_once(
-            "SM70 HCX not prepared: requires admitted NVLink HC LL and a separate "
+            "SM70 HCX/Top1X requires admitted NVLink HC LL and a separate "
             "FULL decode graph."
         )
         return
@@ -715,11 +715,12 @@ def _prepare_sm70_hcx(config: VllmConfig, layers: Iterable[nn.Module]) -> None:
     ll.hcx = Sm70HcxRuntime(get_tp_group().cpu_group, ll.device, ll.rank)
     ll.hcx.top1_enabled = config.kernel_config.sm70_top1x
     config.kernel_config.sm70_hcx_active = bool(seams)
-    logger.info_once(
-        "SM70 HCX prepared %d HC seams (uniform FULL, M=1..8); top1x=%s.",
-        len(seams),
-        config.kernel_config.sm70_top1x,
-    )
+    if seams:
+        logger.info_once(
+            "SM70 HCX prepared %d HC seams (uniform FULL, M=1..8).", len(seams)
+        )
+    if ll.hcx.top1_enabled:
+        logger.info_once("SM70 Top1X prepared.")
 
 
 class Qwen4ExpMixtureOfExperts(MixtureOfExperts):

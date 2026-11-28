@@ -171,10 +171,13 @@ def test_physical_gate_and_policy(monkeypatch, settings, case):
     assert decision.hc_ll_requested
     monkeypatch.setattr(torch.accelerator, "device_count", lambda: 4)
     monkeypatch.setattr(hc_ll.current_platform, "get_device_uuid", _UUIDS.__getitem__)
+    # Ranks gather UUIDs, then each rank's (here identical) admission.
     monkeypatch.setattr(
         hc_ll.dist,
         "all_gather_object",
-        lambda out, value, group: out.__setitem__(slice(None), _UUIDS),
+        lambda out, value, group: out.__setitem__(
+            slice(None), _UUIDS if isinstance(value, str) else [value] * 4
+        ),
     )
     monkeypatch.setattr(
         hc_ll.ops,

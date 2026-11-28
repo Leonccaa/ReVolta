@@ -17,6 +17,7 @@ import vllm.platforms.cuda as cuda_platform
 from vllm.distributed.device_communicators import all_reduce_utils as aru
 from vllm.distributed.device_communicators import custom_all_reduce as car
 from vllm.platforms.interface import DeviceCapability
+from vllm.revolta_profile import frontend_interconnect_mode
 
 from .test_sm70_pcie_switch_custom_all_reduce import PCIE_SWITCH_TOPOLOGY, _FakeNvml
 
@@ -44,6 +45,12 @@ def topology(monkeypatch):
     )
     nvml = _FakeNvml(PCIE_SWITCH_TOPOLOGY)
     monkeypatch.setattr(cuda_platform, "pynvml", nvml)
+    monkeypatch.setattr(
+        car.current_platform,
+        "get_all_gpu_pci_bus_ids",
+        lambda: dict.fromkeys(range(len(PCIE_SWITCH_TOPOLOGY)), ""),
+        raising=False,
+    )
     driver = Mock(return_value=True)
     fresh = Mock(return_value=True)
     monkeypatch.setattr(torch.cuda, "can_device_access_peer", driver)
@@ -71,6 +78,93 @@ def resolve(*, rank=0, size=4, cap=(7, 0), physical=None, visible=None, disabled
         list(range(size)) if visible is None else visible,
         disabled,
     )
+
+
+def test_frontend_uses_selected_physical_devices(topology, monkeypatch, caplog):
+    from vllm.revolta_profile import logger
+
+    monkeypatch.setattr(logger, "warning_once", logger.warning)
+    monkeypatch.setenv("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+    monkeypatch.setattr(
+        car.current_platform,
+        "get_all_gpu_pci_bus_ids",
+        lambda: dict.fromkeys(range(8), ""),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        car.current_platform,
+        "device_id_to_physical_device_id",
+        lambda logical: (6, 4, 7, 5)[logical],
+    )
+    get_p2p = Mock(side_effect=topology.nvml.nvmlDeviceGetP2PStatus)
+    monkeypatch.setattr(topology.nvml, "nvmlDeviceGetP2PStatus", get_p2p)
+    topology.nvml.nvlink = True
+    assert frontend_interconnect_mode(device_ids=(0, 1, 2, 3)) == "nvlink"
+    pairs = {frozenset(call.args[:2]) for call in get_p2p.call_args_list}
+    assert pairs == {
+        frozenset((a, b)) for a in (4, 5, 6, 7) for b in (4, 5, 6, 7) if a < b
+    }
+    topology.driver.assert_not_called()
+    get_p2p.side_effect = lambda a, b, _: int((a, b) == (4, 7))
+    monkeypatch.setattr(
+        car.current_platform, "is_pcie_switch_connected", lambda _: True
+    )
+    assert frontend_interconnect_mode(device_ids=(0, 1, 2, 3)) == "pex_p2p"
+    assert "do not form a 6/6 direct NVLink mesh" in caplog.text
+
+
+def test_frontend_numeric_subset_needs_pci_bus_order(topology, monkeypatch):
+    # Eight GPUs: FASTEST_FIRST ordinals 0-3 need not be NVML indices 0-3.
+    monkeypatch.delenv("CUDA_DEVICE_ORDER", raising=False)
+    monkeypatch.setattr(
+        car.current_platform,
+        "get_all_gpu_pci_bus_ids",
+        lambda: dict.fromkeys(range(8), ""),
+        raising=False,
+    )
+    get_p2p = Mock(side_effect=topology.nvml.nvmlDeviceGetP2PStatus)
+    monkeypatch.setattr(topology.nvml, "nvmlDeviceGetP2PStatus", get_p2p)
+    topology.nvml.nvlink = True
+    assert frontend_interconnect_mode(device_ids=(0, 1, 2, 3)) == "pex_p2p"
+    get_p2p.assert_not_called()
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-a,GPU-b,GPU-c,GPU-d")
+    assert frontend_interconnect_mode(device_ids=(0, 1, 2, 3)) == "nvlink"
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    monkeypatch.setenv("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+    assert frontend_interconnect_mode(device_ids=(0, 1, 2, 3)) == "nvlink"
+
+
+def test_nvlink_candidate_drops_hc_ll_after_failed_p2p(topology, monkeypatch):
+    topology.nvml.nvlink = True
+    assert frontend_interconnect_mode(device_ids=(0, 1, 2, 3)) == "nvlink"
+    monkeypatch.setattr(car, "_sm70_hc_ll_requested", lambda: True)
+    assert resolve().hc_ll_requested
+    topology.driver.return_value = False
+    decision = resolve()
+    assert decision.mode == "no_p2p"
+    assert not decision.hc_ll_requested
+
+
+def test_hc_ll_peer_atomics_rejection_is_shared(monkeypatch):
+    from vllm.distributed.device_communicators import sm70_hc_ll as hc
+
+    monkeypatch.setattr(hc, "_full_nvlink_mesh", lambda _: True)
+    monkeypatch.setattr(hc.current_platform, "get_device_uuid", str, raising=False)
+    monkeypatch.setattr(torch.accelerator, "device_count", lambda: 4)
+    monkeypatch.setattr(hc.ops, "sm70_ring_native_peer_atomics", lambda *_: True)
+
+    def gather(output, value, group):
+        if value is True:
+            output[:] = [True, True, False, True]
+        else:
+            output[:] = list("0123")
+
+    monkeypatch.setattr(hc.dist, "all_gather_object", gather)
+    allocate = Mock(side_effect=AssertionError("HC LL IPC must stay disabled"))
+    monkeypatch.setattr(car.CustomAllreduce, "create_shared_buffer", allocate)
+    device = torch.device("cuda:0")
+    assert hc.Sm70HcLLCommunicator.create("cpu-group", device, 0) is None
+    allocate.assert_not_called()
 
 
 def test_pex_auto_validates_all_edges_despite_skip_flag(topology):

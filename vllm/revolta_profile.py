@@ -12,9 +12,14 @@ import os
 from typing import TYPE_CHECKING, Any, Literal
 
 from vllm import envs
+from vllm.logger import init_logger
 
 if TYPE_CHECKING:
+    from vllm.config.parallel import ParallelConfig
     from vllm.config.vllm import VllmConfig
+    from vllm.platforms.sm70_interconnect import _InterconnectDecision
+
+logger = init_logger(__name__)
 
 InterconnectMode = Literal["pex_p2p", "no_p2p", "nvlink"]
 
@@ -111,6 +116,7 @@ KERNEL_DEFAULTS = {"ple_disk_cascade": False}
 # Include the entire deployment inventory in the audit, even entries whose
 # defaults remain upstream. In particular, never write the three FP16 flags.
 UPSTREAM_AND_DEPLOYMENT = (
+    "VLLM_SM70_NVLINK_HC",
     "VLLM_SM70_AWQ_TURBOMIND",
     "VLLM_SM70_AWQ_WARMUP",
     "VLLM_SM70_AUX_KERNEL_WARMUP",
@@ -284,16 +290,9 @@ def all_visible_devices_sm70() -> bool:
 
 
 def frontend_interconnect_mode(
-    *, disable_custom_all_reduce: bool = False
+    *, disable_custom_all_reduce: bool = False, device_ids: tuple[int, ...] = ()
 ) -> InterconnectMode:
-    """The interconnect the profile assumes before workers resolve topology.
-
-    Only explicit operator choices are known this early: nccl or a disabled
-    custom AR mean no_p2p, and nvlink forces that path. auto and pex assume
-    pex_p2p; workers log the resolved mode ("SM70 interconnect=...") and fall
-    back to NCCL when P2P fails, which leaves the custom-AR default inert.
-    Unknown values also assume pex_p2p and fail in the worker resolver.
-    """
+    """Select frontend defaults from topology before worker P2P admission."""
     if disable_custom_all_reduce:
         return "no_p2p"
     requested = os.environ.get("VLLM_SM70_INTERCONNECT", "auto").strip().lower()
@@ -301,19 +300,104 @@ def frontend_interconnect_mode(
         return "no_p2p"
     if requested == "nvlink":
         return "nvlink"
+    if requested == "auto" and device_ids:
+        try:
+            if not _cuda_ids_name_nvml_devices(device_ids):
+                return "pex_p2p"
+            decision = _select_sm70_interconnect(device_ids, disable_custom_all_reduce)
+        except Exception as error:
+            # Workers repeat the query and resolve the path; keep the old default.
+            logger.warning_once(
+                "SM70 frontend topology query failed (%s); keeping PCIe defaults.",
+                type(error).__name__,
+            )
+            return "pex_p2p"
+        if decision.mode == "nvlink":
+            return "nvlink"
+        logger.warning_once(
+            "Selected SM70 TP4 CUDA devices %s do not form a 6/6 direct NVLink "
+            "mesh. Check CUDA_VISIBLE_DEVICES and nvidia-smi topo -m if NVLink "
+            "was intended.",
+            device_ids,
+        )
     return "pex_p2p"
 
 
-def _logged_interconnect_mode(mode: InterconnectMode, policy: str) -> str:
-    """The audit names a mode only when the operator chose it explicitly.
+def local_tp4_device_ids(parallel: "ParallelConfig") -> tuple[int, ...]:
+    """Only local, single-replica TP4 has known placement in the frontend."""
+    from vllm.platforms import current_platform
 
-    frontend_interconnect_mode() assumes pex_p2p for auto, which applies the
-    same defaults as nvlink; only the workers know the topology and log the
-    resolved mode ("SM70 interconnect=..."). Logging the assumption as a mode
-    would contradict them on an NVLink machine.
+    if (
+        parallel.tensor_parallel_size == 4
+        and parallel.pipeline_parallel_size == 1
+        and parallel.data_parallel_size == 1
+        and parallel.nnodes == 1
+        and parallel.distributed_executor_backend in (None, "mp")
+        and current_platform.is_cuda()
+        and current_platform.device_count() >= 4
+        and all(
+            current_platform.is_device_capability((7, 0), device_id=i) for i in range(4)
+        )
+    ):
+        return (0, 1, 2, 3)
+    return ()
+
+
+def _cuda_ids_name_nvml_devices(device_ids: tuple[int, ...]) -> bool:
+    """Whether numeric CUDA ordinals map to the same NVML devices.
+
+    CUDA enumerates FASTEST_FIRST by default, so a numeric ordinal names an
+    NVML index only in PCI bus order. UUID masks name devices exactly, and a
+    selection of every GPU is the same set in any order.
     """
+    from vllm.platforms import current_platform
+
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if os.environ.get("CUDA_DEVICE_ORDER") == "PCI_BUS_ID" or (
+        visible and all(v.strip().startswith("GPU-") for v in visible.split(","))
+    ):
+        return True
+    physical_ids = sorted(
+        current_platform.device_id_to_physical_device_id(i) for i in device_ids
+    )
+    return physical_ids == sorted(current_platform.get_all_gpu_pci_bus_ids())
+
+
+def _select_sm70_interconnect(
+    device_ids: tuple[int, ...], disable_custom_all_reduce: bool
+) -> "_InterconnectDecision":
+    from vllm.platforms import current_platform
+    from vllm.platforms.interface import DeviceCapability
+    from vllm.platforms.sm70_interconnect import _select_interconnect
+
+    physical_ids = [
+        current_platform.device_id_to_physical_device_id(i) for i in device_ids
+    ]
+    return _select_interconnect(
+        len(physical_ids),
+        DeviceCapability(7, 0),
+        physical_ids,
+        disable_custom_all_reduce,
+    )
+
+
+def is_nvlink_auto_profile(model_config: Any, mode: InterconnectMode) -> bool:
+    return (
+        mode == "nvlink"
+        and envs.VLLM_SM70_INTERCONNECT == "auto"
+        and (
+            getattr(model_config, "quantization", None) == "awq"
+            or has_nvfp4_weights(model_config)
+        )
+    )
+
+
+def _logged_interconnect_mode(mode: InterconnectMode, policy: str) -> str:
+    """Distinguish the frontend NVLink candidate from worker admission."""
+    if mode == "nvlink" and policy.strip().lower() == "auto":
+        return "nvlink (pending worker admission)"
     if mode != "pex_p2p":
-        return mode  # nccl, nvlink or a disabled custom AR
+        return mode
     requested = policy.strip().lower()
     if requested == "pex":
         return mode
@@ -421,6 +505,10 @@ def apply_revolta_profile(
             defaults.update(mtp_planar_kv_defaults)
     if interconnect_mode != "no_p2p":
         defaults.update(CUSTOM_AR_DEFAULTS)
+    if speculative_method in ("mtp", "dflash") and is_nvlink_auto_profile(
+        model_config, interconnect_mode
+    ):
+        defaults["VLLM_SM70_NVLINK_HC"] = "1"
     if hybrid_serving:
         defaults.update(HYBRID_SERVING_DEFAULTS)
         if speculative_method == "dflash":
@@ -437,10 +525,6 @@ def apply_awq_mtp_wide_verify_defaults(
     config: "VllmConfig", device_ids: tuple[int, ...]
 ) -> bool:
     """Apply the wide verifier settings within the qualified ReVolta profile."""
-    from vllm.platforms import current_platform
-    from vllm.platforms.interface import DeviceCapability
-    from vllm.platforms.sm70_interconnect import _select_interconnect
-
     model = config.model_config
     spec = config.speculative_config
     parallel = config.parallel_config
@@ -458,15 +542,7 @@ def apply_awq_mtp_wide_verify_defaults(
     ):
         return False
 
-    physical_ids = [
-        current_platform.device_id_to_physical_device_id(i) for i in device_ids
-    ]
-    decision = _select_interconnect(
-        len(physical_ids),
-        DeviceCapability(7, 0),
-        physical_ids,
-        parallel.disable_custom_all_reduce,
-    )
+    decision = _select_sm70_interconnect(device_ids, parallel.disable_custom_all_reduce)
     if decision.mode != "pex_p2p":
         return False
 
@@ -516,12 +592,50 @@ def apply_revolta_kernel_profile(kernel_config: Any, *, enabled: bool) -> None:
         )
 
 
+def apply_revolta_nvlink_kernel_profile(
+    config: "VllmConfig",
+) -> dict[str, dict[str, Any]]:
+    spec = config.speculative_config
+    assert spec is not None
+    kernel = config.kernel_config
+    kv_dtype = config.cache_config.cache_dtype
+    dcp2 = config.parallel_config.decode_context_parallel_size == 2
+    host = kernel.long_context_kv
+    fp16_target = kv_dtype in ("auto", "float16")
+    defaults: dict[str, Any] = {
+        "sm70_hc_ll_async": True,
+        "sm70_qsa_paged_fp16_h12": (
+            dcp2
+            and fp16_target
+            and (not host.enabled or host.main_kv_placement == "gpu")
+        ),
+    }
+    if spec.method == "mtp":
+        defaults["sm70_sparse_target_sampling"] = "device_top64"
+
+    values = {}
+    for name, default in defaults.items():
+        value = getattr(kernel, name)
+        # A set value also covers assignment after construction.
+        explicit = name in kernel._nvlink_profile_fields or bool(value)
+        if not explicit:
+            setattr(kernel, name, default)
+        values[name] = {
+            "value": value if explicit else default,
+            "source": (
+                "explicit" if explicit else "profile" if default else "upstream_default"
+            ),
+        }
+    return values
+
+
 def profile_audit(
     *,
     enabled: bool,
     interconnect_mode: InterconnectMode = "pex_p2p",
     quantization: str | None = None,
     kernel_config: Any = None,
+    config_values: dict[str, dict[str, Any]] | None = None,
 ) -> str:
     """One JSON line, after upstream config policy has resolved its defaults."""
     from vllm import envs
@@ -567,6 +681,7 @@ def profile_audit(
                 if kernel_config is not None
                 else {}
             ),
+            **({"config_values": config_values} if config_values else {}),
         },
         sort_keys=True,
     )

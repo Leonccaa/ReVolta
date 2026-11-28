@@ -530,41 +530,61 @@ def test_final_mixer_keeps_lora_wrapped_projection(monkeypatch):
     torch.testing.assert_close(block, hc.hc_gate_mix(x, gate, 4), rtol=0, atol=0)
 
 
-def test_direct_reload_refreshes_final_mixer_ll_packs(monkeypatch):
+@pytest.mark.parametrize("entry", ["reload_weights", "finish_weight_update"])
+def test_weight_update_refreshes_final_mixer_ll_packs(entry, monkeypatch):
+    from vllm import _custom_ops as ops
+    from vllm.distributed import parallel_state
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+    from vllm.v1.worker.gpu_worker import Worker
 
     mixer = torch.nn.Module()
     mixer.input_mix_weight_down = _hc_linear(monkeypatch, 10240, 320, "down")
     mixer.input_mix_weight_up = _hc_linear(monkeypatch, 320, 10240, "up")
     model = torch.nn.Module()
     model.mixer = mixer
-    # CPU stand-in for the CUDA-only pack preparation (rank 0 shard).
+    # Run the real pack preparation on CPU as TP rank 0 without HC LL.
+    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
     monkeypatch.setattr(
-        sm70_fp16_hc,
-        "_prepare_hc_batch_weight",
-        lambda layer: layer.register_buffer(
-            "_sm70_qwen38_hc_batch_packed",
-            sm70_fp16_hc._pack_hc_batch_weight(
-                layer.weight, layer._sm70_qwen38_hc_batch_role, 0
-            ),
-            persistent=False,
-        ),
+        ops, "supports_sm70_qwen38_hc_batch", lambda: True, raising=False
     )
+    monkeypatch.setattr(
+        parallel_state,
+        "get_tp_group",
+        lambda: SimpleNamespace(rank_in_group=0, device_communicator=None),
+    )
+    monkeypatch.setattr(sm70_fp16_hc, "get_tp_hc_ll", lambda: None)
     layers = (mixer.input_mix_weight_down, mixer.input_mix_weight_up)
+    for layer in layers:
+        sm70_fp16_hc._prepare_hc_batch_weight(layer)
     packed = [layer._sm70_qwen38_hc_batch_packed for layer in layers]
     new = [torch.randn_like(layer.weight) * 0.01 for layer in layers]
-    runner = SimpleNamespace(
-        get_model=lambda: model, model_config=SimpleNamespace(quantization=None)
-    )
+    weights = [
+        ("mixer.input_mix_weight_down.weight", new[0]),
+        ("mixer.input_mix_weight_up.weight", new[1]),
+    ]
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
 
-    GPUModelRunner.reload_weights(
-        runner,
-        weights_iterator=[
-            ("mixer.input_mix_weight_down.weight", new[0]),
-            ("mixer.input_mix_weight_up.weight", new[1]),
-        ],
-        is_checkpoint_format=False,
-    )
+    if entry == "reload_weights":
+        runner = SimpleNamespace(
+            get_model=lambda: model, model_config=SimpleNamespace(quantization=None)
+        )
+        GPUModelRunner.reload_weights(
+            runner, weights_iterator=weights, is_checkpoint_format=False
+        )
+    else:
+        worker = SimpleNamespace(
+            weight_transfer_engine=SimpleNamespace(
+                parse_update_info=lambda info: info,
+                receive_weights=lambda info, load_weights: load_weights(info),
+            ),
+            _check_weight_transfer_engine=lambda: None,
+            _weight_update_active=True,
+            _is_checkpoint_format=False,
+            model_runner=SimpleNamespace(model=model),
+            device="cpu",
+        )
+        Worker.update_weights(worker, weights)
+        Worker.finish_weight_update(worker)
     for layer, old, weight, role in zip(layers, packed, new, ("down", "up")):
         assert layer._sm70_qwen38_hc_batch_packed is old
         assert torch.equal(old, sm70_fp16_hc._pack_hc_batch_weight(weight, role, 0))

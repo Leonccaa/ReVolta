@@ -1609,17 +1609,13 @@ class Worker(WorkerBase):
             model = self.model_runner.model
             with torch.device(self.device):
                 finalize_layerwise_reload(model, self.model_config)
-        else:
-            from vllm.model_executor.model_loader.weight_utils import (
-                refresh_derived_weights,
-            )
 
-            # Every update_weights call has synchronized its (possibly
-            # side-stream) copies, so derived weights see the new params.
-            refresh_derived_weights(self.model_runner.model)
-            # The refresh writes in place on this stream; sync before
-            # returning so graphs replayed on other streams see it.
-            torch.accelerator.synchronize()
+        from vllm.model_executor.model_loader.weight_utils import (
+            publish_weight_update,
+        )
+
+        # Checkpoint finalize and derived-weight refresh write in place.
+        publish_weight_update(self.model_runner.model)
 
         # Reset state
         self._weight_update_active = False

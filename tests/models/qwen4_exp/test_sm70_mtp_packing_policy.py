@@ -283,41 +283,87 @@ def _assert_pack_refreshed(layer, packed, ptr):
     assert torch.equal(packed, expected)
 
 
-def test_kernel_format_reload_refreshes_shared_pack(monkeypatch):
-    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-
-    model, layer = _shared_model(monkeypatch)
-    packed = layer._sm70_mtp_shared_packed
-    ptr = packed.data_ptr()
-    runner = SimpleNamespace(
-        get_model=lambda: model, model_config=SimpleNamespace(quantization=None)
+def _defer_device_writes(monkeypatch, layer):
+    # Device writes (side-stream receives, layerwise write-back, pack refresh)
+    # are asynchronous; run them only at the device sync so a missing sync
+    # leaves the old values visible when the entry point returns.
+    pending = []
+    refresh = layer.refresh_derived_weights
+    monkeypatch.setattr(
+        layer, "refresh_derived_weights", lambda: pending.append(refresh)
     )
-    new_weight = torch.flip(layer.weight.detach(), dims=(1,)).clone()
-    GPUModelRunner.reload_weights(
-        runner,
-        weights_iterator=[("gate_up_proj.weight", new_weight)],
-        is_checkpoint_format=False,
+
+    def synchronize():
+        while pending:
+            pending.pop(0)()
+
+    monkeypatch.setattr(torch.accelerator, "synchronize", synchronize)
+    return pending
+
+
+def _stub_layerwise(monkeypatch, model, layer, new_weight, pending):
+    # Checkpoint format: load_weights buffers, finalize writes back in place.
+    from vllm.model_executor.model_loader import reload
+    from vllm.v1.worker import gpu_model_runner
+
+    def finalize(*args):
+        pending.append(lambda: layer.weight.data.copy_(new_weight))
+
+    for module in (reload, gpu_model_runner):
+        monkeypatch.setattr(module, "finalize_layerwise_reload", finalize)
+    monkeypatch.setattr(
+        gpu_model_runner, "initialize_layerwise_reload", lambda model: None
     )
-    assert torch.equal(layer.weight, new_weight)
-    _assert_pack_refreshed(layer, packed, ptr)
+    model.load_weights = lambda weights: {name for name, _ in weights}
 
 
-def test_kernel_format_weight_update_refreshes_shared_pack(monkeypatch):
+@pytest.mark.parametrize("runner_version", ["v1", "v2"])
+@pytest.mark.parametrize("checkpoint_format", [False, True])
+def test_reload_weights_publishes_shared_pack(
+    runner_version, checkpoint_format, monkeypatch
+):
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner as V2Runner
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner as V1Runner
     from vllm.v1.worker.gpu_worker import Worker
 
     model, layer = _shared_model(monkeypatch)
     packed = layer._sm70_mtp_shared_packed
     ptr = packed.data_ptr()
     new_weight = torch.flip(layer.weight.detach(), dims=(1,)).clone()
-    # NCCL packed receive copies on a side stream and returns before the
-    # copies finish, and the pack refresh is an async device copy that a
-    # graph replayed on another stream may race; model both by deferring
-    # them to the device sync.
-    pending = []
-    refresh = layer.refresh_derived_weights
-    monkeypatch.setattr(
-        layer, "refresh_derived_weights", lambda: pending.append(refresh)
+    pending = _defer_device_writes(monkeypatch, layer)
+    if checkpoint_format:
+        _stub_layerwise(monkeypatch, model, layer, new_weight, pending)
+    runner = SimpleNamespace(
+        get_model=lambda: model,
+        model_config=SimpleNamespace(quantization=None),
+        reset_encoder_cache=lambda: None,
+        reset_mm_cache=lambda: None,
     )
+    runner_cls = V1Runner if runner_version == "v1" else V2Runner
+    runner.reload_weights = MethodType(runner_cls.reload_weights, runner)
+    worker = SimpleNamespace(_ple_offload_enabled=False, model_runner=runner)
+
+    Worker.reload_weights(
+        worker,
+        weights_iterator=[("gate_up_proj.weight", new_weight)],
+        is_checkpoint_format=checkpoint_format,
+    )
+    assert torch.equal(layer.weight, new_weight)
+    _assert_pack_refreshed(layer, packed, ptr)
+
+
+@pytest.mark.parametrize("checkpoint_format", [False, True])
+def test_weight_update_publishes_shared_pack(checkpoint_format, monkeypatch):
+    from vllm.v1.worker.gpu_worker import Worker
+
+    model, layer = _shared_model(monkeypatch)
+    packed = layer._sm70_mtp_shared_packed
+    ptr = packed.data_ptr()
+    new_weight = torch.flip(layer.weight.detach(), dims=(1,)).clone()
+    pending = _defer_device_writes(monkeypatch, layer)
+    if checkpoint_format:
+        _stub_layerwise(monkeypatch, model, layer, new_weight, pending)
+    # NCCL and IPC engines differ only in receive_weights.
     engine = SimpleNamespace(
         parse_update_info=lambda info: info,
         receive_weights=lambda info, load_weights: pending.append(
@@ -328,16 +374,12 @@ def test_kernel_format_weight_update_refreshes_shared_pack(monkeypatch):
         weight_transfer_engine=engine,
         _check_weight_transfer_engine=lambda: None,
         _weight_update_active=True,
-        _is_checkpoint_format=False,
+        _is_checkpoint_format=checkpoint_format,
         model_runner=SimpleNamespace(model=model),
+        model_config=None,
         device="cpu",
     )
 
-    def synchronize():
-        while pending:
-            pending.pop(0)()
-
-    monkeypatch.setattr(torch.accelerator, "synchronize", synchronize)
     Worker.update_weights(worker, [("gate_up_proj.weight", new_weight)])
     Worker.finish_weight_update(worker)
     assert torch.equal(layer.weight, new_weight)

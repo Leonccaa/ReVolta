@@ -1706,6 +1706,15 @@ def refresh_derived_weights(model: torch.nn.Module) -> None:
             refresh()
 
 
+def publish_weight_update(model: torch.nn.Module) -> None:
+    """Finish an in-place weight update: rebuild derived weights, then wait
+    for every pending device write so graphs replayed on other streams see
+    the new values. Call once when the update ends, never per step.
+    """
+    refresh_derived_weights(model)
+    torch.accelerator.synchronize()
+
+
 def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
     """Default weight loader."""
     try:

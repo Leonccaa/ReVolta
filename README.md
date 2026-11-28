@@ -62,9 +62,11 @@ Cold prefill uses one request and divides the actual prompt length by median pre
 
 | Sessions running at once, each at full length | 256K | 512K | 1M |
 | --- | ---: | ---: | ---: |
-| GPU KV (1.19M / 1.85M-token pool, MTP4 / DFlash2) | 4 / 7 | 2 / 3 | 1 |
+| GPU KV (1.19M / 1.85M-token pool, MTP4 / DFlash2) | at most 4 / 7 | 2 / 3 | 1 |
 | Host KV, 98 GiB store | **8** | **8** | 6–7 |
 | Host KV, 192 GiB store | **8** | **8** | **8** |
+
+GPU KV at 512K is the startup log's maximum concurrency; at 256K it is an upper bound, because every running request also takes recurrent-state and drafter blocks from the same pool.
 
 - **Cost:** **2–4 ms per decode round** (16.4 → 19.7 ms at one request on NVLink); the KV that fits grows from 1.31M to **7.33M tokens** with 98 GiB (5.6×).
 - **For whom:** small and medium teams that share one server for coding agents, long documents and research sessions that stay open for hours and are revisited over days, on a server with plenty of RAM and an NVMe SSD.

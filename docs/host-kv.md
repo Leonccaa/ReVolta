@@ -15,18 +15,18 @@ This page explains the idea, the numbers and the use cases. Settings, requiremen
 
 ## Eight long sessions at once
 
-A GPU KV pool of 1.2–1.8 million tokens does not mean that eight long sessions run at once. Every request that is decoding needs **all of its K/V in GPU memory**, and the scheduler admits a request only when its blocks fit. The number of long requests that run together is therefore at most the pool size divided by the context length, and in practice lower: the pool is allocated in whole blocks and has to absorb each request's growth while it decodes, so even eight requests of 150–230K each start to queue or get preempted before the pool is nominally full. A CPU KV pool does not change this limit: it keeps the K/V of evicted or preempted requests so that they do not have to be recomputed when they get their turn, but they still wait for that turn.
+A GPU KV pool of 1.2–1.8 million tokens does not mean that eight long sessions run at once. Every request that is decoding needs **all of its K/V in GPU memory**, and the scheduler admits a request only when its blocks fit. The number of long requests that run together is therefore at most the pool size divided by the context length, and in practice lower: each running request also takes its own recurrent-state and drafter blocks from the same pool, the pool is allocated in whole blocks, and it has to absorb each request's growth while it decodes. Even eight requests of 150–230K each start to queue or get preempted before the pool is nominally full. A CPU KV pool does not change this limit: it keeps the K/V of evicted or preempted requests so that they do not have to be recomputed when they get their turn, but they still wait for that turn.
 
 With Host KV the full history is in RAM and the GPU only needs the index and the hot pages, so the limit becomes the host store:
 
 | Sessions running at once, each at full length | 256K | 512K | 1M |
 | --- | ---: | ---: | ---: |
-| GPU KV, AWQ + MTP4 (1,194,816-token pool) | 4 | 2 | 1 |
-| GPU KV, AWQ + DFlash2 (1,851,676-token pool) | 7 | 3 | 1 |
+| GPU KV, AWQ + MTP4 (1,194,816-token pool) | at most 4 | 2 | 1 |
+| GPU KV, AWQ + DFlash2 (1,851,676-token pool) | at most 7 | 3 | 1 |
 | Host KV, 98 GiB store | **8** | **8** | 6–7 |
 | Host KV, 192 GiB store | **8** | **8** | **8** |
 
-- GPU KV rows: the pool size from the 0.2.0 startup log divided by the context (the startup log prints the same number as "Maximum concurrency"; 2.28× and 3.53× at 512K). A 1M context needs the 1M checkpoint view and `--max-model-len 1048576`.
+- GPU KV rows: the 512K column is the startup log's "Maximum concurrency" (2.28× and 3.53×), which counts every request at the full 512K plus its own recurrent-state and drafter blocks. The 256K column is only an upper bound (the pool divided by 256K): the block pool is shared by attention K/V and those per-request state blocks, so each extra running request takes room from the attention tokens and fewer 256K requests fit in practice. The pool itself is sized at startup from `--max-num-seqs`, the CUDA graph capture sizes and the draft width, so a configuration with more concurrency starts with a smaller pool. A 1M context needs the 1M checkpoint view and `--max-model-len 1048576`.
 - Host KV rows: the engine's startup plan at 512K with 98 GiB (measured; eight is set by the GPU recurrent-state slots and `--max-num-seqs 8`) and the planner arithmetic of 0.2.0rc15 for 1M (seven with DFlash2 and six with MTP4 at 98 GiB, eight at 192 GiB). In this setup eight is the limit of those slots and of `--max-num-seqs`, not of the host store.
 - When a session does not fit, it waits in the queue. Host KV never rejects a request or returns an error for lack of memory; it waits like a full GPU pool does.
 

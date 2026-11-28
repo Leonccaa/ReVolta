@@ -11,11 +11,11 @@ ReVolta is built for four or more V100 32 GB GPUs and validated on four. We reco
 | Hardware | Status |
 | --- | --- |
 | 4 × V100 32 GB PCIe under one PCIe switch (PIX/PXB in `nvidia-smi topo -m`), P2P enabled | Reference system, with a 128 GiB container memory limit. Release acceptance runs here. |
-| 4 × V100-SXM2 32 GB, NVLink | Passed [0.2.0 acceptance](performance.md#nvlink-tp4-acceptance). Also tested by the community: [@jttdev](https://github.com/jttdev) ([#2](https://github.com/Leonccaa/ReVolta/issues/2)): speed, retrieval to about 490K tokens, vision (0.1.2); also [#37](https://github.com/Leonccaa/ReVolta/issues/37) and [#38](https://github.com/Leonccaa/ReVolta/issues/38) |
+| 4 × V100-SXM2 32 GB, all six pairs directly connected by NVLink | Passed [0.2.0 acceptance](performance.md#nvlink-tp4-acceptance). Also tested by the community: [@jttdev](https://github.com/jttdev) ([#2](https://github.com/Leonccaa/ReVolta/issues/2)): speed, retrieval to about 490K tokens, vision (0.1.2); also [#37](https://github.com/Leonccaa/ReVolta/issues/37) and [#38](https://github.com/Leonccaa/ReVolta/issues/38) |
 | The reference system with P2P disabled | Correct output; about 30–55% of P2P throughput (0.1.0 release test) |
 | V100 16 GB, TP2, TP8, other GPU counts | Not tested |
 
-The release builds for SM70 only. Other GPU architectures, ROCm, CPU, XPU, TPU and GGUF are outside the build. There is no GPU CI: releases are checked on the reference system.
+The release builds for SM70 only. Other GPU architectures, ROCm, CPU, XPU, TPU and GGUF are outside the build. There is no GPU CI. The 0.2.0 package was tested on both the PCIe reference system and the fully connected NVLink system.
 
 The supported model is Qwen3.8 Flash-Next. Checkpoints and their test status are in [Checkpoints](checkpoints.md#choose-a-checkpoint). The 0.2.0 release acceptance covers only Qwen3.8 Flash-Next; Hy4-flash has validation support (below). The supported serving forms run tensor parallel 4 with decode context parallel 2 (DCP2) and combine:
 
@@ -27,12 +27,12 @@ The supported model is Qwen3.8 Flash-Next. Checkpoints and their test status are
 | --- | --- |
 | GPU KV with the CPU KV pool | Stable; the [reference launch](getting-started.md#4-launch) uses a 48 GiB pool |
 | `revolta_fs` disk tier below the CPU KV pool | Supported; the production form in the acceptance table below runs it. The on-disk format can change between releases, and pages are reused only by the same configuration; see [Disk tier](kv-offload.md#disk-tier-revolta_fs) |
-| Host KV (Active Host KV) with MTP | Supported, off by default; passed 0.2.0 acceptance with AWQ and MTP5 (configuration E2 below) |
+| Host KV (Active Host KV) with MTP | Supported, off by default; tested with AWQ + MTP5 on PCIe and NVFP4 + MTP5 on NVLink |
 | Host KV with DFlash2 | Supported combination; not tested separately in the 0.2.0 release acceptance |
 
 The modes are described in [KV offload](kv-offload.md).
 
-0.2.0 release acceptance covers these configurations:
+PCIe release acceptance covers these configurations:
 
 | Weights | Speculative decoding | KV | Tests | Result |
 | --- | --- | --- | --- | --- |
@@ -42,6 +42,16 @@ The modes are described in [KV offload](kv-offload.md).
 | AWQ | MTP, 5 drafts | Host KV | Serving, concurrency, cold prefill and quality | Passed; SSD readback after restart not measured |
 | NVFP4 | MTP, 5 drafts | GPU KV | Reduced core tests | Passed |
 | NVFP4 | DFlash2 | GPU KV | Reduced core tests | Passed |
+
+The PCIe FP4-Local + MTP5 smoke test also passed; it did not run the full acceptance suite.
+
+[NVLink release acceptance](performance.md#nvlink-tp4-acceptance) covers these configurations:
+
+| Weights | Speculative decoding | KV | Tests |
+| --- | --- | --- | --- |
+| NVFP4 | MTP, 5 drafts with DSD | GPU KV, INT8 | Passed output speed, cold TTFT, quality and RevBench checks |
+| AWQ g32 | DFlash2, 7 drafts with DSD | GPU KV, INT8 | Passed output speed, cold TTFT, quality and RevBench checks |
+| NVFP4 | MTP, 5 drafts with DSD | Host KV, INT8 and FP16 | Startup, capacity and short-prompt timing; no separate quality gate or SSD-backed restart test |
 
 Text-only Hy4-flash has validation support and is outside the 0.2.0 release acceptance; its status and limits are in [Hy4-flash](hy4-flash.md).
 

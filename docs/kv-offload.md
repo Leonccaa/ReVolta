@@ -179,7 +179,7 @@ The external prefix-cache hit counters combine CPU and disk hits, so they cannot
 A prefix restored from disk is first staged in the CPU pool. Two limits follow:
 
 - The pool must be larger than the largest prefix you expect to restore from disk, or the request is computed again. At the per-token sizes [above](#cpu-offload-reference-configuration) (about 21 KB with MTP4 and about 50 KB with DFlash2, E4M3 KV), a 100K-token prefix needs more than 2 GiB with MTP4 and about 5 GB with DFlash2.
-- With MTP4 the pool is grouped: each recurrent-state group gets its own slots, sized from `mamba_state_slots_reference_tokens`. If more requests restore from disk at the same time than there are state slots, the extra requests are treated as cache misses and computed again; their output is not affected. The startup line `Grouped CPU offload pool: N token slots, M state slots per Mamba group` gives the state slots; each restoring request needs two. With the reference launch on a 0.2.0 development build, that was 4 slots per group at 2 GiB and 72 at 48 GiB, about 0.73 requests' worth of states per GiB. Size the pool so that 0.73 × pool GiB covers the requests that may restore at once: about 11 GiB for the default 8 sequences, hence 16 GiB in the example. Or lower `mamba_state_slots_reference_tokens`: 16384 gives each state group about four times as many slots from the same budget, at the cost of fewer token slots (not measured).
+- With MTP4 the pool is grouped: each recurrent-state group gets its own slots, sized from `mamba_state_slots_reference_tokens`. If more requests restore from disk at the same time than there are state slots, the extra requests are treated as cache misses and computed again; their output is not affected. The startup line `Grouped CPU offload pool: N token slots, M state slots per Mamba group` gives the state slots; each restoring request needs two. As a historical sizing example, a 0.2.0 development build with the reference launch had 4 slots per group at 2 GiB and 72 at 48 GiB, about 0.73 requests' worth of states per GiB. That suggested about 11 GiB for the default 8 sequences, hence 16 GiB in the example. Use your startup log to size the pool. Or lower `mamba_state_slots_reference_tokens`: 16384 gives each state group about four times as many slots from the same budget, at the cost of fewer token slots (not measured).
 
 ### Set the SSD write delay
 
@@ -224,7 +224,7 @@ Prefixes served from the GPU or CPU also refresh their disk pages, with the star
 
 In Host KV mode, the main K/V history of the QSA layers lives in a host memory store. The GPU keeps the compressed index, recurrent states, drafter windows and a pool of hot pages that the sparse attention reads. Long contexts and many concurrent long requests then fit even when their K/V does not fit in GPU memory. Prefix reuse works through the same host store, and an optional SSD tier keeps pages across restarts.
 
-**Status:** supported in 0.2.0 and off by default. On PCIe, AWQ with INT8 Host KV and MTP5 passed startup, serving, concurrency and quality checks (configuration E2); SSD readback after restart was not measured. The synthetic short-prompt test measured 26.76, 36.17 and 52.30 ms per decode round at C1, C4 and C8. These are wall-clock round times, not kernel timings. Host KV with DFlash2 is supported but was not tested separately in 0.2.0.
+**Status:** supported in 0.2.0 and off by default. On PCIe, AWQ with INT8 Host KV and MTP5 passed startup, serving, concurrency and quality checks; see [PCIe output speed](performance.md#speed). On fully connected NVLink, NVFP4 + MTP5 ran startup, capacity and [short-prompt timing checks](performance.md#nvlink-kv-capacity) with INT8 and FP16. The NVLink Host KV runs did not repeat quality checks, and neither interconnect measured Host KV SSD readback after restart. Host KV with DFlash2 is supported but was not tested separately in 0.2.0.
 
 ### Requirements
 
@@ -306,9 +306,16 @@ A recurrent-state checkpoint lets a later request resume from the end of an earl
 
 ### Host KV capacity
 
-These sizing examples are from 0.2.0rc15: Qwen3.8 Flash-Next AWQ, four 32 GB V100s, TP4 + DCP2, the compressed index split over all TP ranks, `max_num_seqs=8`, `--gpu-memory-utilization 0.956` and planar INT8 KV. The "Startup" row was measured at engine start on PCIe V100s; "Planner" rows are the engine planner's arithmetic with an estimated per-GPU budget.
+The final 0.2.0 package was measured with a 98 GiB Host KV store, TP4 + DCP2, up to eight sequences and a 512K context limit. In the PCIe AWQ + MTP5 run with INT8, the host pool had 7,329,312 usable tokens after excluding the reserved page. The startup plan allocated 14,588 usable GPU history blocks (4.98 GiB per GPU including the reserved block).
 
-In the final 0.2.0 PCIe acceptance, AWQ with MTP5 and a configured 98 GiB Host KV pool had 7,329,312 usable host tokens after excluding one reserved page. The startup plan allocated 14,588 usable GPU history blocks (4.98 GiB per GPU including the reserved block).
+The NVLink startup sizes below include the reserved page. The INT8 pool held about 1.9× as many tokens as FP16.
+
+| System | Configuration | KV format | Host pool tokens |
+| --- | --- | --- | ---: |
+| NVLink | NVFP4 + MTP5 | INT8 | 7,330,944 |
+| NVLink | NVFP4 + MTP5 | FP16 | 3,832,192 |
+
+The historical sizing examples below are from 0.2.0rc15: Qwen3.8 Flash-Next AWQ, four 32 GB V100s, TP4 + DCP2, the compressed index split over all TP ranks, `max_num_seqs=8`, `--gpu-memory-utilization 0.956` and planar INT8 KV. The "Startup" row was measured at engine start on PCIe V100s; "Planner" rows are the engine planner's arithmetic with an estimated per-GPU budget.
 
 A host page row takes 13,248 bytes per token for DFlash2 and 14,352 bytes per token for MTP4 (which also stores the draft layer's K/V and index), with planar INT8 (0.2.0rc15). Divide the host store by these sizes for a first estimate of the tokens it holds. DFlash2 keeps its FP16 sliding-window drafter KV on the GPU.
 

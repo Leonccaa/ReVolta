@@ -4,7 +4,7 @@ This tutorial installs ReVolta 0.2.0, prepares the default checkpoint and launch
 
 You need:
 
-- Four V100 32 GB GPUs, connected by NVLink or under one PCIe switch with P2P enabled. See [Support and known limits](known-limits.md) for the hardware scope.
+- Four V100 32 GB GPUs, fully connected by NVLink or under one PCIe switch with P2P enabled. See [Support and known limits](known-limits.md) for the hardware scope.
 - 128 GiB of host memory for this configuration. See [System memory and storage](configuration.md#system-memory-and-storage).
 - An NVIDIA driver for CUDA 12.8.
 - For a pip install: Linux x86-64 with glibc 2.34 or newer, Python 3.12 and the CUDA 12.8 Toolkit. For Docker: Docker with the NVIDIA Container Toolkit.
@@ -162,7 +162,7 @@ Notes:
 - **KV cache.** `--kv-cache-dtype auto` selects planar INT8 for this model on V100. INT8 computes its scales at runtime, so no KV scale pack is needed. The MTP draft has no `kv_cache_dtype` of its own and inherits the target's INT8. To keep the draft KV in FP16 instead, add `"kv_cache_dtype": "float16"` to `--speculative-config`. For other KV formats, see [Choose the KV format](checkpoints.md#weight-and-kv-formats).
 - **Draft width.** The profile lowers the number of draft tokens when more requests run; see [Dynamic speculative decoding](dynamic-speculative-decoding.md). To compare MTP with DFlash2, see [Speculative decoding](speculative-decoding.md).
 - **CPU KV pool.** `cpu_bytes_to_use` is the total for all four workers: 48 GiB, 12 GiB per worker. See [KV offload](kv-offload.md) for SSD tiers and other pool sizes.
-- **NVLink.** If the four selected GPUs are fully connected by NVLink, remove `--no-async-scheduling` to let the [NVLink profile](configuration.md#nvlink-tp4-auto-configuration) enable async scheduling. This applies to both launch commands on this page.
+- **NVLink.** If all six GPU pairs have direct NVLink, remove `--no-async-scheduling` from either MTP launch on this page. The [NVLink profile](configuration.md#nvlink-tp4-auto-configuration) can then enable async scheduling without manual NVLink flags. DFlash2 remains synchronous with its default draft schedule. See the [0.2.0 measurements](performance.md#nvlink-tp4-acceptance).
 - **Wide verifier.** On a system whose GPUs share one PCIe switch with P2P, the profile also turns on the [AWQ MTP4 wide verifier](configuration.md#awq-mtp4-wide-verifier) for this configuration; the CPU KV pool does not prevent it. NVLink systems keep the standard verifier.
 - **Cold startup** took 693 s (about 12 minutes) to reach readiness in the PCIe AWQ + MTP4 acceptance. This includes weight and PLE loading, `torch.compile` and CUDA graph capture. Later starts reuse the compile cache. The first start after an upgrade recompiles.
 

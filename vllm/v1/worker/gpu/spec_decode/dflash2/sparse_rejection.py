@@ -19,6 +19,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import CachedLogitsFallback
 from vllm.triton_utils import tl, triton
 from vllm.v1.sample.ops.topk_topp_triton import sort_topk_with_vocab_ties
+from vllm.v1.worker.gpu.sample.gumbel import apply_temperature
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
 from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
@@ -414,6 +415,61 @@ def _supports_sparse_sampling_contract(
     if sampler.logprob_token_ids_state.max_num_token_ids(idx) != 0:
         return False
     return not sampler.compute_nans
+
+
+def warmup_dflash2_sparse_target_rejection(
+    speculator: DFlash2Speculator,
+    rejection_sampler: RejectionSampler,
+) -> bool:
+    candidates = speculator.get_sparse_draft_logits()
+    if candidates is None or rejection_sampler.rejection_sample_method != "standard":
+        return False
+
+    # Compile the two fixed probe widths without a model forward or a
+    # dependency on whether the warmup logits hit the dense fallback.
+    steps = rejection_sampler.num_speculative_steps
+    rows = steps + 1
+    device = speculator.device
+    vocab_size = rejection_sampler.sampler.sampling_states.vocab_size
+    widths = [_TARGET_TOP_K + 1]
+    if speculator.max_num_reqs > 1 and vocab_size >= 32768:
+        widths.append(_TARGET_PROBE_K)
+    draft_width = candidates[0].shape[-1]
+    draft_ids = torch.arange(draft_width, device=device).repeat(1, steps, 1)
+    draft_logits = torch.zeros(draft_ids.shape, device=device, dtype=torch.float32)
+    request_ids = torch.zeros(rows, device=device, dtype=torch.int32)
+    cu_num_logits = torch.tensor([0, rows], device=device, dtype=torch.int32)
+    positions = torch.arange(rows, device=device, dtype=torch.int64)
+    temperature = torch.full((1,), 0.9, device=device, dtype=torch.float32)
+    top_p = torch.ones_like(temperature)
+    seeds = torch.zeros(1, device=device, dtype=torch.int64)
+    for width in widths:
+        target_ids = torch.arange(width, device=device).repeat(rows, 1)
+        target_logits = torch.zeros(
+            target_ids.shape, device=device, dtype=torch.float32
+        )
+        apply_temperature(target_logits, request_ids, temperature)
+        target_logits, target_ids = sort_topk_with_vocab_ties(
+            target_logits, target_ids, vocab_size=vocab_size, descending=True
+        )
+        keep = _TARGET_TOP_K if width == _TARGET_TOP_K + 1 else width
+        dflash2_sparse_topk_rejection_sample(
+            target_ids[:, :keep],
+            target_logits[:, :keep],
+            draft_ids,
+            draft_logits,
+            request_ids,
+            cu_num_logits,
+            positions,
+            request_ids[:1],
+            temperature,
+            top_p,
+            seeds,
+            steps,
+            use_fp64=rejection_sampler.sampler.use_fp64_gumbel,
+            target_top_k=_TARGET_TOP_K,
+        )
+    return True
 
 
 def try_dflash2_sparse_target_rejection(

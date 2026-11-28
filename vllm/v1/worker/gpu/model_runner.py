@@ -125,6 +125,7 @@ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dflash2.sparse_rejection import (
     DFlash2LogitsFallback,
     try_dflash2_sparse_target_rejection,
+    warmup_dflash2_sparse_target_rejection,
 )
 from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
@@ -913,6 +914,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         warmed: list[str] = []
         if hasattr(self, "_kv_block_zeroer") and self._kv_block_zeroer.warmup_kernel():
             warmed.append("zero_kv_blocks")
+
+        for layer in self.compilation_config.static_forward_context.values():
+            warmup_qsa = getattr(layer, "_warmup_sm70_qsa_folded8", None)
+            if warmup_qsa is not None and warmup_qsa(self.vllm_config):
+                warmed.append("qsa_folded8")
+                break
+
+        if (
+            isinstance(self.speculator, DFlash2Speculator)
+            and self.rejection_sampler is not None
+            and hasattr(self.model, "get_topk_tokens_and_logits")
+            and warmup_dflash2_sparse_target_rejection(
+                self.speculator, self.rejection_sampler
+            )
+        ):
+            warmed.append("dflash2_sparse_target_rejection")
 
         speculator_warmup = getattr(
             self.speculator, "warmup_sm70_mtp_moe_kernels", None

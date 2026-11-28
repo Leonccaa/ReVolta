@@ -236,7 +236,8 @@ def _accept_draft(target_log_prob, log_uniform_times_draft):
     do_not_specialize=[
         "rejected_logsumexp_plane_stride",
         "block_stats_plane_stride",
-    ]
+    ],
+    do_not_specialize_on_alignment=["cu_num_logits_ptr"],
 )
 def _rejection_kernel(
     # [num_reqs, num_speculative_steps + 1]
@@ -460,7 +461,7 @@ def _single_lse_residual_logits(target_logits, draft_logits, target_lse, draft_l
     ).to(tl.float32)
 
 
-@triton.jit
+@triton.jit(do_not_specialize_on_alignment=["cu_num_logits_ptr"])
 def _resample_kernel(
     # [num_reqs, num_blocks]
     resampled_local_argmax_ptr,
@@ -655,7 +656,10 @@ def _row_gumbel_argmax(
     return best_token, best_value
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["block_stats_plane_stride"],
+    do_not_specialize_on_alignment=["cu_num_logits_ptr"],
+)
 def _insert_resampled_kernel(
     # [num_reqs, num_speculative_steps + 1]
     sampled_ptr,

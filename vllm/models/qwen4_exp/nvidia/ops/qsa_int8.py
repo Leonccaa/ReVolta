@@ -16,7 +16,7 @@ from vllm.v1.attention.kv_cache_view import KVPageMapping
 from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD, INT8
 
 
-@triton.jit(do_not_specialize=["num_requests"])
+@triton.jit(do_not_specialize=["num_requests", "num_rows"])
 def _int8_sparse_kernel(
     q_ptr,
     k_cache_ptr,

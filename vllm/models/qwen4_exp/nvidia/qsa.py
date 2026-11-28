@@ -69,8 +69,10 @@ from ..common.qsa_cache import (
     build_qsa_metadata,
     qsa_dcp_block_geometry,
     qsa_draft_dcp_sharded,
+    qsa_index_dcp_sharded,
 )
 from .indexer_qsa import QSAIndexer
+from .ops.qsa import _SM70_INDEXER_CUBLAS, expand_qsa_block_indices_cuda
 from .ops.qsa_device_history import (
     H6_MAX_ROWS,
     load_qsa_device_history,
@@ -1180,6 +1182,42 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 f"shape={tuple(topk_indices_buffer.shape)}"
             )
         self.topk_indices_buffer = topk_indices_buffer
+
+    def _warmup_sm70_qsa_folded8(self, vllm_config: VllmConfig) -> bool:
+        indexer = self.indexer
+        cache = indexer.compressed_key_cache
+        if (
+            not _SM70_INDEXER_CUBLAS
+            or indexer.prefill_tp_group is None
+            or cache.dtype != torch.float16
+            or (indexer.index_n_heads, indexer.index_head_dim) != (4, 128)
+            or (indexer.token_topk, indexer.compress_ratio) != (2048, 4)
+            or qsa_index_dcp_sharded(vllm_config, cache.prefix, indexer.compress_ratio)
+            or min(
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                vllm_config.model_config.max_model_len,
+            )
+            < 2048
+        ):
+            return False
+
+        # Eight rows exercise the folded layout. The expansion kernel's key
+        # is independent of row count, so no long model prefill is needed.
+        rows = 8
+        out = self.topk_indices_buffer[:rows]
+        blocks = out.new_zeros((rows, indexer.token_topk // indexer.compress_ratio))
+        positions = torch.arange(rows, dtype=torch.int64, device=out.device)
+        expand_qsa_block_indices_cuda(
+            blocks,
+            positions,
+            out.new_full((1,), rows),
+            out.new_zeros(rows),
+            indexer.compress_ratio,
+            indexer.token_topk,
+            out,
+            folded8=True,
+        )
+        return True
 
     def adopt_default_kv_scales(self) -> None:
         """Use the module's own unit scales when the checkpoint has none.

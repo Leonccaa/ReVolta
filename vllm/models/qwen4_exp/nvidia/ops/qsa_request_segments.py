@@ -44,7 +44,10 @@ def _minimum(a, b):
     return tl.minimum(a, b)
 
 
-@triton.jit(do_not_specialize=["num_rows", "num_requests"])
+@triton.jit(
+    do_not_specialize=["num_rows", "num_requests"],
+    do_not_specialize_on_alignment=["requests", "positions"],
+)
 def _build_segments(
     requests,
     positions,

@@ -21,9 +21,13 @@ from torch import nn
 
 import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
-from vllm.compilation.sm70_decode_graph import is_sm70_decode_graph_compiling
+from vllm.compilation.sm70_decode_graph import (
+    is_sm70_decode_graph_compiling,
+    use_sm70_decode_graph_semantics,
+)
 from vllm.config import SpeculativeConfig, VllmConfig, replace, set_current_vllm_config
 from vllm.distributed import get_pp_group, tensor_model_parallel_all_gather
+from vllm.distributed.device_communicators.sm70_hc_ll import get_tp_hc_ll
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ColumnParallelLinear
@@ -384,6 +388,11 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
 
         self.hidden_size = config.hidden_size
         self.hc_count = config.hc_count
+        self._sm70_nvlink_mtp_fc_peer = (
+            vllm_config.kernel_config.sm70_nvlink_mtp_fc_peer
+            and (self.hc_count, self.hidden_size) == (4, 2560)
+            and get_tp_hc_ll() is not None
+        )
 
         self.embed_tokens = VocabParallelEmbedding(self.vocab_size, self.hidden_size)
         draft_vllm_config = _make_draft_vllm_config(
@@ -557,6 +566,10 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         )
         hidden_states = self.fc_hidden(hidden_states)
         # Add the embedding residual on the local feature shard before gather.
+        if self._sm70_nvlink_mtp_fc_peer and use_sm70_decode_graph_semantics():
+            return torch.ops.vllm.qwen38_sm70_fc_add_all_gather(
+                inputs_embeds, hidden_states
+            )
         return tensor_model_parallel_all_gather(
             inputs_embeds.unsqueeze(-2) + hidden_states
         ).flatten(-2)

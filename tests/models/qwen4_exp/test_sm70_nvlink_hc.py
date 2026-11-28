@@ -10,7 +10,7 @@ import torch
 
 import vllm.config as config_module
 import vllm.config.vllm as vllm_config_module
-from vllm.config import SchedulerConfig, VllmConfig
+from vllm.config import SchedulerConfig, VllmConfig, set_current_vllm_config
 from vllm.config.kernel import KernelConfig
 from vllm.distributed.device_communicators import custom_all_reduce as car
 from vllm.distributed.device_communicators import sm70_hc_ll as hc_ll
@@ -137,6 +137,8 @@ def test_async_scheduling_warns_when_hc_ll_requested(
     ],
 )
 def test_physical_gate_and_policy(monkeypatch, settings, case):
+    settings.speculative_config.method = "mtp"
+    settings.kernel_config.sm70_nvlink_mtp_fc_peer = True
     request = "auto" if case == "pex" else "nvlink"
     monkeypatch.setenv("VLLM_SM70_INTERCONNECT", request)
     if case == "pex":
@@ -206,6 +208,35 @@ def test_request_scope_and_compilation_identity(settings, method):
     assert config.compute_hash() != disabled
     config.sm70_nvlink_hc_active = False
     assert config.compute_hash() == disabled
+
+
+@pytest.mark.parametrize("method", ["dflash", "mtp"])
+def test_fc_peer_mailbox_and_hash_require_admitted_mtp(monkeypatch, method):
+    config = KernelConfig()
+    assert not config.sm70_nvlink_mtp_fc_peer
+    inactive_hash = config.compute_hash()
+    config.sm70_nvlink_mtp_fc_peer = True
+    assert config.compute_hash() == inactive_hash
+    config.sm70_nvlink_hc_active = True
+    vllm_config = SimpleNamespace(
+        model_config=None,
+        speculative_config=SimpleNamespace(method=method),
+        kernel_config=config,
+    )
+    allocate = Mock(return_value=[0] * 4)
+    monkeypatch.setattr(car.CustomAllreduce, "create_shared_buffer", allocate)
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    monkeypatch.setattr(hc_ll.dist, "barrier", lambda **_: None)
+    hashes, sizes = [], []
+    for enabled in (False, True):
+        config.sm70_nvlink_mtp_fc_peer = enabled
+        config.set_platform_defaults(vllm_config)
+        hashes.append(config.compute_hash())
+        with set_current_vllm_config(vllm_config):
+            hc_ll.Sm70HcLLCommunicator("tp", torch.device("cpu"), 0)
+        sizes.append(allocate.call_args.args[0])
+    assert (hashes[0] != hashes[1]) == (method == "mtp")
+    assert sizes[1] - sizes[0] == (5 * 1024**2 if method == "mtp" else 0)
 
 
 def test_lossless_tp4_packs_keep_checkpoint_weights():

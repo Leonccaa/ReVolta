@@ -104,8 +104,22 @@ def test_tp_forward_zeroes_other_ranks_rows_across_the_split(
     )
     monkeypatch.setattr(ple_layer, "tensor_model_parallel_all_reduce", lambda t: t)
 
+    gather = torch.ops.vllm.qwen4_exp_ple_pinned_gather
+    gathered_ids = {}
+
+    def record_gather(ids, output, scale, name, use_host, dim):
+        gathered_ids[use_host] = ids.clone()
+        gather(ids, output, scale, name, use_host, dim)
+
+    monkeypatch.setattr(torch.ops.vllm, "qwen4_exp_ple_pinned_gather", record_gather)
+
     global_ids = [[6, 0, 11], [3, 7, 9], [8, 8, 5]]
     out = ple_layer.Qwen4ExpPinnedHostEmbedding.forward(layer, torch.tensor(global_ids))
 
     local_ids = [i - 6 if 6 <= i < 12 else -1 for row in global_ids for i in row]
     _assert_bitwise(out.reshape(-1, DIM), _reference(local, local_ids))
+    if device_rows and host_rows:
+        # The final merge hides reads of rows that belong to the other table.
+        on_host = torch.tensor(local_ids) >= device_rows
+        assert (gathered_ids[False][on_host] < 0).all()
+        assert (gathered_ids[True][~on_host] < 0).all()

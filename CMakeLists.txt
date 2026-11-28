@@ -847,6 +847,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" AND SM70_TURBOMIND_ARCHS)
   define_extension_target(
     _sm70_qsa_device_C DESTINATION vllm LANGUAGE CUDA
     SOURCES "csrc/sm70_turbomind/ops/qsa_device_history_sm70.cu"
+            "csrc/sm70_turbomind/ops/qsa_rows_int8_sm70.cu"
     COMPILE_FLAGS ${VLLM_GPU_FLAGS}
     ARCHITECTURES "70"
     LIBRARIES "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so"

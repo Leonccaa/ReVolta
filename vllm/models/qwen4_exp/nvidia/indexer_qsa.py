@@ -25,6 +25,7 @@ from ..common.qsa_cache import (
     QSAForwardMetadata,
     QSAKeyStateCache,
     canonical_qsa_rope_positions,
+    is_mtp_draft_prefix,
     qsa_index_dcp_sharded,
 )
 from .ops.qsa_pre_indexer import qsa_pre_indexer
@@ -382,7 +383,8 @@ class QSAIndexer(nn.Module):
             return out
 
         # Score compressed keys, select blocks, then expand them to token indices.
-        uniform_decode = get_forward_context().is_uniform_decode
+        forward_context = get_forward_context()
+        uniform_decode = forward_context.is_uniform_decode
         token_to_req = compressed_metadata.token_to_req
         logical_positions = compressed_metadata.logical_positions
         query_start_loc_cpu = compressed_metadata.query_start_loc_cpu
@@ -394,6 +396,10 @@ class QSAIndexer(nn.Module):
             # The original request segments refer to the cache-write rows.
             query_start_loc_cpu = None
             prefill_ranges = ()
+        if prefill_ranges and is_mtp_draft_prefix(self.prefix):
+            # Draft step 0 has its own forward context. Its sharded index
+            # metadata already carries the real prefill rows from MRv2.
+            forward_context.additional_kwargs["qsa_has_prefill"] = True
         return qsa_select_paged_tokens(
             q,
             compressed_key_cache,

@@ -2188,6 +2188,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     and uniform_tok_count is not None
                 ),
             ):
+                # QSA runs outside PIECEWISE capture and uses the live batch phase.
+                has_prefill = bool(input_batch.is_prefilling_np.any())
+                get_forward_context().additional_kwargs["qsa_has_prefill"] = has_prefill
                 # Piecewise graphs can replay the same shape for prefill.
                 if (
                     (
@@ -2197,7 +2200,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     )
                     and batch_desc.cg_mode == CUDAGraphMode.NONE
                     and not dummy_run
-                    and not input_batch.is_prefilling_np.any()
+                    and not has_prefill
                 ):
                     get_forward_context().additional_kwargs[
                         "sm70_nvfp4_decode_only"

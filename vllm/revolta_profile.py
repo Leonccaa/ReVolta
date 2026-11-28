@@ -616,7 +616,8 @@ def apply_revolta_nvlink_kernel_profile(
     values = {}
     for name, default in defaults.items():
         value = getattr(kernel, name)
-        explicit = name in kernel._nvlink_profile_fields
+        # A set value also covers assignment after construction.
+        explicit = name in kernel._nvlink_profile_fields or bool(value)
         if not explicit:
             setattr(kernel, name, default)
         values[name] = {

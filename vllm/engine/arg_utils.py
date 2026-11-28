@@ -1849,12 +1849,7 @@ class EngineArgs:
         if (
             mtp_with_prefix_cache
             and "gdn_state_replay" not in self.speculative_config
-            and (
-                not nvlink_mtp
-                or self.async_scheduling is False
-                # Deferred commit keeps the existing synchronous default.
-                or self.speculative_config.get("gdn_deferred_commit_metadata")
-            )
+            and (not nvlink_mtp or self.async_scheduling is False)
         ):
             defaults["gdn_state_replay"] = True
 

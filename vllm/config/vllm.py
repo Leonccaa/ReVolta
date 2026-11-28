@@ -425,8 +425,10 @@ def _gdn_spec_state_replay_reasons(
         reasons.append("mamba_cache_mode is not align")
     if vllm_config.scheduler_config.async_scheduling and not deferred:
         reasons.append("async scheduling")
+    # --kv-offloading-size declares a connector that is built after this check.
     if deferred and (
-        vllm_config.kv_transfer_config is not None
+        vllm_config.cache_config.kv_offloading_size is not None
+        or vllm_config.kv_transfer_config is not None
         and vllm_config.kv_transfer_config.kv_connector is not None
     ):
         reasons.append("a KV connector can release request slots before exact-end")

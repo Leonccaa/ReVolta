@@ -1302,7 +1302,19 @@ def test_audit_log_text_does_not_change_applied_values(profile, monkeypatch):
 
 
 @pytest.mark.skip_global_cleanup
-@pytest.mark.parametrize("case", ["nvlink", "pcie", "explicit", "denied", "deferred"])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "nvlink",
+        "pcie",
+        "explicit",
+        "assigned",
+        "denied",
+        "deferred",
+        "deferred_pool",
+        "deferred_connector",
+    ],
+)
 def test_engineargs_nvlink_profile(
     profile, monkeypatch, tmp_path, sm70_serving_resolution, case
 ):
@@ -1334,21 +1346,27 @@ def test_engineargs_nvlink_profile(
     monkeypatch.setattr(config_module.logger, "info_once", profile_log)
     flags = ["--decode-context-parallel-size", "2", "--kv-cache-dtype", "float16"]
     spec_options: dict[str, Any] = {
-        "num_speculative_tokens": 5 if case in ("nvlink", "deferred") else 4
+        "num_speculative_tokens": 4 if case in ("pcie", "explicit", "denied") else 5
     }
-    if case == "nvlink":
-        flags += [
-            "--kv-transfer-config",
-            '{"kv_connector":"OffloadingConnector","kv_role":"kv_both",'
-            '"kv_connector_extra_config":{"cpu_bytes_to_use":51539607552}}',
-        ]
-    if case == "deferred":
-        # The CPU pool connector is built after the GDN policy has resolved.
+    connector = [
+        "--kv-transfer-config",
+        '{"kv_connector":"OffloadingConnector","kv_role":"kv_both",'
+        '"kv_connector_extra_config":{"cpu_bytes_to_use":51539607552}}',
+    ]
+    if case in ("nvlink", "deferred_connector"):
+        flags += connector
+    if case == "deferred_pool":
+        # The CPU pool shorthand names the same connector.
         flags += ["--kv-offloading-size", "48"]
+    if case.startswith("deferred"):
         spec_options["gdn_deferred_commit_metadata"] = True
-        # Admit deferred commit for the stand-in target model.
+        # Admit deferred commit for the stand-in target model, keeping the
+        # connector rule.
+        reasons = config_module._gdn_spec_state_replay_reasons
         monkeypatch.setattr(
-            config_module, "_gdn_spec_state_replay_reasons", lambda *_, **__: []
+            config_module,
+            "_gdn_spec_state_replay_reasons",
+            lambda *a, **kw: [r for r in reasons(*a, **kw) if "KV connector" in r],
         )
     if case == "explicit":
         flags += [
@@ -1369,9 +1387,15 @@ def test_engineargs_nvlink_profile(
     args, context = hybrid_serving_args(
         profile, monkeypatch, tmp_path, "mtp", flags, spec_options
     )
+    if case == "assigned":
+        args.kernel_config.sm70_sparse_target_sampling = True
+    if case in ("deferred_pool", "deferred_connector"):
+        with pytest.raises(ValueError, match="a KV connector"):
+            args.create_engine_config(usage_context=context)
+        return
     config = args.create_engine_config(usage_context=context)
     kernel = config.kernel_config
-    enabled = case in ("nvlink", "deferred")
+    enabled = case in ("nvlink", "assigned", "deferred")
     assert (
         config.speculative_config.num_speculative_tokens
         == spec_options["num_speculative_tokens"]
@@ -1379,8 +1403,7 @@ def test_engineargs_nvlink_profile(
     assert config.speculative_config.num_speculative_tokens_per_batch_size == (
         [(1, 8, 3)] if enabled else [(1, 8, 2)] if case == "explicit" else MTP_DSD
     )
-    # Explicit deferred commit keeps the synchronous default with a CPU pool.
-    assert config.scheduler_config.async_scheduling is (case == "nvlink")
+    assert config.scheduler_config.async_scheduling is enabled
     assert config.speculative_config.gdn_deferred_commit_metadata is (
         case == "deferred"
     )
@@ -1389,7 +1412,9 @@ def test_engineargs_nvlink_profile(
     assert kernel.sm70_qsa_paged_fp16_h6 is enabled
     assert kernel.sm70_qsa_paged_fp16_h12 is enabled
     assert kernel.sm70_sparse_target_sampling == (
-        "device_top64" if enabled else case == "explicit"
+        "device_top64"
+        if case in ("nvlink", "deferred")
+        else case in ("explicit", "assigned")
     )
     assert envs.VLLM_SM70_NVLINK_HC is enabled
     audit = next(

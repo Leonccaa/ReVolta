@@ -1,19 +1,22 @@
 # Getting started
 
-This tutorial installs and launches the reference configuration. Before starting, check the
-[hardware scope](known-limits.md) and [host memory requirements](configuration.md#system-memory-and-storage).
+This tutorial installs ReVolta 0.2.0, prepares the default checkpoint and launches the reference configuration, then checks that the server answers.
 
-Reference configuration: Uncensored AWQ g32, TP4 + DCP2,
-MTP4 greedy draft with KV inherited from the INT8 target, 512K context through
-YaRN, multimodal input, 8 concurrent requests in testing, and a 48 GiB CPU KV pool.
+You need:
+
+- Four V100 32 GB GPUs, connected by NVLink or under one PCIe switch with P2P enabled. See [Support and known limits](known-limits.md) for the hardware scope.
+- 128 GiB of host memory for this configuration. See [System memory and storage](configuration.md#system-memory-and-storage).
+- An NVIDIA driver for CUDA 12.8.
+- For a pip install: Linux x86-64 with glibc 2.34 or newer, Python 3.12 and the CUDA 12.8 Toolkit. For Docker: Docker with the NVIDIA Container Toolkit.
+- About 142 GB of disk space for the checkpoint and its MTP draft, plus the compile caches.
+
+The reference configuration is Uncensored AWQ g32 with tensor parallelism of four and decode context parallelism of two (TP4 + DCP2), an MTP draft with up to four draft tokens per round, INT8 KV cache for the target and the draft, a 524,288-token (512K) context through YaRN, image and video input, up to 8 concurrent requests and a 48 GiB CPU KV pool.
 
 ## 1. Install
 
-This recipe uses the `revolta` distribution (version `0.2.0`). The Python import name and the
-CLI are still **`vllm`** (`import vllm`, `vllm serve`); this is intentional. Only
-compute capability 7.0 is built, with CUDA 12.8, Python 3.12 and PyTorch 2.10.
+The distribution is `revolta` (version `0.2.0`). The Python import name and the CLI stay **`vllm`** (`import vllm`, `vllm serve`). The build contains only compute capability 7.0 (V100), with CUDA 12.8, Python 3.12 and PyTorch 2.10.
 
-From PyPI (Linux x86-64 with glibc 2.34 or newer, Python 3.12):
+From PyPI:
 
 ```bash
 python3.12 -m venv /data/revolta/venv
@@ -22,41 +25,21 @@ pip install revolta==0.2.0
 vllm --version          # 0.2.0
 ```
 
-The wheel pins `torch==2.10.0`, `torchaudio==2.10.0` and `torchvision==0.25.0`,
-and pip installs them from PyPI. PyPI's `torch==2.10.0` is the CUDA 12.8 build.
-Install the NVIDIA driver for CUDA 12.8 on the host.
+The wheel pins `torch==2.10.0` (the CUDA 12.8 build on PyPI) with the matching `torchaudio` and `torchvision`. The first start compiles kernels, so a pip install needs the CUDA 12.8 Toolkit on the serving host: check that `nvcc --version` reports CUDA 12.8. The wheel attached to the [GitHub release](https://github.com/Leonccaa/ReVolta/releases/tag/v0.2.0) has the same files and installs the same PyTorch versions from `download.pytorch.org`.
 
-Install the CUDA 12.8 Toolkit on the serving host for first-start kernel
-compilation. Check that `nvcc` is on `PATH` and `nvcc --version` reports CUDA 12.8.
-
-The wheel attached to the GitHub release contains the same files. Only its metadata
-differs: it pins the same versions to the CUDA 12.8 builds on `download.pytorch.org`
-and has the generic `linux_x86_64` tag.
-
-```bash
-pip install "https://github.com/Leonccaa/ReVolta/releases/download/v0.2.0/revolta-0.2.0-cp312-cp312-linux_x86_64.whl"
-```
-
-ReVolta does not report to the upstream vLLM statistics server. It sends its own
-anonymous usage report; see [Anonymous usage statistics](usage-stats.md) for what it
-contains and how to turn it off.
-
-Or use the Docker image:
+Or use the Docker image, which includes the compiler tools for the first start:
 
 ```bash
 docker pull ghcr.io/leonccaa/revolta:0.2.0
 ```
 
+ReVolta does not report to the upstream vLLM statistics server. It sends its own anonymous usage report; see [Anonymous usage statistics](usage-stats.md) for what it contains and how to turn it off.
+
 ## 2. Download the checkpoint and make 512K views
 
-The checkpoint's native context is 262,144 tokens. ReVolta reaches 524,288 tokens with
-YaRN (factor 2). The target model **and** the MTP draft must both see the YaRN
-settings. `--hf-overrides` reaches only the target model, so make two "view"
-directories instead. Each view links to every checkpoint file and contains an edited
-`config.json`. The validated setup used views of this kind.
+The checkpoint's native context is 262,144 tokens. ReVolta reaches 524,288 tokens with YaRN (factor 2). The script below gives the target model and the MTP draft each a "view" directory with the YaRN settings: the view links to every file of the checkpoint (or of its `mtp-fp8/` draft) and contains an edited `config.json`. The validated setup used views of this kind. (`--hf-overrides` reaches only the target; the engine also copies the target's YaRN scaling to an MTP draft that ships native RoPE with the same `rope_theta`, but the release tests used the two views.)
 
-For the static YaRN trade-off and the native 262K alternative, see
-[YaRN and native context](configuration.md#yarn-and-native-context).
+Run the script in the ReVolta virtual environment, which already has `huggingface_hub`. With Docker only, install `huggingface_hub` on the host first (`pip install huggingface_hub`).
 
 ```bash
 python - <<'EOF'
@@ -65,9 +48,10 @@ from pathlib import Path
 from huggingface_hub import snapshot_download
 
 repo = "leoncca/Qwen3.8-Flash-Next-Uncensored-AWQ-g32"
-ckpt = Path("/data/revolta/models/Qwen3.8-Flash-Next-Uncensored-AWQ-g32")
+revision = "1fd7ab705731c9dacc3bcd5b5d15783c60706d64"
+ckpt = Path("/data/revolta/models") / repo.split("/")[-1]
 views = Path("/data/revolta/views")
-snapshot_download(repo, local_dir=ckpt, revision="1fd7ab705731c9dacc3bcd5b5d15783c60706d64")
+snapshot_download(repo, local_dir=ckpt, revision=revision)
 
 YARN = {"rope_type": "yarn", "factor": 2, "original_max_position_embeddings": 262144}
 
@@ -94,30 +78,31 @@ make_view(ckpt / "mtp-fp8", views / "draft-512k")
 EOF
 ```
 
+Keep the downloaded checkpoint: the views link to its files. YaRN in vLLM scales every request, short or long. If prompt and output together stay within 262,144 tokens, you can skip the views; see [YaRN and native context](configuration.md#yarn-and-native-context). For another checkpoint, change `repo`, `revision`, `views` and the draft line as described in [Prepare the checkpoint](checkpoints.md#prepare-the-checkpoint).
+
 ## 3. Environment
 
-Apply the reference deployment settings below; see
-[Environment settings](configuration.md#environment-settings) for profile behaviour.
+The engine detects V100 (SM70), TP4, a Qwen3.8 Flash-Next model and FP16, and then applies its tuned defaults by itself (the "ReVolta profile"). The first four exports below repeat values the profile already sets; they are written out because the tested deployment used them. The last two are deployment settings that the profile does not set.
 
 ```bash
+# Also applied by the ReVolta profile when unset.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTORCH_ALLOC_CONF=expandable_segments:True
-export NCCL_GRAPH_REGISTER=0                    # required with expandable segments
+export NCCL_GRAPH_REGISTER=0                     # set automatically with expandable segments
 export VLLM_SM70_AWQ_MOE_INT4_ZERO=1             # pack AWQ zero points to 4 bits in GPU memory
-# Optional per-rank PLE cap. The full FP8 table is pinned on host by default.
+# Deployment settings.
+export VLLM_PLE_OFFLOAD_READY_TIMEOUT=1200       # seconds (default 600); PLE loading takes a while
+export TILELANG_CACHE_DIR=/data/revolta/cache/tilelang  # keep compiled TileLang kernels across restarts
+# Optional per-rank cap for the PLE table in pinned host memory. By default the
+# whole FP8 table is pinned on the host.
 # export VLLM_QWEN4EXP_PLE_HOST_GIB=12
-export VLLM_PLE_OFFLOAD_READY_TIMEOUT=1200       # seconds; PLE loading takes a while
-export TILELANG_CACHE_DIR=/data/revolta/cache/tilelang  # persistent TileLang kernel cache
 ```
 
-Continue with the launch command below.
+Explicit values always override the profile. See [Environment settings](configuration.md#environment-settings) for what the profile changes.
 
 ## 4. Launch
 
-Use the 512K YaRN target view and matching draft from step 2 with
-`--max-model-len 524288`. With unmodified checkpoints, use a length supported
-by both the target and the draft. With `--gpu-memory-utilization 0.956`, keep the
-GPUs free of other processes that use GPU memory.
+Use the 512K target view and the matching draft view from step 2 with `--max-model-len 524288`. With unmodified checkpoints, use a length that both the target and the draft support. With `--gpu-memory-utilization 0.956`, keep the GPUs free of other processes that use GPU memory.
 
 ```bash
 vllm serve /data/revolta/views/target-512k \
@@ -173,21 +158,15 @@ vllm serve /data/revolta/views/target-512k \
 
 Notes:
 
-- `--kv-cache-dtype auto` selects planar INT8 for this QSA target on SM70 (V100).
-  The MTP draft inherits the target's INT8 KV. To use FP16 draft KV instead,
-  set `"kv_cache_dtype": "float16"` in `--speculative-config`. INT8 computes
-  scales at runtime, so no separate KV scale pack or scale-enriched view is
-  needed. For calibrated E4M3 KV (a frozen format), see [Checkpoints](checkpoints.md#e4m3-kv).
-- **Startup** takes roughly 10–15 minutes: weight and PLE loading, `torch.compile`
-  and CUDA graph capture. Later starts reuse the compile cache. After an upgrade that
-  cache can still be incomplete: keeping the 0.1.3 cache, MTP4 and DFlash2 each compiled
-  four graphs again on the first 0.1.4 start (about 5 s on the reference machine), and
-  later starts loaded them from the cache. The 0.1.2 to 0.1.3 upgrade invalidated the
-  whole cache, even with MTP or no speculation, because the traced GDN source changed;
-  allow a cold compile after upgrading. On a first start with an empty compile cache,
-  the reported GPU KV capacity can be one allocation unit (7,182 tokens) lower.
+- Many of these options repeat values that the ReVolta profile or the engine already chooses, for example the scheduler limits, prefix caching, the attention backend and the compilation mode. They are written out so that the command matches the tested configuration. See [ReVolta serving defaults](configuration.md#revolta-serving-defaults) before changing them.
+- **KV cache.** `--kv-cache-dtype auto` selects planar INT8 for this model on V100. INT8 computes its scales at runtime, so no KV scale pack is needed. The MTP draft has no `kv_cache_dtype` of its own and inherits the target's INT8. To keep the draft KV in FP16 instead, add `"kv_cache_dtype": "float16"` to `--speculative-config`. For other KV formats, see [Choose the KV format](checkpoints.md#weight-and-kv-formats).
+- **Draft width.** The profile lowers the number of draft tokens when more requests run; see [Dynamic speculative decoding](dynamic-speculative-decoding.md). To compare MTP with DFlash2, see [Speculative decoding](speculative-decoding.md).
+- **CPU KV pool.** `cpu_bytes_to_use` is the total for all four workers: 48 GiB, 12 GiB per worker. See [KV offload](kv-offload.md) for SSD tiers and other pool sizes.
+- **NVLink.** If the four selected GPUs are fully connected by NVLink, remove `--no-async-scheduling` to let the [NVLink profile](configuration.md#nvlink-tp4-auto-configuration) enable async scheduling. This applies to both launch commands on this page.
+- **Wide verifier.** On a system whose GPUs share one PCIe switch with P2P, the profile also turns on the [AWQ MTP4 wide verifier](configuration.md#awq-mtp4-wide-verifier) for this configuration; the CPU KV pool does not prevent it. NVLink systems keep the standard verifier.
+- **Cold startup** took 693 s (about 12 minutes) to reach readiness in the PCIe AWQ + MTP4 acceptance. This includes weight and PLE loading, `torch.compile` and CUDA graph capture. Later starts reuse the compile cache. The first start after an upgrade recompiles.
 
-See [Launch options](configuration.md#launch-options) before changing these settings.
+See [Launch options](configuration.md#launch-options) for the meaning of each option.
 
 ## 5. Check
 
@@ -203,24 +182,17 @@ curl -s http://localhost:8000/v1/chat/completions \
 
 In the startup log, look for:
 
-- `ReVolta profile {"enabled": true, ...}`: the profile is active. The line lists
-  each tuned switch with its value and source (profile, environment or upstream
-  default).
+- `ReVolta profile {"enabled": true, ...}`: the profile is active. The line lists the audited settings with their values and sources (`profile`, `environment` or `upstream_default`); some settings the profile applies, such as the wide verifier switches, are not in it.
+- `Defaulting QSA main KV storage to int8`: the target KV cache is INT8.
 - `SM70 interconnect=pex_p2p` (or `no_p2p` / `nvlink`) from each worker.
 
-For request defaults and the model vendor's recommendations, see
-[Sampling parameters](configuration.md#sampling-parameters).
+The server also provides the Anthropic-compatible `/v1/messages` (including streaming) and `/v1/messages/count_tokens`; their limits are in [API behaviour](known-limits.md#api-behaviour).
 
-The server also provides Anthropic-compatible `/v1/messages` (including streaming)
-and `/v1/messages/count_tokens`. From 0.1.4, an overlong prompt returns HTTP 400 with
-`invalid_request_error` and an unknown model returns HTTP 404 with `not_found_error`;
-internal errors stay HTTP 500 (#32). In 0.1.3 the overlong-prompt case returned HTTP 500
-with `api_error` (#26).
+For request defaults and the model vendor's sampling recommendations, see [Sampling parameters](configuration.md#sampling-parameters).
 
 ## Docker
 
-The image entry point is `vllm serve`. Mount the model and view directories at the
-same path inside the container, so that the view symlinks resolve.
+The image's entry point is `vllm serve`, so the server options follow the image name. The command below passes the same environment and options as steps 3 and 4. Mount the model and view directories at the same path inside the container so that the view symlinks resolve.
 
 ```bash
 docker run --rm --gpus all \
@@ -236,34 +208,71 @@ docker run --rm --gpus all \
   -e VLLM_SM70_AWQ_MOE_INT4_ZERO=1 \
   -e VLLM_PLE_OFFLOAD_READY_TIMEOUT=1200 \
   -e TILELANG_CACHE_DIR=/data/revolta/cache/tilelang \
+  -e VLLM_CACHE_ROOT=/data/revolta/cache/vllm \
   ghcr.io/leonccaa/revolta:0.2.0 \
-  /data/revolta/views/target-512k --served-model-name Qwen3.8-Flash-Next \
+  /data/revolta/views/target-512k \
+  --served-model-name Qwen3.8-Flash-Next \
+  --dtype half \
+  --tensor-parallel-size 4 \
+  --decode-context-parallel-size 2 \
   --gpu-memory-utilization 0.956 \
+  --max-model-len 524288 \
+  --max-num-seqs 8 \
+  --max-num-batched-tokens 8192 \
+  --enable-chunked-prefill \
+  --enable-prefix-caching \
+  --prefix-cache-retention-interval 0 \
+  --mamba-cache-mode align \
+  --no-async-scheduling \
   --kv-cache-dtype auto \
+  --no-language-model-only \
+  --limit-mm-per-prompt '{"image": 16, "video": 1}' \
+  --media-io-kwargs '{"video": {"num_frames": 16}}' \
+  --compilation-config '{"mode": 3, "cudagraph_mode": "FULL_AND_PIECEWISE"}' \
+  --structured-outputs-config '{"backend": "xgrammar"}' \
+  --seed 0 \
   --speculative-config '{"method": "mtp",
       "model": "/data/revolta/views/draft-512k",
       "quantization": "modelopt_mixed",
       "num_speculative_tokens": 4,
       "draft_sample_method": "greedy",
       "attention_backend": "FLASH_ATTN_V100"}' \
-  ...
+  --attention-backend FLASH_ATTN_V100 \
+  --prefill-pressure-token-budget 1024 \
+  --prefill-pressure-threshold 1 \
+  --long-prefill-token-threshold 4896 \
+  --mixed-prefill-step-latency-ms 0 \
+  --kernel-config '{"ple_disk_cascade": false}' \
+  --kv-transfer-config '{"kv_connector": "OffloadingConnector",
+      "kv_role": "kv_both",
+      "kv_connector_extra_config": {
+        "spec_name": "TieringOffloadingSpec",
+        "cpu_bytes_to_use": 51539607552,
+        "eviction_policy": "lru",
+        "secondary_tiers": [],
+        "demote_superseded_states": true,
+        "mamba_state_slots_reference_tokens": 65536}}' \
+  --shutdown-timeout 30 \
+  --enable-auto-tool-choice \
+  --tool-call-parser qwen3_coder \
+  --reasoning-parser qwen3 \
+  --enable-prompt-tokens-details \
+  --sse-keep-alive-interval 15 \
+  --host 0.0.0.0 --port 8000
 ```
 
-Replace `...` with the launch options from step 4 that are not already shown
-above. The same GPU memory requirement applies. Container notes:
+Container notes:
 
-- The CPU KV pool is a file in `/dev/shm`. Make `--shm-size` larger than
-  `cpu_bytes_to_use` (the validated container used 128g).
-  After an abnormal service exit, recreate the container to release leftover
-  CPU offload files in its private `/dev/shm`.
-- `--cap-add SYS_PTRACE` was required in the validated container: the workers share
-  memory with each other through `pidfd_getfd`.
-  Whether `seccomp=unconfined` is needed remains to be checked.
-- Do not bake `VLLM_SM70_*` switches into derived images. Values from the environment
-  override the profile.
+- **Shared memory.** The CPU KV pool is a file in `/dev/shm`, and so is the host store of [Host KV](kv-offload.md#host-kv-long-context). Make `--shm-size` larger than `cpu_bytes_to_use` (or `host_store_gib` with Host KV); the validated container used `128g`. The engine removes the file names once every process has mapped them, so a normal or forced stop releases the memory. Only a crash during startup can leave `vllm_offload_*.mmap` files behind; recreating the container removes them.
+- **Caches.** The compile cache lives under `VLLM_CACHE_ROOT` (default `/root/.cache/vllm` inside the container) and the TileLang cache under `TILELANG_CACHE_DIR`. Point both at the mounted volume, as above; otherwise a container started with `--rm` compiles everything again on each start.
+- **Privileges.** `--cap-add SYS_PTRACE` was required in the validated container: the workers share memory with each other through `pidfd_getfd`. The validated container also used `--security-opt seccomp=unconfined`; it has not been tested without it.
+- **Stopping.** Keep `--stop-timeout` above `--shutdown-timeout` plus the process-exit wait, which defaults to the same value (30 + 30 seconds here). See [Shutdown and diagnostics](configuration.md#shutdown-and-diagnostics).
+- **Derived images.** Do not bake `VLLM_SM70_*` switches into derived images: values from the environment override the profile.
 
 ## See also
 
-- [Prepare another checkpoint](checkpoints.md)
-- [Configuration reference](configuration.md)
-- [KV offload modes](kv-offload.md)
+- [Checkpoints and KV formats](checkpoints.md): other checkpoints, MTP drafts and KV formats
+- [Configuration reference](configuration.md): launch options, profile defaults and memory budgets
+- [Speculative decoding](speculative-decoding.md): MTP and DFlash2
+- [KV offload](kv-offload.md): CPU, SSD and Host KV modes
+- [Multimodal input limits](multimodal.md)

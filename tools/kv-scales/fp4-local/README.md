@@ -1,14 +1,8 @@
 # QSA FP8 E4M3 KV scales: Qwen3.8-Flash-Next-FP4-Local
 
-Calibrated FP32 K/V scales for
-[`nvidia/Qwen3.8-Flash-Next-FP4-Local`](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local)
-at revision `b9ce18a6887e18c089fdea8509a33e63429a3300`: 24 scales (2,640 bytes)
-for the main QSA KV cache and 2 scales (296 bytes) for the checkpoint's built-in
-MTP draft layer, plus a tool that builds a loadable checkpoint view from them.
-The same payload is published on Hugging Face as
-[`leoncca/Qwen3.8-Flash-Next-FP4-Local-QSA-FP8-E4M3-KV-Scales`](https://huggingface.co/leoncca/Qwen3.8-Flash-Next-FP4-Local-QSA-FP8-E4M3-KV-Scales)
-(tag `v1.1-base-b9ce18a6`; `v1.0-base-b9ce18a6` has the 24 target scales only).
-The model card there describes the calibration and the validation results.
+Calibrated FP32 K/V scales for [`nvidia/Qwen3.8-Flash-Next-FP4-Local`](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local) at revision `b9ce18a6887e18c089fdea8509a33e63429a3300`: 24 scales (2,640 bytes) for the main QSA KV cache and 2 scales (296 bytes) for the checkpoint's built-in MTP draft layer, plus a tool that builds a loadable checkpoint view from them. The same payload is published on Hugging Face as [`leoncca/Qwen3.8-Flash-Next-FP4-Local-QSA-FP8-E4M3-KV-Scales`](https://huggingface.co/leoncca/Qwen3.8-Flash-Next-FP4-Local-QSA-FP8-E4M3-KV-Scales) (tag `v1.1-base-b9ce18a6`; `v1.0-base-b9ce18a6` has the 24 target scales only). The model card there describes the calibration and the validation results.
+
+You need this pack only for the scalar E4M3 KV cache (`--kv-cache-dtype fp8_e4m3`), which is a frozen format. The default KV cache on V100, `--kv-cache-dtype auto` (planar INT8), needs no scale files. See [Scalar E4M3 KV](../../../docs/checkpoints.md#scalar-e4m3-kv-frozen).
 
 | File | Purpose |
 |---|---|
@@ -38,24 +32,15 @@ python materialize_overlay.py \
   --output-dir /path/to/qsa-e4m3-checkpoint
 ```
 
-The tool refuses to run if the base `model.safetensors.index.json` or
-`config.json` hash, the scale file hash, or any tensor name or value differs
-from the manifests. The view contains the merged index with 26 scale entries,
-copies of both scale files under `calibration/`, a `kvscales-provenance.json`,
-and symlinks to the unchanged base files. Keep the base directory in place.
+The tool refuses to run if the base `model.safetensors.index.json` or `config.json` hash, the scale file hash, or any tensor name or value differs from the manifests. The view contains the merged index with 26 scale entries, copies of both scale files under `calibration/`, a `kvscales-provenance.json`, and symlinks to the unchanged base files. Keep the base directory in place.
 
-Serve the view with a V100 (SM70) vLLM build with QSA E4M3 KV support, using
-`--dtype half` and `--kv-cache-dtype fp8_e4m3`. Set
-`VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES=1` so that the server refuses to start
-unless all 24 target scales are loaded. The MTP draft (no `model` field in
-`--speculative-config`) loads its two scales from the same view and can use an
-E4M3 KV cache (`"kv_cache_dtype": "fp8_e4m3"`); an FP16 draft cache
-(`"float16"`) also works.
+Serve the view with ReVolta, using `--dtype half` and `--kv-cache-dtype fp8_e4m3`. Set `VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES=1` so that the server refuses to start unless all target scales are loaded; without it, missing scales fall back to 1.0 with a warning. The built-in MTP draft (no `model` field in `--speculative-config`) inherits the target's E4M3 KV format and loads its two scales from the same view. To keep the draft cache in FP16 instead, add `"kv_cache_dtype": "float16"` to `--speculative-config`. [Scalar E4M3 KV](../../../docs/checkpoints.md#scalar-e4m3-kv-frozen) has the preparation and launch steps.
 
 ## License
 
-`materialize_overlay.py` is Apache-2.0. The scale file is a derived artifact of
-the base checkpoint and follows its terms: the
-[NVIDIA Open Model Agreement](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-agreement/),
-and the [Qwen Community License 1.0](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE)
-for the underlying Qwen3.8-Flash-Next model.
+`materialize_overlay.py` is Apache-2.0. The scale files are derived artifacts of the base checkpoint and follow its terms: the [NVIDIA Open Model Agreement](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-agreement/), and the [Qwen Community License 1.0](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE) for the underlying Qwen3.8-Flash-Next model.
+
+## See also
+
+- [Checkpoints, KV scales and MTP drafts](../../../docs/checkpoints.md)
+- [QSA scalar E4M3 KV calibration tools](../../qwen4_exp/README.md)

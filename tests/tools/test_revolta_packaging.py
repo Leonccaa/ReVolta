@@ -33,8 +33,8 @@ def load_setup_function(name, *dependencies, **scope):
 @pytest.mark.parametrize(
     ("override", "skip_suffix", "expected"),
     [
-        (None, True, "0.2.0rc14"),
-        (None, False, "0.2.0rc14+precompiled"),
+        (None, True, "0.2.0"),
+        (None, False, "0.2.0+precompiled"),
         ("0.2.0rc15+local.g0123456789", True, "0.2.0rc15+local.g0123456789"),
     ],
 )

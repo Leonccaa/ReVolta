@@ -1,178 +1,245 @@
 # Performance and measurements
 
-This reference collects measured speed, cache capacity, readback and quantization results.
-Read the [hardware scope](known-limits.md) first; each group keeps its own version and test conditions.
+<a id="performance"></a><a id="measurements"></a>
 
-## Measurements
+This page lists what ReVolta 0.2.0 measured: output speed, time to first token, KV cache capacity, prefix reuse and answer quality, for each tested configuration. It also explains how the values were measured and keeps a few earlier results that are still useful for comparison. Every value carries its version and test conditions; do not compare values across tables unless the conditions match.
 
-### Speed
+For the supported hardware and configurations, see [Support and known limits](known-limits.md). To reproduce a configuration, start from [Getting started](getting-started.md).
 
-Version and test conditions: the PCIe values use 0.1.2; the NVLink overview combines 0.1.2 and 0.1.1.
-See [DFlash2 against MTP4](#dflash2-against-mtp4), [Cold prefill](#cold-prefill) and
-[NVLink](#nvlink-community-result) for the per-group conditions. The 0.1.4 release-gate
-speed comparison against 0.1.3 is in [Reference system, MTP4](#reference-system-mtp4).
+## How we measure
 
-Best measured output speed in tokens/s, 512-token responses. The breakdown by speculative
-method (MTP4 and DFlash2) and prompt type is in [Performance](#performance).
+### Test system
 
-| System | 1 request | 2 | 4 | 8 |
-| --- | ---: | ---: | ---: | ---: |
-| 4 × V100 32 GB PCIe, one PCIe switch, P2P, no NVLink (our reference) | **201** | **275** | **370** | **509** |
-| 4 × V100-SXM2 32 GB, NV2 NVLink mesh ([community result](https://github.com/Leonccaa/ReVolta/issues/2)) | **234** | **260** | **368** | **525** |
+The PCIe acceptance tables below use one test system. The [NVLink acceptance measurements](#nvlink-tp4-acceptance) use a separate system.
 
-| Cold prefill, tok/s | 8K tokens | 131K tokens |
-| --- | ---: | ---: |
-| PCIe reference | 3,382 | 3,016 |
-| NVLink community | 4,680 | 4,037 |
+- Four V100 32 GB PCIe GPUs, all under one PCIe switch with peer-to-peer (P2P) access, no NVLink.
+- Power limit 200 W per GPU.
+- Tensor parallel 4 with decode context parallel 2 (TP4 + DCP2).
+- `--max-model-len 524288` on the 512K views built in [Getting started](getting-started.md#2-download-the-checkpoint-and-make-512k-views).
+- `--max-num-seqs 8`, which the ReVolta serving profile sets when you leave it unset.
+
+Each configuration below states its other settings.
+
+### Benchmark method
+
+**Short-prompt output speed.** Each PCIe concurrency uses variants of one synthetic English story prompt through the raw completions API (no chat template or thinking mode). Requests sample at temperature 1.0, top-p 0.95 and top-k 20, with a fixed seed per request and exactly 512 output tokens (EOS ignored). The table shows the median of three recorded passes per concurrency. These throughput values describe only this synthetic workload. Use time per round, not tokens/s or draft acceptance on this workload, to compare decode-round cost across configurations.
+
+**Cold TTFT.** The streaming chat requests use synthetic word sequences of the target length, greedy decoding, a four-token output cap and no thinking override. For each length, a short warm-up and one full-length warm-up are excluded; the table reports the median of three cold requests.
+
+**Acceptance and quality.** The AWQ GPU KV configurations also ran the fixed RevBench-Accept v1 suite in sampled mode (97 requests). Task accuracy below uses separate fixed GSM8K and MMLU subsets.
+
+### What the columns mean
+
+| Term | Meaning |
+| --- | --- |
+| C1, C4, C8 | One, four or eight requests running at the same time. |
+| Output speed | Generated tokens of all running requests divided by wall-clock time, in tokens/s. It includes the time to first token. At C4 and C8 it is the total over all requests, not the speed of one request. |
+| Cold TTFT | Time to first token for a prompt that is in no prefix cache. |
+| Second-token latency | Time from the first to the second output token of the same request. |
+| KV capacity | Tokens of context the KV cache can hold. With GPU KV, from the startup log line `GPU KV cache size: N tokens`. With Host KV, which does not log that line, the host pool tokens from the `long-context KV worker=N ... plan` line, minus one reserved page. |
+| Capacity ratio | KV capacity divided by 524,288. With GPU KV it equals the `Maximum concurrency` value in the same startup log; with Host KV it is computed from the host pool tokens. It is a capacity ratio, not a request limit: at 2.5×, two full 512K requests fit, and many more shorter requests can run. With Host KV, the number of full-length requests is the smallest of the per-pool limits in the plan line. |
+| Prompt tokens hit | Prompt tokens served from a prefix cache instead of being computed. |
+| GSM8K, MMLU | Fixed subsets of the public GSM8K and MMLU sets, given as correct answers / questions. |
+
+### Configurations
+
+The PCIe results below cover six configurations. All use TP4 + DCP2 on the system above and `--gpu-memory-utilization 0.956`. E4M3 was tested on an earlier 0.2.0 candidate build, not rerun on the final package.
+
+| Configuration | Weights | Speculative decoding | KV cache | CPU KV pool and disk tier | Other settings |
+| --- | --- | --- | --- | --- | --- |
+| C: production form | Uncensored AWQ g32 | DFlash2, 7 draft tokens, dynamic draft width (profile default) | GPU KV; INT8 target, FP16 draft | 98 GiB CPU KV pool and 350 GiB `revolta_fs` disk tier | `--gpu-memory-utilization 0.956` |
+| D+E1: public default | Uncensored AWQ g32 | MTP, 4 draft tokens, dynamic draft width, greedy drafting | GPU KV; INT8 target and draft (`--kv-cache-dtype auto`) | 48 GiB CPU KV pool and 350 GiB `revolta_fs` disk tier | AWQ + MTP4 from [Getting started](getting-started.md), with the disk tier enabled for acceptance |
+| E4M3 | As D+E1 | As D+E1 | GPU KV; calibrated E4M3 target and draft (`--kv-cache-dtype fp8_e4m3`) | 48 GiB CPU KV pool | Functional check only: start, serve and answer quality |
+| E2: Host KV | AWQ | MTP, 5 drafts at C1–C3 and 3 at C4–C8, greedy drafting | INT8 target and draft; 98 GiB Host KV pool | Host KV pool, no separate CPU KV pool; 350 GiB `host_kv.ssd` tier | QSA index sharding (`qsa_dcp_index_shard: true`), union prefill gather, PLE disk cascade off |
+| E3a: NVFP4 + MTP | Standard NVFP4 with the scale-pack MTP draft | MTP, 5 drafts at C1–C3 and 3 at C4–C8, greedy drafting | GPU KV; INT8 target and draft | 98 GiB CPU KV pool and 350 GiB `revolta_fs` disk tier | PLE disk cascade and QSA index sharding off |
+| E3b: NVFP4 + DFlash2 | Standard NVFP4 | DFlash2, 7 drafts at C1–C3, 3 at C4 and 4 at C5–C8 | GPU KV; INT8 target, FP16 draft | 98 GiB CPU KV pool and 350 GiB `revolta_fs` disk tier | Default sparse verification; PLE disk cascade and QSA index sharding off |
+
+## Results
+
+All values in this section are from the final 0.2.0 package on the PCIe test system above, except for the E4M3 candidate results.
+
+### Output speed
+
+<a id="speed"></a>
+
+Observed end-to-end output in tokens/s on the synthetic short-prompt workload.
+
+| Configuration | C1 | C4 | C8 |
+| --- | ---: | ---: | ---: |
+| C: AWQ, DFlash2, GPU KV | 97.4 | 283.0 | 360.1 |
+| D+E1: AWQ, MTP4, GPU KV | 114.4 | 260.7 | 378.1 |
+| E2: Host KV, MTP | 91.1 | 255.1 | 332.4 |
+| E3a: NVFP4, MTP5 | 97.6 | 264.5 | 396.6 |
+| E3b: NVFP4, DFlash2 | 103.7 | 280.7 | 372.7 |
+
+The E4M3 configuration was a functional check; its speed was not measured.
+
+### Time to first token
+
+One request at a time, cold prefix cache.
+
+| Configuration | Cold TTFT, 8K prompt | Cold TTFT, 32K prompt | Second-token latency, 32K prompt |
+| --- | ---: | ---: | ---: |
+| D+E1: AWQ, MTP4, GPU KV | 2.102 s | 8.228 s | Not measured |
+| E2: Host KV, MTP | 2.204 s | 8.442 s | Not measured |
+| E3a: NVFP4, MTP5 | 1.987 s | 7.747 s | Not measured |
+
+### GPU KV capacity
+
+<a id="gpu-kv-capacity-by-method"></a>
+
+KV capacity at `--max-model-len 524288`, read from the startup log.
+
+| Configuration | Target / draft KV | Where | KV capacity, tokens | Capacity ratio |
+| --- | --- | --- | ---: | ---: |
+| C: AWQ, DFlash2 | INT8 / FP16 | GPU | 1,851,676 | 3.53× |
+| D+E1: AWQ, MTP4 | INT8 / INT8 | GPU | 1,194,816 | 2.28× |
+| E4M3: AWQ, MTP4 (earlier candidate) | E4M3 / E4M3 | GPU | 1,224,375 | 2.34× |
+| E2: Host KV, MTP | INT8 / INT8 | Host pool | 7,329,312 | 13.98× |
+| E3a: NVFP4, MTP5 | INT8 / INT8 | GPU | 1,488,853 | 2.84× |
+| E3b: NVFP4, DFlash2 | INT8 / FP16 | GPU | 1,700,147 | 3.24× |
 
 ### Coming back to a document
 
-Measured on 0.1.4 with DFlash2 (recommended settings), Uncensored AWQ, E4M3 KV, 250 W,
-the pinned PLE table, a 7 GiB CPU pool and a disk tier on a local NVMe SSD. Each
-document was first computed cold. The CPU readback followed after the GPU prefix cache
-was cleared; the disk readback followed an engine restart with the page cache dropped.
-Both readbacks hit the whole cacheable prefix, and the disk readbacks gave the same
-64-token greedy output as the cold run.
+When a new request starts with a prompt the engine has seen before, such as a follow-up question about the same document, ReVolta reuses the stored KV instead of computing it again. The table gives the time to first token, one request at a time. "Second request" follows directly after the first; in C the cached prefix is served mostly from the GPU (the longer prompt also hits CPU pages), and in E2 the main KV history is in host memory. "From CPU memory" follows after the prefix was evicted from GPU memory. "From SSD after a restart" follows an engine restart.
 
-| Prompt tokens | Recomputed | From CPU memory | From NVMe after a restart |
-| ---: | ---: | ---: | ---: |
-| 32,768 | 10.12 s | 0.61 s | 1.47 s |
-| 99,000 | 31.88 s | 0.77 s | 2.93 s |
-| 131,072 | 42.43 s | 0.99 s | 3.77 s |
+| Configuration | Prompt tokens | Recomputed | Second request | From CPU memory | From SSD after a restart | Prompt tokens hit |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| C: AWQ, DFlash2 | 32,839 | 8.56 s | 0.535 s | 0.599 s | 1.011 s | 31,616 |
+| C: AWQ, DFlash2 | 130,402 | 33.42 s | 0.780 s | 0.893 s | 1.692 s | 129,792 |
+| E2: Host KV, MTP | ~32K | 8.442 s (separate cold test) | Not measured | — | Not measured | Not measured |
 
-Times are to the first token, one request at a time. The about 2.2–2.4 GB/s quoted in
-[KV offload modes](kv-offload.md) is the disk read rate inside the restore, not these
-stored bytes divided by these times. Eight more 32K-token documents
-gave 0.62–0.66 s from CPU memory and 1.41–1.46 s from NVMe for the first four of them.
-Four 32K-token documents read from NVMe at the same time after the restart took
-1.48–3.84 s each (median 2.67 s).
+How the tiers work and how to size them: [KV offload modes](kv-offload.md).
 
-An earlier measurement, with no ReVolta version recorded, under the request and cache
-conditions below:
+### Task accuracy
 
-A cached 32K-token document answered a follow-up in **1.28 seconds from memory**,
-compared with **10.06 seconds when recomputed**. Both produced identical output.
+Correct answers / questions on fixed subsets of GSM8K and MMLU.
 
-| Prefix location | Request time |
-| --- | ---: |
-| GPU | 1.23 s |
-| Recomputed, offload disabled | 10.06 s |
-| CPU memory | 1.28 s |
-| CPU memory + filesystem cache | 1.60 s |
-
-The request generated 64 tokens and reused 31,008 cached prompt tokens. A small GPU
-pool forced eviction. The filesystem tier in this earlier measurement was on a network
-filesystem.
-
-### Quantization quality
-
-No ReVolta version is specified for these measurements. The reference and
-[quality measurement method](#quality-measurements) apply to the table below.
-
-The default AWQ format keeps the model close to its BF16 parent on the measured
-English, Chinese, and code samples.
-
-| AWQ checkpoint | BF16 reference | KL ↓ | Top-1 agreement ↑ |
-| --- | --- | ---: | ---: |
-| Uncensored AWQ g32 | Its own parent | 0.0214 | 97.08% |
-| Base AWQ g32 | Base model | 0.0207 | 97.06% |
-
-KL measures changes in next-token probabilities. Top-1 agreement counts how often
-the most likely next token matches. These are distribution measurements, not task
-accuracy or a percentage of model ability retained. See [Quality measurements](#quality-measurements).
-
-## GPU KV capacity by method
-
-Measured on our 4x V100 PCIe deployment with TP4 + DCP2, `--gpu-memory-utilization 0.95`, `--max-model-len 524288` (512K) and `--max-num-seqs 8`. Capacity and maximum concurrency use the startup log's convention: the concurrency figure is the KV token capacity divided by 524,288. It is a capacity ratio; 2.94× fits two full-length requests. Eight shorter requests are a separate tested workload.
-
-| Format | Measured version | Method | GPU KV capacity, tokens | Maximum concurrency at 512K |
-| --- | --- | --- | ---: | ---: |
-| Uncensored AWQ g32 + E4M3 KV | 0.1.4 | DFlash2 recommended (probabilistic drafting, state replay off) | **1,366,121** | **2.61×** |
-| Uncensored AWQ g32 + E4M3 KV | 0.1.3 / 0.1.4 | DFlash2, greedy drafting, state replay off | 1,379,634 | 2.63× |
-| Uncensored AWQ g32 + E4M3 KV | 0.1.3 | DFlash2 with state replay | 1,542,558 | 2.94× |
-| Uncensored AWQ g32 + E4M3 KV | 0.1.2 | DFlash2 | 1,268,831 | 2.42× |
-| Uncensored AWQ g32 + E4M3 KV | 0.1.2 / 0.1.3 | MTP4 | 1,153,143 | 2.20× |
-| Uncensored AWQ g32 + INT8 KV | 0.1.2 / 0.1.3 | MTP4 | 1,140,072 | 2.17× |
-| Uncensored AWQ g32 + INT8 KV | — | DFlash2 | Unsupported | — |
-| Uncensored AWQ g32 + FP16 KV | 0.1.2 | MTP4 | 673,749 | 1.29× |
-| Uncensored AWQ g32 + FP16 KV | 0.1.2 | DFlash2 | 781,584 | 1.49× |
-| NVIDIA FP4-Local + E4M3 KV | 0.1.3 | MTP4, E4M3 draft KV | 1,474,106 | 2.81× |
-| NVIDIA FP4-Local + E4M3 KV | 0.1.2 / 0.1.3 | MTP4, FP16 draft KV | 1,321,612 | 2.52× |
-| NVIDIA FP4-Local + E4M3 KV | 0.1.2 | DFlash2 | 1,335,042 | 2.55× |
-| Standard NVFP4 + E4M3 KV | 0.1.2 / 0.1.3 | MTP4 | 1,250,448 | 2.39× |
-| Standard NVFP4 + E4M3 KV | 0.1.2 | DFlash2 | 1,337,745 | 2.55× |
-
-The 0.1.3 AWQ DFlash2 measurements include sharded selector codebooks (#9) and the 1200 MiB graph reserve with tail graphs off (#23), with state replay (#21) off (recommended) or on. The MTP4 rows marked 0.1.2 / 0.1.3 were remeasured unchanged on the 0.1.3 release image; the FP4-Local E4M3-draft row is a separate smoke with the `v1.1-base-b9ce18a6` scale pack. The FP16 KV, FP4-Local and NVFP4 DFlash2 values were measured on 0.1.2; they have not been remeasured with the 0.1.3 DFlash2 changes. The 0.1.2 AWQ DFlash2 measurements use a 1500 MiB graph reserve. INT8 target KV is not supported with DFlash2; 0.1.4 rejects it during configuration even with a separate FP16 draft cache (#33, fixes #25).
-
-## Performance
-
-### Reference system, MTP4
-
-Historical measurement configuration: Uncensored AWQ g32, E4M3 KV, TP4 + DCP2, MTP4, on the reference system.
-The first table records 0.1.0; the release-to-release comparisons follow below.
-
-| Metric | 0.1.0 |
-| --- | ---: |
-| GPU KV capacity, tokens (maximum concurrency at 512K) | 1,140,505 (2.18×) |
-| Total output throughput, C1 | 152.5 |
-| Total output throughput, C2 | 167.2 |
-| Total output throughput, C4 | 262.2 |
-| Total output throughput, C8 | 383.6 |
-| 211K-token retrieval (5 needles) | 5/5 |
-| 512K boundary: 524,224 input + 64 output | Passed; one more input token is rejected |
-
-**Method.** Each output test requests 512 tokens, with thinking off,
-`temperature=0`, streaming, and MTP4 enabled. English code, Chinese explanation,
-and English arithmetic prompts rotate across clients. Each concurrency level
-has one warm-up and eight measured runs; the table reports the mean.
-
-In the 0.1.0 C2 measurement, the two requests share the first prefill step only if the second one reaches
-the engine within a sub-millisecond window. With the same code, this happened in
-0 to 8 of the 8 measured repetitions, varying from run to run, and C2 ranged
-from 159.7 to 173.7 tok/s; the table's 167.2 came from a run with 4 of 8.
-Repetitions where both requests started together reached about 174 tok/s.
-
-Total output throughput is all generated tokens divided by wall time, including
-time to first token. It is an end-to-end rate, not a decode-only measurement.
-Prefill uses a cold prefix cache and divides computed prompt tokens by time to
-first token.
-
-Version-to-version speed comparisons use the same machine, configuration, and test
-window. Other context lengths, media workloads, and thinking-mode outputs can give
-different results.
-
-The 0.1.3 release gate repeated the output-speed comparison against 0.1.2 in the same
-window and configuration, at 250 W per GPU, with 512-token responses and eight repeats
-per concurrency level:
-
-| Total output throughput, tokens/s | 0.1.2 | 0.1.3 |
+| Configuration | GSM8K | MMLU |
 | --- | ---: | ---: |
-| C1 | 153.1 | 153.2 |
-| C2 | 170.7 | 169.4 |
-| C4 | 263.4 | 268.3 |
-| C8 | 389.3 | 390.4 |
+| C: AWQ, DFlash2, GPU KV | 180 / 200 | 263 / 300 |
+| D+E1: AWQ, MTP4, GPU KV | 177 / 200 (88.5%); rerun 176 / 200 (88.0%) | 264 / 300 |
+| E4M3: AWQ, MTP4, E4M3 KV (earlier candidate) | 184 / 200 | 262 / 300 |
+| E2: Host KV, MTP | 181 / 200 | 264 / 300 |
+| E3a: NVFP4, MTP5 | 180 / 200 | 267 / 300 |
+| E3b: NVFP4, DFlash2 | 181 / 200 | 266 / 300 |
 
-The 0.1.4 release gate measured MTP4 output against 0.1.3 on the reference system: two
-concurrent requests produced about 3% more output tokens per second, and the other MTP4
-levels were unchanged within 1% (#34). The gain comes from the MoE all-reduce no longer
-using the slow generic sum2 kernel at two and three requests behind a PCIe switch. MTP4
-output at two and three concurrent requests is therefore not bitwise identical to 0.1.3,
-because the summation order changed, while single-request output and DFlash2 output are
-unchanged. A repeated A/B measurement at three to five requests found DFlash2 within about
-2% per step of 0.1.3, with the same acceptance length. The best-of entries in
-[Speed](#speed) come from DFlash2 on the reference system and do not change: the MTP4
-values in these windows stay below them at every concurrency level shown.
+The lower D+E1 GSM8K scores came from long reasoning answers cut off at the 512-token limit; at a 1,024-token limit, a paired test of the same deployment across three seeds gave 94.7% on the final package versus 94.3% on the earlier candidate, with no significant difference (p = 0.80) and essentially the same output lengths.
 
-### Cold prefill
+For how closely each quantized checkpoint follows a BF16 reference, see [Quality measurements](#quality-measurements).
 
-The PCIe reference measured 0.1.2 with MTP4 at 250 W per GPU: **3,382 tok/s at 8K** and **3,016 tok/s at 131K**. With DFlash2 on 0.1.2, the same window measured 3,120 and 3,093 tok/s. These use 512K views, one request at a time and a cold prefix cache; throughput is computed prompt tokens divided by time to first token. The Measurements table uses the MTP4 values so both systems use the same speculative method. See [NVLink](#nvlink-community-result) for the community method and longer prompts.
+### Speculative decoding comparison
 
-### DFlash2 against MTP4
+To compare the two speculative methods in 0.2.0, read C against D+E1 for AWQ (DFlash2 against MTP4) and E3b against E3a for NVFP4 (DFlash2 against MTP5). The AWQ pair also differs in draft KV format and in the CPU KV pool and disk tier; see [Configurations](#configurations). Earlier per-prompt results are in [DFlash2 against MTP4 on PCIe (0.1.2)](#dflash2-against-mtp4-on-pcie-012); which method to choose is in [Choosing a method](speculative-decoding.md#choosing-a-method).
 
-Reference system, 0.1.2 recommended DFlash2 config, greedy, thinking off,
-512-token responses. One request: decode speed after the first token. Four and eight
-mixed requests: total output. With one prompt per category, the per-category values are
-indicative.
+## NVLink TP4 acceptance
+
+The 0.2.0 release package ran on four V100-SXM2-32GB GPUs, with direct NVLink on all six pairs and a 300 W power limit per GPU. The public default NVFP4 + MTP5 configuration used TP4 + DCP2, INT8 GPU KV and a 512K context limit. We removed `--no-async-scheduling` so the [NVLink profile](configuration.md#nvlink-tp4-auto-configuration) could select the scheduling and draft-width defaults without manual NVLink settings.
+
+The synthetic short-prompt test used the same English story template and sampling settings as the PCIe speed test. Each concurrency excludes one warm-up and reports the median of three measured passes without inference-time compilation. These are wall-clock milliseconds per decode round, not kernel timings or output throughput.
+
+| Concurrent requests | Time per decode round |
+| ---: | ---: |
+| 1 | 16.43 ms |
+| 4 | 23.45 ms |
+| 8 | 32.81 ms |
+
+With one request and a cold prefix, TTFT was 1.130 s at 8K, 4.168 s at 32K and 8.254 s at 64K. GSM8K scored 90.5%, MMLU 88.0%, and all 97 sampled RevBench-Accept v1 requests completed without errors.
+
+In a separate NVFP4 + MTP5 run using Host KV, the 98 GiB INT8 host pool had 7,330,944 tokens before excluding the reserved page. On the same synthetic short-prompt workload, time per round was 19.68, 27.58 and 35.11 ms at C1, C4 and C8.
+
+## Kernel changes during serving
+
+<a id="triton-compilation-during-serving"></a>
+
+**Triton compilation.** Some SM70 kernels used to recompile during requests when a buffer slice changed pointer alignment or an integer argument changed divisibility by 16. In 0.2.0 these arguments no longer specialize on those properties, and the existing startup warmup compiles the remaining known variants covered by the fix. The kernel bodies are unchanged. This applies to AWQ and NVFP4 with MTP or DFlash2 on PCIe and NVLink; it does not eliminate all compilation during serving.
+
+**MTP shared expert.** Eligible SM70 TP4 MTP verification graph batches of 2–64 rows use dedicated shared-expert kernels without a new setting. The gate/up projection is fused with SiLU. The down projection is fused with the expert gate through 8 rows; larger eligible batches keep the down GEMM and fuse the gate dot product and multiply. This applies to AWQ and NVFP4, not DFlash2 ([#371](https://github.com/Leonccaa/ReVolta/pull/371)).
+
+**Row-wise INT8 QSA prefill.** On SM70 TP4/DCP2, eligible prefill batches with FP16 queries, planar INT8 KV and at least 256 rows automatically read each row's own selected tokens instead of the union for a group of eight rows. This works with GPU or Host KV, AWQ or NVFP4, and MTP or DFlash2. Decode-only batches, CUDA graph capture and FP16 KV do not use this path. In a single-V100 PCIe kernel benchmark (12 heads, head dimension 256, one DCP2 rank, causal top-512), median attention time per chunk went from 22.5 to 10.8 ms at the 8K chunk end and from 63.1 to 12.6 ms at 32K. These are kernel timings, not service TTFT ([#372](https://github.com/Leonccaa/ReVolta/pull/372)).
+
+**FP8 PLE table reads.** The pinned-host and hybrid PLE gathers skip table reads for rows owned by another rank or another tier instead of repeatedly reading row zero over PCIe. The change is automatic, does not change the output and does not apply to NVFP4-format PLE tables. In a single-V100 PCIe kernel benchmark (96 rows, a TP4 ID mix and the first gather after a 300 µs idle gap), median gather time fell from 125–132 µs to 6.1–7.0 µs across pinned host tables of 3–12 GiB. This is a gather timing, not a decode-round or service result ([#373](https://github.com/Leonccaa/ReVolta/pull/373)).
+
+## Quality measurements
+
+<a id="quantization-quality"></a>
+
+These measurements show how closely each quantized checkpoint follows a BF16 reference. They were published with 0.1.0 (the exact build was not recorded) and have not been repeated with 0.2.0. All use scalar E4M3 KV unless the KV column says otherwise.
+
+Two BF16 references are used:
+
+- **Its own BF16 parent:** the model the checkpoint was quantized from. For Uncensored AWQ that is the uncensored fine-tune; for the other checkpoints it is the base model. The [model table in the README](../README.md#models) uses these values.
+- **The base BF16 model** for every format. Against this reference, the Uncensored rows include the effect of fine-tuning as well as quantization.
+
+| Checkpoint | KV | BF16 reference | KL ↓ | Top-1 agreement ↑ |
+| --- | --- | --- | ---: | ---: |
+| Uncensored AWQ g32 | E4M3 | Its own parent | 0.0214 | 97.08% |
+| Uncensored AWQ g32 | E4M3 | Base model | 0.0273 | 96.63% |
+| Uncensored AWQ g32 | INT8 | Base model | 0.0267 | Within 0.1 percentage point of E4M3 |
+| Base AWQ g32 | E4M3 | Base model (its parent) | 0.0207 | 97.06% |
+| Standard NVFP4 | E4M3 | Base model (its parent) | 0.0303 | 96.36% |
+| NVIDIA FP4-Local | E4M3 | Base model (its parent) | 0.0380 | 95.91% |
+
+A separate comparison against the Uncensored checkpoint's own parent put FP16 KV within 0.001 KL of E4M3: on the short set KL 0.0220 against 0.0214 with top-1 97.08% for both, and on the long set 0.0239 against 0.0238. NVIDIA NVFP4-QAD has not been measured.
+
+KL measures how much the next-token probabilities change. Top-1 agreement counts how often the most likely next token is the same. Both are distribution measurements, not task accuracy or a percentage of model ability retained.
+
+Method:
+
+- Teacher forcing, measuring `KL(quantized ‖ BF16)` and top-1 agreement.
+- Short set: 66 English, Chinese and code records; 39,101 tokens; contexts up to 4K.
+- Long set: three natural documents (English 32K, Chinese 64K and SQLite source 128K) with 14,336 sampled positions.
+- KL uses the top-20 log-probabilities plus a tail bucket. In one checked quantization, this estimate was 7–10% below the full-vocabulary KL.
+- The BF16 reference also uses YaRN, so these values do not show the effect of YaRN on short texts; see [YaRN and native context](configuration.md#yarn-and-native-context).
+
+Compare results from other datasets or estimators separately.
+
+## Earlier results
+
+<a id="reference-system-mtp4"></a>
+
+These results were measured with earlier releases and are kept because 0.2.0 has no comparable measurement. 0.2.0 changed the default KV format to INT8, the serving defaults and both speculative methods, so these values do not describe 0.2.0.
+
+### Standard NVFP4 against AWQ (0.2.0rc12)
+
+Paired measurements on 0.2.0rc12 development builds (same configuration and time window, 4 × V100 PCIe, 250 W per GPU, TP4 + DCP2): NVFP4 and Uncensored AWQ ran at similar speed with MTP4 at one to eight requests and with DFlash2 at four and eight requests. With DFlash2 at one request, NVFP4 was slower (90.4 against 97.8 tok/s). NVFP4 weights took 21.48 GiB per GPU and Uncensored AWQ weights 22.01 GiB; the raw NVFP4 scales (the profile default) saved about 1.69 GiB per GPU compared with FP16 scales.
+
+The [final 0.2.0 PCIe measurements](#speed) use a different setup. On that synthetic workload, observed aggregate C1/C4/C8 output was 97.6/264.5/396.6 tok/s for NVFP4 + MTP5, 103.7/280.7/372.7 tok/s for NVFP4 + DFlash2 and 114.4/260.7/378.1 tok/s for AWQ + MTP4. These are configuration results, not an isolated comparison of weight formats.
+
+### NVLink community result (0.1.2)
+
+<a id="nvlink-community-result"></a><a id="cold-prefill"></a>
+
+[@jttdev](https://github.com/jttdev) measured **0.1.2 at a 200 W cap per GPU** on 2026-10-24 ([report in #2](https://github.com/Leonccaa/ReVolta/issues/2#issuecomment-6384639530)): 4 × V100-SXM2 32 GB with an NV2 NVLink mesh, Uncensored AWQ `5d0ef929`, 512K views, `--gpu-memory-utilization 0.95`, `--max-num-seqs 8` and a 16 GiB CPU KV pool. DFlash2 used the 0.1.2 recommended settings, including the explicit 1500 MiB graph reserve.
+
+| Requests and prompt | MTP4, tok/s | DFlash2, tok/s | DFlash2 / MTP4 |
+| --- | ---: | ---: | ---: |
+| 1, English code | 180.4 | **234.3** | 1.30× |
+| 1, Chinese | 117.1 | 114.3 | 0.98× |
+| 1, English reasoning | 184.9 | 228.2 | 1.23× |
+| 2, aggregate | 231.8 | 260.1 | 1.12× |
+| 4, aggregate | 337.6 | **367.8** | 1.09× |
+| 8, aggregate | **516.3** | 513.0 | 0.99× |
+
+The tests used the same three prompts, 512-token responses, thinking off and `temperature=0`. Single-request values are decode rates; concurrent values are aggregate output. DFlash2's KV pool held 1,216,131 tokens (capacity ratio 2.32× at 512K), 10.2% more than MTP4's 1,103,764 (2.11×).
+
+Cold prefill used MTP4, one request at a time, token-ID prompts from Python standard-library sources, a nonce to miss the prefix cache, and `max_tokens=1`. Throughput is computed prompt tokens divided by time to first token. The 8K and 131K values are medians of three runs; the other lengths have two runs each.
+
+| Prompt tokens | NVLink prefill, tok/s |
+| --- | ---: |
+| 8,192 | **4,680** |
+| 32,768 | 4,505 |
+| 131,072 | **4,037** |
+| 262,144 | 3,618 |
+| 460,000 | 3,007 |
+
+On the PCIe reference system, 0.1.2 with MTP4 at 250 W per GPU measured 3,382 tok/s at 8K and 3,016 tok/s at 131K (512K views, one request at a time, cold prefix cache). The NVLink values are about 1.38× and 1.34× these; the machines and power caps differ. PCIe decode speeds for the same release are in the next table.
+
+### DFlash2 against MTP4 on PCIe (0.1.2)
+
+<a id="dflash2-against-mtp4"></a>
+
+The PCIe reference system (four V100 32 GB PCIe GPUs under one PCIe switch) with 0.1.2: Uncensored AWQ g32, E4M3 KV, TP4 + DCP2, the 0.1.2 recommended DFlash2 settings, greedy decoding, thinking off, 512-token responses. One request: decode speed after the first token. Four and eight requests with mixed prompts: total output. With one prompt per category, the per-category values are indicative.
 
 | Requests and prompt | DFlash2, tok/s | MTP4, tok/s |
 | --- | ---: | ---: |
@@ -184,122 +251,12 @@ indicative.
 | 4, mixed | 238 | 236 |
 | 8, mixed | 331 | 357 |
 
-By prompt category, 8 prompts per category, aggregate output; measured with the 0.1.2
-code before the final width ladder, with the same verify widths at 2 and 8 requests:
-
-| Requests | DFlash2: code / English / Chinese | MTP4: code / English / Chinese |
-| --- | ---: | ---: |
-| 2 | 275 / 203 / 129 | 232 / 193 / 141 |
-| 8 | 505 / 336 / 285 | 492 / 332 / 327 |
-
-A later 0.1.2 DFlash2 measurement at 250 W, with the recommended configuration, recorded the following aggregate output rates. The fastest code values below supply the four- and eight-request PCIe entries in the overview; the one- and two-request entries come from the preceding tables. Values in the overview are rounded to whole tokens/s.
-
-| Requests | Code | English | Chinese |
-| --- | ---: | ---: | ---: |
-| 4 | 370.0 | 245.2 | 214.0 |
-| 8, run 1 | 497.3 | 343.9 | 288.2 |
-| 8, run 2 | 508.7 | 340.1 | 294.8 |
-
-English code and reasoning gain the most; Chinese text is slower with DFlash2. On a
-replay of real agent sessions (one request at a time, sampling), the two were on par
-(0.97× the MTP4 speed). See [DFlash2 speculative decoding](dflash2.md).
-
-### State replay in 0.1.4
-
-From 0.1.4, state replay is optional and off by default, and when turned on its post-sampling replay runs as a CUDA graph. Measured on our 4 × V100 PCIe deployment in one session (30 replayed agent turns at one request with sampling, 200 W; greedy benchmark phases at 250 W, two rounds):
-
-| Configuration | Sampled, ms per step | vs replay off |
-| --- | ---: | ---: |
-| Replay off (recommended) | 30.05 | — |
-| Replay on, 0.1.3 (no graph) | 37.15 | +7.10 ms |
-| Replay on, 0.1.4 without the graph | 35.44 | +5.39 ms |
-| Replay on, 0.1.4 (graph, default when on) | 30.49 | +0.44 ms |
-
-Outputs were identical in all four (30 of 30 sampled turns, 24 of 24 greedy streams). With greedy decoding, replay on with the graph ran 1–4% below replay off at one to four requests and level at eight, and faster than 0.1.3's replay at every concurrency. The remaining cost is the replay's own GPU work.
-
-### State replay in 0.1.3
-
-In 0.1.3, GDN speculative state replay (`sm70_dflash2.spec_state_replay`, on by default where supported) added about 7 ms per decoding step when the target sampled (30.6 to 37.9 ms per step at one request on our 4 × V100 PCIe deployment). With greedy decoding, development runs measured 2 to 3% lower throughput at one request and up to about 5% at eight; on the release image, eight greedy requests measured 312.6 tokens/s with replay (one run) and 302.1 and 335.8 without it (two runs), so the high-concurrency difference was within run-to-run variation. The 0.1.3 reference deployment therefore turned it off with `"sm70_dflash2": {"spec_state_replay": false}`; outputs were unchanged either way. See [State replay (optional)](dflash2.md#state-replay-optional) for the configuration requirements and current default.
-
-With replay off, DFlash2 keeps the other 0.1.3 memory changes (sharded selector codebooks, verifier tail graphs off, 1200 MiB graph reserve): 1,379,634 KV tokens at 512K against 1,268,831 in 0.1.2. Replay adds about 12% more (1,542,558). At eight concurrent 96K-token requests, peak KV use was 26% with replay, sharding and the graph defaults together, against 55% without replay and 60% on 0.1.2. MTP4 remains the default speculative method.
-
-### NVLink (community result)
-
-[@jttdev](https://github.com/jttdev) measured **0.1.2 at a 200 W cap per GPU** on 2026-10-24 ([report in #2](https://github.com/Leonccaa/ReVolta/issues/2#issuecomment-6384639530)): 4 × V100-SXM2 32 GB, NV2 mesh, Uncensored AWQ `5d0ef929`, 512K views, `--gpu-memory-utilization 0.95`, `--max-num-seqs 8` and a 16 GiB CPU KV pool. DFlash2 used the 0.1.2 recommended settings, including the explicit 1500 MiB graph reserve.
-
-| Requests and prompt | MTP4, tok/s | DFlash2, tok/s | DFlash2 / MTP4 |
-| --- | ---: | ---: | ---: |
-| 1, English code | 180.4 | **234.3** | 1.30× |
-| 1, Chinese | 117.1 | 114.3 | 0.98× |
-| 1, English reasoning | 184.9 | 228.2 | 1.23× |
-| 2, aggregate | 231.8 | 260.1 | 1.12× |
-| 4, aggregate | 337.6 | **367.8** | 1.09× |
-| 8, aggregate | **516.3** | 513.0 | 0.99× |
-
-The tests use the same three prompts, 512-token responses, thinking off and `temperature=0`. Single-request values are decode rates; concurrent values are aggregate output. MTP4 reached about 516 tok/s at eight requests. DFlash2's pool held 1,216,131 tokens (2.32× maximum concurrency at 512K), **10.2% more** than MTP4's 1,103,764 (2.11×). NVLink retained a 9% DFlash2 gain at four requests; eight requests were level.
-
-Cold prefill used MTP4, one request at a time, token-ID prompts from Python standard-library sources, a nonce to miss the prefix cache, and `max_tokens=1`. Throughput is computed prompt tokens / time to first token. The 8K and 131K values are medians of three runs; the other lengths have two runs each.
-
-| Prompt tokens | NVLink prefill, tok/s |
-| --- | ---: |
-| 8,192 | **4,680** |
-| 32,768 | 4,505 |
-| 131,072 | **4,037** |
-| 262,144 | 3,618 |
-| 460,000 | 3,007 |
-
-The community report's 1.33× prefill comparison at 8K and 131K used the earlier README PCIe figures of 3,510 / 3,020. Against the 0.1.2 PCIe measurements above (3,382 / 3,016 at 250 W), the ratios are about 1.38× / 1.34×; the machines and power caps differ.
-
-The overview uses the 0.1.2 DFlash2 values for one, two and four requests. Its eight-request value remains the higher 0.1.1 MTP4 measurement below: 524.6, rounded to 525 tok/s.
-
-Earlier 0.1.1 results:
-
-[@jttdev](https://github.com/jttdev) measured 0.1.1 on 4 × V100-SXM2 32 GB with an NV2
-NVLink mesh ([#2](https://github.com/Leonccaa/ReVolta/issues/2)): MTP4, the same three
-prompts, base AWQ checkpoint, 512K views, `--max-num-seqs 8`, `--gpu-memory-utilization 0.95` and a 16 GiB CPU
-KV pool (`cpu_bytes_to_use`). Each level runs 3 requests per stream.
-
-| | 1 request: code / Chinese / reasoning (decode) | 2 | 4 | 8 |
-| --- | ---: | ---: | ---: | ---: |
-| 0.1.1 | 178 / 123 / 191 | 231.3 | 329.5 | 524.6 |
-| 0.1.0, same session | 179 / 123 / 191 | 231.0 | 329.0 | 519.2 |
-
-- The greedy outputs of both releases were byte-identical.
-- At 262K context, `--gpu-memory-utilization 0.925` and a 32 GiB CPU pool, four requests
-  reached 338 without the prefill-pressure flags (333 with them).
-- The CPU KV pool size affects eight requests: in that 262K setup, eight requests gave
-  513 tokens/s with a 16 GiB pool and 497 with 32 GiB, about 3% less; one to four
-  requests did not change. An earlier 8-request gap against a hand-built 1Cat-vLLM setup
-  did not reproduce in later runs.
-- The GPU KV pool at 0.95 and 512K is 1,095,050 tokens with 0.1.1 (2.09× maximum concurrency at 512K), against 1,100,286 with 0.1.0 (2.10×);
-  0.1.1 creates the NCCL communicators before memory profiling, which probably explains
-  the 0.5% difference.
-- Two concurrent retrieval requests of about 490K tokens each found all three needles
-  (0.1.0); 0.1.1 found 3 of 3 at 91K and 244K tokens.
-
-## Quality measurements
-
-No ReVolta version is specified for this quality dataset and method.
-
-Quality uses teacher forcing, measuring `KL(quantized ‖ BF16)` and top-1 agreement.
-
-- Short set: 66 English, Chinese, and code records; 39,101 tokens; contexts up to 4K.
-- Long set: three natural documents—English 32K, Chinese 64K, and SQLite source
-  128K—with 14,336 sampled positions.
-- KL uses top-20 log-probabilities plus a tail bucket. In one checked quantization,
-  this estimate was 7–10% below full-vocabulary KL.
-
-These KL values are lower than published KLD figures for other quantizations of this
-model mainly because only the routed experts are 4-bit: the PLE tables are FP8 and all
-other weights stay 16-bit. For comparison, llama.cpp Q8_0 of this model measures about
-0.02 against BF16 on English text. Only English, Chinese and code were measured.
-
-The AWQ quality table near the top compares each checkpoint with its own BF16 parent.
-The [format table](checkpoints.md#quantization-comparison) uses the base BF16 model throughout. Results from other datasets
-or estimators should be compared separately.
+English code and reasoning gained the most; Chinese text was slower with DFlash2. With 0.1.4 on the same system, DFlash2 ran about 20% faster than MTP4 at four concurrent requests and about 9% faster at eight (512-token answers), and a replay of 90 agent sessions, one request at a time, put DFlash2 at 0.98 of the MTP4 speed, within run-to-run variation (0.1.5 release notes; 0.1.5 speed is unchanged from 0.1.4).
 
 ## See also
 
-- [Checkpoint and KV formats](checkpoints.md)
-- [DFlash2 setup](dflash2.md)
+- [Checkpoints, KV scales and MTP drafts](checkpoints.md)
+- [DFlash2 speculative decoding](dflash2.md)
+- [Dynamic speculative decoding](dynamic-speculative-decoding.md)
 - [KV offload modes](kv-offload.md)
+- [Built-in engine dashboard](dashboard.md) for live metrics of a running service

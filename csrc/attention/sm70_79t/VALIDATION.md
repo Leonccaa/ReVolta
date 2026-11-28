@@ -1,5 +1,7 @@
 # SM70 Q8000/Q8192 integration validation (2026-09-14)
 
+> Historical validation record from development. It is kept as-is for reference; the cold benchmark script it names (`benchmarks/benchmark_sm70_79t_cold.py`) is no longer in the repository.
+
 The first integration measurements below are retained as historical evidence
 and explicitly identify their eager configuration. Follow-up validation from
 the E4M3 route-parity work uses normal CUDA graphs. The current

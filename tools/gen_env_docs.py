@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from tools.env_docs_notes import (  # noqa: E402
+    COMPACT_SECTIONS,
     DFLASH2_NOTES,
     NOTES,
     PROFILE_NOTE,
@@ -59,7 +60,13 @@ def profile_values(source: str) -> dict[str, list[str]]:
         "NVFP4_DFLASH_PLANAR_KV_DEFAULTS": "NVFP4+DFlash2, planar KV",
         "MTP_PLANAR_KV_DEFAULTS": "fixed MTP, planar KV",
         "MTP_DSD_PLANAR_KV_DEFAULTS": "dynamic MTP, planar KV",
+        "MTP_DSD_PLANAR_KV_WIDE_DEFAULTS": "dynamic MTP with 5+ drafts, planar KV",
+        "AWQ_DFLASH_PLANAR_KV_MIXED_PREFILL_DEFAULTS": (
+            "AWQ+DFlash2, planar KV, positive mixed-prefill target"
+        ),
         "CUSTOM_AR_DEFAULTS": "P2P/NVLink",
+        "HYBRID_SERVING_DEFAULTS": "vllm serve",
+        "DFLASH_SERVING_DEFAULTS": "DFlash2, vllm serve",
     }
     for node in ast.parse(source).body:
         if (
@@ -93,6 +100,37 @@ def cell(text: str) -> str:
     return " ".join(str(text).split()).replace("|", "\\|")
 
 
+_COMPUTED = "Computed when unset: "
+_CALLS = {"max": max, "min": min, "int": int, "str": str, "float": float}
+
+
+def _evaluate(node: ast.expr) -> object:
+    """Evaluate the small literal expressions used in declared defaults."""
+    if isinstance(node, ast.Constant):
+        return node.value
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in _CALLS
+        and not node.keywords
+    ):
+        return _CALLS[node.func.id](*(_evaluate(a) for a in node.args))
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.LShift):
+        return _evaluate(node.left) << _evaluate(node.right)  # type: ignore[operator]
+    raise ValueError(ast.unparse(node))
+
+
+def literal_default(declared: str) -> str:
+    """Show a computed default such as ``max(0, int('3'))`` as its value."""
+    if not declared.startswith(_COMPUTED):
+        return declared
+    try:
+        value = _evaluate(ast.parse(declared[len(_COMPUTED) :], mode="eval").body)
+    except (SyntaxError, ValueError, TypeError):
+        return declared
+    return repr(value) if isinstance(value, str) else str(value)
+
+
 def render() -> str:
     envs_source = (ROOT / "vllm/envs.py").read_text(encoding="utf-8")
     metadata, errors = read_metadata(envs_source)
@@ -103,7 +141,11 @@ def render() -> str:
     missing = sorted(set(NOTES) - set(metadata))
     if missing:
         raise SystemExit(f"notes for unregistered variables: {missing}")
-    untyped = sorted(set(NOTES) - set(types))
+    untyped = sorted(
+        n
+        for n, note in NOTES.items()
+        if note["section"] not in COMPACT_SECTIONS and n not in types
+    )
     if untyped:
         raise SystemExit(
             f"add TYPE_CHECKING annotations in vllm/envs.py for: {untyped}"
@@ -114,16 +156,36 @@ def render() -> str:
         "",
         "## Environment variable reference",
         "",
-        "Every variable below is read once per process (deployment scope). Columns:",
-        "type and default as registered in `vllm/envs.py`; *Since* is the first",
-        "release with the variable (1Cat = inherited from 1Cat-vLLM); *Category*",
-        "is configuration, tuning, experimental, debug or deprecated.",
+        "Every variable below is read once per process (deployment scope). "
+        "Columns: type and default as registered in `vllm/envs.py`; *Since* is "
+        "the first release with the variable (1Cat = inherited from 1Cat-vLLM); "
+        "*Category* is configuration, tuning or experimental. Developer and "
+        "deprecated variables are listed by name at the end.",
     ]
     for key, title in SECTIONS.items():
         names = [n for n, note in NOTES.items() if note["section"] == key]
         if not names:
             continue
         lines += ["", f"### {title}", ""]
+        if key in COMPACT_SECTIONS:
+            lines += [COMPACT_SECTIONS[key], ""]
+            if key == "lookup":
+                lines += ["| Name | Default | Effect |", "|---|---|---|"]
+                for name in sorted(names):
+                    default = literal_default(metadata[name]["declared_default"])
+                    lines.append(
+                        f"| `{name}` | `{cell(default)}` | "
+                        f"{cell(NOTES[name]['tradeoff'])} |"
+                    )
+                continue
+            groups: dict[str, list[str]] = {}
+            for name in sorted(names):
+                groups.setdefault(NOTES[name]["tradeoff"], []).append(name)
+            joiner = " → " if key == "retiring" else ": "
+            for text, members in groups.items():
+                listed = ", ".join(f"`{m}`" for m in members)
+                lines.append(f"- {listed}{joiner}{cell(text)}")
+            continue
         columns = ["Name", "Type", "Default", "Range", "Category", "Since"]
         if key == "profile":
             lines += [PROFILE_NOTE, ""]
@@ -141,7 +203,7 @@ def render() -> str:
             row = [
                 f"`{name}`",
                 cell(types[name]),
-                f"`{cell(meta['declared_default'])}`",
+                f"`{cell(literal_default(meta['declared_default']))}`",
             ]
             if key == "profile":
                 row.append(cell(", ".join(profile.get(name, ["-"]))))
@@ -157,9 +219,12 @@ def render() -> str:
         "",
         "### speculative_config.sm70_dflash2 keys",
         "",
-        "Pass these inside `--speculative-config '{..., \"sm70_dflash2\": {...}}'`",
-        "(see [DFlash2](dflash2.md)). `None` selects the model-qualified policy;",
-        "operator shape, dtype and native checks still decide each dispatch.",
+        "Pass these inside `--speculative-config '{..., \"sm70_dflash2\": {...}}'` "
+        "(see [DFlash2](dflash2.md)). `None` (unset) takes the built-in default "
+        "when the DFlash2 verifier qualifies (Flash-Next on SM70 under the ReVolta "
+        "serving profile), otherwise the value of the matching legacy "
+        "`VLLM_SM70_DFLASH2_*` environment variable; shape, dtype and native "
+        "checks still decide each dispatch.",
         "",
         "| Key | Type | Default | Effect and trade-off |",
         "|---|---|---|---|",

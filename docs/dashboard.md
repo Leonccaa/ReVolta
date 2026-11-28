@@ -1,187 +1,130 @@
 # Built-in engine dashboard
 
-The optional dashboard shows aggregate metrics from one ReVolta service. It is
-separate from any externally hosted status site. It does not contain deployment
-announcements, a maintenance schedule, hardware claims or an operator changelog.
+The dashboard is an optional web page that shows live aggregate metrics of one ReVolta API server: requests, decode and prefill speed, cache use, speculative decoding and latency. It reads the same Prometheus metrics as `/metrics` and does all calculations in the browser. It is off by default.
 
-## Enable and open
+Prerequisites: an OpenAI-compatible server started with `vllm serve` or the Docker image, with engine statistics on (the default).
 
-Add `--enable-dashboard` to your existing `revolta serve` command, then open
-`http://localhost:8000/dashboard/` using your service's host and port. The option
-is a boolean, defaults to `false`, and also accepts `enable-dashboard: true` in
-the usual server YAML configuration. Omit it, or use `--no-enable-dashboard`, to
-disable the page and all its data and asset routes. This is an experimental
-Python API server feature prepared for a future release; it does not change the
-supported hardware/model matrix or release acceptance requirements.
+## Turn it on
 
-No JavaScript build step, third-party chart library, CDN or external font is
-needed. HTML, CSS and ES modules are included in both the source distribution and
-wheel. Assets use conditional HTTP caching; metric and configuration responses
-use `Cache-Control: no-store`.
+<a id="enable-and-open"></a>
 
-The browser fetches `/dashboard/metrics`, a read-only view of the **same registry
-as `/metrics`**, every two seconds while visible. The separate URL lets dashboard
-data follow `--api-key` / `VLLM_API_KEY` access control without changing the
-existing Prometheus scrape policy. It does not introduce a new metering path.
-When a key is configured, enter it in the page. The key remains in that tab's
-memory and is sent in an Authorization header; it is never placed in a URL or
-saved to browser storage. The unauthenticated HTML shell contains no metrics.
-Configuration follows the ordinary server's CLI-key-over-environment priority.
-A rejected data request answers `401` with `WWW-Authenticate: Bearer` and
-`Cache-Control: no-store`. The dashboard builds that response inside its own
-authorization step rather than raising an exception, so the API server's shared
-`HTTPException` handler, which rebuilds the body without the exception headers,
-cannot strip them. A dead engine answers `503` with the same no-store header.
+Add `--enable-dashboard` to your `vllm serve` command, or `enable-dashboard: true` to the YAML file you pass with `--config`. Then open `http://<host>:<port>/dashboard/` (port 8000 by default); `/dashboard` redirects there.
 
-Routes use the server's reverse-proxy root path, and assets/data use relative
-URLs. The page becomes available with the API server after model loading. An
-already open page shows an offline state on failed or timed-out scrapes; it
-cannot serve itself while the API server is down.
+| Option | Type | Default | Effect |
+| --- | --- | --- | --- |
+| `--enable-dashboard` / `--no-enable-dashboard` | boolean | `false` | Serves the page under `/dashboard/`. When off, none of the dashboard routes exist. |
 
-## Metric scopes
+The page becomes available once the model has loaded and the API server is listening. It cannot load while the API server is down; a page that is already open shows an offline state when a request fails or takes longer than 6 seconds.
 
-The six cards are Requests, Decode, Prefill, Cache, Speculative decoding and
-Latency. Their details open in a dialog; on a narrow screen it becomes a scrollable
-bottom sheet. Every detail view includes the engine's cumulative counters.
+What the data needs:
 
-- **Since engine start** shows cumulative tokens, completed requests, cache hit
-  rate and average RPM/TPM. Service uptime starts at API service setup, including
-  model loading. The service instance ID and start time are initialized before
-  API workers fork. Version is the installed engine's version, not hand-filled
-  site content.
-- **Now** uses current running/waiting gauges and the most recent pair of token
-  counter observations, normally two seconds apart. A long observation gap does
-  not produce a realtime rate.
-- **Last 1/5/15 min** uses raw counter differences over actual elapsed time.
-  Partial windows work after the second sample. Once enough history exists, the
-  baseline rolls forward within the selected duration. It uses a real sample
-  inside the cutoff, not an interpolated counter; the exact span is shown in
-  details and partial-window labels. Ratios use summed numerators/denominators,
-  not averages of per-sample percentages.
+- **Engine statistics.** They are on by default. With `--disable-log-stats` the token metrics are missing and the page says so.
+- **Store metrics for the Cache card.** The RAM, SSD and GPU Hot views use the store metrics (`--enable-store-metrics`, on by default, needs engine statistics), which the engine publishes at most once a minute. Their occupancy values come from Host KV's store gauges; with GPU KV and CPU or disk offload only some event counters are published, so most of those values show `—`.
+
+The page needs no JavaScript build step, chart library, CDN or external font. Its HTML, CSS and JavaScript files are part of the wheel and the Docker image. The page loads nothing from other origins.
+
+Routes follow the server's `--root-path`, and the page uses relative URLs, so it works behind a reverse proxy that serves the API under a path prefix.
+
+## Access control
+
+The page shell (`/dashboard/` and its assets) contains no metrics and needs no key. The two data routes follow the server's API key:
+
+| Route | Content |
+| --- | --- |
+| `/dashboard/config` | Service instance ID, start time and engine version |
+| `/dashboard/metrics` | The same Prometheus registry as `/metrics` |
+
+When the server has an API key (`--api-key`, or `VLLM_API_KEY` if `--api-key` is not given), the data routes need `Authorization: Bearer <key>`. The page asks for the key, keeps it in the tab's memory only and sends it in that header; it never puts the key in a URL or in browser storage. A missing or wrong key gets `401` with `WWW-Authenticate: Bearer`. If the key is rejected later, the page drops the observations it holds in memory.
+
+`/metrics` itself keeps its existing access policy; the dashboard does not change it. Data responses carry `Cache-Control: no-store`. `/dashboard/metrics` answers `503` when the engine has failed. Assets use `Cache-Control: no-cache` with conditional requests.
+
+## What the page shows
+
+The page has six cards: Requests, Decode, Prefill, Cache, Speculative decoding and Latency. **View details** opens a dialog with more values, the window values next to the totals since engine start, and an explanation of each calculation. On a narrow screen the dialog becomes a scrollable bottom sheet.
+
+### Time scopes
+
+<a id="metric-scopes"></a>
+
+Each value belongs to one of three scopes:
+
+- **Since engine start.** Cumulative engine counters: total tokens, cached input tokens, output tokens, completed requests, cache hit rate, and average RPM and TPM. Service uptime counts from API server setup, including model loading. The version shown is the installed engine version.
+- **Now.** Current running and waiting requests, and rates from the two most recent observations, normally 2 seconds apart. After a gap of more than 10 seconds there is no "now" rate.
+- **Last 1, 5 or 15 minutes.** Counter changes divided by the actual elapsed time. The window starts at the oldest real observation inside it; nothing is interpolated. A partial window works from the second observation and shows how much time it covers. Ratios divide summed counters; they are not averages of per-sample percentages.
+
+The page polls every 2 seconds while its tab is visible and stops while the tab is hidden. Hidden time leaves a gap in the charts. Window averages still cover a gap when the counters stayed valid, because the change and the elapsed time are known; the activity pattern, gauge history and individual prefill events inside the gap are lost. A first visit has no window history, but the totals since engine start are available at once.
+
+### Definitions
 
 | Display | Definition |
 | --- | --- |
-| RPM | Completed requests × 60 / elapsed seconds; native stop, length and abort finish reasons are included |
+| RPM | Completed requests × 60 / elapsed seconds. Every finish reason counts: stop, length, abort, error and repetition. |
 | TPM | (Input tokens + output tokens) × 60 / elapsed seconds |
 | Decode throughput | Output token change / elapsed seconds |
 | Computed input throughput | Newly computed input token change / elapsed seconds |
 | Total input throughput | All input token change / elapsed seconds, including cached input |
-| Total cache hit rate | Cached input tokens / input tokens; equivalently cached input / (total tokens − output tokens) |
-| Latest reported prefill | Newly completed requests' computed KV tokens / their prefill-phase seconds; counts and engine labels must match |
+| Total cache hit rate | Cached input tokens / input tokens |
+| Latest reported prefill | Computed KV tokens of newly completed requests / their prefill-phase seconds |
 | Draft acceptance | Accepted draft tokens / drafted tokens |
-| Mean acceptance length | 1 + accepted draft tokens / draft rounds, including the bonus token |
-| Latency mean | Histogram sum change / count change |
-| TTFT P50/P95 | Histogram bucket upper bounds; P95 needs at least ten samples; an infinite bound is unavailable |
+| Mean acceptance length | 1 + accepted draft tokens / draft rounds; includes the bonus token |
+| Latency means | Histogram sum change / count change |
+| TTFT P50 / P95 | Upper bound of the histogram bucket that holds the percentile, not an interpolated value. P95 needs at least 10 samples; a value beyond the largest finite bucket shows `—`. |
 
-Prefill's completed-request histograms arrive at request completion. The latest
-rate is retained through idle/decode periods with its observation age and sample
-count. Multiple completions in one scrape are weighted by their total phase
-time. Cache-only samples can report a real zero. The large Prefill number uses
-full numeric notation, never `K`. The window's computed-input throughput is a
-different measurement with wall time as its denominator.
+Missing metrics show `—`, not zero.
 
-Cache details provide Summary, GPU Hot, RAM and SSD views. Occupancy uses
-horizontal bars and net changes; it does not infer peak occupancy before the
-browser observed it. RAM/SSD input shares use all classified prompt tokens as
-their denominator. They are **not** conditional tier lookup hit rates. GPU Hot
-hit rate uses groups, not tokens. Current store occupancy becomes unavailable
-when its snapshot is older than 180 seconds or its age cannot be verified. The
-`RAM allocation / capacity` and `SSD allocation / capacity` lines follow the
-occupancy bars and use the same rule: when the store snapshot is stale or the
-service is offline they report `Unavailable` plus the age of the last observed
-value, instead of repeating a number that is no longer current. SSD bytes can be
-shown without a capacity, but SSD utilization remains unavailable when this
-engine build does not export capacity. Native engine KV utilization is available
-in Cache details; with multiple engines it shows the maximum exported fraction.
-Missing metrics are shown as `—`, not zero.
+**Prefill.** The prefill histograms are reported when a request completes. The latest value stays on screen through idle and decode periods, with its age and sample count. Several completions in one poll are weighted by their prefill time. A gap of more than 10 seconds clears the latest value until a new completion is seen. The large prefill number is always written in full, never as `K`. The window's computed input throughput is a different measurement: it divides by wall time.
 
-## Browser history and caching
+**Cache.** The Cache details have Summary, GPU Hot, RAM and SSD views.
 
-**Remember history** is off by default. Nothing is written to browser storage
-until you turn it on, and a first visit only observes in memory. When it is on,
-one local storage record holds aggregate observations, limited to at most 15
-minutes of samples, 500 samples and 1.5 MiB of serialized UTF-8 data. Writes are
-throttled to once per 30 seconds and flushed when the page is hidden or exited.
+- RAM and SSD input shares divide by all classified prompt tokens. They are not hit rates of a lookup in that tier.
+- GPU Hot hit rate counts cache groups, not tokens.
+- Occupancy bars show the latest store snapshot and its net change in the window. Peaks the browser did not observe cannot be recovered.
+- A store snapshot older than 180 seconds, or one whose age cannot be checked, is not current. The bars and the `RAM allocation / capacity` and `SSD allocation / capacity` lines then show `Unavailable` with the age of the last observed value, and so do they while the service is offline.
+- This release does not export SSD capacity, so the SSD view shows bytes used but no utilization.
+- Engine KV usage shows the maximum across engines when there is more than one.
 
-The saved fields are:
+### Metrics it reads
 
-- the schema version and the service instance ID the observations belong to;
-- each observation's browser-side timestamp;
-- aggregate counter, gauge and store-occupancy values (tokens, completed
-  requests, cache and speculative-decoding counters, running/waiting counts,
-  engine KV utilization, RAM/SSD byte totals and the store snapshot timestamp);
-- the model names taken from the metric labels;
-- for each tracked counter series (input tokens, output tokens and completed
-  requests) the value together with that series' full label key and value list,
-  which includes the model name and engine labels;
-- time-to-first-token histogram bucket counts and the completed-prefill
-  histogram values with their label keys.
+All names carry the `vllm:` prefix in `/metrics`.
 
-A model name can itself contain a deployment path, and label values are stored
-verbatim, so treat the stored record as revealing which model this service
-served. API keys are never part of it. The selected statistics window and the
-remembering choice are stored separately as page preferences and contain no
-metric values.
+| Card | Metrics |
+| --- | --- |
+| Requests | `request_success_total`, `num_requests_running`, `num_requests_waiting`, `prompt_tokens_total`, `generation_tokens_total`, `num_preemptions_total` |
+| Decode | `generation_tokens_total`, `inter_token_latency_seconds`, `request_time_per_output_token_seconds` |
+| Prefill | `prompt_tokens_total`, `prompt_tokens_cached_total`, `prompt_tokens_by_source_total`, `request_prefill_time_seconds`, `request_prefill_kv_computed_tokens` |
+| Cache | `prompt_tokens_cached_total`, `kv_cache_usage_perc`, `store_state`, `store_events_total` |
+| Speculative decoding | `spec_decode_num_accepted_tokens_total`, `spec_decode_num_draft_tokens_total`, `spec_decode_num_drafts_total` |
+| Latency | `time_to_first_token_seconds`, `e2e_request_latency_seconds`, `request_queue_time_seconds` |
 
-There is **no automatic expiry**. A record that is no longer being written stays
-in browser storage indefinitely; samples older than 15 minutes are only dropped
-when the history is restored or extended, and the storage entry itself survives
-until it is replaced or removed. To remove it: use **Clear history** to delete
-the observations and start a new window, turn **Remember history** off (which
-deletes the stored record immediately while allowing in-memory observation to
-continue), or clear this site's browsing data in the browser. While remembering
-is off, opening the page also drops a record an earlier session left behind, so
-turning the option off does not keep model names or label keys on disk. Storage
-denial, quota errors and corrupted caches fall back to memory without breaking
-the page.
+## Browser history
 
-The cache is scoped to browser origin, dashboard path, schema and service
-instance. Reloading the same service can restore observed history after successful
-authentication, but only when remembering is on. An engine restart,
-model/engine-series change or a decreasing counter invalidates it. Client clock
-reversal also starts a new observation segment. API workers in one service share
-an identity; independent service restarts do not.
+<a id="browser-history-and-caching"></a>
 
-Hidden tabs stop polling. A gap has no instantaneous chart points. Counter-based
-window averages can still cover the gap if the same service's counters remain
-valid: their exact change and elapsed time are known. The browser cannot recover
-the activity pattern, gauge history or individual prefill events during that
-gap. A resumed observation gap longer than ten seconds clears the latest prefill
-event until a fresh matching completion is observed. A first visit has no earlier
-window history; cumulative engine counters are immediately available.
+**Remember history** is off by default. Until you turn it on, the page writes no observations to browser storage and keeps them in memory only.
 
-There is no server-side history task, timer, database or EngineCore change. Each
-open visible tab does request metrics, so collection/serialization still consumes
-API server CPU and multiprocess metric reads. This is not a zero-overhead or
-GPU-performance claim. Keep the option off in unrelated acceptance runs.
+When it is on, one local storage record holds the observations: at most 15 minutes of samples, 500 samples and 1.5 MiB of serialized data. The page writes it at most once every 30 seconds, and also when the tab is hidden or closed. The record contains:
 
-## CPU verification
+- the schema version and the service instance ID;
+- the browser-side timestamp of each observation;
+- aggregate counter, gauge and store values (tokens, completed requests, cache and speculative decoding counters, running and waiting counts, engine KV usage, RAM and SSD byte totals and the store snapshot time);
+- the model names from the metric labels;
+- for input tokens, output tokens and completed requests, each series' value with its full label set, which includes the model name and engine index;
+- TTFT histogram bucket counts and the prefill histogram values with their labels.
 
-These checks need no model, GPU, Torch import or running inference service:
+Label values are stored as they are, and a model name can contain a deployment path, so the record reveals which model the service served. API keys are never stored. The selected window and the remember setting are stored separately as page preferences; they contain no metric values.
 
-```sh
-uv venv .venv
-uv pip install --python .venv/bin/python 'fastapi>=0.141.1,<0.142.0' httpx prometheus-client prometheus-fastapi-instrumentator regex uvicorn
-.venv/bin/python -m unittest discover -s tests/entrypoints/serve/dashboard -p 'test_*.py' -v
-node --test tests/entrypoints/serve/dashboard/test_metrics.mjs
-```
+The record does not expire. To remove it, use **Clear history** (deletes the observations and starts a new window), turn **Remember history** off (deletes the record at once; observation in memory continues), or clear the site's data in the browser. While remembering is off, opening the page also deletes a record that an earlier session left behind. If storage is blocked, full or corrupted, the page falls back to memory.
 
-The Python suite exercises actual ASGI routes, authentication, the API server's
-HTTPException handler chain, disabled routes, shared worker identity, proxy
-paths, assets and exporter responses. The JavaScript suite exercises parsing,
-counter math, rolling/partial windows, store-snapshot freshness, prefill
-matching, histogram bounds, reset detection and browser-cache behavior. Use Node
-22 or later. Browser verification uses a CPU fixture service, including mobile
-dialogs, reload, offline/stale-store occupancy, missing metrics and
-authentication with local history off by default; these results do not establish
-GPU serving performance or production readiness.
+The record is tied to the browser origin, the dashboard path, the schema and the service instance. After a reload with remembering on, the page restores the history once the data routes accept it. A restart of the service, a change in the model or engine series, a counter that decreases, or the browser clock going backwards starts a new history. API workers of one service share one instance ID.
 
-To repeat the browser check with an installed Chromium or Chrome executable:
+## Cost
 
-```sh
-node tests/entrypoints/serve/dashboard/browser_check.mjs --chrome /usr/bin/chromium --output dashboard-browser-results
-```
+The server keeps no history: there is no background task, timer, database or engine change. Each open, visible tab requests `/dashboard/metrics` every 2 seconds, which costs API server CPU time to collect and serialize the metrics. Close the page, or leave the option off, during benchmarks.
 
-It starts and stops its own local CPU fixture service and browser, and writes
-screenshots and an acceptance report to the selected output directory. The
-fixture has no model or GPU dependency and is not part of the installed package.
+The dashboard was tested with CPU-only suites (Python, JavaScript and a headless browser); its cost while a model serves requests on GPUs has not been measured. The CPU test commands are in [CONTRIBUTING.md](../CONTRIBUTING.md#dashboard-checks).<a id="cpu-verification"></a><a id="testing-without-a-gpu"></a>
+
+## See also
+
+- [Configuration](configuration.md) for `--enable-dashboard` and the other server options.
+- [KV offload modes](kv-offload.md) for the CPU and SSD tiers shown in the Cache card.
+- [Performance and measurements](performance.md) for benchmark results.

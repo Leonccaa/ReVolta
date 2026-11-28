@@ -22,7 +22,7 @@ NOTE: If you want to not only transfer KV caches, but adjust the model execution
 
 ## Disaggregated prefilling
 
-The example usage is in [this file](../../../examples/disaggregated/disaggregated_prefill.sh).
+The example usage is in upstream vLLM's `examples/disaggregated/disaggregated_prefill.sh`; ReVolta does not ship the `examples/` directory.
 
 Here is the diagram of how we run disaggregated prefilling.
 

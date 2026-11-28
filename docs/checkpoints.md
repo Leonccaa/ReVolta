@@ -1,530 +1,179 @@
-# Checkpoints, KV scales and MTP drafts
+# Checkpoints and KV formats
 
-Use this guide to select and prepare a checkpoint, its MTP draft and any optional KV scales.
-First [install ReVolta](getting-started.md#1-install); for a complete first launch, follow the tutorial.
+<a id="checkpoints-kv-scales-and-mtp-drafts"></a>
 
-- **Weight formats:** standard AWQ, NVFP4, NVIDIA FP4-Local, and NVIDIA NVFP4-QAD.
-- **KV formats:** FP8 E4M3, FP16, and INT8.
+Use this guide to choose a Qwen3.8 Flash-Next checkpoint, prepare it with its MTP draft and 512K views, and choose the KV cache format. It assumes that ReVolta is [installed](getting-started.md#1-install) and that you have read the [reference launch](getting-started.md#4-launch); this page lists only what changes for each checkpoint. Speculative decoding settings are in [DFlash2](dflash2.md) and [Dynamic speculative decoding](dynamic-speculative-decoding.md).
 
-## Models
+## Choose a checkpoint
 
-| Checkpoint | Test status |
-| --- | --- |
-| [Uncensored AWQ g32](https://huggingface.co/leoncca/Qwen3.8-Flash-Next-Uncensored-AWQ-g32) | Default; full serving acceptance passed |
-| [Base AWQ g32](https://huggingface.co/leoncca/Qwen3.8-Flash-Next-AWQ-g32) | Quantization quality measured; full serving acceptance not run |
-| [Standard NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4) | Full serving acceptance passed with format-specific settings |
-| [NVIDIA FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local) | Full serving acceptance passed with vision-tower TP4 |
-| [NVIDIA NVFP4-QAD](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4-QAD) | Loading and serving checks passed on four V100s; quantization quality not yet measured |
+<a id="models"></a><a id="uncensored-or-base-awq"></a>
 
-Both AWQ checkpoints use group-size-32 4-bit routed experts, FP8 E4M3 PLE tables,
-and 16-bit remaining weights. Each includes calibrated QSA E4M3 K/V scales and an
-optional `mtp-fp8/` draft with separate calibrated scales. Use the draft from the
-same repository as the target.
-
-Use `--dtype half`: V100 has no BF16 support.
-
-## KV scales and draft selection
-
-Tensor-scale calibrated E4M3 KV is frozen: it still works, but it is no longer
-optimized or tested in release acceptance. Eligible SM70 QSA models can use
-`--kv-cache-dtype auto` (INT8) or `fp8_per_token_head` for E4M3 storage.
-
-For explicit `fp8` / `fp8_e4m3`, calibrated scalar E4M3 KV scales belong to a
-specific checkpoint revision. Keep
-`VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES=1` enabled: missing target scales then
-reject startup. Without it, missing target scales fall back to unit scale
-with a warning. That fallback is unvalidated and can saturate E4M3 values.
-An uncalibrated MTP draft with E4M3 draft KV is rejected even without strict
-target-scale checking. Use the draft's own scales or set its
-`"kv_cache_dtype": "float16"`.
-
-| Target checkpoint | E4M3 target scales | MTP draft | Draft KV dtype |
+| Checkpoint | Weights | MTP draft | Test status |
 | --- | --- | --- | --- |
-| Uncensored AWQ g32 | Included in the same checkpoint | Its own `mtp-fp8/`, including draft scales | `fp8_e4m3` (or `float16`) |
-| Base AWQ g32 | Included in the same checkpoint | Its own `mtp-fp8/`, converted and calibrated separately | `fp8_e4m3` (or `float16`) |
-| Standard NVFP4 `7b719225` | [NVFP4 pack](https://huggingface.co/leoncca/Qwen3.8-Flash-Next-NVFP4-QSA-FP8-E4M3-KV-Scales), `v1.2-base-7b719225`; materialize first | Uncensored FP8 MTP and its scales, included in that pack | `fp8_e4m3` (or `float16`) |
-| NVIDIA FP4-Local `b9ce18a6` | [FP4-Local pack](https://huggingface.co/leoncca/Qwen3.8-Flash-Next-FP4-Local-QSA-FP8-E4M3-KV-Scales), `v1.1-base-b9ce18a6`; materialize first | The checkpoint's built-in MTP layer; its two draft scales are in the same pack | `fp8_e4m3` (or `float16`) |
+| [Uncensored AWQ g32](https://huggingface.co/leoncca/Qwen3.8-Flash-Next-Uncensored-AWQ-g32) (default) | 4-bit AWQ routed experts (group size 32), FP8 E4M3 PLE tables, 16-bit other weights; 137 GB | Its own `mtp-fp8/` | Passed 0.2.0 acceptance with DFlash2, GPU KV + MTP4 and Host KV + MTP5. E4M3 passed functional checks on an earlier 0.2.0 candidate build |
+| [Base AWQ g32](https://huggingface.co/leoncca/Qwen3.8-Flash-Next-AWQ-g32) | Same layout as Uncensored AWQ | Its own `mtp-fp8/`, converted and calibrated separately | Quantization quality measured; serving acceptance not run |
+| [Standard NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4) | ModelOpt NVFP4 routed experts; about 126 GiB | The Uncensored AWQ draft, shipped in the NVFP4 scale pack | Passed 0.2.0 acceptance with MTP5 and DFlash2; passed the 0.1.0 release gate |
+| [NVIDIA FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local) | NVFP4 experts, MXFP8 layers, NVFP4 PLE table; about 95 GiB | Built-in MTP layer | Passed the 0.1.0 release gate; not in the 0.2.0 release tests |
+| [NVIDIA NVFP4-QAD](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4-QAD) | NVFP4 routed and shared experts, MXFP8 GDN and QSA projections, FP8 PLE table | Built-in MTP layer | Loading and serving checks passed in 0.2.0rc12; quantization quality not measured. The repository is not publicly downloadable at the time of writing |
 
-DFlash2 drafts do not need these K/V scales. Their own configuration is in
-[DFlash2 speculative decoding](dflash2.md).
-The AWQ, Standard NVFP4 and NVIDIA FP4-Local examples below show the optional,
-frozen scalar `fp8_e4m3` setup for target and MTP. The strict-scale and scale-pack
-instructions apply to that format. The [reference launch](getting-started.md#4-launch)
-uses `auto` for the target and lets the MTP draft inherit its INT8 KV. Omitting
-the target option also selects `auto`: planar INT8 for eligible QSA models on
-SM70 and planar `fp8_per_token_head` on other supported CUDA devices. Both compute
-scales at runtime and need no KV scale overlay. MTP inherits the target format
-when the draft dtype is omitted. On supported QSA Model Runner V2 configurations,
-an explicit FP16 draft can also be used with an 8-bit target.
-SM70 QSA DFlash/DFlash2 defaults to FP16 draft KV. See the
-[KV dtype comparison](configuration.md#launch-options) for eligibility and ABI.
+- Start with **Uncensored AWQ**: it is the default, the most tested, and has the best measured quality of the compared formats.
+- Choose **Base AWQ** for the original, not fine-tuned model in the same format.
+- **Standard NVFP4** ran at similar speed to AWQ in most measured cases and needs about 0.5 GiB less weight memory per GPU (see [Standard NVFP4](#standard-nvfp4)).
+- **FP4-Local** and **NVFP4-QAD** are smaller NVIDIA quantizations. FP4-Local has the lowest measured quality of the compared formats; QAD has not been measured.
 
-On V100, Flash-Next MTP uses Q8_0 for supported floating-point or block-FP8 routed
-expert weights. The runtime packs the experts once at load time. Packed
-NVFP4 draft experts keep their checkpoint format. To keep FP8 draft expert
-storage, add `"mtp_expert_quantization":"fp8"` to the speculative config.
-For the supported draft sources, `"mtp_expert_quantization":"fp16"` selects
-the FP16 reference. These settings affect only the draft's routed expert
-weights. The draft KV dtype is configured separately.
+V100 has no BF16 support, so serve every checkpoint with `--dtype half`.
 
-When target E4M3 scales are unavailable, FP16 KV needs no calibration but
-holds roughly half as many KV tokens at the same memory budget. INT8 KV
-computes per-token, per-head scales at runtime. MTP inherits an INT8 target
-format by default. DFlash2 supports an INT8 target with an FP16 draft. On
-Flash-V100, DFlash2 draft attention with sliding windows or attention sinks
-requires FP16 draft KV for this combination.
+<a id="quantization-comparison"></a>
 
-The following steps pin every download. Retain the downloaded base and pack:
-the materialized checkpoints and 512K YaRN views link to their files. Use a
-fresh output directory for each run. **Materialize before making YaRN views**:
-the materializer verifies the unmodified base index (and FP4-Local config).
-Both target and draft need YaRN; `--hf-overrides` only reaches the target.
-Views must also link directories such as `tensors/` and `calibration/`.
-Run these commands in the installed ReVolta environment and apply the
-[environment settings](getting-started.md#3-environment) before launching. These are checkpoint
-setup and minimal launch examples; use the rest of the [quick-start launch
-options](getting-started.md#4-launch) for the reference multimodal and CPU KV offload configuration.
+Quality measurements for each format, against two BF16 references, are in [Quality measurements](performance.md#quality-measurements).
 
-## Uncensored or Base AWQ
+## Prepare the checkpoint
 
-Use the target and `mtp-fp8/` from the same repository. The default below is
-Uncensored. To use Base AWQ, change `variant` to `"base"`; its revision is
-pinned separately. No materialization is needed because both target and
-draft scales are already included.
+Preparing a checkpoint means three things: download a pinned revision, get its MTP draft, and make the 512K YaRN views. Use the script in [step 2 of Getting started](getting-started.md#2-download-the-checkpoint-and-make-512k-views) and change only these lines:
 
-```bash
-python - <<'EOF'
-import json
-from pathlib import Path
-from huggingface_hub import snapshot_download
+1. `repo` and `revision`: from the table below.
+2. `views`: a separate directory per checkpoint, for example `/data/revolta/views/nvfp4`, so that the views of several checkpoints can coexist.
+3. The draft line at the end, `make_view(ckpt / "mtp-fp8", views / "draft-512k")`: as in the last column.
 
-variant = "uncensored"  # or "base"
-choices = {
-    "uncensored": ("leoncca/Qwen3.8-Flash-Next-Uncensored-AWQ-g32",
-                   "1fd7ab705731c9dacc3bcd5b5d15783c60706d64"),
-    "base": ("leoncca/Qwen3.8-Flash-Next-AWQ-g32",
-             "c6d84ec547717f71710f82ec3783027b61bbfc49"),
-}
-repo, revision = choices[variant]
-ckpt = Path("/data/revolta/models") / repo.split("/")[-1]
-views = Path("/data/revolta/views/awq")
-snapshot_download(repo, revision=revision, local_dir=ckpt)
+| Checkpoint | `repo` | `revision` | Draft line |
+| --- | --- | --- | --- |
+| Uncensored AWQ g32 | `leoncca/Qwen3.8-Flash-Next-Uncensored-AWQ-g32` | `1fd7ab705731c9dacc3bcd5b5d15783c60706d64` | Keep it |
+| Base AWQ g32 | `leoncca/Qwen3.8-Flash-Next-AWQ-g32` | `c6d84ec547717f71710f82ec3783027b61bbfc49` | Keep it |
+| Standard NVFP4 | `RadixArk/Qwen3.8-Flash-Next-NVFP4` | `7b719225242aacd3dbd3f9407468c2ee9a9d2594` | Replace it with the three lines below: the draft is in the NVFP4 scale pack |
+| NVIDIA FP4-Local | `nvidia/Qwen3.8-Flash-Next-FP4-Local` | `b9ce18a6887e18c089fdea8509a33e63429a3300` | Delete it: the built-in MTP layer loads from the target view |
+| NVIDIA NVFP4-QAD | `nvidia/Qwen3.8-Flash-Next-NVFP4-QAD` | `eec0322cb03229cae4cd8e2fa45547542e472eac` | Delete it, as for FP4-Local. The repository is not publicly downloadable at the time of writing |
 
-YARN = {"rope_type": "yarn", "factor": 2, "original_max_position_embeddings": 262144}
+For Standard NVFP4, replace the draft line with:
 
-def make_view(src: Path, dst: Path) -> None:
-    dst.mkdir(parents=True, exist_ok=False)
-    for item in src.iterdir():
-        if item.name not in ("config.json", ".cache", ".git"):
-            (dst / item.name).symlink_to(item.resolve(), target_is_directory=item.is_dir())
-    config = json.loads((src / "config.json").read_text())
-    text = config["text_config"]
-    rope = dict(text["rope_parameters"])
-    # Keep the outer default; YaRN applies only to text_config.
-    config["rope_parameters"] = dict(rope)
-    rope.update(YARN)
-    text["rope_parameters"] = dict(rope)
-    text["rope_scaling"] = dict(rope)
-    (dst / "config.json").write_text(json.dumps(config, indent=2) + "\n")
-
-make_view(ckpt, views / "target-512k")
-make_view(ckpt / "mtp-fp8", views / "draft-512k")
-EOF
-
-VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES=1 \
-vllm serve /data/revolta/views/awq/target-512k \
-  --dtype half --tensor-parallel-size 4 --decode-context-parallel-size 2 \
-  --gpu-memory-utilization 0.95 --max-model-len 524288 \
-  --max-num-seqs 8 --max-num-batched-tokens 8192 \
-  --enable-chunked-prefill --enable-prefix-caching --mamba-cache-mode align \
-  --no-async-scheduling --kv-cache-dtype fp8_e4m3 \
-  --attention-backend FLASH_ATTN_V100 --kernel-config '{"ple_disk_cascade":false}' \
-  --speculative-config '{"method":"mtp","model":"/data/revolta/views/awq/draft-512k","quantization":"modelopt_mixed","num_speculative_tokens":4,"draft_sample_method":"greedy","attention_backend":"FLASH_ATTN_V100","kv_cache_dtype":"fp8_e4m3"}'
-```
-
-## Standard NVFP4 checkpoint setup
-
-The pack includes the 24 target scales and the optional Uncensored FP8 MTP
-draft with its own two K/V scales. Download only the base model separately.
-The draft is copied from Uncensored AWQ revision
-`1fd7ab705731c9dacc3bcd5b5d15783c60706d64`, including its license and provenance.
-ReVolta validated this pairing with **62.5% acceptance**; that number is a
-serving-test result, not an answer-quality measurement.
-
-```bash
-python - <<'EOF'
-import json
-import subprocess
-import sys
-from pathlib import Path
-from huggingface_hub import snapshot_download
-
-base = Path("/data/revolta/models/nvfp4-base")
-pack = Path("/data/revolta/models/nvfp4-pack-v1.2")
-merged = Path("/data/revolta/models/nvfp4-e4m3")
-views = Path("/data/revolta/views/nvfp4")
-snapshot_download("RadixArk/Qwen3.8-Flash-Next-NVFP4",
-                  revision="7b719225242aacd3dbd3f9407468c2ee9a9d2594", local_dir=base)
-snapshot_download("leoncca/Qwen3.8-Flash-Next-NVFP4-QSA-FP8-E4M3-KV-Scales",
-                  revision="v1.2-base-7b719225", local_dir=pack)
-subprocess.run([sys.executable, str(pack / "materialize_overlay.py"),
-                "--pack-dir", str(pack), "--base-checkpoint", str(base),
-                "--output-dir", str(merged)], check=True)
-
-YARN = {"rope_type": "yarn", "factor": 2, "original_max_position_embeddings": 262144}
-
-def make_view(src: Path, dst: Path) -> None:
-    dst.mkdir(parents=True, exist_ok=False)
-    for item in src.iterdir():
-        if item.name not in ("config.json", ".cache", ".git"):
-            (dst / item.name).symlink_to(item.resolve(), target_is_directory=item.is_dir())
-    config = json.loads((src / "config.json").read_text())
-    text = config["text_config"]
-    rope = dict(text["rope_parameters"])
-    # Keep the outer default; YaRN applies only to text_config.
-    config["rope_parameters"] = dict(rope)
-    rope.update(YARN)
-    text["rope_parameters"] = dict(rope)
-    text["rope_scaling"] = dict(rope)
-    (dst / "config.json").write_text(json.dumps(config, indent=2) + "\n")
-
-make_view(merged, views / "target-512k")
+```python
+pack = Path("/data/revolta/models/Qwen3.8-Flash-Next-NVFP4-QSA-FP8-E4M3-KV-Scales")
+snapshot_download("leoncca/Qwen3.8-Flash-Next-NVFP4-QSA-FP8-E4M3-KV-Scales", local_dir=pack, revision="v1.2-base-7b719225")
 make_view(pack / "mtp-fp8", views / "draft-512k")
-EOF
-
-VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES=1 \
-vllm serve /data/revolta/views/nvfp4/target-512k \
-  --dtype half \
-  --tensor-parallel-size 4 --decode-context-parallel-size 2 \
-  --gpu-memory-utilization 0.95 --max-model-len 524288 \
-  --max-num-seqs 8 --max-num-batched-tokens 8192 \
-  --enable-chunked-prefill --enable-prefix-caching --mamba-cache-mode align \
-  --no-async-scheduling --kv-cache-dtype fp8_e4m3 \
-  --attention-backend FLASH_ATTN_V100 --kernel-config '{"ple_disk_cascade":false}' \
-  --speculative-config '{"method":"mtp","model":"/data/revolta/views/nvfp4/draft-512k","quantization":"modelopt_mixed","num_speculative_tokens":4,"draft_sample_method":"greedy","attention_backend":"FLASH_ATTN_V100","kv_cache_dtype":"fp8_e4m3"}'
 ```
 
-## NVIDIA FP4-Local checkpoint setup
+If prompt and output together stay within 262,144 tokens, you can serve the checkpoint directory itself with `--max-model-len 262144`; see [YaRN and native context](configuration.md#yarn-and-native-context).
 
-The pack (`v1.1-base-b9ce18a6`) contains the 24 target scales and the two K/V
-scales of the checkpoint's built-in MTP layer, so both target and draft can use
-E4M3 KV. Omit the draft `model` field: the drafter uses the same materialized
-512K view, its YaRN settings and its draft scales. In a paired test that changed
-only the draft KV type, MTP acceptance was 63.1% (greedy) and 62.0% (sampled)
-with E4M3 draft KV, against 64.4% and 61.9% with FP16 draft KV. The 0.1.3 release-image
-smoke measured 1,474,106 GPU KV tokens (2.81× at 512K) with E4M3 target and draft KV,
-against 1,321,612 (2.52×) with an FP16 draft cache.
+### Launch
 
-`"kv_cache_dtype": "float16"` for the draft still works. The older
-`v1.0-base-b9ce18a6` tag has no draft scales; with it, keep the draft in
-`float16`, because an E4M3 draft cache without calibrated draft scales is
-rejected at startup.
+<a id="gpu-memory-per-card"></a><a id="--gpu-memory-utilization"></a>
 
-```bash
-python - <<'EOF'
-import json
-import subprocess
-import sys
-from pathlib import Path
-from huggingface_hub import snapshot_download
+Use the [reference command](getting-started.md#4-launch) and change only the paths and the draft (`<views>` is the directory you set in the script):
 
-base = Path("/data/revolta/models/fp4-local-base")
-pack = Path("/data/revolta/models/fp4-local-pack-v1.1")
-merged = Path("/data/revolta/models/fp4-local-e4m3")
-views = Path("/data/revolta/views/fp4-local")
-snapshot_download("nvidia/Qwen3.8-Flash-Next-FP4-Local",
-                  revision="b9ce18a6887e18c089fdea8509a33e63429a3300", local_dir=base)
-snapshot_download("leoncca/Qwen3.8-Flash-Next-FP4-Local-QSA-FP8-E4M3-KV-Scales",
-                  revision="v1.1-base-b9ce18a6", local_dir=pack)
-subprocess.run([sys.executable, str(pack / "materialize_overlay.py"),
-                "--pack-dir", str(pack), "--base-checkpoint", str(base),
-                "--output-dir", str(merged)], check=True)
+| Checkpoint | Model path | `--speculative-config` |
+| --- | --- | --- |
+| Uncensored AWQ, Base AWQ, Standard NVFP4 | `<views>/target-512k` | Set `"model"` to `<views>/draft-512k`; keep the other fields |
+| NVIDIA FP4-Local, NVIDIA NVFP4-QAD | `<views>/target-512k` | Remove `"model"` and `"quantization"`: the built-in MTP layer loads from the target view |
 
-YARN = {"rope_type": "yarn", "factor": 2, "original_max_position_embeddings": 262144}
+<a id="gpu-memory"></a><a id="cuda-graph-reserve"></a>
 
-def make_view(src: Path, dst: Path) -> None:
-    dst.mkdir(parents=True, exist_ok=False)
-    for item in src.iterdir():
-        if item.name not in ("config.json", ".cache", ".git"):
-            (dst / item.name).symlink_to(item.resolve(), target_is_directory=item.is_dir())
-    config = json.loads((src / "config.json").read_text())
-    text = config["text_config"]
-    rope = dict(text["rope_parameters"])
-    # Keep the outer default; YaRN applies only to text_config.
-    config["rope_parameters"] = dict(rope)
-    rope.update(YARN)
-    text["rope_parameters"] = dict(rope)
-    text["rope_scaling"] = dict(rope)
-    (dst / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+Nothing else changes:
 
-# The built-in MTP uses this same view; no separate draft directory is needed.
-make_view(merged, views / "target-512k")
-EOF
+- The weight format comes from the checkpoint's quantization metadata, so `--quantization` is not needed. For a ModelOpt checkpoint the detected method replaces any `--quantization` value.
+- The ReVolta profile selects the NVFP4 kernel settings and the [CUDA graph reserve](configuration.md#cuda-graph-reserve) by itself.
+- The KV cache is INT8 for every checkpoint (`--kv-cache-dtype auto`), and the MTP draft inherits it. No KV scales are needed.
 
-VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES=1 \
-vllm serve /data/revolta/views/fp4-local/target-512k \
-  --quantization modelopt_mixed --dtype half \
-  --tensor-parallel-size 4 --decode-context-parallel-size 2 \
-  --gpu-memory-utilization 0.95 --max-model-len 524288 \
-  --max-num-seqs 8 --max-num-batched-tokens 8192 \
-  --enable-chunked-prefill --enable-prefix-caching --mamba-cache-mode align \
-  --no-async-scheduling --kv-cache-dtype fp8_e4m3 \
-  --attention-backend FLASH_ATTN_V100 --kernel-config '{"ple_disk_cascade":false}' \
-  --speculative-config '{"method":"mtp","num_speculative_tokens":4,"draft_sample_method":"greedy","attention_backend":"FLASH_ATTN_V100","kv_cache_dtype":"fp8_e4m3"}'
-```
+NVFP4-QAD was validated in 0.2.0rc12 with `--kv-cache-dtype fp8_per_token_head`. The 0.2.0 default gives it INT8, which has not been tested on QAD; set `fp8_per_token_head` to reproduce the validated setup.
 
-## NVIDIA NVFP4-QAD checkpoint setup
+### MTP drafts
 
-`nvidia/Qwen3.8-Flash-Next-NVFP4-QAD` is a mixed-precision ModelOpt checkpoint:
-NVFP4 routed and shared experts, MXFP8 GDN and QSA projections (expanded to FP16
-at load), an FP8 PLE table, and a built-in MTP layer whose experts use FP8 block
-scales. It ships no QSA K/V scales, so this recipe uses `fp8_per_token_head`,
-which needs no calibration. The built-in MTP layer follows the target's KV format.
+<a id="kv-scales-and-draft-selection"></a>
 
-Validated on four V100s (TP4/DCP2, MTP4, `fp8_per_token_head`, long-context host
-KV): every quantized path loads and serves, and greedy, sampled, tool-call, 32K
-prefix-reuse and 4-way concurrent requests pass. Weights take 21.5 GiB per GPU,
-about 0.5 GiB less than the Uncensored AWQ checkpoint in the same configuration.
-Quantization quality against BF16 has not been measured yet.
-
-```bash
-python - <<'EOF'
-import json
-from pathlib import Path
-from huggingface_hub import snapshot_download
-
-base = Path("/data/revolta/models/nvfp4-qad")
-views = Path("/data/revolta/views/nvfp4-qad")
-snapshot_download("nvidia/Qwen3.8-Flash-Next-NVFP4-QAD",
-                  revision="eec0322cb03229cae4cd8e2fa45547542e472eac", local_dir=base)
-
-YARN = {"rope_type": "yarn", "factor": 2, "original_max_position_embeddings": 262144}
-
-def make_view(src: Path, dst: Path) -> None:
-    dst.mkdir(parents=True, exist_ok=False)
-    for item in src.iterdir():
-        if item.name not in ("config.json", ".cache", ".git"):
-            (dst / item.name).symlink_to(item.resolve(), target_is_directory=item.is_dir())
-    config = json.loads((src / "config.json").read_text())
-    text = config["text_config"]
-    rope = dict(text["rope_parameters"])
-    # Keep the outer default; YaRN applies only to text_config.
-    config["rope_parameters"] = dict(rope)
-    rope.update(YARN)
-    text["rope_parameters"] = dict(rope)
-    text["rope_scaling"] = dict(rope)
-    (dst / "config.json").write_text(json.dumps(config, indent=2) + "\n")
-
-# The built-in MTP uses this same view; no separate draft directory is needed.
-make_view(base, views / "target-512k")
-EOF
-
-vllm serve /data/revolta/views/nvfp4-qad/target-512k \
-  --dtype half \
-  --tensor-parallel-size 4 --decode-context-parallel-size 2 \
-  --gpu-memory-utilization 0.95 --max-model-len 524288 \
-  --max-num-seqs 8 --max-num-batched-tokens 8192 \
-  --enable-chunked-prefill --enable-prefix-caching --mamba-cache-mode align \
-  --no-async-scheduling --kv-cache-dtype fp8_per_token_head \
-  --attention-backend FLASH_ATTN_V100 --kernel-config '{"ple_disk_cascade":false}' \
-  --speculative-config '{"method":"mtp","num_speculative_tokens":4,"draft_sample_method":"greedy","attention_backend":"FLASH_ATTN_V100"}'
-```
+- Use the draft that belongs to the target: an AWQ checkpoint's own `mtp-fp8/`, the scale pack's `mtp-fp8/` for Standard NVFP4, or the built-in layer of FP4-Local and NVFP4-QAD. The AWQ drafts also contain calibrated draft K/V scales, which only scalar E4M3 KV uses.
+- The Standard NVFP4 draft is copied from Uncensored AWQ revision `1fd7ab705731c9dacc3bcd5b5d15783c60706d64`, including its license and provenance. With Standard NVFP4 it reached 62.5% acceptance in a 0.1.0 serving test; this is not an answer-quality measurement.
+- On V100, the engine packs floating-point and block-FP8 MTP routed experts into Q8_0 once at load time and logs `Defaulting SM70 Qwen4Exp MTP routed experts to Q8_0`. Packed NVFP4 draft experts keep their checkpoint format. Add `"mtp_expert_quantization": "fp8"` to the speculative config to keep FP8 draft experts, or `"fp16"` for the FP16 reference. This affects only the draft's routed expert weights, not the draft KV.
+- DFlash2 drafts need no K/V scales; see [DFlash2](dflash2.md).
 
 ## Weight and KV formats
 
-V100 stores compressed weights and KV, then converts them to FP16 for computation.
-The reference recipe is AWQ g32 with planar INT8 target KV (`auto` on SM70),
-which the MTP draft inherits. Calibrated scalar E4M3 KV is optional and frozen.
-Use `fp8_per_token_head` for dynamic planar E4M3.
+<a id="kv-cache-format"></a><a id="int8-kv"></a>
 
-## Quantization comparison
+V100 stores compressed weights and KV and converts them to FP16 for computation. The weight format is fixed by the checkpoint. The KV format is chosen with `--kv-cache-dtype`:
 
-No ReVolta version is specified for these measurements. See
-[Quality measurements](performance.md#quality-measurements) for the datasets, reference and estimator.
-The E4M3 results below use the original scalar format, not planar E4M3.
+| Value | Storage | Calibration | Status in 0.2.0 |
+| --- | --- | --- | --- |
+| `auto` (default) | Planar INT8 on V100 for Qwen3.8 Flash-Next, with FP32 scales per token and KV head computed at runtime | None | Default; used by the reference configuration |
+| `int8`, `int8_per_token_head` | The same planar INT8, selected explicitly | None | Same as `auto` on V100 |
+| `fp8_per_token_head` | Planar E4M3 with FP32 scales per token and KV head computed at runtime | None | Supported |
+| `fp8`, `fp8_e4m3` | Scalar E4M3 with calibrated per-layer K/V scales | Scale files | Frozen: still works, no longer optimized; the 0.2.0 release tests check function and answer quality, not speed |
+| `float16` | FP16 | None | Holds about half as many KV tokens as the 8-bit formats in the same memory |
 
-| Format | KL vs BF16 (reference below) | Top-1 agreement |
-| --- | ---: | ---: |
-| Uncensored AWQ g32 + E4M3 KV | 0.0273 | 96.63% |
-| Standard NVFP4 + E4M3 KV | 0.0303 | 96.36% |
-| NVIDIA FP4-Local + E4M3 KV | 0.0380 | 95.91% |
-| Uncensored AWQ g32 + INT8 KV | 0.0267 | Within 0.1 percentage point of E4M3 |
-| Uncensored AWQ g32 + FP16 KV | Within 0.001 of E4M3 | Same as E4M3 |
+- **INT8 versus E4M3.** On the measured sets, INT8 has slightly lower KL and similar top-1 agreement to scalar E4M3 (see [Quality measurements](performance.md#quality-measurements)). This does not establish a difference in task-level answer quality.
+- **Draft KV.** The MTP draft inherits the target format unless `speculative_config.kv_cache_dtype` sets another supported format. An FP16 draft (`"kv_cache_dtype": "float16"`) works with an INT8, `fp8_per_token_head` or scalar `fp8_e4m3` target. DFlash2 drafts use FP16 KV by default; see [What the profile sets](dflash2.md#what-the-profile-sets). Eligibility and page layouts are in [KV cache format](configuration.md#kv-cache-format).
+- **Offload.** CPU KV offload and the `revolta_fs` SSD tier store planar INT8 together with its scale planes; the plain `fs` tier rejects planar formats. See [KV offload](kv-offload.md).
+- **Capacity.** For measured GPU KV capacity by format, see [GPU KV capacity](performance.md#gpu-kv-capacity).
 
-The first four rows use the same base BF16 reference; the Uncensored rows there include the effect of fine-tuning as well as quantization. The FP16 KV row is a separate comparison of FP16 and E4M3 KV against the Uncensored checkpoint's own BF16 parent (on short prompts: KL 0.0220 against 0.0214, top-1 97.08% for both; on the long-context set: 0.0239 against 0.0238).
+### Scalar E4M3 KV (frozen)
 
-## E4M3 KV
+<a id="e4m3-kv"></a>
 
-Frozen; see [KV scales and draft selection](#kv-scales-and-draft-selection).
+Use scalar E4M3 only to reproduce earlier measurements. It needs calibrated K/V scales that belong to a specific checkpoint revision:
 
-For explicit scalar `fp8` / `fp8_e4m3`, use the calibrated per-layer K/V scales
-included in the checkpoint. Keep
-`VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES=1` enabled to reject missing scales.
-Without it, the loader warns and falls back to 1.0.
+| Target checkpoint | Target scales | MTP draft scales |
+| --- | --- | --- |
+| Uncensored AWQ g32 | Included in the checkpoint | Included in its `mtp-fp8/` |
+| Base AWQ g32 | Included in the checkpoint | Included in its `mtp-fp8/` |
+| Standard NVFP4 `7b719225` | [NVFP4 pack](https://huggingface.co/leoncca/Qwen3.8-Flash-Next-NVFP4-QSA-FP8-E4M3-KV-Scales) `v1.2-base-7b719225` (24 scales); materialize first | Included in the pack's `mtp-fp8/` |
+| NVIDIA FP4-Local `b9ce18a6` | [FP4-Local pack](https://huggingface.co/leoncca/Qwen3.8-Flash-Next-FP4-Local-QSA-FP8-E4M3-KV-Scales) `v1.1-base-b9ce18a6` (24 scales); materialize first | The built-in layer's two scales are in the same pack; the older `v1.0-base-b9ce18a6` tag has none |
+| NVIDIA NVFP4-QAD | Not available | Not available |
 
-On the long-context quality set, E4M3 and FP16 KV measured KL 0.0238 and 0.0239
-against the Uncensored checkpoint's own BF16 parent.
+For Standard NVFP4 and FP4-Local, materialize the pack onto the unmodified base checkpoint and make the target view from the result. In the preparation script, set `views` to a new directory (for example `/data/revolta/views/nvfp4-e4m3`) and replace the line `make_view(ckpt, views / "target-512k")` with the lines below, using the pack and tag from the table. Use a new output directory for each run.
 
-## INT8 KV
+```python
+import subprocess, sys
+pack_repo, pack_tag = "leoncca/Qwen3.8-Flash-Next-NVFP4-QSA-FP8-E4M3-KV-Scales", "v1.2-base-7b719225"
+pack = Path("/data/revolta/models") / pack_repo.split("/")[-1]
+snapshot_download(pack_repo, local_dir=pack, revision=pack_tag)
+merged = Path(f"{ckpt}-e4m3")  # must not exist yet
+subprocess.run([sys.executable, str(pack / "materialize_overlay.py"),
+                "--pack-dir", str(pack), "--base-checkpoint", str(ckpt),
+                "--output-dir", str(merged)], check=True)
+make_view(merged, views / "target-512k")
+```
 
-With MTP4, set `--kv-cache-dtype int8` to select planar INT8 explicitly.
-The draft inherits INT8 unless `speculative_config.kv_cache_dtype` specifies
-another supported format, such as FP16. Scales are computed per token and head
-at runtime.
+The materializer refuses to run if the base index (and, for FP4-Local, the base `config.json`) or the scale files differ from its manifest. The materialized directory links to the base files, so keep the base checkpoint.
 
-On the measured sets, INT8 has slightly lower KL and similar top-1 agreement to
-E4M3. This has not established a difference in task-level answer quality.
+To launch, start from the reference command and:
 
-The built-in offloading connector supports CPU and SSD persistence of planar
-INT8, including its scale planes. See [KV offload](kv-offload.md).
+- set `--kv-cache-dtype fp8_e4m3`; the MTP draft inherits it and loads its own scales;
+- export `VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES=1`, so that startup fails if any target scale is missing. Without it, missing target scales fall back to 1.0 with a warning; that fallback is unvalidated and can saturate E4M3 values.
 
-## Standard NVFP4
+An MTP draft without calibrated scales is always rejected with E4M3 draft KV, even without the strict setting. For such a draft, or with the `v1.0` FP4-Local pack, set `"kv_cache_dtype": "float16"` in `--speculative-config`.
 
-The checkpoint is about 126 GiB. Follow the
-[checkpoint setup](#standard-nvfp4-checkpoint-setup) for the pinned base,
-combined scale/draft pack and 512K views. This section covers the settings that
-matter once it loads.
+## Format-specific notes
 
-### Automatic configuration
+### Standard NVFP4
 
-`--quantization` is not needed. The engine reads `quant_algo: NVFP4` from the
-checkpoint and selects `modelopt_fp4`; this replaces a `--quantization` value given on
-the command line. On the FP16 QSA SM70 TP4 profile, ReVolta detects NVFP4
-weights from checkpoint quantization metadata and sets the validated kernel
-switches for unset variables:
+<a id="standard-nvfp4-checkpoint-setup"></a><a id="speed-compared-with-awq"></a>
 
-- raw E4M3 block scales (`VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE=1`), which
-  avoid keeping a second FP16 copy of the scales;
-- raw grouped decode for 2–40 rows
-  (`VLLM_SM70_NVFP4_QWEN38_MOE_RAW_GROUPED_DECODE=1`);
-- QPN dynamic decode for every live width 2–16
-  (`VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE=1`);
-- TurboMind NVFP4 routes, grouped prefill and small-shape tuning, and a CUDA
-  graph reserve chosen by speculative method (next section).
+The checkpoint is about 126 GiB. The engine reads `quant_algo: NVFP4` from the checkpoint and selects `modelopt_fp4`.
 
-Explicit environment settings take precedence. The startup profile audit logs
-each value and its source (`profile`, `environment`, or `upstream_default`).
-The complete list is in
-[Values applied by the ReVolta profile](configuration.md#values-applied-by-the-revolta-profile).
+<a id="automatic-configuration"></a><a id="settings-you-may-change"></a>
 
-### CUDA graph reserve
+On V100 with TP4 and FP16, the ReVolta profile detects NVFP4 weights from the checkpoint's quantization metadata and sets the NVFP4 kernel switches (marked *NVFP4* in [Values applied by the ReVolta profile](configuration.md#values-applied-by-the-revolta-profile)) and the [CUDA graph reserve](configuration.md#cuda-graph-reserve). Explicit environment settings take precedence, and the startup profile line logs each audited value with its source. Raw E4M3 block scales, the profile default, cannot be combined with dual-batch overlap or microbatching; set `VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE=0` for those.
 
-MRv2 does not profile graph memory, so the profile reserves it before sizing the
-KV cache through `VLLM_V2_CUDAGRAPH_MEM_MIB`:
+In 0.2.0rc12 development measurements, NVFP4 weights took about 0.5 GiB less GPU memory per GPU than Uncensored AWQ and ran at similar speed in most cases; see [Standard NVFP4 against AWQ](performance.md#standard-nvfp4-against-awq-020rc12).
 
-| Speculative method | KV cache dtype | Reserve per GPU |
-| --- | --- | ---: |
-| MTP | `fp8_per_token_head` or `int8` | 600 MiB |
-| MTP | other (for example `fp8_e4m3`) | 700 MiB |
-| DFlash2 | `fp8_per_token_head` or `int8` | 1024 MiB (1000 MiB for AWQ), single-request tail graphs off |
-| DFlash2 | other | 1200 MiB, single-request tail graphs off |
+### NVIDIA FP4-Local
 
-If the startup log shows `CUDA graphs took … more than the reserve`, set
-`VLLM_V2_CUDAGRAPH_MEM_MIB` to at least the value in the message, or lower
-`--gpu-memory-utilization`. Otherwise the KV pool takes memory the graphs need
-and a large mixed step can run out of GPU memory. Measured capture size per GPU
-with `fp8_per_token_head`: 0.51 GiB for NVFP4 with MTP4 and 0.95 GiB for NVFP4
-with DFlash2 (tail graphs off). Other capture sizes, such as additional draft
-widths from [dynamic speculative decoding](dynamic-speculative-decoding.md),
-add graphs: check the startup log after changing them.
+<a id="nvidia-fp4-local-checkpoint-setup"></a>
 
-### KV cache format
+The checkpoint is about 95 GiB. ReVolta runs its experts as W4A16 (activations stay FP16) and expands its MXFP8 layers to FP16. The engine detects the format (`modelopt_mixed`) from the checkpoint, and the same automatic NVFP4 profile applies.
 
-On SM70, `--kv-cache-dtype auto` selects planar INT8 for eligible QSA models.
-It computes scales at runtime, so the NVFP4 checkpoint works without the
-scale pack. The explicit planar `fp8_per_token_head` option also computes
-scales at runtime. Calibrated `fp8_e4m3` uses the scales that the
-[pack](#standard-nvfp4-checkpoint-setup) supplies. MTP inherits the target format
-by default and supports an explicit FP16 draft on eligible configurations.
-See [KV scales and draft selection](#kv-scales-and-draft-selection).
+The vision tower uses tensor parallelism by default. ReVolta expands 27 affected vision `fc2` weights to FP16 so that they can be sharded correctly; this configuration passed the large-image and video stress tests in 0.1.0 testing.
 
-### GPU memory per card
+The NVFP4 PLE table uses about 26.8 GiB of pinned host memory across the four ranks.
 
-Measured on 4×V100 with TP4, MTP4, `fp8_per_token_head` and long-context host
-KV, per GPU:
+### NVIDIA NVFP4-QAD
 
-| Item | Standard NVFP4 (RadixArk) |
-| --- | ---: |
-| Weights | 21.48 GiB |
-| torch peak | 1.41 GiB |
-| Non-torch | 0.15 GiB |
-| Warmup | 0.71 GiB |
-| CUDA graph reserve | 0.59 GiB |
-| GPU KV cache | 5.81 GiB |
+<a id="nvidia-nvfp4-qad-checkpoint-setup"></a>
 
-Uncensored AWQ weights take 22.01 GiB in the same configuration. Raw scales save
-about 1.69 GiB per GPU compared with prepared scales, and the MoE decode scratch
-is shared by all layers.
+`nvidia/Qwen3.8-Flash-Next-NVFP4-QAD` is a mixed-precision ModelOpt checkpoint: NVFP4 routed and shared experts, MXFP8 GDN and QSA projections (expanded to FP16 at load), an FP8 PLE table, and a built-in MTP layer whose experts use FP8 block scales. It ships no QSA K/V scales, so scalar E4M3 KV is not available.
 
-### `--gpu-memory-utilization`
-
-Use `0.95`. With long-context host KV, eight concurrent decodes plus three
-74K-token prompts completed at `0.95` with MTP4 and at `0.956` with DFlash2.
-Earlier versions reserved too little CUDA graph memory for NVFP4 with DFlash2
-and could run out of memory on a large mixed step at `0.95`; on those versions
-use 0.92–0.93.
-
-### Speed compared with AWQ
-
-Same configuration and time window on 4×V100 PCIe, 250 W per GPU, TP4/DCP2.
-Single-request figures are per speculative round.
-
-| Measurement | Uncensored AWQ | Standard NVFP4 |
-| --- | ---: | ---: |
-| MTP4, 1 request, sampling | 28.36 ms | 28.67 ms |
-| MTP4, 1 request, greedy | 27.68 ms | 28.00 ms |
-| MTP4, 4 requests | 206.9 tok/s | 207.6 tok/s |
-| MTP4, 8 requests | 316.5 tok/s | 325.4 tok/s |
-| DFlash2, 1 request, sampling / greedy | 29.41 / 28.25 ms | 29.65 / 28.69 ms |
-| DFlash2, 1 request | 97.8 tok/s | 90.4 tok/s |
-| DFlash2, 4 requests | 243.4 tok/s | 238.3 tok/s |
-| DFlash2, 8 requests | 321.2 tok/s | 331.8 tok/s |
-
-- With MTP4, NVFP4 rounds are about 1.1% slower and single-request tok/s is
-  level. Single-request short-prompt throughput also depends on the MTP draft's
-  acceptance rate, which comes from the draft shipped with the checkpoint, not
-  from the NVFP4 kernel speed.
-- Graph all-reduces of 100–200 KiB now use the in-stream push kernel on PCIe
-  switches. Measured on NVFP4 after that change: MTP4 at 4 requests 214.7 →
-  224.0 tok/s and at 8 requests 316.9 → 328.7 tok/s; DFlash2 at 5 requests
-  243.7 → 269.9 tok/s. The table above predates it.
-- At four or more requests, three MTP drafts are faster than four (NVFP4, 4
-  requests: 240.9 against 217.5 tok/s), while one request accepts more with
-  four. [Dynamic speculative decoding](dynamic-speculative-decoding.md) switches
-  between them by batch size.
-- Prepared scales (`VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE=0`) run a single request
-  about 0.5 ms per round faster, but are slower at 4 and 8 requests and use
-  1.69 GiB more per GPU, so the profile does not select them.
-
-### Settings you may change
-
-Names are as defined in `vllm/envs.py`; see
-[configuration](configuration.md#values-applied-by-the-revolta-profile) for the rest.
-
-| Variable | When to change |
-| --- | --- |
-| `VLLM_V2_CUDAGRAPH_MEM_MIB` | Raise it when the startup warning above appears. A reserve that is too high wastes KV capacity. |
-| `VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE` | `0` keeps prepared FP16 scales: faster single request, slower at 4–8 requests, 1.69 GiB more per GPU. Raw scales cannot be combined with DBO or microbatching; the loader rejects that and asks you to disable this variable. |
-| `VLLM_SM70_NVFP4_QWEN38_MOE_RAW_GROUPED_DECODE` | Needs raw scale storage; with `RAW_SCALE=0` the raw grouped route is not used. |
-| `VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS` | The profile sets `0` for DFlash2. Set `1` to capture single-request verifier tails again, and raise the reserve to 1500 MiB (see [DFlash2](dflash2.md)). |
-
-## NVIDIA FP4-Local
-
-[NVIDIA FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local)
-is about 95 GiB. ReVolta runs its experts as W4A16, leaves activations in FP16,
-and expands MXFP8 layers to FP16.
-
-The vision tower uses TP4 by default. ReVolta converts 27 affected vision `fc2`
-weights to FP16 so that their dimensions can be sharded correctly. This configuration
-passed the large-image and video stress tests.
-
-The PLE table uses about 26.8 GiB of pinned host memory across four ranks.
-Use `--quantization modelopt_mixed` (matches the automatic detection); the same automatic NVFP4 profile applies.
-Follow the [checkpoint setup](#nvidia-fp4-local-checkpoint-setup) for pinned
-downloads, the scale overlay, 512K views and the MTP draft KV options.
+In 0.2.0rc12 it was checked on four V100s with TP4/DCP2, MTP4, `fp8_per_token_head` KV and long-context Host KV: every quantized path loaded and served, and greedy, sampled, tool-call, 32K prefix-reuse and 4-way concurrent requests passed. Weights took 21.5 GiB per GPU, about 0.5 GiB less than Uncensored AWQ in the same configuration. Quantization quality against BF16 has not been measured.
 
 ## See also
 
-- [Reference launch tutorial](getting-started.md)
-- [DFlash2 setup](dflash2.md)
-- [GPU KV capacity and quality measurements](performance.md)
+- [Getting started](getting-started.md): the reference launch
+- [DFlash2](dflash2.md) and [Dynamic speculative decoding](dynamic-speculative-decoding.md): speculative decoding settings
+- [Configuration reference](configuration.md): KV dtype details and profile values
+- [Performance](performance.md): GPU KV capacity, speed and quality measurements

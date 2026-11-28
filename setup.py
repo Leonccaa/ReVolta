@@ -1238,7 +1238,7 @@ def get_vllm_version() -> str:
     version = (
         os.getenv("SETUPTOOLS_SCM_PRETEND_VERSION_FOR_REVOLTA")
         or os.getenv("SETUPTOOLS_SCM_PRETEND_VERSION")
-        or "0.2.0rc14"
+        or "0.2.0"
     )
     sep = "+" if "+" not in version else "."  # dev versions might contain +
 

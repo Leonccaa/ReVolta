@@ -301,7 +301,17 @@ def frontend_interconnect_mode(
     if requested == "nvlink":
         return "nvlink"
     if requested == "auto" and device_ids:
-        decision = _select_sm70_interconnect(device_ids, disable_custom_all_reduce)
+        try:
+            if not _cuda_ids_name_nvml_devices(device_ids):
+                return "pex_p2p"
+            decision = _select_sm70_interconnect(device_ids, disable_custom_all_reduce)
+        except Exception as error:
+            # Workers repeat the query and resolve the path; keep the old default.
+            logger.warning_once(
+                "SM70 frontend topology query failed (%s); keeping PCIe defaults.",
+                type(error).__name__,
+            )
+            return "pex_p2p"
         if decision.mode == "nvlink":
             return "nvlink"
         logger.warning_once(
@@ -331,6 +341,26 @@ def local_tp4_device_ids(parallel: "ParallelConfig") -> tuple[int, ...]:
     ):
         return (0, 1, 2, 3)
     return ()
+
+
+def _cuda_ids_name_nvml_devices(device_ids: tuple[int, ...]) -> bool:
+    """Whether numeric CUDA ordinals map to the same NVML devices.
+
+    CUDA enumerates FASTEST_FIRST by default, so a numeric ordinal names an
+    NVML index only in PCI bus order. UUID masks name devices exactly, and a
+    selection of every GPU is the same set in any order.
+    """
+    from vllm.platforms import current_platform
+
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if os.environ.get("CUDA_DEVICE_ORDER") == "PCI_BUS_ID" or (
+        visible and all(v.strip().startswith("GPU-") for v in visible.split(","))
+    ):
+        return True
+    physical_ids = sorted(
+        current_platform.device_id_to_physical_device_id(i) for i in device_ids
+    )
+    return physical_ids == sorted(current_platform.get_all_gpu_pci_bus_ids())
 
 
 def _select_sm70_interconnect(
@@ -574,9 +604,6 @@ def apply_revolta_nvlink_kernel_profile(
     fp16_target = kv_dtype in ("auto", "float16")
     defaults: dict[str, Any] = {
         "sm70_hc_ll_async": True,
-        "sm70_sparse_target_sampling": "device_top64"
-        if spec.method == "mtp"
-        else False,
         "sm70_qsa_paged_fp16_h12": (
             dcp2
             and fp16_target
@@ -584,21 +611,12 @@ def apply_revolta_nvlink_kernel_profile(
         ),
     }
     if spec.method == "mtp":
-        draft_dtype = spec.kv_cache_dtype or kv_dtype
-        if dcp2 and not host.enabled and draft_dtype in ("auto", "float16"):
-            defaults["sm70_qsa_paged_fp16_h6"] = True
-    # The INT8 reader and its config field are introduced together.
-    if hasattr(kernel, "sm70_qsa_paged_int8_h12"):
-        defaults["sm70_qsa_paged_int8_h12"] = dcp2 and kv_dtype == "int8"
+        defaults["sm70_sparse_target_sampling"] = "device_top64"
 
     values = {}
     for name, default in defaults.items():
         value = getattr(kernel, name)
-        explicit = (
-            name in kernel._nvlink_profile_fields
-            or bool(value)
-            or (name == "sm70_qsa_paged_fp16_h6" and value is not None)
-        )
+        explicit = name in kernel._nvlink_profile_fields
         if not explicit:
             setattr(kernel, name, default)
         values[name] = {

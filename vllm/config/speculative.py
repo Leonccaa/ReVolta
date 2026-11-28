@@ -1962,6 +1962,7 @@ class SpeculativeConfig:
             disable_custom_all_reduce=target_parallel_config.disable_custom_all_reduce,
             ray_workers_use_nsight=target_parallel_config.ray_workers_use_nsight,
             placement_group=target_parallel_config.placement_group,
+            enable_hc_sp=False,
         )
 
         return draft_parallel_config

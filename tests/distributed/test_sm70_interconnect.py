@@ -45,6 +45,12 @@ def topology(monkeypatch):
     )
     nvml = _FakeNvml(PCIE_SWITCH_TOPOLOGY)
     monkeypatch.setattr(cuda_platform, "pynvml", nvml)
+    monkeypatch.setattr(
+        car.current_platform,
+        "get_all_gpu_pci_bus_ids",
+        lambda: dict.fromkeys(range(len(PCIE_SWITCH_TOPOLOGY)), ""),
+        raising=False,
+    )
     driver = Mock(return_value=True)
     fresh = Mock(return_value=True)
     monkeypatch.setattr(torch.cuda, "can_device_access_peer", driver)
@@ -78,6 +84,13 @@ def test_frontend_uses_selected_physical_devices(topology, monkeypatch, caplog):
     from vllm.revolta_profile import logger
 
     monkeypatch.setattr(logger, "warning_once", logger.warning)
+    monkeypatch.setenv("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+    monkeypatch.setattr(
+        car.current_platform,
+        "get_all_gpu_pci_bus_ids",
+        lambda: dict.fromkeys(range(8), ""),
+        raising=False,
+    )
     monkeypatch.setattr(
         car.current_platform,
         "device_id_to_physical_device_id",
@@ -87,14 +100,10 @@ def test_frontend_uses_selected_physical_devices(topology, monkeypatch, caplog):
     monkeypatch.setattr(topology.nvml, "nvmlDeviceGetP2PStatus", get_p2p)
     topology.nvml.nvlink = True
     assert frontend_interconnect_mode(device_ids=(0, 1, 2, 3)) == "nvlink"
-    assert [call.args[:2] for call in get_p2p.call_args_list] == [
-        (6, 4),
-        (6, 7),
-        (6, 5),
-        (4, 7),
-        (4, 5),
-        (7, 5),
-    ]
+    pairs = {frozenset(call.args[:2]) for call in get_p2p.call_args_list}
+    assert pairs == {
+        frozenset((a, b)) for a in (4, 5, 6, 7) for b in (4, 5, 6, 7) if a < b
+    }
     topology.driver.assert_not_called()
     get_p2p.side_effect = lambda a, b, _: int((a, b) == (4, 7))
     monkeypatch.setattr(
@@ -102,6 +111,27 @@ def test_frontend_uses_selected_physical_devices(topology, monkeypatch, caplog):
     )
     assert frontend_interconnect_mode(device_ids=(0, 1, 2, 3)) == "pex_p2p"
     assert "do not form a 6/6 direct NVLink mesh" in caplog.text
+
+
+def test_frontend_numeric_subset_needs_pci_bus_order(topology, monkeypatch):
+    # Eight GPUs: FASTEST_FIRST ordinals 0-3 need not be NVML indices 0-3.
+    monkeypatch.delenv("CUDA_DEVICE_ORDER", raising=False)
+    monkeypatch.setattr(
+        car.current_platform,
+        "get_all_gpu_pci_bus_ids",
+        lambda: dict.fromkeys(range(8), ""),
+        raising=False,
+    )
+    get_p2p = Mock(side_effect=topology.nvml.nvmlDeviceGetP2PStatus)
+    monkeypatch.setattr(topology.nvml, "nvmlDeviceGetP2PStatus", get_p2p)
+    topology.nvml.nvlink = True
+    assert frontend_interconnect_mode(device_ids=(0, 1, 2, 3)) == "pex_p2p"
+    get_p2p.assert_not_called()
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-a,GPU-b,GPU-c,GPU-d")
+    assert frontend_interconnect_mode(device_ids=(0, 1, 2, 3)) == "nvlink"
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    monkeypatch.setenv("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+    assert frontend_interconnect_mode(device_ids=(0, 1, 2, 3)) == "nvlink"
 
 
 def test_nvlink_candidate_drops_hc_ll_after_failed_p2p(topology, monkeypatch):

@@ -2187,7 +2187,6 @@ class VllmConfig:
             and uses_adaptive_dflash_lookup(self.speculative_config)
             and self.speculative_config.lookup_env("VLLM_DFLASH2_LOOKUP_ADAPTIVE")
         )
-        async_explicit = self.scheduler_config.async_scheduling is not None
         if self.scheduler_config.async_scheduling:
             # Async scheduling explicitly enabled, hard fail any incompatibilities.
             # Currently, async scheduling only support eagle speculative
@@ -2303,10 +2302,13 @@ class VllmConfig:
             else:
                 self.scheduler_config.async_scheduling = True
 
-        h6_explicit = self.kernel_config.sm70_qsa_paged_fp16_h6 is not None
         nvlink_config_values: dict[str, dict[str, Any]] = {}
         if nvlink_profile:
             nvlink_config_values = apply_revolta_nvlink_kernel_profile(self)
+            nvlink_config_values["enable_hc_sp"] = {
+                "value": self.parallel_config.enable_hc_sp,
+                "source": "explicit" if hc_sp_explicit else "profile",
+            }
         if self.kernel_config.sm70_qsa_paged_fp16_h6 is None:
             self.kernel_config.sm70_qsa_paged_fp16_h6 = (
                 revolta_profile_enabled
@@ -2317,38 +2319,18 @@ class VllmConfig:
                 and self.cache_config.cache_dtype in ("auto", "float16")
                 and not self.kernel_config.long_context_kv.enabled
                 and has_nvfp4_weights(self.model_config)
-            )
-        if nvlink_profile:
-            nvlink_config_values.update(
-                enable_hc_sp={
-                    "value": self.parallel_config.enable_hc_sp,
-                    "source": "explicit" if hc_sp_explicit else "profile",
-                },
-                async_scheduling={
-                    "value": self.scheduler_config.async_scheduling,
-                    "source": (
-                        "explicit"
-                        if async_explicit
-                        else "profile"
-                        if spec is not None
-                        and spec.method == "mtp"
-                        and self.scheduler_config.async_scheduling
-                        else "upstream_default"
-                    ),
-                },
-            )
-            nvlink_config_values.setdefault(
-                "sm70_qsa_paged_fp16_h6",
-                {
-                    "value": self.kernel_config.sm70_qsa_paged_fp16_h6,
-                    "source": (
-                        "explicit"
-                        if h6_explicit
-                        else "profile"
-                        if self.kernel_config.sm70_qsa_paged_fp16_h6
-                        else "upstream_default"
-                    ),
-                },
+            ) or (
+                # Direct NVLink TP4 also takes H6 for an FP16 MTP draft cache.
+                nvlink_profile
+                and self.speculative_config is not None
+                and self.speculative_config.method == "mtp"
+                and self.parallel_config.decode_context_parallel_size == 2
+                and not self.kernel_config.long_context_kv.enabled
+                and (
+                    self.speculative_config.kv_cache_dtype
+                    or self.cache_config.cache_dtype
+                )
+                in ("auto", "float16")
             )
 
         logger.info_once(

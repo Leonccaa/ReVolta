@@ -1849,12 +1849,17 @@ class EngineArgs:
         if (
             mtp_with_prefix_cache
             and "gdn_state_replay" not in self.speculative_config
-            and (not nvlink_mtp or self.async_scheduling is False)
+            and (
+                not nvlink_mtp
+                or self.async_scheduling is False
+                # Deferred commit keeps the existing synchronous default.
+                or self.speculative_config.get("gdn_deferred_commit_metadata")
+            )
         ):
             defaults["gdn_state_replay"] = True
 
         schedule_key = "num_speculative_tokens_per_batch_size"
-        nvlink_dsd = nvlink_mtp and k in (4, 5) and not spec.ngram_assist
+        nvlink_dsd = nvlink_mtp and k in (4, 5)
         if (
             schedule_key not in self.speculative_config
             and "dflash_concurrency_drafts" not in self.speculative_config

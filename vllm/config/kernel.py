@@ -804,7 +804,6 @@ class KernelConfig:
                     "sm70_hc_ll_async",
                     "sm70_sparse_target_sampling",
                     "sm70_qsa_paged_fp16_h12",
-                    "sm70_qsa_paged_int8_h12",
                 )
                 if name in raw
             )

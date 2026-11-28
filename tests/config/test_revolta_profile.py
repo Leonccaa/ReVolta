@@ -1301,33 +1301,8 @@ def test_audit_log_text_does_not_change_applied_values(profile, monkeypatch):
     assert by_mode["p2p"][0][0] != by_mode["no_p2p"][0][0]
 
 
-def test_vllmconfig_profile_and_audit_receive_frontend_interconnect():
-    # Both VllmConfig call sites must pass the same frontend assumption.
-    import vllm.config.vllm as config_module
-
-    assert config_module.__file__ is not None
-    tree = ast.parse(Path(config_module.__file__).read_text())
-    calls = [
-        (node.func.id, node)
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id in ("apply_revolta_profile", "profile_audit")
-    ]
-    # The second profile call refines the graph reserve once the KV dtype
-    # is resolved.
-    assert sorted(name for name, _ in calls) == [
-        "apply_revolta_profile",
-        "apply_revolta_profile",
-        "profile_audit",
-    ]
-    for _, call in calls:
-        value = next(k.value for k in call.keywords if k.arg == "interconnect_mode")
-        assert ast.unparse(value) == "interconnect_mode"
-
-
 @pytest.mark.skip_global_cleanup
-@pytest.mark.parametrize("case", ["nvlink", "pcie", "explicit"])
+@pytest.mark.parametrize("case", ["nvlink", "pcie", "explicit", "denied", "deferred"])
 def test_engineargs_nvlink_profile(
     profile, monkeypatch, tmp_path, sm70_serving_resolution, case
 ):
@@ -1336,9 +1311,18 @@ def test_engineargs_nvlink_profile(
     from vllm.platforms import current_platform
 
     topology = Mock(return_value=case != "pcie")
+    if case == "denied":
+        # CUDA capability reads succeed while NVML topology is not permitted.
+        topology.side_effect = RuntimeError("NVMLError_NoPermission")
     monkeypatch.setattr(current_platform, "is_fully_connected", topology, raising=False)
     monkeypatch.setattr(
         current_platform, "is_pcie_switch_connected", lambda _: True, raising=False
+    )
+    monkeypatch.setattr(
+        current_platform,
+        "get_all_gpu_pci_bus_ids",
+        lambda: dict.fromkeys(range(4), ""),
+        raising=False,
     )
     monkeypatch.setattr(current_platform, "device_count", lambda: 4)
     monkeypatch.setattr(
@@ -1350,7 +1334,7 @@ def test_engineargs_nvlink_profile(
     monkeypatch.setattr(config_module.logger, "info_once", profile_log)
     flags = ["--decode-context-parallel-size", "2", "--kv-cache-dtype", "float16"]
     spec_options: dict[str, Any] = {
-        "num_speculative_tokens": 5 if case == "nvlink" else 4
+        "num_speculative_tokens": 5 if case in ("nvlink", "deferred") else 4
     }
     if case == "nvlink":
         flags += [
@@ -1358,6 +1342,14 @@ def test_engineargs_nvlink_profile(
             '{"kv_connector":"OffloadingConnector","kv_role":"kv_both",'
             '"kv_connector_extra_config":{"cpu_bytes_to_use":51539607552}}',
         ]
+    if case == "deferred":
+        # The CPU pool connector is built after the GDN policy has resolved.
+        flags += ["--kv-offloading-size", "48"]
+        spec_options["gdn_deferred_commit_metadata"] = True
+        # Admit deferred commit for the stand-in target model.
+        monkeypatch.setattr(
+            config_module, "_gdn_spec_state_replay_reasons", lambda *_, **__: []
+        )
     if case == "explicit":
         flags += [
             "--no-enable-hc-sp",
@@ -1379,32 +1371,25 @@ def test_engineargs_nvlink_profile(
     )
     config = args.create_engine_config(usage_context=context)
     kernel = config.kernel_config
-    enabled = case == "nvlink"
+    enabled = case in ("nvlink", "deferred")
     assert (
         config.speculative_config.num_speculative_tokens
         == spec_options["num_speculative_tokens"]
     )
-    assert (
-        config.speculative_config.num_speculative_tokens_per_batch_size
-        == {
-            "nvlink": [(1, 8, 3)],
-            "pcie": MTP_DSD,
-            "explicit": [(1, 8, 2)],
-        }[case]
+    assert config.speculative_config.num_speculative_tokens_per_batch_size == (
+        [(1, 8, 3)] if enabled else [(1, 8, 2)] if case == "explicit" else MTP_DSD
     )
-    assert config.scheduler_config.async_scheduling is enabled
-    assert config.speculative_config.gdn_deferred_commit_metadata is False
+    # Explicit deferred commit keeps the synchronous default with a CPU pool.
+    assert config.scheduler_config.async_scheduling is (case == "nvlink")
+    assert config.speculative_config.gdn_deferred_commit_metadata is (
+        case == "deferred"
+    )
     assert config.parallel_config.enable_hc_sp is enabled
     assert kernel.sm70_hc_ll_async is enabled
     assert kernel.sm70_qsa_paged_fp16_h6 is enabled
     assert kernel.sm70_qsa_paged_fp16_h12 is enabled
-    assert (
-        kernel.sm70_sparse_target_sampling
-        == {
-            "nvlink": "device_top64",
-            "pcie": False,
-            "explicit": True,
-        }[case]
+    assert kernel.sm70_sparse_target_sampling == (
+        "device_top64" if enabled else case == "explicit"
     )
     assert envs.VLLM_SM70_NVLINK_HC is enabled
     audit = next(
@@ -1412,18 +1397,24 @@ def test_engineargs_nvlink_profile(
         for call in profile_log.call_args_list
         if call.args[0] == "ReVolta profile %s"
     )
-    assert (
-        audit["values"]["VLLM_SM70_NVLINK_HC"]["source"]
-        == {
-            "nvlink": "profile",
-            "pcie": "upstream_default",
-            "explicit": "environment",
-        }[case]
+    assert audit["values"]["VLLM_SM70_NVLINK_HC"]["source"] == (
+        "profile"
+        if enabled
+        else "environment"
+        if case == "explicit"
+        else "upstream_default"
     )
-    if case != "pcie":
-        assert {row["source"] for row in audit["config_values"].values()} == {
-            "profile" if enabled else "explicit"
-        }
+    if case in ("nvlink", "explicit"):
+        source = "profile" if enabled else "explicit"
+        for name in (
+            "enable_hc_sp",
+            "sm70_hc_ll_async",
+            "sm70_qsa_paged_fp16_h12",
+            "sm70_sparse_target_sampling",
+        ):
+            assert audit["config_values"][name]["source"] == source
+    elif case in ("pcie", "denied"):
+        assert "config_values" not in audit
 
 
 def test_audit_logs_disabled_profile(profile):

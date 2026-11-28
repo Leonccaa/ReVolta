@@ -72,7 +72,6 @@ __device__ __forceinline__ uint4 decode8_int8_unscaled(const uint2 packed) {
       int8x2_half(packed.y, 0x4140u), int8x2_half(packed.y, 0x4342u));
 }
 
-template <bool ResidualPV>
 __global__ __launch_bounds__(256, 2) void rows_int8_planar(Args a) {
   const int row = blockIdx.x;
   const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
@@ -267,30 +266,26 @@ __global__ __launch_bounds__(256, 2) void rows_int8_planar(Args a) {
         const uint32_t v23 = int8x2_half(codes, 0x4342u);
         mma_rr(pv, *reinterpret_cast<const uint32_t*>(&p01),
                *reinterpret_cast<const uint32_t*>(&p23), v01, v23);
-        if constexpr (ResidualPV) {
-          // Lift the residual before rounding. Dividing exact INT8 values
-          // by 2048 is also exact in half. Sum corrections within this tile.
-          const float2 rounded01 = __half22float2(p01);
-          const float2 rounded23 = __half22float2(p23);
-          const half2 r01 = __floats2half2_rn((p.x - rounded01.x) * 2048.f,
-                                              (p.y - rounded01.y) * 2048.f);
-          const half2 r23 = __floats2half2_rn((p.z - rounded23.x) * 2048.f,
-                                              (p.w - rounded23.y) * 2048.f);
-          const half2 inv = __float2half2_rn(1.f / 2048.f);
-          const half2 v01_scaled =
-              __hmul2(*reinterpret_cast<const half2*>(&v01), inv);
-          const half2 v23_scaled =
-              __hmul2(*reinterpret_cast<const half2*>(&v23), inv);
-          mma_rr(correction, *reinterpret_cast<const uint32_t*>(&r01),
-                 *reinterpret_cast<const uint32_t*>(&r23),
-                 *reinterpret_cast<const uint32_t*>(&v01_scaled),
-                 *reinterpret_cast<const uint32_t*>(&v23_scaled));
-        }
+        // Lift the residual before rounding. Dividing exact INT8 values
+        // by 2048 is also exact in half. Sum corrections within this tile.
+        const float2 rounded01 = __half22float2(p01);
+        const float2 rounded23 = __half22float2(p23);
+        const half2 r01 = __floats2half2_rn((p.x - rounded01.x) * 2048.f,
+                                            (p.y - rounded01.y) * 2048.f);
+        const half2 r23 = __floats2half2_rn((p.z - rounded23.x) * 2048.f,
+                                            (p.w - rounded23.y) * 2048.f);
+        const half2 inv = __float2half2_rn(1.f / 2048.f);
+        const half2 v01_scaled =
+            __hmul2(*reinterpret_cast<const half2*>(&v01), inv);
+        const half2 v23_scaled =
+            __hmul2(*reinterpret_cast<const half2*>(&v23), inv);
+        mma_rr(correction, *reinterpret_cast<const uint32_t*>(&r01),
+               *reinterpret_cast<const uint32_t*>(&r23),
+               *reinterpret_cast<const uint32_t*>(&v01_scaled),
+               *reinterpret_cast<const uint32_t*>(&v23_scaled));
       }
-      if constexpr (ResidualPV) {
 #pragma unroll
-        for (int e = 0; e < 8; ++e) pv[e] += correction[e];
-      }
+      for (int e = 0; e < 8; ++e) pv[e] += correction[e];
     }
     // Publishes tile j + 2's location; tile/scores free for the next tile.
     const int count2 = __syncthreads_count(stage_store(b2));
@@ -313,7 +308,6 @@ __global__ __launch_bounds__(256, 2) void rows_int8_planar(Args a) {
   }
 }
 
-template <bool ResidualPV>
 void rows_int8_planar_out(const torch::Tensor& q, const torch::Tensor& k,
                           const torch::Tensor& v, const torch::Tensor& sk,
                           const torch::Tensor& sv, const torch::Tensor& indices,
@@ -354,7 +348,7 @@ void rows_int8_planar_out(const torch::Tensor& q, const torch::Tensor& k,
   // As in the upstream host path, each launch reads six heads with the
   // original row strides and writes its slice of the output and LSE.
   for (int head = 0; head < q.size(1); head += H) {
-    rows_int8_planar<ResidualPV><<<q.size(0), 256, 0, stream>>>(a);
+    rows_int8_planar<<<q.size(0), 256, 0, stream>>>(a);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     a.q += H * a.qs1;
     a.out += H * a.os1;
@@ -368,12 +362,5 @@ TORCH_LIBRARY_FRAGMENT(vllm_sm70_qsa_device, m) {
       "rows_int8_planar(Tensor q, Tensor k, Tensor v, Tensor sk, Tensor sv, "
       "Tensor indices, Tensor table, Tensor requests, Tensor(a!) out, "
       "Tensor(b!) lse) -> ()");
-  m.impl("rows_int8_planar", torch::kCUDA, &rows_int8_planar_out<false>);
-  // The benchmark calls this compile-time variant directly.
-  m.def(
-      "rows_int8_planar_residual(Tensor q, Tensor k, Tensor v, Tensor sk, "
-      "Tensor sv, Tensor indices, Tensor table, Tensor requests, "
-      "Tensor(a!) out, Tensor(b!) lse) -> ()");
-  m.impl("rows_int8_planar_residual", torch::kCUDA,
-         &rows_int8_planar_out<true>);
+  m.impl("rows_int8_planar", torch::kCUDA, &rows_int8_planar_out);
 }

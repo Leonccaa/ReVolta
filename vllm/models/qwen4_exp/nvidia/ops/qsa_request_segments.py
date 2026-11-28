@@ -231,6 +231,63 @@ class SegmentWorkspace:
         )
 
 
+def _launch_build_segments(
+    requests: torch.Tensor,
+    positions: torch.Tensor,
+    lengths: torch.Tensor,
+    descriptors: torch.Tensor,
+    visible: torch.Tensor,
+    compress: int,
+    max_rows: int,
+    index_dcp_world_size: int,
+    index_dcp_rank: int,
+) -> None:
+    m = requests.numel()
+    _build_segments[(1,)](
+        requests,
+        positions,
+        lengths,
+        descriptors,
+        visible,
+        requests.stride(0),
+        positions.stride(0),
+        lengths.stride(0),
+        m,
+        lengths.numel(),
+        compress,
+        MAX_ROWS=max_rows,
+        BLOCK_M=triton.next_power_of_2(m),
+        INDEX_DCP_WORLD=index_dcp_world_size,
+        INDEX_DCP_RANK=index_dcp_rank,
+        num_warps=4,
+    )
+
+
+def warmup_build_segments(
+    device: torch.device, compress: int, world: int, rank: int
+) -> None:
+    # The serving logs missed every listed bucket with a replicated index,
+    # but only 8 and 256 with a sharded index.
+    buckets = (4, 8, 16, 32, 64, 128, 256) if world == 1 else (8, 256)
+    for m in buckets:
+        requests = torch.arange(2, device=device, dtype=torch.int32).repeat_interleave(
+            m // 2
+        )
+        positions = torch.arange(m, device=device, dtype=torch.int64)
+        lengths = requests.new_full((2,), m)
+        _launch_build_segments(
+            requests,
+            positions,
+            lengths,
+            requests.new_empty((m, 3)),
+            requests.new_empty(m),
+            compress,
+            4,
+            world,
+            rank,
+        )
+
+
 def qsa_mqa_request_segments(
     q: torch.Tensor,
     cache: torch.Tensor,
@@ -293,23 +350,16 @@ def qsa_mqa_request_segments(
     if m and not (cache.shape[0] and cache.shape[1] and all(table.shape)):
         raise ValueError("nonempty queries require paged storage")
     if m:
-        _build_segments[(1,)](
+        _launch_build_segments(
             requests,
             positions,
             lengths,
             workspace.descriptors,
             workspace.visible,
-            requests.stride(0),
-            positions.stride(0),
-            lengths.stride(0),
-            m,
-            table.shape[0],
             compress,
-            MAX_ROWS=max_rows,
-            BLOCK_M=triton.next_power_of_2(m),
-            INDEX_DCP_WORLD=index_dcp_world_size,
-            INDEX_DCP_RANK=index_dcp_rank,
-            num_warps=4,
+            max_rows,
+            index_dcp_world_size,
+            index_dcp_rank,
         )
         if columns:
             # Match the paged scorer's 8 tiles for M > 32 to avoid twice as many

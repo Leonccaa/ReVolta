@@ -12,10 +12,14 @@ from typing import TYPE_CHECKING, ClassVar, cast
 import torch
 from torch import nn
 
+from vllm import envs
 from vllm.compilation.sm70_decode_graph import is_sm70_decode_graph_compiling
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.config.cache import CacheDType
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention.attention import (
     set_default_quant_scales,
@@ -70,6 +74,7 @@ from ..common.qsa_cache import (
     qsa_dcp_block_geometry,
     qsa_draft_dcp_sharded,
     qsa_index_dcp_sharded,
+    qsa_index_shard_world,
 )
 from .indexer_qsa import QSAIndexer
 from .ops.qsa import _SM70_INDEXER_CUBLAS, expand_qsa_block_indices_cuda
@@ -94,6 +99,7 @@ from .ops.qsa_paged_fp16_h12 import (
     qsa_paged_fp16_h12,
     qsa_paged_fp16_h12_workspace,
 )
+from .ops.qsa_request_segments import warmup_build_segments
 from .ops.sm70_dcp2 import get_sm70_dcp2_for_batch
 
 if TYPE_CHECKING:
@@ -878,6 +884,44 @@ def _verify_e4m3_kv_requirements(
 
     if reason := qsa_e4m3_capability_reason(model_config.dtype):
         raise NotImplementedError(f"QSA E4M3 cache unavailable: {reason}")
+
+
+def _warmup_sm70_qsa_folded8(
+    forward_context: dict[str, object], vllm_config: VllmConfig
+) -> bool:
+    for layer in forward_context.values():
+        if isinstance(layer, Qwen4ExpQSAAttention) and layer._warmup_sm70_qsa_folded8(
+            vllm_config
+        ):
+            return True
+    return False
+
+
+def _warmup_sm70_qsa_segments(
+    forward_context: dict[str, object], vllm_config: VllmConfig
+) -> bool:
+    if not envs.VLLM_SM70_QSA_REQUEST_SEGMENTS:
+        return False
+    for layer in forward_context.values():
+        if isinstance(layer, Qwen4ExpQSAAttention):
+            indexer = layer.indexer
+            cache = indexer.compressed_key_cache
+            if cache.dtype != torch.float16 or (
+                indexer.index_n_heads,
+                indexer.index_head_dim,
+            ) != (4, 128):
+                continue
+            sharded = qsa_index_dcp_sharded(
+                vllm_config, cache.prefix, indexer.compress_ratio
+            )
+            warmup_build_segments(
+                layer.topk_indices_buffer.device,
+                indexer.compress_ratio,
+                qsa_index_shard_world(vllm_config) if sharded else 1,
+                get_tensor_model_parallel_rank() if sharded else 0,
+            )
+            return True
+    return False
 
 
 class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):

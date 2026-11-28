@@ -915,11 +915,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if hasattr(self, "_kv_block_zeroer") and self._kv_block_zeroer.warmup_kernel():
             warmed.append("zero_kv_blocks")
 
-        for layer in self.compilation_config.static_forward_context.values():
-            warmup_qsa = getattr(layer, "_warmup_sm70_qsa_folded8", None)
-            if warmup_qsa is not None and warmup_qsa(self.vllm_config):
-                warmed.append("qsa_folded8")
-                break
+        if any(
+            arch.startswith("Qwen4ExpFor") for arch in self.model_config.architectures
+        ):
+            from vllm.models.qwen4_exp.nvidia.warmup import (
+                warmup_sm70_qwen4_exp_kernels,
+            )
+
+            warmed.extend(warmup_sm70_qwen4_exp_kernels(self.vllm_config, self.device))
 
         if (
             isinstance(self.speculator, DFlash2Speculator)

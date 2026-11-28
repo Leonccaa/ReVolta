@@ -129,6 +129,7 @@ def test_v2_warms_qwen38_mtp_moe_prefill_and_decode_shapes(monkeypatch) -> None:
     runner._kv_block_zeroer = zeroer
     runner.speculator = speculator
     runner.compilation_config = SimpleNamespace(static_forward_context={})
+    runner.model_config = SimpleNamespace(architectures=[])
     runner._dummy_run = mock.Mock()
 
     with (

@@ -92,14 +92,11 @@ def _compact_target_reference_rows_kernel(
     tl.store(reference_rows + row, reference)
 
 
-def _compact_target_reference_rows_gpu(
+def _launch_compact_target_reference_rows(
     probe: torch.Tensor,
     top_ps: torch.Tensor,
     row_to_request: torch.Tensor,
-    *,
-    strict_top_k: bool = False,
-) -> np.ndarray:
-    """Check FP32 temperature-scaled probes using the request-slot mapping."""
+) -> torch.Tensor:
     rows, width = probe.shape
     result = torch.empty(rows, device=probe.device, dtype=torch.bool)
     _compact_target_reference_rows_kernel[(rows,)](
@@ -113,6 +110,18 @@ def _compact_target_reference_rows_gpu(
         triton.next_power_of_2(width),
         num_warps=1,
     )
+    return result
+
+
+def _compact_target_reference_rows_gpu(
+    probe: torch.Tensor,
+    top_ps: torch.Tensor,
+    row_to_request: torch.Tensor,
+    *,
+    strict_top_k: bool = False,
+) -> np.ndarray:
+    """Check FP32 temperature-scaled probes using the request-slot mapping."""
+    result = _launch_compact_target_reference_rows(probe, top_ps, row_to_request)
     if strict_top_k:
         # The dense combined filter can let a tie spanning the k cutoff back
         # in during its final top-p mask, even if all ties fit in the probe.
@@ -452,6 +461,8 @@ def warmup_dflash2_sparse_target_rejection(
         target_logits, target_ids = sort_topk_with_vocab_ties(
             target_logits, target_ids, vocab_size=vocab_size, descending=True
         )
+        if width == _TARGET_PROBE_K:
+            _launch_compact_target_reference_rows(target_logits, top_p, request_ids)
         keep = _TARGET_TOP_K if width == _TARGET_TOP_K + 1 else width
         dflash2_sparse_topk_rejection_sample(
             target_ids[:, :keep],

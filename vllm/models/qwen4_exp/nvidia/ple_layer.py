@@ -2093,6 +2093,37 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         return loaded
 
 
+def _warmup_sm70_ple_ngram_ids(forward_context: dict[str, object]) -> bool:
+    if not envs.VLLM_SM70_PLE_NGRAM_BATCH:
+        return False
+    for layer in forward_context.values():
+        if not isinstance(layer, Qwen4ExpPLELayer):
+            continue
+        embedding = layer.ple_embedding
+        # The GPU placeholder for a CPU-only embedding has no n-gram buffers.
+        multipliers = getattr(embedding, "layer_multipliers", None)
+        if multipliers is None or not multipliers.is_cuda:
+            continue
+        if (embedding.ngram_size, embedding.heads_per_ngram) != (3, 8):
+            continue
+        device = multipliers.device
+        ids = torch.zeros(7, dtype=torch.int32, device=device)
+        starts = torch.arange(8, dtype=torch.int32, device=device)
+        context = ids.new_full((7, 2), embedding.eos_token_id)
+        for requests in (4, 5, 6, 7):
+            sm70_ple_ngram_ids(
+                ids[:requests],
+                starts[: requests + 1],
+                context[:requests],
+                multipliers,
+                embedding.ngram_heads_vocab_sizes,
+                embedding.ngram_heads_offsets,
+                embedding.eos_token_id,
+            )
+        return True
+    return False
+
+
 class Qwen4ExpPLELayer(nn.Module, MambaBase):
     def __init__(
         self,

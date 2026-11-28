@@ -5,7 +5,8 @@ from collections.abc import Callable
 from dataclasses import asdict, fields
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, ModelWrapValidatorHandler, field_validator, model_validator
+from pydantic_core import ArgsKwargs
 
 from vllm.config.utils import config, get_hash_factors, hash_factors
 from vllm.logger import init_logger
@@ -769,6 +770,11 @@ class KernelConfig:
     sm70_hc_ll_async: bool = False
     """Allow the usual SM70 NVLink HC LL admission under async scheduling."""
 
+    sm70_nvlink_mtp_fc_peer: bool = False
+    """Fuse the Flash-Next MTP draft FC residual add and feature all-gather
+    over admitted SM70 TP4 NVLink HC LL for batches of at most 64 rows.
+    """
+
     sm70_hc_moe_dual_partial: bool = False
     """Pass separate routed and shared expert outputs into NVLink HC on
     Flash-Next decode. Independent of HCX admission. HCX accumulates both
@@ -785,6 +791,28 @@ class KernelConfig:
     as the all-gather for finite logits."""
     sm70_hcx_active: bool = Field(default=False, init=False)
     """HCX operator/weight preparation changed the target compiler graph."""
+
+    _nvlink_profile_fields: tuple[str, ...] = Field(default=(), init=False, repr=False)
+    """Explicit kernel inputs used when resolving NVLink profile defaults."""
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _record_nvlink_profile_fields(
+        cls, data: Any, handler: ModelWrapValidatorHandler["KernelConfig"]
+    ) -> "KernelConfig":
+        result = handler(data)
+        raw = (data.kwargs or {}) if isinstance(data, ArgsKwargs) else data
+        if isinstance(raw, dict):
+            result._nvlink_profile_fields = tuple(
+                name
+                for name in (
+                    "sm70_hc_ll_async",
+                    "sm70_sparse_target_sampling",
+                    "sm70_qsa_paged_fp16_h12",
+                )
+                if name in raw
+            )
+        return result
 
     ple_result_transport: Literal["auto", "cuda", "mapped"] = "auto"
     """Select CPU PLE result transport by local operator/resource capability."""
@@ -821,6 +849,7 @@ class KernelConfig:
         Any future fields that don't affect compilation should be excluded.
         """
         ignored_factors = {
+            "_nvlink_profile_fields",
             "topology_all_reduce",  # Include enabled math policy below, not cache path.
             "enable_flashinfer_autotune",
             "ir_op_priority",  # handled separately below
@@ -854,6 +883,8 @@ class KernelConfig:
             ignored_factors.add("sm70_dflash2_fp16_m8")
         if not self.sm70_nvlink_hc_active:
             ignored_factors.add("sm70_nvlink_hc_active")
+        if not (self.sm70_nvlink_hc_active and self.sm70_nvlink_mtp_fc_peer):
+            ignored_factors.add("sm70_nvlink_mtp_fc_peer")
         if not self.sm70_hc_moe_dual_partial:
             ignored_factors.add("sm70_hc_moe_dual_partial")
         ignored_factors.add("sm70_hcx")  # Only resolved preparation changes the graph.
@@ -927,6 +958,10 @@ class KernelConfig:
         import torch
 
         from vllm.platforms import current_platform
+
+        spec = vllm_config.speculative_config
+        if spec is None or spec.method != "mtp":
+            self.sm70_nvlink_mtp_fc_peer = False
 
         model = vllm_config.model_config
         text = getattr(model, "hf_text_config", None)

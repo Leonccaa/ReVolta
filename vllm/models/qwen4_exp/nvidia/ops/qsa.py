@@ -186,7 +186,14 @@ def _qsa_grouped_page4_supported(
     )
 
 
-@triton.jit(do_not_specialize=["num_requests", "num_rows", "num_columns"])
+@triton.jit(
+    do_not_specialize=["num_requests", "num_rows", "num_columns", "stride_logits_row"],
+    do_not_specialize_on_alignment=[
+        "token_to_req_ptr",
+        "query_positions_ptr",
+        "sequence_lengths_ptr",
+    ],
+)
 def _qsa_mqa_paged_kernel(
     q_ptr,
     k_cache_ptr,
@@ -318,7 +325,10 @@ def _qsa_mqa_paged_kernel(
         )
 
 
-@triton.jit(do_not_specialize=["rows", "num_requests"])
+@triton.jit(
+    do_not_specialize=["rows", "num_requests"],
+    do_not_specialize_on_alignment=["query_positions_ptr", "sequence_lengths_ptr"],
+)
 def _qsa_visible_blocks_kernel(
     token_to_req_ptr,
     query_positions_ptr,
@@ -402,7 +412,10 @@ def _qsa_gather_single_request_keys_kernel(
     tl.store(valid_ptr + column, valid, mask=column < columns)
 
 
-@triton.jit(do_not_specialize=["width", "stride_score_row"])
+@triton.jit(
+    do_not_specialize=["width", "stride_score_row", "stride_logits_row"],
+    do_not_specialize_on_alignment=["visible_ptr"],
+)
 def _qsa_relu_headsum_visible_kernel(
     score_ptr,
     visible_ptr,
@@ -444,7 +457,15 @@ def _qsa_relu_headsum_visible_kernel(
     )
 
 
-@triton.jit(do_not_specialize=["rows", "num_requests"])
+@triton.jit(
+    do_not_specialize=["rows", "num_requests"],
+    do_not_specialize_on_alignment=[
+        "query_positions_ptr",
+        "sequence_lengths_ptr",
+        "token_to_req_ptr",
+        "output_ptr",
+    ],
+)
 def _expand_qsa_indices_kernel(
     block_indices_ptr,
     query_positions_ptr,

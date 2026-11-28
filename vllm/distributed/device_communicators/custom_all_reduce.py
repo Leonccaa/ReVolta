@@ -327,13 +327,6 @@ def _resolve_interconnect(
             candidate,
             p2p="driver" if envs.VLLM_SKIP_P2P_CHECK else "cached IPC",
         )
-    if (
-        candidate.mode == "nvlink"
-        and world_size == 4
-        and capability == DeviceCapability(7, 0)
-        and current_platform.is_cuda()
-    ):
-        candidate = replace(candidate, hc_ll_requested=_sm70_hc_ll_requested())
     candidates = [candidate] * world_size
     dist.all_gather_object(candidates, candidate, group=group)
     # Compare dispatch limits as well as mode: different graph/size admission
@@ -410,7 +403,17 @@ def _resolve_interconnect(
                 p2p=p2p + "=failed",
                 reason="fresh IPC failed; entire group uses NCCL",
             )
-    return replace(candidate, p2p=p2p + "=passed")
+    return replace(
+        candidate,
+        p2p=p2p + "=passed",
+        hc_ll_requested=(
+            candidate.mode == "nvlink"
+            and world_size == 4
+            and capability == DeviceCapability(7, 0)
+            and current_platform.is_cuda()
+            and _sm70_hc_ll_requested()
+        ),
+    )
 
 
 def get_sm70_interconnect_mode(

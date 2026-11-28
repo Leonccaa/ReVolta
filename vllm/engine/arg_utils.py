@@ -502,7 +502,7 @@ class EngineArgs:
     numa_bind_cpus: list[str] | None = ParallelConfig.numa_bind_cpus
     tensor_parallel_size: int = ParallelConfig.tensor_parallel_size
     prefill_context_parallel_size: int = ParallelConfig.prefill_context_parallel_size
-    enable_hc_sp: bool = ParallelConfig.enable_hc_sp
+    enable_hc_sp: bool | None = ParallelConfig.enable_hc_sp
     decode_context_parallel_size: int = ParallelConfig.decode_context_parallel_size
     dcp_comm_backend: DCPCommBackend | None = ParallelConfig.dcp_comm_backend
     dcp_kv_cache_interleave_size: int = ParallelConfig.dcp_kv_cache_interleave_size
@@ -1833,21 +1833,43 @@ class EngineArgs:
             and not spec.ngram_assist
         )
         mtp_with_prefix_cache = spec.method == "mtp" and self.enable_prefix_caching
-        if mtp_with_prefix_cache and "gdn_state_replay" not in self.speculative_config:
-            defaults["gdn_state_replay"] = True
+        nvlink_mtp = False
+        if mtp_with_prefix_cache:
+            from vllm.revolta_profile import (
+                frontend_interconnect_mode,
+                is_nvlink_auto_profile,
+                local_tp4_device_ids,
+            )
+
+            mode = frontend_interconnect_mode(
+                disable_custom_all_reduce=target_parallel_config.disable_custom_all_reduce,
+                device_ids=local_tp4_device_ids(target_parallel_config),
+            )
+            nvlink_mtp = is_nvlink_auto_profile(target_model_config, mode)
         if (
-            "num_speculative_tokens_per_batch_size" not in self.speculative_config
+            mtp_with_prefix_cache
+            and "gdn_state_replay" not in self.speculative_config
+            and (not nvlink_mtp or self.async_scheduling is False)
+        ):
+            defaults["gdn_state_replay"] = True
+
+        schedule_key = "num_speculative_tokens_per_batch_size"
+        nvlink_dsd = nvlink_mtp and k in (4, 5)
+        if (
+            schedule_key not in self.speculative_config
             and "dflash_concurrency_drafts" not in self.speculative_config
             and target_parallel_config.pipeline_parallel_size == 1
         ):
             if dflash2_k7:
-                defaults["num_speculative_tokens_per_batch_size"] = [
+                defaults[schedule_key] = [
                     (1, 3, 7),
                     (4, 4, 3),
                     (5, 8, 4),
                 ]
+            elif nvlink_dsd:
+                defaults[schedule_key] = [(1, 8, 3)]
             elif k == 4 and mtp_with_prefix_cache:
-                defaults["num_speculative_tokens_per_batch_size"] = [
+                defaults[schedule_key] = [
                     (1, 3, 4),
                     (4, 8, 3),
                 ]
@@ -1866,7 +1888,15 @@ class EngineArgs:
                 "collect_stats": True,
                 "max_requests": 1,
             }
-        return replace(spec, **defaults) if defaults else spec
+        spec = replace(spec, **defaults) if defaults else spec
+        if nvlink_dsd:
+            logger.info_once(
+                "ReVolta %s=%s value_source=%s",
+                schedule_key,
+                str(spec.num_speculative_tokens_per_batch_size),
+                "profile" if schedule_key in defaults else "explicit",
+            )
+        return spec
 
     def _maybe_apply_sm70_mtp_defaults(
         self,

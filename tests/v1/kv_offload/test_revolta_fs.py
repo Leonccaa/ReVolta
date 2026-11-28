@@ -7,7 +7,7 @@ import mmap
 import os
 import shutil
 import time
-from dataclasses import make_dataclass
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -20,7 +20,14 @@ from tests.v1.kv_offload.test_fs_tier import (
     key,
     make_job,
 )
-from vllm.v1.kv_cache_interface import KVBlockSegments, KVCacheTensor
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVBlockSegments,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    KVCacheTensor,
+    MambaSpec,
+)
 from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
 from vllm.v1.kv_offload.tiering.fs.config import fs_tier_configs
 from vllm.v1.kv_offload.tiering.fs.content_manifest import build_manifest
@@ -31,11 +38,9 @@ from vllm.v1.kv_offload.tiering.fs.revolta import (
 )
 
 
-def _view(num_blocks: int = 4):
-    backing = mmap.mmap(-1, num_blocks * _BLOCK_ELEMENTS * 4)
-    tensor = torch.frombuffer(backing, dtype=_DTYPE).reshape(
-        num_blocks, _BLOCK_ELEMENTS
-    )
+def _view(num_blocks: int = 4, block_elements: int = _BLOCK_ELEMENTS):
+    backing = mmap.mmap(-1, num_blocks * block_elements * 4)
+    tensor = torch.frombuffer(backing, dtype=_DTYPE).reshape(num_blocks, block_elements)
     return tensor, memoryview(tensor.numpy())
 
 
@@ -172,74 +177,119 @@ def _load(tier, k, slot=1, job_id=2):
     return [r.success for r in drain(tier)]
 
 
-def test_unified_tensor_schema_reuses_pre_split_ssd_page(tmp_path):
-    # The old dataclass had precisely these three fields and this FQN. Use it
-    # to write an actual checksummed page, then reopen with today's dataclass.
-    legacy = make_dataclass(
-        "KVCacheTensor",
-        [("size", int), ("shared_by", list), ("packed_members", object)],
-    )
-    legacy.__module__ = KVCacheTensor.__module__
-    tensor, view = _view()
+@pytest.mark.parametrize("split", [False, True], ids=["unified", "split"])
+def test_pool_resize_reuses_ssd_page(tmp_path, split):
     spec, manifest = checkpoint_spec(tmp_path)
-    spec.kv_cache_config.block_segments = None
-    spec.kv_cache_config.kv_cache_tensors = [legacy(4096, ["layer"], None)]
+    spec.vllm_config.cache_config.cache_dtype = "auto"
+    attention = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=64, dtype=torch.float16
+    )
+    state = MambaSpec(block_size=16, shapes=((1024,),), dtypes=(torch.float32,))
+    groups = [KVCacheGroupSpec(["history"], attention)]
+    if split:
+        groups.append(KVCacheGroupSpec(["state"], state))
+
+    def make_cache(history_blocks, state_blocks):
+        tensors = [
+            KVCacheTensor(
+                attention.page_size_bytes * history_blocks,
+                ["history"],
+                num_blocks=history_blocks if split else None,
+            )
+        ]
+        segments = None
+        if split:
+            tensors.append(
+                KVCacheTensor(
+                    state.page_size_bytes * state_blocks,
+                    ["state"],
+                    num_blocks=state_blocks,
+                )
+            )
+            segments = KVBlockSegments(
+                ("state", "history"), (state_blocks, history_blocks), (1, 0), 1
+            )
+        return KVCacheConfig(history_blocks, tensors, groups, block_segments=segments)
+
+    elements = sum(group.kv_cache_spec.page_size_bytes for group in groups) // 4
+    source, view = _view(4, elements)
+    spec.kv_cache_config = make_cache(16, 8)
     writer = make_tier(tmp_path, view, spec=spec, content_manifest_path=manifest)
     try:
         assert not writer.disabled
-        old_layout = writer._extra_layout.copy()
-        old_path = _store(writer, tensor, key(1), value=7.0)
+        run_config = writer.file_mapper.get_run_config()
+        path = _store(writer, source, key(1), value=7.0)
     finally:
         writer.shutdown()
-    spec.kv_cache_config.kv_cache_tensors = [KVCacheTensor(4096, ["layer"])]
+
+    destination, view = _view(6, elements)
+    spec.kv_cache_config = make_cache(12, 5)
     reader = make_tier(tmp_path, view, spec=spec, content_manifest_path=manifest)
     try:
         assert not reader.disabled
-        assert reader._extra_layout == old_layout
-        assert reader.file_mapper.get_file_name(key(1)) == old_path
-        tensor[1].zero_()
+        assert reader.file_mapper.get_run_config() == run_config
+        assert reader.file_mapper.get_file_name(key(1)) == path
         assert reader.lookup(key(1))
         assert _load(reader, key(1)) == [True]
-        assert torch.equal(tensor[1], torch.full_like(tensor[1], 7.0))
+        assert torch.equal(destination[1], source[0])
     finally:
         reader.shutdown()
 
 
-def test_split_persistence_binds_tensor_counts_and_segments(tmp_path):
-    tensor, view = _view()
+def test_page_layout_changes_namespace(tmp_path):
     spec, manifest = checkpoint_spec(tmp_path)
-    layouts = []
-    for blocks, primary in ((2, 1), (3, 1), (2, 0)):
-        spec.kv_cache_config.block_segments = KVBlockSegments(
-            ("state", "history"), (4, 4), (), primary
-        )
-        spec.kv_cache_config.kv_cache_tensors = [
-            KVCacheTensor(4096, ["layer"], num_blocks=blocks)
-        ]
+    spec.vllm_config.cache_config.cache_dtype = "auto"
+    attention = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=64, dtype=torch.float16
+    )
+    group = KVCacheGroupSpec(["history"], attention)
+    tensor = KVCacheTensor(4 * attention.page_size_bytes, ["history"], num_blocks=4)
+    segments = KVBlockSegments(("state", "history"), (4, 4), (1,), 1)
+    cache = KVCacheConfig(4, [tensor], [group], block_segments=segments)
+    wider = replace(attention, page_size_padded=2 * attention.page_size_bytes)
+    variants = [
+        cache,
+        replace(
+            cache,
+            kv_cache_groups=[
+                replace(
+                    group,
+                    kv_cache_spec=replace(
+                        attention, block_size=32, head_size=32, head_size_v=32
+                    ),
+                )
+            ],
+        ),
+        replace(
+            cache,
+            kv_cache_groups=[
+                replace(group, kv_cache_spec=replace(attention, dtype=torch.bfloat16))
+            ],
+        ),
+        replace(
+            cache,
+            kv_cache_groups=[replace(group, layer_names=["draft"])],
+            kv_cache_tensors=[replace(tensor, shared_by=["draft"])],
+        ),
+        replace(cache, block_segments=replace(segments, group_segments=(0,))),
+        replace(
+            cache,
+            kv_cache_groups=[replace(group, kv_cache_spec=wider)],
+            kv_cache_tensors=[replace(tensor, size=4 * wider.page_size_bytes)],
+        ),
+    ]
+    namespaces = set()
+    for variant in variants:
+        spec.kv_cache_config = variant
+        page_bytes = variant.kv_cache_groups[0].kv_cache_spec.page_size_bytes
+        _, view = _view(block_elements=page_bytes // 4)
         tier = make_tier(tmp_path, view, spec=spec, content_manifest_path=manifest)
         try:
             assert not tier.disabled
-            layouts.append(tier._extra_layout["page_layout"])
+            namespaces.add(tier.file_mapper.base_path)
         finally:
             tier.shutdown()
-    assert len(set(layouts)) == 3
-
-
-def test_unified_explicit_tensor_count_changes_identity(tmp_path):
-    tensor, view = _view()
-    spec, manifest = checkpoint_spec(tmp_path)
-    layouts = []
-    for blocks in (None, 2, 3):
-        spec.kv_cache_config.kv_cache_tensors = [
-            KVCacheTensor(4096, ["layer"], num_blocks=blocks)
-        ]
-        tier = make_tier(tmp_path, view, spec=spec, content_manifest_path=manifest)
-        try:
-            assert not tier.disabled
-            layouts.append(tier._extra_layout["page_layout"])
-        finally:
-            tier.shutdown()
-    assert len(set(layouts)) == 3
+    assert len(namespaces) == len(variants)
 
 
 def test_page_has_checksum_and_no_temp_files(revolta_tier):

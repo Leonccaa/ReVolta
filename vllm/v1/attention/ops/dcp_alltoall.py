@@ -164,7 +164,7 @@ def reserve_dcp_a2a_workspace(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["send_stride_N"])
 def _dcp_a2a_pack_send_kernel(
     out_ptr,
     lse_ptr,
@@ -227,7 +227,7 @@ def _dcp_a2a_pack_send_kernel(
             )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["recv_stride_N"])
 def _dcp_a2a_unpack_combine_kernel(
     recv_ptr,
     out_ptr,

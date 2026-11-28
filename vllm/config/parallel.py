@@ -321,8 +321,9 @@ class ParallelConfig:
     _ple_offload_ipc_path: str = ""
     """Node-local ZMQ IPC address for the PLE offload worker."""
 
-    enable_hc_sp: bool = False
-    """Shard Flash-Next HC and PLE rows in large compiled prefill batches."""
+    enable_hc_sp: bool | None = None
+    """Shard Flash-Next HC and PLE rows in large compiled prefill batches.
+    Unset lets the ReVolta profile select it for direct NVLink TP4."""
 
     decode_context_parallel_size: int = 1
     """Number of decode context parallel groups, because the world size does

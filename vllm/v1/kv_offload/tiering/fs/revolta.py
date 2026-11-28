@@ -36,9 +36,9 @@ import weakref
 from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING
 
-from vllm.config.utils import normalize_value
 from vllm.logger import init_logger
 from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD, INT8
+from vllm.v1.kv_cache_interface import KVCacheConfig, kv_tensor_num_blocks
 from vllm.v1.kv_offload.base import OffloadKey, get_offload_group_idx
 from vllm.v1.kv_offload.tiering.base import (
     JobMetadata,
@@ -62,30 +62,18 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _persistent_kv_tensors(kv_cache_config):
-    """Keep the pre-split tensor schema for caches using the unified pool.
-
-    normalize_value retains the dataclass's fully qualified name. Converting
-    to a dict would change the namespace too, even with identical fields.
-    Explicit tensor block counts retain their physical identity, including in
-    a unified cache. Only the new field's absent/default value is omitted.
-    """
-    tensors = kv_cache_config.kv_cache_tensors
-    absent_fields = {"page_stride_bytes"}
-    if getattr(kv_cache_config, "block_segments", None) is None:
-        absent_fields.add("num_blocks")
-    normalized = []
-    for tensor in tensors:
-        type_name, items = normalize_value(tensor)
-        normalized.append(
-            (
-                type_name,
-                tuple(
-                    (k, v) for k, v in items if k not in absent_fields or v is not None
-                ),
-            )
-        )
-    return normalized
+def _persistent_kv_tensors(kv_cache_config: KVCacheConfig) -> list[dict]:
+    """Describe tensor pages independently of their allocation lengths."""
+    return [
+        {
+            "page_size_bytes": tensor.size
+            // kv_tensor_num_blocks(kv_cache_config, tensor),
+            "shared_by": tensor.shared_by,
+            "packed_members": tensor.packed_members,
+            "page_stride_bytes": tensor.page_stride_bytes,
+        }
+        for tensor in kv_cache_config.kv_cache_tensors
+    ]
 
 
 CHECKSUM_XATTR = "user.revolta.kv_crc32c"
@@ -471,8 +459,10 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
         if identity is None:
             self._init_disabled(offloading_spec, primary_kv_view, tier_type)
             return
-        # Include the actual physical page description, not just compile hashes.
+        # The primary view is a contiguous array of fixed-width CPU rows.
         assert primary_kv_view.shape is not None
+        kv_cache_config = offloading_spec.kv_cache_config
+        segments = getattr(kv_cache_config, "block_segments", None)
         try:
             self._extra_layout = {
                 "revolta_fs_format": PAGE_FORMAT,
@@ -485,28 +475,16 @@ class RevoltaFileSystemTierManager(FileSystemTierManager):
                                 "layers": list(group.layer_names),
                                 "spec": group.kv_cache_spec,
                             }
-                            for group in offloading_spec.kv_cache_config.kv_cache_groups
+                            for group in kv_cache_config.kv_cache_groups
                         ],
-                        "tensors": _persistent_kv_tensors(
-                            offloading_spec.kv_cache_config
-                        ),
+                        "tensors": _persistent_kv_tensors(kv_cache_config),
                         "primary_shape": primary_kv_view.shape[1:],
                         "primary_strides": primary_kv_view.strides,
                         "primary_format": primary_kv_view.format,
                         "block_size_factor": offloading_spec.block_size_factor,
                         "layout": getattr(offloading_spec, "persistent_layout", None),
-                        **(
-                            {
-                                "split_layout_version": 1,
-                                "block_segments": (
-                                    offloading_spec.kv_cache_config.block_segments
-                                ),
-                            }
-                            if getattr(
-                                offloading_spec.kv_cache_config, "block_segments", None
-                            )
-                            is not None
-                            else {}
+                        "block_segments": (
+                            segments.group_segments if segments is not None else None
                         ),
                     }
                 ),

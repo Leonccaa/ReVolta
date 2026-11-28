@@ -1553,9 +1553,6 @@ class Worker(WorkerBase):
             )
 
         from vllm.model_executor.model_loader.reload import validate_weight_reload
-        from vllm.model_executor.model_loader.weight_utils import (
-            refresh_derived_weights,
-        )
 
         validate_weight_reload(self.model_runner.model)
 
@@ -1583,7 +1580,6 @@ class Worker(WorkerBase):
                     typed_update_info,
                     load_weights=load_weights_direct,
                 )
-                refresh_derived_weights(model)
 
         # NCCL broadcast/packed path are asynchronous.
         # Sync here so the next step uses the new weights.
@@ -1613,6 +1609,14 @@ class Worker(WorkerBase):
             model = self.model_runner.model
             with torch.device(self.device):
                 finalize_layerwise_reload(model, self.model_config)
+        else:
+            from vllm.model_executor.model_loader.weight_utils import (
+                refresh_derived_weights,
+            )
+
+            # Every update_weights call has synchronized its (possibly
+            # side-stream) copies, so derived weights see the new params.
+            refresh_derived_weights(self.model_runner.model)
 
         # Reset state
         self._weight_update_active = False

@@ -320,9 +320,7 @@ def _shared_batch_runtime_ok(x: torch.Tensor) -> bool:
 
 
 def _pack_shared_up_weight(weight: torch.Tensor) -> torch.Tensor:
-    return (
-        weight.detach().reshape(10, 32, 160, 2, 8).permute(0, 2, 3, 1, 4).contiguous()
-    )
+    return weight.detach().reshape(10, 32, 160, 2, 8).permute(0, 2, 3, 1, 4)
 
 
 def _refresh_shared_up_pack(layer: nn.Module) -> None:
@@ -782,7 +780,7 @@ class Qwen38SM70FP16LinearMethod(UnquantizedLinearMethod):
                     raise RuntimeError("Rebuild the SM70 extension for shared expert")
                 layer.register_buffer(
                     "_sm70_mtp_shared_packed",
-                    _pack_shared_up_weight(weight),
+                    _pack_shared_up_weight(weight).contiguous(),
                     persistent=False,
                 )
                 layer.refresh_derived_weights = MethodType(

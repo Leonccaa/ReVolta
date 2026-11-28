@@ -80,9 +80,9 @@ One request at a time, cold prefix cache.
 
 | Configuration | Cold TTFT, 8K prompt | Cold TTFT, 32K prompt | Second-token latency, 32K prompt |
 | --- | ---: | ---: | ---: |
-| D+E1: AWQ, MTP4, GPU KV | 2.102 s | 8.228 s | Not measured <!-- TODO(0.2.0-acceptance): second-token latency at 32K, D+E1 --> |
-| E2: Host KV, MTP | 2.204 s | 8.442 s | Not measured <!-- TODO(0.2.0-acceptance): second-token latency at 32K, E2 --> |
-| E3a: NVFP4, MTP5 | 1.987 s | 7.747 s | Not measured <!-- TODO(0.2.0-acceptance): second-token latency at 32K, E3a --> |
+| D+E1: AWQ, MTP4, GPU KV | 2.102 s | 8.228 s | Not measured |
+| E2: Host KV, MTP | 2.204 s | 8.442 s | Not measured |
+| E3a: NVFP4, MTP5 | 1.987 s | 7.747 s | Not measured |
 
 ### GPU KV capacity
 
@@ -107,7 +107,7 @@ When a new request starts with a prompt the engine has seen before, such as a fo
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | C: AWQ, DFlash2 | 32,839 | 8.56 s | 0.535 s | 0.599 s | 1.011 s | 31,616 |
 | C: AWQ, DFlash2 | 130,402 | 33.42 s | 0.780 s | 0.893 s | 1.692 s | 129,792 |
-| E2: Host KV, MTP | ~32K | 8.442 s (separate cold test) | Not measured <!-- TODO(0.2.0-acceptance): TTFT with Host KV hit at 32K, E2 --> | — | Not measured | Not measured <!-- TODO(0.2.0-acceptance): prompt tokens hit at 32K, E2 --> |
+| E2: Host KV, MTP | ~32K | 8.442 s (separate cold test) | Not measured | — | Not measured | Not measured |
 
 How the tiers work and how to size them: [KV offload modes](kv-offload.md).
 

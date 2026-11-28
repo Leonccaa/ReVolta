@@ -164,7 +164,7 @@ Notes:
 - **CPU KV pool.** `cpu_bytes_to_use` is the total for all four workers: 48 GiB, 12 GiB per worker. See [KV offload](kv-offload.md) for SSD tiers and other pool sizes.
 - **NVLink.** If the four selected GPUs are fully connected by NVLink, remove `--no-async-scheduling` to let the [NVLink profile](configuration.md#nvlink-tp4-auto-configuration) enable async scheduling. This applies to both launch commands on this page.
 - **Wide verifier.** On a system whose GPUs share one PCIe switch with P2P, the profile also turns on the [AWQ MTP4 wide verifier](configuration.md#awq-mtp4-wide-verifier) for this configuration; the CPU KV pool does not prevent it. NVLink systems keep the standard verifier.
-- **Cold startup** took 693 s (about 12 minutes) to reach readiness in the PCIe AWQ + MTP4 acceptance. This includes weight and PLE loading, `torch.compile` and CUDA graph capture. <!-- TODO(0.2.0-acceptance): warm startup time, D+E1 --> Later starts reuse the compile cache. The first start after an upgrade recompiles.
+- **Cold startup** took 693 s (about 12 minutes) to reach readiness in the PCIe AWQ + MTP4 acceptance. This includes weight and PLE loading, `torch.compile` and CUDA graph capture. Later starts reuse the compile cache. The first start after an upgrade recompiles.
 
 See [Launch options](configuration.md#launch-options) for the meaning of each option.
 

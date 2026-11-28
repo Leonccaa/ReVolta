@@ -18,32 +18,37 @@ ReVolta is built for four or more V100 32 GB GPUs and validated on four. We reco
 
 ## At a glance
 
-**What 0.2.0 improves:** These gains are measured against earlier 0.2.0 builds, not against 0.1.5.
+### 0.1.5 → 0.2.0
 
-- **NVLink, public NVFP4 + MTP5:** In same-system tests during 0.2.0 development, automatic tuning cut wall-clock time per decode round by **38% / 33% / 28%** at 1 / 4 / 8 concurrent requests versus the earlier defaults without automatic tuning. The release measured **16.43 / 23.45 / 32.81 ms** per round on a separate fully connected NVLink system.
-- **PCIe, production AWQ + DFlash2:** Compared with the same setup on the previous 0.2.0 candidate, cold time to first token at 32K fell from **9.90 to 8.54 s**, 128K prefill fell from **39.0 to 32.8 s**, and RevBench decode throughput rose **2.4%**.
-- **PCIe, public AWQ + MTP4:** Compared with the same setup on the previous 0.2.0 candidate, cold time to first token at 32K fell **14%** and RevBench decode throughput rose **7.3%**.
+| What changed | [0.1.5](https://github.com/Leonccaa/ReVolta/releases/tag/v0.1.5) | [0.2.0](https://github.com/Leonccaa/ReVolta/releases/tag/v0.2.0) | Notes |
+| --- | --- | --- | --- |
+| Default Flash-Next KV format | Scalar FP8 E4M3 with checkpoint-specific calibration | **INT8 with per-token, per-head scales**; no calibration | Reference launches on V100 |
+| GPU KV pool: AWQ + MTP4 | 1,153,143 tokens (2.20×) | 1,194,816 tokens (2.28×) | PCIe; target and draft both E4M3 → both INT8 |
+| GPU KV pool: AWQ + DFlash2 | 1,366,121 tokens (2.61×) | **1,851,676 tokens (3.53×)** | PCIe; target E4M3 → INT8; 0.2.0 uses an FP16 draft cache |
+| Host KV (active history in RAM) | Not available | **About 7.33 million usable tokens in 98 GiB** | INT8 + MTP5; AWQ on PCIe, NVFP4 on NVLink |
+| Revisit a 32K document: cold / CPU / SSD after restart | 10.1 / 0.6 / 1.5 s | **8.56 / 0.60 / 1.01 s** | First-token latency, one AWQ + DFlash2 request on PCIe; 0.1.4 at 250 W with E4M3 vs. 0.2.0 at 200 W with INT8 target KV |
+| Single-request cold prefill on PCIe | 3,016 prompt tok/s at 131K | **3,898 prompt tok/s at ~128K** | 0.1.2: MTP4, E4M3, 250 W, through first token; 0.2.0: DFlash2, INT8 target KV, 200 W, prefill time only |
+| NVLink tuning | Interconnect detected; no automatic NVLink tuning profile | **Automatic tuning** on fully connected four-GPU groups | On the same 275 W system during 0.2.0 development, NVFP4 + MTP5 with INT8 took **38% / 33% / 28% less time per round** at 1 / 4 / 8 requests vs. earlier untuned defaults. The release measured **16.43 / 23.45 / 32.81 ms** per round on the separate NVLink system below. |
+| SSD writeback | Writes queued without a delay | **300 s delay** by default | `revolta_fs` skips pages evicted or superseded during the delay |
+| Speculative decoding | Fixed draft width for MTP4 and DFlash2 | Draft width can adapt to concurrency; KV-only MTP draft prefill and sparse DFlash2 verification where eligible | MTP uses the model's own draft layer; DFlash2 uses a separate drafter |
+| Models | AWQ reference; NVFP4 and FP4-Local load and serve | Measured KV capacity for all three; Hy4-flash validation support | Hy4-flash was validated before the final release, not in the release tests |
+| Serving defaults | Reference launch sets scheduler tuning by hand | The profile applies tested serving defaults | Explicit settings still take precedence |
 
-MTP4 drafts up to four tokens per step with the model's own multi-token-prediction (MTP) layer (three per step at four or more requests); the reference launch uses it. DFlash2 uses a separate drafter model; our own server uses it.
+### Why INT8 KV is the default
 
-**Context and capacity** (0.2.0; Uncensored AWQ g32, INT8 target KV, 512K context, 8 sequences, `--gpu-memory-utilization 0.956`, our 4 × V100 32 GB PCIe server)
+In matched four-V100 tests, target scores with INT8 were closer to FP16 KV than with calibrated E4M3 (**KL 0.024 vs. 0.061**, lower is better). INT8 also cut time per round (**5.9%** for MTP at eight requests; **2.7% and 1.5%** in two single-request DFlash2 comparisons), with no significant change in accepted draft length. Native INT8 decode in 0.2.0 adds **2.8% / 3.0%** PCIe RevBench throughput for DFlash2 / MTP4 compared with the previous INT8 readers, and cuts single-request DFlash2 round time by **9.5%** at 128K without changing acceptance. In a separate MTP test with INT8 target KV, an INT8 draft held **11.3%** more KV tokens than an FP16 draft after capacity was normalized to the same context length.
 
-| | MTP4 (reference launch; draft KV inherits INT8) | DFlash2 (our production setup; FP16 draft KV) |
-| --- | ---: | ---: |
-| Context per request | 512K tokens | 512K tokens |
-| GPU KV pool | 1,194,816 tokens | 1,851,676 tokens |
-| GPU KV pool / 512K tokens (capacity ratio) | 2.28× | 3.53× |
-| Concurrent requests | 8 | 8 |
+### Why per-token, per-head scales
 
-On the NVLink system below, NVFP4 + MTP5 with INT8 KV held **1,305,719 tokens** in the GPU KV pool.
+Each token and each KV head gets its own **FP32** scales based on its actual key and value ranges. An outlier in one head or token therefore does not reduce precision elsewhere. ReVolta computes the scales at runtime, so supported Flash-Next weights such as AWQ, NVFP4 and FP4-Local need no checkpoint-specific KV calibration pack. Calibrated scalar E4M3 is frozen: it still works, but is no longer optimized. See [KV formats](https://github.com/Leonccaa/ReVolta/blob/main/docs/checkpoints.md#weight-and-kv-formats).
 
-With optional Host KV and INT8 KV, the 98 GiB host pool held **7,329,312 usable tokens** on both systems (AWQ + MTP5 on PCIe, NVFP4 + MTP5 on NVLink). In the separate GPU KV test with DFlash2, one request revisiting a 32K-token document reached its first token in **0.599 s** from CPU memory or **1.011 s** from SSD after restart, versus **8.56 s** with cold recomputation. See [KV offload](https://github.com/Leonccaa/ReVolta/blob/main/docs/kv-offload.md).
+The PCIe GPU pools above use Uncensored AWQ g32, a 512K context limit and up to eight scheduled sequences, with GPU memory utilization set to 0.95 in the old measurements and 0.956 in 0.2.0. The 0.2.0 runs used a 200 W cap per GPU; the old pool sizes were confirmed unchanged in 0.1.5. The ratio is total pool capacity divided by 512K, not a request limit. On the NVLink system below, NVFP4 + MTP5 with INT8 KV held **1,305,719 tokens** in the GPU pool. See [KV offload](https://github.com/Leonccaa/ReVolta/blob/main/docs/kv-offload.md) for host and SSD options.
 
 **Speed** (0.2.0): observed end-to-end output from the same short synthetic English story workload, sampled without the chat template and fixed at 512 output tokens per request. Each concurrency shows the higher total output rate of the tested MTP and DFlash2 configurations: AWQ + MTP4 versus AWQ + DFlash2 on PCIe, and NVFP4 + MTP5 versus AWQ + DFlash2 on NVLink. These are separate machines with different power limits, not a same-system interconnect comparison or a ranking for real prompts.
 
 | System (power limit per GPU) | 1 request | 4 | 8 | Cold prefill (prompt tok/s at stated lengths) |
 | --- | ---: | ---: | ---: | ---: |
-| 4 × V100 32 GB PCIe, one PCIe switch with P2P (200 W) | 114.4 tok/s | 283.0 tok/s | 378.1 tok/s | 3,787 at 32K / 3,898 at 128K |
+| 4 × V100 32 GB PCIe, one PCIe switch with P2P (200 W) | 114.4 tok/s | 283.0 tok/s | 378.1 tok/s | 3,787 at 32K; longer prompt in the comparison above |
 | 4 × V100-SXM2 32 GB, all six pairs directly linked by NVLink (300 W) | 136.1 tok/s | 370.9 tok/s | 532.4 tok/s | 7,892 at 32K / 7,953 at 64K |
 
 Cold prefill uses one request and divides the actual prompt length by median prefill time for PCIe (AWQ + DFlash2) or median time to first token for NVLink (NVFP4 + MTP5). NVLink was not tested at 128K in this benchmark. See [Performance](https://github.com/Leonccaa/ReVolta/blob/main/docs/performance.md#nvlink-tp4-acceptance) for test conditions.

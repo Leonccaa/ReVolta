@@ -249,8 +249,8 @@ Start from the reference launch and replace `--kernel-config` and `--kv-transfer
 ```
 
 - `host_store_gib` is the host store in GiB, summed over all workers. It holds the main K/V pages, recurrent states and drafter pages. Size it to the memory left after the PLE table (about 48 GiB for AWQ), other processes and the page cache. The example uses the same 48 GiB as the reference CPU pool, which fits the 128 GiB reference host; the [capacity table](#host-kv-capacity) shows 98 GiB stores.
-- `qsa_dcp_index_shard` (in `--kernel-config`) splits the compressed index over all tensor-parallel ranks at DCP2 and lets the MTP draft's main K/V move to the host store; see [MTP draft placement](#mtp-draft-placement). When it is unset, the ReVolta profile turns it on for DFlash2 and, in Host KV mode, for MTP, so the example does not set it. An explicit value takes precedence. DCP1 does not use it. Do not set it for MTP with GPU KV: outside Host KV mode the model rejects index sharding with MTP.
-- The index layout is part of the SSD page identity. If an earlier Host KV MTP deployment ran without index sharding, it now gets it by default, so its existing Host KV SSD pages are not reused after the upgrade; the prefixes are computed again.
+- `qsa_dcp_index_shard` (in `--kernel-config`) splits the compressed index over all tensor-parallel ranks at DCP2 and lets the MTP draft's main K/V move to the host store; see [MTP draft placement](#mtp-draft-placement). If unset, the ReVolta hybrid serving profile turns it on for DFlash2 and for MTP with `long_context_kv.enabled`, when the model selects 512 index groups, as Flash-Next does. An explicit value takes precedence. DCP1 does not use it. MTP with GPU KV keeps the replicated index and does not support sharding.
+- The index layout is part of the SSD page identity. If a Host KV MTP deployment switches from a replicated index to a sharded one on upgrade, existing Host KV SSD pages miss and the prefixes are computed again.
 - `main_kv_placement` and `draft_main_placement` default to `"host"`; there is no need to set them.
 
 ### Add an SSD to Host KV

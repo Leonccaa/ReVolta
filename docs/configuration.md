@@ -118,7 +118,7 @@ All options in this section are deployment scope.
 
 `auto` selects planar INT8 only when the model has QSA selector metadata, `--calculate-kv-scales` is not set and prefill context parallelism is 1. Otherwise the generic vLLM rules apply. Planar formats use four page regions `[K | V | sK | sV]`, not upstream vLLM's inline FP8 page layout. The old name `fp8_e4m3_per_token_head` is removed without an alias.
 
-Pending merge: the ReVolta profile will enable the native paged QSA decode reader by default on SM70 TP4/DCP2 with INT8 main KV and Model Runner V2, on both PCIe and NVLink. This covers eligible target decode (H12) and eligible INT8 MTP draft decode (H6), including reads from the hot pool with Host KV. To turn it off explicitly, add `"sm70_qsa_paged_int8_h12": false` to `--kernel-config`. <!-- TODO(0.2.0-acceptance): confirm the INT8 reader change has merged and verify the default and opt-out in the release build -->
+The ReVolta profile enables native paged QSA decode by default with Model Runner V2 on SM70 TP4/DCP2 when main KV resolves to planar INT8, on both PCIe and NVLink. This covers eligible target decode (H12), including reads from the GPU hot pool in Host KV mode, and eligible INT8 MTP draft decode (H6). FP16 DFlash2 draft reads are unchanged. To keep the previous decode readers, add `"sm70_qsa_paged_int8_h12": false` to `--kernel-config`.
 
 Draft KV:
 
@@ -134,6 +134,8 @@ These fields go in `--speculative-config`.
 | `draft_sample_method` | string | `greedy` | `greedy`, `probabilistic` | 1Cat | stable | How the drafter picks proposals. MTP must stay `greedy`: a probabilistic MTP draft corrupts output above `max_num_seqs=2` at temperature above 0 (1CatAI/1Cat-vLLM#656). For DFlash2, `probabilistic` is recommended; it passed the 0.1.4 release gate at 1–8 concurrent requests, temperature 1 with thinking, tool calls and structured output. This setting affects drafting and draft verification only; clients can still use any sampling parameters. |
 | `num_speculative_tokens_per_batch_size` | list of `[first, last, drafts]` | profile default ([Default schedules](dynamic-speculative-decoding.md#default-schedules)) | inclusive ranges of the scheduled request count | 0.2.0 | stable | Chooses the number of drafts from the number of scheduled requests. See [Dynamic speculative decoding](dynamic-speculative-decoding.md). |
 | `kv_cache_dtype` | string | unset (inherit) | see [KV cache format](#kv-cache-format) | upstream | stable | Draft KV format; see the draft KV notes above. |
+
+For eligible greedy Flash-Next MTP target batches on SM70 TP4 with Model Runner V2, `"sm70_mtp_bounded_target_head": true` in `--kernel-config` enables a bounded QPN8 vocabulary search. It is experimental and off by default. The search runs for up to 12 rows on the greedy target fast path: it rescores 128 candidates per rank with the original FP16 head and runs the full FP16 head for rows where the bound cannot establish the winner. Larger batches keep the existing target head.
 
 DFlash2 options are in [DFlash2 speculative decoding](dflash2.md) and [speculative_config.sm70_dflash2 keys](#speculative_configsm70_dflash2-keys).
 

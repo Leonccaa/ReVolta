@@ -139,9 +139,17 @@ The synthetic short-prompt decode test used one English story template at temper
 
 In a separate 32K single-request decode test, the development build took 16.04 ms per round. Cold prefill time to first token on that build was 1.149 s at 8K, 4.222 s at 32K and 8.405 s at 64K.
 
-## Triton compilation during serving
+## Kernel changes during serving
 
-Some SM70 kernels used to recompile during requests when a buffer slice changed pointer alignment or an integer argument changed divisibility by 16. In 0.2.0 these arguments no longer specialize on those properties, and the existing startup warmup compiles the remaining known variants covered by the fix. The kernel bodies are unchanged. This applies to AWQ and NVFP4 with MTP or DFlash2 on PCIe and NVLink; it does not eliminate all compilation during serving.
+<a id="triton-compilation-during-serving"></a>
+
+**Triton compilation.** Some SM70 kernels used to recompile during requests when a buffer slice changed pointer alignment or an integer argument changed divisibility by 16. In 0.2.0 these arguments no longer specialize on those properties, and the existing startup warmup compiles the remaining known variants covered by the fix. The kernel bodies are unchanged. This applies to AWQ and NVFP4 with MTP or DFlash2 on PCIe and NVLink; it does not eliminate all compilation during serving.
+
+**MTP shared expert.** Eligible SM70 TP4 MTP verification graph batches of 2–64 rows use dedicated shared-expert kernels without a new setting. The gate/up projection is fused with SiLU. The down projection is fused with the expert gate through 8 rows; larger eligible batches keep the down GEMM and fuse the gate dot product and multiply. This applies to AWQ and NVFP4, not DFlash2 ([#371](https://github.com/Leonccaa/ReVolta/pull/371)).
+
+**Row-wise INT8 QSA prefill.** On SM70 TP4/DCP2, eligible prefill batches with FP16 queries, planar INT8 KV and at least 256 rows automatically read each row's own selected tokens instead of the union for a group of eight rows. This works with GPU or Host KV, AWQ or NVFP4, and MTP or DFlash2. Decode-only batches, CUDA graph capture and FP16 KV do not use this path. In a single-V100 PCIe kernel benchmark (12 heads, head dimension 256, one DCP2 rank, causal top-512), median attention time per chunk went from 22.5 to 10.8 ms at the 8K chunk end and from 63.1 to 12.6 ms at 32K. These are kernel timings, not service TTFT ([#372](https://github.com/Leonccaa/ReVolta/pull/372)).
+
+**FP8 PLE table reads.** The pinned-host and hybrid PLE gathers skip table reads for rows owned by another rank or another tier instead of repeatedly reading row zero over PCIe. The change is automatic, does not change the output and does not apply to NVFP4-format PLE tables. In a single-V100 PCIe kernel benchmark (96 rows, a TP4 ID mix and the first gather after a 300 µs idle gap), median gather time fell from 125–132 µs to 6.1–7.0 µs across pinned host tables of 3–12 GiB. This is a gather timing, not a decode-round or service result ([#373](https://github.com/Leonccaa/ReVolta/pull/373)).
 
 ## Quality measurements
 

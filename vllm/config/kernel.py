@@ -770,6 +770,11 @@ class KernelConfig:
     sm70_hc_ll_async: bool = False
     """Allow the usual SM70 NVLink HC LL admission under async scheduling."""
 
+    sm70_nvlink_mtp_fc_peer: bool = False
+    """Fuse the Flash-Next MTP draft FC residual add and feature all-gather
+    over admitted SM70 TP4 NVLink HC LL for batches of at most 64 rows.
+    """
+
     sm70_hc_moe_dual_partial: bool = False
     """Pass separate routed and shared expert outputs into NVLink HC on
     Flash-Next decode. Independent of HCX admission. HCX accumulates both
@@ -878,6 +883,8 @@ class KernelConfig:
             ignored_factors.add("sm70_dflash2_fp16_m8")
         if not self.sm70_nvlink_hc_active:
             ignored_factors.add("sm70_nvlink_hc_active")
+        if not (self.sm70_nvlink_hc_active and self.sm70_nvlink_mtp_fc_peer):
+            ignored_factors.add("sm70_nvlink_mtp_fc_peer")
         if not self.sm70_hc_moe_dual_partial:
             ignored_factors.add("sm70_hc_moe_dual_partial")
         ignored_factors.add("sm70_hcx")  # Only resolved preparation changes the graph.
@@ -951,6 +958,10 @@ class KernelConfig:
         import torch
 
         from vllm.platforms import current_platform
+
+        spec = vllm_config.speculative_config
+        if spec is None or spec.method != "mtp":
+            self.sm70_nvlink_mtp_fc_peer = False
 
         model = vllm_config.model_config
         text = getattr(model, "hf_text_config", None)

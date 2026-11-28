@@ -18,10 +18,8 @@ struct Args {
   const int8_t *k, *v;
   const float *sk, *sv;
   const int *indices, *table, *requests;
-  const int64_t* positions;
-  const int* lengths;
   float *out, *lse;
-  int blocks, page, width, table_width, num_requests;
+  int page, width, table_width;
   int64_t qs0, qs1, kb, kt, vb, vt, skb, skt, svb, svt, is0, ts0, os0, os1, ls0;
 };
 
@@ -88,9 +86,6 @@ __global__ __launch_bounds__(256, 2) void rows_int8_planar(Args a) {
   __shared__ float kscale[3][C], vscale[3][C];
   __shared__ float alpha[8], denom[8];
   const int req = a.requests[row];
-  const int64_t position = a.positions[row];
-  const bool live = req >= 0 && req < a.num_requests;
-  const int length = live ? a.lengths[req] : 0;
   const int ntiles = (a.width + C - 1) / C;
   // Locate stages (threads t < C, key t of the located tile).
   int logical = -1;
@@ -104,11 +99,9 @@ __global__ __launch_bounds__(256, 2) void rows_int8_planar(Args a) {
   };
   auto stage_table = [&]() {
     found = -1;
-    if (live && logical >= 0 && logical <= position && logical < length &&
-        logical / a.page < a.table_width) {
+    if (req >= 0 && logical >= 0 && logical / a.page < a.table_width) {
       const int physical = a.table[req * a.ts0 + logical / a.page];
-      if (physical >= 0 && physical < a.blocks)
-        found = (int64_t(physical) << 32) | (logical % a.page);
+      if (physical >= 0) found = (int64_t(physical) << 32) | (logical % a.page);
     }
   };
   auto stage_scales = [&]() {
@@ -326,8 +319,6 @@ void rows_int8_planar_out(const torch::Tensor& q, const torch::Tensor& k,
                           const torch::Tensor& sv, const torch::Tensor& indices,
                           const torch::Tensor& table,
                           const torch::Tensor& requests,
-                          const torch::Tensor& positions,
-                          const torch::Tensor& lengths,
                           const torch::Tensor& out, const torch::Tensor& lse) {
   const c10::cuda::CUDAGuard guard(q.device());
   const auto stream = at::cuda::getCurrentCUDAStream();
@@ -340,15 +331,11 @@ void rows_int8_planar_out(const torch::Tensor& q, const torch::Tensor& k,
   a.indices = indices.data_ptr<int>();
   a.table = table.data_ptr<int>();
   a.requests = requests.data_ptr<int>();
-  a.positions = positions.data_ptr<int64_t>();
-  a.lengths = lengths.data_ptr<int>();
   a.out = out.data_ptr<float>();
   a.lse = lse.data_ptr<float>();
-  a.blocks = k.size(0);
   a.page = k.size(1);
   a.width = indices.size(1);
   a.table_width = table.size(1);
-  a.num_requests = table.size(0);
   a.qs0 = q.stride(0);
   a.qs1 = q.stride(1);
   a.kb = k.stride(0);
@@ -379,15 +366,14 @@ void rows_int8_planar_out(const torch::Tensor& q, const torch::Tensor& k,
 TORCH_LIBRARY_FRAGMENT(vllm_sm70_qsa_device, m) {
   m.def(
       "rows_int8_planar(Tensor q, Tensor k, Tensor v, Tensor sk, Tensor sv, "
-      "Tensor indices, Tensor table, Tensor requests, Tensor positions, "
-      "Tensor lengths, Tensor(a!) out, Tensor(b!) lse) -> ()");
+      "Tensor indices, Tensor table, Tensor requests, Tensor(a!) out, "
+      "Tensor(b!) lse) -> ()");
   m.impl("rows_int8_planar", torch::kCUDA, &rows_int8_planar_out<false>);
   // The benchmark calls this compile-time variant directly.
   m.def(
       "rows_int8_planar_residual(Tensor q, Tensor k, Tensor v, Tensor sk, "
       "Tensor sv, Tensor indices, Tensor table, Tensor requests, "
-      "Tensor positions, Tensor lengths, Tensor(a!) out, Tensor(b!) lse) -> "
-      "()");
+      "Tensor(a!) out, Tensor(b!) lse) -> ()");
   m.impl("rows_int8_planar_residual", torch::kCUDA,
          &rows_int8_planar_out<true>);
 }

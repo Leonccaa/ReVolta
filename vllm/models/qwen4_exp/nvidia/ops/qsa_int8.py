@@ -724,13 +724,6 @@ def dcp_grouped(
         and is_forward_context_available()
         and get_forward_context().additional_kwargs.get("qsa_has_prefill", False)
     )
-    if not use_rows:
-        rows = rows // 8 * 8
-    capacity = table.shape[1] * k.shape[1]
-    positions = torch.full((rows,), capacity - 1, device=q.device, dtype=torch.int64)
-    lengths = torch.full(
-        (table.shape[0],), capacity, device=q.device, dtype=torch.int32
-    )
     if use_rows:
         importlib.import_module("vllm._sm70_qsa_device_C")
         torch.ops.vllm_sm70_qsa_device.rows_int8_planar(
@@ -742,12 +735,16 @@ def dcp_grouped(
             indices[:, :local_width],
             table,
             requests,
-            positions,
-            lengths,
             out,
             lse,
         )
         return rows
+    rows = rows // 8 * 8
+    capacity = table.shape[1] * k.shape[1]
+    positions = torch.full((rows,), capacity - 1, device=q.device, dtype=torch.int64)
+    lengths = torch.full(
+        (table.shape[0],), capacity, device=q.device, dtype=torch.int32
+    )
     native_grouped(
         q[:rows],
         k,

@@ -653,6 +653,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 self.kv_cache_dtype,
                 k_scale,
                 v_scale,
+                local_width=local_width,
                 **scale_kwargs,
             )
             if (
@@ -692,9 +693,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 )
 
         def attend_dcp_union(table: torch.Tensor, requests: torch.Tensor, outs) -> None:
-            # The GPU arm's _forward_qsa_dcp routes on the whole batch shape:
-            # grouped page4 for the leading multiple of eight rows (when
-            # eligible), Triton for the rest with the local width.
+            # Match the GPU arm's prefill routing on the whole batch shape.
             rows_out, rows_lse = outs
             grouped = qsa_dcp_sparse_paged_attention_sm70_grouped_page4(
                 gathered_query,
@@ -708,6 +707,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 self.kv_cache_dtype,
                 k_scale,
                 v_scale,
+                local_width=local_width,
                 **scale_kwargs,
             )
             if grouped < num_tokens:
@@ -836,8 +836,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 "k_scale_cache": k_scale_cache,
                 "v_scale_cache": v_scale_cache,
             }
-        # Prefill-sized batches use grouped page4 for their leading multiple
-        # of eight rows. Small uniform decode batches may use the native reader.
+        # Small uniform decode batches may use the native H12 reader below.
         grouped_rows = qsa_dcp_sparse_paged_attention_sm70_grouped_page4(
             gathered_query,
             key_cache,
@@ -850,6 +849,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             self.kv_cache_dtype,
             layer._k_scale_float,
             layer._v_scale_float,
+            local_width=local_width,
             **scale_kwargs,
         )
         if (

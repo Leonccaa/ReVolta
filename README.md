@@ -18,6 +18,12 @@ ReVolta is built for four or more V100 32 GB GPUs and validated on four. We reco
 
 ## At a glance
 
+**What 0.2.0 improves:** These gains are measured against earlier 0.2.0 builds, not against 0.1.5.
+
+- **NVLink, public NVFP4 + MTP5:** In same-system tests during 0.2.0 development, automatic tuning cut wall-clock time per decode round by **38% / 33% / 28%** at 1 / 4 / 8 concurrent requests versus the earlier defaults without automatic tuning. The release measured **16.43 / 23.45 / 32.81 ms** per round on a separate fully connected NVLink system.
+- **PCIe, production AWQ + DFlash2:** Compared with the same setup on the previous 0.2.0 candidate, cold time to first token at 32K fell from **9.90 to 8.54 s**, 128K prefill fell from **39.0 to 32.8 s**, and RevBench decode throughput rose **2.4%**.
+- **PCIe, public AWQ + MTP4:** Compared with the same setup on the previous 0.2.0 candidate, cold time to first token at 32K fell **14%** and RevBench decode throughput rose **7.3%**.
+
 MTP4 drafts up to four tokens per step with the model's own multi-token-prediction (MTP) layer (three per step at four or more requests); the reference launch uses it. DFlash2 uses a separate drafter model; our own server uses it.
 
 **Context and capacity** (0.2.0; Uncensored AWQ g32, INT8 target KV, 512K context, 8 sequences, `--gpu-memory-utilization 0.956`, our 4 × V100 32 GB PCIe server)
@@ -29,15 +35,18 @@ MTP4 drafts up to four tokens per step with the model's own multi-token-predicti
 | GPU KV pool / 512K tokens (capacity ratio) | 2.28× | 3.53× |
 | Concurrent requests | 8 | 8 |
 
-With optional Host KV, the 98 GiB host pool held **7,329,312 usable tokens** with AWQ, MTP5 and INT8 KV. In the separate GPU KV test with DFlash2, one request revisiting a 32K-token document reached its first token in **0.599 s** from CPU memory or **1.011 s** from SSD after restart, versus **8.56 s** with cold recomputation. See [KV offload](https://github.com/Leonccaa/ReVolta/blob/main/docs/kv-offload.md).
+On the NVLink system below, NVFP4 + MTP5 with INT8 KV held **1,305,719 tokens** in the GPU KV pool.
 
-**Speed** (0.2.0, 200 W per GPU): observed end-to-end output from short synthetic English story prompts, sampled without the chat template and fixed at 512 output tokens per request. Each concurrency shows the higher recorded total output rate of MTP4 and DFlash2 on this workload, not a ranking for real prompts.
+With optional Host KV and INT8 KV, the 98 GiB host pool held **7,329,312 usable tokens** on both systems (AWQ + MTP5 on PCIe, NVFP4 + MTP5 on NVLink). In the separate GPU KV test with DFlash2, one request revisiting a 32K-token document reached its first token in **0.599 s** from CPU memory or **1.011 s** from SSD after restart, versus **8.56 s** with cold recomputation. See [KV offload](https://github.com/Leonccaa/ReVolta/blob/main/docs/kv-offload.md).
 
-| System | 1 request | 4 | 8 | Cold prefill, 32K / 128K prompt |
+**Speed** (0.2.0): observed end-to-end output from the same short synthetic English story workload, sampled without the chat template and fixed at 512 output tokens per request. Each concurrency shows the higher total output rate of the tested MTP and DFlash2 configurations: AWQ + MTP4 versus AWQ + DFlash2 on PCIe, and NVFP4 + MTP5 versus AWQ + DFlash2 on NVLink. These are separate machines with different power limits, not a same-system interconnect comparison or a ranking for real prompts.
+
+| System (power limit per GPU) | 1 request | 4 | 8 | Cold prefill (prompt tok/s at stated lengths) |
 | --- | ---: | ---: | ---: | ---: |
-| 4 × V100 32 GB PCIe, one PCIe switch with P2P (our server) | 114.4 tok/s | 283.0 tok/s | 378.1 tok/s | 3,787 / 3,898 prompt tok/s |
+| 4 × V100 32 GB PCIe, one PCIe switch with P2P (200 W) | 114.4 tok/s | 283.0 tok/s | 378.1 tok/s | 3,787 at 32K / 3,898 at 128K |
+| 4 × V100-SXM2 32 GB, all six pairs directly linked by NVLink (300 W) | 136.1 tok/s | 370.9 tok/s | 532.4 tok/s | 7,892 at 32K / 7,953 at 64K |
 
-Cold prefill uses DFlash2 with one request, dividing the actual synthetic prompt length by the median time to first token. For the separate 0.2.0 NVLink acceptance and test conditions, see [Performance](https://github.com/Leonccaa/ReVolta/blob/main/docs/performance.md#nvlink-tp4-acceptance).
+Cold prefill uses one request and divides the actual prompt length by median prefill time for PCIe (AWQ + DFlash2) or median time to first token for NVLink (NVFP4 + MTP5). NVLink was not tested at 128K in this benchmark. See [Performance](https://github.com/Leonccaa/ReVolta/blob/main/docs/performance.md#nvlink-tp4-acceptance) for test conditions.
 
 ## Models
 

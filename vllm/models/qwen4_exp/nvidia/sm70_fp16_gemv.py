@@ -312,6 +312,24 @@ def _shared_batch_runtime_ok(x: torch.Tensor) -> bool:
     )
 
 
+def _shared_fp32_batch_runtime_ok(x: torch.Tensor) -> bool:
+    # 1Cat v1.5.4: MTP verify rows keep FP32 split partials when cuBLAS
+    # reduced-precision reduction is off.
+    return bool(
+        envs.VLLM_SM70_MTP_SHARED_BATCH
+        and not envs.VLLM_BATCH_INVARIANT
+        and x.ndim == 2
+        and 2 <= x.shape[0] <= 64
+        and x.shape[1] == 2560
+        and x.is_cuda
+        and x.dtype == torch.float16
+        and x.is_contiguous()
+        and x.data_ptr() % 16 == 0
+        and not torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
+        and not torch.backends.cuda.matmul.allow_fp16_accumulation
+    )
+
+
 def _qwen38_sm70_shared_up(
     x: torch.Tensor, weight: torch.Tensor, packed: torch.Tensor | None
 ) -> torch.Tensor:
@@ -320,6 +338,12 @@ def _qwen38_sm70_shared_up(
         partial = x.new_empty((8, x.shape[0], 320))
         torch.ops._C.qwen38_shared_up_batch_sm70_out(out, partial, x, packed)
         logger.info_once("SM70 MTP4 exact shared-expert batch projection enabled.")
+        return out
+    if packed is not None and _shared_fp32_batch_runtime_ok(x):
+        out = x.new_empty((x.shape[0], 160))
+        partial = x.new_empty((0,), dtype=torch.float32)
+        torch.ops._C.qwen38_shared_up_batch_fp32_sm70_out(out, partial, x, packed)
+        logger.info_once("SM70 MTP shared-expert batch projection enabled (FP32).")
         return out
     gate_up = torch.nn.functional.linear(x, weight)
     out = gate_up.new_empty((*gate_up.shape[:-1], 160))
@@ -360,6 +384,42 @@ direct_register_custom_op(
     op_name="qwen38_sm70_shared_gate_mul",
     op_func=_qwen38_sm70_shared_gate_mul,
     fake_impl=_qwen38_sm70_shared_gate_mul_fake,
+)
+
+
+def _qwen38_sm70_shared_down_gated(
+    x: torch.Tensor,
+    act_out: torch.Tensor,
+    down_weight: torch.Tensor,
+    gate_weight: torch.Tensor,
+) -> torch.Tensor:
+    # 1Cat v1.5.4 MTP routing: one fused down+gate kernel up to M8; wider
+    # verify batches keep the down GEMM and fuse the gate dot and multiply.
+    if x.shape[0] <= 8:
+        out = x.new_empty((x.shape[0], 2560))
+        torch.ops._C.qwen38_shared_down_gated_sm70_out(
+            out, x, act_out, down_weight, gate_weight
+        )
+        logger.info_once("SM70 MTP fused shared-expert down+gate enabled.")
+        return out
+    out = torch.nn.functional.linear(act_out, down_weight)
+    torch.ops._C.qwen38_shared_gate_dot_mul_sm70_out(out, x, gate_weight)
+    return out
+
+
+def _qwen38_sm70_shared_down_gated_fake(
+    x: torch.Tensor,
+    act_out: torch.Tensor,
+    down_weight: torch.Tensor,
+    gate_weight: torch.Tensor,
+) -> torch.Tensor:
+    return x.new_empty((*x.shape[:-1], 2560))
+
+
+direct_register_custom_op(
+    op_name="qwen38_sm70_shared_down_gated",
+    op_func=_qwen38_sm70_shared_down_gated,
+    fake_impl=_qwen38_sm70_shared_down_gated_fake,
 )
 
 
@@ -684,7 +744,8 @@ def _mtp_batch_packing_allowed(layer: nn.Module, role: str) -> bool:
         return True
     matmul = torch.backends.cuda.matmul
     reason = None
-    if not matmul.allow_fp16_reduced_precision_reduction:
+    # Shared up keeps FP32 partials when reduced-precision reduction is off.
+    if role != "shared" and not matmul.allow_fp16_reduced_precision_reduction:
         reason = "fp16_reduced_precision_reduction_disabled"
     elif matmul.allow_fp16_accumulation:
         reason = "fp16_accumulation_enabled"

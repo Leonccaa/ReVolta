@@ -70,14 +70,15 @@ def prepare_on_cpu(layer, monkeypatch, *, native_available=True):
 
 
 @pytest.mark.parametrize(
-    "reduced,accumulation,reason",
+    "reduced,accumulation,reasons",
     [
-        (False, False, "fp16_reduced_precision_reduction_disabled"),
-        (True, True, "fp16_accumulation_enabled"),
-        (True, False, None),
+        # Shared up keeps FP32 partials without reduced-precision reduction.
+        (False, False, {"router": "fp16_reduced_precision_reduction_disabled"}),
+        (True, True, dict.fromkeys(("router", "shared"), "fp16_accumulation_enabled")),
+        (True, False, {}),
     ],
 )
-def test_precision_skip_info_once_per_role(reduced, accumulation, reason, monkeypatch):
+def test_precision_skip_info_once_per_role(reduced, accumulation, reasons, monkeypatch):
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = reduced
     torch.backends.cuda.matmul.allow_fp16_accumulation = accumulation
     # A dedicated logger exercises the real info_once deduplication without
@@ -90,19 +91,15 @@ def test_precision_skip_info_once_per_role(reduced, accumulation, reason, monkey
     monkeypatch.setattr(gemv, "logger", logger)
     for role in ("router", "shared"):
         # Target and draft layers share the process/role precision policy.
+        reason = reasons.get(role)
         for _ in range(2):
             layer = torch.nn.Module()
             assert gemv._mtp_batch_packing_allowed(layer, role) == (reason is None)
             assert getattr(layer, f"_sm70_mtp_{role}_batch_reason") == reason
-    expected = (
-        []
-        if reason is None
-        else [
-            f"Skipping SM70 MTP {role} packed weights due to precision policy: "
-            f"{reason}."
-            for role in ("router", "shared")
-        ]
-    )
+    expected = [
+        f"Skipping SM70 MTP {role} packed weights due to precision policy: {reason}."
+        for role, reason in reasons.items()
+    ]
     assert messages == expected
 
 
@@ -121,7 +118,7 @@ def test_loader_skips_only_precision_rejected_packs(
     hook = getattr(layer, "forward_fused_silu_and_mul", None)
     prepare_on_cpu(layer, monkeypatch)
 
-    admitted = reduced and not accumulation
+    admitted = (reduced or role == "shared") and not accumulation
     buffer_name = f"_sm70_mtp_{role}_packed"
     assert hasattr(layer, buffer_name) == admitted
     assert layer.weight is weight and torch.equal(layer.weight, before)
@@ -142,7 +139,7 @@ def test_loader_skips_only_precision_rejected_packs(
     else:
         expected = (
             "fp16_reduced_precision_reduction_disabled"
-            if not reduced
+            if not reduced and role == "router"
             else "fp16_accumulation_enabled"
         )
         assert report["reasons"][reason_name] == expected
@@ -152,6 +149,7 @@ def test_loader_skips_only_precision_rejected_packs(
 @pytest.mark.parametrize("role", ["router", "shared"])
 def test_rejected_pack_does_not_require_native_operator(role, monkeypatch):
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+    torch.backends.cuda.matmul.allow_fp16_accumulation = True
     layer = make_layer(role)
     prepare_on_cpu(layer, monkeypatch, native_available=False)
     assert not hasattr(layer, f"_sm70_mtp_{role}_packed")
@@ -177,21 +175,17 @@ def test_admitted_pack_remains_reloadable(role, monkeypatch):
     assert torch.equal(getattr(layer, f"_sm70_mtp_{role}_packed"), old * 0.5)
 
 
-@pytest.mark.parametrize("role", ["router", "shared"])
 @pytest.mark.parametrize("rows", [5, 10])
-def test_rejected_policy_fallback_is_unchanged_with_or_without_pack(
-    role, rows, monkeypatch
-):
+def test_rejected_policy_fallback_is_unchanged_with_or_without_pack(rows, monkeypatch):
     # Model the pre-fix resident pack, then compare against the skipped pack at
     # the same precision policy. Assert the original F.linear fallback executes.
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
     torch.backends.cuda.matmul.allow_fp16_accumulation = False
-    layer = make_layer(role)
+    layer = make_layer("router")
     prepare_on_cpu(layer, monkeypatch)
-    packed = getattr(layer, f"_sm70_mtp_{role}_packed")
+    packed = layer._sm70_mtp_router_packed
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
     monkeypatch.setenv("VLLM_SM70_MTP_ROUTER_BATCH", "1")
-    monkeypatch.setenv("VLLM_SM70_MTP_SHARED_BATCH", "1")
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
     envs.disable_envs_cache()
     x = torch.linspace(-0.01, 0.01, rows * 2560, dtype=torch.float16).reshape(
@@ -204,25 +198,69 @@ def test_rejected_policy_fallback_is_unchanged_with_or_without_pack(
         calls.append(args[0].shape)
         return linear(*args, **kwargs)
 
-    def cpu_silu_and_mul(out, gate_up):
-        gate, up = gate_up.chunk(2, dim=-1)
-        out.copy_(F.silu(gate) * up)
-
     monkeypatch.setattr(F, "linear", record_linear)
-    monkeypatch.setattr(torch.ops._C, "silu_and_mul", cpu_silu_and_mul, raising=False)
     with monkeypatch.context() as m:
         m.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
-        if role == "router":
-            assert not gemv._router_batch_runtime_ok(x, packed)
-            before = gemv._qwen38_sm70_fp16_gemv(
-                x, layer.weight, "model.layers.0.mlp.gate", packed
-            )
-            after = gemv._qwen38_sm70_fp16_gemv(
-                x, layer.weight, "model.layers.0.mlp.gate", None
-            )
-        else:
-            assert not gemv._shared_batch_runtime_ok(x)
-            before = gemv._qwen38_sm70_shared_up(x, layer.weight, packed)
-            after = gemv._qwen38_sm70_shared_up(x, layer.weight, None)
+        assert not gemv._router_batch_runtime_ok(x, packed)
+        before = gemv._qwen38_sm70_fp16_gemv(
+            x, layer.weight, "model.layers.0.mlp.gate", packed
+        )
+        after = gemv._qwen38_sm70_fp16_gemv(
+            x, layer.weight, "model.layers.0.mlp.gate", None
+        )
     assert calls == [x.shape, x.shape]
     assert torch.equal(before.view(torch.int16), after.view(torch.int16))
+
+
+def _shared_up_fp32_reference(out, partial, x, packed):
+    # Read the pack exactly as shared_up_fused_silu_kernel indexes it:
+    # packed[n32_block, k16_group, k8_half, row_in_block, k].
+    assert partial.dtype == torch.float32 and partial.numel() == 0
+    assert packed.shape == (10, 160, 2, 32, 8)
+    weight = packed.permute(0, 3, 1, 2, 4).reshape(320, 2560).float()
+    gate_up = x.float() @ weight.t()
+    gate = gate_up[:, :160].half().float()
+    up = gate_up[:, 160:].half()
+    out.copy_((F.silu(gate).half() * up).to(out.dtype))
+
+
+@pytest.mark.parametrize("rows", [1, 2, 4, 16, 64, 65])
+def test_shared_fp32_batch_routes_mtp_rows(rows, monkeypatch):
+    # Exact policy (no reduced-precision reduction) now packs shared up and
+    # uses the FP32-partial kernel for verify rows 2..64.
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+    torch.backends.cuda.matmul.allow_fp16_accumulation = False
+    layer = make_layer("shared")
+    layer.weight.data.mul_(1 / 4096)
+    prepare_on_cpu(layer, monkeypatch)
+    packed = layer._sm70_mtp_shared_packed
+    monkeypatch.setenv("VLLM_SM70_MTP_SHARED_BATCH", "1")
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+    envs.disable_envs_cache()
+    x = torch.linspace(-0.5, 0.5, rows * 2560).reshape(rows, 2560).half()
+    native = []
+    linear = F.linear
+
+    def record_native(*args):
+        native.append(args[2].shape)
+        _shared_up_fp32_reference(*args)
+
+    def cpu_silu_and_mul(out, gate_up):
+        gate, up = gate_up.chunk(2, dim=-1)
+        out.copy_(F.silu(gate.float()).half() * up)
+
+    monkeypatch.setattr(
+        torch.ops._C,
+        "qwen38_shared_up_batch_fp32_sm70_out",
+        record_native,
+        raising=False,
+    )
+    monkeypatch.setattr(torch.ops._C, "silu_and_mul", cpu_silu_and_mul, raising=False)
+    monkeypatch.setattr(F, "linear", lambda a, w: linear(a.float(), w.float()).half())
+    with monkeypatch.context() as m:
+        m.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
+        actual = gemv._qwen38_sm70_shared_up(x, layer.weight, packed)
+        fallback = gemv._qwen38_sm70_shared_up(x, layer.weight, None)
+    assert native == ([x.shape] if 2 <= rows <= 64 else [])
+    assert actual.shape == (rows, 160)
+    torch.testing.assert_close(actual, fallback, atol=0, rtol=0)

@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from types import MethodType
+
 import torch
 from torch import nn
 
@@ -112,6 +114,7 @@ def _prepare_hc_batch_weight(layer: nn.Module) -> None:
         _pack_hc_batch_weight(weight, layer._sm70_qwen38_hc_batch_role, rank),
         persistent=False,
     )
+    layer.refresh_derived_weights = MethodType(refresh_hc_batch_weight, layer)
 
 
 def refresh_hc_batch_weight(layer: nn.Module) -> None:

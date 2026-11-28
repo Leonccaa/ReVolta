@@ -1610,6 +1610,13 @@ class Worker(WorkerBase):
             with torch.device(self.device):
                 finalize_layerwise_reload(model, self.model_config)
 
+        from vllm.model_executor.model_loader.weight_utils import (
+            publish_weight_update,
+        )
+
+        # Checkpoint finalize and derived-weight refresh write in place.
+        publish_weight_update(self.model_runner.model)
+
         # Reset state
         self._weight_update_active = False
         self._is_checkpoint_format = True

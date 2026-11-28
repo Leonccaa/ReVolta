@@ -1617,6 +1617,9 @@ class Worker(WorkerBase):
             # Every update_weights call has synchronized its (possibly
             # side-stream) copies, so derived weights see the new params.
             refresh_derived_weights(self.model_runner.model)
+            # The refresh writes in place on this stream; sync before
+            # returning so graphs replayed on other streams see it.
+            torch.accelerator.synchronize()
 
         # Reset state
         self._weight_update_active = False

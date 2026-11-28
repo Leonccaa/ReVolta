@@ -310,8 +310,14 @@ def test_kernel_format_weight_update_refreshes_shared_pack(monkeypatch):
     ptr = packed.data_ptr()
     new_weight = torch.flip(layer.weight.detach(), dims=(1,)).clone()
     # NCCL packed receive copies on a side stream and returns before the
-    # copies finish; model that by deferring the copy to the device sync.
+    # copies finish, and the pack refresh is an async device copy that a
+    # graph replayed on another stream may race; model both by deferring
+    # them to the device sync.
     pending = []
+    refresh = layer.refresh_derived_weights
+    monkeypatch.setattr(
+        layer, "refresh_derived_weights", lambda: pending.append(refresh)
+    )
     engine = SimpleNamespace(
         parse_update_info=lambda info: info,
         receive_weights=lambda info, load_weights: pending.append(
@@ -326,9 +332,12 @@ def test_kernel_format_weight_update_refreshes_shared_pack(monkeypatch):
         model_runner=SimpleNamespace(model=model),
         device="cpu",
     )
-    monkeypatch.setattr(
-        torch.accelerator, "synchronize", lambda: [f() for f in pending]
-    )
+
+    def synchronize():
+        while pending:
+            pending.pop(0)()
+
+    monkeypatch.setattr(torch.accelerator, "synchronize", synchronize)
     Worker.update_weights(worker, [("gate_up_proj.weight", new_weight)])
     Worker.finish_weight_update(worker)
     assert torch.equal(layer.weight, new_weight)

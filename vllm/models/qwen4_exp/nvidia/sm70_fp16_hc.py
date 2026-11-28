@@ -114,6 +114,14 @@ def _prepare_hc_batch_weight(layer: nn.Module) -> None:
     )
 
 
+def refresh_hc_batch_weight(layer: nn.Module) -> None:
+    """Repack after an in-place weight update, keeping the captured buffer."""
+    packed = layer._sm70_qwen38_hc_batch_packed
+    _prepare_hc_batch_weight(layer)
+    packed.copy_(layer._sm70_qwen38_hc_batch_packed)
+    layer._sm70_qwen38_hc_batch_packed = packed
+
+
 def _batch_runtime_ok(x, packed_down, packed_up, concurrent_batch=False) -> bool:
     if x.ndim != 2:
         return False
@@ -745,7 +753,6 @@ def enable_qwen38_sm70_fp16_fused_hc(
     for child in module.modules():
         if (
             ll_enabled
-            and tp4
             and not getattr(child, "use_combine", True)
             and getattr(child, "lora_rank", None) == _HC_RANK
             and getattr(child, "hc_count", None) == _HC_COUNT
@@ -759,10 +766,7 @@ def enable_qwen38_sm70_fp16_fused_hc(
                 ("down", child.input_mix_weight_down),
                 ("up", child.input_mix_weight_up),
             ):
-                if type(layer.quant_method) is UnquantizedLinearMethod:
-                    layer.quant_method = Qwen38SM70FP16LinearMethod()
-                if not isinstance(layer.quant_method, Qwen38SM70FP16LinearMethod):
-                    raise RuntimeError("HC LL requires checkpoint-FP16 linears")
+                layer.quant_method = Qwen38SM70FP16LinearMethod()
                 layer._sm70_qwen38_hc_batch_role = role
             child._sm70_qwen38_fp16_fused_hc_no_combine = True
             enabled_count += 1
@@ -835,6 +839,9 @@ def maybe_apply_qwen38_sm70_fp16_fused_hc_no_combine(
 ) -> torch.Tensor | None:
     if not enabled or not use_sm70_decode_graph_semantics():
         return None
+    # LoRA wrappers keep their own forward so adapter updates still apply.
+    if not (isinstance(down_layer, LinearBase) and isinstance(up_layer, LinearBase)):
+        return None
     return torch.ops.vllm.qwen38_sm70_fp16_fused_hc_no_combine(
         x,
         down_layer.weight,
@@ -852,7 +859,7 @@ def _qwen38_sm70_fp16_fused_hc_no_combine(
     packed_up: torch.Tensor,
 ) -> torch.Tensor:
     ll = get_tp_hc_ll()
-    if ll is not None and x.ndim == 2 and 1 <= x.shape[0] <= MAX_ROWS:
+    if ll is not None and x.shape[0] <= MAX_ROWS:
         return ll.project(x.contiguous(), packed_down, packed_up)[0]
     lora = torch.ops.vllm.qwen4_exp_hc_silu(
         torch.nn.functional.linear(x, down_weight), _HC_COUNT

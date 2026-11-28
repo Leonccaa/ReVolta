@@ -14,6 +14,9 @@ from vllm.config import SchedulerConfig, VllmConfig
 from vllm.config.kernel import KernelConfig
 from vllm.distributed.device_communicators import custom_all_reduce as car
 from vllm.distributed.device_communicators import sm70_hc_ll as hc_ll
+from vllm.lora.layers import ReplicatedLinearWithLoRA
+from vllm.model_executor import parameter
+from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.models.qwen4_exp.nvidia import hyperconnection as hc
 from vllm.models.qwen4_exp.nvidia import sm70_fp16_hc
 from vllm.platforms import sm70_interconnect
@@ -397,48 +400,65 @@ def test_moe_tail_passes_one_rank_local_half_sum(monkeypatch):
     runner._maybe_sm70_moe_sum2_allreduce.assert_called_once()
 
 
-def test_final_mixer_pack_pads_missing_injection_rows():
-    down = torch.randn((320, 10240)).half()
-    padded = torch.cat((down, down.new_zeros((16, 10240))))
-    for rank in range(4):
-        assert torch.equal(
-            sm70_fp16_hc._pack_hc_batch_weight(down, "down", rank),
-            sm70_fp16_hc._pack_hc_batch_weight(padded, "down", rank),
-        )
+def _hc_linear(monkeypatch, in_features, out_features, role):
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_world_size", lambda: 1)
+    layer = ReplicatedLinear(
+        in_features,
+        out_features,
+        bias=False,
+        params_dtype=torch.float16,
+        return_bias=False,
+        disable_tp=True,
+    )
+    layer.weight.data.copy_(torch.randn((out_features, in_features)) * 0.01)
+    layer.cpu_linear = torch.nn.functional.linear
+    layer._sm70_qwen38_hc_batch_role = role
+    layer.register_buffer(
+        "_sm70_qwen38_hc_batch_packed",
+        sm70_fp16_hc._pack_hc_batch_weight(layer.weight, role, 0),
+        persistent=False,
+    )
+    return layer
 
 
-class _Linear:
-    def __init__(self, weight, role, rank=0):
-        self.weight = weight
-        self._sm70_qwen38_hc_batch_packed = sm70_fp16_hc._pack_hc_batch_weight(
-            weight, role, rank
-        )
-
-    def __call__(self, x):
-        return torch.nn.functional.linear(x, self.weight)
-
-
-@pytest.mark.parametrize(
-    "rows,hc_sp,use_ll",
-    [(4, False, True), (64, False, True), (65, False, False), (4, True, False)],
-)
-def test_final_mixer_uses_ll_projection(monkeypatch, rows, hc_sp, use_ll):
-    x = torch.randn((rows, 10240)).half()
-    down = _Linear((torch.randn((320, 10240)) * 0.01).half(), "down")
-    up = _Linear((torch.randn((10240, 320)) * 0.01).half(), "up")
-    module = SimpleNamespace(
+def _final_mixer(monkeypatch):
+    return SimpleNamespace(
         use_combine=False,
         hc_count=4,
-        input_mix_weight_down=down,
-        input_mix_weight_up=up,
+        input_mix_weight_down=_hc_linear(monkeypatch, 10240, 320, "down"),
+        input_mix_weight_up=_hc_linear(monkeypatch, 320, 10240, "up"),
         _sm70_qwen38_fp16_fused_hc_no_combine=True,
     )
-    output = torch.ones((rows, 2560), dtype=torch.float16)
-    project = Mock(return_value=(output, torch.ones((rows, 4))))
+
+
+def _mock_ll(monkeypatch, rows):
+    project = Mock(
+        return_value=(
+            torch.ones((rows, 2560), dtype=torch.float16),
+            torch.ones((rows, 4)),
+        )
+    )
     monkeypatch.setattr(
         sm70_fp16_hc, "get_tp_hc_ll", lambda: SimpleNamespace(project=project)
     )
     monkeypatch.setattr(sm70_fp16_hc, "use_sm70_decode_graph_semantics", lambda: True)
+    return project
+
+
+def _generic_final_mix(x, down_weight, up_weight):
+    lora = hc.hc_silu(torch.nn.functional.linear(x, down_weight), 4)
+    return hc.hc_gate_mix(x, torch.nn.functional.linear(lora, up_weight), 4)
+
+
+@pytest.mark.parametrize(
+    "rows,hc_sp,use_ll", [(64, False, True), (65, False, False), (4, True, False)]
+)
+def test_final_mixer_uses_ll_projection(monkeypatch, rows, hc_sp, use_ll):
+    x = torch.randn((rows, 10240)).half()
+    module = _final_mixer(monkeypatch)
+    down, up = module.input_mix_weight_down, module.input_mix_weight_up
+    project = _mock_ll(monkeypatch, rows)
 
     block, injection = hc.GatedResidual._project(module, x, hc_sp=hc_sp)
     assert injection is None
@@ -448,8 +468,69 @@ def test_final_mixer_uses_ll_projection(monkeypatch, rows, hc_sp, use_ll):
         assert torch.equal(args[0], x)
         assert args[1] is down._sm70_qwen38_hc_batch_packed
         assert args[2] is up._sm70_qwen38_hc_batch_packed
-        assert torch.equal(block, output)
+        assert torch.equal(block, project.return_value[0])
         return
     project.assert_not_called()
-    gate = up(hc.hc_silu(down(x), 4))
+    torch.testing.assert_close(
+        block, _generic_final_mix(x, down.weight, up.weight), rtol=0, atol=0
+    )
+
+
+def test_final_mixer_keeps_lora_wrapped_projection(monkeypatch):
+    x = torch.randn((4, 10240)).half()
+    module = _final_mixer(monkeypatch)
+    base = module.input_mix_weight_up
+    module.input_mix_weight_up = ReplicatedLinearWithLoRA(base)
+    # Stand-in for the adapter update; the wrapper's own forward must run.
+    module.input_mix_weight_up.apply = (
+        lambda x, bias=None: torch.nn.functional.linear(x, base.weight) + 1
+    )
+    project = _mock_ll(monkeypatch, 4)
+
+    block, injection = hc.GatedResidual._project(module, x)
+    project.assert_not_called()
+    assert injection is None
+    down_weight = module.input_mix_weight_down.weight
+    lora = hc.hc_silu(torch.nn.functional.linear(x, down_weight), 4)
+    gate = torch.nn.functional.linear(lora, base.weight) + 1
     torch.testing.assert_close(block, hc.hc_gate_mix(x, gate, 4), rtol=0, atol=0)
+
+
+def test_direct_reload_refreshes_final_mixer_ll_packs(monkeypatch):
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    mixer = torch.nn.Module()
+    mixer.input_mix_weight_down = _hc_linear(monkeypatch, 10240, 320, "down")
+    mixer.input_mix_weight_up = _hc_linear(monkeypatch, 320, 10240, "up")
+    model = torch.nn.Module()
+    model.mixer = mixer
+    # CPU stand-in for the CUDA-only pack preparation (rank 0 shard).
+    monkeypatch.setattr(
+        sm70_fp16_hc,
+        "_prepare_hc_batch_weight",
+        lambda layer: layer.register_buffer(
+            "_sm70_qwen38_hc_batch_packed",
+            sm70_fp16_hc._pack_hc_batch_weight(
+                layer.weight, layer._sm70_qwen38_hc_batch_role, 0
+            ),
+            persistent=False,
+        ),
+    )
+    layers = (mixer.input_mix_weight_down, mixer.input_mix_weight_up)
+    packed = [layer._sm70_qwen38_hc_batch_packed for layer in layers]
+    new = [torch.randn_like(layer.weight) * 0.01 for layer in layers]
+    runner = SimpleNamespace(
+        get_model=lambda: model, model_config=SimpleNamespace(quantization=None)
+    )
+
+    GPUModelRunner.reload_weights(
+        runner,
+        weights_iterator=[
+            ("mixer.input_mix_weight_down.weight", new[0]),
+            ("mixer.input_mix_weight_up.weight", new[1]),
+        ],
+        is_checkpoint_format=False,
+    )
+    for layer, old, weight, role in zip(layers, packed, new, ("down", "up")):
+        assert layer._sm70_qwen38_hc_batch_packed is old
+        assert torch.equal(old, sm70_fp16_hc._pack_hc_batch_weight(weight, role, 0))

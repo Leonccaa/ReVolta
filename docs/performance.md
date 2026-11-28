@@ -10,7 +10,7 @@ For the supported hardware and configurations, see [Support and known limits](kn
 
 ### Test system
 
-All 0.2.0 results come from one machine:
+The PCIe acceptance tables below use one test system. The [NVLink development measurements](#nvlink-tp4-development-measurements) use a separate system.
 
 - Four V100 32 GB PCIe GPUs, all under one PCIe switch with peer-to-peer (P2P) access, no NVLink.
 - Power limit 200 W per GPU.
@@ -46,9 +46,9 @@ The 0.2.0 acceptance tested six configurations. All use TP4 + DCP2 on the test s
 | C: production form | Uncensored AWQ g32 | DFlash2, 7 draft tokens, dynamic draft width (profile default) | GPU KV; INT8 target, FP16 draft | 98 GiB CPU KV pool and 350 GiB `revolta_fs` disk tier | `--gpu-memory-utilization 0.956` |
 | D+E1: public default | Uncensored AWQ g32 | MTP, 4 draft tokens, dynamic draft width (profile default), greedy drafting | GPU KV; INT8 target and draft (`--kv-cache-dtype auto`) | 48 GiB CPU KV pool | Reference configuration in [Getting started](getting-started.md); `--gpu-memory-utilization 0.956` |
 | E4M3 | As D+E1 | As D+E1 | GPU KV; calibrated E4M3 target and draft (`--kv-cache-dtype fp8_e4m3`) | As D+E1 | Functional check only: start, serve and answer quality |
-| E2: Host KV | <!-- TODO(0.2.0-acceptance): checkpoint, E2 --> | MTP <!-- TODO(0.2.0-acceptance): draft tokens, E2 --> | Host KV: main KV history in host memory <!-- TODO(0.2.0-acceptance): KV format and host pool size, E2 --> | <!-- TODO(0.2.0-acceptance): CPU and SSD tiers, E2 --> | <!-- TODO(0.2.0-acceptance): other non-default settings, E2 --> |
-| E3a: NVFP4 + MTP | <!-- TODO(0.2.0-acceptance): NVFP4 checkpoint name, E3a --> | MTP, 5 draft tokens | <!-- TODO(0.2.0-acceptance): KV placement and target / draft format, E3a --> | <!-- TODO(0.2.0-acceptance): CPU and SSD tiers, E3a --> | <!-- TODO(0.2.0-acceptance): other non-default settings, E3a --> |
-| E3b: NVFP4 + DFlash2 | <!-- TODO(0.2.0-acceptance): NVFP4 checkpoint name, E3b --> | DFlash2 <!-- TODO(0.2.0-acceptance): draft tokens, E3b --> | <!-- TODO(0.2.0-acceptance): KV placement and target / draft format, E3b --> | <!-- TODO(0.2.0-acceptance): CPU and SSD tiers, E3b --> | <!-- TODO(0.2.0-acceptance): other non-default settings, E3b --> |
+| E2: Host KV | AWQ | MTP, 5 draft tokens | Host KV: main KV history in host memory <!-- TODO(0.2.0-acceptance): KV format and host pool size, E2 --> | <!-- TODO(0.2.0-acceptance): CPU and SSD tiers, E2 --> | QSA index sharding (`qsa_dcp_index_shard: true`) <!-- TODO(0.2.0-acceptance): remaining non-default settings, E2 --> |
+| E3a: NVFP4 + MTP | <!-- TODO(0.2.0-acceptance): NVFP4 checkpoint variant, E3a --> | MTP, 5 draft tokens | GPU main KV; INT8 target and draft | CPU KV pool, no SSD tier <!-- TODO(0.2.0-acceptance): CPU KV pool size, E3a --> | <!-- TODO(0.2.0-acceptance): other non-default settings, E3a --> |
+| E3b: NVFP4 + DFlash2 | <!-- TODO(0.2.0-acceptance): NVFP4 checkpoint variant, E3b --> | DFlash2 <!-- TODO(0.2.0-acceptance): draft tokens, E3b --> | <!-- TODO(0.2.0-acceptance): KV placement and target / draft format, E3b --> | CPU KV pool, no SSD tier <!-- TODO(0.2.0-acceptance): CPU KV pool size, E3b --> | <!-- TODO(0.2.0-acceptance): other non-default settings, E3b --> |
 
 ## Results
 
@@ -92,7 +92,7 @@ KV capacity at `--max-model-len 524288`, read from the startup log.
 | D+E1: AWQ, MTP4 | INT8 / INT8 | GPU | <!-- TODO(0.2.0-acceptance): GPU KV capacity tokens, D+E1 --> | <!-- TODO(0.2.0-acceptance): capacity ratio at 512K, D+E1 --> |
 | E4M3: AWQ, MTP4 | E4M3 / E4M3 | GPU | <!-- TODO(0.2.0-acceptance): GPU KV capacity tokens, E4M3 --> | <!-- TODO(0.2.0-acceptance): capacity ratio at 512K, E4M3 --> |
 | E2: Host KV, MTP | <!-- TODO(0.2.0-acceptance): target / draft KV format, E2 --> | Host pool | <!-- TODO(0.2.0-acceptance): host KV pool tokens, E2 --> | <!-- TODO(0.2.0-acceptance): capacity ratio at 512K, E2 --> |
-| E3a: NVFP4, MTP5 | <!-- TODO(0.2.0-acceptance): target / draft KV format, E3a --> | GPU | <!-- TODO(0.2.0-acceptance): GPU KV capacity tokens, E3a --> | <!-- TODO(0.2.0-acceptance): capacity ratio at 512K, E3a --> |
+| E3a: NVFP4, MTP5 | INT8 / INT8 | GPU | <!-- TODO(0.2.0-acceptance): GPU KV capacity tokens, E3a --> | <!-- TODO(0.2.0-acceptance): capacity ratio at 512K, E3a --> |
 | E3b: NVFP4, DFlash2 | <!-- TODO(0.2.0-acceptance): target / draft KV format, E3b --> | GPU | <!-- TODO(0.2.0-acceptance): GPU KV capacity tokens, E3b --> | <!-- TODO(0.2.0-acceptance): capacity ratio at 512K, E3b --> |
 
 ### Coming back to a document
@@ -124,6 +124,24 @@ For how closely each quantized checkpoint follows a BF16 reference, see [Quality
 ### Speculative decoding comparison
 
 To compare the two speculative methods in 0.2.0, read C against D+E1 for AWQ (DFlash2 against MTP4) and E3b against E3a for NVFP4 (DFlash2 against MTP5). The AWQ pair also differs in draft KV format and in the CPU KV pool and disk tier; see [Configurations](#configurations). Earlier per-prompt results are in [DFlash2 against MTP4 on PCIe (0.1.2)](#dflash2-against-mtp4-on-pcie-012); which method to choose is in [Choosing a method](speculative-decoding.md#choosing-a-method).
+
+## NVLink TP4 development measurements
+
+The test system had eight V100 SXM2 32 GB GPUs in two fully connected four-GPU groups, with a 275 W power limit per GPU. The run used one group (TP4 + DCP2), NVFP4 with MTP5, INT8 main KV, a 512K context limit, `--gpu-memory-utilization 0.956`, a 48 GiB CPU KV pool and multimodal inputs enabled. It used the [NVLink auto-configuration](configuration.md#nvlink-tp4-auto-configuration) with `--no-async-scheduling` removed. The integration development build (`0.2.0.dev9012`) also included native INT8 decode and prefill changes. These are not final release acceptance numbers or a measurement of the profile change in isolation.
+
+The synthetic short-prompt decode test used one English story template at temperature 1.0. The table includes only runs with no compilation during inference and reports time per decode round, not output throughput.
+
+| Concurrent requests | Before auto-configuration (ms/round) | Development build with auto-configuration (ms/round) |
+| ---: | ---: | ---: |
+| 1 | 26.51 | 16.33 |
+| 4 | 35.52 | 23.95 |
+| 8 | 46.28 | 33.36 |
+
+In a separate 32K single-request decode test, the development build took 16.04 ms per round. Cold prefill time to first token on that build was 1.149 s at 8K, 4.222 s at 32K and 8.405 s at 64K.
+
+## Triton compilation during serving
+
+Some SM70 kernels used to recompile during requests when a buffer slice changed pointer alignment or an integer argument changed divisibility by 16. In 0.2.0 these arguments no longer specialize on those properties, and the existing startup warmup compiles the remaining known variants covered by the fix. The kernel bodies are unchanged. This applies to AWQ and NVFP4 with MTP or DFlash2 on PCIe and NVLink; it does not eliminate all compilation during serving.
 
 ## Quality measurements
 
@@ -173,7 +191,7 @@ Paired measurements on 0.2.0rc12 development builds (same configuration and time
 
 <a id="nvlink-community-result"></a><a id="cold-prefill"></a>
 
-[@jttdev](https://github.com/jttdev) measured **0.1.2 at a 200 W cap per GPU** on 2026-10-24 ([report in #2](https://github.com/Leonccaa/ReVolta/issues/2#issuecomment-6384639530)): 4 × V100-SXM2 32 GB with an NV2 NVLink mesh, Uncensored AWQ `5d0ef929`, 512K views, `--gpu-memory-utilization 0.95`, `--max-num-seqs 8` and a 16 GiB CPU KV pool. DFlash2 used the 0.1.2 recommended settings, including the explicit 1500 MiB graph reserve. It is the only NVLink measurement so far.
+[@jttdev](https://github.com/jttdev) measured **0.1.2 at a 200 W cap per GPU** on 2026-10-24 ([report in #2](https://github.com/Leonccaa/ReVolta/issues/2#issuecomment-6384639530)): 4 × V100-SXM2 32 GB with an NV2 NVLink mesh, Uncensored AWQ `5d0ef929`, 512K views, `--gpu-memory-utilization 0.95`, `--max-num-seqs 8` and a 16 GiB CPU KV pool. DFlash2 used the 0.1.2 recommended settings, including the explicit 1500 MiB graph reserve.
 
 | Requests and prompt | MTP4, tok/s | DFlash2, tok/s | DFlash2 / MTP4 |
 | --- | ---: | ---: | ---: |

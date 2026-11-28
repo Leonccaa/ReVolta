@@ -50,7 +50,25 @@ The profile applies these defaults to the OpenAI-compatible server (`vllm serve`
 | `VLLM_SM70_QSA_GROUPED_LPT`, `VLLM_SM70_GDN_SKINNY_MPLAN` | `1` | Longest-first grouped QSA work and row-count-based GDN input plans. |
 | `VLLM_SM70_DFLASH2_FUSED_QKV_PACK` | `1` for DFlash2 | Fuses eligible post-convolution QKV packing. |
 
-Omitted `--async-scheduling` is still resolved from the executor and the speculative settings. A dynamic schedule and MTP's GDN state replay select synchronous scheduling, which is the recommended setting. An explicit `--async-scheduling` keeps the existing compatibility checks. What async scheduling does to the GDN state depends on the deployment; see [DFlash2 scheduling](dflash2.md#scheduling).
+Outside the fully connected [NVLink TP4 profile](#nvlink-tp4-auto-configuration), omitted `--async-scheduling` is resolved from the executor and the speculative settings. A dynamic schedule and MTP's GDN state replay select synchronous scheduling. An explicit `--async-scheduling` keeps the existing compatibility checks. What async scheduling does to the GDN state depends on the deployment; see [DFlash2 scheduling](dflash2.md#scheduling).
+
+### NVLink TP4 auto-configuration
+
+With `VLLM_SM70_INTERCONNECT=auto`, the SM70 profile selects NVLink defaults for AWQ or NVFP4 with MTP or DFlash2 when all six pairs among the four TP ranks have direct NVLink. This is a single-node, single-replica setup with pipeline parallelism 1. Explicit environment, CLI and JSON settings take precedence.
+
+| Default | What it enables |
+| --- | --- |
+| `VLLM_SM70_NVLINK_HC=1` and `sm70_hc_ll_async: true` | HyperConnection low-latency (HC LL) communication, including with async scheduling. Workers still require P2P access and peer atomics for HC LL. |
+| Asynchronous scheduling | Remove `--no-async-scheduling` from the launch command to use this default. |
+| `--enable-hc-sp` | HyperConnection sequence parallelism for eligible prefill batches. |
+| FP16 paged QSA readers | H12 (`sm70_qsa_paged_fp16_h12`) for eligible DCP2 decode with FP16 GPU main KV; H6 (`sm70_qsa_paged_fp16_h6`) for eligible DCP2 MTP decode with FP16 draft KV. |
+| MTP sampling and draft schedule | `sm70_sparse_target_sampling: "device_top64"` and DSD `[[1, 8, 3]]` without changing the configured draft maximum. |
+
+If the selected GPUs do not form a six-pair direct mesh, startup warns that they are not fully connected and does not apply the NVLink profile. Check `nvidia-smi topo -m` and select a fully connected group in `CUDA_VISIBLE_DEVICES`.
+
+When HC LL is active, the final HyperConnection mixers in the target and MTP draft use the fused down/up projection for up to 64 rows. Larger batches and sequence-parallel prefill keep the generic projection.
+
+The MTP draft FC residual add and all-gather can also run in one peer kernel. This is off by default; add `"sm70_nvlink_mtp_fc_peer": true` to `--kernel-config` to enable it on Model Runner V2 with fully connected NVLink TP4 and HC LL active. It works with AWQ or NVFP4 and GPU or Host KV, for up to 64 rows. It does not apply to DFlash2.
 
 ### Mixed prefill scheduling
 
@@ -99,6 +117,8 @@ All options in this section are deployment scope.
 | `float16` | stable | Model-precision storage. Uses the most GPU memory per token. |
 
 `auto` selects planar INT8 only when the model has QSA selector metadata, `--calculate-kv-scales` is not set and prefill context parallelism is 1. Otherwise the generic vLLM rules apply. Planar formats use four page regions `[K | V | sK | sV]`, not upstream vLLM's inline FP8 page layout. The old name `fp8_e4m3_per_token_head` is removed without an alias.
+
+Pending merge: the ReVolta profile will enable the native paged QSA decode reader by default on SM70 TP4/DCP2 with INT8 main KV and Model Runner V2, on both PCIe and NVLink. This covers eligible target decode (H12) and eligible INT8 MTP draft decode (H6), including reads from the hot pool with Host KV. To turn it off explicitly, add `"sm70_qsa_paged_int8_h12": false` to `--kernel-config`. <!-- TODO(0.2.0-acceptance): confirm the INT8 reader change has merged and verify the default and opt-out in the release build -->
 
 Draft KV:
 
@@ -191,7 +211,7 @@ The engine selects the interconnect automatically and each worker logs `SM70 int
 | `VLLM_SM70_INTERCONNECT` | string | `auto` | `auto`, `pex`, `nccl`, `nvlink` | 0.1.0 | stable | `auto` detects NVLink, then a PCIe switch topology (PIX/PXB) with a fresh P2P check. `pex` skips the topology query but still checks P2P. `nccl` disables custom all-reduce. `nvlink` forces the fully connected path and still checks P2P. `--disable-custom-all-reduce` overrides all of them. |
 | `VLLM_SM70_PCIE_SWITCH_CAR_MAX_BYTES` | integer bytes | `327680` (320 KiB) | ≥ 0 | 0.1.0 | stable | Largest payload the PCIe switch custom all-reduce handles; larger payloads use NCCL. The default covers 42–64 rows of width 2560 in FP16. `0` removes the byte cap but keeps the other custom all-reduce limits. |
 | `VLLM_SM70_PCIE_SWITCH_CAR_GRAPH_ONLY` | boolean | `1` | `0`, `1` | 0.1.0 | stable | `1` uses custom all-reduce only inside CUDA graphs; eager calls use NCCL. With `0`, eager calls also use it, within the same byte cap. |
-| `VLLM_SM70_NVLINK_HC` | boolean | `0` | `0`, `1` | 0.2.0 | experimental | Flash-Next HC sharding, fused all-reduce and HC, and the QSA DCP2 query exchange and output merge over NVLink. All six GPU pairs must have direct NVLink and native peer atomics; `VLLM_SM70_INTERCONNECT=nvlink` does not bypass this check. Asynchronous scheduling turns it off. The QSA route takes FP16 queries with six 256-element heads per rank and up to 64 rows. It can change floating-point rounding. |
+| `VLLM_SM70_NVLINK_HC` | boolean | `0` | `0`, `1` | 0.2.0 | experimental | Flash-Next HC sharding, fused all-reduce and HC, and the QSA DCP2 query exchange and output merge over NVLink. All six GPU pairs must have direct NVLink and native peer atomics; `VLLM_SM70_INTERCONNECT=nvlink` does not bypass this check. The [NVLink TP4 profile](#nvlink-tp4-auto-configuration) sets it to `1` and sets `sm70_hc_ll_async: true` to allow it with asynchronous scheduling. The QSA route takes FP16 queries with six 256-element heads per rank and up to 64 rows. It can change floating-point rounding. |
 | `VLLM_SM70_DCP2_P2P` | boolean | `0` | `0`, `1` | 0.2.0 | experimental | QSA DCP2 query and packed output/LSE exchange through the registered PCIe switch push buffers, with the A2A DCP backend (the Flash-Next default). It covers eager uniform decode and dedicated FULL decode graphs up to 53 rows; PIECEWISE graphs keep NCCL. In 0.2.0 tests with four GPUs and AWQ, it gave no stable gain in cold time to first token or decode, and fixed-prompt outputs matched the NCCL path token for token. Needs the native extension from the same build. |
 
 ## Sampling parameters

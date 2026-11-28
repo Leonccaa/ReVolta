@@ -39,7 +39,7 @@ The modes are described in [KV offload](kv-offload.md).
 | AWQ g32 | DFlash2, 7 drafts with DSD | GPU KV, INT8, CPU and disk offload | Full core tests (the maintainer's production form) | <!-- TODO(0.2.0-acceptance): acceptance result, C production form --> |
 | AWQ g32 | MTP, 4 drafts with DSD | GPU KV, INT8, 48 GiB CPU pool | Reduced core tests (the [reference launch](getting-started.md#4-launch)) | <!-- TODO(0.2.0-acceptance): acceptance result, D+E1 public default AWQ + MTP4 --> |
 | AWQ g32 | MTP, 4 drafts with DSD | GPU KV, scalar E4M3 | Functional check only | <!-- TODO(0.2.0-acceptance): functional check result, E4M3 --> |
-| <!-- TODO(0.2.0-acceptance): weights and draft count, E2 Host KV + MTP --> | MTP | Host KV | Host KV path and offload readback | <!-- TODO(0.2.0-acceptance): acceptance result, E2 Host KV + MTP --> |
+| AWQ | MTP, 5 drafts | Host KV | Host KV path and offload readback | <!-- TODO(0.2.0-acceptance): acceptance result, E2 Host KV + MTP --> |
 | NVFP4 | MTP, 5 drafts | GPU KV | Reduced core tests | <!-- TODO(0.2.0-acceptance): acceptance result, E3a NVFP4 + MTP5 --> |
 | NVFP4 | DFlash2 | GPU KV | Reduced core tests | <!-- TODO(0.2.0-acceptance): acceptance result, E3b NVFP4 + DFlash2 --> |
 

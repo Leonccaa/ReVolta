@@ -58,11 +58,22 @@ The PCIe results below cover six configurations. All use TP4 + DCP2 on the syste
 
 All values in this section are from the final 0.2.0 package on the PCIe test system above, except for the E4M3 candidate results.
 
-### Output speed
+### Real-prompt speed
 
-<a id="speed"></a>
+Decode speed on the 97 sampled prompts of RevBench-Accept v1 (chat, coding, math, tool calls, 8K and 32K documents and agent turns), one request at a time, and the same prompts in groups of concurrent requests. These are the numbers to expect for real use; the synthetic test in the next section measures time per round and runs low.
 
-Observed end-to-end output in tokens/s on the synthetic short-prompt workload.
+| Configuration | Single request, median | Coding | Long 32K documents | Agent steps |
+| --- | ---: | ---: | ---: | ---: |
+| AWQ, DFlash2, GPU KV (production) | 168.3 tok/s | 216.8 tok/s | 125.3 tok/s | 196.7 tok/s |
+| AWQ, MTP4, GPU KV (public default) | 158.4 tok/s | 180.6 tok/s | 122.2 tok/s | 179.8 tok/s |
+
+"Agent steps" are the tool-reading and execution turns of agent sessions. With the production configuration, the same prompts in concurrent groups gave a total output of 227.5 / 341.5 / 417.9 / 451.6 tok/s at 2 / 4 / 6 / 8 requests.
+
+### Synthetic short-prompt output
+
+<a id="speed"></a><a id="output-speed"></a>
+
+Observed end-to-end output in tokens/s on the synthetic short-prompt workload. Random English stories accept few draft tokens, so these values are lower than with real prompts; use them to compare time per round.
 
 | Configuration | C1 | C4 | C8 |
 | --- | ---: | ---: | ---: |
@@ -142,6 +153,17 @@ To compare the two speculative methods in 0.2.0, compare the production configur
 The 0.2.0 release package ran on four V100-SXM2 32 GB GPUs, with two direct NVLink links on each of the six GPU pairs (NV2) and a 300 W power limit per GPU. The runs used TP4 + DCP2, a 512K context limit, up to eight sequences and `--gpu-memory-utilization 0.956`. The Xeon Gold 6130 differs from the PCIe test system's CPU; DFlash2 uses synchronous scheduling, so CPU time affects the measured round times.
 
 We omitted `--no-async-scheduling` and left draft-width and NVLink settings to the [NVLink profile](configuration.md#nvlink-tp4-auto-configuration). NVFP4 + MTP5 ran asynchronously, with three drafts at one to eight requests; AWQ + DFlash2 stayed synchronous.
+
+### NVLink real-prompt speed
+
+RevBench-Accept v1 on the release package, one request at a time:
+
+| Configuration | Single request, median | Coding | Long 32K documents | Agent steps |
+| --- | ---: | ---: | ---: | ---: |
+| NVFP4 + MTP5, GPU KV | 194.0 tok/s | 215.4 tok/s | 211.6 tok/s | 223.0 tok/s |
+| AWQ + DFlash2, GPU KV | 183.0 tok/s | 244.5 tok/s | 216.1 tok/s | 222.9 tok/s |
+
+With eight requests at once, TokenSpeed with 16K documents and thinking off measured a total of **812.5 tok/s** for NVFP4 + MTP and **631.1 tok/s** for AWQ + DFlash2, with a single-request peak of 261.0 and 276.5 tok/s. That test ran on a 0.2.0 development build with manual NVLink settings on another fully connected system. In a same-system test, the automatic settings of the release took 0.8–1.6 ms more per round than the best manual MTP settings (with a different launch around them), so expect slightly lower concurrent numbers with the release package.
 
 ### NVLink output speed
 

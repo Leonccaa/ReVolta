@@ -855,8 +855,8 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         if (
             grouped_rows == 0
             and layer.sm70_qsa_paged_h12
-            and 0 < query.shape[0] <= H12_MAX_ROWS
-            and 0 < local_width <= H12_MAX_WIDTH
+            and query.shape[0] <= H12_MAX_ROWS
+            and local_width <= H12_MAX_WIDTH
             and get_forward_context().is_uniform_decode
         ):
             qsa_paged_h12(

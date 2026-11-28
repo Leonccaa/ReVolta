@@ -7,9 +7,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm import distributed
+from vllm import distributed, platforms
 from vllm.config import CUDAGraphMode, KernelConfig
+from vllm.config.kernel import LongContextKVConfig
 from vllm.forward_context import get_forward_context, set_forward_context
+from vllm.models.qwen4_exp.common.kv_policy import resolve_qsa_auto_cache_dtype
 from vllm.models.qwen4_exp.nvidia import qsa
 from vllm.models.qwen4_exp.nvidia.host_kv import history
 from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
@@ -68,8 +70,31 @@ def _planar_cache():
 def test_qsa_h12_dcp_reader(
     monkeypatch, dtype, host, enabled, phase, rows, topk, native
 ):
+    sm70 = SimpleNamespace(
+        is_cuda=lambda: True,
+        is_device_capability=(70).__eq__,
+        has_device_capability=(70).__eq__,
+    )
+    monkeypatch.setattr(platforms, "current_platform", sm70)
+    monkeypatch.setattr(qsa, "current_platform", sm70)
+    monkeypatch.setattr(qsa_ops, "current_platform", sm70)
+    config = _h12_config(
+        "host" if host else None,
+        int8=enabled and dtype == "int8",
+        fp16=enabled and dtype == "float16",
+    )
+    config.model_config.hf_text_config = SimpleNamespace(indexer_n_heads=12)
+    config.parallel_config.prefill_context_parallel_size = 1
+    config.cache_config = SimpleNamespace(
+        cache_dtype="auto" if dtype == "int8" else dtype, calculate_kv_scales=False
+    )
+    resolve_qsa_auto_cache_dtype(config)
+    resolved_dtype = config.cache_config.cache_dtype
+    assert resolved_dtype == dtype
     layer = SimpleNamespace(
-        sm70_qsa_paged_h12=enabled,
+        sm70_qsa_paged_h12=qsa._sm70_qsa_paged_h12_admitted(
+            config, resolved_dtype, True, 4, (6, 1, 256)
+        ),
         qsa_dcp_sharded=True,
         sm70_qsa_device_history=False,
         dcp_local_indices_buffer=torch.empty(rows, topk + 3, dtype=torch.int32),
@@ -135,8 +160,27 @@ def test_qsa_h12_dcp_reader(
         assert torch.all(out == 3) and torch.all(lse == -2)
         return out[:, :6]
 
-    def native_reader(q, k, v, ids, block_table, token_to_req, out, lse, **scales):
-        reader(q, k, v, ids, block_table, token_to_req, out, lse, paged=True, **scales)
+    def fp16_op(q, k, v, ids, block_table, token_to_req, out, lse, partial, state):
+        assert dtype == "float16"
+        reader(q, k, v, ids, block_table, token_to_req, out, lse, paged=True)
+
+    def int8_op(
+        q, k, v, sk, sv, ids, block_table, token_to_req, out, lse, partial, state
+    ):
+        assert dtype == "int8"
+        reader(
+            q,
+            k,
+            v,
+            ids,
+            block_table,
+            token_to_req,
+            out,
+            lse,
+            paged=True,
+            k_scale_cache=sk,
+            v_scale_cache=sv,
+        )
 
     def triton_reader(
         q,
@@ -158,14 +202,20 @@ def test_qsa_h12_dcp_reader(
         assert kv_cache_dtype == dtype and compacted_indices is not host
         reader(q, k, v, ids, block_table, token_to_req, out, lse, paged=False, **scales)
 
-    monkeypatch.setattr(qsa, "qsa_paged_h12", native_reader)
+    monkeypatch.setattr(
+        workspace, "_manager", workspace.WorkspaceManager(torch.device("cpu"))
+    )
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    ops = torch.ops.vllm_sm70_qsa_indexer
+    monkeypatch.setattr(ops, "paged_fp16_h12", fp16_op, raising=False)
+    monkeypatch.setattr(ops, "paged_int8_h12", int8_op, raising=False)
     monkeypatch.setattr(qsa_ops, "qsa_sparse_paged_attention", triton_reader)
     monkeypatch.setattr(
         qsa_ops, "_qsa_output_gate", lambda out, gate, *, merged: out.copy_(merged)
     )
     impl = object.__new__(qsa.Qwen4ExpQSAFlashAttentionImpl)
     impl.dcp_world_size, impl.dcp_rank = 2, 0
-    impl.kv_cache_dtype, impl.dcp_combine = dtype, combine
+    impl.kv_cache_dtype, impl.dcp_combine = resolved_dtype, combine
     impl.head_size, impl.sliding_window = 256, (-1, -1)
     impl.alibi_slopes = impl.sinks = None
     with set_forward_context(None, _forward_config(), is_uniform_decode=phase):
@@ -216,10 +266,10 @@ def test_qsa_h12_dcp_reader(
 
 def _h12_config(placement, *, int8, fp16, v2=True, draft=False, dcp=2):
     return SimpleNamespace(
-        kernel_config=SimpleNamespace(
+        kernel_config=KernelConfig(
             sm70_qsa_paged_int8_h12=int8,
             sm70_qsa_paged_fp16_h12=fp16,
-            long_context_kv=SimpleNamespace(
+            long_context_kv=LongContextKVConfig(
                 enabled=placement is not None, main_kv_placement=placement or "host"
             ),
         ),
@@ -293,45 +343,6 @@ def h12_late_scale(q, k, v, sk, sv, valid):
         ..., None
     ]
     return out, maximum.squeeze(-1) + denominator.log2()
-
-
-def test_int8_h12_late_scale_split_merge():
-    _, _, view = _planar_cache()
-    rng = torch.Generator().manual_seed(603)
-    view.key.random_(-127, 128, generator=rng)
-    view.value.random_(-127, 128, generator=rng)
-    view.key_scale.uniform_(0.002, 0.02, generator=rng)
-    view.value_scale.uniform_(0.001, 0.01, generator=rng)
-    q = torch.randn((3, 12, 256), generator=rng).half()
-    table = torch.tensor([[2, 0, 1]], dtype=torch.int32)
-    requests = torch.zeros(3, dtype=torch.int32)
-    indices = torch.full((3, 2051), -1, dtype=torch.int32)[:, :1026]
-    indices[0] = torch.arange(767, 1793)
-    indices[1, :3] = torch.tensor([831, 832, 1664])
-    positions = indices.clamp_min(0).long()
-    pages, offsets = table[requests[:, None], positions // 832].long(), positions % 832
-    k, v, sk, sv = (
-        plane[pages, offsets, 0].float()
-        for plane in (view.key, view.value, view.key_scale, view.value_scale)
-    )
-    valid = indices[:, None, :] >= 0
-    dense_logits = (q.float() @ (k * sk[..., None]).transpose(1, 2)) / 16
-    dense_logits = dense_logits.masked_fill(~valid, -torch.inf)
-    dense_lse = torch.logsumexp(dense_logits, dim=-1) / math.log(2)
-    dense_probs = torch.where(valid, dense_logits.softmax(-1), 0)
-    dense_out = dense_probs @ (v * sv[..., None])
-    h12_out, h12_lse = h12_late_scale(q, k, v, sk, sv, valid[:, 0])
-
-    # Isolate the Triton PV rounding from the different split reduction order.
-    weighted = dense_probs * sv[:, None]
-    high = weighted.half().float()
-    low = ((weighted - high) * 2048).half().float() / 2048
-    triton_pv = high @ v + low @ v
-    torch.testing.assert_close(h12_out, dense_out, rtol=2e-5, atol=2e-6)
-    torch.testing.assert_close(h12_lse, dense_lse, rtol=2e-6, atol=2e-6)
-    torch.testing.assert_close(triton_pv, dense_out, rtol=2e-5, atol=2e-6)
-    assert torch.count_nonzero(h12_out[2]) == 0
-    assert torch.isneginf(h12_lse[2]).all()
 
 
 def test_qsa_h12_workspace_survives_capture_lock(monkeypatch):

@@ -53,6 +53,16 @@ The PCIe GPU pools above use Uncensored AWQ g32, a 512K context limit and up to 
 
 Cold prefill uses one request and divides the actual prompt length by median prefill time for PCIe (AWQ + DFlash2) or the time to first token of the median-latency request for NVLink (NVFP4 + MTP5). NVLink was not tested at 128K in this benchmark. See [Performance](https://github.com/Leonccaa/ReVolta/blob/main/docs/performance.md#nvlink-tp4-acceptance) for test conditions.
 
+### Host KV: keep long sessions in RAM
+
+![Host KV: the GPU keeps the model, the attention index and hot pages; RAM keeps the full K/V history of every session; an optional SSD keeps pages across restarts](https://raw.githubusercontent.com/Leonccaa/ReVolta/main/docs/images/host-kv.svg)
+
+- **Why:** after the model, a 32 GB V100 has about 6.3 GiB left for KV, so four GPUs hold two or three 512K sessions. Flash-Next's sparse attention reads only the selected past tokens each step, so the rest of the history can wait in RAM, which V100 servers have plenty of.
+- **How much:** **1.31M → 7.33M tokens** with a 98 GiB store (5.6×), and eight 1M-token sessions with a 192 GiB store. The cost is **2–4 ms per decode round** (16.4 → 19.7 ms at one request on NVLink).
+- **For whom:** small and medium teams that share one server for coding agents, long documents and research sessions that stay open for hours and are revisited over days, on servers with plenty of RAM and an NVMe SSD.
+
+How it works, sizing and when GPU KV is the better choice: [Host KV](https://github.com/Leonccaa/ReVolta/blob/main/docs/host-kv.md).
+
 ## Models
 
 | Model | Weights (bits per weight: routed experts / whole model) | Download | PLE table in host memory | GPU KV pool (0.2.0) | Quality vs its BF16 parent: KL ↓ / top-1 ↑ | Notes |
@@ -95,6 +105,7 @@ For another checkpoint, follow its [preparation guide](https://github.com/Leoncc
 | Choose between MTP and DFlash2 | [Speculative decoding](https://github.com/Leonccaa/ReVolta/blob/main/docs/speculative-decoding.md) |
 | Enable DFlash2 and choose its settings | [DFlash2](https://github.com/Leonccaa/ReVolta/blob/main/docs/dflash2.md) |
 | Change the number of draft tokens with the batch size | [Dynamic speculative decoding](https://github.com/Leonccaa/ReVolta/blob/main/docs/dynamic-speculative-decoding.md) |
+| Understand Host KV and decide whether it fits your team and server | [Host KV](https://github.com/Leonccaa/ReVolta/blob/main/docs/host-kv.md) |
 | Keep evicted prefixes in CPU memory or on disk, or the KV cache in host memory | [KV offload](https://github.com/Leonccaa/ReVolta/blob/main/docs/kv-offload.md); every key and metric: [KV offload reference](https://github.com/Leonccaa/ReVolta/blob/main/docs/kv-offload-reference.md) |
 | Look up launch options, environment variables, sampling defaults and memory budgets | [Configuration](https://github.com/Leonccaa/ReVolta/blob/main/docs/configuration.md) |
 | Compare measured speed, KV capacity and quantization quality | [Performance](https://github.com/Leonccaa/ReVolta/blob/main/docs/performance.md) |

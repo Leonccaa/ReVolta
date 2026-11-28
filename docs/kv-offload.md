@@ -18,8 +18,8 @@ Terms used on this page:
 | --- | --- | --- | --- | --- |
 | [GPU KV only](#gpu-kv-only) | Stable | Nowhere: they are computed again | None | Host memory is tight |
 | [GPU KV + CPU offload](#cpu-offload-reference-configuration) | Stable; used by the reference launch | The CPU KV pool in `/dev/shm` | `cpu_bytes_to_use` (48 GiB in the reference) | Most deployments |
-| [GPU KV + CPU + disk](#disk-tier-revolta_fs) | Supported; used by the production form in the 0.2.0 acceptance (configuration C) | The CPU KV pool, then the `revolta_fs` disk tier on a local SSD | The CPU pool, plus SSD space | Cached documents should survive a restart |
-| [Host KV](#host-kv-long-context) | Supported; validated with MTP (acceptance configuration E2) | Main K/V lives in host memory; optional SSD | `host_store_gib` | Long contexts or many long requests do not fit in GPU KV |
+| [GPU KV + CPU + disk](#disk-tier-revolta_fs) | Supported; used by the production configuration in the 0.2.0 acceptance | The CPU KV pool, then the `revolta_fs` disk tier on a local SSD | The CPU pool, plus SSD space | Cached documents should survive a restart |
+| [Host KV](#host-kv-long-context) | Supported; validated with MTP in the 0.2.0 acceptance; see [Host KV](host-kv.md) for how it works and when to use it | Main K/V lives in host memory; optional SSD | `host_store_gib` | Long contexts or many long requests do not fit in GPU KV |
 
 All modes use the same model, KV format (INT8 by default) and speculative decoding settings. Only `--kv-transfer-config` and, for Host KV, `--kernel-config` change.
 

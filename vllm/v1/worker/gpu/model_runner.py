@@ -2188,6 +2188,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     and uniform_tok_count is not None
                 ),
             ):
+                # QSA runs outside PIECEWISE capture and uses the live batch phase.
+                get_forward_context().additional_kwargs["qsa_has_prefill"] = bool(
+                    input_batch.is_prefilling_np.any()
+                )
                 # Piecewise graphs can replay the same shape for prefill.
                 if (
                     (

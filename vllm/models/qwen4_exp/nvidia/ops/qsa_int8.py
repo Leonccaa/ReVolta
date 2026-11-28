@@ -721,9 +721,8 @@ def dcp_grouped(
         codec is INT8
         and current_platform.is_device_capability(70)
         and not torch.cuda.is_current_stream_capturing()
-        and not (
-            is_forward_context_available() and get_forward_context().is_uniform_decode
-        )
+        and is_forward_context_available()
+        and get_forward_context().additional_kwargs.get("qsa_has_prefill", False)
     )
     if not use_rows:
         rows = rows // 8 * 8

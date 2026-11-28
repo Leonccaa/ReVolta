@@ -8,6 +8,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.config import CUDAGraphMode
+from vllm.forward_context import ForwardContext, override_forward_context
 from vllm.models.qwen4_exp.nvidia.ops import qsa as ops
 from vllm.models.qwen4_exp.nvidia.ops import qsa_int8 as reader
 from vllm.v1.attention.kv_cache_view import KVCacheView, bind_planar_kv_cache
@@ -64,8 +66,6 @@ def test_workspace_cache_separates_streams(monkeypatch):
 
 
 def test_workspace_reserves_capture_width_and_keeps_its_address():
-    from vllm.forward_context import ForwardContext, override_forward_context
-
     context = ForwardContext({}, {}, {}, max_cudagraph_capture_size=40)
     with override_forward_context(context):
         target = ops._qsa_xqa_page4_workspace(_query(5), 9, torch.float32)[0]
@@ -313,7 +313,7 @@ def test_planar_int8_dcp_prefill_writes_all_rows_with_local_width(monkeypatch):
         assert ks is sk and vs is sv and blocks is table and req is requests
         assert ids.shape == (rows, 1026) and ids.stride() == (2051, 1)
         assert ids.data_ptr() == indices.data_ptr()
-        assert torch.all(pos == 31) and lengths.tolist() == [32]
+        assert torch.all(pos == 31) and lengths.tolist() == [32] * table.shape[0]
         assert pos.dtype == torch.int64 and lengths.dtype == torch.int32
         assert dst is out and dst_lse is lse
         dst.fill_(1)
@@ -344,7 +344,15 @@ def test_planar_int8_dcp_prefill_writes_all_rows_with_local_width(monkeypatch):
             local_width=1026,
         )
 
-    assert call() == rows and calls == ["rows"]
+    context = ForwardContext(
+        {},
+        {},
+        {},
+        cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+        additional_kwargs={"qsa_has_prefill": True},
+    )
+    with override_forward_context(context):
+        assert call() == rows and calls == ["rows"]
     assert torch.all(out == 1) and torch.all(lse == 2)
 
     def grouped(query, _k, _v, ids, *args, **kwargs):
@@ -353,4 +361,14 @@ def test_planar_int8_dcp_prefill_writes_all_rows_with_local_width(monkeypatch):
 
     monkeypatch.setattr(reader, "native_grouped", grouped)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    assert call() == rows - 1 and calls == ["rows", "grouped"]
+    with override_forward_context(context):
+        assert call() == rows - 1 and calls == ["rows", "grouped"]
+
+    # A PIECEWISE batch can have one decode row per request while this split
+    # op runs outside stream capture.
+    table = table.repeat(rows, 1)
+    requests = torch.arange(rows, dtype=torch.int32)
+    context.additional_kwargs["qsa_has_prefill"] = False
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    with override_forward_context(context):
+        assert call() == rows - 1 and calls == ["rows", "grouped", "grouped"]

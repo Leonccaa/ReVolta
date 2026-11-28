@@ -145,7 +145,7 @@ We omitted `--no-async-scheduling` and left draft-width and NVLink settings to t
 
 ### NVLink output speed
 
-Same synthetic short-story workload as on PCIe. The table gives aggregate output in tok/s and wall-clock milliseconds per decode round. Medians exclude the warm-up and any pass with inference-time compilation. Each cell summarises three clean passes, except AWQ + DFlash2 at C1, which has two. The [release notes](https://github.com/Leonccaa/ReVolta/releases/tag/v0.2.0) report 109.6 tok/s at that point using all three measured passes.
+Same synthetic short-story workload as on PCIe. The table gives aggregate output in tok/s and wall-clock milliseconds per decode round. Medians exclude the warm-up and any pass with inference-time compilation. Each cell summarises three clean passes, except AWQ + DFlash2 at C1, which has two.
 
 | Configuration | C1 tok/s | C4 tok/s | C8 tok/s | C1 ms/round | C4 ms/round | C8 ms/round |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |

@@ -25,28 +25,28 @@ MTP4 drafts up to four tokens per step with the model's own multi-token-predicti
 | | MTP4 (reference launch; draft KV inherits INT8) | DFlash2 (our production setup; FP16 draft KV) |
 | --- | ---: | ---: |
 | Context per request | 512K tokens | 512K tokens |
-| GPU KV pool | <!-- TODO(0.2.0-acceptance): GPU KV pool tokens from the startup log, D+E1 --> | <!-- TODO(0.2.0-acceptance): GPU KV pool tokens from the startup log, C --> |
-| GPU KV pool / 512K tokens (capacity ratio) | <!-- TODO(0.2.0-acceptance): GPU KV pool / 524,288, D+E1 --> | <!-- TODO(0.2.0-acceptance): GPU KV pool / 524,288, C --> |
+| GPU KV pool | 1,194,816 tokens | 1,851,676 tokens |
+| GPU KV pool / 512K tokens (capacity ratio) | 2.28× | 3.53× |
 | Concurrent requests | 8 | 8 |
 
-With the optional Host KV mode, the main KV cache lives in host memory instead: <!-- TODO(0.2.0-acceptance): usable Host KV tokens and host pool size, E2 -->. Prefixes evicted from the GPU stay in CPU memory or on disk: a cached 32K-token document comes back from CPU memory in **0.6 s**, and after an engine restart from a local NVMe disk tier in **1.5 s**, instead of **10.1 s** when recomputed (0.1.4, DFlash2, E4M3 KV). <!-- TODO(0.2.0-acceptance): 32K readback time from CPU memory and from disk after a restart, and recompute time, C --> See [KV offload](https://github.com/Leonccaa/ReVolta/blob/main/docs/kv-offload.md).
+With optional Host KV, the 98 GiB host pool held **7,329,312 usable tokens** with AWQ, MTP5 and INT8 KV. In the separate GPU KV test with DFlash2, one request revisiting a 32K-token document reached its first token in **0.599 s** from CPU memory or **1.011 s** from SSD after restart, versus **8.56 s** with cold recomputation. See [KV offload](https://github.com/Leonccaa/ReVolta/blob/main/docs/kv-offload.md).
 
-**Speed** (0.2.0; total output tokens/s, the faster of MTP4 and DFlash2 at each concurrency, 200 W per GPU <!-- TODO(0.2.0-acceptance): response length and prompt set, C and D+E1 -->)
+**Speed** (0.2.0, 200 W per GPU): observed end-to-end output from short synthetic English story prompts, sampled without the chat template and fixed at 512 output tokens per request. Each concurrency shows the higher recorded total output rate of MTP4 and DFlash2 on this workload, not a ranking for real prompts.
 
 | System | 1 request | 4 | 8 | Cold prefill, 32K / 128K prompt |
 | --- | ---: | ---: | ---: | ---: |
-| 4 × V100 32 GB PCIe, one PCIe switch with P2P (our server) | <!-- TODO(0.2.0-acceptance): C1 output tok/s, best of C and D+E1 --> | <!-- TODO(0.2.0-acceptance): C4 output tok/s, best of C and D+E1 --> | <!-- TODO(0.2.0-acceptance): C8 output tok/s, best of C and D+E1 --> | <!-- TODO(0.2.0-acceptance): cold prefill tok/s at 32K / 128K, C --> |
+| 4 × V100 32 GB PCIe, one PCIe switch with P2P (our server) | 114.4 tok/s | 283.0 tok/s | 378.1 tok/s | 3,787 / 3,898 prompt tok/s |
 
-0.2.0 has not been measured on NVLink. Community results on 4 × V100-SXM2 32 GB with NVLink (0.1.1 and 0.1.2), the per-method breakdown and the test conditions are in [Performance](https://github.com/Leonccaa/ReVolta/blob/main/docs/performance.md).
+Cold prefill uses DFlash2 with one request, dividing the actual synthetic prompt length by the median time to first token. For the separate 0.2.0 NVLink acceptance and test conditions, see [Performance](https://github.com/Leonccaa/ReVolta/blob/main/docs/performance.md#nvlink-tp4-acceptance).
 
 ## Models
 
 | Model | Weights (bits per weight: routed experts / whole model) | Download | PLE table in host memory | GPU KV pool (0.2.0) | Quality vs its BF16 parent: KL ↓ / top-1 ↑ | Notes |
 | --- | --- | ---: | ---: | ---: | ---: | --- |
-| [Uncensored AWQ g32](https://huggingface.co/leoncca/Qwen3.8-Flash-Next-Uncensored-AWQ-g32) **(recommended)** | 4-bit AWQ g32 experts, FP8 PLE, BF16 rest (**4.63 / 5.95**) | 142 GB, MTP draft included | 48 GiB | <!-- TODO(0.2.0-acceptance): GPU KV pool tokens, MTP4 INT8, D+E1 --> (MTP4) | 0.0214 / 97.1% | Uncensored fine-tune; the reference setup |
+| [Uncensored AWQ g32](https://huggingface.co/leoncca/Qwen3.8-Flash-Next-Uncensored-AWQ-g32) **(recommended)** | 4-bit AWQ g32 experts, FP8 PLE, BF16 rest (**4.63 / 5.95**) | 142 GB, MTP draft included | 48 GiB | 1,194,816 tokens (MTP4) | 0.0214 / 97.1% | Uncensored fine-tune; the reference setup |
 | [Base AWQ g32](https://huggingface.co/leoncca/Qwen3.8-Flash-Next-AWQ-g32) | 4-bit AWQ g32 experts, FP8 PLE, BF16 rest (**4.63 / 5.95**) | 142 GB, MTP draft included | 48 GiB | Same layout as Uncensored | 0.0207 / 97.1% | The original model |
-| [Standard NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4) | NVFP4 experts, FP8 PLE, BF16 rest (**4.50 / 5.86**) | 135 GB + 5 GB draft pack | 48 GiB | <!-- TODO(0.2.0-acceptance): GPU KV pool tokens, Standard NVFP4 MTP5 INT8, E3a --> (MTP5) | 0.0303 / 96.4% | Widely used community format |
-| [NVIDIA FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local) | NVFP4 experts and PLE, MXFP8 attention and shared experts (**4.26 / 4.53**) | 102 GB, MTP layer built in | **27 GiB** | <!-- TODO(0.2.0-acceptance): GPU KV pool tokens, FP4-Local MTP5 INT8, E3c smoke --> (MTP5) | 0.0380 / 95.9% | NVIDIA's official checkpoint; least host memory |
+| [Standard NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4) | NVFP4 experts, FP8 PLE, BF16 rest (**4.50 / 5.86**) | 135 GB + 5 GB draft pack | 48 GiB | 1,488,853 tokens (MTP5) | 0.0303 / 96.4% | Widely used community format |
+| [NVIDIA FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local) | NVFP4 experts and PLE, MXFP8 attention and shared experts (**4.26 / 4.53**) | 102 GB, MTP layer built in | **27 GiB** | 1,518,412 tokens (MTP5 smoke test) | 0.0380 / 95.9% | NVIDIA's official checkpoint; least host memory |
 
 The PLE tables are the model's n-gram embedding tables; they hold 51 billion of its 177 billion stored parameters and stay in host memory by default. V100 has no BF16 units, so ReVolta runs BF16 weights in FP16, which `--dtype auto` selects on V100. Bits per weight include quantization scales and zero points and exclude the MTP draft; the whole-model figure covers all 177 billion stored parameters. The full weight layout of each checkpoint is in [Checkpoints](https://github.com/Leonccaa/ReVolta/blob/main/docs/checkpoints.md#choose-a-checkpoint).
 
@@ -103,7 +103,7 @@ The complete list and the test boundaries are in [Support and known limits](http
 
 ReVolta focuses on dependable daily service on V100. Releases check output correctness, long-context retrieval, concurrent use, cache recovery and speed on the reference machine.
 
-After 0.2.0, work continues on faster decoding with several concurrent requests, smoother service when long prompts arrive during decoding, and tuning for NVLink systems once one is available for testing. Longer-term work includes lower host-memory use and fewer runtime dependencies. There are no release dates.
+After 0.2.0, work continues on faster decoding with several concurrent requests, smoother service when long prompts arrive during decoding, and further tuning for NVLink systems. Longer-term work includes lower host-memory use and fewer runtime dependencies. There are no release dates.
 
 ## Getting help
 

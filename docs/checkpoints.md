@@ -10,9 +10,9 @@ Use this guide to choose a Qwen3.8 Flash-Next checkpoint, prepare it with its MT
 
 | Checkpoint | Weights | MTP draft | Test status |
 | --- | --- | --- | --- |
-| [Uncensored AWQ g32](https://huggingface.co/leoncca/Qwen3.8-Flash-Next-Uncensored-AWQ-g32) (default) | 4-bit AWQ routed experts (group size 32), FP8 E4M3 PLE tables, 16-bit other weights; 137 GB | Its own `mtp-fp8/` | Covered by the 0.2.0 release tests <!-- TODO(0.2.0-acceptance): pass/fail summary, C, D+E1, E4M3, E2 --> |
+| [Uncensored AWQ g32](https://huggingface.co/leoncca/Qwen3.8-Flash-Next-Uncensored-AWQ-g32) (default) | 4-bit AWQ routed experts (group size 32), FP8 E4M3 PLE tables, 16-bit other weights; 137 GB | Its own `mtp-fp8/` | Passed 0.2.0 acceptance with DFlash2, GPU KV + MTP4 and Host KV + MTP5. E4M3 passed functional checks on an earlier 0.2.0 candidate build |
 | [Base AWQ g32](https://huggingface.co/leoncca/Qwen3.8-Flash-Next-AWQ-g32) | Same layout as Uncensored AWQ | Its own `mtp-fp8/`, converted and calibrated separately | Quantization quality measured; serving acceptance not run |
-| [Standard NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4) | ModelOpt NVFP4 routed experts; about 126 GiB | The Uncensored AWQ draft, shipped in the NVFP4 scale pack | Covered by the 0.2.0 release tests with MTP5 and DFlash2 <!-- TODO(0.2.0-acceptance): pass/fail summary, E3a, E3b -->; passed the 0.1.0 release gate |
+| [Standard NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4) | ModelOpt NVFP4 routed experts; about 126 GiB | The Uncensored AWQ draft, shipped in the NVFP4 scale pack | Passed 0.2.0 acceptance with MTP5 and DFlash2; passed the 0.1.0 release gate |
 | [NVIDIA FP4-Local](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local) | NVFP4 experts, MXFP8 layers, NVFP4 PLE table; about 95 GiB | Built-in MTP layer | Passed the 0.1.0 release gate; not in the 0.2.0 release tests |
 | [NVIDIA NVFP4-QAD](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4-QAD) | NVFP4 routed and shared experts, MXFP8 GDN and QSA projections, FP8 PLE table | Built-in MTP layer | Loading and serving checks passed in 0.2.0rc12; quantization quality not measured. The repository is not publicly downloadable at the time of writing |
 

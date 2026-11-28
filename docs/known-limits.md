@@ -11,7 +11,7 @@ ReVolta is built for four or more V100 32 GB GPUs and validated on four. We reco
 | Hardware | Status |
 | --- | --- |
 | 4 × V100 32 GB PCIe under one PCIe switch (PIX/PXB in `nvidia-smi topo -m`), P2P enabled | Reference system, with a 128 GiB container memory limit. Release acceptance runs here. |
-| 4 × V100-SXM2 32 GB, NVLink | Tested by the community: [@jttdev](https://github.com/jttdev) ([#2](https://github.com/Leonccaa/ReVolta/issues/2)): speed, retrieval to about 490K tokens, vision (0.1.2); also [#37](https://github.com/Leonccaa/ReVolta/issues/37) and [#38](https://github.com/Leonccaa/ReVolta/issues/38) |
+| 4 × V100-SXM2 32 GB, NVLink | Passed [0.2.0 acceptance](performance.md#nvlink-tp4-acceptance). Also tested by the community: [@jttdev](https://github.com/jttdev) ([#2](https://github.com/Leonccaa/ReVolta/issues/2)): speed, retrieval to about 490K tokens, vision (0.1.2); also [#37](https://github.com/Leonccaa/ReVolta/issues/37) and [#38](https://github.com/Leonccaa/ReVolta/issues/38) |
 | The reference system with P2P disabled | Correct output; about 30–55% of P2P throughput (0.1.0 release test) |
 | V100 16 GB, TP2, TP8, other GPU counts | Not tested |
 
@@ -27,7 +27,7 @@ The supported model is Qwen3.8 Flash-Next. Checkpoints and their test status are
 | --- | --- |
 | GPU KV with the CPU KV pool | Stable; the [reference launch](getting-started.md#4-launch) uses a 48 GiB pool |
 | `revolta_fs` disk tier below the CPU KV pool | Supported; the production form in the acceptance table below runs it. The on-disk format can change between releases, and pages are reused only by the same configuration; see [Disk tier](kv-offload.md#disk-tier-revolta_fs) |
-| Host KV (Active Host KV) with MTP | Supported, off by default; in the 0.2.0 release acceptance (configuration E2 below) <!-- TODO(0.2.0-acceptance): acceptance result, E2 Host KV + MTP --> |
+| Host KV (Active Host KV) with MTP | Supported, off by default; passed 0.2.0 acceptance with AWQ and MTP5 (configuration E2 below) |
 | Host KV with DFlash2 | Supported combination; not tested separately in the 0.2.0 release acceptance |
 
 The modes are described in [KV offload](kv-offload.md).
@@ -36,12 +36,12 @@ The modes are described in [KV offload](kv-offload.md).
 
 | Weights | Speculative decoding | KV | Tests | Result |
 | --- | --- | --- | --- | --- |
-| AWQ g32 | DFlash2, 7 drafts with DSD | GPU KV, INT8, CPU and disk offload | Full core tests (the maintainer's production form) | <!-- TODO(0.2.0-acceptance): acceptance result, C production form --> |
-| AWQ g32 | MTP, 4 drafts with DSD | GPU KV, INT8, 48 GiB CPU pool | Reduced core tests (the [reference launch](getting-started.md#4-launch)) | <!-- TODO(0.2.0-acceptance): acceptance result, D+E1 public default AWQ + MTP4 --> |
-| AWQ g32 | MTP, 4 drafts with DSD | GPU KV, scalar E4M3 | Functional check only | <!-- TODO(0.2.0-acceptance): functional check result, E4M3 --> |
-| AWQ | MTP, 5 drafts | Host KV | Host KV path and offload readback | <!-- TODO(0.2.0-acceptance): acceptance result, E2 Host KV + MTP --> |
-| NVFP4 | MTP, 5 drafts | GPU KV | Reduced core tests | <!-- TODO(0.2.0-acceptance): acceptance result, E3a NVFP4 + MTP5 --> |
-| NVFP4 | DFlash2 | GPU KV | Reduced core tests | <!-- TODO(0.2.0-acceptance): acceptance result, E3b NVFP4 + DFlash2 --> |
+| AWQ g32 | DFlash2, 7 drafts with DSD | GPU KV, INT8, CPU and disk offload | Full core tests (the maintainer's production form) | Passed, including CPU and cross-restart SSD readback |
+| AWQ g32 | MTP, 4 drafts with DSD | GPU KV, INT8, 48 GiB CPU pool | Reduced core tests (the [reference launch](getting-started.md#4-launch)) | Passed; see the [GSM8K cap comparison](performance.md#task-accuracy) |
+| AWQ g32 | MTP, 4 drafts with DSD | GPU KV, scalar E4M3 | Functional check only | Passed on an earlier 0.2.0 candidate build |
+| AWQ | MTP, 5 drafts | Host KV | Serving, concurrency, cold prefill and quality | Passed; SSD readback after restart not measured |
+| NVFP4 | MTP, 5 drafts | GPU KV | Reduced core tests | Passed |
+| NVFP4 | DFlash2 | GPU KV | Reduced core tests | Passed |
 
 Text-only Hy4-flash has validation support and is outside the 0.2.0 release acceptance; its status and limits are in [Hy4-flash](hy4-flash.md).
 
@@ -73,7 +73,7 @@ Measured in 0.1.4 (Uncensored AWQ, DFlash2, E4M3 KV, 250 W, table on a local NVM
 
 ### Long context
 
-Release retrieval was tested at 211K tokens, and the production build retrieved 20/20 needles at 489K (0.1.0). At 512K, the test covers capacity and the input/output boundary. <!-- TODO(0.2.0-acceptance): long-context result (32K / 128K), C production form -->
+Release retrieval was tested at 211K tokens, and the production build retrieved 20/20 needles at 489K (0.1.0). At 512K, the test covers capacity and the input/output boundary. In 0.2.0, the PCIe DFlash2 production configuration served 32K and 128K contexts and reused both prompts from CPU memory and after an SSD-backed restart; see [measured readback times](performance.md#coming-back-to-a-document).
 
 ### Speculative decoding
 

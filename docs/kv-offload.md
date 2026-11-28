@@ -63,7 +63,7 @@ The reference launch uses this `--kv-transfer-config`:
 
 **Host memory.** The pool is a shared-memory file in `/dev/shm`. It is allocated and touched at startup, so the whole pool is resident from the start. In a container, make `--shm-size` larger than `cpu_bytes_to_use` (the reference container uses `--shm-size 128g`). 128 GiB of RAM is recommended for the 48 GiB pool; with less, make the pool smaller or turn offload off ([System memory and storage](configuration.md#system-memory-and-storage)). At startup, the line `Qwen4Exp PLE host preflight (...)` lists the PLE share, the CPU KV pool and the available memory; if it is logged as a warning, the two together may not fit.
 
-**Capacity.** With MTP4, a 48 GiB pool held about 2.4 million tokens, about 21 KB per token (0.1.0, E4M3 KV). <!-- TODO(0.2.0-acceptance): CPU pool token capacity at 48 GiB with INT8 KV, D+E1 --> With DFlash2, the drafter uses a different cache block size, so every cache group takes pages of the full block size: a prefix needs about 50 KB per token in the CPU pool and on disk (measured in 0.1.4 with E4M3 KV: 1.84 GB for a 32K-token prefix, 6.36 GB for 131K). The same 48 GiB pool then holds about 1 million tokens (an estimate from the same 50 KB per token). <!-- TODO(0.2.0-acceptance): CPU pool bytes per token with DFlash2 and INT8 KV, C -->
+**Capacity.** With MTP4, a 48 GiB pool held about 2.4 million tokens, about 21 KB per token (0.1.0, E4M3 KV). With INT8 KV in the 0.2.0 MTP4 test, the same 48 GiB grouped CPU pool had 1,455 token-page slots of 1,632 tokens each (2,374,560 tokens of page capacity), with separate slots for recurrent state. With DFlash2, the drafter uses a different cache block size, so every cache group takes pages of the full block size: a prefix needs about 50 KB per token in the CPU pool and on disk (measured in 0.1.4 with E4M3 KV: 1.84 GB for a 32K-token prefix, 6.36 GB for 131K). The same 48 GiB pool then holds about 1 million tokens (an estimate from the same 50 KB per token). <!-- TODO(0.2.0-acceptance): CPU pool bytes per token with DFlash2 and INT8 KV, C -->
 
 **Check that it works.** At startup, look for:
 
@@ -224,7 +224,7 @@ Prefixes served from the GPU or CPU also refresh their disk pages, with the star
 
 In Host KV mode, the main K/V history of the QSA layers lives in a host memory store. The GPU keeps the compressed index, recurrent states, drafter windows and a pool of hot pages that the sparse attention reads. Long contexts and many concurrent long requests then fit even when their K/V does not fit in GPU memory. Prefix reuse works through the same host store, and an optional SSD tier keeps pages across restarts.
 
-**Status:** supported in 0.2.0 and off by default. The 0.2.0 acceptance covers Host KV with MTP (configuration E2); Host KV with DFlash2 is supported but was not tested separately. <!-- TODO(0.2.0-acceptance): Host KV functional and speed results, E2 -->
+**Status:** supported in 0.2.0 and off by default. On PCIe, AWQ with INT8 Host KV and MTP5 passed startup, serving, concurrency and quality checks (configuration E2); SSD readback after restart was not measured. The synthetic short-prompt test measured 26.76, 36.17 and 52.30 ms per decode round at C1, C4 and C8. These are wall-clock round times, not kernel timings. Host KV with DFlash2 is supported but was not tested separately in 0.2.0.
 
 ### Requirements
 
@@ -306,7 +306,9 @@ A recurrent-state checkpoint lets a later request resume from the end of an earl
 
 ### Host KV capacity
 
-These sizing examples are from 0.2.0rc15: Qwen3.8 Flash-Next AWQ, four 32 GB V100s, TP4 + DCP2, the compressed index split over all TP ranks, `max_num_seqs=8`, `--gpu-memory-utilization 0.956` and planar INT8 KV. The "Startup" row was measured at engine start on PCIe V100s; "Planner" rows are the engine planner's arithmetic with an estimated per-GPU budget. <!-- TODO(0.2.0-acceptance): Host KV startup capacity (host pool tokens, GPU history), E2 -->
+These sizing examples are from 0.2.0rc15: Qwen3.8 Flash-Next AWQ, four 32 GB V100s, TP4 + DCP2, the compressed index split over all TP ranks, `max_num_seqs=8`, `--gpu-memory-utilization 0.956` and planar INT8 KV. The "Startup" row was measured at engine start on PCIe V100s; "Planner" rows are the engine planner's arithmetic with an estimated per-GPU budget.
+
+In the final 0.2.0 PCIe acceptance, AWQ with MTP5 and a configured 98 GiB Host KV pool had 7,329,312 usable host tokens after excluding one reserved page. The startup plan allocated 14,588 usable GPU history blocks (4.98 GiB per GPU including the reserved block).
 
 A host page row takes 13,248 bytes per token for DFlash2 and 14,352 bytes per token for MTP4 (which also stores the draft layer's K/V and index), with planar INT8 (0.2.0rc15). Divide the host store by these sizes for a first estimate of the tokens it holds. DFlash2 keeps its FP16 sliding-window drafter KV on the GPU.
 

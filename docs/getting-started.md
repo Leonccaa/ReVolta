@@ -4,12 +4,12 @@ This tutorial installs and launches the reference configuration. Before starting
 [hardware scope](known-limits.md) and [host memory requirements](configuration.md#system-memory-and-storage).
 
 Reference configuration: Uncensored AWQ g32, TP4 + DCP2,
-MTP4 greedy draft, E4M3 KV cache, 512K context through YaRN, multimodal input, 8
-concurrent requests in testing, and a 48 GiB CPU KV pool.
+MTP4 greedy draft with KV inherited from the INT8 target, 512K context through
+YaRN, multimodal input, 8 concurrent requests in testing, and a 48 GiB CPU KV pool.
 
 ## 1. Install
 
-This recipe uses the `revolta` distribution (version `0.2.0rc15`). The Python import name and the
+This recipe uses the `revolta` distribution (version `0.2.0`). The Python import name and the
 CLI are still **`vllm`** (`import vllm`, `vllm serve`); this is intentional. Only
 compute capability 7.0 is built, with CUDA 12.8, Python 3.12 and PyTorch 2.10.
 
@@ -18,8 +18,8 @@ From PyPI (Linux x86-64 with glibc 2.34 or newer, Python 3.12):
 ```bash
 python3.12 -m venv /data/revolta/venv
 . /data/revolta/venv/bin/activate
-pip install --pre revolta==0.2.0rc15
-vllm --version          # 0.2.0rc15
+pip install revolta==0.2.0
+vllm --version          # 0.2.0
 ```
 
 The wheel pins `torch==2.10.0`, `torchaudio==2.10.0` and `torchvision==0.25.0`,
@@ -34,7 +34,7 @@ differs: it pins the same versions to the CUDA 12.8 builds on `download.pytorch.
 and has the generic `linux_x86_64` tag.
 
 ```bash
-pip install "https://github.com/Leonccaa/ReVolta/releases/download/v0.2.0rc15/revolta-0.2.0rc15-cp312-cp312-linux_x86_64.whl"
+pip install "https://github.com/Leonccaa/ReVolta/releases/download/v0.2.0/revolta-0.2.0-cp312-cp312-linux_x86_64.whl"
 ```
 
 ReVolta does not report to the upstream vLLM statistics server. It sends its own
@@ -44,7 +44,7 @@ contains and how to turn it off.
 Or use the Docker image:
 
 ```bash
-docker pull ghcr.io/leonccaa/revolta:0.2.0rc15
+docker pull ghcr.io/leonccaa/revolta:0.2.0
 ```
 
 ## 2. Download the checkpoint and make 512K views
@@ -107,7 +107,6 @@ export VLLM_SM70_AWQ_MOE_INT4_ZERO=1             # pack AWQ zero points to 4 bit
 # Optional per-rank PLE cap. The full FP8 table is pinned on host by default.
 # export VLLM_QWEN4EXP_PLE_HOST_GIB=12
 export VLLM_PLE_OFFLOAD_READY_TIMEOUT=1200       # seconds; PLE loading takes a while
-export VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES=1    # refuse to start without calibrated E4M3 KV scales
 export TILELANG_CACHE_DIR=/data/revolta/cache/tilelang  # persistent TileLang kernel cache
 ```
 
@@ -117,7 +116,8 @@ Continue with the launch command below.
 
 Use the 512K YaRN target view and matching draft from step 2 with
 `--max-model-len 524288`. With unmodified checkpoints, use a length supported
-by both the target and the draft.
+by both the target and the draft. With `--gpu-memory-utilization 0.956`, keep the
+GPUs free of other processes that use GPU memory.
 
 ```bash
 vllm serve /data/revolta/views/target-512k \
@@ -125,7 +125,7 @@ vllm serve /data/revolta/views/target-512k \
   --dtype half \
   --tensor-parallel-size 4 \
   --decode-context-parallel-size 2 \
-  --gpu-memory-utilization 0.95 \
+  --gpu-memory-utilization 0.956 \
   --max-model-len 524288 \
   --max-num-seqs 8 \
   --max-num-batched-tokens 8192 \
@@ -134,7 +134,7 @@ vllm serve /data/revolta/views/target-512k \
   --prefix-cache-retention-interval 0 \
   --mamba-cache-mode align \
   --no-async-scheduling \
-  --kv-cache-dtype fp8_e4m3 \
+  --kv-cache-dtype auto \
   --no-language-model-only \
   --limit-mm-per-prompt '{"image": 16, "video": 1}' \
   --media-io-kwargs '{"video": {"num_frames": 16}}' \
@@ -146,10 +146,9 @@ vllm serve /data/revolta/views/target-512k \
       "quantization": "modelopt_mixed",
       "num_speculative_tokens": 4,
       "draft_sample_method": "greedy",
-      "attention_backend": "FLASH_ATTN_V100",
-      "kv_cache_dtype": "fp8_e4m3"}' \
+      "attention_backend": "FLASH_ATTN_V100"}' \
   --attention-backend FLASH_ATTN_V100 \
-  --prefill-pressure-token-budget 1632 \
+  --prefill-pressure-token-budget 1024 \
   --prefill-pressure-threshold 1 \
   --long-prefill-token-threshold 4896 \
   --mixed-prefill-step-latency-ms 0 \
@@ -174,10 +173,11 @@ vllm serve /data/revolta/views/target-512k \
 
 Notes:
 
-- This recipe explicitly selects calibrated scalar `fp8_e4m3` for target and
-  MTP. The CLI default `auto` selects planar INT8 for eligible QSA models on
-  V100. See the [KV dtype comparison](configuration.md#launch-options) before
-  changing it.
+- `--kv-cache-dtype auto` selects planar INT8 for this QSA target on SM70 (V100).
+  The MTP draft inherits the target's INT8 KV. To use FP16 draft KV instead,
+  set `"kv_cache_dtype": "float16"` in `--speculative-config`. INT8 computes
+  scales at runtime, so no separate KV scale pack or scale-enriched view is
+  needed. For calibrated E4M3 KV (a frozen format), see [Checkpoints](checkpoints.md#e4m3-kv).
 - **Startup** takes roughly 10–15 minutes: weight and PLE loading, `torch.compile`
   and CUDA graph capture. Later starts reuse the compile cache. After an upgrade that
   cache can still be incomplete: keeping the 0.1.3 cache, MTP4 and DFlash2 each compiled
@@ -235,13 +235,22 @@ docker run --rm --gpus all \
   -e NCCL_GRAPH_REGISTER=0 \
   -e VLLM_SM70_AWQ_MOE_INT4_ZERO=1 \
   -e VLLM_PLE_OFFLOAD_READY_TIMEOUT=1200 \
-  -e VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES=1 \
   -e TILELANG_CACHE_DIR=/data/revolta/cache/tilelang \
-  ghcr.io/leonccaa/revolta:0.2.0rc15 \
-  /data/revolta/views/target-512k --served-model-name Qwen3.8-Flash-Next ...
+  ghcr.io/leonccaa/revolta:0.2.0 \
+  /data/revolta/views/target-512k --served-model-name Qwen3.8-Flash-Next \
+  --gpu-memory-utilization 0.956 \
+  --kv-cache-dtype auto \
+  --speculative-config '{"method": "mtp",
+      "model": "/data/revolta/views/draft-512k",
+      "quantization": "modelopt_mixed",
+      "num_speculative_tokens": 4,
+      "draft_sample_method": "greedy",
+      "attention_backend": "FLASH_ATTN_V100"}' \
+  ...
 ```
 
-Replace `...` with the remaining arguments from step 4. Container notes:
+Replace `...` with the launch options from step 4 that are not already shown
+above. The same GPU memory requirement applies. Container notes:
 
 - The CPU KV pool is a file in `/dev/shm`. Make `--shm-size` larger than
   `cpu_bytes_to_use` (the validated container used 128g).

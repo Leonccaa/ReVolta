@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
@@ -209,7 +210,11 @@ def test_sources_after_upstream_auto_defaults(profile, monkeypatch):
     monkeypatch.setenv("NCCL_GRAPH_REGISTER", "0")  # env_override
     audit = json.loads(module.profile_audit(enabled=True))
     assert audit["enabled"]
-    assert len(audit["values"]) == 49
+    assert audit["values"]["VLLM_SM70_NVLINK_HC"] == {
+        "value": "0",
+        "source": "upstream_default",
+    }
+    assert len(audit["values"]) == 50
     assert audit["values"][FP16[0]]["source"] == "upstream_default"
     assert audit["values"]["NCCL_GRAPH_REGISTER"]["source"] == "upstream_default"
     assert audit["values"]["VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT"] == {
@@ -863,6 +868,13 @@ def test_dflash2_shorthand_matches_json(
     ("method", "flags", "spec_options", "budget", "expected"),
     [
         ("mtp", [], {}, 2048, (False, False, True)),
+        (
+            "mtp",
+            ["--kernel-config", '{"long_context_kv":{"enabled":true}}'],
+            {},
+            2048,
+            (True, False, True),
+        ),
         ("mtp", ["--async-scheduling"], {}, 2048, (False, True, False)),
         ("mtp", [], {"gdn_state_replay": False}, 2048, (False, True, False)),
         ("dflash", [], {}, 2048, (True, False, True)),
@@ -985,7 +997,7 @@ I1_DFLASH2_POLICY = {
         (False, True, True, {}, {}, {}),
     ],
 )
-def test_dflash2_serving_verifier_defaults_match_i1(
+def test_dflash2_serving_verifier_defaults(
     profile,
     monkeypatch,
     tmp_path,
@@ -1015,6 +1027,7 @@ def test_dflash2_serving_verifier_defaults_match_i1(
     spec = args.create_engine_config(usage_context=context).speculative_config
     policy = spec.sm70_dflash2
 
+    expected = expected | {"sparse_target_rejection": active and serving and selector}
     reference = Sm70DFlash2Config(**expected)
     reference.resolve(qualified=False)
     assert policy.qualified is False
@@ -1061,9 +1074,9 @@ def test_hybrid_serving_allocator_with_connector(
 @pytest.mark.parametrize(
     ("quantization", "method", "source", "overrides", "expected"),
     [
-        ("awq", "dflash", "cli", {}, (448, 1, 0)),
-        ("modelopt_fp4", "mtp", "yaml", {}, (448, 1, 0)),
-        ("awq", "qwen4_exp_mtp", "json", {}, (448, 1, 0)),
+        ("awq", "dflash", "cli", {}, (1024, 1, 0)),
+        ("modelopt_fp4", "mtp", "yaml", {}, (1024, 1, 0)),
+        ("awq", "qwen4_exp_mtp", "json", {}, (1024, 1, 0)),
         ("awq", None, "json", {}, (0, 1, 250)),
         ("awq", "mtp", "json", {"enable_chunked_prefill": False}, (0, 1, 0)),
         (
@@ -1234,7 +1247,7 @@ INTERCONNECT_CASES = [
 def test_frontend_interconnect_mode_and_audit(
     profile, monkeypatch, requested, disabled, expected, logged
 ):
-    # The frontend knows only explicit choices; workers resolve auto/pex.
+    # With no local device IDs the frontend only has the explicit policy.
     if requested is not None:
         monkeypatch.setenv("VLLM_SM70_INTERCONNECT", requested)
     mode = profile.frontend_interconnect_mode(disable_custom_all_reduce=disabled)
@@ -1248,7 +1261,7 @@ def test_frontend_interconnect_mode_and_audit(
     # policy must not read "pex_p2p" while the workers log nvlink.
     assert audit["interconnect_mode"] == logged
     assert audit["interconnect_policy"] == ("auto" if requested is None else requested)
-    assert len(audit["values"]) == 49
+    assert len(audit["values"]) == 50
 
 
 def _applied_profile(profile, monkeypatch, requested, disabled):
@@ -1288,36 +1301,203 @@ def test_audit_log_text_does_not_change_applied_values(profile, monkeypatch):
     assert by_mode["p2p"][0][0] != by_mode["no_p2p"][0][0]
 
 
-def test_vllmconfig_profile_and_audit_receive_frontend_interconnect():
-    # Both VllmConfig call sites must pass the same frontend assumption.
-    import vllm.config.vllm as config_module
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize(
+    "case",
+    [
+        "nvlink",
+        "pcie",
+        "explicit",
+        "assigned",
+        "denied",
+        "deferred",
+        "deferred_pool",
+        "deferred_connector",
+    ],
+)
+def test_engineargs_nvlink_profile(
+    profile, monkeypatch, tmp_path, sm70_serving_resolution, case
+):
+    from vllm import revolta_profile
+    from vllm.config import vllm as config_module
+    from vllm.platforms import current_platform
 
-    assert config_module.__file__ is not None
-    tree = ast.parse(Path(config_module.__file__).read_text())
-    calls = [
-        (node.func.id, node)
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id in ("apply_revolta_profile", "profile_audit")
+    topology = Mock(return_value=case != "pcie")
+    if case == "denied":
+        # CUDA capability reads succeed while NVML topology is not permitted.
+        topology.side_effect = RuntimeError("NVMLError_NoPermission")
+    monkeypatch.setattr(current_platform, "is_fully_connected", topology, raising=False)
+    monkeypatch.setattr(
+        current_platform, "is_pcie_switch_connected", lambda _: True, raising=False
+    )
+    monkeypatch.setattr(
+        current_platform,
+        "get_all_gpu_pci_bus_ids",
+        lambda: dict.fromkeys(range(4), ""),
+        raising=False,
+    )
+    monkeypatch.setattr(current_platform, "device_count", lambda: 4)
+    monkeypatch.setattr(
+        current_platform, "is_device_capability", lambda cap, device_id=0: cap == (7, 0)
+    )
+    monkeypatch.setattr(current_platform, "use_custom_allreduce", lambda: True)
+    monkeypatch.setattr(revolta_profile, "profile_audit", profile.profile_audit)
+    profile_log = Mock(wraps=config_module.logger.info_once)
+    monkeypatch.setattr(config_module.logger, "info_once", profile_log)
+    flags = ["--decode-context-parallel-size", "2", "--kv-cache-dtype", "float16"]
+    spec_options: dict[str, Any] = {
+        "num_speculative_tokens": 4 if case in ("pcie", "explicit", "denied") else 5
+    }
+    connector = [
+        "--kv-transfer-config",
+        '{"kv_connector":"OffloadingConnector","kv_role":"kv_both",'
+        '"kv_connector_extra_config":{"cpu_bytes_to_use":51539607552}}',
     ]
-    # The second profile call refines the graph reserve once the KV dtype
-    # is resolved.
-    assert sorted(name for name, _ in calls) == [
-        "apply_revolta_profile",
-        "apply_revolta_profile",
-        "profile_audit",
-    ]
-    for _, call in calls:
-        value = next(k.value for k in call.keywords if k.arg == "interconnect_mode")
-        assert isinstance(value, ast.Call)
-        assert isinstance(value.func, ast.Name)
-        assert value.func.id == "frontend_interconnect_mode"
-        (keyword,) = value.keywords
-        assert keyword.arg == "disable_custom_all_reduce"
-        assert ast.unparse(keyword.value) == (
-            "self.parallel_config.disable_custom_all_reduce"
+    if case in ("nvlink", "deferred_connector"):
+        flags += connector
+    if case == "deferred_pool":
+        # The CPU pool shorthand names the same connector.
+        flags += ["--kv-offloading-size", "48"]
+    if case.startswith("deferred"):
+        spec_options["gdn_deferred_commit_metadata"] = True
+        # Admit deferred commit for the stand-in target model, keeping the
+        # connector rule.
+        reasons = config_module._gdn_spec_state_replay_reasons
+        monkeypatch.setattr(
+            config_module,
+            "_gdn_spec_state_replay_reasons",
+            lambda *a, **kw: [r for r in reasons(*a, **kw) if "KV connector" in r],
         )
+    if case == "explicit":
+        flags += [
+            "--no-enable-hc-sp",
+            "--no-async-scheduling",
+            "--kernel-config",
+            json.dumps(
+                {
+                    "sm70_hc_ll_async": False,
+                    "sm70_qsa_paged_fp16_h6": False,
+                    "sm70_qsa_paged_fp16_h12": False,
+                    "sm70_sparse_target_sampling": True,
+                }
+            ),
+        ]
+        spec_options["num_speculative_tokens_per_batch_size"] = [[1, 8, 2]]
+        monkeypatch.setenv("VLLM_SM70_NVLINK_HC", "0")
+    args, context = hybrid_serving_args(
+        profile, monkeypatch, tmp_path, "mtp", flags, spec_options
+    )
+    if case == "assigned":
+        args.kernel_config.sm70_sparse_target_sampling = True
+    if case in ("deferred_pool", "deferred_connector"):
+        with pytest.raises(ValueError, match="a KV connector"):
+            args.create_engine_config(usage_context=context)
+        return
+    config = args.create_engine_config(usage_context=context)
+    kernel = config.kernel_config
+    enabled = case in ("nvlink", "assigned", "deferred")
+    assert (
+        config.speculative_config.num_speculative_tokens
+        == spec_options["num_speculative_tokens"]
+    )
+    assert config.speculative_config.num_speculative_tokens_per_batch_size == (
+        [(1, 8, 3)] if enabled else [(1, 8, 2)] if case == "explicit" else MTP_DSD
+    )
+    assert config.scheduler_config.async_scheduling is enabled
+    assert config.speculative_config.gdn_deferred_commit_metadata is (
+        case == "deferred"
+    )
+    assert config.parallel_config.enable_hc_sp is enabled
+    assert kernel.sm70_hc_ll_async is enabled
+    assert kernel.sm70_qsa_paged_fp16_h6 is enabled
+    assert kernel.sm70_qsa_paged_fp16_h12 is enabled
+    assert kernel.sm70_sparse_target_sampling == (
+        "device_top64"
+        if case in ("nvlink", "deferred")
+        else case in ("explicit", "assigned")
+    )
+    assert envs.VLLM_SM70_NVLINK_HC is enabled
+    audit = next(
+        json.loads(call.args[1])
+        for call in profile_log.call_args_list
+        if call.args[0] == "ReVolta profile %s"
+    )
+    assert audit["values"]["VLLM_SM70_NVLINK_HC"]["source"] == (
+        "profile"
+        if enabled
+        else "environment"
+        if case == "explicit"
+        else "upstream_default"
+    )
+    if case in ("nvlink", "explicit"):
+        source = "profile" if enabled else "explicit"
+        for name in (
+            "enable_hc_sp",
+            "sm70_hc_ll_async",
+            "sm70_qsa_paged_fp16_h12",
+            "sm70_sparse_target_sampling",
+        ):
+            assert audit["config_values"][name]["source"] == source
+    elif case in ("pcie", "denied"):
+        assert audit["config_values"] == {
+            "sm70_qsa_paged_int8_h12": {"value": False, "source": "upstream_default"}
+        }
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize(
+    ("mode", "method", "kv_dtype", "dcp", "override", "expected", "source"),
+    [
+        ("pex_p2p", "dflash", "auto", 2, None, True, "profile"),
+        ("nvlink", "mtp", "int8_per_token_head", 2, None, True, "profile"),
+        ("pex_p2p", "dflash", "int8", 2, False, False, "explicit"),
+        ("nvlink", "mtp", "int8", 2, False, False, "explicit"),
+        ("pex_p2p", "dflash", "float16", 2, None, False, "upstream_default"),
+        ("nvlink", "mtp", "int8", 1, None, False, "upstream_default"),
+    ],
+)
+def test_engineargs_int8_qsa_reader_profile(
+    profile,
+    monkeypatch,
+    tmp_path,
+    sm70_serving_resolution,
+    mode,
+    method,
+    kv_dtype,
+    dcp,
+    override,
+    expected,
+    source,
+):
+    from vllm import revolta_profile
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(revolta_profile, "frontend_interconnect_mode", lambda **_: mode)
+    monkeypatch.setattr(
+        current_platform, "has_device_capability", lambda cap: cap == 70
+    )
+    monkeypatch.setattr(
+        current_platform,
+        "is_device_capability",
+        lambda cap, device_id=0: cap in (70, (7, 0)),
+    )
+    audit = Mock(wraps=profile.profile_audit)
+    monkeypatch.setattr(revolta_profile, "profile_audit", audit)
+    name = "sm70_qsa_paged_int8_h12"
+    flags = ["--decode-context-parallel-size", str(dcp), "--kv-cache-dtype", kv_dtype]
+    if override is not None:
+        flags += ["--kernel-config", json.dumps({name: override})]
+    args, context = hybrid_serving_args(
+        profile, monkeypatch, tmp_path, method, flags, {}
+    )
+    config = args.create_engine_config(usage_context=context)
+    assert config.cache_config.cache_dtype == (
+        "float16" if kv_dtype == "float16" else "int8"
+    )
+    assert config.kernel_config.sm70_qsa_paged_int8_h12 is expected
+    values = audit.call_args.kwargs["config_values"]
+    assert values[name] == {"value": expected, "source": source}
+    assert ("enable_hc_sp" in values) is (mode == "nvlink")
 
 
 def test_audit_logs_disabled_profile(profile):
@@ -1438,6 +1618,125 @@ def test_mtp_dynamic_schedule_refines_the_planar_kv_reserve(
         num_speculative_tokens_per_batch_size=[(1, 3, 4), (4, 8, 3)],
     )
     assert os.environ[GRAPH_RESERVE] == (override or "705")
+
+
+@pytest.mark.parametrize(
+    ("quantization", "num_drafts", "schedule", "expected"),
+    [
+        ("awq", 4, [(1, 3, 4), (4, 8, 3)], "705"),
+        ("awq", 5, [(1, 3, 5), (4, 8, 4)], "800"),
+        # The verify graphs reach the global draft count whatever the
+        # schedule lists, so a K5 model with a K4 schedule still needs 800.
+        ("awq", 5, [(1, 8, 4)], "800"),
+        # A schedule wider than global K is clipped before capture.
+        ("awq", 4, [(1, 8, 5)], "705"),
+        ("modelopt_fp4", 4, [(1, 3, 4), (4, 8, 3)], "705"),
+        ("modelopt_fp4", 5, [(1, 3, 5), (4, 8, 4)], "800"),
+    ],
+)
+def test_mtp_dynamic_schedule_widens_the_reserve_at_five_drafts(
+    profile, quantization, num_drafts, schedule, expected
+):
+    # NVFP4 + MTP5 planar DSD measured 0.73 GiB per rank on TP4.
+    assert profile.apply_revolta_profile(
+        model(quantization),
+        4,
+        is_sm70=True,
+        speculative_method="mtp",
+        kv_cache_dtype="fp8_per_token_head",
+        num_speculative_tokens_per_batch_size=schedule,
+        num_speculative_tokens=num_drafts,
+    )
+    assert os.environ[GRAPH_RESERVE] == expected
+
+
+def test_wide_mtp_schedule_keeps_the_explicit_reserve(profile, monkeypatch):
+    monkeypatch.setenv(GRAPH_RESERVE, "750")
+    assert profile.apply_revolta_profile(
+        model(),
+        4,
+        is_sm70=True,
+        speculative_method="mtp",
+        kv_cache_dtype="fp8_per_token_head",
+        num_speculative_tokens_per_batch_size=[(1, 3, 5), (4, 8, 4)],
+        num_speculative_tokens=5,
+    )
+    assert os.environ[GRAPH_RESERVE] == "750"
+
+
+@pytest.mark.parametrize(
+    ("quantization", "latency_ms", "expected"),
+    [
+        ("awq", 0, "1000"),
+        ("awq", 250, "1150"),
+        ("awq", 500, "1150"),
+        # The target adds prefill-width graphs only to the AWQ DFlash planar
+        # pool we measured (1094/1094/1074/1094 MiB); every other tier is
+        # unchanged until measured.
+        ("modelopt_fp4", 0, "1024"),
+        ("modelopt_fp4", 250, "1024"),
+    ],
+)
+def test_graph_reserve_follows_the_mixed_prefill_latency_target(
+    profile, quantization, latency_ms, expected
+):
+    assert profile.apply_revolta_profile(
+        model(quantization),
+        4,
+        is_sm70=True,
+        speculative_method="dflash",
+        kv_cache_dtype="fp8_per_token_head",
+        mixed_prefill_step_latency_ms=latency_ms,
+    )
+    assert os.environ[GRAPH_RESERVE] == expected
+
+
+def test_mixed_prefill_target_only_applies_to_planar_dflash(profile):
+    # Non-planar AWQ DFlash keeps 1200 (measured pool about 1.13 GiB), and
+    # MTP's planar tier ignores the target.
+    assert profile.apply_revolta_profile(
+        model(),
+        4,
+        is_sm70=True,
+        speculative_method="dflash",
+        kv_cache_dtype="fp8_e4m3",
+        mixed_prefill_step_latency_ms=250,
+    )
+    assert os.environ[GRAPH_RESERVE] == "1200"
+    os.environ.pop(GRAPH_RESERVE)
+    assert profile.apply_revolta_profile(
+        model(),
+        4,
+        is_sm70=True,
+        speculative_method="mtp",
+        kv_cache_dtype="int8",
+        mixed_prefill_step_latency_ms=250,
+    )
+    assert os.environ[GRAPH_RESERVE] == "600"
+
+
+def test_mixed_prefill_target_refines_the_awq_dflash_planar_reserve(profile):
+    # EngineArgs and the first VllmConfig call run before the scheduler target
+    # is passed; the second VllmConfig call raises only the profile value.
+    assert profile.apply_revolta_profile(
+        model(),
+        4,
+        is_sm70=True,
+        speculative_method="dflash",
+        kv_cache_dtype="int8",
+    )
+    assert os.environ[GRAPH_RESERVE] == "1000"
+    assert profile.apply_revolta_profile(
+        model(),
+        4,
+        is_sm70=True,
+        speculative_method="dflash",
+        kv_cache_dtype="int8",
+        mixed_prefill_step_latency_ms=250,
+    )
+    assert os.environ[GRAPH_RESERVE] == "1150"
+    row = json.loads(profile.profile_audit(enabled=True))["values"][GRAPH_RESERVE]
+    assert row == {"value": "1150", "source": "profile"}
 
 
 def test_dflash_leaves_every_other_default_alone(profile):
@@ -1566,7 +1865,11 @@ def test_vllmconfig_profile_receives_the_speculative_method():
     assert refined[schedule_field] == (
         f"getattr(self.speculative_config, '{schedule_field}', None)"
     )
+    assert refined["mixed_prefill_step_latency_ms"] == (
+        "self.scheduler_config.mixed_prefill_step_latency_ms"
+    )
     assert "kv_cache_dtype" not in {k.arg for k in first.keywords}
+    assert "mixed_prefill_step_latency_ms" not in {k.arg for k in first.keywords}
 
 
 def test_speculative_draft_keeps_target_graph_reserve(profile, monkeypatch, tmp_path):

@@ -2,11 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Planar token/head readers. Legacy scalar QSA kernels remain unchanged."""
 
+import importlib
 import math
 
 import torch
 
-from vllm.forward_context import get_forward_context
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.models.deepseek_v4.common.ops.fp8_software import (
     fp8_e4m3fn_bits_to_fp32_bitcast,
 )
@@ -16,7 +17,7 @@ from vllm.v1.attention.kv_cache_view import KVPageMapping
 from vllm.v1.attention.kv_codecs import FP8_E4M3_PER_TOKEN_HEAD, INT8
 
 
-@triton.jit(do_not_specialize=["num_requests"])
+@triton.jit(do_not_specialize=["num_requests", "num_rows"])
 def _int8_sparse_kernel(
     q_ptr,
     k_cache_ptr,
@@ -703,7 +704,9 @@ def sparse_attention(
     )
 
 
-def dcp_grouped(q, k, v, indices, table, requests, out, lse, sk, sv, *, codec=INT8):
+def dcp_grouped(
+    q, k, v, indices, table, requests, out, lse, sk, sv, *, codec=INT8, local_width=None
+):
     """Row-scaled DCP uses the same owner mapping on each rank."""
     from .qsa import _SM70_QSA_DCP_GROUPED_PAGE4_MIN_ROWS
 
@@ -712,13 +715,33 @@ def dcp_grouped(q, k, v, indices, table, requests, out, lse, sk, sv, *, codec=IN
     rows = q.shape[0]
     if q.dtype != torch.float16 or rows < _SM70_QSA_DCP_GROUPED_PAGE4_MIN_ROWS:
         return 0
-    rows = rows // 8 * 8
-    if rows < 8 or q.shape[1] % 6 or indices.shape[1] != 2051:
+    if q.shape[1] % 6 or indices.shape[1] != 2051:
         return 0
-    capacity = table.shape[1] * k.shape[1]
-    positions = torch.full(
-        (q.shape[0],), capacity - 1, device=q.device, dtype=torch.int64
+    use_rows = (
+        codec is INT8
+        and current_platform.is_device_capability(70)
+        and not torch.cuda.is_current_stream_capturing()
+        and is_forward_context_available()
+        and get_forward_context().additional_kwargs.get("qsa_has_prefill", False)
     )
+    if use_rows:
+        importlib.import_module("vllm._sm70_qsa_device_C")
+        torch.ops.vllm_sm70_qsa_device.rows_int8_planar(
+            q,
+            k,
+            v,
+            sk,
+            sv,
+            indices[:, :local_width],
+            table,
+            requests,
+            out,
+            lse,
+        )
+        return rows
+    rows = rows // 8 * 8
+    capacity = table.shape[1] * k.shape[1]
+    positions = torch.full((rows,), capacity - 1, device=q.device, dtype=torch.int64)
     lengths = torch.full(
         (table.shape[0],), capacity, device=q.device, dtype=torch.int32
     )
@@ -729,7 +752,7 @@ def dcp_grouped(q, k, v, indices, table, requests, out, lse, sk, sv, *, codec=IN
         indices[:rows],
         table,
         requests[:rows],
-        positions[:rows],
+        positions,
         lengths,
         out[:rows],
         sk,

@@ -19,6 +19,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import CachedLogitsFallback
 from vllm.triton_utils import tl, triton
 from vllm.v1.sample.ops.topk_topp_triton import sort_topk_with_vocab_ties
+from vllm.v1.worker.gpu.sample.gumbel import apply_temperature
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
 from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
@@ -91,14 +92,11 @@ def _compact_target_reference_rows_kernel(
     tl.store(reference_rows + row, reference)
 
 
-def _compact_target_reference_rows_gpu(
+def _launch_compact_target_reference_rows(
     probe: torch.Tensor,
     top_ps: torch.Tensor,
     row_to_request: torch.Tensor,
-    *,
-    strict_top_k: bool = False,
-) -> np.ndarray:
-    """Check FP32 temperature-scaled probes using the request-slot mapping."""
+) -> torch.Tensor:
     rows, width = probe.shape
     result = torch.empty(rows, device=probe.device, dtype=torch.bool)
     _compact_target_reference_rows_kernel[(rows,)](
@@ -112,6 +110,18 @@ def _compact_target_reference_rows_gpu(
         triton.next_power_of_2(width),
         num_warps=1,
     )
+    return result
+
+
+def _compact_target_reference_rows_gpu(
+    probe: torch.Tensor,
+    top_ps: torch.Tensor,
+    row_to_request: torch.Tensor,
+    *,
+    strict_top_k: bool = False,
+) -> np.ndarray:
+    """Check FP32 temperature-scaled probes using the request-slot mapping."""
+    result = _launch_compact_target_reference_rows(probe, top_ps, row_to_request)
     if strict_top_k:
         # The dense combined filter can let a tie spanning the k cutoff back
         # in during its final top-p mask, even if all ties fit in the probe.
@@ -416,6 +426,63 @@ def _supports_sparse_sampling_contract(
     return not sampler.compute_nans
 
 
+def warmup_dflash2_sparse_target_rejection(
+    speculator: DFlash2Speculator,
+    rejection_sampler: RejectionSampler,
+) -> bool:
+    candidates = speculator.get_sparse_draft_logits()
+    if candidates is None or rejection_sampler.rejection_sample_method != "standard":
+        return False
+
+    # Compile the two fixed probe widths without a model forward or a
+    # dependency on whether the warmup logits hit the dense fallback.
+    steps = rejection_sampler.num_speculative_steps
+    rows = steps + 1
+    device = speculator.device
+    vocab_size = rejection_sampler.sampler.sampling_states.vocab_size
+    widths = [_TARGET_TOP_K + 1]
+    if speculator.max_num_reqs > 1 and vocab_size >= 32768:
+        widths.append(_TARGET_PROBE_K)
+    draft_width = candidates[0].shape[-1]
+    draft_ids = torch.arange(draft_width, device=device).repeat(1, steps, 1)
+    draft_logits = torch.zeros(draft_ids.shape, device=device, dtype=torch.float32)
+    request_ids = torch.zeros(rows, device=device, dtype=torch.int32)
+    cu_num_logits = torch.tensor([0, rows], device=device, dtype=torch.int32)
+    positions = torch.arange(rows, device=device, dtype=torch.int64)
+    temperature = torch.full((1,), 0.9, device=device, dtype=torch.float32)
+    top_p = torch.ones_like(temperature)
+    seeds = torch.zeros(1, device=device, dtype=torch.int64)
+    for width in widths:
+        target_ids = torch.arange(width, device=device).repeat(rows, 1)
+        target_logits = torch.zeros(
+            target_ids.shape, device=device, dtype=torch.float32
+        )
+        apply_temperature(target_logits, request_ids, temperature)
+        target_logits, target_ids = sort_topk_with_vocab_ties(
+            target_logits, target_ids, vocab_size=vocab_size, descending=True
+        )
+        if width == _TARGET_PROBE_K:
+            _launch_compact_target_reference_rows(target_logits, top_p, request_ids)
+        keep = _TARGET_TOP_K if width == _TARGET_TOP_K + 1 else width
+        dflash2_sparse_topk_rejection_sample(
+            target_ids[:, :keep],
+            target_logits[:, :keep],
+            draft_ids,
+            draft_logits,
+            request_ids,
+            cu_num_logits,
+            positions,
+            request_ids[:1],
+            temperature,
+            top_p,
+            seeds,
+            steps,
+            use_fp64=rejection_sampler.sampler.use_fp64_gumbel,
+            target_top_k=_TARGET_TOP_K,
+        )
+    return True
+
+
 def try_dflash2_sparse_target_rejection(
     model: Any,
     speculator: Any,
@@ -494,6 +561,7 @@ def try_dflash2_sparse_target_rejection(
             target_topk_logits,
             states.top_p.gpu,
             input_batch.expanded_idx_mapping,
+            strict_top_k=True,
         )
     else:
         num_logits = np.diff(input_batch.cu_num_logits_np)
@@ -515,18 +583,20 @@ def try_dflash2_sparse_target_rejection(
         )
         if fallback is None:
             return None
+        # A one-row slice would switch from Triton to the PyTorch filter.
+        if (
+            reference_reqs.size == idx.size
+            or np.diff(input_batch.cu_num_logits_np)[reference_reqs].sum() == 1
+        ):
+            return DFlash2LogitsFallback(fallback())
         # On SM70 the shared target probe selects the same requests on all
         # ranks. Use the packed gather without a reasoning EOS mask.
-        if (
-            reference_reqs.size < idx.size
-            and reasoning_eos is None
-            and isinstance(fallback, CachedLogitsFallback)
-        ):
+        if reasoning_eos is None and isinstance(fallback, CachedLogitsFallback):
             packed_metadata = _pack_reference_requests(input_batch, reference_reqs)
             reference_logits = fallback.gather_rows(packed_metadata[0])
         else:
             reference_logits = fallback()
-        if reference_reqs.size == idx.size or reference_logits is None:
+        if reference_logits is None:
             return DFlash2LogitsFallback(reference_logits)
     if not retain_ties:
         target_topk_ids = target_topk_ids[:, :_TARGET_TOP_K]

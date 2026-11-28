@@ -175,7 +175,7 @@ def _use_sm70_native_router_top10(
     num_tokens = gating_output.shape[0]
     return bool(
         envs.VLLM_SM70_QWEN38_NATIVE_ROUTER_TOPK
-        and (17 <= num_tokens <= 20 or num_tokens in (24, 48))
+        and 17 <= num_tokens <= 64
         and gating_output.shape == (num_tokens, 512)
         and gating_output.dtype == torch.float16
         and gating_output.is_cuda

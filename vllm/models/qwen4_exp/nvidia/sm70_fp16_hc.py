@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from types import MethodType
+
 import torch
 from torch import nn
 
@@ -52,6 +54,9 @@ def _pack_hc_batch_weight(
     if weight.dtype != torch.float16 or (rank is not None and not 0 <= rank < 4):
         raise ValueError("HC batch packing requires FP16 and a TP4 rank")
     weight = weight.detach()
+    if role == "down" and weight.shape == (_HC_RANK, _HC_HIDDEN):
+        # Final mixers have no injection rows; zero rows keep the HC LL layout.
+        weight = torch.nn.functional.pad(weight, (0, 0, 0, 16))
     if role == "down" and weight.shape == (336, 10240):
         if rank is None:
             padded = weight.new_zeros((352, 10240))
@@ -109,6 +114,15 @@ def _prepare_hc_batch_weight(layer: nn.Module) -> None:
         _pack_hc_batch_weight(weight, layer._sm70_qwen38_hc_batch_role, rank),
         persistent=False,
     )
+    layer.refresh_derived_weights = MethodType(refresh_hc_batch_weight, layer)
+
+
+def refresh_hc_batch_weight(layer: nn.Module) -> None:
+    """Repack after an in-place weight update, keeping the captured buffer."""
+    packed = layer._sm70_qwen38_hc_batch_packed
+    _prepare_hc_batch_weight(layer)
+    packed.copy_(layer._sm70_qwen38_hc_batch_packed)
+    layer._sm70_qwen38_hc_batch_packed = packed
 
 
 def _batch_runtime_ok(x, packed_down, packed_up, concurrent_batch=False) -> bool:
@@ -740,6 +754,26 @@ def enable_qwen38_sm70_fp16_fused_hc(
         vllm_config or get_current_vllm_config()
     ).parallel_config.tensor_parallel_size == 4
     for child in module.modules():
+        if (
+            ll_enabled
+            and not getattr(child, "use_combine", True)
+            and getattr(child, "lora_rank", None) == _HC_RANK
+            and getattr(child, "hc_count", None) == _HC_COUNT
+            and getattr(child, "hidden_size", None) == _HC_DIM
+            and hasattr(child, "input_mix_weight_down")
+            and hasattr(child, "input_mix_weight_up")
+        ):
+            # 1Cat v1.5.4 runs final mixers through the same HC LL fused
+            # down+up schedule, with the down weight padded by 16 zero rows.
+            for role, layer in (
+                ("down", child.input_mix_weight_down),
+                ("up", child.input_mix_weight_up),
+            ):
+                layer.quant_method = Qwen38SM70FP16LinearMethod()
+                layer._sm70_qwen38_hc_batch_role = role
+            child._sm70_qwen38_fp16_fused_hc_no_combine = True
+            enabled_count += 1
+            continue
         if not (
             getattr(child, "use_combine", False)
             and getattr(child, "lora_rank", None) == _HC_RANK
@@ -803,9 +837,61 @@ def enable_qwen38_sm70_fp16_fused_hc(
         )
 
 
+def maybe_apply_qwen38_sm70_fp16_fused_hc_no_combine(
+    down_layer: nn.Module, up_layer: nn.Module, x: torch.Tensor, enabled: bool
+) -> torch.Tensor | None:
+    if not enabled or not use_sm70_decode_graph_semantics():
+        return None
+    # LoRA wrappers keep their own forward so adapter updates still apply.
+    if not (isinstance(down_layer, LinearBase) and isinstance(up_layer, LinearBase)):
+        return None
+    return torch.ops.vllm.qwen38_sm70_fp16_fused_hc_no_combine(
+        x,
+        down_layer.weight,
+        up_layer.weight,
+        down_layer._sm70_qwen38_hc_batch_packed,
+        up_layer._sm70_qwen38_hc_batch_packed,
+    )
+
+
+def _qwen38_sm70_fp16_fused_hc_no_combine(
+    x: torch.Tensor,
+    down_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+    packed_down: torch.Tensor,
+    packed_up: torch.Tensor,
+) -> torch.Tensor:
+    ll = get_tp_hc_ll()
+    if ll is not None and x.shape[0] <= MAX_ROWS:
+        return ll.project(x.contiguous(), packed_down, packed_up)[0]
+    lora = torch.ops.vllm.qwen4_exp_hc_silu(
+        torch.nn.functional.linear(x, down_weight), _HC_COUNT
+    )
+    gate = torch.nn.functional.linear(lora, up_weight)
+    return torch.ops.vllm.qwen4_exp_hc_gate_mix(x, gate, _HC_COUNT)
+
+
+def _qwen38_sm70_fp16_fused_hc_no_combine_fake(
+    x: torch.Tensor,
+    down_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+    packed_down: torch.Tensor,
+    packed_up: torch.Tensor,
+) -> torch.Tensor:
+    return x.new_empty((*x.shape[:-1], _HC_DIM))
+
+
+direct_register_custom_op(
+    op_name="qwen38_sm70_fp16_fused_hc_no_combine",
+    op_func=_qwen38_sm70_fp16_fused_hc_no_combine,
+    fake_impl=_qwen38_sm70_fp16_fused_hc_no_combine_fake,
+)
+
+
 __all__ = [
     "_qwen38_hc_down_local_shard_kernel",
     "_qwen38_hc_up_local_gate_kernel",
     "enable_qwen38_sm70_fp16_fused_hc",
     "maybe_apply_qwen38_sm70_fp16_fused_hc",
+    "maybe_apply_qwen38_sm70_fp16_fused_hc_no_combine",
 ]

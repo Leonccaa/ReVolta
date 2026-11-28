@@ -3,13 +3,15 @@
 """Flash-Next LL scratch and SM70 physical NVLink admission (1Cat #992/#1521)."""
 
 from itertools import combinations
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from vllm import _custom_ops as ops
+from vllm.config import get_current_vllm_config
+from vllm.distributed.communication_op import tensor_model_parallel_all_gather
 from vllm.distributed.parallel_state import (
     get_tp_group,
     model_parallel_is_initialized,
@@ -17,6 +19,7 @@ from vllm.distributed.parallel_state import (
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import import_pynvml
+from vllm.utils.torch_utils import direct_register_custom_op
 
 if TYPE_CHECKING:
     from vllm.models.qwen4_exp.nvidia.sm70_hcx import Sm70HcxRuntime
@@ -27,6 +30,7 @@ MAX_ROWS = 64
 _DOWN_BYTES = 2 * MAX_ROWS * 336 * 4
 _UP_BYTES = 2 * MAX_ROWS * 2560 * 4
 _AR_BYTES = 2 * 4 * MAX_ROWS * 2560 * 4
+_FC_BYTES = 2 * MAX_ROWS * 10240 * 4
 
 
 def _full_nvlink_mesh(uuids: list[str]) -> bool:
@@ -59,12 +63,15 @@ class Sm70HcLLCommunicator:
             for i in range(torch.accelerator.device_count())
         }
         # All six pairs must be direct NVLink with native peer atomics.
-        if not _full_nvlink_mesh(uuids) or not all(
+        admitted = _full_nvlink_mesh(uuids) and all(
             ops.sm70_ring_native_peer_atomics(device.index, visible[uuid])
             for index, uuid in enumerate(uuids)
             if index != rank
-        ):
-            logger.info("SM70 HC LL disabled: physical NVLink mesh not confirmed.")
+        )
+        admissions = [None] * len(uuids)
+        dist.all_gather_object(admissions, admitted, group=group)
+        if not all(admissions):
+            logger.info("SM70 HC LL disabled: requires direct NVLink and peer atomics.")
             return None
         logger.info("SM70 HC LL enabled: six direct NVLink pairs and peer atomics.")
         return cls(group, device, rank)
@@ -75,9 +82,12 @@ class Sm70HcLLCommunicator:
         self.rank = rank
         self.device = device
         self.hcx: Sm70HcxRuntime | None = None
+        fc_peer = get_current_vllm_config().kernel_config.sm70_nvlink_mtp_fc_peer
+        fc_offset = _DOWN_BYTES + _UP_BYTES + _AR_BYTES
+        total_bytes = fc_offset + _FC_BYTES * fc_peer
         with torch.accelerator.device_index(device.index):
             self.pointers = CustomAllreduce.create_shared_buffer(
-                _DOWN_BYTES + _UP_BYTES + _AR_BYTES, group=group
+                total_bytes, group=group
             )
             self.down_ptrs = self.pointers
             self.up_ptrs = [ptr + _DOWN_BYTES for ptr in self.pointers]
@@ -95,6 +105,11 @@ class Sm70HcLLCommunicator:
             self.ar_dirty = torch.zeros(2, dtype=torch.int32, device=device)
             self.ar_seq = torch.zeros(1, dtype=torch.int32, device=device)
             self.empty = torch.empty(0, dtype=torch.float16, device=device)
+            if fc_peer:
+                self.fc_ptrs = [ptr + fc_offset for ptr in self.pointers]
+                self.fc_counter = torch.zeros(1, dtype=torch.int32, device=device)
+                self.fc_dirty = torch.zeros(2, dtype=torch.int32, device=device)
+                self.fc_seq = torch.zeros(1, dtype=torch.int32, device=device)
             torch.accelerator.synchronize()
         dist.barrier(group=group)
 
@@ -122,6 +137,21 @@ class Sm70HcLLCommunicator:
             injection,
         )
         return out, injection
+
+    def add_all_gather_fc(self, el: torch.Tensor, hl: torch.Tensor) -> torch.Tensor:
+        out = el.new_empty((el.shape[0], 10240))
+        ops.sm70_hc_ll_add_all_gather_fc_out(
+            out,
+            el.contiguous(),
+            hl.contiguous(),
+            self.fc_counter,
+            self.fc_dirty,
+            self.fc_ptrs,
+            self.fc_seq,
+            self.rank,
+            [0, 1, 2, 3],
+        )
+        return out
 
     def combine_norm(
         self,
@@ -173,3 +203,22 @@ def get_tp_hc_ll() -> Sm70HcLLCommunicator | None:
     if model_parallel_is_initialized():
         return getattr(get_tp_group().device_communicator, "sm70_hc_ll", None)
     return None
+
+
+def _fc_add_all_gather(el: torch.Tensor, hl: torch.Tensor) -> torch.Tensor:
+    rows = el.shape[0]
+    if 1 <= rows <= MAX_ROWS:
+        ll = cast(Sm70HcLLCommunicator, get_tp_hc_ll())
+        return ll.add_all_gather_fc(el, hl)
+    return tensor_model_parallel_all_gather(el.unsqueeze(-2) + hl).flatten(-2)
+
+
+def _fc_add_all_gather_fake(el: torch.Tensor, hl: torch.Tensor) -> torch.Tensor:
+    return el.new_empty((el.shape[0], 10240))
+
+
+direct_register_custom_op(
+    op_name="qwen38_sm70_fc_add_all_gather",
+    op_func=_fc_add_all_gather,
+    fake_impl=_fc_add_all_gather_fake,
+)

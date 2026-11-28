@@ -8,11 +8,11 @@ It is built for four or more V100 32 GB GPUs and validated on four. We recommend
 
 **You need:** four or more V100 32 GB GPUs (validated on four), on NVLink or with all GPUs under one PCIe switch with P2P; at least 32 GiB of system memory with the experimental whole-table PLE disk option (about 23–25% slower single-request decoding), 80 GiB with the default pinned PLE table, 128 GiB recommended; Linux x86-64 with glibc 2.34 or newer; and an NVIDIA driver for CUDA 12.8. Tested hardware and limits: [Support and known limits](docs/known-limits.md).
 
-Current release: [0.1.5](https://github.com/Leonccaa/ReVolta/releases/tag/v0.1.5).
+Current release: [0.2.0](https://github.com/Leonccaa/ReVolta/releases/tag/v0.2.0).
 
 ## At a glance
 
-**Context and capacity** (Uncensored AWQ, E4M3 KV cache, 0.1.4)
+**Context and capacity** (historical measurements: Uncensored AWQ, E4M3 KV cache, 0.1.4)
 
 | | MTP4 (default) | DFlash2 (recommended settings) |
 | --- | ---: | ---: |
@@ -45,7 +45,7 @@ In the AWQ and standard NVFP4 checkpoints only the routed experts are 4-bit: the
 
 **Hy4-flash (validation support, 0.2.0rc13):** text-only [tencent/Hy4-flash](https://huggingface.co/tencent/Hy4-flash) runs on four V100 32 GB GPUs with the [AWQ g32 checkpoint](https://huggingface.co/leoncca/Hy4-flash-AWQ-g32), FP8 attention KV and optional decode context parallelism up to 512K tokens. Support is frozen at this release. See [Hy4-flash](docs/hy4-flash.md).
 
-GPU KV pools use the recommended setup for each checkpoint (E4M3 target and draft KV, 512K, 8 sequences). Quality is measured with an E4M3 KV cache on 66 English, Chinese and code records against each checkpoint's own BF16 parent; method and other datasets are in [Quality measurements](docs/performance.md#quality-measurements). Test status, pinned revisions and preparation steps for each checkpoint are in [Checkpoints](docs/checkpoints.md).
+The GPU KV pool figures were measured with E4M3 target and draft KV, 512K context and 8 sequences. The quality figures were also measured with E4M3 KV, on 66 English, Chinese and code records against each checkpoint's own BF16 parent; method and other datasets are in [Quality measurements](docs/performance.md#quality-measurements). Test status, pinned revisions and preparation steps for each checkpoint are in [Checkpoints](docs/checkpoints.md).
 
 ## Quick start
 
@@ -55,19 +55,19 @@ The package is `revolta`; the Python import and CLI remain `vllm`.
 ```bash
 python3.12 -m venv /data/revolta/venv
 . /data/revolta/venv/bin/activate
-pip install revolta==0.1.5
-vllm --version          # 0.1.5
+pip install revolta==0.2.0
+vllm --version          # 0.2.0
 ```
 
 Or pull the Docker image:
 
 ```bash
-docker pull ghcr.io/leonccaa/revolta:0.1.5
+docker pull ghcr.io/leonccaa/revolta:0.2.0
 ```
 
 Follow [Getting started](docs/getting-started.md) to download the pinned checkpoint,
 make the target and draft views, apply the environment settings, launch and check the API.
-It includes the complete reference launch and Docker commands.
+The reference configuration uses INT8 target KV, which the MTP draft inherits.
 
 For another checkpoint, use its [preparation guide](docs/checkpoints.md) before launching.
 
@@ -76,7 +76,7 @@ For another checkpoint, use its [preparation guide](docs/checkpoints.md) before 
 | I want to… | Read |
 | --- | --- |
 | Install and launch the reference configuration | [Getting started](docs/getting-started.md) |
-| Select and prepare a checkpoint, KV scales and an MTP draft | [Checkpoints](docs/checkpoints.md) |
+| Select and prepare a checkpoint, an MTP draft and optional E4M3 KV scales | [Checkpoints](docs/checkpoints.md) |
 | Enable DFlash2 and choose its settings | [DFlash2](docs/dflash2.md) |
 | Keep evicted prefixes in CPU memory or on disk | [KV offload](docs/kv-offload.md) |
 | Look up deployment settings, sampling and memory budgets | [Configuration](docs/configuration.md) |

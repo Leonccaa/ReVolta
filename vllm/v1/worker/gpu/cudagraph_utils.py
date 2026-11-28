@@ -866,6 +866,14 @@ class ModelCudaGraphManager(CudaGraphManager):
                         ),
                     ),
                 ):
+                    if (
+                        desc.cg_mode == CUDAGraphMode.FULL
+                        and desc.uniform_token_count is not None
+                        and desc.uniform_token_count > 1
+                    ):
+                        get_forward_context().additional_kwargs["sm70_gdn_verify"] = (
+                            True
+                        )
                     # Only uniform decode graphs are phase-specialized. The
                     # same decision applies to their warmup and capture.
                     if (

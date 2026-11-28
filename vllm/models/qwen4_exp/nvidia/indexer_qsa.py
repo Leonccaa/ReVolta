@@ -25,6 +25,7 @@ from ..common.qsa_cache import (
     QSAForwardMetadata,
     QSAKeyStateCache,
     canonical_qsa_rope_positions,
+    is_mtp_draft_prefix,
     qsa_index_dcp_sharded,
 )
 from .ops.qsa_pre_indexer import qsa_pre_indexer
@@ -136,6 +137,28 @@ class QSAIndexer(nn.Module):
             or envs.VLLM_SM70_QSA_SHARED_KEY
         )
         self.fused_topk = vllm_config.kernel_config.sm70_qsa_fused_topk
+        # ModelOpt mixed checkpoints can contain FP8 as well as NVFP4.
+        quant = getattr(quant_config, "fallback", quant_config)
+        quant_name = quant.get_name() if quant is not None else None
+        nvfp4 = quant_name == "modelopt_fp4" or (
+            quant_name == "modelopt_mixed"
+            and any(
+                ".mlp.experts" in name and info.get("quant_algo", "").upper() == "NVFP4"
+                for name, info in getattr(quant, "quantized_layers", {}).items()
+            )
+        )
+        parallel = vllm_config.parallel_config
+        self.prefill_tp_group = None
+        if (
+            nvfp4
+            and parallel.tensor_parallel_size == 4
+            and parallel.pipeline_parallel_size == 1
+            and parallel.decode_context_parallel_size in (1, 2)
+            and parallel.prefill_context_parallel_size == 1
+        ):
+            from vllm.distributed.parallel_state import get_tp_group
+
+            self.prefill_tp_group = get_tp_group()
 
         self.index_qk_proj = ReplicatedLinear(
             int(config.hidden_size),
@@ -208,8 +231,11 @@ class QSAIndexer(nn.Module):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         out: torch.Tensor | None = None,
+        select: bool = True,
+        *,
+        row_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Return fixed-width request-relative token indices padded with ``-1``."""
+        """Write key caches and optionally select request-relative token indices."""
 
         metadata = self._metadata()
         if metadata is None:
@@ -351,34 +377,51 @@ class QSAIndexer(nn.Module):
                     position_rows,
                 )
 
-        if self.skip_topk:
+        if self.skip_topk or not select:
             if out is None:
                 raise RuntimeError("QSA top-k reuse requires an output buffer")
             return out
 
         # Score compressed keys, select blocks, then expand them to token indices.
-        uniform_decode = get_forward_context().is_uniform_decode
+        forward_context = get_forward_context()
+        uniform_decode = forward_context.is_uniform_decode
+        token_to_req = compressed_metadata.token_to_req
+        logical_positions = compressed_metadata.logical_positions
+        query_start_loc_cpu = compressed_metadata.query_start_loc_cpu
+        prefill_ranges = compressed_metadata.prefill_ranges
+        if row_indices is not None:
+            q = q.index_select(0, row_indices)
+            token_to_req = token_to_req.index_select(0, row_indices)
+            logical_positions = logical_positions.index_select(0, row_indices)
+            # The original request segments refer to the cache-write rows.
+            query_start_loc_cpu = None
+            prefill_ranges = ()
+        if prefill_ranges and is_mtp_draft_prefix(self.prefix):
+            # Draft step 0 has its own forward context. Its sharded index
+            # metadata already carries the real prefill rows from MRv2.
+            forward_context.additional_kwargs["qsa_has_prefill"] = True
         return qsa_select_paged_tokens(
             q,
             compressed_key_cache,
             compressed_metadata.block_table,
-            compressed_metadata.token_to_req,
-            compressed_metadata.logical_positions,
+            token_to_req,
+            logical_positions,
             compressed_metadata.seq_lens,
             self.token_topk,
             self.compress_ratio,
             out,
-            query_start_loc_cpu=compressed_metadata.query_start_loc_cpu,
+            query_start_loc_cpu=query_start_loc_cpu,
             shared_key_scoring=self.shared_key_scoring,
             max_seq_len=compressed_metadata.max_seq_len,
             seq_lens_cpu_upper_bound=compressed_metadata.seq_lens_cpu_upper_bound,
             index_dcp_world_size=compressed_metadata.index_dcp_world_size,
             index_dcp_rank=compressed_metadata.index_dcp_rank,
-            prefill_ranges=compressed_metadata.prefill_ranges,
+            prefill_ranges=prefill_ranges,
             batch_query_starts=(
                 compressed_metadata.query_start_loc if uniform_decode else None
             ),
             fused_topk=self.fused_topk and uniform_decode,
+            tp_group=self.prefill_tp_group,
         )
 
 

@@ -147,7 +147,7 @@ or per-token-head E4M3, both of which the raw `fs` tier rejects.
   "kv_role": "kv_both",
   "kv_connector_extra_config": {
     "spec_name": "TieringOffloadingSpec",
-    "cpu_bytes_to_use": 2147483648,
+    "cpu_bytes_to_use": 17179869184,
     "eviction_policy": "lru",
     "secondary_tiers": [
       {
@@ -168,7 +168,7 @@ or per-token-head E4M3, both of which the raw `fs` tier rejects.
 }
 ```
 
-The example sets a 2 GiB CPU pool and an 8 GiB disk budget.
+The example sets a 16 GiB CPU pool and an 8 GiB disk budget.
 
 - `max_size_bytes` is **required**. It is a positive integer: the total page budget
   for everything under `root_dir`. Configuration fails without it.
@@ -187,6 +187,18 @@ The example sets a 2 GiB CPU pool and an 8 GiB disk budget.
   2 GiB with MTP4 and about 5 GB with DFlash2). Otherwise the request is computed
   again. The quick-start 48 GiB pool holds about 2.4M tokens with MTP4; with DFlash2 the
   same pool holds about 1M tokens, an estimate from the same about 50 KB per token.
+- With a grouped CPU pool (a hybrid model with a recurrent-state group, for example
+  the default MTP4), each state pool is sized from `mamba_state_slots_reference_tokens`
+  alone, without counting requests restoring from disk at the same time. With MTP4
+  the pool holds roughly 0.73 requests' worth of recurrent states per GiB (measured:
+  4 state slots per group at 2 GiB, 72 at 48 GiB, two slots per request), so if more
+  requests restore from disk at once than the pool has state slots for, the extra
+  requests are treated as cache misses and fully recomputed; their output is not
+  affected. Size the pool so that 0.73 × pool GiB covers the number of requests that
+  may restore concurrently (about 11 GiB for 8, the default `--max-num-seqs`, hence
+  the 16 GiB in this example), or lower `mamba_state_slots_reference_tokens` (for
+  example 16384, which by the sizing formula gives each state pool about four times
+  more slots from the same budget, at the cost of fewer token slots; not measured).
 
 Validation scope for the raw `fs` tier: the full release gate passed on a network file
 system (8 GiB CPU pool, 40 GiB disk budget), including a 99K-token prefix restored from
@@ -298,6 +310,52 @@ Prometheus endpoint or a prompt-token hit rate. The delayed queue's `written` an
 `written_bytes_24h` count submitted rows and page bytes, which may still fail or be
 skipped by the disk tier; they do not prove successful physical writes.
 
+## Setting the SSD write delay
+
+`write_delay_s` delays the write of a page to disk. It appears in two places,
+both with a default of 300 s: the `write_delay_s` key of a `revolta_fs` tier
+entry in `secondary_tiers`, and the `write_delay_s` option of the host SSD
+persistence under `host_kv.ssd`. A unified host deployment sets
+`host_kv.ssd.write_delay_s`; when legacy `secondary_tiers` entries are kept as
+well, the engine rejects a mismatch between the two at startup.
+
+The delay saves disk bandwidth: a page that is superseded shortly after it was
+written never reaches the disk. The cost is that a page evicted during the
+delay is not written. The host SSD persistence attempts a write-back before it
+evicts a page, so an evicted page usually reaches the disk; the attempt is
+skipped when the write queue is full, the disk budget has no headroom, or the
+page cannot be written. The `revolta_fs` tier path has no pre-eviction write at
+all: a page evicted or demoted before its deadline is dropped.
+
+Size the delay against the turnover of the pool that feeds the disk: the delay
+should stay well below the turnover time. Estimate the turnover from the pool
+capacity and the actual byte rate entering the pool, and the SSD throughput
+from the actual byte rate that still has to be written.
+
+```text
+turnover ≈ pool capacity ÷ new KV write rate
+new KV write rate ≈ KV bytes per token × actual prefill tokens per second
+```
+
+The numbers below are estimates for Flash-Next with one KV dtype, not
+measurements of your deployment: about 13.8 KB per token and, with four-way
+prefill, about 40 MB/s. A 98 GiB pool then turns over in about 40 minutes, so
+300 s is safe there. A 7 GiB pool turns over in about 3 minutes, so 300 s
+would evict most pages before they reach the disk; use about 20 to 60 s there.
+The SSD must sustain a write rate above the average new KV write rate.
+
+Check the result in the field. With Host SSD persistence, the store counters
+`host_ssd_evict_unwritten` and `host_ssd_evicted_persisted` appear in the
+`Store stats` log line and as Prometheus counters, for example
+`vllm:store_events_total{event="host_ssd_evict_unwritten"}`. A rising
+`host_ssd_evict_unwritten` means pages left the pool before they were written:
+the delay is too long for the pool size, or the write queue and the disk
+budget could not keep up. These two counters apply to Host SSD only. For a
+plain `revolta_fs` tier, read the `Delayed writes` log line instead:
+`dropped_evicted` counts pages dropped because they were evicted before their
+deadline, and `dropped_superseded` counts pages dropped because a newer
+version replaced them.
+
 ## Active Host KV development configuration
 
 `kernel_config.long_context_kv` is an experimental, opt-in configuration for
@@ -360,12 +418,26 @@ explicitly when single-request speed matters more than context concurrency,
 when pinned host memory is tight, or when output must stay bitwise comparable
 with releases that defaulted to `"gpu"`. `"host"` needs
 `main_kv_placement="host"` and matching target/draft storage formats and page
-geometry. With DCP2, explicitly set `"qsa_dcp_index_shard": true` at the top
-level of `--kernel-config` for Host MTP. Use the unsharded index for GPU MTP.
-Without the index shard in DCP2, the draft stays on GPU. A draft with a different
-format or geometry stays on the GPU and logs a warning. Changing the value
-changes the host row layout, so an SSD tier written with the other value is not
-read back.
+geometry.
+
+**MTP at DCP2.** `qsa_dcp_index_shard` is unset by default and only the DFlash2
+hybrid serving profile turns it on, so a Host MTP run at DCP2 keeps the
+replicated index by default. The draft then does not have the target's sharded
+geometry, does not become a layer of the host row, and stays in GPU history;
+the engine logs a warning that the draft stays on the GPU. Every history ID
+then costs the `"gpu"` amount of GPU bytes (about 1.13 MB) instead of about
+0.71 MB, so the same GPU budget holds fewer long contexts than the host
+recipe. To place the draft on the host, set `"qsa_dcp_index_shard": true` at
+the top level of `--kernel-config` and keep the defaults
+`main_kv_placement="host"` and `draft_main_placement="host"`. The target and
+the draft must then use the same storage format (the MTP draft inherits the
+target's KV format unless `speculative_config.kv_cache_dtype` overrides it)
+and the same page geometry. DCP1 needs no extra setting. Do not copy that
+flag into a GPU MTP run: outside the long-context mode the model rejects
+index sharding with MTP, and inside it, with `main_kv_placement="gpu"`, the
+flag still leaves the draft on the GPU. A draft with a different format or
+geometry stays on the GPU and logs a warning. Changing the value changes the
+host row layout, so an SSD tier written with the other value is not read back.
 
 `speculative_config.gdn_state_replay=true` replays the accepted target GDN
 inputs for MTP, so recurrent layers keep two state blocks per request instead

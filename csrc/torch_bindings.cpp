@@ -1310,6 +1310,11 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
   custom_ar.def("meta_size", &meta_size);
   custom_ar.def("sm70_tp4_push_allreduce_buffer_size",
                 &sm70_tp4_push_allreduce_buffer_size);
+  custom_ar.def("sm70_dcp2_p2p_buffer_size", &sm70_dcp2_p2p_buffer_size);
+  custom_ar.def(
+      "sm70_dcp2_p2p(int fa, int peer, Tensor local_input, Tensor peer_input, "
+      "Tensor(a!) local_out, Tensor(a!) peer_out) -> ()");
+  custom_ar.impl("sm70_dcp2_p2p", torch::kCUDA, &sm70_dcp2_p2p);
   custom_ar.def(
       "sm70_tp4_push_allgather(int fa, Tensor input, Tensor(a!) output) -> ()");
   custom_ar.impl("sm70_tp4_push_allgather", torch::kCUDA,

@@ -125,6 +125,7 @@ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dflash2.sparse_rejection import (
     DFlash2LogitsFallback,
     try_dflash2_sparse_target_rejection,
+    warmup_dflash2_sparse_target_rejection,
 )
 from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
@@ -547,6 +548,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.use_aux_hidden_state_outputs:
                 assert self.speculative_config is not None
                 set_eagle3_aux_hidden_state_layers(self.model, self.speculative_config)
+            # Before the draft loads, so its QPN8 head can share the FP8 codes.
+            prepare_target_head = getattr(
+                self.model, "prepare_sm70_bounded_target_head", None
+            )
+            if prepare_target_head is not None:
+                prepare_target_head()
             if self.speculator is not None:
                 _reclaim_before_draft_load()
                 self.speculator.load_model(self.model)
@@ -913,6 +920,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         warmed: list[str] = []
         if hasattr(self, "_kv_block_zeroer") and self._kv_block_zeroer.warmup_kernel():
             warmed.append("zero_kv_blocks")
+
+        if any(
+            arch.startswith("Qwen4ExpFor") for arch in self.model_config.architectures
+        ):
+            from vllm.models.qwen4_exp.nvidia.warmup import (
+                warmup_sm70_qwen4_exp_kernels,
+            )
+
+            warmed.extend(warmup_sm70_qwen4_exp_kernels(self.vllm_config, self.device))
+
+        if (
+            isinstance(self.speculator, DFlash2Speculator)
+            and self.rejection_sampler is not None
+            and hasattr(self.model, "get_topk_tokens_and_logits")
+            and warmup_dflash2_sparse_target_rejection(
+                self.speculator, self.rejection_sampler
+            )
+        ):
+            warmed.append("dflash2_sparse_target_rejection")
 
         speculator_warmup = getattr(
             self.speculator, "warmup_sm70_mtp_moe_kernels", None
@@ -2162,6 +2188,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     and uniform_tok_count is not None
                 ),
             ):
+                # QSA runs outside PIECEWISE capture and uses the live batch phase.
+                has_prefill = bool(input_batch.is_prefilling_np.any())
+                get_forward_context().additional_kwargs["qsa_has_prefill"] = has_prefill
                 # Piecewise graphs can replay the same shape for prefill.
                 if (
                     (
@@ -2171,7 +2200,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     )
                     and batch_desc.cg_mode == CUDAGraphMode.NONE
                     and not dummy_run
-                    and not input_batch.is_prefilling_np.any()
+                    and not has_prefill
                 ):
                     get_forward_context().additional_kwargs[
                         "sm70_nvfp4_decode_only"

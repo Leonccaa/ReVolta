@@ -781,7 +781,7 @@ def test_sm70_dflash2_capture_sizes_with_f4(checkpoint, monkeypatch, max_capture
             max_num_seqs=8,
             max_num_batched_tokens=2048,
             is_encoder_decoder=False,
-            prefill_pressure_token_budget=448,
+            prefill_pressure_token_budget=1024,
             mixed_prefill_step_latency_ms=0,
         ),
         compilation_config=CompilationConfig(

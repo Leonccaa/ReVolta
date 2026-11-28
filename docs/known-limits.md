@@ -9,9 +9,10 @@ all GPUs under one PCIe switch with P2P, are the recommended and tested intercon
 The reference system uses four V100 32 GB PCIe cards behind one PCIe switch
 (PIX/PXB in `nvidia-smi topo -m`), with P2P enabled and a 128 GiB container memory limit.
 
-The release results below use the documented scalar E4M3 recipes. On V100,
-eligible QSA `auto` selects planar INT8. Use `fp8_per_token_head` to select
-dynamic planar E4M3 explicitly. See the [dtype comparison](configuration.md#launch-options).
+The reference recipe uses planar INT8 target KV (`auto` on SM70); the MTP draft
+KV inherits it. Earlier release acceptance used scalar E4M3 KV, an optional, frozen
+format, and the results below were measured with scalar E4M3 KV unless noted.
+See the [dtype comparison](configuration.md#launch-options).
 
 ## Support matrix
 
@@ -59,11 +60,12 @@ GGUF are outside the build.
 - **Long context.** Release retrieval is tested at 211K. The previous production
   build retrieved 20/20 needles at 489K. At 512K, the test covers capacity and the
   input/output boundary.
-- **Memory.** The default GPU utilization of 0.95 passed multimodal stress. Retest
-  memory use when changing concurrency or media limits. By default the AWQ PLE table
-  needs about 48 GiB of pinned host memory, and 80 GiB is the smallest tested limit that
-  passed memory stress on that path with KV offload off. The experimental disk option
-  below served under a 32 GiB limit.
+- **Memory.** The earlier E4M3 recipe passed multimodal stress at GPU utilization
+  0.95. See [Launch options](configuration.md#launch-options) for the INT8 reference
+  setting. Retest memory use when changing concurrency or media limits. By default the
+  AWQ PLE table needs about 48 GiB of pinned host memory, and 80 GiB is the smallest
+  tested limit that passed memory stress on that path with KV offload off. The
+  experimental disk option below served under a 32 GiB limit.
 - **PLE cascade.** Cascade (`ple_disk_cascade=true`) spills the part of the PLE table
   that does not fit in host memory to the checkpoint files. It is not supported yet
   and is off by default in the ReVolta profile; full support is planned for 0.2.
@@ -141,17 +143,6 @@ GGUF are outside the build.
   the first message (`System message must be at the beginning.`). Agent stacks that send
   several system messages need to merge them.
 - **Allocator.** Keep `NCCL_GRAPH_REGISTER=0` with expandable allocator segments.
-- **CPU KV offload and restarts.** With CPU KV offload on, a normal stop can leave the
-  shared offload file `/dev/shm/vllm_offload_<id>.mmap` behind
-  ([#51](https://github.com/Leonccaa/ReVolta/issues/51)). Each file is the size of the CPU
-  pool and every start creates a new one, so repeated restarts in the same `/dev/shm`
-  fill it until a start fails. `--shutdown-timeout 0` (the default) stops the engine
-  before its cleanup runs. Use a positive `--shutdown-timeout`, or remove stale
-  `vllm_offload_*.mmap` files that no process has open before starting. A container
-  with its own IPC namespace drops its `/dev/shm` when it is removed. The host KV
-  region (`long_context_kv`, files `vllm_offload_host_v2_*.mmap`) is not affected: its
-  name is removed as soon as every engine process has mapped it, so the memory returns
-  to the system when the last process exits, even after `SIGKILL`.
 - **Sleep level 2.** Not supported on the reference setup (128 GiB host, PLE tables in host
   memory): it needs about 87 GiB of free host memory for the model buffers while about
   63 GiB is available. Sleep level 1 works.

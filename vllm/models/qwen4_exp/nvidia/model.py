@@ -526,6 +526,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         aux_hidden_states: list[torch.Tensor] | None = None,
         hc_sp: bool = False,
         dual_moe_partials: bool = False,
+        row_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | HCTensorParallelPartial, torch.Tensor]:
         attn_hc = self.attn_hyper_connection
         hc_kwargs = {"hc_sp": True} if hc_sp else {}
@@ -572,7 +573,19 @@ class Qwen4ExpDecoderLayer(nn.Module):
         if hc_sp:
             block_input = sp_all_gather(block_input)[: positions.shape[-1]]
 
-        if self.layer_type == "linear_attention":
+        if row_indices is not None:
+            # Single-layer MTP uses all rows for cache writes, then only
+            # the sampled rows need the attention residual and MLP.
+            attn_out = self.self_attn(
+                hidden_states=block_input,
+                positions=positions,
+                output=None,
+                row_indices=row_indices,
+            )
+            hidden_states = hidden_states.index_select(0, row_indices)
+            assert injection is not None
+            injection = injection.index_select(0, row_indices)
+        elif self.layer_type == "linear_attention":
             use_direct_attention_output = (
                 envs.VLLM_SM70_TP4_LONG_PREFILL_FUSED_NORM
                 and torch.compiler.is_compiling()
@@ -660,7 +673,7 @@ def _prepare_sm70_hcx(config: VllmConfig, layers: Iterable[nn.Module]) -> None:
         mode.separate_routine() and mode.decode_mode() == CUDAGraphMode.FULL
     ):
         logger.info_once(
-            "SM70 HCX not prepared: requires admitted NVLink HC LL and a separate "
+            "SM70 HCX/Top1X requires admitted NVLink HC LL and a separate "
             "FULL decode graph."
         )
         return
@@ -702,11 +715,12 @@ def _prepare_sm70_hcx(config: VllmConfig, layers: Iterable[nn.Module]) -> None:
     ll.hcx = Sm70HcxRuntime(get_tp_group().cpu_group, ll.device, ll.rank)
     ll.hcx.top1_enabled = config.kernel_config.sm70_top1x
     config.kernel_config.sm70_hcx_active = bool(seams)
-    logger.info_once(
-        "SM70 HCX prepared %d HC seams (uniform FULL, M=1..8); top1x=%s.",
-        len(seams),
-        config.kernel_config.sm70_top1x,
-    )
+    if seams:
+        logger.info_once(
+            "SM70 HCX prepared %d HC seams (uniform FULL, M=1..8).", len(seams)
+        )
+    if ll.hcx.top1_enabled:
+        logger.info_once("SM70 Top1X prepared.")
 
 
 class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
@@ -1289,6 +1303,18 @@ class Qwen4ExpForCausalLM(
             self, self.model_config.dtype, self.vllm_config
         )
         object.__setattr__(self, "_sm70_decode_graph_model", None)
+        object.__setattr__(self, "_sm70_target_head", None)
+
+    def prepare_sm70_bounded_target_head(self) -> None:
+        if not self.vllm_config.kernel_config.sm70_mtp_bounded_target_head:
+            return
+        from .sm70_bounded_target_head import prepare_mtp_bounded_target_head
+
+        object.__setattr__(
+            self,
+            "_sm70_target_head",
+            prepare_mtp_bounded_target_head(self.lm_head, self.vllm_config),
+        )
 
     def prepare_hc_sp_model(self) -> None:
         config = copy.copy(self.vllm_config)
@@ -1529,7 +1555,10 @@ class Qwen4ExpForCausalLM(
         return self.logits_processor(self.lm_head, hidden_states)
 
     def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
+        head = self._sm70_target_head
+        return self.logits_processor.get_top_tokens(
+            self.lm_head if head is None else head, hidden_states
+        )
 
     def get_topk_tokens_and_logits(
         self, hidden_states: torch.Tensor, top_k: int
@@ -1788,6 +1817,9 @@ class Qwen4ExpForConditionalGeneration(
 
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
         return self.language_model.get_mtp_target_hidden_states()
+
+    def prepare_sm70_bounded_target_head(self) -> None:
+        self.language_model.prepare_sm70_bounded_target_head()
 
     def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.language_model.get_top_tokens(hidden_states)

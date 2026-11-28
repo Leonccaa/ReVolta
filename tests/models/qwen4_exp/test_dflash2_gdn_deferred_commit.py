@@ -65,6 +65,7 @@ def _make_vllm_config(
         cache_config=NS(
             mamba_cache_mode="align",
             mamba_ssm_cache_dtype=ssm_dtype,
+            kv_offloading_size=None,
         ),
         scheduler_config=NS(async_scheduling=async_scheduling),
         kv_transfer_config=NS(kv_connector=kv_connector) if kv_connector else None,

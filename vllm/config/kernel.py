@@ -5,7 +5,8 @@ from collections.abc import Callable
 from dataclasses import asdict, fields
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, ModelWrapValidatorHandler, field_validator, model_validator
+from pydantic_core import ArgsKwargs
 
 from vllm.config.utils import config, get_hash_factors, hash_factors
 from vllm.logger import init_logger
@@ -670,6 +671,13 @@ class KernelConfig:
     """Use the native FP16 paged QSA reader for eligible TP4/DCP2 target
     decode on SM70. Its reduction and probability rounding differ."""
 
+    sm70_qsa_paged_int8_h12: bool | None = None
+    """Use native planar INT8 paged QSA on SM70 for eligible TP4/DCP2 target
+    decode (H12) and replicated MTP draft decode graphs (H6). Both readers
+    can use the hot pool when main K/V is placed on the host. When unset,
+    enable it in the ReVolta SM70 TP4/DCP2 profile with INT8 main KV and
+    Model Runner V2. Explicit True/False overrides the profile default."""
+
     sm70_qsa_paged_fp16_h6: bool | None = None
     """Use the native FP16 paged QSA reader in replicated MTP decode graphs
     on SM70. When unset, enable it in the SM70 TP4/DCP2 NVFP4 profile with
@@ -688,9 +696,12 @@ class KernelConfig:
     channel-QPN8 on SM70. Only draft proposals change; verification uses the
     target's own weights."""
 
-    sm70_gdn_input_v154: bool = False
-    """Use the v154 packed GDN inputs for physical M3/M4 during SM70 target
-    FULL graph capture. Other rows keep their existing path."""
+    sm70_gdn_input_v154: bool | None = None
+    """Use v154 packed FP16 GDN inputs for M2..64 in target FULL verify
+    graphs (query length > 1), and retain M3/M4 FULL decode with speculative
+    decoding. Applies to AWQ g32 and standard NVFP4 FP16 projections, not
+    FP4-Local or QAD MXFP8 projections. Changes reduction order. When unset,
+    enable only for the validated ReVolta AWQ MTP4 profile."""
 
     sm70_gdn_input_skinny_k4: bool = False
     """Use four K warps in the SM70 row-major FP16 GDN input projection.
@@ -703,13 +714,15 @@ class KernelConfig:
     """
 
     qsa_dcp_index_shard: bool | None = None
-    """Shard the target QSA compressed indexer keys over the DCP group.
+    """Shard the QSA compressed indexer keys over the TP group.
 
-    Group g is owned by DCP rank ``g % dcp`` at local column ``g // dcp``. Each
+    Group g is owned by TP rank ``g % tp`` at local column ``g // tp``. Each
     rank scores only its own groups; local top-k candidates are merged across
-    the group into the unchanged global selection. Unset enables sharding only
-    for DFlash2 with 512 selected groups under the ReVolta hybrid serving profile.
-    Sharding takes effect with DCP > 1. GPU MTP keeps the replicated default.
+    the group into the unchanged global selection. Unset enables sharding, with
+    512 selected groups under the ReVolta hybrid serving profile, for DFlash2
+    and for MTP with Active Host KV (where it also moves the MTP draft's main
+    K/V to the host). Sharding takes effect with DCP > 1. GPU KV MTP keeps the
+    replicated default. An explicit value always wins.
     """
 
     long_context_kv: LongContextKVConfig = Field(default_factory=LongContextKVConfig)
@@ -746,6 +759,14 @@ class KernelConfig:
     """Verify greedy MTP drafts from TP-local target argmax pairs instead of
     gathering full-vocabulary logits for the rejection sampler."""
 
+    sm70_mtp_bounded_target_head: bool = False
+    """Select greedy target tokens on SM70 Flash-Next MTP with a bounded QPN8
+    vocabulary search (1CatAI v1.5.4): candidates are scored with the original
+    FP16 head, and rows whose bound is inconclusive run the full FP16 head.
+    Applies to TP-local argmax pairs of at most 64 rows. Shares the FP8 copy
+    of the head with the draft QPN8 head, else adds it (about 0.16 GB per rank
+    at TP4)."""
+
     sm70_sparse_target_sampling: bool | Literal["device_top64"] = False
     """Compact target sampling for SM70 MRv2 with uniform MTP3-5,
     greedy drafts and target temperature=1, top_k=20, top_p=0.95.
@@ -764,6 +785,11 @@ class KernelConfig:
     sm70_hc_ll_async: bool = False
     """Allow the usual SM70 NVLink HC LL admission under async scheduling."""
 
+    sm70_nvlink_mtp_fc_peer: bool = False
+    """Fuse the Flash-Next MTP draft FC residual add and feature all-gather
+    over admitted SM70 TP4 NVLink HC LL for batches of at most 64 rows.
+    """
+
     sm70_hc_moe_dual_partial: bool = False
     """Pass separate routed and shared expert outputs into NVLink HC on
     Flash-Next decode. Independent of HCX admission. HCX accumulates both
@@ -780,6 +806,28 @@ class KernelConfig:
     as the all-gather for finite logits."""
     sm70_hcx_active: bool = Field(default=False, init=False)
     """HCX operator/weight preparation changed the target compiler graph."""
+
+    _nvlink_profile_fields: tuple[str, ...] = Field(default=(), init=False, repr=False)
+    """Explicit kernel inputs used when resolving NVLink profile defaults."""
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _record_nvlink_profile_fields(
+        cls, data: Any, handler: ModelWrapValidatorHandler["KernelConfig"]
+    ) -> "KernelConfig":
+        result = handler(data)
+        raw = (data.kwargs or {}) if isinstance(data, ArgsKwargs) else data
+        if isinstance(raw, dict):
+            result._nvlink_profile_fields = tuple(
+                name
+                for name in (
+                    "sm70_hc_ll_async",
+                    "sm70_sparse_target_sampling",
+                    "sm70_qsa_paged_fp16_h12",
+                )
+                if name in raw
+            )
+        return result
 
     ple_result_transport: Literal["auto", "cuda", "mapped"] = "auto"
     """Select CPU PLE result transport by local operator/resource capability."""
@@ -816,6 +864,7 @@ class KernelConfig:
         Any future fields that don't affect compilation should be excluded.
         """
         ignored_factors = {
+            "_nvlink_profile_fields",
             "topology_all_reduce",  # Include enabled math policy below, not cache path.
             "enable_flashinfer_autotune",
             "ir_op_priority",  # handled separately below
@@ -831,6 +880,7 @@ class KernelConfig:
             "qsa_auto_e4m3_reason",
             # Sampler-only switches; they do not change the compiled model.
             "sm70_greedy_verify",
+            "sm70_mtp_bounded_target_head",
             "sm70_top1x",
             "sm70_sparse_target_sampling",
             "sm70_hc_ll_async",  # Compiled model uses sm70_nvlink_hc_active.
@@ -839,6 +889,8 @@ class KernelConfig:
         }
         if not self.sm70_qsa_fused_topk:
             ignored_factors.add("sm70_qsa_fused_topk")
+        if not self.sm70_qsa_paged_int8_h12:
+            ignored_factors.add("sm70_qsa_paged_int8_h12")
         if not self.sm70_qsa_paged_fp16_h6:
             ignored_factors.add("sm70_qsa_paged_fp16_h6")
         if not self.sm70_gdn_input_skinny_k4:
@@ -849,6 +901,8 @@ class KernelConfig:
             ignored_factors.add("sm70_dflash2_fp16_m8")
         if not self.sm70_nvlink_hc_active:
             ignored_factors.add("sm70_nvlink_hc_active")
+        if not (self.sm70_nvlink_hc_active and self.sm70_nvlink_mtp_fc_peer):
+            ignored_factors.add("sm70_nvlink_mtp_fc_peer")
         if not self.sm70_hc_moe_dual_partial:
             ignored_factors.add("sm70_hc_moe_dual_partial")
         ignored_factors.add("sm70_hcx")  # Only resolved preparation changes the graph.
@@ -922,6 +976,10 @@ class KernelConfig:
         import torch
 
         from vllm.platforms import current_platform
+
+        spec = vllm_config.speculative_config
+        if spec is None or spec.method != "mtp":
+            self.sm70_nvlink_mtp_fc_peer = False
 
         model = vllm_config.model_config
         text = getattr(model, "hf_text_config", None)

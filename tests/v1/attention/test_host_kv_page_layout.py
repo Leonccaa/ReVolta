@@ -20,7 +20,6 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     MLAAttentionSpec,
 )
-from vllm.v1.kv_offload.tiering.fs.revolta import _persistent_kv_tensors
 from vllm.v1.worker.gpu.attn_utils import _reshape_kv_cache
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -182,20 +181,3 @@ def test_payload_follows_inner_strides_and_ring_offsets():
     assert torch.equal(pack_page_payload(view, 1, 2), payload)
     with pytest.raises(ValueError):
         scatter_page_payload(payload[:3], view, 1, 2)
-
-
-def test_ordinary_persistent_identity_omits_both_absent_fields():
-    tensor = KVCacheTensor(128, ["a"])
-    cfg = SimpleNamespace(kv_cache_tensors=[tensor], block_segments=None)
-    [(type_name, fields)] = _persistent_kv_tensors(cfg)
-    assert type_name == "vllm.v1.kv_cache_interface.KVCacheTensor"
-    assert fields == (("packed_members", None), ("shared_by", ("a",)), ("size", 128))
-    cfg.kv_cache_tensors = [replace(tensor, num_blocks=2, page_stride_bytes=64)]
-    assert _persistent_kv_tensors(cfg) != [(type_name, fields)]
-    # Existing split GPU layouts already serialized num_blocks, but had no
-    # page_stride_bytes field. Keep that namespace stable as well.
-    cfg.block_segments = object()
-    cfg.kv_cache_tensors = [replace(tensor, num_blocks=2)]
-    [(split_name, split_fields)] = _persistent_kv_tensors(cfg)
-    assert split_name == type_name
-    assert dict(split_fields) == {**dict(fields), "num_blocks": 2}

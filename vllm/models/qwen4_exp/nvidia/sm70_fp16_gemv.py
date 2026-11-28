@@ -24,6 +24,7 @@ from vllm.compilation.sm70_decode_graph import (
     use_sm70_decode_graph_semantics,
 )
 from vllm.config import get_current_vllm_config
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.platforms import current_platform
@@ -295,30 +296,59 @@ def _pack_router_batch_weight(weight: torch.Tensor) -> torch.Tensor:
     )
 
 
-def _shared_batch_runtime_ok(x: torch.Tensor) -> bool:
+def _shared_batch_input_ok(x: torch.Tensor) -> bool:
     return bool(
         envs.VLLM_SM70_MTP_SHARED_BATCH
         and not envs.VLLM_BATCH_INVARIANT
         and x.ndim == 2
-        and x.shape[0] in (5, 10)
+        and 2 <= x.shape[0] <= 64
         and x.shape[1] == 2560
         and x.is_cuda
         and x.dtype == torch.float16
         and x.is_contiguous()
         and x.data_ptr() % 16 == 0
-        and torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
         and not torch.backends.cuda.matmul.allow_fp16_accumulation
     )
+
+
+def _shared_batch_runtime_ok(x: torch.Tensor) -> bool:
+    return bool(
+        _shared_batch_input_ok(x)
+        and x.shape[0] in (5, 10)
+        and torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
+    )
+
+
+def _pack_shared_up_weight(weight: torch.Tensor) -> torch.Tensor:
+    return weight.detach().reshape(10, 32, 160, 2, 8).permute(0, 2, 3, 1, 4)
+
+
+def _refresh_shared_up_pack(layer: nn.Module) -> None:
+    # Kernel-format weight updates write only the parameter; keep the pack
+    # address that captured graphs read.
+    layer._sm70_mtp_shared_packed.copy_(_pack_shared_up_weight(layer.weight))
 
 
 def _qwen38_sm70_shared_up(
     x: torch.Tensor, weight: torch.Tensor, packed: torch.Tensor | None
 ) -> torch.Tensor:
-    if _shared_batch_runtime_ok(x) and packed is not None:
+    if packed is not None and _shared_batch_runtime_ok(x):
         out = x.new_empty((x.shape[0], 160))
         partial = x.new_empty((8, x.shape[0], 320))
         torch.ops._C.qwen38_shared_up_batch_sm70_out(out, partial, x, packed)
         logger.info_once("SM70 MTP4 exact shared-expert batch projection enabled.")
+        return out
+    if (
+        packed is not None
+        and _shared_batch_input_ok(x)
+        and not torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
+    ):
+        # 1Cat v1.5.4: MTP verify rows keep FP32 split partials when cuBLAS
+        # reduced-precision reduction is off.
+        out = x.new_empty((x.shape[0], 160))
+        partial = x.new_empty((0,), dtype=torch.float32)
+        torch.ops._C.qwen38_shared_up_batch_fp32_sm70_out(out, partial, x, packed)
+        logger.info_once("SM70 MTP shared-expert batch projection enabled (FP32).")
         return out
     gate_up = torch.nn.functional.linear(x, weight)
     out = gate_up.new_empty((*gate_up.shape[:-1], 160))
@@ -360,6 +390,26 @@ direct_register_custom_op(
     op_func=_qwen38_sm70_shared_gate_mul,
     fake_impl=_qwen38_sm70_shared_gate_mul_fake,
 )
+
+
+def _qwen38_sm70_shared_down_gated(
+    x: torch.Tensor,
+    act_out: torch.Tensor,
+    down_weight: torch.Tensor,
+    gate_weight: torch.Tensor,
+) -> torch.Tensor:
+    # 1Cat v1.5.4 MTP routing: one fused down+gate kernel up to M8; wider
+    # verify batches keep the down GEMM and fuse the gate dot and multiply.
+    if x.shape[0] <= 8:
+        out = x.new_empty((x.shape[0], 2560))
+        torch.ops._C.qwen38_shared_down_gated_sm70_out(
+            out, x, act_out, down_weight, gate_weight
+        )
+        logger.info_once("SM70 MTP fused shared-expert down+gate enabled.")
+        return out
+    out = torch.nn.functional.linear(act_out, down_weight)
+    torch.ops._C.qwen38_shared_gate_dot_mul_sm70_out(out, x, gate_weight)
+    return out
 
 
 def _forward_shared_batch_silu(layer, x):
@@ -542,7 +592,7 @@ def _pack_gdn_input_weight(weight: torch.Tensor) -> torch.Tensor:
     return weight.reshape(-1, 32, 160, 2, 8).permute(0, 2, 3, 1, 4).contiguous()
 
 
-def _can_use_packed_gdn_input(x, packed_qkvz, packed_ba) -> bool:
+def _can_use_packed_gdn_input(x, packed_qkvz, packed_ba, max_rows=16) -> bool:
     return bool(
         (envs.VLLM_SM70_QWEN38_GDN_INPUT_BATCH or envs.VLLM_SM70_QWEN38_BATCH_FASTPATH)
         and not envs.VLLM_BATCH_INVARIANT
@@ -550,7 +600,7 @@ def _can_use_packed_gdn_input(x, packed_qkvz, packed_ba) -> bool:
         # Let cuBLAS honor an explicit request for FP16 accumulation.
         and not torch.backends.cuda.matmul.allow_fp16_accumulation
         and x.ndim == 2
-        and 2 <= x.shape[0] <= 16
+        and 2 <= x.shape[0] <= max_rows
         and x.shape[1] == 2560
         and x.is_cuda
         and x.dtype == torch.float16
@@ -580,26 +630,30 @@ def _qwen38_sm70_fp16_gdn_input(
     use_v154_m3_m4: bool = False,
     use_skinny_k4: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    if _can_use_packed_gdn_input(x, packed_qkvz, packed_ba):
-        use_v154 = (
-            use_v154_m3_m4 and x.shape[0] in (3, 4) and is_sm70_decode_graph_compiling()
+    use_v154 = (
+        use_v154_m3_m4
+        and is_sm70_decode_graph_compiling()
+        and (
+            x.shape[0] in (3, 4)
+            or get_forward_context().additional_kwargs.get("sm70_gdn_verify", False)
         )
-        # With NO_PACK=1 the new packed weights are only for the FULL trial.
-        if use_v154 or not envs.VLLM_SM70_QWEN38_GDN_NO_PACK:
-            op = (
-                torch.ops._C.qwen38_gdn_input_mtp_batch_sm70_out
-                if use_v154
-                else torch.ops._C.qwen38_gdn_input_batch_sm70_out
-            )
-            qkv, z, b, a = (x.new_empty((x.shape[0], n)) for n in (2560, 1536, 12, 12))
-            op(qkv, z, b, a, x, packed_qkvz, packed_ba)
-            if use_v154:
-                logger.info_once("SM70 v154 packed target GDN input enabled for M3/M4.")
-            else:
-                logger.info_once(
-                    "SM70 Qwen3.8 checkpoint-FP16 batched GDN input enabled."
-                )
-            return qkv, z, b, a
+    )
+    # With NO_PACK=1 the packed weights are only for the FULL trial.
+    if (use_v154 or not envs.VLLM_SM70_QWEN38_GDN_NO_PACK) and (
+        _can_use_packed_gdn_input(x, packed_qkvz, packed_ba, 64 if use_v154 else 16)
+    ):
+        op = (
+            torch.ops._C.qwen38_gdn_input_mtp_batch_sm70_out
+            if use_v154
+            else torch.ops._C.qwen38_gdn_input_batch_sm70_out
+        )
+        qkv, z, b, a = (x.new_empty((x.shape[0], n)) for n in (2560, 1536, 12, 12))
+        op(qkv, z, b, a, x, packed_qkvz, packed_ba)
+        if use_v154:
+            logger.info_once("SM70 v154 packed target GDN input enabled.")
+        else:
+            logger.info_once("SM70 Qwen3.8 checkpoint-FP16 batched GDN input enabled.")
+        return qkv, z, b, a
     if not (
         qkvz_weight.shape == (4096, 2560)
         and ba_weight.shape == (24, 2560)
@@ -679,7 +733,8 @@ def _mtp_batch_packing_allowed(layer: nn.Module, role: str) -> bool:
         return True
     matmul = torch.backends.cuda.matmul
     reason = None
-    if not matmul.allow_fp16_reduced_precision_reduction:
+    # Shared up keeps FP32 partials when reduced-precision reduction is off.
+    if role != "shared" and not matmul.allow_fp16_reduced_precision_reduction:
         reason = "fp16_reduced_precision_reduction_disabled"
     elif matmul.allow_fp16_accumulation:
         reason = "fp16_accumulation_enabled"
@@ -725,11 +780,11 @@ class Qwen38SM70FP16LinearMethod(UnquantizedLinearMethod):
                     raise RuntimeError("Rebuild the SM70 extension for shared expert")
                 layer.register_buffer(
                     "_sm70_mtp_shared_packed",
-                    weight.detach()
-                    .reshape(10, 32, 160, 2, 8)
-                    .permute(0, 2, 3, 1, 4)
-                    .contiguous(),
+                    _pack_shared_up_weight(weight).contiguous(),
                     persistent=False,
+                )
+                layer.refresh_derived_weights = MethodType(
+                    _refresh_shared_up_pack, layer
                 )
         if getattr(layer, "_sm70_qwen38_hc_batch_role", None) is not None:
             from .sm70_fp16_hc import _prepare_hc_batch_weight
@@ -977,6 +1032,10 @@ def enable_qwen38_sm70_fp16_gemv(
                 if (
                     batch_qualified
                     and vllm_config.kernel_config.sm70_gdn_input_v154
+                    and vllm_config.speculative_config is not None
+                    and (
+                        vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs()
+                    )
                     and not vllm_config.is_speculative_draft
                 ):
                     qkvz._sm70_qwen38_gdn_input_v154 = True

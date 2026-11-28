@@ -184,7 +184,7 @@ def test_pinned_host_ple_fp8_rows_are_gatherable_across_the_split_on_sm70(
 ) -> None:
     _patch_tp(monkeypatch, rank=0, world_size=1)
     monkeypatch.setattr(
-        embedding_module, "tensor_model_parallel_all_reduce", lambda tensor: tensor
+        ple_module, "tensor_model_parallel_all_reduce", lambda tensor: tensor
     )
     monkeypatch.setattr(ple_module, "ple_host_budget_bytes", lambda: host_rows * 8)
     layer = _pinned_layer(num_embeddings=8)

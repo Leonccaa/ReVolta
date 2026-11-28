@@ -1,6 +1,6 @@
 # Checkpoints, KV scales and MTP drafts
 
-Use this guide to select and prepare a checkpoint, its KV scales and its MTP draft.
+Use this guide to select and prepare a checkpoint, its MTP draft and any optional KV scales.
 First [install ReVolta](getting-started.md#1-install); for a complete first launch, follow the tutorial.
 
 - **Weight formats:** standard AWQ, NVFP4, NVIDIA FP4-Local, and NVIDIA NVFP4-QAD.
@@ -25,6 +25,10 @@ Use `--dtype half`: V100 has no BF16 support.
 
 ## KV scales and draft selection
 
+Tensor-scale calibrated E4M3 KV is frozen: it still works, but it is no longer
+optimized or tested in release acceptance. Eligible SM70 QSA models can use
+`--kv-cache-dtype auto` (INT8) or `fp8_per_token_head` for E4M3 storage.
+
 For explicit `fp8` / `fp8_e4m3`, calibrated scalar E4M3 KV scales belong to a
 specific checkpoint revision. Keep
 `VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES=1` enabled: missing target scales then
@@ -43,13 +47,15 @@ target-scale checking. Use the draft's own scales or set its
 
 DFlash2 drafts do not need these K/V scales. Their own configuration is in
 [DFlash2 speculative decoding](dflash2.md).
-The launch examples below explicitly select scalar `fp8_e4m3` for target and
-MTP; the strict-scale instructions apply to that recipe. Omitting the target
-CLI option selects `auto`. Eligible QSA models use planar INT8 on SM70 and
-planar `fp8_per_token_head` on other supported CUDA devices. Both compute scales
-at runtime. MTP inherits the target format when draft dtype is omitted. On
-supported QSA Model Runner V2 configurations, an explicit FP16 draft can also
-be used with an 8-bit target.
+The AWQ, Standard NVFP4 and NVIDIA FP4-Local examples below show the optional,
+frozen scalar `fp8_e4m3` setup for target and MTP. The strict-scale and scale-pack
+instructions apply to that format. The [reference launch](getting-started.md#4-launch)
+uses `auto` for the target and lets the MTP draft inherit its INT8 KV. Omitting
+the target option also selects `auto`: planar INT8 for eligible QSA models on
+SM70 and planar `fp8_per_token_head` on other supported CUDA devices. Both compute
+scales at runtime and need no KV scale overlay. MTP inherits the target format
+when the draft dtype is omitted. On supported QSA Model Runner V2 configurations,
+an explicit FP16 draft can also be used with an 8-bit target.
 SM70 QSA DFlash/DFlash2 defaults to FP16 draft KV. See the
 [KV dtype comparison](configuration.md#launch-options) for eligibility and ABI.
 
@@ -272,9 +278,8 @@ vllm serve /data/revolta/views/fp4-local/target-512k \
 `nvidia/Qwen3.8-Flash-Next-NVFP4-QAD` is a mixed-precision ModelOpt checkpoint:
 NVFP4 routed and shared experts, MXFP8 GDN and QSA projections (expanded to FP16
 at load), an FP8 PLE table, and a built-in MTP layer whose experts use FP8 block
-scales. It ships no QSA K/V scales, so it uses the per-token-head FP8 KV cache,
-which needs no calibration; with `--kv-cache-dtype auto` ReVolta selects it on
-its own. The built-in MTP layer follows the target's KV format.
+scales. It ships no QSA K/V scales, so this recipe uses `fp8_per_token_head`,
+which needs no calibration. The built-in MTP layer follows the target's KV format.
 
 Validated on four V100s (TP4/DCP2, MTP4, `fp8_per_token_head`, long-context host
 KV): every quantized path loads and serves, and greedy, sampled, tool-call, 32K
@@ -328,8 +333,8 @@ vllm serve /data/revolta/views/nvfp4-qad/target-512k \
 ## Weight and KV formats
 
 V100 stores compressed weights and KV, then converts them to FP16 for computation.
-The documented reference recipe is AWQ g32 with explicit scalar E4M3 KV.
-The CLI default `auto` selects planar INT8 for eligible QSA models on V100.
+The reference recipe is AWQ g32 with planar INT8 target KV (`auto` on SM70),
+which the MTP draft inherits. Calibrated scalar E4M3 KV is optional and frozen.
 Use `fp8_per_token_head` for dynamic planar E4M3.
 
 ## Quantization comparison
@@ -349,6 +354,8 @@ The E4M3 results below use the original scalar format, not planar E4M3.
 The first four rows use the same base BF16 reference; the Uncensored rows there include the effect of fine-tuning as well as quantization. The FP16 KV row is a separate comparison of FP16 and E4M3 KV against the Uncensored checkpoint's own BF16 parent (on short prompts: KL 0.0220 against 0.0214, top-1 97.08% for both; on the long-context set: 0.0239 against 0.0238).
 
 ## E4M3 KV
+
+Frozen; see [KV scales and draft selection](#kv-scales-and-draft-selection).
 
 For explicit scalar `fp8` / `fp8_e4m3`, use the calibrated per-layer K/V scales
 included in the checkpoint. Keep

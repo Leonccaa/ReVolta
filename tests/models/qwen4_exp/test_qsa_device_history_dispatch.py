@@ -152,7 +152,7 @@ def _rank_forward(inputs, rank, monkeypatch, interleave):
         indexer=SimpleNamespace(token_topk=TOPK, compress_ratio=RATIO),
         _k_scale_float=K_SCALE,
         _v_scale_float=V_SCALE,
-        sm70_qsa_paged_fp16_h12=False,
+        sm70_qsa_paged_h12=False,
     )
     impl = Qwen4ExpQSAFlashAttentionImpl.__new__(Qwen4ExpQSAFlashAttentionImpl)
     impl.kv_cache_dtype, impl.head_size = "fp8_e4m3", 256

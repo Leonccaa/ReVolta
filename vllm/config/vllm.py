@@ -425,8 +425,10 @@ def _gdn_spec_state_replay_reasons(
         reasons.append("mamba_cache_mode is not align")
     if vllm_config.scheduler_config.async_scheduling and not deferred:
         reasons.append("async scheduling")
+    # --kv-offloading-size declares a connector that is built after this check.
     if deferred and (
-        vllm_config.kv_transfer_config is not None
+        vllm_config.cache_config.kv_offloading_size is not None
+        or vllm_config.kv_transfer_config is not None
         and vllm_config.kv_transfer_config.kv_connector is not None
     ):
         reasons.append("a KV connector can release request slots before exact-end")
@@ -1934,12 +1936,18 @@ class VllmConfig:
             self.speculative_config.require_lookup_runtime()
 
         from vllm.revolta_profile import (
+            InterconnectMode,
             all_visible_devices_sm70,
+            apply_awq_mtp_wide_verify_defaults,
             apply_revolta_allocator_default,
+            apply_revolta_int8_qsa_profile,
             apply_revolta_kernel_profile,
+            apply_revolta_nvlink_kernel_profile,
             apply_revolta_profile,
             frontend_interconnect_mode,
             has_nvfp4_weights,
+            is_nvlink_auto_profile,
+            local_tp4_device_ids,
         )
 
         # Apply engine defaults before overlap, hybrid-PLE and compilation.
@@ -1949,16 +1957,18 @@ class VllmConfig:
             or self.parallel_config.enable_dbo
         )
         revolta_profile_enabled = False
+        interconnect_mode: InterconnectMode = "pex_p2p"
         if not self.is_speculative_draft:
+            device_ids = local_tp4_device_ids(self.parallel_config)
+            interconnect_mode = frontend_interconnect_mode(
+                disable_custom_all_reduce=self.parallel_config.disable_custom_all_reduce,
+                device_ids=device_ids,
+            )
             revolta_profile_enabled = apply_revolta_profile(
                 self.model_config,
                 self.parallel_config.tensor_parallel_size,
                 is_sm70=all_visible_devices_sm70(),
-                interconnect_mode=frontend_interconnect_mode(
-                    disable_custom_all_reduce=(
-                        self.parallel_config.disable_custom_all_reduce
-                    )
-                ),
+                interconnect_mode=interconnect_mode,
                 speculative_method=getattr(self.speculative_config, "method", None),
                 allow_shared_expert_overlap=allow_shared_expert_overlap,
                 hybrid_serving=revolta_hybrid_serving,
@@ -1966,12 +1976,30 @@ class VllmConfig:
             apply_revolta_kernel_profile(
                 self.kernel_config, enabled=revolta_profile_enabled
             )
+        nvlink_profile = (
+            revolta_profile_enabled
+            and self.speculative_config is not None
+            and self.speculative_config.method in ("mtp", "dflash")
+            and is_nvlink_auto_profile(self.model_config, interconnect_mode)
+        )
+        hc_sp_explicit = self.parallel_config.enable_hc_sp is not None
+        if not hc_sp_explicit:
+            self.parallel_config.enable_hc_sp = nvlink_profile
         if self.kernel_config.qsa_dcp_index_shard is None:
             self.kernel_config.qsa_dcp_index_shard = False
+            spec = self.speculative_config
             if (
                 revolta_hybrid_serving
-                and self.speculative_config is not None
-                and self.speculative_config.use_dflash()
+                and spec is not None
+                and (
+                    spec.use_dflash()
+                    # Host KV MTP keeps the draft's main K/V on the host only
+                    # when the index is sharded.
+                    or (
+                        spec.method == "mtp"
+                        and self.kernel_config.long_context_kv.enabled
+                    )
+                )
             ):
                 from vllm.models.qwen4_exp.config import QSA_INDEX_DCP_SHARD_TOPK
 
@@ -2019,11 +2047,7 @@ class VllmConfig:
                 self.model_config,
                 self.parallel_config.tensor_parallel_size,
                 is_sm70=True,
-                interconnect_mode=frontend_interconnect_mode(
-                    disable_custom_all_reduce=(
-                        self.parallel_config.disable_custom_all_reduce
-                    )
-                ),
+                interconnect_mode=interconnect_mode,
                 speculative_method=getattr(self.speculative_config, "method", None),
                 allow_shared_expert_overlap=allow_shared_expert_overlap,
                 kv_cache_dtype=self.cache_config.cache_dtype,
@@ -2031,6 +2055,12 @@ class VllmConfig:
                     self.speculative_config,
                     "num_speculative_tokens_per_batch_size",
                     None,
+                ),
+                num_speculative_tokens=getattr(
+                    self.speculative_config, "num_speculative_tokens", None
+                ),
+                mixed_prefill_step_latency_ms=(
+                    self.scheduler_config.mixed_prefill_step_latency_ms
                 ),
             )
 
@@ -2275,6 +2305,17 @@ class VllmConfig:
             else:
                 self.scheduler_config.async_scheduling = True
 
+        config_values: dict[str, dict[str, Any]] = {}
+        if not self.is_speculative_draft:
+            config_values["sm70_qsa_paged_int8_h12"] = apply_revolta_int8_qsa_profile(
+                self, enabled=revolta_profile_enabled
+            )
+        if nvlink_profile:
+            config_values.update(apply_revolta_nvlink_kernel_profile(self))
+            config_values["enable_hc_sp"] = {
+                "value": self.parallel_config.enable_hc_sp,
+                "source": "explicit" if hc_sp_explicit else "profile",
+            }
         if self.kernel_config.sm70_qsa_paged_fp16_h6 is None:
             self.kernel_config.sm70_qsa_paged_fp16_h6 = (
                 revolta_profile_enabled
@@ -2285,6 +2326,18 @@ class VllmConfig:
                 and self.cache_config.cache_dtype in ("auto", "float16")
                 and not self.kernel_config.long_context_kv.enabled
                 and has_nvfp4_weights(self.model_config)
+            ) or (
+                # Direct NVLink TP4 also takes H6 for an FP16 MTP draft cache.
+                nvlink_profile
+                and self.speculative_config is not None
+                and self.speculative_config.method == "mtp"
+                and self.parallel_config.decode_context_parallel_size == 2
+                and not self.kernel_config.long_context_kv.enabled
+                and (
+                    self.speculative_config.kv_cache_dtype
+                    or self.cache_config.cache_dtype
+                )
+                in ("auto", "float16")
             )
 
         logger.info_once(
@@ -2604,11 +2657,48 @@ class VllmConfig:
                 )
                 and "VLLM_SM70_QWEN38_DUAL_COMPILE" not in os.environ
             ):
-                os.environ["VLLM_SM70_QWEN38_DUAL_COMPILE"] = "1"
-                logger.info_once(
-                    "Auto-enabling the SM70 Qwen3.8 dual-compile lane: "
-                    "large prefill and FULL decode graphs share one model."
-                )
+                # Without speculation the decode lane cannot trace a
+                # single-token FULL capture dynamically (issue #343), so skip
+                # auto-enabling when that is the largest FULL decode batch.
+                cudagraph_mode = self.compilation_config.cudagraph_mode
+                single_token_full_decode = False
+                if (
+                    self.speculative_config is None
+                    and not self.model_config.enforce_eager
+                    and (
+                        cudagraph_mode is None
+                        or cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+                    )
+                ):
+                    max_num_seqs = self.scheduler_config.max_num_seqs
+                    capture_sizes = self.compilation_config.cudagraph_capture_sizes
+                    if capture_sizes is not None:
+                        capture_sizes = [
+                            size for size in capture_sizes if size <= max_num_seqs
+                        ]
+                        largest_full_decode = (
+                            max(capture_sizes) if capture_sizes else None
+                        )
+                    elif self.compilation_config.max_cudagraph_capture_size is None:
+                        largest_full_decode = max_num_seqs
+                    else:
+                        largest_full_decode = min(
+                            max_num_seqs,
+                            self.compilation_config.max_cudagraph_capture_size,
+                        )
+                    single_token_full_decode = largest_full_decode == 1
+                if single_token_full_decode:
+                    logger.info_once(
+                        "Not auto-enabling the SM70 Qwen3.8 dual-compile "
+                        "lane: the largest FULL decode capture is a single "
+                        "token."
+                    )
+                else:
+                    os.environ["VLLM_SM70_QWEN38_DUAL_COMPILE"] = "1"
+                    logger.info_once(
+                        "Auto-enabling the SM70 Qwen3.8 dual-compile lane: "
+                        "large prefill and FULL decode graphs share one model."
+                    )
             if (
                 _is_sm70_qwen38_decode_compile_contract(
                     self.model_config,
@@ -2663,6 +2753,7 @@ class VllmConfig:
                         "fused_gdn_metadata",
                         "fused_smallq_metadata",
                         "grouped_smallq_metadata",
+                        "sparse_target_rejection",
                     ):
                         if name not in policy.explicit_fields:
                             setattr(policy, name, True)
@@ -3374,6 +3465,11 @@ class VllmConfig:
         # Resolve kv_offloading-derived connector name into kv_transfer_config
         # before the HMA check below, which inspects the connector class.
         self._post_init_kv_transfer_config()
+        wide_verify = revolta_profile_enabled and apply_awq_mtp_wide_verify_defaults(
+            self, _participating_cuda_device_ids(self)
+        )
+        if self.kernel_config.sm70_gdn_input_v154 is None:
+            self.kernel_config.sm70_gdn_input_v154 = wide_verify
         if revolta_hybrid_serving and (
             self.kv_transfer_config is None
             or self.kv_transfer_config.kv_connector is None
@@ -3495,13 +3591,10 @@ class VllmConfig:
                 "ReVolta profile %s",
                 profile_audit(
                     enabled=revolta_profile_enabled,
-                    interconnect_mode=frontend_interconnect_mode(
-                        disable_custom_all_reduce=(
-                            self.parallel_config.disable_custom_all_reduce
-                        )
-                    ),
+                    interconnect_mode=interconnect_mode,
                     quantization=getattr(self.model_config, "quantization", None),
                     kernel_config=self.kernel_config,
+                    config_values=config_values,
                 ),
             )
 

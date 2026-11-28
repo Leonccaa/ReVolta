@@ -82,6 +82,12 @@ _SM70_INDEXER_CUBLAS_MIN_SCORE_ELEMENTS = legacy_qsa_tuning(
     "VLLM_SM70_QSA_INDEXER_CUBLAS_MIN_SCORE_ELEMENTS",
     SM70_QSA_TUNING.cublas_min_score_elements,
 )
+# Lower the single-request cuBLAS row floor for short warm appends to 128
+# rows (1Cat #1601). Set the flag to 0 to restore the original routing.
+# Near-tied blocks may differ from paged; the score-work gate is unchanged.
+_SM70_QSA_SHORT_APPEND = envs.VLLM_SM70_QSA_SHORT_APPEND
+_SM70_QSA_SHORT_APPEND_MIN_ROWS = 128
+_SM70_QSA_SHORT_APPEND_MIN_COLUMNS = 4096
 _SM70_QSA_XQA_PAGE4 = os.getenv("VLLM_SM70_QSA_XQA_PAGE4", "1") == "1"
 _SM70_QSA_XQA_PAGE4_MIN_ROWS = legacy_qsa_tuning(
     "VLLM_SM70_QSA_XQA_PAGE4_MIN_ROWS", SM70_QSA_TUNING.xqa_page4_min_rows
@@ -180,7 +186,14 @@ def _qsa_grouped_page4_supported(
     )
 
 
-@triton.jit(do_not_specialize=["num_requests", "num_rows", "num_columns"])
+@triton.jit(
+    do_not_specialize=["num_requests", "num_rows", "num_columns", "stride_logits_row"],
+    do_not_specialize_on_alignment=[
+        "token_to_req_ptr",
+        "query_positions_ptr",
+        "sequence_lengths_ptr",
+    ],
+)
 def _qsa_mqa_paged_kernel(
     q_ptr,
     k_cache_ptr,
@@ -312,7 +325,10 @@ def _qsa_mqa_paged_kernel(
         )
 
 
-@triton.jit(do_not_specialize=["rows", "num_requests"])
+@triton.jit(
+    do_not_specialize=["rows", "num_requests"],
+    do_not_specialize_on_alignment=["query_positions_ptr", "sequence_lengths_ptr"],
+)
 def _qsa_visible_blocks_kernel(
     token_to_req_ptr,
     query_positions_ptr,
@@ -396,7 +412,10 @@ def _qsa_gather_single_request_keys_kernel(
     tl.store(valid_ptr + column, valid, mask=column < columns)
 
 
-@triton.jit(do_not_specialize=["width", "stride_score_row"])
+@triton.jit(
+    do_not_specialize=["width", "stride_score_row", "stride_logits_row"],
+    do_not_specialize_on_alignment=["visible_ptr"],
+)
 def _qsa_relu_headsum_visible_kernel(
     score_ptr,
     visible_ptr,
@@ -438,7 +457,15 @@ def _qsa_relu_headsum_visible_kernel(
     )
 
 
-@triton.jit(do_not_specialize=["rows", "num_requests"])
+@triton.jit(
+    do_not_specialize=["rows", "num_requests"],
+    do_not_specialize_on_alignment=[
+        "query_positions_ptr",
+        "sequence_lengths_ptr",
+        "token_to_req_ptr",
+        "output_ptr",
+    ],
+)
 def _expand_qsa_indices_kernel(
     block_indices_ptr,
     query_positions_ptr,
@@ -456,6 +483,7 @@ def _expand_qsa_indices_kernel(
     TOKEN_TOPK: tl.constexpr,
     OUTPUT_WIDTH: tl.constexpr,
     COLUMN_BLOCK: tl.constexpr,
+    FOLDED8: tl.constexpr = False,
 ) -> None:
     row = tl.program_id(0)
     columns = tl.program_id(1) * COLUMN_BLOCK + tl.arange(0, COLUMN_BLOCK)
@@ -482,8 +510,18 @@ def _expand_qsa_indices_kernel(
     block_rank = columns // COMPRESS_RATIO
     offset = columns % COMPRESS_RATIO
     safe_rank = tl.minimum(block_rank, BLOCK_TOPK - 1)
+    if FOLDED8:
+        h_step = rows >> 3
+        seg = row // h_step
+        seg_off = row - seg * h_step
+        folded_seg = tl.where(seg < 4, seg * 2, (7 - seg) * 2 + 1)
+        src_row = folded_seg * h_step + seg_off
+    else:
+        src_row = row
     block = tl.load(
-        block_indices_ptr + row * stride_blocks_row + safe_rank * stride_blocks_column,
+        block_indices_ptr
+        + src_row * stride_blocks_row
+        + safe_rank * stride_blocks_column,
         mask=(row < rows) & is_expanded,
         other=-1,
     )
@@ -952,8 +990,12 @@ def _qsa_merge_splitk_kernel(
 
 @triton.jit
 def _qsa_output_gate_kernel(
+    input_ptr,
     output_ptr,
     output_gate_ptr,
+    stride_input_row,
+    stride_input_head,
+    stride_input_dim,
     stride_output_row,
     stride_output_head,
     stride_output_gate_row,
@@ -963,9 +1005,17 @@ def _qsa_output_gate_kernel(
     row = tl.program_id(0)
     head = tl.program_id(1)
     dim_offsets = tl.arange(0, HEAD_DIM)
-    output = tl.load(
-        output_ptr + row * stride_output_row + head * stride_output_head + dim_offsets
-    ).to(tl.float32)
+    # Preserve the rounding of copying the FP32 DCP merge to output first.
+    value = (
+        tl.load(
+            input_ptr
+            + row * stride_input_row
+            + head * stride_input_head
+            + dim_offsets * stride_input_dim
+        )
+        .to(output_ptr.dtype.element_ty)
+        .to(tl.float32)
+    )
     gate = tl.load(
         output_gate_ptr
         + row * stride_output_gate_row
@@ -974,14 +1024,24 @@ def _qsa_output_gate_kernel(
     ).to(tl.float32)
     tl.store(
         output_ptr + row * stride_output_row + head * stride_output_head + dim_offsets,
-        output * tl.sigmoid(gate),
+        value * tl.sigmoid(gate),
     )
 
 
-def _qsa_output_gate(output: torch.Tensor, output_gate: torch.Tensor) -> None:
+def _qsa_output_gate(
+    output: torch.Tensor,
+    output_gate: torch.Tensor,
+    *,
+    merged: torch.Tensor | None = None,
+) -> None:
+    source = output if merged is None else merged
     _qsa_output_gate_kernel[(output.shape[0], output.shape[1])](
+        source,
         output,
         output_gate,
+        source.stride(0),
+        source.stride(1),
+        source.stride(2),
         output.stride(0),
         output.stride(1),
         output_gate.stride(0),
@@ -1342,11 +1402,19 @@ def _use_sm70_qsa_indexer_cublas(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     page_table: torch.Tensor,
+    bounded_columns: int | None = None,
 ) -> bool:
+    min_rows = _SM70_INDEXER_CUBLAS_MIN_ROWS
+    if (
+        _SM70_QSA_SHORT_APPEND
+        and bounded_columns is not None
+        and bounded_columns >= _SM70_QSA_SHORT_APPEND_MIN_COLUMNS
+    ):
+        min_rows = min(min_rows, _SM70_QSA_SHORT_APPEND_MIN_ROWS)
     return (
         _SM70_INDEXER_CUBLAS
         and current_platform.is_device_capability(70)
-        and q.shape[0] >= _SM70_INDEXER_CUBLAS_MIN_ROWS
+        and q.shape[0] >= min_rows
         and _qsa_indexer_cublas_shape_supported(q, k_cache, page_table)
     )
 
@@ -1651,6 +1719,8 @@ def expand_qsa_block_indices_cuda(
     compress_ratio: int,
     token_topk: int,
     out: torch.Tensor | None = None,
+    *,
+    folded8: bool = False,
 ) -> torch.Tensor:
     """Expand compressed blocks and compact the causal tail of the open group."""
 
@@ -1696,6 +1766,7 @@ def expand_qsa_block_indices_cuda(
         TOKEN_TOPK=token_topk,
         OUTPUT_WIDTH=output_width,
         COLUMN_BLOCK=column_block,
+        FOLDED8=folded8,
         num_warps=4,
     )
     return out
@@ -1767,9 +1838,10 @@ def _qsa_select_by_request(
     # batches (decode graphs) on the batched path.
     if query_start_loc[0] != 0 or query_start_loc[-1] != rows:
         return False
-    segments = _qsa_indexer_request_segments(
-        query_start_loc, _SM70_INDEXER_CUBLAS_MIN_ROWS
-    )
+    segment_min_rows = _SM70_INDEXER_CUBLAS_MIN_ROWS
+    if _SM70_QSA_SHORT_APPEND and (max_seq_len or 0) >= 16384:
+        segment_min_rows = min(segment_min_rows, _SM70_QSA_SHORT_APPEND_MIN_ROWS)
+    segments = _qsa_indexer_request_segments(query_start_loc, segment_min_rows)
     if all(request is None for _, _, request in segments):
         return False
     for start, end, request in segments:
@@ -1837,6 +1909,7 @@ def qsa_select_paged_tokens(
     prefill_ranges: tuple[tuple[int, int], ...] = (),
     batch_query_starts: torch.Tensor | None = None,
     fused_topk: bool = False,
+    tp_group: Any = None,
 ) -> torch.Tensor:
     """Score and select QSA indices, using a host bound when available.
 
@@ -1895,7 +1968,33 @@ def qsa_select_paged_tokens(
     contiguous_keys: torch.Tensor | None = None
     key_valid: torch.Tensor | None = None
     all_visible: torch.Tensor | None = None
-    if _use_sm70_qsa_indexer_cublas(q, k_cache, page_table) and (
+    # The same local upper bound on every rank (ceil over ranks).
+    host_columns = (
+        min(
+            capacity_columns,
+            max(block_topk, -(-(max_seq_len // compress_ratio) // world)),
+        )
+        if max_seq_len is not None
+        else None
+    )
+    # Both gates use the route columns. The row floor checks them rounded up
+    # to 4 as in 1Cat #1601; the work gate below uses the unrounded width.
+    route_columns = (
+        _qsa_cublas_route_columns(
+            host_columns,
+            max_seq_len,
+            compress_ratio,
+            world,
+            block_topk,
+            capacity_columns,
+        )
+        if host_columns is not None
+        else None
+    )
+    bounded_columns = (
+        triton.cdiv(route_columns, 4) * 4 if route_columns is not None else None
+    )
+    if _use_sm70_qsa_indexer_cublas(q, k_cache, page_table, bounded_columns) and (
         world == 1 or max_seq_len is not None
     ):
         # Sharded ranks need a host bound: a device max of their local
@@ -1912,24 +2011,15 @@ def qsa_select_paged_tokens(
         # prefix so early-context prefill does not multiply the unused 140K
         # model-capacity tail. The host upper bound removes the scalar sync;
         # device visibility masks any extra columns before top-k selection.
-        live_blocks = (
-            # The same local upper bound on every rank (ceil over ranks).
-            -(-(max_seq_len // compress_ratio) // world)
-            if max_seq_len is not None
-            else int(all_visible.max().item())
-        )
-        score_columns = min(capacity_columns, max(block_topk, live_blocks))
-        if _qsa_indexer_cublas_work_supported(
-            rows,
-            _qsa_cublas_route_columns(
-                score_columns,
-                max_seq_len,
-                compress_ratio,
-                world,
-                block_topk,
-                capacity_columns,
-            ),
-        ):
+        if host_columns is not None:
+            score_columns = host_columns
+        else:
+            score_columns = min(
+                capacity_columns, max(block_topk, int(all_visible.max().item()))
+            )
+            route_columns = score_columns
+        assert route_columns is not None
+        if _qsa_indexer_cublas_work_supported(rows, route_columns):
             logger.info_once(
                 "Using SM70 QSA indexer prefill cuBLAS path "
                 "(single-request FP16, rows=%d, score_tile_mib=%d).",
@@ -1945,6 +2035,45 @@ def qsa_select_paged_tokens(
         else:
             score_columns = capacity_columns
             all_visible = None
+    # Replicated index keys only: DCP column shards use their existing merge.
+    tp_step = 0
+    tp_folded8 = False
+    if (
+        tp_group is not None
+        and tp_group.world_size == 4
+        and world == 1
+        and 1024 <= rows <= 16384
+        and q.shape[1:] == (4, 128)
+        and token_topk == 2048
+        and compress_ratio == 4
+        and contiguous_keys is not None
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        step = triton.cdiv(rows, tp_group.world_size)
+        smallest_partition = rows - (tp_group.world_size - 1) * step
+        if smallest_partition >= _SM70_INDEXER_CUBLAS_MIN_ROWS and (
+            _qsa_indexer_cublas_work_supported(smallest_partition, score_columns)
+        ):
+            tp_step = step
+            assert all_visible is not None
+            if (rows & 7) == 0 and rows >= 2048:
+                tp_folded8 = True
+                h_step = rows >> 3
+                rank = tp_group.rank_in_group
+                s0 = slice(rank * h_step, (rank + 1) * h_step)
+                s1 = slice((7 - rank) * h_step, (8 - rank) * h_step)
+                q = torch.cat((q[s0], q[s1]), dim=0)
+                all_visible = torch.cat((all_visible[s0], all_visible[s1]), dim=0)
+                rows = 2 * h_step
+            else:
+                first = tp_group.rank_in_group * step
+                last = min(first + step, rows)
+                q = q[first:last]
+                all_visible = all_visible[first:last]
+                rows = last - first
+            logger.info_once(
+                "Using SM70 QSA TP4 prefill row partition with block-index AllGather."
+            )
     rows_per_chunk = max(1, _LOGITS_WORKSPACE_BYTES // max(score_columns * 4, 1))
     # Preserve the existing chunk boundaries and DCP collective sequence.
     paged_columns = score_columns
@@ -1955,7 +2084,7 @@ def qsa_select_paged_tokens(
         )
     chunk_rows = min(rows, rows_per_chunk)
     blocks_buffer = torch.empty(
-        (chunk_rows, block_topk), dtype=torch.int32, device=q.device
+        (tp_step or chunk_rows, block_topk), dtype=torch.int32, device=q.device
     )
     exact_topk = _use_sm70_qsa_lexicographic_topk(block_topk)
     if (
@@ -2070,7 +2199,11 @@ def qsa_select_paged_tokens(
                 **shard_kwargs,
             )
             topk_columns = paged_columns
-        blocks = blocks_buffer[: row_end - row_start]
+        blocks = (
+            blocks_buffer[row_slice]
+            if tp_step
+            else blocks_buffer[: row_end - row_start]
+        )
         use_cooperative_topk = (
             blocks.shape[0] <= 32
             and logits.stride(0) % 4 == 0
@@ -2136,14 +2269,29 @@ def qsa_select_paged_tokens(
                 row_keys=(token_to_req[row_slice], query_positions[row_slice]),
                 owner_merge=owner_merge,
             )
+        if not tp_step:
+            expand_qsa_block_indices_cuda(
+                blocks,
+                query_positions[row_slice],
+                sequence_lengths,
+                token_to_req[row_slice],
+                compress_ratio,
+                token_topk,
+                out[row_slice],
+            )
+    if tp_step:
+        # Collect compressed block IDs before expanding them to token indices.
+        blocks_buffer[rows:].fill_(-1)
+        gathered_blocks = tp_group.all_gather(blocks_buffer, dim=0)[: out.shape[0]]
         expand_qsa_block_indices_cuda(
-            blocks,
-            query_positions[row_slice],
+            gathered_blocks,
+            query_positions,
             sequence_lengths,
-            token_to_req[row_slice],
+            token_to_req,
             compress_ratio,
             token_topk,
-            out[row_slice],
+            out,
+            folded8=tp_folded8,
         )
     return out
 
@@ -3096,19 +3244,21 @@ def qsa_dcp_sparse_paged_attention_sm70_grouped_page4(
     v_scale: float,
     k_scale_cache: torch.Tensor | None = None,
     v_scale_cache: torch.Tensor | None = None,
+    *,
+    local_width: int | None = None,
 ) -> int:
-    """Run the leading rows of a QSA DCP batch through the grouped page4 route.
+    """Run a QSA DCP batch through its native prefill route.
 
     ``q`` holds the gathered heads of every DCP rank and ``local_indices`` this
-    rank's compacted selection at the full 2051-column width. The grouped
-    kernels take six heads, so every six-head slice reuses one plan. Localized
-    IDs are causal by construction but are not ordered against positions in
-    the local token space, so every query position and sequence length is set
-    to the local capacity and the planner reads every column.
+    rank's compacted selection at the full 2051-column width. INT8 row prefill
+    reads only the first ``local_width`` columns and processes every row.
+    Grouped page4 shares one plan across the six-head slices. Localized IDs
+    already enforce causality, so both routes use the local capacity as the
+    visibility bound.
 
     Writes FP32 ``out`` and base-2 ``lse`` (-inf for rows without a local
-    token), as the Triton route does. Returns the number of rows written: a
-    multiple of eight, or 0 when the route does not apply. The caller runs the
+    token), as the Triton route does. Returns the number of rows written.
+    Grouped page4 writes a multiple of eight rows. The caller runs the
     remaining rows through ``qsa_sparse_paged_attention``.
     """
     codec = resolve_kv_codec(kv_cache_dtype)
@@ -3127,6 +3277,7 @@ def qsa_dcp_sparse_paged_attention_sm70_grouped_page4(
             k_scale_cache,
             v_scale_cache,
             codec=codec,
+            local_width=local_width,
         )
 
     heads = 6

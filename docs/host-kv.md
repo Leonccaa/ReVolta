@@ -78,7 +78,7 @@ The traffic per step is small. For example, if two verify rows select groups `[8
 
   The store also holds recurrent-state checkpoints and drafter pages, so leave headroom; the Host KV plan in the startup log gives the real limits for your settings.
 
-- **FP16 KV** holds about half as many tokens (3,832,192 in the same 98 GiB) and is slower; keep the INT8 default.
+- **FP16 KV** holds about half as many tokens (3,832,192 in the same 98 GiB) and is slower (see [Limits](#limits-in-020)); keep the INT8 default.
 - **Long contexts** (planner arithmetic in 0.2.0rc15, AWQ, INT8, 8 sequences):
 
 | Context per session | Host store | Sessions that fit at full length |
@@ -142,7 +142,7 @@ Give the container a `--shm-size` larger than the store. At startup each worker 
 
 ## Limits in 0.2.0
 
-- FP16 Host KV uses a slower reader than INT8; keep the INT8 default.
+- With FP16 main K/V in Host KV mode, decode reads the hot pages with the generic Triton reader; the native reader that 0.2.0 adds for Host KV covers INT8 only. In the 0.2.0 NVLink test FP16 Host KV took 0.8–2.9 ms more per round than INT8 and held half the tokens, so keep the INT8 default.
 - Host KV with DFlash2 is supported but was not tested separately in the 0.2.0 acceptance.
 - Reading Host KV pages back from SSD after a restart was not measured in the 0.2.0 acceptance.
 - Changing `qsa_dcp_index_shard` changes the page layout; SSD pages written with the other value are not read back.

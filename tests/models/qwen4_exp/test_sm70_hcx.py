@@ -365,13 +365,16 @@ def test_moe_partial_seam_on_next_attention(monkeypatch, seam):
     assert seam.config.kernel_config.sm70_hcx_active
 
 
-def test_top1x_uses_the_hcx_peer_mailbox(monkeypatch, seam):
+def test_top1x_uses_the_hcx_peer_mailbox(monkeypatch, seam, caplog):
     from vllm.model_executor.layers import logits_processor as lp
 
-    seam.config.kernel_config = KernelConfig(sm70_top1x=True)
+    seam.config.kernel_config = KernelConfig(sm70_hcx=False, sm70_top1x=True)
     model._prepare_sm70_hcx(seam.config, [seam.layer])
     runtime = seam.owner.hcx
     assert runtime.top1_enabled and not seam.config.kernel_config.sm70_hcx_active
+    assert seam.module._sm70_hcx_name is None
+    assert "SM70 HCX prepared" not in caplog.text
+    assert "SM70 Top1X prepared" in caplog.text
 
     calls = []
 

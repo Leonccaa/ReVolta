@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
@@ -209,7 +210,11 @@ def test_sources_after_upstream_auto_defaults(profile, monkeypatch):
     monkeypatch.setenv("NCCL_GRAPH_REGISTER", "0")  # env_override
     audit = json.loads(module.profile_audit(enabled=True))
     assert audit["enabled"]
-    assert len(audit["values"]) == 49
+    assert audit["values"]["VLLM_SM70_NVLINK_HC"] == {
+        "value": "0",
+        "source": "upstream_default",
+    }
+    assert len(audit["values"]) == 50
     assert audit["values"][FP16[0]]["source"] == "upstream_default"
     assert audit["values"]["NCCL_GRAPH_REGISTER"]["source"] == "upstream_default"
     assert audit["values"]["VLLM_SM70_AWQ_QWEN38_GROUPED_QPN_SPLIT"] == {
@@ -1242,7 +1247,7 @@ INTERCONNECT_CASES = [
 def test_frontend_interconnect_mode_and_audit(
     profile, monkeypatch, requested, disabled, expected, logged
 ):
-    # The frontend knows only explicit choices; workers resolve auto/pex.
+    # With no local device IDs the frontend only has the explicit policy.
     if requested is not None:
         monkeypatch.setenv("VLLM_SM70_INTERCONNECT", requested)
     mode = profile.frontend_interconnect_mode(disable_custom_all_reduce=disabled)
@@ -1256,7 +1261,7 @@ def test_frontend_interconnect_mode_and_audit(
     # policy must not read "pex_p2p" while the workers log nvlink.
     assert audit["interconnect_mode"] == logged
     assert audit["interconnect_policy"] == ("auto" if requested is None else requested)
-    assert len(audit["values"]) == 49
+    assert len(audit["values"]) == 50
 
 
 def _applied_profile(profile, monkeypatch, requested, disabled):
@@ -1318,14 +1323,107 @@ def test_vllmconfig_profile_and_audit_receive_frontend_interconnect():
     ]
     for _, call in calls:
         value = next(k.value for k in call.keywords if k.arg == "interconnect_mode")
-        assert isinstance(value, ast.Call)
-        assert isinstance(value.func, ast.Name)
-        assert value.func.id == "frontend_interconnect_mode"
-        (keyword,) = value.keywords
-        assert keyword.arg == "disable_custom_all_reduce"
-        assert ast.unparse(keyword.value) == (
-            "self.parallel_config.disable_custom_all_reduce"
-        )
+        assert ast.unparse(value) == "interconnect_mode"
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("case", ["nvlink", "pcie", "explicit"])
+def test_engineargs_nvlink_profile(
+    profile, monkeypatch, tmp_path, sm70_serving_resolution, case
+):
+    from vllm import revolta_profile
+    from vllm.config import vllm as config_module
+    from vllm.platforms import current_platform
+
+    topology = Mock(return_value=case != "pcie")
+    monkeypatch.setattr(current_platform, "is_fully_connected", topology, raising=False)
+    monkeypatch.setattr(
+        current_platform, "is_pcie_switch_connected", lambda _: True, raising=False
+    )
+    monkeypatch.setattr(current_platform, "device_count", lambda: 4)
+    monkeypatch.setattr(
+        current_platform, "is_device_capability", lambda cap, device_id=0: cap == (7, 0)
+    )
+    monkeypatch.setattr(current_platform, "use_custom_allreduce", lambda: True)
+    monkeypatch.setattr(revolta_profile, "profile_audit", profile.profile_audit)
+    profile_log = Mock(wraps=config_module.logger.info_once)
+    monkeypatch.setattr(config_module.logger, "info_once", profile_log)
+    flags = ["--decode-context-parallel-size", "2", "--kv-cache-dtype", "float16"]
+    spec_options: dict[str, Any] = {
+        "num_speculative_tokens": 5 if case == "nvlink" else 4
+    }
+    if case == "nvlink":
+        flags += [
+            "--kv-transfer-config",
+            '{"kv_connector":"OffloadingConnector","kv_role":"kv_both",'
+            '"kv_connector_extra_config":{"cpu_bytes_to_use":51539607552}}',
+        ]
+    if case == "explicit":
+        flags += [
+            "--no-enable-hc-sp",
+            "--no-async-scheduling",
+            "--kernel-config",
+            json.dumps(
+                {
+                    "sm70_hc_ll_async": False,
+                    "sm70_qsa_paged_fp16_h6": False,
+                    "sm70_qsa_paged_fp16_h12": False,
+                    "sm70_sparse_target_sampling": True,
+                }
+            ),
+        ]
+        spec_options["num_speculative_tokens_per_batch_size"] = [[1, 8, 2]]
+        monkeypatch.setenv("VLLM_SM70_NVLINK_HC", "0")
+    args, context = hybrid_serving_args(
+        profile, monkeypatch, tmp_path, "mtp", flags, spec_options
+    )
+    config = args.create_engine_config(usage_context=context)
+    kernel = config.kernel_config
+    enabled = case == "nvlink"
+    assert (
+        config.speculative_config.num_speculative_tokens
+        == spec_options["num_speculative_tokens"]
+    )
+    assert (
+        config.speculative_config.num_speculative_tokens_per_batch_size
+        == {
+            "nvlink": [(1, 8, 3)],
+            "pcie": MTP_DSD,
+            "explicit": [(1, 8, 2)],
+        }[case]
+    )
+    assert config.scheduler_config.async_scheduling is enabled
+    assert config.speculative_config.gdn_deferred_commit_metadata is False
+    assert config.parallel_config.enable_hc_sp is enabled
+    assert kernel.sm70_hc_ll_async is enabled
+    assert kernel.sm70_qsa_paged_fp16_h6 is enabled
+    assert kernel.sm70_qsa_paged_fp16_h12 is enabled
+    assert (
+        kernel.sm70_sparse_target_sampling
+        == {
+            "nvlink": "device_top64",
+            "pcie": False,
+            "explicit": True,
+        }[case]
+    )
+    assert envs.VLLM_SM70_NVLINK_HC is enabled
+    audit = next(
+        json.loads(call.args[1])
+        for call in profile_log.call_args_list
+        if call.args[0] == "ReVolta profile %s"
+    )
+    assert (
+        audit["values"]["VLLM_SM70_NVLINK_HC"]["source"]
+        == {
+            "nvlink": "profile",
+            "pcie": "upstream_default",
+            "explicit": "environment",
+        }[case]
+    )
+    if case != "pcie":
+        assert {row["source"] for row in audit["config_values"].values()} == {
+            "profile" if enabled else "explicit"
+        }
 
 
 def test_audit_logs_disabled_profile(profile):

@@ -1934,13 +1934,17 @@ class VllmConfig:
             self.speculative_config.require_lookup_runtime()
 
         from vllm.revolta_profile import (
+            InterconnectMode,
             all_visible_devices_sm70,
             apply_awq_mtp_wide_verify_defaults,
             apply_revolta_allocator_default,
             apply_revolta_kernel_profile,
+            apply_revolta_nvlink_kernel_profile,
             apply_revolta_profile,
             frontend_interconnect_mode,
             has_nvfp4_weights,
+            is_nvlink_auto_profile,
+            local_tp4_device_ids,
         )
 
         # Apply engine defaults before overlap, hybrid-PLE and compilation.
@@ -1950,16 +1954,18 @@ class VllmConfig:
             or self.parallel_config.enable_dbo
         )
         revolta_profile_enabled = False
+        interconnect_mode: InterconnectMode = "pex_p2p"
         if not self.is_speculative_draft:
+            device_ids = local_tp4_device_ids(self.parallel_config)
+            interconnect_mode = frontend_interconnect_mode(
+                disable_custom_all_reduce=self.parallel_config.disable_custom_all_reduce,
+                device_ids=device_ids,
+            )
             revolta_profile_enabled = apply_revolta_profile(
                 self.model_config,
                 self.parallel_config.tensor_parallel_size,
                 is_sm70=all_visible_devices_sm70(),
-                interconnect_mode=frontend_interconnect_mode(
-                    disable_custom_all_reduce=(
-                        self.parallel_config.disable_custom_all_reduce
-                    )
-                ),
+                interconnect_mode=interconnect_mode,
                 speculative_method=getattr(self.speculative_config, "method", None),
                 allow_shared_expert_overlap=allow_shared_expert_overlap,
                 hybrid_serving=revolta_hybrid_serving,
@@ -1967,6 +1973,15 @@ class VllmConfig:
             apply_revolta_kernel_profile(
                 self.kernel_config, enabled=revolta_profile_enabled
             )
+        nvlink_profile = (
+            revolta_profile_enabled
+            and self.speculative_config is not None
+            and self.speculative_config.method in ("mtp", "dflash")
+            and is_nvlink_auto_profile(self.model_config, interconnect_mode)
+        )
+        hc_sp_explicit = self.parallel_config.enable_hc_sp is not None
+        if not hc_sp_explicit:
+            self.parallel_config.enable_hc_sp = nvlink_profile
         if self.kernel_config.qsa_dcp_index_shard is None:
             self.kernel_config.qsa_dcp_index_shard = False
             spec = self.speculative_config
@@ -2029,11 +2044,7 @@ class VllmConfig:
                 self.model_config,
                 self.parallel_config.tensor_parallel_size,
                 is_sm70=True,
-                interconnect_mode=frontend_interconnect_mode(
-                    disable_custom_all_reduce=(
-                        self.parallel_config.disable_custom_all_reduce
-                    )
-                ),
+                interconnect_mode=interconnect_mode,
                 speculative_method=getattr(self.speculative_config, "method", None),
                 allow_shared_expert_overlap=allow_shared_expert_overlap,
                 kv_cache_dtype=self.cache_config.cache_dtype,
@@ -2176,6 +2187,7 @@ class VllmConfig:
             and uses_adaptive_dflash_lookup(self.speculative_config)
             and self.speculative_config.lookup_env("VLLM_DFLASH2_LOOKUP_ADAPTIVE")
         )
+        async_explicit = self.scheduler_config.async_scheduling is not None
         if self.scheduler_config.async_scheduling:
             # Async scheduling explicitly enabled, hard fail any incompatibilities.
             # Currently, async scheduling only support eagle speculative
@@ -2291,6 +2303,10 @@ class VllmConfig:
             else:
                 self.scheduler_config.async_scheduling = True
 
+        h6_explicit = self.kernel_config.sm70_qsa_paged_fp16_h6 is not None
+        nvlink_config_values: dict[str, dict[str, Any]] = {}
+        if nvlink_profile:
+            nvlink_config_values = apply_revolta_nvlink_kernel_profile(self)
         if self.kernel_config.sm70_qsa_paged_fp16_h6 is None:
             self.kernel_config.sm70_qsa_paged_fp16_h6 = (
                 revolta_profile_enabled
@@ -2301,6 +2317,38 @@ class VllmConfig:
                 and self.cache_config.cache_dtype in ("auto", "float16")
                 and not self.kernel_config.long_context_kv.enabled
                 and has_nvfp4_weights(self.model_config)
+            )
+        if nvlink_profile:
+            nvlink_config_values.update(
+                enable_hc_sp={
+                    "value": self.parallel_config.enable_hc_sp,
+                    "source": "explicit" if hc_sp_explicit else "profile",
+                },
+                async_scheduling={
+                    "value": self.scheduler_config.async_scheduling,
+                    "source": (
+                        "explicit"
+                        if async_explicit
+                        else "profile"
+                        if spec is not None
+                        and spec.method == "mtp"
+                        and self.scheduler_config.async_scheduling
+                        else "upstream_default"
+                    ),
+                },
+            )
+            nvlink_config_values.setdefault(
+                "sm70_qsa_paged_fp16_h6",
+                {
+                    "value": self.kernel_config.sm70_qsa_paged_fp16_h6,
+                    "source": (
+                        "explicit"
+                        if h6_explicit
+                        else "profile"
+                        if self.kernel_config.sm70_qsa_paged_fp16_h6
+                        else "upstream_default"
+                    ),
+                },
             )
 
         logger.info_once(
@@ -3554,13 +3602,10 @@ class VllmConfig:
                 "ReVolta profile %s",
                 profile_audit(
                     enabled=revolta_profile_enabled,
-                    interconnect_mode=frontend_interconnect_mode(
-                        disable_custom_all_reduce=(
-                            self.parallel_config.disable_custom_all_reduce
-                        )
-                    ),
+                    interconnect_mode=interconnect_mode,
                     quantization=getattr(self.model_config, "quantization", None),
                     kernel_config=self.kernel_config,
+                    config_values=nvlink_config_values,
                 ),
             )
 

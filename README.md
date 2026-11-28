@@ -18,14 +18,15 @@ ReVolta turns a server with four or more V100 32 GB GPUs and plenty of system me
 
 | ReVolta 0.2.0 | 4 × V100 32 GB PCIe, one switch with P2P, 200 W | 4 × V100-SXM2 32 GB NVLink, 300 W |
 | --- | ---: | ---: |
-| Output, 1 / 4 / 8 requests | 114 / 283 / 378 tok/s | **136 / 371 / 532 tok/s** |
+| Single request, real prompts (coding) | 168 tok/s (217) | **194 tok/s (245)** |
+| 4 / 8 requests at once, real prompts | 341 / 452 tok/s | 8 requests: **812 tok/s**¹ |
 | Cold prefill, 32K prompt | 3,787 tok/s (8.5 s) | **7,892 tok/s (4.2 s)** |
 | GPU KV pool, MTP / DFlash2 | 1.19M / **1.85M** tokens | 1.31M / 1.78M tokens |
 | Host KV pool, 98 GiB of RAM | **7.33M tokens** | **7.33M tokens** |
 | 512K sessions running at once | 2–3 with GPU KV, **8** with Host KV | 2–3 with GPU KV, **8** with Host KV |
 | GSM8K / MMLU | 90.0% / 87.7% | 90.5% / 88.0% |
 
-Output: short synthetic prompts with 512 output tokens, the better of the tested MTP and DFlash2 setups at each concurrency (AWQ on PCIe; NVFP4 for MTP and AWQ for DFlash2 on NVLink). Quality: AWQ + DFlash2 on PCIe, NVFP4 + MTP5 on NVLink. Conditions and every configuration: [Performance](https://github.com/Leonccaa/ReVolta/blob/main/docs/performance.md).
+Single request: median decode speed over the 97 sampled prompts of RevBench-Accept v1, with the coding prompts in brackets; the better of the tested MTP and DFlash2 setups (PCIe: AWQ + DFlash2; NVLink: NVFP4 + MTP5, coding AWQ + DFlash2). 4 / 8 requests on PCIe: the same prompts in groups, total output, AWQ + DFlash2. ¹ NVLink with 8 requests: TokenSpeed with 16K documents and thinking off, on a 0.2.0 development build with manual NVLink settings, NVFP4 + MTP (AWQ + DFlash2: 631 tok/s). Quality: AWQ + DFlash2 on PCIe, NVFP4 + MTP5 on NVLink. Conditions and every configuration: [Performance](https://github.com/Leonccaa/ReVolta/blob/main/docs/performance.md#real-prompt-speed).
 
 ### Host KV: many long sessions at once
 

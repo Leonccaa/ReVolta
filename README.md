@@ -68,6 +68,7 @@ Cold prefill uses one request and divides the actual prompt length by median pre
 
 GPU KV at 512K is the startup log's maximum concurrency; at 256K it is an upper bound, because every running request also takes recurrent-state and drafter blocks from the same pool.
 
+- **GPU memory:** a running 512K session keeps only its attention index on the GPU, about 2% of the shared region instead of 44% of the KV pool; index pages that are not in use serve as hot pages, so a lightly loaded server reads almost everything from GPU memory. [How GPU memory is divided](https://github.com/Leonccaa/ReVolta/blob/main/docs/host-kv.md#how-gpu-memory-is-divided)
 - **Cost:** **2–4 ms per decode round** (16.4 → 19.7 ms at one request on NVLink); the KV that fits grows from 1.31M to **7.33M tokens** with 98 GiB (5.6×).
 - **For whom:** small and medium teams that share one server for coding agents, long documents and research sessions that stay open for hours and are revisited over days, on a server with plenty of RAM and an NVMe SSD.
 

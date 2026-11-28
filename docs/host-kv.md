@@ -41,10 +41,36 @@ With Host KV the full history is in RAM and the GPU only needs the index and the
 | Model weights | GPU | The PLE embedding tables stay in RAM in every mode (about 48 GiB for AWQ). |
 | Attention index | GPU, split across the four GPUs | Decides which past tokens each step reads. |
 | Recurrent (linear attention) state | GPU | Checkpoints are kept in RAM so a conversation can resume at the end of its last turn. |
-| Hot pages | GPU | Holds the pages that attention reads now. Sized automatically and always large enough for every admitted request. |
+| Hot pages | GPU, in the free part of the index region | Holds the pages that attention reads now. Grows and shrinks with load and always holds every admitted request's working set (see below). |
 | Full main K/V history | RAM (`/dev/shm`) | INT8 by default. This is where the capacity comes from. |
 | MTP draft K/V | RAM by default | Read through the hot pages like the target. Can be kept on the GPU instead. |
 | SSD copy | Optional | Pages are written after 300 s and read back after a restart. |
+
+### How GPU memory is divided
+
+In Host KV mode the GPU memory left for KV after the weights, activations and CUDA graphs is split into three parts. The numbers are the startup plans of the 0.2.0 acceptance (per GPU, INT8, 98 GiB store, eight sequences, 512K):
+
+| Part | PCIe, AWQ + MTP5 | NVLink, NVFP4 + MTP5 | What it holds |
+| --- | ---: | ---: | --- |
+| Recurrent-state segment | 0.54 GiB (9%) | 1.67 GiB (28%) | The linear-attention state of every sequence slot, reserved for `--max-num-seqs` at startup. Asynchronous MTP without state replay keeps a state per draft position, hence the larger NVLink share. |
+| Prefill staging | 0.15 GiB (3%) | 0.15 GiB (2%) | Buffers for writing new K/V to RAM during prefill. |
+| Shared index and hot region | **4.98 GiB (88%)** | **4.24 GiB (70%)** | The attention index of running requests, the index of recently used sessions, and the hot pages. |
+| Total KV budget | 5.68 GiB | 6.08 GiB | |
+
+The hot pages have no fixed share. They live in the index pages that are not in use (a fixed scratch of about 0.01 GiB aside), so their size depends on the load:
+
+- **Light load:** almost the whole shared region serves as hot pages: up to about 190,000 four-token groups per layer on each GPU on PCIe (160,000 on NVLink). Most selected tokens are then already on the GPU, and little crosses PCIe.
+- **Eight 512K sessions running:** the region holds the index of 45 such sessions on PCIe (38 on NVLink), so eight take about **18% (21%)** of it. The other ~80% is still available for hot pages and for the index of idle sessions.
+- **Never below the working set:** a floor keeps enough hot pages for every admitted request's current selection.
+
+When running requests grow, space is taken in this order: first the index of idle sessions, then hot pages down to the floor, and only then a request is preempted.
+
+**Why this design:**
+
+- **About 20× less GPU memory per session.** With GPU KV one 512K session takes 44% of the KV pool (MTP4); with Host KV its index takes about 2% of the shared region, because the K/V itself is in RAM.
+- **Nothing is reserved and left idle.** The same pages serve the running requests, recently used sessions and the hot pages, so a lightly loaded server reads almost everything from GPU memory and a busy one still fits eight long sessions.
+- **Running requests come first.** Idle sessions and hot pages give way before any running request is preempted.
+- **Returning sessions resume fast.** If a session's index is still on the GPU it continues at once; otherwise only its index is copied back from RAM, not its K/V.
 
 ### One decode step
 

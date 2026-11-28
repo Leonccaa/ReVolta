@@ -34,6 +34,8 @@ ReVolta is built for four or more V100 32 GB GPUs and validated on four. We reco
 | Models | AWQ reference; NVFP4 and FP4-Local load and serve | Measured KV capacity for all three; Hy4-flash validation support | Hy4-flash was validated before the final release, not in the release tests |
 | Serving defaults | Reference launch sets scheduler tuning by hand | The profile applies tested serving defaults | Explicit settings still take precedence |
 
+The PCIe GPU pools in this table use Uncensored AWQ g32, a 512K context limit and up to eight scheduled sequences, with GPU memory utilization set to 0.95 in the old measurements and 0.956 in 0.2.0. The 0.2.0 runs used a 200 W cap per GPU; the old pool sizes were confirmed unchanged in 0.1.5. The ratio is the startup log's maximum concurrency: how many full 512K requests fit at once. On the NVLink system below, NVFP4 + MTP5 with INT8 KV held **1,305,719 tokens** in the GPU pool. See [KV offload](https://github.com/Leonccaa/ReVolta/blob/main/docs/kv-offload.md) for host and SSD options.
+
 ### Why INT8 KV is the default
 
 In matched four-V100 tests, target scores with INT8 were closer to FP16 KV than with calibrated E4M3 (**KL 0.024 vs. 0.061**, lower is better). INT8 also cut time per round (**5.9%** for MTP at eight requests; **2.7% and 1.5%** in two single-request DFlash2 comparisons), with no significant change in accepted draft length. Native INT8 decode in 0.2.0 adds **2.8% / 3.0%** PCIe RevBench throughput for DFlash2 / MTP4 compared with the previous INT8 readers, and cuts single-request DFlash2 round time by **9.5%** at 128K without changing acceptance. In a separate MTP test with INT8 target KV, an INT8 draft held **11.3%** more KV tokens than an FP16 draft after capacity was normalized to the same context length.
@@ -41,8 +43,6 @@ In matched four-V100 tests, target scores with INT8 were closer to FP16 KV than 
 ### Why per-token, per-head scales
 
 Each token and each KV head gets its own **FP32** scales based on its actual key and value ranges. An outlier in one head or token therefore does not reduce precision elsewhere. ReVolta computes the scales at runtime, so supported Flash-Next weights such as AWQ, NVFP4 and FP4-Local need no checkpoint-specific KV calibration pack. Calibrated scalar E4M3 is frozen: it still works, but is no longer optimized. See [KV formats](https://github.com/Leonccaa/ReVolta/blob/main/docs/checkpoints.md#weight-and-kv-formats).
-
-The PCIe GPU pools above use Uncensored AWQ g32, a 512K context limit and up to eight scheduled sequences, with GPU memory utilization set to 0.95 in the old measurements and 0.956 in 0.2.0. The 0.2.0 runs used a 200 W cap per GPU; the old pool sizes were confirmed unchanged in 0.1.5. The ratio is total pool capacity divided by 512K, not a request limit. On the NVLink system below, NVFP4 + MTP5 with INT8 KV held **1,305,719 tokens** in the GPU pool. See [KV offload](https://github.com/Leonccaa/ReVolta/blob/main/docs/kv-offload.md) for host and SSD options.
 
 **Speed** (0.2.0): observed end-to-end output from the same short synthetic English story workload, sampled without the chat template and fixed at 512 output tokens per request. Each concurrency shows the higher total output rate of the tested MTP and DFlash2 configurations: AWQ + MTP4 versus AWQ + DFlash2 on PCIe, and NVFP4 + MTP5 versus AWQ + DFlash2 on NVLink. These are separate machines with different power limits, not a same-system interconnect comparison or a ranking for real prompts.
 

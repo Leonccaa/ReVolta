@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU checks for the 1Cat TP4 QSA prefill row partition."""
 
+import sys
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
 
@@ -109,7 +110,19 @@ def test_indexer_forward_passes_tp_group(monkeypatch):
         index_dcp_rank=0,
         prefill_ranges=(),
     )
-    indexer = NS(
+    indexer = _packed_indexer(monkeypatch, raw, compressed, group)
+    select = Mock(return_value=torch.empty(0))
+    monkeypatch.setattr(qsa, "qsa_select_paged_tokens", select)
+    monkeypatch.setattr(
+        indexer_qsa, "get_forward_context", lambda: NS(is_uniform_decode=False)
+    )
+    indexer_qsa.QSAIndexer.forward(indexer, torch.empty(rows, 640), torch.arange(rows))
+    assert select.call_args.kwargs["tp_group"] is group
+
+
+def _packed_indexer(monkeypatch, raw, compressed, group=None):
+    monkeypatch.setattr(indexer_qsa, "qsa_pre_indexer", lambda *a, **kw: None)
+    return NS(
         _metadata=lambda: (raw, compressed),
         index_qk_proj=NS(_sm70_qsa_input_packed=True, output_size=640),
         index_n_heads=4,
@@ -128,14 +141,116 @@ def test_indexer_forward_passes_tp_group(monkeypatch):
         fused_topk=False,
         prefill_tp_group=group,
     )
-    select = Mock(return_value=torch.empty(0))
-    monkeypatch.setattr(indexer_qsa, "qsa_pre_indexer", lambda *a, **kw: None)
-    monkeypatch.setattr(qsa, "qsa_select_paged_tokens", select)
-    monkeypatch.setattr(
-        indexer_qsa, "get_forward_context", lambda: NS(is_uniform_decode=False)
+
+
+def test_sharded_mtp_draft_mixed_prefill_routes_all_rows(monkeypatch):
+    from vllm.config import CUDAGraphMode
+    from vllm.models.qwen4_exp.nvidia.ops import qsa_int8
+    from vllm.v1.attention.kv_codecs import INT8
+    from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
+
+    rows = 5 + 256
+    starts = torch.tensor([0, 5, rows], dtype=torch.int32)
+    positions = torch.cat((torch.arange(507, 512), torch.arange(256, 512)))
+    requests = torch.repeat_interleave(
+        torch.arange(2, dtype=torch.int32), starts.diff()
     )
-    indexer_qsa.QSAIndexer.forward(indexer, torch.empty(rows, 640), torch.arange(rows))
-    assert select.call_args.kwargs["tp_group"] is group
+    table = torch.arange(32, dtype=torch.int32).view(2, 16)
+    raw = NS(
+        num_actual_tokens=rows,
+        slot_mapping=None,
+        block_table=table,
+        query_start_loc=starts,
+        logical_positions=positions,
+    )
+    compressed = NS(
+        slot_mapping=None,
+        k_work_metadata=None,
+        block_table=table,
+        token_to_req=requests,
+        logical_positions=positions,
+        seq_lens=torch.tensor([512, 512], dtype=torch.int32),
+        query_start_loc_cpu=starts,
+        max_seq_len=512,
+        seq_lens_cpu_upper_bound=None,
+        index_dcp_world_size=4,
+        index_dcp_rank=0,
+    )
+    indexer = _packed_indexer(monkeypatch, raw, compressed)
+    indexer.prefix = "model.mtp.layers.0.indexer"
+    indices = torch.full((rows, 2051), -1, dtype=torch.int32)
+    monkeypatch.setattr(qsa, "qsa_select_paged_tokens", Mock(return_value=indices))
+
+    calls = []
+    monkeypatch.setitem(sys.modules, "vllm._sm70_qsa_device_C", NS())
+    monkeypatch.setattr(
+        qsa_int8.current_platform, "is_device_capability", lambda _: True
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        torch.ops.vllm_sm70_qsa_device,
+        "rows_int8_planar",
+        lambda q, *args: calls.append(("rows", q.shape[0])),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        qsa_int8,
+        "native_grouped",
+        lambda q, *a, **kw: calls.append(("grouped", q.shape[0])),
+    )
+
+    k = torch.empty(32, 16, 1, 256, dtype=torch.int8)
+    scales = torch.ones(k.shape[:-1])
+
+    def model(*, hidden_states, positions, **kwargs):
+        selection = indexer_qsa.QSAIndexer.forward(indexer, hidden_states, positions)
+        query = hidden_states.new_empty((hidden_states.shape[0], 12, 256))
+        written = qsa.qsa_dcp_sparse_paged_attention_sm70_grouped_page4(
+            query,
+            k,
+            k,
+            selection,
+            table,
+            requests,
+            torch.empty_like(query, dtype=torch.float32),
+            torch.empty(query.shape[:2]),
+            INT8.name,
+            1.0,
+            1.0,
+            scales,
+            scales,
+            local_width=1026,
+        )
+        calls.append(("written", written))
+        return hidden_states
+
+    speculator = EagleSpeculator.__new__(EagleSpeculator)
+    speculator.model = model
+    speculator.supports_mm_inputs = False
+    speculator.vllm_config = NS(
+        parallel_config=NS(data_parallel_size=1),
+        compilation_config=NS(
+            fast_moe_cold_start=False,
+            static_forward_context={},
+            max_cudagraph_capture_size=0,
+        ),
+    )
+    speculator.input_buffers = NS(input_ids=torch.zeros(rows, dtype=torch.long))
+    speculator.last_token_indices = starts[1:].long() - 1
+    speculator.idx_mapping = torch.arange(2, dtype=torch.int32)
+    speculator.current_draft_step = torch.tensor(0)
+    speculator.draft_logits = None
+    speculator.draft_tokens = torch.empty(2, 4, dtype=torch.long)
+    speculator._sample_draft = Mock(return_value=torch.zeros(2, dtype=torch.long))
+
+    # Each step-0 forward creates a fresh context. Keep the reader geometry fixed.
+    for ranges, expected in [(((5, rows),), ("rows", 261)), ((), ("grouped", 256))]:
+        compressed.prefill_ranges = ranges
+        speculator.hidden_states = torch.empty(rows, 640, dtype=torch.float16)
+        speculator.input_buffers.positions = positions.clone()
+        calls.clear()
+        speculator.prefill(2, rows, {}, {}, None, CUDAGraphMode.PIECEWISE)
+        assert calls == [expected, ("written", expected[1])]
 
 
 class Scored(Exception):

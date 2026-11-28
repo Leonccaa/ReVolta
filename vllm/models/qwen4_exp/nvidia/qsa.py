@@ -997,7 +997,7 @@ def _sm70_qsa_paged_int8_h6_admitted(
     geometry: tuple[int, int, int],
 ) -> bool:
     return (
-        vllm_config.kernel_config.sm70_qsa_paged_int8_h12
+        vllm_config.kernel_config.sm70_qsa_paged_int8_h12 is True
         and kv_cache_dtype == "int8"
         and vllm_config.is_speculative_draft
         and not dcp_sharded
@@ -1021,7 +1021,7 @@ def _sm70_qsa_paged_h12_admitted(
     kernel_config = vllm_config.kernel_config
     host_kv = kernel_config.long_context_kv
     if kv_cache_dtype == "int8":
-        enabled = kernel_config.sm70_qsa_paged_int8_h12
+        enabled = kernel_config.sm70_qsa_paged_int8_h12 is True
     else:
         enabled = kernel_config.sm70_qsa_paged_fp16_h12 and kv_cache_dtype in (
             "auto",

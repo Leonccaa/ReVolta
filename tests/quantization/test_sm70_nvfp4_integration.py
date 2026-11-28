@@ -9,6 +9,7 @@ import torch
 
 from vllm import _sm70_ops as ops
 from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization import nvfp4_sm70_moe as moe
 from vllm.model_executor.models import qwen2_moe
 
@@ -210,3 +211,120 @@ def test_batch_shared_gate_preserves_linear(
         enabled and available and decode_phase and 2 <= rows <= 16
     )
     torch.testing.assert_close(result, x * torch.sigmoid(logits), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("rows", [1, 2, 8, 9, 64, 65])
+@pytest.mark.parametrize("mtp", [False, True])
+def test_mtp_shared_down_gated_route(monkeypatch, rows, mtp):
+    from vllm.models.qwen4_exp.nvidia import sm70_fp16_gemv as gemv
+
+    monkeypatch.setattr(
+        qwen2_moe, "_sm70_dump_qwen_mlp_tensor", lambda label, idx, x: x
+    )
+    monkeypatch.setattr(qwen2_moe, "use_sm70_decode_graph_semantics", lambda: True)
+    monkeypatch.setattr(ops, "has_qwen38_shared_gate_exact", lambda: False)
+    monkeypatch.setattr(ops, "has_qwen38_shared_gate_sigmoid_mul", lambda: False)
+    torch.manual_seed(0)
+    x = (torch.randn(rows, 2560) * 0.1).half()
+    act = (torch.randn(rows, 160) * 0.1).half()
+    down_w = (torch.randn(2560, 160) * 0.05).half()
+    gate_w = (torch.randn(1, 2560) * 0.05).half()
+
+    def matmul(a, w):
+        return (a.float() @ w.float().t()).half()
+
+    def fused_op(x, act, dw, gw):
+        return (matmul(act, dw).float() * torch.sigmoid(matmul(x, gw).float())).half()
+
+    fused = Mock(side_effect=fused_op)
+    monkeypatch.setattr(gemv, "_qwen38_sm70_shared_down_gated", fused)
+    down = Mock(side_effect=lambda a: (matmul(a, down_w), None))
+    down.weight = down_w
+    down.quant_method = UnquantizedLinearMethod()
+    gate = Mock(side_effect=lambda a: (matmul(a, gate_w), None))
+    gate.weight = gate_w
+    gate.quant_method = UnquantizedLinearMethod()
+    layer = NS(
+        layer_idx=0,
+        _sm70_exact_shared_expert_gate=True,
+        _sm70_batch_shared_expert_gate=True,
+        gate_up_proj=NS(
+            forward_fused_silu_and_mul=lambda x: act,
+            _sm70_mtp_prepare_shared_batch=mtp,
+        ),
+        down_proj=down,
+        expert_gate=gate,
+    )
+    result = qwen2_moe.Qwen2MoeMLP.forward(layer, x)
+    use_fused = mtp and 2 <= rows <= 64
+    assert fused.call_count == int(use_fused)
+    assert down.call_count == int(not use_fused)
+    assert result.shape == (rows, 2560)
+    if not use_fused:
+        torch.testing.assert_close(result, fused_op(x, act, down_w, gate_w))
+
+
+@pytest.mark.parametrize("rows", [2, 8, 9, 64])
+def test_mtp_shared_down_gated_op_dispatch(monkeypatch, rows):
+    from vllm.models.qwen4_exp.nvidia import sm70_fp16_gemv as gemv
+
+    fused, dot = Mock(), Mock()
+    monkeypatch.setattr(
+        torch.ops._C, "qwen38_shared_down_gated_sm70_out", fused, raising=False
+    )
+    monkeypatch.setattr(
+        torch.ops._C, "qwen38_shared_gate_dot_mul_sm70_out", dot, raising=False
+    )
+    x = torch.zeros(rows, 2560, dtype=torch.float16)
+    act = torch.zeros(rows, 160, dtype=torch.float16)
+    down_w = torch.zeros(2560, 160, dtype=torch.float16)
+    gate_w = torch.zeros(1, 2560, dtype=torch.float16)
+    out = gemv._qwen38_sm70_shared_down_gated(x, act, down_w, gate_w)
+    assert out.shape == (rows, 2560)
+    # 1Cat v1.5.4: fused down+gate up to M8, then down GEMM + gate dot/mul.
+    assert fused.call_count == int(rows <= 8)
+    assert dot.call_count == int(rows > 8)
+
+
+def test_mtp_shared_down_gated_keeps_lora_down(monkeypatch):
+    # A LoRA-wrapped down projection exposes the base weight through
+    # `.weight`, but only its forward adds the adapter delta.
+    from vllm.lora.layers.row_parallel_linear import RowParallelLinearWithLoRA
+    from vllm.models.qwen4_exp.nvidia import sm70_fp16_gemv as gemv
+
+    monkeypatch.setattr(
+        qwen2_moe, "_sm70_dump_qwen_mlp_tensor", lambda label, idx, x: x
+    )
+    monkeypatch.setattr(qwen2_moe, "use_sm70_decode_graph_semantics", lambda: True)
+    monkeypatch.setattr(ops, "has_qwen38_shared_gate_exact", lambda: False)
+    monkeypatch.setattr(ops, "has_qwen38_shared_gate_sigmoid_mul", lambda: False)
+    rows = 4
+    x = torch.zeros(rows, 2560, dtype=torch.float16)
+    act = torch.zeros(rows, 160, dtype=torch.float16)
+    down_w = torch.zeros(2560, 160, dtype=torch.float16)
+    gate_w = torch.zeros(1, 2560, dtype=torch.float16)
+    lora_delta = 0.5
+    down = RowParallelLinearWithLoRA.__new__(RowParallelLinearWithLoRA)
+    torch.nn.Module.__init__(down)
+    down.base_layer = NS(weight=down_w)
+    down.forward = lambda a: (a @ down_w.t() + lora_delta, None)
+    fused = Mock(side_effect=lambda x, act, dw, gw: torch.zeros_like(x))
+    monkeypatch.setattr(gemv, "_qwen38_sm70_shared_down_gated", fused)
+    gate = Mock(side_effect=lambda a: (a @ gate_w.t(), None))
+    gate.weight = gate_w
+    gate.quant_method = UnquantizedLinearMethod()
+    layer = NS(
+        layer_idx=0,
+        _sm70_exact_shared_expert_gate=True,
+        _sm70_batch_shared_expert_gate=True,
+        gate_up_proj=NS(
+            forward_fused_silu_and_mul=lambda x: act,
+            _sm70_mtp_prepare_shared_batch=True,
+        ),
+        down_proj=down,
+        expert_gate=gate,
+    )
+    result = qwen2_moe.Qwen2MoeMLP.forward(layer, x)
+    assert fused.call_count == 0
+    # sigmoid(0) * (0 + LoRA delta)
+    torch.testing.assert_close(result, torch.full_like(x, 0.25))

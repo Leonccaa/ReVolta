@@ -1439,7 +1439,65 @@ def test_engineargs_nvlink_profile(
         ):
             assert audit["config_values"][name]["source"] == source
     elif case in ("pcie", "denied"):
-        assert "config_values" not in audit
+        assert audit["config_values"] == {
+            "sm70_qsa_paged_int8_h12": {"value": False, "source": "upstream_default"}
+        }
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize(
+    ("mode", "method", "kv_dtype", "dcp", "override", "expected", "source"),
+    [
+        ("pex_p2p", "dflash", "auto", 2, None, True, "profile"),
+        ("nvlink", "mtp", "int8_per_token_head", 2, None, True, "profile"),
+        ("pex_p2p", "dflash", "int8", 2, False, False, "explicit"),
+        ("nvlink", "mtp", "int8", 2, False, False, "explicit"),
+        ("pex_p2p", "dflash", "float16", 2, None, False, "upstream_default"),
+        ("nvlink", "mtp", "int8", 1, None, False, "upstream_default"),
+    ],
+)
+def test_engineargs_int8_qsa_reader_profile(
+    profile,
+    monkeypatch,
+    tmp_path,
+    sm70_serving_resolution,
+    mode,
+    method,
+    kv_dtype,
+    dcp,
+    override,
+    expected,
+    source,
+):
+    from vllm import revolta_profile
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(revolta_profile, "frontend_interconnect_mode", lambda **_: mode)
+    monkeypatch.setattr(
+        current_platform, "has_device_capability", lambda cap: cap == 70
+    )
+    monkeypatch.setattr(
+        current_platform,
+        "is_device_capability",
+        lambda cap, device_id=0: cap in (70, (7, 0)),
+    )
+    audit = Mock(wraps=profile.profile_audit)
+    monkeypatch.setattr(revolta_profile, "profile_audit", audit)
+    name = "sm70_qsa_paged_int8_h12"
+    flags = ["--decode-context-parallel-size", str(dcp), "--kv-cache-dtype", kv_dtype]
+    if override is not None:
+        flags += ["--kernel-config", json.dumps({name: override})]
+    args, context = hybrid_serving_args(
+        profile, monkeypatch, tmp_path, method, flags, {}
+    )
+    config = args.create_engine_config(usage_context=context)
+    assert config.cache_config.cache_dtype == (
+        "float16" if kv_dtype == "float16" else "int8"
+    )
+    assert config.kernel_config.sm70_qsa_paged_int8_h12 is expected
+    values = audit.call_args.kwargs["config_values"]
+    assert values[name] == {"value": expected, "source": source}
+    assert ("enable_hc_sp" in values) is (mode == "nvlink")
 
 
 def test_audit_logs_disabled_profile(profile):

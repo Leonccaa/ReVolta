@@ -79,6 +79,7 @@ from vllm.model_executor.model_loader.reload import (
     initialize_layerwise_reload,
     validate_weight_reload,
 )
+from vllm.model_executor.model_loader.weight_utils import publish_weight_update
 from vllm.model_executor.models.interfaces import (
     MixtureOfExperts,
     MultiModalEmbeddings,
@@ -10778,13 +10779,7 @@ class GPUModelRunner(
                 param = model.get_parameter(name)  # TODO: buffers?
                 param.copy_(loaded_weight)
                 loaded_weights.add(name)
-                layer = model.get_submodule(name.rpartition(".")[0])
-                if hasattr(layer, "_sm70_qwen38_hc_batch_packed"):
-                    from vllm.models.qwen4_exp.nvidia.sm70_fp16_hc import (
-                        refresh_hc_batch_weight,
-                    )
-
-                    refresh_hc_batch_weight(layer)
+        publish_weight_update(model)
 
         # logging and validation
         counter_after_reloading = time.perf_counter()

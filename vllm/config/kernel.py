@@ -671,6 +671,13 @@ class KernelConfig:
     """Use the native FP16 paged QSA reader for eligible TP4/DCP2 target
     decode on SM70. Its reduction and probability rounding differ."""
 
+    sm70_qsa_paged_int8_h12: bool | None = None
+    """Use native planar INT8 paged QSA on SM70 for eligible TP4/DCP2 target
+    decode (H12) and replicated MTP draft decode graphs (H6). Both readers
+    can use the hot pool when main K/V is placed on the host. When unset,
+    enable it in the ReVolta SM70 TP4/DCP2 profile with INT8 main KV and
+    Model Runner V2. Explicit True/False overrides the profile default."""
+
     sm70_qsa_paged_fp16_h6: bool | None = None
     """Use the native FP16 paged QSA reader in replicated MTP decode graphs
     on SM70. When unset, enable it in the SM70 TP4/DCP2 NVFP4 profile with
@@ -751,6 +758,14 @@ class KernelConfig:
     sm70_greedy_verify: bool = False
     """Verify greedy MTP drafts from TP-local target argmax pairs instead of
     gathering full-vocabulary logits for the rejection sampler."""
+
+    sm70_mtp_bounded_target_head: bool = False
+    """Select greedy target tokens on SM70 Flash-Next MTP with a bounded QPN8
+    vocabulary search (1CatAI v1.5.4): candidates are scored with the original
+    FP16 head, and rows whose bound is inconclusive run the full FP16 head.
+    Applies to TP-local argmax pairs of at most 64 rows. Shares the FP8 copy
+    of the head with the draft QPN8 head, else adds it (about 0.16 GB per rank
+    at TP4)."""
 
     sm70_sparse_target_sampling: bool | Literal["device_top64"] = False
     """Compact target sampling for SM70 MRv2 with uniform MTP3-5,
@@ -865,6 +880,7 @@ class KernelConfig:
             "qsa_auto_e4m3_reason",
             # Sampler-only switches; they do not change the compiled model.
             "sm70_greedy_verify",
+            "sm70_mtp_bounded_target_head",
             "sm70_top1x",
             "sm70_sparse_target_sampling",
             "sm70_hc_ll_async",  # Compiled model uses sm70_nvlink_hc_active.
@@ -873,6 +889,8 @@ class KernelConfig:
         }
         if not self.sm70_qsa_fused_topk:
             ignored_factors.add("sm70_qsa_fused_topk")
+        if not self.sm70_qsa_paged_int8_h12:
+            ignored_factors.add("sm70_qsa_paged_int8_h12")
         if not self.sm70_qsa_paged_fp16_h6:
             ignored_factors.add("sm70_qsa_paged_fp16_h6")
         if not self.sm70_gdn_input_skinny_k4:

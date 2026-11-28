@@ -3244,19 +3244,21 @@ def qsa_dcp_sparse_paged_attention_sm70_grouped_page4(
     v_scale: float,
     k_scale_cache: torch.Tensor | None = None,
     v_scale_cache: torch.Tensor | None = None,
+    *,
+    local_width: int | None = None,
 ) -> int:
-    """Run the leading rows of a QSA DCP batch through the grouped page4 route.
+    """Run a QSA DCP batch through its native prefill route.
 
     ``q`` holds the gathered heads of every DCP rank and ``local_indices`` this
-    rank's compacted selection at the full 2051-column width. The grouped
-    kernels take six heads, so every six-head slice reuses one plan. Localized
-    IDs are causal by construction but are not ordered against positions in
-    the local token space, so every query position and sequence length is set
-    to the local capacity and the planner reads every column.
+    rank's compacted selection at the full 2051-column width. INT8 row prefill
+    reads only the first ``local_width`` columns and processes every row.
+    Grouped page4 shares one plan across the six-head slices. Localized IDs
+    already enforce causality, so both routes use the local capacity as the
+    visibility bound.
 
     Writes FP32 ``out`` and base-2 ``lse`` (-inf for rows without a local
-    token), as the Triton route does. Returns the number of rows written: a
-    multiple of eight, or 0 when the route does not apply. The caller runs the
+    token), as the Triton route does. Returns the number of rows written.
+    Grouped page4 writes a multiple of eight rows. The caller runs the
     remaining rows through ``qsa_sparse_paged_attention``.
     """
     codec = resolve_kv_codec(kv_cache_dtype)
@@ -3275,6 +3277,7 @@ def qsa_dcp_sparse_paged_attention_sm70_grouped_page4(
             k_scale_cache,
             v_scale_cache,
             codec=codec,
+            local_width=local_width,
         )
 
     heads = 6

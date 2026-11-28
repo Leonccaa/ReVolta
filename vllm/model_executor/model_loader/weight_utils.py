@@ -1693,6 +1693,28 @@ def convert_pyslice_to_tensor(x: Any) -> torch.Tensor:
     return x
 
 
+@torch.no_grad()
+def refresh_derived_weights(model: torch.nn.Module) -> None:
+    """Call ``refresh_derived_weights()`` on every module that defines it, to
+    rebuild tensors kept out of ``state_dict()`` after the weights were
+    overwritten in place. Hooks must be idempotent, write in place and run no
+    collectives.
+    """
+    for module in model.modules():
+        refresh = getattr(module, "refresh_derived_weights", None)
+        if callable(refresh):
+            refresh()
+
+
+def publish_weight_update(model: torch.nn.Module) -> None:
+    """Finish an in-place weight update: rebuild derived weights, then wait
+    for every pending device write so graphs replayed on other streams see
+    the new values. Call once when the update ends, never per step.
+    """
+    refresh_derived_weights(model)
+    torch.accelerator.synchronize()
+
+
 def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
     """Default weight loader."""
     try:

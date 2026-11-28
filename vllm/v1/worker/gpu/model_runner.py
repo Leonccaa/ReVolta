@@ -548,6 +548,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.use_aux_hidden_state_outputs:
                 assert self.speculative_config is not None
                 set_eagle3_aux_hidden_state_layers(self.model, self.speculative_config)
+            # Before the draft loads, so its QPN8 head can share the FP8 codes.
+            prepare_target_head = getattr(
+                self.model, "prepare_sm70_bounded_target_head", None
+            )
+            if prepare_target_head is not None:
+                prepare_target_head()
             if self.speculator is not None:
                 _reclaim_before_draft_load()
                 self.speculator.load_model(self.model)
@@ -2182,6 +2188,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     and uniform_tok_count is not None
                 ),
             ):
+                # QSA runs outside PIECEWISE capture and uses the live batch phase.
+                has_prefill = bool(input_batch.is_prefilling_np.any())
+                get_forward_context().additional_kwargs["qsa_has_prefill"] = has_prefill
                 # Piecewise graphs can replay the same shape for prefill.
                 if (
                     (
@@ -2191,7 +2200,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     )
                     and batch_desc.cg_mode == CUDAGraphMode.NONE
                     and not dummy_run
-                    and not input_batch.is_prefilling_np.any()
+                    and not has_prefill
                 ):
                     get_forward_context().additional_kwargs[
                         "sm70_nvfp4_decode_only"

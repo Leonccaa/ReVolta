@@ -1303,6 +1303,18 @@ class Qwen4ExpForCausalLM(
             self, self.model_config.dtype, self.vllm_config
         )
         object.__setattr__(self, "_sm70_decode_graph_model", None)
+        object.__setattr__(self, "_sm70_target_head", None)
+
+    def prepare_sm70_bounded_target_head(self) -> None:
+        if not self.vllm_config.kernel_config.sm70_mtp_bounded_target_head:
+            return
+        from .sm70_bounded_target_head import prepare_mtp_bounded_target_head
+
+        object.__setattr__(
+            self,
+            "_sm70_target_head",
+            prepare_mtp_bounded_target_head(self.lm_head, self.vllm_config),
+        )
 
     def prepare_hc_sp_model(self) -> None:
         config = copy.copy(self.vllm_config)
@@ -1543,7 +1555,10 @@ class Qwen4ExpForCausalLM(
         return self.logits_processor(self.lm_head, hidden_states)
 
     def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
+        head = self._sm70_target_head
+        return self.logits_processor.get_top_tokens(
+            self.lm_head if head is None else head, hidden_states
+        )
 
     def get_topk_tokens_and_logits(
         self, hidden_states: torch.Tensor, top_k: int
@@ -1802,6 +1817,9 @@ class Qwen4ExpForConditionalGeneration(
 
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
         return self.language_model.get_mtp_target_hidden_states()
+
+    def prepare_sm70_bounded_target_head(self) -> None:
+        self.language_model.prepare_sm70_bounded_target_head()
 
     def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.language_model.get_top_tokens(hidden_states)

@@ -759,6 +759,14 @@ class KernelConfig:
     """Verify greedy MTP drafts from TP-local target argmax pairs instead of
     gathering full-vocabulary logits for the rejection sampler."""
 
+    sm70_mtp_bounded_target_head: bool = False
+    """Select greedy target tokens on SM70 Flash-Next MTP with a bounded QPN8
+    vocabulary search (1CatAI v1.5.4): candidates are scored with the original
+    FP16 head, and rows whose bound is inconclusive run the full FP16 head.
+    Applies to TP-local argmax pairs of at most 64 rows. Shares the FP8 copy
+    of the head with the draft QPN8 head, else adds it (about 0.16 GB per rank
+    at TP4)."""
+
     sm70_sparse_target_sampling: bool | Literal["device_top64"] = False
     """Compact target sampling for SM70 MRv2 with uniform MTP3-5,
     greedy drafts and target temperature=1, top_k=20, top_p=0.95.
@@ -872,6 +880,7 @@ class KernelConfig:
             "qsa_auto_e4m3_reason",
             # Sampler-only switches; they do not change the compiled model.
             "sm70_greedy_verify",
+            "sm70_mtp_bounded_target_head",
             "sm70_top1x",
             "sm70_sparse_target_sampling",
             "sm70_hc_ll_async",  # Compiled model uses sm70_nvlink_hc_active.

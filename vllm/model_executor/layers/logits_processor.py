@@ -355,6 +355,11 @@ class LogitsProcessor(PluggableLayer):
         hidden_states: torch.Tensor,
         embedding_bias: torch.Tensor | None,
     ) -> torch.Tensor:
+        pair_getter = getattr(lm_head, "maybe_get_sm70_lm_head_top1_pair", None)
+        if pair_getter is not None and self.soft_cap is None and self.scale == 1.0:
+            pair = pair_getter(hidden_states, embedding_bias)
+            if pair is not None:
+                return pair
         values, indices = self.get_local_top1(lm_head, hidden_states, embedding_bias)
         # Use float32 to avoid bf16 precision loss on vocabulary indices.
         return torch.stack([values.float(), indices.float()], dim=-1)
